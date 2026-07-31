@@ -51,6 +51,7 @@ Everything runs from the repo root, so one command covers every package.
 deno task test        # all tests, host-side and wac-written
 deno task coverage    # branch coverage of the wac sources
 deno task mutate      # mutation testing
+deno task bench       # throughput benchmark
 
 deno run --allow-read tools/check.ts <entry.wac>   # type-check one file, no run
 ```
