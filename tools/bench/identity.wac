@@ -1,0 +1,18 @@
+// Baseline for measuring the host/wasm boundary on its own.
+//
+// bindgen marshals an array with one exported call per element in each direction,
+// so a codec's measured time includes that copy twice. This does nothing but
+// return its argument, which isolates the cost.
+
+export i8[] identity(i8[] data) {
+  return data;
+}
+
+/** Touches every byte without allocating, to separate the copy from the scan. */
+export i32 checksum(i8[] data) {
+  i32 sum = 0;
+  for (i32 i = 0; i < data.len(); i++) {
+    sum += data[i];
+  }
+  return sum;
+}
