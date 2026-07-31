@@ -90,7 +90,8 @@ function expr(e: any): string {
       return `(incr${pos(e)} ${e.op} ${e.prefix ? "pre" : "post"} ${lvalue(e.lval)})`;
     case "arrNew": {
       const size = e.size === null ? "-" : expr(e.size);
-      return `(arrnew${pos(e)} ${ty(e.elem)} ${size}${exprList(e.fixed ?? [])})`;
+      const fill = e.fill === undefined || e.fill === null ? "-" : expr(e.fill);
+      return `(arrnew${pos(e)} ${ty(e.elem)} ${size} ${fill}${exprList(e.fixed ?? [])})`;
     }
   }
   throw new Error(`unknown expr kind ${e.kind}`);
@@ -168,7 +169,8 @@ function stmt(s: any): string {
 }
 
 function params(ps: any[]): string {
-  return ` (${ps.map((p) => `(${p.name} ${ty(p.type)})`).join(" ")})`;
+  return ` (${ps.map((p) =>
+    `(${p.isConst ? "const" : "mut"} ${p.name} ${ty(p.type)})`).join(" ")})`;
 }
 
 function decl(d: any): string {
@@ -355,6 +357,19 @@ Deno.test("parse: agrees on constructs a working corpus does not contain", () =>
       `i32 f(anyref x, f64 y) { return (y as! i32) + (x as~ i31ref as i32) + (y as i32); }`],
     ["this as an lvalue root",
       `struct S { i32 v; void set(this, i32 n) { this.v = n; } }`],
+    ["fixed literal with a named element type",
+      `struct S { i32 v; } S[] f() { return S[](S(1), S(2)); }`],
+    ["empty literal with a named element type",
+      `struct S { i32 v; } S[] f() { return S[](); }`],
+    ["sized array with a fill value",
+      `struct S { i32 v; } S[] f(i32 n) { return S[n](fill: S(1)); }`],
+    ["fill value that is itself a construction",
+      `struct S { i32 v; } S[][] f(i32 n) { return S[][n](fill: S[](S(2))); }`],
+    ["const parameters",
+      `struct P { i32 v; } i32 peek(const P p, i32 n) { return p.v + n; }`],
+    ["const parameter in a method",
+      `struct P { i32 v; }\nstruct S { i32 n; i32 m(const this, const P p) { return p.v; } }`],
+    ["f32 literal by context", `f32 f() { f32 x = 1.5; return x; }`],
     ["compound assignment through an index and a field",
       `struct S { i32 v; } void f(S[] a) { a[0].v += 1; a[0].v >>>= 2; }`],
   ];

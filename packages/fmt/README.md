@@ -36,6 +36,17 @@ digits come out most-significant first, and the loop stops as soon as the digits
 emitted identify this double rather than either neighbour. That stopping rule is
 what makes the output *shortest*; the exact arithmetic is what makes it correct.
 
+What a float turned out to be is an `enum` — `NaN`, `Inf(neg)`, `Zero`,
+`Digits(...)` — rather than a struct with `isNaN`/`isInf` flags. The flags made
+nonsense representable, both set at once or a NaN carrying digits, and every reader
+had to know which fields were meaningful in which combination. Formatting is now
+exhaustive over the four cases.
+
+One consequence worth knowing before porting anything similar: a variant's payload
+cannot be written after construction, so digit generation accumulates in locals and
+constructs the variant once at the end. It was a builder in disguise before, so this
+made it more honest rather than less.
+
 `src/bigint.wac` is the arithmetic: fixed-size unsigned, `u32` limbs with `u64`
 intermediates. Deliberately not a general bignum — the algorithm needs compare,
 subtract, multiply by a small constant and shift left, and finds each digit by

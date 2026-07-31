@@ -325,11 +325,13 @@ void printExpr(Pr w, Expr e) {
       w.sp(); printLvalue(w, target);
       w.close();
     }
-    case ArrNew(elem, size, elements): {
+    case ArrNew(elem, size, fill, elements): {
       w.open("arrnew", e.line, e.col);
       w.sp(); printTy(w, elem);
       w.sp();
       if (size is null) { w.s("-"); } else { printExpr(w, size!); }
+      w.sp();
+      if (fill is null) { w.s("-"); } else { printExpr(w, fill!); }
       printExprList(w, elements);
       w.close();
     }
@@ -497,6 +499,7 @@ void printParams(Pr w, Param[] params) {
   for (i32 i = 0; i < params.len(); i++) {
     if (i > 0) { w.sp(); }
     w.out.push('(');
+    w.s(params[i].isConst ? "const " : "mut ");
     w.tok(params[i].nameTok);
     w.sp();
     printTy(w, params[i].type);
