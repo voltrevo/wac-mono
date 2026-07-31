@@ -16,6 +16,7 @@ compiler, this one is things built with it.
 | [`gzip`](packages/gzip/) | gzip and DEFLATE, both directions — compresses at or under `gzip -6` |
 | [`json`](packages/json/) | JSON parse and serialize, verified against the host's own JSON |
 | [`bignum`](packages/bignum/) | arbitrary-precision integers, semantics identical to `BigInt` |
+| [`url`](packages/url/) | WHATWG URL parsing, serialization and relative resolution |
 | [`std`](packages/std/) | `Vec<T>`, `Map<K, V>`, `Option<T>`, `Result<T, E>` — the containers generics made writable |
 | [`wactest`](packages/wactest/) | assertions for writing tests in wac |
 
@@ -65,6 +66,7 @@ deno task coverage:fmt
 deno task coverage:gzip
 deno task coverage:json
 deno task coverage:std
+deno task coverage:url
 deno task mutate          # mutation testing
 deno task bench           # gzip throughput
 deno task bench:json      # json throughput, by document shape

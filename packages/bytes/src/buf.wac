@@ -155,7 +155,15 @@ export struct Buf {
       this.len = 0;
       return out;
     }
-    return this.bytes();
+    // The copy path has to empty the buffer too. It did not, so `take` kept its contents
+    // whenever the buffer was not exactly full — which is almost always — and the next push
+    // appended to bytes the caller thought it had handed away. Nothing here notices, because
+    // every caller in this repo used to take once and drop the Buf; `packages/url` reuses one
+    // across a parse and got its scheme glued to the front of its path.
+    u8[] out = this.bytes();
+    this.data = u8[0]();
+    this.len = 0;
+    return out;
   }
 
   // Exact-length copy — the internal array is over-allocated.

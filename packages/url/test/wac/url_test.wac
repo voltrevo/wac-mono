@@ -1,0 +1,124 @@
+// The wac-facing side of url.
+//
+// The differential tests own correctness: two runtimes and the standard decide what a URL means,
+// and nothing here tries to re-litigate that. What they cannot reach is the parts of the package
+// that are not on the path from a byte string to a parsed URL — the component encode set, which
+// no input selects, and the host serializer applied to a host built by hand.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Host, writeHost, parseIpv4, parseIpv6, endsInNumber } from "../../src/host.wac";
+import { encode, decode, inEncodeSet, SET_C0, SET_FRAGMENT, SET_QUERY, SET_SPECIAL_QUERY,
+         SET_PATH, SET_USERINFO, SET_COMPONENT } from "../../src/percent.wac";
+import { Buf } from "../../../bytes/src/buf.wac";
+
+u8[] hostStr(Host h) {
+  Buf b = Buf.create();
+  writeHost(b, h);
+  return b.take();
+}
+
+export string test_encode_sets_nest() {
+  T t = T.create();
+  // The sets are *not* one chain, which is the thing worth pinning: fragment and query are
+  // siblings, not nested. Fragment escapes a backtick and query does not; query escapes `#` and
+  // fragment does not. Everything else does form a chain, hanging off query.
+  //
+  // Written as a property over all 256 bytes rather than case by case, since that is how the
+  // standard defines them — each set is the previous one plus a handful of punctuation.
+  i32[] chain = i32[]( SET_C0(), SET_QUERY(), SET_PATH(), SET_USERINFO(), SET_COMPONENT() );
+  i32 violations = 0;
+  for (i32 c = 0; c < 256; c++) {
+    for (i32 i = 1; i < chain.len(); i++) {
+      violations = violations
+        + ((inEncodeSet(c, chain[i - 1]) && !inEncodeSet(c, chain[i])) ? 1 : 0);
+    }
+    // The two that hang off the chain rather than continuing it.
+    violations = violations + ((inEncodeSet(c, SET_C0()) && !inEncodeSet(c, SET_FRAGMENT())) ? 1 : 0);
+    violations = violations
+      + ((inEncodeSet(c, SET_QUERY()) && !inEncodeSet(c, SET_SPECIAL_QUERY())) ? 1 : 0);
+  }
+  t.eqI32(violations, 0, "C0 < query < path < userinfo < component, and C0 < fragment");
+  return t.report();
+}
+
+export string test_fragment_and_query_are_incomparable() {
+  T t = T.create();
+  // Neither contains the other, so there is no single ordering of the sets. A test that assumed
+  // one — as the first version of the test above did — passes for the wrong reason.
+  t.eqI32(inEncodeSet('`', SET_FRAGMENT()) ? 1 : 0, 1, "fragment escapes a backtick");
+  t.eqI32(inEncodeSet('`', SET_QUERY()) ? 1 : 0, 0, "query does not");
+  t.eqI32(inEncodeSet('#', SET_QUERY()) ? 1 : 0, 1, "query escapes a hash");
+  t.eqI32(inEncodeSet('#', SET_FRAGMENT()) ? 1 : 0, 0, "fragment does not");
+  return t.report();
+}
+
+export string test_the_component_set_escapes_percent() {
+  T t = T.create();
+  // The only set that does, which is what separates it from the path set: an already-encoded
+  // string survives a path and does not survive a component.
+  t.eqBytes(encode("%41".toBytes(), SET_PATH()), "%41".toBytes(), "a path leaves %41 alone");
+  t.eqBytes(encode("%41".toBytes(), SET_COMPONENT()), "%2541".toBytes(), "a component re-encodes it");
+  t.eqBytes(encode("a&b+c,d$e".toBytes(), SET_COMPONENT()), "a%26b%2Bc%2Cd%24e".toBytes(),
+    "and the rest of the component set");
+  return t.report();
+}
+
+export string test_special_query_adds_the_apostrophe() {
+  T t = T.create();
+  t.eqBytes(encode("a'b".toBytes(), SET_QUERY()), "a'b".toBytes(), "a plain query keeps it");
+  t.eqBytes(encode("a'b".toBytes(), SET_SPECIAL_QUERY()), "a%27b".toBytes(), "a special one does not");
+  return t.report();
+}
+
+export string test_percent_decode_leaves_malformed_escapes() {
+  T t = T.create();
+  // Decoding never fails: `%zz` and a trailing `%` are literal, which is what the standard says
+  // and what stops a decode from being a place a URL can be rejected.
+  t.eqBytes(decode("%41%42".toBytes()), "AB".toBytes(), "well-formed escapes decode");
+  t.eqBytes(decode("%zz".toBytes()), "%zz".toBytes(), "a bad escape is literal");
+  t.eqBytes(decode("%".toBytes()), "%".toBytes(), "so is a trailing percent");
+  t.eqBytes(decode("%4".toBytes()), "%4".toBytes(), "and a truncated one");
+  t.eqBytes(decode("a%2Fb".toBytes()), "a/b".toBytes(), "uppercase hex too");
+  return t.report();
+}
+
+export string test_ipv6_serializes_compressed() {
+  T t = T.create();
+  // The longest run of zero pieces becomes `::`, ties going to the first run. Reached from wac
+  // because it is the serializer, not the parser, that has to make this choice.
+  t.eqBytes(hostStr(parseIpv6("0:0:0:0:0:0:0:1".toBytes())!), "[::1]".toBytes(), "leading zeros");
+  t.eqBytes(hostStr(parseIpv6("0:0:0:0:0:0:0:0".toBytes())!), "[::]".toBytes(), "all zeros");
+  t.eqBytes(hostStr(parseIpv6("1:0:0:2:0:0:0:3".toBytes())!), "[1:0:0:2::3]".toBytes(),
+    "the longer run wins, not the first");
+  t.eqBytes(hostStr(parseIpv6("1:0:0:2:0:0:3:4".toBytes())!), "[1::2:0:0:3:4]".toBytes(),
+    "and on a tie the first run wins");
+  t.eqBytes(hostStr(parseIpv6("1:2:3:4:5:6:7:8".toBytes())!), "[1:2:3:4:5:6:7:8]".toBytes(),
+    "no run, no compression");
+  t.eqBytes(hostStr(parseIpv6("1:0:3:4:5:6:7:8".toBytes())!), "[1:0:3:4:5:6:7:8]".toBytes(),
+    "a single zero is not compressed");
+  return t.report();
+}
+
+export string test_ipv4_canonicalises() {
+  T t = T.create();
+  t.eqBytes(hostStr(parseIpv4("127.1".toBytes())!), "127.0.0.1".toBytes(), "short form expands");
+  t.eqBytes(hostStr(parseIpv4("0x7f.1".toBytes())!), "127.0.0.1".toBytes(), "hex is decimal now");
+  t.eqBytes(hostStr(parseIpv4("2130706433".toBytes())!), "127.0.0.1".toBytes(), "so is one number");
+  t.eqBytes(hostStr(parseIpv4("0.0.0.0".toBytes())!), "0.0.0.0".toBytes(), "zero stays");
+  t.eqBytes(hostStr(parseIpv4("255.255.255.255".toBytes())!), "255.255.255.255".toBytes(), "and the top");
+  return t.report();
+}
+
+export string test_ends_in_number_selects_ipv4() {
+  T t = T.create();
+  // The check that decides whether a host is parsed as an address at all.
+  t.eqI32(endsInNumber("1.2.3.4".toBytes()) ? 1 : 0, 1, "all digits");
+  t.eqI32(endsInNumber("a.1".toBytes()) ? 1 : 0, 1, "a digit last is enough");
+  t.eqI32(endsInNumber("1.2.3.4.".toBytes()) ? 1 : 0, 1, "a trailing dot is ignored");
+  t.eqI32(endsInNumber("a.0x1f".toBytes()) ? 1 : 0, 1, "hex counts as a number");
+  t.eqI32(endsInNumber("a.0177".toBytes()) ? 1 : 0, 1, "so does octal");
+  t.eqI32(endsInNumber("example.com".toBytes()) ? 1 : 0, 0, "a name does not");
+  t.eqI32(endsInNumber("1.2.3.4a".toBytes()) ? 1 : 0, 0, "nor a digit run with a letter after it");
+  t.eqI32(endsInNumber("".toBytes()) ? 1 : 0, 0, "nor the empty host");
+  return t.report();
+}

@@ -1,0 +1,70 @@
+// Host-facing entry point.
+//
+// One call returns every component at once, NUL-separated, because the interesting failures are
+// the ones where the href matches and a component does not — a parser can put the right bytes in
+// the wrong field and still round-trip. Comparing all nine against `new URL` catches that.
+//
+// Field 0 is "1" or "0" for whether the URL parsed at all, so a rejection is a comparison rather
+// than an exception.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { Url, parseUrl, serialize, pathname, hostname } from "../src/url.wac";
+
+void writeDecimal(Buf out, i32 v) {
+  if (v == 0) { out.push('0'); return; }
+  u8[] tmp = u8[6]();
+  i32 n = 0;
+  i32 x = v;
+  while (x > 0) { tmp[n] = 48 + (x % 10); x = x / 10; n++; }
+  for (i32 i = n - 1; i >= 0; i--) { out.push(tmp[i]); }
+}
+
+/**
+ * Every component, in the order `url.test.ts` reads them.
+ *
+ * `search` and `hash` follow the JS accessors rather than the URL record: an empty query
+ * serializes as `?` in the href but reads as `""` from `.search`, and the same for the fragment.
+ */
+u8[] describe(Url? parsed) {
+  Buf out = Buf.create();
+  if (parsed is null) {
+    out.push('0');
+    return out.take();
+  }
+  Url u = parsed!;
+  out.push('1');
+  out.push(0);
+
+  out.pushAll(serialize(u));                          // href
+  out.push(0);
+  out.pushAll(u.scheme);                              // protocol, without the colon
+  out.push(0);
+  out.pushAll(u.username);
+  out.push(0);
+  out.pushAll(u.password);
+  out.push(0);
+  out.pushAll(hostname(u));
+  out.push(0);
+  if (u.port >= 0) { writeDecimal(out, u.port); }     // port, empty when default or absent
+  out.push(0);
+  out.pushAll(pathname(u));
+  out.push(0);
+  if ((u.query is not null) && u.query!.len() > 0) {  // search
+    out.push('?');
+    out.pushAll(u.query!);
+  }
+  out.push(0);
+  if ((u.fragment is not null) && u.fragment!.len() > 0) {
+    out.push('#');
+    out.pushAll(u.fragment!);
+  }
+  return out.take();
+}
+
+export u8[] parse(u8[] input) { return describe(parseUrl(input, null)); }
+
+export u8[] parseWithBase(u8[] input, u8[] base) {
+  Url? b = parseUrl(base, null);
+  if (b is null) { return u8[1](fill: '0'); }
+  return describe(parseUrl(input, b));
+}

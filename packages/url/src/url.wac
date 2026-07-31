@@ -1,0 +1,664 @@
+// The basic URL parser, from the WHATWG URL standard.
+//
+// A state machine over the input, one byte at a time, with the state transitions written to
+// follow the standard's prose closely enough that a divergence is findable by reading both. The
+// odd-looking parts are odd in the standard too — `file` URLs get four states of their own,
+// backslashes are slashes under a special scheme, and a `:` in the authority may turn out to be
+// a port or a password depending on what comes after it.
+//
+// Everything is UTF-8 bytes. The standard is defined over code points, and the difference shows
+// up in exactly one place: a byte-wise loop cannot reject a lone surrogate, because UTF-8 input
+// cannot contain one. Percent-encoding is byte-wise in the standard anyway.
+//
+// Not implemented: IDNA, so a non-ASCII domain is rejected rather than mapped. See host.wac.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { bytesEq } from "../../bytes/src/hash.wac";
+import { Vec } from "../../std/src/vec.wac";
+import { Host, HostResult, parseHost, writeHost, isForbiddenHost } from "./host.wac";
+import { encodeInto, isHexDigit, SET_C0, SET_FRAGMENT, SET_QUERY, SET_SPECIAL_QUERY,
+         SET_PATH, SET_USERINFO } from "./percent.wac";
+
+/**
+ * A parsed URL.
+ *
+ * `port` is -1 for "none" and `query`/`fragment` are null for "none", which are different from
+ * empty: `http://h/?` has an empty query and `http://h/` has none, and they serialize
+ * differently.
+ *
+ * A path is either a list of segments or one opaque string. `a:b` has the opaque path `b` and
+ * cannot be resolved against — that is the standard's "cannot-be-a-base-URL", and the flag is
+ * what stops `..` from doing anything to it.
+ */
+export struct Url {
+  u8[] scheme;
+  u8[] username;
+  u8[] password;
+  Host? host;
+  i32 port;
+  Vec<u8[]> path;
+  u8[] opaquePath;
+  bool hasOpaquePath;
+  u8[]? query;
+  u8[]? fragment;
+
+  Url create() {
+    return Url(u8[0](), u8[0](), u8[0](), null, -1, Vec.create(), u8[0](), false, null, null);
+  }
+}
+
+// ── Schemes ────────────────────────────────────────────────────────────────────────────
+
+/** Whether `s` is one of the six special schemes, which get slash and host handling. */
+export bool isSpecial(u8[] s) {
+  return eqStr(s, "http") || eqStr(s, "https") || eqStr(s, "file")
+      || eqStr(s, "ftp") || eqStr(s, "ws") || eqStr(s, "wss");
+}
+
+/** The port that is omitted when serializing, or -1 if the scheme has none. */
+export i32 defaultPort(u8[] s) {
+  if (eqStr(s, "http") || eqStr(s, "ws")) { return 80; }
+  if (eqStr(s, "https") || eqStr(s, "wss")) { return 443; }
+  if (eqStr(s, "ftp")) { return 21; }
+  return -1;
+}
+
+bool eqStr(u8[] a, string b) {
+  u8[] bs = b.toBytes();
+  if (a.len() != bs.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != bs[i]) { return false; }
+  }
+  return true;
+}
+
+// ── Small helpers ──────────────────────────────────────────────────────────────────────
+
+bool isAsciiAlpha(i32 c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+bool isAsciiDigit(i32 c) { return c >= '0' && c <= '9'; }
+bool isAsciiAlnum(i32 c) { return isAsciiAlpha(c) || isAsciiDigit(c); }
+
+/** A slash, or a backslash when the scheme is special — the standard treats them alike. */
+bool isSlash(i32 c, bool special) { return c == '/' || (special && c == '\\'); }
+
+u8[] lowerAscii(u8[] s) {
+  u8[] out = u8[s.len()]();
+  for (i32 i = 0; i < s.len(); i++) {
+    i32 c = s[i];
+    out[i] = c >= 'A' && c <= 'Z' ? c + 32 : c;
+  }
+  return out;
+}
+
+/** `c:` or `c|`, the shape that makes a file path a Windows drive letter. */
+bool isWindowsDrive(u8[] s) {
+  return s.len() == 2 && isAsciiAlpha(s[0]) && (s[1] == ':' || s[1] == '|');
+}
+
+/** The same, but only `c:` counts once a URL has been parsed. */
+bool isNormalizedWindowsDrive(u8[] s) {
+  return s.len() == 2 && isAsciiAlpha(s[0]) && s[1] == ':';
+}
+
+/** Whether `s` starts with a drive letter that is not followed by more path-ish bytes. */
+bool startsWithWindowsDrive(u8[] s, i32 at) {
+  i32 n = s.len() - at;
+  if (n < 2) { return false; }
+  if (!isAsciiAlpha(s[at]) || (s[at + 1] != ':' && s[at + 1] != '|')) { return false; }
+  if (n == 2) { return true; }
+  i32 c = s[at + 2];
+  return c == '/' || c == '\\' || c == '?' || c == '#';
+}
+
+/** `.` or its percent-encoded spellings, which count as a single-dot segment. */
+bool isSingleDot(u8[] s) {
+  return eqStr(s, ".") || eqStr(lowerAscii(s), "%2e");
+}
+
+bool isDoubleDot(u8[] s) {
+  u8[] l = lowerAscii(s);
+  return eqStr(l, "..") || eqStr(l, ".%2e") || eqStr(l, "%2e.") || eqStr(l, "%2e%2e");
+}
+
+/** Drop the last segment, except that a file URL keeps a lone drive letter. */
+void shortenPath(Url url) {
+  if (url.hasOpaquePath || url.path.len() == 0) { return; }
+  if (eqStr(url.scheme, "file") && url.path.len() == 1
+      && isNormalizedWindowsDrive(url.path.get(0))) {
+    return;
+  }
+  url.path.pop();
+}
+
+// ── States ─────────────────────────────────────────────────────────────────────────────
+
+i32 S_SCHEME_START() { return 0; }
+i32 S_SCHEME() { return 1; }
+i32 S_NO_SCHEME() { return 2; }
+i32 S_SPECIAL_RELATIVE_OR_AUTHORITY() { return 3; }
+i32 S_PATH_OR_AUTHORITY() { return 4; }
+i32 S_RELATIVE() { return 5; }
+i32 S_RELATIVE_SLASH() { return 6; }
+i32 S_SPECIAL_AUTHORITY_SLASHES() { return 7; }
+i32 S_SPECIAL_AUTHORITY_IGNORE_SLASHES() { return 8; }
+i32 S_AUTHORITY() { return 9; }
+i32 S_HOST() { return 10; }
+i32 S_PORT() { return 11; }
+i32 S_FILE() { return 12; }
+i32 S_FILE_SLASH() { return 13; }
+i32 S_FILE_HOST() { return 14; }
+i32 S_PATH_START() { return 15; }
+i32 S_PATH() { return 16; }
+i32 S_OPAQUE_PATH() { return 17; }
+i32 S_QUERY() { return 18; }
+i32 S_FRAGMENT() { return 19; }
+
+/**
+ * Strip leading and trailing C0-control-or-space, and remove every tab and newline.
+ *
+ * Both are silent in the standard — they are validation errors, not failures — which is why
+ * `"  http://a/  "` and `"htt\nps://a/"` both parse.
+ */
+u8[] clean(u8[] input) {
+  i32 lo = 0;
+  i32 hi = input.len();
+  while (lo < hi && input[lo] <= 0x20) { lo++; }
+  while (hi > lo && input[hi - 1] <= 0x20) { hi--; }
+  Buf out = Buf.create();
+  for (i32 i = lo; i < hi; i++) {
+    i32 c = input[i];
+    if (c == 0x09 || c == 0x0A || c == 0x0D) { continue; }
+    out.push(c);
+  }
+  return out.take();
+}
+
+/**
+ * The basic URL parser. Null on failure.
+ *
+ * `base` is the URL to resolve against, or null. The standard's parser also takes a state
+ * override for the setters; that is not implemented, since nothing here mutates a parsed URL.
+ */
+export Url? parseUrl(u8[] rawInput, Url? base) {
+  u8[] input = clean(rawInput);
+  Url url = Url.create();
+  i32 state = S_SCHEME_START();
+  i32 pointer = 0;
+  Buf buffer = Buf.create();
+  bool atSignSeen = false;
+  bool insideBrackets = false;
+  bool passwordSeen = false;
+
+  // `pointer == input.len()` is the standard's EOF code point, so the loop runs one past the
+  // end. `c` is -1 there, which no branch matches by accident.
+  while (pointer <= input.len()) {
+    i32 c = pointer < input.len() ? input[pointer] : -1;
+    bool eof = c < 0;
+
+    if (state == S_SCHEME_START()) {
+      if (!eof && isAsciiAlpha(c)) {
+        buffer.push(c >= 'A' && c <= 'Z' ? c + 32 : c);
+        state = S_SCHEME();
+      } else {
+        state = S_NO_SCHEME();
+        continue;                                   // reprocess without advancing
+      }
+
+    } else if (state == S_SCHEME()) {
+      if (!eof && (isAsciiAlnum(c) || c == '+' || c == '-' || c == '.')) {
+        buffer.push(c >= 'A' && c <= 'Z' ? c + 32 : c);
+      } else if (c == ':') {
+        url.scheme = buffer.take();
+        if (eqStr(url.scheme, "file")) {
+          state = S_FILE();
+        } else if (isSpecial(url.scheme)) {
+          if ((base is not null) && bytesEq(base!.scheme, url.scheme)) {
+            state = S_SPECIAL_RELATIVE_OR_AUTHORITY();
+          } else {
+            state = S_SPECIAL_AUTHORITY_SLASHES();
+          }
+        } else if (pointer + 1 < input.len() && input[pointer + 1] == '/') {
+          state = S_PATH_OR_AUTHORITY();
+          pointer++;
+        } else {
+          url.hasOpaquePath = true;
+          url.opaquePath = u8[0]();
+          state = S_OPAQUE_PATH();
+        }
+      } else {
+        // Not a scheme after all: rewind and try again as a relative reference.
+        buffer = Buf.create();
+        state = S_NO_SCHEME();
+        pointer = -1;                               // the ++ below makes this 0
+      }
+
+    } else if (state == S_NO_SCHEME()) {
+      if (base is null) { return null; }
+      if (base!.hasOpaquePath && c != '#') { return null; }
+      if (base!.hasOpaquePath && c == '#') {
+        url.scheme = base!.scheme;
+        url.hasOpaquePath = true;
+        url.opaquePath = base!.opaquePath;
+        url.query = base!.query;
+        url.fragment = u8[0]();
+        state = S_FRAGMENT();
+      } else if (!eqStr(base!.scheme, "file")) {
+        state = S_RELATIVE();
+        continue;
+      } else {
+        state = S_FILE();
+        continue;
+      }
+
+    } else if (state == S_SPECIAL_RELATIVE_OR_AUTHORITY()) {
+      if (c == '/' && pointer + 1 < input.len() && input[pointer + 1] == '/') {
+        state = S_SPECIAL_AUTHORITY_IGNORE_SLASHES();
+        pointer++;
+      } else {
+        state = S_RELATIVE();
+        continue;
+      }
+
+    } else if (state == S_PATH_OR_AUTHORITY()) {
+      if (c == '/') {
+        state = S_AUTHORITY();
+      } else {
+        state = S_PATH();
+        continue;
+      }
+
+    } else if (state == S_RELATIVE()) {
+      url.scheme = base!.scheme;
+      if (isSlash(c, isSpecial(url.scheme)) && !eof) {
+        state = S_RELATIVE_SLASH();
+      } else {
+        url.username = base!.username;
+        url.password = base!.password;
+        url.host = base!.host;
+        url.port = base!.port;
+        url.path = copyPath(base!.path);
+        url.query = base!.query;
+        if (c == '?') {
+          url.query = u8[0]();
+          state = S_QUERY();
+        } else if (c == '#') {
+          url.fragment = u8[0]();
+          state = S_FRAGMENT();
+        } else if (!eof) {
+          url.query = null;
+          shortenPath(url);
+          state = S_PATH();
+          continue;
+        }
+      }
+
+    } else if (state == S_RELATIVE_SLASH()) {
+      if (isSpecial(url.scheme) && isSlash(c, true)) {
+        state = S_SPECIAL_AUTHORITY_IGNORE_SLASHES();
+      } else if (c == '/') {
+        state = S_AUTHORITY();
+      } else {
+        url.username = base!.username;
+        url.password = base!.password;
+        url.host = base!.host;
+        url.port = base!.port;
+        state = S_PATH();
+        continue;
+      }
+
+    } else if (state == S_SPECIAL_AUTHORITY_SLASHES()) {
+      if (c == '/' && pointer + 1 < input.len() && input[pointer + 1] == '/') {
+        state = S_SPECIAL_AUTHORITY_IGNORE_SLASHES();
+        pointer++;
+      } else {
+        state = S_SPECIAL_AUTHORITY_IGNORE_SLASHES();
+        continue;
+      }
+
+    } else if (state == S_SPECIAL_AUTHORITY_IGNORE_SLASHES()) {
+      if (c != '/' && c != '\\') {
+        state = S_AUTHORITY();
+        continue;
+      }
+
+    } else if (state == S_AUTHORITY()) {
+      if (c == '@') {
+        // Everything buffered was userinfo; a second `@` re-encodes the first.
+        u8[] buffered = buffer.take();
+        if (atSignSeen) {
+          Buf re = Buf.create();
+          re.pushAll("%40".toBytes());
+          re.pushAll(buffered);
+          buffered = re.take();
+        }
+        atSignSeen = true;
+        Buf user = Buf.create();
+        Buf pass = Buf.create();
+        bool inPass = passwordSeen;
+        for (i32 i = 0; i < buffered.len(); i++) {
+          i32 b = buffered[i];
+          if (b == ':' && !inPass) {
+            inPass = true;
+            passwordSeen = true;
+            continue;
+          }
+          Buf target = inPass ? pass : user;
+          if (b == '%' || b == 0) {
+            // `%` reaches here already encoded when it came from the re-encode above.
+            encodeInto(target, u8[](b), SET_USERINFO());
+          } else {
+            encodeInto(target, u8[](b), SET_USERINFO());
+          }
+        }
+        Buf u2 = Buf.create();
+        u2.pushAll(url.username);
+        u2.pushAll(user.take());
+        url.username = u2.take();
+        Buf p2 = Buf.create();
+        p2.pushAll(url.password);
+        p2.pushAll(pass.take());
+        url.password = p2.take();
+      } else if (eof || c == '/' || c == '?' || c == '#'
+                 || (isSpecial(url.scheme) && c == '\\')) {
+        if (atSignSeen && buffer.len == 0) { return null; }
+        pointer = pointer - buffer.len - 1;
+        buffer = Buf.create();
+        state = S_HOST();
+      } else {
+        buffer.push(c);
+      }
+
+    } else if (state == S_HOST()) {
+      if (c == ':' && !insideBrackets) {
+        if (buffer.len == 0) { return null; }
+        HostResult hr = parseHost(buffer.take(), isSpecial(url.scheme));
+        if (hr.host is null) { return null; }
+        url.host = hr.host;
+        state = S_PORT();
+      } else if (eof || c == '/' || c == '?' || c == '#'
+                 || (isSpecial(url.scheme) && c == '\\')) {
+        pointer--;
+        if (isSpecial(url.scheme) && buffer.len == 0) { return null; }
+        HostResult hr = parseHost(buffer.take(), isSpecial(url.scheme));
+        if (hr.host is null) { return null; }
+        url.host = hr.host;
+        state = S_PATH_START();
+      } else {
+        if (c == '[') { insideBrackets = true; }
+        if (c == ']') { insideBrackets = false; }
+        buffer.push(c);
+      }
+
+    } else if (state == S_PORT()) {
+      if (!eof && isAsciiDigit(c)) {
+        buffer.push(c);
+      } else if (eof || c == '/' || c == '?' || c == '#'
+                 || (isSpecial(url.scheme) && c == '\\')) {
+        if (buffer.len > 0) {
+          u8[] digits = buffer.take();
+          i32 value = 0;
+          for (i32 i = 0; i < digits.len(); i++) {
+            value = value * 10 + (digits[i] - '0');
+            if (value > 65535) { return null; }
+          }
+          url.port = value == defaultPort(url.scheme) ? -1 : value;
+        }
+        buffer = Buf.create();
+        state = S_PATH_START();
+        continue;
+      } else {
+        return null;
+      }
+
+    } else if (state == S_FILE()) {
+      url.scheme = "file".toBytes();
+      url.host = Host.Named(u8[0]());
+      if (c == '/' || c == '\\') {
+        state = S_FILE_SLASH();
+      } else if ((base is not null) && eqStr(base!.scheme, "file")) {
+        url.host = base!.host;
+        url.path = copyPath(base!.path);
+        url.query = base!.query;
+        if (c == '?') {
+          url.query = u8[0]();
+          state = S_QUERY();
+        } else if (c == '#') {
+          url.fragment = u8[0]();
+          state = S_FRAGMENT();
+        } else if (!eof) {
+          url.query = null;
+          if (!startsWithWindowsDrive(input, pointer)) {
+            shortenPath(url);
+          } else {
+            url.path = Vec.create();
+          }
+          state = S_PATH();
+          continue;
+        }
+      } else {
+        state = S_PATH();
+        continue;
+      }
+
+    } else if (state == S_FILE_SLASH()) {
+      if (c == '/' || c == '\\') {
+        state = S_FILE_HOST();
+      } else {
+        if ((base is not null) && eqStr(base!.scheme, "file")) {
+          url.host = base!.host;
+          if (!startsWithWindowsDrive(input, pointer) && base!.path.len() > 0
+              && isNormalizedWindowsDrive(base!.path.get(0))) {
+            url.path.push(base!.path.get(0));
+          }
+        }
+        state = S_PATH();
+        continue;
+      }
+
+    } else if (state == S_FILE_HOST()) {
+      if (eof || c == '/' || c == '\\' || c == '?' || c == '#') {
+        pointer--;
+        // Peeked rather than taken: if this turns out to be a drive letter the buffer is
+        // handed to the path state as-is, which is how `file://c:/` becomes the path `/c:/`
+        // with no host rather than a host named `c:`.
+        u8[] buffered = buffer.bytes();
+        if (isWindowsDrive(buffered)) {
+          state = S_PATH();
+        } else if (buffered.len() == 0) {
+          buffer.take();
+          url.host = Host.Named(u8[0]());
+          state = S_PATH_START();
+        } else {
+          buffer.take();
+          HostResult hr = parseHost(buffered, true);
+          if (hr.host is null) { return null; }
+          // Written as an `if` rather than a ternary: `cond ? T : T?` takes the non-nullable
+          // arm's type as the result and emits invalid wasm — wac/issues/0048.
+          Host? chosen = hr.host;
+          if (eqStr(hostBytes(hr.host!), "localhost")) { chosen = Host.Named(u8[0]()); }
+          url.host = chosen;
+          state = S_PATH_START();
+        }
+      } else {
+        buffer.push(c);
+      }
+
+    } else if (state == S_PATH_START()) {
+      if (isSpecial(url.scheme)) {
+        state = S_PATH();
+        if (c != '/' && c != '\\') { continue; }
+      } else if (c == '?') {
+        url.query = u8[0]();
+        state = S_QUERY();
+      } else if (c == '#') {
+        url.fragment = u8[0]();
+        state = S_FRAGMENT();
+      } else if (!eof) {
+        state = S_PATH();
+        if (c != '/') { continue; }
+      }
+
+    } else if (state == S_PATH()) {
+      bool segmentEnd = eof || c == '/' || (isSpecial(url.scheme) && c == '\\')
+                     || c == '?' || c == '#';
+      if (segmentEnd) {
+        u8[] segment = buffer.take();
+        if (isDoubleDot(segment)) {
+          shortenPath(url);
+          if (c != '/' && !(isSpecial(url.scheme) && c == '\\')) {
+            url.path.push(u8[0]());
+          }
+        } else if (isSingleDot(segment)) {
+          if (c != '/' && !(isSpecial(url.scheme) && c == '\\')) {
+            url.path.push(u8[0]());
+          }
+        } else {
+          if (eqStr(url.scheme, "file") && url.path.len() == 0 && isWindowsDrive(segment)) {
+            // `|` normalises to `:` so the drive letter has one spelling.
+            u8[] fixed = u8[2]();
+            fixed[0] = segment[0];
+            fixed[1] = ':';
+            segment = fixed;
+          }
+          url.path.push(segment);
+        }
+        if (c == '?') {
+          url.query = u8[0]();
+          state = S_QUERY();
+        } else if (c == '#') {
+          url.fragment = u8[0]();
+          state = S_FRAGMENT();
+        }
+      } else {
+        encodeInto(buffer, u8[](c), SET_PATH());
+      }
+
+    } else if (state == S_OPAQUE_PATH()) {
+      if (c == '?') {
+        url.opaquePath = buffer.take();
+        url.query = u8[0]();
+        state = S_QUERY();
+      } else if (c == '#') {
+        url.opaquePath = buffer.take();
+        url.fragment = u8[0]();
+        state = S_FRAGMENT();
+      } else if (eof) {
+        url.opaquePath = buffer.take();
+      } else {
+        encodeInto(buffer, u8[](c), SET_C0());
+      }
+
+    } else if (state == S_QUERY()) {
+      if (eof || c == '#') {
+        url.query = buffer.take();
+        if (c == '#') {
+          url.fragment = u8[0]();
+          state = S_FRAGMENT();
+        }
+      } else {
+        encodeInto(buffer, u8[](c),
+                   isSpecial(url.scheme) ? SET_SPECIAL_QUERY() : SET_QUERY());
+      }
+
+    } else if (state == S_FRAGMENT()) {
+      if (eof) {
+        url.fragment = buffer.take();
+      } else {
+        encodeInto(buffer, u8[](c), SET_FRAGMENT());
+      }
+    }
+
+    pointer++;
+  }
+  return url;
+}
+
+/** The bytes of a host, for the `localhost` comparison. Non-names compare unequal. */
+u8[] hostBytes(Host h) {
+  return match (h) {
+    case Named(name): name,
+    case Ipv4(address): u8[0](),
+    case Ipv6(pieces): u8[0](),
+  };
+}
+
+Vec<u8[]> copyPath(Vec<u8[]> p) {
+  Vec<u8[]> out = Vec.create();
+  for (i32 i = 0; i < p.len(); i++) { out.push(p.get(i)); }
+  return out;
+}
+
+// ── Serialization ──────────────────────────────────────────────────────────────────────
+
+void writeDecimal(Buf out, i32 v) {
+  if (v == 0) { out.push('0'); return; }
+  u8[] tmp = u8[6]();
+  i32 n = 0;
+  i32 x = v;
+  while (x > 0) { tmp[n] = 48 + (x % 10); x = x / 10; n++; }
+  for (i32 i = n - 1; i >= 0; i--) { out.push(tmp[i]); }
+}
+
+/** The href: scheme, authority if there is one, path, query, fragment. */
+export u8[] serialize(Url url) {
+  Buf out = Buf.create();
+  out.pushAll(url.scheme);
+  out.push(':');
+  if (url.host is not null) {
+    out.push('/');
+    out.push('/');
+    if (url.username.len() > 0 || url.password.len() > 0) {
+      out.pushAll(url.username);
+      if (url.password.len() > 0) {
+        out.push(':');
+        out.pushAll(url.password);
+      }
+      out.push('@');
+    }
+    writeHost(out, url.host!);
+    if (url.port >= 0) {
+      out.push(':');
+      writeDecimal(out, url.port);
+    }
+  } else if (!url.hasOpaquePath && url.path.len() > 1 && url.path.get(0).len() == 0) {
+    // A path starting with two slashes and no host would re-parse as an authority, so the
+    // standard inserts `/.` to keep the round trip honest.
+    out.push('/');
+    out.push('.');
+  }
+  if (url.hasOpaquePath) {
+    out.pushAll(url.opaquePath);
+  } else {
+    for (i32 i = 0; i < url.path.len(); i++) {
+      out.push('/');
+      out.pushAll(url.path.get(i));
+    }
+  }
+  if (url.query is not null) {
+    out.push('?');
+    out.pushAll(url.query!);
+  }
+  if (url.fragment is not null) {
+    out.push('#');
+    out.pushAll(url.fragment!);
+  }
+  return out.take();
+}
+
+/** Just the path, which is `pathname` — always at least `/` for a special scheme. */
+export u8[] pathname(Url url) {
+  if (url.hasOpaquePath) { return url.opaquePath; }
+  Buf out = Buf.create();
+  for (i32 i = 0; i < url.path.len(); i++) {
+    out.push('/');
+    out.pushAll(url.path.get(i));
+  }
+  return out.take();
+}
+
+export u8[] hostname(Url url) {
+  if (url.host is null) { return u8[0](); }
+  Buf out = Buf.create();
+  writeHost(out, url.host!);
+  return out.take();
+}

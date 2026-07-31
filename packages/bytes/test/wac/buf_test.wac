@@ -245,3 +245,24 @@ export string test_to_str() {
   t.eqStr(empty.toStr(), "", "and the empty buffer");
   return t.report();
 }
+
+export string test_take_empties_the_buffer_when_it_copies() {
+  T t = T.create();
+  // The other `take` test covers the exactly-full case, where the buffer's own array is handed
+  // over and the reset is obvious. The copy path — every other length — did not reset, so `take`
+  // left the contents in place and the next push appended to bytes the caller had been given.
+  //
+  // Found by packages/url, the first caller to reuse a Buf across several takes: it parses a
+  // scheme, takes it, then accumulates the authority in the same buffer, and got "foo" glued to
+  // the front of every later field.
+  Buf b = Buf.create();
+  b.pushAll(u8[]('f', 'o', 'o'));
+  u8[] first = b.take();
+  t.eqBytes(first, u8[]('f', 'o', 'o'), "take returns what was pushed");
+  t.eqI32(b.len, 0, "and empties the buffer, even though it was not full");
+
+  b.pushAll(u8[]('b', 'a', 'r'));
+  t.eqBytes(b.take(), u8[]('b', 'a', 'r'), "so the next take sees only the new bytes");
+  t.eqBytes(first, u8[]('f', 'o', 'o'), "and the first result is untouched");
+  return t.report();
+}

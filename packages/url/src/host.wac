@@ -1,0 +1,425 @@
+// Host parsing and serialization.
+//
+// Three representations, because the standard round-trips two of them through a canonical form
+// rather than through the input: `0x7f.1` and `127.1` are both the address `127.0.0.1` and
+// serialize as that, and `[0:0::1]` serializes as `[::1]`. A name is kept as bytes.
+//
+// Not implemented: IDNA. A domain containing non-ASCII should be run through UTS-46 ToASCII,
+// which needs Unicode mapping tables; instead such a domain is rejected. That is a divergence
+// from the standard rather than an approximation of it, and the tests assert exactly where the
+// boundary falls rather than skipping the cases — see the package README.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { decode, encodeInto, SET_C0 } from "./percent.wac";
+
+/**
+ * A parsed host.
+ *
+ * `Named` covers a domain, an opaque host and the empty host together: they differ in how they
+ * are *parsed* and validated, but all three serialize as their own bytes, so keeping them apart
+ * afterwards would be a distinction nothing reads.
+ */
+export enum Host {
+  Named(u8[] name),
+  Ipv4(u32 address),
+  // Eight 16-bit pieces, held in an i32[] because wac has no u16 and the values are small.
+  Ipv6(i32[] pieces),
+}
+
+/** U+0000, tab, LF, CR, space, and the punctuation that would end the host in a URL. */
+export bool isForbiddenHost(i32 c) {
+  return c == 0x00 || c == 0x09 || c == 0x0A || c == 0x0D || c == ' '
+      || c == '#' || c == '/' || c == ':' || c == '<' || c == '>' || c == '?'
+      || c == '@' || c == '[' || c == '\\' || c == ']' || c == '^' || c == '|';
+}
+
+/** The above, plus C0 controls, `%` and DEL — a domain may not carry an escape at all. */
+bool isForbiddenDomain(i32 c) {
+  return isForbiddenHost(c) || c < 0x20 || c == '%' || c == 0x7F;
+}
+
+bool isDigit(i32 c) { return c >= '0' && c <= '9'; }
+bool isHex(i32 c) { return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+
+i32 hexVal(i32 c) {
+  if (isDigit(c)) { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  return c - 'A' + 10;
+}
+
+// ── IPv4 ───────────────────────────────────────────────────────────────────────────────
+
+/** One dot-separated part, as a number, or -1 for a syntax error. Traps nothing. */
+struct Part {
+  i64 value;
+  bool ok;
+  // A number too wide to be an address is still a *number*: it makes the host end in one, and
+  // so selects the IPv4 path, which then rejects it. Failing to parse it here instead would
+  // send `http://0x100000000/` down the domain path and accept it as a name.
+  bool overflow;
+}
+
+/**
+ * A single IPv4 part.
+ *
+ * Three radixes, chosen by prefix, which is what makes `0x7f.1`, `0177.1` and `127.1` the same
+ * address. An empty string after a radix prefix is zero — `0x` alone is 0 — but an empty part
+ * with no prefix is a failure.
+ */
+Part parseIpv4Number(u8[] s) {
+  if (s.len() == 0) { return Part(0, false, false); }
+  i32 radix = 10;
+  i32 i = 0;
+  if (s.len() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+    radix = 16;
+    i = 2;
+  } else if (s.len() >= 2 && s[0] == '0') {
+    radix = 8;
+    i = 1;
+  }
+  // `0`, `0x` and `00` all reduce to zero once the prefix is taken off.
+  if (i >= s.len()) { return Part(0, true, false); }
+
+  i64 value = 0;
+  bool overflow = false;
+  while (i < s.len()) {
+    i32 c = s[i];
+    i32 d = -1;
+    if (radix == 16) {
+      if (!isHex(c)) { return Part(0, false, false); }
+      d = hexVal(c);
+    } else {
+      if (!isDigit(c)) { return Part(0, false, false); }
+      d = c - '0';
+      if (radix == 8 && d > 7) { return Part(0, false, false); }
+    }
+    if (!overflow) {
+      value = value * (radix as i64) + (d as i64);
+      // Clamped rather than wrapped: the exact value stops mattering once it is too wide, and
+      // a long run of digits would otherwise overflow the accumulator itself.
+      if (value > 4294967295) { overflow = true; }
+    }
+    i++;
+  }
+  return Part(value, true, overflow);
+}
+
+/** Whether the last dot-separated part is entirely a number, which is what selects IPv4. */
+export bool endsInNumber(u8[] s) {
+  i32 start = 0;
+  i32 end = s.len();
+  // A single trailing dot is allowed and ignored, so look at the part before it.
+  if (end > 0 && s[end - 1] == '.') { end--; }
+  for (i32 i = end - 1; i >= 0; i--) {
+    if (s[i] == '.') { start = i + 1; break; }
+  }
+  if (start >= end) { return false; }
+  u8[] last = slicing(s, start, end);
+  // Either every byte is a digit, or it is a valid hex-prefixed number.
+  bool allDigits = true;
+  for (i32 i = 0; i < last.len(); i++) {
+    if (!isDigit(last[i])) { allDigits = false; }
+  }
+  if (allDigits) { return true; }
+  // Anything the number parser accepts counts, which is what makes `0x7f` and `0177` hosts
+  // into addresses rather than names.
+  return parseIpv4Number(last).ok;
+}
+
+u8[] slicing(u8[] s, i32 lo, i32 hi) {
+  if (hi < lo) { hi = lo; }
+  u8[] out = u8[hi - lo]();
+  for (i32 i = lo; i < hi; i++) { out[i - lo] = s[i]; }
+  return out;
+}
+
+/**
+ * IPv4 from a domain that ends in a number. Null if it is not one after all.
+ *
+ * Fewer than four parts means the last one spans the remaining bytes: `127.1` is 127.0.0.1 and
+ * `2130706433` is the same address written whole.
+ */
+export Host? parseIpv4(u8[] s) {
+  i32 end = s.len();
+  if (end > 0 && s[end - 1] == '.') { end--; }
+
+  // Split into at most five, so a fifth is detectable as a failure.
+  i32[] starts = i32[6]();
+  i32 n = 0;
+  i32 lo = 0;
+  for (i32 i = 0; i <= end; i++) {
+    if (i == end || s[i] == '.') {
+      if (n >= 5) { return null; }
+      starts[n] = lo;
+      starts[n + 1] = i;
+      n++;
+      lo = i + 1;
+    }
+  }
+  if (n > 4) { return null; }
+
+  i64[] parts = i64[4]();
+  for (i32 k = 0; k < n; k++) {
+    // Parts are recomputed rather than read back out of `starts`, since there are at most four.
+    Part p = parseIpv4Number(partBytes(s, starts, k, end));
+    if (!p.ok || p.overflow) { return null; }
+    parts[k] = p.value;
+  }
+
+  // Every part but the last is one byte; the last takes whatever is left.
+  for (i32 k = 0; k < n - 1; k++) {
+    if (parts[k] > 255) { return null; }
+  }
+  i64 limit = 1;
+  for (i32 k = 0; k < 5 - n; k++) { limit = limit * 256; }
+  if (parts[n - 1] >= limit) { return null; }
+
+  u64 addr = parts[n - 1] as@ u64;
+  for (i32 k = 0; k < n - 1; k++) {
+    addr = addr + ((parts[k] as@ u64) << (((3 - k) * 8) as i64) as@ u64);
+  }
+  return Host.Ipv4(addr as@ u32);
+}
+
+/** The k-th dot-separated part of `s`, recomputed rather than stored, since there are ≤4. */
+u8[] partBytes(u8[] s, i32[] starts, i32 k, i32 end) {
+  i32 seen = 0;
+  i32 lo = 0;
+  for (i32 i = 0; i <= end; i++) {
+    if (i == end || s[i] == '.') {
+      if (seen == k) { return slicing(s, lo, i); }
+      seen++;
+      lo = i + 1;
+    }
+  }
+  return u8[0]();
+}
+
+// ── IPv6 ───────────────────────────────────────────────────────────────────────────────
+
+/**
+ * IPv6 from the bytes *between* the brackets. Null on any syntax error.
+ *
+ * Follows the standard's parser directly, including the trailing dotted-quad form
+ * (`::ffff:127.0.0.1`), which writes two pieces at a time.
+ */
+export Host? parseIpv6(u8[] s) {
+  i32[] pieces = i32[8]();
+  i32 pieceIndex = 0;
+  i32 compress = -1;
+  i32 i = 0;
+
+  if (i < s.len() && s[i] == ':') {
+    if (i + 1 >= s.len() || s[i + 1] != ':') { return null; }
+    i = i + 2;
+    pieceIndex++;
+    compress = pieceIndex;
+  }
+
+  while (i < s.len()) {
+    if (pieceIndex == 8) { return null; }
+    if (s[i] == ':') {
+      if (compress >= 0) { return null; }
+      i++;
+      pieceIndex++;
+      compress = pieceIndex;
+      continue;
+    }
+
+    i32 value = 0;
+    i32 length = 0;
+    while (length < 4 && i < s.len() && isHex(s[i])) {
+      value = value * 16 + hexVal(s[i]);
+      i++;
+      length++;
+    }
+
+    if (i < s.len() && s[i] == '.') {
+      // A dotted quad, which must be the last thing and fills the final two pieces.
+      if (length == 0) { return null; }
+      i = i - length;
+      if (pieceIndex > 6) { return null; }
+      i32 numbersSeen = 0;
+      while (i < s.len()) {
+        i32 ipv4Piece = -1;
+        if (numbersSeen > 0) {
+          if (s[i] == '.' && numbersSeen < 4) { i++; } else { return null; }
+        }
+        if (i >= s.len() || !isDigit(s[i])) { return null; }
+        while (i < s.len() && isDigit(s[i])) {
+          i32 d = s[i] - '0';
+          if (ipv4Piece < 0) {
+            ipv4Piece = d;
+          } else if (ipv4Piece == 0) {
+            return null;                       // a leading zero is not allowed here
+          } else {
+            ipv4Piece = ipv4Piece * 10 + d;
+          }
+          if (ipv4Piece > 255) { return null; }
+          i++;
+        }
+        pieces[pieceIndex] = pieces[pieceIndex] * 256 + ipv4Piece;
+        numbersSeen++;
+        if (numbersSeen == 2 || numbersSeen == 4) { pieceIndex++; }
+      }
+      if (numbersSeen != 4) { return null; }
+      break;
+    }
+
+    if (i < s.len()) {
+      if (s[i] != ':') { return null; }
+      i++;
+      if (i >= s.len()) { return null; }       // a trailing single colon
+    }
+    pieces[pieceIndex] = value;
+    pieceIndex++;
+  }
+
+  if (compress >= 0) {
+    // Slide everything after the `::` down to the end.
+    i32 swaps = pieceIndex - compress;
+    pieceIndex = 7;
+    while (pieceIndex != 0 && swaps > 0) {
+      i32 tmp = pieces[compress + swaps - 1];
+      pieces[compress + swaps - 1] = pieces[pieceIndex];
+      pieces[pieceIndex] = tmp;
+      pieceIndex--;
+      swaps--;
+    }
+  } else if (pieceIndex != 8) {
+    return null;
+  }
+  return Host.Ipv6(pieces);
+}
+
+// ── Entry points ───────────────────────────────────────────────────────────────────────
+
+/**
+ * A host for a non-special scheme: no IDNA, no IPv4, percent-encoded rather than decoded.
+ *
+ * Brackets still mean IPv6, which is why this is not simply "the bytes".
+ */
+export Host? parseOpaqueHost(u8[] s) {
+  if (s.len() > 0 && s[0] == '[') {
+    if (s[s.len() - 1] != ']') { return null; }
+    return parseIpv6(slicing(s, 1, s.len() - 1));
+  }
+  for (i32 i = 0; i < s.len(); i++) {
+    if (isForbiddenHost(s[i])) { return null; }
+  }
+  Buf out = Buf.create();
+  encodeInto(out, s, SET_C0());
+  return Host.Named(out.take());
+}
+
+/**
+ * A host for a special scheme: percent-decoded, lowercased, and IPv4 if it looks like one.
+ *
+ * `isAscii` reports whether IDNA would have been needed. The caller decides what to do about
+ * it — this returns null either way, and the flag is what lets the tests tell a real syntax
+ * error apart from the gap.
+ */
+export struct HostResult {
+  Host? host;
+  bool neededIdna;
+}
+
+export HostResult parseHost(u8[] s, bool special) {
+  if (s.len() > 0 && s[0] == '[') {
+    if (s[s.len() - 1] != ']') { return HostResult(null, false); }
+    return HostResult(parseIpv6(slicing(s, 1, s.len() - 1)), false);
+  }
+  if (!special) { return HostResult(parseOpaqueHost(s), false); }
+  if (s.len() == 0) { return HostResult(Host.Named(u8[0]()), false); }
+
+  u8[] decoded = decode(s);
+  // ASCII-lowercase, which is all of IDNA that is implemented here.
+  Buf lowered = Buf.create();
+  bool ascii = true;
+  for (i32 i = 0; i < decoded.len(); i++) {
+    i32 c = decoded[i];
+    if (c > 0x7F) { ascii = false; }
+    lowered.push(c >= 'A' && c <= 'Z' ? c + 32 : c);
+  }
+  if (!ascii) { return HostResult(null, true); }
+
+  u8[] domain = lowered.take();
+  for (i32 i = 0; i < domain.len(); i++) {
+    if (isForbiddenDomain(domain[i])) { return HostResult(null, false); }
+  }
+  if (endsInNumber(domain)) { return HostResult(parseIpv4(domain), false); }
+  return HostResult(Host.Named(domain), false);
+}
+
+// ── Serialization ──────────────────────────────────────────────────────────────────────
+
+void writeU32Decimal(Buf out, u32 v) {
+  if (v == 0) { out.push('0'); return; }
+  u8[] tmp = u8[10]();
+  i32 n = 0;
+  u32 x = v;
+  while (x > 0) {
+    tmp[n] = 48 + ((x % 10) as@ i32);
+    x = x / 10;
+    n++;
+  }
+  for (i32 i = n - 1; i >= 0; i--) { out.push(tmp[i]); }
+}
+
+void writeHexLower(Buf out, i32 v) {
+  if (v == 0) { out.push('0'); return; }
+  u8[] tmp = u8[4]();
+  i32 n = 0;
+  i32 x = v;
+  while (x > 0) {
+    i32 d = x & 15;
+    tmp[n] = d < 10 ? 48 + d : 87 + d;
+    x = x >> 4;
+    n++;
+  }
+  for (i32 i = n - 1; i >= 0; i--) { out.push(tmp[i]); }
+}
+
+/** Append the host in its canonical form, brackets included for IPv6. */
+export void writeHost(Buf out, Host h) {
+  match (h) {
+    case Named(name): out.pushAll(name);
+    case Ipv4(address): {
+      // Most significant octet first, which is the reverse of how it was accumulated.
+      for (i32 i = 3; i >= 0; i--) {
+        writeU32Decimal(out, (address >> ((i * 8) as@ u32)) & 255);
+        if (i > 0) { out.push('.'); }
+      }
+    }
+    case Ipv6(pieces): {
+      out.push('[');
+      // The longest run of two or more zero pieces is replaced by `::`; ties go to the first.
+      i32 bestStart = -1;
+      i32 bestLen = 1;
+      i32 runStart = -1;
+      for (i32 i = 0; i < 8; i++) {
+        if (pieces[i] == 0) {
+          if (runStart < 0) { runStart = i; }
+          i32 runLen = i - runStart + 1;
+          if (runLen > bestLen) { bestLen = runLen; bestStart = runStart; }
+        } else {
+          runStart = -1;
+        }
+      }
+      bool ignoreZero = false;
+      for (i32 i = 0; i < 8; i++) {
+        if (ignoreZero && pieces[i] == 0) { continue; }
+        if (ignoreZero) { ignoreZero = false; }
+        if (i == bestStart) {
+          out.push(':');
+          if (i == 0) { out.push(':'); }
+          ignoreZero = true;
+          continue;
+        }
+        writeHexLower(out, pieces[i]);
+        if (i != 7) { out.push(':'); }
+      }
+      out.push(']');
+    }
+  }
+}
