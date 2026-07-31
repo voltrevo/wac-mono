@@ -1,0 +1,329 @@
+// DEFLATE decompressor (RFC 1951) and gzip reader (RFC 1952).
+//
+// Decoding is the mirror of encoding, with one asymmetry that matters: the
+// decoder is fed bytes it did not produce, so every field is untrusted. Bad
+// input must trap rather than read out of bounds or loop forever.
+
+import { Buf } from "./buf.wac";
+import { Tables } from "./tables.wac";
+import { crc32 } from "./crc32.wac";
+
+i32 maxBits() { return 15; }
+
+// ── Bit reader ────────────────────────────────────────────────────────────────
+
+/**
+ * LSB-first bit reader, the counterpart of BitWriter. Huffman codes are read one
+ * bit at a time and accumulated most-significant-bit first, matching how they
+ * were written.
+ */
+struct BitReader {
+  i8[] data;
+  i32 pos;       // next byte to consume
+  i32 bitBuf;
+  i32 bitCount;
+
+  BitReader create(i8[] data, i32 start) {
+    return BitReader(data, start, 0, 0);
+  }
+
+  i32 readBit(this) {
+    if (this.bitCount == 0) {
+      if (this.pos >= this.data.len()) { trap; }   // truncated stream
+      this.bitBuf = this.data[this.pos];
+      this.pos++;
+      this.bitCount = 8;
+    }
+    i32 bit = this.bitBuf & 1;
+    this.bitBuf >>>= 1;
+    this.bitCount--;
+    return bit;
+  }
+
+  i32 readBits(this, i32 count) {
+    i32 v = 0;
+    for (i32 i = 0; i < count; i++) {
+      v |= this.readBit() << i;
+    }
+    return v;
+  }
+
+  void alignByte(this) {
+    this.bitBuf = 0;
+    this.bitCount = 0;
+  }
+}
+
+// ── Canonical Huffman decoding ────────────────────────────────────────────────
+
+/**
+ * A canonical code, stored the way it is decoded rather than the way it is
+ * built: a count of codes per length, plus the symbols ordered by (length,
+ * symbol). Because canonical codes are numerically ordered within a length,
+ * that is enough to walk bit by bit without materialising a table — the
+ * approach zlib's `puff` reference decoder uses.
+ */
+struct Decoder {
+  i32[] count;    // count[len], len 0..15
+  i32[] symbol;   // symbols sorted by (len, symbol)
+
+  Decoder build(i32[] lengths, i32 n) {
+    i32[] count = i32[maxBits() + 1]();
+    for (i32 i = 0; i < n; i++) {
+      count[lengths[i]]++;
+    }
+    count[0] = 0;   // unused symbols are not codes
+
+    // Offset of each length's first symbol in the sorted table.
+    i32[] offs = i32[maxBits() + 2]();
+    for (i32 len = 1; len <= maxBits(); len++) {
+      offs[len + 1] = offs[len] + count[len];
+    }
+
+    i32[] symbol = i32[n]();
+    for (i32 i = 0; i < n; i++) {
+      if (lengths[i] > 0) {
+        symbol[offs[lengths[i] + 1 - 1]] = i;
+        offs[lengths[i] + 1 - 1]++;
+      }
+    }
+    return Decoder(count, symbol);
+  }
+
+  /**
+   * Read one symbol. `code` accumulates the bits seen so far; `first` is the
+   * first code of the current length and `index` its position in the symbol
+   * table. If the accumulated code falls inside this length's range, it names a
+   * symbol; otherwise advance to the next length.
+   */
+  i32 decode(const this, BitReader br) {
+    i32 code = 0;
+    i32 first = 0;
+    i32 index = 0;
+    for (i32 len = 1; len <= maxBits(); len++) {
+      code |= br.readBit();
+      i32 count = this.count[len];
+      if (code - first < count) {
+        return this.symbol[index + (code - first)];
+      }
+      index += count;
+      first = (first + count) << 1;
+      code <<= 1;
+    }
+    trap;   // no code matched in 15 bits — corrupt stream
+  }
+}
+
+// ── Fixed and dynamic code construction ───────────────────────────────────────
+
+/** The fixed literal/length code lengths, RFC 1951 section 3.2.6. */
+i32[] fixedLitLengths() {
+  i32[] lengths = i32[288]();
+  for (i32 i = 0; i <= 143; i++)   { lengths[i] = 8; }
+  for (i32 i = 144; i <= 255; i++) { lengths[i] = 9; }
+  for (i32 i = 256; i <= 279; i++) { lengths[i] = 7; }
+  for (i32 i = 280; i <= 287; i++) { lengths[i] = 8; }
+  return lengths;
+}
+
+i32[] fixedDistLengths() {
+  i32[] lengths = i32[30]();
+  for (i32 i = 0; i < 30; i++) {
+    lengths[i] = 5;
+  }
+  return lengths;
+}
+
+i32[] clOrder() {
+  return i32[](16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);
+}
+
+/**
+ * Read a dynamic block's two code tables. Returns the literal/length lengths
+ * followed by the distance lengths, with the split at `hlit` — returned via the
+ * array's own layout because wac has no tuples.
+ */
+i32[] readDynamicLengths(BitReader br, i32[] outSplit) {
+  i32 hlit = br.readBits(5) + 257;
+  i32 hdist = br.readBits(5) + 1;
+  i32 hclen = br.readBits(4) + 4;
+  if (hlit > 286 || hdist > 30) { trap; }   // beyond what the format defines
+
+  // The code-length code, sent in a fixed permuted order.
+  i32[] order = clOrder();
+  i32[] clLengths = i32[19]();
+  for (i32 i = 0; i < hclen; i++) {
+    clLengths[order[i]] = br.readBits(3);
+  }
+  Decoder cl = Decoder.build(clLengths, 19);
+
+  // Both tables arrive as one run-length encoded sequence.
+  i32 total = hlit + hdist;
+  i32[] lengths = i32[total]();
+  i32 i = 0;
+  while (i < total) {
+    i32 sym = cl.decode(br);
+    if (sym < 16) {
+      lengths[i] = sym;
+      i++;
+    } else if (sym == 16) {
+      if (i == 0) { trap; }                 // nothing to repeat
+      i32 prev = lengths[i - 1];
+      i32 run = br.readBits(2) + 3;
+      for (i32 k = 0; k < run; k++) {
+        if (i >= total) { trap; }           // run overflows the table
+        lengths[i] = prev;
+        i++;
+      }
+    } else if (sym == 17) {
+      i32 run = br.readBits(3) + 3;
+      for (i32 k = 0; k < run; k++) {
+        if (i >= total) { trap; }
+        lengths[i] = 0;
+        i++;
+      }
+    } else {
+      i32 run = br.readBits(7) + 11;
+      for (i32 k = 0; k < run; k++) {
+        if (i >= total) { trap; }
+        lengths[i] = 0;
+        i++;
+      }
+    }
+  }
+
+  outSplit[0] = hlit;
+  outSplit[1] = hdist;
+  return lengths;
+}
+
+// ── Block decoding ────────────────────────────────────────────────────────────
+
+/** Decode one Huffman-coded block into `out`, literal by literal and match by match. */
+void inflateBlock(BitReader br, Buf out, Tables t, Decoder lit, Decoder dist) {
+  bool endOfBlock = false;
+  while (!endOfBlock) {
+    i32 sym = lit.decode(br);
+    if (sym < 256) {
+      out.push(sym);
+    } else if (sym == 256) {
+      endOfBlock = true;
+    } else {
+      i32 li = sym - 257;
+      if (li >= 29) { trap; }               // 286 and 287 are not valid lengths
+      i32 len = t.lenBase[li] + br.readBits(t.lenExtra[li]);
+
+      i32 di = dist.decode(br);
+      if (di >= 30) { trap; }
+      i32 d = t.distBase[di] + br.readBits(t.distExtra[di]);
+      if (d > out.len) { trap; }            // reference before the start of output
+
+      // Byte at a time, deliberately: when d < len the copy reads bytes this
+      // same loop is writing, which is how DEFLATE encodes runs. A bulk copy
+      // would read stale bytes.
+      i32 src = out.len - d;
+      for (i32 k = 0; k < len; k++) {
+        out.push(out.get(src + k));
+      }
+    }
+  }
+}
+
+/** Decompress a raw DEFLATE stream starting at `start`. */
+i8[] inflateFrom(i8[] data, i32 start) {
+  BitReader br = BitReader.create(data, start);
+  Buf out = Buf.create();
+  Tables t = Tables.create();
+
+  bool last = false;
+  while (!last) {
+    last = br.readBit() == 1;
+    i32 btype = br.readBits(2);
+
+    if (btype == 0) {
+      // Stored: byte-aligned, with a length and its complement.
+      br.alignByte();
+      if (br.pos + 4 > data.len()) { trap; }
+      i32 len = data[br.pos] | (data[br.pos + 1] << 8);
+      i32 nlen = data[br.pos + 2] | (data[br.pos + 3] << 8);
+      br.pos += 4;
+      if ((len ^ 0xFFFF) != nlen) { trap; }  // the check the format builds in
+      if (br.pos + len > data.len()) { trap; }
+      for (i32 i = 0; i < len; i++) {
+        out.push(data[br.pos + i]);
+      }
+      br.pos += len;
+    } else if (btype == 1) {
+      inflateBlock(br, out, t,
+        Decoder.build(fixedLitLengths(), 288),
+        Decoder.build(fixedDistLengths(), 30));
+    } else if (btype == 2) {
+      i32[] split = i32[2]();
+      i32[] lengths = readDynamicLengths(br, split);
+      i32 hlit = split[0];
+      i32 hdist = split[1];
+
+      i32[] litLengths = i32[hlit]();
+      for (i32 i = 0; i < hlit; i++) {
+        litLengths[i] = lengths[i];
+      }
+      i32[] distLengths = i32[hdist]();
+      for (i32 i = 0; i < hdist; i++) {
+        distLengths[i] = lengths[hlit + i];
+      }
+      inflateBlock(br, out, t,
+        Decoder.build(litLengths, hlit),
+        Decoder.build(distLengths, hdist));
+    } else {
+      trap;   // BTYPE 11 is reserved
+    }
+  }
+
+  return out.bytes();
+}
+
+/** Decompress a raw DEFLATE stream. */
+export i8[] inflate(i8[] data) {
+  return inflateFrom(data, 0);
+}
+
+/**
+ * Read a gzip member: validate the header, inflate the payload, and check both
+ * trailer fields. A CRC or length mismatch traps — silently returning data that
+ * failed its own integrity check would defeat the point of carrying one.
+ */
+export i8[] gunzipBytes(i8[] gz) {
+  if (gz.len() < 18) { trap; }                    // header + empty body + trailer
+  if (gz[0] != 0x1F || gz[1] != 0x8B) { trap; }   // magic
+  if (gz[2] != 8) { trap; }                       // CM must be deflate
+
+  i32 flg = gz[3];
+  i32 pos = 10;                                   // fixed header size
+
+  if ((flg & 4) != 0) {                           // FEXTRA
+    i32 xlen = gz[pos] | (gz[pos + 1] << 8);
+    pos += 2 + xlen;
+  }
+  if ((flg & 8) != 0) {                           // FNAME, NUL-terminated
+    while (pos < gz.len() && gz[pos] != 0) { pos++; }
+    pos++;
+  }
+  if ((flg & 16) != 0) {                          // FCOMMENT, NUL-terminated
+    while (pos < gz.len() && gz[pos] != 0) { pos++; }
+    pos++;
+  }
+  if ((flg & 2) != 0) {                           // FHCRC
+    pos += 2;
+  }
+  if (pos >= gz.len()) { trap; }
+
+  i8[] out = inflateFrom(gz, pos);
+
+  // Trailer: CRC-32 then ISIZE, both little-endian, in the last 8 bytes.
+  i32 n = gz.len();
+  i32 wantCrc = gz[n - 8] | (gz[n - 7] << 8) | (gz[n - 6] << 16) | (gz[n - 5] << 24);
+  i32 wantSize = gz[n - 4] | (gz[n - 3] << 8) | (gz[n - 2] << 16) | (gz[n - 1] << 24);
+  if (crc32(out) != wantCrc) { trap; }
+  if (out.len() != wantSize) { trap; }
+  return out;
+}
