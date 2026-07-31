@@ -18,7 +18,7 @@ deno run --allow-read tools/check.ts packages/json/src/json.wac
 | UTF-8 validity | enforced; agrees with a strict `TextDecoder` |
 | Decimal → f64 | correctly rounded, bit-exact against `Number(s)` |
 | Serializer | done, numbers emitted verbatim |
-| Object key lookup | O(n) linear scan |
+| Object key lookup | linear scan, then a hash index once it pays — see below |
 | Serializing a hand-built tree | done, via `packages/fmt` |
 
 Correctness is judged against the host's own `JSON.parse`/`JSON.stringify` rather
@@ -40,11 +40,56 @@ What changed is the boundary. `JsonString.str()`, `JsonMember.keyStr()` and
 ```wac
 JsonObject o = ...;
 JsonValue? name = o.getStr("name");
-string s = (name! as! JsonString).str();
+match (name!) {
+  case Str(bytes): return string.fromBytes(bytes);
+  else: trap;
+}
 ```
 
-`getStr` converts the key once, outside the scan — `toBytes()` allocates, so
-converting per member would turn an O(n) lookup into an O(n)-allocation lookup.
+`getStr` converts the key once, outside the lookup — `toBytes()` allocates, so
+converting per member would have turned a scan into an allocation per member.
+
+## Object key lookup
+
+`get` scans the member list, and switches to a hash index once an object has served
+16 lookups and has at least 16 members. Both numbers come from
+`deno task bench:json-lookup`, which measures three things: what a scan costs per
+lookup, what an indexed lookup costs, and what the index costs to build.
+
+That third column is the one that decides the design:
+
+| members | scan/lookup | indexed/lookup | index build | break-even |
+|---:|---:|---:|---:|---|
+| 16 | 19 ns | 17 ns | 257 ns | 122 lookups |
+| 32 | 36 ns | 18 ns | 529 ns | 29 lookups |
+| 64 | 83 ns | 16 ns | 1000 ns | 16 lookups |
+| 256 | 280 ns | 18 ns | 3784 ns | 15 lookups |
+| 1024 | 1460 ns | 27 ns | 23494 ns | 17 lookups |
+
+An index is O(n) hashes before it answers anything, so it takes 15-35 lookups of the
+*same object* to repay itself, at every size where it wins at all. Parse a document
+and read three fields and it never pays — which is most JSON use.
+
+So the index is built lazily and only on evidence that this object is being read
+repeatedly. Two earlier designs were wrong and the benchmark said so:
+
+- **Indexing in `push`**, the obvious version, cost **50% of parse throughput on
+  objects with long keys and 68% on nested empty objects**. The second number is the
+  instructive one: `Map.create` allocates an eight-slot table, so every `{}` in a
+  document paid for a table nothing would ever query. A parser creates far more
+  objects than anything looks up.
+- **Indexing on size alone**, lazily, fixed the parse cost but still lost on the
+  common shape — a 100-member object read twice does 100 hashes to save one scan.
+
+`get` therefore takes `this`, not `const this`: it may build the index. Deep const
+makes "logically const, physically memoising" unspellable, since a `const this`
+method cannot write a field even when the write is invisible from outside. The same
+rule pushed `packages/bignum` from methods to free functions.
+
+Duplicate keys stay correct throughout. JSON permits them, member order is
+observable, and `canonicalize` is byte-exact — so the index maps a key to its
+*first* member and the list keeps every one. A `Map<u8[], JsonValue>` on its own
+would silently collapse `{"a":1,"a":2}` to one member.
 
 ## Numbers
 
@@ -120,7 +165,7 @@ and slow on numbers and still look reasonable.
 |---|---:|
 | strings with escapes | 132 |
 | long ASCII strings | 109 |
-| structure only | 40 |
+| structure only | 42 |
 | multi-byte UTF-8 strings | 96 |
 | objects, long keys | 88 |
 | realistic mixed | 80 |
@@ -143,6 +188,15 @@ It is not avoidable within the enum: variants cannot carry methods, so the growa
 part has to be a separate struct, and mutating a payload in place is blocked because
 a matched subject is `const` within its arm.
 
+The same effect is why `std`'s `Vec` is not used here — one more object in the chain,
+measured at 16-20% on these shapes. See point 3 under "What this exercised in the
+language".
+
+A note on measuring any of this: the box is shared with other agents, and a single
+`bench:json` run varies by up to 40% on the object shapes. The numbers above and the
+Vec comparison are best-of-nine, and a difference under about 5% on this hardware
+should not be believed without that.
+
 ## Layout
 
 ```
@@ -152,6 +206,8 @@ src/stringify.wac  serializer
 src/json.wac       entry points shaped for the bindgen boundary
 test/              host-side differential tests
 test/wac/          unit tests written in wac, via the wactest package
+bench/throughput.ts   MB/s by document shape
+bench/lookup.ts       scan vs hash index, and what the index costs to build
 ```
 
 Results cross the bindgen boundary as bytes with a status byte in front. Only
@@ -171,11 +227,22 @@ how much each cost:
    `string.toBytes` were all added because of this package. The last of them
    deleted a 40-line ASCII lookup table from the tests that existed purely because
    nothing converted text to bytes.
-3. **No generics.** `JsonArray.items` and `JsonObject.members` are the same
-   double-when-full logic twice, differing only in element type. The byte buffer
-   was a third copy and `gzip`'s was a fourth; those two are now one shared
-   `packages/bytes`, which is as far as the deduplication can go without generics
-   — the two ref-element containers still cannot be shared with it or each other.
+3. **No generics — fixed, and it did not help here.** wac has generics now, and
+   `std` has `Vec<T>`. Swapping `JsonObject`'s member list to `Vec<JsonMember>`
+   cost **16-20% of throughput** on object- and container-heavy documents, because
+   a reusable container has to be its own object: every JSON object paid an extra
+   allocation, and every member access an extra hop, where the array had sat
+   directly in the struct. An inline array measured within 2% of baseline on every
+   shape. So both growable cases here are still hand-written, and the duplication
+   between them is the price of that 16-20%.
+
+   `Map` is the opposite verdict and is used — see the lookup section. The
+   difference is that a map has nothing to inline, and its alternative was O(n).
+
+   Worth being blunt about, since "no generics" was this repo's top-ranked language
+   gap for months and *this file* was the example most often cited. The gap was
+   real; the fix pays for code reuse, not for speed, and the container it was argued
+   from is the one that wants to stay hand-written.
 4. **No module-level constants.** Kind tags are zero-argument functions; the
    powers-of-ten table is a `switch` returning literals.
 5. **No sum types — fixed.** `JsonValue` is now an `enum` and every fold is a

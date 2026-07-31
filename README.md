@@ -67,6 +67,7 @@ deno task coverage:std   # branch coverage of std
 deno task mutate      # mutation testing
 deno task bench       # gzip throughput
 deno task bench:json  # json throughput, by document shape
+deno task bench:json-lookup # json object lookup: scan vs hash index
 deno task verify:fmt  # fmt exactness over 500k doubles, both directions
 
 deno run --allow-read tools/check.ts <entry.wac>    # type-check one file, no run

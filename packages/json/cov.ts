@@ -84,6 +84,21 @@ for (const d of [1, 399, 400, 500]) {
   errorCode(enc.encode("[".repeat(d) + "]".repeat(d)));
 }
 
+/**
+ * The lookup index: both sides of the threshold, and a push after it is built.
+ *
+ * `get` scans until an object has served `INDEX_MIN_SCANS` lookups and has at least
+ * `INDEX_MIN_MEMBERS` members, then indexes. The indexed path, the build, and index
+ * maintenance in `push` are all unreachable from a workload that looks something up once —
+ * which every other exercise in this file does.
+ */
+const indexRun = await instrument("packages/json/test/wac/json_test.wac");
+for (const [name, fn] of Object.entries(indexRun.mod)) {
+  if (!name.startsWith("test") || typeof fn !== "function") continue;
+  const failure = (fn as () => string)();
+  if (failure !== "") throw new Error(`${name} failed during coverage: ${failure}`);
+}
+
 /** Containers big enough to grow several times, and lookup hits and misses. */
 canonicalize(enc.encode(`[${Array.from({ length: 200 }, (_, i) => i).join(",")}]`));
 canonicalize(enc.encode(`{${Array.from({ length: 200 }, (_, i) => `"k${i}":${i}`).join(",")}}`));
@@ -97,18 +112,11 @@ canonicalize(enc.encode('{"a":1,"a":2}'));
  * report over the public API alone shows those as dead, which is the opposite of the
  * truth: they are tested, just not from here.
  */
-const testRun = await instrument("packages/json/test/wac/json_test.wac");
-for (const [name, fn] of Object.entries(testRun.mod)) {
-  if (!name.startsWith("test") || typeof fn !== "function") continue;
-  const failure = (fn as () => string)();
-  if (failure !== "") throw new Error(`${name} failed during coverage: ${failure}`);
-}
-
 /** The bounds traps, which need one call each from the host to observe. */
 const bounds = await instrument("packages/json/test/bounds.wac");
 for (const name of ["arrayPastEnd", "arrayNegative", "objectPastEnd", "objectNegative", "arrayOk"]) {
   try { (bounds.mod[name] as () => number)(); } catch { /* the trap is the point */ }
 }
 
-const { total, covered } = report([run, testRun, bounds], "packages/json/", { verbose });
+const { total, covered } = report([run, indexRun, bounds], "packages/json/", { verbose });
 if (covered < total) Deno.exit(0); // reporting tool, not a gate

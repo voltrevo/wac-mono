@@ -9,7 +9,7 @@
 // which is the difference between this and the switch-on-tag it replaced, where a
 // forgotten case fell through to `trap` at run time.
 
-import { JsonValue } from "./value.wac";
+import { JsonValue, JsonMember } from "./value.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { writeF64 } from "../../fmt/src/ftoa.wac";
 
@@ -44,7 +44,7 @@ export void writeValue(Buf out, JsonValue v) {
       out.push('[');
       for (i32 i = 0; i < items.len(); i++) {
         if (i > 0) { out.push(','); }
-        writeValue(out, items.at(i));
+        writeValue(out, items.get(i));
       }
       out.push(']');
     }
@@ -52,9 +52,12 @@ export void writeValue(Buf out, JsonValue v) {
       out.push('{');
       for (i32 i = 0; i < members.len(); i++) {
         if (i > 0) { out.push(','); }
-        writeString(out, members.at(i).key);
+        // Fetched once: `at` is a bounds-checked call through the member Vec, and asking
+        // twice per member was measurable on object-heavy documents.
+        JsonMember m = members.at(i);
+        writeString(out, m.key);
         out.push(':');
-        writeValue(out, members.at(i).value);
+        writeValue(out, m.value);
       }
       out.push('}');
     }

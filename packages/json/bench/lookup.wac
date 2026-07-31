@@ -1,0 +1,91 @@
+// Both lookup paths, exposed separately so the threshold in `JsonObject.INDEX_MIN` is a
+// measurement rather than a guess.
+//
+// `scan` and `get` are the same query; the only difference is whether a hash index is built
+// and used. Each entry point does `reps` lookups over an object of `n` members so the loop
+// is inside wasm and the bindgen crossing is amortised away.
+
+import { JsonValue, JsonObject, numberOf } from "../src/value.wac";
+
+/**
+ * An object with `n` members keyed "k0".."k(n-1)".
+ *
+ * Keys are short and share a prefix, which is the realistic bad case: a scan's early-exit on
+ * length never fires, so it compares bytes.
+ */
+JsonObject build(i32 n) {
+  JsonObject o = JsonObject.create();
+  for (i32 i = 0; i < n; i++) {
+    o.push(("k" + itoaLocal(i)).toBytes(), numberOf(i as f64));
+  }
+  return o;
+}
+
+// A local itoa so the bench does not depend on packages/fmt.
+string itoaLocal(i32 v) {
+  if (v == 0) { return "0"; }
+  string out = "";
+  i32 n = v;
+  while (n > 0) {
+    out = string.fromCodepoint(48 + (n % 10)) + out;
+    n = n / 10;
+  }
+  return out;
+}
+
+/** `reps` scans, cycling through every key so the average is over all positions. */
+export i32 scanKeys(i32 n, i32 reps) {
+  JsonObject o = build(n);
+  u8[][] keys = u8[][n]();
+  for (i32 i = 0; i < n; i++) { keys[i] = ("k" + itoaLocal(i)).toBytes(); }
+  i32 hits = 0;
+  for (i32 r = 0; r < reps; r++) {
+    JsonValue? v = o.scan(keys[r % n]);
+    if (v is not null) { hits++; }
+  }
+  return hits;
+}
+
+/** The same, through `get` — so above the threshold it builds an index once and uses it. */
+export i32 getKeys(i32 n, i32 reps) {
+  JsonObject o = build(n);
+  u8[][] keys = u8[][n]();
+  for (i32 i = 0; i < n; i++) { keys[i] = ("k" + itoaLocal(i)).toBytes(); }
+  i32 hits = 0;
+  for (i32 r = 0; r < reps; r++) {
+    JsonValue? v = o.get(keys[r % n]);
+    if (v is not null) { hits++; }
+  }
+  return hits;
+}
+
+/** Forces the indexed path regardless of size, so the crossover can be seen from below. */
+export i32 indexedKeys(i32 n, i32 reps) {
+  JsonObject o = build(n);
+  o.buildIndex();
+  u8[][] keys = u8[][n]();
+  for (i32 i = 0; i < n; i++) { keys[i] = ("k" + itoaLocal(i)).toBytes(); }
+  i32 hits = 0;
+  for (i32 r = 0; r < reps; r++) {
+    JsonValue? v = o.get(keys[r % n]);
+    if (v is not null) { hits++; }
+  }
+  return hits;
+}
+
+/**
+ * Just the index build, repeated.
+ *
+ * The number the steady-state columns hide: an index costs O(n) hashes before it answers
+ * anything, and a document looked up once pays that instead of half a scan. This is what makes
+ * a threshold worth having rather than always indexing.
+ */
+export i32 buildOnly(i32 n, i32 reps) {
+  JsonObject o = build(n);
+  i32 acc = 0;
+  for (i32 r = 0; r < reps; r++) {
+    o.buildIndex();
+    acc = acc + o.len();
+  }
+  return acc;
+}

@@ -5,21 +5,28 @@
 // downcast in every arm — four constructs standing in for one, and the compiler
 // could not tell you when a fold forgot a case.
 //
-// Two things the enum cannot do, which shape what is below.
+// Both growable cases still hold hand-written storage, and that is a measured decision rather
+// than a leftover. `std`'s `Vec<JsonMember>` was tried here and cost **16-20% of throughput
+// on object- and container-heavy documents** (`deno task bench:json`, best of nine runs):
+// a reusable container has to be its own object, so every JSON object paid one extra
+// allocation and every member access one extra hop, where the array used to sit directly in
+// the struct. An inline array measured within 2% of baseline on every shape.
 //
-// Variants carry no methods, so the two growable cases keep their storage and
-// growth in ordinary structs — `JsonArray` and `JsonObject` — and the variant holds
-// one of those. That recursion runs enum -> struct -> array-of-enum and neither
-// declaration precedes the other, which is `[§enum-recursive-via-struct]`.
-//
-// `match` is a statement rather than an expression, so a fold assigns into a local
-// or returns from each arm rather than yielding a value.
+// So generics bought this file one thing and not the other. `Map` earns its place — see
+// `JsonObject.index`, where the alternative was an O(n) scan and there is nothing to inline.
+// `Vec` does not, at this call frequency. That is worth stating plainly because "no generics"
+// was this repo's top-ranked language gap for months, and the container it was most often
+// argued from is the one that does not want them.
 //
 // Strings are held as UTF-8 `u8[]`, not the built-in `string`. That began as a
 // necessity and stays because bytes are right *inside* a parser: scanning is a
 // `switch` over `i32`, and a document's strings accumulate in a buffer instead of
 // allocating a `string` per token. The edge is where they become text —
-// `JsonString.str()`, `JsonMember.keyStr()`, `JsonObject.getStr()`.
+// `JsonMember.keyStr()`, `JsonObject.getStr()`.
+
+import { Map } from "../../std/src/map.wac";
+import { Option } from "../../std/src/option.wac";
+import { hashBytes, bytesEq } from "../../bytes/src/hash.wac";
 
 export enum JsonValue {
   Null,
@@ -31,44 +38,46 @@ export enum JsonValue {
   // serializer formats `value` with packages/fmt, which was written for this.
   Number(f64 value, u8[] raw),
   Str(u8[] bytes),
+  // `Vec<JsonValue>` for the same reasons as the member list, plus one of its own: two
+  // instantiations of a generic where either type argument is an enum compile to invalid wasm
+  // (`wac/issues/0046`), which this hit first.
   Array(JsonArray items),
   Object(JsonObject members),
 }
 
-/** A number with no source span, to be formatted on output rather than copied. */
-export JsonValue numberOf(f64 v) { return JsonValue.Number(v, u8[0]()); }
-
-// Growable array of values. wac has no generics, so this and JsonObject's member
-// list are the same double-when-full logic written twice, differing only in element
-// type — the standing argument for generics, and the reason packages/bytes exists
-// for the one case whose element type is fixed.
+/**
+ * Growable array of values.
+ *
+ * The API is deliberately `Vec`'s — `push`, `len`, `get` — so that swapping to it is an import
+ * and a rename if the throughput ever stops mattering here.
+ */
 export struct JsonArray {
   JsonValue?[] items;
-  i32 count;
+  i32 n;
 
   JsonArray create() { return JsonArray(JsonValue?[0](), 0); }
 
   void push(this, JsonValue v) {
-    if (this.count == this.items.len()) {
-      i32 next = this.items.len() * 2;
-      if (next == 0) { next = 4; }
-      JsonValue?[] grown = JsonValue?[next]();
-      for (i32 i = 0; i < this.count; i++) {
-        grown[i] = this.items[i];
-      }
-      this.items = grown;
+    if (this.n == this.items.len()) {
+      i32 grown = this.items.len() == 0 ? 4 : this.items.len() * 2;
+      JsonValue?[] next = JsonValue?[grown]();
+      for (i32 i = 0; i < this.n; i++) { next[i] = this.items[i]; }
+      this.items = next;
     }
-    this.items[this.count] = v;
-    this.count++;
+    this.items[this.n] = v;
+    this.n++;
   }
 
-  i32 len(const this) { return this.count; }
+  i32 len(const this) { return this.n; }
 
-  JsonValue at(const this, i32 i) {
-    if (i < 0 || i >= this.count) { trap; }
+  JsonValue get(const this, i32 i) {
+    if (i < 0 || i >= this.n) { trap; }
     return this.items[i]!;
   }
 }
+
+/** A number with no source span, to be formatted on output rather than copied. */
+export JsonValue numberOf(f64 v) { return JsonValue.Number(v, u8[0]()); }
 
 export struct JsonMember {
   const u8[] key;
@@ -77,23 +86,64 @@ export struct JsonMember {
   string keyStr(const this) { return string.fromBytes(this.key); }
 }
 
+/**
+ * A JSON object: an ordered list of members, plus an index built only if it pays.
+ *
+ * The **list** is what JSON actually is. Member order is observable — `canonicalize` is
+ * byte-exact — and duplicate keys are legal and must both survive, so `{"a":1,"a":2}` has
+ * two members. A `Map` alone would silently collapse it, which is why this is not simply
+ * `Map<u8[], JsonValue>`.
+ *
+ * The **index** maps a key to the position of its *first* member, which is the one a lookup
+ * returns. It is null until someone actually looks something up, and is not built at all for
+ * an object small enough that scanning is cheaper.
+ *
+ * Both of those conditions are measured rather than assumed, and getting them wrong is
+ * expensive in a way worth recording. Building the index eagerly in `push` cost **50% of
+ * parse throughput on objects with long keys and 68% on nested empty objects** — the latter
+ * because `Map.create` allocates an eight-slot table, so every `{}` in a document paid for a
+ * table it would never use. A parser creates far more objects than anything looks up.
+ */
 export struct JsonObject {
-  JsonMember?[] members;
+  // The member list, inline rather than in a container object. See the file header.
+  JsonMember?[] slots;
   i32 count;
+  // Null until this object has been looked up often enough to repay building it. `push` keeps
+  // it current if it exists, so it cannot go stale, and never creates it.
+  Map<u8[], i32>? index;
+  // Lookups served by a scan so far. Only counted while `index` is null.
+  i32 scans;
 
-  JsonObject create() { return JsonObject(JsonMember?[0](), 0); }
+  JsonObject create() { return JsonObject(JsonMember?[0](), 0, null, 0); }
+
+  /**
+   * Both conditions for building an index, and both are measurements.
+   *
+   * `deno task bench:json-lookup` reports what a scan costs, what an indexed lookup costs, and
+   * what the index costs to build. The last one is the reason this is not simply "index if the
+   * object is big": an index is O(n) hashes before it answers anything, so on a 256-member
+   * object it takes **15 lookups to repay itself**, and 15-35 across every size where it wins
+   * at all. Parse a document and read three fields and it never pays.
+   *
+   * So: at least this many members, *and* at least this many lookups already served. Below
+   * either, scanning is not a fallback, it is the right answer.
+   */
+  i32 INDEX_MIN_MEMBERS() { return 16; }
+  i32 INDEX_MIN_SCANS() { return 16; }
 
   void push(this, u8[] key, JsonValue v) {
-    if (this.count == this.members.len()) {
-      i32 next = this.members.len() * 2;
-      if (next == 0) { next = 4; }
-      JsonMember?[] grown = JsonMember?[next]();
-      for (i32 i = 0; i < this.count; i++) {
-        grown[i] = this.members[i];
-      }
-      this.members = grown;
+    // Only the first occurrence of a key is indexed; a later duplicate is still appended to
+    // the list, so it round-trips, but it is not what `get` finds.
+    if ((this.index is not null) && !this.index!.has(key)) {
+      this.index!.set(key, this.count);
     }
-    this.members[this.count] = JsonMember(key, v);
+    if (this.count == this.slots.len()) {
+      i32 grown = this.slots.len() == 0 ? 4 : this.slots.len() * 2;
+      JsonMember?[] next = JsonMember?[grown]();
+      for (i32 i = 0; i < this.count; i++) { next[i] = this.slots[i]; }
+      this.slots = next;
+    }
+    this.slots[this.count] = JsonMember(key, v);
     this.count++;
   }
 
@@ -101,34 +151,62 @@ export struct JsonObject {
 
   JsonMember at(const this, i32 i) {
     if (i < 0 || i >= this.count) { trap; }
-    return this.members[i]!;
+    return this.slots[i]!;
   }
 
-  // Linear scan. A hash map would want generics over the value type; with none,
-  // every JSON object lookup is O(n) until a string-keyed map is hand-written.
-  JsonValue? get(const this, u8[] key) {
+  /**
+   * The value for `key`, or null.
+   *
+   * Takes `this` rather than `const this` because it may build the index, and deep const
+   * makes "logically const, physically memoising" unspellable — a `const this` method cannot
+   * write to a field even when the write is invisible from outside. The same rule pushed
+   * `packages/bignum` from methods to free functions.
+   */
+  JsonValue? get(this, u8[] key) {
+    if (this.index is null) {
+      if (this.count < JsonObject.INDEX_MIN_MEMBERS()
+          || this.scans < JsonObject.INDEX_MIN_SCANS()) {
+        this.scans++;
+        return this.scan(key);
+      }
+      this.buildIndex();
+    }
+    Option<i32> i = this.index!.get(key);
+    if (i.isNone()) { return null; }
+    return this.at(i.unwrap()).value;
+  }
+
+  /** Linear scan, returning the first match. What `get` does below the threshold. */
+  JsonValue? scan(const this, u8[] key) {
     for (i32 i = 0; i < this.count; i++) {
-      JsonMember m = this.members[i]!;
-      if (bytesEqual(m.key, key)) { return m.value; }
+      JsonMember m = this.slots[i]!;
+      if (bytesEq(m.key, key)) { return m.value; }
     }
     return null;
+  }
+
+  void buildIndex(this) {
+    Map<u8[], i32> ix = Map.withCapacity(this.count, hashBytes, bytesEq);
+    for (i32 i = 0; i < this.count; i++) {
+      u8[] k = this.slots[i]!.key;
+      if (!ix.has(k)) { ix.set(k, i); }
+    }
+    this.index = ix;
   }
 
   /**
    * Lookup by a `string` key, which is what calling code actually has.
    *
-   * The conversion happens once, outside the loop — `key.toBytes()` allocates, so
-   * doing it per member would make an O(n) scan an O(n)-allocation scan.
+   * The conversion happens once, outside the lookup — `key.toBytes()` allocates, and hashing
+   * bytes rather than the `string` is why `hashBytes` exists.
    */
-  JsonValue? getStr(const this, string key) {
-    return this.get(key.toBytes());
-  }
+  JsonValue? getStr(this, string key) { return this.get(key.toBytes()); }
 }
 
-export bool bytesEqual(u8[] a, u8[] b) {
-  if (a.len() != b.len()) { return false; }
-  for (i32 i = 0; i < a.len(); i++) {
-    if (a[i] != b[i]) { return false; }
-  }
-  return true;
-}
+/**
+ * Byte equality.
+ *
+ * Kept as an export because the tests and `json.wac` use it by this name; the
+ * implementation now lives in `bytes` because `Map` needs it as a funcref.
+ */
+export bool bytesEqual(u8[] a, u8[] b) { return bytesEq(a, b); }

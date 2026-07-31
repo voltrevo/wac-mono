@@ -5,6 +5,7 @@
   "tasks": {
     "bench": "deno run -A tools/bench.ts",
     "bench:json": "deno run -A packages/json/bench/throughput.ts",
+    "bench:json-lookup": "deno run -A packages/json/bench/lookup.ts",
     "coverage": "deno run -A tools/coverage.ts",
     "coverage:bignum": "deno run -A packages/bignum/cov.ts",
     "coverage:bytes": "deno run -A packages/bytes/cov.ts",

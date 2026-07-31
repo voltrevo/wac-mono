@@ -123,8 +123,76 @@ export string test_json_array_growth() {
     a.push(JsonValue.Number(1.0, u8[](0x31)));
   }
   t.eqI32(a.len(), 50, "length after 50 pushes");
-  t.eqI32(tagOf(a.at(0)), 2, "element kind survives growth");
-  t.eqI32(tagOf(a.at(49)), 2, "last element too");
+  t.eqI32(tagOf(a.get(0)), 2, "element kind survives growth");
+  t.eqI32(tagOf(a.get(49)), 2, "last element too");
+  return t.report();
+}
+
+/** An object with `n` members keyed by a single ascending byte, plus a duplicate of the first. */
+JsonObject manyMembers(i32 n) {
+  JsonObject o = JsonObject.create();
+  for (i32 i = 0; i < n; i++) {
+    o.push(u8[](65 + i), numberOf(i as f64));
+  }
+  // A duplicate of the first key, with a different value. Lookup must still find the first.
+  o.push(u8[](65), numberOf(999.0));
+  return o;
+}
+
+/**
+ * Lookup agrees with itself either side of the index threshold.
+ *
+ * `get` scans until an object has been looked up `INDEX_MIN_SCANS` times, then builds a hash
+ * index and uses that instead. Two code paths for one question, so the test asks the same
+ * questions enough times to cross over and checks nothing changed — including the rule that a
+ * duplicated key resolves to its *first* member, which a Map would happily lose.
+ */
+export string test_lookup_agrees_across_the_index_threshold() {
+  T t = T.create();
+  i32 n = 20;                       // above INDEX_MIN_MEMBERS
+  JsonObject o = manyMembers(n);
+
+  // 40 rounds is well past the scan-count threshold, so the later rounds are indexed.
+  //
+  // Summed rather than checked per lookup, and with no conditional in the loop at all. Any
+  // `if` or ternary in a passing test has a side that never runs, which a branch-coverage
+  // report cannot distinguish from a real hole; `t.eq*` keeps its branch inside `assert.wac`,
+  // where wactest's own tests cover both sides. `v!` traps if a key vanished, which is a loud
+  // enough failure for a test.
+  f64 sum = 0.0;
+  for (i32 round = 0; round < 40; round++) {
+    for (i32 i = 0; i < n; i++) {
+      sum = sum + numValue(o.get(u8[](65 + i))!);
+    }
+  }
+  // 0+1+..+19 per round. The duplicate of key "A" holds 999, so a lookup resolving to it
+  // instead of the first member would push the total far past this.
+  t.eqF64(sum, 40.0 * 190.0, "every round agrees, scanned and indexed alike");
+  t.isTrue(o.get(u8[](200)) is null, "a missing key is still missing once indexed");
+  t.eqI32(o.len(), n + 1, "every member is still there, duplicate included");
+  return t.report();
+}
+
+/**
+ * A push after the index exists is still findable.
+ *
+ * The index is built lazily and then maintained by `push`. If `push` forgot to update it, this
+ * is the shape that breaks: look something up enough times to force the index, then add a key
+ * and ask for it.
+ */
+export string test_push_after_indexing_is_visible() {
+  T t = T.create();
+  JsonObject o = manyMembers(20);
+  for (i32 round = 0; round < 40; round++) { o.get(u8[](66)); }
+
+  o.push(u8[](200), numberOf(7.0));
+  JsonValue? found = o.get(u8[](200));
+  t.isTrue(found is not null, "a member pushed after the index was built is found");
+  t.eqF64(numValue(found!), 7.0, "and has the right value");
+
+  // And a duplicate added after indexing must not displace the original.
+  o.push(u8[](66), numberOf(123.0));
+  t.eqF64(numValue(o.get(u8[](66))!), 1.0, "the first member still wins");
   return t.report();
 }
 
@@ -165,8 +233,8 @@ export string test_tree_shape() {
 
   JsonArray arr = asArray(o.at(0).value);
   t.eqI32(arr.len(), 2, "a has two elements");
-  t.eqI32(tagOf(arr.at(0)), 2, "first is a number");
-  t.eqI32(tagOf(arr.at(1)), 1, "second is a bool");
+  t.eqI32(tagOf(arr.get(0)), 2, "first is a number");
+  t.eqI32(tagOf(arr.get(1)), 1, "second is a bool");
   return t.report();
 }
 
@@ -252,9 +320,9 @@ export string test_number_keeps_its_source_span() {
   JsonValue? v = parseStr("[1e2,-0]");
   t.isTrue(v is not null, "parses");
   JsonArray a = asArray(v!);
-  t.eqBytes(numRaw(a.at(0)), u8[](0x31, 0x65, 0x32), "raw span is 1e2, not 100");
-  t.isTrue(numValue(a.at(0)) == 100.0, "value is still 100");
-  t.eqBytes(numRaw(a.at(1)), u8[](0x2D, 0x30), "negative zero keeps its sign in the span");
+  t.eqBytes(numRaw(a.get(0)), u8[](0x31, 0x65, 0x32), "raw span is 1e2, not 100");
+  t.isTrue(numValue(a.get(0)) == 100.0, "value is still 100");
+  t.eqBytes(numRaw(a.get(1)), u8[](0x2D, 0x30), "negative zero keeps its sign in the span");
   return t.report();
 }
 
