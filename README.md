@@ -19,6 +19,7 @@ compiler, this one is things built with it.
 | [`url`](packages/url/) | WHATWG URL parsing, serialization and relative resolution |
 | [`codec`](packages/codec/) | base16, base32 and base64 from RFC 4648, strict on decode |
 | [`regex`](packages/regex/) | a backtracking regex engine with JavaScript's semantics |
+| [`datetime`](packages/datetime/) | the proleptic Gregorian calendar and RFC 3339 timestamps |
 | [`std`](packages/std/) | `Vec<T>`, `Map<K, V>`, `Option<T>`, `Result<T, E>` — the containers generics made writable |
 | [`wactest`](packages/wactest/) | assertions for writing tests in wac |
 
@@ -65,6 +66,7 @@ deno task coverage:bignum # ...and the host-driven exercises, per package
 deno task coverage:bytes
 deno task coverage:codec
 deno task coverage:crypto
+deno task coverage:datetime
 deno task coverage:fmt
 deno task coverage:gzip
 deno task coverage:json

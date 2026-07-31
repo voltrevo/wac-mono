@@ -1,0 +1,160 @@
+// RFC 3339 timestamps: parse to epoch milliseconds, and format back.
+//
+// RFC 3339 is the strict profile of ISO 8601 that everything on the wire actually uses — HTTP
+// dates in JSON, log lines, `Date.toISOString`. Strict is the point: ISO 8601 admits week dates,
+// ordinal dates, two-digit years, comma decimal separators and omitted separators, and a parser
+// that accepts all of them accepts things nobody meant to write.
+//
+// One deliberate divergence from the RFC, in §5.7: a `60` in the seconds field is a leap second
+// and this rejects it. Representing it faithfully needs a leap-second table, which has to be
+// updated by hand and would be stale; mapping it onto :59 or onto the next day is silently wrong
+// in a way that only shows up years later. Rejecting says so at the point of use.
+
+import { Civil, civilFromDays, daysFromCivil, isValidDate } from "./civil.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+
+/** A parse result. `ok` is false for anything malformed; the fields are then meaningless. */
+export struct Parsed {
+  bool ok;
+  i64 millis;       // since 1970-01-01T00:00:00Z
+  i32 offsetMin;    // the offset as written, kept because it is not recoverable from `millis`
+}
+
+bool isDigit(i32 c) { return c >= '0' && c <= '9'; }
+
+/** `n` digits as a number, or -1 if any of them is not a digit. */
+i32 digits(u8[] s, i32 at, i32 n) {
+  if (at + n > s.len()) { return -1; }
+  i32 v = 0;
+  for (i32 i = 0; i < n; i++) {
+    if (!isDigit(s[at + i])) { return -1; }
+    v = v * 10 + (s[at + i] - '0');
+  }
+  return v;
+}
+
+/**
+ * Parse a full RFC 3339 `date-time`.
+ *
+ * The grammar, with the separator case-insensitive as §5.6 allows:
+ *
+ *     YYYY-MM-DD ("T"|"t"|" ") HH:MM:SS [ "." 1*DIGIT ] ( "Z" | "z" | ("+"|"-") HH:MM )
+ *
+ * A fractional part of any length is accepted and truncated to milliseconds — truncated, not
+ * rounded, because rounding can move a timestamp into the next second and the RFC gives no
+ * licence to do that.
+ */
+export Parsed parse(u8[] s) {
+  Parsed bad = Parsed(false, 0, 0);
+  i32 year = digits(s, 0, 4);
+  if (year < 0 || s.len() < 20) { return bad; }
+  if (s[4] != '-') { return bad; }
+  i32 month = digits(s, 5, 2);
+  if (month < 0 || s[7] != '-') { return bad; }
+  i32 day = digits(s, 8, 2);
+  if (day < 0) { return bad; }
+
+  i32 sep = s[10];
+  // §5.6 permits a lowercase `t`; a space is the RFC's own "NOTE" alternative for readability.
+  if (sep != 'T' && sep != 't' && sep != ' ') { return bad; }
+
+  i32 hour = digits(s, 11, 2);
+  if (hour < 0 || s[13] != ':') { return bad; }
+  i32 minute = digits(s, 14, 2);
+  if (minute < 0 || s[16] != ':') { return bad; }
+  i32 second = digits(s, 17, 2);
+  if (second < 0) { return bad; }
+
+  if (!isValidDate(year, month, day)) { return bad; }
+  if (hour > 23 || minute > 59) { return bad; }
+  // 60 is a leap second; see the note at the top of the file.
+  if (second > 59) { return bad; }
+
+  i32 at = 19;
+  i32 millis = 0;
+  if (at < s.len() && s[at] == '.') {
+    at++;
+    i32 start = at;
+    i32 place = 100;
+    while (at < s.len() && isDigit(s[at])) {
+      if (place > 0) {
+        millis = millis + (s[at] - '0') * place;
+        place = place / 10;
+      }
+      at++;
+    }
+    // "." with no digits after it is not a fraction.
+    if (at == start) { return bad; }
+  }
+
+  i32 offsetMin = 0;
+  if (at >= s.len()) { return bad; }
+  i32 z = s[at];
+  if (z == 'Z' || z == 'z') {
+    at++;
+  } else if (z == '+' || z == '-') {
+    i32 oh = digits(s, at + 1, 2);
+    if (oh < 0 || at + 3 >= s.len() || s[at + 3] != ':') { return bad; }
+    i32 om = digits(s, at + 4, 2);
+    if (om < 0) { return bad; }
+    if (oh > 23 || om > 59) { return bad; }
+    offsetMin = oh * 60 + om;
+    if (z == '-') { offsetMin = -offsetMin; }
+    at = at + 6;
+  } else {
+    return bad;
+  }
+  // Trailing anything is a rejection: a parser that ignores the tail accepts a truncated
+  // timestamp glued to whatever followed it.
+  if (at != s.len()) { return bad; }
+
+  i64 days = daysFromCivil(year, month, day);
+  i64 secs = days * 86400 + (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64);
+  secs = secs - (offsetMin as i64) * 60;
+  return Parsed(true, secs * 1000 + (millis as i64), offsetMin);
+}
+
+void pad(Buf out, i32 value, i32 width) {
+  i32 divisor = 1;
+  for (i32 i = 1; i < width; i++) { divisor = divisor * 10; }
+  i32 v = value;
+  while (divisor > 0) {
+    out.push(48 + (v / divisor) % 10);
+    divisor = divisor / 10;
+  }
+}
+
+/**
+ * Format as `YYYY-MM-DDTHH:MM:SS.sssZ`, which is exactly what `Date.toISOString` produces.
+ *
+ * Milliseconds are always written, including `.000`, because that is what makes the output a
+ * fixed width and lexicographically sortable — the property most callers actually want from a
+ * timestamp in a log line or a key.
+ */
+export u8[] format(i64 millis) {
+  // Floor division, so a negative instant lands on the right day rather than a day late.
+  i64 ms = millis % 1000;
+  i64 secs = millis / 1000;
+  if (ms < 0) { ms = ms + 1000; secs = secs - 1; }
+  i64 days = secs / 86400;
+  i64 rem = secs % 86400;
+  if (rem < 0) { rem = rem + 86400; days = days - 1; }
+
+  Civil c = civilFromDays(days);
+  Buf out = Buf.create();
+  pad(out, c.year, 4);
+  out.push('-');
+  pad(out, c.month, 2);
+  out.push('-');
+  pad(out, c.day, 2);
+  out.push('T');
+  pad(out, (rem / 3600) as! i32, 2);
+  out.push(':');
+  pad(out, ((rem / 60) % 60) as! i32, 2);
+  out.push(':');
+  pad(out, (rem % 60) as! i32, 2);
+  out.push('.');
+  pad(out, ms as! i32, 3);
+  out.push('Z');
+  return out.take();
+}
