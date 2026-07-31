@@ -8,7 +8,7 @@
 // means "check p.err".
 
 import { JsonValue, JsonBool, JsonNumber, JsonString, JsonArray, JsonObject, jsonNull } from "./value.wac";
-import { ByteBuf } from "./bytes.wac";
+import { Buf } from "../../bytes/src/buf.wac";
 
 export i32 ERR_NONE()         { return 0; }
 export i32 ERR_UNEXPECTED()   { return 1; }  // wrong byte for the position
@@ -180,13 +180,13 @@ export struct Parser {
   // closing quote.
   u8[]? parseStringBytes(this) {
     this.pos++;                                        // consume opening "
-    ByteBuf out = ByteBuf.create();
+    Buf out = Buf.create();
     while (true) {
       if (this.pos >= this.src.len()) { this.fail(ERR_EOF()); return null; }
       i32 c = this.src[this.pos];
       if (c == '"') {
         this.pos++;
-        return out.toBytes();
+        return out.bytes();
       }
       if (c == '\\') {
         this.pos++;
@@ -200,7 +200,7 @@ export struct Parser {
     }
   }
 
-  bool readEscape(this, ByteBuf out) {
+  bool readEscape(this, Buf out) {
     i32 e = this.peek();
     if (e < 0) { this.fail(ERR_EOF()); return false; }
     switch (e) {
@@ -224,7 +224,7 @@ export struct Parser {
   // so it *could* be — but only one character at a time, joined with `+`, which
   // on an immutable string is quadratic. Bytes stay the right representation
   // until there is a `string.fromBytes`.
-  bool readUnicodeEscape(this, ByteBuf out) {
+  bool readUnicodeEscape(this, Buf out) {
     this.pos++;                                        // consume 'u'
     i32 hi = this.readHex4();
     if (hi < 0) { return false; }

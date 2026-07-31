@@ -6,7 +6,7 @@
 // accepts this output, which pins the container down before any Huffman work
 // starts.
 
-import { Buf } from "./buf.wac";
+import { Buf } from "../../bytes/src/buf.wac";
 import { crc32 } from "./crc32.wac";
 import { deflateFixed, deflateDynamic } from "./deflate.wac";
 

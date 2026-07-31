@@ -1,0 +1,159 @@
+// Buf — a growable byte buffer.
+//
+// Shared because `gzip` and `json` had written the same type twice. It exists as
+// a package rather than a copy per consumer for the reason the monorepo exists:
+// wac has no generics, so a container cannot be written once over its element
+// type, but it can at least be written once over `u8`.
+//
+// Capacity doubles, so appending n bytes is amortised O(n).
+//
+// Shape notes, because they are load-bearing rather than stylistic:
+//
+//   `len` is a public field, not a method. It is read once per pushed byte in
+//   gzip's inner loops, and a method call there is measurable.
+//
+//   `reserve()` takes no argument and only checks for one byte. That keeps the
+//   common `push` path to a single comparison. Bulk appends use `reserveFor(n)`
+//   so they grow once instead of doubling repeatedly.
+
+export struct Buf {
+  u8[] data;
+  i32 len;
+
+  Buf create() {
+    return Buf(u8[16](), 0);
+  }
+
+  /**
+   * A buffer pre-sized to `capacity`.
+   *
+   * Worth it when the final length is known up front — inflate reads it from the
+   * gzip trailer — because it skips the doubling reallocations *and* lets `take`
+   * hand back the array without a copy.
+   */
+  Buf withCapacity(i32 capacity) {
+    if (capacity < 16) { capacity = 16; }
+    return Buf(u8[capacity](), 0);
+  }
+
+  i32 get(const this, i32 i) {
+    if (i < 0 || i >= this.len) { trap; }
+    return this.data[i];
+  }
+
+  // Make room for at least one more byte.
+  void reserve(this) {
+    if (this.len < this.data.len()) { return; }
+    i32 cap = this.data.len() * 2;
+    u8[] next = u8[cap]();
+    for (i32 i = 0; i < this.len; i++) {
+      next[i] = this.data[i];
+    }
+    this.data = next;
+  }
+
+  /**
+   * Make room for at least `extra` more bytes, growing once.
+   *
+   * Repeated `push` would reach the same capacity through a series of doublings,
+   * each copying everything written so far.
+   */
+  void reserveFor(this, i32 extra) {
+    i32 need = this.len + extra;
+    if (need <= this.data.len()) { return; }
+    i32 cap = this.data.len() * 2;
+    if (cap < 16) { cap = 16; }
+    while (cap < need) { cap = cap * 2; }
+    u8[] next = u8[cap]();
+    for (i32 i = 0; i < this.len; i++) {
+      next[i] = this.data[i];
+    }
+    this.data = next;
+  }
+
+  void push(this, i32 v) {
+    this.reserve();
+    this.data[this.len] = v;
+    this.len++;
+  }
+
+  // gzip and DEFLATE are little-endian throughout.
+  void pushU16(this, i32 v) {
+    this.push(v & 0xFF);
+    this.push((v >>> 8) & 0xFF);
+  }
+
+  void pushU32(this, i32 v) {
+    this.push(v & 0xFF);
+    this.push((v >>> 8) & 0xFF);
+    this.push((v >>> 16) & 0xFF);
+    this.push((v >>> 24) & 0xFF);
+  }
+
+  // `start`, not `from` — `from` is a keyword (import ... from "...").
+  void pushBytes(this, u8[] src, i32 start, i32 count) {
+    this.reserveFor(count);
+    for (i32 i = 0; i < count; i++) {
+      this.data[this.len + i] = src[start + i];
+    }
+    this.len += count;
+  }
+
+  /** The whole of `src`. */
+  void pushAll(this, u8[] src) {
+    this.pushBytes(src, 0, src.len());
+  }
+
+  /**
+   * Append a Unicode scalar as UTF-8.
+   *
+   * Callers must have resolved surrogate pairs already — a lone surrogate has no
+   * UTF-8 form. Kept here rather than in `json` because the encoding is a
+   * property of UTF-8, not of JSON.
+   */
+  void pushCodepoint(this, i32 cp) {
+    if (cp < 0x80) {
+      this.push(cp);
+    } else if (cp < 0x800) {
+      this.push(0xC0 | (cp >> 6));
+      this.push(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+      this.push(0xE0 | (cp >> 12));
+      this.push(0x80 | ((cp >> 6) & 0x3F));
+      this.push(0x80 | (cp & 0x3F));
+    } else {
+      this.push(0xF0 | (cp >> 18));
+      this.push(0x80 | ((cp >> 12) & 0x3F));
+      this.push(0x80 | ((cp >> 6) & 0x3F));
+      this.push(0x80 | (cp & 0x3F));
+    }
+  }
+
+  /**
+   * Hand over the contents, avoiding the copy when the buffer is exactly full.
+   *
+   * The returned array is the buffer's own storage in that case, so the Buf must
+   * not be used afterwards. That is why this is separate from `bytes()`: callers
+   * that keep appending need the copy.
+   */
+  u8[] take(this) {
+    if (this.len == this.data.len()) {
+      return this.data;
+    }
+    return this.bytes();
+  }
+
+  // Exact-length copy — the internal array is over-allocated.
+  u8[] bytes(const this) {
+    u8[] out = u8[this.len]();
+    for (i32 i = 0; i < this.len; i++) {
+      out[i] = this.data[i];
+    }
+    return out;
+  }
+
+  /** The contents as a string, taking them to be UTF-8. */
+  string toStr(const this) {
+    return string.fromBytes(this.bytes());
+  }
+}

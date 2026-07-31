@@ -7,12 +7,16 @@
 // plus `switch` is how you branch over a sum type. Testing `is JsonNumber` in
 // an if-chain would work too, but a tag maps to `br_table` and reads better.
 //
-// Strings are held as UTF-8 `u8[]`, not the built-in `string`. `string` has only
-// len/slice/indexOf, and while `string.fromCodepoint` can now produce any single
-// character, assembling a whole string means `+` per character — quadratic on an
-// immutable string. Bytes stay the right representation until there is a
-// `string.fromBytes`, and they also make the scanner a `switch` over i32 rather
-// than a chain of one-character string compares.
+// Strings are held as UTF-8 `u8[]`, not the built-in `string`. This began as a
+// necessity — nothing could build a `string` from bytes — and `string.fromBytes`
+// now exists, so it is worth saying why it stays.
+//
+// Bytes are the right representation *inside* a parser. Scanning is a `switch`
+// over `i32` rather than a chain of one-character string comparisons, and a
+// document's strings are built into a growable buffer instead of allocating a
+// `string` per token. What changes is the edge: `JsonString.str()`,
+// `JsonMember.keyStr()` and `JsonObject.getStr()` mean calling code never has to
+// see a `u8[]` unless it wants to.
 
 export struct JsonValue {
   const i32 kind;
@@ -48,6 +52,9 @@ export struct JsonString : JsonValue {
   const u8[] bytes;
 
   JsonString of(u8[] b) { return JsonString(3, b); }
+
+  /** The value as a `string`. Copies, so callers that compare should keep it. */
+  string str(const this) { return string.fromBytes(this.bytes); }
 }
 
 // A null is just the base struct carrying tag 0 — no subtype needed.
@@ -87,6 +94,8 @@ export struct JsonArray : JsonValue {
 export struct JsonMember {
   const u8[] key;
   const JsonValue value;
+
+  string keyStr(const this) { return string.fromBytes(this.key); }
 }
 
 export struct JsonObject : JsonValue {
@@ -124,6 +133,16 @@ export struct JsonObject : JsonValue {
       if (bytesEqual(m.key, key)) { return m.value; }
     }
     return null;
+  }
+
+  /**
+   * Lookup by a `string` key, which is what calling code actually has.
+   *
+   * The conversion happens once, outside the loop — `key.toBytes()` allocates, so
+   * doing it per member would make an O(n) scan an O(n)-allocation scan.
+   */
+  JsonValue? getStr(const this, string key) {
+    return this.get(key.toBytes());
   }
 }
 

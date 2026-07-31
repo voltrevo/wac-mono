@@ -4,7 +4,7 @@
 // decoder is fed bytes it did not produce, so every field is untrusted. Bad
 // input must trap rather than read out of bounds or loop forever.
 
-import { Buf } from "./buf.wac";
+import { Buf } from "../../bytes/src/buf.wac";
 import { Tables } from "./tables.wac";
 import { crc32 } from "./crc32.wac";
 

@@ -6,7 +6,7 @@
 // two separate methods here — conflating them is the classic way to produce a
 // stream that looks right and inflates to garbage.
 
-import { Buf } from "./buf.wac";
+import { Buf } from "../../bytes/src/buf.wac";
 
 export struct BitWriter {
   Buf out;

@@ -9,24 +9,24 @@
 // dispatch, this is the shape every fold over the tree has to take.
 
 import { JsonValue, JsonBool, JsonNumber, JsonString, JsonArray, JsonObject } from "./value.wac";
-import { ByteBuf } from "./bytes.wac";
+import { Buf } from "../../bytes/src/buf.wac";
 
-export void writeValue(ByteBuf out, JsonValue v) {
+export void writeValue(Buf out, JsonValue v) {
   switch (v.kind) {
     case 0: {                                  // null
-      out.pushBytes(u8[]('n', 'u', 'l', 'l'));
+      out.pushAll(u8[]('n', 'u', 'l', 'l'));
     }
     case 1: {                                  // bool
       JsonBool b = v as! JsonBool;
       if (b.value) {
-        out.pushBytes(u8[]('t', 'r', 'u', 'e'));
+        out.pushAll(u8[]('t', 'r', 'u', 'e'));
       } else {
-        out.pushBytes(u8[]('f', 'a', 'l', 's', 'e'));
+        out.pushAll(u8[]('f', 'a', 'l', 's', 'e'));
       }
     }
     case 2: {                                  // number
       JsonNumber n = v as! JsonNumber;
-      out.pushBytes(n.raw);
+      out.pushAll(n.raw);
     }
     case 3: {                                  // string
       JsonString s = v as! JsonString;
@@ -59,7 +59,7 @@ export void writeValue(ByteBuf out, JsonValue v) {
 // Quote and escape a UTF-8 byte string. Only the characters JSON requires are
 // escaped — quote, backslash, and anything below a space — so multi-byte UTF-8
 // passes through untouched, which matches what JSON.stringify emits.
-export void writeString(ByteBuf out, u8[] bytes) {
+export void writeString(Buf out, u8[] bytes) {
   out.push('"');
   for (i32 i = 0; i < bytes.len(); i++) {
     i32 c = bytes[i];
@@ -84,7 +84,7 @@ export void writeString(ByteBuf out, u8[] bytes) {
   out.push('"');
 }
 
-void writeUnicodeEscape(ByteBuf out, i32 c) {
+void writeUnicodeEscape(Buf out, i32 c) {
   out.push('\\');
   out.push('u');
   out.push(hexChar((c >> 12) & 0xF));
