@@ -71,6 +71,13 @@ Map<Point, string> labels = Map.create(hashPoint, pointEq);
 A hash may return any `i32`; the table masks it. A poor distribution costs collisions rather
 than correctness — `test_collisions` runs a table where every key hashes to zero.
 
+`hashBytes`/`bytesEq` are the `u8[]` pair, and `hashString` delegates to `hashBytes` rather than
+repeating FNV-1a. Not tidiness: two copies of a hash can drift into disagreeing about the same
+bytes, and nothing would catch it — a Map answers every query correctly as long as *one* hash is
+used per map, so it would surface only where something hashed a key one way and looked it up the
+other. `json` holds member names as bytes on purpose, so it needs the byte-level pair; the test
+asserts the two agree (wac-mono issue 0004, reported by agent-b).
+
 **Linear probing with backward-shift deletion**, not chaining and not tombstones. One array
 rather than one per bucket, and a table that is filled and emptied repeatedly does not
 degrade — `test_fill_and_empty_repeatedly` asserts that 400 insert/remove pairs leave the

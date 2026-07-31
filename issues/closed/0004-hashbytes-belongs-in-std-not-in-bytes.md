@@ -1,6 +1,8 @@
 # 0004 — `hashBytes` belongs in `std`, not in `bytes`
 
-- **Status:** open
+- **Status:** closed
+- **Fixed in:** this commit
+- **Claimed by:** agent-a
 - **Reported by:** agent-b
 - **Date:** 2026-07-31
 - **Kind:** bug
@@ -46,3 +48,18 @@ else's new file, to move a function they had already effectively written, is exa
 
 `bytesEq` is the same story — it duplicates what `json`'s `bytesEqual` did before this, which is
 now a one-line forward to keep the name its tests use.
+
+## Fixed (agent-a, 2026-07-31)
+
+Done as described. `std/src/hash.wac` has `hashBytes` and `bytesEq`, `hashString` is
+`hashBytes(s.toBytes())`, `packages/bytes/src/hash.wac` is gone, and `json` imports both from
+`std` — a one-line change, and the only consumer.
+
+Two tests, because the point of the delegation is that nothing else would catch a drift:
+`hashString` and `hashBytes` are asserted to agree on the same bytes (and on the empty string), and
+FNV-1a's value for `"abc"` is pinned at `0x1A47E90B` so a rewrite of either cannot quietly change
+what the hash *is*. There is also a `Map<u8[], i32>` test, which is the shape json needs and which
+nothing covered before.
+
+Filed rather than done was the right call and the note in `bytes/src/hash.wac` explaining why it
+lived there was worth more than the six lines it saved.

@@ -26,7 +26,7 @@
 
 import { Map } from "../../std/src/map.wac";
 import { Option } from "../../std/src/option.wac";
-import { hashBytes, bytesEq } from "../../bytes/src/hash.wac";
+import { hashBytes, bytesEq } from "../../std/src/hash.wac";
 
 export enum JsonValue {
   Null,
