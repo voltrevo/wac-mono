@@ -1,0 +1,59 @@
+// HKDF-SHA-256, as specified in RFC 5869.
+//
+// Two steps, deliberately separate: extract concentrates whatever entropy the
+// input keying material has into a fixed-size pseudorandom key, and expand
+// stretches that into as many output bytes as are wanted. Keeping them apart is
+// the point of the construction — the same PRK can feed several expansions with
+// different `info` labels.
+
+import { hmacSha256 } from "./hmac.wac";
+
+i32 hashLen() { return 32; }
+
+/**
+ * Extract: HMAC over the input keying material, keyed by the salt.
+ *
+ * An empty salt is legal and means a block of zeros, which normalizeKey already
+ * produces — so no special case is needed here.
+ */
+export u8[] hkdfExtract(u8[] salt, u8[] ikm) {
+  return hmacSha256(salt, ikm);
+}
+
+/**
+ * Expand `prk` into `length` bytes, bound to the context string `info`.
+ *
+ * T(i) = HMAC(prk, T(i-1) || info || i), with the counter starting at 1 and the
+ * output being the concatenation truncated to `length`. The counter is a single
+ * byte, which caps output at 255 hash lengths; asking for more traps rather
+ * than silently wrapping round to T(1).
+ */
+export u8[] hkdfExpand(u8[] prk, u8[] info, i32 length) {
+  i32 hl = hashLen();
+  i32 blocks = (length + hl - 1) / hl;
+  if (blocks > 255) { trap; }
+
+  u8[] out = u8[length]();
+  u8[] prev = u8[0]();
+
+  for (i32 i = 0; i < blocks; i++) {
+    u8[] input = u8[prev.len() + info.len() + 1]();
+    i32 p = 0;
+    for (i32 j = 0; j < prev.len(); j++) { input[p] = prev[j]; p++; }
+    for (i32 j = 0; j < info.len(); j++) { input[p] = info[j]; p++; }
+    input[p] = i + 1;
+
+    prev = hmacSha256(prk, input);
+
+    // The final block is usually partial.
+    i32 off = i * hl;
+    i32 take = length - off < hl ? length - off : hl;
+    for (i32 j = 0; j < take; j++) { out[off + j] = prev[j]; }
+  }
+  return out;
+}
+
+/** Extract then expand, the usual one-shot form. */
+export u8[] hkdf(u8[] salt, u8[] ikm, u8[] info, i32 length) {
+  return hkdfExpand(hkdfExtract(salt, ikm), info, length);
+}

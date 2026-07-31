@@ -1,0 +1,89 @@
+// ChaCha20, as specified in RFC 8439.
+//
+// The whole cipher is addition modulo 2^32, xor and rotate-left over sixteen
+// u32 words — no tables, no field arithmetic, nothing that needs a bignum. It
+// is the closest thing to a pure demonstration that unsigned types belong in
+// the language: every line here is one line of the RFC.
+//
+// This is the 32-bit-counter, 96-bit-nonce variant from RFC 8439, not the
+// original 64/64 split.
+
+u32 rotl(u32 x, u32 n) { return (x << n) | (x >> (32 - n)); }
+
+/** Little-endian u32 at byte offset `i`. */
+u32 leWord(u8[] b, i32 i) {
+  return (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) as@ u32;
+}
+
+/**
+ * The quarter round, in place over the state array.
+ *
+ * Written against indices rather than values because wac has no way to return
+ * four words at once, and no out-parameters — the array *is* the tuple.
+ */
+void quarterRound(u32[] s, i32 a, i32 b, i32 c, i32 d) {
+  s[a] += s[b]; s[d] ^= s[a]; s[d] = rotl(s[d], 16);
+  s[c] += s[d]; s[b] ^= s[c]; s[b] = rotl(s[b], 12);
+  s[a] += s[b]; s[d] ^= s[a]; s[d] = rotl(s[d], 8);
+  s[c] += s[d]; s[b] ^= s[c]; s[b] = rotl(s[b], 7);
+}
+
+/** The 16-word initial state for a key, counter and nonce. */
+u32[] initialState(u8[] key, u32 counter, u8[] nonce) {
+  u32[] s = u32[16]();
+  // "expand 32-byte k", as four little-endian words.
+  s[0] = 0x61707865; s[1] = 0x3320646e; s[2] = 0x79622d32; s[3] = 0x6b206574;
+  for (i32 i = 0; i < 8; i++) { s[4 + i] = leWord(key, i * 4); }
+  s[12] = counter;
+  for (i32 i = 0; i < 3; i++) { s[13 + i] = leWord(nonce, i * 4); }
+  return s;
+}
+
+/** One 64-byte keystream block. */
+export u8[] chachaBlock(u8[] key, u32 counter, u8[] nonce) {
+  u32[] start = initialState(key, counter, nonce);
+  u32[] s = u32[16]();
+  for (i32 i = 0; i < 16; i++) { s[i] = start[i]; }
+
+  // 20 rounds = 10 iterations of a column round followed by a diagonal round.
+  for (i32 r = 0; r < 10; r++) {
+    quarterRound(s, 0, 4, 8, 12);
+    quarterRound(s, 1, 5, 9, 13);
+    quarterRound(s, 2, 6, 10, 14);
+    quarterRound(s, 3, 7, 11, 15);
+    quarterRound(s, 0, 5, 10, 15);
+    quarterRound(s, 1, 6, 11, 12);
+    quarterRound(s, 2, 7, 8, 13);
+    quarterRound(s, 3, 4, 9, 14);
+  }
+
+  u8[] out = u8[64]();
+  for (i32 i = 0; i < 16; i++) {
+    // The feed-forward add is what makes the core non-invertible.
+    u32 v = s[i] + start[i];
+    out[i * 4]     = (v & 255) as@ i32;
+    out[i * 4 + 1] = ((v >> 8) & 255) as@ i32;
+    out[i * 4 + 2] = ((v >> 16) & 255) as@ i32;
+    out[i * 4 + 3] = ((v >> 24) & 255) as@ i32;
+  }
+  return out;
+}
+
+/**
+ * Encrypt (or decrypt — it is the same operation) `msg` by xoring it with the
+ * keystream starting at `counter`.
+ */
+export u8[] chacha20(u8[] key, u32 counter, u8[] nonce, u8[] msg) {
+  i32 n = msg.len();
+  u8[] out = u8[n]();
+  i32 i = 0;
+  u32 block = counter;
+  while (i < n) {
+    u8[] ks = chachaBlock(key, block, nonce);
+    i32 take = n - i < 64 ? n - i : 64;
+    for (i32 j = 0; j < take; j++) { out[i + j] = msg[i + j] ^ ks[j]; }
+    i += 64;
+    block += 1;
+  }
+  return out;
+}
