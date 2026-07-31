@@ -383,6 +383,84 @@ u64 approxBits(Parts p) {
   return f64.toBits(m);
 }
 
+/** The f32 nearest the decimal in `src[start..end)`, correctly rounded. */
+export f32 atof32Span(u8[] src, i32 start, i32 end) {
+  Parts p = scan(src, start, end);
+  f32 mag = bisect32(p);
+  if (p.neg) { return -mag; }
+  return mag;
+}
+
+/**
+ * The f32 version of the bisection.
+ *
+ * Separate rather than shared because the two return different types and wac has
+ * no generics — the comparison machinery below *is* shared, since it works on a
+ * significand and a binary exponent and does not care which width they came from.
+ *
+ * Not implemented by parsing to f64 and narrowing: that rounds twice, and the two
+ * roundings disagree for values sitting near an f32 boundary.
+ */
+f32 bisect32(Parts p) {
+  if (p.count == 0) { return 0.0 as~ f32; }
+  i32 top = p.exp10 + p.count;
+  if (top >= 40) { return (1.0 / 0.0) as~ f32; }
+  if (top < -50) { return 0.0 as~ f32; }
+
+  i32 limbs = ATOF_LIMBS();
+  Big dec = Big.withLimbs(limbs);
+  for (i32 i = 0; i < p.count; i++) {
+    dec.mulAddSmall(10, (p.digits[i] - '0') as@ u32);
+  }
+  Big pow = Big.withLimbs(limbs);
+  if (p.exp10 > 0) {
+    mulPow10(dec, p.exp10);
+  } else if (p.exp10 < 0) {
+    pow.setU64(1);
+    mulPow10(pow, -p.exp10);
+  }
+  Cmp c = Cmp(dec, pow, Big.withLimbs(limbs), Big.withLimbs(limbs),
+              Big.withLimbs(limbs), p.exp10, p.sticky);
+
+  u64 maxFinite = 2139095039;              // 0x7F7FFFFF
+
+  if (compareValue32(c, maxFinite) > 0) {
+    if (compareMidpoint32(c, maxFinite) >= 0) { return (1.0 / 0.0) as~ f32; }
+    return f32.fromBits(maxFinite as@ u32);
+  }
+
+  u64 lo = 0;
+  u64 hi = maxFinite;
+  while (lo < hi) {
+    u64 mid = lo + (hi - lo + 1) / 2;
+    if (compareValue32(c, mid) >= 0) { lo = mid; } else { hi = mid - 1; }
+  }
+
+  i32 m = compareMidpoint32(c, lo);
+  if (m > 0) { return f32.fromBits((lo + 1) as@ u32); }
+  if (m < 0) { return f32.fromBits(lo as@ u32); }
+  if ((lo & 1) == 0) { return f32.fromBits(lo as@ u32); }
+  return f32.fromBits((lo + 1) as@ u32);
+}
+
+/** value = f * 2^g for an f32 bit pattern: 8 exponent bits, bias 150. */
+Split splitBits32(u64 bits) {
+  i32 be = ((bits >> 23) & 255) as@ i32;
+  u64 frac = bits & 8388607;
+  if (be == 0) { return Split(frac, -149); }
+  return Split(frac + 8388608, be - 150);
+}
+
+i32 compareValue32(Cmp c, u64 bits) {
+  Split s = splitBits32(bits);
+  return compareScaled(c, s.f, s.g);
+}
+
+i32 compareMidpoint32(Cmp c, u64 bits) {
+  Split s = splitBits32(bits);
+  return compareScaled(c, s.f * 2 + 1, s.g - 1);
+}
+
 /** The significand and exponent of a positive double: value = f * 2^g. */
 struct Split { u64 f; i32 g; }
 
