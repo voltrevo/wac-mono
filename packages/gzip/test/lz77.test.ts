@@ -3,10 +3,10 @@
 // there at all (a literals-only compressor would pass the round-trip tests) and
 // push on the boundaries of the length and distance code tables.
 
-import { wacBind } from "../harness/wacBind.ts";
+import { wacBind } from "../../../harness/wacBind.ts";
 import { gunzip, roundTrip } from "./util.ts";
 
-const mod = await wacBind("src/gzip.wac");
+const mod = await wacBind("packages/gzip/src/gzip.wac");
 const gzipFixed = mod.gzipFixed as (data: Uint8Array) => Uint8Array;
 
 Deno.test("lz77: repetitive input actually compresses", async () => {

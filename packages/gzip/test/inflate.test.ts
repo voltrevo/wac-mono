@@ -9,14 +9,14 @@
 // A decompressor also has an obligation the compressor does not: its input is
 // untrusted. Corrupt streams must trap, not read out of bounds or spin.
 
-import { wacBind } from "../harness/wacBind.ts";
+import { wacBind } from "../../../harness/wacBind.ts";
 import { bytesEqual, pythonGzip } from "./util.ts";
 
-const inflateMod = await wacBind("src/inflate.wac");
+const inflateMod = await wacBind("packages/gzip/src/inflate.wac");
 const gunzipBytes = inflateMod.gunzipBytes as (gz: Uint8Array) => Uint8Array;
 const inflateRaw = inflateMod.inflate as (data: Uint8Array) => Uint8Array;
 
-const gzipMod = await wacBind("src/gzip.wac");
+const gzipMod = await wacBind("packages/gzip/src/gzip.wac");
 const gzipStored = gzipMod.gzipStored as (d: Uint8Array) => Uint8Array;
 const gzipFixed = gzipMod.gzipFixed as (d: Uint8Array) => Uint8Array;
 const gzipDynamic = gzipMod.gzipDynamic as (d: Uint8Array) => Uint8Array;

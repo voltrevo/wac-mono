@@ -3,6 +3,9 @@
     "wac/": "../wac/atoms/wac/"
   },
   "tasks": {
-    "test": "deno test --allow-read --allow-write --allow-run"
-  }
+    "test": "deno test --allow-read --allow-write --allow-run",
+    "coverage": "deno run -A tools/coverage.ts",
+    "mutate": "deno run -A tools/mutate.ts"
+  },
+  "exclude": [".cache"]
 }

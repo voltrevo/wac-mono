@@ -11,7 +11,7 @@
 import { wacCompile } from "wac/wacCompile.ts";
 import { wacBindgen } from "wac/wacBindgen.ts";
 import { wacFiles } from "../harness/wacFiles.ts";
-import { buildCorpus } from "../test/fuzz/corpus.ts";
+import { buildCorpus } from "../packages/gzip/test/fuzz/corpus.ts";
 
 type Point = { index: number; file: string; line: number; col: number; kind: string };
 
@@ -60,7 +60,7 @@ function readCounts(mod: Record<string, unknown>, n: number): number[] {
 // ── Exercise the compressor ───────────────────────────────────────────────────
 
 {
-  const { mod, points } = await instrument("src/gzip.wac");
+  const { mod, points } = await instrument("packages/gzip/src/gzip.wac");
   (mod.__cov_init as () => void)();
   const len = (mod.__cov_len as () => number)();
 
@@ -85,7 +85,7 @@ function readCounts(mod: Record<string, unknown>, n: number): number[] {
 // ── Exercise the decompressor ─────────────────────────────────────────────────
 
 {
-  const { mod, points } = await instrument("src/inflate.wac");
+  const { mod, points } = await instrument("packages/gzip/src/inflate.wac");
   (mod.__cov_init as () => void)();
   const len = (mod.__cov_len as () => number)();
 
@@ -94,7 +94,7 @@ function readCounts(mod: Record<string, unknown>, n: number): number[] {
 
   // Streams from our own compressor, and from python at every level so stored,
   // fixed and dynamic blocks all appear.
-  const gz = await instrument("src/gzip.wac");
+  const gz = await instrument("packages/gzip/src/gzip.wac");
   (gz.mod.__cov_init as () => void)();
   const best = gz.mod.gzipBest as (d: Uint8Array) => Uint8Array;
   const storedFn = gz.mod.gzipStored as (d: Uint8Array) => Uint8Array;

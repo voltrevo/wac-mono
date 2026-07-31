@@ -1,0 +1,130 @@
+// wactest testing itself, in wac.
+//
+// The important cases are the negative ones: an assertion library that never
+// reports a failure would make every suite using it pass. So each assertion is
+// checked both ways — that it stays silent when it should, and that it records
+// when it should — by driving a second T and inspecting its report.
+
+import { T } from "../../src/assert.wac";
+import { itoa } from "../../src/itoa.wac";
+
+export string test_itoa() {
+  T t = T.create();
+  t.eqStr(itoa(0), "0", "zero");
+  t.eqStr(itoa(7), "7", "single digit");
+  t.eqStr(itoa(42), "42", "two digits");
+  t.eqStr(itoa(1000000), "1000000", "many digits");
+  t.eqStr(itoa(-1), "-1", "negative");
+  t.eqStr(itoa(-987), "-987", "negative multi-digit");
+  t.eqStr(itoa(2147483647), "2147483647", "i32 max");
+  // Negating i32 min overflows back to itself, so it needs its own path. Written
+  // as hex because the decimal form is not an i32 literal.
+  t.eqStr(itoa(0x80000000), "-2147483648", "i32 min");
+  return t.report();
+}
+
+export string test_passing_assertions_are_silent() {
+  T t = T.create();
+  T inner = T.create();
+
+  inner.eqI32(1, 1, "eq");
+  inner.neI32(1, 2, "ne");
+  inner.isTrue(true, "true");
+  inner.isFalse(false, "false");
+  inner.eqStr("a", "a", "str");
+  inner.eqI32Array(i32[](1, 2, 3), i32[](1, 2, 3), "arr");
+  inner.eqBytes(i8[](1, 2), i8[](1, 2), "bytes");
+
+  t.eqI32(inner.failed, 0, "no failures recorded");
+  t.eqStr(inner.report(), "", "report is empty");
+  return t.report();
+}
+
+export string test_failing_assertions_are_recorded() {
+  T t = T.create();
+
+  T eq = T.create();
+  eq.eqI32(3, 4, "eqI32");
+  t.eqI32(eq.failed, 1, "eqI32 records one failure");
+  t.eqStr(eq.report(), "1 failed: eqI32: got 3, want 4", "eqI32 message names both values");
+
+  T ne = T.create();
+  ne.neI32(5, 5, "neI32");
+  t.eqI32(ne.failed, 1, "neI32 records");
+
+  T tr = T.create();
+  tr.isTrue(false, "isTrue");
+  t.eqI32(tr.failed, 1, "isTrue records");
+
+  T fa = T.create();
+  fa.isFalse(true, "isFalse");
+  t.eqI32(fa.failed, 1, "isFalse records");
+
+  T st = T.create();
+  st.eqStr("got", "want", "eqStr");
+  t.eqI32(st.failed, 1, "eqStr records");
+
+  return t.report();
+}
+
+export string test_multiple_failures_accumulate() {
+  T t = T.create();
+  T inner = T.create();
+
+  inner.eqI32(1, 2, "first");
+  inner.eqI32(3, 4, "second");
+  inner.isTrue(false, "third");
+
+  t.eqI32(inner.failed, 3, "all three recorded, not just the first");
+  t.eqStr(inner.report(),
+    "3 failed: first: got 1, want 2; second: got 3, want 4; third: expected true",
+    "failures are joined in order");
+  return t.report();
+}
+
+export string test_array_length_mismatch_is_its_own_message() {
+  T t = T.create();
+
+  T len = T.create();
+  len.eqI32Array(i32[](1, 2), i32[](1, 2, 3), "arr");
+  t.eqI32(len.failed, 1, "length mismatch records");
+  t.eqStr(len.report(), "1 failed: arr: length 2, want 3", "reports lengths, not elements");
+
+  T elem = T.create();
+  elem.eqI32Array(i32[](1, 9, 3), i32[](1, 2, 3), "arr");
+  t.eqStr(elem.report(), "1 failed: arr: element 1 is 9, want 2", "names the index");
+
+  // Only the first differing element is reported — the rest is noise.
+  T many = T.create();
+  many.eqI32Array(i32[](9, 9, 9), i32[](1, 2, 3), "arr");
+  t.eqI32(many.failed, 1, "stops after the first difference");
+
+  return t.report();
+}
+
+export string test_bytes_compare_zero_extended() {
+  T t = T.create();
+
+  // i8[] reads zero-extend, so 0xFF is 255 rather than -1. If it compared as
+  // signed, this would spuriously fail.
+  i8[] a = i8[](0xFF, 0x00, 0x80);
+  i8[] b = i8[](255, 0, 128);
+  T inner = T.create();
+  inner.eqBytes(a, b, "bytes");
+  t.eqI32(inner.failed, 0, "0xFF equals 255");
+
+  T diff = T.create();
+  diff.eqBytes(i8[](1, 2), i8[](1, 3), "bytes");
+  t.eqStr(diff.report(), "1 failed: bytes: byte 1 is 2, want 3", "names the byte index");
+
+  return t.report();
+}
+
+export string test_failNow_records_without_a_condition() {
+  T t = T.create();
+  T inner = T.create();
+  inner.failNow("unreachable branch taken");
+  t.eqI32(inner.failed, 1, "failNow records");
+  t.eqStr(inner.report(), "1 failed: unreachable branch taken", "message passes through");
+  return t.report();
+}

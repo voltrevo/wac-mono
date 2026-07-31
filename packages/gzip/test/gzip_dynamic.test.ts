@@ -3,10 +3,10 @@
 // of the code lengths, the HLIT/HDIST/HCLEN counts, or the permuted transmission
 // order — and any of them yields a stream that gunzip rejects or mis-decodes.
 
-import { wacBind } from "../harness/wacBind.ts";
+import { wacBind } from "../../../harness/wacBind.ts";
 import { gunzip, pythonGzip, roundTrip } from "./util.ts";
 
-const mod = await wacBind("src/gzip.wac");
+const mod = await wacBind("packages/gzip/src/gzip.wac");
 const gzipDynamic = mod.gzipDynamic as (data: Uint8Array) => Uint8Array;
 
 Deno.test("gzipDynamic: block header is BFINAL=1, BTYPE=10", () => {

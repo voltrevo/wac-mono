@@ -1,0 +1,33 @@
+// Integer to decimal string.
+//
+// wac has no number-to-string conversion and `string + i32` is deliberately a
+// compile error, so a failure message that names the offending value needs this
+// first. It works because indexing a string yields a one-character string, so a
+// digit table can be indexed directly.
+
+/**
+ * Decimal representation of `n`, with a leading `-` when negative.
+ *
+ * i32 minimum is special-cased: negating it overflows back to itself, so the
+ * loop below would never terminate on it.
+ */
+export string itoa(i32 n) {
+  if (n == 0) { return "0"; }
+  // 0x80000000 rather than -2147483648: the decimal literal 2147483648 exceeds
+  // i32, so it types as i64 and negating it stays i64. Hex is a bit pattern, so
+  // this is the i32 minimum directly.
+  if (n == 0x80000000) { return "-2147483648"; }
+
+  string digits = "0123456789";
+  bool negative = n < 0;
+  i32 m = negative ? -n : n;
+
+  string out = "";
+  while (m > 0) {
+    out = digits[m % 10] + out;
+    m /= 10;
+  }
+
+  if (negative) { return "-" + out; }
+  return out;
+}

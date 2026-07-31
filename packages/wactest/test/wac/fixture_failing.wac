@@ -1,0 +1,13 @@
+// A test that is meant to fail, used to prove failures actually propagate.
+//
+// Not named *_test.wac so it is never picked up as part of the suite. Without a
+// fixture like this, a runner that ignored the returned report would make every
+// wac test pass and nothing would notice.
+
+import { T } from "../../src/assert.wac";
+
+export string test_deliberately_fails() {
+  T t = T.create();
+  t.eqI32(1, 2, "deliberate");
+  return t.report();
+}

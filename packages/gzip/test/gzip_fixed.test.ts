@@ -4,10 +4,10 @@
 // is exactly what an external decompressor catches and a self-round-trip does
 // not.
 
-import { wacBind } from "../harness/wacBind.ts";
+import { wacBind } from "../../../harness/wacBind.ts";
 import { gunzip, roundTrip } from "./util.ts";
 
-const mod = await wacBind("src/gzip.wac");
+const mod = await wacBind("packages/gzip/src/gzip.wac");
 const gzipFixed = mod.gzipFixed as (data: Uint8Array) => Uint8Array;
 
 Deno.test("gzipFixed: gunzip round trips", async () => {

@@ -8,12 +8,12 @@
 // Seeds are fixed, so a failure is reproducible and can be pinned as a
 // regression test by index.
 
-import { wacBind } from "../harness/wacBind.ts";
+import { wacBind } from "../../../harness/wacBind.ts";
 import { bytesEqual } from "./util.ts";
 import { buildCorpus, makeRng } from "./fuzz/corpus.ts";
 
-const gzipMod = await wacBind("src/gzip.wac");
-const inflateMod = await wacBind("src/inflate.wac");
+const gzipMod = await wacBind("packages/gzip/src/gzip.wac");
+const inflateMod = await wacBind("packages/gzip/src/inflate.wac");
 const gzipBest = gzipMod.gzipBest as (d: Uint8Array) => Uint8Array;
 const gzipDynamic = gzipMod.gzipDynamic as (d: Uint8Array) => Uint8Array;
 const gunzipBytes = inflateMod.gunzipBytes as (gz: Uint8Array) => Uint8Array;
@@ -37,7 +37,7 @@ Deno.test("fuzz: python reads everything we write, and we read everything python
 
     // One python pass: read ours, and write theirs for us to read back.
     const cmd = new Deno.Command("python3", {
-      args: ["test/fuzz/oracle.py", work, String(corpus.length)],
+      args: ["packages/gzip/test/fuzz/oracle.py", work, String(corpus.length)],
       stdout: "piped",
       stderr: "piped",
     });

@@ -1,0 +1,117 @@
+// Huffman construction tested in wac, importing both the library under test and
+// the assertion library from a sibling package.
+//
+// This replaces test/probe/huffman_probe.wac, which existed only to re-export
+// internals one value at a time so TypeScript could reach them — each property
+// needed its own export whose whole job was to compute a number for the host to
+// compare. Here the assertions live next to the thing being asserted.
+//
+// Fibonacci frequencies throughout: each weight is the sum of the two below it,
+// so the tree degenerates into a chain. That is the worst case for code length
+// and therefore the way to exercise DEFLATE's 15-bit limit.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa } from "../../../wactest/src/itoa.wac";
+import { Huff } from "../../src/huffman.wac";
+
+i32[] fibFreqs(i32 count) {
+  i32[] freq = i32[count]();
+  if (count > 0) { freq[0] = 1; }
+  if (count > 1) { freq[1] = 1; }
+  for (i32 i = 2; i < count; i++) {
+    freq[i] = freq[i - 1] + freq[i - 2];
+  }
+  return freq;
+}
+
+export string test_length_limit_is_enforced() {
+  T t = T.create();
+  i32[] counts = i32[](2, 3, 8, 20, 30, 40, 60, 100, 286);
+  for (i32 i = 0; i < counts.len(); i++) {
+    Huff h = Huff.build(fibFreqs(counts[i]), counts[i], 15);
+    t.isTrue(h.maxLen <= 15, "count " + itoa(counts[i]) + " max length " + itoa(h.maxLen));
+    t.isTrue(h.maxLen >= 1, "count " + itoa(counts[i]) + " produced a code at all");
+  }
+  return t.report();
+}
+
+export string test_the_limit_actually_binds() {
+  // If an unlimited build of this input stayed under 15 bits, the test above would
+  // pass without the limiter ever running.
+  T t = T.create();
+  Huff unlimited = Huff.build(fibFreqs(40), 40, 30);
+  t.isTrue(unlimited.maxLen > 15,
+    "unlimited build reaches " + itoa(unlimited.maxLen) + " bits, needs to exceed 15");
+  return t.report();
+}
+
+export string test_cl_alphabet_limit_is_seven_bits() {
+  T t = T.create();
+  i32[] counts = i32[](2, 5, 10, 19);
+  for (i32 i = 0; i < counts.len(); i++) {
+    Huff h = Huff.build(fibFreqs(counts[i]), counts[i], 7);
+    t.isTrue(h.maxLen <= 7, "count " + itoa(counts[i]) + " max length " + itoa(h.maxLen));
+  }
+  return t.report();
+}
+
+export string test_kraft_equality() {
+  // Sum of 2^(maxLen - len) over used symbols must be exactly 2^maxLen. Less means
+  // the code is incomplete — some bit patterns decode to nothing. More means it is
+  // over-subscribed and two symbols share a pattern.
+  T t = T.create();
+  i32[] counts = i32[](2, 3, 8, 19, 20, 40, 100, 286);
+  for (i32 c = 0; c < counts.len(); c++) {
+    i32 n = counts[c];
+    Huff h = Huff.build(fibFreqs(n), n, 15);
+    i32 sum = 0;
+    for (i32 i = 0; i < n; i++) {
+      if (h.len[i] > 0) {
+        sum += 1 << (h.maxLen - h.len[i]);
+      }
+    }
+    t.eqI32(sum, 1 << h.maxLen, "kraft sum for count " + itoa(n));
+  }
+  return t.report();
+}
+
+export string test_codes_form_a_prefix_code() {
+  T t = T.create();
+  i32[] counts = i32[](2, 3, 8, 20, 40, 100, 286);
+  for (i32 c = 0; c < counts.len(); c++) {
+    i32 n = counts[c];
+    Huff h = Huff.build(fibFreqs(n), n, 15);
+    i32 violations = 0;
+    for (i32 i = 0; i < n; i++) {
+      if (h.len[i] == 0) { continue; }
+      for (i32 j = 0; j < n; j++) {
+        if (h.len[j] == 0 || i == j) { continue; }
+        if (h.len[i] <= h.len[j]) {
+          // Is i's code a prefix of j's? Compare against j's leading bits.
+          if ((h.code[j] >>> (h.len[j] - h.len[i])) == h.code[i]) {
+            violations++;
+          }
+        }
+      }
+    }
+    t.eqI32(violations, 0, "prefix violations for count " + itoa(n));
+  }
+  return t.report();
+}
+
+export string test_codes_fit_their_stated_width() {
+  T t = T.create();
+  i32[] counts = i32[](2, 3, 8, 20, 40, 100, 286);
+  for (i32 c = 0; c < counts.len(); c++) {
+    i32 n = counts[c];
+    Huff h = Huff.build(fibFreqs(n), n, 15);
+    i32 overlong = 0;
+    for (i32 i = 0; i < n; i++) {
+      if (h.len[i] > 0 && h.code[i] >= (1 << h.len[i])) {
+        overlong++;
+      }
+    }
+    t.eqI32(overlong, 0, "codes wider than their length, count " + itoa(n));
+  }
+  return t.report();
+}

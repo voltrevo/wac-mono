@@ -11,13 +11,16 @@ function resolveFrom(fromPath: string, spec: string): string {
   const dir = fromPath.includes("/") ? fromPath.slice(0, fromPath.lastIndexOf("/")) : ".";
   const joined = `${dir}/${spec}`;
   // Collapse `a/./b` and `a/b/../c` so the same file is never keyed two ways.
+  // An absolute path keeps its leading slash — normalising it away silently turns
+  // it into a relative path and the read fails somewhere far from the cause.
+  const absolute = joined.startsWith("/");
   const parts: string[] = [];
   for (const part of joined.split("/")) {
     if (part === "." || part === "") continue;
     if (part === ".." && parts.length > 0 && parts[parts.length - 1] !== "..") parts.pop();
     else parts.push(part);
   }
-  return parts.join("/");
+  return (absolute ? "/" : "") + parts.join("/");
 }
 
 export async function wacFiles(entry: string): Promise<Map<string, string>> {

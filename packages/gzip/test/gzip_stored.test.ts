@@ -3,9 +3,9 @@
 // wrong ISIZE, or bad block framing all fail here rather than being reasoned
 // about.
 
-import { wacBind } from "../harness/wacBind.ts";
+import { wacBind } from "../../../harness/wacBind.ts";
 
-const mod = await wacBind("src/gzip.wac");
+const mod = await wacBind("packages/gzip/src/gzip.wac");
 const gzipStored = mod.gzipStored as (data: Uint8Array) => Uint8Array;
 
 /** Decompress with the system gunzip; throws if it rejects the stream. */

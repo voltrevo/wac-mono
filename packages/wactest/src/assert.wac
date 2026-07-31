@@ -1,0 +1,122 @@
+// Assertions for tests written in wac.
+//
+// The shape is dictated by what wac provides. There is no top-level mutable
+// state, so failures accumulate in a value the test owns and hands back. `trap`
+// carries no message, so assertions record instead of trapping — which also means
+// one test reports every failure rather than only the first.
+//
+// A test is an exported function returning `string`: empty means pass, anything
+// else is the failure report. Nothing needs to know the test exists beyond that,
+// because a runner can enumerate exports named `test*` from the compiled module's
+// export list.
+//
+//   import { T } from "../../wactest/src/assert.wac";
+//
+//   export string test_adds() {
+//     T t = T.create();
+//     t.eqI32(2 + 2, 4, "two plus two");
+//     return t.report();
+//   }
+//
+// What this deliberately does not cover: anything needing an external oracle.
+// Differential tests against another implementation, or interop with a real tool,
+// cannot run inside wasm and belong in a host-side test.
+
+import { itoa } from "./itoa.wac";
+
+export struct T {
+  i32 failed;
+  string messages;
+
+  T create() {
+    return T(0, "");
+  }
+
+  // ── Recording ───────────────────────────────────────────────────────────────
+
+  /** Record a failure. Assertions funnel through here. */
+  void fail(this, string what) {
+    this.failed++;
+    if (this.messages.len() > 0) {
+      this.messages += "; ";
+    }
+    this.messages += what;
+  }
+
+  /** Fail unconditionally — for a branch that should be unreachable. */
+  void failNow(this, string what) {
+    this.fail(what);
+  }
+
+  // ── Assertions ──────────────────────────────────────────────────────────────
+
+  void isTrue(this, bool cond, string what) {
+    if (!cond) {
+      this.fail(what + ": expected true");
+    }
+  }
+
+  void isFalse(this, bool cond, string what) {
+    if (cond) {
+      this.fail(what + ": expected false");
+    }
+  }
+
+  void eqI32(this, i32 got, i32 want, string what) {
+    if (got != want) {
+      this.fail(what + ": got " + itoa(got) + ", want " + itoa(want));
+    }
+  }
+
+  void neI32(this, i32 got, i32 unwanted, string what) {
+    if (got == unwanted) {
+      this.fail(what + ": got " + itoa(got) + ", wanted anything else");
+    }
+  }
+
+  void eqStr(this, string got, string want, string what) {
+    if (got != want) {
+      this.fail(what + ": got \"" + got + "\", want \"" + want + "\"");
+    }
+  }
+
+  /** Every element must match, and the lengths must agree. */
+  void eqI32Array(this, i32[] got, i32[] want, string what) {
+    if (got.len() != want.len()) {
+      this.fail(what + ": length " + itoa(got.len()) + ", want " + itoa(want.len()));
+      return;
+    }
+    for (i32 i = 0; i < got.len(); i++) {
+      if (got[i] != want[i]) {
+        this.fail(what + ": element " + itoa(i) + " is " + itoa(got[i])
+          + ", want " + itoa(want[i]));
+        return;   // one differing element is enough; the rest is noise
+      }
+    }
+  }
+
+  /** Same, for byte arrays. Reads are zero-extended, so these compare as 0..255. */
+  void eqBytes(this, i8[] got, i8[] want, string what) {
+    if (got.len() != want.len()) {
+      this.fail(what + ": length " + itoa(got.len()) + ", want " + itoa(want.len()));
+      return;
+    }
+    for (i32 i = 0; i < got.len(); i++) {
+      if (got[i] != want[i]) {
+        this.fail(what + ": byte " + itoa(i) + " is " + itoa(got[i])
+          + ", want " + itoa(want[i]));
+        return;
+      }
+    }
+  }
+
+  // ── Result ──────────────────────────────────────────────────────────────────
+
+  /** Empty when everything passed, otherwise the accumulated failures. */
+  string report(const this) {
+    if (this.failed == 0) {
+      return "";
+    }
+    return itoa(this.failed) + " failed: " + this.messages;
+  }
+}

@@ -3,9 +3,9 @@
 // Nothing is eyeballed, and none of them are round numbers that could pass by
 // coincidence.
 
-import { wacBind } from "../harness/wacBind.ts";
+import { wacBind } from "../../../harness/wacBind.ts";
 
-const mod = await wacBind("src/crc32.wac");
+const mod = await wacBind("packages/gzip/src/crc32.wac");
 const crc32 = mod.crc32 as (data: Uint8Array) => number;
 
 /** zlib returns unsigned; wac returns the same bits as a signed i32. */

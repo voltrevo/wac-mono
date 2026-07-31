@@ -10,9 +10,9 @@
 // Streams are assembled bit by bit with the fixed Huffman code, which needs no
 // transmitted tables and so can be written by hand.
 
-import { wacBind } from "../harness/wacBind.ts";
+import { wacBind } from "../../../harness/wacBind.ts";
 
-const inflateMod = await wacBind("src/inflate.wac");
+const inflateMod = await wacBind("packages/gzip/src/inflate.wac");
 const inflateRaw = inflateMod.inflate as (data: Uint8Array) => Uint8Array;
 
 /** LSB-first bit writer, mirroring src/bitwriter.wac. */
