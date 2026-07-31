@@ -1,11 +1,13 @@
 # fmt
 
-Decimal and `f64`, converted exactly in both directions.
+Numbers to and from text.
 
 - `ftoa(x)` — the shortest digit sequence that reads back as the same double,
   formatted exactly as JavaScript's `Number::toString`.
 - `atofSpan(src, start, end)` — the double nearest a decimal, ties to even.
   Correctly rounded for every input.
+- `itoa(n)` — an `i32` in decimal.
+- `ftoa32` / `atof32Span` — the same pair for `f32`.
 
 ```wac
 import { ftoa, ftoaBytes, writeF64 } from "../../fmt/src/ftoa.wac";
@@ -98,8 +100,54 @@ random decimals across the whole exponent range, and *constructed exact midpoint
 — decimals sitting precisely between two doubles, where always-round-up and
 always-truncate both fail.
 
+## Speed
+
+Formatting is not on anyone's hot path; parsing is, so it has three tiers.
+
+A scan that allocates nothing decides the common case: up to 19 digits accumulate
+into a `u64`, and if the significand is under 2^53 with an exponent inside the
+exactly-representable powers of ten, one multiply or divide is the answer.
+Clinger's extension stretches that to exponents up to 37 by pushing the excess into
+the significand while it still fits.
+
+Only what fails all of that reaches the bignum, and it starts from a **verified**
+bracket: a cheap f64 estimate gives a ±4-ulp window, both ends are checked by exact
+comparison, and a bad end widens to the full range. The estimate can cost time,
+never correctness — which is exactly the distinction the first version of this file
+got wrong by trusting one.
+
+Measured through json, MB/s of document:
+
+| document | before | after |
+|---|---:|---:|
+| small integers | 18.9 | 64.4 |
+| simple decimals | 23.9 | 75.7 |
+| exponent-form | 0.5 | 8.7 |
+| long-mantissa | 1.9 | 20.6 |
+
+Three things got it there, in order of size: not allocating an 800-byte digit
+buffer for every number including `1`; hoisting the power-of-ten scaling out of the
+bisection, where it had been rebuilt on all 63 iterations; and the narrow bracket,
+which cuts those iterations to about three.
+
+## f32
+
+Both directions, sharing the machinery. Digit generation takes the significand,
+exponent and boundary rules as parameters, so `f32` is a decomposition and not a
+second copy of Burger & Dybvig. Parsing needs its own bisection — the two return
+different types and wac has no generics — but the exact comparison underneath is
+shared, since it works on a significand and a binary exponent and does not care
+where they came from.
+
+`atof32Span` is **not** "parse to f64, then narrow". That rounds twice, and the two
+roundings disagree for decimals sitting near an f32 boundary.
+
+JavaScript has no `f32`, so `String(x)` is not the oracle it was for doubles.
+Instead the two defining properties are checked directly: the output must read back
+as the same `f32`, and no decimal with fewer significant digits may do so. That is
+what shortest-round-tripping means, and asserting it is stronger than agreeing with
+another implementation.
+
 ## Not here yet
 
-- `itoa`. `wactest` has one; it belongs here, but moving it is that package's call.
-- `f32`, in either direction. The algorithms are the same with different constants.
 - Fixed-precision output (`toFixed`-style). Only shortest is implemented.

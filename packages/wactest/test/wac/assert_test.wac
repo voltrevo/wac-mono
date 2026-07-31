@@ -6,7 +6,7 @@
 // when it should — by driving a second T and inspecting its report.
 
 import { T } from "../../src/assert.wac";
-import { itoa } from "../../src/itoa.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
 
 export string test_itoa() {
   T t = T.create();

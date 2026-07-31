@@ -42,9 +42,29 @@ export Decimal decompose(f64 x) {
   bool neg = (bits >> 63) != 0;
   i32 be = ((bits >> 52) & 2047) as@ i32;
   u64 frac = bits & 4503599627370495;          // low 52 bits
+  // 11 exponent bits, bias 1075, implicit bit at 2^52.
+  return decomposeFloat(neg, be, frac, 2047, 4503599627370496, 1075);
+}
 
+/** The same, for an f32: 8 exponent bits, bias 150, implicit bit at 2^23. */
+export Decimal decompose32(f32 x) {
+  u32 bits = f32.toBits(x);
+  bool neg = (bits >> 31) != 0;
+  i32 be = ((bits >> 23) & 255) as@ i32;
+  u64 frac = (bits & 8388607) as u64;          // low 23 bits
+  return decomposeFloat(neg, be, frac, 255, 8388608, 150);
+}
+
+/**
+ * Digit generation, shared by both widths.
+ *
+ * Everything below the decomposition is identical for f32 and f64 — only the
+ * exponent field's width, the bias and the implicit bit differ, so they are
+ * parameters rather than a second copy of Burger & Dybvig.
+ */
+Decimal decomposeFloat(bool neg, i32 be, u64 frac, i32 maxBe, u64 implicitBit, i32 bias) {
   Decimal d = Decimal(u8[24](), 0, 0, neg, false, false);
-  if (be == 2047) {
+  if (be == maxBe) {
     if (frac != 0) { d.isNaN = true; } else { d.isInf = true; }
     return d;
   }
@@ -57,21 +77,21 @@ export Decimal decompose(f64 x) {
   }
 
   u64 f = frac;
-  i32 e = -1074;
+  i32 e = 1 - bias;
   // A normal number's implicit leading bit, and the asymmetric-gap test. The gap
   // below is half the gap above only when the significand is at its minimum and
   // the exponent is not, since at be == 1 the neighbour below is subnormal and the
   // spacing is the same on both sides.
   bool lowerCloser = false;
   // With round-half-to-even, a decimal landing exactly on the boundary between
-  // this double and its neighbour reads back as this one when the significand is
+  // this float and its neighbour reads back as this one when the significand is
   // even. So the boundary is attainable, and the stopping tests below are
   // inclusive. Getting this wrong does not produce wrong digits — it produces one
   // or two more of them than necessary, which is how it was found.
   bool boundaryOk = false;
   if (be != 0) {
-    f = frac + 4503599627370496;               // 2^52
-    e = be - 1075;
+    f = frac + implicitBit;
+    e = be - bias;
     lowerCloser = (frac == 0 && be > 1);
   }
   boundaryOk = (f & 1) == 0;
@@ -221,9 +241,32 @@ export string ftoa(f64 x) {
   return out.toStr();
 }
 
-export void writeF64(Buf out, f64 x) {
-  Decimal d = decompose(x);
+/** The same for an f32: shortest digits that read back as the same f32. */
+export string ftoa32(f32 x) {
+  Buf out = Buf.create();
+  writeDecimal(out, decompose32(x));
+  return out.toStr();
+}
 
+export u8[] ftoa32Bytes(f32 x) {
+  Buf out = Buf.create();
+  writeDecimal(out, decompose32(x));
+  return out.bytes();
+}
+
+export void writeF32(Buf out, f32 x) { writeDecimal(out, decompose32(x)); }
+
+export void writeF64(Buf out, f64 x) { writeDecimal(out, decompose(x)); }
+
+/**
+ * Format generated digits, by ECMA-262's Number::toString rules.
+ *
+ * Applied to f32 as well. ECMA-262 defines the rules for doubles, but they are a
+ * function of the digit count and the decimal exponent, not of the width — and
+ * using the same thresholds for both means one reader does not have to hold two
+ * sets of them.
+ */
+void writeDecimal(Buf out, Decimal d) {
   if (d.isNaN) {
     out.pushAll(u8[]('N', 'a', 'N'));
     return;

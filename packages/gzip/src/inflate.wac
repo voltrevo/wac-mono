@@ -223,9 +223,9 @@ i32[] fixedDistLengths() {
   return lengths;
 }
 
-i32[] clOrder() {
-  return i32[](16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);
-}
+// The code-length code order from RFC 1951 §3.2.7. A module-level constant, so
+// it is built once at instantiation rather than on every call.
+const i32[] CL_ORDER = i32[](16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);
 
 /**
  * Read a dynamic block's two code tables. Returns the literal/length lengths
@@ -239,7 +239,7 @@ i32[] readDynamicLengths(BitReader br, i32[] outSplit) {
   if (hlit > 286 || hdist > 30) { trap; }   // beyond what the format defines
 
   // The code-length code, sent in a fixed permuted order.
-  i32[] order = clOrder();
+  i32[] order = CL_ORDER;
   i32[] clLengths = i32[19]();
   for (i32 i = 0; i < hclen; i++) {
     clLengths[order[i]] = br.readBits(3);

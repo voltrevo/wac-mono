@@ -1,0 +1,152 @@
+// Poly1305, as specified in RFC 8439.
+//
+// The message is read as a sequence of 128-bit numbers, each with a 1 bit
+// appended, and evaluated as a polynomial in the key `r` modulo 2^130 - 5. The
+// prime is what makes the reduction cheap: 2^130 = 5 (mod p), so anything
+// overflowing 130 bits folds back in as a multiply by 5.
+//
+// ## Why 26-bit limbs
+//
+// 130 bits split five ways is 26 bits each. The multiply forms five sums of
+// five limb products, with a factor of 5 on the folded terms, so the widest
+// accumulator holds 5 * (2^26-1)^2 * 5 ~= 1.1e17 against a u64's 1.8e19 — about
+// 164x of headroom. That is what lets carries be deferred to the end of the
+// multiply instead of propagated inside it.
+//
+// 32-bit limbs would not do: two of those multiply to a full 64 bits with
+// nothing left to sum into. The odd-looking split is forced by the arithmetic,
+// and it is why this needs u32 and u64 together rather than either alone.
+
+u32 mask26() { return 0x3ffffff; }
+
+/** Little-endian u32 at byte offset `i`. */
+u32 leWord(u8[] b, i32 i) {
+  return (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) as@ u32;
+}
+
+/**
+ * The one-time authenticator for `msg` under the 32-byte `key`, 16 bytes.
+ *
+ * The key is r || s: r is the evaluation point, clamped so intermediate values
+ * stay inside the limb bounds, and s is the final additive blind.
+ */
+export u8[] poly1305(u8[] key, u8[] msg) {
+  u32 t0 = leWord(key, 0);
+  u32 t1 = leWord(key, 4);
+  u32 t2 = leWord(key, 8);
+  u32 t3 = leWord(key, 12);
+
+  // These masks fold RFC 8439's clamp into the 26-bit split in one step.
+  u32 r0 = t0 & 0x3ffffff;
+  u32 r1 = ((t0 >> 26) | (t1 << 6)) & 0x3ffff03;
+  u32 r2 = ((t1 >> 20) | (t2 << 12)) & 0x3ffc0ff;
+  u32 r3 = ((t2 >> 14) | (t3 << 18)) & 0x3f03fff;
+  u32 r4 = (t3 >> 8) & 0x00fffff;
+
+  // A limb past position 130 re-enters multiplied by 5.
+  u32 s1 = r1 * 5; u32 s2 = r2 * 5; u32 s3 = r3 * 5; u32 s4 = r4 * 5;
+
+  u32 h0 = 0; u32 h1 = 0; u32 h2 = 0; u32 h3 = 0; u32 h4 = 0;
+
+  i32 n = msg.len();
+  i32 pos = 0;
+  while (pos < n) {
+    i32 take = n - pos < 16 ? n - pos : 16;
+
+    // A whole block carries an implicit 1 at bit 128; a short final block puts
+    // that 1 straight after the data, so it is padded here rather than flagged.
+    u8[] blk = u8[16]();
+    for (i32 i = 0; i < take; i++) { blk[i] = msg[pos + i]; }
+    u32 hibit = 0;
+    if (take == 16) { hibit = 1 << 24; } else { blk[take] = 1; }
+
+    u32 b0 = leWord(blk, 0);
+    u32 b1 = leWord(blk, 4);
+    u32 b2 = leWord(blk, 8);
+    u32 b3 = leWord(blk, 12);
+
+    h0 += b0 & 0x3ffffff;
+    h1 += ((b0 >> 26) | (b1 << 6)) & 0x3ffffff;
+    h2 += ((b1 >> 20) | (b2 << 12)) & 0x3ffffff;
+    h3 += ((b2 >> 14) | (b3 << 18)) & 0x3ffffff;
+    h4 += (b3 >> 8) | hibit;
+
+    // h *= r (mod 2^130-5). Both sides widen to u64 first — losslessly, which
+    // is why these are `as` rather than a checked cast.
+    u64 d0 = (h0 as u64) * (r0 as u64) + (h1 as u64) * (s4 as u64)
+           + (h2 as u64) * (s3 as u64) + (h3 as u64) * (s2 as u64)
+           + (h4 as u64) * (s1 as u64);
+    u64 d1 = (h0 as u64) * (r1 as u64) + (h1 as u64) * (r0 as u64)
+           + (h2 as u64) * (s4 as u64) + (h3 as u64) * (s3 as u64)
+           + (h4 as u64) * (s2 as u64);
+    u64 d2 = (h0 as u64) * (r2 as u64) + (h1 as u64) * (r1 as u64)
+           + (h2 as u64) * (r0 as u64) + (h3 as u64) * (s4 as u64)
+           + (h4 as u64) * (s3 as u64);
+    u64 d3 = (h0 as u64) * (r3 as u64) + (h1 as u64) * (r2 as u64)
+           + (h2 as u64) * (r1 as u64) + (h3 as u64) * (r0 as u64)
+           + (h4 as u64) * (s4 as u64);
+    u64 d4 = (h0 as u64) * (r4 as u64) + (h1 as u64) * (r3 as u64)
+           + (h2 as u64) * (r2 as u64) + (h3 as u64) * (r1 as u64)
+           + (h4 as u64) * (r0 as u64);
+
+    // One carry pass, deferred until here because the headroom allowed it.
+    u64 c = d0 >> 26; h0 = (d0 as@ u32) & mask26();
+    d1 += c; c = d1 >> 26; h1 = (d1 as@ u32) & mask26();
+    d2 += c; c = d2 >> 26; h2 = (d2 as@ u32) & mask26();
+    d3 += c; c = d3 >> 26; h3 = (d3 as@ u32) & mask26();
+    d4 += c; c = d4 >> 26; h4 = (d4 as@ u32) & mask26();
+    h0 += (c as@ u32) * 5;
+    u32 cw = h0 >> 26; h0 = h0 & mask26();
+    h1 += cw;
+
+    pos += 16;
+  }
+
+  // Carry the accumulator fully.
+  u32 cc = h1 >> 26; h1 = h1 & mask26();
+  h2 += cc; cc = h2 >> 26; h2 = h2 & mask26();
+  h3 += cc; cc = h3 >> 26; h3 = h3 & mask26();
+  h4 += cc; cc = h4 >> 26; h4 = h4 & mask26();
+  h0 += cc * 5; cc = h0 >> 26; h0 = h0 & mask26();
+  h1 += cc;
+
+  // h - p, computed unconditionally and selected with a mask rather than a
+  // branch, following the reference implementation.
+  u32 g0 = h0 + 5; cc = g0 >> 26; g0 = g0 & mask26();
+  u32 g1 = h1 + cc; cc = g1 >> 26; g1 = g1 & mask26();
+  u32 g2 = h2 + cc; cc = g2 >> 26; g2 = g2 & mask26();
+  u32 g3 = h3 + cc; cc = g3 >> 26; g3 = g3 & mask26();
+  u32 g4 = h4 + cc - (1 << 26);
+
+  // g4's top bit is the borrow: set means h < p, so keep h. The wrap of 0 - 1
+  // to all-ones is deliberate, and is one of the places this must be unsigned.
+  u32 sel = (g4 >> 31) - 1;
+  u32 keep = ~sel;
+  h0 = (h0 & keep) | (g0 & sel);
+  h1 = (h1 & keep) | (g1 & sel);
+  h2 = (h2 & keep) | (g2 & sel);
+  h3 = (h3 & keep) | (g3 & sel);
+  h4 = (h4 & keep) | (g4 & sel);
+
+  // Back to four 32-bit words, then add s with carries.
+  u32 f0 = h0 | (h1 << 26);
+  u32 f1 = (h1 >> 6) | (h2 << 20);
+  u32 f2 = (h2 >> 12) | (h3 << 14);
+  u32 f3 = (h3 >> 18) | (h4 << 8);
+
+  u64 acc = (f0 as u64) + (leWord(key, 16) as u64); f0 = acc as@ u32;
+  acc = (f1 as u64) + (leWord(key, 20) as u64) + (acc >> 32); f1 = acc as@ u32;
+  acc = (f2 as u64) + (leWord(key, 24) as u64) + (acc >> 32); f2 = acc as@ u32;
+  acc = (f3 as u64) + (leWord(key, 28) as u64) + (acc >> 32); f3 = acc as@ u32;
+
+  u32[] words = u32[](f0, f1, f2, f3);
+  u8[] out = u8[16]();
+  for (i32 i = 0; i < 4; i++) {
+    u32 v = words[i];
+    out[i * 4]     = (v & 255) as@ i32;
+    out[i * 4 + 1] = ((v >> 8) & 255) as@ i32;
+    out[i * 4 + 2] = ((v >> 16) & 255) as@ i32;
+    out[i * 4 + 3] = ((v >> 24) & 255) as@ i32;
+  }
+  return out;
+}

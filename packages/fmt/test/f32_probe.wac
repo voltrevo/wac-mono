@@ -1,0 +1,8 @@
+// Test fixture: f32 formatting across the bindgen boundary.
+import { ftoa32Bytes } from "../src/ftoa.wac";
+
+export u8[] fmt32(f32 x) { return ftoa32Bytes(x); }
+
+import { atof32Span } from "../src/atof.wac";
+
+export f32 parse32(u8[] src) { return atof32Span(src, 0, src.len()); }

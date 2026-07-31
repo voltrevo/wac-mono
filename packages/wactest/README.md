@@ -72,5 +72,8 @@ a false comparison pass it.
 
 Both name the offending value in the failure message, which needs float-to-string
 and so depends on [`fmt`](../fmt/). That dependency is why they did not exist
-before: an assertion that cannot say what it got is close to useless, which is the
-same reason this package ships `itoa`.
+before: an assertion that cannot say what it got is close to useless.
+
+`itoa` used to live here for the same reason and has moved to `fmt`, next to
+`ftoa` — same job, other numeric type, and a test library is not the natural home
+for number formatting.

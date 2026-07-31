@@ -110,6 +110,31 @@ check on its re-serialization, and a bug that cancelled itself out between parse
 and stringify would pass. These reach kinds, member ordering, decoded string
 contents and container growth where they live.
 
+## Speed
+
+`packages/json/bench/throughput.ts` measures by document shape rather than as one
+number, because an aggregate hides everything: a parser can be fast on structure
+and slow on numbers and still look reasonable.
+
+| shape | MB/s |
+|---|---:|
+| strings with escapes | 132 |
+| long ASCII strings | 109 |
+| structure only | 98 |
+| multi-byte UTF-8 strings | 96 |
+| objects, long keys | 88 |
+| realistic mixed | 82 |
+| simple decimals | 76 |
+| small integers | 64 |
+| objects, short keys | 40 |
+| long-mantissa numbers | 21 |
+| exponent-form numbers | 9 |
+
+Numbers used to be the whole story — 19 MB/s for small integers, 0.5 for
+exponent-form — and the fixes were in `packages/fmt`; see its README. What remains
+is per-node allocation: a `JsonNumber` for every number and a `JsonMember` for every
+member, which is why short keys cost more per byte than long ones.
+
 ## Layout
 
 ```
