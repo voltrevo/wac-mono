@@ -1,0 +1,76 @@
+// ChaCha20-Poly1305 AEAD, as specified in RFC 8439 §2.8.
+//
+// Encrypt-then-MAC: the plaintext is encrypted with ChaCha20 starting at
+// counter 1, and the tag covers the associated data and the *ciphertext*, never
+// the plaintext. The one-time Poly1305 key comes from ChaCha20 block 0 under
+// the same key and nonce, which is why counter 1 is where the message starts.
+
+import { chachaBlock, chacha20 } from "./chacha20.wac";
+import { poly1305 } from "./poly1305.wac";
+
+/** Bytes needed to round `n` up to a 16-byte boundary. */
+i32 padLen(i32 n) {
+  i32 r = n % 16;
+  return r == 0 ? 0 : 16 - r;
+}
+
+/** The one-time Poly1305 key: the first 32 bytes of keystream block 0. */
+u8[] oneTimeKey(u8[] key, u8[] nonce) {
+  u8[] block = chachaBlock(key, 0, nonce);
+  u8[] otk = u8[32]();
+  for (i32 i = 0; i < 32; i++) { otk[i] = block[i]; }
+  return otk;
+}
+
+/**
+ * The authenticated data: aad || pad || ciphertext || pad || len(aad) ||
+ * len(ciphertext), each length a little-endian u64.
+ *
+ * The padding and the explicit lengths are what stop a byte moving between the
+ * associated data and the ciphertext without changing the tag.
+ */
+u8[] macInput(u8[] aad, u8[] ct) {
+  i32 aPad = padLen(aad.len());
+  i32 cPad = padLen(ct.len());
+  u8[] m = u8[aad.len() + aPad + ct.len() + cPad + 16]();
+
+  i32 p = 0;
+  for (i32 i = 0; i < aad.len(); i++) { m[p] = aad[i]; p++; }
+  p += aPad;
+  for (i32 i = 0; i < ct.len(); i++) { m[p] = ct[i]; p++; }
+  p += cPad;
+
+  i64 aLen = aad.len() as i64;
+  i64 cLen = ct.len() as i64;
+  for (i32 i = 0; i < 8; i++) { m[p + i] = ((aLen >> ((i * 8) as i64)) & 255) as! i32; }
+  for (i32 i = 0; i < 8; i++) { m[p + 8 + i] = ((cLen >> ((i * 8) as i64)) & 255) as! i32; }
+  return m;
+}
+
+/** The 16-byte tag over `aad` and `ct`. */
+export u8[] aeadTag(u8[] key, u8[] nonce, u8[] aad, u8[] ct) {
+  return poly1305(oneTimeKey(key, nonce), macInput(aad, ct));
+}
+
+/** Ciphertext for `plain`. The tag is a separate call, so callers choose the framing. */
+export u8[] aeadEncrypt(u8[] key, u8[] nonce, u8[] plain) {
+  return chacha20(key, 1, nonce, plain);
+}
+
+/**
+ * Plaintext for `ct`, or a trap if the tag does not match.
+ *
+ * Trapping rather than returning a status is deliberate: an AEAD whose failure
+ * can be ignored by a caller who forgets to check is the classic misuse, and
+ * wac has no way to return a value the type system forces you to inspect.
+ */
+export u8[] aeadDecrypt(u8[] key, u8[] nonce, u8[] aad, u8[] ct, u8[] tag) {
+  u8[] want = aeadTag(key, nonce, aad, ct);
+  if (tag.len() != 16) { trap; }
+  // Compared without an early exit. Not a constant-time guarantee — wac gives
+  // no such control — but it costs nothing and removes the obvious leak.
+  i32 diff = 0;
+  for (i32 i = 0; i < 16; i++) { diff |= want[i] ^ tag[i]; }
+  if (diff != 0) { trap; }
+  return chacha20(key, 1, nonce, ct);
+}
