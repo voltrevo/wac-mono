@@ -1,0 +1,121 @@
+// Properties the published vectors do not check.
+//
+// A fixed vector proves one input maps to one output. It says nothing about
+// whether the construction *depends* on everything it should — an
+// implementation that ignored its key would still pass a single HMAC vector if
+// that vector were the one it hard-coded. These check the dependencies.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { sha256 } from "../../src/sha256.wac";
+import { hmacSha256 } from "../../src/hmac.wac";
+import { chacha20 } from "../../src/chacha20.wac";
+import { hkdf } from "../../src/hkdf.wac";
+
+/** Bytes differing between two equal-length arrays. */
+i32 diffCount(u8[] a, u8[] b) {
+  i32 n = 0;
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { n++; }
+  }
+  return n;
+}
+
+u8[] filled(i32 n, i32 v) {
+  u8[] b = u8[n]();
+  for (i32 i = 0; i < n; i++) { b[i] = v; }
+  return b;
+}
+
+export string test_sha256_avalanche() {
+  T t = T.create();
+  u8[] a = filled(64, 0);
+  u8[] b = filled(64, 0);
+  b[31] = 1;                      // one bit, in the middle of the block
+  u8[] ha = sha256(a);
+  u8[] hb = sha256(b);
+  // A correct hash changes about 31 of 32 bytes; anything under 20 means whole
+  // words are passing through untouched.
+  t.eqI32(ha.len(), 32, "digest length");
+  if (diffCount(ha, hb) < 20) {
+    t.fail("one input bit changed fewer than 20 output bytes");
+  }
+  return t.report();
+}
+
+export string test_sha256_length_matters() {
+  T t = T.create();
+  // Padding must bind the length: these differ only in trailing zeros, and a
+  // hash that skipped the length field would collide on them.
+  u8[] short1 = filled(3, 0);
+  u8[] long1 = filled(4, 0);
+  if (diffCount(sha256(short1), sha256(long1)) == 0) {
+    t.fail("digests of 3 and 4 zero bytes collided — length is not bound in");
+  }
+  return t.report();
+}
+
+export string test_hmac_depends_on_key() {
+  T t = T.create();
+  u8[] msg = filled(40, 7);
+  u8[] k1 = filled(32, 1);
+  u8[] k2 = filled(32, 2);
+  if (diffCount(hmacSha256(k1, msg), hmacSha256(k2, msg)) == 0) {
+    t.fail("HMAC ignored the key");
+  }
+  // A key at exactly the block size and one just over take different paths.
+  u8[] at = filled(64, 3);
+  u8[] over = filled(65, 3);
+  if (diffCount(hmacSha256(at, msg), hmacSha256(over, msg)) == 0) {
+    t.fail("64- and 65-byte keys produced the same tag");
+  }
+  return t.report();
+}
+
+export string test_chacha_roundtrip_and_keystream() {
+  T t = T.create();
+  u8[] key = filled(32, 9);
+  u8[] nonce = filled(12, 4);
+  // 197 bytes: three whole blocks and a partial one.
+  u8[] msg = u8[197]();
+  for (i32 i = 0; i < 197; i++) { msg[i] = (i * 31 + 7) & 0xFF; }
+
+  u8[] ct = chacha20(key, 1, nonce, msg);
+  u8[] back = chacha20(key, 1, nonce, ct);
+  t.eqI32(diffCount(back, msg), 0, "decrypt undoes encrypt");
+  if (diffCount(ct, msg) < 150) {
+    t.fail("ciphertext too close to plaintext — keystream may be mostly zero");
+  }
+  // A different counter must give a different keystream, or blocks repeat.
+  u8[] ct2 = chacha20(key, 2, nonce, msg);
+  if (diffCount(ct, ct2) == 0) {
+    t.fail("counter had no effect");
+  }
+  return t.report();
+}
+
+export string test_hkdf_lengths_and_binding() {
+  T t = T.create();
+  u8[] salt = filled(16, 0xAB);
+  u8[] ikm = filled(32, 5);
+  u8[] infoA = filled(4, 1);
+  u8[] infoB = filled(4, 2);
+
+  t.eqI32(hkdf(salt, ikm, infoA, 1).len(), 1, "one byte out");
+  t.eqI32(hkdf(salt, ikm, infoA, 100).len(), 100, "spanning four blocks");
+
+  // A prefix property: the first 32 bytes of a longer expansion are the same
+  // bytes as a 32-byte expansion, because T(1) does not depend on the length.
+  u8[] a32 = hkdf(salt, ikm, infoA, 32);
+  u8[] a100 = hkdf(salt, ikm, infoA, 100);
+  i32 same = 0;
+  for (i32 i = 0; i < 32; i++) {
+    if (a32[i] == a100[i]) { same++; }
+  }
+  t.eqI32(same, 32, "the first block is a prefix of a longer expansion");
+
+  // info must be bound in, or two contexts would share key material.
+  if (diffCount(hkdf(salt, ikm, infoA, 32), hkdf(salt, ikm, infoB, 32)) == 0) {
+    t.fail("info had no effect on the output");
+  }
+  return t.report();
+}
