@@ -1,0 +1,53 @@
+// Result<T, E> — a value or an error, as a type rather than a convention.
+//
+// wac has `trap`, which carries no message and cannot be caught, so a function that can
+// fail has had three options: trap, return a sentinel, or return a bool and write the real
+// answer through an out-parameter struct. json's parser uses the third and it costs a
+// struct per call site.
+//
+// `E` is a type parameter rather than a fixed error type because the useful error differs:
+// a parser wants a message and a position, an arithmetic routine wants a code, and a
+// caller that only branches wants nothing but the fact of failure — `Result<T, bool>`.
+
+import { Option } from "./option.wac";
+
+export enum Result<T, E> {
+  Ok(T v), Err(E e)
+
+  bool isOk(const this) {
+    return match (this) { case Ok(_): true, case Err(_): false };
+  }
+
+  bool isErr(const this) {
+    return match (this) { case Ok(_): false, case Err(_): true };
+  }
+
+  /** The value, or `d` if this is an error. */
+  T orElse(const this, T d) {
+    return match (this) { case Ok(v): v, case Err(_): d };
+  }
+
+  /** The value, or a trap. For when an error here means the program is wrong. */
+  T unwrap(const this) {
+    match (this) {
+      case Ok(v): return v;
+      case Err(_): trap;
+    }
+  }
+
+  /** The value if there is one, discarding the error — for when only presence matters. */
+  Option<T> ok(const this) {
+    return match (this) {
+      case Ok(v): Option.Some(v),
+      case Err(_): Option.None,
+    };
+  }
+
+  /** The error if there is one. */
+  Option<E> err(const this) {
+    return match (this) {
+      case Ok(_): Option.None,
+      case Err(e): Option.Some(e),
+    };
+  }
+}

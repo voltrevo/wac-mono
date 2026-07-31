@@ -1,0 +1,380 @@
+// Map's own tests.
+//
+// A hash table has two kinds of bug: the ones a handful of insertions find, and the ones
+// that need a specific probe sequence. So there are two kinds of test here — direct
+// assertions, and a differential run against a naive association list over a pseudo-random
+// operation sequence, which is the only thing that reaches the second kind.
+//
+// `badHash` exists for the same reason: with every key hashing to the same slot, the table
+// degenerates to a single probe run, which is where insert, lookup, growth and
+// backward-shift deletion all have to agree with each other.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Map } from "../../src/map.wac";
+import { Vec } from "../../src/vec.wac";
+import { Option } from "../../src/option.wac";
+import { hashString, stringEq, hashI32, i32Eq, hashI64, i64Eq } from "../../src/hash.wac";
+
+/** Every key in one slot. Legal, and the worst case a hash may be. */
+i32 badHash(i32 k) { return 0; }
+
+/** Only the low two bits, so keys collide in groups of four however large the table is. */
+i32 weakHash(i32 k) { return k & 3; }
+
+struct Point { i32 x; i32 y; }
+
+i32 hashPoint(Point p) { return hashI32(p.x * 31 + p.y); }
+bool pointEq(Point a, Point b) { return a.x == b.x && a.y == b.y; }
+
+export string test_basics() {
+  T t = T.create();
+  Map<string, i32> m = Map.create(hashString, stringEq);
+  t.eqI32(m.len(), 0, "starts empty");
+  t.isTrue(m.isEmpty(), "isEmpty");
+  t.isTrue(m.get("nothing").isNone(), "a lookup in an empty map");
+
+  t.isTrue(!m.set("one", 1), "set returns false for a new key");
+  t.isTrue(!m.set("two", 2), "and again");
+  t.eqI32(m.len(), 2, "length counts entries");
+  t.eqI32(m.get("one").orElse(-1), 1, "get finds a value");
+  t.eqI32(m.getOr("two", -1), 2, "getOr too");
+  t.eqI32(m.getOr("three", -1), -1, "and gives the default when absent");
+  t.isTrue(m.has("one"), "has");
+  t.isTrue(!m.has("three"), "and not for an absent key");
+  t.isTrue(m.get("three").isNone(), "get is None when absent");
+
+  t.isTrue(m.set("one", 11), "set returns true when overwriting");
+  t.eqI32(m.len(), 2, "overwriting does not change the length");
+  t.eqI32(m.getOr("one", -1), 11, "and the value is the new one");
+  return t.report();
+}
+
+export string test_growth_keeps_every_entry() {
+  T t = T.create();
+  // Growth rehashes, and a rehash that loses or duplicates an entry is the classic bug.
+  // 500 keys is several doublings from the initial 8 slots.
+  Map<i32, i32> m = Map.create(hashI32, i32Eq);
+  for (i32 i = 0; i < 500; i++) { m.set(i, i * 3); }
+  t.eqI32(m.len(), 500, "every key counted once");
+
+  i32 wrong = 0;
+  for (i32 i = 0; i < 500; i++) { if (m.getOr(i, -1) != i * 3) { wrong++; } }
+  t.eqI32(wrong, 0, "and every value survived the rehashes");
+
+  i32 present = 0;
+  for (i32 i = 500; i < 1000; i++) { if (m.has(i)) { present++; } }
+  t.eqI32(present, 0, "and nothing was invented");
+  t.isTrue(m.capacity() >= 500, "the table grew");
+  return t.report();
+}
+
+export string test_load_factor_bounds_the_table() {
+  T t = T.create();
+  // The table must stay under its load factor, because a full open-addressed table makes
+  // `slotFor` loop forever. Asserted rather than assumed: this is the invariant that turns
+  // a subtle bug into a hang.
+  Map<i32, i32> m = Map.create(hashI32, i32Eq);
+  i32 tooFull = 0;
+  for (i32 i = 0; i < 300; i++) {
+    m.set(i, i);
+    if (m.len() * 4 > m.capacity() * 3) { tooFull++; }
+  }
+  t.eqI32(tooFull, 0, "the table never exceeds three quarters full");
+  return t.report();
+}
+
+export string test_collisions() {
+  T t = T.create();
+  // Every key in one slot: insertion, lookup and growth all walk one long probe run.
+  Map<i32, string> m = Map.create(badHash, i32Eq);
+  for (i32 i = 0; i < 40; i++) { m.set(i, "v"); }
+  t.eqI32(m.len(), 40, "all 40 inserted despite hashing alike");
+  i32 missing = 0;
+  for (i32 i = 0; i < 40; i++) { if (!m.has(i)) { missing++; } }
+  t.eqI32(missing, 0, "and all 40 are findable");
+  t.isTrue(!m.has(40), "and a key that was never inserted is not");
+
+  // Groups of four, which is the more realistic shape: several short runs rather than one
+  // long one, so a probe that stops early fails here and not above.
+  Map<i32, i32> w = Map.create(weakHash, i32Eq);
+  for (i32 i = 0; i < 64; i++) { w.set(i, i); }
+  i32 wrong = 0;
+  for (i32 i = 0; i < 64; i++) { if (w.getOr(i, -1) != i) { wrong++; } }
+  t.eqI32(wrong, 0, "every key in a four-way collision is found");
+  return t.report();
+}
+
+export string test_remove() {
+  T t = T.create();
+  Map<i32, i32> m = Map.create(hashI32, i32Eq);
+  t.isTrue(!m.remove(1), "removing from empty is false");
+
+  for (i32 i = 0; i < 20; i++) { m.set(i, i * 2); }
+  t.isTrue(m.remove(7), "remove returns true when it removed something");
+  t.eqI32(m.len(), 19, "and shortens");
+  t.isTrue(!m.has(7), "the key is gone");
+  t.isTrue(!m.remove(7), "and removing it again is false");
+
+  i32 wrong = 0;
+  for (i32 i = 0; i < 20; i++) {
+    if (i == 7) { continue; }
+    if (m.getOr(i, -1) != i * 2) { wrong++; }
+  }
+  t.eqI32(wrong, 0, "every other entry is untouched");
+  return t.report();
+}
+
+export string test_remove_keeps_probe_runs_contiguous() {
+  T t = T.create();
+  // The reason `remove` shifts entries back rather than leaving a tombstone: a hole in the
+  // middle of a probe run makes everything after it unreachable. With every key in one slot
+  // the whole table *is* one run, so removing from the middle is the worst case.
+  Map<i32, i32> m = Map.create(badHash, i32Eq);
+  for (i32 i = 0; i < 20; i++) { m.set(i, i); }
+  // Remove from the middle of the run, in an order that leaves holes behind holes.
+  m.remove(5); m.remove(6); m.remove(10); m.remove(0); m.remove(19);
+  t.eqI32(m.len(), 15, "five removed");
+
+  i32 unreachable = 0;
+  for (i32 i = 0; i < 20; i++) {
+    bool shouldBeThere = !(i == 5 || i == 6 || i == 10 || i == 0 || i == 19);
+    if (shouldBeThere != m.has(i)) { unreachable++; }
+  }
+  t.eqI32(unreachable, 0, "and every surviving key is still reachable");
+
+  // Reinsertion has to find the freed slots rather than run off the end of the table.
+  m.set(5, 55); m.set(0, 100);
+  t.eqI32(m.getOr(5, -1), 55, "a removed key can be reinserted");
+  t.eqI32(m.getOr(0, -1), 100, "including the first one");
+  t.eqI32(m.len(), 17, "with the length keeping up");
+  return t.report();
+}
+
+export string test_fill_and_empty_repeatedly() {
+  T t = T.create();
+  // Tombstones would accumulate here and eventually make every probe walk the whole table.
+  // Backward-shift deletion is what keeps this from degrading, and the observable
+  // consequence is that the table does not grow: it is never more than a quarter full.
+  Map<i32, i32> m = Map.create(hashI32, i32Eq);
+  for (i32 round = 0; round < 50; round++) {
+    for (i32 i = 0; i < 8; i++) { m.set(round * 8 + i, i); }
+    for (i32 i = 0; i < 8; i++) { m.remove(round * 8 + i); }
+  }
+  t.eqI32(m.len(), 0, "empty again after 400 insert/remove pairs");
+  t.isTrue(m.capacity() <= 32, "and the table did not grow to hold the dead entries");
+  m.set(1, 1);
+  t.eqI32(m.getOr(1, -1), 1, "and it still works");
+  return t.report();
+}
+
+export string test_clear() {
+  T t = T.create();
+  Map<string, i32> m = Map.create(hashString, stringEq);
+  m.set("a", 1); m.set("b", 2); m.set("c", 3);
+  i32 cap = m.capacity();
+  m.clear();
+  t.eqI32(m.len(), 0, "cleared");
+  t.isTrue(m.isEmpty(), "and empty");
+  t.isTrue(!m.has("a"), "nothing is findable");
+  t.eqI32(m.capacity(), cap, "the table is kept");
+  m.set("a", 9);
+  t.eqI32(m.getOr("a", -1), 9, "and it is reusable");
+  t.eqI32(m.len(), 1, "with the right length");
+  return t.report();
+}
+
+export string test_keys_and_values() {
+  T t = T.create();
+  Map<i32, i32> m = Map.create(hashI32, i32Eq);
+  t.eqI32(m.keys().len(), 0, "an empty map has no keys");
+  t.eqI32(m.values().len(), 0, "nor values");
+
+  for (i32 i = 0; i < 10; i++) { m.set(i, i * i); }
+  i32[] ks = m.keys();
+  i32[] vs = m.values();
+  t.eqI32(ks.len(), 10, "one key per entry");
+  t.eqI32(vs.len(), 10, "one value per entry");
+
+  // The order is unspecified, so what is checkable is that the two arrays correspond and
+  // that every key appears exactly once.
+  i32 mismatched = 0;
+  for (i32 i = 0; i < ks.len(); i++) { if (vs[i] != ks[i] * ks[i]) { mismatched++; } }
+  t.eqI32(mismatched, 0, "keys and values are in the same order");
+
+  i32 sum = 0;
+  for (i32 i = 0; i < ks.len(); i++) { sum = sum + ks[i]; }
+  t.eqI32(sum, 45, "and every key from 0..9 appears exactly once");
+  return t.report();
+}
+
+export string test_key_types() {
+  T t = T.create();
+  // Hash and equality as funcrefs mean K needs nothing of its own — including being a
+  // struct the Map has never heard of.
+  Map<Point, string> pts = Map.create(hashPoint, pointEq);
+  pts.set(Point(1, 2), "a");
+  pts.set(Point(3, 4), "b");
+  t.eqStr(pts.getOr(Point(1, 2), ""), "a", "a struct key, found by value rather than identity");
+  t.eqStr(pts.getOr(Point(3, 4), ""), "b", "and another");
+  t.isTrue(!pts.has(Point(1, 3)), "a key that differs in one field is a different key");
+
+  Map<i64, i32> longs = Map.create(hashI64, i64Eq);
+  longs.set(9000000000, 1);
+  t.eqI32(longs.getOr(9000000000, -1), 1, "an i64 key above the i32 range");
+  t.isTrue(!longs.has(9000000001), "and its neighbour is not it");
+
+  // A value type that is itself generic, which is the shape json will want.
+  Map<string, Vec<i32>> lists = Map.create(hashString, stringEq);
+  Vec<i32> xs = Vec.create();
+  xs.push(7);
+  lists.set("xs", xs);
+  t.eqI32(lists.getOr("xs", Vec.create()).get(0), 7, "a Vec value");
+  return t.report();
+}
+
+export string test_with_capacity() {
+  T t = T.create();
+  Map<i32, i32> m = Map.withCapacity(100, hashI32, i32Eq);
+  i32 cap = m.capacity();
+  t.isTrue(cap >= 134, "the table is sized for the load factor, not the count");
+  for (i32 i = 0; i < 100; i++) { m.set(i, i); }
+  t.eqI32(m.capacity(), cap, "and 100 entries needed no growth");
+  t.eqI32(m.len(), 100, "all present");
+  return t.report();
+}
+
+// ── Differential: Map against a naive association list ───────────────────────
+//
+// The oracle is two parallel Vecs with linear search, which is obviously correct and
+// obviously too slow to use. Both get the same pseudo-random operation sequence and are
+// compared after every step, so a divergence is reported at the operation that caused it
+// rather than at the end.
+//
+// This is where a probe-sequence bug shows up: it needs a specific interleaving of
+// insertions, overwrites and removals against a specific table size, which no
+// hand-written case is going to hit.
+
+struct Naive {
+  Vec<i32> keys;
+  Vec<i32> vals;
+
+  Naive create() { return Naive(Vec.create(), Vec.create()); }
+
+  i32 find(const this, i32 k) {
+    for (i32 i = 0; i < this.keys.len(); i++) {
+      if (this.keys.get(i) == k) { return i; }
+    }
+    return -1;
+  }
+
+  void set(this, i32 k, i32 v) {
+    i32 at = this.find(k);
+    if (at >= 0) { this.vals.set(at, v); return; }
+    this.keys.push(k);
+    this.vals.push(v);
+  }
+
+  bool remove(this, i32 k) {
+    i32 at = this.find(k);
+    if (at < 0) { return false; }
+    this.keys.swapRemove(at);
+    this.vals.swapRemove(at);
+    return true;
+  }
+
+  Option<i32> get(const this, i32 k) {
+    i32 at = this.find(k);
+    return at < 0 ? Option.None : Option.Some(this.vals.get(at));
+  }
+
+  i32 len(const this) { return this.keys.len(); }
+}
+
+/** One step of an LCG — the same constants as `rand()` in Numerical Recipes. */
+u32 nextRand(u32 seed) { return seed * 1664525 + 1013904223; }
+
+string differential(fn[i32(i32)] hash, i32 keySpace, i32 steps, u32 seed0) {
+  T t = T.create();
+  Map<i32, i32> m = Map.create(hash, i32Eq);
+  Naive naive = Naive.create();
+  u32 seed = seed0;
+
+  for (i32 step = 0; step < steps; step++) {
+    seed = nextRand(seed);
+    i32 k = ((seed >> 8) % (keySpace as@ u32)) as@ i32;
+    seed = nextRand(seed);
+    u32 what = (seed >> 8) % 4;
+
+    if (what == 0) {
+      // A removal, which is a quarter of the operations so the table both fills and empties.
+      bool a = m.remove(k);
+      bool b = naive.remove(k);
+      if (a != b) {
+        t.failNow("remove disagreed at step " + itoaLocal(step) + " for key " + itoaLocal(k));
+        return t.report();
+      }
+    } else {
+      i32 v = step * 7 + 1;
+      m.set(k, v);
+      naive.set(k, v);
+    }
+
+    if (m.len() != naive.len()) {
+      t.failNow("length disagreed at step " + itoaLocal(step) +
+                ": map " + itoaLocal(m.len()) + " vs naive " + itoaLocal(naive.len()));
+      return t.report();
+    }
+
+    // Every key in the space, every step: with a small space that is cheap and it catches a
+    // wrong answer at the operation that caused it.
+    for (i32 probe = 0; probe < keySpace; probe++) {
+      Option<i32> got = m.get(probe);
+      Option<i32> want = naive.get(probe);
+      if (got.isSome() != want.isSome()) {
+        t.failNow("presence disagreed at step " + itoaLocal(step) +
+                  " for key " + itoaLocal(probe));
+        return t.report();
+      }
+      if (got.orElse(0) != want.orElse(0)) {
+        t.failNow("value disagreed at step " + itoaLocal(step) +
+                  " for key " + itoaLocal(probe));
+        return t.report();
+      }
+    }
+  }
+  return t.report();
+}
+
+/** Decimal, for the failure messages. `itoa` lives in fmt and this file needs only this. */
+string itoaLocal(i32 v) {
+  if (v == 0) { return "0"; }
+  bool neg = v < 0;
+  i32 n = neg ? -v : v;
+  string out = "";
+  while (n > 0) {
+    out = digitOf(n % 10) + out;
+    n = n / 10;
+  }
+  return neg ? "-" + out : out;
+}
+
+string digitOf(i32 d) {
+  return d == 0 ? "0" : d == 1 ? "1" : d == 2 ? "2" : d == 3 ? "3" : d == 4 ? "4"
+       : d == 5 ? "5" : d == 6 ? "6" : d == 7 ? "7" : d == 8 ? "8" : "9";
+}
+
+export string test_differential_good_hash() {
+  return differential(hashI32, 24, 400, 12345);
+}
+
+export string test_differential_all_collide() {
+  // The same sequence against a hash that puts everything in one slot, so the whole table is
+  // one probe run and backward-shift deletion is exercised on every removal.
+  return differential(badHash, 16, 300, 777);
+}
+
+export string test_differential_weak_hash() {
+  // Four-way collision groups: several short runs, which is where a removal that shifts one
+  // entry too far or not far enough shows up.
+  return differential(weakHash, 20, 300, 999);
+}

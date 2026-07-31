@@ -1,0 +1,215 @@
+// Map<K, V> — a hash map, open-addressed with linear probing.
+//
+// The measured demand: `json`'s object lookup is O(n) in the number of members, so a
+// document that reads the same object repeatedly is quadratic. Nothing in this repo could
+// fix that before generics, because a map over `string -> JsonValue` written by hand would
+// have been a fourth hand-rolled container.
+//
+// **Hash and equality arrive as funcrefs**, not as a requirement on K. wac has no traits, so
+// there is no `K: Hash` to ask for — and the funcrefs turn out to be better than a trait
+// would have been: `hash.wac` has the ready-made ones, and a caller who wants
+// case-insensitive keys or hashing on one field of a struct passes their own without
+// wrapping the key type.
+//
+// Linear probing rather than chaining because it needs one array rather than one per bucket,
+// and WasmGC arrays are the only allocation wac gives cheaply. Deletion is backward-shift,
+// not tombstones, so a table that is filled and emptied repeatedly does not degrade.
+
+import { Option } from "./option.wac";
+
+/**
+ * One slot's contents.
+ *
+ * A struct rather than parallel `K[]`/`V[]` arrays because an empty slot has to be
+ * representable: `Entry<K, V>?[]` is an array of nulls at creation, whereas `K[n]()` needs a
+ * default value for K and a struct or enum has none. The nullable is the same trick
+ * `json`'s hand-written containers use, and it costs one reference per slot.
+ */
+struct MapEntry<K, V> {
+  K key;
+  V val;
+}
+
+export struct Map<K, V> {
+  MapEntry<K, V>?[] slots;
+  i32 n;
+  fn[i32(K)] hash;
+  fn[bool(K, K)] eq;
+
+  /**
+   * An empty Map.
+   *
+   * ```wac
+   * Map<string, i32> m = Map.create(hashString, stringEq);
+   * ```
+   *
+   * The type arguments come from the declared type; the funcrefs say how K behaves.
+   */
+  Map<K, V> create(fn[i32(K)] hash, fn[bool(K, K)] eq) {
+    return Map(MapEntry<K, V>?[8](), 0, hash, eq);
+  }
+
+  /** An empty Map with room for `capacity` entries before it has to grow. */
+  Map<K, V> withCapacity(i32 capacity, fn[i32(K)] hash, fn[bool(K, K)] eq) {
+    // Slots are a power of two so the mask replaces a modulo, and the load factor is 3/4, so
+    // the array has to be a third larger than the capacity asked for.
+    i32 want = capacity + capacity / 3 + 1;
+    i32 size = 8;
+    while (size < want) { size = size * 2; }
+    return Map(MapEntry<K, V>?[size](), 0, hash, eq);
+  }
+
+  i32 len(const this) { return this.n; }
+
+  bool isEmpty(const this) { return this.n == 0; }
+
+  /** Slots allocated. Interesting only when measuring growth. */
+  i32 capacity(const this) { return this.slots.len(); }
+
+  /**
+   * The slot `k` lives in, or the first free slot on its probe sequence.
+   *
+   * One function for lookup and insert, because they walk the same sequence and separating
+   * them means writing the probe loop twice. The caller tells the two cases apart by asking
+   * whether the slot is null.
+   */
+  i32 slotFor(const this, K k) {
+    i32 mask = this.slots.len() - 1;
+    i32 i = this.hash(k) & mask;
+    while (true) {
+      MapEntry<K, V>? e = this.slots[i];
+      if (e is null) { return i; }
+      if (this.eq(e!.key, k)) { return i; }
+      i = (i + 1) & mask;
+    }
+    // Unreachable: the table is never full — `set` grows at 3/4 load — so the loop always
+    // finds a null slot. Without a `return` here the checker cannot see that.
+    return -1;
+  }
+
+  /** The value for `k`, or None. */
+  Option<V> get(const this, K k) {
+    MapEntry<K, V>? e = this.slots[this.slotFor(k)];
+    if (e is null) { return Option.None; }
+    return Option.Some(e!.val);
+  }
+
+  /** The value for `k`, or `d` — for when absence has an obvious answer. */
+  V getOr(const this, K k, V d) {
+    MapEntry<K, V>? e = this.slots[this.slotFor(k)];
+    return e is null ? d : e!.val;
+  }
+
+  bool has(const this, K k) {
+    MapEntry<K, V>? e = this.slots[this.slotFor(k)];
+    return !(e is null);
+  }
+
+  /** Insert or overwrite. True if `k` was already present. */
+  bool set(this, K k, V v) {
+    // Grown before the insert rather than after, so the slot index this computes stays valid.
+    if ((this.n + 1) * 4 > this.slots.len() * 3) { this.grow(); }
+    i32 i = this.slotFor(k);
+    MapEntry<K, V>? e = this.slots[i];
+    if (e is null) {
+      this.slots[i] = MapEntry(k, v);
+      this.n++;
+      return false;
+    }
+    // The key stays as it was first inserted: for a K where equality is looser than identity
+    // — case-insensitive strings — overwriting it would silently change what the caller sees
+    // back from an iteration.
+    e!.val = v;
+    return true;
+  }
+
+  /**
+   * Remove `k`. True if it was there.
+   *
+   * Backward-shift deletion: an entry after the hole is moved into it if the hole is at
+   * least as close to where that entry wants to be. That keeps every probe sequence
+   * contiguous without tombstones, which is what stops a table that is filled and emptied
+   * repeatedly from filling with dead slots.
+   */
+  bool remove(this, K k) {
+    i32 mask = this.slots.len() - 1;
+    i32 hole = this.slotFor(k);
+    if (this.slots[hole] is null) { return false; }
+    this.slots[hole] = null;
+    this.n--;
+
+    i32 j = hole;
+    while (true) {
+      j = (j + 1) & mask;
+      MapEntry<K, V>? e = this.slots[j];
+      if (e is null) { return true; }
+      i32 ideal = this.hash(e!.key) & mask;
+      // Move it back only if the hole is on or after its ideal slot, cyclically — which is
+      // exactly "the hole is not inside the run this entry has already probed past".
+      if (!this.cyclicBetween(ideal, hole, j)) {
+        this.slots[hole] = e;
+        this.slots[j] = null;
+        hole = j;
+      }
+    }
+    return true;
+  }
+
+  /** Is `x` in the cyclic interval (a, b]? Used only by `remove`. */
+  bool cyclicBetween(const this, i32 x, i32 a, i32 b) {
+    if (a < b) { return x > a && x <= b; }
+    return x > a || x <= b;
+  }
+
+  void clear(this) {
+    for (i32 i = 0; i < this.slots.len(); i++) { this.slots[i] = null; }
+    this.n = 0;
+  }
+
+  /**
+   * Every key, in slot order — which is to say an order the caller must not rely on. It
+   * depends on the hash, the capacity, and the insertion history.
+   */
+  K[] keys(const this) {
+    K[] out = K[]();
+    i32 seen = 0;
+    for (i32 i = 0; i < this.slots.len(); i++) {
+      MapEntry<K, V>? e = this.slots[i];
+      if (e is null) { continue; }
+      // The first live entry supplies the fill value, which is why the array is not
+      // allocated before the loop: there is nothing to fill it with until one is found.
+      if (seen == 0) { out = K[this.n](fill: e!.key); }
+      out[seen] = e!.key;
+      seen++;
+    }
+    return out;
+  }
+
+  /** Every value, in the same order as `keys()`. */
+  V[] values(const this) {
+    V[] out = V[]();
+    i32 seen = 0;
+    for (i32 i = 0; i < this.slots.len(); i++) {
+      MapEntry<K, V>? e = this.slots[i];
+      if (e is null) { continue; }
+      if (seen == 0) { out = V[this.n](fill: e!.val); }
+      out[seen] = e!.val;
+      seen++;
+    }
+    return out;
+  }
+
+  /** Double the table and reinsert. Private in spirit; wac has no way to say so. */
+  void grow(this) {
+    MapEntry<K, V>?[] old = this.slots;
+    this.slots = MapEntry<K, V>?[old.len() * 2]();
+    this.n = 0;
+    for (i32 i = 0; i < old.len(); i++) {
+      MapEntry<K, V>? e = old[i];
+      if (e is null) { continue; }
+      // Through `set` rather than a raw store, so the probe sequence is built by the same
+      // code that reads it. `set` cannot recurse into `grow` here: the table just doubled.
+      this.set(e!.key, e!.val);
+    }
+  }
+}

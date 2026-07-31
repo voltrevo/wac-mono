@@ -1,0 +1,153 @@
+// Vec<T> — a growable array.
+//
+// The container this repo wrote by hand three times before generics existed: `Buf` over
+// `u8`, `JsonArray.items` over `JsonValue?`, `JsonObject.members` over `JsonMember?`.
+// `Buf` stays as it is — it is a byte buffer with `pushU16`/`pushU32` and a measured
+// reason for `len` to be a field rather than a method — but nothing else needs writing
+// again.
+//
+// Capacity doubles, so n pushes cost O(n) amortised.
+//
+// One shape note that is wac rather than taste: growing an array needs a value to fill it
+// with, because `T[n]()` requires T to have a default and a struct or enum has none. The
+// value being pushed is always available at exactly the moment growth is needed, so `push`
+// fills with it. That is why there is no `reserve()` without an element and why
+// `withCapacity` asks for one.
+
+import { Option } from "./option.wac";
+
+export struct Vec<T> {
+  T[] data;
+  i32 n;
+
+  /** An empty Vec. Zero capacity, so the first push allocates. */
+  Vec<T> create() {
+    // The array *literal* form with no elements, not `T[0]()`: a sized array needs a default
+    // value for T and an enum or a struct has none, whereas a literal with no elements needs
+    // nothing. That is what makes an empty `Vec<Option<i32>>` possible at all.
+    return Vec(T[](), 0);
+  }
+
+  /**
+   * An empty Vec with room for `capacity` elements.
+   *
+   * `fill` is never read: the slots above `n` are unreachable through `get`, and `push`
+   * overwrites before it increments. It is a parameter because WasmGC arrays are
+   * initialised on creation and wac will not invent a value for a T it knows nothing about.
+   */
+  Vec<T> withCapacity(i32 capacity, T fill) {
+    if (capacity < 0) { trap; }
+    return Vec(T[capacity](fill: fill), 0);
+  }
+
+  /** A Vec over an existing array, taking ownership of it — no copy. */
+  Vec<T> fromArray(T[] xs) {
+    return Vec(xs, xs.len());
+  }
+
+  i32 len(const this) { return this.n; }
+
+  bool isEmpty(const this) { return this.n == 0; }
+
+  /** Allocated room, which is only interesting when measuring growth. */
+  i32 capacity(const this) { return this.data.len(); }
+
+  /** Element `i`. Traps outside `0 <= i < len()`, as an array index does. */
+  T get(const this, i32 i) {
+    if (i < 0 || i >= this.n) { trap; }
+    return this.data[i];
+  }
+
+  /** Element `i`, or None rather than a trap. */
+  Option<T> at(const this, i32 i) {
+    if (i < 0 || i >= this.n) { return Option.None; }
+    return Option.Some(this.data[i]);
+  }
+
+  void set(this, i32 i, T v) {
+    if (i < 0 || i >= this.n) { trap; }
+    this.data[i] = v;
+  }
+
+  void push(this, T v) {
+    if (this.n == this.data.len()) {
+      // Doubling zero is zero, so the floor matters: `create()` starts at zero capacity and
+      // without it the store below would go out of bounds. Buf learned the same thing.
+      i32 grown = this.data.len() == 0 ? 4 : this.data.len() * 2;
+      T[] next = T[grown](fill: v);
+      for (i32 i = 0; i < this.n; i++) { next[i] = this.data[i]; }
+      this.data = next;
+    }
+    this.data[this.n] = v;
+    this.n++;
+  }
+
+  /** The last element, removed. None if empty. */
+  Option<T> pop(this) {
+    if (this.n == 0) { return Option.None; }
+    this.n--;
+    // The slot keeps its reference: there is no value to overwrite it with, so a popped
+    // element stays reachable from the backing array until something else is pushed over
+    // it. It matters only if T is large and the Vec is long-lived.
+    return Option.Some(this.data[this.n]);
+  }
+
+  Option<T> last(const this) {
+    return this.n == 0 ? Option.None : Option.Some(this.data[this.n - 1]);
+  }
+
+  Option<T> first(const this) {
+    return this.n == 0 ? Option.None : Option.Some(this.data[0]);
+  }
+
+  /**
+   * Remove element `i`, shifting everything after it down. O(n).
+   *
+   * `swapRemove` is the O(1) alternative when order does not matter.
+   */
+  T remove(this, i32 i) {
+    if (i < 0 || i >= this.n) { trap; }
+    T out = this.data[i];
+    for (i32 j = i; j < this.n - 1; j++) { this.data[j] = this.data[j + 1]; }
+    this.n--;
+    return out;
+  }
+
+  /** Remove element `i` by moving the last element into its place. O(1), reorders. */
+  T swapRemove(this, i32 i) {
+    if (i < 0 || i >= this.n) { trap; }
+    T out = this.data[i];
+    this.data[i] = this.data[this.n - 1];
+    this.n--;
+    return out;
+  }
+
+  /** Insert `v` at `i`, shifting everything from `i` up. `i == len()` appends. */
+  void insert(this, i32 i, T v) {
+    if (i < 0 || i > this.n) { trap; }
+    this.push(v);                       // grows if needed, and puts v at the end
+    for (i32 j = this.n - 1; j > i; j--) { this.data[j] = this.data[j - 1]; }
+    this.data[i] = v;
+  }
+
+  /**
+   * Forget every element.
+   *
+   * Keeps the capacity, and keeps the elements reachable from the backing array for the
+   * same reason `pop` does.
+   */
+  void clear(this) { this.n = 0; }
+
+  /** Everything, as an array of exactly `len()` — a copy, so the Vec may still be used. */
+  T[] toArray(const this) {
+    if (this.n == 0) { return T[](); }
+    T[] out = T[this.n](fill: this.data[0]);
+    for (i32 i = 0; i < this.n; i++) { out[i] = this.data[i]; }
+    return out;
+  }
+
+  /** Append every element of `other`, which is left alone. */
+  void extend(this, const Vec<T> other) {
+    for (i32 i = 0; i < other.n; i++) { this.push(other.data[i]); }
+  }
+}

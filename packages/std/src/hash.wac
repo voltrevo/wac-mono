@@ -1,0 +1,62 @@
+// Hash and equality functions for the key types worth having ready-made.
+//
+// `Map<K, V>` takes its hash and equality as funcrefs rather than requiring anything of K,
+// because wac has no traits and no constraints on type parameters. That is not only a
+// workaround: it also lets one key type be hashed two ways — case-insensitively, or on a
+// field of a struct — without a wrapper type.
+//
+// A hash may return any i32. `Map` masks it, so a poor low bit distribution costs
+// collisions rather than correctness.
+
+/**
+ * FNV-1a over the string's UTF-8 bytes.
+ *
+ * Chosen over anything stronger for the reason a hash table wants: it is a handful of
+ * instructions per byte, and the keys it will see are identifiers and JSON member names
+ * rather than adversarial input. If a Map is ever exposed to untrusted keys, pass a keyed
+ * hash instead — that is what the funcref is for.
+ */
+export i32 hashString(string s) {
+  u8[] b = s.toBytes();
+  u32 h = 2166136261;
+  for (i32 i = 0; i < b.len(); i++) {
+    h = h ^ (b[i] as@ u32);
+    h = h * 16777619;
+  }
+  return h as@ i32;
+}
+
+export bool stringEq(string a, string b) { return a == b; }
+
+/**
+ * An i32 key, mixed.
+ *
+ * Returning the key unchanged would be a valid hash and a bad one: `Map` takes the low bits
+ * of it, and consecutive or aligned integers — array indices, pointers, ids — would then
+ * collide in runs. This is the finaliser from MurmurHash3, which is four multiplies and
+ * gives every input bit a chance to affect the low ones.
+ */
+export i32 hashI32(i32 x) {
+  u32 h = x as@ u32;
+  h = h ^ (h >> 16);
+  h = h * 2246822507;
+  h = h ^ (h >> 13);
+  h = h * 3266489909;
+  h = h ^ (h >> 16);
+  return h as@ i32;
+}
+
+export bool i32Eq(i32 a, i32 b) { return a == b; }
+
+/** The same mixing for a 64-bit key, folded to 32 bits. */
+export i32 hashI64(i64 x) {
+  u64 h = x as@ u64;
+  h = h ^ (h >> 33);
+  h = h * 18397679294719823053;
+  h = h ^ (h >> 29);
+  h = h * 14181476777654086739;
+  h = h ^ (h >> 32);
+  return (h & 4294967295) as@ i32;
+}
+
+export bool i64Eq(i64 a, i64 b) { return a == b; }

@@ -1,0 +1,203 @@
+// Vec's own tests.
+//
+// The shapes that matter are the ones a hand-written container gets wrong: growth from
+// zero capacity, the boundary of every index check, and removal from each end. The
+// element types are deliberately mixed — a primitive, a string, a struct and a nested Vec
+// — because monomorphisation makes those four different pieces of generated code.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Vec } from "../../src/vec.wac";
+import { Option } from "../../src/option.wac";
+
+struct P { i32 v; }
+
+export string test_growth_from_empty() {
+  T t = T.create();
+  Vec<i32> v = Vec.create();
+  t.eqI32(v.len(), 0, "starts empty");
+  t.eqI32(v.capacity(), 0, "and allocates nothing");
+  t.isTrue(v.isEmpty(), "isEmpty");
+
+  for (i32 i = 0; i < 100; i++) { v.push(i * i); }
+  t.eqI32(v.len(), 100, "length after 100 pushes");
+  t.eqI32(v.get(0), 0, "first");
+  t.eqI32(v.get(99), 9801, "last");
+  t.isTrue(v.capacity() >= 100, "capacity kept up");
+  // Doubling from a floor of 4: 4, 8, 16, 32, 64, 128. Asserted because a growth policy
+  // that quietly became linear would still pass every other test here.
+  t.eqI32(v.capacity(), 128, "capacity doubled rather than crept");
+  return t.report();
+}
+
+export string test_every_element_survives_growth() {
+  T t = T.create();
+  // Growth copies the backing array, so an off-by-one in the copy loop loses exactly one
+  // element — which a spot check of the first and last would miss.
+  Vec<i32> v = Vec.create();
+  for (i32 i = 0; i < 257; i++) { v.push(i * 7); }
+  i32 wrong = 0;
+  for (i32 i = 0; i < 257; i++) { if (v.get(i) != i * 7) { wrong++; } }
+  t.eqI32(wrong, 0, "every element still holds what was pushed");
+  return t.report();
+}
+
+export string test_index_bounds() {
+  T t = T.create();
+  Vec<i32> v = Vec.create();
+  v.push(1); v.push(2);
+  // `at` is the non-trapping form, so the boundary is checkable without a subprocess.
+  t.isTrue(v.at(-1).isNone(), "below zero is None");
+  t.isTrue(v.at(0).isSome(), "zero is in range");
+  t.isTrue(v.at(1).isSome(), "the last index is in range");
+  t.isTrue(v.at(2).isNone(), "one past the end is None");
+  // And it is `len`, not `capacity`, that bounds it: the slots above len exist.
+  t.isTrue(v.capacity() > v.len(), "there is spare capacity to be wrong about");
+  t.isTrue(v.at(v.capacity() - 1).isNone(), "a slot inside the capacity is still out of range");
+  return t.report();
+}
+
+export string test_pop_and_ends() {
+  T t = T.create();
+  Vec<i32> v = Vec.create();
+  t.isTrue(v.pop().isNone(), "popping empty is None, not a trap");
+  t.isTrue(v.first().isNone(), "first of empty");
+  t.isTrue(v.last().isNone(), "last of empty");
+
+  v.push(10); v.push(20); v.push(30);
+  t.eqI32(v.first().orElse(-1), 10, "first");
+  t.eqI32(v.last().orElse(-1), 30, "last");
+  t.eqI32(v.pop().orElse(-1), 30, "pop takes the last");
+  t.eqI32(v.len(), 2, "and shortens");
+  t.eqI32(v.last().orElse(-1), 20, "so last moved back");
+  return t.report();
+}
+
+export string test_remove_insert_and_swap() {
+  T t = T.create();
+  Vec<i32> v = Vec.create();
+  for (i32 i = 0; i < 5; i++) { v.push(i); }        // 0 1 2 3 4
+
+  t.eqI32(v.remove(0), 0, "remove returns the element");
+  t.eqI32(v.get(0), 1, "and shifts the rest down");
+  t.eqI32(v.len(), 4, "and shortens");               // 1 2 3 4
+
+  t.eqI32(v.remove(3), 4, "removing the last is the same call");
+  t.eqI32(v.len(), 3, "still shortens");             // 1 2 3
+
+  t.eqI32(v.swapRemove(0), 1, "swapRemove returns the element");
+  t.eqI32(v.get(0), 3, "and moves the last into the hole");
+  t.eqI32(v.len(), 2, "and shortens");               // 3 2
+
+  v.insert(0, 99);
+  t.eqI32(v.get(0), 99, "insert at the front");
+  t.eqI32(v.get(1), 3, "shifting the rest up");
+  v.insert(v.len(), 77);
+  t.eqI32(v.last().orElse(-1), 77, "insert at len appends");
+  t.eqI32(v.len(), 4, "and lengthens");              // 99 3 2 77
+  return t.report();
+}
+
+export string test_insert_at_capacity_boundary() {
+  T t = T.create();
+  // insert grows through push and then shifts, so the interesting case is inserting when
+  // the array is exactly full — where the shift runs over the freshly allocated slots.
+  Vec<i32> v = Vec.create();
+  for (i32 i = 0; i < 4; i++) { v.push(i); }
+  t.eqI32(v.len(), v.capacity(), "exactly full");
+  v.insert(0, 42);
+  t.eqI32(v.get(0), 42, "inserted at the front of a full Vec");
+  i32 wrong = 0;
+  for (i32 i = 0; i < 4; i++) { if (v.get(i + 1) != i) { wrong++; } }
+  t.eqI32(wrong, 0, "and shifted every old element up by one");
+  return t.report();
+}
+
+export string test_clear_and_reuse() {
+  T t = T.create();
+  Vec<i32> v = Vec.create();
+  for (i32 i = 0; i < 10; i++) { v.push(i); }
+  i32 cap = v.capacity();
+  v.clear();
+  t.eqI32(v.len(), 0, "cleared");
+  t.eqI32(v.capacity(), cap, "keeping the capacity");
+  t.isTrue(v.at(0).isNone(), "and nothing is reachable");
+  v.push(5);
+  t.eqI32(v.get(0), 5, "reusable afterwards");
+  t.eqI32(v.len(), 1, "with the right length");
+  return t.report();
+}
+
+export string test_to_array_and_from_array() {
+  T t = T.create();
+  Vec<i32> empty = Vec.create();
+  t.eqI32(empty.toArray().len(), 0, "an empty Vec gives an empty array");
+
+  Vec<i32> v = Vec.create();
+  for (i32 i = 0; i < 5; i++) { v.push(i); }
+  i32[] a = v.toArray();
+  t.eqI32(a.len(), 5, "toArray trims spare capacity");
+  t.eqI32Array(a, i32[](0, 1, 2, 3, 4), "and holds the elements in order");
+  // It is a copy: mutating the Vec afterwards must not show through.
+  v.set(0, 99);
+  t.eqI32(a[0], 0, "toArray copied rather than aliased");
+
+  Vec<i32> w = Vec.fromArray(i32[](7, 8, 9));
+  t.eqI32(w.len(), 3, "fromArray takes the length from the array");
+  t.eqI32(w.get(2), 9, "and the elements");
+  return t.report();
+}
+
+export string test_extend() {
+  T t = T.create();
+  Vec<i32> a = Vec.create();
+  Vec<i32> b = Vec.create();
+  for (i32 i = 0; i < 3; i++) { a.push(i); }
+  for (i32 i = 10; i < 13; i++) { b.push(i); }
+  a.extend(b);
+  t.eqI32(a.len(), 6, "lengths add");
+  t.eqI32(a.get(3), 10, "the other Vec's elements follow");
+  t.eqI32(a.get(5), 12, "all of them");
+  t.eqI32(b.len(), 3, "and the source is untouched");
+  return t.report();
+}
+
+export string test_element_types() {
+  T t = T.create();
+  // Four instantiations, four copies of the generated code. A bug in one need not be a bug
+  // in the others: the growth path in particular is the only place the element type appears
+  // in an allocation.
+  Vec<string> strs = Vec.create();
+  for (i32 i = 0; i < 10; i++) { strs.push("x"); }
+  t.eqI32(strs.len(), 10, "a string element type grows");
+  t.eqStr(strs.get(9), "x", "and reads back");
+
+  Vec<P> structs = Vec.create();
+  for (i32 i = 0; i < 10; i++) { structs.push(P(i)); }
+  t.eqI32(structs.get(7).v, 7, "a struct element type");
+
+  Vec<Option<i32>> opts = Vec.create();
+  opts.push(Option.Some(3));
+  opts.push(Option.None);
+  t.eqI32(opts.get(0).orElse(-1), 3, "a generic enum element type");
+  t.isTrue(opts.get(1).isNone(), "including its absent case");
+
+  Vec<Vec<i32>> nested = Vec.create();
+  Vec<i32> inner = Vec.create();
+  inner.push(42);
+  nested.push(inner);
+  t.eqI32(nested.get(0).get(0), 42, "a Vec of Vec");
+  return t.report();
+}
+
+export string test_with_capacity() {
+  T t = T.create();
+  Vec<i32> v = Vec.withCapacity(64, 0);
+  t.eqI32(v.len(), 0, "starts empty despite the capacity");
+  t.eqI32(v.capacity(), 64, "with the capacity asked for");
+  for (i32 i = 0; i < 64; i++) { v.push(i); }
+  t.eqI32(v.capacity(), 64, "and no growth was needed");
+  t.eqI32(v.get(63), 63, "the last element fits");
+  v.push(64);
+  t.eqI32(v.capacity(), 128, "the 65th grows it");
+  return t.report();
+}

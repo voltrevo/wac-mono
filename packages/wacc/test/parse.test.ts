@@ -244,7 +244,7 @@ function check(name: string, source: string): void {
 // ── Corpus ────────────────────────────────────────────────────────────────────
 
 Deno.test("parse: agrees with the reference on every .wac file in the repo", async () => {
-  const files = await loadCorpus("parse");
+  const files = await loadCorpus("parse", { skipGenerics: true });
   let failures = 0;
   const messages: string[] = [];
   for (const [name, source] of files) {

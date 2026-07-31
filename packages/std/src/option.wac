@@ -1,0 +1,58 @@
+// Option<T> — a value that may be absent, without using null.
+//
+// wac has `T?` for reference types, and it is the right thing when T is a struct: one
+// word, no allocation. Option earns its place where `T?` cannot go:
+//
+//   - a primitive. `i32?` is not usable today (wac issue 0045), and even when it is it
+//     means boxing, so `Option<i32>` is the honest way to say "an i32 or nothing".
+//   - a nested absence. `T??` does not exist, so a container of nullables cannot
+//     distinguish "no entry" from "an entry holding null". `Option<T?>` can.
+//   - a return type that must be matched rather than checked. `match` is exhaustive;
+//     forgetting a null check is not a compile error, and forgetting a `case` is.
+//
+// `Map.get` returns one, which is what it is for here.
+
+export enum Option<T> {
+  Some(T v), None
+
+  bool isSome(const this) {
+    return match (this) { case Some(_): true, case None: false };
+  }
+
+  bool isNone(const this) {
+    return match (this) { case Some(_): false, case None: true };
+  }
+
+  /** The value, or `d` if there is none. */
+  T orElse(const this, T d) {
+    return match (this) { case Some(v): v, case None: d };
+  }
+
+  /**
+   * The value, or a trap.
+   *
+   * For the case where absence is a bug rather than a possibility — the parallel of `x!`
+   * on a nullable. `trap` carries no message, so prefer `match` where the caller can say
+   * something useful.
+   */
+  T unwrap(const this) {
+    match (this) {
+      case Some(v): return v;
+      case None: trap;
+    }
+  }
+}
+
+/**
+ * `f` applied to the value, if there is one.
+ *
+ * A free function rather than a method because a method cannot introduce a type parameter
+ * of its own: `U` is not the enum's. Inference reads `T` from the Option and `U` from the
+ * function's return type, so the call site names neither.
+ */
+export Option<U> mapOption<T, U>(Option<T> o, fn[U(T)] f) {
+  return match (o) {
+    case Some(v): Option.Some(f(v)),
+    case None: Option.None,
+  };
+}

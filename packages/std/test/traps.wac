@@ -1,0 +1,37 @@
+// Fixture for the traps, which cannot be tested from wac: a trap aborts the whole module,
+// so each case needs its own call from the host.
+//
+// The one that matters is `getAtCapacityNotLength`: an index inside the allocated array but
+// past `len`. A bounds check written against the backing array's length instead of the
+// element count would return a stale or filler element there rather than trapping, and no
+// test written in wac can tell the difference.
+
+import { Vec } from "../src/vec.wac";
+import { Option } from "../src/option.wac";
+import { Result } from "../src/result.wac";
+
+Vec<i32> oneElement() { Vec<i32> v = Vec.create(); v.push(42); return v; }
+
+export i32 getPastEnd()   { return oneElement().get(1); }
+export i32 getNegative()  { return oneElement().get(0 - 1); }
+export i32 getAtCapacityNotLength() {
+  Vec<i32> v = Vec.withCapacity(16, 0);
+  v.push(1);
+  return v.get(5);
+}
+export i32 setPastEnd()        { Vec<i32> v = oneElement(); v.set(1, 0); return v.get(0); }
+export i32 removePastEnd()     { return oneElement().remove(1); }
+export i32 swapRemovePastEnd() { return oneElement().swapRemove(1); }
+export i32 insertPastEnd()     { Vec<i32> v = oneElement(); v.insert(2, 0); return v.len(); }
+export i32 negativeCapacity()  { Vec<i32> v = Vec.withCapacity(0 - 1, 0); return v.len(); }
+
+export i32 unwrapNone() { Option<i32> o = Option.None; return o.unwrap(); }
+export i32 unwrapErr()  { Result<i32, i32> r = Result.Err(1); return r.unwrap(); }
+
+// The in-range companions, so a test that traps for the wrong reason is distinguishable
+// from one that traps for the right one.
+export i32 getOk()          { return oneElement().get(0); }
+export i32 setOk()          { Vec<i32> v = oneElement(); v.set(0, 7); return v.get(0); }
+export i32 insertAtLenOk()  { Vec<i32> v = oneElement(); v.insert(1, 9); return v.get(1); }
+export i32 unwrapSomeOk()   { Option<i32> o = Option.Some(5); return o.unwrap(); }
+export i32 unwrapOkOk()     { Result<i32, i32> r = Result.Ok(6); return r.unwrap(); }

@@ -1,0 +1,99 @@
+// Option and Result. Written in wac because the values never need to cross the wasm
+// boundary — an `Option<i32>` has no JS representation worth defining.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Option, mapOption } from "../../src/option.wac";
+import { Result } from "../../src/result.wac";
+
+i32 double(i32 x) { return x * 2; }
+string describe(i32 x) { return x > 0 ? "pos" : "neg"; }
+
+export string test_option_basics() {
+  T t = T.create();
+  Option<i32> some = Option.Some(4);
+  Option<i32> none = Option.None;
+
+  t.isTrue(some.isSome(), "Some is some");
+  t.isTrue(!some.isNone(), "Some is not none");
+  t.isTrue(none.isNone(), "None is none");
+  t.isTrue(!none.isSome(), "None is not some");
+  t.eqI32(some.orElse(9), 4, "orElse on Some gives the value");
+  t.eqI32(none.orElse(9), 9, "orElse on None gives the default");
+  t.eqI32(some.unwrap(), 4, "unwrap on Some");
+  return t.report();
+}
+
+export string test_option_holds_any_type() {
+  T t = T.create();
+  // The point of the type parameter: a primitive without boxing, and a reference in the
+  // same program, from one declaration.
+  Option<string> s = Option.Some("hi");
+  Option<f64> f = Option.Some(1.5);
+  Option<bool> b = Option.None;
+  t.eqStr(s.orElse(""), "hi", "a string payload");
+  t.eqF64(f.orElse(0.0), 1.5, "an f64 payload, unboxed");
+  t.isTrue(!b.orElse(true) == false, "a bool payload's default");
+  // Nested, which `T?` cannot express: `T??` does not exist.
+  Option<Option<i32>> nested = Option.Some(Option.None);
+  t.isTrue(nested.isSome(), "the outer Option is present");
+  t.isTrue(nested.orElse(Option.Some(1)).isNone(), "and the inner one is absent");
+  return t.report();
+}
+
+export string test_option_match_is_exhaustive() {
+  T t = T.create();
+  // The reason to prefer Option over a sentinel: taking it apart is `match`, which the
+  // compiler checks covers every variant.
+  Option<i32> o = Option.Some(7);
+  i32 got = match (o) {
+    case Some(v): v * 3,
+    case None: -1,
+  };
+  t.eqI32(got, 21, "match binds the payload");
+  return t.report();
+}
+
+export string test_map_option() {
+  T t = T.create();
+  // mapOption is a generic *function*: T comes from the Option, U from the callback's
+  // return type, and the call site names neither.
+  Option<i32> some = Option.Some(21);
+  Option<i32> none = Option.None;
+  t.eqI32(mapOption(some, double).orElse(0), 42, "mapped");
+  t.isTrue(mapOption(none, double).isNone(), "None maps to None");
+  // A different U, which is the half a method could not have expressed.
+  t.eqStr(mapOption(some, describe).orElse("?"), "pos", "mapped to another type");
+  return t.report();
+}
+
+export string test_result_basics() {
+  T t = T.create();
+  Result<i32, string> ok = Result.Ok(3);
+  Result<i32, string> bad = Result.Err("nope");
+
+  t.isTrue(ok.isOk(), "Ok is ok");
+  t.isTrue(!ok.isErr(), "Ok is not err");
+  t.isTrue(bad.isErr(), "Err is err");
+  t.isTrue(!bad.isOk(), "and is not ok");
+  t.eqI32(ok.orElse(-1), 3, "orElse on Ok");
+  t.eqI32(bad.orElse(-1), -1, "orElse on Err");
+  t.eqI32(ok.unwrap(), 3, "unwrap on Ok");
+
+  t.isTrue(ok.ok().isSome(), "ok() on Ok");
+  t.isTrue(ok.err().isNone(), "err() on Ok");
+  t.eqStr(bad.err().orElse(""), "nope", "err() carries the error");
+  t.isTrue(bad.ok().isNone(), "ok() on Err");
+  return t.report();
+}
+
+export string test_result_error_type_varies() {
+  T t = T.create();
+  // E is a parameter because the useful error differs. A caller that only branches wants
+  // nothing but the fact of failure.
+  Result<f64, i32> coded = Result.Err(404);
+  Result<i32, bool> plain = Result.Err(true);
+  t.eqI32(coded.err().orElse(0), 404, "an i32 error code");
+  t.isTrue(plain.isErr(), "a bool error, which is just the fact of failure");
+  t.eqF64(coded.orElse(2.5), 2.5, "and the value type is independent of it");
+  return t.report();
+}
