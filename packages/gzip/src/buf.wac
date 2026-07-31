@@ -12,6 +12,18 @@ export struct Buf {
     return Buf(i8[16](), 0);
   }
 
+  /**
+   * A buffer pre-sized to `capacity`.
+   *
+   * Worth it when the final length is known up front — inflate reads it from the
+   * gzip trailer — because it skips the doubling reallocations *and* lets `take`
+   * hand back the array without a copy.
+   */
+  Buf withCapacity(i32 capacity) {
+    if (capacity < 16) { capacity = 16; }
+    return Buf(i8[capacity](), 0);
+  }
+
   i32 get(const this, i32 i) {
     if (i < 0 || i >= this.len) { trap; }
     return this.data[i];
@@ -52,6 +64,20 @@ export struct Buf {
     for (i32 i = 0; i < count; i++) {
       this.push(src[start + i]);
     }
+  }
+
+  /**
+   * Hand over the contents, avoiding the copy when the buffer is exactly full.
+   *
+   * The returned array is the buffer's own storage in that case, so the Buf must
+   * not be used afterwards. That is why this is separate from `bytes()`: callers
+   * that keep appending need the copy.
+   */
+  i8[] take(this) {
+    if (this.len == this.data.len()) {
+      return this.data;
+    }
+    return this.bytes();
   }
 
   // Exact-length copy — the internal array is over-allocated.

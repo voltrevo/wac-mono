@@ -318,10 +318,28 @@ void inflateBlock(BitReader br, Buf out, Tables t, Decoder lit, Decoder dist) {
   }
 }
 
-/** Decompress a raw DEFLATE stream starting at `start`. */
-i8[] inflateFrom(i8[] data, i32 start) {
+/**
+ * Largest output size hint that will be trusted for pre-allocation.
+ *
+ * The hint comes from the gzip trailer, which is attacker-controlled: a stream can
+ * claim any size at all. Allocating on that would turn a 30-byte input into a
+ * 4 GB request, so an implausible hint is ignored and the buffer grows normally
+ * instead. Getting the hint wrong costs speed, never correctness.
+ */
+i32 maxSizeHint() { return 1 << 26; }   // 64 MiB
+
+/**
+ * Decompress a raw DEFLATE stream starting at `start`.
+ *
+ * `sizeHint` is the expected output length, or 0 if unknown. When it is right —
+ * which it is for any well-formed gzip member — the output buffer is allocated
+ * once at the correct size and handed back without a copy.
+ */
+i8[] inflateFrom(i8[] data, i32 start, i32 sizeHint) {
   BitReader br = BitReader.create(data, start);
-  Buf out = Buf.create();
+  i32 hint = sizeHint;
+  if (hint < 0 || hint > maxSizeHint()) { hint = 0; }
+  Buf out = Buf.withCapacity(hint);
   Tables t = Tables.create();
 
   bool last = false;
@@ -368,12 +386,12 @@ i8[] inflateFrom(i8[] data, i32 start) {
     }
   }
 
-  return out.bytes();
+  return out.take();
 }
 
 /** Decompress a raw DEFLATE stream. */
 export i8[] inflate(i8[] data) {
-  return inflateFrom(data, 0);
+  return inflateFrom(data, 0, 0);
 }
 
 /**
@@ -406,12 +424,14 @@ export i8[] gunzipBytes(i8[] gz) {
   }
   if (pos >= gz.len()) { trap; }
 
-  i8[] out = inflateFrom(gz, pos);
-
-  // Trailer: CRC-32 then ISIZE, both little-endian, in the last 8 bytes.
+  // Trailer: CRC-32 then ISIZE, both little-endian, in the last 8 bytes. ISIZE is
+  // read before inflating so it can size the output buffer — it is a hint only,
+  // and still checked against the actual output below.
   i32 n = gz.len();
   i32 wantCrc = gz[n - 8] | (gz[n - 7] << 8) | (gz[n - 6] << 16) | (gz[n - 5] << 24);
   i32 wantSize = gz[n - 4] | (gz[n - 3] << 8) | (gz[n - 2] << 16) | (gz[n - 1] << 24);
+
+  i8[] out = inflateFrom(gz, pos, wantSize);
   if (crc32(out) != wantCrc) { trap; }
   if (out.len() != wantSize) { trap; }
   return out;

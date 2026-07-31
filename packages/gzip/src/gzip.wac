@@ -49,9 +49,15 @@ i8[] container(i8[] body, i32 crc, i32 isize) {
   return out.bytes();
 }
 
-/** The DEFLATE stored-block stream for `data`, without the gzip container. */
-i8[] storedBody(i8[] data) {
-  Buf out = Buf.create();
+/**
+ * Write the DEFLATE stored-block stream for `data` into `out`.
+ *
+ * Writes in place rather than returning a body, because a stored payload is the
+ * whole input: handing it back for `container` to copy would walk every byte a
+ * second time, which measurably halved stored-block throughput when this was
+ * briefly written that way.
+ */
+void storedInto(Buf out, i8[] data) {
   i32 n = data.len();
 
   if (n == 0) {
@@ -66,11 +72,20 @@ i8[] storedBody(i8[] data) {
     storedBlock(out, data, pos, count, (pos + count) == n);
     pos += count;
   }
+}
+
+/** A complete stored-block gzip member, assembled in one pass. */
+i8[] storedContainer(i8[] data, i32 crc) {
+  Buf out = Buf.create();
+  header(out);
+  storedInto(out, data);
+  out.pushU32(crc);
+  out.pushU32(data.len());
   return out.bytes();
 }
 
 export i8[] gzipStored(i8[] data) {
-  return container(storedBody(data), crc32(data), data.len());
+  return storedContainer(data, crc32(data));
 }
 
 /** Same container, but the payload is a fixed-Huffman deflate stream. */
@@ -108,7 +123,7 @@ export i8[] gzipBest(i8[] data) {
     // is a fixed cost that a short payload cannot amortise.
     i8[] fixed = container(deflateFixed(data), crc, n);
     if (fixed.len() < best.len()) { best = fixed; }
-    i8[] stored = container(storedBody(data), crc, n);
+    i8[] stored = storedContainer(data, crc);
     if (stored.len() < best.len()) { best = stored; }
     return best;
   }
@@ -117,7 +132,7 @@ export i8[] gzipBest(i8[] data) {
   // data that does not compress at all — where stored is the floor. Checking that
   // costs one comparison instead of two more compression passes.
   if (best.len() >= n) {
-    i8[] stored = container(storedBody(data), crc, n);
+    i8[] stored = storedContainer(data, crc);
     if (stored.len() < best.len()) { return stored; }
   }
   return best;

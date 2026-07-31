@@ -12,14 +12,16 @@
 // throughput regardless of how compressible the input was.
 
 /**
- * Per-byte remainders for the reflected polynomial.
+ * Eight stacked tables, flat in one array at `k * 256 + n`.
  *
- * Rebuilt per call because wac has no module-level constants. 256 entries at 8
- * shifts each is roughly 2 microseconds, which is noise beside any payload large
- * enough to care about.
+ * Table 0 is the ordinary per-byte table; each subsequent one is table 0 advanced
+ * another byte, so eight bytes can be folded in with eight *independent* lookups.
+ * That is the point: the byte-at-a-time loop carries a dependency from each
+ * iteration to the next, so it runs at the latency of a table lookup rather than
+ * the throughput. Flat rather than nested to keep it one bounds-checked array.
  */
-i32[] crcTable() {
-  i32[] table = i32[256]();
+i32[] crcTable8() {
+  i32[] t = i32[2048]();
   for (i32 n = 0; n < 256; n++) {
     i32 c = n;
     for (i32 k = 0; k < 8; k++) {
@@ -29,18 +31,57 @@ i32[] crcTable() {
         c = c >>> 1;
       }
     }
-    table[n] = c;
+    t[n] = c;
   }
-  return table;
+  for (i32 k = 1; k < 8; k++) {
+    for (i32 n = 0; n < 256; n++) {
+      i32 prev = t[(k - 1) * 256 + n];
+      t[k * 256 + n] = (prev >>> 8) ^ t[prev & 0xFF];
+    }
+  }
+  return t;
 }
 
-/** CRC-32 of `data`: one table lookup per byte instead of eight shift steps. */
+// Below this, building 2048 table entries costs more than it saves, so the bitwise
+// form wins outright — no table at all.
+i32 sliceThreshold() { return 512; }
+
+/**
+ * CRC-32 of `data`, eight bytes at a time.
+ *
+ * Folds four bytes into the running value, then indexes eight tables at once and
+ * xors the results. The lookups do not depend on each other, so they pipeline
+ * instead of serialising on lookup latency the way the byte-at-a-time loop does.
+ */
 export i32 crc32(i8[] data) {
-  i32[] table = crcTable();
-  i32 crc = 0xFFFFFFFF;
-  for (i32 i = 0; i < data.len(); i++) {
-    crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+  i32 n = data.len();
+  if (n < sliceThreshold()) {
+    return crc32Bitwise(data);
   }
+
+  i32[] t = crcTable8();
+  i32 crc = 0xFFFFFFFF;
+  i32 i = 0;
+
+  while (i + 8 <= n) {
+    i32 a = crc ^ data[i] ^ (data[i + 1] << 8) ^ (data[i + 2] << 16) ^ (data[i + 3] << 24);
+    crc = t[1792 + (a & 0xFF)]
+        ^ t[1536 + ((a >>> 8) & 0xFF)]
+        ^ t[1280 + ((a >>> 16) & 0xFF)]
+        ^ t[1024 + ((a >>> 24) & 0xFF)]
+        ^ t[768 + data[i + 4]]
+        ^ t[512 + data[i + 5]]
+        ^ t[256 + data[i + 6]]
+        ^ t[data[i + 7]];
+    i += 8;
+  }
+
+  // Whatever is left over, one byte at a time.
+  while (i < n) {
+    crc = t[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+    i++;
+  }
+
   return crc ^ 0xFFFFFFFF;
 }
 

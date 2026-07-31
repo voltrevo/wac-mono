@@ -76,61 +76,60 @@ inflate(data)      // read a raw deflate stream
 
 ## Throughput
 
-`deno task bench`. On 1 MiB:
+`deno task bench`. On 1 MiB, with python zlib alongside:
 
-| | MB/s | python zlib |
+| | ours | python zlib |
 |---|---:|---:|
 | host/wasm boundary (identity) | 776 | — |
-| stored blocks | 113 | — |
-| dynamic, text | 11 | 49 |
-| dynamic, already-compressible | 132 | 455 |
-| inflate, text | 120 | 694 |
-| inflate, incompressible | 86 | 2672 |
+| stored blocks | 158 | — |
+| dynamic, text | 28 | 50 |
+| dynamic, already-compressible | 210 | 468 |
+| inflate, text | 196 | 694 |
+| inflate, incompressible | 114 | 2671 |
 
-End to end on 4 MB of real TypeScript source: `gzipDynamic` 20.9 MB/s at 24.0%,
-`gzipBest` the same, decompress 120 MB/s — against zlib's 46.2 MB/s at 23.1%. So
-~2.2x slower compressing and ~5.8x decompressing, for 0.9% less compression.
+End to end on 4 MB of real TypeScript source: compress 22.3 MB/s at 24.0%,
+decompress 148 MB/s — against zlib's 46.2 MB/s at 23.1%. So **~2.1x slower
+compressing and ~3.0x decompressing**, for 0.9% less compression.
 
-`gzipBest` used to be half the speed of `gzipDynamic` for identical output: it
-compressed three times and checksummed twice. It now computes the CRC once, and
-above 4 KB only prices the alternatives when dynamic fails to shrink the input at
-all — the one case where stored can win. Below 4 KB all three are still tried,
-because a dynamic block's transmitted code table is a fixed cost a short payload
-cannot amortise (an 11-byte input is 31 bytes with fixed against 43 with dynamic).
+### How it got there
 
-The match search stops once a match is long enough to not be worth improving on,
-and narrows after a decent one, following zlib's `nice_match`/`good_match` at
-level 6. That is +19% on real source for 0.9% larger output; `niceLength()` and
-`goodLength()` in `deflate.wac` are the dials if the trade should go the other
-way.
+Every step was measured, and the first three guesses were wrong — worth recording
+because the wrong guesses were the plausible ones.
 
-Scaling is flat from 16K to 4 MB, so the match search and hash inserts are linear.
+| change | effect |
+|---|---|
+| Bulk array marshalling (in wac's bindgen) | boundary 35 -> 776 MB/s |
+| Table-driven CRC-32 | inflate 34 -> 120 MB/s |
+| Table-driven Huffman decode | ~4% |
+| `gzipBest` stops compressing three times | 8.2 -> 21 MB/s, identical output |
+| Match-search cutoffs (zlib's nice/good) | +19% compress, 0.9% larger output |
+| Pre-sized inflate output from ISIZE | inflate +4% to +24% |
+| Slice-by-8 CRC-32 | CRC 238 -> 636 MB/s, inflate +57% to +74% |
 
-### What the numbers cost to find
+CRC-32 was the dominant cost twice over. Before any table it was 26 of the 30 ms
+needed per MiB — more than LZ77 and Huffman coding combined — which is why every
+operation used to sit at ~34 MB/s no matter how compressible the input was. The
+byte-at-a-time table fixed most of that; slice-by-8 fixed the rest by removing the
+loop-carried dependency, so eight independent lookups pipeline instead of
+serialising on lookup latency.
 
-Three things were profiled in the order they seemed obvious, and only the third
-mattered:
+Scaling is flat from 16K to 4 MB, so match search and hash inserts are linear.
 
-1. **Bit-at-a-time Huffman decode** — replaced with a 9-bit root lookup table.
-   Worth about 4%.
-2. **`Buf.push` per byte** — measured at 3.3 ns/byte including the final copy,
-   about 11% of inflate. Real, but not the problem.
-3. **Bitwise CRC-32** — 25 ns/byte, and *every* operation checksums its whole
-   payload. It was 26 ms of the 30 ms needed to process 1 MiB: more than LZ77 and
-   Huffman coding put together. A 256-entry table made stored blocks 3.3x faster
-   and inflate 3.5x.
+`niceLength()` and `goodLength()` in `deflate.wac` are the ratio/speed dials. The
+current values are zlib's level 6; the previous no-cutoff behaviour was closer to
+level 9.
 
-That is why every operation previously sat at ~34 MB/s no matter how compressible
-the input was — the checksum did not care, and it dominated. The lesson is the
-ordinary one: the bottleneck was in the part nobody thinks of as the codec.
+### What is left
 
-Remaining gaps, in order of size: compression is greedy rather than lazy; the
-decoder's root table could be two-level; and `Buf.push` at 3.3 ns/byte against a
-pre-sized array's 0.5 ns/byte is the copy in `bytes()` plus a growth check per
-byte. WasmGC has `array.copy`, which wac does not expose, so a bulk copy is not
-writable in wac today.
+- **Compression is greedy, not lazy.** zlib defers a match one byte to see if the
+  next position does better. Worth a few percent of ratio, costs speed.
+- **`Buf.push` is 1.3 ns/byte against a pre-sized array's 0.5.** WasmGC has
+  `array.copy`, which wac does not expose, so a bulk copy is not writable in wac.
+- **No SIMD.** Wasm SIMD only addresses linear memory, so a GC-array codec cannot
+  vectorise match comparison at all. Native CRC also uses carry-less multiply,
+  which wasm has no equivalent of — that gap is structural rather than fixable.
 
-## Known limitations## Known limitations
+## Known limitations## Known limitations## Known limitations
 
 - **Single-member only.** Concatenated gzip members are legal; this reads the
   first and then fails the trailer check. It traps rather than silently

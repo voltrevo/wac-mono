@@ -23,7 +23,12 @@ export string test_table_agrees_with_definition_on_every_byte() {
 
 export string test_table_agrees_across_lengths() {
   T t = T.create();
-  i32[] lengths = i32[](0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 255, 256, 257, 1000, 4095);
+  // Lengths chosen around the two seams: 512 is where the slice-by-8 path takes
+  // over from the bitwise one, and the stride is 8, so the tail loop has to handle
+  // every remainder from 0 to 7.
+  i32[] lengths = i32[](0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 255, 256, 257,
+                        511, 512, 513, 514, 515, 516, 517, 518, 519, 520,
+                        1000, 1023, 1024, 4095, 4096, 8191);
   for (i32 j = 0; j < lengths.len(); j++) {
     i32 n = lengths[j];
     i8[] data = i8[n]();
