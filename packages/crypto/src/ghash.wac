@@ -1,0 +1,82 @@
+// GHASH — the universal hash under AES-GCM (NIST SP 800-38D §6.4).
+//
+// Arithmetic in GF(2^128) modulo x^128 + x^7 + x^2 + x + 1, in the bit order the
+// standard uses: the *most* significant bit of the first byte is the coefficient
+// of x^0. That reversal is why the reduction constant appears as 0xE1... at the
+// top of the high word rather than 0x87 at the bottom of the low word, and it is
+// the single easiest thing to get backwards here.
+//
+// A 128-bit value is two u64s, big-endian: v[0] is the first eight bytes.
+
+/** Big-endian u64 at byte offset `i`. */
+u64 beWord(u8[] b, i32 i) {
+  u64 v = 0;
+  for (i32 j = 0; j < 8; j++) { v = (v << 8) | (b[i + j] as! u64); }
+  return v;
+}
+
+void storeBE(u64 v, u8[] out, i32 at) {
+  for (i32 j = 0; j < 8; j++) {
+    out[at + j] = ((v >> (((7 - j) * 8) as! u64)) & 255) as! i32;
+  }
+}
+
+/**
+ * z = x * y in GF(2^128).
+ *
+ * Shift-and-add over the 128 bits of x, most significant first. Not
+ * constant-time: the branch on each bit of x is exactly what a table-driven or
+ * carry-less-multiply implementation exists to remove.
+ */
+void gfMul(u64[] x, u64[] y, u64[] z) {
+  u64 vhi = y[0];
+  u64 vlo = y[1];
+  u64 zhi = 0;
+  u64 zlo = 0;
+
+  for (i32 i = 0; i < 128; i++) {
+    u64 bit = 0;
+    if (i < 64) { bit = (x[0] >> ((63 - i) as! u64)) & 1; }
+    else        { bit = (x[1] >> ((127 - i) as! u64)) & 1; }
+    if (bit != 0) { zhi ^= vhi; zlo ^= vlo; }
+
+    // V >>= 1 across both words, then reduce if a 1 fell off the bottom.
+    u64 lsb = vlo & 1;
+    vlo = (vlo >> 1) | (vhi << 63);
+    vhi = vhi >> 1;
+    if (lsb != 0) { vhi ^= 0xE100000000000000; }
+  }
+
+  z[0] = zhi;
+  z[1] = zlo;
+}
+
+/**
+ * GHASH_H(data), 16 bytes. `data` must be a whole number of blocks — GCM pads
+ * its inputs itself, and silently zero-filling here would hide a caller's bug.
+ */
+export u8[] ghash(u8[] h, u8[] data) {
+  if (h.len() != 16) { trap; }
+  if (data.len() % 16 != 0) { trap; }
+
+  u64[] hv = u64[](beWord(h, 0), beWord(h, 8));
+  u64[] y = u64[](0, 0);
+  u64[] blk = u64[2]();
+  u64[] tmp = u64[2]();
+
+  i32 n = data.len();
+  for (i32 pos = 0; pos < n; pos += 16) {
+    blk[0] = beWord(data, pos);
+    blk[1] = beWord(data, pos + 8);
+    y[0] ^= blk[0];
+    y[1] ^= blk[1];
+    gfMul(y, hv, tmp);
+    y[0] = tmp[0];
+    y[1] = tmp[1];
+  }
+
+  u8[] out = u8[16]();
+  storeBE(y[0], out, 0);
+  storeBE(y[1], out, 8);
+  return out;
+}
