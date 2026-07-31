@@ -361,18 +361,36 @@ void lexNumber(Lexer lx, Lexed out, i32 startLine, i32 startCol) {
 
   while (!lx.atEnd() && (isDigit(lx.peek(0)) || lx.peek(0) == '_')) { lx.advance(); }
 
+  // A decimal point, an exponent, or both — either marks the literal a float. The reference stopped
+  // requiring the point in wac issue 0018, and the differential test compares token for token, so
+  // this has to move with it.
   if (lx.peek(0) == '.' && isDigit(lx.peek(1))) {
     lx.advance();
     while (!lx.atEnd() && (isDigit(lx.peek(0)) || lx.peek(0) == '_')) { lx.advance(); }
-    if (lx.peek(0) == 'e' || lx.peek(0) == 'E') {
-      lx.advance();
-      if (lx.peek(0) == '+' || lx.peek(0) == '-') { lx.advance(); }
-      while (!lx.atEnd() && (isDigit(lx.peek(0)) || lx.peek(0) == '_')) { lx.advance(); }
-    }
+    takeExponent(lx);
+    emit(out, kFloat(), start, lx.pos - start, startLine, startCol);
+  } else if (takeExponent(lx)) {
     emit(out, kFloat(), start, lx.pos - start, startLine, startCol);
   } else {
     emit(out, kInt(), start, lx.pos - start, startLine, startCol);
   }
+}
+
+/**
+ * Consume an exponent if one is really there, reporting whether it was.
+ *
+ * `1e` and `1electron` are an integer followed by an identifier, not malformed floats, so the digits
+ * after `e` are what decides — checking for `e` alone would swallow the identifier.
+ */
+bool takeExponent(Lexer lx) {
+  if (lx.peek(0) != 'e' && lx.peek(0) != 'E') { return false; }
+  bool signed = lx.peek(1) == '+' || lx.peek(1) == '-';
+  i32 digitAt = signed ? 2 : 1;
+  if (!isDigit(lx.peek(digitAt))) { return false; }
+  lx.advance();
+  if (signed) { lx.advance(); }
+  while (!lx.atEnd() && (isDigit(lx.peek(0)) || lx.peek(0) == '_')) { lx.advance(); }
+  return true;
 }
 
 /**

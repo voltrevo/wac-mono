@@ -148,6 +148,10 @@ Deno.test("lex: agrees on constructs a working corpus does not contain", () => {
     ["cast suffixes", "as as! as~ as@"],
     ["greedy operator runs", ">>>>= <<<= ===== !=== &&& |||"],
     ["numbers", "0 1 42 0x0 0xFF 0xff_ff 1_000 1.5 1.5e10 1.5e+10 1.5e-10 0.0"],
+    // An exponent with no decimal point became a float in wac issue 0018, and `1e`/`1electron`
+    // must stay an integer followed by an identifier.
+    ["bare exponents", "1e9 1E10 2e-3 1_000e3 1e1_0"],
+    ["not exponents", "1e 1electron 0x1e5"],
     ["number then dot", "1.foo"],
     ["keywords", "import from export struct const this override if else while for " +
       "do switch case default break continue return trap true false null is not " +
