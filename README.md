@@ -56,18 +56,19 @@ like. Keeping the tree at `packages/<name>/src` bounds the depth.
 Everything runs from the repo root, so one command covers every package.
 
 ```sh
-deno task test        # all tests, host-side and wac-written
-deno task coverage       # branch coverage of gzip (see issues/0002)
-deno task coverage:json  # branch coverage of json
-deno task coverage:fmt   # branch coverage of fmt
-deno task coverage:bytes # branch coverage of bytes
-deno task coverage:crypto # branch coverage of crypto
-deno task coverage:bignum # branch coverage of bignum
-deno task coverage:std   # branch coverage of std
-deno task mutate      # mutation testing
-deno task bench       # gzip throughput
-deno task bench:json  # json throughput, by document shape
-deno task verify:fmt  # fmt exactness over 500k doubles, both directions
+deno task test            # all tests, host-side and wac-written
+deno task coverage        # branch coverage of every package, from its wac-native tests
+deno task coverage:bignum # ...and the host-driven exercises, per package
+deno task coverage:bytes
+deno task coverage:crypto
+deno task coverage:fmt
+deno task coverage:gzip
+deno task coverage:json
+deno task coverage:std
+deno task mutate          # mutation testing
+deno task bench           # gzip throughput
+deno task bench:json      # json throughput, by document shape
+deno task verify:fmt      # fmt exactness over 500k doubles, both directions
 
 deno run --allow-read tools/check.ts <entry.wac>    # type-check one file, no run
 deno run -A tools/validate.ts <entry.wac>          # ...and check the wasm validates

@@ -8,75 +8,18 @@
 // takes a stream built on purpose.
 //
 // Streams are assembled bit by bit with the fixed Huffman code, which needs no
-// transmitted tables and so can be written by hand.
+// transmitted tables and so can be written by hand. The builder lives in streams.ts,
+// shared with inflate_dynamic_adversarial.test.ts and with cov.ts — the coverage run
+// drives these same streams, so the report describes a workload that is actually
+// asserted on.
 
 import { wacBind } from "../../../harness/wacBind.ts";
+import { Bits, fixedBlock, mustTrap } from "./streams.ts";
 
 const inflateMod = await wacBind("packages/gzip/src/inflate.wac");
 const inflateRaw = inflateMod.inflate as (data: Uint8Array) => Uint8Array;
 
-/** LSB-first bit writer, mirroring src/bitwriter.wac. */
-class Bits {
-  private bytes: number[] = [];
-  private buf = 0;
-  private count = 0;
-
-  /** Data elements: least significant bit first. */
-  bits(value: number, n: number): this {
-    for (let i = 0; i < n; i++) {
-      this.buf |= ((value >>> i) & 1) << this.count;
-      if (++this.count === 8) {
-        this.bytes.push(this.buf & 0xFF);
-        this.buf = 0;
-        this.count = 0;
-      }
-    }
-    return this;
-  }
-
-  /** Huffman codes: most significant bit of the code first. */
-  code(value: number, n: number): this {
-    for (let i = n - 1; i >= 0; i--) this.bits((value >>> i) & 1, 1);
-    return this;
-  }
-
-  /** A literal byte under the fixed literal/length code. */
-  literal(byte: number): this {
-    return byte <= 143 ? this.code(0x30 + byte, 8) : this.code(0x190 + (byte - 144), 9);
-  }
-
-  /** A literal/length symbol under the fixed code. */
-  litLenSymbol(sym: number): this {
-    if (sym <= 143) return this.code(0x30 + sym, 8);
-    if (sym <= 255) return this.code(0x190 + (sym - 144), 9);
-    if (sym <= 279) return this.code(sym - 256, 7);
-    return this.code(0xC0 + (sym - 280), 8);
-  }
-
-  done(): Uint8Array {
-    if (this.count > 0) this.bytes.push(this.buf & 0xFF);
-    return new Uint8Array(this.bytes);
-  }
-}
-
-/** BFINAL=1, BTYPE=01 (fixed Huffman). */
-function fixedBlock(): Bits {
-  return new Bits().bits(1, 1).bits(1, 2);
-}
-
-function mustTrap(name: string, stream: Uint8Array): void {
-  let threw = false;
-  let got: Uint8Array | undefined;
-  try {
-    got = inflateRaw(stream);
-  } catch {
-    threw = true;
-  }
-  if (!threw) {
-    const shown = got ? Array.from(got.slice(0, 16)).join(",") : "?";
-    throw new Error(`${name}: expected a trap, got ${got?.length} bytes [${shown}]`);
-  }
-}
+const traps = (name: string, stream: Uint8Array) => mustTrap(inflateRaw, name, stream);
 
 Deno.test("inflate/adversarial: distance pointing before the start of the output", () => {
   // One literal, so the output is 1 byte. Then a length-3 match at distance 5,
@@ -88,7 +31,7 @@ Deno.test("inflate/adversarial: distance pointing before the start of the output
     .litLenSymbol(257)      // length 3
     .code(4, 5).bits(0, 1)  // distance 5 > 1
     .done();
-  mustTrap("distance 5 with 1 byte of output", s);
+  traps("distance 5 with 1 byte of output", s);
 });
 
 Deno.test("inflate/adversarial: distance exactly equal to the output length is valid", () => {
@@ -116,7 +59,7 @@ Deno.test("inflate/adversarial: a distance just past the output length traps", (
     .litLenSymbol(257)      // length 3
     .code(2, 5)             // distance symbol 2 = distance 3, no extra bits
     .done();
-  mustTrap("distance 3 with 2 bytes of output", s);
+  traps("distance 3 with 2 bytes of output", s);
 });
 
 Deno.test("inflate/adversarial: a match at the very start of a block", () => {
@@ -125,7 +68,7 @@ Deno.test("inflate/adversarial: a match at the very start of a block", () => {
     .litLenSymbol(257)      // length 3, with nothing to copy from
     .code(0, 5)             // distance 1
     .done();
-  mustTrap("match before any output exists", s);
+  traps("match before any output exists", s);
 });
 
 Deno.test("inflate/adversarial: reserved literal/length symbols 286 and 287", () => {
@@ -134,20 +77,28 @@ Deno.test("inflate/adversarial: reserved literal/length symbols 286 and 287", ()
   // them rather than index past its length table.
   for (const sym of [286, 287]) {
     const s = fixedBlock().literal(0x41).litLenSymbol(sym).done();
-    mustTrap(`literal/length symbol ${sym}`, s);
+    traps(`literal/length symbol ${sym}`, s);
   }
 });
 
 Deno.test("inflate/adversarial: reserved distance symbols 30 and 31", () => {
-  // Same for the distance alphabet: the fixed code is 5 bits wide, so 30 and 31
-  // are encodable but undefined.
+  // Same for the distance alphabet: the fixed code is 5 bits wide, so 30 and 31 are
+  // expressible bit patterns but not defined symbols.
+  //
+  // Worth being precise about where these are caught, because it is not where the
+  // matching literal/length case is caught. The fixed distance decoder is built with
+  // exactly 30 symbols, so no code is assigned to 30 or 31 and the stream dies inside
+  // `Decoder.decode` for want of a matching code. The reserved *literal* symbols 286
+  // and 287 do have codes — the fixed literal table has 288 entries — so those decode
+  // successfully and are caught by an explicit bound in `inflateBlock`. See the comment
+  // on the `di >= 30` check, which is unreachable for this reason.
   for (const sym of [30, 31]) {
     const s = fixedBlock()
       .literal(0x41)
       .litLenSymbol(257)    // length 3
       .code(sym, 5)
       .done();
-    mustTrap(`distance symbol ${sym}`, s);
+    traps(`distance symbol ${sym}`, s);
   }
 });
 
@@ -157,7 +108,7 @@ Deno.test("inflate/adversarial: stored block with a length that runs off the end
     .bits(1, 1).bits(0, 2)  // BFINAL=1, BTYPE=00
     .done();
   const withLen = new Uint8Array([...s, 0xFF, 0x00, 0x00, 0xFF, 0x41]);  // LEN=255, only 1 byte follows
-  mustTrap("stored LEN past end of input", withLen);
+  traps("stored LEN past end of input", withLen);
 });
 
 Deno.test("inflate/adversarial: truncated mid-symbol", () => {
@@ -165,7 +116,7 @@ Deno.test("inflate/adversarial: truncated mid-symbol", () => {
   // whatever has been decoded so far.
   const full = fixedBlock().literal(0x41).literal(0x42).litLenSymbol(256).done();
   for (let keep = 0; keep < full.length; keep++) {
-    mustTrap(`truncated to ${keep} of ${full.length} bytes`, full.slice(0, keep));
+    traps(`truncated to ${keep} of ${full.length} bytes`, full.slice(0, keep));
   }
 });
 
@@ -174,5 +125,5 @@ Deno.test("inflate/adversarial: a block that never ends", () => {
   // trap rather than loop.
   const b = fixedBlock();
   for (let i = 0; i < 100; i++) b.literal(0x41);
-  mustTrap("no end-of-block symbol", b.done());
+  traps("no end-of-block symbol", b.done());
 });

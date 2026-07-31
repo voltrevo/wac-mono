@@ -86,7 +86,7 @@ Where the coverage half now stands:
 | crypto  | yes | `packages/crypto/cov.ts` |
 | fmt     | yes | `packages/fmt/cov.ts` |
 | json    | yes | `packages/json/cov.ts` |
-| gzip    | yes | `tools/coverage.ts`, still the hardcoded original |
+| gzip    | yes | `tools/coverage.ts`, still the hardcoded original (superseded below) |
 | wacc    | no  | — |
 | wactest | no  | — |
 
@@ -104,3 +104,51 @@ That may be an argument for a different shape rather than the same one again.
 
 Leaving this open and unedited above this line — it is agent-b's issue and the wacc,
 wactest, label and mutate parts all remain.
+
+## Progress — 2026-07-31, agent-c (second pass)
+
+The coverage half is done, and not the way the note above guessed. agent-a generalised
+`tools/coverage.ts` in 990dc8c instead of retiring it: discovery is by directory now, and
+each package's *wac-native* tests are the exercise. That is a better answer than either
+option this issue offered, and the reasoning in that commit is the part worth keeping —
+wac issue 0024 (branch coverage never instrumented `match` arms) survived undetected
+because the only measured package contained no `match`, so the fix is to stop having a
+measured set at all rather than to enumerate a better one.
+
+I had started down the option-2 path and deleted the tool in favour of a
+`packages/gzip/cov.ts`. That was wrong once 990dc8c existed, and the deletion is reverted.
+gzip keeps a `cov.ts` because it was the one package without one, but the two tools now
+measure different things and neither subsumes the other:
+
+- `deno task coverage` — every package, driven by its wac-native tests. No opt-in.
+- `deno task coverage:<pkg>` — the host-driven exercises wac cannot express: a fuzz
+  corpus, a python or WebCrypto oracle, DEFLATE streams assembled bit by bit.
+
+gzip is measured by both, and they disagree on inflate by design: the shared tool does not
+drive the hand-built adversarial streams, so it still reports those branches as uncovered.
+
+| package | via cov.ts | notes |
+|---|---:|---|
+| bignum  | 100.0 | |
+| bytes   | 100.0 | |
+| crypto  | 100.0 | |
+| gzip    |  99.6 | the one uncovered point is unreachable and declared as such |
+| json    |  96.3 | |
+| fmt     |  93.1 | |
+| std     |  85.0 | newest package |
+| wacc    | — | no cov.ts; covered by `deno task coverage` if it grows wac-native tests |
+| wactest | — | same |
+
+Worth recording what closing gzip's sixteen uncovered branches showed, because it bears on
+what a coverage number is worth here: **four of the sixteen already had tests.** They
+looked uncovered because the tool's workload was narrower than the suite's — it never drove
+the adversarial streams, and never used the gzip CLI, which is what puts a filename in a
+header. Eleven were genuinely untested. One is dead code.
+
+So the number was wrong in both directions at once: it overstated the gap by four, and said
+nothing about whether the covered branches were *asserted* on. Collecting counters during
+the real test run is the fix for both, and nothing does that yet — agent-a's tool gets
+closest, since for a wac-native suite the tests genuinely are the exercise.
+
+Still open: the `mutate` half is untouched — every mutation in `tools/mutate.ts` is still in
+gzip's `crc32.wac` or `bitwriter.wac`.

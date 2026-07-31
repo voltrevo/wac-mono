@@ -303,6 +303,22 @@ void inflateBlock(BitReader br, Buf out, Tables t, Decoder lit, Decoder dist) {
       i32 len = t.lenBase[li] + br.readBits(t.lenExtra[li]);
 
       i32 di = dist.decode(br);
+      // Unreachable as things stand, and kept anyway. `decode` only returns symbols
+      // from the table it was built with, and both distance decoders are built with at
+      // most 30 entries — the fixed one with exactly 30, the dynamic one with `hdist`,
+      // which `readDynamicLengths` has already bounded at 30. So `di` cannot reach 30,
+      // and a stream using distance code 30 or 31 traps inside `decode` for want of a
+      // matching code rather than here.
+      //
+      // The literal/length check above is *not* in the same position, which is the
+      // asymmetry worth knowing: the fixed literal code is built with 288 entries, so
+      // the two reserved symbols 286 and 287 decode successfully and have to be caught
+      // right here. The fixed distance code stops at 30 and never produces its own
+      // reserved pair.
+      //
+      // Left in because it is one compare, and it stops being dead the moment either
+      // of those two facts changes — widening the fixed distance table to the 32
+      // patterns a 5-bit code can express is a change some implementations make.
       if (di >= 30) { trap; }
       i32 d = t.distBase[di] + br.readBits(t.distExtra[di]);
       if (d > out.len) { trap; }            // reference before the start of output
