@@ -1,0 +1,85 @@
+// Test-only entry point exposing the Huffman builder directly.
+//
+// Round-tripping through gunzip proves the codes work, but not *why*. These
+// exports let the tests check the two structural properties that make a code
+// usable at all: that it satisfies Kraft equality (complete — no wasted code
+// space, no over-subscription), and that the length limit is enforced.
+
+import { Huff } from "../../src/huffman.wac";
+
+// Fibonacci frequencies are the worst case for code length: each symbol's
+// weight equals the sum of the two below it, so the tree degenerates into a
+// chain and depth grows with the symbol count.
+i32[] fibFreqs(i32 count) {
+  i32[] freq = i32[count]();
+  if (count > 0) { freq[0] = 1; }
+  if (count > 1) { freq[1] = 1; }
+  for (i32 i = 2; i < count; i++) {
+    freq[i] = freq[i - 1] + freq[i - 2];
+  }
+  return freq;
+}
+
+/** Longest code length for Fibonacci frequencies, built under `maxBits`. */
+export i32 fibMaxLen(i32 count, i32 maxBits) {
+  Huff h = Huff.build(fibFreqs(count), count, maxBits);
+  return h.maxLen;
+}
+
+/**
+ * Kraft sum for Fibonacci frequencies, scaled to an integer: the sum of
+ * 2^(maxLen - len) over used symbols. A complete prefix code gives exactly
+ * 2^maxLen. Less means the code is incomplete (some bit patterns decode to
+ * nothing); more means it is over-subscribed and ambiguous.
+ */
+export i32 fibKraft(i32 count, i32 maxBits) {
+  Huff h = Huff.build(fibFreqs(count), count, maxBits);
+  i32 sum = 0;
+  for (i32 i = 0; i < count; i++) {
+    if (h.len[i] > 0) {
+      sum += 1 << (h.maxLen - h.len[i]);
+    }
+  }
+  return sum;
+}
+
+/** 2^maxLen for the same build, so the test can compare against Kraft. */
+export i32 fibKraftTarget(i32 count, i32 maxBits) {
+  Huff h = Huff.build(fibFreqs(count), count, maxBits);
+  return 1 << h.maxLen;
+}
+
+/**
+ * Check the canonical code is a genuine prefix code: no code is a prefix of
+ * another. Returns the number of violating pairs, so 0 means correct.
+ */
+export i32 fibPrefixViolations(i32 count, i32 maxBits) {
+  Huff h = Huff.build(fibFreqs(count), count, maxBits);
+  i32 bad = 0;
+  for (i32 i = 0; i < count; i++) {
+    if (h.len[i] == 0) { continue; }
+    for (i32 j = 0; j < count; j++) {
+      if (h.len[j] == 0 || i == j) { continue; }
+      if (h.len[i] <= h.len[j]) {
+        // Is code[i] a prefix of code[j]? Compare i's bits against j's top bits.
+        i32 shift = h.len[j] - h.len[i];
+        if ((h.code[j] >>> shift) == h.code[i]) {
+          bad++;
+        }
+      }
+    }
+  }
+  return bad;
+}
+
+/** Codes must fit in their stated length — no code may exceed 2^len - 1. */
+export i32 fibOverlongCodes(i32 count, i32 maxBits) {
+  Huff h = Huff.build(fibFreqs(count), count, maxBits);
+  i32 bad = 0;
+  for (i32 i = 0; i < count; i++) {
+    if (h.len[i] > 0 && h.code[i] >= (1 << h.len[i])) {
+      bad++;
+    }
+  }
+  return bad;
+}

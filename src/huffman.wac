@@ -1,0 +1,182 @@
+// Canonical Huffman code construction with a code-length limit.
+//
+// DEFLATE caps code lengths: 15 bits for the literal/length and distance codes,
+// 7 bits for the code-length code. A plain Huffman tree can exceed that on
+// skewed frequencies, so the limit has to be enforced.
+//
+// The enforcement here is by frequency scaling rather than package-merge: if any
+// code comes out too long, halve every nonzero frequency (rounding up so
+// nothing reaches zero) and rebuild. Squeezing the dynamic range shortens the
+// longest code, and in the limit every frequency is 1, which gives a balanced
+// tree of depth ceil(log2(288)) = 9 — so this always terminates well inside 15.
+// It can cost a fraction of a percent against the optimal length-limited code,
+// which is a deliberate trade for something short enough to verify by reading.
+
+export struct Huff {
+  i32[] len;    // code length per symbol, 0 = symbol unused
+  i32[] code;   // canonical code per symbol, valid where len > 0
+  i32 maxLen;   // longest code actually used
+
+  /**
+   * Build a canonical code over `count` symbols from their frequencies.
+   *
+   * The caller must ensure at least two symbols have a nonzero frequency. A
+   * single-symbol code is a degenerate case DEFLATE handles inconsistently
+   * across decoders, so callers pad instead — see forceTwo.
+   */
+  Huff build(i32[] freq, i32 count, i32 maxBits) {
+    i32[] work = i32[count]();
+    for (i32 i = 0; i < count; i++) {
+      work[i] = freq[i];
+    }
+
+    i32[] len = i32[count]();
+    i32 longest = 0;
+    bool done = false;
+
+    // Rebuild until every code fits in maxBits.
+    while (!done) {
+      lengthsFrom(work, count, len);
+
+      longest = 0;
+      for (i32 i = 0; i < count; i++) {
+        if (len[i] > longest) { longest = len[i]; }
+      }
+
+      if (longest <= maxBits) {
+        done = true;
+      } else {
+        // Too long: compress the dynamic range and try again.
+        for (i32 i = 0; i < count; i++) {
+          if (work[i] > 0) {
+            work[i] = (work[i] + 1) >>> 1;
+          }
+        }
+      }
+    }
+
+    return Huff(len, canonical(len, count, longest), longest);
+  }
+}
+
+/**
+ * Compute a code length per symbol by building a Huffman tree.
+ *
+ * Nodes 0..count-1 are the leaves, indexed by symbol; internal nodes are
+ * appended after them. Selecting the two lightest active nodes is a linear scan
+ * rather than a heap — with at most 288 symbols that is a few hundred thousand
+ * comparisons, and it keeps the tie-breaking explicit: lowest index wins, so
+ * the output is deterministic and the same input always produces the same
+ * bytes.
+ */
+void lengthsFrom(i32[] freq, i32 count, i32[] outLen) {
+  i32 cap = count * 2;
+  i32[] weight = i32[cap]();
+  i32[] parent = i32[cap]();
+  i32[] alive = i32[cap]();
+
+  i32 live = 0;
+  for (i32 i = 0; i < count; i++) {
+    parent[i] = -1;
+    outLen[i] = 0;
+    if (freq[i] > 0) {
+      weight[i] = freq[i];
+      alive[i] = 1;
+      live++;
+    }
+  }
+
+  i32 next = count;
+  while (live > 1) {
+    // Two lightest active nodes.
+    i32 a = -1;
+    i32 b = -1;
+    for (i32 i = 0; i < next; i++) {
+      if (alive[i] == 0) { continue; }
+      if (a < 0 || weight[i] < weight[a]) {
+        b = a;
+        a = i;
+      } else if (b < 0 || weight[i] < weight[b]) {
+        b = i;
+      }
+    }
+
+    i32 k = next;
+    next++;
+    weight[k] = weight[a] + weight[b];
+    parent[k] = -1;
+    alive[k] = 1;
+    parent[a] = k;
+    parent[b] = k;
+    alive[a] = 0;
+    alive[b] = 0;
+    live--;
+  }
+
+  // Depth of each leaf is its code length.
+  for (i32 i = 0; i < count; i++) {
+    if (freq[i] > 0) {
+      i32 d = 0;
+      i32 cur = i;
+      while (parent[cur] >= 0) {
+        d++;
+        cur = parent[cur];
+      }
+      outLen[i] = d;
+    }
+  }
+}
+
+/**
+ * Assign canonical codes from code lengths, per RFC 1951 section 3.2.2:
+ * shorter codes precede longer ones numerically, and codes of equal length are
+ * assigned in increasing symbol order. Both the encoder and decoder derive the
+ * codes from the lengths alone, which is why only lengths are transmitted.
+ */
+i32[] canonical(i32[] len, i32 count, i32 maxLen) {
+  i32[] blCount = i32[maxLen + 2]();
+  for (i32 i = 0; i < count; i++) {
+    if (len[i] > 0) {
+      blCount[len[i]]++;
+    }
+  }
+
+  i32[] nextCode = i32[maxLen + 2]();
+  i32 code = 0;
+  for (i32 bits = 1; bits <= maxLen; bits++) {
+    code = (code + blCount[bits - 1]) << 1;
+    nextCode[bits] = code;
+  }
+
+  i32[] out = i32[count]();
+  for (i32 i = 0; i < count; i++) {
+    if (len[i] > 0) {
+      out[i] = nextCode[len[i]];
+      nextCode[len[i]]++;
+    }
+  }
+  return out;
+}
+
+/**
+ * Ensure at least two symbols have a nonzero frequency.
+ *
+ * A code over one symbol needs zero bits to identify it, which the format
+ * cannot express, and decoders disagree about whether a one-code tree is legal.
+ * Padding an unused symbol up to frequency 1 sidesteps it: the tree is complete,
+ * and the extra symbol simply never appears in the output.
+ */
+export void forceTwo(i32[] freq, i32 count) {
+  i32 used = 0;
+  for (i32 i = 0; i < count; i++) {
+    if (freq[i] > 0) { used++; }
+  }
+  i32 i = 0;
+  while (used < 2 && i < count) {
+    if (freq[i] == 0) {
+      freq[i] = 1;
+      used++;
+    }
+    i++;
+  }
+}

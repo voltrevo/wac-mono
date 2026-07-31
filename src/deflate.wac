@@ -1,12 +1,25 @@
-// DEFLATE compressor (RFC 1951), fixed Huffman blocks (BTYPE=01).
+// DEFLATE compressor (RFC 1951): fixed (BTYPE=01) and dynamic (BTYPE=10)
+// Huffman blocks over a shared LZ77 pass.
 //
-// The fixed code is defined by the spec, so no code lengths are transmitted —
-// the decompressor already knows them. Compression comes entirely from LZ77:
-// repeated byte sequences become (length, distance) back-references instead of
-// literals.
+// Fixed blocks use the code the spec defines, so nothing is transmitted about
+// it. Dynamic blocks build a code fitted to the actual symbol frequencies and
+// transmit it — which costs a header but usually pays for itself, because real
+// data is nowhere near the uniform distribution the fixed code assumes.
 
 import { BitWriter } from "./bitwriter.wac";
 import { Tables } from "./tables.wac";
+import { Huff, forceTwo } from "./huffman.wac";
+
+i32 numLitLen() { return 286; }   // 0..255 literals, 256 end-of-block, 257..285 lengths
+i32 numDist()   { return 30; }    // distance symbols 0..29
+i32 numCl()     { return 19; }    // code-length alphabet 0..18
+i32 maxCodeBits() { return 15; }  // literal/length and distance code limit
+i32 maxClBits()   { return 7; }   // code-length code limit
+
+i32 imin(i32 a, i32 b) {
+  if (a < b) { return a; }
+  return b;
+}
 
 // ── Fixed literal/length code, RFC 1951 section 3.2.6 ────────────────────────
 //
@@ -30,22 +43,27 @@ i32 fixedLitCode(i32 sym) {
   return 0xC0 + (sym - 280);
 }
 
-void writeLit(BitWriter w, i32 sym) {
-  w.writeCode(fixedLitCode(sym), fixedLitBits(sym));
+// ── LZ77 ──────────────────────────────────────────────────────────────────────
+
+/**
+ * The LZ77 pass, kept separate from encoding so both block types compress the
+ * same symbol stream and the only difference between them is the code used to
+ * write it. Frequencies are gathered here because the dynamic encoder needs
+ * them before it can write anything.
+ */
+struct Tokens {
+  i32[] a;          // literal byte, or match length
+  i32[] b;          // 0 for a literal, else the match distance
+  i32 n;
+  i32[] litFreq;    // over numLitLen symbols, includes end-of-block
+  i32[] distFreq;   // over numDist symbols
 }
 
-// ── Match finding ─────────────────────────────────────────────────────────────
-//
-// Hash chains: hash the 3 bytes at each position into a bucket, and keep a
-// singly-linked list per bucket, newest first. Searching a bucket walks back
-// through earlier positions with the same 3-byte prefix, which are the only
-// candidates that can start a match of the 3-byte minimum.
-
-i32 hashSize()  { return 32768; }  // 1 << 15, one bucket per distance
-i32 maxDist()   { return 32768; }  // RFC 1951: window is 32 KiB
-i32 maxMatch()  { return 258; }    // longest length the code can express
-i32 minMatch()  { return 3; }      // shorter than this costs more than literals
-i32 chainLimit() { return 128; }   // candidates per position, bounds the search
+i32 hashSize()   { return 32768; }  // 1 << 15, one bucket per possible distance
+i32 maxDist()    { return 32768; }  // RFC 1951: 32 KiB window
+i32 maxMatch()   { return 258; }    // longest length the code can express
+i32 minMatch()   { return 3; }      // shorter than this costs more than literals
+i32 chainLimit() { return 128; }    // candidates per position, bounds the search
 
 i32 hash3(i8[] data, i32 pos) {
   return ((data[pos] << 10) ^ (data[pos + 1] << 5) ^ data[pos + 2]) & 0x7FFF;
@@ -58,21 +76,19 @@ void insertHash(i8[] data, i32[] head, i32[] prev, i32 pos) {
 }
 
 /**
- * Compress to a single final fixed-Huffman block.
+ * Greedy match finding over hash chains: hash the 3 bytes at each position, keep
+ * a newest-first list per bucket, and walk back through earlier positions with
+ * the same 3-byte prefix — the only candidates that can start a match.
  *
- * Greedy matching: at each position take the longest match found, otherwise
- * emit a literal. No lazy evaluation — zlib defers a match by one byte to see
- * if the next position does better, which gains a few percent and is a separate
- * concern from getting the stream correct.
+ * Greedy, not lazy: zlib defers a match by one byte to check whether the next
+ * position does better, worth a few percent. That is a ratio refinement, not a
+ * correctness one.
  */
-export i8[] deflateFixed(i8[] data) {
-  BitWriter w = BitWriter.create();
-  Tables t = Tables.create();
-
-  w.writeBits(1, 1);   // BFINAL = 1, only block
-  w.writeBits(1, 2);   // BTYPE = 01, fixed Huffman
-
+Tokens lz77(i8[] data, Tables t) {
   i32 n = data.len();
+  // Every token consumes at least one input byte, so n slots always suffice.
+  Tokens tok = Tokens(i32[n](), i32[n](), 0, i32[numLitLen()](), i32[numDist()]());
+
   i32[] head = i32[hashSize()]();
   for (i32 i = 0; i < hashSize(); i++) {
     head[i] = -1;
@@ -84,7 +100,6 @@ export i8[] deflateFixed(i8[] data) {
     i32 bestLen = 0;
     i32 bestDist = 0;
 
-    // Only look for a match if a minimum-length one could still fit.
     if (pos + minMatch() <= n) {
       i32 cand = head[hash3(data, pos)];
       i32 chain = 0;
@@ -102,7 +117,6 @@ export i8[] deflateFixed(i8[] data) {
             bestLen = len;
             bestDist = dist;
           }
-          // Nothing can beat the maximum, so stop looking.
           if (bestLen == maxMatch()) {
             cand = -1;
           } else {
@@ -114,19 +128,13 @@ export i8[] deflateFixed(i8[] data) {
     }
 
     if (bestLen >= minMatch()) {
-      i32 li = t.lenIndex(bestLen);
-      writeLit(w, 257 + li);
-      if (t.lenExtra[li] > 0) {
-        w.writeBits(bestLen - t.lenBase[li], t.lenExtra[li]);
-      }
-      // Fixed distance codes are 5 bits and equal to the symbol number.
-      i32 di = t.distIndex(bestDist);
-      w.writeCode(di, 5);
-      if (t.distExtra[di] > 0) {
-        w.writeBits(bestDist - t.distBase[di], t.distExtra[di]);
-      }
-      // Every position the match covers still needs to be hashed, or later
-      // matches cannot reference into it.
+      tok.a[tok.n] = bestLen;
+      tok.b[tok.n] = bestDist;
+      tok.n++;
+      tok.litFreq[257 + t.lenIndex(bestLen)]++;
+      tok.distFreq[t.distIndex(bestDist)]++;
+      // Every covered position still needs hashing, or later matches cannot
+      // reference into this one.
       for (i32 k = 0; k < bestLen; k++) {
         if (pos + k + minMatch() <= n) {
           insertHash(data, head, prev, pos + k);
@@ -134,7 +142,10 @@ export i8[] deflateFixed(i8[] data) {
       }
       pos += bestLen;
     } else {
-      writeLit(w, data[pos]);
+      tok.a[tok.n] = data[pos];
+      tok.b[tok.n] = 0;
+      tok.n++;
+      tok.litFreq[data[pos]]++;
       if (pos + minMatch() <= n) {
         insertHash(data, head, prev, pos);
       }
@@ -142,7 +153,226 @@ export i8[] deflateFixed(i8[] data) {
     }
   }
 
-  writeLit(w, 256);    // end-of-block
+  tok.litFreq[256]++;   // end-of-block, emitted once
+  return tok;
+}
+
+/** Write the token stream using whatever literal/length and distance code. */
+void writeTokens(
+  BitWriter w, Tokens tok, Tables t,
+  i32[] litCode, i32[] litLen, i32[] distCode, i32[] distLen
+) {
+  for (i32 i = 0; i < tok.n; i++) {
+    if (tok.b[i] == 0) {
+      i32 sym = tok.a[i];
+      w.writeCode(litCode[sym], litLen[sym]);
+    } else {
+      i32 len = tok.a[i];
+      i32 li = t.lenIndex(len);
+      w.writeCode(litCode[257 + li], litLen[257 + li]);
+      if (t.lenExtra[li] > 0) {
+        w.writeBits(len - t.lenBase[li], t.lenExtra[li]);
+      }
+      i32 dist = tok.b[i];
+      i32 di = t.distIndex(dist);
+      w.writeCode(distCode[di], distLen[di]);
+      if (t.distExtra[di] > 0) {
+        w.writeBits(dist - t.distBase[di], t.distExtra[di]);
+      }
+    }
+  }
+  w.writeCode(litCode[256], litLen[256]);   // end-of-block
+}
+
+// ── Fixed Huffman ─────────────────────────────────────────────────────────────
+
+/** Compress to a single final fixed-Huffman block. */
+export i8[] deflateFixed(i8[] data) {
+  BitWriter w = BitWriter.create();
+  Tables t = Tables.create();
+  Tokens tok = lz77(data, t);
+
+  w.writeBits(1, 1);   // BFINAL = 1, only block
+  w.writeBits(1, 2);   // BTYPE = 01, fixed Huffman
+
+  // Materialise the fixed code as tables so writeTokens is shared.
+  i32[] litCode = i32[288]();
+  i32[] litLen = i32[288]();
+  for (i32 s = 0; s < 288; s++) {
+    litCode[s] = fixedLitCode(s);
+    litLen[s] = fixedLitBits(s);
+  }
+  i32[] distCode = i32[numDist()]();
+  i32[] distLen = i32[numDist()]();
+  for (i32 d = 0; d < numDist(); d++) {
+    distCode[d] = d;     // fixed distance codes are 5 bits, code == symbol
+    distLen[d] = 5;
+  }
+
+  writeTokens(w, tok, t, litCode, litLen, distCode, distLen);
+  w.alignByte();
+  return w.bytes();
+}
+
+// ── Dynamic Huffman ───────────────────────────────────────────────────────────
+
+/**
+ * The code lengths of both trees, run-length encoded over the code-length
+ * alphabet (RFC 1951 section 3.2.7):
+ *
+ *   0..15  a literal code length
+ *   16     repeat the previous length 3-6 times   (2 extra bits)
+ *   17     a run of 3-10 zero lengths             (3 extra bits)
+ *   18     a run of 11-138 zero lengths           (7 extra bits)
+ *
+ * Zero runs are common — most of the 286 literal/length symbols go unused in
+ * any given block — which is what symbols 17 and 18 exist for.
+ */
+struct ClSeq {
+  i32[] sym;
+  i32[] extra;
+  i32 n;
+}
+
+void clPush(ClSeq s, i32 sym, i32 extra) {
+  s.sym[s.n] = sym;
+  s.extra[s.n] = extra;
+  s.n++;
+}
+
+ClSeq runLengthEncode(i32[] lens, i32 total) {
+  // Each input length emits at most one symbol, so `total` slots suffice.
+  ClSeq s = ClSeq(i32[total + 1](), i32[total + 1](), 0);
+
+  i32 i = 0;
+  while (i < total) {
+    i32 cur = lens[i];
+    i32 run = 1;
+    while (i + run < total && lens[i + run] == cur) {
+      run++;
+    }
+    i += run;
+
+    if (cur == 0) {
+      while (run >= 11) {
+        i32 k = imin(run, 138);
+        clPush(s, 18, k - 11);
+        run -= k;
+      }
+      while (run >= 3) {
+        i32 k = imin(run, 10);
+        clPush(s, 17, k - 3);
+        run -= k;
+      }
+      while (run > 0) {
+        clPush(s, 0, 0);
+        run--;
+      }
+    } else {
+      clPush(s, cur, 0);   // symbol 16 copies a previous length, so send one
+      run--;
+      while (run >= 3) {
+        i32 k = imin(run, 6);
+        clPush(s, 16, k - 3);
+        run -= k;
+      }
+      while (run > 0) {
+        clPush(s, cur, 0);
+        run--;
+      }
+    }
+  }
+  return s;
+}
+
+/**
+ * The order the code-length code's own lengths are transmitted in. Front-loaded
+ * with the symbols most likely to be used, so trailing entries are usually zero
+ * and can be dropped (that is what HCLEN counts).
+ */
+i32[] clOrder() {
+  return i32[](16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);
+}
+
+/** Extra bits carried by code-length symbols 16, 17 and 18. */
+i32 clExtraBits(i32 sym) {
+  if (sym == 16) { return 2; }
+  if (sym == 17) { return 3; }
+  if (sym == 18) { return 7; }
+  return 0;
+}
+
+/** Compress to a single final dynamic-Huffman block. */
+export i8[] deflateDynamic(i8[] data) {
+  BitWriter w = BitWriter.create();
+  Tables t = Tables.create();
+  Tokens tok = lz77(data, t);
+
+  // A one-symbol code cannot be expressed, so pad before building.
+  forceTwo(tok.litFreq, numLitLen());
+  forceTwo(tok.distFreq, numDist());
+
+  Huff lit = Huff.build(tok.litFreq, numLitLen(), maxCodeBits());
+  Huff dist = Huff.build(tok.distFreq, numDist(), maxCodeBits());
+
+  // Trailing unused symbols need not be transmitted, but the minimum counts are
+  // fixed by the format: 257 literal/length lengths and 1 distance length.
+  i32 hlit = numLitLen();
+  while (hlit > 257 && lit.len[hlit - 1] == 0) {
+    hlit--;
+  }
+  i32 hdist = numDist();
+  while (hdist > 1 && dist.len[hdist - 1] == 0) {
+    hdist--;
+  }
+
+  // Both trees' lengths are encoded as one concatenated sequence, so a repeat
+  // can straddle the boundary between them.
+  i32 total = hlit + hdist;
+  i32[] lens = i32[total]();
+  for (i32 i = 0; i < hlit; i++) {
+    lens[i] = lit.len[i];
+  }
+  for (i32 i = 0; i < hdist; i++) {
+    lens[hlit + i] = dist.len[i];
+  }
+
+  ClSeq seq = runLengthEncode(lens, total);
+
+  i32[] clFreq = i32[numCl()]();
+  for (i32 i = 0; i < seq.n; i++) {
+    clFreq[seq.sym[i]]++;
+  }
+  forceTwo(clFreq, numCl());
+  Huff cl = Huff.build(clFreq, numCl(), maxClBits());
+
+  // Drop trailing zero lengths in the transmission order; at least 4 are sent.
+  i32[] order = clOrder();
+  i32 hclen = numCl();
+  while (hclen > 4 && cl.len[order[hclen - 1]] == 0) {
+    hclen--;
+  }
+
+  w.writeBits(1, 1);          // BFINAL = 1, only block
+  w.writeBits(2, 2);          // BTYPE = 10, dynamic Huffman
+  w.writeBits(hlit - 257, 5); // HLIT
+  w.writeBits(hdist - 1, 5);  // HDIST
+  w.writeBits(hclen - 4, 4);  // HCLEN
+
+  for (i32 i = 0; i < hclen; i++) {
+    w.writeBits(cl.len[order[i]], 3);
+  }
+
+  for (i32 i = 0; i < seq.n; i++) {
+    i32 sym = seq.sym[i];
+    w.writeCode(cl.code[sym], cl.len[sym]);
+    i32 bits = clExtraBits(sym);
+    if (bits > 0) {
+      w.writeBits(seq.extra[i], bits);
+    }
+  }
+
+  writeTokens(w, tok, t, lit.code, lit.len, dist.code, dist.len);
   w.alignByte();
   return w.bytes();
 }

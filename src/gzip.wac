@@ -8,7 +8,7 @@
 
 import { Buf } from "./buf.wac";
 import { crc32 } from "./crc32.wac";
-import { deflateFixed } from "./deflate.wac";
+import { deflateFixed, deflateDynamic } from "./deflate.wac";
 
 // A stored block's LEN field is 16 bits, so a block tops out at 65535 bytes.
 // Longer input becomes several blocks, only the last of which is marked final.
@@ -57,15 +57,50 @@ export i8[] gzipStored(i8[] data) {
   return out.bytes();
 }
 
-/** Same container, but the payload is a fixed-Huffman deflate stream. */
-export i8[] gzipFixed(i8[] data) {
+/** Wrap an already-compressed deflate stream in the gzip container. */
+i8[] wrap(i8[] data, i8[] body) {
   Buf out = Buf.create();
   header(out);
-
-  i8[] body = deflateFixed(data);
   out.pushBytes(body, 0, body.len());
-
   out.pushU32(crc32(data));
   out.pushU32(data.len());
   return out.bytes();
+}
+
+/** Same container, but the payload is a fixed-Huffman deflate stream. */
+export i8[] gzipFixed(i8[] data) {
+  return wrap(data, deflateFixed(data));
+}
+
+/** Same container, dynamic-Huffman payload. */
+export i8[] gzipDynamic(i8[] data) {
+  return wrap(data, deflateDynamic(data));
+}
+
+/**
+ * Compress and keep whichever block type came out smallest.
+ *
+ * Dynamic almost always wins, but not always: on incompressible input its code
+ * header is pure overhead, and a stored block's 5 bytes per 64 KiB is the floor.
+ * Trying all three costs three passes and guarantees the output is never larger
+ * than stored — which is the property that matters, since expansion is the one
+ * outcome a compressor should never produce.
+ */
+export i8[] gzipBest(i8[] data) {
+  i8[] dynamic = deflateDynamic(data);
+  i8[] fixed = deflateFixed(data);
+
+  i8[] best = dynamic;
+  if (fixed.len() < best.len()) {
+    best = fixed;
+  }
+
+  // Stored is framed by gzipStored rather than as a bare body, so compare the
+  // finished containers.
+  i8[] wrapped = wrap(data, best);
+  i8[] stored = gzipStored(data);
+  if (stored.len() < wrapped.len()) {
+    return stored;
+  }
+  return wrapped;
 }
