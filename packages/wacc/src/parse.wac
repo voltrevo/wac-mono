@@ -142,8 +142,12 @@ struct ExprList {
   }
 
   Expr[] take(const this) {
-    Expr[] out = Expr[this.n]();
-    for (i32 i = 0; i < this.n; i++) { out[i] = this.items[i]!; }
+    // `Expr[n]()` would need `Expr` to have a default value, and anything reachable from an
+    // enum has none. The first collected element serves as the fill; every slot is then
+    // overwritten, so the sharing `fill:` implies is invisible here.
+    if (this.n == 0) { return Expr[](); }
+    Expr[] out = Expr[this.n](fill: this.items[0]!);
+    for (i32 i = 1; i < this.n; i++) { out[i] = this.items[i]!; }
     return out;
   }
 }
@@ -165,8 +169,12 @@ struct TyList {
   }
 
   Ty[] take(const this) {
-    Ty[] out = Ty[this.n]();
-    for (i32 i = 0; i < this.n; i++) { out[i] = this.items[i]!; }
+    // `Ty[n]()` would need `Ty` to have a default value, and anything reachable from an
+    // enum has none. The first collected element serves as the fill; every slot is then
+    // overwritten, so the sharing `fill:` implies is invisible here.
+    if (this.n == 0) { return Ty[](); }
+    Ty[] out = Ty[this.n](fill: this.items[0]!);
+    for (i32 i = 1; i < this.n; i++) { out[i] = this.items[i]!; }
     return out;
   }
 }
@@ -188,8 +196,12 @@ struct NamedArgList {
   }
 
   NamedArg[] take(const this) {
-    NamedArg[] out = NamedArg[this.n]();
-    for (i32 i = 0; i < this.n; i++) { out[i] = this.items[i]!; }
+    // `NamedArg[n]()` would need `NamedArg` to have a default value, and anything reachable from an
+    // enum has none. The first collected element serves as the fill; every slot is then
+    // overwritten, so the sharing `fill:` implies is invisible here.
+    if (this.n == 0) { return NamedArg[](); }
+    NamedArg[] out = NamedArg[this.n](fill: this.items[0]!);
+    for (i32 i = 1; i < this.n; i++) { out[i] = this.items[i]!; }
     return out;
   }
 }
@@ -211,8 +223,12 @@ struct StmtList {
   }
 
   Stmt[] take(const this) {
-    Stmt[] out = Stmt[this.n]();
-    for (i32 i = 0; i < this.n; i++) { out[i] = this.items[i]!; }
+    // `Stmt[n]()` would need `Stmt` to have a default value, and anything reachable from an
+    // enum has none. The first collected element serves as the fill; every slot is then
+    // overwritten, so the sharing `fill:` implies is invisible here.
+    if (this.n == 0) { return Stmt[](); }
+    Stmt[] out = Stmt[this.n](fill: this.items[0]!);
+    for (i32 i = 1; i < this.n; i++) { out[i] = this.items[i]!; }
     return out;
   }
 }
@@ -233,8 +249,12 @@ struct CaseList {
   }
 
   Case[] take(const this) {
-    Case[] out = Case[this.n]();
-    for (i32 i = 0; i < this.n; i++) { out[i] = this.items[i]!; }
+    // `Case[n]()` would need `Case` to have a default value, and anything reachable from an
+    // enum has none. The first collected element serves as the fill; every slot is then
+    // overwritten, so the sharing `fill:` implies is invisible here.
+    if (this.n == 0) { return Case[](); }
+    Case[] out = Case[this.n](fill: this.items[0]!);
+    for (i32 i = 1; i < this.n; i++) { out[i] = this.items[i]!; }
     return out;
   }
 }
@@ -255,8 +275,12 @@ struct ArmList {
   }
 
   Arm[] take(const this) {
-    Arm[] out = Arm[this.n]();
-    for (i32 i = 0; i < this.n; i++) { out[i] = this.items[i]!; }
+    // `Arm[n]()` would need `Arm` to have a default value, and anything reachable from an
+    // enum has none. The first collected element serves as the fill; every slot is then
+    // overwritten, so the sharing `fill:` implies is invisible here.
+    if (this.n == 0) { return Arm[](); }
+    Arm[] out = Arm[this.n](fill: this.items[0]!);
+    for (i32 i = 1; i < this.n; i++) { out[i] = this.items[i]!; }
     return out;
   }
 }
@@ -277,8 +301,12 @@ struct ParamList {
   }
 
   Param[] take(const this) {
-    Param[] out = Param[this.n]();
-    for (i32 i = 0; i < this.n; i++) { out[i] = this.items[i]!; }
+    // `Param[n]()` would need `Param` to have a default value, and anything reachable from an
+    // enum has none. The first collected element serves as the fill; every slot is then
+    // overwritten, so the sharing `fill:` implies is invisible here.
+    if (this.n == 0) { return Param[](); }
+    Param[] out = Param[this.n](fill: this.items[0]!);
+    for (i32 i = 1; i < this.n; i++) { out[i] = this.items[i]!; }
     return out;
   }
 }
@@ -299,8 +327,12 @@ struct FieldList {
   }
 
   Field[] take(const this) {
-    Field[] out = Field[this.n]();
-    for (i32 i = 0; i < this.n; i++) { out[i] = this.items[i]!; }
+    // `Field[n]()` would need `Field` to have a default value, and anything reachable from an
+    // enum has none. The first collected element serves as the fill; every slot is then
+    // overwritten, so the sharing `fill:` implies is invisible here.
+    if (this.n == 0) { return Field[](); }
+    Field[] out = Field[this.n](fill: this.items[0]!);
+    for (i32 i = 1; i < this.n; i++) { out[i] = this.items[i]!; }
     return out;
   }
 }
@@ -321,8 +353,12 @@ struct MethodList {
   }
 
   Method[] take(const this) {
-    Method[] out = Method[this.n]();
-    for (i32 i = 0; i < this.n; i++) { out[i] = this.items[i]!; }
+    // `Method[n]()` would need `Method` to have a default value, and anything reachable from an
+    // enum has none. The first collected element serves as the fill; every slot is then
+    // overwritten, so the sharing `fill:` implies is invisible here.
+    if (this.n == 0) { return Method[](); }
+    Method[] out = Method[this.n](fill: this.items[0]!);
+    for (i32 i = 1; i < this.n; i++) { out[i] = this.items[i]!; }
     return out;
   }
 }
@@ -343,8 +379,12 @@ struct VariantList {
   }
 
   Variant[] take(const this) {
-    Variant[] out = Variant[this.n]();
-    for (i32 i = 0; i < this.n; i++) { out[i] = this.items[i]!; }
+    // `Variant[n]()` would need `Variant` to have a default value, and anything reachable from an
+    // enum has none. The first collected element serves as the fill; every slot is then
+    // overwritten, so the sharing `fill:` implies is invisible here.
+    if (this.n == 0) { return Variant[](); }
+    Variant[] out = Variant[this.n](fill: this.items[0]!);
+    for (i32 i = 1; i < this.n; i++) { out[i] = this.items[i]!; }
     return out;
   }
 }
@@ -365,8 +405,12 @@ struct ImportItemList {
   }
 
   ImportItem[] take(const this) {
-    ImportItem[] out = ImportItem[this.n]();
-    for (i32 i = 0; i < this.n; i++) { out[i] = this.items[i]!; }
+    // `ImportItem[n]()` would need `ImportItem` to have a default value, and anything reachable from an
+    // enum has none. The first collected element serves as the fill; every slot is then
+    // overwritten, so the sharing `fill:` implies is invisible here.
+    if (this.n == 0) { return ImportItem[](); }
+    ImportItem[] out = ImportItem[this.n](fill: this.items[0]!);
+    for (i32 i = 1; i < this.n; i++) { out[i] = this.items[i]!; }
     return out;
   }
 }
@@ -387,8 +431,12 @@ struct DeclList {
   }
 
   Decl[] take(const this) {
-    Decl[] out = Decl[this.n]();
-    for (i32 i = 0; i < this.n; i++) { out[i] = this.items[i]!; }
+    // `Decl[n]()` would need `Decl` to have a default value, and anything reachable from an
+    // enum has none. The first collected element serves as the fill; every slot is then
+    // overwritten, so the sharing `fill:` implies is invisible here.
+    if (this.n == 0) { return Decl[](); }
+    Decl[] out = Decl[this.n](fill: this.items[0]!);
+    for (i32 i = 1; i < this.n; i++) { out[i] = this.items[i]!; }
     return out;
   }
 }
@@ -862,7 +910,7 @@ Expr parsePrimary(P p) {
           p.advance();
           Expr[] args = parseArgList(p);
           p.expect(kRparen());
-          return Expr(ExprKind.ArrNew(elem, null, args), line, col);
+          return Expr(ExprKind.ArrNew(elem, null, null, args), line, col);
         }
         p.fail(perrFnArray());
         return Expr(ExprKind.NullLit, line, col);
@@ -915,11 +963,20 @@ bool looksLikeConstructionOrCall(P p) {
   if (next == kLbrack() || next == kQuestion()) {
     i32 j = 1;                        // relative offset of the `[` or `?`
     // Skip element-type suffixes: `[]` pairs and `?`.
+    bool lastWasBracketPair = false;
     while (true) {
-      if (p.kindAt(j) == kLbrack() && p.kindAt(j + 1) == kRbrack()) { j += 2; }
-      else if (p.kindAt(j) == kQuestion()) { j++; }
-      else { break; }
+      if (p.kindAt(j) == kLbrack() && p.kindAt(j + 1) == kRbrack()) {
+        j += 2;
+        lastWasBracketPair = true;
+      } else if (p.kindAt(j) == kQuestion()) {
+        j++;
+        lastWasBracketPair = false;
+      } else { break; }
     }
+    // A fixed literal with a named element type: `S[](S(1), S(2))`. The final `[]` pair
+    // is the construction bracket, so the scan lands on `(` with no size bracket to
+    // find. An empty `[]` cannot be an index, so there is no ambiguity.
+    if (lastWasBracketPair && p.kindAt(j) == kLparen()) { return true; }
     if (p.kindAt(j) != kLbrack()) { return false; }
     j++;
     i32 depth = 1;
@@ -928,11 +985,24 @@ bool looksLikeConstructionOrCall(P p) {
       else if (p.kindAt(j) == kRbrack()) { depth--; }
       j++;
     }
+    // `T[N](fill: v)` gives every element a value. A call cannot take a named argument,
+    // so this is unambiguous where a bare `T[N](v)` would collide with `arr[i](5)`.
+    if (p.kindAt(j) == kLparen() && p.kindAt(j + 1) == kIdent()
+        && spanIsFill(p.src, p.startAt(j + 1), p.lenAt(j + 1))
+        && p.kindAt(j + 2) == kColon()) {
+      return true;
+    }
     // `T[N]()` constructs only when the parentheses are empty; `arr[i](5)` is an
     // index followed by a call.
     return p.kindAt(j) == kLparen() && p.kindAt(j + 1) == kRparen();
   }
   return false;
+}
+
+/** Is this identifier span exactly `fill`? */
+bool spanIsFill(u8[] s, i32 start, i32 len) {
+  if (len != 4) { return false; }
+  return s[start] == 'f' && s[start + 1] == 'i' && s[start + 2] == 'l' && s[start + 3] == 'l';
 }
 
 Expr parseConstructionOrCall(P p, i32 line, i32 col) {
@@ -972,18 +1042,29 @@ Expr parseConstructionOrCall(P p, i32 line, i32 col) {
     }
     p.advance();                       // the construction `[`
     if (!p.at1(kRbrack())) {
-      Expr size = parseExpr(p);        // `T[N]()`
+      Expr size = parseExpr(p);        // `T[N]()` or `T[N](fill: v)`
       p.expect(kRbrack());
       p.expect(kLparen());
+      Expr? fill = null;
+      if (!p.at1(kRparen())) {
+        if (p.at1(kIdent()) && spanIsFill(p.src, p.startAt(0), p.lenAt(0))
+            && p.kindAt(1) == kColon()) {
+          p.advance();
+          p.advance();
+          fill = parseExpr(p);
+        } else {
+          p.fail(perrExpected());
+        }
+      }
       p.expect(kRparen());
-      Expr[] empty = Expr[0]();
-      return Expr(ExprKind.ArrNew(elem, size, empty), line, col);
+      Expr[] empty = Expr[]();
+      return Expr(ExprKind.ArrNew(elem, size, fill, empty), line, col);
     }
     p.advance();                       // `]`
     p.expect(kLparen());
     Expr[] args = parseArgList(p);
     p.expect(kRparen());
-    return Expr(ExprKind.ArrNew(elem, null, args), line, col);
+    return Expr(ExprKind.ArrNew(elem, null, null, args), line, col);
   }
 
   // `Type { field: value, ... }` — named construction.
@@ -1001,7 +1082,7 @@ Expr parseConstructionOrCall(P p, i32 line, i32 col) {
       }
     }
     p.expect(kRbrace());
-    Expr[] empty = Expr[0]();
+    Expr[] empty = Expr[]();
     return Expr(ExprKind.Construct(tyNamed(nameTok, line, col), empty, named.take()),
       line, col);
   }
@@ -1012,7 +1093,7 @@ Expr parseConstructionOrCall(P p, i32 line, i32 col) {
     Expr[] args = parseArgList(p);
     p.expect(kRparen());
     Ty t = prim ? tyPrim(nameTok, line, col) : tyNamed(nameTok, line, col);
-    NamedArg[] empty = NamedArg[0]();
+    NamedArg[] empty = NamedArg[]();
     return Expr(ExprKind.Construct(t, args, empty), line, col);
   }
 
@@ -1214,7 +1295,7 @@ Stmt parseIfStmt(P p) {
   Expr cond = parseExpr(p);
   p.expect(kRparen());
   Stmt[] then = parseBlock(p);
-  Stmt[] els = Stmt[0]();
+  Stmt[] els = Stmt[]();
   if (p.eat(kElse())) {
     if (p.at1(kIf())) {
       StmtList one = StmtList.create();
@@ -1391,10 +1472,11 @@ Stmt parseMatchStmt(P p) {
 void parseParams(P p, ParamList out) {
   while (true) {
     if (p.at1(kRparen())) { return; }              // trailing comma
+    bool isConst = p.eat(kConst());
     Ty t = parseType(p);
     i32 nameTok = -1;
     if (p.at1(kIdent())) { nameTok = p.advance(); } else { p.fail(perrExpected()); }
-    out.push(Param(nameTok, t));
+    out.push(Param(nameTok, t, isConst));
     if (!p.eat(kComma())) { return; }
   }
 }

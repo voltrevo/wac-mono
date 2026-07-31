@@ -106,8 +106,14 @@ export enum ExprKind {
   Construct(Ty ctype, Expr[] args, NamedArg[] named),
   /** `++`/`--`; `prefix` distinguishes `++i` from `i++`. */
   Incr(Lvalue target, i32 op, bool prefix),
-  /** `i32[n]()` or `i32[]{1, 2, 3}` — `size` and `elements` are exclusive. */
-  ArrNew(Ty elem, Expr? size, Expr[] elements),
+  /**
+   * `i32[n]()`, `i32[n](fill: v)`, or `i32[](1, 2, 3)`.
+   *
+   * `size` and `elements` are exclusive. `fill` accompanies `size` and gives every
+   * element that value, which is the only way to size an array dynamically when the
+   * element type has no default — as anything reachable from an enum does not.
+   */
+  ArrNew(Ty elem, Expr? size, Expr? fill, Expr[] elements),
 }
 
 // ── Lvalues ───────────────────────────────────────────────────────────────────
@@ -194,6 +200,8 @@ export struct ImportItem {
 export struct Param {
   i32 nameTok;
   Ty type;
+  /** A leading `const`, which forbids writing through the parameter. */
+  bool isConst;
 }
 
 export struct Field {
