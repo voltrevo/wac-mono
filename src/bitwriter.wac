@@ -49,10 +49,6 @@ export struct BitWriter {
     }
   }
 
-  i32 byteLen(const this) {
-    return this.out.len;
-  }
-
   i8[] bytes(const this) {
     return this.out.bytes();
   }

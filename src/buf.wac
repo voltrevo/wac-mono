@@ -17,11 +17,6 @@ export struct Buf {
     return this.data[i];
   }
 
-  void set(this, i32 i, i32 v) {
-    if (i < 0 || i >= this.len) { trap; }
-    this.data[i] = v;
-  }
-
   // Make room for at least one more byte.
   void reserve(this) {
     if (this.len < this.data.len()) { return; }

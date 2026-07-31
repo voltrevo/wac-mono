@@ -129,6 +129,43 @@ silently. Some corruptions are legitimately benign, since MTIME, XFL and the OS
 byte are not covered by the CRC, so decoding is allowed but only to the original
 bytes.
 
+### Branch coverage
+
+```sh
+deno run -A tools/coverage.ts [--verbose]
+```
+
+wac gained opt-in branch-coverage instrumentation
+(`wacCompile(files, entry, { coverage: true })`), so the wac sources now have a
+real number rather than only mutation testing as a proxy. Current state:
+
+| file | points | covered | % |
+|---|---:|---:|---:|
+| bitwriter.wac | 8 | 8 | 100.0 |
+| buf.wac | 14 | 13 | 92.9 |
+| crc32.wac | 4 | 4 | 100.0 |
+| deflate.wac | 80 | 80 | 100.0 |
+| gzip.wac | 15 | 15 | 100.0 |
+| huffman.wac | 34 | 34 | 100.0 |
+| inflate.wac | 78 | 62 | 79.5 |
+| tables.wac | 7 | 7 | 100.0 |
+| **all** | **240** | **223** | **92.9** |
+
+The remaining gap is almost entirely inflate's validation paths — the `trap`
+branches for malformed input. They are reached only by streams built on purpose,
+which is the same lesson mutation testing taught. `buf.wac`'s one uncovered point
+is `get`'s bounds check, which is unreachable in practice because inflate
+validates distances before calling it.
+
+Two caveats on the number:
+
+- It measures what `tools/coverage.ts` exercises, which approximates the test
+  suite rather than being it. Collecting counters during the actual test run
+  would be more honest and is not done yet — for instance the FNAME/FCOMMENT
+  header-skip loops are covered by `inflate.test.ts` but not by this tool.
+- An `if`/`else if` chain with no final `else` has no counter for falling past
+  every arm, since points count arms entered.
+
 ### Mutation testing
 
 ```sh
