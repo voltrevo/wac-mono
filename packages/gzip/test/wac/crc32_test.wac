@@ -6,7 +6,7 @@
 // definition across every byte value and a spread of lengths.
 
 import { T } from "../../../wactest/src/assert.wac";
-import { itoa } from "../../../wactest/src/itoa.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
 import { crc32, crc32Bitwise } from "../../src/crc32.wac";
 
 export string test_table_agrees_with_definition_on_every_byte() {

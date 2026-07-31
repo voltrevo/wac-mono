@@ -1,11 +1,12 @@
 # fmt
 
-Decimal and `f64`, converted exactly in both directions.
+Numbers to and from text.
 
 - `ftoa(x)` — the shortest digit sequence that reads back as the same double,
   formatted exactly as JavaScript's `Number::toString`.
 - `atofSpan(src, start, end)` — the double nearest a decimal, ties to even.
   Correctly rounded for every input.
+- `itoa(n)` — an `i32` in decimal.
 
 ```wac
 import { ftoa, ftoaBytes, writeF64 } from "../../fmt/src/ftoa.wac";
@@ -130,6 +131,7 @@ which cuts those iterations to about three.
 
 ## Not here yet
 
-- `itoa`. `wactest` has one; it belongs here, but moving it is that package's call.
-- `f32`, in either direction. The algorithms are the same with different constants.
+- `f32`, in either direction. The algorithms are the same with different constants,
+  but it also needs `f32.toBits`/`f32.fromBits` in the language — only the `f64`
+  pair exists — and nothing in this repo uses `f32` yet.
 - Fixed-precision output (`toFixed`-style). Only shortest is implemented.

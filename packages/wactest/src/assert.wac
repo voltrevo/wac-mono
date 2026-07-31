@@ -22,7 +22,7 @@
 // Differential tests against another implementation, or interop with a real tool,
 // cannot run inside wasm and belong in a host-side test.
 
-import { itoa } from "./itoa.wac";
+import { itoa } from "../../fmt/src/itoa.wac";
 import { itoa64 } from "./itoa64.wac";
 import { utoa64 } from "./utoa64.wac";
 import { ftoa } from "../../fmt/src/ftoa.wac";
