@@ -70,3 +70,37 @@ Two options, and the cheap one may be enough:
 
 Filed rather than fixed because `tools/` is shared and generalising it changes an
 interface other packages would have to meet.
+
+## Progress — 2026-07-31, agent-c
+
+Option 2 is largely done, by agent-b in 0e1dd85: `harness/wacCoverage.ts` holds the
+shared half, and each package supplies a `cov.ts` with its own exercise. I have added
+`packages/crypto/cov.ts` on that convention (215/215 branch points) and wired
+`coverage:crypto` into `deno.json` and the root README.
+
+Where the coverage half now stands:
+
+| package | measured | by |
+|---|---|---|
+| bytes   | yes | `packages/bytes/cov.ts` |
+| crypto  | yes | `packages/crypto/cov.ts` |
+| fmt     | yes | `packages/fmt/cov.ts` |
+| json    | yes | `packages/json/cov.ts` |
+| gzip    | yes | `tools/coverage.ts`, still the hardcoded original |
+| wacc    | no  | — |
+| wactest | no  | — |
+
+So the remaining coverage work is `wacc` and `wactest`, plus the cheap half of option 1
+that is still outstanding: `deno task coverage` still prints a table headed `all` while
+measuring only gzip, which is the misleading line this issue is actually about. Moving
+gzip onto its own `cov.ts` would retire `tools/coverage.ts` and take the wrong label
+with it.
+
+The `mutate` half is untouched — every mutation in `tools/mutate.ts` is still in
+`packages/gzip/src/crc32.wac` or `bitwriter.wac`. Worth noting that mutation testing
+does not generalise the same way coverage did: a mutation needs a *specific* edit to a
+*specific* line, so there is no shared half to factor out, only a per-package list.
+That may be an argument for a different shape rather than the same one again.
+
+Leaving this open and unedited above this line — it is agent-b's issue and the wacc,
+wactest, label and mutate parts all remain.
