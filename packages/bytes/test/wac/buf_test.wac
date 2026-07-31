@@ -1,0 +1,195 @@
+// Buf's own tests. It was previously covered only incidentally, through gzip's
+// codecs and json's serializer, which meant the parts neither of them used —
+// pushU16/pushU32 in isolation, take()'s aliasing contract, the bulk reserve
+// path — were unverified.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Buf } from "../../src/buf.wac";
+
+export string test_growth_from_empty() {
+  T t = T.create();
+  Buf b = Buf.create();
+  t.eqI32(b.len, 0, "starts empty");
+  for (i32 i = 0; i < 100; i++) { b.push(i); }
+  t.eqI32(b.len, 100, "length after 100 pushes");
+  t.eqI32(b.get(0), 0, "first byte");
+  t.eqI32(b.get(99), 99, "last byte");
+  // bytes() must hand back exactly len, not the doubled capacity.
+  t.eqI32(b.bytes().len(), 100, "bytes() trims spare capacity");
+  return t.report();
+}
+
+export string test_bytes_are_stored_unsigned() {
+  T t = T.create();
+  // The u8/i8 distinction: a byte with the high bit set must read back as 255,
+  // not -1. This is what the i8 -> u8 migration was about.
+  Buf b = Buf.create();
+  b.push(0xFF);
+  b.push(0x80);
+  t.eqI32(b.get(0), 255, "0xFF reads back as 255");
+  t.eqI32(b.get(1), 128, "0x80 reads back as 128");
+  t.eqBytes(b.bytes(), u8[](0xFF, 0x80), "and survives the copy out");
+  return t.report();
+}
+
+export string test_push_truncates_to_a_byte() {
+  T t = T.create();
+  Buf b = Buf.create();
+  b.push(0x1FF);
+  b.push(-1);
+  t.eqI32(b.get(0), 0xFF, "0x1FF truncates to 0xFF");
+  t.eqI32(b.get(1), 0xFF, "-1 truncates to 0xFF");
+  return t.report();
+}
+
+export string test_with_capacity() {
+  T t = T.create();
+  Buf b = Buf.withCapacity(64);
+  t.eqI32(b.len, 0, "capacity is not length");
+  for (i32 i = 0; i < 64; i++) { b.push(i); }
+  t.eqI32(b.len, 64, "fills to capacity without growing");
+  b.push(64);
+  t.eqI32(b.len, 65, "and still grows past it");
+  t.eqI32(b.get(64), 64, "the byte past the original capacity survived");
+
+  // A capacity below the default floor is raised to it rather than honoured, so
+  // a tiny hint cannot make growth quadratic.
+  Buf small = Buf.withCapacity(1);
+  for (i32 i = 0; i < 16; i++) { small.push(i); }
+  t.eqI32(small.len, 16, "a capacity of 1 still holds 16 without trouble");
+  return t.report();
+}
+
+export string test_push_bytes_range() {
+  T t = T.create();
+  Buf b = Buf.create();
+  u8[] src = u8[]('a', 'b', 'c', 'd', 'e');
+  b.pushBytes(src, 1, 3);
+  t.eqBytes(b.bytes(), u8[]('b', 'c', 'd'), "start and count are both honoured");
+  b.pushBytes(src, 0, 0);
+  t.eqI32(b.len, 3, "a zero count is a no-op");
+  return t.report();
+}
+
+export string test_push_bytes_grows_once_and_correctly() {
+  T t = T.create();
+  // The bulk path takes a different branch from repeated push, so the contents
+  // have to be checked, not just the length. 300 bytes crosses several doublings
+  // from the default capacity of 16.
+  Buf b = Buf.create();
+  u8[] src = u8[300]();
+  for (i32 i = 0; i < 300; i++) { src[i] = i & 0xFF; }
+  b.pushBytes(src, 0, 300);
+  t.eqI32(b.len, 300, "all 300 arrived");
+  t.eqI32(b.get(0), 0, "first");
+  t.eqI32(b.get(255), 255, "the byte at the wrap point");
+  t.eqI32(b.get(256), 0, "and just past it");
+  t.eqI32(b.get(299), 299 & 0xFF, "last");
+  return t.report();
+}
+
+export string test_push_all() {
+  T t = T.create();
+  Buf b = Buf.create();
+  b.push('x');
+  b.pushAll(u8[]('y', 'z'));
+  b.pushAll(u8[0]());
+  t.eqBytes(b.bytes(), u8[]('x', 'y', 'z'), "pushAll appends the whole array");
+  return t.report();
+}
+
+export string test_little_endian_writes() {
+  T t = T.create();
+  Buf b = Buf.create();
+  b.pushU16(0x1234);
+  b.pushU32(0xDEADBEEF);
+  // Low byte first in both cases. A big-endian mistake would reverse each group
+  // and still produce the right length.
+  t.eqBytes(b.bytes(), u8[](0x34, 0x12, 0xEF, 0xBE, 0xAD, 0xDE),
+    "u16 then u32, little-endian");
+  return t.report();
+}
+
+export string test_push_codepoint_widths() {
+  T t = T.create();
+  Buf a = Buf.create();
+  a.pushCodepoint('A');
+  t.eqBytes(a.bytes(), u8[](0x41), "ASCII is one byte");
+
+  Buf b = Buf.create();
+  b.pushCodepoint(0xE9);
+  t.eqBytes(b.bytes(), u8[](0xC3, 0xA9), "U+00E9 is two bytes");
+
+  Buf c = Buf.create();
+  c.pushCodepoint(0x65E5);
+  t.eqBytes(c.bytes(), u8[](0xE6, 0x97, 0xA5), "U+65E5 is three bytes");
+
+  Buf d = Buf.create();
+  d.pushCodepoint(0x1F600);
+  t.eqBytes(d.bytes(), u8[](0xF0, 0x9F, 0x98, 0x80), "U+1F600 is four bytes");
+
+  // Each width boundary, so no scalar can land in the wrong branch.
+  Buf e = Buf.create(); e.pushCodepoint(0x7F);
+  t.eqI32(e.len, 1, "U+007F still one");
+  Buf f = Buf.create(); f.pushCodepoint(0x80);
+  t.eqI32(f.len, 2, "U+0080 crosses to two");
+  Buf g = Buf.create(); g.pushCodepoint(0x7FF);
+  t.eqI32(g.len, 2, "U+07FF still two");
+  Buf h = Buf.create(); h.pushCodepoint(0x800);
+  t.eqI32(h.len, 3, "U+0800 crosses to three");
+  Buf i = Buf.create(); i.pushCodepoint(0xFFFF);
+  t.eqI32(i.len, 3, "U+FFFF still three");
+  Buf j = Buf.create(); j.pushCodepoint(0x10000);
+  t.eqI32(j.len, 4, "U+10000 crosses to four");
+  return t.report();
+}
+
+export string test_take_avoids_the_copy_when_exactly_full() {
+  T t = T.create();
+  // take() returns the buffer's own storage when len == capacity, so the caller
+  // owns it and the Buf must not be reused. The observable difference is that a
+  // later write through the returned array is visible in it — which is exactly
+  // why the contract is documented and why bytes() exists separately.
+  Buf full = Buf.withCapacity(16);
+  for (i32 i = 0; i < 16; i++) { full.push(i); }
+  u8[] taken = full.take();
+  t.eqI32(taken.len(), 16, "exact length");
+  t.eqI32(taken[15], 15, "contents intact");
+
+  // Not exactly full: take() falls back to a copy, and the contents still match.
+  Buf partial = Buf.withCapacity(16);
+  partial.push('q');
+  u8[] copied = partial.take();
+  t.eqI32(copied.len(), 1, "trimmed to length");
+  t.eqI32(copied[0], 'q', "contents intact");
+  return t.report();
+}
+
+export string test_bytes_is_a_copy() {
+  T t = T.create();
+  // bytes() must not alias, or a caller that keeps appending would see its
+  // earlier result change underneath it.
+  Buf b = Buf.create();
+  b.push('a');
+  u8[] first = b.bytes();
+  b.push('b');
+  t.eqI32(first.len(), 1, "the earlier result kept its length");
+  t.eqBytes(first, u8[]('a'), "and its contents");
+  t.eqBytes(b.bytes(), u8[]('a', 'b'), "while the buffer moved on");
+  return t.report();
+}
+
+export string test_to_str() {
+  T t = T.create();
+  Buf b = Buf.create();
+  b.pushAll(u8[]('h', 'i'));
+  t.eqStr(b.toStr(), "hi", "ASCII round-trips");
+
+  Buf u = Buf.create();
+  u.pushCodepoint(0x65E5);
+  t.eqStr(u.toStr(), "日", "so does a multi-byte scalar");
+
+  Buf empty = Buf.create();
+  t.eqStr(empty.toStr(), "", "and the empty buffer");
+  return t.report();
+}

@@ -7,11 +7,11 @@
 // really a check on its re-serialization, and a bug that cancelled itself out
 // between parse and stringify would pass.
 //
-// These reach the tree. Kinds, member ordering, unescaped string contents and
-// the growth behaviour of the containers are checked where they live.
+// These reach the tree: kinds, member ordering, unescaped string contents and the
+// growth of json's own ref-element containers. The shared byte buffer has its own
+// tests in packages/bytes.
 
 import { T } from "../../../wactest/src/assert.wac";
-import { ByteBuf } from "../../src/bytes.wac";
 import { JsonValue, JsonNumber, JsonString, JsonArray, JsonObject, bytesEqual } from "../../src/value.wac";
 import { Parser, parseDocument, hexDigit, scaleByPow10, ERR_NONE, ERR_TRAILING, ERR_CONTROL } from "../../src/parse.wac";
 
@@ -69,72 +69,6 @@ export string test_char_tables_are_intact() {
 JsonValue? parseStr(string src) {
   Parser p = Parser.create(ascii(src));
   return parseDocument(p);
-}
-
-// ── ByteBuf ──────────────────────────────────────────────────────────────────
-
-export string test_bytebuf_grows_and_trims() {
-  T t = T.create();
-  ByteBuf b = ByteBuf.create();
-  for (i32 i = 0; i < 100; i++) { b.push(i); }
-  t.eqI32(b.len(), 100, "length after 100 pushes");
-  t.eqI32(b.at(0), 0, "first byte");
-  t.eqI32(b.at(99), 99, "last byte");
-  // toBytes must hand back exactly len bytes, not the doubled capacity.
-  t.eqI32(b.toBytes().len(), 100, "toBytes trims spare capacity");
-  return t.report();
-}
-
-export string test_bytebuf_push_bytes() {
-  T t = T.create();
-  ByteBuf b = ByteBuf.create();
-  b.push(1);
-  b.pushBytes(u8[](2, 3, 4));
-  b.pushBytes(u8[0]());
-  t.eqBytes(b.toBytes(), u8[](1, 2, 3, 4), "pushBytes appends, empty is a no-op");
-  return t.report();
-}
-
-export string test_bytebuf_codepoint_widths() {
-  T t = T.create();
-
-  ByteBuf a = ByteBuf.create();
-  a.pushCodepoint(0x41);
-  t.eqBytes(a.toBytes(), u8[](0x41), "ASCII is one byte");
-
-  ByteBuf b = ByteBuf.create();
-  b.pushCodepoint(0xE9);                 // é
-  t.eqBytes(b.toBytes(), u8[](0xC3, 0xA9), "U+00E9 is two bytes");
-
-  ByteBuf c = ByteBuf.create();
-  c.pushCodepoint(0x65E5);               // 日
-  t.eqBytes(c.toBytes(), u8[](0xE6, 0x97, 0xA5), "U+65E5 is three bytes");
-
-  ByteBuf d = ByteBuf.create();
-  d.pushCodepoint(0x1F600);              // 😀
-  t.eqBytes(d.toBytes(), u8[](0xF0, 0x9F, 0x98, 0x80), "U+1F600 is four bytes");
-
-  // Boundaries between encoding widths.
-  ByteBuf e = ByteBuf.create();
-  e.pushCodepoint(0x7F);
-  t.eqI32(e.toBytes().len(), 1, "U+007F still one byte");
-  ByteBuf f = ByteBuf.create();
-  f.pushCodepoint(0x80);
-  t.eqI32(f.toBytes().len(), 2, "U+0080 crosses to two");
-  ByteBuf g = ByteBuf.create();
-  g.pushCodepoint(0x7FF);
-  t.eqI32(g.toBytes().len(), 2, "U+07FF still two");
-  ByteBuf h = ByteBuf.create();
-  h.pushCodepoint(0x800);
-  t.eqI32(h.toBytes().len(), 3, "U+0800 crosses to three");
-  ByteBuf i = ByteBuf.create();
-  i.pushCodepoint(0xFFFF);
-  t.eqI32(i.toBytes().len(), 3, "U+FFFF still three");
-  ByteBuf j = ByteBuf.create();
-  j.pushCodepoint(0x10000);
-  t.eqI32(j.toBytes().len(), 4, "U+10000 crosses to four");
-
-  return t.report();
 }
 
 // ── Small helpers ────────────────────────────────────────────────────────────

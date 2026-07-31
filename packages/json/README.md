@@ -94,7 +94,6 @@ contents and container growth where they live.
 
 ```
 src/value.wac      the JSON value tree
-src/bytes.wac      growable byte buffer
 src/parse.wac      scanner and recursive-descent parser
 src/stringify.wac  serializer
 src/json.wac       entry points shaped for the bindgen boundary
@@ -116,9 +115,11 @@ how much each cost:
    byte-oriented. `string.fromCodepoint` (added because of this package) covers a
    single character; assembling a string from bytes is still quadratic.
 2. **No float → string.** Blocking for any serializer over computed values.
-3. **No generics.** `JsonArray.items`, `JsonObject.members` and `ByteBuf.data` are
-   the same double-when-full logic three times, differing only in element type.
-   `gzip`'s `Buf` is a fourth.
+3. **No generics.** `JsonArray.items` and `JsonObject.members` are the same
+   double-when-full logic twice, differing only in element type. The byte buffer
+   was a third copy and `gzip`'s was a fourth; those two are now one shared
+   `packages/bytes`, which is as far as the deduplication can go without generics
+   — the two ref-element containers still cannot be shared with it or each other.
 4. **No module-level constants.** Kind tags are zero-argument functions; the
    powers-of-ten table is a `switch` returning literals.
 5. **No sum types or pattern matching**, and no virtual dispatch, so a tag plus

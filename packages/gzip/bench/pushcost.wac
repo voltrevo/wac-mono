@@ -1,4 +1,4 @@
-import { Buf } from "../src/buf.wac";
+import { Buf } from "../../bytes/src/buf.wac";
 
 // Push n bytes through Buf, the path inflate and stored blocks both use.
 export i32 viaPush(i32 n) {

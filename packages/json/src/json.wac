@@ -8,21 +8,21 @@
 import { JsonValue, JsonNumber } from "./value.wac";
 import { Parser, parseDocument, ERR_NONE } from "./parse.wac";
 import { writeValue } from "./stringify.wac";
-import { ByteBuf } from "./bytes.wac";
+import { Buf } from "../../bytes/src/buf.wac";
 
 // Parse and re-serialize. Byte 0 is the error code (0 = success); the rest is
 // canonical JSON, empty when parsing failed.
 export u8[] canonicalize(u8[] src) {
   Parser p = Parser.create(src);
   JsonValue? v = parseDocument(p);
-  ByteBuf out = ByteBuf.create();
+  Buf out = Buf.create();
   if (v is null) {
     out.push(p.err);
-    return out.toBytes();
+    return out.bytes();
   }
   out.push(0);
   writeValue(out, v!);
-  return out.toBytes();
+  return out.bytes();
 }
 
 // Error code for a document, without building the output.
