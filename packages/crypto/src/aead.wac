@@ -7,12 +7,7 @@
 
 import { chachaBlock, chacha20 } from "./chacha20.wac";
 import { poly1305 } from "./poly1305.wac";
-
-/** Bytes needed to round `n` up to a 16-byte boundary. */
-i32 padLen(i32 n) {
-  i32 r = n % 16;
-  return r == 0 ? 0 : 16 - r;
-}
+import { padTo16 } from "./layout.wac";
 
 /** The one-time Poly1305 key: the first 32 bytes of keystream block 0. */
 u8[] oneTimeKey(u8[] key, u8[] nonce) {
@@ -30,8 +25,8 @@ u8[] oneTimeKey(u8[] key, u8[] nonce) {
  * associated data and the ciphertext without changing the tag.
  */
 u8[] macInput(u8[] aad, u8[] ct) {
-  i32 aPad = padLen(aad.len());
-  i32 cPad = padLen(ct.len());
+  i32 aPad = padTo16(aad.len());
+  i32 cPad = padTo16(ct.len());
   u8[] m = u8[aad.len() + aPad + ct.len() + cPad + 16]();
 
   i32 p = 0;

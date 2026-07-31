@@ -8,6 +8,7 @@
     "coverage": "deno run -A tools/coverage.ts",
     "coverage:bignum": "deno run -A packages/bignum/cov.ts",
     "coverage:bytes": "deno run -A packages/bytes/cov.ts",
+    "coverage:crypto": "deno run -A packages/crypto/cov.ts",
     "coverage:fmt": "deno run -A packages/fmt/cov.ts",
     "coverage:json": "deno run -A packages/json/cov.ts",
     "mutate": "deno run -A tools/mutate.ts",

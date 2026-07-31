@@ -147,3 +147,16 @@ Deno.test("aes-gcm: the counter wraps at 2^32 and never carries higher", () => {
     if (got !== after) throw new Error(`inc32(${before})\n  got  ${got}\n  want ${after}`);
   }
 });
+
+Deno.test("aes-gcm: gcmTag rejects an empty IV too, not just gcmEncrypt", () => {
+  // Both exports guard the IV independently. gcmEncrypt's check is exercised above,
+  // and a caller that computes a tag without encrypting — verifying someone else's
+  // ciphertext, say — reaches only this one. With a zero-length IV, J0 would be
+  // GHASH over no blocks, which is a fixed value: every message under that key would
+  // share a counter stream.
+  const key = unhex("feffe9928665731c6d6a8f9467308308");
+  const ct = unhex("42831ec2217774244b7221b784d0d49c");
+  if (!rejects(() => tag(key, new Uint8Array(0), new Uint8Array(0), ct))) {
+    throw new Error("gcmTag accepted an empty IV");
+  }
+});

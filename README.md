@@ -60,6 +60,7 @@ deno task coverage       # branch coverage of gzip (see issues/0002)
 deno task coverage:json  # branch coverage of json
 deno task coverage:fmt   # branch coverage of fmt
 deno task coverage:bytes # branch coverage of bytes
+deno task coverage:crypto # branch coverage of crypto
 deno task mutate      # mutation testing
 deno task bench       # gzip throughput
 deno task bench:json  # json throughput, by document shape

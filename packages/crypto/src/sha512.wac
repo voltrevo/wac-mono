@@ -9,6 +9,8 @@
 // 48 bytes. It is not a shortened SHA-512: the initial values differ precisely
 // so that one is not a prefix of the other.
 
+import { beWord64, storeBE64 } from "./layout.wac";
+
 /** Rotate right, 64-bit. */
 u64 rotr(u64 x, u64 n) { return (x >> n) | (x << (64 - n)); }
 
@@ -55,13 +57,6 @@ const u64[] H512 = u64[](0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f
 /** Initial state for SHA-384: square roots of the *ninth* through sixteenth. */
 const u64[] H384 = u64[](0xcbbb9d5dc1059ed8, 0x629a292a367cd507, 0x9159015a3070dd17, 0x152fecd8f70e5939, 0x67332667ffc00b31, 0x8eb44a8768581511, 0xdb0c2e0d64f98fa7, 0x47b5481dbefa4fa4);
 
-/** Big-endian u64 at byte offset `i`. */
-u64 beWord(u8[] b, i32 i) {
-  u64 v = 0;
-  for (i32 j = 0; j < 8; j++) { v = (v << 8) | (b[i + j] as! u64); }
-  return v;
-}
-
 /**
  * The compression, shared by both digest sizes: returns the eight-word state
  * after absorbing every block of the padded message.
@@ -78,10 +73,7 @@ u64[] compress(u8[] msg, u64[] iv) {
 
   // Only the low 64 bits of the length are written: the high half is zero for
   // any message this can be handed, and wac has no 128-bit integer to hold it.
-  u64 bits = (len as! u64) * 8;
-  for (i32 i = 0; i < 8; i++) {
-    m[total - 1 - i] = ((bits >> ((i * 8) as! u64)) & 255) as! i32;
-  }
+  storeBE64((len as! u64) * 8, m, total - 8);
 
   u64[] h = u64[8]();
   for (i32 i = 0; i < 8; i++) { h[i] = iv[i]; }
@@ -89,7 +81,7 @@ u64[] compress(u8[] msg, u64[] iv) {
 
   for (i32 b = 0; b < blocks; b++) {
     i32 off = b * 128;
-    for (i32 t = 0; t < 16; t++) { w[t] = beWord(m, off + t * 8); }
+    for (i32 t = 0; t < 16; t++) { w[t] = beWord64(m, off + t * 8); }
     for (i32 t = 16; t < 80; t++) {
       w[t] = smallSigma1(w[t - 2]) + w[t - 7] + smallSigma0(w[t - 15]) + w[t - 16];
     }

@@ -12,6 +12,7 @@
 
 import { wacLex } from "wac/wacLex.ts";
 import { wacBind } from "../../../harness/wacBind.ts";
+import { loadCorpus } from "./corpus.ts";
 
 const mod = await wacBind("packages/wacc/src/lex.wac");
 const lex = mod.lex as (src: Uint8Array) => unknown;
@@ -118,35 +119,9 @@ function check(name: string, source: string): void {
 
 // ── Corpus ────────────────────────────────────────────────────────────────────
 
-async function corpus(): Promise<[string, string][]> {
-  const out: [string, string][] = [];
-  for await (const entry of Deno.readDir("packages")) {
-    if (!entry.isDirectory) continue;
-    for (const sub of ["src", "test/wac", "bench"]) {
-      const dir = `packages/${entry.name}/${sub}`;
-      try {
-        for await (const f of Deno.readDir(dir)) {
-          if (f.isFile && f.name.endsWith(".wac")) {
-            out.push([`${dir}/${f.name}`, await Deno.readTextFile(`${dir}/${f.name}`)]);
-          }
-        }
-      } catch { /* directory does not exist for this package */ }
-    }
-  }
-  const tour = new URL("../../../../wac/spec/tour.wac", import.meta.url);
-  try {
-    out.push(["wac/spec/tour.wac", await Deno.readTextFile(tour)]);
-  } catch { /* sibling checkout missing */ }
-  return out;
-}
-
 Deno.test("lex: agrees with the reference on every .wac file in the repo", async () => {
-  const files = await corpus();
-  if (files.length < 10) {
-    throw new Error(`corpus is only ${files.length} files — the walk is probably wrong`);
-  }
+  const files = await loadCorpus("lex");
   for (const [name, source] of files) check(name, source);
-  console.log(`  compared ${files.length} files`);
 });
 
 Deno.test("lex: agrees on constructs a working corpus does not contain", () => {

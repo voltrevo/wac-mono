@@ -1640,8 +1640,11 @@ export Program parseProgram(P p) {
     } else if (k == kConst()) {
       if (exported) { p.advance(); }
       decls.push(parseConstDecl(p, exported));
-    } else {
-      // A function: `parseFuncDecl` consumes its own `export`.
+    } else if (exported || k == kFn() || k == kVoid() || k == kIdent()) {
+      // A function: `parseFuncDecl` consumes its own `export`. Entered only when the
+      // token could actually begin one — a return type is an `ident` (the primitives
+      // are not keywords), or `void`, or `fn`, or an `export` whose declaration kind
+      // was not matched above.
       i32 before = p.at;
       decls.push(parseFuncDecl(p));
       if (p.at == before) {
@@ -1650,6 +1653,14 @@ export Program parseProgram(P p) {
         p.fail(perrTopLevel());
         p.advance();
       }
+    } else {
+      // Nothing can start a top-level item here. One error and skip the token, which
+      // is what the reference does; attempting a function parse instead makes the
+      // parser report a cascade of missing types and names for what is really a single
+      // stray token. `;;;` produced eleven errors that way against the reference's
+      // three, and a stray `}` after a complete function produced seven against one.
+      p.fail(perrTopLevel());
+      p.advance();
     }
   }
   return Program(decls.take());
