@@ -33,6 +33,20 @@ i32 ATOF_LIMBS() { return 160; }
  */
 i32 MAX_DIGITS() { return 800; }
 
+/**
+ * The cheap scan's result: no arrays, so parsing a number that takes the fast path
+ * allocates nothing but this.
+ *
+ * `mant` holds up to 19 significant digits; `sticky` records that more followed.
+ */
+struct Quick {
+  u64 mant;
+  i32 digits;       // digits accumulated into mant
+  i32 exp10;
+  bool sticky;
+  bool neg;
+}
+
 /** Parsed shape of a JSON number: value = (digits as an integer) * 10^exp10. */
 struct Parts {
   u8[] digits;      // significant decimal digits, no leading zeros
@@ -49,11 +63,111 @@ struct Parts {
  * that has just validated it, so there is no error return.
  */
 export f64 atofSpan(u8[] src, i32 start, i32 end) {
-  Parts p = scan(src, start, end);
+  Quick q = quickScan(src, start, end);
 
-  f64 mag = magnitude(p);
-  if (p.neg) { return -mag; }
+  f64 mag = fastPath(q);
+  // NaN is the "not exactly representable this way" signal — no JSON number can
+  // produce it, so it cannot be confused with a real answer.
+  if (mag != mag) {
+    Parts p = scan(src, start, end);
+    mag = exactMagnitude(p);
+  }
+  if (q.neg) { return -mag; }
   return mag;
+}
+
+/**
+ * Scan without allocating anything array-shaped.
+ *
+ * The previous version built the full 800-digit buffer for every number, including
+ * `1`. That single allocation per number was the difference between 19 MB/s and
+ * the rest of the parser's 100+.
+ */
+Quick quickScan(u8[] src, i32 start, i32 end) {
+  Quick q = Quick(0, 0, 0, false, false);
+  i32 i = start;
+  if (i < end && src[i] == '-') { q.neg = true; i++; }
+
+  bool seenPoint = false;
+  bool seenNonZero = false;
+  i32 dropped = 0;
+  i32 afterPoint = 0;
+
+  while (i < end) {
+    i32 c = src[i];
+    if (c == '.') { seenPoint = true; i++; continue; }
+    if (c == 'e' || c == 'E') { break; }
+    if (c == '0' && !seenNonZero) {
+      if (seenPoint) { q.exp10--; }
+      i++;
+      continue;
+    }
+    seenNonZero = true;
+    // 19 digits is the most that always fits a u64 without wrapping.
+    if (q.digits < 19) {
+      q.mant = q.mant * 10 + ((c - '0') as! u64);
+      q.digits++;
+      if (seenPoint) { afterPoint++; }
+    } else {
+      if (c != '0') { q.sticky = true; }
+      if (!seenPoint) { dropped++; }
+    }
+    i++;
+  }
+  q.exp10 = q.exp10 - afterPoint + dropped;
+
+  if (i < end && (src[i] == 'e' || src[i] == 'E')) {
+    i++;
+    bool eneg = false;
+    if (i < end && src[i] == '-') { eneg = true; i++; }
+    else if (i < end && src[i] == '+') { i++; }
+    i32 ev = 0;
+    while (i < end) {
+      if (ev < 100000) { ev = ev * 10 + (src[i] - '0'); }
+      i++;
+    }
+    if (eneg) { q.exp10 -= ev; } else { q.exp10 += ev; }
+  }
+  return q;
+}
+
+/** 10^n as a u64, for n up to 19. */
+u64 pow10U64(i32 n) {
+  u64 r = 1;
+  for (i32 i = 0; i < n; i++) { r = r * 10; }
+  return r;
+}
+
+/**
+ * The answer when it is provably exact, or NaN when the exact path is needed.
+ *
+ * Exact requires the significand to land in an f64 without rounding — at most 2^53
+ * — and the power of ten to be exactly representable, which holds up to 10^22.
+ * Clinger's extension covers a further stretch: when the exponent is above 22 but
+ * the significand can absorb the excess and stay under 2^53, two exact operations
+ * still compose. `1e30` is in that stretch; without it, it went to the bignum.
+ */
+f64 fastPath(Quick q) {
+  if (q.digits == 0) { return 0.0; }
+  if (q.sticky) { return 0.0 / 0.0; }
+  // 2^53: above this a u64 significand no longer converts to f64 exactly.
+  if (q.mant > 9007199254740992) { return 0.0 / 0.0; }
+
+  f64 m = q.mant as~ f64;
+  i32 e = q.exp10;
+  if (e == 0) { return m; }
+  if (e > 0 && e <= 22) { return m * pow10Exact(e); }
+  if (e < 0 && e >= -22) { return m / pow10Exact(-e); }
+
+  if (e > 22 && e <= 37) {
+    // Push the excess into the significand while it still fits exactly.
+    i32 shift = e - 22;
+    u64 limit = 9007199254740992 / pow10U64(shift);
+    if (q.mant <= limit) {
+      return (q.mant * pow10U64(shift)) as~ f64 * 1.0e22;
+    }
+  }
+  return 0.0 / 0.0;
 }
 
 /** Split the span into significant digits and a decimal exponent. */
@@ -115,8 +229,8 @@ Parts scan(u8[] src, i32 start, i32 end) {
   return p;
 }
 
-/** The magnitude, ignoring sign. */
-f64 magnitude(Parts p) {
+/** The magnitude via the exact path, ignoring sign. */
+f64 exactMagnitude(Parts p) {
   if (p.count == 0) { return 0.0; }
 
   // Decisive range checks before any work: the most significant digit sits at
@@ -129,20 +243,7 @@ f64 magnitude(Parts p) {
   if (top >= 310) { return 1.0 / 0.0; }
   if (top < -330) { return 0.0; }
 
-  // Fast path. Up to 15 digits always fit in an f64's 53-bit significand exactly,
-  // and 10^|e| up to 22 is exactly representable, so one multiply or divide is
-  // correctly rounded and therefore exact.
-  if (p.count <= 15 && !p.sticky && p.exp10 >= -22 && p.exp10 <= 22) {
-    f64 m = 0.0;
-    for (i32 i = 0; i < p.count; i++) {
-      m = m * 10.0 + ((p.digits[i] - '0') as f64);
-    }
-    if (p.exp10 == 0) { return m; }
-    if (p.exp10 > 0) { return m * pow10Exact(p.exp10); }
-    return m / pow10Exact(-p.exp10);
-  }
-
-  return exact(p);
+  return bisect(p);
 }
 
 /** Exactly representable powers of ten, for the fast path. */
@@ -174,37 +275,112 @@ f64 pow10Exact(i32 n) {
  * silently failed at both ends of the range where the estimate was thousands of
  * ulps out.
  */
-f64 exact(Parts p) {
-  Big n = Big.withLimbs(ATOF_LIMBS());
+/**
+ * Everything the comparison needs, built once per number.
+ *
+ * The decimal side of `digits * 10^exp10  vs  f * 2^g` does not change as the
+ * bisection moves the candidate, so scaling it by the power of ten belongs out
+ * here. Rebuilding it inside the loop meant up to 128 multiply passes over 120
+ * limbs on every one of 63 iterations, which is why exponent-form numbers parsed
+ * at 0.5 MB/s.
+ */
+struct Cmp {
+  Big dec;        // digits * 10^exp10 when exp10 >= 0, else just the digits
+  Big pow;        // 10^-exp10 when exp10 < 0, else unused
+  Big lhs;        // scratch
+  Big rhs;        // scratch
+  Big scratch;    // scratch for mulU64
+  i32 exp10;
+  bool sticky;
+}
+
+f64 bisect(Parts p) {
+  i32 limbs = ATOF_LIMBS();
+  Big dec = Big.withLimbs(limbs);
   for (i32 i = 0; i < p.count; i++) {
-    n.mulAddSmall(10, (p.digits[i] - '0') as@ u32);
+    dec.mulAddSmall(10, (p.digits[i] - '0') as@ u32);
   }
+  Big pow = Big.withLimbs(limbs);
+  if (p.exp10 > 0) {
+    mulPow10(dec, p.exp10);
+  } else if (p.exp10 < 0) {
+    pow.setU64(1);
+    mulPow10(pow, -p.exp10);
+  }
+  Cmp c = Cmp(dec, pow, Big.withLimbs(limbs), Big.withLimbs(limbs),
+              Big.withLimbs(limbs), p.exp10, p.sticky);
 
   u64 maxFinite = 9218868437227405311;    // 0x7FEFFFFFFFFFFFFF
 
-  // Above every finite double: round to infinity or back down to the largest,
+  // Above every finite double: round to infinity or back to the largest finite,
   // whichever the midpoint says. The largest finite has an odd significand, so an
   // exact tie goes to infinity under round-half-to-even.
-  if (compareValue(n, p, maxFinite) > 0) {
-    if (compareMidpoint(n, p, maxFinite) >= 0) { return 1.0 / 0.0; }
+  if (compareValue(c, maxFinite) > 0) {
+    if (compareMidpoint(c, maxFinite) >= 0) { return 1.0 / 0.0; }
     return f64.fromBits(maxFinite);
   }
 
   // Largest bits with value(bits) <= decimal. Zero always satisfies it, which is
   // what makes the subnormal range fall out for free.
+  //
+  // The bracket starts narrow, around a cheap estimate, and is *verified* by exact
+  // comparison before use — if either end is wrong it widens to the full range. So
+  // the estimate can only cost time, never correctness, which is the distinction
+  // the first version of this file got wrong by trusting one.
   u64 lo = 0;
   u64 hi = maxFinite;
+  u64 guess = approxBits(p);
+  if (guess > 0 && guess < maxFinite) {
+    u64 window = 4;
+    u64 gLo = guess > window ? guess - window : 0;
+    u64 gHi = guess + window < maxFinite ? guess + window : maxFinite;
+    // value(gLo) must not exceed the decimal, and the decimal must be below
+    // value(gHi + 1) — otherwise the answer lies outside and the bracket is unsafe.
+    if (compareValue(c, gLo) >= 0) { lo = gLo; }
+    if (gHi < maxFinite && compareValue(c, gHi + 1) < 0) { hi = gHi; }
+  }
   while (lo < hi) {
     u64 mid = lo + (hi - lo + 1) / 2;
-    if (compareValue(n, p, mid) >= 0) { lo = mid; } else { hi = mid - 1; }
+    if (compareValue(c, mid) >= 0) { lo = mid; } else { hi = mid - 1; }
   }
 
-  i32 c = compareMidpoint(n, p, lo);
-  if (c > 0) { return f64.fromBits(lo + 1); }
-  if (c < 0) { return f64.fromBits(lo); }
+  i32 m = compareMidpoint(c, lo);
+  if (m > 0) { return f64.fromBits(lo + 1); }
+  if (m < 0) { return f64.fromBits(lo); }
   // Exactly halfway: take the even significand.
   if ((lo & 1) == 0) { return f64.fromBits(lo); }
   return f64.fromBits(lo + 1);
+}
+
+/**
+ * A rough starting point for the bisection, from f64 arithmetic alone.
+ *
+ * Deliberately sloppy: repeated scaling by 1e22 accumulates error, and the digits
+ * past 17 are ignored. Its only job is to be within a few ulps most of the time.
+ * Zero or infinity means "no useful estimate", and the caller then bisects the
+ * whole range.
+ */
+u64 approxBits(Parts p) {
+  f64 m = 0.0;
+  i32 used = p.count < 17 ? p.count : 17;
+  for (i32 i = 0; i < used; i++) {
+    m = m * 10.0 + ((p.digits[i] - '0') as f64);
+  }
+  i32 e = p.exp10 + (p.count - used);
+  while (e > 22) {
+    m = m * 1.0e22;
+    e -= 22;
+    if (m > 1.0e300) { return 0; }
+  }
+  while (e < -22) {
+    m = m / 1.0e22;
+    e += 22;
+    if (m < 1.0e-300 && m != 0.0) { return 0; }
+  }
+  if (e > 0) { m = m * pow10Exact(e); } else if (e < 0) { m = m / pow10Exact(-e); }
+  if (m != m || m == 0.0) { return 0; }
+  if (m > 1.0e308) { return 0; }
+  return f64.toBits(m);
 }
 
 /** The significand and exponent of a positive double: value = f * 2^g. */
@@ -217,17 +393,10 @@ Split splitBits(u64 bits) {
   return Split(frac + 4503599627370496, be - 1075);
 }
 
-/**
- * Compare the decimal against the double with these bits.
- *
- * Both sides are scaled into integers — the decimal by 10^exp when positive and
- * the double by 10^-exp when negative, then whichever side needs the power of two
- * — so the comparison is exact with no division. A dropped nonzero digit makes the
- * decimal strictly larger, which is what `sticky` resolves.
- */
-i32 compareValue(Big n, Parts p, u64 bits) {
+/** Compare the decimal against the double with these bits. */
+i32 compareValue(Cmp c, u64 bits) {
   Split s = splitBits(bits);
-  return compareScaled(n, p, s.f, s.g, p.sticky);
+  return compareScaled(c, s.f, s.g);
 }
 
 /**
@@ -237,26 +406,33 @@ i32 compareValue(Big n, Parts p, u64 bits) {
  * remains correct at the top of a binade where the successor moves to the next
  * exponent.
  */
-i32 compareMidpoint(Big n, Parts p, u64 bits) {
+i32 compareMidpoint(Cmp c, u64 bits) {
   Split s = splitBits(bits);
-  return compareScaled(n, p, s.f * 2 + 1, s.g - 1, p.sticky);
+  return compareScaled(c, s.f * 2 + 1, s.g - 1);
 }
 
-/** Compare (digits * 10^exp10) against (f * 2^g). */
-i32 compareScaled(Big n, Parts p, u64 f, i32 g, bool sticky) {
-  Big lhs = Big.withLimbs(ATOF_LIMBS());
-  lhs.copyFrom(n);
-  Big rhs = Big.withLimbs(ATOF_LIMBS());
-  rhs.setU64(f);
+/**
+ * Compare (digits * 10^exp10) against (f * 2^g), exactly.
+ *
+ * Both sides are cross-multiplied into integers, so there is no division. Only the
+ * per-candidate work happens here: the power of ten was applied when the Cmp was
+ * built.
+ */
+i32 compareScaled(Cmp c, u64 f, i32 g) {
+  c.lhs.copyFrom(c.dec);
+  if (c.exp10 < 0) {
+    c.rhs.copyFrom(c.pow);
+    c.rhs.mulU64(f, c.scratch);
+  } else {
+    c.rhs.setU64(f);
+  }
+  if (g > 0) { c.rhs.shiftLeft(g); } else if (g < 0) { c.lhs.shiftLeft(-g); }
 
-  if (p.exp10 > 0) { mulPow10(lhs, p.exp10); } else if (p.exp10 < 0) { mulPow10(rhs, -p.exp10); }
-  if (g > 0) { rhs.shiftLeft(g); } else if (g < 0) { lhs.shiftLeft(-g); }
-
-  i32 c = lhs.cmp(rhs);
-  // The digits that were dropped were nonzero, so the true value is above what
-  // was compared. Only an apparent tie can be decided by that.
-  if (c == 0 && sticky) { return 1; }
-  return c;
+  i32 r = c.lhs.cmp(c.rhs);
+  // The digits that were dropped were nonzero, so the true value is above what was
+  // compared. Only an apparent tie can be decided by that.
+  if (r == 0 && c.sticky) { return 1; }
+  return r;
 }
 
 void mulPow10(Big b, i32 e) {

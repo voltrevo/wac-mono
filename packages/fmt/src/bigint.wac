@@ -155,6 +155,44 @@ export struct Big {
     this.trim();
   }
 
+  /** this += o, in place. */
+  void add(this, Big o) {
+    i32 m = this.n > o.n ? this.n : o.n;
+    u64 carry = 0;
+    for (i32 i = 0; i < m; i++) {
+      u64 t = carry;
+      if (i < this.n) { t = t + (this.limbs[i] as u64); }
+      if (i < o.n) { t = t + (o.limbs[i] as u64); }
+      this.limbs[i] = t as@ u32;
+      carry = t >> 32;
+    }
+    this.n = m;
+    while (carry != 0) {
+      this.limbs[this.n] = carry as@ u32;
+      carry = carry >> 32;
+      this.n++;
+    }
+  }
+
+  /**
+   * this *= v, using `scratch` rather than allocating.
+   *
+   * A limb-by-limb product with a u64 would not fit a u64 intermediate, so the
+   * multiplier is split into halves: this*lo + ((this*hi) << 32). Takes a scratch
+   * buffer because this is called inside a bisection loop, where allocating would
+   * cost more than the arithmetic.
+   */
+  void mulU64(this, u64 v, Big scratch) {
+    u32 lo = v as@ u32;
+    u32 hi = (v >> 32) as@ u32;
+    if (hi == 0) { this.mulSmall(lo); return; }
+    scratch.copyFrom(this);
+    scratch.mulSmall(hi);
+    scratch.shiftLeft(32);
+    this.mulSmall(lo);
+    this.add(scratch);
+  }
+
   /** this = a + b. Neither operand may be this. */
   void setSum(this, Big a, Big b) {
     i32 m = a.n > b.n ? a.n : b.n;

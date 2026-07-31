@@ -98,6 +98,36 @@ random decimals across the whole exponent range, and *constructed exact midpoint
 — decimals sitting precisely between two doubles, where always-round-up and
 always-truncate both fail.
 
+## Speed
+
+Formatting is not on anyone's hot path; parsing is, so it has three tiers.
+
+A scan that allocates nothing decides the common case: up to 19 digits accumulate
+into a `u64`, and if the significand is under 2^53 with an exponent inside the
+exactly-representable powers of ten, one multiply or divide is the answer.
+Clinger's extension stretches that to exponents up to 37 by pushing the excess into
+the significand while it still fits.
+
+Only what fails all of that reaches the bignum, and it starts from a **verified**
+bracket: a cheap f64 estimate gives a ±4-ulp window, both ends are checked by exact
+comparison, and a bad end widens to the full range. The estimate can cost time,
+never correctness — which is exactly the distinction the first version of this file
+got wrong by trusting one.
+
+Measured through json, MB/s of document:
+
+| document | before | after |
+|---|---:|---:|
+| small integers | 18.9 | 64.4 |
+| simple decimals | 23.9 | 75.7 |
+| exponent-form | 0.5 | 8.7 |
+| long-mantissa | 1.9 | 20.6 |
+
+Three things got it there, in order of size: not allocating an 800-byte digit
+buffer for every number including `1`; hoisting the power-of-ten scaling out of the
+bisection, where it had been rebuilt on all 63 iterations; and the narrow bracket,
+which cuts those iterations to about three.
+
 ## Not here yet
 
 - `itoa`. `wactest` has one; it belongs here, but moving it is that package's call.
