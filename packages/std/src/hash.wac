@@ -9,15 +9,17 @@
 // collisions rather than correctness.
 
 /**
- * FNV-1a over the string's UTF-8 bytes.
+ * FNV-1a over a byte slice, 32-bit.
  *
  * Chosen over anything stronger for the reason a hash table wants: it is a handful of
  * instructions per byte, and the keys it will see are identifiers and JSON member names
- * rather than adversarial input. If a Map is ever exposed to untrusted keys, pass a keyed
- * hash instead — that is what the funcref is for.
+ * rather than adversarial input. It is not keyed and not collision-resistant — a Map fed
+ * untrusted keys wants a keyed hash passed in instead, which is what the funcref is for.
+ *
+ * Bytes rather than `string` is the primitive because that is what `json` has: it holds
+ * member names as `u8[]` on purpose, so hashing one must not allocate a string first.
  */
-export i32 hashString(string s) {
-  u8[] b = s.toBytes();
+export i32 hashBytes(u8[] b) {
   u32 h = 2166136261;
   for (i32 i = 0; i < b.len(); i++) {
     h = h ^ (b[i] as@ u32);
@@ -25,6 +27,26 @@ export i32 hashString(string s) {
   }
   return h as@ i32;
 }
+
+/** Byte-wise equality, the companion `eq` for a `u8[]`-keyed Map. */
+export bool bytesEq(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+
+/**
+ * The same hash over a string's UTF-8 bytes.
+ *
+ * Delegates rather than repeating the loop: FNV-1a was written twice — here and in `bytes` —
+ * and two copies of a hash can drift into disagreeing about the same bytes. Nothing would
+ * catch that, because a Map answers every query correctly as long as *one* hash is used per
+ * map; it would surface only where something hashed a key one way and looked it up the other
+ * (wac-mono issue 0004, reported by agent-b).
+ */
+export i32 hashString(string s) { return hashBytes(s.toBytes()); }
 
 export bool stringEq(string a, string b) { return a == b; }
 

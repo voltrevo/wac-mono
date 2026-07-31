@@ -13,7 +13,7 @@ import { T } from "../../../wactest/src/assert.wac";
 import { Map } from "../../src/map.wac";
 import { Vec } from "../../src/vec.wac";
 import { Option } from "../../src/option.wac";
-import { hashString, stringEq, hashI32, i32Eq, hashI64, i64Eq } from "../../src/hash.wac";
+import { hashString, stringEq, hashI32, i32Eq, hashI64, i64Eq, hashBytes, bytesEq } from "../../src/hash.wac";
 
 /** Every key in one slot. Legal, and the worst case a hash may be. */
 i32 badHash(i32 k) { return 0; }
@@ -204,6 +204,32 @@ export string test_keys_and_values() {
   i32 sum = 0;
   for (i32 i = 0; i < ks.len(); i++) { sum = sum + ks[i]; }
   t.eqI32(sum, 45, "and every key from 0..9 appears exactly once");
+  return t.report();
+}
+
+export string test_hash_bytes_and_string_agree() {
+  T t = T.create();
+  // hashString delegates to hashBytes, so the two cannot drift — asserted rather than assumed,
+  // because the whole reason for the delegation is that nothing else would catch a drift
+  // (wac-mono issue 0004).
+  t.eqI32(hashString("abc"), hashBytes("abc".toBytes()), "the same bytes hash the same way");
+  t.eqI32(hashString(""), hashBytes(u8[]()), "including empty");
+  t.eqI32(hashString("abc"), 440920331, "and it is FNV-1a: 0x1A47E90B for 'abc'");
+  t.isTrue(bytesEq("hi".toBytes(), "hi".toBytes()), "bytesEq on equal bytes");
+  t.isTrue(!bytesEq("hi".toBytes(), "ho".toBytes()), "and unequal ones");
+  t.isTrue(!bytesEq("hi".toBytes(), "hit".toBytes()), "including different lengths");
+  return t.report();
+}
+
+export string test_bytes_keyed_map() {
+  T t = T.create();
+  // The shape json needs: member names held as bytes, hashed without allocating a string.
+  Map<u8[], i32> m = Map.create(hashBytes, bytesEq);
+  m.set("one".toBytes(), 1);
+  m.set("two".toBytes(), 2);
+  t.eqI32(m.getOr("one".toBytes(), -1), 1, "found by value, not by identity");
+  t.eqI32(m.getOr("two".toBytes(), -1), 2, "and the other");
+  t.isTrue(!m.has("three".toBytes()), "and an absent key is absent");
   return t.report();
 }
 
