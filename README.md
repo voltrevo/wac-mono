@@ -61,12 +61,14 @@ deno task coverage:json  # branch coverage of json
 deno task coverage:fmt   # branch coverage of fmt
 deno task coverage:bytes # branch coverage of bytes
 deno task coverage:crypto # branch coverage of crypto
+deno task coverage:bignum # branch coverage of bignum
 deno task mutate      # mutation testing
 deno task bench       # gzip throughput
 deno task bench:json  # json throughput, by document shape
 deno task verify:fmt  # fmt exactness over 500k doubles, both directions
 
-deno run --allow-read tools/check.ts <entry.wac>   # type-check one file, no run
+deno run --allow-read tools/check.ts <entry.wac>    # type-check one file, no run
+deno run -A tools/validate.ts <entry.wac>          # ...and check the wasm validates
 ```
 
 ## Two kinds of test
