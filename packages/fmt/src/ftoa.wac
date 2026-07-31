@@ -20,16 +20,22 @@
 import { Big } from "./bigint.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 
-/** Digits of x, most significant first, with the decimal exponent. */
-export struct Decimal {
+/**
+ * What a float turned out to be.
+ *
+ * An enum rather than a struct with `isNaN`/`isInf` flags, because the flags made
+ * nonsense representable — both set at once, or a NaN carrying digits — and every
+ * reader had to know which fields were meaningful in which combination. Now the
+ * cases are the type, and `writeDecimal` is exhaustive over them.
+ *
+ * `Zero` carries no sign: `String(-0)` is `"0"`, so the sign has nowhere to go.
+ */
+export enum Decimal {
+  NaN,
+  Inf(bool neg),
+  Zero,
   // digits[0..count) are ASCII '0'..'9'; the value is 0.digits * 10^exp10.
-  u8[] digits;
-  i32 count;
-  i32 exp10;
-  bool neg;
-  // Set for the values that have no digits: NaN and the infinities.
-  bool isNaN;
-  bool isInf;
+  Digits(u8[] digits, i32 count, i32 exp10, bool neg),
 }
 
 /**
@@ -63,18 +69,19 @@ export Decimal decompose32(f32 x) {
  * parameters rather than a second copy of Burger & Dybvig.
  */
 Decimal decomposeFloat(bool neg, i32 be, u64 frac, i32 maxBe, u64 implicitBit, i32 bias) {
-  Decimal d = Decimal(u8[24](), 0, 0, neg, false, false);
   if (be == maxBe) {
-    if (frac != 0) { d.isNaN = true; } else { d.isInf = true; }
-    return d;
+    if (frac != 0) { return Decimal.NaN; }
+    return Decimal.Inf(neg);
   }
-  if (be == 0 && frac == 0) {
-    // Zero has no significant digits; the sign is kept but JS drops it on output.
-    d.digits[0] = '0';
-    d.count = 1;
-    d.exp10 = 1;
-    return d;
-  }
+  if (be == 0 && frac == 0) { return Decimal.Zero; }
+
+  // Digits accumulate in locals. A variant's payload cannot be written after
+  // construction — a matched subject is const within its arm, and outside a match
+  // the enum has no fields — so the value is built here and constructed once at the
+  // end. That was a builder in disguise before.
+  u8[] digits = u8[24]();
+  i32 count = 0;
+  i32 exp10 = 0;
 
   u64 f = frac;
   i32 e = 1 - bias;
@@ -157,7 +164,7 @@ Decimal decomposeFloat(bool neg, i32 be, u64 frac, i32 maxBe, u64 implicitBit, i
       break;
     }
   }
-  d.exp10 = k;
+  exp10 = k;
 
   Big twice = Big.zero();
   while (true) {
@@ -176,8 +183,8 @@ Decimal decomposeFloat(bool neg, i32 be, u64 frac, i32 maxBe, u64 implicitBit, i
     bool high = boundaryOk ? cHigh >= 0 : cHigh > 0;
 
     if (!low && !high) {
-      d.digits[d.count] = '0' + digit;
-      d.count++;
+      digits[count] = '0' + digit;
+      count++;
       continue;
     }
     // Stop: the digits so far pin this double down. Which way the last one goes
@@ -199,27 +206,27 @@ Decimal decomposeFloat(bool neg, i32 be, u64 frac, i32 maxBe, u64 implicitBit, i
       last = digit + 1;
     }
     if (last < 10) {
-      d.digits[d.count] = '0' + last;
-      d.count++;
-      return d;
+      digits[count] = '0' + last;
+      count++;
+      return Decimal.Digits(digits, count, exp10, neg);
     }
 
     // Rounding up a 9 carries. The digit itself becomes 0, and since everything
     // after the carry is zeros, they are trailing zeros in a shortest
     // representation and are dropped rather than emitted.
-    i32 i = d.count - 1;
-    while (i >= 0 && d.digits[i] == '9') { i--; }
+    i32 i = count - 1;
+    while (i >= 0 && digits[i] == '9') { i--; }
     if (i < 0) {
       // Carried off the front: the value rounds to a power of ten. 9.99e22 is
       // where this happens — its shortest form is 1e23, not 10e22.
-      d.digits[0] = '1';
-      d.count = 1;
-      d.exp10 = d.exp10 + 1;
+      digits[0] = '1';
+      count = 1;
+      exp10 = exp10 + 1;
     } else {
-      d.digits[i] = d.digits[i] + 1;
-      d.count = i + 1;
+      digits[i] = digits[i] + 1;
+      count = i + 1;
     }
-    return d;
+    return Decimal.Digits(digits, count, exp10, neg);
   }
 }
 
@@ -258,45 +265,50 @@ export void writeF32(Buf out, f32 x) { writeDecimal(out, decompose32(x)); }
 
 export void writeF64(Buf out, f64 x) { writeDecimal(out, decompose(x)); }
 
-/**
- * Format generated digits, by ECMA-262's Number::toString rules.
- *
- * Applied to f32 as well. ECMA-262 defines the rules for doubles, but they are a
- * function of the digit count and the decimal exponent, not of the width — and
- * using the same thresholds for both means one reader does not have to hold two
- * sets of them.
- */
+/** Exhaustive over the four things a float can be. */
 void writeDecimal(Buf out, Decimal d) {
-  if (d.isNaN) {
-    out.pushAll(u8[]('N', 'a', 'N'));
-    return;
+  match (d) {
+    case NaN: {
+      out.pushAll(u8[]('N', 'a', 'N'));
+    }
+    case Inf(neg): {
+      if (neg) { out.push('-'); }
+      out.pushAll(u8[]('I', 'n', 'f', 'i', 'n', 'i', 't', 'y'));
+    }
+    case Zero: {
+      // Unsigned, matching String(-0) === "0".
+      out.push('0');
+    }
+    case Digits(digits, count, exp10, neg): {
+      if (neg) { out.push('-'); }
+      writeDigits(out, digits, count, exp10);
+    }
   }
-  if (d.isInf) {
-    if (d.neg) { out.push('-'); }
-    out.pushAll(u8[]('I', 'n', 'f', 'i', 'n', 'i', 't', 'y'));
-    return;
-  }
-  // Zero prints without its sign, matching String(-0) === "0".
-  if (d.count == 1 && d.digits[0] == '0') {
-    out.push('0');
-    return;
-  }
-  if (d.neg) { out.push('-'); }
+}
 
-  i32 k = d.count;      // digit count
-  i32 n = d.exp10;      // value is 0.digits * 10^n
+/**
+ * Place the decimal point, by ECMA-262's Number::toString rules.
+ *
+ * `count` digits with the value 0.digits * 10^exp10. Applied to f32 as well:
+ * ECMA-262 defines the rules for doubles, but they are a function of the digit count
+ * and the exponent, not of the width, and one set of thresholds is easier to read
+ * than two.
+ */
+void writeDigits(Buf out, u8[] digits, i32 count, i32 exp10) {
+  i32 k = count;
+  i32 n = exp10;
 
   if (k <= n && n <= 21) {
     // Integer with trailing zeros: 1e3 prints as 1000.
-    for (i32 i = 0; i < k; i++) { out.push(d.digits[i]); }
+    for (i32 i = 0; i < k; i++) { out.push(digits[i]); }
     for (i32 i = 0; i < n - k; i++) { out.push('0'); }
     return;
   }
   if (0 < n && n <= 21) {
     // Decimal point inside the digits.
-    for (i32 i = 0; i < n; i++) { out.push(d.digits[i]); }
+    for (i32 i = 0; i < n; i++) { out.push(digits[i]); }
     out.push('.');
-    for (i32 i = n; i < k; i++) { out.push(d.digits[i]); }
+    for (i32 i = n; i < k; i++) { out.push(digits[i]); }
     return;
   }
   if (-6 < n && n <= 0) {
@@ -304,15 +316,15 @@ void writeDecimal(Buf out, Decimal d) {
     out.push('0');
     out.push('.');
     for (i32 i = 0; i < -n; i++) { out.push('0'); }
-    for (i32 i = 0; i < k; i++) { out.push(d.digits[i]); }
+    for (i32 i = 0; i < k; i++) { out.push(digits[i]); }
     return;
   }
 
   // Exponential. The exponent is n-1 because the point sits after the first digit.
-  out.push(d.digits[0]);
+  out.push(digits[0]);
   if (k > 1) {
     out.push('.');
-    for (i32 i = 1; i < k; i++) { out.push(d.digits[i]); }
+    for (i32 i = 1; i < k; i++) { out.push(digits[i]); }
   }
   out.push('e');
   i32 exp = n - 1;
