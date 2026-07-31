@@ -141,6 +141,57 @@ function readCounts(mod: Record<string, unknown>, n: number): number[] {
   record(points, readCounts(mod, len));
 }
 
+// ── Exercise every package's wac test suite ───────────────────────────────────
+//
+// The gzip exercises above are hand-written because they drive a fuzz corpus, which is more
+// thorough than any test file. Every *other* package is covered by running its wac-native tests
+// with instrumentation — the tests are the exercise, and they are already there.
+//
+// This is why issue 0024 survived: branch coverage never instrumented `match` arms, and nothing
+// noticed, because the only package under this tool contained no `match`. The packages that use one
+// — fmt, json, wacc — were outside it. A whole class of instrumentation bug is undetectable while
+// the measured set and the feature-using set do not overlap, so the fix is to stop having a
+// measured set [issue 0025].
+//
+// Discovery is by directory rather than a list, so a new package is covered by default and has to
+// opt *out* by having no wac tests.
+
+async function wacTestFiles(): Promise<string[]> {
+  const out: string[] = [];
+  for await (const pkg of Deno.readDir("packages")) {
+    if (!pkg.isDirectory) continue;
+    const dir = `packages/${pkg.name}/test/wac`;
+    try {
+      for await (const f of Deno.readDir(dir)) {
+        // `probe.wac` and friends are scratch files for host-side tests, not test suites: a test
+        // file is one that exports `test*` functions, which is checked after compiling.
+        if (f.isFile && f.name.endsWith("_test.wac")) out.push(`${dir}/${f.name}`);
+      }
+    } catch { /* the package has no wac tests */ }
+  }
+  return out.sort();
+}
+
+for (const entry of await wacTestFiles()) {
+  const { mod, points } = await instrument(entry);
+  (mod.__cov_init as () => void)();
+  const len = (mod.__cov_len as () => number)();
+
+  // Every no-argument export named test* returning a string is a test, the same rule
+  // `harness/wacTestRun.ts` uses. Running them is the exercise.
+  let ran = 0;
+  for (const [name, fn] of Object.entries(mod)) {
+    if (!name.startsWith("test") || typeof fn !== "function") continue;
+    try { (fn as () => unknown)(); ran++; } catch (e) {
+      // A failing wac test is the test suite's business, not this tool's — but a *trap* would
+      // leave the counters half-filled, so it is worth saying which file did it.
+      console.warn(`  note: ${entry} ${name} threw during coverage: ${String(e).split("\n")[0]}`);
+    }
+  }
+  if (ran === 0) console.warn(`  note: ${entry} exported no runnable tests`);
+  record(points, readCounts(mod, len));
+}
+
 // ── Report ────────────────────────────────────────────────────────────────────
 
 const byFile = new Map<string, { total: number; hit: number; missing: Point[] }>();
