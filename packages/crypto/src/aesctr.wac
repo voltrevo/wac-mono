@@ -1,0 +1,51 @@
+// AES-CTR (NIST SP 800-38A).
+//
+// The block cipher becomes a stream cipher: encrypt successive counter blocks
+// and xor the keystream with the data. Encryption and decryption are the same
+// operation, as with ChaCha20.
+//
+// The counter is the full 128-bit block, incremented as a big-endian integer —
+// the convention WebCrypto uses with `length: 128`, so the two agree byte for
+// byte. Narrower counter fields exist in the standard and are not implemented.
+//
+// A counter value must never repeat under one key. Nothing here can enforce
+// that, and reusing one is the way CTR fails catastrophically.
+
+import { aesExpandKey, aesEncryptBlock, aesRounds } from "./aes.wac";
+
+/** Increment a 16-byte big-endian counter in place, wrapping at 2^128. */
+void increment(u8[] ctr) {
+  for (i32 i = 15; i >= 0; i--) {
+    i32 v = ctr[i] + 1;
+    ctr[i] = v & 0xFF;
+    if (v < 256) { return; }
+  }
+}
+
+/**
+ * Encrypt or decrypt `data` under `key`, starting from counter block `iv`.
+ *
+ * The final block is truncated to the data length, so the output is exactly as
+ * long as the input and no padding is involved.
+ */
+export u8[] aesCtr(u8[] key, u8[] iv, u8[] data) {
+  if (iv.len() != 16) { trap; }
+
+  u8[] w = aesExpandKey(key);
+  i32 nr = aesRounds(key.len());
+
+  u8[] ctr = u8[16]();
+  for (i32 i = 0; i < 16; i++) { ctr[i] = iv[i]; }
+
+  i32 n = data.len();
+  u8[] out = u8[n]();
+  i32 pos = 0;
+  while (pos < n) {
+    u8[] ks = aesEncryptBlock(w, ctr, nr);
+    i32 take = n - pos < 16 ? n - pos : 16;
+    for (i32 j = 0; j < take; j++) { out[pos + j] = data[pos + j] ^ ks[j]; }
+    increment(ctr);
+    pos += 16;
+  }
+  return out;
+}
