@@ -20,23 +20,23 @@
  * iteration to the next, so it runs at the latency of a table lookup rather than
  * the throughput. Flat rather than nested to keep it one bounds-checked array.
  */
-i32[] crcTable8() {
-  i32[] t = i32[2048]();
+u32[] crcTable8() {
+  u32[] t = u32[2048]();
   for (i32 n = 0; n < 256; n++) {
-    i32 c = n;
+    u32 c = n as@ u32;
     for (i32 k = 0; k < 8; k++) {
       if ((c & 1) != 0) {
-        c = 0xEDB88320 ^ (c >>> 1);
+        c = 0xEDB88320 ^ (c >> 1);
       } else {
-        c = c >>> 1;
+        c = c >> 1;
       }
     }
     t[n] = c;
   }
   for (i32 k = 1; k < 8; k++) {
     for (i32 n = 0; n < 256; n++) {
-      i32 prev = t[(k - 1) * 256 + n];
-      t[k * 256 + n] = (prev >>> 8) ^ t[prev & 0xFF];
+      u32 prev = t[(k - 1) * 256 + n];
+      t[k * 256 + n] = (prev >> 8) ^ t[(prev & 0xFF) as@ i32];
     }
   }
   return t;
@@ -53,22 +53,23 @@ i32 sliceThreshold() { return 512; }
  * xors the results. The lookups do not depend on each other, so they pipeline
  * instead of serialising on lookup latency the way the byte-at-a-time loop does.
  */
-export i32 crc32(u8[] data) {
+export u32 crc32(u8[] data) {
   i32 n = data.len();
   if (n < sliceThreshold()) {
     return crc32Bitwise(data);
   }
 
-  i32[] t = crcTable8();
-  i32 crc = 0xFFFFFFFF;
+  u32[] t = crcTable8();
+  u32 crc = 0xFFFFFFFF;
   i32 i = 0;
 
   while (i + 8 <= n) {
-    i32 a = crc ^ data[i] ^ (data[i + 1] << 8) ^ (data[i + 2] << 16) ^ (data[i + 3] << 24);
-    crc = t[1792 + (a & 0xFF)]
-        ^ t[1536 + ((a >>> 8) & 0xFF)]
-        ^ t[1280 + ((a >>> 16) & 0xFF)]
-        ^ t[1024 + ((a >>> 24) & 0xFF)]
+    u32 a = crc ^ (data[i] as@ u32) ^ ((data[i + 1] << 8) as@ u32)
+          ^ ((data[i + 2] << 16) as@ u32) ^ ((data[i + 3] << 24) as@ u32);
+    crc = t[1792 + ((a & 0xFF) as@ i32)]
+        ^ t[1536 + (((a >> 8) & 0xFF) as@ i32)]
+        ^ t[1280 + (((a >> 16) & 0xFF) as@ i32)]
+        ^ t[1024 + (((a >> 24) & 0xFF) as@ i32)]
         ^ t[768 + data[i + 4]]
         ^ t[512 + data[i + 5]]
         ^ t[256 + data[i + 6]]
@@ -78,7 +79,7 @@ export i32 crc32(u8[] data) {
 
   // Whatever is left over, one byte at a time.
   while (i < n) {
-    crc = t[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+    crc = t[((crc ^ (data[i] as@ u32)) & 0xFF) as@ i32] ^ (crc >> 8);
     i++;
   }
 
@@ -90,13 +91,13 @@ export i32 crc32(u8[] data) {
  * table-driven version is tested against, because a single wrong table entry
  * would otherwise only be caught if some fixed vector happened to reach it.
  */
-export i32 crc32Bitwise(u8[] data) {
-  i32 crc = 0xFFFFFFFF;
+export u32 crc32Bitwise(u8[] data) {
+  u32 crc = 0xFFFFFFFF;
   for (i32 i = 0; i < data.len(); i++) {
-    crc ^= data[i];
+    crc ^= data[i] as@ u32;
     for (i32 k = 0; k < 8; k++) {
       bool low = (crc & 1) != 0;
-      crc >>>= 1;
+      crc >>= 1;
       if (low) { crc ^= 0xEDB88320; }
     }
   }

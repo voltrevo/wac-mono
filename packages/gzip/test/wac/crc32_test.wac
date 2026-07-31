@@ -16,7 +16,7 @@ export string test_table_agrees_with_definition_on_every_byte() {
   for (i32 b = 0; b < 256; b++) {
     u8[] one = u8[1]();
     one[0] = b;
-    t.eqI32(crc32(one), crc32Bitwise(one), "single byte " + itoa(b));
+    t.eqU32(crc32(one), crc32Bitwise(one), "single byte " + itoa(b));
   }
   return t.report();
 }
@@ -37,7 +37,7 @@ export string test_table_agrees_across_lengths() {
     for (i32 i = 0; i < n; i++) {
       data[i] = (i * 37 + n * 11) & 0xFF;
     }
-    t.eqI32(crc32(data), crc32Bitwise(data), "length " + itoa(n));
+    t.eqU32(crc32(data), crc32Bitwise(data), "length " + itoa(n));
   }
   return t.report();
 }
@@ -46,9 +46,9 @@ export string test_known_vectors() {
   T t = T.create();
   // "hello world", from python zlib.crc32 — 222957957.
   u8[] hw = u8[](104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100);
-  t.eqI32(crc32(hw), 222957957, "crc32(\"hello world\")");
+  t.eqU32(crc32(hw), 222957957, "crc32(\"hello world\")");
   // Empty input is 0 by definition, and is the one case with no table lookup.
   u8[] empty = u8[0]();
-  t.eqI32(crc32(empty), 0, "crc32 of empty");
+  t.eqU32(crc32(empty), 0, "crc32 of empty");
   return t.report();
 }
