@@ -301,9 +301,7 @@ ClSeq runLengthEncode(i32[] lens, i32 total) {
  * with the symbols most likely to be used, so trailing entries are usually zero
  * and can be dropped (that is what HCLEN counts).
  */
-i32[] clOrder() {
-  return i32[](16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);
-}
+const i32[] CL_ORDER = i32[](16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);
 
 /** Extra bits carried by code-length symbols 16, 17 and 18. */
 i32 clExtraBits(i32 sym) {
@@ -358,7 +356,7 @@ export u8[] deflateDynamic(u8[] data) {
   Huff cl = Huff.build(clFreq, numCl(), maxClBits());
 
   // Drop trailing zero lengths in the transmission order; at least 4 are sent.
-  i32[] order = clOrder();
+  i32[] order = CL_ORDER;
   i32 hclen = numCl();
   while (hclen > 4 && cl.len[order[hclen - 1]] == 0) {
     hclen--;
