@@ -1,0 +1,35 @@
+// The wacc entry points that cross the JavaScript boundary.
+//
+// Everything else in this package traffics in structs and sum types, which bindgen
+// cannot marshal — and should not, since an AST is not a value to hand across a
+// boundary. So the surface is bytes in, text out: the caller passes source and gets
+// the canonical dump that `test/parse.test.ts` compares against the reference.
+
+import { lex, Lexed } from "./lex.wac";
+import { P, parseProgram } from "./parse.wac";
+import { Program } from "./ast.wac";
+import { Pr, printProgram } from "./print.wac";
+
+/** Lex, parse, and render the AST in canonical form. */
+export string dump(u8[] src) {
+  Lexed lexed = lex(src);
+  P p = P.create(src, lexed.tokens, lexed.tokenCount);
+  Program prog = parseProgram(p);
+  Pr w = Pr.create(src, lexed.tokens, lexed.tokenCount);
+  return printProgram(w, prog);
+}
+
+/**
+ * The parser's errors, as (code, line, col) triples.
+ *
+ * Separate from `dump` because a caller comparing ASTs and a caller comparing
+ * diagnostics want different things, and returning both would mean a struct.
+ */
+export i32[] dumpErrors(u8[] src) {
+  Lexed lexed = lex(src);
+  P p = P.create(src, lexed.tokens, lexed.tokenCount);
+  parseProgram(p);
+  i32[] out = i32[p.errorCount * 3]();
+  for (i32 i = 0; i < p.errorCount * 3; i++) { out[i] = p.errors[i]; }
+  return out;
+}

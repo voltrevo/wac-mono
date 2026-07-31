@@ -1,0 +1,600 @@
+// A canonical text form for the AST, so it can be compared against the reference.
+//
+// The oracle for the parser is the TypeScript implementation, and the two build
+// unrelated data structures — one an object graph with string fields, the other sum
+// types holding token indices. Comparing them means projecting both onto one text
+// form, and this is that form. `test/parse.test.ts` produces the same text from the
+// reference AST.
+//
+// Shape: `(kind@line:col child child ...)`. Positions are included because they are
+// part of what the parser is responsible for, and rung 3's diagnostics compare by
+// position — so a divergence is worth catching here rather than one rung later.
+//
+// Every walk here is a `match` over an AST enum, so adding a variant breaks this file
+// at compile time. That is the whole reason the AST is sum types: this printer is the
+// exact shape of code the node pool made unsafe, a dispatch on tag where nothing
+// checked that the fields being read meant what the tag implied.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { Ty, TyKind, Expr, ExprKind, NamedArg, Lvalue, LvalueKind,
+  Stmt, StmtKind, Case, Arm,
+  Decl, DeclKind, Param, Field, Method, Variant, ImportItem, Program } from "./ast.wac";
+import { tokenStride } from "./lex.wac";
+
+/** Everything the printer needs: the AST's token table and the source behind it. */
+export struct Pr {
+  Buf out;
+  u8[] src;
+  i32[] toks;
+  i32 tokCount;
+
+  Pr create(u8[] src, i32[] toks, i32 tokCount) {
+    return Pr(Buf.withCapacity(4096), src, toks, tokCount);
+  }
+
+  void s(this, string text) { this.out.pushAll(text.toBytes()); }
+
+  void num(this, i32 v) {
+    if (v < 0) { this.out.push('-'); this.num(0 - v); return; }
+    if (v >= 10) { this.num(v / 10); }
+    this.out.push('0' + v % 10);
+  }
+
+  /** `@line:col`, the position suffix every node carries. */
+  void pos(this, i32 line, i32 col) {
+    this.out.push('@');
+    this.num(line);
+    this.out.push(':');
+    this.num(col);
+  }
+
+  void open(this, string kind, i32 line, i32 col) {
+    this.out.push('(');
+    this.s(kind);
+    this.pos(line, col);
+  }
+
+  void close(this) { this.out.push(')'); }
+  void sp(this) { this.out.push(' '); }
+
+  /**
+   * The raw source text of a token.
+   *
+   * A token index of -1 means the parser recorded an error and had no name to use;
+   * it prints as `?`, which is what the reference substitutes in the same situation.
+   */
+  void tok(this, i32 t) {
+    if (t < 0 || t >= this.tokCount) { this.out.push('?'); return; }
+    i32 start = this.toks[t * tokenStride() + 1];
+    i32 len = this.toks[t * tokenStride() + 2];
+    for (i32 i = 0; i < len; i++) { this.out.push(this.src[start + i]); }
+  }
+
+  /**
+   * An integer literal token, as the reference stores it.
+   *
+   * A character literal is an `int` token whose value is its codepoint, so `'a'`
+   * prints as `97` rather than as its span. Every other number prints verbatim,
+   * including its underscores and hex prefix, because that is what the reference
+   * keeps.
+   */
+  void intTok(this, i32 t) {
+    if (t < 0 || t >= this.tokCount) { this.out.push('?'); return; }
+    i32 start = this.toks[t * tokenStride() + 1];
+    i32 len = this.toks[t * tokenStride() + 2];
+    if (len == 0 || this.src[start] != '\'') { this.tok(t); return; }
+    this.num(charLitValue(this.src, start, len));
+  }
+
+  /**
+   * A string literal token, unescaped and then re-escaped canonically.
+   *
+   * The reference stores the *unescaped* value, so the span cannot be compared
+   * directly: `"a\nb"` is three characters there and six bytes here. Both sides
+   * unescape and then re-escape by the same rule, which makes the comparison exact
+   * without either side having to reproduce the other's quoting.
+   */
+  void strTok(this, i32 t) {
+    if (t < 0 || t >= this.tokCount) { this.out.push('?'); return; }
+    i32 start = this.toks[t * tokenStride() + 1];
+    i32 len = this.toks[t * tokenStride() + 2];
+    this.out.push('"');
+    // Skip the opening quote, and the closing one when the literal is terminated.
+    i32 i = start + 1;
+    i32 end = start + len;
+    if (len > 1 && this.src[end - 1] == '"') { end = end - 1; }
+    while (i < end) {
+      i32 c = this.src[i];
+      if (c == '\\' && i + 1 < end) {
+        i32 e = this.src[i + 1];
+        i += 2;
+        if (e == 'n')       { this.escByte(10); }
+        else if (e == 't')  { this.escByte(9); }
+        else if (e == 'r')  { this.escByte(13); }
+        else if (e == '\\') { this.escByte('\\'); }
+        else if (e == '"')  { this.escByte('"'); }
+        else if (e == '0')  { this.escByte(0); }
+        else { this.escByte(e); }        // an unknown escape keeps the character
+        continue;
+      }
+      this.escByte(c);
+      i++;
+    }
+    this.out.push('"');
+  }
+
+  /** One byte of a string, escaped so the result is unambiguous and printable. */
+  void escByte(this, i32 c) {
+    if (c == '\\' || c == '"') { this.out.push('\\'); this.out.push(c); return; }
+    if (c < 32 || c == 127) {
+      this.out.push('\\');
+      this.out.push('x');
+      this.out.push(hexDigit(c >> 4));
+      this.out.push(hexDigit(c & 15));
+      return;
+    }
+    this.out.push(c);
+  }
+}
+
+i32 hexDigit(i32 v) { return v < 10 ? '0' + v : 'a' + (v - 10); }
+
+/** The codepoint a character literal denotes, given its raw span. */
+i32 charLitValue(u8[] s, i32 start, i32 len) {
+  i32 end = start + len;
+  if (len > 1 && s[end - 1] == '\'') { end = end - 1; }
+  i32 i = start + 1;
+  if (i >= end) { return 0; }
+  if (s[i] == '\\' && i + 1 < end) {
+    i32 e = s[i + 1];
+    if (e == 'n')  { return 10; }
+    if (e == 't')  { return 9; }
+    if (e == 'r')  { return 13; }
+    if (e == '\\') { return 92; }
+    if (e == '"')  { return 34; }
+    if (e == '\'') { return 39; }
+    if (e == '0')  { return 0; }
+    return e;
+  }
+  // A literal character, decoded from UTF-8 so a non-ASCII one gives its codepoint.
+  i32 c = s[i];
+  if (c < 0x80) { return c; }
+  if ((c & 0xE0) == 0xC0 && i + 1 < end) {
+    return ((c & 0x1F) << 6) | (s[i + 1] & 0x3F);
+  }
+  if ((c & 0xF0) == 0xE0 && i + 2 < end) {
+    return ((c & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F);
+  }
+  if ((c & 0xF8) == 0xF0 && i + 3 < end) {
+    return ((c & 0x07) << 18) | ((s[i + 1] & 0x3F) << 12)
+         | ((s[i + 2] & 0x3F) << 6) | (s[i + 3] & 0x3F);
+  }
+  return c;
+}
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+void printTy(Pr w, Ty t) {
+  match (t.kind) {
+    case Prim(tok): {
+      w.open("prim", t.line, t.col);
+      w.sp();
+      // No token means the parser substituted `i32` for a malformed type, which is
+      // exactly what the reference does, so it prints as that rather than as `?`.
+      if (tok < 0) { w.s("i32"); } else { w.tok(tok); }
+      w.close();
+    }
+    case Named(tok): {
+      w.open("named", t.line, t.col);
+      w.sp();
+      w.tok(tok);
+      w.close();
+    }
+    case Arr(elem): {
+      w.open("arr", t.line, t.col);
+      w.sp();
+      printTy(w, elem);
+      w.close();
+    }
+    case Nullable(inner): {
+      w.open("nullable", t.line, t.col);
+      w.sp();
+      printTy(w, inner);
+      w.close();
+    }
+    case Funcref(ret, params): {
+      w.open("funcref", t.line, t.col);
+      w.sp();
+      printTy(w, ret);
+      w.s(" (");
+      for (i32 i = 0; i < params.len(); i++) {
+        if (i > 0) { w.sp(); }
+        printTy(w, params[i]);
+      }
+      w.s("))");
+    }
+  }
+}
+
+// ── Expressions ───────────────────────────────────────────────────────────────
+
+void printExpr(Pr w, Expr e) {
+  match (e.kind) {
+    case IntLit(tok): {
+      w.open("int", e.line, e.col); w.sp(); w.intTok(tok); w.close();
+    }
+    case FloatLit(tok): {
+      w.open("float", e.line, e.col); w.sp(); w.tok(tok); w.close();
+    }
+    case StrLit(tok): {
+      w.open("str", e.line, e.col); w.sp(); w.strTok(tok); w.close();
+    }
+    case BoolLit(value): {
+      w.open("bool", e.line, e.col);
+      w.sp();
+      w.s(value ? "true" : "false");
+      w.close();
+    }
+    case NullLit: {
+      w.open("null", e.line, e.col); w.close();
+    }
+    case Ident(tok): {
+      w.open("ident", e.line, e.col); w.sp(); w.tok(tok); w.close();
+    }
+    case Unary(op, operand): {
+      w.open("unary", e.line, e.col);
+      w.sp(); w.tok(op);
+      w.sp(); printExpr(w, operand);
+      w.close();
+    }
+    case Binary(op, left, right): {
+      w.open("binary", e.line, e.col);
+      w.sp(); w.tok(op);
+      w.sp(); printExpr(w, left);
+      w.sp(); printExpr(w, right);
+      w.close();
+    }
+    case Cast(op, operand, target): {
+      w.open("cast", e.line, e.col);
+      w.sp(); w.tok(op);
+      w.sp(); printExpr(w, operand);
+      w.sp(); printTy(w, target);
+      w.close();
+    }
+    case Is(left, target, other, negated): {
+      w.open("is", e.line, e.col);
+      w.sp(); w.s(negated ? "not" : "plain");
+      w.sp(); printExpr(w, left);
+      w.sp();
+      // A type prints as `(prim ...)`/`(named ...)` and a value as `(ident ...)`, so
+      // the three forms stay distinguishable without a tag of their own.
+      if (target is not null)     { printTy(w, target!); }
+      else if (other is not null) { printExpr(w, other!); }
+      else                        { w.s("null"); }
+      w.close();
+    }
+    case Ternary(cond, then, els): {
+      w.open("ternary", e.line, e.col);
+      w.sp(); printExpr(w, cond);
+      w.sp(); printExpr(w, then);
+      w.sp(); printExpr(w, els);
+      w.close();
+    }
+    case Call(callee, args): {
+      w.open("call", e.line, e.col);
+      w.sp(); printExpr(w, callee);
+      printExprList(w, args);
+      w.close();
+    }
+    case Index(arr, index): {
+      w.open("index", e.line, e.col);
+      w.sp(); printExpr(w, arr);
+      w.sp(); printExpr(w, index);
+      w.close();
+    }
+    case Member(obj, nameTok): {
+      w.open("member", e.line, e.col);
+      w.sp(); printExpr(w, obj);
+      w.sp(); w.tok(nameTok);
+      w.close();
+    }
+    case Unwrap(operand): {
+      w.open("unwrap", e.line, e.col);
+      w.sp(); printExpr(w, operand);
+      w.close();
+    }
+    case Construct(ctype, args, named): {
+      w.open("construct", e.line, e.col);
+      w.sp(); printTy(w, ctype);
+      printExprList(w, args);
+      w.s(" (");
+      for (i32 i = 0; i < named.len(); i++) {
+        if (i > 0) { w.sp(); }
+        w.out.push('(');
+        w.tok(named[i].nameTok);
+        w.sp();
+        printExpr(w, named[i].value);
+        w.out.push(')');
+      }
+      w.s("))");
+    }
+    case Incr(target, op, prefix): {
+      w.open("incr", e.line, e.col);
+      w.sp(); w.tok(op);
+      w.sp(); w.s(prefix ? "pre" : "post");
+      w.sp(); printLvalue(w, target);
+      w.close();
+    }
+    case ArrNew(elem, size, elements): {
+      w.open("arrnew", e.line, e.col);
+      w.sp(); printTy(w, elem);
+      w.sp();
+      if (size is null) { w.s("-"); } else { printExpr(w, size!); }
+      printExprList(w, elements);
+      w.close();
+    }
+  }
+}
+
+void printExprList(Pr w, Expr[] items) {
+  w.s(" (");
+  for (i32 i = 0; i < items.len(); i++) {
+    if (i > 0) { w.sp(); }
+    printExpr(w, items[i]);
+  }
+  w.out.push(')');
+}
+
+// ── Lvalues ───────────────────────────────────────────────────────────────────
+
+void printLvalue(Pr w, Lvalue lv) {
+  match (lv.kind) {
+    case LIdent(tok): {
+      w.open("lv-ident", lv.line, lv.col); w.sp(); w.tok(tok); w.close();
+    }
+    case LField(base, nameTok): {
+      w.open("lv-field", lv.line, lv.col);
+      w.sp(); printLvalue(w, base);
+      w.sp(); w.tok(nameTok);
+      w.close();
+    }
+    case LIndex(base, index): {
+      w.open("lv-index", lv.line, lv.col);
+      w.sp(); printLvalue(w, base);
+      w.sp(); printExpr(w, index);
+      w.close();
+    }
+    case LUnwrap(base): {
+      w.open("lv-unwrap", lv.line, lv.col);
+      w.sp(); printLvalue(w, base);
+      w.close();
+    }
+  }
+}
+
+// ── Statements ────────────────────────────────────────────────────────────────
+
+void printStmt(Pr w, Stmt s) {
+  match (s.kind) {
+    case Var(type, nameTok, init, isConst): {
+      w.open("var", s.line, s.col);
+      w.sp(); w.s(isConst ? "const" : "let");
+      w.sp(); printTy(w, type);
+      w.sp(); w.tok(nameTok);
+      w.sp(); printExpr(w, init);
+      w.close();
+    }
+    case Assign(target, op, rhs): {
+      w.open("assign", s.line, s.col);
+      w.sp(); w.tok(op);
+      w.sp(); printLvalue(w, target);
+      w.sp(); printExpr(w, rhs);
+      w.close();
+    }
+    case IncrStmt(target, op): {
+      w.open("incr-stmt", s.line, s.col);
+      w.sp(); w.tok(op);
+      w.sp(); printLvalue(w, target);
+      w.close();
+    }
+    case If(cond, then, els): {
+      w.open("if", s.line, s.col);
+      w.sp(); printExpr(w, cond);
+      printStmtList(w, then);
+      printStmtList(w, els);
+      w.close();
+    }
+    case While(cond, body): {
+      w.open("while", s.line, s.col);
+      w.sp(); printExpr(w, cond);
+      printStmtList(w, body);
+      w.close();
+    }
+    case For(init, cond, update, body): {
+      w.open("for", s.line, s.col);
+      w.sp();
+      if (init is null) { w.s("-"); } else { printStmt(w, init!); }
+      w.sp();
+      if (cond is null) { w.s("-"); } else { printExpr(w, cond!); }
+      w.sp();
+      if (update is null) { w.s("-"); } else { printStmt(w, update!); }
+      printStmtList(w, body);
+      w.close();
+    }
+    case DoWhile(body, cond): {
+      w.open("dowhile", s.line, s.col);
+      printStmtList(w, body);
+      w.sp(); printExpr(w, cond);
+      w.close();
+    }
+    case Switch(subject, cases): {
+      w.open("switch", s.line, s.col);
+      w.sp(); printExpr(w, subject);
+      w.s(" (");
+      for (i32 i = 0; i < cases.len(); i++) {
+        if (i > 0) { w.sp(); }
+        w.s("(case ");
+        if (cases[i].value is null) { w.s("default"); } else { printExpr(w, cases[i].value!); }
+        printStmtList(w, cases[i].body);
+        w.out.push(')');
+      }
+      w.s("))");
+    }
+    case Match(subject, arms): {
+      w.open("match", s.line, s.col);
+      w.sp(); printExpr(w, subject);
+      w.s(" (");
+      for (i32 i = 0; i < arms.len(); i++) {
+        if (i > 0) { w.sp(); }
+        w.s("(arm ");
+        if (arms[i].variantTok < 0) { w.s("else"); } else { w.tok(arms[i].variantTok); }
+        w.s(" (");
+        for (i32 j = 0; j < arms[i].bindingToks.len(); j++) {
+          if (j > 0) { w.sp(); }
+          w.tok(arms[i].bindingToks[j]);
+        }
+        w.out.push(')');
+        printStmtList(w, arms[i].body);
+        w.out.push(')');
+      }
+      w.s("))");
+    }
+    case Return(value): {
+      w.open("return", s.line, s.col);
+      w.sp();
+      if (value is null) { w.s("-"); } else { printExpr(w, value!); }
+      w.close();
+    }
+    case Break:    { w.open("break", s.line, s.col); w.close(); }
+    case Continue: { w.open("continue", s.line, s.col); w.close(); }
+    case Trap:     { w.open("trap", s.line, s.col); w.close(); }
+    case Block(body): {
+      w.open("block", s.line, s.col);
+      printStmtList(w, body);
+      w.close();
+    }
+    case ExprStmt(expr): {
+      w.open("expr", s.line, s.col);
+      w.sp(); printExpr(w, expr);
+      w.close();
+    }
+  }
+}
+
+void printStmtList(Pr w, Stmt[] items) {
+  w.s(" (");
+  for (i32 i = 0; i < items.len(); i++) {
+    if (i > 0) { w.sp(); }
+    printStmt(w, items[i]);
+  }
+  w.out.push(')');
+}
+
+// ── Declarations ──────────────────────────────────────────────────────────────
+
+void printParams(Pr w, Param[] params) {
+  w.s(" (");
+  for (i32 i = 0; i < params.len(); i++) {
+    if (i > 0) { w.sp(); }
+    w.out.push('(');
+    w.tok(params[i].nameTok);
+    w.sp();
+    printTy(w, params[i].type);
+    w.out.push(')');
+  }
+  w.out.push(')');
+}
+
+void printDecl(Pr w, Decl d) {
+  match (d.kind) {
+    case Import(pathTok, items): {
+      w.open("import", d.line, d.col);
+      w.sp(); w.strTok(pathTok);
+      w.s(" (");
+      for (i32 i = 0; i < items.len(); i++) {
+        if (i > 0) { w.sp(); }
+        w.out.push('(');
+        w.tok(items[i].nameTok);
+        w.sp();
+        w.tok(items[i].aliasTok);
+        w.out.push(')');
+      }
+      w.s("))");
+    }
+    case Func(nameTok, returnType, params, body, exported): {
+      w.open("func", d.line, d.col);
+      w.sp(); w.s(exported ? "export" : "local");
+      w.sp(); w.tok(nameTok);
+      w.sp(); printTy(w, returnType);
+      printParams(w, params);
+      printStmtList(w, body);
+      w.close();
+    }
+    case StructDecl(nameTok, parentTok, fields, methods, exported, isConst): {
+      w.open("struct", d.line, d.col);
+      w.sp(); w.s(exported ? "export" : "local");
+      w.sp(); w.s(isConst ? "const" : "mut");
+      w.sp(); w.tok(nameTok);
+      w.sp();
+      if (parentTok < 0) { w.s("-"); } else { w.tok(parentTok); }
+      w.s(" (");
+      for (i32 i = 0; i < fields.len(); i++) {
+        if (i > 0) { w.sp(); }
+        w.s("(field ");
+        w.s(fields[i].isConst ? "const " : "mut ");
+        w.tok(fields[i].nameTok);
+        w.sp();
+        printTy(w, fields[i].type);
+        w.out.push(')');
+      }
+      w.s(") (");
+      for (i32 i = 0; i < methods.len(); i++) {
+        if (i > 0) { w.sp(); }
+        w.s("(method ");
+        w.tok(methods[i].nameTok);
+        w.sp();
+        w.s(methods[i].isOverride ? "override" : "plain");
+        w.sp();
+        w.s(methods[i].hasThis ? (methods[i].thisConst ? "constthis" : "this") : "static");
+        w.sp();
+        printTy(w, methods[i].returnType);
+        printParams(w, methods[i].params);
+        printStmtList(w, methods[i].body);
+        w.out.push(')');
+      }
+      w.s("))");
+    }
+    case EnumDecl(nameTok, variants, exported): {
+      w.open("enum", d.line, d.col);
+      w.sp(); w.s(exported ? "export" : "local");
+      w.sp(); w.tok(nameTok);
+      w.s(" (");
+      for (i32 i = 0; i < variants.len(); i++) {
+        if (i > 0) { w.sp(); }
+        w.s("(variant ");
+        w.tok(variants[i].nameTok);
+        printParams(w, variants[i].fields);
+        w.out.push(')');
+      }
+      w.s("))");
+    }
+    case ConstDecl(nameTok, type, init, exported): {
+      w.open("const", d.line, d.col);
+      w.sp(); w.s(exported ? "export" : "local");
+      w.sp(); w.tok(nameTok);
+      w.sp(); printTy(w, type);
+      w.sp(); printExpr(w, init);
+      w.close();
+    }
+  }
+}
+
+export string printProgram(Pr w, Program prog) {
+  w.s("(program");
+  for (i32 i = 0; i < prog.decls.len(); i++) {
+    w.s("\n  ");
+    printDecl(w, prog.decls[i]);
+  }
+  w.s(")\n");
+  return w.out.toStr();
+}

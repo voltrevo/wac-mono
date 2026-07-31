@@ -3,8 +3,15 @@
 // wacCompile takes a path -> source map and does no I/O of its own, so someone
 // has to walk the import graph. That someone is here rather than in a test, so
 // the tests stay about gzip.
+//
+// The walk lexes rather than pattern-matching the raw text. A regex found import
+// specifiers inside comments and string literals too, which meant a file that merely
+// *described* an import — `// import { a } from "./m.wac"` in a doc comment — sent
+// the walker off to read a file that does not exist, with an error pointing at the
+// missing file rather than at the comment. Using the real lexer makes that class of
+// mistake impossible instead of merely unlikely.
 
-const IMPORT_RE = /\bimport\s*\{[^}]*\}\s*from\s*"([^"]+)"/g;
+import { wacLex } from "wac/wacLex.ts";
 
 /** Resolve `spec` relative to the directory of `fromPath`. */
 function resolveFrom(fromPath: string, spec: string): string {
@@ -23,6 +30,30 @@ function resolveFrom(fromPath: string, spec: string): string {
   return (absolute ? "/" : "") + parts.join("/");
 }
 
+/**
+ * The path of every `import ... from "..."` in `src`.
+ *
+ * Comments and string literals cannot contribute, because the lexer has already
+ * classified them. A malformed import contributes nothing and is left for the
+ * compiler to report properly.
+ */
+export function importPaths(src: string): string[] {
+  const { tokens } = wacLex(src);
+  const out: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i].kind !== "import") continue;
+    // Scan to this import's `from`. Stopping at `;` keeps a malformed import from
+    // consuming the one after it.
+    let j = i + 1;
+    while (j < tokens.length && tokens[j].kind !== "from" && tokens[j].kind !== ";") j++;
+    if (j < tokens.length && tokens[j].kind === "from" && tokens[j + 1]?.kind === "string") {
+      out.push(tokens[j + 1].text);
+      i = j + 1;
+    }
+  }
+  return out;
+}
+
 export async function wacFiles(entry: string): Promise<Map<string, string>> {
   const files = new Map<string, string>();
   const queue = [entry];
@@ -32,8 +63,8 @@ export async function wacFiles(entry: string): Promise<Map<string, string>> {
     if (files.has(path)) continue;
     const src = await Deno.readTextFile(path);
     files.set(path, src);
-    for (const m of src.matchAll(IMPORT_RE)) {
-      queue.push(resolveFrom(path, m[1]));
+    for (const spec of importPaths(src)) {
+      queue.push(resolveFrom(path, spec));
     }
   }
 

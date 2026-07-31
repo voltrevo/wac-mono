@@ -63,11 +63,17 @@ numbering has to be kept in sync with the harness by hand.
 
 ## Status
 
+**Rung 2 (parser) passes.** The AST it builds agrees with the reference node for
+node, positions included, on all 42 `.wac` files in the repo plus the language tour,
+and on 48 hand-written cases a working corpus cannot contain (every precedence level,
+every cast, `else if` chains, bare-statement `switch` bodies, trailing commas
+everywhere, char and string escapes, malformed types).
+
 **Rung 1 (lexer) passes.** Token for token, position for position, against the
 reference on 24 `.wac` files plus 31 adversarial cases the corpus cannot cover
 (unterminated everything, every escape, greedy operator runs, non-ASCII columns).
 
-Next: rung 2, the parser.
+Next: rung 3, the type checker.
 
 ## What rung 1 cost, in language terms
 
@@ -101,3 +107,55 @@ spans are a better token representation than strings anyway, and counting column
 UTF-16 code units inside `advance` reproduces the reference's positions exactly — so
 the non-ASCII divergence I expected to have to negotiate at rung 3 simply is not
 there.
+
+## What rung 2 cost, in language terms
+
+**The AST is sum types, and that was the point.** It began as a flat integer node
+pool, because wac had no alternative when it was written. Porting it to `enum` removed:
+
+- `pack2` / `unpackLo` / `unpackHi` / `none` — the whole bit-packing convention, which
+  existed only because a record held three fields and `for` and `func` needed four.
+- The single tag space, which forced `sCase` to be a statement and `dParam` a
+  declaration. Case clauses, params, fields, methods, variants and import items are
+  now ordinary structs.
+- Every untyped integer field access. `a`, `b` and `c` meant something different per
+  tag and nothing checked it; the comments were the only schema.
+
+`print.wac` is the payoff made concrete: 5 exhaustive `match` statements over 49
+variants, written in one pass and compiling first try. The same walk over the node
+pool would have been a chain of integer comparisons with a silent fall-through, and
+adding a variant would not have broken it.
+
+**Positions had to be exactly right, and guessing was expensive.** Three divergences
+cost real time, all of them the reference doing something not inferable from the
+grammar:
+
+- Each `[]` or `?` suffix on a type carries *its own* token position, not the base
+  type's. 34 of 42 corpus files disagreed on this alone.
+- A malformed type is reported and **substituted** with `i32` without consuming a
+  token. Advancing instead desynchronises the two parsers for the rest of the file.
+- After `is`, whether the right side is a type or a value is decided by **naming
+  convention** — a lowercase initial means a variable. A plausible approximation of
+  this read `(a is b)` in the tour and `byStr! is byBytes!` in the json tests as type
+  tests.
+
+Every one of those was found by the differential test and none would have been found
+by a test written from the same understanding as the implementation.
+
+**Thirteen growable-list structs, character-identical but for the type name.** A
+recursive-descent parser collects a list of every node type it builds, and with no
+generics each needs its own `push`/`take`. This is now the most-repeated cost of that
+gap in the repo, ahead of the four hand-written byte buffers.
+
+**Two bugs of my own, both from the language rather than the algorithm.** A
+zero-argument `XList()` default-constructs rather than calling the static `create()`,
+so every list started with a zero-length backing array that doubled to zero and trapped
+on first push. And `const` on a free-function parameter is not accepted — only `const
+this` on a method — so the read-only intent of the lookahead helpers cannot be stated.
+
+**Five compiler bugs found, all in `match`** — reported and fixed upstream in wac
+`08fedd2` and `2a5c1c1`. Four were statement walks that predated `match` and were
+never extended, so anything reachable only inside an arm was invisible to them; the
+fifth was `break` in an arm, which reaches the enclosing loop but which the return
+checker assumed did not. A sixth and seventh were enums resolved by name where
+identity was meant, which only two files declaring the same enum name could expose.

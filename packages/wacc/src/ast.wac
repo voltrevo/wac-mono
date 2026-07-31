@@ -1,263 +1,241 @@
-// The AST, as a flat pool of fixed-width records.
+// The wac AST, as sum types.
 //
-// The reference uses discriminated unions — 5 type variants, 17 expression
-// variants, 14 statement variants, 4 lvalue variants, each a distinct object shape.
-// wac has neither sum types nor generics, so the two available shapes are:
+// This file replaces a flat integer node pool. That pool was not a bad design —
+// real compilers use one deliberately, and it removed an allocation per node — but
+// it was chosen here because wac had no sum types, and the cost landed on every
+// line that touched a node rather than once at the definition:
 //
-//   a struct per variant, plus a base struct with a `kind` tag, plus a downcast at
-//   every use — 40 structs and an `as!` on every branch (what wac-json does); or
+//   * `a`, `b`, `c` meant something different per tag, and nothing checked it. The
+//     comments were the only schema.
+//   * Three fields was the hard limit, so `sFor` and `dFunc` packed two node indices
+//     into one i32 (`pack2`/`unpackLo`/`unpackHi`, with `none()` standing in for -1
+//     because -1 does not survive packing). Four references needed a bit-layout
+//     convention.
+//   * Everything shared one tag space, so `sCase` had to be a statement and `dParam`
+//     a declaration, though neither is one.
+//   * A missing case in a walk was silent.
 //
-//   one integer array holding fixed-width records, with children referenced by
-//   index.
+// All four are gone. `pack2`, `unpackLo`, `unpackHi` and `none` are deleted rather
+// than ported — the three-field limit was their only reason to exist. Case clauses,
+// parameters, fields and import items are now their own types instead of squatting
+// in a tag range. And `match` is exhaustive, so a walk that misses a variant does not
+// compile.
 //
-// This takes the second. It is not a workaround chosen for lack of anything better:
-// real compilers do this deliberately (Zig's AST, Roslyn's green trees) because it
-// removes an allocation per node and makes the whole tree one contiguous block. It
-// also makes the differential test easy, since dumping a pool is trivial.
-//
-// The cost is that every field access is an untyped integer offset. `a`, `b`, `c`
-// mean different things per tag, and nothing checks it — the comments below are the
-// only schema there is. That is the real price of no sum types, and it is paid on
-// every line that touches a node rather than once at the definition.
+// Positions live on the wrapper structs rather than being repeated in every variant:
+// `Expr` carries line and col, `Expr.kind` says what it is. That keeps 2 fields in
+// one place instead of 98 across 49 variants, and matches how the reference nests
+// its discriminant inside an object that always has a position.
 
-// ── Record layout ─────────────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
-/** i32s per node: tag, a, b, c, line, col. */
-export i32 nodeStride() { return 6; }
+export struct Ty {
+  TyKind kind;
+  i32 line;
+  i32 col;
+}
 
-// Field offsets within a record.
-export i32 fTag()  { return 0; }
-export i32 fA()    { return 1; }
-export i32 fB()    { return 2; }
-export i32 fC()    { return 3; }
-export i32 fLine() { return 4; }
-export i32 fCol()  { return 5; }
+export enum TyKind {
+  /** `i32`, `bool`, `string`, … — `tok` is the name token. */
+  Prim(i32 tok),
+  /** A named struct, enum or variant. */
+  Named(i32 tok),
+  Arr(Ty elem),
+  Nullable(Ty inner),
+  Funcref(Ty ret, Ty[] params),
+}
 
-// ── Tags ──────────────────────────────────────────────────────────────────────
-//
-// Numbered by category so a range check can classify a node without a table:
-// types 100+, expressions 200+, statements 300+, lvalues 400+, top level 500+.
-//
-// Field meanings are given per tag. `n:` is a node index, `t:` a token index,
-// `l:` a list handle (see below), `-` unused.
+export Ty tyPrim(i32 tok, i32 line, i32 col) {
+  return Ty(TyKind.Prim(tok), line, col);
+}
+export Ty tyNamed(i32 tok, i32 line, i32 col) {
+  return Ty(TyKind.Named(tok), line, col);
+}
+export Ty tyArr(Ty elem, i32 line, i32 col) {
+  return Ty(TyKind.Arr(elem), line, col);
+}
+export Ty tyNullable(Ty inner, i32 line, i32 col) {
+  return Ty(TyKind.Nullable(inner), line, col);
+}
+export Ty tyFuncref(Ty ret, Ty[] params, i32 line, i32 col) {
+  return Ty(TyKind.Funcref(ret, params), line, col);
+}
 
-// Types ------------------------------------------------------------------------
-/** a: token of the name, b: -, c: - */
-export i32 tPrim()     { return 100; }
-/** a: token of the name */
-export i32 tStruct()   { return 101; }
-/** a: n element type */
-export i32 tArray()    { return 102; }
-/** a: n inner type */
-export i32 tNullable() { return 103; }
-/** a: n return type, b: l param types */
-export i32 tFuncref()  { return 104; }
+// ── Expressions ───────────────────────────────────────────────────────────────
 
-// Expressions ------------------------------------------------------------------
-/** a: t literal token */
-export i32 eInt()     { return 200; }
-/** a: t literal token */
-export i32 eFloat()   { return 201; }
-/** a: t literal token */
-export i32 eString()  { return 202; }
-/** a: 1 for true, 0 for false */
-export i32 eBool()    { return 203; }
-export i32 eNull()    { return 204; }
-/** a: t identifier token */
-export i32 eIdent()   { return 205; }
-/** a: t operator token, b: n operand */
-export i32 eUnary()   { return 206; }
-/** a: t operator token, b: n left, c: n right */
-export i32 eBinary()  { return 207; }
-/** a: t cast operator token, b: n operand, c: n target type */
-export i32 eCast()    { return 208; }
-/** a: n operand, b: n type or -1, c: 1 when negated (`is not`) */
-export i32 eIs()      { return 209; }
-/** a: n condition, b: n then, c: n else */
-export i32 eTernary() { return 210; }
-/** a: n callee, b: l arguments */
-export i32 eCall()    { return 211; }
-/** a: n array, b: n index */
-export i32 eIndex()   { return 212; }
-/** a: n object, b: t field name token */
-export i32 eField()   { return 213; }
-/** a: n operand */
-export i32 eUnwrap()  { return 214; }
-/** a: n type, b: l positional args, c: l named initialisers or -1 */
-export i32 eConstruct() { return 215; }
-/** a: n lvalue, b: t operator token, c: 1 when prefix */
-export i32 eIncr()    { return 216; }
-/** a: n element type, b: n size or -1, c: l fixed elements */
-export i32 eArrNew()  { return 217; }
+export struct Expr {
+  ExprKind kind;
+  i32 line;
+  i32 col;
+}
 
-// Statements -------------------------------------------------------------------
-/** a: n type, b: t name token, c: n initialiser; const-ness in `d` is folded into the tag */
-export i32 sVar()      { return 300; }
-export i32 sVarConst() { return 301; }
-/** a: n lvalue, b: t operator token, c: n right-hand side */
-export i32 sAssign()   { return 302; }
-/** a: n lvalue, b: t operator token */
-export i32 sIncr()     { return 303; }
-/** a: n condition, b: l then block, c: n else branch or -1 */
-export i32 sIf()       { return 304; }
-/** a: n condition, b: l body */
-export i32 sWhile()    { return 305; }
-/** a: n init or -1, b: n condition or -1, c: packed (update, body) — see forParts */
-export i32 sFor()      { return 306; }
-/** a: l body, b: n condition */
-export i32 sDoWhile()  { return 307; }
-/** a: n subject, b: l cases */
-export i32 sSwitch()   { return 308; }
-/** a: n value or -1 */
-export i32 sReturn()   { return 309; }
-export i32 sBreak()    { return 310; }
-export i32 sContinue() { return 311; }
-export i32 sTrap()     { return 312; }
-/** a: l statements */
-export i32 sBlock()    { return 313; }
-/** a: n expression */
-export i32 sExpr()     { return 314; }
-/** a: n value or -1 for `default`, b: l statements */
-export i32 sCase()     { return 315; }
+/** A named argument in a struct literal: `Point(x: 1, y: 2)`. */
+export struct NamedArg {
+  i32 nameTok;
+  Expr value;
+}
 
-// Lvalues ----------------------------------------------------------------------
-/** a: t identifier token */
-export i32 lIdent()  { return 400; }
-/** a: n base, b: t field token */
-export i32 lField()  { return 401; }
-/** a: n base, b: n index */
-export i32 lIndex()  { return 402; }
-/** a: n base */
-export i32 lUnwrap() { return 403; }
-
-// Top level --------------------------------------------------------------------
-/** a: t path token, b: l items */
-export i32 dImport()     { return 500; }
-/** a: t name token, b: t alias token */
-export i32 dImportItem() { return 501; }
-/** a: t name token, b: n type */
-export i32 dParam()      { return 502; }
-/** a: t name token, b: n type, c: 1 when const */
-export i32 dField()       { return 503; }
-/** a: t name token, b: n return type, c: packed (params, body) */
-export i32 dFunc()        { return 504; }
-export i32 dFuncExport()  { return 505; }
-/** a: t name token, b: l members, c: packed (parent token, flags) */
-export i32 dStruct()      { return 506; }
-/** a: t name token, b: n return type, c: packed (params, body); flags in `line` sign */
-export i32 dMethod()      { return 507; }
-/** a: l declarations */
-export i32 dProgram()     { return 508; }
-
-// ── The pool ──────────────────────────────────────────────────────────────────
-
-/**
- * Nodes and lists in two integer arrays.
- *
- * `lists` holds runs of node indices; a list handle is an offset into it, with the
- * length stored at that offset and the elements after. Nodes reference lists by
- * handle, so a variable-arity node stays fixed width.
- *
- * Both arrays are grown by doubling. This is the fourth growable container in the
- * repo — after gzip's `Buf`, json's, and the lexer's flat token array — which is
- * the single most repeated cost of having no generics.
- */
-export struct Ast {
-  i32[] nodes;
-  i32 nodeCount;
-  i32[] lists;
-  i32 listLen;
-
-  Ast create() {
-    return Ast(i32[1024](), 0, i32[1024](), 0);
-  }
-
-  void growNodes(this) {
-    if ((this.nodeCount + 1) * nodeStride() <= this.nodes.len()) { return; }
-    i32[] next = i32[this.nodes.len() * 2]();
-    for (i32 i = 0; i < this.nodeCount * nodeStride(); i++) {
-      next[i] = this.nodes[i];
-    }
-    this.nodes = next;
-  }
-
-  /** Append a node, returning its index. */
-  i32 add(this, i32 tag, i32 a, i32 b, i32 c, i32 line, i32 col) {
-    this.growNodes();
-    i32 at = this.nodeCount * nodeStride();
-    this.nodes[at + fTag()] = tag;
-    this.nodes[at + fA()] = a;
-    this.nodes[at + fB()] = b;
-    this.nodes[at + fC()] = c;
-    this.nodes[at + fLine()] = line;
-    this.nodes[at + fCol()] = col;
-    this.nodeCount++;
-    return this.nodeCount - 1;
-  }
-
-  i32 field(const this, i32 node, i32 which) {
-    return this.nodes[node * nodeStride() + which];
-  }
-
-  i32 tag(const this, i32 node)  { return this.field(node, fTag()); }
-  i32 a(const this, i32 node)    { return this.field(node, fA()); }
-  i32 b(const this, i32 node)    { return this.field(node, fB()); }
-  i32 c(const this, i32 node)    { return this.field(node, fC()); }
-  i32 line(const this, i32 node) { return this.field(node, fLine()); }
-  i32 col(const this, i32 node)  { return this.field(node, fCol()); }
-
-  void setB(this, i32 node, i32 v) { this.nodes[node * nodeStride() + fB()] = v; }
-  void setC(this, i32 node, i32 v) { this.nodes[node * nodeStride() + fC()] = v; }
-
-  void growLists(this, i32 need) {
-    if (this.listLen + need <= this.lists.len()) { return; }
-    i32 cap = this.lists.len() * 2;
-    while (this.listLen + need > cap) { cap *= 2; }
-    i32[] next = i32[cap]();
-    for (i32 i = 0; i < this.listLen; i++) {
-      next[i] = this.lists[i];
-    }
-    this.lists = next;
-  }
-
+export enum ExprKind {
+  /** `tok` is the literal token; the value is read from the source span. */
+  IntLit(i32 tok),
+  FloatLit(i32 tok),
+  StrLit(i32 tok),
+  BoolLit(bool value),
+  NullLit,
+  Ident(i32 tok),
+  /** `op` is the operator token. */
+  Unary(i32 op, Expr operand),
+  Binary(i32 op, Expr left, Expr right),
+  /** One of `as`, `as!`, `as~`, `as@` — which is in `op`. */
+  Cast(i32 op, Expr operand, Ty target),
   /**
-   * Reserve a list of `count` slots, returning its handle.
+   * `x is T`, `x is null`, or `x is y` — reference identity against a value.
    *
-   * Two-step rather than one because the parser discovers elements as it goes: it
-   * collects into a scratch array, then commits. Committing copies, which is the
-   * price of not having a growable-list-of-lists.
+   * Which of the three is encoded by what is present: `target` for a type test,
+   * `other` for an identity test, neither for a null test. The reference stores the
+   * right side in one field of a union type; there is no union of a type and an
+   * expression here, so they are separate optional fields and at most one is set.
    */
-  i32 addList(this, i32[] items, i32 count) {
-    this.growLists(count + 1);
-    i32 handle = this.listLen;
-    this.lists[handle] = count;
-    for (i32 i = 0; i < count; i++) {
-      this.lists[handle + 1 + i] = items[i];
-    }
-    this.listLen += count + 1;
-    return handle;
-  }
+  Is(Expr left, Ty? target, Expr? other, bool negated),
+  Ternary(Expr cond, Expr then, Expr els),
+  Call(Expr callee, Expr[] args),
+  Index(Expr arr, Expr index),
+  Member(Expr obj, i32 nameTok),
+  /** `x!` — the non-null assertion. */
+  Unwrap(Expr operand),
+  /** `Point(1, 2)` or `Point(x: 1, y: 2)`; one of the two lists is empty. */
+  Construct(Ty ctype, Expr[] args, NamedArg[] named),
+  /** `++`/`--`; `prefix` distinguishes `++i` from `i++`. */
+  Incr(Lvalue target, i32 op, bool prefix),
+  /** `i32[n]()` or `i32[]{1, 2, 3}` — `size` and `elements` are exclusive. */
+  ArrNew(Ty elem, Expr? size, Expr[] elements),
+}
 
-  i32 listCount(const this, i32 handle) {
-    if (handle < 0) { return 0; }
-    return this.lists[handle];
-  }
+// ── Lvalues ───────────────────────────────────────────────────────────────────
+//
+// Kept a separate type from `Expr`, as in the reference: an assignment target is a
+// narrower grammar than an expression, and making that a type rather than a
+// validation pass means an unassignable target cannot be constructed.
 
-  i32 listAt(const this, i32 handle, i32 i) {
-    return this.lists[handle + 1 + i];
-  }
+export struct Lvalue {
+  LvalueKind kind;
+  i32 line;
+  i32 col;
+}
+
+export enum LvalueKind {
+  LIdent(i32 tok),
+  LField(Lvalue base, i32 nameTok),
+  LIndex(Lvalue base, Expr index),
+  LUnwrap(Lvalue base),
+}
+
+// ── Statements ────────────────────────────────────────────────────────────────
+
+export struct Stmt {
+  StmtKind kind;
+  i32 line;
+  i32 col;
 }
 
 /**
- * Two node indices in one field.
+ * One `case` or `default` clause.
  *
- * `sFor` and `dFunc` need four references and a record holds three, so two are
- * packed into 16 bits each. 65535 nodes per file is far beyond anything real —
- * `wacEmitFunc.ts`, the largest source here, is about 4000 nodes.
+ * Its own type now. In the pool it had to be tag `sCase` in the statement range,
+ * which meant every statement walk saw a node that is not a statement.
  */
-export i32 pack2(i32 lo, i32 hi) { return (lo & 0xFFFF) | ((hi & 0xFFFF) << 16); }
-export i32 unpackLo(i32 v) { return v & 0xFFFF; }
-export i32 unpackHi(i32 v) { return (v >>> 16) & 0xFFFF; }
+export struct Case {
+  /** null for `default`. */
+  Expr? value;
+  Stmt[] body;
+}
 
-/** -1 does not survive packing, so absence is this instead. */
-export i32 none() { return 0xFFFF; }
+/**
+ * One `case Pattern:` or `else:` arm of a `match`.
+ *
+ * `variantTok` is -1 for the `else` arm. A binding of `_` is a discard and is kept as
+ * the token so the printer can reproduce it.
+ */
+export struct Arm {
+  i32 variantTok;
+  i32[] bindingToks;
+  Stmt[] body;
+}
+
+export enum StmtKind {
+  /** `isConst` folds what the pool needed two tags for. */
+  Var(Ty type, i32 nameTok, Expr init, bool isConst),
+  Assign(Lvalue target, i32 op, Expr rhs),
+  IncrStmt(Lvalue target, i32 op),
+  /** `els` is empty for no else; an `else if` is a single-statement block. */
+  If(Expr cond, Stmt[] then, Stmt[] els),
+  While(Expr cond, Stmt[] body),
+  /** Four references, which the pool could not hold without bit-packing. */
+  For(Stmt? init, Expr? cond, Stmt? update, Stmt[] body),
+  DoWhile(Stmt[] body, Expr cond),
+  Switch(Expr subject, Case[] cases),
+  Return(Expr? value),
+  Break,
+  Continue,
+  Trap,
+  Match(Expr subject, Arm[] arms),
+  Block(Stmt[] body),
+  ExprStmt(Expr expr),
+}
+
+// ── Declarations ──────────────────────────────────────────────────────────────
+
+/** `import { a, b as c } from "./m.wac"` — one item. */
+export struct ImportItem {
+  i32 nameTok;
+  /** The same token as `nameTok` when there is no `as`. */
+  i32 aliasTok;
+}
+
+export struct Param {
+  i32 nameTok;
+  Ty type;
+}
+
+export struct Field {
+  i32 nameTok;
+  Ty type;
+  bool isConst;
+}
+
+export struct Method {
+  i32 nameTok;
+  Ty returnType;
+  Param[] params;
+  Stmt[] body;
+  bool isOverride;
+  /** A method without `this` is static. */
+  bool hasThis;
+  bool thisConst;
+}
+
+/** One variant of an `enum` declaration. Payload fields are shaped like params. */
+export struct Variant {
+  i32 nameTok;
+  Param[] fields;
+}
+
+export struct Decl {
+  DeclKind kind;
+  i32 line;
+  i32 col;
+}
+
+export enum DeclKind {
+  Import(i32 pathTok, ImportItem[] items),
+  Func(i32 nameTok, Ty returnType, Param[] params, Stmt[] body, bool exported),
+  /** `parentTok` is -1 when the struct has no parent. */
+  StructDecl(i32 nameTok, i32 parentTok, Field[] fields, Method[] methods,
+             bool exported, bool isConst),
+  EnumDecl(i32 nameTok, Variant[] variants, bool exported),
+  /** `[export] const <type> <name> = <expr>;` at file scope. */
+  ConstDecl(i32 nameTok, Ty type, Expr init, bool exported),
+}
+
+export struct Program {
+  Decl[] decls;
+}
