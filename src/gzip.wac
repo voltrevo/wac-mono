@@ -8,6 +8,7 @@
 
 import { Buf } from "./buf.wac";
 import { crc32 } from "./crc32.wac";
+import { deflateFixed } from "./deflate.wac";
 
 // A stored block's LEN field is 16 bits, so a block tops out at 65535 bytes.
 // Longer input becomes several blocks, only the last of which is marked final.
@@ -53,5 +54,18 @@ export i8[] gzipStored(i8[] data) {
 
   out.pushU32(crc32(data));
   out.pushU32(n);        // ISIZE, input size mod 2^32
+  return out.bytes();
+}
+
+/** Same container, but the payload is a fixed-Huffman deflate stream. */
+export i8[] gzipFixed(i8[] data) {
+  Buf out = Buf.create();
+  header(out);
+
+  i8[] body = deflateFixed(data);
+  out.pushBytes(body, 0, body.len());
+
+  out.pushU32(crc32(data));
+  out.pushU32(data.len());
   return out.bytes();
 }

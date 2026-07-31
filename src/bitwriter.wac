@@ -1,0 +1,59 @@
+// BitWriter — LSB-first bit packing, as DEFLATE requires.
+//
+// RFC 1951 section 3.1.1: data elements are packed starting with the least
+// significant bit of the element, but *Huffman codes* are packed starting with
+// the most significant bit of the code. Those are opposite orders, so they are
+// two separate methods here — conflating them is the classic way to produce a
+// stream that looks right and inflates to garbage.
+
+import { Buf } from "./buf.wac";
+
+export struct BitWriter {
+  Buf out;
+  i32 bitBuf;    // pending bits, LSB-first
+  i32 bitCount;  // how many bits of bitBuf are live (0..7 between calls)
+
+  BitWriter create() {
+    return BitWriter(Buf.create(), 0, 0);
+  }
+
+  // Write the low `count` bits of `value`, least significant bit first.
+  // `count` must be <= 16: bitCount is at most 7 on entry, so 16 + 7 = 23 bits
+  // stay well clear of the i32 sign bit.
+  void writeBits(this, i32 value, i32 count) {
+    i32 masked = value & ((1 << count) - 1);
+    this.bitBuf |= masked << this.bitCount;
+    this.bitCount += count;
+    while (this.bitCount >= 8) {
+      this.out.push(this.bitBuf & 0xFF);
+      this.bitBuf >>>= 8;
+      this.bitCount -= 8;
+    }
+  }
+
+  // Write a Huffman code of `count` bits, most significant bit of the code
+  // first — the reverse of writeBits.
+  void writeCode(this, i32 code, i32 count) {
+    for (i32 i = count - 1; i >= 0; i--) {
+      this.writeBits((code >>> i) & 1, 1);
+    }
+  }
+
+  // Pad to a byte boundary with zero bits. Needed before a stored block's
+  // LEN/NLEN and at the end of the final block.
+  void alignByte(this) {
+    if (this.bitCount > 0) {
+      this.out.push(this.bitBuf & 0xFF);
+      this.bitBuf = 0;
+      this.bitCount = 0;
+    }
+  }
+
+  i32 byteLen(const this) {
+    return this.out.len;
+  }
+
+  i8[] bytes(const this) {
+    return this.out.bytes();
+  }
+}

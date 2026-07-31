@@ -1,0 +1,148 @@
+// DEFLATE compressor (RFC 1951), fixed Huffman blocks (BTYPE=01).
+//
+// The fixed code is defined by the spec, so no code lengths are transmitted —
+// the decompressor already knows them. Compression comes entirely from LZ77:
+// repeated byte sequences become (length, distance) back-references instead of
+// literals.
+
+import { BitWriter } from "./bitwriter.wac";
+import { Tables } from "./tables.wac";
+
+// ── Fixed literal/length code, RFC 1951 section 3.2.6 ────────────────────────
+//
+//   symbol     bits   codes
+//     0-143      8    00110000  through 10111111   (0x30..0xBF)
+//   144-255      9    110010000 through 111111111  (0x190..0x1FF)
+//   256-279      7    0000000   through 0010111    (0x00..0x17)
+//   280-287      8    11000000  through 11000111   (0xC0..0xC7)
+
+i32 fixedLitBits(i32 sym) {
+  if (sym <= 143) { return 8; }
+  if (sym <= 255) { return 9; }
+  if (sym <= 279) { return 7; }
+  return 8;
+}
+
+i32 fixedLitCode(i32 sym) {
+  if (sym <= 143) { return 0x30 + sym; }
+  if (sym <= 255) { return 0x190 + (sym - 144); }
+  if (sym <= 279) { return sym - 256; }
+  return 0xC0 + (sym - 280);
+}
+
+void writeLit(BitWriter w, i32 sym) {
+  w.writeCode(fixedLitCode(sym), fixedLitBits(sym));
+}
+
+// ── Match finding ─────────────────────────────────────────────────────────────
+//
+// Hash chains: hash the 3 bytes at each position into a bucket, and keep a
+// singly-linked list per bucket, newest first. Searching a bucket walks back
+// through earlier positions with the same 3-byte prefix, which are the only
+// candidates that can start a match of the 3-byte minimum.
+
+i32 hashSize()  { return 32768; }  // 1 << 15, one bucket per distance
+i32 maxDist()   { return 32768; }  // RFC 1951: window is 32 KiB
+i32 maxMatch()  { return 258; }    // longest length the code can express
+i32 minMatch()  { return 3; }      // shorter than this costs more than literals
+i32 chainLimit() { return 128; }   // candidates per position, bounds the search
+
+i32 hash3(i8[] data, i32 pos) {
+  return ((data[pos] << 10) ^ (data[pos + 1] << 5) ^ data[pos + 2]) & 0x7FFF;
+}
+
+void insertHash(i8[] data, i32[] head, i32[] prev, i32 pos) {
+  i32 h = hash3(data, pos);
+  prev[pos] = head[h];
+  head[h] = pos;
+}
+
+/**
+ * Compress to a single final fixed-Huffman block.
+ *
+ * Greedy matching: at each position take the longest match found, otherwise
+ * emit a literal. No lazy evaluation — zlib defers a match by one byte to see
+ * if the next position does better, which gains a few percent and is a separate
+ * concern from getting the stream correct.
+ */
+export i8[] deflateFixed(i8[] data) {
+  BitWriter w = BitWriter.create();
+  Tables t = Tables.create();
+
+  w.writeBits(1, 1);   // BFINAL = 1, only block
+  w.writeBits(1, 2);   // BTYPE = 01, fixed Huffman
+
+  i32 n = data.len();
+  i32[] head = i32[hashSize()]();
+  for (i32 i = 0; i < hashSize(); i++) {
+    head[i] = -1;
+  }
+  i32[] prev = i32[n]();
+
+  i32 pos = 0;
+  while (pos < n) {
+    i32 bestLen = 0;
+    i32 bestDist = 0;
+
+    // Only look for a match if a minimum-length one could still fit.
+    if (pos + minMatch() <= n) {
+      i32 cand = head[hash3(data, pos)];
+      i32 chain = 0;
+      while (cand >= 0 && chain < chainLimit()) {
+        i32 dist = pos - cand;
+        if (dist > maxDist()) {
+          cand = -1;
+        } else {
+          i32 len = 0;
+          while (len < maxMatch() && pos + len < n
+                 && data[cand + len] == data[pos + len]) {
+            len++;
+          }
+          if (len > bestLen) {
+            bestLen = len;
+            bestDist = dist;
+          }
+          // Nothing can beat the maximum, so stop looking.
+          if (bestLen == maxMatch()) {
+            cand = -1;
+          } else {
+            cand = prev[cand];
+            chain++;
+          }
+        }
+      }
+    }
+
+    if (bestLen >= minMatch()) {
+      i32 li = t.lenIndex(bestLen);
+      writeLit(w, 257 + li);
+      if (t.lenExtra[li] > 0) {
+        w.writeBits(bestLen - t.lenBase[li], t.lenExtra[li]);
+      }
+      // Fixed distance codes are 5 bits and equal to the symbol number.
+      i32 di = t.distIndex(bestDist);
+      w.writeCode(di, 5);
+      if (t.distExtra[di] > 0) {
+        w.writeBits(bestDist - t.distBase[di], t.distExtra[di]);
+      }
+      // Every position the match covers still needs to be hashed, or later
+      // matches cannot reference into it.
+      for (i32 k = 0; k < bestLen; k++) {
+        if (pos + k + minMatch() <= n) {
+          insertHash(data, head, prev, pos + k);
+        }
+      }
+      pos += bestLen;
+    } else {
+      writeLit(w, data[pos]);
+      if (pos + minMatch() <= n) {
+        insertHash(data, head, prev, pos);
+      }
+      pos++;
+    }
+  }
+
+  writeLit(w, 256);    // end-of-block
+  w.alignByte();
+  return w.bytes();
+}
