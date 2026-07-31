@@ -1,0 +1,572 @@
+// The wac lexer, in wac. Port of wac/atoms/wac/wacLex.ts.
+//
+// Differences from the reference, both deliberate:
+//
+// A token holds a byte *span* into the source rather than its text. The reference
+// stores `text: string`; spans are cheaper and are what real compilers keep. Three
+// kinds have text that is computed rather than copied — string literals (the
+// reference stores the unescaped value), character literals (stored as the decimal
+// codepoint) and nothing else — so a consumer that wants the value calls
+// `tokenString` or `tokenCodepoint` rather than reading the span directly.
+//
+// Columns count UTF-16 code units, not bytes, so that positions match the reference
+// exactly on non-ASCII lines. `advance` does the accounting: a continuation byte
+// adds nothing, a 4-byte sequence adds two (it is a surrogate pair in UTF-16), and
+// everything else adds one.
+
+import {
+  kInt, kFloat, kString, kIdent, kEof,
+  kImport, kFrom, kExport, kStruct, kConst, kThis, kOverride,
+  kIf, kElse, kWhile, kFor, kDo, kSwitch, kCase, kDefault,
+  kBreak, kContinue, kReturn, kTrap, kTrue, kFalse, kNull,
+  kIs, kNot, kAs, kVoid, kFn,
+  kAsBang, kAsTilde, kAsAt,
+  kPlus, kMinus, kStar, kSlash, kPercent, kAssign, kEq, kNe,
+  kLt, kLe, kGt, kGe, kAndAnd, kOrOr, kBang, kAnd, kOr, kCaret, kTilde,
+  kShl, kShr, kShrU,
+  kPlusEq, kMinusEq, kStarEq, kSlashEq, kPercentEq,
+  kAndEq, kOrEq, kCaretEq, kShlEq, kShrEq, kShrUEq,
+  kInc, kDec,
+  kLparen, kRparen, kLbrace, kRbrace, kLbrack, kRbrack,
+  kSemi, kColon, kComma, kDot, kQuestion, kAt,
+} from "./kinds.wac";
+
+// ── Output ────────────────────────────────────────────────────────────────────
+//
+// Tokens come back as a flat i32 array of (kind, start, len, line, col) and errors
+// as (code, line, col). Not because that is nicer — a `Token[]` would be — but
+// because wac has no generics, so a growable array of structs means writing a third
+// container by hand after gzip's `Buf` and json's. Flat also means no growth at
+// all: a source of n bytes cannot produce more than n tokens, so the arrays are
+// sized once from the input.
+
+export i32 tokenStride() { return 5; }   // kind, start, len, line, col
+export i32 errorStride() { return 3; }   // code, line, col
+
+export struct Lexed {
+  i32[] tokens;
+  i32 tokenCount;      // tokens, not i32s
+  i32[] errors;
+  i32 errorCount;
+}
+
+// Error codes rather than messages: a message would mean building a string per
+// error, and the consumer renders these anyway.
+export i32 errUnexpectedChar()      { return 1; }
+export i32 errUnterminatedString()  { return 2; }
+export i32 errUnknownEscape()       { return 3; }
+export i32 errUnterminatedComment() { return 4; }
+export i32 errUnterminatedChar()    { return 5; }
+export i32 errEmptyChar()           { return 6; }
+export i32 errCharTooLong()         { return 7; }
+
+// ── Character classification ──────────────────────────────────────────────────
+//
+// Bytes, not codepoints: every character wac's grammar cares about is ASCII, and a
+// non-ASCII byte can only appear inside a string, a comment or an error.
+
+bool isDigit(i32 c)  { return c >= '0' && c <= '9'; }
+bool isHexDigit(i32 c) {
+  return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+bool isIdentStart(i32 c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+bool isIdentPart(i32 c) { return isIdentStart(c) || isDigit(c); }
+bool isSpace(i32 c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
+// Keyword matching by packing the span into an i64 and comparing integers.
+//
+// Comparing against a `string` literal is now possible — `string.toBytes` landed
+// mid-write — but it allocates a byte array per candidate, and this runs once per
+// identifier in the source. Packing is allocation free and every wac keyword is
+// 8 bytes or fewer, so each fits an i64 exactly.
+//
+// (Indexing a string still yields a one-character *string*, not a byte, so the
+// direct `src[i] != want[i]` comparison remains unavailable.)
+
+i64 packSpan(u8[] src, i32 start, i32 len) {
+  i64 v = 0 as i64;
+  for (i32 i = 0; i < len; i++) {
+    v = (v << 8) | (src[start + i] as i64);
+  }
+  return v;
+}
+
+i64 p2(i32 a, i32 b) { return ((a as i64) << 8) | (b as i64); }
+i64 p3(i32 a, i32 b, i32 c) { return (p2(a, b) << 8) | (c as i64); }
+i64 p4(i32 a, i32 b, i32 c, i32 d) { return (p3(a, b, c) << 8) | (d as i64); }
+i64 p5(i32 a, i32 b, i32 c, i32 d, i32 e) { return (p4(a, b, c, d) << 8) | (e as i64); }
+i64 p6(i32 a, i32 b, i32 c, i32 d, i32 e, i32 f) {
+  return (p5(a, b, c, d, e) << 8) | (f as i64);
+}
+i64 p7(i32 a, i32 b, i32 c, i32 d, i32 e, i32 f, i32 g) {
+  return (p6(a, b, c, d, e, f) << 8) | (g as i64);
+}
+i64 p8(i32 a, i32 b, i32 c, i32 d, i32 e, i32 f, i32 g, i32 h) {
+  return (p7(a, b, c, d, e, f, g) << 8) | (h as i64);
+}
+
+/** The keyword kind for an identifier span, or `kIdent` if it is not a keyword. */
+i32 keywordKind(u8[] src, i32 start, i32 len) {
+  if (len < 2 || len > 8) { return kIdent(); }
+  i64 v = packSpan(src, start, len);
+
+  if (len == 2) {
+    if (v == p2('i', 'f')) { return kIf(); }
+    if (v == p2('d', 'o')) { return kDo(); }
+    if (v == p2('i', 's')) { return kIs(); }
+    if (v == p2('a', 's')) { return kAs(); }
+    if (v == p2('f', 'n')) { return kFn(); }
+    return kIdent();
+  }
+  if (len == 3) {
+    if (v == p3('f', 'o', 'r')) { return kFor(); }
+    if (v == p3('n', 'o', 't')) { return kNot(); }
+    return kIdent();
+  }
+  if (len == 4) {
+    if (v == p4('e', 'l', 's', 'e')) { return kElse(); }
+    if (v == p4('c', 'a', 's', 'e')) { return kCase(); }
+    if (v == p4('t', 'r', 'u', 'e')) { return kTrue(); }
+    if (v == p4('n', 'u', 'l', 'l')) { return kNull(); }
+    if (v == p4('v', 'o', 'i', 'd')) { return kVoid(); }
+    if (v == p4('t', 'h', 'i', 's')) { return kThis(); }
+    if (v == p4('t', 'r', 'a', 'p')) { return kTrap(); }
+    if (v == p4('f', 'r', 'o', 'm')) { return kFrom(); }
+    return kIdent();
+  }
+  if (len == 5) {
+    if (v == p5('w', 'h', 'i', 'l', 'e')) { return kWhile(); }
+    if (v == p5('b', 'r', 'e', 'a', 'k')) { return kBreak(); }
+    if (v == p5('f', 'a', 'l', 's', 'e')) { return kFalse(); }
+    if (v == p5('c', 'o', 'n', 's', 't')) { return kConst(); }
+    return kIdent();
+  }
+  if (len == 6) {
+    if (v == p6('i', 'm', 'p', 'o', 'r', 't')) { return kImport(); }
+    if (v == p6('e', 'x', 'p', 'o', 'r', 't')) { return kExport(); }
+    if (v == p6('s', 't', 'r', 'u', 'c', 't')) { return kStruct(); }
+    if (v == p6('s', 'w', 'i', 't', 'c', 'h')) { return kSwitch(); }
+    if (v == p6('r', 'e', 't', 'u', 'r', 'n')) { return kReturn(); }
+    return kIdent();
+  }
+  if (len == 7) {
+    if (v == p7('d', 'e', 'f', 'a', 'u', 'l', 't')) { return kDefault(); }
+    return kIdent();
+  }
+  if (v == p8('c', 'o', 'n', 't', 'i', 'n', 'u', 'e')) { return kContinue(); }
+  if (v == p8('o', 'v', 'e', 'r', 'r', 'i', 'd', 'e')) { return kOverride(); }
+  return kIdent();
+}
+
+// ── Lexer ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Lexer state.
+ *
+ * Held in a struct rather than as locals because the reference's closures over
+ * `pos`/`line`/`col` have no equivalent: wac has no closures, so every helper takes
+ * the state explicitly.
+ */
+struct Lexer {
+  u8[] src;
+  i32 pos;
+  i32 line;
+  i32 col;
+
+  i32 peek(const this, i32 offset) {
+    i32 at = this.pos + offset;
+    if (at >= this.src.len()) { return -1; }   // -1 rather than 0: NUL is a real byte
+    return this.src[at];
+  }
+
+  /**
+   * Consume one byte, keeping `line` and `col` right.
+   *
+   * `col` counts UTF-16 code units so positions match the reference: continuation
+   * bytes (0x80..0xBF) add nothing, a 4-byte lead adds two because it becomes a
+   * surrogate pair, and anything else adds one.
+   */
+  i32 advance(this) {
+    i32 c = this.src[this.pos];
+    this.pos++;
+    if (c == '\n') {
+      this.line++;
+      this.col = 1;
+    } else if (c >= 0x80 && c < 0xC0) {
+      // continuation byte: part of a character already counted
+    } else if (c >= 0xF0) {
+      this.col += 2;
+    } else {
+      this.col++;
+    }
+    return c;
+  }
+
+  bool atEnd(const this) { return this.pos >= this.src.len(); }
+}
+
+// ── Emitting ──────────────────────────────────────────────────────────────────
+//
+// The output arrays are pre-sized and written by index, so these take the Lexed
+// value and mutate it rather than returning a new one.
+
+void emit(Lexed out, i32 kind, i32 start, i32 len, i32 line, i32 col) {
+  i32 at = out.tokenCount * tokenStride();
+  out.tokens[at] = kind;
+  out.tokens[at + 1] = start;
+  out.tokens[at + 2] = len;
+  out.tokens[at + 3] = line;
+  out.tokens[at + 4] = col;
+  out.tokenCount++;
+}
+
+void fail(Lexed out, i32 code, i32 line, i32 col) {
+  i32 at = out.errorCount * errorStride();
+  if (at + errorStride() > out.errors.len()) { return; }   // errors are capped
+  out.errors[at] = code;
+  out.errors[at + 1] = line;
+  out.errors[at + 2] = col;
+  out.errorCount++;
+}
+
+// ── Pieces ────────────────────────────────────────────────────────────────────
+
+void skipSpaceAndComments(Lexer lx, Lexed out) {
+  while (!lx.atEnd()) {
+    i32 c = lx.peek(0);
+    if (isSpace(c)) {
+      lx.advance();
+    } else if (c == '/' && lx.peek(1) == '/') {
+      while (!lx.atEnd() && lx.peek(0) != '\n') { lx.advance(); }
+    } else if (c == '/' && lx.peek(1) == '*') {
+      i32 startLine = lx.line;
+      i32 startCol = lx.col;
+      lx.advance();
+      lx.advance();
+      bool closed = false;
+      while (!lx.atEnd() && !closed) {
+        if (lx.peek(0) == '*' && lx.peek(1) == '/') {
+          lx.advance();
+          lx.advance();
+          closed = true;
+        } else {
+          lx.advance();
+        }
+      }
+      if (!closed) { fail(out, errUnterminatedComment(), startLine, startCol); }
+    } else {
+      return;
+    }
+  }
+}
+
+/**
+ * A string literal. The span kept is the whole literal including both quotes, so
+ * a consumer can re-scan the escapes; the reference stores the decoded value
+ * instead, and the differential test decodes the span to compare.
+ */
+void lexString(Lexer lx, Lexed out, i32 startLine, i32 startCol) {
+  i32 start = lx.pos;
+  lx.advance();                       // opening quote
+  bool closed = false;
+  while (!lx.atEnd() && !closed) {
+    i32 c = lx.peek(0);
+    if (c == '"') {
+      lx.advance();
+      closed = true;
+    } else if (c == '\\') {
+      lx.advance();
+      if (lx.atEnd()) { break; }
+      i32 esc = lx.advance();
+      if (esc != 'n' && esc != 't' && esc != 'r' && esc != '\\'
+          && esc != '"' && esc != '0' && esc != '\'') {
+        fail(out, errUnknownEscape(), startLine, startCol);
+      }
+    } else {
+      lx.advance();
+    }
+  }
+  if (!closed) { fail(out, errUnterminatedString(), startLine, startCol); }
+  emit(out, kString(), start, lx.pos - start, startLine, startCol);
+}
+
+/**
+ * A character literal, emitted as an `int` whose span is the literal. The
+ * reference emits the decimal codepoint as the token's text; the value is
+ * recovered from the span by `tokenCodepoint`.
+ */
+void lexChar(Lexer lx, Lexed out, i32 startLine, i32 startCol) {
+  i32 start = lx.pos;
+  lx.advance();                       // opening quote
+
+  if (lx.atEnd()) {
+    fail(out, errUnterminatedChar(), startLine, startCol);
+    emit(out, kInt(), start, lx.pos - start, startLine, startCol);
+    return;
+  }
+  if (lx.peek(0) == '\'') {
+    lx.advance();
+    fail(out, errEmptyChar(), startLine, startCol);
+    emit(out, kInt(), start, lx.pos - start, startLine, startCol);
+    return;
+  }
+
+  if (lx.peek(0) == '\\') {
+    lx.advance();
+    if (lx.atEnd()) {
+      fail(out, errUnterminatedChar(), startLine, startCol);
+      emit(out, kInt(), start, lx.pos - start, startLine, startCol);
+      return;
+    }
+    i32 esc = lx.advance();
+    if (esc != 'n' && esc != 't' && esc != 'r' && esc != '\\'
+        && esc != '"' && esc != '0' && esc != '\'') {
+      fail(out, errUnknownEscape(), startLine, startCol);
+    }
+  } else {
+    // One character, however many bytes it takes.
+    lx.advance();
+    while (!lx.atEnd() && lx.peek(0) >= 0x80 && lx.peek(0) < 0xC0) {
+      lx.advance();
+    }
+  }
+
+  if (lx.atEnd()) {
+    fail(out, errUnterminatedChar(), startLine, startCol);
+  } else if (lx.peek(0) == '\'') {
+    lx.advance();
+  } else {
+    // More than one character before the closing quote.
+    while (!lx.atEnd() && lx.peek(0) != '\'' && lx.peek(0) != '\n') { lx.advance(); }
+    if (!lx.atEnd() && lx.peek(0) == '\'') { lx.advance(); }
+    fail(out, errCharTooLong(), startLine, startCol);
+  }
+  emit(out, kInt(), start, lx.pos - start, startLine, startCol);
+}
+
+void lexNumber(Lexer lx, Lexed out, i32 startLine, i32 startCol) {
+  i32 start = lx.pos;
+
+  if (lx.peek(0) == '0' && (lx.peek(1) == 'x' || lx.peek(1) == 'X')) {
+    lx.advance();
+    lx.advance();
+    while (!lx.atEnd() && (isHexDigit(lx.peek(0)) || lx.peek(0) == '_')) { lx.advance(); }
+    emit(out, kInt(), start, lx.pos - start, startLine, startCol);
+    return;
+  }
+
+  while (!lx.atEnd() && (isDigit(lx.peek(0)) || lx.peek(0) == '_')) { lx.advance(); }
+
+  if (lx.peek(0) == '.' && isDigit(lx.peek(1))) {
+    lx.advance();
+    while (!lx.atEnd() && (isDigit(lx.peek(0)) || lx.peek(0) == '_')) { lx.advance(); }
+    if (lx.peek(0) == 'e' || lx.peek(0) == 'E') {
+      lx.advance();
+      if (lx.peek(0) == '+' || lx.peek(0) == '-') { lx.advance(); }
+      while (!lx.atEnd() && (isDigit(lx.peek(0)) || lx.peek(0) == '_')) { lx.advance(); }
+    }
+    emit(out, kFloat(), start, lx.pos - start, startLine, startCol);
+  } else {
+    emit(out, kInt(), start, lx.pos - start, startLine, startCol);
+  }
+}
+
+/**
+ * `as`, `as!`, `as~` and `as@` — the one place an identifier can grow a suffix, so
+ * it is handled where the identifier is recognised rather than with the operators.
+ */
+i32 identOrKeyword(Lexer lx, i32 start, i32 len) {
+  i32 kind = keywordKind(lx.src, start, len);
+  if (kind != kAs()) { return kind; }
+  i32 c = lx.peek(0);
+  if (c == '!') { lx.advance(); return kAsBang(); }
+  if (c == '~') { lx.advance(); return kAsTilde(); }
+  if (c == '@') { lx.advance(); return kAsAt(); }
+  return kAs();
+}
+
+// ── Operators ─────────────────────────────────────────────────────────────────
+//
+// One function per lead byte, longest match first. Split out from the main loop
+// because wac has no fallthrough and no multi-byte switch, so a single `switch`
+// over the lead byte with nested prefix tests is the shape that stays readable.
+
+/** The kind for an operator starting at the current position, consuming its bytes. */
+i32 lexOperator(Lexer lx) {
+  i32 c = lx.advance();
+
+  if (c == '+') {
+    if (lx.peek(0) == '+') { lx.advance(); return kInc(); }
+    if (lx.peek(0) == '=') { lx.advance(); return kPlusEq(); }
+    return kPlus();
+  }
+  if (c == '-') {
+    if (lx.peek(0) == '-') { lx.advance(); return kDec(); }
+    if (lx.peek(0) == '=') { lx.advance(); return kMinusEq(); }
+    return kMinus();
+  }
+  if (c == '*') {
+    if (lx.peek(0) == '=') { lx.advance(); return kStarEq(); }
+    return kStar();
+  }
+  if (c == '/') {
+    if (lx.peek(0) == '=') { lx.advance(); return kSlashEq(); }
+    return kSlash();
+  }
+  if (c == '%') {
+    if (lx.peek(0) == '=') { lx.advance(); return kPercentEq(); }
+    return kPercent();
+  }
+  if (c == '=') {
+    if (lx.peek(0) == '=') { lx.advance(); return kEq(); }
+    return kAssign();
+  }
+  if (c == '!') {
+    if (lx.peek(0) == '=') { lx.advance(); return kNe(); }
+    return kBang();
+  }
+  if (c == '<') {
+    if (lx.peek(0) == '<') {
+      lx.advance();
+      if (lx.peek(0) == '=') { lx.advance(); return kShlEq(); }
+      return kShl();
+    }
+    if (lx.peek(0) == '=') { lx.advance(); return kLe(); }
+    return kLt();
+  }
+  if (c == '>') {
+    if (lx.peek(0) == '>') {
+      lx.advance();
+      if (lx.peek(0) == '>') {
+        lx.advance();
+        if (lx.peek(0) == '=') { lx.advance(); return kShrUEq(); }
+        return kShrU();
+      }
+      if (lx.peek(0) == '=') { lx.advance(); return kShrEq(); }
+      return kShr();
+    }
+    if (lx.peek(0) == '=') { lx.advance(); return kGe(); }
+    return kGt();
+  }
+  if (c == '&') {
+    if (lx.peek(0) == '&') { lx.advance(); return kAndAnd(); }
+    if (lx.peek(0) == '=') { lx.advance(); return kAndEq(); }
+    return kAnd();
+  }
+  if (c == '|') {
+    if (lx.peek(0) == '|') { lx.advance(); return kOrOr(); }
+    if (lx.peek(0) == '=') { lx.advance(); return kOrEq(); }
+    return kOr();
+  }
+  if (c == '^') {
+    if (lx.peek(0) == '=') { lx.advance(); return kCaretEq(); }
+    return kCaret();
+  }
+  if (c == '~') { return kTilde(); }
+  if (c == '(') { return kLparen(); }
+  if (c == ')') { return kRparen(); }
+  if (c == '{') { return kLbrace(); }
+  if (c == '}') { return kRbrace(); }
+  if (c == '[') { return kLbrack(); }
+  if (c == ']') { return kRbrack(); }
+  if (c == ';') { return kSemi(); }
+  if (c == ':') { return kColon(); }
+  if (c == ',') { return kComma(); }
+  if (c == '.') { return kDot(); }
+  if (c == '?') { return kQuestion(); }
+  if (c == '@') { return kAt(); }
+
+  return -1;   // not an operator: the caller reports it
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+/**
+ * Tokenize `src`.
+ *
+ * Output arrays are sized from the input: at most one token per byte, and errors
+ * capped at a fraction of that since a pathological input would otherwise allocate
+ * a triple per byte.
+ */
+export Lexed lex(u8[] src) {
+  i32 n = src.len();
+  i32 maxErrors = n / 4 + 8;
+  Lexed out = Lexed(
+    i32[(n + 1) * tokenStride()](), 0,
+    i32[maxErrors * errorStride()](), 0
+  );
+  Lexer lx = Lexer(src, 0, 1, 1);
+
+  while (true) {
+    skipSpaceAndComments(lx, out);
+    if (lx.atEnd()) { break; }
+
+    i32 startLine = lx.line;
+    i32 startCol = lx.col;
+    i32 c = lx.peek(0);
+
+    if (c == '"') {
+      lexString(lx, out, startLine, startCol);
+    } else if (c == '\'') {
+      lexChar(lx, out, startLine, startCol);
+    } else if (isDigit(c)) {
+      lexNumber(lx, out, startLine, startCol);
+    } else if (isIdentStart(c)) {
+      i32 start = lx.pos;
+      while (!lx.atEnd() && isIdentPart(lx.peek(0))) { lx.advance(); }
+      i32 len = lx.pos - start;
+      i32 kind = identOrKeyword(lx, start, len);
+      // The cast suffixes lengthen the span, so it is measured after.
+      emit(out, kind, start, lx.pos - start, startLine, startCol);
+    } else {
+      i32 start = lx.pos;
+      i32 kind = lexOperator(lx);
+      if (kind < 0) {
+        fail(out, errUnexpectedChar(), startLine, startCol);
+      } else {
+        emit(out, kind, start, lx.pos - start, startLine, startCol);
+      }
+    }
+  }
+
+  emit(out, kEof(), n, 0, lx.line, lx.col);
+  return out;
+}
+
+// ── Reading a token's value ───────────────────────────────────────────────────
+
+/** The source text of a token's span. */
+export string tokenText(u8[] src, i32 start, i32 len) {
+  u8[] slice = u8[len]();
+  for (i32 i = 0; i < len; i++) {
+    slice[i] = src[start + i];
+  }
+  return string.fromBytes(slice);
+}
+
+// ── Flat accessors for the host ───────────────────────────────────────────────
+//
+// bindgen cannot marshal a struct, so the host gets the arrays directly. Trimmed to
+// the used length, since `lex` over-allocates from the source size.
+
+export i32[] lexTokens(u8[] src) {
+  Lexed r = lex(src);
+  i32 n = r.tokenCount * tokenStride();
+  i32[] out = i32[n]();
+  for (i32 i = 0; i < n; i++) {
+    out[i] = r.tokens[i];
+  }
+  return out;
+}
+
+export i32[] lexErrors(u8[] src) {
+  Lexed r = lex(src);
+  i32 n = r.errorCount * errorStride();
+  i32[] out = i32[n]();
+  for (i32 i = 0; i < n; i++) {
+    out[i] = r.errors[i];
+  }
+  return out;
+}

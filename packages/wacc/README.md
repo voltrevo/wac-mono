@@ -55,5 +55,41 @@ numbering has to be kept in sync with the harness by hand.
 
 ## Status
 
-Rung 1 not yet started. Nothing here is wired into `deno task test` until a rung
-passes its differential test.
+**Rung 1 (lexer) passes.** Token for token, position for position, against the
+reference on 24 `.wac` files plus 31 adversarial cases the corpus cannot cover
+(unterminated everything, every escape, greedy operator runs, non-ASCII columns).
+
+Next: rung 2, the parser.
+
+## What rung 1 cost, in language terms
+
+Worth recording precisely, since measuring this is the point.
+
+**83 token kinds became 83 zero-argument functions** (`kinds.wac`, 264 lines) with
+no module-level constants. The numbering has to match the reference's union order,
+so the test derives that order from `wacLex.ts` at run time rather than trusting a
+copy — a hand-synced enum would drift silently.
+
+**Tokens are flat `i32` quintuples, not a `Token[]`.** A growable array of structs
+means writing a container by hand, and gzip and json have already each written one.
+Flattening also removed growth entirely: a source of n bytes yields at most n
+tokens, so the array is sized once.
+
+**Keyword matching packs bytes into an `i64`.** Indexing a `string` yields a
+one-character string rather than a byte, so `src[i] == want[i]` does not typecheck.
+`string.toBytes` landed mid-write and makes the direct version possible, but it
+allocates per candidate and this runs once per identifier.
+
+**No closures**, so the reference's captured `pos`/`line`/`col` become a `Lexer`
+struct threaded through every helper. Mechanical, and arguably clearer.
+
+**One compiler bug found and fixed** (`wac` 13e83cc): casting a packed array element
+to a wider type emitted no widening at all — `bytes[0] as i64` was invalid wasm for
+every packed type. Found because packing bytes into an i64 is the natural way to
+compare keywords.
+
+The two design worries from before writing any code both turned out fine. Byte
+spans are a better token representation than strings anyway, and counting columns in
+UTF-16 code units inside `advance` reproduces the reference's positions exactly — so
+the non-ASCII divergence I expected to have to negotiate at rung 3 simply is not
+there.

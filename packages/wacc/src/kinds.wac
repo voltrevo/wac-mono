@@ -1,0 +1,264 @@
+// Token kinds, as integers.
+//
+// The numbering is the declaration order of `TokenKind` in the reference lexer's
+// union (`wac/atoms/wac/wacLex.ts`). The test harness derives the same order from
+// that file at run time rather than hardcoding it, so if the union is reordered the
+// differential test fails loudly instead of silently comparing the wrong names.
+//
+// Every one of these is a zero-argument function because wac has no module-level
+// constants. An 83-variant enum therefore costs 83 declarations — the clearest
+// measurement so far of that gap, and the reason this file exists at all.
+
+
+/** `int` */
+export i32 kInt() { return 0; }
+
+/** `float` */
+export i32 kFloat() { return 1; }
+
+/** `string` */
+export i32 kString() { return 2; }
+
+/** `bool` */
+export i32 kBool() { return 3; }
+
+/** `ident` */
+export i32 kIdent() { return 4; }
+
+/** `import` */
+export i32 kImport() { return 5; }
+
+/** `from` */
+export i32 kFrom() { return 6; }
+
+/** `export` */
+export i32 kExport() { return 7; }
+
+/** `struct` */
+export i32 kStruct() { return 8; }
+
+/** `const` */
+export i32 kConst() { return 9; }
+
+/** `this` */
+export i32 kThis() { return 10; }
+
+/** `override` */
+export i32 kOverride() { return 11; }
+
+/** `if` */
+export i32 kIf() { return 12; }
+
+/** `else` */
+export i32 kElse() { return 13; }
+
+/** `while` */
+export i32 kWhile() { return 14; }
+
+/** `for` */
+export i32 kFor() { return 15; }
+
+/** `do` */
+export i32 kDo() { return 16; }
+
+/** `switch` */
+export i32 kSwitch() { return 17; }
+
+/** `case` */
+export i32 kCase() { return 18; }
+
+/** `default` */
+export i32 kDefault() { return 19; }
+
+/** `break` */
+export i32 kBreak() { return 20; }
+
+/** `continue` */
+export i32 kContinue() { return 21; }
+
+/** `return` */
+export i32 kReturn() { return 22; }
+
+/** `trap` */
+export i32 kTrap() { return 23; }
+
+/** `true` */
+export i32 kTrue() { return 24; }
+
+/** `false` */
+export i32 kFalse() { return 25; }
+
+/** `null` */
+export i32 kNull() { return 26; }
+
+/** `is` */
+export i32 kIs() { return 27; }
+
+/** `not` */
+export i32 kNot() { return 28; }
+
+/** `as` */
+export i32 kAs() { return 29; }
+
+/** `void` */
+export i32 kVoid() { return 30; }
+
+/** `fn` */
+export i32 kFn() { return 31; }
+
+/** `as!` */
+export i32 kAsBang() { return 32; }
+
+/** `as~` */
+export i32 kAsTilde() { return 33; }
+
+/** `as@` */
+export i32 kAsAt() { return 34; }
+
+/** `+` */
+export i32 kPlus() { return 35; }
+
+/** `-` */
+export i32 kMinus() { return 36; }
+
+/** `*` */
+export i32 kStar() { return 37; }
+
+/** `/` */
+export i32 kSlash() { return 38; }
+
+/** `%` */
+export i32 kPercent() { return 39; }
+
+/** `=` */
+export i32 kAssign() { return 40; }
+
+/** `==` */
+export i32 kEq() { return 41; }
+
+/** `!=` */
+export i32 kNe() { return 42; }
+
+/** `<` */
+export i32 kLt() { return 43; }
+
+/** `<=` */
+export i32 kLe() { return 44; }
+
+/** `>` */
+export i32 kGt() { return 45; }
+
+/** `>=` */
+export i32 kGe() { return 46; }
+
+/** `&&` */
+export i32 kAndAnd() { return 47; }
+
+/** `||` */
+export i32 kOrOr() { return 48; }
+
+/** `!` */
+export i32 kBang() { return 49; }
+
+/** `&` */
+export i32 kAnd() { return 50; }
+
+/** `|` */
+export i32 kOr() { return 51; }
+
+/** `^` */
+export i32 kCaret() { return 52; }
+
+/** `~` */
+export i32 kTilde() { return 53; }
+
+/** `<<` */
+export i32 kShl() { return 54; }
+
+/** `>>` */
+export i32 kShr() { return 55; }
+
+/** `>>>` */
+export i32 kShrU() { return 56; }
+
+/** `+=` */
+export i32 kPlusEq() { return 57; }
+
+/** `-=` */
+export i32 kMinusEq() { return 58; }
+
+/** `*=` */
+export i32 kStarEq() { return 59; }
+
+/** `/=` */
+export i32 kSlashEq() { return 60; }
+
+/** `%=` */
+export i32 kPercentEq() { return 61; }
+
+/** `&=` */
+export i32 kAndEq() { return 62; }
+
+/** `|=` */
+export i32 kOrEq() { return 63; }
+
+/** `^=` */
+export i32 kCaretEq() { return 64; }
+
+/** `<<=` */
+export i32 kShlEq() { return 65; }
+
+/** `>>=` */
+export i32 kShrEq() { return 66; }
+
+/** `>>>=` */
+export i32 kShrUEq() { return 67; }
+
+/** `++` */
+export i32 kInc() { return 68; }
+
+/** `--` */
+export i32 kDec() { return 69; }
+
+/** `(` */
+export i32 kLparen() { return 70; }
+
+/** `)` */
+export i32 kRparen() { return 71; }
+
+/** `{` */
+export i32 kLbrace() { return 72; }
+
+/** `}` */
+export i32 kRbrace() { return 73; }
+
+/** `[` */
+export i32 kLbrack() { return 74; }
+
+/** `]` */
+export i32 kRbrack() { return 75; }
+
+/** `;` */
+export i32 kSemi() { return 76; }
+
+/** `:` */
+export i32 kColon() { return 77; }
+
+/** `,` */
+export i32 kComma() { return 78; }
+
+/** `.` */
+export i32 kDot() { return 79; }
+
+/** `?` */
+export i32 kQuestion() { return 80; }
+
+/** `@` */
+export i32 kAt() { return 81; }
+
+/** `eof` */
+export i32 kEof() { return 82; }
+
+
+/** How many kinds there are, for bounds checks and table sizing. */
+export i32 kindCount() { return 83; }
