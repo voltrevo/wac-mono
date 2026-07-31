@@ -13,7 +13,9 @@
 
 import { T } from "../../../wactest/src/assert.wac";
 import { JsonValue, JsonNumber, JsonString, JsonArray, JsonObject, bytesEqual } from "../../src/value.wac";
-import { Parser, parseDocument, hexDigit, scaleByPow10, ERR_NONE, ERR_TRAILING, ERR_CONTROL } from "../../src/parse.wac";
+import { writeValue } from "../../src/stringify.wac";
+import { Buf } from "../../../bytes/src/buf.wac";
+import { Parser, parseDocument, hexDigit, ERR_NONE, ERR_TRAILING, ERR_CONTROL } from "../../src/parse.wac";
 
 JsonValue? parseStr(string src) {
   // `string.toBytes()` replaced a 40-line ASCII lookup table here. The table
@@ -47,22 +49,6 @@ export string test_bytes_equal() {
   t.isFalse(bytesEqual(u8[](1, 2), u8[](1, 2, 3)), "prefix is not equal");
   t.isFalse(bytesEqual(u8[](1, 2, 3), u8[](1, 2, 4)), "last byte differs");
   t.isFalse(bytesEqual(u8[](1), u8[0]()), "one empty");
-  return t.report();
-}
-
-export string test_scale_by_pow10() {
-  T t = T.create();
-  // No float assertion in wactest — with no float-to-string there is no way to
-  // put the actual value in a message — so these compare through isTrue.
-  t.isTrue(scaleByPow10(1.0, 0) == 1.0, "10^0 is identity");
-  t.isTrue(scaleByPow10(1.5, 2) == 150.0, "1.5e2");
-  t.isTrue(scaleByPow10(15.0, -1) == 1.5, "15e-1");
-  t.isTrue(scaleByPow10(1.0, 22) == 1.0e22, "the largest exact power");
-  t.isTrue(scaleByPow10(1.0, 23) == 1.0e23, "one past the exact table");
-  t.isTrue(scaleByPow10(0.0, 999) == 0.0, "zero scales to zero, not NaN");
-  t.isTrue(scaleByPow10(-0.0, 999) == 0.0, "negative zero likewise");
-  t.isTrue(scaleByPow10(1.0, 400) > 1.0e300, "overflow goes to infinity");
-  t.isTrue(scaleByPow10(1.0, -400) == 0.0, "underflow goes to zero");
   return t.report();
 }
 
@@ -234,5 +220,40 @@ export string test_error_codes_and_positions() {
   t.isTrue(parseDocument(p3) is not null, "valid input succeeds");
   t.eqI32(p3.err, ERR_NONE(), "no error recorded");
 
+  return t.report();
+}
+
+// ── Serializing a tree that was never parsed ─────────────────────────────────
+
+export string test_hand_built_tree_serializes() {
+  T t = T.create();
+  // The gap this closes: before packages/fmt there was no float-to-string, so a
+  // JsonNumber with no source span could not be written at all.
+  JsonObject o = JsonObject.create();
+  o.push("n".toBytes(), JsonNumber.ofValue(1.5));
+  o.push("big".toBytes(), JsonNumber.ofValue(1.0e21));
+  o.push("small".toBytes(), JsonNumber.ofValue(0.1));
+  JsonArray a = JsonArray.create();
+  a.push(JsonNumber.ofValue(0.0));
+  a.push(JsonNumber.ofValue(-2.25));
+  o.push("xs".toBytes(), a);
+
+  Buf out = Buf.create();
+  writeValue(out, o);
+  t.eqStr(out.toStr(),
+    "{\"n\":1.5,\"big\":1e+21,\"small\":0.1,\"xs\":[0,-2.25]}",
+    "every number is formatted to its shortest form");
+  return t.report();
+}
+
+export string test_parsed_numbers_keep_their_span() {
+  T t = T.create();
+  // The other half of the rule: a parsed number is written back verbatim, so
+  // `1e2` does not become `100` and `-0` keeps its sign.
+  JsonValue? v = parseStr("[1e2,-0,1.50]");
+  t.isTrue(v is not null, "parses");
+  Buf out = Buf.create();
+  writeValue(out, v!);
+  t.eqStr(out.toStr(), "[1e2,-0,1.50]", "spans are preserved exactly");
   return t.report();
 }

@@ -29,8 +29,8 @@ void header(Buf out) {
 // aligns to a byte boundary, LEN / ~LEN and the raw bytes.
 void storedBlock(Buf out, u8[] data, i32 start, i32 count, bool isFinal) {
   out.push(isFinal ? 1 : 0);
-  out.pushU16(count);
-  out.pushU16((~count) & 0xFFFF);
+  out.pushU16(count as@ u32);
+  out.pushU16(((~count) & 0xFFFF) as@ u32);
   out.pushBytes(data, start, count);
 }
 
@@ -40,12 +40,12 @@ void storedBlock(Buf out, u8[] data, i32 start, i32 count, bool isFinal) {
  * The CRC is a parameter rather than computed here, so a caller comparing several
  * block types checksums the payload once instead of once per attempt.
  */
-u8[] container(u8[] body, i32 crc, i32 isize) {
+u8[] container(u8[] body, u32 crc, i32 isize) {
   Buf out = Buf.create();
   header(out);
   out.pushBytes(body, 0, body.len());
   out.pushU32(crc);
-  out.pushU32(isize);
+  out.pushU32(isize as@ u32);
   return out.bytes();
 }
 
@@ -75,12 +75,12 @@ void storedInto(Buf out, u8[] data) {
 }
 
 /** A complete stored-block gzip member, assembled in one pass. */
-u8[] storedContainer(u8[] data, i32 crc) {
+u8[] storedContainer(u8[] data, u32 crc) {
   Buf out = Buf.create();
   header(out);
   storedInto(out, data);
   out.pushU32(crc);
-  out.pushU32(data.len());
+  out.pushU32(data.len() as@ u32);
   return out.bytes();
 }
 
@@ -113,7 +113,7 @@ i32 smallInput() { return 4096; }
  * outcome a compressor should never produce.
  */
 export u8[] gzipBest(u8[] data) {
-  i32 crc = crc32(data);
+  u32 crc = crc32(data);
   i32 n = data.len();
 
   u8[] best = container(deflateDynamic(data), crc, n);

@@ -9,6 +9,7 @@
 
 import { JsonValue, JsonBool, JsonNumber, JsonString, JsonArray, JsonObject, jsonNull } from "./value.wac";
 import { Buf } from "../../bytes/src/buf.wac";
+import { atofSpan } from "../../fmt/src/atof.wac";
 
 export i32 ERR_NONE()         { return 0; }
 export i32 ERR_UNEXPECTED()   { return 1; }  // wrong byte for the position
@@ -19,6 +20,7 @@ export i32 ERR_ESCAPE()       { return 5; }  // bad \ escape
 export i32 ERR_CONTROL()      { return 6; }  // raw control byte in a string
 export i32 ERR_TRAILING()     { return 7; }  // non-whitespace after the value
 export i32 ERR_DEPTH()        { return 8; }  // nesting limit exceeded
+export i32 ERR_UTF8()         { return 9; }  // malformed UTF-8 inside a string
 
 // Bounded so a hostile input cannot exhaust the wasm stack. Real JSON is
 // nowhere near this deep.
@@ -195,9 +197,60 @@ export struct Parser {
       }
       // RFC 8259: unescaped bytes below ' ' are not allowed in a string.
       if (c < ' ') { this.fail(ERR_CONTROL()); return null; }
-      out.push(c);
-      this.pos++;
+      if (c < 0x80) {
+        out.push(c);
+        this.pos++;
+        continue;
+      }
+      // Non-ASCII: the whole sequence is validated and copied together. JSON text
+      // must be UTF-8, and a byte above 0x7F can only appear here — outside a
+      // string every legal byte is ASCII, so a bad one already fails structurally.
+      i32 seq = this.utf8SeqLen();
+      if (seq < 0) { this.fail(ERR_UTF8()); return null; }
+      for (i32 k = 0; k < seq; k++) { out.push(this.src[this.pos + k]); }
+      this.pos += seq;
     }
+  }
+
+  /**
+   * Length of the well-formed UTF-8 sequence at the cursor, or -1.
+   *
+   * Rejects what RFC 3629 excludes as well as what it never defined: overlong
+   * encodings (which would let a quote or a NUL hide inside a multi-byte form),
+   * the surrogate range D800-DFFF, which has no UTF-8 encoding, and anything above
+   * U+10FFFF. A length-only check waves all three through.
+   */
+  i32 utf8SeqLen(const this) {
+    i32 n = this.src.len();
+    i32 b0 = this.src[this.pos];
+
+    if (b0 < 0xC2) { return -1; }          // continuation byte, or an overlong lead
+
+    i32 need = 0;
+    i32 lo = 0x80;
+    i32 hi = 0xBF;
+    if (b0 <= 0xDF) {
+      need = 1;
+    } else if (b0 <= 0xEF) {
+      need = 2;
+      if (b0 == 0xE0) { lo = 0xA0; }       // below this is overlong
+      if (b0 == 0xED) { hi = 0x9F; }       // above this is the surrogate range
+    } else if (b0 <= 0xF4) {
+      need = 3;
+      if (b0 == 0xF0) { lo = 0x90; }       // below this is overlong
+      if (b0 == 0xF4) { hi = 0x8F; }       // above this is past U+10FFFF
+    } else {
+      return -1;                           // F5..FF encode nothing
+    }
+
+    if (this.pos + need >= n) { return -1; }
+    i32 c1 = this.src[this.pos + 1];
+    if (c1 < lo || c1 > hi) { return -1; }
+    for (i32 i = 2; i <= need; i++) {
+      i32 ci = this.src[this.pos + i];
+      if (ci < 0x80 || ci > 0xBF) { return -1; }
+    }
+    return need + 1;
   }
 
   bool readEscape(this, Buf out) {
@@ -279,18 +332,11 @@ export struct Parser {
 
   // number = '-'? ('0' | [1-9][0-9]*) ('.' [0-9]+)? ([eE] [+-]? [0-9]+)?
   //
-  // Significant digits accumulate into an i64 with a decimal exponent, then one
-  // scaling gives the f64. Exact while the mantissa stays under 2^53 and the
-  // exponent within the exactly-representable powers of ten; beyond that it is
-  // correctly rounded only to within an ulp or so. A conformant strtod needs
-  // wide-integer fallback, which is its own project.
+  // This only validates the syntax and finds the span's extent. Converting the
+  // span to an f64 belongs to packages/fmt, which does it exactly.
   JsonValue? parseNumber(this) {
     i32 start = this.pos;
-    bool neg = false;
-    if (this.peek() == '-') { neg = true; this.pos++; }
-    i64 mant = 0 as i64;
-    i32 digits = 0;      // significant digits taken into mant
-    i32 exp10 = 0;       // decimal point offset to apply to mant
+    if (this.peek() == '-') { this.pos++; }
     bool any = false;
 
     i32 c = this.peek();
@@ -306,15 +352,6 @@ export struct Parser {
         if (d < '0' || d > '9') { break; }
         this.pos++;
         any = true;
-        if (digits < 18) {
-          mant = mant * (10 as i64) + ((d - '0') as i64);
-          digits++;
-        } else {
-          // Past what an i64 holds without wrapping — 18 digits always fit, 19
-          // sometimes do not, and wac wraps silently with no checked add. The
-          // digit still moves the magnitude.
-          exp10++;
-        }
       }
     } else {
       this.fail(ERR_NUMBER());
@@ -330,13 +367,6 @@ export struct Parser {
         if (d < '0' || d > '9') { break; }
         this.pos++;
         fracDigits++;
-        if (digits < 18) {
-          mant = mant * (10 as i64) + ((d - '0') as i64);
-          digits++;
-          exp10--;
-        }
-        // Digits beyond 19 are below the f64's resolution; dropping them is
-        // what rounding would do anyway.
       }
       if (fracDigits == 0) { this.fail(ERR_NUMBER()); return null; }
     }
@@ -344,26 +374,23 @@ export struct Parser {
     i32 e = this.peek();
     if (e == 'e' || e == 'E') {                          // e E
       this.pos++;
-      bool expNeg = false;
       i32 s = this.peek();
-      if (s == '+') { this.pos++; }
-      else if (s == '-') { expNeg = true; this.pos++; }
+      if (s == '+' || s == '-') { this.pos++; }
       i32 expDigits = 0;
-      i32 expVal = 0;
       while (true) {
         i32 d = this.peek();
         if (d < '0' || d > '9') { break; }
         this.pos++;
         expDigits++;
-        // Clamp: past this the result is already 0 or infinity.
-        if (expVal < 100000) { expVal = expVal * 10 + (d - '0'); }
       }
       if (expDigits == 0) { this.fail(ERR_NUMBER()); return null; }
-      if (expNeg) { exp10 -= expVal; } else { exp10 += expVal; }
     }
 
-    f64 value = scaleByPow10(mant as~ f64, exp10);
-    if (neg) { value = -value; }
+    // The span is now known to be a well-formed JSON number, and the conversion is
+    // packages/fmt's problem. It is correctly rounded — the double nearest the
+    // decimal, ties to even — where the accumulate-and-scale this replaced was
+    // exact only 72% of the time and up to 2 ulp out otherwise.
+    f64 value = atofSpan(this.src, start, this.pos);
 
     // Keep the source span: it lets the serializer round-trip a number without
     // a shortest-representation float formatter, which wac does not have.
@@ -380,91 +407,6 @@ export i32 hexDigit(i32 b) {
   if (b >= 'a' && b <= 'f') { return b - 'a' + 10; }   // a-f
   if (b >= 'A' && b <= 'F') { return b - 'A' + 10; }   // A-F
   return -1;
-}
-
-// 10^e applied to a mantissa.
-//
-// Powers up to 1e22 are exactly representable in an f64, so one multiply by a
-// table entry is correctly rounded — that case is exact whenever the mantissa
-// is also under 2^53. Past 1e22 the power is decomposed as 10^(22k + r) so the
-// result costs three roundings rather than one per factor of 1e22.
-//
-// It is still not a correctly-rounded conversion. Being exact for every input
-// needs either 128-bit intermediates (Eisel-Lemire) or a big-decimal fallback,
-// and wac's widest integer is i64. See README for the measured error.
-export f64 scaleByPow10(f64 m, i32 e) {
-  if (e == 0) { return m; }
-  // Zero scales to itself, and short-circuiting keeps 0 * infinity (NaN) out of
-  // the overflow path for inputs like "0e999".
-  if (m == 0.0) { return m; }
-
-  if (e > 0) {
-    if (e <= 22) { return m * pow10Exact(e); }
-    i32 k = e / 22;
-    i32 r = e % 22;
-    return m * pow10Exact(r) * pow10Coarse(k);
-  }
-
-  i32 n = -e;
-  if (n <= 22) { return m / pow10Exact(n); }
-  i32 k2 = n / 22;
-  i32 r2 = n % 22;
-  return m / pow10Exact(r2) / pow10Coarse(k2);
-}
-
-// 10^(22k), correctly rounded, for the decomposition above. Beyond 10^308 the
-// result is out of f64 range, and returning infinity lets the caller's multiply
-// or divide produce the infinity or zero the input asked for.
-f64 pow10Coarse(i32 k) {
-  switch (k) {
-    case 1:  { return 1.0e22; }
-    case 2:  { return 1.0e44; }
-    case 3:  { return 1.0e66; }
-    case 4:  { return 1.0e88; }
-    case 5:  { return 1.0e110; }
-    case 6:  { return 1.0e132; }
-    case 7:  { return 1.0e154; }
-    case 8:  { return 1.0e176; }
-    case 9:  { return 1.0e198; }
-    case 10: { return 1.0e220; }
-    case 11: { return 1.0e242; }
-    case 12: { return 1.0e264; }
-    case 13: { return 1.0e286; }
-    case 14: { return 1.0e308; }
-    default: { return 1.0 / 0.0; }
-  }
-}
-
-// The exactly-representable powers of ten. A literal table because wac has no
-// module-level constants to hold an f64[] and building one per call would
-// allocate on every number parsed.
-f64 pow10Exact(i32 n) {
-  switch (n) {
-    case 0:  { return 1.0; }
-    case 1:  { return 10.0; }
-    case 2:  { return 100.0; }
-    case 3:  { return 1000.0; }
-    case 4:  { return 10000.0; }
-    case 5:  { return 100000.0; }
-    case 6:  { return 1000000.0; }
-    case 7:  { return 10000000.0; }
-    case 8:  { return 100000000.0; }
-    case 9:  { return 1000000000.0; }
-    case 10: { return 1.0e10; }
-    case 11: { return 1.0e11; }
-    case 12: { return 1.0e12; }
-    case 13: { return 1.0e13; }
-    case 14: { return 1.0e14; }
-    case 15: { return 1.0e15; }
-    case 16: { return 1.0e16; }
-    case 17: { return 1.0e17; }
-    case 18: { return 1.0e18; }
-    case 19: { return 1.0e19; }
-    case 20: { return 1.0e20; }
-    case 21: { return 1.0e21; }
-    case 22: { return 1.0e22; }
-    default: { trap; }
-  }
 }
 
 // Parse a complete document: one value, optional surrounding whitespace,

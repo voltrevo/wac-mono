@@ -1,0 +1,54 @@
+// Exports the bignum's operations across the bindgen boundary so the host can
+// compare them against its own BigInt. A `Big` is a GC reference and cannot cross,
+// so each entry point builds one from primitives and dumps the limbs as bytes.
+//
+// This is a test fixture, not part of the library.
+
+import { Big } from "../src/bigint.wac";
+
+// Return the bignum as bytes, little-endian, so the host can rebuild it exactly.
+u8[] dump(Big b) {
+  u8[] out = u8[b.n * 4]();
+  for (i32 i = 0; i < b.n; i++) {
+    u32 v = b.limbs[i];
+    out[i * 4]     = (v & (255 as@ u32)) as@ i32;
+    out[i * 4 + 1] = ((v >> (8 as@ u32)) & (255 as@ u32)) as@ i32;
+    out[i * 4 + 2] = ((v >> (16 as@ u32)) & (255 as@ u32)) as@ i32;
+    out[i * 4 + 3] = ((v >> (24 as@ u32)) & (255 as@ u32)) as@ i32;
+  }
+  return out;
+}
+
+export u8[] shiftTest(u64 v, i32 bits) {
+  Big b = Big.fromU64(v);
+  b.shiftLeft(bits);
+  return dump(b);
+}
+
+export u8[] mulTest(u64 v, i32 bits, u32 m, i32 times) {
+  Big b = Big.fromU64(v);
+  b.shiftLeft(bits);
+  for (i32 i = 0; i < times; i++) { b.mulSmall(m); }
+  return dump(b);
+}
+
+export u8[] sumTest(u64 a, i32 ashift, u64 b, i32 bshift) {
+  Big x = Big.fromU64(a); x.shiftLeft(ashift);
+  Big y = Big.fromU64(b); y.shiftLeft(bshift);
+  Big z = Big.zero();
+  z.setSum(x, y);
+  return dump(z);
+}
+
+export u8[] subTest(u64 a, i32 ashift, u64 b, i32 bshift) {
+  Big x = Big.fromU64(a); x.shiftLeft(ashift);
+  Big y = Big.fromU64(b); y.shiftLeft(bshift);
+  x.sub(y);
+  return dump(x);
+}
+
+export i32 cmpTest(u64 a, i32 ashift, u64 b, i32 bshift) {
+  Big x = Big.fromU64(a); x.shiftLeft(ashift);
+  Big y = Big.fromU64(b); y.shiftLeft(bshift);
+  return x.cmp(y);
+}

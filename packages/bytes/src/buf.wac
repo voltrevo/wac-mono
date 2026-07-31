@@ -78,16 +78,18 @@ export struct Buf {
   }
 
   // gzip and DEFLATE are little-endian throughout.
-  void pushU16(this, i32 v) {
-    this.push(v & 0xFF);
-    this.push((v >>> 8) & 0xFF);
+  // Unsigned, because a header field is a bit pattern rather than a magnitude.
+  // `>>` is the logical shift on an unsigned type, so no `>>>` is needed.
+  void pushU16(this, u32 v) {
+    this.push((v & 0xFF) as@ i32);
+    this.push(((v >> 8) & 0xFF) as@ i32);
   }
 
-  void pushU32(this, i32 v) {
-    this.push(v & 0xFF);
-    this.push((v >>> 8) & 0xFF);
-    this.push((v >>> 16) & 0xFF);
-    this.push((v >>> 24) & 0xFF);
+  void pushU32(this, u32 v) {
+    this.push((v & 0xFF) as@ i32);
+    this.push(((v >> 8) & 0xFF) as@ i32);
+    this.push(((v >> 16) & 0xFF) as@ i32);
+    this.push(((v >> 24) & 0xFF) as@ i32);
   }
 
   // `start`, not `from` — `from` is a keyword (import ... from "...").

@@ -62,3 +62,15 @@ host-side `.test.ts`, and for `gzip` that is where most of the value is.
 
 So this is for unit tests of wac code. It complements the host-side suite rather
 than replacing it.
+
+## Float assertions
+
+`eqF64` compares through `f64.toBits`, not `==`, so NaN equals NaN and `-0.0` is
+distinct from `0.0` — the two cases `==` gets wrong for a test's purposes.
+`nearF64(got, want, tol)` is the tolerance form, and rejects NaN rather than letting
+a false comparison pass it.
+
+Both name the offending value in the failure message, which needs float-to-string
+and so depends on [`fmt`](../fmt/). That dependency is why they did not exist
+before: an assertion that cannot say what it got is close to useless, which is the
+same reason this package ships `itoa`.

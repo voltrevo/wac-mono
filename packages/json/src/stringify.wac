@@ -10,6 +10,7 @@
 
 import { JsonValue, JsonBool, JsonNumber, JsonString, JsonArray, JsonObject } from "./value.wac";
 import { Buf } from "../../bytes/src/buf.wac";
+import { writeF64 } from "../../fmt/src/ftoa.wac";
 
 export void writeValue(Buf out, JsonValue v) {
   switch (v.kind) {
@@ -26,7 +27,13 @@ export void writeValue(Buf out, JsonValue v) {
     }
     case 2: {                                  // number
       JsonNumber n = v as! JsonNumber;
-      out.pushAll(n.raw);
+      // A parsed number is written back exactly as it was read; one built by hand
+      // has no span and is formatted to its shortest round-tripping decimal.
+      if (n.hasRaw()) {
+        out.pushAll(n.raw);
+      } else {
+        writeF64(out, n.value);
+      }
     }
     case 3: {                                  // string
       JsonString s = v as! JsonString;

@@ -23,6 +23,24 @@
 // cannot run inside wasm and belong in a host-side test.
 
 import { itoa } from "./itoa.wac";
+import { itoa64 } from "./itoa64.wac";
+import { utoa64 } from "./utoa64.wac";
+import { ftoa } from "../../fmt/src/ftoa.wac";
+
+// Decimal for a u32. itoa cannot serve: it takes an i32, and every value above
+// 2147483647 would arrive as a negative. Unsigned `/` and `%` make this the
+// obvious loop it looks like — with i32 the same code would go wrong at exactly
+// the values that need it.
+string utoa(u32 v) {
+  if (v == 0) { return "0"; }
+  string out = "";
+  u32 n = v;
+  while (n > 0) {
+    out = itoa((n % 10) as@ i32) + out;
+    n = n / 10;
+  }
+  return out;
+}
 
 export struct T {
   i32 failed;
@@ -68,9 +86,54 @@ export struct T {
     }
   }
 
+  // A u32 above i32's range would print as a negative through itoa, so it gets
+  // its own formatter.
+  void eqU32(this, u32 got, u32 want, string what) {
+    if (got != want) {
+      this.fail(what + ": got " + utoa64(got as u64) + ", want " + utoa64(want as u64));
+    }
+  }
+
   void neI32(this, i32 got, i32 unwanted, string what) {
     if (got == unwanted) {
       this.fail(what + ": got " + itoa(got) + ", wanted anything else");
+    }
+  }
+
+  /**
+   * Bit-exact float equality.
+   *
+   * Compared through the bits rather than `==` so that NaN equals NaN and -0.0 is
+   * distinct from 0.0 — the two cases a float assertion most needs to pin down,
+   * and the two that `==` gets wrong for this purpose. Use `nearF64` when a
+   * tolerance is what you mean.
+   */
+  void eqF64(this, f64 got, f64 want, string what) {
+    if (f64.toBits(got) != f64.toBits(want)) {
+      this.fail(what + ": got " + ftoa(got) + ", want " + ftoa(want));
+    }
+  }
+
+  void eqI64(this, i64 got, i64 want, string what) {
+    if (got != want) {
+      this.fail(what + ": got " + itoa64(got) + ", want " + itoa64(want));
+    }
+  }
+
+  void eqU64(this, u64 got, u64 want, string what) {
+    if (got != want) {
+      this.fail(what + ": got " + utoa64(got) + ", want " + utoa64(want));
+    }
+  }
+
+  /** Within `tol` of `want`, inclusive. NaN on either side always fails. */
+  void nearF64(this, f64 got, f64 want, f64 tol, string what) {
+    f64 diff = got - want;
+    if (diff < 0.0) { diff = -diff; }
+    // A NaN comparison is false either way, so this also rejects NaN.
+    if (!(diff <= tol)) {
+      this.fail(what + ": got " + ftoa(got) + ", want " + ftoa(want)
+        + " within " + ftoa(tol));
     }
   }
 

@@ -1,0 +1,179 @@
+// Fixed-size unsigned big integer, exactly as much as shortest-float formatting
+// needs and no more.
+//
+// Burger & Dybvig's digit generation needs compare, subtract, multiply by a small
+// constant, and shift left. It never needs general division: each digit is found
+// by trial subtraction, at most nine times. So this is deliberately not a general
+// bignum — no division, no multiplication of two Bigs, no signs.
+//
+// Limbs are u32 little-endian with u64 intermediates, which is the standard shape
+// when the widest type is twice the limb width. Limbs above `n` are always zero,
+// so `n` alone decides magnitude.
+
+/**
+ * Enough limbs for any f64.
+ *
+ * The largest value reached is around 2^1030: an f64's significand is under 2^53
+ * and its exponent under 2^971, the scaling loop takes S to within a factor of ten
+ * of R, and the digit loop multiplies by ten at most seventeen more times. 40
+ * limbs is 1280 bits, comfortably clear of that.
+ */
+export i32 LIMBS() { return 40; }
+
+export struct Big {
+  u32[] limbs;
+  i32 n;
+
+  Big zero() { return Big(u32[LIMBS()](), 0); }
+
+  /**
+   * A bignum with room for `limbs` limbs.
+   *
+   * Decimal parsing needs far more headroom than formatting: comparing an
+   * 800-digit decimal against a double's exact value reaches ~3900 bits, where
+   * shortest-formatting never passes ~1030.
+   */
+  Big withLimbs(i32 limbs) { return Big(u32[limbs](), 0); }
+
+  Big fromU64(u64 v) {
+    Big b = Big.zero();
+    b.limbs[0] = v as@ u32;
+    b.limbs[1] = (v >> 32) as@ u32;
+    b.n = 2;
+    b.trim();
+    return b;
+  }
+
+  bool isZero(const this) { return this.n == 0; }
+
+  /** Drop leading zero limbs so `n` is exact — every comparison depends on it. */
+  void trim(this) {
+    while (this.n > 0 && this.limbs[this.n - 1] == 0) {
+      this.n--;
+    }
+  }
+
+  void setU64(this, u64 v) {
+    for (i32 i = 0; i < this.n; i++) { this.limbs[i] = 0; }
+    this.limbs[0] = v as@ u32;
+    this.limbs[1] = (v >> 32) as@ u32;
+    this.n = 2;
+    this.trim();
+  }
+
+  void copyFrom(this, Big src) {
+    // Clear the old tail: limbs above n must stay zero for shiftLeft and mulSmall.
+    for (i32 i = src.n; i < this.n; i++) { this.limbs[i] = 0; }
+    for (i32 i = 0; i < src.n; i++) { this.limbs[i] = src.limbs[i]; }
+    this.n = src.n;
+  }
+
+  void shiftLeft(this, i32 bits) {
+    if (this.n == 0 || bits == 0) { return; }
+    i32 words = bits / 32;
+    i32 rem = bits % 32;
+
+    if (rem == 0) {
+      for (i32 i = this.n - 1; i >= 0; i--) {
+        this.limbs[i + words] = this.limbs[i];
+      }
+      this.n = this.n + words;
+    } else {
+      // Top-down, so each limb is read before it is overwritten. The high part of
+      // limb i lands in i+words+1, which the previous iteration has already
+      // written in full, hence the OR rather than an assignment.
+      this.limbs[this.n + words] = 0;
+      for (i32 i = this.n - 1; i >= 0; i--) {
+        u32 v = this.limbs[i];
+        this.limbs[i + words + 1] = this.limbs[i + words + 1] | (v >> ((32 - rem) as@ u32));
+        this.limbs[i + words] = v << (rem as@ u32);
+      }
+      this.n = this.n + words + 1;
+    }
+    for (i32 i = 0; i < words; i++) { this.limbs[i] = 0; }
+    this.trim();
+  }
+
+  void mulSmall(this, u32 m) {
+    if (this.n == 0) { return; }
+    u64 carry = 0;
+    for (i32 i = 0; i < this.n; i++) {
+      u64 t = (this.limbs[i] as u64) * (m as u64) + carry;
+      this.limbs[i] = t as@ u32;
+      carry = t >> 32;
+    }
+    while (carry != 0) {
+      this.limbs[this.n] = carry as@ u32;
+      carry = carry >> 32;
+      this.n++;
+    }
+  }
+
+  /** this = this * m + add, with both small. Used to build a digit string. */
+  void mulAddSmall(this, u32 m, u32 add) {
+    u64 carry = add as u64;
+    for (i32 i = 0; i < this.n; i++) {
+      u64 t = (this.limbs[i] as u64) * (m as u64) + carry;
+      this.limbs[i] = t as@ u32;
+      carry = t >> 32;
+    }
+    while (carry != 0) {
+      this.limbs[this.n] = carry as@ u32;
+      carry = carry >> 32;
+      this.n++;
+    }
+  }
+
+  /** -1, 0 or 1 for this < o, this == o, this > o. */
+  i32 cmp(const this, Big o) {
+    if (this.n != o.n) { return this.n > o.n ? 1 : -1; }
+    for (i32 i = this.n - 1; i >= 0; i--) {
+      if (this.limbs[i] != o.limbs[i]) {
+        // Unsigned, which is the whole reason the limbs are u32.
+        return this.limbs[i] > o.limbs[i] ? 1 : -1;
+      }
+    }
+    return 0;
+  }
+
+  /** this -= o. The caller must know this >= o; a smaller o would underflow. */
+  void sub(this, Big o) {
+    u64 borrow = 0;
+    for (i32 i = 0; i < this.n; i++) {
+      u64 a = this.limbs[i] as u64;
+      u64 b = borrow;
+      if (i < o.n) { b = b + (o.limbs[i] as u64); }
+      if (a >= b) {
+        this.limbs[i] = (a - b) as@ u32;
+        borrow = 0;
+      } else {
+        // Borrow from the next limb: add 2^32 before subtracting.
+        this.limbs[i] = ((a + 4294967296) - b) as@ u32;
+        borrow = 1;
+      }
+    }
+    this.trim();
+  }
+
+  /** this = a + b. Neither operand may be this. */
+  void setSum(this, Big a, Big b) {
+    i32 m = a.n > b.n ? a.n : b.n;
+    u64 carry = 0;
+    for (i32 i = 0; i < m; i++) {
+      u64 t = carry;
+      if (i < a.n) { t = t + (a.limbs[i] as u64); }
+      if (i < b.n) { t = t + (b.limbs[i] as u64); }
+      this.limbs[i] = t as@ u32;
+      carry = t >> 32;
+    }
+    i32 top = m;
+    if (carry != 0) {
+      this.limbs[m] = carry as@ u32;
+      top = m + 1;
+    }
+    // Anything the previous contents left above the new top would corrupt cmp.
+    for (i32 i = top; i < this.limbs.len(); i++) { this.limbs[i] = 0; }
+    this.n = top;
+    this.trim();
+  }
+}
