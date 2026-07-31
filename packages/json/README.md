@@ -24,19 +24,25 @@ than against hand-written expectations: round-trips are compared to
 `JSON.stringify(JSON.parse(x))`, number conversion to `Number(x)` bit-for-bit,
 and accept/reject decisions to whether `JSON.parse` throws.
 
-## Everything is bytes
+## Bytes inside, strings at the edge
 
-The API takes and returns `u8[]` (UTF-8), not wac's `string`.
+The parser works in `u8[]` UTF-8. That began as a necessity — nothing could build
+a `string` from bytes — and it stays because it is right for a scanner: scanning is
+a `switch` over `i32` spelled with character literals (`case '{':`), and a
+document's strings accumulate in a growable buffer rather than allocating a
+`string` per token.
 
-`string` is immutable and has `len`, `slice`, `indexOf` and `fromCodepoint`.
-`fromCodepoint` can now produce any single character, so the `\uXXXX` decoding
-that was once inexpressible is expressible — but only one character at a time,
-joined with `+`, which on an immutable string is quadratic. Bytes stay the right
-representation until there is a `string.fromBytes`.
+What changed is the boundary. `JsonString.str()`, `JsonMember.keyStr()` and
+`JsonObject.getStr("key")` mean calling code never has to see a `u8[]`:
 
-They are also the better representation for a scanner: it becomes a `switch` over
-`i32` — spelled with character literals, so `case '{':` rather than `case 0x7B:` —
-and output accumulates in a growable buffer instead of through `+`.
+```wac
+JsonObject o = ...;
+JsonValue? name = o.getStr("name");
+string s = (name! as! JsonString).str();
+```
+
+`getStr` converts the key once, outside the scan — `toBytes()` allocates, so
+converting per member would turn an O(n) lookup into an O(n)-allocation lookup.
 
 ## Numbers
 
@@ -111,10 +117,13 @@ for a second call to collect.
 Full detail, ranked, in `~/notes/living/wac/language-friction-log.md`. In order of
 how much each cost:
 
-1. **No bytes → string.** Still the blocking one, and the reason this package is
-   byte-oriented. `string.fromCodepoint` (added because of this package) covers a
-   single character; assembling a string from bytes is still quadratic.
-2. **No float → string.** Blocking for any serializer over computed values.
+1. **No float → string.** Now the only blocking gap: a tree built by hand rather
+   than by parsing cannot be serialized, because numbers are written from the
+   source span they were parsed from.
+2. **No bytes → string — fixed.** `string.fromCodepoint`, `string.fromBytes` and
+   `string.toBytes` were all added because of this package. The last of them
+   deleted a 40-line ASCII lookup table from the tests that existed purely because
+   nothing converted text to bytes.
 3. **No generics.** `JsonArray.items` and `JsonObject.members` are the same
    double-when-full logic twice, differing only in element type. The byte buffer
    was a third copy and `gzip`'s was a fourth; those two are now one shared

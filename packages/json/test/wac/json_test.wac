@@ -15,59 +15,12 @@ import { T } from "../../../wactest/src/assert.wac";
 import { JsonValue, JsonNumber, JsonString, JsonArray, JsonObject, bytesEqual } from "../../src/value.wac";
 import { Parser, parseDocument, hexDigit, scaleByPow10, ERR_NONE, ERR_TRAILING, ERR_CONTROL } from "../../src/parse.wac";
 
-/** ASCII bytes of a wac string literal, for feeding the parser. */
-u8[] ascii(string s) {
-  u8[] out = u8[s.len()]();
-  for (i32 i = 0; i < s.len(); i++) {
-    // Indexing yields a one-character string; comparing against a digit/char
-    // table is the only route from text to a byte value in wac.
-    out[i] = charByte(s[i]);
-  }
-  return out;
-}
-
-/**
- * Byte value of a one-character ASCII string.
- *
- * Still needed because indexing a string yields a one-character *string*, not a
- * number, so there is no direct char-to-int. Char literals give the table's
- * right-hand side, which is why it can be one contiguous run again: the `\\`
- * escape used to lose the character after it, so the table had to be split
- * either side of the backslash.
- */
-i32 charByte(string ch) {
-  string table = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
-  for (i32 i = 0; i < table.len(); i++) {
-    if (table[i] == ch) { return ' ' + i; }
-  }
-  if (ch == "\n") { return '\n'; }
-  if (ch == "\t") { return '\t'; }
-  if (ch == "\r") { return '\r'; }
-  trap;
-}
-
-/** Guards the table above against silently losing a character. */
-export string test_char_tables_are_intact() {
-  T t = T.create();
-  // 0x20..0x7E is 95 characters. A dropped escape shows up here first.
-  t.eqI32(charByte("~") - charByte(" ") + 1, 95, "the table spans the printable range");
-  t.eqI32(charByte(" "), 0x20, "space");
-  t.eqI32(charByte("\""), 0x22, "quote");
-  t.eqI32(charByte("0"), 0x30, "zero");
-  t.eqI32(charByte(":"), 0x3A, "colon");
-  t.eqI32(charByte("A"), 0x41, "A");
-  t.eqI32(charByte("["), 0x5B, "open bracket");
-  t.eqI32(charByte("\\"), 0x5C, "backslash");
-  t.eqI32(charByte("]"), 0x5D, "close bracket");
-  t.eqI32(charByte("a"), 0x61, "a");
-  t.eqI32(charByte("{"), 0x7B, "open brace");
-  t.eqI32(charByte("~"), 0x7E, "tilde");
-  t.eqI32(charByte("\n"), 0x0A, "newline");
-  return t.report();
-}
-
 JsonValue? parseStr(string src) {
-  Parser p = Parser.create(ascii(src));
+  // `string.toBytes()` replaced a 40-line ASCII lookup table here. The table
+  // existed only because nothing converted text to bytes, and it could not
+  // represent a non-ASCII character at all — which is what this test file needs
+  // for a multi-byte key.
+  Parser p = Parser.create(src.toBytes());
   return parseDocument(p);
 }
 
@@ -171,6 +124,45 @@ export string test_tree_shape() {
   return t.report();
 }
 
+export string test_string_accessors() {
+  T t = T.create();
+  JsonValue? v = parseStr("{\"name\":\"wac\",\"n\":1}");
+  t.isTrue(v is not null, "parses");
+  JsonObject o = v! as! JsonObject;
+
+  // Lookup by a string key is what calling code actually has, and it must agree
+  // with the byte-keyed form rather than being a separate code path.
+  JsonValue? byStr = o.getStr("name");
+  t.isTrue(byStr is not null, "getStr finds the member");
+  t.eqStr((byStr! as! JsonString).str(), "wac", "and its value comes back as a string");
+  JsonValue? byBytes = o.get(u8[]('n', 'a', 'm', 'e'));
+  t.isTrue(byBytes is not null, "the byte-keyed form finds it too");
+  t.isTrue(byStr! is byBytes!, "and both return the same object");
+
+  t.isTrue(o.getStr("nope") is null, "a missing key is null");
+  t.isTrue(o.getStr("") is null, "so is the empty key");
+  // A prefix of a real key must not match — bytesEqual compares lengths first.
+  t.isTrue(o.getStr("nam") is null, "a prefix does not match");
+  t.eqStr(o.at(0).keyStr(), "name", "keyStr reads the member key");
+  t.eqStr(o.at(1).keyStr(), "n", "including a one-character one");
+  return t.report();
+}
+
+export string test_string_accessors_handle_utf8() {
+  T t = T.create();
+  // The interesting case for a byte/string boundary: a key and a value that are
+  // multi-byte, plus one built from an escape rather than from literal bytes.
+  JsonValue? v = parseStr("{\"日\":\"caf\\u00e9\"}");
+  t.isTrue(v is not null, "parses");
+  JsonObject o = v! as! JsonObject;
+  t.eqStr(o.at(0).keyStr(), "日", "a multi-byte key round-trips");
+  JsonValue? found = o.getStr("日");
+  t.isTrue(found is not null, "and can be looked up by that string");
+  t.eqStr((found! as! JsonString).str(), "café",
+    "a value assembled from a \\u escape comes back as the right string");
+  return t.report();
+}
+
 export string test_member_order_is_source_order() {
   T t = T.create();
   // The host cannot check this: JS hoists integer-like keys to the front of its
@@ -228,7 +220,7 @@ export string test_number_keeps_its_source_span() {
 export string test_error_codes_and_positions() {
   T t = T.create();
 
-  Parser p1 = Parser.create(ascii("[1] junk"));
+  Parser p1 = Parser.create("[1] junk".toBytes());
   t.isTrue(parseDocument(p1) is null, "trailing content fails");
   t.eqI32(p1.err, ERR_TRAILING(), "reported as trailing");
   t.eqI32(p1.errPos, 4, "position is where the junk starts");
@@ -238,7 +230,7 @@ export string test_error_codes_and_positions() {
   t.eqI32(p2.err, ERR_CONTROL(), "reported as a control byte");
   t.eqI32(p2.errPos, 1, "position is the control byte");
 
-  Parser p3 = Parser.create(ascii("[1]"));
+  Parser p3 = Parser.create("[1]".toBytes());
   t.isTrue(parseDocument(p3) is not null, "valid input succeeds");
   t.eqI32(p3.err, ERR_NONE(), "no error recorded");
 
