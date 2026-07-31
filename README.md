@@ -113,6 +113,66 @@ Two rules, both inherited from wac's CONTRIBUTING.md:
   15 bits, so the length limiter is known to be running rather than incidentally
   satisfied.
 
+### Differential fuzzing
+
+`test/fuzz.test.ts` generates a corpus and runs it through python's zlib in both
+directions. Random bytes alone would be a weak corpus — being incompressible,
+they only ever exercise the literal path — so there are generators for runs,
+periodic data, text, sparse data, small alphabets, exponentially skewed
+frequencies (which force the 15-bit code-length limit), data placed at the 32 KiB
+window edge, and mixtures. Sizes cluster on the awkward values: 0, 1, 2, 3, 258,
+65535.
+
+Corrupted streams are fuzzed too. The contract is that for *any* byte sequence
+the decompressor either produces the right answer or fails — never a wrong answer
+silently. Some corruptions are legitimately benign, since MTIME, XFL and the OS
+byte are not covered by the CRC, so decoding is allowed but only to the original
+bytes.
+
+### Mutation testing
+
+```sh
+deno run -A tools/mutate.ts
+```
+
+`deno coverage` measures the TypeScript harness, not the compiled wasm, so there
+is no branch-coverage number for the wac code. Mutation testing answers what
+coverage is a proxy for, and answers it more directly: break the implementation
+on purpose and check the tests notice. Each mutation is one deliberate defect — a
+flipped comparison, an off-by-one on a boundary, a reversed bit order, a removed
+validity check. A mutation that survives names a behaviour nothing checks.
+
+The suite includes a **no-op control mutation that must survive**. Without it, a
+staged project failing to build for an unrelated reason would report every
+mutation as killed and the run would look perfect while proving nothing — which
+is exactly what happened on the first attempt, when the copied `deno.json` import
+map no longer resolved. If the control is ever reported killed, disbelieve the
+rest of the run.
+
+Survivors are separated into three kinds, because "a mutation lived" on its own
+does not say what to do about it:
+
+- **ratio-only** — changes compression ratio, not correctness. Expected.
+- **provably unobservable** — no behaviour differs, with the evidence recorded.
+  Only marked after demonstrating it, never assumed.
+- **genuine** — untested behaviour, and a failure.
+
+Mutation testing found one real gap: removing inflate's "distance points before
+the start of the output" check failed no test. Random corruption never reaches
+that code, because a flipped bit breaks the Huffman symbol decode long before a
+distance is ever validated. `test/inflate_adversarial.test.ts` now builds
+malformed streams by hand to reach it, along with reserved symbols 286/287 and
+30/31, stored blocks whose LEN runs off the end, truncation mid-symbol, and a
+block with no end-of-block symbol.
+
+Those distance-guard mutations still survive, and that turned out to be worth
+understanding rather than fixing. Removing *both* source-level guards leaves the
+behaviour unchanged: WasmGC's array bounds check traps on the negative index
+regardless. The property is enforced three times over, so no mutation of the wac
+source can be observable. In C the same edit would be a heap over-read; here the
+compilation target makes it a trap. That is a real benefit of the target, and it
+also means mutation scores on defensive checks should be read with it in mind.
+
 ## Notes on wac
 
 Things worth knowing when writing wac, found while building this:
