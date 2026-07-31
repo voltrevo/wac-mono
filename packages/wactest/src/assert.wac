@@ -24,6 +24,21 @@
 
 import { itoa } from "./itoa.wac";
 
+// Decimal for a u32. itoa cannot serve: it takes an i32, and every value above
+// 2147483647 would arrive as a negative. Unsigned `/` and `%` make this the
+// obvious loop it looks like — with i32 the same code would go wrong at exactly
+// the values that need it.
+string utoa(u32 v) {
+  if (v == 0) { return "0"; }
+  string out = "";
+  u32 n = v;
+  while (n > 0) {
+    out = itoa((n % 10) as@ i32) + out;
+    n = n / 10;
+  }
+  return out;
+}
+
 export struct T {
   i32 failed;
   string messages;
@@ -65,6 +80,14 @@ export struct T {
   void eqI32(this, i32 got, i32 want, string what) {
     if (got != want) {
       this.fail(what + ": got " + itoa(got) + ", want " + itoa(want));
+    }
+  }
+
+  // A u32 above i32's range would print as a negative through itoa, so it gets
+  // its own formatter.
+  void eqU32(this, u32 got, u32 want, string what) {
+    if (got != want) {
+      this.fail(what + ": got " + utoa(got) + ", want " + utoa(want));
     }
   }
 

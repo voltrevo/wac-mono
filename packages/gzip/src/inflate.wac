@@ -428,7 +428,9 @@ export u8[] gunzipBytes(u8[] gz) {
   // read before inflating so it can size the output buffer — it is a hint only,
   // and still checked against the actual output below.
   i32 n = gz.len();
-  i32 wantCrc = gz[n - 8] | (gz[n - 7] << 8) | (gz[n - 6] << 16) | (gz[n - 5] << 24);
+  // The trailer CRC is a bit pattern, so it is a u32 — which is also what
+  // crc32 returns, so the comparison needs no cast either way.
+  u32 wantCrc = (gz[n - 8] | (gz[n - 7] << 8) | (gz[n - 6] << 16) | (gz[n - 5] << 24)) as@ u32;
   i32 wantSize = gz[n - 4] | (gz[n - 3] << 8) | (gz[n - 2] << 16) | (gz[n - 1] << 24);
 
   u8[] out = inflateFrom(gz, pos, wantSize);
