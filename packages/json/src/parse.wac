@@ -7,7 +7,7 @@
 // Parser plus a null return. Every parse entry point returns `T?`; null always
 // means "check p.err".
 
-import { JsonValue, JsonBool, JsonNumber, JsonString, JsonArray, JsonObject, jsonNull } from "./value.wac";
+import { JsonValue, JsonArray, JsonObject } from "./value.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { atofSpan } from "../../fmt/src/atof.wac";
 
@@ -82,20 +82,20 @@ export struct Parser {
       case '"': {
         u8[]? b = this.parseStringBytes();
         if (b is null) { return null; }
-        return JsonString.of(b!);
+        return JsonValue.Str(b!);
       }
       case 't': {
-        if (this.eatWord(u8[]('t', 'r', 'u', 'e'))) { return JsonBool.of(true); }
+        if (this.eatWord(u8[]('t', 'r', 'u', 'e'))) { return JsonValue.Bool(true); }
         this.fail(ERR_UNEXPECTED());
         return null;
       }
       case 'f': {
-        if (this.eatWord(u8[]('f', 'a', 'l', 's', 'e'))) { return JsonBool.of(false); }
+        if (this.eatWord(u8[]('f', 'a', 'l', 's', 'e'))) { return JsonValue.Bool(false); }
         this.fail(ERR_UNEXPECTED());
         return null;
       }
       case 'n': {
-        if (this.eatWord(u8[]('n', 'u', 'l', 'l'))) { return jsonNull(); }
+        if (this.eatWord(u8[]('n', 'u', 'l', 'l'))) { return JsonValue.Null; }
         this.fail(ERR_UNEXPECTED());
         return null;
       }
@@ -117,7 +117,7 @@ export struct Parser {
     if (this.peek() == ']') {
       this.pos++;
       this.depth--;
-      return arr;
+      return JsonValue.Array(arr);
     }
     while (true) {
       this.skipWs();
@@ -130,7 +130,7 @@ export struct Parser {
       if (c == ']') {
         this.pos++;
         this.depth--;
-        return arr;
+        return JsonValue.Array(arr);
       }
       if (c < 0) { this.fail(ERR_EOF()); } else { this.fail(ERR_UNEXPECTED()); }
       return null;
@@ -145,7 +145,7 @@ export struct Parser {
     if (this.peek() == '}') {
       this.pos++;
       this.depth--;
-      return obj;
+      return JsonValue.Object(obj);
     }
     while (true) {
       this.skipWs();
@@ -171,7 +171,7 @@ export struct Parser {
       if (c == '}') {
         this.pos++;
         this.depth--;
-        return obj;
+        return JsonValue.Object(obj);
       }
       if (c < 0) { this.fail(ERR_EOF()); } else { this.fail(ERR_UNEXPECTED()); }
       return null;
@@ -398,7 +398,7 @@ export struct Parser {
     for (i32 i = 0; i < raw.len(); i++) {
       raw[i] = this.src[start + i];
     }
-    return JsonNumber.of(value, raw);
+    return JsonValue.Number(value, raw);
   }
 }
 

@@ -5,7 +5,7 @@
 // in front, because there are no module-level globals to stash an error code in
 // and an export returns exactly one value.
 
-import { JsonValue, JsonNumber } from "./value.wac";
+import { JsonValue } from "./value.wac";
 import { Parser, parseDocument, ERR_NONE } from "./parse.wac";
 import { writeValue } from "./stringify.wac";
 import { Buf } from "../../bytes/src/buf.wac";
@@ -48,7 +48,9 @@ export f64 parseNumberValue(u8[] src) {
   Parser p = Parser.create(src);
   JsonValue? v = parseDocument(p);
   if (v is null) { return 0.0 / 0.0; }
-  if (v!.kind != 2) { return 0.0 / 0.0; }
-  JsonNumber n = v! as! JsonNumber;
-  return n.value;
+  JsonValue val = v!;
+  match (val) {
+    case Number(value, raw): return value;
+    else: return 0.0 / 0.0;
+  }
 }

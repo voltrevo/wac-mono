@@ -120,10 +120,10 @@ and slow on numbers and still look reasonable.
 |---|---:|
 | strings with escapes | 132 |
 | long ASCII strings | 109 |
-| structure only | 98 |
+| structure only | 40 |
 | multi-byte UTF-8 strings | 96 |
 | objects, long keys | 88 |
-| realistic mixed | 82 |
+| realistic mixed | 80 |
 | simple decimals | 76 |
 | small integers | 64 |
 | objects, short keys | 40 |
@@ -131,9 +131,17 @@ and slow on numbers and still look reasonable.
 | exponent-form numbers | 9 |
 
 Numbers used to be the whole story — 19 MB/s for small integers, 0.5 for
-exponent-form — and the fixes were in `packages/fmt`; see its README. What remains
-is per-node allocation: a `JsonNumber` for every number and a `JsonMember` for every
-member, which is why short keys cost more per byte than long ones.
+exponent-form — and the fixes were in `packages/fmt`; see its README.
+
+What remains is per-node allocation, and porting `JsonValue` to an enum added one:
+a variant carrying a container is a struct wrapping a struct, where the old
+`JsonArray : JsonValue` subtype was a single object. The cost is one allocation per
+array or object and it scales with container density — structure-only documents went
+98 → 40 MB/s, realistic ones 82 → 80. Worth it for exhaustiveness, but worth knowing.
+
+It is not avoidable within the enum: variants cannot carry methods, so the growable
+part has to be a separate struct, and mutating a payload in place is blocked because
+a matched subject is `const` within its arm.
 
 ## Layout
 
@@ -170,8 +178,10 @@ how much each cost:
    — the two ref-element containers still cannot be shared with it or each other.
 4. **No module-level constants.** Kind tags are zero-argument functions; the
    powers-of-ten table is a `switch` returning literals.
-5. **No sum types or pattern matching**, and no virtual dispatch, so a tag plus
-   `switch` plus a downcast is the shape of every fold over the tree.
+5. **No sum types — fixed.** `JsonValue` is now an `enum` and every fold is a
+   `match`, so a forgotten case is a compile error rather than a runtime `trap`. It
+   replaced a base struct, an `i32 kind`, six tag constants, a `switch` and an `as!`
+   per arm.
 6. **Unchecked integer overflow caused a real bug** — 19 digits could exceed
    `i64`, it wraps silently, and only the randomized number sweep caught it. The
    code that overflowed is gone now: conversion moved to `packages/fmt`, which
