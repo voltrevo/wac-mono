@@ -120,6 +120,27 @@ function readCounts(mod: Record<string, unknown>, n: number): number[] {
   record(points, readCounts(mod, len));
 }
 
+// ── Exercise crc32 directly ───────────────────────────────────────────────────
+//
+// crc32Bitwise is the reference the table version is tested against, so it is
+// never called from the pipeline. Instrumenting crc32.wac on its own keeps the
+// number honest rather than reporting a tested function as uncovered.
+
+{
+  const { mod, points } = await instrument("packages/gzip/src/crc32.wac");
+  (mod.__cov_init as () => void)();
+  const len = (mod.__cov_len as () => number)();
+  const table = mod.crc32 as (d: Uint8Array) => number;
+  const bitwise = mod.crc32Bitwise as (d: Uint8Array) => number;
+  for (const n of [0, 1, 2, 255, 256, 4096]) {
+    const data = Uint8Array.from({ length: n }, (_, i) => (i * 37 + n) & 0xFF);
+    if (table(data) !== bitwise(data)) {
+      throw new Error(`crc32 disagrees with crc32Bitwise at length ${n}`);
+    }
+  }
+  record(points, readCounts(mod, len));
+}
+
 // ── Report ────────────────────────────────────────────────────────────────────
 
 const byFile = new Map<string, { total: number; hit: number; missing: Point[] }>();

@@ -1,0 +1,49 @@
+// The table-driven CRC-32 against the bitwise definition.
+//
+// Fixed vectors only prove the table entries those vectors happen to reach. A
+// single wrong entry is reached only by inputs containing one particular byte
+// value at one particular state, so the check that matters is agreement with the
+// definition across every byte value and a spread of lengths.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa } from "../../../wactest/src/itoa.wac";
+import { crc32, crc32Bitwise } from "../../src/crc32.wac";
+
+export string test_table_agrees_with_definition_on_every_byte() {
+  T t = T.create();
+  // Every single-byte input reaches a different table entry, so this covers all
+  // 256 of them.
+  for (i32 b = 0; b < 256; b++) {
+    i8[] one = i8[1]();
+    one[0] = b;
+    t.eqI32(crc32(one), crc32Bitwise(one), "single byte " + itoa(b));
+  }
+  return t.report();
+}
+
+export string test_table_agrees_across_lengths() {
+  T t = T.create();
+  i32[] lengths = i32[](0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 255, 256, 257, 1000, 4095);
+  for (i32 j = 0; j < lengths.len(); j++) {
+    i32 n = lengths[j];
+    i8[] data = i8[n]();
+    // A deterministic spread rather than a constant, so state varies across the
+    // whole table as the loop advances.
+    for (i32 i = 0; i < n; i++) {
+      data[i] = (i * 37 + n * 11) & 0xFF;
+    }
+    t.eqI32(crc32(data), crc32Bitwise(data), "length " + itoa(n));
+  }
+  return t.report();
+}
+
+export string test_known_vectors() {
+  T t = T.create();
+  // "hello world", from python zlib.crc32 — 222957957.
+  i8[] hw = i8[](104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100);
+  t.eqI32(crc32(hw), 222957957, "crc32(\"hello world\")");
+  // Empty input is 0 by definition, and is the one case with no table lookup.
+  i8[] empty = i8[0]();
+  t.eqI32(crc32(empty), 0, "crc32 of empty");
+  return t.report();
+}

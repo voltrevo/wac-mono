@@ -1,0 +1,28 @@
+import { Buf } from "../src/buf.wac";
+
+// Push n bytes through Buf, the path inflate and stored blocks both use.
+export i32 viaPush(i32 n) {
+  Buf b = Buf.create();
+  for (i32 i = 0; i < n; i++) {
+    b.push(i & 0xFF);
+  }
+  return b.bytes().len();
+}
+
+// Same bytes, written straight into a pre-sized array.
+export i32 viaPresized(i32 n) {
+  i8[] out = i8[n]();
+  for (i32 i = 0; i < n; i++) {
+    out[i] = i & 0xFF;
+  }
+  return out.len();
+}
+
+// Push without the final bytes() copy, to separate the two costs.
+export i32 viaPushNoCopy(i32 n) {
+  Buf b = Buf.create();
+  for (i32 i = 0; i < n; i++) {
+    b.push(i & 0xFF);
+  }
+  return b.len;
+}

@@ -76,31 +76,48 @@ inflate(data)      // read a raw deflate stream
 
 ## Throughput
 
-`deno task bench`. On 1 MiB, after wac's bindgen gained bulk array transfer:
+`deno task bench`. On 1 MiB:
 
-| | MB/s |
-|---|---:|
-| host/wasm boundary (identity) | 776 |
-| stored blocks | 34 |
-| dynamic, text | 9.4 |
-| dynamic, already-compressible | 36 |
-| inflate, text | 33 |
-| _python zlib compress, text_ | 49 |
-| _python zlib decompress, text_ | 643 |
+| | MB/s | python zlib |
+|---|---:|---:|
+| host/wasm boundary (identity) | 776 | — |
+| stored blocks | 113 | — |
+| dynamic, text | 11 | 49 |
+| dynamic, already-compressible | 132 | 455 |
+| inflate, text | 120 | 694 |
+| inflate, incompressible | 86 | 2672 |
+
+End to end on 4 MB of real TypeScript source: `gzipDynamic` 17.3 MB/s at 23.8%,
+decompress 120 MB/s, against zlib's 46.2 MB/s at 23.1%. So ~2.7x slower
+compressing and ~5.8x decompressing, at the same ratio.
 
 Scaling is flat from 16K to 4 MB, so the match search and hash inserts are linear.
 
-The decompression gap is the honest one: zlib decodes Huffman through lookup
-tables, this walks the canonical code one bit at a time — zlib's `puff` reference
-approach, chosen for being readable. A table-driven decoder is the obvious next
-step.
+### What the numbers cost to find
 
-Stored blocks at 34 MB/s against a 776 MB/s boundary means the remaining cost is
-`Buf.push` per byte plus a final copy in `bytes()`. WasmGC has an `array.copy`
-instruction; wac does not expose it, so there is no way to write a bulk copy in
-wac today.
+Three things were profiled in the order they seemed obvious, and only the third
+mattered:
 
-## Known limitations
+1. **Bit-at-a-time Huffman decode** — replaced with a 9-bit root lookup table.
+   Worth about 4%.
+2. **`Buf.push` per byte** — measured at 3.3 ns/byte including the final copy,
+   about 11% of inflate. Real, but not the problem.
+3. **Bitwise CRC-32** — 25 ns/byte, and *every* operation checksums its whole
+   payload. It was 26 ms of the 30 ms needed to process 1 MiB: more than LZ77 and
+   Huffman coding put together. A 256-entry table made stored blocks 3.3x faster
+   and inflate 3.5x.
+
+That is why every operation previously sat at ~34 MB/s no matter how compressible
+the input was — the checksum did not care, and it dominated. The lesson is the
+ordinary one: the bottleneck was in the part nobody thinks of as the codec.
+
+Remaining gaps, in order of size: compression is greedy rather than lazy; the
+decoder's root table could be two-level; and `Buf.push` at 3.3 ns/byte against a
+pre-sized array's 0.5 ns/byte is the copy in `bytes()` plus a growth check per
+byte. WasmGC has `array.copy`, which wac does not expose, so a bulk copy is not
+writable in wac today.
+
+## Known limitations## Known limitations
 
 - **Single-member only.** Concatenated gzip members are legal; this reads the
   first and then fails the trailer check. It traps rather than silently

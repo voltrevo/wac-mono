@@ -1,8 +1,55 @@
 // CRC-32 as gzip uses it: reflected polynomial 0xEDB88320, pre- and
-// post-inverted. This is the bitwise form — one shift per bit, no table. It is
-// the reference the table-driven version is checked against.
+// post-inverted.
+//
+// Two implementations. The table-driven one is what the pipeline calls; the
+// bitwise one is kept because it is the definition, and the tests check the table
+// against it over random input rather than only against fixed vectors.
+//
+// This matters more than it looks. Every compress and every decompress checksums
+// the whole payload, so with only the bitwise form CRC-32 was ~26 ms of the ~30 ms
+// needed to process 1 MiB — the dominant cost of the whole library, ahead of both
+// LZ77 and Huffman coding, and the reason every operation plateaued at the same
+// throughput regardless of how compressible the input was.
 
+/**
+ * Per-byte remainders for the reflected polynomial.
+ *
+ * Rebuilt per call because wac has no module-level constants. 256 entries at 8
+ * shifts each is roughly 2 microseconds, which is noise beside any payload large
+ * enough to care about.
+ */
+i32[] crcTable() {
+  i32[] table = i32[256]();
+  for (i32 n = 0; n < 256; n++) {
+    i32 c = n;
+    for (i32 k = 0; k < 8; k++) {
+      if ((c & 1) != 0) {
+        c = 0xEDB88320 ^ (c >>> 1);
+      } else {
+        c = c >>> 1;
+      }
+    }
+    table[n] = c;
+  }
+  return table;
+}
+
+/** CRC-32 of `data`: one table lookup per byte instead of eight shift steps. */
 export i32 crc32(i8[] data) {
+  i32[] table = crcTable();
+  i32 crc = 0xFFFFFFFF;
+  for (i32 i = 0; i < data.len(); i++) {
+    crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+/**
+ * The definition, bit by bit. Not used in the pipeline — it is the reference the
+ * table-driven version is tested against, because a single wrong table entry
+ * would otherwise only be caught if some fixed vector happened to reach it.
+ */
+export i32 crc32Bitwise(i8[] data) {
   i32 crc = 0xFFFFFFFF;
   for (i32 i = 0; i < data.len(); i++) {
     crc ^= data[i];

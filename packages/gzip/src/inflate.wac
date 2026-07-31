@@ -13,42 +13,71 @@ i32 maxBits() { return 15; }
 // ── Bit reader ────────────────────────────────────────────────────────────────
 
 /**
- * LSB-first bit reader, the counterpart of BitWriter. Huffman codes are read one
- * bit at a time and accumulated most-significant-bit first, matching how they
- * were written.
+ * LSB-first bit reader with lookahead.
+ *
+ * Buffers up to 24 bits so a decoder can *peek* at the next several bits without
+ * consuming them, look the whole code up in a table, and then skip exactly its
+ * length. Reading one bit at a time cannot do that — you have to consume a bit
+ * before you know whether you needed it.
+ *
+ * Peeking past the end of the stream pads with zero bits rather than trapping,
+ * because the last real code in a stream is legitimately shorter than the
+ * lookahead window. Consuming more bits than exist is what traps.
  */
 struct BitReader {
   i8[] data;
-  i32 pos;       // next byte to consume
-  i32 bitBuf;
-  i32 bitCount;
+  i32 pos;       // next byte to pull into the buffer
+  i32 bitBuf;    // bits not yet consumed, LSB first
+  i32 bitCount;  // how many bits of bitBuf are live
 
   BitReader create(i8[] data, i32 start) {
     return BitReader(data, start, 0, 0);
   }
 
-  i32 readBit(this) {
-    if (this.bitCount == 0) {
-      if (this.pos >= this.data.len()) { trap; }   // truncated stream
-      this.bitBuf = this.data[this.pos];
+  /** Pull bytes in until at least `need` bits are buffered, or input runs out. */
+  void fill(this, i32 need) {
+    while (this.bitCount < need && this.pos < this.data.len()) {
+      this.bitBuf |= this.data[this.pos] << this.bitCount;
       this.pos++;
-      this.bitCount = 8;
+      this.bitCount += 8;
     }
-    i32 bit = this.bitBuf & 1;
-    this.bitBuf >>>= 1;
-    this.bitCount--;
-    return bit;
+  }
+
+  /** The next `count` bits without consuming them, zero-padded past the end. */
+  i32 peek(this, i32 count) {
+    this.fill(count);
+    return this.bitBuf & ((1 << count) - 1);
+  }
+
+  /** Consume `count` bits, which must actually be present. */
+  void skip(this, i32 count) {
+    if (count > this.bitCount) { trap; }   // ran off the end of the stream
+    this.bitBuf >>>= count;
+    this.bitCount -= count;
+  }
+
+  i32 readBit(this) {
+    i32 b = this.peek(1);
+    this.skip(1);
+    return b;
   }
 
   i32 readBits(this, i32 count) {
-    i32 v = 0;
-    for (i32 i = 0; i < count; i++) {
-      v |= this.readBit() << i;
-    }
+    if (count == 0) { return 0; }
+    i32 v = this.peek(count);
+    this.skip(count);
     return v;
   }
 
+  /**
+   * Drop to the next byte boundary.
+   *
+   * Whole bytes sitting unconsumed in the buffer are pushed back by rewinding
+   * `pos`; only the partial byte is discarded. Forgetting the rewind would skip
+   * real input, which is how a stored block ends up reading from the wrong place.
+   */
   void alignByte(this) {
+    this.pos -= this.bitCount >>> 3;
     this.bitBuf = 0;
     this.bitCount = 0;
   }
@@ -56,16 +85,38 @@ struct BitReader {
 
 // ── Canonical Huffman decoding ────────────────────────────────────────────────
 
+// Root table width. A 9-bit table is 512 entries, small enough to build per
+// block and wide enough that almost every symbol in real data is one lookup:
+// literals in a dynamic block are typically 6-9 bits. Codes longer than this fall
+// back to the bit-by-bit walk, which is rare enough not to matter.
+i32 rootBits() { return 9; }
+
+/** Reverse the low `len` bits of `code` — see Decoder.build for why. */
+i32 reverseBits(i32 code, i32 len) {
+  i32 out = 0;
+  for (i32 i = 0; i < len; i++) {
+    out = (out << 1) | ((code >>> i) & 1);
+  }
+  return out;
+}
+
 /**
- * A canonical code, stored the way it is decoded rather than the way it is
- * built: a count of codes per length, plus the symbols ordered by (length,
- * symbol). Because canonical codes are numerically ordered within a length,
- * that is enough to walk bit by bit without materialising a table — the
- * approach zlib's `puff` reference decoder uses.
+ * A canonical code in two forms: a root lookup table for the common case, and the
+ * count/symbol arrays for codes too long to fit in it.
+ *
+ * The table is indexed by the next `rootBits()` bits of the stream *as they
+ * arrive*. Huffman codes go most-significant-bit first while the reader hands
+ * bits back least-significant-first, so a code's table index is its bit-reversal
+ * — and every index sharing those low bits maps to the same symbol, which is what
+ * makes one lookup replace a loop.
+ *
+ * Entries pack length and symbol as (len << 16) | sym. Zero means "no code here",
+ * which is unambiguous because a real entry always has len >= 1.
  */
 struct Decoder {
   i32[] count;    // count[len], len 0..15
   i32[] symbol;   // symbols sorted by (len, symbol)
+  i32[] fast;     // 1 << rootBits() entries
 
   Decoder build(i32[] lengths, i32 n) {
     i32[] count = i32[maxBits() + 1]();
@@ -87,23 +138,61 @@ struct Decoder {
         offs[lengths[i] + 1 - 1]++;
       }
     }
-    return Decoder(count, symbol);
+
+    // Walk the code space in canonical order, filling every table slot that a
+    // short code claims. A code of length L owns all indices congruent to its
+    // reversal modulo 2^L, because the bits above L are not part of it.
+    i32 size = 1 << rootBits();
+    i32[] fast = i32[size]();
+    i32 code = 0;
+    i32 next = 0;
+    for (i32 len = 1; len <= maxBits(); len++) {
+      for (i32 k = 0; k < count[len]; k++) {
+        i32 sym = symbol[next];
+        next++;
+        if (len <= rootBits()) {
+          i32 entry = (len << 16) | sym;
+          i32 step = 1 << len;
+          for (i32 idx = reverseBits(code, len); idx < size; idx += step) {
+            fast[idx] = entry;
+          }
+        }
+        code++;
+      }
+      code <<= 1;
+    }
+
+    return Decoder(count, symbol, fast);
   }
 
   /**
-   * Read one symbol. `code` accumulates the bits seen so far; `first` is the
-   * first code of the current length and `index` its position in the symbol
-   * table. If the accumulated code falls inside this length's range, it names a
-   * symbol; otherwise advance to the next length.
+   * Read one symbol.
+   *
+   * One table lookup for codes up to rootBits() long. Otherwise fall through to
+   * the canonical walk: `code` accumulates bits, `first` is the first code of the
+   * current length and `index` its position in the symbol table, so a code inside
+   * this length's range names a symbol directly.
+   *
+   * The walk reads from a peeked window rather than consuming as it goes, so
+   * nothing is consumed until the length is known — which is what lets the fast
+   * path skip exactly the right number of bits.
    */
   i32 decode(const this, BitReader br) {
+    i32 entry = this.fast[br.peek(rootBits())];
+    if (entry != 0) {
+      br.skip(entry >>> 16);
+      return entry & 0xFFFF;
+    }
+
+    i32 window = br.peek(maxBits());
     i32 code = 0;
     i32 first = 0;
     i32 index = 0;
     for (i32 len = 1; len <= maxBits(); len++) {
-      code |= br.readBit();
+      code |= (window >>> (len - 1)) & 1;
       i32 count = this.count[len];
       if (code - first < count) {
+        br.skip(len);
         return this.symbol[index + (code - first)];
       }
       index += count;
