@@ -7,6 +7,7 @@ Numbers to and from text.
 - `atofSpan(src, start, end)` — the double nearest a decimal, ties to even.
   Correctly rounded for every input.
 - `itoa(n)` — an `i32` in decimal.
+- `ftoa32` / `atof32Span` — the same pair for `f32`.
 
 ```wac
 import { ftoa, ftoaBytes, writeF64 } from "../../fmt/src/ftoa.wac";
@@ -129,9 +130,24 @@ buffer for every number including `1`; hoisting the power-of-ten scaling out of 
 bisection, where it had been rebuilt on all 63 iterations; and the narrow bracket,
 which cuts those iterations to about three.
 
+## f32
+
+Both directions, sharing the machinery. Digit generation takes the significand,
+exponent and boundary rules as parameters, so `f32` is a decomposition and not a
+second copy of Burger & Dybvig. Parsing needs its own bisection — the two return
+different types and wac has no generics — but the exact comparison underneath is
+shared, since it works on a significand and a binary exponent and does not care
+where they came from.
+
+`atof32Span` is **not** "parse to f64, then narrow". That rounds twice, and the two
+roundings disagree for decimals sitting near an f32 boundary.
+
+JavaScript has no `f32`, so `String(x)` is not the oracle it was for doubles.
+Instead the two defining properties are checked directly: the output must read back
+as the same `f32`, and no decimal with fewer significant digits may do so. That is
+what shortest-round-tripping means, and asserting it is stronger than agreeing with
+another implementation.
+
 ## Not here yet
 
-- `f32`, in either direction. The algorithms are the same with different constants,
-  but it also needs `f32.toBits`/`f32.fromBits` in the language — only the `f64`
-  pair exists — and nothing in this repo uses `f32` yet.
 - Fixed-precision output (`toFixed`-style). Only shortest is implemented.
