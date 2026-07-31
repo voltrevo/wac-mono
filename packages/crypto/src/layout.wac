@@ -1,0 +1,61 @@
+// Byte layout: endianness conversions, and the block padding the AEADs share.
+//
+// Every primitive in this package is defined over machine words but specified over
+// byte strings, so each one needs the same handful of conversions. They were written
+// separately in each file to begin with, which was fine while there was one hash; by
+// the time there were eleven files the little-endian u32 read existed twice verbatim,
+// the big-endian u64 store five times, and the pad-to-16 calculation twice under two
+// different names. Endianness is the single easiest thing here to get backwards, and a
+// helper that is right in four files and subtly wrong in the fifth is the failure this
+// avoids.
+//
+// The width is in the name because both widths and both orders appear, and `beWord`
+// alone does not say which. Offsets are byte offsets throughout, and no function
+// bounds-checks: reads past the end trap on the array access, which is what the
+// callers want, since every one of them has already established the length.
+
+/** Little-endian u32 at byte offset `i`. */
+export u32 leWord32(u8[] b, i32 i) {
+  return (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) as@ u32;
+}
+
+/** Write `v` little-endian into four bytes at `at`. */
+export void storeLE32(u32 v, u8[] out, i32 at) {
+  for (i32 j = 0; j < 4; j++) { out[at + j] = ((v >> ((j * 8) as@ u32)) & 255) as@ i32; }
+}
+
+/** Big-endian u32 at byte offset `i`. */
+export u32 beWord32(u8[] b, i32 i) {
+  return ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) as@ u32;
+}
+
+/** Write `v` big-endian into four bytes at `at`. */
+export void storeBE32(u32 v, u8[] out, i32 at) {
+  for (i32 j = 0; j < 4; j++) { out[at + j] = ((v >> (((3 - j) * 8) as@ u32)) & 255) as@ i32; }
+}
+
+/** Big-endian u64 at byte offset `i`. */
+export u64 beWord64(u8[] b, i32 i) {
+  u64 v = 0;
+  for (i32 j = 0; j < 8; j++) { v = (v << 8) | (b[i + j] as! u64); }
+  return v;
+}
+
+/** Write `v` big-endian into eight bytes at `at`. */
+export void storeBE64(u64 v, u8[] out, i32 at) {
+  for (i32 j = 0; j < 8; j++) {
+    out[at + j] = ((v >> (((7 - j) * 8) as! u64)) & 255) as! i32;
+  }
+}
+
+/**
+ * Bytes needed to round `n` up to a 16-byte boundary — 0 when `n` is already a
+ * multiple, never 16.
+ *
+ * Both AEADs pad their MAC inputs to whole 16-byte blocks, and both had this under a
+ * different name.
+ */
+export i32 padTo16(i32 n) {
+  i32 r = n % 16;
+  return r == 0 ? 0 : 16 - r;
+}

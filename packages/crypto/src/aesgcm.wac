@@ -16,6 +16,7 @@
 
 import { aesExpandKey, aesEncryptBlock, aesRounds } from "./aes.wac";
 import { ghash } from "./ghash.wac";
+import { storeBE64, padTo16 } from "./layout.wac";
 
 /**
  * Increment the low 32 bits of a 16-byte counter block, wrapping at 2^32.
@@ -34,12 +35,6 @@ void inc32(u8[] ctr) {
     ctr[i] = v & 0xFF;
     if (v < 256) { return; }
   }
-}
-
-/** Bytes needed to round `n` up to a whole block. */
-i32 padTo16(i32 n) {
-  i32 r = n % 16;
-  return r == 0 ? 0 : 16 - r;
 }
 
 /** The hash subkey: the block cipher applied to a block of zeros. */
@@ -64,11 +59,7 @@ u8[] initialCounter(u8[] h, u8[] iv) {
   i32 pad = padTo16(iv.len());
   u8[] buf = u8[iv.len() + pad + 16]();
   for (i32 i = 0; i < iv.len(); i++) { buf[i] = iv[i]; }
-  u64 bits = (iv.len() as! u64) * 8;
-  i32 at = iv.len() + pad + 8;
-  for (i32 j = 0; j < 8; j++) {
-    buf[at + j] = ((bits >> (((7 - j) * 8) as! u64)) & 255) as! i32;
-  }
+  storeBE64((iv.len() as! u64) * 8, buf, iv.len() + pad + 8);
   return ghash(h, buf);
 }
 
@@ -109,12 +100,8 @@ u8[] tagInput(u8[] aad, u8[] ct) {
   for (i32 i = 0; i < ct.len(); i++) { m[p] = ct[i]; p++; }
   p += cp;
 
-  u64 abits = (aad.len() as! u64) * 8;
-  u64 cbits = (ct.len() as! u64) * 8;
-  for (i32 j = 0; j < 8; j++) {
-    m[p + j]     = ((abits >> (((7 - j) * 8) as! u64)) & 255) as! i32;
-    m[p + 8 + j] = ((cbits >> (((7 - j) * 8) as! u64)) & 255) as! i32;
-  }
+  storeBE64((aad.len() as! u64) * 8, m, p);
+  storeBE64((ct.len() as! u64) * 8, m, p + 8);
   return m;
 }
 

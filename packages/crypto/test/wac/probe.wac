@@ -10,6 +10,9 @@ import { chachaBlock as blockImpl, chacha20 as chachaImpl } from "../../src/chac
 import { hkdf as hkdfImpl, hkdfExtract as extractImpl } from "../../src/hkdf.wac";
 import { poly1305 as polyImpl } from "../../src/poly1305.wac";
 import { aeadEncrypt as encImpl, aeadDecrypt as decImpl, aeadTag as tagImpl } from "../../src/aead.wac";
+import { leWord32 as leWord32Impl, storeLE32 as storeLE32Impl, beWord32 as beWord32Impl,
+  storeBE32 as storeBE32Impl, beWord64 as beWord64Impl, storeBE64 as storeBE64Impl,
+  padTo16 as padTo16Impl } from "../../src/layout.wac";
 
 export u8[] sha256(u8[] m) { return sha256Impl(m); }
 
@@ -33,8 +36,6 @@ export u8[] sha384(u8[] m) { return sha384Impl(m); }
 export u8[] aesEncrypt(u8[] k, u8[] b) { return aesEncImpl(k, b); }
 export u8[] aesDecrypt(u8[] k, u8[] b) { return aesDecImpl(k, b); }
 
-
-
 export u8[] aesCtr(u8[] k, u8[] iv, u8[] d) { return aesCtrImpl(k, iv, d); }
 
 export u8[] ghash(u8[] h, u8[] d) { return ghashImpl(h, d); }
@@ -43,3 +44,13 @@ export u8[] gcmTag(u8[] k, u8[] iv, u8[] a, u8[] c) { return gcmTagImpl(k, iv, a
 export u8[] gcmDecrypt(u8[] k, u8[] iv, u8[] a, u8[] c, u8[] t) { return gcmDecImpl(k, iv, a, c, t); }
 
 export u8[] gcmInc32(u8[] c) { u8[] o = u8[16](); for (i32 i = 0; i < 16; i++) { o[i] = c[i]; } incImpl(o); return o; }
+
+// layout.wac's conversions, so they can be checked against the host's DataView
+// rather than only indirectly through the primitives that use them.
+export u32 leWord32(u8[] b, i32 i) { return leWord32Impl(b, i); }
+export u32 beWord32(u8[] b, i32 i) { return beWord32Impl(b, i); }
+export u64 beWord64(u8[] b, i32 i) { return beWord64Impl(b, i); }
+export u8[] storeLE32(u32 v) { u8[] o = u8[4](); storeLE32Impl(v, o, 0); return o; }
+export u8[] storeBE32(u32 v) { u8[] o = u8[4](); storeBE32Impl(v, o, 0); return o; }
+export u8[] storeBE64(u64 v) { u8[] o = u8[8](); storeBE64Impl(v, o, 0); return o; }
+export i32 padTo16(i32 n) { return padTo16Impl(n); }

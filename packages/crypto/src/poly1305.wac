@@ -17,12 +17,9 @@
 // nothing left to sum into. The odd-looking split is forced by the arithmetic,
 // and it is why this needs u32 and u64 together rather than either alone.
 
-u32 mask26() { return 0x3ffffff; }
+import { leWord32, storeLE32 } from "./layout.wac";
 
-/** Little-endian u32 at byte offset `i`. */
-u32 leWord(u8[] b, i32 i) {
-  return (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) as@ u32;
-}
+u32 mask26() { return 0x3ffffff; }
 
 /**
  * The one-time authenticator for `msg` under the 32-byte `key`, 16 bytes.
@@ -31,10 +28,10 @@ u32 leWord(u8[] b, i32 i) {
  * stay inside the limb bounds, and s is the final additive blind.
  */
 export u8[] poly1305(u8[] key, u8[] msg) {
-  u32 t0 = leWord(key, 0);
-  u32 t1 = leWord(key, 4);
-  u32 t2 = leWord(key, 8);
-  u32 t3 = leWord(key, 12);
+  u32 t0 = leWord32(key, 0);
+  u32 t1 = leWord32(key, 4);
+  u32 t2 = leWord32(key, 8);
+  u32 t3 = leWord32(key, 12);
 
   // These masks fold RFC 8439's clamp into the 26-bit split in one step.
   u32 r0 = t0 & 0x3ffffff;
@@ -60,10 +57,10 @@ export u8[] poly1305(u8[] key, u8[] msg) {
     u32 hibit = 0;
     if (take == 16) { hibit = 1 << 24; } else { blk[take] = 1; }
 
-    u32 b0 = leWord(blk, 0);
-    u32 b1 = leWord(blk, 4);
-    u32 b2 = leWord(blk, 8);
-    u32 b3 = leWord(blk, 12);
+    u32 b0 = leWord32(blk, 0);
+    u32 b1 = leWord32(blk, 4);
+    u32 b2 = leWord32(blk, 8);
+    u32 b3 = leWord32(blk, 12);
 
     h0 += b0 & 0x3ffffff;
     h1 += ((b0 >> 26) | (b1 << 6)) & 0x3ffffff;
@@ -134,19 +131,13 @@ export u8[] poly1305(u8[] key, u8[] msg) {
   u32 f2 = (h2 >> 12) | (h3 << 14);
   u32 f3 = (h3 >> 18) | (h4 << 8);
 
-  u64 acc = (f0 as u64) + (leWord(key, 16) as u64); f0 = acc as@ u32;
-  acc = (f1 as u64) + (leWord(key, 20) as u64) + (acc >> 32); f1 = acc as@ u32;
-  acc = (f2 as u64) + (leWord(key, 24) as u64) + (acc >> 32); f2 = acc as@ u32;
-  acc = (f3 as u64) + (leWord(key, 28) as u64) + (acc >> 32); f3 = acc as@ u32;
+  u64 acc = (f0 as u64) + (leWord32(key, 16) as u64); f0 = acc as@ u32;
+  acc = (f1 as u64) + (leWord32(key, 20) as u64) + (acc >> 32); f1 = acc as@ u32;
+  acc = (f2 as u64) + (leWord32(key, 24) as u64) + (acc >> 32); f2 = acc as@ u32;
+  acc = (f3 as u64) + (leWord32(key, 28) as u64) + (acc >> 32); f3 = acc as@ u32;
 
   u32[] words = u32[](f0, f1, f2, f3);
   u8[] out = u8[16]();
-  for (i32 i = 0; i < 4; i++) {
-    u32 v = words[i];
-    out[i * 4]     = (v & 255) as@ i32;
-    out[i * 4 + 1] = ((v >> 8) & 255) as@ i32;
-    out[i * 4 + 2] = ((v >> 16) & 255) as@ i32;
-    out[i * 4 + 3] = ((v >> 24) & 255) as@ i32;
-  }
+  for (i32 i = 0; i < 4; i++) { storeLE32(words[i], out, i * 4); }
   return out;
 }

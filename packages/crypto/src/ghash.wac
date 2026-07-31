@@ -8,18 +8,7 @@
 //
 // A 128-bit value is two u64s, big-endian: v[0] is the first eight bytes.
 
-/** Big-endian u64 at byte offset `i`. */
-u64 beWord(u8[] b, i32 i) {
-  u64 v = 0;
-  for (i32 j = 0; j < 8; j++) { v = (v << 8) | (b[i + j] as! u64); }
-  return v;
-}
-
-void storeBE(u64 v, u8[] out, i32 at) {
-  for (i32 j = 0; j < 8; j++) {
-    out[at + j] = ((v >> (((7 - j) * 8) as! u64)) & 255) as! i32;
-  }
-}
+import { beWord64, storeBE64 } from "./layout.wac";
 
 /**
  * z = x * y in GF(2^128).
@@ -59,15 +48,15 @@ export u8[] ghash(u8[] h, u8[] data) {
   if (h.len() != 16) { trap; }
   if (data.len() % 16 != 0) { trap; }
 
-  u64[] hv = u64[](beWord(h, 0), beWord(h, 8));
+  u64[] hv = u64[](beWord64(h, 0), beWord64(h, 8));
   u64[] y = u64[](0, 0);
   u64[] blk = u64[2]();
   u64[] tmp = u64[2]();
 
   i32 n = data.len();
   for (i32 pos = 0; pos < n; pos += 16) {
-    blk[0] = beWord(data, pos);
-    blk[1] = beWord(data, pos + 8);
+    blk[0] = beWord64(data, pos);
+    blk[1] = beWord64(data, pos + 8);
     y[0] ^= blk[0];
     y[1] ^= blk[1];
     gfMul(y, hv, tmp);
@@ -76,7 +65,7 @@ export u8[] ghash(u8[] h, u8[] data) {
   }
 
   u8[] out = u8[16]();
-  storeBE(y[0], out, 0);
-  storeBE(y[1], out, 8);
+  storeBE64(y[0], out, 0);
+  storeBE64(y[1], out, 8);
   return out;
 }

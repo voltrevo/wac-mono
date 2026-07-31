@@ -8,12 +8,9 @@
 // This is the 32-bit-counter, 96-bit-nonce variant from RFC 8439, not the
 // original 64/64 split.
 
-u32 rotl(u32 x, u32 n) { return (x << n) | (x >> (32 - n)); }
+import { leWord32, storeLE32 } from "./layout.wac";
 
-/** Little-endian u32 at byte offset `i`. */
-u32 leWord(u8[] b, i32 i) {
-  return (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) as@ u32;
-}
+u32 rotl(u32 x, u32 n) { return (x << n) | (x >> (32 - n)); }
 
 /**
  * The quarter round, in place over the state array.
@@ -33,9 +30,9 @@ u32[] initialState(u8[] key, u32 counter, u8[] nonce) {
   u32[] s = u32[16]();
   // "expand 32-byte k", as four little-endian words.
   s[0] = 0x61707865; s[1] = 0x3320646e; s[2] = 0x79622d32; s[3] = 0x6b206574;
-  for (i32 i = 0; i < 8; i++) { s[4 + i] = leWord(key, i * 4); }
+  for (i32 i = 0; i < 8; i++) { s[4 + i] = leWord32(key, i * 4); }
   s[12] = counter;
-  for (i32 i = 0; i < 3; i++) { s[13 + i] = leWord(nonce, i * 4); }
+  for (i32 i = 0; i < 3; i++) { s[13 + i] = leWord32(nonce, i * 4); }
   return s;
 }
 
@@ -60,11 +57,7 @@ export u8[] chachaBlock(u8[] key, u32 counter, u8[] nonce) {
   u8[] out = u8[64]();
   for (i32 i = 0; i < 16; i++) {
     // The feed-forward add is what makes the core non-invertible.
-    u32 v = s[i] + start[i];
-    out[i * 4]     = (v & 255) as@ i32;
-    out[i * 4 + 1] = ((v >> 8) & 255) as@ i32;
-    out[i * 4 + 2] = ((v >> 16) & 255) as@ i32;
-    out[i * 4 + 3] = ((v >> 24) & 255) as@ i32;
+    storeLE32(s[i] + start[i], out, i * 4);
   }
   return out;
 }
