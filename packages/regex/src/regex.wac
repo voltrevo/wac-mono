@@ -1,0 +1,30 @@
+// The public face: compile a pattern, then search a subject.
+//
+// `search` is the unanchored match JavaScript's `exec` performs without the `g` flag: try to
+// match at each position from left to right and take the first that succeeds. That is a loop
+// around the anchored machine rather than something the machine does, which keeps the leftmost
+// rule in one obvious place.
+
+import { Program, runAt, NO_MATCH, BUDGET } from "./program.wac";
+import { compile as compilePattern } from "./compile.wac";
+
+export Program? compile(u8[] pattern) { return compilePattern(pattern); }
+
+/** Capture slots for a program: two per group, plus two for the whole match. */
+export i32 slotCount(Program p) { return (p.groups + 1) * 2; }
+
+/**
+ * Find the leftmost match at or after `at`, filling `caps`.
+ *
+ * Returns the start of the match, `NO_MATCH`, or `BUDGET` if the step limit ran out — which is
+ * deliberately not the same answer as "no match", so a caller can tell a refusal from a result.
+ */
+export i32 search(Program p, u8[] input, i32 at, i32[] caps, i32 budget) {
+  for (i32 start = at; start <= input.len(); start++) {
+    for (i32 i = 0; i < caps.len(); i++) { caps[i] = -1; }
+    i32 end = runAt(p, input, start, caps, budget);
+    if (end == BUDGET()) { return BUDGET(); }
+    if (end != NO_MATCH()) { return start; }
+  }
+  return NO_MATCH();
+}

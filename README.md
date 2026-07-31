@@ -18,6 +18,7 @@ compiler, this one is things built with it.
 | [`bignum`](packages/bignum/) | arbitrary-precision integers, semantics identical to `BigInt` |
 | [`url`](packages/url/) | WHATWG URL parsing, serialization and relative resolution |
 | [`codec`](packages/codec/) | base16, base32 and base64 from RFC 4648, strict on decode |
+| [`regex`](packages/regex/) | a backtracking regex engine with JavaScript's semantics |
 | [`std`](packages/std/) | `Vec<T>`, `Map<K, V>`, `Option<T>`, `Result<T, E>` — the containers generics made writable |
 | [`wactest`](packages/wactest/) | assertions for writing tests in wac |
 
@@ -67,6 +68,7 @@ deno task coverage:crypto
 deno task coverage:fmt
 deno task coverage:gzip
 deno task coverage:json
+deno task coverage:regex
 deno task coverage:std
 deno task coverage:url
 deno task mutate          # mutation testing
