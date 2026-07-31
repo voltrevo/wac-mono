@@ -11,6 +11,7 @@ compiler, this one is things built with it.
 | package | what it is |
 |---|---|
 | [`gzip`](packages/gzip/) | gzip and DEFLATE, both directions — compresses at or under `gzip -6` |
+| [`json`](packages/json/) | JSON parse and serialize, verified against the host's own JSON |
 | [`wactest`](packages/wactest/) | assertions for writing tests in wac |
 
 ## Layout
@@ -21,7 +22,7 @@ harness/           TypeScript for driving the compiler
   wacFiles.ts        read an entry file and its transitive imports
   wacBind.ts         compile -> bindgen -> importable JS module
   wacTestRun.ts      run wac-written tests as Deno tests
-tools/             coverage.ts, mutate.ts
+tools/             check.ts, coverage.ts, mutate.ts
 packages/<name>/
   src/               wac source
   test/              host-side tests (.test.ts)
@@ -50,6 +51,8 @@ Everything runs from the repo root, so one command covers every package.
 deno task test        # all tests, host-side and wac-written
 deno task coverage    # branch coverage of the wac sources
 deno task mutate      # mutation testing
+
+deno run --allow-read tools/check.ts <entry.wac>   # type-check one file, no run
 ```
 
 ## Two kinds of test

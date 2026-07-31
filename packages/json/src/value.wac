@@ -1,0 +1,134 @@
+// JSON value tree.
+//
+// Two things about wac shape this representation.
+//
+// There is no virtual dispatch — which method runs depends on the static type
+// at the call site, not the runtime type — so a `kind` tag on the base struct
+// plus `switch` is how you branch over a sum type. Testing `is JsonNumber` in
+// an if-chain would work too, but a tag maps to `br_table` and reads better.
+//
+// Strings are held as UTF-8 `i8[]`, not the built-in `string`. `string` has
+// only len/slice/indexOf and no way to build one from bytes or a codepoint, so
+// `\uXXXX` unescaping is impossible through it. Bytes also make the scanner a
+// `switch` over i32 rather than a chain of one-character string compares.
+
+export struct JsonValue {
+  const i32 kind;
+}
+
+// Tag values. `switch` needs i32 cases, and wac has no module-level constants,
+// so these are zero-argument functions the emitter inlines as calls.
+export i32 KIND_NULL()   { return 0; }
+export i32 KIND_BOOL()   { return 1; }
+export i32 KIND_NUMBER() { return 2; }
+export i32 KIND_STRING() { return 3; }
+export i32 KIND_ARRAY()  { return 4; }
+export i32 KIND_OBJECT() { return 5; }
+
+export struct JsonBool : JsonValue {
+  const bool value;
+
+  JsonBool of(bool v) { return JsonBool(1, v); }
+}
+
+// `raw` holds the number exactly as it appeared in the source. wac has no
+// float-to-string of any kind, so a serializer that had only `value` could not
+// print it; keeping the span lets a round-trip be exact and defers writing a
+// shortest-representation formatter.
+export struct JsonNumber : JsonValue {
+  const f64 value;
+  const i8[] raw;
+
+  JsonNumber of(f64 v, i8[] raw) { return JsonNumber(2, v, raw); }
+}
+
+export struct JsonString : JsonValue {
+  const i8[] bytes;
+
+  JsonString of(i8[] b) { return JsonString(3, b); }
+}
+
+// A null is just the base struct carrying tag 0 — no subtype needed.
+export JsonValue jsonNull() { return JsonValue(0); }
+
+// Growable array of values. wac has no generics, so this and JsonObject's
+// member list are the same growth logic written twice, differing only in
+// element type.
+export struct JsonArray : JsonValue {
+  JsonValue?[] items;
+  i32 count;
+
+  JsonArray create() { return JsonArray(4, JsonValue?[0](), 0); }
+
+  void push(this, JsonValue v) {
+    if (this.count == this.items.len()) {
+      i32 next = this.items.len() * 2;
+      if (next == 0) { next = 4; }
+      JsonValue?[] grown = JsonValue?[next]();
+      for (i32 i = 0; i < this.count; i++) {
+        grown[i] = this.items[i];
+      }
+      this.items = grown;
+    }
+    this.items[this.count] = v;
+    this.count++;
+  }
+
+  i32 len(const this) { return this.count; }
+
+  JsonValue at(const this, i32 i) {
+    if (i < 0 || i >= this.count) { trap; }
+    return this.items[i]!;
+  }
+}
+
+export struct JsonMember {
+  const i8[] key;
+  const JsonValue value;
+}
+
+export struct JsonObject : JsonValue {
+  JsonMember?[] members;
+  i32 count;
+
+  JsonObject create() { return JsonObject(5, JsonMember?[0](), 0); }
+
+  void push(this, i8[] key, JsonValue v) {
+    if (this.count == this.members.len()) {
+      i32 next = this.members.len() * 2;
+      if (next == 0) { next = 4; }
+      JsonMember?[] grown = JsonMember?[next]();
+      for (i32 i = 0; i < this.count; i++) {
+        grown[i] = this.members[i];
+      }
+      this.members = grown;
+    }
+    this.members[this.count] = JsonMember(key, v);
+    this.count++;
+  }
+
+  i32 len(const this) { return this.count; }
+
+  JsonMember at(const this, i32 i) {
+    if (i < 0 || i >= this.count) { trap; }
+    return this.members[i]!;
+  }
+
+  // Linear scan. A hash map would want generics over the value type; with none,
+  // every JSON object lookup is O(n) until a string-keyed map is hand-written.
+  JsonValue? get(const this, i8[] key) {
+    for (i32 i = 0; i < this.count; i++) {
+      JsonMember m = this.members[i]!;
+      if (bytesEqual(m.key, key)) { return m.value; }
+    }
+    return null;
+  }
+}
+
+export bool bytesEqual(i8[] a, i8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
