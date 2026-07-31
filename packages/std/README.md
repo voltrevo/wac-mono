@@ -90,11 +90,19 @@ match (found) {
 }
 ```
 
-`T?` is still the right thing for a nullable *reference*: one word, no allocation. `Option`
-earns its place where `T?` cannot go — a primitive (`i32?` is not usable today, [wac issue
-0045](../../../wac/issues/open/0045-nullable-primitives-are-not-boxed.md)), a nested absence
-(`T??` does not exist), and anywhere the absent case should be a compile error to forget.
-That last one is the real argument: `match` is exhaustive and a missing null check is not.
+`T?` works for every type, primitives included ([wac issue
+0045](../../../wac/issues/closed/0045-nullable-primitives-are-not-boxed.md)), and for a
+*reference* it is cheaper — one word, no allocation. So `Point?` is the right thing to write and
+`Option<Point>` is not.
+
+`Option` earns its place on two narrower grounds. **A nested absence:** `T??` does not exist, so
+a container of nullables cannot distinguish "no entry" from "an entry holding null" — which is
+why `Map.get` returns an Option rather than a `V?`, since `Map<string, JsonValue?>` is a real
+shape. **An absent case that is a compile error to forget:** `match` is exhaustive, and a
+missing null check is not.
+
+A nullable primitive is boxed and so is an Option, so between `i32?` and `Option<i32>` there is
+nothing to choose on cost. Pick by which of those two reasons applies.
 
 `mapOption(o, f)` is a free function rather than a method because a method cannot introduce a
 type parameter of its own — `U` is not the enum's:

@@ -1,16 +1,18 @@
 // Option<T> — a value that may be absent, without using null.
 //
-// wac has `T?` for reference types, and it is the right thing when T is a struct: one
-// word, no allocation. Option earns its place where `T?` cannot go:
+// wac has `T?`, and it works for every T including a primitive (wac issue 0045). For a
+// reference it is also cheaper — one word, no allocation — so `Point?` is the right thing to
+// write and `Option<Point>` is not. Option earns its place on two narrower grounds:
 //
-//   - a primitive. `i32?` is not usable today (wac issue 0045), and even when it is it
-//     means boxing, so `Option<i32>` is the honest way to say "an i32 or nothing".
-//   - a nested absence. `T??` does not exist, so a container of nullables cannot
-//     distinguish "no entry" from "an entry holding null". `Option<T?>` can.
-//   - a return type that must be matched rather than checked. `match` is exhaustive;
-//     forgetting a null check is not a compile error, and forgetting a `case` is.
+//   - **a nested absence.** `T??` does not exist, so a container of nullables cannot
+//     distinguish "no entry" from "an entry holding null". `Option<T?>` can, which is why
+//     `Map.get` returns one: `Map<string, JsonValue?>` is a real shape and `null` would be
+//     ambiguous in it.
+//   - **an absent case that is a compile error to forget.** `match` is exhaustive. A missing
+//     `case` is refused; a missing null check is not.
 //
-// `Map.get` returns one, which is what it is for here.
+// A nullable primitive is boxed, and so is an Option, so between `i32?` and `Option<i32>`
+// there is nothing to choose on cost — pick by which of the two reasons above applies.
 
 export enum Option<T> {
   Some(T v), None
