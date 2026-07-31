@@ -1,0 +1,243 @@
+// The wac parser, in wac. Port of wac/atoms/wac/wacParse.ts.
+//
+// Recursive descent over the token array the lexer produces, building into the flat
+// node pool in ast.wac. Structured as a `Parser` struct threaded through every
+// function, since wac has no closures to capture the position the way the reference
+// does.
+//
+// Scope so far: types, the full expression precedence ladder, and the statements a
+// function body needs. Struct declarations, imports and switch are not yet ported —
+// `parseSupported` reports what is covered so the differential test can say which
+// inputs it is entitled to compare.
+
+import { Ast, none, pack2, unpackLo, unpackHi,
+  tPrim, tStruct, tArray, tNullable, tFuncref,
+  eInt, eFloat, eString, eBool, eNull, eIdent, eUnary, eBinary, eCast, eIs,
+  eTernary, eCall, eIndex, eField, eUnwrap, eConstruct, eIncr, eArrNew,
+  sVar, sVarConst, sAssign, sIncr, sIf, sWhile, sFor, sDoWhile, sReturn,
+  sBreak, sContinue, sTrap, sBlock, sExpr,
+  lIdent, lField, lIndex, lUnwrap,
+  dParam, dFunc, dFuncExport, dProgram } from "./ast.wac";
+import { tokenStride } from "./lex.wac";
+import {
+  kInt, kFloat, kString, kIdent, kEof, kTrue, kFalse, kNull, kVoid, kFn,
+  kConst, kExport, kIf, kElse, kWhile, kFor, kDo, kReturn, kBreak, kContinue,
+  kTrap, kIs, kNot, kAs, kAsBang, kAsTilde, kAsAt, kThis,
+  kPlus, kMinus, kStar, kSlash, kPercent, kAssign, kEq, kNe,
+  kLt, kLe, kGt, kGe, kAndAnd, kOrOr, kBang, kAnd, kOr, kCaret, kTilde,
+  kShl, kShr, kShrU,
+  kPlusEq, kMinusEq, kStarEq, kSlashEq, kPercentEq,
+  kAndEq, kOrEq, kCaretEq, kShlEq, kShrEq, kShrUEq,
+  kInc, kDec,
+  kLparen, kRparen, kLbrace, kRbrace, kLbrack, kRbrack,
+  kSemi, kColon, kComma, kDot, kQuestion,
+} from "./kinds.wac";
+
+/** Parse errors, as (code, line, col) like the lexer's. */
+export i32 perrExpected()   { return 20; }
+export i32 perrBadType()    { return 21; }
+export i32 perrBadPrimary() { return 22; }
+export i32 perrBadLvalue()  { return 23; }
+export i32 perrTopLevel()   { return 24; }
+export i32 perrUnsupported() { return 25; }
+
+export struct Parsed {
+  Ast ast;
+  i32 root;
+  i32[] errors;
+  i32 errorCount;
+}
+
+struct Parser {
+  u8[] src;
+  i32[] toks;      // flat quintuples from lex
+  i32 tokCount;
+  i32 at;          // token index
+  Ast ast;
+  i32[] errors;
+  i32 errorCount;
+  i32[] scratch;   // shared collection buffer for list building
+  i32 scratchTop;  // high-water mark, so nested lists do not collide
+
+  // ── Token access ────────────────────────────────────────────────────────────
+
+  i32 kindAt(const this, i32 offset) {
+    i32 i = this.at + offset;
+    if (i >= this.tokCount) { i = this.tokCount - 1; }   // the eof token
+    return this.toks[i * tokenStride()];
+  }
+
+  i32 lineAt(const this, i32 offset) {
+    i32 i = this.at + offset;
+    if (i >= this.tokCount) { i = this.tokCount - 1; }
+    return this.toks[i * tokenStride() + 3];
+  }
+
+  i32 colAt(const this, i32 offset) {
+    i32 i = this.at + offset;
+    if (i >= this.tokCount) { i = this.tokCount - 1; }
+    return this.toks[i * tokenStride() + 4];
+  }
+
+  bool at1(const this, i32 kind) { return this.kindAt(0) == kind; }
+
+  i32 advance(this) {
+    i32 i = this.at;
+    if (this.at < this.tokCount - 1) { this.at++; }
+    return i;
+  }
+
+  bool eat(this, i32 kind) {
+    if (this.at1(kind)) { this.advance(); return true; }
+    return false;
+  }
+
+  i32 expect(this, i32 kind) {
+    if (this.at1(kind)) { return this.advance(); }
+    this.fail(perrExpected());
+    return this.at;
+  }
+
+  void fail(this, i32 code) {
+    i32 slot = this.errorCount * 3;
+    if (slot + 3 > this.errors.len()) { return; }
+    this.errors[slot] = code;
+    this.errors[slot + 1] = this.lineAt(0);
+    this.errors[slot + 2] = this.colAt(0);
+    this.errorCount++;
+  }
+
+  // ── Scratch lists ───────────────────────────────────────────────────────────
+  //
+  // Elements are collected into a shared buffer and committed to the pool in one
+  // go. `scratchTop` makes nesting safe: a nested list starts above whatever the
+  // outer one has collected so far.
+
+  i32 openList(this) { return this.scratchTop; }
+
+  void pushItem(this, i32 node) {
+    if (this.scratchTop >= this.scratch.len()) {
+      i32[] next = i32[this.scratch.len() * 2]();
+      for (i32 i = 0; i < this.scratchTop; i++) { next[i] = this.scratch[i]; }
+      this.scratch = next;
+    }
+    this.scratch[this.scratchTop] = node;
+    this.scratchTop++;
+  }
+
+  /** Commit everything pushed since `base` as a list, and release the scratch. */
+  i32 closeList(this, i32 base) {
+    i32 count = this.scratchTop - base;
+    i32[] items = i32[count]();
+    for (i32 i = 0; i < count; i++) { items[i] = this.scratch[base + i]; }
+    this.scratchTop = base;
+    return this.ast.addList(items, count);
+  }
+}
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+bool isPrimKind(i32 k) { return k == kVoid(); }
+
+/** Is the identifier at `offset` one of the primitive type names? */
+bool identIsPrim(Parser p, i32 offset) {
+  i32 i = p.at + offset;
+  i32 start = p.toks[i * tokenStride() + 1];
+  i32 len = p.toks[i * tokenStride() + 2];
+  return spanIsPrimName(p.src, start, len);
+}
+
+/**
+ * The primitive type names, matched by packing the span into an i64.
+ *
+ * The reference uses a `Set<string>`. There is no string-keyed set here, and every
+ * name is 8 bytes or fewer, so the same integer-packing trick the lexer uses for
+ * keywords applies — allocation free, and exact.
+ */
+bool spanIsPrimName(u8[] s, i32 start, i32 len) {
+  if (len < 2 || len > 6) { return false; }
+  i64 v = 0 as i64;
+  for (i32 i = 0; i < len; i++) {
+    v = (v << 8) | (s[start + i] as i64);
+  }
+  if (len == 2) {
+    return v == q2('i', '8') || v == q2('u', '8');
+  }
+  if (len == 3) {
+    return v == q3('i', '3', '2') || v == q3('i', '6', '4')
+        || v == q3('u', '3', '2') || v == q3('u', '6', '4')
+        || v == q3('f', '3', '2') || v == q3('f', '6', '4')
+        || v == q3('i', '1', '6') || v == q3('u', '1', '6');
+  }
+  if (len == 4) {
+    return v == q4('b', 'o', 'o', 'l') || v == q4('v', 'o', 'i', 'd');
+  }
+  if (len == 6) {
+    return v == q6('s', 't', 'r', 'i', 'n', 'g') || v == q6('a', 'n', 'y', 'r', 'e', 'f')
+        || v == q6('i', '3', '1', 'r', 'e', 'f');
+  }
+  return false;
+}
+
+i64 q2(i32 a, i32 b) { return ((a as i64) << 8) | (b as i64); }
+i64 q3(i32 a, i32 b, i32 c) { return (q2(a, b) << 8) | (c as i64); }
+i64 q4(i32 a, i32 b, i32 c, i32 d) { return (q3(a, b, c) << 8) | (d as i64); }
+i64 q6(i32 a, i32 b, i32 c, i32 d, i32 e, i32 f) {
+  return (((q4(a, b, c, d) << 8) | (e as i64)) << 8) | (f as i64);
+}
+
+i32 parseType(Parser p) {
+  i32 line = p.lineAt(0);
+  i32 col = p.colAt(0);
+  i32 node = -1;
+
+  if (p.at1(kFn())) {
+    p.advance();
+    p.expect(kLbrack());
+    i32 ret = parseType(p);
+    p.expect(kLparen());
+    i32 base = p.openList();
+    if (!p.at1(kRparen())) {
+      p.pushItem(parseType(p));
+      while (p.eat(kComma())) {
+        if (p.at1(kRparen())) { break; }
+        p.pushItem(parseType(p));
+      }
+    }
+    i32 params = p.closeList(base);
+    p.expect(kRparen());
+    p.expect(kRbrack());
+    node = p.ast.add(tFuncref(), ret, params, -1, line, col);
+  } else if (p.at1(kVoid())) {
+    i32 t = p.advance();
+    node = p.ast.add(tPrim(), t, -1, -1, line, col);
+  } else if (p.at1(kIdent())) {
+    bool prim = identIsPrim(p, 0);
+    i32 t = p.advance();
+    if (prim) {
+      node = p.ast.add(tPrim(), t, -1, -1, line, col);
+    } else {
+      node = p.ast.add(tStruct(), t, -1, -1, line, col);
+    }
+  } else {
+    p.fail(perrBadType());
+    p.advance();
+    return p.ast.add(tPrim(), -1, -1, -1, line, col);
+  }
+
+  // Suffixes bind left to right: `i32[]?[]` is an array of nullable arrays.
+  bool more = true;
+  while (more) {
+    if (p.at1(kLbrack()) && p.kindAt(1) == kRbrack()) {
+      p.advance();
+      p.advance();
+      node = p.ast.add(tArray(), node, -1, -1, line, col);
+    } else if (p.at1(kQuestion())) {
+      p.advance();
+      node = p.ast.add(tNullable(), node, -1, -1, line, col);
+    } else {
+      more = false;
+    }
+  }
+  return node;
+}

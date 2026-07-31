@@ -1,0 +1,263 @@
+// The AST, as a flat pool of fixed-width records.
+//
+// The reference uses discriminated unions — 5 type variants, 17 expression
+// variants, 14 statement variants, 4 lvalue variants, each a distinct object shape.
+// wac has neither sum types nor generics, so the two available shapes are:
+//
+//   a struct per variant, plus a base struct with a `kind` tag, plus a downcast at
+//   every use — 40 structs and an `as!` on every branch (what wac-json does); or
+//
+//   one integer array holding fixed-width records, with children referenced by
+//   index.
+//
+// This takes the second. It is not a workaround chosen for lack of anything better:
+// real compilers do this deliberately (Zig's AST, Roslyn's green trees) because it
+// removes an allocation per node and makes the whole tree one contiguous block. It
+// also makes the differential test easy, since dumping a pool is trivial.
+//
+// The cost is that every field access is an untyped integer offset. `a`, `b`, `c`
+// mean different things per tag, and nothing checks it — the comments below are the
+// only schema there is. That is the real price of no sum types, and it is paid on
+// every line that touches a node rather than once at the definition.
+
+// ── Record layout ─────────────────────────────────────────────────────────────
+
+/** i32s per node: tag, a, b, c, line, col. */
+export i32 nodeStride() { return 6; }
+
+// Field offsets within a record.
+export i32 fTag()  { return 0; }
+export i32 fA()    { return 1; }
+export i32 fB()    { return 2; }
+export i32 fC()    { return 3; }
+export i32 fLine() { return 4; }
+export i32 fCol()  { return 5; }
+
+// ── Tags ──────────────────────────────────────────────────────────────────────
+//
+// Numbered by category so a range check can classify a node without a table:
+// types 100+, expressions 200+, statements 300+, lvalues 400+, top level 500+.
+//
+// Field meanings are given per tag. `n:` is a node index, `t:` a token index,
+// `l:` a list handle (see below), `-` unused.
+
+// Types ------------------------------------------------------------------------
+/** a: token of the name, b: -, c: - */
+export i32 tPrim()     { return 100; }
+/** a: token of the name */
+export i32 tStruct()   { return 101; }
+/** a: n element type */
+export i32 tArray()    { return 102; }
+/** a: n inner type */
+export i32 tNullable() { return 103; }
+/** a: n return type, b: l param types */
+export i32 tFuncref()  { return 104; }
+
+// Expressions ------------------------------------------------------------------
+/** a: t literal token */
+export i32 eInt()     { return 200; }
+/** a: t literal token */
+export i32 eFloat()   { return 201; }
+/** a: t literal token */
+export i32 eString()  { return 202; }
+/** a: 1 for true, 0 for false */
+export i32 eBool()    { return 203; }
+export i32 eNull()    { return 204; }
+/** a: t identifier token */
+export i32 eIdent()   { return 205; }
+/** a: t operator token, b: n operand */
+export i32 eUnary()   { return 206; }
+/** a: t operator token, b: n left, c: n right */
+export i32 eBinary()  { return 207; }
+/** a: t cast operator token, b: n operand, c: n target type */
+export i32 eCast()    { return 208; }
+/** a: n operand, b: n type or -1, c: 1 when negated (`is not`) */
+export i32 eIs()      { return 209; }
+/** a: n condition, b: n then, c: n else */
+export i32 eTernary() { return 210; }
+/** a: n callee, b: l arguments */
+export i32 eCall()    { return 211; }
+/** a: n array, b: n index */
+export i32 eIndex()   { return 212; }
+/** a: n object, b: t field name token */
+export i32 eField()   { return 213; }
+/** a: n operand */
+export i32 eUnwrap()  { return 214; }
+/** a: n type, b: l positional args, c: l named initialisers or -1 */
+export i32 eConstruct() { return 215; }
+/** a: n lvalue, b: t operator token, c: 1 when prefix */
+export i32 eIncr()    { return 216; }
+/** a: n element type, b: n size or -1, c: l fixed elements */
+export i32 eArrNew()  { return 217; }
+
+// Statements -------------------------------------------------------------------
+/** a: n type, b: t name token, c: n initialiser; const-ness in `d` is folded into the tag */
+export i32 sVar()      { return 300; }
+export i32 sVarConst() { return 301; }
+/** a: n lvalue, b: t operator token, c: n right-hand side */
+export i32 sAssign()   { return 302; }
+/** a: n lvalue, b: t operator token */
+export i32 sIncr()     { return 303; }
+/** a: n condition, b: l then block, c: n else branch or -1 */
+export i32 sIf()       { return 304; }
+/** a: n condition, b: l body */
+export i32 sWhile()    { return 305; }
+/** a: n init or -1, b: n condition or -1, c: packed (update, body) — see forParts */
+export i32 sFor()      { return 306; }
+/** a: l body, b: n condition */
+export i32 sDoWhile()  { return 307; }
+/** a: n subject, b: l cases */
+export i32 sSwitch()   { return 308; }
+/** a: n value or -1 */
+export i32 sReturn()   { return 309; }
+export i32 sBreak()    { return 310; }
+export i32 sContinue() { return 311; }
+export i32 sTrap()     { return 312; }
+/** a: l statements */
+export i32 sBlock()    { return 313; }
+/** a: n expression */
+export i32 sExpr()     { return 314; }
+/** a: n value or -1 for `default`, b: l statements */
+export i32 sCase()     { return 315; }
+
+// Lvalues ----------------------------------------------------------------------
+/** a: t identifier token */
+export i32 lIdent()  { return 400; }
+/** a: n base, b: t field token */
+export i32 lField()  { return 401; }
+/** a: n base, b: n index */
+export i32 lIndex()  { return 402; }
+/** a: n base */
+export i32 lUnwrap() { return 403; }
+
+// Top level --------------------------------------------------------------------
+/** a: t path token, b: l items */
+export i32 dImport()     { return 500; }
+/** a: t name token, b: t alias token */
+export i32 dImportItem() { return 501; }
+/** a: t name token, b: n type */
+export i32 dParam()      { return 502; }
+/** a: t name token, b: n type, c: 1 when const */
+export i32 dField()       { return 503; }
+/** a: t name token, b: n return type, c: packed (params, body) */
+export i32 dFunc()        { return 504; }
+export i32 dFuncExport()  { return 505; }
+/** a: t name token, b: l members, c: packed (parent token, flags) */
+export i32 dStruct()      { return 506; }
+/** a: t name token, b: n return type, c: packed (params, body); flags in `line` sign */
+export i32 dMethod()      { return 507; }
+/** a: l declarations */
+export i32 dProgram()     { return 508; }
+
+// ── The pool ──────────────────────────────────────────────────────────────────
+
+/**
+ * Nodes and lists in two integer arrays.
+ *
+ * `lists` holds runs of node indices; a list handle is an offset into it, with the
+ * length stored at that offset and the elements after. Nodes reference lists by
+ * handle, so a variable-arity node stays fixed width.
+ *
+ * Both arrays are grown by doubling. This is the fourth growable container in the
+ * repo — after gzip's `Buf`, json's, and the lexer's flat token array — which is
+ * the single most repeated cost of having no generics.
+ */
+export struct Ast {
+  i32[] nodes;
+  i32 nodeCount;
+  i32[] lists;
+  i32 listLen;
+
+  Ast create() {
+    return Ast(i32[1024](), 0, i32[1024](), 0);
+  }
+
+  void growNodes(this) {
+    if ((this.nodeCount + 1) * nodeStride() <= this.nodes.len()) { return; }
+    i32[] next = i32[this.nodes.len() * 2]();
+    for (i32 i = 0; i < this.nodeCount * nodeStride(); i++) {
+      next[i] = this.nodes[i];
+    }
+    this.nodes = next;
+  }
+
+  /** Append a node, returning its index. */
+  i32 add(this, i32 tag, i32 a, i32 b, i32 c, i32 line, i32 col) {
+    this.growNodes();
+    i32 at = this.nodeCount * nodeStride();
+    this.nodes[at + fTag()] = tag;
+    this.nodes[at + fA()] = a;
+    this.nodes[at + fB()] = b;
+    this.nodes[at + fC()] = c;
+    this.nodes[at + fLine()] = line;
+    this.nodes[at + fCol()] = col;
+    this.nodeCount++;
+    return this.nodeCount - 1;
+  }
+
+  i32 field(const this, i32 node, i32 which) {
+    return this.nodes[node * nodeStride() + which];
+  }
+
+  i32 tag(const this, i32 node)  { return this.field(node, fTag()); }
+  i32 a(const this, i32 node)    { return this.field(node, fA()); }
+  i32 b(const this, i32 node)    { return this.field(node, fB()); }
+  i32 c(const this, i32 node)    { return this.field(node, fC()); }
+  i32 line(const this, i32 node) { return this.field(node, fLine()); }
+  i32 col(const this, i32 node)  { return this.field(node, fCol()); }
+
+  void setB(this, i32 node, i32 v) { this.nodes[node * nodeStride() + fB()] = v; }
+  void setC(this, i32 node, i32 v) { this.nodes[node * nodeStride() + fC()] = v; }
+
+  void growLists(this, i32 need) {
+    if (this.listLen + need <= this.lists.len()) { return; }
+    i32 cap = this.lists.len() * 2;
+    while (this.listLen + need > cap) { cap *= 2; }
+    i32[] next = i32[cap]();
+    for (i32 i = 0; i < this.listLen; i++) {
+      next[i] = this.lists[i];
+    }
+    this.lists = next;
+  }
+
+  /**
+   * Reserve a list of `count` slots, returning its handle.
+   *
+   * Two-step rather than one because the parser discovers elements as it goes: it
+   * collects into a scratch array, then commits. Committing copies, which is the
+   * price of not having a growable-list-of-lists.
+   */
+  i32 addList(this, i32[] items, i32 count) {
+    this.growLists(count + 1);
+    i32 handle = this.listLen;
+    this.lists[handle] = count;
+    for (i32 i = 0; i < count; i++) {
+      this.lists[handle + 1 + i] = items[i];
+    }
+    this.listLen += count + 1;
+    return handle;
+  }
+
+  i32 listCount(const this, i32 handle) {
+    if (handle < 0) { return 0; }
+    return this.lists[handle];
+  }
+
+  i32 listAt(const this, i32 handle, i32 i) {
+    return this.lists[handle + 1 + i];
+  }
+}
+
+/**
+ * Two node indices in one field.
+ *
+ * `sFor` and `dFunc` need four references and a record holds three, so two are
+ * packed into 16 bits each. 65535 nodes per file is far beyond anything real —
+ * `wacEmitFunc.ts`, the largest source here, is about 4000 nodes.
+ */
+export i32 pack2(i32 lo, i32 hi) { return (lo & 0xFFFF) | ((hi & 0xFFFF) << 16); }
+export i32 unpackLo(i32 v) { return v & 0xFFFF; }
+export i32 unpackHi(i32 v) { return (v >>> 16) & 0xFFFF; }
+
+/** -1 does not survive packing, so absence is this instead. */
+export i32 none() { return 0xFFFF; }
