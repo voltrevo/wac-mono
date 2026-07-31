@@ -1,9 +1,12 @@
 // Integer to decimal string.
 //
+// Lives here with ftoa because it is the same job for the other numeric type, and
+// wactest — which needed it first, for failure messages — is a test library rather
+// than the natural home for number formatting.
+//
 // wac has no number-to-string conversion and `string + i32` is deliberately a
-// compile error, so a failure message that names the offending value needs this
-// first. It works because indexing a string yields a one-character string, so a
-// digit table can be indexed directly.
+// compile error. This works because indexing a string yields a one-character
+// string, so a digit table can be indexed directly.
 
 /**
  * Decimal representation of `n`, with a leading `-` when negative.

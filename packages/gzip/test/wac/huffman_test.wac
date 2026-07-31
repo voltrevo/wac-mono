@@ -11,7 +11,7 @@
 // and therefore the way to exercise DEFLATE's 15-bit limit.
 
 import { T } from "../../../wactest/src/assert.wac";
-import { itoa } from "../../../wactest/src/itoa.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
 import { Huff } from "../../src/huffman.wac";
 
 i32[] fibFreqs(i32 count) {
