@@ -74,6 +74,32 @@ gunzipBytes(gz)    // read a gzip member
 inflate(data)      // read a raw deflate stream
 ```
 
+## Throughput
+
+`deno task bench`. On 1 MiB, after wac's bindgen gained bulk array transfer:
+
+| | MB/s |
+|---|---:|
+| host/wasm boundary (identity) | 776 |
+| stored blocks | 34 |
+| dynamic, text | 9.4 |
+| dynamic, already-compressible | 36 |
+| inflate, text | 33 |
+| _python zlib compress, text_ | 49 |
+| _python zlib decompress, text_ | 643 |
+
+Scaling is flat from 16K to 4 MB, so the match search and hash inserts are linear.
+
+The decompression gap is the honest one: zlib decodes Huffman through lookup
+tables, this walks the canonical code one bit at a time — zlib's `puff` reference
+approach, chosen for being readable. A table-driven decoder is the obvious next
+step.
+
+Stored blocks at 34 MB/s against a 776 MB/s boundary means the remaining cost is
+`Buf.push` per byte plus a final copy in `bytes()`. WasmGC has an `array.copy`
+instruction; wac does not expose it, so there is no way to write a bulk copy in
+wac today.
+
 ## Known limitations
 
 - **Single-member only.** Concatenated gzip members are legal; this reads the
