@@ -12,7 +12,7 @@ compiler, this one is things built with it.
 |---|---|
 | [`bytes`](packages/bytes/) | `Buf`, the growable byte buffer both other packages build on |
 | [`fmt`](packages/fmt/) | `f64` to its shortest decimal, matching JavaScript exactly |
-| [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR — checked against WebCrypto, a BigInt reference and the published vectors |
+| [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM — checked against WebCrypto, a BigInt reference and the published vectors |
 | [`gzip`](packages/gzip/) | gzip and DEFLATE, both directions — compresses at or under `gzip -6` |
 | [`json`](packages/json/) | JSON parse and serialize, verified against the host's own JSON |
 | [`wactest`](packages/wactest/) | assertions for writing tests in wac |

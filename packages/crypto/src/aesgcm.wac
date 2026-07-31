@@ -1,0 +1,162 @@
+// AES-GCM (NIST SP 800-38D).
+//
+// CTR for confidentiality, GHASH for authenticity, sharing one key: the hash
+// subkey is H = E_K(0^128), so a GCM implementation is the block cipher plus
+// GHASH plus careful bookkeeping about counters and lengths.
+//
+// The bookkeeping is where GCM goes wrong, so it is spelled out here:
+//
+//   J0 = IV || 0^31 || 1                    when the IV is 96 bits
+//   J0 = GHASH_H(IV || 0^s || [len(IV)]_64) otherwise
+//   C  = GCTR(inc32(J0), P)                 — the message starts one past J0
+//   S  = GHASH_H(A || pad || C || pad || [len(A)]_64 || [len(C)]_64)
+//   T  = E_K(J0) xor S                      — J0 itself, not inc32(J0)
+//
+// The lengths are bit counts, not byte counts.
+
+import { aesExpandKey, aesEncryptBlock, aesRounds } from "./aes.wac";
+import { ghash } from "./ghash.wac";
+
+/**
+ * Increment the low 32 bits of a 16-byte counter block, wrapping at 2^32.
+ *
+ * SP 800-38D defines inc_32 as leaving the upper 96 bits alone: a carry out of
+ * the low word wraps rather than propagating. Exported only so that wrap can be
+ * tested — reaching it through gcmEncrypt would take 2^32 blocks, so it is an
+ * untestable branch otherwise, and it is the kind of branch that is wrong in
+ * real implementations.
+ */
+export void gcmInc32(u8[] ctr) { inc32(ctr); }
+
+void inc32(u8[] ctr) {
+  for (i32 i = 15; i >= 12; i--) {
+    i32 v = ctr[i] + 1;
+    ctr[i] = v & 0xFF;
+    if (v < 256) { return; }
+  }
+}
+
+/** Bytes needed to round `n` up to a whole block. */
+i32 padTo16(i32 n) {
+  i32 r = n % 16;
+  return r == 0 ? 0 : 16 - r;
+}
+
+/** The hash subkey: the block cipher applied to a block of zeros. */
+u8[] hashSubkey(u8[] w, i32 nr) {
+  return aesEncryptBlock(w, u8[16](), nr);
+}
+
+/**
+ * The pre-counter block J0.
+ *
+ * A 96-bit IV is the common case and is used directly. Any other length is
+ * hashed, which is why this needs H before it can start.
+ */
+u8[] initialCounter(u8[] h, u8[] iv) {
+  u8[] j0 = u8[16]();
+  if (iv.len() == 12) {
+    for (i32 i = 0; i < 12; i++) { j0[i] = iv[i]; }
+    j0[15] = 1;
+    return j0;
+  }
+  // GHASH over the IV padded to a block boundary, then its bit length.
+  i32 pad = padTo16(iv.len());
+  u8[] buf = u8[iv.len() + pad + 16]();
+  for (i32 i = 0; i < iv.len(); i++) { buf[i] = iv[i]; }
+  u64 bits = (iv.len() as! u64) * 8;
+  i32 at = iv.len() + pad + 8;
+  for (i32 j = 0; j < 8; j++) {
+    buf[at + j] = ((bits >> (((7 - j) * 8) as! u64)) & 255) as! i32;
+  }
+  return ghash(h, buf);
+}
+
+/** GCTR: xor `data` with the keystream from counter block `ctr0`. */
+u8[] gctr(u8[] w, i32 nr, u8[] ctr0, u8[] data) {
+  i32 n = data.len();
+  u8[] out = u8[n]();
+  if (n == 0) { return out; }
+
+  u8[] ctr = u8[16]();
+  for (i32 i = 0; i < 16; i++) { ctr[i] = ctr0[i]; }
+
+  i32 pos = 0;
+  while (pos < n) {
+    u8[] ks = aesEncryptBlock(w, ctr, nr);
+    i32 take = n - pos < 16 ? n - pos : 16;
+    for (i32 j = 0; j < take; j++) { out[pos + j] = data[pos + j] ^ ks[j]; }
+    inc32(ctr);
+    pos += 16;
+  }
+  return out;
+}
+
+/**
+ * The tag input: aad || pad || ciphertext || pad || bitlen(aad) || bitlen(ct).
+ *
+ * The trailing lengths are what stop a byte moving between the associated data
+ * and the ciphertext without changing the tag.
+ */
+u8[] tagInput(u8[] aad, u8[] ct) {
+  i32 ap = padTo16(aad.len());
+  i32 cp = padTo16(ct.len());
+  u8[] m = u8[aad.len() + ap + ct.len() + cp + 16]();
+
+  i32 p = 0;
+  for (i32 i = 0; i < aad.len(); i++) { m[p] = aad[i]; p++; }
+  p += ap;
+  for (i32 i = 0; i < ct.len(); i++) { m[p] = ct[i]; p++; }
+  p += cp;
+
+  u64 abits = (aad.len() as! u64) * 8;
+  u64 cbits = (ct.len() as! u64) * 8;
+  for (i32 j = 0; j < 8; j++) {
+    m[p + j]     = ((abits >> (((7 - j) * 8) as! u64)) & 255) as! i32;
+    m[p + 8 + j] = ((cbits >> (((7 - j) * 8) as! u64)) & 255) as! i32;
+  }
+  return m;
+}
+
+/** Ciphertext for `plain`. The tag is a separate call, so callers pick the framing. */
+export u8[] gcmEncrypt(u8[] key, u8[] iv, u8[] plain) {
+  if (iv.len() == 0) { trap; }
+  u8[] w = aesExpandKey(key);
+  i32 nr = aesRounds(key.len());
+  u8[] j0 = initialCounter(hashSubkey(w, nr), iv);
+  u8[] c = u8[16]();
+  for (i32 i = 0; i < 16; i++) { c[i] = j0[i]; }
+  inc32(c);
+  return gctr(w, nr, c, plain);
+}
+
+/** The 16-byte tag over `aad` and `ct`. */
+export u8[] gcmTag(u8[] key, u8[] iv, u8[] aad, u8[] ct) {
+  if (iv.len() == 0) { trap; }
+  u8[] w = aesExpandKey(key);
+  i32 nr = aesRounds(key.len());
+  u8[] h = hashSubkey(w, nr);
+  u8[] j0 = initialCounter(h, iv);
+  u8[] s = ghash(h, tagInput(aad, ct));
+  // The tag masks S with E_K(J0) — J0 itself, before any increment.
+  u8[] mask = aesEncryptBlock(w, j0, nr);
+  u8[] t = u8[16]();
+  for (i32 i = 0; i < 16; i++) { t[i] = s[i] ^ mask[i]; }
+  return t;
+}
+
+/**
+ * Plaintext for `ct`, or a trap if the tag does not match.
+ *
+ * Trapping rather than returning a status is deliberate, as in the ChaCha20
+ * AEAD: wac cannot express a result the caller is forced to inspect, and an
+ * AEAD whose failure can be ignored is the classic misuse.
+ */
+export u8[] gcmDecrypt(u8[] key, u8[] iv, u8[] aad, u8[] ct, u8[] tag) {
+  if (tag.len() != 16) { trap; }
+  u8[] want = gcmTag(key, iv, aad, ct);
+  i32 diff = 0;
+  for (i32 i = 0; i < 16; i++) { diff |= want[i] ^ tag[i]; }
+  if (diff != 0) { trap; }
+  return gcmEncrypt(key, iv, ct);
+}

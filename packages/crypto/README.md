@@ -1,6 +1,6 @@
 # crypto
 
-SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305 and AES-CTR,
+SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR and AES-GCM,
 written in wac.
 
 A package of [wac-mono](../../README.md) — see the root README for layout and how
@@ -15,6 +15,7 @@ import { chacha20 } from "../../crypto/src/chacha20.wac";
 import { aeadEncrypt, aeadTag, aeadDecrypt } from "../../crypto/src/aead.wac";
 import { aesEncrypt, aesDecrypt } from "../../crypto/src/aes.wac";
 import { aesCtr } from "../../crypto/src/aesctr.wac";
+import { gcmEncrypt, gcmTag, gcmDecrypt } from "../../crypto/src/aesgcm.wac";
 
 u8[] digest = sha256(msg);                     // 32 bytes
 u8[] tag    = hmacSha256(key, msg);            // 32 bytes
@@ -39,9 +40,40 @@ u8[] opened = aeadDecrypt(key, nonce, aad, sealed, tag);   // traps if forged
 | ChaCha20-Poly1305 | RFC 8439 §2.8 | done |
 | AES-128/192/256 | FIPS 197 | done, encrypt and decrypt |
 | AES-CTR | SP 800-38A | done, full 128-bit counter |
+| GHASH | SP 800-38D §6.4 | done |
+| AES-GCM | SP 800-38D | done, any IV length |
 
-Not here: AES-GCM, which needs GHASH — multiplication in GF(2^128) — and so a
-second field implementation beyond Poly1305's.
+Everything the suite set out to cover is here.
+
+### GHASH, and testing field arithmetic without vectors
+
+GF(2^128) multiplication is where GCM hides. The bit order is reversed from the
+obvious one — the *most* significant bit of the first byte is the coefficient of
+x^0 — which is why the reduction constant appears as `0xE1...` at the top of the
+high word rather than `0x87` at the bottom of the low word.
+
+After the S-box, the lesson was that spot values do not catch a subtly wrong
+table, and the same applies to a subtly wrong field. So GHASH is checked
+*algebraically*, on properties no single vector can fake:
+
+- **bilinear**: `H·(X ⊕ Y) = H·X ⊕ H·Y`, over 300 random triples
+- **has the right identity**: `0x80 00…00` is 1 in this bit order
+- **commutative**: `A·B = B·A`
+
+Any of those fails immediately if the reduction constant or the bit order is
+wrong, and they exercise the reduction path far more than a vector list does.
+
+### The branch a test suite cannot reach
+
+GCM's counter increments only the low 32 bits and *wraps* there; a carry into the
+upper 96 bits would be wrong. Reaching that through `gcmEncrypt` needs 2^32
+blocks, so it is unreachable in a test — and a mutation that carries all 128 bits
+passed every other test in the package.
+
+`gcmInc32` is therefore exported purely so the wrap can be pinned directly. That
+is a real trade — an internal in the public surface — taken because the
+alternative is an untested branch in security code of exactly the kind that is
+wrong in real implementations.
 
 ### The AES S-box, and a lesson about generated tables
 
@@ -125,7 +157,7 @@ more ground than a vector list, and catches padding mistakes at 55/56/63/64
 bytes where they hide.
 
 **The published vectors.** FIPS 197 appendices B and C for AES at all three key
-sizes, SP 800-38A F.5.1 for CTR, NIST for SHA-256 and SHA-512 including the
+sizes, SP 800-38A F.5.1 for CTR, the McGrew–Viega GCM cases 1–6, NIST for SHA-256 and SHA-512 including the
 million-`a` case for both,
 RFC 4231 for HMAC including the 131-byte key that forces the hash-the-key path,
 RFC 5869 for HKDF including the empty-salt case, RFC 8439 for ChaCha20, Poly1305
@@ -159,10 +191,18 @@ fields in the MAC input exist to prevent.
 
 WebCrypto has no raw block cipher, but AES-CTR with counter block B over an
 all-zero plaintext returns E(B) — so the host is an oracle for the primitive
-itself, not only for the mode.
+itself, not only for the mode. It does implement AES-GCM, so that whole
+construction is compared against it across key sizes, AAD sizes and message
+lengths — but only at a 96-bit IV, since WebCrypto rejects every other length.
+The GHASH-derived `J0` path therefore has no host oracle and rests on the
+published 64-bit and 480-bit IV vectors.
 
-Verified by mutation. In AES: the GF reduction polynomial 0x1B → 0x1D fails 6
-tests, swapped MixColumns coefficients 7, ShiftRows off by one 7, AES-192's
+Verified by mutation. In GHASH and GCM: the reduction constant `0xE1` → `0x87`
+fails 4 tests, reversing the bit order in the low word 6, masking the tag with
+`E(inc32(J0))` instead of `E(J0)` four, a length field in bytes rather than bits
+4, and the counter carrying past 32 bits 2 — that last one caught *nothing*
+until the test above was added, which is why it is there. In AES: the GF
+reduction polynomial 0x1B → 0x1D fails 6 tests, swapped MixColumns coefficients 7, ShiftRows off by one 7, AES-192's
 round count 12 → 11 four, and the Rcon index off by one 6. Changing one SHA-256
 rotation constant from 25 to 26 fails 11 tests; one ChaCha20 quarter-round rotate from 7 to 8 fails 4. In Poly1305:
 the fold factor 5 → 4 fails 5, a loosened clamp mask fails 5, the high bit at
