@@ -1,0 +1,23 @@
+// Unsigned integer to decimal string.
+//
+// itoa cannot serve: it takes an i32, so every value above 2147483647 would
+// arrive as a negative and print as one. Unsigned `/` and `%` are what make the
+// loop below the obvious thing it looks like — over i64 the same code goes
+// wrong at exactly the values that need it.
+//
+// u32 callers widen first: `utoa64(x as u64)` is lossless.
+
+/** Decimal representation of `n`. Never signed — a u64 has no negative values. */
+export string utoa64(u64 n) {
+  if (n == 0) { return "0"; }
+
+  string digits = "0123456789";
+  string out = "";
+  u64 m = n;
+  while (m > 0) {
+    // The remainder is 0..9, so the narrowing cannot trap; `as!` says so.
+    out = digits[(m % 10) as! i32] + out;
+    m /= 10;
+  }
+  return out;
+}

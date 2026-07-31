@@ -1,0 +1,30 @@
+// itoa64 / utoa64 — the boundary values, checked in wac. The exhaustive
+// comparison against the host lives in ../itoa64.test.ts, which has an oracle.
+
+import { T } from "../../src/assert.wac";
+import { itoa64 } from "../../src/itoa64.wac";
+import { utoa64 } from "../../src/utoa64.wac";
+
+export string test_utoa64_range() {
+  T t = T.create();
+  t.eqStr(utoa64(0), "0", "zero");
+  t.eqStr(utoa64(9), "9", "one digit");
+  t.eqStr(utoa64(10), "10", "carry");
+  t.eqStr(utoa64(4294967295), "4294967295", "u32 max");
+  t.eqStr(utoa64(4294967296), "4294967296", "one past u32 max");
+  // The whole reason utoa64 exists: this is negative read as an i64.
+  t.eqStr(utoa64(9223372036854775808), "9223372036854775808", "i64 max + 1");
+  t.eqStr(utoa64(18446744073709551615), "18446744073709551615", "u64 max");
+  return t.report();
+}
+
+export string test_itoa64_signs() {
+  T t = T.create();
+  t.eqStr(itoa64(0), "0", "zero");
+  t.eqStr(itoa64(-1), "-1", "minus one");
+  t.eqStr(itoa64(9223372036854775807), "9223372036854775807", "i64 max");
+  // Negating i64's minimum overflows back to itself; reading those bits as
+  // unsigned is what gives the right magnitude.
+  t.eqStr(itoa64(-9223372036854775808), "-9223372036854775808", "i64 min");
+  return t.report();
+}

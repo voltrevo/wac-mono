@@ -1,0 +1,6 @@
+// Host-visible wrappers, so the differential test can reach the formatters.
+import { itoa64 } from "../../src/itoa64.wac";
+import { utoa64 } from "../../src/utoa64.wac";
+
+export string u(u64 n) { return utoa64(n); }
+export string i(i64 n) { return itoa64(n); }

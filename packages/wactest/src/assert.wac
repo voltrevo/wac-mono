@@ -23,6 +23,8 @@
 // cannot run inside wasm and belong in a host-side test.
 
 import { itoa } from "./itoa.wac";
+import { itoa64 } from "./itoa64.wac";
+import { utoa64 } from "./utoa64.wac";
 import { ftoa } from "../../fmt/src/ftoa.wac";
 
 // Decimal for a u32. itoa cannot serve: it takes an i32, and every value above
@@ -88,7 +90,7 @@ export struct T {
   // its own formatter.
   void eqU32(this, u32 got, u32 want, string what) {
     if (got != want) {
-      this.fail(what + ": got " + utoa(got) + ", want " + utoa(want));
+      this.fail(what + ": got " + utoa64(got as u64) + ", want " + utoa64(want as u64));
     }
   }
 
@@ -109,6 +111,18 @@ export struct T {
   void eqF64(this, f64 got, f64 want, string what) {
     if (f64.toBits(got) != f64.toBits(want)) {
       this.fail(what + ": got " + ftoa(got) + ", want " + ftoa(want));
+    }
+  }
+
+  void eqI64(this, i64 got, i64 want, string what) {
+    if (got != want) {
+      this.fail(what + ": got " + itoa64(got) + ", want " + itoa64(want));
+    }
+  }
+
+  void eqU64(this, u64 got, u64 want, string what) {
+    if (got != want) {
+      this.fail(what + ": got " + utoa64(got) + ", want " + utoa64(want));
     }
   }
 

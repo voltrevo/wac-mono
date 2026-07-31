@@ -1,0 +1,15 @@
+// Signed 64-bit integer to decimal string.
+
+import { utoa64 } from "./utoa64.wac";
+
+/**
+ * Decimal representation of `n`, with a leading `-` when negative.
+ *
+ * i64's minimum needs no special case here, unlike itoa's. Negating it does
+ * overflow back to itself — but those same bits read as unsigned are exactly
+ * its magnitude, which is what utoa64 wants, so two's complement does the work.
+ */
+export string itoa64(i64 n) {
+  if (n >= 0) { return utoa64(n as! u64); }
+  return "-" + utoa64((0 - n) as@ u64);
+}
