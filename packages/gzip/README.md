@@ -126,7 +126,7 @@ writable in wac today.
   statistics would compress better split into blocks with their own codes.
 - **Whole-buffer, not streaming.** Input and output are both fully in memory.
 
-`i8[]` crosses the wasm boundary as a `Uint8Array` via wac's bindgen, so the
+`u8[]` crosses the wasm boundary as a `Uint8Array` via wac's bindgen, so the
 exports are plain `(data: Uint8Array) => Uint8Array` on the JS side.
 
 ## Testing

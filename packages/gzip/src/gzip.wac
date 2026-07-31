@@ -27,14 +27,14 @@ void header(Buf out) {
 
 // One stored block: 3 header bits (BFINAL, BTYPE=00) then, because BTYPE=00
 // aligns to a byte boundary, LEN / ~LEN and the raw bytes.
-void storedBlock(Buf out, i8[] data, i32 start, i32 count, bool isFinal) {
+void storedBlock(Buf out, u8[] data, i32 start, i32 count, bool isFinal) {
   out.push(isFinal ? 1 : 0);
   out.pushU16(count);
   out.pushU16((~count) & 0xFFFF);
   out.pushBytes(data, start, count);
 }
 
-export i8[] gzipStored(i8[] data) {
+export u8[] gzipStored(u8[] data) {
   Buf out = Buf.create();
   header(out);
 
@@ -58,7 +58,7 @@ export i8[] gzipStored(i8[] data) {
 }
 
 /** Wrap an already-compressed deflate stream in the gzip container. */
-i8[] wrap(i8[] data, i8[] body) {
+u8[] wrap(u8[] data, u8[] body) {
   Buf out = Buf.create();
   header(out);
   out.pushBytes(body, 0, body.len());
@@ -68,12 +68,12 @@ i8[] wrap(i8[] data, i8[] body) {
 }
 
 /** Same container, but the payload is a fixed-Huffman deflate stream. */
-export i8[] gzipFixed(i8[] data) {
+export u8[] gzipFixed(u8[] data) {
   return wrap(data, deflateFixed(data));
 }
 
 /** Same container, dynamic-Huffman payload. */
-export i8[] gzipDynamic(i8[] data) {
+export u8[] gzipDynamic(u8[] data) {
   return wrap(data, deflateDynamic(data));
 }
 
@@ -86,19 +86,19 @@ export i8[] gzipDynamic(i8[] data) {
  * than stored — which is the property that matters, since expansion is the one
  * outcome a compressor should never produce.
  */
-export i8[] gzipBest(i8[] data) {
-  i8[] dynamic = deflateDynamic(data);
-  i8[] fixed = deflateFixed(data);
+export u8[] gzipBest(u8[] data) {
+  u8[] dynamic = deflateDynamic(data);
+  u8[] fixed = deflateFixed(data);
 
-  i8[] best = dynamic;
+  u8[] best = dynamic;
   if (fixed.len() < best.len()) {
     best = fixed;
   }
 
   // Stored is framed by gzipStored rather than as a bare body, so compare the
   // finished containers.
-  i8[] wrapped = wrap(data, best);
-  i8[] stored = gzipStored(data);
+  u8[] wrapped = wrap(data, best);
+  u8[] stored = gzipStored(data);
   if (stored.len() < wrapped.len()) {
     return stored;
   }

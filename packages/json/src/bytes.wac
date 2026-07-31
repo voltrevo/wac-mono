@@ -8,12 +8,12 @@
 // output by concatenation is quadratic. Bytes accumulate here instead.
 
 export struct ByteBuf {
-  i8[] data;
+  u8[] data;
   i32 count;
 
-  ByteBuf create() { return ByteBuf(i8[0](), 0); }
+  ByteBuf create() { return ByteBuf(u8[0](), 0); }
 
-  ByteBuf withCapacity(i32 cap) { return ByteBuf(i8[cap](), 0); }
+  ByteBuf withCapacity(i32 cap) { return ByteBuf(u8[cap](), 0); }
 
   i32 len(const this) { return this.count; }
 
@@ -23,7 +23,7 @@ export struct ByteBuf {
     i32 next = this.data.len() * 2;
     if (next < 8) { next = 8; }
     while (next < need) { next = next * 2; }
-    i8[] grown = i8[next]();
+    u8[] grown = u8[next]();
     for (i32 i = 0; i < this.count; i++) {
       grown[i] = this.data[i];
     }
@@ -36,7 +36,7 @@ export struct ByteBuf {
     this.count++;
   }
 
-  void pushBytes(this, i8[] src) {
+  void pushBytes(this, u8[] src) {
     this.reserve(src.len());
     for (i32 i = 0; i < src.len(); i++) {
       this.data[this.count + i] = src[i];
@@ -71,8 +71,8 @@ export struct ByteBuf {
 
   // Trim to exactly `count` bytes. Callers hand these out as owned values, so
   // the spare capacity must not come along.
-  i8[] toBytes(const this) {
-    i8[] out = i8[this.count]();
+  u8[] toBytes(const this) {
+    u8[] out = u8[this.count]();
     for (i32 i = 0; i < this.count; i++) {
       out[i] = this.data[i];
     }

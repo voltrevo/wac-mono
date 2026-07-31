@@ -14,14 +14,14 @@ import { ByteBuf } from "./bytes.wac";
 export void writeValue(ByteBuf out, JsonValue v) {
   switch (v.kind) {
     case 0: {                                  // null
-      out.pushBytes(i8[](110, 117, 108, 108));               // null
+      out.pushBytes(u8[](110, 117, 108, 108));               // null
     }
     case 1: {                                  // bool
       JsonBool b = v as! JsonBool;
       if (b.value) {
-        out.pushBytes(i8[](116, 114, 117, 101));             // true
+        out.pushBytes(u8[](116, 114, 117, 101));             // true
       } else {
-        out.pushBytes(i8[](102, 97, 108, 115, 101));         // false
+        out.pushBytes(u8[](102, 97, 108, 115, 101));         // false
       }
     }
     case 2: {                                  // number
@@ -59,7 +59,7 @@ export void writeValue(ByteBuf out, JsonValue v) {
 // Quote and escape a UTF-8 byte string. Only the characters JSON requires are
 // escaped — quote, backslash, and anything below 0x20 — so multi-byte UTF-8
 // passes through untouched, which matches what JSON.stringify emits.
-export void writeString(ByteBuf out, i8[] bytes) {
+export void writeString(ByteBuf out, u8[] bytes) {
   out.push(0x22);                                            // "
   for (i32 i = 0; i < bytes.len(); i++) {
     i32 c = bytes[i];

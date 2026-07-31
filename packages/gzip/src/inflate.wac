@@ -25,12 +25,12 @@ i32 maxBits() { return 15; }
  * lookahead window. Consuming more bits than exist is what traps.
  */
 struct BitReader {
-  i8[] data;
+  u8[] data;
   i32 pos;       // next byte to pull into the buffer
   i32 bitBuf;    // bits not yet consumed, LSB first
   i32 bitCount;  // how many bits of bitBuf are live
 
-  BitReader create(i8[] data, i32 start) {
+  BitReader create(u8[] data, i32 start) {
     return BitReader(data, start, 0, 0);
   }
 
@@ -319,7 +319,7 @@ void inflateBlock(BitReader br, Buf out, Tables t, Decoder lit, Decoder dist) {
 }
 
 /** Decompress a raw DEFLATE stream starting at `start`. */
-i8[] inflateFrom(i8[] data, i32 start) {
+u8[] inflateFrom(u8[] data, i32 start) {
   BitReader br = BitReader.create(data, start);
   Buf out = Buf.create();
   Tables t = Tables.create();
@@ -372,7 +372,7 @@ i8[] inflateFrom(i8[] data, i32 start) {
 }
 
 /** Decompress a raw DEFLATE stream. */
-export i8[] inflate(i8[] data) {
+export u8[] inflate(u8[] data) {
   return inflateFrom(data, 0);
 }
 
@@ -381,7 +381,7 @@ export i8[] inflate(i8[] data) {
  * trailer fields. A CRC or length mismatch traps — silently returning data that
  * failed its own integrity check would defeat the point of carrying one.
  */
-export i8[] gunzipBytes(i8[] gz) {
+export u8[] gunzipBytes(u8[] gz) {
   if (gz.len() < 18) { trap; }                    // header + empty body + trailer
   if (gz[0] != 0x1F || gz[1] != 0x8B) { trap; }   // magic
   if (gz[2] != 8) { trap; }                       // CM must be deflate
@@ -406,7 +406,7 @@ export i8[] gunzipBytes(i8[] gz) {
   }
   if (pos >= gz.len()) { trap; }
 
-  i8[] out = inflateFrom(gz, pos);
+  u8[] out = inflateFrom(gz, pos);
 
   // Trailer: CRC-32 then ISIZE, both little-endian, in the last 8 bytes.
   i32 n = gz.len();

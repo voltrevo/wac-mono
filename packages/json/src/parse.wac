@@ -25,13 +25,13 @@ export i32 ERR_DEPTH()        { return 8; }  // nesting limit exceeded
 i32 MAX_DEPTH() { return 400; }
 
 export struct Parser {
-  i8[] src;
+  u8[] src;
   i32 pos;
   i32 err;
   i32 errPos;
   i32 depth;
 
-  Parser create(i8[] src) { return Parser(src, 0, 0, 0, 0); }
+  Parser create(u8[] src) { return Parser(src, 0, 0, 0, 0); }
 
   // -1 rather than a bool+out-param: every caller compares against a byte
   // value anyway, and no real byte is negative.
@@ -60,7 +60,7 @@ export struct Parser {
   }
 
   // Match an ASCII keyword at the cursor without allocating.
-  bool eatWord(this, i8[] word) {
+  bool eatWord(this, u8[] word) {
     if (this.pos + word.len() > this.src.len()) { return false; }
     for (i32 i = 0; i < word.len(); i++) {
       if (this.src[this.pos + i] != word[i]) { return false; }
@@ -78,22 +78,22 @@ export struct Parser {
       case 0x7B: { return this.parseObject(); }        // {
       case 0x5B: { return this.parseArray(); }         // [
       case 0x22: {                                     // "
-        i8[]? b = this.parseStringBytes();
+        u8[]? b = this.parseStringBytes();
         if (b is null) { return null; }
         return JsonString.of(b!);
       }
       case 0x74: {                                     // t
-        if (this.eatWord(i8[](116, 114, 117, 101))) { return JsonBool.of(true); }
+        if (this.eatWord(u8[](116, 114, 117, 101))) { return JsonBool.of(true); }
         this.fail(ERR_UNEXPECTED());
         return null;
       }
       case 0x66: {                                     // f
-        if (this.eatWord(i8[](102, 97, 108, 115, 101))) { return JsonBool.of(false); }
+        if (this.eatWord(u8[](102, 97, 108, 115, 101))) { return JsonBool.of(false); }
         this.fail(ERR_UNEXPECTED());
         return null;
       }
       case 0x6E: {                                     // n
-        if (this.eatWord(i8[](110, 117, 108, 108))) { return jsonNull(); }
+        if (this.eatWord(u8[](110, 117, 108, 108))) { return jsonNull(); }
         this.fail(ERR_UNEXPECTED());
         return null;
       }
@@ -151,7 +151,7 @@ export struct Parser {
         if (this.peek() < 0) { this.fail(ERR_EOF()); } else { this.fail(ERR_UNEXPECTED()); }
         return null;
       }
-      i8[]? key = this.parseStringBytes();
+      u8[]? key = this.parseStringBytes();
       if (key is null) { return null; }
       this.skipWs();
       if (this.peek() != 0x3A) {                       // :
@@ -178,7 +178,7 @@ export struct Parser {
 
   // Returns the unescaped UTF-8 bytes of a string, cursor left after the
   // closing quote.
-  i8[]? parseStringBytes(this) {
+  u8[]? parseStringBytes(this) {
     this.pos++;                                        // consume opening "
     ByteBuf out = ByteBuf.create();
     while (true) {
@@ -364,7 +364,7 @@ export struct Parser {
 
     // Keep the source span: it lets the serializer round-trip a number without
     // a shortest-representation float formatter, which wac does not have.
-    i8[] raw = i8[this.pos - start]();
+    u8[] raw = u8[this.pos - start]();
     for (i32 i = 0; i < raw.len(); i++) {
       raw[i] = this.src[start + i];
     }

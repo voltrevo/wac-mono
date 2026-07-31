@@ -12,7 +12,7 @@ import { ByteBuf } from "./bytes.wac";
 
 // Parse and re-serialize. Byte 0 is the error code (0 = success); the rest is
 // canonical JSON, empty when parsing failed.
-export i8[] canonicalize(i8[] src) {
+export u8[] canonicalize(u8[] src) {
   Parser p = Parser.create(src);
   JsonValue? v = parseDocument(p);
   ByteBuf out = ByteBuf.create();
@@ -26,7 +26,7 @@ export i8[] canonicalize(i8[] src) {
 }
 
 // Error code for a document, without building the output.
-export i32 errorCode(i8[] src) {
+export i32 errorCode(u8[] src) {
   Parser p = Parser.create(src);
   JsonValue? v = parseDocument(p);
   if (v is null) { return p.err; }
@@ -34,7 +34,7 @@ export i32 errorCode(i8[] src) {
 }
 
 // Byte offset where parsing gave up. Only meaningful when errorCode is nonzero.
-export i32 errorPos(i8[] src) {
+export i32 errorPos(u8[] src) {
   Parser p = Parser.create(src);
   JsonValue? v = parseDocument(p);
   if (v is null) { return p.errPos; }
@@ -44,7 +44,7 @@ export i32 errorPos(i8[] src) {
 // The f64 value of a document that is a bare number, for testing the decimal
 // conversion against the host's own strtod. NaN signals a parse failure, which
 // no valid JSON number can produce.
-export f64 parseNumberValue(i8[] src) {
+export f64 parseNumberValue(u8[] src) {
   Parser p = Parser.create(src);
   JsonValue? v = parseDocument(p);
   if (v is null) { return 0.0 / 0.0; }

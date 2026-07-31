@@ -35,7 +35,7 @@ i32[] crcTable() {
 }
 
 /** CRC-32 of `data`: one table lookup per byte instead of eight shift steps. */
-export i32 crc32(i8[] data) {
+export i32 crc32(u8[] data) {
   i32[] table = crcTable();
   i32 crc = 0xFFFFFFFF;
   for (i32 i = 0; i < data.len(); i++) {
@@ -49,7 +49,7 @@ export i32 crc32(i8[] data) {
  * table-driven version is tested against, because a single wrong table entry
  * would otherwise only be caught if some fixed vector happened to reach it.
  */
-export i32 crc32Bitwise(i8[] data) {
+export i32 crc32Bitwise(u8[] data) {
   i32 crc = 0xFFFFFFFF;
   for (i32 i = 0; i < data.len(); i++) {
     crc ^= data[i];

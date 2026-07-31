@@ -1,8 +1,8 @@
 // wacBind — compile a .wac entry file and hand back its bindgen'd JS module.
 //
-// Going through wacBindgen rather than wacInstance is what makes i8[] usable
+// Going through wacBindgen rather than wacInstance is what makes u8[] usable
 // from the test side: bindgen embeds the copy-in/copy-out helpers, so an
-// `i8[] gzip(i8[])` export becomes `gzip(Uint8Array): Uint8Array`. Calling the
+// `u8[] gzip(u8[])` export becomes `gzip(Uint8Array): Uint8Array`. Calling the
 // raw wasm export directly is not an option — a JS caller cannot build a
 // WasmGC array without those helpers.
 //
