@@ -77,9 +77,11 @@ than choosing a house style. `deno task test` compares 20 000 random bit pattern
 and 8 000 random decimals, plus the notation boundaries and the classic hard cases,
 and separately asserts every output reads back as the original double.
 
-`tools/sweep.ts` runs the same comparison over 500 000 doubles when a change wants
-more than the suite gives — it takes about seven seconds and currently reports zero
-mismatches.
+`deno task verify:fmt` runs the same comparison over 500 000 doubles in both
+directions when a change wants more than the suite gives — about nine seconds,
+currently zero mismatches. **Run it after touching anything in this package**: the
+committed suite samples 28 000 values, which is enough to catch a broken change and
+not enough to catch a subtly wrong one.
 
 The bignum has its own tests against the host's `BigInt` (`test/bigint.test.ts`),
 because a wrong carry surfaces as one extra digit several layers up, where the

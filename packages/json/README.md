@@ -112,7 +112,7 @@ contents and container growth where they live.
 
 ## Speed
 
-`packages/json/bench/throughput.ts` measures by document shape rather than as one
+`deno task bench:json` measures by document shape rather than as one
 number, because an aggregate hides everything: a parser can be fast on structure
 and slow on numbers and still look reasonable.
 
