@@ -227,15 +227,23 @@ Two caveats on the number:
 ### Mutation testing
 
 ```sh
-deno task mutate
+deno task mutate                        # curated defects, all packages
+deno task mutate --package gzip         # just this one
+deno task mutate:operators              # ...plus generated guard and extreme mutants
 ```
 
-`deno coverage` measures the TypeScript harness, not the compiled wasm, so there
-is no branch-coverage number for the wac code. Mutation testing answers what
-coverage is a proxy for, and answers it more directly: break the implementation
-on purpose and check the tests notice. Each mutation is one deliberate defect — a
+Mutation testing answers what coverage is a proxy for, and answers it more directly:
+break the implementation on purpose and check the tests notice. Coverage says a line
+ran; a surviving mutant says nothing checked what the line *did*, which is the failure
+a coverage number structurally cannot show. Each mutation is one deliberate defect — a
 flipped comparison, an off-by-one on a boundary, a reversed bit order, a removed
-validity check. A mutation that survives names a behaviour nothing checks.
+validity check.
+
+Mutants are compiled before any test runs, and one that emits byte-identical wasm is
+discarded as provably equivalent rather than counted (Trivial Compiler Equivalence).
+One that fails to compile is INVALID and excluded too — it tested nothing about the
+tests, and scoring it as a kill is how a mutation score inflates itself. Runs are
+scoped to the packages that import the mutated file, from the real import graph.
 
 The suite includes a **no-op control mutation that must survive**. Without it, a
 staged project failing to build for an unrelated reason would report every
