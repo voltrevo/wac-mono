@@ -1,0 +1,57 @@
+// gzip container (RFC 1952) around DEFLATE stored blocks (RFC 1951 BTYPE=00).
+//
+// Stored blocks apply no compression at all — the output is slightly larger
+// than the input. The point is that everything except the compressor is real:
+// the header, the block framing, the CRC-32, the length trailer. `gunzip`
+// accepts this output, which pins the container down before any Huffman work
+// starts.
+
+import { Buf } from "./buf.wac";
+import { crc32 } from "./crc32.wac";
+
+// A stored block's LEN field is 16 bits, so a block tops out at 65535 bytes.
+// Longer input becomes several blocks, only the last of which is marked final.
+// (wac has no top-level constants, so this is a function.)
+i32 maxStored() { return 65535; }
+
+void header(Buf out) {
+  out.push(0x1F);        // magic
+  out.push(0x8B);
+  out.push(8);           // CM = 8, deflate
+  out.push(0);           // FLG = 0, no name/comment/extra/hcrc
+  out.pushU32(0);        // MTIME = 0, "no time available"
+  out.push(0);           // XFL
+  out.push(255);         // OS = 255, unknown
+}
+
+// One stored block: 3 header bits (BFINAL, BTYPE=00) then, because BTYPE=00
+// aligns to a byte boundary, LEN / ~LEN and the raw bytes.
+void storedBlock(Buf out, i8[] data, i32 start, i32 count, bool isFinal) {
+  out.push(isFinal ? 1 : 0);
+  out.pushU16(count);
+  out.pushU16((~count) & 0xFFFF);
+  out.pushBytes(data, start, count);
+}
+
+export i8[] gzipStored(i8[] data) {
+  Buf out = Buf.create();
+  header(out);
+
+  i32 n = data.len();
+  if (n == 0) {
+    // Empty input still needs one final block, or the stream is truncated.
+    storedBlock(out, data, 0, 0, true);
+  }
+
+  i32 pos = 0;
+  while (pos < n) {
+    i32 count = n - pos;
+    if (count > maxStored()) { count = maxStored(); }
+    storedBlock(out, data, pos, count, (pos + count) == n);
+    pos += count;
+  }
+
+  out.pushU32(crc32(data));
+  out.pushU32(n);        // ISIZE, input size mod 2^32
+  return out.bytes();
+}

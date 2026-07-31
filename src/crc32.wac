@@ -1,0 +1,16 @@
+// CRC-32 as gzip uses it: reflected polynomial 0xEDB88320, pre- and
+// post-inverted. This is the bitwise form — one shift per bit, no table. It is
+// the reference the table-driven version is checked against.
+
+export i32 crc32(i8[] data) {
+  i32 crc = 0xFFFFFFFF;
+  for (i32 i = 0; i < data.len(); i++) {
+    crc ^= data[i];
+    for (i32 k = 0; k < 8; k++) {
+      bool low = (crc & 1) != 0;
+      crc >>>= 1;
+      if (low) { crc ^= 0xEDB88320; }
+    }
+  }
+  return crc ^ 0xFFFFFFFF;
+}

@@ -1,0 +1,39 @@
+// wacBind — compile a .wac entry file and hand back its bindgen'd JS module.
+//
+// Going through wacBindgen rather than wacInstance is what makes i8[] usable
+// from the test side: bindgen embeds the copy-in/copy-out helpers, so an
+// `i8[] gzip(i8[])` export becomes `gzip(Uint8Array): Uint8Array`. Calling the
+// raw wasm export directly is not an option — a JS caller cannot build a
+// WasmGC array without those helpers.
+//
+// The generated module is written under .cache/ and imported, because a
+// bindgen'd file is a real TypeScript module, not a string to eval.
+
+import { wacCompile } from "wac/wacCompile.ts";
+import { wacBindgen } from "wac/wacBindgen.ts";
+import { wacFiles } from "./wacFiles.ts";
+
+const CACHE_DIR = ".cache";
+
+export async function wacBind(entry: string): Promise<Record<string, unknown>> {
+  const files = await wacFiles(entry);
+  const result = wacCompile(files, entry);
+
+  if (!result.ok) {
+    const lines = result.diagnostics.map(d =>
+      `  ${d.file}:${d.line}:${d.col} [${d.phase}] ${d.message}`);
+    throw new Error(`wac compile failed for ${entry}:\n${lines.join("\n")}`);
+  }
+  // Warnings do not fail the compile, but silently dropping them in a build
+  // helper is how they stay unnoticed forever.
+  for (const d of result.diagnostics) {
+    console.warn(`warning: ${d.file}:${d.line}:${d.col} ${d.message}`);
+  }
+
+  const ts = wacBindgen(result.compiled);
+  await Deno.mkdir(CACHE_DIR, { recursive: true });
+  const outPath = `${CACHE_DIR}/${entry.replaceAll("/", "_")}.gen.ts`;
+  await Deno.writeTextFile(outPath, ts);
+
+  return await import(`${Deno.cwd()}/${outPath}`);
+}

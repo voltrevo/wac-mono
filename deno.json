@@ -1,0 +1,8 @@
+{
+  "imports": {
+    "wac/": "../wac/atoms/wac/"
+  },
+  "tasks": {
+    "test": "deno test --allow-read --allow-write --allow-run"
+  }
+}
