@@ -1,13 +1,13 @@
 // Decimal -> f64 against the host's own conversion, compared bit-exactly.
 //
-// This is the part of the parser most likely to be subtly wrong: wac has no
-// wide-integer type, so scaling is done in f64 (see parse.wac). Anything that
-// needs more than an i64 mantissa or a power of ten outside ±1e22 can only be
-// correct to within a rounding step.
+// Conversion is correctly rounded — the double nearest the decimal, ties to even —
+// so every comparison here is bit-exact. It was not always: accumulating into an
+// i64 and scaling in f64 was exact for 72% of random decimals and up to 2 ulp out
+// otherwise. packages/fmt does it with exact arithmetic instead.
 
 import { assertSameNumber, numberValue } from "./util.ts";
 
-/** Values where the fast path is provably exact: mantissa < 2^53, |exp| <= 22. */
+/** Values where even a naive conversion is exact: mantissa < 2^53, |exp| <= 22. */
 const EXACT = [
   "0", "-0", "1", "-1", "42", "-42",
   "1.5", "-1.5", "0.5", "2.25", "3.14159",
@@ -23,7 +23,7 @@ const EXACT = [
   "-0.0", "0.0",
 ];
 
-/** Values that exercise the parts that cannot be exact by construction. */
+/** Values that no fast path can reach, so the exact fallback has to carry them. */
 const HARD = [
   "1e23",                      // first power of ten past the exact table
   "1e100", "1e308", "-1e308",
@@ -47,31 +47,16 @@ Deno.test("exact cases match the host bit-for-bit", async () => {
   }
 });
 
-Deno.test("hard cases: report agreement, bound the error", async () => {
-  const off: string[] = [];
+Deno.test("hard cases are exact too", async () => {
   for (const src of HARD) {
-    const got = await numberValue(src);
-    const want = Number(src);
-    if (Object.is(got, want)) continue;
-    // Distance in representable steps, which is the only honest error measure
-    // for a float conversion.
-    const ulps = ulpsApart(got, want);
-    off.push(`${src}: got ${got}, want ${want} (${ulps} ulp)`);
-    if (!Number.isFinite(ulps) || ulps > 1) {
-      throw new Error(`number conversion off by more than one ulp:\n  ${off.join("\n  ")}`);
-    }
-  }
-  if (off.length > 0) {
-    console.log(`  ${off.length}/${HARD.length} inexact (all within one ulp):`);
-    for (const line of off) console.log(`    ${line}`);
+    assertSameNumber(await numberValue(src), Number(src), `for ${src}`);
   }
 });
 
-// The hand-picked corpus above is chosen to be interesting, which is exactly
-// why it cannot establish the error rate. This does: random decimals across the
-// whole exponent range, compared against the host, reporting the distribution
-// rather than asserting a hope.
-Deno.test("random decimals: measure the error distribution", async () => {
+// The hand-picked corpus is chosen to be interesting, which is exactly why it
+// cannot establish the error rate. This does: random decimals across the whole
+// exponent range, every one required to match the host bit for bit.
+Deno.test("random decimals are bit-exact", async () => {
   const ROUNDS = 3000;
   let seed = 0x9e3779b9;
   const rnd = () => {
@@ -82,7 +67,6 @@ Deno.test("random decimals: measure the error distribution", async () => {
     return seed / 0x100000000;
   };
 
-  const hist = new Map<number, number>();
   let worst = { src: "", ulps: 0 };
 
   for (let i = 0; i < ROUNDS; i++) {
@@ -98,20 +82,12 @@ Deno.test("random decimals: measure the error distribution", async () => {
 
     const got = await numberValue(src);
     const want = Number(src);
-    const ulps = Object.is(got, want) ? 0 : ulpsApart(got, want);
-    hist.set(ulps, (hist.get(ulps) ?? 0) + 1);
-    if (ulps > worst.ulps) worst = { src, ulps };
+    if (!Object.is(got, want)) {
+      const ulps = ulpsApart(got, want);
+      throw new Error(`${src}: got ${got}, want ${want} (${ulps} ulp)`);
+    }
   }
-
-  const keys = [...hist.keys()].sort((a, b) => a - b);
-  const summary = keys.map(k => `${k} ulp: ${hist.get(k)}`).join(", ");
-  const exact = hist.get(0) ?? 0;
-  console.log(`  ${ROUNDS} random decimals — ${summary}`);
-  console.log(`  exact: ${((exact / ROUNDS) * 100).toFixed(1)}%; worst: ${worst.src} at ${worst.ulps} ulp`);
-
-  if (!Number.isFinite(worst.ulps) || worst.ulps > 2) {
-    throw new Error(`conversion error exceeded 2 ulp: ${worst.src} off by ${worst.ulps}`);
-  }
+  console.log(`  ${ROUNDS} random decimals, all bit-exact`);
 });
 
 /** Steps between two f64s, via their monotonic integer ordering. */
