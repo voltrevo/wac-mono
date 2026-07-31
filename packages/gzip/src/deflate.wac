@@ -65,6 +65,13 @@ i32 maxMatch()   { return 258; }    // longest length the code can express
 i32 minMatch()   { return 3; }      // shorter than this costs more than literals
 i32 chainLimit() { return 128; }    // candidates per position, bounds the search
 
+// Search cutoffs, following zlib's good_match/nice_match at level 6. Once a match
+// is long enough, the remaining candidates cost more time than the bits they might
+// save: text compression spent most of its time walking all 128 candidates after
+// a perfectly good match was already in hand.
+i32 goodLength() { return 8; }      // beyond this, narrow the search
+i32 niceLength() { return 128; }    // beyond this, stop looking entirely
+
 i32 hash3(i8[] data, i32 pos) {
   return ((data[pos] << 10) ^ (data[pos + 1] << 5) ^ data[pos + 2]) & 0x7FFF;
 }
@@ -103,7 +110,8 @@ Tokens lz77(i8[] data, Tables t) {
     if (pos + minMatch() <= n) {
       i32 cand = head[hash3(data, pos)];
       i32 chain = 0;
-      while (cand >= 0 && chain < chainLimit()) {
+      i32 limit = chainLimit();
+      while (cand >= 0 && chain < limit) {
         i32 dist = pos - cand;
         if (dist > maxDist()) {
           cand = -1;
@@ -116,10 +124,13 @@ Tokens lz77(i8[] data, Tables t) {
           if (len > bestLen) {
             bestLen = len;
             bestDist = dist;
+            if (bestLen >= niceLength()) {
+              cand = -1;                      // long enough; stop searching
+            } else if (bestLen >= goodLength()) {
+              limit = chainLimit() >>> 2;      // decent already; look less hard
+            }
           }
-          if (bestLen == maxMatch()) {
-            cand = -1;
-          } else {
+          if (cand >= 0) {
             cand = prev[cand];
             chain++;
           }

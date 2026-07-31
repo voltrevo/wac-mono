@@ -34,11 +34,26 @@ void storedBlock(Buf out, i8[] data, i32 start, i32 count, bool isFinal) {
   out.pushBytes(data, start, count);
 }
 
-export i8[] gzipStored(i8[] data) {
+/**
+ * Wrap a deflate stream in the gzip container.
+ *
+ * The CRC is a parameter rather than computed here, so a caller comparing several
+ * block types checksums the payload once instead of once per attempt.
+ */
+i8[] container(i8[] body, i32 crc, i32 isize) {
   Buf out = Buf.create();
   header(out);
+  out.pushBytes(body, 0, body.len());
+  out.pushU32(crc);
+  out.pushU32(isize);
+  return out.bytes();
+}
 
+/** The DEFLATE stored-block stream for `data`, without the gzip container. */
+i8[] storedBody(i8[] data) {
+  Buf out = Buf.create();
   i32 n = data.len();
+
   if (n == 0) {
     // Empty input still needs one final block, or the stream is truncated.
     storedBlock(out, data, 0, 0, true);
@@ -51,31 +66,27 @@ export i8[] gzipStored(i8[] data) {
     storedBlock(out, data, pos, count, (pos + count) == n);
     pos += count;
   }
-
-  out.pushU32(crc32(data));
-  out.pushU32(n);        // ISIZE, input size mod 2^32
   return out.bytes();
 }
 
-/** Wrap an already-compressed deflate stream in the gzip container. */
-i8[] wrap(i8[] data, i8[] body) {
-  Buf out = Buf.create();
-  header(out);
-  out.pushBytes(body, 0, body.len());
-  out.pushU32(crc32(data));
-  out.pushU32(data.len());
-  return out.bytes();
+export i8[] gzipStored(i8[] data) {
+  return container(storedBody(data), crc32(data), data.len());
 }
 
 /** Same container, but the payload is a fixed-Huffman deflate stream. */
 export i8[] gzipFixed(i8[] data) {
-  return wrap(data, deflateFixed(data));
+  return container(deflateFixed(data), crc32(data), data.len());
 }
 
 /** Same container, dynamic-Huffman payload. */
 export i8[] gzipDynamic(i8[] data) {
-  return wrap(data, deflateDynamic(data));
+  return container(deflateDynamic(data), crc32(data), data.len());
 }
+
+// Below this size a dynamic block's transmitted code table can cost more than it
+// saves, so the alternatives are worth trying — and trying them is cheap when the
+// input is this small.
+i32 smallInput() { return 4096; }
 
 /**
  * Compress and keep whichever block type came out smallest.
@@ -87,20 +98,27 @@ export i8[] gzipDynamic(i8[] data) {
  * outcome a compressor should never produce.
  */
 export i8[] gzipBest(i8[] data) {
-  i8[] dynamic = deflateDynamic(data);
-  i8[] fixed = deflateFixed(data);
+  i32 crc = crc32(data);
+  i32 n = data.len();
 
-  i8[] best = dynamic;
-  if (fixed.len() < best.len()) {
-    best = fixed;
+  i8[] best = container(deflateDynamic(data), crc, n);
+
+  if (n <= smallInput()) {
+    // Small enough that all three are worth pricing: a dynamic block's code table
+    // is a fixed cost that a short payload cannot amortise.
+    i8[] fixed = container(deflateFixed(data), crc, n);
+    if (fixed.len() < best.len()) { best = fixed; }
+    i8[] stored = container(storedBody(data), crc, n);
+    if (stored.len() < best.len()) { best = stored; }
+    return best;
   }
 
-  // Stored is framed by gzipStored rather than as a bare body, so compare the
-  // finished containers.
-  i8[] wrapped = wrap(data, best);
-  i8[] stored = gzipStored(data);
-  if (stored.len() < wrapped.len()) {
-    return stored;
+  // Otherwise dynamic wins on anything compressible, and the only case it loses is
+  // data that does not compress at all — where stored is the floor. Checking that
+  // costs one comparison instead of two more compression passes.
+  if (best.len() >= n) {
+    i8[] stored = container(storedBody(data), crc, n);
+    if (stored.len() < best.len()) { return stored; }
   }
-  return wrapped;
+  return best;
 }

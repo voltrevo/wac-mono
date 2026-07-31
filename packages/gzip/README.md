@@ -87,9 +87,22 @@ inflate(data)      // read a raw deflate stream
 | inflate, text | 120 | 694 |
 | inflate, incompressible | 86 | 2672 |
 
-End to end on 4 MB of real TypeScript source: `gzipDynamic` 17.3 MB/s at 23.8%,
-decompress 120 MB/s, against zlib's 46.2 MB/s at 23.1%. So ~2.7x slower
-compressing and ~5.8x decompressing, at the same ratio.
+End to end on 4 MB of real TypeScript source: `gzipDynamic` 20.9 MB/s at 24.0%,
+`gzipBest` the same, decompress 120 MB/s — against zlib's 46.2 MB/s at 23.1%. So
+~2.2x slower compressing and ~5.8x decompressing, for 0.9% less compression.
+
+`gzipBest` used to be half the speed of `gzipDynamic` for identical output: it
+compressed three times and checksummed twice. It now computes the CRC once, and
+above 4 KB only prices the alternatives when dynamic fails to shrink the input at
+all — the one case where stored can win. Below 4 KB all three are still tried,
+because a dynamic block's transmitted code table is a fixed cost a short payload
+cannot amortise (an 11-byte input is 31 bytes with fixed against 43 with dynamic).
+
+The match search stops once a match is long enough to not be worth improving on,
+and narrows after a decent one, following zlib's `nice_match`/`good_match` at
+level 6. That is +19% on real source for 0.9% larger output; `niceLength()` and
+`goodLength()` in `deflate.wac` are the dials if the trade should go the other
+way.
 
 Scaling is flat from 16K to 4 MB, so the match search and hash inserts are linear.
 
