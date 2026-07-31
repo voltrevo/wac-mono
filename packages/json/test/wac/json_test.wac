@@ -54,14 +54,14 @@ export string test_bytes_equal() {
 
 export string test_scale_by_pow10() {
   T t = T.create();
-  // No float assertion in wactest — with no float-to-string there is no way to
-  // put the actual value in a message — so these compare through isTrue.
-  t.isTrue(scaleByPow10(1.0, 0) == 1.0, "10^0 is identity");
-  t.isTrue(scaleByPow10(1.5, 2) == 150.0, "1.5e2");
-  t.isTrue(scaleByPow10(15.0, -1) == 1.5, "15e-1");
-  t.isTrue(scaleByPow10(1.0, 22) == 1.0e22, "the largest exact power");
-  t.isTrue(scaleByPow10(1.0, 23) == 1.0e23, "one past the exact table");
-  t.isTrue(scaleByPow10(0.0, 999) == 0.0, "zero scales to zero, not NaN");
+  // eqF64 names the offending value in the message, which was impossible before
+  // packages/fmt; these used to compare through isTrue and report nothing useful.
+  t.eqF64(scaleByPow10(1.0, 0), 1.0, "10^0 is identity");
+  t.eqF64(scaleByPow10(1.5, 2), 150.0, "1.5e2");
+  t.eqF64(scaleByPow10(15.0, -1), 1.5, "15e-1");
+  t.eqF64(scaleByPow10(1.0, 22), 1.0e22, "the largest exact power");
+  t.eqF64(scaleByPow10(1.0, 23), 1.0e23, "one past the exact table");
+  t.eqF64(scaleByPow10(0.0, 999), 0.0, "zero scales to zero, not NaN");
   t.isTrue(scaleByPow10(-0.0, 999) == 0.0, "negative zero likewise");
   t.isTrue(scaleByPow10(1.0, 400) > 1.0e300, "overflow goes to infinity");
   t.isTrue(scaleByPow10(1.0, -400) == 0.0, "underflow goes to zero");

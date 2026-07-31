@@ -128,3 +128,49 @@ export string test_failNow_records_without_a_condition() {
   t.eqStr(inner.report(), "1 failed: unreachable branch taken", "message passes through");
   return t.report();
 }
+
+export string test_eqF64_is_bit_exact() {
+  T t = T.create();
+  T inner = T.create();
+
+  inner.eqF64(1.5, 1.5, "equal");
+  t.eqI32(inner.failed, 0, "equal floats pass");
+
+  inner.eqF64(0.1, 0.2, "different");
+  t.eqI32(inner.failed, 1, "different floats fail");
+  t.eqStr(inner.messages, "different: got 0.1, want 0.2",
+    "and the message names both values, which needed float-to-string");
+
+  // The two cases `==` gets wrong for a test's purposes.
+  T zeros = T.create();
+  zeros.eqF64(-0.0, 0.0, "signed zero");
+  t.eqI32(zeros.failed, 1, "-0.0 is not 0.0");
+
+  T nan = T.create();
+  f64 n = 0.0 / 0.0;
+  nan.eqF64(n, n, "nan");
+  t.eqI32(nan.failed, 0, "NaN equals itself under a bit comparison");
+  return t.report();
+}
+
+export string test_nearF64_tolerance() {
+  T t = T.create();
+  T inner = T.create();
+
+  inner.nearF64(0.1 + 0.2, 0.3, 1.0e-9, "sum");
+  t.eqI32(inner.failed, 0, "0.1 + 0.2 is near 0.3");
+
+  inner.nearF64(1.0, 2.0, 0.5, "far");
+  t.eqI32(inner.failed, 1, "1.0 is not within 0.5 of 2.0");
+
+  // Exactly at the tolerance is inclusive.
+  T edge = T.create();
+  edge.nearF64(1.5, 1.0, 0.5, "edge");
+  t.eqI32(edge.failed, 0, "a difference exactly equal to tol passes");
+
+  // NaN fails rather than sneaking through a false comparison.
+  T nan = T.create();
+  nan.nearF64(0.0 / 0.0, 1.0, 1000.0, "nan");
+  t.eqI32(nan.failed, 1, "NaN is never near anything");
+  return t.report();
+}
