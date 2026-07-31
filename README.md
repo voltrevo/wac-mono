@@ -15,6 +15,7 @@ compiler, this one is things built with it.
 | [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM — checked against WebCrypto, a BigInt reference and the published vectors |
 | [`gzip`](packages/gzip/) | gzip and DEFLATE, both directions — compresses at or under `gzip -6` |
 | [`json`](packages/json/) | JSON parse and serialize, verified against the host's own JSON |
+| [`bignum`](packages/bignum/) | arbitrary-precision integers, semantics identical to `BigInt` |
 | [`wactest`](packages/wactest/) | assertions for writing tests in wac |
 
 ## Layout
@@ -26,7 +27,7 @@ harness/           TypeScript for driving the compiler
   wacBind.ts         compile -> bindgen -> importable JS module
   wacTestRun.ts      run wac-written tests as Deno tests
   wacCoverage.ts     instrument an entry point and report branch coverage
-tools/             check.ts, coverage.ts, mutate.ts
+tools/             check.ts, validate.ts, coverage.ts, mutate.ts
 issues/            bug reports and cross-cutting tasks; see issues/README.md
 packages/<name>/
   src/               wac source

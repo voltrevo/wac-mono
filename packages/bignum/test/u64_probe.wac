@@ -1,0 +1,15 @@
+// u64 primitives, exposed so the host can compare them against BigInt.
+export i64 divU(i64 a, i64 b) { return ((a as@ u64) / (b as@ u64)) as@ i64; }
+export i64 remU(i64 a, i64 b) { return ((a as@ u64) % (b as@ u64)) as@ i64; }
+export i64 shrU(i64 a, i32 k) { return ((a as@ u64) >> ((k as i64) as@ u64)) as@ i64; }
+export i64 mulU(i64 a, i64 b) { return ((a as@ u64) * (b as@ u64)) as@ i64; }
+export i64 addU(i64 a, i64 b) { return ((a as@ u64) + (b as@ u64)) as@ i64; }
+export i64 subU(i64 a, i64 b) { return ((a as@ u64) - (b as@ u64)) as@ i64; }
+export i32 truncU32(i64 a) { return ((a as@ u64) as@ u32) as@ i32; }
+export bool geU(i64 a, i64 b) { return (a as@ u64) >= (b as@ u64); }
+/** u32 * u32 widened, the shape the multiply-subtract inner loop uses. */
+export i64 mulWide(i32 x, i32 y) {
+  u32 a = x as@ u32;
+  u32 b = y as@ u32;
+  return ((a as u64) * (b as u64)) as@ i64;
+}

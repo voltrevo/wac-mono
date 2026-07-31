@@ -17,7 +17,7 @@
 // Matching JavaScript is deliberate: it makes `String(x)` an oracle for every
 // finite double, which is the only way to have confidence in this.
 
-import { Big } from "./bigint.wac";
+import { FixedBig } from "./bigint.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 
 /**
@@ -103,14 +103,14 @@ Decimal decomposeFloat(bool neg, i32 be, u64 frac, i32 maxBe, u64 implicitBit, i
   }
   boundaryOk = (f & 1) == 0;
 
-  Big r = Big.fromU64(f);
-  Big s = Big.zero();
-  Big mPlus = Big.zero();
-  Big mMinus = Big.zero();
+  FixedBig r = FixedBig.fromU64(f);
+  FixedBig s = FixedBig.zero();
+  FixedBig mPlus = FixedBig.zero();
+  FixedBig mMinus = FixedBig.zero();
 
   if (e >= 0) {
     // 2^e, which is both the gap to each neighbour and the factor on f.
-    Big pow = Big.fromU64(1);
+    FixedBig pow = FixedBig.fromU64(1);
     pow.shiftLeft(e);
     // R = f * 2^e * 2 (or * 4 when the gaps differ), S = 2 (or 4).
     r.shiftLeft(e);
@@ -146,7 +146,7 @@ Decimal decomposeFloat(bool neg, i32 be, u64 frac, i32 maxBe, u64 implicitBit, i
   // Scale so that the first digit generated is the first significant one, i.e.
   // R/S lands in [1/10, 1). `k` counts the decimal point's position.
   i32 k = 0;
-  Big scratch = Big.zero();
+  FixedBig scratch = FixedBig.zero();
   while (true) {
     scratch.setSum(r, mPlus);
     i32 c = scratch.cmp(s);
@@ -166,7 +166,7 @@ Decimal decomposeFloat(bool neg, i32 be, u64 frac, i32 maxBe, u64 implicitBit, i
   }
   exp10 = k;
 
-  Big twice = Big.zero();
+  FixedBig twice = FixedBig.zero();
   while (true) {
     r.mulSmall(10);
     mPlus.mulSmall(10);

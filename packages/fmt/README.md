@@ -47,10 +47,12 @@ cannot be written after construction, so digit generation accumulates in locals 
 constructs the variant once at the end. It was a builder in disguise before, so this
 made it more honest rather than less.
 
-`src/bigint.wac` is the arithmetic: fixed-size unsigned, `u32` limbs with `u64`
-intermediates. Deliberately not a general bignum — the algorithm needs compare,
+`src/bigint.wac` is the arithmetic — `FixedBig`: fixed-size unsigned, `u32` limbs with
+`u64` intermediates. Deliberately not a general bignum, and named apart from
+`packages/bignum`'s `Big` because two structs of the same name in one program is a
+compiler bug rather than an error (`wac/issues/0006`) — the algorithm needs compare,
 subtract, multiply by a small constant and shift left, and finds each digit by
-trial subtraction, so there is no division and no Big×Big multiply.
+trial subtraction, so there is no division and no FixedBig×FixedBig multiply.
 
 Ryu would be faster and needs no bignum, but wants two tables of ~600 128-bit
 constants; with no module-level constants those become a `switch` of 1200 literals.

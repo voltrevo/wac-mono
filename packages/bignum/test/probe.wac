@@ -1,0 +1,82 @@
+// Host-facing entry point for the bignum tests.
+//
+// A `Big` is a GC reference and cannot cross the bindgen boundary, so every operation is
+// exposed as decimal-string in, decimal-string out. That routes each test through
+// `parseDecimal` and `formatDecimal` as well as the operation itself, which is why the
+// text conversions are tested first and directly: a bug in either would otherwise be
+// blamed on arithmetic.
+
+import { Big, add, sub, mul, mulSmall, negate, abs, cmp, cmpAbs, bitLen, shl, shr,
+         divmod, divSmall, DivMod, DivSmall, isZero, copy } from "../src/big.wac";
+import { parseDecimal, formatDecimal, parseHex, formatHex } from "../src/text.wac";
+
+/** Parse or trap. The tests only pass well-formed input; malformed input has its own. */
+Big need(u8[] s) {
+  Big? b = parseDecimal(s);
+  if (b is null) { trap; }
+  return b!;
+}
+
+export u8[] opAdd(u8[] a, u8[] b) { return formatDecimal(add(need(a), need(b))); }
+export u8[] opSub(u8[] a, u8[] b) { return formatDecimal(sub(need(a), need(b))); }
+export u8[] opMul(u8[] a, u8[] b) { return formatDecimal(mul(need(a), need(b))); }
+export u8[] opNeg(u8[] a) { return formatDecimal(negate(need(a))); }
+export u8[] opAbs(u8[] a) { return formatDecimal(abs(need(a))); }
+export u8[] opCopy(u8[] a) { return formatDecimal(copy(need(a))); }
+
+export u8[] opDiv(u8[] a, u8[] b) {
+  DivMod d = divmod(need(a), need(b));
+  return formatDecimal(d.q);
+}
+
+export u8[] opRem(u8[] a, u8[] b) {
+  DivMod d = divmod(need(a), need(b));
+  return formatDecimal(d.r);
+}
+
+export u8[] opShl(u8[] a, i32 bits) { return formatDecimal(shl(need(a), bits)); }
+export u8[] opShr(u8[] a, i32 bits) { return formatDecimal(shr(need(a), bits)); }
+
+export u8[] opMulSmall(u8[] a, i32 m) {
+  return formatDecimal(mulSmall(need(a), m as@ u32));
+}
+
+/** Quotient by a single limb, which has its own code path separate from divmod. */
+export u8[] opDivSmall(u8[] a, i32 m) {
+  DivSmall d = divSmall(need(a), m as@ u32);
+  return formatDecimal(d.q);
+}
+
+/** Remainder by a single limb, as an unsigned magnitude — see divSmall's contract. */
+export i32 opRemSmall(u8[] a, i32 m) {
+  DivSmall d = divSmall(need(a), m as@ u32);
+  return d.r as@ i32;
+}
+
+export i32 opCmp(u8[] a, u8[] b) { return cmp(need(a), need(b)); }
+export i32 opCmpAbs(u8[] a, u8[] b) { return cmpAbs(need(a), need(b)); }
+export i32 opBitLen(u8[] a) { return bitLen(need(a)); }
+export bool opIsZero(u8[] a) { return isZero(need(a)); }
+
+/** Decimal round-trip on its own, with no arithmetic in between. */
+export u8[] roundTrip(u8[] s) { return formatDecimal(need(s)); }
+
+/** Whether `parseDecimal` accepts the input at all. */
+export bool acceptsDecimal(u8[] s) { return !(parseDecimal(s) is null); }
+
+export bool acceptsHex(u8[] s) { return !(parseHex(s) is null); }
+
+/** Decimal in, hex out — the two conversions checked against each other. */
+export u8[] toHex(u8[] s) { return formatHex(need(s)); }
+
+/** Hex in, decimal out. Traps on malformed input. */
+export u8[] fromHex(u8[] s) {
+  Big? b = parseHex(s);
+  if (b is null) { trap; }
+  return formatDecimal(b!);
+}
+
+/** The i64 constructor, which the string path never reaches. */
+export u8[] fromI64(i64 v) { return formatDecimal(Big.fromI64(v)); }
+
+export u8[] fromU64(i64 v) { return formatDecimal(Big.fromU64(v as@ u64)); }

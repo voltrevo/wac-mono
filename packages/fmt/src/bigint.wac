@@ -4,7 +4,11 @@
 // Burger & Dybvig's digit generation needs compare, subtract, multiply by a small
 // constant, and shift left. It never needs general division: each digit is found
 // by trial subtraction, at most nine times. So this is deliberately not a general
-// bignum — no division, no multiplication of two Bigs, no signs.
+// bignum — no division, no multiplication of two FixedBigs, no signs.
+//
+// Named `FixedBig` rather than `Big` to stay clear of `packages/bignum`, which is the
+// general one. That is not only taste: two structs with the same name in one program
+// compile to invalid wasm rather than to an error — see `wac/issues/0006`.
 //
 // Limbs are u32 little-endian with u64 intermediates, which is the standard shape
 // when the widest type is twice the limb width. Limbs above `n` are always zero,
@@ -20,11 +24,11 @@
  */
 export i32 LIMBS() { return 40; }
 
-export struct Big {
+export struct FixedBig {
   u32[] limbs;
   i32 n;
 
-  Big zero() { return Big(u32[LIMBS()](), 0); }
+  FixedBig zero() { return FixedBig(u32[LIMBS()](), 0); }
 
   /**
    * A bignum with room for `limbs` limbs.
@@ -33,10 +37,10 @@ export struct Big {
    * 800-digit decimal against a double's exact value reaches ~3900 bits, where
    * shortest-formatting never passes ~1030.
    */
-  Big withLimbs(i32 limbs) { return Big(u32[limbs](), 0); }
+  FixedBig withLimbs(i32 limbs) { return FixedBig(u32[limbs](), 0); }
 
-  Big fromU64(u64 v) {
-    Big b = Big.zero();
+  FixedBig fromU64(u64 v) {
+    FixedBig b = FixedBig.zero();
     b.limbs[0] = v as@ u32;
     b.limbs[1] = (v >> 32) as@ u32;
     b.n = 2;
@@ -59,7 +63,7 @@ export struct Big {
     this.trim();
   }
 
-  void copyFrom(this, Big src) {
+  void copyFrom(this, FixedBig src) {
     // Clear the old tail: limbs above n must stay zero for shiftLeft and mulSmall.
     for (i32 i = src.n; i < this.n; i++) { this.limbs[i] = 0; }
     for (i32 i = 0; i < src.n; i++) { this.limbs[i] = src.limbs[i]; }
@@ -123,7 +127,7 @@ export struct Big {
   }
 
   /** -1, 0 or 1 for this < o, this == o, this > o. */
-  i32 cmp(const this, Big o) {
+  i32 cmp(const this, FixedBig o) {
     if (this.n != o.n) { return this.n > o.n ? 1 : -1; }
     for (i32 i = this.n - 1; i >= 0; i--) {
       if (this.limbs[i] != o.limbs[i]) {
@@ -135,7 +139,7 @@ export struct Big {
   }
 
   /** this -= o. The caller must know this >= o; a smaller o would underflow. */
-  void sub(this, Big o) {
+  void sub(this, FixedBig o) {
     u64 borrow = 0;
     for (i32 i = 0; i < this.n; i++) {
       u64 a = this.limbs[i] as u64;
@@ -154,7 +158,7 @@ export struct Big {
   }
 
   /** this += o, in place. */
-  void add(this, Big o) {
+  void add(this, FixedBig o) {
     i32 m = this.n > o.n ? this.n : o.n;
     u64 carry = 0;
     for (i32 i = 0; i < m; i++) {
@@ -180,7 +184,7 @@ export struct Big {
    * buffer because this is called inside a bisection loop, where allocating would
    * cost more than the arithmetic.
    */
-  void mulU64(this, u64 v, Big scratch) {
+  void mulU64(this, u64 v, FixedBig scratch) {
     u32 lo = v as@ u32;
     u32 hi = (v >> 32) as@ u32;
     if (hi == 0) { this.mulSmall(lo); return; }
@@ -192,7 +196,7 @@ export struct Big {
   }
 
   /** this = a + b. Neither operand may be this. */
-  void setSum(this, Big a, Big b) {
+  void setSum(this, FixedBig a, FixedBig b) {
     i32 m = a.n > b.n ? a.n : b.n;
     u64 carry = 0;
     for (i32 i = 0; i < m; i++) {

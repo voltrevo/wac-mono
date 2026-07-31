@@ -1,0 +1,164 @@
+// Decimal and hexadecimal text for Big.
+//
+// These are also how a Big reaches the host: it is a GC reference and cannot cross the
+// bindgen boundary, so the tests exchange decimal strings and compare against BigInt.
+// That makes the conversions load-bearing for every other test in the package, so they
+// are tested against BigInt first and directly.
+//
+// Both directions work nine digits at a time rather than one. 10^9 is the largest power
+// of ten that fits a u32, so a chunk is one `mulSmall` plus one small add on the way in
+// and one `divSmall` on the way out, instead of nine of each.
+
+import { Big, DivSmall, divSmall, mul, mulSmall, add, abs, isZero, cmpAbs } from "./big.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+
+/** 10^9, the largest power of ten in a u32. */
+i32 CHUNK_DIGITS() { return 9; }
+u32 CHUNK_BASE() { return 1000000000; }
+
+/**
+ * Parse an optionally-signed decimal integer. Returns null on anything malformed,
+ * including an empty string, a lone sign, and any non-digit byte.
+ *
+ * Leading zeros are accepted — "007" is 7 — because they are unambiguous here. There is
+ * no exponent and no decimal point: this is an integer parser, and silently truncating
+ * "1.5" would be worse than rejecting it.
+ */
+export Big? parseDecimal(u8[] s) {
+  i32 i = 0;
+  bool neg = false;
+  if (s.len() > 0 && (s[0] == '-' || s[0] == '+')) {
+    neg = s[0] == '-';
+    i = 1;
+  }
+  if (i >= s.len()) { return null; }
+
+  Big acc = Big.zero();
+  while (i < s.len()) {
+    // Take up to nine digits, then fold the whole chunk in at once.
+    u32 chunk = 0;
+    u32 scale = 1;
+    i32 taken = 0;
+    while (i < s.len() && taken < CHUNK_DIGITS()) {
+      i32 c = s[i];
+      if (c < '0' || c > '9') { return null; }
+      chunk = chunk * 10 + ((c - '0') as@ u32);
+      scale = scale * 10;
+      taken++;
+      i++;
+    }
+    acc = add(mulSmall(acc, scale), Big.fromU64(chunk as u64));
+  }
+  acc.neg = neg && !isZero(acc);
+  return acc;
+}
+
+/** Decimal digits, with a leading '-' for a negative value and "0" for zero. */
+export u8[] formatDecimal(Big a) {
+  if (isZero(a)) { return u8[1](fill: '0'); }
+
+  // Nine digits per limb-sized division. The digits come out least-significant first,
+  // so they are collected and then reversed.
+  Buf digits = Buf.create();
+  Big cur = abs(a);
+  while (!isZero(cur)) {
+    DivSmall d = divSmall(cur, CHUNK_BASE());
+    cur = d.q;
+    u32 rem = d.r;
+    if (isZero(cur)) {
+      // The most significant chunk: emit its digits and stop, so there are no
+      // leading zeros. `rem` is nonzero here, since a trimmed value's top chunk is.
+      while (rem != 0) {
+        digits.push(48 + ((rem % 10) as@ i32));
+        rem = rem / 10;
+      }
+    } else {
+      // An interior chunk stands for exactly nine digits, zeros included.
+      for (i32 k = 0; k < CHUNK_DIGITS(); k++) {
+        digits.push(48 + ((rem % 10) as@ i32));
+        rem = rem / 10;
+      }
+    }
+  }
+
+  i32 n = digits.len;
+  i32 total = a.neg ? n + 1 : n;
+  u8[] out = u8[total]();
+  i32 at = 0;
+  if (a.neg) { out[0] = '-'; at = 1; }
+  for (i32 i = 0; i < n; i++) { out[at + i] = digits.get(n - 1 - i); }
+  return out;
+}
+
+export string toStr(Big a) { return string.fromBytes(formatDecimal(a)); }
+
+i32 hexDigit(u32 nib) { return nib < 10 ? (48 + nib) as@ i32 : (87 + nib) as@ i32; }
+
+/** Lowercase hex digits, with a leading '-' for a negative value and "0" for zero. */
+export u8[] formatHex(Big a) {
+  if (isZero(a)) { return u8[1](fill: '0'); }
+  Buf digits = Buf.create();
+  for (i32 i = 0; i < a.n; i++) {
+    u32 v = a.limbs[i];
+    if (i == a.n - 1) {
+      // The top limb, which is nonzero in canonical form: significant digits only.
+      while (v != 0) {
+        digits.push(hexDigit(v & 15));
+        v = v >> 4;
+      }
+    } else {
+      // Every other limb contributes exactly eight digits, zeros included.
+      for (i32 k = 0; k < 8; k++) {
+        digits.push(hexDigit(v & 15));
+        v = v >> 4;
+      }
+    }
+  }
+  i32 n = digits.len;
+  i32 total = a.neg ? n + 1 : n;
+  u8[] out = u8[total]();
+  i32 at = 0;
+  if (a.neg) { out[0] = '-'; at = 1; }
+  for (i32 i = 0; i < n; i++) { out[at + i] = digits.get(n - 1 - i); }
+  return out;
+}
+
+/** Parse hex, with an optional sign and an optional `0x` prefix. Null if malformed. */
+export Big? parseHex(u8[] s) {
+  i32 i = 0;
+  bool neg = false;
+  if (s.len() > 0 && (s[0] == '-' || s[0] == '+')) {
+    neg = s[0] == '-';
+    i = 1;
+  }
+  if (i + 1 < s.len() && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) { i = i + 2; }
+  if (i >= s.len()) { return null; }
+
+  Big acc = Big.zero();
+  while (i < s.len()) {
+    // Seven digits at a time: 16^7 fits a u32, 16^8 does not.
+    u32 chunk = 0;
+    u32 scale = 1;
+    i32 taken = 0;
+    while (i < s.len() && taken < 7) {
+      i32 c = s[i];
+      u32 v = 0;
+      if (c >= '0' && c <= '9') {
+        v = (c - '0') as@ u32;
+      } else if (c >= 'a' && c <= 'f') {
+        v = (c - 'a' + 10) as@ u32;
+      } else if (c >= 'A' && c <= 'F') {
+        v = (c - 'A' + 10) as@ u32;
+      } else {
+        return null;
+      }
+      chunk = chunk * 16 + v;
+      scale = scale * 16;
+      taken++;
+      i++;
+    }
+    acc = add(mulSmall(acc, scale), Big.fromU64(chunk as u64));
+  }
+  acc.neg = neg && !isZero(acc);
+  return acc;
+}

@@ -1,0 +1,107 @@
+// The wac-facing side of bignum: that the package is usable from wac.
+//
+// Correctness of the arithmetic lives in the host-side tests, where BigInt is the oracle
+// and there is no arguing with it. What those cannot reach is the shape of the API from
+// inside the language: `toStr` returns a `string` rather than bytes, and the whole thing
+// is free functions rather than methods, which is a decision worth a test that would
+// break if someone changed it back.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Big, add, sub, mul, negate, abs, cmp, cmpAbs, bitLen, shl, shr, divmod, divSmall,
+         DivMod, DivSmall, copy } from "../../src/big.wac";
+import { parseDecimal, formatDecimal, toStr, formatHex, parseHex } from "../../src/text.wac";
+
+/** Parse a literal that the test author knows is well-formed. */
+Big of(string s) { return parseDecimal(s.toBytes())!; }
+
+export string test_toStr_returns_text() {
+  T t = T.create();
+  t.eqStr(toStr(of("0")), "0", "zero");
+  t.eqStr(toStr(of("-1")), "-1", "a negative value keeps its sign");
+  t.eqStr(toStr(of("123456789012345678901234567890")), "123456789012345678901234567890",
+    "a value far wider than i64 survives the round trip");
+  return t.report();
+}
+
+export string test_arithmetic_from_wac() {
+  T t = T.create();
+  Big a = of("340282366920938463463374607431768211456"); // 2^128
+  Big b = of("18446744073709551616"); // 2^64
+  t.eqStr(toStr(add(a, b)), "340282366920938463481821351505477763072", "2^128 + 2^64");
+  t.eqStr(toStr(sub(a, b)), "340282366920938463444927863358058659840", "2^128 - 2^64");
+  t.eqStr(toStr(mul(b, b)), "340282366920938463463374607431768211456", "2^64 squared is 2^128");
+  DivMod d = divmod(a, b);
+  t.eqStr(toStr(d.q), "18446744073709551616", "2^128 / 2^64");
+  t.eqStr(toStr(d.r), "0", "and it divides exactly");
+  return t.report();
+}
+
+export string test_signs_and_predicates() {
+  T t = T.create();
+  Big neg = of("-42");
+  t.eqStr(toStr(negate(neg)), "42", "negate a negative");
+  t.eqStr(toStr(abs(neg)), "42", "abs a negative");
+  t.eqStr(toStr(copy(neg)), "-42", "copy preserves the sign");
+  t.eqI32(cmp(neg, of("42")), -1, "-42 < 42");
+  t.eqI32(cmpAbs(neg, of("42")), 0, "magnitudes are equal");
+  t.eqI32(cmp(of("0"), of("-0")), 0, "the two spellings of zero compare equal");
+  // `isZero` is asserted from the host side, where a bool crosses the boundary directly.
+  // Reaching it from here would need a conditional in the test, and a branch a passing
+  // test never takes shows up as a coverage hole for the rest of time.
+  return t.report();
+}
+
+export string test_shifts_floor_for_negatives() {
+  T t = T.create();
+  // The rule that separates an arithmetic shift from a magnitude shift.
+  t.eqStr(toStr(shr(of("-5"), 1)), "-3", "-5 >> 1 floors to -3");
+  t.eqStr(toStr(shr(of("5"), 1)), "2", "5 >> 1 truncates to 2");
+  t.eqStr(toStr(shr(of("-1"), 100)), "-1", "-1 never reaches zero");
+  t.eqStr(toStr(shl(of("1"), 64)), "18446744073709551616", "1 << 64");
+  return t.report();
+}
+
+export string test_truncated_division() {
+  T t = T.create();
+  // Truncated, not floored: the remainder takes the sign of the dividend.
+  DivMod a = divmod(of("-7"), of("2"));
+  t.eqStr(toStr(a.q), "-3", "-7 / 2 truncates toward zero");
+  t.eqStr(toStr(a.r), "-1", "and the remainder is negative");
+  DivMod b = divmod(of("7"), of("-2"));
+  t.eqStr(toStr(b.q), "-3", "7 / -2");
+  t.eqStr(toStr(b.r), "1", "remainder follows the dividend, so it stays positive");
+  return t.report();
+}
+
+export string test_divSmall_remainder_is_a_magnitude() {
+  T t = T.create();
+  // Unlike divmod's, divSmall's remainder is unsigned — it is the piece the text
+  // conversions need, and they only ever divide a magnitude.
+  DivSmall d = divSmall(of("-1000000007"), 10);
+  t.eqStr(toStr(d.q), "-100000000", "the quotient keeps the sign");
+  t.eqU32(d.r, 7, "the remainder does not");
+  return t.report();
+}
+
+export string test_bitLen_and_hex() {
+  T t = T.create();
+  t.eqI32(bitLen(of("0")), 0, "zero has no bits");
+  t.eqI32(bitLen(of("1")), 1, "one bit");
+  t.eqI32(bitLen(of("255")), 8, "255");
+  t.eqI32(bitLen(of("4294967296")), 33, "2^32 crosses a limb");
+  t.eqBytes(formatHex(of("255")), "ff".toBytes(), "hex of 255");
+  t.eqBytes(formatHex(of("-4294967296")), "-100000000".toBytes(), "hex across a limb");
+  t.eqStr(toStr(parseHex("0xdeadbeef".toBytes())!), "3735928559", "hex in, decimal out");
+  return t.report();
+}
+
+export string test_formatDecimal_pads_interior_chunks() {
+  T t = T.create();
+  // The conversion emits nine digits at a time; an interior chunk of zeros has to be
+  // written out in full or the digits silently close up.
+  t.eqBytes(formatDecimal(of("1000000000")), "1000000000".toBytes(), "10^9 exactly");
+  t.eqBytes(formatDecimal(of("1000000001")), "1000000001".toBytes(), "a zero run inside");
+  t.eqBytes(formatDecimal(of("1000000000000000000")), "1000000000000000000".toBytes(),
+    "10^18, two full chunks of zeros");
+  return t.report();
+}

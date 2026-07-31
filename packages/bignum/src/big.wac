@@ -1,0 +1,449 @@
+// Arbitrary-precision integers.
+//
+// Sign-magnitude: `limbs` holds the magnitude little-endian in u32 digits, `n` counts
+// the significant limbs, and `neg` is the sign. Two's complement would make bitwise
+// operations natural and everything else harder, and this is an arithmetic package
+// first.
+//
+// Every operation returns a fresh value and allocates its result exactly, because every
+// result size is known in advance: an addition is at most max(n,m)+1 limbs, a product is
+// n+m, a quotient is n-m+1 and a remainder is m. So there is no growable container here,
+// which is worth saying given the absence of generics has forced one into four other
+// packages.
+//
+// The API is free functions rather than methods — `add(a, b)`, not `a.add(b)` — because
+// deep const makes the method form impossible to write. A `const this` method cannot use
+// a value returned by another `const this` method, even one freshly allocated, since the
+// result of a call through a const receiver is itself const. See the package README.
+//
+// Semantics follow JavaScript's BigInt exactly, which is what makes BigInt an exact
+// oracle rather than an approximate one. Division truncates toward zero and a remainder
+// takes the sign of the dividend, so -7/2 is -3 remainder -1; `shr` is arithmetic, so
+// -5 >> 1 is -3 and not -2.
+//
+// `fmt` has its own fixed-size, division-free bignum specialised for float conversion.
+// It is deliberately not built on this one: it must not allocate on its hot path, and
+// this allocates per operation.
+
+/**
+ * Canonical form: `n` counts significant limbs with no leading zeros, and `neg` is false
+ * whenever `n` is 0. Every constructor and operation restores it, and comparison depends
+ * on it.
+ */
+export struct Big {
+  u32[] limbs;
+  i32 n;
+  bool neg;
+
+  Big zero() { return Big(u32[1](), 0, false); }
+
+  /** Room for `cap` limbs, no significant digits yet. */
+  Big withCap(i32 cap) {
+    if (cap < 1) { cap = 1; }
+    return Big(u32[cap](), 0, false);
+  }
+
+  Big fromU64(u64 v) {
+    Big b = Big.withCap(2);
+    b.limbs[0] = v as@ u32;
+    b.limbs[1] = (v >> 32) as@ u32;
+    b.n = 2;
+    b.trim();
+    return b;
+  }
+
+  Big fromI64(i64 v) {
+    bool neg = v < 0;
+    // Two's complement negate rather than `-v`: the most negative i64 has no positive
+    // counterpart, and negating it would overflow back to itself.
+    u64 mag = v as@ u64;
+    if (neg) { mag = ~mag + 1; }
+    Big b = Big.fromU64(mag);
+    b.neg = neg && b.n != 0;
+    return b;
+  }
+
+  /** Drop leading zero limbs, and normalise the sign of zero. */
+  void trim(this) {
+    while (this.n > 0 && this.limbs[this.n - 1] == 0) { this.n--; }
+    if (this.n == 0) { this.neg = false; }
+  }
+}
+
+export bool isZero(Big a) { return a.n == 0; }
+
+export Big copy(Big a) {
+  Big r = Big.withCap(a.n);
+  for (i32 i = 0; i < a.n; i++) { r.limbs[i] = a.limbs[i]; }
+  r.n = a.n;
+  r.neg = a.neg;
+  return r;
+}
+
+/** A copy with the sign flipped. Zero stays positive. */
+export Big negate(Big a) {
+  Big r = copy(a);
+  r.neg = !a.neg && a.n != 0;
+  return r;
+}
+
+export Big abs(Big a) {
+  Big r = copy(a);
+  r.neg = false;
+  return r;
+}
+
+/** Bit length of the magnitude: 0 for zero, else the position of the top set bit. */
+export i32 bitLen(Big a) {
+  if (a.n == 0) { return 0; }
+  u32 top = a.limbs[a.n - 1];
+  i32 bits = 0;
+  while (top != 0) { top = top >> 1; bits++; }
+  return (a.n - 1) * 32 + bits;
+}
+
+// ── Comparison ─────────────────────────────────────────────────────────────────────
+
+/** -1, 0, 1 comparing magnitudes only. */
+export i32 cmpAbs(Big a, Big b) {
+  if (a.n != b.n) { return a.n > b.n ? 1 : -1; }
+  for (i32 i = a.n - 1; i >= 0; i--) {
+    if (a.limbs[i] != b.limbs[i]) { return a.limbs[i] > b.limbs[i] ? 1 : -1; }
+  }
+  return 0;
+}
+
+/** -1, 0, 1 comparing signed values. */
+export i32 cmp(Big a, Big b) {
+  if (a.neg != b.neg) { return a.neg ? -1 : 1; }
+  i32 c = cmpAbs(a, b);
+  return a.neg ? -c : c;
+}
+
+// ── Addition and subtraction ───────────────────────────────────────────────────────
+
+/** |a| + |b|. */
+export Big addAbs(Big a, Big b) {
+  i32 m = a.n > b.n ? a.n : b.n;
+  Big r = Big.withCap(m + 1);
+  u64 carry = 0;
+  for (i32 i = 0; i < m; i++) {
+    u64 t = carry;
+    if (i < a.n) { t = t + (a.limbs[i] as u64); }
+    if (i < b.n) { t = t + (b.limbs[i] as u64); }
+    r.limbs[i] = t as@ u32;
+    carry = t >> 32;
+  }
+  r.n = m;
+  if (carry != 0) { r.limbs[m] = carry as@ u32; r.n = m + 1; }
+  r.trim();
+  return r;
+}
+
+/** |a| - |b|. The caller must know |a| >= |b|. */
+export Big subAbs(Big a, Big b) {
+  Big r = Big.withCap(a.n);
+  u64 borrow = 0;
+  for (i32 i = 0; i < a.n; i++) {
+    u64 x = a.limbs[i] as u64;
+    u64 y = borrow;
+    if (i < b.n) { y = y + (b.limbs[i] as u64); }
+    if (x >= y) {
+      r.limbs[i] = (x - y) as@ u32;
+      borrow = 0;
+    } else {
+      r.limbs[i] = ((x + 4294967296) - y) as@ u32;
+      borrow = 1;
+    }
+  }
+  r.n = a.n;
+  r.trim();
+  return r;
+}
+
+export Big add(Big a, Big b) {
+  if (a.neg == b.neg) {
+    Big r = addAbs(a, b);
+    r.neg = a.neg && r.n != 0;
+    return r;
+  }
+  // Opposite signs: the larger magnitude decides both the result and its sign.
+  i32 c = cmpAbs(a, b);
+  if (c == 0) { return Big.zero(); }
+  if (c > 0) {
+    Big r = subAbs(a, b);
+    r.neg = a.neg && r.n != 0;
+    return r;
+  }
+  Big r = subAbs(b, a);
+  r.neg = b.neg && r.n != 0;
+  return r;
+}
+
+export Big sub(Big a, Big b) { return add(a, negate(b)); }
+
+// ── Multiplication ─────────────────────────────────────────────────────────────────
+
+/**
+ * Schoolbook, O(n*m).
+ *
+ * Karatsuba wins above a few hundred limbs and is a later change that touches nothing
+ * else; the sizes this package sees are well below that.
+ */
+export Big mul(Big a, Big b) {
+  if (a.n == 0 || b.n == 0) { return Big.zero(); }
+  Big r = Big.withCap(a.n + b.n);
+  for (i32 i = 0; i < a.n + b.n; i++) { r.limbs[i] = 0; }
+  for (i32 i = 0; i < a.n; i++) {
+    u64 carry = 0;
+    u64 x = a.limbs[i] as u64;
+    for (i32 j = 0; j < b.n; j++) {
+      u64 t = (r.limbs[i + j] as u64) + x * (b.limbs[j] as u64) + carry;
+      r.limbs[i + j] = t as@ u32;
+      carry = t >> 32;
+    }
+    r.limbs[i + b.n] = carry as@ u32;
+  }
+  r.n = a.n + b.n;
+  r.neg = a.neg != b.neg;
+  r.trim();
+  return r;
+}
+
+/** a * m for a single-limb m. */
+export Big mulSmall(Big a, u32 m) {
+  if (a.n == 0 || m == 0) { return Big.zero(); }
+  Big r = Big.withCap(a.n + 1);
+  u64 carry = 0;
+  for (i32 i = 0; i < a.n; i++) {
+    u64 t = (a.limbs[i] as u64) * (m as u64) + carry;
+    r.limbs[i] = t as@ u32;
+    carry = t >> 32;
+  }
+  r.n = a.n;
+  if (carry != 0) { r.limbs[a.n] = carry as@ u32; r.n = a.n + 1; }
+  r.neg = a.neg;
+  r.trim();
+  return r;
+}
+
+// ── Shifts ─────────────────────────────────────────────────────────────────────────
+
+export Big shl(Big a, i32 bits) {
+  if (bits < 0) { return shr(a, -bits); }
+  if (a.n == 0 || bits == 0) { return copy(a); }
+  i32 words = bits / 32;
+  i32 rem = bits % 32;
+  i32 cap = a.n + words + 1;
+  Big r = Big.withCap(cap);
+  for (i32 i = 0; i < cap; i++) { r.limbs[i] = 0; }
+  for (i32 i = 0; i < a.n; i++) {
+    u32 v = a.limbs[i];
+    if (rem == 0) {
+      r.limbs[i + words] = r.limbs[i + words] | v;
+    } else {
+      r.limbs[i + words] = r.limbs[i + words] | (v << (rem as@ u32));
+      r.limbs[i + words + 1] = r.limbs[i + words + 1] | (v >> ((32 - rem) as@ u32));
+    }
+  }
+  r.n = cap;
+  r.neg = a.neg;
+  r.trim();
+  return r;
+}
+
+/**
+ * Arithmetic shift right, matching BigInt's `>>`.
+ *
+ * For a negative value that floors rather than truncates: -5 >> 1 is -3. Shifting the
+ * magnitude discards low bits, which rounds toward zero, so one is subtracted back
+ * (added to the magnitude) when anything was discarded.
+ */
+export Big shr(Big a, i32 bits) {
+  if (bits < 0) { return shl(a, -bits); }
+  if (bits == 0 || a.n == 0) { return copy(a); }
+  i32 words = bits / 32;
+  i32 rem = bits % 32;
+
+  if (words >= a.n) {
+    // Everything shifted out: zero for a positive value, -1 for a negative one.
+    if (!a.neg) { return Big.zero(); }
+    return Big.fromI64(-1);
+  }
+
+  bool lost = false;
+  for (i32 i = 0; i < words; i++) { if (a.limbs[i] != 0) { lost = true; } }
+  if (rem != 0) {
+    u32 mask = ((1 as@ u32) << (rem as@ u32)) - 1;
+    if ((a.limbs[words] & mask) != 0) { lost = true; }
+  }
+
+  i32 outN = a.n - words;
+  Big r = Big.withCap(outN);
+  for (i32 i = 0; i < outN; i++) {
+    u32 v = a.limbs[i + words];
+    if (rem == 0) {
+      r.limbs[i] = v;
+    } else {
+      u32 hi = 0;
+      if (i + words + 1 < a.n) { hi = a.limbs[i + words + 1]; }
+      r.limbs[i] = (v >> (rem as@ u32)) | (hi << ((32 - rem) as@ u32));
+    }
+  }
+  r.n = outN;
+  r.neg = a.neg;
+  r.trim();
+  if (a.neg && lost) { return add(r, Big.fromI64(-1)); }
+  return r;
+}
+
+// ── Division ───────────────────────────────────────────────────────────────────────
+
+/** A quotient and remainder together, since wac has no tuples. */
+export struct DivMod {
+  Big q;
+  Big r;
+}
+
+/** A quotient and a single-limb remainder, which the text conversions need. */
+export struct DivSmall {
+  Big q;
+  u32 r;
+}
+
+/** a / m and a % m for a single-limb divisor. Traps on m == 0. */
+export DivSmall divSmall(Big a, u32 m) {
+  if (m == 0) { trap; }
+  if (a.n == 0) { return DivSmall(Big.zero(), 0); }
+  Big q = Big.withCap(a.n);
+  u64 rem = 0;
+  for (i32 i = a.n - 1; i >= 0; i--) {
+    u64 cur = (rem << 32) | (a.limbs[i] as u64);
+    q.limbs[i] = (cur / (m as u64)) as@ u32;
+    rem = cur % (m as u64);
+  }
+  q.n = a.n;
+  q.neg = a.neg;
+  q.trim();
+  return DivSmall(q, rem as@ u32);
+}
+
+/**
+ * Truncated division, matching BigInt: the quotient rounds toward zero and the remainder
+ * takes the sign of the dividend. Traps on division by zero.
+ *
+ * Knuth's algorithm D. The divisor is normalised so its top limb has its high bit set,
+ * which is what bounds the quotient-digit estimate to at most one too high after the
+ * refinement loop — and the add-back handles that remaining case.
+ */
+export DivMod divmod(Big a, Big b) {
+  if (b.n == 0) { trap; }
+
+  if (cmpAbs(a, b) < 0) {
+    // |a| < |b|: the quotient is zero and the remainder is a itself.
+    return DivMod(Big.zero(), copy(a));
+  }
+  if (b.n == 1) {
+    DivSmall d = divSmall(abs(a), b.limbs[0]);
+    Big q = d.q;
+    q.neg = (a.neg != b.neg) && q.n != 0;
+    Big r = Big.fromU64(d.r as u64);
+    r.neg = a.neg && r.n != 0;
+    return DivMod(q, r);
+  }
+
+  // Normalise so the divisor's top limb has its high bit set.
+  i32 shift = 0;
+  u32 top = b.limbs[b.n - 1];
+  while ((top & (2147483648 as@ u32)) == 0) { top = top << 1; shift++; }
+
+  Big u = shl(abs(a), shift);
+  Big v = shl(abs(b), shift);
+  i32 n = v.n;
+  i32 m = u.n - n;
+
+  // The running remainder needs one limb of headroom above u.
+  Big un = Big.withCap(u.n + 1);
+  for (i32 i = 0; i < u.n; i++) { un.limbs[i] = u.limbs[i]; }
+  un.limbs[u.n] = 0;
+  un.n = u.n + 1;
+
+  Big q = Big.withCap(m + 1);
+  for (i32 i = 0; i <= m; i++) { q.limbs[i] = 0; }
+
+  u64 base = 4294967296;
+  u64 vTop = v.limbs[n - 1] as u64;
+  u64 vNext = v.limbs[n - 2] as u64;
+
+  for (i32 j = m; j >= 0; j--) {
+    // Estimate one quotient digit from the top two limbs of the remainder.
+    u64 num = ((un.limbs[j + n] as u64) << 32) | (un.limbs[j + n - 1] as u64);
+    u64 qhat = num / vTop;
+    u64 rhat = num % vTop;
+    if (qhat >= base) { qhat = base - 1; rhat = num - qhat * vTop; }
+    // The refinement below forms base*rhat, so it only means anything while rhat is
+    // below base. The clamp on the line above can leave rhat at exactly base — and then
+    // `rhat << 32` is 2^64, which wraps a u64 to zero and makes the comparison reject a
+    // digit that was already right. Hence `rhat < base` as a loop condition rather than
+    // a check after the increment.
+    while (qhat != 0 && rhat < base) {
+      u64 lhs = qhat * vNext;
+      u64 rhs = (rhat << 32) | (un.limbs[j + n - 2] as u64);
+      if (lhs <= rhs) { break; }
+      qhat = qhat - 1;
+      rhat = rhat + vTop;
+    }
+
+    // Subtract qhat * v from the window of un at offset j.
+    u64 borrow = 0;
+    u64 carry = 0;
+    for (i32 i = 0; i < n; i++) {
+      u64 p = qhat * (v.limbs[i] as u64) + carry;
+      carry = p >> 32;
+      u64 need = ((p as@ u32) as u64) + borrow;
+      u64 cur = un.limbs[i + j] as u64;
+      if (cur >= need) {
+        un.limbs[i + j] = (cur - need) as@ u32;
+        borrow = 0;
+      } else {
+        un.limbs[i + j] = ((cur + base) - need) as@ u32;
+        borrow = 1;
+      }
+    }
+    u64 curTop = un.limbs[j + n] as u64;
+    u64 needTop = carry + borrow;
+    if (curTop >= needTop) {
+      un.limbs[j + n] = (curTop - needTop) as@ u32;
+      borrow = 0;
+    } else {
+      un.limbs[j + n] = ((curTop + base) - needTop) as@ u32;
+      borrow = 1;
+    }
+
+    if (borrow != 0) {
+      // The estimate was one too high: add the divisor back and step the digit down.
+      qhat = qhat - 1;
+      u64 c2 = 0;
+      for (i32 i = 0; i < n; i++) {
+        u64 t = (un.limbs[i + j] as u64) + (v.limbs[i] as u64) + c2;
+        un.limbs[i + j] = t as@ u32;
+        c2 = t >> 32;
+      }
+      un.limbs[j + n] = ((un.limbs[j + n] as u64) + c2) as@ u32;
+    }
+    q.limbs[j] = qhat as@ u32;
+  }
+
+  q.n = m + 1;
+  q.trim();
+  q.neg = (a.neg != b.neg) && q.n != 0;
+
+  // The remainder is the low n limbs of un, shifted back down.
+  Big rmag = Big.withCap(n);
+  for (i32 i = 0; i < n; i++) { rmag.limbs[i] = un.limbs[i]; }
+  rmag.n = n;
+  rmag.trim();
+  Big r = shr(rmag, shift);
+  r.neg = a.neg && r.n != 0;
+  return DivMod(q, r);
+}

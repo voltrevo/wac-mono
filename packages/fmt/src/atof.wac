@@ -13,7 +13,7 @@
 // and the other by a power of two, so only multiply and compare are needed. That is
 // the same reason bigint.wac has no division.
 
-import { Big } from "./bigint.wac";
+import { FixedBig } from "./bigint.wac";
 
 /**
  * Limbs for the exact path.
@@ -285,30 +285,30 @@ f64 pow10Exact(i32 n) {
  * at 0.5 MB/s.
  */
 struct Cmp {
-  Big dec;        // digits * 10^exp10 when exp10 >= 0, else just the digits
-  Big pow;        // 10^-exp10 when exp10 < 0, else unused
-  Big lhs;        // scratch
-  Big rhs;        // scratch
-  Big scratch;    // scratch for mulU64
+  FixedBig dec;        // digits * 10^exp10 when exp10 >= 0, else just the digits
+  FixedBig pow;        // 10^-exp10 when exp10 < 0, else unused
+  FixedBig lhs;        // scratch
+  FixedBig rhs;        // scratch
+  FixedBig scratch;    // scratch for mulU64
   i32 exp10;
   bool sticky;
 }
 
 f64 bisect(Parts p) {
   i32 limbs = ATOF_LIMBS();
-  Big dec = Big.withLimbs(limbs);
+  FixedBig dec = FixedBig.withLimbs(limbs);
   for (i32 i = 0; i < p.count; i++) {
     dec.mulAddSmall(10, (p.digits[i] - '0') as@ u32);
   }
-  Big pow = Big.withLimbs(limbs);
+  FixedBig pow = FixedBig.withLimbs(limbs);
   if (p.exp10 > 0) {
     mulPow10(dec, p.exp10);
   } else if (p.exp10 < 0) {
     pow.setU64(1);
     mulPow10(pow, -p.exp10);
   }
-  Cmp c = Cmp(dec, pow, Big.withLimbs(limbs), Big.withLimbs(limbs),
-              Big.withLimbs(limbs), p.exp10, p.sticky);
+  Cmp c = Cmp(dec, pow, FixedBig.withLimbs(limbs), FixedBig.withLimbs(limbs),
+              FixedBig.withLimbs(limbs), p.exp10, p.sticky);
 
   u64 maxFinite = 9218868437227405311;    // 0x7FEFFFFFFFFFFFFF
 
@@ -408,19 +408,19 @@ f32 bisect32(Parts p) {
   if (top < -50) { return 0.0 as~ f32; }
 
   i32 limbs = ATOF_LIMBS();
-  Big dec = Big.withLimbs(limbs);
+  FixedBig dec = FixedBig.withLimbs(limbs);
   for (i32 i = 0; i < p.count; i++) {
     dec.mulAddSmall(10, (p.digits[i] - '0') as@ u32);
   }
-  Big pow = Big.withLimbs(limbs);
+  FixedBig pow = FixedBig.withLimbs(limbs);
   if (p.exp10 > 0) {
     mulPow10(dec, p.exp10);
   } else if (p.exp10 < 0) {
     pow.setU64(1);
     mulPow10(pow, -p.exp10);
   }
-  Cmp c = Cmp(dec, pow, Big.withLimbs(limbs), Big.withLimbs(limbs),
-              Big.withLimbs(limbs), p.exp10, p.sticky);
+  Cmp c = Cmp(dec, pow, FixedBig.withLimbs(limbs), FixedBig.withLimbs(limbs),
+              FixedBig.withLimbs(limbs), p.exp10, p.sticky);
 
   u64 maxFinite = 2139095039;              // 0x7F7FFFFF
 
@@ -513,7 +513,7 @@ i32 compareScaled(Cmp c, u64 f, i32 g) {
   return r;
 }
 
-void mulPow10(Big b, i32 e) {
+void mulPow10(FixedBig b, i32 e) {
   i32 left = e;
   // 10^9 is the largest power of ten inside a u32, so nine digits at a time.
   while (left >= 9) { b.mulSmall(1000000000); left -= 9; }

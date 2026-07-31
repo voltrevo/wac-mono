@@ -26,7 +26,7 @@ function assertEq(got: bigint | number, want: bigint | number, what: string): vo
   if (got !== want) throw new Error(`${what}: got ${got}, want ${want}`);
 }
 
-Deno.test("Big: shiftLeft across every limb boundary", () => {
+Deno.test("FixedBig: shiftLeft across every limb boundary", () => {
   // 31/32/33 is where a word-shift plus a bit-shift interact, which is the part
   // that is easy to get wrong and impossible to notice from a length check.
   const shifts = [0, 1, 7, 31, 32, 33, 63, 64, 65, 95, 96, 127, 200, 500, 971, 1074];
@@ -38,7 +38,7 @@ Deno.test("Big: shiftLeft across every limb boundary", () => {
   }
 });
 
-Deno.test("Big: mulSmall carries through many multiplications", () => {
+Deno.test("FixedBig: mulSmall carries through many multiplications", () => {
   // Repeated ×10 is what the scaling and digit loops do, up to ~340 times for a
   // subnormal, so the carry chain has to hold over a long run.
   for (const [v, bits, mul, times] of [
@@ -54,7 +54,7 @@ Deno.test("Big: mulSmall carries through many multiplications", () => {
   }
 });
 
-Deno.test("Big: random add, subtract and compare agree with BigInt", () => {
+Deno.test("FixedBig: random add, subtract and compare agree with BigInt", () => {
   let seed = 0x5bd1e995;
   const next = (): number => {
     seed ^= seed << 13; seed >>>= 0;
@@ -83,7 +83,7 @@ Deno.test("Big: random add, subtract and compare agree with BigInt", () => {
   }
 });
 
-Deno.test("Big: subtraction that borrows across many zero limbs", () => {
+Deno.test("FixedBig: subtraction that borrows across many zero limbs", () => {
   // 2^n - 1 turns every limb below the top into 0xFFFFFFFF, so the borrow has to
   // run the whole length. An off-by-one in the borrow shows up here and nowhere
   // else.
@@ -92,7 +92,7 @@ Deno.test("Big: subtraction that borrows across many zero limbs", () => {
   }
 });
 
-Deno.test("Big: zero and equality edge cases", () => {
+Deno.test("FixedBig: zero and equality edge cases", () => {
   assertEq(toBig(m.sumTest(0n, 0, 0n, 0)), 0n, "0 + 0");
   assertEq(toBig(m.subTest(5n, 0, 5n, 0)), 0n, "5 - 5 normalises to zero");
   assertEq(m.cmpTest(0n, 0, 0n, 0), 0, "0 == 0");
