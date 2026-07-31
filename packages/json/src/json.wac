@@ -1,0 +1,54 @@
+// Public entry points, shaped for the bindgen boundary.
+//
+// Only primitives and primitive arrays cross into JS, so a JsonValue tree
+// cannot be handed out directly. Results come back as bytes with a status byte
+// in front, because there are no module-level globals to stash an error code in
+// and an export returns exactly one value.
+
+import { JsonValue, JsonNumber } from "./value.wac";
+import { Parser, parseDocument, ERR_NONE } from "./parse.wac";
+import { writeValue } from "./stringify.wac";
+import { ByteBuf } from "./bytes.wac";
+
+// Parse and re-serialize. Byte 0 is the error code (0 = success); the rest is
+// canonical JSON, empty when parsing failed.
+export i8[] canonicalize(i8[] src) {
+  Parser p = Parser.create(src);
+  JsonValue? v = parseDocument(p);
+  ByteBuf out = ByteBuf.create();
+  if (v is null) {
+    out.push(p.err);
+    return out.toBytes();
+  }
+  out.push(0);
+  writeValue(out, v!);
+  return out.toBytes();
+}
+
+// Error code for a document, without building the output.
+export i32 errorCode(i8[] src) {
+  Parser p = Parser.create(src);
+  JsonValue? v = parseDocument(p);
+  if (v is null) { return p.err; }
+  return ERR_NONE();
+}
+
+// Byte offset where parsing gave up. Only meaningful when errorCode is nonzero.
+export i32 errorPos(i8[] src) {
+  Parser p = Parser.create(src);
+  JsonValue? v = parseDocument(p);
+  if (v is null) { return p.errPos; }
+  return -1;
+}
+
+// The f64 value of a document that is a bare number, for testing the decimal
+// conversion against the host's own strtod. NaN signals a parse failure, which
+// no valid JSON number can produce.
+export f64 parseNumberValue(i8[] src) {
+  Parser p = Parser.create(src);
+  JsonValue? v = parseDocument(p);
+  if (v is null) { return 0.0 / 0.0; }
+  if (v!.kind != 2) { return 0.0 / 0.0; }
+  JsonNumber n = v! as! JsonNumber;
+  return n.value;
+}
