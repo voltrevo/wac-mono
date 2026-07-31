@@ -1,7 +1,7 @@
 # crypto
 
-SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20, Poly1305 and the
-ChaCha20-Poly1305 AEAD, written in wac.
+SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305 and AES-CTR,
+written in wac.
 
 A package of [wac-mono](../../README.md) — see the root README for layout and how
 to run things. All commands run from the repo root.
@@ -13,6 +13,8 @@ import { hmacSha256 } from "../../crypto/src/hmac.wac";
 import { hkdf } from "../../crypto/src/hkdf.wac";
 import { chacha20 } from "../../crypto/src/chacha20.wac";
 import { aeadEncrypt, aeadTag, aeadDecrypt } from "../../crypto/src/aead.wac";
+import { aesEncrypt, aesDecrypt } from "../../crypto/src/aes.wac";
+import { aesCtr } from "../../crypto/src/aesctr.wac";
 
 u8[] digest = sha256(msg);                     // 32 bytes
 u8[] tag    = hmacSha256(key, msg);            // 32 bytes
@@ -35,8 +37,32 @@ u8[] opened = aeadDecrypt(key, nonce, aad, sealed, tag);   // traps if forged
 | ChaCha20 | RFC 8439 | done, 32-bit counter / 96-bit nonce |
 | Poly1305 | RFC 8439 | done, 26-bit limbs |
 | ChaCha20-Poly1305 | RFC 8439 §2.8 | done |
+| AES-128/192/256 | FIPS 197 | done, encrypt and decrypt |
+| AES-CTR | SP 800-38A | done, full 128-bit counter |
 
-Not here: AES.
+Not here: AES-GCM, which needs GHASH — multiplication in GF(2^128) — and so a
+second field implementation beyond Poly1305's.
+
+### The AES S-box, and a lesson about generated tables
+
+The S-box is generated from its definition (inverse in GF(2^8), then the affine
+map) rather than transcribed, for the same reason SHA-512's constants are: 256
+values is well past where a typo and a bug look alike.
+
+The generator was wrong on the first attempt. Exactly one entry — S[0x01] — came
+out as 0x63 instead of 0x7c, because an index into the antilog table needed to be
+taken modulo 255 and only the input 1 reaches that case. Three spot checks
+(0x00, 0x53, 0xFF) all passed straight over it.
+
+The result was a cipher that was *right for most inputs and wrong for some*:
+AES-128 matched 5 of 8 random vectors against WebCrypto. That is the worst way
+for a cipher to be wrong, and a fixed-vector test can easily miss it — FIPS
+197's C.1 happened to pass.
+
+What catches it is a structural invariant rather than more spot values. The
+generator now asserts the table is a permutation of 0..255 and that it is
+mutually inverse with INV_SBOX, either of which fails immediately on a single
+wrong entry.
 
 ### What SHA-512 is for
 
@@ -98,7 +124,8 @@ straddle the 64-byte block boundary, and over random inputs. That covers far
 more ground than a vector list, and catches padding mistakes at 55/56/63/64
 bytes where they hide.
 
-**The published vectors.** NIST for SHA-256 and SHA-512 including the
+**The published vectors.** FIPS 197 appendices B and C for AES at all three key
+sizes, SP 800-38A F.5.1 for CTR, NIST for SHA-256 and SHA-512 including the
 million-`a` case for both,
 RFC 4231 for HMAC including the 131-byte key that forces the hash-the-key path,
 RFC 5869 for HKDF including the empty-salt case, RFC 8439 for ChaCha20, Poly1305
@@ -130,8 +157,14 @@ rejected, as is a truncated ciphertext and a short tag — and moving a byte
 across the aad/ciphertext boundary, which is exactly what the trailing length
 fields in the MAC input exist to prevent.
 
-Verified by mutation. Changing one SHA-256 rotation constant from 25 to 26 fails
-11 tests; one ChaCha20 quarter-round rotate from 7 to 8 fails 4. In Poly1305:
+WebCrypto has no raw block cipher, but AES-CTR with counter block B over an
+all-zero plaintext returns E(B) — so the host is an oracle for the primitive
+itself, not only for the mode.
+
+Verified by mutation. In AES: the GF reduction polynomial 0x1B → 0x1D fails 6
+tests, swapped MixColumns coefficients 7, ShiftRows off by one 7, AES-192's
+round count 12 → 11 four, and the Rcon index off by one 6. Changing one SHA-256
+rotation constant from 25 to 26 fails 11 tests; one ChaCha20 quarter-round rotate from 7 to 8 fails 4. In Poly1305:
 the fold factor 5 → 4 fails 5, a loosened clamp mask fails 5, the high bit at
 the wrong limb position fails 6, and the borrow-detect shift 31 → 30 fails 4 —
 with a no-op edit failing none, so those are measuring behaviour rather than
