@@ -11,6 +11,7 @@ compiler, this one is things built with it.
 | package | what it is |
 |---|---|
 | [`bytes`](packages/bytes/) | `Buf`, the growable byte buffer both other packages build on |
+| [`fmt`](packages/fmt/) | `f64` to its shortest decimal, matching JavaScript exactly |
 | [`gzip`](packages/gzip/) | gzip and DEFLATE, both directions — compresses at or under `gzip -6` |
 | [`json`](packages/json/) | JSON parse and serialize, verified against the host's own JSON |
 | [`wactest`](packages/wactest/) | assertions for writing tests in wac |

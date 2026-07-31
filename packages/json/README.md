@@ -17,7 +17,7 @@ deno run --allow-read tools/check.ts packages/json/src/json.wac
 | Decimal → f64 | exact on the fast path, ≤2 ulp otherwise |
 | Serializer | done, numbers emitted verbatim |
 | Object key lookup | O(n) linear scan |
-| f64 → shortest decimal | not implemented — see below |
+| Serializing a hand-built tree | done, via `packages/fmt` |
 
 Correctness is judged against the host's own `JSON.parse`/`JSON.stringify` rather
 than against hand-written expectations: round-trips are compared to
@@ -65,11 +65,14 @@ Being exact on every input needs 128-bit intermediates (Eisel-Lemire) or a
 big-decimal fallback. wac's widest integer is `i64`, so neither is available
 without implementing wide arithmetic first.
 
-The serializer writes each number from the source span retained on `JsonNumber`.
-That makes round-trips exact and avoids the other half of the problem: wac has no
-float-to-string operation of any kind, so printing a *computed* number would mean
-implementing shortest-round-trip formatting (Ryu or Grisu) from scratch. A tree
-built by hand rather than by parsing cannot currently be serialized.
+The serializer writes a parsed number from the source span retained on
+`JsonNumber`, so a round-trip is byte-exact: `1e2` comes back as `1e2`, `1.50`
+keeps its trailing zero, and `-0` keeps its sign — none of which survives a trip
+through the shortest decimal.
+
+A number with no span — `JsonNumber.ofValue(x)`, a tree built by hand — is
+formatted by `packages/fmt` to its shortest round-tripping form instead. That was
+impossible until `fmt` existed, and is why it does.
 
 ## Deliberate divergences from `JSON.parse`
 
@@ -117,9 +120,9 @@ for a second call to collect.
 Full detail, ranked, in `~/notes/living/wac/language-friction-log.md`. In order of
 how much each cost:
 
-1. **No float → string.** Now the only blocking gap: a tree built by hand rather
-   than by parsing cannot be serialized, because numbers are written from the
-   source span they were parsed from.
+1. **No float → string — fixed.** `packages/fmt` implements Burger & Dybvig, and
+   the one language addition it needed was `f64.toBits`: a program that cannot see
+   a float's representation cannot decompose it. A hand-built tree now serializes.
 2. **No bytes → string — fixed.** `string.fromCodepoint`, `string.fromBytes` and
    `string.toBytes` were all added because of this package. The last of them
    deleted a 40-line ASCII lookup table from the tests that existed purely because

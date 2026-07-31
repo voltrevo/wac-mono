@@ -1,0 +1,73 @@
+// The wac-facing side of ftoa: that it produces a `string`, and that each of
+// ECMA-262's notation branches is taken at the right boundary.
+//
+// Correctness of the digits lives in the host-side test, where String(x) is the
+// oracle. These cover the parts a byte comparison in TypeScript would not: the
+// string return path, and the exact thresholds where the notation changes.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { ftoa } from "../../src/ftoa.wac";
+
+export string test_specials() {
+  T t = T.create();
+  t.eqStr(ftoa(0.0 / 0.0), "NaN", "NaN");
+  t.eqStr(ftoa(1.0 / 0.0), "Infinity", "positive infinity");
+  t.eqStr(ftoa(-1.0 / 0.0), "-Infinity", "negative infinity");
+  return t.report();
+}
+
+export string test_zero_drops_its_sign() {
+  T t = T.create();
+  // String(-0) is "0" in JavaScript, even though the sign bit is set and
+  // f64.toBits can see it.
+  t.eqStr(ftoa(0.0), "0", "positive zero");
+  t.eqStr(ftoa(-0.0), "0", "negative zero prints unsigned");
+  return t.report();
+}
+
+export string test_plain_notation() {
+  T t = T.create();
+  t.eqStr(ftoa(1.0), "1", "an integer has no point");
+  t.eqStr(ftoa(-1.0), "-1", "the sign is kept");
+  t.eqStr(ftoa(1000.0), "1000", "trailing zeros are written out");
+  t.eqStr(ftoa(0.5), "0.5", "a fraction below one");
+  t.eqStr(ftoa(1.5), "1.5", "a point inside the digits");
+  t.eqStr(ftoa(0.1), "0.1", "the shortest form of a value that is not exact");
+  return t.report();
+}
+
+export string test_notation_boundaries() {
+  T t = T.create();
+  // ECMA-262 switches to exponential above 1e21 and below 1e-6, and the choice is
+  // made on the decimal exponent rather than on the magnitude, so both sides of
+  // each threshold matter.
+  t.eqStr(ftoa(1.0e20), "100000000000000000000", "1e20 is still plain");
+  t.eqStr(ftoa(1.0e21), "1e+21", "1e21 crosses to exponential");
+  t.eqStr(ftoa(1.0e-6), "0.000001", "1e-6 is still plain");
+  t.eqStr(ftoa(1.0e-7), "1e-7", "1e-7 crosses to exponential");
+  return t.report();
+}
+
+export string test_exponential_form() {
+  T t = T.create();
+  t.eqStr(ftoa(1.0e21), "1e+21", "a positive exponent carries a plus");
+  t.eqStr(ftoa(1.0e-7), "1e-7", "a negative one carries a minus");
+  t.eqStr(ftoa(1.5e21), "1.5e+21", "digits after the first get a point");
+  t.eqStr(ftoa(-1.5e-7), "-1.5e-7", "with the sign in front of all of it");
+  // Three exponent digits, which is where a fixed-width exponent would fail.
+  t.eqStr(ftoa(1.0e300), "1e+300", "a three-digit exponent");
+  return t.report();
+}
+
+export string test_shortest_not_exact() {
+  T t = T.create();
+  // The point of the algorithm: 0.1 is not exactly representable, and the exact
+  // value has 55 significant digits. Emitting the exact value would round-trip
+  // too, so a test that only checked round-tripping would pass on it.
+  t.eqStr(ftoa(0.1), "0.1", "0.1 prints as one digit, not its exact expansion");
+  t.eqStr(ftoa(0.3), "0.3", "and so does 0.3");
+  // A power of two, where the neighbour below is half as far away as the one
+  // above — the asymmetric-gap case in the setup.
+  t.eqStr(ftoa(1.0e23), "1e+23", "1e23 rounds up to a power of ten and carries");
+  return t.report();
+}

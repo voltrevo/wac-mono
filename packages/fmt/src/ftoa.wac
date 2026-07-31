@@ -1,0 +1,292 @@
+// f64 -> decimal string: the shortest digit sequence that reads back as the same
+// double, formatted exactly as JavaScript's Number::toString would.
+//
+// Algorithm is Burger & Dybvig's free-format "printing floating-point numbers
+// quickly and accurately" (1996), which is Steele & White's Dragon4 restated. The
+// value is held as an exact rational R/S together with the half-gaps to its
+// neighbours, mPlus and mMinus; digits are produced most-significant first and the
+// loop stops as soon as the digits emitted so far identify this double rather than
+// either neighbour. That stopping rule is what makes the output shortest, and the
+// exact arithmetic is what makes it correct — there is no approximate mode that is
+// usually right.
+//
+// The alternative was Ryu, which is faster and needs no bignum, but wants two
+// tables of ~600 128-bit constants. With no module-level constants those become a
+// switch of 1200 literals, and formatting is not a hot path.
+//
+// Matching JavaScript is deliberate: it makes `String(x)` an oracle for every
+// finite double, which is the only way to have confidence in this.
+
+import { Big } from "./bigint.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+
+/** Digits of x, most significant first, with the decimal exponent. */
+export struct Decimal {
+  // digits[0..count) are ASCII '0'..'9'; the value is 0.digits * 10^exp10.
+  u8[] digits;
+  i32 count;
+  i32 exp10;
+  bool neg;
+  // Set for the values that have no digits: NaN and the infinities.
+  bool isNaN;
+  bool isInf;
+}
+
+/**
+ * Decompose and generate digits. Exact for every finite double, including
+ * subnormals and the boundary cases where a power of two's lower neighbour is
+ * half as far away as its upper one.
+ */
+export Decimal decompose(f64 x) {
+  u64 bits = f64.toBits(x);
+  bool neg = (bits >> 63) != 0;
+  i32 be = ((bits >> 52) & 2047) as@ i32;
+  u64 frac = bits & 4503599627370495;          // low 52 bits
+
+  Decimal d = Decimal(u8[24](), 0, 0, neg, false, false);
+  if (be == 2047) {
+    if (frac != 0) { d.isNaN = true; } else { d.isInf = true; }
+    return d;
+  }
+  if (be == 0 && frac == 0) {
+    // Zero has no significant digits; the sign is kept but JS drops it on output.
+    d.digits[0] = '0';
+    d.count = 1;
+    d.exp10 = 1;
+    return d;
+  }
+
+  u64 f = frac;
+  i32 e = -1074;
+  // A normal number's implicit leading bit, and the asymmetric-gap test. The gap
+  // below is half the gap above only when the significand is at its minimum and
+  // the exponent is not, since at be == 1 the neighbour below is subnormal and the
+  // spacing is the same on both sides.
+  bool lowerCloser = false;
+  // With round-half-to-even, a decimal landing exactly on the boundary between
+  // this double and its neighbour reads back as this one when the significand is
+  // even. So the boundary is attainable, and the stopping tests below are
+  // inclusive. Getting this wrong does not produce wrong digits — it produces one
+  // or two more of them than necessary, which is how it was found.
+  bool boundaryOk = false;
+  if (be != 0) {
+    f = frac + 4503599627370496;               // 2^52
+    e = be - 1075;
+    lowerCloser = (frac == 0 && be > 1);
+  }
+  boundaryOk = (f & 1) == 0;
+
+  Big r = Big.fromU64(f);
+  Big s = Big.zero();
+  Big mPlus = Big.zero();
+  Big mMinus = Big.zero();
+
+  if (e >= 0) {
+    // 2^e, which is both the gap to each neighbour and the factor on f.
+    Big pow = Big.fromU64(1);
+    pow.shiftLeft(e);
+    // R = f * 2^e * 2 (or * 4 when the gaps differ), S = 2 (or 4).
+    r.shiftLeft(e);
+    if (lowerCloser) {
+      r.mulSmall(4);
+      s.setU64(4);
+      mPlus.copyFrom(pow);
+      mPlus.mulSmall(2);
+      mMinus.copyFrom(pow);
+    } else {
+      r.mulSmall(2);
+      s.setU64(2);
+      mPlus.copyFrom(pow);
+      mMinus.copyFrom(pow);
+    }
+  } else {
+    // S = 2^-e * 2 (or * 4); the gaps are 1 (or 2 above, 1 below).
+    s.setU64(1);
+    s.shiftLeft(-e);
+    if (lowerCloser) {
+      r.mulSmall(4);
+      s.mulSmall(4);
+      mPlus.setU64(2);
+      mMinus.setU64(1);
+    } else {
+      r.mulSmall(2);
+      s.mulSmall(2);
+      mPlus.setU64(1);
+      mMinus.setU64(1);
+    }
+  }
+
+  // Scale so that the first digit generated is the first significant one, i.e.
+  // R/S lands in [1/10, 1). `k` counts the decimal point's position.
+  i32 k = 0;
+  Big scratch = Big.zero();
+  while (true) {
+    scratch.setSum(r, mPlus);
+    i32 c = scratch.cmp(s);
+    if (c > 0 || (boundaryOk && c == 0)) { s.mulSmall(10); k++; } else { break; }
+  }
+  while (true) {
+    scratch.setSum(r, mPlus);
+    scratch.mulSmall(10);
+    if (scratch.cmp(s) <= 0) {
+      r.mulSmall(10);
+      mPlus.mulSmall(10);
+      mMinus.mulSmall(10);
+      k--;
+    } else {
+      break;
+    }
+  }
+  d.exp10 = k;
+
+  Big twice = Big.zero();
+  while (true) {
+    r.mulSmall(10);
+    mPlus.mulSmall(10);
+    mMinus.mulSmall(10);
+
+    // digit = R / S, by trial subtraction: it cannot exceed 9.
+    i32 digit = 0;
+    while (r.cmp(s) >= 0) { r.sub(s); digit++; }
+
+    i32 cLow = r.cmp(mMinus);
+    bool low = boundaryOk ? cLow <= 0 : cLow < 0;
+    scratch.setSum(r, mPlus);
+    i32 cHigh = scratch.cmp(s);
+    bool high = boundaryOk ? cHigh >= 0 : cHigh > 0;
+
+    if (!low && !high) {
+      d.digits[d.count] = '0' + digit;
+      d.count++;
+      continue;
+    }
+    // Stop: the digits so far pin this double down. Which way the last one goes
+    // depends on which neighbour is still in reach.
+    i32 last = digit;
+    if (low && high) {
+      // Both neighbours are still in reach, so take whichever the remainder is
+      // nearer to. On an exact halfway remainder both candidates round-trip, and
+      // ECMA-262 resolves it by choosing the even digit — not by rounding up.
+      twice.copyFrom(r);
+      twice.mulSmall(2);
+      i32 c = twice.cmp(s);
+      if (c > 0) {
+        last = digit + 1;
+      } else if (c == 0 && (digit % 2) != 0) {
+        last = digit + 1;
+      }
+    } else if (high) {
+      last = digit + 1;
+    }
+    if (last < 10) {
+      d.digits[d.count] = '0' + last;
+      d.count++;
+      return d;
+    }
+
+    // Rounding up a 9 carries. The digit itself becomes 0, and since everything
+    // after the carry is zeros, they are trailing zeros in a shortest
+    // representation and are dropped rather than emitted.
+    i32 i = d.count - 1;
+    while (i >= 0 && d.digits[i] == '9') { i--; }
+    if (i < 0) {
+      // Carried off the front: the value rounds to a power of ten. 9.99e22 is
+      // where this happens — its shortest form is 1e23, not 10e22.
+      d.digits[0] = '1';
+      d.count = 1;
+      d.exp10 = d.exp10 + 1;
+    } else {
+      d.digits[i] = d.digits[i] + 1;
+      d.count = i + 1;
+    }
+    return d;
+  }
+}
+
+/**
+ * The bytes of x, formatted as ECMA-262's Number::toString.
+ *
+ * That means: plain notation between 1e-6 and 1e21, exponential outside it, no
+ * trailing zeros, no `+` on a positive exponent, and `-0` printed as `0`.
+ */
+export u8[] ftoaBytes(f64 x) {
+  Buf out = Buf.create();
+  writeF64(out, x);
+  return out.bytes();
+}
+
+export string ftoa(f64 x) {
+  Buf out = Buf.create();
+  writeF64(out, x);
+  return out.toStr();
+}
+
+export void writeF64(Buf out, f64 x) {
+  Decimal d = decompose(x);
+
+  if (d.isNaN) {
+    out.pushAll(u8[]('N', 'a', 'N'));
+    return;
+  }
+  if (d.isInf) {
+    if (d.neg) { out.push('-'); }
+    out.pushAll(u8[]('I', 'n', 'f', 'i', 'n', 'i', 't', 'y'));
+    return;
+  }
+  // Zero prints without its sign, matching String(-0) === "0".
+  if (d.count == 1 && d.digits[0] == '0') {
+    out.push('0');
+    return;
+  }
+  if (d.neg) { out.push('-'); }
+
+  i32 k = d.count;      // digit count
+  i32 n = d.exp10;      // value is 0.digits * 10^n
+
+  if (k <= n && n <= 21) {
+    // Integer with trailing zeros: 1e3 prints as 1000.
+    for (i32 i = 0; i < k; i++) { out.push(d.digits[i]); }
+    for (i32 i = 0; i < n - k; i++) { out.push('0'); }
+    return;
+  }
+  if (0 < n && n <= 21) {
+    // Decimal point inside the digits.
+    for (i32 i = 0; i < n; i++) { out.push(d.digits[i]); }
+    out.push('.');
+    for (i32 i = n; i < k; i++) { out.push(d.digits[i]); }
+    return;
+  }
+  if (-6 < n && n <= 0) {
+    // Leading zeros after the point: 1e-6 prints as 0.000001.
+    out.push('0');
+    out.push('.');
+    for (i32 i = 0; i < -n; i++) { out.push('0'); }
+    for (i32 i = 0; i < k; i++) { out.push(d.digits[i]); }
+    return;
+  }
+
+  // Exponential. The exponent is n-1 because the point sits after the first digit.
+  out.push(d.digits[0]);
+  if (k > 1) {
+    out.push('.');
+    for (i32 i = 1; i < k; i++) { out.push(d.digits[i]); }
+  }
+  out.push('e');
+  i32 exp = n - 1;
+  if (exp < 0) { out.push('-'); exp = -exp; } else { out.push('+'); }
+  writeSmallInt(out, exp);
+}
+
+/** Decimal digits of a non-negative i32. Only ever called with 0..323 here. */
+void writeSmallInt(Buf out, i32 v) {
+  if (v == 0) { out.push('0'); return; }
+  u8[] tmp = u8[12]();
+  i32 n = 0;
+  i32 m = v;
+  while (m > 0) {
+    tmp[n] = '0' + (m % 10);
+    n++;
+    m = m / 10;
+  }
+  for (i32 i = n - 1; i >= 0; i--) { out.push(tmp[i]); }
+}

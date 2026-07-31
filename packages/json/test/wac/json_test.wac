@@ -13,6 +13,8 @@
 
 import { T } from "../../../wactest/src/assert.wac";
 import { JsonValue, JsonNumber, JsonString, JsonArray, JsonObject, bytesEqual } from "../../src/value.wac";
+import { writeValue } from "../../src/stringify.wac";
+import { Buf } from "../../../bytes/src/buf.wac";
 import { Parser, parseDocument, hexDigit, scaleByPow10, ERR_NONE, ERR_TRAILING, ERR_CONTROL } from "../../src/parse.wac";
 
 JsonValue? parseStr(string src) {
@@ -234,5 +236,40 @@ export string test_error_codes_and_positions() {
   t.isTrue(parseDocument(p3) is not null, "valid input succeeds");
   t.eqI32(p3.err, ERR_NONE(), "no error recorded");
 
+  return t.report();
+}
+
+// ── Serializing a tree that was never parsed ─────────────────────────────────
+
+export string test_hand_built_tree_serializes() {
+  T t = T.create();
+  // The gap this closes: before packages/fmt there was no float-to-string, so a
+  // JsonNumber with no source span could not be written at all.
+  JsonObject o = JsonObject.create();
+  o.push("n".toBytes(), JsonNumber.ofValue(1.5));
+  o.push("big".toBytes(), JsonNumber.ofValue(1.0e21));
+  o.push("small".toBytes(), JsonNumber.ofValue(0.1));
+  JsonArray a = JsonArray.create();
+  a.push(JsonNumber.ofValue(0.0));
+  a.push(JsonNumber.ofValue(-2.25));
+  o.push("xs".toBytes(), a);
+
+  Buf out = Buf.create();
+  writeValue(out, o);
+  t.eqStr(out.toStr(),
+    "{\"n\":1.5,\"big\":1e+21,\"small\":0.1,\"xs\":[0,-2.25]}",
+    "every number is formatted to its shortest form");
+  return t.report();
+}
+
+export string test_parsed_numbers_keep_their_span() {
+  T t = T.create();
+  // The other half of the rule: a parsed number is written back verbatim, so
+  // `1e2` does not become `100` and `-0` keeps its sign.
+  JsonValue? v = parseStr("[1e2,-0,1.50]");
+  t.isTrue(v is not null, "parses");
+  Buf out = Buf.create();
+  writeValue(out, v!);
+  t.eqStr(out.toStr(), "[1e2,-0,1.50]", "spans are preserved exactly");
   return t.report();
 }
