@@ -16,8 +16,8 @@ import { JsonValue, JsonNumber, JsonString, JsonArray, JsonObject, bytesEqual } 
 import { Parser, parseDocument, hexDigit, scaleByPow10, ERR_NONE, ERR_TRAILING, ERR_CONTROL } from "../../src/parse.wac";
 
 /** ASCII bytes of a wac string literal, for feeding the parser. */
-i8[] ascii(string s) {
-  i8[] out = i8[s.len()]();
+u8[] ascii(string s) {
+  u8[] out = u8[s.len()]();
   for (i32 i = 0; i < s.len(); i++) {
     // Indexing yields a one-character string; comparing against a digit/char
     // table is the only route from text to a byte value in wac.
@@ -95,9 +95,9 @@ export string test_bytebuf_push_bytes() {
   T t = T.create();
   ByteBuf b = ByteBuf.create();
   b.push(1);
-  b.pushBytes(i8[](2, 3, 4));
-  b.pushBytes(i8[0]());
-  t.eqBytes(b.toBytes(), i8[](1, 2, 3, 4), "pushBytes appends, empty is a no-op");
+  b.pushBytes(u8[](2, 3, 4));
+  b.pushBytes(u8[0]());
+  t.eqBytes(b.toBytes(), u8[](1, 2, 3, 4), "pushBytes appends, empty is a no-op");
   return t.report();
 }
 
@@ -106,19 +106,19 @@ export string test_bytebuf_codepoint_widths() {
 
   ByteBuf a = ByteBuf.create();
   a.pushCodepoint(0x41);
-  t.eqBytes(a.toBytes(), i8[](0x41), "ASCII is one byte");
+  t.eqBytes(a.toBytes(), u8[](0x41), "ASCII is one byte");
 
   ByteBuf b = ByteBuf.create();
   b.pushCodepoint(0xE9);                 // é
-  t.eqBytes(b.toBytes(), i8[](0xC3, 0xA9), "U+00E9 is two bytes");
+  t.eqBytes(b.toBytes(), u8[](0xC3, 0xA9), "U+00E9 is two bytes");
 
   ByteBuf c = ByteBuf.create();
   c.pushCodepoint(0x65E5);               // 日
-  t.eqBytes(c.toBytes(), i8[](0xE6, 0x97, 0xA5), "U+65E5 is three bytes");
+  t.eqBytes(c.toBytes(), u8[](0xE6, 0x97, 0xA5), "U+65E5 is three bytes");
 
   ByteBuf d = ByteBuf.create();
   d.pushCodepoint(0x1F600);              // 😀
-  t.eqBytes(d.toBytes(), i8[](0xF0, 0x9F, 0x98, 0x80), "U+1F600 is four bytes");
+  t.eqBytes(d.toBytes(), u8[](0xF0, 0x9F, 0x98, 0x80), "U+1F600 is four bytes");
 
   // Boundaries between encoding widths.
   ByteBuf e = ByteBuf.create();
@@ -161,11 +161,11 @@ export string test_hex_digit() {
 
 export string test_bytes_equal() {
   T t = T.create();
-  t.isTrue(bytesEqual(i8[](1, 2, 3), i8[](1, 2, 3)), "identical");
-  t.isTrue(bytesEqual(i8[0](), i8[0]()), "both empty");
-  t.isFalse(bytesEqual(i8[](1, 2), i8[](1, 2, 3)), "prefix is not equal");
-  t.isFalse(bytesEqual(i8[](1, 2, 3), i8[](1, 2, 4)), "last byte differs");
-  t.isFalse(bytesEqual(i8[](1), i8[0]()), "one empty");
+  t.isTrue(bytesEqual(u8[](1, 2, 3), u8[](1, 2, 3)), "identical");
+  t.isTrue(bytesEqual(u8[0](), u8[0]()), "both empty");
+  t.isFalse(bytesEqual(u8[](1, 2), u8[](1, 2, 3)), "prefix is not equal");
+  t.isFalse(bytesEqual(u8[](1, 2, 3), u8[](1, 2, 4)), "last byte differs");
+  t.isFalse(bytesEqual(u8[](1), u8[0]()), "one empty");
   return t.report();
 }
 
@@ -192,7 +192,7 @@ export string test_json_array_growth() {
   JsonArray a = JsonArray.create();
   t.eqI32(a.len(), 0, "starts empty");
   for (i32 i = 0; i < 50; i++) {
-    a.push(JsonNumber.of(1.0, i8[](0x31)));
+    a.push(JsonNumber.of(1.0, u8[](0x31)));
   }
   t.eqI32(a.len(), 50, "length after 50 pushes");
   t.eqI32(a.at(0).kind, 2, "element kind survives growth");
@@ -203,21 +203,21 @@ export string test_json_array_growth() {
 export string test_json_object_lookup() {
   T t = T.create();
   JsonObject o = JsonObject.create();
-  o.push(i8[](0x61), JsonNumber.of(1.0, i8[](0x31)));           // a: 1
-  o.push(i8[](0x62), JsonNumber.of(2.0, i8[](0x32)));           // b: 2
+  o.push(u8[](0x61), JsonNumber.of(1.0, u8[](0x31)));           // a: 1
+  o.push(u8[](0x62), JsonNumber.of(2.0, u8[](0x32)));           // b: 2
   t.eqI32(o.len(), 2, "two members");
 
-  JsonValue? found = o.get(i8[](0x62));
+  JsonValue? found = o.get(u8[](0x62));
   t.isTrue(found is not null, "b is found");
   t.eqI32(found!.kind, 2, "b is a number");
 
-  t.isTrue(o.get(i8[](0x63)) is null, "c is absent");
-  t.isTrue(o.get(i8[0]()) is null, "empty key is absent");
+  t.isTrue(o.get(u8[](0x63)) is null, "c is absent");
+  t.isTrue(o.get(u8[0]()) is null, "empty key is absent");
 
   // Duplicates are retained, and lookup returns the first.
-  o.push(i8[](0x61), JsonNumber.of(9.0, i8[](0x39)));
+  o.push(u8[](0x61), JsonNumber.of(9.0, u8[](0x39)));
   t.eqI32(o.len(), 3, "duplicate key is kept as a third member");
-  JsonNumber first = o.get(i8[](0x61))! as! JsonNumber;
+  JsonNumber first = o.get(u8[](0x61))! as! JsonNumber;
   t.isTrue(first.value == 1.0, "lookup returns the first of a duplicated key");
   return t.report();
 }
@@ -232,8 +232,8 @@ export string test_tree_shape() {
 
   JsonObject o = v! as! JsonObject;
   t.eqI32(o.len(), 2, "two members");
-  t.eqBytes(o.at(0).key, i8[](0x61), "first key is a");
-  t.eqBytes(o.at(1).key, i8[](0x62), "second key is b");
+  t.eqBytes(o.at(0).key, u8[](0x61), "first key is a");
+  t.eqBytes(o.at(1).key, u8[](0x62), "second key is b");
   t.eqI32(o.at(1).value.kind, 0, "b is null");
 
   JsonArray arr = o.at(0).value as! JsonArray;
@@ -251,9 +251,9 @@ export string test_member_order_is_source_order() {
   JsonValue? v = parseStr("{\"2\":0,\"b\":0,\"1\":0}");
   t.isTrue(v is not null, "parses");
   JsonObject o = v! as! JsonObject;
-  t.eqBytes(o.at(0).key, i8[](0x32), "first key is 2");
-  t.eqBytes(o.at(1).key, i8[](0x62), "second key is b");
-  t.eqBytes(o.at(2).key, i8[](0x31), "third key is 1");
+  t.eqBytes(o.at(0).key, u8[](0x32), "first key is 2");
+  t.eqBytes(o.at(1).key, u8[](0x62), "second key is b");
+  t.eqBytes(o.at(2).key, u8[](0x31), "third key is 1");
   return t.report();
 }
 
@@ -263,7 +263,7 @@ export string test_member_order_is_source_order() {
 // above. Once the emitter's double-decoding is fixed these can go back to
 // parseStr("...").
 
-JsonValue? parseBytes(i8[] src) {
+JsonValue? parseBytes(u8[] src) {
   Parser p = Parser.create(src);
   return parseDocument(p);
 }
@@ -271,39 +271,39 @@ JsonValue? parseBytes(i8[] src) {
 export string test_unescaped_string_contents() {
   T t = T.create();
   // "aA\n\\b"
-  JsonValue? v = parseBytes(i8[](
+  JsonValue? v = parseBytes(u8[](
     0x22, 0x61, 0x5C, 0x75, 0x30, 0x30, 0x34, 0x31,
     0x5C, 0x6E, 0x5C, 0x5C, 0x62, 0x22,
   ));
   t.isTrue(v is not null, "parses");
   JsonString s = v! as! JsonString;
   // a A newline backslash b
-  t.eqBytes(s.bytes, i8[](0x61, 0x41, 0x0A, 0x5C, 0x62), "escapes are decoded in place");
+  t.eqBytes(s.bytes, u8[](0x61, 0x41, 0x0A, 0x5C, 0x62), "escapes are decoded in place");
   return t.report();
 }
 
 export string test_surrogate_pair_decodes_to_one_scalar() {
   T t = T.create();
   // "😀"
-  JsonValue? v = parseBytes(i8[](
+  JsonValue? v = parseBytes(u8[](
     0x22, 0x5C, 0x75, 0x64, 0x38, 0x33, 0x64,
     0x5C, 0x75, 0x64, 0x65, 0x30, 0x30, 0x22,
   ));
   t.isTrue(v is not null, "parses");
   JsonString s = v! as! JsonString;
-  t.eqBytes(s.bytes, i8[](0xF0, 0x9F, 0x98, 0x80), "pair becomes U+1F600");
+  t.eqBytes(s.bytes, u8[](0xF0, 0x9F, 0x98, 0x80), "pair becomes U+1F600");
   return t.report();
 }
 
 export string test_unpaired_surrogate_becomes_replacement() {
   T t = T.create();
   // "\ud83d"
-  JsonValue? v = parseBytes(i8[](
+  JsonValue? v = parseBytes(u8[](
     0x22, 0x5C, 0x75, 0x64, 0x38, 0x33, 0x64, 0x22,
   ));
   t.isTrue(v is not null, "parses");
   JsonString s = v! as! JsonString;
-  t.eqBytes(s.bytes, i8[](0xEF, 0xBF, 0xBD), "lone high surrogate becomes U+FFFD");
+  t.eqBytes(s.bytes, u8[](0xEF, 0xBF, 0xBD), "lone high surrogate becomes U+FFFD");
   return t.report();
 }
 
@@ -313,10 +313,10 @@ export string test_number_keeps_its_source_span() {
   t.isTrue(v is not null, "parses");
   JsonArray a = v! as! JsonArray;
   JsonNumber n = a.at(0) as! JsonNumber;
-  t.eqBytes(n.raw, i8[](0x31, 0x65, 0x32), "raw span is 1e2, not 100");
+  t.eqBytes(n.raw, u8[](0x31, 0x65, 0x32), "raw span is 1e2, not 100");
   t.isTrue(n.value == 100.0, "value is still 100");
   JsonNumber z = a.at(1) as! JsonNumber;
-  t.eqBytes(z.raw, i8[](0x2D, 0x30), "negative zero keeps its sign in the span");
+  t.eqBytes(z.raw, u8[](0x2D, 0x30), "negative zero keeps its sign in the span");
   return t.report();
 }
 
@@ -328,7 +328,7 @@ export string test_error_codes_and_positions() {
   t.eqI32(p1.err, ERR_TRAILING(), "reported as trailing");
   t.eqI32(p1.errPos, 4, "position is where the junk starts");
 
-  Parser p2 = Parser.create(i8[](0x22, 0x0A, 0x22));   // "\n" raw newline
+  Parser p2 = Parser.create(u8[](0x22, 0x0A, 0x22));   // "\n" raw newline
   t.isTrue(parseDocument(p2) is null, "raw control byte fails");
   t.eqI32(p2.err, ERR_CONTROL(), "reported as a control byte");
   t.eqI32(p2.errPos, 1, "position is the control byte");

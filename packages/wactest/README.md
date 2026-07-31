@@ -8,7 +8,7 @@ import { crc32 } from "../../src/crc32.wac";
 
 export string test_crc32_of_hello_world() {
   T t = T.create();
-  i8[] data = i8[](104, 101, 108, 108, 111);
+  u8[] data = u8[](104, 101, 108, 108, 111);
   t.eqI32(crc32(data), 907060870, "crc32(\"hello\")");
   return t.report();
 }
@@ -45,7 +45,7 @@ state, so there is nowhere global to put them; the test creates a `T` and return
 | `isTrue(cond, what)` / `isFalse` | boolean |
 | `eqStr(got, want, what)` | string equality |
 | `eqI32Array(got, want, what)` | length then first differing element |
-| `eqBytes(got, want, what)` | same for `i8[]`, compared zero-extended |
+| `eqBytes(got, want, what)` | same for `u8[]`, compared zero-extended |
 | `failNow(what)` | unconditional — for a branch that should be unreachable |
 
 `itoa` is exported separately for building messages of your own. It exists

@@ -27,7 +27,7 @@ void header(Buf out) {
 
 // One stored block: 3 header bits (BFINAL, BTYPE=00) then, because BTYPE=00
 // aligns to a byte boundary, LEN / ~LEN and the raw bytes.
-void storedBlock(Buf out, i8[] data, i32 start, i32 count, bool isFinal) {
+void storedBlock(Buf out, u8[] data, i32 start, i32 count, bool isFinal) {
   out.push(isFinal ? 1 : 0);
   out.pushU16(count);
   out.pushU16((~count) & 0xFFFF);
@@ -40,7 +40,7 @@ void storedBlock(Buf out, i8[] data, i32 start, i32 count, bool isFinal) {
  * The CRC is a parameter rather than computed here, so a caller comparing several
  * block types checksums the payload once instead of once per attempt.
  */
-i8[] container(i8[] body, i32 crc, i32 isize) {
+u8[] container(u8[] body, i32 crc, i32 isize) {
   Buf out = Buf.create();
   header(out);
   out.pushBytes(body, 0, body.len());
@@ -54,10 +54,10 @@ i8[] container(i8[] body, i32 crc, i32 isize) {
  *
  * Writes in place rather than returning a body, because a stored payload is the
  * whole input: handing it back for `container` to copy would walk every byte a
- * second time, which measurably halved stored-block throughput when this was
+ * second time, which measurably halved stored-block throughput when it was
  * briefly written that way.
  */
-void storedInto(Buf out, i8[] data) {
+void storedInto(Buf out, u8[] data) {
   i32 n = data.len();
 
   if (n == 0) {
@@ -75,7 +75,7 @@ void storedInto(Buf out, i8[] data) {
 }
 
 /** A complete stored-block gzip member, assembled in one pass. */
-i8[] storedContainer(i8[] data, i32 crc) {
+u8[] storedContainer(u8[] data, i32 crc) {
   Buf out = Buf.create();
   header(out);
   storedInto(out, data);
@@ -84,17 +84,17 @@ i8[] storedContainer(i8[] data, i32 crc) {
   return out.bytes();
 }
 
-export i8[] gzipStored(i8[] data) {
+export u8[] gzipStored(u8[] data) {
   return storedContainer(data, crc32(data));
 }
 
 /** Same container, but the payload is a fixed-Huffman deflate stream. */
-export i8[] gzipFixed(i8[] data) {
+export u8[] gzipFixed(u8[] data) {
   return container(deflateFixed(data), crc32(data), data.len());
 }
 
 /** Same container, dynamic-Huffman payload. */
-export i8[] gzipDynamic(i8[] data) {
+export u8[] gzipDynamic(u8[] data) {
   return container(deflateDynamic(data), crc32(data), data.len());
 }
 
@@ -112,18 +112,18 @@ i32 smallInput() { return 4096; }
  * than stored — which is the property that matters, since expansion is the one
  * outcome a compressor should never produce.
  */
-export i8[] gzipBest(i8[] data) {
+export u8[] gzipBest(u8[] data) {
   i32 crc = crc32(data);
   i32 n = data.len();
 
-  i8[] best = container(deflateDynamic(data), crc, n);
+  u8[] best = container(deflateDynamic(data), crc, n);
 
   if (n <= smallInput()) {
     // Small enough that all three are worth pricing: a dynamic block's code table
     // is a fixed cost that a short payload cannot amortise.
-    i8[] fixed = container(deflateFixed(data), crc, n);
+    u8[] fixed = container(deflateFixed(data), crc, n);
     if (fixed.len() < best.len()) { best = fixed; }
-    i8[] stored = storedContainer(data, crc);
+    u8[] stored = storedContainer(data, crc);
     if (stored.len() < best.len()) { best = stored; }
     return best;
   }
@@ -132,7 +132,7 @@ export i8[] gzipBest(i8[] data) {
   // data that does not compress at all — where stored is the floor. Checking that
   // costs one comparison instead of two more compression passes.
   if (best.len() >= n) {
-    i8[] stored = storedContainer(data, crc);
+    u8[] stored = storedContainer(data, crc);
     if (stored.len() < best.len()) { return stored; }
   }
   return best;

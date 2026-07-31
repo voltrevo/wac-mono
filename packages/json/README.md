@@ -26,7 +26,7 @@ and accept/reject decisions to whether `JSON.parse` throws.
 
 ## Everything is bytes
 
-The API takes and returns `i8[]` (UTF-8), not wac's `string`.
+The API takes and returns `u8[]` (UTF-8), not wac's `string`.
 
 That is forced rather than chosen. `string` is immutable and has exactly three
 operations — `len`, `slice`, `indexOf`. A number can reach text through a literal

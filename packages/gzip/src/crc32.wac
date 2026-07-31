@@ -53,7 +53,7 @@ i32 sliceThreshold() { return 512; }
  * xors the results. The lookups do not depend on each other, so they pipeline
  * instead of serialising on lookup latency the way the byte-at-a-time loop does.
  */
-export i32 crc32(i8[] data) {
+export i32 crc32(u8[] data) {
   i32 n = data.len();
   if (n < sliceThreshold()) {
     return crc32Bitwise(data);
@@ -90,7 +90,7 @@ export i32 crc32(i8[] data) {
  * table-driven version is tested against, because a single wrong table entry
  * would otherwise only be caught if some fixed vector happened to reach it.
  */
-export i32 crc32Bitwise(i8[] data) {
+export i32 crc32Bitwise(u8[] data) {
   i32 crc = 0xFFFFFFFF;
   for (i32 i = 0; i < data.len(); i++) {
     crc ^= data[i];

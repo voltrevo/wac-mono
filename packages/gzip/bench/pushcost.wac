@@ -11,7 +11,7 @@ export i32 viaPush(i32 n) {
 
 // Same bytes, written straight into a pre-sized array.
 export i32 viaPresized(i32 n) {
-  i8[] out = i8[n]();
+  u8[] out = u8[n]();
   for (i32 i = 0; i < n; i++) {
     out[i] = i & 0xFF;
   }

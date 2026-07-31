@@ -49,7 +49,7 @@ export struct BitWriter {
     }
   }
 
-  i8[] bytes(const this) {
+  u8[] bytes(const this) {
     return this.out.bytes();
   }
 }

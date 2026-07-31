@@ -4,12 +4,12 @@
 // so a codec's measured time includes that copy twice. This does nothing but
 // return its argument, which isolates the cost.
 
-export i8[] identity(i8[] data) {
+export u8[] identity(u8[] data) {
   return data;
 }
 
 /** Touches every byte without allocating, to separate the copy from the scan. */
-export i32 checksum(i8[] data) {
+export i32 checksum(u8[] data) {
   i32 sum = 0;
   for (i32 i = 0; i < data.len(); i++) {
     sum += data[i];

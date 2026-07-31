@@ -25,12 +25,12 @@ i32 maxBits() { return 15; }
  * lookahead window. Consuming more bits than exist is what traps.
  */
 struct BitReader {
-  i8[] data;
+  u8[] data;
   i32 pos;       // next byte to pull into the buffer
   i32 bitBuf;    // bits not yet consumed, LSB first
   i32 bitCount;  // how many bits of bitBuf are live
 
-  BitReader create(i8[] data, i32 start) {
+  BitReader create(u8[] data, i32 start) {
     return BitReader(data, start, 0, 0);
   }
 
@@ -335,7 +335,7 @@ i32 maxSizeHint() { return 1 << 26; }   // 64 MiB
  * which it is for any well-formed gzip member — the output buffer is allocated
  * once at the correct size and handed back without a copy.
  */
-i8[] inflateFrom(i8[] data, i32 start, i32 sizeHint) {
+u8[] inflateFrom(u8[] data, i32 start, i32 sizeHint) {
   BitReader br = BitReader.create(data, start);
   i32 hint = sizeHint;
   if (hint < 0 || hint > maxSizeHint()) { hint = 0; }
@@ -390,7 +390,7 @@ i8[] inflateFrom(i8[] data, i32 start, i32 sizeHint) {
 }
 
 /** Decompress a raw DEFLATE stream. */
-export i8[] inflate(i8[] data) {
+export u8[] inflate(u8[] data) {
   return inflateFrom(data, 0, 0);
 }
 
@@ -399,7 +399,7 @@ export i8[] inflate(i8[] data) {
  * trailer fields. A CRC or length mismatch traps — silently returning data that
  * failed its own integrity check would defeat the point of carrying one.
  */
-export i8[] gunzipBytes(i8[] gz) {
+export u8[] gunzipBytes(u8[] gz) {
   if (gz.len() < 18) { trap; }                    // header + empty body + trailer
   if (gz[0] != 0x1F || gz[1] != 0x8B) { trap; }   // magic
   if (gz[2] != 8) { trap; }                       // CM must be deflate
@@ -431,7 +431,7 @@ export i8[] gunzipBytes(i8[] gz) {
   i32 wantCrc = gz[n - 8] | (gz[n - 7] << 8) | (gz[n - 6] << 16) | (gz[n - 5] << 24);
   i32 wantSize = gz[n - 4] | (gz[n - 3] << 8) | (gz[n - 2] << 16) | (gz[n - 1] << 24);
 
-  i8[] out = inflateFrom(gz, pos, wantSize);
+  u8[] out = inflateFrom(gz, pos, wantSize);
   if (crc32(out) != wantCrc) { trap; }
   if (out.len() != wantSize) { trap; }
   return out;

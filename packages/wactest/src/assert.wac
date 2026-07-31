@@ -96,7 +96,7 @@ export struct T {
   }
 
   /** Same, for byte arrays. Reads are zero-extended, so these compare as 0..255. */
-  void eqBytes(this, i8[] got, i8[] want, string what) {
+  void eqBytes(this, u8[] got, u8[] want, string what) {
     if (got.len() != want.len()) {
       this.fail(what + ": length " + itoa(got.len()) + ", want " + itoa(want.len()));
       return;

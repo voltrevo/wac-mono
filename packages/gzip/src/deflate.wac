@@ -72,11 +72,11 @@ i32 chainLimit() { return 128; }    // candidates per position, bounds the searc
 i32 goodLength() { return 8; }      // beyond this, narrow the search
 i32 niceLength() { return 128; }    // beyond this, stop looking entirely
 
-i32 hash3(i8[] data, i32 pos) {
+i32 hash3(u8[] data, i32 pos) {
   return ((data[pos] << 10) ^ (data[pos + 1] << 5) ^ data[pos + 2]) & 0x7FFF;
 }
 
-void insertHash(i8[] data, i32[] head, i32[] prev, i32 pos) {
+void insertHash(u8[] data, i32[] head, i32[] prev, i32 pos) {
   i32 h = hash3(data, pos);
   prev[pos] = head[h];
   head[h] = pos;
@@ -91,7 +91,7 @@ void insertHash(i8[] data, i32[] head, i32[] prev, i32 pos) {
  * position does better, worth a few percent. That is a ratio refinement, not a
  * correctness one.
  */
-Tokens lz77(i8[] data, Tables t) {
+Tokens lz77(u8[] data, Tables t) {
   i32 n = data.len();
   // Every token consumes at least one input byte, so n slots always suffice.
   Tokens tok = Tokens(i32[n](), i32[n](), 0, i32[numLitLen()](), i32[numDist()]());
@@ -198,7 +198,7 @@ void writeTokens(
 // ── Fixed Huffman ─────────────────────────────────────────────────────────────
 
 /** Compress to a single final fixed-Huffman block. */
-export i8[] deflateFixed(i8[] data) {
+export u8[] deflateFixed(u8[] data) {
   BitWriter w = BitWriter.create();
   Tables t = Tables.create();
   Tokens tok = lz77(data, t);
@@ -314,7 +314,7 @@ i32 clExtraBits(i32 sym) {
 }
 
 /** Compress to a single final dynamic-Huffman block. */
-export i8[] deflateDynamic(i8[] data) {
+export u8[] deflateDynamic(u8[] data) {
   BitWriter w = BitWriter.create();
   Tables t = Tables.create();
   Tokens tok = lz77(data, t);
