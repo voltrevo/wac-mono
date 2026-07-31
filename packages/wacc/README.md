@@ -61,6 +61,22 @@ become ~80 zero-argument functions. Mechanical, but it is the clearest measureme
 yet of that gap: an enum of 80 variants costs 80 function declarations, and the
 numbering has to be kept in sync with the harness by hand.
 
+## Known gap: three constructs added to wac after rung 2
+
+The parser here is behind the reference on three things that landed in wac on 2026-07-31, and
+the corpus does not use any of them yet — which is the only reason the differential test is
+green:
+
+- **`match` as an expression** (`case P: value,` arms) — wac issue 0026
+- **methods in an enum body** — wac issue 0028
+- **`const` on a parameter** — already tracked; the AST field exists here, the parser accepts it
+
+The first two need `ast.wac`, `parse.wac` and `print.wac` extending, and the reference printer
+in `test/parse.test.ts` to match. Until then, the moment any `.wac` file in this repo uses one,
+`parse: agrees with the reference` fails — loudly, and pointing at the file, which is the
+intended behaviour rather than a problem. Noting it here so the failure is recognised as a
+known gap rather than a regression.
+
 ## Status
 
 **Rung 2 (parser) passes.** The AST it builds agrees with the reference node for
