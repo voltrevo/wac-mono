@@ -29,6 +29,7 @@ export const ERR = {
   CONTROL: 6,
   TRAILING: 7,
   DEPTH: 8,
+  UTF8: 9,
 } as const;
 
 export type Canon = { err: number; text: string };
@@ -48,6 +49,18 @@ export async function numberValue(src: string): Promise<number> {
 export async function errorOf(src: string): Promise<number> {
   const m = await json();
   return m.errorCode(enc.encode(src));
+}
+
+/**
+ * Error code for raw bytes.
+ *
+ * Needed wherever the input is not valid UTF-8: passing such bytes through a JS
+ * string and back re-encodes them (0xC3 becomes C3 83), so the parser would never
+ * see the sequence under test.
+ */
+export async function errorOfBytes(bytes: Uint8Array): Promise<number> {
+  const m = await json();
+  return m.errorCode(bytes);
 }
 
 // Own assertions rather than jsr:@std/assert — the wac projects carry no

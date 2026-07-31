@@ -14,6 +14,8 @@ deno run --allow-read tools/check.ts packages/json/src/json.wac
 | Parser: objects, arrays, strings, numbers, literals | done |
 | String escapes, including `\uXXXX` and surrogate pairs | done |
 | Rejection of malformed input | agrees with `JSON.parse` on 5744/5744 mutations |
+| Conformance | JSONTestSuite: 95/95 accepted, 188/188 rejected |
+| UTF-8 validity | enforced; agrees with a strict `TextDecoder` |
 | Decimal → f64 | correctly rounded, bit-exact against `Number(s)` |
 | Serializer | done, numbers emitted verbatim |
 | Object key lookup | O(n) linear scan |
@@ -82,10 +84,24 @@ discards, and both are covered by tests.
 Unpaired surrogate escapes become U+FFFD, because a lone surrogate has no UTF-8
 encoding. `JSON.parse` yields a lone surrogate in a UTF-16 string instead.
 
+Malformed UTF-8 in a string is rejected, per RFC 8259 §8.1 — including overlong
+forms, CESU-8 surrogates and anything above U+10FFFF. That is stricter than
+JSONTestSuite requires, which classifies those documents as implementation-defined.
+
 ## Tests
 
 **Host-side (`test/*.test.ts`)** hold the conformance work, because the oracle is
 the host's own JSON and cannot exist inside wasm.
+
+`test/jsontestsuite/` is the vendored [JSONTestSuite](https://github.com/nst/JSONTestSuite)
+corpus, 318 documents with the expected answer in the filename. It passes whole.
+
+It is worth knowing what it does *not* cover, because it passed on the first run
+while the parser accepted every malformed UTF-8 sequence there is. Its
+invalid-UTF-8 documents are rejected for structural reasons — `[\xff]` fails
+because 0xFF cannot begin a value — and the cases that would test string content
+are classified `i_`, where either answer conforms. `test/utf8.test.ts` covers that
+gap separately, against a strict `TextDecoder`.
 
 **wac-written (`test/wac/json_test.wac`)** cover internals and the parsed tree.
 Host tests can only observe bytes — a `JsonValue` is a GC reference and bindgen

@@ -20,6 +20,7 @@ export i32 ERR_ESCAPE()       { return 5; }  // bad \ escape
 export i32 ERR_CONTROL()      { return 6; }  // raw control byte in a string
 export i32 ERR_TRAILING()     { return 7; }  // non-whitespace after the value
 export i32 ERR_DEPTH()        { return 8; }  // nesting limit exceeded
+export i32 ERR_UTF8()         { return 9; }  // malformed UTF-8 inside a string
 
 // Bounded so a hostile input cannot exhaust the wasm stack. Real JSON is
 // nowhere near this deep.
@@ -196,9 +197,60 @@ export struct Parser {
       }
       // RFC 8259: unescaped bytes below ' ' are not allowed in a string.
       if (c < ' ') { this.fail(ERR_CONTROL()); return null; }
-      out.push(c);
-      this.pos++;
+      if (c < 0x80) {
+        out.push(c);
+        this.pos++;
+        continue;
+      }
+      // Non-ASCII: the whole sequence is validated and copied together. JSON text
+      // must be UTF-8, and a byte above 0x7F can only appear here — outside a
+      // string every legal byte is ASCII, so a bad one already fails structurally.
+      i32 seq = this.utf8SeqLen();
+      if (seq < 0) { this.fail(ERR_UTF8()); return null; }
+      for (i32 k = 0; k < seq; k++) { out.push(this.src[this.pos + k]); }
+      this.pos += seq;
     }
+  }
+
+  /**
+   * Length of the well-formed UTF-8 sequence at the cursor, or -1.
+   *
+   * Rejects what RFC 3629 excludes as well as what it never defined: overlong
+   * encodings (which would let a quote or a NUL hide inside a multi-byte form),
+   * the surrogate range D800-DFFF, which has no UTF-8 encoding, and anything above
+   * U+10FFFF. A length-only check waves all three through.
+   */
+  i32 utf8SeqLen(const this) {
+    i32 n = this.src.len();
+    i32 b0 = this.src[this.pos];
+
+    if (b0 < 0xC2) { return -1; }          // continuation byte, or an overlong lead
+
+    i32 need = 0;
+    i32 lo = 0x80;
+    i32 hi = 0xBF;
+    if (b0 <= 0xDF) {
+      need = 1;
+    } else if (b0 <= 0xEF) {
+      need = 2;
+      if (b0 == 0xE0) { lo = 0xA0; }       // below this is overlong
+      if (b0 == 0xED) { hi = 0x9F; }       // above this is the surrogate range
+    } else if (b0 <= 0xF4) {
+      need = 3;
+      if (b0 == 0xF0) { lo = 0x90; }       // below this is overlong
+      if (b0 == 0xF4) { hi = 0x8F; }       // above this is past U+10FFFF
+    } else {
+      return -1;                           // F5..FF encode nothing
+    }
+
+    if (this.pos + need >= n) { return -1; }
+    i32 c1 = this.src[this.pos + 1];
+    if (c1 < lo || c1 > hi) { return -1; }
+    for (i32 i = 2; i <= need; i++) {
+      i32 ci = this.src[this.pos + i];
+      if (ci < 0x80 || ci > 0xBF) { return -1; }
+    }
+    return need + 1;
   }
 
   bool readEscape(this, Buf out) {
