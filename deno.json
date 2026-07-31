@@ -5,7 +5,8 @@
   "tasks": {
     "test": "deno test --allow-read --allow-write --allow-run",
     "coverage": "deno run -A tools/coverage.ts",
-    "mutate": "deno run -A tools/mutate.ts"
+    "mutate": "deno run -A tools/mutate.ts",
+    "bench": "deno run -A tools/bench.ts"
   },
   "exclude": [".cache"]
 }
