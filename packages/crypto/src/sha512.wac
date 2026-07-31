@@ -1,0 +1,130 @@
+// SHA-512 and SHA-384, as specified in FIPS 180-4.
+//
+// Structurally SHA-256 in 64 bits: same compression shape, wider words, 80
+// rounds instead of 64, a 128-byte block, and different rotation amounts. It is
+// here as much for what it exercises as for the algorithm — every operation is
+// u64, so it covers the half of the unsigned work that SHA-256 does not.
+//
+// SHA-384 is the same computation with a different initial state, truncated to
+// 48 bytes. It is not a shortened SHA-512: the initial values differ precisely
+// so that one is not a prefix of the other.
+
+/** Rotate right, 64-bit. */
+u64 rotr(u64 x, u64 n) { return (x >> n) | (x << (64 - n)); }
+
+u64 ch(u64 x, u64 y, u64 z)  { return (x & y) ^ (~x & z); }
+u64 maj(u64 x, u64 y, u64 z) { return (x & y) ^ (x & z) ^ (y & z); }
+
+u64 bigSigma0(u64 x)   { return rotr(x, 28) ^ rotr(x, 34) ^ rotr(x, 39); }
+u64 bigSigma1(u64 x)   { return rotr(x, 14) ^ rotr(x, 18) ^ rotr(x, 41); }
+u64 smallSigma0(u64 x) { return rotr(x, 1) ^ rotr(x, 8) ^ (x >> 7); }
+u64 smallSigma1(u64 x) { return rotr(x, 19) ^ rotr(x, 61) ^ (x >> 6); }
+
+/**
+ * The 80 round constants: the first 64 bits of the fractional parts of the cube
+ * roots of the first 80 primes. Generated rather than typed — 80 sixteen-digit
+ * values is exactly the sort of table where a transcription slip is
+ * indistinguishable from a bug.
+ */
+const u64[] K = u64[](
+  0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
+  0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
+  0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
+  0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
+  0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
+  0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
+  0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
+  0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
+  0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
+  0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
+  0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
+  0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
+  0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
+  0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
+  0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+  0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
+  0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
+  0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
+  0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
+  0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
+);
+
+/** Initial state for SHA-512: square roots of the first eight primes. */
+const u64[] H512 = u64[](0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1, 0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179);
+
+/** Initial state for SHA-384: square roots of the *ninth* through sixteenth. */
+const u64[] H384 = u64[](0xcbbb9d5dc1059ed8, 0x629a292a367cd507, 0x9159015a3070dd17, 0x152fecd8f70e5939, 0x67332667ffc00b31, 0x8eb44a8768581511, 0xdb0c2e0d64f98fa7, 0x47b5481dbefa4fa4);
+
+/** Big-endian u64 at byte offset `i`. */
+u64 beWord(u8[] b, i32 i) {
+  u64 v = 0;
+  for (i32 j = 0; j < 8; j++) { v = (v << 8) | (b[i + j] as! u64); }
+  return v;
+}
+
+/**
+ * The compression, shared by both digest sizes: returns the eight-word state
+ * after absorbing every block of the padded message.
+ */
+u64[] compress(u8[] msg, u64[] iv) {
+  i32 len = msg.len();
+  // 0x80, then zeros, then a 128-bit big-endian length, to a multiple of 128.
+  i32 blocks = (len + 17 + 127) / 128;
+  i32 total = blocks * 128;
+
+  u8[] m = u8[total]();
+  for (i32 i = 0; i < len; i++) { m[i] = msg[i]; }
+  m[len] = 0x80;
+
+  // Only the low 64 bits of the length are written: the high half is zero for
+  // any message this can be handed, and wac has no 128-bit integer to hold it.
+  u64 bits = (len as! u64) * 8;
+  for (i32 i = 0; i < 8; i++) {
+    m[total - 1 - i] = ((bits >> ((i * 8) as! u64)) & 255) as! i32;
+  }
+
+  u64[] h = u64[8]();
+  for (i32 i = 0; i < 8; i++) { h[i] = iv[i]; }
+  u64[] w = u64[80]();
+
+  for (i32 b = 0; b < blocks; b++) {
+    i32 off = b * 128;
+    for (i32 t = 0; t < 16; t++) { w[t] = beWord(m, off + t * 8); }
+    for (i32 t = 16; t < 80; t++) {
+      w[t] = smallSigma1(w[t - 2]) + w[t - 7] + smallSigma0(w[t - 15]) + w[t - 16];
+    }
+
+    u64 a = h[0]; u64 b1 = h[1]; u64 c = h[2]; u64 d = h[3];
+    u64 e = h[4]; u64 f = h[5]; u64 g = h[6]; u64 hh = h[7];
+
+    for (i32 t = 0; t < 80; t++) {
+      u64 t1 = hh + bigSigma1(e) + ch(e, f, g) + K[t] + w[t];
+      u64 t2 = bigSigma0(a) + maj(a, b1, c);
+      hh = g; g = f; f = e;
+      e = d + t1;
+      d = c; c = b1; b1 = a;
+      a = t1 + t2;
+    }
+
+    h[0] += a; h[1] += b1; h[2] += c; h[3] += d;
+    h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+  return h;
+}
+
+/** Serialise the first `bytes` bytes of the state, big-endian. */
+u8[] serialize(u64[] h, i32 bytes) {
+  u8[] out = u8[bytes]();
+  for (i32 i = 0; i < bytes; i++) {
+    u64 word = h[i / 8];
+    u64 shift = ((7 - (i % 8)) * 8) as! u64;
+    out[i] = ((word >> shift) & 255) as! i32;
+  }
+  return out;
+}
+
+/** SHA-512 of `msg`, 64 bytes. */
+export u8[] sha512(u8[] msg) { return serialize(compress(msg, H512), 64); }
+
+/** SHA-384 of `msg`, 48 bytes. */
+export u8[] sha384(u8[] msg) { return serialize(compress(msg, H384), 48); }

@@ -1,13 +1,14 @@
 # crypto
 
-SHA-256, HMAC, HKDF, ChaCha20, Poly1305 and the ChaCha20-Poly1305 AEAD,
-written in wac.
+SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20, Poly1305 and the
+ChaCha20-Poly1305 AEAD, written in wac.
 
 A package of [wac-mono](../../README.md) — see the root README for layout and how
 to run things. All commands run from the repo root.
 
 ```wac
 import { sha256 } from "../../crypto/src/sha256.wac";
+import { sha512, sha384 } from "../../crypto/src/sha512.wac";
 import { hmacSha256 } from "../../crypto/src/hmac.wac";
 import { hkdf } from "../../crypto/src/hkdf.wac";
 import { chacha20 } from "../../crypto/src/chacha20.wac";
@@ -28,13 +29,31 @@ u8[] opened = aeadDecrypt(key, nonce, aad, sealed, tag);   // traps if forged
 | Piece | Spec | State |
 |---|---|---|
 | SHA-256 | FIPS 180-4 | done |
+| SHA-512, SHA-384 | FIPS 180-4 | done |
 | HMAC-SHA-256 | RFC 2104, FIPS 198-1 | done |
 | HKDF-SHA-256 | RFC 5869 | done, extract and expand separately |
 | ChaCha20 | RFC 8439 | done, 32-bit counter / 96-bit nonce |
 | Poly1305 | RFC 8439 | done, 26-bit limbs |
 | ChaCha20-Poly1305 | RFC 8439 §2.8 | done |
 
-Not here: SHA-512 and AES.
+Not here: AES.
+
+### What SHA-512 is for
+
+It is SHA-256 in 64 bits — same compression shape, wider words, 80 rounds, a
+128-byte block, different rotation amounts. It earns its place as much for
+exercising `u64` end to end as for the algorithm, and it did: writing it beside
+SHA-256 surfaced two compiler bugs, one of them serious.
+
+Both files declare private helpers called `rotr`, `ch` and `maj`, at 32 and 64
+bits. The compiler resolved a bare function name through a global map, so
+SHA-512's calls bound to SHA-256's functions. Differing widths turned that into
+a wasm validation failure; at equal widths it would have been a wrong answer
+with no error at all. `~` on a `u64` also emitted the 32-bit instruction. Both
+are fixed upstream with regression tests.
+
+SHA-384 is not a truncated SHA-512 — the initial state differs precisely so one
+is not a prefix of the other, and a test asserts exactly that.
 
 ### Poly1305 and limbs
 
@@ -79,7 +98,8 @@ straddle the 64-byte block boundary, and over random inputs. That covers far
 more ground than a vector list, and catches padding mistakes at 55/56/63/64
 bytes where they hide.
 
-**The published vectors.** NIST for SHA-256 including the million-`a` case,
+**The published vectors.** NIST for SHA-256 and SHA-512 including the
+million-`a` case for both,
 RFC 4231 for HMAC including the 131-byte key that forces the hash-the-key path,
 RFC 5869 for HKDF including the empty-salt case, RFC 8439 for ChaCha20, Poly1305
 and the full AEAD worked example. These matter because an oracle sharing a bug

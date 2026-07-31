@@ -1,5 +1,6 @@
 // Host-visible wrappers for the differential tests.
 import { sha256 as sha256Impl } from "../../src/sha256.wac";
+import { sha512 as sha512Impl, sha384 as sha384Impl } from "../../src/sha512.wac";
 import { hmacSha256 as hmacImpl } from "../../src/hmac.wac";
 import { chachaBlock as blockImpl, chacha20 as chachaImpl } from "../../src/chacha20.wac";
 import { hkdf as hkdfImpl, hkdfExtract as extractImpl } from "../../src/hkdf.wac";
@@ -21,3 +22,6 @@ export u8[] poly1305(u8[] key, u8[] msg) { return polyImpl(key, msg); }
 export u8[] aeadEncrypt(u8[] k, u8[] n, u8[] p) { return encImpl(k, n, p); }
 export u8[] aeadTag(u8[] k, u8[] n, u8[] a, u8[] c) { return tagImpl(k, n, a, c); }
 export u8[] aeadDecrypt(u8[] k, u8[] n, u8[] a, u8[] c, u8[] t) { return decImpl(k, n, a, c, t); }
+
+export u8[] sha512(u8[] m) { return sha512Impl(m); }
+export u8[] sha384(u8[] m) { return sha384Impl(m); }
