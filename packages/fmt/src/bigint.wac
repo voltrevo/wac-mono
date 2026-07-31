@@ -44,8 +44,6 @@ export struct Big {
     return b;
   }
 
-  bool isZero(const this) { return this.n == 0; }
-
   /** Drop leading zero limbs so `n` is exact — every comparison depends on it. */
   void trim(this) {
     while (this.n > 0 && this.limbs[this.n - 1] == 0) {

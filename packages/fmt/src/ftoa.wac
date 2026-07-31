@@ -211,21 +211,26 @@ Decimal decomposeFloat(bool neg, i32 be, u64 frac, i32 maxBe, u64 implicitBit, i
       return Decimal.Digits(digits, count, exp10, neg);
     }
 
-    // Rounding up a 9 carries. The digit itself becomes 0, and since everything
-    // after the carry is zeros, they are trailing zeros in a shortest
-    // representation and are dropped rather than emitted.
-    i32 i = count - 1;
-    while (i >= 0 && digits[i] == '9') { i--; }
-    if (i < 0) {
-      // Carried off the front: the value rounds to a power of ten. 9.99e22 is
-      // where this happens — its shortest form is 1e23, not 10e22.
-      digits[0] = '1';
-      count = 1;
-      exp10 = exp10 + 1;
-    } else {
-      digits[i] = digits[i] + 1;
-      count = i + 1;
-    }
+    // Rounding a 9 up carries, and it can only happen on the *first* digit, so the
+    // carry always runs off the front and the value becomes a power of ten one
+    // exponent higher: 9.99e22 is 1e23, not 10e22.
+    //
+    // Why only the first. Suppose digit k+1 is 9 and rounds up, so `high` holds
+    // there: r + mPlus > s, where r and mPlus are the values after being scaled by
+    // ten and r has had 9s subtracted. Substituting the previous step's values,
+    // 10*(r_k + mPlus_k) - 9s > s, i.e. r_k + mPlus_k > s — which is exactly the
+    // stopping condition at step k. So the loop would already have stopped there,
+    // and only the first digit has no previous step to contradict.
+    //
+    // An earlier version walked back over the emitted digits absorbing the carry.
+    // Branch coverage showed that path never taken by 60 000 random doubles nor by
+    // 60 000 neighbours of round decimals, which prompted the proof above. The trap
+    // is here rather than a comment because an untested branch that silently does
+    // the wrong thing is worse than one that stops.
+    if (count != 0) { trap; }
+    digits[0] = '1';
+    count = 1;
+    exp10 = exp10 + 1;
     return Decimal.Digits(digits, count, exp10, neg);
   }
 }

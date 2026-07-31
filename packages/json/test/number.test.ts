@@ -47,6 +47,22 @@ Deno.test("exact cases match the host bit-for-bit", async () => {
   }
 });
 
+Deno.test("a document that is not a number yields NaN", async () => {
+  // parseNumberValue's two failure paths. Branch coverage found both unexercised:
+  // every test fed it a valid number, so a change that returned 0 or the last
+  // successful value on failure would have gone unnoticed.
+  for (const src of ["", "[", "1 2", "01", "-", "1e"]) {
+    const got = await numberValue(src);
+    if (!Number.isNaN(got)) throw new Error(`${JSON.stringify(src)} parsed to ${got}, want NaN`);
+  }
+  // Parses, but is not a number — the `else` arm of the match rather than the null
+  // check above it.
+  for (const src of ['"1"', "true", "false", "null", "[1]", '{"a":1}']) {
+    const got = await numberValue(src);
+    if (!Number.isNaN(got)) throw new Error(`${JSON.stringify(src)} parsed to ${got}, want NaN`);
+  }
+});
+
 Deno.test("hard cases are exact too", async () => {
   for (const src of HARD) {
     assertSameNumber(await numberValue(src), Number(src), `for ${src}`);

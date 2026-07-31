@@ -1,0 +1,11 @@
+// One entry point reaching everything in fmt, for the coverage driver and for any
+// host-side test that wants the whole surface without four fixtures.
+import { ftoaBytes, ftoa32Bytes } from "../src/ftoa.wac";
+import { atofSpan, atof32Span } from "../src/atof.wac";
+import { itoa } from "../src/itoa.wac";
+
+export u8[] fmtF64(f64 x) { return ftoaBytes(x); }
+export u8[] fmtF32(f32 x) { return ftoa32Bytes(x); }
+export f64 parseF64(u8[] src) { return atofSpan(src, 0, src.len()); }
+export f32 parseF32(u8[] src) { return atof32Span(src, 0, src.len()); }
+export string itoaOf(i32 n) { return itoa(n); }

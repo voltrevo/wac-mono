@@ -15,12 +15,11 @@ export i32 ERR_NONE()         { return 0; }
 export i32 ERR_UNEXPECTED()   { return 1; }  // wrong byte for the position
 export i32 ERR_EOF()          { return 2; }  // ran out of input mid-value
 export i32 ERR_NUMBER()       { return 3; }  // malformed number
-export i32 ERR_STRING()       { return 4; }  // malformed string body
-export i32 ERR_ESCAPE()       { return 5; }  // bad \ escape
-export i32 ERR_CONTROL()      { return 6; }  // raw control byte in a string
-export i32 ERR_TRAILING()     { return 7; }  // non-whitespace after the value
-export i32 ERR_DEPTH()        { return 8; }  // nesting limit exceeded
-export i32 ERR_UTF8()         { return 9; }  // malformed UTF-8 inside a string
+export i32 ERR_ESCAPE()       { return 4; }  // bad \ escape
+export i32 ERR_CONTROL()      { return 5; }  // raw control byte in a string
+export i32 ERR_TRAILING()     { return 6; }  // non-whitespace after the value
+export i32 ERR_DEPTH()        { return 7; }  // nesting limit exceeded
+export i32 ERR_UTF8()         { return 8; }  // malformed UTF-8 inside a string
 
 // Bounded so a hostile input cannot exhaust the wasm stack. Real JSON is
 // nowhere near this deep.
@@ -337,12 +336,9 @@ export struct Parser {
   JsonValue? parseNumber(this) {
     i32 start = this.pos;
     if (this.peek() == '-') { this.pos++; }
-    bool any = false;
-
     i32 c = this.peek();
     if (c == '0') {                                       // leading 0
       this.pos++;
-      any = true;
       // A second digit after a leading zero is invalid JSON (01, 00).
       i32 n = this.peek();
       if (n >= '0' && n <= '9') { this.fail(ERR_NUMBER()); return null; }
@@ -351,13 +347,11 @@ export struct Parser {
         i32 d = this.peek();
         if (d < '0' || d > '9') { break; }
         this.pos++;
-        any = true;
       }
     } else {
       this.fail(ERR_NUMBER());
       return null;
     }
-    if (!any) { this.fail(ERR_NUMBER()); return null; }
 
     if (this.peek() == '.') {
       this.pos++;

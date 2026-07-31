@@ -1,0 +1,14 @@
+// Fixture for the bounds traps, which cannot be tested from wac: a trap aborts the
+// whole module, so each case needs its own call from the host.
+import { Buf } from "../src/buf.wac";
+
+export i32 getPastEnd() { Buf b = Buf.create(); b.push(1); return b.get(1); }
+export i32 getNegative() { Buf b = Buf.create(); b.push(1); return b.get(0 - 1); }
+export i32 getAtCapacityNotLength() {
+  // Index inside the allocated array but past `len` — the case a naive bounds check
+  // against data.len() rather than len would wrongly allow.
+  Buf b = Buf.withCapacity(16);
+  b.push(1);
+  return b.get(5);
+}
+export i32 getOk() { Buf b = Buf.create(); b.push(42); return b.get(0); }

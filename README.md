@@ -25,12 +25,14 @@ harness/           TypeScript for driving the compiler
   wacFiles.ts        read an entry file and its transitive imports
   wacBind.ts         compile -> bindgen -> importable JS module
   wacTestRun.ts      run wac-written tests as Deno tests
+  wacCoverage.ts     instrument an entry point and report branch coverage
 tools/             check.ts, coverage.ts, mutate.ts
 issues/            bug reports and cross-cutting tasks; see issues/README.md
 packages/<name>/
   src/               wac source
   test/              host-side tests (.test.ts)
   test/wac/          tests written in wac (*_test.wac)
+  cov.ts             optional: drives this package's branch coverage
 ```
 
 `deno.json` maps `wac/` to a sibling checkout of the compiler
@@ -53,7 +55,10 @@ Everything runs from the repo root, so one command covers every package.
 
 ```sh
 deno task test        # all tests, host-side and wac-written
-deno task coverage    # branch coverage of the wac sources
+deno task coverage       # branch coverage of gzip (see issues/0002)
+deno task coverage:json  # branch coverage of json
+deno task coverage:fmt   # branch coverage of fmt
+deno task coverage:bytes # branch coverage of bytes
 deno task mutate      # mutation testing
 deno task bench       # gzip throughput
 deno task bench:json  # json throughput, by document shape

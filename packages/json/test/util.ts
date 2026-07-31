@@ -32,12 +32,11 @@ export const ERR = {
   UNEXPECTED: 1,
   EOF: 2,
   NUMBER: 3,
-  STRING: 4,
-  ESCAPE: 5,
-  CONTROL: 6,
-  TRAILING: 7,
-  DEPTH: 8,
-  UTF8: 9,
+  ESCAPE: 4,
+  CONTROL: 5,
+  TRAILING: 6,
+  DEPTH: 7,
+  UTF8: 8,
 } as const;
 
 /**

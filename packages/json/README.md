@@ -197,3 +197,17 @@ Four compiler defects came out of writing this, all since fixed upstream:
   implemented, and this package's scanner is written with them.
 - **A bare `string` in an expression parsed as the literal `"string"`**, found
   while adding `string.fromCodepoint`.
+
+## Coverage
+
+`deno task coverage:json` reports branch coverage, driven by `cov.ts` in this
+package. Currently 100% — all four source files.
+
+Coverage needs an exercise, and an exercise only measures the code it drives, so each
+package supplies its own; `harness/wacCoverage.ts` is the shared half. The repo-level
+`deno task coverage` covers gzip only, which is [issues/0002](../../issues/open/0002-coverage-and-mutate-only-see-gzip.md).
+
+The hazard to know about: `cov.ts` is a second workload written by hand, so it drifts
+from the test suite it is meant to measure. Twice now it has reported a branch as
+uncovered that the tests do cover, and once the reverse. When it disagrees with the
+suite, the suite is right and `cov.ts` needs the input adding.

@@ -1,0 +1,12 @@
+// Fixture for the container bounds traps. A trap aborts the module, so each case
+// needs its own call from the host rather than a wac test.
+import { JsonValue, JsonArray, JsonObject, numberOf } from "../src/value.wac";
+
+JsonArray oneItem() { JsonArray a = JsonArray.create(); a.push(numberOf(1.0)); return a; }
+JsonObject oneMember() { JsonObject o = JsonObject.create(); o.push(u8[]('k'), numberOf(1.0)); return o; }
+
+export i32 arrayPastEnd()   { JsonArray a = oneItem(); a.at(1); return 0; }
+export i32 arrayNegative()  { JsonArray a = oneItem(); a.at(0 - 1); return 0; }
+export i32 objectPastEnd()  { JsonObject o = oneMember(); o.at(1); return 0; }
+export i32 objectNegative() { JsonObject o = oneMember(); o.at(0 - 1); return 0; }
+export i32 arrayOk()        { JsonArray a = oneItem(); a.at(0); return a.len(); }

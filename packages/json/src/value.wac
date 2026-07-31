@@ -38,9 +38,6 @@ export enum JsonValue {
 /** A number with no source span, to be formatted on output rather than copied. */
 export JsonValue numberOf(f64 v) { return JsonValue.Number(v, u8[0]()); }
 
-/** The value of a `Str`, as a `string`. Copies, so a caller comparing should keep it. */
-export string strOf(Str s) { return string.fromBytes(s.bytes); }
-
 // Growable array of values. wac has no generics, so this and JsonObject's member
 // list are the same double-when-full logic written twice, differing only in element
 // type — the standing argument for generics, and the reason packages/bytes exists

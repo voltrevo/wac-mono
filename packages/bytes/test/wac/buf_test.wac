@@ -186,6 +186,37 @@ export string test_grows_from_zero_capacity() {
   return t.report();
 }
 
+export string test_bulk_append_onto_a_partly_filled_buffer() {
+  T t = T.create();
+  // reserveFor's copy loop, which every existing test missed: they all bulk-append
+  // onto an empty buffer, so there was nothing to carry over.
+  Buf b = Buf.create();
+  b.pushAll(u8[]('a', 'b', 'c'));
+  u8[] big = u8[100]();
+  for (i32 i = 0; i < 100; i++) { big[i] = i; }
+  b.pushAll(big);
+  t.eqI32(b.len, 103, "both parts are there");
+  t.eqI32(b.get(0), 'a', "the original bytes survived the growth");
+  t.eqI32(b.get(2), 'c', "including the last of them");
+  t.eqI32(b.get(3), 0, "and the appended block starts where it should");
+  t.eqI32(b.get(102), 99, "through to its end");
+  return t.report();
+}
+
+export string test_bulk_append_from_zero_capacity() {
+  T t = T.create();
+  // reserveFor's capacity floor. Reachable only when the buffer has no capacity at
+  // all, since 16 doubled already clears the floor — so only after `take`.
+  Buf b = Buf.withCapacity(16);
+  for (i32 i = 0; i < 16; i++) { b.push(i); }
+  u8[] taken = b.take();
+  t.eqI32(taken.len(), 16, "storage handed over");
+  b.pushAll(u8[]('x', 'y'));
+  t.eqI32(b.len, 2, "the emptied buffer takes a bulk append");
+  t.eqI32(b.get(1), 'y', "with the right contents");
+  return t.report();
+}
+
 export string test_bytes_is_a_copy() {
   T t = T.create();
   // bytes() must not alias, or a caller that keeps appending would see its

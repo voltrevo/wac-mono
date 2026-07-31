@@ -164,3 +164,17 @@ another implementation.
 ## Not here yet
 
 - Fixed-precision output (`toFixed`-style). Only shortest is implemented.
+
+## Coverage
+
+`deno task coverage:fmt` reports branch coverage, driven by `cov.ts` in this
+package. Currently 94.5% ftoa, 96.5% bigint, 90.7% atof — the remainder is defensive guards and unreachable range checks.
+
+Coverage needs an exercise, and an exercise only measures the code it drives, so each
+package supplies its own; `harness/wacCoverage.ts` is the shared half. The repo-level
+`deno task coverage` covers gzip only, which is [issues/0002](../../issues/open/0002-coverage-and-mutate-only-see-gzip.md).
+
+The hazard to know about: `cov.ts` is a second workload written by hand, so it drifts
+from the test suite it is meant to measure. Twice now it has reported a branch as
+uncovered that the tests do cover, and once the reverse. When it disagrees with the
+suite, the suite is right and `cov.ts` needs the input adding.

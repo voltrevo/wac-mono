@@ -58,6 +58,45 @@ Deno.test("utf8: malformed sequences are rejected", async () => {
   if (wrong.length) throw new Error(`${wrong.length} not rejected as UTF-8:\n  ${wrong.join("\n  ")}`);
 });
 
+Deno.test("utf8: a sequence cut off by the end of input is rejected", async () => {
+  // Distinct from a sequence followed by a wrong byte: here the string never
+  // terminates, so the length check fires rather than the range check. Branch
+  // coverage found this path unexercised — every existing case had a closing quote,
+  // which supplies a byte for the range check to reject.
+  const cases: [string, number[]][] = [
+    ["two-byte lead at EOF", [0x22, 0xC3]],
+    ["three-byte lead at EOF", [0x22, 0xE6]],
+    ["three-byte, one continuation, at EOF", [0x22, 0xE6, 0x97]],
+    ["four-byte lead at EOF", [0x22, 0xF0]],
+    ["four-byte, two continuations, at EOF", [0x22, 0xF0, 0x9F, 0x98]],
+  ];
+  for (const [label, bytes] of cases) {
+    const err = await errorOfBytes(new Uint8Array(bytes));
+    // Either verdict is defensible — the input is both truncated UTF-8 and an
+    // unterminated string — but it must be one of them and never accepted.
+    if (err !== ERR.UTF8 && err !== ERR.EOF) {
+      throw new Error(`${label}: got code ${err}, want UTF8 or EOF`);
+    }
+  }
+});
+
+Deno.test("utf8: a valid lead with a bad later continuation byte", async () => {
+  // The loop that checks continuation bytes after the first. A sequence whose first
+  // continuation is in range but whose second is not only reaches it here.
+  const cases: [string, number[]][] = [
+    ["three-byte, second continuation bad", [0xE6, 0x97, 0x41]],
+    ["four-byte, second continuation bad", [0xF0, 0x9F, 0x41, 0x80]],
+    ["four-byte, third continuation bad", [0xF0, 0x9F, 0x98, 0x41]],
+  ];
+  for (const [label, body] of cases) {
+    if (hostAccepts(new Uint8Array(body))) {
+      throw new Error(`${label}: the host considers these valid — bad test case`);
+    }
+    const err = await errorOfBytes(doc(...body));
+    if (err !== ERR.UTF8) throw new Error(`${label}: got code ${err}, want ${ERR.UTF8}`);
+  }
+});
+
 Deno.test("utf8: well-formed sequences at every width are accepted", async () => {
   const good: [string, number[]][] = [
     ["two-byte, lowest", [0xC2, 0x80]],
