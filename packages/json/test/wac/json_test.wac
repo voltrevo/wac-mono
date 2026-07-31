@@ -12,10 +12,71 @@
 // tests in packages/bytes.
 
 import { T } from "../../../wactest/src/assert.wac";
-import { JsonValue, JsonNumber, JsonString, JsonArray, JsonObject, bytesEqual } from "../../src/value.wac";
+import { JsonValue, JsonArray, JsonObject, bytesEqual, numberOf } from "../../src/value.wac";
 import { writeValue } from "../../src/stringify.wac";
 import { Buf } from "../../../bytes/src/buf.wac";
 import { Parser, parseDocument, hexDigit, ERR_NONE, ERR_TRAILING, ERR_CONTROL } from "../../src/parse.wac";
+
+/**
+ * Extractors.
+ *
+ * `match` is a statement and narrows only a plain variable, so pulling one field out
+ * for an assertion takes a function. That is not worse than the `as!` chain it
+ * replaces — it is one place per shape instead of one cast per use — and an arm that
+ * cannot happen traps rather than returning a plausible default.
+ */
+i32 tagOf(JsonValue v) {
+  match (v) {
+    case Null:   return 0;
+    case Bool:   return 1;
+    case Number: return 2;
+    case Str:    return 3;
+    case Array:  return 4;
+    case Object: return 5;
+  }
+}
+
+u8[] strBytes(JsonValue v) {
+  match (v) {
+    case Str(bytes): return bytes;
+    else: trap;
+  }
+}
+
+bool boolValue(JsonValue v) {
+  match (v) {
+    case Bool(value): return value;
+    else: trap;
+  }
+}
+
+f64 numValue(JsonValue v) {
+  match (v) {
+    case Number(value, raw): return value;
+    else: trap;
+  }
+}
+
+u8[] numRaw(JsonValue v) {
+  match (v) {
+    case Number(value, raw): return raw;
+    else: trap;
+  }
+}
+
+JsonArray asArray(JsonValue v) {
+  match (v) {
+    case Array(items): return items;
+    else: trap;
+  }
+}
+
+JsonObject asObject(JsonValue v) {
+  match (v) {
+    case Object(members): return members;
+    else: trap;
+  }
+}
 
 JsonValue? parseStr(string src) {
   // `string.toBytes()` replaced a 40-line ASCII lookup table here. The table
@@ -59,33 +120,32 @@ export string test_json_array_growth() {
   JsonArray a = JsonArray.create();
   t.eqI32(a.len(), 0, "starts empty");
   for (i32 i = 0; i < 50; i++) {
-    a.push(JsonNumber.of(1.0, u8[](0x31)));
+    a.push(JsonValue.Number(1.0, u8[](0x31)));
   }
   t.eqI32(a.len(), 50, "length after 50 pushes");
-  t.eqI32(a.at(0).kind, 2, "element kind survives growth");
-  t.eqI32(a.at(49).kind, 2, "last element too");
+  t.eqI32(tagOf(a.at(0)), 2, "element kind survives growth");
+  t.eqI32(tagOf(a.at(49)), 2, "last element too");
   return t.report();
 }
 
 export string test_json_object_lookup() {
   T t = T.create();
   JsonObject o = JsonObject.create();
-  o.push(u8[](0x61), JsonNumber.of(1.0, u8[](0x31)));           // a: 1
-  o.push(u8[](0x62), JsonNumber.of(2.0, u8[](0x32)));           // b: 2
+  o.push(u8[](0x61), JsonValue.Number(1.0, u8[](0x31)));           // a: 1
+  o.push(u8[](0x62), JsonValue.Number(2.0, u8[](0x32)));           // b: 2
   t.eqI32(o.len(), 2, "two members");
 
   JsonValue? found = o.get(u8[](0x62));
   t.isTrue(found is not null, "b is found");
-  t.eqI32(found!.kind, 2, "b is a number");
+  t.eqI32(tagOf(found!), 2, "b is a number");
 
   t.isTrue(o.get(u8[](0x63)) is null, "c is absent");
   t.isTrue(o.get(u8[0]()) is null, "empty key is absent");
 
   // Duplicates are retained, and lookup returns the first.
-  o.push(u8[](0x61), JsonNumber.of(9.0, u8[](0x39)));
+  o.push(u8[](0x61), JsonValue.Number(9.0, u8[](0x39)));
   t.eqI32(o.len(), 3, "duplicate key is kept as a third member");
-  JsonNumber first = o.get(u8[](0x61))! as! JsonNumber;
-  t.isTrue(first.value == 1.0, "lookup returns the first of a duplicated key");
+  t.isTrue(numValue(o.get(u8[](0x61))!) == 1.0, "lookup returns the first of a duplicated key");
   return t.report();
 }
 
@@ -95,18 +155,18 @@ export string test_tree_shape() {
   T t = T.create();
   JsonValue? v = parseStr("{\"a\":[1,true],\"b\":null}");
   t.isTrue(v is not null, "document parses");
-  t.eqI32(v!.kind, 5, "root is an object");
+  t.eqI32(tagOf(v!), 5, "root is an object");
 
-  JsonObject o = v! as! JsonObject;
+  JsonObject o = asObject(v!);
   t.eqI32(o.len(), 2, "two members");
   t.eqBytes(o.at(0).key, u8[](0x61), "first key is a");
   t.eqBytes(o.at(1).key, u8[](0x62), "second key is b");
-  t.eqI32(o.at(1).value.kind, 0, "b is null");
+  t.eqI32(tagOf(o.at(1).value), 0, "b is null");
 
-  JsonArray arr = o.at(0).value as! JsonArray;
+  JsonArray arr = asArray(o.at(0).value);
   t.eqI32(arr.len(), 2, "a has two elements");
-  t.eqI32(arr.at(0).kind, 2, "first is a number");
-  t.eqI32(arr.at(1).kind, 1, "second is a bool");
+  t.eqI32(tagOf(arr.at(0)), 2, "first is a number");
+  t.eqI32(tagOf(arr.at(1)), 1, "second is a bool");
   return t.report();
 }
 
@@ -114,13 +174,13 @@ export string test_string_accessors() {
   T t = T.create();
   JsonValue? v = parseStr("{\"name\":\"wac\",\"n\":1}");
   t.isTrue(v is not null, "parses");
-  JsonObject o = v! as! JsonObject;
+  JsonObject o = asObject(v!);
 
   // Lookup by a string key is what calling code actually has, and it must agree
   // with the byte-keyed form rather than being a separate code path.
   JsonValue? byStr = o.getStr("name");
   t.isTrue(byStr is not null, "getStr finds the member");
-  t.eqStr((byStr! as! JsonString).str(), "wac", "and its value comes back as a string");
+  t.eqStr(string.fromBytes(strBytes(byStr!)), "wac", "and its value comes back as a string");
   JsonValue? byBytes = o.get(u8[]('n', 'a', 'm', 'e'));
   t.isTrue(byBytes is not null, "the byte-keyed form finds it too");
   t.isTrue(byStr! is byBytes!, "and both return the same object");
@@ -140,11 +200,11 @@ export string test_string_accessors_handle_utf8() {
   // multi-byte, plus one built from an escape rather than from literal bytes.
   JsonValue? v = parseStr("{\"日\":\"caf\\u00e9\"}");
   t.isTrue(v is not null, "parses");
-  JsonObject o = v! as! JsonObject;
+  JsonObject o = asObject(v!);
   t.eqStr(o.at(0).keyStr(), "日", "a multi-byte key round-trips");
   JsonValue? found = o.getStr("日");
   t.isTrue(found is not null, "and can be looked up by that string");
-  t.eqStr((found! as! JsonString).str(), "café",
+  t.eqStr(string.fromBytes(strBytes(found!)), "café",
     "a value assembled from a \\u escape comes back as the right string");
   return t.report();
 }
@@ -156,7 +216,7 @@ export string test_member_order_is_source_order() {
   // have nothing to do with this parser.
   JsonValue? v = parseStr("{\"2\":0,\"b\":0,\"1\":0}");
   t.isTrue(v is not null, "parses");
-  JsonObject o = v! as! JsonObject;
+  JsonObject o = asObject(v!);
   t.eqBytes(o.at(0).key, u8[](0x32), "first key is 2");
   t.eqBytes(o.at(1).key, u8[](0x62), "second key is b");
   t.eqBytes(o.at(2).key, u8[](0x31), "third key is 1");
@@ -167,8 +227,7 @@ export string test_unescaped_string_contents() {
   T t = T.create();
   JsonValue? v = parseStr("\"a\\u0041\\n\\\\b\"");
   t.isTrue(v is not null, "parses");
-  JsonString s = v! as! JsonString;
-  t.eqBytes(s.bytes, u8[]('a', 'A', '\n', '\\', 'b'), "escapes are decoded in place");
+  t.eqBytes(strBytes(v!), u8[]('a', 'A', '\n', '\\', 'b'), "escapes are decoded in place");
   return t.report();
 }
 
@@ -176,8 +235,7 @@ export string test_surrogate_pair_decodes_to_one_scalar() {
   T t = T.create();
   JsonValue? v = parseStr("\"\\ud83d\\ude00\"");
   t.isTrue(v is not null, "parses");
-  JsonString s = v! as! JsonString;
-  t.eqBytes(s.bytes, u8[](0xF0, 0x9F, 0x98, 0x80), "pair becomes U+1F600");
+  t.eqBytes(strBytes(v!), u8[](0xF0, 0x9F, 0x98, 0x80), "pair becomes U+1F600");
   return t.report();
 }
 
@@ -185,8 +243,7 @@ export string test_unpaired_surrogate_becomes_replacement() {
   T t = T.create();
   JsonValue? v = parseStr("\"\\ud83d\"");
   t.isTrue(v is not null, "parses");
-  JsonString s = v! as! JsonString;
-  t.eqBytes(s.bytes, u8[](0xEF, 0xBF, 0xBD), "lone high surrogate becomes U+FFFD");
+  t.eqBytes(strBytes(v!), u8[](0xEF, 0xBF, 0xBD), "lone high surrogate becomes U+FFFD");
   return t.report();
 }
 
@@ -194,12 +251,10 @@ export string test_number_keeps_its_source_span() {
   T t = T.create();
   JsonValue? v = parseStr("[1e2,-0]");
   t.isTrue(v is not null, "parses");
-  JsonArray a = v! as! JsonArray;
-  JsonNumber n = a.at(0) as! JsonNumber;
-  t.eqBytes(n.raw, u8[](0x31, 0x65, 0x32), "raw span is 1e2, not 100");
-  t.isTrue(n.value == 100.0, "value is still 100");
-  JsonNumber z = a.at(1) as! JsonNumber;
-  t.eqBytes(z.raw, u8[](0x2D, 0x30), "negative zero keeps its sign in the span");
+  JsonArray a = asArray(v!);
+  t.eqBytes(numRaw(a.at(0)), u8[](0x31, 0x65, 0x32), "raw span is 1e2, not 100");
+  t.isTrue(numValue(a.at(0)) == 100.0, "value is still 100");
+  t.eqBytes(numRaw(a.at(1)), u8[](0x2D, 0x30), "negative zero keeps its sign in the span");
   return t.report();
 }
 
@@ -230,16 +285,16 @@ export string test_hand_built_tree_serializes() {
   // The gap this closes: before packages/fmt there was no float-to-string, so a
   // JsonNumber with no source span could not be written at all.
   JsonObject o = JsonObject.create();
-  o.push("n".toBytes(), JsonNumber.ofValue(1.5));
-  o.push("big".toBytes(), JsonNumber.ofValue(1.0e21));
-  o.push("small".toBytes(), JsonNumber.ofValue(0.1));
+  o.push("n".toBytes(), numberOf(1.5));
+  o.push("big".toBytes(), numberOf(1.0e21));
+  o.push("small".toBytes(), numberOf(0.1));
   JsonArray a = JsonArray.create();
-  a.push(JsonNumber.ofValue(0.0));
-  a.push(JsonNumber.ofValue(-2.25));
-  o.push("xs".toBytes(), a);
+  a.push(numberOf(0.0));
+  a.push(numberOf(-2.25));
+  o.push("xs".toBytes(), JsonValue.Array(a));
 
   Buf out = Buf.create();
-  writeValue(out, o);
+  writeValue(out, JsonValue.Object(o));
   t.eqStr(out.toStr(),
     "{\"n\":1.5,\"big\":1e+21,\"small\":0.1,\"xs\":[0,-2.25]}",
     "every number is formatted to its shortest form");

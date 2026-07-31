@@ -5,61 +5,59 @@
 // has no float-to-string operation, so printing an f64 would mean implementing
 // shortest-round-trip formatting (Ryu or Grisu) first.
 //
-// Dispatch is a switch on the kind tag followed by a downcast. With no virtual
-// dispatch, this is the shape every fold over the tree has to take.
+// The fold is a `match`, so the compiler checks that every variant is handled —
+// which is the difference between this and the switch-on-tag it replaced, where a
+// forgotten case fell through to `trap` at run time.
 
-import { JsonValue, JsonBool, JsonNumber, JsonString, JsonArray, JsonObject } from "./value.wac";
+import { JsonValue } from "./value.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { writeF64 } from "../../fmt/src/ftoa.wac";
 
 export void writeValue(Buf out, JsonValue v) {
-  switch (v.kind) {
-    case 0: {                                  // null
+  // Exhaustive: adding a variant to JsonValue makes this a compile error rather
+  // than a case that silently falls through to `trap`, which is what the old
+  // switch-on-tag did.
+  match (v) {
+    case Null: {
       out.pushAll(u8[]('n', 'u', 'l', 'l'));
     }
-    case 1: {                                  // bool
-      JsonBool b = v as! JsonBool;
-      if (b.value) {
+    case Bool(value): {
+      if (value) {
         out.pushAll(u8[]('t', 'r', 'u', 'e'));
       } else {
         out.pushAll(u8[]('f', 'a', 'l', 's', 'e'));
       }
     }
-    case 2: {                                  // number
-      JsonNumber n = v as! JsonNumber;
+    case Number(value, raw): {
       // A parsed number is written back exactly as it was read; one built by hand
       // has no span and is formatted to its shortest round-tripping decimal.
-      if (n.hasRaw()) {
-        out.pushAll(n.raw);
+      if (raw.len() > 0) {
+        out.pushAll(raw);
       } else {
-        writeF64(out, n.value);
+        writeF64(out, value);
       }
     }
-    case 3: {                                  // string
-      JsonString s = v as! JsonString;
-      writeString(out, s.bytes);
+    case Str(bytes): {
+      writeString(out, bytes);
     }
-    case 4: {                                  // array
-      JsonArray a = v as! JsonArray;
+    case Array(items): {
       out.push('[');
-      for (i32 i = 0; i < a.len(); i++) {
+      for (i32 i = 0; i < items.len(); i++) {
         if (i > 0) { out.push(','); }
-        writeValue(out, a.at(i));
+        writeValue(out, items.at(i));
       }
       out.push(']');
     }
-    case 5: {                                  // object
-      JsonObject o = v as! JsonObject;
+    case Object(members): {
       out.push('{');
-      for (i32 i = 0; i < o.len(); i++) {
+      for (i32 i = 0; i < members.len(); i++) {
         if (i > 0) { out.push(','); }
-        writeString(out, o.at(i).key);
+        writeString(out, members.at(i).key);
         out.push(':');
-        writeValue(out, o.at(i).value);
+        writeValue(out, members.at(i).value);
       }
       out.push('}');
     }
-    default: { trap; }
   }
 }
 
