@@ -27,36 +27,30 @@ u8[] ascii(string s) {
 }
 
 /**
- * Byte value of a one-character ASCII string, via literal tables.
+ * Byte value of a one-character ASCII string.
  *
- * Split either side of the backslash on purpose. A `\\` escape followed by more
- * characters in the same literal currently loses a byte — the lexer decodes the
- * escape and then the emitter's encodeString decodes the resulting real
- * backslash a second time, consuming the character after it. `"\\"` on its own
- * is unaffected, because there is nothing following it to swallow, so the
- * backslash is handled as its own case here.
+ * Still needed because indexing a string yields a one-character *string*, not a
+ * number, so there is no direct char-to-int. Char literals give the table's
+ * right-hand side, which is why it can be one contiguous run again: the `\\`
+ * escape used to lose the character after it, so the table had to be split
+ * either side of the backslash.
  */
 i32 charByte(string ch) {
-  // 0x20 ' ' through 0x5B '['
-  string low = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[";
-  for (i32 i = 0; i < low.len(); i++) {
-    if (low[i] == ch) { return 0x20 + i; }
+  string table = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+  for (i32 i = 0; i < table.len(); i++) {
+    if (table[i] == ch) { return ' ' + i; }
   }
-  if (ch == "\\") { return 0x5C; }
-  // 0x5D ']' through 0x7E '~'
-  string high = "]^_`abcdefghijklmnopqrstuvwxyz{|}~";
-  for (i32 i = 0; i < high.len(); i++) {
-    if (high[i] == ch) { return 0x5D + i; }
-  }
-  if (ch == "\n") { return 0x0A; }
-  if (ch == "\t") { return 0x09; }
-  if (ch == "\r") { return 0x0D; }
+  if (ch == "\n") { return '\n'; }
+  if (ch == "\t") { return '\t'; }
+  if (ch == "\r") { return '\r'; }
   trap;
 }
 
-/** Guards the tables above against silently losing a character. */
+/** Guards the table above against silently losing a character. */
 export string test_char_tables_are_intact() {
   T t = T.create();
+  // 0x20..0x7E is 95 characters. A dropped escape shows up here first.
+  t.eqI32(charByte("~") - charByte(" ") + 1, 95, "the table spans the printable range");
   t.eqI32(charByte(" "), 0x20, "space");
   t.eqI32(charByte("\""), 0x22, "quote");
   t.eqI32(charByte("0"), 0x30, "zero");
@@ -257,38 +251,18 @@ export string test_member_order_is_source_order() {
   return t.report();
 }
 
-// The three tests below spell their input out as bytes rather than as a wac
-// string literal. Their inputs contain JSON `\` escapes, and a wac literal
-// cannot currently hold a backslash followed by more characters — see charByte
-// above. Once the emitter's double-decoding is fixed these can go back to
-// parseStr("...").
-
-JsonValue? parseBytes(u8[] src) {
-  Parser p = Parser.create(src);
-  return parseDocument(p);
-}
-
 export string test_unescaped_string_contents() {
   T t = T.create();
-  // "aA\n\\b"
-  JsonValue? v = parseBytes(u8[](
-    0x22, 0x61, 0x5C, 0x75, 0x30, 0x30, 0x34, 0x31,
-    0x5C, 0x6E, 0x5C, 0x5C, 0x62, 0x22,
-  ));
+  JsonValue? v = parseStr("\"a\\u0041\\n\\\\b\"");
   t.isTrue(v is not null, "parses");
   JsonString s = v! as! JsonString;
-  // a A newline backslash b
-  t.eqBytes(s.bytes, u8[](0x61, 0x41, 0x0A, 0x5C, 0x62), "escapes are decoded in place");
+  t.eqBytes(s.bytes, u8[]('a', 'A', '\n', '\\', 'b'), "escapes are decoded in place");
   return t.report();
 }
 
 export string test_surrogate_pair_decodes_to_one_scalar() {
   T t = T.create();
-  // "😀"
-  JsonValue? v = parseBytes(u8[](
-    0x22, 0x5C, 0x75, 0x64, 0x38, 0x33, 0x64,
-    0x5C, 0x75, 0x64, 0x65, 0x30, 0x30, 0x22,
-  ));
+  JsonValue? v = parseStr("\"\\ud83d\\ude00\"");
   t.isTrue(v is not null, "parses");
   JsonString s = v! as! JsonString;
   t.eqBytes(s.bytes, u8[](0xF0, 0x9F, 0x98, 0x80), "pair becomes U+1F600");
@@ -297,10 +271,7 @@ export string test_surrogate_pair_decodes_to_one_scalar() {
 
 export string test_unpaired_surrogate_becomes_replacement() {
   T t = T.create();
-  // "\ud83d"
-  JsonValue? v = parseBytes(u8[](
-    0x22, 0x5C, 0x75, 0x64, 0x38, 0x33, 0x64, 0x22,
-  ));
+  JsonValue? v = parseStr("\"\\ud83d\"");
   t.isTrue(v is not null, "parses");
   JsonString s = v! as! JsonString;
   t.eqBytes(s.bytes, u8[](0xEF, 0xBF, 0xBD), "lone high surrogate becomes U+FFFD");

@@ -28,18 +28,15 @@ and accept/reject decisions to whether `JSON.parse` throws.
 
 The API takes and returns `u8[]` (UTF-8), not wac's `string`.
 
-That is forced rather than chosen. `string` is immutable and has exactly three
-operations — `len`, `slice`, `indexOf`. A number can reach text through a literal
-digit table, because indexing a string yields a one-character string (this is how
-`wactest`'s `itoa` works), but that only reaches characters you can write down.
-There is no way to turn an arbitrary codepoint into a character, so `\uXXXX`
-unescaping over the whole of Unicode is not expressible through `string`, and a
-conformant parser has to work in bytes.
+`string` is immutable and has `len`, `slice`, `indexOf` and `fromCodepoint`.
+`fromCodepoint` can now produce any single character, so the `\uXXXX` decoding
+that was once inexpressible is expressible — but only one character at a time,
+joined with `+`, which on an immutable string is quadratic. Bytes stay the right
+representation until there is a `string.fromBytes`.
 
-It turned out to be the better representation anyway: scanning becomes a `switch`
-over `i32` instead of a chain of one-character string comparisons, and output
-accumulates into a growable buffer rather than through `+`, which on an immutable
-string is quadratic.
+They are also the better representation for a scanner: it becomes a `switch` over
+`i32` — spelled with character literals, so `case '{':` rather than `case 0x7B:` —
+and output accumulates in a growable buffer instead of through `+`.
 
 ## Numbers
 
@@ -112,34 +109,30 @@ for a second call to collect.
 
 ## What this exercised in the language
 
-Full detail, ranked, in `~/notes/living/wac/language-friction-log.md`. The short
-version, in order of how much each cost:
+Full detail, ranked, in `~/notes/living/wac/language-friction-log.md`. In order of
+how much each cost:
 
-1. **No bytes → string, and no codepoint → character.** Blocking. Decided the
-   whole architecture.
+1. **No bytes → string.** Still the blocking one, and the reason this package is
+   byte-oriented. `string.fromCodepoint` (added because of this package) covers a
+   single character; assembling a string from bytes is still quadratic.
 2. **No float → string.** Blocking for any serializer over computed values.
-3. **No generics.** `JsonArray.items`, `JsonObject.members` and `ByteBuf.data`
-   are the same double-when-full logic three times, differing only in element
-   type. `gzip`'s `Buf` is a fourth.
+3. **No generics.** `JsonArray.items`, `JsonObject.members` and `ByteBuf.data` are
+   the same double-when-full logic three times, differing only in element type.
+   `gzip`'s `Buf` is a fourth.
 4. **No module-level constants.** Kind tags are zero-argument functions; the
    powers-of-ten table is a `switch` returning literals.
 5. **No sum types or pattern matching**, and no virtual dispatch, so a tag plus
    `switch` plus a downcast is the shape of every fold over the tree.
-6. **No `i64` literals.** `i64 x = 0;` is a type error; every small `i64` constant
-   needs `as i64`.
-7. **Unchecked `i64` overflow caused a real bug** — 19 digits can exceed range,
+6. **Unchecked integer overflow caused a real bug** — 19 digits can exceed `i64`,
    it wraps silently, and only the randomized number sweep caught it.
 
-Three compiler bugs fell out, none worked around beyond avoiding the syntax:
+Four compiler defects came out of writing this, all since fixed upstream:
 
-- **`\\` in a string literal loses the following character.** Escapes are decoded
-  twice: `wacLex.ts` turns `\\` into a real backslash, then `encodeString` in
-  `wacEmitFunc.ts` treats that backslash as the start of an escape and consumes
-  the next character with it. `"\\"` alone survives because nothing follows it,
-  which is why the spec test misses it. Blocks writing a backslash in any literal
-  that continues afterwards.
-- **`export const struct` does not parse.** `const struct` parses and
-  `export struct` parses, but the combination falls through the top-level
-  dispatch.
-- **Char literals** are in the grammar as `CHAR_LITERAL`, and `structs.md` lists
-  `'\0'` among primitive defaults, but the lexer rejects them.
+- **`\\` in a string literal lost the character after it** — escapes were decoded
+  twice, once by the lexer and again by the emitter. It is why this package's wac
+  tests used to spell three inputs out as byte arrays; they read normally now.
+- **`export const struct` did not parse.**
+- **Character literals** were in the grammar but rejected by the lexer. Now
+  implemented, and this package's scanner is written with them.
+- **A bare `string` in an expression parsed as the literal `"string"`**, found
+  while adding `string.fromCodepoint`.

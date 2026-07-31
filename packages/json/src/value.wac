@@ -7,10 +7,12 @@
 // plus `switch` is how you branch over a sum type. Testing `is JsonNumber` in
 // an if-chain would work too, but a tag maps to `br_table` and reads better.
 //
-// Strings are held as UTF-8 `u8[]`, not the built-in `string`. `string` has
-// only len/slice/indexOf and no way to build one from bytes or a codepoint, so
-// `\uXXXX` unescaping is impossible through it. Bytes also make the scanner a
-// `switch` over i32 rather than a chain of one-character string compares.
+// Strings are held as UTF-8 `u8[]`, not the built-in `string`. `string` has only
+// len/slice/indexOf, and while `string.fromCodepoint` can now produce any single
+// character, assembling a whole string means `+` per character — quadratic on an
+// immutable string. Bytes stay the right representation until there is a
+// `string.fromBytes`, and they also make the scanner a `switch` over i32 rather
+// than a chain of one-character string compares.
 
 export struct JsonValue {
   const i32 kind;
