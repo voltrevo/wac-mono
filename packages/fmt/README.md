@@ -1,7 +1,11 @@
 # fmt
 
-`f64` → decimal string: the shortest digit sequence that reads back as the same
-double, formatted exactly as JavaScript's `Number::toString`.
+Decimal and `f64`, converted exactly in both directions.
+
+- `ftoa(x)` — the shortest digit sequence that reads back as the same double,
+  formatted exactly as JavaScript's `Number::toString`.
+- `atofSpan(src, start, end)` — the double nearest a decimal, ties to even.
+  Correctly rounded for every input.
 
 ```wac
 import { ftoa, ftoaBytes, writeF64 } from "../../fmt/src/ftoa.wac";
@@ -68,8 +72,34 @@ The bignum has its own tests against the host's `BigInt` (`test/bigint.test.ts`)
 because a wrong carry surfaces as one extra digit several layers up, where the
 cause is invisible.
 
+## Parsing
+
+`atofSpan` is the mirror of `ftoa` and shares its arithmetic. A fast path handles
+short decimals — up to 15 digits with |exponent| ≤ 22 fits an f64's significand
+exactly and scales by an exactly-representable power of ten, so one operation is
+correctly rounded. Everything else goes to the exact path.
+
+The exact path **bisects the bit pattern**. For positive doubles the bits are
+monotonic in the value, so the largest double not exceeding the decimal is found in
+63 exact comparisons, and a comparison against the midpoint picks between it and
+its successor. No division: comparisons cross-multiply, scaling one side by a power
+of ten and the other by a power of two.
+
+An earlier version estimated the answer and stepped by ulps. It failed silently at
+both ends of the range, where the estimate was thousands of ulps out — bisection
+has no estimate to be wrong.
+
+Digits past 800 are dropped with a sticky flag. They cannot change which double is
+nearest; they can only break an exact midpoint tie, which the flag resolves. 800 is
+beyond the ~767 digits an exact midpoint can have.
+
+Verified the same way: bit-exact against `Number(s)`, over the boundary cases,
+random decimals across the whole exponent range, and *constructed exact midpoints*
+— decimals sitting precisely between two doubles, where always-round-up and
+always-truncate both fail.
+
 ## Not here yet
 
 - `itoa`. `wactest` has one; it belongs here, but moving it is that package's call.
-- `f32`. The algorithm is the same with different constants.
+- `f32`, in either direction. The algorithms are the same with different constants.
 - Fixed-precision output (`toFixed`-style). Only shortest is implemented.

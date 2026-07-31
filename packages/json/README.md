@@ -14,7 +14,7 @@ deno run --allow-read tools/check.ts packages/json/src/json.wac
 | Parser: objects, arrays, strings, numbers, literals | done |
 | String escapes, including `\uXXXX` and surrogate pairs | done |
 | Rejection of malformed input | agrees with `JSON.parse` on 5744/5744 mutations |
-| Decimal → f64 | exact on the fast path, ≤2 ulp otherwise |
+| Decimal → f64 | correctly rounded, bit-exact against `Number(s)` |
 | Serializer | done, numbers emitted verbatim |
 | Object key lookup | O(n) linear scan |
 | Serializing a hand-built tree | done, via `packages/fmt` |
@@ -46,24 +46,20 @@ converting per member would turn an O(n) lookup into an O(n)-allocation lookup.
 
 ## Numbers
 
-Significant digits accumulate into an `i64` with a decimal exponent, then a
-single scaling step produces the `f64`. This is exact when the mantissa is under
-2^53 and the power of ten is within the exactly-representable range (|e| ≤ 22).
-Beyond that, the power is decomposed as `10^(22k + r)` so the result costs three
-roundings rather than one per factor of `1e22`.
+Conversion is **correctly rounded**: the double nearest the decimal, ties to even,
+for every input. `packages/fmt`'s `atofSpan` does it — a provably exact fast path
+for short decimals, and exact bignum arithmetic for everything else, with the
+double found by bisecting the bit pattern rather than estimated.
 
-Measured against the host over 3000 random decimals spanning the full exponent
-range:
+It was not always. Accumulating digits into an `i64` and scaling in `f64` was exact
+for 72% of random decimals and up to 2 ulp out otherwise; the table below is what
+that used to look like and is kept only to say what changed.
 
-| error | share |
+| error | share, before |
 |---|---|
 | exact | 72.0% |
 | 1 ulp | 27.6% |
 | 2 ulp | 0.4% |
-
-Being exact on every input needs 128-bit intermediates (Eisel-Lemire) or a
-big-decimal fallback. wac's widest integer is `i64`, so neither is available
-without implementing wide arithmetic first.
 
 The serializer writes a parsed number from the source span retained on
 `JsonNumber`, so a round-trip is byte-exact: `1e2` comes back as `1e2`, `1.50`
@@ -71,8 +67,7 @@ keeps its trailing zero, and `-0` keeps its sign — none of which survives a tr
 through the shortest decimal.
 
 A number with no span — `JsonNumber.ofValue(x)`, a tree built by hand — is
-formatted by `packages/fmt` to its shortest round-tripping form instead. That was
-impossible until `fmt` existed, and is why it does.
+formatted by `packages/fmt` to its shortest round-tripping form instead.
 
 ## Deliberate divergences from `JSON.parse`
 
@@ -136,8 +131,10 @@ how much each cost:
    powers-of-ten table is a `switch` returning literals.
 5. **No sum types or pattern matching**, and no virtual dispatch, so a tag plus
    `switch` plus a downcast is the shape of every fold over the tree.
-6. **Unchecked integer overflow caused a real bug** — 19 digits can exceed `i64`,
-   it wraps silently, and only the randomized number sweep caught it.
+6. **Unchecked integer overflow caused a real bug** — 19 digits could exceed
+   `i64`, it wraps silently, and only the randomized number sweep caught it. The
+   code that overflowed is gone now: conversion moved to `packages/fmt`, which
+   never accumulates into a fixed-width integer.
 
 Four compiler defects came out of writing this, all since fixed upstream:
 

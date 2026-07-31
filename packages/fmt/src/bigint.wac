@@ -26,6 +26,15 @@ export struct Big {
 
   Big zero() { return Big(u32[LIMBS()](), 0); }
 
+  /**
+   * A bignum with room for `limbs` limbs.
+   *
+   * Decimal parsing needs far more headroom than formatting: comparing an
+   * 800-digit decimal against a double's exact value reaches ~3900 bits, where
+   * shortest-formatting never passes ~1030.
+   */
+  Big withLimbs(i32 limbs) { return Big(u32[limbs](), 0); }
+
   Big fromU64(u64 v) {
     Big b = Big.zero();
     b.limbs[0] = v as@ u32;
@@ -100,6 +109,21 @@ export struct Big {
     }
   }
 
+  /** this = this * m + add, with both small. Used to build a digit string. */
+  void mulAddSmall(this, u32 m, u32 add) {
+    u64 carry = add as u64;
+    for (i32 i = 0; i < this.n; i++) {
+      u64 t = (this.limbs[i] as u64) * (m as u64) + carry;
+      this.limbs[i] = t as@ u32;
+      carry = t >> 32;
+    }
+    while (carry != 0) {
+      this.limbs[this.n] = carry as@ u32;
+      carry = carry >> 32;
+      this.n++;
+    }
+  }
+
   /** -1, 0 or 1 for this < o, this == o, this > o. */
   i32 cmp(const this, Big o) {
     if (this.n != o.n) { return this.n > o.n ? 1 : -1; }
@@ -148,7 +172,7 @@ export struct Big {
       top = m + 1;
     }
     // Anything the previous contents left above the new top would corrupt cmp.
-    for (i32 i = top; i < LIMBS(); i++) { this.limbs[i] = 0; }
+    for (i32 i = top; i < this.limbs.len(); i++) { this.limbs[i] = 0; }
     this.n = top;
     this.trim();
   }

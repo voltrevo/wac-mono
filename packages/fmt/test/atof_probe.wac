@@ -1,0 +1,5 @@
+// Test fixture: exposes atofSpan over a byte span so the host can compare against
+// its own Number().
+import { atofSpan } from "../src/atof.wac";
+
+export f64 parse(u8[] src) { return atofSpan(src, 0, src.len()); }

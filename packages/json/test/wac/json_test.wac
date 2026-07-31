@@ -15,7 +15,7 @@ import { T } from "../../../wactest/src/assert.wac";
 import { JsonValue, JsonNumber, JsonString, JsonArray, JsonObject, bytesEqual } from "../../src/value.wac";
 import { writeValue } from "../../src/stringify.wac";
 import { Buf } from "../../../bytes/src/buf.wac";
-import { Parser, parseDocument, hexDigit, scaleByPow10, ERR_NONE, ERR_TRAILING, ERR_CONTROL } from "../../src/parse.wac";
+import { Parser, parseDocument, hexDigit, ERR_NONE, ERR_TRAILING, ERR_CONTROL } from "../../src/parse.wac";
 
 JsonValue? parseStr(string src) {
   // `string.toBytes()` replaced a 40-line ASCII lookup table here. The table
@@ -49,22 +49,6 @@ export string test_bytes_equal() {
   t.isFalse(bytesEqual(u8[](1, 2), u8[](1, 2, 3)), "prefix is not equal");
   t.isFalse(bytesEqual(u8[](1, 2, 3), u8[](1, 2, 4)), "last byte differs");
   t.isFalse(bytesEqual(u8[](1), u8[0]()), "one empty");
-  return t.report();
-}
-
-export string test_scale_by_pow10() {
-  T t = T.create();
-  // eqF64 names the offending value in the message, which was impossible before
-  // packages/fmt; these used to compare through isTrue and report nothing useful.
-  t.eqF64(scaleByPow10(1.0, 0), 1.0, "10^0 is identity");
-  t.eqF64(scaleByPow10(1.5, 2), 150.0, "1.5e2");
-  t.eqF64(scaleByPow10(15.0, -1), 1.5, "15e-1");
-  t.eqF64(scaleByPow10(1.0, 22), 1.0e22, "the largest exact power");
-  t.eqF64(scaleByPow10(1.0, 23), 1.0e23, "one past the exact table");
-  t.eqF64(scaleByPow10(0.0, 999), 0.0, "zero scales to zero, not NaN");
-  t.isTrue(scaleByPow10(-0.0, 999) == 0.0, "negative zero likewise");
-  t.isTrue(scaleByPow10(1.0, 400) > 1.0e300, "overflow goes to infinity");
-  t.isTrue(scaleByPow10(1.0, -400) == 0.0, "underflow goes to zero");
   return t.report();
 }
 
