@@ -1,0 +1,147 @@
+// Base32, from RFC 4648 §6, and base32hex from §7.
+//
+// Five bytes become eight digits, so a short final group can be 1, 2, 3 or 4 bytes and pads to
+// 6, 4, 3 or 1 `=` respectively. Those numbers are not a pattern anyone remembers, so they are a
+// table rather than arithmetic: `PAD_FOR` and `DIGITS_FOR`, indexed by the number of leftover
+// bytes.
+//
+// There is no platform base32 to compare against, so this is judged against the test vectors in
+// RFC 4648 §10 — which are normative, and a stronger oracle than an implementation would be —
+// plus a round-trip over random input and a strictness suite mirroring base64's.
+
+import { Buf } from "../../bytes/src/buf.wac";
+
+/** `A-Z2-7`, from §6. */
+export i32 ALPHABET_STANDARD() { return 0; }
+/** `0-9A-V`, from §7 — extended hex, which sorts in the same order as the data. */
+export i32 ALPHABET_HEX() { return 1; }
+
+i32 encodeDigit(i32 v, i32 alphabet) {
+  if (alphabet == ALPHABET_HEX()) {
+    return v < 10 ? 48 + v : 65 + (v - 10);
+  }
+  return v < 26 ? 65 + v : 50 + (v - 26);
+}
+
+export i32 digitValue(i32 c, i32 alphabet) {
+  if (alphabet == ALPHABET_HEX()) {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'A' && c <= 'V') { return c - 'A' + 10; }
+    if (c >= 'a' && c <= 'v') { return c - 'a' + 10; }
+    return -1;
+  }
+  if (c >= 'A' && c <= 'Z') { return c - 'A'; }
+  if (c >= 'a' && c <= 'z') { return c - 'a'; }
+  if (c >= '2' && c <= '7') { return c - '2' + 26; }
+  return -1;
+}
+
+/** Digits produced by a final group of 0..4 leftover bytes. */
+i32 digitsFor(i32 leftover) {
+  if (leftover == 1) { return 2; }
+  if (leftover == 2) { return 4; }
+  if (leftover == 3) { return 5; }
+  if (leftover == 4) { return 7; }
+  return 0;
+}
+
+/** `=` needed to bring a short group to eight characters. Only called for 1..4 leftover bytes. */
+i32 padFor(i32 leftover) { return 8 - digitsFor(leftover); }
+
+export u8[] encode(u8[] data, i32 alphabet, bool pad) {
+  Buf out = Buf.create();
+  out.reserveFor((data.len() + 4) / 5 * 8);
+  i32 i = 0;
+  // Whole groups of five bytes, taken as one 40-bit number. u64 rather than two i32 halves
+  // because the shifts stay readable and there is no hot path here.
+  //
+  // The `as i64 as@ u64` on every byte is not decoration: i32 to u64 has no direct conversion,
+  // since sign- and zero-extension are different answers and the language will not pick one.
+  while (i + 4 < data.len()) {
+    u64 n = 0;
+    for (i32 k = 0; k < 5; k++) { n = (n << 8) | ((data[i + k] as i64) as@ u64); }
+    for (i32 k = 7; k >= 0; k--) {
+      out.push(encodeDigit(((n >> (((k * 5) as i64) as@ u64)) & 31) as@ i32, alphabet));
+    }
+    i = i + 5;
+  }
+  i32 left = data.len() - i;
+  if (left > 0) {
+    u64 n = 0;
+    for (i32 k = 0; k < 5; k++) {
+      n = (n << 8) | (((k < left ? data[i + k] : 0) as i64) as@ u64);
+    }
+    i32 digits = digitsFor(left);
+    for (i32 k = 0; k < digits; k++) {
+      out.push(encodeDigit(((n >> ((((7 - k) * 5) as i64) as@ u64)) & 31) as@ i32, alphabet));
+    }
+    if (pad) {
+      for (i32 k = 0; k < padFor(left); k++) { out.push('='); }
+    }
+  }
+  return out.take();
+}
+
+/**
+ * Decode, or null. Strict on the same four counts as base64.
+ *
+ * The digit counts that can end a group are 2, 4, 5 and 7. Anything else — 1, 3, 6 — is not a
+ * short group, it is a corrupt one, and is rejected rather than rounded.
+ */
+export u8[]? decode(u8[] text, i32 alphabet) {
+  i32 n = text.len();
+  i32 pads = 0;
+  while (n > 0 && text[n - 1] == '=') {
+    n--;
+    pads++;
+    if (pads > 6) { return null; }
+  }
+  if (pads > 0 && (n + pads) % 8 != 0) { return null; }
+
+  i32 rem = n % 8;
+  i32 leftover = -1;
+  if (rem == 0) { leftover = 0; }
+  else if (rem == 2) { leftover = 1; }
+  else if (rem == 4) { leftover = 2; }
+  else if (rem == 5) { leftover = 3; }
+  else if (rem == 7) { leftover = 4; }
+  else { return null; }
+  // As in base64: the length test above already forces the pad count, since the digit count fixes
+  // it. An explicit check here was unreachable and is gone.
+
+  u8[] out = u8[n / 8 * 5 + leftover]();
+  i32 at = 0;
+  i32 i = 0;
+  while (i + 7 < n) {
+    u64 acc = 0;
+    for (i32 k = 0; k < 8; k++) {
+      i32 v = digitValue(text[i + k], alphabet);
+      if (v < 0) { return null; }
+      acc = (acc << 5) | ((v as i64) as@ u64);
+    }
+    for (i32 k = 4; k >= 0; k--) {
+      out[at] = ((acc >> (((k * 8) as i64) as@ u64)) & 255) as@ i32;
+      at++;
+    }
+    i = i + 8;
+  }
+  if (leftover > 0) {
+    u64 acc = 0;
+    i32 digits = digitsFor(leftover);
+    for (i32 k = 0; k < digits; k++) {
+      i32 v = digitValue(text[i + k], alphabet);
+      if (v < 0) { return null; }
+      acc = (acc << 5) | ((v as i64) as@ u64);
+    }
+    // The group carries digits*5 bits and only leftover*8 of them are data; the rest must be
+    // zero, or the byte string would have two encodings.
+    i32 spare = digits * 5 - leftover * 8;
+    if ((acc & (((1 as i64 as@ u64) << ((spare as i64) as@ u64)) - 1)) != 0) { return null; }
+    acc = acc >> ((spare as i64) as@ u64);
+    for (i32 k = leftover - 1; k >= 0; k--) {
+      out[at + k] = (acc & 255) as@ i32;
+      acc = acc >> 8;
+    }
+  }
+  return out;
+}

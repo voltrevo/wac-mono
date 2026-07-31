@@ -9,6 +9,7 @@
     "coverage": "deno run -A tools/coverage.ts",
     "coverage:bignum": "deno run -A packages/bignum/cov.ts",
     "coverage:bytes": "deno run -A packages/bytes/cov.ts",
+    "coverage:codec": "deno run -A packages/codec/cov.ts",
     "coverage:crypto": "deno run -A packages/crypto/cov.ts",
     "coverage:fmt": "deno run -A packages/fmt/cov.ts",
     "coverage:gzip": "deno run -A packages/gzip/cov.ts",

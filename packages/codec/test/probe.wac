@@ -1,0 +1,42 @@
+// Host-facing entry points.
+//
+// A decode returns `u8[]?`, and null cannot cross the bindgen boundary as itself, so a rejection
+// comes back as a zero-length array and `accepts*` answers the question separately. That is
+// ambiguous for one input — the empty string, which every decoder accepts as the empty output —
+// so the tests check acceptance and contents as two questions rather than inferring one from the
+// other.
+
+import { encode as hexEncode, encodeUpper as hexEncodeUpper, decode as hexDecode }
+  from "../src/hex.wac";
+import { encode as b64Encode, decode as b64Decode, ALPHABET_STANDARD, ALPHABET_URL }
+  from "../src/base64.wac";
+import { encode as b32Encode, decode as b32Decode, ALPHABET_STANDARD as B32_STANDARD,
+         ALPHABET_HEX as B32_HEX } from "../src/base32.wac";
+
+export u8[] hexEnc(u8[] data) { return hexEncode(data); }
+export u8[] hexEncUpper(u8[] data) { return hexEncodeUpper(data); }
+export u8[] hexDec(u8[] text) {
+  u8[]? r = hexDecode(text);
+  return r is null ? u8[0]() : r!;
+}
+export bool hexAccepts(u8[] text) { return !(hexDecode(text) is null); }
+
+export u8[] b64Enc(u8[] data, bool url, bool pad) {
+  return b64Encode(data, url ? ALPHABET_URL() : ALPHABET_STANDARD(), pad);
+}
+export u8[] b64Dec(u8[] text) {
+  u8[]? r = b64Decode(text);
+  return r is null ? u8[0]() : r!;
+}
+export bool b64Accepts(u8[] text) { return !(b64Decode(text) is null); }
+
+export u8[] b32Enc(u8[] data, bool hex, bool pad) {
+  return b32Encode(data, hex ? B32_HEX() : B32_STANDARD(), pad);
+}
+export u8[] b32Dec(u8[] text, bool hex) {
+  u8[]? r = b32Decode(text, hex ? B32_HEX() : B32_STANDARD());
+  return r is null ? u8[0]() : r!;
+}
+export bool b32Accepts(u8[] text, bool hex) {
+  return !(b32Decode(text, hex ? B32_HEX() : B32_STANDARD()) is null);
+}
