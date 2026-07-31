@@ -11,6 +11,7 @@
     "coverage:bytes": "deno run -A packages/bytes/cov.ts",
     "coverage:crypto": "deno run -A packages/crypto/cov.ts",
     "coverage:fmt": "deno run -A packages/fmt/cov.ts",
+    "coverage:gzip": "deno run -A packages/gzip/cov.ts",
     "coverage:json": "deno run -A packages/json/cov.ts",
     "coverage:std": "deno run -A packages/std/cov.ts",
     "mutate": "deno run -A tools/mutate.ts",

@@ -182,44 +182,52 @@ bytes.
 ### Branch coverage
 
 ```sh
-deno run -A tools/coverage.ts [--verbose]
+deno task coverage:gzip [--verbose]   # this package, including the hand-built streams
+deno task coverage [--verbose]        # every package, from its wac-native tests
 ```
 
 wac gained opt-in branch-coverage instrumentation
-(`wacCompile(files, entry, { coverage: true })`), so the wac sources now have a
-real number rather than only mutation testing as a proxy. Current state:
+(`wacCompile(files, entry, { coverage: true })`), so the wac sources have a real number
+rather than only mutation testing as a proxy. Current state:
 
 | file | points | covered | % |
 |---|---:|---:|---:|
 | bitwriter.wac | 8 | 8 | 100.0 |
-| buf.wac | 14 | 13 | 92.9 |
-| crc32.wac | 4 | 4 | 100.0 |
-| deflate.wac | 80 | 80 | 100.0 |
-| gzip.wac | 15 | 15 | 100.0 |
+| crc32.wac | 16 | 16 | 100.0 |
+| deflate.wac | 82 | 82 | 100.0 |
+| gzip.wac | 21 | 21 | 100.0 |
 | huffman.wac | 34 | 34 | 100.0 |
-| inflate.wac | 78 | 62 | 79.5 |
+| inflate.wac | 92 | 91 | 98.9 |
 | tables.wac | 7 | 7 | 100.0 |
-| **all** | **240** | **223** | **92.9** |
+| **all** | **260** | **259** | **99.6** |
 
-The remaining gap is almost entirely inflate's validation paths — the `trap`
-branches for malformed input. They are reached only by streams built on purpose,
-which is the same lesson mutation testing taught. `buf.wac`'s one uncovered point
-is `get`'s bounds check, which is unreachable in practice because inflate
-validates distances before calling it.
+Every reachable point is covered. The single exception is inflate's `di >= 30` check,
+which cannot be reached: both distance decoders are built with at most 30 symbols, so a
+stream using distance code 30 or 31 traps inside `Decoder.decode` for want of a matching
+code instead. `cov.ts` lists it explicitly with that reason and fails if a point outside
+that list goes uncovered — or if a listed one turns out to be reachable after all.
+
+Getting there was mostly inflate's validation paths, and they needed streams built on
+purpose. Random corruption does not reach them: a flipped bit in a Huffman-coded stream
+breaks the symbol decode long before a code-length run overruns its table, so the stream
+dies first. `test/streams.ts` assembles them bit by bit, and `cov.ts` drives the same
+ones the tests assert on so the report describes a workload that is actually checked.
 
 Two caveats on the number:
 
-- It measures what `tools/coverage.ts` exercises, which approximates the test
-  suite rather than being it. Collecting counters during the actual test run
-  would be more honest and is not done yet — for instance the FNAME/FCOMMENT
-  header-skip loops are covered by `inflate.test.ts` but not by this tool.
-- An `if`/`else if` chain with no final `else` has no counter for falling past
-  every arm, since points count arms entered.
+- It measures what `cov.ts` exercises, which mirrors the shapes the test suite drives
+  rather than being the suite. `deno task coverage` gets closer for packages whose tests
+  are wac-native, since there the tests *are* the exercise; gzip's are host-side, so it
+  does not. Until counters are collected during the real test run, a branch reached with
+  no assertion behind it is a gap no number here can show — which is why closing the last
+  sixteen meant auditing each against the tests, and finding four already had them.
+- An `if`/`else if` chain with no final `else` has no counter for falling past every
+  arm, since points count arms entered.
 
 ### Mutation testing
 
 ```sh
-deno run -A tools/mutate.ts
+deno task mutate
 ```
 
 `deno coverage` measures the TypeScript harness, not the compiled wasm, so there
