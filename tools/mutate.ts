@@ -1,357 +1,313 @@
 // Mutation testing for the wac sources.
 //
-// `deno coverage` measures the TypeScript harness, not the compiled wasm, so
-// there is no branch-coverage number for the wac code itself. Mutation testing
-// answers the question coverage is a proxy for, and answers it more directly:
-// break the implementation on purpose, and see whether the tests notice.
+// Coverage says a line ran. Mutation testing says something stronger and much harder to
+// fake: break the line on purpose, and see whether anything notices. A surviving mutant
+// names a behaviour nothing checks — which is the failure coverage structurally cannot
+// see, because a test can execute a line thoroughly and assert nothing about it.
 //
-// Each mutation is a single deliberate defect — a flipped comparison, an
-// off-by-one on a boundary, a reversed bit order, a removed validity check. For
-// each one the project is copied to a temp directory, the mutation applied, and
-// the suite run there. A mutation that is KILLED (tests fail) is evidence the
-// tests cover that behaviour. A mutation that SURVIVES names a behaviour nothing
-// checks.
+//   deno task mutate                     # curated mutations only, as before
+//   deno task mutate --operators         # ...plus guard and extreme mutants
+//   deno task mutate --operators=all     # ...plus relational and literal too (slow)
+//   deno task mutate --diff              # only files changed against origin/master
+//   deno task mutate crc                 # only mutants whose name matches
+//   deno task mutate --package gzip      # only mutants in one package
+//   deno task mutate --operators --dry-run   # what would run, without running it
 //
-// Some survivors are legitimate: mutations that only affect compression ratio,
-// not correctness, are marked `ratioOnly` and reported separately, because the
-// suite deliberately allows slack there.
+// Three things make this affordable enough to run over more than one package.
 //
-//   deno run -A tools/mutate.ts            # all mutations
-//   deno run -A tools/mutate.ts crc        # only those whose name matches
+// **Trivial Compiler Equivalence.** Every mutant is compiled before any test runs. If
+// its wasm is byte-identical to the original's, the mutation provably changed nothing
+// and no test could ever kill it — it is discarded, not counted. If its wasm matches
+// another mutant's, the two are the same experiment and only one is run. This is
+// Papadakis et al.'s TCE, and it is unusually cheap here because the compiler is an
+// in-process function returning bytes: no subprocess, no temp directory, milliseconds.
+//
+// **Scoped test runs.** A mutant is tested against the packages that actually depend on
+// the file it edits, computed from the real import graph rather than guessed from the
+// path. Mutating `bytes` still runs gzip's and json's tests, because they import it;
+// mutating `crypto` runs only crypto's.
+//
+// **Stage once.** The project is copied to a scratch directory a single time, then each
+// mutant patches and restores the files it touches, rather than re-copying the tree.
+//
+// Outcomes are three, not two. A mutant that fails to compile is INVALID, not killed:
+// it tested nothing about the test suite, and counting it as a kill inflates the score.
+// That distinction barely mattered for a hand-written list where every mutation was
+// known to build; it is the difference between a meaningful number and a meaningless
+// one as soon as mutants are generated mechanically.
 
-type Edit = { file: string; find: string; replace: string };
+import { wacCompile } from "wac/wacCompile.ts";
+import { wacFiles } from "../harness/wacFiles.ts";
+import { CURATED } from "./mutate/curated.ts";
+import { ALL_OPERATORS, generate, type OperatorName } from "./mutate/operators.ts";
+import { applyEdits, packagesOf, type Curated, type Edit, type Mutant } from "./mutate/types.ts";
 
-type Mutation = {
-  name: string;
-  /** One or more simultaneous edits. A single edit may use file/find/replace. */
-  file?: string;
-  find?: string;
-  replace?: string;
-  edits?: Edit[];
-  /** True if this changes only how well it compresses, never correctness. */
-  ratioOnly?: boolean;
-  /** A no-op control: must survive, or the harness itself is broken. */
-  mustSurvive?: boolean;
-  /**
-   * Why this mutation is provably unobservable, if it is. Set only with evidence
-   * — an equivalent mutant is indistinguishable from a coverage gap until you
-   * show which one it is.
-   */
-  equivalent?: string;
-};
+const args = Deno.args;
+/**
+ * `--operators` with an optional comma list; bare means the default set.
+ *
+ * The default is deliberately not everything. Generating every operator over the repo
+ * produces 6,281 mutants — roughly eight hours even with scoped runs — and most of that
+ * is `literal` (3,856) and `relational` (2,029), which are high-volume and low average
+ * signal: many are killed by the first test that touches the line, and many more are
+ * duplicates of each other. `guard` (46) and `extreme` (350) are the opposite: a removed
+ * validity check and a gutted function are each worth reading when they survive. Ask for
+ * the rest explicitly, ideally with --diff or --package.
+ */
+const opArg = args.find((a) => a.startsWith("--operators"));
+const DEFAULT_OPERATORS: OperatorName[] = ["guard", "extreme"];
+const operators: OperatorName[] = opArg === undefined
+  ? []
+  : !opArg.includes("=")
+  ? DEFAULT_OPERATORS
+  : opArg.split("=")[1] === "all"
+  ? ALL_OPERATORS
+  : opArg.split("=")[1].split(",").map((o) => o.trim()) as OperatorName[];
+const useOperators = operators.length > 0;
+const diffOnly = args.includes("--diff");
+/** Generate and triage, but run nothing — for seeing what a run would cost. */
+const dryRun = args.includes("--dry-run");
+const pkgArg = args.includes("--package") ? args[args.indexOf("--package") + 1] : undefined;
+const filter = args.find((a) => !a.startsWith("--") && a !== pkgArg);
+/** A mutant that hangs the suite is a real outcome, not a reason to wait forever. */
+const TEST_TIMEOUT_MS = 180_000;
 
-function editsOf(m: Mutation): Edit[] {
-  if (m.edits) return m.edits;
-  return [{ file: m.file!, find: m.find!, replace: m.replace! }];
+// ── The source universe ───────────────────────────────────────────────────────
+
+/** Every `.wac` file under `packages/`, by path. */
+async function allWacFiles(): Promise<string[]> {
+  const out: string[] = [];
+  const walk = async (dir: string): Promise<void> => {
+    for await (const e of Deno.readDir(dir)) {
+      const path = `${dir}/${e.name}`;
+      if (e.isDirectory) await walk(path);
+      else if (e.isFile && e.name.endsWith(".wac")) out.push(path);
+    }
+  };
+  await walk("packages");
+  return out.sort();
 }
 
-const MUTATIONS: Mutation[] = [
-  // ── Control ─────────────────────────────────────────────────────────────────
-  // A no-op edit that must SURVIVE. If a staged project failed to build for some
-  // unrelated reason, every mutation would report as killed and the whole run
-  // would look perfect while proving nothing. This is the check against that:
-  // if the control is ever killed, disbelieve the rest of the results.
-  {
-    name: "control/comment-only-noop",
-    file: "packages/gzip/src/crc32.wac",
-    find: "// CRC-32 as gzip uses it",
-    replace: "// CRC-32 as gzip uses it (control mutation: no behaviour change)",
-    mustSurvive: true,
-  },
-
-  // ── CRC-32 ──────────────────────────────────────────────────────────────────
-  {
-    name: "crc32/polynomial",
-    file: "packages/gzip/src/crc32.wac",
-    find: "crc ^= 0xEDB88320;",
-    replace: "crc ^= 0xEDB88321;",
-  },
-  {
-    name: "crc32/initial-value",
-    file: "packages/gzip/src/crc32.wac",
-    find: "i32 crc = 0xFFFFFFFF;",
-    replace: "i32 crc = 0;",
-  },
-  {
-    name: "crc32/final-inversion",
-    file: "packages/gzip/src/crc32.wac",
-    find: "return crc ^ 0xFFFFFFFF;",
-    replace: "return crc;",
-  },
-  {
-    name: "crc32/shift-distance",
-    file: "packages/gzip/src/crc32.wac",
-    find: "crc >>>= 1;",
-    replace: "crc >>>= 2;",
-  },
-  {
-    name: "crc32/signed-shift",
-    file: "packages/gzip/src/crc32.wac",
-    find: "crc >>>= 1;",
-    replace: "crc >>= 1;",
-  },
-
-  // ── Bit order ───────────────────────────────────────────────────────────────
-  // The classic DEFLATE bug: Huffman codes go MSB-first, everything else
-  // LSB-first. Reversing either produces a plausible-looking stream.
-  {
-    name: "bitwriter/huffman-code-bit-order",
-    file: "packages/gzip/src/bitwriter.wac",
-    find: "for (i32 i = count - 1; i >= 0; i--) {",
-    replace: "for (i32 i = 0; i < count; i++) {",
-  },
-  {
-    name: "bitwriter/align-is-noop",
-    file: "packages/gzip/src/bitwriter.wac",
-    find: "if (this.bitCount > 0) {",
-    replace: "if (false) {",
-  },
-
-  // ── LZ77 boundaries ─────────────────────────────────────────────────────────
-  {
-    name: "lz77/max-match-258-to-257",
-    file: "packages/gzip/src/deflate.wac",
-    find: "i32 maxMatch()   { return 258; }",
-    replace: "i32 maxMatch()   { return 257; }",
-    ratioOnly: true,
-  },
-  {
-    name: "lz77/min-match-3-to-4",
-    file: "packages/gzip/src/deflate.wac",
-    find: "i32 minMatch()   { return 3; }",
-    replace: "i32 minMatch()   { return 4; }",
-    ratioOnly: true,
-  },
-  {
-    name: "lz77/window-off-by-one",
-    file: "packages/gzip/src/deflate.wac",
-    find: "if (dist > maxDist()) {",
-    replace: "if (dist > maxDist() + 1) {",
-  },
-  {
-    name: "lz77/chain-limit",
-    file: "packages/gzip/src/deflate.wac",
-    find: "i32 chainLimit() { return 128; }",
-    replace: "i32 chainLimit() { return 1; }",
-    ratioOnly: true,
-  },
-  {
-    name: "lz77/match-past-end",
-    file: "packages/gzip/src/deflate.wac",
-    find: "while (len < maxMatch() && pos + len < n",
-    replace: "while (len < maxMatch() && pos + len <= n",
-  },
-
-  // ── Code tables ─────────────────────────────────────────────────────────────
-  {
-    name: "tables/length-base-entry",
-    file: "packages/gzip/src/tables.wac",
-    find: "131,163,195,227,258),",
-    replace: "131,163,195,226,258),",
-  },
-  {
-    name: "tables/distance-base-entry",
-    file: "packages/gzip/src/tables.wac",
-    find: "1025,1537,2049,3073,4097,6145,8193,12289,16385,24577),",
-    replace: "1025,1537,2049,3073,4097,6145,8193,12289,16385,24578),",
-  },
-  {
-    name: "tables/length-extra-bits",
-    file: "packages/gzip/src/tables.wac",
-    find: "i32[](0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0),",
-    replace: "i32[](0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,1),",
-  },
-  {
-    name: "tables/length-index-off-by-one",
-    file: "packages/gzip/src/tables.wac",
-    find: "while (i > 0 && this.lenBase[i] > len) {",
-    replace: "while (i > 0 && this.lenBase[i] >= len) {",
-  },
-
-  // ── Huffman construction ────────────────────────────────────────────────────
-  {
-    name: "huffman/canonical-missing-shift",
-    file: "packages/gzip/src/huffman.wac",
-    find: "code = (code + blCount[bits - 1]) << 1;",
-    replace: "code = code + blCount[bits - 1];",
-  },
-  {
-    name: "huffman/length-limit-not-enforced",
-    file: "packages/gzip/src/huffman.wac",
-    find: "if (longest <= maxBits) {",
-    replace: "if (true) {",
-  },
-  {
-    name: "huffman/force-two-disabled",
-    file: "packages/gzip/src/huffman.wac",
-    find: "while (used < 2 && i < count) {",
-    replace: "while (false) {",
-  },
-  {
-    name: "huffman/tie-break-changes-tree",
-    file: "packages/gzip/src/huffman.wac",
-    find: "} else if (b < 0 || weight[i] < weight[b]) {",
-    replace: "} else if (b < 0 || weight[i] <= weight[b]) {",
-    ratioOnly: true,
-  },
-
-  // ── Dynamic block header ────────────────────────────────────────────────────
-  {
-    name: "deflate/hlit-off-by-one",
-    file: "packages/gzip/src/deflate.wac",
-    find: "w.writeBits(hlit - 257, 5); // HLIT",
-    replace: "w.writeBits(hlit - 256, 5); // HLIT",
-  },
-  {
-    name: "deflate/hdist-off-by-one",
-    file: "packages/gzip/src/deflate.wac",
-    find: "w.writeBits(hdist - 1, 5);  // HDIST",
-    replace: "w.writeBits(hdist, 5);  // HDIST",
-  },
-  {
-    name: "deflate/hclen-off-by-one",
-    file: "packages/gzip/src/deflate.wac",
-    find: "w.writeBits(hclen - 4, 4);  // HCLEN",
-    replace: "w.writeBits(hclen - 3, 4);  // HCLEN",
-  },
-  {
-    name: "deflate/cl-order-permutation",
-    file: "packages/gzip/src/deflate.wac",
-    find: "return i32[](16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);",
-    replace: "return i32[](16, 17, 18, 0, 7, 8, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15);",
-  },
-  {
-    name: "deflate/rle-repeat-base",
-    file: "packages/gzip/src/deflate.wac",
-    find: "clPush(s, 18, k - 11);",
-    replace: "clPush(s, 18, k - 10);",
-  },
-  {
-    name: "deflate/btype-bits",
-    file: "packages/gzip/src/deflate.wac",
-    find: "w.writeBits(2, 2);          // BTYPE = 10, dynamic Huffman",
-    replace: "w.writeBits(1, 2);          // BTYPE = 10, dynamic Huffman",
-  },
-
-  // ── gzip container ──────────────────────────────────────────────────────────
-  {
-    name: "gzip/isize-field",
-    file: "packages/gzip/src/gzip.wac",
-    find: "out.pushU32(data.len());",
-    replace: "out.pushU32(data.len() + 1);",
-  },
-  {
-    name: "gzip/stored-nlen",
-    file: "packages/gzip/src/gzip.wac",
-    find: "out.pushU16((~count) & 0xFFFF);",
-    replace: "out.pushU16(count & 0xFFFF);",
-  },
-  {
-    name: "gzip/little-endian-u32",
-    file: "packages/gzip/src/buf.wac",
-    find: "void pushU32(this, i32 v) {\n    this.push(v & 0xFF);",
-    replace: "void pushU32(this, i32 v) {\n    this.push((v >>> 24) & 0xFF);",
-  },
-
-  // ── Inflate ─────────────────────────────────────────────────────────────────
-  {
-    name: "inflate/crc-check-removed",
-    file: "packages/gzip/src/inflate.wac",
-    find: "if (crc32(out) != wantCrc) { trap; }",
-    replace: "if (false) { trap; }",
-  },
-  {
-    name: "inflate/isize-check-removed",
-    file: "packages/gzip/src/inflate.wac",
-    find: "if (out.len() != wantSize) { trap; }",
-    replace: "if (false) { trap; }",
-  },
-  {
-    name: "inflate/nlen-check-removed",
-    file: "packages/gzip/src/inflate.wac",
-    find: "if ((len ^ 0xFFFF) != nlen) { trap; }",
-    replace: "if (false) { trap; }",
-  },
-  {
-    name: "inflate/distance-bound",
-    file: "packages/gzip/src/inflate.wac",
-    find: "if (d > out.len) { trap; }",
-    replace: "if (d > out.len + 1) { trap; }",
-    equivalent: "Same redundancy as inflate/distance-check-removed — the one distance this " +
-      "lets through still yields a negative index, which Buf.get and wasm both reject.",
-  },
-  {
-    name: "inflate/distance-check-removed",
-    file: "packages/gzip/src/inflate.wac",
-    find: "if (d > out.len) { trap; }",
-    replace: "if (false) { trap; }",
-    equivalent: "Buf.get's own bounds check still traps on the resulting negative index. " +
-      "test/inflate_adversarial.test.ts drives this path; the rejection is just guarded twice.",
-  },
-  {
-    name: "buf/get-bounds-check-removed",
-    file: "packages/gzip/src/buf.wac",
-    find: "i32 get(const this, i32 i) {\n    if (i < 0 || i >= this.len) { trap; }",
-    replace: "i32 get(const this, i32 i) {\n    if (false) { trap; }",
-    equivalent: "inflate's distance check rejects the stream before Buf.get is reached.",
-  },
-  {
-    // The decisive experiment: remove BOTH guards at once. If this still
-    // survives, the behaviour is enforced a third time by wasm's own array
-    // bounds check, and no mutation of the wac source can ever be observable —
-    // which makes the two survivors above provably equivalent rather than
-    // evidence of a coverage gap.
-    name: "inflate+buf/all-distance-guards-removed",
-    edits: [
-      {
-        file: "packages/gzip/src/inflate.wac",
-        find: "if (d > out.len) { trap; }",
-        replace: "if (false) { trap; }",
-      },
-      {
-        file: "packages/gzip/src/buf.wac",
-        find: "i32 get(const this, i32 i) {\n    if (i < 0 || i >= this.len) { trap; }",
-        replace: "i32 get(const this, i32 i) {\n    if (false) { trap; }",
-      },
-    ],
-    equivalent: "wasm's array.get bounds check traps on a negative index regardless, " +
-      "so out-of-range distances are rejected even with both source-level guards gone.",
-  },
-  {
-    name: "inflate/magic-check-removed",
-    file: "packages/gzip/src/inflate.wac",
-    find: "if (gz[0] != 0x1F || gz[1] != 0x8B) { trap; }   // magic",
-    replace: "if (false) { trap; }   // magic",
-  },
-  {
-    name: "inflate/bit-read-order",
-    file: "packages/gzip/src/inflate.wac",
-    find: "v |= this.readBit() << i;",
-    replace: "v = (v << 1) | this.readBit();",
-  },
-  {
-    name: "inflate/decoder-first-update",
-    file: "packages/gzip/src/inflate.wac",
-    find: "first = (first + count) << 1;",
-    replace: "first = first + count;",
-  },
-];
-
-const filter = Deno.args[0];
-const selected = filter ? MUTATIONS.filter((m) => m.name.includes(filter)) : MUTATIONS;
-
-if (selected.length === 0) {
-  console.error(`no mutations match ${JSON.stringify(filter)}`);
-  Deno.exit(2);
-}
+const wacPaths = await allWacFiles();
+const sources = new Map<string, string>();
+for (const p of wacPaths) sources.set(p, await Deno.readTextFile(p));
 
 /**
- * Copy the project into a scratch directory, excluding generated output.
+ * Which packages' tests can observe a change to each file, from the import graph.
  *
- * deno.json's import map points at the wac compiler relatively ("../wac/"),
- * which does not resolve from a temp directory — so it is rewritten to an
- * absolute path. Without this the staged project fails to type-check and *every*
- * mutation reports as killed, which is why there is a control mutation.
+ * Scoping by the mutated file's own package would be wrong rather than merely coarse:
+ * `bytes` is imported by gzip, json and crypto, so a mutation there is killed by tests
+ * that live somewhere else entirely. Reading the graph is the difference between a
+ * faster run and a run that invents survivors.
+ */
+async function dependents(): Promise<Map<string, Set<string>>> {
+  const map = new Map<string, Set<string>>();
+  const entries = wacPaths.filter((p) => /\/(src|test\/wac|bench)\//.test(p));
+  for (const entry of entries) {
+    const pkg = entry.split("/")[1];
+    let included: Map<string, string>;
+    try {
+      included = await wacFiles(entry);
+    } catch {
+      continue;   // an entry that does not resolve is the suite's problem, not ours
+    }
+    for (const file of included.keys()) {
+      const set = map.get(file) ?? new Set<string>();
+      set.add(pkg);
+      map.set(file, set);
+    }
+  }
+  return map;
+}
+
+const DEPENDENTS = await dependents();
+
+// ── Locating the curated mutations ────────────────────────────────────────────
+
+type Located = { mutant: Mutant } | { name: string; problem: string };
+
+function locate(c: Curated): Located {
+  const raw = c.edits ?? [{ file: c.file!, find: c.find!, replace: c.replace!, nth: c.nth }];
+  const edits: Edit[] = [];
+  for (const r of raw) {
+    const text = sources.get(r.file);
+    if (text === undefined) return { name: c.name, problem: `no such file: ${r.file}` };
+    const hits: number[] = [];
+    for (let i = text.indexOf(r.find); i !== -1; i = text.indexOf(r.find, i + 1)) hits.push(i);
+    if (hits.length === 0) {
+      return { name: c.name, problem: `pattern not found in ${r.file}: ${JSON.stringify(r.find)}` };
+    }
+    const nth = r.nth ?? c.nth;
+    if (hits.length > 1 && nth === undefined) {
+      return {
+        name: c.name,
+        problem: `pattern occurs ${hits.length} times in ${r.file} and no \`nth\` says which — ` +
+          `${JSON.stringify(r.find)}`,
+      };
+    }
+    const at = hits[(nth ?? 1) - 1];
+    if (at === undefined) {
+      return { name: c.name, problem: `nth: ${nth} but only ${hits.length} occurrence(s) in ${r.file}` };
+    }
+    edits.push({ file: r.file, start: at, end: at + r.find.length, replacement: r.replace, was: r.find });
+  }
+  return {
+    mutant: {
+      name: c.name,
+      edits,
+      origin: "curated",
+      ratioOnly: c.ratioOnly,
+      mustSurvive: c.mustSurvive,
+      equivalent: c.equivalent,
+    },
+  };
+}
+
+// ── Build the mutant set ──────────────────────────────────────────────────────
+
+async function changedFiles(): Promise<Set<string>> {
+  const cmd = new Deno.Command("git", {
+    args: ["diff", "--name-only", "origin/master...HEAD"],
+    stdout: "piped",
+    stderr: "piped",
+  });
+  const { code, stdout } = await cmd.output();
+  if (code !== 0) return new Set();
+  return new Set(new TextDecoder().decode(stdout).split("\n").filter((l) => l.endsWith(".wac")));
+}
+
+const located = CURATED.map(locate);
+const broken = located.filter((l): l is { name: string; problem: string } => "problem" in l);
+let mutants = located.filter((l): l is { mutant: Mutant } => "mutant" in l).map((l) => l.mutant);
+
+if (useOperators) {
+  for (const [file, text] of sources) {
+    // Test fixtures and benchmarks are not the code under test.
+    if (/\/(test|bench)\//.test(file)) continue;
+    mutants.push(...generate(file, text, operators));
+  }
+}
+
+if (diffOnly) {
+  const changed = await changedFiles();
+  mutants = mutants.filter((m) => m.edits.some((e) => changed.has(e.file)));
+  console.log(`--diff: ${changed.size} changed .wac file(s)`);
+}
+if (pkgArg !== undefined) mutants = mutants.filter((m) => packagesOf(m).includes(pkgArg));
+if (filter !== undefined) mutants = mutants.filter((m) => m.name.includes(filter));
+
+if (broken.length > 0) {
+  console.log(`${broken.length} curated mutation(s) could not be located:`);
+  for (const b of broken) console.log(`  - ${b.name}: ${b.problem}`);
+  console.log();
+}
+if (mutants.length === 0) {
+  console.error("no mutants selected");
+  Deno.exit(broken.length > 0 ? 1 : 2);
+}
+
+// ── Trivial Compiler Equivalence ──────────────────────────────────────────────
+
+/**
+ * Compile one file as its own entry and hash the wasm.
+ *
+ * Every .wac file is a module and compiles standalone, which makes the file the natural
+ * unit here: a mutation changes one file, so that file's own compilation is the smallest
+ * thing whose bytes can answer "did this change anything at all".
+ */
+function wasmHash(files: Map<string, string>, entry: string): string | null {
+  const result = wacCompile(files, entry);
+  if (!result.ok) return null;
+  const bytes = result.compiled.wasm;
+  // Two 32-bit FNV-1a lanes with different offset bases, combined with the length.
+  // This only has to distinguish, not resist anything — but it does run over every byte
+  // of every mutant's wasm, so it has to be cheap. The first version used a 64-bit
+  // BigInt lane and spent most of the triage phase in bignum arithmetic.
+  let a = 0x811C9DC5, b = 0x01000193;
+  for (let i = 0; i < bytes.length; i++) {
+    a = Math.imul(a ^ bytes[i], 0x01000193);
+    b = Math.imul(b ^ bytes[i], 0x85EBCA6B);
+  }
+  return `${bytes.length}:${(a >>> 0).toString(16)}:${(b >>> 0).toString(16)}`;
+}
+
+const baseline = new Map<string, string | null>();
+for (const m of mutants) {
+  for (const e of m.edits) {
+    if (!baseline.has(e.file)) baseline.set(e.file, wasmHash(sources, e.file));
+  }
+}
+
+type Triage =
+  | { verdict: "run" }
+  | { verdict: "equivalent" }
+  | { verdict: "duplicate"; of: string }
+  | { verdict: "invalid"; detail: string };
+
+const seenHash = new Map<string, string>();   // wasm hash -> first mutant with it
+/** Whether each control mutant compiled to byte-identical wasm, which it must. */
+const controlIsNoop = new Map<string, boolean>();
+
+function triage(m: Mutant): Triage {
+  const mutated = applyEdits(sources, m);
+  const parts: string[] = [];
+  for (const file of [...new Set(m.edits.map((e) => e.file))].sort()) {
+    const h = wasmHash(mutated, file);
+    if (h === null) return { verdict: "invalid", detail: `${file} does not compile` };
+    parts.push(`${file}=${h}`);
+  }
+  const signature = parts.join("|");
+  const original = [...new Set(m.edits.map((e) => e.file))].sort()
+    .map((f) => `${f}=${baseline.get(f)}`).join("|");
+  const isNoop = signature === original;
+
+  // A control mutant is a no-op by construction, so TCE proves it equivalent — and
+  // discarding it on that basis would delete the only check that the staging and test
+  // pipeline works at all. The two facts are both worth having, so the control is
+  // always run, and whether TCE called it a no-op is recorded separately: a control
+  // whose wasm *differs* is not a control any more, and TCE failing to notice a
+  // genuine no-op would mean the equivalence detector is broken.
+  if (m.mustSurvive === true) {
+    controlIsNoop.set(m.name, isNoop);
+    return { verdict: "run" };
+  }
+
+  if (isNoop) return { verdict: "equivalent" };
+  const first = seenHash.get(signature);
+  if (first !== undefined) return { verdict: "duplicate", of: first };
+  seenHash.set(signature, m.name);
+  return { verdict: "run" };
+}
+
+console.log(`${mutants.length} mutant(s) generated; compiling for equivalence…`);
+const triaged = mutants.map((m) => ({ mutant: m, triage: triage(m) }));
+const toRun = triaged.filter((t) => t.triage.verdict === "run");
+const equivalent = triaged.filter((t) => t.triage.verdict === "equivalent");
+const duplicate = triaged.filter((t) => t.triage.verdict === "duplicate");
+const invalid = triaged.filter((t) => t.triage.verdict === "invalid");
+console.log(
+  `  ${toRun.length} to run, ${equivalent.length} provably equivalent, ` +
+  `${duplicate.length} duplicate, ${invalid.length} did not compile\n`);
+
+if (dryRun) {
+  const byPkg = new Map<string, number>();
+  for (const t of toRun) {
+    for (const p of packagesOf(t.mutant)) byPkg.set(p, (byPkg.get(p) ?? 0) + 1);
+  }
+  console.log("mutants that would run, by package:");
+  for (const [p, n] of [...byPkg].sort()) console.log(`  ${p.padEnd(10)} ${n}`);
+  Deno.exit(0);
+}
+
+// ── Staging ───────────────────────────────────────────────────────────────────
+
+/**
+ * Copy the project to a scratch directory, once.
+ *
+ * deno.json's import map points at the wac compiler relatively ("../wac/"), which does
+ * not resolve from a temp directory — so it is rewritten absolute. Without this the
+ * staged project fails to type-check and *every* mutant reports as killed, which is why
+ * there is a control mutation.
  */
 async function stageProject(dest: string): Promise<void> {
   for (const entry of ["packages", "harness", "deno.json"]) {
@@ -359,7 +315,6 @@ async function stageProject(dest: string): Promise<void> {
     const { code, stderr } = await cmd.output();
     if (code !== 0) throw new Error(`copy ${entry} failed: ${new TextDecoder().decode(stderr)}`);
   }
-
   const configPath = `${dest}/deno.json`;
   const config = JSON.parse(await Deno.readTextFile(configPath));
   const imports = config.imports ?? {};
@@ -372,105 +327,154 @@ async function stageProject(dest: string): Promise<void> {
   await Deno.writeTextFile(configPath, JSON.stringify(config, null, 2));
 }
 
-type Result = { mutation: Mutation; killed: boolean; detail: string };
+/** Packages whose tests can see this mutant, from the import graph. */
+function testDirs(m: Mutant): string[] {
+  const pkgs = new Set<string>();
+  for (const e of m.edits) {
+    for (const p of DEPENDENTS.get(e.file) ?? []) pkgs.add(p);
+    // A file nothing imports is still tested by its own package.
+    for (const p of packagesOf(m)) pkgs.add(p);
+  }
+  return [...pkgs].sort().map((p) => `packages/${p}`);
+}
+
+type Result = {
+  mutant: Mutant;
+  killed: boolean;
+  timedOut: boolean;
+  dirs: string[];
+  detail: string;
+};
+
+const work = await Deno.makeTempDir({ prefix: "wac-mutate-" });
 const results: Result[] = [];
+try {
+  await stageProject(work);
 
-console.log(`running ${selected.length} mutations\n`);
+  for (const { mutant } of toRun) {
+    const mutated = applyEdits(sources, mutant);
+    const touched = [...new Set(mutant.edits.map((e) => e.file))];
+    for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, mutated.get(f)!);
 
-for (const m of selected) {
-  const work = await Deno.makeTempDir({ prefix: "wac-gzip-mutate-" });
-  try {
-    await stageProject(work);
-
-    let missing: string | null = null;
-    for (const edit of editsOf(m)) {
-      const path = `${work}/${edit.file}`;
-      const before = await Deno.readTextFile(path);
-      if (!before.includes(edit.find)) { missing = edit.file; break; }
-      await Deno.writeTextFile(path, before.replace(edit.find, edit.replace));
-    }
-    if (missing !== null) {
-      results.push({
-        mutation: m,
-        killed: false,
-        detail: `PATTERN NOT FOUND in ${missing} — the mutation did not apply, so this result is meaningless`,
-      });
-      console.log(`  ??  ${m.name.padEnd(38)} pattern not found`);
-      continue;
-    }
-
+    const dirs = testDirs(mutant);
     const cmd = new Deno.Command("deno", {
-      args: ["test", "--allow-read", "--allow-write", "--allow-run", "--quiet"],
+      args: ["test", "--allow-read", "--allow-write", "--allow-run", "--quiet", ...dirs],
       cwd: work,
       stdout: "piped",
       stderr: "piped",
     });
-    const { code, stdout, stderr } = await cmd.output();
-    const output = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
+    const child = cmd.spawn();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+    }, TEST_TIMEOUT_MS);
+    const { code, stdout, stderr } = await child.output();
+    clearTimeout(timer);
 
-    // A compile error also counts as killed: the mutation was rejected, which
-    // means the behaviour is pinned, just by the compiler rather than a test.
-    const killed = code !== 0;
+    const output = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
+    // A timeout counts as killed: an infinite loop is a detected defect, not a silent one.
+    const killed = timedOut || code !== 0;
     const firstFail = output.split("\n").find((l) => l.includes("FAILED") || l.includes("error"));
-    results.push({ mutation: m, killed, detail: (firstFail ?? "").trim().slice(0, 90) });
-    console.log(`  ${killed ? "ok " : "!! "} ${m.name.padEnd(38)} ${killed ? "killed" : "SURVIVED"}`);
-  } finally {
-    await Deno.remove(work, { recursive: true });
+    results.push({
+      mutant,
+      killed,
+      timedOut,
+      dirs,
+      detail: timedOut ? `timed out after ${TEST_TIMEOUT_MS / 1000}s` : (firstFail ?? "").trim().slice(0, 90),
+    });
+    const mark = timedOut ? "TO " : killed ? "ok " : "!! ";
+    console.log(`  ${mark} ${mutant.name.padEnd(52)} ${killed ? "killed" : "SURVIVED"}`);
+
+    for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, sources.get(f)!);
   }
+} finally {
+  await Deno.remove(work, { recursive: true });
 }
 
 // ── Report ────────────────────────────────────────────────────────────────────
 
-const notApplied = results.filter((r) => r.detail.startsWith("PATTERN NOT FOUND"));
-const applied = results.filter((r) => !r.detail.startsWith("PATTERN NOT FOUND"));
-const controls = applied.filter((r) => r.mutation.mustSurvive);
-const real = applied.filter((r) => !r.mutation.mustSurvive);
+const controls = results.filter((r) => r.mutant.mustSurvive);
+const real = results.filter((r) => !r.mutant.mustSurvive);
 const survivors = real.filter((r) => !r.killed);
-const realSurvivors = survivors.filter((r) => !r.mutation.ratioOnly && !r.mutation.equivalent);
-const ratioSurvivors = survivors.filter((r) => r.mutation.ratioOnly);
-const equivalentSurvivors = survivors.filter((r) => r.mutation.equivalent && !r.mutation.ratioOnly);
+const realSurvivors = survivors.filter((r) => !r.mutant.ratioOnly && !r.mutant.equivalent);
+const ratioSurvivors = survivors.filter((r) => r.mutant.ratioOnly);
+const claimedEquivalent = survivors.filter((r) => r.mutant.equivalent && !r.mutant.ratioOnly);
 
 // Validate the harness before reporting anything about the implementation.
+const notNoop = controls.filter((r) => controlIsNoop.get(r.mutant.name) !== true);
+if (notNoop.length > 0) {
+  console.log(`\nHARNESS BROKEN: ${notNoop.length} control mutation(s) changed the emitted wasm.`);
+  console.log("A control is supposed to be a no-op — a comment edit. One that alters the binary");
+  console.log("is testing something, so it cannot serve as the check that a clean run survives.");
+  for (const r of notNoop) console.log(`  - ${r.mutant.name}`);
+  Deno.exit(2);
+}
+
 const brokenControls = controls.filter((r) => r.killed);
 if (brokenControls.length > 0) {
   console.log(`\nHARNESS BROKEN: ${brokenControls.length} no-op control mutation(s) were reported killed.`);
   console.log("Every other result in this run is meaningless — a staged project is failing to");
   console.log("build or run for a reason unrelated to the mutation.");
-  for (const r of brokenControls) console.log(`  - ${r.mutation.name}: ${r.detail}`);
+  for (const r of brokenControls) console.log(`  - ${r.mutant.name}: ${r.detail}`);
   Deno.exit(2);
 }
 
-console.log(`\n${real.filter((r) => r.killed).length}/${real.length} mutations killed` +
-  (controls.length > 0 ? `  (${controls.length} no-op control(s) correctly survived)` : ""));
+const killedCount = real.filter((r) => r.killed).length;
+console.log(`\n${killedCount}/${real.length} mutants killed` +
+  (controls.length > 0
+    ? `  (${controls.length} control(s) survived, and TCE independently confirmed each is a no-op)`
+    : ""));
+console.log(
+  `discarded before running: ${equivalent.length} provably equivalent, ` +
+  `${duplicate.length} duplicate, ${invalid.length} uncompilable`);
+console.log(
+  "  Equivalent and duplicate mutants are excluded from the score rather than counted as\n" +
+  "  killed. Counting them is what inflates a mutation score: a duplicate is the same\n" +
+  "  experiment twice, and an equivalent mutant is one no test could ever kill.");
 
-if (equivalentSurvivors.length > 0) {
-  console.log(`\n${equivalentSurvivors.length} provably unobservable survivor(s):`);
-  for (const r of equivalentSurvivors) {
-    console.log(`  - ${r.mutation.name}`);
-    console.log(`      ${r.mutation.equivalent}`);
+if (equivalent.length > 0) {
+  console.log(`\n${equivalent.length} mutant(s) compiled to byte-identical wasm (TCE-equivalent):`);
+  for (const t of equivalent.slice(0, 12)) console.log(`  - ${t.mutant.name}`);
+  if (equivalent.length > 12) console.log(`  ... and ${equivalent.length - 12} more`);
+}
+
+if (invalid.length > 0) {
+  console.log(`\n${invalid.length} mutant(s) did not compile — excluded, not counted as killed:`);
+  for (const t of invalid.slice(0, 12)) {
+    console.log(`  - ${t.mutant.name}: ${(t.triage as { detail: string }).detail}`);
+  }
+  if (invalid.length > 12) console.log(`  ... and ${invalid.length - 12} more`);
+}
+
+if (claimedEquivalent.length > 0) {
+  console.log(`\n${claimedEquivalent.length} survivor(s) documented as unobservable:`);
+  for (const r of claimedEquivalent) {
+    console.log(`  - ${r.mutant.name}\n      ${r.mutant.equivalent}`);
   }
 }
 
 if (ratioSurvivors.length > 0) {
   console.log(`\n${ratioSurvivors.length} ratio-only survivor(s) — expected, the suite allows ratio slack:`);
-  for (const r of ratioSurvivors) console.log(`  - ${r.mutation.name}`);
+  for (const r of ratioSurvivors) console.log(`  - ${r.mutant.name}`);
 }
 
-if (notApplied.length > 0) {
-  console.log(`\n${notApplied.length} mutation(s) did not apply — update the patterns:`);
-  for (const r of notApplied) console.log(`  - ${r.mutation.name} (${r.mutation.file})`);
+if (broken.length > 0) {
+  console.log(`\n${broken.length} curated mutation(s) could not be located — the patterns are stale.`);
+  console.log("  A mutation that does not apply is not a passing result; it is a test that stopped");
+  console.log("  running. Update the pattern or delete the mutation.");
 }
 
 if (realSurvivors.length > 0) {
-  console.log(`\n${realSurvivors.length} SURVIVING correctness mutation(s) — untested behaviour:`);
+  console.log(`\n${realSurvivors.length} SURVIVING mutant(s) — untested behaviour:`);
   for (const r of realSurvivors) {
-    console.log(`  - ${r.mutation.name}`);
-    for (const edit of editsOf(r.mutation)) {
-      console.log(`      ${edit.file}: ${edit.find.slice(0, 68)}`);
-      console.log(`      ->            ${edit.replace.slice(0, 68)}`);
+    console.log(`  - ${r.mutant.name}   [tested against ${r.dirs.join(", ")}]`);
+    for (const e of r.mutant.edits) {
+      console.log(`      ${e.file}: ${e.was.slice(0, 66)}`);
+      console.log(`      ->            ${e.replacement.slice(0, 66)}`);
     }
   }
-  Deno.exit(1);
 }
 
-console.log("\nno surviving correctness mutations");
+if (realSurvivors.length > 0 || broken.length > 0) Deno.exit(1);
+console.log("\nno surviving correctness mutants");
