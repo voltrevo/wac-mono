@@ -11,7 +11,7 @@
 // rather than trap or hang, and the behaviour is reported so a change to it is
 // visible in the diff.
 
-import { json, ERR } from "./util.ts";
+import { json, ERR, errorCodesAgree } from "./util.ts";
 
 // A plain path, not a URL: one document is named `n_structure_trailing_#.json`
 // and `new URL` would read the `#` as a fragment separator.
@@ -33,6 +33,21 @@ function load(): Case[] {
 }
 
 const CASES = load();
+
+Deno.test("the TypeScript error codes match the wac ones", async () => {
+  // Every test in this package compares against a number from ERR. If that list
+  // drifts from parse.wac they all keep passing against the wrong codes.
+  const problems = await errorCodesAgree();
+  if (problems.length > 0) {
+    throw new Error(`error codes disagree:\n  ${problems.join("\n  ")}`);
+  }
+  // And the check can actually fail — a checker that always passes is worse than none.
+  // One complaint for the wrong value, one for the name that does not exist in wac.
+  const wrong = await errorCodesAgree({ ...ERR, UTF8: 99, INVENTED: 42 });
+  if (wrong.length !== 2) {
+    throw new Error(`expected 2 complaints about a bad list, got ${wrong.length}: ${wrong.join("; ")}`);
+  }
+});
 
 Deno.test("JSONTestSuite: the corpus is present and complete", () => {
   // A silently empty corpus would make every test below pass.

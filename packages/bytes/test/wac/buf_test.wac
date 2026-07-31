@@ -156,12 +156,33 @@ export string test_take_avoids_the_copy_when_exactly_full() {
   t.eqI32(taken.len(), 16, "exact length");
   t.eqI32(taken[15], 15, "contents intact");
 
+  // The buffer is emptied, so continuing to use it cannot write through the array
+  // it just handed away — the failure mode the doc comment used to only warn about.
+  t.eqI32(full.len, 0, "the taken buffer is empty");
+  full.push('z');
+  t.eqI32(taken[0], 0, "a later push does not reach the taken array");
+  t.eqBytes(full.bytes(), u8[]('z'), "and lands in fresh storage");
+
   // Not exactly full: take() falls back to a copy, and the contents still match.
   Buf partial = Buf.withCapacity(16);
   partial.push('q');
   u8[] copied = partial.take();
   t.eqI32(copied.len(), 1, "trimmed to length");
   t.eqI32(copied[0], 'q', "contents intact");
+  return t.report();
+}
+
+export string test_grows_from_zero_capacity() {
+  T t = T.create();
+  // A buffer with no capacity at all, which `take` now produces. Doubling zero is
+  // zero, so this is where a missing floor in `reserve` goes out of bounds.
+  Buf b = Buf.withCapacity(16);
+  for (i32 i = 0; i < 16; i++) { b.push(i); }
+  u8[] gone = b.take();
+  t.eqI32(gone.len(), 16, "the storage was handed over");
+  for (i32 i = 0; i < 40; i++) { b.push(i); }
+  t.eqI32(b.len, 40, "and the emptied buffer refills");
+  t.eqI32(b.get(39), 39, "with the right contents");
   return t.report();
 }
 

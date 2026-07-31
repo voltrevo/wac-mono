@@ -19,6 +19,14 @@ export async function json(): Promise<JsonMod> {
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+/**
+ * Error codes, mirrored from `src/parse.wac`.
+ *
+ * A hand-kept copy of a list in another language, which is exactly the kind of thing
+ * that drifts silently — add a code on the wac side and every test here keeps passing
+ * against the old numbering. `errorCodesAgree` below reads the wac source and checks
+ * the two lists match, so a drift fails a test instead of a document.
+ */
 export const ERR = {
   NONE: 0,
   UNEXPECTED: 1,
@@ -31,6 +39,29 @@ export const ERR = {
   DEPTH: 8,
   UTF8: 9,
 } as const;
+
+/**
+ * Check ERR against the `ERR_*` declarations in the parser.
+ *
+ * Derived rather than trusted, the same way wacc's token-kind test reads its order
+ * from `wacLex.ts` instead of keeping a copy.
+ */
+export async function errorCodesAgree(expected: Record<string, number> = ERR): Promise<string[]> {
+  const src = await Deno.readTextFile("packages/json/src/parse.wac");
+  const found = new Map<string, number>();
+  for (const m of src.matchAll(/export i32 ERR_([A-Z0-9]+)\(\)\s*\{\s*return\s+(\d+);/g)) {
+    found.set(m[1], Number(m[2]));
+  }
+  const problems: string[] = [];
+  for (const [name, code] of Object.entries(expected)) {
+    if (!found.has(name)) problems.push(`ERR.${name} = ${code} has no ERR_${name}() in parse.wac`);
+    else if (found.get(name) !== code) problems.push(`ERR.${name} is ${code}, ERR_${name}() returns ${found.get(name)}`);
+  }
+  for (const [name, code] of found) {
+    if (!(name in expected)) problems.push(`ERR_${name}() = ${code} is missing from ERR`);
+  }
+  return problems;
+}
 
 export type Canon = { err: number; text: string };
 

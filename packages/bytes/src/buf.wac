@@ -44,7 +44,12 @@ export struct Buf {
   // Make room for at least one more byte.
   void reserve(this) {
     if (this.len < this.data.len()) { return; }
+    // Doubling zero is zero, so the floor is load-bearing rather than defensive:
+    // without it an empty buffer grows to nothing and the store below goes out of
+    // bounds. Unreachable while every constructor started at 16, and reachable as
+    // soon as `take` began leaving the buffer empty.
     i32 cap = this.data.len() * 2;
+    if (cap < 16) { cap = 16; }
     u8[] next = u8[cap]();
     for (i32 i = 0; i < this.len; i++) {
       next[i] = this.data[i];
@@ -134,13 +139,21 @@ export struct Buf {
   /**
    * Hand over the contents, avoiding the copy when the buffer is exactly full.
    *
-   * The returned array is the buffer's own storage in that case, so the Buf must
-   * not be used afterwards. That is why this is separate from `bytes()`: callers
-   * that keep appending need the copy.
+   * The returned array is the buffer's own storage in that case, so the Buf must not
+   * be used afterwards. That is why this is separate from `bytes()`: callers that
+   * keep appending need the copy.
+   *
+   * The buffer is emptied to enforce it. Without that, a caller who kept pushing
+   * would be writing through a value it had already handed away, and nothing would
+   * say so — the array it returned would change under its new owner. Reusing a taken
+   * Buf now traps on the next `get`, and pushes land in fresh storage.
    */
   u8[] take(this) {
     if (this.len == this.data.len()) {
-      return this.data;
+      u8[] out = this.data;
+      this.data = u8[0]();
+      this.len = 0;
+      return out;
     }
     return this.bytes();
   }

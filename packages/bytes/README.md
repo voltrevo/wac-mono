@@ -33,9 +33,10 @@ up in `deno task bench`:
 - **`reserve()` takes no argument** and only makes room for one byte, keeping the
   common `push` path to a single comparison. Bulk appends use `reserveFor(n)` so
   they grow once instead of doubling repeatedly.
-- **`take()` returns the buffer's own storage** when the buffer is exactly full,
-  so it must not be used afterwards. `bytes()` always copies, for callers that
-  keep appending.
+- **`take()` returns the buffer's own storage** when the buffer is exactly full, and
+  empties the buffer to enforce it. Continuing to use a taken `Buf` is safe — pushes
+  land in fresh storage rather than writing through the array it handed away.
+  `bytes()` always copies, for callers that keep appending.
 
 ## API
 
