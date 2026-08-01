@@ -23,7 +23,7 @@ here is at or near 100% branch coverage.
 | package | survivors |
 |---|---:|
 | wacc    | 20 |
-| gzip    | 18 |
+| gzip    | 18 → resolved, see below |
 | fmt     |  4 |
 | std     |  3 |
 | json    |  3 |
@@ -49,19 +49,26 @@ That matters more than it looks, because rung 3 compares type-checker diagnostic
 the plan is to compare them by position too. The rungs are being built on a comparison
 that does not check the one field wacc uses to say *what went wrong*.
 
-**gzip: twelve inflate guards are redundant with a later check.** These are the
-rejection paths I added tests for in 0acf481, and the tests do pass. Removing the guard
-still rejects the input — just later and for a different reason. `hlit > 286` removed
-means symbol 286 decodes and then trips `li >= 29`; a stored block's bad `NLEN` removed
-means the length runs off the end and trips the bounds check.
+**gzip: twelve inflate guards.** Resolved — the question was asked of each one by
+removing the guard and re-running a probe built to reach exactly that check.
 
-Whether that is a gap or a fact depends on the guard, and the crypto ones show it can go
-either way. There, four of five guards looked equally redundant and were not: every test
-passed a *short* input, which traps with or without the check, while a *long* input is
-read happily — a 17-byte AEAD tag whose first 16 bytes are valid verified successfully
-with the length check removed. The short case had exercised the guard without testing
-it. Each of gzip's twelve needs the same question asked: is there an input on the other
-side of the boundary that the later check does not catch?
+Eleven are genuinely redundant with a bounds check: the next thing the code does is
+index an array outside its bounds, and WasmGC traps unconditionally. One of those
+eleven, `di >= 30`, is not even reachable. All are recorded in `tools/mutate/known.ts`
+with the argument and the confirmation, and they stay in the source because a named
+rejection beats an out-of-range read.
+
+The twelfth was a real gap, and it was the one that looked most like the others.
+`hlit > 286 || hdist > 30` deleted, an otherwise-valid dynamic block declaring 287
+literal codes **decodes and returns successfully** — nothing else objects, because
+symbols 286 and 287 simply have no code assigned. The test that was supposed to cover
+this sent a header and stopped, so the stream ran out of bits and trapped whether or not
+the count was checked: it reached the line without testing it. Same shape as the crypto
+guards, where every test passed a short input that traps either way. Fixed by building a
+complete block whose only fault is the count.
+
+That is eleven arguments and one bug from twelve mutants that all looked alike, which is
+the case for asking rather than assuming.
 
 ## The rest
 
