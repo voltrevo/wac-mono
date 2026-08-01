@@ -72,7 +72,12 @@ export type Divergence = {
   at: number;
   file: string;
   line: number;
-  kind: CoveragePoint["kind"];
+  /**
+   * `index` — this site used a different index, which is a leak *here*.
+   * `path-split` — the runs took different paths, and this is merely where one of
+   * them stood. Everything after it is incomparable, not clean.
+   */
+  kind: CoveragePoint["kind"] | "path-split";
   detail: string;
 };
 
@@ -107,6 +112,67 @@ export function firstDivergence(
     detail: `one run performed ${Math.abs(a.events.length - b.events.length)} more ` +
       `operation(s); the other stopped here`,
   };
+}
+
+/**
+ * Every site at which two traces diverge, up to the point where comparison stops
+ * meaning anything.
+ *
+ * `firstDivergence` is what a test assertion wants — one place, one message. A survey
+ * wants the list, because a routine that leaks in several places reports only the
+ * earliest otherwise.
+ *
+ * **Two kinds of divergence, and only one is recoverable.** If both runs are at the
+ * same site and used different indices, the paths still agree and the walk continues:
+ * that is an index leak, and there may be more after it. If they are at *different*
+ * sites the control flow has split, and from there the two event streams describe
+ * different executions — pairing them up produces noise, not findings. So the walk
+ * reports that divergence and stops.
+ *
+ * Resynchronising by guesswork was the first attempt and it invented leaks: after
+ * ghash's loop count changed, misaligned events reported `y[0] = tmp[0]` — a constant
+ * index — as key-dependent. An over-reporting security tool gets ignored, which is
+ * worse than a quiet one.
+ */
+export function allDivergentSites(
+  m: CtModule,
+  a: { events: Event[] },
+  b: { events: Event[] },
+): { sites: Divergence[]; stoppedAtPathSplit: boolean } {
+  const sites: Divergence[] = [];
+  const seen = new Set<number>();
+  const n = Math.min(a.events.length, b.events.length);
+  for (let k = 0; k < n; k++) {
+    const x = a.events[k], y = b.events[k];
+    if (x.site === y.site && x.value === y.value) continue;
+    const p = m.points[x.site];
+    if (x.site !== y.site) {
+      // Not a leaking site: it is where *this* run happened to be when the two stopped
+      // agreeing. The other run was somewhere else, and naming both is the only honest
+      // report — `ghash.wac:63` indexes with a literal 0 and cannot itself depend on a
+      // key, but it is where one run stood at the split.
+      const q = m.points[y.site];
+      sites.push({
+        at: k, file: p.file, line: p.line, kind: "path-split",
+        detail: `one run at ${p.file}:${p.line}, the other at ${q.file}:${q.line}`,
+      });
+      return { sites, stoppedAtPathSplit: true };
+    }
+    if (!seen.has(x.site)) {
+      seen.add(x.site);
+      sites.push({ at: k, file: p.file, line: p.line, kind: p.kind, detail: `index ${x.value} vs ${y.value}` });
+    }
+  }
+  if (a.events.length !== b.events.length) {
+    const longer = a.events.length > b.events.length ? a : b;
+    const p = m.points[longer.events[n].site];
+    sites.push({
+      at: n, file: p.file, line: p.line, kind: "path-split",
+      detail: `one run continued past the other, which stopped at ${p.file}:${p.line}`,
+    });
+    return { sites, stoppedAtPathSplit: true };
+  }
+  return { sites, stoppedAtPathSplit: false };
 }
 
 /**
