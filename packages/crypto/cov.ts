@@ -20,6 +20,9 @@ import { instrument, report } from "../../harness/wacCoverage.ts";
 const verbose = Deno.args.includes("--verbose");
 
 const run = await instrument("packages/crypto/test/wac/probe.wac");
+// Curve25519 has its own probe: the field operations are internal to the package and
+// reach the boundary only for the BigInt differential.
+const curve = await instrument("packages/crypto/test/wac/curve25519_probe.wac");
 const f = <T extends (...a: never[]) => unknown>(name: string) => run.mod[name] as T;
 
 const sha256 = f<(b: Uint8Array) => Uint8Array>("sha256");
@@ -194,5 +197,182 @@ for (const v of [0, 1, 0x80000000, 0xFFFFFFFF]) {
 for (const v of [0n, 1n, 0x8000000000000000n, 0xFFFFFFFFFFFFFFFFn]) storeBE64(v);
 for (let n = 0; n <= 32; n++) padTo16(n);
 
-const { total, covered } = report([run], "packages/crypto/", { verbose });
-if (covered < total) Deno.exit(1);
+/**
+ * Curve25519, at the shapes its tests drive.
+ *
+ * The ladder covers nearly everything on its own — 255 rounds of every field operation —
+ * so what is listed separately here is the parts a ladder never reaches: the encoder's
+ * conditional final subtraction, which needs a value at or above p, and both arms of the
+ * conditional swap.
+ */
+{
+  const c = <T extends (...a: never[]) => unknown>(name: string) => curve.mod[name] as T;
+  const x25519 = c<(k: Uint8Array, u: Uint8Array) => Uint8Array>("x25519");
+  const x25519Base = c<(k: Uint8Array) => Uint8Array>("x25519Base");
+  const fAdd = c<(a: Uint8Array, b: Uint8Array) => Uint8Array>("fAdd");
+  const fSub = c<(a: Uint8Array, b: Uint8Array) => Uint8Array>("fSub");
+  const fMul = c<(a: Uint8Array, b: Uint8Array) => Uint8Array>("fMul");
+  const fSquare = c<(a: Uint8Array) => Uint8Array>("fSquare");
+  const fMulSmall = c<(a: Uint8Array, m: bigint) => Uint8Array>("fMulSmall");
+  const fInvert = c<(a: Uint8Array) => Uint8Array>("fInvert");
+  const fRoundTrip = c<(a: Uint8Array) => Uint8Array>("fRoundTrip");
+  const fCSwap = c<(a: Uint8Array, b: Uint8Array, s: number) => Uint8Array>("fCSwap");
+
+  const P = (1n << 255n) - 19n;
+  const enc = (v: bigint) => {
+    const o = new Uint8Array(32);
+    let x = ((v % P) + P) % P;
+    for (let i = 0; i < 32; i++) { o[i] = Number(x & 0xFFn); x >>= 8n; }
+    return o;
+  };
+  // Values at and just below p, so feToBytes takes both sides of its final subtraction.
+  for (const v of [0n, 1n, P - 1n, P - 2n, (1n << 254n), (1n << 26n), (1n << 25n)]) {
+    fRoundTrip(enc(v));
+    fInvert(enc(v));
+    fSquare(enc(v));
+    fMulSmall(enc(v), 121665n);
+    fAdd(enc(v), enc(P - 1n));
+    fSub(enc(v), enc(P - 1n));
+    fMul(enc(v), enc(P - 2n));
+  }
+  // A u-coordinate with bit 255 set: ignored, and ignored structurally rather than by a
+  // branch — see the note on feFromBytes.
+  const masked = enc(1n);
+  masked[31] |= 0x80;
+  fRoundTrip(masked);
+  // A sum that lands on exactly p. Every canonical input is already below p, so nothing
+  // above reaches feToBytes' final conditional subtraction; this is the only way to.
+  fAdd(enc(P - 19n), enc(19n));
+  fAdd(enc(P - 1n), enc(1n));
+  fCSwap(enc(3n), enc(5n), 0);
+  fCSwap(enc(3n), enc(5n), 1);
+
+  // Ed25519. Signing and verifying between them reach the group law, both branches of
+  // the scalar select, encoding and decoding; the rejection cases reach the rest.
+  const edPublicKey = c<(s: Uint8Array) => Uint8Array>("edPublicKey");
+  const edSign = c<(s: Uint8Array, m: Uint8Array) => Uint8Array>("edSign");
+  const edVerify = c<(p: Uint8Array, m: Uint8Array, s: Uint8Array) => boolean>("edVerify");
+  const edRecode = c<(p: Uint8Array) => Uint8Array>("edRecode");
+  const edScalarBase = c<(k: Uint8Array) => Uint8Array>("edScalarBase");
+  c<() => Uint8Array>("edBaseEncoded")();
+
+  const seed = bytes(32, 50);
+  const pub = edPublicKey(seed);
+  for (const msgLen of [0, 1, 64]) {
+    const msg = bytes(msgLen, 51);
+    const sig = edSign(seed, msg);
+    edVerify(pub, msg, sig);
+    const tampered = Uint8Array.from(sig);
+    tampered[0] ^= 1;
+    edVerify(pub, msg, tampered);         // R decodes but the equation fails
+  }
+  // Rejections: bad lengths, an S at or above L, a y that is not on the curve.
+  edVerify(bytes(31, 52), bytes(4, 53), bytes(64, 54));
+  edVerify(pub, bytes(4, 53), bytes(63, 54));
+  edVerify(pub, bytes(4, 53), bytes(64, 55));   // random S is almost surely >= L or a bad point
+  const notAPoint = new Uint8Array(32);
+  notAPoint[0] = 2;
+  edRecode(notAPoint);
+  edRecode(pub);
+  // An odd-x point, so the sign branch in recoverX runs both ways.
+  const oddX = Uint8Array.from(pub);
+  oddX[31] ^= 0x80;
+  edRecode(oddX);
+  edScalarBase(bytes(32, 56));
+  // y = 1 with the sign bit set: x is zero, which has no odd root, so the decode must
+  // fail. This is the one branch in recoverX that a valid point never reaches.
+  const yOneOddX = new Uint8Array(32);
+  yOneOddX[0] = 1;
+  yOneOddX[31] = 0x80;
+  edRecode(yOneOddX);
+  edRecode(bytes(31, 57));                      // wrong length
+  mustTrap("edPublicKey short seed", () => edPublicKey(bytes(31, 58)));
+  mustTrap("edSign short seed", () => edSign(bytes(31, 58), bytes(4, 59)));
+  // A public key that is not a point, and a signature whose R is not a point.
+  const goodSig = edSign(seed, bytes(8, 60));
+  edVerify(notAPoint, bytes(8, 60), goodSig);
+  const badR = Uint8Array.from(goodSig);
+  badR.set(notAPoint, 0);
+  edVerify(pub, bytes(8, 60), badR);
+
+  x25519Base(bytes(32, 40));
+  x25519(bytes(32, 41), x25519Base(bytes(32, 42)));
+  mustTrap("x25519 short scalar", () => x25519(bytes(31, 43), bytes(32, 44)));
+  mustTrap("x25519 short u", () => x25519(bytes(32, 43), bytes(31, 44)));
+}
+
+/**
+ * Branch points no exercise here reaches, with the reason.
+ *
+ * Named rather than tolerated as a percentage below 100, for the same reason gzip's
+ * cov.ts carries a list: a report that sits at 99.3% forever teaches everyone to skip
+ * the last line, and then a real gap arrives looking like the one that was always there.
+ */
+const UNREACHED: { file: string; line: number; snippet: string; why: string }[] = [
+  {
+    file: "packages/crypto/src/field25519.wac",
+    line: 200,
+    snippet: "if (geP == 1)",
+    why:
+      "feToBytes' final conditional subtraction, for a value that is still in [p, 2^255) " +
+      "after carrying. No input reaches it, and the likely reason is that feCarry's " +
+      "round-to-nearest pass already folds anything at or above about 2^254 back down, so " +
+      "the nineteen values in that band never survive to be tested. That is an argument, " +
+      "not a proof — I could not construct an input, and I have not shown none exists. " +
+      "It stays because the cost of being wrong in the other direction is a " +
+      "non-canonical encoding for those nineteen values, which is the kind of defect " +
+      "that shows up as an interop failure years later. If someone proves it dead, " +
+      "delete it and this entry together.",
+  },
+  {
+    file: "packages/crypto/src/field25519.wac",
+    line: 202,
+    snippet: "for (i32 i = 0; i < 10; i++) { h[i] = t[i]; }",
+    why: "The copy inside that same conditional. Unreached for the one reason above, not " +
+      "a second one.",
+  },
+];
+
+report([run, curve], "packages/crypto/", { verbose });
+
+const missed = new Set<string>();
+for (const r of [run, curve]) {
+  const counts = r.counts();
+  const hit = new Map<string, boolean>();
+  for (const p of r.points) {
+    if (!p.file.startsWith("packages/crypto/")) continue;
+    const key = `${p.file}:${p.line}:${p.col}:${p.kind}`;
+    hit.set(key, (hit.get(key) ?? false) || counts[p.index] > 0);
+  }
+  for (const [key, ok] of hit) if (!ok) missed.add(key.split(":").slice(0, 2).join(":"));
+}
+// A point covered by one probe and missed by the other is covered; merge before judging.
+for (const r of [run, curve]) {
+  const counts = r.counts();
+  for (const p of r.points) {
+    if (counts[p.index] > 0) missed.delete(`${p.file}:${p.line}`);
+  }
+}
+
+let failed = false;
+for (const u of UNREACHED) {
+  const where = `${u.file}:${u.line}`;
+  const source = (await Deno.readTextFile(u.file)).split("\n")[u.line - 1] ?? "";
+  if (!source.includes(u.snippet)) {
+    console.log(`\n${where} no longer holds ${JSON.stringify(u.snippet)} — it holds:\n  ${source.trim()}`);
+    console.log("  The UNREACHED entry has drifted onto the wrong line; fix the line number.");
+    failed = true;
+  } else if (!missed.has(where)) {
+    console.log(`\n${where} is listed as unreached but was covered — drop the entry.`);
+    failed = true;
+  } else {
+    console.log(`\nexcluded as unreached: ${where}  ${u.snippet}\n  ${u.why}`);
+  }
+}
+const unexpected = [...missed].filter(m => !UNREACHED.some(u => `${u.file}:${u.line}` === m));
+if (unexpected.length > 0) {
+  console.log(`\n${unexpected.length} branch point(s) uncovered:`);
+  for (const m of unexpected.sort()) console.log(`  ${m}`);
+  failed = true;
+}
+if (failed) Deno.exit(1);

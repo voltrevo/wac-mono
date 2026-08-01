@@ -1,7 +1,13 @@
 # crypto
 
-SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR and AES-GCM,
-written in wac.
+SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519 and
+Ed25519, written in wac.
+
+> **Not for production.** Nothing here is constant-time. `ghash`'s multiply branches on
+> every bit of its operand, `aes` indexes an S-box with key-dependent values, and
+> `x25519`'s ladder is only structurally uniform — wac offers no way to stop a compiler
+> or a CPU from undoing that, and none of it has been measured against a timing oracle.
+> The correctness is tested hard; the side channels are not addressed at all.
 
 A package of [wac-mono](../../README.md) — see the root README for layout and how
 to run things. All commands run from the repo root.
@@ -16,6 +22,8 @@ import { aeadEncrypt, aeadTag, aeadDecrypt } from "../../crypto/src/aead.wac";
 import { aesEncrypt, aesDecrypt } from "../../crypto/src/aes.wac";
 import { aesCtr } from "../../crypto/src/aesctr.wac";
 import { gcmEncrypt, gcmTag, gcmDecrypt } from "../../crypto/src/aesgcm.wac";
+import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
+import { ed25519Sign, ed25519Verify, ed25519PublicKey } from "../../crypto/src/ed25519.wac";
 
 u8[] digest = sha256(msg);                     // 32 bytes
 u8[] tag    = hmacSha256(key, msg);            // 32 bytes
@@ -25,7 +33,48 @@ u8[] ct     = chacha20(key, 1, nonce, msg);    // same call decrypts
 u8[] sealed = aeadEncrypt(key, nonce, msg);
 u8[] tag    = aeadTag(key, nonce, aad, sealed);
 u8[] opened = aeadDecrypt(key, nonce, aad, sealed, tag);   // traps if forged
+
+u8[] pub    = x25519Base(secret);              // 32-byte public key
+u8[] shared = x25519(secret, theirPub);        // 32-byte shared secret
+
+u8[] vk     = ed25519PublicKey(seed);          // 32 bytes
+u8[] sig    = ed25519Sign(seed, msg);          // 64 bytes
+bool ok     = ed25519Verify(vk, msg, sig);
 ```
+
+## X25519
+
+Curve25519 Diffie-Hellman, RFC 7748. `src/field25519.wac` is the arithmetic in
+GF(2^255-19) — ten limbs alternating 26 and 25 bits, the same technique poly1305 uses
+for GF(2^130-5) — and `src/x25519.wac` is the Montgomery ladder over it, transcribed
+from RFC 7748 §5 in the RFC's own variable names so the two can be read side by side.
+
+Three independent checks, because a ladder has no partial credit: the published vectors
+including the 1000-iteration chain, a differential against WebCrypto's X25519 on random
+keys in both directions, and the field operations against JavaScript BigInt over 270
+values weighted toward limb and modulus boundaries. The field differential is what makes
+this tractable to develop at all — a wrong ladder tells you only that one of two
+thousand multiplications was wrong.
+
+## Ed25519
+
+RFC 8032, over the same field on the twisted Edwards curve. Points are kept in extended
+coordinates, and the base point is derived from y = 4/5 rather than written out, so the
+x-recovery is exercised on the one point everything else depends on.
+
+Signing and verifying are tested separately rather than only round-tripped, which is not
+pedantry: the first version signed all of RFC 8032's vectors correctly and failed to
+verify two of the three public keys. `sqrt(-1)` had been computed one factor of two
+short, which only affects point *decoding* — a path signing never takes. A sign-then-
+verify test would have passed.
+
+Roughly 120 ms per signature. The scalar multiplication is a plain 256-step
+double-and-add with no windowing, which is the slowest reasonable choice and the easiest
+to read against the spec.
+
+A caller checking for the all-zero shared secret, as RFC 7748 §6.1 permits, gets it: a
+low-order point multiplies to the identity and encodes as zero. This package does not
+reject those itself, because whether that is an error depends on the protocol above.
 
 ## Status
 
