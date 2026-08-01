@@ -39,6 +39,7 @@
 import { wacCompile } from "wac/wacCompile.ts";
 import { wacFiles } from "../harness/wacFiles.ts";
 import { CURATED } from "./mutate/curated.ts";
+import { KNOWN_SURVIVORS } from "./mutate/known.ts";
 import { ALL_OPERATORS, generate, type OperatorName } from "./mutate/operators.ts";
 import { applyEdits, packagesOf, type Curated, type Edit, type Mutant } from "./mutate/types.ts";
 
@@ -389,7 +390,10 @@ try {
     for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, sources.get(f)!);
   }
 } finally {
-  await Deno.remove(work, { recursive: true });
+  // Tolerate the directory already being gone. It should never be, but a crash here
+  // discards a run's entire report after the work has been done, which is a bad trade
+  // for a cleanup step.
+  await Deno.remove(work, { recursive: true }).catch(() => {});
 }
 
 // ── Report ────────────────────────────────────────────────────────────────────
@@ -397,7 +401,10 @@ try {
 const controls = results.filter((r) => r.mutant.mustSurvive);
 const real = results.filter((r) => !r.mutant.mustSurvive);
 const survivors = real.filter((r) => !r.killed);
-const realSurvivors = survivors.filter((r) => !r.mutant.ratioOnly && !r.mutant.equivalent);
+const knownWhy = new Map(KNOWN_SURVIVORS.map((k) => [k.name, k.why]));
+const documented = survivors.filter((r) => knownWhy.has(r.mutant.name));
+const realSurvivors = survivors.filter((r) =>
+  !r.mutant.ratioOnly && !r.mutant.equivalent && !knownWhy.has(r.mutant.name));
 const ratioSurvivors = survivors.filter((r) => r.mutant.ratioOnly);
 const claimedEquivalent = survivors.filter((r) => r.mutant.equivalent && !r.mutant.ratioOnly);
 
@@ -447,6 +454,20 @@ if (invalid.length > 0) {
   if (invalid.length > 12) console.log(`  ... and ${invalid.length - 12} more`);
 }
 
+// A documented survivor that gets killed means its argument has stopped holding.
+const staleKnown = real.filter((r) => r.killed && knownWhy.has(r.mutant.name));
+if (staleKnown.length > 0) {
+  console.log(`\n${staleKnown.length} mutant(s) listed in known.ts were killed:`);
+  for (const r of staleKnown) {
+    console.log(`  - ${r.mutant.name}\n      the recorded reason no longer holds; drop the entry`);
+  }
+}
+
+if (documented.length > 0) {
+  console.log(`\n${documented.length} generated survivor(s) documented in known.ts:`);
+  for (const r of documented) console.log(`  - ${r.mutant.name}\n      ${knownWhy.get(r.mutant.name)}`);
+}
+
 if (claimedEquivalent.length > 0) {
   console.log(`\n${claimedEquivalent.length} survivor(s) documented as unobservable:`);
   for (const r of claimedEquivalent) {
@@ -476,5 +497,5 @@ if (realSurvivors.length > 0) {
   }
 }
 
-if (realSurvivors.length > 0 || broken.length > 0) Deno.exit(1);
+if (realSurvivors.length > 0 || broken.length > 0 || staleKnown.length > 0) Deno.exit(1);
 console.log("\nno surviving correctness mutants");

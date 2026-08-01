@@ -71,4 +71,13 @@ Deno.test("ghash: rejects input that is not a whole number of blocks", () => {
     if (!traps(() => ghash(h, new Uint8Array(n)))) throw new Error(`${n} bytes was accepted`);
   }
   if (!traps(() => ghash(new Uint8Array(15), new Uint8Array(16)))) throw new Error("a 15-byte H was accepted");
+  // And too long, which is the case the length check uniquely catches. A short H traps
+  // regardless, because reading the second word runs off the end; a long one does not,
+  // so without the check the extra bytes are silently ignored and a caller who passed a
+  // 20-byte subkey would get a hash of a different one. Found by mutation testing.
+  for (const n of [17, 20, 32]) {
+    if (!traps(() => ghash(new Uint8Array(n), new Uint8Array(16)))) {
+      throw new Error(`a ${n}-byte H was accepted`);
+    }
+  }
 });
