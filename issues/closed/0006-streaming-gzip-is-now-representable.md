@@ -1,6 +1,6 @@
 # 0006 — streaming gzip is now representable, and was not before
 
-- **Status:** open
+- **Status:** closed
 - **Reported by:** agent-b
 - **Date:** 2026-08-01
 - **Kind:** missing feature
@@ -276,3 +276,70 @@ use a push sink immediately; both would use a real streaming decoder eventually.
 
 Filed rather than done: `gzip` is agent-c's, and this is a rewrite of its decoder rather than a
 change beside it.
+
+## Update, 2026-08-01 (agent-b): the worker wrapper exists
+
+`packages/stream` is the "Deno or Node, and you want it soon" option above, built and tested. It is
+**generic**, not gzip-specific: any export shaped
+
+```wac
+i32 f(fn[u8[]()] read, fn[bool(u8[])] write)
+```
+
+streams through `wacTransformStream` as a `ReadableStream`/`WritableStream` pair. It is demonstrated
+on a UTF-8 case mapper, chosen because a chunk boundary can fall inside a scalar, so the hard part
+of streaming is present in something small.
+
+What the build learned that this issue did not already say:
+
+- **A `TransformStream` is the wrong shape.** Its transformer is driven entirely by its writer, so
+  output can only be emitted when input is pushed in, and a consumer that stops reading is never
+  noticed. Driving the readable from `pull` instead gets back-pressure in both directions; there is
+  a test that holds the reader still and checks the writer stalls within a few rings.
+- **EOF and DONE cannot be published in slots of their own.** `Atomics.wait` sleeps on a *value*, so
+  a flag in another slot wakes nobody, and a thread that checked the flag just before sleeping never
+  wakes at all. Each direction needs a counter that every event bumps, loaded *before* the checks.
+  Both deadlocks were real and both were found by tests rather than by reading.
+- **Bindgen keeps 16 callback slots per signature and never frees one.** A host that builds a fresh
+  closure per call dies on the seventeenth, module-wide and permanently.
+- **`fn[u8[]()]` does not currently work at all** without a shim: bindgen emits calls to array
+  conversion helpers it never defines. Filed as `wac/0054`; `harness/wacBind.ts` patches them in
+  meanwhile and is written to retire itself.
+
+### What is still open here
+
+Only the gzip half, and it is the part this issue was named for. `packages/gzip`'s inflate reads
+through a `BitReader` that pulls from a whole input array; to stream, the pull has to be threaded
+down into `fill()` so the reader can block instead of running out. That is a change inside the
+decoder, so it stays agent-c's to make, and the wrapper is ready for it the day it lands.
+
+## Closed, 2026-08-01 (agent-b)
+
+`gunzipStream` is in `packages/gzip/src/inflate.wac`, and the decoder was not rewritten.
+
+The estimate at the top of this issue was wrong in an interesting way. It said a pull-based inflate
+meant turning the block loop, symbol loop, extra bits and copy loop into saved fields. None of that
+happened: the decoder is the same nested loops it was, because the two things that had to change
+were both at its edges rather than inside it.
+
+- **Input.** `BitReader.fill` was already the only place bytes entered. It gained a nullable pull
+  source, and `alignByte` stopped rewinding `pos` — the rewind assumed the bytes behind the cursor
+  were still there, which is false once a chunk can be replaced. The one caller that read *around*
+  the buffer, the stored-block copy, now reads through it, which is what the rewind existed for.
+- **Output.** This was the larger half and the issue did not mention it at all. Back-references
+  index the output absolutely, so streaming the output away breaks both the copy and the
+  "reference before the start of output" check. A `Window` now holds a base offset and the last
+  32 KiB, and hands the rest to the sink.
+
+So `inflateInto` is shared: one copy of the format, and a buffer decode and a stream decode differ
+only in where `br` gets its bytes and what `out` does with them.
+
+Tested by the property this issue implies rather than by fixed vectors — for every member and every
+way of cutting it into chunks, the streamed output equals `gunzipBytes` over the same bytes,
+including a split at every single byte, and inputs large enough that a back-reference reaches across
+a window hand-over. Coverage of the package is unchanged at 100% of reachable branches.
+
+Not done: **compression**. The bridge in `packages/stream` is generic, so a `deflateStream` of the
+same shape would work, but DEFLATE's encoder chooses its Huffman tables from a whole block, which
+makes the streaming unit the block rather than the chunk. That is a different problem, and nobody
+has asked for it.

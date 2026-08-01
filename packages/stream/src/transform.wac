@@ -1,0 +1,75 @@
+// Streaming transforms, written as ordinary pull loops.
+//
+// Each takes a `read` that hands back the next chunk — an empty array meaning end of input — and a
+// `write` that takes output and returns whether to keep going. No state machine, no resumption:
+// the loop simply blocks inside `read` until there is more, because the host runs it on a worker
+// that can block. See `host/bridge.ts`.
+//
+// The interesting part of any streaming transform is what happens when a *unit* straddles a chunk
+// boundary, and both of these have one: a UTF-8 scalar is up to four bytes and a base64 group is
+// four characters. A transform that gets this wrong looks correct until a chunk lands badly, which
+// is why the tests compare every split rather than a few.
+
+import { Scalar, decode, encode, encodedLength } from "../../unicode/src/utf8.wac";
+import { toUpper } from "../../unicode/src/case.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+
+/** Bytes in, same bytes out. The control: any failure here is the bridge, not a transform. */
+export i32 passthrough(fn[u8[]()] read, fn[bool(u8[])] write) {
+  i32 total = 0;
+  while (true) {
+    u8[] chunk = read();
+    if (chunk.len() == 0) { break; }
+    total = total + chunk.len();
+    if (!write(chunk)) { break; }
+  }
+  return total;
+}
+
+/**
+ * Uppercase UTF-8 text, simple mapping, across chunk boundaries.
+ *
+ * `held` is the tail of a chunk that stopped mid-scalar. It is carried into the next read rather
+ * than emitted, which is the whole difficulty: a two-byte `é` split across a chunk boundary must
+ * not become two replacement characters, and must not be emitted twice either.
+ */
+export i32 upperCase(fn[u8[]()] read, fn[bool(u8[])] write) {
+  u8[] held = u8[0]();
+  i32 total = 0;
+  while (true) {
+    u8[] chunk = read();
+    if (chunk.len() == 0) { break; }
+
+    // Whatever was left over joins the front of this chunk.
+    u8[] input = u8[held.len() + chunk.len()]();
+    for (i32 i = 0; i < held.len(); i++) { input[i] = held[i]; }
+    for (i32 i = 0; i < chunk.len(); i++) { input[held.len() + i] = chunk[i]; }
+
+    Buf out = Buf.create();
+    i32 at = 0;
+    while (at < input.len()) {
+      Scalar s = decode(input, at);
+      if (s.code == -2) { break; }              // TRUNCATED: hold the tail for the next chunk
+      if (s.code < 0) { return -1; }            // INVALID: not text, and not this loop's problem
+      i32 up = toUpper(s.code);
+      u8[] one = u8[encodedLength(up)]();
+      encode(one, 0, up);
+      out.pushAll(one);
+      at = at + s.size;
+    }
+
+    // The bytes the decoder could not finish are held, not emitted.
+    u8[] tail = u8[input.len() - at]();
+    for (i32 i = at; i < input.len(); i++) { tail[i - at] = input[i]; }
+    held = tail;
+
+    u8[] bytes = out.take();
+    total = total + bytes.len();
+    if (bytes.len() > 0) {
+      if (!write(bytes)) { break; }
+    }
+  }
+  // A held tail at end of input is a truncated scalar: the input was not valid UTF-8.
+  if (held.len() > 0) { return -1; }
+  return total;
+}

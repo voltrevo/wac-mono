@@ -38,6 +38,10 @@ export i32 extKeyShare() { return 51; }
 
 /** The x25519 named group. */
 export i32 groupX25519() { return 0x001d; }
+/** secp256r1, which RFC 8446 §9.1 makes mandatory to support. */
+export i32 groupP256() { return 0x0017; }
+/** X25519MLKEM768, the hybrid post-quantum group. */
+export i32 groupHybrid() { return 0x11EC; }
 /** ed25519 in the signature-algorithms registry. */
 export i32 sigEd25519() { return 0x0807; }
 
@@ -45,7 +49,11 @@ export i32 sigEd25519() { return 0x0807; }
 export struct ClientHello {
   u8[] random;
   u8[] sessionId;
-  /** The client's x25519 key share, or empty if it did not offer one. */
+  /**
+   * The client's key share, as group ++ key, or empty if it offered no group we have.
+   * x25519 is preferred when both are offered: it is several times faster here and the
+   * client sending both means it does not mind which.
+   */
   u8[] keyShare;
   /** The negotiated suite, or 0 if none of ours was offered. */
   i32 suite;
@@ -96,13 +104,33 @@ export ClientHello parseClientHello(u8[] body, i32 preferredSuite) {
           if (vs.u16() == 0x0304) { tls13 = true; }
         }
       } else if (kind == 51) {
-        // key_share: a list of (group, key) pairs. Take the x25519 one if present.
+        // key_share: a list of (group, key) pairs. The hybrid is preferred when it is
+        // offered — a client that sends it is asking for post-quantum protection and
+        // costs nothing to give it — then x25519, then P-256.
         Reader shares = body2.sub16();
+        u8[] hybridShare = u8[0]();
+        u8[] x25519Share = u8[0]();
+        u8[] p256Share = u8[0]();
         while (!shares.empty()) {
           i32 group = shares.u16();
           u8[] key = shares.vec16();
-          if (group == 0x001d && key.len() == 32) { keyShare = key; }
+          if (group == 0x11EC && key.len() == 1216) {
+            hybridShare = u8[1218]();
+            hybridShare[0] = 0x11; hybridShare[1] = 0xEC;
+            for (i32 i = 0; i < 1216; i++) { hybridShare[2 + i] = key[i]; }
+          } else if (group == 0x001d && key.len() == 32) {
+            x25519Share = u8[34]();
+            x25519Share[0] = 0x00; x25519Share[1] = 0x1d;
+            for (i32 i = 0; i < 32; i++) { x25519Share[2 + i] = key[i]; }
+          } else if (group == 0x0017 && key.len() == 65) {
+            p256Share = u8[67]();
+            p256Share[0] = 0x00; p256Share[1] = 0x17;
+            for (i32 i = 0; i < 65; i++) { p256Share[2 + i] = key[i]; }
+          }
         }
+        keyShare = hybridShare;
+        if (keyShare.len() == 0) { keyShare = x25519Share; }
+        if (keyShare.len() == 0) { keyShare = p256Share; }
       } else if (kind == 13) {
         Reader algs = body2.sub16();
         while (!algs.empty()) {
@@ -139,7 +167,7 @@ export u8[] handshakeMessage(i32 msgType, u8[] body) {
  * and omitting it makes middleboxes drop the connection, which is the whole of TLS 1.3's
  * compatibility story in one field.
  */
-export u8[] serverHello(u8[] random, u8[] sessionId, i32 suite, u8[] keyShare) {
+export u8[] serverHello(u8[] random, u8[] sessionId, i32 suite, i32 group, u8[] keyShare) {
   Writer body = Writer.create();
   body.u16(0x0303);               // legacy_version: always TLS 1.2 on the wire
   body.bytes(random);
@@ -153,10 +181,12 @@ export u8[] serverHello(u8[] random, u8[] sessionId, i32 suite, u8[] keyShare) {
   Writer sv = Writer.create();
   sv.u16(0x0304);
   exts.vec16(sv.take());
-  // key_share: the server's single share, not a list.
+  // key_share: the server's single share, not a list, and in the group the client's
+  // share used — a ServerHello that answers in a different group is not a negotiation,
+  // it is a HelloRetryRequest, which is a different message.
   exts.u16(51);
   Writer ks = Writer.create();
-  ks.u16(0x001d);
+  ks.u16(group);
   ks.vec16(keyShare);
   exts.vec16(ks.take());
 

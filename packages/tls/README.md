@@ -16,6 +16,7 @@ A package of [wac-mono](../../README.md). All commands run from the repo root.
 | `src/asn1.wac` | a DER reader, bounds-checked and strict about what DER forbids |
 | `src/x509.wac` | certificate parsing, chain and host-name verification |
 | `src/client.wac` | the client state machine |
+| `src/hybrid.wac` | X25519MLKEM768, the post-quantum hybrid key agreement |
 | `host/serve.ts` | the socket and the randomness, which wasm does not have |
 | `host/connect.ts` | the same, for the client |
 
@@ -49,8 +50,19 @@ malformed.
 
 ## What works
 
-Both ends. TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256, X25519 key exchange,
-Ed25519 certificates. Full 1-RTT handshake, application data both ways, alerts,
+Both ends. TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256; **X25519MLKEM768**,
+X25519 and secp256r1 key exchange; and Ed25519, ECDSA-P256 and RSA certificates.
+
+X25519MLKEM768 is the post-quantum hybrid from
+[draft-ietf-tls-ecdhe-mlkem](https://datatracker.ietf.org/doc/html/draft-ietf-tls-ecdhe-mlkem),
+offered first by the client and preferred by the server. Both ends negotiate it with
+OpenSSL 3.5.7 configured to accept nothing else, which is in the suite.
+
+The concatenation order is the part worth knowing: X25519MLKEM768 puts ML-KEM first and
+SecP256r1MLKEM768 puts the ECDHE half first. Two hybrids in one document, ordered
+differently — a fact about the registry rather than a principle, and precisely the sort
+of thing a reader assumes is consistent. It was taken from the draft and then confirmed
+against a real ClientHello, which offers 1216 bytes for this group. Full 1-RTT handshake, application data both ways, alerts,
 close_notify, KeyUpdate, and the compatibility fields — the legacy version, the echoed
 session id, the meaningless ChangeCipherSpec — that middleboxes need to see.
 
@@ -60,19 +72,40 @@ CertificateVerify signature, binding that identity to *this* transcript; and the
 server's Finished. Each refusal has its own test, paired with the connection that must
 still succeed — a client that refuses everything passes every rejection test.
 
+It offers both key shares in its first flight rather than one. That costs about a
+hundred bytes and saves a whole round trip when a server prefers P-256, which matters
+because this client cannot answer a HelloRetryRequest.
+
+Three certificate types, three encoding quirks, each a place a parser is right for two
+and wrong for the third:
+
+| type | the quirk |
+|---|---|
+| Ed25519 | the key is the BIT STRING and that is all |
+| ECDSA | the *curve* is in the algorithm parameters, not the key — ignore them and a P-384 key reads as P-256 |
+| RSA | the modulus is a DER INTEGER, so one with its top bit set carries a leading zero that is not part of the key |
+
+And ECDSA signatures arrive as a SEQUENCE of two INTEGERs that must be unwrapped and
+zero-padded back to 32 bytes each — a shorter `r` is not a smaller signature, it is the
+same number with fewer digits.
+
 ## What is missing
 
 No PSK or session resumption, no 0-RTT, no HelloRetryRequest, no client certificates
 and no session tickets. Each is a real part of TLS 1.3; both sides send an alert rather
 than pretending.
 
-**Ed25519 only.** The public web runs on RSA and ECDSA, so this client cannot talk to
-it. Adding P-256 means a second field and ECDSA; adding RSA means bignum modular
-exponentiation and PKCS#1. Both are tractable and neither is here.
+**One trusted root, not a store, and no intermediates.** `tlsClientInit` takes a single
+certificate and checks leaf-against-root. A real client carries hundreds of roots and
+builds a path through intermediates, which is the largest remaining gap between this and
+something you could point at the web.
 
-**One trusted root, not a store.** `tlsClientInit` takes a single certificate. A real
-client carries hundreds and has to build a path through intermediates; this checks
-leaf-against-root and nothing longer.
+**No P-384, no Ed448, no RSA below SHA-256.** `ecdsa-with-SHA384` in a certificate is
+recognised and refused rather than mis-verified against the wrong curve.
+
+**PSS parameters are assumed, not parsed.** A certificate signed with RSASSA-PSS carries
+its hash and salt length in the algorithm parameters; this assumes SHA-256 with a
+matching salt, which is what certificate authorities issue. Anything else fails closed.
 
 The HelloRetryRequest gap has a visible consequence: a client offering no X25519 key
 share gets `handshake_failure`, where a complete server would ask it to try again with

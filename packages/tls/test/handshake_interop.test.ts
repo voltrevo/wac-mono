@@ -178,3 +178,42 @@ Deno.test("tls: the connection closes cleanly, not as a truncation", async () =>
   try { conn.close(); } catch { /* already closed by the peer */ }
   await server.done;
 });
+
+/** OpenSSL 3.5.7, built by tools/openssl35.sh. The system 3.0.13 has no ML-KEM. */
+const OPENSSL35 = Deno.env.get("OPENSSL35") ??
+  "/tmp/ossl/openssl-openssl-3.5.7/apps/openssl";
+const HAVE_OPENSSL35 = (() => {
+  try {
+    return Deno.statSync(OPENSSL35).isFile;
+  } catch {
+    return false;
+  }
+})();
+
+Deno.test({
+  name: "tls: the server negotiates X25519MLKEM768 with a post-quantum client",
+  // Skipped rather than failed without the newer OpenSSL: it is a reference this repo
+  // does not ship, and a suite that goes red over a missing optional tool gets ignored.
+  ignore: !HAVE_OPENSSL35,
+  fn: async () => {
+    // `-groups X25519MLKEM768` makes it the *only* group offered, so a server that
+    // quietly fell back to X25519 would fail the handshake rather than silently
+    // downgrade — which is the outcome worth testing for.
+    const server = serveOnce(REPLY);
+    const proc = new Deno.Command(OPENSSL35, {
+      args: ["s_client", "-connect", `127.0.0.1:${server.port}`, "-tls1_3",
+             "-groups", "X25519MLKEM768", "-quiet", "-verify_quiet"],
+      stdin: "piped", stdout: "piped", stderr: "piped",
+    }).spawn();
+    const w = proc.stdin.getWriter();
+    await w.write(enc.encode("GET / HTTP/1.1\r\nHost: wac.test\r\n\r\n"));
+    const { stdout, stderr } = await proc.output();
+    try { w.releaseLock(); } catch { /* already released */ }
+    await server.done;
+
+    const out = dec.decode(stdout);
+    if (!out.includes("HTTP/1.1 200 OK") || !out.includes(BODY.trim())) {
+      throw new Error(`no reply over the hybrid group.\nstdout:\n${out}\nstderr:\n${dec.decode(stderr)}`);
+    }
+  },
+});

@@ -1,0 +1,6 @@
+import { mlkemKeyGen, mlkemEncaps, mlkemDecaps } from "../../src/mlkem.wac";
+/** ek ++ dk, 1184 + 2400 bytes. */
+export u8[] kemKeyGen(u8[] seed) { return mlkemKeyGen(seed); }
+/** shared ++ ciphertext, 32 + 1088 bytes. */
+export u8[] kemEncaps(u8[] ek, u8[] m) { return mlkemEncaps(ek, m); }
+export u8[] kemDecaps(u8[] dk, u8[] ct) { return mlkemDecaps(dk, ct); }

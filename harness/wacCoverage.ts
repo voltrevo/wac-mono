@@ -11,6 +11,7 @@
 import { wacCompile } from "wac/wacCompile.ts";
 import { wacBindgen } from "wac/wacBindgen.ts";
 import { wacFiles } from "./wacFiles.ts";
+import { withArrayHelpers } from "./wacBind.ts";
 
 export type Point = {
   index: number;
@@ -37,7 +38,7 @@ export async function instrument(entry: string): Promise<Instrumented> {
   const ts = wacBindgen(result.compiled);
   await Deno.mkdir(".cache", { recursive: true });
   const out = `.cache/cov_${entry.replaceAll("/", "_")}.gen.ts`;
-  await Deno.writeTextFile(out, ts);
+  await Deno.writeTextFile(out, withArrayHelpers(ts));
   const mod = await import(`${Deno.cwd()}/${out}`) as Record<string, unknown>;
   // The counter array is allocated here, not at instantiation. Skip this and every
   // instrumented function traps on its first branch with "dereferencing a null
