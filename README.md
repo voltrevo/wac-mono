@@ -16,6 +16,13 @@ compiler, this one is things built with it.
 | [`gzip`](packages/gzip/) | gzip and DEFLATE, both directions — compresses at or under `gzip -6` |
 | [`json`](packages/json/) | JSON parse and serialize, verified against the host's own JSON |
 | [`bignum`](packages/bignum/) | arbitrary-precision integers, semantics identical to `BigInt` |
+| [`url`](packages/url/) | WHATWG URL parsing, serialization and relative resolution |
+| [`codec`](packages/codec/) | base16, base32 and base64 from RFC 4648, strict on decode |
+| [`regex`](packages/regex/) | a backtracking regex engine with JavaScript's semantics |
+| [`datetime`](packages/datetime/) | the proleptic Gregorian calendar and RFC 3339 timestamps |
+| [`http`](packages/http/) | HTTP/1.1 request parsing, strict about framing |
+| [`unicode`](packages/unicode/) | UTF-8 as code points, and simple case mapping |
+| [`server`](packages/server/) | an HTTP server in wac — the packages, composed and running |
 | [`std`](packages/std/) | `Vec<T>`, `Map<K, V>`, `Option<T>`, `Result<T, E>` — the containers generics made writable |
 | [`wactest`](packages/wactest/) | assertions for writing tests in wac |
 
@@ -28,7 +35,7 @@ harness/           TypeScript for driving the compiler
   wacBind.ts         compile -> bindgen -> importable JS module
   wacTestRun.ts      run wac-written tests as Deno tests
   wacCoverage.ts     instrument an entry point and report branch coverage
-tools/             check.ts, validate.ts, coverage.ts, mutate.ts
+tools/             check.ts, validate.ts, coverage.ts, mutate.ts, mutate/
 issues/            bug reports and cross-cutting tasks; see issues/README.md
 packages/<name>/
   src/               wac source
@@ -60,12 +67,21 @@ deno task test            # all tests, host-side and wac-written
 deno task coverage        # branch coverage of every package, from its wac-native tests
 deno task coverage:bignum # ...and the host-driven exercises, per package
 deno task coverage:bytes
+deno task coverage:codec
 deno task coverage:crypto
+deno task coverage:datetime
 deno task coverage:fmt
 deno task coverage:gzip
+deno task coverage:http
 deno task coverage:json
+deno task coverage:regex
+deno task coverage:server
 deno task coverage:std
-deno task mutate          # mutation testing
+deno task coverage:unicode
+deno task coverage:url
+deno task mutate          # mutation testing, curated defects
+deno task mutate:operators # ...plus generated ones (removed guards, gutted functions)
+deno task mutate:diff     # ...only for .wac files changed against origin/master
 deno task bench           # gzip throughput
 deno task bench:json      # json throughput, by document shape
 deno task bench:json-lookup # json object lookup: scan vs hash index, and index build cost

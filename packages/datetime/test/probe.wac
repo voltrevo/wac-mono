@@ -1,0 +1,26 @@
+// Host-facing entry points. Timestamps cross as i64 milliseconds, which bindgen marshals.
+
+import { Civil, civilFromDays, daysFromCivil, weekday, isLeap, daysInMonth, isValidDate,
+         dayOfYear } from "../src/civil.wac";
+import { Parsed, parse, format } from "../src/rfc3339.wac";
+
+export i64 toDays(i32 y, i32 m, i32 d) { return daysFromCivil(y, m, d); }
+export i32 fromDaysYear(i64 days) { return civilFromDays(days).year; }
+export i32 fromDaysMonth(i64 days) { return civilFromDays(days).month; }
+export i32 fromDaysDay(i64 days) { return civilFromDays(days).day; }
+export i32 dayOfWeek(i64 days) { return weekday(days); }
+export bool leap(i32 y) { return isLeap(y); }
+export i32 monthLength(i32 y, i32 m) { return daysInMonth(y, m); }
+export bool validDate(i32 y, i32 m, i32 d) { return isValidDate(y, m, d); }
+export i32 yearDay(i32 y, i32 m, i32 d) { return dayOfYear(y, m, d); }
+
+export bool accepts(u8[] s) { return parse(s).ok; }
+export i64 parseMillis(u8[] s) {
+  Parsed p = parse(s);
+  return p.ok ? p.millis : 0;
+}
+export i32 parseOffset(u8[] s) {
+  Parsed p = parse(s);
+  return p.ok ? p.offsetMin : 0;
+}
+export u8[] formatMillis(i64 millis) { return format(millis); }

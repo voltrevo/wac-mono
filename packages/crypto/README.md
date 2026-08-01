@@ -1,7 +1,13 @@
 # crypto
 
-SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR and AES-GCM,
-written in wac.
+SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519,
+NIST P-256 (ECDH and ECDSA) and RSA signature verification, written in wac.
+
+> **Not for production.** Nothing here is constant-time. `ghash`'s multiply branches on
+> every bit of its operand, `aes` indexes an S-box with key-dependent values, and
+> `x25519`'s ladder is only structurally uniform — wac offers no way to stop a compiler
+> or a CPU from undoing that, and none of it has been measured against a timing oracle.
+> The correctness is tested hard; the side channels are not addressed at all.
 
 A package of [wac-mono](../../README.md) — see the root README for layout and how
 to run things. All commands run from the repo root.
@@ -16,6 +22,8 @@ import { aeadEncrypt, aeadTag, aeadDecrypt } from "../../crypto/src/aead.wac";
 import { aesEncrypt, aesDecrypt } from "../../crypto/src/aes.wac";
 import { aesCtr } from "../../crypto/src/aesctr.wac";
 import { gcmEncrypt, gcmTag, gcmDecrypt } from "../../crypto/src/aesgcm.wac";
+import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
+import { ed25519Sign, ed25519Verify, ed25519PublicKey } from "../../crypto/src/ed25519.wac";
 
 u8[] digest = sha256(msg);                     // 32 bytes
 u8[] tag    = hmacSha256(key, msg);            // 32 bytes
@@ -25,7 +33,89 @@ u8[] ct     = chacha20(key, 1, nonce, msg);    // same call decrypts
 u8[] sealed = aeadEncrypt(key, nonce, msg);
 u8[] tag    = aeadTag(key, nonce, aad, sealed);
 u8[] opened = aeadDecrypt(key, nonce, aad, sealed, tag);   // traps if forged
+
+u8[] pub    = x25519Base(secret);              // 32-byte public key
+u8[] shared = x25519(secret, theirPub);        // 32-byte shared secret
+
+u8[] vk     = ed25519PublicKey(seed);          // 32 bytes
+u8[] sig    = ed25519Sign(seed, msg);          // 64 bytes
+bool ok     = ed25519Verify(vk, msg, sig);
 ```
+
+## X25519
+
+Curve25519 Diffie-Hellman, RFC 7748. `src/field25519.wac` is the arithmetic in
+GF(2^255-19) — ten limbs alternating 26 and 25 bits, the same technique poly1305 uses
+for GF(2^130-5) — and `src/x25519.wac` is the Montgomery ladder over it, transcribed
+from RFC 7748 §5 in the RFC's own variable names so the two can be read side by side.
+
+Three independent checks, because a ladder has no partial credit: the published vectors
+including the 1000-iteration chain, a differential against WebCrypto's X25519 on random
+keys in both directions, and the field operations against JavaScript BigInt over 270
+values weighted toward limb and modulus boundaries. The field differential is what makes
+this tractable to develop at all — a wrong ladder tells you only that one of two
+thousand multiplications was wrong.
+
+## Ed25519
+
+RFC 8032, over the same field on the twisted Edwards curve. Points are kept in extended
+coordinates, and the base point is derived from y = 4/5 rather than written out, so the
+x-recovery is exercised on the one point everything else depends on.
+
+Signing and verifying are tested separately rather than only round-tripped, which is not
+pedantry: the first version signed all of RFC 8032's vectors correctly and failed to
+verify two of the three public keys. `sqrt(-1)` had been computed one factor of two
+short, which only affects point *decoding* — a path signing never takes. A sign-then-
+verify test would have passed.
+
+Roughly 120 ms per signature. The scalar multiplication is a plain 256-step
+double-and-add with no windowing, which is the slowest reasonable choice and the easiest
+to read against the spec.
+
+## RSA
+
+`src/rsa.wac`, built on [bignum](../bignum/README.md) — verification only. Signing needs
+the private key, and private-key RSA in a language with no constant-time story is a worse
+idea than the rest of this package already is; verification touches only public values.
+
+PKCS#1 v1.5 *and* PSS, because TLS 1.3 needs both for different things. RFC 8446 §4.4.3
+forbids v1.5 in CertificateVerify — a peer must use PSS — while §4.4.2.2 allows it for
+the signatures inside a certificate chain, which is how almost every certificate in the
+world is signed.
+
+The tests are mostly refusals. RSA's history is a list of verifiers that *searched* for
+the padding structure instead of requiring it: Bleichenbacher's 2006 forgery worked
+against implementations that parsed the DigestInfo rather than matching its bytes, and
+against ones that stopped checking after finding the hash. So the DigestInfo prefix here
+is a byte table to compare against, never something to parse.
+
+About 170 ms per 2048-bit verification. `modPow` is square-and-multiply with a divmod
+after each step; the exponent is public, so branching on its bits is the one place in
+this package where the timing caveat genuinely does not apply.
+
+## P-256
+
+`src/fieldp256.wac` and `src/p256.wac`. A different prime and a different curve shape
+from Curve25519, and both differences show:
+
+- 2^255-19 is a power of two minus a small number, so a value that overflows folds back
+  as one small multiply. P-256's prime is a **Solinas** prime, chosen so reduction is a
+  shuffle of 32-bit words with no multiplication — nine terms selected from the product
+  and combined. Neither trick works for the other prime.
+- Curve25519's Montgomery ladder needs no addition law. A short Weierstrass curve has
+  one, with exceptional cases: a point plus itself needs a different formula, and a point
+  plus its negation gives the identity, which has no affine coordinates. Those cases are
+  most of the extra code, and each is reached by ordinary inputs.
+
+Checked against BigInt for the field and WebCrypto for ECDH and ECDSA, in both
+directions. ECDSA is randomised, so "our signatures verify in WebCrypto" is a separate
+test from "we verify theirs" — there is no byte-identity to compare, unlike Ed25519.
+
+Roughly 37 ms per scalar multiplication.
+
+A caller checking for the all-zero shared secret, as RFC 7748 §6.1 permits, gets it: a
+low-order point multiplies to the identity and encodes as zero. This package does not
+reject those itself, because whether that is an error depends on the protocol above.
 
 ## Status
 

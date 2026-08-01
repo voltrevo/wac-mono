@@ -1,0 +1,121 @@
+// Reading and writing TLS's wire encoding.
+//
+// TLS is big-endian and length-prefixed everywhere, with prefixes of one, two or three
+// bytes depending on how large the field can be. Almost every parsing bug in a TLS
+// implementation is a length prefix trusted without checking it against the bytes
+// actually present, so the reader here bounds-checks every read against the enclosing
+// slice and traps rather than returning a short value.
+//
+// `bytes`'s Buf is little-endian — it grew up serving gzip — so the writer is here
+// rather than there. Sharing one with a byte order flag would be worse than two: the
+// flag would be right in the tests and wrong once in the code.
+
+/** A bounds-checked cursor over a byte slice. */
+export struct Reader {
+  u8[] buf;
+  i32 pos;
+  i32 end;
+
+  Reader create(u8[] buf) { return Reader(buf, 0, buf.len()); }
+
+  /** A sub-reader over the next `n` bytes, and advance past them. */
+  Reader slice(this, i32 n) {
+    if (n < 0) { trap; }
+    if (this.pos + n > this.end) { trap; }
+    Reader r = Reader(this.buf, this.pos, this.pos + n);
+    this.pos += n;
+    return r;
+  }
+
+  i32 remaining(const this) { return this.end - this.pos; }
+  bool empty(const this) { return this.pos >= this.end; }
+
+  i32 u8(this) {
+    if (this.pos >= this.end) { trap; }
+    i32 v = this.buf[this.pos];
+    this.pos++;
+    return v;
+  }
+
+  i32 u16(this) { return (this.u8() << 8) | this.u8(); }
+  i32 u24(this) { return (this.u16() << 8) | this.u8(); }
+  i32 u32(this) { return (this.u16() << 16) | this.u16(); }
+
+  /** `n` raw bytes. */
+  u8[] take(this, i32 n) {
+    if (n < 0) { trap; }
+    if (this.pos + n > this.end) { trap; }
+    u8[] out = u8[n]();
+    for (i32 i = 0; i < n; i++) { out[i] = this.buf[this.pos + i]; }
+    this.pos += n;
+    return out;
+  }
+
+  /** A vector with a one-, two- or three-byte length prefix. */
+  u8[] vec8(this) { return this.take(this.u8()); }
+  u8[] vec16(this) { return this.take(this.u16()); }
+  u8[] vec24(this) { return this.take(this.u24()); }
+
+  /** A sub-reader over a length-prefixed vector, without copying. */
+  Reader sub16(this) { return this.slice(this.u16()); }
+  Reader sub8(this) { return this.slice(this.u8()); }
+
+  /** Everything a well-formed message should have consumed. */
+  void expectEnd(const this) { if (this.pos != this.end) { trap; } }
+}
+
+/** A growable big-endian byte writer. */
+export struct Writer {
+  u8[] buf;
+  i32 len;
+
+  Writer create() { return Writer(u8[64](), 0); }
+
+  void reserve(this, i32 extra) {
+    if (this.len + extra <= this.buf.len()) { return; }
+    i32 want = this.buf.len() * 2;
+    while (want < this.len + extra) { want = want * 2; }
+    u8[] bigger = u8[want]();
+    for (i32 i = 0; i < this.len; i++) { bigger[i] = this.buf[i]; }
+    this.buf = bigger;
+  }
+
+  void u8(this, i32 v) {
+    this.reserve(1);
+    this.buf[this.len] = v & 0xFF;
+    this.len++;
+  }
+
+  void u16(this, i32 v) { this.u8((v >> 8) & 0xFF); this.u8(v & 0xFF); }
+  void u24(this, i32 v) { this.u8((v >> 16) & 0xFF); this.u16(v & 0xFFFF); }
+  void u32(this, i32 v) { this.u16((v >> 16) & 0xFFFF); this.u16(v & 0xFFFF); }
+
+  void bytes(this, u8[] src) {
+    this.reserve(src.len());
+    for (i32 i = 0; i < src.len(); i++) { this.buf[this.len + i] = src[i]; }
+    this.len += src.len();
+  }
+
+  /** Write `src` behind a one-, two- or three-byte length prefix. */
+  void vec8(this, u8[] src) {
+    if (src.len() > 255) { trap; }
+    this.u8(src.len());
+    this.bytes(src);
+  }
+  void vec16(this, u8[] src) {
+    if (src.len() > 65535) { trap; }
+    this.u16(src.len());
+    this.bytes(src);
+  }
+  void vec24(this, u8[] src) {
+    if (src.len() > 16777215) { trap; }
+    this.u24(src.len());
+    this.bytes(src);
+  }
+
+  u8[] take(const this) {
+    u8[] out = u8[this.len]();
+    for (i32 i = 0; i < this.len; i++) { out[i] = this.buf[i]; }
+    return out;
+  }
+}

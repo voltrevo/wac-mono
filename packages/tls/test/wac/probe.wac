@@ -1,0 +1,123 @@
+// The key schedule at the host boundary.
+import { expandLabel, deriveSecret, earlySecret, handshakeSecret, masterSecret,
+         trafficKeyIv, finishedVerify, nextTrafficSecret, emptyHash, zeroKey }
+  from "../../src/keyschedule.wac";
+
+export u8[] tlsExpandLabel(u8[] secret, u8[] label, u8[] ctx, i32 len) {
+  return expandLabel(secret, label, ctx, len);
+}
+export u8[] tlsDeriveSecret(u8[] secret, u8[] label, u8[] th) { return deriveSecret(secret, label, th); }
+export u8[] tlsEarlySecret(u8[] psk) { return earlySecret(psk); }
+export u8[] tlsHandshakeSecret(u8[] early, u8[] dhe) { return handshakeSecret(early, dhe); }
+export u8[] tlsMasterSecret(u8[] hs) { return masterSecret(hs); }
+export u8[] tlsTrafficKeyIv(u8[] secret, i32 keyLen) { return trafficKeyIv(secret, keyLen); }
+export u8[] tlsFinishedVerify(u8[] base, u8[] th) { return finishedVerify(base, th); }
+export u8[] tlsNextTrafficSecret(u8[] s) { return nextTrafficSecret(s); }
+export u8[] tlsEmptyHash() { return emptyHash(); }
+export u8[] tlsZeroKey() { return zeroKey(); }
+
+// Record layer.
+import { recordSeal, recordOpen, recordType, recordContent, recordLength,
+         suiteAes128Gcm, suiteChaCha20, suiteKeyLen } from "../../src/record.wac";
+
+export u8[] tlsSeal(i32 suite, u8[] k, u8[] iv, i64 seq, i32 ct, u8[] content, i32 pad) {
+  return recordSeal(suite, k, iv, seq, ct, content, pad);
+}
+export u8[] tlsOpen(i32 suite, u8[] k, u8[] iv, i64 seq, u8[] rec) {
+  return recordOpen(suite, k, iv, seq, rec);
+}
+export i32 tlsRecordType(u8[] inner) { return recordType(inner); }
+export u8[] tlsRecordContent(u8[] inner) { return recordContent(inner); }
+export i32 tlsRecordLength(u8[] buf) { return recordLength(buf); }
+export i32 tlsSuiteAes() { return suiteAes128Gcm(); }
+export i32 tlsSuiteChaCha() { return suiteChaCha20(); }
+export i32 tlsSuiteKeyLen(i32 s) { return suiteKeyLen(s); }
+
+// Handshake messages.
+import { parseClientHello, ClientHello, serverHello, encryptedExtensions, certificate,
+         certificateVerify, certificateVerifyContent, finished, handshakeMessage,
+         messageType, messageBody, messageLength } from "../../src/handshake.wac";
+
+/**
+ * Parse a ClientHello and flatten the result, since bindgen cannot marshal a struct.
+ * Layout: suite(2) flags(1) sessionIdLen(1) sessionId keyShareLen(1) keyShare
+ *         nameLen(2) name random(32)
+ */
+export u8[] tlsParseClientHello(u8[] body, i32 preferred) {
+  ClientHello ch = parseClientHello(body, preferred);
+  i32 n = 2 + 1 + 1 + ch.sessionId.len() + 1 + ch.keyShare.len() + 2 + ch.serverName.len() + 32;
+  u8[] out = u8[n]();
+  i32 p = 0;
+  out[p] = (ch.suite >> 8) & 0xFF; p++;
+  out[p] = ch.suite & 0xFF; p++;
+  out[p] = (ch.offersTls13 ? 1 : 0) | (ch.offersEd25519 ? 2 : 0); p++;
+  out[p] = ch.sessionId.len(); p++;
+  for (i32 i = 0; i < ch.sessionId.len(); i++) { out[p + i] = ch.sessionId[i]; }
+  p += ch.sessionId.len();
+  out[p] = ch.keyShare.len(); p++;
+  for (i32 i = 0; i < ch.keyShare.len(); i++) { out[p + i] = ch.keyShare[i]; }
+  p += ch.keyShare.len();
+  out[p] = (ch.serverName.len() >> 8) & 0xFF; p++;
+  out[p] = ch.serverName.len() & 0xFF; p++;
+  for (i32 i = 0; i < ch.serverName.len(); i++) { out[p + i] = ch.serverName[i]; }
+  p += ch.serverName.len();
+  for (i32 i = 0; i < 32; i++) { out[p + i] = ch.random[i]; }
+  return out;
+}
+export u8[] tlsServerHello(u8[] r, u8[] sid, i32 suite, u8[] ks) { return serverHello(r, sid, suite, ks); }
+export u8[] tlsEncryptedExtensions() { return encryptedExtensions(); }
+export u8[] tlsCertificate(u8[] der) { return certificate(der); }
+export u8[] tlsCertificateVerify(u8[] sig) { return certificateVerify(sig); }
+export u8[] tlsCertVerifyContent(u8[] th, bool server) { return certificateVerifyContent(th, server); }
+export u8[] tlsFinished(u8[] vd) { return finished(vd); }
+export u8[] tlsHandshakeMessage(i32 t, u8[] b) { return handshakeMessage(t, b); }
+export i32 tlsMessageType(u8[] m) { return messageType(m); }
+export u8[] tlsMessageBody(u8[] m) { return messageBody(m); }
+export i32 tlsMessageLength(u8[] b) { return messageLength(b); }
+
+// The server state machine.
+import { tlsServerInit, tlsServerFeed, tlsServerSend, tlsPhase, tlsRecordNeeded,
+         tlsServerClose, tlsServerAlert } from "../../src/server.wac";
+export u8[] srvInit(u8[] cert, u8[] seed, u8[] eph, u8[] rnd) { return tlsServerInit(cert, seed, eph, rnd); }
+export u8[] srvFeed(u8[] state, u8[] input) { return tlsServerFeed(state, input); }
+export u8[] srvSend(u8[] state, u8[] data) { return tlsServerSend(state, data); }
+export i32 srvPhase(u8[] state) { return tlsPhase(state); }
+export i32 srvRecordNeeded(u8[] buf) { return tlsRecordNeeded(buf); }
+export u8[] srvClose(u8[] state) { return tlsServerClose(state); }
+export u8[] srvAlert(u8[] state, i32 d) { return tlsServerAlert(state, d); }
+
+// X.509.
+import { parseCert, Cert, certMatchesHost, certSignedBy, verifyChain } from "../../src/x509.wac";
+
+/** Parse and flatten: [notBefore(8)][notAfter(8)][isCa(1)][pubkey(32)][dnsLen(2)][dns] */
+export u8[] x509Parse(u8[] der) {
+  Cert c = parseCert(der);
+  u8[] out = u8[8 + 8 + 1 + 32 + 2 + c.dnsNames.len()]();
+  for (i32 i = 0; i < 8; i++) { out[i] = ((c.notBefore >> (((7 - i) * 8) as i64)) & 255) as! i32; }
+  for (i32 i = 0; i < 8; i++) { out[8 + i] = ((c.notAfter >> (((7 - i) * 8) as i64)) & 255) as! i32; }
+  out[16] = c.isCa ? 1 : 0;
+  for (i32 i = 0; i < 32; i++) { out[17 + i] = c.publicKey[i]; }
+  out[49] = (c.dnsNames.len() >> 8) & 0xFF;
+  out[50] = c.dnsNames.len() & 0xFF;
+  for (i32 i = 0; i < c.dnsNames.len(); i++) { out[51 + i] = c.dnsNames[i]; }
+  return out;
+}
+export bool x509MatchesHost(u8[] der, u8[] host) { return certMatchesHost(parseCert(der), host); }
+export bool x509SignedBy(u8[] leafDer, u8[] caDer) {
+  return certSignedBy(parseCert(leafDer), parseCert(caDer));
+}
+export i32 x509VerifyChain(u8[] leafDer, u8[] caDer, u8[] host, i64 now) {
+  return verifyChain(parseCert(leafDer), parseCert(caDer), host, now);
+}
+
+// The client state machine.
+import { tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientClose, tlsClientPhase,
+         tlsClientFailure } from "../../src/client.wac";
+export u8[] cliInit(u8[] host, u8[] root, u8[] eph, u8[] rnd, i64 now) {
+  return tlsClientInit(host, root, eph, rnd, now);
+}
+export u8[] cliFeed(u8[] state, u8[] input) { return tlsClientFeed(state, input); }
+export u8[] cliSend(u8[] state, u8[] data) { return tlsClientSend(state, data); }
+export u8[] cliClose(u8[] state) { return tlsClientClose(state); }
+export i32 cliPhase(u8[] state) { return tlsClientPhase(state); }
+export i32 cliFailure(u8[] state) { return tlsClientFailure(state); }

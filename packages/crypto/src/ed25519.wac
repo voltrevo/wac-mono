@@ -1,0 +1,408 @@
+// Ed25519 signatures, RFC 8032.
+//
+// The same field as X25519 and a different curve over it: the twisted Edwards curve
+// -x^2 + y^2 = 1 + d*x^2*y^2, which is birationally equivalent to Curve25519 but has an
+// addition law with no exceptional cases. Every pair of points adds by one formula,
+// including a point plus itself and anything plus the identity, which is why signatures
+// live here and Diffie-Hellman lives on the Montgomery form: the ladder needs no
+// addition law at all, and a signature scheme needs one that never branches.
+//
+// Points are kept in extended coordinates (X:Y:Z:T) with x = X/Z, y = Y/Z and
+// x*y = T/Z. The redundant T is what makes the addition law cheap — without it every
+// addition would need an inversion.
+//
+// ## Two moduli
+//
+// Coordinates live mod p = 2^255-19. *Scalars* live mod L = 2^252 + 277423..., the order
+// of the base point's subgroup, which is a different and unrelated modulus. Mixing them
+// up produces something that verifies against itself and against nothing else, so scalar
+// arithmetic is kept in its own section and works on bytes rather than field elements.
+//
+// ## What this does not promise
+//
+// Not constant-time — see the package README. Signing branches on scalar bits in the
+// double-and-add, which leaks the nonce and therefore the key to anyone who can measure
+// it. This is a correctness exercise.
+
+import { sha512 } from "./sha512.wac";
+import {
+  feAdd, feCopy, feEquals, feFromBytes, feInvert, feIsNegative, feIsZero, feMul,
+  feMulSmall, feNeg, feOne, fePow22523, feSelect, feSquare, feSub, feToBytes, feZero,
+} from "./field25519.wac";
+
+// ── Curve constants ───────────────────────────────────────────────────────────
+
+/** d = -121665/121666, the curve parameter. */
+i64[] curveD() {
+  return feMul(feNeg(feMulSmall(feOne(), 121665)), feInvert(feMulSmall(feOne(), 121666)));
+}
+
+/** 2*d, which the addition law uses directly. */
+i64[] curveD2() { return feMulSmall(curveD(), 2); }
+
+/**
+ * sqrt(-1) in the field, needed when recovering x from y.
+ *
+ * 2^((p-1)/4) mod p. Computed rather than written out, because the constant's ten limbs
+ * would be opaque and a transcription error in them is undetectable by reading — but the
+ * exponent has to be exactly right, and getting it wrong is quiet:
+ *
+ *   p = 2^255 - 19,  so  (p-1)/4 = 2^253 - 5
+ *   fePow22523(2)         = 2^(2^252 - 3)
+ *   squared               = 2^(2^253 - 6)
+ *   times two             = 2^(2^253 - 5)      <- this one
+ *
+ * The first version stopped at the squaring, one factor of two short. That produced a
+ * sqrt(-1) that was simply some other field element, so `recoverX` took the wrong branch
+ * for exactly those y whose candidate root needed correcting — about half of them. The
+ * base point was not one of them, and neither was one of RFC 8032's three public keys,
+ * so signing was perfect and verification failed two times in three.
+ */
+i64[] sqrtM1() {
+  i64[] two = feMulSmall(feOne(), 2);
+  return feMul(feSquare(fePow22523(two)), two);
+}
+
+// ── Points ────────────────────────────────────────────────────────────────────
+
+/** A point in extended coordinates. */
+export struct Point {
+  i64[] x;
+  i64[] y;
+  i64[] z;
+  i64[] t;
+}
+
+/** The identity, (0, 1). */
+export Point ptIdentity() { return Point(feZero(), feOne(), feOne(), feZero()); }
+
+/**
+ * The base point B, whose y-coordinate is 4/5 and whose x is the even root.
+ *
+ * RFC 8032 §5.1 gives it as a decimal pair; deriving it from y = 4/5 instead means the
+ * recovery code is exercised on the one point everything else depends on, so a broken
+ * `recoverX` fails immediately and loudly rather than only for received keys.
+ */
+export Point ptBase() {
+  i64[] y = feMul(feMulSmall(feOne(), 4), feInvert(feMulSmall(feOne(), 5)));
+  i64[] x = recoverX(y, 0);
+  return Point(x, y, feOne(), feMul(x, y));
+}
+
+/**
+ * The x-coordinate with the given sign for a point with y-coordinate `y`.
+ *
+ * From the curve equation, x^2 = (y^2 - 1) / (d*y^2 + 1). Taking the square root uses
+ * p = 5 (mod 8): a candidate is (u/v) * (u*v^3) * (u*v^7)^((p-5)/8), and if that squares
+ * to -u/v rather than u/v the true root is the candidate times sqrt(-1).
+ *
+ * Returns zero for a y with no root, which the caller must reject — an invalid encoding
+ * is not a point.
+ */
+i64[] recoverX(i64[] y, i32 wantSign) {
+  i64[] y2 = feSquare(y);
+  i64[] u = feSub(y2, feOne());
+  i64[] v = feAdd(feMul(curveD(), y2), feOne());
+
+  i64[] v3 = feMul(feSquare(v), v);
+  i64[] v7 = feMul(feSquare(v3), v);
+  i64[] x = feMul(feMul(u, v3), fePow22523(feMul(u, v7)));
+
+  // Check x^2 * v == u; if it equals -u instead, multiply by sqrt(-1).
+  i64[] check = feMul(feSquare(x), v);
+  if (feEquals(check, u) == 0) {
+    if (feEquals(check, feNeg(u)) == 1) {
+      x = feMul(x, sqrtM1());
+    } else {
+      return feZero();   // no square root: not a point
+    }
+  }
+
+  if (feIsZero(x) == 1 && wantSign == 1) { return feZero(); }   // x = 0 has no odd root
+  if (feIsNegative(x) != wantSign) { x = feNeg(x); }
+  return x;
+}
+
+/** P + Q, by RFC 8032's addition law for extended coordinates. */
+export Point ptAdd(Point p, Point q) {
+  i64[] a = feMul(feSub(p.y, p.x), feSub(q.y, q.x));
+  i64[] b = feMul(feAdd(p.y, p.x), feAdd(q.y, q.x));
+  i64[] c = feMul(feMul(p.t, q.t), curveD2());
+  i64[] d = feMulSmall(feMul(p.z, q.z), 2);
+  i64[] e = feSub(b, a);
+  i64[] f = feSub(d, c);
+  i64[] g = feAdd(d, c);
+  i64[] h = feAdd(b, a);
+  return Point(feMul(e, f), feMul(g, h), feMul(f, g), feMul(e, h));
+}
+
+/** 2P. The same formula as ptAdd with q = p, kept separate only for clarity. */
+export Point ptDouble(Point p) { return ptAdd(p, p); }
+
+/** P == Q, comparing projectively: x1*z2 == x2*z1 and y1*z2 == y2*z1. */
+export i32 ptEquals(Point p, Point q) {
+  i32 xs = feEquals(feMul(p.x, q.z), feMul(q.x, p.z));
+  i32 ys = feEquals(feMul(p.y, q.z), feMul(q.y, p.z));
+  return (xs == 1 && ys == 1) ? 1 : 0;
+}
+
+/**
+ * The 32-byte encoding: y with the low bit of x in the top bit.
+ *
+ * Only 255 bits of y are meaningful, so bit 255 is free to carry the sign — the same
+ * trick X25519 leaves unused.
+ */
+export u8[] ptEncode(Point p) {
+  i64[] zi = feInvert(p.z);
+  i64[] x = feMul(p.x, zi);
+  i64[] y = feMul(p.y, zi);
+  u8[] out = feToBytes(y);
+  out[31] = out[31] | (feIsNegative(x) << 7);
+  return out;
+}
+
+/** Decode a point, or null if the bytes are not one. */
+export Point? ptDecode(u8[] s) {
+  if (s.len() != 32) { return null; }
+  u8[] yBytes = u8[32]();
+  for (i32 i = 0; i < 32; i++) { yBytes[i] = s[i]; }
+  i32 sign = (yBytes[31] >> 7) & 1;
+  yBytes[31] = yBytes[31] & 127;
+
+  i64[] y = feFromBytes(yBytes);
+  i64[] x = recoverX(y, sign);
+  // recoverX returns zero both for "no root" and for the legitimate x = 0 with sign 0.
+  // Distinguish by checking the curve equation rather than by trusting the zero.
+  Point p = Point(x, y, feOne(), feMul(x, y));
+  if (onCurve(p) == 0) { return null; }
+  return p;
+}
+
+/** Whether an affine (z = 1) point satisfies -x^2 + y^2 = 1 + d*x^2*y^2. */
+i32 onCurve(Point p) {
+  i64[] x2 = feSquare(p.x);
+  i64[] y2 = feSquare(p.y);
+  i64[] lhs = feSub(y2, x2);
+  i64[] rhs = feAdd(feOne(), feMul(curveD(), feMul(x2, y2)));
+  return feEquals(lhs, rhs);
+}
+
+/**
+ * scalar * P, by double-and-add over the scalar's 256 bits.
+ *
+ * Both branches of the conditional add are computed and one is selected, so the shape
+ * does not depend on the bit — the same discipline as X25519's ladder, and with the same
+ * caveat that wac cannot promise it survives compilation.
+ */
+export Point ptMul(u8[] scalar, Point p) {
+  Point acc = ptIdentity();
+  Point addend = Point(feCopy(p.x), feCopy(p.y), feCopy(p.z), feCopy(p.t));
+  for (i32 i = 0; i < 256; i++) {
+    i32 bit = (scalar[i / 8] >> (i % 8)) & 1;
+    Point sum = ptAdd(acc, addend);
+    acc = Point(
+      feSelect(acc.x, sum.x, bit),
+      feSelect(acc.y, sum.y, bit),
+      feSelect(acc.z, sum.z, bit),
+      feSelect(acc.t, sum.t, bit));
+    addend = ptDouble(addend);
+  }
+  return acc;
+}
+
+// ── Scalars, modulo the group order L ─────────────────────────────────────────
+
+/**
+ * L = 2^252 + 27742317777372353535851937790883648493, little-endian.
+ *
+ * The order of the base point's subgroup. Note this is *not* the field modulus: mixing
+ * the two is the classic Ed25519 error and produces signatures that verify only against
+ * the same broken implementation.
+ */
+const u8[] L = u8[](
+  0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
+  0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+);
+
+/**
+ * Reduce a 64-byte little-endian integer modulo L, to 32 bytes.
+ *
+ * Schoolbook long division by repeated conditional subtraction of shifted L, which is
+ * 512 iterations of a 33-byte compare-and-subtract. Slower than Barrett reduction by a
+ * wide margin and short enough to check by reading, which is the trade this package
+ * makes everywhere the answer has to be right more than it has to be quick.
+ */
+u8[] scReduce(u8[] wide) {
+  // Work in a 64-byte accumulator, subtracting L shifted left by k bits for k from the
+  // top down. `shifted` holds L << k as 64 bytes.
+  u8[] r = u8[64]();
+  for (i32 i = 0; i < 64; i++) { r[i] = wide[i]; }
+
+  for (i32 k = 259; k >= 0; k--) {
+    // shifted = L << k
+    u8[] shifted = u8[64]();
+    i32 byteShift = k / 8;
+    i32 bitShift = k % 8;
+    i32 carry = 0;
+    for (i32 i = 0; i < 32; i++) {
+      i32 v = (L[i] << bitShift) | carry;
+      if (byteShift + i < 64) { shifted[byteShift + i] = v & 0xFF; }
+      carry = (v >> 8) & 0xFF;
+    }
+    if (byteShift + 32 < 64) { shifted[byteShift + 32] = carry; }
+
+    // r >= shifted ?
+    i32 ge = 1;
+    for (i32 i = 63; i >= 0; i--) {
+      if (r[i] != shifted[i]) { ge = r[i] > shifted[i] ? 1 : 0; i = -1; }
+    }
+    if (ge == 1) {
+      i32 borrow = 0;
+      for (i32 i = 0; i < 64; i++) {
+        i32 diff = r[i] - shifted[i] - borrow;
+        borrow = diff < 0 ? 1 : 0;
+        r[i] = diff & 0xFF;
+      }
+    }
+  }
+
+  u8[] out = u8[32]();
+  for (i32 i = 0; i < 32; i++) { out[i] = r[i]; }
+  return out;
+}
+
+/** (a*b + c) mod L, with a, b, c each 32 bytes little-endian. */
+u8[] scMulAdd(u8[] a, u8[] b, u8[] c) {
+  u8[] wide = u8[64]();
+  for (i32 i = 0; i < 32; i++) {
+    i32 carry = 0;
+    for (i32 j = 0; j < 32; j++) {
+      i32 v = wide[i + j] + a[i] * b[j] + carry;
+      wide[i + j] = v & 0xFF;
+      carry = v >> 8;
+    }
+    // Propagate the final carry across the rest of the accumulator unconditionally
+    // rather than while it is non-zero. The conditional version is the obvious way to
+    // write it and stops early almost always, which means the tail is reached by about
+    // one input in sixteen — a branch that is live, rare, and therefore untested. Fixed
+    // bounds cost a few hundred additions per signature and remove the question.
+    for (i32 k = i + 32; k < 64; k++) {
+      i32 v = wide[k] + carry;
+      wide[k] = v & 0xFF;
+      carry = v >> 8;
+    }
+  }
+  i32 carry2 = 0;
+  for (i32 i = 0; i < 32; i++) {
+    i32 v = wide[i] + c[i] + carry2;
+    wide[i] = v & 0xFF;
+    carry2 = v >> 8;
+  }
+  for (i32 k = 32; k < 64; k++) {
+    i32 v = wide[k] + carry2;
+    wide[k] = v & 0xFF;
+    carry2 = v >> 8;
+  }
+  return scReduce(wide);
+}
+
+/** Whether a 32-byte scalar is below L, which a valid signature's S must be. */
+i32 scLessThanL(u8[] s) {
+  for (i32 i = 31; i >= 0; i--) {
+    if (s[i] != L[i]) { return s[i] < L[i] ? 1 : 0; }
+  }
+  return 0;   // equal to L is not less than L
+}
+
+// ── The signature scheme ──────────────────────────────────────────────────────
+
+/**
+ * Expand a 32-byte seed into the scalar and the nonce prefix.
+ *
+ * SHA-512 of the seed: the first half becomes the secret scalar after the same clamp
+ * X25519 uses, the second half is the prefix that makes the per-message nonce
+ * deterministic. Determinism is the point — Ed25519 has no random number generator to
+ * get wrong, and a repeated nonce in a randomised scheme reveals the key.
+ */
+u8[] expandSeed(u8[] seed) { return sha512(seed); }
+
+u8[] clampScalar(u8[] h) {
+  u8[] a = u8[32]();
+  for (i32 i = 0; i < 32; i++) { a[i] = h[i]; }
+  a[0] = a[0] & 248;
+  a[31] = a[31] & 63;
+  a[31] = a[31] | 64;
+  return a;
+}
+
+/** The 32-byte public key for a 32-byte seed. */
+export u8[] ed25519PublicKey(u8[] seed) {
+  if (seed.len() != 32) { trap; }
+  u8[] a = clampScalar(expandSeed(seed));
+  return ptEncode(ptMul(a, ptBase()));
+}
+
+/** The 64-byte signature over `msg` for a 32-byte seed. */
+export u8[] ed25519Sign(u8[] seed, u8[] msg) {
+  if (seed.len() != 32) { trap; }
+  u8[] h = expandSeed(seed);
+  u8[] a = clampScalar(h);
+  u8[] pub = ptEncode(ptMul(a, ptBase()));
+
+  // r = H(prefix || msg) mod L, where prefix is the second half of the expansion.
+  u8[] prefixMsg = u8[32 + msg.len()]();
+  for (i32 i = 0; i < 32; i++) { prefixMsg[i] = h[32 + i]; }
+  for (i32 i = 0; i < msg.len(); i++) { prefixMsg[32 + i] = msg[i]; }
+  u8[] r = scReduce(sha512(prefixMsg));
+
+  u8[] rPoint = ptEncode(ptMul(r, ptBase()));
+
+  // k = H(R || A || msg) mod L
+  u8[] kInput = u8[64 + msg.len()]();
+  for (i32 i = 0; i < 32; i++) { kInput[i] = rPoint[i]; }
+  for (i32 i = 0; i < 32; i++) { kInput[32 + i] = pub[i]; }
+  for (i32 i = 0; i < msg.len(); i++) { kInput[64 + i] = msg[i]; }
+  u8[] k = scReduce(sha512(kInput));
+
+  u8[] s = scMulAdd(k, a, r);
+
+  u8[] sig = u8[64]();
+  for (i32 i = 0; i < 32; i++) { sig[i] = rPoint[i]; sig[32 + i] = s[i]; }
+  return sig;
+}
+
+/**
+ * Verify a 64-byte signature.
+ *
+ * Checks [S]B == R + [k]A. RFC 8032 §5.1.7 also requires rejecting an S at or above L,
+ * which is what stops a signature being malleable: without it, S and S+L both verify and
+ * a signature is no longer a unique token.
+ */
+export bool ed25519Verify(u8[] pub, u8[] msg, u8[] sig) {
+  if (pub.len() != 32) { return false; }
+  if (sig.len() != 64) { return false; }
+
+  u8[] rBytes = u8[32]();
+  u8[] s = u8[32]();
+  for (i32 i = 0; i < 32; i++) { rBytes[i] = sig[i]; s[i] = sig[32 + i]; }
+  if (scLessThanL(s) == 0) { return false; }
+
+  Point? maybeA = ptDecode(pub);
+  if (maybeA is null) { return false; }
+  Point a = maybeA!;
+  Point? maybeR = ptDecode(rBytes);
+  if (maybeR is null) { return false; }
+  Point rPoint = maybeR!;
+
+  u8[] kInput = u8[64 + msg.len()]();
+  for (i32 i = 0; i < 32; i++) { kInput[i] = rBytes[i]; }
+  for (i32 i = 0; i < 32; i++) { kInput[32 + i] = pub[i]; }
+  for (i32 i = 0; i < msg.len(); i++) { kInput[64 + i] = msg[i]; }
+  u8[] k = scReduce(sha512(kInput));
+
+  Point left = ptMul(s, ptBase());
+  Point right = ptAdd(rPoint, ptMul(k, a));
+  return ptEquals(left, right) == 1;
+}

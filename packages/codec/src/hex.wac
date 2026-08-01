@@ -1,0 +1,58 @@
+// Base16, from RFC 4648.
+//
+// The simplest of the three encodings and the one with the least room for disagreement, which
+// makes it the right place to settle the decisions the other two share: decoding is strict, a
+// decode returns null rather than trapping, and encoding chooses a case while decoding accepts
+// either.
+
+import { Buf } from "../../bytes/src/buf.wac";
+
+i32 lowerDigit(i32 v) { return v < 10 ? 48 + v : 87 + v; }
+i32 upperDigit(i32 v) { return v < 10 ? 48 + v : 55 + v; }
+
+/** The value of one hex digit, or -1. Accepts both cases, as RFC 4648 requires of decoders. */
+export i32 digitValue(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+  return -1;
+}
+
+export u8[] encode(u8[] data) {
+  Buf out = Buf.create();
+  out.reserveFor(data.len() * 2);
+  for (i32 i = 0; i < data.len(); i++) {
+    out.push(lowerDigit((data[i] >> 4) & 15));
+    out.push(lowerDigit(data[i] & 15));
+  }
+  return out.take();
+}
+
+export u8[] encodeUpper(u8[] data) {
+  Buf out = Buf.create();
+  out.reserveFor(data.len() * 2);
+  for (i32 i = 0; i < data.len(); i++) {
+    out.push(upperDigit((data[i] >> 4) & 15));
+    out.push(upperDigit(data[i] & 15));
+  }
+  return out.take();
+}
+
+/**
+ * Decode, or null.
+ *
+ * Strict: an odd length and any non-digit are both failures. Nothing is skipped — whitespace is
+ * not ignored, because "ignore whitespace" is a decision the caller should make explicitly
+ * rather than one a decoder makes for everyone. Mixed case is fine.
+ */
+export u8[]? decode(u8[] text) {
+  if (text.len() % 2 != 0) { return null; }
+  u8[] out = u8[text.len() / 2]();
+  for (i32 i = 0; i < text.len(); i = i + 2) {
+    i32 hi = digitValue(text[i]);
+    i32 lo = digitValue(text[i + 1]);
+    if (hi < 0 || lo < 0) { return null; }
+    out[i / 2] = hi * 16 + lo;
+  }
+  return out;
+}

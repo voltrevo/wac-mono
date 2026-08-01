@@ -148,13 +148,12 @@ because 0xFF cannot begin a value — and the cases that would test string conte
 are classified `i_`, where either answer conforms. `test/utf8.test.ts` covers that
 gap separately, against a strict `TextDecoder`.
 
-**wac-written (`test/wac/json_test.wac`)** cover internals: scanner state, the
-object index, container growth — the things that have no shape outside the parser.
-
-**Tree walk (`test/tree.test.ts`)** compares the parsed tree against `JSON.parse`
-directly. Structs and enums cross the bindgen boundary as classes now, so a host
-test can read the tree rather than its re-serialization; before that, a bug that
-cancelled itself out between parse and stringify passed every host test there was.
+**wac-written (`test/wac/json_test.wac`)** cover internals and the parsed tree.
+Host tests can only observe bytes — a `JsonValue` is a GC reference and bindgen
+marshals only primitives — so everything they check about the tree is really a
+check on its re-serialization, and a bug that cancelled itself out between parse
+and stringify would pass. These reach kinds, member ordering, decoded string
+contents and container growth where they live.
 
 ## Speed
 
@@ -204,20 +203,26 @@ should not be believed without that.
 src/value.wac      the JSON value tree
 src/parse.wac      scanner and recursive-descent parser
 src/stringify.wac  serializer
-src/json.wac       entry points that return bytes, for the differential tests
-src/tree.wac       entry points that return the tree itself
+src/json.wac       entry points shaped for the bindgen boundary
 test/              host-side differential tests
 test/wac/          unit tests written in wac, via the wactest package
 bench/throughput.ts   MB/s by document shape
 bench/lookup.ts       scan vs hash index, and what the index costs to build
 ```
 
-`json.wac` returns bytes with a status byte in front: that was once the only shape
-available, since a `JsonValue` had no representation on the other side, and it is
-still the cheaper call when re-serialization is all that is wanted. `tree.wac`
-returns the tree, which a caller walks with `tag`, the payload getters and the
-container methods. An error code still needs its own call — an export returns one
-value and there are no module-level globals to leave the other in.
+A `JsonValue` tree crosses the boundary directly: structs and enums bind as
+classes, so `parse` hands back the tree and a JS caller walks it with `tag` and
+the container methods — see `test/tree.test.ts`.
+
+That was not always true. `json.wac` used to return bytes with a status byte in
+front, because an export returns one value and nothing but primitives crossed.
+The shape was a trap as well as a nuisance: `canonicalize` returned `u8[]`
+whether it succeeded or failed, so calling it from *wac* — where the convention
+does not apply — put a NUL at the front of the output and made a failure
+indistinguishable from success. `packages/server` did exactly that. The result is
+a struct now, with an `ok` field, and `errorCode`/`errorPos` are gone: they were
+separate exports that re-parsed the input to answer, and a struct carries all
+three.
 
 ## What this exercised in the language
 

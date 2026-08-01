@@ -1,0 +1,141 @@
+// Base64 and base64url, from RFC 4648 §4 and §5.
+//
+// One implementation, two alphabets. They differ in two characters — `+/` against `-_` — and by
+// convention in whether the output is padded, so the alphabet and the padding are parameters
+// rather than a second copy of the algorithm.
+//
+// Decoding is strict, which is worth stating because the platform decoders are not. `atob` and
+// Node's `Buffer.from(s, "base64")` both accept input that RFC 4648 rejects — wrong padding,
+// stray characters, a final group whose unused bits are not zero. This rejects all of those, so
+// a round trip through it is a proof about the input rather than a best effort.
+
+import { Buf } from "../../bytes/src/buf.wac";
+
+/** Standard `+/`, from §4. */
+export i32 ALPHABET_STANDARD() { return 0; }
+/** URL and filename safe `-_`, from §5. */
+export i32 ALPHABET_URL() { return 1; }
+
+i32 encodeDigit(i32 v, i32 alphabet) {
+  if (v < 26) { return 65 + v; }              // A-Z
+  if (v < 52) { return 97 + (v - 26); }       // a-z
+  if (v < 62) { return 48 + (v - 52); }       // 0-9
+  if (v == 62) { return alphabet == ALPHABET_URL() ? '-' : '+'; }
+  return alphabet == ALPHABET_URL() ? '_' : '/';
+}
+
+/**
+ * The value of one digit, or -1.
+ *
+ * Both alphabets are accepted whichever was asked for, because the two are disjoint outside the
+ * 62 shared characters, so accepting both cannot make an ambiguous input. A decoder that
+ * rejected `-` when asked for standard base64 would reject data that is unambiguously
+ * base64url, for no benefit.
+ */
+export i32 digitValue(i32 c) {
+  if (c >= 'A' && c <= 'Z') { return c - 'A'; }
+  if (c >= 'a' && c <= 'z') { return c - 'a' + 26; }
+  if (c >= '0' && c <= '9') { return c - '0' + 52; }
+  if (c == '+' || c == '-') { return 62; }
+  if (c == '/' || c == '_') { return 63; }
+  return -1;
+}
+
+export u8[] encode(u8[] data, i32 alphabet, bool pad) {
+  Buf out = Buf.create();
+  out.reserveFor((data.len() + 2) / 3 * 4);
+  i32 i = 0;
+  while (i + 2 < data.len()) {
+    i32 n = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
+    out.push(encodeDigit((n >> 18) & 63, alphabet));
+    out.push(encodeDigit((n >> 12) & 63, alphabet));
+    out.push(encodeDigit((n >> 6) & 63, alphabet));
+    out.push(encodeDigit(n & 63, alphabet));
+    i = i + 3;
+  }
+  i32 left = data.len() - i;
+  if (left == 1) {
+    i32 n = data[i] << 16;
+    out.push(encodeDigit((n >> 18) & 63, alphabet));
+    out.push(encodeDigit((n >> 12) & 63, alphabet));
+    if (pad) { out.push('='); out.push('='); }
+  } else if (left == 2) {
+    i32 n = (data[i] << 16) | (data[i + 1] << 8);
+    out.push(encodeDigit((n >> 18) & 63, alphabet));
+    out.push(encodeDigit((n >> 12) & 63, alphabet));
+    out.push(encodeDigit((n >> 6) & 63, alphabet));
+    if (pad) { out.push('='); }
+  }
+  return out.take();
+}
+
+/**
+ * Decode, or null.
+ *
+ * Strict on four counts, each of which some platform decoder allows:
+ *
+ *   - a group of one digit is never valid, since one digit carries six bits and a byte needs
+ *     eight;
+ *   - padding, if present, must bring the length to a multiple of four and must be the only
+ *     thing after the digits;
+ *   - unpadded input is accepted, but only at a length that could have been padded;
+ *   - the bits a final short group does not use must be zero, so `QQ==` decodes and `QR==` does
+ *     not, and every byte string has exactly one encoding.
+ *
+ * That last rule is the one that makes base64 canonical, and the one every lenient decoder
+ * drops. Without it `QQ==` and `QR==` both decode to `A`, and a signature over the text means
+ * nothing.
+ */
+export u8[]? decode(u8[] text) {
+  // Count padding first: it may only appear at the end, and at most twice.
+  i32 n = text.len();
+  i32 pads = 0;
+  while (n > 0 && text[n - 1] == '=') {
+    n--;
+    pads++;
+    if (pads > 2) { return null; }
+  }
+  if (pads > 0 && (n + pads) % 4 != 0) { return null; }
+  // With padding removed, the digit count decides how many bytes there are. A remainder of one
+  // is impossible: no number of bytes encodes to 4k+1 digits.
+  i32 rem = n % 4;
+  if (rem == 1) { return null; }
+  // No check that the pad count matches the digit count, because it cannot fail: the length test
+  // above forces pads to be (4 - rem) mod 4, which is the only correct count. Written out first
+  // and removed once branch coverage showed both arms unreachable.
+
+  i32 outLen = n / 4 * 3 + (rem == 2 ? 1 : (rem == 3 ? 2 : 0));
+  u8[] out = u8[outLen]();
+  i32 at = 0;
+  i32 i = 0;
+  while (i + 3 < n) {
+    i32 a = digitValue(text[i]);
+    i32 b = digitValue(text[i + 1]);
+    i32 c = digitValue(text[i + 2]);
+    i32 d = digitValue(text[i + 3]);
+    if (a < 0 || b < 0 || c < 0 || d < 0) { return null; }
+    i32 v = (a << 18) | (b << 12) | (c << 6) | d;
+    out[at] = (v >> 16) & 255;
+    out[at + 1] = (v >> 8) & 255;
+    out[at + 2] = v & 255;
+    at = at + 3;
+    i = i + 4;
+  }
+  if (rem == 2) {
+    i32 a = digitValue(text[i]);
+    i32 b = digitValue(text[i + 1]);
+    if (a < 0 || b < 0) { return null; }
+    // Four unused bits, which must be zero for the encoding to be the only one.
+    if ((b & 15) != 0) { return null; }
+    out[at] = ((a << 2) | (b >> 4)) & 255;
+  } else if (rem == 3) {
+    i32 a = digitValue(text[i]);
+    i32 b = digitValue(text[i + 1]);
+    i32 c = digitValue(text[i + 2]);
+    if (a < 0 || b < 0 || c < 0) { return null; }
+    if ((c & 3) != 0) { return null; }        // two unused bits
+    out[at] = ((a << 2) | (b >> 4)) & 255;
+    out[at + 1] = ((b << 4) | (c >> 2)) & 255;
+  }
+  return out;
+}

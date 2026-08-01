@@ -1,0 +1,107 @@
+// X25519, the Diffie-Hellman function on Curve25519 (RFC 7748).
+//
+// Scalar multiplication on a Montgomery curve, computed with a ladder that carries only
+// the u-coordinate. That is the whole reason this curve is shaped the way it is: the
+// v-coordinate never appears, so there are no point formulas to get wrong, no special
+// cases for the identity or for doubling, and the same arithmetic runs for every scalar
+// bit. What is left is 255 iterations of eleven field operations.
+//
+// The ladder below is a direct transcription of RFC 7748 §5's pseudocode, kept in the
+// RFC's variable names — x2/z2, x3/z3, A/AA/B/BB/E/C/D/DA/CB — rather than renamed to
+// something more descriptive. Renaming would make it read better and make it impossible
+// to diff against the spec, and diffing against the spec is the only review that
+// matters here.
+//
+// ## What this does not promise
+//
+// Nothing here is constant-time. `feCSwap` avoids a data-dependent branch, and the
+// ladder does the same work for a 0 bit as for a 1, so the shape is right — but wac
+// offers no way to stop a compiler or a CPU from noticing, and this has not been checked
+// against a real timing oracle. See the package README.
+
+import {
+  feAdd, feCSwap, feCopy, feFromBytes, feInvert, feMul, feMulSmall, feOne, feSquare,
+  feSub, feToBytes, feZero,
+} from "./field25519.wac";
+
+/**
+ * Clamp a 32-byte scalar, per RFC 7748 §5.
+ *
+ * Three bits low and two high. Clearing the low three puts the scalar in the subgroup of
+ * order 8h, which is what makes small-subgroup attacks moot; setting bit 254 fixes the
+ * scalar's bit length so the ladder runs the same number of iterations whatever the key
+ * is; clearing bit 255 keeps it inside the field.
+ *
+ * Done on a copy: clamping the caller's array in place would be a surprising thing for a
+ * function that looks like it only reads.
+ */
+u8[] clamp(u8[] k) {
+  u8[] e = u8[32]();
+  for (i32 i = 0; i < 32; i++) { e[i] = k[i]; }
+  e[0] = e[0] & 248;
+  e[31] = e[31] & 127;
+  e[31] = e[31] | 64;
+  return e;
+}
+
+/**
+ * The raw scalar multiplication: `scalar` times the point with u-coordinate `u`.
+ *
+ * Both arguments are 32 bytes, little-endian, and the result is the u-coordinate of the
+ * product, also 32 bytes little-endian.
+ */
+export u8[] x25519(u8[] scalar, u8[] u) {
+  if (scalar.len() != 32) { trap; }
+  if (u.len() != 32) { trap; }
+
+  u8[] e = clamp(scalar);
+  i64[] x1 = feFromBytes(u);
+
+  i64[] x2 = feOne();
+  i64[] z2 = feZero();
+  i64[] x3 = feCopy(x1);
+  i64[] z3 = feOne();
+  i32 swap = 0;
+
+  // Bit 254 down to 0. Bit 255 is cleared by the clamp and bit 254 is set, so starting
+  // at 254 is not an optimisation — it is the whole of the scalar that can be set.
+  for (i32 t = 254; t >= 0; t--) {
+    i32 kt = (e[t / 8] >> (t % 8)) & 1;
+    swap = swap ^ kt;
+    feCSwap(x2, x3, swap);
+    feCSwap(z2, z3, swap);
+    swap = kt;
+
+    i64[] a = feAdd(x2, z2);
+    i64[] aa = feSquare(a);
+    i64[] b = feSub(x2, z2);
+    i64[] bb = feSquare(b);
+    i64[] e2 = feSub(aa, bb);
+    i64[] c = feAdd(x3, z3);
+    i64[] d = feSub(x3, z3);
+    i64[] da = feMul(d, a);
+    i64[] cb = feMul(c, b);
+
+    x3 = feSquare(feAdd(da, cb));
+    z3 = feMul(x1, feSquare(feSub(da, cb)));
+    x2 = feMul(aa, bb);
+    // a24 = 121665, RFC 7748 §5. Not 121666: that constant belongs to a different
+    // arrangement of the same step, and the two differ by exactly one wrong answer.
+    z2 = feMul(e2, feAdd(aa, feMulSmall(e2, 121665)));
+  }
+
+  feCSwap(x2, x3, swap);
+  feCSwap(z2, z3, swap);
+
+  return feToBytes(feMul(x2, feInvert(z2)));
+}
+
+/** The base point, u = 9. */
+u8[] basePoint() {
+  u8[] u = u8[32]();
+  u[0] = 9;
+  return u;
+}
+
+/** The public key for a secret scalar: the scalar times the base point. */
+export u8[] x25519Base(u8[] scalar) { return x25519(scalar, basePoint()); }

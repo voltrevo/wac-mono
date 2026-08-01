@@ -1,0 +1,192 @@
+// The compiled program and the backtracking machine that runs it.
+//
+// A regex compiles to a flat instruction array, three `i32` per instruction — opcode and two
+// operands — and matching is a loop over it with an explicit backtracking stack. That shape is
+// chosen for a language without closures: the textbook recursive matcher takes a continuation
+// for "the rest of the pattern", and there is no way to spell one here. A program with an
+// explicit stack needs nothing the language does not have.
+//
+// Semantics are JavaScript's, because that is the oracle: leftmost match, greedy by default,
+// alternation preferring the earlier branch, and the whole thing backtracking rather than
+// simulating all threads at once. A Thompson NFA would be faster and would not have the same
+// capture semantics, so it would not be comparable.
+
+/** No match. */
+export i32 NO_MATCH() { return -1; }
+/** The step budget ran out — not the same as "does not match", and never reported as one. */
+export i32 BUDGET() { return -2; }
+
+export i32 OP_CHAR() { return 0; }       // a: the byte
+export i32 OP_ANY() { return 1; }        // any byte except newline
+export i32 OP_CLASS() { return 2; }      // a: index into the class table
+export i32 OP_MATCH() { return 3; }
+export i32 OP_JMP() { return 4; }        // a: target
+export i32 OP_SPLIT() { return 5; }      // try a, and on failure b
+export i32 OP_SAVE() { return 6; }       // a: capture slot
+export i32 OP_BOL() { return 7; }
+export i32 OP_EOL() { return 8; }
+export i32 OP_WORDB() { return 9; }      // a: 1 for \b, 0 for \B
+export i32 OP_MARK() { return 10; }      // a: loop slot — remember where this iteration began
+export i32 OP_PROGRESS() { return 11; }  // a: loop slot — fail if the iteration consumed nothing
+// a..b: capture slots to reset. Every iteration of a quantifier clears the groups inside its
+// body, so `(?:(a)|b){2}` on "ab" reports group 1 as absent rather than as the "a" the first
+// iteration matched. Without this the engine is right about the match and wrong about the
+// captures, which is the half nobody notices until they read a group.
+export i32 OP_CLEAR() { return 12; }
+
+/**
+ * A compiled pattern.
+ *
+ * `code` is three ints per instruction. `classLo`/`classHi` hold the ranges of every character
+ * class end to end, with `classStart`/`classCount` indexing into them and `classNeg` saying
+ * whether the class is negated — one flat pair of arrays rather than an array of class objects,
+ * because wac has no generics-free way to hold a list of structs without writing the container
+ * again, and the ranges never need to be addressed as a group.
+ */
+export struct Program {
+  i32[] code;
+  i32 len;              // instructions, not ints
+  i32 groups;           // capturing groups, so slots = (groups + 1) * 2
+  i32 loops;            // loop slots needed by MARK/PROGRESS
+  i32[] classLo;
+  i32[] classHi;
+  i32[] classStart;
+  i32[] classCount;
+  bool[] classNeg;
+  i32 classes;
+}
+
+bool isWordByte(i32 c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+bool inClass(Program p, i32 index, i32 c) {
+  i32 start = p.classStart[index];
+  i32 n = p.classCount[index];
+  bool found = false;
+  for (i32 i = 0; i < n; i++) {
+    if (c >= p.classLo[start + i] && c <= p.classHi[start + i]) { found = true; }
+  }
+  return p.classNeg[index] ? !found : found;
+}
+
+/**
+ * Run `p` against `input` starting exactly at `at`, with no searching.
+ *
+ * Returns the end position of the match, `NO_MATCH`, or `BUDGET`. Capture slots are written into
+ * `caps`, which the caller sizes and fills with -1.
+ *
+ * The backtracking stack holds (pc, sp, undo length). Captures are undone rather than copied: a
+ * `SAVE` pushes the old value onto an undo log, and unwinding to a recorded length restores
+ * everything a failed branch wrote. Copying the whole capture array per choice point would be
+ * simpler and quadratic.
+ */
+export i32 runAt(Program p, u8[] input, i32 at, i32[] caps, i32 budget) {
+  // Sized generously and grown by nothing: a program with `len` instructions cannot push more
+  // than one frame per step, so the budget bounds the stack too.
+  i32 cap = budget < 64 ? 64 : budget;
+  i32[] stackPc = i32[cap]();
+  i32[] stackSp = i32[cap]();
+  i32[] stackUndo = i32[cap]();
+  i32 sp32 = 0;
+
+  i32[] undoSlot = i32[cap]();
+  i32[] undoVal = i32[cap]();
+  i32 undoLen = 0;
+
+  i32[] marks = i32[p.loops > 0 ? p.loops : 1]();
+  for (i32 i = 0; i < marks.len(); i++) { marks[i] = -1; }
+
+  i32 pc = 0;
+  i32 sp = at;
+  i32 steps = 0;
+
+  while (true) {
+    steps++;
+    if (steps > budget) { return BUDGET(); }
+
+    i32 op = p.code[pc * 3];
+    i32 a = p.code[pc * 3 + 1];
+    i32 b = p.code[pc * 3 + 2];
+    bool ok = true;
+
+    if (op == OP_CHAR()) {
+      if (sp < input.len() && input[sp] == a) { pc++; sp++; } else { ok = false; }
+    } else if (op == OP_ANY()) {
+      // Without the `s` flag, `.` does not match a newline. That is JavaScript's rule and the
+      // one the oracle applies.
+      if (sp < input.len() && input[sp] != 10) { pc++; sp++; } else { ok = false; }
+    } else if (op == OP_CLASS()) {
+      if (sp < input.len() && inClass(p, a, input[sp])) { pc++; sp++; } else { ok = false; }
+    } else if (op == OP_MATCH()) {
+      return sp;
+    } else if (op == OP_JMP()) {
+      pc = a;
+    } else if (op == OP_SPLIT()) {
+      if (sp32 >= cap) { return BUDGET(); }
+      stackPc[sp32] = b;
+      stackSp[sp32] = sp;
+      stackUndo[sp32] = undoLen;
+      sp32++;
+      pc = a;
+    } else if (op == OP_SAVE()) {
+      if (undoLen >= cap) { return BUDGET(); }
+      undoSlot[undoLen] = a;
+      undoVal[undoLen] = caps[a];
+      undoLen++;
+      caps[a] = sp;
+      pc++;
+    } else if (op == OP_BOL()) {
+      if (sp == 0) { pc++; } else { ok = false; }
+    } else if (op == OP_EOL()) {
+      if (sp == input.len()) { pc++; } else { ok = false; }
+    } else if (op == OP_WORDB()) {
+      bool before = sp > 0 && isWordByte(input[sp - 1]);
+      bool after = sp < input.len() && isWordByte(input[sp]);
+      bool boundary = before != after;
+      if (boundary == (a == 1)) { pc++; } else { ok = false; }
+    } else if (op == OP_MARK()) {
+      if (undoLen >= cap) { return BUDGET(); }
+      // Marks are undone like captures, so a backtracked iteration does not leave its position
+      // behind to be compared against.
+      undoSlot[undoLen] = -1 - a;
+      undoVal[undoLen] = marks[a];
+      undoLen++;
+      marks[a] = sp;
+      pc++;
+    } else if (op == OP_CLEAR()) {
+      bool room = true;
+      for (i32 slot = a; slot <= b; slot++) {
+        if (undoLen >= cap) { room = false; }
+      }
+      if (!room) { return BUDGET(); }
+      for (i32 slot = a; slot <= b; slot++) {
+        undoSlot[undoLen] = slot;
+        undoVal[undoLen] = caps[slot];
+        undoLen++;
+        caps[slot] = -1;
+      }
+      pc++;
+    } else if (op == OP_PROGRESS()) {
+      // The iteration matched the empty string. Continuing would loop for ever, and JavaScript
+      // stops too — `(a*)*` against "" enters the body once and then gives up on it.
+      if (sp != marks[a]) { pc++; } else { ok = false; }
+    } else {
+      trap;
+    }
+
+    if (!ok) {
+      if (sp32 == 0) { return NO_MATCH(); }
+      sp32--;
+      pc = stackPc[sp32];
+      sp = stackSp[sp32];
+      i32 target = stackUndo[sp32];
+      while (undoLen > target) {
+        undoLen--;
+        i32 slot = undoSlot[undoLen];
+        if (slot >= 0) { caps[slot] = undoVal[undoLen]; } else { marks[-1 - slot] = undoVal[undoLen]; }
+      }
+    }
+  }
+  return NO_MATCH();
+}

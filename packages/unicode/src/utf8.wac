@@ -1,0 +1,107 @@
+// UTF-8 as code points.
+//
+// The rest of this repo works on bytes on purpose — a parser scanning `switch (c)` over `i32` is
+// right to. But case mapping is defined over code points and nothing else, so this is where the
+// boundary is crossed, and it is crossed strictly: an over-long encoding, a surrogate, or a value
+// past U+10FFFF is a decoding *error* and not a replacement character.
+//
+// That strictness is the same argument as `packages/codec`'s. A decoder that silently substitutes
+// U+FFFD turns "these bytes are not UTF-8" into "these bytes are some other text", and two
+// systems that both do it disagree about what the text was.
+
+/** Returned by `decode` when the bytes at that position are not a scalar value. */
+export i32 INVALID() { return -1; }
+/** Returned when the sequence is well-formed so far but runs past the end of the input. */
+export i32 TRUNCATED() { return -2; }
+
+/** A decoded code point and how many bytes it took. */
+export struct Scalar {
+  i32 code;      // or INVALID / TRUNCATED
+  i32 size;      // bytes consumed; 1 on an invalid lead so a caller can make progress
+}
+
+/** Decode the scalar starting at `at`. */
+export Scalar decode(u8[] s, i32 at) {
+  if (at >= s.len()) { return Scalar(TRUNCATED(), 0); }
+  i32 b0 = s[at];
+  if (b0 < 0x80) { return Scalar(b0, 1); }
+  if (b0 < 0xC2) { return Scalar(INVALID(), 1); }   // a continuation byte, or an over-long C0/C1
+
+  i32 need = 0;
+  i32 code = 0;
+  if (b0 < 0xE0) { need = 1; code = b0 & 0x1F; }
+  else if (b0 < 0xF0) { need = 2; code = b0 & 0x0F; }
+  else if (b0 < 0xF5) { need = 3; code = b0 & 0x07; }
+  else { return Scalar(INVALID(), 1); }             // F5..FF encode nothing below U+10FFFF
+
+  if (at + need >= s.len()) { return Scalar(TRUNCATED(), 0); }
+  for (i32 i = 1; i <= need; i++) {
+    i32 b = s[at + i];
+    if (b < 0x80 || b > 0xBF) { return Scalar(INVALID(), 1); }
+    code = (code << 6) | (b & 0x3F);
+  }
+
+  // The three ways a well-shaped sequence can still be wrong.
+  if (need == 1 && code < 0x80) { return Scalar(INVALID(), 1); }
+  if (need == 2 && code < 0x800) { return Scalar(INVALID(), 1); }
+  if (need == 3 && code < 0x10000) { return Scalar(INVALID(), 1); }
+  if (code >= 0xD800 && code <= 0xDFFF) { return Scalar(INVALID(), 1); }
+  if (code > 0x10FFFF) { return Scalar(INVALID(), 1); }
+  return Scalar(code, need + 1);
+}
+
+/** How many bytes `cp` encodes to, or 0 if it is not a scalar value. */
+export i32 encodedLength(i32 cp) {
+  if (cp < 0) { return 0; }
+  if (cp < 0x80) { return 1; }
+  if (cp < 0x800) { return 2; }
+  if (cp >= 0xD800 && cp <= 0xDFFF) { return 0; }
+  if (cp < 0x10000) { return 3; }
+  if (cp <= 0x10FFFF) { return 4; }
+  return 0;
+}
+
+/** Write `cp` into `out` at `at`, returning how many bytes it took. The caller sizes `out`. */
+export i32 encode(u8[] out, i32 at, i32 cp) {
+  i32 n = encodedLength(cp);
+  if (n == 1) {
+    out[at] = cp;
+  } else if (n == 2) {
+    out[at] = 0xC0 | (cp >> 6);
+    out[at + 1] = 0x80 | (cp & 0x3F);
+  } else if (n == 3) {
+    out[at] = 0xE0 | (cp >> 12);
+    out[at + 1] = 0x80 | ((cp >> 6) & 0x3F);
+    out[at + 2] = 0x80 | (cp & 0x3F);
+  } else if (n == 4) {
+    out[at] = 0xF0 | (cp >> 18);
+    out[at + 1] = 0x80 | ((cp >> 12) & 0x3F);
+    out[at + 2] = 0x80 | ((cp >> 6) & 0x3F);
+    out[at + 3] = 0x80 | (cp & 0x3F);
+  }
+  return n;
+}
+
+/** Whether every byte of `s` is part of a well-formed scalar. */
+export bool isValid(u8[] s) {
+  i32 at = 0;
+  while (at < s.len()) {
+    Scalar sc = decode(s, at);
+    if (sc.code < 0) { return false; }
+    at = at + sc.size;
+  }
+  return true;
+}
+
+/** The number of scalars in `s`, or -1 if it is not valid UTF-8. */
+export i32 count(u8[] s) {
+  i32 at = 0;
+  i32 n = 0;
+  while (at < s.len()) {
+    Scalar sc = decode(s, at);
+    if (sc.code < 0) { return -1; }
+    at = at + sc.size;
+    n++;
+  }
+  return n;
+}

@@ -1,0 +1,74 @@
+// Host-facing entry point for the client half.
+//
+// Two calls: build a request, and parse a response. The host owns the socket in between, exactly
+// as it does for the server — so the client's decisions are all here and testable without one.
+
+import { Outgoing, write as writeRequest } from "../src/outgoing.wac";
+import { Incoming, ParsedResponse, parseResponse } from "../src/incoming.wac";
+import { Headers } from "../src/headers.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+
+void writeInt(Buf out, i32 v) {
+  if (v == 0) { out.push('0'); return; }
+  u8[] tmp = u8[12]();
+  i32 n = 0;
+  i32 x = v;
+  while (x > 0) { tmp[n] = 48 + (x % 10); x = x / 10; n++; }
+  for (i32 i = n - 1; i >= 0; i--) { out.push(tmp[i]); }
+}
+
+/** Build a request. Headers arrive as a NUL-separated name/value list. */
+export u8[] buildRequest(u8[] method, u8[] target, u8[] host, u8[] headers, u8[] body,
+                         bool keepAlive) {
+  Outgoing req = Outgoing(method, target, host, Headers.create(), body);
+  i32 at = 0;
+  while (at < headers.len()) {
+    i32 mid = at;
+    while (mid < headers.len() && headers[mid] != 0) { mid++; }
+    i32 end = mid + 1;
+    while (end < headers.len() && headers[end] != 0) { end++; }
+    u8[] name = u8[mid - at]();
+    for (i32 i = at; i < mid; i++) { name[i - at] = headers[i]; }
+    u8[] value = u8[end - mid - 1]();
+    for (i32 i = mid + 1; i < end; i++) { value[i - mid - 1] = headers[i]; }
+    req.headers.push(name, value);
+    at = end + 1;
+  }
+  return writeRequest(req, keepAlive);
+}
+
+/**
+ * Parse a response: `ok\0status\0minor\0consumed\0closeDelimited\0body\0name\0value...`, or
+ * `bad\0code`, or `incomplete`.
+ */
+export u8[] parse(u8[] input, u8[] method, bool eof, i32 maxBody) {
+  Buf out = Buf.create();
+  match (parseResponse(input, method, eof, maxBody)) {
+    case Incomplete: { out.pushAll("incomplete".toBytes()); }
+    case Bad(code): {
+      out.pushAll("bad".toBytes());
+      out.push(0);
+      writeInt(out, code);
+    }
+    case Ok(response): {
+      out.pushAll("ok".toBytes());
+      out.push(0);
+      writeInt(out, response.status);
+      out.push(0);
+      writeInt(out, response.minor);
+      out.push(0);
+      writeInt(out, response.consumed);
+      out.push(0);
+      out.push(response.closeDelimited ? '1' : '0');
+      out.push(0);
+      out.pushAll(response.body);
+      for (i32 i = 0; i < response.headers.len(); i++) {
+        out.push(0);
+        out.pushAll(response.headers.nameAt(i));
+        out.push(0);
+        out.pushAll(response.headers.valueAt(i));
+      }
+    }
+  }
+  return out.take();
+}

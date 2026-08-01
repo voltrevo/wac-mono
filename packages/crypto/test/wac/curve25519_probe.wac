@@ -1,0 +1,51 @@
+// Field operations at the host boundary, for the BigInt differential.
+//
+// Elements cross as their 32-byte encoding rather than as limbs: the encoding is the
+// only canonical form, and comparing limbs would compare a representation choice rather
+// than a value.
+import { feFromBytes, feToBytes, feAdd, feSub, feMul, feSquare, feMulSmall,
+         feInvert, feCSwap, feCarry } from "../../src/field25519.wac";
+import { x25519 as x25519Impl, x25519Base as x25519BaseImpl } from "../../src/x25519.wac";
+import { ed25519PublicKey as edPubImpl, ed25519Sign as edSignImpl,
+         ed25519Verify as edVerifyImpl, ptEncode, ptBase,
+         ptDecode as ptDecodeX, ptMul as ptMulX, Point } from "../../src/ed25519.wac";
+
+export u8[] fAdd(u8[] a, u8[] b) { return feToBytes(feAdd(feFromBytes(a), feFromBytes(b))); }
+export u8[] fSub(u8[] a, u8[] b) { return feToBytes(feSub(feFromBytes(a), feFromBytes(b))); }
+export u8[] fMul(u8[] a, u8[] b) { return feToBytes(feMul(feFromBytes(a), feFromBytes(b))); }
+export u8[] fSquare(u8[] a) { return feToBytes(feSquare(feFromBytes(a))); }
+export u8[] fMulSmall(u8[] a, i64 m) { return feToBytes(feMulSmall(feFromBytes(a), m)); }
+export u8[] fInvert(u8[] a) { return feToBytes(feInvert(feFromBytes(a))); }
+export u8[] fRoundTrip(u8[] a) { return feToBytes(feFromBytes(a)); }
+
+/** Swap-or-not, returning the two results concatenated so both can be checked. */
+export u8[] fCSwap(u8[] a, u8[] b, i32 swap) {
+  i64[] x = feFromBytes(a);
+  i64[] y = feFromBytes(b);
+  feCSwap(x, y, swap);
+  u8[] xb = feToBytes(x);
+  u8[] yb = feToBytes(y);
+  u8[] out = u8[64]();
+  for (i32 i = 0; i < 32; i++) { out[i] = xb[i]; out[32 + i] = yb[i]; }
+  return out;
+}
+
+// X25519 itself, so the field and the curve can be driven from one probe.
+export u8[] x25519(u8[] k, u8[] u) { return x25519Impl(k, u); }
+export u8[] x25519Base(u8[] k) { return x25519BaseImpl(k); }
+
+// Ed25519.
+export u8[] edPublicKey(u8[] seed) { return edPubImpl(seed); }
+export u8[] edSign(u8[] seed, u8[] msg) { return edSignImpl(seed, msg); }
+export bool edVerify(u8[] pub, u8[] msg, u8[] sig) { return edVerifyImpl(pub, msg, sig); }
+/** The base point, encoded — a direct check on recoverX and the encoding. */
+export u8[] edBaseEncoded() { return ptEncode(ptBase()); }
+
+/** Decode then re-encode: null decode returns 32 zero bytes with byte 0 set to 0xFF. */
+export u8[] edRecode(u8[] p) {
+  Point? q = ptDecodeX(p);
+  if (q is null) { u8[] bad = u8[32](); bad[0] = 0xFF; return bad; }
+  return ptEncode(q!);
+}
+/** k*B encoded, so scalar multiplication can be checked on its own. */
+export u8[] edScalarBase(u8[] k) { return ptEncode(ptMulX(k, ptBase())); }

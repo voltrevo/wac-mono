@@ -8,7 +8,7 @@
 import { wacBind } from "../../../harness/wacBind.ts";
 
 const mod = await wacBind("packages/json/src/json.wac") as unknown as {
-  canonicalize(src: Uint8Array): Uint8Array;
+  canonicalize(src: Uint8Array): { ok: boolean; text: Uint8Array };
   errorCode(src: Uint8Array): number;
 };
 

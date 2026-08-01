@@ -1,51 +1,62 @@
-// Public entry points that return bytes.
+// Public entry points.
 //
-// Results come back as bytes with a status byte in front, because an export returns
-// exactly one value and there are no module-level globals to stash an error code in.
-// This was once the only shape available — a JsonValue had no representation on the
-// other side of the boundary. `tree.wac` hands the tree out directly now; this stays
-// as the cheaper call when re-serialization is all that is wanted, and as what the
-// differential tests compare against the host's own JSON.
+// This file used to exist because nothing but primitives and primitive arrays could cross into
+// JS, so a `JsonValue` tree could not be handed out and results came back as bytes with a status
+// byte in front. That is no longer true: structs and enums bind as classes, so `parse` returns
+// the tree and a JS caller walks it with `tag` and the container methods.
+//
+// The old shape was not merely inconvenient. `canonicalize` returned `u8[]` whether it succeeded
+// or failed, with the difference in byte 0 — so calling it from *wac*, where the convention does
+// not apply, put a NUL at the front of the output and made a parse failure indistinguishable from
+// success. `packages/server` did exactly that, and nothing caught it, because both outcomes have
+// the same type. The result is now a struct with an `ok` field and the failure carries its own
+// code and position.
 
 import { JsonValue } from "./value.wac";
 import { Parser, parseDocument, ERR_NONE } from "./parse.wac";
 import { writeValue } from "./stringify.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 
-// Parse and re-serialize. Byte 0 is the error code (0 = success); the rest is
-// canonical JSON, empty when parsing failed.
-export u8[] canonicalize(u8[] src) {
+/** The parsed tree, or null if the document is not JSON. */
+export JsonValue? parse(u8[] src) {
+  Parser p = Parser.create(src);
+  return parseDocument(p);
+}
+
+/**
+ * Everything about one document, in one call.
+ *
+ * `code` and `pos` used to be two more exports that re-parsed the input to answer, because an
+ * export returns one value and there was no way to hand back three. A struct is one value.
+ */
+export struct Canonical {
+  bool ok;
+  i32 code;         // 0 when ok; see parse.wac's ERR_* for the numbering
+  i32 pos;          // byte offset where parsing gave up, or -1 when ok
+  u8[] text;        // canonical JSON, empty when it failed
+}
+
+/** Parse and re-serialize. */
+export Canonical canonicalize(u8[] src) {
   Parser p = Parser.create(src);
   JsonValue? v = parseDocument(p);
+  if (v is null) { return Canonical(false, p.err, p.errPos, u8[0]()); }
   Buf out = Buf.create();
-  if (v is null) {
-    out.push(p.err);
-    return out.bytes();
-  }
-  out.push(0);
   writeValue(out, v!);
-  return out.bytes();
+  return Canonical(true, ERR_NONE(), -1, out.take());
 }
 
-// Error code for a document, without building the output.
-export i32 errorCode(u8[] src) {
-  Parser p = Parser.create(src);
-  JsonValue? v = parseDocument(p);
-  if (v is null) { return p.err; }
-  return ERR_NONE();
+/** The other direction: a tree, built by hand or edited after parsing, as bytes. */
+export u8[] stringify(JsonValue value) {
+  Buf out = Buf.create();
+  writeValue(out, value);
+  return out.take();
 }
 
-// Byte offset where parsing gave up. Only meaningful when errorCode is nonzero.
-export i32 errorPos(u8[] src) {
-  Parser p = Parser.create(src);
-  JsonValue? v = parseDocument(p);
-  if (v is null) { return p.errPos; }
-  return -1;
-}
-
-// The f64 value of a document that is a bare number, for testing the decimal
-// conversion against the host's own strtod. NaN signals a parse failure, which
-// no valid JSON number can produce.
+/**
+ * The `f64` of a document that is a bare number, for checking the decimal conversion against the
+ * host's own. NaN signals a parse failure, which no valid JSON number can produce.
+ */
 export f64 parseNumberValue(u8[] src) {
   Parser p = Parser.create(src);
   JsonValue? v = parseDocument(p);

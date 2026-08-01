@@ -117,6 +117,18 @@ Deno.test("aes-gcm: decrypt round-trips and rejects every tampering", () => {
   if (!rejects(() => dec(key, flip(iv, 0), aad, ct, t))) throw new Error("accepted the wrong nonce");
   if (!rejects(() => dec(key, iv, aad, ct.slice(0, 96), t))) throw new Error("accepted a truncated ciphertext");
   if (!rejects(() => dec(key, iv, aad, ct, t.slice(0, 15)))) throw new Error("accepted a short tag");
+  // Same asymmetry as ChaCha20-Poly1305: a short tag traps whichever way the length
+  // check goes, so it never tested the check. A long tag whose first sixteen bytes are
+  // right verifies happily without it — tag padding as a forgery. Found by mutation
+  // testing rather than by reading the code, which I had done.
+  for (const extra of [1, 2, 16]) {
+    const padded = new Uint8Array(16 + extra);
+    padded.set(t);
+    padded.fill(0xAA, 16);
+    if (!rejects(() => dec(key, iv, aad, ct, padded))) {
+      throw new Error(`accepted a ${16 + extra}-byte tag whose first 16 bytes are valid`);
+    }
+  }
   if (!rejects(() => enc(key, new Uint8Array(0), pt))) throw new Error("accepted an empty IV");
 
   // The trailing length fields are what stop a byte crossing the aad/ct boundary.

@@ -1,0 +1,34 @@
+// Host-facing entry point.
+
+import { Scalar, decode, encode, encodedLength, isValid, count } from "../src/utf8.wac";
+import { toLower, toUpper, fold, lowerAll, upperAll, foldAll, foldEqual } from "../src/case.wac";
+
+export i32 mapLower(i32 cp) { return toLower(cp); }
+export i32 mapUpper(i32 cp) { return toUpper(cp); }
+export i32 mapFold(i32 cp) { return fold(cp); }
+
+export i32 decodeCode(u8[] s, i32 at) { return decode(s, at).code; }
+export i32 decodeSize(u8[] s, i32 at) { return decode(s, at).size; }
+export bool valid(u8[] s) { return isValid(s); }
+export i32 scalarCount(u8[] s) { return count(s); }
+
+export u8[] encodeOne(i32 cp) {
+  i32 n = encodedLength(cp);
+  u8[] out = u8[n]();
+  if (n > 0) { encode(out, 0, cp); }
+  return out;
+}
+
+export u8[] lower(u8[] s) {
+  u8[]? r = lowerAll(s);
+  return r is null ? u8[0]() : r!;
+}
+export u8[] upper(u8[] s) {
+  u8[]? r = upperAll(s);
+  return r is null ? u8[0]() : r!;
+}
+export u8[] casefold(u8[] s) {
+  u8[]? r = foldAll(s);
+  return r is null ? u8[0]() : r!;
+}
+export bool equalFold(u8[] a, u8[] b) { return foldEqual(a, b); }

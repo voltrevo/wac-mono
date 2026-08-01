@@ -1,0 +1,74 @@
+// The proleptic Gregorian calendar: days since the epoch, and back.
+//
+// Howard Hinnant's algorithms, which are exact for any year an i32 can hold and use no tables and
+// no loops. The trick is to shift the year so that March is month 0, which puts the leap day at
+// the *end* of the year and makes the month-length pattern a single linear formula — `(153*m+2)/5`
+// — instead of a twelve-entry table with a special case.
+//
+// Everything here is UTC and civil: no time zones, no leap seconds. A "day" is exactly 86 400
+// seconds, which is what makes epoch arithmetic reversible.
+
+export struct Civil {
+  i32 year;
+  i32 month;        // 1-12
+  i32 day;          // 1-31
+}
+
+export bool isLeap(i32 y) {
+  return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+}
+
+export i32 daysInMonth(i32 y, i32 m) {
+  if (m == 2) { return isLeap(y) ? 29 : 28; }
+  if (m == 4 || m == 6 || m == 9 || m == 11) { return 30; }
+  return 31;
+}
+
+/** Whether the fields name a real date. Month and day are 1-based. */
+export bool isValidDate(i32 y, i32 m, i32 d) {
+  if (m < 1 || m > 12) { return false; }
+  if (d < 1) { return false; }
+  return d <= daysInMonth(y, m);
+}
+
+/**
+ * Days since 1970-01-01, negative before it.
+ *
+ * The `y -= m <= 2` shift moves January and February into the previous year, so an era of 400
+ * years — 146 097 days, which is a whole number of weeks — begins on 1 March. Division truncates
+ * toward zero in wac as in C, which is why the negative branches subtract first.
+ */
+export i64 daysFromCivil(i32 year, i32 month, i32 day) {
+  i64 y = (year as i64) - (month <= 2 ? 1 : 0);
+  i64 era = (y >= 0 ? y : y - 399) / 400;
+  i64 yoe = y - era * 400;                                    // [0, 399]
+  i64 mp = ((month + (month > 2 ? -3 : 9)) as i64);           // March is 0
+  i64 doy = (153 * mp + 2) / 5 + (day as i64) - 1;            // [0, 365]
+  i64 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;            // [0, 146096]
+  return era * 146097 + doe - 719468;
+}
+
+/** The inverse. */
+export Civil civilFromDays(i64 days) {
+  i64 z = days + 719468;
+  i64 era = (z >= 0 ? z : z - 146096) / 146097;
+  i64 doe = z - era * 146097;                                 // [0, 146096]
+  i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  i64 y = yoe + era * 400;
+  i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);          // [0, 365]
+  i64 mp = (5 * doy + 2) / 153;                               // [0, 11]
+  i64 d = doy - (153 * mp + 2) / 5 + 1;
+  i64 m = mp + (mp < 10 ? 3 : -9);
+  return Civil((y + (m <= 2 ? 1 : 0)) as! i32, m as! i32, d as! i32);
+}
+
+/** 0 is Sunday. Works for negative days, where a plain `%` would not. */
+export i32 weekday(i64 days) {
+  i64 w = (days + 4) % 7;                                     // 1970-01-01 was a Thursday
+  return (w < 0 ? w + 7 : w) as! i32;
+}
+
+/** Day of the year, 1-based. */
+export i32 dayOfYear(i32 y, i32 m, i32 d) {
+  return (daysFromCivil(y, m, d) - daysFromCivil(y, 1, 1)) as! i32 + 1;
+}

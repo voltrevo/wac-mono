@@ -1,0 +1,23 @@
+// P-256 field and curve at the host boundary.
+import { fpAdd, fpSub, fpMul, fpSquare, fpInvert, fpNeg, fpToBytes, fpFromBytes,
+         fpInRange, fpIsZero, fpEquals } from "../../src/fieldp256.wac";
+
+export u8[] pAdd(u8[] a, u8[] b) { return fpToBytes(fpAdd(fpFromBytes(a), fpFromBytes(b))); }
+export u8[] pSub(u8[] a, u8[] b) { return fpToBytes(fpSub(fpFromBytes(a), fpFromBytes(b))); }
+export u8[] pMul(u8[] a, u8[] b) { return fpToBytes(fpMul(fpFromBytes(a), fpFromBytes(b))); }
+export u8[] pSquare(u8[] a) { return fpToBytes(fpSquare(fpFromBytes(a))); }
+export u8[] pInvert(u8[] a) { return fpToBytes(fpInvert(fpFromBytes(a))); }
+export u8[] pNeg(u8[] a) { return fpToBytes(fpNeg(fpFromBytes(a))); }
+export u8[] pRoundTrip(u8[] a) { return fpToBytes(fpFromBytes(a)); }
+export bool pInRange(u8[] a) { return fpInRange(a); }
+
+// The curve.
+import { p256PublicKey, p256Ecdh, p256Verify, p256Sign, p256Order, p256Base,
+         p256Encode, p256Decode, jacMul } from "../../src/p256.wac";
+export u8[] pubKey(u8[] priv) { return p256PublicKey(priv); }
+export u8[] ecdh(u8[] priv, u8[] peer) { return p256Ecdh(priv, peer); }
+export bool verify(u8[] pub, u8[] msg, u8[] sig) { return p256Verify(pub, msg, sig); }
+export u8[] sign(u8[] priv, u8[] msg, u8[] k) { return p256Sign(priv, msg, k); }
+export u8[] order() { return p256Order(); }
+export u8[] baseEncoded() { return p256Encode(p256Base()); }
+export u8[] scalarBase(u8[] k) { return p256Encode(jacMul(k, p256Base())); }

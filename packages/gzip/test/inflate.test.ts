@@ -165,6 +165,28 @@ Deno.test("inflate: corrupt input traps rather than misbehaving", async () => {
   badSize[good.length - 4] ^= 0xFF;
   mustTrap("wrong ISIZE", badSize);
 
+  // An *implausible* ISIZE, which is a different thing from a wrong one. The trailer is
+  // attacker-controlled, and the decoder uses it to size the output buffer in one go, so
+  // a thirty-byte member claiming four gigabytes would turn into a four-gigabyte request
+  // if the hint were trusted. `maxSizeHint` caps it and the buffer grows normally
+  // instead. Flipping one bit of ISIZE, as above, never reaches that cap.
+  //
+  // The bound is deliberately loose. It is not measuring speed — it is checking that no
+  // enormous allocation was attempted, and the honest path takes well under a
+  // millisecond, so anything under a second distinguishes the two without being
+  // sensitive to a loaded machine.
+  for (const claimed of [100 * 1024 * 1024, 1 << 30, 0xFFFFFFFF]) {
+    const huge = good.slice();
+    new DataView(huge.buffer, huge.byteOffset).setUint32(huge.length - 4, claimed >>> 0, true);
+    const started = performance.now();
+    mustTrap(`ISIZE claiming ${claimed} bytes`, huge);
+    const took = performance.now() - started;
+    if (took > 1000) {
+      throw new Error(`an ISIZE of ${claimed} took ${took.toFixed(0)}ms to reject — ` +
+        `the size hint looks like it was trusted`);
+    }
+  }
+
   // BTYPE 11 is reserved. Byte 10 is the first payload byte: keep BFINAL, set
   // BTYPE to 3.
   const badType = good.slice();

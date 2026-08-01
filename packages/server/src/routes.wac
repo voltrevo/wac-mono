@@ -1,0 +1,255 @@
+// The routes, which exist to make the packages meet.
+//
+// Each one is chosen because it puts a different package on the request path, so that a bug in
+// how they fit together shows up as a wrong HTTP response rather than as nothing at all. Unit
+// tests have covered each package alone; this is the first thing that uses six of them in one
+// call stack, and every time something in this repo became the first outside consumer of
+// something else it found a defect.
+//
+//   GET  /               nothing but the response writer
+//   GET  /time           datetime — the instant the host passed in, as RFC 3339
+//   GET  /echo?a=1&b=2   url — the query, parsed and returned as JSON
+//   POST /json           json — parse the body and give it back canonicalised
+//   GET  /b64/<data>     codec + url — percent-decode, then base64url-decode
+//   GET  /match/<p>/<s>  regex — compile <p>, run it on <s>, report the captures
+
+import { Request } from "../../http/src/request.wac";
+import { Response, write } from "../../http/src/response.wac";
+import { Url, parseUrl, pathname } from "../../url/src/url.wac";
+import { decode as pctDecode } from "../../url/src/percent.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+import { format as formatTime } from "../../datetime/src/rfc3339.wac";
+import { Parser, parseDocument } from "../../json/src/parse.wac";
+import { JsonValue } from "../../json/src/value.wac";
+import { writeValue } from "../../json/src/stringify.wac";
+import { decode as b64Decode, ALPHABET_URL } from "../../codec/src/base64.wac";
+import { Program, NO_MATCH, BUDGET } from "../../regex/src/program.wac";
+import { compile as reCompile, search as reSearch, slotCount } from "../../regex/src/regex.wac";
+
+bool eqBytes(u8[] a, string b) {
+  u8[] bs = b.toBytes();
+  if (a.len() != bs.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != bs[i]) { return false; }
+  }
+  return true;
+}
+
+u8[] slice(u8[] s, i32 lo, i32 hi) {
+  if (hi < lo) { hi = lo; }
+  u8[] out = u8[hi - lo]();
+  for (i32 i = lo; i < hi; i++) { out[i - lo] = s[i]; }
+  return out;
+}
+
+Response text(i32 status, u8[] body) {
+  Response res = Response.create(status);
+  res.set("Content-Type", "text/plain; charset=utf-8");
+  res.body = body;
+  return res;
+}
+
+Response json(i32 status, u8[] body) {
+  Response res = Response.create(status);
+  res.set("Content-Type", "application/json");
+  res.body = body;
+  return res;
+}
+
+/** A JSON string literal, escaped enough to be valid for the values these routes produce. */
+void writeJsonString(Buf out, u8[] s) {
+  out.push('"');
+  for (i32 i = 0; i < s.len(); i++) {
+    i32 c = s[i];
+    if (c == '"' || c == '\\') {
+      out.push('\\');
+      out.push(c);
+    } else if (c < 0x20) {
+      out.pushAll("\\u00".toBytes());
+      i32 hi = (c >> 4) & 15;
+      i32 lo = c & 15;
+      out.push(hi < 10 ? 48 + hi : 87 + hi);
+      out.push(lo < 10 ? 48 + lo : 87 + lo);
+    } else {
+      out.push(c);
+    }
+  }
+  out.push('"');
+}
+
+void writeInt(Buf out, i32 v) {
+  if (v < 0) { out.push('-'); v = -v; }
+  if (v == 0) { out.push('0'); return; }
+  u8[] tmp = u8[12]();
+  i32 n = 0;
+  while (v > 0) { tmp[n] = 48 + (v % 10); v = v / 10; n++; }
+  for (i32 i = n - 1; i >= 0; i--) { out.push(tmp[i]); }
+}
+
+/**
+ * `a=1&b=2` as a JSON object.
+ *
+ * Percent-decoding and `+` for space are the form-encoding rules, not the URL ones, which is why
+ * this is here and not in `packages/url` — that package parses a query, it does not interpret it.
+ */
+u8[] queryToJson(u8[] query) {
+  Buf out = Buf.create();
+  out.push('{');
+  i32 at = 0;
+  bool first = true;
+  while (at <= query.len()) {
+    i32 end = at;
+    while (end < query.len() && query[end] != '&') { end++; }
+    if (end > at) {
+      i32 eq = at;
+      while (eq < end && query[eq] != '=') { eq++; }
+      if (!first) { out.push(','); }
+      first = false;
+      writeJsonString(out, formDecode(slice(query, at, eq)));
+      out.push(':');
+      writeJsonString(out, formDecode(slice(query, eq < end ? eq + 1 : end, end)));
+    }
+    if (end >= query.len()) { break; }
+    at = end + 1;
+  }
+  out.push('}');
+  return out.take();
+}
+
+/** Percent-decoding plus `+` meaning space, which is what a query string uses. */
+u8[] formDecode(u8[] s) {
+  u8[] plussed = u8[s.len()]();
+  for (i32 i = 0; i < s.len(); i++) { plussed[i] = s[i] == '+' ? ' ' : s[i]; }
+  return pctDecode(plussed);
+}
+
+/** The path split on `/`, with empty segments dropped. */
+u8[][] segments(u8[] path) {
+  i32 count = 0;
+  for (i32 i = 0; i < path.len(); i++) {
+    if (path[i] == '/' && i + 1 < path.len() && path[i + 1] != '/') { count++; }
+  }
+  u8[][] out = u8[][count > 0 ? count : 1]();
+  i32 n = 0;
+  i32 at = 0;
+  while (at < path.len()) {
+    while (at < path.len() && path[at] == '/') { at++; }
+    i32 end = at;
+    while (end < path.len() && path[end] != '/') { end++; }
+    if (end > at && n < out.len()) {
+      out[n] = slice(path, at, end);
+      n++;
+    }
+    at = end;
+  }
+  u8[][] exact = u8[][n]();
+  for (i32 i = 0; i < n; i++) { exact[i] = out[i]; }
+  return exact;
+}
+
+Response matchRoute(u8[] patternRaw, u8[] subjectRaw) {
+  u8[] pattern = pctDecode(patternRaw);
+  u8[] subject = pctDecode(subjectRaw);
+  Program? p = reCompile(pattern);
+  if (p is null) { return text(400, "the pattern is outside the supported subset\n".toBytes()); }
+
+  i32 n = slotCount(p!);
+  i32[] caps = i32[n]();
+  i32 start = reSearch(p!, subject, 0, caps, 200000);
+  Buf out = Buf.create();
+  if (start == BUDGET()) {
+    return text(400, "the pattern needed more steps than this server will spend\n".toBytes());
+  }
+  out.push('{');
+  out.pushAll("\"matched\":".toBytes());
+  out.pushAll(start == NO_MATCH() ? "false".toBytes() : "true".toBytes());
+  if (start != NO_MATCH()) {
+    out.pushAll(",\"groups\":[".toBytes());
+    for (i32 g = 0; g * 2 < n; g++) {
+      if (g > 0) { out.push(','); }
+      i32 s = caps[g * 2];
+      i32 e = caps[g * 2 + 1];
+      if (s < 0 || e < 0) {
+        out.pushAll("null".toBytes());
+      } else {
+        writeJsonString(out, slice(subject, s, e));
+      }
+    }
+    out.push(']');
+    out.pushAll(",\"start\":".toBytes());
+    writeInt(out, start);
+  }
+  out.push('}');
+  return json(200, out.take());
+}
+
+/** Pick a handler. Returns the response; `serve` decides framing and keep-alive. */
+export Response route(Request request, i64 nowMillis) {
+  // The target is parsed with packages/url, resolved against a dummy base so that both
+  // origin-form (`/a?b`) and absolute-form (`http://h/a?b`) reach the same code.
+  Url? base = parseUrl("http://server.invalid/".toBytes(), null);
+  Url? parsed = parseUrl(request.target, base);
+  if (parsed is null) { return text(400, "unparseable request target\n".toBytes()); }
+  Url u = parsed!;
+  u8[] path = pathname(u);
+  u8[] query = (u.query is not null) ? u.query! : u8[0]();
+
+  bool isGet = eqBytes(request.method, "GET") || eqBytes(request.method, "HEAD");
+  bool isPost = eqBytes(request.method, "POST");
+
+  if (eqBytes(path, "/")) {
+    if (!isGet) { return methodNotAllowed("GET, HEAD"); }
+    return text(200, "wac http server\n".toBytes());
+  }
+
+  if (eqBytes(path, "/time")) {
+    if (!isGet) { return methodNotAllowed("GET, HEAD"); }
+    Buf out = Buf.create();
+    out.pushAll("{\"now\":".toBytes());
+    writeJsonString(out, formatTime(nowMillis));
+    out.push('}');
+    return json(200, out.take());
+  }
+
+  if (eqBytes(path, "/echo")) {
+    if (!isGet) { return methodNotAllowed("GET, HEAD"); }
+    return json(200, queryToJson(query));
+  }
+
+  if (eqBytes(path, "/json")) {
+    if (!isPost) { return methodNotAllowed("POST"); }
+    // `json.wac`'s `canonicalize` is the *bindgen* entry point: it returns a status byte
+    // followed by the output, because an export returns one value. From wac the library itself
+    // is what to call — using the boundary shape here put a NUL at the front of every response
+    // and made a parse failure indistinguishable from success, since both are a `u8[]`.
+    Parser parser = Parser.create(request.body);
+    JsonValue? value = parseDocument(parser);
+    if (value is null) { return text(400, "not valid JSON\n".toBytes()); }
+    Buf out = Buf.create();
+    writeValue(out, value!);
+    return json(200, out.take());
+  }
+
+  u8[][] parts = segments(path);
+  if (parts.len() == 2 && eqBytes(parts[0], "b64")) {
+    if (!isGet) { return methodNotAllowed("GET, HEAD"); }
+    u8[]? decoded = b64Decode(pctDecode(parts[1]));
+    if (decoded is null) { return text(400, "not valid base64url\n".toBytes()); }
+    return text(200, decoded!);
+  }
+
+  if (parts.len() == 3 && eqBytes(parts[0], "match")) {
+    if (!isGet) { return methodNotAllowed("GET, HEAD"); }
+    return matchRoute(parts[1], parts[2]);
+  }
+
+  return text(404, "no route\n".toBytes());
+}
+
+Response methodNotAllowed(string allowed) {
+  Response res = Response.create(405);
+  res.set("Allow", allowed);
+  res.set("Content-Type", "text/plain; charset=utf-8");
+  res.body = "method not allowed\n".toBytes();
+  return res;
+}

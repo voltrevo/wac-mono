@@ -1,0 +1,696 @@
+// Pattern text to program, in one pass and with no syntax tree.
+//
+// A recursive-descent parser that emits instructions as it goes. There is no AST because there
+// is nothing an AST would buy: every construct needs the code range of the thing it wraps, and
+// the emitter already knows that — a quantifier records where its atom started, and then either
+// inserts an instruction in front of it or copies the range. In a language with no generics that
+// is one hand-written growable array instead of two, plus a node type and a visitor.
+//
+// The cost is that a quantifier has to shift code that is already emitted, which `insertAt` does.
+// Programs are small and compiled once, so an O(n) shift per quantifier is not worth avoiding.
+
+import { OP_CHAR, OP_ANY, OP_CLASS, OP_MATCH, OP_JMP, OP_SPLIT, OP_SAVE, OP_BOL, OP_EOL,
+         OP_WORDB, OP_MARK, OP_PROGRESS, OP_CLEAR, Program } from "./program.wac";
+
+/** The compiler's own state: the program under construction, and where the parser is. */
+struct C {
+  i32[] code;
+  i32 len;
+  i32 pos;
+  u8[] src;
+  i32 groups;
+  i32 loops;
+  i32[] classLo;
+  i32[] classHi;
+  i32[] classStart;
+  i32[] classCount;
+  bool[] classNeg;
+  i32 classes;
+  i32 ranges;
+  bool failed;
+  // Case-insensitive matching, done at *compile* time by expanding each literal and each class
+  // range to cover both cases. The machine is untouched: adding a fold to OP_CHAR would put a
+  // table lookup on the hot path of every match, and would have to answer for a byte that is half
+  // of a multi-byte scalar. See the README on why this is ASCII only.
+  bool ignoreCase;
+
+  void grow(this, i32 want) {
+    if (want * 3 <= this.code.len()) { return; }
+    i32 cap = this.code.len() == 0 ? 96 : this.code.len() * 2;
+    while (cap < want * 3) { cap = cap * 2; }
+    i32[] next = i32[cap]();
+    for (i32 i = 0; i < this.len * 3; i++) { next[i] = this.code[i]; }
+    this.code = next;
+  }
+
+  void emit(this, i32 op, i32 a, i32 b) {
+    this.grow(this.len + 1);
+    this.code[this.len * 3] = op;
+    this.code[this.len * 3 + 1] = a;
+    this.code[this.len * 3 + 2] = b;
+    this.len++;
+  }
+
+  /**
+   * Insert one instruction at `at`, shifting the rest along.
+   *
+   * The fixup is the subtle part, and a blanket "move every target at or past `at`" is wrong. A
+   * target of exactly `at` means two different things depending on where the jump is:
+   *
+   *   - from *inside* the region being wrapped, it means "the start of this body", and must move
+   *     with it — a `x*` inside a `y*` jumps back to its own first instruction;
+   *   - from *before* it, it means "whatever comes next", and must not move — the previous
+   *     construct's skip target has to land on the newly inserted instruction, not step over it.
+   *
+   * Getting this wrong shows up only when two quantified atoms sit next to each other and the
+   * first can match empty, which is why `\d*\d*?` was the case that found it.
+   */
+  void insertAt(this, i32 at, i32 op, i32 a, i32 b) {
+    this.grow(this.len + 1);
+    for (i32 i = this.len - 1; i >= at; i--) {
+      this.code[(i + 1) * 3] = this.code[i * 3];
+      this.code[(i + 1) * 3 + 1] = this.code[i * 3 + 1];
+      this.code[(i + 1) * 3 + 2] = this.code[i * 3 + 2];
+    }
+    this.code[at * 3] = op;
+    this.code[at * 3 + 1] = a;
+    this.code[at * 3 + 2] = b;
+    this.len++;
+    for (i32 j = 0; j < this.len; j++) {
+      if (j == at) { continue; }
+      i32 o = this.code[j * 3];
+      if (o != OP_JMP() && o != OP_SPLIT()) { continue; }
+      // `j > at` is exactly "this instruction was inside or after the shifted region".
+      bool inside = j > at;
+      i32 t1 = this.code[j * 3 + 1];
+      if (t1 > at || (t1 == at && inside)) { this.code[j * 3 + 1] = t1 + 1; }
+      if (o == OP_SPLIT()) {
+        i32 t2 = this.code[j * 3 + 2];
+        if (t2 > at || (t2 == at && inside)) { this.code[j * 3 + 2] = t2 + 1; }
+      }
+    }
+  }
+
+  /**
+   * Append a copy of the instructions in [lo, hi), relocating what has to move.
+   *
+   * Two things do. Jumps that stay inside the range shift by the distance the copy moved; jumps
+   * that leave it — there are none today, since a copied body is self-contained — would not.
+   * And every loop in the copy needs its *own* MARK/PROGRESS slot: two copies of `x*` sharing a
+   * slot would have the second compare its position against the first's, so `(a*){2}` would
+   * stop after one iteration.
+   */
+  void copyRange(this, i32 lo, i32 hi) {
+    i32 shift = this.len - lo;
+    i32 n = hi - lo;
+    this.grow(this.len + n);
+
+    // Loop slots used in the range are contiguous, because they are handed out in source order
+    // as the body is compiled. So one base offset remaps all of them.
+    i32 minSlot = -1;
+    i32 maxSlot = -1;
+    for (i32 i = 0; i < n; i++) {
+      i32 o = this.code[(lo + i) * 3];
+      if (o == OP_MARK() || o == OP_PROGRESS()) {
+        i32 slot = this.code[(lo + i) * 3 + 1];
+        if (minSlot < 0 || slot < minSlot) { minSlot = slot; }
+        if (slot > maxSlot) { maxSlot = slot; }
+      }
+    }
+    i32 slotBase = this.loops;
+    if (minSlot >= 0) { this.loops = this.loops + (maxSlot - minSlot + 1); }
+
+    for (i32 i = 0; i < n; i++) {
+      i32 o = this.code[(lo + i) * 3];
+      i32 a = this.code[(lo + i) * 3 + 1];
+      i32 b = this.code[(lo + i) * 3 + 2];
+      if (o == OP_JMP() || o == OP_SPLIT()) {
+        if (a >= lo && a <= hi) { a = a + shift; }
+        if (o == OP_SPLIT() && b >= lo && b <= hi) { b = b + shift; }
+      }
+      if (o == OP_MARK() || o == OP_PROGRESS()) { a = slotBase + (a - minSlot); }
+      this.code[this.len * 3] = o;
+      this.code[this.len * 3 + 1] = a;
+      this.code[this.len * 3 + 2] = b;
+      this.len++;
+    }
+  }
+
+  i32 peek(const this) { return this.pos < this.src.len() ? this.src[this.pos] : -1; }
+  i32 peekAt(const this, i32 k) {
+    return this.pos + k < this.src.len() ? this.src[this.pos + k] : -1;
+  }
+  void bump(this) { this.pos++; }
+  void fail(this) { this.failed = true; }
+
+  i32 newClass(this, bool negated) {
+    if (this.classes >= this.classStart.len()) {
+      i32 cap = this.classStart.len() == 0 ? 8 : this.classStart.len() * 2;
+      i32[] s = i32[cap]();
+      i32[] c = i32[cap]();
+      bool[] g = bool[cap]();
+      for (i32 i = 0; i < this.classes; i++) {
+        s[i] = this.classStart[i];
+        c[i] = this.classCount[i];
+        g[i] = this.classNeg[i];
+      }
+      this.classStart = s;
+      this.classCount = c;
+      this.classNeg = g;
+    }
+    this.classStart[this.classes] = this.ranges;
+    this.classCount[this.classes] = 0;
+    this.classNeg[this.classes] = negated;
+    this.classes++;
+    return this.classes - 1;
+  }
+
+  /** Add `[lo, hi]`, plus its case counterpart when folding. */
+  void addFolded(this, i32 index, i32 lo, i32 hi) {
+    this.addRange(index, lo, hi);
+    if (!this.ignoreCase) { return; }
+    // The part of the range that is a lowercase letter, mapped to uppercase, and vice versa.
+    i32 loA = lo > 'a' ? lo : 'a';
+    i32 hiA = hi < 'z' ? hi : 'z';
+    if (loA <= hiA) { this.addRange(index, loA - 32, hiA - 32); }
+    i32 loB = lo > 'A' ? lo : 'A';
+    i32 hiB = hi < 'Z' ? hi : 'Z';
+    if (loB <= hiB) { this.addRange(index, loB + 32, hiB + 32); }
+  }
+
+  void addRange(this, i32 index, i32 lo, i32 hi) {
+    if (this.ranges >= this.classLo.len()) {
+      i32 cap = this.classLo.len() == 0 ? 32 : this.classLo.len() * 2;
+      i32[] l = i32[cap]();
+      i32[] h = i32[cap]();
+      for (i32 i = 0; i < this.ranges; i++) { l[i] = this.classLo[i]; h[i] = this.classHi[i]; }
+      this.classLo = l;
+      this.classHi = h;
+    }
+    this.classLo[this.ranges] = lo;
+    this.classHi[this.ranges] = hi;
+    this.ranges++;
+    this.classCount[index] = this.classCount[index] + 1;
+  }
+}
+
+bool isDigit(i32 c) { return c >= '0' && c <= '9'; }
+
+/** The ranges behind `\d`, `\w` and `\s`, added to whichever class is being built. */
+void addShorthand(C c, i32 index, i32 letter) {
+  if (letter == 'd' || letter == 'D') {
+    c.addRange(index, '0', '9');
+  } else if (letter == 'w' || letter == 'W') {
+    c.addRange(index, 'a', 'z');
+    c.addRange(index, 'A', 'Z');
+    c.addRange(index, '0', '9');
+    c.addRange(index, '_', '_');
+  } else {
+    // \s: the ASCII part. JavaScript also includes several Unicode spaces, which byte-wise
+    // matching cannot see — the tests keep to ASCII for that reason, and the README says so.
+    c.addRange(index, ' ', ' ');
+    c.addRange(index, 9, 13);
+  }
+}
+
+bool isShorthand(i32 c) {
+  return c == 'd' || c == 'D' || c == 'w' || c == 'W' || c == 's' || c == 'S';
+}
+
+/** The byte an escape stands for, or -1 if it is not that kind of escape. */
+i32 escapeByte(i32 c) {
+  if (c == 'n') { return 10; }
+  if (c == 'r') { return 13; }
+  if (c == 't') { return 9; }
+  if (c == 'f') { return 12; }
+  if (c == 'v') { return 11; }
+  if (c == '0') { return 0; }
+  return -1;
+}
+
+// ── The grammar ────────────────────────────────────────────────────────────────────────
+
+/** `[...]`, emitting one CLASS instruction. */
+void parseClass(C c) {
+  c.bump();                                    // [
+  bool negated = c.peek() == '^';
+  if (negated) { c.bump(); }
+  i32 index = c.newClass(negated);
+  // No "a `]` in first position is literal" rule: that is Perl and POSIX, not JavaScript. Here
+  // `[]` is the empty class, which matches nothing, and `[^]` is its negation, which matches
+  // anything — so `[]]` is the empty class followed by a literal `]` and never matches at all.
+  while (true) {
+    i32 ch = c.peek();
+    if (ch < 0) { c.fail(); return; }
+    if (ch == ']') { c.bump(); break; }
+
+    i32 lo = -1;
+    if (ch == '\\') {
+      c.bump();
+      i32 e = c.peek();
+      if (e < 0) { c.fail(); return; }
+      c.bump();
+      if (isShorthand(e)) {
+        // A shorthand inside a class contributes its ranges and cannot be an endpoint. A
+        // negated one inside a positive class would need set subtraction, which this does not
+        // do — `[\D]` is rejected rather than quietly wrong.
+        if (e == 'D' || e == 'W' || e == 'S') { c.fail(); return; }
+        addShorthand(c, index, e);
+        continue;
+      }
+      i32 named = escapeByte(e);
+      lo = named >= 0 ? named : e;
+    } else {
+      c.bump();
+      lo = ch;
+    }
+
+    // A `-` that is not last makes this a range.
+    if (c.peek() == '-' && c.peekAt(1) != ']' && c.peekAt(1) >= 0) {
+      c.bump();
+      i32 hiCh = c.peek();
+      i32 hi = -1;
+      if (hiCh == '\\') {
+        c.bump();
+        i32 e = c.peek();
+        if (e < 0 || isShorthand(e)) { c.fail(); return; }
+        c.bump();
+        i32 named = escapeByte(e);
+        hi = named >= 0 ? named : e;
+      } else {
+        c.bump();
+        hi = hiCh;
+      }
+      if (hi < lo) { c.fail(); return; }
+      c.addFolded(index, lo, hi);
+    } else {
+      c.addFolded(index, lo, lo);
+    }
+  }
+  c.emit(OP_CLASS(), index, 0);
+}
+
+/** One atom: a group, a class, a dot, an anchor, an escape or a literal byte. */
+void parseAtom(C c) {
+  i32 ch = c.peek();
+  if (ch == '(') {
+    c.bump();
+    i32 slot = -1;
+    if (c.peek() == '?' && c.peekAt(1) == ':') {
+      c.bump();
+      c.bump();
+    } else if (c.peek() == '?') {
+      // Lookaround and named groups are not implemented, and are rejected rather than
+      // mis-parsed as something else.
+      c.fail();
+      return;
+    } else {
+      c.groups++;
+      slot = c.groups;
+    }
+    if (slot >= 0) { c.emit(OP_SAVE(), slot * 2, 0); }
+    parseAlternation(c);
+    if (c.failed) { return; }
+    if (c.peek() != ')') { c.fail(); return; }
+    c.bump();
+    if (slot >= 0) { c.emit(OP_SAVE(), slot * 2 + 1, 0); }
+  } else if (ch == '[') {
+    parseClass(c);
+  } else if (ch == '.') {
+    c.bump();
+    c.emit(OP_ANY(), 0, 0);
+  } else if (ch == '^') {
+    c.bump();
+    c.emit(OP_BOL(), 0, 0);
+  } else if (ch == '$') {
+    c.bump();
+    c.emit(OP_EOL(), 0, 0);
+  } else if (ch == '\\') {
+    c.bump();
+    i32 e = c.peek();
+    if (e < 0) { c.fail(); return; }
+    c.bump();
+    if (isShorthand(e)) {
+      bool negated = e == 'D' || e == 'W' || e == 'S';
+      i32 index = c.newClass(negated);
+      addShorthand(c, index, e);
+      c.emit(OP_CLASS(), index, 0);
+    } else if (e == 'b' || e == 'B') {
+      c.emit(OP_WORDB(), e == 'b' ? 1 : 0, 0);
+    } else if (isDigit(e) && e != '0') {
+      c.fail();                                // a backreference; not implemented
+    } else {
+      i32 named = escapeByte(e);
+      emitLiteral(c, named >= 0 ? named : e);
+    }
+  } else if (ch < 0 || ch == '|' || ch == ')') {
+    // An empty branch, which is legal: `a|` matches "a" or "".
+  } else if (ch == '*' || ch == '+' || ch == '?') {
+    c.fail();                                  // a quantifier with nothing to quantify
+  } else {
+    c.bump();
+    emitLiteral(c, ch);
+  }
+}
+
+/** A literal byte: one CHAR, or a two-case class when folding and the byte is a letter. */
+void emitLiteral(C c, i32 ch) {
+  bool cased = c.ignoreCase
+    && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'));
+  if (!cased) {
+    c.emit(OP_CHAR(), ch, 0);
+    return;
+  }
+  i32 lower = ch >= 'A' && ch <= 'Z' ? ch + 32 : ch;
+  i32 index = c.newClass(false);
+  c.addRange(index, lower, lower);
+  c.addRange(index, lower - 32, lower - 32);
+  c.emit(OP_CLASS(), index, 0);
+}
+
+/** `{n}`, `{n,}` or `{n,m}` if that is what follows, else -1 in `min`. */
+struct Bounds { i32 min; i32 max; bool present; }
+
+Bounds parseBounds(C c) {
+  i32 save = c.pos;
+  if (c.peek() != '{') { return Bounds(0, 0, false); }
+  c.bump();
+  if (!isDigit(c.peek())) { c.pos = save; return Bounds(0, 0, false); }
+  i32 min = 0;
+  while (isDigit(c.peek())) { min = min * 10 + (c.peek() - '0'); c.bump(); }
+  i32 max = min;
+  if (c.peek() == ',') {
+    c.bump();
+    if (isDigit(c.peek())) {
+      max = 0;
+      while (isDigit(c.peek())) { max = max * 10 + (c.peek() - '0'); c.bump(); }
+    } else {
+      max = -1;                                // unbounded
+    }
+  }
+  if (c.peek() != '}') { c.pos = save; return Bounds(0, 0, false); }
+  c.bump();
+  return Bounds(min, max, true);
+}
+
+/** How many instructions a `{n,m}` may expand to before the compile is refused. */
+i32 EXPANSION_LIMIT() { return 4000; }
+
+/** An atom and whatever quantifier follows it. */
+void parseRepeat(C c) {
+  i32 start = c.len;
+  i32 groupsBefore = c.groups;
+  parseAtom(c);
+  if (c.failed) { return; }
+  if (c.len == start) { return; }              // nothing to quantify
+
+  // An assertion is a Term, not an Atom, so ECMAScript's grammar gives it nowhere to hang a
+  // quantifier: `^?`, `$*` and `\b+` are all syntax errors rather than no-ops. Detected here
+  // because the atom parser has just emitted exactly one instruction and this is the only place
+  // that knows what came next.
+  bool isAssertion = c.len == start + 1
+    && (c.code[start * 3] == OP_BOL() || c.code[start * 3] == OP_EOL()
+        || c.code[start * 3] == OP_WORDB());
+
+  while (true) {
+    i32 ch = c.peek();
+    Bounds bounds = Bounds(0, 0, false);
+    if (ch == '{') {
+      bounds = parseBounds(c);
+      if (!bounds.present) { return; }         // a literal `{`, handled as a normal byte
+    } else if (ch != '*' && ch != '+' && ch != '?') {
+      return;
+    } else {
+      c.bump();
+      if (ch == '*') { bounds = Bounds(0, -1, true); }
+      else if (ch == '+') { bounds = Bounds(1, -1, true); }
+      else { bounds = Bounds(0, 1, true); }
+    }
+    if (isAssertion) { c.fail(); return; }
+
+    bool lazy = c.peek() == '?';
+    if (lazy) { c.bump(); }
+    if (bounds.max >= 0 && bounds.max < bounds.min) { c.fail(); return; }
+
+    // Every iteration resets the groups inside the body. Inserted before any copying, so each
+    // copy carries its own reset, and only when the body actually contains a group.
+    if (c.groups > groupsBefore) {
+      c.insertAt(start, OP_CLEAR(), (groupsBefore + 1) * 2, c.groups * 2 + 1);
+    }
+
+    i32 bodyLo = start;
+    i32 bodyHi = c.len;
+    i32 bodyLen = bodyHi - bodyLo;
+
+    if (bounds.min == 0 && bounds.max == -1) {
+      wrapStar(c, bodyLo, lazy);
+    } else if (bounds.min == 1 && bounds.max == -1) {
+      wrapPlus(c, bodyLo, bodyHi, lazy);
+    } else if (bounds.min == 0 && bounds.max == 1) {
+      wrapOptional(c, bodyLo, lazy);
+    } else {
+      if (bodyLen * (bounds.max < 0 ? bounds.min + 1 : bounds.max) > EXPANSION_LIMIT()) {
+        c.fail();
+        return;
+      }
+      expandBounded(c, bodyLo, bodyHi, bounds.min, bounds.max, lazy);
+    }
+    if (c.failed) { return; }
+    // A quantifier may itself be quantified — `a**` is a syntax error in JavaScript, but
+    // `(a*)*` is not, and the loop above has already closed the group.
+    start = bodyLo;
+  }
+}
+
+/**
+ * The empty-iteration rule, which every quantifier below turns on.
+ *
+ * ECMAScript's RepeatMatcher applies its empty check only once the minimum is satisfied: an
+ * iteration that is still *required* may match the empty string, and one that is optional may
+ * not. That is exactly the difference between `(a*)*` on "" — which reports group 1 as absent,
+ * because the one optional iteration matched empty and was rejected — and `(a*)+`, which reports
+ * it as [0,0], because the first iteration was mandatory.
+ *
+ * So a mandatory copy of a body is emitted bare, and an optional one is wrapped in MARK and
+ * PROGRESS. Getting this backwards is invisible on every pattern whose body cannot match empty,
+ * which is most of them.
+ */
+i32 newLoopSlot(C c) {
+  i32 slot = c.loops;
+  c.loops++;
+  return slot;
+}
+
+/**
+ * `x*` becomes
+ *
+ *     L0: SPLIT L1, L3
+ *     L1: MARK k
+ *         x
+ *         PROGRESS k
+ *         JMP L0
+ *     L3:
+ */
+void wrapStar(C c, i32 lo, bool lazy) {
+  i32 slot = newLoopSlot(c);
+  c.emit(OP_PROGRESS(), slot, 0);
+  c.insertAt(lo, OP_MARK(), slot, 0);
+  c.insertAt(lo, OP_SPLIT(), 0, 0);
+  c.emit(OP_JMP(), lo, 0);
+  i32 after = c.len;
+  c.code[lo * 3 + 1] = lazy ? after : lo + 1;
+  c.code[lo * 3 + 2] = lazy ? lo + 1 : after;
+}
+
+/**
+ * `x?` — one optional iteration, so the empty check applies to it.
+ *
+ * The body is at [lo, c.len). PROGRESS goes on the end and MARK and SPLIT on the front, in that
+ * order, so each insert only moves code the next one has not looked at yet.
+ */
+void wrapOptional(C c, i32 lo, bool lazy) {
+  i32 slot = newLoopSlot(c);
+  c.emit(OP_PROGRESS(), slot, 0);
+  c.insertAt(lo, OP_MARK(), slot, 0);
+  c.insertAt(lo, OP_SPLIT(), 0, 0);
+  i32 after = c.len;
+  c.code[lo * 3 + 1] = lazy ? after : lo + 1;
+  c.code[lo * 3 + 2] = lazy ? lo + 1 : after;
+}
+
+/**
+ * `x+` is one mandatory copy followed by `x*` over a second copy.
+ *
+ * The duplication is the price of the rule above: the first iteration must not be subject to the
+ * empty check and every later one must be, and one body cannot be both. A counter in the machine
+ * would avoid it, at the cost of putting the counter into the backtracking state.
+ */
+void wrapPlus(C c, i32 lo, i32 hi, bool lazy) {
+  i32 starLo = c.len;
+  c.copyRange(lo, hi);
+  wrapStar(c, starLo, lazy);
+}
+
+/**
+ * `x{n,m}` by duplication: n mandatory copies, then optional ones.
+ *
+ * Optional copies nest rather than sit side by side, so giving up on the k-th gives up on every
+ * one after it — otherwise `a{0,2}` could match "a" by taking the second copy and skipping the
+ * first, and report the wrong capture positions for a group inside the body.
+ */
+void expandBounded(C c, i32 lo, i32 hi, i32 min, i32 max, bool lazy) {
+  if (max == 0) {
+    c.len = lo;                                // `x{0}` matches empty and never runs the body
+    return;
+  }
+
+  // Copy 1 is the body already emitted. Mandatory copies are bare.
+  for (i32 i = 1; i < min; i++) { c.copyRange(lo, hi); }
+
+  if (max < 0) {
+    if (min == 0) {
+      wrapStar(c, lo, lazy);
+    } else {
+      wrapPlus(c, lo, hi, lazy);
+    }
+    return;
+  }
+
+  // Optional copies, recorded as they are appended so they can be wrapped last-to-first: an
+  // insert shifts everything after it, and going backwards means nothing already recorded moves.
+  i32 optional = max - min;
+  i32 first = min == 0 ? 1 : 0;                // whether the emitted body is itself optional
+  i32 toAppend = optional - first;
+  i32[] starts = i32[optional > 0 ? optional : 1]();
+  i32[] ends = i32[optional > 0 ? optional : 1]();
+  i32 count = 0;
+  if (first == 1) {
+    starts[count] = lo;
+    ends[count] = hi;
+    count++;
+  }
+  for (i32 i = 0; i < toAppend; i++) {
+    starts[count] = c.len;
+    c.copyRange(lo, hi);
+    ends[count] = c.len;
+    count++;
+  }
+  for (i32 i = count - 1; i >= 0; i--) {
+    i32 s = starts[i];
+    i32 e = ends[i];
+    i32 slot = newLoopSlot(c);
+    c.insertAt(e, OP_PROGRESS(), slot, 0);
+    c.insertAt(s, OP_MARK(), slot, 0);
+    c.insertAt(s, OP_SPLIT(), 0, 0);
+    i32 after = c.len;
+    c.code[s * 3 + 1] = lazy ? after : s + 1;
+    c.code[s * 3 + 2] = lazy ? s + 1 : after;
+  }
+}
+
+void parseConcat(C c) {
+  while (true) {
+    i32 ch = c.peek();
+    if (ch < 0 || ch == '|' || ch == ')') { return; }
+    i32 before = c.len;
+    parseRepeat(c);
+    if (c.failed) { return; }
+    if (c.len == before && c.peek() == ch) {
+      // No progress and no error: a construct the parser does not consume. Refuse rather than
+      // spin.
+      c.fail();
+      return;
+    }
+  }
+}
+
+/**
+ * `a|b|c`, emitted as a chain of SPLITs.
+ *
+ * Each branch is compiled in place and then a SPLIT is inserted in front of it and a JMP to the
+ * end appended, which is why the branch starts are recorded: the insert shifts everything after.
+ */
+void parseAlternation(C c) {
+  i32 start = c.len;
+  parseConcat(c);
+  if (c.failed) { return; }
+  if (c.peek() != '|') { return; }
+
+  // Two or more branches, chained:
+  //
+  //     SPLIT B1, S2
+  //  B1: branch 1
+  //      JMP END
+  //  S2: SPLIT B2, B3
+  //  B2: branch 2
+  //      JMP END
+  //  B3: branch 3
+  //  END:
+  //
+  // Each SPLIT is inserted in front of the branch it selects, *after* that branch is compiled,
+  // because the branch's length is not known until then. Every recorded position is earlier in
+  // the code than the insert point, so none of them shifts — with one exception, handled below:
+  // the previous SPLIT's second target points exactly at the insert position, and `insertAt`
+  // moves targets at or past that point. It has to, for quantifiers. So the chain link is
+  // re-pointed explicitly afterwards.
+  i32[] splits = i32[8]();
+  i32 nSplits = 0;
+  i32[] jmps = i32[8]();
+  i32 nJmps = 0;
+  i32 branchStart = start;
+
+  while (c.peek() == '|') {
+    c.bump();
+    c.emit(OP_JMP(), 0, 0);                    // closes the branch just parsed; patched at the end
+    i32 jmpAt = c.len - 1;
+
+    c.insertAt(branchStart, OP_SPLIT(), 0, 0);
+    i32 splitAt = branchStart;
+    jmpAt++;                                   // the only recorded position after the insert
+
+    if (nSplits > 0) {
+      // insertAt pushed this forward by one; it must point at the new SPLIT, not past it.
+      c.code[splits[nSplits - 1] * 3 + 2] = splitAt;
+    }
+    c.code[splitAt * 3 + 1] = splitAt + 1;
+
+    if (nSplits >= splits.len()) {
+      i32[] bigger = i32[splits.len() * 2]();
+      for (i32 i = 0; i < nSplits; i++) { bigger[i] = splits[i]; }
+      splits = bigger;
+    }
+    splits[nSplits] = splitAt;
+    nSplits++;
+
+    if (nJmps >= jmps.len()) {
+      i32[] bigger = i32[jmps.len() * 2]();
+      for (i32 i = 0; i < nJmps; i++) { bigger[i] = jmps[i]; }
+      jmps = bigger;
+    }
+    jmps[nJmps] = jmpAt;
+    nJmps++;
+
+    branchStart = c.len;
+    c.code[splitAt * 3 + 2] = branchStart;
+    parseConcat(c);
+    if (c.failed) { return; }
+  }
+  i32 end = c.len;
+  for (i32 i = 0; i < nJmps; i++) { c.code[jmps[i] * 3 + 1] = end; }
+}
+
+/** Compile `pattern`, or null if it is not one this engine accepts. */
+export Program? compile(u8[] pattern) { return compileFlags(pattern, false); }
+
+/** As `compile`, with `ignoreCase` for the `i` flag. */
+export Program? compileFlags(u8[] pattern, bool ignoreCase) {
+  C c = C(i32[0](), 0, 0, pattern, 0, 0, i32[0](), i32[0](), i32[0](), i32[0](), bool[0](), 0, 0,
+          false, ignoreCase);
+  c.emit(OP_SAVE(), 0, 0);
+  parseAlternation(c);
+  if (c.failed || c.pos < c.src.len()) { return null; }
+  c.emit(OP_SAVE(), 1, 0);
+  c.emit(OP_MATCH(), 0, 0);
+  return Program(c.code, c.len, c.groups, c.loops, c.classLo, c.classHi, c.classStart,
+                 c.classCount, c.classNeg, c.classes);
+}

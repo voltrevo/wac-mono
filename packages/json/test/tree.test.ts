@@ -1,39 +1,116 @@
-// Differential walk of the parsed tree: build plain JavaScript data out of the wac-side
-// `JsonValue` and compare against `JSON.parse`.
+// Walking a parsed tree from TypeScript.
 //
-// Every other host test here observes bytes — the tree was unreachable from JavaScript, so
-// what they check about it is really a check on its *re-serialization*, and a bug that
-// cancelled itself out between parse and stringify would pass all of them. This one reads the
-// tree directly, so parse is compared against the host on its own.
+// New, and the reason `json.wac` no longer has a status byte in it: a `JsonValue` crosses the
+// boundary as a class with a `tag` to switch on, and the containers arrive with their methods, so
+// a JSON document is walkable from the host without being re-serialized first.
+//
+// Worth its own test because it is the interface a caller now actually uses. The rest of this
+// package's tests go through `canonicalize`, which compares bytes and would not notice a tree that
+// serialized correctly but was shaped wrongly — a number stored as a string, say, or a member
+// order that only survives because the serializer re-derives it.
 
-import { assertEquals } from "./util.ts";
 import { wacBind } from "../../../harness/wacBind.ts";
+import { assertEquals } from "./util.ts";
 
-/** The wrappers bindgen generates for `src/tree.wac`, as this test uses them. */
-type Value = {
-  tag: "Null" | "Bool" | "Number" | "Str" | "Array" | "Object";
-  Bool_value: boolean;
-  Number_value: number;
-  Str_bytes: Uint8Array;
-  Array_items: { len(): number; get(i: number): Value };
-  Object_members: { len(): number; at(i: number): { keyStr(): string; value: Value } };
+const mod = await wacBind("packages/json/src/json.wac") as unknown as {
+  parse(src: Uint8Array): JsonRef | null;
+  stringify(value: JsonRef): Uint8Array;
 };
 
-type TreeMod = {
-  parse(src: string): Value | null;
-  errorCodeOf(src: string): number;
+/** The generated class, as much of it as these tests touch. */
+type JsonRef = {
+  readonly tag: "Null" | "Bool" | "Number" | "Str" | "Array" | "Object";
+  readonly Bool_value: boolean;
+  readonly Number_value: number;
+  readonly Number_raw: Uint8Array;
+  readonly Str_bytes: Uint8Array;
+  readonly Array_items: { len(): number; get(i: number): JsonRef };
+  readonly Object_members: { len(): number; at(i: number): { key: Uint8Array; value: JsonRef; keyStr(): string } };
 };
 
-let cached: TreeMod | null = null;
-async function tree(): Promise<TreeMod> {
-  if (cached === null) cached = await wacBind("packages/json/src/tree.wac") as unknown as TreeMod;
-  return cached;
-}
-
+const enc = new TextEncoder();
 const dec = new TextDecoder();
+const parse = (s: string): JsonRef | null => mod.parse(enc.encode(s));
 
-/** The whole point of the test: a tree walk written the way a consumer would write it. */
-function toJs(v: Value): unknown {
+Deno.test("every kind arrives with the right tag", () => {
+  const cases: Array<[string, string]> = [
+    ["null", "Null"],
+    ["true", "Bool"],
+    ["1", "Number"],
+    ['"x"', "Str"],
+    ["[]", "Array"],
+    ["{}", "Object"],
+  ];
+  for (const [src, tag] of cases) {
+    const v = parse(src);
+    if (v === null) throw new Error(`${src} did not parse`);
+    assertEquals(v.tag, tag, src);
+  }
+});
+
+Deno.test("a document that is not JSON parses as null", () => {
+  for (const src of ["", "{", "[1,]", "tru", '{"a"}', "1 2"]) {
+    if (parse(src) !== null) throw new Error(`${JSON.stringify(src)} should not have parsed`);
+  }
+});
+
+Deno.test("scalars carry their values", () => {
+  assertEquals(parse("true")!.Bool_value, true);
+  assertEquals(parse("false")!.Bool_value, false);
+  assertEquals(parse("1.5")!.Number_value, 1.5);
+  assertEquals(parse("-0")!.Number_value, -0);
+  assertEquals(dec.decode(parse('"héllo"')!.Str_bytes), "héllo");
+  // The source span, which is what makes a round trip byte-exact. A tree walker can see it too.
+  assertEquals(dec.decode(parse("1e2")!.Number_raw), "1e2");
+  assertEquals(parse("1e2")!.Number_value, 100);
+});
+
+Deno.test("containers are walkable, in order and with duplicates", () => {
+  const arr = parse("[1,true,null,[2]]")!;
+  assertEquals(arr.Array_items.len(), 4);
+  assertEquals(arr.Array_items.get(0).Number_value, 1);
+  assertEquals(arr.Array_items.get(1).Bool_value, true);
+  assertEquals(arr.Array_items.get(2).tag, "Null");
+  assertEquals(arr.Array_items.get(3).Array_items.get(0).Number_value, 2);
+
+  const obj = parse('{"b":1,"a":2,"b":3}')!;
+  assertEquals(obj.Object_members.len(), 3, "a duplicate key is kept");
+  assertEquals(obj.Object_members.at(0).keyStr(), "b", "source order, not sorted");
+  assertEquals(obj.Object_members.at(1).keyStr(), "a");
+  assertEquals(obj.Object_members.at(2).keyStr(), "b");
+  assertEquals(obj.Object_members.at(0).value.Number_value, 1);
+  assertEquals(obj.Object_members.at(2).value.Number_value, 3);
+});
+
+Deno.test("reading the wrong variant throws rather than lying", () => {
+  // The protection `match` gives inside wac, arriving as an exception rather than a wrong answer.
+  const n = parse("1")!;
+  let threw = false;
+  try {
+    n.Str_bytes;
+  } catch {
+    threw = true;
+  }
+  if (!threw) throw new Error("reading Str_bytes off a Number did not throw");
+});
+
+Deno.test("a tree handed back serializes to what it came from", () => {
+  // `stringify` is the other direction, and takes the reference straight back — so this is a
+  // round trip through the boundary, not through bytes.
+  for (const src of ['{"b":1,"a":[1,2,{"c":true}],"n":1e2}', "[]", "{}", "null", '"x"', "-0"]) {
+    const v = parse(src);
+    if (v === null) throw new Error(`${src} did not parse`);
+    assertEquals(dec.decode(mod.stringify(v)), src, src);
+  }
+});
+
+// The tests above check the tree against what this package knows about itself: tags, values,
+// order, and a round trip back through `stringify`. This one checks it against a *different*
+// implementation — the host's own parser — by walking the whole tree into plain data. A shape
+// that is self-consistently wrong survives everything above and fails here.
+
+/** A tree walk written the way a consumer would write it. */
+function toJs(v: JsonRef): unknown {
   switch (v.tag) {
     case "Null":   return null;
     case "Bool":   return v.Bool_value;
@@ -46,52 +123,27 @@ function toJs(v: Value): unknown {
     case "Object": {
       const members = v.Object_members;
       const out: Record<string, unknown> = {};
-      // Last wins, which is what JSON.parse does with a duplicate key. The tree keeps
-      // both members — that is the parser being right, not a disagreement.
+      // Last wins, which is what JSON.parse does with a duplicate key. The tree keeps both
+      // members, which the test above asserts; this one is about agreeing with the host.
       for (let i = 0; i < members.len(); i++) out[members.at(i).keyStr()] = toJs(members.at(i).value);
       return out;
     }
   }
 }
 
-const CASES = [
-  "null", "true", "false", "0", "-1", "42", "1.5", "-2.25", "1e3",
-  '""', '"hello"', '"h\\u00e9llo \\ud83d\\ude00"', '"\\t\\n\\"\\\\"',
-  "[]", "[1]", "[1,2,3]", "[[1],[2,[3]]]", "[null,true,false]",
-  "{}", '{"a":1}', '{"a":1,"b":[2,3]}', '{"a":{"b":{"c":[]}}}',
-  '{"deep":[1,[2,[3,[4]]]],"uni":"héllo 😀","neg":-0.5,"big":1e20}',
-  '{"a":1,"a":2}',                       // duplicate keys: both kept, last wins on the way out
-  '  \t{ "spaced" : [ 1 , 2 ] }\n',
-];
-
-Deno.test("the parsed tree walks to the same data JSON.parse produces", async () => {
-  const m = await tree();
-  for (const src of CASES) {
-    const v = m.parse(src);
-    if (v === null) throw new Error(`parse failed for ${src}`);
-    assertEquals(
-      JSON.stringify(toJs(v)),
-      JSON.stringify(JSON.parse(src)),
-      `tree walk differs for ${src}`,
-    );
+Deno.test("the tree walks to the same data JSON.parse produces", () => {
+  const cases = [
+    "null", "true", "false", "0", "-1", "42", "1.5", "-2.25", "1e3",
+    '""', '"hello"', '"h\\u00e9llo \\ud83d\\ude00"', '"\\t\\n\\"\\\\"',
+    "[]", "[1]", "[1,2,3]", "[[1],[2,[3]]]", "[null,true,false]",
+    "{}", '{"a":1}', '{"a":1,"b":[2,3]}', '{"a":{"b":{"c":[]}}}',
+    '{"deep":[1,[2,[3,[4]]]],"uni":"héllo 😀","neg":-0.5,"big":1e20}',
+    '{"a":1,"a":2}',
+    '  \t{ "spaced" : [ 1 , 2 ] }\n',
+  ];
+  for (const src of cases) {
+    const v = parse(src);
+    if (v === null) throw new Error(`${src} did not parse`);
+    assertEquals(JSON.stringify(toJs(v)), JSON.stringify(JSON.parse(src)), src);
   }
-});
-
-Deno.test("an invalid document is null, with the error code alongside", async () => {
-  const m = await tree();
-  for (const src of ["", "{", "[1,", "nul", '{"a"}', "1 2", '"\\x"']) {
-    assertEquals(m.parse(src), null, `expected a parse failure for ${JSON.stringify(src)}`);
-    assertEquals(m.errorCodeOf(src) !== 0, true, `expected a nonzero code for ${JSON.stringify(src)}`);
-  }
-});
-
-Deno.test("a duplicate key keeps both members in the tree", async () => {
-  // The list *is* the JSON, and this is the thing a plain-object walk cannot show: the
-  // tree has two members where `JSON.parse` has one key.
-  const m = await tree();
-  const v = m.parse('{"a":1,"a":2}');
-  if (v === null || v.tag !== "Object") throw new Error("expected an object");
-  assertEquals(v.Object_members.len(), 2, "both members survive");
-  assertEquals(v.Object_members.at(0).keyStr(), "a");
-  assertEquals(v.Object_members.at(1).value.Number_value, 2, "and the second is the later value");
 });

@@ -1,6 +1,7 @@
 # 0002 — `coverage` and `mutate` only see gzip, but report as if repo-wide
 
-- **Status:** open
+- **Status:** closed
+- **Closed:** 2026-08-01 by agent-c
 - **Reported by:** agent-b
 - **Date:** 2026-07-31
 - **Kind:** bug
@@ -150,5 +151,72 @@ nothing about whether the covered branches were *asserted* on. Collecting counte
 the real test run is the fix for both, and nothing does that yet — agent-a's tool gets
 closest, since for a wac-native suite the tests genuinely are the exercise.
 
-Still open: the `mutate` half is untouched — every mutation in `tools/mutate.ts` is still in
-gzip's `crc32.wac` or `bitwriter.wac`.
+## Progress — 2026-07-31, agent-c (third pass): the mutate half
+
+Done. `tools/mutate.ts` was rewritten and now covers every package. The interesting part
+is not the coverage, though — it is what building it turned up about the old tool.
+
+**Seven of the 43 curated mutations no longer applied, and the run still exited 0.** The
+patterns had rotted: `crc32.wac` says `u32 crc` and `crc >>= 1` since unsigned types
+landed, `buf.wac` moved to the `bytes` package, `CL_ORDER` became a module-level
+constant, and the bit reader was rewritten into peek/skip. The tool printed "update the
+patterns" and then "no surviving correctness mutations" and exited clean. A mutation that
+does not apply is not a passing result; it is a test that stopped running. It now fails
+the run.
+
+**One mutation was silently mutating the wrong line.** `crc32/final-inversion` matched
+`return crc ^ 0xFFFFFFFF;`, which appears in both `crc32` and `crc32Bitwise`, and
+`String.replace` takes the first. Mutants are now located by byte span, and an ambiguous
+pattern is an error unless the mutation says which occurrence it means.
+
+**A compile error counted as a kill.** Defensible for a hand-written list where every
+mutation was known to build. Fatal for generated ones, where failing to compile is the
+most common outcome — the first version of the `guard` operator produced 46 mutants of
+which 46 failed to compile, and would have scored a flawless 46/46 while testing nothing.
+Outcomes are now KILLED / SURVIVED / INVALID, and INVALID is out of the denominator.
+
+What the rewrite adds, following the techniques the literature has settled on:
+
+- **Trivial Compiler Equivalence** (Papadakis et al., ICSE 2015). Every mutant is
+  compiled before any test runs; byte-identical wasm means provably equivalent, and a
+  matching hash between two mutants means they are the same experiment. 436 mutants
+  triage in 33 seconds. Yield is low so far — 2 equivalent, 0 duplicate — because wac's
+  emitter does not optimise, and TCE's equivalence detection leans on optimisation
+  collapsing differences. Its value here is mostly the INVALID filter.
+- **Scoped runs**, from the real import graph rather than the path: mutating `bytes`
+  still runs gzip's and json's tests because they import it.
+- **Stage once**, patching and restoring per mutant instead of copying the tree 40 times.
+- **Mechanical operators** over wac's own token stream — a flipped comparison, a shifted
+  literal, a removed `trap` guard, a function body replaced by a constant ("extreme
+  mutation"). Not regex: a regex for `<` finds every one in a comment.
+- **`--diff`**, mutating only what changed against origin/master, which is how Google
+  runs this at scale and fits how this repo is written.
+
+Together those took the curated run from ~9 minutes to 2:55 while running more mutants
+than before, because seven of the old ones were not running at all.
+
+Operators are opt-in and default to a cheap subset. All four over the whole repo generate
+6,281 mutants — roughly eight hours — and most of that is `literal` (3,856) and
+`relational` (2,029), which are high-volume and low average signal. `guard` and `extreme`
+are ~430 and worth reading one by one.
+
+## Closed — 2026-08-01
+
+Both halves are done and the state this issue describes no longer exists.
+
+`deno task coverage` discovers every package by directory and drives each one's
+wac-native tests (agent-a, 990dc8c). Eight packages additionally have a `cov.ts` for the
+host-driven exercises wac cannot express. `deno task mutate` covers every package too,
+and no longer reports a figure headed `all` that means gzip.
+
+What the two halves ended up measuring is different, which is worth keeping straight:
+
+- coverage says a line ran
+- a surviving mutant says nothing checked what the line did
+
+The second is what this issue was really reaching for. The proof that it matters is that
+every package here was at or near 100% branch coverage when mutation testing found 58
+survivors, five of them real defects in crypto — including an AEAD that accepted a
+17-byte tag whose first sixteen bytes were valid.
+
+The remaining survivors are tracked in [0005](0005-mutation-testing-found-54-untested-behaviours.md).

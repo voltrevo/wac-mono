@@ -1,0 +1,293 @@
+// Parsing an HTTP/1.1 request from a byte buffer.
+//
+// Three outcomes, and keeping them apart is the whole design: a message can be complete, refused,
+// or *not yet decided*. A parser that folds "I need more bytes" into "no" closes connections on
+// slow clients; one that folds it into "yes" reads a truncated message as a whole one. So
+// `Parsed` has three cases and every caller has to say what it does about each.
+//
+// The framing rules in RFC 9112 §6 get most of the attention here, because that is where the
+// consequences are. When two parties disagree about where one message ends and the next begins,
+// an attacker who can reach both writes one request that the front thinks is one message and the
+// back thinks is two — request smuggling. The defence is not cleverness, it is refusing every
+// input where the length is ambiguous:
+//
+//   - `Content-Length` and `Transfer-Encoding` both present;
+//   - `Content-Length` given more than once, even with the same value;
+//   - a `Content-Length` that is not a plain decimal number;
+//   - a `Transfer-Encoding` whose last coding is not `chunked`;
+//   - obsolete line folding, which lets a header's value contain what looks like another header.
+//
+// Each of those is a rejection below, and each has a test naming the shape it prevents.
+
+import { Headers, eqFold, isToken, isOws, isFieldValueByte } from "./headers.wac";
+
+export i32 ERR_NONE() { return 0; }
+export i32 ERR_METHOD() { return 1; }         // the method is not a token
+export i32 ERR_TARGET() { return 2; }         // an empty or malformed request target
+export i32 ERR_VERSION() { return 3; }        // not `HTTP/1.x`
+export i32 ERR_LINE() { return 4; }           // the request line is not three parts and CRLF
+export i32 ERR_HEADER_NAME() { return 5; }    // a non-token byte, or space before the colon
+export i32 ERR_HEADER_VALUE() { return 6; }   // a control byte in a value
+export i32 ERR_OBS_FOLD() { return 7; }       // a continuation line
+export i32 ERR_FRAMING() { return 8; }        // the body length is ambiguous — see above
+export i32 ERR_CHUNK() { return 9; }          // a malformed chunk header, size or terminator
+export i32 ERR_TOO_LARGE() { return 10; }     // past a configured limit
+
+export struct Request {
+  u8[] method;
+  u8[] target;
+  i32 minor;                                  // the `x` of HTTP/1.x
+  Headers headers;
+  u8[] body;
+  i32 consumed;                               // bytes of the input this message used
+}
+
+/** Complete, refused, or undecided. */
+export enum Parsed {
+  Ok(Request request),
+  Bad(i32 code),
+  Incomplete,
+}
+
+u8[] slice(u8[] s, i32 lo, i32 hi) {
+  if (hi < lo) { hi = lo; }
+  u8[] out = u8[hi - lo]();
+  for (i32 i = lo; i < hi; i++) { out[i - lo] = s[i]; }
+  return out;
+}
+
+/** The index just past the next CRLF at or after `at`, or -1 if there is not one yet. */
+i32 findCrlf(u8[] s, i32 at) {
+  for (i32 i = at; i + 1 < s.len(); i++) {
+    if (s[i] == 13 && s[i + 1] == 10) { return i; }
+  }
+  return -1;
+}
+
+bool isDigit(i32 c) { return c >= '0' && c <= '9'; }
+
+/** Origin-, absolute-, authority- or asterisk-form. See the call site for why. */
+bool isValidTarget(u8[] s, i32 lo, i32 hi) {
+  if (hi <= lo) { return false; }
+  if (s[lo] == '/') { return true; }
+  if (hi - lo == 1 && s[lo] == '*') { return true; }
+  // Absolute-form is recognised by its `://`, authority-form by a colon with a port after it.
+  for (i32 i = lo; i + 2 < hi; i++) {
+    if (s[i] == ':' && s[i + 1] == '/' && s[i + 2] == '/') { return true; }
+  }
+  for (i32 i = lo + 1; i < hi - 1; i++) {
+    if (s[i] == ':' && isDigit(s[i + 1])) { return true; }
+  }
+  return false;
+}
+
+i32 hexValue(i32 c) {
+  if (isDigit(c)) { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+  return -1;
+}
+
+/**
+ * Parse a request from the front of `input`.
+ *
+ * `maxBody` caps the body this will assemble; a longer one is refused rather than buffered, so a
+ * `Content-Length: 999999999999` costs nothing.
+ */
+export Parsed parseRequest(u8[] input, i32 maxBody) {
+  // RFC 9112 §2.2: a server should ignore at least one empty line before the request line. Old
+  // clients emit a stray CRLF after a body, and a parser that treats it as a malformed request
+  // line drops the connection on the message that follows it.
+  i32 begin = 0;
+  while (begin + 1 < input.len() && input[begin] == 13 && input[begin + 1] == 10) { begin = begin + 2; }
+
+  i32 lineEnd = findCrlf(input, begin);
+  if (lineEnd < 0) { return Parsed.Incomplete; }
+
+  // ── The request line: method SP target SP HTTP/1.x ──────────────────────────────────
+  i32 sp1 = -1;
+  for (i32 i = begin; i < lineEnd; i++) {
+    if (input[i] == ' ') { sp1 = i; break; }
+  }
+  if (sp1 < 0) { return Parsed.Bad(ERR_LINE()); }
+  if (sp1 == begin) { return Parsed.Bad(ERR_METHOD()); }
+  for (i32 i = begin; i < sp1; i++) {
+    if (!isToken(input[i])) { return Parsed.Bad(ERR_METHOD()); }
+  }
+
+  i32 sp2 = -1;
+  for (i32 i = sp1 + 1; i < lineEnd; i++) {
+    if (input[i] == ' ') { sp2 = i; break; }
+  }
+  if (sp2 < 0) { return Parsed.Bad(ERR_LINE()); }
+  if (sp2 == sp1 + 1) { return Parsed.Bad(ERR_TARGET()); }
+  for (i32 i = sp1 + 1; i < sp2; i++) {
+    // The target is not parsed here — that is `packages/url` — but a control byte or a space in
+    // it is a framing problem rather than a URL problem, so it is caught here.
+    // A URI is ASCII by grammar; anything above 0x7F has to be percent-encoded before it gets
+    // here, and accepting it raw means two hops can decode it two ways.
+    if (input[i] <= 0x20 || input[i] >= 0x7F) { return Parsed.Bad(ERR_TARGET()); }
+  }
+  // RFC 9112 §3.2 gives four forms and no others: origin (`/path`), absolute (`http://h/p`),
+  // authority (`h:port`, for CONNECT) and asterisk (`*`, for OPTIONS). A bare `x` is none of
+  // them, and accepting it is how a target becomes whatever the next hop decides it is.
+  if (!isValidTarget(input, sp1 + 1, sp2)) { return Parsed.Bad(ERR_TARGET()); }
+
+  // `HTTP/1.` and one digit is the whole of what is accepted; 0.9 has no headers and 2 and 3 are
+  // not this grammar at all.
+  if (lineEnd - (sp2 + 1) != 8) { return Parsed.Bad(ERR_VERSION()); }
+  u8[] want = "HTTP/1.".toBytes();
+  for (i32 i = 0; i < 7; i++) {
+    if (input[sp2 + 1 + i] != want[i]) { return Parsed.Bad(ERR_VERSION()); }
+  }
+  i32 minorByte = input[sp2 + 8];
+  if (!isDigit(minorByte)) { return Parsed.Bad(ERR_VERSION()); }
+
+  Request req = Request(slice(input, begin, sp1), slice(input, sp1 + 1, sp2), minorByte - '0',
+                        Headers.create(), u8[0](), 0);
+
+  // ── Header fields ───────────────────────────────────────────────────────────────────
+  i32 at = lineEnd + 2;
+  while (true) {
+    i32 end = findCrlf(input, at);
+    if (end < 0) { return Parsed.Incomplete; }
+    if (end == at) { at = at + 2; break; }              // the empty line ends the block
+
+    // A line beginning with space or tab is obsolete line folding. RFC 9112 §5.2 says a server
+    // must reject it: the folded text becomes part of the previous value, and a value that can
+    // contain CRLF is a value that can contain a header.
+    if (isOws(input[at])) { return Parsed.Bad(ERR_OBS_FOLD()); }
+
+    i32 colon = -1;
+    for (i32 i = at; i < end; i++) {
+      if (input[i] == ':') { colon = i; break; }
+    }
+    if (colon < 0 || colon == at) { return Parsed.Bad(ERR_HEADER_NAME()); }
+    for (i32 i = at; i < colon; i++) {
+      // Whitespace before the colon included: `Host : a` is rejected, because some parsers read
+      // the name as `Host` and others as `Host `, and that disagreement is the bug.
+      if (!isToken(input[i])) { return Parsed.Bad(ERR_HEADER_NAME()); }
+    }
+
+    i32 vs = colon + 1;
+    while (vs < end && isOws(input[vs])) { vs++; }
+    i32 ve = end;
+    while (ve > vs && isOws(input[ve - 1])) { ve--; }
+    for (i32 i = vs; i < ve; i++) {
+      if (!isFieldValueByte(input[i])) { return Parsed.Bad(ERR_HEADER_VALUE()); }
+    }
+
+    req.headers.push(slice(input, at, colon), slice(input, vs, ve));
+    at = end + 2;
+  }
+
+  // ── Framing ─────────────────────────────────────────────────────────────────────────
+  i32 teCount = req.headers.countOf("Transfer-Encoding");
+  i32 clCount = req.headers.countOf("Content-Length");
+
+  if (teCount > 0 && clCount > 0) { return Parsed.Bad(ERR_FRAMING()); }
+  if (clCount > 1) { return Parsed.Bad(ERR_FRAMING()); }
+
+  if (teCount > 0) {
+    if (teCount > 1) { return Parsed.Bad(ERR_FRAMING()); }
+    u8[] te = req.headers.first("Transfer-Encoding");
+    if (!eqFold(te, "chunked".toBytes())) { return Parsed.Bad(ERR_FRAMING()); }
+    return readChunked(input, at, req, maxBody);
+  }
+
+  i32 length = 0;
+  if (clCount == 1) {
+    u8[] cl = req.headers.first("Content-Length");
+    if (cl.len() == 0) { return Parsed.Bad(ERR_FRAMING()); }
+    for (i32 i = 0; i < cl.len(); i++) {
+      // No sign, no whitespace, no hex, no `+5`: a value some parsers read as 5 and others
+      // reject is precisely the ambiguity to refuse.
+      if (!isDigit(cl[i])) { return Parsed.Bad(ERR_FRAMING()); }
+      length = length * 10 + (cl[i] - '0');
+      if (length > maxBody) { return Parsed.Bad(ERR_TOO_LARGE()); }
+    }
+  }
+
+  if (input.len() - at < length) { return Parsed.Incomplete; }
+  req.body = slice(input, at, at + length);
+  req.consumed = at + length;
+  return Parsed.Ok(req);
+}
+
+/**
+ * The chunked transfer coding, from RFC 9112 §7.1.
+ *
+ * `chunk-size [ chunk-ext ] CRLF chunk-data CRLF`, repeated, ending with a zero-size chunk and an
+ * optional trailer section. Chunk extensions are parsed and discarded; a trailer field is parsed
+ * with the same rules as a header and appended, since a caller that ignores trailers is safe and
+ * one that cannot see them is not.
+ */
+Parsed readChunked(u8[] input, i32 start, Request req, i32 maxBody) {
+  i32 at = start;
+  i32 total = 0;
+  u8[] body = u8[0]();
+  i32 bodyLen = 0;
+
+  while (true) {
+    i32 end = findCrlf(input, at);
+    if (end < 0) { return Parsed.Incomplete; }
+    if (end == at) { return Parsed.Bad(ERR_CHUNK()); }   // an empty size line
+
+    i32 size = 0;
+    i32 i = at;
+    i32 digitsSeen = 0;
+    while (i < end && hexValue(input[i]) >= 0) {
+      size = size * 16 + hexValue(input[i]);
+      digitsSeen++;
+      if (size > maxBody) { return Parsed.Bad(ERR_TOO_LARGE()); }
+      i++;
+    }
+    if (digitsSeen == 0) { return Parsed.Bad(ERR_CHUNK()); }
+    // Anything after the size must be an extension, introduced by `;`. A space is not one.
+    if (i < end && input[i] != ';') { return Parsed.Bad(ERR_CHUNK()); }
+
+    at = end + 2;
+    if (size == 0) { break; }
+
+    if (input.len() < at + size + 2) { return Parsed.Incomplete; }
+    if (input[at + size] != 13 || input[at + size + 1] != 10) { return Parsed.Bad(ERR_CHUNK()); }
+
+    total = total + size;
+    if (total > maxBody) { return Parsed.Bad(ERR_TOO_LARGE()); }
+    u8[] grown = u8[total]();
+    for (i32 k = 0; k < bodyLen; k++) { grown[k] = body[k]; }
+    for (i32 k = 0; k < size; k++) { grown[bodyLen + k] = input[at + k]; }
+    body = grown;
+    bodyLen = total;
+    at = at + size + 2;
+  }
+
+  // The trailer section, ending with an empty line.
+  while (true) {
+    i32 end = findCrlf(input, at);
+    if (end < 0) { return Parsed.Incomplete; }
+    if (end == at) { at = at + 2; break; }
+    if (isOws(input[at])) { return Parsed.Bad(ERR_OBS_FOLD()); }
+    i32 colon = -1;
+    for (i32 k = at; k < end; k++) {
+      if (input[k] == ':') { colon = k; break; }
+    }
+    if (colon < 0 || colon == at) { return Parsed.Bad(ERR_HEADER_NAME()); }
+    for (i32 k = at; k < colon; k++) {
+      if (!isToken(input[k])) { return Parsed.Bad(ERR_HEADER_NAME()); }
+    }
+    i32 vs = colon + 1;
+    while (vs < end && isOws(input[vs])) { vs++; }
+    i32 ve = end;
+    while (ve > vs && isOws(input[ve - 1])) { ve--; }
+    for (i32 k = vs; k < ve; k++) {
+      if (!isFieldValueByte(input[k])) { return Parsed.Bad(ERR_HEADER_VALUE()); }
+    }
+    req.headers.push(slice(input, at, colon), slice(input, vs, ve));
+    at = end + 2;
+  }
+
+  req.body = body;
+  req.consumed = at;
+  return Parsed.Ok(req);
+}
