@@ -332,6 +332,33 @@ const UNREACHED: { file: string; line: number; snippet: string; why: string }[] 
       "a second one.",
   },
   {
+    file: "packages/crypto/src/rsa.wac",
+    line: 54,
+    snippet: "if (!isZero(cur)) { trap; }",
+    why: "toBytes' overflow guard. Every caller passes a length taken from the modulus " +
+      "and a value already reduced below it, so the value always fits. Defensive against " +
+      "a future caller that computes the length some other way.",
+  },
+  {
+    file: "packages/crypto/src/rsa.wac",
+    line: 67,
+    snippet: "if (limb >= a.n) { return 0; }",
+    why: "bitAt reading past the top limb. modPow bounds its loop by bitLen(exp), so it " +
+      "never asks for a bit above the exponent's own length. Kept because a bit accessor " +
+      "that reads out of range on a plausible argument is a worse thing to leave than an " +
+      "unreached branch.",
+  },
+  {
+    file: "packages/crypto/src/rsa.wac",
+    line: 234,
+    snippet: "if (diff != 0) { return false; }",
+    why: "PSS's check that the unmasked DB is zeros then 0x01. Reaching it needs a " +
+      "signature whose masked DB unmasks to the wrong shape *and* whose trailer and " +
+      "unused bits are both right — an attacker constructing one, not a bit flip, which " +
+      "changes the mask and fails earlier. The check is the reason that attack does not " +
+      "work, so it stays untested rather than removed.",
+  },
+  {
     file: "packages/crypto/src/fieldp256.wac",
     line: 273,
     snippet: "if (s.len() != 32) { trap; }",
@@ -490,10 +517,78 @@ const p256 = await instrument("packages/crypto/test/wac/p256_probe.wac");
   mustTrap("p256 short key for sign", () => sign(new Uint8Array(31), msg, be(7n, N)));
 }
 
-report([run, curve, p256], "packages/crypto/", { verbose });
+const rsa = await instrument("packages/crypto/test/wac/rsa_probe.wac");
+{
+  const g = <T extends (...a: never[]) => unknown>(n: string) => rsa.mod[n] as T;
+  const modExp = g<(b: Uint8Array, e: Uint8Array, n: Uint8Array) => Uint8Array>("modExp");
+  const vPkcs1 = g<(n: Uint8Array, e: Uint8Array, m: Uint8Array, s: Uint8Array, h: number) => boolean>("verifyPkcs1");
+  const vPss = g<(n: Uint8Array, e: Uint8Array, m: Uint8Array, s: Uint8Array, h: number, sl: number) => boolean>("verifyPss");
+  const be = (v: bigint, len: number) => {
+    const o = new Uint8Array(len);
+    let x = v;
+    for (let i = len - 1; i >= 0; i--) { o[i] = Number(x & 0xFFn); x >>= 8n; }
+    return o;
+  };
+  modExp(be(3n, 32), be(5n, 32), be(7n, 32));
+  modExp(be(0n, 32), be(65537n, 32), be(3233n, 32));
+
+  // Real keys and signatures, so the accepting path runs; the rejecting paths need only
+  // the shapes. Generated here rather than fixed, because a fixed key would make this
+  // file the only place the modulus size is pinned.
+  for (const [name, hash, hashLen] of [["RSASSA-PKCS1-v1_5", "SHA-256", 32],
+                                        ["RSASSA-PKCS1-v1_5", "SHA-384", 48],
+                                        ["RSASSA-PKCS1-v1_5", "SHA-512", 64]] as const) {
+    const kp = await crypto.subtle.generateKey(
+      { name, modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash },
+      true, ["sign", "verify"]) as CryptoKeyPair;
+    const jwk = await crypto.subtle.exportKey("jwk", kp.publicKey);
+    const b64u = (x: string) => Uint8Array.from(atob(x.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+    const n = b64u(jwk.n!), e = b64u(jwk.e!);
+    const msg = bytes(24, 80);
+    const sig = new Uint8Array(await crypto.subtle.sign(name, kp.privateKey, msg as BufferSource));
+    vPkcs1(n, e, msg, sig, hashLen);
+    const bad = Uint8Array.from(sig);
+    bad[3] ^= 1;
+    vPkcs1(n, e, msg, bad, hashLen);
+    vPkcs1(n, e, msg, new Uint8Array(10), hashLen);   // wrong length
+    vPkcs1(n, e, msg, n, hashLen);                    // s = n
+    vPkcs1(new Uint8Array(256), e, msg, sig, hashLen); // modulus zero
+  }
+  {
+    const kp = await crypto.subtle.generateKey(
+      { name: "RSA-PSS", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+      true, ["sign", "verify"]) as CryptoKeyPair;
+    const jwk = await crypto.subtle.exportKey("jwk", kp.publicKey);
+    const b64u = (x: string) => Uint8Array.from(atob(x.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+    const n = b64u(jwk.n!), e = b64u(jwk.e!);
+    const msg = bytes(24, 81);
+    for (const saltLength of [0, 32]) {
+      const sig = new Uint8Array(await crypto.subtle.sign(
+        { name: "RSA-PSS", saltLength }, kp.privateKey, msg as BufferSource));
+      vPss(n, e, msg, sig, 32, saltLength);
+      const bad = Uint8Array.from(sig);
+      bad[7] ^= 1;
+      vPss(n, e, msg, bad, 32, saltLength);
+      const badTrailer = Uint8Array.from(sig);
+      badTrailer[badTrailer.length - 1] ^= 0xFF;
+      vPss(n, e, msg, badTrailer, 32, saltLength);
+    }
+    vPss(n, e, msg, new Uint8Array(10), 32, 32);
+    vPss(n, e, msg, n, 32, 32);
+    vPss(new Uint8Array(256), e, msg, new Uint8Array(256), 32, 32);
+    vPss(n, e, msg, new Uint8Array(256), 32, 250);    // salt too long for the modulus
+    // A modulus too small to hold the padding at all: 64 bytes cannot carry a SHA-512
+    // DigestInfo plus eight padding bytes, so the length check fires before any work.
+    const tiny = new Uint8Array(64);
+    tiny[0] = 0xC0;
+    vPkcs1(tiny, e, msg, new Uint8Array(64), 64);
+  }
+}
+
+report([run, curve, p256, rsa], "packages/crypto/", { verbose });
 
 const missed = new Set<string>();
-for (const r of [run, curve, p256]) {
+for (const r of [run, curve, p256, rsa]) {
   const counts = r.counts();
   const hit = new Map<string, boolean>();
   for (const p of r.points) {
@@ -504,7 +599,7 @@ for (const r of [run, curve, p256]) {
   for (const [key, ok] of hit) if (!ok) missed.add(key.split(":").slice(0, 2).join(":"));
 }
 // A point covered by one probe and missed by the other is covered; merge before judging.
-for (const r of [run, curve, p256]) {
+for (const r of [run, curve, p256, rsa]) {
   const counts = r.counts();
   for (const p of r.points) {
     if (counts[p.index] > 0) missed.delete(`${p.file}:${p.line}`);
