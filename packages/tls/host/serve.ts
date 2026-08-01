@@ -15,6 +15,7 @@ const feed = mod.srvFeed as (state: Uint8Array, input: Uint8Array) => Uint8Array
 const send = mod.srvSend as (state: Uint8Array, data: Uint8Array) => Uint8Array;
 const phase = mod.srvPhase as (state: Uint8Array) => number;
 const recordNeeded = mod.srvRecordNeeded as (buf: Uint8Array) => number;
+const close = mod.srvClose as (state: Uint8Array) => Uint8Array;
 
 const cert = await Deno.readFile(new URL("../test/data/server.der", import.meta.url));
 const seed = await Deno.readFile(new URL("../test/data/server.seed", import.meta.url));
@@ -39,7 +40,7 @@ export function newConnection(): Uint8Array {
     crypto.getRandomValues(new Uint8Array(32)));
 }
 
-export { feed, phase, recordNeeded, send };
+export { close as tlsClose, feed, phase, recordNeeded, send };
 
 if (import.meta.main) {
   const port = Number(Deno.args[0] ?? 8443);

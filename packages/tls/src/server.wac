@@ -37,16 +37,18 @@ import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
 import { ed25519Sign } from "../../crypto/src/ed25519.wac";
 import {
   deriveSecret, earlySecret, finishedVerify, handshakeSecret, hashLen, masterSecret,
-  trafficKeyIv,
+  nextTrafficSecret, trafficKeyIv,
 } from "./keyschedule.wac";
 import {
   recordSeal, recordOpen, recordType, recordContent, suiteAes128Gcm, suiteKeyLen,
   typeHandshake, typeApplicationData, typeAlert, typeChangeCipherSpec, maxPlaintext,
+  alertBody, plaintextAlert, alertCloseNotify, alertDecryptError, alertHandshakeFailure,
+  alertIllegalParameter, alertProtocolVersion, alertUnexpectedMessage,
 } from "./record.wac";
 import {
   certificate, certificateVerify, certificateVerifyContent, encryptedExtensions,
-  finished, messageBody, messageLength, messageType, parseClientHello, serverHello,
-  ClientHello,
+  finished, handshakeMessage, messageBody, messageLength, messageType, parseClientHello,
+  serverHello, ClientHello,
 } from "./handshake.wac";
 import { Reader, Writer } from "./wire.wac";
 
@@ -143,6 +145,12 @@ export u8[] tlsServerInit(u8[] certDer, u8[] seed, u8[] ephemeralPriv, u8[] serv
                          u8[0](), certDer, seed, ephemeralPriv, serverRandom));
 }
 
+/** Give up before any key exists: an alert in the clear, and the connection is done. */
+u8[] failPlain(Conn c, i32 desc) {
+  c.phase = 3;
+  return plaintextAlert(desc);
+}
+
 void addTranscript(Conn c, u8[] msg) {
   if (c.transcript.len() + msg.len() > maxTranscript()) { trap; }
   u8[] t = u8[c.transcript.len() + msg.len()]();
@@ -186,10 +194,16 @@ u8[] openWith(Conn c, u8[] record) {
  */
 u8[] serverFlight(Conn c, u8[] clientHelloMsg) {
   ClientHello ch = parseClientHello(messageBody(clientHelloMsg), c.suite);
-  if (!ch.offersTls13) { trap; }
-  if (ch.suite != c.suite) { trap; }
-  if (ch.keyShare.len() != 32) { trap; }
-  if (!ch.offersEd25519) { trap; }
+  // A peer's mistake gets an alert, not a trap. Trapping drops the connection with no
+  // explanation, which leaves the client guessing between "wrong version", "no shared
+  // cipher" and "the server is broken" — and those want different fixes.
+  if (!ch.offersTls13) { return failPlain(c, alertProtocolVersion()); }
+  if (ch.suite != c.suite) { return failPlain(c, alertHandshakeFailure()); }
+  if (!ch.offersEd25519) { return failPlain(c, alertHandshakeFailure()); }
+  // No x25519 share. The correct answer is a HelloRetryRequest asking for one, which is
+  // not implemented — so this says so plainly rather than pretending the client is at
+  // fault. See the README.
+  if (ch.keyShare.len() != 32) { return failPlain(c, alertHandshakeFailure()); }
 
   addTranscript(c, clientHelloMsg);
 
@@ -316,10 +330,18 @@ export u8[] tlsServerFeed(u8[] state, u8[] input) {
       // verify_data covers the transcript up to but not including this message.
       u8[] want = finishedVerify(c.clientSecret, sha256(c.transcript));
       u8[] got = messageBody(msg);
-      if (got.len() != want.len()) { trap; }
-      i32 diff = 0;
-      for (i32 i = 0; i < want.len(); i++) { diff = diff | (got[i] ^ want[i]); }
-      if (diff != 0) { trap; }
+      i32 diff = got.len() == want.len() ? 0 : 1;
+      if (diff == 0) {
+        for (i32 i = 0; i < want.len(); i++) { diff = diff | (got[i] ^ want[i]); }
+      }
+      if (diff != 0) {
+        // decrypt_error is what RFC 8446 §6.2 names for a Finished that does not verify.
+        // The record decrypted, so the keys agree; what failed is the proof that both
+        // sides saw the same handshake.
+        sealInto(toSend, c, typeAlert(), alertBody(alertDecryptError()));
+        c.phase = 3;
+        return result(c, toSend.take(), appData.take());
+      }
 
       addTranscript(c, msg);
       // Both directions switch to application keys, each counting from zero again.
@@ -335,9 +357,34 @@ export u8[] tlsServerFeed(u8[] state, u8[] input) {
         appData.bytes(recordContent(inner));
       } else if (t == typeAlert()) {
         c.phase = 3;
+      } else if (t == typeHandshake()) {
+        u8[] msg = recordContent(inner);
+        if (messageType(msg) == 24) {
+          // KeyUpdate, RFC 8446 §4.6.3. The peer has moved its write key on, so our read
+          // secret must follow. `request_update` of 1 means it wants ours moved too, and
+          // answering is a MUST — a peer that asked and was ignored will keep using a
+          // key we have stopped reading.
+          u8[] body = messageBody(msg);
+          if (body.len() != 1) {
+            sealInto(toSend, c, typeAlert(), alertBody(alertIllegalParameter()));
+            c.phase = 3;
+            return result(c, toSend.take(), appData.take());
+          }
+          c.clientSecret = nextTrafficSecret(c.clientSecret);
+          c.seqIn = 0;
+          if (body[0] == 1) {
+            // Reply under the *old* write key, then move ours: the peer cannot read the
+            // new one until it has seen this message.
+            u8[] body0 = u8[1]();
+            u8[] reply = handshakeMessage(24, body0);
+            sealInto(toSend, c, typeHandshake(), reply);
+            c.serverSecret = nextTrafficSecret(c.serverSecret);
+            c.seqOut = 0;
+          }
+        }
+        // Anything else post-handshake — a NewSessionTicket, say — is ignored. We never
+        // send tickets, so a client has no reason to expect us to act on one.
       }
-      // A post-handshake handshake message — a session ticket or a KeyUpdate — is
-      // ignored rather than rejected. Neither is implemented, and neither is required.
     } else {
       trap;
     }
@@ -376,4 +423,37 @@ export i32 tlsRecordNeeded(u8[] buf) {
   if (buf.len() < 5) { return 5 - buf.len(); }
   i32 want = 5 + ((buf[3] << 8) | buf[4]);
   return buf.len() >= want ? 0 : want - buf.len();
+}
+
+/**
+ * A `close_notify`, which is how a TLS connection ends on purpose.
+ *
+ * Without it a peer cannot tell an orderly shutdown from a truncated one, and a
+ * truncation is exactly what an attacker cutting the connection produces — so a client
+ * that cares reports an error, which is why `openssl s_client` complains about
+ * "unexpected eof while reading" against a server that just closes the socket.
+ */
+export u8[] tlsServerClose(u8[] state) {
+  Conn c = decodeConn(state);
+  Writer out = Writer.create();
+  if (c.phase == 2 || c.phase == 1) {
+    sealInto(out, c, typeAlert(), alertBody(alertCloseNotify()));
+  } else if (c.phase == 0) {
+    out.bytes(plaintextAlert(alertCloseNotify()));
+  }
+  c.phase = 3;
+  return result(c, out.take(), u8[0]());
+}
+
+/** Send a fatal alert of the caller's choosing and close. */
+export u8[] tlsServerAlert(u8[] state, i32 desc) {
+  Conn c = decodeConn(state);
+  Writer out = Writer.create();
+  if (c.phase == 1 || c.phase == 2) {
+    sealInto(out, c, typeAlert(), alertBody(desc));
+  } else {
+    out.bytes(plaintextAlert(desc));
+  }
+  c.phase = 3;
+  return result(c, out.take(), u8[0]());
 }

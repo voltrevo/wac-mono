@@ -185,3 +185,49 @@ export u8[] recordContent(u8[] inner) {
   for (i32 i = 0; i < end; i++) { out[i] = inner[i]; }
   return out;
 }
+
+// ── Alerts, RFC 8446 §6 ───────────────────────────────────────────────────────
+
+export i32 alertCloseNotify() { return 0; }
+export i32 alertUnexpectedMessage() { return 10; }
+export i32 alertBadRecordMac() { return 20; }
+export i32 alertHandshakeFailure() { return 40; }
+export i32 alertIllegalParameter() { return 47; }
+export i32 alertDecodeError() { return 50; }
+export i32 alertDecryptError() { return 51; }
+export i32 alertProtocolVersion() { return 70; }
+export i32 alertMissingExtension() { return 109; }
+export i32 alertNoApplicationProtocol() { return 120; }
+
+/**
+ * An alert body: a level and a description.
+ *
+ * TLS 1.3 treats every alert except `close_notify` and `user_canceled` as fatal
+ * regardless of the level byte, so the level is very nearly decorative — but it is still
+ * sent, and sending `warning` on a fatal condition would be a lie a peer might act on.
+ */
+export u8[] alertBody(i32 description) {
+  u8[] a = u8[2]();
+  a[0] = description == 0 ? 1 : 2;   // close_notify is a warning; everything else fatal
+  a[1] = description;
+  return a;
+}
+
+/**
+ * An alert as a plaintext record, for failures before any key exists.
+ *
+ * Once handshake keys are established an alert is sealed like anything else; before
+ * that there is nothing to seal it with, and a peer that cannot decrypt an alert learns
+ * only that something went wrong — which is why an unencrypted one is still worth
+ * sending.
+ */
+export u8[] plaintextAlert(i32 description) {
+  u8[] body = alertBody(description);
+  u8[] rec = u8[7]();
+  rec[0] = 21;
+  rec[1] = 3; rec[2] = 3;
+  rec[3] = 0; rec[4] = 2;
+  rec[5] = body[0];
+  rec[6] = body[1];
+  return rec;
+}

@@ -76,10 +76,12 @@ export u8[] tlsMessageBody(u8[] m) { return messageBody(m); }
 export i32 tlsMessageLength(u8[] b) { return messageLength(b); }
 
 // The server state machine.
-import { tlsServerInit, tlsServerFeed, tlsServerSend, tlsPhase, tlsRecordNeeded }
-  from "../../src/server.wac";
+import { tlsServerInit, tlsServerFeed, tlsServerSend, tlsPhase, tlsRecordNeeded,
+         tlsServerClose, tlsServerAlert } from "../../src/server.wac";
 export u8[] srvInit(u8[] cert, u8[] seed, u8[] eph, u8[] rnd) { return tlsServerInit(cert, seed, eph, rnd); }
 export u8[] srvFeed(u8[] state, u8[] input) { return tlsServerFeed(state, input); }
 export u8[] srvSend(u8[] state, u8[] data) { return tlsServerSend(state, data); }
 export i32 srvPhase(u8[] state) { return tlsPhase(state); }
 export i32 srvRecordNeeded(u8[] buf) { return tlsRecordNeeded(buf); }
+export u8[] srvClose(u8[] state) { return tlsServerClose(state); }
+export u8[] srvAlert(u8[] state, i32 d) { return tlsServerAlert(state, d); }

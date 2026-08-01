@@ -27,7 +27,13 @@ curl --noproxy '*' --cacert packages/tls/test/data/ca.pem \
 
 Three clients complete the handshake today: OpenSSL 3.0, rustls (through Deno's TLS
 client, which also verifies the certificate chain) and curl. The first two run in
-`test/handshake_interop.test.ts` on every `deno task test`.
+`test/handshake_interop.test.ts` on every `deno task test`, and one of those checks that
+the shutdown is seen as a `close_notify` rather than as a truncation.
+
+`openssl s_client -quiet` still prints "unexpected eof while reading" at the end. That is
+its own stdin handling rather than a missing alert: curl exits 0 with no stderr and
+rustls reads a clean end-of-stream, both of which would fail if the alert were absent or
+malformed.
 
 ## What works
 
@@ -39,8 +45,16 @@ ChangeCipherSpec — that middleboxes need to see.
 ## What is missing
 
 No PSK or session resumption, no 0-RTT, no HelloRetryRequest, no client certificates,
-no session tickets, no key update, no `close_notify` on shutdown, and no client side at
-all. Each is a real part of TLS 1.3; the server refuses rather than pretending.
+no session tickets, and no client side at all. Each is a real part of TLS 1.3; the
+server sends an alert rather than pretending.
+
+The HelloRetryRequest gap has a visible consequence: a client offering no X25519 key
+share gets `handshake_failure`, where a complete server would ask it to try again with
+one. Every mainstream client offers X25519, so this is rarely hit and is still wrong.
+
+Alerts, `close_notify` and KeyUpdate *are* handled. A peer's mistake produces the alert
+RFC 8446 §6 names for it rather than a dropped connection — the difference between a
+client that can report what went wrong and one that has to guess.
 
 The certificate is presented, not parsed — a server sends a DER blob it was handed. A
 client would need X.509 parsing and chain validation, which is a much larger job than
