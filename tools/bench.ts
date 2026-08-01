@@ -73,6 +73,10 @@ const mbps = (bytes: number, ms: number) => (bytes / 1e6) / (ms / 1000);
 
 const gz = await wacBind("packages/gzip/src/gzip.wac");
 const inf = await wacBind("packages/gzip/src/inflate.wac");
+const gunzipStream = inf.gunzipStream as (
+  read: () => Uint8Array,
+  write: (b: Uint8Array) => boolean,
+) => number;
 const id = await wacBind("tools/bench/identity.wac");
 
 const identity = id.identity as (d: Uint8Array) => Uint8Array;
@@ -80,6 +84,10 @@ const checksum = id.checksum as (d: Uint8Array) => number;
 const stored = gz.gzipStored as (d: Uint8Array) => Uint8Array;
 const fixed = gz.gzipFixed as (d: Uint8Array) => Uint8Array;
 const dynamic = gz.gzipDynamic as (d: Uint8Array) => Uint8Array;
+const gzipStream = gz.gzipStream as (
+  read: () => Uint8Array,
+  write: (b: Uint8Array) => boolean,
+) => number;
 const gunzipBytes = inf.gunzipBytes as (d: Uint8Array) => Uint8Array;
 
 // ── Reference: python zlib, timed inside the python process ───────────────────
@@ -124,6 +132,31 @@ console.log(`| copy in only (checksum) | ${sumMs.toFixed(1)} | ${mbps(N, sumMs).
 console.log(`\nEvery codec figure below includes a copy in, and the compressors a`);
 console.log(`copy out too, so subtract roughly this much to see the codec itself.\n`);
 
+// ── Driving the streaming entry points ────────────────────────────────────────
+//
+// One reader and one writer for the whole run: bindgen registers 16 callback identities per
+// signature and never releases one, so a closure per call would run out.
+
+let queue: Uint8Array[] = [];
+let queueAt = 0;
+let written = 0;
+
+function feed(src: Uint8Array): void {
+  queue = [];
+  for (let i = 0; i < src.length; i += 1 << 16) queue.push(src.subarray(i, i + (1 << 16)));
+  queueAt = 0;
+  written = 0;
+}
+
+function chunkRead(): Uint8Array {
+  return queueAt < queue.length ? queue[queueAt++] : new Uint8Array(0);
+}
+
+function countWrite(b: Uint8Array): boolean {
+  written += b.length;
+  return true;
+}
+
 // ── Codecs ────────────────────────────────────────────────────────────────────
 
 if (!scaling) {
@@ -141,6 +174,15 @@ if (!scaling) {
     const gzipped = dynamic(data);
     const infMs = timeBest(() => { gunzipBytes(gzipped); }, 3);
     console.log(`| inflate | ${infMs.toFixed(0)} | ${mbps(data.length, infMs).toFixed(1)} | — |`);
+
+    // The streaming pair, fed 64 KiB at a time. The gap against the whole-buffer figures
+    // above is what bounded memory costs — which is the only reason to reach for these.
+    const sInfMs = timeBest(() => { feed(gzipped); gunzipStream(chunkRead, countWrite); }, 3);
+    console.log(`| inflate, streamed | ${sInfMs.toFixed(0)} | ${mbps(data.length, sInfMs).toFixed(1)} | — |`);
+    const sDefMs = timeBest(() => { feed(data); gzipStream(chunkRead, countWrite); }, 3);
+    feed(data);
+    gzipStream(chunkRead, countWrite);
+    console.log(`| dynamic, streamed | ${sDefMs.toFixed(0)} | ${mbps(data.length, sDefMs).toFixed(1)} | ${(100 * written / data.length).toFixed(1)}% |`);
 
     const py = await pythonThroughput(data);
     console.log(`| _python zlib compress_ | ${py.comp.toFixed(0)} | ${mbps(data.length, py.comp).toFixed(1)} | — |`);

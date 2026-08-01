@@ -107,7 +107,18 @@ Tokens lz77(u8[] data, Tables t) {
  * region several times the window is what keeps that from mattering.
  */
 export Tokens lz77From(u8[] data, Tables t, i32 start) {
-  i32 n = data.len();
+  return lz77Range(data, t, start, data.len());
+}
+
+/**
+ * The same again, stopping at `end` rather than at the end of the array.
+ *
+ * So a caller with an accumulation buffer can hand over the buffer itself instead of copying
+ * the part it wants compressed. That copy is the whole region, once per block, and measured
+ * a fifth of the streaming compressor.
+ */
+export Tokens lz77Range(u8[] data, Tables t, i32 start, i32 end) {
+  i32 n = end;
   // Every token consumes at least one input byte, so one slot per fresh byte suffices.
   i32 room = n - start + 1;
   Tokens tok = Tokens(i32[room](), i32[room](), 0, i32[numLitLen()](), i32[numDist()]());

@@ -55,8 +55,8 @@ dynamic-Huffman block, and **the last 32 KiB of each chunk is carried into the n
 history**, so a match that spans a block boundary is still found — the block boundaries are
 the only thing that differ from a whole-input pass.
 
-What that costs, measured on 820 KB of repetitive text: 2553 bytes streamed against 2458
-whole-input, so **3.9%**, all of it per-block code tables. On smaller inputs that fit one
+What that costs, measured on 820 KB of repetitive text: 2505 bytes streamed against 2458
+whole-input, so **1.9%**, all of it per-block code tables. On smaller inputs that fit one
 block there is no difference at all.
 
 The block type is chosen per block rather than per member, by writing a dynamic block and
@@ -65,6 +65,28 @@ exists for — the output is never larger than a stored member — which a dynam
 would break the moment it met incompressible input. The chunk size is an exact multiple of
 the 64 KiB stored-block maximum for the same reason: a chunk that does not tile pays five
 bytes of framing for its remnant.
+
+### Throughput
+
+`deno task bench`, 1 MB inputs. Streaming is the price of bounded memory, and it is not
+free — reach for it when the data does not fit or has not all arrived, not by default:
+
+| | whole buffer | streamed |
+|---|---:|---:|
+| decompress, text | 350 MB/s | 305 MB/s |
+| decompress, incompressible | 296 MB/s | 261 MB/s |
+| compress, text | 210 MB/s | 132 MB/s |
+| compress, incompressible | 26 MB/s | 24 MB/s |
+
+Decompression streams at roughly nine tenths of the buffer speed; compression at about
+two thirds, because each block re-hashes the 32 KiB of history it carries and the match
+chains are rebuilt per block rather than once.
+
+Adding the streaming path made the whole-buffer decoder **faster**, which was not the plan:
+routing output through a window forced the match copy into one call per match instead of two
+per byte, and that is worth about 15% on text. The lesson was that the abstraction is free
+only if you check — the first version of it was 10-20% *slower*, and the causes were a copy
+in `take` that the old code avoided and a method call in the copy loop.
 
 ### Compression
 
