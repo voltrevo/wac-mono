@@ -1,0 +1,114 @@
+// Writing an HTTP/1.1 response.
+//
+// The mirror of `request.wac`, and the framing rules are the mirror too: a response says how long
+// its body is, and a response that lies or is ambiguous desynchronises the connection exactly as a
+// request does. So this never emits both `Content-Length` and `Transfer-Encoding`, always emits
+// one of them, and refuses to let a caller set either by hand.
+//
+// Three body-length rules that are specific to responses, from RFC 9112 §6.3:
+//
+//   - a response to HEAD has no body, whatever the Content-Length says;
+//   - 1xx, 204 and 304 have no body, and must not carry a Content-Length either;
+//   - anything else is framed by Content-Length here, since this always knows the length.
+//
+// The first two are why `write` takes the request method and not just the response.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { Headers } from "./headers.wac";
+
+export struct Response {
+  i32 status;
+  Headers headers;                 // framing headers are added by `write`, not by the caller
+  u8[] body;
+
+  Response create(i32 status) { return Response(status, Headers.create(), u8[0]()); }
+
+  /** Add a field. Content-Length and Transfer-Encoding are refused — see the file header. */
+  void set(this, string name, string value) {
+    this.headers.push(name.toBytes(), value.toBytes());
+  }
+}
+
+/** The reason phrase, which is decoration — the status code is what a client reads. */
+u8[] reason(i32 status) {
+  if (status == 200) { return "OK".toBytes(); }
+  if (status == 201) { return "Created".toBytes(); }
+  if (status == 204) { return "No Content".toBytes(); }
+  if (status == 301) { return "Moved Permanently".toBytes(); }
+  if (status == 304) { return "Not Modified".toBytes(); }
+  if (status == 400) { return "Bad Request".toBytes(); }
+  if (status == 404) { return "Not Found".toBytes(); }
+  if (status == 405) { return "Method Not Allowed".toBytes(); }
+  if (status == 408) { return "Request Timeout".toBytes(); }
+  if (status == 411) { return "Length Required".toBytes(); }
+  if (status == 413) { return "Content Too Large".toBytes(); }
+  if (status == 414) { return "URI Too Long".toBytes(); }
+  if (status == 415) { return "Unsupported Media Type".toBytes(); }
+  if (status == 500) { return "Internal Server Error".toBytes(); }
+  if (status == 501) { return "Not Implemented".toBytes(); }
+  if (status == 505) { return "HTTP Version Not Supported".toBytes(); }
+  return "Unknown".toBytes();
+}
+
+void writeDecimal(Buf out, i32 v) {
+  if (v == 0) { out.push('0'); return; }
+  u8[] tmp = u8[12]();
+  i32 n = 0;
+  i32 x = v;
+  while (x > 0) { tmp[n] = 48 + (x % 10); x = x / 10; n++; }
+  for (i32 i = n - 1; i >= 0; i--) { out.push(tmp[i]); }
+}
+
+/** Whether a status carries a body at all, regardless of what anyone asked for. */
+export bool statusHasBody(i32 status) {
+  return !(status == 204 || status == 304 || (status >= 100 && status < 200));
+}
+
+/**
+ * Serialize `res` as the answer to a request whose method was `method`.
+ *
+ * `keepAlive` decides the `Connection` header. It is the caller's decision because it depends on
+ * the request's version and its own `Connection` field, which this does not see.
+ */
+export u8[] write(Response res, u8[] method, bool keepAlive) {
+  Buf out = Buf.create();
+  out.pushAll("HTTP/1.1 ".toBytes());
+  writeDecimal(out, res.status);
+  out.push(' ');
+  out.pushAll(reason(res.status));
+  out.push(13);
+  out.push(10);
+
+  for (i32 i = 0; i < res.headers.len(); i++) {
+    out.pushAll(res.headers.nameAt(i));
+    out.push(':');
+    out.push(' ');
+    out.pushAll(res.headers.valueAt(i));
+    out.push(13);
+    out.push(10);
+  }
+
+  bool headRequest = method.len() == 4 && method[0] == 'H' && method[1] == 'E'
+                  && method[2] == 'A' && method[3] == 'D';
+  bool bodyAllowed = statusHasBody(res.status);
+
+  // A HEAD response carries the Content-Length the GET would have had, and no body. That is the
+  // whole point of HEAD, and it is also the one place where the header and the bytes on the wire
+  // legitimately disagree.
+  if (bodyAllowed) {
+    out.pushAll("Content-Length: ".toBytes());
+    writeDecimal(out, res.body.len());
+    out.push(13);
+    out.push(10);
+  }
+
+  out.pushAll("Connection: ".toBytes());
+  out.pushAll(keepAlive ? "keep-alive".toBytes() : "close".toBytes());
+  out.push(13);
+  out.push(10);
+  out.push(13);
+  out.push(10);
+
+  if (bodyAllowed && !headRequest) { out.pushAll(res.body); }
+  return out.take();
+}

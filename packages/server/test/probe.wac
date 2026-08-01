@@ -1,0 +1,39 @@
+// Host-facing entry point.
+//
+// The whole server is one call: bytes in, bytes out, plus how much of the input was used and
+// whether to keep the connection. Everything the host does is sockets.
+
+import { Served, serve } from "../src/serve.wac";
+
+/**
+ * `ready\0consumed\0keepAlive\0<response bytes>`, or `wait` when more input is needed.
+ *
+ * The response is last and unescaped, since it is binary and the fields before it are fixed.
+ */
+export u8[] handle(u8[] input, i64 nowMillis) {
+  Served s = serve(input, nowMillis);
+  if (!s.ready) { return "wait".toBytes(); }
+  u8[] head = "ready".toBytes();
+  u8[] digits = u8[24]();
+  i32 n = 0;
+  i32 c = s.consumed;
+  if (c == 0) { digits[n] = '0'; n++; }
+  i32 lo = n;
+  while (c > 0) { digits[n] = 48 + (c % 10); c = c / 10; n++; }
+  // Reverse the digits written above.
+  for (i32 i = 0; i < (n - lo) / 2; i++) {
+    i32 t = digits[lo + i];
+    digits[lo + i] = digits[n - 1 - i];
+    digits[n - 1 - i] = t;
+  }
+  u8[] out = u8[head.len() + 1 + n + 1 + 1 + 1 + s.response.len()]();
+  i32 at = 0;
+  for (i32 i = 0; i < head.len(); i++) { out[at] = head[i]; at++; }
+  out[at] = 0; at++;
+  for (i32 i = 0; i < n; i++) { out[at] = digits[i]; at++; }
+  out[at] = 0; at++;
+  out[at] = s.keepAlive ? '1' : '0'; at++;
+  out[at] = 0; at++;
+  for (i32 i = 0; i < s.response.len(); i++) { out[at] = s.response[i]; at++; }
+  return out;
+}
