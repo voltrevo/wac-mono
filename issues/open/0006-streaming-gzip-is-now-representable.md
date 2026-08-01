@@ -74,6 +74,63 @@ That fixes unbounded output memory for a whole input that is already in hand, wh
 problem and none of the difficulty. It does not help with input arriving in pieces. Worth doing
 first if the motivation is memory rather than latency.
 
+## What the no-compromises version looks like
+
+Taking "no compromises" as: bounded memory (O(window), not O(input) or O(output)); suspend and
+resume at *any* byte boundary; back-pressure in both directions; errors as values rather than
+`trap`; an exact consumed-count so a caller can find a member's end inside a longer stream;
+multi-member streams; and no copy per chunk.
+
+Two designs reach different subsets, and both were checked against the current compiler rather
+than reasoned about.
+
+**A — wac pulls and pushes.** One call, two callbacks:
+
+```wac
+export i32 inflateStream(fn[u8[]()] read, fn[bool(u8[])] write)
+```
+
+Verified working: wac calls `read()` for the next chunk and `write()` for output, and a `bool`
+return gives the sink back-pressure. **The decoder stays an ordinary nested loop — no state
+machine at all**, because it never has to suspend. This meets everything on the list except one
+thing, and that one thing is fatal for some callers: a wasm call cannot yield, so `read()` has to
+supply input *synchronously*. Fine for a file, wrong for a socket.
+
+**B — the host pushes into a held object.**
+
+```wac
+export struct Inflater { … Inflater create(); void push(this, u8[] chunk); }
+```
+
+Also verified: a struct crosses as a class, `create()` binds as a static, and state persists across
+calls with identity intact — two wrappers over one reference are one object. This works with async
+I/O because the host drives the loop. It meets the whole list. The cost is entirely in **2**:
+resuming mid-symbol forces block loop, symbol loop, extra-bits and copy loop each into saved
+fields.
+
+So the no-compromises version is **B, and it is possible in current wac with nothing missing**.
+What is missing is ergonomics, not expressiveness.
+
+### What would actually change that
+
+**Coroutines, or stack switching.** With them, B is *written* as A: the natural loop, suspended by
+the runtime rather than by hand. wasm has a stack-switching proposal; wac exposing it would turn a
+decoder rewrite into an annotation. That is the honest "wants more language work" answer — not
+required, but the difference between a rewrite and a keyword. Worth weighing before anyone starts,
+because a hand-written state machine is the kind of code that has to be rewritten again if the
+feature lands.
+
+**Zero copy is the one thing genuinely not expressible**, and it is not a wac oversight. Arrays
+cross the boundary *by copy* — the spec says so — so every input chunk is copied in and every
+output chunk out. wac cannot be handed a view of a host buffer, and cannot fill one, because a
+write through a `u8[]` parameter is not visible to the caller. Fixing it needs either linear memory,
+which wac deliberately does not have, or a borrowed view into a GC array, which wasm GC does not
+offer. At gzip's throughput that copy is real but small, and it is the only item on the list that
+no amount of work here removes.
+
+**Errors as values needs nothing.** Enums are already there, and `inflate` trapping on a CRC
+mismatch is a compromise the language is not forcing.
+
 ## Who wants it
 
 `packages/server` has `gzip` unwired, with `Accept-Encoding` and a compressed body listed as the
