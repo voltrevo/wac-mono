@@ -8,7 +8,7 @@
 
 import { Buf } from "../../bytes/src/buf.wac";
 import { crc32, crc32Start, crc32Finish, crc32Update, crcTable8 } from "./crc32.wac";
-import { deflateFixed, deflateDynamic, lz77From, writeDynamicBlock, Tokens } from "./deflate.wac";
+import { deflateFixed, deflateDynamic, lz77Range, writeDynamicBlock, Tokens } from "./deflate.wac";
 import { BitWriter } from "./bitwriter.wac";
 import { Tables } from "./tables.wac";
 
@@ -154,8 +154,21 @@ export u8[] gzipBest(u8[] data) {
  * comes out stored tiles into whole 64 KiB pieces with nothing left over. At 1 << 17 the
  * remaining two bytes need a third piece, and five bytes of framing with them — which is
  * how a stream ends up larger than the whole-input compressor on input that stores.
+ *
+ * Four pieces because both throughput and ratio improve with it and memory is what pays.
+ * Measured on 1 MB of text, against 205 MB/s and 2458 bytes for the whole-input compressor:
+ *
+ * | chunk | MB/s | bytes | working set |
+ * |---|---:|---:|---:|
+ * | 1x | 94 | — | ~0.9 MB |
+ * | 2x | 127 | 2553 | ~1.7 MB |
+ * | **4x** | **134** | **2505** | **~3.4 MB** |
+ * | 8x | 143 | 2473 | ~6.8 MB |
+ *
+ * The working set is about thirteen bytes per buffered byte, most of it the match chains and
+ * the token arrays. Past 4x the returns flatten while the memory does not.
  */
-i32 chunkBytes() { return 2 * maxStored(); }
+i32 chunkBytes() { return 4 * maxStored(); }
 
 /** History carried into the next block, which is as far as a back-reference can reach. */
 i32 historyBytes() { return 32768; }
@@ -211,11 +224,14 @@ export i32 gzipStream(fn[u8[]()] read, fn[bool(u8[])] write) {
     if (take > chunkBytes()) { take = chunkBytes(); }
     bool last = done && take == fresh;
 
+    // The buffer's own array, not a copy of it: `lz77Range` stops at `end`, so the bytes
+    // past it — fresh input that has not been compressed yet, and whatever slack the buffer
+    // is carrying — are simply not looked at.
     i32 end = history + take;
-    u8[] region = prefix(buf, end);
-    Tokens tok = lz77From(region, t, history);
+    u8[] region = buf.data;
+    Tokens tok = lz77Range(region, t, history, end);
 
-    // Which block type, decided by writing one and measuring it.
+    // Which block type, decided by writing the dynamic one and measuring it.
     //
     // Expansion is the one outcome a compressor should never produce, and a dynamic block
     // over incompressible input is bigger than the input — the code table is pure overhead
@@ -223,18 +239,22 @@ export i32 gzipStream(fn[u8[]()] read, fn[bool(u8[])] write) {
     // every block type over the whole input; a stream cannot look ahead, so it decides per
     // block instead, which is the same guarantee at a finer grain.
     //
-    // Measured rather than estimated: writing the block is the only thing that knows what
-    // it costs, and doing it twice costs less than the match search that produced the
-    // tokens. The probe starts byte-aligned and the real writer may not, so the comparison
-    // can be off by one byte — which only ever picks the wrong side of a tie.
-    BitWriter probe = BitWriter.create();
+    // Written into a scratch writer that *starts where the real one is*, which is what makes
+    // this cost one encode rather than two. Bits are not bytes: a block written from a byte
+    // boundary cannot be appended to a stream sitting three bits into a byte. Carrying the
+    // pending bits into the scratch writer means its output is exactly what belongs at the
+    // end of the real one, so a winning block is spliced across rather than re-encoded.
+    // Doing it the obvious way — encode to measure, encode again to keep — measured 2.2x
+    // slower than the whole-input compressor on text.
+    BitWriter probe = BitWriter(Buf.create(), w.bitBuf, w.bitCount);
     writeDynamicBlock(probe, tok, t, last);
-    probe.alignByte();
 
     if (storedCost(take) < probe.out.len) {
       storedBits(w, region, history, take, last);
     } else {
-      writeDynamicBlock(w, tok, t, last);
+      w.out.pushBytes(probe.out.data, 0, probe.out.len);
+      w.bitBuf = probe.bitBuf;
+      w.bitCount = probe.bitCount;
     }
     wroteFinal = last;
 
@@ -260,15 +280,6 @@ export i32 gzipStream(fn[u8[]()] read, fn[bool(u8[])] write) {
 i32 imin32(i32 a, i32 b) {
   if (a < b) { return a; }
   return b;
-}
-
-/** The first `n` bytes of `b`, copied out. */
-u8[] prefix(Buf b, i32 n) {
-  u8[] out = u8[n]();
-  for (i32 i = 0; i < n; i++) {
-    out[i] = b.get(i);
-  }
-  return out;
 }
 
 /** Bytes a stored block costs for `n` bytes of payload: five per piece, and never no piece. */
