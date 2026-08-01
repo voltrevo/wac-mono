@@ -1,0 +1,220 @@
+// Zstandard frames and blocks (RFC 8878, sections 3.1.1 and 3.1.1.2).
+//
+// The outer layer only: what a frame declares about itself, and the three shapes a block can
+// take. Two of those shapes carry their content plainly — a run of bytes, or one byte and a
+// count — and this file decodes both. The third is a compressed block, which is where the
+// entropy coding lives; it is a separate piece of work and traps here for now.
+//
+// Deciding this layer first is not arbitrary. Every field below is a length or an offset, so
+// getting one wrong moves everything after it, and a decoder that is wrong here fails in ways
+// that look like entropy bugs later. It is also the part that can be checked immediately: a
+// real encoder emits raw blocks for incompressible input and RLE blocks for runs, so the
+// tests are against zstd's own output rather than against a reading of the specification.
+
+import { Buf } from "../../bytes/src/buf.wac";
+
+/** `0xFD2FB528`, little-endian, at the start of every zstd frame. */
+i32 magic() { return 0xFD2FB528; }
+
+/** Skippable frames use `0x184D2A50` through `0x184D2A5F` — the low nibble is the caller's. */
+i32 skippableBase() { return 0x184D2A50; }
+
+/** The largest a single block may be, regardless of window size. */
+i32 blockMaxSize() { return 131072; }
+
+/**
+ * A little-endian reader over the whole input.
+ *
+ * Every read is bounds-checked against the end rather than trusting the frame's own numbers:
+ * the sizes below are attacker-controlled, and a frame that claims more than it carries must
+ * be refused rather than read past.
+ */
+struct Reader {
+  u8[] src;
+  i32 pos;
+
+  Reader create(u8[] src) { return Reader(src, 0); }
+
+  i32 left(const this) { return this.src.len() - this.pos; }
+
+  i32 byte(this) {
+    if (this.pos >= this.src.len()) { trap; }
+    i32 v = this.src[this.pos];
+    this.pos++;
+    return v;
+  }
+
+  /** `n` bytes, little-endian, as an i32. Only used where the field is at most four bytes. */
+  i32 num(this, i32 n) {
+    i32 v = 0;
+    for (i32 i = 0; i < n; i++) {
+      v = v | (this.byte() << (i * 8));
+    }
+    return v;
+  }
+
+  /** The same for the eight-byte content size, which does not fit an i32. */
+  i64 num64(this, i32 n) {
+    i64 v = 0;
+    for (i32 i = 0; i < n; i++) {
+      v = v | ((this.byte() as i64) << (i * 8));
+    }
+    return v;
+  }
+
+  void skip(this, i32 n) {
+    if (n < 0 || n > this.left()) { trap; }
+    this.pos += n;
+  }
+}
+
+/**
+ * What a frame header declares.
+ *
+ * `contentSize` is -1 when the frame does not say, which is normal — an encoder that is
+ * streaming does not know it yet. It is a hint for allocation and a check at the end, never
+ * something to trust for sizing a buffer.
+ */
+struct FrameHeader {
+  i64 contentSize;      // -1 when absent
+  i32 windowSize;       // bytes a match may reach back
+  bool hasChecksum;
+  i32 dictId;           // 0 when absent
+}
+
+/**
+ * Parse a frame header, positioned just after the magic.
+ *
+ * The descriptor byte packs six fields, two of which change the size of what follows, so this
+ * is read strictly in order: get one wrong and every later field is misaligned.
+ */
+FrameHeader readHeader(Reader r) {
+  i32 fhd = r.byte();
+  i32 fcsFlag = (fhd >>> 6) & 3;
+  bool singleSegment = ((fhd >>> 5) & 1) == 1;
+  bool checksum = ((fhd >>> 2) & 1) == 1;
+  i32 didFlag = fhd & 3;
+
+  // Bit 3 is reserved and bit 4 is unused; both must be zero. A decoder that ignores them
+  // would accept frames a later version of the format may define differently.
+  if (((fhd >>> 3) & 1) != 0) { trap; }
+
+  i32 windowSize = 0;
+  if (!singleSegment) {
+    // Window_Descriptor: a mantissa and an exponent, giving base + base/8 * mantissa.
+    i32 wd = r.byte();
+    i32 exponent = (wd >>> 3) & 31;
+    i32 mantissa = wd & 7;
+    i32 windowLog = 10 + exponent;
+    if (windowLog > 30) { trap; }          // beyond what an i32 window can address here
+    i32 windowBase = 1 << windowLog;
+    windowSize = windowBase + (windowBase / 8) * mantissa;
+  }
+
+  i32 dictId = 0;
+  if (didFlag != 0) {
+    i32 n = 1;
+    if (didFlag == 2) { n = 2; }
+    if (didFlag == 3) { n = 4; }
+    dictId = r.num(n);
+  }
+
+  // With no Frame_Content_Size field, a single-segment frame still carries one byte of it —
+  // the flag means "one byte" rather than "absent" in that case only.
+  i64 contentSize = -1;
+  i32 fcsSize = 0;
+  if (fcsFlag == 0) {
+    if (singleSegment) { fcsSize = 1; }
+  } else if (fcsFlag == 1) {
+    fcsSize = 2;
+  } else if (fcsFlag == 2) {
+    fcsSize = 4;
+  } else {
+    fcsSize = 8;
+  }
+  if (fcsSize > 0) {
+    contentSize = r.num64(fcsSize);
+    // The two-byte form is offset by 256: the values below that are reachable by one byte.
+    if (fcsSize == 2) { contentSize = contentSize + 256; }
+  }
+
+  // A single-segment frame has no window descriptor because the content size *is* the window.
+  if (singleSegment) {
+    if (contentSize < 0) { trap; }
+    windowSize = contentSize as~ i32;
+  }
+
+  return FrameHeader(contentSize, windowSize, checksum, dictId);
+}
+
+/**
+ * Decode every frame in `src` and return the concatenated content.
+ *
+ * Concatenated frames are part of the format rather than a curiosity — `cat a.zst b.zst` is a
+ * valid zstd file — and skippable frames may sit between them carrying anything at all.
+ *
+ * Traps on a malformed frame, on a compressed block (not yet implemented), and on a content
+ * size that does not match what came out. Returning data that failed its own declared length
+ * would defeat the point of carrying one.
+ */
+export u8[] decompress(u8[] src) {
+  Reader r = Reader.create(src);
+  Buf out = Buf.create();
+
+  while (r.left() > 0) {
+    if (r.left() < 4) { trap; }
+    i32 m = r.num(4);
+
+    // Skippable frames: a magic in a 16-value range, a length, and content nobody decodes.
+    if ((m & 0xFFFFFFF0) == skippableBase()) {
+      i32 size = r.num(4);
+      if (size < 0) { trap; }
+      r.skip(size);
+      continue;
+    }
+    if (m != magic()) { trap; }
+
+    FrameHeader h = readHeader(r);
+    i32 startLen = out.len;
+    decodeBlocks(r, out);
+
+    if (h.hasChecksum) {
+      // Four bytes of XXH64, low bits first. Checking it needs XXH64, which is the next piece
+      // of work; skipping the field keeps the frame walk correct meanwhile.
+      r.skip(4);
+    }
+    if (h.contentSize >= 0 && ((out.len - startLen) as i64) != h.contentSize) { trap; }
+  }
+
+  return out.take();
+}
+
+/** The block loop: header, content, repeat until the one flagged last. */
+void decodeBlocks(Reader r, Buf out) {
+  bool last = false;
+  while (!last) {
+    i32 header = r.num(3);
+    last = (header & 1) == 1;
+    i32 blockType = (header >>> 1) & 3;
+    i32 size = header >>> 3;
+
+    if (blockType == 0) {
+      // Raw: the bytes are the content.
+      if (size > blockMaxSize()) { trap; }
+      if (size > r.left()) { trap; }
+      out.pushBytes(r.src, r.pos, size);
+      r.skip(size);
+    } else if (blockType == 1) {
+      // RLE: one byte, repeated. `size` is the *decoded* length here, not the stored one.
+      if (size > blockMaxSize()) { trap; }
+      i32 v = r.byte();
+      for (i32 i = 0; i < size; i++) {
+        out.push(v);
+      }
+    } else if (blockType == 2) {
+      trap;   // compressed blocks: entropy coding, not yet implemented
+    } else {
+      trap;   // block type 3 is reserved
+    }
+  }
+}

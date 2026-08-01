@@ -246,7 +246,18 @@ for (const n of [0, 1, 2, 255, 256, 4096]) {
 const UNREACHABLE: { file: string; line: number; snippet: string; why: string }[] = [
   {
     file: "packages/gzip/src/inflate.wac",
-    line: 449,
+    line: 129,
+    snippet: "while (left > 0 && this.bitCount >= 8) {",
+    why: "copyBytes is only ever called straight after alignByte and two readBits(16). " +
+      "alignByte leaves a multiple of 8 bits, fill only ever adds whole bytes, and skip " +
+      "removes exactly 16 — so the bit buffer is empty by the time this runs, and this " +
+      "loop drains nothing. Kept because it is what makes copyBytes correct on its own " +
+      "terms rather than by the habits of its one caller: a second caller that aligned " +
+      "differently would otherwise read the payload from the wrong offset, silently.",
+  },
+  {
+    file: "packages/gzip/src/inflate.wac",
+    line: 574,
     snippet: "if (di >= 30) { trap; }",
     why: "Both distance decoders are built with at most 30 symbols — the fixed one with " +
       "exactly 30, the dynamic one with hdist, already bounded at 30 — so decode cannot " +
@@ -329,6 +340,32 @@ for (const chunk of [512, 1 << 20]) stream(gzipBest(repetitive), chunk);
 const noisy = new Uint8Array(200000);
 for (let i = 0; i < noisy.length; i++) noisy[i] = (i * 2654435761) & 0xFF;
 for (const chunk of [999, 1 << 20]) stream(gzipStored(noisy), chunk);
+// The same length again but Huffman-coded, so it arrives as literals rather than as a bulk
+// copy. That is the only way the window's per-byte flush check is the one that fires: a
+// match crossing the limit is handled before the copy starts, not during it.
+//
+// Genuinely random rather than a multiplicative pattern — `(i * k) & 0xFF` repeats every
+// 256 bytes, so it codes as matches and crosses the limit inside one, which is the other
+// branch entirely.
+const noise = new Uint8Array(200000);
+let ns = 0x1a2b3c4d | 0;
+for (let i = 0; i < noise.length; i++) {
+  ns ^= ns << 13; ns >>>= 0;
+  ns ^= ns >>> 17;
+  ns ^= ns << 5; ns >>>= 0;
+  noise[i] = ns & 0xFF;
+}
+for (const chunk of [999, 1 << 20]) stream(gzipDynamic(noise), chunk);
+
+// Small members, so the output window is allocated below its floor and handed over in one
+// piece, and truncations of a *stored* stream, which fails inside the bulk byte copy rather
+// than inside a Huffman decode.
+for (const body of [new Uint8Array(0), enc.encode("x"), enc.encode("a short one")]) {
+  for (const chunk of [1, 1 << 20]) stream(gzipStored(body), chunk);
+  ignoringTraps(() => gunzipBytes(gzipStored(body)));
+}
+const storedStream = gzipStored(enc.encode("stored and cut short ".repeat(4000)));
+for (let i = 8; i < storedStream.length; i += 37) stream(storedStream.slice(0, i), 1 << 20);
 
 // A sink that refuses. The bytes are dropped either way — the window has to stay bounded
 // whatever the consumer does — so this is about the refusal path, not the output.
