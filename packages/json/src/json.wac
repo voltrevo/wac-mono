@@ -1,9 +1,11 @@
-// Public entry points, shaped for the bindgen boundary.
+// Public entry points that return bytes.
 //
-// Only primitives and primitive arrays cross into JS, so a JsonValue tree
-// cannot be handed out directly. Results come back as bytes with a status byte
-// in front, because there are no module-level globals to stash an error code in
-// and an export returns exactly one value.
+// Results come back as bytes with a status byte in front, because an export returns
+// exactly one value and there are no module-level globals to stash an error code in.
+// This was once the only shape available — a JsonValue had no representation on the
+// other side of the boundary. `tree.wac` hands the tree out directly now; this stays
+// as the cheaper call when re-serialization is all that is wanted, and as what the
+// differential tests compare against the host's own JSON.
 
 import { JsonValue } from "./value.wac";
 import { Parser, parseDocument, ERR_NONE } from "./parse.wac";

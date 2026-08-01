@@ -1,0 +1,55 @@
+// The parsed tree, handed to the host as a tree.
+//
+// `json.wac` returns bytes with a status byte in front, because when it was written only
+// primitives and primitive arrays crossed the bindgen boundary — a `JsonValue` had no
+// representation on the other side, so a host test could observe the tree only through its
+// re-serialization, and a bug that cancelled itself out between parse and stringify would
+// pass unnoticed.
+//
+// Structs and enums cross as classes now, so the tree itself can be the result. A caller
+// walks it with `tag`, the payload getters, and the container methods:
+//
+// ```ts
+// const v = parse('{"a":[1,2]}');
+// v.tag;                      // "Object"
+// v.Object_members.at(0).keyStr();
+// ```
+//
+// Both entry points stay: the bytes form is what the differential tests compare against the
+// host's own JSON, and it stays the cheaper call when re-serialization is all that is wanted.
+
+import { JsonValue, JsonArray, JsonObject, JsonMember } from "./value.wac";
+import { Parser, parseDocument } from "./parse.wac";
+
+/** Parse a document. Null means the source was not valid JSON. */
+export JsonValue? parse(string src) {
+  Parser p = Parser.create(src.toBytes());
+  return parseDocument(p);
+}
+
+/** Parse bytes, for a caller that already has them and would rather not re-encode. */
+export JsonValue? parseBytes(u8[] src) {
+  Parser p = Parser.create(src);
+  return parseDocument(p);
+}
+
+/**
+ * The error code for a failed parse, and the byte offset it gave up at.
+ *
+ * Separate calls because an export returns one value and there are no module-level globals
+ * to leave the other in — the same reason `json.wac` puts a status byte in front of its
+ * bytes. Only meaningful when `parse` returned null.
+ */
+export i32 errorCodeOf(string src) {
+  Parser p = Parser.create(src.toBytes());
+  JsonValue? v = parseDocument(p);
+  if (v is null) { return p.err; }
+  return 0;
+}
+
+export i32 errorPosOf(string src) {
+  Parser p = Parser.create(src.toBytes());
+  JsonValue? v = parseDocument(p);
+  if (v is null) { return p.errPos; }
+  return -1;
+}
