@@ -32,3 +32,54 @@ export i32 tlsRecordLength(u8[] buf) { return recordLength(buf); }
 export i32 tlsSuiteAes() { return suiteAes128Gcm(); }
 export i32 tlsSuiteChaCha() { return suiteChaCha20(); }
 export i32 tlsSuiteKeyLen(i32 s) { return suiteKeyLen(s); }
+
+// Handshake messages.
+import { parseClientHello, ClientHello, serverHello, encryptedExtensions, certificate,
+         certificateVerify, certificateVerifyContent, finished, handshakeMessage,
+         messageType, messageBody, messageLength } from "../../src/handshake.wac";
+
+/**
+ * Parse a ClientHello and flatten the result, since bindgen cannot marshal a struct.
+ * Layout: suite(2) flags(1) sessionIdLen(1) sessionId keyShareLen(1) keyShare
+ *         nameLen(2) name random(32)
+ */
+export u8[] tlsParseClientHello(u8[] body, i32 preferred) {
+  ClientHello ch = parseClientHello(body, preferred);
+  i32 n = 2 + 1 + 1 + ch.sessionId.len() + 1 + ch.keyShare.len() + 2 + ch.serverName.len() + 32;
+  u8[] out = u8[n]();
+  i32 p = 0;
+  out[p] = (ch.suite >> 8) & 0xFF; p++;
+  out[p] = ch.suite & 0xFF; p++;
+  out[p] = (ch.offersTls13 ? 1 : 0) | (ch.offersEd25519 ? 2 : 0); p++;
+  out[p] = ch.sessionId.len(); p++;
+  for (i32 i = 0; i < ch.sessionId.len(); i++) { out[p + i] = ch.sessionId[i]; }
+  p += ch.sessionId.len();
+  out[p] = ch.keyShare.len(); p++;
+  for (i32 i = 0; i < ch.keyShare.len(); i++) { out[p + i] = ch.keyShare[i]; }
+  p += ch.keyShare.len();
+  out[p] = (ch.serverName.len() >> 8) & 0xFF; p++;
+  out[p] = ch.serverName.len() & 0xFF; p++;
+  for (i32 i = 0; i < ch.serverName.len(); i++) { out[p + i] = ch.serverName[i]; }
+  p += ch.serverName.len();
+  for (i32 i = 0; i < 32; i++) { out[p + i] = ch.random[i]; }
+  return out;
+}
+export u8[] tlsServerHello(u8[] r, u8[] sid, i32 suite, u8[] ks) { return serverHello(r, sid, suite, ks); }
+export u8[] tlsEncryptedExtensions() { return encryptedExtensions(); }
+export u8[] tlsCertificate(u8[] der) { return certificate(der); }
+export u8[] tlsCertificateVerify(u8[] sig) { return certificateVerify(sig); }
+export u8[] tlsCertVerifyContent(u8[] th, bool server) { return certificateVerifyContent(th, server); }
+export u8[] tlsFinished(u8[] vd) { return finished(vd); }
+export u8[] tlsHandshakeMessage(i32 t, u8[] b) { return handshakeMessage(t, b); }
+export i32 tlsMessageType(u8[] m) { return messageType(m); }
+export u8[] tlsMessageBody(u8[] m) { return messageBody(m); }
+export i32 tlsMessageLength(u8[] b) { return messageLength(b); }
+
+// The server state machine.
+import { tlsServerInit, tlsServerFeed, tlsServerSend, tlsPhase, tlsRecordNeeded }
+  from "../../src/server.wac";
+export u8[] srvInit(u8[] cert, u8[] seed, u8[] eph, u8[] rnd) { return tlsServerInit(cert, seed, eph, rnd); }
+export u8[] srvFeed(u8[] state, u8[] input) { return tlsServerFeed(state, input); }
+export u8[] srvSend(u8[] state, u8[] data) { return tlsServerSend(state, data); }
+export i32 srvPhase(u8[] state) { return tlsPhase(state); }
+export i32 srvRecordNeeded(u8[] buf) { return tlsRecordNeeded(buf); }

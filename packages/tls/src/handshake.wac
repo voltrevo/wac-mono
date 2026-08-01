@@ -1,0 +1,253 @@
+// TLS 1.3 handshake messages, RFC 8446 §4.
+//
+// Enough of them for a server: parse a ClientHello, emit everything from ServerHello to
+// Finished, and check the client's Finished. A client would additionally need to verify
+// certificates, which is a much larger job than producing one.
+//
+// ## The legacy fields are not optional
+//
+// A TLS 1.3 ClientHello still says version 1.2 in `legacy_version`, still carries a
+// session id it will never resume, and a ServerHello still echoes that session id back.
+// None of it means anything; all of it is required, because middleboxes that only
+// understand TLS 1.2 drop anything that looks different. The real version lives in the
+// `supported_versions` extension, and a server that reads `legacy_version` instead will
+// interoperate with nothing.
+//
+// ## What is deliberately missing
+//
+// No PSK, no early data, no HelloRetryRequest, no client certificates, no session
+// tickets. Each is a real part of TLS 1.3 and none is needed to complete a handshake, so
+// each is a place where this says "not supported" rather than pretending.
+
+import { Reader, Writer } from "./wire.wac";
+
+// Handshake message types, RFC 8446 §4.
+export i32 hsClientHello() { return 1; }
+export i32 hsServerHello() { return 2; }
+export i32 hsEncryptedExtensions() { return 8; }
+export i32 hsCertificate() { return 11; }
+export i32 hsCertificateVerify() { return 15; }
+export i32 hsFinished() { return 20; }
+
+// Extension types.
+export i32 extServerName() { return 0; }
+export i32 extSupportedGroups() { return 10; }
+export i32 extSignatureAlgorithms() { return 13; }
+export i32 extSupportedVersions() { return 43; }
+export i32 extKeyShare() { return 51; }
+
+/** The x25519 named group. */
+export i32 groupX25519() { return 0x001d; }
+/** ed25519 in the signature-algorithms registry. */
+export i32 sigEd25519() { return 0x0807; }
+
+/** What a server needs out of a ClientHello. */
+export struct ClientHello {
+  u8[] random;
+  u8[] sessionId;
+  /** The client's x25519 key share, or empty if it did not offer one. */
+  u8[] keyShare;
+  /** The negotiated suite, or 0 if none of ours was offered. */
+  i32 suite;
+  bool offersTls13;
+  bool offersEd25519;
+  /** The server_name extension's host name, or empty. */
+  u8[] serverName;
+}
+
+/**
+ * Parse a ClientHello body — the message contents, without the four-byte handshake
+ * header.
+ *
+ * Everything is bounds-checked by `Reader`, so a truncated or over-long field traps
+ * rather than being read past. Unknown extensions are skipped rather than rejected:
+ * TLS's extension space is meant to be extended, and a server that fails on anything it
+ * does not recognise breaks every future client.
+ */
+export ClientHello parseClientHello(u8[] body, i32 preferredSuite) {
+  Reader r = Reader.create(body);
+  r.u16();                        // legacy_version, ignored: the real one is an extension
+  u8[] random = r.take(32);
+  u8[] sessionId = r.vec8();
+
+  Reader suites = r.sub16();
+  i32 chosen = 0;
+  while (!suites.empty()) {
+    i32 s = suites.u16();
+    if (s == preferredSuite) { chosen = s; }
+  }
+
+  r.vec8();                       // legacy_compression_methods, must be [0] and unused
+
+  u8[] keyShare = u8[0]();
+  bool tls13 = false;
+  bool ed = false;
+  u8[] serverName = u8[0]();
+
+  if (!r.empty()) {
+    Reader exts = r.sub16();
+    while (!exts.empty()) {
+      i32 kind = exts.u16();
+      Reader body2 = exts.sub16();
+      if (kind == 43) {
+        // supported_versions: a list of two-byte versions behind a one-byte length.
+        Reader vs = body2.sub8();
+        while (!vs.empty()) {
+          if (vs.u16() == 0x0304) { tls13 = true; }
+        }
+      } else if (kind == 51) {
+        // key_share: a list of (group, key) pairs. Take the x25519 one if present.
+        Reader shares = body2.sub16();
+        while (!shares.empty()) {
+          i32 group = shares.u16();
+          u8[] key = shares.vec16();
+          if (group == 0x001d && key.len() == 32) { keyShare = key; }
+        }
+      } else if (kind == 13) {
+        Reader algs = body2.sub16();
+        while (!algs.empty()) {
+          if (algs.u16() == 0x0807) { ed = true; }
+        }
+      } else if (kind == 0) {
+        // server_name: a list of names, each a type byte and a length-prefixed string.
+        Reader names = body2.sub16();
+        while (!names.empty()) {
+          i32 nameType = names.u8();
+          u8[] host = names.vec16();
+          if (nameType == 0) { serverName = host; }
+        }
+      }
+      // Anything else is skipped: body2 simply goes unread.
+    }
+  }
+
+  return ClientHello(random, sessionId, keyShare, chosen, tls13, ed, serverName);
+}
+
+/** Wrap a message body in its four-byte handshake header. */
+export u8[] handshakeMessage(i32 msgType, u8[] body) {
+  Writer w = Writer.create();
+  w.u8(msgType);
+  w.vec24(body);
+  return w.take();
+}
+
+/**
+ * A ServerHello.
+ *
+ * `legacy_session_id_echo` must be the client's session id verbatim. It means nothing
+ * and omitting it makes middleboxes drop the connection, which is the whole of TLS 1.3's
+ * compatibility story in one field.
+ */
+export u8[] serverHello(u8[] random, u8[] sessionId, i32 suite, u8[] keyShare) {
+  Writer body = Writer.create();
+  body.u16(0x0303);               // legacy_version: always TLS 1.2 on the wire
+  body.bytes(random);
+  body.vec8(sessionId);
+  body.u16(suite);
+  body.u8(0);                     // legacy_compression_method
+
+  Writer exts = Writer.create();
+  // supported_versions: the actual version, and the only place it appears.
+  exts.u16(43);
+  Writer sv = Writer.create();
+  sv.u16(0x0304);
+  exts.vec16(sv.take());
+  // key_share: the server's single share, not a list.
+  exts.u16(51);
+  Writer ks = Writer.create();
+  ks.u16(0x001d);
+  ks.vec16(keyShare);
+  exts.vec16(ks.take());
+
+  body.vec16(exts.take());
+  return handshakeMessage(2, body.take());
+}
+
+/** EncryptedExtensions, with nothing in it. */
+export u8[] encryptedExtensions() {
+  Writer body = Writer.create();
+  body.vec16(u8[0]());
+  return handshakeMessage(8, body.take());
+}
+
+/**
+ * A Certificate message carrying one DER certificate and no extensions.
+ *
+ * `certificate_request_context` is empty for a server certificate; it is only non-empty
+ * when the certificate answers a CertificateRequest.
+ */
+export u8[] certificate(u8[] der) {
+  Writer body = Writer.create();
+  body.vec8(u8[0]());             // certificate_request_context
+
+  Writer entry = Writer.create();
+  entry.vec24(der);
+  entry.vec16(u8[0]());           // per-certificate extensions
+
+  body.vec24(entry.take());
+  return handshakeMessage(11, body.take());
+}
+
+/**
+ * The bytes CertificateVerify signs, RFC 8446 §4.4.3.
+ *
+ * Sixty-four spaces, then a context string, then a zero byte, then the transcript hash.
+ * The padding and the context are what stop a signature made for one purpose being
+ * replayed as another — a TLS 1.2 signature, or a client's signature reused by a server.
+ */
+export u8[] certificateVerifyContent(u8[] transcriptHash, bool isServer) {
+  Writer w = Writer.create();
+  for (i32 i = 0; i < 64; i++) { w.u8(32); }
+  if (isServer) {
+    w.bytes("TLS 1.3, server CertificateVerify".toBytes());
+  } else {
+    w.bytes("TLS 1.3, client CertificateVerify".toBytes());
+  }
+  w.u8(0);
+  w.bytes(transcriptHash);
+  return w.take();
+}
+
+/** A CertificateVerify carrying an ed25519 signature. */
+export u8[] certificateVerify(u8[] signature) {
+  Writer body = Writer.create();
+  body.u16(0x0807);               // ed25519
+  body.vec16(signature);
+  return handshakeMessage(15, body.take());
+}
+
+/** A Finished message. */
+export u8[] finished(u8[] verifyData) {
+  return handshakeMessage(20, verifyData);
+}
+
+/** The type of a handshake message, from its header. */
+export i32 messageType(u8[] msg) {
+  if (msg.len() < 4) { trap; }
+  return msg[0];
+}
+
+/** The body of a handshake message, with the header removed. */
+export u8[] messageBody(u8[] msg) {
+  if (msg.len() < 4) { trap; }
+  i32 len = (msg[1] << 16) | (msg[2] << 8) | msg[3];
+  if (4 + len != msg.len()) { trap; }
+  u8[] out = u8[len]();
+  for (i32 i = 0; i < len; i++) { out[i] = msg[4 + i]; }
+  return out;
+}
+
+/**
+ * How long the handshake message starting at `buf` is, including its header, or -1 if
+ * `buf` does not yet hold all of it.
+ *
+ * Handshake messages are framed independently of records: one message may span several
+ * records and one record may hold several messages, so a reader has to reassemble.
+ */
+export i32 messageLength(u8[] buf) {
+  if (buf.len() < 4) { return -1; }
+  i32 len = (buf[1] << 16) | (buf[2] << 8) | buf[3];
+  if (buf.len() < 4 + len) { return -1; }
+  return 4 + len;
+}
