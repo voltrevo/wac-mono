@@ -1,0 +1,304 @@
+// Arithmetic in GF(2^255 - 19), the field Curve25519 is defined over.
+//
+// This is the same shape as poly1305's mod 2^130-5 arithmetic and for the same reason:
+// the prime is just below a power of two, so anything overflowing folds back in as a
+// small multiply — 2^255 = 19 (mod p) here, against 2^130 = 5 there.
+//
+// ## Why ten limbs of 25.5 bits
+//
+// 255 bits will not divide evenly into limbs small enough to multiply. Two 26-bit limbs
+// multiply to 52 bits, leaving 12 bits of a u64 to accumulate ten such products plus a
+// factor of 19 and an occasional doubling — 38 * 2^52 * 10 is about 1.7e18 against
+// i64's 9.2e18, which is the headroom that lets carries be deferred to the end of a
+// multiply instead of propagated inside it. Splitting 255 into ten limbs of 26 bits
+// would need 260 bits of room and waste the reduction; ten limbs *alternating* 26 and
+// 25 gives exactly 5*26 + 5*25 = 255.
+//
+// So limb i holds the coefficient of 2^ceil(25.5*i):
+//
+//   i       0   1   2   3    4    5    6    7    8    9
+//   offset  0   26  51  77   102  128  153  179  204  230
+//   bits    26  25  26  25   26   25   26   25   26   25
+//
+// That alternation has one consequence that is easy to miss and impossible to debug by
+// staring: when both limb indices are odd, offset(i) + offset(j) lands one bit *above*
+// offset(i+j), because two roundings-up have accumulated. The product has to be doubled
+// to sit in the right place. `feMul` does that, and it is the single most likely thing
+// here to be wrong, which is why every operation in this file is checked against a
+// BigInt reference over random inputs rather than only against curve vectors.
+//
+// ## Signed limbs
+//
+// Limbs are i64 rather than u64 so subtraction needs no borrow: `feSub` subtracts limb
+// by limb and lets the carry pass fix up the negatives afterwards. The carry uses an
+// arithmetic shift, which rounds toward negative infinity, so the `+ 2^(shift-1)` bias
+// makes it round to nearest instead — without that, a negative limb carries the wrong
+// way and the error compounds over a ladder.
+
+/** Bits in limb `i`: 26 for even, 25 for odd. */
+i32 limbBits(i32 i) { return (i % 2) == 0 ? 26 : 25; }
+
+/** A field element, uncarried. Ten i64 limbs, little-endian by significance. */
+export i64[] feZero() { return i64[10](); }
+
+export i64[] feOne() {
+  i64[] h = i64[10]();
+  h[0] = 1;
+  return h;
+}
+
+export i64[] feCopy(i64[] a) {
+  i64[] h = i64[10]();
+  for (i32 i = 0; i < 10; i++) { h[i] = a[i]; }
+  return h;
+}
+
+/**
+ * Propagate carries so every limb fits its width.
+ *
+ * Run twice by callers that need tight bounds: one pass can leave limb 0 large again,
+ * because the wrap from limb 9 multiplies by 19 and adds back at the bottom.
+ */
+export void feCarry(i64[] h) {
+  for (i32 i = 0; i < 10; i++) {
+    i64 shift = limbBits(i) as i64;
+    // Round to nearest rather than toward -inf, so a negative limb carries down.
+    i64 c = (h[i] + (1 << (shift - 1))) >> shift;
+    h[i] -= c << shift;
+    if (i == 9) { h[0] += c * 19; } else { h[i + 1] += c; }
+  }
+}
+
+/**
+ * Carry so that every limb ends up in [0, 2^bits) — non-negative, unlike `feCarry`.
+ *
+ * `feCarry` rounds to nearest, which is what keeps magnitudes small through a chain of
+ * multiplies, but it routinely leaves a limb negative: 2^25 carries to limb 0 = -2^25
+ * and limb 1 = 1, which is the same value and a perfectly good intermediate. It is not a
+ * good *encoding*, and reading those limbs as unsigned bit patterns is how the first
+ * version of `feToBytes` turned 2^25 into 3 * 2^25.
+ *
+ * Arithmetic shift floors toward negative infinity, which is exactly what makes this
+ * work: a negative limb borrows from the next one up rather than truncating.
+ */
+void feCarryFloor(i64[] h) {
+  // Two passes: the wrap at limb 9 adds 19*c back at the bottom, which can push limb 0
+  // out of range again, and that second excursion is always small enough to settle.
+  for (i32 pass = 0; pass < 2; pass++) {
+    for (i32 i = 0; i < 10; i++) {
+      i64 shift = limbBits(i) as i64;
+      i64 c = h[i] >> shift;
+      h[i] -= c << shift;
+      if (i == 9) { h[0] += c * 19; } else { h[i + 1] += c; }
+    }
+  }
+}
+
+export i64[] feAdd(i64[] a, i64[] b) {
+  i64[] h = i64[10]();
+  for (i32 i = 0; i < 10; i++) { h[i] = a[i] + b[i]; }
+  return h;
+}
+
+export i64[] feSub(i64[] a, i64[] b) {
+  i64[] h = i64[10]();
+  for (i32 i = 0; i < 10; i++) { h[i] = a[i] - b[i]; }
+  return h;
+}
+
+/**
+ * a * b (mod p).
+ *
+ * Schoolbook, written from the definition rather than unrolled: every pair (i, j)
+ * contributes a_i*b_j at position i+j, doubled when both indices are odd, and folded
+ * back to position i+j-10 with a factor of 19 when i+j reaches 10. Written this way it
+ * is possible to check the rule by reading it; an unrolled version is faster and is a
+ * transcription exercise, which is how this kind of code goes quietly wrong.
+ */
+export i64[] feMul(i64[] a, i64[] b) {
+  i64[] h = i64[10]();
+  for (i32 i = 0; i < 10; i++) {
+    for (i32 j = 0; j < 10; j++) {
+      i64 t = a[i] * b[j];
+      if ((i % 2) == 1 && (j % 2) == 1) { t = t * 2; }
+      i32 k = i + j;
+      if (k < 10) {
+        h[k] += t;
+      } else {
+        // 2^255 = 19 (mod p), and offset(k) = offset(k - 10) + 255.
+        h[k - 10] += t * 19;
+      }
+    }
+  }
+  feCarry(h);
+  feCarry(h);
+  return h;
+}
+
+export i64[] feSquare(i64[] a) { return feMul(a, a); }
+
+/**
+ * a * m for a small non-negative m — the ladder needs a * 121665 (RFC 7748's a24).
+ *
+ * Kept general rather than hardcoding the constant, so it can be checked against a
+ * BigInt reference at many multipliers instead of one. `m` must be small enough that
+ * m * 2^26 * 10 stays inside an i64, which any curve constant is by a wide margin.
+ */
+export i64[] feMulSmall(i64[] a, i64 m) {
+  i64[] h = i64[10]();
+  for (i32 i = 0; i < 10; i++) { h[i] = a[i] * m; }
+  feCarry(h);
+  feCarry(h);
+  return h;
+}
+
+/**
+ * Swap `a` and `b` if `swap` is 1, leave them if it is 0.
+ *
+ * Branch-free by arithmetic rather than by an `if`, because the ladder calls this with
+ * a bit of the secret scalar. wac gives no guarantee that this compiles to something
+ * constant-time — see the note in the package README — but a data-dependent branch here
+ * would be a leak by construction rather than merely by compilation.
+ */
+export void feCSwap(i64[] a, i64[] b, i32 swap) {
+  i64 mask = -(swap as i64);
+  for (i32 i = 0; i < 10; i++) {
+    i64 t = mask & (a[i] ^ b[i]);
+    a[i] ^= t;
+    b[i] ^= t;
+  }
+}
+
+/**
+ * The 32-byte little-endian encoding, fully reduced.
+ *
+ * Reduction to canonical form is the fiddly half: after carrying, the value is in
+ * [0, 2p) rather than [0, p), so p may still need subtracting once. That is done by
+ * adding 19, seeing whether bit 255 sets — which means the value was at least p — and
+ * using the answer to choose. Getting this wrong produces an encoding that is correct
+ * for almost every input and wrong for the handful just below p.
+ */
+export u8[] feToBytes(i64[] hIn) {
+  i64[] h = feCopy(hIn);
+  feCarry(h);
+  feCarry(h);
+  feCarryFloor(h);
+  // Now every limb is in [0, 2^bits), so h is a plain integer in [0, 2^255).
+
+  // It may still be >= p. Add 19 and carry *without* wrapping the top: if that sets
+  // bit 255 then h was at least p, and h + 19 - 2^255 is exactly h - p.
+  i64[] t = feCopy(h);
+  t[0] += 19;
+  for (i32 i = 0; i < 9; i++) {
+    i64 shift = limbBits(i) as i64;
+    i64 c = t[i] >> shift;
+    t[i] -= c << shift;
+    t[i + 1] += c;
+  }
+  i32 geP = ((t[9] >> 25) & 1) as! i32;
+
+  if (geP == 1) {
+    t[9] -= 1 << 25;
+    for (i32 i = 0; i < 10; i++) { h[i] = t[i]; }
+  }
+
+  // Pack the limbs into 32 bytes, little-endian.
+  u8[] out = u8[32]();
+  i32 bitPos = 0;
+  for (i32 i = 0; i < 10; i++) {
+    i32 width = limbBits(i);
+    i64 v = h[i];
+    for (i32 b = 0; b < width; b++) {
+      i32 bit = ((v >> b) & 1) as! i32;
+      i32 byteIdx = (bitPos + b) / 8;
+      if (byteIdx < 32) {
+        out[byteIdx] = out[byteIdx] | (bit << ((bitPos + b) % 8));
+      }
+    }
+    bitPos += width;
+  }
+  return out;
+}
+
+/**
+ * Decode 32 little-endian bytes.
+ *
+ * Bit 255 is ignored, as RFC 7748 §5 requires of u-coordinates: "implementations MUST
+ * mask the most significant bit". No mask appears below because none is needed — the ten
+ * limbs span 26+25+... = 255 bits, so the loop reads indices 0 through 254 and never
+ * looks at bit 255 at all. An explicit `idx == 255 ? 0 : ...` was here first and coverage
+ * showed the branch could not be taken; the masking is structural, and saying so is
+ * better than a guard that reads as if the case were live.
+ */
+export i64[] feFromBytes(u8[] s) {
+  i64[] h = i64[10]();
+  i32 bitPos = 0;
+  for (i32 i = 0; i < 10; i++) {
+    i32 width = limbBits(i);
+    i64 v = 0;
+    for (i32 b = 0; b < width; b++) {
+      i32 idx = bitPos + b;
+      i32 byteIdx = idx / 8;
+      i32 bit = (s[byteIdx] >> (idx % 8)) & 1;
+      v = v | ((bit as i64) << b);
+    }
+    h[i] = v;
+    bitPos += width;
+  }
+  return h;
+}
+
+/**
+ * 1/a, by Fermat's little theorem: a^(p-2) = a^-1 for a != 0.
+ *
+ * p - 2 is 2^255 - 21, whose binary expansion is 250 ones, a zero, a one, then two
+ * zeros — so the chain is "square-and-multiply through 250 ones" with a short tail. The
+ * addition chain below is the standard one and costs 254 squarings and 11
+ * multiplications; the obvious square-and-multiply would cost 254 and 250.
+ *
+ * a = 0 returns 0, which is what the ladder wants: the identity's u-coordinate.
+ */
+export i64[] feInvert(i64[] z) {
+  i64[] z2 = feSquare(z);                       // 2
+  i64[] t = feSquare(z2);                       // 4
+  t = feSquare(t);                              // 8
+  i64[] z9 = feMul(t, z);                       // 9
+  i64[] z11 = feMul(z9, z2);                    // 11
+  t = feSquare(z11);                            // 22
+  i64[] z2_5_0 = feMul(t, z9);                  // 31 = 2^5 - 1
+
+  t = feSquare(z2_5_0);
+  for (i32 i = 1; i < 5; i++) { t = feSquare(t); }
+  i64[] z2_10_0 = feMul(t, z2_5_0);             // 2^10 - 1
+
+  t = feSquare(z2_10_0);
+  for (i32 i = 1; i < 10; i++) { t = feSquare(t); }
+  i64[] z2_20_0 = feMul(t, z2_10_0);            // 2^20 - 1
+
+  t = feSquare(z2_20_0);
+  for (i32 i = 1; i < 20; i++) { t = feSquare(t); }
+  t = feMul(t, z2_20_0);                        // 2^40 - 1
+
+  t = feSquare(t);
+  for (i32 i = 1; i < 10; i++) { t = feSquare(t); }
+  i64[] z2_50_0 = feMul(t, z2_10_0);            // 2^50 - 1
+
+  t = feSquare(z2_50_0);
+  for (i32 i = 1; i < 50; i++) { t = feSquare(t); }
+  i64[] z2_100_0 = feMul(t, z2_50_0);           // 2^100 - 1
+
+  t = feSquare(z2_100_0);
+  for (i32 i = 1; i < 100; i++) { t = feSquare(t); }
+  t = feMul(t, z2_100_0);                       // 2^200 - 1
+
+  t = feSquare(t);
+  for (i32 i = 1; i < 50; i++) { t = feSquare(t); }
+  t = feMul(t, z2_50_0);                        // 2^250 - 1
+
+  t = feSquare(t);
+  t = feSquare(t);
+  t = feSquare(t);
+  t = feSquare(t);
+  t = feSquare(t);                              // 2^255 - 32
+  return feMul(t, z11);                         // 2^255 - 21 = p - 2
+}
