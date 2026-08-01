@@ -211,6 +211,63 @@ Random split points, plus the adversarial ones — a split inside the gzip heade
 table, between a length and its distance, mid-match. If those agree, the resumption logic is right;
 if the split-independence property holds, nothing about *where* the chunks fall can matter.
 
+## Or wrap it at the JS level, without touching wac at all
+
+Two of these were measured here rather than reasoned about, and one of them fails.
+
+**Buffering the whole input and calling `inflate` at the end is not a stream.** It has the shape
+and none of the properties: memory is O(input) + O(output) and nothing is emitted until the last
+byte arrives. Worth naming because it is what usually ships under the word "streaming".
+
+**Compressing each chunk as its own gzip member — measured, and not portable.** Concatenated
+members are legal per RFC 1952 §2.2 and three decoders read them as one stream:
+
+| decoder | concatenated members |
+|---|---|
+| system `gunzip` | reads them |
+| Python `gzip.decompress` | reads them |
+| Node `zlib.gunzipSync` | reads them |
+| **`DecompressionStream("gzip")` (Deno)** | **rejects: "failed to write whole buffer"** |
+
+So the trick works if you control the consumer and fails against the one a browser-side caller
+would reach for first. It also costs ratio — a header and trailer per chunk, and no matches across
+chunk boundaries. Usable, but it needs the caveat attached, not a footnote.
+
+The *correct* version — one member whose deflate stream is many blocks, realigned with a
+`00 00 00 FF FF` sync marker as zlib's `Z_SYNC_FLUSH` does — cannot be assembled in JS from the
+current exports, because a non-final compressed block does not end on a byte boundary. That one
+needs a wac change, and it is a much smaller change than a streaming decoder.
+
+**Decompression: a worker blocking on `Atomics.wait`, and it works.** This is design A with the
+synchronous `read()` it wants, obtained without JSPI:
+
+- the wac module runs in a worker as an ordinary pull loop — no state machine, no compiler change;
+- the producer writes chunks into a `SharedArrayBuffer` and calls `Atomics.notify`;
+- `read()` blocks in `Atomics.wait` when the buffer is empty, **inside the wasm frame**.
+
+Verified end to end: chunks arriving 5 ms apart, the worker suspended in the middle of a wasm call
+each time, the right answer out. Two things that cost time and are not obvious:
+
+- **the feed must be push-only.** A blocked worker cannot deliver a `postMessage`, so it cannot
+  *ask* for the next chunk — a request/response handshake deadlocks immediately. The producer
+  pushes and the consumer blocks when empty.
+- **install the worker's `onmessage` before any top-level `await`**, or the first message is lost
+  while module evaluation is suspended.
+
+Costs: one worker and one wasm instantiation per concurrent stream (or a pool), and
+`SharedArrayBuffer`. In Deno it is available with no ceremony. In a browser it needs cross-origin
+isolation — COOP and COEP headers — which is a deployment constraint on the *page*, not on this
+code, and was not testable from here.
+
+### So which
+
+- **Deno or Node, and you want it soon:** the worker wrapper. wac stays a plain loop, no decoder
+  rewrite, and it is all host-side code that can be deleted later.
+- **Browser, or no SharedArrayBuffer:** the held `Inflater` above. It is the only one with no
+  environmental requirement.
+- **Compression only, consumer under your control:** per-chunk members today; the sync-flush
+  marker when someone wants the ratio back.
+
 ## Who wants it
 
 `packages/server` has `gzip` unwired, with `Accept-Encoding` and a compressed body listed as the
