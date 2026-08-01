@@ -103,3 +103,47 @@ Deno.test("a tree handed back serializes to what it came from", () => {
     assertEquals(dec.decode(mod.stringify(v)), src, src);
   }
 });
+
+// The tests above check the tree against what this package knows about itself: tags, values,
+// order, and a round trip back through `stringify`. This one checks it against a *different*
+// implementation — the host's own parser — by walking the whole tree into plain data. A shape
+// that is self-consistently wrong survives everything above and fails here.
+
+/** A tree walk written the way a consumer would write it. */
+function toJs(v: JsonRef): unknown {
+  switch (v.tag) {
+    case "Null":   return null;
+    case "Bool":   return v.Bool_value;
+    case "Number": return v.Number_value;
+    case "Str":    return dec.decode(v.Str_bytes);
+    case "Array": {
+      const items = v.Array_items;
+      return Array.from({ length: items.len() }, (_, i) => toJs(items.get(i)));
+    }
+    case "Object": {
+      const members = v.Object_members;
+      const out: Record<string, unknown> = {};
+      // Last wins, which is what JSON.parse does with a duplicate key. The tree keeps both
+      // members, which the test above asserts; this one is about agreeing with the host.
+      for (let i = 0; i < members.len(); i++) out[members.at(i).keyStr()] = toJs(members.at(i).value);
+      return out;
+    }
+  }
+}
+
+Deno.test("the tree walks to the same data JSON.parse produces", () => {
+  const cases = [
+    "null", "true", "false", "0", "-1", "42", "1.5", "-2.25", "1e3",
+    '""', '"hello"', '"h\\u00e9llo \\ud83d\\ude00"', '"\\t\\n\\"\\\\"',
+    "[]", "[1]", "[1,2,3]", "[[1],[2,[3]]]", "[null,true,false]",
+    "{}", '{"a":1}', '{"a":1,"b":[2,3]}', '{"a":{"b":{"c":[]}}}',
+    '{"deep":[1,[2,[3,[4]]]],"uni":"héllo 😀","neg":-0.5,"big":1e20}',
+    '{"a":1,"a":2}',
+    '  \t{ "spaced" : [ 1 , 2 ] }\n',
+  ];
+  for (const src of cases) {
+    const v = parse(src);
+    if (v === null) throw new Error(`${src} did not parse`);
+    assertEquals(JSON.stringify(toJs(v)), JSON.stringify(JSON.parse(src)), src);
+  }
+});

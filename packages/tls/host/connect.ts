@@ -5,12 +5,31 @@
 import { wacBind } from "../../../harness/wacBind.ts";
 
 const mod = await wacBind("packages/tls/test/wac/probe.wac");
-const init = mod.cliInit as (h: Uint8Array, root: Uint8Array, e: Uint8Array, r: Uint8Array, now: bigint) => Uint8Array;
+const init = mod.cliInit as (
+  h: Uint8Array, root: Uint8Array, e: Uint8Array, p256: Uint8Array, r: Uint8Array, now: bigint,
+) => Uint8Array;
 const feedRaw = mod.cliFeed as (state: Uint8Array, input: Uint8Array) => Uint8Array;
 const sendRaw = mod.cliSend as (state: Uint8Array, data: Uint8Array) => Uint8Array;
 const closeRaw = mod.cliClose as (state: Uint8Array) => Uint8Array;
 const phase = mod.cliPhase as (state: Uint8Array) => number;
 const failure = mod.cliFailure as (state: Uint8Array) => number;
+
+/**
+ * A P-256 private scalar: 32 random bytes, retried until they land in [1, n).
+ *
+ * Rejection sampling rather than reduction, because reducing a uniform 256-bit value mod
+ * n biases the low end. The rejection probability is about 2^-32, so this virtually
+ * never loops.
+ */
+export function p256Scalar(): Uint8Array {
+  const N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551n;
+  while (true) {
+    const k = crypto.getRandomValues(new Uint8Array(32));
+    let v = 0n;
+    for (const b of k) v = (v << 8n) | BigInt(b);
+    if (v > 0n && v < N) return k;
+  }
+}
 
 export function unpack(r: Uint8Array): { state: Uint8Array; toSend: Uint8Array; appData: Uint8Array } {
   const dv = new DataView(r.buffer, r.byteOffset, r.byteLength);
@@ -48,6 +67,7 @@ export async function request(
     const r = unpack(init(
       enc.encode(serverName), rootDer,
       crypto.getRandomValues(new Uint8Array(32)),
+      p256Scalar(),
       crypto.getRandomValues(new Uint8Array(32)),
       BigInt(Math.floor(Date.now() / 1000)),
     ));

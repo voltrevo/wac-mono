@@ -1,0 +1,15 @@
+import { sha3_256, sha3_512, shake128, shake256, keccakF } from "../../src/keccak.wac";
+export u8[] k256(u8[] m) { return sha3_256(m); }
+export u8[] k512(u8[] m) { return sha3_512(m); }
+export u8[] x128(u8[] m, i32 n) { return shake128(m, n); }
+export u8[] x256(u8[] m, i32 n) { return shake256(m, n); }
+/** The permutation on an all-zero state, as 200 bytes — the narrowest possible check. */
+export u8[] permuteZero() {
+  u64[] s = u64[25]();
+  keccakF(s);
+  u8[] out = u8[200]();
+  for (i32 i = 0; i < 200; i++) {
+    out[i] = ((s[i / 8] >> (((i % 8) * 8) as! u64)) & 255) as! i32;
+  }
+  return out;
+}

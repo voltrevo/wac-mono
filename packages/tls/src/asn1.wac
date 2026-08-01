@@ -171,3 +171,37 @@ export u8[] oidSubjectAltName() { return u8[](0x55, 0x1D, 0x11); }
 export u8[] oidBasicConstraints() { return u8[](0x55, 0x1D, 0x13); }
 /** 2.5.4.3 — commonName. */
 export u8[] oidCommonName() { return u8[](0x55, 0x04, 0x03); }
+
+// Algorithm identifiers a certificate can carry.
+/** 1.2.840.10045.2.1 — id-ecPublicKey. */
+export u8[] oidEcPublicKey() { return u8[](0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01); }
+/** 1.2.840.10045.3.1.7 — prime256v1, the curve parameter for P-256. */
+export u8[] oidPrime256v1() { return u8[](0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07); }
+/** 1.2.840.10045.4.3.2 — ecdsa-with-SHA256. */
+export u8[] oidEcdsaSha256() { return u8[](0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02); }
+/** 1.2.840.10045.4.3.3 — ecdsa-with-SHA384. */
+export u8[] oidEcdsaSha384() { return u8[](0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03); }
+/** 1.2.840.113549.1.1.1 — rsaEncryption. */
+export u8[] oidRsaEncryption() { return u8[](0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01); }
+/** 1.2.840.113549.1.1.10 — RSASSA-PSS. */
+export u8[] oidRsaPss() { return u8[](0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A); }
+/** 1.2.840.113549.1.1.11 / .12 / .13 — sha256/384/512 WithRSAEncryption. */
+export u8[] oidRsaSha256() { return u8[](0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B); }
+export u8[] oidRsaSha384() { return u8[](0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C); }
+export u8[] oidRsaSha512() { return u8[](0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D); }
+
+/**
+ * The contents of an INTEGER, with any leading zero removed.
+ *
+ * DER writes integers signed, so a value whose top bit is set gets a leading zero byte
+ * to keep it positive. An RSA modulus almost always has that bit set, so almost every
+ * modulus in the world arrives one byte longer than it is — and using that length as the
+ * key size makes every signature check fail on a length comparison.
+ */
+export u8[] unsignedInteger(u8[] der) {
+  i32 at = 0;
+  while (at + 1 < der.len() && der[at] == 0) { at++; }
+  u8[] out = u8[der.len() - at]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = der[at + i]; }
+  return out;
+}
