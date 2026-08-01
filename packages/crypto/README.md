@@ -1,7 +1,7 @@
 # crypto
 
-SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519 and
-Ed25519, written in wac.
+SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519
+and NIST P-256 (ECDH and ECDSA), written in wac.
 
 > **Not for production.** Nothing here is constant-time. `ghash`'s multiply branches on
 > every bit of its operand, `aes` indexes an S-box with key-dependent values, and
@@ -71,6 +71,26 @@ verify test would have passed.
 Roughly 120 ms per signature. The scalar multiplication is a plain 256-step
 double-and-add with no windowing, which is the slowest reasonable choice and the easiest
 to read against the spec.
+
+## P-256
+
+`src/fieldp256.wac` and `src/p256.wac`. A different prime and a different curve shape
+from Curve25519, and both differences show:
+
+- 2^255-19 is a power of two minus a small number, so a value that overflows folds back
+  as one small multiply. P-256's prime is a **Solinas** prime, chosen so reduction is a
+  shuffle of 32-bit words with no multiplication — nine terms selected from the product
+  and combined. Neither trick works for the other prime.
+- Curve25519's Montgomery ladder needs no addition law. A short Weierstrass curve has
+  one, with exceptional cases: a point plus itself needs a different formula, and a point
+  plus its negation gives the identity, which has no affine coordinates. Those cases are
+  most of the extra code, and each is reached by ordinary inputs.
+
+Checked against BigInt for the field and WebCrypto for ECDH and ECDSA, in both
+directions. ECDSA is randomised, so "our signatures verify in WebCrypto" is a separate
+test from "we verify theirs" — there is no byte-identity to compare, unlike Ed25519.
+
+Roughly 37 ms per scalar multiplication.
 
 A caller checking for the all-zero shared secret, as RFC 7748 §6.1 permits, gets it: a
 low-order point multiplies to the identity and encodes as zero. This package does not
