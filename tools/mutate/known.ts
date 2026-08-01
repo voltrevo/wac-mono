@@ -119,4 +119,63 @@ export const KNOWN_SURVIVORS: KnownSurvivor[] = [
       "starts past the end of the input and the bit reader traps. Confirmed with FNAME " +
       "set and a name that consumes the rest of the member.",
   },
+  // ── gzip's tuning constants ─────────────────────────────────────────────────
+  //
+  // Six functions that return a threshold. `extreme` replaces each body with `return 0`,
+  // which changes how the code goes about its work and not what it produces, so no
+  // correctness test can kill them — and a correctness test is the only kind here.
+  //
+  // Worth separating the two reasons, because they are not equally comfortable. The
+  // first two produce byte-identical output, verified rather than argued. The next three
+  // change the compression ratio, which the suite deliberately does not pin — the same
+  // category the curated list marks `ratioOnly`. The last is a memory bound, and the
+  // mutation moves it in the safe direction, which is a limitation of the operator
+  // rather than a property of the code.
+  {
+    name: "extreme/gzip/crc32/sliceThreshold",
+    why:
+      "The input length above which CRC-32 uses the slice-by-8 table instead of the " +
+      "bitwise loop. Both compute the same CRC — crc32.test.ts checks them against each " +
+      "other and against python — so the constant selects an implementation, not a " +
+      "result. Verified: with it returning 0, gzip output over five input sizes is " +
+      "byte-identical.",
+  },
+  {
+    name: "extreme/gzip/inflate/rootBits",
+    why:
+      "The width of the Huffman fast-lookup table. A smaller table means more symbols " +
+      "fall through to the canonical walk, which decodes them identically. Verified: " +
+      "with it returning 0, round trips still hold and gzip output is byte-identical " +
+      "over five input sizes.",
+  },
+  {
+    name: "extreme/gzip/deflate/goodLength",
+    why:
+      "LZ77 search tuning — the match length beyond which the search narrows. Affects " +
+      "the compression ratio, never correctness; every stream still round-trips and " +
+      "still reads with the system gunzip. The suite allows ratio slack deliberately, " +
+      "which is why the curated lz77/chain-limit mutation is marked ratioOnly and " +
+      "survives for the same reason.",
+  },
+  {
+    name: "extreme/gzip/deflate/niceLength",
+    why: "LZ77 search tuning — the match length beyond which the search stops. Same as " +
+      "goodLength: ratio, not correctness.",
+  },
+  {
+    name: "extreme/gzip/gzip/smallInput",
+    why: "The size below which gzipBest does not bother trying dynamic Huffman. Picks a " +
+      "strategy; every strategy produces a valid stream. Ratio, not correctness.",
+  },
+  {
+    name: "extreme/gzip/inflate/maxSizeHint",
+    why:
+      "The cap on how much of the gzip trailer's ISIZE is trusted for pre-allocation. " +
+      "Returning 0 means never trusting it, which is the *conservative* direction — the " +
+      "buffer grows normally and output is unchanged, so no test can object. The " +
+      "dangerous direction is raising the cap, which `extreme` cannot express; the " +
+      "`literal` operator on the 26 would. What the cap is actually for is now pinned " +
+      "directly by inflate.test.ts, which checks that a member claiming 100 MiB, 1 GiB " +
+      "or 4 GiB is rejected in under a second rather than attempting the allocation.",
+  },
 ];
