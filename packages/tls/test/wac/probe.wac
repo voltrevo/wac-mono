@@ -1,0 +1,34 @@
+// The key schedule at the host boundary.
+import { expandLabel, deriveSecret, earlySecret, handshakeSecret, masterSecret,
+         trafficKeyIv, finishedVerify, nextTrafficSecret, emptyHash, zeroKey }
+  from "../../src/keyschedule.wac";
+
+export u8[] tlsExpandLabel(u8[] secret, u8[] label, u8[] ctx, i32 len) {
+  return expandLabel(secret, label, ctx, len);
+}
+export u8[] tlsDeriveSecret(u8[] secret, u8[] label, u8[] th) { return deriveSecret(secret, label, th); }
+export u8[] tlsEarlySecret(u8[] psk) { return earlySecret(psk); }
+export u8[] tlsHandshakeSecret(u8[] early, u8[] dhe) { return handshakeSecret(early, dhe); }
+export u8[] tlsMasterSecret(u8[] hs) { return masterSecret(hs); }
+export u8[] tlsTrafficKeyIv(u8[] secret, i32 keyLen) { return trafficKeyIv(secret, keyLen); }
+export u8[] tlsFinishedVerify(u8[] base, u8[] th) { return finishedVerify(base, th); }
+export u8[] tlsNextTrafficSecret(u8[] s) { return nextTrafficSecret(s); }
+export u8[] tlsEmptyHash() { return emptyHash(); }
+export u8[] tlsZeroKey() { return zeroKey(); }
+
+// Record layer.
+import { recordSeal, recordOpen, recordType, recordContent, recordLength,
+         suiteAes128Gcm, suiteChaCha20, suiteKeyLen } from "../../src/record.wac";
+
+export u8[] tlsSeal(i32 suite, u8[] k, u8[] iv, i64 seq, i32 ct, u8[] content, i32 pad) {
+  return recordSeal(suite, k, iv, seq, ct, content, pad);
+}
+export u8[] tlsOpen(i32 suite, u8[] k, u8[] iv, i64 seq, u8[] rec) {
+  return recordOpen(suite, k, iv, seq, rec);
+}
+export i32 tlsRecordType(u8[] inner) { return recordType(inner); }
+export u8[] tlsRecordContent(u8[] inner) { return recordContent(inner); }
+export i32 tlsRecordLength(u8[] buf) { return recordLength(buf); }
+export i32 tlsSuiteAes() { return suiteAes128Gcm(); }
+export i32 tlsSuiteChaCha() { return suiteChaCha20(); }
+export i32 tlsSuiteKeyLen(i32 s) { return suiteKeyLen(s); }
