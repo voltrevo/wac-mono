@@ -35,6 +35,7 @@
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
 import { p256Ecdh, p256PublicKey } from "../../crypto/src/p256.wac";
+import { hybridServerAccept } from "./hybrid.wac";
 import { ed25519Sign } from "../../crypto/src/ed25519.wac";
 import {
   deriveSecret, earlySecret, finishedVerify, handshakeSecret, hashLen, masterSecret,
@@ -213,8 +214,20 @@ u8[] serverFlight(Conn c, u8[] clientHelloMsg) {
   u8[] peerKey = u8[ch.keyShare.len() - 2]();
   for (i32 i = 0; i < peerKey.len(); i++) { peerKey[i] = ch.keyShare[2 + i]; }
 
+  // The hybrid does the exchange while building the share, because encapsulation
+  // produces both at once; the other two derive the secret separately below.
   u8[] ourShare = u8[0]();
-  if (group == 0x001d) {
+  u8[] hybridSecret = u8[0]();
+  if (group == 0x11EC) {
+    // The ML-KEM randomness is the server random reused. That is fine here and would not
+    // be in a real deployment: it must be unpredictable and unique per handshake, and
+    // this host supplies exactly one 32-byte random value per connection.
+    u8[] accepted = hybridServerAccept(peerKey, c.serverRandom, c.ephemeralPriv);
+    ourShare = u8[1120]();
+    for (i32 i = 0; i < 1120; i++) { ourShare[i] = accepted[i]; }
+    hybridSecret = u8[64]();
+    for (i32 i = 0; i < 64; i++) { hybridSecret[i] = accepted[1120 + i]; }
+  } else if (group == 0x001d) {
     ourShare = x25519Base(c.ephemeralPriv);
   } else {
     ourShare = p256PublicKey(c.ephemeralPriv);
@@ -226,7 +239,9 @@ u8[] serverFlight(Conn c, u8[] clientHelloMsg) {
   // is exactly ClientHello ++ ServerHello, which is what "CH..SH" means in RFC 8446 §7.1
   // — one message too many or too few here yields keys that are wrong and look fine.
   u8[] shared = u8[0]();
-  if (group == 0x001d) {
+  if (group == 0x11EC) {
+    shared = hybridSecret;
+  } else if (group == 0x001d) {
     shared = x25519(c.ephemeralPriv, peerKey);
   } else {
     shared = p256Ecdh(c.ephemeralPriv, peerKey);

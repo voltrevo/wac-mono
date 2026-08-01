@@ -154,6 +154,7 @@ Deno.test("client: refuses when the certificate is outside its validity window",
   {
     const r = unpack(init(enc.encode("wac.test"), caDer,
       crypto.getRandomValues(new Uint8Array(32)), p256Scalar(),
+      crypto.getRandomValues(new Uint8Array(64)),
       crypto.getRandomValues(new Uint8Array(32)), longAgo));
     state = r.state;
     await conn.write(r.toSend);
@@ -195,7 +196,8 @@ Deno.test("client: sends a ClientHello a real server understands", async () => {
   // no useful signal, and this at least says the failure is later than the hello.
   const seed = new Uint8Array(32);
   seed[31] = 7;
-  const r = unpack(init(enc.encode("wac.test"), caDer, seed, seed, new Uint8Array(32), 0n));
+  const r = unpack(init(enc.encode("wac.test"), caDer, seed, seed,
+    new Uint8Array(64), new Uint8Array(32), 0n));
   const hello = r.toSend;
   if (hello[0] !== 22) throw new Error("the first record is not a handshake record");
   const recLen = (hello[3] << 8) | hello[4];
@@ -249,3 +251,49 @@ async function againstOpenSslServer(kind: "ec" | "rsa"): Promise<void> {
     await proc.status;
   }
 }
+
+/** OpenSSL 3.5.7, which unlike the system 3.0.13 speaks ML-KEM. */
+const OPENSSL35 = Deno.env.get("OPENSSL35") ??
+  "/tmp/ossl/openssl-openssl-3.5.7/apps/openssl";
+const HAVE_OPENSSL35 = (() => {
+  try {
+    return Deno.statSync(OPENSSL35).isFile;
+  } catch {
+    return false;
+  }
+})();
+
+Deno.test({
+  name: "client: negotiates X25519MLKEM768 against a post-quantum-only server",
+  ignore: !HAVE_OPENSSL35,
+  fn: async () => {
+    // The server accepts nothing else, so a client whose 1216-byte share were built the
+    // wrong way round — ML-KEM and X25519 are concatenated in one order for this group
+    // and the other order for SecP256r1MLKEM768 — would fail rather than fall back.
+    const probe = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+    const port = (probe.addr as Deno.NetAddr).port;
+    probe.close();
+
+    const dir = new URL("./data/", import.meta.url).pathname;
+    const proc = new Deno.Command(OPENSSL35, {
+      args: ["s_server", "-accept", String(port), "-cert", `${dir}ec_leaf.pem`,
+             "-key", `${dir}ec_leaf.key`, "-tls1_3", "-groups", "X25519MLKEM768",
+             "-www", "-quiet"],
+      stdout: "null", stderr: "null",
+    }).spawn();
+    await new Promise((r) => setTimeout(r, 1500));
+
+    try {
+      const ca = pemToDer(await Deno.readTextFile(new URL("./data/ec_ca.pem", import.meta.url)));
+      const r = await request("127.0.0.1", port, "wac.test", ca,
+        "GET / HTTP/1.1\r\nHost: wac.test\r\n\r\n");
+      if (r.failure !== 0) throw new Error(`hybrid handshake failed, code ${r.failure}`);
+      if (!r.response.includes("200 ok") && !r.response.includes("200 OK")) {
+        throw new Error(`no reply: ${JSON.stringify(r.response.slice(0, 120))}`);
+      }
+    } finally {
+      try { proc.kill(); } catch { /* already gone */ }
+      await proc.status;
+    }
+  },
+});

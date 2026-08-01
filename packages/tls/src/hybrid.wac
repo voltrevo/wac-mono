@@ -1,0 +1,121 @@
+// X25519MLKEM768, the hybrid post-quantum key agreement of draft-ietf-tls-ecdhe-mlkem.
+//
+// Two key exchanges run side by side and their secrets concatenated. The point is that
+// an attacker must break *both* to recover the traffic key: X25519 covers the case where
+// ML-KEM's lattice assumption turns out to be wrong, and ML-KEM covers the case where
+// someone records the traffic today and has a quantum computer later. Neither alone is
+// what anyone is willing to deploy, which is why the hybrid is what shipped.
+//
+// It is not speculative. Chrome enabled it by default in M124 and it carries a large
+// share of real HTTPS traffic; a client that offers only X25519 is now the unusual one.
+//
+// ## The concatenation order is not obvious and not uniform
+//
+//   X25519MLKEM768      ML-KEM first, then X25519
+//   SecP256r1MLKEM768   secp256r1 first, then ML-KEM
+//
+// The two hybrids in the same document order their halves differently. That is a fact
+// about the registry rather than a principle, and it is exactly the sort of thing a
+// reader assumes is consistent. Only X25519MLKEM768 is implemented here; the order was
+// taken from the draft and then confirmed against a real ClientHello from OpenSSL 3.5.7,
+// which offers a 1216-byte share for this group.
+//
+//   client share   ML-KEM encapsulation key (1184) ++ X25519 public key (32)  = 1216
+//   server share   ML-KEM ciphertext (1088)        ++ X25519 public key (32)  = 1120
+//   shared secret  ML-KEM shared secret (32)       ++ X25519 shared secret (32) = 64
+//
+// The 64-byte secret goes into the key schedule exactly where a 32-byte one would: it is
+// the IKM of the handshake-secret extract, and HKDF does not care how long it is.
+
+import { mlkemKeyGen, mlkemEncaps, mlkemDecaps } from "../../crypto/src/mlkem.wac";
+import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
+
+/** The TLS named group code point. */
+export i32 groupX25519MlKem768() { return 0x11EC; }
+
+export i32 hybridClientShareLen() { return 1184 + 32; }
+export i32 hybridServerShareLen() { return 1088 + 32; }
+export i32 hybridSecretLen() { return 64; }
+
+/**
+ * A client's offer, from a 64-byte ML-KEM seed and a 32-byte X25519 scalar.
+ *
+ * Returns the 1216-byte share followed by the 2400-byte ML-KEM decapsulation key, which
+ * the caller must keep to finish the exchange. Keeping it in the returned bytes rather
+ * than deriving it again later is deliberate: regenerating from the seed would work and
+ * would mean the seed had to be held anyway, which is a longer-lived secret than the
+ * decapsulation key it produces.
+ */
+export u8[] hybridClientOffer(u8[] kemSeed, u8[] xPriv) {
+  if (kemSeed.len() != 64) { trap; }
+  if (xPriv.len() != 32) { trap; }
+  u8[] kem = mlkemKeyGen(kemSeed);          // ek ++ dk
+  u8[] xPub = x25519Base(xPriv);
+
+  u8[] out = u8[1216 + 2400]();
+  for (i32 i = 0; i < 1184; i++) { out[i] = kem[i]; }
+  for (i32 i = 0; i < 32; i++) { out[1184 + i] = xPub[i]; }
+  for (i32 i = 0; i < 2400; i++) { out[1216 + i] = kem[1184 + i]; }
+  return out;
+}
+
+/**
+ * The server's half: encapsulate to the client's key and do the X25519 exchange.
+ *
+ * Returns the 1120-byte share followed by the 64-byte shared secret. `m` is the ML-KEM
+ * randomness, a parameter for the same reason ECDSA's k and ML-KEM's own m are.
+ */
+export u8[] hybridServerAccept(u8[] clientShare, u8[] m, u8[] xPriv) {
+  if (clientShare.len() != 1216) { trap; }
+  if (m.len() != 32) { trap; }
+  if (xPriv.len() != 32) { trap; }
+
+  u8[] ek = u8[1184]();
+  for (i32 i = 0; i < 1184; i++) { ek[i] = clientShare[i]; }
+  u8[] xPeer = u8[32]();
+  for (i32 i = 0; i < 32; i++) { xPeer[i] = clientShare[1184 + i]; }
+
+  // mlkemEncaps validates the encapsulation key's coefficients, which is the check
+  // FIPS 203 requires of a peer's key and the only defence against one chosen to put
+  // the arithmetic outside the ring.
+  u8[] enc = mlkemEncaps(ek, m);            // shared ++ ciphertext
+  u8[] xShared = x25519(xPriv, xPeer);
+  u8[] xPub = x25519Base(xPriv);
+
+  u8[] out = u8[1120 + 64]();
+  for (i32 i = 0; i < 1088; i++) { out[i] = enc[32 + i]; }
+  for (i32 i = 0; i < 32; i++) { out[1088 + i] = xPub[i]; }
+  for (i32 i = 0; i < 32; i++) { out[1120 + i] = enc[i]; }
+  for (i32 i = 0; i < 32; i++) { out[1152 + i] = xShared[i]; }
+  return out;
+}
+
+/**
+ * The client's finish: decapsulate and complete the X25519 exchange.
+ *
+ * Returns the 64-byte shared secret. Note there is no failure path for the ML-KEM half —
+ * decapsulation of a bad ciphertext yields a different secret rather than an error, so a
+ * tampered share shows up as a Finished that does not verify. That is the intended
+ * behaviour and not a shortcut: a KEM that reported "invalid ciphertext" would give an
+ * attacker a decryption oracle.
+ */
+export u8[] hybridClientFinish(u8[] offerAndDk, u8[] serverShare, u8[] xPriv) {
+  if (offerAndDk.len() != 1216 + 2400) { trap; }
+  if (serverShare.len() != 1120) { trap; }
+  if (xPriv.len() != 32) { trap; }
+
+  u8[] dk = u8[2400]();
+  for (i32 i = 0; i < 2400; i++) { dk[i] = offerAndDk[1216 + i]; }
+  u8[] ct = u8[1088]();
+  for (i32 i = 0; i < 1088; i++) { ct[i] = serverShare[i]; }
+  u8[] xPeer = u8[32]();
+  for (i32 i = 0; i < 32; i++) { xPeer[i] = serverShare[1088 + i]; }
+
+  u8[] kemShared = mlkemDecaps(dk, ct);
+  u8[] xShared = x25519(xPriv, xPeer);
+
+  u8[] out = u8[64]();
+  for (i32 i = 0; i < 32; i++) { out[i] = kemShared[i]; }
+  for (i32 i = 0; i < 32; i++) { out[32 + i] = xShared[i]; }
+  return out;
+}

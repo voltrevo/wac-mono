@@ -16,6 +16,7 @@ A package of [wac-mono](../../README.md). All commands run from the repo root.
 | `src/asn1.wac` | a DER reader, bounds-checked and strict about what DER forbids |
 | `src/x509.wac` | certificate parsing, chain and host-name verification |
 | `src/client.wac` | the client state machine |
+| `src/hybrid.wac` | X25519MLKEM768, the post-quantum hybrid key agreement |
 | `host/serve.ts` | the socket and the randomness, which wasm does not have |
 | `host/connect.ts` | the same, for the client |
 
@@ -49,9 +50,19 @@ malformed.
 
 ## What works
 
-Both ends. TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256; X25519 **and
-secp256r1** key exchange, the latter being what RFC 8446 §9.1 makes mandatory; and
-Ed25519, **ECDSA-P256 and RSA** certificates. Full 1-RTT handshake, application data both ways, alerts,
+Both ends. TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256; **X25519MLKEM768**,
+X25519 and secp256r1 key exchange; and Ed25519, ECDSA-P256 and RSA certificates.
+
+X25519MLKEM768 is the post-quantum hybrid from
+[draft-ietf-tls-ecdhe-mlkem](https://datatracker.ietf.org/doc/html/draft-ietf-tls-ecdhe-mlkem),
+offered first by the client and preferred by the server. Both ends negotiate it with
+OpenSSL 3.5.7 configured to accept nothing else, which is in the suite.
+
+The concatenation order is the part worth knowing: X25519MLKEM768 puts ML-KEM first and
+SecP256r1MLKEM768 puts the ECDHE half first. Two hybrids in one document, ordered
+differently — a fact about the registry rather than a principle, and precisely the sort
+of thing a reader assumes is consistent. It was taken from the draft and then confirmed
+against a real ClientHello, which offers 1216 bytes for this group. Full 1-RTT handshake, application data both ways, alerts,
 close_notify, KeyUpdate, and the compatibility fields — the legacy version, the echoed
 session id, the meaningless ChangeCipherSpec — that middleboxes need to see.
 

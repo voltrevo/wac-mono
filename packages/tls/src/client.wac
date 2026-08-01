@@ -23,6 +23,7 @@
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
 import { p256Ecdh, p256PublicKey } from "../../crypto/src/p256.wac";
+import { hybridClientOffer, hybridClientFinish } from "./hybrid.wac";
 import { ed25519Verify } from "../../crypto/src/ed25519.wac";
 import {
   deriveSecret, earlySecret, finishedVerify, handshakeSecret, hashLen, masterSecret,
@@ -53,8 +54,12 @@ struct CConn {
   u8[] serverAppSecret;
   u8[] transcript;
   u8[] ephemeralPriv;
-  /** A second ephemeral key, because two key shares are offered. */
+  /** A second ephemeral key, because several key shares are offered. */
   u8[] p256Priv;
+  /** The 64-byte ML-KEM seed for the hybrid group. */
+  u8[] kemSeed;
+  /** The hybrid offer and its decapsulation key, held until the ServerHello. */
+  u8[] hybridState;
   /** The group the server chose: 0x001d or 0x0017. */
   i32 group;
   u8[] clientRandom;
@@ -83,6 +88,9 @@ u8[] encodeConn(CConn c) {
   w.bytes(c.transcript);
   w.vec8(c.ephemeralPriv);
   w.vec8(c.p256Priv);
+  w.vec8(c.kemSeed);
+  w.u32(c.hybridState.len());
+  w.bytes(c.hybridState);
   w.u16(c.group);
   w.vec8(c.clientRandom);
   w.vec16(c.host);
@@ -111,6 +119,8 @@ CConn decodeConn(u8[] state) {
   u8[] transcript = r.take(r.u32());
   u8[] eph = r.vec8();
   u8[] p256 = r.vec8();
+  u8[] kemSeed = r.vec8();
+  u8[] hybridState = r.take(r.u32());
   i32 group = r.u16();
   u8[] rnd = r.vec8();
   u8[] host = r.vec16();
@@ -118,7 +128,7 @@ CConn decodeConn(u8[] state) {
   u8[] cert = r.take(r.u32());
   r.expectEnd();
   return CConn(phase, suite, seqIn, seqOut, cs, ss, cas, sas, transcript, eph, p256,
-               group, rnd, host, root, now, cert, failure);
+               kemSeed, hybridState, group, rnd, host, root, now, cert, failure);
 }
 
 void addTranscript(CConn c, u8[] msg) {
@@ -186,6 +196,7 @@ u8[] clientHello(CConn c) {
   exts.u16(10);
   Writer groups = Writer.create();
   Writer groupList = Writer.create();
+  groupList.u16(0x11EC);          // X25519MLKEM768, first because it is preferred
   groupList.u16(0x001d);          // x25519
   groupList.u16(0x0017);          // secp256r1
   groups.vec16(groupList.take());
@@ -218,6 +229,13 @@ u8[] clientHello(CConn c) {
   exts.u16(51);
   Writer ks = Writer.create();
   Writer share = Writer.create();
+  // The hybrid share is 1216 bytes on its own, which makes this hello span two records
+  // for most servers. That is the cost of not needing a HelloRetryRequest, and it is
+  // what every deployed client does.
+  u8[] hybridShare = u8[1216]();
+  for (i32 i = 0; i < 1216; i++) { hybridShare[i] = c.hybridState[i]; }
+  share.u16(0x11EC);
+  share.vec16(hybridShare);
   share.u16(0x001d);
   share.vec16(x25519Base(c.ephemeralPriv));
   share.u16(0x0017);
@@ -252,7 +270,11 @@ u8[] serverShare(u8[] shBody) {
       if (kind == 51) {
         i32 g = body.u16();
         u8[] key = body.vec16();
-        if (g == 0x001d && key.len() == 32) {
+        if (g == 0x11EC && key.len() == 1120) {
+          share = u8[1122]();
+          share[0] = 0x11; share[1] = 0xEC;
+          for (i32 i = 0; i < 1120; i++) { share[2 + i] = key[i]; }
+        } else if (g == 0x001d && key.len() == 32) {
           share = u8[34]();
           share[0] = 0x00; share[1] = 0x1d;
           for (i32 i = 0; i < 32; i++) { share[2 + i] = key[i]; }
@@ -311,12 +333,18 @@ u8[] fail(CConn c, i32 code, i32 alert, Writer out, Writer appData) {
  * otherwise is why this takes a root rather than a flag to skip verification.
  */
 export u8[] tlsClientInit(u8[] host, u8[] rootDer, u8[] ephemeralPriv, u8[] p256Priv,
-                          u8[] clientRandom, i64 now) {
+                          u8[] kemSeed, u8[] clientRandom, i64 now) {
   if (ephemeralPriv.len() != 32) { trap; }
   if (p256Priv.len() != 32) { trap; }
+  if (kemSeed.len() != 64) { trap; }
   if (clientRandom.len() != 32) { trap; }
   CConn c = CConn(0, suiteAes128Gcm(), 0, 0, u8[0](), u8[0](), u8[0](), u8[0](), u8[0](),
-                  ephemeralPriv, p256Priv, 0, clientRandom, host, rootDer, now, u8[0](), 0);
+                  ephemeralPriv, p256Priv, kemSeed, u8[0](), 0, clientRandom, host,
+                  rootDer, now, u8[0](), 0);
+  // The hybrid offer is built once and kept: it carries the ML-KEM decapsulation key,
+  // which the ServerHello will need and which regenerating would mean holding the seed
+  // for longer than the key it produces.
+  c.hybridState = hybridClientOffer(kemSeed, ephemeralPriv);
   u8[] ch = clientHello(c);
   addTranscript(c, ch);
   c.phase = 1;
@@ -375,7 +403,11 @@ export u8[] tlsClientFeed(u8[] state, u8[] input) {
 
       addTranscript(c, msg);
       u8[] shared = u8[0]();
-      if (group == 0x001d) {
+      if (group == 0x11EC) {
+        // 64 bytes rather than 32, and the key schedule takes it unchanged: it is the
+        // IKM of an HKDF extract, which has no opinion about length.
+        shared = hybridClientFinish(c.hybridState, peerKey, c.ephemeralPriv);
+      } else if (group == 0x001d) {
         shared = x25519(c.ephemeralPriv, peerKey);
       } else {
         // p256Ecdh validates the peer's point, which is the defence against an

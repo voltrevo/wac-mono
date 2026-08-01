@@ -6,7 +6,8 @@ import { wacBind } from "../../../harness/wacBind.ts";
 
 const mod = await wacBind("packages/tls/test/wac/probe.wac");
 const init = mod.cliInit as (
-  h: Uint8Array, root: Uint8Array, e: Uint8Array, p256: Uint8Array, r: Uint8Array, now: bigint,
+  h: Uint8Array, root: Uint8Array, e: Uint8Array, p256: Uint8Array, kemSeed: Uint8Array,
+  r: Uint8Array, now: bigint,
 ) => Uint8Array;
 const feedRaw = mod.cliFeed as (state: Uint8Array, input: Uint8Array) => Uint8Array;
 const sendRaw = mod.cliSend as (state: Uint8Array, data: Uint8Array) => Uint8Array;
@@ -68,6 +69,7 @@ export async function request(
       enc.encode(serverName), rootDer,
       crypto.getRandomValues(new Uint8Array(32)),
       p256Scalar(),
+      crypto.getRandomValues(new Uint8Array(64)),   // the ML-KEM seed, d || z
       crypto.getRandomValues(new Uint8Array(32)),
       BigInt(Math.floor(Date.now() / 1000)),
     ));
