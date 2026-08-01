@@ -1,0 +1,379 @@
+// A TLS 1.3 server handshake, RFC 8446 §4.
+//
+// Shaped like `packages/server`'s HTTP handler and for the same reason: everything wac
+// cannot do lives in the host, and what is left is a pure function from bytes to bytes.
+// The host owns the socket and the randomness — wasm has neither — and every decision
+// about what those bytes mean is made here.
+//
+// ## The state is a byte string
+//
+// bindgen cannot marshal a struct across the boundary, so a connection cannot be a
+// handle the host holds. The state is serialised instead, and `feed` takes the old state
+// and returns the new one alongside whatever should go on the wire. That is a constraint
+// rather than a design, but it has one real virtue: a connection's entire state is a
+// byte string that a test can inspect, corrupt, or replay.
+//
+// The transcript is kept as bytes rather than as a running hash, because `sha256` here
+// is one-shot. A handshake transcript is a few kilobytes, so this costs memory rather
+// than correctness — but it does mean a peer that sends an enormous handshake makes us
+// hold it, which is why `feed` caps the transcript.
+//
+// ## The flow
+//
+//   client                                        server
+//   ClientHello              -------->
+//                            <--------  ServerHello           (plaintext)
+//                                       {EncryptedExtensions}
+//                                       {Certificate}
+//                                       {CertificateVerify}
+//                                       {Finished}
+//   {Finished}               -------->
+//   [Application Data]       <------->  [Application Data]
+//
+// {} is encrypted under the handshake traffic keys, [] under the application ones.
+
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
+import { ed25519Sign } from "../../crypto/src/ed25519.wac";
+import {
+  deriveSecret, earlySecret, finishedVerify, handshakeSecret, hashLen, masterSecret,
+  trafficKeyIv,
+} from "./keyschedule.wac";
+import {
+  recordSeal, recordOpen, recordType, recordContent, suiteAes128Gcm, suiteKeyLen,
+  typeHandshake, typeApplicationData, typeAlert, typeChangeCipherSpec, maxPlaintext,
+} from "./record.wac";
+import {
+  certificate, certificateVerify, certificateVerifyContent, encryptedExtensions,
+  finished, messageBody, messageLength, messageType, parseClientHello, serverHello,
+  ClientHello,
+} from "./handshake.wac";
+import { Reader, Writer } from "./wire.wac";
+
+// Connection phases.
+export i32 phaseStart() { return 0; }
+export i32 phaseWaitFinished() { return 1; }
+export i32 phaseEstablished() { return 2; }
+export i32 phaseFailed() { return 3; }
+
+/** The largest handshake transcript we will accumulate before giving up. */
+i32 maxTranscript() { return 65536; }
+
+/** A connection, as it is held between calls. */
+struct Conn {
+  i32 phase;
+  i32 suite;
+  i64 seqIn;
+  i64 seqOut;
+  u8[] clientSecret;      // current read secret: handshake, then application
+  u8[] serverSecret;      // current write secret
+  // Derived at the server's Finished and held until the client's arrives, because the
+  // client keeps writing under handshake keys until then.
+  u8[] clientAppSecret;
+  u8[] serverAppSecret;
+  u8[] transcript;
+  u8[] certDer;
+  u8[] seed;
+  u8[] ephemeralPriv;
+  u8[] serverRandom;
+}
+
+/**
+ * Serialise a connection.
+ *
+ * Fixed-width fields first so the parse needs no lookahead, then the four variable ones
+ * behind 32-bit lengths. Nothing here is secret from the host — it holds the keys either
+ * way — so this is a plain encoding rather than a sealed one.
+ */
+u8[] encodeConn(Conn c) {
+  Writer w = Writer.create();
+  w.u8(c.phase);
+  w.u16(c.suite);
+  for (i32 i = 0; i < 8; i++) { w.u8(((c.seqIn >> (((7 - i) * 8) as i64)) & 255) as! i32); }
+  for (i32 i = 0; i < 8; i++) { w.u8(((c.seqOut >> (((7 - i) * 8) as i64)) & 255) as! i32); }
+  w.vec8(c.clientSecret);
+  w.vec8(c.serverSecret);
+  w.vec8(c.clientAppSecret);
+  w.vec8(c.serverAppSecret);
+  w.u32(c.transcript.len());
+  w.bytes(c.transcript);
+  w.u32(c.certDer.len());
+  w.bytes(c.certDer);
+  w.vec8(c.seed);
+  w.vec8(c.ephemeralPriv);
+  w.vec8(c.serverRandom);
+  return w.take();
+}
+
+Conn decodeConn(u8[] state) {
+  Reader r = Reader.create(state);
+  i32 phase = r.u8();
+  i32 suite = r.u16();
+  i64 seqIn = 0;
+  for (i32 i = 0; i < 8; i++) { seqIn = (seqIn << 8) | (r.u8() as i64); }
+  i64 seqOut = 0;
+  for (i32 i = 0; i < 8; i++) { seqOut = (seqOut << 8) | (r.u8() as i64); }
+  u8[] clientSecret = r.vec8();
+  u8[] serverSecret = r.vec8();
+  u8[] clientApp = r.vec8();
+  u8[] serverApp = r.vec8();
+  u8[] transcript = r.take(r.u32());
+  u8[] certDer = r.take(r.u32());
+  u8[] seed = r.vec8();
+  u8[] eph = r.vec8();
+  u8[] rnd = r.vec8();
+  r.expectEnd();
+  return Conn(phase, suite, seqIn, seqOut, clientSecret, serverSecret, clientApp,
+              serverApp, transcript, certDer, seed, eph, rnd);
+}
+
+/**
+ * A new connection.
+ *
+ * The host supplies the ephemeral private key and the server random, because wac has no
+ * randomness and inventing some here would be worse than not having it. Passing them in
+ * also makes a handshake reproducible, which is what lets a test compare against a
+ * recorded trace.
+ */
+export u8[] tlsServerInit(u8[] certDer, u8[] seed, u8[] ephemeralPriv, u8[] serverRandom) {
+  if (seed.len() != 32) { trap; }
+  if (ephemeralPriv.len() != 32) { trap; }
+  if (serverRandom.len() != 32) { trap; }
+  return encodeConn(Conn(0, suiteAes128Gcm(), 0, 0, u8[0](), u8[0](), u8[0](), u8[0](),
+                         u8[0](), certDer, seed, ephemeralPriv, serverRandom));
+}
+
+void addTranscript(Conn c, u8[] msg) {
+  if (c.transcript.len() + msg.len() > maxTranscript()) { trap; }
+  u8[] t = u8[c.transcript.len() + msg.len()]();
+  for (i32 i = 0; i < c.transcript.len(); i++) { t[i] = c.transcript[i]; }
+  for (i32 i = 0; i < msg.len(); i++) { t[c.transcript.len() + i] = msg[i]; }
+  c.transcript = t;
+}
+
+/** Seal a handshake message under the current write secret and append it to `out`. */
+void sealInto(Writer out, Conn c, i32 contentType, u8[] content) {
+  i32 keyLen = suiteKeyLen(c.suite);
+  u8[] ki = trafficKeyIv(c.serverSecret, keyLen);
+  u8[] key = u8[keyLen]();
+  u8[] iv = u8[12]();
+  for (i32 i = 0; i < keyLen; i++) { key[i] = ki[i]; }
+  for (i32 i = 0; i < 12; i++) { iv[i] = ki[keyLen + i]; }
+  out.bytes(recordSeal(c.suite, key, iv, c.seqOut, contentType, content, 0));
+  c.seqOut += 1;
+}
+
+/** Open a record under the current read secret. */
+u8[] openWith(Conn c, u8[] record) {
+  i32 keyLen = suiteKeyLen(c.suite);
+  u8[] ki = trafficKeyIv(c.clientSecret, keyLen);
+  u8[] key = u8[keyLen]();
+  u8[] iv = u8[12]();
+  for (i32 i = 0; i < keyLen; i++) { key[i] = ki[i]; }
+  for (i32 i = 0; i < 12; i++) { iv[i] = ki[keyLen + i]; }
+  u8[] inner = recordOpen(c.suite, key, iv, c.seqIn, record);
+  c.seqIn += 1;
+  return inner;
+}
+
+/**
+ * The whole server flight, in response to a ClientHello.
+ *
+ * ServerHello goes out in the clear because the keys it establishes do not exist until
+ * the client has read it. Everything after is encrypted under the handshake traffic
+ * keys, which is TLS 1.3's headline change: the certificate is no longer visible to an
+ * observer.
+ */
+u8[] serverFlight(Conn c, u8[] clientHelloMsg) {
+  ClientHello ch = parseClientHello(messageBody(clientHelloMsg), c.suite);
+  if (!ch.offersTls13) { trap; }
+  if (ch.suite != c.suite) { trap; }
+  if (ch.keyShare.len() != 32) { trap; }
+  if (!ch.offersEd25519) { trap; }
+
+  addTranscript(c, clientHelloMsg);
+
+  u8[] ourShare = x25519Base(c.ephemeralPriv);
+  u8[] sh = serverHello(c.serverRandom, ch.sessionId, c.suite, ourShare);
+  addTranscript(c, sh);
+
+  // The key schedule, up to the handshake traffic secrets. The transcript at this point
+  // is exactly ClientHello ++ ServerHello, which is what "CH..SH" means in RFC 8446 §7.1
+  // — one message too many or too few here yields keys that are wrong and look fine.
+  u8[] shared = x25519(c.ephemeralPriv, ch.keyShare);
+  u8[] early = earlySecret(u8[hashLen()]());
+  u8[] hs = handshakeSecret(early, shared);
+  u8[] thSh = sha256(c.transcript);
+  u8[] clientHs = deriveSecret(hs, "c hs traffic".toBytes(), thSh);
+  u8[] serverHs = deriveSecret(hs, "s hs traffic".toBytes(), thSh);
+
+  Writer out = Writer.create();
+  // ServerHello, in the clear.
+  Writer plainRec = Writer.create();
+  plainRec.u8(typeHandshake());
+  plainRec.u16(0x0303);
+  plainRec.vec16(sh);
+  out.bytes(plainRec.take());
+
+  // A ChangeCipherSpec that means nothing, sent because middleboxes expect one after a
+  // ServerHello and drop connections that skip it. RFC 8446 appendix D.4.
+  out.bytes(u8[](20, 3, 3, 0, 1, 1));
+
+  c.serverSecret = serverHs;
+  c.seqOut = 0;
+
+  u8[] ee = encryptedExtensions();
+  addTranscript(c, ee);
+  sealInto(out, c, typeHandshake(), ee);
+
+  u8[] cert = certificate(c.certDer);
+  addTranscript(c, cert);
+  sealInto(out, c, typeHandshake(), cert);
+
+  // CertificateVerify signs the transcript so far, which now includes the certificate —
+  // so the signature covers the key exchange, the identity, and everything either side
+  // has said. That is what binds this certificate to this connection.
+  u8[] toSign = certificateVerifyContent(sha256(c.transcript), true);
+  u8[] cv = certificateVerify(ed25519Sign(c.seed, toSign));
+  addTranscript(c, cv);
+  sealInto(out, c, typeHandshake(), cv);
+
+  u8[] fin = finished(finishedVerify(serverHs, sha256(c.transcript)));
+  addTranscript(c, fin);
+  sealInto(out, c, typeHandshake(), fin);
+
+  // The application secrets come from the transcript *through the server's Finished*,
+  // so they can be derived now even though the client has not answered yet. They are
+  // held rather than installed: the client is still writing under handshake keys, and
+  // switching the read side early would reject its Finished.
+  u8[] master = masterSecret(hs);
+  u8[] thSf = sha256(c.transcript);
+  c.clientAppSecret = deriveSecret(master, "c ap traffic".toBytes(), thSf);
+  c.serverAppSecret = deriveSecret(master, "s ap traffic".toBytes(), thSf);
+
+  c.clientSecret = clientHs;
+  c.seqIn = 0;
+  c.phase = 1;
+  return out.take();
+}
+
+/** What `tlsServerFeed` returns: new state, then bytes to send, then plaintext received. */
+u8[] result(Conn c, u8[] toSend, u8[] appData) {
+  u8[] state = encodeConn(c);
+  Writer w = Writer.create();
+  w.u32(state.len());
+  w.bytes(state);
+  w.u32(toSend.len());
+  w.bytes(toSend);
+  w.u32(appData.len());
+  w.bytes(appData);
+  return w.take();
+}
+
+/**
+ * Feed the connection whatever has arrived, and get back what to send.
+ *
+ * The return is `[stateLen][state][toSendLen][toSend][appDataLen][appData]`, and the
+ * caller must use the new state for the next call. `input` is whole records only — the
+ * host buffers until `tlsRecordNeeded` says a complete one is present, the same
+ * discipline `packages/server` uses for HTTP requests.
+ *
+ * Application data to *send* goes through `tlsServerSend` rather than here, because a
+ * response is produced by the layer above rather than in reply to a record.
+ */
+export u8[] tlsServerFeed(u8[] state, u8[] input) {
+  Conn c = decodeConn(state);
+  Writer toSend = Writer.create();
+  Writer appData = Writer.create();
+
+  i32 pos = 0;
+  while (pos < input.len()) {
+    if (input.len() - pos < 5) { trap; }
+    i32 recLen = (input[pos + 3] << 8) | input[pos + 4];
+    if (pos + 5 + recLen > input.len()) { trap; }
+    i32 outerType = input[pos];
+    u8[] record = u8[5 + recLen]();
+    for (i32 i = 0; i < 5 + recLen; i++) { record[i] = input[pos + i]; }
+    pos += 5 + recLen;
+
+    // A ChangeCipherSpec after the ClientHello is compatibility noise and must be
+    // ignored without disturbing the sequence numbers — it is not an encrypted record,
+    // so counting it would desynchronise every record after it.
+    if (outerType == typeChangeCipherSpec()) { continue; }
+
+    if (c.phase == 0) {
+      if (outerType != typeHandshake()) { trap; }
+      u8[] body = u8[recLen]();
+      for (i32 i = 0; i < recLen; i++) { body[i] = record[5 + i]; }
+      if (messageLength(body) != body.len()) { trap; }
+      if (messageType(body) != 1) { trap; }
+      toSend.bytes(serverFlight(c, body));
+    } else if (c.phase == 1) {
+      u8[] inner = openWith(c, record);
+      if (recordType(inner) != typeHandshake()) { trap; }
+      u8[] msg = recordContent(inner);
+      if (messageType(msg) != 20) { trap; }
+      // verify_data covers the transcript up to but not including this message.
+      u8[] want = finishedVerify(c.clientSecret, sha256(c.transcript));
+      u8[] got = messageBody(msg);
+      if (got.len() != want.len()) { trap; }
+      i32 diff = 0;
+      for (i32 i = 0; i < want.len(); i++) { diff = diff | (got[i] ^ want[i]); }
+      if (diff != 0) { trap; }
+
+      addTranscript(c, msg);
+      // Both directions switch to application keys, each counting from zero again.
+      c.clientSecret = c.clientAppSecret;
+      c.serverSecret = c.serverAppSecret;
+      c.seqIn = 0;
+      c.seqOut = 0;
+      c.phase = 2;
+    } else if (c.phase == 2) {
+      u8[] inner = openWith(c, record);
+      i32 t = recordType(inner);
+      if (t == typeApplicationData()) {
+        appData.bytes(recordContent(inner));
+      } else if (t == typeAlert()) {
+        c.phase = 3;
+      }
+      // A post-handshake handshake message — a session ticket or a KeyUpdate — is
+      // ignored rather than rejected. Neither is implemented, and neither is required.
+    } else {
+      trap;
+    }
+  }
+
+  return result(c, toSend.take(), appData.take());
+}
+
+/** Seal application data for sending. Returns `[stateLen][state][recordLen][record][0]`. */
+export u8[] tlsServerSend(u8[] state, u8[] data) {
+  Conn c = decodeConn(state);
+  if (c.phase != 2) { trap; }
+  Writer out = Writer.create();
+  i32 pos = 0;
+  // Split at the record size limit rather than trusting the caller to.
+  while (pos < data.len() || pos == 0) {
+    i32 n = data.len() - pos;
+    if (n > maxPlaintext()) { n = maxPlaintext(); }
+    u8[] chunk = u8[n]();
+    for (i32 i = 0; i < n; i++) { chunk[i] = data[pos + i]; }
+    sealInto(out, c, typeApplicationData(), chunk);
+    pos += n;
+    if (n == 0) { pos = data.len() + 1; }
+  }
+  return result(c, out.take(), u8[0]());
+}
+
+/** The connection's phase, without decoding the whole state. */
+export i32 tlsPhase(u8[] state) { return state[0]; }
+
+/**
+ * How many more bytes the host must read before a whole record is present, or 0 if one
+ * already is.
+ */
+export i32 tlsRecordNeeded(u8[] buf) {
+  if (buf.len() < 5) { return 5 - buf.len(); }
+  i32 want = 5 + ((buf[3] << 8) | buf[4]);
+  return buf.len() >= want ? 0 : want - buf.len();
+}

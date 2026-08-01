@@ -1,0 +1,187 @@
+// The TLS 1.3 record layer, RFC 8446 §5.
+//
+// A record is a five-byte header and an AEAD-sealed payload. Three details carry the
+// security of the whole thing and all three are easy to get subtly wrong:
+//
+// **The content type moves inside.** TLS 1.3 encrypts it. Every record on the wire says
+// `application_data` in its header whatever it really carries, and the true type is the
+// last non-zero byte of the decrypted plaintext. An implementation that trusts the outer
+// type is not doing TLS 1.3, it is doing TLS 1.2 with new key derivation.
+//
+// **The nonce is the IV xor the sequence number**, not a nonce sent alongside the
+// record. Nothing on the wire says which record this is, so both ends count
+// independently and a desynchronised counter is indistinguishable from forgery — which
+// is the intent: a dropped or reordered record must not decrypt.
+//
+// **The header is the AAD.** Including it is what stops an attacker rewriting the length
+// field, and the length covers the sealed payload including the tag, so it has to be
+// computed before sealing rather than after.
+//
+// Both TLS 1.3 AEADs are here. They differ only in key length and which function to
+// call; the framing is identical, which is the point of TLS 1.3 having exactly one
+// record format.
+
+import { gcmEncrypt, gcmTag, gcmDecrypt } from "../../crypto/src/aesgcm.wac";
+import { aeadEncrypt, aeadTag, aeadDecrypt } from "../../crypto/src/aead.wac";
+
+/** TLS_AES_128_GCM_SHA256. */
+export i32 suiteAes128Gcm() { return 0x1301; }
+/** TLS_CHACHA20_POLY1305_SHA256. */
+export i32 suiteChaCha20() { return 0x1303; }
+
+/** The AEAD key length for a suite, in bytes. */
+export i32 suiteKeyLen(i32 suite) {
+  if (suite == 0x1301) { return 16; }
+  if (suite == 0x1303) { return 32; }
+  trap;
+}
+
+// Record content types, RFC 8446 §5.1.
+export i32 typeChangeCipherSpec() { return 20; }
+export i32 typeAlert() { return 21; }
+export i32 typeHandshake() { return 22; }
+export i32 typeApplicationData() { return 23; }
+
+/** The largest plaintext a single record may carry, RFC 8446 §5.1. */
+export i32 maxPlaintext() { return 16384; }
+
+/**
+ * The per-record nonce: the static IV xored with the sequence number.
+ *
+ * The counter is right-aligned in the twelve-byte IV, so the first record's nonce is the
+ * IV itself and only the low eight bytes ever change. Left-aligning it instead produces
+ * a nonce that is wrong for every record after the first — including the first, which
+ * still works, so the mistake survives any test that seals one record.
+ */
+u8[] recordNonce(u8[] iv, i64 seq) {
+  u8[] nonce = u8[12]();
+  for (i32 i = 0; i < 12; i++) { nonce[i] = iv[i]; }
+  for (i32 i = 0; i < 8; i++) {
+    i32 shift = (7 - i) * 8;
+    nonce[4 + i] = nonce[4 + i] ^ (((seq >> (shift as i64)) & 255) as! i32);
+  }
+  return nonce;
+}
+
+/** The five-byte header, which is also the AEAD's additional data. */
+u8[] header(i32 sealedLen) {
+  u8[] h = u8[5]();
+  h[0] = 23;          // always application_data on the wire
+  h[1] = 3; h[2] = 3; // legacy_record_version, frozen at TLS 1.2 for middleboxes
+  h[3] = (sealedLen >> 8) & 0xFF;
+  h[4] = sealedLen & 0xFF;
+  return h;
+}
+
+/**
+ * Seal one record: header ++ AEAD(content ++ contentType ++ padding).
+ *
+ * `padLen` zero bytes are appended after the content type, which hides the true length
+ * from an observer. Padding is optional in TLS 1.3 and this leaves the choice to the
+ * caller, because how much to pad is a policy question about the traffic rather than
+ * something the record layer can answer.
+ */
+export u8[] recordSeal(i32 suite, u8[] key, u8[] iv, i64 seq, i32 contentType,
+                       u8[] content, i32 padLen) {
+  if (content.len() > maxPlaintext()) { trap; }
+  if (padLen < 0) { trap; }
+
+  u8[] inner = u8[content.len() + 1 + padLen]();
+  for (i32 i = 0; i < content.len(); i++) { inner[i] = content[i]; }
+  inner[content.len()] = contentType;
+  // The padding is already zero.
+
+  // The length in the header covers the ciphertext and the sixteen-byte tag, so the
+  // header has to be built before sealing — it is the AAD.
+  u8[] hdr = header(inner.len() + 16);
+  u8[] nonce = recordNonce(iv, seq);
+
+  u8[] ct = u8[0]();
+  u8[] tag = u8[0]();
+  if (suite == 0x1301) {
+    ct = gcmEncrypt(key, nonce, inner);
+    tag = gcmTag(key, nonce, hdr, ct);
+  } else if (suite == 0x1303) {
+    ct = aeadEncrypt(key, nonce, inner);
+    tag = aeadTag(key, nonce, hdr, ct);
+  } else {
+    trap;
+  }
+
+  u8[] out = u8[5 + ct.len() + 16]();
+  for (i32 i = 0; i < 5; i++) { out[i] = hdr[i]; }
+  for (i32 i = 0; i < ct.len(); i++) { out[5 + i] = ct[i]; }
+  for (i32 i = 0; i < 16; i++) { out[5 + ct.len() + i] = tag[i]; }
+  return out;
+}
+
+/**
+ * The length a record claims, from its first five bytes, or -1 if there are not five.
+ *
+ * Separate from opening because a reader needs to know how many bytes to wait for before
+ * it has a record to open at all.
+ */
+export i32 recordLength(u8[] buf) {
+  if (buf.len() < 5) { return -1; }
+  return (buf[3] << 8) | buf[4];
+}
+
+/**
+ * Open one record, returning the inner plaintext with the content type as its last byte.
+ *
+ * Traps if the tag does not verify, if the framing is wrong, or if the plaintext is all
+ * zeros — that last one being a record with padding and no content type, which RFC 8446
+ * §5.4 says to treat as `unexpected_message` rather than as an empty anything.
+ *
+ * The caller gets content type and content together because separating them would mean
+ * either two return values or two passes; `recordType` and `recordContent` below split
+ * the result.
+ */
+export u8[] recordOpen(i32 suite, u8[] key, u8[] iv, i64 seq, u8[] record) {
+  if (record.len() < 5 + 16) { trap; }
+  i32 sealedLen = (record[3] << 8) | record[4];
+  if (5 + sealedLen != record.len()) { trap; }
+  if (sealedLen < 16) { trap; }
+  // A sealed payload longer than the plaintext limit plus its own overhead cannot be
+  // legitimate, and admitting one is how a peer makes us allocate on demand.
+  if (sealedLen > maxPlaintext() + 256) { trap; }
+
+  u8[] hdr = u8[5]();
+  for (i32 i = 0; i < 5; i++) { hdr[i] = record[i]; }
+  i32 ctLen = sealedLen - 16;
+  u8[] ct = u8[ctLen]();
+  for (i32 i = 0; i < ctLen; i++) { ct[i] = record[5 + i]; }
+  u8[] tag = u8[16]();
+  for (i32 i = 0; i < 16; i++) { tag[i] = record[5 + ctLen + i]; }
+
+  u8[] nonce = recordNonce(iv, seq);
+  u8[] inner = u8[0]();
+  if (suite == 0x1301) {
+    inner = gcmDecrypt(key, nonce, hdr, ct, tag);
+  } else if (suite == 0x1303) {
+    inner = aeadDecrypt(key, nonce, hdr, ct, tag);
+  } else {
+    trap;
+  }
+  return inner;
+}
+
+/** The real content type: the last non-zero byte of an opened record. */
+export i32 recordType(u8[] inner) {
+  for (i32 i = inner.len() - 1; i >= 0; i--) {
+    if (inner[i] != 0) { return inner[i]; }
+  }
+  trap;   // all padding and no type — RFC 8446 §5.4 calls this unexpected_message
+}
+
+/** The content of an opened record, with the type byte and padding removed. */
+export u8[] recordContent(u8[] inner) {
+  i32 end = -1;
+  for (i32 i = inner.len() - 1; i >= 0; i--) {
+    if (inner[i] != 0) { end = i; i = -1; }
+  }
+  if (end < 0) { trap; }
+  u8[] out = u8[end]();
+  for (i32 i = 0; i < end; i++) { out[i] = inner[i]; }
+  return out;
+}
