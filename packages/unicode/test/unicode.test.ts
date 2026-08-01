@@ -92,14 +92,89 @@ Deno.test("the simple/full boundary is where it is claimed to be", () => {
   }
   if (bad.length > 0) throw new Error(bad.slice(0, 10).join("\n  "));
 
-  // And the famous one, spelled out so the behaviour is visible rather than inferred.
-  const sharpS = enc.encode("straße");
-  if (dec.decode(mod.upper(sharpS)) !== "STRASSE".replace("SS", "ß".toUpperCase() === "SS" ? "ß" : "SS")) {
-    // The host uppercases ß to SS; simple mapping cannot, so it stays.
-    if (dec.decode(mod.upper(sharpS)) !== "STRAßE") {
-      throw new Error(`ß under simple uppercase: ${dec.decode(mod.upper(sharpS))}`);
+  // The famous one, spelled out so the behaviour is visible rather than inferred. The host
+  // uppercases ß to SS; simple mapping cannot change a scalar's count, so it leaves it.
+  if ("ß".toUpperCase() !== "SS") {
+    throw new Error("the host no longer uppercases ß to SS, so this case has moved");
+  }
+  const got = dec.decode(mod.upper(enc.encode("straße")));
+  if (got !== "STRAßE") throw new Error(`ß under simple uppercase: ${got}`);
+});
+
+Deno.test("fold is an equivalence, and agrees with case mapping", () => {
+  // `fold` had no direct test: it was only ever exercised through `foldEqual`, which would have
+  // hidden a fold that was consistently wrong. These are properties the generator cannot satisfy
+  // by construction.
+  const bad: string[] = [];
+  let moved = 0;
+  for (let cp = 0; cp <= MAX; cp++) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    const f = mod.mapFold(cp);
+    if (f !== cp) moved++;
+
+    // Idempotent: folding a folded code point changes nothing. A table with a two-step chain in
+    // it — x to y to z — would break this and nothing else here would notice.
+    if (mod.mapFold(f) !== f) {
+      if (bad.length < 10) bad.push(`U+${cp.toString(16)} folds to ${f}, which folds again to ${mod.mapFold(f)}`);
+    }
+
+    // Consistent with the classes: two code points with the same single-code-point uppercase are
+    // the same letter, so they must fold together.
+    const up = single(String.fromCodePoint(cp).toUpperCase());
+    if (up >= 0 && up !== cp && mod.mapFold(up) !== f) {
+      if (bad.length < 10) {
+        bad.push(`U+${cp.toString(16)} and its uppercase U+${up.toString(16)} fold apart: ${f} vs ${mod.mapFold(up)}`);
+      }
     }
   }
+  if (moved < 1000) throw new Error(`only ${moved} code points fold to anything, which is too few`);
+
+  // The three that are the point of folding at all.
+  const classes: number[][] = [
+    [0x61, 0x41],                 // a A
+    [0x3c3, 0x3c2, 0x3a3],        // σ ς Σ — the contextual form is why fold is lower(upper(x))
+    [0x6b, 0x4b, 0x212a],         // k K and the Kelvin sign
+  ];
+  for (const group of classes) {
+    const first = mod.mapFold(group[0]);
+    for (const cp of group) {
+      if (mod.mapFold(cp) !== first) {
+        bad.push(`U+${cp.toString(16)} folds to ${mod.mapFold(cp)}, not ${first} like the rest of its class`);
+      }
+    }
+  }
+  if (bad.length > 0) throw new Error(bad.join("\n  "));
+});
+
+Deno.test("foldAll folds every scalar, and matches foldEqual", () => {
+  // `foldAll` had no test at all. The property that ties it to `foldEqual` is the one worth
+  // having: two strings compare fold-equal exactly when their folded forms are identical. If they
+  // ever disagree, one of the two is wrong and neither test alone would say which.
+  const strings = [
+    "", "a", "A", "abc", "ABC", "AbC", "straße", "STRAßE", "ΣΊΣΥΦΟΣ", "σίσυφος",
+    "ΠΡΙΒΕΤ", "привет", "ПРИВЕТ", "日本", "K", "k", "K", "ﬁ", "İ",
+  ];
+  const bad: string[] = [];
+  for (const s of strings) {
+    const folded = mod.casefold(enc.encode(s));
+    // Every scalar in the output is already folded — folding is idempotent on whole strings too.
+    const twice = mod.casefold(folded);
+    if (dec.decode(twice) !== dec.decode(folded)) {
+      bad.push(`${JSON.stringify(s)}: folding twice differs from folding once`);
+    }
+    for (const other of strings) {
+      const bothFolded = dec.decode(mod.casefold(enc.encode(other))) === dec.decode(folded);
+      const equal = mod.equalFold(enc.encode(s), enc.encode(other));
+      if (bothFolded !== equal) {
+        bad.push(`${JSON.stringify(s)} vs ${JSON.stringify(other)}: foldEqual says ${equal}, folded forms say ${bothFolded}`);
+      }
+    }
+  }
+  // Invalid input is reported as empty by the probe, and must not be mistaken for a fold.
+  if (mod.casefold(new Uint8Array([0xff])).length !== 0) {
+    throw new Error("invalid UTF-8 folded to something");
+  }
+  if (bad.length > 0) throw new Error(bad.slice(0, 10).join("\n  "));
 });
 
 Deno.test("mapping whole strings agrees with the host where mapping is simple", () => {
