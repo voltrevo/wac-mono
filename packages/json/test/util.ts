@@ -1,9 +1,15 @@
 import { wacBind } from "../../../harness/wacBind.ts";
 
+/** The generated class for `json.wac`'s `Canonical` struct. */
+type CanonicalRef = {
+  readonly ok: boolean;
+  readonly code: number;
+  readonly pos: number;
+  readonly text: Uint8Array;
+};
+
 type JsonMod = {
-  canonicalize(src: Uint8Array): Uint8Array;
-  errorCode(src: Uint8Array): number;
-  errorPos(src: Uint8Array): number;
+  canonicalize(src: Uint8Array): CanonicalRef;
   parseNumberValue(src: Uint8Array): number;
 };
 
@@ -64,11 +70,17 @@ export async function errorCodesAgree(expected: Record<string, number> = ERR): P
 
 export type Canon = { err: number; text: string };
 
-/** Run canonicalize and split the leading status byte from the payload. */
+/**
+ * Run canonicalize.
+ *
+ * This used to split a status byte off the front of the payload, because an export returned one
+ * value and there was nowhere else to put the error. `Canonical` is a struct now and crosses as
+ * one, so the outcome and the output are separate fields rather than a convention.
+ */
 export async function canon(src: string): Promise<Canon> {
   const m = await json();
   const out = m.canonicalize(enc.encode(src));
-  return { err: out[0], text: dec.decode(out.subarray(1)) };
+  return { err: out.code, text: dec.decode(out.text) };
 }
 
 export async function numberValue(src: string): Promise<number> {
@@ -78,7 +90,7 @@ export async function numberValue(src: string): Promise<number> {
 
 export async function errorOf(src: string): Promise<number> {
   const m = await json();
-  return m.errorCode(enc.encode(src));
+  return m.canonicalize(enc.encode(src)).code;
 }
 
 /**
@@ -90,7 +102,7 @@ export async function errorOf(src: string): Promise<number> {
  */
 export async function errorOfBytes(bytes: Uint8Array): Promise<number> {
   const m = await json();
-  return m.errorCode(bytes);
+  return m.canonicalize(bytes).code;
 }
 
 // Own assertions rather than jsr:@std/assert — the wac projects carry no

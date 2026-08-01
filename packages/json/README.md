@@ -210,10 +210,19 @@ bench/throughput.ts   MB/s by document shape
 bench/lookup.ts       scan vs hash index, and what the index costs to build
 ```
 
-Results cross the bindgen boundary as bytes with a status byte in front. Only
-primitives and primitive arrays marshal, so a `JsonValue` tree cannot be returned
-directly, and with no module-level globals there is nowhere to leave an error code
-for a second call to collect.
+A `JsonValue` tree crosses the boundary directly: structs and enums bind as
+classes, so `parse` hands back the tree and a JS caller walks it with `tag` and
+the container methods — see `test/tree.test.ts`.
+
+That was not always true. `json.wac` used to return bytes with a status byte in
+front, because an export returns one value and nothing but primitives crossed.
+The shape was a trap as well as a nuisance: `canonicalize` returned `u8[]`
+whether it succeeded or failed, so calling it from *wac* — where the convention
+does not apply — put a NUL at the front of the output and made a failure
+indistinguishable from success. `packages/server` did exactly that. The result is
+a struct now, with an `ok` field, and `errorCode`/`errorPos` are gone: they were
+separate exports that re-parsed the input to answer, and a struct carries all
+three.
 
 ## What this exercised in the language
 

@@ -66,7 +66,7 @@ Deno.test("JSONTestSuite: every y_ document is accepted", async () => {
   const failures: string[] = [];
   for (const c of CASES) {
     if (c.expect !== "accept") continue;
-    const err = m.errorCode(c.bytes);
+    const err = m.canonicalize(c.bytes).code;
     if (err !== ERR.NONE) failures.push(`${c.name}: rejected with code ${err}`);
   }
   if (failures.length) {
@@ -79,7 +79,7 @@ Deno.test("JSONTestSuite: every n_ document is rejected", async () => {
   const failures: string[] = [];
   for (const c of CASES) {
     if (c.expect !== "reject") continue;
-    if (m.errorCode(c.bytes) === ERR.NONE) failures.push(c.name);
+    if (m.canonicalize(c.bytes).code === ERR.NONE) failures.push(c.name);
   }
   if (failures.length) {
     throw new Error(`${failures.length} invalid documents accepted:\n  ${failures.join("\n  ")}`);
@@ -96,8 +96,8 @@ Deno.test("JSONTestSuite: accepted documents re-serialize to the same tree", asy
   for (const c of CASES) {
     if (c.expect !== "accept") continue;
     const out = m.canonicalize(c.bytes);
-    if (out[0] !== ERR.NONE) continue;      // covered by the test above
-    const text = dec.decode(out.subarray(1));
+    if (!out.ok) continue;                  // covered by the test above
+    const text = dec.decode(out.text);
     let ours: unknown, theirs: unknown;
     try {
       ours = JSON.parse(text);
@@ -127,7 +127,7 @@ Deno.test("JSONTestSuite: implementation-defined documents terminate with an ans
   const rejected = new Map<number, number>();
   for (const c of CASES) {
     if (c.expect !== "either") continue;
-    const err = m.errorCode(c.bytes);
+    const err = m.canonicalize(c.bytes).code;
     if (err === ERR.NONE) accepted++;
     else rejected.set(err, (rejected.get(err) ?? 0) + 1);
   }
