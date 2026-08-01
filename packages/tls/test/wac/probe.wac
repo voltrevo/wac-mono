@@ -85,3 +85,39 @@ export i32 srvPhase(u8[] state) { return tlsPhase(state); }
 export i32 srvRecordNeeded(u8[] buf) { return tlsRecordNeeded(buf); }
 export u8[] srvClose(u8[] state) { return tlsServerClose(state); }
 export u8[] srvAlert(u8[] state, i32 d) { return tlsServerAlert(state, d); }
+
+// X.509.
+import { parseCert, Cert, certMatchesHost, certSignedBy, verifyChain } from "../../src/x509.wac";
+
+/** Parse and flatten: [notBefore(8)][notAfter(8)][isCa(1)][pubkey(32)][dnsLen(2)][dns] */
+export u8[] x509Parse(u8[] der) {
+  Cert c = parseCert(der);
+  u8[] out = u8[8 + 8 + 1 + 32 + 2 + c.dnsNames.len()]();
+  for (i32 i = 0; i < 8; i++) { out[i] = ((c.notBefore >> (((7 - i) * 8) as i64)) & 255) as! i32; }
+  for (i32 i = 0; i < 8; i++) { out[8 + i] = ((c.notAfter >> (((7 - i) * 8) as i64)) & 255) as! i32; }
+  out[16] = c.isCa ? 1 : 0;
+  for (i32 i = 0; i < 32; i++) { out[17 + i] = c.publicKey[i]; }
+  out[49] = (c.dnsNames.len() >> 8) & 0xFF;
+  out[50] = c.dnsNames.len() & 0xFF;
+  for (i32 i = 0; i < c.dnsNames.len(); i++) { out[51 + i] = c.dnsNames[i]; }
+  return out;
+}
+export bool x509MatchesHost(u8[] der, u8[] host) { return certMatchesHost(parseCert(der), host); }
+export bool x509SignedBy(u8[] leafDer, u8[] caDer) {
+  return certSignedBy(parseCert(leafDer), parseCert(caDer));
+}
+export i32 x509VerifyChain(u8[] leafDer, u8[] caDer, u8[] host, i64 now) {
+  return verifyChain(parseCert(leafDer), parseCert(caDer), host, now);
+}
+
+// The client state machine.
+import { tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientClose, tlsClientPhase,
+         tlsClientFailure } from "../../src/client.wac";
+export u8[] cliInit(u8[] host, u8[] root, u8[] eph, u8[] rnd, i64 now) {
+  return tlsClientInit(host, root, eph, rnd, now);
+}
+export u8[] cliFeed(u8[] state, u8[] input) { return tlsClientFeed(state, input); }
+export u8[] cliSend(u8[] state, u8[] data) { return tlsClientSend(state, data); }
+export u8[] cliClose(u8[] state) { return tlsClientClose(state); }
+export i32 cliPhase(u8[] state) { return tlsClientPhase(state); }
+export i32 cliFailure(u8[] state) { return tlsClientFailure(state); }
