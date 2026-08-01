@@ -389,7 +389,10 @@ try {
     for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, sources.get(f)!);
   }
 } finally {
-  await Deno.remove(work, { recursive: true });
+  // Tolerate the directory already being gone. It should never be, but a crash here
+  // discards a run's entire report after the work has been done, which is a bad trade
+  // for a cleanup step.
+  await Deno.remove(work, { recursive: true }).catch(() => {});
 }
 
 // ── Report ────────────────────────────────────────────────────────────────────
