@@ -37,18 +37,22 @@
 //             almost all of them, carries a leading zero byte that is not part of the key
 
 import { ed25519Verify } from "../../crypto/src/ed25519.wac";
-import { p256Verify } from "../../crypto/src/p256.wac";
+import { p256Verify, p256VerifyDigest } from "../../crypto/src/p256.wac";
+import { p384VerifyDigest } from "../../crypto/src/p384.wac";
 import { rsaVerifyPkcs1, rsaVerifyPss } from "../../crypto/src/rsa.wac";
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { sha384 } from "../../crypto/src/sha512.wac";
 import {
-  Der, oidBasicConstraints, oidEcPublicKey, oidEcdsaSha256, oidEcdsaSha384, oidEd25519,
+  Der, oidBasicConstraints, oidEcPublicKey, oidKeyUsage, oidEcdsaSha256, oidEcdsaSha384, oidEd25519,
   oidEquals, oidPrime256v1, oidRsaEncryption, oidRsaPss, oidRsaSha256, oidRsaSha384,
-  oidRsaSha512, oidSubjectAltName, unsignedInteger,
+  oidRsaSha512, oidSecp384r1, oidSubjectAltName, unsignedInteger,
 } from "./asn1.wac";
 
 /** Key types this understands. */
 export i32 keyEd25519() { return 1; }
 export i32 keyP256() { return 2; }
 export i32 keyRsa() { return 3; }
+export i32 keyP384() { return 4; }
 
 /** Signature algorithms this understands. */
 export i32 sigEd25519Alg() { return 1; }
@@ -85,6 +89,22 @@ export struct Cert {
   i64 notAfter;
   /** Whether basicConstraints says this may sign other certificates. */
   bool isCa;
+  /**
+   * basicConstraints' pathLenConstraint, or -1 when absent.
+   *
+   * The number of intermediates allowed *below* this certificate. A CA with 0 may sign
+   * leaves and not other CAs. Ignoring it is how a constrained intermediate gets used to
+   * issue for the whole internet.
+   */
+  i32 pathLen;
+  /**
+   * Whether keyUsage permits signing certificates, or true when the extension is absent.
+   *
+   * Absent means unconstrained, which is the opposite of the safe default everywhere
+   * else — but it is what RFC 5280 §4.2.1.3 says, and inventing a stricter rule here
+   * would reject certificates that every other client accepts.
+   */
+  bool canSignCerts;
   /** The dNSName entries in subjectAltName, NUL-separated. */
   u8[] dnsNames;
 }
@@ -180,30 +200,37 @@ export Cert parseCert(u8[] der) {
   u8[] publicKey = u8[0]();
   u8[] rsaExponent = u8[0]();
 
+  // An algorithm we do not implement leaves keyType at 0, which every verification
+  // treats as "cannot check this". Trapping instead would conflate *malformed* with
+  // *unsupported* — and a trust store is full of the second kind: the system bundle here
+  // has 121 roots including P-384 and other things this does not do, and one of them
+  // must not take down the parse of the 120 it could have used.
   if (oidEquals(algOid, oidEd25519())) {
-    keyType = 1;
     publicKey = spki.bitString();
-    if (publicKey.len() != 32) { trap; }
+    if (publicKey.len() == 32) { keyType = 1; }
   } else if (oidEquals(algOid, oidEcPublicKey())) {
     // The curve is in the parameters, not the key. Reading the key without checking
     // them would take a P-384 point for a P-256 one and verify against the wrong curve.
     u8[] curve = alg.oid();
-    if (!oidEquals(curve, oidPrime256v1())) { trap; }
-    keyType = 2;
-    publicKey = spki.bitString();
-    if (publicKey.len() != 65 || publicKey[0] != 4) { trap; }
+    if (oidEquals(curve, oidPrime256v1())) {
+      publicKey = spki.bitString();
+      if (publicKey.len() == 65 && publicKey[0] == 4) { keyType = 2; }
+    } else if (oidEquals(curve, oidSecp384r1())) {
+      publicKey = spki.bitString();
+      if (publicKey.len() == 97 && publicKey[0] == 4) { keyType = 4; }
+    }
   } else if (oidEquals(algOid, oidRsaEncryption())) {
-    keyType = 3;
     // The BIT STRING holds another DER structure: SEQUENCE { modulus, exponent }.
     Der inner = Der.create(spki.bitString());
     Der seq = inner.element(0x30);
     publicKey = unsignedInteger(seq.element(0x02).rest());
     rsaExponent = unsignedInteger(seq.element(0x02).rest());
-  } else {
-    trap;
+    keyType = 3;
   }
 
   bool isCa = false;
+  i32 pathLen = -1;
+  bool canSignCerts = true;
   u8[] dnsNames = u8[0]();
 
   if (t.nextIs(0x81)) { t.skip(); }   // issuerUniqueID
@@ -223,6 +250,19 @@ export Cert parseCert(u8[] der) {
         if (seq.nextIs(0x01)) {
           isCa = seq.element(0x01).rest()[0] != 0;
         }
+        if (seq.nextIs(0x02)) {
+          u8[] pl = seq.element(0x02).rest();
+          // A one- or two-byte integer in practice; anything larger is not a constraint
+          // anyone means, so it is treated as absent rather than parsed heroically.
+          pathLen = pl.len() == 1 ? pl[0] : (pl.len() == 2 ? ((pl[0] << 8) | pl[1]) : -1);
+        }
+      } else if (oidEquals(id, oidKeyUsage())) {
+        // A BIT STRING whose bit 5 is keyCertSign. The first content byte is the count
+        // of unused trailing bits, and the bits are numbered from the *most* significant
+        // end — so keyCertSign is 0x04 in the first data byte, not 0x20.
+        Der ku = Der.create(value);
+        u8[] bits = ku.element(0x03).rest();
+        canSignCerts = bits.len() >= 2 && (bits[1] & 0x04) != 0;
       } else if (oidEquals(id, oidSubjectAltName())) {
         dnsNames = collectDnsNames(value);
       }
@@ -241,11 +281,12 @@ export Cert parseCert(u8[] der) {
   else if (oidEquals(sigOid, oidRsaSha384())) { sigAlg = 5; }
   else if (oidEquals(sigOid, oidRsaSha512())) { sigAlg = 6; }
   else if (oidEquals(sigOid, oidRsaPss())) { sigAlg = 7; }
-  else { trap; }
+  // Anything else leaves sigAlg at 0, which certSignedBy refuses. Same reasoning as
+  // the key type above.
   u8[] signature = cert.bitString();
 
   return Cert(tbs, signature, sigAlg, keyType, publicKey, rsaExponent, issuer, subject,
-              notBefore, notAfter, isCa, dnsNames);
+              notBefore, notAfter, isCa, pathLen, canSignCerts, dnsNames);
 }
 
 /** The dNSName entries of a SubjectAltName, joined with NUL bytes. */
@@ -322,20 +363,28 @@ bool matchesOne(u8[] pat, i32 at, i32 len, u8[] host) {
  * An ECDSA signature from its DER wrapper, as raw r ++ s.
  *
  * X.509 writes ECDSA as SEQUENCE { r INTEGER, s INTEGER }; the crypto layer wants two
- * fixed 32-byte values. The integers are signed and variable-length, so each needs its
- * sign byte stripped and then left-padding back to 32 — a shorter r is not a smaller
- * signature, it is the same number with fewer digits.
+ * fixed-width values, `len` bytes each — 32 for P-256, 48 for P-384. The integers are
+ * signed and variable-length, so each needs its sign byte stripped and then left-padding
+ * back to `len`: a shorter r is not a smaller signature, it is the same number with fewer
+ * digits.
  */
-u8[] ecdsaFromDer(u8[] der) {
+u8[] ecdsaFromDer(u8[] der, i32 len) {
   Der outer = Der.create(der);
   Der seq = outer.element(0x30);
   u8[] r = unsignedInteger(seq.element(0x02).rest());
   u8[] s = unsignedInteger(seq.element(0x02).rest());
-  if (r.len() > 32 || s.len() > 32) { trap; }
-  u8[] out = u8[64]();
-  for (i32 i = 0; i < r.len(); i++) { out[32 - r.len() + i] = r[i]; }
-  for (i32 i = 0; i < s.len(); i++) { out[64 - s.len() + i] = s[i]; }
+  if (r.len() > len || s.len() > len) { trap; }
+  u8[] out = u8[2 * len]();
+  for (i32 i = 0; i < r.len(); i++) { out[len - r.len() + i] = r[i]; }
+  for (i32 i = 0; i < s.len(); i++) { out[2 * len - s.len() + i] = s[i]; }
   return out;
+}
+
+/** An ECDSA signature verified against whichever curve the signer's key is on. */
+bool ecdsaCheck(i32 keyType, u8[] publicKey, u8[] digest, u8[] derSig) {
+  if (keyType == 2) { return p256VerifyDigest(publicKey, digest, ecdsaFromDer(derSig, 32)); }
+  if (keyType == 4) { return p384VerifyDigest(publicKey, digest, ecdsaFromDer(derSig, 48)); }
+  return false;
 }
 
 /**
@@ -347,13 +396,18 @@ u8[] ecdsaFromDer(u8[] der) {
  * been assembled wrongly.
  */
 export bool certSignedBy(Cert cert, Cert signer) {
+  if (cert.sigAlg == 0 || signer.keyType == 0) { return false; }
   if (cert.sigAlg == 1) {
     if (signer.keyType != 1) { return false; }
     return ed25519Verify(signer.publicKey, cert.tbs, cert.signature);
   }
-  if (cert.sigAlg == 2) {
-    if (signer.keyType != 2) { return false; }
-    return p256Verify(signer.publicKey, cert.tbs, ecdsaFromDer(cert.signature));
+  if (cert.sigAlg == 2 || cert.sigAlg == 3) {
+    // The hash comes from the signature algorithm and the curve from the signer's key,
+    // and they are independent: ecdsa-with-SHA256 under a P-384 key is legal and occurs.
+    // Pairing them the other way round — assuming SHA-384 means P-384 — would verify real
+    // chains by accident and reject the ones that mix.
+    u8[] digest = cert.sigAlg == 2 ? sha256(cert.tbs) : sha384(cert.tbs);
+    return ecdsaCheck(signer.keyType, signer.publicKey, digest, cert.signature);
   }
   if (cert.sigAlg == 4 || cert.sigAlg == 5 || cert.sigAlg == 6) {
     if (signer.keyType != 3) { return false; }
@@ -370,7 +424,6 @@ export bool certSignedBy(Cert cert, Cert signer) {
     return rsaVerifyPss(signer.publicKey, signer.rsaExponent, cert.tbs,
                         cert.signature, 32, 32);
   }
-  // ecdsa-with-SHA384 (3) would need P-384, which this does not have.
   return false;
 }
 
@@ -414,7 +467,11 @@ export bool certVerifySignature(Cert c, i32 scheme, u8[] content, u8[] signature
   }
   if (scheme == 0x0403) {                       // ecdsa_secp256r1_sha256
     if (c.keyType != 2) { return false; }
-    return p256Verify(c.publicKey, content, ecdsaFromDer(signature));
+    return p256Verify(c.publicKey, content, ecdsaFromDer(signature, 32));
+  }
+  if (scheme == 0x0503) {                       // ecdsa_secp384r1_sha384
+    if (c.keyType != 4) { return false; }
+    return p384VerifyDigest(c.publicKey, sha384(content), ecdsaFromDer(signature, 48));
   }
   if (scheme == 0x0804) {                       // rsa_pss_rsae_sha256
     if (c.keyType != 3) { return false; }
@@ -431,4 +488,92 @@ export bool certVerifySignature(Cert c, i32 scheme, u8[] content, u8[] signature
     return false;
   }
   return false;
+}
+
+/**
+ * Verify a certificate chain against a set of trusted roots.
+ *
+ * `chain` is the leaf followed by whatever intermediates the server chose to send, in
+ * the order it sent them — which RFC 8446 §4.4.2 says *should* be leaf-first but does
+ * not require, and which some servers get wrong. `roots` is the trust store.
+ *
+ * The path is built from the leaf upwards, each step looking for a certificate whose
+ * subject matches the current issuer, and stopping at the first root that both matches
+ * and verifies. A cross-signed root sent as an intermediate is followed like any other
+ * link, which is not a special case here but is how a good deal of the web chains: for
+ * raw.githubusercontent.com the server sends ISRG's newer root cross-signed by Root X1,
+ * so the anchor is three certificates up rather than at the end of what was sent.
+ *
+ * What it does not do is backtrack. If a link verifies but leads nowhere, no alternative
+ * issuer for that link is tried, so a chain with two possible paths where only the second
+ * reaches a root is reported as untrusted. Nor is there any revocation checking. A real
+ * client does both.
+ *
+ * Returns 0 for success, or a code saying which check failed. Codes are distinguished
+ * because "expired", "unknown issuer" and "wrong name" want different alerts and
+ * different advice to a human.
+ *
+ * `chainOffsets` and `rootOffsets` describe where each DER certificate begins inside
+ * the two blobs, because wac has no array of byte arrays crossing a boundary and
+ * flattening is cheaper than a struct nobody else needs.
+ */
+export i32 verifyPath(u8[] chain, i32[] chainOffsets, u8[] roots, i32[] rootOffsets,
+                      u8[] host, i64 now, i32 maxDepth) {
+  i32 nChain = chainOffsets.len() / 2;
+  i32 nRoots = rootOffsets.len() / 2;
+  if (nChain == 0) { return 8; }                 // nothing to verify
+
+  Cert leaf = parseCert(slice(chain, chainOffsets[0], chainOffsets[1]));
+  if (now < leaf.notBefore) { return 1; }
+  if (now > leaf.notAfter) { return 2; }
+  if (!certMatchesHost(leaf, host)) { return 7; }
+
+  Cert current = leaf;
+  i32 depth = 0;
+  while (depth < maxDepth) {
+    // A root that signed the current certificate ends the path.
+    for (i32 r = 0; r < nRoots; r++) {
+      Cert root = parseCert(slice(roots, rootOffsets[2 * r], rootOffsets[2 * r + 1]));
+      if (!nameEquals(current.issuer, root.subject)) { continue; }
+      if (root.keyType == 0) { continue; }       // an algorithm we cannot check
+      if (!root.isCa) { continue; }
+      if (!root.canSignCerts) { continue; }
+      if (now < root.notBefore || now > root.notAfter) { continue; }
+      if (certSignedBy(current, root)) { return 0; }
+      // A root with a matching name whose signature does not check is not this path's
+      // root. Two authorities can share a subject name, so this keeps looking rather
+      // than failing — which is the difference between working and not for the handful
+      // of CAs that have reissued under the same name.
+    }
+
+    // Otherwise look for an intermediate in the chain the server sent.
+    bool advanced = false;
+    for (i32 i = 1; i < nChain; i++) {
+      Cert cand = parseCert(slice(chain, chainOffsets[2 * i], chainOffsets[2 * i + 1]));
+      if (!nameEquals(current.issuer, cand.subject)) { continue; }
+      if (cand.keyType == 0) { continue; }
+      if (!cand.isCa) { continue; }              // a leaf cannot vouch for anything
+      if (!cand.canSignCerts) { continue; }
+      if (now < cand.notBefore || now > cand.notAfter) { continue; }
+      // pathLenConstraint counts the intermediates permitted below this one. `depth`
+      // is how many we have already walked past, so exceeding it means this CA is being
+      // used further down a chain than its issuer allowed.
+      if (cand.pathLen >= 0 && depth > cand.pathLen) { continue; }
+      if (!certSignedBy(current, cand)) { continue; }
+      current = cand;
+      advanced = true;
+      i = nChain;
+    }
+    if (!advanced) { return 5; }                 // no issuer found: unknown authority
+    depth++;
+  }
+  return 9;                                      // ran past the depth limit
+}
+
+/** A copy of `[start, end)`. */
+u8[] slice(u8[] b, i32 start, i32 end) {
+  if (start < 0 || end > b.len() || start > end) { trap; }
+  u8[] out = u8[end - start]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = b[start + i]; }
+  return out;
 }
