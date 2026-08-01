@@ -201,8 +201,10 @@ export const CURATED: Curated[] = [
   {
     name: "deflate/btype-bits",
     file: "packages/gzip/src/deflate.wac",
-    find: "w.writeBits(2, 2);          // BTYPE = 10, dynamic Huffman",
-    replace: "w.writeBits(1, 2);          // BTYPE = 10, dynamic Huffman",
+    // Keyed on the statement rather than the statement plus its comment: the comment's
+    // indentation shifted once and took this mutation out of service silently.
+    find: "w.writeBits(2, 2);",
+    replace: "w.writeBits(1, 2);",
   },
 
   // ── gzip container ──────────────────────────────────────────────────────────
@@ -211,6 +213,17 @@ export const CURATED: Curated[] = [
     file: "packages/gzip/src/gzip.wac",
     find: "out.pushU32(isize as@ u32);",
     replace: "out.pushU32((isize + 1) as@ u32);",
+    nth: 1,
+  },
+  {
+    // The streaming writer's own copy of the trailer. It appeared with gzipStream and
+    // was not covered by anything: the one-shot mutation above stopped applying rather
+    // than starting to cover both, which is the failure mode `nth` exists to prevent.
+    name: "gzip/isize-field-streaming",
+    file: "packages/gzip/src/gzip.wac",
+    find: "out.pushU32(isize as@ u32);",
+    replace: "out.pushU32((isize + 1) as@ u32);",
+    nth: 2,
   },
   {
     name: "gzip/stored-nlen",
@@ -238,6 +251,15 @@ export const CURATED: Curated[] = [
     file: "packages/gzip/src/inflate.wac",
     find: "if (out.len() != wantSize) { trap; }",
     replace: "if (false) { trap; }",
+    nth: 1,
+  },
+  {
+    // gunzipStream's copy of the same trailer check.
+    name: "inflate/isize-check-removed-streaming",
+    file: "packages/gzip/src/inflate.wac",
+    find: "if (out.len() != wantSize) { trap; }",
+    replace: "if (false) { trap; }",
+    nth: 2,
   },
   {
     name: "inflate/nlen-check-removed",
@@ -248,15 +270,15 @@ export const CURATED: Curated[] = [
   {
     name: "inflate/distance-bound",
     file: "packages/gzip/src/inflate.wac",
-    find: "if (d > out.len) { trap; }",
-    replace: "if (d > out.len + 1) { trap; }",
+    find: "if (d > out.len()) { trap; }",
+    replace: "if (d > out.len() + 1) { trap; }",
     equivalent: "Same redundancy as inflate/distance-check-removed — the one distance this " +
       "lets through still yields a negative index, which Buf.get and wasm both reject.",
   },
   {
     name: "inflate/distance-check-removed",
     file: "packages/gzip/src/inflate.wac",
-    find: "if (d > out.len) { trap; }",
+    find: "if (d > out.len()) { trap; }",
     replace: "if (false) { trap; }",
     equivalent: "Buf.get's own bounds check still traps on the resulting negative index. " +
       "test/inflate_adversarial.test.ts drives this path; the rejection is just guarded twice.",
@@ -278,7 +300,7 @@ export const CURATED: Curated[] = [
     edits: [
       {
         file: "packages/gzip/src/inflate.wac",
-        find: "if (d > out.len) { trap; }",
+        find: "if (d > out.len()) { trap; }",
         replace: "if (false) { trap; }",
       },
       {
