@@ -247,6 +247,54 @@ for (let n = 0; n <= 32; n++) padTo16(n);
   fCSwap(enc(3n), enc(5n), 0);
   fCSwap(enc(3n), enc(5n), 1);
 
+  // Ed25519. Signing and verifying between them reach the group law, both branches of
+  // the scalar select, encoding and decoding; the rejection cases reach the rest.
+  const edPublicKey = c<(s: Uint8Array) => Uint8Array>("edPublicKey");
+  const edSign = c<(s: Uint8Array, m: Uint8Array) => Uint8Array>("edSign");
+  const edVerify = c<(p: Uint8Array, m: Uint8Array, s: Uint8Array) => boolean>("edVerify");
+  const edRecode = c<(p: Uint8Array) => Uint8Array>("edRecode");
+  const edScalarBase = c<(k: Uint8Array) => Uint8Array>("edScalarBase");
+  c<() => Uint8Array>("edBaseEncoded")();
+
+  const seed = bytes(32, 50);
+  const pub = edPublicKey(seed);
+  for (const msgLen of [0, 1, 64]) {
+    const msg = bytes(msgLen, 51);
+    const sig = edSign(seed, msg);
+    edVerify(pub, msg, sig);
+    const tampered = Uint8Array.from(sig);
+    tampered[0] ^= 1;
+    edVerify(pub, msg, tampered);         // R decodes but the equation fails
+  }
+  // Rejections: bad lengths, an S at or above L, a y that is not on the curve.
+  edVerify(bytes(31, 52), bytes(4, 53), bytes(64, 54));
+  edVerify(pub, bytes(4, 53), bytes(63, 54));
+  edVerify(pub, bytes(4, 53), bytes(64, 55));   // random S is almost surely >= L or a bad point
+  const notAPoint = new Uint8Array(32);
+  notAPoint[0] = 2;
+  edRecode(notAPoint);
+  edRecode(pub);
+  // An odd-x point, so the sign branch in recoverX runs both ways.
+  const oddX = Uint8Array.from(pub);
+  oddX[31] ^= 0x80;
+  edRecode(oddX);
+  edScalarBase(bytes(32, 56));
+  // y = 1 with the sign bit set: x is zero, which has no odd root, so the decode must
+  // fail. This is the one branch in recoverX that a valid point never reaches.
+  const yOneOddX = new Uint8Array(32);
+  yOneOddX[0] = 1;
+  yOneOddX[31] = 0x80;
+  edRecode(yOneOddX);
+  edRecode(bytes(31, 57));                      // wrong length
+  mustTrap("edPublicKey short seed", () => edPublicKey(bytes(31, 58)));
+  mustTrap("edSign short seed", () => edSign(bytes(31, 58), bytes(4, 59)));
+  // A public key that is not a point, and a signature whose R is not a point.
+  const goodSig = edSign(seed, bytes(8, 60));
+  edVerify(notAPoint, bytes(8, 60), goodSig);
+  const badR = Uint8Array.from(goodSig);
+  badR.set(notAPoint, 0);
+  edVerify(pub, bytes(8, 60), badR);
+
   x25519Base(bytes(32, 40));
   x25519(bytes(32, 41), x25519Base(bytes(32, 42)));
   mustTrap("x25519 short scalar", () => x25519(bytes(31, 43), bytes(32, 44)));

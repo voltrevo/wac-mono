@@ -302,3 +302,89 @@ export i64[] feInvert(i64[] z) {
   t = feSquare(t);                              // 2^255 - 32
   return feMul(t, z11);                         // 2^255 - 21 = p - 2
 }
+
+// ── What Edwards-curve work needs on top of the ladder ────────────────────────
+
+/** a == b, as a 0/1 flag, compared on canonical encodings. */
+export i32 feEquals(i64[] a, i64[] b) {
+  u8[] x = feToBytes(a);
+  u8[] y = feToBytes(b);
+  i32 diff = 0;
+  for (i32 i = 0; i < 32; i++) { diff = diff | (x[i] ^ y[i]); }
+  return diff == 0 ? 1 : 0;
+}
+
+export i32 feIsZero(i64[] a) { return feEquals(a, feZero()); }
+
+/**
+ * The sign bit: the low bit of the canonical encoding.
+ *
+ * Ed25519 defines "negative" this way rather than by any ordering of the field — x and
+ * -x differ in that bit for every x except zero, which is what lets a compressed point
+ * carry the sign of its x-coordinate in one bit.
+ */
+export i32 feIsNegative(i64[] a) { return feToBytes(a)[0] & 1; }
+
+/**
+ * a^((p-5)/8), the exponent square-root recovery needs.
+ *
+ * p = 5 (mod 8), so a square root of a is either a^((p+3)/8) or that times sqrt(-1) —
+ * and a^((p-5)/8) is the shared part of both. (p-5)/8 is 2^252 - 3, so the chain is the
+ * inversion chain stopped three squarings early.
+ */
+export i64[] fePow22523(i64[] z) {
+  i64[] z2 = feSquare(z);
+  i64[] t = feSquare(z2);
+  t = feSquare(t);
+  i64[] z9 = feMul(t, z);
+  i64[] z11 = feMul(z9, z2);
+  t = feSquare(z11);
+  i64[] z2_5_0 = feMul(t, z9);
+
+  t = feSquare(z2_5_0);
+  for (i32 i = 1; i < 5; i++) { t = feSquare(t); }
+  i64[] z2_10_0 = feMul(t, z2_5_0);
+
+  t = feSquare(z2_10_0);
+  for (i32 i = 1; i < 10; i++) { t = feSquare(t); }
+  i64[] z2_20_0 = feMul(t, z2_10_0);
+
+  t = feSquare(z2_20_0);
+  for (i32 i = 1; i < 20; i++) { t = feSquare(t); }
+  t = feMul(t, z2_20_0);
+
+  t = feSquare(t);
+  for (i32 i = 1; i < 10; i++) { t = feSquare(t); }
+  i64[] z2_50_0 = feMul(t, z2_10_0);
+
+  t = feSquare(z2_50_0);
+  for (i32 i = 1; i < 50; i++) { t = feSquare(t); }
+  i64[] z2_100_0 = feMul(t, z2_50_0);
+
+  t = feSquare(z2_100_0);
+  for (i32 i = 1; i < 100; i++) { t = feSquare(t); }
+  t = feMul(t, z2_100_0);
+
+  t = feSquare(t);
+  for (i32 i = 1; i < 50; i++) { t = feSquare(t); }
+  t = feMul(t, z2_50_0);
+
+  t = feSquare(t);
+  t = feSquare(t);
+  return feMul(t, z);      // 2^252 - 3
+}
+
+/** Negation, which the Edwards addition law needs for subtraction. */
+export i64[] feNeg(i64[] a) {
+  i64[] h = i64[10]();
+  for (i32 i = 0; i < 10; i++) { h[i] = -a[i]; }
+  return h;
+}
+
+/** Select b if `pick` is 1, a if it is 0, without branching on `pick`. */
+export i64[] feSelect(i64[] a, i64[] b, i32 pick) {
+  i64 mask = -(pick as i64);
+  i64[] h = i64[10]();
+  for (i32 i = 0; i < 10; i++) { h[i] = a[i] ^ (mask & (a[i] ^ b[i])); }
+  return h;
+}
