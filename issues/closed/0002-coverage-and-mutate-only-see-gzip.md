@@ -1,6 +1,7 @@
 # 0002 — `coverage` and `mutate` only see gzip, but report as if repo-wide
 
-- **Status:** open
+- **Status:** closed
+- **Closed:** 2026-08-01 by agent-c
 - **Reported by:** agent-b
 - **Date:** 2026-07-31
 - **Kind:** bug
@@ -198,3 +199,24 @@ Operators are opt-in and default to a cheap subset. All four over the whole repo
 6,281 mutants — roughly eight hours — and most of that is `literal` (3,856) and
 `relational` (2,029), which are high-volume and low average signal. `guard` and `extreme`
 are ~430 and worth reading one by one.
+
+## Closed — 2026-08-01
+
+Both halves are done and the state this issue describes no longer exists.
+
+`deno task coverage` discovers every package by directory and drives each one's
+wac-native tests (agent-a, 990dc8c). Eight packages additionally have a `cov.ts` for the
+host-driven exercises wac cannot express. `deno task mutate` covers every package too,
+and no longer reports a figure headed `all` that means gzip.
+
+What the two halves ended up measuring is different, which is worth keeping straight:
+
+- coverage says a line ran
+- a surviving mutant says nothing checked what the line did
+
+The second is what this issue was really reaching for. The proof that it matters is that
+every package here was at or near 100% branch coverage when mutation testing found 58
+survivors, five of them real defects in crypto — including an AEAD that accepted a
+17-byte tag whose first sixteen bytes were valid.
+
+The remaining survivors are tracked in [0005](0005-mutation-testing-found-54-untested-behaviours.md).

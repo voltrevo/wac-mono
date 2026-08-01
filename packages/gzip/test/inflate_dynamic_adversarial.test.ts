@@ -42,36 +42,58 @@ function clCode(lengths: Record<number, number>): number[] {
   return out;
 }
 
+/**
+ * A complete dynamic block that decodes to "A", with the given HLIT and HDIST.
+ *
+ * Everything else about the stream is valid, so the only thing a decoder can object to
+ * is the pair of counts. That is what makes it a test of the count check rather than of
+ * whatever happens to fail first — the distinction that let a mutation of that check
+ * survive the previous version of this test.
+ *
+ * Only three symbols get a code: 'A' at 65, end-of-block at 256, and the first distance
+ * code, which sits at index `hlit` because the distance lengths follow the literal ones
+ * in one run-length-encoded sequence rather than starting a new table.
+ */
+function completeDynamic(hlit: number, hdist: number): Uint8Array {
+  const total = hlit + hdist;
+  const b = dynamicHeader({
+    hlit,
+    hdist,
+    clLengths: CL_FULL,
+    ops: [
+      ...fillZeros(65), { sym: 1 },
+      ...fillZeros(190), { sym: 1 },
+      ...fillZeros(hlit - 257), { sym: 1 },
+      ...fillZeros(total - hlit - 1),
+    ],
+  });
+  b.code(0, 1).code(1, 1);   // literal 'A', then end-of-block; both are 1-bit codes
+  return b.done();
+}
+
 Deno.test("inflate/dynamic: HLIT and HDIST beyond what the format defines", () => {
   // HLIT is sent as HLIT-257 in five bits, so 287 and 288 are encodable while RFC 1951
   // defines only 286 literal/length codes. HDIST is sent as HDIST-1, so 31 and 32 are
   // encodable against 30 defined distance codes. Both would size a table larger than
   // the fixed length/distance base arrays the decoder indexes with the symbol, so
   // accepting them turns a header field into an out-of-range read.
+  // These streams are complete and correct apart from the count, which is the only way
+  // to test the check rather than merely reach it. The first version of this test sent a
+  // header and stopped, so the stream ran out of bits and trapped whether or not the
+  // count was validated — it executed the line without testing it. A mutation run caught
+  // that by deleting the check and watching every test still pass.
+  //
+  // With the check gone, `hlit = 287` decodes to "A" and returns successfully: nothing
+  // else objects, because symbols 286 and 287 simply have no code assigned to them.
   for (const hlit of [287, 288]) {
-    traps(`hlit ${hlit}`, dynamicHeader({ hlit, hdist: 1, clLengths: CL_REPEAT, ops: [] }).done());
+    traps(`hlit ${hlit}, otherwise valid`, completeDynamic(hlit, 1));
   }
   for (const hdist of [31, 32]) {
-    traps(`hdist ${hdist}`, dynamicHeader({ hlit: 257, hdist, clLengths: CL_REPEAT, ops: [] }).done());
+    traps(`hdist ${hdist}, otherwise valid`, completeDynamic(257, hdist));
   }
   // The largest legal pair must still be accepted, or the bound could be off by one in
   // the other direction and every test above would still pass.
-  const ok = dynamicHeader({
-    hlit: 286,
-    hdist: 30,
-    clLengths: CL_FULL,
-    // 286 + 30 = 316 lengths, and the distance table starts at index 286 rather than
-    // straight after end-of-block. Only 'A' (65), end-of-block (256) and the first
-    // distance code (286) get a length; the rest are zero.
-    ops: [
-      ...fillZeros(65), { sym: 1 },        // indices 0..65,   'A' at 65
-      ...fillZeros(190), { sym: 1 },       // indices 66..256, end-of-block at 256
-      ...fillZeros(29), { sym: 1 },        // indices 257..286, dist[0] at 286
-      ...fillZeros(29),                    // indices 287..315
-    ],
-  });
-  ok.code(0, 1).code(1, 1);   // literal 'A' then end-of-block, both 1-bit codes
-  const got = new TextDecoder().decode(inflate(ok.done()));
+  const got = new TextDecoder().decode(inflate(completeDynamic(286, 30)));
   if (got !== "A") throw new Error(`hlit=286 hdist=30 should decode to "A", got ${JSON.stringify(got)}`);
 });
 
