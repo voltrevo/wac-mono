@@ -4,11 +4,10 @@ SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-
 X25519, Ed25519, NIST P-256 and P-384, RSA signature verification and ML-KEM-768,
 written in wac.
 
-> **Not for production.** Nothing here is constant-time. `ghash`'s multiply branches on
-> every bit of its operand, `aes` indexes an S-box with key-dependent values, and
-> `x25519`'s ladder is only structurally uniform — wac offers no way to stop a compiler
-> or a CPU from undoing that, and none of it has been measured against a timing oracle.
-> The correctness is tested hard; the side channels are not addressed at all.
+> **Not for production.** Two routines here are known to leak, and the rest are uniform
+> only at the level this can measure. See [Side channels](#side-channels) — that section
+> is now a measurement rather than a disclaimer, but the conclusion is unchanged: do not
+> use this where an attacker can observe timing.
 
 A package of [wac-mono](../../README.md) — see the root README for layout and how
 to run things. All commands run from the repo root.
@@ -373,8 +372,38 @@ the wrong limb position fails 6, and the borrow-detect shift 31 → 30 fails 4 �
 with a no-op edit failing none, so those are measuring behaviour rather than
 broken compilation.
 
-## Not for production
+## Side channels
 
-Nothing here is constant-time. Comparisons short-circuit, and the compiler is
-free to reorder as it likes. Do not use this where timing is observable to an
-attacker.
+`test/constanttime.test.ts` runs each routine twice with different secrets and the same
+public input, and compares the ordered sequence of **branches taken and memory indices
+used**. Both matter: a secret-dependent branch is the obvious leak, and a secret-dependent
+*index* has no branch at all — `SBOX[key_byte]` touches a cache line chosen by the key,
+which is how AES keys have been recovered from cache timing since 2005.
+
+| routine | events per run | result |
+|---|---:|---|
+| `sha256` | 1,555 | uniform |
+| `chachaBlock` | 1,598 | uniform |
+| `poly1305` | 139 | uniform |
+| `x25519Base` | 1,620,094 | uniform |
+| `ghash` | 513 | **branches on the bits of H** — `ghash.wac:26` |
+| `aesEncrypt`, `aesExpandKey` | 8,631 / 455 | **S-box index depends on the key** — `aes.wac:113` |
+
+The x25519 row is the one worth reading twice: the ladder is uniform across every one of
+1.6 million events, which is what "structurally uniform" was claiming without evidence.
+
+Two leaks were already documented. The measurement added a third that was not: `xtime`'s
+conditional reduction at `aes.wac:66` branches on the high bit of a key-derived value,
+executing 1090 times for one key and 1182 for another.
+
+**What a uniform result does not mean.** The check is dynamic, so it covers the key pairs
+tested and no others; it is wasm-level, so identical operations can still take different
+time on hardware — `i64.div_s` latency depends on its operands, and the engine and CPU do
+as they please; and it says nothing about values written, only about branches and
+addresses. It is a necessary condition, not a sufficient one. A *failure* is definite.
+
+**Fixing the index leak** means removing the table, not moving it: either scan every entry
+and select with an arithmetic mask (`0 - (i == want)` is all-ones or zero, no branch),
+which costs O(n) per lookup, or bitslice the S-box so there is no table to index. wac does
+not optimise, so a masked select survives compilation intact — which is the one place the
+compiler being simple is a security property.
