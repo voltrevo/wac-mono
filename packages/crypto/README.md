@@ -402,6 +402,13 @@ time on hardware — `i64.div_s` latency depends on its operands, and the engine
 as they please; and it says nothing about values written, only about branches and
 addresses. It is a necessary condition, not a sufficient one. A *failure* is definite.
 
+**A static check was considered and declined** (2026-08-01). A `secret` qualifier on a
+parameter, propagated by the type checker and refused at a branch or an index, would
+cover every path rather than the inputs tested. It also needs declassification — a
+ciphertext is key-derived and must become public somewhere — and an over-taint story, and
+it wants the same machinery as putting `const` in the type. Not worth it for a package
+that is not for production: the dynamic check finds the leaks that get written.
+
 **Fixing the index leak** means removing the table, not moving it: either scan every entry
 and select with an arithmetic mask (`0 - (i == want)` is all-ones or zero, no branch),
 which costs O(n) per lookup, or bitslice the S-box so there is no table to index. wac does
