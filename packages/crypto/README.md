@@ -1,7 +1,7 @@
 # crypto
 
-SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519
-and NIST P-256 (ECDH and ECDSA), written in wac.
+SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519,
+NIST P-256 (ECDH and ECDSA) and RSA signature verification, written in wac.
 
 > **Not for production.** Nothing here is constant-time. `ghash`'s multiply branches on
 > every bit of its operand, `aes` indexes an S-box with key-dependent values, and
@@ -71,6 +71,27 @@ verify test would have passed.
 Roughly 120 ms per signature. The scalar multiplication is a plain 256-step
 double-and-add with no windowing, which is the slowest reasonable choice and the easiest
 to read against the spec.
+
+## RSA
+
+`src/rsa.wac`, built on [bignum](../bignum/README.md) — verification only. Signing needs
+the private key, and private-key RSA in a language with no constant-time story is a worse
+idea than the rest of this package already is; verification touches only public values.
+
+PKCS#1 v1.5 *and* PSS, because TLS 1.3 needs both for different things. RFC 8446 §4.4.3
+forbids v1.5 in CertificateVerify — a peer must use PSS — while §4.4.2.2 allows it for
+the signatures inside a certificate chain, which is how almost every certificate in the
+world is signed.
+
+The tests are mostly refusals. RSA's history is a list of verifiers that *searched* for
+the padding structure instead of requiring it: Bleichenbacher's 2006 forgery worked
+against implementations that parsed the DigestInfo rather than matching its bytes, and
+against ones that stopped checking after finding the hash. So the DigestInfo prefix here
+is a byte table to compare against, never something to parse.
+
+About 170 ms per 2048-bit verification. `modPow` is square-and-multiply with a divmod
+after each step; the exponent is public, so branching on its bits is the one place in
+this package where the timing caveat genuinely does not apply.
 
 ## P-256
 

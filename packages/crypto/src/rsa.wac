@@ -1,0 +1,251 @@
+// RSA signature verification: PKCS#1 v1.5 and PSS.
+//
+// Verification only. Signing needs the private key, and a private-key RSA in a language
+// with no constant-time story is a worse idea than the rest of this package already is —
+// verification handles only public values, so the timing exposure is nil.
+//
+// Both padding schemes are here because TLS 1.3 needs both and for different things.
+// RFC 8446 §4.4.3 forbids PKCS#1 v1.5 in CertificateVerify — a peer must use PSS — but
+// §4.4.2.2 allows it for the signatures *inside* a certificate chain, and the world's
+// certificates are overwhelmingly signed that way. A client that implements only one of
+// them cannot complete a handshake with most of the web.
+//
+// ## Why this can be short
+//
+// `bignum` already has multiply and divmod, so modular exponentiation is square-and-
+// multiply with a reduction after each step. A public exponent is small — 65537 has
+// seventeen bits and two of them set — so a verification is about eighteen modular
+// multiplications, and the naive method is fast enough that Montgomery form would be
+// added complexity for no visible gain.
+
+import { sha256 } from "./sha256.wac";
+import { sha512, sha384 } from "./sha512.wac";
+import {
+  Big, DivMod, add, bitLen, cmp, divmod, isZero, mul,
+} from "../../bignum/src/big.wac";
+
+/** A big integer from big-endian bytes, which is how RSA writes everything. */
+export Big fromBytes(u8[] b) {
+  // Build by repeated shift-and-add through the existing API rather than by poking
+  // limbs: `bignum` owns its representation, and reaching into it here would be a second
+  // place that has to know about normalisation.
+  Big acc = Big.zero();
+  Big base = Big.fromU64(256);
+  for (i32 i = 0; i < b.len(); i++) {
+    acc = mul(acc, base);
+    acc = addSmall(acc, b[i]);
+  }
+  return acc;
+}
+
+/** a + v, for a small non-negative addend. */
+Big addSmall(Big a, i32 v) { return add(a, Big.fromU64(v as! u64)); }
+
+/** Big-endian bytes of `a`, left-padded to `len`. Traps if it does not fit. */
+export u8[] toBytes(Big a, i32 len) {
+  u8[] out = u8[len]();
+  Big cur = a;
+  Big base = Big.fromU64(256);
+  for (i32 i = len - 1; i >= 0; i--) {
+    DivMod d = divmod(cur, base);
+    out[i] = smallValue(d.r);
+    cur = d.q;
+  }
+  if (!isZero(cur)) { trap; }   // the value needed more than `len` bytes
+  return out;
+}
+
+/** The value of a Big known to be below 256. */
+i32 smallValue(Big a) {
+  if (isZero(a)) { return 0; }
+  return (a.limbs[0] & 255) as@ i32;
+}
+
+/** Bit `i` of a non-negative Big, counting from the least significant. */
+i32 bitAt(Big a, i32 i) {
+  i32 limb = i / 32;
+  if (limb >= a.n) { return 0; }
+  return ((a.limbs[limb] >> ((i % 32) as@ u32)) & 1) as@ i32;
+}
+
+/**
+ * base^exp mod m, by square-and-multiply over the exponent's bits.
+ *
+ * The exponent is public — it is part of the public key — so branching on its bits leaks
+ * nothing. That is the one place in this package where the non-constant-time caveat does
+ * not apply, and it is worth saying because everywhere else it does.
+ */
+export Big modPow(Big base, Big exp, Big m) {
+  Big result = Big.fromU64(1);
+  Big b = divmod(base, m).r;
+  i32 bits = bitLen(exp);
+  for (i32 i = bits - 1; i >= 0; i--) {
+    result = divmod(mul(result, result), m).r;
+    if (bitAt(exp, i) == 1) {
+      result = divmod(mul(result, b), m).r;
+    }
+  }
+  return result;
+}
+
+/**
+ * The DigestInfo prefix PKCS#1 v1.5 puts in front of a hash.
+ *
+ * A fixed DER header naming the hash algorithm. It is fixed per algorithm, so it is
+ * written out rather than encoded — and it has to be compared, not parsed: a verifier
+ * that parses the DER here rather than matching bytes accepts alternative encodings of
+ * the same structure, which is the Bleichenbacher '06 signature forgery.
+ */
+u8[] digestInfoPrefix(i32 hashLen) {
+  if (hashLen == 32) {
+    return u8[](0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
+                0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20);
+  }
+  if (hashLen == 48) {
+    return u8[](0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
+                0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30);
+  }
+  if (hashLen == 64) {
+    return u8[](0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
+                0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40);
+  }
+  trap;
+}
+
+u8[] digest(u8[] msg, i32 hashLen) {
+  if (hashLen == 32) { return sha256(msg); }
+  if (hashLen == 48) { return sha384(msg); }
+  if (hashLen == 64) { return sha512(msg); }
+  trap;
+}
+
+/**
+ * Verify an RSASSA-PKCS1-v1_5 signature.
+ *
+ * The recovered block must be exactly
+ *
+ *   0x00 || 0x01 || 0xFF...FF || 0x00 || DigestInfo || Hash
+ *
+ * with at least eight 0xFF bytes. Every byte is checked. The historical forgeries here
+ * all come from verifiers that searched for the structure instead of requiring it —
+ * accepting trailing garbage, or a short padding run, turns a signature check into a
+ * pattern match that an attacker can satisfy without the private key.
+ */
+export bool rsaVerifyPkcs1(u8[] n, u8[] e, u8[] msg, u8[] sig, i32 hashLen) {
+  if (sig.len() != n.len()) { return false; }
+  Big modulus = fromBytes(n);
+  if (isZero(modulus)) { return false; }
+  Big s = fromBytes(sig);
+  if (cmp(s, modulus) >= 0) { return false; }
+
+  Big m = modPow(s, fromBytes(e), modulus);
+  u8[] em = toBytes(m, n.len());
+
+  u8[] prefix = digestInfoPrefix(hashLen);
+  u8[] h = digest(msg, hashLen);
+  i32 tLen = prefix.len() + hashLen;
+  // At least eight padding bytes, plus the two leading bytes and the separator.
+  if (n.len() < tLen + 11) { return false; }
+
+  i32 diff = 0;
+  diff = diff | (em[0] ^ 0x00);
+  diff = diff | (em[1] ^ 0x01);
+  i32 padEnd = n.len() - tLen - 1;
+  for (i32 i = 2; i < padEnd; i++) { diff = diff | (em[i] ^ 0xFF); }
+  diff = diff | (em[padEnd] ^ 0x00);
+  for (i32 i = 0; i < prefix.len(); i++) { diff = diff | (em[padEnd + 1 + i] ^ prefix[i]); }
+  for (i32 i = 0; i < hashLen; i++) { diff = diff | (em[padEnd + 1 + prefix.len() + i] ^ h[i]); }
+  return diff == 0;
+}
+
+/**
+ * MGF1, the mask generation function PSS uses.
+ *
+ * A counter-mode hash: H(seed || 0), H(seed || 1), ... truncated to the length wanted.
+ */
+u8[] mgf1(u8[] seed, i32 length, i32 hashLen) {
+  u8[] out = u8[length]();
+  i32 at = 0;
+  i32 counter = 0;
+  while (at < length) {
+    u8[] input = u8[seed.len() + 4]();
+    for (i32 i = 0; i < seed.len(); i++) { input[i] = seed[i]; }
+    input[seed.len()] = (counter >> 24) & 0xFF;
+    input[seed.len() + 1] = (counter >> 16) & 0xFF;
+    input[seed.len() + 2] = (counter >> 8) & 0xFF;
+    input[seed.len() + 3] = counter & 0xFF;
+    u8[] block = digest(input, hashLen);
+    for (i32 i = 0; i < hashLen && at < length; i++) {
+      out[at] = block[i];
+      at++;
+    }
+    counter++;
+  }
+  return out;
+}
+
+/**
+ * Verify an RSASSA-PSS signature, RFC 8017 §9.1.2.
+ *
+ * PSS is what TLS 1.3 requires in CertificateVerify. The structure is inverted relative
+ * to PKCS#1: rather than a fixed block to compare, the signature carries a masked salt
+ * that has to be unmasked and then used to recompute the hash. So this cannot be one
+ * byte comparison — it is a sequence of checks, and each is load-bearing.
+ *
+ * `saltLen` is the salt length the signer used, which for TLS is always the hash length.
+ */
+export bool rsaVerifyPss(u8[] n, u8[] e, u8[] msg, u8[] sig, i32 hashLen, i32 saltLen) {
+  if (sig.len() != n.len()) { return false; }
+  Big modulus = fromBytes(n);
+  if (isZero(modulus)) { return false; }
+  Big s = fromBytes(sig);
+  if (cmp(s, modulus) >= 0) { return false; }
+
+  i32 emBits = bitLen(modulus) - 1;
+  i32 emLen = (emBits + 7) / 8;
+  if (emLen < hashLen + saltLen + 2) { return false; }
+
+  Big m = modPow(s, fromBytes(e), modulus);
+  u8[] em = toBytes(m, emLen);
+
+  if (em[emLen - 1] != 0xBC) { return false; }
+
+  i32 dbLen = emLen - hashLen - 1;
+  u8[] maskedDb = u8[dbLen]();
+  for (i32 i = 0; i < dbLen; i++) { maskedDb[i] = em[i]; }
+  u8[] hSeed = u8[hashLen]();
+  for (i32 i = 0; i < hashLen; i++) { hSeed[i] = em[dbLen + i]; }
+
+  // The unused leading bits of the first byte must be zero. Skipping this lets a
+  // signature be malleable in those bits.
+  i32 unusedBits = 8 * emLen - emBits;
+  if (unusedBits > 0 && (maskedDb[0] >> (8 - unusedBits)) != 0) { return false; }
+
+  u8[] dbMask = mgf1(hSeed, dbLen, hashLen);
+  u8[] db = u8[dbLen]();
+  for (i32 i = 0; i < dbLen; i++) { db[i] = maskedDb[i] ^ dbMask[i]; }
+  if (unusedBits > 0) { db[0] = db[0] & (0xFF >> unusedBits); }
+
+  // db must be zeros, then 0x01, then the salt.
+  i32 zeroEnd = dbLen - saltLen - 1;
+  i32 diff = 0;
+  for (i32 i = 0; i < zeroEnd; i++) { diff = diff | db[i]; }
+  diff = diff | (db[zeroEnd] ^ 0x01);
+  if (diff != 0) { return false; }
+
+  u8[] salt = u8[saltLen]();
+  for (i32 i = 0; i < saltLen; i++) { salt[i] = db[zeroEnd + 1 + i]; }
+
+  // H' = Hash(00 00 00 00 00 00 00 00 || mHash || salt), and the eight zero bytes are
+  // not decoration: they are what stops a PSS signature being reinterpreted as a
+  // signature over a different structure.
+  u8[] mHash = digest(msg, hashLen);
+  u8[] mPrime = u8[8 + hashLen + saltLen]();
+  for (i32 i = 0; i < hashLen; i++) { mPrime[8 + i] = mHash[i]; }
+  for (i32 i = 0; i < saltLen; i++) { mPrime[8 + hashLen + i] = salt[i]; }
+  u8[] hPrime = digest(mPrime, hashLen);
+
+  i32 diff2 = 0;
+  for (i32 i = 0; i < hashLen; i++) { diff2 = diff2 | (hPrime[i] ^ hSeed[i]); }
+  return diff2 == 0;
+}
