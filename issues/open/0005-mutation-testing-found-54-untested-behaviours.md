@@ -1,4 +1,4 @@
-# 0005 — 54 surviving mutants: behaviours nothing checks
+# 0005 — surviving mutants: behaviours nothing checks
 
 - **Status:** open
 - **Reported by:** agent-c
@@ -14,8 +14,8 @@ discarded: 4 provably equivalent (TCE), 0 duplicate, 5 uncompilable
 58 surviving
 ```
 
-Four of the 58 are already fixed (crypto, see 9c937ce) and one is documented as
-genuinely equivalent, leaving **54 open**. A surviving mutant means the code was
+Crypto's five and gzip's eighteen are resolved (9c937ce, c392701), leaving **31 open**.
+`deno task mutate --operators --package crypto` and `--package gzip` both exit 0. A surviving mutant means the code was
 changed and no test noticed — which is the failure branch coverage cannot show, since a
 test can execute a line thoroughly and assert nothing about what it did. Every package
 here is at or near 100% branch coverage.
@@ -23,7 +23,7 @@ here is at or near 100% branch coverage.
 | package | survivors |
 |---|---:|
 | wacc    | 20 |
-| gzip    | 18 → resolved, see below |
+| gzip    | 18 → resolved |
 | fmt     |  4 |
 | std     |  3 |
 | json    |  3 |
@@ -73,9 +73,6 @@ the case for asking rather than assuming.
 ## The rest
 
 ```
-extreme/gzip/crc32/sliceThreshold      extreme/gzip/deflate/goodLength
-extreme/gzip/deflate/niceLength        extreme/gzip/gzip/smallInput
-extreme/gzip/inflate/rootBits          extreme/gzip/inflate/maxSizeHint
 extreme/fmt/atof/approxBits            extreme/fmt/ftoa/ftoa32
 extreme/fmt/ftoa/writeF32              guard/fmt/ftoa:230:23
 extreme/std/hash/hashI32               extreme/std/hash/hashI64
@@ -84,11 +81,15 @@ extreme/url/percent/needsEncoding      guard/bignum/big:316:17
 guard/bignum/big:340:19                extreme/wactest/assert/utoa
 ```
 
-Several of the `extreme` ones are tuning constants — `sliceThreshold`, `goodLength`,
-`niceLength`, `rootBits` — where a survivor may be the same "ratio only, not
-correctness" category the curated list already marks. That is a judgement per constant,
-not a blanket excuse: `rootBits` is a decoder table size, not a tuning knob, and
-`maxSizeHint` bounds an allocation from attacker-controlled input.
+Gzip's six `extreme` survivors were all tuning constants and are recorded in known.ts,
+but not with one blanket excuse — the reasons differ and two of them needed checking
+rather than asserting. `sliceThreshold` and `rootBits` select an implementation and were
+verified to produce byte-identical output; `goodLength`, `niceLength` and `smallInput`
+change the ratio, which the suite deliberately does not pin; `maxSizeHint` is a memory
+bound where the mutation moves in the *safe* direction, so its survival says nothing
+about whether the bound works — that is a limit of the `extreme` operator, and what the
+cap is for is now pinned directly by a test. Expect the same spread in the remaining
+`extreme` survivors rather than one answer.
 
 `extreme/fmt/ftoa/ftoa32` and `writeF32` surviving while their f64 twins are killed
 suggests the 32-bit path is tested much more thinly than the 64-bit one.
