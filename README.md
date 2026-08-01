@@ -20,6 +20,7 @@ compiler, this one is things built with it.
 | [`codec`](packages/codec/) | base16, base32 and base64 from RFC 4648, strict on decode |
 | [`regex`](packages/regex/) | a backtracking regex engine with JavaScript's semantics |
 | [`datetime`](packages/datetime/) | the proleptic Gregorian calendar and RFC 3339 timestamps |
+| [`http`](packages/http/) | HTTP/1.1 request parsing, strict about framing |
 | [`std`](packages/std/) | `Vec<T>`, `Map<K, V>`, `Option<T>`, `Result<T, E>` — the containers generics made writable |
 | [`wactest`](packages/wactest/) | assertions for writing tests in wac |
 
@@ -69,6 +70,7 @@ deno task coverage:crypto
 deno task coverage:datetime
 deno task coverage:fmt
 deno task coverage:gzip
+deno task coverage:http
 deno task coverage:json
 deno task coverage:regex
 deno task coverage:std

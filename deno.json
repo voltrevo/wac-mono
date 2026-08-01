@@ -14,6 +14,7 @@
     "coverage:datetime": "deno run -A packages/datetime/cov.ts",
     "coverage:fmt": "deno run -A packages/fmt/cov.ts",
     "coverage:gzip": "deno run -A packages/gzip/cov.ts",
+    "coverage:http": "deno run -A packages/http/cov.ts",
     "coverage:json": "deno run -A packages/json/cov.ts",
     "coverage:regex": "deno run -A packages/regex/cov.ts",
     "coverage:std": "deno run -A packages/std/cov.ts",
@@ -21,7 +22,7 @@
     "mutate": "deno run -A tools/mutate.ts",
     "mutate:diff": "deno run -A tools/mutate.ts --diff --operators",
     "mutate:operators": "deno run -A tools/mutate.ts --operators",
-    "test": "deno test --allow-read --allow-write --allow-run",
+    "test": "deno test --allow-read --allow-write --allow-run --allow-net",
     "validate": "deno run -A tools/validate.ts",
     "verify:fmt": "deno run -A packages/fmt/tools/sweep.ts"
   },

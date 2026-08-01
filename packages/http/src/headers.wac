@@ -1,0 +1,100 @@
+// Header fields: the store, and the token rules that decide what is a field at all.
+//
+// Names and values are kept as parallel arrays of byte slices, in the order they arrived and with
+// duplicates intact. Both of those matter and neither is the convenient choice: `Set-Cookie`
+// cannot be folded into one value, the order of `Via` and `Forwarded` is the record of the path a
+// message took, and a duplicate `Content-Length` is the thing a framing check has to notice
+// rather than the thing a map would silently drop.
+//
+// Lookup is case-insensitive over ASCII, which is what RFC 9110 §5.1 says a field name is.
+
+export struct Headers {
+  u8[][] names;
+  u8[][] values;
+  i32 count;
+
+  Headers create() { return Headers(u8[][0](), u8[][0](), 0); }
+
+  void push(this, u8[] name, u8[] value) {
+    if (this.count == this.names.len()) {
+      i32 next = this.names.len() == 0 ? 8 : this.names.len() * 2;
+      u8[][] n = u8[][next]();
+      u8[][] v = u8[][next]();
+      for (i32 i = 0; i < this.count; i++) { n[i] = this.names[i]; v[i] = this.values[i]; }
+      this.names = n;
+      this.values = v;
+    }
+    this.names[this.count] = name;
+    this.values[this.count] = value;
+    this.count++;
+  }
+
+  i32 len(const this) { return this.count; }
+  u8[] nameAt(const this, i32 i) { return this.names[i]; }
+  u8[] valueAt(const this, i32 i) { return this.values[i]; }
+
+  /** How many fields carry this name, which is what the framing rules actually ask. */
+  i32 countOf(const this, string name) {
+    u8[] want = name.toBytes();
+    i32 n = 0;
+    for (i32 i = 0; i < this.count; i++) {
+      if (eqFold(this.names[i], want)) { n++; }
+    }
+    return n;
+  }
+
+  /** The first value with this name, or an empty slice. Use with `countOf`, not instead of it. */
+  u8[] first(const this, string name) {
+    u8[] want = name.toBytes();
+    for (i32 i = 0; i < this.count; i++) {
+      if (eqFold(this.names[i], want)) { return this.values[i]; }
+    }
+    return u8[0]();
+  }
+}
+
+i32 lowerByte(i32 c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+
+/** ASCII case-insensitive equality, which is exactly the comparison a field name wants. */
+export bool eqFold(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (lowerByte(a[i]) != lowerByte(b[i])) { return false; }
+  }
+  return true;
+}
+
+/**
+ * A `token` character, from RFC 9110 §5.6.2.
+ *
+ * Spelled out rather than "not a separator", because the set is the whole point: a byte outside
+ * it in a field name is what tells `Host : a` and `X-Foo\x00: a` apart from a real header, and
+ * accepting either is how a parser and its proxy come to disagree about where a message ends.
+ */
+export bool isToken(i32 c) {
+  if (c >= 'a' && c <= 'z') { return true; }
+  if (c >= 'A' && c <= 'Z') { return true; }
+  if (c >= '0' && c <= '9') { return true; }
+  return c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' || c == '*'
+      || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' || c == '`' || c == '|'
+      || c == '~';
+}
+
+/** Optional whitespace: space or horizontal tab, and nothing else. */
+export bool isOws(i32 c) { return c == ' ' || c == 9; }
+
+/**
+ * A byte allowed in a field value: visible ASCII, plus space and tab inside.
+ *
+ * Control characters are not, and that is the load-bearing part: a bare CR or LF in a value is
+ * how a header injection gets written, and a parser that passes them through hands the next hop
+ * a message with a different shape.
+ *
+ * Bytes above 0x7F are not either, though RFC 9110 §5.5 still permits them as `obs-text`. The
+ * grammar allows them and says they are deprecated and have no defined character encoding — so
+ * two parties that both accept them will decode them differently, which is the same class of
+ * problem as an ambiguous length. llhttp rejects them too.
+ */
+export bool isFieldValueByte(i32 c) {
+  return c == 9 || (c >= 0x20 && c < 0x7F);
+}

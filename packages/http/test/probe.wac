@@ -1,0 +1,56 @@
+// Host-facing entry point.
+//
+// One call returns the whole parse, NUL-separated: an outcome word, then the request line and
+// every header name and value in order. Order and duplicates survive the crossing, since both are
+// part of what is being compared.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { Parsed, Request, parseRequest } from "../src/request.wac";
+
+void writeInt(Buf out, i32 v) {
+  if (v == 0) { out.push('0'); return; }
+  u8[] tmp = u8[12]();
+  i32 n = 0;
+  i32 x = v;
+  while (x > 0) { tmp[n] = 48 + (x % 10); x = x / 10; n++; }
+  for (i32 i = n - 1; i >= 0; i--) { out.push(tmp[i]); }
+}
+
+/**
+ * `ok\0method\0target\0minor\0consumed\0bodyLen\0name\0value\0...`, or `bad\0code`, or
+ * `incomplete`. The body is reported by length and by content separately so a body that contains
+ * a NUL is still comparable.
+ */
+export u8[] parse(u8[] input, i32 maxBody) {
+  Buf out = Buf.create();
+  match (parseRequest(input, maxBody)) {
+    case Incomplete: {
+      out.pushAll("incomplete".toBytes());
+    }
+    case Bad(code): {
+      out.pushAll("bad".toBytes());
+      out.push(0);
+      writeInt(out, code);
+    }
+    case Ok(request): {
+      out.pushAll("ok".toBytes());
+      out.push(0);
+      out.pushAll(request.method);
+      out.push(0);
+      out.pushAll(request.target);
+      out.push(0);
+      writeInt(out, request.minor);
+      out.push(0);
+      writeInt(out, request.consumed);
+      out.push(0);
+      out.pushAll(request.body);
+      for (i32 i = 0; i < request.headers.len(); i++) {
+        out.push(0);
+        out.pushAll(request.headers.nameAt(i));
+        out.push(0);
+        out.pushAll(request.headers.valueAt(i));
+      }
+    }
+  }
+  return out.take();
+}
