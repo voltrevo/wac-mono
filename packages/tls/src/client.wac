@@ -216,18 +216,25 @@ u8[] clientHello(CConn c) {
   groupList.u16(0x0017);          // secp256r1
   groups.vec16(groupList.take());
   exts.vec16(groups.take());
-  // signature_algorithms. The first three are what a peer may use in CertificateVerify;
-  // rsa_pkcs1_sha256 is listed because RFC 8446 §4.4.2.2 lets *certificates* be signed
-  // that way — which is how almost every certificate on the web is signed — while
-  // §4.4.3 forbids it for CertificateVerify itself.
+  // signature_algorithms. This list is a claim about what we can check, so everything
+  // certSignedBy and certVerifySignature handle belongs in it and nothing else does:
+  // advertising more invites a server to send something that then fails verification,
+  // and advertising less makes a server pick a weaker option or give up.
+  //
+  // The pkcs1 entries are here because RFC 8446 §4.4.2.2 lets *certificates* be signed
+  // that way — which is how almost every certificate on the web is signed — while §4.4.3
+  // forbids it for CertificateVerify itself.
   exts.u16(13);
   Writer sigs = Writer.create();
   Writer sigList = Writer.create();
   sigList.u16(0x0807);            // ed25519
   sigList.u16(0x0403);            // ecdsa_secp256r1_sha256
+  sigList.u16(0x0503);            // ecdsa_secp384r1_sha384
   sigList.u16(0x0804);            // rsa_pss_rsae_sha256
   sigList.u16(0x0805);            // rsa_pss_rsae_sha384
   sigList.u16(0x0401);            // rsa_pkcs1_sha256, for certificates only
+  sigList.u16(0x0501);            // rsa_pkcs1_sha384, likewise
+  sigList.u16(0x0601);            // rsa_pkcs1_sha512, likewise
   sigs.vec16(sigList.take());
   exts.vec16(sigs.take());
   // supported_versions
