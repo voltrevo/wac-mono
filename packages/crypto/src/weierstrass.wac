@@ -1,0 +1,388 @@
+// Short Weierstrass curves y^2 = x^3 - 3x + b over a NIST prime field.
+//
+// P-256 and P-384 differ in their prime, their b, their order and their base point, and
+// in nothing else — same equation, same a = -3, same coordinates, same formulas. So the
+// curve arithmetic lives here once and `p256.wac` and `p384.wac` are the constants plus
+// a named API. The field module picks its prime from the limb count, so this code never
+// needs to know which curve it is on.
+//
+// Jacobian coordinates throughout: (X, Y, Z) stands for the affine (X/Z^2, Y/Z^3), which
+// turns the inversion in every point addition into one inversion at the very end.
+
+import {
+  fpZero, fpOne, fpSmall, fpCopy, fpAdd, fpSub, fpMul, fpSquare, fpInvert,
+  fpIsZero, fpEquals, fpToBytes, fpFromBytes, fpInRange,
+} from "./fieldp.wac";
+
+/**
+ * A curve's constants.
+ *
+ * `order` and the coordinates are all the same length — 32 bytes for P-256, 48 for P-384
+ * — which is true of both curves here and is what lets the sizes below be derived from
+ * `order.len()` rather than passed around.
+ */
+export struct Curve {
+  i64[] b;
+  u8[] order;
+  u8[] gx;
+  u8[] gy;
+}
+
+/** A point in Jacobian coordinates. Z = 0 is the point at infinity. */
+export struct Jac {
+  i64[] x;
+  i64[] y;
+  i64[] z;
+}
+
+i32 limbCount(Curve c) { return c.b.len(); }
+i32 byteLen(Curve c) { return c.order.len(); }
+
+export Jac jacInfinity(Curve c) {
+  i32 n = limbCount(c);
+  return Jac(fpOne(n), fpOne(n), fpZero(n));
+}
+
+export bool jacIsInfinity(Jac p) { return fpIsZero(p.z); }
+
+Jac jacFromAffine(Curve c, i64[] x, i64[] y) {
+  return Jac(fpCopy(x), fpCopy(y), fpOne(limbCount(c)));
+}
+
+export Jac curveBase(Curve c) {
+  return jacFromAffine(c, fpFromBytes(c.gx), fpFromBytes(c.gy));
+}
+
+/**
+ * 2P, by the a = -3 doubling formula.
+ *
+ * The curve's `a` being exactly -3 is not a coincidence; NIST chose it for every curve in
+ * the family because it makes `3(X - Z^2)(X + Z^2)` stand in for the general
+ * `3X^2 + aZ^4`, saving two squarings per doubling. Using the general formula here would
+ * be correct and slower.
+ */
+export Jac jacDouble(Curve c, Jac p) {
+  if (jacIsInfinity(p)) { return jacInfinity(c); }
+  i32 n = limbCount(c);
+  i64[] zz = fpSquare(p.z);
+  i64[] m = fpMul(fpSmall(n, 3), fpMul(fpSub(p.x, zz), fpAdd(p.x, zz)));   // 3(X-Z^2)(X+Z^2)
+  i64[] yy = fpSquare(p.y);
+  i64[] s = fpMul(fpSmall(n, 4), fpMul(p.x, yy));                          // 4XY^2
+  i64[] x3 = fpSub(fpSquare(m), fpAdd(s, s));
+  i64[] y3 = fpSub(fpMul(m, fpSub(s, x3)), fpMul(fpSmall(n, 8), fpSquare(yy)));
+  i64[] z3 = fpMul(fpAdd(p.y, p.y), p.z);
+  return Jac(x3, y3, z3);
+}
+
+/**
+ * P + Q.
+ *
+ * The exceptional cases are what make this longer than it looks: either operand may be
+ * the identity, the two may be equal — in which case the general formula divides by zero
+ * and doubling is meant — and they may be negations of each other, giving the identity.
+ * Getting any of these wrong produces a scalar multiplication that is right for almost
+ * every input, which is the worst kind of wrong.
+ */
+export Jac jacAdd(Curve c, Jac p, Jac q) {
+  if (jacIsInfinity(p)) { return Jac(fpCopy(q.x), fpCopy(q.y), fpCopy(q.z)); }
+  if (jacIsInfinity(q)) { return Jac(fpCopy(p.x), fpCopy(p.y), fpCopy(p.z)); }
+
+  i64[] z1z1 = fpSquare(p.z);
+  i64[] z2z2 = fpSquare(q.z);
+  i64[] u1 = fpMul(p.x, z2z2);
+  i64[] u2 = fpMul(q.x, z1z1);
+  i64[] s1 = fpMul(p.y, fpMul(q.z, z2z2));
+  i64[] s2 = fpMul(q.y, fpMul(p.z, z1z1));
+
+  if (fpEquals(u1, u2)) {
+    if (fpEquals(s1, s2)) { return jacDouble(c, p); }
+    return jacInfinity(c);                        // Q = -P
+  }
+
+  i64[] h = fpSub(u2, u1);
+  i64[] r = fpSub(s2, s1);
+  i64[] hh = fpSquare(h);
+  i64[] hhh = fpMul(h, hh);
+  i64[] u1hh = fpMul(u1, hh);
+  i64[] x3 = fpSub(fpSub(fpSquare(r), hhh), fpAdd(u1hh, u1hh));
+  i64[] y3 = fpSub(fpMul(r, fpSub(u1hh, x3)), fpMul(s1, hhh));
+  i64[] z3 = fpMul(fpMul(p.z, q.z), h);
+  return Jac(x3, y3, z3);
+}
+
+/** scalar * P, most significant bit first. `scalar` is big-endian, `byteLen` long. */
+export Jac jacMul(Curve c, u8[] scalar, Jac p) {
+  Jac acc = jacInfinity(c);
+  i32 bits = 8 * byteLen(c);
+  for (i32 i = 0; i < bits; i++) {
+    acc = jacDouble(c, acc);
+    i32 bit = (scalar[i / 8] >> (7 - (i % 8))) & 1;
+    if (bit == 1) { acc = jacAdd(c, acc, p); }
+  }
+  return acc;
+}
+
+/** The affine coordinates of a point, as x ++ y. Traps on the identity, which has none. */
+export u8[] jacToAffine(Curve c, Jac p) {
+  if (jacIsInfinity(p)) { trap; }
+  i32 len = byteLen(c);
+  i64[] zi = fpInvert(p.z);
+  i64[] zi2 = fpSquare(zi);
+  i64[] zi3 = fpMul(zi2, zi);
+  u8[] x = fpToBytes(fpMul(p.x, zi2));
+  u8[] y = fpToBytes(fpMul(p.y, zi3));
+  u8[] out = u8[2 * len]();
+  for (i32 i = 0; i < len; i++) { out[i] = x[i]; out[len + i] = y[i]; }
+  return out;
+}
+
+/** Whether an affine point satisfies the curve equation. */
+bool onCurve(Curve c, i64[] x, i64[] y) {
+  i32 n = limbCount(c);
+  i64[] lhs = fpSquare(y);
+  i64[] rhs = fpAdd(fpSub(fpMul(fpSquare(x), x), fpMul(fpSmall(n, 3), x)), c.b);
+  return fpEquals(lhs, rhs);
+}
+
+/**
+ * Decode an uncompressed point: 0x04 followed by x and y.
+ *
+ * Every check here matters. A point off the curve, or with a coordinate at or above p,
+ * lets an attacker run the scalar multiplication in a group they chose — which for ECDH
+ * leaks the private key a few bits at a time. This is the invalid-curve attack, and
+ * skipping the validation is how implementations fall to it.
+ */
+export Jac curveDecode(Curve c, u8[] s) {
+  i32 len = byteLen(c);
+  if (s.len() != 1 + 2 * len) { trap; }
+  if (s[0] != 4) { trap; }
+  u8[] xb = u8[len]();
+  u8[] yb = u8[len]();
+  for (i32 i = 0; i < len; i++) { xb[i] = s[1 + i]; yb[i] = s[1 + len + i]; }
+  if (!fpInRange(xb)) { trap; }
+  if (!fpInRange(yb)) { trap; }
+  i64[] x = fpFromBytes(xb);
+  i64[] y = fpFromBytes(yb);
+  // No separate check for (0, 0): the curve equation already rejects it, since 0 = b is
+  // false for both curves' b. An explicit one was here and coverage showed it could not
+  // be reached — the range check above always fires first.
+  if (!onCurve(c, x, y)) { trap; }
+  return jacFromAffine(c, x, y);
+}
+
+/** Encode a point uncompressed: 0x04 ++ x ++ y. */
+export u8[] curveEncode(Curve c, Jac p) {
+  u8[] xy = jacToAffine(c, p);
+  u8[] out = u8[1 + xy.len()]();
+  out[0] = 4;
+  for (i32 i = 0; i < xy.len(); i++) { out[1 + i] = xy[i]; }
+  return out;
+}
+
+// ── Scalars, modulo the group order n ─────────────────────────────────────────
+
+/** Compare two equal-length big-endian scalars. */
+export i32 cmpBE(u8[] a, u8[] b) {
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return a[i] < b[i] ? -1 : 1; }
+  }
+  return 0;
+}
+
+export bool isZeroBE(u8[] a) {
+  i32 acc = 0;
+  for (i32 i = 0; i < a.len(); i++) { acc = acc | a[i]; }
+  return acc == 0;
+}
+
+/** (a + b) mod n. */
+u8[] scAdd(Curve c, u8[] a, u8[] b) {
+  u8[] n = c.order;
+  i32 len = n.len();
+  u8[] out = u8[len]();
+  i32 carry = 0;
+  for (i32 i = len - 1; i >= 0; i--) {
+    i32 s = a[i] + b[i] + carry;
+    out[i] = s & 0xFF;
+    carry = s >> 8;
+  }
+  if (carry != 0 || cmpBE(out, n) >= 0) {
+    i32 borrow = 0;
+    for (i32 i = len - 1; i >= 0; i--) {
+      i32 d = out[i] - n[i] - borrow;
+      borrow = d < 0 ? 1 : 0;
+      out[i] = d & 0xFF;
+    }
+  }
+  return out;
+}
+
+/**
+ * (a * b) mod n, by double-and-add over the bits of b.
+ *
+ * A modular doubling and a conditional modular addition per bit. Far slower than a
+ * Montgomery multiplication and about a tenth the code, which is the right trade for
+ * something that runs a handful of times per signature.
+ */
+u8[] scMul(Curve c, u8[] a, u8[] b) {
+  i32 len = c.order.len();
+  u8[] acc = u8[len]();
+  u8[] addend = u8[len]();
+  for (i32 i = 0; i < len; i++) { addend[i] = a[i]; }
+  for (i32 i = 8 * len - 1; i >= 0; i--) {
+    i32 bit = (b[i / 8] >> (7 - (i % 8))) & 1;
+    if (bit == 1) { acc = scAdd(c, acc, addend); }
+    addend = scAdd(c, addend, addend);
+  }
+  return acc;
+}
+
+/** 1/a mod n, by Fermat. n is prime, so a^(n-2) is the inverse. */
+u8[] scInvert(Curve c, u8[] a) {
+  i32 len = c.order.len();
+  u8[] e = u8[len]();
+  for (i32 i = 0; i < len; i++) { e[i] = c.order[i]; }
+  i32 at = len - 1;
+  while (at >= 0) {
+    if (e[at] >= 2) { e[at] -= 2; at = -1; } else { e[at] = e[at] + 254; at--; }
+  }
+  u8[] result = u8[len]();
+  result[len - 1] = 1;
+  u8[] base = u8[len]();
+  for (i32 i = 0; i < len; i++) { base[i] = a[i]; }
+  for (i32 bit = 8 * len - 1; bit >= 0; bit--) {
+    i32 b = (e[bit / 8] >> (7 - (bit % 8))) & 1;
+    if (b == 1) { result = scMul(c, result, base); }
+    base = scMul(c, base, base);
+  }
+  return result;
+}
+
+/** Reduce a big-endian value of the order's length mod n, by conditional subtraction. */
+u8[] scReduce(Curve c, u8[] a) {
+  i32 len = c.order.len();
+  u8[] out = u8[len]();
+  for (i32 i = 0; i < len; i++) { out[i] = a[i]; }
+  while (cmpBE(out, c.order) >= 0) {
+    i32 borrow = 0;
+    for (i32 i = len - 1; i >= 0; i--) {
+      i32 d = out[i] - c.order[i] - borrow;
+      borrow = d < 0 ? 1 : 0;
+      out[i] = d & 0xFF;
+    }
+  }
+  return out;
+}
+
+// ── ECDH ──────────────────────────────────────────────────────────────────────
+
+/** The public key for a private scalar, uncompressed. */
+export u8[] curvePublicKey(Curve c, u8[] priv) {
+  if (priv.len() != byteLen(c)) { trap; }
+  if (isZeroBE(priv) || cmpBE(priv, c.order) >= 0) { trap; }
+  return curveEncode(c, jacMul(c, priv, curveBase(c)));
+}
+
+/**
+ * The ECDH shared secret: the x-coordinate of priv * peerPublic.
+ *
+ * `curveDecode` validates the peer's point, which is the whole defence against an
+ * invalid-curve attack — the multiplication itself cannot tell it is working in the
+ * wrong group.
+ */
+export u8[] curveEcdh(Curve c, u8[] priv, u8[] peerPublic) {
+  i32 len = byteLen(c);
+  if (priv.len() != len) { trap; }
+  if (isZeroBE(priv) || cmpBE(priv, c.order) >= 0) { trap; }
+  Jac shared = jacMul(c, priv, curveDecode(c, peerPublic));
+  if (jacIsInfinity(shared)) { trap; }
+  u8[] xy = jacToAffine(c, shared);
+  u8[] out = u8[len]();
+  for (i32 i = 0; i < len; i++) { out[i] = xy[i]; }
+  return out;
+}
+
+// ── ECDSA ─────────────────────────────────────────────────────────────────────
+
+/**
+ * A digest as a scalar, by the truncation rule of SEC 1 §4.1.3.
+ *
+ * When the digest is longer than the order, the *leftmost* bits are taken — SHA-512 under
+ * P-256 keeps the first 32 bytes and discards the rest. When it is shorter it is treated
+ * as a small number, so it is right-aligned. Both orders here are a whole number of bytes
+ * (exactly 256 and 384 bits), so there is no trailing bit shift, which there would be for
+ * a curve like P-521.
+ */
+u8[] digestScalar(Curve c, u8[] digest) {
+  i32 len = c.order.len();
+  u8[] e = u8[len]();
+  if (digest.len() >= len) {
+    for (i32 i = 0; i < len; i++) { e[i] = digest[i]; }
+  } else {
+    i32 pad = len - digest.len();
+    for (i32 i = 0; i < digest.len(); i++) { e[pad + i] = digest[i]; }
+  }
+  return scReduce(c, e);
+}
+
+/**
+ * Verify an ECDSA signature over an already-computed digest.
+ *
+ * `sig` is r ++ s, each the order's length, which is how TLS and X.509 carry it inside a
+ * DER wrapper the caller has already unwrapped. Both must be in [1, n). Taking a digest
+ * rather than a message is what lets one curve verify against several hashes, which
+ * certificates need: ecdsa-with-SHA384 on a P-256 key is legal and does occur.
+ */
+export bool ecdsaVerify(Curve c, u8[] publicKey, u8[] digest, u8[] sig) {
+  i32 len = byteLen(c);
+  if (sig.len() != 2 * len) { return false; }
+  u8[] r = u8[len]();
+  u8[] s = u8[len]();
+  for (i32 i = 0; i < len; i++) { r[i] = sig[i]; s[i] = sig[len + i]; }
+  if (isZeroBE(r) || cmpBE(r, c.order) >= 0) { return false; }
+  if (isZeroBE(s) || cmpBE(s, c.order) >= 0) { return false; }
+
+  u8[] e = digestScalar(c, digest);
+  u8[] sInv = scInvert(c, s);
+  u8[] u1 = scMul(c, e, sInv);
+  u8[] u2 = scMul(c, r, sInv);
+
+  Jac pub = curveDecode(c, publicKey);
+  Jac point = jacAdd(c, jacMul(c, u1, curveBase(c)), jacMul(c, u2, pub));
+  if (jacIsInfinity(point)) { return false; }
+
+  u8[] xy = jacToAffine(c, point);
+  u8[] x = u8[len]();
+  for (i32 i = 0; i < len; i++) { x[i] = xy[i]; }
+  return cmpBE(scReduce(c, x), r) == 0;
+}
+
+/**
+ * Sign a digest, with the caller supplying `k`.
+ *
+ * `k` is a parameter rather than generated here because wac has no randomness, and
+ * because a k that repeats across two signatures reveals the private key outright — so it
+ * belongs where the caller can see the responsibility. Returns r ++ s, or an empty array
+ * if this k does not work, in which case the caller must try another.
+ */
+export u8[] ecdsaSign(Curve c, u8[] priv, u8[] digest, u8[] k) {
+  i32 len = byteLen(c);
+  if (priv.len() != len || k.len() != len) { trap; }
+  if (isZeroBE(k) || cmpBE(k, c.order) >= 0) { return u8[0](); }
+
+  Jac point = jacMul(c, k, curveBase(c));
+  if (jacIsInfinity(point)) { return u8[0](); }
+  u8[] xy = jacToAffine(c, point);
+  u8[] r = u8[len]();
+  for (i32 i = 0; i < len; i++) { r[i] = xy[i]; }
+  r = scReduce(c, r);
+  if (isZeroBE(r)) { return u8[0](); }
+
+  u8[] e = digestScalar(c, digest);
+  u8[] s = scMul(c, scInvert(c, k), scAdd(c, e, scMul(c, r, priv)));
+  if (isZeroBE(s)) { return u8[0](); }
+
+  u8[] out = u8[2 * len]();
+  for (i32 i = 0; i < len; i++) { out[i] = r[i]; out[len + i] = s[i]; }
+  return out;
+}

@@ -89,7 +89,7 @@ export u8[] srvClose(u8[] state) { return tlsServerClose(state); }
 export u8[] srvAlert(u8[] state, i32 d) { return tlsServerAlert(state, d); }
 
 // X.509.
-import { parseCert, Cert, certMatchesHost, certSignedBy, verifyChain } from "../../src/x509.wac";
+import { parseCert, Cert, certMatchesHost, certSignedBy, verifyChain, verifyPath } from "../../src/x509.wac";
 
 /**
  * Parse and flatten.
@@ -129,11 +129,18 @@ export i32 x509VerifyChain(u8[] leafDer, u8[] caDer, u8[] host, i64 now) {
   return verifyChain(parseCert(leafDer), parseCert(caDer), host, now);
 }
 
+/** Path building over a concatenated chain and trust store, as the client does it. */
+export i32 x509VerifyPath(u8[] chain, i32[] chainOffsets, u8[] roots, i32[] rootOffsets,
+                          u8[] host, i64 now, i32 maxDepth) {
+  return verifyPath(chain, chainOffsets, roots, rootOffsets, host, now, maxDepth);
+}
+
 // The client state machine.
 import { tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientClose, tlsClientPhase,
          tlsClientFailure } from "../../src/client.wac";
-export u8[] cliInit(u8[] host, u8[] root, u8[] eph, u8[] p256, u8[] kemSeed, u8[] rnd, i64 now) {
-  return tlsClientInit(host, root, eph, p256, kemSeed, rnd, now);
+export u8[] cliInit(u8[] host, u8[] roots, i32[] rootOffsets, u8[] eph, u8[] p256,
+                    u8[] kemSeed, u8[] rnd, i64 now) {
+  return tlsClientInit(host, roots, rootOffsets, eph, p256, kemSeed, rnd, now);
 }
 export u8[] cliFeed(u8[] state, u8[] input) { return tlsClientFeed(state, input); }
 export u8[] cliSend(u8[] state, u8[] data) { return tlsClientSend(state, data); }

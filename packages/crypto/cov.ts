@@ -359,16 +359,40 @@ const UNREACHED: { file: string; line: number; snippet: string; why: string }[] 
       "work, so it stays untested rather than removed.",
   },
   {
-    file: "packages/crypto/src/fieldp256.wac",
-    line: 273,
-    snippet: "if (s.len() != 32) { trap; }",
-    why: "fpFromBytes' length guard. Every caller inside the package passes exactly 32, " +
+    file: "packages/crypto/src/fieldp.wac",
+    line: 319,
+    snippet: "if (s.len() % 4 != 0) { trap; }",
+    why: "fpFromBytes' length guard. Every caller inside the package passes 32 or 48, " +
       "and the function is not on the package's public surface, so nothing can reach it " +
       "without a code change. Defensive against a future caller.",
   },
   {
-    file: "packages/crypto/src/p256.wac",
-    line: 111,
+    file: "packages/crypto/src/fieldp.wac",
+    line: 51,
+    snippet: "if (n != 12) { trap; }",
+    why: "pLimbs asked for a limb count that is neither eight nor twelve. Unreachable " +
+      "for the same reason as the guard above — every field element originates from a " +
+      "decode that already checked — and kept because the alternative to trapping is " +
+      "returning P-384's prime for a P-521 element.",
+  },
+  {
+    file: "packages/crypto/src/fieldp.wac",
+    line: 66,
+    snippet: "if (n != 12) { trap; }",
+    why: "foldVector's copy of that same guard.",
+  },
+  {
+    file: "packages/crypto/src/fieldp.wac",
+    line: 262,
+    snippet: "if (b.len() != n) { trap; }",
+    why: "fpMul with operands from two different curves. Nothing mixes them: a Curve's " +
+      "b, its base point and every intermediate all come from the same decode. Kept " +
+      "because the failure it prevents — reducing a P-256 product modulo P-384 — would " +
+      "be silent arithmetic rather than an error.",
+  },
+  {
+    file: "packages/crypto/src/weierstrass.wac",
+    line: 88,
     snippet: "if (jacIsInfinity(q))",
     why: "jacAdd with the *second* operand at infinity. The ladder only ever adds a fixed " +
       "point to an accumulator, so the identity always arrives as the first operand and " +
@@ -376,9 +400,9 @@ const UNREACHED: { file: string; line: number; snippet: string; why: string }[] 
       "the other way round.",
   },
   {
-    file: "packages/crypto/src/p256.wac",
-    line: 121,
-    snippet: "if (fpEquals(s1, s2)) { return jacDouble(p); }",
+    file: "packages/crypto/src/weierstrass.wac",
+    line: 98,
+    snippet: "if (fpEquals(s1, s2)) { return jacDouble(c, p); }",
     why: "The doubling case inside jacAdd, for P + P. The ladder doubles the accumulator " +
       "before every conditional add, so the accumulator is never equal to the addend at " +
       "the point of adding. It is reachable through the exported jacAdd and through an " +
@@ -387,29 +411,29 @@ const UNREACHED: { file: string; line: number; snippet: string; why: string }[] 
       "the general formula divides by zero for P + P — so it stays.",
   },
   {
-    file: "packages/crypto/src/p256.wac",
-    line: 286,
-    snippet: "while (cmpBE(out, n) >= 0)",
+    file: "packages/crypto/src/weierstrass.wac",
+    line: 266,
+    snippet: "while (cmpBE(out, c.order) >= 0)",
     why: "scReduce's conditional subtraction, for a value at or above n. n is within " +
       "2^-32 of 2^256, so a uniformly random 32-byte value — a SHA-256 digest, or a " +
       "point's x-coordinate — lands above it about once in four billion times. Not " +
       "reachable by choosing inputs; reachable in the field, eventually, by somebody.",
   },
   {
-    file: "packages/crypto/src/p256.wac",
-    line: 288,
-    snippet: "for (i32 i = 31; i >= 0; i--)",
+    file: "packages/crypto/src/weierstrass.wac",
+    line: 268,
+    snippet: "for (i32 i = len - 1; i >= 0; i--)",
     why: "The subtraction inside that same loop.",
   },
   {
-    file: "packages/crypto/src/p256.wac",
-    line: 290,
+    file: "packages/crypto/src/weierstrass.wac",
+    line: 270,
     snippet: "borrow = d < 0 ? 1 : 0;",
     why: "The borrow inside that same loop.",
   },
   {
-    file: "packages/crypto/src/p256.wac",
-    line: 318,
+    file: "packages/crypto/src/weierstrass.wac",
+    line: 298,
     snippet: "if (jacIsInfinity(shared)) { trap; }",
     why: "An ECDH result at infinity. P-256 has prime order, so the only point of small " +
       "order is the identity itself, and p256Decode rejects anything not on the curve — " +
@@ -417,30 +441,30 @@ const UNREACHED: { file: string; line: number; snippet: string; why: string }[] 
       "because that argument depends on the validation above it staying correct.",
   },
   {
-    file: "packages/crypto/src/p256.wac",
-    line: 349,
+    file: "packages/crypto/src/weierstrass.wac",
+    line: 352,
     snippet: "if (jacIsInfinity(point)) { return false; }",
     why: "u1*G + u2*Q landing on the identity during verification. Constructible by an " +
       "attacker choosing r and s together, which is exactly why the check is here; not " +
       "constructible by accident, which is why no test drives it.",
   },
   {
-    file: "packages/crypto/src/p256.wac",
-    line: 371,
+    file: "packages/crypto/src/weierstrass.wac",
+    line: 374,
     snippet: "if (jacIsInfinity(point)) { return u8[0](); }",
     why: "k*G at infinity during signing, which needs k = 0 mod n — already rejected " +
       "above. FIPS 186-4 specifies the retry anyway.",
   },
   {
-    file: "packages/crypto/src/p256.wac",
-    line: 376,
+    file: "packages/crypto/src/weierstrass.wac",
+    line: 379,
     snippet: "if (isZeroBE(r)) { return u8[0](); }",
     why: "r = 0 during signing. FIPS 186-4 requires the retry; the probability is about " +
       "2^-256 and no test can produce it without solving for k.",
   },
   {
-    file: "packages/crypto/src/p256.wac",
-    line: 380,
+    file: "packages/crypto/src/weierstrass.wac",
+    line: 383,
     snippet: "if (isZeroBE(s)) { return u8[0](); }",
     why: "s = 0 during signing. As above.",
   },
@@ -515,6 +539,53 @@ const p256 = await instrument("packages/crypto/test/wac/p256_probe.wac");
   mustTrap("p256 short private key", () => pubKey(new Uint8Array(31)));
   mustTrap("p256 short key for ecdh", () => ecdh(new Uint8Array(31), pub));
   mustTrap("p256 short key for sign", () => sign(new Uint8Array(31), msg, be(7n, N)));
+
+  // P-384, through the same probe. The field functions read their prime off the operand
+  // length, so 48-byte inputs drive the twelve-limb side of every branch eight-byte
+  // inputs just drove — which is the point of testing them here rather than separately.
+  const P384 = (1n << 384n) - (1n << 128n) - (1n << 96n) + (1n << 32n) - 1n;
+  const be48 = (v: bigint, m = P384) => {
+    const o = new Uint8Array(48);
+    let x = ((v % m) + m) % m;
+    for (let i = 47; i >= 0; i--) { o[i] = Number(x & 0xFFn); x >>= 8n; }
+    return o;
+  };
+  for (const v of [0n, 1n, P384 - 1n, 1n << 32n, 1n << 96n, 1n << 128n, 1n << 383n]) {
+    g<(a: Uint8Array, b: Uint8Array) => Uint8Array>("pAdd")(be48(v), be48(P384 - 1n));
+    g<(a: Uint8Array, b: Uint8Array) => Uint8Array>("pSub")(be48(v), be48(P384 - 1n));
+    g<(a: Uint8Array, b: Uint8Array) => Uint8Array>("pMul")(be48(v), be48(P384 - 2n));
+    g<(a: Uint8Array) => Uint8Array>("pSquare")(be48(v));
+    g<(a: Uint8Array) => Uint8Array>("pInvert")(be48(v));
+    g<(a: Uint8Array) => Uint8Array>("pNeg")(be48(v));
+    g<(a: Uint8Array) => Uint8Array>("pRoundTrip")(be48(v));
+    g<(a: Uint8Array) => boolean>("pInRange")(be48(v));
+  }
+  const verify384 = g<(p: Uint8Array, m: Uint8Array, s: Uint8Array) => boolean>("verify384");
+  const verify384Digest = g<(p: Uint8Array, d: Uint8Array, s: Uint8Array) => boolean>("verify384Digest");
+  g<() => Uint8Array>("order384")();
+
+  const kp384 = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-384" }, true, ["sign", "verify"]) as CryptoKeyPair;
+  const pub384 = new Uint8Array(await crypto.subtle.exportKey("raw", kp384.publicKey));
+  const msg384 = bytes(30, 11);
+  const sig384 = new Uint8Array(await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-384" }, kp384.privateKey, msg384 as BufferSource));
+  verify384(pub384, msg384, sig384);
+  const bad384 = Uint8Array.from(sig384); bad384[0] ^= 1;
+  verify384(pub384, msg384, bad384);
+  verify384(pub384, msg384, new Uint8Array(95));
+  const N384 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF581A0DB248B0A77AECEC196ACCC52973n;
+  const n384 = be48(N384, N384 + 1n);
+  const bigR384 = Uint8Array.from(sig384); bigR384.set(n384, 0); verify384(pub384, msg384, bigR384);
+  const bigS384 = Uint8Array.from(sig384); bigS384.set(n384, 48); verify384(pub384, msg384, bigS384);
+  // A short digest under a long curve, which takes the right-aligning branch.
+  const sig256on384 = new Uint8Array(await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" }, kp384.privateKey, msg384 as BufferSource));
+  verify384Digest(pub384, sha256(msg384), sig256on384);
+  // p256VerifyDigest exists for x509, which hashes with whatever the certificate says
+  // rather than always SHA-256; nothing else in this package calls it.
+  g<(p: Uint8Array, d: Uint8Array, s: Uint8Array) => boolean>("verifyDigest")(
+    pub, sha256(msg), sig);
 }
 
 const rsa = await instrument("packages/crypto/test/wac/rsa_probe.wac");

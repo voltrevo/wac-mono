@@ -12,7 +12,8 @@
 // and would hide a shared misreading of the spec — hence the OpenSSL case.
 
 import {
-  close, failure, feed, init, p256Scalar, phase, pemToDer, request, send, unpack,
+  close, failure, feed, init, p256Scalar, pemBundle, phase, pemToDer, request,
+  send, singleRoot, unpack,
 } from "../host/connect.ts";
 import {
   feed as srvFeed, newConnection, recordNeeded, send as srvSend, tlsClose, unpack as srvUnpack,
@@ -152,7 +153,8 @@ Deno.test("client: refuses when the certificate is outside its validity window",
   const longAgo = BigInt(Math.floor(new Date("1990-01-01T00:00:00Z").getTime() / 1000));
   let state: Uint8Array;
   {
-    const r = unpack(init(enc.encode("wac.test"), caDer,
+    const store = singleRoot(caDer);
+    const r = unpack(init(enc.encode("wac.test"), store.der, store.offsets,
       crypto.getRandomValues(new Uint8Array(32)), p256Scalar(),
       crypto.getRandomValues(new Uint8Array(64)),
       crypto.getRandomValues(new Uint8Array(32)), longAgo));
@@ -196,7 +198,8 @@ Deno.test("client: sends a ClientHello a real server understands", async () => {
   // no useful signal, and this at least says the failure is later than the hello.
   const seed = new Uint8Array(32);
   seed[31] = 7;
-  const r = unpack(init(enc.encode("wac.test"), caDer, seed, seed,
+  const store = singleRoot(caDer);
+  const r = unpack(init(enc.encode("wac.test"), store.der, store.offsets, seed, seed,
     new Uint8Array(64), new Uint8Array(32), 0n));
   const hello = r.toSend;
   if (hello[0] !== 22) throw new Error("the first record is not a handshake record");

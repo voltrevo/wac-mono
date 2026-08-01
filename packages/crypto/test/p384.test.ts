@@ -1,0 +1,207 @@
+// NIST P-384: the field and ECDSA verification.
+//
+// P-384 shares every line of its arithmetic with P-256 — the same Jacobian formulas, the
+// same Solinas reduction reading its prime off the limb count — so this file is testing
+// that the *generalisation* holds, not a second implementation. That makes the field
+// differential the important part: if twelve limbs work as well as eight, the shared code
+// is genuinely generic, and if they do not, it is P-256 code with a P-384 door on it.
+//
+// The reduction is the specific thing under test. It is derived here rather than
+// transcribed from FIPS 186-4's ten-term table, from the one line
+//
+//   2^384 = 2^128 + 2^96 - 2^32 + 1   (mod p)
+//
+// which is p rearranged. That is much easier to check by eye than a grid of word indices,
+// but "easier to check" is not "checked", and only BigInt over thousands of products can
+// say whether the fold that grows out of it is right. Note it must also handle a negative
+// carry out of the fold, which P-256's positive-heavy vector rarely produces and P-384's
+// -2^32 term produces constantly.
+
+import { wacBind } from "../../../harness/wacBind.ts";
+
+const mod = await wacBind("packages/crypto/test/wac/p256_probe.wac");
+const pAdd = mod.pAdd as (a: Uint8Array, b: Uint8Array) => Uint8Array;
+const pSub = mod.pSub as (a: Uint8Array, b: Uint8Array) => Uint8Array;
+const pMul = mod.pMul as (a: Uint8Array, b: Uint8Array) => Uint8Array;
+const pSquare = mod.pSquare as (a: Uint8Array) => Uint8Array;
+const pInvert = mod.pInvert as (a: Uint8Array) => Uint8Array;
+const pNeg = mod.pNeg as (a: Uint8Array) => Uint8Array;
+const pRoundTrip = mod.pRoundTrip as (a: Uint8Array) => Uint8Array;
+const pInRange = mod.pInRange as (a: Uint8Array) => boolean;
+const verify384 = mod.verify384 as (pub: Uint8Array, msg: Uint8Array, sig: Uint8Array) => boolean;
+const verify384Digest =
+  mod.verify384Digest as (pub: Uint8Array, d: Uint8Array, sig: Uint8Array) => boolean;
+const order384 = mod.order384 as () => Uint8Array;
+
+const P = (1n << 384n) - (1n << 128n) - (1n << 96n) + (1n << 32n) - 1n;
+const N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF581A0DB248B0A77AECEC196ACCC52973n;
+
+const hex = (b: Uint8Array) => Array.from(b).map(x => x.toString(16).padStart(2, "0")).join("");
+
+/** A field element or scalar as 48 big-endian bytes. */
+function enc(v: bigint, m = P): Uint8Array {
+  const out = new Uint8Array(48);
+  let x = ((v % m) + m) % m;
+  for (let i = 47; i >= 0; i--) {
+    out[i] = Number(x & 0xFFn);
+    x >>= 8n;
+  }
+  return out;
+}
+
+const dec = (b: Uint8Array) => BigInt("0x" + (hex(b) || "0"));
+
+/**
+ * Inputs chosen to sit on the boundaries the reduction cares about.
+ *
+ * Random values almost never produce a carry out of the top limb, and never produce the
+ * repeated negative carry that P-384's -2^32 term can. p-1 squared, and values just below
+ * powers of two that appear in the prime, do.
+ */
+function corpus(): bigint[] {
+  const xs: bigint[] = [
+    0n, 1n, 2n, P - 1n, P - 2n, (P - 1n) / 2n,
+    (1n << 32n) - 1n, 1n << 32n, (1n << 32n) + 1n,
+    (1n << 96n) - 1n, 1n << 96n, (1n << 96n) + 1n,
+    (1n << 128n) - 1n, 1n << 128n, (1n << 128n) + 1n,
+    (1n << 192n), (1n << 256n), (1n << 383n),
+  ];
+  let seed = 0x9E3779B9n;
+  for (let i = 0; i < 40; i++) {
+    let v = 0n;
+    for (let j = 0; j < 6; j++) {
+      seed = (seed * 6364136223846793005n + 1442695040888963407n) & ((1n << 64n) - 1n);
+      v = (v << 64n) | seed;
+    }
+    xs.push(v % P);
+  }
+  return xs;
+}
+
+Deno.test("p384 field: add, sub, mul, square and negate agree with BigInt", () => {
+  const xs = corpus();
+  for (const a of xs) {
+    if (hex(pRoundTrip(enc(a))) !== hex(enc(a))) throw new Error(`round trip failed at ${a}`);
+    if (hex(pNeg(enc(a))) !== hex(enc(-a))) throw new Error(`negate failed at ${a}`);
+    if (hex(pSquare(enc(a))) !== hex(enc(a * a))) throw new Error(`square failed at ${a}`);
+    for (const b of xs) {
+      if (hex(pAdd(enc(a), enc(b))) !== hex(enc(a + b))) throw new Error(`add ${a} ${b}`);
+      if (hex(pSub(enc(a), enc(b))) !== hex(enc(a - b))) throw new Error(`sub ${a} ${b}`);
+      if (hex(pMul(enc(a), enc(b))) !== hex(enc(a * b))) throw new Error(`mul ${a} ${b}`);
+    }
+  }
+});
+
+Deno.test("p384 field: inversion, and that it undoes multiplication", () => {
+  for (const a of corpus()) {
+    if (a === 0n) continue;
+    const inv = dec(pInvert(enc(a)));
+    if ((a * inv) % P !== 1n) throw new Error(`inverse of ${a} is wrong`);
+  }
+});
+
+Deno.test("p384 field: values at or above p are not in range", () => {
+  if (!pInRange(enc(P - 1n))) throw new Error("p-1 should be in range");
+  // enc() reduces, so build the out-of-range values by hand.
+  const raw = (v: bigint) => {
+    const out = new Uint8Array(48);
+    let x = v;
+    for (let i = 47; i >= 0; i--) { out[i] = Number(x & 0xFFn); x >>= 8n; }
+    return out;
+  };
+  for (const v of [P, P + 1n, (1n << 384n) - 1n]) {
+    if (pInRange(raw(v))) throw new Error(`${v} should be out of range`);
+  }
+});
+
+Deno.test("p384: the group order is right", () => {
+  if (dec(order384()) !== N) throw new Error("order mismatch");
+});
+
+Deno.test("p384: verifies WebCrypto's ECDSA signatures and rejects tampering", async () => {
+  const kp = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-384" }, true, ["sign", "verify"]) as CryptoKeyPair;
+  const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+  if (pub.length !== 97) throw new Error(`expected a 97-byte point, got ${pub.length}`);
+
+  for (let round = 0; round < 3; round++) {
+    const msg = crypto.getRandomValues(new Uint8Array(40 + round));
+    const sig = new Uint8Array(await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-384" }, kp.privateKey, msg as BufferSource));
+    if (sig.length !== 96) throw new Error(`expected a 96-byte signature, got ${sig.length}`);
+    if (!verify384(pub, msg, sig)) throw new Error(`round ${round}: a genuine signature was rejected`);
+
+    // Every byte of the signature matters, and so does every byte of the message.
+    for (const i of [0, 1, 47, 48, 95]) {
+      const bad = Uint8Array.from(sig);
+      bad[i] ^= 1;
+      if (verify384(pub, msg, bad)) throw new Error(`round ${round}: accepted a signature altered at byte ${i}`);
+    }
+    const other = Uint8Array.from(msg);
+    other[0] ^= 1;
+    if (verify384(pub, other, sig)) throw new Error(`round ${round}: accepted a signature over a different message`);
+  }
+});
+
+Deno.test("p384: a signature is rejected under the wrong key", async () => {
+  // The check that distinguishes verification from a self-consistent computation: a
+  // signature that verifies must do so only under the key that made it.
+  const a = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-384" }, true, ["sign", "verify"]) as CryptoKeyPair;
+  const b = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-384" }, true, ["sign", "verify"]) as CryptoKeyPair;
+  const msg = new TextEncoder().encode("the same message under two keys");
+  const sig = new Uint8Array(await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-384" }, a.privateKey, msg as BufferSource));
+  const pubB = new Uint8Array(await crypto.subtle.exportKey("raw", b.publicKey));
+  if (verify384(pubB, msg, sig)) throw new Error("a signature verified under the wrong key");
+});
+
+Deno.test("p384: a SHA-256 digest under a P-384 key is right-aligned", async () => {
+  // Legal and it happens: ecdsa-with-SHA256 on a P-384 key. The digest is shorter than
+  // the order, so SEC 1 treats it as a small number rather than padding on the right. A
+  // left-aligned implementation verifies nothing and would look like a broken curve.
+  const kp = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-384" }, true, ["sign", "verify"]) as CryptoKeyPair;
+  const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+  const msg = new TextEncoder().encode("a short digest under a long curve");
+  const sig = new Uint8Array(await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" }, kp.privateKey, msg as BufferSource));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", msg as BufferSource));
+  if (!verify384Digest(pub, digest, sig)) throw new Error("a SHA-256 signature under P-384 was rejected");
+});
+
+Deno.test("p384: r or s outside [1, n) is refused", async () => {
+  const kp = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-384" }, true, ["sign", "verify"]) as CryptoKeyPair;
+  const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+  const msg = new TextEncoder().encode("range checks");
+  const sig = new Uint8Array(await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-384" }, kp.privateKey, msg as BufferSource));
+  if (!verify384(pub, msg, sig)) throw new Error("the genuine signature was rejected");
+
+  const withRS = (r: bigint, s: bigint) => {
+    const out = new Uint8Array(96);
+    out.set(enc(r, N), 0);
+    out.set(enc(s, N), 48);
+    return out;
+  };
+  const good = { r: dec(sig.subarray(0, 48)), s: dec(sig.subarray(48)) };
+  // enc() reduces mod N, so n and n+1 have to be laid down without it.
+  const rawRS = (r: bigint, s: bigint) => {
+    const out = new Uint8Array(96);
+    let x = r, y = s;
+    for (let i = 47; i >= 0; i--) { out[i] = Number(x & 0xFFn); x >>= 8n; }
+    for (let i = 47; i >= 0; i--) { out[48 + i] = Number(y & 0xFFn); y >>= 8n; }
+    return out;
+  };
+  for (const [r, s, what] of [
+    [0n, good.s, "r = 0"], [good.r, 0n, "s = 0"],
+    [N, good.s, "r = n"], [good.r, N, "s = n"],
+    [N + 1n, good.s, "r = n+1"], [good.r, N + 1n, "s = n+1"],
+  ] as const) {
+    if (verify384(pub, msg, rawRS(r, s))) throw new Error(`accepted ${what}`);
+  }
+  if (verify384(pub, msg, withRS(good.r, good.s)) !== true) throw new Error("the rebuilt genuine signature was rejected");
+  if (verify384(pub, msg, new Uint8Array(95))) throw new Error("accepted a 95-byte signature");
+});

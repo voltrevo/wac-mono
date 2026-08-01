@@ -14,7 +14,7 @@ A package of [wac-mono](../../README.md). All commands run from the repo root.
 | `src/handshake.wac` | handshake messages (§4) |
 | `src/server.wac` | the server state machine |
 | `src/asn1.wac` | a DER reader, bounds-checked and strict about what DER forbids |
-| `src/x509.wac` | certificate parsing, chain and host-name verification |
+| `src/x509.wac` | certificate parsing, path building, chain and host-name verification |
 | `src/client.wac` | the client state machine |
 | `src/hybrid.wac` | X25519MLKEM768, the post-quantum hybrid key agreement |
 | `host/serve.ts` | the socket and the randomness, which wasm does not have |
@@ -51,7 +51,8 @@ malformed.
 ## What works
 
 Both ends. TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256; **X25519MLKEM768**,
-X25519 and secp256r1 key exchange; and Ed25519, ECDSA-P256 and RSA certificates.
+X25519 and secp256r1 key exchange; and Ed25519, ECDSA-P256, ECDSA-P384 and RSA
+certificates.
 
 X25519MLKEM768 is the post-quantum hybrid from
 [draft-ietf-tls-ecdhe-mlkem](https://datatracker.ietf.org/doc/html/draft-ietf-tls-ecdhe-mlkem),
@@ -66,11 +67,33 @@ against a real ClientHello, which offers 1216 bytes for this group. Full 1-RTT h
 close_notify, KeyUpdate, and the compatibility fields — the legacy version, the echoed
 session id, the meaningless ChangeCipherSpec — that middleboxes need to see.
 
-The client verifies three things before it sends a byte, and refuses if any fails: the
-certificate chain to a root it was given, in date and covering the name asked for; the
-CertificateVerify signature, binding that identity to *this* transcript; and the
-server's Finished. Each refusal has its own test, paired with the connection that must
-still succeed — a client that refuses everything passes every rejection test.
+The client verifies three things before it sends a byte, and refuses if any fails: a
+path from the leaf, through whatever intermediates the server sent, to a root in the
+trust store it was given, in date and covering the name asked for; the CertificateVerify
+signature, binding that identity to *this* transcript; and the server's Finished. Each
+refusal has its own test, paired with the connection that must still succeed — a client
+that refuses everything passes every rejection test.
+
+### It reaches the actual web
+
+`host/connect.ts` points the client at a real host with the system trust store:
+
+```
+deno run -A packages/tls/host/connect.ts github.com 443
+```
+
+which returns `HTTP/1.1 200 OK` from github.com, having built and verified the path
+against `/etc/ssl/certs/ca-certificates.crt` — 121 roots, none of them fixtures.
+
+Two real chains, two shapes, and both were needed to find the gaps. github.com is
+leaf → Sectigo E36 → **Sectigo Public Server Authentication Root E46**: every certificate
+below the top is P-256, and the root is P-384. A client without P-384 parses the whole
+chain, walks the path all the way up, and then reports "unknown authority" about a root
+sitting right there in the store — which is what happened, and is why P-384 exists here.
+raw.githubusercontent.com is the other shape: leaf → Let's Encrypt YR2 → ISRG Root YR
+**cross-signed by ISRG Root X1**, where the anchor is three certificates up and the last
+certificate the server sends is not in the store at all. Anything that assumes the chain
+ends at a root fails that one.
 
 It offers both key shares in its first flight rather than one. That costs about a
 hundred bytes and saves a whole round trip when a server prefers P-256, which matters
@@ -82,12 +105,17 @@ and wrong for the third:
 | type | the quirk |
 |---|---|
 | Ed25519 | the key is the BIT STRING and that is all |
-| ECDSA | the *curve* is in the algorithm parameters, not the key — ignore them and a P-384 key reads as P-256 |
+| ECDSA | the *curve* is in the algorithm parameters, not the key — ignore them and a P-384 key reads as P-256. The parameters use a different OID arc for each curve: P-256 is under ANSI's 1.2.840.10045, P-384 only ever got registered by SECG under 1.3.132 |
 | RSA | the modulus is a DER INTEGER, so one with its top bit set carries a leading zero that is not part of the key |
 
 And ECDSA signatures arrive as a SEQUENCE of two INTEGERs that must be unwrapped and
-zero-padded back to 32 bytes each — a shorter `r` is not a smaller signature, it is the
-same number with fewer digits.
+zero-padded back to the curve's width — 32 bytes for P-256, 48 for P-384. A shorter `r`
+is not a smaller signature, it is the same number with fewer digits.
+
+The hash and the curve are independent, too. `ecdsa-with-SHA384` says nothing about which
+curve signed it, and a P-384 key signing with SHA-256 is legal and occurs; the hash comes
+from the signature algorithm and the curve from the *signer's key*. Pairing them the
+other way round verifies every chain where they happen to agree, which is most of them.
 
 ## What is missing
 
@@ -95,13 +123,18 @@ No PSK or session resumption, no 0-RTT, no HelloRetryRequest, no client certific
 and no session tickets. Each is a real part of TLS 1.3; both sides send an alert rather
 than pretending.
 
-**One trusted root, not a store, and no intermediates.** `tlsClientInit` takes a single
-certificate and checks leaf-against-root. A real client carries hundreds of roots and
-builds a path through intermediates, which is the largest remaining gap between this and
-something you could point at the web.
+**No backtracking in path building, and no revocation.** `tlsClientInit` takes a trust
+store and the client builds a path from the leaf up through whatever intermediates the
+server sent, stopping at the first root that both matches by name and verifies. A
+cross-signed root arriving as an intermediate is followed like any other link. What it
+does not do is try an alternative issuer when a link verifies but leads nowhere, so a
+chain with two possible paths where only the second reaches a root is reported as
+untrusted. There is no CRL or OCSP checking of any kind.
 
-**No P-384, no Ed448, no RSA below SHA-256.** `ecdsa-with-SHA384` in a certificate is
-recognised and refused rather than mis-verified against the wrong curve.
+**No Ed448, no P-521, no RSA below SHA-256.** An unsupported algorithm leaves a
+certificate's key type at zero and path building skips it, rather than trapping — the
+system trust store here holds 121 roots and some use things this does not implement, and
+one exotic root must not take down the parse of the other 120.
 
 **PSS parameters are assumed, not parsed.** A certificate signed with RSASSA-PSS carries
 its hash and salt length in the algorithm parameters; this assumes SHA-256 with a
