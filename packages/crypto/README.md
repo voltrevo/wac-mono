@@ -1,7 +1,7 @@
 # crypto
 
 SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM,
-X25519, Ed25519, NIST P-256 (ECDH and ECDSA), RSA signature verification and ML-KEM-768,
+X25519, Ed25519, NIST P-256 and P-384, RSA signature verification and ML-KEM-768,
 written in wac.
 
 > **Not for production.** Nothing here is constant-time. `ghash`'s multiply branches on
@@ -137,25 +137,54 @@ About 170 ms per 2048-bit verification. `modPow` is square-and-multiply with a d
 after each step; the exponent is public, so branching on its bits is the one place in
 this package where the timing caveat genuinely does not apply.
 
-## P-256
+## P-256 and P-384
 
-`src/fieldp256.wac` and `src/p256.wac`. A different prime and a different curve shape
-from Curve25519, and both differences show:
+`src/fieldp.wac`, `src/weierstrass.wac`, and `src/p256.wac` / `src/p384.wac`. A different
+prime and a different curve shape from Curve25519, and both differences show:
 
 - 2^255-19 is a power of two minus a small number, so a value that overflows folds back
-  as one small multiply. P-256's prime is a **Solinas** prime, chosen so reduction is a
-  shuffle of 32-bit words with no multiplication — nine terms selected from the product
-  and combined. Neither trick works for the other prime.
+  as one small multiply. The NIST primes are **Solinas** primes, chosen so reduction is a
+  shuffle of 32-bit words with no multiplication at all. Neither trick works for the
+  other prime.
 - Curve25519's Montgomery ladder needs no addition law. A short Weierstrass curve has
   one, with exceptional cases: a point plus itself needs a different formula, and a point
   plus its negation gives the identity, which has no affine coordinates. Those cases are
   most of the extra code, and each is reached by ordinary inputs.
 
+**One implementation, two curves.** P-256 and P-384 differ in their prime, their `b`,
+their order and their base point, and in nothing else — same equation, same `a = -3`,
+same formulas. So `weierstrass.wac` holds the curve arithmetic once and a field element
+is an array of 32-bit limbs whose *length* picks the prime: eight for P-256, twelve for
+P-384. The two curve files are constants and a named API.
+
+**The reduction is derived rather than transcribed.** FIPS 186-4 prints a table per curve
+— nine terms for P-256 in D.2.3, ten for P-384 in D.2.4 — as a grid of product-word
+indices to permute and add, printed most-significant-word first. Transcribing one, and
+reversing it while you do, is how you get an implementation that is wrong for every
+input. Instead this uses the single fact those tables are derived from:
+
+    2^256 = 2^224 - 2^192 - 2^96 + 1        2^384 = 2^128 + 2^96 - 2^32 + 1
+
+which is just `p` rearranged, and folds the product's top half down one word at a time.
+Slightly slower than the flat table and checkable against `p` by eye. It replaced the
+transcribed P-256 table, and every existing P-256 test passed unchanged — which is the
+only reason to believe the derivation.
+
+The one subtlety is the leftover: carry propagation leaves a signed multiple `k` of
+2^(32n), and a negative `k` folded by subtraction can borrow, producing another negative
+`k`, forever. Since `k*fold` and `k*fold + |k|*p` are congruent, a negative `k` is folded
+as `|k| * (p - fold)` instead — positive, because `0 < fold < p` for both primes.
+
 Checked against BigInt for the field and WebCrypto for ECDH and ECDSA, in both
 directions. ECDSA is randomised, so "our signatures verify in WebCrypto" is a separate
 test from "we verify theirs" — there is no byte-identity to compare, unlike Ed25519.
 
-Roughly 37 ms per scalar multiplication.
+P-384 exports verification only; there is no P-384 key exchange in this stack and signing
+would need a use for it. Its tests are aimed at the generalisation rather than at a second
+implementation: if twelve limbs work as well as eight, the shared code is genuinely
+generic.
+
+Roughly 37 ms per P-256 scalar multiplication.
 
 A caller checking for the all-zero shared secret, as RFC 7748 §6.1 permits, gets it: a
 low-order point multiplies to the identity and encodes as zero. This package does not

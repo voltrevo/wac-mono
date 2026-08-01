@@ -34,13 +34,13 @@ import {
   typeHandshake, typeApplicationData, typeAlert, typeChangeCipherSpec, maxPlaintext,
   alertBody, plaintextAlert, alertBadCertificate, alertCertificateExpired,
   alertCloseNotify, alertDecryptError, alertHandshakeFailure, alertIllegalParameter,
-  alertUnexpectedMessage, alertUnsupportedCertificate,
+  alertUnexpectedMessage, alertUnknownCa, alertUnsupportedCertificate,
 } from "./record.wac";
 import {
   certificateVerifyContent, finished, handshakeMessage, messageBody, messageLength,
   messageType,
 } from "./handshake.wac";
-import { parseCert, verifyChain, certVerifySignature, Cert } from "./x509.wac";
+import { parseCert, verifyChain, verifyPath, certVerifySignature, Cert } from "./x509.wac";
 import { Reader, Writer } from "./wire.wac";
 
 struct CConn {
@@ -64,10 +64,14 @@ struct CConn {
   i32 group;
   u8[] clientRandom;
   u8[] host;
+  /** The trust store: DER certificates concatenated, with `rootOffsets` indexing them. */
   u8[] rootDer;
+  i32[] rootOffsets;
   i64 now;
-  /** The server's certificate, held between Certificate and CertificateVerify. */
+  /** The server's chain, concatenated, held between Certificate and CertificateVerify. */
   u8[] serverCertDer;
+  /** Where each certificate starts and ends inside `serverCertDer`. */
+  i32[] chainOffsets;
   /** Non-zero once something has gone wrong, for the host to report. */
   i32 failure;
 }
@@ -96,8 +100,12 @@ u8[] encodeConn(CConn c) {
   w.vec16(c.host);
   w.u32(c.rootDer.len());
   w.bytes(c.rootDer);
+  w.u32(c.rootOffsets.len());
+  for (i32 i = 0; i < c.rootOffsets.len(); i++) { w.u32(c.rootOffsets[i]); }
   w.u32(c.serverCertDer.len());
   w.bytes(c.serverCertDer);
+  w.u32(c.chainOffsets.len());
+  for (i32 i = 0; i < c.chainOffsets.len(); i++) { w.u32(c.chainOffsets[i]); }
   return w.take();
 }
 
@@ -125,10 +133,17 @@ CConn decodeConn(u8[] state) {
   u8[] rnd = r.vec8();
   u8[] host = r.vec16();
   u8[] root = r.take(r.u32());
+  i32 nOff = r.u32();
+  i32[] rootOffsets = i32[nOff]();
+  for (i32 i = 0; i < nOff; i++) { rootOffsets[i] = r.u32(); }
   u8[] cert = r.take(r.u32());
+  i32 nCh = r.u32();
+  i32[] chainOffsets = i32[nCh]();
+  for (i32 i = 0; i < nCh; i++) { chainOffsets[i] = r.u32(); }
   r.expectEnd();
   return CConn(phase, suite, seqIn, seqOut, cs, ss, cas, sas, transcript, eph, p256,
-               kemSeed, hybridState, group, rnd, host, root, now, cert, failure);
+               kemSeed, hybridState, group, rnd, host, root, rootOffsets, now, cert,
+               chainOffsets, failure);
 }
 
 void addTranscript(CConn c, u8[] msg) {
@@ -201,18 +216,25 @@ u8[] clientHello(CConn c) {
   groupList.u16(0x0017);          // secp256r1
   groups.vec16(groupList.take());
   exts.vec16(groups.take());
-  // signature_algorithms. The first three are what a peer may use in CertificateVerify;
-  // rsa_pkcs1_sha256 is listed because RFC 8446 §4.4.2.2 lets *certificates* be signed
-  // that way — which is how almost every certificate on the web is signed — while
-  // §4.4.3 forbids it for CertificateVerify itself.
+  // signature_algorithms. This list is a claim about what we can check, so everything
+  // certSignedBy and certVerifySignature handle belongs in it and nothing else does:
+  // advertising more invites a server to send something that then fails verification,
+  // and advertising less makes a server pick a weaker option or give up.
+  //
+  // The pkcs1 entries are here because RFC 8446 §4.4.2.2 lets *certificates* be signed
+  // that way — which is how almost every certificate on the web is signed — while §4.4.3
+  // forbids it for CertificateVerify itself.
   exts.u16(13);
   Writer sigs = Writer.create();
   Writer sigList = Writer.create();
   sigList.u16(0x0807);            // ed25519
   sigList.u16(0x0403);            // ecdsa_secp256r1_sha256
+  sigList.u16(0x0503);            // ecdsa_secp384r1_sha384
   sigList.u16(0x0804);            // rsa_pss_rsae_sha256
   sigList.u16(0x0805);            // rsa_pss_rsae_sha384
   sigList.u16(0x0401);            // rsa_pkcs1_sha256, for certificates only
+  sigList.u16(0x0501);            // rsa_pkcs1_sha384, likewise
+  sigList.u16(0x0601);            // rsa_pkcs1_sha512, likewise
   sigs.vec16(sigList.take());
   exts.vec16(sigs.take());
   // supported_versions
@@ -332,15 +354,15 @@ u8[] fail(CConn c, i32 code, i32 alert, Writer out, Writer appData) {
  * hundreds; one is enough to demonstrate that the check happens, and refusing to pretend
  * otherwise is why this takes a root rather than a flag to skip verification.
  */
-export u8[] tlsClientInit(u8[] host, u8[] rootDer, u8[] ephemeralPriv, u8[] p256Priv,
-                          u8[] kemSeed, u8[] clientRandom, i64 now) {
+export u8[] tlsClientInit(u8[] host, u8[] rootDer, i32[] rootOffsets, u8[] ephemeralPriv,
+                          u8[] p256Priv, u8[] kemSeed, u8[] clientRandom, i64 now) {
   if (ephemeralPriv.len() != 32) { trap; }
   if (p256Priv.len() != 32) { trap; }
   if (kemSeed.len() != 64) { trap; }
   if (clientRandom.len() != 32) { trap; }
   CConn c = CConn(0, suiteAes128Gcm(), 0, 0, u8[0](), u8[0](), u8[0](), u8[0](), u8[0](),
                   ephemeralPriv, p256Priv, kemSeed, u8[0](), 0, clientRandom, host,
-                  rootDer, now, u8[0](), 0);
+                  rootDer, rootOffsets, now, u8[0](), i32[0](), 0);
   // The hybrid offer is built once and kept: it carries the ML-KEM decapsulation key,
   // which the ServerHello will need and which regenerating would mean holding the seed
   // for longer than the key it produces.
@@ -450,26 +472,46 @@ export u8[] tlsClientFeed(u8[] state, u8[] input) {
         } else if (mt == 11) {
           // Certificate. The transcript hash for CertificateVerify includes this, so it
           // has to be added before the signature is checked.
+          // Keep the whole chain, not only the leaf. A server sends its intermediates
+          // here and a client that reads one entry can verify only against a root that
+          // signed the leaf directly — which almost no public certificate is.
           u8[] cbody = messageBody(msg);
           Reader r = Reader.create(cbody);
           r.vec8();                                 // certificate_request_context
           Reader list = r.slice(r.u24());
           if (list.empty()) { return fail(c, 30, alertHandshakeFailure(), toSend, appData); }
-          c.serverCertDer = list.vec24();           // the leaf is first
+          Writer chain = Writer.create();
+          i32[] offsets = i32[32]();
+          i32 count = 0;
+          while (!list.empty() && count < 16) {
+            u8[] der = list.vec24();
+            list.vec16();                           // per-certificate extensions
+            offsets[2 * count] = chain.len;
+            chain.bytes(der);
+            offsets[2 * count + 1] = chain.len;
+            count++;
+          }
+          c.serverCertDer = chain.take();
+          i32[] trimmed = i32[2 * count]();
+          for (i32 i = 0; i < 2 * count; i++) { trimmed[i] = offsets[i]; }
+          c.chainOffsets = trimmed;
           addTranscript(c, msg);
         } else if (mt == 15) {
           // CertificateVerify. Check the chain first — a signature from a certificate we
           // do not trust is not worth verifying, and checking it first would mean
           // reporting "bad signature" for what is really "unknown issuer".
-          if (c.serverCertDer.len() == 0) { return fail(c, 31, alertUnexpectedMessage(), toSend, appData); }
-          Cert leaf = parseCert(c.serverCertDer);
-          Cert root = parseCert(c.rootDer);
-          i32 chain = verifyChain(leaf, root, c.host, c.now);
-          if (chain != 0) {
+          if (c.chainOffsets.len() == 0) { return fail(c, 31, alertUnexpectedMessage(), toSend, appData); }
+          i32 verdict = verifyPath(c.serverCertDer, c.chainOffsets, c.rootDer,
+                                   c.rootOffsets, c.host, c.now, 8);
+          if (verdict != 0) {
             i32 alert = alertBadCertificate();
-            if (chain == 1 || chain == 2 || chain == 3) { alert = alertCertificateExpired(); }
-            return fail(c, 40 + chain, alert, toSend, appData);
+            if (verdict == 1 || verdict == 2 || verdict == 3) { alert = alertCertificateExpired(); }
+            if (verdict == 5) { alert = alertUnknownCa(); }
+            return fail(c, 40 + verdict, alert, toSend, appData);
           }
+          u8[] leafDer = u8[c.chainOffsets[1] - c.chainOffsets[0]]();
+          for (i32 i = 0; i < leafDer.len(); i++) { leafDer[i] = c.serverCertDer[c.chainOffsets[0] + i]; }
+          Cert leaf = parseCert(leafDer);
 
           u8[] cvBody = messageBody(msg);
           Reader r = Reader.create(cvBody);

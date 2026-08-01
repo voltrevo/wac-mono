@@ -177,6 +177,14 @@ export u8[] oidCommonName() { return u8[](0x55, 0x04, 0x03); }
 export u8[] oidEcPublicKey() { return u8[](0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01); }
 /** 1.2.840.10045.3.1.7 — prime256v1, the curve parameter for P-256. */
 export u8[] oidPrime256v1() { return u8[](0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07); }
+/**
+ * 1.3.132.0.34 — secp384r1, the curve parameter for P-384.
+ *
+ * A different arc from every other OID here: the P-256 parameters are under ANSI's
+ * 1.2.840.10045, but P-384 and P-521 were only ever registered by SECG under 1.3.132, so
+ * the byte string looks nothing like its neighbour and cannot be derived from it.
+ */
+export u8[] oidSecp384r1() { return u8[](0x2B, 0x81, 0x04, 0x00, 0x22); }
 /** 1.2.840.10045.4.3.2 — ecdsa-with-SHA256. */
 export u8[] oidEcdsaSha256() { return u8[](0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02); }
 /** 1.2.840.10045.4.3.3 — ecdsa-with-SHA384. */
@@ -205,3 +213,5 @@ export u8[] unsignedInteger(u8[] der) {
   for (i32 i = 0; i < out.len(); i++) { out[i] = der[at + i]; }
   return out;
 }
+/** 2.5.29.15 — keyUsage. */
+export u8[] oidKeyUsage() { return u8[](0x55, 0x1D, 0x0F); }

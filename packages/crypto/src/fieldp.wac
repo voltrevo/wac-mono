@@ -1,0 +1,335 @@
+// Arithmetic modulo a NIST Solinas prime — P-256 and P-384 from one implementation.
+//
+//   p256 = 2^256 - 2^224 + 2^192 + 2^96 - 1
+//   p384 = 2^384 - 2^128 - 2^96 + 2^32 - 1
+//
+// Both are *Solinas* primes: a sum of a few powers of 2^32, chosen so that reduction is
+// word shuffles and additions with no multiplication at all. Nothing like Curve25519's
+// 2^255-19, where anything overflowing folds back as one small multiply.
+//
+// ## Which prime is decided by the array length
+//
+// A field element is `i64[]` of 32-bit limbs, least significant first: eight limbs for
+// P-256, twelve for P-384. Every function reads the length and picks the prime, so there
+// is one copy of the arithmetic rather than two that drift. The cost is that `fpZero` and
+// `fpOne` need to be told a size, since they have no operand to read it from.
+//
+// ## The reduction is derived, not transcribed
+//
+// FIPS 186-4 prints a reduction per curve — nine terms for P-256 in D.2.3, ten for P-384
+// in D.2.4 — as a grid of product-word indices to permute and add. Transcribing one is
+// how you get an implementation that is wrong for every input, and reversing the word
+// order while you do it (the standard prints most-significant first) is how you get one
+// that is wrong for most of them. This file does not transcribe them.
+//
+// Instead it uses the single fact those tables are derived from: modulo p,
+//
+//   2^256 = 2^224 - 2^192 - 2^96 + 1        2^384 = 2^128 + 2^96 - 2^32 + 1
+//
+// which is just p rearranged. Each is a handful of limb positions with coefficient +1 or
+// -1 — the `foldVector` below — and a word sitting at 2^(32*(n+i)) is worth that vector
+// shifted up by i limbs. Folding the top half down one word at a time reproduces exactly
+// what the standard's table computes, from a line anyone can check against p by eye.
+//
+// It is a little slower than the flat table: the same additions happen, but spread over
+// a loop instead of nine precomputed selections. Certificate verification does this a few
+// thousand times per chain, which is microseconds.
+
+/**
+ * p, as 32-bit limbs, least significant first.
+ *
+ * In decimal, not hex, and not by choice: `i64 v = 0xFFFFFFFF` is -1 in wac today,
+ * because a hex literal that fits in 32 bits is sign-extended when the target is 64-bit
+ * (wac issue 0054). Written in hex this table has six limbs of -1 for P-256, which made
+ * the comparison against p wrong, which made `reduceOnce` subtract p from zero, which
+ * meant zero did not survive a round trip through the encoder. 4294967295 is 0xFFFFFFFF.
+ */
+i64[] pLimbs(i32 n) {
+  if (n == 8) {
+    return i64[](4294967295, 4294967295, 4294967295, 0, 0, 0, 1, 4294967295);
+  }
+  if (n != 12) { trap; }
+  return i64[](4294967295, 0, 0, 4294967295, 4294967294, 4294967295,
+               4294967295, 4294967295, 4294967295, 4294967295, 4294967295, 4294967295);
+}
+
+/**
+ * 2^(32n) modulo p, as a coefficient per limb.
+ *
+ * Read it against the prime: for P-256, 2^256 = 2^224 - 2^192 - 2^96 + 1 means +1 at limb
+ * 7 (2^224), -1 at limb 6 (2^192), -1 at limb 3 (2^96) and +1 at limb 0. For P-384,
+ * 2^384 = 2^128 + 2^96 - 2^32 + 1 means +1 at limbs 4, 3 and 0 and -1 at limb 1. Both are
+ * p moved across the equals sign and nothing more.
+ */
+i64[] foldVector(i32 n) {
+  if (n == 8) { return i64[](1, 0, 0, -1, 0, 0, -1, 1); }
+  if (n != 12) { trap; }
+  return i64[](1, -1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0);
+}
+
+export i64[] fpZero(i32 n) { return i64[n](); }
+
+export i64[] fpOne(i32 n) {
+  i64[] h = i64[n]();
+  h[0] = 1;
+  return h;
+}
+
+/** A small non-negative constant as a field element. */
+export i64[] fpSmall(i32 n, i32 v) {
+  i64[] h = i64[n]();
+  h[0] = v as i64;
+  return h;
+}
+
+export i64[] fpCopy(i64[] a) {
+  i64[] h = i64[a.len()]();
+  for (i32 i = 0; i < a.len(); i++) { h[i] = a[i]; }
+  return h;
+}
+
+/** a < b, on equal-length values whose limbs are all in [0, 2^32). */
+bool lessThan(i64[] a, i64[] b) {
+  for (i32 i = a.len() - 1; i >= 0; i--) {
+    if (a[i] != b[i]) { return a[i] < b[i]; }
+  }
+  return false;
+}
+
+/** a - b, assuming a >= b. Returns the borrow, which must be zero for a valid result. */
+i64 subInto(i64[] out, i64[] a, i64[] b) {
+  i64 borrow = 0;
+  for (i32 i = 0; i < a.len(); i++) {
+    i64 d = a[i] - b[i] - borrow;
+    borrow = d < 0 ? 1 : 0;
+    out[i] = d & 4294967295;
+  }
+  return borrow;
+}
+
+/** a + b, returning the carry out of the top limb. */
+i64 addInto(i64[] out, i64[] a, i64[] b) {
+  i64 carry = 0;
+  for (i32 i = 0; i < a.len(); i++) {
+    i64 s = a[i] + b[i] + carry;
+    out[i] = s & 4294967295;
+    carry = s >> 32;
+  }
+  return carry;
+}
+
+/** Conditionally subtract p, so a value in [0, 2p) lands in [0, p). */
+void reduceOnce(i64[] h) {
+  i64[] p = pLimbs(h.len());
+  if (!lessThan(h, p)) {
+    i64[] t = i64[h.len()]();
+    subInto(t, h, p);
+    for (i32 i = 0; i < h.len(); i++) { h[i] = t[i]; }
+  }
+}
+
+export i64[] fpAdd(i64[] a, i64[] b) {
+  i64[] h = i64[a.len()]();
+  i64 carry = addInto(h, a, b);
+  // A carry out means the sum is at least 2^(32n), which is more than p — subtract once
+  // for the carry, then once more below for a possible remainder above p.
+  if (carry != 0) {
+    i64[] p = pLimbs(h.len());
+    i64[] t = i64[h.len()]();
+    subInto(t, h, p);
+    for (i32 i = 0; i < h.len(); i++) { h[i] = t[i]; }
+  }
+  reduceOnce(h);
+  return h;
+}
+
+export i64[] fpSub(i64[] a, i64[] b) {
+  i64[] h = i64[a.len()]();
+  i64 borrow = subInto(h, a, b);
+  if (borrow != 0) {
+    i64[] p = pLimbs(h.len());
+    i64[] t = i64[h.len()]();
+    addInto(t, h, p);
+    for (i32 i = 0; i < h.len(); i++) { h[i] = t[i]; }
+  }
+  return h;
+}
+
+export i64[] fpNeg(i64[] a) { return fpSub(fpZero(a.len()), a); }
+
+export bool fpIsZero(i64[] a) {
+  i64 acc = 0;
+  for (i32 i = 0; i < a.len(); i++) { acc = acc | a[i]; }
+  return acc == 0;
+}
+
+export bool fpEquals(i64[] a, i64[] b) {
+  i64 acc = 0;
+  for (i32 i = 0; i < a.len(); i++) { acc = acc | (a[i] ^ b[i]); }
+  return acc == 0;
+}
+
+/**
+ * Carry-propagate a signed limb array into [0, 2^32) per limb, returning the carry out.
+ *
+ * The shift is arithmetic, which is what makes this work for negative limbs: `v >> 32`
+ * floors, so the borrow propagates as a negative carry and `v & 4294967295` still leaves
+ * the correct non-negative remainder behind.
+ */
+i64 normalise(i64[] h) {
+  i64 carry = 0;
+  for (i32 i = 0; i < h.len(); i++) {
+    i64 v = h[i] + carry;
+    carry = v >> 32;
+    h[i] = v & 4294967295;
+  }
+  return carry;
+}
+
+/** The fold vector as an actual positive number, and p minus it. Both fit in n limbs. */
+i64[] foldLimbs(i32 n) {
+  i64[] f = foldVector(n);
+  i64[] h = i64[n]();
+  for (i32 i = 0; i < n; i++) { h[i] = f[i]; }
+  normalise(h);
+  return h;
+}
+
+i64[] complementLimbs(i32 n) {
+  i64[] out = i64[n]();
+  subInto(out, pLimbs(n), foldLimbs(n));
+  return out;
+}
+
+/**
+ * Reduce a 2n-word product modulo p. `c` is consumed.
+ *
+ * Two stages. First fold the top half down: the word at index j is worth `foldVector`
+ * shifted up by j-n limbs, and every target index is at most j-1, so a single pass from
+ * the top clears the whole upper half without anything landing above where it started.
+ *
+ * Then the leftover. Carry propagation leaves n limbs in range plus a signed multiple k
+ * of 2^(32n), which is congruent to k*fold. Folding a positive k is direct. A negative k
+ * is the case that has to be handled rather than ignored: subtracting could borrow, and
+ * borrowing produces another negative k, and the loop never ends. Since k*fold and
+ * k*fold + |k|*p are congruent, a negative k is folded as |k| * (p - fold) instead —
+ * strictly positive, because 0 < fold < p for both primes — so every addition is an
+ * addition and the carry out is never negative twice.
+ */
+i64[] reduceWide(i64[] c) {
+  i32 n = c.len() / 2;
+  i64[] fv = foldVector(n);
+
+  for (i32 j = c.len() - 1; j >= n; j--) {
+    i64 v = c[j];
+    if (v != 0) {
+      c[j] = 0;
+      i32 base = j - n;
+      for (i32 k = 0; k < n; k++) {
+        if (fv[k] != 0) { c[base + k] += fv[k] * v; }
+      }
+    }
+  }
+
+  i64[] h = i64[n]();
+  for (i32 i = 0; i < n; i++) { h[i] = c[i]; }
+
+  i64 k = normalise(h);
+  while (k != 0) {
+    i64[] src = k > 0 ? foldLimbs(n) : complementLimbs(n);
+    i64 m = k > 0 ? k : -k;
+    for (i32 i = 0; i < n; i++) { h[i] += src[i] * m; }
+    k = normalise(h);
+  }
+
+  // h is now below 2^(32n) and congruent. p is within a factor of two of 2^(32n), so this
+  // subtracts at most once, but the loop costs nothing and does not depend on that.
+  while (!lessThan(h, pLimbs(n))) { reduceOnce(h); }
+  return h;
+}
+
+/**
+ * a * b (mod p), schoolbook with explicit carries.
+ *
+ * The product of two 32-bit limbs needs all 64 bits, so `a[i] * b[j]` overflows a signed
+ * i64 and wraps. That is fine and deliberate: the true value fits in 64 *unsigned* bits,
+ * so the low word is `t & 4294967295` regardless of sign, and masking the arithmetic
+ * shift with `& 4294967295` recovers the high word from the sign-extended result. Drop
+ * either mask and it is wrong only for the operands where the top bit happens to be set.
+ */
+export i64[] fpMul(i64[] a, i64[] b) {
+  i32 n = a.len();
+  if (b.len() != n) { trap; }
+  i64[] c = i64[2 * n]();
+  for (i32 i = 0; i < n; i++) {
+    i64 carry = 0;
+    for (i32 j = 0; j < n; j++) {
+      i64 t = c[i + j] + a[i] * b[j] + carry;
+      c[i + j] = t & 4294967295;
+      carry = (t >> 32) & 4294967295;
+    }
+    c[i + n] += carry;
+  }
+  return reduceWide(c);
+}
+
+export i64[] fpSquare(i64[] a) { return fpMul(a, a); }
+
+/**
+ * 1/a, by Fermat: a^(p-2).
+ *
+ * Plain square-and-multiply over the exponent's bits rather than an addition chain.
+ * Inversion happens twice per signature verification, so the multiplications an optimal
+ * chain would save are not worth the transcription risk of writing one. The exponent is
+ * p with two taken off the bottom limb, which needs no borrow because both primes end in
+ * 0xFFFFFFFF — derived rather than written out, for the same reason as the reduction.
+ */
+export i64[] fpInvert(i64[] a) {
+  i32 n = a.len();
+  i64[] e = pLimbs(n);
+  e[0] -= 2;
+  i64[] result = fpOne(n);
+  i64[] base = fpCopy(a);
+  for (i32 limb = 0; limb < n; limb++) {
+    for (i32 bit = 0; bit < 32; bit++) {
+      if (((e[limb] >> (bit as i64)) & 1) != 0) { result = fpMul(result, base); }
+      base = fpSquare(base);
+    }
+  }
+  return result;
+}
+
+/** The big-endian encoding, 4n bytes, which is what these curves use everywhere. */
+export u8[] fpToBytes(i64[] a) {
+  i32 n = a.len();
+  i64[] h = fpCopy(a);
+  reduceOnce(h);
+  u8[] out = u8[4 * n]();
+  for (i32 i = 0; i < n; i++) {
+    i64 v = h[n - 1 - i];
+    for (i32 b = 0; b < 4; b++) {
+      out[i * 4 + b] = ((v >> (((3 - b) * 8) as i64)) & 255) as! i32;
+    }
+  }
+  return out;
+}
+
+/** Decode 4n big-endian bytes. Values at or above p are not valid field elements. */
+export i64[] fpFromBytes(u8[] s) {
+  if (s.len() % 4 != 0) { trap; }
+  i32 n = s.len() / 4;
+  if (n != 8 && n != 12) { trap; }
+  i64[] h = i64[n]();
+  for (i32 i = 0; i < n; i++) {
+    i64 v = 0;
+    for (i32 b = 0; b < 4; b++) { v = (v << 8) | (s[i * 4 + b] as i64); }
+    h[n - 1 - i] = v;
+  }
+  return h;
+}
+
+/** Whether big-endian bytes are a canonical field element, i.e. below p. */
+export bool fpInRange(u8[] s) {
+  i64[] h = fpFromBytes(s);
+  return lessThan(h, pLimbs(h.len()));
+}
