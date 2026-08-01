@@ -19,7 +19,7 @@
 // rejects a CA certificate presented as an end-entity — correctly, and the first version
 // of this test hit exactly that.
 
-import { feed, newConnection, recordNeeded, send, unpack } from "../host/serve.ts";
+import { feed, newConnection, recordNeeded, send, tlsClose, unpack } from "../host/serve.ts";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -71,6 +71,9 @@ function serveOnce(reply: string): { port: number; done: Promise<string | null>;
             const s = unpack(send(state, enc.encode(reply)));
             state = s.state;
             await conn.write(s.toSend);
+            const c = unpack(tlsClose(state));
+            state = c.state;
+            if (c.toSend.length > 0) await conn.write(c.toSend);
             break;
           }
         }
@@ -147,4 +150,31 @@ Deno.test("tls: a client offering no TLS 1.3 support is rejected", async () => {
   await server.done;
   const out = dec.decode(stdout);
   if (out.includes("HTTP/1.1 200 OK")) throw new Error("a TLS 1.2 client was served");
+});
+
+Deno.test("tls: the connection closes cleanly, not as a truncation", async () => {
+  // A TLS peer cannot distinguish an orderly shutdown from an attacker cutting the
+  // connection unless it sees close_notify — so a client that cares reports an error on
+  // a bare TCP close. rustls is such a client: a clean shutdown makes `read` return null,
+  // and a truncated one makes it throw.
+  const ca = await Deno.readTextFile(new URL("./data/ca.pem", import.meta.url));
+  const server = serveOnce(REPLY);
+  const conn = await Deno.connectTls({ hostname: "127.0.0.1", port: server.port, caCerts: [ca] });
+  await conn.write(enc.encode("GET / HTTP/1.1\r\nHost: wac.test\r\n\r\n"));
+
+  const buf = new Uint8Array(4096);
+  const n = await conn.read(buf) ?? 0;
+  if (!dec.decode(buf.subarray(0, n)).includes("HTTP/1.1 200 OK")) {
+    throw new Error("did not get the reply");
+  }
+  // The next read must report end-of-stream rather than raising.
+  let second: number | null;
+  try {
+    second = await conn.read(new Uint8Array(64));
+  } catch (e) {
+    throw new Error(`the shutdown was seen as a truncation: ${String(e).split("\n")[0]}`);
+  }
+  if (second !== null) throw new Error(`expected end of stream, read ${second} more bytes`);
+  try { conn.close(); } catch { /* already closed by the peer */ }
+  await server.done;
 });
