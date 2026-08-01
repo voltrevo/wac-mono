@@ -51,6 +51,20 @@ Deno.test("aead: every tampering is rejected", () => {
   if (!rejects(() => dec(bitFlip(KEY, 0), NONCE, AAD, ct, t))) throw new Error("accepted the wrong key");
   if (!rejects(() => dec(KEY, bitFlip(NONCE, 0), AAD, ct, t))) throw new Error("accepted the wrong nonce");
   if (!rejects(() => dec(KEY, NONCE, AAD, ct, t.slice(0, 15)))) throw new Error("accepted a short tag");
+  // A tag that is too *long* is the case the length check actually earns its keep on, and
+  // nothing tested it. A short tag traps either way, because the comparison loop reads
+  // past the end — so the short case exercised the check without testing it. A long tag
+  // does not: the loop compares the first sixteen bytes, finds them correct, and returns
+  // the plaintext. Anyone holding a valid tag could append arbitrary bytes and still
+  // verify. Mutation testing found this; deleting the check failed no test.
+  for (const extra of [1, 2, 16]) {
+    const padded = new Uint8Array(16 + extra);
+    padded.set(t);
+    padded.fill(0xAA, 16);
+    if (!rejects(() => dec(KEY, NONCE, AAD, ct, padded))) {
+      throw new Error(`accepted a ${16 + extra}-byte tag whose first 16 bytes are valid`);
+    }
+  }
   // Truncating the ciphertext changes the length field inside the MAC input.
   if (!rejects(() => dec(KEY, NONCE, AAD, ct.slice(0, ct.length - 1), t))) throw new Error("accepted a truncated ciphertext");
 });

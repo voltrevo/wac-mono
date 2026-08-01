@@ -78,4 +78,13 @@ Deno.test("aes-ctr: decryption is encryption, and a bad IV traps", () => {
   if (hex(ct) === hex(pt)) throw new Error("ciphertext equals plaintext");
   const traps = (f: () => unknown) => { try { f(); return false; } catch { return true; } };
   if (!traps(() => ctr(key, new Uint8Array(15), pt))) throw new Error("a 15-byte IV was accepted");
+  // Too long matters more than too short, and was the case nothing covered. A short IV
+  // traps whether or not the length is checked, because the counter block reads past the
+  // end — so the short case never tested the check. A *long* IV is read happily: without
+  // the length check, `ctr` silently uses the first 16 bytes and ignores the rest, so two
+  // callers passing different 20-byte IVs with a shared prefix would reuse a keystream.
+  // Mutation testing found this: deleting the check failed no test.
+  for (const n of [17, 20, 32]) {
+    if (!traps(() => ctr(key, new Uint8Array(n), pt))) throw new Error(`a ${n}-byte IV was accepted`);
+  }
 });
