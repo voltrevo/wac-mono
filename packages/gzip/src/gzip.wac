@@ -7,8 +7,10 @@
 // starts.
 
 import { Buf } from "../../bytes/src/buf.wac";
-import { crc32 } from "./crc32.wac";
-import { deflateFixed, deflateDynamic } from "./deflate.wac";
+import { crc32, crc32Start, crc32Finish, crc32Update, crcTable8 } from "./crc32.wac";
+import { deflateFixed, deflateDynamic, lz77From, writeDynamicBlock, Tokens } from "./deflate.wac";
+import { BitWriter } from "./bitwriter.wac";
+import { Tables } from "./tables.wac";
 
 // A stored block's LEN field is 16 bits, so a block tops out at 65535 bytes.
 // Longer input becomes several blocks, only the last of which is marked final.
@@ -136,4 +138,170 @@ export u8[] gzipBest(u8[] data) {
     if (stored.len() < best.len()) { return stored; }
   }
   return best;
+}
+
+// ── Streaming ─────────────────────────────────────────────────────────────────
+
+/**
+ * Fresh input compressed per block.
+ *
+ * The trade is ratio against memory, and it is not the block size that costs ratio — the
+ * history below is carried across blocks, so matches still reach back 32 KiB regardless.
+ * What a bigger figure buys is amortising the re-hash of that history: at ~128 KiB the
+ * carried window is re-hashed once per four fresh windows.
+ *
+ * An exact multiple of `maxStored()` rather than a round power of two, so that a block that
+ * comes out stored tiles into whole 64 KiB pieces with nothing left over. At 1 << 17 the
+ * remaining two bytes need a third piece, and five bytes of framing with them — which is
+ * how a stream ends up larger than the whole-input compressor on input that stores.
+ */
+i32 chunkBytes() { return 2 * maxStored(); }
+
+/** History carried into the next block, which is as far as a back-reference can reach. */
+i32 historyBytes() { return 32768; }
+
+/**
+ * Compress `read` into a gzip member and hand the bytes to `write` as they are produced.
+ *
+ * The streaming counterpart to `gzipDynamic`, and the mirror of `gunzipStream`. Input is
+ * taken a chunk at a time, each chunk becomes one dynamic-Huffman block, and the last
+ * 32 KiB of each chunk is carried into the next as history — so a match that spans a chunk
+ * boundary is still found, and the output is what a whole-input pass would have produced
+ * apart from the block boundaries themselves.
+ *
+ * Memory is bounded by `chunkBytes()` plus the history, not by the size of the input.
+ *
+ * Returns 0. Traps on nothing: any byte sequence is compressible.
+ */
+export i32 gzipStream(fn[u8[]()] read, fn[bool(u8[])] write) {
+  BitWriter w = BitWriter.create();
+  Tables t = Tables.create();
+  header(w.out);
+
+  u32[] table = crcTable8();
+  u32 crc = crc32Start();
+  i32 isize = 0;
+
+  // The compression buffer: carried history first, then the fresh bytes after it.
+  Buf buf = Buf.create();
+  i32 history = 0;             // bytes of `buf` that are history rather than fresh input
+  bool done = false;           // the source is spent
+  bool wroteFinal = false;     // the block with BFINAL set has been written
+
+  while (!wroteFinal) {
+    // Fill up to a chunk of fresh input. A short read is not end of input; only an empty
+    // one is, so this keeps asking until there is enough or the source is spent.
+    while (buf.len - history < chunkBytes() && !done) {
+      u8[] next = read();
+      if (next.len() == 0) {
+        done = true;
+      } else {
+        buf.pushAll(next);
+        crc = crc32Update(table, crc, next);
+        isize += next.len();
+      }
+    }
+
+    // A read can overshoot — they arrive in whole pieces — so compress at most a chunk and
+    // leave the rest for the next block. Letting it overshoot instead costs real bytes: a
+    // block over a chunk boundary no longer tiles into whole stored pieces, and pays five
+    // bytes of framing for the remnant.
+    i32 fresh = buf.len - history;
+    i32 take = fresh;
+    if (take > chunkBytes()) { take = chunkBytes(); }
+    bool last = done && take == fresh;
+
+    i32 end = history + take;
+    u8[] region = prefix(buf, end);
+    Tokens tok = lz77From(region, t, history);
+
+    // Which block type, decided by writing one and measuring it.
+    //
+    // Expansion is the one outcome a compressor should never produce, and a dynamic block
+    // over incompressible input is bigger than the input — the code table is pure overhead
+    // and the literals cost more than eight bits each. `gzipBest` avoids that by trying
+    // every block type over the whole input; a stream cannot look ahead, so it decides per
+    // block instead, which is the same guarantee at a finer grain.
+    //
+    // Measured rather than estimated: writing the block is the only thing that knows what
+    // it costs, and doing it twice costs less than the match search that produced the
+    // tokens. The probe starts byte-aligned and the real writer may not, so the comparison
+    // can be off by one byte — which only ever picks the wrong side of a tie.
+    BitWriter probe = BitWriter.create();
+    writeDynamicBlock(probe, tok, t, last);
+    probe.alignByte();
+
+    if (storedCost(take) < probe.out.len) {
+      storedBits(w, region, history, take, last);
+    } else {
+      writeDynamicBlock(w, tok, t, last);
+    }
+    wroteFinal = last;
+
+    // Carry the tail of what was just compressed as the next block's history, and drop
+    // everything older. Anything past `end` is fresh input that has not been compressed yet
+    // and stays where it is.
+    i32 keep = imin32(end, historyBytes());
+    buf.dropFront(end - keep);
+    history = keep;
+
+    // Whole bytes only: the writer holds fewer than eight pending bits, so what is in its
+    // buffer is always complete and safe to hand over mid-stream.
+    if (w.out.len > 0) { write(w.out.take()); }
+  }
+
+  w.alignByte();
+  w.out.pushU32(crc32Finish(crc));
+  w.out.pushU32(isize as@ u32);
+  write(w.out.take());
+  return 0;
+}
+
+i32 imin32(i32 a, i32 b) {
+  if (a < b) { return a; }
+  return b;
+}
+
+/** The first `n` bytes of `b`, copied out. */
+u8[] prefix(Buf b, i32 n) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) {
+    out[i] = b.get(i);
+  }
+  return out;
+}
+
+/** Bytes a stored block costs for `n` bytes of payload: five per piece, and never no piece. */
+i32 storedCost(i32 n) {
+  i32 pieces = (n + maxStored() - 1) / maxStored();
+  if (pieces < 1) { pieces = 1; }
+  return n + 5 * pieces;
+}
+
+/**
+ * Stored blocks for `count` bytes of `data` at `start`, into a bit writer that may be
+ * mid-byte.
+ *
+ * The byte-aligned `storedBlock` above cannot be used here: it writes its header as a whole
+ * byte, which is only right at the start of a member. A stored block *is* byte-aligned, but
+ * the three bits that introduce it are not — they go wherever the bit stream had got to.
+ */
+void storedBits(BitWriter w, u8[] data, i32 start, i32 count, bool isFinal) {
+  i32 sent = 0;
+  bool first = true;
+  while (sent < count || first) {
+    i32 piece = count - sent;
+    if (piece > maxStored()) { piece = maxStored(); }
+    bool last = isFinal && (sent + piece) == count;
+
+    w.writeBits(last ? 1 : 0, 1);
+    w.writeBits(0, 2);                  // BTYPE = 00, stored
+    w.alignByte();                      // the payload is byte-aligned; the header bits are not
+    w.out.pushU16(piece as@ u32);
+    w.out.pushU16(((~piece) & 0xFFFF) as@ u32);
+    w.out.pushBytes(data, start + sent, piece);
+
+    sent += piece;
+    first = false;
+  }
 }

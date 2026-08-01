@@ -246,7 +246,7 @@ for (const n of [0, 1, 2, 255, 256, 4096]) {
 const UNREACHABLE: { file: string; line: number; snippet: string; why: string }[] = [
   {
     file: "packages/gzip/src/inflate.wac",
-    line: 322,
+    line: 449,
     snippet: "if (di >= 30) { trap; }",
     why: "Both distance decoders are built with at most 30 symbols — the fixed one with " +
       "exactly 30, the dynamic one with hdist, already bounded at 30 — so decode cannot " +
@@ -273,6 +273,154 @@ function uncoveredLines(): Set<string> {
   }
   return out;
 }
+
+// ── The streaming decoder ─────────────────────────────────────────────────────
+//
+// `gunzipStream` shares `inflateInto` with `gunzipBytes`, so the format work above already
+// covers most of what it runs. What is left is the parts that only exist because the input
+// arrives in pieces: the reader's pull, the header read forward instead of indexed, the
+// sliding window, and the trailer checked at the end rather than the start.
+//
+// Chunk size is the axis that matters. One byte at a time makes the reader exhaust its
+// buffer on nearly every call; a single huge chunk never exhausts it at all.
+
+const gunzipStream = inf.mod.gunzipStream as (
+  read: () => Uint8Array,
+  write: (b: Uint8Array) => boolean,
+) => number;
+
+// Stable identities: bindgen keeps 16 per signature and never frees one.
+let feed: Uint8Array[] = [];
+let feedAt = 0;
+let sinkAccepts = true;
+
+function covRead(): Uint8Array {
+  return feedAt < feed.length ? feed[feedAt++] : new Uint8Array(0);
+}
+
+function covWrite(): boolean {
+  return sinkAccepts;
+}
+
+function stream(gz: Uint8Array, chunk: number, accepts = true): void {
+  feed = [];
+  for (let i = 0; i < gz.length; i += chunk) feed.push(gz.slice(i, i + chunk));
+  feedAt = 0;
+  sinkAccepts = accepts;
+  ignoringTraps(() => gunzipStream(covRead, covWrite));
+}
+
+for (const { data } of buildCorpus(12, 20260801)) {
+  for (const compress of [gzipBest, gzipStored, gzipFixed]) {
+    const member = compress(data);
+    for (const chunk of [1, 7, 4096, 1 << 20]) stream(member, chunk);
+  }
+}
+// An empty member, which is the only way the window is asked to hand over nothing.
+for (const compress of [gzipBest, gzipStored, gzipFixed]) {
+  stream(compress(new Uint8Array(0)), 1 << 20);
+}
+
+// Past the 128 KiB flush, in both directions: repetitive input keeps the window busy with
+// back-references that reach across a hand-over, and incompressible input walks the stored
+// path over more than one window.
+const repetitive = enc.encode("windows slide and matches reach back. ".repeat(6000));
+for (const chunk of [512, 1 << 20]) stream(gzipBest(repetitive), chunk);
+const noisy = new Uint8Array(200000);
+for (let i = 0; i < noisy.length; i++) noisy[i] = (i * 2654435761) & 0xFF;
+for (const chunk of [999, 1 << 20]) stream(gzipStored(noisy), chunk);
+
+// A sink that refuses. The bytes are dropped either way — the window has to stay bounded
+// whatever the consumer does — so this is about the refusal path, not the output.
+stream(gzipBest(repetitive), 1 << 20, false);
+
+// Every optional header field, which the streaming parser reads forward one byte at a time.
+// Hand-built rather than produced, because no encoder here emits FEXTRA or FCOMMENT.
+function member(flg: number, extras: number[], body: Uint8Array): Uint8Array {
+  const plain = gzipBest(body);
+  const head = [0x1F, 0x8B, 8, flg, 0, 0, 0, 0, 0, 3, ...extras];
+  const out = new Uint8Array(head.length + plain.length - 10);
+  out.set(head, 0);
+  out.set(plain.subarray(10), head.length);
+  return out;
+}
+const small = enc.encode("header flags");
+for (
+  const [flg, extras] of [
+    [4, [3, 0, 1, 2, 3]],                       // FEXTRA, XLEN=3
+    [8, [0x61, 0x62, 0]],                       // FNAME
+    [16, [0x68, 0x69, 0]],                      // FCOMMENT
+    [2, [0xAB, 0xCD]],                          // FHCRC
+    [4 | 8 | 16 | 2, [1, 0, 9, 0x61, 0, 0x62, 0, 0xAB, 0xCD]],   // all four at once
+  ] as [number, number[]][]
+) {
+  for (const chunk of [1, 1 << 20]) stream(member(flg, extras, small), chunk);
+}
+
+// Rejections along the streaming path: bad magic, wrong compression method, a broken
+// trailer, and every truncation of a valid member.
+const goodStream = gzipBest(enc.encode("streamed error paths ".repeat(30)));
+for (const mangle of [0, 1, 2]) {
+  const bad = goodStream.slice();
+  bad[mangle] ^= 0xFF;
+  stream(bad, 1 << 20);
+}
+for (const back of [1, 5, 8]) {
+  const bad = goodStream.slice();
+  bad[bad.length - back] ^= 0xFF;
+  stream(bad, 1 << 20);
+}
+for (let i = 0; i < goodStream.length; i += 5) stream(goodStream.slice(0, i), 1 << 20);
+
+// ── The streaming compressor ──────────────────────────────────────────────────
+//
+// `gzipStream` shares its matcher and its block writer with the whole-input compressors, so
+// what is left is the streaming frame: the fill loop, the chunk cap, the history carried
+// between blocks, and the per-block choice between dynamic and stored.
+//
+// Chunk size drives most of it. Feeding one byte at a time makes the fill loop iterate for
+// every byte; feeding more than a chunk at once makes it overshoot and leave a remainder
+// for the next block, which is a different path through the same code.
+
+const gzipStream = gz.mod.gzipStream as (
+  read: () => Uint8Array,
+  write: (b: Uint8Array) => boolean,
+) => number;
+
+let zfeed: Uint8Array[] = [];
+let zfeedAt = 0;
+
+function zcovRead(): Uint8Array {
+  return zfeedAt < zfeed.length ? zfeed[zfeedAt++] : new Uint8Array(0);
+}
+
+function zcovWrite(): boolean {
+  return true;
+}
+
+function compressStream(data: Uint8Array, chunk: number): void {
+  zfeed = [];
+  for (let i = 0; i < data.length; i += chunk) zfeed.push(data.slice(i, i + chunk));
+  zfeedAt = 0;
+  ignoringTraps(() => gzipStream(zcovRead, zcovWrite));
+}
+
+for (const { data } of buildCorpus(10, 20260802)) {
+  for (const chunk of [1, 4096, 1 << 20]) compressStream(data, chunk);
+}
+// The empty input, which still has to emit a final block.
+compressStream(new Uint8Array(0), 1 << 20);
+
+// More than one block, so history is carried and the chunk cap is reached — and a feed
+// larger than a chunk, so the fill overshoots and leaves a remainder behind.
+const manyBlocks = enc.encode("blocks and blocks and blocks. ".repeat(20000));
+for (const chunk of [4096, 1 << 16, 1 << 19]) compressStream(manyBlocks, chunk);
+
+// Incompressible, so the per-block comparison picks stored — including a length that needs
+// more than one 64 KiB piece within a single block.
+const random = new Uint8Array(300000);
+for (let i = 0; i < random.length; i++) random[i] = (i * 2654435761) >>> 13 & 0xFF;
+for (const chunk of [1 << 16, 1 << 20]) compressStream(random, chunk);
 
 report([gz, inf, crc], "packages/gzip/src/", { verbose });
 

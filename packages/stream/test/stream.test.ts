@@ -19,8 +19,12 @@ const MODULE = "packages/stream/src/transform.wac";
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-async function streamed(entry: string, chunks: Uint8Array[]): Promise<Uint8Array> {
-  const ts = wacTransformStream({ modulePath: MODULE, entry });
+async function streamed(
+  entry: string,
+  chunks: Uint8Array[],
+  modulePath: string = MODULE,
+): Promise<Uint8Array> {
+  const ts = wacTransformStream({ modulePath, entry });
   const writer = ts.writable.getWriter();
   const reading = new Response(ts.readable).arrayBuffer();
   for (const c of chunks) await writer.write(c);
@@ -225,4 +229,68 @@ Deno.test("it is a stream, so it composes with pipeThrough", async () => {
   const out = source.pipeThrough(wacTransformStream({ modulePath: MODULE, entry: "upperCase" }));
   const got = new Uint8Array(await new Response(out).arrayBuffer());
   if (dec.decode(got) !== "PIPED THROUGH WAC") throw new Error(dec.decode(got));
+});
+
+Deno.test("gunzip through the bridge, which is what the whole thing was for", async () => {
+  // `packages/gzip` exports `gunzipStream` in exactly the shape this bridge drives, so a gzip
+  // file becomes a `DecompressionStream` with no glue between them. Nothing here knows it is
+  // gzip: `modulePath` and `entry` are the only difference from `upperCase` above.
+  const GZIP = "packages/gzip/src/inflate.wac";
+  const unit = enc.encode("streaming all the way down. ");
+  const data = new Uint8Array(unit.length * 9000);
+  for (let i = 0; i < 9000; i++) data.set(unit, i * unit.length);
+
+  const cmd = new Deno.Command("python3", {
+    args: ["-c", "import sys,gzip; sys.stdout.buffer.write(gzip.compress(sys.stdin.buffer.read(), 6))"],
+    stdin: "piped",
+    stdout: "piped",
+  });
+  const child = cmd.spawn();
+  const w = child.stdin.getWriter();
+  await w.write(data);
+  await w.close();
+  const gz = (await child.output()).stdout;
+
+  // Fed in small pieces, so the decoder blocks on input repeatedly rather than seeing it whole.
+  const chunks: Uint8Array[] = [];
+  for (let i = 0; i < gz.length; i += 1000) chunks.push(gz.slice(i, i + 1000));
+
+  const got = await streamed("gunzipStream", chunks, GZIP);
+  if (!bytesEqual(got, data)) {
+    throw new Error(`${got.length} bytes out of the bridge, want ${data.length}`);
+  }
+});
+
+Deno.test("gzip through the bridge, so both directions stream", async () => {
+  // The compressing half. Judged by the system `gunzip` rather than by our own decoder: a
+  // compressor that only agrees with its own reader has proved nothing.
+  const GZIP = "packages/gzip/src/gzip.wac";
+  const unit = enc.encode("compressed on the way out. ");
+  const data = new Uint8Array(unit.length * 9000);
+  for (let i = 0; i < 9000; i++) data.set(unit, i * unit.length);
+
+  const chunks: Uint8Array[] = [];
+  for (let i = 0; i < data.length; i += 4096) chunks.push(data.subarray(i, i + 4096));
+  const gz = await streamed("gzipStream", chunks, GZIP);
+  if (gz.length >= data.length) throw new Error(`${gz.length} bytes out for ${data.length} in`);
+
+  const cmd = new Deno.Command("gunzip", { args: ["-c"], stdin: "piped", stdout: "piped", stderr: "piped" });
+  const child = cmd.spawn();
+  const w = child.stdin.getWriter();
+  await w.write(gz);
+  await w.close();
+  const { code, stdout, stderr } = await child.output();
+  if (code !== 0) throw new Error(`gunzip rejected it: ${dec.decode(stderr)}`);
+  if (!bytesEqual(stdout, data)) throw new Error(`gunzip gave back ${stdout.length} bytes`);
+});
+
+Deno.test("compress then decompress, as two piped wac streams", async () => {
+  // Both halves composed with `pipeThrough`, which is the shape the whole exercise was for.
+  const data = enc.encode("through wac and back again. ".repeat(4000));
+  const source = new Blob([data]).stream();
+  const out = source
+    .pipeThrough(wacTransformStream({ modulePath: "packages/gzip/src/gzip.wac", entry: "gzipStream" }))
+    .pipeThrough(wacTransformStream({ modulePath: "packages/gzip/src/inflate.wac", entry: "gunzipStream" }));
+  const got = new Uint8Array(await new Response(out).arrayBuffer());
+  if (!bytesEqual(got, data)) throw new Error(`${got.length} bytes back, want ${data.length}`);
 });

@@ -17,6 +17,54 @@ Complete, both directions.
 | Fixed Huffman + LZ77 (`BTYPE=01`) | done |
 | Dynamic Huffman (`BTYPE=10`) | done, at or under `gzip -6` |
 | Inflate | all three block types, plus raw deflate |
+| Streaming inflate | `gunzipStream`, input and output both incremental |
+| Streaming deflate | `gzipStream`, one block per chunk, history carried across |
+
+### Streaming
+
+`gunzipBytes` needs the whole member in memory and produces the whole payload at once.
+`gunzipStream` does neither:
+
+```wac
+export i32 gunzipStream(fn[u8[]()] read, fn[bool(u8[])] write)
+```
+
+It pulls input through `read` and hands output to `write` as it is produced, holding only a
+32 KiB window — the furthest a DEFLATE back-reference can reach — rather than the whole
+output. What it retains is bounded by the flush threshold, currently 128 KiB, and not by the
+size of the member: a 1 GiB file needs no more than a 1 KiB one.
+
+Both entry points share `inflateInto`, so there is one copy of the format and the difference
+between them is only where bytes come from and where they go. The trailer is what forces two
+entry points rather than one: a buffer decode reads the CRC and length from the *last* eight
+bytes before it starts, which is how it pre-sizes its output, while a stream has no last eight
+bytes until it reaches them and so checksums as it goes. Same guarantees, opposite order — a
+member that fails its CRC traps either way.
+
+The signature is the one [`packages/stream`](../stream/README.md) drives, so a gzip file
+becomes a `DecompressionStream` with no glue:
+
+```ts
+const out = file.readable.pipeThrough(
+  wacTransformStream({ modulePath: "packages/gzip/src/inflate.wac", entry: "gunzipStream" }),
+);
+```
+
+Compression streams too, through `gzipStream(read, write)`. Each chunk of input becomes one
+dynamic-Huffman block, and **the last 32 KiB of each chunk is carried into the next as
+history**, so a match that spans a block boundary is still found — the block boundaries are
+the only thing that differ from a whole-input pass.
+
+What that costs, measured on 820 KB of repetitive text: 2553 bytes streamed against 2458
+whole-input, so **3.9%**, all of it per-block code tables. On smaller inputs that fit one
+block there is no difference at all.
+
+The block type is chosen per block rather than per member, by writing a dynamic block and
+measuring it against what a stored one would cost. That preserves the property `gzipBest`
+exists for — the output is never larger than a stored member — which a dynamic-only stream
+would break the moment it met incompressible input. The chunk size is an exact multiple of
+the 64 KiB stored-block maximum for the same reason: a chunk that does not tile pays five
+bytes of framing for its remnant.
 
 ### Compression
 
