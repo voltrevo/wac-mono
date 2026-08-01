@@ -260,3 +260,37 @@ Deno.test("gunzip through the bridge, which is what the whole thing was for", as
     throw new Error(`${got.length} bytes out of the bridge, want ${data.length}`);
   }
 });
+
+Deno.test("gzip through the bridge, so both directions stream", async () => {
+  // The compressing half. Judged by the system `gunzip` rather than by our own decoder: a
+  // compressor that only agrees with its own reader has proved nothing.
+  const GZIP = "packages/gzip/src/gzip.wac";
+  const unit = enc.encode("compressed on the way out. ");
+  const data = new Uint8Array(unit.length * 9000);
+  for (let i = 0; i < 9000; i++) data.set(unit, i * unit.length);
+
+  const chunks: Uint8Array[] = [];
+  for (let i = 0; i < data.length; i += 4096) chunks.push(data.subarray(i, i + 4096));
+  const gz = await streamed("gzipStream", chunks, GZIP);
+  if (gz.length >= data.length) throw new Error(`${gz.length} bytes out for ${data.length} in`);
+
+  const cmd = new Deno.Command("gunzip", { args: ["-c"], stdin: "piped", stdout: "piped", stderr: "piped" });
+  const child = cmd.spawn();
+  const w = child.stdin.getWriter();
+  await w.write(gz);
+  await w.close();
+  const { code, stdout, stderr } = await child.output();
+  if (code !== 0) throw new Error(`gunzip rejected it: ${dec.decode(stderr)}`);
+  if (!bytesEqual(stdout, data)) throw new Error(`gunzip gave back ${stdout.length} bytes`);
+});
+
+Deno.test("compress then decompress, as two piped wac streams", async () => {
+  // Both halves composed with `pipeThrough`, which is the shape the whole exercise was for.
+  const data = enc.encode("through wac and back again. ".repeat(4000));
+  const source = new Blob([data]).stream();
+  const out = source
+    .pipeThrough(wacTransformStream({ modulePath: "packages/gzip/src/gzip.wac", entry: "gzipStream" }))
+    .pipeThrough(wacTransformStream({ modulePath: "packages/gzip/src/inflate.wac", entry: "gunzipStream" }));
+  const got = new Uint8Array(await new Response(out).arrayBuffer());
+  if (!bytesEqual(got, data)) throw new Error(`${got.length} bytes back, want ${data.length}`);
+});

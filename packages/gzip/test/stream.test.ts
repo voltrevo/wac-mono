@@ -198,3 +198,121 @@ Deno.test("truncated input traps rather than returning what it managed", async (
     if (!trapped) throw new Error(`${keep} of ${gz.length} bytes was accepted as a whole member`);
   }
 });
+
+// ── Compression ───────────────────────────────────────────────────────────────
+//
+// `gzipStream` is judged by an external decompressor rather than by ours, because a
+// compressor that agrees with its own reader has proved nothing. `gunzip` is the oracle.
+//
+// Its output is *not* expected to be identical across chunk sizes: where the block
+// boundaries fall depends on how the input arrives, and a different split is a different
+// (still valid) encoding. What must hold at every chunk size is that it decompresses to the
+// input, and that it never expands past what a stored member costs.
+
+import { gunzip } from "./util.ts";
+
+const zip = await wacBind("packages/gzip/src/gzip.wac") as unknown as {
+  gzipStream(read: () => Uint8Array, write: (b: Uint8Array) => boolean): number;
+  gzipBest(d: Uint8Array): Uint8Array;
+};
+
+let zqueue: Uint8Array[] = [];
+let znext = 0;
+let zparts: Uint8Array[] = [];
+
+function zread(): Uint8Array {
+  return znext < zqueue.length ? zqueue[znext++] : new Uint8Array(0);
+}
+
+function zwrite(b: Uint8Array): boolean {
+  zparts.push(b.slice());
+  return true;
+}
+
+/** Compress `data`, handed over `chunk` bytes at a time. */
+function compressed(data: Uint8Array, chunk: number): Uint8Array {
+  zqueue = [];
+  for (let i = 0; i < data.length; i += chunk) zqueue.push(data.slice(i, i + chunk));
+  znext = 0;
+  zparts = [];
+  zip.gzipStream(zread, zwrite);
+  return join(zparts);
+}
+
+/** The floor for a member that stores its payload: 18 bytes of frame, 5 per 64 KiB piece. */
+function storedFloor(n: number): number {
+  return n + 18 + 5 * Math.max(1, Math.ceil(n / 65535));
+}
+
+function corpus(): [string, Uint8Array][] {
+  let x = 0x2545f491 | 0;
+  const rnd = new Uint8Array(300000);
+  for (let i = 0; i < rnd.length; i++) {
+    x ^= x << 13; x >>>= 0;
+    x ^= x >>> 17;
+    x ^= x << 5; x >>>= 0;
+    rnd[i] = x & 0xff;
+  }
+  return [
+    ["empty", new Uint8Array(0)],
+    ["one byte", enc.encode("x")],
+    ["prose", enc.encode("the quick brown fox jumps over the lazy dog. ".repeat(50))],
+    // Bigger than one chunk, so several blocks, and repetitive enough that matches want to
+    // reach across the boundaries between them.
+    ["multi-block", enc.encode("Lorem ipsum dolor sit amet, consectetur. ".repeat(20000))],
+    ["incompressible", rnd],
+  ];
+}
+
+Deno.test("gunzip accepts what gzipStream produces, at every chunk size", async () => {
+  for (const [name, data] of corpus()) {
+    for (const chunk of [1, 997, 1 << 16, 1 << 22]) {
+      const gz = compressed(data, chunk);
+      const back = await gunzip(gz);
+      if (!same(back, data)) {
+        throw new Error(`${name} at chunk ${chunk}: ${back.length} bytes back, want ${data.length}`);
+      }
+    }
+  }
+});
+
+Deno.test("it never expands past a stored member, whatever it is given", () => {
+  // The property gzipBest exists to guarantee over a whole input. A stream cannot look
+  // ahead, so it picks a block type per block instead — and incompressible input is where
+  // that shows: a dynamic block over random bytes is larger than the bytes.
+  for (const [name, data] of corpus()) {
+    for (const chunk of [1 << 16, 1 << 22]) {
+      const gz = compressed(data, chunk);
+      const floor = storedFloor(data.length);
+      if (gz.length > floor) {
+        throw new Error(`${name} at chunk ${chunk}: ${gz.length} bytes for ${data.length}, above the stored floor of ${floor}`);
+      }
+    }
+  }
+});
+
+Deno.test("matches still reach across a block boundary", async () => {
+  // The reason each block carries the previous 32 KiB as history. Without it every block
+  // starts with an empty window, and repetitive input pays for it: the check is against the
+  // whole-input compressor, which has the whole history by definition.
+  const data = enc.encode("history has to survive the boundary. ".repeat(20000));
+  const streamed = compressed(data, 1 << 16);
+  const whole = zip.gzipBest(data);
+  if (!same(await gunzip(streamed), data)) throw new Error("does not round trip");
+
+  // Block framing costs something, so the two are not equal — but losing the history would
+  // cost far more than this. Measured at 3.9% when written.
+  const overhead = (streamed.length - whole.length) / whole.length;
+  if (overhead > 0.15) {
+    throw new Error(`${streamed.length} streamed vs ${whole.length} whole — ${(overhead * 100).toFixed(1)}% worse, so history is not crossing blocks`);
+  }
+});
+
+Deno.test("compress and decompress, both streamed, are inverses", async () => {
+  // The two halves against each other. A bug shared by both would hide here, which is why
+  // gunzip is the oracle above — this one is about the pair composing.
+  const data = enc.encode("round and round. ".repeat(9000));
+  const gz = compressed(data, 4096);
+  const back = streamed(gz, 4096);
+  if (!same(back, data)) throw new Error(`${back.length} bytes back, want ${data.length}`);
+});

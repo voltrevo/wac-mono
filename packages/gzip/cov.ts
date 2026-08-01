@@ -372,6 +372,56 @@ for (const back of [1, 5, 8]) {
 }
 for (let i = 0; i < goodStream.length; i += 5) stream(goodStream.slice(0, i), 1 << 20);
 
+// ── The streaming compressor ──────────────────────────────────────────────────
+//
+// `gzipStream` shares its matcher and its block writer with the whole-input compressors, so
+// what is left is the streaming frame: the fill loop, the chunk cap, the history carried
+// between blocks, and the per-block choice between dynamic and stored.
+//
+// Chunk size drives most of it. Feeding one byte at a time makes the fill loop iterate for
+// every byte; feeding more than a chunk at once makes it overshoot and leave a remainder
+// for the next block, which is a different path through the same code.
+
+const gzipStream = gz.mod.gzipStream as (
+  read: () => Uint8Array,
+  write: (b: Uint8Array) => boolean,
+) => number;
+
+let zfeed: Uint8Array[] = [];
+let zfeedAt = 0;
+
+function zcovRead(): Uint8Array {
+  return zfeedAt < zfeed.length ? zfeed[zfeedAt++] : new Uint8Array(0);
+}
+
+function zcovWrite(): boolean {
+  return true;
+}
+
+function compressStream(data: Uint8Array, chunk: number): void {
+  zfeed = [];
+  for (let i = 0; i < data.length; i += chunk) zfeed.push(data.slice(i, i + chunk));
+  zfeedAt = 0;
+  ignoringTraps(() => gzipStream(zcovRead, zcovWrite));
+}
+
+for (const { data } of buildCorpus(10, 20260802)) {
+  for (const chunk of [1, 4096, 1 << 20]) compressStream(data, chunk);
+}
+// The empty input, which still has to emit a final block.
+compressStream(new Uint8Array(0), 1 << 20);
+
+// More than one block, so history is carried and the chunk cap is reached — and a feed
+// larger than a chunk, so the fill overshoots and leaves a remainder behind.
+const manyBlocks = enc.encode("blocks and blocks and blocks. ".repeat(20000));
+for (const chunk of [4096, 1 << 16, 1 << 19]) compressStream(manyBlocks, chunk);
+
+// Incompressible, so the per-block comparison picks stored — including a length that needs
+// more than one 64 KiB piece within a single block.
+const random = new Uint8Array(300000);
+for (let i = 0; i < random.length; i++) random[i] = (i * 2654435761) >>> 13 & 0xFF;
+for (const chunk of [1 << 16, 1 << 20]) compressStream(random, chunk);
+
 report([gz, inf, crc], "packages/gzip/src/", { verbose });
 
 let failed = false;

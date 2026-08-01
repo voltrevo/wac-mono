@@ -85,8 +85,13 @@ shape, so a gzip file becomes a `DecompressionStream` by naming a different modu
 wacTransformStream({ modulePath: "packages/gzip/src/inflate.wac", entry: "gunzipStream" })
 ```
 
-Compression is not streamed. DEFLATE's encoder picks its Huffman tables from a whole block, so the
-unit there is the block rather than the chunk — a different problem from this one.
+`gzipStream` in `packages/gzip/src/gzip.wac` is the other direction, so the two compose:
+
+```ts
+source
+  .pipeThrough(wacTransformStream({ modulePath: "packages/gzip/src/gzip.wac", entry: "gzipStream" }))
+  .pipeThrough(wacTransformStream({ modulePath: "packages/gzip/src/inflate.wac", entry: "gunzipStream" }));
+```
 
 ## Layout
 

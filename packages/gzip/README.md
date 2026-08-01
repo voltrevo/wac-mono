@@ -18,6 +18,7 @@ Complete, both directions.
 | Dynamic Huffman (`BTYPE=10`) | done, at or under `gzip -6` |
 | Inflate | all three block types, plus raw deflate |
 | Streaming inflate | `gunzipStream`, input and output both incremental |
+| Streaming deflate | `gzipStream`, one block per chunk, history carried across |
 
 ### Streaming
 
@@ -49,10 +50,21 @@ const out = file.readable.pipeThrough(
 );
 ```
 
-Compression does not stream yet. `packages/stream`'s bridge is generic, so a `deflateStream`
-of the same shape would work the same way; what stops it is that DEFLATE's encoder chooses
-its Huffman tables from a whole block, so the streaming unit is the block rather than the
-chunk.
+Compression streams too, through `gzipStream(read, write)`. Each chunk of input becomes one
+dynamic-Huffman block, and **the last 32 KiB of each chunk is carried into the next as
+history**, so a match that spans a block boundary is still found — the block boundaries are
+the only thing that differ from a whole-input pass.
+
+What that costs, measured on 820 KB of repetitive text: 2553 bytes streamed against 2458
+whole-input, so **3.9%**, all of it per-block code tables. On smaller inputs that fit one
+block there is no difference at all.
+
+The block type is chosen per block rather than per member, by writing a dynamic block and
+measuring it against what a stored one would cost. That preserves the property `gzipBest`
+exists for — the output is never larger than a stored member — which a dynamic-only stream
+would break the moment it met incompressible input. The chunk size is an exact multiple of
+the 64 KiB stored-block maximum for the same reason: a chunk that does not tile pays five
+bytes of framing for its remnant.
 
 ### Compression
 
