@@ -75,8 +75,11 @@ code disagreed and only a new consumer noticed.
 
 ## Not implemented
 
-- **IDNA.** A non-ASCII domain should be mapped through UTS-46 ToASCII, which needs Unicode
-  tables; it is rejected instead. This is the one deliberate divergence from the standard, and
+- **IDNA.** A non-ASCII domain should be mapped through UTS-46 ToASCII. `packages/unicode` now
+  supplies half of what that needs — case folding, and a generator that can produce the UTS-46
+  mapping table the same way — but ToASCII also requires NFC, and normalization needs the
+  canonical combining class, which the host does not expose. So this is rejected still, and now
+  for a reason with a name. This is the one deliberate divergence from the standard, and
   it is asserted rather than skipped: a test checks that these are still rejected and that
   already-punycoded domains still agree, so the day it lands, or the day the boundary moves,
   something says so.

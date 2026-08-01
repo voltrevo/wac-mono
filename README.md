@@ -21,6 +21,7 @@ compiler, this one is things built with it.
 | [`regex`](packages/regex/) | a backtracking regex engine with JavaScript's semantics |
 | [`datetime`](packages/datetime/) | the proleptic Gregorian calendar and RFC 3339 timestamps |
 | [`http`](packages/http/) | HTTP/1.1 request parsing, strict about framing |
+| [`unicode`](packages/unicode/) | UTF-8 as code points, and simple case mapping |
 | [`server`](packages/server/) | an HTTP server in wac — the packages, composed and running |
 | [`std`](packages/std/) | `Vec<T>`, `Map<K, V>`, `Option<T>`, `Result<T, E>` — the containers generics made writable |
 | [`wactest`](packages/wactest/) | assertions for writing tests in wac |
@@ -76,6 +77,7 @@ deno task coverage:json
 deno task coverage:regex
 deno task coverage:server
 deno task coverage:std
+deno task coverage:unicode
 deno task coverage:url
 deno task mutate          # mutation testing, curated defects
 deno task mutate:operators # ...plus generated ones (removed guards, gutted functions)

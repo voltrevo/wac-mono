@@ -28,6 +28,11 @@ struct C {
   i32 classes;
   i32 ranges;
   bool failed;
+  // Case-insensitive matching, done at *compile* time by expanding each literal and each class
+  // range to cover both cases. The machine is untouched: adding a fold to OP_CHAR would put a
+  // table lookup on the hot path of every match, and would have to answer for a byte that is half
+  // of a multi-byte scalar. See the README on why this is ASCII only.
+  bool ignoreCase;
 
   void grow(this, i32 want) {
     if (want * 3 <= this.code.len()) { return; }
@@ -160,6 +165,19 @@ struct C {
     return this.classes - 1;
   }
 
+  /** Add `[lo, hi]`, plus its case counterpart when folding. */
+  void addFolded(this, i32 index, i32 lo, i32 hi) {
+    this.addRange(index, lo, hi);
+    if (!this.ignoreCase) { return; }
+    // The part of the range that is a lowercase letter, mapped to uppercase, and vice versa.
+    i32 loA = lo > 'a' ? lo : 'a';
+    i32 hiA = hi < 'z' ? hi : 'z';
+    if (loA <= hiA) { this.addRange(index, loA - 32, hiA - 32); }
+    i32 loB = lo > 'A' ? lo : 'A';
+    i32 hiB = hi < 'Z' ? hi : 'Z';
+    if (loB <= hiB) { this.addRange(index, loB + 32, hiB + 32); }
+  }
+
   void addRange(this, i32 index, i32 lo, i32 hi) {
     if (this.ranges >= this.classLo.len()) {
       i32 cap = this.classLo.len() == 0 ? 32 : this.classLo.len() * 2;
@@ -264,9 +282,9 @@ void parseClass(C c) {
         hi = hiCh;
       }
       if (hi < lo) { c.fail(); return; }
-      c.addRange(index, lo, hi);
+      c.addFolded(index, lo, hi);
     } else {
-      c.addRange(index, lo, lo);
+      c.addFolded(index, lo, lo);
     }
   }
   c.emit(OP_CLASS(), index, 0);
@@ -323,7 +341,7 @@ void parseAtom(C c) {
       c.fail();                                // a backreference; not implemented
     } else {
       i32 named = escapeByte(e);
-      c.emit(OP_CHAR(), named >= 0 ? named : e, 0);
+      emitLiteral(c, named >= 0 ? named : e);
     }
   } else if (ch < 0 || ch == '|' || ch == ')') {
     // An empty branch, which is legal: `a|` matches "a" or "".
@@ -331,8 +349,23 @@ void parseAtom(C c) {
     c.fail();                                  // a quantifier with nothing to quantify
   } else {
     c.bump();
-    c.emit(OP_CHAR(), ch, 0);
+    emitLiteral(c, ch);
   }
+}
+
+/** A literal byte: one CHAR, or a two-case class when folding and the byte is a letter. */
+void emitLiteral(C c, i32 ch) {
+  bool cased = c.ignoreCase
+    && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'));
+  if (!cased) {
+    c.emit(OP_CHAR(), ch, 0);
+    return;
+  }
+  i32 lower = ch >= 'A' && ch <= 'Z' ? ch + 32 : ch;
+  i32 index = c.newClass(false);
+  c.addRange(index, lower, lower);
+  c.addRange(index, lower - 32, lower - 32);
+  c.emit(OP_CLASS(), index, 0);
 }
 
 /** `{n}`, `{n,}` or `{n,m}` if that is what follows, else -1 in `min`. */
@@ -647,9 +680,12 @@ void parseAlternation(C c) {
 }
 
 /** Compile `pattern`, or null if it is not one this engine accepts. */
-export Program? compile(u8[] pattern) {
+export Program? compile(u8[] pattern) { return compileFlags(pattern, false); }
+
+/** As `compile`, with `ignoreCase` for the `i` flag. */
+export Program? compileFlags(u8[] pattern, bool ignoreCase) {
   C c = C(i32[0](), 0, 0, pattern, 0, 0, i32[0](), i32[0](), i32[0](), i32[0](), bool[0](), 0, 0,
-          false);
+          false, ignoreCase);
   c.emit(OP_SAVE(), 0, 0);
   parseAlternation(c);
   if (c.failed || c.pos < c.src.len()) { return null; }

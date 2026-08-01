@@ -88,12 +88,13 @@ Three outcomes are distinguished, and the tests treat them differently:
 ## The subset
 
 Supported: literals, `.`, classes with ranges and negation, `\d \D \w \W \s \S`, `\b \B`, `^ $`,
-groups and `(?:)`, alternation, `* + ? {n} {n,} {n,m}` greedy and lazy, and the usual escapes.
+groups and `(?:)`, alternation, `* + ? {n} {n,} {n,m}` greedy and lazy, the usual escapes, and the
+`i` flag over ASCII.
 
 Refused, rather than mis-parsed — which is the dangerous alternative, since `(?=a)` read as a
 group containing `?=a` would silently match the wrong thing:
 
-- lookahead and lookbehind, backreferences, named groups, flags;
+- lookahead and lookbehind, backreferences, named groups, and every flag but `i`;
 - a quantified assertion (`^?`, `\b+`), which is a syntax error in JavaScript too;
 - `[\D]`, `[\W]`, `[\S]` — a negated shorthand inside a positive class needs set subtraction.
 
@@ -108,4 +109,9 @@ reason, and lifting it means a UTF-8-aware machine, not a bigger table.
 - **A DFA or Thompson simulation for patterns without captures**, which would make the
   pathological cases linear. It is a second engine, not a change to this one, and it cannot
   answer capture questions.
-- **Case-insensitive matching**, which is a flag and a fold table.
+- **Case-insensitive matching beyond ASCII.** The `i` flag exists and agrees with `RegExp` over
+  ASCII: folding is done at compile time, expanding each literal and class range to cover both
+  cases, so the machine is untouched. It stops at ASCII because this engine matches *bytes*, and
+  folding a non-ASCII letter would mean folding half of a multi-byte scalar. `packages/unicode`
+  has the full simple-fold table; using it needs a code-point-aware matcher, which is a different
+  engine rather than a flag.

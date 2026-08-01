@@ -1,0 +1,70 @@
+// Case mapping and case-insensitive comparison, over UTF-8.
+//
+// Simple mapping only: one code point in, one out. Full mapping — `ß` to `SS`, `ﬁ` to `FI`, the
+// Turkish dotted and dotless i — changes the length of the text and depends on locale and
+// context, and a function that silently did some of that and not the rest would be worse than one
+// that does none of it. Where the host's mapping is more than one code point, this leaves the
+// code point alone, and the tests assert exactly which ones those are.
+//
+// `foldEqual` is the operation most callers actually want: whether two strings are the same
+// ignoring case. It compares code point by code point rather than mapping both and comparing
+// bytes, so it allocates nothing and stops at the first difference.
+
+import { Scalar, decode, encode, encodedLength } from "./utf8.wac";
+import { simpleLower, simpleUpper, simpleFold } from "./tables.wac";
+
+export i32 toLower(i32 cp) { return simpleLower(cp); }
+export i32 toUpper(i32 cp) { return simpleUpper(cp); }
+export i32 fold(i32 cp) { return simpleFold(cp); }
+
+/** Map every scalar with `which`: 0 lower, 1 upper, 2 fold. Null if `s` is not valid UTF-8. */
+u8[]? mapAll(u8[] s, i32 which) {
+  // Two passes: measure, then write. A simple mapping can change a scalar's encoded length —
+  // U+00DF is two bytes and U+1E9E is three — so the output size is not the input size.
+  i32 total = 0;
+  i32 at = 0;
+  while (at < s.len()) {
+    Scalar sc = decode(s, at);
+    if (sc.code < 0) { return null; }
+    i32 mapped = which == 0 ? toLower(sc.code) : (which == 1 ? toUpper(sc.code) : fold(sc.code));
+    total = total + encodedLength(mapped);
+    at = at + sc.size;
+  }
+
+  u8[] out = u8[total]();
+  i32 write = 0;
+  at = 0;
+  while (at < s.len()) {
+    Scalar sc = decode(s, at);
+    i32 mapped = which == 0 ? toLower(sc.code) : (which == 1 ? toUpper(sc.code) : fold(sc.code));
+    write = write + encode(out, write, mapped);
+    at = at + sc.size;
+  }
+  return out;
+}
+
+export u8[]? lowerAll(u8[] s) { return mapAll(s, 0); }
+export u8[]? upperAll(u8[] s) { return mapAll(s, 1); }
+export u8[]? foldAll(u8[] s) { return mapAll(s, 2); }
+
+/**
+ * Whether `a` and `b` are equal ignoring case.
+ *
+ * Invalid UTF-8 on either side is unequal, rather than an error or a byte comparison: two byte
+ * strings that are not text cannot be *the same text*, and answering "true" for two identical
+ * invalid sequences would let a caller use this as an equality check it is not.
+ */
+export bool foldEqual(u8[] a, u8[] b) {
+  i32 i = 0;
+  i32 j = 0;
+  while (i < a.len() && j < b.len()) {
+    Scalar x = decode(a, i);
+    Scalar y = decode(b, j);
+    if (x.code < 0 || y.code < 0) { return false; }
+    if (fold(x.code) != fold(y.code)) { return false; }
+    i = i + x.size;
+    j = j + y.size;
+  }
+  // Both must have ended together, and neither may have trailing rubbish.
+  return i == a.len() && j == b.len();
+}

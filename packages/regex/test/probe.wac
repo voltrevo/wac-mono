@@ -6,11 +6,14 @@
 // one function.
 
 import { Program, NO_MATCH, BUDGET } from "../src/program.wac";
-import { compile, search, slotCount } from "../src/regex.wac";
+import { compile, compileIgnoreCase, search, slotCount } from "../src/regex.wac";
 
 /** 1 = matched, 0 = no match, -1 = pattern rejected, -2 = step budget exhausted. */
-export i32[] exec(u8[] pattern, u8[] input, i32 at) {
-  Program? p = compile(pattern);
+export i32[] exec(u8[] pattern, u8[] input, i32 at) { return execFlags(pattern, input, at, false); }
+
+/** As `exec`, with the `i` flag. */
+export i32[] execFlags(u8[] pattern, u8[] input, i32 at, bool ignoreCase) {
+  Program? p = ignoreCase ? compileIgnoreCase(pattern) : compile(pattern);
   if (p is null) { return i32[1](fill: -1); }
   i32 n = slotCount(p!);
   i32[] caps = i32[n]();

@@ -18,6 +18,7 @@ import { wacBind } from "../../../harness/wacBind.ts";
 
 const mod = await wacBind("packages/regex/test/probe.wac") as unknown as {
   exec(pattern: Uint8Array, input: Uint8Array, at: number): Int32Array;
+  execFlags(pattern: Uint8Array, input: Uint8Array, at: number, ignoreCase: boolean): Int32Array;
   accepts(pattern: Uint8Array): boolean;
 };
 
@@ -310,4 +311,90 @@ Deno.test("fuzz: nested groups and alternations agree with RegExp", () => {
   // gets wrapped already contains jumps of its own.
   fuzz(0x0badc0de, 2000, true);
   fuzz(0x7e577e57, 2000, true);
+});
+
+/**
+ * The `i` flag, judged against `RegExp` with `"i"`.
+ *
+ * ASCII only, and that is a real limit rather than an oversight: this engine matches *bytes*, so
+ * folding a non-ASCII letter would mean folding half of a multi-byte scalar. `packages/unicode`
+ * has the full simple-fold table for a caller that works in code points; a code-point-aware
+ * matcher is what would use it, and is not this.
+ *
+ * The subjects are ASCII for the same reason the rest of this file's are.
+ */
+function wacFlags(pattern: string, input: string, ignoreCase: boolean): Match | "rejected" | "budget" {
+  const out = mod.execFlags(b(pattern), b(input), 0, ignoreCase);
+  if (out[0] === STATUS_REJECTED) return "rejected";
+  if (out[0] === STATUS_BUDGET) return "budget";
+  if (out[0] === 0) return null;
+  const groups: Match = [];
+  for (let i = 1; i + 1 < out.length; i += 2) {
+    const s = out[i];
+    const e = out[i + 1];
+    groups.push(s < 0 || e < 0 ? null : [s, e]);
+  }
+  return groups;
+}
+
+function oracleFlags(pattern: string, input: string): Match {
+  const withIndices = new RegExp(pattern, "di").exec(input) as RegExpExecArray & {
+    indices?: Array<[number, number] | undefined>;
+  };
+  if (withIndices === null) return null;
+  const idx = withIndices.indices;
+  if (idx === undefined) throw new Error("the runtime does not support the d flag");
+  const groups: Match = [];
+  for (let i = 0; i < idx.length; i++) {
+    const pair = idx[i];
+    groups.push(pair === undefined ? null : [pair[0], pair[1]]);
+  }
+  return groups;
+}
+
+Deno.test("the i flag agrees with RegExp over ASCII", () => {
+  const patterns = [
+    "a", "abc", "A", "ABC", "aBc", "[a-z]", "[A-Z]", "[a-cX-Z]", "[^a-z]", "[^A]",
+    "a+", "A*", "(a|B)", "(?:ab)+", "a{2,3}", "\\ba\\b", "^abc$", "[a-z0-9_]+",
+    "x[yz]", "(a)(B)?", "\\w+", "\\d[a-f]", "[-a-c]", "K", "k",
+  ];
+  const subjects = [
+    "", "a", "A", "ab", "AB", "aB", "Ab", "abc", "ABC", "AbC", "xyz", "XYZ", "a1b2",
+    "_x_", "ABCABC", "kK", "Kk", "zZ",
+  ];
+  const bad: string[] = [];
+  for (const p of patterns) {
+    for (const s of subjects) {
+      const got = wacFlags(p, s, true);
+      if (got === "rejected") {
+        bad.push(`/${p}/i was rejected`);
+        continue;
+      }
+      if (got === "budget") {
+        bad.push(`/${p}/i on ${JSON.stringify(s)} ran out of steps`);
+        continue;
+      }
+      const want = oracleFlags(p, s);
+      if (!same(got, want)) {
+        bad.push(`/${p}/i on ${JSON.stringify(s)}: got ${show(got)}, RegExp says ${show(want)}`);
+      }
+    }
+  }
+  if (bad.length > 0) {
+    throw new Error(`${bad.length} disagreed:\n  ${bad.slice(0, 12).join("\n  ")}`);
+  }
+});
+
+Deno.test("the i flag changes nothing when nothing is cased", () => {
+  // A pattern with no letters must behave identically with and without the flag, which is the
+  // cheapest check that the folding is confined to where it belongs.
+  for (const p of ["\\d+", "[0-9]", "^$", "\\.", "[-_]", "1{2}", "(\\s)"]) {
+    for (const s of ["", "1", "12", ".", "-", "_", " ", "a1"]) {
+      const plain = show(wacFlags(p, s, false));
+      const folded = show(wacFlags(p, s, true));
+      if (plain !== folded) {
+        throw new Error(`/${p}/ on ${JSON.stringify(s)}: ${plain} without i, ${folded} with`);
+      }
+    }
+  }
 });
