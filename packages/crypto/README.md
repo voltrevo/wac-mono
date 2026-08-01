@@ -1,8 +1,8 @@
 # crypto
 
 SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM,
-X25519, Ed25519, NIST P-256 (ECDH and ECDSA) and RSA signature verification, written
-in wac.
+X25519, Ed25519, NIST P-256 (ECDH and ECDSA), RSA signature verification and ML-KEM-768,
+written in wac.
 
 > **Not for production.** Nothing here is constant-time. `ghash`'s multiply branches on
 > every bit of its operand, `aes` indexes an S-box with key-dependent values, and
@@ -72,6 +72,31 @@ verify test would have passed.
 Roughly 120 ms per signature. The scalar multiplication is a plain 256-step
 double-and-add with no windowing, which is the slowest reasonable choice and the easiest
 to read against the spec.
+
+## ML-KEM-768
+
+`src/mlkem.wac` — FIPS 203, the post-quantum KEM formerly called Kyber. TLS 1.3 uses it
+alongside X25519 in the hybrid group X25519MLKEM768, which carries a large share of real
+HTTPS traffic today, so this is a deployed algorithm rather than a speculative one.
+
+Smaller than it looks: everything is arithmetic mod q = 3329 on degree-256 polynomials,
+so there is no bignum, no modular inversion and no curve with exceptional cases. Against
+P-256 it is a much simpler object. The difficulty is entirely that the transform and the
+sampling are silent when wrong.
+
+The number-theoretic transform is *incomplete* — q−1 contains a 256th root of unity but
+not a 512th — so X^256+1 factors into 128 quadratics and the pointwise multiply is a
+degree-1 product, not a scalar one. Treating it as 256 independent products is the
+mistake the structure invites, and it yields a key exchange where the two sides derive
+different secrets. The 128 twiddle factors are computed, not transcribed.
+
+**The oracle here is the strongest in the package.** WebCrypto exports an ML-KEM private
+key as its 64-byte seed and FIPS 203 keygen is deterministic in it, so keygen is compared
+*byte for byte* — 1184 bytes agreeing means SHA3-512, the seed split, the SHAKE128
+rejection sampling, the CBD noise, the NTT, the matrix multiply and the twelve-bit
+packing are all simultaneously right. Nothing weaker pins the NTT at all: it is an
+internal representation, and two different transforms each work perfectly with
+themselves.
 
 ## SHA-3 and SHAKE
 
