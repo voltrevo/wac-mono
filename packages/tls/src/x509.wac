@@ -1,0 +1,275 @@
+// X.509 certificates: enough to check a TLS server's identity.
+//
+// A certificate is a signed assertion that a public key belongs to a name. Verifying one
+// means three separate things, and skipping any of them makes the other two pointless:
+//
+//   1. the signature is valid, so the issuer really said this
+//   2. the issuer is one we trust, or is vouched for by one, up to a root we hold
+//   3. the name we asked for is one this certificate covers
+//
+// A client that checks the signature and not the name accepts any valid certificate for
+// any host, which is the classic failure — the attacker gets a real certificate for a
+// domain they own and presents it for yours.
+//
+// ## What is parsed
+//
+//   Certificate ::= SEQUENCE {
+//     tbsCertificate       TBSCertificate,
+//     signatureAlgorithm   AlgorithmIdentifier,
+//     signatureValue       BIT STRING }
+//
+// The signature covers `tbsCertificate` *as encoded*, so its bytes are kept verbatim
+// rather than re-serialised from a parse. Re-encoding would produce a byte string that
+// is equal in meaning and possibly not equal in bytes, and the signature is over bytes.
+//
+// ## Ed25519 only
+//
+// A real client needs RSA and ECDSA, because that is what the web uses. This handles
+// Ed25519 and rejects everything else by name, which is honest and useless against the
+// public internet — it is enough to talk to the server in this repo and to any other
+// Ed25519 endpoint.
+
+import { ed25519Verify } from "../../crypto/src/ed25519.wac";
+import { Der, oidEd25519, oidEquals, oidSubjectAltName, oidBasicConstraints } from "./asn1.wac";
+
+/** What a client needs out of a certificate. */
+export struct Cert {
+  /** The exact bytes the signature covers. */
+  u8[] tbs;
+  /** The signature over `tbs`. */
+  u8[] signature;
+  /** The Ed25519 public key this certificate binds. */
+  u8[] publicKey;
+  /** The issuer's Name, as encoded, for chaining. */
+  u8[] issuer;
+  /** The subject's Name, as encoded. */
+  u8[] subject;
+  /** notBefore and notAfter, as seconds since the epoch. */
+  i64 notBefore;
+  i64 notAfter;
+  /** Whether basicConstraints says this may sign other certificates. */
+  bool isCa;
+  /** The dNSName entries in subjectAltName, NUL-separated. */
+  u8[] dnsNames;
+}
+
+/**
+ * Days from the epoch to the start of `year`, proleptic Gregorian.
+ *
+ * Certificate times are absolute, so this needs to be right rather than approximately
+ * right — a leap-year rule that is off by a day makes a certificate expire a day early
+ * once every four years, which is the kind of bug that gets found in production.
+ */
+i64 daysFromCivil(i32 y, i32 m, i32 d) {
+  i32 yy = m <= 2 ? y - 1 : y;
+  i32 era = (yy >= 0 ? yy : yy - 399) / 400;
+  i32 yoe = yy - era * 400;
+  i32 doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  i32 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return (era as i64) * 146097 + (doe as i64) - 719468;
+}
+
+i32 twoDigits(u8[] s, i32 at) { return (s[at] - '0') * 10 + (s[at + 1] - '0'); }
+
+/**
+ * A UTCTime or GeneralizedTime, as seconds since the epoch.
+ *
+ * UTCTime writes the year with two digits, which needs a rule for the century: RFC 5280
+ * says 50 and above is 19xx, below is 20xx. That rule expires in 2049, and writing it
+ * down is the only thing anyone can do about it.
+ */
+i64 parseTime(u8[] s, bool generalized) {
+  i32 at = 0;
+  i32 year = 0;
+  if (generalized) {
+    year = twoDigits(s, 0) * 100 + twoDigits(s, 2);
+    at = 4;
+  } else {
+    i32 yy = twoDigits(s, 0);
+    year = yy >= 50 ? 1900 + yy : 2000 + yy;
+    at = 2;
+  }
+  i32 month = twoDigits(s, at);
+  i32 day = twoDigits(s, at + 2);
+  i32 hour = twoDigits(s, at + 4);
+  i32 minute = twoDigits(s, at + 6);
+  i32 second = twoDigits(s, at + 8);
+  if (month < 1 || month > 12 || day < 1 || day > 31) { trap; }
+  if (hour > 23 || minute > 59 || second > 60) { trap; }
+  return daysFromCivil(year, month, day) * 86400
+       + (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64);
+}
+
+/** Read the two times out of a Validity SEQUENCE. */
+i64 readTime(Der v) {
+  i32 tag = v.peekTag();
+  if (tag == 0x17) { return parseTime(v.element(0x17).rest(), false); }
+  if (tag == 0x18) { return parseTime(v.element(0x18).rest(), true); }
+  trap;
+}
+
+/**
+ * Parse a DER certificate.
+ *
+ * Fields that no decision here depends on — the serial number, the inner signature
+ * algorithm, the unique identifiers — are skipped rather than read. Parsing something to
+ * throw it away is a place for a bug to hide with nothing to catch it.
+ */
+export Cert parseCert(u8[] der) {
+  Der top = Der.create(der);
+  Der cert = top.element(0x30);
+
+  // tbsCertificate: keep the bytes, then parse a copy of them.
+  u8[] tbs = cert.elementBytes();
+  Der tbsOuter = Der.create(tbs);
+  Der t = tbsOuter.element(0x30);
+
+  // version [0] EXPLICIT, absent for v1.
+  if (t.nextIs(0xA0)) { t.skip(); }
+  t.skip();                          // serialNumber
+  t.skip();                          // signature AlgorithmIdentifier, checked outside
+  u8[] issuer = t.elementBytes();    // issuer Name, kept whole for chaining
+
+  Der validity = t.element(0x30);
+  i64 notBefore = readTime(validity);
+  i64 notAfter = readTime(validity);
+
+  u8[] subject = t.elementBytes();
+
+  // subjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey BIT STRING }
+  Der spki = t.element(0x30);
+  Der alg = spki.element(0x30);
+  u8[] algOid = alg.oid();
+  if (!oidEquals(algOid, oidEd25519())) { trap; }
+  u8[] publicKey = spki.bitString();
+  if (publicKey.len() != 32) { trap; }
+
+  bool isCa = false;
+  u8[] dnsNames = u8[0]();
+
+  if (t.nextIs(0x81)) { t.skip(); }   // issuerUniqueID
+  if (t.nextIs(0x82)) { t.skip(); }   // subjectUniqueID
+  if (t.nextIs(0xA3)) {
+    Der extsOuter = t.element(0xA3);
+    Der exts = extsOuter.element(0x30);
+    while (!exts.empty()) {
+      Der ext = exts.element(0x30);
+      u8[] id = ext.oid();
+      if (ext.nextIs(0x01)) { ext.skip(); }   // critical, whose value we do not need
+      u8[] value = ext.element(0x04).rest();
+
+      if (oidEquals(id, oidBasicConstraints())) {
+        Der bc = Der.create(value);
+        Der seq = bc.element(0x30);
+        if (seq.nextIs(0x01)) {
+          isCa = seq.element(0x01).rest()[0] != 0;
+        }
+      } else if (oidEquals(id, oidSubjectAltName())) {
+        dnsNames = collectDnsNames(value);
+      }
+    }
+  }
+
+  // signatureAlgorithm, which must match the key that will check it.
+  Der sigAlg = cert.element(0x30);
+  if (!oidEquals(sigAlg.oid(), oidEd25519())) { trap; }
+  u8[] signature = cert.bitString();
+
+  return Cert(tbs, signature, publicKey, issuer, subject, notBefore, notAfter, isCa, dnsNames);
+}
+
+/** The dNSName entries of a SubjectAltName, joined with NUL bytes. */
+u8[] collectDnsNames(u8[] value) {
+  Der san = Der.create(value);
+  Der names = san.element(0x30);
+  u8[] acc = u8[0]();
+  while (!names.empty()) {
+    i32 tag = names.peekTag();
+    Der item = names.any();
+    if (tag == 0x82) {                 // dNSName, IMPLICIT IA5String
+      u8[] name = item.rest();
+      u8[] joined = u8[acc.len() + (acc.len() > 0 ? 1 : 0) + name.len()]();
+      i32 p = 0;
+      for (i32 i = 0; i < acc.len(); i++) { joined[p] = acc[i]; p++; }
+      if (acc.len() > 0) { joined[p] = 0; p++; }
+      for (i32 i = 0; i < name.len(); i++) { joined[p] = name[i]; p++; }
+      acc = joined;
+    }
+  }
+  return acc;
+}
+
+/** Case-insensitive comparison of two host-name byte strings. */
+bool eqHost(u8[] a, i32 aFrom, i32 aLen, u8[] b) {
+  if (aLen != b.len()) { return false; }
+  for (i32 i = 0; i < aLen; i++) {
+    i32 x = a[aFrom + i];
+    i32 y = b[i];
+    if (x >= 'A' && x <= 'Z') { x += 32; }
+    if (y >= 'A' && y <= 'Z') { y += 32; }
+    if (x != y) { return false; }
+  }
+  return true;
+}
+
+/**
+ * Whether `host` matches one of the certificate's dNSName entries.
+ *
+ * Wildcards are handled for the leftmost label only, which is what RFC 6125 §6.4.3
+ * allows: `*.example.com` matches `a.example.com` and not `a.b.example.com` and not
+ * `example.com`. A wildcard anywhere else, or one matching a bare dot-less name, is the
+ * shape that lets one certificate cover a whole registry.
+ */
+export bool certMatchesHost(Cert c, u8[] host) {
+  i32 start = 0;
+  for (i32 i = 0; i <= c.dnsNames.len(); i++) {
+    if (i == c.dnsNames.len() || c.dnsNames[i] == 0) {
+      i32 len = i - start;
+      if (len > 0 && matchesOne(c.dnsNames, start, len, host)) { return true; }
+      start = i + 1;
+    }
+  }
+  return false;
+}
+
+bool matchesOne(u8[] pat, i32 at, i32 len, u8[] host) {
+  if (len >= 2 && pat[at] == '*' && pat[at + 1] == '.') {
+    // The host must have at least one label before a dot, and the rest must match
+    // exactly. `*.a.com` against `a.com` is not a match: there is no label to consume.
+    i32 dot = -1;
+    for (i32 i = 0; i < host.len(); i++) {
+      if (host[i] == '.' && dot < 0) { dot = i; }
+    }
+    if (dot <= 0) { return false; }
+    u8[] tail = u8[host.len() - dot - 1]();
+    for (i32 i = 0; i < tail.len(); i++) { tail[i] = host[dot + 1 + i]; }
+    return eqHost(pat, at + 2, len - 2, tail);
+  }
+  return eqHost(pat, at, len, host);
+}
+
+/** Whether `signer` signed `cert`. */
+export bool certSignedBy(Cert cert, Cert signer) {
+  return ed25519Verify(signer.publicKey, cert.tbs, cert.signature);
+}
+
+/** Whether two encoded Names are byte-identical, which is how a chain links. */
+bool nameEquals(u8[] a, u8[] b) { return oidEquals(a, b); }
+
+/**
+ * Verify a leaf against a trusted root, at a point in time, for a host name.
+ *
+ * Returns 0 for success and a non-zero code otherwise, because a boolean would answer
+ * "did it work" and the caller needs to know which of the three checks failed — the
+ * alert to send differs, and so does the advice to a human.
+ */
+export i32 verifyChain(Cert leaf, Cert root, u8[] host, i64 now) {
+  if (now < leaf.notBefore) { return 1; }        // not yet valid
+  if (now > leaf.notAfter) { return 2; }         // expired
+  if (now < root.notBefore || now > root.notAfter) { return 3; }
+  if (!root.isCa) { return 4; }                  // a leaf cannot vouch for anything
+  if (!nameEquals(leaf.issuer, root.subject)) { return 5; }
+  if (!certSignedBy(leaf, root)) { return 6; }
+  if (!certMatchesHost(leaf, host)) { return 7; }
+  return 0;
+}

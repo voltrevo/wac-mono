@@ -231,3 +231,7 @@ export u8[] plaintextAlert(i32 description) {
   rec[6] = body[1];
   return rec;
 }
+export i32 alertBadCertificate() { return 42; }
+export i32 alertUnsupportedCertificate() { return 43; }
+export i32 alertCertificateExpired() { return 45; }
+export i32 alertUnknownCa() { return 48; }

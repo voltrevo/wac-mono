@@ -1,0 +1,484 @@
+// A TLS 1.3 client handshake, RFC 8446 §4.
+//
+// The mirror of `server.wac`, and a larger job for one reason: a server presents a
+// certificate and a client has to *believe* one. Producing an identity is a matter of
+// having the bytes; checking one means parsing X.509, verifying a signature chain to
+// something you already trusted, and matching the name you asked for against the name
+// you were given. Skipping the last of those is the classic mistake — an attacker with a
+// valid certificate for a domain they own presents it for yours, and a client that only
+// checks the signature is satisfied.
+//
+// Three things have to verify before this client sends a byte of application data:
+//
+//   the certificate chain    signed by a root we were handed, in date, for this host
+//   CertificateVerify        the server holds the key in that certificate, and signed
+//                            this transcript with it — binding the identity to this
+//                            connection rather than to a recorded one
+//   Finished                 both sides saw the same handshake, so nothing was tampered
+//                            with in transit
+//
+// Like the server, the state is a byte string and the host owns the socket and the
+// randomness.
+
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
+import { ed25519Verify } from "../../crypto/src/ed25519.wac";
+import {
+  deriveSecret, earlySecret, finishedVerify, handshakeSecret, hashLen, masterSecret,
+  trafficKeyIv,
+} from "./keyschedule.wac";
+import {
+  recordSeal, recordOpen, recordType, recordContent, suiteAes128Gcm, suiteKeyLen,
+  typeHandshake, typeApplicationData, typeAlert, typeChangeCipherSpec, maxPlaintext,
+  alertBody, plaintextAlert, alertBadCertificate, alertCertificateExpired,
+  alertCloseNotify, alertDecryptError, alertHandshakeFailure, alertIllegalParameter,
+  alertUnexpectedMessage, alertUnsupportedCertificate,
+} from "./record.wac";
+import {
+  certificateVerifyContent, finished, handshakeMessage, messageBody, messageLength,
+  messageType,
+} from "./handshake.wac";
+import { parseCert, verifyChain, Cert } from "./x509.wac";
+import { Reader, Writer } from "./wire.wac";
+
+struct CConn {
+  i32 phase;
+  i32 suite;
+  i64 seqIn;
+  i64 seqOut;
+  u8[] clientSecret;
+  u8[] serverSecret;
+  u8[] clientAppSecret;
+  u8[] serverAppSecret;
+  u8[] transcript;
+  u8[] ephemeralPriv;
+  u8[] clientRandom;
+  u8[] host;
+  u8[] rootDer;
+  i64 now;
+  /** The server's certificate, held between Certificate and CertificateVerify. */
+  u8[] serverCertDer;
+  /** Non-zero once something has gone wrong, for the host to report. */
+  i32 failure;
+}
+
+u8[] encodeConn(CConn c) {
+  Writer w = Writer.create();
+  w.u8(c.phase);
+  w.u16(c.suite);
+  for (i32 i = 0; i < 8; i++) { w.u8(((c.seqIn >> (((7 - i) * 8) as i64)) & 255) as! i32); }
+  for (i32 i = 0; i < 8; i++) { w.u8(((c.seqOut >> (((7 - i) * 8) as i64)) & 255) as! i32); }
+  for (i32 i = 0; i < 8; i++) { w.u8(((c.now >> (((7 - i) * 8) as i64)) & 255) as! i32); }
+  w.u16(c.failure);
+  w.vec8(c.clientSecret);
+  w.vec8(c.serverSecret);
+  w.vec8(c.clientAppSecret);
+  w.vec8(c.serverAppSecret);
+  w.u32(c.transcript.len());
+  w.bytes(c.transcript);
+  w.vec8(c.ephemeralPriv);
+  w.vec8(c.clientRandom);
+  w.vec16(c.host);
+  w.u32(c.rootDer.len());
+  w.bytes(c.rootDer);
+  w.u32(c.serverCertDer.len());
+  w.bytes(c.serverCertDer);
+  return w.take();
+}
+
+CConn decodeConn(u8[] state) {
+  Reader r = Reader.create(state);
+  i32 phase = r.u8();
+  i32 suite = r.u16();
+  i64 seqIn = 0;
+  for (i32 i = 0; i < 8; i++) { seqIn = (seqIn << 8) | (r.u8() as i64); }
+  i64 seqOut = 0;
+  for (i32 i = 0; i < 8; i++) { seqOut = (seqOut << 8) | (r.u8() as i64); }
+  i64 now = 0;
+  for (i32 i = 0; i < 8; i++) { now = (now << 8) | (r.u8() as i64); }
+  i32 failure = r.u16();
+  u8[] cs = r.vec8();
+  u8[] ss = r.vec8();
+  u8[] cas = r.vec8();
+  u8[] sas = r.vec8();
+  u8[] transcript = r.take(r.u32());
+  u8[] eph = r.vec8();
+  u8[] rnd = r.vec8();
+  u8[] host = r.vec16();
+  u8[] root = r.take(r.u32());
+  u8[] cert = r.take(r.u32());
+  r.expectEnd();
+  return CConn(phase, suite, seqIn, seqOut, cs, ss, cas, sas, transcript, eph, rnd,
+               host, root, now, cert, failure);
+}
+
+void addTranscript(CConn c, u8[] msg) {
+  if (c.transcript.len() + msg.len() > 65536) { trap; }
+  u8[] t = u8[c.transcript.len() + msg.len()]();
+  for (i32 i = 0; i < c.transcript.len(); i++) { t[i] = c.transcript[i]; }
+  for (i32 i = 0; i < msg.len(); i++) { t[c.transcript.len() + i] = msg[i]; }
+  c.transcript = t;
+}
+
+void sealInto(Writer out, CConn c, i32 contentType, u8[] content) {
+  i32 keyLen = suiteKeyLen(c.suite);
+  u8[] ki = trafficKeyIv(c.clientSecret, keyLen);
+  u8[] key = u8[keyLen]();
+  u8[] iv = u8[12]();
+  for (i32 i = 0; i < keyLen; i++) { key[i] = ki[i]; }
+  for (i32 i = 0; i < 12; i++) { iv[i] = ki[keyLen + i]; }
+  out.bytes(recordSeal(c.suite, key, iv, c.seqOut, contentType, content, 0));
+  c.seqOut += 1;
+}
+
+u8[] openWith(CConn c, u8[] record) {
+  i32 keyLen = suiteKeyLen(c.suite);
+  u8[] ki = trafficKeyIv(c.serverSecret, keyLen);
+  u8[] key = u8[keyLen]();
+  u8[] iv = u8[12]();
+  for (i32 i = 0; i < keyLen; i++) { key[i] = ki[i]; }
+  for (i32 i = 0; i < 12; i++) { iv[i] = ki[keyLen + i]; }
+  u8[] inner = recordOpen(c.suite, key, iv, c.seqIn, record);
+  c.seqIn += 1;
+  return inner;
+}
+
+/**
+ * A ClientHello.
+ *
+ * The extensions are the message: `supported_versions` is the only place TLS 1.3 is
+ * named, `key_share` carries a guess at what the server will pick, and
+ * `signature_algorithms` says what certificates we can check. Omitting the last would
+ * mean claiming to accept anything, which for this client is untrue by a wide margin.
+ */
+u8[] clientHello(CConn c) {
+  Writer body = Writer.create();
+  body.u16(0x0303);                     // legacy_version
+  body.bytes(c.clientRandom);
+  body.vec8(u8[32]());                  // legacy_session_id: 32 bytes for compatibility
+  Writer suites = Writer.create();
+  suites.u16(c.suite);
+  body.vec16(suites.take());
+  body.vec8(u8[1]());                   // legacy_compression_methods = [0]
+
+  Writer exts = Writer.create();
+  // server_name
+  if (c.host.len() > 0) {
+    exts.u16(0);
+    Writer sniList = Writer.create();
+    sniList.u8(0);
+    sniList.vec16(c.host);
+    Writer sni = Writer.create();
+    sni.vec16(sniList.take());
+    exts.vec16(sni.take());
+  }
+  // supported_groups: x25519 only
+  exts.u16(10);
+  Writer groups = Writer.create();
+  Writer groupList = Writer.create();
+  groupList.u16(0x001d);
+  groups.vec16(groupList.take());
+  exts.vec16(groups.take());
+  // signature_algorithms: ed25519 only
+  exts.u16(13);
+  Writer sigs = Writer.create();
+  Writer sigList = Writer.create();
+  sigList.u16(0x0807);
+  sigs.vec16(sigList.take());
+  exts.vec16(sigs.take());
+  // supported_versions
+  exts.u16(43);
+  Writer vers = Writer.create();
+  Writer verList = Writer.create();
+  verList.u16(0x0304);
+  vers.vec8(verList.take());
+  exts.vec16(vers.take());
+  // key_share
+  exts.u16(51);
+  Writer ks = Writer.create();
+  Writer share = Writer.create();
+  share.u16(0x001d);
+  share.vec16(x25519Base(c.ephemeralPriv));
+  ks.vec16(share.take());
+  exts.vec16(ks.take());
+
+  body.vec16(exts.take());
+  return handshakeMessage(1, body.take());
+}
+
+/** The server's x25519 share, out of a ServerHello. Empty if it did not send one. */
+u8[] serverShare(u8[] shBody) {
+  Reader r = Reader.create(shBody);
+  r.u16();                              // legacy_version
+  r.take(32);                           // random
+  r.vec8();                             // legacy_session_id_echo
+  r.u16();                              // cipher_suite
+  r.u8();                               // legacy_compression_method
+  u8[] share = u8[0]();
+  bool sawTls13 = false;
+  if (!r.empty()) {
+    Reader exts = r.sub16();
+    while (!exts.empty()) {
+      i32 kind = exts.u16();
+      Reader body = exts.sub16();
+      if (kind == 51) {
+        i32 group = body.u16();
+        u8[] key = body.vec16();
+        if (group == 0x001d && key.len() == 32) { share = key; }
+      } else if (kind == 43) {
+        if (body.u16() == 0x0304) { sawTls13 = true; }
+      }
+    }
+  }
+  if (!sawTls13) { return u8[0](); }
+  return share;
+}
+
+/** The cipher suite a ServerHello selected. */
+i32 serverSuite(u8[] shBody) {
+  Reader r = Reader.create(shBody);
+  r.u16();
+  r.take(32);
+  r.vec8();
+  return r.u16();
+}
+
+u8[] result(CConn c, u8[] toSend, u8[] appData) {
+  u8[] state = encodeConn(c);
+  Writer w = Writer.create();
+  w.u32(state.len());
+  w.bytes(state);
+  w.u32(toSend.len());
+  w.bytes(toSend);
+  w.u32(appData.len());
+  w.bytes(appData);
+  return w.take();
+}
+
+/** Give up, recording why, and produce the alert that says so. */
+u8[] fail(CConn c, i32 code, i32 alert, Writer out, Writer appData) {
+  c.failure = code;
+  if (c.phase >= 1) {
+    sealInto(out, c, typeAlert(), alertBody(alert));
+  } else {
+    out.bytes(plaintextAlert(alert));
+  }
+  c.phase = 4;
+  return result(c, out.take(), appData.take());
+}
+
+/**
+ * Start a connection: returns state and the ClientHello to send.
+ *
+ * `rootDer` is the one certificate this client trusts. A real client carries a store of
+ * hundreds; one is enough to demonstrate that the check happens, and refusing to pretend
+ * otherwise is why this takes a root rather than a flag to skip verification.
+ */
+export u8[] tlsClientInit(u8[] host, u8[] rootDer, u8[] ephemeralPriv, u8[] clientRandom, i64 now) {
+  if (ephemeralPriv.len() != 32) { trap; }
+  if (clientRandom.len() != 32) { trap; }
+  CConn c = CConn(0, suiteAes128Gcm(), 0, 0, u8[0](), u8[0](), u8[0](), u8[0](), u8[0](),
+                  ephemeralPriv, clientRandom, host, rootDer, now, u8[0](), 0);
+  u8[] ch = clientHello(c);
+  addTranscript(c, ch);
+  c.phase = 1;
+
+  Writer out = Writer.create();
+  Writer rec = Writer.create();
+  rec.u8(typeHandshake());
+  rec.u16(0x0301);                      // the first record says 1.0, per RFC 8446 D.4
+  rec.vec16(ch);
+  out.bytes(rec.take());
+  return result(c, out.take(), u8[0]());
+}
+
+/** Phases: 0 fresh, 1 sent hello, 2 got ServerHello, 3 established, 4 failed. */
+export i32 tlsClientPhase(u8[] state) { return state[0]; }
+
+/** Why the handshake failed, or 0. */
+export i32 tlsClientFailure(u8[] state) {
+  CConn c = decodeConn(state);
+  return c.failure;
+}
+
+/** Feed whatever arrived. Returns `[state][toSend][appData]`. */
+export u8[] tlsClientFeed(u8[] state, u8[] input) {
+  CConn c = decodeConn(state);
+  Writer toSend = Writer.create();
+  Writer appData = Writer.create();
+
+  i32 pos = 0;
+  while (pos < input.len()) {
+    if (input.len() - pos < 5) { trap; }
+    i32 recLen = (input[pos + 3] << 8) | input[pos + 4];
+    if (pos + 5 + recLen > input.len()) { trap; }
+    i32 outerType = input[pos];
+    u8[] record = u8[5 + recLen]();
+    for (i32 i = 0; i < 5 + recLen; i++) { record[i] = input[pos + i]; }
+    pos += 5 + recLen;
+
+    if (outerType == typeChangeCipherSpec()) { continue; }
+
+    if (c.phase == 1) {
+      // ServerHello, in the clear.
+      if (outerType != typeHandshake()) { return fail(c, 10, alertUnexpectedMessage(), toSend, appData); }
+      u8[] msg = u8[recLen]();
+      for (i32 i = 0; i < recLen; i++) { msg[i] = record[5 + i]; }
+      if (messageLength(msg) != msg.len()) { return fail(c, 11, alertIllegalParameter(), toSend, appData); }
+      if (messageType(msg) != 2) { return fail(c, 12, alertUnexpectedMessage(), toSend, appData); }
+      u8[] shBody = messageBody(msg);
+      if (serverSuite(shBody) != c.suite) { return fail(c, 13, alertHandshakeFailure(), toSend, appData); }
+      u8[] share = serverShare(shBody);
+      if (share.len() != 32) { return fail(c, 14, alertHandshakeFailure(), toSend, appData); }
+
+      addTranscript(c, msg);
+      u8[] shared = x25519(c.ephemeralPriv, share);
+      u8[] early = earlySecret(u8[hashLen()]());
+      u8[] hs = handshakeSecret(early, shared);
+      u8[] th = sha256(c.transcript);
+      c.clientSecret = deriveSecret(hs, "c hs traffic".toBytes(), th);
+      c.serverSecret = deriveSecret(hs, "s hs traffic".toBytes(), th);
+      u8[] master = masterSecret(hs);
+      // Held: the application secrets need the transcript through the server's Finished,
+      // which has not arrived. They are derived at that point, not here.
+      c.clientAppSecret = master;
+      c.seqIn = 0;
+      c.seqOut = 0;
+      c.phase = 2;
+    } else if (c.phase == 2) {
+      u8[] inner = openWith(c, record);
+      i32 t = recordType(inner);
+      if (t == typeAlert()) { return fail(c, 20, alertCloseNotify(), toSend, appData); }
+      if (t != typeHandshake()) { return fail(c, 21, alertUnexpectedMessage(), toSend, appData); }
+
+      // A record may carry several handshake messages, and one message may span records.
+      u8[] buf = recordContent(inner);
+      i32 at = 0;
+      while (at < buf.len()) {
+        u8[] rest = u8[buf.len() - at]();
+        for (i32 i = 0; i < rest.len(); i++) { rest[i] = buf[at + i]; }
+        i32 mlen = messageLength(rest);
+        if (mlen < 0) { return fail(c, 22, alertIllegalParameter(), toSend, appData); }
+        u8[] msg = u8[mlen]();
+        for (i32 i = 0; i < mlen; i++) { msg[i] = rest[i]; }
+        at += mlen;
+
+        i32 mt = messageType(msg);
+        if (mt == 8) {
+          addTranscript(c, msg);                    // EncryptedExtensions, ignored
+        } else if (mt == 11) {
+          // Certificate. The transcript hash for CertificateVerify includes this, so it
+          // has to be added before the signature is checked.
+          u8[] cbody = messageBody(msg);
+          Reader r = Reader.create(cbody);
+          r.vec8();                                 // certificate_request_context
+          Reader list = r.slice(r.u24());
+          if (list.empty()) { return fail(c, 30, alertHandshakeFailure(), toSend, appData); }
+          c.serverCertDer = list.vec24();           // the leaf is first
+          addTranscript(c, msg);
+        } else if (mt == 15) {
+          // CertificateVerify. Check the chain first — a signature from a certificate we
+          // do not trust is not worth verifying, and checking it first would mean
+          // reporting "bad signature" for what is really "unknown issuer".
+          if (c.serverCertDer.len() == 0) { return fail(c, 31, alertUnexpectedMessage(), toSend, appData); }
+          Cert leaf = parseCert(c.serverCertDer);
+          Cert root = parseCert(c.rootDer);
+          i32 chain = verifyChain(leaf, root, c.host, c.now);
+          if (chain != 0) {
+            i32 alert = alertBadCertificate();
+            if (chain == 1 || chain == 2 || chain == 3) { alert = alertCertificateExpired(); }
+            return fail(c, 40 + chain, alert, toSend, appData);
+          }
+
+          u8[] cvBody = messageBody(msg);
+          Reader r = Reader.create(cvBody);
+          if (r.u16() != 0x0807) { return fail(c, 32, alertUnsupportedCertificate(), toSend, appData); }
+          u8[] sig = r.vec16();
+          u8[] signed = certificateVerifyContent(sha256(c.transcript), true);
+          if (!ed25519Verify(leaf.publicKey, signed, sig)) {
+            return fail(c, 33, alertDecryptError(), toSend, appData);
+          }
+          addTranscript(c, msg);
+        } else if (mt == 20) {
+          // The server's Finished, over the transcript that does not include it.
+          u8[] want = finishedVerify(c.serverSecret, sha256(c.transcript));
+          u8[] got = messageBody(msg);
+          i32 diff = got.len() == want.len() ? 0 : 1;
+          if (diff == 0) {
+            for (i32 i = 0; i < want.len(); i++) { diff = diff | (got[i] ^ want[i]); }
+          }
+          if (diff != 0) { return fail(c, 34, alertDecryptError(), toSend, appData); }
+          addTranscript(c, msg);
+
+          // Application secrets, from the transcript through the server's Finished.
+          u8[] master = c.clientAppSecret;
+          u8[] thSf = sha256(c.transcript);
+          u8[] cApp = deriveSecret(master, "c ap traffic".toBytes(), thSf);
+          u8[] sApp = deriveSecret(master, "s ap traffic".toBytes(), thSf);
+
+          // Our Finished goes out under the *handshake* keys, before the switch.
+          u8[] myFin = finished(finishedVerify(c.clientSecret, sha256(c.transcript)));
+          // Middlebox compatibility: a ChangeCipherSpec before our first encrypted flight.
+          toSend.bytes(u8[](20, 3, 3, 0, 1, 1));
+          sealInto(toSend, c, typeHandshake(), myFin);
+          addTranscript(c, myFin);
+
+          c.clientSecret = cApp;
+          c.serverSecret = sApp;
+          c.clientAppSecret = cApp;
+          c.serverAppSecret = sApp;
+          c.seqIn = 0;
+          c.seqOut = 0;
+          c.phase = 3;
+        } else {
+          return fail(c, 23, alertUnexpectedMessage(), toSend, appData);
+        }
+      }
+    } else if (c.phase == 3) {
+      u8[] inner = openWith(c, record);
+      i32 t = recordType(inner);
+      if (t == typeApplicationData()) {
+        appData.bytes(recordContent(inner));
+      } else if (t == typeAlert()) {
+        c.phase = 4;
+      }
+      // NewSessionTicket and friends are ignored: nothing here resumes.
+    } else {
+      trap;
+    }
+  }
+  return result(c, toSend.take(), appData.take());
+}
+
+/** Seal application data for sending. */
+export u8[] tlsClientSend(u8[] state, u8[] data) {
+  CConn c = decodeConn(state);
+  if (c.phase != 3) { trap; }
+  Writer out = Writer.create();
+  i32 pos = 0;
+  bool once = false;
+  while (pos < data.len() || !once) {
+    once = true;
+    i32 n = data.len() - pos;
+    if (n > maxPlaintext()) { n = maxPlaintext(); }
+    u8[] chunk = u8[n]();
+    for (i32 i = 0; i < n; i++) { chunk[i] = data[pos + i]; }
+    sealInto(out, c, typeApplicationData(), chunk);
+    pos += n;
+    if (n == 0) { pos = data.len() + 1; }
+  }
+  return result(c, out.take(), u8[0]());
+}
+
+/** close_notify. */
+export u8[] tlsClientClose(u8[] state) {
+  CConn c = decodeConn(state);
+  Writer out = Writer.create();
+  if (c.phase == 2 || c.phase == 3) {
+    sealInto(out, c, typeAlert(), alertBody(alertCloseNotify()));
+  } else if (c.phase <= 1) {
+    out.bytes(plaintextAlert(alertCloseNotify()));
+  }
+  c.phase = 4;
+  return result(c, out.take(), u8[0]());
+}
