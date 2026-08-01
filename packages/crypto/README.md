@@ -1,7 +1,8 @@
 # crypto
 
-SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519,
-NIST P-256 (ECDH and ECDSA) and RSA signature verification, written in wac.
+SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM,
+X25519, Ed25519, NIST P-256 (ECDH and ECDSA) and RSA signature verification, written
+in wac.
 
 > **Not for production.** Nothing here is constant-time. `ghash`'s multiply branches on
 > every bit of its operand, `aes` indexes an S-box with key-dependent values, and
@@ -71,6 +72,24 @@ verify test would have passed.
 Roughly 120 ms per signature. The scalar multiplication is a plain 256-step
 double-and-add with no windowing, which is the slowest reasonable choice and the easiest
 to read against the spec.
+
+## SHA-3 and SHAKE
+
+`src/keccak.wac` — Keccak-f[1600] and the four functions FIPS 202 builds on it. Here
+because ML-KEM is defined entirely in terms of them: the matrix is sampled from SHAKE128,
+the noise from SHAKE256, and the key derivation uses SHA3-256 and SHA3-512. No amount of
+SHA-2 substitutes.
+
+The rho offsets and the pi permutation are *computed* from the spec's walk rather than
+transcribed. FIPS 202 prints them as a 5×5 grid, and copying a grid of rotation amounts
+into a flat array indexed the other way round is the classic way to produce a hash that
+is wrong for every input. Deriving them is four lines and is the definition.
+
+Two oracles, split by what exists: WebCrypto has SHA3-256 and SHA3-512 but no SHAKE,
+OpenSSL 3.5.7 has all four. Between a browser engine and a C library that is a wider net
+than either. `tools/openssl35.sh` builds the latter — the system OpenSSL is 3.0.13, which
+predates ML-KEM — and the SHAKE test skips itself when it is absent rather than failing
+over a tool the repo does not ship.
 
 ## RSA
 

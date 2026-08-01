@@ -1,0 +1,184 @@
+// Keccak-f[1600], and the SHA-3 and SHAKE functions built on it (FIPS 202).
+//
+// Needed here because ML-KEM is defined entirely in terms of SHAKE and SHA-3 — the
+// matrix is sampled from SHAKE128, the noise from SHAKE256, and the key derivation uses
+// SHA3-256 and SHA3-512. None of SHA-2 will do; they are different functions.
+//
+// ## The state
+//
+// 1600 bits as twenty-five 64-bit lanes, indexed `x + 5y`. Five steps per round, done
+// twenty-four times:
+//
+//   theta  each lane is xored with the parities of two neighbouring columns
+//   rho    each lane is rotated by its own fixed amount
+//   pi     the lanes are permuted
+//   chi    the only non-linear step: a row is combined with the two lanes to its right
+//   iota   one round constant is xored into lane zero, which is what stops every round
+//          being identical and the whole thing collapsing
+//
+// ## The tables are computed, not transcribed
+//
+// The rho offsets and the pi permutation both come from the same walk over the state —
+// `(x, y) -> (y, 2x + 3y)` — and the offsets are the triangular numbers modulo 64. FIPS
+// 202 prints them as a 5x5 grid, and copying a 5x5 grid of rotation amounts into a flat
+// array indexed the other way round is exactly the sort of transcription that produces a
+// hash which is wrong for every input. Deriving them is four lines and is the definition.
+//
+// The round constants cannot be derived so cheaply — they come from an LFSR — so those
+// are written out, with a wrinkle: five of the twenty-four sit in [2^31, 2^32), where a
+// hex literal is sign-extended into a 64-bit target (wac issue 0054). Every constant
+// below 2^32 is masked to undo that. The mask is harmless on the ones that do not need
+// it and applying it uniformly is easier to check than a list of exceptions.
+
+/** The 24 round constants, from FIPS 202 Table 1. */
+const u64[] RC = u64[](
+  0x0000000000000001 & 4294967295,
+  0x0000000000008082 & 4294967295,
+  0x800000000000808A,
+  0x8000000080008000,
+  0x000000000000808B & 4294967295,
+  0x0000000080000001 & 4294967295,
+  0x8000000080008081,
+  0x8000000000008009,
+  0x000000000000008A & 4294967295,
+  0x0000000000000088 & 4294967295,
+  0x0000000080008009 & 4294967295,
+  0x000000008000000A & 4294967295,
+  0x000000008000808B & 4294967295,
+  0x800000000000008B,
+  0x8000000000008089,
+  0x8000000000008003,
+  0x8000000000008002,
+  0x8000000000000080,
+  0x000000000000800A & 4294967295,
+  0x800000008000000A,
+  0x8000000080008081,
+  0x8000000000008080,
+  0x0000000080000001 & 4294967295,
+  0x8000000080008008,
+);
+
+u64 rotl(u64 x, u64 n) { return n == 0 ? x : ((x << n) | (x >> (64 - n))); }
+
+/**
+ * The rho offsets and the pi destination for each lane, both from the spec's walk.
+ *
+ * Returned as one array of fifty: the first twenty-five are rotation amounts indexed by
+ * source lane, the next twenty-five are the destination index for that lane. Two arrays
+ * would be tidier and wac has no tuples.
+ */
+i32[] rhoPi() {
+  i32[] t = i32[50]();
+  // Lane (0,0) is not part of the walk: it is neither rotated nor moved.
+  t[0] = 0;
+  t[25] = 0;
+  i32 x = 1;
+  i32 y = 0;
+  for (i32 i = 0; i < 24; i++) {
+    i32 src = x + 5 * y;
+    // The (i+1)(i+2)/2 triangular number, modulo the lane width.
+    t[src] = ((i + 1) * (i + 2) / 2) % 64;
+    // pi sends (x, y) to (y, 2x + 3y).
+    t[25 + src] = y + 5 * ((2 * x + 3 * y) % 5);
+    i32 nx = y;
+    i32 ny = (2 * x + 3 * y) % 5;
+    x = nx;
+    y = ny;
+  }
+  return t;
+}
+
+/** The permutation, in place over twenty-five lanes. */
+export void keccakF(u64[] a) {
+  i32[] t = rhoPi();
+  u64[] c = u64[5]();
+  u64[] b = u64[25]();
+
+  for (i32 round = 0; round < 24; round++) {
+    // theta
+    for (i32 x = 0; x < 5; x++) {
+      c[x] = a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20];
+    }
+    for (i32 x = 0; x < 5; x++) {
+      u64 d = c[(x + 4) % 5] ^ rotl(c[(x + 1) % 5], 1);
+      for (i32 y = 0; y < 5; y++) { a[x + 5 * y] ^= d; }
+    }
+
+    // rho and pi together: rotate each lane and place it where pi says.
+    for (i32 i = 0; i < 25; i++) {
+      b[t[25 + i]] = rotl(a[i], t[i] as! u64);
+    }
+
+    // chi, row by row.
+    for (i32 y = 0; y < 5; y++) {
+      for (i32 x = 0; x < 5; x++) {
+        a[x + 5 * y] = b[x + 5 * y] ^ (~b[(x + 1) % 5 + 5 * y] & b[(x + 2) % 5 + 5 * y]);
+      }
+    }
+
+    // iota
+    a[0] ^= RC[round];
+  }
+}
+
+/**
+ * The sponge: absorb `input` at `rate` bytes a block, then squeeze `outLen`.
+ *
+ * `domain` is the padding's first byte — 0x06 for SHA-3, 0x1F for the SHAKEs. It is the
+ * only difference between them apart from the rate, and it is what stops SHA3-256 and a
+ * SHAKE128 truncated to 32 bytes being the same function.
+ *
+ * The padding is `pad10*1`: the domain byte, zeros, and a final bit at the top of the
+ * last rate byte. When the message ends exactly one byte short of a block, those two
+ * land in the same byte and are ored together — a special case that a padding written as
+ * "append the domain byte, then zeros, then 0x80" gets wrong for exactly that length.
+ */
+export u8[] sponge(u8[] input, i32 rate, i32 domain, i32 outLen) {
+  if (rate <= 0 || rate > 200) { trap; }
+  u64[] state = u64[25]();
+
+  i32 at = 0;
+  u8[] block = u8[rate]();
+  while (at + rate <= input.len()) {
+    for (i32 i = 0; i < rate; i++) { block[i] = input[at + i]; }
+    absorb(state, block, rate);
+    at += rate;
+  }
+
+  // The final, partial block, with the padding.
+  for (i32 i = 0; i < rate; i++) { block[i] = 0; }
+  i32 tail = input.len() - at;
+  for (i32 i = 0; i < tail; i++) { block[i] = input[at + i]; }
+  block[tail] = block[tail] | domain;
+  block[rate - 1] = block[rate - 1] | 0x80;
+  absorb(state, block, rate);
+
+  // Squeeze: read a block, then permute if more is wanted. Reading first is what makes
+  // this correct — the absorb of the padded block already permuted, so the state is
+  // ready. Permuting first instead would work for a single output block and quietly
+  // shift every byte of a longer one, which is the shape SHAKE is always used in.
+  u8[] out = u8[outLen]();
+  i32 produced = 0;
+  while (true) {
+    for (i32 i = 0; i < rate && produced < outLen; i++) {
+      out[produced] = ((state[i / 8] >> (((i % 8) * 8) as! u64)) & 255) as! i32;
+      produced++;
+    }
+    if (produced >= outLen) { return out; }
+    keccakF(state);
+  }
+  return out;
+}
+
+/** Xor one rate-sized block into the state, little-endian by lane, then permute. */
+void absorb(u64[] state, u8[] block, i32 rate) {
+  for (i32 i = 0; i < rate; i++) {
+    state[i / 8] ^= (block[i] as! u64) << (((i % 8) * 8) as! u64);
+  }
+  keccakF(state);
+}
+
+export u8[] sha3_256(u8[] msg) { return sponge(msg, 136, 0x06, 32); }
+export u8[] sha3_512(u8[] msg) { return sponge(msg, 72, 0x06, 64); }
+export u8[] shake128(u8[] msg, i32 outLen) { return sponge(msg, 168, 0x1F, outLen); }
+export u8[] shake256(u8[] msg, i32 outLen) { return sponge(msg, 136, 0x1F, outLen); }
