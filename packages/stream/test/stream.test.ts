@@ -19,8 +19,12 @@ const MODULE = "packages/stream/src/transform.wac";
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-async function streamed(entry: string, chunks: Uint8Array[]): Promise<Uint8Array> {
-  const ts = wacTransformStream({ modulePath: MODULE, entry });
+async function streamed(
+  entry: string,
+  chunks: Uint8Array[],
+  modulePath: string = MODULE,
+): Promise<Uint8Array> {
+  const ts = wacTransformStream({ modulePath, entry });
   const writer = ts.writable.getWriter();
   const reading = new Response(ts.readable).arrayBuffer();
   for (const c of chunks) await writer.write(c);
@@ -225,4 +229,34 @@ Deno.test("it is a stream, so it composes with pipeThrough", async () => {
   const out = source.pipeThrough(wacTransformStream({ modulePath: MODULE, entry: "upperCase" }));
   const got = new Uint8Array(await new Response(out).arrayBuffer());
   if (dec.decode(got) !== "PIPED THROUGH WAC") throw new Error(dec.decode(got));
+});
+
+Deno.test("gunzip through the bridge, which is what the whole thing was for", async () => {
+  // `packages/gzip` exports `gunzipStream` in exactly the shape this bridge drives, so a gzip
+  // file becomes a `DecompressionStream` with no glue between them. Nothing here knows it is
+  // gzip: `modulePath` and `entry` are the only difference from `upperCase` above.
+  const GZIP = "packages/gzip/src/inflate.wac";
+  const unit = enc.encode("streaming all the way down. ");
+  const data = new Uint8Array(unit.length * 9000);
+  for (let i = 0; i < 9000; i++) data.set(unit, i * unit.length);
+
+  const cmd = new Deno.Command("python3", {
+    args: ["-c", "import sys,gzip; sys.stdout.buffer.write(gzip.compress(sys.stdin.buffer.read(), 6))"],
+    stdin: "piped",
+    stdout: "piped",
+  });
+  const child = cmd.spawn();
+  const w = child.stdin.getWriter();
+  await w.write(data);
+  await w.close();
+  const gz = (await child.output()).stdout;
+
+  // Fed in small pieces, so the decoder blocks on input repeatedly rather than seeing it whole.
+  const chunks: Uint8Array[] = [];
+  for (let i = 0; i < gz.length; i += 1000) chunks.push(gz.slice(i, i + 1000));
+
+  const got = await streamed("gunzipStream", chunks, GZIP);
+  if (!bytesEqual(got, data)) {
+    throw new Error(`${got.length} bytes out of the bridge, want ${data.length}`);
+  }
 });

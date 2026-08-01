@@ -1,0 +1,28 @@
+import { crc32, crc32Start, crc32Finish, crc32Update, crcTable8 } from "../../src/crc32.wac";
+import { Buf } from "../../../bytes/src/buf.wac";
+
+export u32 whole(u8[] d) { return crc32(d); }
+
+/** Fold `d` in `step` bytes at a time and finish — must equal `whole`. */
+export u32 chunked(u8[] d, i32 step) {
+  u32[] t = crcTable8();
+  u32 c = crc32Start();
+  i32 i = 0;
+  while (i < d.len()) {
+    i32 n = step;
+    if (i + n > d.len()) { n = d.len() - i; }
+    u8[] part = u8[n]();
+    for (i32 k = 0; k < n; k++) { part[k] = d[i + k]; }
+    c = crc32Update(t, c, part);
+    i += n;
+  }
+  return crc32Finish(c);
+}
+
+/** Push `d`, drop `n` from the front, return what is left. */
+export u8[] dropped(u8[] d, i32 n) {
+  Buf b = Buf.create();
+  b.pushAll(d);
+  b.dropFront(n);
+  return b.take();
+}

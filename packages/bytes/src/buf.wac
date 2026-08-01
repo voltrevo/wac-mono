@@ -166,6 +166,26 @@ export struct Buf {
     return out;
   }
 
+  /**
+   * Discard the first `n` bytes and shift the rest to the front.
+   *
+   * For a sliding window: a decoder that has emitted the front of its output still needs the
+   * tail addressable for back-references, and needs the buffer to stop growing. Shifts in
+   * place rather than reallocating, because bounding what is held is the whole point.
+   *
+   * Indices move. A caller holding absolute positions has to track how much has been
+   * dropped — `Window` in `packages/gzip/src/inflate.wac` is the worked example.
+   */
+  void dropFront(this, i32 n) {
+    if (n <= 0) { return; }
+    if (n >= this.len) { this.len = 0; return; }
+    i32 keep = this.len - n;
+    for (i32 i = 0; i < keep; i++) {
+      this.data[i] = this.data[n + i];
+    }
+    this.len = keep;
+  }
+
   // Exact-length copy — the internal array is over-allocated.
   u8[] bytes(const this) {
     u8[] out = u8[this.len]();

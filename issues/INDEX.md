@@ -5,7 +5,6 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
-| [0006](open/0006-streaming-gzip-is-now-representable.md) | streaming gzip is now representable, and was not before | missing feature | not implemented |
 | [0005](open/0005-mutation-testing-found-54-untested-behaviours.md) | surviving mutants: behaviours nothing checks (31 open) | task | wrong answer |
 | [0003](open/0003-wacc-parser-does-not-implement-generics.md) | wacc's parser does not implement generics, so `std` is outside its corpus | missing feature | not implemented |
 | [0001](open/0001-the-compiler-is-an-unpinned-dependency.md) | the compiler is an unpinned dependency, and a stale one blames the wrong package | bug | compile error |

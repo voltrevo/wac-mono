@@ -266,3 +266,39 @@ export string test_take_empties_the_buffer_when_it_copies() {
   t.eqBytes(first, u8[]('f', 'o', 'o'), "and the first result is untouched");
   return t.report();
 }
+
+export string test_drop_front_shifts_what_is_left() {
+  T t = T.create();
+  // For a sliding window: the front has been handed away and the tail still has to be
+  // addressable. Written for gzip's streaming inflate, where the tail is the 32 KiB a
+  // back-reference can still reach.
+  Buf b = Buf.create();
+  b.pushAll(u8[]('a', 'b', 'c', 'd', 'e'));
+
+  b.dropFront(2);
+  t.eqI32(b.len, 3, "the length drops by what was dropped");
+  t.eqI32(b.get(0), 'c', "and the rest moves to the front");
+  t.eqI32(b.get(2), 'e', "all of it, not just the first byte");
+
+  b.pushAll(u8[]('f'));
+  t.eqBytes(b.take(), u8[]('c', 'd', 'e', 'f'), "a push after a drop lands after the tail");
+  return t.report();
+}
+
+export string test_drop_front_at_the_edges() {
+  T t = T.create();
+  Buf b = Buf.create();
+  b.pushAll(u8[]('x', 'y', 'z'));
+
+  b.dropFront(0);
+  t.eqI32(b.len, 3, "dropping nothing keeps everything");
+  b.dropFront(-4);
+  t.eqI32(b.len, 3, "and so does a negative count, rather than corrupting the length");
+
+  b.dropFront(9);
+  t.eqI32(b.len, 0, "dropping more than there is empties it instead of going negative");
+
+  b.pushAll(u8[]('q'));
+  t.eqBytes(b.take(), u8[]('q'), "and it is reusable afterwards");
+  return t.report();
+}

@@ -17,6 +17,42 @@ Complete, both directions.
 | Fixed Huffman + LZ77 (`BTYPE=01`) | done |
 | Dynamic Huffman (`BTYPE=10`) | done, at or under `gzip -6` |
 | Inflate | all three block types, plus raw deflate |
+| Streaming inflate | `gunzipStream`, input and output both incremental |
+
+### Streaming
+
+`gunzipBytes` needs the whole member in memory and produces the whole payload at once.
+`gunzipStream` does neither:
+
+```wac
+export i32 gunzipStream(fn[u8[]()] read, fn[bool(u8[])] write)
+```
+
+It pulls input through `read` and hands output to `write` as it is produced, holding only a
+32 KiB window — the furthest a DEFLATE back-reference can reach — rather than the whole
+output. What it retains is bounded by the flush threshold, currently 128 KiB, and not by the
+size of the member: a 1 GiB file needs no more than a 1 KiB one.
+
+Both entry points share `inflateInto`, so there is one copy of the format and the difference
+between them is only where bytes come from and where they go. The trailer is what forces two
+entry points rather than one: a buffer decode reads the CRC and length from the *last* eight
+bytes before it starts, which is how it pre-sizes its output, while a stream has no last eight
+bytes until it reaches them and so checksums as it goes. Same guarantees, opposite order — a
+member that fails its CRC traps either way.
+
+The signature is the one [`packages/stream`](../stream/README.md) drives, so a gzip file
+becomes a `DecompressionStream` with no glue:
+
+```ts
+const out = file.readable.pipeThrough(
+  wacTransformStream({ modulePath: "packages/gzip/src/inflate.wac", entry: "gunzipStream" }),
+);
+```
+
+Compression does not stream yet. `packages/stream`'s bridge is generic, so a `deflateStream`
+of the same shape would work the same way; what stops it is that DEFLATE's encoder chooses
+its Huffman tables from a whole block, so the streaming unit is the block rather than the
+chunk.
 
 ### Compression
 

@@ -16,8 +16,9 @@ const out = Deno.stdin.readable.pipeThrough(
 wac has no way to suspend. A transform that wants its input in pieces therefore has to be written as
 a resumable state machine — every loop position, every partially-read unit and every phase turned
 into a field it can be re-entered from. For a UTF-8 case mapper that is mildly annoying; for
-DEFLATE it is block loop, symbol loop, extra bits and copy loop all rewritten, which is why
-[`issues/0006`](../../issues/0006-streaming-gzip-is-now-representable.md) is still open.
+DEFLATE it is block loop, symbol loop, extra bits and copy loop all rewritten — which is what
+[`issues/0006`](../../issues/closed/0006-streaming-gzip-is-now-representable.md) was about, and what
+this avoided.
 
 The observation here is that **the transform does not have to be the thing that suspends.** If the
 host blocks instead, wac can stay an ordinary nested loop:
@@ -77,9 +78,15 @@ callback with an array in its signature throws `ReferenceError` on first use. **
 `withArrayHelpers` when 0054 is fixed**; it is written to be inert once the definitions arrive.
 
 The bridge is generic: any export shaped `i32 f(fn[u8[]()] read, fn[bool(u8[])] write)` can be
-streamed through it. `gzip` is the obvious next one and is not done — its inflate loop reads through
-a `BitReader` that pulls from a whole input array, so it needs the pull threaded down to `fill()`
-first. That work is specified in `issues/0006`.
+streamed through it. [`packages/gzip`](../gzip/README.md) now exports `gunzipStream` in exactly that
+shape, so a gzip file becomes a `DecompressionStream` by naming a different module:
+
+```ts
+wacTransformStream({ modulePath: "packages/gzip/src/inflate.wac", entry: "gunzipStream" })
+```
+
+Compression is not streamed. DEFLATE's encoder picks its Huffman tables from a whole block, so the
+unit there is the block rather than the chunk — a different problem from this one.
 
 ## Layout
 

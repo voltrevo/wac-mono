@@ -20,7 +20,7 @@
  * iteration to the next, so it runs at the latency of a table lookup rather than
  * the throughput. Flat rather than nested to keep it one bounds-checked array.
  */
-u32[] crcTable8() {
+export u32[] crcTable8() {
   u32[] t = u32[2048]();
   for (i32 n = 0; n < 256; n++) {
     u32 c = n as@ u32;
@@ -102,4 +102,52 @@ export u32 crc32Bitwise(u8[] data) {
     }
   }
   return crc ^ 0xFFFFFFFF;
+}
+
+// ── Incremental form ──────────────────────────────────────────────────────────
+//
+// `crc32` takes a whole array, which a stream does not have. The three functions below
+// expose the same computation in the three pieces a stream needs.
+//
+// The value carried between calls is the *unfinalised* register: `crc32` starts it at all
+// ones and inverts it at the end, so a caller that held the finished checksum and fed it
+// back would be inverting twice. `crc32Start` and `crc32Finish` name the two ends so that
+// is not something to remember.
+//
+// The table is a parameter rather than rebuilt per call: `crcTable8` computes 2048 entries,
+// which is amortised to nothing over a whole payload and would otherwise dominate a stream
+// that folds in 32 KiB at a time.
+
+/** The initial register value. Not a checksum — pass it to `crc32Update`. */
+export u32 crc32Start() { return 0xFFFFFFFF; }
+
+/** Turn a register value into the checksum that goes in a gzip trailer. */
+export u32 crc32Finish(u32 crc) { return crc ^ 0xFFFFFFFF; }
+
+/** Fold `data` into a running register. `t` comes from `crcTable8()`, built once. */
+export u32 crc32Update(u32[] t, u32 crc, u8[] data) {
+  i32 n = data.len();
+  u32 acc = crc;
+  i32 i = 0;
+
+  while (i + 8 <= n) {
+    u32 a = acc ^ (data[i] as@ u32) ^ ((data[i + 1] << 8) as@ u32)
+          ^ ((data[i + 2] << 16) as@ u32) ^ ((data[i + 3] << 24) as@ u32);
+    acc = t[1792 + ((a & 0xFF) as@ i32)]
+        ^ t[1536 + (((a >> 8) & 0xFF) as@ i32)]
+        ^ t[1280 + (((a >> 16) & 0xFF) as@ i32)]
+        ^ t[1024 + (((a >> 24) & 0xFF) as@ i32)]
+        ^ t[768 + data[i + 4]]
+        ^ t[512 + data[i + 5]]
+        ^ t[256 + data[i + 6]]
+        ^ t[data[i + 7]];
+    i += 8;
+  }
+
+  while (i < n) {
+    acc = t[((acc ^ (data[i] as@ u32)) & 0xFF) as@ i32] ^ (acc >> 8);
+    i++;
+  }
+
+  return acc;
 }
