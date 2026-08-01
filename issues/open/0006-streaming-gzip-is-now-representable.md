@@ -111,14 +111,24 @@ fields.
 So the no-compromises version is **B, and it is possible in current wac with nothing missing**.
 What is missing is ergonomics, not expressiveness.
 
-### What would actually change that
+### What would actually change that — and it is closer than it looks
 
-**Coroutines, or stack switching.** With them, B is *written* as A: the natural loop, suspended by
-the runtime rather than by hand. wasm has a stack-switching proposal; wac exposing it would turn a
-decoder rewrite into an annotation. That is the honest "wants more language work" answer — not
-required, but the difference between a rewrite and a keyword. Worth weighing before anyone starts,
-because a hand-written state machine is the kind of code that has to be rewritten again if the
-feature lands.
+Coroutines would let B be *written* as A: the natural loop, suspended by the runtime rather than by
+hand. That sounds like a language feature and a long wait. It is not.
+
+**A wac module can already be suspended across an asynchronous host call, with no compiler change
+at all.** Verified end-to-end: wrap the callback dispatcher the module imports in
+`WebAssembly.Suspending`, call the export through `WebAssembly.promising`, and an ordinary wac loop
+suspends on a real `await` without knowing it. Design A then works for a socket, not just a file,
+and the state machine of design B is never written.
+
+What is missing is only the *bindings* asking for it — filed as `wac/issues/0053`, where the
+mechanics, the wrinkle (a dispatcher is per signature, not per parameter) and the caveats live.
+Chief caveat: Deno has JSPI, Node 22 does not without a flag.
+
+**So the recommendation is to wait before hand-writing a resumable decoder.** A state machine
+written now is exactly the code that gets deleted when the bindings offer suspension, and design A
+is both simpler to write and simpler to read.
 
 **Zero copy is the one thing genuinely not expressible**, and it is not a wac oversight. Arrays
 cross the boundary *by copy* — the spec says so — so every input chunk is copied in and every
