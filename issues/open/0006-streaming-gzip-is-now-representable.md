@@ -141,6 +141,76 @@ no amount of work here removes.
 **Errors as values needs nothing.** Enums are already there, and `inflate` trapping on a CRC
 mismatch is a compromise the language is not forcing.
 
+## Recommended design, without JSPI
+
+JSPI is Deno-only today (`wac/issues/0053` has the measurements), so anything that must run on
+Node or in a browser needs design B. B does **not** require resuming mid-symbol, and that is the
+part worth getting right before starting — it is the difference between a six-state machine and a
+thirty-state one.
+
+**Two granularities of resumption, not one.** DEFLATE has bounded-size phases and one unbounded
+phase, and they deserve different treatment:
+
+- **Bounded phases — the gzip header, a block header, a dynamic Huffman table.** Each is at most a
+  few hundred bytes. Treat them as *atomic*: if the retained bytes are not enough to finish one,
+  keep them and return "need more", then **redo it from its start** next time. The table builder
+  stays an ordinary function with no saved state at all. The cost is re-scanning a few hundred
+  bytes when a chunk boundary lands badly, which is bounded and rare.
+- **The unbounded phase — the symbol stream.** Commit at *symbol* boundaries. A literal, or a
+  length/distance pair with its extra bits, is at most about 48 bits, so run the decode loop only
+  while at least that many bits are buffered. Below the threshold, stop: the position is a symbol
+  boundary and the state to save is small. This is what zlib's `inflate_fast` does and for the same
+  reason.
+
+Nothing then resumes mid-symbol, and the saved state is:
+
+```wac
+export struct Inflater {
+  i32 mode;            // Header, BlockHeader, Stored, Tables, Symbols, Trailer, Done, Failed
+  u32 bitBuf;          // partial byte
+  i32 bitCount;
+  u8[] pending;        // retained input, bounded by the largest bounded phase
+  u8[] window;         // 32 KiB ring — matches reach back this far after output is handed over
+  i32 windowAt;
+  Huff lit;            // the current block's tables
+  Huff dist;
+  u32 crc;             // running, so the trailer is checked without keeping the output
+  i32 outSize;
+}
+```
+
+**Output needs no suspension at all**, which is the part that makes this portable. A
+`fn[bool(u8[])] sink` parameter is an ordinary synchronous call — verified working, no JSPI
+involved — so output is pushed as it is produced and never accumulated. The `bool` is
+back-pressure.
+
+```wac
+Status push(this, u8[] chunk, fn[bool(u8[])] sink);
+Status finish(this, fn[bool(u8[])] sink);
+```
+
+**`Status` is an enum, not a `trap`.** The current `inflate` traps on a CRC mismatch, which is a
+compromise the language never forced — and in a streaming decoder it is worse, because a trap
+takes down the caller mid-connection.
+
+**Keep the whole-buffer API and implement it on top**: `inflate(data)` is `create`, one `push`, one
+`finish`. One implementation, and the existing tests keep their meaning.
+
+**The deflate side is easier and should not copy this shape.** The encoder chooses its own block
+boundaries, so it resumes at them by construction: accumulate input up to a block's worth, emit,
+repeat. No threshold logic and no partial-symbol question.
+
+### The test that makes it safe
+
+The property worth building first, because it subsumes most of the hand-written cases:
+
+> for every input in the corpus and every chunk split, streaming output is byte-identical to
+> whole-buffer output.
+
+Random split points, plus the adversarial ones — a split inside the gzip header, inside a dynamic
+table, between a length and its distance, mid-match. If those agree, the resumption logic is right;
+if the split-independence property holds, nothing about *where* the chunks fall can matter.
+
 ## Who wants it
 
 `packages/server` has `gzip` unwired, with `Accept-Encoding` and a compressed body listed as the
