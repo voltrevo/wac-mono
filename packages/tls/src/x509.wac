@@ -22,24 +22,60 @@
 // rather than re-serialised from a parse. Re-encoding would produce a byte string that
 // is equal in meaning and possibly not equal in bytes, and the signature is over bytes.
 //
-// ## Ed25519 only
+// ## Three key types
 //
-// A real client needs RSA and ECDSA, because that is what the web uses. This handles
-// Ed25519 and rejects everything else by name, which is honest and useless against the
-// public internet — it is enough to talk to the server in this repo and to any other
-// Ed25519 endpoint.
+// Ed25519, ECDSA P-256, and RSA. Between them that is essentially every certificate on
+// the public web. Each brings its own encoding quirk, and each quirk is a place where a
+// parser is wrong for one key type and right for the other two:
+//
+//   Ed25519   the key is the BIT STRING, 32 bytes, and that is all
+//   EC        the BIT STRING is an uncompressed point, and the *curve* lives in the
+//             algorithm parameters rather than in the key — a parser that ignores the
+//             parameters will read a P-384 key as though it were P-256
+//   RSA       the BIT STRING contains another DER structure, a SEQUENCE of two INTEGERs,
+//             and DER integers are signed — so a modulus with its top bit set, which is
+//             almost all of them, carries a leading zero byte that is not part of the key
 
 import { ed25519Verify } from "../../crypto/src/ed25519.wac";
-import { Der, oidEd25519, oidEquals, oidSubjectAltName, oidBasicConstraints } from "./asn1.wac";
+import { p256Verify } from "../../crypto/src/p256.wac";
+import { rsaVerifyPkcs1, rsaVerifyPss } from "../../crypto/src/rsa.wac";
+import {
+  Der, oidBasicConstraints, oidEcPublicKey, oidEcdsaSha256, oidEcdsaSha384, oidEd25519,
+  oidEquals, oidPrime256v1, oidRsaEncryption, oidRsaPss, oidRsaSha256, oidRsaSha384,
+  oidRsaSha512, oidSubjectAltName, unsignedInteger,
+} from "./asn1.wac";
+
+/** Key types this understands. */
+export i32 keyEd25519() { return 1; }
+export i32 keyP256() { return 2; }
+export i32 keyRsa() { return 3; }
+
+/** Signature algorithms this understands. */
+export i32 sigEd25519Alg() { return 1; }
+export i32 sigEcdsaSha256() { return 2; }
+export i32 sigEcdsaSha384() { return 3; }
+export i32 sigRsaSha256() { return 4; }
+export i32 sigRsaSha384() { return 5; }
+export i32 sigRsaSha512() { return 6; }
+export i32 sigRsaPss() { return 7; }
 
 /** What a client needs out of a certificate. */
 export struct Cert {
   /** The exact bytes the signature covers. */
   u8[] tbs;
-  /** The signature over `tbs`. */
+  /** The signature over `tbs`, as it appeared. */
   u8[] signature;
-  /** The Ed25519 public key this certificate binds. */
+  /** How `signature` was made — one of the sig* constants. */
+  i32 sigAlg;
+  /** Which of the key* constants `publicKey` is. */
+  i32 keyType;
+  /**
+   * The key. Ed25519: 32 raw bytes. P-256: 65 uncompressed point bytes. RSA: the
+   * modulus, with the DER sign byte already stripped.
+   */
   u8[] publicKey;
+  /** RSA's public exponent, empty for the other key types. */
+  u8[] rsaExponent;
   /** The issuer's Name, as encoded, for chaining. */
   u8[] issuer;
   /** The subject's Name, as encoded. */
@@ -140,9 +176,32 @@ export Cert parseCert(u8[] der) {
   Der spki = t.element(0x30);
   Der alg = spki.element(0x30);
   u8[] algOid = alg.oid();
-  if (!oidEquals(algOid, oidEd25519())) { trap; }
-  u8[] publicKey = spki.bitString();
-  if (publicKey.len() != 32) { trap; }
+  i32 keyType = 0;
+  u8[] publicKey = u8[0]();
+  u8[] rsaExponent = u8[0]();
+
+  if (oidEquals(algOid, oidEd25519())) {
+    keyType = 1;
+    publicKey = spki.bitString();
+    if (publicKey.len() != 32) { trap; }
+  } else if (oidEquals(algOid, oidEcPublicKey())) {
+    // The curve is in the parameters, not the key. Reading the key without checking
+    // them would take a P-384 point for a P-256 one and verify against the wrong curve.
+    u8[] curve = alg.oid();
+    if (!oidEquals(curve, oidPrime256v1())) { trap; }
+    keyType = 2;
+    publicKey = spki.bitString();
+    if (publicKey.len() != 65 || publicKey[0] != 4) { trap; }
+  } else if (oidEquals(algOid, oidRsaEncryption())) {
+    keyType = 3;
+    // The BIT STRING holds another DER structure: SEQUENCE { modulus, exponent }.
+    Der inner = Der.create(spki.bitString());
+    Der seq = inner.element(0x30);
+    publicKey = unsignedInteger(seq.element(0x02).rest());
+    rsaExponent = unsignedInteger(seq.element(0x02).rest());
+  } else {
+    trap;
+  }
 
   bool isCa = false;
   u8[] dnsNames = u8[0]();
@@ -170,12 +229,23 @@ export Cert parseCert(u8[] der) {
     }
   }
 
-  // signatureAlgorithm, which must match the key that will check it.
-  Der sigAlg = cert.element(0x30);
-  if (!oidEquals(sigAlg.oid(), oidEd25519())) { trap; }
+  // signatureAlgorithm, which says how the issuer signed — a different question from
+  // what key *this* certificate carries.
+  Der sigAlgSeq = cert.element(0x30);
+  u8[] sigOid = sigAlgSeq.oid();
+  i32 sigAlg = 0;
+  if (oidEquals(sigOid, oidEd25519())) { sigAlg = 1; }
+  else if (oidEquals(sigOid, oidEcdsaSha256())) { sigAlg = 2; }
+  else if (oidEquals(sigOid, oidEcdsaSha384())) { sigAlg = 3; }
+  else if (oidEquals(sigOid, oidRsaSha256())) { sigAlg = 4; }
+  else if (oidEquals(sigOid, oidRsaSha384())) { sigAlg = 5; }
+  else if (oidEquals(sigOid, oidRsaSha512())) { sigAlg = 6; }
+  else if (oidEquals(sigOid, oidRsaPss())) { sigAlg = 7; }
+  else { trap; }
   u8[] signature = cert.bitString();
 
-  return Cert(tbs, signature, publicKey, issuer, subject, notBefore, notAfter, isCa, dnsNames);
+  return Cert(tbs, signature, sigAlg, keyType, publicKey, rsaExponent, issuer, subject,
+              notBefore, notAfter, isCa, dnsNames);
 }
 
 /** The dNSName entries of a SubjectAltName, joined with NUL bytes. */
@@ -248,9 +318,60 @@ bool matchesOne(u8[] pat, i32 at, i32 len, u8[] host) {
   return eqHost(pat, at, len, host);
 }
 
-/** Whether `signer` signed `cert`. */
+/**
+ * An ECDSA signature from its DER wrapper, as raw r ++ s.
+ *
+ * X.509 writes ECDSA as SEQUENCE { r INTEGER, s INTEGER }; the crypto layer wants two
+ * fixed 32-byte values. The integers are signed and variable-length, so each needs its
+ * sign byte stripped and then left-padding back to 32 — a shorter r is not a smaller
+ * signature, it is the same number with fewer digits.
+ */
+u8[] ecdsaFromDer(u8[] der) {
+  Der outer = Der.create(der);
+  Der seq = outer.element(0x30);
+  u8[] r = unsignedInteger(seq.element(0x02).rest());
+  u8[] s = unsignedInteger(seq.element(0x02).rest());
+  if (r.len() > 32 || s.len() > 32) { trap; }
+  u8[] out = u8[64]();
+  for (i32 i = 0; i < r.len(); i++) { out[32 - r.len() + i] = r[i]; }
+  for (i32 i = 0; i < s.len(); i++) { out[64 - s.len() + i] = s[i]; }
+  return out;
+}
+
+/**
+ * Whether `signer` signed `cert`.
+ *
+ * The signature algorithm on the certificate and the key type of the signer have to
+ * agree — an ECDSA signature checked against an RSA key is not a failure to verify, it
+ * is a category error, and treating it as a mere `false` would hide a chain that has
+ * been assembled wrongly.
+ */
 export bool certSignedBy(Cert cert, Cert signer) {
-  return ed25519Verify(signer.publicKey, cert.tbs, cert.signature);
+  if (cert.sigAlg == 1) {
+    if (signer.keyType != 1) { return false; }
+    return ed25519Verify(signer.publicKey, cert.tbs, cert.signature);
+  }
+  if (cert.sigAlg == 2) {
+    if (signer.keyType != 2) { return false; }
+    return p256Verify(signer.publicKey, cert.tbs, ecdsaFromDer(cert.signature));
+  }
+  if (cert.sigAlg == 4 || cert.sigAlg == 5 || cert.sigAlg == 6) {
+    if (signer.keyType != 3) { return false; }
+    i32 hashLen = cert.sigAlg == 4 ? 32 : (cert.sigAlg == 5 ? 48 : 64);
+    return rsaVerifyPkcs1(signer.publicKey, signer.rsaExponent, cert.tbs,
+                          cert.signature, hashLen);
+  }
+  if (cert.sigAlg == 7) {
+    if (signer.keyType != 3) { return false; }
+    // The PSS parameters live in the algorithm identifier and default to SHA-1, which
+    // nothing sane uses. Assuming SHA-256 with a matching salt covers what certificate
+    // authorities actually issue and is wrong for anything else — a limitation, not a
+    // safe default, and it fails closed rather than accepting the wrong hash.
+    return rsaVerifyPss(signer.publicKey, signer.rsaExponent, cert.tbs,
+                        cert.signature, 32, 32);
+  }
+  // ecdsa-with-SHA384 (3) would need P-384, which this does not have.
+  return false;
 }
 
 /** Whether two encoded Names are byte-identical, which is how a chain links. */
@@ -272,4 +393,42 @@ export i32 verifyChain(Cert leaf, Cert root, u8[] host, i64 now) {
   if (!certSignedBy(leaf, root)) { return 6; }
   if (!certMatchesHost(leaf, host)) { return 7; }
   return 0;
+}
+
+/**
+ * Verify a TLS CertificateVerify signature against this certificate's key.
+ *
+ * `scheme` is a TLS SignatureScheme code point, which is a different namespace from the
+ * OIDs a certificate uses — 0x0403 and `ecdsa-with-SHA256` mean the same thing and are
+ * written nothing alike. Keeping the translation here rather than in the handshake means
+ * the one place that knows both namespaces is the one place that has both to hand.
+ *
+ * The scheme must match the key: RFC 8446 §4.4.3 requires that a peer only send a
+ * signature its certificate can actually carry, and accepting a mismatch would mean
+ * verifying an ECDSA signature against whatever bytes an RSA modulus happens to be.
+ */
+export bool certVerifySignature(Cert c, i32 scheme, u8[] content, u8[] signature) {
+  if (scheme == 0x0807) {                       // ed25519
+    if (c.keyType != 1) { return false; }
+    return ed25519Verify(c.publicKey, content, signature);
+  }
+  if (scheme == 0x0403) {                       // ecdsa_secp256r1_sha256
+    if (c.keyType != 2) { return false; }
+    return p256Verify(c.publicKey, content, ecdsaFromDer(signature));
+  }
+  if (scheme == 0x0804) {                       // rsa_pss_rsae_sha256
+    if (c.keyType != 3) { return false; }
+    return rsaVerifyPss(c.publicKey, c.rsaExponent, content, signature, 32, 32);
+  }
+  if (scheme == 0x0805) {                       // rsa_pss_rsae_sha384
+    if (c.keyType != 3) { return false; }
+    return rsaVerifyPss(c.publicKey, c.rsaExponent, content, signature, 48, 48);
+  }
+  if (scheme == 0x0401) {                       // rsa_pkcs1_sha256
+    // RFC 8446 §4.4.3 forbids PKCS#1 v1.5 in CertificateVerify — it is listed in
+    // signature_algorithms only so a peer knows we can check *certificate* signatures
+    // made with it. A peer that uses it here is not speaking TLS 1.3.
+    return false;
+  }
+  return false;
 }

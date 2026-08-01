@@ -34,6 +34,7 @@
 
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
+import { p256Ecdh, p256PublicKey } from "../../crypto/src/p256.wac";
 import { ed25519Sign } from "../../crypto/src/ed25519.wac";
 import {
   deriveSecret, earlySecret, finishedVerify, handshakeSecret, hashLen, masterSecret,
@@ -203,18 +204,33 @@ u8[] serverFlight(Conn c, u8[] clientHelloMsg) {
   // No x25519 share. The correct answer is a HelloRetryRequest asking for one, which is
   // not implemented — so this says so plainly rather than pretending the client is at
   // fault. See the README.
-  if (ch.keyShare.len() != 32) { return failPlain(c, alertHandshakeFailure()); }
+  if (ch.keyShare.len() < 3) { return failPlain(c, alertHandshakeFailure()); }
 
   addTranscript(c, clientHelloMsg);
 
-  u8[] ourShare = x25519Base(c.ephemeralPriv);
-  u8[] sh = serverHello(c.serverRandom, ch.sessionId, c.suite, ourShare);
+  // The client's share arrives as group ++ key; answer in the same group.
+  i32 group = (ch.keyShare[0] << 8) | ch.keyShare[1];
+  u8[] peerKey = u8[ch.keyShare.len() - 2]();
+  for (i32 i = 0; i < peerKey.len(); i++) { peerKey[i] = ch.keyShare[2 + i]; }
+
+  u8[] ourShare = u8[0]();
+  if (group == 0x001d) {
+    ourShare = x25519Base(c.ephemeralPriv);
+  } else {
+    ourShare = p256PublicKey(c.ephemeralPriv);
+  }
+  u8[] sh = serverHello(c.serverRandom, ch.sessionId, c.suite, group, ourShare);
   addTranscript(c, sh);
 
   // The key schedule, up to the handshake traffic secrets. The transcript at this point
   // is exactly ClientHello ++ ServerHello, which is what "CH..SH" means in RFC 8446 §7.1
   // — one message too many or too few here yields keys that are wrong and look fine.
-  u8[] shared = x25519(c.ephemeralPriv, ch.keyShare);
+  u8[] shared = u8[0]();
+  if (group == 0x001d) {
+    shared = x25519(c.ephemeralPriv, peerKey);
+  } else {
+    shared = p256Ecdh(c.ephemeralPriv, peerKey);
+  }
   u8[] early = earlySecret(u8[hashLen()]());
   u8[] hs = handshakeSecret(early, shared);
   u8[] thSh = sha256(c.transcript);

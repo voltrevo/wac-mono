@@ -22,6 +22,7 @@
 
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
+import { p256Ecdh, p256PublicKey } from "../../crypto/src/p256.wac";
 import { ed25519Verify } from "../../crypto/src/ed25519.wac";
 import {
   deriveSecret, earlySecret, finishedVerify, handshakeSecret, hashLen, masterSecret,
@@ -38,7 +39,7 @@ import {
   certificateVerifyContent, finished, handshakeMessage, messageBody, messageLength,
   messageType,
 } from "./handshake.wac";
-import { parseCert, verifyChain, Cert } from "./x509.wac";
+import { parseCert, verifyChain, certVerifySignature, Cert } from "./x509.wac";
 import { Reader, Writer } from "./wire.wac";
 
 struct CConn {
@@ -52,6 +53,10 @@ struct CConn {
   u8[] serverAppSecret;
   u8[] transcript;
   u8[] ephemeralPriv;
+  /** A second ephemeral key, because two key shares are offered. */
+  u8[] p256Priv;
+  /** The group the server chose: 0x001d or 0x0017. */
+  i32 group;
   u8[] clientRandom;
   u8[] host;
   u8[] rootDer;
@@ -77,6 +82,8 @@ u8[] encodeConn(CConn c) {
   w.u32(c.transcript.len());
   w.bytes(c.transcript);
   w.vec8(c.ephemeralPriv);
+  w.vec8(c.p256Priv);
+  w.u16(c.group);
   w.vec8(c.clientRandom);
   w.vec16(c.host);
   w.u32(c.rootDer.len());
@@ -103,13 +110,15 @@ CConn decodeConn(u8[] state) {
   u8[] sas = r.vec8();
   u8[] transcript = r.take(r.u32());
   u8[] eph = r.vec8();
+  u8[] p256 = r.vec8();
+  i32 group = r.u16();
   u8[] rnd = r.vec8();
   u8[] host = r.vec16();
   u8[] root = r.take(r.u32());
   u8[] cert = r.take(r.u32());
   r.expectEnd();
-  return CConn(phase, suite, seqIn, seqOut, cs, ss, cas, sas, transcript, eph, rnd,
-               host, root, now, cert, failure);
+  return CConn(phase, suite, seqIn, seqOut, cs, ss, cas, sas, transcript, eph, p256,
+               group, rnd, host, root, now, cert, failure);
 }
 
 void addTranscript(CConn c, u8[] msg) {
@@ -172,18 +181,27 @@ u8[] clientHello(CConn c) {
     sni.vec16(sniList.take());
     exts.vec16(sni.take());
   }
-  // supported_groups: x25519 only
+  // supported_groups: x25519 first, then secp256r1. Order is a preference and servers
+  // generally honour it, which is why the faster curve goes first.
   exts.u16(10);
   Writer groups = Writer.create();
   Writer groupList = Writer.create();
-  groupList.u16(0x001d);
+  groupList.u16(0x001d);          // x25519
+  groupList.u16(0x0017);          // secp256r1
   groups.vec16(groupList.take());
   exts.vec16(groups.take());
-  // signature_algorithms: ed25519 only
+  // signature_algorithms. The first three are what a peer may use in CertificateVerify;
+  // rsa_pkcs1_sha256 is listed because RFC 8446 §4.4.2.2 lets *certificates* be signed
+  // that way — which is how almost every certificate on the web is signed — while
+  // §4.4.3 forbids it for CertificateVerify itself.
   exts.u16(13);
   Writer sigs = Writer.create();
   Writer sigList = Writer.create();
-  sigList.u16(0x0807);
+  sigList.u16(0x0807);            // ed25519
+  sigList.u16(0x0403);            // ecdsa_secp256r1_sha256
+  sigList.u16(0x0804);            // rsa_pss_rsae_sha256
+  sigList.u16(0x0805);            // rsa_pss_rsae_sha384
+  sigList.u16(0x0401);            // rsa_pkcs1_sha256, for certificates only
   sigs.vec16(sigList.take());
   exts.vec16(sigs.take());
   // supported_versions
@@ -193,12 +211,17 @@ u8[] clientHello(CConn c) {
   verList.u16(0x0304);
   vers.vec8(verList.take());
   exts.vec16(vers.take());
-  // key_share
+  // key_share: one for each group offered, so the server can pick either without a
+  // HelloRetryRequest — which this client cannot answer. Two shares cost about a hundred
+  // extra bytes in the hello and save a whole extra round trip when the server prefers
+  // P-256, which some do.
   exts.u16(51);
   Writer ks = Writer.create();
   Writer share = Writer.create();
   share.u16(0x001d);
   share.vec16(x25519Base(c.ephemeralPriv));
+  share.u16(0x0017);
+  share.vec16(p256PublicKey(c.p256Priv));
   ks.vec16(share.take());
   exts.vec16(ks.take());
 
@@ -206,7 +229,12 @@ u8[] clientHello(CConn c) {
   return handshakeMessage(1, body.take());
 }
 
-/** The server's x25519 share, out of a ServerHello. Empty if it did not send one. */
+/**
+ * The server's key share, out of a ServerHello, as group ++ key.
+ *
+ * The group is prefixed rather than returned separately because wac has no tuples, and
+ * because the two are never useful apart — a key without its group is a number.
+ */
 u8[] serverShare(u8[] shBody) {
   Reader r = Reader.create(shBody);
   r.u16();                              // legacy_version
@@ -222,9 +250,17 @@ u8[] serverShare(u8[] shBody) {
       i32 kind = exts.u16();
       Reader body = exts.sub16();
       if (kind == 51) {
-        i32 group = body.u16();
+        i32 g = body.u16();
         u8[] key = body.vec16();
-        if (group == 0x001d && key.len() == 32) { share = key; }
+        if (g == 0x001d && key.len() == 32) {
+          share = u8[34]();
+          share[0] = 0x00; share[1] = 0x1d;
+          for (i32 i = 0; i < 32; i++) { share[2 + i] = key[i]; }
+        } else if (g == 0x0017 && key.len() == 65) {
+          share = u8[67]();
+          share[0] = 0x00; share[1] = 0x17;
+          for (i32 i = 0; i < 65; i++) { share[2 + i] = key[i]; }
+        }
       } else if (kind == 43) {
         if (body.u16() == 0x0304) { sawTls13 = true; }
       }
@@ -274,11 +310,13 @@ u8[] fail(CConn c, i32 code, i32 alert, Writer out, Writer appData) {
  * hundreds; one is enough to demonstrate that the check happens, and refusing to pretend
  * otherwise is why this takes a root rather than a flag to skip verification.
  */
-export u8[] tlsClientInit(u8[] host, u8[] rootDer, u8[] ephemeralPriv, u8[] clientRandom, i64 now) {
+export u8[] tlsClientInit(u8[] host, u8[] rootDer, u8[] ephemeralPriv, u8[] p256Priv,
+                          u8[] clientRandom, i64 now) {
   if (ephemeralPriv.len() != 32) { trap; }
+  if (p256Priv.len() != 32) { trap; }
   if (clientRandom.len() != 32) { trap; }
   CConn c = CConn(0, suiteAes128Gcm(), 0, 0, u8[0](), u8[0](), u8[0](), u8[0](), u8[0](),
-                  ephemeralPriv, clientRandom, host, rootDer, now, u8[0](), 0);
+                  ephemeralPriv, p256Priv, 0, clientRandom, host, rootDer, now, u8[0](), 0);
   u8[] ch = clientHello(c);
   addTranscript(c, ch);
   c.phase = 1;
@@ -329,10 +367,21 @@ export u8[] tlsClientFeed(u8[] state, u8[] input) {
       u8[] shBody = messageBody(msg);
       if (serverSuite(shBody) != c.suite) { return fail(c, 13, alertHandshakeFailure(), toSend, appData); }
       u8[] share = serverShare(shBody);
-      if (share.len() != 32) { return fail(c, 14, alertHandshakeFailure(), toSend, appData); }
+      if (share.len() < 3) { return fail(c, 14, alertHandshakeFailure(), toSend, appData); }
+      i32 group = (share[0] << 8) | share[1];
+      u8[] peerKey = u8[share.len() - 2]();
+      for (i32 i = 0; i < peerKey.len(); i++) { peerKey[i] = share[2 + i]; }
+      c.group = group;
 
       addTranscript(c, msg);
-      u8[] shared = x25519(c.ephemeralPriv, share);
+      u8[] shared = u8[0]();
+      if (group == 0x001d) {
+        shared = x25519(c.ephemeralPriv, peerKey);
+      } else {
+        // p256Ecdh validates the peer's point, which is the defence against an
+        // invalid-curve attack; a bad point traps rather than returning a secret.
+        shared = p256Ecdh(c.p256Priv, peerKey);
+      }
       u8[] early = earlySecret(u8[hashLen()]());
       u8[] hs = handshakeSecret(early, shared);
       u8[] th = sha256(c.transcript);
@@ -392,10 +441,10 @@ export u8[] tlsClientFeed(u8[] state, u8[] input) {
 
           u8[] cvBody = messageBody(msg);
           Reader r = Reader.create(cvBody);
-          if (r.u16() != 0x0807) { return fail(c, 32, alertUnsupportedCertificate(), toSend, appData); }
+          i32 scheme = r.u16();
           u8[] sig = r.vec16();
           u8[] signed = certificateVerifyContent(sha256(c.transcript), true);
-          if (!ed25519Verify(leaf.publicKey, signed, sig)) {
+          if (!certVerifySignature(leaf, scheme, signed, sig)) {
             return fail(c, 33, alertDecryptError(), toSend, appData);
           }
           addTranscript(c, msg);
