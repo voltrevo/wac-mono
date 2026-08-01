@@ -193,3 +193,38 @@ Deno.test("a client that disappears mid-request does not take the server with it
   if (res.status !== 200) throw new Error(`the server did not survive: ${res.status}`);
   await res.text();
 });
+
+Deno.test("a silent client is dropped rather than held forever", async () => {
+  // Limits are the host's job, since wac can see neither time nor connections. Without them a
+  // client that connects and says nothing holds a slot for ever, which is the cheapest denial of
+  // service there is.
+  const { listen: listenWith } = await import("../host/serve.ts");
+  const strict = await listenWith(0, { requestMs: 120, idleMs: 120, maxConnections: 8 });
+  const strictPort = (strict.addr as Deno.NetAddr).port;
+  try {
+    // Connects, sends half a request, then stops. The server should give up and say why.
+    const conn = await Deno.connect({ hostname: "127.0.0.1", port: strictPort });
+    await conn.write(enc.encode("GET / HTTP/1.1\r\nHost: a\r\n"));
+    const buf = new Uint8Array(1024);
+    const n = await conn.read(buf);
+    const out = n === null ? "" : dec.decode(buf.subarray(0, n));
+    conn.close();
+    if (!out.startsWith("HTTP/1.1 408")) {
+      throw new Error(`a stalled request got ${JSON.stringify(out.slice(0, 40))}, want 408`);
+    }
+
+    // And a connection that says nothing at all is simply dropped — there is no request to answer.
+    const silent = await Deno.connect({ hostname: "127.0.0.1", port: strictPort });
+    const quiet = new Uint8Array(16);
+    const m = await silent.read(quiet);
+    silent.close();
+    if (m !== null) throw new Error("an idle connection got bytes rather than a close");
+
+    // The server is still serving.
+    const fine = await fetch(`http://127.0.0.1:${strictPort}/`);
+    if (fine.status !== 200) throw new Error(`the server did not survive: ${fine.status}`);
+    await fine.text();
+  } finally {
+    strict.close();
+  }
+});

@@ -1,0 +1,287 @@
+// Parsing an HTTP/1.1 response.
+//
+// Not a mirror of the request parser, because response framing is a different and harder problem.
+// A request always says how long its body is; a response has five rules to try in order, and two
+// of them depend on things the message does not contain — what the *request* method was, and
+// whether the connection has closed.
+//
+// RFC 9112 §6.3, in order:
+//
+//   1. HEAD, and 1xx, 204 and 304, have no body. Whatever the headers say.
+//   2. A 2xx to CONNECT has no body; what follows is a tunnel.
+//   3. `Transfer-Encoding` frames the body — chunked if that is the final coding, and otherwise
+//      by reading until the connection closes. That is the opposite of the request rule, where a
+//      non-chunked coding is a 400: a server may not guess how long a request is, but a client
+//      always has the close to fall back on.
+//   4. `Content-Length` frames it, and a repeated or malformed one is a refusal.
+//   5. Otherwise the body runs until the connection closes.
+//
+// Rule 1 is the one that bites: a HEAD response carries the Content-Length the GET would have had
+// and *no bytes*. A client that believes the header waits for a body that is never coming, and
+// then reads the next response's bytes as this one's — the client-side version of smuggling.
+//
+// Rule 5 is why `parseResponse` takes `eof`. Without a length and without chunking, "the message
+// is complete" and "the connection ended" are the same statement, and a parser that cannot be
+// told the connection ended can never finish such a response.
+
+import { Headers, eqFold, isToken, isOws, isFieldValueByte } from "./headers.wac";
+import { ERR_VERSION, ERR_LINE, ERR_HEADER_NAME, ERR_HEADER_VALUE, ERR_OBS_FOLD, ERR_FRAMING,
+         ERR_CHUNK, ERR_TOO_LARGE } from "./request.wac";
+
+/** A status line outside 100..599, which is not a status at all. */
+export i32 ERR_STATUS() { return 11; }
+
+export struct Incoming {
+  i32 status;
+  i32 minor;
+  u8[] reason;
+  Headers headers;
+  u8[] body;
+  i32 consumed;
+  // True when rule 5 applied: the body was however many bytes arrived before the close. A caller
+  // that wants to reuse the connection cannot, and this is how it finds out.
+  bool closeDelimited;
+}
+
+export enum ParsedResponse {
+  Ok(Incoming response),
+  Bad(i32 code),
+  Incomplete,
+}
+
+u8[] slice(u8[] s, i32 lo, i32 hi) {
+  if (hi < lo) { hi = lo; }
+  u8[] out = u8[hi - lo]();
+  for (i32 i = lo; i < hi; i++) { out[i - lo] = s[i]; }
+  return out;
+}
+
+i32 findCrlf(u8[] s, i32 at) {
+  for (i32 i = at; i + 1 < s.len(); i++) {
+    if (s[i] == 13 && s[i + 1] == 10) { return i; }
+  }
+  return -1;
+}
+
+bool isDigit(i32 c) { return c >= '0' && c <= '9'; }
+
+i32 hexValue(i32 c) {
+  if (isDigit(c)) { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+  return -1;
+}
+
+bool isHead(u8[] method) {
+  return method.len() == 4 && method[0] == 'H' && method[1] == 'E' && method[2] == 'A'
+      && method[3] == 'D';
+}
+
+bool isConnect(u8[] method) {
+  u8[] want = "CONNECT".toBytes();
+  if (method.len() != want.len()) { return false; }
+  for (i32 i = 0; i < want.len(); i++) {
+    if (method[i] != want[i]) { return false; }
+  }
+  return true;
+}
+
+/**
+ * Parse a response to a request that used `method`.
+ *
+ * `eof` says the connection has closed and no more bytes are coming, which is what completes a
+ * close-delimited body. Passing it as an argument rather than inferring it keeps the parser a
+ * function of its inputs — the same reason `serve` takes the clock.
+ */
+export ParsedResponse parseResponse(u8[] input, u8[] method, bool eof, i32 maxBody) {
+  i32 lineEnd = findCrlf(input, 0);
+  if (lineEnd < 0) { return ParsedResponse.Incomplete; }
+
+  // ── The status line: HTTP/1.x SP status [SP reason] ─────────────────────────────────
+  if (lineEnd < 8) { return ParsedResponse.Bad(ERR_VERSION()); }
+  u8[] want = "HTTP/1.".toBytes();
+  for (i32 i = 0; i < 7; i++) {
+    if (input[i] != want[i]) { return ParsedResponse.Bad(ERR_VERSION()); }
+  }
+  if (!isDigit(input[7])) { return ParsedResponse.Bad(ERR_VERSION()); }
+  i32 minor = input[7] - '0';
+  if (input[8] != ' ') { return ParsedResponse.Bad(ERR_LINE()); }
+
+  if (lineEnd < 12) { return ParsedResponse.Bad(ERR_STATUS()); }
+  for (i32 i = 9; i < 12; i++) {
+    if (!isDigit(input[i])) { return ParsedResponse.Bad(ERR_STATUS()); }
+  }
+  // Any three digits. The classes are 1xx to 5xx, but the grammar in RFC 9110 §15 says
+  // three digits and nothing more, so a `099` is a status this does not understand rather than
+  // a message it should refuse — that judgement belongs to the caller.
+  i32 status = (input[9] - '0') * 100 + (input[10] - '0') * 10 + (input[11] - '0');
+
+  // The reason phrase is optional and free-form, but a space must separate it if it is there.
+  i32 reasonStart = 12;
+  if (lineEnd > 12) {
+    if (input[12] != ' ') { return ParsedResponse.Bad(ERR_LINE()); }
+    reasonStart = 13;
+  }
+  for (i32 i = reasonStart; i < lineEnd; i++) {
+    if (!isFieldValueByte(input[i])) { return ParsedResponse.Bad(ERR_LINE()); }
+  }
+
+  Incoming res = Incoming(status, minor, slice(input, reasonStart, lineEnd), Headers.create(),
+                          u8[0](), 0, false);
+
+  // ── Header fields, on the same rules as a request ───────────────────────────────────
+  i32 at = lineEnd + 2;
+  while (true) {
+    i32 end = findCrlf(input, at);
+    if (end < 0) { return ParsedResponse.Incomplete; }
+    if (end == at) { at = at + 2; break; }
+    if (isOws(input[at])) { return ParsedResponse.Bad(ERR_OBS_FOLD()); }
+
+    i32 colon = -1;
+    for (i32 i = at; i < end; i++) {
+      if (input[i] == ':') { colon = i; break; }
+    }
+    if (colon < 0 || colon == at) { return ParsedResponse.Bad(ERR_HEADER_NAME()); }
+    for (i32 i = at; i < colon; i++) {
+      if (!isToken(input[i])) { return ParsedResponse.Bad(ERR_HEADER_NAME()); }
+    }
+    i32 vs = colon + 1;
+    while (vs < end && isOws(input[vs])) { vs++; }
+    i32 ve = end;
+    while (ve > vs && isOws(input[ve - 1])) { ve--; }
+    for (i32 i = vs; i < ve; i++) {
+      if (!isFieldValueByte(input[i])) { return ParsedResponse.Bad(ERR_HEADER_VALUE()); }
+    }
+    res.headers.push(slice(input, at, colon), slice(input, vs, ve));
+    at = end + 2;
+  }
+
+  // ── Framing, in the order the RFC gives ─────────────────────────────────────────────
+
+  // Rule 1 and rule 2: no body at all, whatever the headers claim. The Content-Length stays in
+  // the headers — a caller may want to know what the GET would have returned — but no bytes are
+  // consumed for it, which is the whole trap.
+  bool bodyless = isHead(method)
+               || (status >= 100 && status < 200)
+               || status == 204
+               || status == 304
+               || (isConnect(method) && status >= 200 && status < 300);
+  if (bodyless) {
+    res.consumed = at;
+    return ParsedResponse.Ok(res);
+  }
+
+  i32 teCount = res.headers.countOf("Transfer-Encoding");
+  i32 clCount = res.headers.countOf("Content-Length");
+
+  // A response with both is the same ambiguity as a request with both, and the same answer.
+  if (teCount > 0 && clCount > 0) { return ParsedResponse.Bad(ERR_FRAMING()); }
+  if (clCount > 1) { return ParsedResponse.Bad(ERR_FRAMING()); }
+
+  if (teCount > 0) {
+    if (teCount > 1) { return ParsedResponse.Bad(ERR_FRAMING()); }
+    if (eqFold(res.headers.first("Transfer-Encoding"), "chunked".toBytes())) {
+      return readChunked(input, at, res, maxBody);
+    }
+    // Present but not chunked: fall through to rule 5. Not an error, unlike in a request.
+    if (!eof) { return ParsedResponse.Incomplete; }
+    if (input.len() - at > maxBody) { return ParsedResponse.Bad(ERR_TOO_LARGE()); }
+    res.body = slice(input, at, input.len());
+    res.consumed = input.len();
+    res.closeDelimited = true;
+    return ParsedResponse.Ok(res);
+  }
+
+  if (clCount == 1) {
+    u8[] cl = res.headers.first("Content-Length");
+    if (cl.len() == 0) { return ParsedResponse.Bad(ERR_FRAMING()); }
+    i32 length = 0;
+    for (i32 i = 0; i < cl.len(); i++) {
+      if (!isDigit(cl[i])) { return ParsedResponse.Bad(ERR_FRAMING()); }
+      length = length * 10 + (cl[i] - '0');
+      if (length > maxBody) { return ParsedResponse.Bad(ERR_TOO_LARGE()); }
+    }
+    if (input.len() - at < length) { return ParsedResponse.Incomplete; }
+    res.body = slice(input, at, at + length);
+    res.consumed = at + length;
+    return ParsedResponse.Ok(res);
+  }
+
+  // Rule 5: everything until the connection closes. Complete only once it has.
+  if (!eof) { return ParsedResponse.Incomplete; }
+  if (input.len() - at > maxBody) { return ParsedResponse.Bad(ERR_TOO_LARGE()); }
+  res.body = slice(input, at, input.len());
+  res.consumed = input.len();
+  res.closeDelimited = true;
+  return ParsedResponse.Ok(res);
+}
+
+/** The chunked coding, identical to a request's — the difference is only in when it applies. */
+ParsedResponse readChunked(u8[] input, i32 start, Incoming res, i32 maxBody) {
+  i32 at = start;
+  i32 total = 0;
+  u8[] body = u8[0]();
+  i32 bodyLen = 0;
+
+  while (true) {
+    i32 end = findCrlf(input, at);
+    if (end < 0) { return ParsedResponse.Incomplete; }
+    if (end == at) { return ParsedResponse.Bad(ERR_CHUNK()); }
+
+    i32 size = 0;
+    i32 i = at;
+    i32 digitsSeen = 0;
+    while (i < end && hexValue(input[i]) >= 0) {
+      size = size * 16 + hexValue(input[i]);
+      digitsSeen++;
+      if (size > maxBody) { return ParsedResponse.Bad(ERR_TOO_LARGE()); }
+      i++;
+    }
+    if (digitsSeen == 0) { return ParsedResponse.Bad(ERR_CHUNK()); }
+    if (i < end && input[i] != ';') { return ParsedResponse.Bad(ERR_CHUNK()); }
+
+    at = end + 2;
+    if (size == 0) { break; }
+
+    if (input.len() < at + size + 2) { return ParsedResponse.Incomplete; }
+    if (input[at + size] != 13 || input[at + size + 1] != 10) {
+      return ParsedResponse.Bad(ERR_CHUNK());
+    }
+    total = total + size;
+    if (total > maxBody) { return ParsedResponse.Bad(ERR_TOO_LARGE()); }
+    u8[] grown = u8[total]();
+    for (i32 k = 0; k < bodyLen; k++) { grown[k] = body[k]; }
+    for (i32 k = 0; k < size; k++) { grown[bodyLen + k] = input[at + k]; }
+    body = grown;
+    bodyLen = total;
+    at = at + size + 2;
+  }
+
+  while (true) {
+    i32 end = findCrlf(input, at);
+    if (end < 0) { return ParsedResponse.Incomplete; }
+    if (end == at) { at = at + 2; break; }
+    if (isOws(input[at])) { return ParsedResponse.Bad(ERR_OBS_FOLD()); }
+    i32 colon = -1;
+    for (i32 k = at; k < end; k++) {
+      if (input[k] == ':') { colon = k; break; }
+    }
+    if (colon < 0 || colon == at) { return ParsedResponse.Bad(ERR_HEADER_NAME()); }
+    for (i32 k = at; k < colon; k++) {
+      if (!isToken(input[k])) { return ParsedResponse.Bad(ERR_HEADER_NAME()); }
+    }
+    i32 vs = colon + 1;
+    while (vs < end && isOws(input[vs])) { vs++; }
+    i32 ve = end;
+    while (ve > vs && isOws(input[ve - 1])) { ve--; }
+    for (i32 k = vs; k < ve; k++) {
+      if (!isFieldValueByte(input[k])) { return ParsedResponse.Bad(ERR_HEADER_VALUE()); }
+    }
+    res.headers.push(slice(input, at, colon), slice(input, vs, ve));
+    at = end + 2;
+  }
+
+  res.body = body;
+  res.consumed = at;
+  return ParsedResponse.Ok(res);
+}

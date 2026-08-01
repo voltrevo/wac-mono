@@ -1,0 +1,85 @@
+// Writing an HTTP/1.1 request.
+//
+// The client half of the framing rules, and the same discipline as the response writer: the
+// caller supplies a method, a target, headers and a body, and this decides the framing. A client
+// that lets a caller set `Content-Length` by hand is a client that can be made to disagree with
+// its own body length, which is the request-smuggling primitive from the other side.
+//
+// `Host` is required for HTTP/1.1 and is a parameter rather than a header, because a request
+// without one is not a message a server has to accept.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { Headers } from "./headers.wac";
+
+export struct Outgoing {
+  u8[] method;
+  u8[] target;
+  u8[] host;
+  Headers headers;
+  u8[] body;
+
+  Outgoing create(string method, string target, string host) {
+    return Outgoing(method.toBytes(), target.toBytes(), host.toBytes(), Headers.create(), u8[0]());
+  }
+
+  void set(this, string name, string value) {
+    this.headers.push(name.toBytes(), value.toBytes());
+  }
+}
+
+void writeDecimal(Buf out, i32 v) {
+  if (v == 0) { out.push('0'); return; }
+  u8[] tmp = u8[12]();
+  i32 n = 0;
+  i32 x = v;
+  while (x > 0) { tmp[n] = 48 + (x % 10); x = x / 10; n++; }
+  for (i32 i = n - 1; i >= 0; i--) { out.push(tmp[i]); }
+}
+
+/**
+ * Serialize. `keepAlive` false adds `Connection: close`, which is also how a client asks for a
+ * close-delimited response — the case the response parser needs `eof` for.
+ */
+export u8[] write(Outgoing req, bool keepAlive) {
+  Buf out = Buf.create();
+  out.pushAll(req.method);
+  out.push(' ');
+  out.pushAll(req.target);
+  out.pushAll(" HTTP/1.1".toBytes());
+  out.push(13);
+  out.push(10);
+
+  out.pushAll("Host: ".toBytes());
+  out.pushAll(req.host);
+  out.push(13);
+  out.push(10);
+
+  for (i32 i = 0; i < req.headers.len(); i++) {
+    out.pushAll(req.headers.nameAt(i));
+    out.push(':');
+    out.push(' ');
+    out.pushAll(req.headers.valueAt(i));
+    out.push(13);
+    out.push(10);
+  }
+
+  // Always exactly one framing header, and only when there is something to frame. A GET with
+  // `Content-Length: 0` is legal but some servers treat it as a body, so it is not sent.
+  if (req.body.len() > 0) {
+    out.pushAll("Content-Length: ".toBytes());
+    writeDecimal(out, req.body.len());
+    out.push(13);
+    out.push(10);
+  }
+
+  if (!keepAlive) {
+    out.pushAll("Connection: close".toBytes());
+    out.push(13);
+    out.push(10);
+  }
+
+  out.push(13);
+  out.push(10);
+  out.pushAll(req.body);
+  return out.take();
+}

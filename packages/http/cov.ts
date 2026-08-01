@@ -125,4 +125,125 @@ for (
   }
 }
 
-report([run], "packages/http/", { verbose });
+/**
+ * The client half: response parsing and request writing.
+ *
+ * Instrumented separately because it is a different entry point — `probe.wac` is the server side
+ * and cannot reach `incoming.wac` at all.
+ */
+const clientRun = await instrument("packages/http/test/client_probe.wac");
+{
+  const parseResponse = clientRun.mod.parse as
+    (input: Uint8Array, method: Uint8Array, eof: boolean, maxBody: number) => Uint8Array;
+  const build = clientRun.mod.buildRequest as (
+    method: Uint8Array, target: Uint8Array, host: Uint8Array, headers: Uint8Array,
+    body: Uint8Array, keepAlive: boolean,
+  ) => Uint8Array;
+  const enc2 = new TextEncoder();
+  const resp = (s: string, method = "GET", eof = true): void => {
+    parseResponse(wire(s), enc2.encode(method), eof, MAX_BODY);
+  };
+
+  for (
+    const [bytes, method] of [
+      ["HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", "GET"],
+      ["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nContent-Length:5\r\n\r\nhello", "GET"],
+      ["HTTP/1.1 200 OK\r\nContent-Length:   5   \r\n\r\nhello", "GET"],
+      ["HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nhi", "GET"],
+      ["HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 \r\nContent-Length: 0\r\n\r\n", "GET"],
+      ["HTTP/1.1 999 Weird\r\nContent-Length: 0\r\n\r\n", "GET"],
+      // bodyless by rule
+      ["HTTP/1.1 204 No Content\r\nContent-Length: 99\r\n\r\n", "GET"],
+      ["HTTP/1.1 304 Not Modified\r\n\r\n", "GET"],
+      ["HTTP/1.1 100 Continue\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n", "HEAD"],
+      ["HTTP/1.1 200 Connected\r\n\r\n", "CONNECT"],
+      // chunked
+      ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;x=1\r\nhello\r\n0\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-T: v\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nz\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloX0\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n X: v\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX v\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: \x01\r\n\r\n", "GET"],
+      // close-delimited, including a non-chunked coding
+      ["HTTP/1.1 200 OK\r\n\r\nuntil close", "GET"],
+      ["HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nbytes", "GET"],
+      // refusals
+      ["HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello", "GET"],
+      ["HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\nhello", "GET"],
+      ["HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nX: 1\r\n 2\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nX : 1\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\n: 1\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nX: \x01\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n", "GET"],
+      // malformed status lines
+      ["HTTP/1.1\r\n\r\n", "GET"],
+      ["HTTP/1.1 \r\n\r\n", "GET"],
+      ["HTTP/1.1 xyz OK\r\n\r\n", "GET"],
+      ["HTTP/1.1 20 OK\r\n\r\n", "GET"],
+      ["HTTP/2.0 200 OK\r\n\r\n", "GET"],
+      ["HTTP/1.1200 OK\r\n\r\n", "GET"],
+      ["HTTP/1.x 200 OK\r\n\r\n", "GET"],
+      ["hello\r\n\r\n", "GET"],
+      ["HTTP/1.1 200 OK\x01\r\n\r\n", "GET"],
+    ] as Array<[string, string]>
+  ) resp(bytes, method);
+
+  /** Every prefix, which is what reaches the Incomplete returns on the response side. */
+  for (
+    const full of [
+      "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX: v\r\n\r\n",
+    ]
+  ) {
+    for (let n = 0; n <= full.length; n++) resp(full.slice(0, n), "GET", false);
+  }
+
+  /** The request writer, in each of its shapes. */
+  for (
+    const [method, target, headers, body, keepAlive] of [
+      ["GET", "/", "", "", true],
+      ["GET", "/", "", "", false],
+      ["POST", "/x", "Accept\0*/*", "hello", true],
+      ["PUT", "/a?b=c", "A\x001\0B\x002", '{"a":1}', false],
+      ["DELETE", "/x", "", "", true],
+    ] as Array<[string, string, string, string, boolean]>
+  ) {
+    build(enc2.encode(method), enc2.encode(target), enc2.encode("example.com"),
+          enc2.encode(headers), enc2.encode(body), keepAlive);
+  }
+}
+
+/**
+ * The response *writer* is only reachable through a server, so the server's probe is a third
+ * entry point here. Its own report filters to `packages/server/` and would show `response.wac` as
+ * dead; this one filters to `packages/http/` and sees it.
+ */
+const serverRun = await instrument("packages/server/test/probe.wac");
+{
+  const serve = serverRun.mod.handle as (input: Uint8Array, now: bigint) => Uint8Array;
+  const now = BigInt(Date.UTC(2020, 5, 15));
+  for (
+    const request of [
+      "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+      "HEAD / HTTP/1.1\r\nHost: a\r\n\r\n",
+      "GET /nope HTTP/1.1\r\nHost: a\r\n\r\n",
+      "DELETE / HTTP/1.1\r\nHost: a\r\n\r\n",
+      "GET / HTTP/1.0\r\n\r\n",
+      "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+      "GET / HTTP/2.0\r\n\r\n",
+      "POST /json HTTP/1.1\r\nHost: a\r\nContent-Length: 99999999\r\n\r\n",
+      "POST /json HTTP/1.1\r\nHost: a\r\nContent-Length: 7\r\n\r\n{\"a\":1}",
+    ]
+  ) serve(wire(request), now);
+}
+
+report([run, clientRun, serverRun], "packages/http/", { verbose });

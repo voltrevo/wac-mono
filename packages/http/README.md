@@ -1,6 +1,6 @@
 # http
 
-An HTTP/1.1 request parser.
+HTTP/1.1: parsing requests and responses, and writing both.
 
 ```wac
 import { Parsed, Request, parseRequest } from "../../http/src/request.wac";
@@ -78,13 +78,54 @@ running index, so a `clientError` arriving after the next connection opened was 
 the wrong case, and valid requests were reported as errors. Correlating by the client's port fixed
 it. An oracle is a program and needs the same suspicion as the thing it judges.
 
-`deno task coverage:http` reports 94%.
+`deno task coverage:http` reports 89% across both halves.
+
+## Responses are the harder half
+
+A request always says how long its body is. A response has **five rules tried in order**, and two
+of them depend on things the message does not contain — the method of the request it answers, and
+whether the connection has closed. From RFC 9112 §6.3:
+
+1. HEAD, and 1xx, 204 and 304, have no body. Whatever the headers say.
+2. A 2xx to CONNECT has no body; what follows is a tunnel.
+3. `Transfer-Encoding` frames it — chunked if that is the final coding, otherwise by reading until
+   the close. **The opposite of the request rule**, where a non-chunked coding is a 400: a server
+   may not guess how long a request is, but a client always has the close to fall back on.
+4. `Content-Length` frames it, and a repeated or malformed one is a refusal.
+5. Otherwise the body runs until the connection closes.
+
+Rule 1 is the one that bites. A HEAD response carries the `Content-Length` the GET would have had
+and *no bytes*. A client that believes the header waits for a body that never comes, and then
+reads the next response's bytes as this one's — the client-side version of smuggling. It is tested
+directly, by parsing a HEAD response followed by another response and checking the second is still
+there.
+
+Rule 5 is why `parseResponse` takes `eof`. Without a length and without chunking, "the message is
+complete" and "the connection ended" are the same statement.
+
+`src/outgoing.wac` writes requests, and refuses to let a caller set `Content-Length` or
+`Transfer-Encoding` by hand — the same discipline as the response writer, for the same reason.
+
+## The 2×2
+
+`test/interop.test.ts` runs two clients against two servers:
+
+| | wac server | Node server |
+|---|---|---|
+| **wac client** | the loop closes | tests the response parser |
+| **fetch / Node** | tests the response writer | the control |
+
+The diagonal is the evidence. A round trip through my own writer and my own parser proves nothing
+— two halves wrong in opposite ways agree perfectly. A wac client reading a Node server's output
+tests the parser against bytes nobody wrote to please it; `fetch` reading the wac server tests the
+writer the same way. Passing both means each half is right *on its own*.
+
+That includes cases Node picks for itself: `/chunked` is chunked because Node did not know the
+length in advance, not because a test asked for it, and the test fails if the response turns out
+not to have been chunked after all.
 
 ## Not here yet
 
-- **Responses.** The status line and the response framing rules — which differ, notably in that a
-  response may be delimited by connection close, and that HEAD and 204 have no body regardless of
-  headers.
 - **A streaming interface.** Everything takes a whole buffer and re-parses from the start.
   `consumed` makes pipelining work, but a large body is assembled in memory; a real server wants
   to hand chunks to the caller as they arrive.

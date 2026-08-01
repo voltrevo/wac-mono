@@ -9,6 +9,10 @@
 // remainder rather than clearing the buffer is what makes pipelining work — a client may have
 // sent the next request already, and it is sitting in the tail.
 //
+// Limits live here rather than in wac, because they are about time and connections and wac can
+// see neither. All three are the ones a server actually needs, and a server without them is not
+// finished — a client that opens a connection and says nothing would otherwise hold it forever.
+//
 //   deno run -A packages/server/host/serve.ts [port]
 
 import { wacBind } from "../../../harness/wacBind.ts";
@@ -51,8 +55,42 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array<ArrayBuffer> {
   return out;
 }
 
+export type Limits = {
+  /** How long a client may take to finish sending one request, once it has started. */
+  requestMs: number;
+  /** How long a kept-alive connection may sit silent between requests. */
+  idleMs: number;
+  /** Connections served at once. Beyond this, new ones are closed immediately. */
+  maxConnections: number;
+};
+
+export const DEFAULT_LIMITS: Limits = {
+  requestMs: 10_000,
+  idleMs: 30_000,
+  maxConnections: 256,
+};
+
+let openConnections = 0;
+
+/** A read that gives up after `ms`, so a silent client cannot hold a connection open. */
+async function readWithTimeout(
+  conn: Deno.Conn,
+  buf: Uint8Array,
+  ms: number,
+): Promise<number | null | "timeout"> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">(resolve => {
+    timer = setTimeout(() => resolve("timeout"), ms);
+  });
+  try {
+    return await Promise.race([conn.read(buf), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Serve one connection until it is closed or the client stops talking. */
-export async function serveConnection(conn: Deno.Conn): Promise<void> {
+export async function serveConnection(conn: Deno.Conn, limits: Limits = DEFAULT_LIMITS): Promise<void> {
   let buffer: Uint8Array<ArrayBuffer> = new Uint8Array(0);
   try {
     while (true) {
@@ -69,8 +107,22 @@ export async function serveConnection(conn: Deno.Conn): Promise<void> {
         if (!result.keepAlive) return;
       }
 
+      // A partly-sent request gets the request budget; an idle kept-alive connection gets the
+      // idle one. They are different numbers because they are different situations: a slow
+      // upload is not the same as a client that has gone away.
+      const budget = buffer.length > 0 ? limits.requestMs : limits.idleMs;
       const chunk = new Uint8Array(16384);
-      const n = await conn.read(chunk);
+      const n = await readWithTimeout(conn, chunk, budget);
+      if (n === "timeout") {
+        // A request that was underway gets told why; an idle connection is simply dropped, since
+        // there is no request to answer.
+        if (buffer.length > 0) {
+          await writeAll(conn, new TextEncoder().encode(
+            "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+          )).catch(() => {});
+        }
+        return;
+      }
       if (n === null) return;
       buffer = concat(buffer, chunk.subarray(0, n));
     }
@@ -83,11 +135,21 @@ export async function serveConnection(conn: Deno.Conn): Promise<void> {
   }
 }
 
-export async function listen(port: number): Promise<Deno.Listener> {
+export async function listen(port: number, limits: Limits = DEFAULT_LIMITS): Promise<Deno.Listener> {
   const listener = Deno.listen({ port, hostname: "127.0.0.1" });
   (async () => {
     for await (const conn of listener) {
-      serveConnection(conn);
+      if (openConnections >= limits.maxConnections) {
+        // Refusing immediately is kinder than accepting and being slow: the client finds out now.
+        try {
+          conn.close();
+        } catch { /* already gone */ }
+        continue;
+      }
+      openConnections++;
+      serveConnection(conn, limits).finally(() => {
+        openConnections--;
+      });
     }
   })();
   return listener;

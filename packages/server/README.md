@@ -77,13 +77,24 @@ The socket cases are why the file exists. Keep-alive and pipelining are properti
 
 `deno task coverage:server` reports 92%.
 
+## Limits
+
+In the host, because they are about time and connections and wac can see neither:
+
+| limit | default | what it stops |
+|---|---|---|
+| `requestMs` | 10 s | a client that starts a request and stalls partway through |
+| `idleMs` | 30 s | a kept-alive connection that goes quiet and never comes back |
+| `maxConnections` | 256 | unbounded concurrency; further connections are closed at once |
+
+A stalled request gets a `408` and a close, because there is a request to answer. An idle
+connection is dropped without one, because there is not. Both are tested against a server started
+with 120 ms budgets.
+
 ## Not here yet
 
 - **Responses are always `Content-Length`.** The body is always assembled before the headers are
   written, so chunked output is never needed. A streaming handler would need it.
-- **No timeouts.** A client that opens a connection and says nothing holds it open. Real servers
-  bound the header phase, the body phase and the idle phase separately.
-- **No concurrency limit.** Every connection gets a task; nothing caps how many.
 - **`gzip` is not wired in**, though the package exists — `Accept-Encoding` and a compressed body
   is the obvious next route, and would make seven packages meet instead of six.
 - **No TLS**, which needs `crypto` and is a different project.
