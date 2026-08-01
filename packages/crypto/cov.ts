@@ -331,12 +331,169 @@ const UNREACHED: { file: string; line: number; snippet: string; why: string }[] 
     why: "The copy inside that same conditional. Unreached for the one reason above, not " +
       "a second one.",
   },
+  {
+    file: "packages/crypto/src/fieldp256.wac",
+    line: 273,
+    snippet: "if (s.len() != 32) { trap; }",
+    why: "fpFromBytes' length guard. Every caller inside the package passes exactly 32, " +
+      "and the function is not on the package's public surface, so nothing can reach it " +
+      "without a code change. Defensive against a future caller.",
+  },
+  {
+    file: "packages/crypto/src/p256.wac",
+    line: 111,
+    snippet: "if (jacIsInfinity(q))",
+    why: "jacAdd with the *second* operand at infinity. The ladder only ever adds a fixed " +
+      "point to an accumulator, so the identity always arrives as the first operand and " +
+      "line 110 catches it. Kept because jacAdd is exported and a caller could pass them " +
+      "the other way round.",
+  },
+  {
+    file: "packages/crypto/src/p256.wac",
+    line: 121,
+    snippet: "if (fpEquals(s1, s2)) { return jacDouble(p); }",
+    why: "The doubling case inside jacAdd, for P + P. The ladder doubles the accumulator " +
+      "before every conditional add, so the accumulator is never equal to the addend at " +
+      "the point of adding. It is reachable through the exported jacAdd and through an " +
+      "ECDSA verification where u1*G happens to equal u2*Q, which needs a signature " +
+      "constructed for the purpose. This is the branch whose absence would be worst — " +
+      "the general formula divides by zero for P + P — so it stays.",
+  },
+  {
+    file: "packages/crypto/src/p256.wac",
+    line: 286,
+    snippet: "while (cmpBE(out, n) >= 0)",
+    why: "scReduce's conditional subtraction, for a value at or above n. n is within " +
+      "2^-32 of 2^256, so a uniformly random 32-byte value — a SHA-256 digest, or a " +
+      "point's x-coordinate — lands above it about once in four billion times. Not " +
+      "reachable by choosing inputs; reachable in the field, eventually, by somebody.",
+  },
+  {
+    file: "packages/crypto/src/p256.wac",
+    line: 288,
+    snippet: "for (i32 i = 31; i >= 0; i--)",
+    why: "The subtraction inside that same loop.",
+  },
+  {
+    file: "packages/crypto/src/p256.wac",
+    line: 290,
+    snippet: "borrow = d < 0 ? 1 : 0;",
+    why: "The borrow inside that same loop.",
+  },
+  {
+    file: "packages/crypto/src/p256.wac",
+    line: 318,
+    snippet: "if (jacIsInfinity(shared)) { trap; }",
+    why: "An ECDH result at infinity. P-256 has prime order, so the only point of small " +
+      "order is the identity itself, and p256Decode rejects anything not on the curve — " +
+      "so a validated peer point times a scalar in [1, n) cannot be the identity. Kept " +
+      "because that argument depends on the validation above it staying correct.",
+  },
+  {
+    file: "packages/crypto/src/p256.wac",
+    line: 349,
+    snippet: "if (jacIsInfinity(point)) { return false; }",
+    why: "u1*G + u2*Q landing on the identity during verification. Constructible by an " +
+      "attacker choosing r and s together, which is exactly why the check is here; not " +
+      "constructible by accident, which is why no test drives it.",
+  },
+  {
+    file: "packages/crypto/src/p256.wac",
+    line: 371,
+    snippet: "if (jacIsInfinity(point)) { return u8[0](); }",
+    why: "k*G at infinity during signing, which needs k = 0 mod n — already rejected " +
+      "above. FIPS 186-4 specifies the retry anyway.",
+  },
+  {
+    file: "packages/crypto/src/p256.wac",
+    line: 376,
+    snippet: "if (isZeroBE(r)) { return u8[0](); }",
+    why: "r = 0 during signing. FIPS 186-4 requires the retry; the probability is about " +
+      "2^-256 and no test can produce it without solving for k.",
+  },
+  {
+    file: "packages/crypto/src/p256.wac",
+    line: 380,
+    snippet: "if (isZeroBE(s)) { return u8[0](); }",
+    why: "s = 0 during signing. As above.",
+  },
 ];
 
-report([run, curve], "packages/crypto/", { verbose });
+const p256 = await instrument("packages/crypto/test/wac/p256_probe.wac");
+{
+  const g = <T extends (...a: never[]) => unknown>(n: string) => p256.mod[n] as T;
+  const P = (1n << 256n) - (1n << 224n) + (1n << 192n) + (1n << 96n) - 1n;
+  const N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551n;
+  const be = (v: bigint, m = P) => {
+    const o = new Uint8Array(32);
+    let x = ((v % m) + m) % m;
+    for (let i = 31; i >= 0; i--) { o[i] = Number(x & 0xFFn); x >>= 8n; }
+    return o;
+  };
+  const pubKey = g<(p: Uint8Array) => Uint8Array>("pubKey");
+  const ecdh = g<(p: Uint8Array, q: Uint8Array) => Uint8Array>("ecdh");
+  const verify = g<(p: Uint8Array, m: Uint8Array, s: Uint8Array) => boolean>("verify");
+  const sign = g<(p: Uint8Array, m: Uint8Array, k: Uint8Array) => Uint8Array>("sign");
+  const scalarBase = g<(k: Uint8Array) => Uint8Array>("scalarBase");
+
+  // Field: the boundaries where the reduction's carry and fold paths differ.
+  for (const v of [0n, 1n, P - 1n, (1n << 224n), (1n << 96n), (1n << 255n)]) {
+    g<(a: Uint8Array, b: Uint8Array) => Uint8Array>("pAdd")(be(v), be(P - 1n));
+    g<(a: Uint8Array, b: Uint8Array) => Uint8Array>("pSub")(be(v), be(P - 1n));
+    g<(a: Uint8Array, b: Uint8Array) => Uint8Array>("pMul")(be(v), be(P - 2n));
+    g<(a: Uint8Array) => Uint8Array>("pSquare")(be(v));
+    g<(a: Uint8Array) => Uint8Array>("pInvert")(be(v));
+    g<(a: Uint8Array) => Uint8Array>("pNeg")(be(v));
+    g<(a: Uint8Array) => Uint8Array>("pRoundTrip")(be(v));
+    g<(a: Uint8Array) => boolean>("pInRange")(be(v));
+  }
+  g<() => Uint8Array>("baseEncoded")();
+  g<() => Uint8Array>("order")();
+
+  // Curve: the general case, the doubling case, the identity, the negation case.
+  const priv = be(12345n, N);
+  const pub = pubKey(priv);
+  scalarBase(be(2n, N));
+  scalarBase(be(3n, N));
+  mustTrap("n*G has no affine form", () => scalarBase(be(N, N + 1n)));
+  scalarBase(be(N - 1n, N));
+  ecdh(priv, pub);
+  const msg = bytes(20, 70);
+  const sig = sign(priv, msg, be(0xDEADBEEFn, N));
+  verify(pub, msg, sig);
+  const bad = Uint8Array.from(sig);
+  bad[0] ^= 1;
+  verify(pub, msg, bad);
+  verify(pub, msg, new Uint8Array(63));
+  verify(pub, msg, new Uint8Array(64));
+  const nb = be(N, N + 1n);
+  const bigR = Uint8Array.from(sig); bigR.set(nb, 0); verify(pub, msg, bigR);
+  const bigS = Uint8Array.from(sig); bigS.set(nb, 32); verify(pub, msg, bigS);
+  sign(priv, msg, new Uint8Array(32));
+  mustTrap("p256 zero scalar", () => pubKey(new Uint8Array(32)));
+  mustTrap("p256 scalar at n", () => pubKey(nb));
+  const offCurve = Uint8Array.from(pub); offCurve[64] ^= 1;
+  mustTrap("p256 off-curve point", () => ecdh(priv, offCurve));
+  const badTag = Uint8Array.from(pub); badTag[0] = 3;
+  mustTrap("p256 compressed point", () => ecdh(priv, badTag));
+  mustTrap("p256 short point", () => ecdh(priv, new Uint8Array(64)));
+  // A coordinate at or above p. P - 1 is still *in* the field, so it exercises the
+  // curve check rather than the range check; all-ones is above p and exercises both.
+  const overP = Uint8Array.from(pub);
+  for (let i = 1; i <= 32; i++) overP[i] = 0xFF;
+  mustTrap("p256 x outside the field", () => ecdh(priv, overP));
+  const overPy = Uint8Array.from(pub);
+  for (let i = 33; i <= 64; i++) overPy[i] = 0xFF;
+  mustTrap("p256 y outside the field", () => ecdh(priv, overPy));
+  mustTrap("p256 short private key", () => pubKey(new Uint8Array(31)));
+  mustTrap("p256 short key for ecdh", () => ecdh(new Uint8Array(31), pub));
+  mustTrap("p256 short key for sign", () => sign(new Uint8Array(31), msg, be(7n, N)));
+}
+
+report([run, curve, p256], "packages/crypto/", { verbose });
 
 const missed = new Set<string>();
-for (const r of [run, curve]) {
+for (const r of [run, curve, p256]) {
   const counts = r.counts();
   const hit = new Map<string, boolean>();
   for (const p of r.points) {
@@ -347,7 +504,7 @@ for (const r of [run, curve]) {
   for (const [key, ok] of hit) if (!ok) missed.add(key.split(":").slice(0, 2).join(":"));
 }
 // A point covered by one probe and missed by the other is covered; merge before judging.
-for (const r of [run, curve]) {
+for (const r of [run, curve, p256]) {
   const counts = r.counts();
   for (const p of r.points) {
     if (counts[p.index] > 0) missed.delete(`${p.file}:${p.line}`);
