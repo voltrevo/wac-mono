@@ -78,9 +78,27 @@ free — reach for it when the data does not fit or has not all arrived, not by 
 | compress, text | 210 MB/s | 132 MB/s |
 | compress, incompressible | 26 MB/s | 24 MB/s |
 
-Decompression streams at roughly nine tenths of the buffer speed; compression at about
-two thirds, because each block re-hashes the 32 KiB of history it carries and the match
-chains are rebuilt per block rather than once.
+Decompression streams at roughly nine tenths of the buffer speed. Compression at about two
+thirds, and **the reason is not what it looks like**: not the per-block work, the block-type
+probe, or the re-hashing of carried history. Removing all three together is worth about 1%.
+
+It is the accumulation buffer. A stream is handed its input in pieces and has to gather them
+into one array before the matcher can look at them; the whole-input compressor is given that
+array and copies nothing. Cutting the work down a piece at a time, on 1.056 MB of text:
+
+| what runs | ms | adds |
+|---|---:|---:|
+| the read callbacks, input dropped | 0.61 | — |
+| + gathering it into a buffer | 1.95 | **1.34** |
+| + CRC-32 | 2.96 | 1.01 |
+| + LZ77 and Huffman coding | 6.97 | 4.01 |
+
+The whole-input compressor does the same job in 5.40 ms, so the gap is 1.57 ms and the gather
+is 1.34 of it. It is slow because wac has no bulk array copy, so `Buf.pushBytes` moves a
+megabyte one element at a time at about 790 MB/s — filed as `wac` issue 0055, where the
+finding is that `array.copy` is already emitted by the compiler for its own helpers and simply
+is not reachable from the language. That one change would close most of this gap, and would
+speed up every buffer in the repo rather than only this one.
 
 Adding the streaming path made the whole-buffer decoder **faster**, which was not the plan:
 routing output through a window forced the match copy into one call per match instead of two
