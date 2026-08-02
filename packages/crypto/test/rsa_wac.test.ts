@@ -4,12 +4,16 @@
 // generated once and reused across the tests that ask for it. The last key generated is
 // also the one the signing modes use, which is why every test asks for its key before it
 // asks for a signature.
-import { createSign, generateKeyPairSync } from "node:crypto";
+import { createSign, generateKeyPairSync, type KeyPairKeyObjectResult } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { wacTestRun } from "../../../harness/wacTestRun.ts";
 
 const KEYGEN = 0, SIGN_PKCS1 = 1, SIGN_PSS = 2;
-const keys = new Map<number, ReturnType<typeof generateKeyPairSync<"rsa">>>();
+// Named outright rather than as `ReturnType<typeof generateKeyPairSync<"rsa">>`: that spelling
+// asks an overloaded function to be instantiated with a type argument, and none of the overloads
+// accepts one, so it fails to type-check. `deno test` type-checks by default, so it fails the
+// whole run. Same family as the `authTagLength` overload in `aes_wac.test.ts` — see 0011.
+const keys = new Map<number, KeyPairKeyObjectResult>();
 let current = 2048;
 
 /** The modulus without its DER sign byte, and the exponent, as raw big-endian bytes. */
