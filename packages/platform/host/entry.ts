@@ -15,13 +15,19 @@ import { serveHostCalls } from "./respond.ts";
 import { denoWorld } from "./deno.ts";
 import { cliOf, coreOf } from "./provider.ts";
 
-/** The generated module of an application: its classes, and its `App`. */
+/**
+ * The generated module of an application.
+ *
+ * `main(Core, Cli) -> i32` is the whole contract. It was a struct with `start` and `run`
+ * first, which bought nothing: a program that runs once and exits has no state to keep
+ * between calls, so the struct was ceremony around a function. A *service*, called
+ * repeatedly, will want the struct — and can have it then.
+ */
 export type AppModule = {
   Core: { of(...a: unknown[]): unknown };
   Cli: { of(...a: unknown[]): unknown };
-  FileResult: new (ref: unknown) => unknown;
-  fileResult?: (ok: boolean, bytes: Uint8Array, error: string) => unknown;
-  App: { start(...a: unknown[]): { run(): number } };
+  FileResult: { of(...a: unknown[]): unknown };
+  main: (core: unknown, cli: unknown) => number;
 };
 
 type Start = { sab: SharedArrayBuffer };
@@ -82,16 +88,10 @@ async function runAsWorker(app: AppModule): Promise<void> {
     {
       const b = bridgeOf(start.sab);
       try {
-        const mk = {
-          fileResult: (ok: boolean, bytes: Uint8Array, error: string) => {
-            if (typeof app.fileResult !== "function") {
-              throw new Error("the application must export `fileResult` to use readFile");
-            }
-            return app.fileResult(ok, bytes, error);
-          },
-        };
-        const instance = app.App.start(coreOf(b, app), cliOf(b, app, mk));
-        worker.postMessage({ ok: true, code: instance.run() });
+        if (typeof app.main !== "function") {
+          throw new Error("an application must export `main(Core, Cli) -> i32`");
+        }
+        worker.postMessage({ ok: true, code: app.main(coreOf(b, app), cliOf(b, app)) });
       } catch (err) {
         worker.postMessage({ ok: false, error: err instanceof Error ? err.message : String(err) });
       }
