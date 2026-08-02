@@ -1,0 +1,115 @@
+// ChaCha20 against RFC 8439's worked examples.
+//
+// No oracle, and not for want of trying to find one: WebCrypto has no ChaCha20 and
+// `node:crypto` exposes it only as part of the AEAD, so the bare stream cipher has no
+// independent implementation to compare against here. The RFC's vectors are the whole
+// external check.
+//
+// That makes the structural properties beside them worth more than they usually are. A
+// vector says the function is right for one input; that xor is an involution and that the
+// counter advances by one per block say something about every input, and they are what
+// catch the mistake a vector cannot — a keystream that is correct for the first block and
+// wrong for the second.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { chachaBlock, chacha20 } from "../../src/chacha20.wac";
+
+u8[] unhex(string h) {
+  u8[] src = h.toBytes();
+  u8[] out = u8[src.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = nib(src[2 * i]) * 16 + nib(src[2 * i + 1]); }
+  return out;
+}
+i32 nib(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  trap;
+}
+
+u8[] key() {
+  return unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+}
+
+export string test_rfc_8439_block_function() {
+  T t = T.create();
+  t.eqBytes(chachaBlock(key(), 1, unhex("000000090000004a00000000")),
+            unhex("10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e" +
+                  "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e"),
+            "RFC 8439 section 2.3.2");
+  return t.report();
+}
+
+export string test_rfc_8439_encryption() {
+  T t = T.create();
+  string plain = "Ladies and Gentlemen of the class of '99: If I could offer you only " +
+                 "one tip for the future, sunscreen would be it.";
+  t.eqBytes(chacha20(key(), 1, unhex("000000000000004a00000000"), plain.toBytes()),
+            unhex("6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0b" +
+                  "f91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d8" +
+                  "07ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab7793736" +
+                  "5af90bbf74a35be6b40b8eedf2785e42874d"),
+            "RFC 8439 section 2.4.2");
+  return t.report();
+}
+
+export string test_rfc_8439_a2_counter_zero() {
+  // A different key and a counter of zero, because the two vectors above both start at
+  // one — an implementation that ignored the counter entirely would pass them both.
+  T t = T.create();
+  t.eqBytes(chacha20(u8[32](), 0, u8[12](), u8[64]()),
+            unhex("76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7" +
+                  "da41597c5157488d7724e03fb8d84a376a43b8f41518a11cc387b669b2ee6586"),
+            "RFC 8439 A.2 case 1");
+  return t.report();
+}
+
+export string test_decryption_is_encryption_and_blocks_chain() {
+  // 197 bytes, so the final block is partial — the case where a keystream generator that
+  // rounds up writes past the message.
+  T t = T.create();
+  u8[] nonce = unhex("000000000000004a00000000");
+  u8[] msg = u8[197]();
+  for (i32 i = 0; i < msg.len(); i++) { msg[i] = (i * 31 + 7) & 0xFF; }
+
+  u8[] ct = chacha20(key(), 1, nonce, msg);
+  t.eqBytes(chacha20(key(), 1, nonce, ct), msg, "encrypting twice returns the plaintext");
+  t.eqI32(ct.len(), msg.len(), "the ciphertext is the plaintext's length");
+  bool changed = false;
+  for (i32 i = 0; i < msg.len(); i++) { if (ct[i] != msg[i]) { changed = true; } }
+  t.isTrue(changed, "and is not the plaintext");
+
+  // Each 64-byte slice must be that block's keystream xored with the plaintext, so a
+  // counter that fails to advance shows up here rather than as a silent weakness.
+  i32 blocks = (msg.len() + 63) / 64;
+  for (i32 b = 0; b < blocks; b++) {
+    u8[] ks = chachaBlock(key(), (1 + b) as! u32, nonce);
+    bool ok = true;
+    for (i32 j = 0; j < 64 && b * 64 + j < msg.len(); j++) {
+      if (ct[b * 64 + j] != (msg[b * 64 + j] ^ ks[j])) { ok = false; }
+    }
+    t.isTrue(ok, "block " + itoa64(b as i64) + " is its own keystream");
+  }
+  return t.report();
+}
+
+export string test_the_counter_actually_counts() {
+  // Two adjacent counters must give different keystreams, and the block at counter n must
+  // be what encrypting at counter n produces. A generator that reused one block would
+  // satisfy the round trip above and nothing else.
+  T t = T.create();
+  u8[] nonce = unhex("000000000000004a00000000");
+  u8[] first = chachaBlock(key(), 7, nonce);
+  u8[] second = chachaBlock(key(), 8, nonce);
+  bool differ = false;
+  for (i32 i = 0; i < 64; i++) { if (first[i] != second[i]) { differ = true; } }
+  t.isTrue(differ, "adjacent counters give different blocks");
+
+  // And the nonce matters too, which no RFC vector above varies.
+  u8[] otherNonce = unhex("000000000000004b00000000");
+  u8[] elsewhere = chachaBlock(key(), 7, otherNonce);
+  bool nonceMatters = false;
+  for (i32 i = 0; i < 64; i++) { if (first[i] != elsewhere[i]) { nonceMatters = true; } }
+  t.isTrue(nonceMatters, "a different nonce gives a different block");
+  return t.report();
+}

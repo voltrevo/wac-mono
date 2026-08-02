@@ -1,0 +1,103 @@
+// GHASH's field, checked by its algebra rather than by a table of products.
+//
+// The clearest case in the repo for invariants over vectors. GHASH multiplies in
+// GF(2^128), and the properties that define that field — bilinearity, commutativity, an
+// identity, an annihilating zero — pin the implementation across the whole input space
+// while needing no expected values at all. A table of products would be a sample someone
+// chose, and a large one at 32 bytes a row.
+//
+// ## Why an anchor is still required
+//
+// Algebra pins *structure*, not identity. An implementation multiplying in a different
+// field — the wrong reduction polynomial, or the bits in the other order — satisfies every
+// property below perfectly, because it is a consistent field, just not GF(2^128) with
+// GCM's conventions. So the identity is checked against its actual encoding, `0x80`
+// followed by zeros, which is where the bit order shows: in this convention the top bit
+// of the first byte is x^0, not x^127. That one value is what ties the algebra to GCM.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { ghash } from "../../src/ghash.wac";
+
+/** A deterministic 16-byte block. An LCG, so the corpus costs three lines to store. */
+struct Rng {
+  i64 s;
+  Rng create(i64 seed) { return Rng(seed); }
+  u8[] block(this) {
+    u8[] o = u8[16]();
+    for (i32 i = 0; i < 16; i++) {
+      this.s = (this.s * 1103515245 + 12345) & 2147483647;
+      o[i] = ((this.s >> 13) & 255) as! i32;
+    }
+    return o;
+  }
+}
+
+u8[] xorBlocks(u8[] a, u8[] b) {
+  u8[] o = u8[16]();
+  for (i32 i = 0; i < 16; i++) { o[i] = a[i] ^ b[i]; }
+  return o;
+}
+
+/** GHASH over one block is exactly the field product H·X. */
+u8[] mul(u8[] h, u8[] x) { return ghash(h, x); }
+
+export string test_multiplication_is_bilinear() {
+  // H·(X ^ Y) == H·X ^ H·Y. The property GCM's security argument rests on, and the one a
+  // carry-less multiply with a botched reduction breaks immediately.
+  T t = T.create();
+  Rng r = Rng.create(12648430);
+  for (i32 i = 0; i < 300; i++) {
+    u8[] h = r.block();
+    u8[] x = r.block();
+    u8[] y = r.block();
+    t.eqBytes(mul(h, xorBlocks(x, y)), xorBlocks(mul(h, x), mul(h, y)),
+              "bilinear at round " + itoa64(i as i64));
+  }
+  return t.report();
+}
+
+export string test_multiplication_commutes() {
+  T t = T.create();
+  Rng r = Rng.create(777);
+  for (i32 i = 0; i < 200; i++) {
+    u8[] a = r.block();
+    u8[] b = r.block();
+    t.eqBytes(mul(a, b), mul(b, a), "commutes at round " + itoa64(i as i64));
+  }
+  return t.report();
+}
+
+export string test_the_identity_and_zero_are_where_gcm_puts_them() {
+  // The anchor. Every property above holds in any field; this is what says *which* field,
+  // because the identity's encoding is where the bit order is visible. 0x80 followed by
+  // zeros is one only if the top bit of the first byte is x^0 — reverse the convention and
+  // this value becomes x^127 and multiplies like it.
+  T t = T.create();
+  u8[] one = u8[16]();
+  one[0] = 0x80;
+  Rng r = Rng.create(12345);
+  for (i32 i = 0; i < 40; i++) {
+    u8[] x = r.block();
+    t.eqBytes(mul(one, x), x, "1 * X == X");
+    t.eqBytes(mul(x, one), x, "X * 1 == X");
+    t.eqBytes(mul(x, u8[16]()), u8[16](), "X * 0 == 0");
+  }
+  return t.report();
+}
+
+export string test_it_is_associative_over_three_blocks() {
+  // Not in the TypeScript this replaces, and worth adding: associativity is the property
+  // that fails when a reduction is applied at the wrong point — after each partial product
+  // rather than once at the end — which leaves bilinearity and commutativity intact.
+  T t = T.create();
+  Rng r = Rng.create(31337);
+  for (i32 i = 0; i < 100; i++) {
+    u8[] a = r.block();
+    u8[] b = r.block();
+    u8[] c = r.block();
+    t.eqBytes(mul(mul(a, b), c), mul(a, mul(b, c)),
+              "associative at round " + itoa64(i as i64));
+  }
+  return t.report();
+}
