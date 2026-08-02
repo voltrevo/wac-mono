@@ -105,3 +105,50 @@ error if the mutant later gets killed.
 A survivor is not automatically a bug. It is a question about whether the tests check
 what they appear to check, and the useful thing is that there are now 54 specific ones
 instead of a percentage.
+
+## 2026-08-02 — tls, 134 survivors
+
+`deno task mutate --operators --package tls` kills 107 of 241. That is far more mutants
+than the whole-repo run above recorded, so tls has grown a great deal since — path
+building, P-384 dispatch, the hybrid — and this is new ground rather than a regression.
+
+| operator | module | survivors |
+|---|---|---:|
+| extreme | asn1 | 20 |
+| extreme | handshake | 14 |
+| guard | server | 13 |
+| extreme | x509 | 13 |
+| extreme | record | 12 |
+| guard | wire | 9 |
+| guard | client | 9 |
+| guard | asn1 | 9 |
+| guard | record | 8 |
+| guard | hybrid | 8 |
+| extreme | server | 6 |
+| guard | x509 | 4 |
+| extreme | hybrid | 4 |
+| guard | handshake | 3 |
+| extreme | keyschedule | 1 |
+| extreme | client | 1 |
+
+Two were defects and are fixed in 78682be: the name-constraint comparison had no fixture
+that could distinguish two names of the same length, so folding every byte to a constant
+passed the whole suite; and x509's eleven `key*`/`sig*` accessors were dead, with the
+tests repeating the numbers instead of reading them.
+
+The largest single remaining item is **`asn1.wac`'s fifteen tag accessors, which are
+dead** — `tagBoolean`, `tagSequence` and the rest, exported and called by nothing, while
+the parser writes `element(0x30)` throughout. That is 20 of the 134. Adopt them at the
+call sites, which reads better than bare hex and makes them live, or delete them; a named
+constant documenting a value the code does not use is worth neither.
+
+The rest are mostly guards and boundary values in the state machines, which is the shape
+you get from a suite whose interop tests drive whole *successful* handshakes: the happy
+path is covered several ways over and the refusals only where somebody wrote a test for
+that refusal. `hybrid`'s twelve deserve an early look — X25519MLKEM768 is the newest code
+and its length arithmetic is all constants, the kind that break loudly in one direction
+and silently in the other.
+
+Three mutants do not compile and are excluded rather than counted: `guard/tls/record` at
+36 and 174, `guard/tls/x509` at 189. A guard whose deletion will not compile is usually
+holding an invariant the types also know, but it may be the operator producing nonsense.
