@@ -1,7 +1,8 @@
 # sh
 
 A shell, in wac. Quoting, parameter expansion, command substitution, pipelines, redirection,
-`&&`/`||`, exit statuses — checked against GNU bash, script for script.
+`&&`/`||`, `if`/`while`/`until`/`for`, globbing, exit statuses — checked against GNU bash, script
+for script.
 
 ```sh
 deno task app packages/sh/src/sh.wac --allow-read --allow-env -- -c 'seq 1 10 | grep 1 | wc -l'
@@ -96,11 +97,16 @@ flag rather than two mechanisms.
 `yes | head -1` terminates in bash and would not here. Real processes will not fix that by
 themselves: it needs the shell to run stages concurrently, which needs more than one thread.
 
-**No compound commands** — `if`, `while`, `for`, `case`, `{…}`, subshells — and no functions.
-The grammar has the place for them; nothing fills it yet.
+**No `case`, no subshells, no functions.** `if`, `while`, `until`, `for` and `{…}` are there;
+`case` and `( … )` are not, and neither are function definitions.
 
-**No globbing.** A word containing `*` reaches the command unchanged, which is what bash does when
-nothing matches, so the difference only shows when something would have.
+**Globbing is last-component only.** A pattern in the final path component works; one in a leading
+component does not, because that needs walking every directory that matches. `[a-z]` classes are
+not implemented — only `*` and `?`.
+
+**Loops are bounded** at 100,000 iterations. bash would run forever; this stops and says why,
+which matters because the shell runs inside a server that has no way to be interrupted. That is a
+deliberate difference and the only one where this refuses to do what bash does.
 
 **No here-documents, backquotes, `${x:-default}`, or arithmetic.** Each is noted in the lexer where
 it would attach.
@@ -115,4 +121,18 @@ nothing of the error stream to redirect, and saying so beats writing the wrong b
 **Standard error arrives in one piece at the end**, as with `packages/ssh` and for the same
 reason — [issue 0014](../../issues/open/0014-platform-has-no-way-to-write-bytes-to-standard-error.md).
 
-Branch coverage is not wired up yet; the differential suite is the only measurement.
+## Coverage
+
+`deno task coverage:sh` drives about two hundred scripts through the lexer, parser and executor
+with the capabilities faked inside wac — `test/wac/probe.wac` builds a `Core` and a `Cli` out of
+pure functions, since wac has no mutable module-level state and a funcref cannot close over
+anything. A fixed answer per path is enough to reach both sides of every branch that asks.
+
+**It stands at 88%**, not the 100% the rest of this repo holds to. The gap is enumerated by
+`--verbose` and is mostly parse-error paths: malformed compound commands have many ways to be
+wrong and the driver reaches some of them. Finishing it is the next job on this package.
+
+The two measurements answer different questions and neither replaces the other. bash says what is
+*right*; coverage says what has *run*. The refusals in particular are invisible to the
+differential suite by construction — bash and this agree on what works, and differ on what this
+declines to do.

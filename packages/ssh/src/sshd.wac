@@ -44,7 +44,7 @@ import { AuthRequest, authFailure, authSuccess, channelClose, channelData, chann
          pkOk,
          channelFailure, channelStderr, channelSuccess, ecdhReply, ephemeralPublic, exchangeHash, execCommand,
          exitStatus, hostKeyBlob, openConfirmation, openFailure, parseAuthRequest, parseEcdhInit,
-         serverProposal, serviceAccept, sharedSecret, verifyAuth,
+         requestName, serverProposal, serviceAccept, sharedSecret, verifyAuth,
          byApplication, disconnect } from "./server.wac";
 
 i32 defaultPort() { return 2222; }
@@ -300,29 +300,39 @@ void session(Conn conn, Cli cli, Core core) {
     return;
   }
 
-  // Requests until one is `exec`. A client may send `env` or ask for a pty first; both get a
-  // refusal rather than silence, because `want_reply` means it is waiting.
+  // Requests until one asks us to run something. A client may send `env` or ask for a pty first.
+  //
+  // **`pty-req` is refused deliberately.** Accepting it makes the client put its terminal in raw
+  // mode and stop echoing locally, expecting the server to echo every keystroke back — which
+  // needs terminal modes this has no way to honour, and the user would type blind. Refusing means
+  // `ssh -T host` behaves exactly as it does against a real sshd running a non-interactive shell,
+  // and plain `ssh host` still works with the client's own line editing.
   u8[] command = u8[0]();
-  for (i32 i = 0; i < 16 && command.len() == 0; i++) {
+  bool interactive = false;
+  for (i32 i = 0; i < 16 && command.len() == 0 && !interactive; i++) {
     u8[] p = conn.readPacket();
     if (conn.failed()) { return; }
     Incoming r = parse(p);
     if (!r.ok) { conn.fail("a channel message did not parse"); return; }
     if (r.kind == msgChannelClose() || r.kind == msgChannelEof()) { return; }
     if (r.kind != msgChannelRequest()) { continue; }
+
+    if (sameBytes(requestName(p), "shell".toBytes())) { interactive = true; break; }
     command = execCommand(p);
     if (command.len() == 0) {
-      // Not exec — a pty, an environment variable, a shell. None of them are things this can do.
       conn.sendPacket(channelFailure(clientChannel));
     }
   }
-  if (command.len() == 0) {
+  if (command.len() == 0 && !interactive) {
     conn.fail("the client never asked to run anything");
     return;
   }
   if (!conn.sendPacket(channelSuccess(clientChannel))) { conn.fail("cannot accept the command"); return; }
 
-  Result result = run(cli, core, command);
+  Result result = interactive
+    ? interactiveSession(conn, cli, core, clientChannel)
+    : run(cli, core, command);
+  if (conn.failed()) { return; }
   if (result.out.len() > 0) { conn.sendPacket(channelData(clientChannel, result.out)); }
   if (result.err.len() > 0) { conn.sendPacket(channelStderr(clientChannel, result.err)); }
   conn.sendPacket(exitStatus(clientChannel, result.status));
@@ -345,6 +355,69 @@ void session(Conn conn, Cli cli, Core core) {
     Incoming r = parse(p);
     if (r.ok && r.kind == msgChannelClose()) { return; }
   }
+}
+
+/**
+ * An interactive session: read lines from the channel, run each, send the output back.
+ *
+ * One shell for the whole session, which is what makes it a session rather than a run of
+ * unrelated commands — a variable set on one line is there on the next.
+ *
+ * A REPL needs no concurrency: the client sends a line and waits, so the ordinary blocking read
+ * is the right shape. What it does need is to send each line's output *as it is produced* rather
+ * than at the end, which is why this sends inside the loop rather than accumulating.
+ *
+ * No prompt is written. Without a pty a real shell is not interactive and prints none, so this
+ * matches `ssh -T host` against a real sshd, which is also the only thing that can be compared
+ * against it.
+ */
+Result interactiveSession(Conn conn, Cli cli, Core core, i32 channel) {
+  Shell sh = Shell.capturing(core, cli);
+  Buf pending = Buf.create();
+
+  while (true) {
+    u8[] p = conn.readPacket();
+    if (conn.failed()) {
+      // The client hanging up ends the session; it is not an error to report.
+      conn.error = "";
+      return Result(u8[0](), u8[0](), sh.status);
+    }
+    Incoming m = parse(p);
+    if (!m.ok) { conn.fail("a channel message did not parse"); return Result(u8[0](), u8[0](), 1); }
+
+    if (m.kind == msgChannelEof() || m.kind == msgChannelClose()) { break; }
+    if (m.kind != msgChannelData()) { continue; }
+
+    pending.pushAll(m.data);
+    // Run whole lines only. A client sends what it has, which may be half a line or three.
+    while (true) {
+      i32 nl = -1;
+      for (i32 i = 0; i < pending.len; i++) {
+        if (pending.get(i) == 10) { nl = i; break; }
+      }
+      if (nl < 0) { break; }
+      u8[] line = u8[nl]();
+      line.copyFrom(pending.data, 0, 0, nl);
+      pending.dropFront(nl + 1);
+
+      runScript(sh, string.fromBytes(line));
+      u8[] out = sh.outBuf.take();
+      u8[] err = sh.errOut.take();
+      if (out.len() > 0) { conn.sendPacket(channelData(channel, out)); }
+      if (err.len() > 0) { conn.sendPacket(channelStderr(channel, err)); }
+      if (sh.exiting) { return Result(u8[0](), u8[0](), sh.exitCode); }
+    }
+  }
+
+  // Anything typed without a final newline still runs, as a shell does at end of input.
+  if (pending.len > 0) {
+    runScript(sh, pending.toStr());
+    u8[] out = sh.outBuf.take();
+    u8[] err = sh.errOut.take();
+    if (out.len() > 0) { conn.sendPacket(channelData(channel, out)); }
+    if (err.len() > 0) { conn.sendPacket(channelStderr(channel, err)); }
+  }
+  return Result(u8[0](), u8[0](), sh.exiting ? sh.exitCode : sh.status);
 }
 
 /** The client's channel number out of a CHANNEL_OPEN for a session, or -1. */
@@ -475,4 +548,12 @@ string itoa(i32 v) {
     x = x / 10;
   }
   return out;
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
 }

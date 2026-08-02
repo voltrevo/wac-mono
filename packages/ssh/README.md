@@ -259,6 +259,27 @@ Pipelines, quoting, `$(…)`, `&&` and redirection all work, because the server 
 any of them — it hands the string to a shell running in *capturing* mode, whose standard output
 collects into a buffer instead of going to the server's terminal, and sends that down the channel.
 
+**Interactive sessions work too.** A client that asks for a `shell` rather than an `exec` gets a
+read-eval-print loop over the channel, with **one shell for the whole session** — a variable set
+on one line is there on the next, which is what makes it a session rather than a run of unrelated
+commands:
+
+```sh
+ssh -T -p 2222 user@host
+x=hello
+echo $x world
+```
+
+A REPL needs no concurrency, which is why this works at all with one thread: the client sends a
+line and waits, so the ordinary blocking read is the right shape.
+
+**`pty-req` is refused, deliberately.** Accepting it makes the client put its terminal in raw mode
+and stop echoing locally, expecting the server to echo every keystroke — which needs terminal
+modes this cannot honour, and the user would type blind. Refused, `ssh host` from a real terminal
+prints `PTY allocation request failed on channel 0` and carries on with the client's own line
+editing, which is the same thing a real sshd gives you when no pty is available. No prompt is
+written, because without a pty a real shell is not interactive and prints none.
+
 **It still cannot start a process** —
 [issue 0015](../../issues/open/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md).
 The shell's external commands are its own, written in wac; `help` lists them. What changed is that
