@@ -117,10 +117,32 @@ export async function buildProfile(
  */
 export function selectTests(p: Profile, locations: string[]): string[] | null {
   const picked = new Set<string>();
+  let anyKnown = false;
   for (const loc of locations) {
-    if (!p.known.has(loc)) return null;      // unknown line: do not narrow
+    if (!p.known.has(loc)) continue;
+    anyKnown = true;
     for (const t of p.lines.get(loc) ?? []) picked.add(t);
   }
+  // *Any* known line, not every one. A mutation spans a whole syntactic construct — an
+  // `extreme` mutant replaces an entire function body — and most interior lines are plain
+  // statements the coverage build does not model, since it instruments branches. Requiring
+  // every line to be known meant one unmodelled statement discarded the whole selection,
+  // which is how 83 of 235 mutants ended up running the full scope for no reason.
+  //
+  // Sound because control enters a construct through its entry: a test that executes an
+  // interior line must have reached the line that dominates it, and that is the line
+  // carrying the point. Verified the only way that counts — the verdicts are unchanged.
+  if (!anyKnown) return null;
+  // Selecting on *any* known line is fine; concluding "nothing executes this" from it is
+  // not. An edit span need not contain the line its coverage point sits on — a function
+  // whose signature wraps has its entry point above where the span begins — so a span can
+  // hold known-but-uncovered interior lines while the covered entry is outside it. Read
+  // literally that says no test reaches the function, and `extreme/tls/client/
+  // tlsClientInit` was reported exactly that way for a function every client test calls.
+  //
+  // So the empty answer is only trusted when every line of the span is accounted for.
+  // Otherwise fall back, which costs time and cannot be wrong.
+  if (picked.size === 0 && !locations.every((l) => p.known.has(l))) return null;
   return [...picked].sort();
 }
 
