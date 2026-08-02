@@ -1,0 +1,150 @@
+// A static file server. `box httpd -8080 [dir]`, or the working directory.
+//
+// The first applet that composes the network *and* the filesystem: accept a connection,
+// parse the request with `packages/http`, map the path to a file, answer with it. `serve`
+// only ever answers `packages/server`'s built-in routes and cannot show you a file.
+//
+// **One connection at a time**, because the world has no `poll` — the same honest limit
+// `serve` has.
+//
+// The path check is the part to read carefully. A request target is attacker-controlled
+// and is the one input here that is *supposed* to be hostile, so `..` is refused outright
+// rather than resolved: resolving is where directory-traversal bugs live, and this program
+// has no need to be clever about it.
+
+import { Cli, Core, FileResult, Stat, Socket } from "../../../platform/src/platform.wac";
+import { Args, has } from "../lib/args.wac";
+import { itoa, itoa64 } from "../lib/num.wac";
+import { concat, slice } from "../lib/bytes.wac";
+import { Parsed, Request, parseRequest } from "../../../http/src/request.wac";
+import { Response, write as writeResponse } from "../../../http/src/response.wac";
+
+export i32 httpd(Core core, Cli cli, Args a) {
+  i32 port = a.num == 0 ? 8080 : a.num;
+  string root = a.rest.len() > 0 ? a.rest[0] : ".";
+
+  Socket l = cli.listen(port);
+  if (l.handle < 0) { core.warn(a.name + ": " + itoa(port) + ": " + l.error); return 1; }
+  // The same phrase `serve` prints, deliberately: it is what a caller waits for to know
+  // the port is up, and two spellings for it meant a test hung instead of failing.
+  core.warn(a.name + ": listening on port " + itoa(port) + ", serving " + root);
+
+  bool once = has(a, 'o');
+  while (true) {
+    Socket c = cli.accept(l.handle);
+    if (c.handle < 0) { core.warn(a.name + ": accept: " + c.error); break; }
+    connection(core, cli, c.handle, root);
+    cli.closeSocket(c.handle);
+    if (once) { break; }
+  }
+  cli.closeSocket(l.handle);
+  return 0;
+}
+
+/** One connection: read a request, answer it, close. No keep-alive — one at a time anyway. */
+void connection(Core core, Cli cli, i32 sock, string root) {
+  u8[] buffered = u8[0]();
+  while (true) {
+    match (parseRequest(buffered, 1 << 20)) {
+      case Incomplete: {
+        u8[] chunk = cli.recv(sock);
+        if (chunk.len() == 0) { return; }
+        buffered = concat(buffered, chunk);
+      }
+      case Bad(code): {
+        cli.send(sock, writeResponse(Response.create(400), "GET".toBytes(), false));
+        return;
+      }
+      case Ok(req): {
+        answer(core, cli, sock, root, req);
+        return;
+      }
+    }
+  }
+}
+
+void answer(Core core, Cli cli, i32 sock, string root, Request req) {
+  bool isGet = eq(req.method, "GET") || eq(req.method, "HEAD");
+  if (!isGet) {
+    cli.send(sock, writeResponse(Response.create(405), req.method, false));
+    return;
+  }
+
+  u8[] target = upTo(req.target, '?');           // the query is not part of the path
+  if (!safe(target)) {
+    cli.send(sock, writeResponse(Response.create(403), req.method, false));
+    return;
+  }
+  string path = root + string.fromBytes(target);
+  Stat st = cli.stat(path);
+  if (st.exists && st.isDir) { path = path + (endsWithSlash(target) ? "index.html" : "/index.html"); }
+
+  FileResult f = cli.readFile(path);
+  if (!f.ok) {
+    Response nf = Response.create(404);
+    nf.set("Content-Type", "text/plain; charset=utf-8");
+    nf.body = ("not found: " + string.fromBytes(target) + "\n").toBytes();
+    cli.send(sock, writeResponse(nf, req.method, false));
+    core.warn("404 " + string.fromBytes(target));
+    return;
+  }
+
+  Response res = Response.create(200);
+  // From the *resolved* path, not the request target: `/` resolves to `index.html`, and
+  // typing that as application/octet-stream makes a browser download the page.
+  res.set("Content-Type", contentType(path.toBytes()));
+  res.body = f.bytes;
+  cli.send(sock, writeResponse(res, req.method, false));
+  core.warn("200 " + string.fromBytes(target) + " " + itoa(f.bytes.len()));
+}
+
+/**
+ * Whether a request target may be joined to the root.
+ *
+ * Refused rather than resolved. It must start with `/`, must not contain `..` anywhere,
+ * and must not contain a NUL or a backslash — the two bytes that mean something different
+ * to a filesystem than they do here. Anything clever belongs in a URL library, and this
+ * does not need clever, it needs to be obviously right.
+ */
+bool safe(u8[] t) {
+  if (t.len() == 0 || t[0] != '/') { return false; }
+  for (i32 i = 0; i < t.len(); i++) {
+    if (t[i] == 0 || t[i] == '\\') { return false; }
+    if (t[i] == '.' && i + 1 < t.len() && t[i + 1] == '.') { return false; }
+  }
+  return true;
+}
+
+bool endsWithSlash(u8[] t) { return t.len() > 0 && t[t.len() - 1] == '/'; }
+
+u8[] upTo(u8[] s, i32 stop) {
+  for (i32 i = 0; i < s.len(); i++) { if (s[i] == stop) { return slice(s, 0, i); } }
+  return s;
+}
+
+bool eq(u8[] a, string b) {
+  u8[] bb = b.toBytes();
+  if (a.len() != bb.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != bb[i]) { return false; } }
+  return true;
+}
+
+/** Enough of a table to be useful; everything else is bytes and says so. */
+string contentType(u8[] path) {
+  if (ends(path, ".html")) { return "text/html; charset=utf-8"; }
+  if (ends(path, ".css")) { return "text/css; charset=utf-8"; }
+  if (ends(path, ".js")) { return "text/javascript; charset=utf-8"; }
+  if (ends(path, ".json")) { return "application/json"; }
+  if (ends(path, ".txt") || ends(path, ".md")) { return "text/plain; charset=utf-8"; }
+  if (ends(path, ".wasm")) { return "application/wasm"; }
+  if (ends(path, ".png")) { return "image/png"; }
+  if (ends(path, ".svg")) { return "image/svg+xml"; }
+  return "application/octet-stream";
+}
+
+bool ends(u8[] s, string suffix) {
+  u8[] x = suffix.toBytes();
+  if (s.len() < x.len()) { return false; }
+  for (i32 i = 0; i < x.len(); i++) { if (s[s.len() - x.len() + i] != x[i]) { return false; } }
+  return true;
+}

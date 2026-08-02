@@ -1,75 +1,17 @@
-// An HTTP GET, to standard output. `box get example.com /path -80`.
+// An HTTP GET, to standard output. `box get example.com /path -80 -i`.
 //
-// The counterpart to `serve`, and the reason `connect` exists. `packages/http` parses the
-// response; the request itself is small enough to spell out, and doing so keeps the applet
-// honest about what it sends.
+// The counterpart to `serve`, and the reason `connect` exists.
 
-import { Cli, Core, Socket } from "../../../platform/src/platform.wac";
+import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
-import { itoa } from "../lib/num.wac";
-import { concat } from "../lib/bytes.wac";
-import { Incoming, ParsedResponse, parseResponse } from "../../../http/src/incoming.wac";
+import { fetch } from "../lib/fetch.wac";
 
 export i32 get(Core core, Cli cli, Args a) {
   if (a.rest.len() < 1) {
     core.warn("usage: " + a.name + " <host> [path] [-<port>] [-i]");
     return 2;
   }
-  string host = a.rest[0];
-  string path = a.rest.len() > 1 ? a.rest[1] : "/";
-  i32 port = a.num == 0 ? 80 : a.num;
-
-  Socket s = cli.connect(host, port);
-  if (s.handle < 0) { core.warn(a.name + ": " + host + ": " + s.error); return 1; }
-
-  string req = "GET " + path + " HTTP/1.1\r\n"
-    + "Host: " + host + "\r\n"
-    + "User-Agent: box\r\n"
-    + "Connection: close\r\n\r\n";
-  if (!cli.send(s.handle, req.toBytes())) {
-    core.warn(a.name + ": " + host + ": cannot send");
-    cli.closeSocket(s.handle);
-    return 1;
-  }
-
-  // `Connection: close` means the body ends when the socket does, so this reads to the end
-  // and then parses once with `eof` set — which is what tells the parser a body with no
-  // length is complete rather than truncated.
-  u8[] all = u8[0]();
-  while (true) {
-    u8[] chunk = cli.recv(s.handle);
-    if (chunk.len() == 0) { break; }
-    all = concat(all, chunk);
-  }
-  cli.closeSocket(s.handle);
-
-  ParsedResponse p = parseResponse(all, "GET".toBytes(), true, 1 << 26);
-  return show(core, cli, p, has(a, 'i'), a.name);
-}
-
-/** The body, or the whole message when `-i` asked for the headers too. */
-i32 show(Core core, Cli cli, ParsedResponse p, bool headers, string name) {
-  match (p) {
-    case Incomplete: {
-      core.warn(name + ": the response ended mid-message");
-      return 1;
-    }
-    case Bad(code): {
-      core.warn(name + ": unparseable response (" + itoa(code) + ")");
-      return 1;
-    }
-    case Ok(res): {
-      if (headers) {
-        core.log("HTTP " + itoa(res.status));
-        for (i32 i = 0; i < res.headers.count; i++) {
-          core.log(string.fromBytes(res.headers.nameAt(i)) + ": "
-                 + string.fromBytes(res.headers.valueAt(i)));
-        }
-        core.log("");
-      }
-      cli.write(res.body);
-      return res.status >= 400 ? 1 : 0;
-    }
-  }
-  return 1;
+  return fetch(core, cli, a.name, a.rest[0],
+               a.rest.len() > 1 ? a.rest[1] : "/",
+               a.num == 0 ? 80 : a.num, has(a, 'i'));
 }

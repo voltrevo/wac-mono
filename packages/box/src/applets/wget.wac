@@ -1,0 +1,25 @@
+// The same GET, into a file. `box wget example.com /path out.html`.
+//
+// Three lines different from `get`, and the three lines are the point: `openOutput` moves
+// where `cli.write` goes, so the fetch itself is unchanged and does not know. Switching
+// back to standard output at the end is what closes the file.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { fetch } from "../lib/fetch.wac";
+
+export i32 wget(Core core, Cli cli, Args a) {
+  if (a.rest.len() < 3) {
+    core.warn("usage: " + a.name + " <host> <path> <outfile> [-<port>]");
+    return 2;
+  }
+  string out = a.rest[2];
+  string error = cli.openOutput(out);
+  if (error != "") { core.warn(a.name + ": " + out + ": " + error); return 1; }
+
+  i32 code = fetch(core, cli, a.name, a.rest[0], a.rest[1], a.num == 0 ? 80 : a.num, false);
+
+  cli.openOutput("");
+  if (code == 0) { core.warn(a.name + ": saved " + out); }
+  return code;
+}

@@ -861,8 +861,8 @@ Deno.test("box's network applets: a wac server and a wac client, over real TCP",
     assertEquals(reply.startsWith("HTTP/1.1 200 OK\r\n"), true, reply.slice(0, 80));
     assertEquals(reply.includes("wac http server"), true, reply.slice(0, 200));
 
-    assertEquals((await server.status).code, 0, "the server exited cleanly");
     server.stdout.cancel();
+    assertEquals((await server.status).code, 0, "the server exited cleanly");
 
     // And the client half against the server half: two wac programs, one socket, no
     // TypeScript in between. Started together — `serve` blocks in `accept` until `get`
@@ -884,8 +884,8 @@ Deno.test("box's network applets: a wac server and a wac client, over real TCP",
     assertEquals(got.code, 0, new TextDecoder().decode(got.stderr));
     assertEquals(body.includes("HTTP 200"), true, body.slice(0, 120));
     assertEquals(body.trimEnd().endsWith("wac http server"), true, body.slice(0, 200));
-    assertEquals((await server2.status).code, 0, "the second server exited cleanly");
     server2.stdout.cancel();
+    assertEquals((await server2.status).code, 0, "the second server exited cleanly");
 
     // Without the grant, nothing — whatever the arguments say.
     const noNet = await Deno.makeTempFile({ prefix: "wac-nonet-" });
@@ -1014,6 +1014,151 @@ Deno.test("box's newest batch: sponge, zstd, json, stat, uuid, shuf, paste, yes"
     await reader.cancel();
     const status = await yes.status;
     assertEquals(status.success || status.signal !== null, true, "yes stopped when the pipe closed");
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("httpd serves a directory, and refuses to leave it", async () => {
+  // The first applet that composes the network *and* the filesystem. The path check is the
+  // part worth testing hardest: a request target is the one input here that is supposed to
+  // be hostile, and `..` is refused outright rather than resolved, because resolving is
+  // where traversal bugs live.
+  const built = await Deno.makeTempFile({ prefix: "wac-httpd-" });
+  const root = await Deno.makeTempDir({ prefix: "wac-httpd-www-" });
+  try {
+    await buildApp(BOX, built, { read: true, net: true });
+    await Deno.writeTextFile(`${root}/index.html`, "<h1>hi</h1>\n");
+    await Deno.writeTextFile(`${root}/notes.txt`, "plain\n");
+    await Deno.mkdir(`${root}/sub`);
+    await Deno.writeTextFile(`${root}/sub/index.html`, "deep\n");
+    // The file the traversal case is trying to reach, one level above the root.
+    await Deno.writeTextFile(`${root}/../wac-httpd-secret.txt`, "should not be served\n");
+
+    const request = async (target: string) => {
+      const port = freePort();
+      const server = new Deno.Command(built, {
+        args: ["httpd", `-${port}`, root, "-o"],
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn();
+      await waitForListening(server, port);
+      // Cancel both pipes before waiting on the child. Deno will not resolve `status`
+      // while a piped stream is unread, so cancelling *after* it is a deadlock — which is
+      // how the first version of this test hung rather than failed.
+      server.stdout.cancel();
+      server.stderr.cancel();
+      const conn = await Deno.connect({ hostname: "127.0.0.1", port });
+      await conn.write(new TextEncoder().encode(
+        `GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`,
+      ));
+      const parts: number[] = [];
+      const buf = new Uint8Array(4096);
+      for (;;) {
+        const n = await conn.read(buf);
+        if (n === null) break;
+        parts.push(...buf.slice(0, n));
+      }
+      conn.close();
+      await server.status;
+      return new TextDecoder().decode(new Uint8Array(parts));
+    };
+
+    const index = await request("/");
+    assertEquals(index.startsWith("HTTP/1.1 200 OK\r\n"), true, index.slice(0, 60));
+    // From the *resolved* path, not the target: `/` becomes `index.html`, and typing that
+    // as application/octet-stream would make a browser download the page instead.
+    assertEquals(index.includes("Content-Type: text/html"), true, index.slice(0, 200));
+    assertEquals(index.trimEnd().endsWith("<h1>hi</h1>"), true);
+
+    const txt = await request("/notes.txt");
+    assertEquals(txt.includes("Content-Type: text/plain"), true, txt.slice(0, 200));
+
+    // A directory resolves to its index, with or without the trailing slash.
+    assertEquals((await request("/sub/")).trimEnd().endsWith("deep"), true);
+    assertEquals((await request("/sub")).trimEnd().endsWith("deep"), true);
+
+    // The query is not part of the path.
+    assertEquals((await request("/notes.txt?v=2")).trimEnd().endsWith("plain"), true);
+
+    assertEquals((await request("/nope")).startsWith("HTTP/1.1 404 "), true);
+    assertEquals((await request("/../wac-httpd-secret.txt")).startsWith("HTTP/1.1 403 "), true);
+    assertEquals((await request("/sub/../../wac-httpd-secret.txt")).startsWith("HTTP/1.1 403 "), true);
+    // A relative target never reaches the path check: `packages/http` rejects an
+    // origin-form target without a leading slash as malformed, which is 400 rather than
+    // 403. Asserted as 400 because that is what happens, not because it is what I guessed.
+    assertEquals((await request("notes.txt")).startsWith("HTTP/1.1 400 "), true);
+    assertEquals((await request("/a\\b")).startsWith("HTTP/1.1 403 "), true);
+
+    const post = await (async () => {
+      const port = freePort();
+      const server = new Deno.Command(built, {
+        args: ["httpd", `-${port}`, root, "-o"], stdout: "piped", stderr: "piped",
+      }).spawn();
+      await waitForListening(server, port);
+      server.stdout.cancel();
+      server.stderr.cancel();
+      const conn = await Deno.connect({ hostname: "127.0.0.1", port });
+      await conn.write(new TextEncoder().encode(
+        `POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`,
+      ));
+      const buf = new Uint8Array(256);
+      const n = await conn.read(buf);
+      conn.close();
+      await server.status;
+      return new TextDecoder().decode(buf.slice(0, n ?? 0));
+    })();
+    assertEquals(post.startsWith("HTTP/1.1 405 "), true, post.slice(0, 60));
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(root, { recursive: true });
+    try { await Deno.remove(`${root}/../wac-httpd-secret.txt`); } catch { /* gone with the dir */ }
+  }
+});
+
+Deno.test("split writes many files, and wget writes one", async () => {
+  // `split` is the first applet to open more than one output — everything else opens a
+  // file, writes it and closes it. `wget` is `get` with the output pointed at a file, and
+  // is three lines different from it: `openOutput` moves where `cli.write` goes, so the
+  // fetch does not know.
+  const built = await Deno.makeTempFile({ prefix: "wac-split-" });
+  const dir = await Deno.makeTempDir({ prefix: "wac-split-d-" });
+  try {
+    await buildApp(BOX, built, { read: true, write: true, net: true });
+    const lines = Array.from({ length: 250 }, (_, i) => `${i + 1}`).join("\n") + "\n";
+    await Deno.writeTextFile(`${dir}/big.txt`, lines);
+
+    const run = (args: string[], cwd: string) =>
+      new Deno.Command(built, { args, cwd, stdout: "piped", stderr: "piped" }).outputSync();
+    assertEquals(run(["split", "-100", "big.txt", "part-"], dir).code, 0);
+
+    // Against the real one, piece for piece.
+    new Deno.Command("split", { args: ["-l", "100", "big.txt", "real-"], cwd: dir }).outputSync();
+    for (const s of ["aa", "ab", "ac"]) {
+      assertEquals(
+        await Deno.readTextFile(`${dir}/part-${s}`),
+        await Deno.readTextFile(`${dir}/real-${s}`),
+        `part-${s} differs`,
+      );
+    }
+    // And no fourth piece: an exact boundary must not open a file it never writes to.
+    let missing = false;
+    try { await Deno.stat(`${dir}/part-ad`); } catch { missing = true; }
+    assertEquals(missing, true, "an empty fourth piece was created");
+
+    // wget, against box's own httpd — two wac programs and a file at the end of it.
+    const port = freePort();
+    const server = new Deno.Command(built, {
+      args: ["httpd", `-${port}`, dir, "-o"], stdout: "piped", stderr: "piped",
+    }).spawn();
+    await waitForListening(server, port);
+    server.stdout.cancel();
+    server.stderr.cancel();
+    const got = run(["wget", "127.0.0.1", "/big.txt", "saved.txt", `-${port}`], dir);
+    assertEquals(got.code, 0, new TextDecoder().decode(got.stderr));
+    assertEquals(await Deno.readTextFile(`${dir}/saved.txt`), lines, "wget saved the body");
+    await server.status;
   } finally {
     await Deno.remove(built);
     await Deno.remove(dir, { recursive: true });

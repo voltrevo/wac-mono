@@ -46,6 +46,7 @@ import { gunzip } from "./applets/gunzip.wac";
 import { gzip } from "./applets/gzip.wac";
 import { head } from "./applets/head.wac";
 import { hex } from "./applets/hex.wac";
+import { httpd } from "./applets/httpd.wac";
 import { json } from "./applets/json.wac";
 import { ls } from "./applets/ls.wac";
 import { mkdir } from "./applets/mkdir.wac";
@@ -61,6 +62,7 @@ import { sha256sum } from "./applets/sha256sum.wac";
 import { sha512sum } from "./applets/sha512sum.wac";
 import { shuf } from "./applets/shuf.wac";
 import { sort } from "./applets/sort.wac";
+import { split } from "./applets/split.wac";
 import { sponge } from "./applets/sponge.wac";
 import { stat } from "./applets/stat.wac";
 import { strings } from "./applets/strings.wac";
@@ -75,6 +77,7 @@ import { urldecode } from "./applets/urldecode.wac";
 import { urlencode } from "./applets/urlencode.wac";
 import { uuid } from "./applets/uuid.wac";
 import { wc } from "./applets/wc.wac";
+import { wget } from "./applets/wget.wac";
 import { yes } from "./applets/yes.wac";
 import { zstd } from "./applets/zstd.wac";
 
@@ -103,6 +106,7 @@ export i32 main(Core core, Cli cli) {
   if (applet == "head")      { return head(core, cli, a); }
   if (applet == "help")      { return usage(core); }
   if (applet == "hex")       { return hex(core, cli, a); }
+  if (applet == "httpd")     { return httpd(core, cli, a); }
   if (applet == "json")      { return json(core, cli, a); }
   if (applet == "ls")        { return ls(core, cli, a); }
   if (applet == "mkdir")     { return mkdir(core, cli, a); }
@@ -118,6 +122,7 @@ export i32 main(Core core, Cli cli) {
   if (applet == "sha512sum") { return sha512sum(core, cli, a); }
   if (applet == "shuf")      { return shuf(core, cli, a); }
   if (applet == "sort")      { return sort(core, cli, a); }
+  if (applet == "split")     { return split(core, cli, a); }
   if (applet == "sponge")    { return sponge(core, cli, a); }
   if (applet == "stat")      { return stat(core, cli, a); }
   if (applet == "strings")   { return strings(core, cli, a); }
@@ -132,6 +137,7 @@ export i32 main(Core core, Cli cli) {
   if (applet == "urlencode") { return urlencode(core, cli, a); }
   if (applet == "uuid")      { return uuid(core, cli, a); }
   if (applet == "wc")        { return wc(core, cli, a); }
+  if (applet == "wget")      { return wget(core, cli, a); }
   if (applet == "yes")       { return yes(core, cli, a); }
   if (applet == "zstd")      { return zstd(core, cli, a); }
 
@@ -147,11 +153,13 @@ export i32 main(Core core, Cli cli) {
 i32 usage(Core core) {
   core.warn("usage: box <applet> [-flags] [args]");
   core.warn("  base32 base64 basename cat cp crc32 cut date dirname du echo false find");
-  core.warn("  fold get grep gunzip gzip head hex json ls mkdir mv nl paste rev rm rmdir");
-  core.warn("  seq serve sha256sum sha512sum shuf sort sponge stat strings tac tail tee");
-  core.warn("  touch tr true uniq unzstd urldecode urlencode uuid wc yes zstd");
+  core.warn("  fold get grep gunzip gzip head hex httpd json ls mkdir mv nl paste rev rm");
+  core.warn("  rmdir seq serve sha256sum sha512sum shuf sort split sponge stat strings");
+  core.warn("  tac tail tee touch tr true uniq unzstd urldecode urlencode uuid wc wget");
+  core.warn("  yes zstd");
   core.warn("flags: grep -ivnc   sort -ru   uniq -c   wc -lwc   head/tail/fold -N");
   core.warn("       cut -f<n> -d<c>   tr <set1> <set2>   mkdir -p   rm -rf   json -c");
-  core.warn("net:   get <host> [path] [-<port>] [-i]   serve [-<port>] [-o]");
+  core.warn("net:   get <host> [path] [-<port>] [-i]   wget <host> <path> <out>\n"
+            + "       serve [-<port>] [-o]   httpd [-<port>] [dir] [-o]");
   return 2;
 }
