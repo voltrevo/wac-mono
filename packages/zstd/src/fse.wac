@@ -406,8 +406,6 @@ export i32[] decompress(u8[] src, i32 maxSymbol, i32 maxLog, i32 maxOut) {
   }
 
   i32[] exact = i32[n]();
-  for (i32 i = 0; i < n; i++) {
-    exact[i] = out[i];
-  }
+  exact.copyFrom(out, 0, 0, n);
   return exact;
 }

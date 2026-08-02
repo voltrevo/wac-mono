@@ -84,9 +84,7 @@ export HuffTable readTable(u8[] src, i32 at) {
     if (header == 0) { trap; }
     if (at + 1 + header > src.len()) { trap; }
     u8[] blob = u8[header]();
-    for (i32 i = 0; i < header; i++) {
-      blob[i] = src[at + 1 + i];
-    }
+    blob.copyFrom(src, at + 1, 0, header);
     // 255 weights at most, so a stream that decodes to more stops on the array bound inside
     // `decompress` rather than being counted and rejected here.
     i32[] decoded = decompress(blob, 255, weightLog(), 255);

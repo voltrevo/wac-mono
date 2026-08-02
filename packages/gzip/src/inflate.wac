@@ -235,11 +235,19 @@ struct Window {
   void pushMatch(this, i32 src, i32 len) {
     if (this.len + len >= this.flushLimit) { this.emit(); }
     while (this.len + len > this.data.len()) { this.grow(); }
-    u8[] d = this.data;
     i32 at = src - this.base;
     i32 to = this.len;
-    for (i32 k = 0; k < len; k++) {
-      d[to + k] = d[at + k];
+
+    // The bulk copy moves like `memmove`, which is right when the ranges are apart and wrong
+    // when they overlap: a run wants the bytes this loop is writing, not the ones that were
+    // there before. Most matches are far enough back to take the fast path.
+    if (at + len <= to) {
+      this.data.copyFrom(this.data, at, to, len);
+    } else {
+      u8[] d = this.data;
+      for (i32 k = 0; k < len; k++) {
+        d[to + k] = d[at + k];
+      }
     }
     this.len = to + len;
   }
@@ -247,9 +255,7 @@ struct Window {
   /** Append `count` bytes of `src`, growing once rather than per byte. */
   void pushBytes(this, u8[] src, i32 start, i32 count) {
     while (this.len + count > this.data.len()) { this.grow(); }
-    for (i32 i = 0; i < count; i++) {
-      this.data[this.len + i] = src[start + i];
-    }
+    this.data.copyFrom(src, start, this.len, count);
     this.len += count;
     if (this.len >= this.flushLimit) { this.emit(); }
   }
@@ -258,9 +264,7 @@ struct Window {
     // `create` never starts below 64, so doubling cannot land under it.
     i32 cap = this.data.len() * 2;
     u8[] bigger = u8[cap]();
-    for (i32 i = 0; i < this.len; i++) {
-      bigger[i] = this.data[i];
-    }
+    bigger.copyFrom(this.data, 0, 0, this.len);
     this.data = bigger;
   }
 
@@ -283,15 +287,12 @@ struct Window {
     i32 keep = windowSize() + maxMatch();
     i32 n = this.len - keep;
     u8[] out = u8[n]();
-    for (i32 i = 0; i < n; i++) {
-      out[i] = this.data[i];
-    }
+    out.copyFrom(this.data, 0, 0, n);
     this.crc = crc32Update(this.crcTable, this.crc, out);
     this.sink!(out);
 
-    for (i32 i = 0; i < keep; i++) {
-      this.data[i] = this.data[n + i];
-    }
+    // A self-copy towards the front, which `memmove` semantics get right.
+    this.data.copyFrom(this.data, n, 0, keep);
     this.len = keep;
     this.base += n;
   }
@@ -301,9 +302,7 @@ struct Window {
     if (this.sink is null) { return; }
     if (this.len == 0) { return; }
     u8[] out = u8[this.len]();
-    for (i32 i = 0; i < this.len; i++) {
-      out[i] = this.data[i];
-    }
+    out.copyFrom(this.data, 0, 0, this.len);
     this.crc = crc32Update(this.crcTable, this.crc, out);
     this.sink!(out);
     this.base += this.len;
