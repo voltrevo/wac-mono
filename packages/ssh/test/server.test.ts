@@ -156,6 +156,67 @@ Deno.test({
 });
 
 Deno.test({
+  name: "an interactive session keeps its shell between lines",
+  ignore: !haveSshd,
+  sanitizeResources: false,
+  fn: async () => {
+    let s: Wacsshd | undefined;
+    try {
+      s = await startWacsshd();
+
+      // `ssh -T` asks for a shell and no pty, which is the case this server serves. Lines go in
+      // over the channel and each one runs as it arrives.
+      const r = await new Deno.Command("ssh", {
+        args: [
+          "-T", "-F", "/dev/null", "-i", `${s.dir}/clientkey`, "-p", String(s.port),
+          "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+          "-o", "BatchMode=yes", "claude@127.0.0.1",
+        ],
+        stdin: "piped",
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn();
+      const w = r.stdin.getWriter();
+      await w.write(new TextEncoder().encode(
+        "x=hello\n" +
+        "echo $x world\n" +
+        "seq 1 5 | wc -l\n" +
+        "echo state persists: $x\n"));
+      await w.close();
+      const out = await r.output();
+      const stdout = text(out.stdout);
+
+      // The middle assertion is the one that makes it a *session*: a variable set on the first
+      // line is still there on the fourth. Without one shell for the whole channel each line
+      // would start again and the last would print nothing.
+      const want = "hello world\n5\nstate persists: hello\n";
+      if (stdout !== want) {
+        throw new Error(`interactive session:\n  got  ${JSON.stringify(stdout)}\n  want ${JSON.stringify(want)}`);
+      }
+
+      // `exit` ends the session and its status becomes ssh's.
+      const bye = new Deno.Command("ssh", {
+        args: [
+          "-T", "-F", "/dev/null", "-i", `${s.dir}/clientkey`, "-p", String(s.port),
+          "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+          "-o", "BatchMode=yes", "claude@127.0.0.1",
+        ],
+        stdin: "piped",
+        stdout: "null",
+        stderr: "null",
+      }).spawn();
+      const bw = bye.stdin.getWriter();
+      await bw.write(new TextEncoder().encode("exit 6\n"));
+      await bw.close();
+      const byeStatus = await bye.status;
+      if (byeStatus.code !== 6) throw new Error(`exit 6 gave ${byeStatus.code}`);
+    } finally {
+      await stopWacsshd(s);
+    }
+  },
+});
+
+Deno.test({
   name: "our own client talks to our own server, both ends in wac",
   ignore: !haveSshd,
   sanitizeResources: false,

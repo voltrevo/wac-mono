@@ -345,6 +345,15 @@ export u8[] channelClose(i32 channel) {
   return w.take();
 }
 
+/** The name of a CHANNEL_REQUEST — `exec`, `shell`, `pty-req`, `env` — or empty. */
+export u8[] requestName(u8[] payload) {
+  Reader r = Reader.over(payload);
+  if (r.byte() != msgChannelRequest()) { return u8[0](); }
+  r.u32();
+  u8[] name = r.str();
+  return r.ok ? name : u8[0]();
+}
+
 /** The command out of a CHANNEL_REQUEST for `exec`, or empty when it is a different request. */
 export u8[] execCommand(u8[] payload) {
   Reader r = Reader.over(payload);
