@@ -52,6 +52,60 @@ export const i32[] ML_BITS = i32[](
   1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11,
   12, 13, 14, 15, 16);
 
+/**
+ * The FSE table and the code table, fused into one entry per state.
+ *
+ * Decoding one code used to be five loads: the symbol for this state, that symbol's baseline and
+ * extra-bit count, then this state's bit count and next-state base — each a separate array, each
+ * bounds-checked. Three codes per sequence made thirteen loads to produce three numbers, and the
+ * sequence loop is over half of decode time.
+ *
+ * Everything in those five is known once the table is built, so it is folded then instead: one
+ * `info` word plus one baseline, indexed by state directly. Six loads per sequence rather than
+ * thirteen. This is what zstd's own decoder does — its per-state entry carries the baseline and
+ * extra-bit count for exactly this reason.
+ *
+ * The cost is a pass over the table per block, which is bounded by 512 entries against thousands
+ * of sequences. A degenerate block — a new table for a handful of sequences — pays for it, which
+ * is why the RLE and Predefined modes exist and why blocks are not tiny in practice.
+ *
+ * `info` packs three fields that provably fit: extra bits reach 31 (offsets), state bit counts
+ * reach the accuracy log of 9, and a next-state base is under 512.
+ */
+struct Fused {
+  i32[] info;          // (extraBits << 24) | (nbBits << 16) | newState
+  i32[] base;          // the value baseline for the symbol this state stands for
+
+  Fused build(FseTable t, const i32[] codeBase, const i32[] codeBits, i32 maxSymbol) {
+    i32 size = t.symbol.len();
+    i32[] info = i32[size]();
+    i32[] base = i32[size]();
+    for (i32 s = 0; s < size; s++) {
+      i32 c = t.symbol[s];
+      // Checked here rather than per sequence. A table naming a code with no baseline is
+      // malformed, and rejecting it on sight beats reaching past the end of `codeBase` later.
+      if (c < 0 || c > maxSymbol) { trap; }
+      info[s] = (codeBits[c] << 24) | (t.nbBits[s] << 16) | t.newState[s];
+      base[s] = codeBase[c];
+    }
+    return Fused(info, base);
+  }
+
+  /** Offsets have no baseline table: code `n` means baseline `1 << n` with `n` extra bits. */
+  Fused buildOffset(FseTable t, i32 maxSymbol) {
+    i32 size = t.symbol.len();
+    i32[] info = i32[size]();
+    i32[] base = i32[size]();
+    for (i32 s = 0; s < size; s++) {
+      i32 c = t.symbol[s];
+      if (c < 0 || c > maxSymbol) { trap; }
+      info[s] = (c << 24) | (t.nbBits[s] << 16) | t.newState[s];
+      base[s] = 1 << c;
+    }
+    return Fused(info, base);
+  }
+}
+
 // The default distributions, used by a block that says Predefined and transmits no table.
 export const i32[] LL_DEFAULT = i32[](
   4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
@@ -201,6 +255,14 @@ export SeqTables decodeAndExecute(
   if (p >= end) { trap; }
   BackBits b = BackBits.create(src, p, end - p);
 
+  // Fuse the tables before decoding: see `Fused`. Built once per block, read once per sequence.
+  Fused fLL = Fused.build(ll, LL_BASE, LL_BITS, llMaxSymbol());
+  Fused fML = Fused.build(ml, ML_BASE, ML_BITS, mlMaxSymbol());
+  Fused fOF = Fused.buildOffset(of, ofMaxSymbol());
+  i32[] llInfo = fLL.info; i32[] llBase = fLL.base;
+  i32[] mlInfo = fML.info; i32[] mlBase = fML.base;
+  i32[] ofInfo = fOF.info; i32[] ofBase = fOF.base;
+
   // Initial states, in this order and no other.
   i32 sLL = initState(b, ll);
   i32 sOF = initState(b, of);
@@ -208,19 +270,18 @@ export SeqTables decodeAndExecute(
 
   i32 litAt = 0;
   for (i32 i = 0; i < n.count; i++) {
-    i32 llCode = symbolAt(ll, sLL);
-    i32 mlCode = symbolAt(ml, sML);
-    i32 ofCode = symbolAt(of, sOF);
-    if (llCode > llMaxSymbol() || mlCode > mlMaxSymbol() || ofCode > ofMaxSymbol()) { trap; }
+    i32 iLL = llInfo[sLL];
+    i32 iML = mlInfo[sML];
+    i32 iOF = ofInfo[sOF];
 
     // Extra bits: offset, then match length, then literal length.
     //
-    // The offset code needs no baseline table: code `n` means baseline `1 << n` with `n` extra
-    // bits. Note that includes code 0, whose value is 1 and not 0 — 1, 2 and 3 are the repeat
-    // slots, so the smallest code already means "the most recent offset".
-    i32 offsetValue = (1 << ofCode) + b.read(ofCode);
-    i32 matchLength = ML_BASE[mlCode] + b.read(ML_BITS[mlCode]);
-    i32 literalLength = LL_BASE[llCode] + b.read(LL_BITS[llCode]);
+    // The offset baseline is `1 << code` with `code` extra bits. Note that includes code 0, whose
+    // value is 1 and not 0 — 1, 2 and 3 are the repeat slots, so the smallest code already means
+    // "the most recent offset".
+    i32 offsetValue = ofBase[sOF] + b.read(iOF >>> 24);
+    i32 matchLength = mlBase[sML] + b.read(iML >>> 24);
+    i32 literalLength = llBase[sLL] + b.read(iLL >>> 24);
     if (b.left < 0) { trap; }
 
     i32 offset = resolveOffset(offsetValue, literalLength, reps);
@@ -231,18 +292,18 @@ export SeqTables decodeAndExecute(
     litAt += literalLength;
 
     if (offset <= 0 || offset > out.len) { trap; }   // a match reaching before the output
-    i32 src0 = out.len - offset;
-    // Byte at a time, deliberately: when the offset is shorter than the match the copy reads
-    // bytes this loop is writing, which is how a run is encoded.
-    for (i32 k = 0; k < matchLength; k++) {
-      out.push(out.get(src0 + k));
-    }
+    // `pushRepeat` rather than a `push(get(..))` loop: that spelling costs two calls and two
+    // bounds checks per matched byte, and matched bytes are most of the output. It keeps the
+    // byte-at-a-time loop for the overlapping case — when the offset is shorter than the match
+    // the copy must read bytes this loop is writing, which is how a run is encoded — and uses
+    // the bulk move for the rest.
+    out.pushRepeat(out.len - offset, matchLength);
 
     if (i + 1 < n.count) {
       // States advance literal length, match length, offset.
-      sLL = nextState(ll, sLL, b);
-      sML = nextState(ml, sML, b);
-      sOF = nextState(of, sOF, b);
+      sLL = (iLL & 0xFFFF) + b.read((iLL >>> 16) & 255);
+      sML = (iML & 0xFFFF) + b.read((iML >>> 16) & 255);
+      sOF = (iOF & 0xFFFF) + b.read((iOF >>> 16) & 255);
       if (b.left < 0) { trap; }
     }
   }

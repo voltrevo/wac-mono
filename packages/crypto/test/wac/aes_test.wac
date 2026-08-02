@@ -1,0 +1,176 @@
+// AES, and the two modes built on it, against the host and against FIPS.
+//
+// One file for the block cipher, CTR and GCM because the modes are the block cipher plus
+// bookkeeping, and a fault in the core shows up in all three at once — testing them apart
+// makes it harder to see which layer moved.
+//
+// `ref(mode, key, iv, aad, data)` is `node:crypto`, synchronously: ECB for a single block,
+// then CTR and GCM. ECB is not a mode anyone should use and is exactly right here — it is
+// the only way to ask a library for one bare block transform, which is the thing under
+// test.
+//
+// ## What each layer can get wrong
+//
+//   the block     the key schedule at 192 and 256 bits, where the expansion gains an extra
+//                 step that the 128-bit case does not exercise at all
+//   CTR           the counter's width and where it carries. Incrementing the whole IV as
+//                 one big number, rather than the last 32 or 128 bits, is right until the
+//                 low word wraps
+//   GCM           J0 for a nonce that is not 96 bits, which takes a different path
+//                 entirely — GHASH over the nonce rather than nonce||1
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { aesEncrypt, aesDecrypt } from "../../src/aes.wac";
+import { aesCtr } from "../../src/aesctr.wac";
+import { gcmEncrypt, gcmTag, gcmInc32 } from "../../src/aesgcm.wac";
+
+const i32 ECB = 0;
+const i32 CTR = 1;
+const i32 GCM = 2;
+
+u8[] unhex(string h) {
+  u8[] src = h.toBytes();
+  u8[] out = u8[src.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = nib(src[2 * i]) * 16 + nib(src[2 * i + 1]); }
+  return out;
+}
+i32 nib(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  trap;
+}
+u8[] fill(i32 n, i32 a, i32 b) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (i * a + b) & 0xFF; }
+  return out;
+}
+u8[] cat(u8[] a, u8[] b) {
+  u8[] o = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { o[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { o[a.len() + i] = b[i]; }
+  return o;
+}
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+export string test_fips_197_worked_examples() {
+  // Appendix B and C. Published values, so this is agreement with the standard rather
+  // than with another implementation.
+  T t = T.create();
+  t.eqBytes(aesEncrypt(unhex("2b7e151628aed2a6abf7158809cf4f3c"),
+                       unhex("3243f6a8885a308d313198a2e0370734")),
+            unhex("3925841d02dc09fbdc118597196a0b32"), "FIPS 197 appendix B");
+  t.eqBytes(aesEncrypt(unhex("000102030405060708090a0b0c0d0e0f"),
+                       unhex("00112233445566778899aabbccddeeff")),
+            unhex("69c4e0d86a7b0430d8cdb78070b4c55a"), "C.1, AES-128");
+  t.eqBytes(aesEncrypt(unhex("000102030405060708090a0b0c0d0e0f1011121314151617"),
+                       unhex("00112233445566778899aabbccddeeff")),
+            unhex("dda97ca4864cdfe06eaf70a0ec0d7191"), "C.2, AES-192");
+  t.eqBytes(aesEncrypt(unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"),
+                       unhex("00112233445566778899aabbccddeeff")),
+            unhex("8ea2b7ca516745bfeafc49904b496089"), "C.3, AES-256");
+  return t.report();
+}
+
+export string test_the_block_agrees_with_the_host(fn[u8[](i32, u8[], u8[], u8[], u8[])] ref) {
+  // All three key sizes, because the expansion gains a step at 192 and another at 256
+  // that the 128-bit path never runs.
+  T t = T.create();
+  i32[] keySizes = i32[](16, 24, 32);
+  for (i32 k = 0; k < keySizes.len(); k++) {
+    for (i32 i = 0; i < 8; i++) {
+      u8[] key = fill(keySizes[k], 7 + i, 3);
+      u8[] block = fill(16, 11 + i, 5);
+      u8[] got = aesEncrypt(key, block);
+      t.eqBytes(got, ref(ECB, key, u8[0](), u8[0](), block),
+                "AES-" + itoa64((keySizes[k] * 8) as i64) + " block " + itoa64(i as i64));
+      t.eqBytes(aesDecrypt(key, got), block, "and decryption inverts it");
+    }
+  }
+  return t.report();
+}
+
+export string test_ctr_agrees_and_the_counter_carries(fn[u8[](i32, u8[], u8[], u8[], u8[])] ref) {
+  T t = T.create();
+  i32[] keySizes = i32[](16, 24, 32);
+  i32[] lens = i32[](0, 1, 15, 16, 17, 31, 32, 33, 200);
+  for (i32 k = 0; k < keySizes.len(); k++) {
+    u8[] key = fill(keySizes[k], 5, 1);
+    u8[] iv = fill(16, 3, 9);
+    for (i32 li = 0; li < lens.len(); li++) {
+      u8[] data = fill(lens[li], 13, 2);
+      t.eqBytes(aesCtr(key, iv, data), ref(CTR, key, iv, u8[0](), data),
+                "ctr at " + itoa64(lens[li] as i64) + " bytes, key " +
+                itoa64((keySizes[k] * 8) as i64));
+    }
+  }
+
+  // The carry. An IV of all ones must wrap, and it must wrap the way the host does —
+  // incrementing the counter as one 128-bit number rather than only its low word is right
+  // until exactly here.
+  u8[] key = fill(16, 2, 4);
+  u8[] allOnes = u8[16]();
+  for (i32 i = 0; i < 16; i++) { allOnes[i] = 0xFF; }
+  u8[] data = fill(64, 17, 3);
+  t.eqBytes(aesCtr(key, allOnes, data), ref(CTR, key, allOnes, u8[0](), data),
+            "ctr wraps from an all-ones counter");
+
+  // And just below a 32-bit boundary, where a counter that carries only within the low
+  // word diverges on the fifth block.
+  u8[] nearWrap = u8[16]();
+  for (i32 i = 12; i < 16; i++) { nearWrap[i] = 0xFF; }
+  t.eqBytes(aesCtr(key, nearWrap, data), ref(CTR, key, nearWrap, u8[0](), data),
+            "ctr carries out of the low word");
+  return t.report();
+}
+
+export string test_gcm_agrees_including_the_short_nonce_path(fn[u8[](i32, u8[], u8[], u8[], u8[])] ref) {
+  // A 96-bit nonce is used directly as J0 || 1; anything else is GHASHed first, which is
+  // a different code path that most callers never take and most tests never reach.
+  T t = T.create();
+  i32[] ivLens = i32[](12, 8, 16, 60);
+  i32[] plainLens = i32[](0, 1, 16, 17, 64);
+  i32[] aadLens = i32[](0, 1, 16, 20);
+  u8[] key = fill(16, 9, 1);
+  for (i32 v = 0; v < ivLens.len(); v++) {
+    for (i32 p = 0; p < plainLens.len(); p++) {
+      for (i32 a = 0; a < aadLens.len(); a++) {
+        u8[] iv = fill(ivLens[v], 3, 7);
+        u8[] plain = fill(plainLens[p], 5, 11);
+        u8[] aad = fill(aadLens[a], 7, 13);
+        u8[] ct = gcmEncrypt(key, iv, plain);
+        u8[] tag = gcmTag(key, iv, aad, ct);
+        t.eqBytes(cat(ct, tag), ref(GCM, key, iv, aad, plain),
+                  "gcm iv " + itoa64(ivLens[v] as i64) +
+                  " plain " + itoa64(plainLens[p] as i64) +
+                  " aad " + itoa64(aadLens[a] as i64));
+      }
+    }
+  }
+  return t.report();
+}
+
+export string test_the_gcm_counter_wraps_at_32_bits() {
+  // GCM increments only the last four bytes and never carries into the rest of J0 — a
+  // deliberate difference from CTR, and one that only shows at the wrap.
+  T t = T.create();
+  u8[] ctr = u8[16]();
+  for (i32 i = 0; i < 12; i++) { ctr[i] = 0xAA; }
+  ctr[12] = 0xFF; ctr[13] = 0xFF; ctr[14] = 0xFF; ctr[15] = 0xFF;
+  gcmInc32(ctr);
+  bool topIntact = true;
+  for (i32 i = 0; i < 12; i++) { if (ctr[i] != 0xAA) { topIntact = false; } }
+  t.isTrue(topIntact, "the wrap does not touch the first twelve bytes");
+  for (i32 i = 12; i < 16; i++) { t.eqI32(ctr[i], 0, "and the low word is zero"); }
+
+  // An ordinary increment, so this is not merely testing that nothing happens.
+  u8[] plain = u8[16]();
+  plain[15] = 7;
+  gcmInc32(plain);
+  t.eqI32(plain[15], 8, "an ordinary increment advances the last byte");
+  return t.report();
+}

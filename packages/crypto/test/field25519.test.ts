@@ -1,19 +1,13 @@
-// GF(2^255 - 19) against JavaScript's BigInt.
+// The field against BigInt.
 //
-// The curve vectors in x25519.test.ts are the thing that matters, but they are a poor
-// way to *develop* field arithmetic: a ladder is 255 rounds of eleven operations, so a
-// wrong answer says only that something among two thousand multiplications was wrong.
-// This checks each operation on its own, which is the difference between a bug that
-// takes minutes and one that takes hours.
+// Kept rather than replaced by `test/wac/field25519_test.wac`, which checks the same
+// arithmetic by its own laws. Those laws, plus anchors naming the modulus, plus boundary
+// values around p, all pass when the carry is one pass short of complete — because a
+// non-canonical representative is congruent, so it satisfies every relation the field can
+// state about itself. An outside reference sees it immediately.
 //
-// BigInt is a real oracle rather than a restatement — a different representation
-// (arbitrary precision, base 2^64 internally) and a different reduction (a `%`), so
-// agreement is evidence about the limb arithmetic rather than about a shared idea of it.
-//
-// The values are deliberately weighted toward boundaries. Uniform random 255-bit numbers
-// never land near p, never hit a limb boundary, and never exercise the one-subtraction
-// case in `feToBytes`; the first version of the encoder was wrong for every input at or
-// above 2^25 and would have passed a purely random sweep of small numbers.
+// So the two are complements: the wac file covers breadth and the properties a reference
+// cannot state cheaply, and this covers representatives.
 
 import { wacBind } from "../../../harness/wacBind.ts";
 

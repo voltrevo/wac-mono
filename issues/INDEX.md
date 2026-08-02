@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0010](closed/0010-the-suite-is-red-in-wacc-and-tls-neither-caused-by-their-own-changes.md) | the suite is red in wacc and tls, neither caused by their own changes | bug | wrong answer |
 | [0009](open/0009-forty-two-exported-wac-functions-that-nothing-calls.md) | forty-two exported wac functions that nothing calls, across eight packages | bug | no error |
 | [0007](open/0007-json-throughput-bench-half-migrated-to-the-canonical-struct.md) | json's throughput bench is half-migrated to the Canonical struct and cannot run | bug | wrong answer |
 | [0005](open/0005-mutation-testing-found-54-untested-behaviours.md) | surviving mutants: behaviours nothing checks (crypto finished; tls at 75, five other packages unmeasured) | task | wrong answer |
