@@ -1,29 +1,41 @@
-// The worker side of the bridge: a synchronous call into the host, from a thread that
-// is allowed to block.
+// The worker side of the bridge: submit a call, and later collect its answer.
 //
 // This is what the capability closures are built from. A wac program calls
-// `caps.readFile(path)` as an ordinary function; the closure behind it calls `hostCall`,
-// which parks this thread until the main thread has done whatever asynchronous work the
-// operation needs. The wac frame stays on the stack throughout and never learns that
-// anything waited.
+// `caps.readFile(path)` and the closure behind it submits into a free slot and parks this
+// thread until the answer lands. The wac frame stays on the stack throughout and never
+// learns that anything waited.
 //
-// Only ever call this on a worker. `Atomics.wait` throws on a browser's main thread, and
+// Only ever call these on a worker. `Atomics.wait` throws on a browser's main thread, and
 // on Deno's it would block the very thread that has to answer — a deadlock rather than an
 // error, which is worse.
+//
+// **Submitting does not block.** That is the point of the split: a caller may put several
+// calls in flight and then wait for whichever finishes first. `hostCall` is a submit
+// followed immediately by a collect, and does exactly the same atomics the single-mailbox
+// version did — store the payload, publish, park — so nothing that does not overlap pays
+// for the ability to.
 
 import {
   type Bridge,
-  BUF,
+  DONE_SEQ,
   OP_CONTINUE,
-  REQ_LEN,
-  REQ_MORE,
-  REQ_OP,
-  REQ_SEQ,
-  RES_LEN,
-  RES_SEQ,
-  RES_STATUS,
+  OP_PUSH,
+  S_GEN,
+  S_OP,
+  S_REQ_LEN,
+  S_RES_LEN,
+  S_RES_STATUS,
+  S_STATUS,
+  SLOT_BUF,
+  SLOTS,
+  slotAt,
+  ST_CANCELLED,
+  ST_FREE,
+  ST_PENDING,
+  ST_READY,
   STATUS_ERR,
   STATUS_MORE,
+  SUBMIT_SEQ,
 } from "./layout.ts";
 
 const enc = new TextEncoder();
@@ -32,75 +44,190 @@ const dec = new TextDecoder();
 /** Raised when a capability reports failure. The message is the host's. */
 export class HostCallError extends Error {}
 
-/** One publish-and-park. Returns the host's status and a copy of its payload. */
-function roundTrip(
-  b: Bridge,
-  op: number,
-  payload: Uint8Array,
-  more: number,
-): { status: number; body: Uint8Array } {
-  b.req.set(payload, 0);
-  Atomics.store(b.ctrl, REQ_OP, op);
-  Atomics.store(b.ctrl, REQ_LEN, payload.length);
-  Atomics.store(b.ctrl, REQ_MORE, more);
+/**
+ * A call in flight.
+ *
+ * The generation is not decoration: slots are reused, and waiting on a ticket whose slot
+ * had been recycled would read whatever call now occupies it — which is the worst kind of
+ * bug, because the answer looks plausible.
+ */
+export type Ticket = { slot: number; gen: number };
 
-  // Loaded *before* the request is published: anything the host does afterwards
-  // changes this value, so a wait on it cannot sleep through the answer.
-  const seen = Atomics.load(b.ctrl, RES_SEQ);
-  Atomics.add(b.ctrl, REQ_SEQ, 1);
-  Atomics.notify(b.ctrl, REQ_SEQ);
+/** Publish a slot's state change and wake the host. */
+function ping(b: Bridge): void {
+  Atomics.add(b.ctrl, SUBMIT_SEQ, 1);
+  Atomics.notify(b.ctrl, SUBMIT_SEQ);
+}
 
-  while (Atomics.load(b.ctrl, RES_SEQ) === seen) {
-    Atomics.wait(b.ctrl, RES_SEQ, seen);
-  }
-
-  const status = Atomics.load(b.ctrl, RES_STATUS);
-  const len = Atomics.load(b.ctrl, RES_LEN);
-  // A copy: the next call overwrites the buffer.
-  return { status, body: b.res.slice(0, len) };
+/** Park until the host changes something, then look again. */
+function parkForHost(b: Bridge, seen: number): void {
+  Atomics.wait(b.ctrl, DONE_SEQ, seen);
 }
 
 /**
- * Perform one host call and block until it answers.
+ * Take a free slot, waiting for one if all are busy.
  *
- * Both directions chunk, and they have to. A response too large for the buffer arrives in
- * pieces: the host says `STATUS_MORE`, we take what is there and ask again with
- * `OP_CONTINUE`. A *request* too large goes out the same way, each piece but the last
- * flagged `REQ_MORE` and answered with an empty OK.
- *
- * Only the response half existed at first, which made the bridge quietly asymmetric: a
- * `readFile` of ten megabytes worked and a `writeFile` of two threw. Every applet whose
- * output is its input — `cat`, `gzip`, `hex` — died above a megabyte, and `cp` turned the
- * throw into "cannot write", blaming the destination for a limit in the transport.
+ * Waiting rather than failing is deliberate: a program submitting more than `SLOTS` calls
+ * is asking for more concurrency than the bridge has, and backpressure is the useful
+ * answer. An error here would have to be handled by waiting anyway.
  */
-export function hostCall(b: Bridge, op: number, payload: Uint8Array): Uint8Array {
-  // Everything but the last chunk of the request, if it needs more than one.
-  let sent = 0;
-  while (payload.length - sent > BUF) {
-    const ack = roundTrip(b, op, payload.subarray(sent, sent + BUF), 1);
-    if (ack.status === STATUS_ERR) throw new HostCallError(dec.decode(ack.body));
-    sent += BUF;
-  }
-
-  const parts: Uint8Array[] = [];
-  let nextOp = op;
-  let nextPayload = payload.subarray(sent);
-
+function claim(b: Bridge): number {
   for (;;) {
-    const { status, body } = roundTrip(b, nextOp, nextPayload, 0);
-    if (status === STATUS_ERR) throw new HostCallError(dec.decode(body));
-    parts.push(body);
-    if (status !== STATUS_MORE) break;
-    nextOp = OP_CONTINUE;
-    nextPayload = new Uint8Array(0);
+    const seen = Atomics.load(b.ctrl, DONE_SEQ);
+    for (let i = 0; i < SLOTS; i++) {
+      const at = slotAt(i);
+      if (Atomics.compareExchange(b.ctrl, at + S_STATUS, ST_FREE, ST_PENDING) === ST_FREE) {
+        return i;
+      }
+    }
+    parkForHost(b, seen);
   }
+}
+
+/** Park until this slot has an answer. */
+function awaitReady(b: Bridge, slot: number): void {
+  const at = slotAt(slot);
+  for (;;) {
+    const seen = Atomics.load(b.ctrl, DONE_SEQ);
+    if (Atomics.load(b.ctrl, at + S_STATUS) === ST_READY) return;
+    parkForHost(b, seen);
+  }
+}
+
+/** Give the slot back and move its generation on, so stale tickets read as expired. */
+function release(b: Bridge, slot: number): void {
+  const at = slotAt(slot);
+  Atomics.add(b.ctrl, at + S_GEN, 1);
+  Atomics.store(b.ctrl, at + S_STATUS, ST_FREE);
+  // Someone may be parked because every slot was busy.
+  Atomics.add(b.ctrl, DONE_SEQ, 1);
+  Atomics.notify(b.ctrl, DONE_SEQ);
+}
+
+/**
+ * Start a call. Returns without waiting for it.
+ *
+ * A payload larger than one slot goes in pieces: each but the last is flagged `OP_PUSH`
+ * and answered with an empty acknowledgement, and the handler runs on the last. Both
+ * directions have to chunk — a `readFile` of ten megabytes and a `writeFile` of two are
+ * the same problem, and until requests chunked, `cp` of a 2MB file reported "cannot write"
+ * and blamed the destination for a limit in the transport.
+ */
+export function submit(b: Bridge, op: number, payload: Uint8Array): Ticket {
+  const slot = claim(b);
+  const at = slotAt(slot);
+  const gen = Atomics.load(b.ctrl, at + S_GEN);
+  const buf = b.req(slot);
+
+  let sent = 0;
+  while (payload.length - sent > SLOT_BUF) {
+    buf.set(payload.subarray(sent, sent + SLOT_BUF), 0);
+    Atomics.store(b.ctrl, at + S_OP, OP_PUSH);
+    Atomics.store(b.ctrl, at + S_REQ_LEN, SLOT_BUF);
+    Atomics.store(b.ctrl, at + S_STATUS, ST_PENDING);
+    ping(b);
+    awaitReady(b, slot);
+    if (Atomics.load(b.ctrl, at + S_RES_STATUS) === STATUS_ERR) {
+      const msg = dec.decode(b.res(slot).slice(0, Atomics.load(b.ctrl, at + S_RES_LEN)));
+      release(b, slot);
+      throw new HostCallError(msg);
+    }
+    sent += SLOT_BUF;   // acknowledged; the host is waiting for the next piece
+  }
+
+  const tail = payload.subarray(sent);
+  buf.set(tail, 0);
+  Atomics.store(b.ctrl, at + S_OP, op);
+  Atomics.store(b.ctrl, at + S_REQ_LEN, tail.length);
+  Atomics.store(b.ctrl, at + S_STATUS, ST_PENDING);
+  ping(b);
+  return { slot, gen };
+}
+
+/** Whether the answer has landed. Never blocks. */
+export function isDone(b: Bridge, t: Ticket): boolean {
+  const at = slotAt(t.slot);
+  // An expired ticket counts as done: there is nothing left to wait for.
+  if (Atomics.load(b.ctrl, at + S_GEN) !== t.gen) return true;
+  return Atomics.load(b.ctrl, at + S_STATUS) === ST_READY;
+}
+
+/**
+ * Park until any of these has an answer, and say which.
+ *
+ * The wait is on `DONE_SEQ` rather than on a slot, because `Atomics.wait` takes one
+ * address: every completion bumps that counter and the waiter rescans. This is also what
+ * `poll` over sockets is — submit a `recv` on each and wait for whichever speaks first.
+ */
+export function waitAny(b: Bridge, tickets: Ticket[]): Ticket | null {
+  if (tickets.length === 0) return null;
+  for (;;) {
+    const seen = Atomics.load(b.ctrl, DONE_SEQ);
+    for (const t of tickets) if (isDone(b, t)) return t;
+    parkForHost(b, seen);
+  }
+}
+
+/**
+ * Wait for this call and take its answer, freeing the slot.
+ *
+ * A response too large for the slot arrives in pieces: the host says `STATUS_MORE`, we take
+ * what is there and ask again with `OP_CONTINUE`.
+ */
+export function collect(b: Bridge, t: Ticket): Uint8Array {
+  const at = slotAt(t.slot);
+  if (Atomics.load(b.ctrl, at + S_GEN) !== t.gen) {
+    throw new HostCallError("this call was already collected or cancelled");
+  }
+  const parts: Uint8Array[] = [];
+  for (;;) {
+    awaitReady(b, t.slot);
+    const status = Atomics.load(b.ctrl, at + S_RES_STATUS);
+    const len = Atomics.load(b.ctrl, at + S_RES_LEN);
+    const chunk = b.res(t.slot).slice(0, len);   // a copy: the slot gets reused
+    if (status === STATUS_ERR) {
+      release(b, t.slot);
+      throw new HostCallError(dec.decode(chunk));
+    }
+    parts.push(chunk);
+    if (status !== STATUS_MORE) break;
+    Atomics.store(b.ctrl, at + S_OP, OP_CONTINUE);
+    Atomics.store(b.ctrl, at + S_REQ_LEN, 0);
+    Atomics.store(b.ctrl, at + S_STATUS, ST_PENDING);
+    ping(b);
+  }
+  release(b, t.slot);
 
   if (parts.length === 1) return parts[0];
   const total = parts.reduce((n, p) => n + p.length, 0);
   const out = new Uint8Array(total);
-  let at = 0;
-  for (const p of parts) { out.set(p, at); at += p.length; }
+  let into = 0;
+  for (const p of parts) { out.set(p, into); into += p.length; }
   return out;
+}
+
+/**
+ * Stop caring about a call.
+ *
+ * **Detach, not abort.** The host may already be inside the work and cannot generally be
+ * interrupted; only where the underlying API takes an `AbortSignal` does anything actually
+ * stop. What this guarantees is that the answer is discarded and the slot comes back,
+ * which is what a caller that has given up needs.
+ */
+export function cancel(b: Bridge, t: Ticket): void {
+  const at = slotAt(t.slot);
+  if (Atomics.load(b.ctrl, at + S_GEN) !== t.gen) return;             // already gone
+  if (Atomics.load(b.ctrl, at + S_STATUS) === ST_READY) { release(b, t.slot); return; }
+  // The host frees it when the work lands. The generation moves now, so the ticket is dead
+  // from this side immediately.
+  Atomics.add(b.ctrl, at + S_GEN, 1);
+  Atomics.store(b.ctrl, at + S_STATUS, ST_CANCELLED);
+  ping(b);
+}
+
+/** Submit and collect, which is what a capability with no reason to overlap does. */
+export function hostCall(b: Bridge, op: number, payload: Uint8Array): Uint8Array {
+  return collect(b, submit(b, op, payload));
 }
 
 // ── Payload encoding ──────────────────────────────────────────────────────────
