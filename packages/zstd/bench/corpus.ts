@@ -117,6 +117,18 @@ export async function corpus(): Promise<Sample[]> {
     }
   }
 
+  // Tor directory data, if the operator has put it in the inbox. Worth having because nothing
+  // else here looks like it: rigid repeated structure — the same handful of field names, over
+  // and over — interleaved with base64 keys, which no matcher can touch and which an order-0
+  // code should shrink by a quarter on the alphabet alone.
+  const zip = await readIfPresent("/inbox/bootstrap.zip");
+  if (zip !== null) {
+    const micro = readStoredEntry(zip, "bootstrap/microdescs.txt");
+    if (micro !== null) add("tor microdescs", "/inbox/bootstrap.zip, first 2 MB", micro.subarray(0, 2 << 20));
+    const consensus = readStoredEntry(zip, "bootstrap/consensus-microdesc.txt");
+    if (consensus !== null) add("tor consensus", "/inbox/bootstrap.zip, first 2 MB", consensus.subarray(0, 2 << 20));
+  }
+
   // Already compressed, which must not expand and cannot compress.
   const wac = out.find(s => s.name === "wac source");
   if (wac !== undefined) {
@@ -134,6 +146,46 @@ async function gzip(data: Uint8Array): Promise<Uint8Array | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Read one stored entry from a zip, without inflating anything.
+ *
+ * Only the stored case, which is all this needs: the entry is the bytes, verbatim. Reading via
+ * the central directory rather than the local headers, because a local header may leave its
+ * sizes to a trailing data descriptor and the directory never does.
+ */
+function readStoredEntry(zip: Uint8Array, wanted: string): Uint8Array | null {
+  const v = new DataView(zip.buffer, zip.byteOffset, zip.byteLength);
+  // The end-of-directory record is last, after a comment of unknown length.
+  let eocd = -1;
+  for (let i = zip.length - 22; i >= 0 && i > zip.length - 70000; i--) {
+    if (v.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return null;
+
+  let at = v.getUint32(eocd + 16, true);
+  const count = v.getUint16(eocd + 10, true);
+  const dec = new TextDecoder();
+  for (let i = 0; i < count; i++) {
+    if (v.getUint32(at, true) !== 0x02014b50) return null;
+    const method = v.getUint16(at + 10, true);
+    const size = v.getUint32(at + 24, true);
+    const nameLen = v.getUint16(at + 28, true);
+    const extraLen = v.getUint16(at + 30, true);
+    const commentLen = v.getUint16(at + 32, true);
+    const localAt = v.getUint32(at + 42, true);
+    const name = dec.decode(zip.subarray(at + 46, at + 46 + nameLen));
+    if (name === wanted) {
+      if (method !== 0) return null;                      // stored only
+      const lNameLen = v.getUint16(localAt + 26, true);
+      const lExtraLen = v.getUint16(localAt + 28, true);
+      const start = localAt + 30 + lNameLen + lExtraLen;
+      return zip.subarray(start, start + size);
+    }
+    at += 46 + nameLen + extraLen + commentLen;
+  }
+  return null;
 }
 
 /** One line per sample, for printing above a table of results. */
