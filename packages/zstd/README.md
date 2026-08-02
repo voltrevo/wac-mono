@@ -79,6 +79,23 @@ config, a wasm module, a native executable, Tor directory data, and something al
 in all three languages and lose on binaries and on Tor's directory data. Already-compressed input
 does not expand.
 
+### The whole of the Tor bootstrap data
+
+The corpus takes 2 MB slices to stay quick. The full files, which is where an encoder bug was
+found that nothing smaller reached:
+
+| entry | raw | ours | ms | MB/s | gzip -6 | zstd -3 | zstd -19 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| microdescs | 38,213,719 | **4,039,712** | 1,139 | 33.6 | 16,899,870 | 3,247,759 | 2,317,304 |
+| consensus-microdesc | 3,422,706 | 902,519 | 250 | 13.7 | 849,782 | 818,482 | 728,222 |
+| authority-certs | 20,442 | 13,140 | 1 | 18.3 | 12,928 | 12,893 | 12,897 |
+
+38 MB of microdescriptors compresses to **a quarter of what gzip manages** and within 24% of
+`zstd -3`, at 34 MB/s. The bug: a literals section of 16 KiB or more uses the widest header form,
+five bytes with neither size on a byte boundary — and ours wrote six bytes with the fields in the
+wrong places. Every test passed, because no sample under 2 MB ever produced a literals section
+that large. `test/encode.test.ts` now builds inputs that land in each of the three widths.
+
 The Tor microdescriptors are the sample worth staring at: **a third of gzip's size**, because
 gzip's window is 32 KiB and the file repeats itself at far greater range than that, while ours
 reaches back a megabyte. It is also, at 1.30x, the furthest we are from `zstd -3`.
