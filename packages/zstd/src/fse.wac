@@ -231,6 +231,18 @@ FseTable build(i32[] counts, i32 maxSymbol, i32 log) {
 }
 
 /**
+ * A table for a symbol that is the only one there is.
+ *
+ * A block may say a code has exactly one symbol, in which case no table is transmitted and no
+ * bits are read — every state means that symbol and stays where it is. One state, zero bits.
+ */
+export FseTable rleTable(i32 symbol) {
+  i32[] sym = i32[1]();
+  sym[0] = symbol;
+  return FseTable(0, sym, i32[1](), i32[1](), 0);
+}
+
+/**
  * The data bitstream, read backwards from the end.
  *
  * The last byte's highest set bit marks where the data stops; everything above it is padding
