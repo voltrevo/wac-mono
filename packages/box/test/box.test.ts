@@ -1314,3 +1314,94 @@ Deno.test("diff agrees with the real one, unified output and exit status", async
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test("gets: TLS 1.3 in wac, against a real TLS server", async () => {
+  // `packages/tls` needed no changes for this. `tlsClientInit`/`tlsClientFeed` are a state
+  // machine over byte arrays — the same shape `packages/server` has — and a state machine
+  // is what a socket wants. The applet is the driver and nothing else.
+  //
+  // The server is Deno's own TLS stack with this repo's test certificate, so the handshake
+  // is against a real implementation rather than against the same code playing both parts.
+  // It runs as a *subprocess*: an in-process `Deno.listenTls` and this test runner do not
+  // compose, and chasing that is not what this test is for.
+  const built = await Deno.makeTempFile({ prefix: "wac-tls-" });
+  const dir = await Deno.makeTempDir({ prefix: "wac-tls-d-" });
+  try {
+    await buildApp(BOX, built, { read: true, net: true });
+    const data = `${Deno.cwd()}/packages/tls/test/data`;
+    // The trust store the client is handed: DER, because that is what a certificate is
+    // once the PEM armour is off.
+    await Deno.writeFile(`${dir}/ca.der`, pemToDer(await Deno.readTextFile(`${data}/ca.pem`)));
+    await Deno.writeFile(`${dir}/other.der`, pemToDer(await Deno.readTextFile(`${data}/other_ca.pem`)));
+
+    const body = "hello from a real TLS server\n";
+    await Deno.writeTextFile(`${dir}/server.ts`, `
+      const cert = await Deno.readTextFile(${JSON.stringify(`${data}/leaf.pem`)});
+      const key = await Deno.readTextFile(${JSON.stringify(`${data}/leaf.key`)});
+      const l = Deno.listenTls({ hostname: "127.0.0.1", port: Number(Deno.args[0]), cert, key });
+      console.error("listening on port " + Deno.args[0]);
+      try {
+        const conn = await l.accept();
+        await conn.read(new Uint8Array(4096));
+        await conn.write(new TextEncoder().encode(
+          "HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: ${body.length}" +
+          "\\r\\nConnection: close\\r\\n\\r\\n${body.trimEnd()}\\n"));
+        conn.close();
+      } catch { /* the client refused the certificate, which is a case below */ }
+      l.close();
+    `);
+
+    const startServer = async () => {
+      const port = freePort();
+      const p = new Deno.Command(Deno.execPath(), {
+        args: ["run", "-A", `${dir}/server.ts`, `${port}`],
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn();
+      await waitForListening(p, port);
+      p.stdout.cancel();
+      p.stderr.cancel();
+      return { port, p };
+    };
+
+    // `localhost` is in the certificate's SAN, and `ca.der` signed it.
+    const good = await startServer();
+    const ok = await new Deno.Command(built, {
+      args: ["gets", "localhost", "/", `${dir}/ca.der`, `-${good.port}`, "-i"],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    await good.p.status;
+    const out = new TextDecoder().decode(ok.stdout);
+    assertEquals(ok.code, 0, new TextDecoder().decode(ok.stderr));
+    assertEquals(out.includes("HTTP 200"), true, out.slice(0, 200));
+    assertEquals(out.trimEnd().endsWith(body.trimEnd()), true, out.slice(0, 300));
+
+    // The check is the point. A root that did not sign this certificate must fail, and
+    // fail *before* any application data — a client that verified after reading the body
+    // would pass a test that only looked at the exit code.
+    const bad = await startServer();
+    const refused = await new Deno.Command(built, {
+      args: ["gets", "localhost", "/", `${dir}/other.der`, `-${bad.port}`],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    await bad.p.status;
+    assertEquals(refused.code, 1, "an untrusted root must not connect");
+    assertEquals(refused.stdout.length, 0, "and must produce no body at all");
+    assertEquals(
+      new TextDecoder().decode(refused.stderr).includes("connection failed"),
+      true,
+      new TextDecoder().decode(refused.stderr),
+    );
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+/** The DER inside PEM armour. */
+function pemToDer(pem: string): Uint8Array {
+  const b64 = pem.split("\n").filter((l) => !l.startsWith("-----")).join("");
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
