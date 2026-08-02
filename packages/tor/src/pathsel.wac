@@ -181,3 +181,30 @@ export i32 choose(
   }
   return weightedChoice(eligible, r);
 }
+
+// ── Exit policies ────────────────────────────────────────────────────────────
+
+/**
+ * Whether an exit whose policy summary is `(isAccept, ranges)` will carry `port`.
+ *
+ * The summary in a microdescriptor is one word and a port list: `accept 80,443` or
+ * `reject 25,119,135-139`. Ranges are inclusive at both ends, and `ranges` is flattened
+ * as lo, hi, lo, hi.
+ *
+ * The polarity is the whole content of this function and the easy thing to get backwards.
+ * Reversed, a client sends traffic to exactly the exits that will refuse it — which looks
+ * like a flaky network rather than a bug, because the failure is a RELAY_END the client
+ * then retries elsewhere.
+ *
+ * An empty accept list permits nothing; an empty reject list permits everything. Both fall
+ * out of the loop, and both are the right answer: a relay that accepts no ports is not an
+ * exit, and one that rejects none is an open one.
+ */
+export bool portPermitted(bool isAccept, i32[] ranges, i32 port) {
+  if (ranges.len() % 2 != 0) { trap; }
+  bool listed = false;
+  for (i32 i = 0; i < ranges.len(); i += 2) {
+    if (port >= ranges[i] && port <= ranges[i + 1]) { listed = true; }
+  }
+  return isAccept ? listed : !listed;
+}

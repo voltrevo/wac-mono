@@ -12,7 +12,7 @@ import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import {
   weightedChoice, weightedBandwidths, positionWeight, pathAllows, sameSubnet16, choose,
-  positionGuard, positionMiddle, positionExit,
+  positionGuard, positionMiddle, positionExit, portPermitted,
 } from "../../src/pathsel.wac";
 
 /** Wgg Wgd Wge Wgm | Wmg Wmd Wme Wmm | Weg Wed Wee Wem */
@@ -251,5 +251,51 @@ export string test_a_fully_constrained_position_reports_no_candidate() {
           "only relay left shares the /16, so there is no candidate");
   t.eqI32(choose(weighted, i32[](0), addrs, fs, fo, true, 7), 1,
           "and waiving the rule finds it");
+  return t.report();
+}
+
+// ── Exit policies ────────────────────────────────────────────────────────────
+
+export string test_an_accept_policy_permits_only_what_it_lists() {
+  T t = T.create();
+  // accept 80,443,8000-8100
+  i32[] r = i32[](80, 80, 443, 443, 8000, 8100);
+  t.isTrue(portPermitted(true, r, 80), "80 is listed");
+  t.isTrue(portPermitted(true, r, 443), "443 is listed");
+  t.isTrue(portPermitted(true, r, 8000), "the low end of a range is inclusive");
+  t.isTrue(portPermitted(true, r, 8100), "and so is the high end");
+  t.isTrue(portPermitted(true, r, 8050), "as is the middle");
+  t.isTrue(!portPermitted(true, r, 79), "one below a single port");
+  t.isTrue(!portPermitted(true, r, 81), "one above it");
+  t.isTrue(!portPermitted(true, r, 7999), "one below a range");
+  t.isTrue(!portPermitted(true, r, 8101), "one above it");
+  t.isTrue(!portPermitted(true, r, 22), "and anything else");
+  return t.report();
+}
+
+export string test_a_reject_policy_permits_everything_it_does_not_list() {
+  // The same data read the other way. Stated as the exact complement, because getting the
+  // polarity backwards sends traffic to precisely the exits that will refuse it — and that
+  // looks like a flaky network, not a bug, since the client just retries elsewhere.
+  T t = T.create();
+  i32[] r = i32[](80, 80, 443, 443, 8000, 8100);
+  for (i32 p = 1; p < 9000; p += 7) {
+    t.isTrue(portPermitted(true, r, p) != portPermitted(false, r, p),
+             "accept and reject disagree at every port, including " + itoa64(p as i64));
+  }
+  t.isTrue(!portPermitted(false, r, 80), "reject 80 refuses 80");
+  t.isTrue(portPermitted(false, r, 22), "and permits 22");
+  return t.report();
+}
+
+export string test_the_degenerate_policies_are_the_right_way_round() {
+  T t = T.create();
+  i32[] none = i32[0]();
+  t.isTrue(!portPermitted(true, none, 80), "accept nothing permits nothing");
+  t.isTrue(portPermitted(false, none, 80), "reject nothing permits everything");
+  i32[] all = i32[](1, 65535);
+  t.isTrue(portPermitted(true, all, 1), "accept 1-65535 permits the first port");
+  t.isTrue(portPermitted(true, all, 65535), "and the last");
+  t.isTrue(!portPermitted(false, all, 443), "reject 1-65535 permits nothing");
   return t.report();
 }

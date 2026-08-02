@@ -10,8 +10,8 @@
 
 import type { Relay } from "../host/directory.ts";
 import {
-  currentGuard, markFailed, markWorking, parseWeights, PathChooser, resolveFamilies,
-  sampleGuards,
+  currentGuard, markFailed, markWorking, networkSeemsDown, parseWeights, PathChooser,
+  resolveFamilies, sampleGuards,
 } from "../host/path.ts";
 
 // Local, because the sandbox cannot reach jsr and the repo's other TypeScript tests do the
@@ -247,4 +247,155 @@ Deno.test("a relay with no onion key is never chosen, whatever its flags say", (
   for (let i = 0; i < 100; i++) {
     assert(chooser.pick(0, []) !== 0, "the keyless relay is not picked");
   }
+});
+
+// ── Exit policies ────────────────────────────────────────────────────────────
+
+const withPolicy = (r: Relay, isAccept: boolean, ranges: number[]): Relay =>
+  ({ ...r, exitPolicy: { isAccept, ranges } });
+
+Deno.test("an exit is chosen only if its policy carries the port", () => {
+  const relays = [
+    relay("g", "10.0.0.1", [...FLAGS, "Guard"], 1),
+    relay("m", "11.0.0.1", FLAGS, 2),
+    withPolicy(relay("web", "12.0.0.1", [...FLAGS, "Exit"], 3), true, [80, 80, 443, 443]),
+    withPolicy(relay("mail", "13.0.0.1", [...FLAGS, "Exit"], 4), true, [25, 25]),
+  ];
+  const chooser = new PathChooser(relays, consensusFor(relays));
+
+  for (let i = 0; i < 100; i++) {
+    const path = chooser.buildPath({ port: 443 });
+    if (path === null) throw new Error("no path for port 443");
+    assertEquals(path[2].nickname, "web", "only the exit that carries 443 is used");
+  }
+  for (let i = 0; i < 100; i++) {
+    const path = chooser.buildPath({ port: 25 });
+    if (path === null) throw new Error("no path for port 25");
+    assertEquals(path[2].nickname, "mail", "and only the one that carries 25");
+  }
+  assertEquals(
+    chooser.buildPath({ port: 22 }),
+    null,
+    "a port no exit carries is no path, not a path through an exit that will refuse it",
+  );
+});
+
+Deno.test("an Exit flag with no policy summary carries nothing", () => {
+  // The flag says the authorities saw it exit something; the summary says what. Reading a
+  // missing summary generously would send streams to relays that refuse them.
+  const relays = [
+    relay("g", "10.0.0.1", [...FLAGS, "Guard"], 1),
+    relay("m", "11.0.0.1", FLAGS, 2),
+    relay("e", "12.0.0.1", [...FLAGS, "Exit"], 3), // no exitPolicy
+  ];
+  const chooser = new PathChooser(relays, consensusFor(relays));
+  assertEquals(chooser.buildPath({ port: 80 }), null, "not chosen for a specific port");
+  assert(chooser.buildPath() !== null, "but usable when no port is named");
+});
+
+Deno.test("families declared in microdescriptors are picked up without being passed in", () => {
+  // The gap this closes: `resolveFamilies` was live code that no real data reached, because
+  // nothing ever populated the map it read from.
+  const relays = [
+    { ...relay("a", "10.0.0.1", [...FLAGS, "Guard"], 1), family: ["b"] },
+    { ...relay("b", "11.0.0.1", FLAGS, 2), family: ["a"] },
+    { ...relay("c", "12.0.0.1", [...FLAGS, "Exit"], 3) },
+  ];
+  const chooser = new PathChooser(relays, consensusFor(relays));
+  // a and b are family, so no path can hold both — and with only three relays there is
+  // then no three-hop path at all.
+  assertEquals(chooser.buildPath(), null, "the declared family is enforced");
+
+  // Break the mutuality and the family evaporates, so a path appears.
+  const oneSided = [{ ...relays[0], family: ["b"] }, { ...relays[1], family: [] }, relays[2]];
+  const permissive = new PathChooser(oneSided, consensusFor(oneSided));
+  assert(permissive.buildPath() !== null, "a one-sided claim does not exclude");
+});
+
+Deno.test("the guard set is consulted in order when one guard cannot serve the path", () => {
+  // The only exit for this port is also the first sampled guard. The right answer is to use
+  // the next guard, not to draw a new one: the sampled set is meant to stay small and
+  // stable, and topping it up whenever a path fails enlarges exposure on a condition an
+  // attacker can arrange.
+  const relays = [
+    withPolicy(relay("both", "10.0.0.1", [...FLAGS, "Guard", "Exit"], 1), true, [80, 80]),
+    relay("g2", "11.0.0.1", [...FLAGS, "Guard"], 2),
+    relay("m", "12.0.0.1", FLAGS, 3),
+  ];
+  const chooser = new PathChooser(relays, consensusFor(relays));
+
+  assertEquals(
+    chooser.pathThroughGuard(relays[0], { port: 80 }),
+    null,
+    "pinned to the guard that is also the only exit, there is no path",
+  );
+  const path = chooser.pathWithGuards([relays[0], relays[1]], { port: 80 });
+  if (path === null) throw new Error("no path from the guard set");
+  assertEquals(path.map((r) => r.nickname), ["g2", "m", "both"], "the second guard is used");
+});
+
+Deno.test("an empty guard set is no path rather than an unguarded one", () => {
+  const relays = guardRelays();
+  const chooser = new PathChooser(relays, consensusFor(relays));
+  assertEquals(chooser.pathWithGuards([]), null);
+});
+
+Deno.test("every guard failing at once is read as the network being down", () => {
+  // The property proposal 271 spends most of its length on. A captive portal fails all three
+  // guards; the client must not come back preferring its third, or an attacker who can make
+  // the network look broken for two minutes gets to choose which guard you end up on.
+  const chooser = new PathChooser(guardRelays(), CONSENSUS);
+  let state = sampleGuards(chooser, { sampled: [], failed: {} });
+  const fpOf = (r: Relay) =>
+    [...r.identity].map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+  const sampled = state.sampled.map((f) => guardRelays().find((r) => fpOf(r) === f)!);
+
+  const t0 = 1_000_000_000_000;
+  const first = currentGuard(chooser, state)!;
+  sampled.forEach((r, i) => state = markFailed(state, r, t0 + i * 1000));
+
+  assert(networkSeemsDown(state), "the conclusion is that the network is down");
+  assertEquals(state.failed, {}, "and the individual marks are dropped as unearned");
+  assertEquals(
+    currentGuard(chooser, state, t0 + 5000)!.nickname,
+    first.nickname,
+    "so the preferred guard is unchanged once the network returns",
+  );
+  assertEquals(state.sampled.length, 3, "and nothing new was sampled");
+});
+
+Deno.test("guards failing far apart are read as guards failing", () => {
+  // The same three failures spread over an afternoon mean something different: these really
+  // are dead relays, and the marks should stick.
+  const chooser = new PathChooser(guardRelays(), CONSENSUS);
+  let state = sampleGuards(chooser, { sampled: [], failed: {} });
+  const fpOf = (r: Relay) =>
+    [...r.identity].map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+  const sampled = state.sampled.map((f) => guardRelays().find((r) => fpOf(r) === f)!);
+
+  const t0 = 1_000_000_000_000;
+  const hour = 3600_000;
+  sampled.forEach((r, i) => state = markFailed(state, r, t0 + i * hour));
+
+  assert(!networkSeemsDown(state), "three failures hours apart are not an outage");
+  assertEquals(
+    Object.keys(state.failed).length,
+    3,
+    "each mark stands on its own",
+  );
+});
+
+Deno.test("one guard working settles that the network is up", () => {
+  const chooser = new PathChooser(guardRelays(), CONSENSUS);
+  let state = sampleGuards(chooser, { sampled: [], failed: {} });
+  const fpOf = (r: Relay) =>
+    [...r.identity].map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+  const sampled = state.sampled.map((f) => guardRelays().find((r) => fpOf(r) === f)!);
+
+  const t0 = 1_000_000_000_000;
+  sampled.forEach((r, i) => state = markFailed(state, r, t0 + i * 1000));
+  assert(networkSeemsDown(state));
+
+  state = markWorking(state, sampled[1]);
+  assert(!networkSeemsDown(state), "one reachable guard is proof the network is not down");
 });
