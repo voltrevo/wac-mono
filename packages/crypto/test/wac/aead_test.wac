@@ -1,0 +1,175 @@
+// Poly1305 and ChaCha20-Poly1305, against RFC 8439 and against the host's AEAD.
+//
+// One file, because Poly1305 exists here to be the AEAD's authenticator and its faults
+// only matter through that. The oracle is `node:crypto`'s chacha20-poly1305 — a whole
+// AEAD rather than a primitive this time, and deliberately: what the construction adds on
+// top of its two parts is the framing, and the framing is precisely what an independent
+// implementation of the *same* construction disagrees with you about if you get it wrong.
+//
+// ## The framing is the interesting part
+//
+// RFC 8439 §2.8 authenticates the AAD and the ciphertext, each padded to a multiple of
+// sixteen, followed by their two lengths as 64-bit little-endian counts. Those trailing
+// lengths are the whole reason a byte cannot be moved from the AAD into the ciphertext:
+// without them, `aad="ab", ct="cd"` and `aad="a", ct="bcd"` authenticate identically.
+// A round trip never notices, because both sides make the same mistake.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { poly1305 } from "../../src/poly1305.wac";
+import { aeadEncrypt, aeadTag } from "../../src/aead.wac";
+
+u8[] unhex(string h) {
+  u8[] src = h.toBytes();
+  u8[] out = u8[src.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = nib(src[2 * i]) * 16 + nib(src[2 * i + 1]); }
+  return out;
+}
+i32 nib(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  trap;
+}
+u8[] fill(i32 n, i32 a, i32 b) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (i * a + b) & 0xFF; }
+  return out;
+}
+u8[] cat(u8[] a, u8[] b) {
+  u8[] o = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { o[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { o[a.len() + i] = b[i]; }
+  return o;
+}
+
+u8[] aeadKey() {
+  return unhex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+}
+
+export string test_rfc_8439_poly1305() {
+  T t = T.create();
+  t.eqBytes(poly1305(unhex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"),
+                     "Cryptographic Forum Research Group".toBytes()),
+            unhex("a8061dc1305136c6c22b8baf0c0127a9"),
+            "RFC 8439 section 2.5.2");
+  return t.report();
+}
+
+export string test_poly1305_forced_carries() {
+  // The modulus is 2^130 - 5, so the accumulator sits just under a power of two and the
+  // reduction is where this goes wrong. An all-ones key and an all-ones message push the
+  // accumulator over the boundary on every block, which is the case a random test never
+  // reaches. No expected value: the assertion is that it produces sixteen bytes without
+  // trapping and that the result depends on the message, which a reduction that
+  // overflowed would break loudly.
+  T t = T.create();
+  u8[] ones = u8[32]();
+  for (i32 i = 0; i < 32; i++) { ones[i] = 0xFF; }
+  u8[] msgA = u8[64]();
+  for (i32 i = 0; i < 64; i++) { msgA[i] = 0xFF; }
+  u8[] msgB = u8[64]();
+  for (i32 i = 0; i < 64; i++) { msgB[i] = 0xFF; }
+  msgB[63] = 0xFE;
+  u8[] tagA = poly1305(ones, msgA);
+  u8[] tagB = poly1305(ones, msgB);
+  t.eqI32(tagA.len(), 16, "an all-ones key still produces a tag");
+  t.isFalse(same(tagA, tagB), "and one bit of the message changes it");
+
+  // r is clamped, so a key differing only in the clamped-away bits must give the same
+  // tag. That is a property of the spec rather than of our arithmetic, and it is the
+  // one an implementation that forgot to clamp fails.
+  u8[] k1 = fill(32, 7, 3);
+  u8[] k2 = u8[32]();
+  for (i32 i = 0; i < 32; i++) { k2[i] = k1[i]; }
+  k2[3] = k2[3] | 0xF0;      // top four bits of r's second word: clamped away
+  k2[7] = k2[7] | 0xF0;
+  k2[11] = k2[11] | 0xF0;
+  k2[15] = k2[15] | 0xF0;
+  u8[] m = "clamping is part of the definition".toBytes();
+  t.eqBytes(poly1305(k1, m), poly1305(k2, m), "the clamped bits of r do not matter");
+  return t.report();
+}
+
+export string test_rfc_8439_aead(fn[u8[](u8[], u8[], u8[], u8[])] ref) {
+  // §2.8.2's worked example, then the same inputs through the host.
+  T t = T.create();
+  u8[] key = aeadKey();
+  u8[] nonce = unhex("070000004041424344454647");
+  u8[] aad = unhex("50515253c0c1c2c3c4c5c6c7");
+  string plainText = "Ladies and Gentlemen of the class of '99: If I could offer you " +
+                     "only one tip for the future, sunscreen would be it.";
+  u8[] plain = plainText.toBytes();
+
+  u8[] ct = aeadEncrypt(key, nonce, plain);
+  t.eqBytes(ct,
+            unhex("d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6" +
+                  "3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36" +
+                  "92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc" +
+                  "3ff4def08e4b7a9de576d26586cec64b6116"),
+            "RFC 8439 2.8.2 ciphertext");
+  t.eqBytes(aeadTag(key, nonce, aad, ct), unhex("1ae10b594f09e26a7e902ecbd0600691"),
+            "RFC 8439 2.8.2 tag");
+
+  // And the host, which agrees only if the framing matches too.
+  u8[] host = ref(key, nonce, aad, cat(ct, aeadTag(key, nonce, aad, ct)));
+  t.eqBytes(host, plain, "the host decrypts what we sealed");
+  return t.report();
+}
+
+export string test_the_length_fields_stop_a_block_moving(fn[u8[](u8[], u8[], u8[], u8[])] ref) {
+  // The property the two trailing counts exist for, and it takes a whole block to expose.
+  //
+  // Moving a *byte* between the fields changes the padded content, so padding alone
+  // catches it — I wrote that test first and it passed with the length fields zeroed,
+  // which means it was testing padding and not the lengths. Moving a whole sixteen-byte
+  // block does not: `aad=A(16), ct=C(16)` and `aad=(), ct=A||C(32)` authenticate exactly
+  // the same 32 bytes with exactly the same padding, so only the counts tell them apart.
+  T t = T.create();
+  u8[] key = aeadKey();
+  u8[] nonce = unhex("070000004041424344454647");
+  u8[] a = fill(16, 3, 1);
+  u8[] c = fill(16, 5, 9);
+
+  u8[] split = aeadTag(key, nonce, a, c);          // aad = 16, ct = 16
+  u8[] joined = aeadTag(key, nonce, u8[0](), cat(a, c));   // aad = 0, ct = 32
+  t.isFalse(same(split, joined),
+            "a 16-byte block moved from the aad into the ciphertext changes the tag");
+
+  // The host agrees about which of the two is which, so this is not just our own opinion.
+  // `c` is arbitrary bytes rather than a real ciphertext, so what comes back is its
+  // decryption and not `c` itself — the assertion is that the tag verifies at all, which
+  // an empty return would deny.
+  t.eqI32(ref(key, nonce, a, cat(c, split)).len(), 16, "the host accepts the split framing");
+  t.eqI32(ref(key, nonce, u8[0](), cat(cat(a, c), split)).len(), 0,
+          "and rejects the same bytes framed the other way");
+  return t.report();
+}
+
+export string test_the_tag_covers_everything(fn[u8[](u8[], u8[], u8[], u8[])] ref) {
+  // Every input must move the tag, and the host must agree at every length — including
+  // the empty cases, where a construction that skipped padding for a zero-length field
+  // diverges from one that pads it to a full block of nothing.
+  T t = T.create();
+  u8[] key = aeadKey();
+  u8[] nonce = unhex("070000004041424344454647");
+  i32[] plainLens = i32[](0, 1, 15, 16, 17, 63, 64, 65);
+  i32[] aadLens = i32[](0, 1, 15, 16, 17);
+  for (i32 p = 0; p < plainLens.len(); p++) {
+    for (i32 a = 0; a < aadLens.len(); a++) {
+      u8[] plain = fill(plainLens[p], 5, 2);
+      u8[] aad = fill(aadLens[a], 11, 7);
+      u8[] ct = aeadEncrypt(key, nonce, plain);
+      u8[] tag = aeadTag(key, nonce, aad, ct);
+      t.eqBytes(ref(key, nonce, aad, cat(ct, tag)), plain,
+                "host agrees at plain " + itoa64(plainLens[p] as i64) +
+                " aad " + itoa64(aadLens[a] as i64));
+    }
+  }
+  return t.report();
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
