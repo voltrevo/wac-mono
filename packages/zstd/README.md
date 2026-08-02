@@ -67,16 +67,50 @@ Where that lands, measured on this container:
 | logs 448K | 448,270 | 41,451 | **24,745** | 11,836 |
 | random 300K | 300,000 | 300,023 | 300,113 | 300,018 |
 
-**Four times better than `gzip -6` where matches dominate, and worse than it where literals do.**
-That is exactly the shape you would predict from leaving literals raw: prose repeats itself, so
-almost everything is a match and the literals barely matter; json and logs carry a large body of
-distinct bytes that Huffman would roughly halve. Incompressible input does not expand, because
-every block falls back to raw when the compressed form is not smaller.
+Four times better than `gzip -6` where matches dominate, worse than it where they do not.
+Incompressible input does not expand, because a block falls back to raw when the compressed form
+is not smaller.
 
-So the next piece is Huffman literals, and it is worth about a factor of two on the samples where
-we currently lose. After that: repeat offsets (every offset here is written explicitly, which
-wastes bits on the common case of a match at the same distance as the last), lazy matching, and
-transmitted tables with per-block mode selection.
+### Where the bytes actually go
+
+Worth measuring rather than assuming — the obvious answer was wrong. On 925 KB of this repo's own
+source, which is more representative than a repeated phrase:
+
+| | size | ratio |
+|---|---:|---:|
+| ours | 347,805 | 2.72x |
+| zstd -1 | 309,243 | 3.06x |
+| gzip -6 | 268,471 | 3.53x |
+| zstd -3 | 272,498 | 3.48x |
+| **the matches we already find, coded ideally** | **~269,800** | **3.51x** |
+
+**The matches are not the problem.** Coding the sequences we already produce at the entropy of
+their own distributions would reach zstd -3 on this data. Broken down, per sequence:
+
+| | bits per sequence |
+|---|---:|
+| offset extra bits | 11.0 |
+| the three codes, at the entropy of their actual distributions | 8.1 |
+| length extra bits | 0.0 |
+
+and literals are **10 KB of a 925 KB input** — entropy-coding them would save around 4 KB of 348 KB.
+
+So the order is:
+
+1. **Transmitted FSE tables**, per block, fitted to that block's own distributions. The predefined
+   tables are generic and this is the whole gap: roughly 80 KB of 348 KB. Most of the machinery
+   already exists — `normalize`, `buildCTable` and `writeDescription` in `src/fseenc.wac` are
+   written and tested. What is missing is counting each block's symbols, choosing an accuracy log,
+   writing the three tables and setting the mode bits.
+2. **Repeat offsets**, whose value depends entirely on the data: 69% of offsets on structured log
+   lines would hit a repeat slot, against 3% on source and 6% on json. Cheap to add, and enormous
+   on exactly the data people compress most of.
+3. **Better matching.** `zstd -19` reaches 4.25x on the same input against `-3`'s 3.48x, purely by
+   parsing better. Our average match is 8.7 bytes with a greedy search 32 candidates deep; lazy
+   matching and a deeper chain are what raise that.
+4. **Huffman literals**, worth about 1% here. Note the interaction: a greedy matcher takes every
+   three-byte match it finds, which *minimises* literals. A better parser skips bad matches and
+   emits more of them, so this grows as (3) lands.
 
 Why that piece first, and not literals: measured on this container, entropy-coding the literals
 of a 102 KB prose sample gets it to 54 KB, while `zstd -3` gets it to 95 bytes. **Almost all of
