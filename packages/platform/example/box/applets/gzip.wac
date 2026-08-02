@@ -1,0 +1,15 @@
+// Compress standard input, or a file, to standard output.
+//
+// The reason `write` had to exist: this output is bytes, and `log` would have mangled it.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { gzipBest } from "../../../../gzip/src/gzip.wac";
+
+export i32 gzip(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  cli.write(gzipBest(in.bytes));
+  return 0;
+}

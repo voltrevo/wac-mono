@@ -1,0 +1,48 @@
+// Percent-encoding, as a URL path component would be written.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { withNewline } from "../lib/bytes.wac";
+import { encode, SET_PATH } from "../../../../url/src/percent.wac";
+
+export i32 urlencode(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  cli.write(withNewline(encode(escapePercent(trimNewline(in.bytes)), SET_PATH())));
+  return 0;
+}
+
+/**
+ * `%` itself, which the URL sets deliberately leave alone.
+ *
+ * That is right for a URL — a path being serialised may already contain valid escapes, and
+ * re-escaping them would corrupt it — but wrong for a filter handed arbitrary bytes, where
+ * a literal `%20` in the input has to survive as `%20` rather than come back as a space.
+ * `encode` will not touch the `2` and `5` this leaves behind, so doing it first is enough.
+ */
+u8[] escapePercent(u8[] b) {
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == '%') { n++; } }
+  if (n == 0) { return b; }
+  u8[] out = u8[b.len() + n * 2](fill: 0);
+  i32 at = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] != '%') { out[at] = b[i]; at++; continue; }
+    out[at] = '%';
+    out[at + 1] = '2';
+    out[at + 2] = '5';
+    at = at + 3;
+  }
+  return out;
+}
+
+/** A trailing newline is the shell's, not the datum's. */
+u8[] trimNewline(u8[] b) {
+  if (b.len() > 0 && b[b.len() - 1] == '\n') {
+    u8[] out = u8[b.len() - 1](fill: 0);
+    out.copyFrom(b, 0, 0, b.len() - 1);
+    return out;
+  }
+  return b;
+}

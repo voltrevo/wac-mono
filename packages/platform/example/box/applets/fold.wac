@@ -1,0 +1,37 @@
+// Lines wrapped at a width, eighty by default: `fold -40`.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { joinLines, splitLines } from "../lib/lines.wac";
+import { slice } from "../lib/bytes.wac";
+
+export i32 fold(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  i32 width = a.num == 0 ? 80 : a.num;
+
+  u8[][] lines = splitLines(in.bytes);
+  // Counted first: a line of length L becomes ceil(L/width) lines, and at least one.
+  i32 total = 0;
+  for (i32 i = 0; i < lines.len(); i++) {
+    i32 len = lines[i].len();
+    total = total + (len == 0 ? 1 : (len + width - 1) / width);
+  }
+
+  u8[][] out = u8[][total](fill: u8[0]());
+  i32 at = 0;
+  for (i32 i = 0; i < lines.len(); i++) {
+    u8[] line = lines[i];
+    if (line.len() == 0) { out[at] = line; at++; continue; }
+    i32 start = 0;
+    while (start < line.len()) {
+      i32 end = start + width < line.len() ? start + width : line.len();
+      out[at] = slice(line, start, end);
+      at++;
+      start = end;
+    }
+  }
+  cli.write(joinLines(out, at));
+  return 0;
+}

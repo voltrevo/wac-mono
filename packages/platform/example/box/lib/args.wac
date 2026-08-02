@@ -52,6 +52,28 @@ export Args parseArgs(Cli cli) {
   return Args(flags, num, rest);
 }
 
+/**
+ * The value of a flag that takes one, attached: the `,` of `-d,`.
+ *
+ * Read from argv rather than from the parsed flags, because a flag's *value* cannot be told
+ * from another flag once they are all letters in one string — `-iv` is two booleans and
+ * `-d,` is one flag with an argument, and only the original spelling knows which. An applet
+ * asks for the ones it defines, so no general rule has to guess.
+ *
+ * The detached spelling `-d ,` is deliberately absent. `parseArgs` would already have put
+ * the `,` among the positional arguments, where it is indistinguishable from a filename, so
+ * an applet that accepted it here would read one argument twice. An applet should treat the
+ * empty result as a usage error rather than guess, which is what `cut` does.
+ */
+export string flagValue(Cli cli, i32 letter) {
+  for (i32 i = 1; i < cli.argCount(); i++) {
+    u8[] b = cli.arg(i).toBytes();
+    if (b.len() < 2 || b[0] != '-' || b[1] != letter) { continue; }
+    if (b.len() > 2) { return string.fromBytes(slice(b, 2, b.len())); }
+  }
+  return "";
+}
+
 bool isFlag(string s) {
   u8[] b = s.toBytes();
   return b.len() > 1 && b[0] == '-';
