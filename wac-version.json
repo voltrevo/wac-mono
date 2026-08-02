@@ -11,8 +11,8 @@
     "See 'Keeping the compiler pin current' in README.md. Checked by",
     "harness/wacVersion.ts on the first wacBind of a run."
   ],
-  "commit": "a8a1bef889b8f2fc3336446dbaf7ffe367119f4c",
-  "shortCommit": "a8a1bef",
-  "reason": "parse: a keyword used as a name is reported as one, at the word (§wac-keyword-name-8wnq4kp)",
+  "commit": "00a83c6f6c6db6f3e8f80e2f91dfa90b4d2a1c0e",
+  "shortCommit": "00a83c6",
+  "reason": "bindgen: a module larger than ~120KB could not be emitted (\u00a7wac-bindgen-large-6wkq3np) \u2014 box hit it on importing zstd",
   "updated": "2026-08-02"
 }

@@ -779,3 +779,243 @@ Deno.test("line-oriented applets stream too, and stay faithful at the edges", as
   }
 });
 
+
+/**
+ * A port nobody is using, taken by binding one and letting go.
+ *
+ * A fixed number would collide with whatever else is on the machine, and these tests run
+ * in parallel with each other.
+ */
+function freePort(): number {
+  const l = Deno.listen({ port: 0 });
+  const n = (l.addr as Deno.NetAddr).port;
+  l.close();
+  return n;
+}
+
+/**
+ * Wait until the server says it is listening, by reading the line it prints.
+ *
+ * Deliberately not by connecting. `serve -o` handles exactly one connection, so a probe
+ * that dials the port *is* that connection — the first version of this test did that and
+ * then hung waiting for a server that had already served the probe and exited.
+ *
+ * Returns the stderr it consumed, so a caller can still assert on it afterwards.
+ */
+async function waitForListening(server: Deno.ChildProcess, port: number): Promise<string> {
+  const reader = server.stderr.getReader();
+  const dec = new TextDecoder();
+  let seen = "";
+  while (!seen.includes(`listening on port ${port}`)) {
+    const { value, done } = await reader.read();
+    if (done) throw new Error(`the server exited before listening: ${seen}`);
+    seen += dec.decode(value, { stream: true });
+  }
+  reader.releaseLock();
+  return seen;
+}
+
+Deno.test("box's network applets: a wac server and a wac client, over real TCP", async () => {
+  // The first applets that are not filters. `packages/server`'s `serve(input, now)` is a
+  // pure state machine — bytes in, a response and a consumed count out — so the socket
+  // loop is thirty lines and nothing in that package knows a socket exists.
+  //
+  // A free port is taken by binding one and letting go; a fixed number would collide with
+  // whatever else is on this machine, and these tests run in parallel with each other.
+  const built = await Deno.makeTempFile({ prefix: "wac-net-" });
+  try {
+    await buildApp(BOX, built, { net: true });
+    const port = freePort();
+
+    // `-o` serves one connection and exits. Not `-1`: a leading digit is how this argument
+    // parser spells a number, so `serve -8080 -1` set the port to 1 — which is how the
+    // first run of this ended up listening on port 1.
+    const server = new Deno.Command(built, {
+      args: ["serve", `-${port}`, "-o"],
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+
+    const listening = await waitForListening(server, port);
+    assertEquals(
+      listening.includes(`listening on port ${port}`),
+      true,
+      "it says where it is listening",
+    );
+    const conn = await Deno.connect({ hostname: "127.0.0.1", port });
+
+    await conn.write(new TextEncoder().encode(
+      `GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n`,
+    ));
+    const parts: Uint8Array[] = [];
+    const buf = new Uint8Array(4096);
+    for (;;) {
+      const n = await conn.read(buf);
+      if (n === null) break;
+      parts.push(buf.slice(0, n));
+    }
+    conn.close();
+    const reply = new TextDecoder().decode(
+      new Uint8Array(parts.flatMap((p) => Array.from(p))),
+    );
+    assertEquals(reply.startsWith("HTTP/1.1 200 OK\r\n"), true, reply.slice(0, 80));
+    assertEquals(reply.includes("wac http server"), true, reply.slice(0, 200));
+
+    assertEquals((await server.status).code, 0, "the server exited cleanly");
+    server.stdout.cancel();
+
+    // And the client half against the server half: two wac programs, one socket, no
+    // TypeScript in between. Started together — `serve` blocks in `accept` until `get`
+    // arrives, which is the whole point of a synchronous capability world.
+    const port2 = freePort();
+    const server2 = new Deno.Command(built, {
+      args: ["serve", `-${port2}`, "-o"],
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    await waitForListening(server2, port2);
+    const client = new Deno.Command(built, {
+      args: ["get", "127.0.0.1", "/", `-${port2}`, "-i"],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    const got = await client;
+    const body = new TextDecoder().decode(got.stdout);
+    assertEquals(got.code, 0, new TextDecoder().decode(got.stderr));
+    assertEquals(body.includes("HTTP 200"), true, body.slice(0, 120));
+    assertEquals(body.trimEnd().endsWith("wac http server"), true, body.slice(0, 200));
+    assertEquals((await server2.status).code, 0, "the second server exited cleanly");
+    server2.stdout.cancel();
+
+    // Without the grant, nothing — whatever the arguments say.
+    const noNet = await Deno.makeTempFile({ prefix: "wac-nonet-" });
+    try {
+      await buildApp(BOX, noNet, {});
+      const denied = new Deno.Command(noNet, {
+        args: ["get", "127.0.0.1", "/", `-${port}`],
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      assertEquals(denied.code, 1);
+      assertEquals(
+        new TextDecoder().decode(denied.stderr).includes("not granted"),
+        true,
+        new TextDecoder().decode(denied.stderr),
+      );
+    } finally {
+      await Deno.remove(noNet);
+    }
+  } finally {
+    await Deno.remove(built);
+  }
+});
+
+Deno.test("box's newest batch: sponge, zstd, json, stat, uuid, shuf, paste, yes", async () => {
+  const built = await Deno.makeTempFile({ prefix: "wac-b3-" });
+  const dir = await Deno.makeTempDir({ prefix: "wac-b3-d-" });
+  try {
+    await buildApp(BOX, built, { read: true, write: true });
+    const run = (args: string[]) => {
+      const r = new Deno.Command(built, { args, stdout: "piped", stderr: "piped" }).outputSync();
+      return { code: r.code, out: new TextDecoder().decode(r.stdout), err: new TextDecoder().decode(r.stderr) };
+    };
+    const pipe = async (args: string[], input: Uint8Array) => {
+      const c = new Deno.Command(built, { args, stdin: "piped", stdout: "piped", stderr: "piped" }).spawn();
+      const w = c.stdin.getWriter();
+      w.write(input).then(() => w.close());
+      return await c.output();
+    };
+    const enc = new TextEncoder();
+
+    // ── sponge: the applet that only exists because of the atomic write ──
+    // `box sort f | box sponge f` works where `sort f > f` cannot, because the shell
+    // truncates `f` before `sort` has read a byte of it. That is the whole point.
+    const target = `${dir}/inplace`;
+    const original = "delta\nalpha\ncharlie\nbravo\n";
+    await Deno.writeTextFile(target, original);
+    const sorter = new Deno.Command(built, { args: ["sort", target], stdout: "piped" }).outputSync();
+    const soak = await pipe(["sponge", target], sorter.stdout);
+    assertEquals(soak.code, 0, new TextDecoder().decode(soak.stderr));
+    assertEquals(await Deno.readTextFile(target), "alpha\nbravo\ncharlie\ndelta\n", "sorted in place");
+    // And no temporary file survived it.
+    const left: string[] = [];
+    for await (const e of Deno.readDir(dir)) left.push(e.name);
+    assertEquals(left.join(","), "inplace", `left behind: ${left}`);
+
+    // ── zstd: the largest package here, round-tripped ──
+    const raw = await Deno.readFile("README.md");
+    const squeezed = (await pipe(["zstd"], raw)).stdout;
+    assertEquals(squeezed.length < raw.length, true, "zstd did not compress");
+    assertSameBytes((await pipe(["unzstd"], squeezed)).stdout, raw, "zstd round trip");
+
+    // ── json: canonical output, and a real parse error ──
+    const canon = await pipe(["json", "-c"], enc.encode(`{"b":1,"a":[2, 3 ],"c":"x"}`));
+    assertEquals(new TextDecoder().decode(canon.stdout).trim(), `{"b":1,"a":[2,3],"c":"x"}`);
+    // Two spellings of the same document canonicalise identically, which is the property
+    // that makes this worth having on a pipe rather than a pretty-printer.
+    const spaced = await pipe(["json", "-c"], enc.encode(`{ "b" : 1 , "a" : [ 2 , 3 ] , "c" : "x" }`));
+    assertEquals(new TextDecoder().decode(spaced.stdout), new TextDecoder().decode(canon.stdout));
+    // Without -c it is a validator: silent and exit 0, so it composes in a test.
+    const valid = await pipe(["json"], enc.encode(`[1,2,3]`));
+    assertEquals(valid.code, 0);
+    assertEquals(valid.stdout.length, 0, "a validator says nothing");
+    const bad = await pipe(["json"], enc.encode(`{"a":}`));
+    assertEquals(bad.code, 1);
+    assertEquals(new TextDecoder().decode(bad.stderr).includes("invalid JSON at byte"), true);
+
+    // ── stat: the capability nothing surfaced ──
+    await Deno.writeTextFile(`${dir}/sized`, "12345");
+    const st = run(["stat", `${dir}/sized`, dir]);
+    assertEquals(st.code, 0, st.err);
+    const rows = st.out.trim().split("\n");
+    assertEquals(rows[0].includes(" file 5 "), true, rows[0]);
+    assertEquals(rows[1].includes(" directory "), true, rows[1]);
+    // The mtime is RFC 3339 and recent, which is `datetime` doing the work.
+    const when = Date.parse(rows[0].split(" ").pop()!);
+    assertEquals(Math.abs(when - Date.now()) < 120_000, true, rows[0]);
+    assertEquals(run(["stat", `${dir}/absent`]).code, 1, "a missing path is an error");
+
+    // ── uuid: version 4, and different every time ──
+    const ids = run(["uuid", "-20"]).out.trim().split("\n");
+    assertEquals(ids.length, 20);
+    for (const id of ids) {
+      assertEquals(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id),
+        true,
+        `not a v4 uuid: ${id}`,
+      );
+    }
+    assertEquals(new Set(ids).size, 20, "twenty draws should be twenty values");
+
+    // ── shuf: a permutation, not a sample ──
+    const lines = Array.from({ length: 200 }, (_, i) => `line${i}`);
+    await Deno.writeTextFile(`${dir}/lines`, lines.join("\n") + "\n");
+    const shuffled = run(["shuf", `${dir}/lines`]).out.trim().split("\n");
+    assertEquals(shuffled.length, 200);
+    assertEquals(shuffled.slice().sort().join(","), lines.slice().sort().join(","), "same lines");
+    assertEquals(shuffled.join(",") !== lines.join(","), true, "and in some other order");
+    assertEquals(run(["shuf", "-5", `${dir}/lines`]).out.trim().split("\n").length, 5);
+
+    // ── paste, against the real one ──
+    await Deno.writeTextFile(`${dir}/p1`, "a\nb\n");
+    await Deno.writeTextFile(`${dir}/p2`, "1\n2\n3\n");
+    const sys = new Deno.Command("paste", {
+      args: [`${dir}/p1`, `${dir}/p2`], stdout: "piped", stderr: "null",
+    }).outputSync();
+    assertEquals(run(["paste", `${dir}/p1`, `${dir}/p2`]).out, new TextDecoder().decode(sys.stdout));
+
+    // ── yes: the only applet that never ends on its own ──
+    // It stops because `write` reports the closed pipe. Without that answer it would spin,
+    // which is why `write` returns a bool at all.
+    const yes = new Deno.Command(built, { args: ["yes", "wac"], stdout: "piped", stderr: "null" }).spawn();
+    const reader = yes.stdout.getReader();
+    const first = await reader.read();
+    assertEquals(new TextDecoder().decode(first.value).startsWith("wac\nwac\n"), true);
+    await reader.cancel();
+    const status = await yes.status;
+    assertEquals(status.success || status.signal !== null, true, "yes stopped when the pipe closed");
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(dir, { recursive: true });
+  }
+});

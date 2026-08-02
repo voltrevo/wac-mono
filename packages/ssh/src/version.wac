@@ -1,0 +1,121 @@
+// The version exchange, RFC 4253 §4.2.
+//
+// Before any packet framing exists, both sides send a line of ASCII ending in CR LF:
+//
+//   SSH-2.0-softwareversion SP comments CR LF
+//
+// Two things about it are easy to get wrong and both are load-bearing later:
+//
+// **The server may send anything it likes first.** Lines that do not begin with `SSH-` are a
+// banner — legal notices, mostly — and must be skipped rather than treated as a protocol error.
+// A client that reads exactly one line works against every server that has no banner, which
+// during development is all of them.
+//
+// **The CR LF is not part of the version string.** Both sides' version strings go into the
+// exchange hash that the host key signs, without their line endings. Including them produces a
+// signature that verifies against nothing, at a point far enough from here that the cause is not
+// obvious.
+
+import { Buf } from "../../bytes/src/buf.wac";
+
+/** What this client announces. Anything after `SSH-2.0-` is free-form. */
+export u8[] clientVersion() {
+  Buf b = Buf.create();
+  // "SSH-2.0-wac_0.1", spelled as bytes because it goes on the wire and into a hash, and a
+  // string literal would invite an encoding question that does not exist here.
+  const u8[] V = u8[](
+    0x53, 0x53, 0x48, 0x2d, 0x32, 0x2e, 0x30, 0x2d,      // SSH-2.0-
+    0x77, 0x61, 0x63, 0x5f, 0x30, 0x2e, 0x31);           // wac_0.1
+  b.pushAll(V);
+  return b.take();
+}
+
+/** `clientVersion()` with the CR LF that goes on the wire but not into the hash. */
+export u8[] clientVersionLine() {
+  Buf b = Buf.create();
+  b.pushAll(clientVersion());
+  b.push(13);
+  b.push(10);
+  return b.take();
+}
+
+export enum Found {
+  Ok,
+  /** No complete `SSH-` line yet. Read more and call again. */
+  Incomplete,
+  /** A line was too long, or the peer sent something that cannot become a version line. */
+  Bad,
+}
+
+export struct Version {
+  Found status;
+  /** The peer's version string, CR LF stripped — this is what the exchange hash uses. */
+  u8[] line;
+  /** Bytes consumed, including any banner lines skipped and the CR LF. */
+  i32 used;
+}
+
+/** The longest a version line may be, RFC 4253 §4.2, including its CR LF. */
+i32 maxLine() { return 255; }
+
+/**
+ * Find the peer's version line in `src[at..end]`, skipping any banner before it.
+ *
+ * Tolerates a bare LF as well as CR LF. The RFC requires CR LF, but enough servers in the world
+ * send LF alone that refusing it buys nothing; the CR is stripped when present so the hash input
+ * is right either way.
+ */
+export Version scanVersion(u8[] src, i32 at, i32 end) {
+  if (at < 0 || end > src.len() || at > end) { return Version(Found.Bad, u8[0](), 0); }
+
+  i32 lineStart = at;
+  while (true) {
+    // Find the end of this line.
+    i32 nl = -1;
+    for (i32 i = lineStart; i < end; i++) {
+      if (src[i] == 10) { nl = i; break; }
+    }
+    if (nl < 0) {
+      // No complete line. A run this long that is still not a line never will be one.
+      if (end - lineStart >= maxLine()) { return Version(Found.Bad, u8[0](), 0); }
+      return Version(Found.Incomplete, u8[0](), 0);
+    }
+    if (nl - lineStart >= maxLine()) { return Version(Found.Bad, u8[0](), 0); }
+
+    i32 stop = nl;
+    if (stop > lineStart && src[stop - 1] == 13) { stop--; }      // drop the CR
+
+    // "SSH-" and nothing else starts a version line.
+    bool isVersion = stop - lineStart >= 4
+                  && src[lineStart] == 0x53 && src[lineStart + 1] == 0x53
+                  && src[lineStart + 2] == 0x48 && src[lineStart + 3] == 0x2d;
+    if (isVersion) {
+      i32 n = stop - lineStart;
+      u8[] line = u8[n]();
+      line.copyFrom(src, lineStart, 0, n);
+      return Version(Found.Ok, line, nl + 1 - at);
+    }
+    lineStart = nl + 1;      // a banner line; keep looking
+  }
+  trap;                      // unreachable: the loop only exits by returning
+}
+
+/**
+ * Whether a version line is a protocol version we can talk to.
+ *
+ * `SSH-2.0-` is the protocol. `SSH-1.99-` means a server that speaks both 1 and 2 and is willing
+ * to do 2, which is the same thing for our purposes.
+ */
+export bool speaksV2(u8[] line) {
+  const u8[] V20 = u8[](0x53, 0x53, 0x48, 0x2d, 0x32, 0x2e, 0x30, 0x2d);
+  const u8[] V199 = u8[](0x53, 0x53, 0x48, 0x2d, 0x31, 0x2e, 0x39, 0x39, 0x2d);
+  return startsWith(line, V20) || startsWith(line, V199);
+}
+
+bool startsWith(u8[] line, const u8[] prefix) {
+  if (line.len() < prefix.len()) { return false; }
+  for (i32 i = 0; i < prefix.len(); i++) {
+    if (line[i] != prefix[i]) { return false; }
+  }
+  return true;
+}

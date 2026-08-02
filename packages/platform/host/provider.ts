@@ -46,6 +46,7 @@ export function cliOf(
     Cli: PlatformClasses["Cli"];
     FileResult: { of(...a: unknown[]): unknown };
     Stat: { of(...a: unknown[]): unknown };
+    Socket: { of(...a: unknown[]): unknown };
   },
 ): unknown {
   const mk = {
@@ -142,7 +143,51 @@ export function cliOf(
         return e instanceof Error ? e.message : String(e);
       }
     },
+
+    // The network. A failure carries the host's message for the same reason `openInput`
+    // does: "connection refused" and "network not granted" are different problems.
+    (host: string, port: number) => {
+      const h = str(host);
+      const payload = new Uint8Array(4 + h.length);
+      payload.set(i32le(port), 0);
+      payload.set(h, 4);
+      return socketOf(b, cls.Socket, OP.CONNECT, payload);
+    },
+    (port: number) => socketOf(b, cls.Socket, OP.LISTEN, i32le(port)),
+    (handle: number) => socketOf(b, cls.Socket, OP.ACCEPT, i32le(handle)),
+    (handle: number) => {
+      try {
+        return hostCall(b, OP.RECV, i32le(handle));
+      } catch {
+        return new Uint8Array(0);   // a broken connection reads as a closed one
+      }
+    },
+    (handle: number, bytes: Uint8Array) => {
+      const payload = new Uint8Array(4 + bytes.length);
+      payload.set(i32le(handle), 0);
+      payload.set(bytes, 4);
+      try {
+        hostCall(b, OP.SEND, payload);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    (handle: number) => { try { hostCall(b, OP.CLOSE_SOCKET, i32le(handle)); } catch { /* already gone */ } },
   );
+}
+
+function socketOf(
+  b: Bridge,
+  cls: { of(...a: unknown[]): unknown },
+  op: number,
+  payload: Uint8Array,
+): unknown {
+  try {
+    return cls.of(readI32le(hostCall(b, op, payload)), "");
+  } catch (e) {
+    return cls.of(-1, e instanceof Error ? e.message : String(e));
+  }
 }
 
 /** An op whose only answer is whether it worked. */

@@ -1,0 +1,25 @@
+// Validate and re-serialize JSON. `-c` for canonical output, otherwise a parse check.
+//
+// The canonical form is what `packages/json` calls `canonicalize`: parse, then write back
+// out. Two documents that mean the same thing come out byte-identical, which is the
+// property that makes this worth having on a pipe rather than a pretty-printer.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args, has } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { itoa } from "../lib/num.wac";
+import { withNewline } from "../lib/bytes.wac";
+import { Canonical, canonicalize } from "../../../json/src/json.wac";
+
+export i32 json(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  Canonical c = canonicalize(in.bytes);
+  if (!c.ok) {
+    core.warn(a.name + ": invalid JSON at byte " + itoa(c.pos) + " (code " + itoa(c.code) + ")");
+    return 1;
+  }
+  // Without `-c` this is a validator: exit 0 and say nothing, so it composes in a test.
+  if (has(a, 'c')) { cli.write(withNewline(c.text)); }
+  return 0;
+}

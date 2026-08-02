@@ -23,9 +23,30 @@ export type NodeIo = {
   openFile(path: string): Promise<{ read(): Promise<Uint8Array>; close(): Promise<void> }>;
   /** A file opened for writing, truncated. */
   createFile(path: string): Promise<{ write(b: Uint8Array): Promise<void>; close(): Promise<void> }>;
+  /**
+   * The network, in the same shape Deno's is.
+   *
+   * Node's `net` is event-based, so the wrapper that gives it this shape lives in
+   * `entryNode.ts` where the module is actually available. What crosses here is already
+   * promise-shaped, which is all the bridge needs.
+   */
+  connect(host: string, port: number): Promise<NodeSock>;
+  listen(port: number): Promise<NodeListener>;
   writeStdout(bytes: Uint8Array): Promise<void>;
   stat(path: string): Promise<{ isFile: boolean; isDirectory: boolean; size: number; mtimeMillis: number }>;
   readDir(path: string): Promise<string[]>;
+};
+
+/** One connection, however the platform underneath spells it. */
+export type NodeSock = {
+  recv(): Promise<Uint8Array>;   // empty when the peer has closed
+  send(b: Uint8Array): Promise<void>;
+  close(): void;
+};
+
+export type NodeListener = {
+  accept(): Promise<NodeSock>;
+  close(): void;
 };
 
 export type NodeWorldOptions = {
@@ -33,6 +54,7 @@ export type NodeWorldOptions = {
   log?(line: string): void;
   warn?(line: string): void;
   fs?: { read?: boolean; write?: boolean };
+  net?: boolean;
   env?(name: string): string | undefined;
 };
 
@@ -61,6 +83,10 @@ export function nodeWorld(
   // The current streaming input; null means standard input. See the note in platform.wac.
   let source: { read(): Promise<Uint8Array>; close(): Promise<void> } | null = null;
   let sink: { write(b: Uint8Array): Promise<void>; close(): Promise<void> } | null = null;
+
+  const sockets = new Map<number, NodeSock>();
+  const listeners = new Map<number, NodeListener>();
+  let nextHandle = 1;
   const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
 
   return {
@@ -155,6 +181,48 @@ export function nodeWorld(
       if (path === "") return EMPTY;
       if (!opts.fs?.write) deny("filesystem write");
       sink = await io.createFile(path);
+      return EMPTY;
+    },
+
+    [OP.CONNECT]: async (p) => {
+      if (!opts.net) deny("network access");
+      const c = await io.connect(unstr(p.subarray(4)), readI32le(p));
+      const h = nextHandle++;
+      sockets.set(h, c);
+      return i32le(h);
+    },
+    [OP.LISTEN]: async (p) => {
+      if (!opts.net) deny("network access");
+      const l = await io.listen(readI32le(p));
+      const h = nextHandle++;
+      listeners.set(h, l);
+      return i32le(h);
+    },
+    [OP.ACCEPT]: async (p) => {
+      const l = listeners.get(readI32le(p));
+      if (l === undefined) throw new Error("not a listening socket");
+      const c = await l.accept();
+      const h = nextHandle++;
+      sockets.set(h, c);
+      return i32le(h);
+    },
+    [OP.RECV]: async (p) => {
+      const c = sockets.get(readI32le(p));
+      if (c === undefined) throw new Error("not an open socket");
+      return await c.recv();
+    },
+    [OP.SEND]: async (p) => {
+      const c = sockets.get(readI32le(p));
+      if (c === undefined) throw new Error("not an open socket");
+      await c.send(p.subarray(4));
+      return EMPTY;
+    },
+    [OP.CLOSE_SOCKET]: (p) => {
+      const h = readI32le(p);
+      try { sockets.get(h)?.close(); } catch { /* already closed */ }
+      try { listeners.get(h)?.close(); } catch { /* already closed */ }
+      sockets.delete(h);
+      listeners.delete(h);
       return EMPTY;
     },
 

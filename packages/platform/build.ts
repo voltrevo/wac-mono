@@ -34,11 +34,71 @@ function shebangFor(g: Grants, target: Target): string {
   const flags: string[] = [];
   if (g.read) flags.push("--allow-read");
   if (g.write) flags.push("--allow-write");
+  if (g.net) flags.push("--allow-net");
   if (g.env) flags.push("--allow-env");
   return `#!/usr/bin/env -S deno run${flags.length ? " " + flags.join(" ") : ""}\n`;
 }
 
-export type Grants = { read?: boolean; write?: boolean; env?: boolean };
+export type Grants = { read?: boolean; write?: boolean; env?: boolean; net?: boolean };
+
+/**
+ * Node's `net`, given the promise shape the world expects.
+ *
+ * Emitted into the launcher only when the network is granted, so a program without it has
+ * no `node:net` import at all — the same discipline as everything else here: an ungranted
+ * capability is absent rather than refused at the call.
+ *
+ * Data is queued rather than dropped. A `recv` that has not been called yet must not lose
+ * bytes the peer has already sent, so the socket is paused between reads and a waiter is
+ * parked only when the queue is empty.
+ */
+const NODE_NET = `
+import * as nodeNetMod from "node:net";
+
+function wrapSock(sock) {
+  const queue = [];
+  let ended = false;
+  let waiting = null;
+  const pump = () => {
+    if (waiting === null) return;
+    if (queue.length > 0) { const w = waiting; waiting = null; w(queue.shift()); return; }
+    if (ended) { const w = waiting; waiting = null; w(new Uint8Array(0)); }
+  };
+  sock.on("data", (c) => { queue.push(new Uint8Array(c)); pump(); });
+  sock.on("end", () => { ended = true; pump(); });
+  sock.on("close", () => { ended = true; pump(); });
+  sock.on("error", () => { ended = true; pump(); });
+  return {
+    recv: () => new Promise((res) => { waiting = res; pump(); }),
+    send: (b) => new Promise((res, rej) => sock.write(b, (e) => (e ? rej(e) : res()))),
+    close: () => sock.destroy(),
+  };
+}
+
+const nodeNet = {
+  connect: (host, port) =>
+    new Promise((res, rej) => {
+      const s = nodeNetMod.createConnection({ host, port }, () => res(wrapSock(s)));
+      s.once("error", rej);
+    }),
+  listen: (port) =>
+    new Promise((res) => {
+      const pending = [];
+      let waiting = null;
+      const server = nodeNetMod.createServer((s) => {
+        const w = wrapSock(s);
+        if (waiting !== null) { const k = waiting; waiting = null; k(w); } else { pending.push(w); }
+      });
+      server.listen(port, () => res({
+        accept: () => new Promise((k) => {
+          if (pending.length > 0) { k(pending.shift()); return; }
+          waiting = k;
+        }),
+        close: () => server.close(),
+      }));
+    }),
+};
+`;
 
 /** Which runtime the built program is for. */
 export type Target = "deno" | "node";
@@ -109,7 +169,8 @@ export async function buildApp(
     const launcher = target === "node"
       ? await bundle(
         "launcher",
-        `import { runLauncherNode } from "${nodeRuntime}";\n` +
+        (grants.net === true ? NODE_NET : "") +
+          `import { runLauncherNode } from "${nodeRuntime}";\n` +
           `import * as wt from "node:worker_threads";\n` +
           `import { readFile, writeFile, stat, readdir, mkdir, rm, rename, open } from "node:fs/promises";\n` +
           `await runLauncherNode(\n` +
@@ -118,6 +179,7 @@ export async function buildApp(
           `  process as unknown as Parameters<typeof runLauncherNode>[2],\n` +
           `  ${JSON.stringify(workerSource)},\n` +
           `  ${JSON.stringify(grants)},\n` +
+          (grants.net === true ? `  nodeNet,\n` : ``) +
           `);\n`,
       )
       : await bundle(
@@ -141,7 +203,8 @@ if (import.meta.main) {
   if (entry === undefined) {
     console.error(
       "usage: deno task app:build <entry.wac> [-o output] " +
-        "[--allow-read] [--allow-write] [--allow-env] [--target deno|node]\n\n" +
+        "[--allow-read] [--allow-write] [--allow-env] [--allow-net]\n" +
+      "                        [--target deno|node]\n\n" +
         "The grants are baked in: the built program takes no permission flags of its own,\n" +
         "and every argument it is given goes to the application.",
     );
@@ -150,6 +213,7 @@ if (import.meta.main) {
   const grants: Grants = {
     read: argv.includes("--allow-read"),
     write: argv.includes("--allow-write"),
+    net: argv.includes("--allow-net"),
     env: argv.includes("--allow-env"),
   };
   const ti = argv.indexOf("--target");

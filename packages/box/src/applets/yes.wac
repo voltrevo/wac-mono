@@ -1,0 +1,23 @@
+// The argument, forever. `y` when there is none.
+//
+// Not a joke entry: it is the only applet that never terminates, which makes it the one
+// that shows `write` reporting a closed pipe. `yes | head -3` ends because `head` exits
+// and the next write fails — without that answer this would spin.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+
+export i32 yes(Core core, Cli cli, Args a) {
+  string line = a.rest.len() > 0 ? a.rest[0] : "y";
+  for (i32 i = 1; i < a.rest.len(); i++) { line = line + " " + a.rest[i]; }
+  u8[] one = (line + "\n").toBytes();
+
+  // A block of them, so the cost is one host call per few thousand lines rather than per
+  // line. The bridge is a round trip; `yes` is the only applet where that dominates.
+  i32 per = 4096;
+  u8[] block = u8[one.len() * per](fill: 0);
+  for (i32 i = 0; i < per; i++) { block.copyFrom(one, 0, i * one.len(), one.len()); }
+
+  while (cli.write(block)) { }
+  return 0;
+}

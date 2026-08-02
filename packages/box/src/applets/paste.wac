@@ -1,0 +1,30 @@
+// Lines from two files side by side, separated by a tab.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { joinLines, splitLines } from "../lib/lines.wac";
+import { concat } from "../lib/bytes.wac";
+
+export i32 paste(Core core, Cli cli, Args a) {
+  if (a.rest.len() < 2) { core.warn("usage: " + a.name + " <file1> <file2>"); return 2; }
+  Input x = readInput(core, cli, a, 0);
+  if (!x.ok) { return 1; }
+  Input y = readInput(core, cli, a, 1);
+  if (!y.ok) { return 1; }
+
+  u8[][] left = splitLines(x.bytes);
+  u8[][] right = splitLines(y.bytes);
+  // The longer file decides the line count; the shorter contributes empty strings, which
+  // is what the real one does rather than stopping early.
+  i32 n = left.len() > right.len() ? left.len() : right.len();
+  u8[][] out = u8[][n](fill: u8[0]());
+  u8[] tab = u8[1](fill: '\t');
+  for (i32 i = 0; i < n; i++) {
+    u8[] l = i < left.len() ? left[i] : u8[0]();
+    u8[] r = i < right.len() ? right[i] : u8[0]();
+    out[i] = concat(concat(l, tab), r);
+  }
+  cli.write(joinLines(out, n));
+  return 0;
+}
