@@ -1,0 +1,15 @@
+// Tor's key expansion, which is HKDF-Expand and not the HKDF this repo already has.
+//
+// `crypto/hkdf.wac` implements RFC 5869 as extract-then-expand, and offers the two halves
+// separately. ntor does its own extract — `KEY_SEED = HMAC(t_key, secret_input)` — and
+// then expands, so what is needed here is the expand step alone against a PRK somebody
+// else produced. That is `hkdfExpand` in the crypto package, and this is a thin alias with
+// a name that says which spec is asking, so a reader of tor code is not left wondering
+// whether Tor uses a different construction. It does not.
+
+import { hkdfExpand } from "../../crypto/src/hkdf.wac";
+
+/** RFC 5869 HKDF-Expand with SHA-256, which tor-spec calls KDF-RFC5869. */
+export u8[] hkdfExpandRfc5869(u8[] prk, u8[] info, i32 length) {
+  return hkdfExpand(prk, info, length);
+}
