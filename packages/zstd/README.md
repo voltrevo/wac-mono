@@ -21,7 +21,7 @@ what zstd's own encoder produces and comparing bytes.
 | Sequences: all four modes per code, and the repeat offsets | done |
 | Content checksum (XXH64) | verified, not skipped |
 | Dictionaries | **not implemented** |
-| Compression | **started**: FSE encoding only — see below |
+| Compression | **works**: valid frames zstd decompresses — see below for how good |
 
 ### What "not implemented" means here
 
@@ -53,9 +53,30 @@ and no ordinary encoder emits one unasked. They exist for the opposite case: man
 that share structure, where the shared part is longer than the message. If that is the use, this
 package cannot serve it; if it is not, nothing here is missing.
 
-**Compression.** `src/fseenc.wac` is the first piece: count normalisation, encoding-table
-construction, the backwards bit writer, and table description writing. Nothing yet produces a
-frame.
+**Compression.** `src/encode.wac` produces valid zstd frames — Node's zstd decompresses every
+one of them back to the input, across a corpus and a fuzzer. It finds matches greedily, leaves
+literals uncompressed, and codes every sequence with the format's predefined FSE tables, so it
+never transmits a table of its own.
+
+Where that lands, measured on this container:
+
+| sample | raw | ours | gzip -6 | zstd -3 |
+|---|---:|---:|---:|---:|
+| prose 102K | 102,000 | **110** | 451 | 95 |
+| json 132K | 131,781 | 23,502 | **16,313** | 6,681 |
+| logs 448K | 448,270 | 41,451 | **24,745** | 11,836 |
+| random 300K | 300,000 | 300,023 | 300,113 | 300,018 |
+
+**Four times better than `gzip -6` where matches dominate, and worse than it where literals do.**
+That is exactly the shape you would predict from leaving literals raw: prose repeats itself, so
+almost everything is a match and the literals barely matter; json and logs carry a large body of
+distinct bytes that Huffman would roughly halve. Incompressible input does not expand, because
+every block falls back to raw when the compressed form is not smaller.
+
+So the next piece is Huffman literals, and it is worth about a factor of two on the samples where
+we currently lose. After that: repeat offsets (every offset here is written explicitly, which
+wastes bits on the common case of a match at the same distance as the last), lazy matching, and
+transmitted tables with per-block mode selection.
 
 Why that piece first, and not literals: measured on this container, entropy-coding the literals
 of a 102 KB prose sample gets it to 54 KB, while `zstd -3` gets it to 95 bytes. **Almost all of
@@ -181,6 +202,7 @@ encoder stops choosing one, the test says so instead of quietly testing less.
 | `src/block.wac` | a compressed block: literals, sequences, and what carries between blocks |
 | `src/xxh64.wac` | the content checksum |
 | `src/fseenc.wac` | FSE encoding: normalisation, encoding tables, the backwards bit writer |
+| `src/encode.wac` | the compressor: matching, sequences, blocks, frames |
 | `test/oracle.mjs` | Node's zstd, both directions, one subprocess per run |
 | `test/frame.test.ts` | against encoder output, and hand-built frames Node validates |
 | `test/fse.test.ts` | the three checks above |
@@ -188,6 +210,7 @@ encoder stops choosing one, the test says so instead of quietly testing less.
 | `test/decode.test.ts` | whole frames against Node, and which codings were reached |
 | `test/xxh64.test.ts` | the published vectors |
 | `test/fseenc.test.ts` | encode, then decode with the decoder that reads real frames |
+| `test/encode.test.ts` | our frames, decompressed by zstd itself |
 | `test/frames.ts` | walking a real frame to find its FSE-coded pieces |
 | `test/writer.ts` | the description writer, for round-tripping |
 | `cov.ts` | `deno task coverage:zstd` — 100% of branches |

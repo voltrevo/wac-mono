@@ -645,18 +645,101 @@ function encodeRoundTrip(symbols: number[], maxSymbol: number, maxLog: number): 
   }
 }
 
+// ── The encoder ───────────────────────────────────────────────────────────────
+//
+// Driven over the shapes an encoder actually branches on: nothing to match, everything matching,
+// lengths that land on a block boundary or the last few bytes, and incompressible input where
+// every block falls back to raw.
+
+const encoder = await instrument("packages/zstd/src/encode.wac");
+const en = encoder.mod as unknown as { compress(d: Uint8Array): Uint8Array };
+
+{
+  const t = new TextEncoder();
+  const noise = (n: number, seed: number) => {
+    const o = new Uint8Array(n);
+    let x = seed;
+    for (let i = 0; i < n; i++) {
+      x ^= x << 13; x >>>= 0;
+      x ^= x >>> 17;
+      x ^= x << 5; x >>>= 0;
+      o[i] = x & 0xff;
+    }
+    return o;
+  };
+
+  for (
+    const d of [
+      new Uint8Array(0), t.encode("x"), t.encode("ab"), t.encode("abc"),
+      t.encode("abcdefghijklmnop"), t.encode("abcabc"), t.encode("xyzabcabc"),
+      t.encode("hello hello hello hello world"),
+      t.encode("the quick brown fox jumps over the lazy dog. ".repeat(300)),
+      new Uint8Array(50000).fill(0x61),
+      noise(200000, 7),
+      // Every literal-length and match-length code width: short runs between long ones.
+      t.encode(("z".repeat(300) + "abcdefghijklmnopqrstuvwxyz").repeat(60)),
+      // Past a block, exactly a block, and one over.
+      t.encode("Lorem ipsum dolor sit amet. ".repeat(9000)),
+      noise(131072, 3), noise(131073, 5),
+      new Uint8Array([...t.encode("aaaa".repeat(20000)), ...noise(60000, 11)]),
+      new Uint8Array(Array.from({ length: 100000 }, (_, i) => i & 0xff)),
+      // Literal runs long enough to need each of the three raw-literals header widths.
+      noise(20, 1), noise(3000, 2), noise(9000, 4),
+    ]
+  ) {
+    ignoringTraps(() => en.compress(d));
+  }
+
+  // Longer than the window, so a candidate is found beyond it and rejected.
+  {
+    const far = new Uint8Array(1300000);
+    const mark = t.encode("a distinctive phrase that will be looked for later. ");
+    far.set(mark, 0);
+    for (let i = mark.length; i < far.length - mark.length; i++) far[i] = 0x41 + (i % 23);
+    far.set(mark, far.length - mark.length);
+    ignoringTraps(() => en.compress(far));
+  }
+
+  // Sequence counts across the one-, two- and three-byte forms. The widest needs more than
+  // 32512 sequences in a single block, which means a match every four bytes or so: three bytes
+  // that repeat, then one that does not.
+  // The literal between matches has to be *unpredictable*, not merely varying: a cycling byte
+  // makes the whole cycle repeat, the matcher finds the cycle rather than the three bytes, and
+  // a block ends up with a handful of long sequences instead of tens of thousands of short ones.
+  for (const reps of [40, 3000, 45000]) {
+    const rnd = noise(reps, 12345);
+    const out = new Uint8Array(reps * 4);
+    for (let i = 0; i < reps; i++) {
+      out[i * 4] = 0x61;
+      out[i * 4 + 1] = 0x62;
+      out[i * 4 + 2] = 0x63;
+      out[i * 4 + 3] = rnd[i];
+    }
+    ignoringTraps(() => en.compress(out));
+  }
+}
+
 /**
- * Branches that no input can reach, with the argument for each.
+ * Branches this run does not cover, each with the reason and whether it is provable.
  *
- * Excluded rather than counted as covered: a guard that cannot fire is still worth keeping when
- * what it guards is worse than a wrong answer, but pretending a test reached it would make the
- * number meaningless. Both entries below are checked against the source, so moving the code
- * without moving the entry fails loudly instead of silently excluding the wrong line.
+ * Two different claims, kept apart on purpose:
+ *
+ *   - `proven: true` — no input can reach it. A guard that cannot fire is still worth keeping
+ *     when what it guards is worse than a wrong answer, but counting it as covered would make
+ *     the number meaningless;
+ *   - `proven: false` — reachable, and we did not manage to construct the input. That is a gap,
+ *     not an exemption, and saying so is the whole point of the distinction. Reading a list of
+ *     "unreachable" branches that quietly includes merely-difficult ones is how a coverage
+ *     number stops meaning anything.
+ *
+ * Every entry is checked against the source, so moving the code without moving the entry fails
+ * loudly rather than silently excluding the wrong line.
  */
-const UNREACHABLE: { file: string; line: number; snippet: string; why: string }[] = [
+const NOT_COVERED: { file: string; line: number; snippet: string; proven: boolean; why: string }[] = [
   {
     file: "packages/zstd/src/fse.wac",
     line: 146,
+    proven: true,
     snippet: "if (remaining < 0) { trap; }",
     why: "The wire form bounds each count by what is left: the field is masked to " +
       "2*threshold-1 and the long branch subtracts max, which together put the count in " +
@@ -666,26 +749,52 @@ const UNREACHABLE: { file: string; line: number; snippet: string; why: string }[
   {
     file: "packages/zstd/src/fse.wac",
     line: 263,
+    proven: true,
     snippet: "if (len <= 0) { trap; }",
     why: "decompress refuses a description with nothing behind it before constructing a " +
       "BackBits, so the only caller in this package cannot pass a non-positive length. The " +
       "struct is exported for the sequences decoder, which is not written yet and will not " +
       "have that guard for free.",
   },
+  {
+    file: "packages/zstd/src/encode.wac",
+    line: 271,
+    proven: false,
+    snippet: "} else {",
+    why: "The three-byte sequence count needs 32512 sequences in one block, and a 128 KiB " +
+      "block holds at most 32768 — every one of them a literal and a three-byte match. The " +
+      "closest input synthesised reached 32223: the matcher takes the best of 32 candidates, " +
+      "so a match extends past three bytes often enough to lose the margin. Periodic input " +
+      "makes it worse, not better, because then the matcher finds the whole cycle as one " +
+      "65 KB match. The branch is three lines and mirrors readCount in sequences.wac, which " +
+      "is tested — but that is an argument, not a test.",
+  },
+  {
+    file: "packages/zstd/src/block.wac",
+    line: 139,
+    proven: false,
+    snippet: "if (h.compressedSize <= 0) { trap; }",
+    why: "A treeless literals section claiming no bytes at all. Reaching it needs a frame " +
+      "whose first block establishes a Huffman table and whose second is treeless with a " +
+      "compressed size of zero — two blocks, hand-built, with a valid Huffman-coded first " +
+      "one. Corrupting a real frame does not get there: damaging the size field of a " +
+      "treeless section is refused by the block bounds first.",
+  },
 ];
 
-report([run, fse, huff, hash, fsee], "packages/zstd/", { verbose });
+report([run, fse, huff, hash, fsee, encoder], "packages/zstd/", { verbose });
 
-const source = await Deno.readTextFile("packages/zstd/src/fse.wac");
-const lines = source.split("\n");
 let stale = false;
-for (const u of UNREACHABLE) {
-  const at = lines[u.line - 1] ?? "";
+const sources = new Map<string, string[]>();
+for (const u of NOT_COVERED) {
+  if (!sources.has(u.file)) sources.set(u.file, (await Deno.readTextFile(u.file)).split("\n"));
+  const at = sources.get(u.file)![u.line - 1] ?? "";
   if (!at.includes(u.snippet)) {
     console.log(`\n${u.file}:${u.line} no longer holds ${JSON.stringify(u.snippet)} — it holds:\n  ${at.trim()}`);
     stale = true;
   } else {
-    console.log(`\nexcluded as unreachable: ${u.file}:${u.line}  ${u.snippet}\n  ${u.why}`);
+    const label = u.proven ? "unreachable" : "reachable, NOT COVERED";
+    console.log(`\n${label}: ${u.file}:${u.line}  ${u.snippet}\n  ${u.why}`);
   }
 }
 if (stale) Deno.exit(1);
