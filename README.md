@@ -22,6 +22,10 @@ compiler, this one is things built with it.
 | [`datetime`](packages/datetime/) | the proleptic Gregorian calendar and RFC 3339 timestamps |
 | [`http`](packages/http/) | HTTP/1.1 request parsing, strict about framing |
 | [`unicode`](packages/unicode/) | UTF-8 as code points, and simple case mapping |
+| [`stream`](packages/stream/) | run a wac transform as a stream, with the host doing the blocking wac cannot |
+| [`zstd`](packages/zstd/) | Zstandard — the frame layer only so far, compressed blocks not yet |
+| [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) — **not for production**, see its README |
+| [`wacc`](packages/wacc/) | the wac compiler, in wac, so it can eventually compile itself |
 | [`server`](packages/server/) | an HTTP server in wac — the packages, composed and running |
 | [`std`](packages/std/) | `Vec<T>`, `Map<K, V>`, `Option<T>`, `Result<T, E>` — the containers generics made writable |
 | [`wactest`](packages/wactest/) | assertions for writing tests in wac |

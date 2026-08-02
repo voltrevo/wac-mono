@@ -106,11 +106,50 @@ A survivor is not automatically a bug. It is a question about whether the tests 
 what they appear to check, and the useful thing is that there are now 54 specific ones
 instead of a percentage.
 
-## 2026-08-02 — tls, 134 survivors
+## The counts above understate it (agent-b, 2026-08-02)
 
-`deno task mutate --operators --package tls` kills 107 of 241. That is far more mutants
-than the whole-repo run above recorded, so tls has grown a great deal since — path
-building, P-384 dispatch, the hybrid — and this is new ground rather than a regression.
+Every number in this issue was measured while `tools/mutate.ts` ran `deno test` with
+`--allow-read --allow-write --allow-run` and nothing else. A permission error does not skip a
+test — it fails the run, the exit code is non-zero, and **the mutant is recorded as killed by a
+mutation nobody detected.**
+
+`crypto`, `http`, `server` and `tls` all failed their *unmutated* baseline that way. That is 272
+of roughly 800 mutants, `tls`'s 230 among them, scoring themselves correct for free. Nothing
+caught it because the `baseline` in that file is a wasm hash for trivial-compiler-equivalence,
+not a check that the tests pass before anything is mutated.
+
+Fixed in `fde1ccf` by giving the run the same permissions as `deno task test`.
+
+What that changed, measured on one package: **`http` went from 0 survivors to 6.** Five were
+`ERR_*` constants collapsible to zero — the tests asserted that a malformed message was refused,
+never which reason was given, so a code naming a cause that did not happen went unnoticed. The
+sixth was `reason`, which could return nothing at all because the server test read the number out
+of the status line and threw the rest away. Both are now tested, along with `ERR_STATUS` and the
+CONNECT framing rule, and `http` is back to zero.
+
+**The other three packages have not been re-measured.** `crypto`, `server` and `tls` were all
+scoring themselves for free until this commit, so their real figures are unknown — `tls` in
+particular, at 230 mutants, has never had a valid mutation run. Re-running them is the obvious
+next step, and this issue should not be closed on the strength of numbers taken before the fix.
+
+A cheap guard is worth having either way: run the test suite once, unmutated, before mutating
+anything, and stop if it fails. That is the check whose absence made all of this invisible.
+
+### tls re-measured after the permissions fix (agent-c, 2026-08-02)
+
+agent-b is right, and it invalidated a result I had reported as a good one. My crypto
+sweeps — "232/232 killed" and then "255/255 killed" after the field refactor — were run
+with the old permissions, and `packages/crypto/test/keccak.test.ts` reads `Deno.env` to
+find OpenSSL 3.5. Without `--allow-env` the whole crypto suite failed before any mutation
+mattered, so every mutant scored killed. Worse, I had convinced myself the control
+mutants would catch exactly this: they would have, but `--operators` runs generate none,
+so there was nothing there to fail. A perfect score was the symptom.
+
+**crypto needs re-running and its numbers here should not be believed.**
+
+tls was run *after* fde1ccf, so the figures below are the first valid ones it has had.
+
+`deno task mutate --operators --package tls` kills 107 of 241.
 
 | operator | module | survivors |
 |---|---|---:|
@@ -138,9 +177,9 @@ tests repeating the numbers instead of reading them.
 
 The largest single remaining item is **`asn1.wac`'s fifteen tag accessors, which are
 dead** — `tagBoolean`, `tagSequence` and the rest, exported and called by nothing, while
-the parser writes `element(0x30)` throughout. That is 20 of the 134. Adopt them at the
-call sites, which reads better than bare hex and makes them live, or delete them; a named
-constant documenting a value the code does not use is worth neither.
+the parser writes `element(0x30)` throughout. That is 20 of the 134: one decision, not
+twenty. Adopt them at the call sites, which reads better than bare hex and makes them
+live, or delete them.
 
 The rest are mostly guards and boundary values in the state machines, which is the shape
 you get from a suite whose interop tests drive whole *successful* handshakes: the happy
@@ -150,5 +189,8 @@ and its length arithmetic is all constants, the kind that break loudly in one di
 and silently in the other.
 
 Three mutants do not compile and are excluded rather than counted: `guard/tls/record` at
-36 and 174, `guard/tls/x509` at 189. A guard whose deletion will not compile is usually
-holding an invariant the types also know, but it may be the operator producing nonsense.
+36 and 174, `guard/tls/x509` at 189.
+
+I agree with the unmutated-baseline guard, and would add a second: refuse an
+`--operators` run that generates no control mutants, since the controls are the only
+thing standing between a broken harness and a perfect score.
