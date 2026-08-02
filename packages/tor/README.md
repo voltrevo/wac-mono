@@ -13,9 +13,11 @@ out of band, and it must be inside its validity window.
 Flow control works, including authenticated SENDMEs: 1.2MB over 209 streams on one circuit,
 2.5x the circuit window.
 
-It is still **not an anonymity tool** and should not be pointed at the real network. It
-picks its path from whatever list it is handed rather than by bandwidth-weighted selection
-with guards, and that is the gap that matters most.
+Paths are chosen rather than handed over: bandwidth-weighted per position, distinct /16s,
+mutual families excluded, and a pinned guard set.
+
+It should still not be pointed at the real network — see *What is not here*, which is now a
+list of things that are wrong rather than things that are missing.
 
 ## Why this is possible at all
 
@@ -66,6 +68,8 @@ happened to this repo's SHAKE tests until they moved to `node:crypto`.
 | `src/consensus.wac` | the signature crypto behind believing a directory |
 | `host/directory.ts` | parsing a consensus and its microdescriptors |
 | `host/verify.ts` | the authority chain and the majority rule |
+| `src/pathsel.wac` | the weighting and the path constraints |
+| `host/path.ts` | resolving the consensus into candidates, and guards |
 
 The split is the same one the TLS package uses: bytes and state machines in wac, and only
 the socket in TypeScript. One exception is forced rather than chosen — a `Hop` is a struct
@@ -99,6 +103,34 @@ value of known length, never searched within.
 
 **The signed portion ends mid-line**, at `directory-signature ` inclusive of the trailing
 space, with the signatures outside it. The leading newline in that search is load-bearing.
+
+## Choosing a path
+
+The part whose failures are silent. A wrong handshake breaks the circuit; a wrong path
+selection builds a working circuit with the anonymity quietly removed.
+
+**Weighted by bandwidth, per position.** Uniform selection sounds fair and is not — capacity
+is enormously unequal, so it sends most traffic through relays that cannot carry it and lets
+an attacker buy influence with relay *count* rather than with bandwidth. But plain bandwidth
+is wrong too, because exit capacity is scarce and must not be spent in the middle position.
+The consensus publishes a weight per (flag combination, position) pair for exactly this, and
+a client that ignores them concentrates its traffic differently from everyone else's, which
+is itself distinguishing.
+
+**Distinct /16s and mutual families.** Two relays in one /16 are plausibly one wire. Family
+declarations must be mutual — A listing B means nothing unless B lists A — because otherwise
+anyone could shrink your candidate set by claiming kinship with relays they do not run.
+
+**A pinned guard.** With a fresh first hop every circuit, an adversary running a fraction of
+the network sees your entry *eventually*, with probability approaching one. Pinning turns
+that into a single sample. So a guard set that rotates is not a guard set, and in particular
+failure must not cause rotation — otherwise blocking someone's guards is how you get chosen
+as the replacement. `currentGuard` skips a failed guard, retries it in an hour, and never
+samples a new one to replace it.
+
+The chooser takes its randomness as an argument. That is what lets the tests sweep the whole
+random space and assert the distribution exactly, instead of sampling it — a statistical
+test loose enough never to flake is loose enough to miss a real bias.
 
 ## Relay cells, and the two things that are easy to get wrong
 
@@ -136,9 +168,16 @@ the send window empties while a cell is waiting to be read, since draining the r
 mid-write would reorder what the caller sees. A client that uploads more than 1000 cells
 while reading needs a proper reader loop; one that fetches does not.
 
-**Path selection, guards, and everything about *choosing* a circuit.** A real client weights
-by bandwidth, pins a guard so it is not resampling its first hop every circuit, and avoids
-putting two relays from one family or one /16 in a path. This takes a list and uses it.
+**Exit policies.** An exit is chosen for its Exit flag, not for whether its policy permits
+the port you want. On the real network that means picking exits that will refuse the stream.
+
+**The guard algorithm is simplified.** Proposal 271 tracks reachability over time and
+distinguishes "the network is down" from "this guard is down", so that a captive portal
+cannot force rotation. This samples, persists, and prefers; it gets the property that
+matters — no rotation on failure — and not the rest.
+
+**Directory fetching.** The consensus is read off disk. A real client fetches it over a
+circuit, which is itself something an observer should not be able to correlate.
 
 **Streams to arbitrary destinations, verified.** `RELAY_BEGIN` reaches the exit and is
 parsed by it — the testnet's exit evaluates our address and answers `RELAY_END`, which

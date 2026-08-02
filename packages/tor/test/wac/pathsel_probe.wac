@@ -1,0 +1,19 @@
+// Path selection at the host boundary. The policy is in src/pathsel.wac; the host resolves
+// the consensus into these arrays and supplies the randomness.
+import {
+  weightedBandwidths as wb, choose as ch, weightedChoice as wc,
+  positionWeight as pw, pathAllows as pa, sameSubnet16 as ss,
+} from "../../src/pathsel.wac";
+
+export i64[] weightedBandwidths(i64[] bw, bool[] g, bool[] e, i32 pos, i64[] w) {
+  return wb(bw, g, e, pos, w);
+}
+export i32 choose(i64[] weighted, i32[] chosen, u8[] addrs, i32[] fs, i32[] fo, bool same, i64 r) {
+  return ch(weighted, chosen, addrs, fs, fo, same, r);
+}
+export i32 weightedChoice(i64[] w, i64 r) { return wc(w, r); }
+export i64 positionWeight(i32 p, bool g, bool e, i64[] w) { return pw(p, g, e, w); }
+export bool pathAllows(i32[] c, i32 cand, u8[] a, i32[] fs, i32[] fo, bool same) {
+  return pa(c, cand, a, fs, fo, same);
+}
+export bool sameSubnet16(u8[] a, u8[] b) { return ss(a, b); }

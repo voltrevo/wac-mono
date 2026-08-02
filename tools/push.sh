@@ -11,6 +11,16 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Refuse to run with a dirty tree. The tests would pass against the working copy and the
+# push would carry the last commit, so it reports success for work that never left the
+# machine — which is worse than failing, because there is nothing to notice. I did this
+# within an hour of writing the script.
+if [ -n "$(git status --porcelain)" ]; then
+  echo "== uncommitted changes: commit them first, or the push will not include them =="
+  git status --short
+  exit 1
+fi
+
 # A stale compiler makes every other package look broken, so rule it out before believing a
 # red suite. The version check in the harness reports it precisely; this just gets ahead of it.
 if [ -d ../wac ]; then
