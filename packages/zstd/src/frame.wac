@@ -177,6 +177,20 @@ export u8[] decompress(u8[] src) {
     if (m != magic()) { trap; }
 
     FrameHeader h = readHeader(r);
+
+    // A frame that names a dictionary cannot be decoded without it: the dictionary supplies the
+    // starting entropy tables, the starting repeat offsets, and a window of history the first
+    // matches reach into. Refused outright rather than attempted — without it the output is
+    // wrong rather than short, and wrong output that looks plausible is the worst outcome here.
+    //
+    // This does not catch every dictionary. A *raw content* dictionary is just history, and a
+    // frame using one declares no identifier at all — it is indistinguishable from an ordinary
+    // frame until a match reaches back before the start of the output, which the offset check
+    // in `sequences.wac` refuses. That refusal is real but incidental, and a frame whose matches
+    // happen never to reach into the dictionary would decode correctly, which is only to say the
+    // dictionary was not doing anything.
+    if (h.dictId != 0) { trap; }
+
     i32 startLen = out.len;
     // Per frame, not per file: a second frame starts with no tables and the initial offsets.
     decodeBlocks(r, out, Decoder.create());

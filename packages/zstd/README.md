@@ -25,10 +25,33 @@ what zstd's own encoder produces and comparing bytes.
 
 ### What "not implemented" means here
 
-**Dictionaries.** A frame may name a dictionary that supplies starting Huffman and FSE tables and
-a window of history. Nothing about the rest of the decoder changes; the missing part is loading
-one and seeding the decoder from it. A frame that names a dictionary is refused rather than
-guessed at.
+**Dictionaries.** A dictionary supplies four things: a Huffman table for literals, the three FSE
+tables, the three starting repeat offsets, and a window of content the first matches reach into.
+
+*The decoder work is small*, and smaller than it looks, because `Decoder` in `src/block.wac`
+already carries exactly those four fields — they are what a block inherits from the block before
+it. Seeding them from a dictionary instead of from a previous block is the same operation, plus
+parsing the dictionary format and pre-filling the history. Call it a couple of hundred lines.
+
+*Testing it here is the actual obstacle.* Dictionaries come in two shapes, and they are not
+equally reachable:
+
+- a **raw content** dictionary is only history, and a frame using one **declares nothing** — it
+  is indistinguishable from an ordinary frame. Node produces these, so they are testable, and
+  the only reason ours are refused is that a match reaches back before the start of the output.
+  That refusal is real but incidental: a frame whose matches never reach into the dictionary
+  would decode correctly, which is only to say the dictionary was not doing anything;
+- a **formatted** dictionary carries the entropy tables and an identifier, and that identifier
+  appears in the frame header. Ours refuses any frame that declares one. Producing a formatted
+  dictionary needs `zstd --train`, and the zstd CLI is not installed here — so the half of
+  dictionary support that seeds entropy tables could be written but not checked against anything
+  real, which by this package's standards is not finished.
+
+*How much it matters* depends entirely on the use. For files, HTTP bodies and anything of
+appreciable size, dictionaries are absent — none of the corpus in `test/decode.test.ts` uses one
+and no ordinary encoder emits one unasked. They exist for the opposite case: many small messages
+that share structure, where the shared part is longer than the message. If that is the use, this
+package cannot serve it; if it is not, nothing here is missing.
 
 **Compression.** A separate and much larger project. Everything here decodes; nothing encodes.
 The pieces that would have to be built are the mirror of the pieces above — FSE table
