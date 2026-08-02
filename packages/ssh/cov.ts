@@ -303,4 +303,61 @@ mKex.sshVerifyHostKey(hostKeyBlob, join(str(bytes("ssh-ed25518")), str(new Uint8
 // One hash block, and more than one, so the extension loop is entered as well as skipped.
 for (const needed of [16, 32, 64]) mKex.sshDeriveKey(secret, h, h, 0x41, needed);
 
+// ── The cipher ────────────────────────────────────────────────────────────────
+
+const mCipher = run.mod as unknown as {
+  sshCipherKeyLength(): number;
+  sshCipherTagLength(): number;
+  sshAeadPaddingFor(n: number, block: number): number;
+  sshSeal(key: Uint8Array, seq: number, payload: Uint8Array, random: Uint8Array, block: number): Uint8Array;
+  sshPeekLength(key: Uint8Array, seq: number, src: Uint8Array, at: number): number;
+  sshOpenStatus(key: Uint8Array, seq: number, src: Uint8Array, at: number, end: number, max: number): number;
+  sshOpenPayload(key: Uint8Array, seq: number, src: Uint8Array, at: number, end: number, max: number): Uint8Array;
+  sshOpenUsed(key: Uint8Array, seq: number, src: Uint8Array, at: number, end: number, max: number): number;
+};
+
+mCipher.sshCipherKeyLength();
+mCipher.sshCipherTagLength();
+const ckey = Uint8Array.from({ length: 64 }, (_, i) => (i * 7 + 1) & 255);
+for (const n of [0, 1, 6, 7, 8, 100]) {
+  for (const b of [8, 16]) mCipher.sshAeadPaddingFor(n, b);
+  const payload = Uint8Array.from({ length: n }, (_, i) => i & 255);
+  const packet = mCipher.sshSeal(ckey, n, payload, new Uint8Array(mCipher.sshAeadPaddingFor(n, 8)).fill(1), 8);
+  mCipher.sshPeekLength(ckey, n, packet, 0);
+  mCipher.sshOpenStatus(ckey, n, packet, 0, packet.length, 35000);
+  mCipher.sshOpenPayload(ckey, n, packet, 0, packet.length, 35000);
+  mCipher.sshOpenUsed(ckey, n, packet, 0, packet.length, 35000);
+  mCipher.sshOpenStatus(ckey, n, packet, 0, packet.length - 1, 35000);   // incomplete
+  mCipher.sshOpenStatus(ckey, n, packet, 0, 2, 35000);                   // shorter than a length
+  mCipher.sshOpenStatus(ckey, n + 1, packet, 0, packet.length, 35000);   // wrong sequence
+  mCipher.sshOpenStatus(ckey, n, packet, 0, packet.length, 4);           // over the caller's limit
+  mCipher.sshOpenStatus(ckey, n, packet, -1, packet.length, 35000);      // bad range
+  mCipher.sshOpenStatus(ckey, n, packet, 0, packet.length + 5, 35000);   // end past the buffer
+}
+
+// A tag that does not match, and a body whose padding length is impossible once decrypted.
+const tampered = mCipher.sshSeal(ckey, 0, bytes("tamper"), new Uint8Array(16).fill(2), 8);
+tampered[tampered.length - 1] ^= 0xff;
+mCipher.sshOpenStatus(ckey, 0, tampered, 0, tampered.length, 35000);
+
+// A packet whose tag is right and whose padding length is impossible: only reachable by sealing a
+// body directly, since `seal` computes a valid one. This is the check that runs *after* the MAC.
+const mBody = run.mod as unknown as {
+  sshSealBody(key: Uint8Array, seq: number, body: Uint8Array): Uint8Array;
+};
+for (const padByte of [200, 0, 3]) {
+  const body = new Uint8Array(8);
+  body[0] = padByte;                       // claims more padding than the packet holds, or too little
+  const forged = mBody.sshSealBody(ckey, 0, body);
+  mCipher.sshOpenStatus(ckey, 0, forged, 0, forged.length, 35000);
+}
+
+mCipher.sshPeekLength(ckey, 0, new Uint8Array(2), 0);                     // too short to peek
+mCipher.sshPeekLength(ckey, 0, new Uint8Array(8), -1);                    // bad offset
+ignoringTraps(() => mBody.sshSealBody(new Uint8Array(63), 0, new Uint8Array(8)));
+ignoringTraps(() => mCipher.sshSeal(new Uint8Array(63), 0, bytes("x"), new Uint8Array(16), 8));
+ignoringTraps(() => mCipher.sshSeal(ckey, 0, bytes("x"), new Uint8Array(0), 8));
+ignoringTraps(() => mCipher.sshPeekLength(new Uint8Array(63), 0, new Uint8Array(8), 0));
+ignoringTraps(() => mCipher.sshOpenStatus(new Uint8Array(63), 0, new Uint8Array(40), 0, 40, 35000));
+
 report([run], "packages/ssh/", { verbose });

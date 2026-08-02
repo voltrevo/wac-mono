@@ -1,0 +1,221 @@
+// chacha20-poly1305@openssh.com — OpenSSH's AEAD, which is *not* the one in RFC 8439.
+//
+// `packages/crypto/src/aead.wac` implements the RFC construction and is the wrong thing here.
+// This one is built from the same two primitives and differs in every structural choice:
+//
+//   **Two keys, not one.** The key exchange yields 512 bits. The first 256 become K_2 and the
+//   second 256 become K_1 — that order, which reads backwards. K_1 encrypts only the 4-byte
+//   packet length; K_2 encrypts the payload and keys the MAC.
+//
+//   **The length is encrypted separately** so a reader can learn how much to read without having
+//   decrypted anything it must then trust. That separation is the point of the design: with a
+//   single key, an attacker who could observe the peer's reaction to a corrupted length field had
+//   an oracle, which is what CVE-2016-* era attacks on other modes exploited.
+//
+//   **The MAC covers the ciphertext**, both the encrypted length and the encrypted payload, and
+//   is checked *before* anything is decrypted — encrypt-then-MAC, unlike the RFC AEAD's
+//   associated-data framing with its 16-byte padding and length trailer. None of that appears
+//   here: the MAC input is simply the bytes on the wire.
+//
+//   **The nonce is the packet sequence number**, a uint64 big-endian, and nothing else. There is
+//   no per-connection IV — the `A`/`B` key derivation outputs go unused for this cipher, as do
+//   `E`/`F`, because the AEAD supplies its own integrity.
+//
+// The sequence number is *not* transmitted. Both sides count, and if they ever disagree the MAC
+// fails with no indication of why — which is what makes strict KEX's reset at NEWKEYS something
+// to get exactly right rather than approximately.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { chacha20, chachaBlock } from "../../crypto/src/chacha20.wac";
+import { poly1305 } from "../../crypto/src/poly1305.wac";
+
+/** Key material this cipher needs from the exchange: two 256-bit keys. */
+export i32 keyLength() { return 64; }
+
+/** The authentication tag length, appended to every packet. */
+export i32 tagLength() { return 16; }
+
+/**
+ * The padding rule for an AEAD packet, which is not the one in `packet.wac`.
+ *
+ * RFC 4253 aligns the whole packet including its 4-byte length field. When the length is
+ * authenticated separately — an AEAD, or encrypt-then-MAC — OpenSSH excludes it, so what must be
+ * a multiple of the block size is `padding_length || payload || padding` alone. Using the RFC
+ * rule here produces packets that are consistently 4 bytes out of alignment, and the server
+ * rejects the first one it sees.
+ */
+export i32 aeadPaddingFor(i32 n, i32 block) {
+  i32 pad = block - ((1 + n) % block);
+  while (pad < 4) { pad += block; }
+  return pad;
+}
+
+/**
+ * The 12-byte RFC 8439 nonce standing for OpenSSH's 64-bit one.
+ *
+ * OpenSSH uses the original ChaCha20 with a 64-bit counter and 64-bit nonce; RFC 8439 splits the
+ * same state words into a 32-bit counter and a 96-bit nonce. The counter never exceeds 32 bits
+ * here, so its high half is zero — which lands in the first four bytes of the RFC nonce, leaving
+ * the sequence number in the remaining eight.
+ *
+ * `seq` is an i32 used as an unsigned bit pattern. SSH requires a rekey long before 2^32 packets,
+ * so the upper half is always zero in practice.
+ */
+u8[] nonceFor(i32 seq) {
+  u8[] nonce = u8[12]();
+  nonce[8] = (seq >>> 24) & 255;
+  nonce[9] = (seq >>> 16) & 255;
+  nonce[10] = (seq >>> 8) & 255;
+  nonce[11] = seq & 255;
+  return nonce;
+}
+
+/** K_2 — the first half. Encrypts the payload and keys the MAC. */
+u8[] payloadKey(u8[] key) {
+  u8[] k = u8[32]();
+  k.copyFrom(key, 0, 0, 32);
+  return k;
+}
+
+/** K_1 — the second half. Encrypts the length field and nothing else. */
+u8[] lengthKey(u8[] key) {
+  u8[] k = u8[32]();
+  k.copyFrom(key, 32, 0, 32);
+  return k;
+}
+
+/**
+ * The one-time Poly1305 key: the first 32 bytes of K_2's keystream at counter 0.
+ *
+ * Counter 0 is reserved for this, which is why the payload starts at counter 1. Encrypting the
+ * payload from counter 0 would reuse the block that is the MAC key and hand it to anyone holding
+ * a known plaintext.
+ */
+u8[] macKey(u8[] key, i32 seq) {
+  u8[] block = chachaBlock(payloadKey(key), 0 as! u32, nonceFor(seq));
+  u8[] k = u8[32]();
+  k.copyFrom(block, 0, 0, 32);
+  return k;
+}
+
+/**
+ * Encrypt and authenticate one packet.
+ *
+ * `key` is the 64 bytes derived for this direction, `random` supplies the padding, and the result
+ * is the encrypted length, the encrypted body and the tag, ready for the wire.
+ */
+export u8[] seal(u8[] key, i32 seq, u8[] payload, u8[] random, i32 block) {
+  if (key.len() != keyLength()) { trap; }
+  i32 pad = aeadPaddingFor(payload.len(), block);
+  if (random.len() < pad) { trap; }
+  i32 packetLength = 1 + payload.len() + pad;
+
+  // The body, in the clear: padding length, payload, padding.
+  Buf body = Buf.withCapacity(packetLength);
+  body.push(pad);
+  body.pushAll(payload);
+  body.pushBytes(random, 0, pad);
+
+  return sealBody(key, seq, body.take());
+}
+
+/**
+ * Encrypt and authenticate a body the caller has already assembled.
+ *
+ * `body` is `padding_length || payload || padding` — the whole of what the length field counts.
+ * `seal` builds one and calls this; separately it is what a test needs in order to produce a
+ * packet that authenticates correctly and is *still* malformed inside, which is the only way to
+ * reach the checks that run after the tag has been verified.
+ */
+export u8[] sealBody(u8[] key, i32 seq, u8[] body) {
+  if (key.len() != keyLength()) { trap; }
+  u8[] nonce = nonceFor(seq);
+  i32 packetLength = body.len();
+
+  u8[] lengthPlain = u8[4]();
+  lengthPlain[0] = (packetLength >>> 24) & 255;
+  lengthPlain[1] = (packetLength >>> 16) & 255;
+  lengthPlain[2] = (packetLength >>> 8) & 255;
+  lengthPlain[3] = packetLength & 255;
+
+  u8[] encLength = chacha20(lengthKey(key), 0 as! u32, nonce, lengthPlain);
+  u8[] encBody = chacha20(payloadKey(key), 1 as! u32, nonce, body);
+
+  Buf out = Buf.withCapacity(4 + packetLength + tagLength());
+  out.pushAll(encLength);
+  out.pushAll(encBody);
+  u8[] authenticated = out.bytes();          // the length and body as they go on the wire
+  out.pushAll(poly1305(macKey(key, seq), authenticated));
+  return out.take();
+}
+
+/**
+ * The packet length hidden in the first four bytes, so a reader knows how much more to await.
+ *
+ * Decrypting the length before the MAC has been checked is unavoidable — the MAC covers bytes we
+ * do not have yet — and is why the value is treated as untrusted until `open` succeeds. A caller
+ * must bound it before allocating anything.
+ */
+export i32 peekLength(u8[] key, i32 seq, u8[] src, i32 at) {
+  if (key.len() != keyLength()) { trap; }
+  if (at < 0 || at + 4 > src.len()) { return -1; }
+  u8[] first = u8[4]();
+  first.copyFrom(src, at, 0, 4);
+  u8[] plain = chacha20(lengthKey(key), 0 as! u32, nonceFor(seq), first);
+  return (plain[0] << 24) | (plain[1] << 16) | (plain[2] << 8) | plain[3];
+}
+
+export enum Opened {
+  Ok,
+  /** Not all of the packet has arrived. */
+  Incomplete,
+  /** The tag did not match, or the packet cannot be one. */
+  Bad,
+}
+
+export struct Plain {
+  Opened status;
+  u8[] payload;
+  i32 used;
+}
+
+/**
+ * Verify and decrypt one packet from `src[at..end]`.
+ *
+ * The tag is checked before the body is decrypted and before the padding length is believed, so a
+ * forged packet never reaches the parser. The comparison is a fold rather than an early return:
+ * an attacker who can time a tag comparison can find the tag a byte at a time.
+ */
+export Plain open(u8[] key, i32 seq, u8[] src, i32 at, i32 end, i32 maxPacket) {
+  if (key.len() != keyLength()) { trap; }
+  if (at < 0 || end > src.len() || at > end) { return Plain(Opened.Bad, u8[0](), 0); }
+  if (end - at < 4) { return Plain(Opened.Incomplete, u8[0](), 0); }
+
+  i32 packetLength = peekLength(key, seq, src, at);
+  // Bounded before it is used for anything. The value is attacker-chosen and unauthenticated at
+  // this point; a packet must at least carry its padding-length byte and four bytes of padding.
+  if (packetLength < 5 || packetLength > maxPacket) { return Plain(Opened.Bad, u8[0](), 0); }
+  i32 total = 4 + packetLength + tagLength();
+  if (end - at < total) { return Plain(Opened.Incomplete, u8[0](), 0); }
+
+  u8[] authenticated = u8[4 + packetLength]();
+  authenticated.copyFrom(src, at, 0, 4 + packetLength);
+  u8[] want = poly1305(macKey(key, seq), authenticated);
+
+  i32 diff = 0;
+  for (i32 i = 0; i < tagLength(); i++) {
+    diff = diff | (want[i] ^ src[at + 4 + packetLength + i]);
+  }
+  if (diff != 0) { return Plain(Opened.Bad, u8[0](), 0); }
+
+  u8[] encBody = u8[packetLength]();
+  encBody.copyFrom(src, at + 4, 0, packetLength);
+  u8[] body = chacha20(payloadKey(key), 1 as! u32, nonceFor(seq), encBody);
+
+  i32 padLength = body[0];
+  if (padLength < 4 || padLength + 1 > packetLength) { return Plain(Opened.Bad, u8[0](), 0); }
+  i32 payloadLength = packetLength - padLength - 1;
+  u8[] payload = u8[payloadLength]();
+  payload.copyFrom(body, 1, 0, payloadLength);
+  return Plain(Opened.Ok, payload, total);
+}

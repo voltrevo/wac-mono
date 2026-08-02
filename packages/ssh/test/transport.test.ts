@@ -38,6 +38,14 @@ const mod = await wacBind("packages/ssh/test/wac/probe.wac") as unknown as {
                   ks: Uint8Array, qc: Uint8Array, qs: Uint8Array, k: Uint8Array): Uint8Array;
   sshVerifyHostKey(hostKey: Uint8Array, signature: Uint8Array, h: Uint8Array): boolean;
   sshDeriveKey(k: Uint8Array, h: Uint8Array, sessionId: Uint8Array, letter: number, needed: number): Uint8Array;
+  sshCipherKeyLength(): number;
+  sshCipherTagLength(): number;
+  sshAeadPaddingFor(n: number, block: number): number;
+  sshSeal(key: Uint8Array, seq: number, payload: Uint8Array, random: Uint8Array, block: number): Uint8Array;
+  sshPeekLength(key: Uint8Array, seq: number, src: Uint8Array, at: number): number;
+  sshOpenStatus(key: Uint8Array, seq: number, src: Uint8Array, at: number, end: number, maxPacket: number): number;
+  sshOpenPayload(key: Uint8Array, seq: number, src: Uint8Array, at: number, end: number, maxPacket: number): Uint8Array;
+  sshOpenUsed(key: Uint8Array, seq: number, src: Uint8Array, at: number, end: number, maxPacket: number): number;
 };
 
 const text = (b: Uint8Array) => new TextDecoder().decode(b);
@@ -61,7 +69,7 @@ function freePort(): number {
 }
 
 Deno.test({
-  name: "version, KEXINIT and key exchange with a real OpenSSH server",
+  name: "a full encrypted exchange with a real OpenSSH server, through SERVICE_ACCEPT",
   ignore: !haveSshd,
   sanitizeResources: false,
   fn: async () => {
@@ -205,6 +213,73 @@ Deno.test({
       bent[0] ^= 1;
       if (mod.sshVerifyHostKey(hostKeyBlob, signature, bent)) {
         throw new Error("a signature verified over the wrong exchange hash");
+      }
+      buf = buf.slice(mod.sshUnframeUsed(buf));
+
+      // ── NEWKEYS, and everything after it is encrypted ───────────────────────
+      //
+      // Both sides advertised strict KEX, so the sequence numbers reset to zero at NEWKEYS rather
+      // than continuing. Getting that wrong fails the MAC on the very first encrypted packet with
+      // no indication of why, which is the whole reason it is asserted rather than assumed.
+      if (!theirKex.includes("kex-strict-s-v00@openssh.com")) {
+        throw new Error("server did not offer strict KEX, so the sequence numbers do not reset");
+      }
+
+      const newKeys = new Uint8Array([21]);
+      const nkPad = crypto.getRandomValues(new Uint8Array(mod.sshPaddingFor(1, block)));
+      await conn.write(mod.sshFrame(newKeys, nkPad, block));
+
+      while (mod.sshUnframeStatus(buf) === 1) await read();
+      if (mod.sshUnframeStatus(buf) !== 0) throw new Error("could not frame the server's NEWKEYS");
+      const nk = mod.sshUnframePayload(buf);
+      if (nk[0] !== 21) throw new Error(`expected SSH_MSG_NEWKEYS (21), got ${nk[0]}`);
+      buf = buf.slice(mod.sshUnframeUsed(buf));
+
+      // session_id is H from the first exchange. 'C' is client-to-server, 'D' the other way.
+      const keyOut = mod.sshDeriveKey(shared, h, h, 0x43, mod.sshCipherKeyLength());
+      const keyIn = mod.sshDeriveKey(shared, h, h, 0x44, mod.sshCipherKeyLength());
+
+      // Send an encrypted SERVICE_REQUEST for ssh-userauth. If our sealing is wrong in any way —
+      // key halves swapped, wrong counter, wrong padding rule, wrong sequence number — the server
+      // drops the connection instead of replying.
+      const serviceRequest = (() => {
+        const name = bytes("ssh-userauth");
+        const out = new Uint8Array(1 + 4 + name.length);
+        out[0] = 5;                                    // SSH_MSG_SERVICE_REQUEST
+        new DataView(out.buffer).setUint32(1, name.length);
+        out.set(name, 5);
+        return out;
+      })();
+      const srPad = crypto.getRandomValues(
+        new Uint8Array(mod.sshAeadPaddingFor(serviceRequest.length, block)));
+      await conn.write(mod.sshSeal(keyOut, 0, serviceRequest, srPad, block));
+
+      // Read encrypted packets until SERVICE_ACCEPT. OpenSSH sends EXT_INFO first, because we
+      // asked for it with ext-info-c.
+      const MAX = 35000;
+      let inSeq = 0;
+      let accepted = false;
+      let sawExtInfo = false;
+      for (let i = 0; i < 8 && !accepted; i++) {
+        while (mod.sshOpenStatus(keyIn, inSeq, buf, 0, buf.length, MAX) === 1) await read();
+        const status = mod.sshOpenStatus(keyIn, inSeq, buf, 0, buf.length, MAX);
+        if (status !== 0) {
+          throw new Error(`encrypted packet ${inSeq} did not open (status ${status}) — ` +
+            `the cipher, the key halves or the sequence number is wrong`);
+        }
+        const p = mod.sshOpenPayload(keyIn, inSeq, buf, 0, buf.length, MAX);
+        buf = buf.slice(mod.sshOpenUsed(keyIn, inSeq, buf, 0, buf.length, MAX));
+        inSeq++;
+        if (p[0] === 7) sawExtInfo = true;                      // SSH_MSG_EXT_INFO
+        if (p[0] === 6) {                                       // SSH_MSG_SERVICE_ACCEPT
+          const name = text(mod.sshReadString(p.slice(1)));
+          if (name !== "ssh-userauth") throw new Error(`service accepted was ${name}`);
+          accepted = true;
+        }
+      }
+      if (!accepted) throw new Error("never received SSH_MSG_SERVICE_ACCEPT");
+      if (!sawExtInfo) {
+        throw new Error("no EXT_INFO, though we advertised ext-info-c — decryption may be wrong");
       }
     } finally {
       try { conn?.close(); } catch { /* already gone */ }
@@ -494,4 +569,144 @@ Deno.test("a low-order peer point is rejected rather than shared", () => {
   // A real peer key does work, so the check is not simply refusing everything.
   const peer = mod.sshEphemeralPublic(Uint8Array.from({ length: 32 }, (_, i) => 200 - i));
   if (mod.sshSharedSecret(secret, peer).length !== 32) throw new Error("a valid point was rejected");
+});
+
+// The cipher, on its own. The interop test above is what says it is *right*; these pin the
+// properties that a wrong-but-self-consistent implementation would still satisfy, so that a
+// future change cannot quietly break interop while still round-tripping with itself.
+Deno.test("sealing and opening round-trips, and the padding rule is the AEAD one", () => {
+  const key = Uint8Array.from({ length: 64 }, (_, i) => (i * 7 + 1) & 255);
+  const block = 8;
+  for (const n of [0, 1, 5, 6, 7, 8, 9, 100, 1000]) {
+    // The AEAD rule excludes the 4-byte length from the alignment, unlike RFC 4253's.
+    const pad = mod.sshAeadPaddingFor(n, block);
+    if (pad < 4) throw new Error(`payload ${n}: padding ${pad} is under the minimum`);
+    if ((1 + n + pad) % block !== 0) {
+      throw new Error(`payload ${n}: (1 + ${n} + ${pad}) is not a multiple of ${block}`);
+    }
+    // And it is *not* the RFC rule — those differ by exactly 4 for every length, so a test that
+    // only checked "some multiple" would pass with either.
+    if ((4 + 1 + n + pad) % block === 0) {
+      throw new Error(`payload ${n}: padding also satisfies the non-AEAD rule, so it is ambiguous`);
+    }
+
+    const payload = Uint8Array.from({ length: n }, (_, i) => (i * 31) & 255);
+    const random = crypto.getRandomValues(new Uint8Array(pad));
+    const packet = mod.sshSeal(key, 7, payload, random, block);
+    if (packet.length !== 4 + 1 + n + pad + mod.sshCipherTagLength()) {
+      throw new Error(`payload ${n}: packet is ${packet.length} bytes`);
+    }
+    if (mod.sshPeekLength(key, 7, packet, 0) !== 1 + n + pad) {
+      throw new Error(`payload ${n}: peeked length is wrong`);
+    }
+    if (mod.sshOpenStatus(key, 7, packet, 0, packet.length, 35000) !== 0) {
+      throw new Error(`payload ${n}: did not open`);
+    }
+    if (hex(mod.sshOpenPayload(key, 7, packet, 0, packet.length, 35000)) !== hex(payload)) {
+      throw new Error(`payload ${n}: contents changed`);
+    }
+    if (mod.sshOpenUsed(key, 7, packet, 0, packet.length, 35000) !== packet.length) {
+      throw new Error(`payload ${n}: used is wrong`);
+    }
+    // One byte short is "read more", never a verdict.
+    if (mod.sshOpenStatus(key, 7, packet, 0, packet.length - 1, 35000) !== 1) {
+      throw new Error(`payload ${n}: a short packet was not incomplete`);
+    }
+  }
+});
+
+Deno.test("a packet does not open under the wrong sequence number", () => {
+  const key = Uint8Array.from({ length: 64 }, (_, i) => (i * 5) & 255);
+  const payload = bytes("the sequence number is the nonce, and it is never transmitted");
+  const random = crypto.getRandomValues(new Uint8Array(mod.sshAeadPaddingFor(payload.length, 8)));
+  const packet = mod.sshSeal(key, 42, payload, random, 8);
+
+  if (mod.sshOpenStatus(key, 42, packet, 0, packet.length, 35000) !== 0) {
+    throw new Error("the packet did not open under its own sequence number");
+  }
+  for (const seq of [0, 41, 43, 43 + 65536]) {
+    if (mod.sshOpenStatus(key, seq, packet, 0, packet.length, 35000) !== 2) {
+      throw new Error(`a packet sealed at 42 opened at ${seq} — the nonce is not the sequence number`);
+    }
+  }
+});
+
+Deno.test("any single flipped bit is caught, wherever it lands", () => {
+  const key = Uint8Array.from({ length: 64 }, (_, i) => (i * 3 + 9) & 255);
+  const payload = bytes("sixteen bytes ok");
+  const random = crypto.getRandomValues(new Uint8Array(mod.sshAeadPaddingFor(payload.length, 8)));
+  const packet = mod.sshSeal(key, 3, payload, random, 8);
+
+  // Every byte: the encrypted length, the encrypted body, and the tag. A corrupted length may be
+  // rejected as out of range rather than by the MAC, which is also a refusal.
+  for (let i = 0; i < packet.length; i++) {
+    const bad = new Uint8Array(packet);
+    bad[i] ^= 0x40;
+    if (mod.sshOpenStatus(key, 3, bad, 0, bad.length, 35000) === 0) {
+      throw new Error(`flipping a bit in byte ${i} of ${packet.length} still opened`);
+    }
+  }
+
+  // And the wrong key.
+  const other = new Uint8Array(key);
+  other[0] ^= 1;
+  if (mod.sshOpenStatus(other, 3, packet, 0, packet.length, 35000) === 0) {
+    throw new Error("a packet opened under the wrong key");
+  }
+});
+
+Deno.test("the two key halves are not interchangeable", () => {
+  // K_2 is the first half and K_1 the second. Swapping them is the single most likely mistake,
+  // and it round-trips perfectly against itself — only a real server notices. So it is asserted
+  // here directly: a packet sealed with the halves swapped must not open with them in order.
+  const key = Uint8Array.from({ length: 64 }, (_, i) => (i * 11 + 4) & 255);
+  const swapped = new Uint8Array(64);
+  swapped.set(key.slice(32), 0);
+  swapped.set(key.slice(0, 32), 32);
+
+  const payload = bytes("halves");
+  const random = crypto.getRandomValues(new Uint8Array(mod.sshAeadPaddingFor(payload.length, 8)));
+  const packet = mod.sshSeal(swapped, 1, payload, random, 8);
+  if (mod.sshOpenStatus(key, 1, packet, 0, packet.length, 35000) === 0) {
+    throw new Error("a packet sealed with swapped key halves opened with them in order");
+  }
+});
+
+Deno.test("an unauthenticated length is bounded before it is believed", () => {
+  const key = Uint8Array.from({ length: 64 }, (_, i) => i & 255);
+  const payload = bytes("x");
+  const random = crypto.getRandomValues(new Uint8Array(mod.sshAeadPaddingFor(1, 8)));
+  const packet = mod.sshSeal(key, 0, payload, random, 8);
+
+  // The length is decrypted before the MAC can be checked — the MAC covers bytes not yet read —
+  // so a peer can steer it. It must be rejected on range, not used to size an allocation.
+  // This packet's inner length is 8 — a 1-byte payload plus the padding-length byte and 6 of
+  // padding — so the limits here are below that, not at it. A limit equal to the length must
+  // accept, which is checked separately below.
+  for (const max of [5, 7]) {
+    if (mod.sshOpenStatus(key, 0, packet, 0, packet.length, max) !== 2) {
+      throw new Error(`a packet longer than the ${max}-byte limit was accepted`);
+    }
+  }
+  if (mod.sshOpenStatus(key, 0, packet, 0, packet.length, 8) !== 0) {
+    throw new Error("a packet exactly at the limit was refused; the bound is off by one");
+  }
+  // Its own limit still works, so the bound is not simply refusing everything.
+  if (mod.sshOpenStatus(key, 0, packet, 0, packet.length, 35000) !== 0) {
+    throw new Error("a packet inside the limit was refused");
+  }
+});
+
+// A regression anchor, not an independent vector: these bytes came from this implementation after
+// the interop test above established it agrees with OpenSSH. On its own it only says we still do
+// what we did before.
+Deno.test("the cipher is pinned to a fixed answer", () => {
+  const key = Uint8Array.from({ length: 64 }, (_, i) => i & 255);
+  const packet = mod.sshSeal(key, 1, bytes("hello"), new Uint8Array(10).fill(0xaa), 8);
+  // 36 bytes: 4 encrypted length, 16 of body (1 padding-length + 5 payload + 10 padding, since
+  // the minimum of 4 forces a whole extra block here), and a 16-byte tag.
+  const want = "c922a7b5633419b55d6512d087dbd48519bebdb8b96aaad3ff47411634076af21570d9a7";
+  const got = hex(packet);
+  if (packet.length !== 36) throw new Error(`packet is ${packet.length} bytes, expected 36`);
+  if (got !== want) throw new Error(`cipher output changed:\n  got  ${got}\n  want ${want}`);
 });

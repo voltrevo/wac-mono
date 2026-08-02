@@ -1,8 +1,8 @@
 # ssh
 
-An SSH-2 client, in wac. **Through key exchange so far** — version exchange, the binary packet
-protocol, algorithm negotiation, curve25519-sha256 key exchange and `ssh-ed25519` host key
-verification. No encryption or authentication yet.
+An SSH-2 client, in wac. **Through to an encrypted connection** — version exchange, the binary
+packet protocol, algorithm negotiation, curve25519-sha256 key exchange, `ssh-ed25519` host key
+verification and the `chacha20-poly1305@openssh.com` AEAD. No authentication yet.
 
 > **Not for production**, for the same reason [crypto](../crypto/README.md) is not: it is built on
 > primitives that are known to leak timing, and nothing here has been reviewed by anyone.
@@ -28,6 +28,11 @@ ephemeral public keys, and the shared secret in its mpint form. One wrong byte a
 Ed25519 verification fails. The test then checks the host key is the one in `hostkey.pub`, since
 a signature that verifies against a key the server also chose proves only self-consistency, and
 bends a bit of H to confirm verification actually fails when it should.
+
+It then sends NEWKEYS, derives the traffic keys, and carries on **encrypted**: an encrypted
+SERVICE_REQUEST goes out and the server's EXT_INFO and SERVICE_ACCEPT come back and decrypt. That
+covers the whole transport in both directions at once — a wrong key half, counter, padding rule
+or sequence number and the server drops the connection rather than replying.
 
 Against OpenSSH 9.6 it negotiates `curve25519-sha256`, `ssh-ed25519` and
 `chacha20-poly1305@openssh.com`.
@@ -87,6 +92,30 @@ transcription of the RFC using WebCrypto.
 An all-zero shared secret means the peer sent a low-order point and every session would share the
 same secret; RFC 8731 §3 requires aborting, and nothing later notices if you do not.
 
+**`cipher.wac`** — `chacha20-poly1305@openssh.com`, which is **not** the RFC 8439 AEAD that
+`crypto/src/aead.wac` implements. Same two primitives, every structural choice different:
+
+Two keys, from 512 bits of key material — and the *first* 256 are K_2, the second K_1, which
+reads backwards. K_1 encrypts only the 4-byte packet length; K_2 encrypts the payload and keys the
+MAC. Swapping them round-trips perfectly against itself and fails only against a real server,
+which is why there is a test asserting the halves are not interchangeable.
+
+The length is encrypted under its own key so a reader can learn how much to read without having
+decrypted anything it must then trust. The MAC covers the ciphertext — both the encrypted length
+and the encrypted body — and is checked *before* anything is decrypted. None of RFC 8439's
+associated-data framing appears: the MAC input is simply the bytes on the wire.
+
+The nonce is the packet sequence number and nothing else, so the `A`/`B` and `E`/`F` key
+derivation outputs go unused. The sequence number is never transmitted; both sides count, and if
+they ever disagree the MAC fails with no indication of why. Strict KEX resets both counters at
+NEWKEYS, which is the one place that is easy to get wrong and impossible to debug from the
+symptom.
+
+Padding here follows the **AEAD rule, not RFC 4253's**: because the length is authenticated
+separately, only `padding_length || payload || padding` is aligned, not the whole packet. The two
+differ by exactly 4 bytes for every length, so a test that checks "aligned to something" passes
+with either.
+
 **`kexinit.wac`** — negotiation, RFC 4253 §7.1. The rule is asymmetric: the chosen algorithm is
 **the client's first preference that the server also supports**. Server order is ignored. Getting
 that backwards yields a client that negotiates something plausible and disagrees with the server
@@ -103,12 +132,9 @@ Terrapin attack (CVE-2023-48795) used to shift sequence numbers.
 
 In the order it is needed:
 
-1. **The cipher** — `chacha20-poly1305@openssh.com`. Not the RFC 8439 AEAD: two keys, the length
-   field encrypted separately, and the MAC over the ciphertext. Buildable from `chacha20` and
-   `poly1305`, and the easiest thing here to get subtly wrong.
-2. **Authentication** — `publickey` with ed25519. Encrypted private keys are already readable;
+1. **Authentication** — `publickey` with ed25519. Encrypted private keys are already readable;
    `bcrypt_pbkdf` landed in crypto for this.
-3. **The connection protocol** — channels, window adjustment, `exec`.
+2. **The connection protocol** — channels, window adjustment, `exec`.
 
 `known_hosts` is a byte comparison against the host key blob, so there is no X.509 and no chain
 building — which is the main reason this is a smaller job than the TLS client already in the repo.

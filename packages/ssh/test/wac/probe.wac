@@ -180,3 +180,34 @@ export bool sshVerifyHostKey(u8[] hostKey, u8[] signature, u8[] h) {
 export u8[] sshDeriveKey(u8[] k, u8[] h, u8[] sessionId, i32 letter, i32 needed) {
   return deriveKey(k, h, sessionId, letter, needed);
 }
+
+// ── The cipher ────────────────────────────────────────────────────────────────
+
+import { Opened, Plain, aeadPaddingFor, keyLength, open, peekLength, seal, sealBody, tagLength }
+  from "../../src/cipher.wac";
+
+export i32 sshCipherKeyLength() { return keyLength(); }
+export i32 sshCipherTagLength() { return tagLength(); }
+export i32 sshAeadPaddingFor(i32 n, i32 block) { return aeadPaddingFor(n, block); }
+export u8[] sshSeal(u8[] key, i32 seq, u8[] payload, u8[] random, i32 block) {
+  return seal(key, seq, payload, random, block);
+}
+export i32 sshPeekLength(u8[] key, i32 seq, u8[] src, i32 at) { return peekLength(key, seq, src, at); }
+
+/** 0 = ok, 1 = incomplete, 2 = bad. */
+export i32 sshOpenStatus(u8[] key, i32 seq, u8[] src, i32 at, i32 end, i32 maxPacket) {
+  match (open(key, seq, src, at, end, maxPacket).status) {
+    case Ok: return 0;
+    case Incomplete: return 1;
+    else: return 2;
+  }
+}
+export u8[] sshOpenPayload(u8[] key, i32 seq, u8[] src, i32 at, i32 end, i32 maxPacket) {
+  return open(key, seq, src, at, end, maxPacket).payload;
+}
+export i32 sshOpenUsed(u8[] key, i32 seq, u8[] src, i32 at, i32 end, i32 maxPacket) {
+  return open(key, seq, src, at, end, maxPacket).used;
+}
+
+/** A packet that authenticates but whose body is whatever the caller says. */
+export u8[] sshSealBody(u8[] key, i32 seq, u8[] body) { return sealBody(key, seq, body); }
