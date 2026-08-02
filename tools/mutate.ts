@@ -359,7 +359,15 @@ try {
 
     const dirs = testDirs(mutant);
     const cmd = new Deno.Command("deno", {
-      args: ["test", "--allow-read", "--allow-write", "--allow-run", "--quiet", ...dirs],
+      // The same permissions as `deno task test`. Anything less does not merely skip a test:
+      // a permission error fails the whole run, the exit code is non-zero, and the mutant is
+      // recorded as killed by a mutation nobody detected. crypto, http, server and tls all
+      // failed their *unmutated* baseline this way, which is a third of the mutants scoring
+      // themselves correct for free.
+      args: [
+        "test", "--allow-read", "--allow-write", "--allow-run", "--allow-net", "--allow-env",
+        "--quiet", ...dirs,
+      ],
       cwd: work,
       stdout: "piped",
       stderr: "piped",
