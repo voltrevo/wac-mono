@@ -11,7 +11,7 @@
 import { instrument, report } from "../../harness/wacCoverage.ts";
 import { weightBytes } from "./test/frames.ts";
 import { writeDescription } from "./test/writer.ts";
-import { literalsSection } from "./test/frames.ts";
+import { literalsSection, zstd } from "./test/frames.ts";
 
 const verbose = Deno.args.includes("--verbose");
 
@@ -334,6 +334,179 @@ for (
   for (const count of [1, 2, 3]) ignoringTraps(() => h.decodeLiterals(t, four, 0, four.length, count, 4));
 }
 
+// ── Whole frames ──────────────────────────────────────────────────────────────
+//
+// Now that a compressed block decodes, the shortest route through most of this package is a
+// real frame. The corpus is chosen for the codings it makes the encoder reach — every literals
+// kind, every sequence-code mode, blocks of different types meeting in one frame — rather than
+// for realism.
+
+const wide = [
+  "",
+  "x",
+  "hello hello hello hello world",
+  "ab".repeat(20000),
+  "the quick brown fox jumps over the lazy dog, and again. ".repeat(6000),
+  JSON.stringify(Array.from({ length: 60000 }, (_, i) => ({ id: i, name: "item" + i }))),
+  Array.from({ length: 40000 }, (_, i) => `2026-08-02T10:00:00Z INFO id=${i} path=/api status=200 ms=${i % 97}\n`).join(""),
+  "\u0000".repeat(50000),
+  // High entropy with occasional long repeats: matches, so the block is compressed, but
+  // literals that Huffman cannot help — which is a *raw* literals section inside a compressed
+  // block, and past 4096 bytes it uses the widest header form.
+  (() => {
+    let s = 0x1234 | 0;
+    const parts: string[] = [];
+    for (let i = 0; i < 40; i++) {
+      let noise = "";
+      for (let j = 0; j < 6000; j++) {
+        s ^= s << 13; s >>>= 0;
+        s ^= s >>> 17;
+        s ^= s << 5; s >>>= 0;
+        noise += String.fromCharCode(s & 0xff);
+      }
+      parts.push(noise, "a repeated marker phrase that definitely matches. ".repeat(20));
+    }
+    return parts.join("");
+  })(),
+];
+for (const text of wide) {
+  for (const level of [1, 9, 19]) {
+    const frame = await zstd(text, level);
+    ignoringTraps(() => m.decompress(frame));
+  }
+  // The same content with a checksum, so the trailer is read and verified rather than skipped.
+  const summed = await zstd(text, 3, true);
+  ignoringTraps(() => m.decompress(summed));
+  // And with its checksum broken, which is the only path that reaches the mismatch.
+  if (summed.length > 4) {
+    const bad = summed.slice();
+    bad[bad.length - 1] ^= 0x40;
+    ignoringTraps(() => m.decompress(bad));
+  }
+}
+
+// Truncations and corruptions of real frames.
+//
+// Every refusal in the block, sequence and Huffman code is only reachable from data that was
+// nearly right — a random byte string trips the magic and gets no further. So: take frames that
+// exercise different codings, and damage them one byte at a time, exhaustively. A sampled sweep
+// reached about half of these; the checks are close enough together that stepping over bytes
+// steps over whole branches.
+{
+  const frames = [
+    await zstd("the quick brown fox jumps over the lazy dog. ".repeat(2000), 9),
+    await zstd(JSON.stringify(Array.from({ length: 400 }, (_, i) => ({ id: i, n: "x".repeat(i % 13) }))), 19),
+    await zstd("ab".repeat(3000), 1),
+    await zstd("\u0000".repeat(9000), 3),
+    await zstd("hello hello hello world", 1),
+    await zstd("mixed content, some of it repeated. ".repeat(50) + "\u00ff\u00fe\u00fd", 3, true),
+  ];
+  for (const frame of frames) {
+    for (let i = 0; i <= frame.length; i++) ignoringTraps(() => m.decompress(frame.slice(0, i)));
+    for (let i = 0; i < frame.length; i++) {
+      for (const mask of [0x01, 0x40, 0xff]) {
+        const bad = frame.slice();
+        bad[i] ^= mask;
+        ignoringTraps(() => m.decompress(bad));
+      }
+    }
+  }
+}
+
+// Compressed blocks built by hand, short enough to stop inside their own headers.
+//
+// Fuzzing a real frame cannot reach these: damaging a block header makes the block loop refuse
+// it before the literals header is ever read, so the only way to truncate a literals header is
+// to declare a block that is shorter than one. Every first byte selects a different kind and
+// size format, and so a different width to run out of.
+{
+  const oneBlock = (body: number[]): Uint8Array => {
+    const header = (body.length << 3) | (2 << 1) | 1;      // last block, compressed
+    return new Uint8Array([
+      0x28, 0xb5, 0x2f, 0xfd, 0x20, 8,                     // magic, single segment, 8 bytes out
+      header & 0xff, (header >>> 8) & 0xff, (header >>> 16) & 0xff,
+      ...body,
+    ]);
+  };
+  ignoringTraps(() => m.decompress(oneBlock([])));       // a block with no body at all
+  for (let first = 0; first < 16; first++) {
+    for (let n = 0; n <= 10; n++) {
+      const body = [first];
+      for (let i = 1; i < n; i++) body.push(0x00);
+      ignoringTraps(() => m.decompress(oneBlock(body)));
+      const filled = [first];
+      for (let i = 1; i < n; i++) filled.push(0xff);
+      ignoringTraps(() => m.decompress(oneBlock(filled)));
+    }
+  }
+  // A literals section whose tree description uses up the whole section, leaving no stream —
+  // and sequence sections that stop inside their own count, mode byte or RLE table byte.
+  for (let treeBytes = 1; treeBytes <= 6; treeBytes++) {
+    for (let comp = 1; comp <= 8; comp++) {
+      // kind 2, size format 0: a three-byte header with 10-bit regenerated and compressed sizes.
+      const b0 = 0x02 | (0 << 2) | ((8 & 15) << 4);
+      const b1 = (8 >>> 4) | ((comp & 63) << 6);
+      const b2 = comp >>> 2;
+      const body = [b0, b1, b2, 128 + treeBytes];
+      for (let i = 0; i < treeBytes; i++) body.push(0x11);
+      ignoringTraps(() => m.decompress(oneBlock(body)));
+    }
+  }
+  for (const tail of [[0x80], [0xff], [0xff, 0x01], [0x01], [0x01, 0x00], [0x01, 0x24], [0x01, 0x24, 0x00]]) {
+    // A raw literals section of length zero, then a sequences section that stops early.
+    ignoringTraps(() => m.decompress(oneBlock([0x00, ...tail])));
+  }
+
+  // The repeat-offset slot that cannot be filled.
+  //
+  // Every code in RLE mode, so the symbols are fixed and no state bits are read: literal length
+  // code 0 (no literals), match length code 0, offset code 1 with its one extra bit set. That
+  // makes the offset value 3, and with no literals the numbering shifts to "the most recent
+  // offset, minus one" — which at the start of a frame is 1 - 1. There is nothing one byte
+  // before the beginning, so the block has to be refused.
+  //
+  // Reachable only from a stream no encoder would write, and only as the *first* sequence, so
+  // fuzzing a real frame never lands on it.
+  ignoringTraps(() => m.decompress(oneBlock([
+    0x00,        // raw literals, none of them
+    0x01,        // one sequence
+    0x54,        // literal length, offset and match length all in RLE mode
+    0x00,        // literal length code 0
+    0x01,        // offset code 1
+    0x00,        // match length code 0
+    0x03,        // one usable bit, set: the offset code's extra bit
+  ])));
+
+  // Literals headers that are complete but claim sizes the block cannot hold, so the refusal
+  // is about the section rather than about running out of bytes.
+  for (const claim of [[0x02, 0xff, 0xff], [0x06, 0xff, 0xff], [0x0a, 0xff, 0xff, 0xff], [0x0e, 0xff, 0xff, 0xff, 0xff]]) {
+    for (let extra = 0; extra <= 6; extra++) {
+      const body = [...claim];
+      for (let i = 0; i < extra; i++) body.push(0x11);
+      ignoringTraps(() => m.decompress(oneBlock(body)));
+    }
+  }
+}
+
+// XXH64 directly, for the bounds it refuses — nothing inside a frame can ask for a range
+// outside the output, so those are only reachable from a caller.
+{
+  const xx = fse.mod as unknown as Record<string, unknown>;
+  void xx;
+  const x = huff.mod as unknown as Record<string, unknown>;
+  void x;
+}
+const hash = await instrument("packages/zstd/src/xxh64.wac");
+const hx = hash.mod as unknown as { xxh64(d: Uint8Array, start: number, len: number): bigint };
+{
+  const d = new Uint8Array(200);
+  for (let i = 0; i < d.length; i++) d[i] = (i * 37 + 11) & 0xff;
+  for (let n = 0; n <= 140; n++) ignoringTraps(() => hx.xxh64(d, 0, n));
+  for (const [start, len] of [[0, 201], [1, 200], [-1, 1], [0, -1], [200, 1]] as [number, number][]) {
+    ignoringTraps(() => hx.xxh64(d, start, len));
+  }
+}
+
 /**
  * Branches that no input can reach, with the argument for each.
  *
@@ -354,7 +527,7 @@ const UNREACHABLE: { file: string; line: number; snippet: string; why: string }[
   },
   {
     file: "packages/zstd/src/fse.wac",
-    line: 251,
+    line: 263,
     snippet: "if (len <= 0) { trap; }",
     why: "decompress refuses a description with nothing behind it before constructing a " +
       "BackBits, so the only caller in this package cannot pass a non-positive length. The " +
@@ -363,7 +536,7 @@ const UNREACHABLE: { file: string; line: number; snippet: string; why: string }[
   },
 ];
 
-report([run, fse, huff], "packages/zstd/", { verbose });
+report([run, fse, huff, hash], "packages/zstd/", { verbose });
 
 const source = await Deno.readTextFile("packages/zstd/src/fse.wac");
 const lines = source.split("\n");

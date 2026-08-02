@@ -5,9 +5,13 @@
 // reading of the specification, so anything that interprets them has to be right.
 
 /** Compress with Node's zstd. */
-export async function zstd(text: string): Promise<Uint8Array> {
+export async function zstd(text: string, level?: number, checksum = false): Promise<Uint8Array> {
+  const params = [
+    level === undefined ? "" : `p[z.constants.ZSTD_c_compressionLevel]=${level};`,
+    checksum ? "p[z.constants.ZSTD_c_checksumFlag]=1;" : "",
+  ].join("");
   const cmd = new Deno.Command("node", {
-    args: ["-e", `const z=require("zlib");const c=[];process.stdin.on("data",d=>c.push(d)).on("end",()=>process.stdout.write(z.zstdCompressSync(Buffer.concat(c))))`],
+    args: ["-e", `const z=require("zlib");const c=[];process.stdin.on("data",d=>c.push(d)).on("end",()=>{const p={};${params}process.stdout.write(z.zstdCompressSync(Buffer.concat(c),{params:p}))})`],
     stdin: "piped",
     stdout: "piped",
   });
@@ -96,3 +100,47 @@ export async function weightBytes(text: string): Promise<Uint8Array | null> {
   return frame.slice(treeAt + 1, treeAt + 1 + headerByte);
 }
 
+
+
+/**
+ * Which literals kinds and sequence-code modes a frame actually uses.
+ *
+ * A decoder has four literals kinds and four modes per sequence code, and an encoder picks
+ * whichever is cheapest — so a corpus can exercise a decoder thoroughly and still never reach
+ * half of it. This says what was reached, so a test can assert on it rather than hope.
+ */
+const KIND = ["raw","rle","compressed","treeless"], MODE = ["predefined","rle","fse","repeat"];
+export function frameShapes(buf: Uint8Array): { kinds: string[]; modes: string[] } {
+  const kinds: string[] = [], modes: string[] = [];
+  let p = 4; const fhd = buf[p++];
+  const fcs = fhd >> 6, single = (fhd >> 5) & 1, did = fhd & 3;
+  if (!single) p++;
+  p += [0,1,2,4][did];
+  p += fcs === 0 ? (single ? 1 : 0) : [1,2,4,8][fcs];
+  for (;;) {
+    const h = buf[p] | (buf[p+1] << 8) | (buf[p+2] << 16);
+    const last = h & 1, type = (h >> 1) & 3, size = h >>> 3;
+    const body = p + 3;
+    if (type === 2) {
+      const b0 = buf[body], kind = b0 & 3, fmt = (b0 >> 2) & 3;
+      kinds.push(KIND[kind]);
+      let hdr = 0, comp = 0;
+      if (kind < 2) {
+        if ((fmt & 1) === 0) { hdr = 1; comp = kind === 1 ? 1 : (b0 >> 3); }
+        else if (fmt === 1) { hdr = 2; const r = (b0>>4)|(buf[body+1]<<4); comp = kind === 1 ? 1 : r; }
+        else { hdr = 3; const r = (b0>>4)|(buf[body+1]<<4)|(buf[body+2]<<12); comp = kind === 1 ? 1 : r; }
+      } else if (fmt <= 1) { hdr = 3; comp = ((buf[body+1] >> 6) | (buf[body+2] << 2)) & 0x3ff; }
+      else if (fmt === 2) { hdr = 4; comp = ((buf[body+2] >> 2) | (buf[body+3] << 6)) & 0x3fff; }
+      else { hdr = 5; comp = ((buf[body+2] >> 6) | (buf[body+3] << 2) | (buf[body+4] << 10)) & 0x3ffff; }
+      let q = body + hdr + comp;
+      const b = buf[q];
+      let nb: number;
+      if (b < 128) { nb = b; q += 1; } else if (b < 255) { nb = ((b-128)<<8) + buf[q+1]; q += 2; } else { nb = buf[q+1] + (buf[q+2]<<8) + 32512; q += 3; }
+      if (nb > 0) { const m = buf[q]; modes.push(`LL:${MODE[(m>>6)&3]} OF:${MODE[(m>>4)&3]} ML:${MODE[(m>>2)&3]}`); }
+      else modes.push("no sequences");
+    }
+    p = body + (type === 1 ? 1 : size);
+    if (last) break;
+  }
+  return { kinds, modes };
+}

@@ -1,0 +1,119 @@
+// XXH64, which is the checksum a zstd frame may carry.
+//
+// Not a cryptographic hash and not trying to be: it is a fast integrity check, and the frame
+// stores only its low 32 bits. What it catches is a frame that decoded without complaint into
+// the wrong bytes — the failure mode that matters most here, because every other check in this
+// package is about whether the *encoding* made sense, not whether the answer is right.
+//
+// Four accumulators over 32-byte stripes, then a tail, then an avalanche. The multiplications
+// are meant to overflow; that is where the mixing comes from.
+
+u64 prime1() { return 0x9E3779B185EBCA87; }
+u64 prime2() { return 0xC2B2AE3D27D4EB4F; }
+u64 prime3() { return 0x165667B19E3779F9; }
+u64 prime4() { return 0x85EBCA77C2B2AE63; }
+u64 prime5() { return 0x27D4EB2F165667C5; }
+
+u64 rotl(u64 v, i32 n) {
+  u64 k = n as! u64;
+  return (v << k) | (v >> (64 as! u64 - k));
+}
+
+/** Fold one 64-bit word into an accumulator. */
+u64 round(u64 acc, u64 input) {
+  u64 a = acc + input * prime2();
+  a = rotl(a, 31);
+  return a * prime1();
+}
+
+/** Fold a finished accumulator into the combined one. */
+u64 mergeRound(u64 acc, u64 val) {
+  u64 v = round(0, val);
+  u64 a = acc ^ v;
+  return a * prime1() + prime4();
+}
+
+/** Eight bytes, little-endian. */
+u64 read64(u8[] d, i32 at) {
+  u64 v = 0;
+  for (i32 i = 0; i < 8; i++) {
+    v = v | ((d[at + i] as! u64) << ((i * 8) as! u64));
+  }
+  return v;
+}
+
+/** Four bytes, little-endian. */
+u64 read32(u8[] d, i32 at) {
+  u64 v = 0;
+  for (i32 i = 0; i < 4; i++) {
+    v = v | ((d[at + i] as! u64) << ((i * 8) as! u64));
+  }
+  return v;
+}
+
+/** XXH64 of `d[start, start+len)` with seed zero, which is what zstd uses. */
+export u64 xxh64(u8[] d, i32 start, i32 len) {
+  if (start < 0 || len < 0 || start + len > d.len()) { trap; }
+
+  u64 acc = 0;
+  i32 at = start;
+  i32 end = start + len;
+
+  if (len >= 32) {
+    // Four lanes so the multiplies are independent; they are combined once at the end.
+    u64 a1 = prime1() + prime2();
+    u64 a2 = prime2();
+    u64 a3 = 0;
+    u64 a4 = 0 - prime1();
+    while (end - at >= 32) {
+      a1 = round(a1, read64(d, at));
+      a2 = round(a2, read64(d, at + 8));
+      a3 = round(a3, read64(d, at + 16));
+      a4 = round(a4, read64(d, at + 24));
+      at += 32;
+    }
+    acc = rotl(a1, 1) + rotl(a2, 7) + rotl(a3, 12) + rotl(a4, 18);
+    acc = mergeRound(acc, a1);
+    acc = mergeRound(acc, a2);
+    acc = mergeRound(acc, a3);
+    acc = mergeRound(acc, a4);
+  } else {
+    acc = prime5();
+  }
+
+  acc += len as! u64;
+
+  while (end - at >= 8) {
+    acc = acc ^ round(0, read64(d, at));
+    acc = rotl(acc, 27) * prime1() + prime4();
+    at += 8;
+  }
+  if (end - at >= 4) {
+    acc = acc ^ (read32(d, at) * prime1());
+    acc = rotl(acc, 23) * prime2() + prime3();
+    at += 4;
+  }
+  while (at < end) {
+    acc = acc ^ ((d[at] as! u64) * prime5());
+    acc = rotl(acc, 11) * prime1();
+    at++;
+  }
+
+  // Avalanche: spread every input bit across the whole word.
+  acc = acc ^ (acc >> (33 as! u64));
+  acc = acc * prime2();
+  acc = acc ^ (acc >> (29 as! u64));
+  acc = acc * prime3();
+  acc = acc ^ (acc >> (32 as! u64));
+  return acc;
+}
+
+/**
+ * The low 32 bits, which is all a frame stores.
+ *
+ * `as@` and not `as~`: the raw cast keeps the low bits, where the nearest cast would clamp a
+ * hash above 2^32 to 0xFFFFFFFF and quietly make almost every checksum agree with itself.
+ */
+export u32 xxh64Low(u8[] d, i32 start, i32 len) {
+  return xxh64(d, start, len) as@ u32;
+}
