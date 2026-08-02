@@ -11,8 +11,8 @@
     "See 'Keeping the compiler pin current' in README.md. Checked by",
     "harness/wacVersion.ts on the first wacBind of a run."
   ],
-  "commit": "04f6cc41e450a760b94aa287c79d935b74190a1c",
-  "shortCommit": "04f6cc4",
-  "reason": "emit: a funcref parameter shadows a function of the same name (\u00a7wac-param-shadows-func-5nkq2wp) \u2014 box's HTTP applets hit it",
+  "commit": "00a83c6f6c6db6f3e8f80e2f91dfa90b4d2a1c0e",
+  "shortCommit": "00a83c6",
+  "reason": "bindgen: a module larger than ~120KB could not be emitted (\u00a7wac-bindgen-large-6wkq3np) \u2014 box hit it on importing zstd",
   "updated": "2026-08-02"
 }

@@ -1,0 +1,43 @@
+// The input's lines in a random order. `-<n>` for at most n of them.
+//
+// Fisher-Yates over `randomBytes`, which is the second consumer of that capability and the
+// reason the modulo below is done the careful way: taking a 32-bit value mod `i + 1`
+// favours the low end unless the values that would skew it are rejected.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { joinLines, splitLines } from "../lib/lines.wac";
+
+export i32 shuf(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  u8[][] lines = splitLines(in.bytes);
+  i32 n = lines.len();
+  for (i32 i = n - 1; i > 0; i--) {
+    i32 j = below(core, i + 1);
+    u8[] t = lines[i];
+    lines[i] = lines[j];
+    lines[j] = t;
+  }
+  i32 take = a.num == 0 || a.num > n ? n : a.num;
+  cli.write(joinLines(lines, take));
+  return 0;
+}
+
+/**
+ * A uniform value in `[0, bound)`.
+ *
+ * Rejection rather than a bare modulo: 2^32 is not a multiple of most bounds, so the
+ * remainder favours the low values. The loop retries the sliver that would skew it, which
+ * for any real bound is almost never.
+ */
+i32 below(Core core, i32 bound) {
+  i64 limit = 4294967296 - (4294967296 % (bound as i64));
+  while (true) {
+    u8[] r = core.randomBytes(4);
+    i64 v = (r[0] as i64) | ((r[1] as i64) << 8) | ((r[2] as i64) << 16) | ((r[3] as i64) << 24);
+    if (v < limit) { return (v % (bound as i64)) as~ i32; }
+  }
+  return 0;
+}

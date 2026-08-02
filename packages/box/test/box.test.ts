@@ -909,3 +909,113 @@ Deno.test("box's network applets: a wac server and a wac client, over real TCP",
     await Deno.remove(built);
   }
 });
+
+Deno.test("box's newest batch: sponge, zstd, json, stat, uuid, shuf, paste, yes", async () => {
+  const built = await Deno.makeTempFile({ prefix: "wac-b3-" });
+  const dir = await Deno.makeTempDir({ prefix: "wac-b3-d-" });
+  try {
+    await buildApp(BOX, built, { read: true, write: true });
+    const run = (args: string[]) => {
+      const r = new Deno.Command(built, { args, stdout: "piped", stderr: "piped" }).outputSync();
+      return { code: r.code, out: new TextDecoder().decode(r.stdout), err: new TextDecoder().decode(r.stderr) };
+    };
+    const pipe = async (args: string[], input: Uint8Array) => {
+      const c = new Deno.Command(built, { args, stdin: "piped", stdout: "piped", stderr: "piped" }).spawn();
+      const w = c.stdin.getWriter();
+      w.write(input).then(() => w.close());
+      return await c.output();
+    };
+    const enc = new TextEncoder();
+
+    // ── sponge: the applet that only exists because of the atomic write ──
+    // `box sort f | box sponge f` works where `sort f > f` cannot, because the shell
+    // truncates `f` before `sort` has read a byte of it. That is the whole point.
+    const target = `${dir}/inplace`;
+    const original = "delta\nalpha\ncharlie\nbravo\n";
+    await Deno.writeTextFile(target, original);
+    const sorter = new Deno.Command(built, { args: ["sort", target], stdout: "piped" }).outputSync();
+    const soak = await pipe(["sponge", target], sorter.stdout);
+    assertEquals(soak.code, 0, new TextDecoder().decode(soak.stderr));
+    assertEquals(await Deno.readTextFile(target), "alpha\nbravo\ncharlie\ndelta\n", "sorted in place");
+    // And no temporary file survived it.
+    const left: string[] = [];
+    for await (const e of Deno.readDir(dir)) left.push(e.name);
+    assertEquals(left.join(","), "inplace", `left behind: ${left}`);
+
+    // ── zstd: the largest package here, round-tripped ──
+    const raw = await Deno.readFile("README.md");
+    const squeezed = (await pipe(["zstd"], raw)).stdout;
+    assertEquals(squeezed.length < raw.length, true, "zstd did not compress");
+    assertSameBytes((await pipe(["unzstd"], squeezed)).stdout, raw, "zstd round trip");
+
+    // ── json: canonical output, and a real parse error ──
+    const canon = await pipe(["json", "-c"], enc.encode(`{"b":1,"a":[2, 3 ],"c":"x"}`));
+    assertEquals(new TextDecoder().decode(canon.stdout).trim(), `{"b":1,"a":[2,3],"c":"x"}`);
+    // Two spellings of the same document canonicalise identically, which is the property
+    // that makes this worth having on a pipe rather than a pretty-printer.
+    const spaced = await pipe(["json", "-c"], enc.encode(`{ "b" : 1 , "a" : [ 2 , 3 ] , "c" : "x" }`));
+    assertEquals(new TextDecoder().decode(spaced.stdout), new TextDecoder().decode(canon.stdout));
+    // Without -c it is a validator: silent and exit 0, so it composes in a test.
+    const valid = await pipe(["json"], enc.encode(`[1,2,3]`));
+    assertEquals(valid.code, 0);
+    assertEquals(valid.stdout.length, 0, "a validator says nothing");
+    const bad = await pipe(["json"], enc.encode(`{"a":}`));
+    assertEquals(bad.code, 1);
+    assertEquals(new TextDecoder().decode(bad.stderr).includes("invalid JSON at byte"), true);
+
+    // ── stat: the capability nothing surfaced ──
+    await Deno.writeTextFile(`${dir}/sized`, "12345");
+    const st = run(["stat", `${dir}/sized`, dir]);
+    assertEquals(st.code, 0, st.err);
+    const rows = st.out.trim().split("\n");
+    assertEquals(rows[0].includes(" file 5 "), true, rows[0]);
+    assertEquals(rows[1].includes(" directory "), true, rows[1]);
+    // The mtime is RFC 3339 and recent, which is `datetime` doing the work.
+    const when = Date.parse(rows[0].split(" ").pop()!);
+    assertEquals(Math.abs(when - Date.now()) < 120_000, true, rows[0]);
+    assertEquals(run(["stat", `${dir}/absent`]).code, 1, "a missing path is an error");
+
+    // ── uuid: version 4, and different every time ──
+    const ids = run(["uuid", "-20"]).out.trim().split("\n");
+    assertEquals(ids.length, 20);
+    for (const id of ids) {
+      assertEquals(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id),
+        true,
+        `not a v4 uuid: ${id}`,
+      );
+    }
+    assertEquals(new Set(ids).size, 20, "twenty draws should be twenty values");
+
+    // ── shuf: a permutation, not a sample ──
+    const lines = Array.from({ length: 200 }, (_, i) => `line${i}`);
+    await Deno.writeTextFile(`${dir}/lines`, lines.join("\n") + "\n");
+    const shuffled = run(["shuf", `${dir}/lines`]).out.trim().split("\n");
+    assertEquals(shuffled.length, 200);
+    assertEquals(shuffled.slice().sort().join(","), lines.slice().sort().join(","), "same lines");
+    assertEquals(shuffled.join(",") !== lines.join(","), true, "and in some other order");
+    assertEquals(run(["shuf", "-5", `${dir}/lines`]).out.trim().split("\n").length, 5);
+
+    // ── paste, against the real one ──
+    await Deno.writeTextFile(`${dir}/p1`, "a\nb\n");
+    await Deno.writeTextFile(`${dir}/p2`, "1\n2\n3\n");
+    const sys = new Deno.Command("paste", {
+      args: [`${dir}/p1`, `${dir}/p2`], stdout: "piped", stderr: "null",
+    }).outputSync();
+    assertEquals(run(["paste", `${dir}/p1`, `${dir}/p2`]).out, new TextDecoder().decode(sys.stdout));
+
+    // ── yes: the only applet that never ends on its own ──
+    // It stops because `write` reports the closed pipe. Without that answer it would spin,
+    // which is why `write` returns a bool at all.
+    const yes = new Deno.Command(built, { args: ["yes", "wac"], stdout: "piped", stderr: "null" }).spawn();
+    const reader = yes.stdout.getReader();
+    const first = await reader.read();
+    assertEquals(new TextDecoder().decode(first.value).startsWith("wac\nwac\n"), true);
+    await reader.cancel();
+    const status = await yes.status;
+    assertEquals(status.success || status.signal !== null, true, "yes stopped when the pipe closed");
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(dir, { recursive: true });
+  }
+});

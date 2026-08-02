@@ -1,0 +1,17 @@
+// Decompress Zstandard.
+//
+// `packages/zstd` is the largest package here and nothing had put it on a pipe. Unlike
+// `gzip` it has no streaming form, so this holds its input — the honest note being that
+// the limit is the package's, not the world's.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { decompress } from "../../../zstd/src/frame.wac";
+
+export i32 unzstd(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  cli.write(decompress(in.bytes));
+  return 0;
+}

@@ -1,6 +1,6 @@
 # box — a busybox, written in wac
 
-Forty-four applets in one program, chosen by the first argument. No TypeScript: `src/` is
+Fifty-two applets in one program, chosen by the first argument. No TypeScript: `src/` is
 wac and the only thing outside it is the test suite.
 
 It exists to exercise `packages/platform`'s capability world more widely than a single
@@ -16,10 +16,10 @@ cat README.md | ./box sort -u | ./box wc -l
 ```
 
 ```
-base32 base64 basename cat cp crc32 cut date dirname du echo false fold
-find get grep gunzip gzip head hex ls mkdir mv nl rev rm rmdir seq serve
-sha256sum sha512sum sort strings tac tail tee touch tr true uniq
-urldecode urlencode wc
+base32 base64 basename cat cp crc32 cut date dirname du echo false find
+fold get grep gunzip gzip head hex json ls mkdir mv nl paste rev rm rmdir
+seq serve sha256sum sha512sum shuf sort sponge stat strings tac tail tee
+touch tr true uniq unzstd urldecode urlencode uuid wc yes zstd
 ```
 
 111K, drawing on this repo's `crypto`, `codec`, `regex`, `gzip`, `datetime` and `url`
@@ -102,6 +102,17 @@ must watch standard input and a socket at once, and nothing here can.
 `-o` serves one connection and exits. Not `-1` — a leading digit is how this argument
 parser spells a number, so `serve -8080 -1` listened on port 1.
 
+## sponge, and why the mutation tier exists
+
+```sh
+box sort f | box sponge f     # works
+box sort f > f                # truncates f before sort reads it
+```
+
+`sponge` soaks up all of standard input and only then touches the target, through
+`lib/safe.wac`'s write-beside-and-rename. It is the applet that makes the point of the
+mutation tier visible rather than buried inside `cp`.
+
 ## What streams and what does not
 
 Memory scales with the input only where it has to. The audit is worth stating explicitly,
@@ -114,7 +125,8 @@ because "cannot stream" turned out to be wrong twice:
 | **Cannot** | tee | two sinks at once, and the world has one current output |
 | **Could, given an API** | sha256sum sha512sum | `crypto` hashes a whole message; it wants `Start`/`Update`/`Finish`, which `crc32` already has |
 | **Could, given an API** | base64 base32 | `codec` encodes a whole array, including the padding, so a chunk cannot be encoded on its own |
-| **Not worth it** | urlencode urldecode basename dirname date echo seq | the input is a line or less |
+| **Cannot** | zstd unzstd | `packages/zstd` has no streaming form — a package limit, not the world's |
+| **Not worth it** | urlencode urldecode basename dirname date echo seq json stat uuid shuf paste sponge | the input is a line, or the job needs all of it anyway |
 
 Two that are easy to get wrong: **`tail` streams** — it has to *reach* the end but only
 has to *hold* N lines, so a ring of N costs what the flag asks for. **`head` need not
