@@ -17,3 +17,8 @@ export bool pathAllows(i32[] c, i32 cand, u8[] a, i32[] fs, i32[] fo, bool same)
   return pa(c, cand, a, fs, fo, same);
 }
 export bool sameSubnet16(u8[] a, u8[] b) { return ss(a, b); }
+
+import { portPermitted as pp } from "../../src/pathsel.wac";
+export bool portPermitted(bool isAccept, i32[] ranges, i32 port) {
+  return pp(isAccept, ranges, port);
+}

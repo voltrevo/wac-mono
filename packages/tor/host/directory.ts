@@ -29,7 +29,38 @@ export type Relay = {
   flags: string[];
   microdescDigest: string; // base64, unpadded — the key into the microdescriptor set
   ntorOnionKey?: Uint8Array; // 32 bytes, once the microdescriptor is matched up
+  /** The exit policy summary, if the microdescriptor carried one. */
+  exitPolicy?: ExitPolicy;
+  /** Relays this one declares kinship with, as written — resolved elsewhere, and only
+   *  believed when mutual. */
+  family?: string[];
 };
+
+/** A policy summary: `accept 80,443` or `reject 25,119,135-139`, with inclusive ranges. */
+export type ExitPolicy = { isAccept: boolean; ranges: number[] };
+
+/**
+ * A `p` line's port list, flattened to lo, hi, lo, hi.
+ *
+ * An unparseable entry is dropped rather than guessed at. Under `accept` that narrows what
+ * the relay is believed to carry and under `reject` it widens it — so the safe direction
+ * differs by polarity and there is no single conservative default. Dropping keeps the
+ * summary honest about the parts that were understood; a relay whose whole line is
+ * unreadable ends up with an empty list, which under `accept` means "no ports" and under
+ * `reject` means "all", both of which are what the words say.
+ */
+export function parsePolicy(line: string): ExitPolicy | undefined {
+  const m = line.match(/^p (accept|reject) (\S+)$/);
+  if (m === null) return undefined;
+  const ranges: number[] = [];
+  for (const part of m[2].split(",")) {
+    const range = part.match(/^(\d+)-(\d+)$/);
+    const single = part.match(/^(\d+)$/);
+    if (range !== null) ranges.push(Number(range[1]), Number(range[2]));
+    else if (single !== null) ranges.push(Number(single[1]), Number(single[1]));
+  }
+  return { isAccept: m[1] === "accept", ranges };
+}
 
 function b64(s: string): Uint8Array {
   // Directory documents use unpadded base64 throughout, which atob rejects.
@@ -73,8 +104,16 @@ export function parseConsensus(text: string): Relay[] {
  * cache's own `@`-prefixed annotations instead would mean a relay could serve a
  * microdescriptor holding somebody else's key.
  */
-export async function parseMicrodescriptors(text: string): Promise<Map<string, Uint8Array>> {
-  const out = new Map<string, Uint8Array>();
+export type Microdescriptor = {
+  ntorOnionKey: Uint8Array;
+  exitPolicy?: ExitPolicy;
+  family?: string[];
+};
+
+export async function parseMicrodescriptors(
+  text: string,
+): Promise<Map<string, Microdescriptor>> {
+  const out = new Map<string, Microdescriptor>();
   // Each microdescriptor starts at an "onion-key" line; the cache file interleaves
   // "@last-listed" annotations that are not part of the digested text.
   const lines = text.split("\n");
@@ -95,9 +134,28 @@ export async function parseMicrodescriptors(text: string): Promise<Map<string, U
     );
     const key = body.match(/^ntor-onion-key (\S+)/m);
     if (key === null) continue;
-    out.set(btoa(String.fromCharCode(...digest)).replace(/=+$/, ""), b64(key[1]));
+    const policyLine = body.match(/^p (?:accept|reject) \S+$/m);
+    const familyLine = body.match(/^family (.+)$/m);
+    out.set(btoa(String.fromCharCode(...digest)).replace(/=+$/, ""), {
+      ntorOnionKey: b64(key[1]),
+      exitPolicy: policyLine === null ? undefined : parsePolicy(policyLine[0]),
+      family: familyLine === null ? undefined : familyLine[1].split(" ").filter((s) => s !== ""),
+    });
   }
   return out;
+}
+
+/** Copy each microdescriptor's fields onto the relay that named it by digest. */
+export function attachMicrodescriptors(
+  relays: Relay[], micros: Map<string, Microdescriptor>,
+): void {
+  for (const r of relays) {
+    const m = micros.get(r.microdescDigest);
+    if (m === undefined) continue;
+    r.ntorOnionKey = m.ntorOnionKey;
+    r.exitPolicy = m.exitPolicy;
+    r.family = m.family;
+  }
 }
 
 /**
@@ -123,8 +181,7 @@ export async function relaysFromVerified(
     );
   }
   const relays = parseConsensus(consensus);
-  const micros = await parseMicrodescriptors(microdescs);
-  for (const r of relays) r.ntorOnionKey = micros.get(r.microdescDigest);
+  attachMicrodescriptors(relays, await parseMicrodescriptors(microdescs));
   return relays;
 }
 
@@ -147,8 +204,7 @@ export async function relaysFromChutney(
     );
   }
   const relays = parseConsensus(consensus);
-  const micros = await parseMicrodescriptors(microdescs);
-  for (const r of relays) r.ntorOnionKey = micros.get(r.microdescDigest);
+  attachMicrodescriptors(relays, await parseMicrodescriptors(microdescs));
   return relays;
 }
 

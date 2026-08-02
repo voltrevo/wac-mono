@@ -25,6 +25,7 @@ const entry = flags.find((a, i) => !a.startsWith("-") && !(targetAt >= 0 && i ==
 if (entry === undefined) {
   console.error(
     "usage: deno task app <entry.wac> [--allow-read] [--allow-write] [--allow-env]\n" +
+      "                    [--allow-net]\n" +
       "                    [--target deno|node] [-- args...]",
   );
   Deno.exit(2);
@@ -34,6 +35,10 @@ const grants: Grants = {
   read: flags.includes("--allow-read"),
   write: flags.includes("--allow-write"),
   env: flags.includes("--allow-env"),
+  // Missing here while `build.ts` had it, so a networked application ran when built and reported
+  // "network access not granted" under `deno task app` — the dev loop broken and the shipped
+  // artifact fine, which is the inverse of the failure this launcher exists to prevent.
+  net: flags.includes("--allow-net"),
 };
 const target = (targetAt >= 0 ? flags[targetAt + 1] : "deno") as Target;
 if (target !== "deno" && target !== "node") {

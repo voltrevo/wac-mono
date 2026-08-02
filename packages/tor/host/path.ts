@@ -15,13 +15,23 @@
 // So a guard is not a performance choice and rotating it "for freshness" is actively
 // harmful. This keeps a small sampled set and prefers the first one that works.
 //
-// ## What this is not
+// ## Network down is not guard down
 //
-// Real Tor's guard algorithm (proposal 271) is considerably more careful: it tracks
-// reachability over time, distinguishes "the network is down" from "this guard is down" so
-// that a captive portal cannot force rotation, and ages entries out of a sampled set on a
-// schedule. This samples, persists and prefers. The distinction that matters is that it does
-// not rotate on failure alone — see `markFailed`.
+// A client that treats every failure as the guard's fault walks down its own preference list
+// whenever the wifi drops, and comes back from a captive portal preferring its third guard
+// having learnt nothing true. Worse, that is something an attacker can arrange: make the
+// network look broken for two minutes and choose which of someone's guards they end up on.
+//
+// So when *every* sampled guard fails inside one short window, the conclusion is that the
+// network is unreachable, and the individual marks are dropped rather than kept. See
+// `markFailed`.
+//
+// ## What this is still not
+//
+// Proposal 271 also ages entries out of the sampled set on a schedule, keeps a confirmed
+// list separate from a primary list, and bounds how much of the network a client may ever
+// have sampled. This has the two properties that matter most — no rotation on failure, and
+// no rotation on a network outage — and not the bookkeeping around them.
 
 import { wacBind } from "../../../harness/wacBind.ts";
 import type { Relay } from "./directory.ts";
@@ -35,6 +45,9 @@ const choose = mod.choose as (
   weighted: BigInt64Array, chosen: Int32Array, addresses: Uint8Array,
   familyStart: Int32Array, familyOf: Int32Array, allowSameSubnet: boolean, r: bigint,
 ) => number;
+const portPermitted = mod.portPermitted as (
+  isAccept: boolean, ranges: Int32Array, port: number,
+) => boolean;
 
 export const POSITION = { guard: 0, middle: 1, exit: 2 } as const;
 
@@ -122,6 +135,15 @@ export type PathOptions = {
   allowSameSubnet?: boolean;
   /** Injectable for tests; must be uniform over the full range. */
   random?: () => bigint;
+  /**
+   * The port the circuit is for, so the exit is one whose policy will carry it.
+   *
+   * Optional, and its absence means "any exit will do" rather than "no port check" — for a
+   * directory circuit, which never leaves the network, that is the truth. For a circuit
+   * that will carry a stream, leaving it out picks exits that refuse the stream, and the
+   * refusal looks like a flaky network rather than a mistake here.
+   */
+  port?: number;
 };
 
 const defaultRandom = (): bigint => {
@@ -142,9 +164,15 @@ export class PathChooser {
   #family: { start: Int32Array; of: Int32Array };
 
   constructor(
-    relays: Relay[], consensus: string, families: Map<string, string[]> = new Map(),
+    relays: Relay[], consensus: string, families?: Map<string, string[]>,
   ) {
     this.#relays = relays;
+    // Declared families come off the microdescriptors unless the caller overrides them,
+    // which only tests do. Before this they were never populated at all, so the family rule
+    // was live code that no real data ever reached.
+    const declared = families ?? new Map(
+      relays.filter((r) => r.family !== undefined).map((r) => [r.nickname, r.family!]),
+    );
     const bw = parseBandwidths(consensus);
     this.#bandwidth = BigInt64Array.from(relays.map((r) => bw.get(r.nickname) ?? 0n));
     // Running and Valid are the flags that say a relay is usable at all; a client that
@@ -162,7 +190,7 @@ export class PathChooser {
       if (o.length === 4) this.#addresses.set(Uint8Array.from(o), i * 4);
     });
     this.#weights = parseWeights(consensus);
-    this.#family = resolveFamilies(relays, families);
+    this.#family = resolveFamilies(relays, declared);
   }
 
   get relays(): Relay[] {
@@ -187,7 +215,8 @@ export class PathChooser {
       const eligible = r.ntorOnionKey !== undefined &&
         r.flags.includes("Running") && r.flags.includes("Valid") &&
         (position !== POSITION.guard || this.#isGuard[i] === 1) &&
-        (position !== POSITION.exit || this.#isExit[i] === 1);
+        (position !== POSITION.exit || this.#isExit[i] === 1) &&
+        (position !== POSITION.exit || opts.port === undefined || this.#carries(i, opts.port));
       if (!eligible) weighted[i] = 0n;
     }
     return choose(
@@ -195,6 +224,19 @@ export class PathChooser {
       this.#family.start, this.#family.of,
       opts.allowSameSubnet ?? false, (opts.random ?? defaultRandom)(),
     );
+  }
+
+  /**
+   * Whether relay `i` will carry `port`.
+   *
+   * A relay with the Exit flag but no policy summary is treated as carrying nothing. The
+   * flag says the authorities saw it exit *something*; the summary says what. Assuming the
+   * generous reading of a missing summary would send streams to relays that refuse them.
+   */
+  #carries(i: number, port: number): boolean {
+    const policy = this.#relays[i].exitPolicy;
+    if (policy === undefined) return false;
+    return portPermitted(policy.isAccept, Int32Array.from(policy.ranges), port);
   }
 
   /**
@@ -214,7 +256,36 @@ export class PathChooser {
     return [this.#relays[guard], this.#relays[middle], this.#relays[exit]];
   }
 
-  /** A path through a guard already chosen. */
+  /**
+   * A path using the guard set, choosing the exit first.
+   *
+   * Exit first because it is the constrained position — it needs the flag, and a policy
+   * carrying the port. Then the first sampled guard that can share a path with it: the
+   * sampled set exists partly for this, and consulting it in preference order is what tor
+   * does rather than drawing a fresh guard.
+   *
+   * Drawing a fresh guard here would be the mistake. The guard set is meant to be small and
+   * stable; a client that topped it up whenever a path did not work out would enlarge its
+   * exposure every time an exit was unavailable, which is a condition an attacker can
+   * arrange.
+   */
+  pathWithGuards(guards: Relay[], opts: PathOptions = {}): Relay[] | null {
+    if (guards.length === 0) return null;
+    const exit = this.pick(POSITION.exit, [], opts);
+    if (exit < 0) return null;
+    for (const guard of guards) {
+      const g = this.#relays.indexOf(guard);
+      if (g < 0 || g === exit) continue;
+      const middle = this.pick(POSITION.middle, [exit, g], opts);
+      if (middle < 0) continue;
+      // pick() has already applied the family and subnet rules against both, so reaching
+      // here means the three are a legal path.
+      return [guard, this.#relays[middle], this.#relays[exit]];
+    }
+    return null;
+  }
+
+  /** A path through one specific guard. */
   pathThroughGuard(guard: Relay, opts: PathOptions = {}): Relay[] | null {
     const g = this.#relays.indexOf(guard);
     if (g < 0) return null;
@@ -233,7 +304,22 @@ export type GuardState = {
   sampled: string[];
   /** Fingerprints currently believed unreachable, and when we last thought so. */
   failed: Record<string, number>;
+  /**
+   * When we concluded the network — rather than any guard — was unreachable.
+   *
+   * Set when every sampled guard fails inside one short window, and it clears the
+   * individual marks. See `markFailed` for why that is not merely tidier.
+   */
+  netDownSince?: number;
 };
+
+/**
+ * How close together every guard must fail before we blame the network instead.
+ *
+ * Long enough that three real timeouts fit inside it, short enough that three genuinely
+ * dead guards spread over an afternoon are still read as dead guards.
+ */
+const NETWORK_DOWN_WINDOW_MS = 120_000;
 
 const GUARD_SET_SIZE = 3;
 
@@ -284,12 +370,43 @@ export function currentGuard(
   return usable.length > 0 ? usable[0] : listed[0];
 }
 
+/**
+ * Record that a guard could not be reached.
+ *
+ * If that completes a set — every sampled guard failing inside one short window — the
+ * conclusion changes. The likely explanation is no longer three unlucky relays but one
+ * unreachable network: a captive portal, a dropped link, a firewall. So the individual
+ * marks are cleared and `netDownSince` is set instead.
+ *
+ * Clearing them is the point rather than housekeeping. Left in place, the client comes back
+ * from a coffee-shop portal preferring its third guard over its first, having learnt nothing
+ * true — and an attacker who can make your network look down for two minutes gets to walk
+ * you down your own preference list. Proposal 271 spends most of its length on this
+ * distinction; this is the part of it that matters.
+ */
 export function markFailed(state: GuardState, relay: Relay, now: number = Date.now()): GuardState {
-  return { sampled: state.sampled, failed: { ...state.failed, [fpOf(relay)]: now } };
+  const failed = { ...state.failed, [fpOf(relay)]: now };
+  const allDownRecently = state.sampled.length > 0 &&
+    state.sampled.every((fp) => (failed[fp] ?? 0) > now - NETWORK_DOWN_WINDOW_MS);
+  if (allDownRecently) {
+    return { sampled: state.sampled, failed: {}, netDownSince: now };
+  }
+  return { sampled: state.sampled, failed, netDownSince: state.netDownSince };
 }
 
+/**
+ * Record that a guard worked, which also settles that the network is up.
+ *
+ * One reachable guard is proof the network is not down, and that is worth acting on: it
+ * means any failure recorded during the supposed outage was about the guard after all.
+ */
 export function markWorking(state: GuardState, relay: Relay): GuardState {
   const failed = { ...state.failed };
   delete failed[fpOf(relay)];
-  return { sampled: state.sampled, failed };
+  return { sampled: state.sampled, failed, netDownSince: undefined };
+}
+
+/** Whether we currently believe the network, rather than our guards, is unreachable. */
+export function networkSeemsDown(state: GuardState): boolean {
+  return state.netDownSince !== undefined;
 }

@@ -1,0 +1,274 @@
+// `ssh` — the client as a program, entire. There is no TypeScript in this package's `src/`.
+//
+//   deno task app packages/ssh/src/ssh.wac --allow-read --allow-net -- user@host uname -a
+//   deno task app:build packages/ssh/src/ssh.wac --allow-read --allow-net -o ssh
+//
+// Usage:
+//
+//   ssh [-p port] [-i identity] [-k] [user@]host command…
+//
+//     -p  port, default 22
+//     -i  private key file, default $HOME/.ssh/id_ed25519
+//     -k  add an unknown host to known_hosts instead of refusing (needs --allow-write)
+//
+// ## What it will not do
+//
+// **An unknown host is refused**, not accepted with a warning. A real client asks the user, and
+// asking needs a terminal this cannot reach: `readStdin` is the pipe the command's own input
+// comes from, so a prompt would consume it. The refusal prints the exact line to add, and `-k`
+// writes it — which is the same decision, made deliberately instead of by pressing return.
+//
+// **An encrypted key needs `SSH_PASSPHRASE` in the environment.** Same reason. That is worse than
+// a prompt in every way except honesty, and the alternative was to support unencrypted keys only.
+//
+// **Standard error arrives in one piece at the end**, not interleaved. The capability world has
+// `write` for standard output as bytes but only `warn`, which is line-oriented, for the error
+// channel — so byte-exact interleaving is not expressible. Filed as wac-mono 0014.
+
+import { Cli, Core, FileResult, Socket } from "../../platform/src/platform.wac";
+import { Client } from "./client.wac";
+import { KeyError, PrivateKey, readEd25519 } from "./privatekey.wac";
+import { Verdict, lookUp } from "./knownhosts.wac";
+import { encode as b64encode, ALPHABET_STANDARD } from "../../codec/src/base64.wac";
+
+i32 defaultPort() { return 22; }
+
+export i32 main(Core core, Cli cli) {
+  Options o = parseArgs(core, cli);
+  if (o.exitCode >= 0) { return o.exitCode; }
+
+  // ── The private key ─────────────────────────────────────────────────────────
+  FileResult keyFile = cli.readFile(o.identity);
+  if (!keyFile.ok) {
+    core.warn("ssh: " + o.identity + ": " + keyFile.error);
+    return 1;
+  }
+  string? passphrase = cli.env("SSH_PASSPHRASE");
+  u8[] pass = (passphrase is null) ? u8[0]() : passphrase!.toBytes();
+  PrivateKey key = readEd25519(keyFile.bytes, pass);
+  match (key.error) {
+    case Ok: {}
+    case BadPassphrase: {
+      core.warn("ssh: " + o.identity + ": wrong or missing passphrase"
+                + ((passphrase is null) ? " — set SSH_PASSPHRASE" : ""));
+      return 1;
+    }
+    case NotEd25519: {
+      core.warn("ssh: " + o.identity + ": not an Ed25519 key, which is all this client knows");
+      return 1;
+    }
+    case Unsupported: {
+      core.warn("ssh: " + o.identity + ": unsupported cipher or KDF");
+      return 1;
+    }
+    else: {
+      core.warn("ssh: " + o.identity + ": not an OpenSSH private key");
+      return 1;
+    }
+  }
+
+  // ── Connect and hand over to the transport ──────────────────────────────────
+  Socket sock = cli.connect(o.host, o.port);
+  if (sock.handle < 0) {
+    core.warn("ssh: " + o.host + ": " + sock.error);
+    return 1;
+  }
+
+  Client c = Client.create(core, cli, sock.handle);
+  c.handshake();
+  if (c.failed()) {
+    core.warn("ssh: " + c.error);
+    cli.closeSocket(sock.handle);
+    return 1;
+  }
+
+  // ── Is this the host we meant? ──────────────────────────────────────────────
+  //
+  // The signature verified, which proves the peer holds the key it presented and nothing about
+  // which peer that is. This is the check that distinguishes the server from someone in the
+  // middle, and it is why it happens before a single byte of the command is sent.
+  i32 hostCheck = checkHost(core, cli, o, c.hostKey);
+  if (hostCheck != 0) {
+    cli.closeSocket(sock.handle);
+    return hostCheck;
+  }
+
+  c.authenticate(o.user.toBytes(), key.publicBlob, key.seed);
+  if (c.failed()) {
+    core.warn("ssh: " + c.error);
+    cli.closeSocket(sock.handle);
+    return 1;
+  }
+
+  i32 status = c.run(o.command.toBytes());
+  cli.closeSocket(sock.handle);
+  if (c.failed()) {
+    core.warn("ssh: " + c.error);
+    return 1;
+  }
+  // A server need not report one. Treating "not reported" as success is what OpenSSH does.
+  return status < 0 ? 0 : status;
+}
+
+/**
+ * Compare the host key against known_hosts, and say what the program should do.
+ *
+ * 0 to carry on, otherwise the exit code.
+ */
+i32 checkHost(Core core, Cli cli, Options o, u8[] hostKey) {
+  string path = o.home + "/.ssh/known_hosts";
+  FileResult f = cli.readFile(path);
+  u8[] contents = f.ok ? f.bytes : u8[0]();
+
+  string name = o.port == defaultPort() ? o.host : "[" + o.host + "]:" + itoa(o.port);
+  u8[] keyType = "ssh-ed25519".toBytes();
+
+  match (lookUp(contents, o.host.toBytes(), o.port, keyType, hostKey)) {
+    case Match: { return 0; }
+    case Revoked: {
+      core.warn("ssh: the host key for " + name + " has been revoked");
+      return 1;
+    }
+    case Mismatch: {
+      // The case the file exists to catch. Loud, and never folded into "unknown".
+      core.warn("ssh: REMOTE HOST IDENTIFICATION HAS CHANGED for " + name);
+      core.warn("ssh: someone may be listening, or the host may have been rebuilt.");
+      core.warn("ssh: remove the old line from " + path + " if you are sure.");
+      return 1;
+    }
+    else: {
+      string line = name + " ssh-ed25519 "
+        + string.fromBytes(b64encode(hostKey, ALPHABET_STANDARD(), true));
+      if (!o.addHost) {
+        core.warn("ssh: " + name + " is not in " + path + ".");
+        core.warn("ssh: pass -k to add it, or append this line yourself:");
+        core.warn(line);
+        return 1;
+      }
+      // `-k`: the same decision, made deliberately rather than by pressing return.
+      u8[] updated = (contents.len() > 0 && contents[contents.len() - 1] != 10)
+        ? joinBytes(contents, ("\n" + line + "\n").toBytes())
+        : joinBytes(contents, (line + "\n").toBytes());
+      if (!cli.writeFile(path, updated)) {
+        core.warn("ssh: cannot write " + path + " — was --allow-write granted?");
+        return 1;
+      }
+      core.warn("ssh: added " + name + " to " + path);
+      return 0;
+    }
+  }
+  return 1;
+}
+
+struct Options {
+  string user;
+  string host;
+  i32 port;
+  string identity;
+  string command;
+  string home;
+  bool addHost;
+  /** Negative while the arguments are still good. */
+  i32 exitCode;
+}
+
+Options bad(i32 code) { return Options("", "", 0, "", "", "", false, code); }
+
+Options parseArgs(Core core, Cli cli) {
+  string? home = cli.env("HOME");
+  string homeDir = (home is null) ? "" : home!;
+
+  i32 port = defaultPort();
+  string identity = "";
+  bool addHost = false;
+  string target = "";
+  string command = "";
+
+  i32 i = 0;
+  i32 n = cli.argCount();
+  while (i < n) {
+    string a = cli.arg(i);
+    if (a == "-p" && i + 1 < n) {
+      i++;
+      port = atoi(cli.arg(i));
+      if (port <= 0 || port > 65535) {
+        core.warn("ssh: bad port: " + cli.arg(i));
+        return bad(2);
+      }
+    } else if (a == "-i" && i + 1 < n) {
+      i++;
+      identity = cli.arg(i);
+    } else if (a == "-k") {
+      addHost = true;
+    } else if (target == "") {
+      target = a;
+    } else {
+      // Everything after the host is the command, joined with spaces as OpenSSH does — the
+      // remote shell splits it again, so quoting is the user's problem either way.
+      command = command == "" ? a : command + " " + a;
+    }
+    i++;
+  }
+
+  if (target == "" || command == "") {
+    core.warn("usage: ssh [-p port] [-i identity] [-k] [user@]host command...");
+    return bad(2);
+  }
+
+  string user = "";
+  string host = target;
+  i32 at = target.indexOf("@");
+  if (at >= 0) {
+    user = target.slice(0, at);
+    host = target.slice(at + 1, target.len());
+  } else {
+    string? envUser = cli.env("USER");
+    user = (envUser is null) ? "" : envUser!;
+  }
+  if (user == "") {
+    core.warn("ssh: no user given and USER is unset — use user@host");
+    return bad(2);
+  }
+  if (host == "") {
+    core.warn("ssh: no host given");
+    return bad(2);
+  }
+  if (identity == "") {
+    if (homeDir == "") {
+      core.warn("ssh: HOME is unset, so there is no default identity — use -i");
+      return bad(2);
+    }
+    identity = homeDir + "/.ssh/id_ed25519";
+  }
+
+  return Options(user, host, port, identity, command, homeDir, addHost, -1);
+}
+
+u8[] joinBytes(u8[] a, u8[] b) {
+  u8[] out = u8[a.len() + b.len()]();
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}
+
+i32 atoi(string s) {
+  i32 v = 0;
+  for (i32 i = 0; i < s.len(); i++) {
+    string ch = s[i];
+    if (ch < "0" || ch > "9") { return -1; }
+    v = v * 10 + (ch.toBytes()[0] - 0x30);
+    if (v > 65535) { return -1; }
+  }
+  return s.len() == 0 ? -1 : v;
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  string out = "";
+  i32 x = v;
+  while (x > 0) {
+    out = string.fromCodepoint(0x30 + (x % 10)) + out;
+    x = x / 10;
+  }
+  return out;
+}

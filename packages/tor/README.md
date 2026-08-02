@@ -13,11 +13,12 @@ out of band, and it must be inside its validity window.
 Flow control works, including authenticated SENDMEs: 1.2MB over 209 streams on one circuit,
 2.5x the circuit window.
 
-Paths are chosen rather than handed over: bandwidth-weighted per position, distinct /16s,
-mutual families excluded, and a pinned guard set.
+It bootstraps over Tor: a one-hop circuit to a starting relay fetches the consensus,
+certificates and microdescriptors, verifies them, and every circuit after that is chosen
+from what it learnt — bandwidth-weighted per position, distinct /16s, mutual families
+excluded, an exit whose policy carries the port, through a pinned guard set.
 
-It should still not be pointed at the real network — see *What is not here*, which is now a
-list of things that are wrong rather than things that are missing.
+It should still not be pointed at the real network — see *What is not here*.
 
 ## Why this is possible at all
 
@@ -70,6 +71,7 @@ happened to this repo's SHAKE tests until they moved to `node:crypto`.
 | `host/verify.ts` | the authority chain and the majority rule |
 | `src/pathsel.wac` | the weighting and the path constraints |
 | `host/path.ts` | resolving the consensus into candidates, and guards |
+| `host/dirclient.ts` | fetching the directory over Tor, and bootstrapping |
 
 The split is the same one the TLS package uses: bytes and state machines in wac, and only
 the socket in TypeScript. One exception is forced rather than chosen — a `Hop` is a struct
@@ -132,6 +134,28 @@ The chooser takes its randomness as an argument. That is what lets the tests swe
 random space and assert the distribution exactly, instead of sampling it — a statistical
 test loose enough never to flake is loose enough to miss a real bias.
 
+## Bootstrapping is not circular
+
+To build a circuit you need relay keys; to get relay keys you need the directory; to fetch
+the directory privately you want a circuit. It resolves because the first fetch does not
+need to be private. The consensus is a public document every client has, and downloading it
+reveals only that you are a Tor user — which connecting to a relay revealed anyway.
+
+What matters is that the download's *source* is irrelevant, and that is what verification
+buys. `bootstrap` takes one starting relay (a real client's hardcoded fallback mirror),
+fetches over a one-hop circuit, and refuses anything a majority of authorities did not sign.
+
+## Exit policies
+
+Chosen for the port, not just the flag. A microdescriptor's `p` line is a summary like
+`accept 80,443` or `reject 25,119`, and getting the polarity backwards sends traffic to
+exactly the exits that will refuse it — which looks like a flaky network, since the client
+just retries elsewhere.
+
+**A missing `p` line means reject-all**, matching tor. The Exit flag says the authorities saw
+the relay exit *something*; the summary says what. Reading a missing summary generously would
+send streams to relays that refuse them.
+
 ## Relay cells, and the two things that are easy to get wrong
 
 **The digest is a running hash, not a per-cell one.** Each direction has a SHA-1 seeded at
@@ -168,16 +192,21 @@ the send window empties while a cell is waiting to be read, since draining the r
 mid-write would reorder what the caller sees. A client that uploads more than 1000 cells
 while reading needs a proper reader loop; one that fetches does not.
 
-**Exit policies.** An exit is chosen for its Exit flag, not for whether its policy permits
-the port you want. On the real network that means picking exits that will refuse the stream.
+**The guard algorithm is still partial.** It has the two properties that matter — no
+rotation on failure, and no rotation when every guard fails at once, which is read as the
+network being down rather than as three dead relays. Proposal 271 also ages entries out of
+the sampled set on a schedule, keeps a confirmed list separate from a primary list, and
+bounds how much of the network a client may ever have sampled. Those are not here.
 
-**The guard algorithm is simplified.** Proposal 271 tracks reachability over time and
-distinguishes "the network is down" from "this guard is down", so that a captive portal
-cannot force rotation. This samples, persists, and prefers; it gets the property that
-matters — no rotation on failure — and not the rest.
+**Circuits are not reused or rotated.** A real client keeps a few open, assigns streams to
+them by destination, and retires them after ten minutes so that separate activity does not
+share a path. Every circuit here is built for one purpose and dropped.
 
-**Directory fetching.** The consensus is read off disk. A real client fetches it over a
-circuit, which is itself something an observer should not be able to correlate.
+**No padding, and no defence against traffic analysis.** Cell timing and volume are exactly
+what the application produced.
+
+**Directory freshness is not maintained.** The consensus is fetched once at bootstrap; a
+real client re-downloads before the old one expires and keeps working across the boundary.
 
 **Streams to arbitrary destinations, verified.** `RELAY_BEGIN` reaches the exit and is
 parsed by it — the testnet's exit evaluates our address and answers `RELAY_END`, which
