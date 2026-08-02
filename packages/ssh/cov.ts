@@ -222,4 +222,142 @@ ignoringTraps(() => mAt.sshKexInitFirst(new Uint8Array(15), false));
 ignoringTraps(() => m.sshKexInit(new Uint8Array(0)));
 ignoringTraps(() => m.sshFrame(new Uint8Array(10), new Uint8Array(0), 8));
 
+// ── Key exchange ──────────────────────────────────────────────────────────────
+//
+// Kept to a handful of curve operations: X25519 and Ed25519 are the expensive things in the repo,
+// and the branches here are all in the parsing and checking around them, not inside.
+
+const mKex = run.mod as unknown as {
+  sshMsgKexEcdhReply(): number;
+  sshEphemeralPublic(secret: Uint8Array): Uint8Array;
+  sshEcdhInit(qc: Uint8Array): Uint8Array;
+  sshEcdhReplyOk(payload: Uint8Array): boolean;
+  sshEcdhReplyField(payload: Uint8Array, which: number): Uint8Array;
+  sshSharedSecret(secret: Uint8Array, peerPublic: Uint8Array): Uint8Array;
+  sshExchangeHash(vc: Uint8Array, vs: Uint8Array, ic: Uint8Array, isrv: Uint8Array,
+                  ks: Uint8Array, qc: Uint8Array, qs: Uint8Array, k: Uint8Array): Uint8Array;
+  sshVerifyHostKey(hostKey: Uint8Array, signature: Uint8Array, h: Uint8Array): boolean;
+  sshDeriveKey(k: Uint8Array, h: Uint8Array, sid: Uint8Array, letter: number, needed: number): Uint8Array;
+};
+
+mKex.sshMsgKexEcdhReply();
+const secret = Uint8Array.from({ length: 32 }, (_, i) => i + 1);
+const qc = mKex.sshEphemeralPublic(secret);
+mKex.sshEcdhInit(qc);
+ignoringTraps(() => mKex.sshEphemeralPublic(new Uint8Array(31)));
+
+const str = (b: Uint8Array) => {
+  const out = new Uint8Array(4 + b.length);
+  new DataView(out.buffer).setUint32(0, b.length);
+  out.set(b, 4);
+  return out;
+};
+const join = (...parts: Uint8Array[]) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  return out;
+};
+
+const hostKeyBlob = join(str(bytes("ssh-ed25519")), str(new Uint8Array(32).fill(2)));
+const sigBlob = join(str(bytes("ssh-ed25519")), str(new Uint8Array(64).fill(3)));
+const reply = join(new Uint8Array([31]), str(hostKeyBlob), str(qc), str(sigBlob));
+mKex.sshEcdhReplyOk(reply);
+for (let which = 0; which < 4; which++) mKex.sshEcdhReplyField(reply, which);
+
+for (
+  const bad of [
+    new Uint8Array([20]),                                          // not an ECDH reply
+    new Uint8Array([31]),                                          // truncated immediately
+    reply.slice(0, 20),                                            // truncated mid-field
+    join(new Uint8Array([31]), str(hostKeyBlob), str(new Uint8Array(31)), str(sigBlob)),  // Q_S 31 bytes
+  ]
+) {
+  mKex.sshEcdhReplyOk(bad);
+  mKex.sshEcdhReplyField(bad, 0);
+}
+
+mKex.sshSharedSecret(secret, qc);
+mKex.sshSharedSecret(secret, new Uint8Array(32));                  // all-zero point
+mKex.sshSharedSecret(new Uint8Array(31), qc);                      // wrong secret length
+mKex.sshSharedSecret(secret, new Uint8Array(31));                  // wrong peer length
+
+const h = mKex.sshExchangeHash(bytes("SSH-2.0-a"), bytes("SSH-2.0-b"), new Uint8Array([20]),
+                               new Uint8Array([20]), hostKeyBlob, qc, qc, secret);
+
+// Every rejection in the host key check, then one real verification.
+mKex.sshVerifyHostKey(hostKeyBlob, sigBlob, h);                              // names right, bytes bogus
+mKex.sshVerifyHostKey(join(str(bytes("ssh-rsa")), str(new Uint8Array(32))), sigBlob, h);
+mKex.sshVerifyHostKey(hostKeyBlob, join(str(bytes("ssh-rsa")), str(new Uint8Array(64))), h);
+mKex.sshVerifyHostKey(join(str(bytes("ssh-ed25519")), str(new Uint8Array(31))), sigBlob, h);
+mKex.sshVerifyHostKey(hostKeyBlob, join(str(bytes("ssh-ed25519")), str(new Uint8Array(63))), h);
+mKex.sshVerifyHostKey(new Uint8Array(0), sigBlob, h);
+mKex.sshVerifyHostKey(hostKeyBlob, new Uint8Array(0), h);
+
+// A name the same length as "ssh-ed25519" but not equal. Every other wrong name here differs in
+// length and is rejected before the bytes are compared, so without this the comparison loop never
+// takes its mismatch branch.
+mKex.sshVerifyHostKey(join(str(bytes("ssh-ed25518")), str(new Uint8Array(32))), sigBlob, h);
+mKex.sshVerifyHostKey(hostKeyBlob, join(str(bytes("ssh-ed25518")), str(new Uint8Array(64))), h);
+
+// One hash block, and more than one, so the extension loop is entered as well as skipped.
+for (const needed of [16, 32, 64]) mKex.sshDeriveKey(secret, h, h, 0x41, needed);
+
+// ── The cipher ────────────────────────────────────────────────────────────────
+
+const mCipher = run.mod as unknown as {
+  sshCipherKeyLength(): number;
+  sshCipherTagLength(): number;
+  sshAeadPaddingFor(n: number, block: number): number;
+  sshSeal(key: Uint8Array, seq: number, payload: Uint8Array, random: Uint8Array, block: number): Uint8Array;
+  sshPeekLength(key: Uint8Array, seq: number, src: Uint8Array, at: number): number;
+  sshOpenStatus(key: Uint8Array, seq: number, src: Uint8Array, at: number, end: number, max: number): number;
+  sshOpenPayload(key: Uint8Array, seq: number, src: Uint8Array, at: number, end: number, max: number): Uint8Array;
+  sshOpenUsed(key: Uint8Array, seq: number, src: Uint8Array, at: number, end: number, max: number): number;
+};
+
+mCipher.sshCipherKeyLength();
+mCipher.sshCipherTagLength();
+const ckey = Uint8Array.from({ length: 64 }, (_, i) => (i * 7 + 1) & 255);
+for (const n of [0, 1, 6, 7, 8, 100]) {
+  for (const b of [8, 16]) mCipher.sshAeadPaddingFor(n, b);
+  const payload = Uint8Array.from({ length: n }, (_, i) => i & 255);
+  const packet = mCipher.sshSeal(ckey, n, payload, new Uint8Array(mCipher.sshAeadPaddingFor(n, 8)).fill(1), 8);
+  mCipher.sshPeekLength(ckey, n, packet, 0);
+  mCipher.sshOpenStatus(ckey, n, packet, 0, packet.length, 35000);
+  mCipher.sshOpenPayload(ckey, n, packet, 0, packet.length, 35000);
+  mCipher.sshOpenUsed(ckey, n, packet, 0, packet.length, 35000);
+  mCipher.sshOpenStatus(ckey, n, packet, 0, packet.length - 1, 35000);   // incomplete
+  mCipher.sshOpenStatus(ckey, n, packet, 0, 2, 35000);                   // shorter than a length
+  mCipher.sshOpenStatus(ckey, n + 1, packet, 0, packet.length, 35000);   // wrong sequence
+  mCipher.sshOpenStatus(ckey, n, packet, 0, packet.length, 4);           // over the caller's limit
+  mCipher.sshOpenStatus(ckey, n, packet, -1, packet.length, 35000);      // bad range
+  mCipher.sshOpenStatus(ckey, n, packet, 0, packet.length + 5, 35000);   // end past the buffer
+}
+
+// A tag that does not match, and a body whose padding length is impossible once decrypted.
+const tampered = mCipher.sshSeal(ckey, 0, bytes("tamper"), new Uint8Array(16).fill(2), 8);
+tampered[tampered.length - 1] ^= 0xff;
+mCipher.sshOpenStatus(ckey, 0, tampered, 0, tampered.length, 35000);
+
+// A packet whose tag is right and whose padding length is impossible: only reachable by sealing a
+// body directly, since `seal` computes a valid one. This is the check that runs *after* the MAC.
+const mBody = run.mod as unknown as {
+  sshSealBody(key: Uint8Array, seq: number, body: Uint8Array): Uint8Array;
+};
+for (const padByte of [200, 0, 3]) {
+  const body = new Uint8Array(8);
+  body[0] = padByte;                       // claims more padding than the packet holds, or too little
+  const forged = mBody.sshSealBody(ckey, 0, body);
+  mCipher.sshOpenStatus(ckey, 0, forged, 0, forged.length, 35000);
+}
+
+mCipher.sshPeekLength(ckey, 0, new Uint8Array(2), 0);                     // too short to peek
+mCipher.sshPeekLength(ckey, 0, new Uint8Array(8), -1);                    // bad offset
+ignoringTraps(() => mBody.sshSealBody(new Uint8Array(63), 0, new Uint8Array(8)));
+ignoringTraps(() => mCipher.sshSeal(new Uint8Array(63), 0, bytes("x"), new Uint8Array(16), 8));
+ignoringTraps(() => mCipher.sshSeal(ckey, 0, bytes("x"), new Uint8Array(0), 8));
+ignoringTraps(() => mCipher.sshPeekLength(new Uint8Array(63), 0, new Uint8Array(8), 0));
+ignoringTraps(() => mCipher.sshOpenStatus(new Uint8Array(63), 0, new Uint8Array(40), 0, 40, 35000));
+
 report([run], "packages/ssh/", { verbose });

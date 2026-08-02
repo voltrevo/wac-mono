@@ -1,7 +1,8 @@
 # ssh
 
-An SSH-2 client, in wac. **Transport layer only so far** — version exchange, the binary packet
-protocol, and algorithm negotiation. No key exchange, no encryption, no authentication yet.
+An SSH-2 client, in wac. **Through to an encrypted connection** — version exchange, the binary
+packet protocol, algorithm negotiation, curve25519-sha256 key exchange, `ssh-ed25519` host key
+verification and the `chacha20-poly1305@openssh.com` AEAD. No authentication yet.
 
 > **Not for production**, for the same reason [crypto](../crypto/README.md) is not: it is built on
 > primitives that are known to leak timing, and nothing here has been reviewed by anyone.
@@ -16,13 +17,25 @@ deno task test packages/ssh
 deno task coverage:ssh
 ```
 
-The test that matters runs a real `sshd`, performs the version exchange and the KEXINIT exchange
-against it, and negotiates. Everything else in the suite pins a rule; that one says the rules were
-read correctly. A server that dislikes anything about our framing closes the connection rather
-than answering, so a parsed server KEXINIT means the packet layer is right in both directions.
+The test that matters runs a real `sshd`, performs the version, KEXINIT and key exchanges
+against it, and **verifies the server's host key signature over our own exchange hash**.
+Everything else in the suite pins a rule; that one says the rules were read correctly.
+
+It is a hard pass or fail, and it covers almost everything at once: the signature verifies only
+if every input to the exchange hash matches what the server used — both version strings without
+their line endings, both KEXINIT payloads byte for byte as sent, the host key blob, both
+ephemeral public keys, and the shared secret in its mpint form. One wrong byte anywhere and
+Ed25519 verification fails. The test then checks the host key is the one in `hostkey.pub`, since
+a signature that verifies against a key the server also chose proves only self-consistency, and
+bends a bit of H to confirm verification actually fails when it should.
+
+It then sends NEWKEYS, derives the traffic keys, and carries on **encrypted**: an encrypted
+SERVICE_REQUEST goes out and the server's EXT_INFO and SERVICE_ACCEPT come back and decrypt. That
+covers the whole transport in both directions at once — a wrong key half, counter, padding rule
+or sequence number and the server drops the connection rather than replying.
 
 Against OpenSSH 9.6 it negotiates `curve25519-sha256`, `ssh-ed25519` and
-`chacha20-poly1305@openssh.com` — which is what the next slice has to implement.
+`chacha20-poly1305@openssh.com`.
 
 ## Why the pieces look like this
 
@@ -61,6 +74,48 @@ string: both versions go into the exchange hash without their line endings, and 
 produces a signature that verifies against nothing, far enough from here that the cause is not
 obvious.
 
+**`kex.wac`** — the exchange itself, and the key derivation of RFC 4253 §7.2. The exchange hash
+H is the security of the whole protocol in one value: the server signs it, so a peer that cannot
+produce that signature cannot have chosen any of its inputs, which is what stops an attacker in
+the middle from downgrading the algorithm lists.
+
+**K is an mpint, not 32 bytes.** The X25519 output is read as an unsigned big-endian integer and
+encoded minimally, so a secret starting with a zero byte is 31 bytes on the wire and one with its
+top bit set gains a leading zero. Each happens about one time in 256 — often enough to be a real
+bug, rarely enough that a client written the obvious way works for a while first.
+
+Key derivation extends by hashing **everything produced so far**, not just the previous block.
+That only shows up above one hash length, and the only key we need that is longer is
+chacha20-poly1305's 64 bytes, so nothing else in the protocol would catch it. Checked against a
+transcription of the RFC using WebCrypto.
+
+An all-zero shared secret means the peer sent a low-order point and every session would share the
+same secret; RFC 8731 §3 requires aborting, and nothing later notices if you do not.
+
+**`cipher.wac`** — `chacha20-poly1305@openssh.com`, which is **not** the RFC 8439 AEAD that
+`crypto/src/aead.wac` implements. Same two primitives, every structural choice different:
+
+Two keys, from 512 bits of key material — and the *first* 256 are K_2, the second K_1, which
+reads backwards. K_1 encrypts only the 4-byte packet length; K_2 encrypts the payload and keys the
+MAC. Swapping them round-trips perfectly against itself and fails only against a real server,
+which is why there is a test asserting the halves are not interchangeable.
+
+The length is encrypted under its own key so a reader can learn how much to read without having
+decrypted anything it must then trust. The MAC covers the ciphertext — both the encrypted length
+and the encrypted body — and is checked *before* anything is decrypted. None of RFC 8439's
+associated-data framing appears: the MAC input is simply the bytes on the wire.
+
+The nonce is the packet sequence number and nothing else, so the `A`/`B` and `E`/`F` key
+derivation outputs go unused. The sequence number is never transmitted; both sides count, and if
+they ever disagree the MAC fails with no indication of why. Strict KEX resets both counters at
+NEWKEYS, which is the one place that is easy to get wrong and impossible to debug from the
+symptom.
+
+Padding here follows the **AEAD rule, not RFC 4253's**: because the length is authenticated
+separately, only `padding_length || payload || padding` is aligned, not the whole packet. The two
+differ by exactly 4 bytes for every length, so a test that checks "aligned to something" passes
+with either.
+
 **`kexinit.wac`** — negotiation, RFC 4253 §7.1. The rule is asymmetric: the chosen algorithm is
 **the client's first preference that the server also supports**. Server order is ignored. Getting
 that backwards yields a client that negotiates something plausible and disagrees with the server
@@ -77,14 +132,9 @@ Terrapin attack (CVE-2023-48795) used to shift sequence numbers.
 
 In the order it is needed:
 
-1. **Key exchange** — `curve25519-sha256`, the exchange hash, and `ssh-ed25519` host key
-   verification. [crypto](../crypto/README.md) already has `x25519` and `ed25519`.
-2. **The cipher** — `chacha20-poly1305@openssh.com`. Not the RFC 8439 AEAD: two keys, the length
-   field encrypted separately, and the MAC over the ciphertext. Buildable from `chacha20` and
-   `poly1305`, and the easiest thing here to get subtly wrong.
-3. **Authentication** — `publickey` with ed25519. Encrypted private keys are already readable;
+1. **Authentication** — `publickey` with ed25519. Encrypted private keys are already readable;
    `bcrypt_pbkdf` landed in crypto for this.
-4. **The connection protocol** — channels, window adjustment, `exec`.
+2. **The connection protocol** — channels, window adjustment, `exec`.
 
 `known_hosts` is a byte comparison against the host key blob, so there is no X.509 and no chain
 building — which is the main reason this is a smaller job than the TLS client already in the repo.

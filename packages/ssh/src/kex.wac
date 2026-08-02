@@ -1,0 +1,179 @@
+// curve25519-sha256 key exchange, RFC 5656 / RFC 8731, and the key derivation of RFC 4253 §7.2.
+//
+// Two messages:
+//
+//   SSH_MSG_KEX_ECDH_INIT   (30)   string Q_C          our ephemeral X25519 public key
+//   SSH_MSG_KEX_ECDH_REPLY  (31)   string K_S          the server's host key blob
+//                                  string Q_S          its ephemeral public key
+//                                  string signature    over the exchange hash
+//
+// Everything then hangs off the **exchange hash** H, which is the security of the whole protocol
+// in one value: it commits to both version strings, both KEXINIT payloads *as sent*, the host
+// key, both ephemeral public keys and the shared secret. The server signs H with its host key,
+// so a peer that cannot produce that signature cannot have chosen any of those inputs — which is
+// what stops an attacker in the middle from downgrading the algorithm lists.
+//
+// The parts that go wrong quietly:
+//
+//   **K is an mpint, not 32 bytes.** The X25519 output is read as an unsigned big-endian integer
+//   and encoded minimally, so a shared secret whose first byte is zero is 31 bytes on the wire
+//   and one whose top bit is set gains a leading zero. Both happen roughly one time in 256, so a
+//   client that writes the raw 32 bytes works, repeatedly, and then fails.
+//
+//   **The version strings go in without their CR LF**, and the KEXINIT payloads go in whole,
+//   including the message number, exactly as they appeared on the wire.
+//
+//   **session_id is H from the *first* exchange** and never changes, even though H itself does on
+//   every rekey. It is what authentication signatures bind to.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { ed25519Verify } from "../../crypto/src/ed25519.wac";
+import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
+import { Reader, Writer } from "./wire.wac";
+
+export i32 msgKexEcdhInit() { return 30; }
+export i32 msgKexEcdhReply() { return 31; }
+
+/** Our ephemeral public key from a 32-byte secret. The secret comes from the host. */
+export u8[] ephemeralPublic(u8[] secret) {
+  if (secret.len() != 32) { trap; }
+  return x25519Base(secret);
+}
+
+/** SSH_MSG_KEX_ECDH_INIT carrying our public key. */
+export u8[] ecdhInit(u8[] qc) {
+  Writer w = Writer.create();
+  w.byte(msgKexEcdhInit());
+  w.str(qc);
+  return w.take();
+}
+
+/** The three fields of a KEX_ECDH_REPLY. */
+export struct EcdhReply {
+  u8[] hostKey;        // K_S, itself a nested blob
+  u8[] serverPublic;   // Q_S
+  u8[] signature;      // a nested blob too
+}
+
+export EcdhReply? parseEcdhReply(u8[] payload) {
+  Reader r = Reader.over(payload);
+  if (r.byte() != msgKexEcdhReply()) { return null; }
+  u8[] ks = r.str();
+  u8[] qs = r.str();
+  u8[] sig = r.str();
+  if (!r.ok) { return null; }
+  // A 32-byte peer key is the only thing X25519 accepts, and checking here keeps the trap in
+  // `sharedSecret` unreachable from the wire.
+  if (qs.len() != 32) { return null; }
+  return EcdhReply(ks, qs, sig);
+}
+
+/**
+ * The X25519 shared secret.
+ *
+ * An all-zero result means the peer sent a low-order point and every session would share the same
+ * secret. RFC 8731 §3 requires aborting; nothing else in the protocol notices, because a shared
+ * secret both sides agree on still produces a working connection.
+ */
+export u8[]? sharedSecret(u8[] secret, u8[] peerPublic) {
+  if (secret.len() != 32 || peerPublic.len() != 32) { return null; }
+  u8[] k = x25519(secret, peerPublic);
+  i32 acc = 0;
+  for (i32 i = 0; i < 32; i++) { acc = acc | k[i]; }
+  if (acc == 0) { return null; }
+  return k;
+}
+
+/**
+ * H = SHA-256 over the eight values, each in its wire form.
+ *
+ * `vc` and `vs` are the version strings without CR LF; `clientKexInit` and `serverKexInit` are the whole KEXINIT
+ * payloads as sent; `k` is the raw 32-byte shared secret, written here as an mpint.
+ */
+export u8[] exchangeHash(u8[] vc, u8[] vs, u8[] clientKexInit, u8[] serverKexInit,
+                         u8[] ks, u8[] qc, u8[] qs, u8[] k) {
+  Writer w = Writer.create();
+  w.str(vc);
+  w.str(vs);
+  w.str(clientKexInit);
+  w.str(serverKexInit);
+  w.str(ks);
+  w.str(qc);
+  w.str(qs);
+  w.mpint(k);
+  return sha256(w.take());
+}
+
+/**
+ * Verify an `ssh-ed25519` host key signature over `h`.
+ *
+ * Both the key and the signature arrive as blobs naming their own algorithm, and **the names must
+ * be checked rather than skipped**: a blob saying `ssh-rsa` whose body happens to be 32 bytes
+ * would otherwise be handed to Ed25519 verification as though it were a point.
+ */
+export bool verifyEd25519Host(u8[] hostKey, u8[] signature, u8[] h) {
+  const u8[] NAME = u8[](0x73, 0x73, 0x68, 0x2d, 0x65, 0x64, 0x32, 0x35,
+                         0x35, 0x31, 0x39);                         // "ssh-ed25519"
+  Reader kr = Reader.over(hostKey);
+  u8[] keyName = kr.str();
+  u8[] pub = kr.str();
+  if (!kr.ok || !bytesEq(keyName, NAME) || pub.len() != 32) { return false; }
+
+  Reader sr = Reader.over(signature);
+  u8[] sigName = sr.str();
+  u8[] sig = sr.str();
+  if (!sr.ok || !bytesEq(sigName, NAME) || sig.len() != 64) { return false; }
+
+  return ed25519Verify(pub, h, sig);
+}
+
+bool bytesEq(u8[] a, const u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+
+/**
+ * Derive `needed` bytes of key material, RFC 4253 §7.2.
+ *
+ * `letter` selects which: 'A' and 'B' are the IVs, 'C' and 'D' the encryption keys, 'E' and 'F'
+ * the integrity keys, client-to-server first in each pair.
+ *
+ *   K1 = HASH(K || H || letter || session_id)
+ *   K2 = HASH(K || H || K1)
+ *   K3 = HASH(K || H || K1 || K2)  …
+ *
+ * The extension hashes the *accumulated* output, not just the previous block, which is the detail
+ * to get right — and only shows up for keys longer than one hash, which for us is
+ * chacha20-poly1305's 64 bytes and nothing else. K is the mpint again, not the raw secret.
+ */
+export u8[] deriveKey(u8[] k, u8[] h, u8[] sessionId, i32 letter, i32 needed) {
+  Writer prefix = Writer.create();
+  prefix.mpint(k);
+  prefix.raw(h);
+  u8[] base = prefix.take();          // K || H, reused by every block
+
+  Buf first = Buf.create();
+  first.pushAll(base);
+  first.push(letter);
+  first.pushAll(sessionId);
+
+  Buf out = Buf.create();
+  u8[] block = sha256(first.take());
+  out.pushAll(block);
+
+  while (out.len < needed) {
+    Buf next = Buf.create();
+    next.pushAll(base);
+    next.pushBytes(out.data, 0, out.len);      // everything produced so far
+    block = sha256(next.take());
+    out.pushAll(block);
+  }
+
+  u8[] result = u8[needed]();
+  result.copyFrom(out.data, 0, 0, needed);
+  return result;
+}
