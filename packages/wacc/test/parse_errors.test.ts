@@ -112,6 +112,32 @@ Deno.test("parse errors: truncation at every point in a declaration", () => {
   ]);
 });
 
+Deno.test("parse errors: a keyword where a name belongs", () => {
+  // The reference gained `declName`, which consumes a keyword found in a name position so
+  // that one mistake yields one error rather than a cascade. Consumption moves every
+  // following position, so this is exactly the kind of recovery change that must be
+  // ported rather than approximated — `"export export"` in the case list below is what
+  // caught it, before these cases existed.
+  agreeAll("keyword-as-name", [
+    "i32 f(i32 match) { return 1; }",
+    "i32 f() { i32 match = 1; }",
+    "i32 match() { return 1; }",
+    "struct S { i32 match; }",
+    "struct match { i32 x; }",
+    "enum match { A }",
+    "i32 f() { return x.match; }",
+    "i32 f() { x.match = 1; }",
+    "i32 f() { return S { match: 1 }; }",
+    // The guard on the declaration lookahead: these stay expressions.
+    "i32 f(f64 x) { i32 y = x as~ i32; return y; }",
+    "i32 f(i32 a, i32 b) { return a < b ? 1 : 0; }",
+    // Two keywords running together, and a keyword as the *last* thing in the file.
+    "export export",
+    "i32 f(i32 match",
+    "struct S { i32 match",
+  ]);
+});
+
 Deno.test("parse errors: malformation inside an otherwise well-formed declaration", () => {
   agreeAll("malformed", [
     "i32 f( { return 1; }",

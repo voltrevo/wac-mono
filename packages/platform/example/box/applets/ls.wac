@@ -10,7 +10,7 @@ export i32 ls(Core core, Cli cli, Args a) {
     // Not a directory, or not permitted — the application cannot tell, by design.
     Stat st = cli.stat(path);
     if (st.exists) { core.log(path); return 0; }
-    core.warn("box: " + path + ": cannot list");
+    core.warn(a.name + ": " + path + ": cannot list");
     return 1;
   }
   string[] found = names!;

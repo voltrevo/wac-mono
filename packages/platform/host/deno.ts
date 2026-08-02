@@ -126,5 +126,25 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       await Deno.writeFile(path, p.subarray(4 + n));
       return EMPTY;
     },
+
+    // The mutation tier. Each throws on failure and the wac side reads that as `false`,
+    // so an application never has to tell "not permitted" from "did not exist" — which
+    // is again the correct amount for it to know.
+    [OP.MKDIR]: async (p) => {
+      if (!opts.fs?.write) deny("filesystem write");
+      await Deno.mkdir(unstr(p.subarray(1)), { recursive: p[0] === 1 });
+      return EMPTY;
+    },
+    [OP.REMOVE]: async (p) => {
+      if (!opts.fs?.write) deny("filesystem write");
+      await Deno.remove(unstr(p.subarray(1)), { recursive: p[0] === 1 });
+      return EMPTY;
+    },
+    [OP.RENAME]: async (p) => {
+      if (!opts.fs?.write) deny("filesystem write");
+      const n = readI32le(p);
+      await Deno.rename(unstr(p.subarray(4, 4 + n)), unstr(p.subarray(4 + n)));
+      return EMPTY;
+    },
   };
 }

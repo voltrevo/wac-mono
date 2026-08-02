@@ -1,0 +1,16 @@
+// Directories made. `-p` makes the parents too, and forgives one that already exists.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args, has } from "../lib/args.wac";
+
+export i32 mkdir(Core core, Cli cli, Args a) {
+  if (a.rest.len() < 1) { core.warn("usage: " + a.name + " [-p] <dir>..."); return 2; }
+  bool parents = has(a, 'p');
+  i32 code = 0;
+  for (i32 i = 0; i < a.rest.len(); i++) {
+    if (cli.mkdir(a.rest[i], parents)) { continue; }
+    core.warn(a.name + ": " + a.rest[i] + ": cannot create");
+    code = 1;
+  }
+  return code;
+}

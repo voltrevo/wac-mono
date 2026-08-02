@@ -5,10 +5,10 @@ import { Args } from "../lib/args.wac";
 import { Input, readInput } from "../lib/input.wac";
 
 export i32 tr(Core core, Cli cli, Args a) {
-  if (a.rest.len() < 2) { core.warn("usage: box tr <set1> <set2> [file]"); return 2; }
+  if (a.rest.len() < 2) { core.warn("usage: " + a.name + " <set1> <set2> [file]"); return 2; }
   u8[] from = expand(a.rest[0].toBytes());
   u8[] to = expand(a.rest[1].toBytes());
-  if (to.len() == 0) { core.warn("box: tr: empty replacement set"); return 2; }
+  if (to.len() == 0) { core.warn(a.name + ": empty replacement set"); return 2; }
 
   Input in = readInput(core, cli, a, 2);
   if (!in.ok) { return 1; }

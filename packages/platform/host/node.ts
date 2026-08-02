@@ -37,6 +37,9 @@ type NodeProcess = { argv: string[]; env: Record<string, string | undefined> };
 type NodeFs = {
   readFile(path: string): Promise<Uint8Array>;
   writeFile(path: string, data: Uint8Array): Promise<void>;
+  mkdir(path: string, opts: { recursive: boolean }): Promise<unknown>;
+  rm(path: string, opts: { recursive: boolean; force: boolean }): Promise<void>;
+  rename(from: string, to: string): Promise<void>;
 };
 
 export function nodeWorld(
@@ -116,6 +119,25 @@ export function nodeWorld(
       if (!opts.fs?.write) deny("filesystem write");
       const n = readI32le(p);
       await fs.writeFile(unstr(p.subarray(4, 4 + n)), p.subarray(4 + n));
+      return EMPTY;
+    },
+
+    [OP.MKDIR]: async (p) => {
+      if (!opts.fs?.write) deny("filesystem write");
+      await fs.mkdir(unstr(p.subarray(1)), { recursive: p[0] === 1 });
+      return EMPTY;
+    },
+    [OP.REMOVE]: async (p) => {
+      if (!opts.fs?.write) deny("filesystem write");
+      // `force: false` so that removing something absent fails, as `Deno.remove` does.
+      // Node's `rm` is otherwise happy to report success for a path that was never there.
+      await fs.rm(unstr(p.subarray(1)), { recursive: p[0] === 1, force: false });
+      return EMPTY;
+    },
+    [OP.RENAME]: async (p) => {
+      if (!opts.fs?.write) deny("filesystem write");
+      const n = readI32le(p);
+      await fs.rename(unstr(p.subarray(4, 4 + n)), unstr(p.subarray(4 + n)));
       return EMPTY;
     },
   };

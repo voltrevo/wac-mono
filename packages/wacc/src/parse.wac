@@ -117,6 +117,34 @@ export struct P {
   }
 }
 
+/**
+ * True when the current token is a keyword.
+ *
+ * The kinds `kImport`..`kMatch` are the keyword block and are contiguous, so this is a
+ * range test rather than a list. `kinds.wac` says every kind after a removed one moves
+ * down, which keeps that true — and the differential test is what noticed last time.
+ */
+bool atKeyword(P p) {
+  i32 k = p.kindAt(0);
+  return k >= kImport() && k <= kMatch();
+}
+
+/**
+ * The token of a name in a declaration, or -1, recording a diagnostic either way.
+ *
+ * Ported from the reference's `declName`: a keyword where a name belongs is *consumed*,
+ * so that one mistake yields one error at the declaration rather than a cascade through
+ * the rest of it. The consumption is the part that matters here — the diagnostics are
+ * compared by position, and leaving the keyword in place would put every following error
+ * somewhere else.
+ */
+i32 declName(P p, i32 code) {
+  if (p.at1(kIdent())) { return p.advance(); }
+  p.fail(code);
+  if (atKeyword(p)) { return p.advance(); }
+  return -1;
+}
+
 // ── Growable lists ────────────────────────────────────────────────────────────
 //
 // One of these per element type, because there are no generics. They are identical
@@ -828,7 +856,7 @@ Expr parsePostfix(P p) {
     if (p.at1(kDot())) {
       p.advance();
       i32 nameTok = -1;
-      if (p.at1(kIdent())) { nameTok = p.advance(); } else { p.fail(perrFieldName()); }
+      nameTok = declName(p, perrFieldName());
       if (p.at1(kLparen())) {
         p.advance();
         Expr[] args = parseArgList(p);
@@ -1074,7 +1102,7 @@ Expr parseConstructionOrCall(P p, i32 line, i32 col) {
     if (!p.at1(kRbrace())) {
       while (true) {
         i32 fieldTok = -1;
-        if (p.at1(kIdent())) { fieldTok = p.advance(); } else { p.fail(perrFieldName()); }
+        fieldTok = declName(p, perrFieldName());
         p.expect(kColon());
         named.push(NamedArg(fieldTok, parseExpr(p)));
         if (!p.eat(kComma())) { break; }
@@ -1147,7 +1175,7 @@ export Lvalue parseLvalue(P p) {
     if (p.at1(kDot())) {
       p.advance();
       i32 fieldTok = -1;
-      if (p.at1(kIdent())) { fieldTok = p.advance(); } else { p.fail(perrFieldName()); }
+      fieldTok = declName(p, perrFieldName());
       lv = Lvalue(LvalueKind.LField(lv, fieldTok), pLine, pCol);
     } else if (p.at1(kLbrack())) {
       p.advance();
@@ -1196,7 +1224,13 @@ bool looksLikeVarDecl(P p) {
     else if (p.kindAt(j) == kQuestion()) { j++; }
     else { break; }
   }
-  return p.kindAt(j) == kIdent();
+  if (p.kindAt(j) == kIdent()) { return true; }
+  // A keyword where the name goes still looks like a declaration, but only with an `=`
+  // after it — without that guard `x as i32;` reads as a declaration named `as`. The
+  // reference does the same, so that `i32 match = 1;` can be told it named a keyword
+  // instead of reporting a missing semicolon further down.
+  i32 k = p.kindAt(j);
+  return k >= kImport() && k <= kMatch() && p.kindAt(j + 1) == kAssign();
 }
 
 Stmt[] parseBlock(P p) {
@@ -1272,7 +1306,7 @@ Stmt parseVarDecl(P p, bool noSemi) {
   bool isConst = p.eat(kConst());
   Ty t = parseType(p);
   i32 nameTok = -1;
-  if (p.at1(kIdent())) { nameTok = p.advance(); } else { p.fail(perrExpected()); }
+  nameTok = declName(p, perrExpected());
   p.expect(kAssign());
   Expr init = parseExpr(p);
   if (!noSemi) { p.expect(kSemi()); }
@@ -1475,7 +1509,7 @@ void parseParams(P p, ParamList out) {
     bool isConst = p.eat(kConst());
     Ty t = parseType(p);
     i32 nameTok = -1;
-    if (p.at1(kIdent())) { nameTok = p.advance(); } else { p.fail(perrExpected()); }
+    nameTok = declName(p, perrExpected());
     out.push(Param(nameTok, t, isConst));
     if (!p.eat(kComma())) { return; }
   }
@@ -1515,7 +1549,7 @@ Decl parseStructDecl(P p, bool exported) {
   bool isConst = p.eat(kConst());
   p.advance();                                     // struct
   i32 nameTok = -1;
-  if (p.at1(kIdent())) { nameTok = p.advance(); } else { p.fail(perrExpected()); }
+  nameTok = declName(p, perrExpected());
   i32 parentTok = -1;
   if (p.eat(kColon())) {
     if (p.at1(kIdent())) { parentTok = p.advance(); } else { p.fail(perrExpected()); }
@@ -1533,7 +1567,7 @@ Decl parseStructDecl(P p, bool exported) {
 
     Ty memberType = parseType(p);
     i32 memberTok = -1;
-    if (p.at1(kIdent())) { memberTok = p.advance(); } else { p.fail(perrExpected()); }
+    memberTok = declName(p, perrExpected());
 
     if (p.at1(kSemi())) {
       p.advance();
@@ -1577,7 +1611,7 @@ Decl parseEnumDecl(P p, bool exported) {
   i32 col = p.colAt(0);
   p.expect(kEnum());
   i32 nameTok = -1;
-  if (p.at1(kIdent())) { nameTok = p.advance(); } else { p.fail(perrExpected()); }
+  nameTok = declName(p, perrExpected());
   p.expect(kLbrace());
   VariantList variants = VariantList.create();
   while (!p.at1(kRbrace()) && !p.at1(kEof())) {
@@ -1601,7 +1635,7 @@ Decl parseFuncDecl(P p) {
   bool exported = p.eat(kExport());
   Ty ret = parseType(p);
   i32 nameTok = -1;
-  if (p.at1(kIdent())) { nameTok = p.advance(); } else { p.fail(perrExpected()); }
+  nameTok = declName(p, perrExpected());
   p.expect(kLparen());
   ParamList params = ParamList.create();
   if (!p.at1(kRparen())) { parseParams(p, params); }

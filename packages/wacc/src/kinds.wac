@@ -15,6 +15,11 @@
 // `from` is absent as of 2026-08-02: it stopped being a keyword in the reference, so
 // that `slice(a, from, to)` can name its argument, and every kind after it moved down
 // by one. The differential test is what said so, exactly as the note above predicts.
+//
+// The keyword kinds `kImport`(5)..`kMatch`(32) are contiguous and `parse.wac` tests that
+// range rather than listing them, to decide whether a token is a keyword. Keep it so:
+// inserting a non-keyword into the middle of that block would silently make `atKeyword`
+// wrong, and nothing else here depends on the ordering.
 
 
 /** `int` */

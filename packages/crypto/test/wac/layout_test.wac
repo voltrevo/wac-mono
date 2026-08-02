@@ -1,0 +1,103 @@
+// Byte-order helpers, checked by round trip rather than against a reference.
+//
+// The TypeScript this replaces compared every read against `DataView`, which is a sound
+// oracle and a heavier one than the job needs: `leWord32` and `beWord32` are inverses of
+// their own stores, and a byte order that is wrong in both directions round-trips — so
+// the round trip alone would not be enough. What pins the direction is a handful of
+// literal values where the two orders visibly differ, which is four lines rather than a
+// host call per offset.
+//
+// Every offset is still swept, because these are read at arbitrary positions inside a
+// buffer and an implementation that assumes alignment is right until it is not.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  leWord32, beWord32, beWord64, storeLE32, storeBE32, storeBE64, padTo16,
+} from "../../src/layout.wac";
+
+u8[] fill(i32 n, i32 a, i32 b) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (i * a + b) & 0xFF; }
+  return out;
+}
+
+export string test_the_two_orders_disagree_where_they_should() {
+  // The anchor. Round trips cannot tell big-endian from little-endian — both are
+  // self-consistent — so the direction is pinned by reading bytes whose value differs
+  // between them, and by the two agreeing exactly on a palindrome.
+  T t = T.create();
+  u8[] b = u8[8]();
+  b[0] = 0x01; b[1] = 0x02; b[2] = 0x03; b[3] = 0x04;
+  b[4] = 0x05; b[5] = 0x06; b[6] = 0x07; b[7] = 0x08;
+  t.eqU32(beWord32(b, 0), 0x01020304 as! u32, "beWord32 reads most-significant first");
+  t.eqU32(leWord32(b, 0), 0x04030201 as! u32, "leWord32 reads least-significant first");
+  t.eqU64(beWord64(b, 0), 0x0102030405060708 as! u64, "beWord64 reads most-significant first");
+
+  u8[] pal = u8[4]();
+  pal[0] = 0xAB; pal[1] = 0xCD; pal[2] = 0xCD; pal[3] = 0xAB;
+  t.eqU32(beWord32(pal, 0), leWord32(pal, 0), "the orders agree on a palindrome");
+  return t.report();
+}
+
+export string test_reads_and_stores_are_inverses_at_every_offset() {
+  // Swept because these run at arbitrary positions inside a buffer, and an implementation
+  // that assumed four-byte alignment is right until the first offset that is not.
+  T t = T.create();
+  u8[] buf = fill(64, 37, 11);
+  for (i32 off = 0; off + 4 <= buf.len(); off++) {
+    u32 be = beWord32(buf, off);
+    u32 le = leWord32(buf, off);
+    u8[] beBytes = u8[4]();
+    u8[] leBytes = u8[4]();
+    storeBE32(be, beBytes, 0);
+    storeLE32(le, leBytes, 0);
+    bool okBe = true;
+    bool okLe = true;
+    for (i32 i = 0; i < 4; i++) {
+      if (beBytes[i] != buf[off + i]) { okBe = false; }
+      if (leBytes[i] != buf[off + i]) { okLe = false; }
+    }
+    t.isTrue(okBe, "storeBE32 undoes beWord32 at offset " + itoa64(off as i64));
+    t.isTrue(okLe, "storeLE32 undoes leWord32 at offset " + itoa64(off as i64));
+  }
+  for (i32 off = 0; off + 8 <= buf.len(); off++) {
+    u8[] back = u8[8]();
+    storeBE64(beWord64(buf, off), back, 0);
+    bool ok = true;
+    for (i32 i = 0; i < 8; i++) { if (back[i] != buf[off + i]) { ok = false; } }
+    t.isTrue(ok, "storeBE64 undoes beWord64 at offset " + itoa64(off as i64));
+  }
+  return t.report();
+}
+
+export string test_the_top_bit_survives() {
+  // 32-bit values with the high bit set are where a signed read shows itself: the round
+  // trip still works, because the same wrong sign is applied both ways, so this checks
+  // the value rather than the round trip.
+  T t = T.create();
+  u8[] ff = u8[8]();
+  for (i32 i = 0; i < 8; i++) { ff[i] = 0xFF; }
+  t.eqU32(beWord32(ff, 0), 4294967295 as! u32, "beWord32 of all ones");
+  t.eqU32(leWord32(ff, 0), 4294967295 as! u32, "leWord32 of all ones");
+
+  u8[] high = u8[4]();
+  high[0] = 0x80; high[1] = 0x00; high[2] = 0x00; high[3] = 0x00;
+  t.eqU32(beWord32(high, 0), 2147483648 as! u32, "beWord32 with only the top bit set");
+  t.eqU32(leWord32(high, 0), 128 as! u32, "and the same bytes read the other way");
+  return t.report();
+}
+
+export string test_pad_to_16_is_the_distance_to_the_next_boundary() {
+  // Never a whole block: a multiple of sixteen needs no padding, and returning sixteen
+  // there would add a block of nothing to every aligned message — which Poly1305's AEAD
+  // would then authenticate differently from every other implementation.
+  T t = T.create();
+  for (i32 n = 0; n < 80; n++) {
+    i32 pad = padTo16(n);
+    t.isTrue(pad >= 0 && pad < 16, "padding for " + itoa64(n as i64) + " is in [0, 16)");
+    t.eqI32((n + pad) % 16, 0, "padding for " + itoa64(n as i64) + " reaches a boundary");
+    if (n % 16 == 0) { t.eqI32(pad, 0, "an aligned length needs none"); }
+  }
+  return t.report();
+}

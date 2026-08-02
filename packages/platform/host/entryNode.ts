@@ -62,6 +62,9 @@ export async function runLauncherNode(
   fs: {
     readFile(p: string): Promise<Uint8Array>;
     writeFile(p: string, d: Uint8Array): Promise<void>;
+    mkdir(p: string, o: { recursive: boolean }): Promise<unknown>;
+    rm(p: string, o: { recursive: boolean; force: boolean }): Promise<void>;
+    rename(from: string, to: string): Promise<void>;
     stat(p: string): Promise<{ isFile(): boolean; isDirectory(): boolean; size: number; mtimeMs: number }>;
     readdir(p: string): Promise<string[]>;
   },

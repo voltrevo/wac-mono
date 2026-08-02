@@ -19,4 +19,7 @@ export const OP = {
   WRITE_STDOUT: 12,
   STAT: 13,
   READ_DIR: 14,
+  MKDIR: 15,
+  REMOVE: 16,
+  RENAME: 17,
 } as const;
