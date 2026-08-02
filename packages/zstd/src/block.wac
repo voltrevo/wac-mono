@@ -115,17 +115,13 @@ export void decodeCompressed(u8[] src, i32 at, i32 size, Buf out, Decoder d) {
   u8[] literals = u8[0]();
   if (h.kind == 0) {
     literals = u8[h.regenSize]();
-    for (i32 i = 0; i < h.regenSize; i++) {
-      literals[i] = src[p + i];
-    }
+    literals.copyFrom(src, p, 0, h.regenSize);
   } else if (h.kind == 1) {
     // An RLE section always occupies one byte, so `p + 1 > end` above has already refused a
     // block that stops here.
     i32 v = src[p];
     literals = u8[h.regenSize]();
-    for (i32 i = 0; i < h.regenSize; i++) {
-      literals[i] = v;
-    }
+    literals.fill(v, 0, h.regenSize);
   } else if (h.kind == 2) {
     // The tree comes with the block, and is what a later treeless block will reuse.
     HuffTable t = readTable(src, p);

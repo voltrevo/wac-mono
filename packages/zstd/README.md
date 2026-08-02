@@ -122,11 +122,21 @@ wrong rather than merely unlucky:
 - hoisting `Buf`'s fields out of its copy loops moved nothing at all. Measured before and after:
   885 MB/s against 894.
 
-What the same measurements did establish is where the floor is. A byte-at-a-time copy in wac runs
-at about 900 MB/s and the host's `TypedArray.set` at **72 GB/s** on the same work — eighty times
-faster — because wac has no bulk array copy and every byte pays two bounds checks. That is
-`wac` issue 0056, filed for the compressor's accumulation buffer, and it bounds the decompressor
-too. XXH64 runs at 782 MB/s for the same reason: it reads eight bytes with eight array reads.
+What the same measurements did establish is where the copy floor was: a byte-at-a-time copy in wac
+ran at about 900 MB/s, because every byte paid two bounds checks. That was `wac` issue 0056, filed
+from this package while looking at the compressor's accumulation buffer — and it has since been
+fixed. `copyFrom` is a single wasm instruction, and `Buf.pushBytes` went from **885 to 2906 MB/s**
+once it used one.
+
+One subtlety made that less mechanical than it looks. `copyFrom` moves like `memmove`, which is
+right when the ranges are apart and **wrong when they overlap**: a match of five bytes from one
+back is how every LZ77 descendant spells a run, and it wants the bytes the copy is writing, not
+the ones that were there before. So `Buf.pushRepeat` and the gzip window's `pushMatch` use the
+instruction only when the source ends before the destination begins, and keep the loop for the
+overlapping case they exist to serve.
+
+XXH64 remains at 782 MB/s, for a related reason that no bulk instruction fixes: it reads eight
+bytes with eight array reads and shifts, because wac has no unaligned load.
 
 ### The whole of the Tor bootstrap data
 

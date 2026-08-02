@@ -51,9 +51,7 @@ export struct Buf {
     i32 cap = this.data.len() * 2;
     if (cap < 16) { cap = 16; }
     u8[] next = u8[cap]();
-    for (i32 i = 0; i < this.len; i++) {
-      next[i] = this.data[i];
-    }
+    next.copyFrom(this.data, 0, 0, this.len);
     this.data = next;
   }
 
@@ -70,9 +68,7 @@ export struct Buf {
     if (cap < 16) { cap = 16; }
     while (cap < need) { cap = cap * 2; }
     u8[] next = u8[cap]();
-    for (i32 i = 0; i < this.len; i++) {
-      next[i] = this.data[i];
-    }
+    next.copyFrom(this.data, 0, 0, this.len);
     this.data = next;
   }
 
@@ -100,9 +96,7 @@ export struct Buf {
   // `start`, not `from` — `from` is a keyword (import ... from "...").
   void pushBytes(this, u8[] src, i32 start, i32 count) {
     this.reserveFor(count);
-    for (i32 i = 0; i < count; i++) {
-      this.data[this.len + i] = src[start + i];
-    }
+    this.data.copyFrom(src, start, this.len, count);
     this.len += count;
   }
 
@@ -185,10 +179,19 @@ export struct Buf {
     if (count < 0 || at < 0) { trap; }
     if (count > 0 && at >= this.len) { trap; }
     this.reserveFor(count);
-    u8[] d = this.data;
     i32 to = this.len;
-    for (i32 k = 0; k < count; k++) {
-      d[to + k] = d[at + k];
+
+    // `copyFrom` moves like `memmove`, which is right for a copy whose ranges do not overlap and
+    // *wrong* for one whose do: a run wants the bytes this loop is writing, not the ones that
+    // were there before. So the bulk instruction is used exactly when the source ends before the
+    // destination begins, and the loop stays for the overlapping case it exists to serve.
+    if (at + count <= to) {
+      this.data.copyFrom(this.data, at, to, count);
+    } else {
+      u8[] d = this.data;
+      for (i32 k = 0; k < count; k++) {
+        d[to + k] = d[at + k];
+      }
     }
     this.len = to + count;
   }
@@ -206,19 +209,17 @@ export struct Buf {
   void dropFront(this, i32 n) {
     if (n <= 0) { return; }
     if (n >= this.len) { this.len = 0; return; }
+    // A self-copy towards the front, which `copyFrom` handles: it moves like `memmove`, so the
+    // source is read before it is overwritten.
     i32 keep = this.len - n;
-    for (i32 i = 0; i < keep; i++) {
-      this.data[i] = this.data[n + i];
-    }
+    this.data.copyFrom(this.data, n, 0, keep);
     this.len = keep;
   }
 
   // Exact-length copy — the internal array is over-allocated.
   u8[] bytes(const this) {
     u8[] out = u8[this.len]();
-    for (i32 i = 0; i < this.len; i++) {
-      out[i] = this.data[i];
-    }
+    out.copyFrom(this.data, 0, 0, this.len);
     return out;
   }
 
