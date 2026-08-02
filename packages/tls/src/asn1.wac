@@ -19,18 +19,23 @@
 //
 // This is a reader only. Nothing here produces DER, because a TLS client never needs to.
 
-/** Universal tags, as they appear as whole first bytes. */
+/**
+ * Universal tags, as they appear as whole first bytes.
+ *
+ * Only the ones this reader actually reads. There were five more — NULL, SET, and the
+ * three string types — describing tags a certificate certainly contains but that nothing
+ * here looks at: Names are compared as encoded bytes rather than parsed into components,
+ * and algorithm parameters are skipped whatever they are. They were deleted rather than
+ * kept as documentation, because a constant no code consults documents nothing and cannot
+ * be wrong in a way any test would notice. Mutation testing is what pointed them out:
+ * every one could return zero with the suite still green.
+ */
 export i32 tagBoolean() { return 0x01; }
 export i32 tagInteger() { return 0x02; }
 export i32 tagBitString() { return 0x03; }
 export i32 tagOctetString() { return 0x04; }
-export i32 tagNull() { return 0x05; }
 export i32 tagOid() { return 0x06; }
-export i32 tagUtf8String() { return 0x0C; }
 export i32 tagSequence() { return 0x30; }
-export i32 tagSet() { return 0x31; }
-export i32 tagPrintableString() { return 0x13; }
-export i32 tagIa5String() { return 0x16; }
 export i32 tagUtcTime() { return 0x17; }
 export i32 tagGeneralizedTime() { return 0x18; }
 
@@ -144,14 +149,14 @@ export struct Der {
    * refusing rather than silently misreading.
    */
   u8[] bitString(this) {
-    Der inner = this.element(0x03);
+    Der inner = this.element(tagBitString());
     i32 unused = inner.byte();
     if (unused != 0) { trap; }
     return inner.rest();
   }
 
   /** An OBJECT IDENTIFIER's raw encoding, which is what comparisons want. */
-  u8[] oid(this) { return this.element(0x06).rest(); }
+  u8[] oid(this) { return this.element(tagOid()).rest(); }
 }
 
 /** Whether two OID encodings are the same. */
