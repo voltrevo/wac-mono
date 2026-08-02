@@ -373,3 +373,85 @@ Deno.test("stat and readDir reach the application, and are gated", async () => {
   assertEquals(denied.code, 1);
   assertEquals(denied.err.includes("not found"), true, denied.err);
 });
+
+// ── box: many applets in one program ──────────────────────────────────────────
+
+const BOX = "packages/platform/example/box.wac";
+
+Deno.test("box's applets agree with the system tools they imitate", async () => {
+  // The widest test of the world so far, and a differential one: every applet here is
+  // compared against the real utility rather than against my idea of it. `sha256sum` and
+  // `base64` go through this repo's own crypto and codec packages, so this is also the
+  // first application to compose several packages at once.
+  const built = await Deno.makeTempFile({ prefix: "wac-box-" });
+  const input = "alpha beta\ngamma\ndelta epsilon zeta\n";
+  const fixture = await Deno.makeTempFile({ prefix: "wac-box-in-" });
+  try {
+    await buildApp(BOX, built, { read: true });
+    await Deno.writeTextFile(fixture, input);
+
+    const box = (args: string[]) => {
+      const r = new Deno.Command(built, { args, stdout: "piped", stderr: "piped" }).outputSync();
+      return { code: r.code, out: new TextDecoder().decode(r.stdout) };
+    };
+    const sys = (cmd: string, args: string[]) => {
+      const r = new Deno.Command(cmd, { args, stdout: "piped", stderr: "null" }).outputSync();
+      return new TextDecoder().decode(r.stdout);
+    };
+
+    // Byte-for-byte against the real thing, where the real thing exists here.
+    for (const [applet, cmd] of [["cat", "cat"], ["rev", "rev"], ["nl", "nl"], ["base64", "base64"]]) {
+      assertEquals(box([applet, fixture]).out, sys(cmd, [fixture]), `${applet} differs`);
+    }
+    assertEquals(
+      box(["sha256sum", fixture]).out.split(" ")[0],
+      sys("sha256sum", [fixture]).split(" ")[0],
+      "sha256sum differs",
+    );
+
+    // `wc` prints its columns without padding, so compare the numbers rather than the text.
+    assertEquals(
+      box(["wc", fixture]).out.trim().split(/\s+/).slice(0, 3).join(" "),
+      sys("wc", [fixture]).trim().split(/\s+/).slice(0, 3).join(" "),
+      "wc counts differ",
+    );
+
+    assertEquals(box(["basename", "a/b/c.txt"]).out.trim(), "c.txt");
+    assertEquals(box(["dirname", "a/b/c.txt"]).out.trim(), "a/b");
+    assertEquals(box(["echo", "hello", "wac"]).out.trim(), "hello wac");
+    assertEquals(box(["seq", "3"]).out.trim().split("\n").join(","), "1,2,3");
+    assertEquals(box(["true"]).code, 0);
+    assertEquals(box(["false"]).code, 1);
+    assertEquals(box(["nope"]).code, 2, "an unknown applet is a usage error");
+
+    // head and tail against a file with more lines than they take.
+    const many = await Deno.makeTempFile();
+    try {
+      await Deno.writeTextFile(many, Array.from({ length: 15 }, (_, i) => i + 1).join("\n") + "\n");
+      assertEquals(box(["head", many]).out, sys("head", ["-10", many]), "head differs");
+      assertEquals(box(["tail", many]).out, sys("tail", ["-10", many]), "tail differs");
+    } finally {
+      await Deno.remove(many);
+    }
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(fixture);
+  }
+});
+
+Deno.test("box works as a filter, and its applets need only what they use", async () => {
+  const input = new TextEncoder().encode("one two\nthree\n");
+  // No grants at all: reading standard input is not a capability, so a pipeline works
+  // even where the filesystem was withheld.
+  const piped = await runFilter(BOX, ["wc"], input);
+  assertEquals(piped.code, 0, piped.err);
+  assertEquals(new TextDecoder().decode(piped.out).trim(), "2 3 14");
+
+  const hashed = await runFilter(BOX, ["sha256sum"], input);
+  assertEquals(new TextDecoder().decode(hashed.out).trim().endsWith("  -"), true, "stdin is '-'");
+
+  // But a file still needs the grant, and says so.
+  const denied = await runFilter(BOX, ["cat", "README.md"], new Uint8Array());
+  assertEquals(denied.code, 1);
+  assertEquals(denied.err.includes("not granted"), true, denied.err);
+});

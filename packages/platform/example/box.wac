@@ -1,0 +1,264 @@
+// A busybox-shaped application: one program, many applets, chosen by the first argument.
+//
+//   box wc README.md
+//   cat README.md | box sha256sum
+//   box ls packages
+//
+// Two things it is for. It is the widest test of the capability world so far — sixteen
+// small programs is a lot of ways to find out that something is missing — and it composes
+// this repo's packages rather than sitting beside them, which is where the bugs have
+// been.
+//
+// **A multicall binary weakens the permission story**, and that is worth saying rather
+// than hiding. `box`'s grants are the *union* of what its applets need, so running `box
+// echo` carries the filesystem access `box cp` would want. Building each applet as its own
+// executable gives each its own shebang and its own list; this exists to exercise the
+// world, not because one binary with sixteen entry points is the better shape.
+
+import { Cli, Core, FileResult, Stat } from "../src/platform.wac";
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { encode as b64encode, ALPHABET_STANDARD } from "../../codec/src/base64.wac";
+import { encode as hexencode } from "../../codec/src/hex.wac";
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount() < 1) { return usage(core); }
+  string applet = cli.arg(0);
+
+  if (applet == "help") { return usage(core); }
+  if (applet == "true") { return 0; }
+  if (applet == "false") { return 1; }
+  if (applet == "echo") { return echo(core, cli); }
+  if (applet == "seq") { return seq(core, cli); }
+  if (applet == "basename") { return basename(core, cli); }
+  if (applet == "dirname") { return dirname(core, cli); }
+  if (applet == "ls") { return ls(core, cli); }
+
+  // Everything below reads input — a file if named, otherwise standard input.
+  Input in = readInput(core, cli);
+  if (!in.ok) { return 1; }
+
+  if (applet == "cat")       { cli.write(in.bytes); return 0; }
+  if (applet == "wc")        { return wc(core, in.bytes, in.label); }
+  if (applet == "rev")       { cli.write(rev(in.bytes)); return 0; }
+  if (applet == "nl")        { cli.write(nl(in.bytes)); return 0; }
+  if (applet == "head")      { cli.write(lines(in.bytes, 10, true)); return 0; }
+  if (applet == "tail")      { cli.write(lines(in.bytes, 10, false)); return 0; }
+  if (applet == "sha256sum") { return sum(core, cli, in); }
+  if (applet == "base64")    { cli.write(withNewline(b64encode(in.bytes, ALPHABET_STANDARD(), true))); return 0; }
+  if (applet == "hex")       { cli.write(withNewline(hexencode(in.bytes))); return 0; }
+
+  core.warn("box: unknown applet '" + applet + "'");
+  return usage(core);
+}
+
+i32 usage(Core core) {
+  core.warn("usage: box <applet> [args]");
+  core.warn("  base64 basename cat dirname echo false head hex ls nl");
+  core.warn("  rev seq sha256sum tail true wc");
+  return 2;
+}
+
+// ── Input, from a file or standard input ──────────────────────────────────────
+
+struct Input { bool ok; u8[] bytes; string label; }
+
+/**
+ * The second argument names a file; without one, standard input.
+ *
+ * That is the whole difference between a tool and a filter, and it is one capability:
+ * `readStdin`. Every applet below gets it for free by going through here.
+ */
+Input readInput(Core core, Cli cli) {
+  if (cli.argCount() < 2) { return Input(true, cli.readStdin(), ""); }
+  string path = cli.arg(1);
+  FileResult f = cli.readFile(path);
+  if (!f.ok) {
+    core.warn("box: " + path + ": " + f.error);
+    return Input(false, u8[0](), path);
+  }
+  return Input(true, f.bytes, path);
+}
+
+// ── Applets ───────────────────────────────────────────────────────────────────
+
+i32 echo(Core core, Cli cli) {
+  string out = "";
+  for (i32 i = 1; i < cli.argCount(); i++) {
+    if (i > 1) { out = out + " "; }
+    out = out + cli.arg(i);
+  }
+  core.log(out);
+  return 0;
+}
+
+i32 seq(Core core, Cli cli) {
+  if (cli.argCount() < 2) { core.warn("usage: box seq <count>"); return 2; }
+  i32 n = atoi(cli.arg(1));
+  for (i32 i = 1; i <= n; i++) { core.log(itoa(i)); }
+  return 0;
+}
+
+i32 basename(Core core, Cli cli) {
+  if (cli.argCount() < 2) { core.warn("usage: box basename <path>"); return 2; }
+  string p = cli.arg(1);
+  u8[] b = p.toBytes();
+  i32 cut = 0;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == '/') { cut = i + 1; } }
+  core.log(string.fromBytes(slice(b, cut, b.len())));
+  return 0;
+}
+
+i32 dirname(Core core, Cli cli) {
+  if (cli.argCount() < 2) { core.warn("usage: box dirname <path>"); return 2; }
+  u8[] b = cli.arg(1).toBytes();
+  i32 cut = -1;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == '/') { cut = i; } }
+  core.log(cut <= 0 ? (cut == 0 ? "/" : ".") : string.fromBytes(slice(b, 0, cut)));
+  return 0;
+}
+
+i32 ls(Core core, Cli cli) {
+  string path = cli.argCount() < 2 ? "." : cli.arg(1);
+  string[]? names = cli.readDir(path);
+  if (names is null) {
+    // Not a directory, or not permitted — the application cannot tell, by design.
+    Stat st = cli.stat(path);
+    if (st.exists) { core.log(path); return 0; }
+    core.warn("box: " + path + ": cannot list");
+    return 1;
+  }
+  string[] found = names!;
+  for (i32 i = 0; i < found.len(); i++) { core.log(found[i]); }
+  return 0;
+}
+
+i32 wc(Core core, u8[] data, string label) {
+  i32 lineCount = 0;
+  i32 words = 0;
+  bool inWord = false;
+  for (i32 i = 0; i < data.len(); i++) {
+    i32 b = data[i];
+    if (b == '\n') { lineCount++; }
+    bool space = b == ' ' || b == '\n' || b == '\t' || b == '\r';
+    if (space) { inWord = false; } else if (!inWord) { inWord = true; words++; }
+  }
+  string line = itoa(lineCount) + " " + itoa(words) + " " + itoa(data.len());
+  core.log(label == "" ? line : line + " " + label);
+  return 0;
+}
+
+i32 sum(Core core, Cli cli, Input in) {
+  u8[] digest = sha256(in.bytes);
+  string name = in.label == "" ? "-" : in.label;
+  core.log(string.fromBytes(hexencode(digest)) + "  " + name);
+  return 0;
+}
+
+// ── Byte helpers ──────────────────────────────────────────────────────────────
+
+/** Reverse each line, keeping the line breaks where they are. */
+u8[] rev(u8[] data) {
+  u8[] out = u8[data.len()](fill: 0);
+  i32 start = 0;
+  for (i32 i = 0; i <= data.len(); i++) {
+    bool end = i == data.len() || data[i] == '\n';
+    if (!end) { continue; }
+    for (i32 k = 0; k < i - start; k++) { out[start + k] = data[i - 1 - k]; }
+    if (i < data.len()) { out[i] = '\n'; }
+    start = i + 1;
+  }
+  return out;
+}
+
+/** Number every line, right-aligned in six columns, as `nl` does. */
+u8[] nl(u8[] data) {
+  u8[] out = u8[0]();
+  i32 start = 0;
+  i32 n = 0;
+  for (i32 i = 0; i <= data.len(); i++) {
+    bool end = i == data.len() || data[i] == '\n';
+    if (!end) { continue; }
+    if (i == data.len() && i == start) { break; }   // no trailing blank line
+    n++;
+    u8[] num = itoa(n).toBytes();
+    u8[] row = u8[6 + 1 + (i - start) + 1](fill: ' ');
+    row.copyFrom(num, 0, 6 - num.len(), num.len());
+    row[6] = '\t';                                  // GNU nl separates with a tab
+    row.copyFrom(data, start, 7, i - start);
+    row[row.len() - 1] = '\n';
+    out = concat(out, row);
+    start = i + 1;
+  }
+  return out;
+}
+
+/** The first or last `count` lines. */
+u8[] lines(u8[] data, i32 count, bool fromStart) {
+  i32 total = 0;
+  for (i32 i = 0; i < data.len(); i++) { if (data[i] == '\n') { total++; } }
+  if (data.len() > 0 && data[data.len() - 1] != '\n') { total++; }
+  i32 skip = fromStart ? 0 : (total > count ? total - count : 0);
+  i32 take = fromStart ? count : total;
+
+  u8[] out = u8[0]();
+  i32 start = 0;
+  i32 seen = 0;
+  for (i32 i = 0; i <= data.len(); i++) {
+    bool end = i == data.len() || data[i] == '\n';
+    if (!end) { continue; }
+    if (i == data.len() && i == start) { break; }
+    if (seen >= skip && seen < skip + take) {
+      i32 upto = i < data.len() ? i + 1 : i;
+      out = concat(out, slice(data, start, upto));
+    }
+    seen++;
+    start = i + 1;
+  }
+  return out;
+}
+
+u8[] concat(u8[] a, u8[] b) {
+  u8[] out = u8[a.len() + b.len()](fill: 0);
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}
+
+// `from` would read better and is a keyword — `import … from` — so it is `at`. The
+// diagnostic for using it pointed a hundred lines further on, at the next declaration.
+u8[] slice(u8[] a, i32 at, i32 to) {
+  i32 n = to - at;
+  if (n <= 0) { return u8[0](); }
+  u8[] out = u8[n](fill: 0);
+  out.copyFrom(a, at, 0, n);
+  return out;
+}
+
+u8[] withNewline(u8[] a) {
+  u8[] out = u8[a.len() + 1](fill: '\n');
+  out.copyFrom(a, 0, 0, a.len());
+  return out;
+}
+
+// ── Numbers ───────────────────────────────────────────────────────────────────
+
+string itoa(i32 n) {
+  if (n == 0) { return "0"; }
+  i32 v = n < 0 ? 0 - n : n;
+  u8[] digits = u8[12](fill: 0);
+  i32 at = 12;
+  while (v > 0) { at--; digits[at] = '0' + (v % 10); v = v / 10; }
+  string s = string.fromBytes(slice(digits, at, 12));
+  return n < 0 ? "-" + s : s;
+}
+
+i32 atoi(string s) {
+  u8[] b = s.toBytes();
+  i32 v = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 c = b[i];
+    if (c < '0' || c > '9') { break; }
+    v = v * 10 + (c - '0');
+  }
+  return v;
+}

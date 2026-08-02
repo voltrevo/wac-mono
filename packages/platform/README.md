@@ -115,6 +115,27 @@ which ruled out every compressor and encoder as a filter.
 `example/hexdump.wac` exercises the difference: `hexdump < file` reads standard input and
 writes exact bytes, and `hexdump <dir>` lists a directory through `stat` and `readDir`.
 
+## box: sixteen applets in one program
+
+```sh
+deno task app:build packages/platform/example/box.wac --allow-read -o box
+./box wc README.md
+cat README.md | ./box sha256sum
+./box ls packages
+```
+
+`base64 basename cat dirname echo false head hex ls nl rev seq sha256sum tail true wc` —
+51K, and `sha256sum`, `base64` and `hex` go through this repo's own `crypto` and `codec`
+packages, so it is the first application to compose several at once. Its tests are
+differential against the system tools: `cat`, `rev`, `nl`, `base64` and `sha256sum` match
+byte for byte, and `head`/`tail`/`wc` match the real ones' numbers.
+
+**It also shows what a multicall binary costs.** `box`'s grants are the *union* of what
+its applets need, so `box echo` carries the filesystem access `box cat` wants. Built as
+separate executables, each would state its own: `wc` needs nothing at all and its shebang
+would say `deno run` with no flags. One binary with sixteen entry points is the shape
+BusyBox has to take; it is not the shape this model is best at.
+
 ## How an asynchronous host looks synchronous
 
 `readFile` is `await Deno.readFile` on the main thread. From wac it is a function call:
