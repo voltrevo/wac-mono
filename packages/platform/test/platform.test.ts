@@ -734,3 +734,161 @@ Deno.test("box's package-backed applets: gzip, gunzip, crc32, date, urlencode", 
     await Deno.remove(built);
   }
 });
+
+Deno.test("box's mutation tier: mkdir, rm, rmdir, mv, touch", async () => {
+  // `writeFile` was the only mutation the world had, which meant an application could
+  // create a file but never remove or move one — so it could not write safely either.
+  // These three ops are what `cp` needs to write beside its target and rename into place.
+  const built = await Deno.makeTempFile({ prefix: "wac-box-m-" });
+  const root = await Deno.makeTempDir({ prefix: "wac-box-fs-" });
+  try {
+    await buildApp(BOX, built, { read: true, write: true });
+    const box = (args: string[]) => {
+      const r = new Deno.Command(built, { args, stdout: "piped", stderr: "piped" }).outputSync();
+      return { code: r.code, err: new TextDecoder().decode(r.stderr) };
+    };
+    const exists = async (p: string) => {
+      try {
+        await Deno.stat(p);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const deep = `${root}/a/b/c`;
+    assertEquals(box(["mkdir", "-p", deep]).code, 0);
+    assertEquals(await exists(deep), true, "mkdir -p made the parents");
+    // Without -p a missing parent is an error, which is the difference between them.
+    assertEquals(box(["mkdir", `${root}/x/y`]).code, 1, "mkdir without -p needs the parent");
+
+    assertEquals(box(["touch", `${deep}/f`]).code, 0);
+    assertEquals((await Deno.stat(`${deep}/f`)).size, 0, "touch made it empty");
+    await Deno.writeTextFile(`${deep}/f`, "kept");
+    assertEquals(box(["touch", `${deep}/f`]).code, 0);
+    assertEquals(await Deno.readTextFile(`${deep}/f`), "kept", "touch left an existing file alone");
+
+    assertEquals(box(["mv", `${deep}/f`, `${root}/moved`]).code, 0);
+    assertEquals(await exists(`${deep}/f`), false, "mv left nothing behind");
+    assertEquals(await Deno.readTextFile(`${root}/moved`), "kept", "mv kept the contents");
+
+    // `rmdir` is never recursive; that distinction is the reason it is its own command.
+    await Deno.writeTextFile(`${deep}/g`, "x");
+    assertEquals(box(["rmdir", deep]).code, 1, "rmdir refuses a non-empty directory");
+    assertEquals(box(["rm", `${deep}/g`]).code, 0);
+    assertEquals(box(["rmdir", deep]).code, 0, "and takes an empty one");
+
+    // Absence is an error unless you say it is not, as `rm -f` says.
+    assertEquals(box(["rm", `${root}/never`]).code, 1);
+    assertEquals(box(["rm", "-f", `${root}/never`]).code, 0);
+    assertEquals(box(["rm", `${root}/a`]).code, 1, "rm needs -r for a directory");
+    assertEquals(box(["rm", "-r", `${root}/a`]).code, 0);
+    assertEquals(await exists(`${root}/a`), false);
+
+    // The point of the tier: `cp` writes beside its target and renames, so the destination
+    // is never seen half-written and no temporary name survives a successful copy.
+    assertEquals(box(["cp", "README.md", `${root}/copy`]).code, 0);
+    assertEquals(
+      await Deno.readTextFile(`${root}/copy`),
+      await Deno.readTextFile("README.md"),
+      "cp copied it",
+    );
+    const left: string[] = [];
+    for await (const e of Deno.readDir(root)) left.push(e.name);
+    assertEquals(left.sort().join(","), "copy,moved", `a temporary file survived: ${left}`);
+
+    // And without the write grant none of it happens, whatever the arguments say.
+    const readOnly = await Deno.makeTempFile({ prefix: "wac-box-ro-" });
+    try {
+      await buildApp(BOX, readOnly, { read: true });
+      const r = new Deno.Command(readOnly, {
+        args: ["mkdir", `${root}/denied`],
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      assertEquals(r.code, 1, "mkdir without the grant should fail");
+      assertEquals(await exists(`${root}/denied`), false, "and should make nothing");
+    } finally {
+      await Deno.remove(readOnly);
+    }
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("bin/: one applet alone states only the grants it needs", async () => {
+  // The README has been claiming that a multicall binary costs you the permission story
+  // and that built separately each applet would state its own. This measures it rather
+  // than asserting it: `wc` and `sha256sum` come out with an empty shebang, and a `wc`
+  // built that way cannot open a file even when told to.
+  const cases: Array<{ name: string; grants: Grants; shebang: string }> = [
+    { name: "wc", grants: {}, shebang: "#!/usr/bin/env -S deno run" },
+    { name: "sha256sum", grants: {}, shebang: "#!/usr/bin/env -S deno run" },
+    { name: "grep", grants: { read: true }, shebang: "#!/usr/bin/env -S deno run --allow-read" },
+    {
+      name: "cp",
+      grants: { read: true, write: true },
+      shebang: "#!/usr/bin/env -S deno run --allow-read --allow-write",
+    },
+  ];
+  const built: string[] = [];
+  try {
+    for (const c of cases) {
+      const out = await Deno.makeTempFile({ prefix: `wac-bin-${c.name}-` });
+      built.push(out);
+      await buildApp(`packages/platform/example/box/bin/${c.name}.wac`, out, c.grants);
+      const first = (await Deno.readTextFile(out)).split("\n")[0];
+      assertEquals(first, c.shebang, `${c.name}'s shebang`);
+    }
+
+    const [wc, sha, grep, cp] = built;
+    const pipe = (path: string, args: string[], input: string) => {
+      const child = new Deno.Command(path, {
+        args, stdin: "piped", stdout: "piped", stderr: "piped",
+      }).spawn();
+      const w = child.stdin.getWriter();
+      w.write(new TextEncoder().encode(input)).then(() => w.close());
+      return child.output();
+    };
+    const dec = new TextDecoder();
+
+    // The applet is the same code, so it must behave the same with no `box` in front.
+    const text = "alpha beta\ngamma\n";
+    assertEquals(dec.decode((await pipe(wc, [], text)).stdout).trim(), "2 3 17");
+    assertEquals(dec.decode((await pipe(wc, ["-l"], text)).stdout).trim(), "2", "flags still parse");
+    assertEquals(
+      dec.decode((await pipe(sha, [], text)).stdout).trim().endsWith("  -"),
+      true,
+      "stdin is still '-'",
+    );
+    assertEquals(dec.decode((await pipe(grep, ["-c", "beta"], text)).stdout).trim(), "1");
+
+    // And a program with no grants cannot be talked into a read, whatever it is passed.
+    const denied = await pipe(wc, ["README.md"], "");
+    assertEquals(denied.code, 1);
+    assertEquals(dec.decode(denied.stderr).includes("not granted"), true);
+    // It names itself, not `box` — the entry point in `bin/` passes the name, because a
+    // program in this model is never handed its own argv[0].
+    assertEquals(dec.decode(denied.stderr).startsWith("wc: "), true, dec.decode(denied.stderr));
+
+    // The one with grants does the real thing.
+    const dst = await Deno.makeTempFile({ prefix: "wac-bin-dst-" });
+    try {
+      const r = new Deno.Command(cp, { args: ["README.md", dst], stderr: "piped" }).outputSync();
+      assertEquals(r.code, 0, dec.decode(r.stderr));
+      assertEquals(await Deno.readTextFile(dst), await Deno.readTextFile("README.md"));
+    } finally {
+      await Deno.remove(dst);
+    }
+
+    // The size of what you gave up: `box` carries every applet and every grant.
+    const alone = (await Deno.stat(wc)).size;
+    const all = await Deno.makeTempFile({ prefix: "wac-bin-box-" });
+    built.push(all);
+    await buildApp(BOX, all, { read: true, write: true });
+    assertEquals(alone * 2 < (await Deno.stat(all)).size, true, "box should be much larger");
+  } finally {
+    for (const b of built) await Deno.remove(b);
+  }
+});

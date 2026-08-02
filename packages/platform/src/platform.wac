@@ -106,6 +106,23 @@ export struct Cli {
   /** Names within a directory, or null if it is not one — or not permitted. */
   fn[string[]?(string)] readDir;
 
+  /**
+   * Making, unmaking and moving. All three answer with whether they worked.
+   *
+   * `writeFile` alone cannot express a safe update: it truncates and then fills, so a
+   * reader arriving in between sees a half-written file, and a crash leaves one. With
+   * `rename` an application can write beside the target and move it into place, which on
+   * every filesystem this runs on is atomic. That is why these are one tier rather than
+   * three conveniences — see `applets/cp.wac`, which does exactly that.
+   *
+   * `parents` and `recursive` are `mkdir -p` and `rm -r`. Both default to nothing: a
+   * caller has to ask for the recursive form, because the recursive form is the one that
+   * can destroy something it was not pointed at.
+   */
+  fn[bool(string, bool)] mkdir;
+  fn[bool(string, bool)] remove;
+  fn[bool(string, string)] rename;
+
   Cli of(
     fn[i32()] argCount,
     fn[string(i32)] arg,
@@ -115,8 +132,14 @@ export struct Cli {
     fn[FileResult(string)] readFile,
     fn[bool(string, u8[])] writeFile,
     fn[Stat(string)] stat,
-    fn[string[]?(string)] readDir
+    fn[string[]?(string)] readDir,
+    fn[bool(string, bool)] mkdir,
+    fn[bool(string, bool)] remove,
+    fn[bool(string, string)] rename
   ) {
-    return Cli(argCount, arg, env, readStdin, write, readFile, writeFile, stat, readDir);
+    return Cli(
+      argCount, arg, env, readStdin, write, readFile, writeFile, stat, readDir,
+      mkdir, remove, rename
+    );
   }
 }

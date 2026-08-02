@@ -12,11 +12,11 @@ import { compile, compileIgnoreCase, search, slotCount } from "../../../../regex
 import { Program, NO_MATCH } from "../../../../regex/src/program.wac";
 
 export i32 grep(Core core, Cli cli, Args a) {
-  if (a.rest.len() < 1) { core.warn("usage: box grep [-ivnc] <pattern> [file]"); return 2; }
+  if (a.rest.len() < 1) { core.warn("usage: " + a.name + " [-ivnc] <pattern> [file]"); return 2; }
   Program? prog = has(a, 'i')
     ? compileIgnoreCase(a.rest[0].toBytes())
     : compile(a.rest[0].toBytes());
-  if (prog is null) { core.warn("box: bad pattern: " + a.rest[0]); return 2; }
+  if (prog is null) { core.warn(a.name + ": bad pattern: " + a.rest[0]); return 2; }
   Program p = prog!;
 
   Input in = readInput(core, cli, a, 1);

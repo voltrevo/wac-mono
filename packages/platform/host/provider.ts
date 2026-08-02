@@ -107,5 +107,38 @@ export function cliOf(
         return null;
       }
     },
+    // A leading flag byte rather than two opcodes: `mkdir -p` and `mkdir` differ in one
+    // bit of intent, and one handler that reads it keeps them from drifting apart.
+    (path: string, parents: boolean) => tried(b, OP.MKDIR, flagged(parents, path)),
+    (path: string, recursive: boolean) => tried(b, OP.REMOVE, flagged(recursive, path)),
+    (from: string, to: string) => tried(b, OP.RENAME, twoPaths(from, to)),
   );
+}
+
+/** An op whose only answer is whether it worked. */
+function tried(b: Bridge, op: number, payload: Uint8Array): boolean {
+  try {
+    hostCall(b, op, payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function flagged(on: boolean, path: string): Uint8Array {
+  const p = str(path);
+  const out = new Uint8Array(1 + p.length);
+  out[0] = on ? 1 : 0;
+  out.set(p, 1);
+  return out;
+}
+
+function twoPaths(from: string, to: string): Uint8Array {
+  const a = str(from);
+  const bs = str(to);
+  const out = new Uint8Array(4 + a.length + bs.length);
+  out.set(i32le(a.length), 0);
+  out.set(a, 4);
+  out.set(bs, 4 + a.length);
+  return out;
 }

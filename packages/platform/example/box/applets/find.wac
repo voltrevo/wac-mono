@@ -6,7 +6,7 @@ import { Args } from "../lib/args.wac";
 export i32 find(Core core, Cli cli, Args a) {
   string root = a.rest.len() < 1 ? "." : a.rest[0];
   Stat st = cli.stat(root);
-  if (!st.exists) { core.warn("box: " + root + ": not found"); return 1; }
+  if (!st.exists) { core.warn(a.name + ": " + root + ": not found"); return 1; }
   core.log(root);
   walk(core, cli, root, 0);
   return 0;

@@ -13,7 +13,7 @@ export i32 cut(Core core, Cli cli, Args a) {
   i32 field = atoi(flagValue(cli, 'f'));
   // The value has to be attached to its flag — see `flagValue`. `-f 2` arrives here as no
   // value at all, so the usage message is what a detached spelling gets.
-  if (field < 1) { core.warn("usage: box cut -f<n> [-d<c>] [file]   (attached, as -f2 -d,)"); return 2; }
+  if (field < 1) { core.warn("usage: " + a.name + " -f<n> [-d<c>] [file]   (attached, as -f2 -d,)"); return 2; }
 
   Input in = readInput(core, cli, a, 0);
   if (!in.ok) { return 1; }
