@@ -9,6 +9,12 @@ deno task app packages/platform/example/wc.wac --allow-read -- README.md
 
 `example/wc.wac` is the whole application. There is no `main.ts` beside it.
 
+That command **builds and runs** — it is a shortcut, not a second runtime. There used to
+be a separate `runApp` that compiled and spawned a worker by a route of its own, which
+meant two launchers and two workers: a dev loop that could be green while the shipped
+artifact was broken, and a change to the application contract that had to be made twice.
+Now there is one path, and the dev loop exercises it.
+
 A package of [wac-mono](../../README.md) — see the root README for layout and how to run
 things. All commands run from the repo root.
 
@@ -126,11 +132,9 @@ host/provider.ts    builds Core and Cli from a bridge
 host/deno.ts        Deno's implementations. Note how much of it is `await`
 host/node.ts        the same table over Node's APIs
 host/entryNode.ts   the launcher and worker halves for Node
-host/worker.ts      loads an application and runs it
-host/launch.ts      compiles, spawns the worker, answers, waits
 host/entry.ts       the launcher and worker halves of a built program
 build.ts            builds an application into one executable
-app.ts              the command line
+app.ts              build and run, in one step
 example/wc.wac      an application, entire
 ```
 
