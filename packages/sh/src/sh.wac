@@ -1,0 +1,57 @@
+// `sh` — the shell as a program, entire, in wac.
+//
+//   deno task app packages/sh/src/sh.wac --allow-read --allow-env -- -c 'echo hi | rev'
+//   deno task app:build packages/sh/src/sh.wac --allow-read --allow-write --allow-env -o wacsh
+//   ./wacsh script.sh
+//
+// Usage:
+//
+//   sh -c 'script'      run the argument
+//   sh file             run the file
+//   sh                  run standard input
+//
+// External commands are implemented in wac, because the capability world cannot start a process
+// (issue 0015). `help` lists what there is. Everything else — quoting, expansion, pipelines,
+// redirection, `&&`, `$(…)`, exit statuses — is a shell.
+
+import { Cli, Core, FileResult } from "../../platform/src/platform.wac";
+import { Shell, runScript } from "./exec.wac";
+
+export i32 main(Core core, Cli cli) {
+  string src = "";
+
+  i32 n = cli.argCount();
+  if (n >= 1 && cli.arg(0) == "-c") {
+    if (n < 2) {
+      core.warn("sh: -c needs a script");
+      return 2;
+    }
+    // Everything after `-c` joined with spaces, as `sh -c` does: the shell re-splits it anyway.
+    src = cli.arg(1);
+    for (i32 i = 2; i < n; i++) { src = src + " " + cli.arg(i); }
+  } else if (n >= 1) {
+    FileResult f = cli.readFile(cli.arg(0));
+    if (!f.ok) {
+      core.warn("sh: " + cli.arg(0) + ": " + f.error);
+      return 127;
+    }
+    src = string.fromBytes(f.bytes);
+  } else {
+    src = string.fromBytes(cli.readStdin());
+  }
+
+  Shell sh = Shell.create(core, cli);
+  i32 status = runScript(sh, src);
+
+  // Standard error goes out in one piece at the end, because the capability world has no
+  // byte-level error channel — issue 0014. `warn` adds its own newline, so a trailing one would
+  // print a blank line.
+  if (sh.errOut.len > 0) {
+    i32 len = sh.errOut.len;
+    while (len > 0 && sh.errOut.get(len - 1) == 10) { len--; }
+    u8[] trimmed = u8[len]();
+    trimmed.copyFrom(sh.errOut.data, 0, 0, len);
+    core.warn(string.fromBytes(trimmed));
+  }
+  return status;
+}
