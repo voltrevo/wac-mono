@@ -1,0 +1,77 @@
+// The platform world: everything an application may do, and nothing else.
+//
+// wac has no ambient access — no imports a program can name, no globals reaching outside
+// — so an application can only touch what it is handed. These structs *are* the
+// permission list. Reading one tells you exactly what a program can do, not because of a
+// convention but because there is no other route out.
+//
+// Two profiles rather than one flat struct, so an application takes what it needs and a
+// reader can see the difference between "reads the clock" and "reads your filesystem".
+//
+// Every capability returns a value; none fills a buffer. Arrays *copy* across the
+// boundary, so a `fn[void(u8[])] fill` type-checks and quietly does nothing — the host's
+// writes land on a copy. Returning is the only shape that works.
+//
+// Capabilities are also coarse on purpose. Behind each one may be a thread parking and
+// unparking on a `SharedArrayBuffer`, which is nothing per file read and ruinous per byte.
+// `readFile`, never `readByte`.
+
+/** A file that may not have been there. `bytes` is empty when `ok` is false. */
+export struct FileResult {
+  bool ok;
+  u8[] bytes;
+  string error;
+}
+
+/**
+ * What every host can do, synchronously or made to look so.
+ *
+ * Deno, Node and a browser all provide these, which is what makes an application that
+ * uses only `Core` portable without qualification.
+ */
+export struct Core {
+  /** Wall clock, milliseconds since the epoch. Moves backwards; do not measure with it. */
+  fn[i64()] nowMillis;
+  /** Monotonic nanoseconds from an arbitrary origin. For measuring, never for dating. */
+  fn[i64()] monotonicNanos;
+  /** Cryptographically secure random bytes. */
+  fn[u8[](i32)] randomBytes;
+  /** A line of output. */
+  fn[void(string)] log;
+  /** A line of output on the error channel. */
+  fn[void(string)] warn;
+
+  Core of(
+    fn[i64()] nowMillis,
+    fn[i64()] monotonicNanos,
+    fn[u8[](i32)] randomBytes,
+    fn[void(string)] log,
+    fn[void(string)] warn
+  ) {
+    return Core(nowMillis, monotonicNanos, randomBytes, log, warn);
+  }
+}
+
+/**
+ * The command line and the filesystem. Absent in a browser, which is the honest reason
+ * this is not part of `Core`.
+ */
+export struct Cli {
+  fn[i32()] argCount;
+  fn[string(i32)] arg;
+  /** Null when the variable is unset, which is not the same as empty. */
+  fn[string?(string)] env;
+  fn[FileResult(string)] readFile;
+  /** True when the write succeeded. */
+  fn[bool(string, u8[])] writeFile;
+
+  Cli of(
+    fn[i32()] argCount,
+    fn[string(i32)] arg,
+    fn[string?(string)] env,
+    fn[FileResult(string)] readFile,
+    fn[bool(string, u8[])] writeFile
+  ) {
+    return Cli(argCount, arg, env, readFile, writeFile);
+  }
+}

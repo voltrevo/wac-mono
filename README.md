@@ -23,6 +23,7 @@ compiler, this one is things built with it.
 | [`http`](packages/http/) | HTTP/1.1 request parsing, strict about framing |
 | [`unicode`](packages/unicode/) | UTF-8 as code points, and simple case mapping |
 | [`stream`](packages/stream/) | run a wac transform as a stream, with the host doing the blocking wac cannot |
+| [`platform`](packages/platform/) | a capability world, so an application can be written **entirely in wac** — no TypeScript of its own |
 | [`zstd`](packages/zstd/) | Zstandard — the frame layer only so far, compressed blocks not yet |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) — **not for production**, see its README |
 | [`wacc`](packages/wacc/) | the wac compiler, in wac, so it can eventually compile itself |
@@ -69,6 +70,7 @@ Everything runs from the repo root, so one command covers every package.
 ```sh
 deno task test            # all tests, host-side and wac-written (parallel: ~30s, vs ~76s serial)
 deno task wac:pin         # record the sibling wac checkout as the minimum this repo needs
+deno task app <entry.wac> --allow-read -- args   # run a wac application
 deno task coverage        # branch coverage of every package, from its wac-native tests
 deno task coverage:bignum # ...and the host-driven exercises, per package
 deno task coverage:bytes
