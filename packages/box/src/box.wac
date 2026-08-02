@@ -42,6 +42,7 @@ import { echo } from "./applets/echo.wac";
 import { find } from "./applets/find.wac";
 import { fold } from "./applets/fold.wac";
 import { get } from "./applets/get.wac";
+import { gets } from "./applets/gets.wac";
 import { grep } from "./applets/grep.wac";
 import { gunzip } from "./applets/gunzip.wac";
 import { gzip } from "./applets/gzip.wac";
@@ -103,6 +104,7 @@ export i32 main(Core core, Cli cli) {
   if (applet == "find")      { return find(core, cli, a); }
   if (applet == "fold")      { return fold(core, cli, a); }
   if (applet == "get")       { return get(core, cli, a); }
+  if (applet == "gets")      { return gets(core, cli, a); }
   if (applet == "grep")      { return grep(core, cli, a); }
   if (applet == "gunzip")    { return gunzip(core, cli, a); }
   if (applet == "gzip")      { return gzip(core, cli, a); }
@@ -157,13 +159,14 @@ export i32 main(Core core, Cli cli) {
 i32 usage(Core core) {
   core.warn("usage: box <applet> [-flags] [args]");
   core.warn("  base32 base64 basename cat cp crc32 cut date diff dirname du echo false");
-  core.warn("  find fold get grep gunzip gzip head hex httpd json ls mkdir mv nl paste");
-  core.warn("  rev rm rmdir seq serve sha256sum sha512sum shuf sort split sponge stat");
-  core.warn("  strings tac tail tar tee touch tr true uniq unzstd urldecode urlencode");
-  core.warn("  uuid wc wget yes zstd");
+  core.warn("  find fold get gets grep gunzip gzip head hex httpd json ls mkdir mv nl");
+  core.warn("  paste rev rm rmdir seq serve sha256sum sha512sum shuf sort split sponge");
+  core.warn("  stat strings tac tail tar tee touch tr true uniq unzstd urldecode");
+  core.warn("  urlencode uuid wc wget yes zstd");
   core.warn("flags: grep -ivnc   sort -ru   uniq -c   wc -lwc   head/tail/fold -N");
   core.warn("       cut -f<n> -d<c>   tr <set1> <set2>   mkdir -p   rm -rf   json -c");
   core.warn("net:   get <host> [path] [-<port>] [-i]   wget <host> <path> <out>\n"
-            + "       serve [-<port>] [-o]   httpd [-<port>] [dir] [-o]");
+            + "       serve [-<port>] [-o]   httpd [-<port>] [dir] [-o]\n"
+            + "       gets <host> <path> <root.der> [-<port>]   (TLS 1.3)");
   return 2;
 }

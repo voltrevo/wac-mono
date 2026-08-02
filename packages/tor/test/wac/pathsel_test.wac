@@ -1,0 +1,255 @@
+// Path selection.
+//
+// Everything here is deterministic on purpose. The chooser takes its randomness as an
+// argument rather than drawing it, because a chooser with its own entropy can only be tested
+// statistically — and a statistical test loose enough never to flake is loose enough to miss
+// a real bias. Feeding it every value in [0, total) instead pins the distribution exactly.
+//
+// That matters more here than anywhere else in the package. A wrong handshake fails loudly;
+// a wrong path selection builds a working circuit with the anonymity quietly removed.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  weightedChoice, weightedBandwidths, positionWeight, pathAllows, sameSubnet16, choose,
+  positionGuard, positionMiddle, positionExit,
+} from "../../src/pathsel.wac";
+
+/** Wgg Wgd Wge Wgm | Wmg Wmd Wme Wmm | Weg Wed Wee Wem */
+i64[] weights() {
+  return i64[](10000, 3333, 0, 10000,
+               0, 3333, 0, 10000,
+               3333, 3333, 10000, 10000);
+}
+
+i32[] noPath() { return i32[0](); }
+i32[] emptyFamilyStart(i32 n) {
+  i32[] s = i32[n + 1]();
+  return s;   // every start is 0, so nobody has any family
+}
+
+export string test_the_distribution_is_exactly_proportional() {
+  // Every value in [0, total) fed through, counting where each lands. Not a sample — the
+  // whole space, so the counts must be the weights and not merely close to them.
+  T t = T.create();
+  i64[] w = i64[](3, 0, 7, 1, 9);
+  i32[] hits = i32[5]();
+  for (i64 r = 0; r < 20; r++) {
+    i32 i = weightedChoice(w, r);
+    hits[i]++;
+  }
+  t.eqI32(hits[0], 3, "weight 3 is chosen three times in twenty");
+  t.eqI32(hits[1], 0, "a zero weight is never chosen");
+  t.eqI32(hits[2], 7, "weight 7");
+  t.eqI32(hits[3], 1, "weight 1");
+  t.eqI32(hits[4], 9, "weight 9");
+  return t.report();
+}
+
+export string test_a_zero_weight_relay_is_never_returned() {
+  // The property the eligibility filter depends on: `choose` excludes a relay by zeroing its
+  // weight, so a chooser that could still return a zero-weighted index would ignore every
+  // flag check, every family and every subnet rule at once.
+  T t = T.create();
+  i64[] w = i64[](0, 5, 0, 0, 11, 0);
+  for (i64 r = 0; r < 16; r++) {
+    i32 i = weightedChoice(w, r);
+    t.isTrue(w[i] > 0, "index " + itoa64(i as i64) + " has a non-zero weight");
+  }
+  return t.report();
+}
+
+export string test_no_eligible_relay_is_reported_not_papered_over() {
+  T t = T.create();
+  t.eqI32(weightedChoice(i64[](0, 0, 0), 5), -1, "all zero weights gives -1");
+  t.eqI32(weightedChoice(i64[0](), 0), -1, "so does an empty candidate list");
+  // And -1 rather than 0: returning the first relay would look like a working client that
+  // always picks the same first hop.
+  t.eqI32(weightedChoice(i64[](0, 0, 4), 0), 2, "the one non-zero entry is found");
+  return t.report();
+}
+
+export string test_the_flag_combination_picks_the_right_weight() {
+  // The ordering bug this is here for: a relay with Guard *and* Exit must take the "both"
+  // weight. Testing Guard first and returning gives it the guard-only weight, which sends
+  // scarce exit capacity into the guard position — and every test of a guard-only relay
+  // still passes.
+  T t = T.create();
+  i64[] w = weights();
+  t.eqI64(positionWeight(positionGuard(), true, false, w), 10000, "guard only, at the guard");
+  t.eqI64(positionWeight(positionGuard(), true, true, w), 3333, "guard and exit, at the guard");
+  t.eqI64(positionWeight(positionGuard(), false, true, w), 0, "exit only cannot be a guard");
+  t.eqI64(positionWeight(positionGuard(), false, false, w), 10000, "neither flag, at the guard");
+
+  t.eqI64(positionWeight(positionExit(), false, true, w), 10000, "exit only, at the exit");
+  t.eqI64(positionWeight(positionExit(), true, true, w), 3333, "guard and exit, at the exit");
+  t.eqI64(positionWeight(positionMiddle(), true, false, w), 0, "guard only, in the middle");
+  t.eqI64(positionWeight(positionMiddle(), false, false, w), 10000, "neither, in the middle");
+
+  // Stated as a relation rather than a number, since this is the actual invariant: a relay
+  // carrying both flags must not be treated as though it carried only one.
+  t.isTrue(positionWeight(positionGuard(), true, true, w)
+           != positionWeight(positionGuard(), true, false, w),
+           "both flags is not the same as guard alone");
+  t.isTrue(positionWeight(positionExit(), true, true, w)
+           != positionWeight(positionExit(), false, true, w),
+           "both flags is not the same as exit alone");
+  return t.report();
+}
+
+export string test_weighting_survives_a_bandwidth_that_overflows_32_bits() {
+  // A consensus bandwidth times a weight of 10000 leaves 32 bits well behind. In i32 the
+  // product wraps negative, `weightedChoice` traps on it, and before that the biggest relays
+  // would simply stop being chosen — a bias toward small relays with nothing in the logs.
+  T t = T.create();
+  i64[] bw = i64[](1000000, 500000, 1);
+  bool[] g = bool[](true, true, true);
+  bool[] e = bool[](false, false, false);
+  i64[] out = weightedBandwidths(bw, g, e, positionGuard(), weights());
+  t.eqI64(out[0], 1000000, "a million times 10000 over 10000");
+  t.eqI64(out[1], 500000, "and half of it");
+  t.isTrue(out[0] > 0, "still positive, which i32 arithmetic would not be");
+  // The ratio is what the selection actually uses, so check that rather than the magnitude.
+  t.eqI64(out[0] / out[1], 2, "twice the bandwidth, twice the weight");
+  return t.report();
+}
+
+export string test_weighting_scales_by_the_position() {
+  T t = T.create();
+  i64[] bw = i64[](100, 100);
+  bool[] g = bool[](true, false);
+  bool[] e = bool[](true, false);
+  // Relay 0 has both flags, relay 1 has neither.
+  i64[] atGuard = weightedBandwidths(bw, g, e, positionGuard(), weights());
+  t.eqI64(atGuard[0], 33, "a guard+exit relay is discounted at the guard position");
+  t.eqI64(atGuard[1], 100, "a plain relay is not");
+  i64[] atExit = weightedBandwidths(bw, g, e, positionExit(), weights());
+  t.eqI64(atExit[0], 33, "and discounted at the exit too");
+  t.eqI64(atExit[1], 100, "while a plain relay can still be one here");
+  return t.report();
+}
+
+// ── Constraints ──────────────────────────────────────────────────────────────
+
+export string test_two_relays_in_one_slash_sixteen_cannot_share_a_path() {
+  T t = T.create();
+  t.isTrue(sameSubnet16(u8[](10, 1, 2, 3), u8[](10, 1, 9, 9)), "same /16");
+  t.isTrue(!sameSubnet16(u8[](10, 1, 2, 3), u8[](10, 2, 2, 3)), "second octet differs");
+  t.isTrue(!sameSubnet16(u8[](10, 1, 2, 3), u8[](11, 1, 2, 3)), "first octet differs");
+
+  // Three relays: 0 and 1 share a /16, 2 does not.
+  u8[] addrs = u8[](10, 1, 0, 1,  10, 1, 0, 2,  10, 2, 0, 1);
+  i32[] fs = emptyFamilyStart(3);
+  i32[] fo = i32[0]();
+  t.isTrue(!pathAllows(i32[](0), 1, addrs, fs, fo, false), "1 cannot join a path with 0");
+  t.isTrue(pathAllows(i32[](0), 2, addrs, fs, fo, false), "2 can");
+  t.isTrue(pathAllows(i32[](0), 1, addrs, fs, fo, true), "unless the rule is waived");
+  return t.report();
+}
+
+export string test_a_relay_cannot_appear_twice_in_one_path() {
+  T t = T.create();
+  u8[] addrs = u8[](10, 1, 0, 1,  20, 1, 0, 2,  30, 2, 0, 1);
+  i32[] fs = emptyFamilyStart(3);
+  i32[] fo = i32[0]();
+  t.isTrue(!pathAllows(i32[](1), 1, addrs, fs, fo, false), "the same relay is refused");
+  t.isTrue(!pathAllows(i32[](0, 1), 1, addrs, fs, fo, true), "even with every rule waived");
+  t.isTrue(pathAllows(i32[](0, 1), 2, addrs, fs, fo, false), "a third relay is fine");
+  return t.report();
+}
+
+export string test_family_members_cannot_share_a_path() {
+  T t = T.create();
+  // Four relays on distinct /16s. 0 and 2 are family; 1 and 3 are unrelated.
+  u8[] addrs = u8[](10, 0, 0, 1,  20, 0, 0, 1,  30, 0, 0, 1,  40, 0, 0, 1);
+  // Flattened adjacency: relay 0 -> [2], relay 2 -> [0], others empty.
+  i32[] fs = i32[](0, 1, 1, 2, 2);
+  i32[] fo = i32[](2, 0);
+
+  t.isTrue(!pathAllows(i32[](0), 2, addrs, fs, fo, false), "2 cannot join a path with 0");
+  t.isTrue(!pathAllows(i32[](2), 0, addrs, fs, fo, false), "and 0 cannot join one with 2");
+  t.isTrue(pathAllows(i32[](0), 1, addrs, fs, fo, false), "an unrelated relay can");
+  t.isTrue(pathAllows(i32[](1), 3, addrs, fs, fo, false), "and so can two unrelated ones");
+  // Family is not waived by allowSameSubnet — that flag is about addresses only.
+  t.isTrue(!pathAllows(i32[](0), 2, addrs, fs, fo, true),
+           "waiving the subnet rule does not waive the family rule");
+  return t.report();
+}
+
+export string test_a_one_sided_family_entry_still_excludes() {
+  // The adjacency `pathAllows` receives is symmetric by construction — the caller drops
+  // claims that are not mutual. This checks the belt-and-braces half anyway, with asymmetric
+  // data that only a bug in that resolution could produce.
+  //
+  // It exists because the test above could not see the difference. Its data was symmetric,
+  // so dropping either direction of the check left every assertion passing; planting exactly
+  // that fault was the only way to find out. The same shape as the relay tests' symmetric
+  // oracle, and the same lesson.
+  T t = T.create();
+  u8[] addrs = u8[](10, 0, 0, 1,  20, 0, 0, 1,  30, 0, 0, 1);
+  // Relay 0 lists relay 2. Relay 2 lists nobody.
+  i32[] forward = i32[](0, 1, 1, 1);
+  i32[] fo = i32[](2);
+  t.isTrue(!pathAllows(i32[](2), 0, addrs, forward, fo, false),
+           "the relay that made the claim is excluded from a path holding its target");
+  t.isTrue(!pathAllows(i32[](0), 2, addrs, forward, fo, false),
+           "and the target is excluded from a path holding the claimant");
+
+  // The mirror image: relay 2 lists relay 0, relay 0 lists nobody.
+  i32[] backward = i32[](0, 0, 0, 1);
+  i32[] bo = i32[](0);
+  t.isTrue(!pathAllows(i32[](0), 2, addrs, backward, bo, false), "and the same the other way");
+  t.isTrue(!pathAllows(i32[](2), 0, addrs, backward, bo, false), "in both orders");
+
+  // An unrelated relay is still fine under either.
+  t.isTrue(pathAllows(i32[](0), 1, addrs, forward, fo, false), "relay 1 is unaffected");
+  t.isTrue(pathAllows(i32[](2), 1, addrs, backward, bo, false), "under either adjacency");
+  return t.report();
+}
+
+export string test_choose_excludes_what_the_path_forbids() {
+  // The two halves together: the weight says who is worth picking, the path says who is
+  // allowed, and `choose` must apply both. Sweeping every random value proves the excluded
+  // relay is unreachable rather than merely unlikely.
+  T t = T.create();
+  u8[] addrs = u8[](10, 0, 0, 1,  10, 0, 0, 2,  30, 0, 0, 1);
+  i32[] fs = emptyFamilyStart(3);
+  i32[] fo = i32[0]();
+  i64[] weighted = i64[](100, 100, 100);
+
+  // With relay 0 already in the path, relay 1 shares its /16 and must never come back.
+  i32[] chosen = i32[](0);
+  i32 sawOne = 0;
+  i32 sawTwo = 0;
+  for (i64 r = 0; r < 300; r++) {
+    i32 i = choose(weighted, chosen, addrs, fs, fo, false, r);
+    if (i == 0) { t.isFalse(true, "the relay already in the path was chosen again"); }
+    if (i == 1) { sawOne++; }
+    if (i == 2) { sawTwo++; }
+  }
+  t.eqI32(sawOne, 0, "the same-/16 relay is never chosen");
+  t.eqI32(sawTwo, 300, "and the eligible one always is");
+
+  // With nothing chosen yet, all three are reachable in proportion.
+  i32 c0 = 0;
+  for (i64 r = 0; r < 300; r++) {
+    if (choose(weighted, noPath(), addrs, fs, fo, false, r) == 0) { c0++; }
+  }
+  t.eqI32(c0, 100, "an unconstrained path picks each of three equally");
+  return t.report();
+}
+
+export string test_a_fully_constrained_position_reports_no_candidate() {
+  // The case a client must not paper over. If every relay is excluded there is no path, and
+  // the honest answer is -1 — not a retry with the rules relaxed.
+  T t = T.create();
+  u8[] addrs = u8[](10, 0, 0, 1,  10, 0, 0, 2);
+  i32[] fs = emptyFamilyStart(2);
+  i32[] fo = i32[0]();
+  i64[] weighted = i64[](50, 50);
+  t.eqI32(choose(weighted, i32[](0), addrs, fs, fo, false, 7), -1,
+          "only relay left shares the /16, so there is no candidate");
+  t.eqI32(choose(weighted, i32[](0), addrs, fs, fo, true, 7), 1,
+          "and waiving the rule finds it");
+  return t.report();
+}

@@ -1,0 +1,183 @@
+// Choosing a path. path-spec.txt, and dir-spec §3.4.3 for the weights.
+//
+// This is the part of a Tor client that decides who gets to watch you. Everything else in
+// the package is mechanism — if the handshake is wrong the circuit fails loudly. If path
+// selection is wrong the circuit works perfectly and the anonymity is gone, so the failures
+// here are the quiet kind.
+//
+// Three things have to be right.
+//
+// ## Bandwidth weighting, per position
+//
+// Picking uniformly at random sounds fair and is not: the network's capacity is enormously
+// unequal, so uniform selection sends most traffic through relays that cannot carry it, and
+// an attacker buys influence with relay *count* rather than with bandwidth. Weighting by
+// bandwidth makes influence cost what capacity costs.
+//
+// But it cannot be plain bandwidth either, because exit capacity is scarce. If exits were
+// chosen as middles as often as anyone else, the scarce resource would be spent in the
+// position that does not need it. The consensus therefore publishes a weight per (flag
+// combination, position) pair — Wgd, Wmg, Wee and the rest — scaled by 10000, and the
+// authorities compute them to balance the three positions. A client that ignores them is
+// not merely suboptimal; it concentrates its traffic differently from everyone else's,
+// which is itself distinguishing.
+//
+// ## Distinct /16s
+//
+// Two relays in one /16 are plausibly one operator, or at least one place a wire can be
+// tapped. A path whose guard and exit share a /16 can be correlated by whoever holds that
+// prefix, which is exactly the adversary the three hops exist to defeat.
+//
+// ## Families
+//
+// Operators declare which relays they run together. The declaration must be *mutual* — A
+// listing B means nothing unless B also lists A — because otherwise anyone could shrink
+// your candidate set by claiming kinship with relays they do not run. That check is the
+// difference between a family list and an attack.
+
+/**
+ * Where in the circuit a relay is being chosen for.
+ *
+ * Not an enum because the weights are indexed by it and the arithmetic is clearer with a
+ * number; the three constants exist so nothing has to remember which is which.
+ */
+export i32 positionGuard() { return 0; }
+export i32 positionMiddle() { return 1; }
+export i32 positionExit() { return 2; }
+
+/**
+ * The weight for one relay at one position, scaled by 10000.
+ *
+ * `weights` is the consensus `bandwidth-weights` line in the fixed order the host packs it:
+ * Wgg Wgd Wge Wgm | Wmg Wmd Wme Wmm | Weg Wed Wee Wem. Four per position, selected by the
+ * relay's Guard and Exit flags in that order: both, guard, exit, neither.
+ *
+ * The order of those four tests matters. A relay with both flags must take the "both"
+ * weight — checking Guard first and returning would give a Guard+Exit relay the guard-only
+ * weight, which is how exit capacity leaks into the guard position.
+ */
+export i64 positionWeight(i32 position, bool isGuard, bool isExit, i64[] weights) {
+  if (position < 0 || position > 2) { trap; }
+  i32 base = position * 4;
+  if (isGuard && isExit) { return weights[base + 1]; }
+  if (isGuard) { return weights[base]; }
+  if (isExit) { return weights[base + 2]; }
+  return weights[base + 3];
+}
+
+/**
+ * Each candidate's weighted bandwidth for a position: bandwidth * weight / 10000.
+ *
+ * Kept as i64 throughout. A consensus bandwidth is in kilobytes and the weights reach
+ * 10000, so a large relay's product overflows 32 bits — and the failure is silent, giving a
+ * negative weight that the chooser skips, which means the biggest relays are never picked
+ * and nothing looks wrong.
+ */
+export i64[] weightedBandwidths(
+  i64[] bandwidth, bool[] isGuard, bool[] isExit, i32 position, i64[] weights
+) {
+  if (bandwidth.len() != isGuard.len() || bandwidth.len() != isExit.len()) { trap; }
+  i64[] out = i64[bandwidth.len()]();
+  for (i32 i = 0; i < bandwidth.len(); i++) {
+    i64 w = positionWeight(position, isGuard[i], isExit[i], weights);
+    out[i] = (bandwidth[i] * w) / 10000;
+  }
+  return out;
+}
+
+/**
+ * Choose an index in proportion to `weights`, given a uniform value in [0, total).
+ *
+ * The randomness comes from the caller because this has to be deterministic to test: a
+ * chooser with its own entropy can only be checked statistically, and a statistical test
+ * that is loose enough never to flake is loose enough to miss a real bias.
+ *
+ * Returns -1 when every weight is zero, which is a real situation — a position with no
+ * eligible relay — and not one to paper over by returning 0 and picking the first.
+ */
+export i32 weightedChoice(i64[] weights, i64 r) {
+  i64 total = 0;
+  for (i32 i = 0; i < weights.len(); i++) {
+    if (weights[i] < 0) { trap; }
+    total += weights[i];
+  }
+  if (total == 0) { return -1; }
+  i64 pick = r % total;
+  i64 seen = 0;
+  for (i32 i = 0; i < weights.len(); i++) {
+    seen += weights[i];
+    if (pick < seen) { return i; }
+  }
+  // Unreachable while the loop above sums to `total`, but a fallthrough that returned 0
+  // would turn an arithmetic slip into a silent bias toward the first relay.
+  trap;
+}
+
+// ── Path constraints ─────────────────────────────────────────────────────────
+
+/** Whether two IPv4 addresses share a /16. */
+export bool sameSubnet16(u8[] a, u8[] b) {
+  if (a.len() != 4 || b.len() != 4) { trap; }
+  return a[0] == b[0] && a[1] == b[1];
+}
+
+/**
+ * Whether `candidate` may join a path that already holds `chosen`.
+ *
+ * `addresses` is four bytes per relay, flat. `family` is a flattened adjacency: for relay i,
+ * the entries of `familyOf` from `familyStart[i]` to `familyStart[i + 1]`, holding the
+ * indices it has *mutually* declared kinship with. The mutuality is resolved by the caller,
+ * because it is a property of two declarations rather than of either one — and doing it
+ * here would mean trusting a single relay's list.
+ *
+ * `allowSameSubnet` exists for testnets, where every relay is on 127.0.0.1 and the rule
+ * would reject every path. It defaults to off nowhere: the caller must ask for it, so it
+ * cannot be reached by forgetting a flag.
+ */
+export bool pathAllows(
+  i32[] chosen, i32 candidate, u8[] addresses,
+  i32[] familyStart, i32[] familyOf, bool allowSameSubnet
+) {
+  for (i32 i = 0; i < chosen.len(); i++) {
+    i32 other = chosen[i];
+    if (other == candidate) { return false; }
+
+    if (!allowSameSubnet) {
+      u8[] a = u8[4]();
+      u8[] b = u8[4]();
+      for (i32 j = 0; j < 4; j++) { a[j] = addresses[candidate * 4 + j]; }
+      for (i32 j = 0; j < 4; j++) { b[j] = addresses[other * 4 + j]; }
+      if (sameSubnet16(a, b)) { return false; }
+    }
+
+    // Both directions, though the caller has already resolved mutuality: this is cheap, and
+    // a one-sided entry surviving that resolution should exclude rather than be ignored.
+    for (i32 j = familyStart[candidate]; j < familyStart[candidate + 1]; j++) {
+      if (familyOf[j] == other) { return false; }
+    }
+    for (i32 j = familyStart[other]; j < familyStart[other + 1]; j++) {
+      if (familyOf[j] == candidate) { return false; }
+    }
+  }
+  return true;
+}
+
+/**
+ * Choose one relay for a position, respecting the path built so far.
+ *
+ * Zeroing the weight of anything the path forbids, rather than filtering and re-indexing,
+ * so the returned index still refers to the caller's arrays. It also keeps the "no eligible
+ * relay" case as `weightedChoice` returning -1 instead of an empty-array special case.
+ */
+export i32 choose(
+  i64[] weighted, i32[] chosen, u8[] addresses,
+  i32[] familyStart, i32[] familyOf, bool allowSameSubnet, i64 r
+) {
+  i64[] eligible = i64[weighted.len()]();
+  for (i32 i = 0; i < weighted.len(); i++) {
+    eligible[i] = pathAllows(chosen, i, addresses, familyStart, familyOf, allowSameSubnet)
+      ? weighted[i]
+      : 0;
+  }
+  return weightedChoice(eligible, r);
+}

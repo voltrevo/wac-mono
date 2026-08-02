@@ -1,6 +1,6 @@
 # box — a busybox, written in wac
 
-Fifty-seven applets in one program, chosen by the first argument. No TypeScript: `src/` is
+Fifty-eight applets in one program, chosen by the first argument. No TypeScript: `src/` is
 wac and the only thing outside it is the test suite.
 
 It exists to exercise `packages/platform`'s capability world more widely than a single
@@ -17,8 +17,8 @@ cat README.md | ./box sort -u | ./box wc -l
 
 ```
 base32 base64 basename cat cp crc32 cut date diff dirname du echo false find
-fold get grep gunzip gzip head hex httpd json ls mkdir mv nl paste rev rm
-rmdir
+fold get gets grep gunzip gzip head hex httpd json ls mkdir mv nl paste rev
+rm rmdir
 seq serve sha256sum sha512sum shuf sort split sponge stat strings tac tail
 tar tee touch tr true uniq unzstd urldecode urlencode uuid wc wget yes zstd
 ```
@@ -83,14 +83,29 @@ argv[0] — argv starts at its first real argument — so the standalone `wc` wo
 have reported errors as `box:`. Under `box` the name is the applet's; in `bin/` the entry
 point passes it.
 
-## The four that are not filters
+## The five that are not filters
 
 ```sh
-box serve -8080                        # the built-in routes
-box httpd -8080 ./public               # a directory, over HTTP
-box get example.com /                  # an HTTP client
-box wget example.com /a.txt out.txt    # ...into a file
+box serve -8080                          # the built-in routes
+box httpd -8080 ./public                 # a directory, over HTTP
+box get example.com /                    # an HTTP client
+box wget example.com /a.txt out.txt      # ...into a file
+box gets host / ca.der                   # ...over TLS 1.3
 ```
+
+`gets` is **TLS 1.3, in wac, over a raw socket**. `packages/tls` needed no changes:
+`tlsClientInit` and `tlsClientFeed` are a state machine over byte arrays, exactly like
+`packages/server`'s, and a state machine is what a socket wants. The applet is the driver
+and the record framing, and nothing else.
+
+Two things to know before reaching for it. It trusts **the one certificate it is handed**,
+because `packages/tls` takes a trust store rather than a flag to skip verification, and
+shipping a copy of Mozilla's list is a different job — so this is a demonstration, not a
+`curl`. And the ephemeral keys come from `randomBytes`, so the world's one unprivileged
+source of entropy is what the handshake's secrecy rests on.
+
+The test runs it against Deno's own TLS server, and checks that a root which did *not*
+sign the certificate is refused with no body produced at all.
 
 `httpd` is the first applet that composes the **network and the filesystem**: accept,
 parse with `packages/http`, map the path to a file, answer. Its path check is the part to
