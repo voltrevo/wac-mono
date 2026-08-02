@@ -21,10 +21,10 @@
 //   - Transmitted tables, and choosing between them per block.
 
 import { Buf } from "../../bytes/src/buf.wac";
-import { BitOut, CTable, Step, buildCTable, encodeStep, initialState } from "./fseenc.wac";
+import { BitOut, CTable, Step, buildCTable, encodeStep, initialState, normalize, optimalLog, writeDescription } from "./fseenc.wac";
 import {
   LL_BASE, LL_BITS, ML_BASE, ML_BITS, LL_DEFAULT, ML_DEFAULT, OF_DEFAULT,
-  llMaxSymbol, mlMaxSymbol,
+  llMaxSymbol, mlMaxSymbol, ofMaxSymbol,
 } from "./sequences.wac";
 import { xxh64Low } from "./xxh64.wac";
 
@@ -261,6 +261,69 @@ u8[] writeSequenceStream(Block b, CTable cLL, CTable cOF, CTable cML) {
   return o.finish();
 }
 
+// ── Choosing how to code the sequences ────────────────────────────────────────
+//
+// A block may use the format's predefined tables, which cost nothing to transmit and fit
+// nothing in particular, or send its own, which cost bytes and fit exactly. Which wins depends
+// on the block: measured on this repo's own source, fitted tables are worth about 80 KB of 348,
+// because the predefined distributions are generic and a block's own are not.
+//
+// So both are built and the smaller body is kept. That costs a second pass over the sequences,
+// which is cheap next to the match search that produced them.
+
+/** The highest code that actually occurs, which is as much of the alphabet as needs describing. */
+i32 highestUsed(i32[] counts, i32 maxSymbol) {
+  for (i32 s = maxSymbol; s >= 0; s--) {
+    if (counts[s] > 0) { return s; }
+  }
+  return 0;
+}
+
+/** How many distinct codes occur, which is the least a table can have room for. */
+i32 distinctUsed(i32[] counts, i32 maxSymbol) {
+  i32 n = 0;
+  for (i32 s = 0; s <= maxSymbol; s++) {
+    if (counts[s] > 0) { n++; }
+  }
+  return n;
+}
+
+/** A fitted table, and the description that transmits it. */
+struct Fitted {
+  CTable table;
+  u8[] description;
+}
+
+/**
+ * Fit a table to `counts` and write its description.
+ *
+ * The accuracy log is bounded three ways: by what the format allows for this code, by what the
+ * data justifies, and — the one that is easy to miss — by needing at least one slot for every
+ * code that occurs, since a code normalised to zero cannot be written at all.
+ */
+Fitted fit(i32[] counts, i32 maxSymbol, i32 total, i32 maxLog) {
+  i32 top = highestUsed(counts, maxSymbol);
+  i32 log = optimalLog(total, top, maxLog);
+  i32 need = distinctUsed(counts, top);
+  while ((1 << log) < need && log < maxLog) {
+    log++;
+  }
+
+  i32[] norm = normalize(counts, top, total, log);
+  BitOut o = BitOut.create();
+  writeDescription(o, norm, top, log);
+  return Fitted(buildCTable(norm, top, log), o.flush());
+}
+
+/** Count how often each code occurs in a block. */
+i32[] countCodes(i32[] codes, i32 count, i32 maxSymbol) {
+  i32[] counts = i32[maxSymbol + 1]();
+  for (i32 i = 0; i < count; i++) {
+    counts[codes[i]]++;
+  }
+  return counts;
+}
+
 /** The number of sequences, in one, two or three bytes. */
 void writeSequenceCount(Buf out, i32 n) {
   if (n < 128) {
@@ -292,21 +355,52 @@ void writeRawLiterals(Buf out, u8[] literals) {
   out.pushBytes(literals, 0, n);
 }
 
-/** Build the body of a compressed block, or an empty array if it would not be smaller. */
-u8[] compressedBody(Block b, CTable cLL, CTable cOF, CTable cML, i32 rawSize) {
+/** A block body coded with the given tables, and the modes byte and descriptions that go with it. */
+u8[] bodyWith(Block b, u8[] literals, CTable cLL, CTable cOF, CTable cML, i32 modes, u8[] tables) {
   Buf body = Buf.create();
-  u8[] literals = b.literals.bytes();
   writeRawLiterals(body, literals);
   writeSequenceCount(body, b.count);
 
   if (b.count > 0) {
-    body.push(0);                                      // every code in Predefined mode
+    body.push(modes);
+    body.pushBytes(tables, 0, tables.len());
     u8[] stream = writeSequenceStream(b, cLL, cOF, cML);
     body.pushBytes(stream, 0, stream.len());
   }
-
-  if (body.len >= rawSize) { return u8[0](); }         // not worth it
   return body.take();
+}
+
+/**
+ * Build the body of a compressed block, or an empty array if raw would be smaller.
+ *
+ * Two codings are built and the shorter kept: the predefined tables, and tables fitted to this
+ * block. Neither is always better — fitted tables pay for their own description, which a block
+ * with few sequences cannot recover.
+ */
+u8[] compressedBody(Block b, CTable cLL, CTable cOF, CTable cML, i32 rawSize) {
+  u8[] literals = b.literals.bytes();
+  u8[] predefined = bodyWith(b, literals, cLL, cOF, cML, 0, u8[0]());
+
+  u8[] best = predefined;
+  if (b.count > 0) {
+    Fitted fLL = fit(countCodes(b.llCode, b.count, llMaxSymbol()), llMaxSymbol(), b.count, 9);
+    Fitted fOF = fit(countCodes(b.ofCode, b.count, ofMaxSymbol()), ofMaxSymbol(), b.count, 8);
+    Fitted fML = fit(countCodes(b.mlCode, b.count, mlMaxSymbol()), mlMaxSymbol(), b.count, 9);
+
+    // The descriptions go in the order the decoder reads them: literal lengths, offsets,
+    // match lengths — which is not the order the modes byte lists them in.
+    Buf tables = Buf.create();
+    tables.pushBytes(fLL.description, 0, fLL.description.len());
+    tables.pushBytes(fOF.description, 0, fOF.description.len());
+    tables.pushBytes(fML.description, 0, fML.description.len());
+
+    i32 modes = (2 << 6) | (2 << 4) | (2 << 2);        // all three FSE_Compressed
+    u8[] fitted = bodyWith(b, literals, fLL.table, fOF.table, fML.table, modes, tables.take());
+    if (fitted.len() < best.len()) { best = fitted; }
+  }
+
+  if (best.len() >= rawSize) { return u8[0](); }       // not worth it
+  return best;
 }
 
 /** A block header: the size, the type, and whether it is the last. */

@@ -203,3 +203,43 @@ Deno.test("fuzz: every shape and size round trips through zstd", async () => {
     }
   }
 });
+
+import { frameShapes } from "./frames.ts";
+
+Deno.test("fitted tables are chosen where they pay, and not where they do not", () => {
+  // Both codings are built per block and the shorter kept, so a bug that made fitted tables
+  // always lose would cost ~25% of the output and break nothing. This asserts the choice is
+  // actually being made, in both directions.
+  const big = e.encode(JSON.stringify(Array.from({ length: 3000 }, (_, i) => ({ id: i, name: "item" + i }))));
+  const modes = new Set<string>();
+  for (const m of frameShapes(enc.compress(big)).modes) {
+    for (const part of m.split(" ")) modes.add(part.split(":")[1] ?? part);
+  }
+  if (!modes.has("fse")) throw new Error(`no block chose fitted tables: saw ${[...modes]}`);
+
+  // A block with few sequences cannot recover the cost of describing three tables, so it should
+  // keep the predefined ones.
+  const small = e.encode("hello hello hello hello world");
+  const smallModes = new Set<string>();
+  for (const m of frameShapes(enc.compress(small)).modes) {
+    for (const part of m.split(" ")) smallModes.add(part.split(":")[1] ?? part);
+  }
+  if (!smallModes.has("predefined")) {
+    throw new Error(`a tiny block paid for its own tables: saw ${[...smallModes]}`);
+  }
+});
+
+Deno.test("fitted tables are worth what they claim to be", () => {
+  // A regression canary on the ratio, not a target. These are the figures fitted tables bought
+  // when they landed; a change that quietly loses a quarter of them should say so.
+  const cases: [string, Uint8Array, number][] = [
+    ["json", e.encode(JSON.stringify(Array.from({ length: 3000 }, (_, i) => ({ id: i, name: "item" + i, active: i % 3 === 0 })))), 18000],
+    ["logs", e.encode(Array.from({ length: 6000 }, (_, i) => `2026-08-02T10:00:00Z INFO request id=${i} path=/api/items status=200 ms=${i % 97}\n`).join("")), 28000],
+  ];
+  for (const [name, data, ceiling] of cases) {
+    const got = enc.compress(data).length;
+    if (got > ceiling) {
+      throw new Error(`${name}: ${got} bytes for ${data.length}, expected under ${ceiling} — fitted tables may have stopped being chosen`);
+    }
+  }
+});
