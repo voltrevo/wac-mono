@@ -1,0 +1,294 @@
+// Relay cells: the layer that carries anything useful. tor-spec §5.5 and §6.
+//
+// A CREATE2 gets you a circuit to one relay and nothing to say over it. Everything after
+// that — extending to a second hop, opening a TCP stream, sending a byte — is a RELAY cell,
+// which is an ordinary fixed cell whose 509-byte payload has been through the onion.
+//
+// ## The payload, before encryption
+//
+//   Relay command   1
+//   Recognized      2      always zero when we write it
+//   StreamID        2
+//   Digest          4      the first four bytes of the running hash
+//   Length          2      how much of Data is real
+//   Data            498
+//
+// ## Why "recognized" is not a checksum
+//
+// A relay in the middle of a circuit peels one layer off every cell it sees and has to
+// decide, without any marker, whether the result is a cell addressed to it or a cell it
+// should pass further along still encrypted. The test is: are the two Recognized bytes zero
+// *and* does the digest field match the running hash. Zeroes alone would fire by accident
+// once in 65536 cells, which is why the digest is checked as well; the digest alone would
+// mean hashing at every hop for every cell, which is why the cheap test comes first.
+//
+// So Recognized is not integrity, it is a fast negative. The digest is the real check.
+//
+// ## The running digest is the part that is easy to get wrong
+//
+// Df and Db are not per-cell hashes. Each is a SHA-1 seeded at the handshake and updated
+// with the *whole payload of every relay cell* sent in that direction, digest field zeroed,
+// and the four bytes written into the cell are the first four of the hash at that point.
+// Three consequences:
+//
+//   - the digest must be computed with its own field zeroed, since the recipient has to
+//     reproduce the hash before it knows what the field should contain;
+//   - a cell that fails to verify cannot be skipped. Its bytes are already in the sender's
+//     hash, so ignoring it desynchronises every cell after it. The circuit is dead.
+//   - `peek`, not `finish` — the stream continues. That is why sha1.wac has one.
+
+import { Sha1 } from "../../crypto/src/sha1.wac";
+import { CtrStream } from "../../crypto/src/aesctr.wac";
+
+const i32 PAYLOAD_LEN = 509;
+const i32 RELAY_HEADER_LEN = 11;
+export i32 relayDataLen() { return PAYLOAD_LEN - RELAY_HEADER_LEN; }
+
+/** Relay commands, from tor-spec §6.1. */
+export i32 relayBegin() { return 1; }
+export i32 relayData() { return 2; }
+export i32 relayEnd() { return 3; }
+export i32 relayConnected() { return 4; }
+export i32 relaySendme() { return 5; }
+export i32 relayExtend() { return 6; }
+export i32 relayExtended() { return 7; }
+export i32 relayTruncate() { return 8; }
+export i32 relayTruncated() { return 9; }
+export i32 relayDrop() { return 10; }
+export i32 relayResolve() { return 11; }
+export i32 relayResolved() { return 12; }
+export i32 relayBeginDir() { return 13; }
+export i32 relayExtend2() { return 14; }
+export i32 relayExtended2() { return 15; }
+
+/**
+ * One hop's cryptographic state: two keystreams and two running digests.
+ *
+ * Built from the 72 bytes the ntor handshake produces, in the order tor-spec §5.2.2 lays
+ * them out: Df | Db | Kf | Kb. The digests are seeded with their 20 bytes as if those bytes
+ * were the first thing hashed, and both ciphers start from an all-zero counter — safe only
+ * because the keys themselves are fresh per circuit.
+ */
+export struct Hop {
+  Sha1 forwardDigest;
+  Sha1 backwardDigest;
+  CtrStream forwardCipher;
+  CtrStream backwardCipher;
+
+  Hop create(u8[] material) {
+    if (material.len() != 72) { trap; }
+    u8[] df = u8[20]();
+    u8[] db = u8[20]();
+    u8[] kf = u8[16]();
+    u8[] kb = u8[16]();
+    for (i32 i = 0; i < 20; i++) { df[i] = material[i]; }
+    for (i32 i = 0; i < 20; i++) { db[i] = material[20 + i]; }
+    for (i32 i = 0; i < 16; i++) { kf[i] = material[40 + i]; }
+    for (i32 i = 0; i < 16; i++) { kb[i] = material[56 + i]; }
+
+    Sha1 fd = Sha1.create();
+    fd.update(df);
+    Sha1 bd = Sha1.create();
+    bd.update(db);
+    return Hop(fd, bd, CtrStream.create(kf, u8[16]()), CtrStream.create(kb, u8[16]()));
+  }
+}
+
+/** The plaintext body of a relay cell, with the digest field left zero. */
+u8[] buildBody(i32 command, i32 streamId, u8[] data) {
+  if (data.len() > relayDataLen()) { trap; }
+  u8[] body = u8[PAYLOAD_LEN]();
+  body[0] = command;
+  // Recognized: bytes 1 and 2, left zero.
+  body[3] = (streamId >> 8) & 0xFF;
+  body[4] = streamId & 0xFF;
+  // Digest: bytes 5 to 8, left zero until the hash is taken over this exact buffer.
+  body[9] = (data.len() >> 8) & 0xFF;
+  body[10] = data.len() & 0xFF;
+  for (i32 i = 0; i < data.len(); i++) { body[RELAY_HEADER_LEN + i] = data[i]; }
+  return body;
+}
+
+/**
+ * A relay cell payload, digested and encrypted for one hop.
+ *
+ * Mutates the hop: both the digest and the keystream advance, so calling this and
+ * discarding the result desynchronises the circuit just as surely as dropping a cell would.
+ */
+export u8[] encryptRelay(Hop hop, i32 command, i32 streamId, u8[] data) {
+  u8[] body = buildBody(command, streamId, data);
+  hop.forwardDigest.update(body);
+  u8[] digest = hop.forwardDigest.peek();
+  for (i32 i = 0; i < 4; i++) { body[5 + i] = digest[i]; }
+  return hop.forwardCipher.apply(body);
+}
+
+/**
+ * Peel one layer off an incoming payload.
+ *
+ * Returns the decrypted body whether or not it verified — `relayRecognized` is the question
+ * of whether it did. Splitting the two would mean either decrypting twice or returning a
+ * sentinel that the caller could forget to check.
+ *
+ * The digest is only advanced when the cell verifies. A cell that does not verify was not
+ * sent by this hop, so folding it into the hash would break every later cell that was.
+ */
+export u8[] decryptRelay(Hop hop, u8[] payload) {
+  if (payload.len() != PAYLOAD_LEN) { trap; }
+  return hop.backwardCipher.apply(payload);
+}
+
+/**
+ * Whether a decrypted body is a cell for us, advancing the digest if it is.
+ *
+ * The two Recognized bytes first, because they are free and reject almost everything. Then
+ * the digest, computed over the body with its own digest field zeroed — which means copying
+ * the body rather than zeroing in place, since the caller still needs the real bytes.
+ */
+export bool relayRecognized(Hop hop, u8[] body) {
+  if (body.len() != PAYLOAD_LEN) { trap; }
+  if (body[1] != 0 || body[2] != 0) { return false; }
+
+  u8[] zeroed = u8[PAYLOAD_LEN]();
+  for (i32 i = 0; i < PAYLOAD_LEN; i++) { zeroed[i] = body[i]; }
+  for (i32 i = 0; i < 4; i++) { zeroed[5 + i] = 0; }
+
+  // Against a copy of the digest state: if this is not our cell, the hash must be left
+  // exactly as it was, and there is no way to un-update a SHA-1.
+  Sha1 trial = hop.backwardDigest.clone();
+  trial.update(zeroed);
+  u8[] expect = trial.peek();
+  bool ok = true;
+  for (i32 i = 0; i < 4; i++) {
+    if (expect[i] != body[5 + i]) { ok = false; }
+  }
+  if (ok) { hop.backwardDigest.update(zeroed); }
+  return ok;
+}
+
+export i32 relayCommand(u8[] body) { return body[0]; }
+export i32 relayStreamId(u8[] body) { return (body[3] << 8) | body[4]; }
+
+/** The real data out of a relay cell body, using its length field. */
+export u8[] relayPayload(u8[] body) {
+  i32 len = (body[9] << 8) | body[10];
+  if (len > relayDataLen()) { trap; }
+  u8[] out = u8[len]();
+  for (i32 i = 0; i < len; i++) { out[i] = body[RELAY_HEADER_LEN + i]; }
+  return out;
+}
+
+// ── Streams ──────────────────────────────────────────────────────────────────
+
+/**
+ * A RELAY_BEGIN body: "host:port\0" then four zero flag bytes.
+ *
+ * The address is sent as text and resolved by the exit, not by us. That is not a
+ * convenience — resolving it here would leak the destination to whoever answers our DNS,
+ * which is the one party the circuit exists to keep it from.
+ */
+export u8[] beginBody(string hostPort) {
+  u8[] h = hostPort.toBytes();
+  u8[] out = u8[h.len() + 1 + 4]();
+  for (i32 i = 0; i < h.len(); i++) { out[i] = h[i]; }
+  return out;
+}
+
+/** The reason code from a RELAY_END body, or 0 if it carries none. */
+export i32 endReason(u8[] body) {
+  u8[] data = relayPayload(body);
+  return data.len() >= 1 ? data[0] : 0;
+}
+
+// ── Crossing the boundary ────────────────────────────────────────────────────
+//
+// A `Hop` is a struct, and structs do not cross bindgen. The host driver — which owns the
+// socket, as it must — therefore holds the hop as a blob of bytes and hands it back with
+// every call, the same discipline `tls/src/client.wac` uses for a connection.
+//
+// It is a real constraint rather than a wart. The state is mutable and the host is the only
+// thing sequencing cells, so either the state crosses the boundary or the socket does.
+//
+// Layout, 290 bytes: forward digest (96) | backward digest (96) | forward cipher (49) |
+// backward cipher (49).
+
+const i32 SHA1_STATE_LEN = 96;
+const i32 CTR_STATE_LEN = 49;
+export i32 hopStateLen() { return 2 * SHA1_STATE_LEN + 2 * CTR_STATE_LEN; }
+
+void putSha1(u8[] out, i32 at, Sha1 s) {
+  u8[] raw = s.saveState();
+  for (i32 i = 0; i < SHA1_STATE_LEN; i++) { out[at + i] = raw[i]; }
+}
+
+void putCtr(u8[] out, i32 at, CtrStream c) {
+  for (i32 i = 0; i < 16; i++) { out[at + i] = c.key[i]; }
+  for (i32 i = 0; i < 16; i++) { out[at + 16 + i] = c.ctr[i]; }
+  for (i32 i = 0; i < 16; i++) { out[at + 32 + i] = c.block[i]; }
+  out[at + 48] = c.used;
+}
+
+u8[] sliceOf(u8[] src, i32 at, i32 n) {
+  u8[] o = u8[n]();
+  for (i32 i = 0; i < n; i++) { o[i] = src[at + i]; }
+  return o;
+}
+
+CtrStream takeCtr(u8[] src, i32 at) {
+  return CtrStream.resume(sliceOf(src, at, 16), sliceOf(src, at + 16, 16),
+                          sliceOf(src, at + 32, 16), src[at + 48]);
+}
+
+/** The hop as bytes. */
+export u8[] hopSave(Hop h) {
+  u8[] out = u8[hopStateLen()]();
+  putSha1(out, 0, h.forwardDigest);
+  putSha1(out, SHA1_STATE_LEN, h.backwardDigest);
+  putCtr(out, 2 * SHA1_STATE_LEN, h.forwardCipher);
+  putCtr(out, 2 * SHA1_STATE_LEN + CTR_STATE_LEN, h.backwardCipher);
+  return out;
+}
+
+/** The hop back from bytes. */
+export Hop hopLoad(u8[] state) {
+  if (state.len() != hopStateLen()) { trap; }
+  return Hop(
+    Sha1.loadState(sliceOf(state, 0, SHA1_STATE_LEN)),
+    Sha1.loadState(sliceOf(state, SHA1_STATE_LEN, SHA1_STATE_LEN)),
+    takeCtr(state, 2 * SHA1_STATE_LEN),
+    takeCtr(state, 2 * SHA1_STATE_LEN + CTR_STATE_LEN));
+}
+
+/** Fresh hop state from the handshake's 72 bytes. */
+export u8[] hopInit(u8[] material) {
+  return hopSave(Hop.create(material));
+}
+
+/** Encrypt a relay cell: the new state, then the 509 wire bytes. */
+export u8[] hopSend(u8[] state, i32 command, i32 streamId, u8[] data) {
+  Hop h = hopLoad(state);
+  u8[] wire = encryptRelay(h, command, streamId, data);
+  u8[] saved = hopSave(h);
+  u8[] out = u8[saved.len() + wire.len()]();
+  for (i32 i = 0; i < saved.len(); i++) { out[i] = saved[i]; }
+  for (i32 i = 0; i < wire.len(); i++) { out[saved.len() + i] = wire[i]; }
+  return out;
+}
+
+/**
+ * Decrypt a relay cell: the new state, a recognised flag, then the 509-byte body.
+ *
+ * The flag rather than an empty body on failure, because a cell that does not verify still
+ * advanced the cipher and the caller needs the state back either way.
+ */
+export u8[] hopRecv(u8[] state, u8[] payload) {
+  Hop h = hopLoad(state);
+  u8[] body = decryptRelay(h, payload);
+  bool ok = relayRecognized(h, body);
+  u8[] saved = hopSave(h);
+  u8[] out = u8[saved.len() + 1 + body.len()]();
+  for (i32 i = 0; i < saved.len(); i++) { out[i] = saved[i]; }
+  out[saved.len()] = ok ? 1 : 0;
+  for (i32 i = 0; i < body.len(); i++) { out[saved.len() + 1 + i] = body[i]; }
+  return out;
+}

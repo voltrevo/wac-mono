@@ -11,7 +11,7 @@
 // This parses a consensus that came from somewhere already trusted — a local testnet whose
 // files are on the same disk. It is enough to build a circuit and see that the handshake,
 // the framing and the relay crypto are right, and it is not enough to be a Tor client.
-// Consensus signature verification is issue 0003 in this package.
+// Consensus signature verification is issue 0012.
 //
 // ## Microdescriptors
 //

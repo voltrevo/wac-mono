@@ -1,0 +1,277 @@
+// Relay cells, tested against the other end of the circuit.
+//
+// The useful trick here: a hop's state is symmetric. What the client calls "forward" the
+// relay calls "backward", and the two use the same 72 bytes read in a different order. So
+// swapping Df with Db and Kf with Kb turns a client Hop into the relay Hop that faces it,
+// and the two can be run against each other without a Tor relay in the room.
+//
+// That gives a real oracle for the *split*: an implementation that mixed Df up with Db, or
+// Kf with Kb, round-trips happily against itself and cannot round-trip against a peer built
+// from the other half of the same material.
+//
+// It gives no oracle at all for the cipher and hash underneath, and it is worth being blunt
+// about that, because the tests below look like they cover it. Both ends run the same
+// CtrStream and the same Sha1; break either one identically at both ends and every test
+// here still passes. Deliberately stopping the CTR counter from advancing was tried, and
+// this file did not notice. What catches that lives in the crypto package, where the oracle
+// is the host's own AES rather than the other end of the same code.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  Hop, encryptRelay, decryptRelay, relayRecognized, relayCommand, relayStreamId,
+  relayPayload, relayData, relayDataLen, beginBody, relayBegin,
+  hopInit, hopSend, hopRecv, hopStateLen,
+} from "../../src/relay.wac";
+
+/** The same key material as seen from the other end of the circuit. */
+u8[] swapDirections(u8[] material) {
+  u8[] out = u8[72]();
+  for (i32 i = 0; i < 20; i++) { out[i] = material[20 + i]; }      // Db becomes Df
+  for (i32 i = 0; i < 20; i++) { out[20 + i] = material[i]; }      // Df becomes Db
+  for (i32 i = 0; i < 16; i++) { out[40 + i] = material[56 + i]; } // Kb becomes Kf
+  for (i32 i = 0; i < 16; i++) { out[56 + i] = material[40 + i]; } // Kf becomes Kb
+  return out;
+}
+
+u8[] material(i32 seed) {
+  u8[] m = u8[72]();
+  for (i32 i = 0; i < 72; i++) { m[i] = (i * 61 + seed * 17) & 0xFF; }
+  return m;
+}
+
+u8[] fill(i32 n, i32 seed) {
+  u8[] o = u8[n]();
+  for (i32 i = 0; i < n; i++) { o[i] = (i * 37 + seed) & 0xFF; }
+  return o;
+}
+
+export string test_a_cell_arrives_at_the_other_end() {
+  T t = T.create();
+  u8[] m = material(1);
+  Hop client = Hop.create(m);
+  Hop relay = Hop.create(swapDirections(m));
+
+  u8[] data = fill(100, 3);
+  u8[] wire = encryptRelay(client, relayData(), 7, data);
+  t.eqI32(wire.len(), 509, "a relay payload is a full cell payload whatever the data length");
+
+  u8[] body = decryptRelay(relay, wire);
+  t.isTrue(relayRecognized(relay, body), "the relay recognises its own cell");
+  t.eqI32(relayCommand(body), relayData(), "command survived");
+  t.eqI32(relayStreamId(body), 7, "stream id survived");
+  t.eqBytes(relayPayload(body), data, "and so did the data");
+  return t.report();
+}
+
+export string test_two_identical_cells_differ_on_the_wire() {
+  // Note what this does *not* establish. It looks like a test that the keystream advances,
+  // and it is not one: these cells differ even under a cipher that never moves its counter,
+  // because the running digest differs between them. Planting exactly that fault leaves
+  // every test in this file passing.
+  //
+  // The reason is the symmetry that makes the rest of the file work — client and relay run
+  // the same cipher, so a cipher broken identically at both ends still round-trips. The
+  // property that pins the keystream down cannot be checked from here at all; it is
+  // `a_ctr_stream_in_pieces_matches_the_one_shot` in the crypto package, against an oracle
+  // this side does not share.
+  //
+  // What is checked here is narrower and still worth having: two cells with identical
+  // contents are distinguishable on the wire, and the receiver follows both in order.
+  T t = T.create();
+  u8[] m = material(2);
+  Hop client = Hop.create(m);
+  u8[] data = fill(50, 9);
+  u8[] first = encryptRelay(client, relayData(), 1, data);
+  u8[] second = encryptRelay(client, relayData(), 1, data);
+
+  bool same = true;
+  for (i32 i = 0; i < 509; i++) {
+    if (first[i] != second[i]) { same = false; }
+  }
+  t.isTrue(!same, "two identical cells encrypt differently");
+
+  // And the receiving end still follows both, in order.
+  Hop relay = Hop.create(swapDirections(m));
+  u8[] b1 = decryptRelay(relay, first);
+  t.isTrue(relayRecognized(relay, b1), "the first cell verifies");
+  u8[] b2 = decryptRelay(relay, second);
+  t.isTrue(relayRecognized(relay, b2), "and so does the second, from the continued keystream");
+  t.eqBytes(relayPayload(b2), data, "with its data intact");
+  return t.report();
+}
+
+export string test_a_long_run_of_cells_stays_in_step() {
+  // A cell payload is 509 bytes, which is not a multiple of the 16-byte block. So each cell
+  // starts part-way into a block, and an implementation that rounded up to a block boundary
+  // between cells would pass a one-cell test and fail here on the second.
+  T t = T.create();
+  u8[] m = material(3);
+  Hop client = Hop.create(m);
+  Hop relay = Hop.create(swapDirections(m));
+  for (i32 i = 0; i < 40; i++) {
+    u8[] data = fill(i * 7 % 400, i);
+    u8[] body = decryptRelay(relay, encryptRelay(client, relayData(), i + 1, data));
+    t.isTrue(relayRecognized(relay, body), "cell " + itoa64(i as i64) + " verifies");
+    t.eqBytes(relayPayload(body), data, "cell " + itoa64(i as i64) + " data");
+    t.eqI32(relayStreamId(body), i + 1, "cell " + itoa64(i as i64) + " stream id");
+  }
+  return t.report();
+}
+
+export string test_the_digest_changes_even_when_nothing_else_does() {
+  // The digest is a running hash, not a hash of the cell. Sending the same cell twice must
+  // put different bytes in the digest field — otherwise a replayed cell would verify.
+  T t = T.create();
+  u8[] m = material(4);
+  Hop a = Hop.create(m);
+  Hop b = Hop.create(m);
+  // Two clients from identical material, each sending one cell: the digests must agree.
+  u8[] w1 = encryptRelay(a, relayData(), 1, fill(10, 1));
+  u8[] w2 = encryptRelay(b, relayData(), 1, fill(10, 1));
+  t.eqBytes(w1, w2, "the same first cell from the same state is the same bytes");
+
+  // But a's second cell differs from its first, because the hash carried forward.
+  u8[] w3 = encryptRelay(a, relayData(), 1, fill(10, 1));
+  bool same = true;
+  for (i32 i = 0; i < 509; i++) {
+    if (w1[i] != w3[i]) { same = false; }
+  }
+  t.isTrue(!same, "the second cell differs, so the digest carried forward");
+  return t.report();
+}
+
+export string test_a_tampered_cell_is_refused_and_costs_nothing() {
+  // Two things at once, because the second is the one implementations miss. A cell that
+  // does not verify must be refused, *and* it must leave the running digest untouched —
+  // otherwise a single junk cell desynchronises every genuine cell after it, and an
+  // attacker who cannot read the circuit can still kill it by injecting one.
+  T t = T.create();
+  u8[] m = material(5);
+  Hop client = Hop.create(m);
+  Hop relay = Hop.create(swapDirections(m));
+
+  u8[] genuine = encryptRelay(client, relayData(), 3, fill(60, 2));
+
+  u8[] junk = u8[509]();
+  for (i32 i = 0; i < 509; i++) { junk[i] = (i * 11 + 5) & 0xFF; }
+  u8[] junkBody = decryptRelay(relay, junk);
+  t.isTrue(!relayRecognized(relay, junkBody), "junk is not recognised");
+
+  // The genuine cell was encrypted before the junk arrived, but the junk went through the
+  // relay's cipher — so the keystream has moved on and this cell can no longer be read.
+  // That is expected and is not what is being tested; rebuild the relay to isolate the
+  // digest question.
+  Hop fresh = Hop.create(swapDirections(m));
+  u8[] junkBody2 = decryptRelay(fresh, junk);
+  t.isTrue(!relayRecognized(fresh, junkBody2), "junk is not recognised by a fresh hop either");
+
+  Hop clean = Hop.create(swapDirections(m));
+  // Feed the junk to the *digest* path only, by asking about a body that will not verify.
+  u8[] notOurs = u8[509]();
+  for (i32 i = 0; i < 509; i++) { notOurs[i] = 0; }
+  notOurs[5] = 0xFF;   // recognized is zero, so this reaches the digest check and fails it
+  t.isTrue(!relayRecognized(clean, notOurs), "a zero cell with a wrong digest is refused");
+  // Now the genuine cell must still verify, which it only can if the refusal left the hash
+  // alone.
+  u8[] body = decryptRelay(clean, genuine);
+  t.isTrue(relayRecognized(clean, body), "a genuine cell still verifies after a refused one");
+  t.eqBytes(relayPayload(body), fill(60, 2), "and reads correctly");
+  return t.report();
+}
+
+export string test_recognized_is_checked_before_the_digest() {
+  // Non-zero Recognized bytes are rejected whatever the digest says. This is the cheap
+  // negative every relay in the circuit applies to every cell it forwards.
+  T t = T.create();
+  u8[] m = material(6);
+  Hop client = Hop.create(m);
+  Hop relay = Hop.create(swapDirections(m));
+  u8[] body = decryptRelay(relay, encryptRelay(client, relayData(), 1, fill(20, 1)));
+  body[1] = 1;
+  t.isTrue(!relayRecognized(relay, body), "a non-zero recognized field is refused");
+  return t.report();
+}
+
+export string test_a_full_payload_fits_and_one_more_byte_does_not() {
+  T t = T.create();
+  t.eqI32(relayDataLen(), 498, "509 less the eleven-byte relay header");
+  u8[] m = material(7);
+  Hop client = Hop.create(m);
+  Hop relay = Hop.create(swapDirections(m));
+  u8[] data = fill(498, 4);
+  u8[] body = decryptRelay(relay, encryptRelay(client, relayData(), 1, data));
+  t.isTrue(relayRecognized(relay, body), "a completely full cell verifies");
+  t.eqBytes(relayPayload(body), data, "and carries all 498 bytes");
+  return t.report();
+}
+
+export string test_a_begin_body_is_a_string_and_four_zeros() {
+  T t = T.create();
+  u8[] b = beginBody("example.com:80");
+  t.eqI32(b.len(), 19, "fourteen characters, a NUL, and four flag bytes");
+  t.eqBytes(relayPayloadOf(b, 0, 14), "example.com:80".toBytes(), "the address, as text");
+  t.eqI32(b[14], 0, "NUL-terminated");
+  t.eqI32(b[15], 0, "flags are zero");
+  t.eqI32(b[18], 0, "all four of them");
+  t.eqI32(relayBegin(), 1, "RELAY_BEGIN is command 1");
+  return t.report();
+}
+
+u8[] relayPayloadOf(u8[] src, i32 from, i32 to) {
+  u8[] o = u8[to - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = src[from + i]; }
+  return o;
+}
+
+export string test_a_hop_survives_a_round_trip_through_bytes() {
+  // The host owns the socket, so the hop state crosses the wasm boundary between every
+  // cell. A save/load that lost the position within the current AES block, or the unfinished
+  // SHA-1 buffer, would work for the first cell and fail on the second — which is exactly
+  // the bug this test exists to catch, so it runs several cells and saves between each.
+  T t = T.create();
+  u8[] m = material(11);
+  Hop relay = Hop.create(swapDirections(m));
+
+  u8[] state = hopInit(m);
+  t.eqI32(state.len(), hopStateLen(), "the state is the advertised length");
+
+  for (i32 i = 0; i < 12; i++) {
+    u8[] data = fill(i * 41 % 400, i + 3);
+    u8[] r = hopSend(state, relayData(), i + 1, data);
+    state = relayPayloadOf(r, 0, hopStateLen());
+    u8[] wire = relayPayloadOf(r, hopStateLen(), hopStateLen() + 509);
+
+    u8[] body = decryptRelay(relay, wire);
+    t.isTrue(relayRecognized(relay, body),
+             "cell " + itoa64(i as i64) + " verifies after a save and load");
+    t.eqBytes(relayPayload(body), data, "cell " + itoa64(i as i64) + " data");
+  }
+  return t.report();
+}
+
+export string test_a_saved_hop_reads_cells_the_same_way() {
+  // The receive direction, and the flag hopRecv returns in place of a body-or-nothing.
+  T t = T.create();
+  u8[] m = material(12);
+  Hop client = Hop.create(m);
+  u8[] state = hopInit(swapDirections(m));
+
+  for (i32 i = 0; i < 6; i++) {
+    u8[] data = fill(70 + i, i);
+    u8[] wire = encryptRelay(client, relayData(), 9, data);
+    u8[] r = hopRecv(state, wire);
+    state = relayPayloadOf(r, 0, hopStateLen());
+    t.eqI32(r[hopStateLen()], 1, "cell " + itoa64(i as i64) + " is recognised");
+    u8[] body = relayPayloadOf(r, hopStateLen() + 1, hopStateLen() + 1 + 509);
+    t.eqBytes(relayPayload(body), data, "cell " + itoa64(i as i64) + " data");
+  }
+
+  // And junk comes back flagged, with the state still returned.
+  u8[] junk = u8[509]();
+  for (i32 i = 0; i < 509; i++) { junk[i] = (i * 3 + 1) & 0xFF; }
+  u8[] r = hopRecv(state, junk);
+  t.eqI32(r[hopStateLen()], 0, "junk is flagged as not recognised");
+  t.eqI32(r.len(), hopStateLen() + 1 + 509, "and the state still comes back");
+  return t.report();
+}
