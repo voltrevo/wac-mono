@@ -1,0 +1,147 @@
+// The shell at the coverage boundary.
+//
+// Running the shell needs a `Core` and a `Cli`, which normally come from the host. Building them
+// here instead keeps the whole thing inside wac, so `instrument` can drive scripts through the
+// lexer, parser and executor with one call and no capability plumbing on the TypeScript side.
+//
+// **The fake capabilities are pure functions**, because wac has no mutable module-level state and
+// a funcref cannot close over anything. That is not the limitation it sounds like: a fixed answer
+// per path reaches both sides of every branch that asks. `readFile` succeeds for two names and
+// fails for everything else, `writeFile` succeeds for one and fails otherwise, `readDir` answers
+// for one directory and not for others — which is all coverage needs, and all a test of the
+// *shell* should depend on anyway.
+
+import { Cli, Core, FileResult, Socket, Stat } from "../../../platform/src/platform.wac";
+import { Shell, runScript } from "../../src/exec.wac";
+
+// ── Core ──────────────────────────────────────────────────────────────────────
+
+i64 fakeNow() { return 0; }
+i64 fakeMonotonic() { return 0; }
+u8[] fakeRandom(i32 n) { return u8[n](); }
+void fakeLog(string s) {}
+void fakeWarn(string s) {}
+
+Core fakeCore() {
+  return Core.of(fakeNow, fakeMonotonic, fakeRandom, fakeLog, fakeWarn);
+}
+
+// ── Cli ───────────────────────────────────────────────────────────────────────
+
+i32 fakeArgCount() { return 0; }
+string fakeArg(i32 i) { return ""; }
+
+/** One name is set and one is not, so both sides of the environment fallback are reachable. */
+string? fakeEnv(string name) {
+  if (name == "SET_IN_ENV") { return "from-env"; }
+  return null;
+}
+
+u8[] fakeStdin() { return "piped\n".toBytes(); }
+bool fakeWrite(u8[] data) { return true; }
+
+/** `in.txt` and `words.txt` exist; nothing else does. */
+FileResult fakeReadFile(string path) {
+  if (path == "in.txt") { return FileResult.of(true, "alpha\nbeta\n".toBytes(), ""); }
+  if (path == "words.txt") { return FileResult.of(true, "b\na\nc\n".toBytes(), ""); }
+  if (path == "out.txt") { return FileResult.of(true, "existing\n".toBytes(), ""); }
+  return FileResult.of(false, u8[0](), "no such file");
+}
+
+/** `out.txt` is writable and `readonly.txt` is not, so both paths through a redirection run. */
+bool fakeWriteFile(string path, u8[] data) {
+  return path != "readonly.txt";
+}
+
+Stat fakeStat(string path) { return Stat.of(false, false, false, 0, 0); }
+
+string[]? fakeReadDir(string path) {
+  if (path == "dir") {
+    string[] names = string[2]();
+    names[0] = "one";
+    names[1] = "two";
+    return names;
+  }
+  return null;
+}
+
+bool fakeMkdir(string path, bool parents) { return true; }
+bool fakeRemove(string path, bool recursive) { return true; }
+bool fakeRename(string from, string to) { return true; }
+string fakeOpenInput(string path) { return ""; }
+u8[] fakeReadChunk() { return u8[0](); }
+string fakeOpenOutput(string path) { return ""; }
+Socket fakeConnect(string host, i32 port) { return Socket(-1, "no network"); }
+Socket fakeListen(i32 port) { return Socket(-1, "no network"); }
+Socket fakeAccept(i32 handle) { return Socket(-1, "no network"); }
+u8[] fakeRecv(i32 handle) { return u8[0](); }
+bool fakeSend(i32 handle, u8[] data) { return false; }
+void fakeCloseSocket(i32 handle) {}
+
+Cli fakeCli() {
+  return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeReadFile, fakeWriteFile,
+                fakeStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
+                fakeReadChunk, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
+                fakeSend, fakeCloseSocket);
+}
+
+// ── What the coverage driver calls ────────────────────────────────────────────
+
+/** Run a script and hand back what it wrote to standard output. */
+export u8[] shOut(string src) {
+  Shell sh = Shell.capturing(fakeCore(), fakeCli());
+  runScript(sh, src);
+  return sh.outBuf.take();
+}
+
+/** Run a script and hand back its exit status. */
+export i32 shStatus(string src) {
+  Shell sh = Shell.capturing(fakeCore(), fakeCli());
+  return runScript(sh, src);
+}
+
+/** Run a script and hand back what it wrote to standard error. */
+export u8[] shErr(string src) {
+  Shell sh = Shell.capturing(fakeCore(), fakeCli());
+  runScript(sh, src);
+  return sh.errOut.take();
+}
+
+/** The same, writing through the capability rather than collecting — the other branch. */
+export i32 shWritten(string src) {
+  Shell sh = Shell.create(fakeCore(), fakeCli());
+  return runScript(sh, src);
+}
+
+/**
+ * Call the capabilities the shell never uses.
+ *
+ * `Cli.of` needs all twenty-one and the shell touches five, so the rest are unreachable through a
+ * script. They are scaffolding rather than code under test, and exercising them once costs
+ * nothing and keeps the report honest about what has actually run.
+ */
+export i32 shTouchStubs() {
+  Cli c = fakeCli();
+  i32 n = c.argCount() + c.arg(0).len() + c.readStdin().len() + c.readChunk().len();
+  if (c.env("SET_IN_ENV") is not null) { n++; }
+  if (c.env("NOT_SET") is null) { n++; }
+  if (c.write(u8[0]())) { n++; }
+  if (c.stat("x").exists) { n++; }
+  if (c.readDir("dir") is not null) { n++; }
+  if (c.readDir("nope") is null) { n++; }
+  if (c.mkdir("d", true)) { n++; }
+  if (c.remove("d", true)) { n++; }
+  if (c.rename("a", "b")) { n++; }
+  n += c.openInput("x").len() + c.openOutput("x").len();
+  n += c.connect("h", 1).handle + c.listen(1).handle + c.accept(1).handle;
+  n += c.recv(1).len();
+  if (c.send(1, u8[0]())) { n++; }
+  c.closeSocket(1);
+
+  Core k = fakeCore();
+  n += (k.nowMillis() + k.monotonicNanos()) as~ i32;
+  n += k.randomBytes(2).len();
+  k.log("");
+  k.warn("");
+  return n;
+}

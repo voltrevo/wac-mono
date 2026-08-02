@@ -21,8 +21,8 @@ import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Cli, Core, FileResult } from "../../platform/src/platform.wac";
 import { Part, PartKind } from "./lex.wac";
-import { AndOr, AndOrOp, Assign, Item, Pipeline, Redir, RedirKind, Script, Simple, Word,
-         parse } from "./parse.wac";
+import { AndOr, AndOrOp, Assign, Clause, CmdKind, Command, Item, Pipeline, Redir, RedirKind,
+         Script, Simple, Word, parse } from "./parse.wac";
 import { Output, itoa, names, run } from "./program.wac";
 
 export struct Shell {
@@ -78,11 +78,16 @@ export i32 runScript(Shell sh, string src) {
     sh.errOut.pushAll(("sh: " + script.error + "\n").toBytes());
     return 2;
   }
-  for (i32 i = 0; i < script.lists.len(); i++) {
-    if (sh.exiting) { break; }
-    runAndOr(sh, script.lists.get(i));
-  }
+  runList(sh, script.lists);
   return sh.exiting ? sh.exitCode : sh.status;
+}
+
+/** A sequence of `&&`/`||` lists — a script, or the body of a compound command. */
+void runList(Shell sh, Vec<AndOr> lists) {
+  for (i32 i = 0; i < lists.len(); i++) {
+    if (sh.exiting) { return; }
+    runAndOr(sh, lists.get(i));
+  }
 }
 
 void runAndOr(Shell sh, AndOr list) {
@@ -115,9 +120,104 @@ void runPipeline(Shell sh, Pipeline pipeline) {
   u8[] carried = u8[0]();
   for (i32 i = 0; i < pipeline.stages.len(); i++) {
     bool last = i == pipeline.stages.len() - 1;
-    carried = runSimple(sh, pipeline.stages.get(i), carried, last);
+    carried = runCommand(sh, pipeline.stages.get(i), carried, last);
     if (sh.exiting) { return; }
   }
+}
+
+/**
+ * One pipeline stage, plain or compound.
+ *
+ * A compound stage that is not last, or that carries a redirection, has to have its output
+ * *collected* rather than written — and the shell already has a flag for that, so this borrows
+ * it and puts it back. Without this `{ echo a; } | rev` would print `a` and pipe nothing.
+ */
+u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
+  match (cmd.kind) {
+    case Plain: return runSimple(sh, cmd.simple, stdin, last);
+    else: {}
+  }
+
+  bool collect = !last || cmd.redirs.len() > 0;
+  bool savedCapture = sh.capture;
+  Buf savedBuf = sh.outBuf;
+  if (collect) {
+    sh.capture = true;
+    sh.outBuf = Buf.create();
+  }
+
+  match (cmd.kind) {
+    case If: {
+      for (i32 i = 0; i < cmd.clauses.len(); i++) {
+        Clause c = cmd.clauses.get(i);
+        // A clause with no condition is the `else` branch, which always runs if it is reached.
+        if (c.cond.len() == 0) { runList(sh, c.body); break; }
+        runList(sh, c.cond);
+        if (sh.exiting) { break; }
+        if (sh.status == 0) { runList(sh, c.body); break; }
+        // Nothing matched: an `if` whose condition failed and which has no `else` succeeds, so
+        // the status of the last *condition* must not leak out as the statement's.
+        if (i == cmd.clauses.len() - 1) { sh.status = 0; }
+      }
+    }
+    case While: { runLoop(sh, cmd.clauses.get(0), false); }
+    case Until: { runLoop(sh, cmd.clauses.get(0), true); }
+    case For: {
+      Vec<string> items = Vec.create();
+      for (i32 i = 0; i < cmd.words.len(); i++) { expandInto(sh, cmd.words.get(i), items); }
+      // A `for` over nothing runs its body zero times and succeeds, which is why the status is
+      // set before the loop rather than left as whatever ran last.
+      sh.status = 0;
+      for (i32 i = 0; i < items.len() && !sh.exiting; i++) {
+        sh.vars.set(cmd.varName, items.get(i));
+        runList(sh, cmd.clauses.get(0).body);
+      }
+    }
+    case Brace: { runList(sh, cmd.clauses.get(0).body); }
+    else: {}
+  }
+
+  if (!collect) { return u8[0](); }
+  u8[] produced = sh.outBuf.take();
+  sh.capture = savedCapture;
+  sh.outBuf = savedBuf;
+
+  for (i32 i = 0; i < cmd.redirs.len(); i++) {
+    Redir r = cmd.redirs.get(i);
+    match (r.kind) {
+      case Out: { writeTo(sh, r, produced, false); return u8[0](); }
+      case Append: { writeTo(sh, r, produced, true); return u8[0](); }
+      else: {}
+    }
+  }
+  if (last) {
+    if (sh.capture) { sh.outBuf.pushAll(produced); }
+    else { sh.cli.write(produced); }
+    return u8[0]();
+  }
+  return produced;
+}
+
+/**
+ * `while` and `until`, which differ only in the sense of the test.
+ *
+ * Bounded, because a shell with no way to interrupt it should not be able to hang the server it
+ * is running inside. bash would loop forever; this stops and says why, which is a difference
+ * worth having until there is a way to send it a signal.
+ */
+void runLoop(Shell sh, Clause c, bool untilForm) {
+  i32 limit = 100000;
+  sh.status = 0;
+  for (i32 i = 0; i < limit; i++) {
+    if (sh.exiting) { return; }
+    runList(sh, c.cond);
+    if (sh.exiting) { return; }
+    bool go = untilForm ? sh.status != 0 : sh.status == 0;
+    if (!go) { sh.status = 0; return; }
+    runList(sh, c.body);
+  }
+  sh.errOut.pushAll("sh: loop ran 100000 times and was stopped\n".toBytes());
+  sh.status = 2;
 }
 
 /**
@@ -329,7 +429,11 @@ Output help() {
  * that yields only whitespace disappears. `echo "$x"` passes one empty argument. Both matter.
  */
 void expandInto(Shell sh, Word word, Vec<string> argv) {
-  string current = "";
+  // The field is built as bytes *and* a mask saying which of them were quoted. Globbing needs
+  // that per character, not per word: in `echo "*"a` the star is literal and the `a` is not, so a
+  // flag on the whole field would either glob a filename nobody asked for or refuse one they did.
+  Buf field = Buf.create();
+  Buf mask = Buf.create();
   bool started = false;
 
   for (i32 i = 0; i < word.parts.len(); i++) {
@@ -337,19 +441,19 @@ void expandInto(Shell sh, Word word, Vec<string> argv) {
     string text = expandPart(sh, p);
 
     if (p.quoted) {
-      current = current + text;
+      appendMasked(field, mask, text, 1);
       started = true;
       continue;
     }
     match (p.kind) {
       case Lit: {
         // Literal text never splits, whatever is in it — `echo a b` is two words because the
-        // *lexer* split it, not because expansion did.
-        current = current + text;
+        // *lexer* split it, not because expansion did. It can still glob.
+        appendMasked(field, mask, text, 0);
         started = true;
       }
       else: {
-        // An unquoted expansion splits on whitespace.
+        // An unquoted expansion splits on whitespace, and its pieces glob.
         u8[] b = text.toBytes();
         i32 start = 0;
         for (i32 j = 0; j <= b.len(); j++) {
@@ -357,12 +461,13 @@ void expandInto(Shell sh, Word word, Vec<string> argv) {
           bool blank = !end && (b[j] == 32 || b[j] == 9 || b[j] == 10);
           if (end || blank) {
             if (j > start) {
-              current = current + sliceString(text, start, j);
+              appendMasked(field, mask, text.slice(start, j), 0);
               started = true;
             }
             if (!end) {
-              if (started) { argv.push(current); }
-              current = "";
+              if (started) { emitField(sh, field, mask, argv); }
+              field = Buf.create();
+              mask = Buf.create();
               started = false;
             }
             start = j + 1;
@@ -371,7 +476,114 @@ void expandInto(Shell sh, Word word, Vec<string> argv) {
       }
     }
   }
-  if (started) { argv.push(current); }
+  if (started) { emitField(sh, field, mask, argv); }
+}
+
+void appendMasked(Buf field, Buf mask, string text, i32 quoted) {
+  u8[] b = text.toBytes();
+  field.pushAll(b);
+  for (i32 i = 0; i < b.len(); i++) { mask.push(quoted); }
+}
+
+/**
+ * Finish one field: glob it if it has an unquoted metacharacter, otherwise pass it through.
+ *
+ * A pattern that matches nothing is passed through unchanged, which is bash's default — so the
+ * difference between globbing and not only shows when something would have matched.
+ */
+void emitField(Shell sh, Buf field, Buf mask, Vec<string> argv) {
+  u8[] bytes = field.bytes();
+  u8[] quoted = mask.bytes();
+  if (!hasUnquotedMeta(bytes, quoted)) {
+    argv.push(string.fromBytes(bytes));
+    return;
+  }
+  i32 before = argv.len();
+  globInto(sh, bytes, quoted, argv);
+  if (argv.len() == before) { argv.push(string.fromBytes(bytes)); }
+}
+
+bool hasUnquotedMeta(u8[] b, u8[] quoted) {
+  for (i32 i = 0; i < b.len(); i++) {
+    if (quoted[i] != 0) { continue; }
+    if (b[i] == 0x2a || b[i] == 0x3f) { return true; }          // '*' '?'
+  }
+  return false;
+}
+
+/**
+ * Pathname expansion, for a pattern in the last path component only.
+ *
+ * A pattern in the final component works; one in a leading component does not, because that needs
+ * walking every directory that matches — a different and much larger job. Splitting at the last
+ * slash keeps this to a single `readDir`.
+ *
+ * (Written out in words rather than shown, because the obvious example contains the two
+ * characters that end this comment.)
+ *
+ * Matches are sorted, because a shell's glob is ordered and `readDir` makes no promise.
+ */
+void globInto(Shell sh, u8[] pattern, u8[] quoted, Vec<string> argv) {
+  i32 slash = -1;
+  for (i32 i = 0; i < pattern.len(); i++) {
+    if (pattern[i] == 0x2f) { slash = i; }                      // '/'
+  }
+  string dir = slash < 0 ? "." : string.fromBytes(sliceBytes(pattern, 0, slash));
+  if (slash == 0) { dir = "/"; }
+  string prefix = slash < 0 ? "" : string.fromBytes(sliceBytes(pattern, 0, slash + 1));
+  u8[] tail = sliceBytes(pattern, slash + 1, pattern.len());
+  u8[] tailMask = sliceBytes(quoted, slash + 1, quoted.len());
+
+  string[]? names = sh.cli.readDir(dir);
+  if (names is null) { return; }
+
+  Vec<string> hits = Vec.create();
+  for (i32 i = 0; i < names!.len(); i++) {
+    u8[] name = names![i].toBytes();
+    // A leading dot is only matched by a pattern that starts with one, which is why `echo *` does
+    // not list every dotfile in the directory.
+    if (name.len() > 0 && name[0] == 0x2e && !(tail.len() > 0 && tail[0] == 0x2e)) { continue; }
+    if (globMatch(tail, tailMask, 0, name, 0)) { hits.push(prefix + names![i]); }
+  }
+
+  for (i32 i = 1; i < hits.len(); i++) {
+    string v = hits.get(i);
+    i32 j = i - 1;
+    while (j >= 0 && hits.get(j) > v) {
+      hits.set(j + 1, hits.get(j));
+      j--;
+    }
+    hits.set(j + 1, v);
+  }
+  for (i32 i = 0; i < hits.len(); i++) { argv.push(hits.get(i)); }
+}
+
+/** `*` any run, `?` one character — and only where the pattern character was unquoted. */
+bool globMatch(u8[] pat, u8[] quoted, i32 p, u8[] name, i32 n) {
+  i32 i = p;
+  i32 j = n;
+  while (i < pat.len()) {
+    bool meta = quoted[i] == 0;
+    if (meta && pat[i] == 0x2a) {
+      for (i32 k = j; k <= name.len(); k++) {
+        if (globMatch(pat, quoted, i + 1, name, k)) { return true; }
+      }
+      return false;
+    }
+    if (j >= name.len()) { return false; }
+    if (meta && pat[i] == 0x3f) { i++; j++; continue; }
+    if (pat[i] != name[j]) { return false; }
+    i++;
+    j++;
+  }
+  return j == name.len();
+}
+
+u8[] sliceBytes(u8[] b, i32 from, i32 to) {
+  if (to <= from) { return u8[0](); }
+  u8[] out = u8[to - from]();
+  out.copyFrom(b, from, 0, to - from);
+  return out;
 }
 
 string expandPart(Shell sh, Part p) {

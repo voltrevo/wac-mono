@@ -100,6 +100,46 @@ const CASES: string[] = [
   `echo a$(echo b)c`,
   `echo $(echo a b c | wc -l)`,
 
+  // ── Compound commands ───────────────────────────────────────────────────────
+  //
+  // Every loop here must terminate, because bash runs these too and a runaway would hang the
+  // suite rather than fail it. Ours has a bound; bash does not.
+  `if true; then echo yes; fi`,
+  `if false; then echo no; fi`,
+  `if false; then echo no; else echo fallback; fi`,
+  `if false; then echo a; elif true; then echo b; else echo c; fi`,
+  `if false; then echo a; elif false; then echo b; else echo c; fi`,
+  `if true; then echo a; elif true; then echo b; fi`,
+  `if echo cond; then echo body; fi`,
+  `if false; then echo no; fi; echo $?`,
+  `if true; then false; fi; echo $?`,
+  `if
+true
+then
+echo multiline
+fi`,
+  `for x in a b c; do echo $x; done`,
+  `for x in a b c; do echo -n $x; done; echo`,
+  `for x in; do echo $x; done; echo empty`,
+  `for x in 1 2 3; do echo $x; done | wc -l`,
+  `for f in one two; do echo "[$f]"; done`,
+  `x=outer; for x in a; do echo $x; done; echo $x`,
+  `for x in $(seq 1 3); do echo n$x; done`,
+  `for x in a b; do for y in 1 2; do echo $x$y; done; done`,
+  `x=1; while test $x -lt 4; do echo $x; x=$(seq $x $x | tr 123 234); done`,
+  `while false; do echo never; done; echo done`,
+  `x=1; until test $x -gt 2; do echo n$x; x=3; done`,
+  `until true; do echo never; done; echo after`,
+  `{ echo a; echo b; }`,
+  `{ echo a; echo b; } | rev`,
+  `{ echo a; } && echo ok`,
+  `for x in a b; do if test $x = b; then echo found; fi; done`,
+  `if true; then for x in 1 2; do echo $x; done; fi`,
+  `if test -z ""; then echo empty; fi`,
+  `echo if`,
+  `echo done`,
+  `echo "if true"`,
+
   // ── Builtins ────────────────────────────────────────────────────────────────
   `echo -n no-newline`,
   `echo -n a; echo b`,
@@ -110,6 +150,31 @@ const CASES: string[] = [
   `unset x; echo [$x]`,
   `x=1; unset x; echo [$x]`,
 ];
+
+/**
+ * A directory to glob against, made once and used by the pattern cases below.
+ *
+ * Absolute paths, because this shell has no working directory of its own — there is no `cd` and
+ * no capability to ask where it is — so a relative pattern would mean different things to the two
+ * shells and the comparison would prove nothing.
+ */
+const globDir = await Deno.makeTempDir();
+for (const name of ["a.txt", "b.txt", "c.log", ".hidden"]) {
+  await Deno.writeTextFile(`${globDir}/${name}`, "");
+}
+await Deno.mkdir(`${globDir}/sub`);
+await Deno.writeTextFile(`${globDir}/sub/x.txt`, "");
+
+for (const pattern of [
+  "*.txt", "*", "?.log", "*.log", "nomatch*", "sub/*", "a?txt", "*.t?t", "sub/x.*",
+]) {
+  CASES.push(`echo ${globDir}/${pattern}`);
+}
+// Quoted patterns must not glob, and neither must a quoted metacharacter next to an unquoted one.
+CASES.push(`echo "${globDir}/*.txt"`);
+CASES.push(`echo '${globDir}/*.txt'`);
+CASES.push(`echo ${globDir}/"*".txt`);
+CASES.push(`x="${globDir}/*.txt"; echo "$x"`);
 
 async function bash(script: string) {
   const r = await new Deno.Command("bash", {
