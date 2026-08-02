@@ -89,7 +89,25 @@ export u8[] srvClose(u8[] state) { return tlsServerClose(state); }
 export u8[] srvAlert(u8[] state, i32 d) { return tlsServerAlert(state, d); }
 
 // X.509.
-import { parseCert, Cert, certMatchesHost, certSignedBy, verifyChain, verifyPath } from "../../src/x509.wac";
+import { parseCert, Cert, certMatchesHost, certSignedBy, verifyChain, verifyPath,
+         keyEd25519, keyP256, keyRsa, keyP384, sigEd25519Alg, sigEcdsaSha256,
+         sigEcdsaSha384, sigRsaSha256, sigRsaSha384, sigRsaSha512, sigRsaPss
+       } from "../../src/x509.wac";
+
+/**
+ * The key* and sig* constants, in one array.
+ *
+ * So a test names them instead of repeating the numbers. It was repeating them: the path
+ * tests had `const KEY_P256 = 2` written out, which is a second copy of a protocol
+ * constant that agrees with the first only until somebody renumbers one. Mutation testing
+ * is what surfaced it — every one of these accessors could be replaced with `return 0`
+ * and no test noticed, because no test called them.
+ */
+export u8[] x509Constants() {
+  return u8[](keyEd25519(), keyP256(), keyRsa(), keyP384(),
+              sigEd25519Alg(), sigEcdsaSha256(), sigEcdsaSha384(),
+              sigRsaSha256(), sigRsaSha384(), sigRsaSha512(), sigRsaPss());
+}
 
 /**
  * Parse and flatten.

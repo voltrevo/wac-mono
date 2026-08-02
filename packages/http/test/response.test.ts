@@ -307,3 +307,49 @@ Deno.test("the request writer produces what our own parser reads back", async ()
     if (atob(o.body) !== cases[i][2]) throw new Error(`body ${atob(o.body)}`);
   }
 });
+
+Deno.test("a malformed status line says so specifically", () => {
+  // Mutation testing found `ERR_STATUS` collapsible to zero with nothing noticing: the tests
+  // above check that a bad response is refused and compare acceptance against llhttp, which
+  // does not constrain *which* reason we give. A code naming a cause that did not happen is
+  // worse than no code.
+  // A line with no status *field* is a line-structure error, not a status one — the parser
+  // says ERR_LINE for that, which is right and is why it is not in this list.
+  for (const text of [
+    "HTTP/1.1 20 OK\r\n\r\n",              // too few status digits
+    "HTTP/1.1 2O0 OK\r\n\r\n",             // a letter among them
+    "HTTP/1.1 abc OK\r\n\r\n",             // no digits at all, but the right shape
+  ]) {
+    const got = wac(enc.encode(text), "GET", true);
+    if (got.outcome !== "bad") throw new Error(`${JSON.stringify(text)}: got ${got.outcome}`);
+    if (got.code !== 11) throw new Error(`${JSON.stringify(text)}: code ${got.code}, want 11 (ERR_STATUS)`);
+  }
+});
+
+Deno.test("a 2xx to CONNECT has no body, whatever it claims", () => {
+  // The fifth framing rule, and the one nothing exercised — `isConnect` could always return
+  // false and every test still passed. After a successful CONNECT the connection becomes a
+  // tunnel, so bytes after the headers belong to the tunnel and not to the response; a parser
+  // that reads them as a body has swallowed the first thing the client sent.
+  const bytes = enc.encode("HTTP/1.1 200 Connection Established\r\nContent-Length: 5\r\n\r\nhello");
+
+  const connect = wac(bytes, "CONNECT", false);
+  if (connect.outcome !== "ok") throw new Error(`CONNECT: got ${connect.outcome}`);
+  if (connect.body !== "") throw new Error(`CONNECT: body ${JSON.stringify(connect.body)}, want none`);
+  if (connect.consumed !== bytes.length - 5) {
+    throw new Error(`CONNECT: consumed ${connect.consumed}, want ${bytes.length - 5} — the tunnel's bytes are not ours`);
+  }
+
+  // The same response to a GET *does* have a body, which is what makes the rule about the
+  // method rather than about the status.
+  const get = wac(bytes, "GET", false);
+  if (get.outcome !== "ok" || get.body !== "hello") {
+    throw new Error(`GET: ${get.outcome} body ${JSON.stringify((get as { body?: string }).body)}, want "hello"`);
+  }
+
+  // A non-2xx to CONNECT is an ordinary response and keeps its body.
+  const refused = wac(enc.encode("HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\nno"), "CONNECT", false);
+  if (refused.outcome !== "ok" || refused.body !== "no") {
+    throw new Error(`403 to CONNECT: body ${JSON.stringify((refused as { body?: string }).body)}, want "no"`);
+  }
+});
