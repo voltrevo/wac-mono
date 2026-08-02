@@ -27,6 +27,7 @@ import {
   llMaxSymbol, mlMaxSymbol, ofMaxSymbol,
 } from "./sequences.wac";
 import { xxh64Low } from "./xxh64.wac";
+import { compressLiterals } from "./huffenc.wac";
 
 // ── Parameters ────────────────────────────────────────────────────────────────
 
@@ -339,6 +340,60 @@ void writeSequenceCount(Buf out, i32 n) {
   }
 }
 
+/**
+ * The literals section: Huffman-coded if that is smaller, otherwise raw.
+ *
+ * A section of one repeated byte becomes RLE, which costs two bytes however long it is — worth
+ * checking first because it is both the cheapest case and the one Huffman cannot express, a code
+ * needing at least two symbols.
+ */
+void writeLiterals(Buf out, u8[] literals) {
+  i32 n = literals.len();
+  if (n == 0) {
+    out.push(0);                                       // raw, length zero
+    return;
+  }
+
+  i32[] counts = i32[256]();
+  for (i32 i = 0; i < n; i++) {
+    counts[literals[i]]++;
+  }
+  i32 distinct = 0;
+  for (i32 s = 0; s < 256; s++) {
+    if (counts[s] > 0) { distinct++; }
+  }
+
+  if (distinct == 1) {
+    // RLE: the kind, the length, and the byte.
+    if (n < 32) {
+      out.push(1 | (n << 3));
+    } else if (n < 4096) {
+      out.push(1 | (1 << 2) | ((n & 15) << 4));
+      out.push(n >>> 4);
+    } else {
+      out.push(1 | (3 << 2) | ((n & 15) << 4));
+      out.push((n >>> 4) & 255);
+      out.push((n >>> 12) & 255);
+    }
+    out.push(literals[0]);
+    return;
+  }
+
+  u8[] coded = compressLiterals(literals, counts, 255);
+  if (coded.len() > 0 && coded.len() < rawLiteralsSize(n)) {
+    out.pushBytes(coded, 0, coded.len());
+    return;
+  }
+  writeRawLiterals(out, literals);
+}
+
+/** What a raw section of `n` literals costs, header included. */
+i32 rawLiteralsSize(i32 n) {
+  if (n < 32) { return 1 + n; }
+  if (n < 4096) { return 2 + n; }
+  return 3 + n;
+}
+
 /** A raw literals section: the header, then the bytes. */
 void writeRawLiterals(Buf out, u8[] literals) {
   i32 n = literals.len();
@@ -358,7 +413,7 @@ void writeRawLiterals(Buf out, u8[] literals) {
 /** A block body coded with the given tables, and the modes byte and descriptions that go with it. */
 u8[] bodyWith(Block b, u8[] literals, CTable cLL, CTable cOF, CTable cML, i32 modes, u8[] tables) {
   Buf body = Buf.create();
-  writeRawLiterals(body, literals);
+  writeLiterals(body, literals);
   writeSequenceCount(body, b.count);
 
   if (b.count > 0) {

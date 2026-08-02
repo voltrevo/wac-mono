@@ -59,28 +59,34 @@ literals uncompressed, and codes every sequence with the format's predefined FSE
 never transmits a table of its own.
 
 Where that lands on real data — `deno task bench:zstd`, over source in three languages, prose,
-config, a wasm module, a native executable, and something already compressed:
+config, a wasm module, a native executable, Tor directory data, and something already compressed:
 
 | sample | raw | ours | gzip -6 | zstd -3 | zstd -19 |
 |---|---:|---:|---:|---:|---:|
-| wac source | 1,002,340 | 281,288 | 280,346 | 284,383 | 230,996 |
-| typescript | 1,048,576 | **287,079** | 293,759 | 292,417 | 238,191 |
-| python | 1,048,576 | **230,990** | 238,783 | 241,915 | 193,448 |
-| markdown | 248,890 | 96,736 | 95,221 | 96,827 | 83,941 |
-| json | 357,128 | **2,947** | 3,481 | 2,833 | 2,575 |
+| wac source | 1,014,867 | 284,753 | 283,810 | 288,004 | 233,786 |
+| typescript | 1,048,576 | **287,426** | 294,001 | 292,769 | 238,497 |
+| python | 1,048,576 | **229,034** | 238,783 | 241,915 | 193,448 |
+| markdown | 252,668 | 98,243 | 96,694 | 98,376 | 85,273 |
+| json | 357,128 | **2,947** | 3,479 | 2,833 | 2,574 |
 | wasm | 12,746 | 5,856 | 5,392 | 5,499 | 5,065 |
 | native binary | 1,048,576 | 184,976 | 181,087 | 169,378 | 147,203 |
-| gzipped source | 283,586 | 283,214 | 282,988 | 283,604 | 282,758 |
-| **total** | **5,050,418** | **1,373,086** | 1,381,057 | 1,376,856 | 1,184,177 |
+| tor microdescs | 2,097,152 | **290,218** | 922,537 | 240,833 | 231,273 |
+| tor consensus | 2,097,152 | 550,197 | 520,158 | 501,718 | 451,051 |
+| gzipped source | 287,124 | 286,754 | 286,526 | 287,142 | 286,295 |
+| **total** | **9,264,565** | **2,220,404** | 2,832,467 | 2,128,467 | 1,874,465 |
 
-**Level with `zstd -3` overall and slightly ahead of `gzip -6`**, winning on source code in all
-three languages and losing on binaries. Already-compressed input does not expand.
+**22% smaller than `gzip -6` across the corpus, 4% larger than `zstd -3`.** We win on source code
+in all three languages and lose on binaries and on Tor's directory data. Already-compressed input
+does not expand.
+
+The Tor microdescriptors are the sample worth staring at: **a third of gzip's size**, because
+gzip's window is 32 KiB and the file repeats itself at far greater range than that, while ours
+reaches back a megabyte. It is also, at 1.30x, the furthest we are from `zstd -3`.
 
 Note what changed when the corpus did. The samples this package started with were repeated
-phrases, and against those `zstd -3` looked 2.4x better on json — which turned out to be a
-property of the generator, not of the compressor. Real json is a win for us by 15% against gzip.
-**Two of the three conclusions drawn from the synthetic corpus were wrong**, which is why
-`bench/corpus.ts` now builds from files that are actually on the machine.
+phrases, and against those `zstd -3` looked 2.4x better on json — a property of the generator, not
+of the compressor. **Two of the three conclusions drawn from the synthetic corpus were wrong**,
+which is why `bench/corpus.ts` now builds from files that are actually on the machine.
 
 ### Where the bytes go, and what fitted tables were worth
 
@@ -113,18 +119,27 @@ and literals are **10 KB of a 925 KB input** — entropy-coding them would save 
 
 What is left, in order:
 
-1. **Repeat offsets**, whose value depends entirely on the data — and on the real corpus that
-   means *binaries*, which is exactly where we lose. Measured share of offsets that would hit a
-   repeat slot: **63% on a native executable**, 8% on wasm, 5% on json, 0-3% on source and prose.
-   The executable currently spends most of its sequence budget on offset magnitudes, so this is
-   the largest single lever left, though the estimate is rough: using repeats changes the parse,
-   and a more regular parse changes the code distributions too.
-3. **Better matching**, which is what separates us from `zstd -19` — 14% across the corpus. `zstd -19` reaches 4.25x on the
+1. ~~**Huffman literals**~~ — done, and worth what the measurement said: the estimate was 24,308
+   bytes on the Tor microdescriptors and it came out at 23,134. Across the corpus it took us from
+   1.07x of `zstd -3` to 1.04x. A section of one repeated byte becomes RLE instead, and a
+   section whose coding would not pay stays raw.
+
+   **With one limitation, and it is why the binaries did not move.** A tree description written
+   directly carries at most 128 weights, because its header byte holds `127 + the count`. Wider
+   alphabets need the FSE-coded form, which needs the two-state interleaved FSE *encoder* this
+   package does not have — the one shape whose termination does not invert cleanly, and which
+   was skipped on the grounds that nothing needed it. Something does now. Literals containing a
+   byte above 128 therefore stay raw, which covers text, base64 and json but not machine code.
+3. **Better matching**, which is what separates us from `zstd -19` — 18% across the corpus — and
+   is most of the remaining gap on the Tor consensus, where offsets alone cost 296 KB of a
+   586 KB output at an average match of only 13 bytes. `zstd -19` reaches 4.25x on the
    same input against `-3`'s 3.48x, purely by parsing better. Our average match is 8.7 bytes from
    a greedy search 32 candidates deep; lazy matching and a deeper chain are what raise that.
-2. **Huffman literals**, worth 1% on source and prose but **6% on a native binary, 8% on wasm and
-   11% on json** — again concentrated where we lose. Literals are 36% of the output on the
-   executable, against 4% on source. Note the interaction: a greedy matcher takes every
+2. **Repeat offsets** — deep but narrow. Across the whole corpus exactly one sample wants them:
+   the native executable, where **63% of offsets would hit a repeat slot** and the offset budget
+   would fall from 58 KB to 32 KB. Everywhere else it is 0-8%, including both Tor samples at
+   0-1%. Worth having, but it is one sample rather than a general win — which is the opposite of
+   what the synthetic log lines suggested. Note the interaction: a greedy matcher takes every
    three-byte match it finds, which *minimises* literals. A better parser skips bad matches and
    emits more of them, so this grows as (3) lands.
 
