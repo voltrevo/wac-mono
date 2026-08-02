@@ -314,3 +314,43 @@ Deno.test("coding the literals is worth what it claims", () => {
     throw new Error(`${got} bytes for ${data.length} of base64, expected under ${ceiling} — literals may not be coded`);
   }
 });
+
+Deno.test("literals sections at every header width", async () => {
+  // The literals header comes in three widths for compressed sections, and which one is used
+  // depends on how many literals a block ends up with. Everything in the corpus above produced
+  // small ones — the widest form went untested and was wrong, writing six bytes of a five-byte
+  // header with the fields in the wrong places. Real data at full size found it; nothing smaller
+  // did, because a block needs 16 KiB of literals before that form is reached.
+  //
+  // So: inputs built to land in each width, and checked against zstd rather than ourselves.
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let s = 0x51ded | 0;
+  const roll = () => { s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s; };
+
+  // High-entropy base64 with a repeated marker: the marker matches, everything else is a
+  // literal, so literal volume tracks the input size closely.
+  const build = (n: number): Uint8Array => {
+    const parts: string[] = [];
+    for (let i = 0; i < n; i++) {
+      parts.push(alphabet[(roll() >>> 8) % 64]);
+      if (i % 70 === 69) parts.push("\nid ed25519 ");
+    }
+    return e.encode(parts.join(""));
+  };
+
+  const cases = [800, 5_000, 20_000, 90_000, 300_000, 900_000];
+  const inputs = cases.map(build);
+  const frames = inputs.map(d => enc.compress(d));
+  const back = await nodeDecompress(frames);
+  for (let i = 0; i < inputs.length; i++) {
+    const got = back[i];
+    if (got === null) throw new Error(`${cases[i]} symbols: zstd refused the frame`);
+    const at = same(got, inputs[i]);
+    if (at !== -2) {
+      throw new Error(`${cases[i]} symbols: ${at === -1 ? `${got.length} bytes, want ${inputs[i].length}` : `differs at ${at}`}`);
+    }
+    // And our own decoder, which has to agree with zstd about the same bytes.
+    const ours = dec.decompress(frames[i]);
+    if (same(ours, inputs[i]) !== -2) throw new Error(`${cases[i]} symbols: our decoder disagrees`);
+  }
+});

@@ -288,13 +288,15 @@ export u8[] compressLiterals(u8[] data, i32[] counts, i32 maxSymbol) {
     out.push(((v >>> 16) & 3) | ((compressedSize << 2) & 255));
     out.push((compressedSize >>> 6) & 255);
   } else {
-    // Eighteen bits each, which is more than a block's literals can reach.
-    out.push(2 | (3 << 2) | ((n & 15) << 4));
-    out.push((n >>> 4) & 255);
-    out.push((n >>> 12) & 255);
-    out.push(((n >>> 20) & 3) | ((compressedSize & 63) << 2));
-    out.push((compressedSize >>> 6) & 255);
-    out.push((compressedSize >>> 14) & 255);
+    // Five bytes: four bits of kind and format, then eighteen bits of each size. The fields do
+    // not land on byte boundaries — the regenerated size ends six bits into the third byte and
+    // the compressed size starts there — which is the whole reason to write it out a byte at a
+    // time rather than build a number and shift it.
+    out.push(2 | (3 << 2) | ((n & 15) << 4));                     // kind, format, regen 0-3
+    out.push((n >>> 4) & 255);                                    // regen 4-11
+    out.push(((n >>> 12) & 63) | ((compressedSize & 3) << 6));    // regen 12-17, compressed 0-1
+    out.push((compressedSize >>> 2) & 255);                       // compressed 2-9
+    out.push((compressedSize >>> 10) & 255);                      // compressed 10-17
   }
   out.pushBytes(content, 0, compressedSize);
   return out.take();
