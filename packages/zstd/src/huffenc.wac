@@ -1,0 +1,301 @@
+// Huffman coding for literals, the encoding side of `huffman.wac` (RFC 8878, section 4.2).
+//
+// Worth having because literals are where the output goes on data a matcher cannot help:
+// measured on this package's corpus, literals are 4-6% of the output on source code but 31% on
+// Tor microdescriptors, 36% on a native binary and 45% on json. The Tor case shows why — those
+// literals are base64, so they use 71 distinct byte values and a quarter of every literal byte
+// is stored and never read.
+//
+// Two things here are not the textbook algorithm:
+//
+//   - **Code lengths are limited to 11 bits** by raising a floor under the counts and rebuilding
+//     until the tree is shallow enough, rather than by package-merge. Simple, obviously
+//     terminating, and it costs a fraction of a percent against the optimal length-limited code.
+//   - **Codes are assigned to match `huffman.wac`'s table build exactly**, which orders symbols
+//     by weight and then by value. The two must agree bit for bit, so this derives the code the
+//     same way the decoder derives the table rather than by a separate canonical ordering.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { BitOut } from "./fseenc.wac";
+
+/** The longest code the format allows, and so the width of a decoder's lookup. */
+i32 maxCodeLength() { return 11; }
+
+/**
+ * The widest alphabet a directly-written tree description can carry.
+ *
+ * The header byte holds `127 + the number of weights`, so at most 128 weights are transmitted
+ * and at most 129 symbols described. A wider alphabet needs the FSE-coded form, which needs the
+ * two-state interleaved FSE encoder this package does not have — so literals containing a byte
+ * above 128 stay raw. That covers text, base64 and json; it does not cover binaries.
+ */
+i32 maxDirectSymbol() { return 128; }
+
+/**
+ * Huffman code lengths for `counts`, none longer than `limit`.
+ *
+ * The tree is built by repeatedly merging the two lightest nodes — an O(n^2) selection, which
+ * for 256 symbols is cheaper than maintaining a heap and much easier to be sure of.
+ *
+ * If the deepest code exceeds the limit, every count is raised to a floor and the whole thing is
+ * rebuilt. Raising the floor compresses the ratio between the rarest and commonest symbol, which
+ * is exactly what sets the depth, so doubling it converges in a handful of rounds.
+ */
+i32[] codeLengths(i32[] counts, i32 maxSymbol, i32 limit) {
+  i32 n = maxSymbol + 1;
+  i32[] lengths = i32[n]();
+  i32 floor = 1;
+
+  while (true) {
+    // Leaves for the symbols that occur, weighted by the floored count.
+    i32[] weight = i32[2 * n]();
+    i32[] left = i32[2 * n]();
+    i32[] right = i32[2 * n]();
+    i32[] leafOf = i32[2 * n]();
+    i32 nodes = 0;
+    for (i32 s = 0; s < n; s++) {
+      if (counts[s] == 0) { continue; }
+      i32 c = counts[s];
+      if (c < floor) { c = floor; }
+      weight[nodes] = c;
+      left[nodes] = -1;
+      right[nodes] = -1;
+      leafOf[nodes] = s;
+      nodes++;
+    }
+    if (nodes < 2) { trap; }             // one symbol is an RLE section, not a Huffman code
+
+    bool[] active = bool[2 * n]();
+    for (i32 i = 0; i < nodes; i++) {
+      active[i] = true;
+    }
+
+    i32 remaining = nodes;
+    i32 count = nodes;
+    while (remaining > 1) {
+      i32 a = -1;
+      i32 b = -1;
+      for (i32 i = 0; i < count; i++) {
+        if (!active[i]) { continue; }
+        if (a < 0 || weight[i] < weight[a]) { b = a; a = i; }
+        else if (b < 0 || weight[i] < weight[b]) { b = i; }
+      }
+      active[a] = false;
+      active[b] = false;
+      weight[count] = weight[a] + weight[b];
+      left[count] = a;
+      right[count] = b;
+      leafOf[count] = -1;
+      active[count] = true;
+      count++;
+      remaining--;
+    }
+
+    // Depths, by walking down from the root.
+    i32 root = count - 1;
+    i32[] depth = i32[count]();
+    i32 deepest = 0;
+    // Nodes are created in increasing order, so a parent always has a higher index than its
+    // children — walking down from the top visits every parent before its children.
+    for (i32 i = root; i >= 0; i--) {
+      if (left[i] < 0) {
+        if (depth[i] > deepest) { deepest = depth[i]; }
+        continue;
+      }
+      depth[left[i]] = depth[i] + 1;
+      depth[right[i]] = depth[i] + 1;
+    }
+
+    if (deepest <= limit) {
+      for (i32 i = 0; i < count; i++) {
+        if (left[i] < 0) { lengths[leafOf[i]] = depth[i]; }
+      }
+      return lengths;
+    }
+    floor = floor * 2;
+  }
+}
+
+/** A built code: what each symbol costs and what it is. */
+export struct HuffEnc {
+  i32 maxBits;
+  i32 maxSymbol;       // the highest symbol that occurs
+  i32[] weights;       // per symbol, 0 where it does not occur
+  i32[] nbBits;
+  i32[] code;
+}
+
+/**
+ * Build the code, assigning each symbol the code the decoder's table will give it.
+ *
+ * Weight and code length are the same statement read two ways: `weight = maxBits + 1 - nbBits`,
+ * so a bigger weight is a shorter code. The decoder lays its table out by weight class, lowest
+ * weight first, and within a class by symbol value — so walking symbols in order and handing out
+ * each weight class's space in turn reproduces exactly the assignment it will make.
+ */
+HuffEnc build(i32[] counts, i32 maxSymbol) {
+  i32[] lengths = codeLengths(counts, maxSymbol, maxCodeLength());
+
+  i32 maxBits = 0;
+  i32 top = 0;
+  for (i32 s = 0; s <= maxSymbol; s++) {
+    if (lengths[s] > maxBits) { maxBits = lengths[s]; }
+    if (counts[s] > 0) { top = s; }
+  }
+
+  i32[] weights = i32[maxSymbol + 1]();
+  i32[] nbBits = i32[maxSymbol + 1]();
+  i32[] code = i32[maxSymbol + 1]();
+  for (i32 s = 0; s <= maxSymbol; s++) {
+    if (lengths[s] > 0) { weights[s] = maxBits + 1 - lengths[s]; }
+  }
+
+  // Where each weight class starts, in the decoder's table.
+  i32[] start = i32[maxCodeLength() + 2]();
+  for (i32 s = 0; s <= maxSymbol; s++) {
+    start[weights[s]]++;
+  }
+  i32 next = 0;
+  for (i32 w = 1; w <= maxBits; w++) {
+    i32 here = next;
+    next += start[w] << (w - 1);
+    start[w] = here;
+  }
+
+  for (i32 s = 0; s <= maxSymbol; s++) {
+    i32 w = weights[s];
+    if (w == 0) { continue; }
+    i32 span = 1 << (w - 1);
+    i32 base = start[w];
+    start[w] = base + span;
+    nbBits[s] = maxBits + 1 - w;
+    code[s] = base / span;             // the top `nbBits` bits of the range it occupies
+  }
+
+  return HuffEnc(maxBits, top, weights, nbBits, code);
+}
+
+/**
+ * Write the tree description in the direct form: the count, then one weight per nibble.
+ *
+ * The last symbol's weight is not transmitted — the code space left over identifies it — so this
+ * writes `top` weights for symbols 0 to `top - 1`.
+ */
+void writeTree(Buf out, HuffEnc h) {
+  i32 count = h.maxSymbol;
+  if (count < 1 || count > maxDirectSymbol()) { trap; }
+  out.push(127 + count);
+  for (i32 i = 0; i < count; i += 2) {
+    i32 hi = h.weights[i];
+    i32 lo = 0;
+    if (i + 1 < count) { lo = h.weights[i + 1]; }
+    out.push((hi << 4) | lo);
+  }
+}
+
+/**
+ * Encode `data[begin, end)` as one backwards stream.
+ *
+ * Backwards for the same reason FSE is: a decoder reads from the end, so the last literal is
+ * written first and the first literal ends up at the top where the decoder meets it.
+ */
+u8[] encodeStream(HuffEnc h, u8[] data, i32 begin, i32 end) {
+  BitOut o = BitOut.create();
+  for (i32 i = end - 1; i >= begin; i--) {
+    i32 s = data[i];
+    o.write(h.code[s], h.nbBits[s]);
+  }
+  return o.finish();
+}
+
+/** Whether this alphabet can be described at all, given only the direct form is implemented. */
+export bool describable(i32[] counts, i32 maxSymbol) {
+  i32 top = -1;
+  i32 distinct = 0;
+  for (i32 s = 0; s <= maxSymbol; s++) {
+    if (counts[s] > 0) {
+      top = s;
+      distinct++;
+    }
+  }
+  return distinct >= 2 && top >= 1 && top <= maxDirectSymbol();
+}
+
+/**
+ * A complete compressed literals section, or an empty array if it would not be smaller.
+ *
+ * One stream or four, and the choice is forced rather than free: the one-stream layout only
+ * exists in the header form with ten-bit sizes, so anything above 1023 bytes must be split. The
+ * four streams share one tree and are decoded independently, which is a decoder's parallelism
+ * rather than a ratio win.
+ */
+export u8[] compressLiterals(u8[] data, i32[] counts, i32 maxSymbol) {
+  if (!describable(counts, maxSymbol)) { return u8[0](); }
+  HuffEnc h = build(counts, maxSymbol);
+
+  Buf tree = Buf.create();
+  writeTree(tree, h);
+  u8[] treeBytes = tree.take();
+
+  i32 n = data.len();
+  Buf body = Buf.create();
+  i32 streams = 1;
+  if (n > 1023) { streams = 4; }
+
+  if (streams == 1) {
+    u8[] one = encodeStream(h, data, 0, n);
+    body.pushBytes(treeBytes, 0, treeBytes.len());
+    body.pushBytes(one, 0, one.len());
+  } else {
+    // Three quarters rounded up, then whatever is left — the split the decoder assumes.
+    // Three quarters rounded up is always short of the whole for anything past a dozen bytes,
+    // and four streams are only used above 1023, so the split always leaves the fourth some work.
+    i32 quarter = (n + 3) / 4;
+    u8[] s1 = encodeStream(h, data, 0, quarter);
+    u8[] s2 = encodeStream(h, data, quarter, quarter * 2);
+    u8[] s3 = encodeStream(h, data, quarter * 2, quarter * 3);
+    u8[] s4 = encodeStream(h, data, quarter * 3, n);
+    // The jump table carries sixteen-bit sizes, which a quarter of a block cannot exceed: the
+    // literals of one block are at most 128 KiB, so a quarter coded at worst eleven bits a byte
+    // is still under 46 KiB.
+
+    body.pushBytes(treeBytes, 0, treeBytes.len());
+    body.pushU16(s1.len() as@ u32);
+    body.pushU16(s2.len() as@ u32);
+    body.pushU16(s3.len() as@ u32);
+    body.pushBytes(s1, 0, s1.len());
+    body.pushBytes(s2, 0, s2.len());
+    body.pushBytes(s3, 0, s3.len());
+    body.pushBytes(s4, 0, s4.len());
+  }
+
+  u8[] content = body.take();
+  i32 compressedSize = content.len();
+
+  // The header: kind 2, and a size format wide enough for both sizes. The narrow forms carry
+  // ten bits each, which is why a 1023-byte limit keeps turning up.
+  Buf out = Buf.create();
+  if (streams == 1) {
+    // The only layout with a single stream, and the reason 1023 keeps appearing: ten bits each.
+    i32 v = 2 | (0 << 2) | (n << 4) | (compressedSize << 14);
+    out.push(v & 255);
+    out.push((v >>> 8) & 255);
+    out.push((v >>> 16) & 255);
+  } else if (n < 16384 && compressedSize < 16384) {
+    i32 v = 2 | (2 << 2) | (n << 4);
+    out.push(v & 255);
+    out.push((v >>> 8) & 255);
+    out.push(((v >>> 16) & 3) | ((compressedSize << 2) & 255));
+    out.push((compressedSize >>> 6) & 255);
+  } else {
+    // Eighteen bits each, which is more than a block's literals can reach.
+    out.push(2 | (3 << 2) | ((n & 15) << 4));
+    out.push((n >>> 4) & 255);
+    out.push((n >>> 12) & 255);
+    out.push(((n >>> 20) & 3) | ((compressedSize & 63) << 2));
+    out.push((compressedSize >>> 6) & 255);
+    out.push((compressedSize >>> 14) & 255);
+  }
+  out.pushBytes(content, 0, compressedSize);
+  return out.take();
+}

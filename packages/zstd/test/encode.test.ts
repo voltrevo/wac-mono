@@ -243,3 +243,74 @@ Deno.test("fitted tables are worth what they claim to be", () => {
     }
   }
 });
+
+Deno.test("literals are coded when that helps, and left alone when it does not", () => {
+  // Three kinds of literals section, each chosen for a different reason: RLE when there is one
+  // distinct byte, Huffman when the alphabet is narrow enough to describe and the coding pays,
+  // raw when neither. A bug that stopped choosing Huffman would cost 8% on base64-heavy data and
+  // break nothing, so the choice is asserted rather than assumed.
+  const kindsOf = (d: Uint8Array) => new Set(frameShapes(enc.compress(d)).kinds);
+
+  // A long run of one byte: the matcher covers all of it but the first three, so the literals
+  // that survive are three copies of the same byte — one distinct value, which is what RLE is.
+  const rle = new Uint8Array(50000).fill(0x61);
+  if (!kindsOf(rle).has("rle")) throw new Error(`one repeated literal byte: saw ${[...kindsOf(rle)]}`);
+
+  // A narrow alphabet with high entropy and matches too short to cover it — the shape Huffman
+  // exists for, and what base64 payloads look like.
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let s = 0x1234 | 0;
+  const parts: string[] = [];
+  for (let i = 0; i < 40000; i++) {
+    s ^= s << 13; s >>>= 0;
+    s ^= s >>> 17;
+    s ^= s << 5; s >>>= 0;
+    parts.push(alphabet[(s >>> 8) % 64]);
+    if (i % 64 === 63) parts.push("\nkey ");
+  }
+  const kinds = kindsOf(e.encode(parts.join("")));
+  if (!kinds.has("compressed")) throw new Error(`base64 literals were not coded: saw ${[...kinds]}`);
+
+  // A byte above 128 puts the alphabet beyond what a directly-written tree can describe, so the
+  // literals stay raw. That is a real limitation, and this is what would notice it changing.
+  // Needs matches, or the whole block falls back to raw and there is no literals section to
+  // look at: high-entropy bytes across the full range, with a repeated marker planted so the
+  // block is compressed and the literals between the markers keep their wide alphabet.
+  const marker = e.encode("=== a marker phrase that certainly repeats ===");
+  const wideParts: number[] = [];
+  let x = 0x9e37 | 0;
+  for (let i = 0; i < 400; i++) {
+    for (let j = 0; j < 50; j++) {
+      x ^= x << 13; x >>>= 0;
+      x ^= x >>> 17;
+      x ^= x << 5; x >>>= 0;
+      wideParts.push(x & 0xff);
+    }
+    for (const b of marker) wideParts.push(b);
+  }
+  const wide = new Uint8Array(wideParts);
+  const wideKinds = kindsOf(wide);
+  if (!wideKinds.has("raw")) throw new Error(`a 256-symbol alphabet: saw ${[...wideKinds]}`);
+});
+
+Deno.test("coding the literals is worth what it claims", () => {
+  // A canary on the figure Huffman literals bought when they landed. base64 is where it matters
+  // most: 64 symbols in 8-bit bytes means a quarter of every literal byte is dead weight.
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let s = 0xBEEF | 0;
+  const parts: string[] = [];
+  for (let i = 0; i < 60000; i++) {
+    s ^= s << 13; s >>>= 0;
+    s ^= s >>> 17;
+    s ^= s << 5; s >>>= 0;
+    parts.push(alphabet[(s >>> 8) % 64]);
+  }
+  const data = e.encode(parts.join(""));
+  const got = enc.compress(data).length;
+  // Incompressible by matching, so this is almost purely the literal coding: six bits a byte
+  // plus the frame, against eight bits stored.
+  const ceiling = Math.ceil(data.length * 6.4 / 8);
+  if (got > ceiling) {
+    throw new Error(`${got} bytes for ${data.length} of base64, expected under ${ceiling} — literals may not be coded`);
+  }
+});

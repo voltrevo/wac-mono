@@ -63,19 +63,19 @@ config, a wasm module, a native executable, Tor directory data, and something al
 
 | sample | raw | ours | gzip -6 | zstd -3 | zstd -19 |
 |---|---:|---:|---:|---:|---:|
-| wac source | 1,002,340 | 281,288 | 280,346 | 284,383 | 230,996 |
-| typescript | 1,048,576 | **286,811** | 293,481 | 292,165 | 237,995 |
-| python | 1,048,576 | **230,990** | 238,783 | 241,915 | 193,448 |
-| markdown | 251,626 | 97,771 | 96,261 | 97,887 | 84,858 |
-| json | 357,128 | **2,947** | 3,481 | 2,833 | 2,575 |
+| wac source | 1,014,867 | 284,753 | 283,810 | 288,004 | 233,786 |
+| typescript | 1,048,576 | **287,426** | 294,001 | 292,769 | 238,497 |
+| python | 1,048,576 | **229,034** | 238,783 | 241,915 | 193,448 |
+| markdown | 252,668 | 98,243 | 96,694 | 98,376 | 85,273 |
+| json | 357,128 | **2,947** | 3,479 | 2,833 | 2,574 |
 | wasm | 12,746 | 5,856 | 5,392 | 5,499 | 5,065 |
 | native binary | 1,048,576 | 184,976 | 181,087 | 169,378 | 147,203 |
-| tor microdescs | 2,097,152 | **313,352** | 922,537 | 240,833 | 231,273 |
-| tor consensus | 2,097,152 | 585,778 | 520,158 | 501,718 | 451,051 |
-| gzipped source | 283,586 | 283,214 | 282,988 | 283,604 | 282,758 |
-| **total** | **9,247,458** | **2,272,983** | 2,824,514 | 2,120,215 | 1,867,222 |
+| tor microdescs | 2,097,152 | **290,218** | 922,537 | 240,833 | 231,273 |
+| tor consensus | 2,097,152 | 550,197 | 520,158 | 501,718 | 451,051 |
+| gzipped source | 287,124 | 286,754 | 286,526 | 287,142 | 286,295 |
+| **total** | **9,264,565** | **2,220,404** | 2,832,467 | 2,128,467 | 1,874,465 |
 
-**20% smaller than `gzip -6` across the corpus, 7% larger than `zstd -3`.** We win on source code
+**22% smaller than `gzip -6` across the corpus, 4% larger than `zstd -3`.** We win on source code
 in all three languages and lose on binaries and on Tor's directory data. Already-compressed input
 does not expand.
 
@@ -119,12 +119,17 @@ and literals are **10 KB of a 925 KB input** — entropy-coding them would save 
 
 What is left, in order:
 
-1. **Huffman literals** — the broadest, and the one the format spends most of its complexity on
-   that we do not use at all. Worth 6-11% on five of the nine samples and about 1% on the rest,
-   because what it buys tracks how much of the output is literals: 4-6% on source, but **31% on
-   Tor microdescriptors, 36% on a native binary and 45% on json**. The Tor data makes the reason
-   plain — its literals use **71 distinct byte values**, being base64, so a quarter of every
-   literal byte is being stored and never read.
+1. ~~**Huffman literals**~~ — done, and worth what the measurement said: the estimate was 24,308
+   bytes on the Tor microdescriptors and it came out at 23,134. Across the corpus it took us from
+   1.07x of `zstd -3` to 1.04x. A section of one repeated byte becomes RLE instead, and a
+   section whose coding would not pay stays raw.
+
+   **With one limitation, and it is why the binaries did not move.** A tree description written
+   directly carries at most 128 weights, because its header byte holds `127 + the count`. Wider
+   alphabets need the FSE-coded form, which needs the two-state interleaved FSE *encoder* this
+   package does not have — the one shape whose termination does not invert cleanly, and which
+   was skipped on the grounds that nothing needed it. Something does now. Literals containing a
+   byte above 128 therefore stay raw, which covers text, base64 and json but not machine code.
 3. **Better matching**, which is what separates us from `zstd -19` — 18% across the corpus — and
    is most of the remaining gap on the Tor consensus, where offsets alone cost 296 KB of a
    586 KB output at an average match of only 13 bytes. `zstd -19` reaches 4.25x on the

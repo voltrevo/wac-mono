@@ -690,6 +690,44 @@ const en = encoder.mod as unknown as { compress(d: Uint8Array): Uint8Array };
     ignoringTraps(() => en.compress(d));
   }
 
+  // Literals sections of each kind. RLE needs one distinct literal byte, Huffman needs a narrow
+  // alphabet and a coding that pays, and raw is what is left — including an alphabet too wide
+  // for a directly-written tree, which needs matches present or the block falls back to raw and
+  // has no literals section at all.
+  {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let s2 = 0x1234 | 0;
+    const roll = () => { s2 ^= s2 << 13; s2 >>>= 0; s2 ^= s2 >>> 17; s2 ^= s2 << 5; s2 >>>= 0; return s2; };
+    // Narrow alphabets at several sizes, so the one-stream and four-stream layouts and each
+    // header width are all reached.
+    for (const n of [40, 300, 900, 1100, 5000, 40000, 200000]) {
+      const parts: string[] = [];
+      for (let i = 0; i < n; i++) {
+        parts.push(alphabet[(roll() >>> 8) % 64]);
+        if (i % 64 === 63) parts.push("\nkey ");
+      }
+      ignoringTraps(() => en.compress(t.encode(parts.join(""))));
+    }
+    // An alphabet of exactly two symbols, and one just inside and just outside what a direct
+    // description can carry.
+    for (const width of [2, 100, 128, 129, 200]) {
+      const out = new Uint8Array(30000);
+      for (let i = 0; i < out.length; i++) out[i] = (roll() >>> 8) % width;
+      // Planted repeats, so there are sequences and therefore a compressed block.
+      for (let i = 0; i + 40 < out.length; i += 500) out.set(t.encode("a marker phrase that repeats here    "), i);
+      ignoringTraps(() => en.compress(out));
+    }
+    ignoringTraps(() => en.compress(new Uint8Array(50000).fill(0x61)));
+    // Many identical literals rather than three: a marker that matches, separated by a single
+    // byte that never does, so every gap contributes one literal and they are all the same. That
+    // is what reaches the wider RLE literal headers.
+    for (const reps of [40, 900, 9000]) {
+      const parts: string[] = [];
+      for (let i = 0; i < reps; i++) parts.push("MARKERPHRASE", "x");
+      ignoringTraps(() => en.compress(t.encode(parts.join(""))));
+    }
+  }
+
   // Longer than the window, so a candidate is found beyond it and rejected.
   {
     const far = new Uint8Array(1300000);
@@ -758,7 +796,7 @@ const NOT_COVERED: { file: string; line: number; snippet: string; proven: boolea
   },
   {
     file: "packages/zstd/src/encode.wac",
-    line: 308,
+    line: 309,
     proven: true,
     snippet: "while ((1 << log) < need && log < maxLog) {",
     why: "optimalLog floors the log at highBit(top) + 2, so the table is at least four times " +
@@ -770,7 +808,7 @@ const NOT_COVERED: { file: string; line: number; snippet: string; proven: boolea
   },
   {
     file: "packages/zstd/src/encode.wac",
-    line: 334,
+    line: 335,
     proven: false,
     snippet: "} else {",
     why: "The three-byte sequence count needs 32512 sequences in one block, and a 128 KiB " +
@@ -780,6 +818,36 @@ const NOT_COVERED: { file: string; line: number; snippet: string; proven: boolea
       "makes it worse, not better, because then the matcher finds the whole cycle as one " +
       "65 KB match. The branch is three lines and mirrors readCount in sequences.wac, which " +
       "is tested — but that is an argument, not a test.",
+  },
+  {
+    file: "packages/zstd/src/huffenc.wac",
+    line: 66,
+    proven: true,
+    snippet: "if (nodes < 2) { trap; }",
+    why: "A Huffman code needs two symbols. compressLiterals checks `describable` first, which " +
+      "requires two, and build has no other caller now that it is not exported — a section with " +
+      "one distinct byte becomes RLE instead. Kept because it is the invariant the tree merge " +
+      "depends on, and violating it would loop rather than fail.",
+  },
+  {
+    file: "packages/zstd/src/huffenc.wac",
+    line: 186,
+    proven: true,
+    snippet: "if (count < 1 || count > maxDirectSymbol()) { trap; }",
+    why: "Same guard from the other end: `describable` has already bounded the highest symbol " +
+      "to 128, which is what a directly-written tree description can carry, and writeTree has " +
+      "no other caller. Kept because writing a wider one would produce a header byte that means " +
+      "something else entirely.",
+  },
+  {
+    file: "packages/zstd/src/encode.wac",
+    line: 370,
+    proven: false,
+    snippet: "} else if (n < 4096) {",
+    why: "The wider RLE literal headers, which need 32 or more literals that are all the same " +
+      "byte. Hard to arrange and possibly not worth arranging: literals are what matching " +
+      "failed on, and a repeated byte is exactly what matching succeeds on, so the runs that " +
+      "would produce them get absorbed into matches instead. Every input tried left three.",
   },
   {
     file: "packages/zstd/src/block.wac",
@@ -794,7 +862,8 @@ const NOT_COVERED: { file: string; line: number; snippet: string; proven: boolea
   },
 ];
 
-report([run, fse, huff, hash, fsee, encoder], "packages/zstd/", { verbose });
+const huffe = await instrument("packages/zstd/src/huffenc.wac");
+report([run, fse, huff, hash, fsee, encoder, huffe], "packages/zstd/", { verbose });
 
 let stale = false;
 const sources = new Map<string, string[]>();
