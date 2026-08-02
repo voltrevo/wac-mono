@@ -256,3 +256,52 @@ export i32 sshKnownHost(u8[] file, u8[] host, i32 port, u8[] keyType, u8[] keyBl
     else: return 3;
   }
 }
+
+// ── Channels ──────────────────────────────────────────────────────────────────
+
+import { Incoming, Window, channelClose, channelData, channelEof, defaultMaxPacket,
+         defaultWindow, execRequest, extendedDataStderr, msgChannelData,
+         msgChannelExtendedData, msgChannelOpenConfirmation, msgChannelOpenFailure,
+         msgChannelClose, msgChannelEof, msgChannelRequest, msgChannelSuccess,
+         msgChannelWindowAdjust, openSession, parse, windowAdjust } from "../../src/channel.wac";
+
+export i32 sshDefaultWindow() { return defaultWindow(); }
+export i32 sshDefaultMaxPacket() { return defaultMaxPacket(); }
+export i32 sshExtendedDataStderr() { return extendedDataStderr(); }
+export i32 sshMsgChannelData() { return msgChannelData(); }
+export i32 sshMsgChannelExtendedData() { return msgChannelExtendedData(); }
+export i32 sshMsgChannelOpenConfirmation() { return msgChannelOpenConfirmation(); }
+export i32 sshMsgChannelOpenFailure() { return msgChannelOpenFailure(); }
+export i32 sshMsgChannelClose() { return msgChannelClose(); }
+export i32 sshMsgChannelEof() { return msgChannelEof(); }
+export i32 sshMsgChannelRequest() { return msgChannelRequest(); }
+export i32 sshMsgChannelSuccess() { return msgChannelSuccess(); }
+export i32 sshMsgChannelWindowAdjust() { return msgChannelWindowAdjust(); }
+
+export u8[] sshOpenSession(i32 channel, i32 window, i32 maxPacket) {
+  return openSession(channel, window, maxPacket);
+}
+export u8[] sshExecRequest(i32 channel, u8[] command, bool wantReply) {
+  return execRequest(channel, command, wantReply);
+}
+export u8[] sshWindowAdjust(i32 channel, i32 increment) { return windowAdjust(channel, increment); }
+export u8[] sshChannelEof(i32 channel) { return channelEof(channel); }
+export u8[] sshChannelClose(i32 channel) { return channelClose(channel); }
+export u8[] sshChannelData(i32 channel, u8[] data) { return channelData(channel, data); }
+
+/** 0 kind, 1 channel, 2 senderChannel, 3 window, 4 extra, 5 ok. */
+export i32 sshIncomingField(u8[] payload, i32 which) {
+  Incoming m = parse(payload);
+  if (which == 0) { return m.kind; }
+  if (which == 1) { return m.channel; }
+  if (which == 2) { return m.senderChannel; }
+  if (which == 3) { return m.window; }
+  if (which == 4) { return m.extra; }
+  return m.ok ? 1 : 0;
+}
+export u8[] sshIncomingData(u8[] payload) { return parse(payload).data; }
+
+// The window is a struct with state, so it is driven through a handle the host keeps.
+export Window sshWindowCreate(i32 initial) { return Window.create(initial); }
+export i32 sshWindowConsume(Window w, i32 n) { return w.consume(n); }
+export i32 sshWindowLeft(Window w) { return w.left; }
