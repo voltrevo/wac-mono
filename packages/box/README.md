@@ -133,13 +133,13 @@ because "cannot stream" turned out to be wrong twice:
 
 | | applets | why |
 |---|---|---|
-| **Streams** | cat wc hex crc32 tr strings gzip gunzip head tail nl rev uniq grep cut fold cp | bounded by a chunk, a line, or a flag |
+| **Streams** | cat wc hex crc32 sha256sum tr strings gzip gunzip head tail nl rev uniq grep cut fold cp split sponge | bounded by a chunk, a line, or a flag |
 | **Cannot** | sort tac | need every line before emitting the first |
 | **Cannot** | tee | two sinks at once, and the world has one current output |
-| **Could, given an API** | sha256sum sha512sum | `crypto` hashes a whole message; it wants `Start`/`Update`/`Finish`, which `crc32` already has |
+| **Could, given an API** | sha512sum | `crypto`'s SHA-512 still hashes a whole message. SHA-256 grew `Sha256.create/update/finish` and `sha256sum` streams on it; SHA-512 wants the same treatment |
 | **Could, given an API** | base64 base32 | `codec` encodes a whole array, including the padding, so a chunk cannot be encoded on its own |
 | **Cannot** | zstd unzstd | `packages/zstd` has no streaming form — a package limit, not the world's |
-| **Not worth it** | urlencode urldecode basename dirname date echo seq json stat uuid shuf paste sponge | the input is a line, or the job needs all of it anyway |
+| **Not worth it** | urlencode urldecode basename dirname date echo seq json stat uuid shuf paste get wget serve httpd | the input is a line, or the job needs all of it anyway |
 
 Two that are easy to get wrong: **`tail` streams** — it has to *reach* the end but only
 has to *hold* N lines, so a ring of N costs what the flag asks for. **`head` need not

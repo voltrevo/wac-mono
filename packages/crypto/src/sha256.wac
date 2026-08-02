@@ -74,35 +74,111 @@ export u8[] sha256(u8[] msg) {
   u32 h4 = 0x510e527f; u32 h5 = 0x9b05688c;
   u32 h6 = 0x1f83d9ab; u32 h7 = 0x5be0cd19;
 
-  u32[] w = u32[64]();
-
-  for (i32 b = 0; b < blocks; b++) {
-    i32 off = b * 64;
-
-    // The block's 16 big-endian words, then the schedule extension.
-    for (i32 t = 0; t < 16; t++) { w[t] = beWord32(m, off + t * 4); }
-    for (i32 t = 16; t < 64; t++) {
-      w[t] = smallSigma1(w[t - 2]) + w[t - 7] + smallSigma0(w[t - 15]) + w[t - 16];
-    }
-
-    u32 a = h0; u32 b1 = h1; u32 c = h2; u32 d = h3;
-    u32 e = h4; u32 f = h5; u32 g = h6; u32 h = h7;
-
-    for (i32 t = 0; t < 64; t++) {
-      u32 t1 = h + bigSigma1(e) + ch(e, f, g) + K[t] + w[t];
-      u32 t2 = bigSigma0(a) + maj(a, b1, c);
-      h = g; g = f; f = e;
-      e = d + t1;
-      d = c; c = b1; b1 = a;
-      a = t1 + t2;
-    }
-
-    h0 += a; h1 += b1; h2 += c; h3 += d;
-    h4 += e; h5 += f; h6 += g; h7 += h;
-  }
-
   u32[] hs = u32[](h0, h1, h2, h3, h4, h5, h6, h7);
+  u32[] w = u32[64]();
+  for (i32 b = 0; b < blocks; b++) { compressBlock(hs, m, b * 64, w); }
+
   u8[] out = u8[32]();
   for (i32 i = 0; i < 8; i++) { storeBE32(hs[i], out, i * 4); }
   return out;
+}
+
+/**
+ * One 64-byte block, folded into `hs` in place.
+ *
+ * `w` is passed in rather than allocated here because a streaming hash calls this once
+ * per block and the schedule is the only scratch it needs — allocating 64 words per block
+ * of a 300MB file is the difference between a hash and a garbage collector benchmark.
+ */
+void compressBlock(u32[] hs, u8[] m, i32 off, u32[] w) {
+  for (i32 t = 0; t < 16; t++) { w[t] = beWord32(m, off + t * 4); }
+  for (i32 t = 16; t < 64; t++) {
+    w[t] = smallSigma1(w[t - 2]) + w[t - 7] + smallSigma0(w[t - 15]) + w[t - 16];
+  }
+
+  u32 a = hs[0]; u32 b1 = hs[1]; u32 c = hs[2]; u32 d = hs[3];
+  u32 e = hs[4]; u32 f = hs[5]; u32 g = hs[6]; u32 h = hs[7];
+
+  for (i32 t = 0; t < 64; t++) {
+    u32 t1 = h + bigSigma1(e) + ch(e, f, g) + K[t] + w[t];
+    u32 t2 = bigSigma0(a) + maj(a, b1, c);
+    h = g; g = f; f = e;
+    e = d + t1;
+    d = c; c = b1; b1 = a;
+    a = t1 + t2;
+  }
+
+  hs[0] += a; hs[1] += b1; hs[2] += c; hs[3] += d;
+  hs[4] += e; hs[5] += f; hs[6] += g; hs[7] += h;
+}
+
+/**
+ * SHA-256 over input that arrives a piece at a time.
+ *
+ * The same digest as `sha256`, without holding the message. Every hash has this shape
+ * underneath — the one-shot form is padding plus a loop over blocks — and exposing it is
+ * what lets a program hash something larger than memory.
+ *
+ * `update` may be called with any sizes: bytes that do not complete a block are held in
+ * `block` until the next call brings enough, which is the whole of the bookkeeping.
+ */
+export struct Sha256 {
+  u32[] hs;       // the eight chaining words
+  u8[] block;     // input not yet forming a whole 64-byte block
+  i32 filled;     // how much of `block` is real
+  i64 total;      // every byte seen, for the length field in the padding
+  u32[] w;        // the message schedule, reused across blocks
+
+  Sha256 create() {
+    return Sha256(
+      u32[](0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19),
+      u8[64](), 0, 0, u32[64]());
+  }
+
+  void update(this, u8[] data) {
+    this.total += data.len() as i64;
+    i32 at = 0;
+
+    // Top up a partial block first, so the fast path below is whole blocks only.
+    if (this.filled > 0) {
+      i32 want = 64 - this.filled;
+      i32 take = data.len() < want ? data.len() : want;
+      this.block.copyFrom(data, 0, this.filled, take);
+      this.filled = this.filled + take;
+      at = take;
+      if (this.filled < 64) { return; }
+      compressBlock(this.hs, this.block, 0, this.w);
+      this.filled = 0;
+    }
+
+    // Whole blocks straight out of the caller's array, with no copy.
+    while (data.len() - at >= 64) {
+      compressBlock(this.hs, data, at, this.w);
+      at = at + 64;
+    }
+
+    i32 rest = data.len() - at;
+    if (rest > 0) {
+      this.block.copyFrom(data, at, 0, rest);
+      this.filled = rest;
+    }
+  }
+
+  /** The digest. The state is spent afterwards and must not be updated again. */
+  u8[] finish(this) {
+    // The padding, which is the only part that needs the total length: a 0x80 byte, then
+    // zeros, then the bit count big-endian, landing on a block boundary.
+    i32 pad = this.filled < 56 ? 56 - this.filled : 120 - this.filled;
+    u8[] tail = u8[pad + 8]();
+    tail[0] = 0x80;
+    // `as@`, not `as!`: the bit count is a count, and reinterpreting is exactly right
+    // where clamping at i64 max would silently hash the wrong length.
+    storeBE64((this.total * 8) as@ u64, tail, pad);
+    this.update(tail);
+
+    u8[] out = u8[32]();
+    for (i32 i = 0; i < 8; i++) { storeBE32(this.hs[i], out, i * 4); }
+    return out;
+  }
 }

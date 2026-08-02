@@ -1,15 +1,26 @@
 // The digest, then two spaces and the name — `-` for standard input, as the real one does.
+//
+// Streams, since `packages/crypto` grew `Sha256.create/update/finish`. It was the last
+// applet in this package that buffered for want of an API rather than by nature.
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, readInput } from "../lib/input.wac";
+import { Input, openStream } from "../lib/input.wac";
 import { encode as hexencode } from "../../../codec/src/hex.wac";
-import { sha256 } from "../../../crypto/src/sha256.wac";
+import { Sha256 } from "../../../crypto/src/sha256.wac";
 
 export i32 sha256sum(Core core, Cli cli, Args a) {
-  Input in = readInput(core, cli, a, 0);
+  Input in = openStream(core, cli, a, 0);
   if (!in.ok) { return 1; }
+
+  Sha256 h = Sha256.create();
+  while (true) {
+    u8[] chunk = cli.readChunk();
+    if (chunk.len() == 0) { break; }
+    h.update(chunk);
+  }
+
   string name = in.label == "" ? "-" : in.label;
-  core.log(string.fromBytes(hexencode(sha256(in.bytes))) + "  " + name);
+  core.log(string.fromBytes(hexencode(h.finish())) + "  " + name);
   return 0;
 }
