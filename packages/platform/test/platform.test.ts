@@ -5,7 +5,7 @@
 // tests are what makes that a measurement — `readFile` really is `await Deno.readFile`,
 // and the wac side really does call it as a function.
 
-import { runApp } from "../host/launch.ts";
+import { buildApp, type Grants } from "../build.ts";
 import { denoWorld } from "../host/deno.ts";
 import { newBridge } from "../host/layout.ts";
 import { serveHostCalls } from "../host/respond.ts";
@@ -23,63 +23,71 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
   }
 }
 
-/** Collect what the application logged instead of letting it reach the console. */
-function collector() {
-  const out: string[] = [];
-  const err: string[] = [];
-  return { out, err, log: (l: string) => out.push(l), warn: (l: string) => err.push(l) };
+/**
+ * Build the application and run it, which is what `deno task app` does and what ships.
+ *
+ * These tests used to call a `runApp` that compiled and spawned a worker by a route of
+ * its own — a second launcher and a second worker, green while the real artifact was
+ * broken. There is one path now, so this is slower and means something.
+ */
+async function runBuilt(
+  args: string[],
+  grants: Grants = {},
+  env: Record<string, string> = {},
+): Promise<{ code: number; out: string[]; err: string[] }> {
+  const built = await Deno.makeTempFile({ prefix: "wac-test-" });
+  try {
+    await buildApp(WC, built, grants);
+    const r = new Deno.Command(built, { args, env, stdout: "piped", stderr: "piped" }).outputSync();
+    const lines = (b: Uint8Array) =>
+      new TextDecoder().decode(b).split("\n").filter((l) => l.length > 0);
+    return { code: r.code, out: lines(r.stdout), err: lines(r.stderr) };
+  } finally {
+    await Deno.remove(built);
+  }
 }
 
 Deno.test("an application written entirely in wac runs, and agrees with wc", async () => {
-  const c = collector();
-  const code = await runApp(WC, { args: [WC], fs: { read: true }, log: c.log, warn: c.warn });
-  assertEquals(code, 0);
-  // Checked against the system `wc` when this was written: 76 455 2588.
-  const [lines, words, bytes] = c.out[0].split(/\s+/);
+  const r = await runBuilt([WC], { read: true });
+  assertEquals(r.code, 0, r.err.join("\n"));
+  const [lines, words, bytes] = r.out[0].split(/\s+/);
   const text = await Deno.readTextFile(WC);
   assertEquals(Number(bytes), new TextEncoder().encode(text).length, "bytes");
   assertEquals(Number(lines), text.split("\n").length - 1, "lines");
   assertEquals(Number(words), text.split(/\s+/).filter((w) => w.length > 0).length, "words");
 });
 
-Deno.test("a capability the host withholds is a failure the application can report", async () => {
-  // No `fs` option at all, so the world has no filesystem. The application gets an
+Deno.test("a capability the build withholds is a failure the application can report", async () => {
+  // Built with no grants, so the world has no filesystem. The application gets an
   // ordinary failed FileResult rather than an exception, and decides what to do.
-  const c = collector();
-  const code = await runApp(WC, { args: [WC], log: c.log, warn: c.warn });
-  assertEquals(code, 1, "the application reported failure");
-  assertEquals(c.err.length, 1);
-  assertEquals(c.err[0].includes("not granted"), true, `got: ${c.err[0]}`);
-  assertEquals(c.out.length, 0, "and printed no counts");
+  const r = await runBuilt([WC]);
+  assertEquals(r.code, 1, "the application reported failure");
+  assertEquals(r.err.length, 1);
+  assertEquals(r.err[0].includes("not granted"), true, `got: ${r.err[0]}`);
+  assertEquals(r.out.length, 0, "and printed no counts");
 });
 
 Deno.test("a missing file reaches the application as its host's message", async () => {
-  const c = collector();
-  const code = await runApp(WC, { args: ["no/such/file"], fs: { read: true }, log: c.log, warn: c.warn });
-  assertEquals(code, 1);
-  assertEquals(c.err[0].includes("no/such/file"), true, `got: ${c.err[0]}`);
+  const r = await runBuilt(["no/such/file"], { read: true });
+  assertEquals(r.code, 1);
+  assertEquals(r.err[0].includes("no/such/file"), true, `got: ${r.err[0]}`);
 });
 
 Deno.test("an application with no arguments says how to be used", async () => {
-  const c = collector();
-  assertEquals(await runApp(WC, { args: [], log: c.log, warn: c.warn }), 2);
-  assertEquals(c.err[0], "usage: wc <file>");
+  const r = await runBuilt([]);
+  assertEquals(r.code, 2);
+  assertEquals(r.err[0], "usage: wc <file>");
 });
 
 Deno.test("env distinguishes unset from empty", async () => {
-  const c = collector();
-  await runApp(WC, {
-    args: [WC], fs: { read: true }, log: c.log, warn: c.warn,
-    env: (n) => (n === "WC_VERBOSE" ? "" : undefined),
-  });
   // An empty value is still *set*, so the timing line appears. A nullable string is what
   // makes the difference expressible at all — it is why `string?` had to cross.
-  assertEquals(c.out.length, 2, `expected the timing line, got ${JSON.stringify(c.out)}`);
-  assertEquals(c.out[1].startsWith("counted in "), true);
+  const set = await runBuilt([WC], { read: true, env: true }, { WC_VERBOSE: "" });
+  assertEquals(set.out.length, 2, `expected the timing line, got ${JSON.stringify(set.out)}`);
+  assertEquals(set.out[1].startsWith("counted in "), true);
 
-  const c2 = collector();
-  await runApp(WC, { args: [WC], fs: { read: true }, log: c2.log, warn: c2.warn });
-  assertEquals(c2.out.length, 1, "unset means absent");
+  const unset = await runBuilt([WC], { read: true, env: true });
+  assertEquals(unset.out.length, 1, "unset means absent");
 });
 
 // ── The bridge itself ─────────────────────────────────────────────────────────

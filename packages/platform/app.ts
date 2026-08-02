@@ -1,30 +1,57 @@
-// Run a wac application from the command line.
+// Build a wac application and run it, in one step.
 //
-//   deno task app <entry.wac> [--allow-read] [--allow-write] [--allow-env] [-- args...]
+//   deno task app <entry.wac> [--allow-read] [--allow-write] [--allow-env]
+//                             [--target deno|node] [-- args...]
 //
-// Permissions are named here rather than inherited, because the capability world is the
-// point: an application gets a filesystem only if this command line says so, and the
-// application cannot tell a withheld capability from a broken one.
+// This *builds* and executes the real artifact rather than running the application by a
+// shortcut of its own. That is the point: a dev loop that exercises a different runtime
+// from the one that ships is a dev loop that can be green while the product is broken —
+// and this package had exactly that, two launchers and two workers, until a change to the
+// application contract had to be made twice.
+//
+// The build costs a few hundred milliseconds. Worth it to be running the thing itself.
 
-import { runApp } from "./host/launch.ts";
+import { buildApp, type Grants, type Target } from "./build.ts";
 
 const argv = [...Deno.args];
 const sep = argv.indexOf("--");
 const flags = sep < 0 ? argv : argv.slice(0, sep);
 const appArgs = sep < 0 ? [] : argv.slice(sep + 1);
 
-const entry = flags.find((a) => !a.startsWith("-"));
+// The value after `--target` is not the entry. `indexOf` returns -1 when the flag is
+// absent, and -1 + 1 is 0 — which excluded the entry itself.
+const targetAt = flags.indexOf("--target");
+const entry = flags.find((a, i) => !a.startsWith("-") && !(targetAt >= 0 && i === targetAt + 1));
 if (entry === undefined) {
   console.error(
-    "usage: deno task app <entry.wac> [--allow-read] [--allow-write] [--allow-env] [-- args...]",
+    "usage: deno task app <entry.wac> [--allow-read] [--allow-write] [--allow-env]\n" +
+      "                    [--target deno|node] [-- args...]",
   );
   Deno.exit(2);
 }
 
-const has = (f: string) => flags.includes(f);
-const code = await runApp(entry, {
-  args: appArgs,
-  fs: { read: has("--allow-read"), write: has("--allow-write") },
-  env: has("--allow-env") ? (n) => Deno.env.get(n) : undefined,
-});
-Deno.exit(code);
+const grants: Grants = {
+  read: flags.includes("--allow-read"),
+  write: flags.includes("--allow-write"),
+  env: flags.includes("--allow-env"),
+};
+const target = (targetAt >= 0 ? flags[targetAt + 1] : "deno") as Target;
+if (target !== "deno" && target !== "node") {
+  console.error(`unknown target '${target}' — deno or node`);
+  Deno.exit(2);
+}
+
+const built = await Deno.makeTempFile({ prefix: "wac-app-" });
+try {
+  await buildApp(entry, built, grants, target);
+  // Inherited, not piped: the application's output is the point, and `outputSync`
+  // would swallow it.
+  const stdio = { stdout: "inherit", stderr: "inherit", stdin: "inherit" } as const;
+  const cmd = target === "node"
+    ? new Deno.Command("node", { args: [built, ...appArgs], ...stdio })
+    : new Deno.Command(built, { args: appArgs, ...stdio });
+  const { code } = cmd.outputSync();
+  Deno.exit(code);
+} finally {
+  await Deno.remove(built).catch(() => {});
+}
