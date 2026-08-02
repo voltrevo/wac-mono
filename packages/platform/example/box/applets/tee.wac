@@ -1,0 +1,16 @@
+// Standard input to standard output *and* a file — two destinations, which is the point.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args } from "../lib/args.wac";
+
+export i32 tee(Core core, Cli cli, Args a) {
+  u8[] data = cli.readStdin();
+  cli.write(data);
+  for (i32 i = 0; i < a.rest.len(); i++) {
+    if (!cli.writeFile(a.rest[i], data)) {
+      core.warn("box: " + a.rest[i] + ": cannot write");
+      return 1;
+    }
+  }
+  return 0;
+}

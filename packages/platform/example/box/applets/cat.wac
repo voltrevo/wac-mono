@@ -1,0 +1,12 @@
+// Bytes through, unchanged.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+
+export i32 cat(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  cli.write(in.bytes);
+  return 0;
+}

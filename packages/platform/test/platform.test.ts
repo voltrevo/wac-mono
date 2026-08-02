@@ -376,7 +376,7 @@ Deno.test("stat and readDir reach the application, and are gated", async () => {
 
 // ── box: many applets in one program ──────────────────────────────────────────
 
-const BOX = "packages/platform/example/box.wac";
+const BOX = "packages/platform/example/box/box.wac";
 
 Deno.test("box's applets agree with the system tools they imitate", async () => {
   // The widest test of the world so far, and a differential one: every applet here is
@@ -509,7 +509,7 @@ Deno.test("box's write-path applets: cp and tee", async () => {
   const dst = await Deno.makeTempFile({ prefix: "wac-box-dst-" });
   try {
     await buildApp(BOX, built, { read: true, write: true });
-    const src = "packages/platform/example/box.wac";
+    const src = "packages/platform/example/box/box.wac";
 
     const cp = new Deno.Command(built, { args: ["cp", src, dst], stderr: "piped" }).outputSync();
     assertEquals(cp.code, 0, new TextDecoder().decode(cp.stderr));

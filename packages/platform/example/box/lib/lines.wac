@@ -1,0 +1,72 @@
+// Splitting, joining, comparing and sorting lines — what most applets are made of.
+
+import { slice } from "./bytes.wac";
+
+/** Split into lines, dropping the empty one a trailing newline would produce. */
+export u8[][] splitLines(u8[] data) {
+  i32 n = 0;
+  for (i32 i = 0; i < data.len(); i++) { if (data[i] == '\n') { n++; } }
+  if (data.len() > 0 && data[data.len() - 1] != '\n') { n++; }
+  u8[][] out = u8[][n](fill: u8[0]());
+  i32 at = 0;
+  i32 start = 0;
+  for (i32 i = 0; i <= data.len(); i++) {
+    bool end = i == data.len() || data[i] == '\n';
+    if (!end) { continue; }
+    if (i == data.len() && i == start) { break; }
+    out[at] = slice(data, start, i);
+    at++;
+    start = i + 1;
+  }
+  return out;
+}
+
+/** The first `count` of `lines`, each followed by a newline. */
+export u8[] joinLines(u8[][] lines, i32 count) {
+  i32 total = 0;
+  for (i32 i = 0; i < count; i++) { total = total + lines[i].len() + 1; }
+  u8[] out = u8[total](fill: '\n');
+  i32 at = 0;
+  for (i32 i = 0; i < count; i++) {
+    out.copyFrom(lines[i], 0, at, lines[i].len());
+    at = at + lines[i].len() + 1;
+  }
+  return out;
+}
+
+/** Byte order, as `sort` uses by default. Negative, zero or positive. */
+export i32 cmpBytes(u8[] a, u8[] b) {
+  i32 n = a.len() < b.len() ? a.len() : b.len();
+  for (i32 i = 0; i < n; i++) {
+    i32 x = a[i];
+    i32 y = b[i];
+    if (x != y) { return x < y ? -1 : 1; }
+  }
+  if (a.len() == b.len()) { return 0; }
+  return a.len() < b.len() ? -1 : 1;
+}
+
+/**
+ * Merge sort, because an insertion sort looks fine on a fixture and takes minutes on a
+ * real file. Stable, which `sort -u` then relies on to drop only adjacent equals.
+ */
+export u8[][] mergeSort(u8[][] xs, i32 n) {
+  if (n <= 1) { return xs; }
+  i32 mid = n / 2;
+  i32 right = n - mid;
+  u8[][] l = u8[][mid](fill: u8[0]());
+  u8[][] r = u8[][right](fill: u8[0]());
+  for (i32 i = 0; i < mid; i++) { l[i] = xs[i]; }
+  for (i32 i = 0; i < right; i++) { r[i] = xs[mid + i]; }
+  u8[][] ls = mergeSort(l, mid);
+  u8[][] rs = mergeSort(r, right);
+
+  u8[][] out = u8[][n](fill: u8[0]());
+  i32 li = 0;
+  i32 ri = 0;
+  for (i32 i = 0; i < n; i++) {
+    bool takeLeft = ri >= right || (li < mid && cmpBytes(ls[li], rs[ri]) <= 0);
+    if (takeLeft) { out[i] = ls[li]; li++; } else { out[i] = rs[ri]; ri++; }
+  }
+  return out;
+}
