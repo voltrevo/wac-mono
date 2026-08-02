@@ -79,6 +79,36 @@ config, a wasm module, a native executable, Tor directory data, and something al
 in all three languages and lose on binaries and on Tor's directory data. Already-compressed input
 does not expand.
 
+### Speed
+
+`deno task bench:zstd-speed`. Each side times itself, so neither figure includes the cost of
+getting the data to the other process — but ours does include copying across the wasm boundary,
+which a caller genuinely pays.
+
+| | ours | zstd -3 | gzip -6 |
+|---|---:|---:|---:|
+| compress, source | 15-19 MB/s | 210-300 MB/s | 57-67 MB/s |
+| compress, tor microdescs | 33 MB/s | 798 MB/s | 70 MB/s |
+| decompress, source | 105-133 MB/s | 483-1080 MB/s | 362-637 MB/s |
+| decompress, tor microdescs | 168 MB/s | 2481 MB/s | 380 MB/s |
+
+**Compressing, 13-26x slower than `zstd -3` and 3-5x slower than `gzip -6`. Decompressing, 5-15x
+slower than zstd and 3-4x slower than gzip.** This is not like for like — zstd is native code
+with two decades of tuning — but the gap is larger than that alone explains, and both halves have
+a known cause.
+
+*Compressing*, the time is in the match search, and it is doing useful work: cutting the chain
+from 32 candidates to 4 makes source 64% faster and 12% bigger, and makes the Tor
+microdescriptors both **slower and 2x bigger**, because short matches mean more sequences to
+code. The other candidate is cheaper than it looks — building both codings per block and keeping
+the smaller costs 15% of the time and buys 22-29% of ratio, which is the best trade in the
+package.
+
+*Decompressing*, the cause is written into `fse.wac` as a deliberate deferral: the bitstream
+reader takes **one bit at a time**. A Huffman symbol needs an 11-bit lookahead, so every literal
+costs eleven loop iterations where a windowed reader would cost one shift and one mask. That is
+the single biggest decode lever and it is a contained change — the reader is one struct.
+
 ### The whole of the Tor bootstrap data
 
 The corpus takes 2 MB slices to stay quick. The full files, which is where an encoder bug was
