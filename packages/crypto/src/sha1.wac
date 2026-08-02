@@ -1,0 +1,165 @@
+// SHA-1, because Tor still needs it.
+//
+// Nothing should choose SHA-1 today: collisions are practical — SHAttered produced two
+// PDFs with one digest in 2017, and the cost has only fallen since. It is here because the
+// Tor relay cell protocol specifies it for the running digest that authenticates a
+// stream's cells, and a client that wants to talk to the network implements what the
+// network speaks.
+//
+// The digest is not load-bearing against a collision attacker in that role: it is a
+// per-circuit running hash keyed by material from the ntor handshake, checked by a party
+// who already shares the key. An attacker who could pick both messages already has the
+// key. That is an argument for why Tor has not urgently replaced it, not an argument that
+// SHA-1 is fine.
+//
+// ## The shape, and where implementations go wrong
+//
+// A 64-byte block, five 32-bit words of state, eighty rounds. The message schedule extends
+// sixteen input words to eighty by xoring four earlier words and rotating left one — that
+// rotate is the only difference between SHA-1 and SHA-0, and omitting it produces a hash
+// that is self-consistent, passes every round trip, and matches nothing.
+//
+// The padding is the other place: a 0x80 byte, zeros, then the length in *bits* as a
+// 64-bit big-endian count. A message 56 bytes into a block leaves no room for that count
+// and needs a whole extra block, which is the length every implementation gets wrong once.
+
+import { beWord32, storeBE32 } from "./layout.wac";
+
+u32 rotl(u32 x, u32 n) { return (x << n) | (x >> (32 - n)); }
+
+/**
+ * The round function and constant, which change every twenty rounds.
+ *
+ * Returned together because they change together; splitting them into two functions
+ * indexed by the same round number is two chances to get the boundary wrong.
+ */
+u32 mix(i32 round, u32 b, u32 c, u32 d) {
+  if (round < 20) { return (b & c) | (~b & d); }
+  if (round < 40) { return b ^ c ^ d; }
+  if (round < 60) { return (b & c) | (b & d) | (c & d); }
+  return b ^ c ^ d;
+}
+
+/**
+ * The four round constants, in decimal and not by choice.
+ *
+ * `0x5A827999` is fine and `0x8F1BBCDC` is not: a hex literal in [2^31, 2^32) is
+ * sign-extended when the target is wider, so three of these four arrive negative and the
+ * cast to u32 traps (wac issue 0054). The same workaround as fieldp.wac's prime — decimal
+ * takes the expected type correctly. 1518500249 is 0x5A827999.
+ */
+u32 roundConst(i32 round) {
+  if (round < 20) { return 1518500249 as! u32; }
+  if (round < 40) { return 1859775393 as! u32; }
+  if (round < 60) { return 2400959708 as! u32; }
+  return 3395469782 as! u32;
+}
+
+/** Compress one 64-byte block into the five-word state, in place. */
+void block(u32[] h, u8[] chunk, i32 at) {
+  u32[] w = u32[80]();
+  for (i32 i = 0; i < 16; i++) { w[i] = beWord32(chunk, at + i * 4); }
+  // The rotate is what makes this SHA-1 rather than SHA-0. Without it every test that
+  // compares the implementation against itself still passes.
+  for (i32 i = 16; i < 80; i++) {
+    w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1 as! u32);
+  }
+
+  u32 a = h[0];
+  u32 b = h[1];
+  u32 c = h[2];
+  u32 d = h[3];
+  u32 e = h[4];
+  for (i32 i = 0; i < 80; i++) {
+    u32 t = rotl(a, 5 as! u32) + mix(i, b, c, d) + e + roundConst(i) + w[i];
+    e = d;
+    d = c;
+    c = rotl(b, 30 as! u32);
+    b = a;
+    a = t;
+  }
+  h[0] += a;
+  h[1] += b;
+  h[2] += c;
+  h[3] += d;
+  h[4] += e;
+}
+
+/**
+ * A SHA-1 that can be fed in pieces.
+ *
+ * Tor needs this rather than a one-shot: the relay cell digest is a *running* hash over
+ * every cell sent on a circuit in one direction, and each cell's digest field carries the
+ * first four bytes of the hash so far. So the state has to survive between cells, and the
+ * digest has to be readable without ending the stream — `peek` clones the state rather
+ * than finalising it, which a one-shot API cannot express at all.
+ */
+export struct Sha1 {
+  u32[] h;
+  u8[] buf;
+  i32 pending;
+  i64 total;
+
+  Sha1 create() {
+    // Decimal for the same reason as the round constants — see roundConst. 1732584193 is
+    // 0x67452301, and the four after it are the rest of FIPS 180-4's initial state.
+    u32[] h = u32[5]();
+    h[0] = 1732584193 as! u32;
+    h[1] = 4023233417 as! u32;
+    h[2] = 2562383102 as! u32;
+    h[3] = 271733878 as! u32;
+    h[4] = 3285377520 as! u32;
+    return Sha1(h, u8[64](), 0, 0);
+  }
+
+  void update(this, u8[] data) {
+    for (i32 i = 0; i < data.len(); i++) {
+      this.buf[this.pending] = data[i];
+      this.pending++;
+      if (this.pending == 64) {
+        block(this.h, this.buf, 0);
+        this.pending = 0;
+      }
+    }
+    this.total += data.len() as i64;
+  }
+
+  /** The digest of everything so far, leaving this able to continue. */
+  u8[] peek(const this) {
+    Sha1 copy = Sha1(u32[5](), u8[64](), this.pending, this.total);
+    for (i32 i = 0; i < 5; i++) { copy.h[i] = this.h[i]; }
+    for (i32 i = 0; i < 64; i++) { copy.buf[i] = this.buf[i]; }
+    return copy.finish();
+  }
+
+  /** The digest, consuming the state. */
+  u8[] finish(this) {
+    i64 bits = this.total * 8;
+    this.buf[this.pending] = 0x80;
+    this.pending++;
+    // A message with 56 or more bytes in its final block leaves no room for the eight-byte
+    // length, so the count goes into a block of its own. This is the length that gets
+    // written wrong once in every implementation.
+    if (this.pending > 56) {
+      for (i32 i = this.pending; i < 64; i++) { this.buf[i] = 0; }
+      block(this.h, this.buf, 0);
+      this.pending = 0;
+    }
+    for (i32 i = this.pending; i < 56; i++) { this.buf[i] = 0; }
+    for (i32 i = 0; i < 8; i++) {
+      this.buf[56 + i] = ((bits >> (((7 - i) * 8) as i64)) & 255) as! i32;
+    }
+    block(this.h, this.buf, 0);
+
+    u8[] out = u8[20]();
+    for (i32 i = 0; i < 5; i++) { storeBE32(this.h[i], out, i * 4); }
+    return out;
+  }
+}
+
+/** The one-shot form, for everything that is not a running digest. */
+export u8[] sha1(u8[] msg) {
+  Sha1 s = Sha1.create();
+  s.update(msg);
+  return s.finish();
+}

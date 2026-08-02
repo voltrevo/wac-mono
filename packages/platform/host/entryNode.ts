@@ -13,6 +13,13 @@
 // — see `node.ts`.
 
 import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
+import { type NodeListener, type NodeSock } from "./node.ts";
+
+/** Supplied by the generated launcher, which is where `node:net` can be imported. */
+export type NodeNet = {
+  connect(host: string, port: number): Promise<NodeSock>;
+  listen(port: number): Promise<NodeListener>;
+};
 import { serveHostCalls } from "./respond.ts";
 import { nodeWorld } from "./node.ts";
 import { cliOf, coreOf } from "./provider.ts";
@@ -82,9 +89,22 @@ export async function runLauncherNode(
   },
   workerSource: string,
   grants: Grants = {},
+  net?: NodeNet,
 ): Promise<void> {
   let stdinIter: AsyncIterator<Uint8Array> | null = null;
   const io = {
+    // Node's `net` is event-based; this is the adapter that gives it the promise shape
+    // `nodeWorld` expects. Incoming data is queued rather than dropped, because a `recv`
+    // that has not been called yet must not lose bytes the peer has already sent — and a
+    // waiter is parked only when the queue is empty.
+    connect: (host: string, port: number) => {
+      if (net === undefined) throw new Error("network access not granted to this application");
+      return net.connect(host, port);
+    },
+    listen: (port: number) => {
+      if (net === undefined) throw new Error("network access not granted to this application");
+      return net.listen(port);
+    },
     readStdin: async (): Promise<Uint8Array> => {
       const parts: Uint8Array[] = [];
       for await (const c of proc.stdin) parts.push(c);
@@ -131,6 +151,7 @@ export async function runLauncherNode(
   const responder = serveHostCalls(bridge, nodeWorld(fs, proc, io, {
     args: proc.argv.slice(2),
     fs: { read: grants.read === true, write: grants.write === true },
+    net: grants.net === true,
     env: grants.env === true ? (n) => proc.env[n] : undefined,
   }));
 

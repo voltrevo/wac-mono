@@ -3,23 +3,26 @@
 //   box grep -i wac README.md
 //   cat README.md | box sort -u | box wc -l
 //   box gzip data | box gunzip | box sha256sum
+//   box serve -8080
 //
 // This file is the dispatcher and nothing else. One applet per file under `applets/`, so
 // finding one takes no thought: it is `applets/<name>.wac`, always. The shared parts —
-// argument parsing, line splitting, byte and number helpers — are under `lib/`.
+// argument parsing, line splitting, byte and number helpers, the line reader, the atomic
+// write — are under `lib/`.
 //
 // The imports below are the table of contents. wac has no re-export, so this is the one
 // place that has to know every applet exists, which is the right place for it.
 //
-// Several applets are thin: `gzip`, `sha256sum`, `date` and `urlencode` are a few lines
-// over a package from this monorepo. That is the point of them — they show that a library
-// written for TypeScript bindings needs no changes to become the inside of a program.
+// Many of these are a few lines over a package from this monorepo: `gzip`, `zstd`, `json`,
+// `sha256sum`, `date`, `serve` and `get` are all thin. That is the point of them — those
+// packages were written to be called from TypeScript through bindgen and needed no change
+// at all to become the inside of a program.
 //
 // **A multicall binary weakens the permission story**, and that is worth saying rather
 // than hiding. `box`'s grants are the *union* of what its applets need, so running `box
-// echo` carries the filesystem access `box cp` would want. One applet per file means each
-// could also be built alone, with only what it needs; this exists to exercise the world,
-// not because one binary with this many entry points is the better shape.
+// echo` carries the filesystem *and network* access `box cp` and `box get` would want. One
+// applet per file means each could also be built alone, with only what it needs — `bin/`
+// does exactly that for four of them, and measures what it saves.
 
 import { Cli, Core } from "../../platform/src/platform.wac";
 import { Args, parseArgs } from "./lib/args.wac";
@@ -37,22 +40,29 @@ import { du } from "./applets/du.wac";
 import { echo } from "./applets/echo.wac";
 import { find } from "./applets/find.wac";
 import { fold } from "./applets/fold.wac";
+import { get } from "./applets/get.wac";
 import { grep } from "./applets/grep.wac";
 import { gunzip } from "./applets/gunzip.wac";
 import { gzip } from "./applets/gzip.wac";
 import { head } from "./applets/head.wac";
 import { hex } from "./applets/hex.wac";
+import { json } from "./applets/json.wac";
 import { ls } from "./applets/ls.wac";
 import { mkdir } from "./applets/mkdir.wac";
 import { mv } from "./applets/mv.wac";
 import { nl } from "./applets/nl.wac";
+import { paste } from "./applets/paste.wac";
 import { rev } from "./applets/rev.wac";
 import { rm } from "./applets/rm.wac";
 import { rmdir } from "./applets/rmdir.wac";
 import { seq } from "./applets/seq.wac";
+import { serve } from "./applets/serve.wac";
 import { sha256sum } from "./applets/sha256sum.wac";
 import { sha512sum } from "./applets/sha512sum.wac";
+import { shuf } from "./applets/shuf.wac";
 import { sort } from "./applets/sort.wac";
+import { sponge } from "./applets/sponge.wac";
+import { stat } from "./applets/stat.wac";
 import { strings } from "./applets/strings.wac";
 import { tac } from "./applets/tac.wac";
 import { tail } from "./applets/tail.wac";
@@ -60,9 +70,13 @@ import { tee } from "./applets/tee.wac";
 import { touch } from "./applets/touch.wac";
 import { tr } from "./applets/tr.wac";
 import { uniq } from "./applets/uniq.wac";
+import { unzstd } from "./applets/unzstd.wac";
 import { urldecode } from "./applets/urldecode.wac";
 import { urlencode } from "./applets/urlencode.wac";
+import { uuid } from "./applets/uuid.wac";
 import { wc } from "./applets/wc.wac";
+import { yes } from "./applets/yes.wac";
+import { zstd } from "./applets/zstd.wac";
 
 export i32 main(Core core, Cli cli) {
   if (cli.argCount() < 1) { return usage(core); }
@@ -82,23 +96,30 @@ export i32 main(Core core, Cli cli) {
   if (applet == "echo")      { return echo(core, cli, a); }
   if (applet == "find")      { return find(core, cli, a); }
   if (applet == "fold")      { return fold(core, cli, a); }
+  if (applet == "get")       { return get(core, cli, a); }
   if (applet == "grep")      { return grep(core, cli, a); }
   if (applet == "gunzip")    { return gunzip(core, cli, a); }
   if (applet == "gzip")      { return gzip(core, cli, a); }
   if (applet == "head")      { return head(core, cli, a); }
   if (applet == "help")      { return usage(core); }
   if (applet == "hex")       { return hex(core, cli, a); }
+  if (applet == "json")      { return json(core, cli, a); }
   if (applet == "ls")        { return ls(core, cli, a); }
   if (applet == "mkdir")     { return mkdir(core, cli, a); }
   if (applet == "mv")        { return mv(core, cli, a); }
   if (applet == "nl")        { return nl(core, cli, a); }
+  if (applet == "paste")     { return paste(core, cli, a); }
   if (applet == "rev")       { return rev(core, cli, a); }
   if (applet == "rm")        { return rm(core, cli, a); }
   if (applet == "rmdir")     { return rmdir(core, cli, a); }
   if (applet == "seq")       { return seq(core, cli, a); }
+  if (applet == "serve")     { return serve(core, cli, a); }
   if (applet == "sha256sum") { return sha256sum(core, cli, a); }
   if (applet == "sha512sum") { return sha512sum(core, cli, a); }
+  if (applet == "shuf")      { return shuf(core, cli, a); }
   if (applet == "sort")      { return sort(core, cli, a); }
+  if (applet == "sponge")    { return sponge(core, cli, a); }
+  if (applet == "stat")      { return stat(core, cli, a); }
   if (applet == "strings")   { return strings(core, cli, a); }
   if (applet == "tac")       { return tac(core, cli, a); }
   if (applet == "tail")      { return tail(core, cli, a); }
@@ -106,9 +127,13 @@ export i32 main(Core core, Cli cli) {
   if (applet == "touch")     { return touch(core, cli, a); }
   if (applet == "tr")        { return tr(core, cli, a); }
   if (applet == "uniq")      { return uniq(core, cli, a); }
+  if (applet == "unzstd")    { return unzstd(core, cli, a); }
   if (applet == "urldecode") { return urldecode(core, cli, a); }
   if (applet == "urlencode") { return urlencode(core, cli, a); }
+  if (applet == "uuid")      { return uuid(core, cli, a); }
   if (applet == "wc")        { return wc(core, cli, a); }
+  if (applet == "yes")       { return yes(core, cli, a); }
+  if (applet == "zstd")      { return zstd(core, cli, a); }
 
   // `true` and `false` have no body: the dispatcher returning a constant *is* the whole
   // applet, and a file containing one `return` would be ceremony rather than clarity.
@@ -121,11 +146,12 @@ export i32 main(Core core, Cli cli) {
 
 i32 usage(Core core) {
   core.warn("usage: box <applet> [-flags] [args]");
-  core.warn("  base32 base64 basename cat cp crc32 cut date dirname du echo false fold");
-  core.warn("  find grep gunzip gzip head hex ls mkdir mv nl rev rm rmdir seq sha256sum");
-  core.warn("  sha512sum sort strings tac tail tee touch tr true uniq urldecode");
-  core.warn("  urlencode wc");
-  core.warn("flags: grep -ivnc   sort -ru   uniq -c   wc -lwc   head/tail/fold/strings -N");
-  core.warn("       cut -f<n> -d<c>   tr <set1> <set2>   mkdir -p   rm -rf");
+  core.warn("  base32 base64 basename cat cp crc32 cut date dirname du echo false find");
+  core.warn("  fold get grep gunzip gzip head hex json ls mkdir mv nl paste rev rm rmdir");
+  core.warn("  seq serve sha256sum sha512sum shuf sort sponge stat strings tac tail tee");
+  core.warn("  touch tr true uniq unzstd urldecode urlencode uuid wc yes zstd");
+  core.warn("flags: grep -ivnc   sort -ru   uniq -c   wc -lwc   head/tail/fold -N");
+  core.warn("       cut -f<n> -d<c>   tr <set1> <set2>   mkdir -p   rm -rf   json -c");
+  core.warn("net:   get <host> [path] [-<port>] [-i]   serve [-<port>] [-o]");
   return 2;
 }

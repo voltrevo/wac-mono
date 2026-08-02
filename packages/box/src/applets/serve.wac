@@ -1,0 +1,55 @@
+// An HTTP server. `box serve -8080`, or port 8080 by default.
+//
+// `packages/server`'s `serve(input, now)` is a pure state machine — bytes in, a response
+// and a consumed count out — which is exactly the shape a socket wants and is why this
+// applet is thirty lines. Nothing in that package knows a socket exists.
+//
+// **One connection at a time**, because the world has no `poll`: `accept` blocks, then
+// the connection is served to its end before the next is taken. That is the honest limit
+// of a synchronous capability world and it is written here rather than hidden.
+
+import { Cli, Core, Socket } from "../../../platform/src/platform.wac";
+import { Args, has } from "../lib/args.wac";
+import { itoa } from "../lib/num.wac";
+import { concat, slice } from "../lib/bytes.wac";
+import { Served, serve as handle } from "../../../server/src/serve.wac";
+
+export i32 serve(Core core, Cli cli, Args a) {
+  i32 port = a.num == 0 ? 8080 : a.num;
+  Socket l = cli.listen(port);
+  if (l.handle < 0) { core.warn(a.name + ": " + itoa(port) + ": " + l.error); return 1; }
+  core.warn(a.name + ": listening on port " + itoa(port));
+
+  // `-o` serves one connection and exits, which is what the tests use and what makes this
+  // runnable without something to stop it. Not `-1`: a leading digit is how this argument
+  // parser spells a number, so `serve -8080 -1` set the port to 1.
+  bool once = has(a, 'o');
+  while (true) {
+    Socket c = cli.accept(l.handle);
+    if (c.handle < 0) { core.warn(a.name + ": accept: " + c.error); break; }
+    connection(core, cli, c.handle);
+    cli.closeSocket(c.handle);
+    if (once) { break; }
+  }
+  cli.closeSocket(l.handle);
+  return 0;
+}
+
+/** One connection, to its end: read, answer, repeat while it wants to be kept alive. */
+void connection(Core core, Cli cli, i32 sock) {
+  u8[] buffered = u8[0]();
+  while (true) {
+    Served s = handle(buffered, core.nowMillis());
+    if (!s.ready) {
+      // Not a whole request yet. More bytes, or the peer has gone.
+      u8[] chunk = cli.recv(sock);
+      if (chunk.len() == 0) { return; }
+      buffered = concat(buffered, chunk);
+      continue;
+    }
+    if (!cli.send(sock, s.response)) { return; }
+    if (!s.keepAlive) { return; }
+    // Whatever the client pipelined after this request stays in the buffer.
+    buffered = slice(buffered, s.consumed, buffered.len());
+  }
+}

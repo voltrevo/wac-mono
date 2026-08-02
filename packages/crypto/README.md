@@ -226,6 +226,23 @@ A caller checking for the all-zero shared secret, as RFC 7748 §6.1 permits, get
 low-order point multiplies to the identity and encodes as zero. This package does not
 reject those itself, because whether that is an error depends on the protocol above.
 
+## SHA-1
+
+`src/sha1.wac`. Nothing should choose it: collisions are practical, and have been since
+SHAttered in 2017. It is here because Tor's relay cell protocol specifies it for the
+running digest that authenticates a circuit's cells, and a client that wants to talk to
+the network implements what the network speaks.
+
+The interface is incremental rather than one-shot, and that is the point of it. Tor's
+digest is a *running* hash over every cell sent in one direction, with each cell carrying
+the first four bytes of the hash so far — so the state survives between cells and has to be
+readable without ending the stream. `peek` clones and finalises a copy; an implementation
+that finalised in place would give a correct first answer and rubbish after it.
+
+Three of its four round constants are written in decimal, for the same reason as the
+NIST primes: a hex literal in [2^31, 2^32) is sign-extended when the target is wider, so
+`0x8F1BBCDC as! u32` traps while `0x5A827999` is fine (wac issue 0054).
+
 ## Status
 
 | Piece | Spec | State |
