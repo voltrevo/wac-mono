@@ -22,7 +22,7 @@ import {
   Hop, encryptRelay, decryptRelay, relayRecognized, relayCommand, relayStreamId,
   relayPayload, relayData, relayDataLen, beginBody, relayBegin,
   hopInit, hopSend, hopRecv, hopStateLen, hopWrap, hopPeel, hopCheck,
-  extend2Body, extended2Reply,
+  extend2Body, extended2Reply, sendmeBodyV1, hopDigest,
 } from "../../src/relay.wac";
 
 /** The same key material as seen from the other end of the circuit. */
@@ -365,5 +365,61 @@ export string test_three_layers_of_onion_go_on_and_come_off() {
     t.isTrue(relayRecognized(r3, atR3), "hop 3 does, on round " + itoa64(round as i64));
     t.eqBytes(relayPayload(atR3), data, "and reads the data");
   }
+  return t.report();
+}
+
+export string test_a_sendme_body_carries_the_running_digest() {
+  // Version 1: VERSION | DATA_LEN | digest. The layout is fixed by tor-spec §7.3.1, and a
+  // relay that disagrees with one byte of it tears the circuit down — which is exactly what
+  // a real tor relay did when this was tried with the digest deliberately flipped.
+  T t = T.create();
+  u8[] d = u8[20]();
+  for (i32 i = 0; i < 20; i++) { d[i] = 0x40 + i; }
+  u8[] b = sendmeBodyV1(d);
+  t.eqI32(b.len(), 23, "one version byte, two length bytes, twenty of digest");
+  t.eqI32(b[0], 1, "version 1");
+  t.eqI32((b[1] << 8) | b[2], 20, "the length, big-endian");
+  t.eqBytes(relayPayloadOf(b, 3, 23), d, "and the digest itself");
+  return t.report();
+}
+
+export string test_the_sendme_digest_is_the_running_hash_at_that_moment() {
+  // The value that authenticates a SENDME. It must be the digest *as it stands* — a peek,
+  // not a fresh hash of the last cell — because that is the only thing a party who did not
+  // receive the whole stream cannot compute.
+  T t = T.create();
+  u8[] m = material(31);
+  u8[] client = hopInit(m);
+  Hop relay = Hop.create(swapDirections(m));
+
+  u8[] previous = hopDigest(client, false);
+  for (i32 i = 0; i < 5; i++) {
+    // The relay sends; we receive. Our backward digest must track theirs cell for cell.
+    u8[] wire = encryptRelay(relay, relayData(), 1, fill(60 + i, i));
+    u8[] r = hopRecv(client, wire);
+    client = relayPayloadOf(r, 0, hopStateLen());
+    t.eqI32(r[hopStateLen()], 1, "cell " + itoa64(i as i64) + " recognised");
+
+    u8[] now = hopDigest(client, false);
+    t.eqI32(now.len(), 20, "twenty bytes, the whole hash and not the cell's four");
+    bool moved = false;
+    for (i32 j = 0; j < 20; j++) {
+      if (now[j] != previous[j]) { moved = true; }
+    }
+    t.isTrue(moved, "the digest advanced with cell " + itoa64(i as i64));
+    previous = now;
+  }
+
+  // And reading it does not disturb it: two peeks in a row agree, or the next SENDME would
+  // carry a value the far end never computed.
+  t.eqBytes(hopDigest(client, false), hopDigest(client, false), "peeking twice agrees");
+  // The two directions are separate hashes.
+  bool sameBoth = true;
+  u8[] f = hopDigest(client, true);
+  u8[] bk = hopDigest(client, false);
+  for (i32 i = 0; i < 20; i++) {
+    if (f[i] != bk[i]) { sameBoth = false; }
+  }
+  t.isTrue(!sameBoth, "forward and backward digests are not the same hash");
   return t.report();
 }

@@ -1,0 +1,182 @@
+// Consensus verification.
+//
+// The oracle for the signatures is node's RSA, reached through a callback: the host makes a
+// keypair and signs a bare digest under PKCS#1 v1.5 padding, which is the unusual shape Tor
+// uses — no DER DigestInfo, just the hash. `crypto.privateEncrypt` produces exactly that,
+// so this is a differential against an implementation that has never seen our code.
+//
+// It matters that it is a real oracle here more than almost anywhere else in the repo. A
+// signature check that always returns true passes every positive test ever written; the
+// tests below therefore spend most of their assertions on what must be *refused*.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  signedLength, signedDigest, keyFingerprint, rsaModulus, rsaExponent, signatureMatches,
+} from "../../src/consensus.wac";
+import { sha1 } from "../../../crypto/src/sha1.wac";
+import { sha256 } from "../../../crypto/src/sha256.wac";
+
+u8[] cat(u8[] a, u8[] b) {
+  u8[] o = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { o[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { o[a.len() + i] = b[i]; }
+  return o;
+}
+
+u8[] copyOf(u8[] s) {
+  u8[] o = u8[s.len()]();
+  for (i32 i = 0; i < s.len(); i++) { o[i] = s[i]; }
+  return o;
+}
+
+export string test_the_signed_portion_ends_at_the_token() {
+  // The boundary is "up to and including the string directory-signature ", trailing space
+  // and all. One byte either side and every signature on every consensus fails.
+  T t = T.create();
+  u8[] doc = "network-status-version 3\nvalid-after x\ndirectory-signature sha256 AAAA\nsig\n".toBytes();
+  i32 n = signedLength(doc);
+  t.eqI32(n, 59, "the offset just past the token");
+  // Spelled out: the last byte of the signed portion is the space, and the next is 's'.
+  t.eqI32(doc[n - 1], ' ', "the signed portion ends with the token's trailing space");
+  t.eqI32(doc[n - 21], '\n', "and begins its match at the preceding newline");
+
+  t.eqI32(signedLength("no signatures here at all\n".toBytes()), -1,
+          "a document with no signature block");
+
+  // The leading newline is required, so the token appearing mid-line is not a boundary.
+  u8[] tricky = "network-status-version 3\nr xdirectory-signature notreally\ndirectory-signature sha256 A\n".toBytes();
+  i32 m = signedLength(tricky);
+  t.eqI32(tricky[m - 1], ' ', "matched a real line start, not the text inside one");
+  t.isTrue(m > 60, "and it is the second occurrence, not the embedded first");
+  return t.report();
+}
+
+export string test_the_digest_covers_the_signed_portion_only() {
+  T t = T.create();
+  u8[] head = "network-status-version 3\nbody\ndirectory-signature ".toBytes();
+  u8[] docA = cat(head, "sha256 AAAA\n-----BEGIN SIGNATURE-----\nxx\n".toBytes());
+  u8[] docB = cat(head, "sha256 BBBB\n-----BEGIN SIGNATURE-----\nyy\n".toBytes());
+  // Different signature blocks, identical signed portion: the digests must agree, or a
+  // consensus could not carry more than one signature.
+  t.eqBytes(signedDigest(docA, false), signedDigest(docB, false),
+            "what follows the token does not change the digest");
+  t.eqBytes(signedDigest(docA, false), sha1(head), "and it is the sha1 of exactly the head");
+  t.eqBytes(signedDigest(docA, true), sha256(head), "sha256 when the flavour says so");
+
+  // But a change inside the signed portion must change it.
+  u8[] altered = cat("network-status-version 3\nBODY\ndirectory-signature ".toBytes(),
+                     "sha256 AAAA\n".toBytes());
+  u8[] d1 = signedDigest(docA, false);
+  u8[] d2 = signedDigest(altered, false);
+  bool equal = true;
+  for (i32 i = 0; i < 20; i++) {
+    if (d1[i] != d2[i]) { equal = false; }
+  }
+  t.isTrue(!equal, "a change in the body changes the digest");
+  return t.report();
+}
+
+export string test_a_public_key_is_read_out_of_its_der(fn[u8[](i32)] keyPart) {
+  // keyPart(0) is a DER RSAPublicKey, (1) its modulus, (2) its exponent — the host takes
+  // them apart with node's own parser, so agreement is not this code checking itself.
+  T t = T.create();
+  u8[] der = keyPart(0);
+  t.eqBytes(rsaModulus(der), keyPart(1), "the modulus");
+  t.eqBytes(rsaExponent(der), keyPart(2), "the exponent");
+  t.eqI32(rsaModulus(der).len(), 256, "a 2048-bit modulus, with DER's sign byte dropped");
+  return t.report();
+}
+
+export string test_a_genuine_signature_verifies(fn[u8[](i32)] keyPart, fn[u8[](u8[])] sign) {
+  // sign(digest) is node's `privateEncrypt` with PKCS#1 v1.5 padding over the bare bytes —
+  // Tor's shape exactly, with no DigestInfo.
+  T t = T.create();
+  u8[] der = keyPart(0);
+  u8[] n = rsaModulus(der);
+  u8[] e = rsaExponent(der);
+
+  for (i32 i = 0; i < 6; i++) {
+    u8[] msg = u8[40 + i]();
+    for (i32 j = 0; j < msg.len(); j++) { msg[j] = (j * 17 + i) & 0xFF; }
+    u8[] d = sha1(msg);
+    t.isTrue(signatureMatches(n, e, d, sign(d)), "signature " + itoa64(i as i64) + " verifies");
+  }
+  // And a sha256 digest, since the consensus uses those.
+  u8[] d32 = sha256("network-status-version 3\n".toBytes());
+  t.isTrue(signatureMatches(n, e, d32, sign(d32)), "a sha256 digest verifies too");
+  return t.report();
+}
+
+export string test_everything_that_must_be_refused(fn[u8[](i32)] keyPart, fn[u8[](u8[])] sign) {
+  // The half that matters. A verifier that returns true unconditionally passes every test
+  // above this one.
+  T t = T.create();
+  u8[] der = keyPart(0);
+  u8[] n = rsaModulus(der);
+  u8[] e = rsaExponent(der);
+  u8[] digest = sha1("the message that was signed".toBytes());
+  u8[] sig = sign(digest);
+  t.isTrue(signatureMatches(n, e, digest, sig), "the control verifies");
+
+  // A different digest under the same signature.
+  u8[] other = sha1("a message that was not signed".toBytes());
+  t.isTrue(!signatureMatches(n, e, other, sig), "a different digest is refused");
+
+  // Every single-bit change to the digest.
+  for (i32 i = 0; i < 20; i++) {
+    u8[] d = copyOf(digest);
+    d[i] = d[i] ^ 1;
+    t.isTrue(!signatureMatches(n, e, d, sig),
+             "digest byte " + itoa64(i as i64) + " flipped is refused");
+  }
+  // Every single-byte change to the signature.
+  for (i32 i = 0; i < 256; i += 17) {
+    u8[] s = copyOf(sig);
+    s[i] = s[i] ^ 0x80;
+    t.isTrue(!signatureMatches(n, e, digest, s),
+             "signature byte " + itoa64(i as i64) + " flipped is refused");
+  }
+
+  // A truncated or over-long signature, which must not be padded or cut to fit.
+  u8[] short_ = u8[255]();
+  for (i32 i = 0; i < 255; i++) { short_[i] = sig[i]; }
+  t.isTrue(!signatureMatches(n, e, digest, short_), "a short signature is refused");
+  u8[] long_ = cat(sig, u8[1]());
+  t.isTrue(!signatureMatches(n, e, digest, long_), "an over-long signature is refused");
+
+  // A prefix of the digest must not satisfy it: the comparison is on the whole payload.
+  u8[] prefix = u8[10]();
+  for (i32 i = 0; i < 10; i++) { prefix[i] = digest[i]; }
+  t.isTrue(!signatureMatches(n, e, prefix, sig), "a prefix of the digest is refused");
+
+  // An all-zero signature, which is the value an attacker reaches for first.
+  t.isTrue(!signatureMatches(n, e, digest, u8[256]()), "an all-zero signature is refused");
+  return t.report();
+}
+
+export string test_a_signature_from_the_wrong_key_is_refused(
+  fn[u8[](i32)] keyPart, fn[u8[](u8[])] sign, fn[u8[](i32)] otherKeyPart
+) {
+  // The check that makes the whole chain mean anything: a signature is only evidence about
+  // the key it was made with. A verifier that ignored the key would accept this.
+  T t = T.create();
+  u8[] digest = sha1("a consensus".toBytes());
+  u8[] sig = sign(digest);
+  t.isTrue(signatureMatches(rsaModulus(keyPart(0)), rsaExponent(keyPart(0)), digest, sig),
+           "the control verifies under its own key");
+  t.isTrue(!signatureMatches(rsaModulus(otherKeyPart(0)), rsaExponent(otherKeyPart(0)),
+                             digest, sig),
+           "and is refused under a different key of the same size");
+  return t.report();
+}
+
+export string test_a_fingerprint_is_the_sha1_of_the_key(fn[u8[](i32)] keyPart) {
+  // The value a client hardcodes. It is the SHA-1 of the DER, not of the PEM and not of the
+  // modulus alone — hashing the wrong thing gives an authority set that matches nobody.
+  T t = T.create();
+  u8[] der = keyPart(0);
+  t.eqBytes(keyFingerprint(der), sha1(der), "the fingerprint is sha1 over the whole DER");
+  t.eqI32(keyFingerprint(der).len(), 20, "twenty bytes");
+  return t.report();
+}

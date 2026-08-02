@@ -6,7 +6,8 @@
 // that vector were the one it hard-coded. These check the dependencies.
 
 import { T } from "../../../wactest/src/assert.wac";
-import { sha256 } from "../../src/sha256.wac";
+import { Sha256, sha256 } from "../../src/sha256.wac";
+import { Sha512, sha384, sha512 } from "../../src/sha512.wac";
 import { hmacSha256 } from "../../src/hmac.wac";
 import { chacha20 } from "../../src/chacha20.wac";
 import { hkdf } from "../../src/hkdf.wac";
@@ -24,6 +25,105 @@ u8[] filled(i32 n, i32 v) {
   u8[] b = u8[n]();
   for (i32 i = 0; i < n; i++) { b[i] = v; }
   return b;
+}
+
+/**
+ * The streaming form must agree with the one-shot for *every* split, not just a tidy one.
+ *
+ * The bookkeeping that can go wrong is all at the boundaries: a chunk that lands exactly
+ * on 64 bytes, one that leaves a partial block, one smaller than what is already buffered,
+ * and a final block with too little room for the length field. So this walks every split
+ * point of a message long enough to cross several blocks, rather than picking three.
+ */
+export string test_sha256_streaming_matches_oneshot() {
+  T t = T.create();
+  u8[] msg = u8[200]();
+  for (i32 i = 0; i < 200; i++) { msg[i] = (i * 37 + 11) & 0xFF; }
+  u8[] want = sha256(msg);
+
+  for (i32 cut = 0; cut <= 200; cut++) {
+    Sha256 h = Sha256.create();
+    h.update(slice(msg, 0, cut));
+    h.update(slice(msg, cut, 200));
+    if (diffCount(h.finish(), want) != 0) {
+      t.fail("a two-part update disagreed with the one-shot");
+      return t.report();
+    }
+  }
+
+  // Byte at a time, which exercises the partial-block path on every single call.
+  Sha256 one = Sha256.create();
+  for (i32 i = 0; i < 200; i++) { one.update(slice(msg, i, i + 1)); }
+  if (diffCount(one.finish(), want) != 0) { t.fail("byte-at-a-time disagreed"); }
+
+  // The empty message, and a message that is exactly one block.
+  if (diffCount(Sha256.create().finish(), sha256(u8[0]())) != 0) { t.fail("empty disagreed"); }
+  Sha256 exact = Sha256.create();
+  exact.update(slice(msg, 0, 64));
+  if (diffCount(exact.finish(), sha256(slice(msg, 0, 64))) != 0) { t.fail("64 bytes disagreed"); }
+
+  // 55 and 56 bytes straddle the point where the length field no longer fits in the
+  // final block, which is the one padding case that needs a whole extra block.
+  for (i32 n = 54; n <= 57; n++) {
+    Sha256 e = Sha256.create();
+    e.update(slice(msg, 0, n));
+    if (diffCount(e.finish(), sha256(slice(msg, 0, n))) != 0) {
+      t.fail("padding boundary disagreed");
+    }
+  }
+  return t.report();
+}
+
+u8[] slice(u8[] a, i32 lo, i32 hi) {
+  u8[] out = u8[hi - lo]();
+  for (i32 i = lo; i < hi; i++) { out[i - lo] = a[i]; }
+  return out;
+}
+
+/**
+ * The same treatment for SHA-512, whose block is 128 bytes and whose padding reserves
+ * sixteen for the length rather than eight — so its boundaries are in different places
+ * and a test that only checked SHA-256's would have said nothing about them.
+ */
+export string test_sha512_streaming_matches_oneshot() {
+  T t = T.create();
+  u8[] msg = u8[400]();
+  for (i32 i = 0; i < 400; i++) { msg[i] = (i * 53 + 7) & 0xFF; }
+  u8[] want = sha512(msg);
+
+  for (i32 cut = 0; cut <= 400; cut++) {
+    Sha512 h = Sha512.create();
+    h.update(slice(msg, 0, cut));
+    h.update(slice(msg, cut, 400));
+    if (diffCount(h.digest(64), want) != 0) {
+      t.fail("a two-part update disagreed with the one-shot");
+      return t.report();
+    }
+  }
+
+  Sha512 one = Sha512.create();
+  for (i32 i = 0; i < 400; i++) { one.update(slice(msg, i, i + 1)); }
+  if (diffCount(one.digest(64), want) != 0) { t.fail("byte-at-a-time disagreed"); }
+
+  if (diffCount(Sha512.create().digest(64), sha512(u8[0]())) != 0) { t.fail("empty disagreed"); }
+
+  // 111 and 112 straddle the point where the 16-byte length field no longer fits in the
+  // final block — the one padding case needing a whole extra block, and 128 is the exact
+  // block boundary either side of it.
+  for (i32 n = 110; n <= 130; n++) {
+    Sha512 e = Sha512.create();
+    e.update(slice(msg, 0, n));
+    if (diffCount(e.digest(64), sha512(slice(msg, 0, n))) != 0) {
+      t.fail("padding boundary disagreed");
+      return t.report();
+    }
+  }
+
+  // SHA-384 is the same computation from different starting words, truncated.
+  Sha512 short = Sha512.create384();
+  short.update(msg);
+  if (diffCount(short.digest(48), sha384(msg)) != 0) { t.fail("sha384 disagreed"); }
+  return t.report();
 }
 
 export string test_sha256_avalanche() {

@@ -381,3 +381,34 @@ export u8[] extended2Reply(u8[] data) {
   for (i32 i = 0; i < len; i++) { out[i] = data[2 + i]; }
   return out;
 }
+
+/**
+ * The current value of a hop's running digest, without disturbing it.
+ *
+ * Authenticated SENDMEs need this. A circuit-level SENDME carries the digest of the cell it
+ * acknowledges, so a relay cannot speed the sender up by inventing credit it never earned —
+ * only someone who actually received the cells knows the running hash at that point.
+ *
+ * The full twenty bytes, not the four that go in a cell's digest field: tor takes the whole
+ * hash here and truncates to twenty because that is the whole hash.
+ */
+export u8[] hopDigest(u8[] state, bool forward) {
+  Hop h = hopLoad(state);
+  return forward ? h.forwardDigest.peek() : h.backwardDigest.peek();
+}
+
+/**
+ * A version-1 SENDME body: VERSION (1) | DATA_LEN (2) | the digest.
+ *
+ * Version 0 is an empty body and is what stream-level SENDMEs still use — there is nothing
+ * to authenticate there, since a stream's credit is bounded by its circuit's.
+ */
+export u8[] sendmeBodyV1(u8[] digest) {
+  if (digest.len() != 20) { trap; }
+  u8[] out = u8[23]();
+  out[0] = 1;
+  out[1] = 0;
+  out[2] = 20;
+  for (i32 i = 0; i < 20; i++) { out[3 + i] = digest[i]; }
+  return out;
+}

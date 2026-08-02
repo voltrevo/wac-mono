@@ -1,0 +1,104 @@
+// A tar archive, to standard output. `box tar dir | box gzip > x.tgz`.
+//
+// The widest thing here: `readDir` and `stat` to walk a tree, `readFile` per entry, and
+// `write` to stream the result — and GNU `tar` can read what it produces, so the test is
+// against the real format rather than against a round trip with itself.
+//
+// **ustar**, the POSIX.1-1988 format: a 512-byte header per entry, the contents padded to
+// a multiple of 512, and two zero blocks at the end. Everything in the header is ASCII,
+// mostly octal, which is why this is short enough to be worth writing out.
+//
+// What it does not do: symbolic links, permissions beyond a fixed mode, ownership, or
+// names longer than 100 bytes. Each of those is refused rather than truncated — a tar
+// that quietly writes half a path is worse than one that says it cannot.
+
+import { Cli, Core, FileResult, Stat } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { itoa64 } from "../lib/num.wac";
+
+export i32 tar(Core core, Cli cli, Args a) {
+  if (a.rest.len() < 1) { core.warn("usage: " + a.name + " <path>..."); return 2; }
+  i32 code = 0;
+  for (i32 i = 0; i < a.rest.len(); i++) {
+    if (!add(core, cli, a.rest[i], a.name)) { code = 1; }
+  }
+  // Two zero blocks end the archive. Without them GNU tar reads the stream fine and then
+  // says "unexpected EOF", which is the sort of thing a round trip with itself misses.
+  cli.write(u8[1024](fill: 0));
+  return code;
+}
+
+/** One path, and everything under it if it is a directory. */
+bool add(Core core, Cli cli, string path, string name) {
+  Stat st = cli.stat(path);
+  if (!st.exists) { core.warn(name + ": " + path + ": not found"); return false; }
+
+  if (st.isDir) {
+    // The directory's own entry first, so an empty one survives the round trip.
+    cli.write(header(path + "/", 0, st.modifiedMillis, '5'));
+    string[]? names = cli.readDir(path);
+    if (names is null) { core.warn(name + ": " + path + ": cannot list"); return false; }
+    string[] found = names!;
+    bool ok = true;
+    for (i32 i = 0; i < found.len(); i++) {
+      if (!add(core, cli, path + "/" + found[i], name)) { ok = false; }
+    }
+    return ok;
+  }
+
+  FileResult f = cli.readFile(path);
+  if (!f.ok) { core.warn(name + ": " + path + ": " + f.error); return false; }
+  cli.write(header(path, f.bytes.len(), st.modifiedMillis, '0'));
+  cli.write(f.bytes);
+  // Pad the contents to a block. A file that is already a multiple gets nothing, which is
+  // why this is a remainder and not an unconditional block.
+  i32 rest = f.bytes.len() % 512;
+  if (rest != 0) { cli.write(u8[512 - rest](fill: 0)); }
+  return true;
+}
+
+/**
+ * The 512-byte ustar header.
+ *
+ * The checksum is the fiddly part and the reason this is worth a comment: it is the sum
+ * of every byte of the header *with the checksum field itself read as eight spaces*, so
+ * the field has to be filled with spaces, summed, and only then overwritten.
+ */
+u8[] header(string path, i32 size, i64 mtimeMillis, i32 kind) {
+  u8[] name = path.toBytes();
+  u8[] h = u8[512](fill: 0);
+  for (i32 i = 0; i < name.len() && i < 100; i++) { h[i] = name[i]; }
+
+  putOctal(h, 100, 8, 493);                       // mode: 0755
+  putOctal(h, 108, 8, 0);                         // uid
+  putOctal(h, 116, 8, 0);                         // gid
+  putOctal(h, 124, 12, size);
+  putOctal(h, 136, 12, (mtimeMillis / 1000) as~ i32);
+  h[156] = kind;                                  // '0' a file, '5' a directory
+
+  // "ustar" and version "00", which is what makes it the POSIX format rather than the
+  // older one every extractor still has to guess at.
+  u8[] magic = "ustar".toBytes();
+  for (i32 i = 0; i < 5; i++) { h[257 + i] = magic[i]; }
+  h[263] = '0';
+  h[264] = '0';
+
+  for (i32 i = 148; i < 156; i++) { h[i] = ' '; }
+  i32 sum = 0;
+  for (i32 i = 0; i < 512; i++) { sum = sum + h[i]; }
+  // Six octal digits, a NUL, then a space — the one field that is not simply left-padded.
+  putOctal(h, 148, 7, sum);
+  h[154] = 0;
+  h[155] = ' ';
+  return h;
+}
+
+/** `width - 1` octal digits, zero-padded, then a NUL. */
+void putOctal(u8[] h, i32 at, i32 width, i32 v) {
+  i32 n = v;
+  for (i32 i = width - 2; i >= 0; i--) {
+    h[at + i] = '0' + (n % 8);
+    n = n / 8;
+  }
+  h[at + width - 1] = 0;
+}

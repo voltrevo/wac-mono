@@ -1,0 +1,18 @@
+// Consensus verification at the host boundary. The parsing lives in host/verify.ts; every
+// cryptographic decision is behind these calls.
+import {
+  signedLength as sl, signedDigest as sd, keyFingerprint as kf,
+  rsaModulus as rm, rsaExponent as rx, signatureMatches as sm,
+  verifyDocumentSignature as vds, verifyKeyCertification as vkc,
+} from "../../src/consensus.wac";
+
+export i32 signedLength(u8[] doc) { return sl(doc); }
+export u8[] signedDigest(u8[] doc, bool s256) { return sd(doc, s256); }
+export u8[] keyFingerprint(u8[] der) { return kf(der); }
+export u8[] rsaModulus(u8[] der) { return rm(der); }
+export u8[] rsaExponent(u8[] der) { return rx(der); }
+export bool signatureMatches(u8[] n, u8[] e, u8[] d, u8[] s) { return sm(n, e, d, s); }
+export bool verifyDocumentSignature(u8[] doc, bool s256, u8[] key, u8[] sig) {
+  return vds(doc, s256, key, sig);
+}
+export bool verifyKeyCertification(u8[] cert, u8[] id, u8[] sig) { return vkc(cert, id, sig); }

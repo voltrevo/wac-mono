@@ -78,30 +78,98 @@ u64[] compress(u8[] msg, u64[] iv) {
   u64[] h = u64[8]();
   for (i32 i = 0; i < 8; i++) { h[i] = iv[i]; }
   u64[] w = u64[80]();
-
-  for (i32 b = 0; b < blocks; b++) {
-    i32 off = b * 128;
-    for (i32 t = 0; t < 16; t++) { w[t] = beWord64(m, off + t * 8); }
-    for (i32 t = 16; t < 80; t++) {
-      w[t] = smallSigma1(w[t - 2]) + w[t - 7] + smallSigma0(w[t - 15]) + w[t - 16];
-    }
-
-    u64 a = h[0]; u64 b1 = h[1]; u64 c = h[2]; u64 d = h[3];
-    u64 e = h[4]; u64 f = h[5]; u64 g = h[6]; u64 hh = h[7];
-
-    for (i32 t = 0; t < 80; t++) {
-      u64 t1 = hh + bigSigma1(e) + ch(e, f, g) + K[t] + w[t];
-      u64 t2 = bigSigma0(a) + maj(a, b1, c);
-      hh = g; g = f; f = e;
-      e = d + t1;
-      d = c; c = b1; b1 = a;
-      a = t1 + t2;
-    }
-
-    h[0] += a; h[1] += b1; h[2] += c; h[3] += d;
-    h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
-  }
+  for (i32 b = 0; b < blocks; b++) { compressBlock(h, m, b * 128, w); }
   return h;
+}
+
+/**
+ * One 128-byte block, folded into `h` in place.
+ *
+ * `w` is passed in rather than allocated here: a streaming hash calls this once per block,
+ * and eighty 64-bit words per block of a large file is a garbage collector benchmark
+ * rather than a hash.
+ */
+void compressBlock(u64[] h, u8[] m, i32 off, u64[] w) {
+  for (i32 t = 0; t < 16; t++) { w[t] = beWord64(m, off + t * 8); }
+  for (i32 t = 16; t < 80; t++) {
+    w[t] = smallSigma1(w[t - 2]) + w[t - 7] + smallSigma0(w[t - 15]) + w[t - 16];
+  }
+
+  u64 a = h[0]; u64 b1 = h[1]; u64 c = h[2]; u64 d = h[3];
+  u64 e = h[4]; u64 f = h[5]; u64 g = h[6]; u64 hh = h[7];
+
+  for (i32 t = 0; t < 80; t++) {
+    u64 t1 = hh + bigSigma1(e) + ch(e, f, g) + K[t] + w[t];
+    u64 t2 = bigSigma0(a) + maj(a, b1, c);
+    hh = g; g = f; f = e;
+    e = d + t1;
+    d = c; c = b1; b1 = a;
+    a = t1 + t2;
+  }
+
+  h[0] += a; h[1] += b1; h[2] += c; h[3] += d;
+  h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+}
+
+/**
+ * SHA-512 over input that arrives a piece at a time, and SHA-384 with it.
+ *
+ * The same shape as `Sha256`, over 128-byte blocks: the two differ only in the block
+ * size, the word width and where the length field goes. `digest(64)` is SHA-512 and
+ * `digest(48)` is SHA-384 — they are the same computation from different starting words,
+ * which is why the truncation is a parameter rather than a second struct.
+ */
+export struct Sha512 {
+  u64[] h;
+  u8[] block;     // input not yet forming a whole 128-byte block
+  i32 filled;
+  i64 total;
+  u64[] w;
+
+  Sha512 create() { return start(H512); }
+  Sha512 create384() { return start(H384); }
+
+  void update(this, u8[] data) {
+    this.total += data.len() as i64;
+    i32 at = 0;
+    if (this.filled > 0) {
+      i32 want = 128 - this.filled;
+      i32 take = data.len() < want ? data.len() : want;
+      this.block.copyFrom(data, 0, this.filled, take);
+      this.filled = this.filled + take;
+      at = take;
+      if (this.filled < 128) { return; }
+      compressBlock(this.h, this.block, 0, this.w);
+      this.filled = 0;
+    }
+    while (data.len() - at >= 128) {
+      compressBlock(this.h, data, at, this.w);
+      at = at + 128;
+    }
+    i32 rest = data.len() - at;
+    if (rest > 0) {
+      this.block.copyFrom(data, at, 0, rest);
+      this.filled = rest;
+    }
+  }
+
+  /** The digest, truncated to `bytes` — 64 for SHA-512, 48 for SHA-384. */
+  u8[] digest(this, i32 bytes) {
+    // The length field is 128 bits here, of which only the low 64 are ever non-zero, so
+    // the padding lands the total on a multiple of 128 with 16 bytes reserved for it.
+    i32 pad = this.filled < 112 ? 112 - this.filled : 240 - this.filled;
+    u8[] tail = u8[pad + 16]();
+    tail[0] = 0x80;
+    storeBE64((this.total * 8) as@ u64, tail, pad + 8);
+    this.update(tail);
+    return serialize(this.h, bytes);
+  }
+}
+
+Sha512 start(u64[] iv) {
+  u64[] h = u64[8]();
+  for (i32 i = 0; i < 8; i++) { h[i] = iv[i]; }
+  return Sha512(h, u8[128](), 0, 0, u64[80]());
 }
 
 /** Serialise the first `bytes` bytes of the state, big-endian. */

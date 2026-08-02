@@ -15,8 +15,7 @@ u64 prime4() { return 0x85EBCA77C2B2AE63; }
 u64 prime5() { return 0x27D4EB2F165667C5; }
 
 u64 rotl(u64 v, i32 n) {
-  u64 k = n as! u64;
-  return (v << k) | (v >> (64 as! u64 - k));
+  return (v << n) | (v >> (64 - n));
 }
 
 /** Fold one 64-bit word into an accumulator. */
@@ -37,7 +36,7 @@ u64 mergeRound(u64 acc, u64 val) {
 u64 read64(u8[] d, i32 at) {
   u64 v = 0;
   for (i32 i = 0; i < 8; i++) {
-    v = v | ((d[at + i] as! u64) << ((i * 8) as! u64));
+    v = v | ((d[at + i] as! u64) << (i * 8));
   }
   return v;
 }
@@ -46,7 +45,7 @@ u64 read64(u8[] d, i32 at) {
 u64 read32(u8[] d, i32 at) {
   u64 v = 0;
   for (i32 i = 0; i < 4; i++) {
-    v = v | ((d[at + i] as! u64) << ((i * 8) as! u64));
+    v = v | ((d[at + i] as! u64) << (i * 8));
   }
   return v;
 }
@@ -100,11 +99,11 @@ export u64 xxh64(u8[] d, i32 start, i32 len) {
   }
 
   // Avalanche: spread every input bit across the whole word.
-  acc = acc ^ (acc >> (33 as! u64));
+  acc = acc ^ (acc >> 33);
   acc = acc * prime2();
-  acc = acc ^ (acc >> (29 as! u64));
+  acc = acc ^ (acc >> 29);
   acc = acc * prime3();
-  acc = acc ^ (acc >> (32 as! u64));
+  acc = acc ^ (acc >> 32);
   return acc;
 }
 

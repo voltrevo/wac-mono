@@ -1,6 +1,6 @@
 # box — a busybox, written in wac
 
-Fifty-five applets in one program, chosen by the first argument. No TypeScript: `src/` is
+Fifty-seven applets in one program, chosen by the first argument. No TypeScript: `src/` is
 wac and the only thing outside it is the test suite.
 
 It exists to exercise `packages/platform`'s capability world more widely than a single
@@ -16,11 +16,11 @@ cat README.md | ./box sort -u | ./box wc -l
 ```
 
 ```
-base32 base64 basename cat cp crc32 cut date dirname du echo false find
+base32 base64 basename cat cp crc32 cut date diff dirname du echo false find
 fold get grep gunzip gzip head hex httpd json ls mkdir mv nl paste rev rm
 rmdir
 seq serve sha256sum sha512sum shuf sort split sponge stat strings tac tail
-tee touch tr true uniq unzstd urldecode urlencode uuid wc wget yes zstd
+tar tee touch tr true uniq unzstd urldecode urlencode uuid wc wget yes zstd
 ```
 
 111K, drawing on this repo's `crypto`, `codec`, `regex`, `gzip`, `datetime` and `url`
@@ -115,6 +115,26 @@ must watch standard input and a socket at once, and nothing here can.
 `-o` serves one connection and exits. Not `-1` — a leading digit is how this argument
 parser spells a number, so `serve -8080 -1` listened on port 1.
 
+## tar and diff
+
+```sh
+box tar dir | box gzip > x.tgz     # GNU tar can read it
+box diff old new                   # unified, byte-identical to diff -u
+```
+
+`tar` is the widest applet here — `readDir` and `stat` to walk a tree, `readFile` per
+entry, `write` to stream it out. It writes **ustar**, and the test extracts with GNU
+`tar` and compares the trees, rather than round-tripping with its own reader: a checksum
+that is wrong in a self-consistent way would pass the round trip and fail the real
+extractor. It does not do symlinks, permissions, ownership, or names over 100 bytes, and
+refuses each rather than truncating.
+
+`diff` is the only applet that is an algorithm rather than plumbing. Longest common
+subsequence, hunks with three lines of context, and the same exit status as the real one
+— 0 same, 1 different, 2 trouble. The LCS table is O(n·m) in *memory* as well as time, so
+it refuses a pair over 4000 lines rather than dying on it; Myers is what a real diff
+wants. Fourteen shapes are compared byte for byte against `diff -u`.
+
 ## sponge, and why the mutation tier exists
 
 ```sh
@@ -133,13 +153,12 @@ because "cannot stream" turned out to be wrong twice:
 
 | | applets | why |
 |---|---|---|
-| **Streams** | cat wc hex crc32 tr strings gzip gunzip head tail nl rev uniq grep cut fold cp | bounded by a chunk, a line, or a flag |
+| **Streams** | cat wc hex crc32 sha256sum sha512sum tr strings gzip gunzip head tail nl rev uniq grep cut fold cp split sponge | bounded by a chunk, a line, or a flag |
 | **Cannot** | sort tac | need every line before emitting the first |
 | **Cannot** | tee | two sinks at once, and the world has one current output |
-| **Could, given an API** | sha256sum sha512sum | `crypto` hashes a whole message; it wants `Start`/`Update`/`Finish`, which `crc32` already has |
 | **Could, given an API** | base64 base32 | `codec` encodes a whole array, including the padding, so a chunk cannot be encoded on its own |
-| **Cannot** | zstd unzstd | `packages/zstd` has no streaming form — a package limit, not the world's |
-| **Not worth it** | urlencode urldecode basename dirname date echo seq json stat uuid shuf paste sponge | the input is a line, or the job needs all of it anyway |
+| **Could, given an API** | zstd unzstd | `packages/zstd` has no streaming form — a package limit, not the world's, and the only row left |
+| **Not worth it** | urlencode urldecode basename dirname date echo seq json stat uuid shuf paste tar diff get wget serve httpd | the input is a line, or the job needs all of it anyway |
 
 Two that are easy to get wrong: **`tail` streams** — it has to *reach* the end but only
 has to *hold* N lines, so a ring of N costs what the flag asks for. **`head` need not
