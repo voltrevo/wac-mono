@@ -416,6 +416,39 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
       "wc counts differ",
     );
 
+    // Flags, which every applet gets from one shared parser.
+    for (const [args, cmd] of [
+      [["sort"], ["sort"]], [["sort", "-r"], ["sort", "-r"]], [["sort", "-u"], ["sort", "-u"]],
+      [["tac"], ["tac"]],
+    ] as [string[], string[]][]) {
+      assertEquals(
+        box([...args, fixture]).out,
+        sys(cmd[0], [...cmd.slice(1), fixture]),
+        `${args.join(" ")} differs`,
+      );
+    }
+    assertEquals(box(["head", "-3", fixture]).out, sys("head", ["-3", fixture]), "head -N");
+    assertEquals(box(["tail", "-n", "2", fixture]).out, sys("tail", ["-n", "2", fixture]), "tail -n N");
+    assertEquals(box(["wc", "-l", fixture]).out.trim(), sys("wc", ["-l", fixture]).trim().split(/\s+/)[0]);
+    assertEquals(
+      box(["sha512sum", fixture]).out.split(" ")[0],
+      sys("sha512sum", [fixture]).split(" ")[0],
+      "sha512sum differs",
+    );
+    assertEquals(box(["base32", fixture]).out, sys("base32", [fixture]), "base32 differs");
+
+    // grep, which brings the regex package in. Every flag against the real thing.
+    for (const args of [["grep", "an"], ["grep", "-i", "AN"], ["grep", "-v", "an"],
+                        ["grep", "-n", "an"], ["grep", "-c", "an"]]) {
+      assertEquals(
+        box([...args, fixture]).out,
+        sys("grep", [...args.slice(1), fixture]),
+        `${args.join(" ")} differs`,
+      );
+    }
+    assertEquals(box(["grep", "zzznope", fixture]).code, 1, "no match exits 1, as grep does");
+    assertEquals(box(["grep", "[", fixture]).code, 2, "a bad pattern is a usage error");
+
     assertEquals(box(["basename", "a/b/c.txt"]).out.trim(), "c.txt");
     assertEquals(box(["dirname", "a/b/c.txt"]).out.trim(), "a/b");
     assertEquals(box(["echo", "hello", "wac"]).out.trim(), "hello wac");
@@ -423,6 +456,18 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     assertEquals(box(["true"]).code, 0);
     assertEquals(box(["false"]).code, 1);
     assertEquals(box(["nope"]).code, 2, "an unknown applet is a usage error");
+
+    // The first applets that recurse, against the real tools over a nested tree.
+    assertEquals(
+      box(["find", "packages/platform/src"]).out.trim().split("\n").sort().join("\n"),
+      sys("find", ["packages/platform/src"]).trim().split("\n").sort().join("\n"),
+      "find differs",
+    );
+    assertEquals(
+      box(["du", "packages/platform/src"]).out.split("\t")[0],
+      sys("du", ["-sb", "packages/platform/src"]).split("\t")[0],
+      "du differs from du -sb",
+    );
 
     // head and tail against a file with more lines than they take.
     const many = await Deno.makeTempFile();
@@ -454,4 +499,59 @@ Deno.test("box works as a filter, and its applets need only what they use", asyn
   const denied = await runFilter(BOX, ["cat", "README.md"], new Uint8Array());
   assertEquals(denied.code, 1);
   assertEquals(denied.err.includes("not granted"), true, denied.err);
+});
+
+Deno.test("box's write-path applets: cp and tee", async () => {
+  // The first applets in `box` that write. `cp` needs no capability the world did not
+  // already have — it is `readFile` and `writeFile` — and `tee` is the first with two
+  // destinations at once.
+  const built = await Deno.makeTempFile({ prefix: "wac-box-w-" });
+  const dst = await Deno.makeTempFile({ prefix: "wac-box-dst-" });
+  try {
+    await buildApp(BOX, built, { read: true, write: true });
+    const src = "packages/platform/example/box.wac";
+
+    const cp = new Deno.Command(built, { args: ["cp", src, dst], stderr: "piped" }).outputSync();
+    assertEquals(cp.code, 0, new TextDecoder().decode(cp.stderr));
+    assertEquals(await Deno.readTextFile(dst), await Deno.readTextFile(src), "cp copied it");
+
+    const child = new Deno.Command(built, {
+      args: ["tee", dst],
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    const w = child.stdin.getWriter();
+    await w.write(new TextEncoder().encode("through\n"));
+    await w.close();
+    const r = await child.output();
+    assertEquals(r.code, 0, new TextDecoder().decode(r.stderr));
+    assertEquals(new TextDecoder().decode(r.stdout), "through\n", "tee wrote to stdout");
+    assertEquals(await Deno.readTextFile(dst), "through\n", "and to the file");
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(dst);
+  }
+});
+
+Deno.test("box's applets compose in a pipeline", async () => {
+  // Three wac programs in a row, which is the thing a file-to-file tool could never do.
+  const built = await Deno.makeTempFile({ prefix: "wac-box-p-" });
+  try {
+    await buildApp(BOX, built, { read: true });
+    const run = (args: string[], input: string) => {
+      const child = new Deno.Command(built, {
+        args, stdin: "piped", stdout: "piped", stderr: "piped",
+      }).spawn();
+      const w = child.stdin.getWriter();
+      w.write(new TextEncoder().encode(input)).then(() => w.close());
+      return child.output().then((r) => new TextDecoder().decode(r.stdout));
+    };
+    const sorted = await run(["sort", "-u"], "b\na\nb\nc\na\n");
+    assertEquals(sorted, "a\nb\nc\n");
+    assertEquals(await run(["wc", "-l"], sorted), "3\n");
+    assertEquals(await run(["tac"], sorted), "c\nb\na\n");
+  } finally {
+    await Deno.remove(built);
+  }
 });
