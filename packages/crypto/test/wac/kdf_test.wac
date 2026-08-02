@@ -1,0 +1,165 @@
+// HMAC-SHA-256 and HKDF, against their RFCs and against the host's HMAC.
+//
+// One file for both because HKDF *is* HMAC used twice — extract then expand — so a fault
+// in the primitive shows up in both, and testing them apart makes it harder to see which
+// layer moved. The oracle is `node:crypto`'s HMAC, which is the primitive alone: checking
+// HKDF against a host HKDF would compare two implementations of the same construction,
+// where checking it against the primitive checks the construction itself.
+//
+// ## Where these functions actually go wrong
+//
+// **HMAC**: the key. Shorter than the block it is zero-padded, longer it is hashed first,
+// and exactly 64 bytes is neither — RFC 4231 case 6 uses a 131-byte key for precisely
+// that reason. An implementation that forgot the hash-first rule is right for every key a
+// test author would type.
+//
+// **HKDF**: the counter. Expand runs a chain, T(n) = HMAC(prk, T(n-1) ++ info ++ n), and
+// omitting T(n-1) gives an output correct in its first 32 bytes and wrong after — which
+// every short vector misses.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { hmacSha256 } from "../../src/hmac.wac";
+import { hkdf, hkdfExtract } from "../../src/hkdf.wac";
+
+u8[] unhex(string h) {
+  u8[] src = h.toBytes();
+  u8[] out = u8[src.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = nib(src[2 * i]) * 16 + nib(src[2 * i + 1]); }
+  return out;
+}
+i32 nib(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  trap;
+}
+u8[] rep(i32 byte, i32 n) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = byte; }
+  return out;
+}
+u8[] fill(i32 n, i32 a, i32 b) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (i * a + b) & 0xFF; }
+  return out;
+}
+
+export string test_rfc_4231_hmac_vectors() {
+  T t = T.create();
+  t.eqBytes(hmacSha256(rep(0x0b, 20), "Hi There".toBytes()),
+            unhex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"),
+            "RFC 4231 case 1");
+  t.eqBytes(hmacSha256("Jefe".toBytes(), "what do ya want for nothing?".toBytes()),
+            unhex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+            "RFC 4231 case 2");
+  t.eqBytes(hmacSha256(rep(0xaa, 20), rep(0xdd, 50)),
+            unhex("773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"),
+            "RFC 4231 case 3");
+  return t.report();
+}
+
+export string test_the_key_length_boundaries(fn[u8[](u8[], u8[])] ref) {
+  // 63, 64 and 65 are the three rules — pad, neither, hash-first — and 131 is RFC 4231's
+  // own long key. An implementation missing the hash-first rule passes everything below
+  // 64 and fails silently above it.
+  T t = T.create();
+  u8[] msg = "the message does not matter here".toBytes();
+  i32[] keyLens = i32[](0, 1, 32, 63, 64, 65, 100, 131, 200);
+  for (i32 i = 0; i < keyLens.len(); i++) {
+    u8[] key = fill(keyLens[i], 7, 3);
+    t.eqBytes(hmacSha256(key, msg), ref(key, msg),
+              "hmac with a " + itoa64(keyLens[i] as i64) + "-byte key");
+  }
+  // And message lengths across the same boundary, since the message is hashed inside.
+  u8[] key = fill(32, 11, 1);
+  i32[] msgLens = i32[](0, 1, 55, 56, 63, 64, 65, 119, 120, 200);
+  for (i32 i = 0; i < msgLens.len(); i++) {
+    u8[] m = fill(msgLens[i], 13, 5);
+    t.eqBytes(hmacSha256(key, m), ref(key, m),
+              "hmac over a " + itoa64(msgLens[i] as i64) + "-byte message");
+  }
+  return t.report();
+}
+
+export string test_rfc_5869_hkdf_vectors() {
+  T t = T.create();
+  // A.1, the basic case.
+  u8[] salt1 = unhex("000102030405060708090a0b0c");
+  u8[] ikm1 = rep(0x0b, 22);
+  t.eqBytes(hkdfExtract(salt1, ikm1),
+            unhex("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"),
+            "A.1 extract");
+  t.eqBytes(hkdf(salt1, ikm1, unhex("f0f1f2f3f4f5f6f7f8f9"), 42),
+            unhex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf" +
+                  "34007208d5b887185865"),
+            "A.1 expand to 42 bytes");
+
+  // A.3, an empty salt and empty info — the case where an implementation that treats an
+  // absent salt as absent rather than as a block of zeros diverges.
+  t.eqBytes(hkdf(u8[0](), rep(0x0b, 22), u8[0](), 42),
+            unhex("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d" +
+                  "9d201395faa4b61a96c8"),
+            "A.3, empty salt and info");
+  return t.report();
+}
+
+export string test_expand_chains_across_blocks(fn[u8[](u8[], u8[])] ref) {
+  // The counter and the chained T(n-1), rebuilt on the host's HMAC. Output lengths either
+  // side of the 32-byte hash size, because an expansion that omits T(n-1) is correct for
+  // the first block and wrong for every one after it.
+  T t = T.create();
+  u8[] salt = fill(16, 3, 9);
+  u8[] ikm = fill(40, 5, 2);
+  u8[] info = fill(11, 7, 1);
+  u8[] prk = hkdfExtract(salt, ikm);
+  t.eqBytes(prk, ref(salt, ikm), "extract is HMAC(salt, ikm)");
+
+  i32[] lens = i32[](1, 31, 32, 33, 63, 64, 65, 200);
+  for (i32 li = 0; li < lens.len(); li++) {
+    i32 len = lens[li];
+    // T(n) = HMAC(prk, T(n-1) ++ info ++ n), concatenated and truncated.
+    u8[] want = u8[len]();
+    u8[] prev = u8[0]();
+    i32 done = 0;
+    i32 n = 1;
+    while (done < len) {
+      u8[] input = u8[prev.len() + info.len() + 1]();
+      for (i32 i = 0; i < prev.len(); i++) { input[i] = prev[i]; }
+      for (i32 i = 0; i < info.len(); i++) { input[prev.len() + i] = info[i]; }
+      input[input.len() - 1] = n;
+      prev = ref(prk, input);
+      for (i32 i = 0; i < prev.len() && done + i < len; i++) { want[done + i] = prev[i]; }
+      done += prev.len();
+      n += 1;
+    }
+    t.eqBytes(hkdf(salt, ikm, info, len), want,
+              "expand to " + itoa64(len as i64) + " bytes");
+  }
+  return t.report();
+}
+
+export string test_every_input_changes_the_output() {
+  // No oracle. A derivation that ignored its info, or its salt, would satisfy the RFC
+  // vectors above — those fix all three inputs at once — and would silently give two
+  // different contexts the same key.
+  T t = T.create();
+  u8[] salt = fill(16, 3, 1);
+  u8[] ikm = fill(32, 5, 2);
+  u8[] info = fill(8, 7, 3);
+  u8[] base = hkdf(salt, ikm, info, 32);
+  t.isFalse(same(base, hkdf(fill(16, 3, 2), ikm, info, 32)), "the salt matters");
+  t.isFalse(same(base, hkdf(salt, fill(32, 5, 3), info, 32)), "the input keying material matters");
+  t.isFalse(same(base, hkdf(salt, ikm, fill(8, 7, 4), 32)), "the info matters");
+  // A longer output must extend the shorter one, since the chain is a stream.
+  u8[] long = hkdf(salt, ikm, info, 96);
+  bool prefix = true;
+  for (i32 i = 0; i < 32; i++) { if (long[i] != base[i]) { prefix = false; } }
+  t.isTrue(prefix, "a longer expansion extends the shorter one");
+  return t.report();
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}

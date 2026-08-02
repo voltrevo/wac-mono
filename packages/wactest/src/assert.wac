@@ -52,9 +52,19 @@ export struct T {
 
   // ── Recording ───────────────────────────────────────────────────────────────
 
-  /** Record a failure. Assertions funnel through here. */
+  /**
+   * Record a failure. Assertions funnel through here.
+   *
+   * Only the first few are kept. Accumulating every one is right for a test that checks
+   * a dozen boundary lengths and useless for one that sweeps three hundred: a genuine
+   * break in a swept property fails on nearly every iteration, and printing all of them
+   * buries the count, the first case, and any other test's output underneath a wall of
+   * near-identical text. The count is what says how bad it is; the first few say what it
+   * is. Seen for real when a reversed GHASH identity produced eighty.
+   */
   void fail(this, string what) {
     this.failed++;
+    if (this.failed > 8) { return; }
     if (this.messages.len() > 0) {
       this.messages += "; ";
     }
@@ -180,6 +190,7 @@ export struct T {
     if (this.failed == 0) {
       return "";
     }
-    return itoa(this.failed) + " failed: " + this.messages;
+    string tail = this.failed > 8 ? " (and " + itoa(this.failed - 8) + " more)" : "";
+    return itoa(this.failed) + " failed: " + this.messages + tail;
   }
 }
