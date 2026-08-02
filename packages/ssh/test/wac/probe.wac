@@ -1,0 +1,213 @@
+// The transport pieces at the host boundary.
+//
+// Flat functions over `u8[]` and `i32`, because that is what crosses the bindgen boundary
+// cleanly. The scanning helpers are called more than once over the same buffer and recompute each
+// time, which is fine for a driver and a test and is not how the client will be shaped once there
+// is state worth keeping — that arrives with the keys.
+
+import { Reader, Writer } from "../../src/wire.wac";
+import { Framed, Status, frame, unframe, minBlock, paddingFor } from "../../src/packet.wac";
+import { Found, Version, clientVersion, clientVersionLine, scanVersion, speaksV2 }
+  from "../../src/version.wac";
+import { Proposal, clientProposal, decode, encode, negotiate } from "../../src/kexinit.wac";
+
+// ── Version exchange ──────────────────────────────────────────────────────────
+
+export u8[] sshClientVersion() { return clientVersion(); }
+export u8[] sshClientVersionLine() { return clientVersionLine(); }
+
+/** 0 = ok, 1 = incomplete, 2 = bad. */
+export i32 sshScanStatus(u8[] buf) {
+  Version v = scanVersion(buf, 0, buf.len());
+  match (v.status) {
+    case Ok: return 0;
+    case Incomplete: return 1;
+    else: return 2;
+  }
+}
+export i32 sshScanUsed(u8[] buf) { return scanVersion(buf, 0, buf.len()).used; }
+export u8[] sshScanLine(u8[] buf) { return scanVersion(buf, 0, buf.len()).line; }
+export bool sshSpeaksV2(u8[] line) { return speaksV2(line); }
+
+// ── Packet framing ────────────────────────────────────────────────────────────
+
+export i32 sshMinBlock() { return minBlock(); }
+export i32 sshPaddingFor(i32 n, i32 block) { return paddingFor(n, block); }
+export u8[] sshFrame(u8[] payload, u8[] random, i32 block) { return frame(payload, random, block); }
+
+/** 0 = ok, 1 = incomplete, 2 = malformed. */
+export i32 sshUnframeStatus(u8[] buf) {
+  Framed f = unframe(buf, 0, buf.len());
+  match (f.status) {
+    case Ok: return 0;
+    case Incomplete: return 1;
+    else: return 2;
+  }
+}
+export i32 sshUnframeUsed(u8[] buf) { return unframe(buf, 0, buf.len()).used; }
+export u8[] sshUnframePayload(u8[] buf) { return unframe(buf, 0, buf.len()).payload; }
+
+// ── KEXINIT ───────────────────────────────────────────────────────────────────
+
+export u8[] sshKexInit(u8[] cookie) { return encode(clientProposal(), cookie); }
+
+/** Which list to pull out of a parsed KEXINIT, by wire position. */
+export u8[] sshProposalField(u8[] payload, i32 which) {
+  Proposal? p = decode(payload);
+  if (p is null) { return u8[0](); }
+  if (which == 0) { return p!.kex; }
+  if (which == 1) { return p!.hostKey; }
+  if (which == 2) { return p!.cipherToServer; }
+  if (which == 3) { return p!.cipherToClient; }
+  if (which == 4) { return p!.macToServer; }
+  if (which == 5) { return p!.macToClient; }
+  if (which == 6) { return p!.compToServer; }
+  if (which == 7) { return p!.compToClient; }
+  return u8[0]();
+}
+
+export bool sshProposalOk(u8[] payload) { return decode(payload) is not null; }
+
+/** Our choice against theirs, by the same field numbering. Empty means no overlap. */
+export u8[] sshNegotiate(u8[] serverPayload, i32 which) {
+  Proposal? theirs = decode(serverPayload);
+  if (theirs is null) { return u8[0](); }
+  Proposal ours = clientProposal();
+  if (which == 0) { return negotiate(ours.kex, theirs!.kex); }
+  if (which == 1) { return negotiate(ours.hostKey, theirs!.hostKey); }
+  if (which == 2) { return negotiate(ours.cipherToServer, theirs!.cipherToServer); }
+  if (which == 3) { return negotiate(ours.cipherToClient, theirs!.cipherToClient); }
+  return u8[0]();
+}
+
+// ── Wire types, exercised directly ────────────────────────────────────────────
+
+export u8[] sshWriteMpint(u8[] magnitude) {
+  Writer w = Writer.create();
+  w.mpint(magnitude);
+  return w.take();
+}
+
+export u8[] sshWriteString(u8[] v) {
+  Writer w = Writer.create();
+  w.str(v);
+  return w.take();
+}
+
+/** Read a string back out, or empty if the buffer does not hold one. */
+export u8[] sshReadString(u8[] buf) {
+  Reader r = Reader.over(buf);
+  u8[] v = r.str();
+  return r.ok ? v : u8[0]();
+}
+
+export bool sshReadStringOk(u8[] buf) {
+  Reader r = Reader.over(buf);
+  r.str();
+  return r.ok;
+}
+
+// ── The range-taking forms ────────────────────────────────────────────────────
+//
+// How a client actually calls these: it holds one growing buffer and parses at an offset, rather
+// than slicing a fresh array per message. The bounds checks in `Reader.create`, `unframe` and
+// `scanVersion` exist for exactly these callers, so they are reachable only through this shape.
+
+export i32 sshUnframeStatusAt(u8[] buf, i32 at, i32 end) {
+  match (unframe(buf, at, end).status) {
+    case Ok: return 0;
+    case Incomplete: return 1;
+    else: return 2;
+  }
+}
+
+export i32 sshScanStatusAt(u8[] buf, i32 at, i32 end) {
+  match (scanVersion(buf, at, end).status) {
+    case Ok: return 0;
+    case Incomplete: return 1;
+    else: return 2;
+  }
+}
+
+export bool sshReadStringOkAt(u8[] buf, i32 at, i32 end) {
+  Reader r = Reader.create(buf, at, end);
+  r.str();
+  return r.ok;
+}
+
+/** Our KEXINIT with `first_kex_packet_follows` set, which we never send but must encode. */
+export u8[] sshKexInitFirst(u8[] cookie, bool first) {
+  Proposal p = clientProposal();
+  p.firstKexFollows = first;
+  return encode(p, cookie);
+}
+
+// ── Key exchange ──────────────────────────────────────────────────────────────
+
+import { EcdhReply, deriveKey, ecdhInit, ephemeralPublic, exchangeHash, msgKexEcdhReply,
+         parseEcdhReply, sharedSecret, verifyEd25519Host } from "../../src/kex.wac";
+
+export i32 sshMsgKexEcdhReply() { return msgKexEcdhReply(); }
+export u8[] sshEphemeralPublic(u8[] secret) { return ephemeralPublic(secret); }
+export u8[] sshEcdhInit(u8[] qc) { return ecdhInit(qc); }
+export bool sshEcdhReplyOk(u8[] payload) { return parseEcdhReply(payload) is not null; }
+
+/** 0 = host key blob, 1 = server public, 2 = signature blob. */
+export u8[] sshEcdhReplyField(u8[] payload, i32 which) {
+  EcdhReply? r = parseEcdhReply(payload);
+  if (r is null) { return u8[0](); }
+  if (which == 0) { return r!.hostKey; }
+  if (which == 1) { return r!.serverPublic; }
+  if (which == 2) { return r!.signature; }
+  return u8[0]();
+}
+
+/** Empty when the peer's point is low-order, which must abort rather than continue. */
+export u8[] sshSharedSecret(u8[] secret, u8[] peerPublic) {
+  u8[]? k = sharedSecret(secret, peerPublic);
+  return k is null ? u8[0]() : k!;
+}
+
+export u8[] sshExchangeHash(u8[] vc, u8[] vs, u8[] ic, u8[] isrv, u8[] ks,
+                            u8[] qc, u8[] qs, u8[] k) {
+  return exchangeHash(vc, vs, ic, isrv, ks, qc, qs, k);
+}
+
+export bool sshVerifyHostKey(u8[] hostKey, u8[] signature, u8[] h) {
+  return verifyEd25519Host(hostKey, signature, h);
+}
+
+export u8[] sshDeriveKey(u8[] k, u8[] h, u8[] sessionId, i32 letter, i32 needed) {
+  return deriveKey(k, h, sessionId, letter, needed);
+}
+
+// ── The cipher ────────────────────────────────────────────────────────────────
+
+import { Opened, Plain, aeadPaddingFor, keyLength, open, peekLength, seal, sealBody, tagLength }
+  from "../../src/cipher.wac";
+
+export i32 sshCipherKeyLength() { return keyLength(); }
+export i32 sshCipherTagLength() { return tagLength(); }
+export i32 sshAeadPaddingFor(i32 n, i32 block) { return aeadPaddingFor(n, block); }
+export u8[] sshSeal(u8[] key, i32 seq, u8[] payload, u8[] random, i32 block) {
+  return seal(key, seq, payload, random, block);
+}
+export i32 sshPeekLength(u8[] key, i32 seq, u8[] src, i32 at) { return peekLength(key, seq, src, at); }
+
+/** 0 = ok, 1 = incomplete, 2 = bad. */
+export i32 sshOpenStatus(u8[] key, i32 seq, u8[] src, i32 at, i32 end, i32 maxPacket) {
+  match (open(key, seq, src, at, end, maxPacket).status) {
+    case Ok: return 0;
+    case Incomplete: return 1;
+    else: return 2;
+  }
+}
+export u8[] sshOpenPayload(u8[] key, i32 seq, u8[] src, i32 at, i32 end, i32 maxPacket) {
+  return open(key, seq, src, at, end, maxPacket).payload;
+}
+export i32 sshOpenUsed(u8[] key, i32 seq, u8[] src, i32 at, i32 end, i32 maxPacket) {
+  return open(key, seq, src, at, end, maxPacket).used;
+}
+
+/** A packet that authenticates but whose body is whatever the caller says. */
+export u8[] sshSealBody(u8[] key, i32 seq, u8[] body) { return sealBody(key, seq, body); }

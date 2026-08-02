@@ -1,0 +1,139 @@
+// SSH's binary wire types, RFC 4251 §5.
+//
+// Everything in SSH is built from six types, and the whole protocol is readable once they are:
+//
+//   byte        one octet
+//   boolean     one octet, 0 or 1
+//   uint32      four octets, big-endian
+//   string      a uint32 length then that many octets — *arbitrary binary*, not NUL-terminated
+//   mpint       a signed big-endian integer, minimally encoded
+//   name-list   a string whose contents are comma-separated ASCII names
+//
+// `string` carrying arbitrary binary is the one that matters most in practice: host keys,
+// signatures and the whole of the key exchange are nested strings inside strings, and a reader
+// that stops at a zero byte silently truncates them.
+//
+// Reading is bounds-checked at every step and a short buffer is an answer rather than a trap —
+// `ok` goes false and the cursor stops. A remote peer chooses these lengths, so running off the
+// end is not an internal error, it is Tuesday.
+
+import { Buf } from "../../bytes/src/buf.wac";
+
+/** Appends the wire types to a buffer. */
+export struct Writer {
+  Buf out;
+
+  Writer create() { return Writer(Buf.create()); }
+
+  void byte(this, i32 v) { this.out.push(v & 255); }
+
+  void bool(this, bool v) { this.out.push(v ? 1 : 0); }
+
+  void u32(this, i32 v) {
+    this.out.push((v >>> 24) & 255);
+    this.out.push((v >>> 16) & 255);
+    this.out.push((v >>> 8) & 255);
+    this.out.push(v & 255);
+  }
+
+  /** Raw bytes, with no length in front — for payloads that are already framed. */
+  void raw(this, u8[] v) { this.out.pushAll(v); }
+
+  /** A length-prefixed string. */
+  void str(this, u8[] v) {
+    this.u32(v.len());
+    this.out.pushAll(v);
+  }
+
+  /**
+   * A non-negative integer, minimally encoded.
+   *
+   * Two rules, both of which a naive encoder gets wrong: leading zero bytes are stripped, and a
+   * leading zero is then *added back* when the top bit of the first remaining byte is set —
+   * because mpint is signed, and without it a 2048-bit RSA modulus reads as negative. Zero itself
+   * encodes as an empty string, not as one zero byte.
+   */
+  void mpint(this, u8[] magnitude) {
+    i32 at = 0;
+    while (at < magnitude.len() && magnitude[at] == 0) { at++; }
+    i32 n = magnitude.len() - at;
+    if (n == 0) {
+      this.u32(0);
+      return;
+    }
+    bool pad = (magnitude[at] & 0x80) != 0;
+    this.u32(pad ? n + 1 : n);
+    if (pad) { this.out.push(0); }
+    this.out.pushBytes(magnitude, at, n);
+  }
+
+  u8[] take(this) { return this.out.take(); }
+}
+
+/**
+ * Reads the wire types out of a buffer.
+ *
+ * `ok` latches false on the first read that would run past the end, and every later read is a
+ * no-op returning zero. That means a caller can parse a whole message and check once at the end,
+ * instead of testing after every field — which is how a missed check turns into a read of
+ * whatever happened to follow in memory.
+ */
+export struct Reader {
+  u8[] src;
+  i32 pos;
+  i32 end;
+  bool ok;
+
+  Reader create(u8[] src, i32 at, i32 end) {
+    if (at < 0 || end > src.len() || at > end) { return Reader(src, 0, 0, false); }
+    return Reader(src, at, end, true);
+  }
+
+  Reader over(u8[] src) { return Reader.create(src, 0, src.len()); }
+
+  /** Fail the reader and return false, so a caller can `if (!this.need(n)) { ... }`. */
+  bool need(this, i32 n) {
+    if (!this.ok || n < 0 || this.end - this.pos < n) {
+      this.ok = false;
+      return false;
+    }
+    return true;
+  }
+
+  i32 byte(this) {
+    if (!this.need(1)) { return 0; }
+    i32 v = this.src[this.pos];
+    this.pos++;
+    return v;
+  }
+
+  bool bool(this) { return this.byte() != 0; }
+
+  i32 u32(this) {
+    if (!this.need(4)) { return 0; }
+    i32 v = (this.src[this.pos] << 24) | (this.src[this.pos + 1] << 16)
+          | (this.src[this.pos + 2] << 8) | this.src[this.pos + 3];
+    this.pos += 4;
+    return v;
+  }
+
+  /**
+   * A length-prefixed string.
+   *
+   * The length is a uint32 and we hold it in a signed i32, so a peer claiming 2^31 or more
+   * arrives here negative. That is rejected rather than wrapped — `need` would otherwise be
+   * asked for a negative count and wave it through.
+   */
+  u8[] str(this) {
+    i32 n = this.u32();
+    if (n < 0) {
+      this.ok = false;
+      return u8[0]();
+    }
+    if (!this.need(n)) { return u8[0](); }
+    u8[] out = u8[n]();
+    out.copyFrom(this.src, this.pos, 0, n);
+    this.pos += n;
+    return out;
+  }
+}

@@ -508,8 +508,21 @@ export u8[] tlsClientFeed(u8[] state, u8[] input) {
           // do not trust is not worth verifying, and checking it first would mean
           // reporting "bad signature" for what is really "unknown issuer".
           if (c.chainOffsets.len() == 0) { return fail(c, 31, alertUnexpectedMessage(), toSend, appData); }
-          i32 verdict = verifyPath(c.serverCertDer, c.chainOffsets, c.rootDer,
-                                   c.rootOffsets, c.host, c.now, 8);
+          // An empty trust store means the caller has taken responsibility for the peer's
+          // identity by some other means. There is exactly one such protocol here: Tor
+          // relays present a self-signed certificate with a random CN and are
+          // authenticated by the ntor handshake against a key from the consensus, so
+          // checking the certificate against a CA would fail and would prove nothing if
+          // it passed. See packages/tor.
+          //
+          // Spelt as an empty store rather than a boolean because a boolean is one typo
+          // from disabling this everywhere, while an empty store is something a caller
+          // has to construct on purpose — and `tlsClientInit`'s other callers all pass a
+          // real one.
+          i32 verdict = c.rootOffsets.len() == 0
+            ? 0
+            : verifyPath(c.serverCertDer, c.chainOffsets, c.rootDer, c.rootOffsets,
+                         c.host, c.now, 8);
           if (verdict != 0) {
             i32 alert = alertBadCertificate();
             if (verdict == 1 || verdict == 2 || verdict == 3) { alert = alertCertificateExpired(); }
