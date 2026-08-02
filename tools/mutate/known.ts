@@ -16,6 +16,89 @@
 export type KnownSurvivor = { name: string; why: string };
 
 export const KNOWN_SURVIVORS: KnownSurvivor[] = [
+  // ── crypto's remaining guards, after the ones that were real gaps were tested ──
+  //
+  // Nine survivors, each argued rather than tested. The distinction that matters is that
+  // every one of these is *redundant* — the rejection still happens, by a different route
+  // — rather than absent. The guards that turned out not to be redundant were tested
+  // instead, and most of them were: every length check had an untested "too long" half,
+  // and the coordinate range check turned out to be load-bearing.
+  {
+    name: "guard/crypto/fieldp:51:18",
+    why:
+      "pLimbs asked for a limb count that is neither eight nor twelve. Reachable only " +
+      "by getting a field element of another size past fpFromBytes, whose own guard is " +
+      "tested — so this and foldVector's copy and fpFromBytes' second check form a trio " +
+      "where removing any one still leaves the value rejected by the next. Kept because " +
+      "returning P-384's prime for a P-521 element would be arithmetic in a ring nobody " +
+      "chose, and silence is the worst outcome for that.",
+  },
+  {
+    name: "guard/crypto/fieldp:66:18",
+    why: "foldVector's copy of the guard above. Same trio, same argument.",
+  },
+  {
+    name: "guard/crypto/fieldp:321:28",
+    why:
+      "fpFromBytes rejecting a length that is a multiple of four but not a curve — 16 " +
+      "bytes, say. Checked by removing it: the value goes on to pLimbs(4), which traps. " +
+      "The guard is kept because it fails at the boundary with the length in hand rather " +
+      "than several frames down.",
+  },
+  {
+    name: "guard/crypto/weierstrass:163:25",
+    why:
+      "The y-coordinate's copy of the range check. Its x-coordinate twin is tested — a " +
+      "point with x + p is accepted without it, because the arithmetic reduces and the " +
+      "curve equation then passes — and the same is true here, but a witness needs a " +
+      "curve point whose *y* is small enough that y + p still fits in the encoding. " +
+      "Finding one means solving the curve equation for x given y, a cubic root modulo p " +
+      "rather than a square root. The x case demonstrates the check is load-bearing; " +
+      "this is the same line of code.",
+  },
+  {
+    name: "guard/crypto/weierstrass:296:54",
+    why:
+      "curveEcdh rejecting a private scalar of zero or one at or above the group order. " +
+      "Zero is caught two lines later, because 0*P is the identity and the identity has " +
+      "no affine coordinates. A scalar at or above n is congruent to scalar mod n and " +
+      "produces a correct shared secret, so nothing downstream can notice. Kept because " +
+      "accepting it would mean two distinct private keys silently being one key.",
+  },
+  {
+    name: "guard/crypto/weierstrass:298:32",
+    why:
+      "An ECDH result at infinity. These curves have prime order, so the only point of " +
+      "small order is the identity itself, and curveDecode rejects anything not on the " +
+      "curve — a validated peer point times a scalar in [1, n) cannot be the identity. " +
+      "Kept because that argument depends on the validation above it staying correct.",
+  },
+  {
+    name: "extreme/crypto/weierstrass/isZeroBE",
+    why:
+      "isZeroBE replaced with a constant false. Every caller has a second line of " +
+      "defence: a zero private key multiplies to the identity and traps for want of " +
+      "affine coordinates, and a zero r or s in a signature leads to a verification that " +
+      "fails on the arithmetic instead. So the rejection still happens everywhere, later " +
+      "and less clearly. Killing it would mean asserting on *which* error came back, " +
+      "which is not something the API distinguishes.",
+  },
+  {
+    name: "guard/crypto/mlkem:174:34",
+    why:
+      "The rejection-sampling loop running off the end of its SHAKE128 stream. The " +
+      "squeeze asks for far more bytes than 256 coefficients need — about one candidate " +
+      "in six is discarded, so 850 bytes suffice on average and the buffer is much " +
+      "larger — and no seed has ever exhausted it. Unreachable rather than untested, and " +
+      "the alternative to trapping is reading zeros and calling the result a public key.",
+  },
+  {
+    name: "guard/crypto/keccak:137:34",
+    why:
+      "sponge's rate bounds. The only callers are sha3_256, sha3_512, shake128 and " +
+      "shake256, which pass 136, 72, 168 and 136 — all constants in the same file. " +
+      "Reachable only by a new caller, which is exactly who the guard is for.",
+  },
   {
     name: "guard/crypto/ghash:49:31",
     why:

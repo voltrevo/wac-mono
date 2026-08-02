@@ -340,6 +340,32 @@ function testDirs(m: Mutant): string[] {
   return [...pkgs].sort().map((p) => `packages/${p}`);
 }
 
+/**
+ * Run the suite in a staged directory. The one place that knows the command, so the
+ * unmutated baseline cannot drift away from what the mutants are measured with.
+ *
+ * --no-check: a mutant is killed by behaviour, not by type errors. Skipping the check is
+ * a quarter of the runtime, and it stops an unrelated type error somewhere in the suite
+ * from failing every run and scoring every mutant as killed.
+ *
+ * --fail-fast: killing needs one failing test, and almost every mutant is killed, so
+ * running the rest of the suite afterwards is pure waiting.
+ *
+ * --allow-net and --allow-env because the suite needs them: a permission error does not
+ * skip a test, it fails the run.
+ */
+function testCommand(work: string, dirs: string[]): Deno.Command {
+  return new Deno.Command("deno", {
+    args: ["test", "--no-check", "--fail-fast", "--allow-read", "--allow-write",
+           "--allow-run", "--allow-net", "--allow-env", "--quiet", ...dirs],
+    cwd: work,
+    stdout: "piped",
+    stderr: "piped",
+  });
+}
+
+const runTests = (work: string, dirs: string[]) => testCommand(work, dirs).output();
+
 type Result = {
   mutant: Mutant;
   killed: boolean;
@@ -372,6 +398,8 @@ const jobs = (() => {
  * disk, and buys the whole run being parallel.
  */
 const workDirs: string[] = [];
+let unmeasurable: typeof toRun = [];
+let measurable: typeof toRun = [];
 const results: (Result & { index: number })[] = [];
 try {
   for (let i = 0; i < jobs; i++) {
@@ -381,40 +409,60 @@ try {
   }
   if (jobs > 1) console.log(`  running ${jobs} at a time`);
 
+  // ── The unmutated baseline ───────────────────────────────────────────────
+  //
+  // Run the suite once, unmutated, before mutating anything. Without this the harness
+  // cannot tell "the mutation was detected" from "the tests were never going to pass":
+  // a failing run is a non-zero exit either way, so a package whose suite is already red
+  // — a missing permission, a type error, somebody else's broken test — scores *every*
+  // mutant as killed and reports a perfect result. That is the failure mode worth
+  // guarding, because its symptom is a better number rather than a worse one, and it
+  // went unnoticed here long enough to produce two write-ups that were wrong.
+  //
+  // Per test-directory scope rather than once over everything, and the mutants in a red
+  // scope are excluded rather than the run being abandoned. A mutant reaching into a
+  // package somebody else has broken is unmeasurable, but the ones that do not are still
+  // worth measuring — and refusing to run at all would mean any red package anywhere
+  // blocks every sweep, which is how a guard gets switched off.
+  const redScopes = new Set<string>();
+  {
+    const scopes = new Set(toRun.map((t) => testDirs(t.mutant).join(" ")));
+    for (const key of [...scopes].sort()) {
+      const dirs = key.split(" ").filter(Boolean);
+      if (dirs.length === 0) continue;
+      const { code, stdout, stderr } = await runTests(workDirs[0], dirs);
+      if (code !== 0) {
+        redScopes.add(key);
+        const out = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
+        const why = out.split("\n").find((l) => l.includes("FAILED") || l.includes("error")) ?? "";
+        console.log(`  BASELINE RED: ${dirs.join(" ")} — ${why.trim().slice(0, 100)}`);
+      }
+    }
+    const clean = scopes.size - redScopes.size;
+    console.log(`  baseline: ${clean}/${scopes.size} test scope(s) pass unmutated`);
+    if (clean === 0) {
+      console.log("\nNothing is measurable: every scope this run touches is already failing.");
+      console.log("Each mutant would be recorded as killed and the run would report a perfect");
+      console.log("score. Fix the suite before trusting any number from here.");
+      Deno.exit(2);
+    }
+  }
+  unmeasurable = toRun.filter((t) => redScopes.has(testDirs(t.mutant).join(" ")));
+  measurable = toRun.filter((t) => !redScopes.has(testDirs(t.mutant).join(" ")));
+
   let next = 0;
   const worker = async (work: string) => {
     while (true) {
       const index = next++;
-      if (index >= toRun.length) return;
-      const mutant = toRun[index].mutant;
+      if (index >= measurable.length) return;
+      const mutant = measurable[index].mutant;
 
       const mutated = applyEdits(sources, mutant);
       const touched = [...new Set(mutant.edits.map((e) => e.file))];
       for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, mutated.get(f)!);
 
       const dirs = testDirs(mutant);
-      const cmd = new Deno.Command("deno", {
-        // --no-check: a mutant is killed by behaviour, not by type errors. Skipping the
-        // check is a quarter of the runtime, and it also stops an unrelated type error
-        // somewhere in the suite from failing every run and scoring every mutant as
-        // killed — which has happened, and is invisible without the control mutants.
-        // Those still guard the staging itself: a broken import map fails at *runtime*,
-        // so a control that should survive gets killed and the harness check fires.
-        //
-        // --fail-fast: killing needs one failing test, and almost every mutant is killed,
-        // so running the rest of the suite afterwards is pure waiting.
-        //
-        // --allow-net and --allow-env because the suite needs them: a permission error does
-        // not skip a test, it fails the run, so the exit code is non-zero and the mutant is
-        // recorded as killed by a mutation nobody detected. crypto, http, server and tls all
-        // failed their *unmutated* baseline without these — 272 mutants, tls's 230 among
-        // them, scoring themselves correct for free.
-        args: ["test", "--no-check", "--fail-fast", "--allow-read", "--allow-write",
-               "--allow-run", "--allow-net", "--allow-env", "--quiet", ...dirs],
-        cwd: work,
-        stdout: "piped",
-        stderr: "piped",
-      });
+      const cmd = testCommand(work, dirs);
       const child = cmd.spawn();
       let timedOut = false;
       const timer = setTimeout(() => {
@@ -453,6 +501,13 @@ try {
 }
 
 // ── Report ────────────────────────────────────────────────────────────────────
+
+if (unmeasurable.length > 0) {
+  console.log(`\n${unmeasurable.length} mutant(s) excluded: their tests do not pass unmutated.`);
+  console.log("  Not counted as killed, because nothing about them was measured.");
+  for (const t of unmeasurable.slice(0, 10)) console.log(`  - ${t.mutant.name}`);
+  if (unmeasurable.length > 10) console.log(`  ... and ${unmeasurable.length - 10} more`);
+}
 
 const controls = results.filter((r) => r.mutant.mustSurvive);
 const real = results.filter((r) => !r.mutant.mustSurvive);

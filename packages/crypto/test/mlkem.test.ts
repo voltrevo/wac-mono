@@ -153,7 +153,12 @@ Deno.test("mlkem: rejects malformed keys and ciphertexts", () => {
   for (const n of [0, EK_LEN - 1, EK_LEN + 1]) {
     if (!traps(() => encaps(new Uint8Array(n), m))) throw new Error(`accepted a ${n}-byte encapsulation key`);
   }
-  if (!traps(() => encaps(ek, new Uint8Array(31)))) throw new Error("accepted a 31-byte message");
+  // Both sides of the length, not just the short one. A short message runs off the end
+  // of the array and traps whatever the guard does; a long one has its tail ignored, so
+  // encapsulating under a 33-byte "message" would silently mean its first 32 bytes.
+  for (const n of [0, 31, 33, 64]) {
+    if (!traps(() => encaps(ek, new Uint8Array(n)))) throw new Error(`accepted a ${n}-byte message`);
+  }
   for (const n of [0, DK_LEN - 1, DK_LEN + 1]) {
     if (!traps(() => decaps(new Uint8Array(n), new Uint8Array(CT_LEN)))) {
       throw new Error(`accepted a ${n}-byte decapsulation key`);
