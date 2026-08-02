@@ -95,8 +95,25 @@ once and exits has no state to keep between calls, so the struct was ceremony ar
 function. A *service*, called repeatedly, will want one — and can have it then.
 
 `Core` is what every host provides — clock, monotonic clock, secure random, output. `Cli`
-is arguments, environment and files, which a browser has none of; that split is why it is
-a second struct rather than five more fields.
+is arguments, the standard streams and the filesystem, which a browser has none of; that
+split is why it is a second struct rather than more fields.
+
+| | capability | grant |
+|---|---|---|
+| `Core` | `nowMillis`, `monotonicNanos`, `randomBytes`, `log`, `warn` | — |
+| `Cli` | `argCount`, `arg`, `env` | — |
+| | `readStdin`, `write` | — |
+| | `readFile`, `stat`, `readDir` | `--allow-read` |
+| | `writeFile` | `--allow-write` |
+
+**`readStdin` and `write` need no grant**, for the same reason `arg` does not: what the
+user pipes in and what the program prints are the user's own doing, not a reach into
+something they did not offer. `write` puts *exactly* those bytes on standard output —
+`log` is for lines of text, and without a byte-level output nothing could emit binary,
+which ruled out every compressor and encoder as a filter.
+
+`example/hexdump.wac` exercises the difference: `hexdump < file` reads standard input and
+writes exact bytes, and `hexdump <dir>` lists a directory through `stat` and `readDir`.
 
 ## How an asynchronous host looks synchronous
 

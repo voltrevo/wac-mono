@@ -60,26 +60,63 @@ export struct Core {
   }
 }
 
+/** What a path is, if it is anything. Everything is zero or false when `exists` is false. */
+export struct Stat {
+  bool exists;
+  bool isFile;
+  bool isDir;
+  i64 size;
+  /** Milliseconds since the epoch, or 0 where the host does not say. */
+  i64 modifiedMillis;
+
+  Stat of(bool exists, bool isFile, bool isDir, i64 size, i64 modifiedMillis) {
+    return Stat(exists, isFile, isDir, size, modifiedMillis);
+  }
+}
+
 /**
- * The command line and the filesystem. Absent in a browser, which is the honest reason
- * this is not part of `Core`.
+ * The command line, the standard streams and the filesystem. Absent in a browser, which
+ * is the honest reason this is not part of `Core`.
+ *
+ * `readStdin` and `write` need no grant, for the same reason `arg` does not: what the
+ * user pipes in and what the program prints are the user's own doing, not a reach into
+ * anything they did not offer. The filesystem is different and is gated.
  */
 export struct Cli {
   fn[i32()] argCount;
   fn[string(i32)] arg;
   /** Null when the variable is unset, which is not the same as empty. */
   fn[string?(string)] env;
+
+  /** All of standard input, to the end. Empty when there is none. */
+  fn[u8[]()] readStdin;
+  /**
+   * Exactly these bytes on standard output — no newline, no encoding.
+   *
+   * `log` is for lines of text; this is for a program whose output *is* bytes. Without it
+   * nothing could emit binary, which ruled out every compressor and encoder as a filter.
+   */
+  fn[void(u8[])] write;
+
   fn[FileResult(string)] readFile;
   /** True when the write succeeded. */
   fn[bool(string, u8[])] writeFile;
+  /** What a path is. `exists` is false where the filesystem was not granted. */
+  fn[Stat(string)] stat;
+  /** Names within a directory, or null if it is not one — or not permitted. */
+  fn[string[]?(string)] readDir;
 
   Cli of(
     fn[i32()] argCount,
     fn[string(i32)] arg,
     fn[string?(string)] env,
+    fn[u8[]()] readStdin,
+    fn[void(u8[])] write,
     fn[FileResult(string)] readFile,
-    fn[bool(string, u8[])] writeFile
+    fn[bool(string, u8[])] writeFile,
+    fn[Stat(string)] stat,
+    fn[string[]?(string)] readDir
   ) {
-    return Cli(argCount, arg, env, readFile, writeFile);
+    return Cli(argCount, arg, env, readStdin, write, readFile, writeFile, stat, readDir);
   }
 }

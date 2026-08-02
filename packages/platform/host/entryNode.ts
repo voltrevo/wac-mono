@@ -59,13 +59,45 @@ export function runAsWorkerEntryNode(wt: WorkerThreads, app: AppModule): void {
 /** The launcher half: serve the granted capabilities, run the worker, exit with its code. */
 export async function runLauncherNode(
   wt: WorkerThreads,
-  fs: { readFile(p: string): Promise<Uint8Array>; writeFile(p: string, d: Uint8Array): Promise<void> },
-  proc: { argv: string[]; env: Record<string, string | undefined>; exit(code: number): never },
+  fs: {
+    readFile(p: string): Promise<Uint8Array>;
+    writeFile(p: string, d: Uint8Array): Promise<void>;
+    stat(p: string): Promise<{ isFile(): boolean; isDirectory(): boolean; size: number; mtimeMs: number }>;
+    readdir(p: string): Promise<string[]>;
+  },
+  proc: {
+    argv: string[];
+    env: Record<string, string | undefined>;
+    exit(code: number): never;
+    stdin: AsyncIterable<Uint8Array>;
+    stdout: { write(b: Uint8Array, cb: (e?: unknown) => void): void };
+  },
   workerSource: string,
   grants: Grants = {},
 ): Promise<void> {
+  const io = {
+    readStdin: async (): Promise<Uint8Array> => {
+      const parts: Uint8Array[] = [];
+      for await (const c of proc.stdin) parts.push(c);
+      const total = parts.reduce((a, p) => a + p.length, 0);
+      const out = new Uint8Array(total);
+      let at = 0;
+      for (const p of parts) { out.set(p, at); at += p.length; }
+      return out;
+    },
+    writeStdout: (b: Uint8Array): Promise<void> =>
+      new Promise((res, rej) => proc.stdout.write(b, (e) => (e ? rej(e) : res()))),
+    stat: async (path: string) => {
+      const st = await fs.stat(path);
+      return {
+        isFile: st.isFile(), isDirectory: st.isDirectory(),
+        size: st.size, mtimeMillis: Math.round(st.mtimeMs),
+      };
+    },
+    readDir: async (path: string) => (await fs.readdir(path)).sort(),
+  };
   const bridge = newBridge();
-  const responder = serveHostCalls(bridge, nodeWorld(fs, proc, {
+  const responder = serveHostCalls(bridge, nodeWorld(fs, proc, io, {
     args: proc.argv.slice(2),
     fs: { read: grants.read === true, write: grants.write === true },
     env: grants.env === true ? (n) => proc.env[n] : undefined,

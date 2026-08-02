@@ -73,10 +73,12 @@ Deno.test("a missing file reaches the application as its host's message", async 
   assertEquals(r.err[0].includes("no/such/file"), true, `got: ${r.err[0]}`);
 });
 
-Deno.test("an application with no arguments says how to be used", async () => {
-  const r = await runBuilt([]);
-  assertEquals(r.code, 2);
-  assertEquals(r.err[0], "usage: wc <file>");
+Deno.test("no arguments means standard input, as wc has always meant it", async () => {
+  // Piped explicitly: a program that reads stdin blocks on a terminal, which is correct
+  // behaviour and a hung test if the pipe is left to chance.
+  const r = await runFilter(WC, [], new TextEncoder().encode("one two\nthree\n"));
+  assertEquals(r.code, 0, r.err);
+  assertEquals(new TextDecoder().decode(r.out).trim(), "2 3 14");
 });
 
 Deno.test("env distinguishes unset from empty", async () => {
@@ -297,4 +299,77 @@ Deno.test("the same application builds for Node and agrees with the Deno build",
     await Deno.remove(denoOut);
     await Deno.remove(nodeOut);
   }
+});
+
+// ── Filters: stdin, byte output, stat, readDir ────────────────────────────────
+
+const HEXDUMP = "packages/platform/example/hexdump.wac";
+
+/** Build once, then run with the given stdin and arguments. */
+async function runFilter(
+  entry: string,
+  args: string[],
+  stdin: Uint8Array,
+  grants: Grants = {},
+): Promise<{ code: number; out: Uint8Array; err: string }> {
+  const built = await Deno.makeTempFile({ prefix: "wac-filter-" });
+  try {
+    await buildApp(entry, built, grants);
+    const child = new Deno.Command(built, {
+      args,
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    const w = child.stdin.getWriter();
+    await w.write(stdin);
+    await w.close();
+    const r = await child.output();
+    return { code: r.code, out: r.stdout, err: new TextDecoder().decode(r.stderr) };
+  } finally {
+    await Deno.remove(built);
+  }
+}
+
+Deno.test("a program can be a filter: stdin in, exact bytes out", async () => {
+  // The gap that mattered most. `log` appends a newline and assumes text, so nothing
+  // could emit binary — every compressor and encoder was a file-to-file tool and could
+  // not go in a pipe. `readStdin` and `write` are what change that, and neither needs a
+  // grant: what the user pipes in and what the program prints are the user's own doing.
+  const input = new TextEncoder().encode("hello, wac");
+  const r = await runFilter(HEXDUMP, [], input);
+  assertEquals(r.code, 0, r.err);
+  const text = new TextDecoder().decode(r.out);
+  assertEquals(text.startsWith("00000000  68 65 6c 6c 6f 2c 20 77 61 63"), true, text);
+  // Exactly one line, ending in a newline — `write` added nothing of its own.
+  assertEquals(text.split("\n").length, 2, JSON.stringify(text));
+
+  // Bytes, not text: 0x00 and 0xFF survive, which a string-shaped output would mangle.
+  const binary = await runFilter(HEXDUMP, [], new Uint8Array([0, 255, 128]));
+  assertEquals(new TextDecoder().decode(binary.out).includes("00 ff 80"), true);
+});
+
+Deno.test("wc reads standard input when given no file", async () => {
+  const text = await Deno.readTextFile(WC);
+  const r = await runFilter(WC, [], new TextEncoder().encode(text));
+  assertEquals(r.code, 0, r.err);
+  const [lines, words, bytes] = new TextDecoder().decode(r.out).trim().split(/\s+/);
+  assertEquals(Number(bytes), new TextEncoder().encode(text).length);
+  assertEquals(Number(lines), text.split("\n").length - 1);
+  assertEquals(Number(words), text.split(/\s+/).filter((w) => w.length > 0).length);
+});
+
+Deno.test("stat and readDir reach the application, and are gated", async () => {
+  const listed = await runFilter(HEXDUMP, ["packages/platform/src"], new Uint8Array(), {
+    read: true,
+  });
+  assertEquals(listed.code, 0, listed.err);
+  assertEquals(new TextDecoder().decode(listed.out).trim(), "platform.wac");
+
+  // Without the grant, `stat` reports "does not exist" rather than throwing: an
+  // application cannot tell a withheld capability from an absent file, which is the
+  // right amount for it to know.
+  const denied = await runFilter(HEXDUMP, ["packages/platform/src"], new Uint8Array());
+  assertEquals(denied.code, 1);
+  assertEquals(denied.err.includes("not found"), true, denied.err);
 });
