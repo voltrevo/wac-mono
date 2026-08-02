@@ -24,8 +24,9 @@ compiler, this one is things built with it.
 | [`unicode`](packages/unicode/) | UTF-8 as code points, and simple case mapping |
 | [`stream`](packages/stream/) | run a wac transform as a stream, with the host doing the blocking wac cannot |
 | [`platform`](packages/platform/) | a capability world, so an application can be written **entirely in wac** — no TypeScript of its own |
-| [`zstd`](packages/zstd/) | Zstandard — the frame layer only so far, compressed blocks not yet |
+| [`zstd`](packages/zstd/) | Zstandard, both directions — 22% smaller than `gzip -6`, within 4% of `zstd -3` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) — **not for production**, see its README |
+| [`ssh`](packages/ssh/) | an SSH-2 client — transport layer so far, checked against a real `sshd` |
 | [`wacc`](packages/wacc/) | the wac compiler, in wac, so it can eventually compile itself |
 | [`server`](packages/server/) | an HTTP server in wac — the packages, composed and running |
 | [`std`](packages/std/) | `Vec<T>`, `Map<K, V>`, `Option<T>`, `Result<T, E>` — the containers generics made writable |

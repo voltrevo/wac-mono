@@ -1,0 +1,162 @@
+// SSH_MSG_KEXINIT and algorithm negotiation, RFC 4253 §7.1.
+//
+// Both sides send their preferences at once, without waiting, and then each works out the result
+// independently from the two lists. The rule is deliberately asymmetric: **the chosen algorithm
+// is the client's first preference that the server also supports** — client order decides, server
+// order is ignored. Getting that backwards produces a client that negotiates something plausible
+// and disagrees with the server about what was negotiated, which surfaces as a MAC failure much
+// later.
+//
+// The whole KEXINIT payload from each side, byte for byte as sent, goes into the exchange hash.
+// So the message has to be kept, not just parsed — re-encoding our own from the parsed fields
+// would be a different byte string if any detail of the encoding differed.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { Reader, Writer } from "./wire.wac";
+
+// Only the one this file needs. The rest of the message numbers arrive with the code that
+// handles them — an unused export is indistinguishable from an untested one, which is what
+// wac-mono's issue 0009 is about.
+export i32 msgKexInit() { return 20; }
+
+/** The ten name-lists of a KEXINIT, in wire order. */
+export struct Proposal {
+  u8[] kex;
+  u8[] hostKey;
+  u8[] cipherToServer;
+  u8[] cipherToClient;
+  u8[] macToServer;
+  u8[] macToClient;
+  u8[] compToServer;
+  u8[] compToClient;
+  u8[] langToServer;
+  u8[] langToClient;
+  bool firstKexFollows;
+}
+
+/**
+ * What this client offers.
+ *
+ * Deliberately narrow: one key exchange, one host key type, one cipher. Advertising an algorithm
+ * we cannot perform is worse than not advertising it, because the server will pick it.
+ *
+ * Two of the entries are not algorithms:
+ *
+ *   `ext-info-c` asks the server to send its extension list, which is how a client learns that
+ *   `rsa-sha2-256` is available for authentication rather than the SHA-1 signature that
+ *   `ssh-rsa` implies. Harmless to send before we use it.
+ *
+ *   `kex-strict-c-v00@openssh.com` opts in to strict KEX, which forbids the unrelated messages
+ *   that the Terrapin attack (CVE-2023-48795) used to shift the sequence numbers, and resets
+ *   those numbers at NEWKEYS. It costs nothing and OpenSSH has supported it since 9.6 — which is
+ *   the version in this container.
+ */
+export Proposal clientProposal() {
+  return Proposal(
+    ascii("curve25519-sha256,curve25519-sha256@libssh.org,ext-info-c,kex-strict-c-v00@openssh.com"),
+    ascii("ssh-ed25519"),
+    ascii("chacha20-poly1305@openssh.com"),
+    ascii("chacha20-poly1305@openssh.com"),
+    // chacha20-poly1305 authenticates on its own, so the MAC list is unused when it is chosen.
+    // It still has to be non-empty and offer something we could do if a different cipher won.
+    ascii("hmac-sha2-256"),
+    ascii("hmac-sha2-256"),
+    ascii("none"),
+    ascii("none"),
+    ascii(""),
+    ascii(""),
+    false);
+}
+
+/**
+ * Encode a KEXINIT payload. `cookie` must be 16 random bytes.
+ *
+ * The cookie is there so that neither side alone determines the exchange hash — the peer cannot
+ * choose a hash input in advance if 16 bytes of it come from us.
+ */
+export u8[] encode(Proposal p, u8[] cookie) {
+  if (cookie.len() != 16) { trap; }
+  Writer w = Writer.create();
+  w.byte(msgKexInit());
+  w.raw(cookie);
+  w.str(p.kex);
+  w.str(p.hostKey);
+  w.str(p.cipherToServer);
+  w.str(p.cipherToClient);
+  w.str(p.macToServer);
+  w.str(p.macToClient);
+  w.str(p.compToServer);
+  w.str(p.compToClient);
+  w.str(p.langToServer);
+  w.str(p.langToClient);
+  w.bool(p.firstKexFollows);
+  w.u32(0);                   // reserved, always zero
+  return w.take();
+}
+
+/** Parse a KEXINIT payload. Null if it is not one, or is truncated. */
+export Proposal? decode(u8[] payload) {
+  Reader r = Reader.over(payload);
+  if (r.byte() != msgKexInit()) { return null; }
+  for (i32 i = 0; i < 16; i++) { r.byte(); }        // cookie, not needed once hashed
+  u8[] kex = r.str();
+  u8[] hostKey = r.str();
+  u8[] cts = r.str();
+  u8[] stc = r.str();
+  u8[] mcts = r.str();
+  u8[] mstc = r.str();
+  u8[] zcts = r.str();
+  u8[] zstc = r.str();
+  u8[] lcts = r.str();
+  u8[] lstc = r.str();
+  bool first = r.bool();
+  r.u32();                                          // reserved
+  if (!r.ok) { return null; }
+  return Proposal(kex, hostKey, cts, stc, mcts, mstc, zcts, zstc, lcts, lstc, first);
+}
+
+/**
+ * The negotiated algorithm: the first name in `ours` that also appears in `theirs`.
+ *
+ * Empty when there is no overlap, which is a failed negotiation and not something to substitute a
+ * default for.
+ */
+export u8[] negotiate(u8[] ours, u8[] theirs) {
+  i32 start = 0;
+  while (start <= ours.len()) {
+    i32 stop = start;
+    while (stop < ours.len() && ours[stop] != 0x2c) { stop++; }      // ','
+    if (stop > start && listContains(theirs, ours, start, stop - start)) {
+      u8[] out = u8[stop - start]();
+      out.copyFrom(ours, start, 0, stop - start);
+      return out;
+    }
+    if (stop >= ours.len()) { break; }
+    start = stop + 1;
+  }
+  return u8[0]();
+}
+
+/** Whether `list` contains the name `name[at..at+n]` as a whole comma-separated element. */
+bool listContains(u8[] list, u8[] name, i32 at, i32 n) {
+  i32 start = 0;
+  while (start <= list.len()) {
+    i32 stop = start;
+    while (stop < list.len() && list[stop] != 0x2c) { stop++; }
+    if (stop - start == n) {
+      bool same = true;
+      for (i32 i = 0; i < n; i++) {
+        if (list[start + i] != name[at + i]) { same = false; break; }
+      }
+      if (same) { return true; }
+    }
+    if (stop >= list.len()) { break; }
+    start = stop + 1;
+  }
+  return false;
+}
+
+/** An ASCII literal as bytes. Names here are all ASCII by definition — RFC 4251 §5 says so. */
+u8[] ascii(string s) {
+  return s.toBytes();
+}

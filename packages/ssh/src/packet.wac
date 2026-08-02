@@ -1,0 +1,112 @@
+// The SSH binary packet protocol, RFC 4253 §6.
+//
+//   uint32    packet_length      how much follows, not counting itself or the MAC
+//   byte      padding_length     at least 4
+//   byte[]    payload            packet_length - padding_length - 1 bytes
+//   byte[]    padding            padding_length bytes, random
+//   byte[]    mac                on the *plaintext*, and not present until keys exist
+//
+// Two rules shape every packet:
+//
+// **The length field is inside the encryption.** So a reader cannot know how much to read before
+// decrypting, which is why SSH decrypts the first block, learns the length from it, and only then
+// reads the rest. It is also why `chacha20-poly1305@openssh.com` exists with its separate
+// length key — encrypting the length under the same key as the payload made length-field oracles
+// possible. Nothing here is encrypted yet; this is the shape the cipher will slot into.
+//
+// **Padding is mandatory and random**, at least 4 bytes, sized so the whole packet including the
+// length field is a multiple of the cipher block size (8 while unencrypted). Random rather than
+// zeroes: the padding is inside the encrypted region and inside the MAC, so it is cheap
+// plaintext-uncertainty on every packet.
+//
+// Randomness comes from the caller. wac cannot ask the host for entropy on its own, and threading
+// it in explicitly is the same arrangement `packages/tls` uses.
+
+import { Buf } from "../../bytes/src/buf.wac";
+
+/** The unencrypted block size. Once a cipher is negotiated this becomes the cipher's. */
+export i32 minBlock() { return 8; }
+
+/** The largest packet anyone has to accept, RFC 4253 §6.1, plus room for length and padding. */
+export i32 maxPacket() { return 35000; }
+
+/** What a framing attempt produced. */
+export enum Status {
+  Ok,
+  /** Not enough bytes yet — read more and call again with the same buffer. */
+  Incomplete,
+  /** The peer sent something that is not a packet. There is no recovering from this. */
+  Malformed,
+}
+
+export struct Framed {
+  Status status;
+  u8[] payload;
+  /** Bytes consumed from the input. Only meaningful when `status` is `Ok`. */
+  i32 used;
+}
+
+/**
+ * How many padding bytes a payload of `n` needs at this block size.
+ *
+ * The 4-byte length field counts toward the multiple, which is the detail worth stating: sizing
+ * the padding to make `1 + n + pad` a multiple instead of `4 + 1 + n + pad` produces packets that
+ * a server rejects only once encryption starts, because before that nothing checks the alignment.
+ */
+export i32 paddingFor(i32 n, i32 block) {
+  i32 unpadded = 4 + 1 + n;
+  i32 pad = block - (unpadded % block);
+  // At least 4, and adding a whole block keeps the alignment while satisfying the minimum.
+  while (pad < 4) { pad += block; }
+  return pad;
+}
+
+/**
+ * Wrap a payload into a packet, taking padding bytes from `random`.
+ *
+ * `random` must hold at least `paddingFor(payload.len(), block)` bytes; the caller sizes it,
+ * because only the caller can obtain them.
+ */
+export u8[] frame(u8[] payload, u8[] random, i32 block) {
+  i32 pad = paddingFor(payload.len(), block);
+  if (random.len() < pad) { trap; }
+  i32 packetLength = 1 + payload.len() + pad;
+
+  Buf out = Buf.withCapacity(4 + packetLength);
+  out.push((packetLength >>> 24) & 255);
+  out.push((packetLength >>> 16) & 255);
+  out.push((packetLength >>> 8) & 255);
+  out.push(packetLength & 255);
+  out.push(pad);
+  out.pushAll(payload);
+  out.pushBytes(random, 0, pad);
+  return out.take();
+}
+
+/**
+ * Read one packet from `src[at..end]`.
+ *
+ * Every bound the peer supplies is checked before it is used. A packet length is a uint32 held in
+ * a signed i32, so a peer claiming 2^31 or more arrives negative; that is malformed rather than
+ * something to clamp, and saying so here keeps every caller from having to remember it.
+ */
+export Framed unframe(u8[] src, i32 at, i32 end) {
+  if (at < 0 || end > src.len() || at > end) { return Framed(Status.Malformed, u8[0](), 0); }
+  if (end - at < 4) { return Framed(Status.Incomplete, u8[0](), 0); }
+
+  i32 packetLength = (src[at] << 24) | (src[at + 1] << 16) | (src[at + 2] << 8) | src[at + 3];
+  // A packet has to carry a padding-length byte and at least the 4 bytes of padding it promises.
+  if (packetLength < 5 || packetLength > maxPacket()) {
+    return Framed(Status.Malformed, u8[0](), 0);
+  }
+  if (end - at < 4 + packetLength) { return Framed(Status.Incomplete, u8[0](), 0); }
+
+  i32 padLength = src[at + 4];
+  if (padLength < 4) { return Framed(Status.Malformed, u8[0](), 0); }
+  i32 payloadLength = packetLength - padLength - 1;
+  if (payloadLength < 0) { return Framed(Status.Malformed, u8[0](), 0); }
+
+  u8[] payload = u8[payloadLength]();
+  payload.copyFrom(src, at + 5, 0, payloadLength);
+  return Framed(Status.Ok, payload, 4 + packetLength);
+}
