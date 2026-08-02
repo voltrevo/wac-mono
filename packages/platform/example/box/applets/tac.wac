@@ -1,0 +1,17 @@
+// Lines in reverse order — as distinct from `rev`, which reverses within a line.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { joinLines, splitLines } from "../lib/lines.wac";
+
+export i32 tac(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  u8[][] lines = splitLines(in.bytes);
+  i32 n = lines.len();
+  u8[][] out = u8[][n](fill: u8[0]());
+  for (i32 i = 0; i < n; i++) { out[i] = lines[n - 1 - i]; }
+  cli.write(joinLines(out, n));
+  return 0;
+}

@@ -22,7 +22,7 @@ import {
   kInt, kFloat, kString, kIdent, kEof, kTrue, kFalse, kNull, kVoid, kFn, kThis,
   kIs, kNot, kAs, kAsBang, kAsTilde, kAsAt,
   kConst, kExport, kIf, kElse, kWhile, kFor, kDo, kSwitch, kCase, kDefault,
-  kReturn, kBreak, kContinue, kTrap, kStruct, kEnum, kMatch, kImport, kFrom,
+  kReturn, kBreak, kContinue, kTrap, kStruct, kEnum, kMatch, kImport,
   kOverride, kAssign,
   kPlusEq, kMinusEq, kStarEq, kSlashEq, kPercentEq,
   kAndEq, kOrEq, kCaretEq, kShlEq, kShrEq, kShrUEq,
@@ -1499,7 +1499,10 @@ Decl parseImport(P p) {
     if (p.at1(kRbrace())) { break; }               // trailing comma
   }
   p.expect(kRbrace());
-  p.expect(kFrom());
+  // `from` lexes as an ordinary identifier — it stopped being a keyword so that
+  // `slice(a, from, to)` could name its argument — and only an import clause can put
+  // one here, which is what makes matching it by text safe.
+  if (p.at1(kIdent())) { p.advance(); } else { p.fail(perrExpected()); }
   i32 pathTok = -1;
   if (p.at1(kString())) { pathTok = p.advance(); } else { p.fail(perrExpected()); }
   p.expect(kSemi());

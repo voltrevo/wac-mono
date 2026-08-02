@@ -1,0 +1,14 @@
+// Encoded, with a trailing newline.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { withNewline } from "../lib/bytes.wac";
+import { encode as b64, ALPHABET_STANDARD } from "../../../../codec/src/base64.wac";
+
+export i32 base64(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  cli.write(withNewline(b64(in.bytes, ALPHABET_STANDARD(), true)));
+  return 0;
+}

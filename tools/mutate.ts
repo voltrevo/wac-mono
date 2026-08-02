@@ -12,6 +12,7 @@
 //   deno task mutate crc                 # only mutants whose name matches
 //   deno task mutate --package gzip      # only mutants in one package
 //   deno task mutate --jobs=2            # how many to test at once (default: cores - 1, max 4)
+//   deno task mutate --no-select         # skip per-test selection, run every test in scope
 //   deno task mutate --operators --dry-run   # what would run, without running it
 //
 // Three things make this affordable enough to run over more than one package.
@@ -41,6 +42,9 @@ import { wacCompile } from "wac/wacCompile.ts";
 import { wacFiles } from "../harness/wacFiles.ts";
 import { CURATED } from "./mutate/curated.ts";
 import { KNOWN_SURVIVORS } from "./mutate/known.ts";
+import {
+  buildProfile, filterFor, selectTests, testFilesIn, type Profile,
+} from "./mutate/profile.ts";
 import { ALL_OPERATORS, generate, type OperatorName } from "./mutate/operators.ts";
 import { applyEdits, packagesOf, type Curated, type Edit, type Mutant } from "./mutate/types.ts";
 
@@ -354,10 +358,11 @@ function testDirs(m: Mutant): string[] {
  * --allow-net and --allow-env because the suite needs them: a permission error does not
  * skip a test, it fails the run.
  */
-function testCommand(work: string, dirs: string[]): Deno.Command {
+function testCommand(work: string, dirs: string[], filter?: string): Deno.Command {
   return new Deno.Command("deno", {
     args: ["test", "--no-check", "--fail-fast", "--allow-read", "--allow-write",
-           "--allow-run", "--allow-net", "--allow-env", "--quiet", ...dirs],
+           "--allow-run", "--allow-net", "--allow-env", "--quiet",
+           ...(filter ? ["--filter", filter] : []), ...dirs],
     cwd: work,
     stdout: "piped",
     stderr: "piped",
@@ -366,12 +371,33 @@ function testCommand(work: string, dirs: string[]): Deno.Command {
 
 const runTests = (work: string, dirs: string[]) => testCommand(work, dirs).output();
 
+/**
+ * Every source line an edit touches, as "file:line".
+ *
+ * Edits are byte spans, and a curated one can cover several lines — the two-file
+ * distance-guard mutation spans a whole `if`. A mutation is reachable if *any* of its
+ * lines is, so all of them are looked up and the union of their tests is selected.
+ */
+function linesOf(file: string, start: number, end: number): string[] {
+  const src = sources.get(file);
+  if (src === undefined) return [];
+  let line = 1;
+  for (let i = 0; i < start && i < src.length; i++) if (src[i] === "\n") line++;
+  const out = [`${file}:${line}`];
+  for (let i = start; i < end && i < src.length; i++) {
+    if (src[i] === "\n") { line++; out.push(`${file}:${line}`); }
+  }
+  return out;
+}
+
 type Result = {
   mutant: Mutant;
   killed: boolean;
   timedOut: boolean;
   dirs: string[];
   detail: string;
+  /** The profile knows this line and no test reaches it, so nothing was run. */
+  notCovered?: boolean;
 };
 
 /**
@@ -399,6 +425,9 @@ const jobs = (() => {
  */
 const workDirs: string[] = [];
 let unmeasurable: typeof toRun = [];
+let profile: Profile | null = null;
+let narrowed = 0, widened = 0;
+const noSelect = args.includes("--no-select");
 let measurable: typeof toRun = [];
 const results: (Result & { index: number })[] = [];
 try {
@@ -450,6 +479,17 @@ try {
   unmeasurable = toRun.filter((t) => redScopes.has(testDirs(t.mutant).join(" ")));
   measurable = toRun.filter((t) => !redScopes.has(testDirs(t.mutant).join(" ")));
 
+  // ── Per-test coverage, so a mutant only faces the tests that reach it ──────
+  if (!noSelect && measurable.length > 0) {
+    const scope = [...new Set(measurable.flatMap((t) => testDirs(t.mutant)))].sort();
+    const files = await testFilesIn(scope.map((d) => `${workDirs[0]}/${d}`));
+    const rel = files.map((f) => f.slice(workDirs[0].length + 1));
+    profile = await buildProfile(workDirs[0], rel, (m) => console.log(m));
+    console.log(
+      `  profile: ${profile.home.size} test(s) across ${rel.length} file(s), ` +
+      `${profile.known.size} covered line(s)`);
+  }
+
   let next = 0;
   const worker = async (work: string) => {
     while (true) {
@@ -462,7 +502,37 @@ try {
       for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, mutated.get(f)!);
 
       const dirs = testDirs(mutant);
-      const cmd = testCommand(work, dirs);
+      // Narrow to the tests that actually execute the mutated lines, when the profile
+      // knows them. `null` means it does not, and the full scope runs — see profile.ts
+      // for why that fallback is the safe direction.
+      let runDirs = dirs;
+      let filter: string | undefined;
+      let notCovered = false;
+      if (profile) {
+        const locs = mutant.edits.flatMap((e) => linesOf(e.file, e.start, e.end));
+        const picked = selectTests(profile, locs);
+        if (picked === null) widened++;
+        if (picked !== null) {
+          if (picked.length === 0) {
+            notCovered = true;
+          } else {
+            const f = filterFor(picked);
+            const files = [...new Set(picked.map((t) => profile!.home.get(t)!))].sort();
+            if (f && files.every(Boolean)) { filter = f; runDirs = files; narrowed++; }
+            else widened++;
+          }
+        }
+      }
+      if (notCovered) {
+        results.push({
+          index, mutant, killed: false, timedOut: false, dirs, notCovered: true,
+          detail: "no test executes this line",
+        });
+        console.log(`  --  ${mutant.name.padEnd(52)} not covered`);
+        for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, sources.get(f)!);
+        continue;
+      }
+      const cmd = testCommand(work, runDirs, filter);
       const child = cmd.spawn();
       let timedOut = false;
       const timer = setTimeout(() => {
@@ -507,6 +577,23 @@ if (unmeasurable.length > 0) {
   console.log("  Not counted as killed, because nothing about them was measured.");
   for (const t of unmeasurable.slice(0, 10)) console.log(`  - ${t.mutant.name}`);
   if (unmeasurable.length > 10) console.log(`  ... and ${unmeasurable.length - 10} more`);
+}
+
+if (profile) {
+  const total = narrowed + widened + results.filter((r) => r.notCovered).length;
+  console.log(
+    `\nselection: ${narrowed}/${total} mutant(s) ran only the tests that reach them, ` +
+    `${widened} fell back to the full scope`);
+}
+
+const uncovered = results.filter((r) => r.notCovered);
+if (uncovered.length > 0) {
+  console.log(`\n${uncovered.length} mutant(s) on lines no test executes.`);
+  console.log("  Not killed, and not the same thing as a survivor: a survivor means the tests");
+  console.log("  ran and noticed nothing, this means nothing ran. The fix is a test, not a");
+  console.log("  better assertion.");
+  for (const r of uncovered.slice(0, 12)) console.log(`  - ${r.mutant.name}`);
+  if (uncovered.length > 12) console.log(`  ... and ${uncovered.length - 12} more`);
 }
 
 const controls = results.filter((r) => r.mutant.mustSurvive);

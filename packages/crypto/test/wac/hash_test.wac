@@ -1,0 +1,100 @@
+// SHA-2, tested in wac against an independent implementation passed in from the host.
+//
+// The pilot for moving tests out of TypeScript. Everything here used to be a `.test.ts`
+// that reached into wac through a probe; now the test is wac and the *oracle* is the only
+// thing that comes from outside. That inverts the dependency: TypeScript supplies a fact,
+// rather than owning the loop, the assertions and the failure messages.
+//
+// `ref(bytes, bits)` is `node:crypto`, which matters for a reason beyond convenience.
+// WebCrypto's digest is a Promise, and a wasm call cannot await, so it cannot be a
+// callback at all — while node's `createHash` is synchronous and can. That is the whole
+// difference between this file being possible and not.
+//
+// ## What is checked, and why these lengths
+//
+// SHA-2 is a block function with length padding, so the interesting inputs are the ones
+// that straddle a block: a message one byte short of 64 leaves no room for the 8-byte
+// length and forces a second block that is nothing but padding. An implementation that
+// writes the length into the wrong block is correct for almost every input and wrong
+// there. Both rates are covered from both sides — 64 bytes for SHA-256, 128 for the
+// SHA-512 family, whose eight-byte length field is really sixteen.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { sha256 } from "../../src/sha256.wac";
+import { sha512, sha384 } from "../../src/sha512.wac";
+
+/** A deterministic message of `n` bytes; no two lengths share a prefix pattern. */
+u8[] msg(i32 n, i32 seed) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (i * 37 + seed * 11 + 3) & 0xFF; }
+  return out;
+}
+
+/** The lengths a padding bug hides in, for a block size of `rate`. */
+i32[] boundaries(i32 rate, i32 lenBytes) {
+  return i32[](0, 1, 2,
+               rate - lenBytes - 1, rate - lenBytes, rate - lenBytes + 1,
+               rate - 2, rate - 1, rate, rate + 1,
+               2 * rate - 1, 2 * rate, 2 * rate + 1,
+               3 * rate + 17);
+}
+
+export string test_sha256_agrees_with_the_host(fn[u8[](u8[], i32)] ref) {
+  T t = T.create();
+  i32[] lens = boundaries(64, 8);
+  for (i32 i = 0; i < lens.len(); i++) {
+    u8[] m = msg(lens[i], i);
+    t.eqBytes(sha256(m), ref(m, 256), "sha256 at " + itoa64(lens[i] as i64) + " bytes");
+  }
+  return t.report();
+}
+
+export string test_sha512_and_sha384_agree_with_the_host(fn[u8[](u8[], i32)] ref) {
+  T t = T.create();
+  i32[] lens = boundaries(128, 16);
+  for (i32 i = 0; i < lens.len(); i++) {
+    u8[] m = msg(lens[i], i + 7);
+    t.eqBytes(sha512(m), ref(m, 512), "sha512 at " + itoa64(lens[i] as i64) + " bytes");
+    t.eqBytes(sha384(m), ref(m, 384), "sha384 at " + itoa64(lens[i] as i64) + " bytes");
+  }
+  return t.report();
+}
+
+export string test_the_three_are_different_functions(fn[u8[](u8[], i32)] ref) {
+  // SHA-384 is SHA-512 with a different initial state and a truncated output, so an
+  // implementation that truncated without changing the state would agree with SHA-512 on
+  // its first 48 bytes. Comparing them to each other catches that; comparing each to the
+  // oracle catches it too, but only this says which mistake was made.
+  T t = T.create();
+  u8[] m = msg(200, 5);
+  u8[] a = sha384(m);
+  u8[] b = sha512(m);
+  bool samePrefix = true;
+  for (i32 i = 0; i < 48; i++) { if (a[i] != b[i]) { samePrefix = false; } }
+  t.isFalse(samePrefix, "sha384 is not a truncated sha512");
+  t.eqI32(a.len(), 48, "sha384 output length");
+  t.eqI32(b.len(), 64, "sha512 output length");
+  t.eqI32(sha256(m).len(), 32, "sha256 output length");
+  return t.report();
+}
+
+/**
+ * A test with no oracle at all, in the same file.
+ *
+ * Worth having here to show the two kinds coexist: this one declares no parameter, so it
+ * reaches nothing outside the module, and the compiled binary says so — a wac module with
+ * no `fn` parameter has no imports, which is checkable rather than promised.
+ */
+export string test_hashing_is_a_function() {
+  T t = T.create();
+  u8[] m = msg(97, 2);
+  t.eqBytes(sha256(m), sha256(m), "the same input gives the same digest");
+  u8[] other = msg(97, 3);
+  bool differs = false;
+  u8[] x = sha256(m);
+  u8[] y = sha256(other);
+  for (i32 i = 0; i < 32; i++) { if (x[i] != y[i]) { differs = true; } }
+  t.isTrue(differs, "different inputs give different digests");
+  return t.report();
+}

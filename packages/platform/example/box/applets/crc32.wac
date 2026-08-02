@@ -1,0 +1,21 @@
+// The CRC-32 of the input, in hex — the checksum gzip itself uses.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { crc32 as crcOf } from "../../../../gzip/src/crc32.wac";
+
+export i32 crc32(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  // `as@` keeps the bits; `as~` would clamp a checksum past 2^31 to i32 max. `& 15`
+  // then makes the sign-extension of the top nibble's shift irrelevant.
+  i32 v = crcOf(in.bytes) as@ i32;
+  u8[] hex = u8[8](fill: '0');
+  u8[] digits = "0123456789abcdef".toBytes();
+  for (i32 i = 0; i < 8; i++) {
+    hex[7 - i] = digits[(v >> (i * 4)) & 15];
+  }
+  core.log(string.fromBytes(hex) + "  " + (in.label == "" ? "-" : in.label));
+  return 0;
+}

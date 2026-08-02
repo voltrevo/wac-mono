@@ -1,0 +1,21 @@
+// One input, from a file or from standard input.
+//
+// That an applet works in a pipe at all is this file: without `readStdin` every one of
+// them would be a file-to-file tool.
+
+import { Cli, Core, FileResult } from "../../../src/platform.wac";
+import { Args } from "./args.wac";
+
+export struct Input { bool ok; u8[] bytes; string label; }
+
+/** Positional argument `n` names a file; without one, standard input. */
+export Input readInput(Core core, Cli cli, Args a, i32 n) {
+  if (a.rest.len() <= n) { return Input(true, cli.readStdin(), ""); }
+  string path = a.rest[n];
+  FileResult f = cli.readFile(path);
+  if (!f.ok) {
+    core.warn("box: " + path + ": " + f.error);
+    return Input(false, u8[0](), path);
+  }
+  return Input(true, f.bytes, path);
+}

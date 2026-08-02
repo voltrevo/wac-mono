@@ -1,0 +1,14 @@
+// The last path component.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { slice } from "../lib/bytes.wac";
+
+export i32 basename(Core core, Cli cli, Args a) {
+  if (a.rest.len() < 1) { core.warn("usage: box basename <path>"); return 2; }
+  u8[] b = a.rest[0].toBytes();
+  i32 cut = 0;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == '/') { cut = i + 1; } }
+  core.log(string.fromBytes(slice(b, cut, b.len())));
+  return 0;
+}

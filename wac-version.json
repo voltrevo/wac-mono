@@ -11,8 +11,8 @@
     "See 'Keeping the compiler pin current' in README.md. Checked by",
     "harness/wacVersion.ts on the first wacBind of a run."
   ],
-  "commit": "4ea004515df27cfffb2b72e15a044404966472e2",
-  "shortCommit": "4ea0045",
-  "reason": "trace mode (ctTrace) and the 'index' coverage-point kind, which packages/crypto's constant-time tests need",
+  "commit": "0a418379c9a9d076918b9f97216b00ee7addaa2b",
+  "shortCommit": "0a41837",
+  "reason": "`from` is contextual, which wacc's token numbering and the import walker depend on",
   "updated": "2026-08-02"
 }

@@ -1,0 +1,34 @@
+// Lines, words and bytes. `-l`, `-w` or `-c` alone prints just that number.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args, has } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { itoa } from "../lib/num.wac";
+
+export i32 wc(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  u8[] data = in.bytes;
+
+  i32 lineCount = 0;
+  i32 words = 0;
+  bool inWord = false;
+  for (i32 i = 0; i < data.len(); i++) {
+    i32 b = data[i];
+    if (b == '\n') { lineCount++; }
+    bool space = b == ' ' || b == '\n' || b == '\t' || b == '\r';
+    if (space) { inWord = false; } else if (!inWord) { inWord = true; words++; }
+  }
+
+  // One number and no label when exactly one of -l -w -c is asked for, as the real one does.
+  bool l = has(a, 'l');
+  bool w = has(a, 'w');
+  bool c = has(a, 'c');
+  if (l && !w && !c) { core.log(itoa(lineCount)); return 0; }
+  if (w && !l && !c) { core.log(itoa(words)); return 0; }
+  if (c && !l && !w) { core.log(itoa(data.len())); return 0; }
+
+  string line = itoa(lineCount) + " " + itoa(words) + " " + itoa(data.len());
+  core.log(in.label == "" ? line : line + " " + in.label);
+  return 0;
+}

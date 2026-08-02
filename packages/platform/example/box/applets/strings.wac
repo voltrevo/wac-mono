@@ -1,0 +1,35 @@
+// Runs of printable bytes, four or more — `strings -6` for a longer minimum.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { joinLines } from "../lib/lines.wac";
+import { slice } from "../lib/bytes.wac";
+
+export i32 strings(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  i32 min = a.num == 0 ? 4 : a.num;
+  u8[] data = in.bytes;
+
+  i32 count = 0;
+  i32 run = 0;
+  for (i32 i = 0; i <= data.len(); i++) {
+    bool printable = i < data.len() && data[i] >= 32 && data[i] < 127;
+    if (printable) { run++; continue; }
+    if (run >= min) { count++; }
+    run = 0;
+  }
+
+  u8[][] out = u8[][count](fill: u8[0]());
+  i32 at = 0;
+  run = 0;
+  for (i32 i = 0; i <= data.len(); i++) {
+    bool printable = i < data.len() && data[i] >= 32 && data[i] < 127;
+    if (printable) { run++; continue; }
+    if (run >= min) { out[at] = slice(data, i - run, i); at++; }
+    run = 0;
+  }
+  cli.write(joinLines(out, at));
+  return 0;
+}

@@ -18,6 +18,7 @@ import { wacCompile } from "wac/wacCompile.ts";
 import { wacBindgen } from "wac/wacBindgen.ts";
 import { wacFiles } from "./wacFiles.ts";
 import { checkWacVersion } from "./wacVersion.ts";
+import { profileDir, registerProfiled } from "./wacProfile.ts";
 
 const CACHE_DIR = ".cache";
 
@@ -36,7 +37,11 @@ export async function wacBind(entry: string): Promise<Record<string, unknown>> {
   // rather than surfacing as a type error in whichever package used a new feature.
   checkWacVersion();
   const files = await wacFiles(entry);
-  const result = wacCompile(files, entry);
+  // Profile mode compiles with coverage instrumentation so wacProfile can record which
+  // tests reach which lines. Off by default and invisible to a normal run: the
+  // instrumented build is a different binary, and it is used for attribution only, never
+  // for deciding whether a mutant was killed.
+  const result = wacCompile(files, entry, profileDir ? { coverage: true } : {});
 
   if (!result.ok) {
     const lines = result.diagnostics.map(d =>
@@ -51,10 +56,25 @@ export async function wacBind(entry: string): Promise<Record<string, unknown>> {
 
   const ts = wacBindgen(result.compiled);
   await Deno.mkdir(CACHE_DIR, { recursive: true });
-  const outPath = `${CACHE_DIR}/${entry.replaceAll("/", "_")}.gen.ts`;
+  const outPath = `${CACHE_DIR}/${profileDir ? "prof_" : ""}${entry.replaceAll("/", "_")}.gen.ts`;
   const tmpPath = tempName(outPath);
   await Deno.writeTextFile(tmpPath, ts);
   await Deno.rename(tmpPath, outPath);
 
-  return await import(`${Deno.cwd()}/${outPath}`);
+  const mod = await import(`${Deno.cwd()}/${outPath}`) as Record<string, unknown>;
+  if (profileDir) {
+    // The counter array is allocated by __cov_init, not at instantiation; without it the
+    // first instrumented branch traps on a null pointer.
+    (mod.__cov_init as () => void)();
+    const points = result.compiled.coverage!;
+    registerProfiled({
+      points,
+      counts: () => {
+        const len = (mod.__cov_len as () => number)();
+        const get = mod.__cov_get as (i: number) => number;
+        return Array.from({ length: len }, (_, i) => get(i));
+      },
+    });
+  }
+  return mod;
 }
