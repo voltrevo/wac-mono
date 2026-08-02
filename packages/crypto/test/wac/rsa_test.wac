@@ -1,0 +1,170 @@
+// RSA signature verification, against node:crypto.
+//
+// Verification only, which shapes the whole file: there is no signing here, so every test
+// is "somebody else signed this and we must agree". The host generates the key and the
+// signature and we check it — the one direction that matters for a TLS client reading a
+// certificate.
+//
+// `ref(mode, a, b)` returns a fresh key as `modulus || exponent` on request, then signs
+// with it. Both PKCS#1 v1.5 and PSS, because they fail differently:
+//
+//   PKCS#1 v1.5   a fixed block — 0x00 0x01, 0xFF padding, 0x00, then a DER-wrapped
+//                 digest. Every byte is specified, so a verifier that skips any of it
+//                 accepts forgeries. Bleichenbacher's 2006 attack was exactly a verifier
+//                 that stopped reading after the digest.
+//   PSS           randomised, so two signatures over one message differ and there is
+//                 nothing to compare byte for byte. The salt length is negotiable and
+//                 wrong-length handling is where implementations diverge.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { rsaVerifyPkcs1, rsaVerifyPss } from "../../src/rsa.wac";
+
+const i32 KEYGEN = 0;
+const i32 SIGN_PKCS1 = 1;
+const i32 SIGN_PSS = 2;
+
+u8[] slice(u8[] src, i32 from, i32 to) {
+  u8[] o = u8[to - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = src[from + i]; }
+  return o;
+}
+u8[] fill(i32 n, i32 seed) {
+  u8[] o = u8[n]();
+  for (i32 i = 0; i < n; i++) { o[i] = (i * 31 + seed * 7 + 5) & 0xFF; }
+  return o;
+}
+
+/** The host's key, returned as a two-byte modulus length then modulus then exponent. */
+struct Key {
+  u8[] n;
+  u8[] e;
+  Key of(u8[] packed) {
+    i32 nLen = (packed[0] << 8) | packed[1];
+    return Key(slice(packed, 2, 2 + nLen), slice(packed, 2 + nLen, packed.len()));
+  }
+}
+
+export string test_pkcs1_signatures_from_the_host(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32[] bits = i32[](2048, 3072);
+  i32[] hashes = i32[](32, 48, 64);
+  for (i32 b = 0; b < bits.len(); b++) {
+    u8[] sizeArg = u8[2]();
+    sizeArg[0] = (bits[b] >> 8) & 0xFF;
+    sizeArg[1] = bits[b] & 0xFF;
+    Key k = Key.of(ref(KEYGEN, sizeArg, u8[0]()));
+    t.eqI32(k.n.len(), bits[b] / 8, "modulus is " + itoa64(bits[b] as i64) + " bits");
+
+    for (i32 h = 0; h < hashes.len(); h++) {
+      u8[] msg = fill(50 + h, b * 3 + h);
+      u8[] hashArg = u8[1]();
+      hashArg[0] = hashes[h];
+      u8[] sig = ref(SIGN_PKCS1, hashArg, msg);
+      t.isTrue(rsaVerifyPkcs1(k.n, k.e, msg, sig, hashes[h]),
+               "pkcs1 sha-" + itoa64((hashes[h] * 8) as i64) + " at " +
+               itoa64(bits[b] as i64) + " bits");
+    }
+  }
+  return t.report();
+}
+
+export string test_pkcs1_refuses_a_block_that_is_not_exact(fn[u8[](i32, u8[], u8[])] ref) {
+  // Every byte of the block is specified, so every byte is worth moving.
+  //
+  // What this does *not* reach, and it is worth saying rather than implying otherwise:
+  // the individual strictness checks guard each other. Flipping a bit in the signature
+  // makes the whole block garbage after exponentiation, so removing any one check — the
+  // leading zero, the 0x01 block type, the padding run — still leaves the others
+  // refusing. Verified by deleting them one at a time; all four tests stayed green.
+  //
+  // Reaching a single check needs a signature crafted to have the right shape everywhere
+  // else, which is Bleichenbacher's 2006 forgery and needs the private key to construct.
+  // That is a fixture worth adding one day; until then the checks are covered
+  // collectively and not individually.
+  T t = T.create();
+  u8[] sizeArg = u8[2]();
+  sizeArg[0] = 8;
+  sizeArg[1] = 0;                                   // 2048
+  Key k = Key.of(ref(KEYGEN, sizeArg, u8[0]()));
+  u8[] hashArg = u8[1]();
+  hashArg[0] = 32;
+  u8[] msg = "a message to sign".toBytes();
+  u8[] sig = ref(SIGN_PKCS1, hashArg, msg);
+  t.isTrue(rsaVerifyPkcs1(k.n, k.e, msg, sig, 32), "the genuine signature verifies");
+
+  // A different message under the same signature.
+  t.isFalse(rsaVerifyPkcs1(k.n, k.e, "a different message".toBytes(), sig, 32),
+            "a different message is refused");
+  // Every part of the signature: the top, the padding, the digest.
+  i32[] spots = i32[](0, 1, 100, 200, 250, 255);
+  for (i32 i = 0; i < spots.len(); i++) {
+    u8[] bad = u8[sig.len()]();
+    for (i32 j = 0; j < sig.len(); j++) { bad[j] = sig[j]; }
+    bad[spots[i]] = bad[spots[i]] ^ 1;
+    t.isFalse(rsaVerifyPkcs1(k.n, k.e, msg, bad, 32),
+              "a signature altered at byte " + itoa64(spots[i] as i64) + " is refused");
+  }
+  // And the wrong hash length, which is a different DER prefix entirely.
+  t.isFalse(rsaVerifyPkcs1(k.n, k.e, msg, sig, 48), "the wrong digest size is refused");
+  return t.report();
+}
+
+export string test_pss_at_every_salt_length(fn[u8[](i32, u8[], u8[])] ref) {
+  // PSS is randomised, so there is nothing to compare byte for byte — only acceptance.
+  // The salt length is the parameter implementations disagree about, so each is checked
+  // against a verifier told the same length.
+  T t = T.create();
+  u8[] sizeArg = u8[2]();
+  sizeArg[0] = 8;
+  sizeArg[1] = 0;
+  Key k = Key.of(ref(KEYGEN, sizeArg, u8[0]()));
+  u8[] msg = "PSS is randomised".toBytes();
+  i32[] salts = i32[](0, 20, 32);
+  for (i32 s = 0; s < salts.len(); s++) {
+    u8[] arg = u8[2]();
+    arg[0] = 32;                                    // SHA-256
+    arg[1] = salts[s];
+    u8[] sig = ref(SIGN_PSS, arg, msg);
+    t.isTrue(rsaVerifyPss(k.n, k.e, msg, sig, 32, salts[s]),
+             "pss with a " + itoa64(salts[s] as i64) + "-byte salt");
+    // Two signatures over one message must differ, or the salt is not being used.
+    u8[] again = ref(SIGN_PSS, arg, msg);
+    if (salts[s] > 0) {
+      bool differ = false;
+      for (i32 i = 0; i < sig.len(); i++) { if (sig[i] != again[i]) { differ = true; } }
+      t.isTrue(differ, "a salted signature is not deterministic");
+    }
+    t.isTrue(rsaVerifyPss(k.n, k.e, msg, again, 32, salts[s]), "and the second verifies too");
+  }
+  return t.report();
+}
+
+export string test_pss_refuses_tampering(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] sizeArg = u8[2]();
+  sizeArg[0] = 8;
+  sizeArg[1] = 0;
+  Key k = Key.of(ref(KEYGEN, sizeArg, u8[0]()));
+  u8[] arg = u8[2]();
+  arg[0] = 32;
+  arg[1] = 32;
+  u8[] msg = "tamper with this".toBytes();
+  u8[] sig = ref(SIGN_PSS, arg, msg);
+  t.isTrue(rsaVerifyPss(k.n, k.e, msg, sig, 32, 32), "the genuine signature verifies");
+
+  i32[] spots = i32[](0, 1, 128, 254, 255);
+  for (i32 i = 0; i < spots.len(); i++) {
+    u8[] bad = u8[sig.len()]();
+    for (i32 j = 0; j < sig.len(); j++) { bad[j] = sig[j]; }
+    bad[spots[i]] = bad[spots[i]] ^ 1;
+    t.isFalse(rsaVerifyPss(k.n, k.e, msg, bad, 32, 32),
+              "pss altered at byte " + itoa64(spots[i] as i64) + " is refused");
+  }
+  t.isFalse(rsaVerifyPss(k.n, k.e, "another message".toBytes(), sig, 32, 32),
+            "a different message is refused");
+  // A salt length the signature was not made with. PSS encodes the salt implicitly, so a
+  // verifier told the wrong length reconstructs a different DB and must refuse.
+  t.isFalse(rsaVerifyPss(k.n, k.e, msg, sig, 32, 20), "the wrong salt length is refused");
+  return t.report();
+}
