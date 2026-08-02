@@ -1164,3 +1164,153 @@ Deno.test("split writes many files, and wget writes one", async () => {
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test("tar writes an archive GNU tar can read", async () => {
+  // The widest applet here: `readDir` and `stat` to walk a tree, `readFile` per entry,
+  // `write` to stream it out. Tested against the real format rather than against itself —
+  // a round trip with its own reader would pass with a checksum that is wrong in a
+  // self-consistent way, which is exactly the mistake ustar's checksum invites.
+  const built = await Deno.makeTempFile({ prefix: "wac-tar-" });
+  const dir = await Deno.makeTempDir({ prefix: "wac-tar-d-" });
+  try {
+    await buildApp(BOX, built, { read: true, write: true });
+    await Deno.mkdir(`${dir}/src/deep`, { recursive: true });
+    // An empty directory only survives if the directory's own entry is written.
+    await Deno.mkdir(`${dir}/src/empty`);
+    await Deno.writeTextFile(`${dir}/src/a.txt`, "hello\n");
+    await Deno.writeTextFile(`${dir}/src/deep/b.txt`, "world\n");
+    // Exactly one block, so the padding path has to write nothing rather than a block.
+    await Deno.writeFile(`${dir}/src/exact.dat`, new Uint8Array(512).fill(7));
+    // And one that is not, so it has to write some.
+    await Deno.writeFile(`${dir}/src/ragged.dat`, new Uint8Array(700).fill(9));
+
+    const tar = new Deno.Command(built, {
+      args: ["tar", "src"], cwd: dir, stdout: "piped", stderr: "piped",
+    }).outputSync();
+    assertEquals(tar.code, 0, new TextDecoder().decode(tar.stderr));
+    await Deno.writeFile(`${dir}/out.tar`, tar.stdout);
+    // Two zero blocks end an archive; without them GNU tar reads the entries and then
+    // says "unexpected EOF", which a round trip with itself would not notice.
+    assertEquals(tar.stdout.length % 512, 0, "an archive is whole blocks");
+
+    const listed = new Deno.Command("tar", {
+      args: ["-tf", "out.tar"], cwd: dir, stdout: "piped", stderr: "piped",
+    }).outputSync();
+    assertEquals(listed.code, 0, new TextDecoder().decode(listed.stderr));
+    const entries = new TextDecoder().decode(listed.stdout).trim().split("\n").sort();
+    assertEquals(
+      entries.join(","),
+      "src/,src/a.txt,src/deep/,src/deep/b.txt,src/empty/,src/exact.dat,src/ragged.dat",
+      entries.join(","),
+    );
+
+    // Extraction, compared tree to tree. This is the assertion that the checksum, the
+    // sizes and the padding are all right at once.
+    await Deno.mkdir(`${dir}/ex`);
+    const ex = new Deno.Command("tar", {
+      args: ["-xf", "out.tar", "-C", "ex"], cwd: dir, stderr: "piped",
+    }).outputSync();
+    assertEquals(ex.code, 0, new TextDecoder().decode(ex.stderr));
+    const diff = new Deno.Command("diff", {
+      args: ["-r", "src", "ex/src"], cwd: dir, stdout: "piped", stderr: "piped",
+    }).outputSync();
+    assertEquals(diff.code, 0, new TextDecoder().decode(diff.stdout));
+
+    // And through box's own compressor, which is the composition worth having.
+    const gz = new Deno.Command(built, {
+      args: ["gzip"], cwd: dir, stdin: "piped", stdout: "piped",
+    }).spawn();
+    const w = gz.stdin.getWriter();
+    w.write(tar.stdout).then(() => w.close());
+    await Deno.writeFile(`${dir}/out.tgz`, (await gz.output()).stdout);
+    await Deno.mkdir(`${dir}/ex2`);
+    const ex2 = new Deno.Command("tar", {
+      args: ["-xzf", "out.tgz", "-C", "ex2"], cwd: dir, stderr: "piped",
+    }).outputSync();
+    assertEquals(ex2.code, 0, new TextDecoder().decode(ex2.stderr));
+    const diff2 = new Deno.Command("diff", {
+      args: ["-r", "src", "ex2/src"], cwd: dir, stdout: "piped",
+    }).outputSync();
+    assertEquals(diff2.code, 0, new TextDecoder().decode(diff2.stdout));
+
+    assertEquals(
+      new Deno.Command(built, { args: ["tar", "absent"], cwd: dir, stderr: "piped" })
+        .outputSync().code,
+      1,
+      "a missing path is an error",
+    );
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("diff agrees with the real one, unified output and exit status", async () => {
+  // The one applet here that is an algorithm rather than plumbing, so it gets the widest
+  // differential test: every shape below is compared byte for byte against `diff -u`.
+  // That is what caught the hunk header for an empty side — a zero-length side starts at
+  // line 0, not 1, which is the sort of convention no amount of reasoning produces.
+  const built = await Deno.makeTempFile({ prefix: "wac-diff-" });
+  const dir = await Deno.makeTempDir({ prefix: "wac-diff-d-" });
+  try {
+    await buildApp(BOX, built, { read: true });
+    const seq = (n: number) => Array.from({ length: n }, (_, i) => `${i + 1}`).join("\n") + "\n";
+
+    const cases: Array<{ what: string; a: string; b: string }> = [
+      { what: "one change", a: seq(8), b: seq(8).replace("\n3\n", "\nX\n") },
+      { what: "two distant hunks", a: seq(30), b: seq(30).replace("\n5\n", "\nfive\n").replace("\n25\n", "\ntwentyfive\n") },
+      // Closer than twice the context, so they must merge into one hunk rather than two.
+      { what: "two close changes merge", a: seq(30), b: seq(30).replace("\n5\n", "\nfive\n").replace("\n7\n", "\nseven\n") },
+      { what: "a deletion", a: seq(30), b: seq(30).replace("\n13\n", "\n") },
+      { what: "an insertion", a: seq(30), b: seq(30).replace("\n13\n", "\ninserted\n13\n") },
+      { what: "change on the first line", a: seq(30), b: `one\n${seq(30).slice(2)}` },
+      { what: "change on the last line", a: seq(30), b: seq(30).replace(/30\n$/, "thirty\n") },
+      { what: "truncated", a: seq(30), b: seq(5) },
+      { what: "appended", a: seq(30), b: seq(40) },
+      { what: "fully reversed", a: seq(20), b: seq(20).trim().split("\n").reverse().join("\n") + "\n" },
+      // The three empty cases: the hunk header's line numbers are the whole point.
+      { what: "new file is empty", a: seq(30), b: "" },
+      { what: "old file is empty", a: "", b: seq(30) },
+      { what: "both empty", a: "", b: "" },
+      { what: "identical", a: seq(30), b: seq(30) },
+    ];
+
+    for (const c of cases) {
+      await Deno.writeTextFile(`${dir}/a`, c.a);
+      await Deno.writeTextFile(`${dir}/b`, c.b);
+      const mine = new Deno.Command(built, {
+        args: ["diff", "a", "b"], cwd: dir, stdout: "piped", stderr: "piped",
+      }).outputSync();
+      const real = new Deno.Command("diff", {
+        args: ["-u", "a", "b"], cwd: dir, stdout: "piped", stderr: "null",
+      }).outputSync();
+
+      // The `---`/`+++` header carries timestamps in the real one, so compare from the
+      // first hunk. Everything after it, including every hunk header, must match.
+      const body = (s: string) => s.split("\n").filter((l) => !l.startsWith("---") && !l.startsWith("+++")).join("\n");
+      assertEquals(
+        body(new TextDecoder().decode(mine.stdout)),
+        body(new TextDecoder().decode(real.stdout)),
+        c.what,
+      );
+      // 0 the same, 1 different, 2 trouble — as the real one does.
+      assertEquals(mine.code, real.code, `${c.what}: exit status`);
+    }
+
+    // A pair too large is refused rather than attempted: the table is quadratic in memory
+    // as well as time, and dying on a big file would be worse than saying so.
+    await Deno.writeTextFile(`${dir}/big`, seq(5000));
+    const refused = new Deno.Command(built, {
+      args: ["diff", "big", "a"], cwd: dir, stdout: "piped", stderr: "piped",
+    }).outputSync();
+    assertEquals(refused.code, 2, "an oversized diff is trouble, not a wrong answer");
+    assertEquals(
+      new TextDecoder().decode(refused.stderr).includes("quadratic"),
+      true,
+      "and it says why",
+    );
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(dir, { recursive: true });
+  }
+});

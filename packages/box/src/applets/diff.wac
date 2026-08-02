@@ -1,0 +1,158 @@
+// A unified diff of two files. `box diff a b`.
+//
+// The one applet here that is an algorithm rather than plumbing: a longest common
+// subsequence, then the differing runs grouped into hunks with three lines of context.
+//
+// The LCS is the straightforward O(n*m) table rather than Myers. That is the honest
+// trade: Myers is O(nd) and matters on large, similar files, and this is quadratic in
+// *memory* as well, so it refuses a pair too big to hold rather than trying and dying.
+// A real diff would want Myers; this wants to be obviously correct.
+//
+// Exit status follows the real one: 0 for the same, 1 for different, 2 for trouble.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { cmpBytes, splitLines } from "../lib/lines.wac";
+import { itoa } from "../lib/num.wac";
+
+/** Above this the table is more memory than the job is worth. */
+i32 MAX_LINES() { return 4000; }
+
+export i32 diff(Core core, Cli cli, Args a) {
+  if (a.rest.len() < 2) { core.warn("usage: " + a.name + " <old> <new>"); return 2; }
+  Input x = readInput(core, cli, a, 0);
+  if (!x.ok) { return 2; }
+  Input y = readInput(core, cli, a, 1);
+  if (!y.ok) { return 2; }
+
+  u8[][] old = splitLines(x.bytes);
+  u8[][] new = splitLines(y.bytes);
+  if (old.len() > MAX_LINES() || new.len() > MAX_LINES()) {
+    core.warn(a.name + ": more than " + itoa(MAX_LINES()) + " lines; this diff is quadratic");
+    return 2;
+  }
+
+  // ops[i] is one of: 0 keep, 1 delete from old, 2 insert from new — the edit script,
+  // read off the LCS table from the front.
+  i32[] ops = script(old, new);
+  bool same = true;
+  for (i32 i = 0; i < ops.len(); i++) { if (ops[i] != 0) { same = false; } }
+  if (same) { return 0; }
+
+  core.log("--- " + x.label);
+  core.log("+++ " + y.label);
+  emit(core, ops, old, new);
+  return 1;
+}
+
+/**
+ * The edit script, from a longest-common-subsequence table.
+ *
+ * `lcs[i][j]` is the length of the longest common subsequence of `old[i..]` and
+ * `new[j..]`, built from the end so the walk that produces the script can go forwards —
+ * which is the order the output needs, and saves reversing it.
+ */
+i32[] script(u8[][] old, u8[][] new) {
+  i32 n = old.len();
+  i32 m = new.len();
+  i32 stride = m + 1;
+  i32[] lcs = i32[(n + 1) * stride](fill: 0);
+  for (i32 i = n - 1; i >= 0; i--) {
+    for (i32 j = m - 1; j >= 0; j--) {
+      i32 best = 0;
+      if (cmpBytes(old[i], new[j]) == 0) {
+        best = lcs[(i + 1) * stride + (j + 1)] + 1;
+      } else {
+        i32 down = lcs[(i + 1) * stride + j];
+        i32 right = lcs[i * stride + (j + 1)];
+        best = down > right ? down : right;
+      }
+      lcs[i * stride + j] = best;
+    }
+  }
+
+  i32[] ops = i32[n + m](fill: 0);
+  i32 at = 0;
+  i32 i = 0;
+  i32 j = 0;
+  while (i < n && j < m) {
+    if (cmpBytes(old[i], new[j]) == 0) { ops[at] = 0; at++; i++; j++; continue; }
+    // Prefer the deletion when the table says the two are equal, which is what makes a
+    // replaced line come out as `-` then `+` rather than the other way round.
+    if (lcs[(i + 1) * stride + j] >= lcs[i * stride + (j + 1)]) {
+      ops[at] = 1; at++; i++;
+    } else {
+      ops[at] = 2; at++; j++;
+    }
+  }
+  while (i < n) { ops[at] = 1; at++; i++; }
+  while (j < m) { ops[at] = 2; at++; j++; }
+
+  i32[] out = i32[at](fill: 0);
+  for (i32 k = 0; k < at; k++) { out[k] = ops[k]; }
+  return out;
+}
+
+/** The script as hunks, each with up to three lines of context either side. */
+void emit(Core core, i32[] ops, u8[][] old, u8[][] new) {
+  i32 ctx = 3;
+  i32 k = 0;
+  i32 oi = 0;                 // how far through `old` the walk has got
+  i32 ni = 0;
+  while (k < ops.len()) {
+    if (ops[k] == 0) { k++; oi++; ni++; continue; }
+
+    // A hunk starts `ctx` keeps before the change and ends `ctx` keeps after the last
+    // one — with two changes closer than that merged, which is why this scans forward
+    // for the end rather than emitting each change on its own.
+    i32 start = k;
+    i32 back = 0;
+    while (start > 0 && ops[start - 1] == 0 && back < ctx) { start--; back++; }
+    // Scan forward for the last change that belongs to this hunk. Two changes separated
+    // by more than `ctx * 2` keeps get their own hunks, because their context would not
+    // have overlapped; anything closer merges, which is why this cannot stop at the
+    // first run of keeps.
+    i32 last = k;                 // one past the last change so far
+    i32 t = k;
+    i32 gap = 0;
+    while (t < ops.len()) {
+      if (ops[t] != 0) { last = t + 1; gap = 0; t++; continue; }
+      gap++;
+      if (gap > ctx * 2) { break; }
+      t++;
+    }
+    i32 stop = last + ctx;
+    if (stop > ops.len()) { stop = ops.len(); }
+
+    // Line numbers of the hunk's first line in each file, counting from the walk.
+    i32 os = oi - back;
+    i32 ns = ni - back;
+    i32 oc = 0;
+    i32 nc = 0;
+    for (i32 t = start; t < stop; t++) {
+      if (ops[t] != 2) { oc++; }
+      if (ops[t] != 1) { nc++; }
+    }
+    // A side contributing no lines starts at 0, not 1 — the unified-diff convention for
+    // "this hunk is entirely an insertion / entirely a deletion". Found by diffing
+    // against an empty file, which was the tenth case tried and the first to catch it.
+    core.log("@@ -" + itoa(oc == 0 ? 0 : os + 1) + "," + itoa(oc)
+           + " +" + itoa(nc == 0 ? 0 : ns + 1) + "," + itoa(nc) + " @@");
+
+    i32 o = os;
+    i32 nn = ns;
+    for (i32 t = start; t < stop; t++) {
+      if (ops[t] == 0) { core.log(" " + string.fromBytes(old[o])); o++; nn++; }
+      else if (ops[t] == 1) { core.log("-" + string.fromBytes(old[o])); o++; }
+      else { core.log("+" + string.fromBytes(new[nn])); nn++; }
+    }
+
+    // Resume after the hunk.
+    for (i32 t = k; t < stop; t++) {
+      if (ops[t] != 2) { oi++; }
+      if (ops[t] != 1) { ni++; }
+    }
+    k = stop;
+  }
+}

@@ -35,6 +35,7 @@ import { cp } from "./applets/cp.wac";
 import { crc32 } from "./applets/crc32.wac";
 import { cut } from "./applets/cut.wac";
 import { date } from "./applets/date.wac";
+import { diff } from "./applets/diff.wac";
 import { dirname } from "./applets/dirname.wac";
 import { du } from "./applets/du.wac";
 import { echo } from "./applets/echo.wac";
@@ -68,6 +69,7 @@ import { stat } from "./applets/stat.wac";
 import { strings } from "./applets/strings.wac";
 import { tac } from "./applets/tac.wac";
 import { tail } from "./applets/tail.wac";
+import { tar } from "./applets/tar.wac";
 import { tee } from "./applets/tee.wac";
 import { touch } from "./applets/touch.wac";
 import { tr } from "./applets/tr.wac";
@@ -94,6 +96,7 @@ export i32 main(Core core, Cli cli) {
   if (applet == "crc32")     { return crc32(core, cli, a); }
   if (applet == "cut")       { return cut(core, cli, a); }
   if (applet == "date")      { return date(core, cli, a); }
+  if (applet == "diff")      { return diff(core, cli, a); }
   if (applet == "dirname")   { return dirname(core, cli, a); }
   if (applet == "du")        { return du(core, cli, a); }
   if (applet == "echo")      { return echo(core, cli, a); }
@@ -128,6 +131,7 @@ export i32 main(Core core, Cli cli) {
   if (applet == "strings")   { return strings(core, cli, a); }
   if (applet == "tac")       { return tac(core, cli, a); }
   if (applet == "tail")      { return tail(core, cli, a); }
+  if (applet == "tar")       { return tar(core, cli, a); }
   if (applet == "tee")       { return tee(core, cli, a); }
   if (applet == "touch")     { return touch(core, cli, a); }
   if (applet == "tr")        { return tr(core, cli, a); }
@@ -152,11 +156,11 @@ export i32 main(Core core, Cli cli) {
 
 i32 usage(Core core) {
   core.warn("usage: box <applet> [-flags] [args]");
-  core.warn("  base32 base64 basename cat cp crc32 cut date dirname du echo false find");
-  core.warn("  fold get grep gunzip gzip head hex httpd json ls mkdir mv nl paste rev rm");
-  core.warn("  rmdir seq serve sha256sum sha512sum shuf sort split sponge stat strings");
-  core.warn("  tac tail tee touch tr true uniq unzstd urldecode urlencode uuid wc wget");
-  core.warn("  yes zstd");
+  core.warn("  base32 base64 basename cat cp crc32 cut date diff dirname du echo false");
+  core.warn("  find fold get grep gunzip gzip head hex httpd json ls mkdir mv nl paste");
+  core.warn("  rev rm rmdir seq serve sha256sum sha512sum shuf sort split sponge stat");
+  core.warn("  strings tac tail tar tee touch tr true uniq unzstd urldecode urlencode");
+  core.warn("  uuid wc wget yes zstd");
   core.warn("flags: grep -ivnc   sort -ru   uniq -c   wc -lwc   head/tail/fold -N");
   core.warn("       cut -f<n> -d<c>   tr <set1> <set2>   mkdir -p   rm -rf   json -c");
   core.warn("net:   get <host> [path] [-<port>] [-i]   wget <host> <path> <out>\n"
