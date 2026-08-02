@@ -3,13 +3,18 @@
 // `link.ts` gets you a CREATE2 and 72 bytes of key material. This turns that into something
 // that carries data: relay cells in both directions, and a stream on top of them.
 //
-// ## One hop
+// ## The onion
 //
-// A real client uses three, and extends to the second and third with RELAY_EXTEND2 cells
-// sent through the hops already built — which is the property that makes Tor Tor, since no
-// single relay learns both who you are and where you are going. This builds one, which is
-// enough to exercise every layer below it and provides no anonymity whatsoever. Extending
-// is the next piece of work, not a missing detail.
+// A circuit is a list of hops, and a cell for hop N is encrypted N times: with hop N's key
+// first, then N-1's, out to hop 1's, which is the only layer the first relay can remove.
+// Each relay peels one layer and forwards what it finds, so no relay sees more than its two
+// neighbours. That is the whole idea, and it is why `extend` sends its request *through* the
+// hops already built rather than opening a new connection.
+//
+// Receiving inverts it: peel with hop 1 and ask whether it is hop 1's cell; if not, peel
+// with hop 2 and ask again. The peel always happens — every hop's cipher advanced when it
+// forwarded the cell — while the digest advances only for the hop the cell came from. That
+// asymmetry is why `hopPeel` and `hopCheck` are separate calls.
 //
 // ## Flow control is not implemented
 //
@@ -26,7 +31,20 @@ const hopInit = mod.hopInit as (material: Uint8Array) => Uint8Array;
 const hopSend = mod.hopSend as (
   state: Uint8Array, cmd: number, streamId: number, data: Uint8Array,
 ) => Uint8Array;
-const hopRecv = mod.hopRecv as (state: Uint8Array, payload: Uint8Array) => Uint8Array;
+const hopPeel = mod.hopPeel as (state: Uint8Array, payload: Uint8Array) => Uint8Array;
+const hopWrap = mod.hopWrap as (state: Uint8Array, payload: Uint8Array) => Uint8Array;
+const hopCheck = mod.hopCheck as (state: Uint8Array, body: Uint8Array) => Uint8Array;
+const extend2Body = mod.extend2Body as (
+  ipv4: Uint8Array, port: number, identity: Uint8Array, handshake: Uint8Array,
+) => Uint8Array;
+const extended2Reply = mod.extended2Reply as (data: Uint8Array) => Uint8Array;
+const ntorClientRequest = mod.ntorClientRequest as (
+  identity: Uint8Array, onionKey: Uint8Array, ephemeralPriv: Uint8Array,
+) => Uint8Array;
+const ntorClientFinish = mod.ntorClientFinish as (
+  identity: Uint8Array, onionKey: Uint8Array, ephemeralPriv: Uint8Array,
+  reply: Uint8Array, keyLen: number,
+) => Uint8Array;
 const hopStateLen = (mod.hopStateLen as () => number)();
 const relayCommand = mod.relayCommand as (body: Uint8Array) => number;
 const relayStreamId = mod.relayStreamId as (body: Uint8Array) => number;
@@ -47,6 +65,8 @@ export const RELAY = {
   connected: (mod.cmdRelayConnected as () => number)(),
   sendme: (mod.cmdRelaySendme as () => number)(),
   beginDir: (mod.cmdRelayBeginDir as () => number)(),
+  extend2: (mod.cmdRelayExtend2 as () => number)(),
+  extended2: (mod.cmdRelayExtended2 as () => number)(),
 } as const;
 
 /** Why a stream ended, from tor-spec §6.3. Enough of them to make a message worth reading. */
@@ -60,21 +80,45 @@ const END_REASONS: Record<number, string> = {
 export class Circuit {
   #link: Link;
   #circId: number;
-  #hop: Uint8Array;
+  #hops: Uint8Array[];
   #nextStreamId = 1;
 
   constructor(link: Link, circId: number, material: Uint8Array) {
     this.#link = link;
     this.#circId = circId;
-    this.#hop = hopInit(material);
+    this.#hops = [hopInit(material)];
   }
 
-  /** Send one relay cell down the circuit. */
-  async #send(command: number, streamId: number, data: Uint8Array): Promise<void> {
-    const r = hopSend(this.#hop, command, streamId, data);
-    this.#hop = r.slice(0, hopStateLen);
+  /** How many relays the circuit runs through. */
+  get length(): number {
+    return this.#hops.length;
+  }
+
+  /**
+   * Send one relay cell to hop `target` (the last hop by default).
+   *
+   * `cellCommand` exists for EXTEND2, which must travel in a RELAY_EARLY cell rather than a
+   * RELAY one. The count of RELAY_EARLY cells a circuit may carry is capped, and that cap is
+   * what bounds how long a circuit can be made — an attacker who could extend without limit
+   * could build a circuit that loops through one relay repeatedly.
+   */
+  async #send(
+    command: number, streamId: number, data: Uint8Array,
+    opts: { target?: number; cellCommand?: number } = {},
+  ): Promise<void> {
+    const target = opts.target ?? this.#hops.length - 1;
+    const r = hopSend(this.#hops[target], command, streamId, data);
+    this.#hops[target] = r.slice(0, hopStateLen);
+    let payload = r.slice(hopStateLen);
+    // Then one layer per hop between us and the target, nearest last: hop 1's layer must be
+    // the outermost, because hop 1 is the only relay that can remove it.
+    for (let i = target - 1; i >= 0; i--) {
+      const w = hopWrap(this.#hops[i], payload);
+      this.#hops[i] = w.slice(0, hopStateLen);
+      payload = w.slice(hopStateLen);
+    }
     await this.#link.conn.write(
-      encodeFixed(this.#circId, CMD.relay, r.slice(hopStateLen)),
+      encodeFixed(this.#circId, opts.cellCommand ?? CMD.relay, payload),
     );
   }
 
@@ -95,12 +139,25 @@ export class Circuit {
       }
       if (cmd !== CMD.relay) continue;   // padding and the like
 
-      const r = hopRecv(this.#hop, cellPayload(cell, 0));
-      this.#hop = r.slice(0, hopStateLen);
-      if (r[hopStateLen] !== 1) {
-        throw new Error("a relay cell failed its digest — the circuit is out of step");
+      let payload = cellPayload(cell, 0);
+      let body: Uint8Array | null = null;
+      for (let i = 0; i < this.#hops.length; i++) {
+        const peeled = hopPeel(this.#hops[i], payload);
+        this.#hops[i] = peeled.slice(0, hopStateLen);
+        payload = peeled.slice(hopStateLen);
+        const checked = hopCheck(this.#hops[i], payload);
+        this.#hops[i] = checked.slice(0, hopStateLen);
+        if (checked[hopStateLen] === 1) {
+          body = payload;
+          break;
+        }
       }
-      const body = r.slice(hopStateLen + 1);
+      if (body === null) {
+        // Every hop's cipher has advanced by now and none claimed the cell, so there is no
+        // state to roll back to and no way to resynchronise. Tor's own client tears the
+        // circuit down here for the same reason.
+        throw new Error("a relay cell was not recognised by any hop — the circuit is dead");
+      }
       const command = relayCommand(body);
       // A SENDME is the peer giving us room to send more. We do not track a window, so
       // there is nothing to credit; swallow it rather than handing it to the caller as data.
@@ -148,6 +205,46 @@ export class Circuit {
       throw new Error(`expected RELAY_CONNECTED, got relay command ${reply.command}`);
     }
     return streamId;
+  }
+
+  /**
+   * Extend the circuit by one relay, through the hops already built.
+   *
+   * The request goes to the current last hop, which opens its own connection onward and
+   * relays the ntor handshake. We authenticate the new relay ourselves: the AUTH check in
+   * `ntorClientFinish` is against the onion key the consensus gave us, so a hop that
+   * connected us somewhere else cannot produce a reply that verifies.
+   */
+  async extend(relay: {
+    address: string;
+    orPort: number;
+    identity: Uint8Array;
+    ntorOnionKey: Uint8Array;
+  }): Promise<void> {
+    const octets = relay.address.split(".").map(Number);
+    if (octets.length !== 4 || octets.some((n) => !(n >= 0 && n <= 255))) {
+      throw new Error(`extend needs an IPv4 address, got ${relay.address}`);
+    }
+    const ephemeralPriv = crypto.getRandomValues(new Uint8Array(32));
+    const handshake = ntorClientRequest(relay.identity, relay.ntorOnionKey, ephemeralPriv);
+    const body = extend2Body(
+      Uint8Array.from(octets), relay.orPort, relay.identity, handshake,
+    );
+    // Stream id 0: EXTEND2 is addressed to the hop, not to any stream on it.
+    await this.#send(RELAY.extend2, 0, body, { cellCommand: CMD.relayEarly });
+
+    const reply = await this.#recv();
+    if (reply.command !== RELAY.extended2) {
+      throw new Error(`expected RELAY_EXTENDED2, got relay command ${reply.command}`);
+    }
+    const keys = ntorClientFinish(
+      relay.identity, relay.ntorOnionKey, ephemeralPriv,
+      extended2Reply(reply.data), 72,
+    );
+    if (keys.length === 0) {
+      throw new Error(`ntor failed extending to ${relay.address}: it did not authenticate`);
+    }
+    this.#hops.push(hopInit(keys));
   }
 
   async write(streamId: number, data: Uint8Array): Promise<void> {

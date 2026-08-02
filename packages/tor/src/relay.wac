@@ -276,19 +276,108 @@ export u8[] hopSend(u8[] state, i32 command, i32 streamId, u8[] data) {
 }
 
 /**
- * Decrypt a relay cell: the new state, a recognised flag, then the 509-byte body.
+ * Take one layer of encryption off, without asking whose cell it is.
  *
- * The flag rather than an empty body on failure, because a cell that does not verify still
- * advanced the cipher and the caller needs the state back either way.
+ * Separate from the digest check because a multi-hop circuit needs them apart: an incoming
+ * cell is peeled by hop 1, tested, and if it is not hop 1's it is peeled by hop 2 and tested
+ * again. The peel always happens — every hop's cipher advances on every cell it forwards —
+ * while the digest must only advance for the hop the cell actually came from.
+ *
+ * Returns the new state followed by the 509 bytes.
  */
-export u8[] hopRecv(u8[] state, u8[] payload) {
+export u8[] hopPeel(u8[] state, u8[] payload) {
   Hop h = hopLoad(state);
   u8[] body = decryptRelay(h, payload);
+  u8[] saved = hopSave(h);
+  u8[] out = u8[saved.len() + body.len()]();
+  for (i32 i = 0; i < saved.len(); i++) { out[i] = saved[i]; }
+  for (i32 i = 0; i < body.len(); i++) { out[saved.len() + i] = body[i]; }
+  return out;
+}
+
+/** Put one layer of encryption on, for a hop the cell is only passing through. */
+export u8[] hopWrap(u8[] state, u8[] payload) {
+  Hop h = hopLoad(state);
+  u8[] wire = h.forwardCipher.apply(payload);
+  u8[] saved = hopSave(h);
+  u8[] out = u8[saved.len() + wire.len()]();
+  for (i32 i = 0; i < saved.len(); i++) { out[i] = saved[i]; }
+  for (i32 i = 0; i < wire.len(); i++) { out[saved.len() + i] = wire[i]; }
+  return out;
+}
+
+/** Whether a peeled body is this hop's, advancing its digest if so: state then a flag. */
+export u8[] hopCheck(u8[] state, u8[] body) {
+  Hop h = hopLoad(state);
   bool ok = relayRecognized(h, body);
   u8[] saved = hopSave(h);
-  u8[] out = u8[saved.len() + 1 + body.len()]();
+  u8[] out = u8[saved.len() + 1]();
   for (i32 i = 0; i < saved.len(); i++) { out[i] = saved[i]; }
   out[saved.len()] = ok ? 1 : 0;
-  for (i32 i = 0; i < body.len(); i++) { out[saved.len() + 1 + i] = body[i]; }
+  return out;
+}
+
+/**
+ * Decrypt a relay cell for a one-hop circuit: state, a recognised flag, then the body.
+ *
+ * `hopPeel` and `hopCheck` composed, which is all a single hop needs. The flag rather than
+ * an empty body on failure, because a cell that does not verify still advanced the cipher
+ * and the caller needs the state back either way.
+ */
+export u8[] hopRecv(u8[] state, u8[] payload) {
+  u8[] peeled = hopPeel(state, payload);
+  u8[] body = u8[509]();
+  for (i32 i = 0; i < 509; i++) { body[i] = peeled[hopStateLen() + i]; }
+  u8[] checked = hopCheck(sliceOf(peeled, 0, hopStateLen()), body);
+
+  u8[] out = u8[hopStateLen() + 1 + 509]();
+  for (i32 i = 0; i < hopStateLen() + 1; i++) { out[i] = checked[i]; }
+  for (i32 i = 0; i < 509; i++) { out[hopStateLen() + 1 + i] = body[i]; }
+  return out;
+}
+
+/**
+ * Build the body of a RELAY_EXTEND2, asking the current last hop to reach a further relay.
+ *
+ * Two link specifiers: where the relay is, and who it must prove to be. The identity is not
+ * decoration — without it the hop we are asking could connect us to any relay it liked and
+ * we would run the ntor handshake against whatever key it offered.
+ *
+ *   NSPEC (1) | { LSTYPE (1) | LSLEN (1) | LSPEC } * | HTYPE (2) | HLEN (2) | HDATA
+ */
+export u8[] extend2Body(u8[] ipv4, i32 port, u8[] identity, u8[] handshake) {
+  if (ipv4.len() != 4 || identity.len() != 20) { trap; }
+  i32 n = 1 + (2 + 6) + (2 + 20) + 4 + handshake.len();
+  u8[] out = u8[n]();
+  i32 at = 0;
+  out[at] = 2; at += 1;              // two link specifiers
+
+  out[at] = 0; at += 1;              // LSTYPE 0: TLS-over-TCP, IPv4
+  out[at] = 6; at += 1;
+  for (i32 i = 0; i < 4; i++) { out[at + i] = ipv4[i]; }
+  at += 4;
+  out[at] = (port >> 8) & 0xFF; at += 1;
+  out[at] = port & 0xFF; at += 1;
+
+  out[at] = 2; at += 1;              // LSTYPE 2: legacy RSA identity fingerprint
+  out[at] = 20; at += 1;
+  for (i32 i = 0; i < 20; i++) { out[at + i] = identity[i]; }
+  at += 20;
+
+  out[at] = 0; at += 1;              // HTYPE: ntor
+  out[at] = 2; at += 1;
+  out[at] = (handshake.len() >> 8) & 0xFF; at += 1;
+  out[at] = handshake.len() & 0xFF; at += 1;
+  for (i32 i = 0; i < handshake.len(); i++) { out[at + i] = handshake[i]; }
+  return out;
+}
+
+/** The ntor reply out of a RELAY_EXTENDED2 body: HLEN (2) | HDATA. */
+export u8[] extended2Reply(u8[] data) {
+  if (data.len() < 2) { trap; }
+  i32 len = (data[0] << 8) | data[1];
+  if (2 + len > data.len()) { trap; }
+  u8[] out = u8[len]();
+  for (i32 i = 0; i < len; i++) { out[i] = data[2 + i]; }
   return out;
 }

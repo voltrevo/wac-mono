@@ -48,3 +48,16 @@ export i32 cmdRelayEnd() { return re(); }
 export i32 cmdRelayConnected() { return rcon(); }
 export i32 cmdRelaySendme() { return rsm(); }
 export i32 cmdRelayBeginDir() { return rbd(); }
+
+import {
+  hopPeel as hp, hopWrap as hw, hopCheck as hc,
+  extend2Body as e2b, extended2Reply as e2r, relayExtend2 as rx2, relayExtended2 as rx2d,
+} from "../../src/relay.wac";
+
+export u8[] hopPeel(u8[] st, u8[] p) { return hp(st, p); }
+export u8[] hopWrap(u8[] st, u8[] p) { return hw(st, p); }
+export u8[] hopCheck(u8[] st, u8[] b) { return hc(st, b); }
+export u8[] extend2Body(u8[] ip, i32 port, u8[] id, u8[] hs) { return e2b(ip, port, id, hs); }
+export u8[] extended2Reply(u8[] d) { return e2r(d); }
+export i32 cmdRelayExtend2() { return rx2(); }
+export i32 cmdRelayExtended2() { return rx2d(); }
