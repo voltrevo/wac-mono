@@ -45,7 +45,8 @@ import { sha384 } from "../../crypto/src/sha512.wac";
 import {
   Der, oidBasicConstraints, oidEcPublicKey, oidKeyUsage, oidEcdsaSha256, oidEcdsaSha384, oidEd25519,
   oidEquals, oidPrime256v1, oidRsaEncryption, oidRsaPss, oidRsaSha256, oidRsaSha384,
-  oidRsaSha512, oidSecp384r1, oidSubjectAltName, unsignedInteger,
+  oidRsaSha512, oidSecp384r1, oidSubjectAltName, oidExtKeyUsage, oidServerAuth,
+  oidAnyExtKeyUsage, oidNameConstraints, unsignedInteger,
 } from "./asn1.wac";
 
 /** Key types this understands. */
@@ -107,6 +108,30 @@ export struct Cert {
   bool canSignCerts;
   /** The dNSName entries in subjectAltName, NUL-separated. */
   u8[] dnsNames;
+  /**
+   * Whether extKeyUsage permits TLS server authentication, or true when it is absent.
+   *
+   * Absent means unrestricted, the same rule as `canSignCerts`. Present means the listed
+   * purposes are the only ones, so a certificate issued for e-mail or code signing is
+   * not usable here — it is a valid certificate for something else.
+   */
+  bool serverAuth;
+  /**
+   * A critical extension this parser does not process, which makes the certificate
+   * unusable rather than merely unfamiliar.
+   *
+   * Also set for a nameConstraints extension whose subtrees are of a kind not enforced
+   * below, because a restriction understood in part is not understood.
+   */
+  bool badCritical;
+  /**
+   * nameConstraints dNSName subtrees, NUL-separated. Empty means no constraint.
+   *
+   * These limit what a CA may vouch for. A sub-CA constrained to `example.com` that can
+   * still issue for a bank is the whole reason the extension exists.
+   */
+  u8[] permittedDns;
+  u8[] excludedDns;
 }
 
 /**
@@ -231,6 +256,10 @@ export Cert parseCert(u8[] der) {
   bool isCa = false;
   i32 pathLen = -1;
   bool canSignCerts = true;
+  bool serverAuth = true;         // absent extKeyUsage means unrestricted
+  bool badCritical = false;
+  u8[] permittedDns = u8[0]();
+  u8[] excludedDns = u8[0]();
   u8[] dnsNames = u8[0]();
 
   if (t.nextIs(0x81)) { t.skip(); }   // issuerUniqueID
@@ -241,7 +270,14 @@ export Cert parseCert(u8[] der) {
     while (!exts.empty()) {
       Der ext = exts.element(0x30);
       u8[] id = ext.oid();
-      if (ext.nextIs(0x01)) { ext.skip(); }   // critical, whose value we do not need
+      // RFC 5280 §4.2: a certificate MUST be rejected if it carries a critical extension
+      // the verifier does not recognise. "Critical" is the issuer saying this restriction
+      // is load-bearing, so skipping one accepts the certificate on terms nobody checked.
+      // Recording it and refusing later beats trapping, for the same reason an unsupported
+      // key algorithm does not trap: a trust store is full of certificates that are merely
+      // not for us.
+      bool critical = false;
+      if (ext.nextIs(0x01)) { critical = ext.element(0x01).rest()[0] != 0; }
       u8[] value = ext.element(0x04).rest();
 
       if (oidEquals(id, oidBasicConstraints())) {
@@ -265,6 +301,33 @@ export Cert parseCert(u8[] der) {
         canSignCerts = bits.len() >= 2 && (bits[1] & 0x04) != 0;
       } else if (oidEquals(id, oidSubjectAltName())) {
         dnsNames = collectDnsNames(value);
+      } else if (oidEquals(id, oidExtKeyUsage())) {
+        // Present means the enumerated purposes are the only ones allowed, so serverAuth
+        // has to be among them. A certificate issued for e-mail or code signing is a
+        // perfectly valid certificate that simply is not for this, and accepting it is
+        // how a CA's separation between purposes stops meaning anything.
+        serverAuth = false;
+        Der eku = Der.create(value);
+        Der purposes = eku.element(0x30);
+        while (!purposes.empty()) {
+          u8[] purpose = purposes.oid();
+          if (oidEquals(purpose, oidServerAuth()) || oidEquals(purpose, oidAnyExtKeyUsage())) {
+            serverAuth = true;
+          }
+        }
+      } else if (oidEquals(id, oidNameConstraints())) {
+        // Only dNSName subtrees are enforced. Anything else — an IP range, a directory
+        // name, an e-mail domain, or a subtree with a minimum or maximum — is a real
+        // restriction that would go unapplied, so the certificate is marked unusable
+        // rather than being trusted with the part that was understood.
+        if (constraintsUnderstood(value)) {
+          permittedDns = subtreeDns(value, 0xA0);
+          excludedDns = subtreeDns(value, 0xA1);
+        } else {
+          badCritical = true;
+        }
+      } else if (critical) {
+        badCritical = true;
       }
     }
   }
@@ -286,7 +349,124 @@ export Cert parseCert(u8[] der) {
   u8[] signature = cert.bitString();
 
   return Cert(tbs, signature, sigAlg, keyType, publicKey, rsaExponent, issuer, subject,
-              notBefore, notAfter, isCa, pathLen, canSignCerts, dnsNames);
+              notBefore, notAfter, isCa, pathLen, canSignCerts, dnsNames,
+              serverAuth, badCritical, permittedDns, excludedDns);
+}
+
+/**
+ * Whether every subtree in a nameConstraints extension is one this code enforces.
+ *
+ * Only dNSName bases with no minimum or maximum. RFC 5280 §4.2.1.10 requires minimum to
+ * be zero and maximum to be absent, so a certificate using them is already irregular;
+ * the other GeneralName kinds — IP ranges, directory names, e-mail domains — are ordinary
+ * and simply not implemented. In both cases the answer is that the certificate cannot be
+ * used, because the alternative is applying the constraints that were understood and
+ * quietly dropping the rest.
+ */
+bool constraintsUnderstood(u8[] value) {
+  Der nc = Der.create(value);
+  Der seq = nc.element(0x30);
+  while (!seq.empty()) {
+    i32 tag = seq.peekTag();
+    Der subtrees = seq.any();
+    if (tag != 0xA0 && tag != 0xA1) { return false; }
+    while (!subtrees.empty()) {
+      Der sub = subtrees.element(0x30);
+      i32 gtag = sub.peekTag();
+      sub.skip();
+      if (gtag != 0x82) { return false; }   // not a dNSName
+      if (!sub.empty()) { return false; }   // a minimum or maximum follows the base
+    }
+  }
+  return true;
+}
+
+/** The dNSName bases of one side of a nameConstraints extension, NUL-joined. */
+u8[] subtreeDns(u8[] value, i32 want) {
+  Der nc = Der.create(value);
+  Der seq = nc.element(0x30);
+  u8[] acc = u8[0]();
+  while (!seq.empty()) {
+    i32 tag = seq.peekTag();
+    Der subtrees = seq.any();
+    if (tag == want) {
+      while (!subtrees.empty()) {
+        Der sub = subtrees.element(0x30);
+        i32 gtag = sub.peekTag();
+        Der base = sub.any();
+        if (gtag == 0x82) { acc = joinName(acc, base.rest()); }
+      }
+    }
+  }
+  return acc;
+}
+
+/** Append one name to a NUL-separated list. */
+u8[] joinName(u8[] acc, u8[] name) {
+  u8[] out = u8[acc.len() + (acc.len() > 0 ? 1 : 0) + name.len()]();
+  i32 p = 0;
+  for (i32 i = 0; i < acc.len(); i++) { out[p] = acc[i]; p++; }
+  if (acc.len() > 0) { out[p] = 0; p++; }
+  for (i32 i = 0; i < name.len(); i++) { out[p] = name[i]; p++; }
+  return out;
+}
+
+i32 lowerByte(i32 c) { return c >= 65 && c <= 90 ? c + 32 : c; }
+
+/**
+ * Whether `name` falls inside the subtree `list[s..e)`, by RFC 5280 §4.2.1.10.
+ *
+ * A dNSName subtree covers the name itself and anything below it, matched on label
+ * boundaries: `wac.test` covers `a.wac.test` and `wac.test`, and does not cover
+ * `evilwac.test`. Comparing by suffix alone is what makes the third one match, and it is
+ * how a constrained CA escapes its namespace by registering the right last letters.
+ */
+bool baseCovers(u8[] list, i32 s, i32 e, u8[] name) {
+  i32 bl = e - s;
+  if (bl == 0) { return true; }            // an empty base is the whole namespace
+  if (name.len() < bl) { return false; }
+  i32 off = name.len() - bl;
+  for (i32 i = 0; i < bl; i++) {
+    if (lowerByte(name[off + i]) != lowerByte(list[s + i])) { return false; }
+  }
+  return off == 0 || name[off - 1] == '.';
+}
+
+/** Whether any subtree in a NUL-separated list covers `name`. */
+bool anyBaseCovers(u8[] list, u8[] name) {
+  if (list.len() == 0) { return false; }
+  i32 s = 0;
+  for (i32 i = 0; i <= list.len(); i++) {
+    if (i == list.len() || list[i] == 0) {
+      if (baseCovers(list, s, i, name)) { return true; }
+      s = i + 1;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether the leaf's names satisfy a CA's nameConstraints.
+ *
+ * Checked against the *leaf*, not against the certificate directly below the CA, because
+ * the constraint governs everything the CA is an authority for however far down it sits.
+ */
+bool namesAllowed(Cert leaf, Cert ca) {
+  if (ca.permittedDns.len() == 0 && ca.excludedDns.len() == 0) { return true; }
+  u8[] names = leaf.dnsNames;
+  i32 s = 0;
+  for (i32 i = 0; i <= names.len(); i++) {
+    if (i == names.len() || names[i] == 0) {
+      if (i > s) {
+        u8[] one = u8[i - s]();
+        for (i32 k = 0; k < one.len(); k++) { one[k] = names[s + k]; }
+        if (ca.permittedDns.len() > 0 && !anyBaseCovers(ca.permittedDns, one)) { return false; }
+        if (anyBaseCovers(ca.excludedDns, one)) { return false; }
+      }
+      s = i + 1;
+    }
+  }
+  return true;
 }
 
 /** The dNSName entries of a SubjectAltName, joined with NUL bytes. */
@@ -445,6 +625,8 @@ export i32 verifyChain(Cert leaf, Cert root, u8[] host, i64 now) {
   if (!nameEquals(leaf.issuer, root.subject)) { return 5; }
   if (!certSignedBy(leaf, root)) { return 6; }
   if (!certMatchesHost(leaf, host)) { return 7; }
+  if (leaf.badCritical) { return 12; }
+  if (!leaf.serverAuth) { return 11; }
   return 0;
 }
 
@@ -511,7 +693,12 @@ export bool certVerifySignature(Cert c, i32 scheme, u8[] content, u8[] signature
  *
  * Returns 0 for success, or a code saying which check failed. Codes are distinguished
  * because "expired", "unknown issuer" and "wrong name" want different alerts and
- * different advice to a human.
+ * different advice to a human:
+ *
+ *   1 not yet valid          2 expired               3 root out of date
+ *   5 unknown authority      7 name mismatch         8 empty chain
+ *   9 depth exceeded        10 name constraint      11 not for server authentication
+ *  12 unrecognised critical extension
  *
  * `chainOffsets` and `rootOffsets` describe where each DER certificate begins inside
  * the two blobs, because wac has no array of byte arrays crossing a boundary and
@@ -527,6 +714,8 @@ export i32 verifyPath(u8[] chain, i32[] chainOffsets, u8[] roots, i32[] rootOffs
   if (now < leaf.notBefore) { return 1; }
   if (now > leaf.notAfter) { return 2; }
   if (!certMatchesHost(leaf, host)) { return 7; }
+  if (leaf.badCritical) { return 12; }
+  if (!leaf.serverAuth) { return 11; }
 
   Cert current = leaf;
   i32 depth = 0;
@@ -536,10 +725,16 @@ export i32 verifyPath(u8[] chain, i32[] chainOffsets, u8[] roots, i32[] rootOffs
       Cert root = parseCert(slice(roots, rootOffsets[2 * r], rootOffsets[2 * r + 1]));
       if (!nameEquals(current.issuer, root.subject)) { continue; }
       if (root.keyType == 0) { continue; }       // an algorithm we cannot check
+      if (root.badCritical) { continue; }        // terms we cannot honour
       if (!root.isCa) { continue; }
       if (!root.canSignCerts) { continue; }
       if (now < root.notBefore || now > root.notAfter) { continue; }
-      if (certSignedBy(current, root)) { return 0; }
+      if (certSignedBy(current, root)) {
+        // After the signature, so a name-constrained root that did not sign this chain
+        // cannot reject it on behalf of the one that did.
+        if (!namesAllowed(leaf, root)) { return 10; }
+        return 0;
+      }
       // A root with a matching name whose signature does not check is not this path's
       // root. Two authorities can share a subject name, so this keeps looking rather
       // than failing — which is the difference between working and not for the handful
@@ -552,6 +747,7 @@ export i32 verifyPath(u8[] chain, i32[] chainOffsets, u8[] roots, i32[] rootOffs
       Cert cand = parseCert(slice(chain, chainOffsets[2 * i], chainOffsets[2 * i + 1]));
       if (!nameEquals(current.issuer, cand.subject)) { continue; }
       if (cand.keyType == 0) { continue; }
+      if (cand.badCritical) { continue; }
       if (!cand.isCa) { continue; }              // a leaf cannot vouch for anything
       if (!cand.canSignCerts) { continue; }
       if (now < cand.notBefore || now > cand.notAfter) { continue; }
@@ -560,6 +756,7 @@ export i32 verifyPath(u8[] chain, i32[] chainOffsets, u8[] roots, i32[] rootOffs
       // used further down a chain than its issuer allowed.
       if (cand.pathLen >= 0 && depth > cand.pathLen) { continue; }
       if (!certSignedBy(current, cand)) { continue; }
+      if (!namesAllowed(leaf, cand)) { return 10; }
       current = cand;
       advanced = true;
       i = nChain;
