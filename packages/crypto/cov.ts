@@ -586,6 +586,8 @@ const p256 = await instrument("packages/crypto/test/wac/p256_probe.wac");
   // rather than always SHA-256; nothing else in this package calls it.
   g<(p: Uint8Array, d: Uint8Array, s: Uint8Array) => boolean>("verifyDigest")(
     pub, sha256(msg), sig);
+  // Decode-and-re-encode, which the canonicity tests drive at the boundary.
+  g<(p: Uint8Array) => Uint8Array>("reencode")(pub);
 }
 
 const rsa = await instrument("packages/crypto/test/wac/rsa_probe.wac");

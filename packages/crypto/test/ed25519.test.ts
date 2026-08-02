@@ -192,3 +192,23 @@ Deno.test("ed25519: signs messages across SHA-512 block boundaries", async () =>
     if (hex(sign(seed, msg)) !== hex(want)) throw new Error(`length ${n}: ${hex(sign(seed, msg))}`);
   }
 });
+
+Deno.test("ed25519: a seed that is not 32 bytes is refused, long as well as short", () => {
+  // The same asymmetry as P-256's length guards. A short seed runs off the end of the
+  // array inside expandSeed and wasm traps regardless, so the guard looks tested; a long
+  // one is read for its first 32 bytes and the tail ignored, so `ed25519PublicKey` would
+  // happily answer for a 33-byte "seed" and give the same key as its 32-byte prefix. Two
+  // different inputs, one identity — which is the kind of thing that only ever surfaces
+  // as a key that mysteriously already exists.
+  const traps = (f: () => unknown) => { try { f(); return false; } catch { return true; } };
+  const msg = new TextEncoder().encode("seed lengths");
+  const seed = Uint8Array.from({ length: 32 }, (_, i) => i);
+
+  if (publicKey(seed).length !== 32) throw new Error("the genuine seed was rejected");
+  for (const n of [0, 31, 33, 64]) {
+    const bad = new Uint8Array(n);
+    bad.set(seed.subarray(0, Math.min(n, 32)));
+    if (!traps(() => publicKey(bad))) throw new Error(`accepted a ${n}-byte seed for a key`);
+    if (!traps(() => sign(bad, msg))) throw new Error(`accepted a ${n}-byte seed for signing`);
+  }
+});
