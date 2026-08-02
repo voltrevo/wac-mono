@@ -58,22 +58,29 @@ one of them back to the input, across a corpus and a fuzzer. It finds matches gr
 literals uncompressed, and codes every sequence with the format's predefined FSE tables, so it
 never transmits a table of its own.
 
-Where that lands, measured on this container:
+Where that lands on real data — `deno task bench:zstd`, over source in three languages, prose,
+config, a wasm module, a native executable, and something already compressed:
 
 | sample | raw | ours | gzip -6 | zstd -3 | zstd -19 |
 |---|---:|---:|---:|---:|---:|
-| prose 102K | 102,000 | **110** | 451 | 95 | 91 |
-| json 132K | 131,781 | **16,023** | 16,313 | 6,681 | 6,676 |
-| logs 448K | 448,270 | 24,998 | **24,745** | 11,836 | 13,150 |
-| source 925K | 947,582 | **270,049** | 268,471 | 272,498 | 223,048 |
-| random 300K | 300,000 | 300,023 | 300,113 | 300,018 | 300,018 |
+| wac source | 1,002,340 | 281,288 | 280,346 | 284,383 | 230,996 |
+| typescript | 1,048,576 | **287,079** | 293,759 | 292,417 | 238,191 |
+| python | 1,048,576 | **230,990** | 238,783 | 241,915 | 193,448 |
+| markdown | 248,890 | 96,736 | 95,221 | 96,827 | 83,941 |
+| json | 357,128 | **2,947** | 3,481 | 2,833 | 2,575 |
+| wasm | 12,746 | 5,856 | 5,392 | 5,499 | 5,065 |
+| native binary | 1,048,576 | 184,976 | 181,087 | 169,378 | 147,203 |
+| gzipped source | 283,586 | 283,214 | 282,988 | 283,604 | 282,758 |
+| **total** | **5,050,418** | **1,373,086** | 1,381,057 | 1,376,856 | 1,184,177 |
 
-Level with `gzip -6` on real text, and ahead of `zstd -3` on the largest sample here — which is
-this repo's own source, and the only one of these that is not a repeated phrase. Incompressible
-input does not expand, because a block falls back to raw when the compressed form is not smaller.
+**Level with `zstd -3` overall and slightly ahead of `gzip -6`**, winning on source code in all
+three languages and losing on binaries. Already-compressed input does not expand.
 
-Still a long way behind `zstd -19`, and the gap is entirely in parsing rather than coding: see
-below.
+Note what changed when the corpus did. The samples this package started with were repeated
+phrases, and against those `zstd -3` looked 2.4x better on json — which turned out to be a
+property of the generator, not of the compressor. Real json is a win for us by 15% against gzip.
+**Two of the three conclusions drawn from the synthetic corpus were wrong**, which is why
+`bench/corpus.ts` now builds from files that are actually on the machine.
 
 ### Where the bytes go, and what fitted tables were worth
 
@@ -106,13 +113,18 @@ and literals are **10 KB of a 925 KB input** — entropy-coding them would save 
 
 What is left, in order:
 
-1. **Repeat offsets**, whose value depends entirely on the data: 69% of offsets on structured log
-   lines would hit a repeat slot, against 3% on source and 6% on json. Cheap to add, and enormous
-   on exactly the data people compress most of.
-2. **Better matching**, which is now the largest remaining lever. `zstd -19` reaches 4.25x on the
+1. **Repeat offsets**, whose value depends entirely on the data — and on the real corpus that
+   means *binaries*, which is exactly where we lose. Measured share of offsets that would hit a
+   repeat slot: **63% on a native executable**, 8% on wasm, 5% on json, 0-3% on source and prose.
+   The executable currently spends most of its sequence budget on offset magnitudes, so this is
+   the largest single lever left, though the estimate is rough: using repeats changes the parse,
+   and a more regular parse changes the code distributions too.
+3. **Better matching**, which is what separates us from `zstd -19` — 14% across the corpus. `zstd -19` reaches 4.25x on the
    same input against `-3`'s 3.48x, purely by parsing better. Our average match is 8.7 bytes from
    a greedy search 32 candidates deep; lazy matching and a deeper chain are what raise that.
-3. **Huffman literals**, worth about 1% here. Note the interaction: a greedy matcher takes every
+2. **Huffman literals**, worth 1% on source and prose but **6% on a native binary, 8% on wasm and
+   11% on json** — again concentrated where we lose. Literals are 36% of the output on the
+   executable, against 4% on source. Note the interaction: a greedy matcher takes every
    three-byte match it finds, which *minimises* literals. A better parser skips bad matches and
    emits more of them, so this grows as (3) lands.
 
