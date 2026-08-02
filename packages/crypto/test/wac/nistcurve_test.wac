@@ -1,0 +1,193 @@
+// NIST P-256 and P-384, against node:crypto.
+//
+// One file, because since the generalisation the two curves are one implementation: the
+// same Jacobian formulas in weierstrass.wac over the same Solinas reduction in fieldp.wac,
+// which reads its prime off the operand's limb count. Testing them together is testing
+// that the generalisation holds, which is the thing most likely to be wrong.
+//
+// `ref(mode, curve, a, b)` is node's ECDSA, with the signature converted between DER and
+// raw r||s at the boundary — X.509 and TLS both carry DER, the crypto layer wants raw, and
+// the conversion is the host's job because it is where the two conventions meet.
+//
+// ## What each direction is worth
+//
+// ECDSA is randomised, so unlike Ed25519 there is no byte-identity to compare. Verifying
+// node's signature and having node verify ours are therefore *both* needed: the first
+// checks the verifier, the second checks the signer, and an implementation can be right
+// about one and wrong about the other without either noticing.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { p256Verify, p256Sign, p256PublicKey, p256Ecdh, p256Order } from "../../src/p256.wac";
+import { p384Verify, p384Order } from "../../src/p384.wac";
+
+const i32 SIGN = 0;
+const i32 VERIFY = 1;
+const i32 PUBKEY = 2;
+const i32 P256 = 256;
+const i32 P384 = 384;
+
+u8[] fill(i32 n, i32 seed) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (i * 41 + seed * 7 + 13) & 0xFF; }
+  // Keep it well inside the group order: the top byte cleared is enough for both curves.
+  out[0] = out[0] & 0x7F;
+  return out;
+}
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+u8[] cat(u8[] a, u8[] b) {
+  u8[] o = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { o[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { o[a.len() + i] = b[i]; }
+  return o;
+}
+
+export string test_the_group_orders() {
+  // Not our own arithmetic — the published constants, so a transposed digit shows here
+  // rather than as a signature that verifies almost always.
+  T t = T.create();
+  t.eqI32(p256Order().len(), 32, "P-256's order is 32 bytes");
+  t.eqI32(p384Order().len(), 48, "P-384's order is 48 bytes");
+  t.eqI32(p256Order()[0], 0xFF, "P-256's order starts 0xFF");
+  t.eqI32(p256Order()[31], 0x51, "and ends 0x51");
+  t.eqI32(p384Order()[47], 0x73, "P-384's order ends 0x73");
+  return t.report();
+}
+
+export string test_public_keys_match_the_host(fn[u8[](i32, i32, u8[], u8[])] ref) {
+  // The host picks the key and returns scalar || point; we must reproduce the point. That
+  // is the stronger direction — the scalar is not one we chose, so it exercises whatever
+  // the generator happens to produce rather than whatever a test author would write.
+  T t = T.create();
+  for (i32 i = 0; i < 8; i++) {
+    u8[] pair = ref(PUBKEY, P256, u8[0](), u8[0]());
+    u8[] priv = u8[32]();
+    for (i32 j = 0; j < 32; j++) { priv[j] = pair[j]; }
+    u8[] point = u8[65]();
+    for (i32 j = 0; j < 65; j++) { point[j] = pair[32 + j]; }
+    t.eqBytes(p256PublicKey(priv), point, "P-256 public key " + itoa64(i as i64));
+  }
+  return t.report();
+}
+
+export string test_we_verify_the_hosts_signatures(fn[u8[](i32, i32, u8[], u8[])] ref) {
+  // The verifier. node signs with a key we chose, and we must accept it — and must refuse
+  // it once a bit moves, or "accepts everything" would pass the first half.
+  T t = T.create();
+  for (i32 i = 0; i < 6; i++) {
+    u8[] pair = ref(PUBKEY, P256, u8[0](), u8[0]());
+    u8[] priv = u8[32]();
+    for (i32 j = 0; j < 32; j++) { priv[j] = pair[j]; }
+    u8[] pub = u8[65]();
+    for (i32 j = 0; j < 65; j++) { pub[j] = pair[32 + j]; }
+    u8[] msg = fill(20 + i, i);
+    u8[] sig = ref(SIGN, P256, cat(priv, pub), msg);
+    t.isTrue(p256Verify(pub, msg, sig), "P-256 accepts the host's signature " + itoa64(i as i64));
+
+    u8[] bad = u8[64]();
+    for (i32 j = 0; j < 64; j++) { bad[j] = sig[j]; }
+    bad[i % 64] = bad[i % 64] ^ 1;
+    t.isFalse(p256Verify(pub, msg, bad), "and refuses it altered " + itoa64(i as i64));
+  }
+  return t.report();
+}
+
+export string test_the_host_verifies_ours(fn[u8[](i32, i32, u8[], u8[])] ref) {
+  // The signer, which is a different claim. ECDSA is randomised so there is no byte
+  // identity to compare against — an implementation that produced a self-consistent but
+  // non-standard signature would verify against itself forever.
+  T t = T.create();
+  for (i32 i = 0; i < 6; i++) {
+    u8[] pair = ref(PUBKEY, P256, u8[0](), u8[0]());
+    u8[] priv = u8[32]();
+    for (i32 j = 0; j < 32; j++) { priv[j] = pair[j]; }
+    u8[] pub = p256PublicKey(priv);
+    u8[] msg = fill(30 + i, i + 5);
+    u8[] k = fill(32, i + 77);
+    u8[] sig = p256Sign(priv, msg, k);
+    t.eqI32(sig.len(), 64, "signing produced a signature at round " + itoa64(i as i64));
+    u8[] ok = ref(VERIFY, P256, cat(pub, sig), msg);
+    t.eqI32(ok[0], 1, "the host verifies our signature " + itoa64(i as i64));
+  }
+  return t.report();
+}
+
+export string test_p384_verifies_the_hosts_signatures(fn[u8[](i32, i32, u8[], u8[])] ref) {
+  // The whole point of the generalisation: twelve limbs behaving as eight do. P-384 is
+  // verification-only here, so this is the only direction available.
+  T t = T.create();
+  for (i32 i = 0; i < 5; i++) {
+    u8[] pair = ref(PUBKEY, P384, u8[0](), u8[0]());
+    u8[] priv = u8[48]();
+    for (i32 j = 0; j < 48; j++) { priv[j] = pair[j]; }
+    u8[] pub = u8[97]();
+    for (i32 j = 0; j < 97; j++) { pub[j] = pair[48 + j]; }
+    t.eqI32(pub.len(), 97, "P-384 public key is an uncompressed point");
+    u8[] msg = fill(40 + i, i + 9);
+    u8[] sig = ref(SIGN, P384, cat(priv, pub), msg);
+    t.eqI32(sig.len(), 96, "P-384 signature is 96 bytes");
+    t.isTrue(p384Verify(pub, msg, sig), "P-384 accepts the host's signature " + itoa64(i as i64));
+
+    u8[] bad = u8[96]();
+    for (i32 j = 0; j < 96; j++) { bad[j] = sig[j]; }
+    bad[(i * 7) % 96] = bad[(i * 7) % 96] ^ 1;
+    t.isFalse(p384Verify(pub, msg, bad), "and refuses it altered " + itoa64(i as i64));
+  }
+  return t.report();
+}
+
+export string test_ecdh_agrees_from_both_ends() {
+  // No oracle needed: the whole claim is that two parties reach the same value from
+  // opposite directions, which is a relation between our own outputs.
+  T t = T.create();
+  for (i32 i = 0; i < 5; i++) {
+    u8[] a = fill(32, i + 41);
+    u8[] b = fill(32, i + 51);
+    u8[] shared = p256Ecdh(a, p256PublicKey(b));
+    t.eqBytes(shared, p256Ecdh(b, p256PublicKey(a)), "both ends agree " + itoa64(i as i64));
+    t.eqI32(shared.len(), 32, "the secret is the x-coordinate alone");
+    t.isFalse(same(shared, p256Ecdh(a, p256PublicKey(fill(32, i + 61)))),
+              "and a different peer gives a different secret");
+  }
+  return t.report();
+}
+
+export string test_signatures_outside_the_group_order_are_refused() {
+  // r and s must each lie in [1, n). Zero and n itself are the boundaries, and accepting
+  // either makes forgery arithmetic rather than work — this returns false rather than
+  // trapping, so it belongs here rather than in the host file.
+  T t = T.create();
+  u8[] priv = fill(32, 91);
+  u8[] pub = p256PublicKey(priv);
+  u8[] msg = "range checks".toBytes();
+  u8[] sig = p256Sign(priv, msg, fill(32, 92));
+  t.isTrue(p256Verify(pub, msg, sig), "the genuine signature verifies");
+
+  u8[] n = p256Order();
+  u8[] zeroR = u8[64]();
+  for (i32 i = 0; i < 64; i++) { zeroR[i] = sig[i]; }
+  for (i32 i = 0; i < 32; i++) { zeroR[i] = 0; }
+  t.isFalse(p256Verify(pub, msg, zeroR), "r = 0 is refused");
+
+  u8[] zeroS = u8[64]();
+  for (i32 i = 0; i < 64; i++) { zeroS[i] = sig[i]; }
+  for (i32 i = 32; i < 64; i++) { zeroS[i] = 0; }
+  t.isFalse(p256Verify(pub, msg, zeroS), "s = 0 is refused");
+
+  u8[] rAtN = u8[64]();
+  for (i32 i = 0; i < 64; i++) { rAtN[i] = sig[i]; }
+  for (i32 i = 0; i < 32; i++) { rAtN[i] = n[i]; }
+  t.isFalse(p256Verify(pub, msg, rAtN), "r = n is refused");
+
+  u8[] sAtN = u8[64]();
+  for (i32 i = 0; i < 64; i++) { sAtN[i] = sig[i]; }
+  for (i32 i = 0; i < 32; i++) { sAtN[32 + i] = n[i]; }
+  t.isFalse(p256Verify(pub, msg, sAtN), "s = n is refused");
+
+  t.isFalse(p256Verify(pub, msg, u8[63]()), "a 63-byte signature is refused");
+  return t.report();
+}
