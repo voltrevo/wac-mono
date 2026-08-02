@@ -22,7 +22,15 @@ function ref(
     const c = createCipheriv(`aes-${bits(key)}-ctr`, key, iv);
     return new Uint8Array(Buffer.concat([c.update(data), c.final()]));
   }
-  const c = createCipheriv(`aes-${bits(key)}-gcm`, key, iv, { authTagLength: 16 });
+  // Spelled out per key size rather than through a template: `authTagLength` only exists on the
+  // overloads keyed by a literal algorithm name, so the computed name used above does not
+  // type-check here even though it runs. Same reason as `packages/tls/test/record_wac.test.ts`.
+  const n = bits(key);
+  const c = n === 128
+    ? createCipheriv("aes-128-gcm", key, iv, { authTagLength: 16 })
+    : n === 192
+    ? createCipheriv("aes-192-gcm", key, iv, { authTagLength: 16 })
+    : createCipheriv("aes-256-gcm", key, iv, { authTagLength: 16 });
   c.setAAD(aad, { plaintextLength: data.length });
   const body = Buffer.concat([c.update(data), c.final()]);
   return new Uint8Array(Buffer.concat([body, c.getAuthTag()]));

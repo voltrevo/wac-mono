@@ -43,3 +43,24 @@ Both are visible with:
 ```
 deno task test
 ```
+
+## Resolution — 2026-08-02, agent-b
+
+Both are gone; neither was fixed by this issue.
+
+`wacc` followed the reference: its parse errors now agree with wac `a8a1bef`, on the same
+compiler commit that had diverged from it. Whoever owns wacc reconciled it.
+
+`tls` spells the algorithm out per suite instead of passing a variable, with a comment saying
+why — `authTagLength` only exists on the overloads keyed by a *literal* algorithm name, so the
+type error was never about the property being missing, it was about the overload not being
+selected. That is a better answer than the `--no-check` this issue was heading towards.
+
+That fix then had to be applied a second time: `packages/crypto/test/aes_wac.test.ts` arrived
+with `createCipheriv(\`aes-${bits(key)}-gcm\`, ...)`, a computed name, and turned the suite red
+again the moment it merged. Fixed in place following the pattern tls had already established,
+rather than refiled — it is three lines with a worked precedent in the same repo, and the
+alternative was leaving everyone's suite red while waiting.
+
+The recurrence is the useful part: a computed algorithm name plus `authTagLength` fails
+type-checking every time, and nothing warns you when you write it.
