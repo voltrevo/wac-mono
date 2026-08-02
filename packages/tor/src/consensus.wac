@@ -1,0 +1,179 @@
+// Deciding whether to believe a consensus. dir-spec §3.4.1 and §3.10.
+//
+// This is the step that makes the directory trustworthy without trusting whoever served it.
+// A client hardcodes the directory authorities' identity key fingerprints; everything else
+// is fetched, and everything else is checked against those.
+//
+//   authority identity key   fingerprint is hardcoded in the client
+//     signs -> a key certificate, naming a shorter-lived signing key
+//       signs -> the consensus
+//
+// A majority of authorities must have signed, so no single compromised authority — and no
+// server on the path — can name your relays or their keys.
+//
+// ## The signed portion is not the document
+//
+// The digest covers the text from the first character up to *and including* the string
+// "directory-signature ", with the signatures themselves outside it. Get the boundary wrong
+// by one byte and every signature fails; get it wrong by including the first signature and
+// every signature fails except in the one arrangement an attacker chooses.
+//
+// ## Tor's signatures have no DigestInfo
+//
+// The usual PKCS#1 v1.5 signature wraps the hash in a DER structure naming the algorithm.
+// Tor does not: the padded block contains the bare digest and nothing else. So
+// `rsaVerifyPkcs1` cannot be used, and `rsaRecoverPkcs1` returns the payload for us to
+// compare — against a digest of known length, whole, never searched within.
+
+import { rsaRecoverPkcs1 } from "../../crypto/src/rsa.wac";
+import { sha1 } from "../../crypto/src/sha1.wac";
+import { sha256 } from "../../crypto/src/sha256.wac";
+
+/**
+ * The length of the signed portion of `doc`, or -1 if it has no signatures.
+ *
+ * Searches for a newline followed by "directory-signature " and returns the offset just
+ * past that token. The leading newline matters: without it the search would also match the
+ * token appearing inside a base64 blob or a nickname, and the first match is the one that
+ * decides what got signed.
+ */
+export i32 signedLength(u8[] doc) {
+  u8[] needle = "\ndirectory-signature ".toBytes();
+  for (i32 i = 0; i + needle.len() <= doc.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < needle.len(); j++) {
+      if (doc[i + j] != needle[j]) { hit = false; }
+    }
+    if (hit) { return i + needle.len(); }
+  }
+  return -1;
+}
+
+/** The digest of the signed portion: SHA-1 by default, SHA-256 when the token says so. */
+export u8[] signedDigest(u8[] doc, bool sha256Flavour) {
+  i32 n = signedLength(doc);
+  if (n < 0) { trap; }
+  u8[] signed = u8[n]();
+  for (i32 i = 0; i < n; i++) { signed[i] = doc[i]; }
+  return sha256Flavour ? sha256(signed) : sha1(signed);
+}
+
+// ── PKCS#1 public keys ───────────────────────────────────────────────────────
+//
+// Authority keys are PEM "RSA PUBLIC KEY" blocks: a DER RSAPublicKey, which is a SEQUENCE
+// of two INTEGERs and nothing else. Simpler than the SubjectPublicKeyInfo in x509.wac,
+// which wraps this same structure in an algorithm identifier and a BIT STRING.
+
+/** The offset and length of the DER element at `at`, as `(contentStart << 16) | length`. */
+i32 derHeader(u8[] der, i32 at) {
+  if (at + 2 > der.len()) { trap; }
+  i32 lenByte = der[at + 1];
+  if (lenByte < 0x80) { return ((at + 2) << 16) | lenByte; }
+  i32 count = lenByte & 0x7F;
+  if (count == 0 || count > 2) { trap; }
+  i32 len = 0;
+  for (i32 i = 0; i < count; i++) { len = (len << 8) | der[at + 2 + i]; }
+  return ((at + 2 + count) << 16) | len;
+}
+
+/** An INTEGER's bytes with any leading zero removed — DER's sign byte is not part of it. */
+u8[] derInteger(u8[] der, i32 at, i32 len) {
+  i32 from = at;
+  i32 n = len;
+  if (n > 1 && der[from] == 0) {
+    from++;
+    n--;
+  }
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = der[from + i]; }
+  return out;
+}
+
+/** The modulus of a DER RSAPublicKey. */
+export u8[] rsaModulus(u8[] der) {
+  i32 h = derHeader(der, 0);
+  i32 at = h >> 16;
+  i32 nh = derHeader(der, at);
+  return derInteger(der, nh >> 16, nh & 0xFFFF);
+}
+
+/** The public exponent of a DER RSAPublicKey. */
+export u8[] rsaExponent(u8[] der) {
+  i32 h = derHeader(der, 0);
+  i32 at = h >> 16;
+  i32 nh = derHeader(der, at);
+  i32 afterN = (nh >> 16) + (nh & 0xFFFF);
+  i32 eh = derHeader(der, afterN);
+  return derInteger(der, eh >> 16, eh & 0xFFFF);
+}
+
+/**
+ * An authority's fingerprint: the SHA-1 of its identity key's DER.
+ *
+ * This is the value a client hardcodes, and it is hardcoded rather than fetched precisely
+ * because it is the root of the whole chain — a fingerprint you downloaded proves nothing
+ * about who you downloaded it from.
+ */
+export u8[] keyFingerprint(u8[] identityKeyDer) {
+  return sha1(identityKeyDer);
+}
+
+/**
+ * Whether `signature` over `digest` was made by the key `(n, e)`.
+ *
+ * The recovered payload must equal the digest exactly. Not start with it, not contain it —
+ * a verifier that checks a prefix accepts a signature over a longer payload that happens to
+ * begin the same way, and the attacker chooses the rest.
+ */
+export bool signatureMatches(u8[] n, u8[] e, u8[] digest, u8[] signature) {
+  u8[] recovered = rsaRecoverPkcs1(n, e, signature);
+  if (recovered.len() != digest.len()) { return false; }
+  i32 diff = 0;
+  for (i32 i = 0; i < digest.len(); i++) { diff = diff | (recovered[i] ^ digest[i]); }
+  return diff == 0;
+}
+
+/**
+ * Verify one signature on a document, given the signing key it claims.
+ *
+ * Combines the two steps because doing them apart invites hashing one document and checking
+ * a signature from another — the digest is only meaningful next to the bytes it came from.
+ */
+export bool verifyDocumentSignature(
+  u8[] doc, bool sha256Flavour, u8[] signingKeyDer, u8[] signature
+) {
+  return signatureMatches(rsaModulus(signingKeyDer), rsaExponent(signingKeyDer),
+                          signedDigest(doc, sha256Flavour), signature);
+}
+
+/**
+ * Whether a key certificate's signing key really was certified by its identity key.
+ *
+ * The certificate body is signed the same way the consensus is — a bare SHA-1 under PKCS#1
+ * padding — but over its own signed portion, which ends at "dir-key-certification\n"
+ * inclusive rather than at "directory-signature ".
+ *
+ * Skipping this is the subtle failure: the consensus signature would still verify against
+ * the signing key in the certificate, and the certificate would be one anybody could write.
+ * The identity key is the only thing in the chain a client knows independently.
+ */
+export bool verifyKeyCertification(u8[] cert, u8[] identityKeyDer, u8[] signature) {
+  u8[] needle = "\ndir-key-certification\n".toBytes();
+  i32 end = -1;
+  for (i32 i = 0; i + needle.len() <= cert.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < needle.len(); j++) {
+      if (cert[i + j] != needle[j]) { hit = false; }
+    }
+    if (hit) {
+      end = i + needle.len();
+      i = cert.len();
+    }
+  }
+  if (end < 0) { return false; }
+
+  u8[] signed = u8[end]();
+  for (i32 i = 0; i < end; i++) { signed[i] = cert[i]; }
+  return signatureMatches(rsaModulus(identityKeyDer), rsaExponent(identityKeyDer),
+                          sha1(signed), signature);
+}

@@ -10,7 +10,6 @@ record of what has been fixed and why.
 | [0007](open/0007-json-throughput-bench-half-migrated-to-the-canonical-struct.md) | json's throughput bench is half-migrated to the Canonical struct and cannot run | bug | wrong answer |
 | [0005](open/0005-mutation-testing-found-54-untested-behaviours.md) | surviving mutants: behaviours nothing checks (crypto finished; tls at 75, five other packages unmeasured) | task | wrong answer |
 | [0003](open/0003-wacc-parser-does-not-implement-generics.md) | wacc's parser does not implement generics, so `std` is outside its corpus | missing feature | not implemented |
-| [0012](open/0012-the-tor-client-believes-any-consensus-it-is-handed.md) | the tor client believes any consensus it is handed — no authority signature check | missing feature | not implemented |
 | [0013](open/0013-the-tor-circuit-has-no-flow-control-so-a-large-response-hangs.md) | the tor circuit has no flow control, so a response over ~249KB hangs rather than failing | missing feature | not implemented |
 
 An empty list is the expected state most of the time — see `README.md`: something you

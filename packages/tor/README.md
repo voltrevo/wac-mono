@@ -6,9 +6,13 @@ It builds circuits. Against a local chutney testnet it does the link handshake, 
 link protocol 5, runs ntor, extends to three hops, opens a stream and fetches a consensus
 over it — every layer ours, from the TLS 1.3 record up.
 
-It is **not an anonymity tool** and should not be pointed at the real network. It does not
-verify consensus signatures (issue 0012), has no flow control (0013), and picks its path
-from whatever list it is handed rather than by bandwidth-weighted selection with guards.
+The consensus is verified before any of that happens: a majority of the directory
+authorities must have signed it, checked against identity fingerprints the caller supplies
+out of band, and it must be inside its validity window.
+
+It is still **not an anonymity tool** and should not be pointed at the real network. It has
+no flow control (issue 0013) and picks its path from whatever list it is handed rather than
+by bandwidth-weighted selection with guards.
 
 ## Why this is possible at all
 
@@ -56,12 +60,42 @@ happened to this repo's SHAKE tests until they moved to `node:crypto`.
 | `src/relay.wac` | relay cells: the running digest, the onion layers, EXTEND2 |
 | `host/link.ts` | the link handshake — owns the socket |
 | `host/circuit.ts` | the circuit: layering, extending, streams |
+| `src/consensus.wac` | the signature crypto behind believing a directory |
 | `host/directory.ts` | parsing a consensus and its microdescriptors |
+| `host/verify.ts` | the authority chain and the majority rule |
 
 The split is the same one the TLS package uses: bytes and state machines in wac, and only
 the socket in TypeScript. One exception is forced rather than chosen — a `Hop` is a struct
 and structs do not cross bindgen, so the hop state crosses as a 290-byte blob and comes back
 with every call.
+
+## Believing the directory
+
+`parseConsensus` reads a document; `relaysFromVerified` decides whether to believe one. Use
+the second. The chain:
+
+```
+authority identity fingerprint   supplied by the caller, out of band
+  -> key certificate             identity key must hash to that fingerprint,
+                                 and must itself have signed the signing key
+    -> consensus signature       made by a signing key certified that way
+      -> majority                more than half the named authorities
+        -> freshness             inside valid-after .. valid-until
+```
+
+A real client compiles the fingerprints in. This takes them as an argument, which is the
+same thing said honestly — a caller that reads them out of the directory it is checking has
+verified nothing.
+
+Two details that would each produce a verifier passing every positive test:
+
+**Tor's signatures carry no DigestInfo.** `rsaVerifyPkcs1` requires the DER structure naming
+the algorithm, which is what stops Bleichenbacher '06. Tor pads a bare digest and nothing
+else, so this uses `rsaRecoverPkcs1` and compares the payload itself — whole, against a
+value of known length, never searched within.
+
+**The signed portion ends mid-line**, at `directory-signature ` inclusive of the trailing
+space, with the signatures outside it. The leading newline in that search is load-bearing.
 
 ## Relay cells, and the two things that are easy to get wrong
 
@@ -93,10 +127,6 @@ of those two kinds it is.
 **The real network.** Directory authorities are reached by IP and this sandbox's proxy
 allowlist is by domain, so they answer 403; torproject.org is blocked outright. Everything
 here is verified offline or against a locally built tor.
-
-**Consensus verification** (issue 0012). The directory parser believes whatever it is
-handed. Anyone who can answer a directory request picks your relays and their keys, which
-is not a degraded anonymity property but the absence of one.
 
 **Flow control** (issue 0013). No SENDMEs are sent, so a response over about 249KB stops
 and the read hangs rather than failing.

@@ -159,6 +159,51 @@ export bool rsaVerifyPkcs1(u8[] n, u8[] e, u8[] msg, u8[] sig, i32 hashLen) {
 }
 
 /**
+ * Recover the payload from a PKCS#1 v1.5 signature block, or an empty array if it is
+ * malformed.
+ *
+ *   0x00 || 0x01 || 0xFF...FF || 0x00 || payload
+ *
+ * `rsaVerifyPkcs1` above is the right function for almost everything, because almost
+ * everything puts a DER DigestInfo in the payload and comparing against a fixed prefix is
+ * what stops Bleichenbacher '06. This is for the protocols that do not — Tor signs a bare
+ * digest with no DigestInfo at all, so there is nothing to match and the caller has to
+ * compare the recovered bytes itself.
+ *
+ * That makes this the more dangerous of the two, and the danger is entirely in what the
+ * caller does next: it must compare the whole payload against a value of known length, not
+ * search within it. Returning the payload rather than a boolean is deliberate — a function
+ * that took an expected value and returned a boolean would look interchangeable with
+ * `rsaVerifyPkcs1`, and it is not.
+ *
+ * The padding itself is still checked strictly: at least eight 0xFF bytes, no shortcuts,
+ * every byte required rather than sought.
+ */
+export u8[] rsaRecoverPkcs1(u8[] n, u8[] e, u8[] sig) {
+  if (sig.len() != n.len()) { return u8[0](); }
+  Big modulus = fromBytes(n);
+  if (isZero(modulus)) { return u8[0](); }
+  Big s = fromBytes(sig);
+  if (cmp(s, modulus) >= 0) { return u8[0](); }
+
+  u8[] em = toBytes(modPow(s, fromBytes(e), modulus), n.len());
+  if (em[0] != 0x00 || em[1] != 0x01) { return u8[0](); }
+
+  // Walk the 0xFF run to its terminator. Anything other than 0xFF or the single 0x00 that
+  // ends it is malformed, so the loop rejects rather than stopping early and hoping.
+  i32 at = 2;
+  while (at < em.len() && em[at] == 0xFF) { at++; }
+  if (at >= em.len()) { return u8[0](); }
+  if (em[at] != 0x00) { return u8[0](); }
+  if (at - 2 < 8) { return u8[0](); }
+  at++;
+
+  u8[] out = u8[em.len() - at]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = em[at + i]; }
+  return out;
+}
+
+/**
  * MGF1, the mask generation function PSS uses.
  *
  * A counter-mode hash: H(seed || 0), H(seed || 1), ... truncated to the length wanted.
