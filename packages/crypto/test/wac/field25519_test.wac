@@ -1,0 +1,214 @@
+// GF(2^255 - 19), checked by its own algebra — alongside the BigInt differential, not
+// instead of it.
+//
+// This file was written to replace `field25519.test.ts`, which compares thousands of
+// products against BigInt. It does not, and the reason is worth recording because the
+// argument for invariants over references is otherwise persuasive.
+//
+// ## What the laws do buy
+//
+// A far wider corpus for three lines of generator, no host, and no committed table — the
+// BigInt sweep as stored vectors would be about 300KB of hex for one function. They also
+// catch what a reference cannot state cheaply: that `feMulSmall` agrees with repeated
+// addition at every multiplier the curve uses, and that `feCSwap` is conditional.
+//
+// ## What they do not
+//
+// Every law here holds in *any* commutative ring, so they are anchored by three values
+// that name the modulus — (p-1)+1 == 0, p encodes as zero, p+1 encodes as one. Reducing
+// modulo 2^255-18 instead is caught by those anchors and by nothing else: the ring laws
+// pass, because it is a perfectly consistent ring.
+//
+// But a reduction one carry pass short of complete passes the laws *and* the anchors *and*
+// forty values just below p *and* twenty sums that wrap past it. The BigInt differential
+// catches it on the first comparison. Two attempts at reaching it from inside the field
+// failed, so `field25519.test.ts` stays: a non-canonical representative is congruent, so
+// it satisfies every relation the field can express about itself, and only something
+// outside the field can see it.
+//
+// The general lesson, since it cost two attempts to learn: invariants pin the structure
+// and anchors pin which structure, but neither can see a *representative* that is wrong
+// while the value it stands for is right.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  feAdd, feSub, feMul, feSquare, feMulSmall, feInvert, feNeg, feZero, feOne,
+  feToBytes, feFromBytes, feEquals, feIsZero, feCSwap,
+} from "../../src/field25519.wac";
+
+/** A deterministic 32-byte field element. Three lines, so the corpus needs no storage. */
+struct Rng {
+  i64 s;
+  Rng create(i64 seed) { return Rng(seed); }
+  u8[] bytes(this) {
+    u8[] o = u8[32]();
+    for (i32 i = 0; i < 32; i++) {
+      this.s = (this.s * 6364136223846793005 + 1442695040888963407);
+      o[i] = ((this.s >> 33) & 255) as! i32;
+    }
+    o[31] = o[31] & 127;      // clear the top bit; the encoding is 255 bits
+    return o;
+  }
+  i64[] elem(this) { return feFromBytes(this.bytes()); }
+}
+
+bool eq(i64[] a, i64[] b) { return feEquals(a, b) == 1; }
+
+export string test_the_anchors_that_name_this_field() {
+  // Without these, everything below holds in any ring. With them, it is this one.
+  T t = T.create();
+  u8[] pMinus1 = u8[32]();
+  pMinus1[0] = 0xEC;                                  // 2^255 - 20
+  for (i32 i = 1; i < 31; i++) { pMinus1[i] = 0xFF; }
+  pMinus1[31] = 0x7F;
+  t.isTrue(feIsZero(feAdd(feFromBytes(pMinus1), feOne())) == 1,
+           "(p-1) + 1 == 0, which names the prime");
+
+  // The same fact from the decoding side: an encoding of p itself must reduce to zero,
+  // and one more than p to one. A field modulo 2^255-18 fails the second.
+  u8[] pBytes = u8[32]();
+  pBytes[0] = 0xED;                                   // 2^255 - 19
+  for (i32 i = 1; i < 31; i++) { pBytes[i] = 0xFF; }
+  pBytes[31] = 0x7F;
+  t.isTrue(feIsZero(feFromBytes(pBytes)) == 1, "p encodes as zero");
+  u8[] pPlus1 = u8[32]();
+  for (i32 i = 0; i < 32; i++) { pPlus1[i] = pBytes[i]; }
+  pPlus1[0] = 0xEE;                                   // 2^255 - 18
+  t.isTrue(eq(feFromBytes(pPlus1), feOne()), "p + 1 encodes as one");
+  return t.report();
+}
+
+export string test_the_ring_laws() {
+  T t = T.create();
+  Rng r = Rng.create(88172645463325252);
+  for (i32 i = 0; i < 200; i++) {
+    i64[] a = r.elem();
+    i64[] b = r.elem();
+    i64[] c = r.elem();
+    string at = " at round " + itoa64(i as i64);
+
+    t.isTrue(eq(feMul(a, b), feMul(b, a)), "multiplication commutes" + at);
+    t.isTrue(eq(feAdd(a, b), feAdd(b, a)), "addition commutes" + at);
+    t.isTrue(eq(feMul(feMul(a, b), c), feMul(a, feMul(b, c))), "multiplication associates" + at);
+    t.isTrue(eq(feAdd(feAdd(a, b), c), feAdd(a, feAdd(b, c))), "addition associates" + at);
+    // Distributivity is the one that breaks first when a reduction is wrong, because it
+    // is the only law that mixes the two operations.
+    t.isTrue(eq(feMul(a, feAdd(b, c)), feAdd(feMul(a, b), feMul(a, c))),
+             "multiplication distributes" + at);
+    t.isTrue(eq(feSub(feAdd(a, b), b), a), "subtraction undoes addition" + at);
+    t.isTrue(eq(feSquare(a), feMul(a, a)), "squaring is multiplying by itself" + at);
+    t.isTrue(eq(feAdd(a, feNeg(a)), feZero()), "a plus its negation is zero" + at);
+    t.isTrue(eq(feMul(a, feOne()), a), "one is the identity" + at);
+    t.isTrue(feIsZero(feMul(a, feZero())) == 1, "zero annihilates" + at);
+  }
+  return t.report();
+}
+
+export string test_inversion_undoes_multiplication() {
+  // Fermat's little theorem in practice. Zero is the documented exception: it has no
+  // inverse and the implementation maps it to zero rather than trapping, which callers
+  // rely on for constant-time code paths.
+  T t = T.create();
+  Rng r = Rng.create(2463534242);
+  for (i32 i = 0; i < 60; i++) {
+    i64[] a = r.elem();
+    if (feIsZero(a) == 1) { continue; }
+    t.isTrue(eq(feMul(a, feInvert(a)), feOne()), "a times its inverse is one");
+    t.isTrue(eq(feInvert(feInvert(a)), a), "inversion is its own inverse");
+  }
+  t.isTrue(feIsZero(feInvert(feZero())) == 1, "zero inverts to zero rather than trapping");
+  return t.report();
+}
+
+export string test_the_small_multiply_matches_repeated_addition() {
+  // feMulSmall is a separate path for the handful of multipliers the curve uses, and its
+  // whole risk is diverging from the general one. Repeated addition is the definition, so
+  // it is the reference — no host needed, and it covers every multiplier that exists.
+  T t = T.create();
+  Rng r = Rng.create(747796405);
+  i64[] multipliers = i64[](1, 2, 3, 4, 8, 19, 121665, 121666);
+  for (i32 i = 0; i < 12; i++) {
+    i64[] a = r.elem();
+    for (i32 m = 0; m < multipliers.len(); m++) {
+      i64 k = multipliers[m];
+      i64[] want = feZero();
+      for (i64 n = 0; n < k; n++) { want = feAdd(want, a); }
+      t.isTrue(eq(feMulSmall(a, k), want),
+               "mulSmall by " + itoa64(k) + " equals adding that many times");
+    }
+  }
+  return t.report();
+}
+
+export string test_encoding_round_trips_and_canonicalises() {
+  T t = T.create();
+  Rng r = Rng.create(1103515245);
+  for (i32 i = 0; i < 60; i++) {
+    u8[] b = r.bytes();
+    t.eqBytes(feToBytes(feFromBytes(b)), b, "a canonical encoding round trips");
+  }
+  // The encoder must emit the canonical representative, so two encodings of the same
+  // value converge. This is the property a lazily-reduced implementation fails, and it
+  // matters on the wire: a peer that accepts both has two names for one key.
+  u8[] p = u8[32]();
+  p[0] = 0xED;
+  for (i32 i = 1; i < 31; i++) { p[i] = 0xFF; }
+  p[31] = 0x7F;
+  t.eqBytes(feToBytes(feFromBytes(p)), u8[32](), "p re-encodes as zero, not as p");
+
+  // The values just below the modulus, which are where canonicalisation actually has
+  // work to do. Random elements are nowhere near p, so a reduction that is one carry
+  // pass short is right for all of them — that mutation survived this file until these
+  // lines were added, and the BigInt differential it replaced caught it immediately.
+  for (i32 k = 1; k <= 40; k++) {
+    u8[] near = u8[32]();
+    near[0] = (0xED - k) & 0xFF;
+    for (i32 i = 1; i < 31; i++) { near[i] = 0xFF; }
+    near[31] = 0x7F;
+    t.eqBytes(feToBytes(feFromBytes(near)), near,
+              "p - " + itoa64(k as i64) + " is already canonical");
+  }
+  // And sums that land just past p, so the carry has to wrap rather than merely settle.
+  u8[] pm1 = u8[32]();
+  pm1[0] = 0xEC;
+  for (i32 i = 1; i < 31; i++) { pm1[i] = 0xFF; }
+  pm1[31] = 0x7F;
+  i64[] top = feFromBytes(pm1);
+  for (i32 k = 1; k <= 20; k++) {
+    i64[] sum = feAdd(top, feMulSmall(feOne(), k as i64));
+    u8[] want = u8[32]();
+    want[0] = (k - 1) & 0xFF;                    // (p-1) + k == k-1 (mod p)
+    t.eqBytes(feToBytes(sum), want,
+              "(p-1) + " + itoa64(k as i64) + " wraps to " + itoa64((k - 1) as i64));
+  }
+  return t.report();
+}
+
+export string test_conditional_swap_is_conditional() {
+  // The ladder's constant-time primitive. Swapping on 0, or failing to on 1, breaks
+  // X25519 for half its inputs — and the failure looks like a wrong shared secret rather
+  // than like a swap bug.
+  T t = T.create();
+  Rng r = Rng.create(69069);
+  for (i32 i = 0; i < 20; i++) {
+    i64[] a = r.elem();
+    i64[] b = r.elem();
+    i64[] a0 = feCopyOf(a);
+    i64[] b0 = feCopyOf(b);
+
+    feCSwap(a, b, 0);
+    t.isTrue(eq(a, a0) && eq(b, b0), "cswap(0) changes nothing");
+    feCSwap(a, b, 1);
+    t.isTrue(eq(a, b0) && eq(b, a0), "cswap(1) exchanges them");
+    feCSwap(a, b, 1);
+    t.isTrue(eq(a, a0) && eq(b, b0), "and twice is the identity");
+  }
+  return t.report();
+}
+
+i64[] feCopyOf(i64[] a) {
+  i64[] o = i64[10]();
+  for (i32 i = 0; i < 10; i++) { o[i] = a[i]; }
+  return o;
+}
