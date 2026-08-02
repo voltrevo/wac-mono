@@ -1,14 +1,15 @@
-// The entry point of a bundled application: one file that is both the launcher and the
-// worker it launches.
+// The two halves of a bundled application: the launcher, and the worker it launches.
 //
-// A self-contained executable cannot reference a sibling `worker.ts`, so the bundle spawns
-// *itself* — `new Worker(import.meta.url)` re-runs the same file, which notices it is on a
-// worker and runs the application instead of launching one. A shebang does not get in the
-// way; that was checked rather than assumed.
+// A built program carries the worker's *source* as a string and spawns it from a blob
+// URL. The obvious alternative — `new Worker(import.meta.url)`, the file spawning itself —
+// works, but needs `--allow-read` on the file, which put a permission in every program's
+// shebang that had nothing to do with what the program could do. A blob URL needs none,
+// so the shebang is now exactly the capabilities the build granted, and a program granted
+// nothing asks for nothing.
 //
-// Detection is `WorkerGlobalScope`, not `import.meta.main`, which is **true in both** — a
-// distinction that would have failed silently, since the bundle would have launched a
-// launcher rather than an application.
+// Worker detection is still `WorkerGlobalScope` rather than `import.meta.main`, which is
+// true in both — the worker bundle has its own entry now, but the check guards the
+// message handler below and getting it wrong would fail silently.
 
 import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
@@ -75,16 +76,24 @@ function firstMessage(): Promise<Start> {
 export type Grants = { read?: boolean; write?: boolean; env?: boolean };
 
 /**
- * Run a bundled application. Called by the generated entry with its own module.
+ * The worker half: wait for the bridge, build the capabilities, run `main`.
  *
- * On the main thread this serves the capabilities the build granted, spawns the worker
- * and exits with the application's code. On a worker it builds the capability structs
- * and runs the application. Every argument goes to the application; the launcher takes
- * none of its own.
+ * Called by the generated worker entry, which imports this module *before* the
+ * application so the handler above is installed first.
  */
-export async function runBundled(app: AppModule, grants: Grants = {}): Promise<void> {
-  if (onWorker()) return runAsWorker(app);
-  await runAsLauncher(grants);
+export async function runAsWorkerEntry(app: AppModule): Promise<void> {
+  await runAsWorker(app);
+}
+
+/**
+ * The launcher half: serve the granted capabilities, spawn the worker, exit with its code.
+ *
+ * `workerSource` is the worker bundle, carried as a string and spawned from a blob URL so
+ * the program needs no filesystem permission of its own. Every argument goes to the
+ * application; the launcher takes none.
+ */
+export async function runLauncher(workerSource: string, grants: Grants = {}): Promise<void> {
+  await runAsLauncher(workerSource, grants);
 }
 
 async function runAsWorker(app: AppModule): Promise<void> {
@@ -105,7 +114,7 @@ async function runAsWorker(app: AppModule): Promise<void> {
   }
 }
 
-async function runAsLauncher(grants: Grants): Promise<void> {
+async function runAsLauncher(workerSource: string, grants: Grants): Promise<void> {
   const bridge = newBridge();
   const responder = serveHostCalls(bridge, denoWorld({
     args: [...Deno.args],
@@ -113,7 +122,8 @@ async function runAsLauncher(grants: Grants): Promise<void> {
     env: grants.env === true ? (n) => Deno.env.get(n) : undefined,
   }));
 
-  const worker = new Worker(import.meta.url, { type: "module" });
+  const url = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
+  const worker = new Worker(url, { type: "module" });
   const finished = new Promise<number>((resolve, reject) => {
     worker.onmessage = (e: MessageEvent) => {
       const m = e.data as Result;
@@ -132,5 +142,6 @@ async function runAsLauncher(grants: Grants): Promise<void> {
   } finally {
     responder.stop();
     worker.terminate();
+    URL.revokeObjectURL(url);
   }
 }

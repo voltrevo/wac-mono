@@ -29,10 +29,41 @@ program. Whoever packages it decides what it may do; whoever runs it cannot wide
 The same source built without `--allow-read` reports `filesystem read not granted` and
 exits 1, and no argument can put the capability back.
 
-The shebang mirrors the grants, with one exception worth knowing: `--allow-read` is always
-there and is *not* a grant to the application. The worker has to read its own module to
-start, and Deno cannot give a worker less than its parent without an unstable flag. What
-the application sees is decided by the capability world, not by that line.
+**The shebang is exactly the grants.** A program granted nothing asks for nothing:
+
+```
+#!/usr/bin/env -S deno run                    # no capabilities
+#!/usr/bin/env -S deno run --allow-read       # built with --allow-read
+```
+
+That is worth the trouble it took. The obvious way to spawn the worker is
+`new Worker(import.meta.url)` — the file spawning itself — but that needs `--allow-read`
+on the file, which put a permission in every shebang whatever the program could do, and
+read as a filesystem grant to anyone auditing it. So a built program carries the worker's
+source as a string and spawns it from a blob URL, which needs no permission at all.
+
+The build is two passes for that reason: the worker bundle holds the application and the
+wasm, and the launcher carries it as a string.
+
+## Node
+
+```sh
+deno task app:build packages/platform/example/wc.wac --allow-read --target node -o wc
+./wc README.md
+```
+
+The same wac, the same wasm, the same bridge and opcodes; a dozen closures and the thread
+API differ. Node's `worker_threads` takes source directly with `{ eval: true }`, which
+suits a bundled program better than a blob URL since there is no URL to make, and Node 22
+runs an extensionless file as ESM with top-level await, so a built program is still `./wc`.
+A test builds both targets and checks they print the same bytes.
+
+**Node has no permission system, so the capability world is the whole boundary there.**
+Under Deno a build that withholds the filesystem is enforced twice — by the world and by
+the process — and under Node only once. The shebang is plain `#!/usr/bin/env node`,
+because there is nothing for it to state. An application that is denied a capability still
+gets `not granted` and exits 1; what is missing is the second line of defence if the
+launcher itself were wrong.
 
 The bundle spawns **itself**: a single file cannot reference a sibling worker module, so
 `new Worker(import.meta.url)` re-runs it, and it notices it is on a worker and runs the
@@ -93,9 +124,11 @@ host/call.ts        the worker side — hostCall, which blocks
 host/respond.ts     the main-thread side — serves calls without blocking
 host/provider.ts    builds Core and Cli from a bridge
 host/deno.ts        Deno's implementations. Note how much of it is `await`
+host/node.ts        the same table over Node's APIs
+host/entryNode.ts   the launcher and worker halves for Node
 host/worker.ts      loads an application and runs it
 host/launch.ts      compiles, spawns the worker, answers, waits
-host/entry.ts       the bundled application's entry: launcher and worker in one file
+host/entry.ts       the launcher and worker halves of a built program
 build.ts            builds an application into one executable
 app.ts              the command line
 example/wc.wac      an application, entire
@@ -128,9 +161,8 @@ enter it. Concurrency means more instances.
 
 ## What is not here yet
 
-- **Node and browser providers.** `host/deno.ts` is the only world; the bridge and the
-  provider are host-agnostic, so another is a file of closures. A browser additionally
-  needs cross-origin isolation for `SharedArrayBuffer`.
+- **A browser provider.** Deno and Node are done; a browser needs cross-origin isolation
+  for `SharedArrayBuffer`, and has no filesystem or argv, so it is `Core` alone.
 - **A service shape.** `run(this) -> i32` is the CLI application. A long-running server
   wants `onBytes(this, u8[]) -> Served`, which `packages/server` already defines and drives
   from its own host; folding it into the launcher is the next step.
