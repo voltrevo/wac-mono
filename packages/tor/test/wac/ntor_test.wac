@@ -1,0 +1,186 @@
+// The ntor handshake, checked by the properties a round trip cannot see.
+//
+// A handshake tested only end to end agrees with itself. That is worth very little here,
+// because the two things ntor adds over a bare Diffie-Hellman — authentication of the
+// relay, and forward secrecy — are both invisible to "did both sides get the same key".
+// So each contribution is removed in turn and the result must change.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { ntorClientRequest, ntorClientFinish, ntorServerRespond } from "../../src/ntor.wac";
+import { x25519Base } from "../../../crypto/src/x25519.wac";
+
+u8[] fill(i32 n, i32 seed) {
+  u8[] o = u8[n]();
+  for (i32 i = 0; i < n; i++) { o[i] = (i * 41 + seed * 7 + 11) & 0xFF; }
+  return o;
+}
+u8[] slice(u8[] s, i32 from, i32 to) {
+  u8[] o = u8[to - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = s[from + i]; }
+  return o;
+}
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+export string test_both_sides_derive_the_same_keys() {
+  T t = T.create();
+  u8[] id = fill(20, 1);
+  u8[] onionPriv = fill(32, 2);
+  u8[] onionKey = x25519Base(onionPriv);
+  u8[] clientPriv = fill(32, 3);
+  u8[] serverPriv = fill(32, 4);
+
+  u8[] req = ntorClientRequest(id, onionKey, clientPriv);
+  t.eqI32(req.len(), 84, "the request is ID || B || X");
+  u8[] out = ntorServerRespond(id, onionPriv, req, serverPriv, 72);
+  t.eqI32(out.len(), 64 + 72, "the relay returns a reply and its key material");
+
+  u8[] keys = ntorClientFinish(id, onionKey, clientPriv, slice(out, 0, 64), 72);
+  t.eqI32(keys.len(), 72, "the client derived key material");
+  t.eqBytes(keys, slice(out, 64, out.len()), "and both sides agree");
+  return t.report();
+}
+
+export string test_the_relay_must_prove_it_holds_the_onion_key() {
+  // The authentication half. A relay that cannot compute EXP(B,x) — anyone in the path
+  // who is not the relay — produces an AUTH that does not match, and the client must
+  // return nothing rather than keys.
+  T t = T.create();
+  u8[] id = fill(20, 5);
+  u8[] onionPriv = fill(32, 6);
+  u8[] onionKey = x25519Base(onionPriv);
+  u8[] clientPriv = fill(32, 7);
+  u8[] req = ntorClientRequest(id, onionKey, clientPriv);
+  u8[] good = ntorServerRespond(id, onionPriv, req, fill(32, 8), 72);
+  t.eqI32(ntorClientFinish(id, onionKey, clientPriv, slice(good, 0, 64), 72).len(), 72,
+          "the genuine reply is accepted");
+
+  // An impostor with its own onion key: the ephemeral exchange still works, so a client
+  // that skipped the AUTH check would agree a key with it quite happily.
+  u8[] impostorPriv = fill(32, 9);
+  u8[] impostor = ntorServerRespond(id, impostorPriv, req, fill(32, 8), 72);
+  t.eqI32(ntorClientFinish(id, onionKey, clientPriv, slice(impostor, 0, 64), 72).len(), 0,
+          "a relay without the onion key is refused");
+
+  // Every byte of AUTH is checked, not just its shape.
+  i32[] spots = i32[](32, 47, 63);
+  for (i32 i = 0; i < spots.len(); i++) {
+    u8[] bad = u8[64]();
+    for (i32 j = 0; j < 64; j++) { bad[j] = good[j]; }
+    bad[spots[i]] = bad[spots[i]] ^ 1;
+    t.eqI32(ntorClientFinish(id, onionKey, clientPriv, bad, 72).len(), 0,
+            "AUTH altered at byte " + itoa64(spots[i] as i64) + " is refused");
+  }
+  return t.report();
+}
+
+export string test_the_identity_is_bound_into_the_keys() {
+  // ID goes into secret_input, so a relay answering under a different fingerprint derives
+  // different keys even holding the right onion key. That is what stops a relay being
+  // used under somebody else's name in the consensus.
+  T t = T.create();
+  u8[] onionPriv = fill(32, 11);
+  u8[] onionKey = x25519Base(onionPriv);
+  u8[] clientPriv = fill(32, 12);
+  u8[] serverPriv = fill(32, 13);
+  u8[] idA = fill(20, 14);
+  u8[] idB = fill(20, 15);
+
+  u8[] outA = ntorServerRespond(idA, onionPriv, ntorClientRequest(idA, onionKey, clientPriv),
+                                serverPriv, 72);
+  u8[] outB = ntorServerRespond(idB, onionPriv, ntorClientRequest(idB, onionKey, clientPriv),
+                                serverPriv, 72);
+  t.isFalse(same(slice(outA, 64, outA.len()), slice(outB, 64, outB.len())),
+            "a different identity gives different keys");
+  // And the client will not accept a reply computed under the other identity.
+  t.eqI32(ntorClientFinish(idA, onionKey, clientPriv, slice(outB, 0, 64), 72).len(), 0,
+          "a reply bound to another identity is refused");
+  return t.report();
+}
+
+export string test_every_input_moves_the_key_material() {
+  // Forward secrecy lives in the ephemeral pair, so both ephemerals must contribute. An
+  // implementation that dropped EXP(Y,x) would still authenticate the relay and still
+  // agree a key — one derived only from long-term material, which is exactly the property
+  // ntor exists to avoid.
+  T t = T.create();
+  u8[] id = fill(20, 21);
+  u8[] onionPriv = fill(32, 22);
+  u8[] onionKey = x25519Base(onionPriv);
+
+  u8[] base = ntorServerRespond(id, onionPriv, ntorClientRequest(id, onionKey, fill(32, 23)),
+                                fill(32, 24), 72);
+  u8[] otherClient = ntorServerRespond(id, onionPriv,
+                                       ntorClientRequest(id, onionKey, fill(32, 25)),
+                                       fill(32, 24), 72);
+  u8[] otherServer = ntorServerRespond(id, onionPriv,
+                                       ntorClientRequest(id, onionKey, fill(32, 23)),
+                                       fill(32, 26), 72);
+  t.isFalse(same(slice(base, 64, base.len()), slice(otherClient, 64, otherClient.len())),
+            "the client's ephemeral contributes");
+  t.isFalse(same(slice(base, 64, base.len()), slice(otherServer, 64, otherServer.len())),
+            "the relay's ephemeral contributes");
+
+  // And key material is a stream: asking for more must extend, not replace.
+  u8[] shortKeys = ntorClientFinish(id, onionKey, fill(32, 23), slice(base, 0, 64), 32);
+  u8[] longKeys = ntorClientFinish(id, onionKey, fill(32, 23), slice(base, 0, 64), 200);
+  t.eqBytes(shortKeys, slice(longKeys, 0, 32), "a longer expansion extends the shorter");
+  return t.report();
+}
+
+export string test_a_small_order_reply_is_refused() {
+  // Curve25519's small-order points make EXP(Y,x) all zero for every x, so an attacker
+  // who sends one derives the same keys the client does without holding any private key.
+  // tor-spec says abort.
+  T t = T.create();
+  u8[] id = fill(20, 31);
+  u8[] onionPriv = fill(32, 32);
+  u8[] onionKey = x25519Base(onionPriv);
+  u8[] clientPriv = fill(32, 33);
+
+  u8[] reply = u8[64]();          // Y = all zeros, a small-order point
+  t.eqI32(ntorClientFinish(id, onionKey, clientPriv, reply, 72).len(), 0,
+          "an all-zero Y is refused");
+
+  u8[] one = u8[64]();
+  one[0] = 1;                     // Y = 1, also small order
+  t.eqI32(ntorClientFinish(id, onionKey, clientPriv, one, 72).len(), 0,
+          "Y = 1 is refused");
+  return t.report();
+}
+
+/**
+ * The whole handshake against tor's own implementation.
+ *
+ * `ref(b, id, msg, keyLen)` shells out to tor's `test-ntor-cl server1`, which is the
+ * relay half of the handshake as the C implementation computes it. It returns the 64-byte
+ * reply followed by the key material, so this checks two things at once: that our client
+ * accepts a reply produced by tor, and that it derives byte-identical keys.
+ *
+ * Everything above this point is a relation between our own outputs. This is the only
+ * test in the file that could notice all of them being consistently wrong.
+ */
+export string test_agrees_with_tors_own_implementation(fn[u8[](u8[], u8[], u8[], i32)] ref) {
+  T t = T.create();
+  for (i32 i = 0; i < 4; i++) {
+    u8[] id = fill(20, i + 41);
+    u8[] onionPriv = fill(32, i + 42);
+    u8[] onionKey = x25519Base(onionPriv);
+    u8[] clientPriv = fill(32, i + 43);
+    u8[] req = ntorClientRequest(id, onionKey, clientPriv);
+
+    u8[] out = ref(onionPriv, id, req, 72);
+    t.isTrue(out.len() == 64 + 72, "tor answered round " + itoa64(i as i64));
+    if (out.len() == 64 + 72) {
+      u8[] keys = ntorClientFinish(id, onionKey, clientPriv, slice(out, 0, 64), 72);
+      t.eqI32(keys.len(), 72, "we accepted tor's reply " + itoa64(i as i64));
+      t.eqBytes(keys, slice(out, 64, out.len()),
+                "and derived tor's keys byte for byte " + itoa64(i as i64));
+    }
+  }
+  return t.report();
+}

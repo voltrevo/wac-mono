@@ -1,0 +1,141 @@
+// The ntor handshake, from tor-spec.txt §5.1.4.
+//
+// This is how a Tor client agrees keys with a relay, and it is a nice piece of design: a
+// one-and-a-half round trip authenticated key exchange built out of nothing but Curve25519
+// and HMAC-SHA256. The client learns it is talking to the relay whose identity key it
+// looked up in the consensus; the relay learns nothing about the client, which is the
+// point.
+//
+// ## The exchange
+//
+// The relay publishes a long-term identity fingerprint `ID` and a rotating onion key `B`.
+// The client generates an ephemeral pair `(x, X)` and sends `ID || B || X`. The relay
+// replies with an ephemeral `Y` and an authenticator.
+//
+//   secret_input = EXP(Y,x) | EXP(B,x) | ID | B | X | Y | PROTOID
+//   KEY_SEED     = HMAC(t_key,    secret_input)
+//   verify       = HMAC(t_verify, secret_input)
+//   auth_input   = verify | ID | B | Y | X | PROTOID | "Server"
+//   AUTH         = HMAC(t_mac, auth_input)
+//
+// Two Diffie-Hellmans, not one. `EXP(Y,x)` is the ephemeral-ephemeral exchange that gives
+// forward secrecy; `EXP(B,x)` binds the result to the relay's published onion key, which
+// is what makes it *authenticated* rather than merely private. Drop either and the
+// handshake still completes and still agrees a key — the first loses forward secrecy, the
+// second lets anyone in the path impersonate the relay — so a round-trip test cannot see
+// the difference and the tests here check each contribution separately.
+//
+// ## Why the all-zero check matters
+//
+// Curve25519 has small-order points. If the relay sends one as `Y`, `EXP(Y,x)` is the
+// all-zero value for every `x`, so the client derives keys the attacker knows without any
+// private key at all. tor-spec says to abort, and this returns an empty result rather than
+// keys — the caller cannot then use them by accident.
+
+import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
+import { hmacSha256 } from "../../crypto/src/hmac.wac";
+import { hkdfExpandRfc5869 } from "./kdf.wac";
+
+/** "ntor-curve25519-sha256-1", the protocol identifier woven through every input. */
+u8[] protoId() { return "ntor-curve25519-sha256-1".toBytes(); }
+u8[] tMac() { return "ntor-curve25519-sha256-1:mac".toBytes(); }
+u8[] tKey() { return "ntor-curve25519-sha256-1:key_extract".toBytes(); }
+u8[] tVerify() { return "ntor-curve25519-sha256-1:verify".toBytes(); }
+u8[] mExpand() { return "ntor-curve25519-sha256-1:key_expand".toBytes(); }
+u8[] serverTag() { return "Server".toBytes(); }
+
+u8[] cat(u8[] a, u8[] b) {
+  u8[] o = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { o[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { o[a.len() + i] = b[i]; }
+  return o;
+}
+
+bool allZero(u8[] a) {
+  i32 acc = 0;
+  for (i32 i = 0; i < a.len(); i++) { acc = acc | a[i]; }
+  return acc == 0;
+}
+
+/** The client's opening message: ID (20) || B (32) || X (32). */
+export u8[] ntorClientRequest(u8[] identity, u8[] onionKey, u8[] ephemeralPriv) {
+  if (identity.len() != 20) { trap; }
+  if (onionKey.len() != 32) { trap; }
+  if (ephemeralPriv.len() != 32) { trap; }
+  return cat(cat(identity, onionKey), x25519Base(ephemeralPriv));
+}
+
+/**
+ * Finish the handshake against the relay's reply.
+ *
+ * `reply` is Y (32) || AUTH (32). Returns `keyLen` bytes of key material, or an empty
+ * array if the relay did not prove it holds the onion key — which is the only signal a
+ * caller gets, and deliberately: returning keys plus a boolean invites using the keys.
+ */
+export u8[] ntorClientFinish(u8[] identity, u8[] onionKey, u8[] ephemeralPriv,
+                             u8[] reply, i32 keyLen) {
+  if (identity.len() != 20) { trap; }
+  if (onionKey.len() != 32) { trap; }
+  if (ephemeralPriv.len() != 32) { trap; }
+  if (reply.len() != 64) { trap; }
+
+  u8[] serverEph = u8[32]();
+  u8[] auth = u8[32]();
+  for (i32 i = 0; i < 32; i++) { serverEph[i] = reply[i]; auth[i] = reply[32 + i]; }
+
+  u8[] xy = x25519(ephemeralPriv, serverEph);
+  u8[] xb = x25519(ephemeralPriv, onionKey);
+  // A small-order Y or B makes the shared value all zero for every scalar, so an attacker
+  // needs no private key at all. tor-spec says abort; there is nothing to salvage.
+  if (allZero(xy) || allZero(xb)) { return u8[0](); }
+
+  u8[] clientEph = x25519Base(ephemeralPriv);
+  u8[] secretInput = cat(cat(cat(cat(cat(cat(xy, xb), identity), onionKey), clientEph),
+                             serverEph), protoId());
+
+  u8[] keySeed = hmacSha256(tKey(), secretInput);
+  u8[] verify = hmacSha256(tVerify(), secretInput);
+
+  u8[] authInput = cat(cat(cat(cat(cat(cat(verify, identity), onionKey), serverEph),
+                                clientEph), protoId()), serverTag());
+  u8[] expected = hmacSha256(tMac(), authInput);
+
+  // Constant time, because a caller may retry on failure and a timing difference here
+  // leaks which byte of AUTH was wrong.
+  i32 diff = 0;
+  for (i32 i = 0; i < 32; i++) { diff = diff | (expected[i] ^ auth[i]); }
+  if (diff != 0) { return u8[0](); }
+
+  return hkdfExpandRfc5869(keySeed, mExpand(), keyLen);
+}
+
+/**
+ * The relay's half, for testing both ends without a relay.
+ *
+ * Not what a client needs, and worth having anyway: a handshake tested only against
+ * itself agrees with itself, and this at least lets the two halves be driven separately
+ * so a change to one shows up as a disagreement rather than as silence.
+ */
+export u8[] ntorServerRespond(u8[] identity, u8[] onionPriv, u8[] request,
+                              u8[] serverEphPriv, i32 keyLen) {
+  if (request.len() != 84) { trap; }
+  u8[] clientEph = u8[32]();
+  for (i32 i = 0; i < 32; i++) { clientEph[i] = request[52 + i]; }
+
+  u8[] onionKey = x25519Base(onionPriv);
+  u8[] serverEph = x25519Base(serverEphPriv);
+  u8[] xy = x25519(serverEphPriv, clientEph);
+  u8[] xb = x25519(onionPriv, clientEph);
+  if (allZero(xy) || allZero(xb)) { return u8[0](); }
+
+  u8[] secretInput = cat(cat(cat(cat(cat(cat(xy, xb), identity), onionKey), clientEph),
+                             serverEph), protoId());
+  u8[] keySeed = hmacSha256(tKey(), secretInput);
+  u8[] verify = hmacSha256(tVerify(), secretInput);
+  u8[] authInput = cat(cat(cat(cat(cat(cat(verify, identity), onionKey), serverEph),
+                                clientEph), protoId()), serverTag());
+  u8[] auth = hmacSha256(tMac(), authInput);
+
+  // reply (64) followed by the key material, so a test can check both halves agree.
+  return cat(cat(serverEph, auth), hkdfExpandRfc5869(keySeed, mExpand(), keyLen));
+}

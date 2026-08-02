@@ -1,0 +1,110 @@
+// SHA-1 against node:crypto and the published vectors.
+//
+// The incremental interface is the part worth testing hardest, because it is the reason
+// this exists. Tor's relay cell digest is a *running* hash over every cell sent on a
+// circuit in one direction, and each cell carries the first four bytes of the hash so far
+// — so the state survives between cells and has to be readable without ending the stream.
+// A one-shot implementation cannot express that, and an incremental one that gets `peek`
+// wrong produces a first cell that verifies and a second that does not.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { sha1, Sha1 } from "../../src/sha1.wac";
+
+u8[] unhex(string h) {
+  u8[] src = h.toBytes();
+  u8[] out = u8[src.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = nib(src[2 * i]) * 16 + nib(src[2 * i + 1]); }
+  return out;
+}
+i32 nib(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  trap;
+}
+u8[] fill(i32 n, i32 seed) {
+  u8[] o = u8[n]();
+  for (i32 i = 0; i < n; i++) { o[i] = (i * 37 + seed) & 0xFF; }
+  return o;
+}
+u8[] slice(u8[] s, i32 from, i32 to) {
+  u8[] o = u8[to - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = s[from + i]; }
+  return o;
+}
+
+export string test_the_published_vectors() {
+  // FIPS 180-4's worked examples, including the 56-byte case that forces a second block
+  // for the length alone.
+  T t = T.create();
+  t.eqBytes(sha1("".toBytes()), unhex("da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+            "sha1 of the empty string");
+  t.eqBytes(sha1("abc".toBytes()), unhex("a9993e364706816aba3e25717850c26c9cd0d89d"),
+            "sha1 abc");
+  t.eqBytes(sha1("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq".toBytes()),
+            unhex("84983e441c3bd26ebaae4aa1f95129e5e54670f1"),
+            "the 56-byte vector, which needs an extra block for the length");
+  return t.report();
+}
+
+export string test_every_length_through_two_blocks(fn[u8[](u8[])] ref) {
+  // Every length rather than the boundaries, since it is cheap and picking cleverly is a
+  // chance to pick wrongly. 0 to 130 covers both block edges and the padding cases either
+  // side of 56.
+  T t = T.create();
+  for (i32 n = 0; n <= 130; n++) {
+    u8[] m = fill(n, n);
+    t.eqBytes(sha1(m), ref(m), "sha1 at length " + itoa64(n as i64));
+  }
+  return t.report();
+}
+
+export string test_the_incremental_form_matches_the_one_shot(fn[u8[](u8[])] ref) {
+  // Split at every offset, because a buffer that mishandles a partial block is right for
+  // whole-block feeds and wrong for the rest — which is exactly how Tor will use it, one
+  // 509-byte cell payload at a time into a 64-byte block.
+  T t = T.create();
+  u8[] msg = fill(200, 5);
+  for (i32 cut = 0; cut <= 200; cut += 7) {
+    Sha1 s = Sha1.create();
+    s.update(slice(msg, 0, cut));
+    s.update(slice(msg, cut, 200));
+    t.eqBytes(s.finish(), ref(msg), "split at " + itoa64(cut as i64));
+  }
+  // And a byte at a time, which is every boundary at once.
+  Sha1 one = Sha1.create();
+  for (i32 i = 0; i < msg.len(); i++) { one.update(slice(msg, i, i + 1)); }
+  t.eqBytes(one.finish(), ref(msg), "fed one byte at a time");
+  return t.report();
+}
+
+export string test_peek_does_not_end_the_stream(fn[u8[](u8[])] ref) {
+  // The property Tor depends on. After hashing a prefix, `peek` must give that prefix's
+  // digest *and* leave the state able to continue — an implementation that finalised in
+  // place would give a correct first answer and rubbish after it.
+  T t = T.create();
+  u8[] a = fill(100, 1);
+  u8[] b = fill(37, 2);
+  Sha1 s = Sha1.create();
+  s.update(a);
+  t.eqBytes(s.peek(), ref(a), "peek gives the digest so far");
+  t.eqBytes(s.peek(), ref(a), "and does not change anything when repeated");
+  s.update(b);
+
+  u8[] both = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { both[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { both[a.len() + i] = b[i]; }
+  t.eqBytes(s.peek(), ref(both), "and the stream continued correctly past it");
+  t.eqBytes(s.finish(), ref(both), "finish agrees with the last peek");
+  return t.report();
+}
+
+export string test_a_long_message_crosses_many_blocks(fn[u8[](u8[])] ref) {
+  T t = T.create();
+  i32[] lens = i32[](511, 512, 513, 1000, 4096);
+  for (i32 i = 0; i < lens.len(); i++) {
+    u8[] m = fill(lens[i], i);
+    t.eqBytes(sha1(m), ref(m), "sha1 at " + itoa64(lens[i] as i64) + " bytes");
+  }
+  return t.report();
+}
