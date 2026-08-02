@@ -212,3 +212,35 @@ Deno.test("ed25519: a seed that is not 32 bytes is refused, long as well as shor
     if (!traps(() => sign(bad, msg))) throw new Error(`accepted a ${n}-byte seed for signing`);
   }
 });
+
+Deno.test("ed25519: x = 0 with the sign bit set is not a point", () => {
+  // A compressed point is y in the low 255 bits and the sign of x in the top one. When
+  // x is zero it has no sign — zero is neither odd nor even in the sense the encoding
+  // means — so an encoding that claims x is odd while y forces x to zero is not a point,
+  // and must be refused rather than quietly decoded as the one with x = 0.
+  //
+  // The identity is the case that makes this bite. y = 1 gives x = 0, and (0, 1) sits on
+  // the curve, so the usual "is it on the curve" check waves it straight through: the
+  // only thing standing between the two encodings is the explicit test for x = 0. Drop
+  // it and the identity has two accepted encodings, one of which no signer would produce.
+  const recode = mod.edRecode as (p: Uint8Array) => Uint8Array;
+  const rejected = (out: Uint8Array) => out[0] === 0xFF;
+
+  const identity = new Uint8Array(32);
+  identity[0] = 1;                       // y = 1, sign 0
+  if (rejected(recode(identity))) throw new Error("the canonical identity was rejected");
+
+  const signed = Uint8Array.from(identity);
+  signed[31] |= 0x80;                    // y = 1, sign 1 — x would have to be an odd zero
+  if (!rejected(recode(signed))) throw new Error("accepted x = 0 with the sign bit set");
+
+  // The same for the other zero-x point, y = -1, which is the identity's negation.
+  const yNeg1 = new Uint8Array(32);
+  yNeg1.fill(0xFF);
+  yNeg1[0] = 0xEC;                       // p - 1 = 2^255 - 20
+  yNeg1[31] = 0x7F;
+  if (rejected(recode(yNeg1))) throw new Error("y = -1 with sign 0 should decode");
+  const yNeg1Signed = Uint8Array.from(yNeg1);
+  yNeg1Signed[31] |= 0x80;
+  if (!rejected(recode(yNeg1Signed))) throw new Error("accepted y = -1 with the sign bit set");
+});
