@@ -145,7 +145,27 @@ mattered, so every mutant scored killed. Worse, I had convinced myself the contr
 mutants would catch exactly this: they would have, but `--operators` runs generate none,
 so there was nothing there to fail. A perfect score was the symptom.
 
-**crypto needs re-running and its numbers here should not be believed.**
+**crypto re-run with the fixed permissions: 223/255 killed, 32 surviving.** Not the
+255/255 I reported.
+
+| operator | module | survivors |
+|---|---|---:|
+| extreme | mlkem | 10 |
+| guard | weierstrass | 8 |
+| guard | fieldp | 5 |
+| guard | mlkem | 2 |
+| guard | ed25519 | 2 |
+| extreme | weierstrass | 1 |
+| extreme | field25519 | 1 |
+| guard | rsa, keccak, ghash | 1 each |
+
+The thirteen `guard/weierstrass` and `guard/fieldp` survivors are the defensive traps in
+the generalised curve code — `if (n != 12) { trap; }`, `if (b.len() != n) { trap; }` and
+their neighbours. `packages/crypto/cov.ts` already carries an argument for each as
+unreachable, so unkillable is the expected answer and they want `known.ts` entries rather
+than tests.
+
+`extreme/mlkem`'s ten are a different thing, and the same thing as asn1's twenty.
 
 tls was run *after* fde1ccf, so the figures below are the first valid ones it has had.
 
@@ -180,6 +200,24 @@ dead** — `tagBoolean`, `tagSequence` and the rest, exported and called by noth
 the parser writes `element(0x30)` throughout. That is 20 of the 134: one decision, not
 twenty. Adopt them at the call sites, which reads better than bare hex and makes them
 live, or delete them.
+
+### The same habit in three places
+
+This is worth naming, because mutation testing found it three times and nothing else
+would have. A named constant is written, exported, and then every call site writes the
+literal instead:
+
+| file | accessors | callers |
+|---|---:|---:|
+| `tls/src/asn1.wac` | 15 tag constants | 0 |
+| `tls/src/x509.wac` | 11 `key*`/`sig*` | 0 — fixed in 78682be |
+| `crypto/src/mlkem.wac` | `q`, `n`, `kk`, `eta1`, `eta2`, `du`, `dv`, `ekSize`, `dkSize`, `ctSize` | 0 |
+
+`mlkem.wac` is the clearest case: `q()` returns 3329 and the code writes `% 3329`, so the
+FIPS 203 parameter names document nothing and the accessor can return anything. Coverage
+cannot see this — the functions are never executed, so they are not uncovered branches,
+they are absent from the report entirely. Adopting them at the call sites fixes the
+mutants and the readability together.
 
 The rest are mostly guards and boundary values in the state machines, which is the shape
 you get from a suite whose interop tests drive whole *successful* handshakes: the happy
