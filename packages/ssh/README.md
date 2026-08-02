@@ -1,9 +1,10 @@
 # ssh
 
-An SSH-2 client, in wac. **It logs in.** Version exchange, the binary packet protocol, algorithm
-negotiation, curve25519-sha256 key exchange, `ssh-ed25519` host key verification, the
-`chacha20-poly1305@openssh.com` AEAD, reading an OpenSSH private key — encrypted or not — and
-publickey authentication. No channels yet, so it cannot run anything.
+An SSH-2 client, in wac. **It runs commands.** Version exchange, the binary packet protocol,
+algorithm negotiation, curve25519-sha256 key exchange, `ssh-ed25519` host key verification, the
+`chacha20-poly1305@openssh.com` AEAD, `known_hosts`, reading an OpenSSH private key — encrypted or
+not — publickey authentication, and the connection protocol: session channels, flow control and
+`exec`.
 
 > **Not for production**, for the same reason [crypto](../crypto/README.md) is not: it is built on
 > primitives that are known to leak timing, and nothing here has been reviewed by anyone.
@@ -36,8 +37,9 @@ covers the whole transport in both directions at once — a wrong key half, coun
 or sequence number and the server drops the connection rather than replying.
 
 It then reads the client private key with its own code, signs the authentication request, and
-receives `SSH_MSG_USERAUTH_SUCCESS`. So the single interop test covers the protocol from the
-first byte to a logged-in session.
+receives `SSH_MSG_USERAUTH_SUCCESS`. A second test carries on from there: it opens a session
+channel, runs `seq 1 100000; echo done >&2; exit 3`, and checks all 100,000 lines came back, that
+stderr arrived separately, and that the exit status was 3.
 
 Against OpenSSH 9.6 it negotiates `curve25519-sha256`, `ssh-ed25519` and
 `chacha20-poly1305@openssh.com`.
@@ -149,17 +151,62 @@ and replay to a third party as the client. The session id is length-prefixed as 
 though nothing follows that could be confused with it — omitting that length produces a signature
 the server rejects, indistinguishable from the key being wrong.
 
+**`knownhosts.wac`** — deciding whether the host key we verified is the one we *expected*. The
+key exchange proves the peer holds the private half of the key it presented; it says nothing about
+which peer that is. Without this, a man-in-the-middle presenting its own host key produces a
+perfectly valid exchange and the client proceeds.
+
+That is worth stating precisely, because the damage is bounded but real: a publickey signature
+binds to the session id, hence the exchange hash, hence the host key the attacker presented, so
+the attacker **cannot** replay our signature to the real server. They do get the session, and
+everything sent afterwards.
+
+Entries come in two forms and they are parsed by completely different code. Hashing is the default
+— `HashKnownHosts yes` — so a real entry is `|1|salt|HMAC-SHA-1(salt, name)`, and a client that
+cannot compute that cannot read the file its user already has. (That is why `crypto` gained
+`hmacSha1`; SHA-1's collision weakness is irrelevant here, since the hostname is the message and
+the per-entry salt is the key.) A non-default port makes the name `[host]:port`, which is what gets
+hashed — get that spelling wrong and every lookup silently reports "unknown".
+
+This reports what the file says and decides nothing. Whether an unknown host should be accepted
+and remembered, refused, or put to the user is policy and belongs where the user is. The
+distinction that matters is **unknown versus changed**: unknown is every first connection, while a
+known host presenting a different key is the case the file exists to catch, and must never be
+quietly folded into the first.
+
+**`channel.wac`** — the connection protocol, RFC 4254. Everything after authentication happens
+inside a channel: open one, ask it to run something, read back interleaved stdout and stderr until
+the far end closes it.
+
+**Each side picks its own number for the same channel** and they need not agree. Every message
+carries the *recipient's* number — the one the other side chose — so a client that echoes its own
+back addresses a channel the server may not have. With a single channel numbered zero on both
+sides, which is the common case, that mistake works perfectly.
+
+**Flow control is not optional.** Each direction has a window: a byte count the sender may
+transmit before it must stop, refilled only by `SSH_MSG_CHANNEL_WINDOW_ADJUST`. A client that
+never adjusts reads exactly one window of output and then hangs, having done nothing that any
+error reports. The default window is large, so this is invisible for short commands and a deadlock
+for long ones — which is why the test runs a command whose output is many windows long and asserts
+the adjustments actually happened. Credit is returned at the half-way mark: adjusting per packet
+spends a packet per packet, and waiting for empty stalls the sender while the adjustment is in
+flight.
+
+**The exit status arrives as a request, not a reply** — a `CHANNEL_REQUEST` named `exit-status`
+with `want_reply` false, prompted by nothing.
+
 ## What is missing
 
-In the order it is needed:
+A client state machine. Everything above is a set of functions over bytes, driven from the test —
+which is the right shape for testing each rule against a real server, and the wrong shape for a
+caller who just wants to run a command. `packages/tls` shows what the answer looks like: one
+`cliFeed(state, input)` returning what to send, with the socket and randomness in the host.
 
-1. **The connection protocol** — channels, window adjustment, `exec`. That is what turns a
-   logged-in connection into one that can run a command.
-
-Also absent, and worth naming rather than leaving implied: `known_hosts` is not consulted, so the
-host key is verified as *self-consistent* but not as *expected* — the interop test compares it
-against the file it generated, which a real client cannot do. Rekeying is not implemented. Neither
-is any authentication method other than publickey with Ed25519.
+Also absent, and worth naming rather than leaving implied: rekeying is not implemented, so a
+long-lived or high-volume connection would run past the point where it is required. There is no
+authentication method other than publickey with Ed25519 — no password, no keyboard-interactive, no
+agent. Host certificates (`@cert-authority` lines) are recognised well enough to be skipped rather
+than misread, but not validated.
 
 `known_hosts` is a byte comparison against the host key blob, so there is no X.509 and no chain
 building — which is the main reason this is a smaller job than the TLS client already in the repo.

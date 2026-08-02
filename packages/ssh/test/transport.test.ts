@@ -53,6 +53,30 @@ const mod = await wacBind("packages/ssh/test/wac/probe.wac") as unknown as {
   sshMsgUserAuthSuccess(): number;
   sshMsgUserAuthFailure(): number;
   sshMsgServiceAccept(): number;
+  sshKnownHost(file: Uint8Array, host: Uint8Array, port: number, keyType: Uint8Array, keyBlob: Uint8Array): number;
+  sshDefaultWindow(): number;
+  sshDefaultMaxPacket(): number;
+  sshExtendedDataStderr(): number;
+  sshMsgChannelData(): number;
+  sshMsgChannelExtendedData(): number;
+  sshMsgChannelOpenConfirmation(): number;
+  sshMsgChannelOpenFailure(): number;
+  sshMsgChannelClose(): number;
+  sshMsgChannelEof(): number;
+  sshMsgChannelRequest(): number;
+  sshMsgChannelSuccess(): number;
+  sshMsgChannelWindowAdjust(): number;
+  sshOpenSession(channel: number, window: number, maxPacket: number): Uint8Array;
+  sshExecRequest(channel: number, command: Uint8Array, wantReply: boolean): Uint8Array;
+  sshWindowAdjust(channel: number, increment: number): Uint8Array;
+  sshChannelEof(channel: number): Uint8Array;
+  sshChannelClose(channel: number): Uint8Array;
+  sshChannelData(channel: number, data: Uint8Array): Uint8Array;
+  sshIncomingField(payload: Uint8Array, which: number): number;
+  sshIncomingData(payload: Uint8Array): Uint8Array;
+  sshWindowCreate(initial: number): unknown;
+  sshWindowConsume(w: unknown, n: number): number;
+  sshWindowLeft(w: unknown): number;
   sshServiceRequest(): Uint8Array;
   sshSignedData(sessionId: Uint8Array, user: Uint8Array, publicBlob: Uint8Array): Uint8Array;
   sshPublicKeyRequest(sessionId: Uint8Array, user: Uint8Array, publicBlob: Uint8Array, seed: Uint8Array): Uint8Array;
@@ -78,280 +102,264 @@ function freePort(): number {
   return port;
 }
 
+/** Everything a test needs from a running sshd, so the setup is written once. */
+type Server = { dir: string; port: number; sshd: Deno.ChildProcess; conn: Deno.TcpConn };
+
+/**
+ * Start an sshd that accepts a freshly generated client key, and connect to it.
+ *
+ * The server runs as this user and so can only authenticate this user, which is exactly the
+ * account the tests attempt.
+ */
+async function startServer(): Promise<Server> {
+  const dir = await Deno.makeTempDir();
+  const port = freePort();
+  for (const name of ["hostkey", "clientkey"]) {
+    const r = await new Deno.Command("ssh-keygen", {
+      args: ["-t", "ed25519", "-f", `${dir}/${name}`, "-N", "", "-q"],
+    }).output();
+    if (!r.success) throw new Error(`ssh-keygen failed for ${name}`);
+    await Deno.chmod(`${dir}/${name}`, 0o600);
+  }
+  await Deno.copyFile(`${dir}/clientkey.pub`, `${dir}/authorized_keys`);
+  await Deno.chmod(`${dir}/authorized_keys`, 0o600);
+  await Deno.writeTextFile(`${dir}/sshd_config`, [
+    `Port ${port}`,
+    "ListenAddress 127.0.0.1",
+    `HostKey ${dir}/hostkey`,
+    `AuthorizedKeysFile ${dir}/authorized_keys`,
+    "StrictModes no",
+    "UsePAM no",
+    "PasswordAuthentication no",
+    "KbdInteractiveAuthentication no",
+    "PidFile none",
+  ].join("\n"));
+
+  // Foreground, so killing the child actually stops the server.
+  const sshd = new Deno.Command("/usr/sbin/sshd", {
+    args: ["-D", "-f", `${dir}/sshd_config`],
+    stdout: "null",
+    stderr: "null",
+  }).spawn();
+
+  // Wait for it to accept, rather than sleeping a guessed amount.
+  let conn: Deno.TcpConn | undefined;
+  for (let i = 0; i < 100 && conn === undefined; i++) {
+    try {
+      conn = await Deno.connect({ hostname: "127.0.0.1", port });
+    } catch {
+      await new Promise(r => setTimeout(r, 50));
+    }
+  }
+  if (conn === undefined) throw new Error(`sshd never accepted on ${port}`);
+  return { dir, port, sshd, conn };
+}
+
+async function stopServer(s: Server | undefined): Promise<void> {
+  if (s === undefined) return;
+  try { s.conn.close(); } catch { /* already gone */ }
+  try { s.sshd.kill("SIGTERM"); } catch { /* already gone */ }
+  await s.sshd.status;
+  await Deno.remove(s.dir, { recursive: true });
+}
+
+/**
+ * The whole handshake, up to an authenticated connection.
+ *
+ * Every intermediate value is returned rather than only the result, so the test that exists to
+ * *verify* the handshake can assert over them while the tests that merely need a session ignore
+ * them. Only the checks a caller could not continue past are made here.
+ */
+async function handshake(s: Server) {
+  const { conn, dir, port } = s;
+  const block = mod.sshMinBlock();
+  const MAX = 35000;
+  let buf = new Uint8Array(0);
+
+  const read = async () => {
+    const chunk = new Uint8Array(65536);
+    const n = await conn.read(chunk);
+    if (n === null) throw new Error("server closed the connection");
+    const next = new Uint8Array(buf.length + n);
+    next.set(buf);
+    next.set(chunk.subarray(0, n), buf.length);
+    buf = next;
+  };
+  const framed = async (payload: Uint8Array) => {
+    const pad = crypto.getRandomValues(new Uint8Array(mod.sshPaddingFor(payload.length, block)));
+    await conn.write(mod.sshFrame(payload, pad, block));
+  };
+  const nextPlain = async () => {
+    while (mod.sshUnframeStatus(buf) === 1) await read();
+    if (mod.sshUnframeStatus(buf) !== 0) throw new Error("a packet could not be framed");
+    const p = mod.sshUnframePayload(buf);
+    buf = buf.slice(mod.sshUnframeUsed(buf));
+    return p;
+  };
+
+  // Our version line goes first; SSH does not wait for the peer's.
+  await conn.write(mod.sshClientVersionLine());
+  while (mod.sshScanStatus(buf) === 1) await read();
+  if (mod.sshScanStatus(buf) !== 0) throw new Error("server version line was rejected");
+  const serverVersion = mod.sshScanLine(buf);
+  buf = buf.slice(mod.sshScanUsed(buf));
+
+  // KEXINIT, both sides sending without waiting.
+  const cookie = crypto.getRandomValues(new Uint8Array(16));
+  const ourKexInit = mod.sshKexInit(cookie);
+  await framed(ourKexInit);
+  const serverKexInit = await nextPlain();
+  if (serverKexInit[0] !== 20) throw new Error(`expected KEXINIT, got ${serverKexInit[0]}`);
+
+  // Key exchange.
+  const secret = crypto.getRandomValues(new Uint8Array(32));
+  const qc = mod.sshEphemeralPublic(secret);
+  await framed(mod.sshEcdhInit(qc));
+  const reply = await nextPlain();
+  if (reply[0] !== 31) throw new Error(`expected KEX_ECDH_REPLY, got ${reply[0]}`);
+  const hostKeyBlob = mod.sshEcdhReplyField(reply, 0);
+  const qs = mod.sshEcdhReplyField(reply, 1);
+  const signature = mod.sshEcdhReplyField(reply, 2);
+  const shared = mod.sshSharedSecret(secret, qs);
+  if (shared.length === 0) throw new Error("shared secret was rejected as low-order");
+  const h = mod.sshExchangeHash(mod.sshClientVersion(), serverVersion, ourKexInit, serverKexInit,
+                                hostKeyBlob, qc, qs, shared);
+  if (!mod.sshVerifyHostKey(hostKeyBlob, signature, h)) {
+    throw new Error("the server's host key signature did not verify over our exchange hash");
+  }
+
+  // NEWKEYS. Both sides advertised strict KEX, so the sequence numbers reset to zero here.
+  await framed(new Uint8Array([21]));
+  const nk = await nextPlain();
+  if (nk[0] !== 21) throw new Error(`expected NEWKEYS, got ${nk[0]}`);
+
+  const keyOut = mod.sshDeriveKey(shared, h, h, 0x43, mod.sshCipherKeyLength());
+  const keyIn = mod.sshDeriveKey(shared, h, h, 0x44, mod.sshCipherKeyLength());
+  let outSeq = 0;
+  let inSeq = 0;
+
+  const send = async (payload: Uint8Array) => {
+    const pad = crypto.getRandomValues(
+      new Uint8Array(mod.sshAeadPaddingFor(payload.length, block)));
+    await conn.write(mod.sshSeal(keyOut, outSeq, payload, pad, block));
+    outSeq++;
+  };
+  const next = async () => {
+    while (mod.sshOpenStatus(keyIn, inSeq, buf, 0, buf.length, MAX) === 1) await read();
+    if (mod.sshOpenStatus(keyIn, inSeq, buf, 0, buf.length, MAX) !== 0) {
+      throw new Error(`encrypted packet ${inSeq} did not open`);
+    }
+    const p = mod.sshOpenPayload(keyIn, inSeq, buf, 0, buf.length, MAX);
+    buf = buf.slice(mod.sshOpenUsed(keyIn, inSeq, buf, 0, buf.length, MAX));
+    inSeq++;
+    return p;
+  };
+
+  await send(mod.sshServiceRequest());
+  let sawExtInfo = false;
+  let accepted = false;
+  for (let i = 0; i < 8 && !accepted; i++) {
+    const p = await next();
+    if (p[0] === 7) sawExtInfo = true;
+    if (p[0] === mod.sshMsgServiceAccept()) accepted = true;
+  }
+  if (!accepted) throw new Error("never received SSH_MSG_SERVICE_ACCEPT");
+
+  // Authenticate, reading the private key with our own code.
+  const pem = await Deno.readFile(`${dir}/clientkey`);
+  const empty = new Uint8Array(0);
+  if (mod.sshReadKeyStatus(pem, empty) !== 0) throw new Error("could not read the private key");
+  const seed = mod.sshReadKeySeed(pem, empty);
+  const publicBlob = mod.sshReadKeyPublic(pem, empty);
+  const user = bytes(Deno.env.get("USER") ?? "claude");
+  await send(mod.sshPublicKeyRequest(h, user, publicBlob, seed));
+
+  let authed = false;
+  for (let i = 0; i < 8 && !authed; i++) {
+    const p = await next();
+    if (p[0] === mod.sshMsgUserAuthFailure()) {
+      throw new Error(`the server rejected our signature: ${text(mod.sshReadString(p.slice(1)))}`);
+    }
+    if (p[0] === mod.sshMsgUserAuthSuccess()) authed = true;
+  }
+  if (!authed) throw new Error("never received SSH_MSG_USERAUTH_SUCCESS");
+
+  return {
+    serverVersion, ourKexInit, serverKexInit, hostKeyBlob, signature, qc, qs, shared, h,
+    publicBlob, seed, sawExtInfo, block, port, dir, send, next, MAX,
+  };
+}
+
 Deno.test({
   name: "connect to a real OpenSSH server and authenticate with a public key",
   ignore: !haveSshd,
   sanitizeResources: false,
   fn: async () => {
-    const dir = await Deno.makeTempDir();
-    const port = freePort();
-    let sshd: Deno.ChildProcess | undefined;
-    let conn: Deno.TcpConn | undefined;
+    let s: Server | undefined;
     try {
-      const kg = await new Deno.Command("ssh-keygen", {
-        args: ["-t", "ed25519", "-f", `${dir}/hostkey`, "-N", "", "-q"],
-      }).output();
-      if (!kg.success) throw new Error("ssh-keygen failed");
-      await Deno.chmod(`${dir}/hostkey`, 0o600);
-      // A client key too, and an sshd that accepts it. sshd runs as this user and so can only
-      // authenticate this user, which is exactly what we want to attempt.
-      const kg2 = await new Deno.Command("ssh-keygen", {
-        args: ["-t", "ed25519", "-f", `${dir}/clientkey`, "-N", "", "-q"],
-      }).output();
-      if (!kg2.success) throw new Error("ssh-keygen failed for the client key");
-      await Deno.copyFile(`${dir}/clientkey.pub`, `${dir}/authorized_keys`);
-      await Deno.chmod(`${dir}/authorized_keys`, 0o600);
-      await Deno.writeTextFile(`${dir}/sshd_config`, [
-        `Port ${port}`,
-        "ListenAddress 127.0.0.1",
-        `HostKey ${dir}/hostkey`,
-        `AuthorizedKeysFile ${dir}/authorized_keys`,
-        "StrictModes no",
-        "UsePAM no",
-        "PasswordAuthentication no",
-        "KbdInteractiveAuthentication no",
-        "PidFile none",
-      ].join("\n"));
+      s = await startServer();
+      const r = await handshake(s);
 
-      // Foreground, so killing the child actually stops the server.
-      sshd = new Deno.Command("/usr/sbin/sshd", {
-        args: ["-D", "-f", `${dir}/sshd_config`],
-        stdout: "null",
-        stderr: "null",
-      }).spawn();
-
-      // Wait for it to accept, rather than sleeping a guessed amount.
-      for (let i = 0; i < 100 && conn === undefined; i++) {
-        try {
-          conn = await Deno.connect({ hostname: "127.0.0.1", port });
-        } catch {
-          await new Promise(r => setTimeout(r, 50));
-        }
+      if (!text(r.serverVersion).startsWith("SSH-2.0-OpenSSH")) {
+        throw new Error(`expected an OpenSSH server, got ${text(r.serverVersion)}`);
       }
-      if (conn === undefined) throw new Error(`sshd never accepted on ${port}`);
+      if (!mod.sshSpeaksV2(r.serverVersion)) throw new Error("server is not SSH-2.0");
 
-      let buf = new Uint8Array(0);
-      const read = async () => {
-        const chunk = new Uint8Array(16384);
-        const n = await conn!.read(chunk);
-        if (n === null) throw new Error("server closed the connection");
-        const next = new Uint8Array(buf.length + n);
-        next.set(buf);
-        next.set(chunk.subarray(0, n), buf.length);
-        buf = next;
-      };
-
-      // Our version line goes first; SSH does not wait for the peer's.
-      await conn.write(mod.sshClientVersionLine());
-
-      while (mod.sshScanStatus(buf) === 1) await read();
-      if (mod.sshScanStatus(buf) !== 0) throw new Error("server version line was rejected");
-      const serverVersion = mod.sshScanLine(buf);
-      if (!mod.sshSpeaksV2(serverVersion)) {
-        throw new Error(`server is not SSH-2.0: ${text(serverVersion)}`);
-      }
-      if (!text(serverVersion).startsWith("SSH-2.0-OpenSSH")) {
-        throw new Error(`expected an OpenSSH server, got ${text(serverVersion)}`);
-      }
-      buf = buf.slice(mod.sshScanUsed(buf));
-
-      // KEXINIT, framed as a binary packet. Both sides send without waiting.
-      const cookie = crypto.getRandomValues(new Uint8Array(16));
-      const ourKexInit = mod.sshKexInit(cookie);
-      const block = mod.sshMinBlock();
-      const padding = crypto.getRandomValues(new Uint8Array(mod.sshPaddingFor(ourKexInit.length, block)));
-      await conn.write(mod.sshFrame(ourKexInit, padding, block));
-
-      while (mod.sshUnframeStatus(buf) === 1) await read();
-      if (mod.sshUnframeStatus(buf) !== 0) throw new Error("could not frame the server's first packet");
-      const payload = mod.sshUnframePayload(buf);
-      if (payload[0] !== 20) throw new Error(`expected SSH_MSG_KEXINIT (20), got ${payload[0]}`);
-      if (!mod.sshProposalOk(payload)) throw new Error("server KEXINIT did not parse");
-
-      // The server must offer what we picked, and our choice must be our own first preference
-      // that it supports — client order decides.
-      const kex = text(mod.sshNegotiate(payload, 0));
-      const hostKey = text(mod.sshNegotiate(payload, 1));
-      const cipherOut = text(mod.sshNegotiate(payload, 2));
-      const cipherIn = text(mod.sshNegotiate(payload, 3));
+      // Our choice must be our own first preference that the server supports — client order
+      // decides, and the server's is ignored.
+      const kex = text(mod.sshNegotiate(r.serverKexInit, 0));
+      const hostKey = text(mod.sshNegotiate(r.serverKexInit, 1));
+      const cipherOut = text(mod.sshNegotiate(r.serverKexInit, 2));
+      const cipherIn = text(mod.sshNegotiate(r.serverKexInit, 3));
       if (kex !== "curve25519-sha256") throw new Error(`kex negotiated as ${kex}`);
       if (hostKey !== "ssh-ed25519") throw new Error(`host key negotiated as ${hostKey}`);
       if (cipherOut !== "chacha20-poly1305@openssh.com") throw new Error(`c2s cipher: ${cipherOut}`);
       if (cipherIn !== "chacha20-poly1305@openssh.com") throw new Error(`s2c cipher: ${cipherIn}`);
 
-      // Sanity that we parsed the server's lists rather than our own: OpenSSH offers several
-      // key exchanges, and a single-entry list here would mean we read back what we sent.
-      const theirKex = text(mod.sshProposalField(payload, 0));
+      // Sanity that we parsed the server's lists rather than our own: OpenSSH offers several key
+      // exchanges, and a single-entry list would mean we read back what we sent.
+      const theirKex = text(mod.sshProposalField(r.serverKexInit, 0));
       if (!theirKex.includes(",")) throw new Error(`server kex list looks wrong: ${theirKex}`);
-      if (!theirKex.includes("curve25519-sha256")) throw new Error("server does not offer curve25519");
-      buf = buf.slice(mod.sshUnframeUsed(buf));
-
-      // ── Key exchange ────────────────────────────────────────────────────────
-      //
-      // The signature check at the end is the whole point: it can only pass if every input to the
-      // exchange hash matches what the server used — both version strings, both KEXINIT payloads
-      // byte for byte, the host key, both ephemeral keys, and the shared secret in its mpint form.
-      // One wrong byte anywhere and Ed25519 verification fails.
-      const secret = crypto.getRandomValues(new Uint8Array(32));
-      const qc = mod.sshEphemeralPublic(secret);
-      const initPayload = mod.sshEcdhInit(qc);
-      const initPad = crypto.getRandomValues(new Uint8Array(mod.sshPaddingFor(initPayload.length, block)));
-      await conn.write(mod.sshFrame(initPayload, initPad, block));
-
-      while (mod.sshUnframeStatus(buf) === 1) await read();
-      if (mod.sshUnframeStatus(buf) !== 0) throw new Error("could not frame the ECDH reply");
-      const reply = mod.sshUnframePayload(buf);
-      if (reply[0] !== 31) {
-        throw new Error(`expected SSH_MSG_KEX_ECDH_REPLY (31), got ${reply[0]}`);
-      }
-      if (!mod.sshEcdhReplyOk(reply)) throw new Error("ECDH reply did not parse");
-
-      const hostKeyBlob = mod.sshEcdhReplyField(reply, 0);
-      const qs = mod.sshEcdhReplyField(reply, 1);
-      const signature = mod.sshEcdhReplyField(reply, 2);
-
-      const shared = mod.sshSharedSecret(secret, qs);
-      if (shared.length === 0) throw new Error("shared secret was rejected as low-order");
-
-      const h = mod.sshExchangeHash(
-        mod.sshClientVersion(), serverVersion, ourKexInit, payload,
-        hostKeyBlob, qc, qs, shared);
-      if (h.length !== 32) throw new Error("exchange hash is not 32 bytes");
-
-      if (!mod.sshVerifyHostKey(hostKeyBlob, signature, h)) {
-        throw new Error("the server's host key signature did not verify over our exchange hash");
-      }
-
-      // Independently: the key the server presented is the one we generated for it. Without this,
-      // a signature that verifies only proves self-consistency — we would accept any host.
-      const pubLine = await Deno.readTextFile(`${dir}/hostkey.pub`);
-      const wantBlob = pubLine.split(" ")[1];
-      const gotBlob = btoa(String.fromCharCode(...hostKeyBlob));
-      if (gotBlob !== wantBlob) throw new Error("host key blob is not the one in hostkey.pub");
-
-      // Tampering with H must break the signature — otherwise the check above proves nothing.
-      const bent = new Uint8Array(h);
-      bent[0] ^= 1;
-      if (mod.sshVerifyHostKey(hostKeyBlob, signature, bent)) {
-        throw new Error("a signature verified over the wrong exchange hash");
-      }
-      buf = buf.slice(mod.sshUnframeUsed(buf));
-
-      // ── NEWKEYS, and everything after it is encrypted ───────────────────────
-      //
-      // Both sides advertised strict KEX, so the sequence numbers reset to zero at NEWKEYS rather
-      // than continuing. Getting that wrong fails the MAC on the very first encrypted packet with
-      // no indication of why, which is the whole reason it is asserted rather than assumed.
       if (!theirKex.includes("kex-strict-s-v00@openssh.com")) {
         throw new Error("server did not offer strict KEX, so the sequence numbers do not reset");
       }
 
-      const newKeys = new Uint8Array([21]);
-      const nkPad = crypto.getRandomValues(new Uint8Array(mod.sshPaddingFor(1, block)));
-      await conn.write(mod.sshFrame(newKeys, nkPad, block));
-
-      while (mod.sshUnframeStatus(buf) === 1) await read();
-      if (mod.sshUnframeStatus(buf) !== 0) throw new Error("could not frame the server's NEWKEYS");
-      const nk = mod.sshUnframePayload(buf);
-      if (nk[0] !== 21) throw new Error(`expected SSH_MSG_NEWKEYS (21), got ${nk[0]}`);
-      buf = buf.slice(mod.sshUnframeUsed(buf));
-
-      // session_id is H from the first exchange. 'C' is client-to-server, 'D' the other way.
-      const keyOut = mod.sshDeriveKey(shared, h, h, 0x43, mod.sshCipherKeyLength());
-      const keyIn = mod.sshDeriveKey(shared, h, h, 0x44, mod.sshCipherKeyLength());
-
-      // Send an encrypted SERVICE_REQUEST for ssh-userauth. If our sealing is wrong in any way —
-      // key halves swapped, wrong counter, wrong padding rule, wrong sequence number — the server
-      // drops the connection instead of replying.
-      const serviceRequest = (() => {
-        const name = bytes("ssh-userauth");
-        const out = new Uint8Array(1 + 4 + name.length);
-        out[0] = 5;                                    // SSH_MSG_SERVICE_REQUEST
-        new DataView(out.buffer).setUint32(1, name.length);
-        out.set(name, 5);
-        return out;
-      })();
-      const srPad = crypto.getRandomValues(
-        new Uint8Array(mod.sshAeadPaddingFor(serviceRequest.length, block)));
-      await conn.write(mod.sshSeal(keyOut, 0, serviceRequest, srPad, block));
-
-      // Read encrypted packets until SERVICE_ACCEPT. OpenSSH sends EXT_INFO first, because we
-      // asked for it with ext-info-c.
-      const MAX = 35000;
-      let inSeq = 0;
-      let accepted = false;
-      let sawExtInfo = false;
-      for (let i = 0; i < 8 && !accepted; i++) {
-        while (mod.sshOpenStatus(keyIn, inSeq, buf, 0, buf.length, MAX) === 1) await read();
-        const status = mod.sshOpenStatus(keyIn, inSeq, buf, 0, buf.length, MAX);
-        if (status !== 0) {
-          throw new Error(`encrypted packet ${inSeq} did not open (status ${status}) — ` +
-            `the cipher, the key halves or the sequence number is wrong`);
-        }
-        const p = mod.sshOpenPayload(keyIn, inSeq, buf, 0, buf.length, MAX);
-        buf = buf.slice(mod.sshOpenUsed(keyIn, inSeq, buf, 0, buf.length, MAX));
-        inSeq++;
-        if (p[0] === 7) sawExtInfo = true;                      // SSH_MSG_EXT_INFO
-        if (p[0] === mod.sshMsgServiceAccept()) {
-          const name = text(mod.sshReadString(p.slice(1)));
-          if (name !== "ssh-userauth") throw new Error(`service accepted was ${name}`);
-          accepted = true;
-        }
-      }
-      if (!accepted) throw new Error("never received SSH_MSG_SERVICE_ACCEPT");
-      if (!sawExtInfo) {
-        throw new Error("no EXT_INFO, though we advertised ext-info-c — decryption may be wrong");
+      // Tampering with H must break the signature — otherwise `handshake`'s check proves nothing.
+      const bent = new Uint8Array(r.h);
+      bent[0] ^= 1;
+      if (mod.sshVerifyHostKey(r.hostKeyBlob, r.signature, bent)) {
+        throw new Error("a signature verified over the wrong exchange hash");
       }
 
-      // ── Authenticate ────────────────────────────────────────────────────────
-      //
-      // The private key is read by our own wac code, straight out of the file ssh-keygen wrote.
-      const pem = await Deno.readFile(`${dir}/clientkey`);
-      const empty = new Uint8Array(0);
-      if (mod.sshReadKeyStatus(pem, empty) !== 0) {
-        throw new Error(`could not read the private key: status ${mod.sshReadKeyStatus(pem, empty)}`);
+      // A verifying signature only proves the peer holds the key it presented — it says nothing
+      // about *which* peer. So the host key goes through known_hosts, as a real client does.
+      const wantBlob = (await Deno.readTextFile(`${s.dir}/hostkey.pub`)).split(" ")[1];
+      const knownHosts = bytes(`[127.0.0.1]:${s.port} ssh-ed25519 ${wantBlob}\n`);
+      const host = bytes("127.0.0.1");
+      const keyType = bytes("ssh-ed25519");
+      if (mod.sshKnownHost(knownHosts, host, s.port, keyType, r.hostKeyBlob) !== 1) {
+        throw new Error("known_hosts did not recognise the host key");
       }
-      const seed = mod.sshReadKeySeed(pem, empty);
-      const publicBlob = mod.sshReadKeyPublic(pem, empty);
-      if (seed.length !== 32) throw new Error("seed is not 32 bytes");
+      if (mod.sshKnownHost(new Uint8Array(0), host, s.port, keyType, r.hostKeyBlob) !== 0) {
+        throw new Error("an empty known_hosts matched");
+      }
+      const wrong = bytes(`[127.0.0.1]:${s.port} ssh-ed25519 ${btoa(String.fromCharCode(
+        ...Uint8Array.from({ length: 51 }, (_, i) => i)))}\n`);
+      if (mod.sshKnownHost(wrong, host, s.port, keyType, r.hostKeyBlob) !== 2) {
+        throw new Error("a changed host key was not caught");
+      }
 
-      // The blob we parsed must be the one in the .pub file, or we would be offering a key the
-      // server has never heard of and reading its refusal as our own bug.
-      const wantPub = (await Deno.readTextFile(`${dir}/clientkey.pub`)).split(" ")[1];
-      if (btoa(String.fromCharCode(...publicBlob)) !== wantPub) {
+      // The blob we parsed out of the private key must be the one in the .pub file, or we would
+      // be offering a key the server never heard of and reading its refusal as our own bug.
+      const wantPub = (await Deno.readTextFile(`${s.dir}/clientkey.pub`)).split(" ")[1];
+      if (btoa(String.fromCharCode(...r.publicBlob)) !== wantPub) {
         throw new Error("the public blob from the private key does not match clientkey.pub");
       }
-
-      // session_id is H from the first exchange. Signing over it is what stops a signature being
-      // replayable to another server.
-      const user = bytes(Deno.env.get("USER") ?? "claude");
-      const authRequest = mod.sshPublicKeyRequest(h, user, publicBlob, seed);
-      const arPad = crypto.getRandomValues(
-        new Uint8Array(mod.sshAeadPaddingFor(authRequest.length, block)));
-      await conn.write(mod.sshSeal(keyOut, 1, authRequest, arPad, block));
-
-      let authed = false;
-      for (let i = 0; i < 8 && !authed; i++) {
-        while (mod.sshOpenStatus(keyIn, inSeq, buf, 0, buf.length, MAX) === 1) await read();
-        if (mod.sshOpenStatus(keyIn, inSeq, buf, 0, buf.length, MAX) !== 0) {
-          throw new Error(`packet ${inSeq} did not open while authenticating`);
-        }
-        const p = mod.sshOpenPayload(keyIn, inSeq, buf, 0, buf.length, MAX);
-        buf = buf.slice(mod.sshOpenUsed(keyIn, inSeq, buf, 0, buf.length, MAX));
-        inSeq++;
-        if (p[0] === mod.sshMsgUserAuthFailure()) {
-          throw new Error(`the server rejected our signature: ${text(mod.sshReadString(p.slice(1)))}`);
-        }
-        if (p[0] === mod.sshMsgUserAuthSuccess()) authed = true;
+      if (!r.sawExtInfo) {
+        throw new Error("no EXT_INFO, though we advertised ext-info-c — decryption may be wrong");
       }
-      if (!authed) throw new Error("never received SSH_MSG_USERAUTH_SUCCESS");
     } finally {
-      try { conn?.close(); } catch { /* already gone */ }
-      if (sshd !== undefined) {
-        try { sshd.kill("SIGTERM"); } catch { /* already gone */ }
-        await sshd.status;
-      }
-      await Deno.remove(dir, { recursive: true });
+      await stopServer(s);
     }
   },
 });
@@ -877,5 +885,385 @@ Deno.test("the signed data length-prefixes the session id", () => {
   const tail = request.slice(withoutSessionId.length);
   if (text(mod.sshReadString(tail.slice(4))) !== "ssh-ed25519") {
     throw new Error("the signature blob does not name ssh-ed25519");
+  }
+});
+
+// known_hosts, against a file the real ssh client wrote.
+//
+// This is the only way to know the hashed form is right: `HashKnownHosts` is on by default, so a
+// real entry is `|1|<salt>|<HMAC-SHA-1(salt, name)>` and there is nothing to compare against
+// except a file OpenSSH produced. It also pins the `[host]:port` spelling, which is what gets
+// hashed for a non-default port — get that wrong and every lookup silently reports "unknown".
+Deno.test({
+  name: "a known_hosts written by the real ssh client is read correctly",
+  ignore: !haveSshd,
+  sanitizeResources: false,
+  fn: async () => {
+    const dir = await Deno.makeTempDir();
+    const port = freePort();
+    let sshd: Deno.ChildProcess | undefined;
+    try {
+      for (const name of ["hostkey", "clientkey"]) {
+        const r = await new Deno.Command("ssh-keygen", {
+          args: ["-t", "ed25519", "-f", `${dir}/${name}`, "-N", "", "-q"],
+        }).output();
+        if (!r.success) throw new Error(`ssh-keygen failed for ${name}`);
+      }
+      await Deno.chmod(`${dir}/hostkey`, 0o600);
+      await Deno.chmod(`${dir}/clientkey`, 0o600);
+      await Deno.copyFile(`${dir}/clientkey.pub`, `${dir}/authorized_keys`);
+      await Deno.chmod(`${dir}/authorized_keys`, 0o600);
+      await Deno.writeTextFile(`${dir}/sshd_config`, [
+        `Port ${port}`, "ListenAddress 127.0.0.1", `HostKey ${dir}/hostkey`,
+        `AuthorizedKeysFile ${dir}/authorized_keys`,
+        "StrictModes no", "UsePAM no", "PasswordAuthentication no", "PidFile none",
+      ].join("\n"));
+
+      sshd = new Deno.Command("/usr/sbin/sshd", {
+        args: ["-D", "-f", `${dir}/sshd_config`], stdout: "null", stderr: "null",
+      }).spawn();
+      for (let i = 0; i < 100; i++) {
+        try {
+          const probe = await Deno.connect({ hostname: "127.0.0.1", port });
+          probe.close();
+          break;
+        } catch {
+          await new Promise(r => setTimeout(r, 50));
+        }
+      }
+
+      // Let the real client connect — that is what writes the entry. Once with hashing and once
+      // without, because `-F /dev/null` drops the system default and the two forms are parsed by
+      // completely different code. Both are files OpenSSH actually produced.
+      async function writeKnownHosts(hashed: boolean): Promise<Uint8Array> {
+        const kh = `${dir}/known_hosts_${hashed ? "hashed" : "plain"}`;
+        const run = await new Deno.Command("ssh", {
+          args: ["-F", "/dev/null", "-i", `${dir}/clientkey`, "-p", String(port),
+                 "-o", "StrictHostKeyChecking=accept-new", "-o", `UserKnownHostsFile=${kh}`,
+                 "-o", `HashKnownHosts=${hashed ? "yes" : "no"}`,
+                 "-o", "BatchMode=yes", "127.0.0.1", "true"],
+        }).output();
+        if (!run.success) throw new Error(`ssh failed: ${text(run.stderr)}`);
+        return await Deno.readFile(kh);
+      }
+
+      const plainFile = await writeKnownHosts(false);
+      const hashedFile = await writeKnownHosts(true);
+      // Confirm each really is the form it claims, so a config change cannot quietly turn this
+      // into the same test twice.
+      if (text(plainFile).includes("|1|")) throw new Error("the plain file is hashed");
+      if (!text(hashedFile).includes("|1|")) {
+        throw new Error(`expected a hashed entry, got: ${text(hashedFile).slice(0, 120)}`);
+      }
+      // The plain form pins the `[host]:port` spelling that also gets hashed.
+      if (!text(plainFile).startsWith(`[127.0.0.1]:${port} ssh-ed25519 `)) {
+        throw new Error(`unexpected plain entry: ${text(plainFile).slice(0, 80)}`);
+      }
+
+      // The host key blob, as it appears in the exchange, taken from the .pub file.
+      const pubB64 = (await Deno.readTextFile(`${dir}/hostkey.pub`)).split(" ")[1];
+      const blob = Uint8Array.from(atob(pubB64), c => c.charCodeAt(0));
+      const type = bytes("ssh-ed25519");
+      const host = bytes("127.0.0.1");
+
+      const changed = new Uint8Array(blob);
+      changed[changed.length - 1] ^= 1;
+
+      for (const [what, file] of [["plain", plainFile], ["hashed", hashedFile]] as const) {
+        if (mod.sshKnownHost(file, host, port, type, blob) !== 1) {
+          throw new Error(`${what}: the entry ssh just wrote was not recognised as a match`);
+        }
+        // One byte different is the case the file exists to catch, and must not read as unknown.
+        if (mod.sshKnownHost(file, host, port, type, changed) !== 2) {
+          throw new Error(`${what}: a changed host key was not reported as a mismatch`);
+        }
+        // The same key on another port is a different entry — the port is part of the name, and
+        // for the hashed form that means it is inside the hash.
+        if (mod.sshKnownHost(file, host, port + 1, type, blob) !== 0) {
+          throw new Error(`${what}: a lookup on the wrong port matched`);
+        }
+        if (mod.sshKnownHost(file, bytes("example.com"), port, type, blob) !== 0) {
+          throw new Error(`${what}: a lookup for another host matched`);
+        }
+        // A different algorithm says nothing about this key — a host may have several.
+        if (mod.sshKnownHost(file, host, port, bytes("ssh-rsa"), blob) !== 0) {
+          throw new Error(`${what}: an entry for another algorithm was treated as authoritative`);
+        }
+      }
+    } finally {
+      if (sshd !== undefined) {
+        try { sshd.kill("SIGTERM"); } catch { /* already gone */ }
+        await sshd.status;
+      }
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test("known_hosts plain entries: patterns, negation, markers and comments", () => {
+  const type = bytes("ssh-ed25519");
+  const blob = Uint8Array.from({ length: 51 }, (_, i) => (i * 3) & 255);
+  const other = Uint8Array.from({ length: 51 }, (_, i) => (i * 5) & 255);
+  const b64 = btoa(String.fromCharCode(...blob));
+  const otherB64 = btoa(String.fromCharCode(...other));
+
+  const check = (file: string, host: string, port = 22, key = blob, kt = type) =>
+    mod.sshKnownHost(bytes(file), bytes(host), port, kt, key);
+
+  // Exact, comments and blank lines.
+  if (check(`# a comment\n\nexample.com ssh-ed25519 ${b64} me@here\n`, "example.com") !== 1) {
+    throw new Error("a plain entry with a trailing comment did not match");
+  }
+  // Several names on one line.
+  if (check(`a.example,b.example,c.example ssh-ed25519 ${b64}\n`, "b.example") !== 1) {
+    throw new Error("a middle name in a list did not match");
+  }
+  // Patterns.
+  if (check(`*.example ssh-ed25519 ${b64}\n`, "host.example") !== 1) throw new Error("* did not match");
+  if (check(`*.example ssh-ed25519 ${b64}\n`, "example") !== 0) throw new Error("* matched too much");
+  if (check(`h??t.example ssh-ed25519 ${b64}\n`, "host.example") !== 1) throw new Error("? did not match");
+  if (check(`h??t.example ssh-ed25519 ${b64}\n`, "hoost.example") !== 0) throw new Error("? matched two");
+  // A negation vetoes the whole entry even though the wildcard matches.
+  if (check(`*.example,!bad.example ssh-ed25519 ${b64}\n`, "bad.example") !== 0) {
+    throw new Error("a negation did not veto the entry");
+  }
+  if (check(`*.example,!bad.example ssh-ed25519 ${b64}\n`, "good.example") !== 1) {
+    throw new Error("a negation vetoed an unrelated host");
+  }
+  // Known host, different key.
+  if (check(`example.com ssh-ed25519 ${otherB64}\n`, "example.com") !== 2) {
+    throw new Error("a different key was not a mismatch");
+  }
+  // A second line with the right key still matches, even after a wrong one.
+  if (check(`example.com ssh-ed25519 ${otherB64}\nexample.com ssh-ed25519 ${b64}\n`, "example.com") !== 1) {
+    throw new Error("a matching line after a non-matching one did not win");
+  }
+  // @revoked outranks everything, wherever it appears.
+  if (check(`example.com ssh-ed25519 ${b64}\n@revoked example.com ssh-ed25519 ${b64}\n`, "example.com") !== 3) {
+    throw new Error("a revocation did not outrank a match");
+  }
+  // @cert-authority describes a CA, not this host key: it must not be compared as one.
+  if (check(`@cert-authority *.example ssh-ed25519 ${otherB64}\n`, "host.example") !== 0) {
+    throw new Error("a cert-authority line was treated as a host key");
+  }
+  // A non-default port uses the bracketed form.
+  if (check(`[example.com]:2222 ssh-ed25519 ${b64}\n`, "example.com", 2222) !== 1) {
+    throw new Error("the bracketed port form did not match");
+  }
+  if (check(`example.com ssh-ed25519 ${b64}\n`, "example.com", 2222) !== 0) {
+    throw new Error("a bare name matched a non-default port");
+  }
+  // Junk lines are ignored rather than fatal — a file may have entries we cannot read.
+  if (check(`garbage\nexample.com ssh-ed25519 !!!not base64!!!\nexample.com ssh-ed25519 ${b64}\n`, "example.com") !== 1) {
+    throw new Error("an unreadable line stopped a later valid one from matching");
+  }
+  if (check("", "example.com") !== 0) throw new Error("an empty file was not unknown");
+});
+
+// Running a command: open a session channel, exec, and read the output back.
+//
+// This is the end of the protocol — everything before it exists to make this possible. The output
+// is deliberately many windows long, because flow control is the part that is invisible when it
+// is wrong: a client that never sends WINDOW_ADJUST reads exactly one window and then hangs,
+// having done nothing that any error reports.
+Deno.test({
+  name: "run a command on a real OpenSSH server and read its output",
+  ignore: !haveSshd,
+  sanitizeResources: false,
+  fn: async () => {
+    let s: Server | undefined;
+    try {
+      s = await startServer();
+      const { send, next } = await handshake(s);
+
+      // A small window on purpose, so the output is many windows long and the adjustment path is
+      // exercised rather than merely present. Channel 7 rather than 0, so a client that echoed
+      // its own number back instead of the server's would fail here.
+      const OUR_CHANNEL = 7;
+      const WINDOW = 8192;
+      await send(mod.sshOpenSession(OUR_CHANNEL, WINDOW, mod.sshDefaultMaxPacket()));
+
+      let serverChannel = -1;
+      for (let i = 0; i < 8 && serverChannel < 0; i++) {
+        const p = await next();
+        const kind = mod.sshIncomingField(p, 0);
+        if (kind === mod.sshMsgChannelOpenFailure()) {
+          throw new Error(`channel open refused: ${text(mod.sshIncomingData(p))}`);
+        }
+        if (kind === mod.sshMsgChannelOpenConfirmation()) {
+          if (mod.sshIncomingField(p, 1) !== OUR_CHANNEL) {
+            throw new Error("the confirmation was addressed to another channel");
+          }
+          serverChannel = mod.sshIncomingField(p, 2);
+        }
+      }
+      if (serverChannel < 0) throw new Error("no channel open confirmation");
+
+      await send(mod.sshExecRequest(serverChannel, bytes("seq 1 100000; echo done >&2; exit 3"), true));
+
+      const window = mod.sshWindowCreate(WINDOW);
+      let stdout = "";
+      let stderr = "";
+      let exitStatus = -1;
+      let closed = false;
+      let adjustments = 0;
+
+      for (let i = 0; i < 20000 && !closed; i++) {
+        const p = await next();
+        const kind = mod.sshIncomingField(p, 0);
+        if (mod.sshIncomingField(p, 5) !== 1) throw new Error("a channel message did not parse");
+
+        if (kind === mod.sshMsgChannelData() || kind === mod.sshMsgChannelExtendedData()) {
+          const data = mod.sshIncomingData(p);
+          if (kind === mod.sshMsgChannelData()) stdout += text(data);
+          else if (mod.sshIncomingField(p, 4) === mod.sshExtendedDataStderr()) stderr += text(data);
+          // Give the credit back, or the server stops sending after one window.
+          const increment = mod.sshWindowConsume(window, data.length);
+          if (increment > 0) {
+            await send(mod.sshWindowAdjust(serverChannel, increment));
+            adjustments++;
+          }
+        } else if (kind === mod.sshMsgChannelRequest()) {
+          if (text(mod.sshIncomingData(p)) === "exit-status") {
+            exitStatus = mod.sshIncomingField(p, 4);
+          }
+        } else if (kind === mod.sshMsgChannelClose()) {
+          closed = true;
+        }
+      }
+
+      if (!closed) throw new Error("the channel never closed");
+      if (exitStatus !== 3) throw new Error(`exit status was ${exitStatus}, expected 3`);
+      if (stderr.trim() !== "done") throw new Error(`stderr was ${JSON.stringify(stderr)}`);
+
+      const lines = stdout.trimEnd().split("\n");
+      if (lines.length !== 100000) throw new Error(`got ${lines.length} lines, expected 100000`);
+      if (lines[0] !== "1" || lines[99999] !== "100000") {
+        throw new Error(`output bounds wrong: ${lines[0]} … ${lines[99999]}`);
+      }
+      // The point of the large output: without window adjustments this would hang rather than
+      // fail, so assert the path was actually taken.
+      if (adjustments < 5) {
+        throw new Error(`only ${adjustments} window adjustments for ${stdout.length} bytes`);
+      }
+
+      await send(mod.sshChannelClose(serverChannel));
+    } finally {
+      await stopServer(s);
+    }
+  },
+});
+
+Deno.test("the window returns credit before it runs out, not after", () => {
+  const initial = 1000;
+  const w = mod.sshWindowCreate(initial);
+  if (mod.sshWindowLeft(w) !== initial) throw new Error("a new window is not full");
+
+  // Above half, nothing is due: adjusting per packet would spend a packet per packet.
+  if (mod.sshWindowConsume(w, 100) !== 0) throw new Error("adjusted too early");
+  if (mod.sshWindowLeft(w) !== 900) throw new Error("consume did not reduce the window");
+  if (mod.sshWindowConsume(w, 399) !== 0) throw new Error("adjusted at exactly half plus one");
+  if (mod.sshWindowLeft(w) !== 501) throw new Error(`window is ${mod.sshWindowLeft(w)}`);
+
+  // Crossing half returns exactly what was consumed, and refills.
+  const increment = mod.sshWindowConsume(w, 1);
+  if (increment !== 500) throw new Error(`increment was ${increment}, expected 500`);
+  if (mod.sshWindowLeft(w) !== initial) throw new Error("the window was not refilled");
+
+  // A single read larger than the whole window still returns the right credit — the server may
+  // send up to its maximum packet size regardless of what we think is left.
+  const w2 = mod.sshWindowCreate(initial);
+  if (mod.sshWindowConsume(w2, 1500) !== 1500) throw new Error("an oversized read mis-credited");
+  if (mod.sshWindowLeft(w2) !== initial) throw new Error("the window was not refilled after overrun");
+});
+
+Deno.test("channel messages parse to their fields", () => {
+  const u32 = (n: number) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+  const str = (b: Uint8Array) => { const o = new Uint8Array(4 + b.length); o.set(u32(b.length)); o.set(b, 4); return o; };
+  const join = (...ps: Uint8Array[]) => {
+    const o = new Uint8Array(ps.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of ps) { o.set(p, at); at += p.length; }
+    return o;
+  };
+  const field = (p: Uint8Array, i: number) => mod.sshIncomingField(p, i);
+
+  // OPEN_CONFIRMATION: our number, then theirs. They need not agree, and the test uses different
+  // values so a parser that read the wrong one would be caught.
+  const conf = join(new Uint8Array([91]), u32(7), u32(42), u32(2097152), u32(32768));
+  if (field(conf, 0) !== 91) throw new Error("kind wrong");
+  if (field(conf, 1) !== 7) throw new Error("recipient channel wrong");
+  if (field(conf, 2) !== 42) throw new Error("sender channel wrong");
+  if (field(conf, 3) !== 2097152) throw new Error("window wrong");
+  if (field(conf, 4) !== 32768) throw new Error("max packet wrong");
+
+  const data = join(new Uint8Array([94]), u32(7), str(bytes("hello")));
+  if (field(data, 0) !== 94 || text(mod.sshIncomingData(data)) !== "hello") {
+    throw new Error("CHANNEL_DATA did not parse");
+  }
+
+  const ext = join(new Uint8Array([95]), u32(7), u32(1), str(bytes("oops")));
+  if (field(ext, 4) !== 1 || text(mod.sshIncomingData(ext)) !== "oops") {
+    throw new Error("EXTENDED_DATA did not parse");
+  }
+
+  const adjust = join(new Uint8Array([93]), u32(7), u32(4096));
+  if (field(adjust, 3) !== 4096) throw new Error("WINDOW_ADJUST increment wrong");
+
+  // exit-status carries a uint32 *after* the want_reply boolean, and is a request rather than a
+  // reply — nothing prompts it.
+  const exit = join(new Uint8Array([98]), u32(7), str(bytes("exit-status")), new Uint8Array([0]), u32(3));
+  if (field(exit, 0) !== 98) throw new Error("request kind wrong");
+  if (text(mod.sshIncomingData(exit)) !== "exit-status") throw new Error("request name wrong");
+  if (field(exit, 4) !== 3) throw new Error(`exit status parsed as ${field(exit, 4)}`);
+
+  // A request that is not exit-status has no trailing uint32 to read, and must not go looking.
+  const other = join(new Uint8Array([98]), u32(7), str(bytes("keepalive@openssh.com")), new Uint8Array([1]));
+  if (field(other, 5) !== 1) throw new Error("a request without a status did not parse");
+  if (field(other, 4) !== 0) throw new Error("a status was invented");
+
+  const failure = join(new Uint8Array([92]), u32(7), u32(4), str(bytes("no more sessions")), str(bytes("")));
+  if (field(failure, 4) !== 4) throw new Error("open failure reason wrong");
+  if (text(mod.sshIncomingData(failure)) !== "no more sessions") throw new Error("description wrong");
+
+  // A transport message is not a channel message, and that is ordinary rather than an error.
+  const transport = new Uint8Array([21]);
+  if (field(transport, 0) !== 0) throw new Error("a transport message was taken for a channel one");
+  if (field(transport, 5) !== 1) throw new Error("a transport message was reported as malformed");
+
+  // Truncated messages are malformed, not silently zero-filled.
+  for (const p of [
+    new Uint8Array([]),
+    new Uint8Array([91]),
+    join(new Uint8Array([91]), u32(7)),
+    join(new Uint8Array([94]), u32(7), new Uint8Array([0, 0, 0, 9, 1])),   // claims 9 bytes, has 1
+    join(new Uint8Array([98]), u32(7), str(bytes("exit-status")), new Uint8Array([0])),  // no status
+  ]) {
+    if (field(p, 5) === 1 && field(p, 0) !== 0) {
+      throw new Error(`a truncated message of ${p.length} bytes parsed as valid`);
+    }
+  }
+});
+
+Deno.test("channel messages address the recipient's channel number", () => {
+  // Every channel message carries the number the *other* side chose. With one channel numbered
+  // zero on both sides — the common case — getting this backwards works perfectly, so it is
+  // asserted with a number that could only have come from the right place.
+  const dv = (b: Uint8Array) => new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const open = mod.sshOpenSession(7, 8192, 32768);
+  if (open[0] !== 90) throw new Error("not a CHANNEL_OPEN");
+  // "session", then *our* number, since the server has not chosen one yet.
+  if (text(mod.sshReadString(open.slice(1))) !== "session") throw new Error("channel type wrong");
+  if (dv(open).getUint32(12) !== 7) throw new Error("open does not carry our channel number");
+  if (dv(open).getUint32(16) !== 8192) throw new Error("open does not carry the window");
+
+  for (const [name, msg] of [
+    ["exec", mod.sshExecRequest(42, bytes("true"), true)],
+    ["adjust", mod.sshWindowAdjust(42, 100)],
+    ["eof", mod.sshChannelEof(42)],
+    ["close", mod.sshChannelClose(42)],
+    ["data", mod.sshChannelData(42, bytes("x"))],
+  ] as const) {
+    if (dv(msg).getUint32(1) !== 42) throw new Error(`${name} does not address the server's number`);
   }
 });

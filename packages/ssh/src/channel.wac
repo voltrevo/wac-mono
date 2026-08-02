@@ -1,0 +1,239 @@
+// The connection protocol, RFC 4254 — channels, flow control, and running a command.
+//
+// Everything after authentication happens inside a channel. A client opens one, asks it to run
+// something, and reads back interleaved stdout and stderr until the far end closes it.
+//
+// ## The two channel numbers
+//
+// Each side picks its own number for the same channel and they need not agree. Every message
+// carries the **recipient's** number — the one the *other* side chose — so a client that echoes
+// back its own number addresses a channel the server may not have. With a single channel numbered
+// zero on both sides, which is the common case, that mistake works perfectly.
+//
+// ## Flow control is not optional
+//
+// Each direction has a window: a byte count the sender may transmit before it must stop. Receiving
+// data consumes ours, and it only refills when we send SSH_MSG_CHANNEL_WINDOW_ADJUST. A client
+// that never adjusts reads exactly one window of output and then hangs forever, having done
+// nothing wrong that any error would report. Since the default window is large, that is invisible
+// for short commands and a deadlock for long ones.
+//
+// ## Exit status arrives as a request, not a reply
+//
+// The command's exit code comes as a CHANNEL_REQUEST named `exit-status` with `want_reply` false,
+// usually just before EOF and CLOSE. It is not a response to anything, and nothing prompts it.
+
+import { Reader, Writer } from "./wire.wac";
+
+export i32 msgChannelOpen() { return 90; }
+export i32 msgChannelOpenConfirmation() { return 91; }
+export i32 msgChannelOpenFailure() { return 92; }
+export i32 msgChannelWindowAdjust() { return 93; }
+export i32 msgChannelData() { return 94; }
+export i32 msgChannelExtendedData() { return 95; }
+export i32 msgChannelEof() { return 96; }
+export i32 msgChannelClose() { return 97; }
+export i32 msgChannelRequest() { return 98; }
+export i32 msgChannelSuccess() { return 99; }
+export i32 msgChannelFailure() { return 100; }
+
+/** The `data_type_code` that means stderr. There is only the one. */
+export i32 extendedDataStderr() { return 1; }
+
+/**
+ * A window's worth of credit, and when to top it up.
+ *
+ * Two megabytes matches what OpenSSH offers and is large enough that a short command never
+ * adjusts at all. The top-up threshold is half: adjusting on every byte would spend a packet per
+ * packet, and waiting until the window is empty stalls the sender while the adjustment is in
+ * flight.
+ */
+export i32 defaultWindow() { return 2 * 1024 * 1024; }
+
+/** The largest payload we will accept in one CHANNEL_DATA. */
+export i32 defaultMaxPacket() { return 32768; }
+
+export struct Window {
+  i32 left;
+  i32 initial;
+
+  Window create(i32 initial) { return Window(initial, initial); }
+
+  /**
+   * Account for `n` bytes received, and say how much credit to return.
+   *
+   * Returns 0 when no adjustment is due yet, so a caller can send unconditionally on a non-zero
+   * result. The window is restored to its initial size rather than incremented by what was
+   * consumed, which is the same thing here and stays right if the threshold ever changes.
+   */
+  i32 consume(this, i32 n) {
+    this.left -= n;
+    if (this.left > this.initial / 2) { return 0; }
+    i32 increment = this.initial - this.left;
+    this.left = this.initial;
+    return increment;
+  }
+}
+
+/** SSH_MSG_CHANNEL_OPEN for a session, which is the channel type a command runs in. */
+export u8[] openSession(i32 channel, i32 window, i32 maxPacket) {
+  const u8[] SESSION = u8[](0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e);      // "session"
+  Writer w = Writer.create();
+  w.byte(msgChannelOpen());
+  w.str(SESSION);
+  w.u32(channel);
+  w.u32(window);
+  w.u32(maxPacket);
+  return w.take();
+}
+
+/**
+ * SSH_MSG_CHANNEL_REQUEST asking the far end to run `command`.
+ *
+ * `channel` is the *server's* number for the channel, taken from the open confirmation.
+ */
+export u8[] execRequest(i32 channel, u8[] command, bool wantReply) {
+  const u8[] EXEC = u8[](0x65, 0x78, 0x65, 0x63);                           // "exec"
+  Writer w = Writer.create();
+  w.byte(msgChannelRequest());
+  w.u32(channel);
+  w.str(EXEC);
+  w.bool(wantReply);
+  w.str(command);
+  return w.take();
+}
+
+export u8[] windowAdjust(i32 channel, i32 increment) {
+  Writer w = Writer.create();
+  w.byte(msgChannelWindowAdjust());
+  w.u32(channel);
+  w.u32(increment);
+  return w.take();
+}
+
+export u8[] channelEof(i32 channel) {
+  Writer w = Writer.create();
+  w.byte(msgChannelEof());
+  w.u32(channel);
+  return w.take();
+}
+
+export u8[] channelClose(i32 channel) {
+  Writer w = Writer.create();
+  w.byte(msgChannelClose());
+  w.u32(channel);
+  return w.take();
+}
+
+/** Data to send on an open channel. */
+export u8[] channelData(i32 channel, u8[] data) {
+  Writer w = Writer.create();
+  w.byte(msgChannelData());
+  w.u32(channel);
+  w.str(data);
+  return w.take();
+}
+
+/**
+ * A parsed channel message.
+ *
+ * One struct for all of them, with the fields each kind happens to use. A tagged union per
+ * message would be tidier and would not survive the bindgen boundary, where this has to arrive as
+ * numbers and byte arrays anyway.
+ */
+export struct Incoming {
+  /** The message number, or 0 when this is not a channel message. */
+  i32 kind;
+  /** Our number for the channel — every channel message carries the recipient's. */
+  i32 channel;
+  /** OPEN_CONFIRMATION: the number the *server* uses. Nothing else sets it. */
+  i32 senderChannel;
+  /** OPEN_CONFIRMATION: their initial window. WINDOW_ADJUST: the increment. */
+  i32 window;
+  /** OPEN_CONFIRMATION: their maximum packet. EXTENDED_DATA: the type code. REQUEST: exit code. */
+  i32 extra;
+  /** DATA and EXTENDED_DATA: the bytes. REQUEST: the request name. FAILURE: the description. */
+  u8[] data;
+  /** False when the message was truncated or malformed. */
+  bool ok;
+}
+
+Incoming none() { return Incoming(0, 0, 0, 0, 0, u8[0](), false); }
+
+/**
+ * Parse one channel message.
+ *
+ * Anything that is not a channel message returns `kind` 0 with `ok` true — a transport message
+ * arriving here is ordinary, not an error, and the caller decides what to do with it.
+ */
+export Incoming parse(u8[] payload) {
+  if (payload.len() == 0) { return none(); }
+  i32 kind = payload[0];
+  if (kind < msgChannelOpen() || kind > msgChannelFailure()) {
+    return Incoming(0, 0, 0, 0, 0, u8[0](), true);
+  }
+
+  Reader r = Reader.over(payload);
+  r.byte();
+  i32 channel = r.u32();
+  if (!r.ok) { return none(); }
+
+  if (kind == msgChannelOpenConfirmation()) {
+    i32 sender = r.u32();
+    i32 window = r.u32();
+    i32 maxPacket = r.u32();
+    if (!r.ok) { return none(); }
+    return Incoming(kind, channel, sender, window, maxPacket, u8[0](), true);
+  }
+
+  if (kind == msgChannelOpenFailure()) {
+    i32 reason = r.u32();
+    u8[] description = r.str();
+    if (!r.ok) { return none(); }
+    return Incoming(kind, channel, 0, 0, reason, description, true);
+  }
+
+  if (kind == msgChannelWindowAdjust()) {
+    i32 increment = r.u32();
+    if (!r.ok) { return none(); }
+    return Incoming(kind, channel, 0, increment, 0, u8[0](), true);
+  }
+
+  if (kind == msgChannelData()) {
+    u8[] data = r.str();
+    if (!r.ok) { return none(); }
+    return Incoming(kind, channel, 0, 0, 0, data, true);
+  }
+
+  if (kind == msgChannelExtendedData()) {
+    i32 typeCode = r.u32();
+    u8[] data = r.str();
+    if (!r.ok) { return none(); }
+    return Incoming(kind, channel, 0, 0, typeCode, data, true);
+  }
+
+  if (kind == msgChannelRequest()) {
+    const u8[] EXIT_STATUS = u8[](0x65, 0x78, 0x69, 0x74, 0x2d, 0x73, 0x74,
+                                  0x61, 0x74, 0x75, 0x73);                   // "exit-status"
+    u8[] name = r.str();
+    bool wantReply = r.bool();
+    if (!r.ok) { return none(); }
+    i32 status = 0;
+    if (sameBytes(name, EXIT_STATUS)) {
+      status = r.u32();
+      if (!r.ok) { return none(); }
+    }
+    return Incoming(kind, channel, 0, 0, status, name, true);
+  }
+
+  // EOF, CLOSE, SUCCESS, FAILURE and OPEN carry nothing more that a client needs.
+  return Incoming(kind, channel, 0, 0, 0, u8[0](), true);
+}
+
+bool sameBytes(u8[] a, const u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}

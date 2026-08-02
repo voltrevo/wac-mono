@@ -469,4 +469,159 @@ mAuth.sshSignedData(sessionId, bytes("user"), pubBlob);
 mAuth.sshPublicKeyRequest(sessionId, bytes("user"), pubBlob, new Uint8Array(32).fill(6));
 ignoringTraps(() => mAuth.sshPublicKeyRequest(sessionId, bytes("user"), pubBlob, new Uint8Array(31)));
 
+// ── known_hosts ───────────────────────────────────────────────────────────────
+
+const mKnown = run.mod as unknown as {
+  sshKnownHost(file: Uint8Array, host: Uint8Array, port: number, keyType: Uint8Array, keyBlob: Uint8Array): number;
+};
+
+const khBlob = Uint8Array.from({ length: 51 }, (_, i) => (i * 3) & 255);
+const khOther = Uint8Array.from({ length: 51 }, (_, i) => (i * 5) & 255);
+const khB64 = btoa(String.fromCharCode(...khBlob));
+const khType = bytes("ssh-ed25519");
+
+for (
+  const [file, host, port] of [
+    ["", "example.com", 22],
+    ["# just a comment\n", "example.com", 22],
+    ["\n\n", "example.com", 22],
+    ["   \n", "example.com", 22],                                   // whitespace only
+    [`example.com ssh-ed25519 ${khB64}\n`, "example.com", 22],
+    [`example.com ssh-ed25519 ${khB64}\r\n`, "example.com", 22],     // CR LF
+    [`example.com ssh-ed25519 ${khB64} a comment\n`, "example.com", 22],
+    [`a.example,b.example ssh-ed25519 ${khB64}\n`, "b.example", 22],
+    [`*.example ssh-ed25519 ${khB64}\n`, "host.example", 22],
+    [`*.example ssh-ed25519 ${khB64}\n`, "example", 22],
+    [`*.exa*ple ssh-ed25519 ${khB64}\n`, "host.example", 22],       // two stars
+    [`h??t.example ssh-ed25519 ${khB64}\n`, "host.example", 22],
+    [`h??t.example ssh-ed25519 ${khB64}\n`, "hoost.example", 22],
+    [`*.example,!bad.example ssh-ed25519 ${khB64}\n`, "bad.example", 22],
+    [`*.example,!bad.example ssh-ed25519 ${khB64}\n`, "ok.example", 22],
+    [`,,example.com,, ssh-ed25519 ${khB64}\n`, "example.com", 22],   // empty list entries
+    [`example.com ssh-rsa ${khB64}\n`, "example.com", 22],           // another algorithm
+    [`[example.com]:2222 ssh-ed25519 ${khB64}\n`, "example.com", 2222],
+    [`[example.com]:2222 ssh-ed25519 ${khB64}\n`, "example.com", 22],
+    [`example.com ssh-ed25519 ${khB64}\n`, "example.com", 65535],    // multi-digit port
+    [`@revoked example.com ssh-ed25519 ${khB64}\n`, "example.com", 22],
+    [`@cert-authority *.example ssh-ed25519 ${khB64}\n`, "host.example", 22],
+    [`@revoked\n`, "example.com", 22],                               // marker and nothing else
+    [`example.com ssh-ed25519 !!!\n`, "example.com", 22],            // unreadable base64
+    [`example.com\n`, "example.com", 22],                            // no key at all
+    [`example.com ssh-ed25519\n`, "example.com", 22],                // no blob
+    [`|1|bad ssh-ed25519 ${khB64}\n`, "example.com", 22],            // hashed, no second bar
+    [`|2|c2FsdA==|aGFzaA== ssh-ed25519 ${khB64}\n`, "example.com", 22],  // unknown revision
+    [`|1|!!!|!!! ssh-ed25519 ${khB64}\n`, "example.com", 22],        // hashed, unreadable base64
+    [`|1|c2FsdA==|aGFzaA== ssh-ed25519 ${khB64}\n`, "example.com", 22], // hashed, wrong hash
+    [`\texample.com ssh-ed25519 ${khB64}\n`, "example.com", 22],      // leading tab
+  ] as const
+) {
+  for (const key of [khBlob, khOther]) {
+    mKnown.sshKnownHost(bytes(file), bytes(host), port, khType, key);
+  }
+  mKnown.sshKnownHost(bytes(file), bytes(host), port, bytes("ssh-rsa"), khBlob);
+}
+
+// Port 0, which is not a real port but is what the digit loop's zero guard exists for.
+mKnown.sshKnownHost(bytes(`[example.com]:0 ssh-ed25519 ${khB64}\n`), bytes("example.com"), 0, khType, khBlob);
+
+// A marker and a key type that are the *same length* as the ones being compared but different.
+// Everything above differs in length and is rejected before the bytes are looked at, so without
+// these the byte-comparison loop never takes its mismatch branch — the third time this exact gap
+// has turned up in this package.
+mKnown.sshKnownHost(bytes(`@revoke1 example.com ssh-ed25519 ${khB64}\n`), bytes("example.com"), 22, khType, khBlob);
+mKnown.sshKnownHost(bytes(`example.com ssh-ed25518 ${khB64}\n`), bytes("example.com"), 22, khType, khBlob);
+
+// A match after a mismatch, and a revocation after a match: the whole file is read either way.
+mKnown.sshKnownHost(bytes(`example.com ssh-ed25519 ${btoa(String.fromCharCode(...khOther))}\n` +
+                          `example.com ssh-ed25519 ${khB64}\n`), bytes("example.com"), 22, khType, khBlob);
+mKnown.sshKnownHost(bytes(`example.com ssh-ed25519 ${khB64}\n@revoked example.com ssh-ed25519 ${khB64}\n`),
+                    bytes("example.com"), 22, khType, khBlob);
+
+// ── Channels ──────────────────────────────────────────────────────────────────
+
+const mChan = run.mod as unknown as {
+  sshDefaultWindow(): number;
+  sshDefaultMaxPacket(): number;
+  sshExtendedDataStderr(): number;
+  sshMsgChannelData(): number;
+  sshMsgChannelExtendedData(): number;
+  sshMsgChannelOpenConfirmation(): number;
+  sshMsgChannelOpenFailure(): number;
+  sshMsgChannelClose(): number;
+  sshMsgChannelEof(): number;
+  sshMsgChannelRequest(): number;
+  sshMsgChannelSuccess(): number;
+  sshMsgChannelWindowAdjust(): number;
+  sshOpenSession(channel: number, window: number, maxPacket: number): Uint8Array;
+  sshExecRequest(channel: number, command: Uint8Array, wantReply: boolean): Uint8Array;
+  sshWindowAdjust(channel: number, increment: number): Uint8Array;
+  sshChannelEof(channel: number): Uint8Array;
+  sshChannelClose(channel: number): Uint8Array;
+  sshChannelData(channel: number, data: Uint8Array): Uint8Array;
+  sshIncomingField(payload: Uint8Array, which: number): number;
+  sshIncomingData(payload: Uint8Array): Uint8Array;
+  sshWindowCreate(initial: number): unknown;
+  sshWindowConsume(w: unknown, n: number): number;
+  sshWindowLeft(w: unknown): number;
+};
+
+mChan.sshDefaultWindow();
+mChan.sshDefaultMaxPacket();
+mChan.sshExtendedDataStderr();
+for (const f of [mChan.sshMsgChannelData, mChan.sshMsgChannelExtendedData,
+                 mChan.sshMsgChannelOpenConfirmation, mChan.sshMsgChannelOpenFailure,
+                 mChan.sshMsgChannelClose, mChan.sshMsgChannelEof, mChan.sshMsgChannelRequest,
+                 mChan.sshMsgChannelSuccess, mChan.sshMsgChannelWindowAdjust]) f.call(mChan);
+
+mChan.sshOpenSession(0, 8192, 32768);
+mChan.sshExecRequest(1, bytes("true"), true);
+mChan.sshExecRequest(1, bytes("true"), false);
+mChan.sshWindowAdjust(1, 4096);
+mChan.sshChannelEof(1);
+mChan.sshChannelClose(1);
+mChan.sshChannelData(1, bytes("x"));
+
+// The window: above half, at half, across it, and a read larger than the whole window.
+const cw = mChan.sshWindowCreate(1000);
+mChan.sshWindowConsume(cw, 100);
+mChan.sshWindowLeft(cw);
+mChan.sshWindowConsume(cw, 400);
+mChan.sshWindowConsume(cw, 2000);
+
+const cu32 = (n: number) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+const cstr = (b: Uint8Array) => join(cu32(b.length), b);
+
+for (
+  const p of [
+    new Uint8Array(0),                                                        // nothing
+    new Uint8Array([21]),                                                     // a transport message
+    new Uint8Array([89]),                                                     // just below the range
+    new Uint8Array([101]),                                                    // just above it
+    new Uint8Array([90]),                                                     // channel message, truncated
+    join(new Uint8Array([90]), cstr(bytes("session")), cu32(0), cu32(1), cu32(2)),
+    join(new Uint8Array([91]), cu32(7), cu32(42), cu32(2097152), cu32(32768)),
+    join(new Uint8Array([91]), cu32(7)),                                      // confirmation cut short
+    join(new Uint8Array([92]), cu32(7), cu32(4), cstr(bytes("no")), cstr(bytes(""))),
+    join(new Uint8Array([92]), cu32(7), cu32(4)),                             // failure cut short
+    join(new Uint8Array([93]), cu32(7), cu32(4096)),
+    join(new Uint8Array([93]), cu32(7)),                                      // adjust cut short
+    join(new Uint8Array([94]), cu32(7), cstr(bytes("hello"))),
+    join(new Uint8Array([94]), cu32(7), new Uint8Array([0, 0, 0, 9, 1])),      // data cut short
+    join(new Uint8Array([95]), cu32(7), cu32(1), cstr(bytes("err"))),
+    join(new Uint8Array([95]), cu32(7), cu32(1)),                             // extended cut short
+    join(new Uint8Array([96]), cu32(7)),                                      // EOF
+    join(new Uint8Array([97]), cu32(7)),                                      // CLOSE
+    join(new Uint8Array([98]), cu32(7), cstr(bytes("exit-status")), new Uint8Array([0]), cu32(3)),
+    join(new Uint8Array([98]), cu32(7), cstr(bytes("exit-status")), new Uint8Array([0])),
+    join(new Uint8Array([98]), cu32(7), cstr(bytes("keepalive")), new Uint8Array([1])),
+    join(new Uint8Array([98]), cu32(7), cstr(bytes("exit-statu5")), new Uint8Array([0])),  // same length, different
+    join(new Uint8Array([98]), cu32(7)),                                      // request cut short
+    join(new Uint8Array([99]), cu32(7)),                                      // SUCCESS
+    join(new Uint8Array([100]), cu32(7)),                                     // FAILURE
+  ]
+) {
+  for (let which = 0; which < 6; which++) mChan.sshIncomingField(p, which);
+  mChan.sshIncomingData(p);
+}
+
 report([run], "packages/ssh/", { verbose });

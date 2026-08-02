@@ -1,4 +1,4 @@
-// HMAC-SHA-256, as specified in RFC 2104 / FIPS 198-1.
+// HMAC-SHA-256 and HMAC-SHA-1, as specified in RFC 2104 / FIPS 198-1.
 //
 //   HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m))
 //
@@ -6,15 +6,27 @@
 // when it is longer than that.
 
 import { sha256 } from "./sha256.wac";
+import { sha1 } from "./sha1.wac";
 
 i32 blockSize() { return 64; }
 
 /** The key, reduced and zero-padded to one block. */
 u8[] normalizeKey(u8[] key) {
+  return normalizeKeyWith(key, false);
+}
+
+/**
+ * The same, choosing the hash used to shorten an over-long key.
+ *
+ * RFC 2104 says the key is reduced with *the HMAC's own hash*, so HMAC-SHA-1 must use SHA-1 here.
+ * Reducing with SHA-256 instead agrees for every key of 64 bytes or fewer — which is every key in
+ * this repo's tests and every known_hosts salt — and silently disagrees for longer ones.
+ */
+u8[] normalizeKeyWith(u8[] key, bool useSha1) {
   u8[] k = u8[blockSize()]();
   // A key longer than the block is hashed first — otherwise two different long
   // keys sharing a prefix would authenticate identically.
-  u8[] src = key.len() > blockSize() ? sha256(key) : key;
+  u8[] src = key.len() > blockSize() ? (useSha1 ? sha1(key) : sha256(key)) : key;
   for (i32 i = 0; i < src.len(); i++) { k[i] = src[i]; }
   return k;
 }
@@ -35,4 +47,36 @@ export u8[] hmacSha256(u8[] key, u8[] msg) {
   for (i32 i = 0; i < 32; i++) { outer[bs + i] = innerHash[i]; }
 
   return sha256(outer);
+}
+
+/**
+ * HMAC-SHA-1 of `msg` under `key`, 20 bytes.
+ *
+ * Here for one reason: OpenSSH hashes the hostnames in `known_hosts` with it, so a client that
+ * cannot compute it cannot look a host up in the file the user already has —
+ * `HashKnownHosts yes` has been the default for years. See `packages/ssh`.
+ *
+ * SHA-1 is broken for collision resistance and that is *not* what this relies on. The hostname is
+ * the message and the per-entry salt is the key, and what is needed is that the hash does not
+ * reveal the hostname and does not collide by accident; HMAC's security does not rest on the
+ * underlying hash being collision-resistant. Do not read this as SHA-1 being fit for signatures.
+ *
+ * The block size is 64 for both, which is why `normalizeKey` is shared — that would not hold for
+ * SHA-512.
+ */
+export u8[] hmacSha1(u8[] key, u8[] msg) {
+  u8[] k = normalizeKeyWith(key, true);
+  i32 bs = blockSize();
+
+  u8[] inner = u8[bs + msg.len()]();
+  for (i32 i = 0; i < bs; i++) { inner[i] = k[i] ^ 0x36; }
+  for (i32 i = 0; i < msg.len(); i++) { inner[bs + i] = msg[i]; }
+
+  u8[] innerHash = sha1(inner);
+
+  u8[] outer = u8[bs + 20]();
+  for (i32 i = 0; i < bs; i++) { outer[i] = k[i] ^ 0x5c; }
+  for (i32 i = 0; i < 20; i++) { outer[bs + i] = innerHash[i]; }
+
+  return sha1(outer);
 }
