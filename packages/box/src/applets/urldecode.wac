@@ -1,0 +1,20 @@
+// Percent-decoding, the other direction.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { withNewline } from "../lib/bytes.wac";
+import { decode } from "../../../url/src/percent.wac";
+
+export i32 urldecode(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  u8[] b = in.bytes;
+  if (b.len() > 0 && b[b.len() - 1] == '\n') {
+    u8[] t = u8[b.len() - 1](fill: 0);
+    t.copyFrom(b, 0, 0, b.len() - 1);
+    b = t;
+  }
+  cli.write(withNewline(decode(b)));
+  return 0;
+}

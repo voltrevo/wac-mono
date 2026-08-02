@@ -1,0 +1,35 @@
+// Lines numbered from one — but only the non-empty ones, which is what `nl` does by
+// default and what this got wrong until a file with a blank line in it was compared. The
+// counter does not advance on a blank line either; it is skipped, not numbered invisibly.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, openStream } from "../lib/input.wac";
+import { Line, Lines, emit, nextLine } from "../lib/reader.wac";
+import { itoa } from "../lib/num.wac";
+
+export i32 nl(Core core, Cli cli, Args a) {
+  Input in = openStream(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+
+  Lines s = Lines.create();
+  i32 n = 0;
+  while (true) {
+    Line l = nextLine(s, cli);
+    if (!l.ok) { return 0; }
+    if (l.bytes.len() == 0) {
+      // Seven spaces where the number and its tab would be, which is what the real one
+      // emits — measured, not derived from the six-wide number field.
+      emit(cli, "       ".toBytes(), true);
+      continue;
+    }
+    n++;
+    string num = itoa(n);
+    string pad = "";
+    for (i32 i = num.toBytes().len(); i < 6; i++) { pad = pad + " "; }
+    // `nl` terminates its last line even when the input did not, unlike `head` and
+    // `tail`. Checked against the real one rather than assumed to be uniform.
+    emit(cli, (pad + num + "\t" + string.fromBytes(l.bytes)).toBytes(), true);
+  }
+  return 0;
+}

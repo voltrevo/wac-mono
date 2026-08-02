@@ -1,0 +1,65 @@
+// Writing a file without a window where it is half-written.
+//
+// `writeFile` truncates and then fills, so a reader arriving in between sees a partial
+// file and a crash leaves one. Writing beside the target and renaming avoids both: on
+// every filesystem this runs on, a rename within a directory is atomic — the old contents
+// or the new, never a mixture.
+//
+// This is why the mutation tier exists at all, and `cp` uses it.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+
+/**
+ * `bytes` at `path`, atomically. False if either step failed.
+ *
+ * The temporary name is random because two copies of this program running at once must
+ * not pick the same one — the whole point is to be safe under concurrency, and a fixed
+ * `.tmp` suffix would trade one race for another.
+ */
+export bool writeAtomic(Core core, Cli cli, string path, u8[] bytes) {
+  string tmp = tempName(core, path);
+  if (!cli.writeFile(tmp, bytes)) { return false; }
+  return finish(cli, tmp, path);
+}
+
+/**
+ * Everything left of the current input, to `path`, atomically and a chunk at a time.
+ *
+ * The streaming form, for a copy that must not be bounded by memory. `openOutput` is what
+ * makes it possible: the bytes go straight to the temporary file rather than being
+ * gathered first, and the rename still happens only once all of them are there.
+ */
+export bool streamAtomic(Core core, Cli cli, string path) {
+  string tmp = tempName(core, path);
+  if (cli.openOutput(tmp) != "") { return false; }
+  while (true) {
+    u8[] chunk = cli.readChunk();
+    if (chunk.len() == 0) { break; }
+    if (!cli.write(chunk)) { cli.openOutput(""); cli.remove(tmp, false); return false; }
+  }
+  // Back to standard output, which closes the temporary file — a rename over a file still
+  // open would move it half-written.
+  cli.openOutput("");
+  return finish(cli, tmp, path);
+}
+
+/** The rename, and the cleanup if it fails. */
+bool finish(Cli cli, string tmp, string path) {
+  if (cli.rename(tmp, path)) { return true; }
+  // The rename is the only step that can leave litter, so clean up after it and not
+  // before: until it succeeds, the temporary file is the only copy of the new contents.
+  cli.remove(tmp, false);
+  return false;
+}
+
+/** A sibling of `path` that no concurrent copy of this program will also pick. */
+string tempName(Core core, string path) {
+  u8[] r = core.randomBytes(6);
+  u8[] out = u8[12](fill: '0');
+  u8[] digits = "0123456789abcdef".toBytes();
+  for (i32 i = 0; i < 6; i++) {
+    out[i * 2] = digits[(r[i] >> 4) & 15];
+    out[i * 2 + 1] = digits[r[i] & 15];
+  }
+  return path + ".tmp" + string.fromBytes(out);
+}

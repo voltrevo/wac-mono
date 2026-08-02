@@ -146,7 +146,7 @@ is the next thing worth having.
 alone cannot express a safe update: it truncates and then fills, so a reader arriving in
 between sees a half-written file and a crash leaves one. With `rename` an application can
 write beside its target and move it into place, which on every filesystem this runs on is
-atomic — `example/box/lib/safe.wac` is that, in fifteen lines, and `cp` uses it. Both
+atomic — `packages/box`'s `lib/safe.wac` is that, in fifteen lines, and `cp` uses it. Both
 recursive forms (`mkdir -p`, `rm -r`) have to be asked for, because the recursive form is
 the one that can destroy something it was not pointed at.
 
@@ -157,82 +157,8 @@ move its mtime. The applet says so instead of pretending.
 `example/hexdump.wac` exercises the difference: `hexdump < file` reads standard input and
 writes exact bytes, and `hexdump <dir>` lists a directory through `stat` and `readDir`.
 
-## box: forty-two applets in one program
-
-```sh
-deno task app:build packages/platform/example/box/box.wac --allow-read --allow-write -o box
-./box grep -i wac README.md
-cat README.md | ./box sort -u | ./box wc -l
-./box du packages
-./box gzip data | ./box gunzip | ./box sha256sum
-```
-
-```
-base32 base64 basename cat cp crc32 cut date dirname du echo false fold
-find grep gunzip gzip head hex ls mkdir mv nl rev rm rmdir seq sha256sum
-sha512sum sort strings tac tail tee touch tr true uniq urldecode
-urlencode wc
-```
-
-111K, drawing on this repo's `crypto`, `codec`, `regex`, `gzip`, `datetime` and `url`
-packages, so it is the widest composition here.
-
-**Several applets are a few lines over a package.** `gzip` is `gzipBest`, `date` is the
-clock capability and `rfc3339.format`, `crc32` and `urlencode` likewise. Those packages
-were written to be called from TypeScript through bindgen and needed no change at all to
-become the inside of a program instead — which is the thing worth showing.
-
-**One applet per file.** `applets/<name>.wac`, always — finding one takes no thought, and
-two people editing different applets do not collide in a 561-line file. `box.wac` is the
-dispatcher and its forty imports are the table of contents; shared parts live in
-`lib/` (`args`, `bytes`, `num`, `lines`, `input`). Splitting thirty files cost 12ms of
-build time, measured before and after.
-
-`true` and `false` are the exception: the dispatcher returning a constant *is* the whole
-applet, and a file containing one `return` would be ceremony rather than clarity. Its tests are differential against the system tools rather than against
-my idea of them: `cat rev nl tac sort sort -r sort -u uniq -c base32 base64 sha256sum
-sha512sum grep grep -i grep -v grep -n grep -c find` all match byte for byte, `du` matches
-`du -sb`, and `head -N`, `tail -n N`, `wc -l/-w/-c` match the real ones' output. `grep`
-returns 1 on no match and 2 on a bad pattern, as it should. The second batch is checked the
-same way: `cut -d -f`, `tr` with ranges, `fold -w` and `strings -n` against the system
-tools, and `gzip`/`gunzip` against the system `gzip` in *both* directions, so neither side
-can be wrong in a way the other cancels out.
-
-Three things it exercises that nothing else did. **One shared option parser** — without it
-`head` was fixed at ten lines and `wc` could not do `-l`, so a dozen applets were
-approximate rather than real. **A recursive walk**, in `find` and `du`, which is the first
-thing to push on `readDir` and `stat` beyond one level. **The write path**, in `cp` and
-`tee`; `cp` needed no new capability at all, being `readFile` and `writeFile` — though it
-is now `readFile`, `writeFile` and `rename`, so that an interrupted copy cannot leave a
-half-written destination.
-
-**It also shows what a multicall binary costs.** `box`'s grants are the *union* of what
-its applets need, so `box echo` carries the filesystem access `box cat` wants. Built as
-separate executables, each would state its own: `wc` needs nothing at all and its shebang
-would say `deno run` with no flags. One binary with forty-two entry points is the shape
-BusyBox has to take; it is not the shape this model is best at.
-
-`bin/` shows the other shape, and measures it rather than asserting it. Four applets are
-also built alone — the entry point is four lines and imports the applet file unchanged:
-
-| built alone | shebang | size |
-| --- | --- | --- |
-| `wc` | `#!/usr/bin/env -S deno run` | 47K |
-| `sha256sum` | `#!/usr/bin/env -S deno run` | 51K |
-| `grep` | `#!/usr/bin/env -S deno run --allow-read` | 59K |
-| `cp` | `#!/usr/bin/env -S deno run --allow-read --allow-write` | 47K |
-| `box` | `#!/usr/bin/env -S deno run --allow-read --allow-write` | 111K |
-
-`wc` and `sha256sum` come out with **no permissions at all** — they read standard input
-and write a line, and a program that only does that needs nothing from anyone. Handed a
-filename, that `wc` says `wc: README.md: filesystem read not granted` and exits 1; it
-cannot be talked past its shebang. Under `box` the same applet carries `--allow-write`,
-because `cp` is in the binary.
-
-That is also why `Args` carries a `name`. A program in this model is never handed its own
-argv[0] — argv starts at its first real argument — so the standalone `wc` would otherwise
-have reported errors as `box:`. Under `box` the name is the applet's; in `bin/` the entry
-point passes it.
+`packages/box` is the widest consumer of all this — forty-two applets in one program, and
+the differential suite that keeps them honest.
 
 ## How an asynchronous host looks synchronous
 

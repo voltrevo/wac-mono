@@ -67,6 +67,7 @@ export async function runLauncherNode(
     rename(from: string, to: string): Promise<void>;
     open(p: string, flags: string): Promise<{
       read(b: Uint8Array, off: number, len: number): Promise<{ bytesRead: number }>;
+      write(b: Uint8Array): Promise<unknown>;
       close(): Promise<void>;
     }>;
     stat(p: string): Promise<{ isFile(): boolean; isDirectory(): boolean; size: number; mtimeMs: number }>;
@@ -99,6 +100,10 @@ export async function runLauncherNode(
       stdinIter ??= proc.stdin[Symbol.asyncIterator]();
       const r = await stdinIter.next();
       return r.done === true ? new Uint8Array(0) : r.value;
+    },
+    createFile: async (path: string) => {
+      const h = await fs.open(path, "w");
+      return { write: async (b: Uint8Array) => { await h.write(b); }, close: () => h.close() };
     },
     openFile: async (path: string) => {
       const h = await fs.open(path, "r");

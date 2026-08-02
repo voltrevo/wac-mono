@@ -24,4 +24,5 @@ export const OP = {
   RENAME: 17,
   OPEN_INPUT: 18,
   READ_CHUNK: 19,
+  OPEN_OUTPUT: 20,
 } as const;

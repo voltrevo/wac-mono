@@ -67,6 +67,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   // The current streaming input. One at a time rather than a handle per file, because the
   // wac side has no closures to carry a handle in — see the note in platform.wac.
   let source: Deno.FsFile | null = null;   // null means standard input
+  let sink: Deno.FsFile | null = null;     // null means standard output
   const buf = new Uint8Array(CHUNK);
 
   return {
@@ -104,7 +105,12 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     // stdin and stdout need no grant: what the user pipes in and what the program prints
     // are the user's own doing, not a reach into something they did not offer.
     [OP.READ_STDIN]: async () => await readAllStdin(),
-    [OP.WRITE_STDOUT]: async (p) => { await writeAllStdout(p); return EMPTY; },
+    [OP.WRITE_STDOUT]: async (p) => {
+      if (sink === null) { await writeAllStdout(p); return EMPTY; }
+      let at = 0;
+      while (at < p.length) at += await sink.write(p.subarray(at));
+      return EMPTY;
+    },
 
     [OP.STAT]: async (p) => {
       const out = new Uint8Array(19);
@@ -150,6 +156,18 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       // A short read is not the end; only null is. Returning the subarray rather than a
       // slice is safe because `send` copies it into the bridge before we are called again.
       return n === null ? EMPTY : buf.subarray(0, n);
+    },
+
+    [OP.OPEN_OUTPUT]: async (p) => {
+      const path = unstr(p);
+      // Closed before the next one opens, so a program that has finished writing a file
+      // can rename over it — see the note in platform.wac.
+      sink?.close();
+      sink = null;
+      if (path === "") return EMPTY;
+      if (!opts.fs?.write) deny("filesystem write");
+      sink = await Deno.open(path, { write: true, create: true, truncate: true });
+      return EMPTY;
     },
 
     [OP.MKDIR]: async (p) => {

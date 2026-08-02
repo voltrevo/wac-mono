@@ -155,6 +155,23 @@ export struct Cli {
   fn[string(string)] openInput;
   fn[u8[]()] readChunk;
 
+  /**
+   * Where `write` goes. `openOutput("")` is standard output, which is where it starts.
+   *
+   * The mirror of `openInput`, and for the same reason: without it a program could not
+   * produce more output to a *file* than fits in memory, because `writeFile` takes the
+   * whole of it at once. `cp` of a file larger than memory needed this; so would `split`,
+   * or any filter told to write somewhere other than a pipe.
+   *
+   * A path truncates that file and makes it the destination of every subsequent `write`.
+   * Opening another output closes the previous one, and so does opening `""` — which is
+   * how a program that has finished writing a file knows the bytes are there, since
+   * `rename` over a file still open would move it half-written. `cp` does exactly that.
+   *
+   * Answers with the empty string on success and the host's message otherwise.
+   */
+  fn[string(string)] openOutput;
+
   Cli of(
     fn[i32()] argCount,
     fn[string(i32)] arg,
@@ -169,11 +186,12 @@ export struct Cli {
     fn[bool(string, bool)] remove,
     fn[bool(string, string)] rename,
     fn[string(string)] openInput,
-    fn[u8[]()] readChunk
+    fn[u8[]()] readChunk,
+    fn[string(string)] openOutput
   ) {
     return Cli(
       argCount, arg, env, readStdin, write, readFile, writeFile, stat, readDir,
-      mkdir, remove, rename, openInput, readChunk
+      mkdir, remove, rename, openInput, readChunk, openOutput
     );
   }
 }

@@ -1,0 +1,39 @@
+// One input, from a file or from standard input.
+//
+// That an applet works in a pipe at all is this file: without `readStdin` every one of
+// them would be a file-to-file tool.
+
+import { Cli, Core, FileResult } from "../../../platform/src/platform.wac";
+import { Args } from "./args.wac";
+
+export struct Input { bool ok; u8[] bytes; string label; }
+
+/**
+ * The same choice, for the streaming pair.
+ *
+ * `readInput` answers with the whole of the input, which is fine for a filename and wrong
+ * for a pipe. This selects the source instead, and the applet pulls it with
+ * `cli.readChunk` — so memory is bounded by the chunk rather than by the input.
+ *
+ * The returned `bytes` is always empty: there is nothing to hand over yet, and an applet
+ * that wanted them would have called `readInput`.
+ */
+export Input openStream(Core core, Cli cli, Args a, i32 n) {
+  string path = a.rest.len() <= n ? "" : a.rest[n];
+  string error = cli.openInput(path);
+  if (error == "") { return Input(true, u8[0](), path); }
+  core.warn(a.name + ": " + path + ": " + error);
+  return Input(false, u8[0](), path);
+}
+
+/** Positional argument `n` names a file; without one, standard input. */
+export Input readInput(Core core, Cli cli, Args a, i32 n) {
+  if (a.rest.len() <= n) { return Input(true, cli.readStdin(), ""); }
+  string path = a.rest[n];
+  FileResult f = cli.readFile(path);
+  if (!f.ok) {
+    core.warn(a.name + ": " + path + ": " + f.error);
+    return Input(false, u8[0](), path);
+  }
+  return Input(true, f.bytes, path);
+}

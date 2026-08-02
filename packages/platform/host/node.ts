@@ -21,6 +21,8 @@ export type NodeIo = {
   readStdinChunk(): Promise<Uint8Array>;
   /** A file opened for sequential reading; `read` answers empty at the end. */
   openFile(path: string): Promise<{ read(): Promise<Uint8Array>; close(): Promise<void> }>;
+  /** A file opened for writing, truncated. */
+  createFile(path: string): Promise<{ write(b: Uint8Array): Promise<void>; close(): Promise<void> }>;
   writeStdout(bytes: Uint8Array): Promise<void>;
   stat(path: string): Promise<{ isFile: boolean; isDirectory: boolean; size: number; mtimeMillis: number }>;
   readDir(path: string): Promise<string[]>;
@@ -58,6 +60,7 @@ export function nodeWorld(
 
   // The current streaming input; null means standard input. See the note in platform.wac.
   let source: { read(): Promise<Uint8Array>; close(): Promise<void> } | null = null;
+  let sink: { write(b: Uint8Array): Promise<void>; close(): Promise<void> } | null = null;
   const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
 
   return {
@@ -101,7 +104,11 @@ export function nodeWorld(
     // stdin and stdout need no grant: what the user pipes in and what the program prints
     // are the user's own doing, not a reach into something they did not offer.
     [OP.READ_STDIN]: async () => await io.readStdin(),
-    [OP.WRITE_STDOUT]: async (p) => { await io.writeStdout(p); return EMPTY; },
+    [OP.WRITE_STDOUT]: async (p) => {
+      if (sink === null) { await io.writeStdout(p); return EMPTY; }
+      await sink.write(p);
+      return EMPTY;
+    },
 
     [OP.STAT]: async (p) => {
       const out = new Uint8Array(19);
@@ -140,6 +147,16 @@ export function nodeWorld(
     },
     [OP.READ_CHUNK]: async () =>
       source === null ? await io.readStdinChunk() : await source.read(),
+
+    [OP.OPEN_OUTPUT]: async (p) => {
+      const path = unstr(p);
+      await sink?.close();
+      sink = null;
+      if (path === "") return EMPTY;
+      if (!opts.fs?.write) deny("filesystem write");
+      sink = await io.createFile(path);
+      return EMPTY;
+    },
 
     [OP.MKDIR]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");
