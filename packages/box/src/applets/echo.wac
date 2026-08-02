@@ -1,0 +1,14 @@
+// The arguments, space separated.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+
+export i32 echo(Core core, Cli cli, Args a) {
+  string out = "";
+  for (i32 i = 0; i < a.rest.len(); i++) {
+    if (i > 0) { out = out + " "; }
+    out = out + a.rest[i];
+  }
+  core.log(out);
+  return 0;
+}

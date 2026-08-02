@@ -347,9 +347,29 @@ Two places wac's shape shows through:
 
 ## Testing
 
+**Most of the suite is written in wac**, in `test/wac/`, with the host supplying
+only what it must — see [`wactest`](../wactest/) for the shapes that takes. What
+remains in a `.test.ts` is there for one of three reasons, each stated in the
+file:
+
+- **it asserts a refusal.** A rejection here is a `trap`, and a trap unwinds the
+  module rather than returning, so only the host can catch one. Every remaining
+  TypeScript file in this package is refusals and nothing else.
+- **it needs an outside reference to see a wrong *representative*.** The field
+  differentials against BigInt — `field25519`, `p256`, `p384`, `rsa`'s modPow.
+  A value congruent to the right one satisfies every relation the arithmetic can
+  state about itself, so no in-language property reaches it. `field25519.wac`'s
+  laws, its modulus anchors and forty boundary values all pass when the carry is
+  one pass short; BigInt catches it on the first comparison.
+- **it is too slow to pay on every run**, like X25519's thousand-iteration
+  vector.
+
 Two oracles, because one is not enough.
 
-**The host.** WebCrypto does SHA-256, HMAC and HKDF, so those are compared
+**The host.** `node:crypto` rather than WebCrypto, because a wasm call cannot
+await a promise and node's equivalents are synchronous — which is what lets them
+be passed into a wac test as a callback. It does SHA-2, HMAC, AES, ChaCha20-Poly1305,
+SHA-3 and SHAKE, X25519, Ed25519, ECDSA and RSA, so those are compared
 against it over every message length through two blocks, over key lengths that
 straddle the 64-byte block boundary, and over random inputs. That covers far
 more ground than a vector list, and catches padding mistakes at 55/56/63/64

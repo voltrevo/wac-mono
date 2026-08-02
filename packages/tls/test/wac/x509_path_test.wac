@@ -1,0 +1,249 @@
+// Certificate path building, in wac, with the host as a fixture loader.
+//
+// The last conversion, and a fourth shape for the boundary. There is no oracle here at
+// all — nothing is being compared against an independent implementation — but the inputs
+// are certificates on disk, and wac cannot read a file. So the callback is not an oracle
+// but a *loader*: `load(n)` returns the DER of fixture `n`, and everything else is here.
+//
+// That distinction is worth naming because it changes what the host is trusted for. An
+// oracle supplies an answer, so a wrong one makes the test wrong. A loader supplies an
+// input, so a wrong one makes the test *fail*, loudly, on the first parse.
+//
+// ## The fixture chain, and why it is shaped like this
+//
+//   root    P-384 key, self-signed with SHA-384
+//   inter   P-256 key, signed by the root with ecdsa-with-SHA384
+//   leaf    P-256 key, signed by the intermediate with SHA-256
+//
+// That is github.com's chain in miniature. The leaf and intermediate are both P-256, so a
+// client with only P-256 parses the whole chain, builds the path to the top, and then
+// finds the root is on a curve it cannot verify — reporting "unknown authority" about a
+// root sitting in the store. Reaching the anchor is not the same as being able to check
+// it, and that gap is why P-384 exists in this repo at all.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { verifyPath, parseCert, Cert, keyP256, keyP384, sigEcdsaSha256, sigEcdsaSha384 }
+  from "../../src/x509.wac";
+
+// Fixture numbering, matching the loader on the host side.
+const i32 ROOT = 0;
+const i32 INTER = 1;
+const i32 LEAF = 2;
+const i32 OTHER_CA = 3;
+const i32 IMPOSTER = 4;
+const i32 LEAF_CRIT = 5;
+const i32 LEAF_NONCRIT = 6;
+const i32 LEAF_CLIENTAUTH = 7;
+const i32 LEAF_SERVERAUTH = 8;
+const i32 NC_OK = 9;
+const i32 NC_BAD = 10;
+const i32 NC_EXCL = 11;
+const i32 NC_IP = 12;
+const i32 NC_SUFFIX = 13;
+const i32 NC_UPPER = 14;
+
+/** 2030-01-01, inside every fixture's 2020-2045 window. */
+const i64 NOW = 1893456000;
+
+/** A chain or store: the DER blobs concatenated, with start/end pairs. */
+struct Bundle {
+  u8[] der;
+  i32[] offsets;
+
+  Bundle of2(u8[] a, u8[] b) {
+    u8[] d = u8[a.len() + b.len()]();
+    for (i32 i = 0; i < a.len(); i++) { d[i] = a[i]; }
+    for (i32 i = 0; i < b.len(); i++) { d[a.len() + i] = b[i]; }
+    i32[] o = i32[](0, a.len(), a.len(), a.len() + b.len());
+    return Bundle(d, o);
+  }
+  Bundle of1(u8[] a) {
+    u8[] d = u8[a.len()]();
+    for (i32 i = 0; i < a.len(); i++) { d[i] = a[i]; }
+    return Bundle(d, i32[](0, a.len()));
+  }
+  Bundle empty() { return Bundle(u8[0](), i32[0]()); }
+}
+
+Bundle of3(u8[] a, u8[] b, u8[] c) {
+  u8[] d = u8[a.len() + b.len() + c.len()]();
+  i32 p = 0;
+  for (i32 i = 0; i < a.len(); i++) { d[p] = a[i]; p++; }
+  for (i32 i = 0; i < b.len(); i++) { d[p] = b[i]; p++; }
+  for (i32 i = 0; i < c.len(); i++) { d[p] = c[i]; p++; }
+  i32[] o = i32[](0, a.len(), a.len(), a.len() + b.len(),
+                  a.len() + b.len(), a.len() + b.len() + c.len());
+  return Bundle(d, o);
+}
+
+i32 check(Bundle chain, Bundle roots, string host, i64 now, i32 maxDepth) {
+  return verifyPath(chain.der, chain.offsets, roots.der, roots.offsets,
+                    host.toBytes(), now, maxDepth);
+}
+
+export string test_the_fixtures_are_the_shape_the_tests_assume(fn[u8[](i32)] load) {
+  // If a fixture were regenerated wrongly every result below would be explicable and
+  // wrong, so the shape is asserted before anything is concluded from it.
+  T t = T.create();
+  Cert root = parseCert(load(ROOT));
+  Cert inter = parseCert(load(INTER));
+  Cert leaf = parseCert(load(LEAF));
+  t.eqI32(root.keyType, keyP384(), "the root is P-384");
+  t.eqI32(inter.keyType, keyP256(), "the intermediate is P-256");
+  t.eqI32(leaf.keyType, keyP256(), "the leaf is P-256");
+  t.isTrue(root.isCa, "the root is a CA");
+  t.isTrue(inter.isCa, "the intermediate is a CA");
+  t.isFalse(leaf.isCa, "the leaf is not");
+  // The hash and the curve disagree on purpose at the middle link: SHA-384 signed by a
+  // P-384 key, then SHA-256 by a P-256 one. Code that reads the curve off the signature
+  // algorithm passes chains where they line up, which is most of them, and fails this.
+  t.eqI32(inter.sigAlg, sigEcdsaSha384(), "the intermediate is signed with SHA-384");
+  t.eqI32(leaf.sigAlg, sigEcdsaSha256(), "the leaf with SHA-256");
+  return t.report();
+}
+
+export string test_a_two_deep_chain_verifies_to_a_p384_root(fn[u8[](i32)] load) {
+  T t = T.create();
+  t.eqI32(check(Bundle.of2(load(LEAF), load(INTER)), Bundle.of1(load(ROOT)),
+                "wac.test", NOW, 8), 0, "the path holds");
+  return t.report();
+}
+
+export string test_the_path_has_to_be_built(fn[u8[](i32)] load) {
+  T t = T.create();
+  // Without the intermediate there is no way up, and the answer must be "unknown
+  // authority" rather than a success that skipped a link.
+  t.eqI32(check(Bundle.of1(load(LEAF)), Bundle.of1(load(ROOT)), "wac.test", NOW, 8), 5,
+          "the intermediate is genuinely required");
+  // RFC 8446 §4.4.2 says the sender should order the chain and some do not, so anything
+  // after the leaf is searched by name rather than assumed to be in sequence.
+  t.eqI32(check(of3(load(LEAF), load(OTHER_CA), load(INTER)), Bundle.of1(load(ROOT)),
+                "wac.test", NOW, 8), 0, "an unordered chain still resolves");
+  t.eqI32(check(Bundle.of2(load(LEAF), load(INTER)), Bundle.of1(load(OTHER_CA)),
+                "wac.test", NOW, 8), 5, "an untrusted root is refused");
+  // The real store is 121 certificates, almost all irrelevant to any given chain.
+  t.eqI32(check(Bundle.of2(load(LEAF), load(INTER)),
+                of3(load(OTHER_CA), load(ROOT), load(OTHER_CA)), "wac.test", NOW, 8), 0,
+          "the right root is found among several");
+  t.eqI32(check(Bundle.of2(load(LEAF), load(INTER)), Bundle.of1(load(ROOT)),
+                "wac.test", NOW, 1), 9, "a chain past the depth limit is refused");
+  t.eqI32(check(Bundle.empty(), Bundle.of1(load(ROOT)), "wac.test", NOW, 8), 8,
+          "an empty chain is refused rather than trusted");
+  return t.report();
+}
+
+export string test_validity_is_checked_at_the_time_given(fn[u8[](i32)] load) {
+  T t = T.create();
+  Bundle chain = Bundle.of2(load(LEAF), load(INTER));
+  Bundle roots = Bundle.of1(load(ROOT));
+  t.eqI32(check(chain, roots, "wac.test", 1500000000, 8), 1, "not yet valid in 2017");
+  t.eqI32(check(chain, roots, "wac.test", 2500000000, 8), 2, "expired by 2049");
+  return t.report();
+}
+
+export string test_the_host_name_is_checked_against_the_leaf(fn[u8[](i32)] load) {
+  T t = T.create();
+  Bundle chain = Bundle.of2(load(LEAF), load(INTER));
+  Bundle roots = Bundle.of1(load(ROOT));
+  t.eqI32(check(chain, roots, "sub.wac.test", NOW, 8), 0, "the wildcard matches one label");
+  string[] wrong = string[]("wac.test.evil.com", "evil.com", "acwac.test", "a.b.wac.test");
+  for (i32 i = 0; i < wrong.len(); i++) {
+    t.eqI32(check(chain, roots, wrong[i], NOW, 8), 7, wrong[i] + " does not match");
+  }
+  return t.report();
+}
+
+export string test_tampering_and_the_anchors_own_signature(fn[u8[](i32)] load) {
+  T t = T.create();
+  // The last byte of a certificate is the last byte of its signature, so flipping it
+  // leaves the DER intact and only the cryptography wrong.
+  u8[] leaf = load(LEAF);
+  u8[] inter = load(INTER);
+  u8[] badLeaf = u8[leaf.len()]();
+  for (i32 i = 0; i < leaf.len(); i++) { badLeaf[i] = leaf[i]; }
+  badLeaf[leaf.len() - 1] = badLeaf[leaf.len() - 1] ^ 1;
+  t.isFalse(check(Bundle.of2(badLeaf, inter), Bundle.of1(load(ROOT)), "wac.test", NOW, 8) == 0,
+            "a tampered leaf breaks the path");
+
+  u8[] badInter = u8[inter.len()]();
+  for (i32 i = 0; i < inter.len(); i++) { badInter[i] = inter[i]; }
+  badInter[inter.len() - 1] = badInter[inter.len() - 1] ^ 1;
+  t.isFalse(check(Bundle.of2(leaf, badInter), Bundle.of1(load(ROOT)), "wac.test", NOW, 8) == 0,
+            "a tampered intermediate breaks the path");
+
+  // But a trust anchor's own signature is not what makes it trusted. RFC 5280 §6.1 takes
+  // the anchor's name and key as given and starts verifying below it — asserted because
+  // the opposite looks equally plausible, and because checking would reject real roots
+  // whose self-signatures use algorithms nobody verifies any more.
+  u8[] root = load(ROOT);
+  u8[] selfBroken = u8[root.len()]();
+  for (i32 i = 0; i < root.len(); i++) { selfBroken[i] = root[i]; }
+  selfBroken[root.len() - 1] = selfBroken[root.len() - 1] ^ 1;
+  t.eqI32(check(Bundle.of2(leaf, inter), Bundle.of1(selfBroken), "wac.test", NOW, 8), 0,
+          "the anchor's own signature is not checked");
+  return t.report();
+}
+
+export string test_a_root_with_the_right_name_and_wrong_key(fn[u8[](i32)] load) {
+  // The imposter's subject is byte-identical to the real root's, so every name comparison
+  // succeeds and only the signature can reject it. Two authorities sharing a subject name
+  // is not hypothetical, which is why verifyPath keeps searching after a name matches but
+  // the signature does not.
+  T t = T.create();
+  Bundle chain = Bundle.of2(load(LEAF), load(INTER));
+  t.eqI32(check(chain, Bundle.of1(load(IMPOSTER)), "wac.test", NOW, 8), 5,
+          "the imposter cannot vouch");
+  t.eqI32(check(chain, Bundle.of2(load(IMPOSTER), load(ROOT)), "wac.test", NOW, 8), 0,
+          "the genuine root is found past it");
+  t.eqI32(check(chain, Bundle.of2(load(ROOT), load(IMPOSTER)), "wac.test", NOW, 8), 0,
+          "in either order");
+  return t.report();
+}
+
+export string test_critical_extensions_and_key_usage(fn[u8[](i32)] load) {
+  T t = T.create();
+  Bundle roots = Bundle.of1(load(ROOT));
+  u8[] inter = load(INTER);
+  // RFC 5280 §4.2: reject rather than ignore. "Critical" is the issuer saying this
+  // restriction is load-bearing, so skipping one accepts the certificate on terms nobody
+  // checked — and the extension nobody checked could be the one that mattered.
+  t.eqI32(check(Bundle.of2(load(LEAF_CRIT), inter), roots, "wac.test", NOW, 8), 12,
+          "an unrecognised critical extension makes the leaf unusable");
+  // The other half of the rule, and why it can be applied at all: unrecognised and not
+  // critical means the issuer says it is safe to skip.
+  t.eqI32(check(Bundle.of2(load(LEAF_NONCRIT), inter), roots, "wac.test", NOW, 8), 0,
+          "the same extension non-critical is ignored");
+  t.eqI32(check(Bundle.of2(load(LEAF_CLIENTAUTH), inter), roots, "wac.test", NOW, 8), 11,
+          "a certificate issued for client authentication is not a server");
+  t.eqI32(check(Bundle.of2(load(LEAF_SERVERAUTH), inter), roots, "wac.test", NOW, 8), 0,
+          "an explicit serverAuth leaf is accepted");
+  t.eqI32(check(Bundle.of2(load(LEAF), inter), roots, "wac.test", NOW, 8), 0,
+          "and absent extKeyUsage still means unrestricted");
+  return t.report();
+}
+
+export string test_name_constraints(fn[u8[](i32)] load) {
+  T t = T.create();
+  Bundle roots = Bundle.of1(load(ROOT));
+  u8[] leaf = load(LEAF);
+  t.eqI32(check(Bundle.of2(leaf, load(NC_OK)), roots, "wac.test", NOW, 8), 0,
+          "a CA constrained to the right namespace works");
+  t.eqI32(check(Bundle.of2(leaf, load(NC_BAD)), roots, "wac.test", NOW, 8), 10,
+          "a CA constrained elsewhere cannot vouch for this name");
+  t.eqI32(check(Bundle.of2(leaf, load(NC_EXCL)), roots, "wac.test", NOW, 8), 10,
+          "an excluded subtree is excluded");
+  // A constraint on a name form this does not enforce must make the CA unusable rather
+  // than be applied in part — so there is no issuer left, and the answer is 5 not 10.
+  t.eqI32(check(Bundle.of2(leaf, load(NC_IP)), roots, "wac.test", NOW, 8), 5,
+          "an unenforceable constraint makes the CA unusable");
+  // `wac.test` ends with `c.test` and is not inside it. A suffix comparison accepts this,
+  // which is how a constrained CA escapes its namespace by registering the right letters.
+  t.eqI32(check(Bundle.of2(leaf, load(NC_SUFFIX)), roots, "wac.test", NOW, 8), 10,
+          "subtrees match on label boundaries, not suffixes");
+  // And case-insensitively, per RFC 5280 §4.2.1.10 — a case-sensitive matcher fails
+  // closed, refusing a CA that is genuinely entitled to the name.
+  t.eqI32(check(Bundle.of2(leaf, load(NC_UPPER)), roots, "wac.test", NOW, 8), 0,
+          "WAC.TEST covers wac.test");
+  return t.report();
+}

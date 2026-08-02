@@ -134,6 +134,14 @@ export function cliOf(
         return new Uint8Array(0);   // unreadable is indistinguishable from ended, as it should be
       }
     },
+    (path: string) => {
+      try {
+        hostCall(b, OP.OPEN_OUTPUT, str(path));
+        return "";
+      } catch (e) {
+        return e instanceof Error ? e.message : String(e);
+      }
+    },
   );
 }
 
