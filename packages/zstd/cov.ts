@@ -758,7 +758,19 @@ const NOT_COVERED: { file: string; line: number; snippet: string; proven: boolea
   },
   {
     file: "packages/zstd/src/encode.wac",
-    line: 271,
+    line: 308,
+    proven: true,
+    snippet: "while ((1 << log) < need && log < maxLog) {",
+    why: "optimalLog floors the log at highBit(top) + 2, so the table is at least four times " +
+      "the highest used code — and since a code alphabet has at most top + 1 members, that is " +
+      "always more slots than distinct codes. The cap at maxLog cannot bite either: the widest " +
+      "alphabet here is match lengths at 53 codes against a 512-slot table. Kept because the " +
+      "property it guards belongs to optimalLog rather than to this function, and a code with " +
+      "no slot cannot be written at all.",
+  },
+  {
+    file: "packages/zstd/src/encode.wac",
+    line: 334,
     proven: false,
     snippet: "} else {",
     why: "The three-byte sequence count needs 32512 sequences in one block, and a 128 KiB " +

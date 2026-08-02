@@ -60,32 +60,37 @@ never transmits a table of its own.
 
 Where that lands, measured on this container:
 
-| sample | raw | ours | gzip -6 | zstd -3 |
-|---|---:|---:|---:|---:|
-| prose 102K | 102,000 | **110** | 451 | 95 |
-| json 132K | 131,781 | 23,502 | **16,313** | 6,681 |
-| logs 448K | 448,270 | 41,451 | **24,745** | 11,836 |
-| random 300K | 300,000 | 300,023 | 300,113 | 300,018 |
+| sample | raw | ours | gzip -6 | zstd -3 | zstd -19 |
+|---|---:|---:|---:|---:|---:|
+| prose 102K | 102,000 | **110** | 451 | 95 | 91 |
+| json 132K | 131,781 | **16,023** | 16,313 | 6,681 | 6,676 |
+| logs 448K | 448,270 | 24,998 | **24,745** | 11,836 | 13,150 |
+| source 925K | 947,582 | **270,049** | 268,471 | 272,498 | 223,048 |
+| random 300K | 300,000 | 300,023 | 300,113 | 300,018 | 300,018 |
 
-Four times better than `gzip -6` where matches dominate, worse than it where they do not.
-Incompressible input does not expand, because a block falls back to raw when the compressed form
-is not smaller.
+Level with `gzip -6` on real text, and ahead of `zstd -3` on the largest sample here — which is
+this repo's own source, and the only one of these that is not a repeated phrase. Incompressible
+input does not expand, because a block falls back to raw when the compressed form is not smaller.
 
-### Where the bytes actually go
+Still a long way behind `zstd -19`, and the gap is entirely in parsing rather than coding: see
+below.
 
-Worth measuring rather than assuming — the obvious answer was wrong. On 925 KB of this repo's own
-source, which is more representative than a repeated phrase:
+### Where the bytes go, and what fitted tables were worth
+
+Worth measuring rather than assuming — the obvious answer was wrong twice. On 925 KB of this
+repo's own source, before fitted tables were added:
 
 | | size | ratio |
 |---|---:|---:|
-| ours | 347,805 | 2.72x |
+| ours, predefined tables only | 347,805 | 2.72x |
 | zstd -1 | 309,243 | 3.06x |
 | gzip -6 | 268,471 | 3.53x |
 | zstd -3 | 272,498 | 3.48x |
 | **the matches we already find, coded ideally** | **~269,800** | **3.51x** |
 
-**The matches are not the problem.** Coding the sequences we already produce at the entropy of
-their own distributions would reach zstd -3 on this data. Broken down, per sequence:
+**The matches were not the problem.** Coding the sequences we already produced at the entropy of
+their own distributions was predicted to reach zstd -3 on this data — and adding fitted tables
+landed at **270,049**, within 0.1% of that estimate. Per sequence, before:
 
 | | bits per sequence |
 |---|---:|
@@ -95,20 +100,19 @@ their own distributions would reach zstd -3 on this data. Broken down, per seque
 
 and literals are **10 KB of a 925 KB input** — entropy-coding them would save around 4 KB of 348 KB.
 
-So the order is:
+1. ~~**Transmitted FSE tables**~~ — done. Both codings are built per block and the shorter kept,
+   because neither always wins: a block with few sequences cannot recover the cost of describing
+   three tables, and small blocks do still choose the predefined ones.
 
-1. **Transmitted FSE tables**, per block, fitted to that block's own distributions. The predefined
-   tables are generic and this is the whole gap: roughly 80 KB of 348 KB. Most of the machinery
-   already exists — `normalize`, `buildCTable` and `writeDescription` in `src/fseenc.wac` are
-   written and tested. What is missing is counting each block's symbols, choosing an accuracy log,
-   writing the three tables and setting the mode bits.
-2. **Repeat offsets**, whose value depends entirely on the data: 69% of offsets on structured log
+What is left, in order:
+
+1. **Repeat offsets**, whose value depends entirely on the data: 69% of offsets on structured log
    lines would hit a repeat slot, against 3% on source and 6% on json. Cheap to add, and enormous
    on exactly the data people compress most of.
-3. **Better matching.** `zstd -19` reaches 4.25x on the same input against `-3`'s 3.48x, purely by
-   parsing better. Our average match is 8.7 bytes with a greedy search 32 candidates deep; lazy
-   matching and a deeper chain are what raise that.
-4. **Huffman literals**, worth about 1% here. Note the interaction: a greedy matcher takes every
+2. **Better matching**, which is now the largest remaining lever. `zstd -19` reaches 4.25x on the
+   same input against `-3`'s 3.48x, purely by parsing better. Our average match is 8.7 bytes from
+   a greedy search 32 candidates deep; lazy matching and a deeper chain are what raise that.
+3. **Huffman literals**, worth about 1% here. Note the interaction: a greedy matcher takes every
    three-byte match it finds, which *minimises* literals. A better parser skips bad matches and
    emits more of them, so this grows as (3) lands.
 
