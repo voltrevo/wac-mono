@@ -115,20 +115,32 @@ which ruled out every compressor and encoder as a filter.
 `example/hexdump.wac` exercises the difference: `hexdump < file` reads standard input and
 writes exact bytes, and `hexdump <dir>` lists a directory through `stat` and `readDir`.
 
-## box: sixteen applets in one program
+## box: twenty-seven applets in one program
 
 ```sh
-deno task app:build packages/platform/example/box.wac --allow-read -o box
-./box wc README.md
-cat README.md | ./box sha256sum
-./box ls packages
+deno task app:build packages/platform/example/box.wac --allow-read --allow-write -o box
+./box grep -i wac README.md
+cat README.md | ./box sort -u | ./box wc -l
+./box du packages
 ```
 
-`base64 basename cat dirname echo false head hex ls nl rev seq sha256sum tail true wc` —
-51K, and `sha256sum`, `base64` and `hex` go through this repo's own `crypto` and `codec`
-packages, so it is the first application to compose several at once. Its tests are
-differential against the system tools: `cat`, `rev`, `nl`, `base64` and `sha256sum` match
-byte for byte, and `head`/`tail`/`wc` match the real ones' numbers.
+```
+base32 base64 basename cat cp dirname du echo false find grep head hex
+ls nl rev seq sha256sum sha512sum sort tac tail tee true uniq wc
+```
+
+74K, drawing on this repo's `crypto`, `codec` and `regex` packages, so it is the widest
+composition here. Its tests are differential against the system tools rather than against
+my idea of them: `cat rev nl tac sort sort -r sort -u uniq -c base32 base64 sha256sum
+sha512sum grep grep -i grep -v grep -n grep -c find` all match byte for byte, `du` matches
+`du -sb`, and `head -N`, `tail -n N`, `wc -l/-w/-c` match the real ones' output. `grep`
+returns 1 on no match and 2 on a bad pattern, as it should.
+
+Three things it exercises that nothing else did. **One shared option parser** — without it
+`head` was fixed at ten lines and `wc` could not do `-l`, so a dozen applets were
+approximate rather than real. **A recursive walk**, in `find` and `du`, which is the first
+thing to push on `readDir` and `stat` beyond one level. **The write path**, in `cp` and
+`tee`; `cp` needed no new capability at all, being `readFile` and `writeFile`.
 
 **It also shows what a multicall binary costs.** `box`'s grants are the *union* of what
 its applets need, so `box echo` carries the filesystem access `box cat` wants. Built as

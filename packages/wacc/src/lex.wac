@@ -16,7 +16,7 @@
 
 import {
   kInt, kFloat, kString, kIdent, kEof,
-  kImport, kFrom, kExport, kStruct, kConst, kThis, kOverride,
+  kImport, kExport, kStruct, kConst, kThis, kOverride,
   kIf, kElse, kWhile, kFor, kDo, kSwitch, kCase, kDefault,
   kBreak, kContinue, kReturn, kTrap, kTrue, kFalse, kNull,
   kIs, kNot, kAs, kVoid, kFn, kEnum, kMatch,
@@ -133,7 +133,6 @@ i32 keywordKind(u8[] src, i32 start, i32 len) {
     if (v == p4('v', 'o', 'i', 'd')) { return kVoid(); }
     if (v == p4('t', 'h', 'i', 's')) { return kThis(); }
     if (v == p4('t', 'r', 'a', 'p')) { return kTrap(); }
-    if (v == p4('f', 'r', 'o', 'm')) { return kFrom(); }
     if (v == p4('e', 'n', 'u', 'm')) { return kEnum(); }
     return kIdent();
   }

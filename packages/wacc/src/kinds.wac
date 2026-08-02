@@ -11,6 +11,10 @@
 // constants. A 85-variant enum therefore costs 85 declarations, which is the
 // clearest measurement so far of that gap. wac now *has* enums — this file is a
 // candidate for becoming one, once an enum can be used where an i32 is expected.
+//
+// `from` is absent as of 2026-08-02: it stopped being a keyword in the reference, so
+// that `slice(a, from, to)` can name its argument, and every kind after it moved down
+// by one. The differential test is what said so, exactly as the note above predicts.
 
 
 /** `int` */
@@ -31,243 +35,240 @@ export i32 kIdent() { return 4; }
 /** `import` */
 export i32 kImport() { return 5; }
 
-/** `from` */
-export i32 kFrom() { return 6; }
-
 /** `export` */
-export i32 kExport() { return 7; }
+export i32 kExport() { return 6; }
 
 /** `struct` */
-export i32 kStruct() { return 8; }
+export i32 kStruct() { return 7; }
 
 /** `const` */
-export i32 kConst() { return 9; }
+export i32 kConst() { return 8; }
 
 /** `this` */
-export i32 kThis() { return 10; }
+export i32 kThis() { return 9; }
 
 /** `override` */
-export i32 kOverride() { return 11; }
+export i32 kOverride() { return 10; }
 
 /** `if` */
-export i32 kIf() { return 12; }
+export i32 kIf() { return 11; }
 
 /** `else` */
-export i32 kElse() { return 13; }
+export i32 kElse() { return 12; }
 
 /** `while` */
-export i32 kWhile() { return 14; }
+export i32 kWhile() { return 13; }
 
 /** `for` */
-export i32 kFor() { return 15; }
+export i32 kFor() { return 14; }
 
 /** `do` */
-export i32 kDo() { return 16; }
+export i32 kDo() { return 15; }
 
 /** `switch` */
-export i32 kSwitch() { return 17; }
+export i32 kSwitch() { return 16; }
 
 /** `case` */
-export i32 kCase() { return 18; }
+export i32 kCase() { return 17; }
 
 /** `default` */
-export i32 kDefault() { return 19; }
+export i32 kDefault() { return 18; }
 
 /** `break` */
-export i32 kBreak() { return 20; }
+export i32 kBreak() { return 19; }
 
 /** `continue` */
-export i32 kContinue() { return 21; }
+export i32 kContinue() { return 20; }
 
 /** `return` */
-export i32 kReturn() { return 22; }
+export i32 kReturn() { return 21; }
 
 /** `trap` */
-export i32 kTrap() { return 23; }
+export i32 kTrap() { return 22; }
 
 /** `true` */
-export i32 kTrue() { return 24; }
+export i32 kTrue() { return 23; }
 
 /** `false` */
-export i32 kFalse() { return 25; }
+export i32 kFalse() { return 24; }
 
 /** `null` */
-export i32 kNull() { return 26; }
+export i32 kNull() { return 25; }
 
 /** `is` */
-export i32 kIs() { return 27; }
+export i32 kIs() { return 26; }
 
 /** `not` */
-export i32 kNot() { return 28; }
+export i32 kNot() { return 27; }
 
 /** `as` */
-export i32 kAs() { return 29; }
+export i32 kAs() { return 28; }
 
 /** `void` */
-export i32 kVoid() { return 30; }
+export i32 kVoid() { return 29; }
 
 /** `fn` */
-export i32 kFn() { return 31; }
+export i32 kFn() { return 30; }
 
 /** `enum` */
-export i32 kEnum() { return 32; }
+export i32 kEnum() { return 31; }
 
 /** `match` */
-export i32 kMatch() { return 33; }
+export i32 kMatch() { return 32; }
 
 /** `as!` */
-export i32 kAsBang() { return 34; }
+export i32 kAsBang() { return 33; }
 
 /** `as~` */
-export i32 kAsTilde() { return 35; }
+export i32 kAsTilde() { return 34; }
 
 /** `as@` */
-export i32 kAsAt() { return 36; }
+export i32 kAsAt() { return 35; }
 
 /** `+` */
-export i32 kPlus() { return 37; }
+export i32 kPlus() { return 36; }
 
 /** `-` */
-export i32 kMinus() { return 38; }
+export i32 kMinus() { return 37; }
 
 /** `*` */
-export i32 kStar() { return 39; }
+export i32 kStar() { return 38; }
 
 /** `/` */
-export i32 kSlash() { return 40; }
+export i32 kSlash() { return 39; }
 
 /** `%` */
-export i32 kPercent() { return 41; }
+export i32 kPercent() { return 40; }
 
 /** `=` */
-export i32 kAssign() { return 42; }
+export i32 kAssign() { return 41; }
 
 /** `==` */
-export i32 kEq() { return 43; }
+export i32 kEq() { return 42; }
 
 /** `!=` */
-export i32 kNe() { return 44; }
+export i32 kNe() { return 43; }
 
 /** `<` */
-export i32 kLt() { return 45; }
+export i32 kLt() { return 44; }
 
 /** `<=` */
-export i32 kLe() { return 46; }
+export i32 kLe() { return 45; }
 
 /** `>` */
-export i32 kGt() { return 47; }
+export i32 kGt() { return 46; }
 
 /** `>=` */
-export i32 kGe() { return 48; }
+export i32 kGe() { return 47; }
 
 /** `&&` */
-export i32 kAndAnd() { return 49; }
+export i32 kAndAnd() { return 48; }
 
 /** `||` */
-export i32 kOrOr() { return 50; }
+export i32 kOrOr() { return 49; }
 
 /** `!` */
-export i32 kBang() { return 51; }
+export i32 kBang() { return 50; }
 
 /** `&` */
-export i32 kAnd() { return 52; }
+export i32 kAnd() { return 51; }
 
 /** `|` */
-export i32 kOr() { return 53; }
+export i32 kOr() { return 52; }
 
 /** `^` */
-export i32 kCaret() { return 54; }
+export i32 kCaret() { return 53; }
 
 /** `~` */
-export i32 kTilde() { return 55; }
+export i32 kTilde() { return 54; }
 
 /** `<<` */
-export i32 kShl() { return 56; }
+export i32 kShl() { return 55; }
 
 /** `>>` */
-export i32 kShr() { return 57; }
+export i32 kShr() { return 56; }
 
 /** `>>>` */
-export i32 kShrU() { return 58; }
+export i32 kShrU() { return 57; }
 
 /** `+=` */
-export i32 kPlusEq() { return 59; }
+export i32 kPlusEq() { return 58; }
 
 /** `-=` */
-export i32 kMinusEq() { return 60; }
+export i32 kMinusEq() { return 59; }
 
 /** `*=` */
-export i32 kStarEq() { return 61; }
+export i32 kStarEq() { return 60; }
 
 /** `/=` */
-export i32 kSlashEq() { return 62; }
+export i32 kSlashEq() { return 61; }
 
 /** `%=` */
-export i32 kPercentEq() { return 63; }
+export i32 kPercentEq() { return 62; }
 
 /** `&=` */
-export i32 kAndEq() { return 64; }
+export i32 kAndEq() { return 63; }
 
 /** `|=` */
-export i32 kOrEq() { return 65; }
+export i32 kOrEq() { return 64; }
 
 /** `^=` */
-export i32 kCaretEq() { return 66; }
+export i32 kCaretEq() { return 65; }
 
 /** `<<=` */
-export i32 kShlEq() { return 67; }
+export i32 kShlEq() { return 66; }
 
 /** `>>=` */
-export i32 kShrEq() { return 68; }
+export i32 kShrEq() { return 67; }
 
 /** `>>>=` */
-export i32 kShrUEq() { return 69; }
+export i32 kShrUEq() { return 68; }
 
 /** `++` */
-export i32 kInc() { return 70; }
+export i32 kInc() { return 69; }
 
 /** `--` */
-export i32 kDec() { return 71; }
+export i32 kDec() { return 70; }
 
 /** `(` */
-export i32 kLparen() { return 72; }
+export i32 kLparen() { return 71; }
 
 /** `)` */
-export i32 kRparen() { return 73; }
+export i32 kRparen() { return 72; }
 
 /** `{` */
-export i32 kLbrace() { return 74; }
+export i32 kLbrace() { return 73; }
 
 /** `}` */
-export i32 kRbrace() { return 75; }
+export i32 kRbrace() { return 74; }
 
 /** `[` */
-export i32 kLbrack() { return 76; }
+export i32 kLbrack() { return 75; }
 
 /** `]` */
-export i32 kRbrack() { return 77; }
+export i32 kRbrack() { return 76; }
 
 /** `;` */
-export i32 kSemi() { return 78; }
+export i32 kSemi() { return 77; }
 
 /** `:` */
-export i32 kColon() { return 79; }
+export i32 kColon() { return 78; }
 
 /** `,` */
-export i32 kComma() { return 80; }
+export i32 kComma() { return 79; }
 
 /** `.` */
-export i32 kDot() { return 81; }
+export i32 kDot() { return 80; }
 
 /** `?` */
-export i32 kQuestion() { return 82; }
+export i32 kQuestion() { return 81; }
 
 /** `@` */
-export i32 kAt() { return 83; }
+export i32 kAt() { return 82; }
 
 /** `eof` */
-export i32 kEof() { return 84; }
+export i32 kEof() { return 83; }
 
 
 /** How many kinds there are, for bounds checks and table sizing. */
-export i32 kindCount() { return 85; }
+export i32 kindCount() { return 84; }

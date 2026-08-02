@@ -45,8 +45,13 @@ export function importPaths(src: string): string[] {
     // Scan to this import's `from`. Stopping at `;` keeps a malformed import from
     // consuming the one after it.
     let j = i + 1;
-    while (j < tokens.length && tokens[j].kind !== "from" && tokens[j].kind !== ";") j++;
-    if (j < tokens.length && tokens[j].kind === "from" && tokens[j + 1]?.kind === "string") {
+    // `from` is contextual as of wac 2026-08-02: it lexes as an ordinary identifier so
+    // that `slice(a, from, to)` can name its argument, and only an import clause can put
+    // one here. Matched by text for that reason.
+    const isFrom = (t: { kind: string; text: string } | undefined) =>
+      t !== undefined && t.kind === "ident" && t.text === "from";
+    while (j < tokens.length && !isFrom(tokens[j]) && tokens[j].kind !== ";") j++;
+    if (j < tokens.length && isFrom(tokens[j]) && tokens[j + 1]?.kind === "string") {
       out.push(tokens[j + 1].text);
       i = j + 1;
     }
