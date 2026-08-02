@@ -96,6 +96,15 @@ inter_variant p384_nc_ip "nameConstraints=critical,permitted;IP:10.0.0.0/255.0.0
 # string suffix accepts this, which is how a constrained CA escapes its namespace by
 # registering a domain with the right last letters.
 inter_variant p384_nc_suffix "nameConstraints=critical,permitted;DNS:c.test"
+# The same permitted subtree in capitals. DNS comparison is case-insensitive (RFC 5280
+# §4.2.1.10), so this must still cover a leaf named wac.test — and a case-sensitive
+# matcher rejects it, which is a constrained CA failing to work rather than failing safe.
+inter_variant p384_nc_upper "nameConstraints=critical,permitted;DNS:WAC.TEST"
+# Exactly as long as `wac.test` and different in every letter that matters. Every other
+# fixture here differs in length or at a label boundary, so none of them ever reaches the
+# byte comparison with two names that could be confused -- which let a mutant that made
+# the comparison always succeed survive the whole suite.
+inter_variant p384_nc_samelen "nameConstraints=critical,permitted;DNS:xyz.test"
 
 for n in p384_root p384_inter p384_leaf p384_imposter; do
   $OPENSSL x509 -in $n.pem -outform der -out $n.der
