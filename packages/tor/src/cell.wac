@@ -1,0 +1,267 @@
+// Tor cells, from tor-spec.txt §3.
+//
+// Everything on a Tor link is a cell, and there are two shapes with a rule for telling
+// them apart that is easy to get subtly wrong.
+//
+//   fixed       CircID (4) | Command (1) | Payload (509)              = 514 bytes
+//   variable    CircID (4) | Command (1) | Length (2) | Payload       = 7 + Length
+//
+// A fixed cell is *always* 514 bytes on the wire, padded — the length is not sent because
+// it is not needed, and a short one is a framing error rather than a short read.
+//
+// ## Three things about VERSIONS
+//
+// VERSIONS is variable-length, and it is the cell that *decides* the link version, so it
+// has to be readable before anything is negotiated. That gives it two quirks:
+//
+//   - its CircID is **two** bytes, not four. Link protocol 1 and 2 used two-byte circuit
+//     IDs; 4 and 5 widened them. VERSIONS predates the answer, so it keeps the old width
+//     and every other cell uses the new one.
+//   - which commands are variable-length depends on the version you have not agreed yet.
+//     In link protocol 2 only VERSIONS is; from 3 onwards the 128-and-above commands are
+//     too. Reading a CERTS cell with version-2 rules treats its length bytes as payload.
+//
+// This implementation speaks link protocol 4 or 5 — four-byte circuit IDs — and treats
+// VERSIONS as the one exception, which is what tor's own `cell_command_is_var_length`
+// does once a version is settled.
+
+const i32 PAYLOAD_LEN = 509;
+const i32 CELL_LEN = 514;
+
+/** Cell commands, from or.h. */
+export i32 cmdPadding() { return 0; }
+export i32 cmdCreate() { return 1; }
+export i32 cmdCreated() { return 2; }
+export i32 cmdRelay() { return 3; }
+export i32 cmdDestroy() { return 4; }
+export i32 cmdCreateFast() { return 5; }
+export i32 cmdCreatedFast() { return 6; }
+export i32 cmdVersions() { return 7; }
+export i32 cmdNetinfo() { return 8; }
+export i32 cmdRelayEarly() { return 9; }
+export i32 cmdCreate2() { return 10; }
+export i32 cmdCreated2() { return 11; }
+export i32 cmdVpadding() { return 128; }
+export i32 cmdCerts() { return 129; }
+export i32 cmdAuthChallenge() { return 130; }
+export i32 cmdAuthenticate() { return 131; }
+
+export i32 cellPayloadLen() { return PAYLOAD_LEN; }
+export i32 cellLen() { return CELL_LEN; }
+
+/**
+ * Whether a command carries an explicit length.
+ *
+ * VERSIONS is variable at every version. The rest of the variable-length commands are the
+ * ones numbered 128 and above, which exist only from link protocol 3 — but this speaks 4
+ * or 5, so the distinction does not arise and the rule is the simple one.
+ */
+export bool isVarLength(i32 command) {
+  return command == cmdVersions() || command >= 128;
+}
+
+/** A fixed-length cell: circuit id, command, and 509 bytes padded with zeros. */
+export u8[] encodeFixed(i32 circId, i32 command, u8[] payload) {
+  if (isVarLength(command)) { trap; }
+  if (payload.len() > PAYLOAD_LEN) { trap; }
+  u8[] out = u8[CELL_LEN]();
+  out[0] = (circId >> 24) & 0xFF;
+  out[1] = (circId >> 16) & 0xFF;
+  out[2] = (circId >> 8) & 0xFF;
+  out[3] = circId & 0xFF;
+  out[4] = command;
+  for (i32 i = 0; i < payload.len(); i++) { out[5 + i] = payload[i]; }
+  return out;
+}
+
+/**
+ * A variable-length cell.
+ *
+ * VERSIONS gets a two-byte circuit id — see the note at the top. Its circuit id is always
+ * zero in practice, but encoding it in four bytes would put two extra zeros in front of
+ * the command and the peer would read the command as part of the id.
+ */
+export u8[] encodeVar(i32 circId, i32 command, u8[] payload) {
+  if (!isVarLength(command)) { trap; }
+  if (payload.len() > 65535) { trap; }
+  i32 idLen = command == cmdVersions() ? 2 : 4;
+  u8[] out = u8[idLen + 3 + payload.len()]();
+  if (idLen == 2) {
+    out[0] = (circId >> 8) & 0xFF;
+    out[1] = circId & 0xFF;
+  } else {
+    out[0] = (circId >> 24) & 0xFF;
+    out[1] = (circId >> 16) & 0xFF;
+    out[2] = (circId >> 8) & 0xFF;
+    out[3] = circId & 0xFF;
+  }
+  out[idLen] = command;
+  out[idLen + 1] = (payload.len() >> 8) & 0xFF;
+  out[idLen + 2] = payload.len() & 0xFF;
+  for (i32 i = 0; i < payload.len(); i++) { out[idLen + 3 + i] = payload[i]; }
+  return out;
+}
+
+/**
+ * How many bytes the cell starting at `at` occupies, or -1 if `buf` does not hold it yet.
+ *
+ * Separate from decoding because a link is a stream: the caller needs to know whether a
+ * whole cell has arrived before it can act on one, and asking "is there a cell" by trying
+ * to parse and catching a failure would make a truncated read indistinguishable from a
+ * malformed one.
+ */
+export i32 cellSize(u8[] buf, i32 at) {
+  i32 have = buf.len() - at;
+  if (have < 5) { return -1; }
+  // The command's position depends on the id width, which depends on the command. Peek
+  // at both possibilities: a VERSIONS cell has its command at offset 2, anything else at
+  // offset 4. They cannot be confused, because 7 is not a valid four-byte-id command in
+  // the same position — but the peek order matters, so VERSIONS is checked first.
+  if (buf[at + 2] == cmdVersions()) {
+    if (have < 5) { return -1; }
+    i32 len = (buf[at + 3] << 8) | buf[at + 4];
+    return have < 5 + len ? -1 : 5 + len;
+  }
+  i32 command = buf[at + 4];
+  if (!isVarLength(command)) {
+    return have < CELL_LEN ? -1 : CELL_LEN;
+  }
+  if (have < 7) { return -1; }
+  i32 len = (buf[at + 5] << 8) | buf[at + 6];
+  return have < 7 + len ? -1 : 7 + len;
+}
+
+/** The command of the cell at `at`. Assumes `cellSize` has already said it is complete. */
+export i32 cellCommand(u8[] buf, i32 at) {
+  if (buf[at + 2] == cmdVersions()) { return cmdVersions(); }
+  return buf[at + 4];
+}
+
+export i32 cellCircId(u8[] buf, i32 at) {
+  if (buf[at + 2] == cmdVersions()) { return (buf[at] << 8) | buf[at + 1]; }
+  return (buf[at] << 24) | (buf[at + 1] << 16) | (buf[at + 2] << 8) | buf[at + 3];
+}
+
+/** The cell's payload: 509 bytes for a fixed cell, or exactly Length for a variable one. */
+export u8[] cellPayload(u8[] buf, i32 at) {
+  i32 command = cellCommand(buf, at);
+  if (command == cmdVersions()) {
+    i32 len = (buf[at + 3] << 8) | buf[at + 4];
+    u8[] out = u8[len]();
+    for (i32 i = 0; i < len; i++) { out[i] = buf[at + 5 + i]; }
+    return out;
+  }
+  if (!isVarLength(command)) {
+    u8[] out = u8[PAYLOAD_LEN]();
+    for (i32 i = 0; i < PAYLOAD_LEN; i++) { out[i] = buf[at + 5 + i]; }
+    return out;
+  }
+  i32 len = (buf[at + 5] << 8) | buf[at + 6];
+  u8[] out = u8[len]();
+  for (i32 i = 0; i < len; i++) { out[i] = buf[at + 7 + i]; }
+  return out;
+}
+
+// ── VERSIONS ─────────────────────────────────────────────────────────────────
+
+/** A VERSIONS cell offering each of `versions`, as two-byte big-endian numbers. */
+export u8[] encodeVersions(i32[] versions) {
+  u8[] payload = u8[versions.len() * 2]();
+  for (i32 i = 0; i < versions.len(); i++) {
+    payload[i * 2] = (versions[i] >> 8) & 0xFF;
+    payload[i * 2 + 1] = versions[i] & 0xFF;
+  }
+  return encodeVar(0, cmdVersions(), payload);
+}
+
+/**
+ * The highest version both sides offer, or 0 if they share none.
+ *
+ * Both lists, not just theirs: agreeing to a version we did not offer is how a peer talks
+ * us down to link protocol 2, where the cell framing itself changes.
+ */
+export i32 negotiateVersion(u8[] theirPayload, i32[] ours) {
+  i32 best = 0;
+  for (i32 i = 0; i + 1 < theirPayload.len(); i += 2) {
+    i32 v = (theirPayload[i] << 8) | theirPayload[i + 1];
+    for (i32 j = 0; j < ours.len(); j++) {
+      if (ours[j] == v && v > best) { best = v; }
+    }
+  }
+  return best;
+}
+
+// ── NETINFO ──────────────────────────────────────────────────────────────────
+
+/**
+ * A NETINFO cell: the time, the address we think the peer has, and our own addresses.
+ *
+ * A client sends zero of its own addresses — it has no reachable address and claiming one
+ * would be a lie the relay might act on. The timestamp is likewise sent as zero by
+ * clients, because a truthful clock is a fingerprint and the relay does not need it.
+ */
+export u8[] encodeNetinfo(u8[] theirIpv4) {
+  if (theirIpv4.len() != 4) { trap; }
+  u8[] payload = u8[4 + 6 + 1]();
+  // TIME: zero. A client's clock is nobody's business.
+  payload[4] = 4;                 // OTHERADDR type: IPv4
+  payload[5] = 4;                 // length
+  for (i32 i = 0; i < 4; i++) { payload[6 + i] = theirIpv4[i]; }
+  payload[10] = 0;                // NMYADDR: none
+  return encodeFixed(0, cmdNetinfo(), payload);
+}
+
+// ── CREATE2 / CREATED2 ───────────────────────────────────────────────────────
+
+/** The ntor handshake type, from tor-spec §5.1. */
+export i32 handshakeNtor() { return 2; }
+
+/** CREATE2: HTYPE (2) | HLEN (2) | HDATA. */
+export u8[] encodeCreate2(i32 circId, i32 hType, u8[] handshake) {
+  u8[] payload = u8[4 + handshake.len()]();
+  payload[0] = (hType >> 8) & 0xFF;
+  payload[1] = hType & 0xFF;
+  payload[2] = (handshake.len() >> 8) & 0xFF;
+  payload[3] = handshake.len() & 0xFF;
+  for (i32 i = 0; i < handshake.len(); i++) { payload[4 + i] = handshake[i]; }
+  return encodeFixed(circId, cmdCreate2(), payload);
+}
+
+/**
+ * The handshake reply out of a CREATED2 payload: HLEN (2) | HDATA.
+ *
+ * The payload is a full 509 bytes whatever the handshake's length, so the length field is
+ * the only thing saying where the reply ends — reading the rest as handshake data hands
+ * the ntor code 445 bytes of padding.
+ */
+export u8[] decodeCreated2(u8[] payload) {
+  if (payload.len() < 2) { trap; }
+  i32 len = (payload[0] << 8) | payload[1];
+  if (2 + len > payload.len()) { trap; }
+  u8[] out = u8[len]();
+  for (i32 i = 0; i < len; i++) { out[i] = payload[2 + i]; }
+  return out;
+}
+
+// ── CERTS and AUTH_CHALLENGE ─────────────────────────────────────────────────
+
+/**
+ * The number of certificates in a CERTS cell, or -1 if it is malformed.
+ *
+ * A client does not have to *use* them — the relay's identity is confirmed by the ntor
+ * handshake against a key from the consensus, not by this cell — but it does have to
+ * parse past it, and a length field that runs off the end is a peer worth hanging up on
+ * rather than reading further from.
+ */
+export i32 certsCount(u8[] payload) {
+  if (payload.len() < 1) { return -1; }
+  i32 n = payload[0];
+  i32 at = 1;
+  for (i32 i = 0; i < n; i++) {
+    if (at + 3 > payload.len()) { return -1; }
+    i32 len = (payload[at + 1] << 8) | payload[at + 2];
+    at += 3 + len;
+    if (at > payload.len()) { return -1; }
+  }
+  return n;
+}

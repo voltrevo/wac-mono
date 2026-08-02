@@ -180,6 +180,132 @@ export async function request(
   return { response, failure: failure(state) };
 }
 
+/**
+ * A TLS connection as a byte stream you can read and write in any order.
+ *
+ * `request` above is a one-shot: send this, read until the response ends. That is the
+ * shape of HTTP and the wrong shape for anything else. A protocol like Tor's link layer
+ * interleaves — the peer sends four cells unprompted, you answer one of them, and both
+ * directions stay open indefinitely — so it needs the connection as a stream rather than
+ * as a function call.
+ *
+ * The framing discipline is the same one `request` uses and both servers use: whole
+ * records are handed to wac, never partial ones and never two half-records glued.
+ */
+export class TlsStream {
+  #conn: Deno.Conn;
+  #state: Uint8Array;
+  #raw = new Uint8Array(0);        // bytes read from the socket, not yet whole records
+  #plain = new Uint8Array(0);      // decrypted application data, not yet handed out
+  #chunk = new Uint8Array(16640);
+  #closed = false;
+
+  private constructor(conn: Deno.Conn, state: Uint8Array) {
+    this.#conn = conn;
+    this.#state = state;
+  }
+
+  /** The connection's failure code: 0 while it is healthy. */
+  get failure(): number {
+    return failure(this.#state);
+  }
+
+  /**
+   * Connect and complete the handshake.
+   *
+   * An empty trust store means "do not build a path" — see the note in `client.wac`. It is
+   * what a Tor relay needs, since its certificate is self-signed and its identity is
+   * established by the ntor handshake instead.
+   */
+  static async connect(
+    hostname: string, port: number, serverName: string,
+    roots: { der: Uint8Array; offsets: Int32Array },
+  ): Promise<TlsStream> {
+    const conn = await openStream(hostname, port);
+    const r = unpack(init(
+      new TextEncoder().encode(serverName), roots.der, roots.offsets,
+      crypto.getRandomValues(new Uint8Array(32)),
+      p256Scalar(),
+      crypto.getRandomValues(new Uint8Array(64)),
+      crypto.getRandomValues(new Uint8Array(32)),
+      BigInt(Math.floor(Date.now() / 1000)),
+    ));
+    const s = new TlsStream(conn, r.state);
+    await conn.write(r.toSend);
+    while (phase(s.#state) !== 3) {
+      if (!await s.#pump()) throw new Error("peer closed during the handshake");
+      if (s.failure !== 0) throw new Error(`handshake failed, code ${s.failure}`);
+    }
+    return s;
+  }
+
+  /** Read once from the socket and feed every whole record to wac. False at end of stream. */
+  async #pump(): Promise<boolean> {
+    const n = await this.#conn.read(this.#chunk);
+    if (n === null) return false;
+    const merged = new Uint8Array(this.#raw.length + n);
+    merged.set(this.#raw);
+    merged.set(this.#chunk.subarray(0, n), this.#raw.length);
+    this.#raw = merged;
+
+    let consumed = 0;
+    while (this.#raw.length - consumed >= 5) {
+      const need = 5 + ((this.#raw[consumed + 3] << 8) | this.#raw[consumed + 4]);
+      if (this.#raw.length - consumed < need) break;
+      consumed += need;
+    }
+    if (consumed === 0) return true;
+    const ready = this.#raw.slice(0, consumed);
+    this.#raw = this.#raw.slice(consumed);
+
+    const r = unpack(feedRaw(this.#state, ready));
+    this.#state = r.state;
+    if (r.toSend.length > 0) await this.#conn.write(r.toSend);
+    if (r.appData.length > 0) {
+      const grown = new Uint8Array(this.#plain.length + r.appData.length);
+      grown.set(this.#plain);
+      grown.set(r.appData, this.#plain.length);
+      this.#plain = grown;
+    }
+    return true;
+  }
+
+  /** Whatever application data has arrived, waiting for at least one byte. Null at EOF. */
+  async read(): Promise<Uint8Array | null> {
+    while (this.#plain.length === 0) {
+      if (this.#closed) return null;
+      if (!await this.#pump()) return null;
+      if (this.failure !== 0) throw new Error(`connection failed, code ${this.failure}`);
+    }
+    const out = this.#plain;
+    this.#plain = new Uint8Array(0);
+    return out;
+  }
+
+  async write(data: Uint8Array): Promise<void> {
+    const r = unpack(sendRaw(this.#state, data));
+    this.#state = r.state;
+    await this.#conn.write(r.toSend);
+  }
+
+  /** Send close_notify, then drop the socket. */
+  async close(): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
+    try {
+      const r = unpack(closeRaw(this.#state));
+      this.#state = r.state;
+      await this.#conn.write(r.toSend);
+    } catch { /* the peer may have gone first, which is not our problem here */ }
+    try { this.#conn.close(); } catch { /* already closed */ }
+  }
+}
+
+/** A trust store with nothing in it: connect without validating a certificate path. */
+export function noTrustStore(): { der: Uint8Array; offsets: Int32Array } {
+  return { der: new Uint8Array(0), offsets: new Int32Array(0) };
+}
+
 if (import.meta.main) {
   const [host, portStr, caPath] = Deno.args;
   // A PEM bundle of any size, so this takes either a single test CA or the system store.

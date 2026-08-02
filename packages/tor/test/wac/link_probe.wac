@@ -1,0 +1,23 @@
+// Cell framing at the host boundary, for the link handshake driver.
+import {
+  encodeVersions as ev, negotiateVersion, encodeNetinfo as en, cellSize as cs,
+  cellCommand as cc, cellPayload as cp, certsCount as ct, encodeCreate2 as ec2,
+  decodeCreated2 as dc2, handshakeNtor,
+} from "../../src/cell.wac";
+import { ntorClientRequest as ncr, ntorClientFinish as ncf } from "../../src/ntor.wac";
+
+export u8[] encodeVersions(i32[] v) { return ev(v); }
+export i32 negotiate(u8[] theirs, i32[] ours) { return negotiateVersion(theirs, ours); }
+export u8[] encodeNetinfo(u8[] ip) { return en(ip); }
+export i32 cellSize(u8[] b, i32 at) { return cs(b, at); }
+export i32 cellCommand(u8[] b, i32 at) { return cc(b, at); }
+export u8[] cellPayload(u8[] b, i32 at) { return cp(b, at); }
+export i32 certsCount(u8[] p) { return ct(p); }
+export u8[] encodeCreate2(i32 circ, u8[] hs) { return ec2(circ, handshakeNtor(), hs); }
+export u8[] decodeCreated2(u8[] p) { return dc2(p); }
+export u8[] ntorClientRequest(u8[] id, u8[] onion, u8[] priv) {
+  return ncr(id, onion, priv);
+}
+export u8[] ntorClientFinish(u8[] id, u8[] onion, u8[] priv, u8[] reply, i32 keyLen) {
+  return ncf(id, onion, priv, reply, keyLen);
+}

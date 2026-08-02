@@ -1,0 +1,188 @@
+// Cell framing, checked against the byte layouts tor-spec fixes.
+//
+// A framing bug is the worst kind here: two implementations that disagree about where a
+// cell ends do not fail, they desynchronise, and every subsequent cell is read from the
+// middle of the last one. So the tests are about boundaries — the exact 514 bytes, the
+// two-byte circuit id VERSIONS uses and nothing else does, and a stream that has not
+// delivered a whole cell yet.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  encodeFixed, encodeVar, cellSize, cellCommand, cellCircId, cellPayload, isVarLength,
+  encodeVersions, negotiateVersion, encodeNetinfo, encodeCreate2, decodeCreated2,
+  cmdVersions, cmdNetinfo, cmdCreate2, cmdCreated2, cmdRelay, cmdCerts, cmdPadding,
+  cellLen, cellPayloadLen, handshakeNtor,
+} from "../../src/cell.wac";
+
+u8[] fill(i32 n, i32 seed) {
+  u8[] o = u8[n]();
+  for (i32 i = 0; i < n; i++) { o[i] = (i * 37 + seed) & 0xFF; }
+  return o;
+}
+u8[] slice(u8[] s, i32 from, i32 to) {
+  u8[] o = u8[to - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = s[from + i]; }
+  return o;
+}
+
+export string test_a_fixed_cell_is_always_514_bytes() {
+  // Padded, not truncated. The length is not on the wire, so a peer that sent 200 bytes
+  // for a short payload would leave the reader 314 bytes into the next cell forever.
+  T t = T.create();
+  i32[] lens = i32[](0, 1, 100, 508, 509);
+  for (i32 i = 0; i < lens.len(); i++) {
+    u8[] cell = encodeFixed(0x12345678, cmdRelay(), fill(lens[i], i));
+    t.eqI32(cell.len(), cellLen(), "a " + itoa64(lens[i] as i64) + "-byte payload still fills a cell");
+    t.eqI32(cellSize(cell, 0), cellLen(), "and cellSize agrees");
+    t.eqI32(cellCommand(cell, 0), cmdRelay(), "the command survives");
+    t.eqI32(cellCircId(cell, 0), 0x12345678, "and the four-byte circuit id");
+    u8[] back = cellPayload(cell, 0);
+    t.eqI32(back.len(), cellPayloadLen(), "the payload reads back at full length");
+    bool prefixOk = true;
+    u8[] want = fill(lens[i], i);
+    for (i32 j = 0; j < lens[i]; j++) { if (back[j] != want[j]) { prefixOk = false; } }
+    t.isTrue(prefixOk, "with the written bytes at the front");
+  }
+  return t.report();
+}
+
+export string test_versions_uses_a_two_byte_circuit_id() {
+  // The quirk that breaks everything downstream if missed. VERSIONS is sent before the
+  // link version is agreed, so it keeps link protocol 2's narrow circuit id while every
+  // other cell uses four bytes. Encode it with four and the peer reads the command from
+  // the wrong offset.
+  T t = T.create();
+  u8[] cell = encodeVersions(i32[](3, 4, 5));
+  t.eqI32(cell.len(), 2 + 1 + 2 + 6, "two id bytes, command, length, three versions");
+  t.eqI32(cell[2], cmdVersions(), "the command sits at offset 2, not 4");
+  t.eqI32(cellCommand(cell, 0), cmdVersions(), "and is read back from there");
+  t.eqI32(cellSize(cell, 0), cell.len(), "cellSize handles the narrow id");
+
+  u8[] payload = cellPayload(cell, 0);
+  t.eqI32(payload.len(), 6, "three versions, two bytes each");
+  t.eqI32((payload[0] << 8) | payload[1], 3, "big-endian, first version");
+  t.eqI32((payload[4] << 8) | payload[5], 5, "and last");
+  return t.report();
+}
+
+export string test_version_negotiation_takes_the_highest_common() {
+  // Both lists, not just theirs. Accepting a version we never offered is how a peer talks
+  // us down to link protocol 2, where the framing itself changes.
+  T t = T.create();
+  i32[] ours = i32[](4, 5);
+  u8[] theirs45 = slice(encodeVersions(i32[](3, 4, 5)), 5, 11);
+  t.eqI32(negotiateVersion(theirs45, ours), 5, "the highest both offer");
+  u8[] theirs34 = slice(encodeVersions(i32[](3, 4)), 5, 9);
+  t.eqI32(negotiateVersion(theirs34, ours), 4, "falls back when 5 is absent");
+  u8[] theirs12 = slice(encodeVersions(i32[](1, 2)), 5, 9);
+  t.eqI32(negotiateVersion(theirs12, ours), 0, "no shared version is zero, not a guess");
+  u8[] theirs99 = slice(encodeVersions(i32[](99)), 5, 7);
+  t.eqI32(negotiateVersion(theirs99, ours), 0, "a version only they offer is not taken");
+  return t.report();
+}
+
+export string test_variable_cells_carry_their_length() {
+  T t = T.create();
+  i32[] lens = i32[](0, 1, 300, 65535);
+  for (i32 i = 0; i < lens.len(); i++) {
+    u8[] cell = encodeVar(0x0A0B0C0D, cmdCerts(), fill(lens[i], i));
+    t.eqI32(cell.len(), 7 + lens[i], "four id bytes, command, length, payload");
+    t.eqI32(cellSize(cell, 0), cell.len(), "cellSize reads the length");
+    t.eqI32(cellCircId(cell, 0), 0x0A0B0C0D, "the wide circuit id survives");
+    t.eqI32(cellPayload(cell, 0).len(), lens[i], "and the payload is exactly its length");
+  }
+  t.isTrue(isVarLength(cmdCerts()), "CERTS is variable");
+  t.isTrue(isVarLength(cmdVersions()), "VERSIONS is variable");
+  t.isFalse(isVarLength(cmdRelay()), "RELAY is not");
+  t.isFalse(isVarLength(cmdPadding()), "nor PADDING");
+  return t.report();
+}
+
+export string test_a_partial_cell_is_reported_as_incomplete() {
+  // A link is a stream, so the reader has to distinguish "not yet" from "malformed". If
+  // those were the same answer a slow network would look like an attack.
+  T t = T.create();
+  u8[] fixed = encodeFixed(1, cmdRelay(), fill(10, 1));
+  i32[] shortLens = i32[](0, 1, 4, 5, 100, 513);
+  for (i32 i = 0; i < shortLens.len(); i++) {
+    t.eqI32(cellSize(slice(fixed, 0, shortLens[i]), 0), -1,
+            itoa64(shortLens[i] as i64) + " bytes is not yet a cell");
+  }
+  t.eqI32(cellSize(fixed, 0), 514, "and 514 is");
+
+  u8[] var = encodeVar(1, cmdCerts(), fill(300, 2));
+  i32[] varShort = i32[](0, 3, 6, 7, 200, 306);
+  for (i32 i = 0; i < varShort.len(); i++) {
+    t.eqI32(cellSize(slice(var, 0, varShort[i]), 0), -1,
+            itoa64(varShort[i] as i64) + " bytes is not yet a variable cell");
+  }
+  t.eqI32(cellSize(var, 0), 307, "and 307 is");
+  return t.report();
+}
+
+export string test_cells_can_be_read_back_to_back_from_a_stream() {
+  // The property a desynchronisation breaks. Three cells of different shapes in one
+  // buffer must be walked exactly, ending on the last byte.
+  T t = T.create();
+  u8[] a = encodeVersions(i32[](4, 5));
+  u8[] b = encodeFixed(7, cmdRelay(), fill(509, 3));
+  u8[] c = encodeVar(9, cmdCerts(), fill(40, 4));
+  u8[] stream = u8[a.len() + b.len() + c.len()]();
+  i32 p = 0;
+  for (i32 i = 0; i < a.len(); i++) { stream[p] = a[i]; p++; }
+  for (i32 i = 0; i < b.len(); i++) { stream[p] = b[i]; p++; }
+  for (i32 i = 0; i < c.len(); i++) { stream[p] = c[i]; p++; }
+
+  i32 at = 0;
+  i32 n = cellSize(stream, at);
+  t.eqI32(cellCommand(stream, at), cmdVersions(), "first cell is VERSIONS");
+  at += n;
+  n = cellSize(stream, at);
+  t.eqI32(n, 514, "second is a fixed cell");
+  t.eqI32(cellCircId(stream, at), 7, "with its own circuit id");
+  at += n;
+  n = cellSize(stream, at);
+  t.eqI32(cellCommand(stream, at), cmdCerts(), "third is CERTS");
+  at += n;
+  t.eqI32(at, stream.len(), "and the walk ends exactly at the end");
+  return t.report();
+}
+
+export string test_create2_carries_the_handshake_and_created2_gives_it_back() {
+  T t = T.create();
+  u8[] handshake = fill(84, 7);            // an ntor request is 84 bytes
+  u8[] cell = encodeCreate2(42, handshakeNtor(), handshake);
+  t.eqI32(cell.len(), 514, "CREATE2 is a fixed cell");
+  u8[] payload = cellPayload(cell, 0);
+  t.eqI32((payload[0] << 8) | payload[1], handshakeNtor(), "the handshake type is ntor");
+  t.eqI32((payload[2] << 8) | payload[3], 84, "and its length is recorded");
+
+  // CREATED2's payload is a full 509 bytes whatever the reply's length, so the length
+  // field is the only thing marking the end — take the rest and ntor gets 445 bytes of
+  // padding along with its 64.
+  u8[] reply = fill(64, 9);
+  u8[] created = u8[cellPayloadLen()]();
+  created[0] = 0;
+  created[1] = 64;
+  for (i32 i = 0; i < 64; i++) { created[2 + i] = reply[i]; }
+  t.eqBytes(decodeCreated2(created), reply, "the reply is cut at its stated length");
+  return t.report();
+}
+
+export string test_netinfo_tells_the_relay_nothing_about_us() {
+  // A client sends no addresses of its own and a zero timestamp. Both are deliberate: it
+  // has no reachable address to claim, and a truthful clock is a fingerprint.
+  T t = T.create();
+  u8[] ip = u8[4]();
+  ip[0] = 127; ip[3] = 1;
+  u8[] cell = encodeNetinfo(ip);
+  t.eqI32(cell.len(), 514, "NETINFO is a fixed cell");
+  u8[] p = cellPayload(cell, 0);
+  t.eqI32(p[0] | p[1] | p[2] | p[3], 0, "the timestamp is zero");
+  t.eqI32(p[4], 4, "the peer's address is typed IPv4");
+  t.eqI32(p[5], 4, "and four bytes long");
+  t.eqI32(p[6], 127, "and is the address we saw");
+  t.eqI32(p[10], 0, "we claim no addresses of our own");
+  return t.report();
+}
