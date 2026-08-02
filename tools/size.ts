@@ -1,0 +1,64 @@
+// What the Tor client costs: to ship, and to compile.
+//
+//   deno task size
+//
+// The layers are compiled separately and each pulls its own dependencies, so they do not
+// sum to the total — TLS and the Tor protocol share most of the crypto, and the shared part
+// is counted twice if you add them up. The interesting numbers are the total and the gap
+// between it and each layer.
+//
+// Times are the median of five runs after a warm-up, so they measure the compiler rather
+// than V8 deciding to optimise it. A genuinely cold run is roughly twice as slow: the first
+// compile in a fresh process pays for the JIT as well as the work.
+
+import { wacCompile } from "wac/wacCompile.ts";
+import { wacFiles } from "../harness/wacFiles.ts";
+
+const gzip = async (b: Uint8Array) =>
+  new Uint8Array(await new Response(
+    new Blob([b as BlobPart]).stream().pipeThrough(new CompressionStream("gzip")),
+  ).arrayBuffer());
+
+const TARGETS: [string, string][] = [
+  ["packages/tor/size/proto_only.wac", "cells + path selection, no crypto"],
+  ["packages/tor/size/tor_only.wac", "tor protocol + its crypto"],
+  ["packages/tor/size/tls_only.wac", "TLS 1.3 client + its crypto"],
+  ["packages/tor/src/client_entry.wac", "the whole client"],
+];
+
+type Compiled = { ok: boolean; compiled?: { wasm: Uint8Array } };
+
+console.log(
+  "layer".padEnd(36) + "     wasm     gzipped     lines    compile",
+);
+console.log("-".repeat(76));
+for (const [entry, label] of TARGETS) {
+  const warm = await wacCompile(await wacFiles(entry) as never, entry) as Compiled;
+  if (!warm.ok || warm.compiled === undefined) {
+    console.log(`${label.padEnd(36)}  did not compile`);
+    continue;
+  }
+
+  const times: number[] = [];
+  let lines = 0;
+  for (let i = 0; i < 5; i++) {
+    const files = await wacFiles(entry) as Map<string, string>;
+    if (i === 0) {
+      lines = [...files.values()].reduce((n, src) => n + src.split("\n").length, 0);
+    }
+    const t0 = performance.now();
+    await wacCompile(files as never, entry);
+    times.push(performance.now() - t0);
+  }
+  times.sort((a, b) => a - b);
+
+  const wasm = warm.compiled.wasm;
+  const gz = await gzip(wasm);
+  console.log(
+    label.padEnd(36) +
+    `${(wasm.length / 1024).toFixed(1).padStart(8)} KiB` +
+    `${(gz.length / 1024).toFixed(1).padStart(9)} KiB` +
+    `${String(lines).padStart(10)}` +
+    `${times[2].toFixed(0).padStart(9)} ms`,
+  );
+}

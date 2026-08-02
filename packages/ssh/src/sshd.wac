@@ -39,6 +39,7 @@ import { KeyError, PrivateKey, readEd25519 } from "./privatekey.wac";
 import { Match, lookUp } from "./authorizedkeys.wac";
 import { Incoming, msgChannelClose, msgChannelData, msgChannelEof, msgChannelOpen,
          msgChannelRequest, msgChannelWindowAdjust, parse } from "./channel.wac";
+import { Shell, runScript } from "../../sh/src/exec.wac";
 import { AuthRequest, authFailure, authSuccess, channelClose, channelData, channelEof,
          pkOk,
          channelFailure, channelStderr, channelSuccess, ecdhReply, ephemeralPublic, exchangeHash, execCommand,
@@ -370,53 +371,28 @@ struct Result {
 }
 
 /**
- * The command set.
+ * Run the command with `packages/sh`.
  *
- * Small and honest: there is no process capability, so this is what a command can be. Anything
- * else answers the way a shell does when it cannot find a program — 127 and a message — rather
- * than pretending the command ran and produced nothing.
+ * The server used to answer a handful of names it knew. It now hands the command string to a
+ * shell, so `seq 1 100 | grep 7 | wc -l` works and so does `&&`, `$(…)`, quoting and redirection
+ * — none of which the server itself knows anything about.
+ *
+ * The shell runs in *capturing* mode, which is the whole reason this is a two-line function: its
+ * standard output collects into a buffer instead of going to the server's own terminal, and that
+ * buffer is what goes down the channel.
+ *
+ * **It still cannot start a process** (issue 0015). The shell's external commands are its own,
+ * written in wac — `help` lists them. What changed is that there is now a shell between the
+ * client and them, not that there is a system underneath.
+ *
+ * The reach is bounded by what the server was granted: with `--allow-read` alone a client can read
+ * what the server can read and write nothing. That is a real exposure and the operator chooses its
+ * size, which is the capability world working as intended rather than a gap.
  */
 Result run(Cli cli, Core core, u8[] command) {
-  string line = string.fromBytes(command);
-  string name = firstWord(line);
-  string rest = line.slice(name.len(), line.len());
-  while (rest.len() > 0 && rest.slice(0, 1) == " ") { rest = rest.slice(1, rest.len()); }
-
-  if (name == "echo") {
-    return Result((rest + "\n").toBytes(), u8[0](), 0);
-  }
-  if (name == "cat") {
-    if (rest == "") { return Result(u8[0](), "cat: no file\n".toBytes(), 2); }
-    FileResult f = cli.readFile(rest);
-    if (!f.ok) { return Result(u8[0](), ("cat: " + rest + ": " + f.error + "\n").toBytes(), 1); }
-    return Result(f.bytes, u8[0](), 0);
-  }
-  if (name == "ls") {
-    string dir = rest == "" ? "." : rest;
-    string[]? names = cli.readDir(dir);
-    if (names is null) { return Result(u8[0](), ("ls: " + dir + ": not a directory\n").toBytes(), 1); }
-    Buf out = Buf.create();
-    for (i32 i = 0; i < names!.len(); i++) {
-      out.pushAll(names![i].toBytes());
-      out.push(10);
-    }
-    return Result(out.take(), u8[0](), 0);
-  }
-  if (name == "true") { return Result(u8[0](), u8[0](), 0); }
-  if (name == "false") { return Result(u8[0](), u8[0](), 1); }
-  if (name == "help") {
-    return Result(("echo cat ls true false help\n"
-                   + "no shell: this server has no capability to start a process\n").toBytes(),
-                  u8[0](), 0);
-  }
-  return Result(u8[0](), (name + ": command not found — try `help`\n").toBytes(), 127);
-}
-
-string firstWord(string s) {
-  for (i32 i = 0; i < s.len(); i++) {
-    if (s.slice(i, i + 1) == " ") { return s.slice(0, i); }
-  }
-  return s;
+  Shell sh = Shell.capturing(core, cli);
+  i32 status = runScript(sh, string.fromBytes(command));
+  return Result(sh.outBuf.take(), sh.errOut.take(), status);
 }
 
 struct Options {

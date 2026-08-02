@@ -22,6 +22,9 @@
 //
 //   - probe files under `test/wac/`, whose whole purpose is to be called from TypeScript
 //     through `wacBind`, so they are skipped entirely
+//   - compile-only entry points — `packages/*/size/` and `client_entry.wac` — which exist to
+//     be fed to the compiler by `deno task size` and are never called by anything. Skipped
+//     for the same reason as probes: their exports are the measurement
 //   - a package's public API, if the only consumers are outside this repo — which is not
 //     the case here, since every package is exercised by a probe
 //
@@ -64,7 +67,8 @@ const source = new Map<string, string>();
 for (const f of files) source.set(f, await Deno.readTextFile(f));
 
 /** A file whose exports exist to be called from TypeScript, not from wac. */
-const isProbe = (f: string) => f.includes("/test/");
+const isProbe = (f: string) =>
+  f.includes("/test/") || f.includes("/size/") || f.endsWith("client_entry.wac");
 
 const decls: Decl[] = [];
 for (const f of files) {

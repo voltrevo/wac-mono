@@ -27,6 +27,7 @@ compiler, this one is things built with it.
 | [`zstd`](packages/zstd/) | Zstandard, both directions — 22% smaller than `gzip -6`, within 4% of `zstd -3` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) — **not for production**, see its README |
 | [`ssh`](packages/ssh/) | SSH-2 both ways — `ssh` runs commands on OpenSSH, `sshd` serves OpenSSH's client |
+| [`sh`](packages/sh/) | a shell — quoting, expansion, pipelines and redirection, checked against bash |
 | [`wacc`](packages/wacc/) | the wac compiler, in wac, so it can eventually compile itself |
 | [`server`](packages/server/) | an HTTP server in wac — the packages, composed and running |
 | [`std`](packages/std/) | `Vec<T>`, `Map<K, V>`, `Option<T>`, `Result<T, E>` — the containers generics made writable |

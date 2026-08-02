@@ -1,0 +1,433 @@
+// Expansion and execution.
+//
+// The order of operations is the part worth being careful about, because every one of them is
+// observable and getting them out of order produces a shell that is right until it is not:
+//
+//   1. expand each word — parameters, then command substitution
+//   2. **split** the result on whitespace, but only where it came from an unquoted expansion
+//   3. quote removal (already done by the lexer, which is why parts carry `quoted`)
+//
+// Splitting *after* expansion and only on unquoted results is the whole game. `x="a b"; echo $x`
+// is two arguments and `echo "$x"` is one. A shell that splits the source text, or that splits
+// everything, gets one of those wrong.
+//
+// Globbing is not implemented. A word containing `*` reaches the command unchanged, which is what
+// bash does when nothing matches — so the difference only shows when something would have.
+
+import { Vec } from "../../std/src/vec.wac";
+import { Map } from "../../std/src/map.wac";
+import { Option } from "../../std/src/option.wac";
+import { hashString, stringEq } from "../../std/src/hash.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+import { Cli, Core, FileResult } from "../../platform/src/platform.wac";
+import { Part, PartKind } from "./lex.wac";
+import { AndOr, AndOrOp, Assign, Item, Pipeline, Redir, RedirKind, Script, Simple, Word,
+         parse } from "./parse.wac";
+import { Output, itoa, names, run } from "./program.wac";
+
+export struct Shell {
+  Core core;
+  Cli cli;
+  Map<string, string> vars;
+  /** `$?` — the status of the last command run. */
+  i32 status;
+  bool exiting;
+  i32 exitCode;
+  /** Everything written to standard error, emitted in one piece at the end. See the README. */
+  Buf errOut;
+  /**
+   * Collect standard output instead of writing it out.
+   *
+   * Two callers need this and they are not obviously related: command substitution, which must
+   * read what a script printed, and `packages/ssh`'s server, which must send it down a channel
+   * rather than to its own terminal. Both want exactly "run this and give me the bytes", so it is
+   * one flag rather than two mechanisms.
+   */
+  bool capture;
+  Buf outBuf;
+
+  Shell create(Core core, Cli cli) {
+    return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
+                 false, Buf.create());
+  }
+
+  /** A shell whose output is collected in `outBuf` rather than written. */
+  Shell capturing(Core core, Cli cli) {
+    Shell sh = Shell.create(core, cli);
+    sh.capture = true;
+    return sh;
+  }
+
+  string lookUp(const this, string name) {
+    if (name == "?") { return itoa(this.status); }
+    Option<string> v = this.vars.get(name);
+    if (v.isNone()) {
+      // A variable the shell has not set falls back to the environment, which is what makes
+      // `echo $HOME` work without an assignment.
+      string? env = this.cli.env(name);
+      return (env is null) ? "" : env!;
+    }
+    return v.unwrap();
+  }
+}
+
+/** Run a whole script, writing standard output through the capability. */
+export i32 runScript(Shell sh, string src) {
+  Script script = parse(src);
+  if (!script.ok) {
+    sh.errOut.pushAll(("sh: " + script.error + "\n").toBytes());
+    return 2;
+  }
+  for (i32 i = 0; i < script.lists.len(); i++) {
+    if (sh.exiting) { break; }
+    runAndOr(sh, script.lists.get(i));
+  }
+  return sh.exiting ? sh.exitCode : sh.status;
+}
+
+void runAndOr(Shell sh, AndOr list) {
+  if (list.background) {
+    // Refused rather than run in the foreground, which would look like it worked.
+    sh.errOut.pushAll("sh: background commands are not supported\n".toBytes());
+    sh.status = 2;
+    return;
+  }
+  for (i32 i = 0; i < list.items.len(); i++) {
+    if (sh.exiting) { return; }
+    Item item = list.items.get(i);
+    match (item.op) {
+      case First: {}
+      case And: { if (sh.status != 0) { continue; } }
+      case Or: { if (sh.status == 0) { continue; } }
+    }
+    runPipeline(sh, item.pipeline);
+  }
+}
+
+/**
+ * Run a pipeline, feeding each stage's output to the next.
+ *
+ * Sequentially and in memory, which is not what a shell does: a real pipeline runs its stages at
+ * once, so `yes | head -1` finishes. Here every stage runs to completion first. The difference is
+ * invisible for finite inputs and total for infinite ones.
+ */
+void runPipeline(Shell sh, Pipeline pipeline) {
+  u8[] carried = u8[0]();
+  for (i32 i = 0; i < pipeline.stages.len(); i++) {
+    bool last = i == pipeline.stages.len() - 1;
+    carried = runSimple(sh, pipeline.stages.get(i), carried, last);
+    if (sh.exiting) { return; }
+  }
+}
+
+/**
+ * One simple command. Returns what it wrote, unless it was the last stage — then it goes out.
+ *
+ * The exit status of a pipeline is its *last* command's, which is why only the last stage's
+ * status is kept.
+ */
+u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
+  Vec<string> argv = Vec.create();
+  for (i32 i = 0; i < cmd.words.len(); i++) {
+    expandInto(sh, cmd.words.get(i), argv);
+  }
+
+  // `a=1` with no command sets the variable for the shell; `a=1 cmd` sets it for that command
+  // only. This shell does the first properly and the second by setting it and leaving it, which
+  // is wrong and is noted in the README rather than silently different.
+  if (argv.len() == 0) {
+    for (i32 i = 0; i < cmd.assigns.len(); i++) {
+      Assign a = cmd.assigns.get(i);
+      sh.vars.set(a.name, joinWord(sh, a.value));
+    }
+    sh.status = 0;
+    return u8[0]();
+  }
+  for (i32 i = 0; i < cmd.assigns.len(); i++) {
+    Assign a = cmd.assigns.get(i);
+    sh.vars.set(a.name, joinWord(sh, a.value));
+  }
+
+  // An input redirection replaces whatever the pipeline was carrying.
+  u8[] input = stdin;
+  for (i32 i = 0; i < cmd.redirs.len(); i++) {
+    Redir r = cmd.redirs.get(i);
+    match (r.kind) {
+      case In: {
+        string path = joinWord(sh, r.target);
+        FileResult f = sh.cli.readFile(path);
+        if (!f.ok) {
+          sh.errOut.pushAll(("sh: " + path + ": " + f.error + "\n").toBytes());
+          sh.status = 1;
+          return u8[0]();
+        }
+        input = f.bytes;
+      }
+      else: {}
+    }
+  }
+
+  Output result = dispatch(sh, argv, input);
+  if (sh.exiting) { return u8[0](); }
+
+  if (!result.found) {
+    sh.errOut.pushAll((argv.get(0) + ": command not found\n").toBytes());
+    sh.status = 127;
+    return u8[0]();
+  }
+  sh.status = result.status;
+  if (result.err.len() > 0) { sh.errOut.pushAll(result.err); }
+
+  // Output redirection wins over the pipeline and over standard output.
+  u8[] out = result.out;
+  bool redirected = false;
+  for (i32 i = 0; i < cmd.redirs.len(); i++) {
+    Redir r = cmd.redirs.get(i);
+    match (r.kind) {
+      case Out: { if (writeTo(sh, r, out, false)) { redirected = true; } }
+      case Append: { if (writeTo(sh, r, out, true)) { redirected = true; } }
+      else: {}
+    }
+  }
+  if (redirected) { return u8[0](); }
+  if (last) {
+    if (sh.capture) { sh.outBuf.pushAll(out); }
+    else { sh.cli.write(out); }
+    return u8[0]();
+  }
+  return out;
+}
+
+/** Write a redirection's target. False when it failed, which is already reported. */
+bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
+  string path = joinWord(sh, r.target);
+  // Only standard output is captured, so `2>` has nothing of its own to write. Saying so beats
+  // writing the wrong stream to the file.
+  if (r.fd != 1) {
+    sh.errOut.pushAll(("sh: redirecting fd " + itoa(r.fd) + " is not supported\n").toBytes());
+    sh.status = 2;
+    return true;
+  }
+  u8[] payload = data;
+  if (append) {
+    FileResult existing = sh.cli.readFile(path);
+    if (existing.ok) {
+      Buf both = Buf.create();
+      both.pushAll(existing.bytes);
+      both.pushAll(data);
+      payload = both.take();
+    }
+  }
+  if (!sh.cli.writeFile(path, payload)) {
+    sh.errOut.pushAll(("sh: " + path + ": cannot write\n").toBytes());
+    sh.status = 1;
+  }
+  return true;
+}
+
+/** A builtin if there is one, otherwise an external program. */
+Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
+  string name = argv.get(0);
+
+  if (name == ":" || name == "true") { return Output.ok(u8[0]()); }
+  if (name == "false") { return Output(u8[0](), u8[0](), 1, true); }
+  if (name == "echo") { return echo(argv); }
+  if (name == "exit") {
+    sh.exiting = true;
+    sh.exitCode = argv.len() > 1 ? atoiOr(argv.get(1), 0) : sh.status;
+    return Output.ok(u8[0]());
+  }
+  if (name == "export") {
+    // No capability sets the environment, so this records the value and says so if asked to do
+    // more — an export that silently did not export would be worse.
+    for (i32 i = 1; i < argv.len(); i++) {
+      string a = argv.get(i);
+      i32 eq = indexOfEq(a);
+      if (eq >= 0) { sh.vars.set(a.slice(0, eq), a.slice(eq + 1, a.len())); }
+    }
+    return Output.ok(u8[0]());
+  }
+  if (name == "unset") {
+    for (i32 i = 1; i < argv.len(); i++) { sh.vars.remove(argv.get(i)); }
+    return Output.ok(u8[0]());
+  }
+  if (name == "test" || name == "[") { return test(sh, argv); }
+  if (name == "help") { return help(); }
+
+  return run(sh.cli, argv, stdin);
+}
+
+Output echo(Vec<string> argv) {
+  bool newline = true;
+  i32 first = 1;
+  if (argv.len() > 1 && argv.get(1) == "-n") { newline = false; first = 2; }
+  string s = "";
+  for (i32 i = first; i < argv.len(); i++) {
+    s = (i == first) ? argv.get(i) : s + " " + argv.get(i);
+  }
+  if (newline) { s = s + "\n"; }
+  return Output.ok(s.toBytes());
+}
+
+/**
+ * `test` — enough of it for a conditional to be worth writing.
+ *
+ * Its exit status *is* its answer: 0 for true. That inversion relative to a boolean is what makes
+ * `test -z "$x" && echo empty` read correctly, and is the thing to keep straight.
+ */
+Output test(Shell sh, Vec<string> argv) {
+  Vec<string> a = Vec.create();
+  for (i32 i = 1; i < argv.len(); i++) {
+    // `[` requires a closing `]`, which is an argument and not syntax.
+    if (i == argv.len() - 1 && argv.get(0) == "[" && argv.get(i) == "]") { break; }
+    a.push(argv.get(i));
+  }
+
+  bool result = false;
+  if (a.len() == 0) { result = false; }
+  else if (a.len() == 1) { result = a.get(0) != ""; }
+  else if (a.len() == 2) {
+    string op = a.get(0);
+    if (op == "-z") { result = a.get(1) == ""; }
+    else if (op == "-n") { result = a.get(1) != ""; }
+    else if (op == "!") { result = a.get(1) == ""; }
+    else { return Output.fail(("test: unknown operator " + op + "\n").toBytes(), 2); }
+  } else if (a.len() == 3) {
+    string op = a.get(1);
+    string l = a.get(0);
+    string r = a.get(2);
+    if (op == "=") { result = l == r; }
+    else if (op == "!=") { result = l != r; }
+    else if (op == "-eq") { result = atoiOr(l, 0) == atoiOr(r, 0); }
+    else if (op == "-ne") { result = atoiOr(l, 0) != atoiOr(r, 0); }
+    else if (op == "-lt") { result = atoiOr(l, 0) < atoiOr(r, 0); }
+    else if (op == "-le") { result = atoiOr(l, 0) <= atoiOr(r, 0); }
+    else if (op == "-gt") { result = atoiOr(l, 0) > atoiOr(r, 0); }
+    else if (op == "-ge") { result = atoiOr(l, 0) >= atoiOr(r, 0); }
+    else { return Output.fail(("test: unknown operator " + op + "\n").toBytes(), 2); }
+  } else {
+    return Output.fail("test: too many arguments\n".toBytes(), 2);
+  }
+  return Output(u8[0](), u8[0](), result ? 0 : 1, true);
+}
+
+Output help() {
+  string s = "builtins: : true false echo exit export unset test [ help\n";
+  Vec<string> ns = names();
+  s = s + "programs:";
+  for (i32 i = 0; i < ns.len(); i++) { s = s + " " + ns.get(i); }
+  s = s + "\nno process capability, so these are implemented in wac — see issue 0015\n";
+  return Output.ok(s.toBytes());
+}
+
+// ── Expansion ─────────────────────────────────────────────────────────────────
+
+/**
+ * Expand one word into zero or more arguments.
+ *
+ * Zero is not a mistake: `x=""; echo $x` passes nothing at all, because an unquoted expansion
+ * that yields only whitespace disappears. `echo "$x"` passes one empty argument. Both matter.
+ */
+void expandInto(Shell sh, Word word, Vec<string> argv) {
+  string current = "";
+  bool started = false;
+
+  for (i32 i = 0; i < word.parts.len(); i++) {
+    Part p = word.parts.get(i);
+    string text = expandPart(sh, p);
+
+    if (p.quoted) {
+      current = current + text;
+      started = true;
+      continue;
+    }
+    match (p.kind) {
+      case Lit: {
+        // Literal text never splits, whatever is in it — `echo a b` is two words because the
+        // *lexer* split it, not because expansion did.
+        current = current + text;
+        started = true;
+      }
+      else: {
+        // An unquoted expansion splits on whitespace.
+        u8[] b = text.toBytes();
+        i32 start = 0;
+        for (i32 j = 0; j <= b.len(); j++) {
+          bool end = j == b.len();
+          bool blank = !end && (b[j] == 32 || b[j] == 9 || b[j] == 10);
+          if (end || blank) {
+            if (j > start) {
+              current = current + sliceString(text, start, j);
+              started = true;
+            }
+            if (!end) {
+              if (started) { argv.push(current); }
+              current = "";
+              started = false;
+            }
+            start = j + 1;
+          }
+        }
+      }
+    }
+  }
+  if (started) { argv.push(current); }
+}
+
+string expandPart(Shell sh, Part p) {
+  match (p.kind) {
+    case Lit: return p.text;
+    case Var: return sh.lookUp(p.text);
+    case Cmd: {
+      // A command substitution runs the text as a script and takes its standard output, with
+      // trailing newlines removed — the removal is why `x=$(pwd)` does not end in a newline.
+      Shell inner = Shell.capturing(sh.core, sh.cli);
+      inner.vars = sh.vars;
+      runScript(inner, p.text);
+      sh.status = inner.status;
+      sh.errOut.pushAll(inner.errOut.bytes());
+      u8[] out = inner.outBuf.take();
+      i32 n = out.len();
+      while (n > 0 && out[n - 1] == 10) { n--; }
+      u8[] trimmed = u8[n]();
+      trimmed.copyFrom(out, 0, 0, n);
+      return string.fromBytes(trimmed);
+    }
+  }
+  return "";
+}
+
+/** A word joined without splitting — for a redirection target or an assignment's value. */
+string joinWord(Shell sh, Word word) {
+  string s = "";
+  for (i32 i = 0; i < word.parts.len(); i++) {
+    s = s + expandPart(sh, word.parts.get(i));
+  }
+  return s;
+}
+
+string sliceString(string s, i32 from, i32 to) {
+  return s.slice(from, to);
+}
+
+i32 indexOfEq(string s) {
+  for (i32 i = 0; i < s.len(); i++) {
+    if (s.slice(i, i + 1) == "=") { return i; }
+  }
+  return -1;
+}
+
+i32 atoiOr(string s, i32 fallback) {
+  if (s.len() == 0) { return fallback; }
+  i32 v = 0;
+  bool negative = false;
+  i32 start = 0;
+  if (s.slice(0, 1) == "-") { negative = true; start = 1; }
+  if (start >= s.len()) { return fallback; }
+  for (i32 i = start; i < s.len(); i++) {
+    u8[] b = s.slice(i, i + 1).toBytes();
+    if (b.len() != 1 || b[0] < 0x30 || b[0] > 0x39) { return fallback; }
+    v = v * 10 + (b[0] - 0x30);
+  }
+  return negative ? -v : v;
+}
