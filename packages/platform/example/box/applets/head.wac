@@ -1,24 +1,24 @@
 // The first N lines, ten by default.
+//
+// The only applet that need not reach the end of its input: once it has the lines it was
+// asked for it stops reading, so `head -1` of a huge file costs one chunk. Nothing else
+// here can do that, and it is the reason `head` no longer shares `pick` with `tail`.
 
 import { Cli, Core } from "../../../src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, readInput } from "../lib/input.wac";
-import { joinLines, splitLines } from "../lib/lines.wac";
+import { Input, openStream } from "../lib/input.wac";
+import { Line, Lines, emit, nextLine } from "../lib/reader.wac";
 
 export i32 head(Core core, Cli cli, Args a) {
-  Input in = readInput(core, cli, a, 0);
+  Input in = openStream(core, cli, a, 0);
   if (!in.ok) { return 1; }
-  cli.write(pick(in.bytes, a.num == 0 ? 10 : a.num, true));
-  return 0;
-}
+  i32 want = a.num == 0 ? 10 : a.num;
 
-/** Shared with `tail`, which is the same operation from the other end. */
-export u8[] pick(u8[] data, i32 count, bool fromStart) {
-  u8[][] lines = splitLines(data);
-  i32 n = lines.len();
-  i32 take = count < n ? count : n;
-  if (take < 0) { take = 0; }
-  u8[][] out = u8[][take](fill: u8[0]());
-  for (i32 i = 0; i < take; i++) { out[i] = fromStart ? lines[i] : lines[n - take + i]; }
-  return joinLines(out, take);
+  Lines s = Lines.create();
+  for (i32 i = 0; i < want; i++) {
+    Line l = nextLine(s, cli);
+    if (!l.ok) { break; }
+    emit(cli, l.bytes, l.nl);
+  }
+  return 0;
 }
