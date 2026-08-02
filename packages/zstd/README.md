@@ -21,7 +21,7 @@ what zstd's own encoder produces and comparing bytes.
 | Sequences: all four modes per code, and the repeat offsets | done |
 | Content checksum (XXH64) | verified, not skipped |
 | Dictionaries | **not implemented** |
-| Compression | **not started** — see below |
+| Compression | **started**: FSE encoding only — see below |
 
 ### What "not implemented" means here
 
@@ -53,12 +53,42 @@ and no ordinary encoder emits one unasked. They exist for the opposite case: man
 that share structure, where the shared part is longer than the message. If that is the use, this
 package cannot serve it; if it is not, nothing here is missing.
 
-**Compression.** A separate and much larger project. Everything here decodes; nothing encodes.
-The pieces that would have to be built are the mirror of the pieces above — FSE table
-construction and encoding, Huffman tree building, match finding, and the choice of which of the
-four modes to use per code per block — and the last of those is where a zstd encoder's quality
-actually lives. `packages/gzip` took a comparable amount of work to reach a compressor that
-matches `gzip -6`, and zstd's format has considerably more choices in it.
+**Compression.** `src/fseenc.wac` is the first piece: count normalisation, encoding-table
+construction, the backwards bit writer, and table description writing. Nothing yet produces a
+frame.
+
+Why that piece first, and not literals: measured on this container, entropy-coding the literals
+of a 102 KB prose sample gets it to 54 KB, while `zstd -3` gets it to 95 bytes. **Almost all of
+zstd's compression is matches, not entropy coding** — so there is no useful milestone before
+sequences, and sequences need FSE encoding. It is on the critical path from the start rather
+than being a refinement.
+
+What is left, in order:
+
+1. **Sequences in Predefined mode.** The default distributions can express every literal-length
+   and match-length code and offset codes up to 28, so a complete valid encoder can be written
+   that never transmits an FSE table. Table construction and mode selection are both deferrable.
+2. **Match finding.** `packages/gzip`'s LZ77 ports structurally — hash chains, chain limits, and
+   the history-carrying trick added for streaming. Different window, different code tables, same
+   search.
+3. **Huffman literals**, which needs length-limited code construction, since zstd caps codes at
+   11 bits and plain Huffman does not bound depth.
+4. **Own tables and per-block mode selection** — Predefined against RLE against transmitted
+   against Repeat, per code, per block. This is where a real encoder's quality lives.
+
+The testing position is much better than the decoder's was. A decoder cannot be checked until it
+decodes something whole, which is why the tests above lean on invariants; an encoder's very first
+valid frame is checkable end to end, because Node must decompress it to the input.
+
+### The normaliser is deliberately not zstd's
+
+Counts have to be scaled to sum to exactly `1 << accuracyLog`. zstd distributes the rounding
+error using a table of thresholds and falls back to a second algorithm in a corner case. Ours
+rounds proportionally, gives every symbol that occurs at least one slot, and settles the
+difference against the largest — correct, and readable in one sitting, at the cost of a fraction
+of a percent of ratio. It also never produces the "less than one" count that the format allows
+and the predefined tables use heavily, which is why `writeDescription` is tested against those
+tables directly rather than against its own output.
 
 ## Why this order
 
@@ -150,12 +180,14 @@ encoder stops choosing one, the test says so instead of quietly testing less.
 | `src/sequences.wac` | the three interleaved codes, and the repeat-offset rules |
 | `src/block.wac` | a compressed block: literals, sequences, and what carries between blocks |
 | `src/xxh64.wac` | the content checksum |
+| `src/fseenc.wac` | FSE encoding: normalisation, encoding tables, the backwards bit writer |
 | `test/oracle.mjs` | Node's zstd, both directions, one subprocess per run |
 | `test/frame.test.ts` | against encoder output, and hand-built frames Node validates |
 | `test/fse.test.ts` | the three checks above |
 | `test/huffman.test.ts` | literals as a subsequence, and the table build |
 | `test/decode.test.ts` | whole frames against Node, and which codings were reached |
 | `test/xxh64.test.ts` | the published vectors |
+| `test/fseenc.test.ts` | encode, then decode with the decoder that reads real frames |
 | `test/frames.ts` | walking a real frame to find its FSE-coded pieces |
 | `test/writer.ts` | the description writer, for round-tripping |
 | `cov.ts` | `deno task coverage:zstd` — 100% of branches |
