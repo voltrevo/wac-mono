@@ -35,9 +35,27 @@ export struct Shell {
   i32 exitCode;
   /** Everything written to standard error, emitted in one piece at the end. See the README. */
   Buf errOut;
+  /**
+   * Collect standard output instead of writing it out.
+   *
+   * Two callers need this and they are not obviously related: command substitution, which must
+   * read what a script printed, and `packages/ssh`'s server, which must send it down a channel
+   * rather than to its own terminal. Both want exactly "run this and give me the bytes", so it is
+   * one flag rather than two mechanisms.
+   */
+  bool capture;
+  Buf outBuf;
 
   Shell create(Core core, Cli cli) {
-    return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create());
+    return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
+                 false, Buf.create());
+  }
+
+  /** A shell whose output is collected in `outBuf` rather than written. */
+  Shell capturing(Core core, Cli cli) {
+    Shell sh = Shell.create(core, cli);
+    sh.capture = true;
+    return sh;
   }
 
   string lookUp(const this, string name) {
@@ -173,7 +191,8 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
   }
   if (redirected) { return u8[0](); }
   if (last) {
-    sh.cli.write(out);
+    if (sh.capture) { sh.outBuf.pushAll(out); }
+    else { sh.cli.write(out); }
     return u8[0]();
   }
   return out;
@@ -362,12 +381,12 @@ string expandPart(Shell sh, Part p) {
     case Cmd: {
       // A command substitution runs the text as a script and takes its standard output, with
       // trailing newlines removed — the removal is why `x=$(pwd)` does not end in a newline.
-      Shell inner = Shell.create(sh.core, sh.cli);
+      Shell inner = Shell.capturing(sh.core, sh.cli);
       inner.vars = sh.vars;
-      Buf captured = Buf.create();
-      captureInto(inner, p.text, captured);
+      runScript(inner, p.text);
       sh.status = inner.status;
-      u8[] out = captured.take();
+      sh.errOut.pushAll(inner.errOut.bytes());
+      u8[] out = inner.outBuf.take();
       i32 n = out.len();
       while (n > 0 && out[n - 1] == 10) { n--; }
       u8[] trimmed = u8[n]();
@@ -376,36 +395,6 @@ string expandPart(Shell sh, Part p) {
     }
   }
   return "";
-}
-
-/**
- * Run a script and collect what it writes, instead of letting it out.
- *
- * There is no capability to redirect standard output, so a substitution cannot simply run the
- * script and catch what `write` emitted. Instead the last stage's output is returned rather than
- * written — which is what `runSimple`'s `last` flag already controls, so this walks the script
- * with that flag turned off.
- */
-void captureInto(Shell sh, string src, Buf out) {
-  Script script = parse(src);
-  if (!script.ok) { return; }
-  for (i32 i = 0; i < script.lists.len(); i++) {
-    AndOr list = script.lists.get(i);
-    for (i32 j = 0; j < list.items.len(); j++) {
-      Item item = list.items.get(j);
-      match (item.op) {
-        case First: {}
-        case And: { if (sh.status != 0) { continue; } }
-        case Or: { if (sh.status == 0) { continue; } }
-      }
-      u8[] carried = u8[0]();
-      Pipeline pipeline = item.pipeline;
-      for (i32 k = 0; k < pipeline.stages.len(); k++) {
-        carried = runSimple(sh, pipeline.stages.get(k), carried, false);
-      }
-      out.pushAll(carried);
-    }
-  }
 }
 
 /** A word joined without splitting — for a redirection target or an assignment's value. */
