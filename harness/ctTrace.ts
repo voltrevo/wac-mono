@@ -28,6 +28,7 @@
 
 import { wacCompile } from "wac/wacCompile.ts";
 import { wacFiles } from "./wacFiles.ts";
+import { checkWacVersion } from "./wacVersion.ts";
 
 /**
  * The compiler's point record, described structurally rather than imported.
@@ -57,6 +58,7 @@ export type CtModule = {
 let available: boolean | undefined;
 export function ctTraceAvailable(): boolean {
   if (available !== undefined) return available;
+  checkWacVersion();
   const src = `const u8[] T = u8[](1, 2);\nexport i32 f(i32 s) { return T[s & 1]; }\n`;
   try {
     const r = wacCompile(new Map([["p.wac", src]]), "p.wac", { ctTrace: true } as Record<string, unknown>);

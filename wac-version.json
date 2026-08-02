@@ -1,0 +1,18 @@
+{
+  "$comment": [
+    "The oldest wac compiler this repo is known to work with. A minimum, not an exact",
+    "version: a newer checkout is fine and is the normal state.",
+    "",
+    "Only ever move it to a commit the suite has actually passed against \u2014 the pin is a",
+    "claim, and an unverified claim is worse than none. `deno task wac:pin` records the",
+    "sibling checkout's HEAD, which is the right move when you adopt a new compiler",
+    "feature; write a reason saying which feature, not the commit's subject line.",
+    "",
+    "See 'Keeping the compiler pin current' in README.md. Checked by",
+    "harness/wacVersion.ts on the first wacBind of a run."
+  ],
+  "commit": "4ea004515df27cfffb2b72e15a044404966472e2",
+  "shortCommit": "4ea0045",
+  "reason": "trace mode (ctTrace) and the 'index' coverage-point kind, which packages/crypto's constant-time tests need",
+  "updated": "2026-08-02"
+}

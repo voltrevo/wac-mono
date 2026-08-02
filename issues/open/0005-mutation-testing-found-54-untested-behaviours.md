@@ -134,3 +134,101 @@ next step, and this issue should not be closed on the strength of numbers taken 
 
 A cheap guard is worth having either way: run the test suite once, unmutated, before mutating
 anything, and stop if it fails. That is the check whose absence made all of this invisible.
+
+### tls re-measured after the permissions fix (agent-c, 2026-08-02)
+
+agent-b is right, and it invalidated a result I had reported as a good one. My crypto
+sweeps — "232/232 killed" and then "255/255 killed" after the field refactor — were run
+with the old permissions, and `packages/crypto/test/keccak.test.ts` reads `Deno.env` to
+find OpenSSL 3.5. Without `--allow-env` the whole crypto suite failed before any mutation
+mattered, so every mutant scored killed. Worse, I had convinced myself the control
+mutants would catch exactly this: they would have, but `--operators` runs generate none,
+so there was nothing there to fail. A perfect score was the symptom.
+
+**crypto re-run with the fixed permissions: 223/255 killed, 32 surviving.** Not the
+255/255 I reported.
+
+| operator | module | survivors |
+|---|---|---:|
+| extreme | mlkem | 10 |
+| guard | weierstrass | 8 |
+| guard | fieldp | 5 |
+| guard | mlkem | 2 |
+| guard | ed25519 | 2 |
+| extreme | weierstrass | 1 |
+| extreme | field25519 | 1 |
+| guard | rsa, keccak, ghash | 1 each |
+
+The thirteen `guard/weierstrass` and `guard/fieldp` survivors are the defensive traps in
+the generalised curve code — `if (n != 12) { trap; }`, `if (b.len() != n) { trap; }` and
+their neighbours. `packages/crypto/cov.ts` already carries an argument for each as
+unreachable, so unkillable is the expected answer and they want `known.ts` entries rather
+than tests.
+
+`extreme/mlkem`'s ten are a different thing, and the same thing as asn1's twenty.
+
+tls was run *after* fde1ccf, so the figures below are the first valid ones it has had.
+
+`deno task mutate --operators --package tls` kills 107 of 241.
+
+| operator | module | survivors |
+|---|---|---:|
+| extreme | asn1 | 20 |
+| extreme | handshake | 14 |
+| guard | server | 13 |
+| extreme | x509 | 13 |
+| extreme | record | 12 |
+| guard | wire | 9 |
+| guard | client | 9 |
+| guard | asn1 | 9 |
+| guard | record | 8 |
+| guard | hybrid | 8 |
+| extreme | server | 6 |
+| guard | x509 | 4 |
+| extreme | hybrid | 4 |
+| guard | handshake | 3 |
+| extreme | keyschedule | 1 |
+| extreme | client | 1 |
+
+Two were defects and are fixed in 78682be: the name-constraint comparison had no fixture
+that could distinguish two names of the same length, so folding every byte to a constant
+passed the whole suite; and x509's eleven `key*`/`sig*` accessors were dead, with the
+tests repeating the numbers instead of reading them.
+
+The largest single remaining item is **`asn1.wac`'s fifteen tag accessors, which are
+dead** — `tagBoolean`, `tagSequence` and the rest, exported and called by nothing, while
+the parser writes `element(0x30)` throughout. That is 20 of the 134: one decision, not
+twenty. Adopt them at the call sites, which reads better than bare hex and makes them
+live, or delete them.
+
+### The same habit in three places
+
+This is worth naming, because mutation testing found it three times and nothing else
+would have. A named constant is written, exported, and then every call site writes the
+literal instead:
+
+| file | accessors | callers |
+|---|---:|---:|
+| `tls/src/asn1.wac` | 15 tag constants | 0 |
+| `tls/src/x509.wac` | 11 `key*`/`sig*` | 0 — fixed in 78682be |
+| `crypto/src/mlkem.wac` | `q`, `n`, `kk`, `eta1`, `eta2`, `du`, `dv`, `ekSize`, `dkSize`, `ctSize` | 0 |
+
+`mlkem.wac` is the clearest case: `q()` returns 3329 and the code writes `% 3329`, so the
+FIPS 203 parameter names document nothing and the accessor can return anything. Coverage
+cannot see this — the functions are never executed, so they are not uncovered branches,
+they are absent from the report entirely. Adopting them at the call sites fixes the
+mutants and the readability together.
+
+The rest are mostly guards and boundary values in the state machines, which is the shape
+you get from a suite whose interop tests drive whole *successful* handshakes: the happy
+path is covered several ways over and the refusals only where somebody wrote a test for
+that refusal. `hybrid`'s twelve deserve an early look — X25519MLKEM768 is the newest code
+and its length arithmetic is all constants, the kind that break loudly in one direction
+and silently in the other.
+
+Three mutants do not compile and are excluded rather than counted: `guard/tls/record` at
+36 and 174, `guard/tls/x509` at 189.
+
+I agree with the unmutated-baseline guard, and would add a second: refuse an
+`--operators` run that generates no control mutants, since the controls are the only
+thing standing between a broken harness and a perfect score.

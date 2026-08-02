@@ -52,6 +52,8 @@ const ncBad = await readPem("p384_nc_bad.pem");
 const ncExcl = await readPem("p384_nc_excl.pem");
 const ncIp = await readPem("p384_nc_ip.pem");
 const ncSuffix = await readPem("p384_nc_suffix.pem");
+const ncUpper = await readPem("p384_nc_upper.pem");
+const ncSameLen = await readPem("p384_nc_samelen.pem");
 
 /** 2030-01-01, comfortably inside every fixture's validity. */
 const NOW = 1893456000n;
@@ -79,7 +81,10 @@ function check(
   return verifyPath(chain.der, chain.offsets, roots.der, roots.offsets, utf8(host), now, maxDepth);
 }
 
-const KEY_P256 = 2, KEY_P384 = 4;
+/** The key* and sig* constants, read from x509.wac rather than copied out of it. */
+const C = (mod.x509Constants as () => Uint8Array)();
+const KEY_P256 = C[1], KEY_P384 = C[3];
+const SIG_ECDSA_SHA256 = C[5], SIG_ECDSA_SHA384 = C[6];
 
 /** The parse probe packs [notBefore(8)][notAfter(8)][isCa(1)][keyType(1)][sigAlg(1)]. */
 const parsed = (der: Uint8Array) => {
@@ -95,8 +100,8 @@ Deno.test("x509: a P-384 root and a P-256 leaf parse as different key types", ()
   if (!r.isCa || !i.isCa) throw new Error("root and intermediate must be CAs");
   if (l.isCa) throw new Error("the leaf must not be a CA");
   // ecdsa-with-SHA384 on the intermediate, ecdsa-with-SHA256 on the leaf.
-  if (i.sigAlg !== 3) throw new Error(`intermediate sigAlg ${i.sigAlg}, want 3`);
-  if (l.sigAlg !== 2) throw new Error(`leaf sigAlg ${l.sigAlg}, want 2`);
+  if (i.sigAlg !== SIG_ECDSA_SHA384) throw new Error(`intermediate sigAlg ${i.sigAlg}`);
+  if (l.sigAlg !== SIG_ECDSA_SHA256) throw new Error(`leaf sigAlg ${l.sigAlg}`);
 });
 
 Deno.test("x509: a two-deep chain verifies to a P-384 root", () => {
@@ -310,4 +315,26 @@ Deno.test("x509: dNSName subtrees match on label boundaries, not on suffixes", (
   if (check(bundle(leaf, ncOk), singleRoot(root), "wac.test") !== 0) {
     throw new Error("a name genuinely inside the permitted subtree was rejected");
   }
+});
+
+Deno.test("x509: subtree matching is case-insensitive", () => {
+  // RFC 5280 §4.2.1.10 compares DNS names without regard to case, and certificates in
+  // the wild are not consistent about it. A case-sensitive matcher does not fail open
+  // here — it fails *closed*, refusing a CA that is genuinely entitled to the name — so
+  // it would show up as an inexplicable outage rather than as a security hole.
+  //
+  // This test exists because mutation testing found `lowerByte` could be replaced with
+  // `return 0` and nothing noticed: the other fixtures all differ in length or at a
+  // label boundary, so none of them ever compared two letters that differed only in case.
+  if (check(bundle(leaf, ncUpper), singleRoot(root)) !== 0) {
+    throw new Error("a CA permitted WAC.TEST refused a leaf named wac.test");
+  }
+
+  // The other direction, and the one that actually pins the comparison. `xyz.test` is
+  // exactly as long as `wac.test`, so the length check cannot reject it and the letters
+  // have to. Without this, folding every byte to a constant passes the whole suite —
+  // which is what happened: the uppercase case above still succeeded, because a matcher
+  // that thinks everything is equal is more permissive, not less.
+  const code = check(bundle(leaf, ncSameLen), singleRoot(root));
+  if (code !== 10) throw new Error(`expected 10 (name constraint) for xyz.test, got ${code}`);
 });

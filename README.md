@@ -68,6 +68,7 @@ Everything runs from the repo root, so one command covers every package.
 
 ```sh
 deno task test            # all tests, host-side and wac-written (parallel: ~30s, vs ~76s serial)
+deno task wac:pin         # record the sibling wac checkout as the minimum this repo needs
 deno task coverage        # branch coverage of every package, from its wac-native tests
 deno task coverage:bignum # ...and the host-driven exercises, per package
 deno task coverage:bytes
@@ -94,6 +95,36 @@ deno task verify:fmt      # fmt exactness over 500k doubles, both directions
 deno run --allow-read tools/check.ts <entry.wac>    # type-check one file, no run
 deno run -A tools/validate.ts <entry.wac>          # ...and check the wasm validates
 ```
+
+## Keeping the compiler pin current
+
+`deno.json` maps `wac/` to `../wac/atoms/wac/`, so the compiler is whichever sibling
+checkout you happen to have. `wac-version.json` records the oldest one this repo is known
+to work with, and the harness checks it before compiling anything. A checkout that is
+older fails with *"wac-mono needs a newer compiler"* naming the commit and the reason,
+instead of a `CompileError` in whichever package used the new feature — which is what
+used to happen, four times, to three different agents (`issues/closed/0001`, `0008`).
+
+**Being ahead of the pin is normal and is never an error.** The pin is a floor.
+
+**Bump it when you adopt a compiler feature that did not exist before.** That is the only
+time it is required, and the sequence is:
+
+```sh
+git -C ../wac pull                              # get the compiler you want
+deno task test                                  # prove this repo works with it
+deno task wac:pin -- "generic enums, for std"   # then record it, with a real reason
+```
+
+The order matters: the pin is a claim that the suite passes against that compiler, and
+`wac:pin` cannot check that for you. It refuses a dirty wac working tree and refuses to
+move the floor backwards, but it takes your word on the rest.
+
+**Otherwise, bump it when it drifts.** Once the checkout is 40 commits ahead, every run
+prints a one-line note suggesting it. That is the whole reminder mechanism — nobody has to
+remember, because the suite says so — and acting on it is a green run plus `wac:pin`. A pin
+that lags a long way behind is not wrong, but it has stopped saying anything useful about
+what this repo needs.
 
 ## Two kinds of test
 
