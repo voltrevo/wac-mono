@@ -242,3 +242,17 @@ export u8[] sshSignedData(u8[] sessionId, u8[] user, u8[] publicBlob) {
 export u8[] sshPublicKeyRequest(u8[] sessionId, u8[] user, u8[] publicBlob, u8[] seed) {
   return publicKeyRequest(sessionId, user, publicBlob, seed);
 }
+
+// ── known_hosts ───────────────────────────────────────────────────────────────
+
+import { Verdict, lookUp } from "../../src/knownhosts.wac";
+
+/** 0 unknown, 1 match, 2 mismatch, 3 revoked. */
+export i32 sshKnownHost(u8[] file, u8[] host, i32 port, u8[] keyType, u8[] keyBlob) {
+  match (lookUp(file, host, port, keyType, keyBlob)) {
+    case Unknown: return 0;
+    case Match: return 1;
+    case Mismatch: return 2;
+    else: return 3;
+  }
+}

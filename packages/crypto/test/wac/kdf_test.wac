@@ -1,4 +1,4 @@
-// HMAC-SHA-256 and HKDF, against their RFCs and against the host's HMAC.
+// HMAC-SHA-256, HMAC-SHA-1 and HKDF, against their RFCs and against the host's HMAC.
 //
 // One file for both because HKDF *is* HMAC used twice — extract then expand — so a fault
 // in the primitive shows up in both, and testing them apart makes it harder to see which
@@ -19,7 +19,7 @@
 
 import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
-import { hmacSha256 } from "../../src/hmac.wac";
+import { hmacSha1, hmacSha256 } from "../../src/hmac.wac";
 import { hkdf, hkdfExtract } from "../../src/hkdf.wac";
 
 u8[] unhex(string h) {
@@ -42,6 +42,29 @@ u8[] fill(i32 n, i32 a, i32 b) {
   u8[] out = u8[n]();
   for (i32 i = 0; i < n; i++) { out[i] = (i * a + b) & 0xFF; }
   return out;
+}
+
+/**
+ * HMAC-SHA-1, RFC 2202. Here because `known_hosts` hashes its hostnames with it — see
+ * `packages/ssh` — and for nothing else.
+ *
+ * Case 6 is the one that matters: an 80-byte key, longer than the 64-byte block, so it is hashed
+ * first. RFC 2104 says the reduction uses *the HMAC's own hash*, and reducing with SHA-256
+ * instead agrees for every key of 64 bytes or fewer — which is every other case here, and every
+ * known_hosts salt. Without this vector that mistake is invisible.
+ */
+export string test_rfc_2202_hmac_sha1_vectors() {
+  T t = T.create();
+  t.eqBytes(hmacSha1(rep(0x0b, 20), "Hi There".toBytes()),
+            unhex("b617318655057264e28bc0b6fb378c8ef146be00"), "RFC 2202 case 1");
+  t.eqBytes(hmacSha1("Jefe".toBytes(), "what do ya want for nothing?".toBytes()),
+            unhex("effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"), "RFC 2202 case 2");
+  t.eqBytes(hmacSha1(rep(0xaa, 20), rep(0xdd, 50)),
+            unhex("125d7342b9ac11cd91a39af48aa17b4f63f175d3"), "RFC 2202 case 3");
+  t.eqBytes(hmacSha1(rep(0xaa, 80),
+                     "Test Using Larger Than Block-Size Key - Hash Key First".toBytes()),
+            unhex("aa4ae5e15272d00e95705637ce8a3b55ed402112"), "RFC 2202 case 6");
+  return t.report();
 }
 
 export string test_rfc_4231_hmac_vectors() {

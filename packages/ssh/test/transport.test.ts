@@ -53,6 +53,7 @@ const mod = await wacBind("packages/ssh/test/wac/probe.wac") as unknown as {
   sshMsgUserAuthSuccess(): number;
   sshMsgUserAuthFailure(): number;
   sshMsgServiceAccept(): number;
+  sshKnownHost(file: Uint8Array, host: Uint8Array, port: number, keyType: Uint8Array, keyBlob: Uint8Array): number;
   sshServiceRequest(): Uint8Array;
   sshSignedData(sessionId: Uint8Array, user: Uint8Array, publicBlob: Uint8Array): Uint8Array;
   sshPublicKeyRequest(sessionId: Uint8Array, user: Uint8Array, publicBlob: Uint8Array, seed: Uint8Array): Uint8Array;
@@ -222,12 +223,27 @@ Deno.test({
         throw new Error("the server's host key signature did not verify over our exchange hash");
       }
 
-      // Independently: the key the server presented is the one we generated for it. Without this,
-      // a signature that verifies only proves self-consistency — we would accept any host.
+      // A verifying signature only proves the peer holds the key it presented — it says nothing
+      // about *which* peer. So the host key goes through known_hosts, which is what a real client
+      // does and the only thing that distinguishes the server from someone in the middle.
       const pubLine = await Deno.readTextFile(`${dir}/hostkey.pub`);
       const wantBlob = pubLine.split(" ")[1];
-      const gotBlob = btoa(String.fromCharCode(...hostKeyBlob));
-      if (gotBlob !== wantBlob) throw new Error("host key blob is not the one in hostkey.pub");
+      const knownHosts = bytes(`[127.0.0.1]:${port} ssh-ed25519 ${wantBlob}\n`);
+      const host = bytes("127.0.0.1");
+      const keyType = bytes("ssh-ed25519");
+
+      const verdict = mod.sshKnownHost(knownHosts, host, port, keyType, hostKeyBlob);
+      if (verdict !== 1) throw new Error(`known_hosts did not recognise the host key: verdict ${verdict}`);
+      // An empty file is "unknown" — a first connection — and must not read as a match.
+      if (mod.sshKnownHost(new Uint8Array(0), host, port, keyType, hostKeyBlob) !== 0) {
+        throw new Error("an empty known_hosts matched");
+      }
+      // And a file naming a different key for this host is the case that must stop a connection.
+      const wrong = bytes(`[127.0.0.1]:${port} ssh-ed25519 ${btoa(String.fromCharCode(
+        ...Uint8Array.from({ length: 51 }, (_, i) => i)))}\n`);
+      if (mod.sshKnownHost(wrong, host, port, keyType, hostKeyBlob) !== 2) {
+        throw new Error("a changed host key was not caught");
+      }
 
       // Tampering with H must break the signature — otherwise the check above proves nothing.
       const bent = new Uint8Array(h);
@@ -878,4 +894,176 @@ Deno.test("the signed data length-prefixes the session id", () => {
   if (text(mod.sshReadString(tail.slice(4))) !== "ssh-ed25519") {
     throw new Error("the signature blob does not name ssh-ed25519");
   }
+});
+
+// known_hosts, against a file the real ssh client wrote.
+//
+// This is the only way to know the hashed form is right: `HashKnownHosts` is on by default, so a
+// real entry is `|1|<salt>|<HMAC-SHA-1(salt, name)>` and there is nothing to compare against
+// except a file OpenSSH produced. It also pins the `[host]:port` spelling, which is what gets
+// hashed for a non-default port — get that wrong and every lookup silently reports "unknown".
+Deno.test({
+  name: "a known_hosts written by the real ssh client is read correctly",
+  ignore: !haveSshd,
+  sanitizeResources: false,
+  fn: async () => {
+    const dir = await Deno.makeTempDir();
+    const port = freePort();
+    let sshd: Deno.ChildProcess | undefined;
+    try {
+      for (const name of ["hostkey", "clientkey"]) {
+        const r = await new Deno.Command("ssh-keygen", {
+          args: ["-t", "ed25519", "-f", `${dir}/${name}`, "-N", "", "-q"],
+        }).output();
+        if (!r.success) throw new Error(`ssh-keygen failed for ${name}`);
+      }
+      await Deno.chmod(`${dir}/hostkey`, 0o600);
+      await Deno.chmod(`${dir}/clientkey`, 0o600);
+      await Deno.copyFile(`${dir}/clientkey.pub`, `${dir}/authorized_keys`);
+      await Deno.chmod(`${dir}/authorized_keys`, 0o600);
+      await Deno.writeTextFile(`${dir}/sshd_config`, [
+        `Port ${port}`, "ListenAddress 127.0.0.1", `HostKey ${dir}/hostkey`,
+        `AuthorizedKeysFile ${dir}/authorized_keys`,
+        "StrictModes no", "UsePAM no", "PasswordAuthentication no", "PidFile none",
+      ].join("\n"));
+
+      sshd = new Deno.Command("/usr/sbin/sshd", {
+        args: ["-D", "-f", `${dir}/sshd_config`], stdout: "null", stderr: "null",
+      }).spawn();
+      for (let i = 0; i < 100; i++) {
+        try {
+          const probe = await Deno.connect({ hostname: "127.0.0.1", port });
+          probe.close();
+          break;
+        } catch {
+          await new Promise(r => setTimeout(r, 50));
+        }
+      }
+
+      // Let the real client connect — that is what writes the entry. Once with hashing and once
+      // without, because `-F /dev/null` drops the system default and the two forms are parsed by
+      // completely different code. Both are files OpenSSH actually produced.
+      async function writeKnownHosts(hashed: boolean): Promise<Uint8Array> {
+        const kh = `${dir}/known_hosts_${hashed ? "hashed" : "plain"}`;
+        const run = await new Deno.Command("ssh", {
+          args: ["-F", "/dev/null", "-i", `${dir}/clientkey`, "-p", String(port),
+                 "-o", "StrictHostKeyChecking=accept-new", "-o", `UserKnownHostsFile=${kh}`,
+                 "-o", `HashKnownHosts=${hashed ? "yes" : "no"}`,
+                 "-o", "BatchMode=yes", "127.0.0.1", "true"],
+        }).output();
+        if (!run.success) throw new Error(`ssh failed: ${text(run.stderr)}`);
+        return await Deno.readFile(kh);
+      }
+
+      const plainFile = await writeKnownHosts(false);
+      const hashedFile = await writeKnownHosts(true);
+      // Confirm each really is the form it claims, so a config change cannot quietly turn this
+      // into the same test twice.
+      if (text(plainFile).includes("|1|")) throw new Error("the plain file is hashed");
+      if (!text(hashedFile).includes("|1|")) {
+        throw new Error(`expected a hashed entry, got: ${text(hashedFile).slice(0, 120)}`);
+      }
+      // The plain form pins the `[host]:port` spelling that also gets hashed.
+      if (!text(plainFile).startsWith(`[127.0.0.1]:${port} ssh-ed25519 `)) {
+        throw new Error(`unexpected plain entry: ${text(plainFile).slice(0, 80)}`);
+      }
+
+      // The host key blob, as it appears in the exchange, taken from the .pub file.
+      const pubB64 = (await Deno.readTextFile(`${dir}/hostkey.pub`)).split(" ")[1];
+      const blob = Uint8Array.from(atob(pubB64), c => c.charCodeAt(0));
+      const type = bytes("ssh-ed25519");
+      const host = bytes("127.0.0.1");
+
+      const changed = new Uint8Array(blob);
+      changed[changed.length - 1] ^= 1;
+
+      for (const [what, file] of [["plain", plainFile], ["hashed", hashedFile]] as const) {
+        if (mod.sshKnownHost(file, host, port, type, blob) !== 1) {
+          throw new Error(`${what}: the entry ssh just wrote was not recognised as a match`);
+        }
+        // One byte different is the case the file exists to catch, and must not read as unknown.
+        if (mod.sshKnownHost(file, host, port, type, changed) !== 2) {
+          throw new Error(`${what}: a changed host key was not reported as a mismatch`);
+        }
+        // The same key on another port is a different entry — the port is part of the name, and
+        // for the hashed form that means it is inside the hash.
+        if (mod.sshKnownHost(file, host, port + 1, type, blob) !== 0) {
+          throw new Error(`${what}: a lookup on the wrong port matched`);
+        }
+        if (mod.sshKnownHost(file, bytes("example.com"), port, type, blob) !== 0) {
+          throw new Error(`${what}: a lookup for another host matched`);
+        }
+        // A different algorithm says nothing about this key — a host may have several.
+        if (mod.sshKnownHost(file, host, port, bytes("ssh-rsa"), blob) !== 0) {
+          throw new Error(`${what}: an entry for another algorithm was treated as authoritative`);
+        }
+      }
+    } finally {
+      if (sshd !== undefined) {
+        try { sshd.kill("SIGTERM"); } catch { /* already gone */ }
+        await sshd.status;
+      }
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test("known_hosts plain entries: patterns, negation, markers and comments", () => {
+  const type = bytes("ssh-ed25519");
+  const blob = Uint8Array.from({ length: 51 }, (_, i) => (i * 3) & 255);
+  const other = Uint8Array.from({ length: 51 }, (_, i) => (i * 5) & 255);
+  const b64 = btoa(String.fromCharCode(...blob));
+  const otherB64 = btoa(String.fromCharCode(...other));
+
+  const check = (file: string, host: string, port = 22, key = blob, kt = type) =>
+    mod.sshKnownHost(bytes(file), bytes(host), port, kt, key);
+
+  // Exact, comments and blank lines.
+  if (check(`# a comment\n\nexample.com ssh-ed25519 ${b64} me@here\n`, "example.com") !== 1) {
+    throw new Error("a plain entry with a trailing comment did not match");
+  }
+  // Several names on one line.
+  if (check(`a.example,b.example,c.example ssh-ed25519 ${b64}\n`, "b.example") !== 1) {
+    throw new Error("a middle name in a list did not match");
+  }
+  // Patterns.
+  if (check(`*.example ssh-ed25519 ${b64}\n`, "host.example") !== 1) throw new Error("* did not match");
+  if (check(`*.example ssh-ed25519 ${b64}\n`, "example") !== 0) throw new Error("* matched too much");
+  if (check(`h??t.example ssh-ed25519 ${b64}\n`, "host.example") !== 1) throw new Error("? did not match");
+  if (check(`h??t.example ssh-ed25519 ${b64}\n`, "hoost.example") !== 0) throw new Error("? matched two");
+  // A negation vetoes the whole entry even though the wildcard matches.
+  if (check(`*.example,!bad.example ssh-ed25519 ${b64}\n`, "bad.example") !== 0) {
+    throw new Error("a negation did not veto the entry");
+  }
+  if (check(`*.example,!bad.example ssh-ed25519 ${b64}\n`, "good.example") !== 1) {
+    throw new Error("a negation vetoed an unrelated host");
+  }
+  // Known host, different key.
+  if (check(`example.com ssh-ed25519 ${otherB64}\n`, "example.com") !== 2) {
+    throw new Error("a different key was not a mismatch");
+  }
+  // A second line with the right key still matches, even after a wrong one.
+  if (check(`example.com ssh-ed25519 ${otherB64}\nexample.com ssh-ed25519 ${b64}\n`, "example.com") !== 1) {
+    throw new Error("a matching line after a non-matching one did not win");
+  }
+  // @revoked outranks everything, wherever it appears.
+  if (check(`example.com ssh-ed25519 ${b64}\n@revoked example.com ssh-ed25519 ${b64}\n`, "example.com") !== 3) {
+    throw new Error("a revocation did not outrank a match");
+  }
+  // @cert-authority describes a CA, not this host key: it must not be compared as one.
+  if (check(`@cert-authority *.example ssh-ed25519 ${otherB64}\n`, "host.example") !== 0) {
+    throw new Error("a cert-authority line was treated as a host key");
+  }
+  // A non-default port uses the bracketed form.
+  if (check(`[example.com]:2222 ssh-ed25519 ${b64}\n`, "example.com", 2222) !== 1) {
+    throw new Error("the bracketed port form did not match");
+  }
+  if (check(`example.com ssh-ed25519 ${b64}\n`, "example.com", 2222) !== 0) {
+    throw new Error("a bare name matched a non-default port");
+  }
+  // Junk lines are ignored rather than fatal — a file may have entries we cannot read.
+  if (check(`garbage\nexample.com ssh-ed25519 !!!not base64!!!\nexample.com ssh-ed25519 ${b64}\n`, "example.com") !== 1) {
+    throw new Error("an unreadable line stopped a later valid one from matching");
+  }
+  if (check("", "example.com") !== 0) throw new Error("an empty file was not unknown");
 });

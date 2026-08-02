@@ -469,4 +469,72 @@ mAuth.sshSignedData(sessionId, bytes("user"), pubBlob);
 mAuth.sshPublicKeyRequest(sessionId, bytes("user"), pubBlob, new Uint8Array(32).fill(6));
 ignoringTraps(() => mAuth.sshPublicKeyRequest(sessionId, bytes("user"), pubBlob, new Uint8Array(31)));
 
+// ── known_hosts ───────────────────────────────────────────────────────────────
+
+const mKnown = run.mod as unknown as {
+  sshKnownHost(file: Uint8Array, host: Uint8Array, port: number, keyType: Uint8Array, keyBlob: Uint8Array): number;
+};
+
+const khBlob = Uint8Array.from({ length: 51 }, (_, i) => (i * 3) & 255);
+const khOther = Uint8Array.from({ length: 51 }, (_, i) => (i * 5) & 255);
+const khB64 = btoa(String.fromCharCode(...khBlob));
+const khType = bytes("ssh-ed25519");
+
+for (
+  const [file, host, port] of [
+    ["", "example.com", 22],
+    ["# just a comment\n", "example.com", 22],
+    ["\n\n", "example.com", 22],
+    ["   \n", "example.com", 22],                                   // whitespace only
+    [`example.com ssh-ed25519 ${khB64}\n`, "example.com", 22],
+    [`example.com ssh-ed25519 ${khB64}\r\n`, "example.com", 22],     // CR LF
+    [`example.com ssh-ed25519 ${khB64} a comment\n`, "example.com", 22],
+    [`a.example,b.example ssh-ed25519 ${khB64}\n`, "b.example", 22],
+    [`*.example ssh-ed25519 ${khB64}\n`, "host.example", 22],
+    [`*.example ssh-ed25519 ${khB64}\n`, "example", 22],
+    [`*.exa*ple ssh-ed25519 ${khB64}\n`, "host.example", 22],       // two stars
+    [`h??t.example ssh-ed25519 ${khB64}\n`, "host.example", 22],
+    [`h??t.example ssh-ed25519 ${khB64}\n`, "hoost.example", 22],
+    [`*.example,!bad.example ssh-ed25519 ${khB64}\n`, "bad.example", 22],
+    [`*.example,!bad.example ssh-ed25519 ${khB64}\n`, "ok.example", 22],
+    [`,,example.com,, ssh-ed25519 ${khB64}\n`, "example.com", 22],   // empty list entries
+    [`example.com ssh-rsa ${khB64}\n`, "example.com", 22],           // another algorithm
+    [`[example.com]:2222 ssh-ed25519 ${khB64}\n`, "example.com", 2222],
+    [`[example.com]:2222 ssh-ed25519 ${khB64}\n`, "example.com", 22],
+    [`example.com ssh-ed25519 ${khB64}\n`, "example.com", 65535],    // multi-digit port
+    [`@revoked example.com ssh-ed25519 ${khB64}\n`, "example.com", 22],
+    [`@cert-authority *.example ssh-ed25519 ${khB64}\n`, "host.example", 22],
+    [`@revoked\n`, "example.com", 22],                               // marker and nothing else
+    [`example.com ssh-ed25519 !!!\n`, "example.com", 22],            // unreadable base64
+    [`example.com\n`, "example.com", 22],                            // no key at all
+    [`example.com ssh-ed25519\n`, "example.com", 22],                // no blob
+    [`|1|bad ssh-ed25519 ${khB64}\n`, "example.com", 22],            // hashed, no second bar
+    [`|2|c2FsdA==|aGFzaA== ssh-ed25519 ${khB64}\n`, "example.com", 22],  // unknown revision
+    [`|1|!!!|!!! ssh-ed25519 ${khB64}\n`, "example.com", 22],        // hashed, unreadable base64
+    [`|1|c2FsdA==|aGFzaA== ssh-ed25519 ${khB64}\n`, "example.com", 22], // hashed, wrong hash
+    [`\texample.com ssh-ed25519 ${khB64}\n`, "example.com", 22],      // leading tab
+  ] as const
+) {
+  for (const key of [khBlob, khOther]) {
+    mKnown.sshKnownHost(bytes(file), bytes(host), port, khType, key);
+  }
+  mKnown.sshKnownHost(bytes(file), bytes(host), port, bytes("ssh-rsa"), khBlob);
+}
+
+// Port 0, which is not a real port but is what the digit loop's zero guard exists for.
+mKnown.sshKnownHost(bytes(`[example.com]:0 ssh-ed25519 ${khB64}\n`), bytes("example.com"), 0, khType, khBlob);
+
+// A marker and a key type that are the *same length* as the ones being compared but different.
+// Everything above differs in length and is rejected before the bytes are looked at, so without
+// these the byte-comparison loop never takes its mismatch branch — the third time this exact gap
+// has turned up in this package.
+mKnown.sshKnownHost(bytes(`@revoke1 example.com ssh-ed25519 ${khB64}\n`), bytes("example.com"), 22, khType, khBlob);
+mKnown.sshKnownHost(bytes(`example.com ssh-ed25518 ${khB64}\n`), bytes("example.com"), 22, khType, khBlob);
+
+// A match after a mismatch, and a revocation after a match: the whole file is read either way.
+mKnown.sshKnownHost(bytes(`example.com ssh-ed25519 ${btoa(String.fromCharCode(...khOther))}\n` +
+                          `example.com ssh-ed25519 ${khB64}\n`), bytes("example.com"), 22, khType, khBlob);
+mKnown.sshKnownHost(bytes(`example.com ssh-ed25519 ${khB64}\n@revoked example.com ssh-ed25519 ${khB64}\n`),
+                    bytes("example.com"), 22, khType, khBlob);
+
 report([run], "packages/ssh/", { verbose });

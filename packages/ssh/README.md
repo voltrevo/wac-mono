@@ -2,8 +2,8 @@
 
 An SSH-2 client, in wac. **It logs in.** Version exchange, the binary packet protocol, algorithm
 negotiation, curve25519-sha256 key exchange, `ssh-ed25519` host key verification, the
-`chacha20-poly1305@openssh.com` AEAD, reading an OpenSSH private key — encrypted or not — and
-publickey authentication. No channels yet, so it cannot run anything.
+`chacha20-poly1305@openssh.com` AEAD, `known_hosts`, reading an OpenSSH private key — encrypted
+or not — and publickey authentication. No channels yet, so it cannot run anything.
 
 > **Not for production**, for the same reason [crypto](../crypto/README.md) is not: it is built on
 > primitives that are known to leak timing, and nothing here has been reviewed by anyone.
@@ -149,6 +149,29 @@ and replay to a third party as the client. The session id is length-prefixed as 
 though nothing follows that could be confused with it — omitting that length produces a signature
 the server rejects, indistinguishable from the key being wrong.
 
+**`knownhosts.wac`** — deciding whether the host key we verified is the one we *expected*. The
+key exchange proves the peer holds the private half of the key it presented; it says nothing about
+which peer that is. Without this, a man-in-the-middle presenting its own host key produces a
+perfectly valid exchange and the client proceeds.
+
+That is worth stating precisely, because the damage is bounded but real: a publickey signature
+binds to the session id, hence the exchange hash, hence the host key the attacker presented, so
+the attacker **cannot** replay our signature to the real server. They do get the session, and
+everything sent afterwards.
+
+Entries come in two forms and they are parsed by completely different code. Hashing is the default
+— `HashKnownHosts yes` — so a real entry is `|1|salt|HMAC-SHA-1(salt, name)`, and a client that
+cannot compute that cannot read the file its user already has. (That is why `crypto` gained
+`hmacSha1`; SHA-1's collision weakness is irrelevant here, since the hostname is the message and
+the per-entry salt is the key.) A non-default port makes the name `[host]:port`, which is what gets
+hashed — get that spelling wrong and every lookup silently reports "unknown".
+
+This reports what the file says and decides nothing. Whether an unknown host should be accepted
+and remembered, refused, or put to the user is policy and belongs where the user is. The
+distinction that matters is **unknown versus changed**: unknown is every first connection, while a
+known host presenting a different key is the case the file exists to catch, and must never be
+quietly folded into the first.
+
 ## What is missing
 
 In the order it is needed:
@@ -156,10 +179,11 @@ In the order it is needed:
 1. **The connection protocol** — channels, window adjustment, `exec`. That is what turns a
    logged-in connection into one that can run a command.
 
-Also absent, and worth naming rather than leaving implied: `known_hosts` is not consulted, so the
-host key is verified as *self-consistent* but not as *expected* — the interop test compares it
-against the file it generated, which a real client cannot do. Rekeying is not implemented. Neither
-is any authentication method other than publickey with Ed25519.
+Also absent, and worth naming rather than leaving implied: rekeying is not implemented, so a
+long-lived or high-volume connection would run past the point where it is required. There is no
+authentication method other than publickey with Ed25519 — no password, no keyboard-interactive, no
+agent. Host certificates (`@cert-authority` lines) are recognised well enough to be skipped rather
+than misread, but not validated.
 
 `known_hosts` is a byte comparison against the host key blob, so there is no X.509 and no chain
 building — which is the main reason this is a smaller job than the TLS client already in the repo.

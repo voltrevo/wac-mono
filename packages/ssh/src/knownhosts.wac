@@ -1,0 +1,266 @@
+// `known_hosts` — deciding whether the host key we just verified is the one we expected.
+//
+// The key exchange proves the peer holds the private half of the key it presented. It says
+// nothing about *which* peer that is. Without this file a man-in-the-middle presenting its own
+// host key produces a perfectly valid exchange, and the client proceeds.
+//
+// What that costs is worth being precise about, because it is not total: a publickey signature
+// binds to the session id, which binds to the exchange hash, which binds to the host key the
+// attacker presented — so the attacker cannot replay our signature to the real server. They do
+// get the session, and everything sent afterwards. With a password they would get the password.
+//
+// ## The file
+//
+// One entry per line, `#` starting a comment:
+//
+//   [marker] hostnames keytype base64-blob [comment]
+//
+// `hostnames` is comma-separated and may be:
+//
+//   - plain names, possibly with `*` and `?` patterns and `!` negations;
+//   - `[host]:port` when the port is not 22;
+//   - or a *hashed* form, `|1|salt|hash`, where hash is HMAC-SHA-1 of the name under the salt.
+//
+// Hashing is the default — `HashKnownHosts yes` — so a client that cannot compute HMAC-SHA-1
+// cannot read the file its user already has. The hash covers one name, so a hashed line matches
+// exactly one host and never a pattern.
+//
+// ## What this does not decide
+//
+// It reports what the file says and nothing more. Whether an unknown host should be accepted and
+// remembered, refused, or put to the user is policy, and belongs where the user is.
+//
+// The distinction that matters is **unknown versus changed**. An unknown host is ordinary — it is
+// every first connection. A host that is known and presents a *different* key is the case the
+// file exists to catch, and it must never be quietly treated as unknown.
+
+import { decode } from "../../codec/src/base64.wac";
+import { hmacSha1 } from "../../crypto/src/hmac.wac";
+
+export enum Verdict {
+  /** No entry for this host. A first connection looks exactly like this. */
+  Unknown,
+  /** An entry for this host names exactly this key. */
+  Match,
+  /** This host is known and its key is different. Refuse; do not treat as unknown. */
+  Mismatch,
+  /** An entry marked `@revoked` names this key. Refuse even if another line matches. */
+  Revoked,
+}
+
+/**
+ * Look `host` up in the contents of a `known_hosts` file.
+ *
+ * `host` is the name as the user typed it; `port` is 22 for the default. `keyType` is the
+ * algorithm name (`ssh-ed25519`) and `keyBlob` the wire-format public key from the exchange.
+ *
+ * A revocation anywhere in the file wins over any match, so the whole file is read rather than
+ * stopping at the first hit.
+ */
+export Verdict lookUp(u8[] file, u8[] host, i32 port, u8[] keyType, u8[] keyBlob) {
+  bool sawHost = false;
+  bool matched = false;
+
+  i32 at = 0;
+  while (at < file.len()) {
+    i32 stop = at;
+    while (stop < file.len() && file[stop] != 10) { stop++; }
+    i32 lineEnd = stop;
+    if (lineEnd > at && file[lineEnd - 1] == 13) { lineEnd--; }
+
+    Verdict v = checkLine(file, at, lineEnd, host, port, keyType, keyBlob);
+    match (v) {
+      // A revocation is final and outranks anything else in the file.
+      case Revoked: return Verdict.Revoked;
+      case Match: { matched = true; sawHost = true; }
+      case Mismatch: { sawHost = true; }
+      else: {}
+    }
+    at = stop + 1;
+  }
+
+  if (matched) { return Verdict.Match; }
+  return sawHost ? Verdict.Mismatch : Verdict.Unknown;
+}
+
+/** Whether one line concerns this host, and if so whether its key agrees. */
+Verdict checkLine(u8[] file, i32 at, i32 end, u8[] host, i32 port, u8[] keyType, u8[] keyBlob) {
+  i32 p = skipSpace(file, at, end);
+  if (p >= end || file[p] == 0x23) { return Verdict.Unknown; }        // blank or '#'
+
+  bool revoked = false;
+  // A marker is a field starting '@'. `@cert-authority` lines describe a CA rather than a host
+  // key, and are skipped rather than compared — treating one as a host key would refuse a host
+  // whose key is perfectly good.
+  if (file[p] == 0x40) {
+    i32 mEnd = fieldEnd(file, p, end);
+    const u8[] REVOKED = u8[](0x40, 0x72, 0x65, 0x76, 0x6f, 0x6b, 0x65, 0x64);    // "@revoked"
+    revoked = region(file, p, mEnd, REVOKED);
+    if (!revoked) { return Verdict.Unknown; }                          // @cert-authority, etc.
+    p = skipSpace(file, mEnd, end);
+  }
+
+  i32 namesEnd = fieldEnd(file, p, end);
+  bool concerns = hostMatches(file, p, namesEnd, host, port);
+  if (!concerns) { return Verdict.Unknown; }
+
+  i32 typeStart = skipSpace(file, namesEnd, end);
+  i32 typeEnd = fieldEnd(file, typeStart, end);
+  if (!region(file, typeStart, typeEnd, keyType)) {
+    // A line for this host naming a *different algorithm* says nothing about this key: a host may
+    // legitimately have an Ed25519 key and an RSA key. Reporting a mismatch here would refuse
+    // every host whose file lists more than one.
+    return Verdict.Unknown;
+  }
+
+  i32 blobStart = skipSpace(file, typeEnd, end);
+  i32 blobEnd = fieldEnd(file, blobStart, end);
+  u8[] b64 = u8[blobEnd - blobStart]();
+  b64.copyFrom(file, blobStart, 0, blobEnd - blobStart);
+  u8[]? blob = decode(b64);
+  if (blob is null) { return Verdict.Unknown; }                        // an unreadable line
+
+  if (!sameBytes(blob!, keyBlob)) { return Verdict.Mismatch; }
+  return revoked ? Verdict.Revoked : Verdict.Match;
+}
+
+/**
+ * Whether the hostname field covers `host`.
+ *
+ * Plain patterns, negations and the hashed form all live in the same comma-separated field. A
+ * negation that matches vetoes the whole entry, which is why the loop cannot return early on a
+ * positive.
+ */
+bool hostMatches(u8[] file, i32 at, i32 end, u8[] host, i32 port) {
+  u8[] wanted = hostForm(host, port);
+  bool any = false;
+  i32 p = at;
+  while (p <= end) {
+    i32 stop = p;
+    while (stop < end && file[stop] != 0x2c) { stop++; }               // ','
+    if (stop > p) {
+      bool negated = file[p] == 0x21;                                  // '!'
+      i32 s = negated ? p + 1 : p;
+      bool hit = (stop - s >= 3 && file[s] == 0x7c)                    // '|' — a hashed entry
+        ? hashedMatches(file, s, stop, wanted)
+        : globMatches(file, s, stop, wanted);
+      if (hit && negated) { return false; }                            // an explicit veto
+      if (hit) { any = true; }
+    }
+    if (stop >= end) { break; }
+    p = stop + 1;
+  }
+  return any;
+}
+
+/**
+ * The name as it appears in the file: bare for port 22, `[host]:port` otherwise.
+ *
+ * The bracketed form is not cosmetic — it is what is hashed, so getting it wrong makes every
+ * non-default-port lookup silently miss and report the host as unknown.
+ */
+u8[] hostForm(u8[] host, i32 port) {
+  if (port == 22) { return host; }
+  u8[] digits = decimal(port);
+  u8[] out = u8[host.len() + digits.len() + 3]();
+  out[0] = 0x5b;                                                       // '['
+  out.copyFrom(host, 0, 1, host.len());
+  out[1 + host.len()] = 0x5d;                                          // ']'
+  out[2 + host.len()] = 0x3a;                                          // ':'
+  out.copyFrom(digits, 0, 3 + host.len(), digits.len());
+  return out;
+}
+
+u8[] decimal(i32 v) {
+  if (v == 0) { return u8[](0x30); }
+  u8[] tmp = u8[10]();
+  i32 n = 0;
+  i32 x = v;
+  while (x > 0) {
+    tmp[n] = 0x30 + (x % 10);
+    x = x / 10;
+    n++;
+  }
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = tmp[n - 1 - i]; }
+  return out;
+}
+
+/** `|1|<base64 salt>|<base64 HMAC-SHA-1(salt, name)>`. */
+bool hashedMatches(u8[] file, i32 at, i32 end, u8[] wanted) {
+  // Exactly "|1|" — no other revision is defined, and guessing at one would compare nonsense.
+  if (end - at < 3 || file[at] != 0x7c || file[at + 1] != 0x31 || file[at + 2] != 0x7c) {
+    return false;
+  }
+  i32 saltStart = at + 3;
+  i32 saltEnd = saltStart;
+  while (saltEnd < end && file[saltEnd] != 0x7c) { saltEnd++; }
+  if (saltEnd >= end) { return false; }
+
+  u8[] saltB64 = u8[saltEnd - saltStart]();
+  saltB64.copyFrom(file, saltStart, 0, saltEnd - saltStart);
+  u8[] hashB64 = u8[end - saltEnd - 1]();
+  hashB64.copyFrom(file, saltEnd + 1, 0, end - saltEnd - 1);
+
+  u8[]? salt = decode(saltB64);
+  u8[]? want = decode(hashB64);
+  if ((salt is null) || (want is null)) { return false; }
+
+  // The salt is the HMAC *key* and the hostname the message, which is the way round that lets one
+  // file hold many entries without any of them revealing a name.
+  return sameBytes(hmacSha1(salt!, wanted), want!);
+}
+
+/** Shell-style matching: `*` any run, `?` one character. Case-sensitive, as OpenSSH is here. */
+bool globMatches(u8[] file, i32 at, i32 end, u8[] host) {
+  return globFrom(file, at, end, host, 0);
+}
+
+bool globFrom(u8[] pat, i32 p, i32 pEnd, u8[] host, i32 h) {
+  i32 i = p;
+  i32 j = h;
+  while (i < pEnd) {
+    i32 c = pat[i];
+    if (c == 0x2a) {                                                   // '*'
+      // Try every split. The pattern after a star is short and hosts are short, so the naive
+      // backtrack is fine and the alternative is a state machine nobody will read.
+      for (i32 k = j; k <= host.len(); k++) {
+        if (globFrom(pat, i + 1, pEnd, host, k)) { return true; }
+      }
+      return false;
+    }
+    if (j >= host.len()) { return false; }
+    if (c != 0x3f && c != host[j]) { return false; }                   // '?' matches anything
+    i++;
+    j++;
+  }
+  return j == host.len();
+}
+
+i32 skipSpace(u8[] src, i32 at, i32 end) {
+  i32 p = at;
+  while (p < end && (src[p] == 32 || src[p] == 9)) { p++; }
+  return p;
+}
+
+i32 fieldEnd(u8[] src, i32 at, i32 end) {
+  i32 p = at;
+  while (p < end && src[p] != 32 && src[p] != 9) { p++; }
+  return p;
+}
+
+bool region(u8[] src, i32 at, i32 end, const u8[] want) {
+  if (end - at != want.len()) { return false; }
+  for (i32 i = 0; i < want.len(); i++) {
+    if (src[at + i] != want[i]) { return false; }
+  }
+  return true;
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
