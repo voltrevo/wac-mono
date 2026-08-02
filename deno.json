@@ -9,6 +9,7 @@
     "bench:json": "deno run -A packages/json/bench/throughput.ts",
     "bench:json-lookup": "deno run -A packages/json/bench/lookup.ts",
     "coverage": "deno run -A tools/coverage.ts",
+    "size": "deno run -A tools/size.ts",
     "coverage:bignum": "deno run -A packages/bignum/cov.ts",
     "coverage:bytes": "deno run -A packages/bytes/cov.ts",
     "coverage:codec": "deno run -A packages/codec/cov.ts",
