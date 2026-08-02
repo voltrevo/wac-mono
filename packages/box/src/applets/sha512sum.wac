@@ -1,15 +1,26 @@
 // The digest, then two spaces and the name — `-` for standard input, as the real one does.
+//
+// Streams, like `sha256sum`. With this there is nothing left in `box` that buffers for
+// want of an API; what still buffers does so because the job needs the whole input.
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, readInput } from "../lib/input.wac";
+import { Input, openStream } from "../lib/input.wac";
 import { encode as hexencode } from "../../../codec/src/hex.wac";
-import { sha512 } from "../../../crypto/src/sha512.wac";
+import { Sha512 } from "../../../crypto/src/sha512.wac";
 
 export i32 sha512sum(Core core, Cli cli, Args a) {
-  Input in = readInput(core, cli, a, 0);
+  Input in = openStream(core, cli, a, 0);
   if (!in.ok) { return 1; }
+
+  Sha512 h = Sha512.create();
+  while (true) {
+    u8[] chunk = cli.readChunk();
+    if (chunk.len() == 0) { break; }
+    h.update(chunk);
+  }
+
   string name = in.label == "" ? "-" : in.label;
-  core.log(string.fromBytes(hexencode(sha512(in.bytes))) + "  " + name);
+  core.log(string.fromBytes(hexencode(h.digest(64))) + "  " + name);
   return 0;
 }
