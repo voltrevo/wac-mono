@@ -16,11 +16,19 @@
 // unparking on a `SharedArrayBuffer`, which is nothing per file read and ruinous per byte.
 // `readFile`, never `readByte`.
 
-/** A file that may not have been there. `bytes` is empty when `ok` is false. */
+/**
+ * A file that may not have been there. `bytes` is empty when `ok` is false.
+ *
+ * The static exists so the *host* can build one. A struct has no constructor JavaScript
+ * can reach, and without this every application had to re-export a maker of its own —
+ * ceremony that had nothing to do with counting words.
+ */
 export struct FileResult {
   bool ok;
   u8[] bytes;
   string error;
+
+  FileResult of(bool ok, u8[] bytes, string error) { return FileResult(ok, bytes, error); }
 }
 
 /**

@@ -41,16 +41,15 @@ outside, so an application can only touch what it is handed. The two structs in
 program can do**:
 
 ```wac
-export struct App {
-  Core core;
-  Cli cli;
-  App start(Core core, Cli cli) { return App(core, cli); }
-  i32 run(this) { … }
-}
+export i32 main(Core core, Cli cli) { … }
 ```
 
-Reading `start`'s parameters tells you the application reads the clock, prints, and
-touches the filesystem. Nothing else is reachable, because there is nowhere else to reach.
+Reading `main`'s parameters tells you the application reads the clock, prints, and touches
+the filesystem. Nothing else is reachable, because there is nowhere else to reach.
+
+It was a struct with `start` and `run` at first. That bought nothing: a program that runs
+once and exits has no state to keep between calls, so the struct was ceremony around a
+function. A *service*, called repeatedly, will want one — and can have it then.
 
 `Core` is what every host provides — clock, monotonic clock, secure random, output. `Cli`
 is arguments, environment and files, which a browser has none of; that split is why it is
@@ -98,15 +97,8 @@ example/wc.wac      an application, entire
 
 ## Writing one
 
-Export an `App` struct with `start(Core, Cli)` and `run(this) -> i32`. Return an exit code.
-To use `readFile`, also export `fileResult` — a struct has no constructor JavaScript can
-reach, so building one is wac's job:
-
-```wac
-export FileResult fileResult(bool ok, u8[] bytes, string error) {
-  return FileResult(ok, bytes, error);
-}
-```
+Export `main(Core, Cli) -> i32` and return an exit code. That is the whole contract —
+nothing to re-export, nothing to register.
 
 Testing needs no worker and no files: build `Core` and `Cli` from wac closures returning
 fixtures, call `run`, and assert on what the fake `log` collected. The capability record

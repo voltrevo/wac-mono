@@ -42,9 +42,12 @@ export function coreOf(b: Bridge, cls: { Core: PlatformClasses["Core"] }): unkno
  */
 export function cliOf(
   b: Bridge,
-  cls: { Cli: PlatformClasses["Cli"]; FileResult: new (ref: unknown) => unknown },
-  mk: { fileResult(ok: boolean, bytes: Uint8Array, error: string): unknown },
+  cls: { Cli: PlatformClasses["Cli"]; FileResult: { of(...a: unknown[]): unknown } },
 ): unknown {
+  const mk = {
+    fileResult: (ok: boolean, bytes: Uint8Array, error: string) =>
+      cls.FileResult.of(ok, bytes, error),
+  };
   return cls.Cli.of(
     () => readI32le(hostCall(b, OP.ARG_COUNT, new Uint8Array(0))),
     (i: number) => unstr(hostCall(b, OP.ARG, i32le(i))),

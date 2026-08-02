@@ -35,25 +35,13 @@ try {
   const cls = mod as unknown as {
     Core: { of(...a: unknown[]): unknown };
     Cli: { of(...a: unknown[]): unknown };
-    FileResult: new (ref: unknown) => unknown;
-    fileResult?: (ok: boolean, bytes: Uint8Array, error: string) => unknown;
-    App: { start(...a: unknown[]): { run(): number } };
+    FileResult: { of(...a: unknown[]): unknown };
+    main: (core: unknown, cli: unknown) => number;
   };
-
-  // The application's own constructor for a FileResult, exported from its wac. A struct
-  // has no constructor JavaScript can reach, so building one is wac's job.
-  const mk = {
-    fileResult: (ok: boolean, bytes: Uint8Array, error: string) => {
-      if (typeof cls.fileResult !== "function") {
-        throw new Error("the application must export `fileResult` to use readFile");
-      }
-      return cls.fileResult(ok, bytes, error);
-    },
-  };
-
-  const core = coreOf(b, cls);
-  const app = cls.App.start(core, cliOf(b, cls, mk));
-  worker.postMessage({ ok: true, code: app.run() });
+  if (typeof cls.main !== "function") {
+    throw new Error("an application must export `main(Core, Cli) -> i32`");
+  }
+  worker.postMessage({ ok: true, code: cls.main(coreOf(b, cls), cliOf(b, cls)) });
 } catch (e) {
   worker.postMessage({ ok: false, error: e instanceof Error ? e.message : String(e) });
 }
