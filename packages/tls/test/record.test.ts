@@ -197,3 +197,48 @@ Deno.test("record: refuses plaintext beyond the 16384-byte limit", () => {
     throw new Error("sealed under an unknown cipher suite");
   }
 });
+
+// ── The alert registry ────────────────────────────────────────────────────────
+
+Deno.test("record: the alert codes are the ones RFC 8446 assigns", () => {
+  // Every one of these accessors could return zero with the whole suite green. They are
+  // not dead — each is used at the point some failure is reported — but no test asserts
+  // *which* alert a rejection produces, only that it was rejected, so the numbers were
+  // unconstrained. An alert is the only thing the other end learns about why you hung up,
+  // and `bad_record_mac` where `unknown_ca` was meant sends a debugging session in
+  // precisely the wrong direction.
+  //
+  // Checked against §6.2's registry, written out here as the independent copy. That the
+  // two agree is the point; if this file were generated from the source it would assert
+  // nothing.
+  const want = [
+    ["close_notify", 0], ["unexpected_message", 10], ["bad_record_mac", 20],
+    ["handshake_failure", 40], ["bad_certificate", 42], ["unsupported_certificate", 43],
+    ["certificate_expired", 45], ["illegal_parameter", 47], ["unknown_ca", 48],
+    ["decode_error", 50], ["decrypt_error", 51], ["protocol_version", 70],
+    ["missing_extension", 109], ["no_application_protocol", 120],
+  ] as const;
+  const got = (mod.alertCodes as () => Uint8Array)();
+  if (got.length !== want.length) throw new Error(`expected ${want.length} codes, got ${got.length}`);
+  want.forEach(([name, code], i) => {
+    if (got[i] !== code) throw new Error(`${name} is ${got[i]}, RFC 8446 says ${code}`);
+  });
+  // No two alerts may share a number, which a copy-paste slip would produce and the
+  // per-value check above would miss if it slipped in both places.
+  if (new Set(got).size !== got.length) throw new Error("two alerts share a code");
+});
+
+Deno.test("record: only close_notify is a warning", () => {
+  // TLS 1.3 treats everything except close_notify and user_canceled as fatal whatever the
+  // level byte says, so this is very nearly decorative — but it is sent, and claiming a
+  // fatal condition is a warning is a lie a peer may act on by carrying on.
+  const encode = mod.alertEncode as (d: number) => Uint8Array;
+  const codes = (mod.alertCodes as () => Uint8Array)();
+  for (const c of codes) {
+    const body = encode(c);
+    if (body.length !== 2) throw new Error(`alert ${c} encoded to ${body.length} bytes`);
+    if (body[1] !== c) throw new Error(`alert ${c} encoded its description as ${body[1]}`);
+    const wantLevel = c === 0 ? 1 : 2;
+    if (body[0] !== wantLevel) throw new Error(`alert ${c} has level ${body[0]}, want ${wantLevel}`);
+  }
+});

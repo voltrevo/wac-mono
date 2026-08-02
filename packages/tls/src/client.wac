@@ -42,6 +42,10 @@ import {
 import {
   certificateVerifyContent, finished, handshakeMessage, messageBody, messageLength,
   messageType,
+  hsClientHello, hsServerHello, hsEncryptedExtensions, hsCertificate,
+  hsCertificateVerify, hsFinished, extServerName, extSupportedGroups,
+  extSignatureAlgorithms, extSupportedVersions, extKeyShare, groupX25519, groupP256,
+  groupHybrid, sigEd25519,
 } from "./handshake.wac";
 import { parseCert, verifyChain, verifyPath, certVerifySignature, Cert } from "./x509.wac";
 import { Reader, Writer } from "./wire.wac";
@@ -63,7 +67,7 @@ struct CConn {
   u8[] kemSeed;
   /** The hybrid offer and its decapsulation key, held until the ServerHello. */
   u8[] hybridState;
-  /** The group the server chose: 0x001d or 0x0017. */
+  /** The group the server chose: groupX25519() or groupP256(). */
   i32 group;
   u8[] clientRandom;
   u8[] host;
@@ -201,7 +205,7 @@ u8[] clientHello(CConn c) {
   Writer exts = Writer.create();
   // server_name
   if (c.host.len() > 0) {
-    exts.u16(0);
+    exts.u16(extServerName());
     Writer sniList = Writer.create();
     sniList.u8(0);
     sniList.vec16(c.host);
@@ -211,12 +215,12 @@ u8[] clientHello(CConn c) {
   }
   // supported_groups: x25519 first, then secp256r1. Order is a preference and servers
   // generally honour it, which is why the faster curve goes first.
-  exts.u16(10);
+  exts.u16(extSupportedGroups());
   Writer groups = Writer.create();
   Writer groupList = Writer.create();
   groupList.u16(groupX25519MlKem768());          // X25519MLKEM768, first because it is preferred
-  groupList.u16(0x001d);          // x25519
-  groupList.u16(0x0017);          // secp256r1
+  groupList.u16(groupX25519());          // x25519
+  groupList.u16(groupP256());          // secp256r1
   groups.vec16(groupList.take());
   exts.vec16(groups.take());
   // signature_algorithms. This list is a claim about what we can check, so everything
@@ -227,10 +231,10 @@ u8[] clientHello(CConn c) {
   // The pkcs1 entries are here because RFC 8446 §4.4.2.2 lets *certificates* be signed
   // that way — which is how almost every certificate on the web is signed — while §4.4.3
   // forbids it for CertificateVerify itself.
-  exts.u16(13);
+  exts.u16(extSignatureAlgorithms());
   Writer sigs = Writer.create();
   Writer sigList = Writer.create();
-  sigList.u16(0x0807);            // ed25519
+  sigList.u16(sigEd25519());            // ed25519
   sigList.u16(0x0403);            // ecdsa_secp256r1_sha256
   sigList.u16(0x0503);            // ecdsa_secp384r1_sha384
   sigList.u16(0x0804);            // rsa_pss_rsae_sha256
@@ -241,7 +245,7 @@ u8[] clientHello(CConn c) {
   sigs.vec16(sigList.take());
   exts.vec16(sigs.take());
   // supported_versions
-  exts.u16(43);
+  exts.u16(extSupportedVersions());
   Writer vers = Writer.create();
   Writer verList = Writer.create();
   verList.u16(0x0304);
@@ -251,7 +255,7 @@ u8[] clientHello(CConn c) {
   // HelloRetryRequest — which this client cannot answer. Two shares cost about a hundred
   // extra bytes in the hello and save a whole extra round trip when the server prefers
   // P-256, which some do.
-  exts.u16(51);
+  exts.u16(extKeyShare());
   Writer ks = Writer.create();
   Writer share = Writer.create();
   // The hybrid share is 1216 bytes on its own, which makes this hello span two records
@@ -261,15 +265,15 @@ u8[] clientHello(CConn c) {
   for (i32 i = 0; i < hybridClientShareLen(); i++) { hybridShare[i] = c.hybridState[i]; }
   share.u16(groupX25519MlKem768());
   share.vec16(hybridShare);
-  share.u16(0x001d);
+  share.u16(groupX25519());
   share.vec16(x25519Base(c.ephemeralPriv));
-  share.u16(0x0017);
+  share.u16(groupP256());
   share.vec16(p256PublicKey(c.p256Priv));
   ks.vec16(share.take());
   exts.vec16(ks.take());
 
   body.vec16(exts.take());
-  return handshakeMessage(1, body.take());
+  return handshakeMessage(hsClientHello(), body.take());
 }
 
 /**
@@ -299,11 +303,11 @@ u8[] serverShare(u8[] shBody) {
           share = u8[1122]();
           share[0] = 0x11; share[1] = 0xEC;
           for (i32 i = 0; i < hybridServerShareLen(); i++) { share[2 + i] = key[i]; }
-        } else if (g == 0x001d && key.len() == 32) {
+        } else if (g == groupX25519() && key.len() == 32) {
           share = u8[34]();
           share[0] = 0x00; share[1] = 0x1d;
           for (i32 i = 0; i < 32; i++) { share[2 + i] = key[i]; }
-        } else if (g == 0x0017 && key.len() == 65) {
+        } else if (g == groupP256() && key.len() == 65) {
           share = u8[67]();
           share[0] = 0x00; share[1] = 0x17;
           for (i32 i = 0; i < 65; i++) { share[2 + i] = key[i]; }
@@ -432,7 +436,7 @@ export u8[] tlsClientFeed(u8[] state, u8[] input) {
         // 64 bytes rather than 32, and the key schedule takes it unchanged: it is the
         // IKM of an HKDF extract, which has no opinion about length.
         shared = hybridClientFinish(c.hybridState, peerKey, c.ephemeralPriv);
-      } else if (group == 0x001d) {
+      } else if (group == groupX25519()) {
         shared = x25519(c.ephemeralPriv, peerKey);
       } else {
         // p256Ecdh validates the peer's point, which is the defence against an

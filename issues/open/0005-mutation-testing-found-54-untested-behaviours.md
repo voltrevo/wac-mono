@@ -232,3 +232,67 @@ Three mutants do not compile and are excluded rather than counted: `guard/tls/re
 I agree with the unmutated-baseline guard, and would add a second: refuse an
 `--operators` run that generates no control mutants, since the controls are the only
 thing standing between a broken harness and a perfect score.
+
+## 2026-08-02, later — crypto is finished; what is left elsewhere
+
+**crypto: 244/255, no undocumented survivors.** `deno task mutate --operators --package
+crypto` exits 0. Eleven survivors remain and each carries a written argument in
+`tools/mutate/known.ts`; the distinction they all turn on is that the rejection still
+happens by another route, rather than not happening. That is the state worth reaching,
+because from here a twelfth survivor is visible instead of being lost in a crowd.
+
+Getting there found three defects rather than three test gaps:
+
+- **ed25519's x = 0 rejection did nothing.** RFC 8032 §5.1.3 requires refusing an encoding
+  that claims x is odd while y forces x to zero. The check existed inside `recoverX`,
+  which signals failure by returning zero — and `ptDecode`, knowing that zero is
+  ambiguous, rebuilt the point and re-validated it against the curve equation. (0, 1) is
+  on the curve, so the rejection was recovered from and discarded and the identity had two
+  accepted encodings. Fixed by moving it where returning null rejects.
+- **The coordinate range check is load-bearing**, not redundant with the curve equation.
+  Without it x + p is accepted, because the arithmetic reduces and `onCurve` then passes
+  the reduced value. It looked unreachable — a random coordinate is out of range once in
+  2^32 — until you notice nobody has to use a random one: x = 5 is on P-256 and x = 2 on
+  P-384, and x + p fits the encoding in both cases.
+- **Every length guard had an untested half.** They are all `!= expected` and every test
+  fed something too short, which traps on a read past the end whether the guard is there
+  or not. Too long had nothing behind it: a 33-byte Ed25519 seed produced the same key as
+  its 32-byte prefix.
+
+### The numbers for the other packages are still unverified
+
+wacc 20, fmt 4, std 3, json 3, url 2, recorded at the top of this issue, were all measured
+before `fde1ccf` — the same permissions bug that made crypto look like 255/255 when it was
+223/255. None has been re-run. They should be treated as unknown rather than as small.
+
+A full `deno task mutate --operators` now has the baseline guard in front of it, so the
+next measurement is the first trustworthy one. That is the obvious next step and it is one
+command.
+
+### The harness guards
+
+`deno task mutate` now runs the suite unmutated before mutating anything, per scope, and
+excludes the mutants in a red scope rather than abandoning the run. That closes the
+failure mode this issue kept tripping over.
+
+The second guard suggested — refusing an `--operators` run that generates no control
+mutants — was not built, and is mostly moot now: the baseline check covers the same ground
+more directly, since a broken harness fails unmutated. Worth knowing that there is exactly
+**one** control mutant in the repo, `control/comment-only-noop` in
+`packages/gzip/src/crc32.wac`, so any run scoped elsewhere still has no control.
+
+### tls: what is left
+
+The clusters that were dead constants are fixed — asn1's fifteen tag accessors, x509's
+eleven key/sig accessors, hybrid's four, handshake's fifteen — and `deno task dead`
+(issue 0009) now catches that shape in a second rather than in a sweep.
+
+Since then: `hybrid.wac` and `wire.wac` both got their first direct tests, having been
+reached only through whole handshakes before, and record's alert codes are pinned against
+RFC 8446 §6.2.
+
+One specific gap named and not closed: **nothing asserts which alert a given rejection
+produces.** The tests check the client's internal failure code, not the alert byte the
+peer is sent, so `unknown_ca` where `bad_certificate` was meant would go unnoticed. The
+values are now pinned; which one each path emits is not. Closing it needs the client's
+output decrypted and parsed, which is the better test and a larger one.
