@@ -1,0 +1,37 @@
+// The Tor protocol layers and the crypto they need, without TLS.
+import { encodeFixed, cellSize, cellCommand, cellPayload, encodeVersions, negotiateVersion,
+         encodeNetinfo, encodeCreate2, decodeCreated2, encodePadding } from "../src/cell.wac";
+import { ntorClientRequest, ntorClientFinish } from "../src/ntor.wac";
+import { hopInit, hopSend, hopRecv, hopPeel, hopWrap, hopCheck, hopDigest, beginBody,
+         extend2Body, extended2Reply, sendmeBodyV1 } from "../src/relay.wac";
+import { signedDigest, keyFingerprint, verifyDocumentSignature } from "../src/consensus.wac";
+import { weightedBandwidths, choose, portPermitted } from "../src/pathsel.wac";
+export u8[] a(i32 c, i32 k, u8[] p) { return encodeFixed(c, k, p); }
+export i32 b(u8[] x, i32 y) { return cellSize(x, y); }
+export i32 b2(u8[] x, i32 y) { return cellCommand(x, y); }
+export u8[] b3(u8[] x, i32 y) { return cellPayload(x, y); }
+export u8[] b4(i32[] v) { return encodeVersions(v); }
+export i32 b5(u8[] t, i32[] o) { return negotiateVersion(t, o); }
+export u8[] b6(u8[] i) { return encodeNetinfo(i); }
+export u8[] b7(i32 c, i32 h, u8[] d) { return encodeCreate2(c, h, d); }
+export u8[] b8(u8[] p) { return decodeCreated2(p); }
+export u8[] b9() { return encodePadding(); }
+export u8[] c1(u8[] i, u8[] o, u8[] p) { return ntorClientRequest(i, o, p); }
+export u8[] c2(u8[] i, u8[] o, u8[] p, u8[] r, i32 n) { return ntorClientFinish(i, o, p, r, n); }
+export u8[] d1(u8[] m) { return hopInit(m); }
+export u8[] d2(u8[] s, i32 c, i32 i, u8[] x) { return hopSend(s, c, i, x); }
+export u8[] d3(u8[] s, u8[] p) { return hopRecv(s, p); }
+export u8[] d4(u8[] s, u8[] p) { return hopPeel(s, p); }
+export u8[] d5(u8[] s, u8[] p) { return hopWrap(s, p); }
+export u8[] d6(u8[] s, u8[] b) { return hopCheck(s, b); }
+export u8[] d7(u8[] s, bool f) { return hopDigest(s, f); }
+export u8[] d8(string h) { return beginBody(h); }
+export u8[] d9(u8[] i, i32 p, u8[] x, u8[] h) { return extend2Body(i, p, x, h); }
+export u8[] da(u8[] d) { return extended2Reply(d); }
+export u8[] db(u8[] d) { return sendmeBodyV1(d); }
+export u8[] e1(u8[] d, bool s) { return signedDigest(d, s); }
+export u8[] e2(u8[] d) { return keyFingerprint(d); }
+export bool e3(u8[] d, bool s, u8[] k, u8[] g) { return verifyDocumentSignature(d, s, k, g); }
+export i64[] f1(i64[] b, bool[] g, bool[] e, i32 p, i64[] w) { return weightedBandwidths(b, g, e, p, w); }
+export i32 f2(i64[] w, i32[] c, u8[] a, i32[] s, i32[] o, bool m, i64 r) { return choose(w, c, a, s, o, m, r); }
+export bool f3(bool a, i32[] r, i32 p) { return portPermitted(a, r, p); }

@@ -1,0 +1,88 @@
+// Everything a Tor client needs, in one module — the artifact you would actually ship.
+//
+// Exists to be compiled and measured, and to be the answer to "what does this cost". The
+// host driver adds TypeScript on top, but this is all the protocol logic and all the
+// cryptography: TLS 1.3 up through path selection.
+
+import { tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientClose,
+         tlsClientPhase, tlsClientFailure } from "../../tls/src/client.wac";
+import { encodeFixed, encodeVar, cellSize, cellCommand, cellCircId, cellPayload,
+         encodeVersions, negotiateVersion, encodeNetinfo, encodeCreate2, decodeCreated2,
+         certsCount, encodePaddingNegotiate, encodePadding } from "./cell.wac";
+import { ntorClientRequest, ntorClientFinish } from "./ntor.wac";
+import { hopInit, hopSend, hopRecv, hopPeel, hopWrap, hopCheck, hopStateLen, hopDigest,
+         relayCommand, relayStreamId, relayPayload, beginBody, extend2Body, extended2Reply,
+         sendmeBodyV1, endReason } from "./relay.wac";
+import { signedLength, signedDigest, keyFingerprint, rsaModulus, rsaExponent,
+         verifyDocumentSignature, verifyKeyCertification } from "./consensus.wac";
+import { weightedBandwidths, choose, portPermitted } from "./pathsel.wac";
+
+// TLS
+export u8[] tlsInit(u8[] h, u8[] roots, i32[] offs, u8[] e, u8[] p, u8[] k, u8[] r, i64 now) {
+  return tlsClientInit(h, roots, offs, e, p, k, r, now);
+}
+export u8[] tlsFeed(u8[] s, u8[] i) { return tlsClientFeed(s, i); }
+export u8[] tlsSend(u8[] s, u8[] d) { return tlsClientSend(s, d); }
+export u8[] tlsClose(u8[] s) { return tlsClientClose(s); }
+export i32 tlsPhase(u8[] s) { return tlsClientPhase(s); }
+export i32 tlsFailure(u8[] s) { return tlsClientFailure(s); }
+
+// Cells
+export u8[] torEncodeFixed(i32 c, i32 k, u8[] p) { return encodeFixed(c, k, p); }
+export u8[] torEncodeVar(i32 c, i32 k, u8[] p) { return encodeVar(c, k, p); }
+export i32 torCellSize(u8[] b, i32 a) { return cellSize(b, a); }
+export i32 torCellCommand(u8[] b, i32 a) { return cellCommand(b, a); }
+export i32 torCellCircId(u8[] b, i32 a) { return cellCircId(b, a); }
+export u8[] torCellPayload(u8[] b, i32 a) { return cellPayload(b, a); }
+export u8[] torEncodeVersions(i32[] v) { return encodeVersions(v); }
+export i32 torNegotiateVersion(u8[] t, i32[] o) { return negotiateVersion(t, o); }
+export u8[] torEncodeNetinfo(u8[] ip) { return encodeNetinfo(ip); }
+export u8[] torEncodeCreate2(i32 c, i32 h, u8[] d) { return encodeCreate2(c, h, d); }
+export u8[] torDecodeCreated2(u8[] p) { return decodeCreated2(p); }
+export i32 torCertsCount(u8[] p) { return certsCount(p); }
+export u8[] torPaddingNegotiate(i32 c, i32 l, i32 h) { return encodePaddingNegotiate(c, l, h); }
+export u8[] torPadding() { return encodePadding(); }
+
+// Handshake
+export u8[] torNtorRequest(u8[] i, u8[] o, u8[] p) { return ntorClientRequest(i, o, p); }
+export u8[] torNtorFinish(u8[] i, u8[] o, u8[] p, u8[] r, i32 n) {
+  return ntorClientFinish(i, o, p, r, n);
+}
+
+// Relay layer
+export u8[] torHopInit(u8[] m) { return hopInit(m); }
+export u8[] torHopSend(u8[] s, i32 c, i32 i, u8[] d) { return hopSend(s, c, i, d); }
+export u8[] torHopRecv(u8[] s, u8[] p) { return hopRecv(s, p); }
+export u8[] torHopPeel(u8[] s, u8[] p) { return hopPeel(s, p); }
+export u8[] torHopWrap(u8[] s, u8[] p) { return hopWrap(s, p); }
+export u8[] torHopCheck(u8[] s, u8[] b) { return hopCheck(s, b); }
+export i32 torHopStateLen() { return hopStateLen(); }
+export u8[] torHopDigest(u8[] s, bool f) { return hopDigest(s, f); }
+export i32 torRelayCommand(u8[] b) { return relayCommand(b); }
+export i32 torRelayStreamId(u8[] b) { return relayStreamId(b); }
+export u8[] torRelayPayload(u8[] b) { return relayPayload(b); }
+export u8[] torBeginBody(string h) { return beginBody(h); }
+export u8[] torExtend2Body(u8[] i, i32 p, u8[] d, u8[] h) { return extend2Body(i, p, d, h); }
+export u8[] torExtended2Reply(u8[] d) { return extended2Reply(d); }
+export u8[] torSendmeBody(u8[] d) { return sendmeBodyV1(d); }
+export i32 torEndReason(u8[] b) { return endReason(b); }
+
+// Directory
+export i32 torSignedLength(u8[] d) { return signedLength(d); }
+export u8[] torSignedDigest(u8[] d, bool s) { return signedDigest(d, s); }
+export u8[] torKeyFingerprint(u8[] d) { return keyFingerprint(d); }
+export u8[] torRsaModulus(u8[] d) { return rsaModulus(d); }
+export u8[] torRsaExponent(u8[] d) { return rsaExponent(d); }
+export bool torVerifySignature(u8[] d, bool s, u8[] k, u8[] g) {
+  return verifyDocumentSignature(d, s, k, g);
+}
+export bool torVerifyCert(u8[] c, u8[] i, u8[] s) { return verifyKeyCertification(c, i, s); }
+
+// Path selection
+export i64[] torWeights(i64[] b, bool[] g, bool[] e, i32 p, i64[] w) {
+  return weightedBandwidths(b, g, e, p, w);
+}
+export i32 torChoose(i64[] w, i32[] c, u8[] a, i32[] fs, i32[] fo, bool s, i64 r) {
+  return choose(w, c, a, fs, fo, s, r);
+}
+export bool torPortPermitted(bool a, i32[] r, i32 p) { return portPermitted(a, r, p); }
