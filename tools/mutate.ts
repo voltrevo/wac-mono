@@ -11,6 +11,7 @@
 //   deno task mutate --diff              # only files changed against origin/master
 //   deno task mutate crc                 # only mutants whose name matches
 //   deno task mutate --package gzip      # only mutants in one package
+//   deno task mutate --jobs=2            # how many to test at once (default: cores - 1, max 4)
 //   deno task mutate --operators --dry-run   # what would run, without running it
 //
 // Three things make this affordable enough to run over more than one package.
@@ -347,53 +348,102 @@ type Result = {
   detail: string;
 };
 
-const work = await Deno.makeTempDir({ prefix: "wac-mutate-" });
-const results: Result[] = [];
+/**
+ * How many mutants to test at once.
+ *
+ * Each `deno test` uses a little over one core, so the useful number is a bit below the
+ * core count rather than equal to it — oversubscribing makes every run slower and pushes
+ * the slow ones towards TEST_TIMEOUT_MS, which would score them as killed for the wrong
+ * reason. One core is left for this process and the OS.
+ */
+const jobs = (() => {
+  const flag = args.find((a) => a.startsWith("--jobs"));
+  const n = flag?.includes("=") ? Number(flag.split("=")[1]) : undefined;
+  if (n && n > 0) return Math.floor(n);
+  return Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1));
+})();
+
+/**
+ * One staging directory per worker.
+ *
+ * The single shared directory is what forced this loop to be sequential: a mutant is
+ * applied by writing the file, and two mutants in one tree would test each other's edits.
+ * Staging is a `cp -r` of the project, so a handful of copies costs a second and some
+ * disk, and buys the whole run being parallel.
+ */
+const workDirs: string[] = [];
+const results: (Result & { index: number })[] = [];
 try {
-  await stageProject(work);
-
-  for (const { mutant } of toRun) {
-    const mutated = applyEdits(sources, mutant);
-    const touched = [...new Set(mutant.edits.map((e) => e.file))];
-    for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, mutated.get(f)!);
-
-    const dirs = testDirs(mutant);
-    const cmd = new Deno.Command("deno", {
-      args: ["test", "--allow-read", "--allow-write", "--allow-run", "--quiet", ...dirs],
-      cwd: work,
-      stdout: "piped",
-      stderr: "piped",
-    });
-    const child = cmd.spawn();
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try { child.kill("SIGKILL"); } catch { /* already gone */ }
-    }, TEST_TIMEOUT_MS);
-    const { code, stdout, stderr } = await child.output();
-    clearTimeout(timer);
-
-    const output = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
-    // A timeout counts as killed: an infinite loop is a detected defect, not a silent one.
-    const killed = timedOut || code !== 0;
-    const firstFail = output.split("\n").find((l) => l.includes("FAILED") || l.includes("error"));
-    results.push({
-      mutant,
-      killed,
-      timedOut,
-      dirs,
-      detail: timedOut ? `timed out after ${TEST_TIMEOUT_MS / 1000}s` : (firstFail ?? "").trim().slice(0, 90),
-    });
-    const mark = timedOut ? "TO " : killed ? "ok " : "!! ";
-    console.log(`  ${mark} ${mutant.name.padEnd(52)} ${killed ? "killed" : "SURVIVED"}`);
-
-    for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, sources.get(f)!);
+  for (let i = 0; i < jobs; i++) {
+    const dir = await Deno.makeTempDir({ prefix: "wac-mutate-" });
+    workDirs.push(dir);
+    await stageProject(dir);
   }
+  if (jobs > 1) console.log(`  running ${jobs} at a time`);
+
+  let next = 0;
+  const worker = async (work: string) => {
+    while (true) {
+      const index = next++;
+      if (index >= toRun.length) return;
+      const mutant = toRun[index].mutant;
+
+      const mutated = applyEdits(sources, mutant);
+      const touched = [...new Set(mutant.edits.map((e) => e.file))];
+      for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, mutated.get(f)!);
+
+      const dirs = testDirs(mutant);
+      const cmd = new Deno.Command("deno", {
+        // --no-check: a mutant is killed by behaviour, not by type errors. Skipping the
+        // check is a quarter of the runtime, and it also stops an unrelated type error
+        // somewhere in the suite from failing every run and scoring every mutant as
+        // killed — which has happened, and is invisible without the control mutants.
+        // Those still guard the staging itself: a broken import map fails at *runtime*,
+        // so a control that should survive gets killed and the harness check fires.
+        //
+        // --fail-fast: killing needs one failing test, and almost every mutant is killed,
+        // so running the rest of the suite afterwards is pure waiting.
+        args: ["test", "--no-check", "--fail-fast", "--allow-read", "--allow-write",
+               "--allow-run", "--quiet", ...dirs],
+        cwd: work,
+        stdout: "piped",
+        stderr: "piped",
+      });
+      const child = cmd.spawn();
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      }, TEST_TIMEOUT_MS);
+      const { code, stdout, stderr } = await child.output();
+      clearTimeout(timer);
+
+      const output = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
+      // A timeout counts as killed: an infinite loop is a detected defect, not a silent one.
+      const killed = timedOut || code !== 0;
+      const firstFail = output.split("\n").find((l) => l.includes("FAILED") || l.includes("error"));
+      results.push({
+        index,
+        mutant,
+        killed,
+        timedOut,
+        dirs,
+        detail: timedOut ? `timed out after ${TEST_TIMEOUT_MS / 1000}s` : (firstFail ?? "").trim().slice(0, 90),
+      });
+      const mark = timedOut ? "TO " : killed ? "ok " : "!! ";
+      console.log(`  ${mark} ${mutant.name.padEnd(52)} ${killed ? "killed" : "SURVIVED"}`);
+
+      for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, sources.get(f)!);
+    }
+  };
+  await Promise.all(workDirs.map(worker));
+  // Workers finish out of order, so the report is not allowed to depend on arrival.
+  results.sort((a, b) => a.index - b.index);
 } finally {
-  // Tolerate the directory already being gone. It should never be, but a crash here
+  // Tolerate a directory already being gone. It should never be, but a crash here
   // discards a run's entire report after the work has been done, which is a bad trade
   // for a cleanup step.
-  await Deno.remove(work, { recursive: true }).catch(() => {});
+  for (const d of workDirs) await Deno.remove(d, { recursive: true }).catch(() => {});
 }
 
 // ── Report ────────────────────────────────────────────────────────────────────

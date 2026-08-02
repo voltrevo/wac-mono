@@ -186,6 +186,41 @@ Deno.test("a corrupted payload fails its checksum instead of being handed over",
   if (!trapped) throw new Error("a wrong CRC was accepted");
 });
 
+Deno.test("a wrong ISIZE is caught even when the CRC is right", async () => {
+  // The trailer carries a CRC *and* a length, and they fail independently. Corrupting
+  // the CRC — which the test above does — never reaches the length check, so the length
+  // check had no test at all: mutation testing found `if (out.total() != wantSize)`
+  // deletable with the whole suite still green.
+  //
+  // Only the last four bytes are touched here, leaving the CRC intact, so the length is
+  // the only thing that can reject the member. It is not a redundant check either: a
+  // truncated deflate stream that happens to decode to a CRC-clean prefix is exactly
+  // what the length is there to catch.
+  //
+  // The streaming decoder counts with `total()` rather than `len()`, because a streaming
+  // Window has already released most of what it wrote. That is a different expression
+  // from the buffered path's, which is why the buffered test passing said nothing about
+  // this one.
+  const data = enc.encode("length matters too. ".repeat(60));
+  const gz = await pythonGzip(data);
+  for (const delta of [1, -1, 0x100]) {
+    const bad = gz.slice();
+    const isize = new DataView(bad.buffer, bad.byteOffset).getUint32(bad.length - 4, true);
+    new DataView(bad.buffer, bad.byteOffset)
+      .setUint32(bad.length - 4, (isize + delta) >>> 0, true);
+    let trapped = false;
+    try {
+      streamed(bad, 1 << 20);
+    } catch {
+      trapped = true;
+    }
+    if (!trapped) throw new Error(`an ISIZE off by ${delta} was accepted`);
+  }
+  // And the unmodified member still decodes, so the check above is rejecting the
+  // corruption rather than everything.
+  if (!same(streamed(gz, 1 << 20), data)) throw new Error("the intact member stopped decoding");
+});
+
 Deno.test("truncated input traps rather than returning what it managed", async () => {
   const gz = await pythonGzip(enc.encode("cut me short. ".repeat(80)));
   for (const keep of [5, 20, gz.length - 9, gz.length - 1]) {

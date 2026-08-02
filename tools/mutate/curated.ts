@@ -251,15 +251,16 @@ export const CURATED: Curated[] = [
     file: "packages/gzip/src/inflate.wac",
     find: "if (out.len() != wantSize) { trap; }",
     replace: "if (false) { trap; }",
-    nth: 1,
   },
   {
-    // gunzipStream's copy of the same trailer check.
+    // gunzipStream's own trailer check. Not the same expression as the buffered one --
+    // a streaming Window has released most of what it wrote, so it counts with total()
+    // rather than len() -- which is exactly why it needs its own mutation and why the
+    // buffered mutation passing says nothing about it.
     name: "inflate/isize-check-removed-streaming",
     file: "packages/gzip/src/inflate.wac",
-    find: "if (out.len() != wantSize) { trap; }",
+    find: "if (out.total() != wantSize) { trap; }",
     replace: "if (false) { trap; }",
-    nth: 2,
   },
   {
     name: "inflate/nlen-check-removed",
@@ -270,15 +271,15 @@ export const CURATED: Curated[] = [
   {
     name: "inflate/distance-bound",
     file: "packages/gzip/src/inflate.wac",
-    find: "if (d > out.len()) { trap; }",
-    replace: "if (d > out.len() + 1) { trap; }",
+    find: "if (d > out.base + out.len) { trap; }",
+    replace: "if (d > out.base + out.len + 1) { trap; }",
     equivalent: "Same redundancy as inflate/distance-check-removed — the one distance this " +
       "lets through still yields a negative index, which Buf.get and wasm both reject.",
   },
   {
     name: "inflate/distance-check-removed",
     file: "packages/gzip/src/inflate.wac",
-    find: "if (d > out.len()) { trap; }",
+    find: "if (d > out.base + out.len) { trap; }",
     replace: "if (false) { trap; }",
     equivalent: "Buf.get's own bounds check still traps on the resulting negative index. " +
       "test/inflate_adversarial.test.ts drives this path; the rejection is just guarded twice.",
@@ -300,7 +301,7 @@ export const CURATED: Curated[] = [
     edits: [
       {
         file: "packages/gzip/src/inflate.wac",
-        find: "if (d > out.len()) { trap; }",
+        find: "if (d > out.base + out.len) { trap; }",
         replace: "if (false) { trap; }",
       },
       {
