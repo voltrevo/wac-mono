@@ -14,7 +14,7 @@ export Input readInput(Core core, Cli cli, Args a, i32 n) {
   string path = a.rest[n];
   FileResult f = cli.readFile(path);
   if (!f.ok) {
-    core.warn("box: " + path + ": " + f.error);
+    core.warn(a.name + ": " + path + ": " + f.error);
     return Input(false, u8[0](), path);
   }
   return Input(true, f.bytes, path);

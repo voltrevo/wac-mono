@@ -1,0 +1,16 @@
+// `wc` on its own: the same applet, built as its own program.
+//
+// Grants: Nothing at all. It reads standard input and writes a line, and
+// a program that only does that needs no permission from anyone.
+//
+// The applet file is imported unchanged. Splitting one per file was about readability, but
+// this is what it also bought: an entry point is four lines, and the thing it wraps did not
+// have to know it was ever part of a multicall binary.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { parseFrom } from "../lib/args.wac";
+import { wc } from "../applets/wc.wac";
+
+export i32 main(Core core, Cli cli) {
+  return wc(core, cli, parseFrom(cli, 0, "wc"));
+}

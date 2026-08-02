@@ -14,11 +14,15 @@ const AES = 0x1301;
 function aead(
   suite: number, key: Uint8Array, nonce: Uint8Array, aad: Uint8Array, ct: Uint8Array,
 ): Uint8Array {
-  const algo = suite === AES ? "aes-128-gcm" : "chacha20-poly1305";
   const body = ct.subarray(0, ct.length - 16);
   const tag = ct.subarray(ct.length - 16);
   try {
-    const d = createDecipheriv(algo, key, nonce, { authTagLength: 16 });
+    // Spelled out per suite rather than through a `string`: `authTagLength` only exists
+    // on the overloads keyed by a literal algorithm name, so a variable here does not
+    // type-check even though it runs.
+    const d = suite === AES
+      ? createDecipheriv("aes-128-gcm", key, nonce, { authTagLength: 16 })
+      : createDecipheriv("chacha20-poly1305", key, nonce, { authTagLength: 16 });
     d.setAAD(aad, { plaintextLength: body.length });
     d.setAuthTag(tag);
     return new Uint8Array(Buffer.concat([d.update(body), d.final()]));
