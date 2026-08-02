@@ -8,12 +8,27 @@
 //
 // The generated module is written under .cache/ and imported, because a
 // bindgen'd file is a real TypeScript module, not a string to eval.
+//
+// The write is atomic — a uniquely named temp file, then rename — because the suite
+// runs in parallel and several test files bind the same entry. Writing the final path
+// directly means one worker can import what another is halfway through writing, which
+// fails as a syntax error in generated code and looks like a compiler bug.
 
 import { wacCompile } from "wac/wacCompile.ts";
 import { wacBindgen } from "wac/wacBindgen.ts";
 import { wacFiles } from "./wacFiles.ts";
 
 const CACHE_DIR = ".cache";
+
+/**
+ * A name no other worker can produce.
+ *
+ * `Deno.pid` plus a counter is not enough: `--parallel` runs test files in isolates
+ * that share a pid, and each starts its counter at zero — so two workers wrote the
+ * same temp path, one renamed it, and the other's rename failed with NotFound. Only
+ * visible in parallel, from a cold cache, about one run in three.
+ */
+const tempName = (base: string) => `${base}.${crypto.randomUUID()}.tmp`;
 
 export async function wacBind(entry: string): Promise<Record<string, unknown>> {
   const files = await wacFiles(entry);
@@ -33,7 +48,9 @@ export async function wacBind(entry: string): Promise<Record<string, unknown>> {
   const ts = wacBindgen(result.compiled);
   await Deno.mkdir(CACHE_DIR, { recursive: true });
   const outPath = `${CACHE_DIR}/${entry.replaceAll("/", "_")}.gen.ts`;
-  await Deno.writeTextFile(outPath, ts);
+  const tmpPath = tempName(outPath);
+  await Deno.writeTextFile(tmpPath, ts);
+  await Deno.rename(tmpPath, outPath);
 
   return await import(`${Deno.cwd()}/${outPath}`);
 }

@@ -386,21 +386,40 @@ which is how AES keys have been recovered from cache timing since 2005.
 | `chachaBlock` | 1,598 | uniform |
 | `poly1305` | 139 | uniform |
 | `x25519Base` | 1,620,094 | uniform |
-| `ghash` | 513 | **branches on the bits of H** — `ghash.wac:26` |
-| `aesEncrypt`, `aesExpandKey` | 8,631 / 455 | **S-box index depends on the key** — `aes.wac:113` |
+| `ghash` | 513 | **leaks** — control flow diverges; not examined past that |
+| `aesExpandKey` | 455 | **leaks** — secret-dependent index at `aes.wac:113`, `aes.wac:114`, `aes.wac:115`, `aes.wac:116` |
+| `aesEncrypt` | 8,631 | **leaks** — secret-dependent index at `aes.wac:113`, `aes.wac:114`, `aes.wac:115`, `aes.wac:116`, `aes.wac:149`; control flow diverges; not examined past that |
 
 The x25519 row is the one worth reading twice: the ladder is uniform across every one of
 1.6 million events, which is what "structurally uniform" was claiming without evidence.
 
-Two leaks were already documented. The measurement added a third that was not: `xtime`'s
-conditional reduction at `aes.wac:66` branches on the high bit of a key-derived value,
-executing 1090 times for one key and 1182 for another.
+**AES leaks in five places, not one.** Four are the key schedule's `SubWord` lookups
+(`aes.wac:113`–`116`) and the fifth is `SubBytes` itself (`aes.wac:149`), each indexing
+the S-box with a key-derived byte — index 0 for an all-zero key against 255 for an
+all-ones one. Then control flow diverges at `xtime`'s conditional reduction
+(`aes.wac:66`), which was not previously documented, and **nothing past that point has
+been examined**: once two runs take different paths their event streams describe
+different executions, so comparing them further produces noise rather than findings.
+
+`ghash` diverges in control flow before any index does, so the same caveat applies to
+everything after its multiply loop.
+
+Regenerate this table with `deno run -A packages/crypto/ct.ts`. It is generated rather
+than hand-written because published figures that cannot be reproduced go stale silently —
+which is what `issues/open/0007` is about.
 
 **What a uniform result does not mean.** The check is dynamic, so it covers the key pairs
 tested and no others; it is wasm-level, so identical operations can still take different
 time on hardware — `i64.div_s` latency depends on its operands, and the engine and CPU do
 as they please; and it says nothing about values written, only about branches and
 addresses. It is a necessary condition, not a sufficient one. A *failure* is definite.
+
+**A static check was considered and declined** (2026-08-01). A `secret` qualifier on a
+parameter, propagated by the type checker and refused at a branch or an index, would
+cover every path rather than the inputs tested. It also needs declassification — a
+ciphertext is key-derived and must become public somewhere — and an over-taint story, and
+it wants the same machinery as putting `const` in the type. Not worth it for a package
+that is not for production: the dynamic check finds the leaks that get written.
 
 **Fixing the index leak** means removing the table, not moving it: either scan every entry
 and select with an arithmetic mask (`0 - (i == want)` is all-ones or zero, no branch),

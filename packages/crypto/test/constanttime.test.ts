@@ -9,7 +9,13 @@
 // claim is a *measurement* rather than a disclaimer: what is uniform is pinned so it
 // stays uniform, and what leaks is named at the line it leaks on.
 
-import { assertNoSecretDependence, ctModule, firstDivergence, traceOf } from "../../../harness/ctTrace.ts";
+import {
+  allDivergentSites,
+  assertNoSecretDependence,
+  ctModule,
+  firstDivergence,
+  traceOf,
+} from "../../../harness/ctTrace.ts";
 
 const bytes = (m: { exports: Record<string, CallableFunction> }, b: number[]): unknown => {
   const a = m.exports.__bind_arr_u8_new(b.length);
@@ -78,4 +84,15 @@ Deno.test("aes indexes its S-box with key-dependent values (known leak)", async 
   // The point of the whole exercise: this one has no branch to find. Counting
   // branches reports AES's S-box lookup as perfectly uniform.
   if (d.kind !== "index") throw new Error(`expected an index leak, got ${d.kind} at ${d.file}:${d.line}`);
+
+  // The README names these lines. Asserting them here is what stops the table drifting
+  // away from the code — a published measurement nothing checks is the failure this
+  // package already has an issue open about elsewhere.
+  const { sites } = allDivergentSites(m, base, other);
+  const idx = sites.filter((x) => x.kind === "index").map((x) => `${x.file}:${x.line}`);
+  for (const want of [113, 114, 115, 116, 149].map((l) => `packages/crypto/src/aes.wac:${l}`)) {
+    if (!idx.includes(want)) {
+      throw new Error(`README says ${want} leaks; the trace no longer agrees.\n  found: ${idx.join(", ")}`);
+    }
+  }
 });
