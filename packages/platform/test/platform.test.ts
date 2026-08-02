@@ -187,31 +187,42 @@ Deno.test("an application builds to one executable file and runs repeatedly", as
   const { buildApp } = await import("../build.ts");
   const out = await Deno.makeTempFile({ prefix: "wac-app-" });
   try {
-    await buildApp(WC, out);
+    await buildApp(WC, out, { read: true });
     const stat = await Deno.stat(out);
     assertEquals(stat.mode !== null && (stat.mode & 0o111) !== 0, true, "executable");
     assertEquals((await Deno.readTextFile(out)).startsWith("#!"), true, "has a shebang");
 
     for (let i = 0; i < 3; i++) {
-      const r = new Deno.Command(out, {
-        args: ["--allow-read", "--", WC],
-        stdout: "piped",
-        stderr: "piped",
-      }).outputSync();
+      // No permission flags and no separator: a built program takes the arguments a
+      // program takes. What it may *do* was decided at build.
+      const r = new Deno.Command(out, { args: [WC], stdout: "piped", stderr: "piped" })
+        .outputSync();
       const stdout = new TextDecoder().decode(r.stdout).trim();
       assertEquals(r.code, 0, `run ${i}: ${new TextDecoder().decode(r.stderr)}`);
       assertEquals(stdout.endsWith(WC), true, `run ${i} counted the file: ${stdout}`);
     }
 
-    // Capabilities are granted by the flags given to the file, not baked in at build.
-    const denied = new Deno.Command(out, { args: ["--", WC], stdout: "piped", stderr: "piped" })
-      .outputSync();
-    assertEquals(denied.code, 1, "denied a filesystem, the application says so");
-    assertEquals(
-      new TextDecoder().decode(denied.stderr).includes("not granted"),
-      true,
-      new TextDecoder().decode(denied.stderr),
-    );
+    // The same application built without the grant: the capability is simply absent, and
+    // nothing the caller passes can put it back.
+    const bare = await Deno.makeTempFile({ prefix: "wac-app-nofs-" });
+    try {
+      await buildApp(WC, bare);
+      const denied = new Deno.Command(bare, { args: [WC], stdout: "piped", stderr: "piped" })
+        .outputSync();
+      assertEquals(denied.code, 1, "no filesystem, and the application says so");
+      assertEquals(
+        new TextDecoder().decode(denied.stderr).includes("not granted"),
+        true,
+        new TextDecoder().decode(denied.stderr),
+      );
+      assertEquals(
+        (await Deno.readTextFile(bare)).split("\n")[0],
+        "#!/usr/bin/env -S deno run --allow-read",
+        "the shebang mirrors the grants — read is the worker loading itself",
+      );
+    } finally {
+      await Deno.remove(bare);
+    }
   } finally {
     await Deno.remove(out);
   }
