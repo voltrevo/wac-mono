@@ -106,6 +106,8 @@ split is why it is a second struct rather than more fields.
 | | `openInput`, `readChunk` | `--allow-read` for a file |
 | | `readFile`, `stat`, `readDir` | `--allow-read` |
 | | `writeFile`, `mkdir`, `remove`, `rename` | `--allow-write` |
+| | `openOutput` (to a file) | `--allow-write` |
+| | `connect`, `listen`, `accept`, `recv`, `send`, `closeSocket` | `--allow-net` |
 
 **`readStdin` and `write` need no grant**, for the same reason `arg` does not: what the
 user pipes in and what the program prints are the user's own doing, not a reach into
@@ -141,6 +143,23 @@ Measured on one 300MB file, peak RSS: **94MB streaming (`wc`), 1.5GB buffered
 `gunzip`. `sort`, `tac` and `tail` cannot stream by nature. `sha256sum` and `sha512sum`
 still buffer because `packages/crypto` hashes a whole message — an incremental API there
 is the next thing worth having.
+
+**Sockets are handles, not a current-socket.** `openInput` and `openOutput` are
+one-at-a-time because the wac side has no closures to carry a handle into the `fn[u8[]()]`
+a transform expects; an `i32` in a struct has no such problem, and a server needs a
+listener and a connection open at the same time, so a current-socket could not express it.
+
+`connect` resolves and dials, `listen` binds, `accept` blocks until someone arrives, and
+`recv` answers empty when the peer closes — a short read means nothing, exactly as for a
+file. **There is no `poll`**, so a program waits on one socket at a time. That is enough
+for a request/response protocol and for a server handling one connection at a time; it is
+not enough for a proxy, or for anything watching two sockets at once. `box nc` is the
+applet that would need it, which is why there isn't one.
+
+The payoff is that `packages/server` and `packages/http` needed no changes at all.
+`serve(input, now)` was already a pure state machine — bytes in, a response and a consumed
+count out — so `box serve` is a thirty-line socket loop and nothing in that package knows
+a socket exists.
 
 **`mkdir`, `remove` and `rename` are one tier, not three conveniences.** `writeFile`
 alone cannot express a safe update: it truncates and then fills, so a reader arriving in

@@ -17,6 +17,8 @@ export type DenoWorldOptions = {
   warn?(line: string): void;
   /** Restrict the filesystem, or leave it out for none at all. */
   fs?: { read?: boolean; write?: boolean };
+  /** The network, or leave it out for none at all. */
+  net?: boolean;
   /** Environment lookups, or leave it out to report every variable unset. */
   env?(name: string): string | undefined;
 };
@@ -69,6 +71,13 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   let source: Deno.FsFile | null = null;   // null means standard input
   let sink: Deno.FsFile | null = null;     // null means standard output
   const buf = new Uint8Array(CHUNK);
+
+  // Sockets by handle. A plain counter rather than reusing slots: a handle that has been
+  // closed must never come back as a different connection, which is the kind of bug that
+  // shows up as one request's answer arriving on another's socket.
+  const sockets = new Map<number, Deno.Conn>();
+  const listeners = new Map<number, Deno.Listener>();
+  let nextHandle = 1;
 
   return {
     [OP.NOW_MILLIS]: () => i64le(BigInt(Date.now())),
@@ -167,6 +176,54 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       if (path === "") return EMPTY;
       if (!opts.fs?.write) deny("filesystem write");
       sink = await Deno.open(path, { write: true, create: true, truncate: true });
+      return EMPTY;
+    },
+
+    [OP.CONNECT]: async (p) => {
+      if (!opts.net) deny("network access");
+      const port = readI32le(p);
+      const conn = await Deno.connect({ hostname: unstr(p.subarray(4)), port });
+      const h = nextHandle++;
+      sockets.set(h, conn);
+      return i32le(h);
+    },
+    [OP.LISTEN]: (p) => {
+      if (!opts.net) deny("network access");
+      const l = Deno.listen({ port: readI32le(p) });
+      const h = nextHandle++;
+      listeners.set(h, l);
+      return i32le(h);
+    },
+    [OP.ACCEPT]: async (p) => {
+      const l = listeners.get(readI32le(p));
+      if (l === undefined) throw new Error("not a listening socket");
+      const conn = await l.accept();
+      const h = nextHandle++;
+      sockets.set(h, conn);
+      return i32le(h);
+    },
+    [OP.RECV]: async (p) => {
+      const c = sockets.get(readI32le(p));
+      if (c === undefined) throw new Error("not an open socket");
+      const n = await c.read(buf);
+      return n === null ? EMPTY : buf.subarray(0, n);
+    },
+    [OP.SEND]: async (p) => {
+      const c = sockets.get(readI32le(p));
+      if (c === undefined) throw new Error("not an open socket");
+      const body = p.subarray(4);
+      let at = 0;
+      while (at < body.length) at += await c.write(body.subarray(at));
+      return EMPTY;
+    },
+    [OP.CLOSE_SOCKET]: (p) => {
+      const h = readI32le(p);
+      // Closing an already-closed socket is not an error; a program that tidies up on
+      // every path would otherwise have to track which paths had already done it.
+      try { sockets.get(h)?.close(); } catch { /* already closed */ }
+      try { listeners.get(h)?.close(); } catch { /* already closed */ }
+      sockets.delete(h);
+      listeners.delete(h);
       return EMPTY;
     },
 

@@ -25,4 +25,10 @@ export const OP = {
   OPEN_INPUT: 18,
   READ_CHUNK: 19,
   OPEN_OUTPUT: 20,
+  CONNECT: 21,
+  LISTEN: 22,
+  ACCEPT: 23,
+  RECV: 24,
+  SEND: 25,
+  CLOSE_SOCKET: 26,
 } as const;

@@ -779,3 +779,133 @@ Deno.test("line-oriented applets stream too, and stay faithful at the edges", as
   }
 });
 
+
+/**
+ * A port nobody is using, taken by binding one and letting go.
+ *
+ * A fixed number would collide with whatever else is on the machine, and these tests run
+ * in parallel with each other.
+ */
+function freePort(): number {
+  const l = Deno.listen({ port: 0 });
+  const n = (l.addr as Deno.NetAddr).port;
+  l.close();
+  return n;
+}
+
+/**
+ * Wait until the server says it is listening, by reading the line it prints.
+ *
+ * Deliberately not by connecting. `serve -o` handles exactly one connection, so a probe
+ * that dials the port *is* that connection — the first version of this test did that and
+ * then hung waiting for a server that had already served the probe and exited.
+ *
+ * Returns the stderr it consumed, so a caller can still assert on it afterwards.
+ */
+async function waitForListening(server: Deno.ChildProcess, port: number): Promise<string> {
+  const reader = server.stderr.getReader();
+  const dec = new TextDecoder();
+  let seen = "";
+  while (!seen.includes(`listening on port ${port}`)) {
+    const { value, done } = await reader.read();
+    if (done) throw new Error(`the server exited before listening: ${seen}`);
+    seen += dec.decode(value, { stream: true });
+  }
+  reader.releaseLock();
+  return seen;
+}
+
+Deno.test("box's network applets: a wac server and a wac client, over real TCP", async () => {
+  // The first applets that are not filters. `packages/server`'s `serve(input, now)` is a
+  // pure state machine — bytes in, a response and a consumed count out — so the socket
+  // loop is thirty lines and nothing in that package knows a socket exists.
+  //
+  // A free port is taken by binding one and letting go; a fixed number would collide with
+  // whatever else is on this machine, and these tests run in parallel with each other.
+  const built = await Deno.makeTempFile({ prefix: "wac-net-" });
+  try {
+    await buildApp(BOX, built, { net: true });
+    const port = freePort();
+
+    // `-o` serves one connection and exits. Not `-1`: a leading digit is how this argument
+    // parser spells a number, so `serve -8080 -1` set the port to 1 — which is how the
+    // first run of this ended up listening on port 1.
+    const server = new Deno.Command(built, {
+      args: ["serve", `-${port}`, "-o"],
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+
+    const listening = await waitForListening(server, port);
+    assertEquals(
+      listening.includes(`listening on port ${port}`),
+      true,
+      "it says where it is listening",
+    );
+    const conn = await Deno.connect({ hostname: "127.0.0.1", port });
+
+    await conn.write(new TextEncoder().encode(
+      `GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n`,
+    ));
+    const parts: Uint8Array[] = [];
+    const buf = new Uint8Array(4096);
+    for (;;) {
+      const n = await conn.read(buf);
+      if (n === null) break;
+      parts.push(buf.slice(0, n));
+    }
+    conn.close();
+    const reply = new TextDecoder().decode(
+      new Uint8Array(parts.flatMap((p) => Array.from(p))),
+    );
+    assertEquals(reply.startsWith("HTTP/1.1 200 OK\r\n"), true, reply.slice(0, 80));
+    assertEquals(reply.includes("wac http server"), true, reply.slice(0, 200));
+
+    assertEquals((await server.status).code, 0, "the server exited cleanly");
+    server.stdout.cancel();
+
+    // And the client half against the server half: two wac programs, one socket, no
+    // TypeScript in between. Started together — `serve` blocks in `accept` until `get`
+    // arrives, which is the whole point of a synchronous capability world.
+    const port2 = freePort();
+    const server2 = new Deno.Command(built, {
+      args: ["serve", `-${port2}`, "-o"],
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    await waitForListening(server2, port2);
+    const client = new Deno.Command(built, {
+      args: ["get", "127.0.0.1", "/", `-${port2}`, "-i"],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    const got = await client;
+    const body = new TextDecoder().decode(got.stdout);
+    assertEquals(got.code, 0, new TextDecoder().decode(got.stderr));
+    assertEquals(body.includes("HTTP 200"), true, body.slice(0, 120));
+    assertEquals(body.trimEnd().endsWith("wac http server"), true, body.slice(0, 200));
+    assertEquals((await server2.status).code, 0, "the second server exited cleanly");
+    server2.stdout.cancel();
+
+    // Without the grant, nothing — whatever the arguments say.
+    const noNet = await Deno.makeTempFile({ prefix: "wac-nonet-" });
+    try {
+      await buildApp(BOX, noNet, {});
+      const denied = new Deno.Command(noNet, {
+        args: ["get", "127.0.0.1", "/", `-${port}`],
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      assertEquals(denied.code, 1);
+      assertEquals(
+        new TextDecoder().decode(denied.stderr).includes("not granted"),
+        true,
+        new TextDecoder().decode(denied.stderr),
+      );
+    } finally {
+      await Deno.remove(noNet);
+    }
+  } finally {
+    await Deno.remove(built);
+  }
+});

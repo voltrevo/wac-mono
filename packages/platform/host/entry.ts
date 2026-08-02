@@ -29,6 +29,7 @@ export type AppModule = {
   Cli: { of(...a: unknown[]): unknown };
   FileResult: { of(...a: unknown[]): unknown };
   Stat: { of(...a: unknown[]): unknown };
+  Socket: { of(...a: unknown[]): unknown };
   main: (core: unknown, cli: unknown) => number;
 };
 
@@ -74,7 +75,7 @@ function firstMessage(): Promise<Start> {
  * whoever packages the thing chooses what it may do, and the person running it cannot
  * quietly widen that.
  */
-export type Grants = { read?: boolean; write?: boolean; env?: boolean };
+export type Grants = { read?: boolean; write?: boolean; env?: boolean; net?: boolean };
 
 /**
  * The worker half: wait for the bridge, build the capabilities, run `main`.
@@ -120,6 +121,7 @@ async function runAsLauncher(workerSource: string, grants: Grants): Promise<void
   const responder = serveHostCalls(bridge, denoWorld({
     args: [...Deno.args],
     fs: { read: grants.read === true, write: grants.write === true },
+    net: grants.net === true,
     env: grants.env === true ? (n) => Deno.env.get(n) : undefined,
   }));
 

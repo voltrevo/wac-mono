@@ -1,6 +1,6 @@
 # box — a busybox, written in wac
 
-Forty-two applets in one program, chosen by the first argument. No TypeScript: `src/` is
+Forty-four applets in one program, chosen by the first argument. No TypeScript: `src/` is
 wac and the only thing outside it is the test suite.
 
 It exists to exercise `packages/platform`'s capability world more widely than a single
@@ -17,9 +17,9 @@ cat README.md | ./box sort -u | ./box wc -l
 
 ```
 base32 base64 basename cat cp crc32 cut date dirname du echo false fold
-find grep gunzip gzip head hex ls mkdir mv nl rev rm rmdir seq sha256sum
-sha512sum sort strings tac tail tee touch tr true uniq urldecode
-urlencode wc
+find get grep gunzip gzip head hex ls mkdir mv nl rev rm rmdir seq serve
+sha256sum sha512sum sort strings tac tail tee touch tr true uniq
+urldecode urlencode wc
 ```
 
 111K, drawing on this repo's `crypto`, `codec`, `regex`, `gzip`, `datetime` and `url`
@@ -81,6 +81,26 @@ That is also why `Args` carries a `name`. A program in this model is never hande
 argv[0] — argv starts at its first real argument — so the standalone `wc` would otherwise
 have reported errors as `box:`. Under `box` the name is the applet's; in `bin/` the entry
 point passes it.
+
+## The two that are not filters
+
+```sh
+box serve -8080          # an HTTP server
+box get example.com /    # an HTTP client
+```
+
+`serve` is `packages/server`'s `serve(input, now)` — a pure state machine, bytes in and a
+response out — wrapped in a socket loop. `get` sends a request and hands the reply to
+`packages/http`'s parser. Neither package needed a change to be put on a socket, which is
+the thing worth showing: they were written for TypeScript bindings and tested against
+byte fixtures.
+
+`serve` handles **one connection at a time**, because the world has no `poll`. That is the
+honest limit of a synchronous capability world. It is also why there is no `nc`: netcat
+must watch standard input and a socket at once, and nothing here can.
+
+`-o` serves one connection and exits. Not `-1` — a leading digit is how this argument
+parser spells a number, so `serve -8080 -1` listened on port 1.
 
 ## What streams and what does not
 

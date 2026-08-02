@@ -82,6 +82,19 @@ export struct Stat {
  * user pipes in and what the program prints are the user's own doing, not a reach into
  * anything they did not offer. The filesystem is different and is gated.
  */
+/**
+ * A socket, or why there isn't one.
+ *
+ * A handle rather than a current-socket, unlike `openInput` and `openOutput`. Those are
+ * one-at-a-time because the wac side has no closures to carry a handle *into a funcref*;
+ * an `i32` in a struct has no such problem, and a server needs a listener and a
+ * connection open at the same time, so a current-socket could not express it.
+ */
+export struct Socket {
+  i32 handle;      // negative when `error` is set
+  string error;
+}
+
 export struct Cli {
   fn[i32()] argCount;
   fn[string(i32)] arg;
@@ -172,6 +185,25 @@ export struct Cli {
    */
   fn[string(string)] openOutput;
 
+  /**
+   * The network. `--allow-net`, and nothing without it.
+   *
+   * `connect` resolves and dials; `listen` binds a port and `accept` blocks until someone
+   * arrives. `recv` answers with at most `CHUNK` bytes and with an empty array when the
+   * peer has closed — a short read means nothing, exactly as it does for a file.
+   *
+   * There is no `poll`, so a program can wait on one socket at a time. That is enough for
+   * a request/response protocol and for a server that handles one connection at a time; it
+   * is not enough for a proxy, or for anything that must watch two sockets at once. When
+   * something needs it, that is the shape to add.
+   */
+  fn[Socket(string, i32)] connect;
+  fn[Socket(i32)] listen;
+  fn[Socket(i32)] accept;
+  fn[u8[](i32)] recv;
+  fn[bool(i32, u8[])] send;
+  fn[void(i32)] closeSocket;
+
   Cli of(
     fn[i32()] argCount,
     fn[string(i32)] arg,
@@ -187,11 +219,18 @@ export struct Cli {
     fn[bool(string, string)] rename,
     fn[string(string)] openInput,
     fn[u8[]()] readChunk,
-    fn[string(string)] openOutput
+    fn[string(string)] openOutput,
+    fn[Socket(string, i32)] connect,
+    fn[Socket(i32)] listen,
+    fn[Socket(i32)] accept,
+    fn[u8[](i32)] recv,
+    fn[bool(i32, u8[])] send,
+    fn[void(i32)] closeSocket
   ) {
     return Cli(
       argCount, arg, env, readStdin, write, readFile, writeFile, stat, readDir,
-      mkdir, remove, rename, openInput, readChunk, openOutput
+      mkdir, remove, rename, openInput, readChunk, openOutput,
+      connect, listen, accept, recv, send, closeSocket
     );
   }
 }
