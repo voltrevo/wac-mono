@@ -1,0 +1,44 @@
+// Selected fields of each line: `cut -d, -f2`. Tab is the delimiter by default.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args, flagValue } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+import { joinLines, splitLines } from "../lib/lines.wac";
+import { slice } from "../lib/bytes.wac";
+import { atoi } from "../lib/num.wac";
+
+export i32 cut(Core core, Cli cli, Args a) {
+  string d = flagValue(cli, 'd');
+  i32 delim = d == "" ? '\t' : d.toBytes()[0];
+  i32 field = atoi(flagValue(cli, 'f'));
+  // The value has to be attached to its flag — see `flagValue`. `-f 2` arrives here as no
+  // value at all, so the usage message is what a detached spelling gets.
+  if (field < 1) { core.warn("usage: box cut -f<n> [-d<c>] [file]   (attached, as -f2 -d,)"); return 2; }
+
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  u8[][] lines = splitLines(in.bytes);
+  u8[][] out = u8[][lines.len()](fill: u8[0]());
+  for (i32 i = 0; i < lines.len(); i++) { out[i] = fieldOf(lines[i], delim, field); }
+  cli.write(joinLines(out, lines.len()));
+  return 0;
+}
+
+/**
+ * The `n`th field, or the whole line when it has no delimiter — which is what `cut` does,
+ * on the reasoning that a line with no fields is one field.
+ */
+u8[] fieldOf(u8[] line, i32 delim, i32 n) {
+  i32 seen = 1;
+  i32 start = 0;
+  for (i32 i = 0; i <= line.len(); i++) {
+    bool end = i == line.len() || line[i] == delim;
+    if (!end) { continue; }
+    if (seen == n) { return slice(line, start, i); }
+    seen++;
+    start = i + 1;
+  }
+  bool hasDelim = false;
+  for (i32 i = 0; i < line.len(); i++) { if (line[i] == delim) { hasDelim = true; } }
+  return hasDelim ? u8[0]() : line;
+}

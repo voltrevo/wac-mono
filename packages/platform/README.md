@@ -115,26 +115,33 @@ which ruled out every compressor and encoder as a filter.
 `example/hexdump.wac` exercises the difference: `hexdump < file` reads standard input and
 writes exact bytes, and `hexdump <dir>` lists a directory through `stat` and `readDir`.
 
-## box: twenty-seven applets in one program
+## box: thirty-six applets in one program
 
 ```sh
 deno task app:build packages/platform/example/box/box.wac --allow-read --allow-write -o box
 ./box grep -i wac README.md
 cat README.md | ./box sort -u | ./box wc -l
 ./box du packages
+./box gzip data | ./box gunzip | ./box sha256sum
 ```
 
 ```
-base32 base64 basename cat cp dirname du echo false find grep head hex
-ls nl rev seq sha256sum sha512sum sort tac tail tee true uniq wc
+base32 base64 basename cat cp crc32 cut date dirname du echo false fold
+find grep gunzip gzip head hex ls nl rev seq sha256sum sha512sum sort
+strings tac tail tee tr true uniq urldecode urlencode wc
 ```
 
-74K, drawing on this repo's `crypto`, `codec` and `regex` packages, so it is the widest
-composition here.
+103K, drawing on this repo's `crypto`, `codec`, `regex`, `gzip`, `datetime` and `url`
+packages, so it is the widest composition here.
+
+**Several applets are a few lines over a package.** `gzip` is `gzipBest`, `date` is the
+clock capability and `rfc3339.format`, `crc32` and `urlencode` likewise. Those packages
+were written to be called from TypeScript through bindgen and needed no change at all to
+become the inside of a program instead — which is the thing worth showing.
 
 **One applet per file.** `applets/<name>.wac`, always — finding one takes no thought, and
 two people editing different applets do not collide in a 561-line file. `box.wac` is the
-dispatcher and its twenty-four imports are the table of contents; shared parts live in
+dispatcher and its thirty-four imports are the table of contents; shared parts live in
 `lib/` (`args`, `bytes`, `num`, `lines`, `input`). Splitting thirty files cost 12ms of
 build time, measured before and after.
 
@@ -143,7 +150,10 @@ applet, and a file containing one `return` would be ceremony rather than clarity
 my idea of them: `cat rev nl tac sort sort -r sort -u uniq -c base32 base64 sha256sum
 sha512sum grep grep -i grep -v grep -n grep -c find` all match byte for byte, `du` matches
 `du -sb`, and `head -N`, `tail -n N`, `wc -l/-w/-c` match the real ones' output. `grep`
-returns 1 on no match and 2 on a bad pattern, as it should.
+returns 1 on no match and 2 on a bad pattern, as it should. The second batch is checked the
+same way: `cut -d -f`, `tr` with ranges, `fold -w` and `strings -n` against the system
+tools, and `gzip`/`gunzip` against the system `gzip` in *both* directions, so neither side
+can be wrong in a way the other cancels out.
 
 Three things it exercises that nothing else did. **One shared option parser** — without it
 `head` was fixed at ten lines and `wc` could not do `-l`, so a dozen applets were
@@ -154,7 +164,7 @@ thing to push on `readDir` and `stat` beyond one level. **The write path**, in `
 **It also shows what a multicall binary costs.** `box`'s grants are the *union* of what
 its applets need, so `box echo` carries the filesystem access `box cat` wants. Built as
 separate executables, each would state its own: `wc` needs nothing at all and its shebang
-would say `deno run` with no flags. One binary with sixteen entry points is the shape
+would say `deno run` with no flags. One binary with thirty-six entry points is the shape
 BusyBox has to take; it is not the shape this model is best at.
 
 ## How an asynchronous host looks synchronous

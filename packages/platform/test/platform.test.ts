@@ -374,6 +374,21 @@ Deno.test("stat and readDir reach the application, and are gated", async () => {
   assertEquals(denied.err.includes("not found"), true, denied.err);
 });
 
+/**
+ * `assertEquals` above is `!==`, so two byte arrays are never equal to it. This says where
+ * they diverge, which for a compressor is the only useful thing to be told.
+ */
+function assertSameBytes(got: Uint8Array, want: Uint8Array, msg: string): void {
+  for (let i = 0; i < Math.max(got.length, want.length); i++) {
+    if (got[i] !== want[i]) {
+      throw new Error(
+        `${msg}\n  first difference at byte ${i}: got ${got[i]}, want ${want[i]}` +
+          ` (lengths ${got.length} and ${want.length})`,
+      );
+    }
+  }
+}
+
 // ── box: many applets in one program ──────────────────────────────────────────
 
 const BOX = "packages/platform/example/box/box.wac";
@@ -551,6 +566,170 @@ Deno.test("box's applets compose in a pipeline", async () => {
     assertEquals(sorted, "a\nb\nc\n");
     assertEquals(await run(["wc", "-l"], sorted), "3\n");
     assertEquals(await run(["tac"], sorted), "c\nb\na\n");
+  } finally {
+    await Deno.remove(built);
+  }
+});
+
+Deno.test("box's text applets agree with the system tools they imitate", async () => {
+  // The second differential batch: `cut`, `tr`, `fold` and `strings`. Everything is checked
+  // against the real tool rather than against my idea of it, as the first batch is.
+  const built = await Deno.makeTempFile({ prefix: "wac-box-t-" });
+  const fixture = await Deno.makeTempFile({ prefix: "wac-box-tin-" });
+  try {
+    await buildApp(BOX, built, { read: true });
+    await Deno.writeTextFile(fixture, "a,b,c\nd,e,f\nnodelim\n,leading,\n");
+
+    const box = (args: string[], input = "") => {
+      const child = new Deno.Command(built, {
+        args, stdin: "piped", stdout: "piped", stderr: "piped",
+      }).spawn();
+      const w = child.stdin.getWriter();
+      w.write(new TextEncoder().encode(input)).then(() => w.close());
+      return child.output().then((o) => new TextDecoder().decode(o.stdout));
+    };
+    const sys = (cmd: string, args: string[], input = "") => {
+      const child = new Deno.Command(cmd, {
+        args, stdin: "piped", stdout: "piped", stderr: "null",
+      }).spawn();
+      const w = child.stdin.getWriter();
+      w.write(new TextEncoder().encode(input)).then(() => w.close());
+      return child.output().then((o) => new TextDecoder().decode(o.stdout));
+    };
+
+    // cut: a field, a chosen delimiter, and a line that has none — which `cut` passes
+    // through whole, on the reasoning that a line with no fields is one field.
+    for (const f of ["1", "2", "3", "9"]) {
+      assertEquals(
+        await box(["cut", "-d,", `-f${f}`, fixture]),
+        await sys("cut", ["-d,", `-f${f}`, fixture]),
+        `cut -f${f} differs`,
+      );
+    }
+    assertEquals(
+      await box(["cut", "-f2", fixture]),
+      await sys("cut", ["-f2", fixture]),
+      "cut with the default tab delimiter differs",
+    );
+    // A flag's value must be attached. The separated spelling would be indistinguishable
+    // from a filename once parsed, so it is refused rather than silently misread.
+    const bare = new Deno.Command(built, {
+      args: ["cut", "-d", ",", "-f", "2", fixture],
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    assertEquals(bare.code, 2, "a detached flag value should be a usage error");
+    assertEquals(
+      new TextDecoder().decode(bare.stderr).includes("-f<n>"),
+      true,
+      "and should say how to spell it",
+    );
+
+    const text = await Deno.readTextFile("README.md");
+    for (const sets of [["a-z", "A-Z"], ["aeiou", "."], ["abc", "x"], ["A-Za-z", "N-ZA-Mn-za-m"]]) {
+      assertEquals(
+        await box(["tr", ...sets], text),
+        await sys("tr", sets, text),
+        `tr ${sets.join(" ")} differs`,
+      );
+    }
+
+    for (const w of ["10", "20", "80"]) {
+      assertEquals(
+        await box(["fold", `-${w}`, fixture]),
+        await sys("fold", [`-w${w}`, fixture]),
+        `fold -${w} differs`,
+      );
+    }
+
+    // `strings` on a binary: the one applet whose input is deliberately not text.
+    for (const n of ["4", "8"]) {
+      assertEquals(
+        await box(["strings", `-${n}`, "/bin/true"]),
+        await sys("strings", [`-n${n}`, "/bin/true"]),
+        `strings -${n} differs`,
+      );
+    }
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(fixture);
+  }
+});
+
+Deno.test("box's package-backed applets: gzip, gunzip, crc32, date, urlencode", async () => {
+  // These are the point of `box`: each is a few lines over a package written in this repo
+  // for TypeScript bindings, reused unchanged as the inside of a program. The compression
+  // ones are checked against the system `gzip` in *both* directions, so neither side can be
+  // wrong in a way the other cancels out.
+  const built = await Deno.makeTempFile({ prefix: "wac-box-g-" });
+  try {
+    await buildApp(BOX, built, { read: true });
+    const raw = await Deno.readFile("README.md");
+
+    const run = (args: string[], input: Uint8Array) => {
+      const child = new Deno.Command(built, {
+        args, stdin: "piped", stdout: "piped", stderr: "piped",
+      }).spawn();
+      const w = child.stdin.getWriter();
+      w.write(input).then(() => w.close());
+      return child.output();
+    };
+    const sysRun = (cmd: string, args: string[], input: Uint8Array) => {
+      const child = new Deno.Command(cmd, {
+        args, stdin: "piped", stdout: "piped", stderr: "null",
+      }).spawn();
+      const w = child.stdin.getWriter();
+      w.write(input).then(() => w.close());
+      return child.output();
+    };
+
+    const squeezed = (await run(["gzip"], raw)).stdout;
+    assertEquals(squeezed.length < raw.length, true, "gzip did not compress");
+    assertSameBytes((await run(["gunzip"], squeezed)).stdout, raw, "box could not read its own gzip");
+    assertSameBytes(
+      (await sysRun("gunzip", [], squeezed)).stdout,
+      raw,
+      "the system gzip could not read box's",
+    );
+    assertSameBytes(
+      (await run(["gunzip"], (await sysRun("gzip", ["-c"], raw)).stdout)).stdout,
+      raw,
+      "box could not read the system gzip's",
+    );
+
+    // crc32 against the checksum gzip itself carries, computed independently here.
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+      table[i] = c >>> 0;
+    }
+    let crc = 0xFFFFFFFF;
+    for (const b of raw) crc = table[(crc ^ b) & 0xFF] ^ (crc >>> 8);
+    const expect = ((crc ^ 0xFFFFFFFF) >>> 0).toString(16).padStart(8, "0");
+    assertEquals(new TextDecoder().decode((await run(["crc32"], raw)).stdout).trim(), `${expect}  -`);
+
+    // `date` is the clock capability with a package on top; it must be RFC 3339 and now.
+    const now = new TextDecoder().decode((await run(["date"], new Uint8Array())).stdout).trim();
+    const parsed = Date.parse(now);
+    assertEquals(Number.isNaN(parsed), false, `not a date: ${now}`);
+    assertEquals(Math.abs(parsed - Date.now()) < 60_000, true, `not now: ${now}`);
+
+    // Percent-encoding round-trips, including bytes that are not ASCII at all.
+    const enc = new TextEncoder();
+    for (const s of ["a b/c?d=e&f#g", "ünïcode ✓", "plain", "%already%20encoded"]) {
+      const encoded = (await run(["urlencode"], enc.encode(s + "\n"))).stdout;
+      assertEquals(
+        new TextDecoder().decode(encoded).includes(" "),
+        false,
+        "a space survived encoding",
+      );
+      assertEquals(
+        new TextDecoder().decode((await run(["urldecode"], encoded)).stdout),
+        s + "\n",
+        `${s} did not round-trip`,
+      );
+    }
   } finally {
     await Deno.remove(built);
   }
