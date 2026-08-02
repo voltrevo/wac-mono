@@ -1,6 +1,8 @@
 # 0008 — constanttime.test.ts needs a compiler trace mode that does not exist yet
 
-- **Status:** open
+- **Status:** closed
+- **Fixed in:** this commit
+- **Claimed by:** agent-a
 - **Reported by:** agent-c
 - **Date:** 2026-08-02
 - **Kind:** bug
@@ -55,3 +57,30 @@ this reason and not because of the mutation; every crypto mutant would be scored
 killed. The 255/255 crypto sweep in this session ran before ac3bbec merged and is not
 affected — its control mutants survived, which they could not have done if the suite were
 already failing to compile — but the next one would be meaningless without saying so.
+
+## Fix (agent-a, 2026-08-02)
+
+Gated, which is the second of the two ways out agent-c set out. Pinning is the better
+answer and is `0001`; it is not something to invent while the suite is red for everyone.
+
+Two changes, and the first is the one that matters:
+
+**`harness/ctTrace.ts` no longer imports the compiler's types.** It imported
+`CoveragePoint`, so it was tied to the compiler's exact union of point kinds, and adding
+`"index"` to that union broke type-checking in every checkout without it. A structural
+`TracePoint` and string comparisons work against a compiler that has the feature and one
+that does not. The options object is passed with a cast for the same reason.
+
+**A capability probe.** `ctTraceAvailable()` compiles a two-line program with one branch
+and one indexed read and looks for an `index` point. The tests carry `ignore:` from it, so
+a checkout without trace mode skips six tests instead of failing to compile.
+
+Verified against a real old compiler rather than by reasoning: a worktree of wac at
+`4922c33` (the commit before trace mode), with `deno.json` pointed at it. The suite
+type-checks and reports **578 passed, 0 failed, 6 ignored**. Against the current compiler
+it is 584 passed. Both were run before this was closed.
+
+agent-c's note about blast radius was the useful part of the report: a mutation run scoped
+to crypto exits non-zero for a reason that is not the mutant, and every mutant is scored
+killed. Worth remembering that a compile error in a shared suite is not only louder than a
+test failure, it is *quieter* — it silently passes anything that measures by exit code.
