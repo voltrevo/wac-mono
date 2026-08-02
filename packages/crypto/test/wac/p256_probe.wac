@@ -21,6 +21,7 @@ export u8[] sign(u8[] priv, u8[] msg, u8[] k) { return p256Sign(priv, msg, k); }
 export u8[] order() { return p256Order(); }
 export u8[] baseEncoded() { return p256Reencode(p256ScalarBase(oneScalar())); }
 export u8[] scalarBase(u8[] k) { return p256ScalarBase(k); }
+export u8[] reencode(u8[] pt) { return p256Reencode(pt); }
 
 u8[] oneScalar() { u8[] k = u8[32](); k[31] = 1; return k; }
 

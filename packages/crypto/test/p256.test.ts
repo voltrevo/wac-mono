@@ -274,3 +274,87 @@ Deno.test("p256: an ECDSA signature with r or s out of range is refused", () => 
   bigS.set(nBytes, 32);
   if (verify(pub, msg, bigS)) throw new Error("accepted s = n");
 });
+
+Deno.test("p256: a coordinate at or above p is refused, even when it reduces onto the curve", () => {
+  // The range check in curveDecode, and the reason it is not redundant with the curve
+  // equation. Drop it and a coordinate of x + p is not rejected: fpFromBytes takes the
+  // bytes as they are, every later multiply reduces modulo p, and `onCurve` then tests
+  // the *reduced* value and passes. One public key would have two accepted encodings,
+  // which matters anywhere a key is fingerprinted, pinned or compared bytewise.
+  //
+  // Constructing it needs a point whose x is small enough that x + p still fits in 32
+  // bytes. p is within 2^224 of 2^256, so a random point almost never qualifies — but one
+  // is not obliged to use a random point. Solving the curve equation for the first few
+  // integers finds x = 5 immediately, which is why "hard to hit by accident" is not the
+  // same as "hard to construct".
+  const reencode = mod.reencode as (pt: Uint8Array) => Uint8Array;
+
+  let x = 0n, y = 0n;
+  for (let i = 1n; i < 400n; i++) {
+    const rhs = (((i * i % P) * i % P) - 3n * i + B + 3n * P) % P;
+    const r = modPow(rhs, (P + 1n) / 4n, P);
+    if (r * r % P === rhs) { x = i; y = r; break; }
+  }
+  if (x === 0n) throw new Error("no small-x point found; the search bound is too tight");
+
+  const point = (xv: bigint, yv: bigint) => {
+    const out = new Uint8Array(65);
+    out[0] = 4;
+    out.set(rawEnc(xv), 1);
+    out.set(rawEnc(yv), 33);
+    return out;
+  };
+
+  // The canonical encoding of that point is accepted, so the rejection below is about
+  // the encoding rather than about the point.
+  if (reencode(point(x, y)).length !== 65) throw new Error("the canonical point was rejected");
+  if (x + P >= (1n << 256n)) throw new Error("x + p does not fit; pick a smaller x");
+
+  if (!traps(() => reencode(point(x + P, y)))) throw new Error("accepted x + p as x");
+  // And the same for y, using the point's own y only if it fits; otherwise the negation,
+  // whichever is small enough to admit a second encoding.
+  const yAlt = P - y;
+  const small = y + P < (1n << 256n) ? y : (yAlt + P < (1n << 256n) ? yAlt : 0n);
+  if (small !== 0n && !traps(() => reencode(point(x, small + P)))) {
+    throw new Error("accepted y + p as y");
+  }
+});
+
+/** b, the curve constant. Only the last test needs it. */
+const B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604bn;
+/** 32 big-endian bytes with no reduction, so an out-of-range value survives encoding. */
+function rawEnc(v: bigint): Uint8Array {
+  const o = new Uint8Array(32);
+  for (let i = 31; i >= 0; i--) { o[i] = Number(v & 0xFFn); v >>= 8n; }
+  return o;
+}
+
+Deno.test("p256: inputs that are too long are refused, not silently truncated", () => {
+  // Every length guard in weierstrass.wac is `!= expected`, and every existing test feeds
+  // something too *short*. That is the half that is already covered twice over: a short
+  // array runs off its end and wasm traps whether or not the guard is there. The long
+  // half has nothing behind it — drop the guard and the extra bytes are simply never
+  // read, so a 33-byte private key or a 66-byte point is accepted as though the tail did
+  // not exist. Mutation testing found all four of these guards deletable together.
+  const reencode = mod.reencode as (pt: Uint8Array) => Uint8Array;
+  const priv = enc(0x1234567n, N);
+  const pub = pubKey(priv);
+  const msg = new TextEncoder().encode("length matters");
+
+  const longer = (b: Uint8Array, extra = 1) => {
+    const out = new Uint8Array(b.length + extra);
+    out.set(b);
+    return out;
+  };
+
+  if (!traps(() => reencode(longer(pub)))) throw new Error("accepted a 66-byte point");
+  if (!traps(() => pubKey(longer(priv)))) throw new Error("accepted a 33-byte private key");
+  if (!traps(() => ecdh(longer(priv), pub))) throw new Error("accepted a long key for ecdh");
+  if (!traps(() => ecdh(priv, longer(pub)))) throw new Error("accepted a long peer point");
+  if (!traps(() => sign(longer(priv), msg, enc(7n, N)))) throw new Error("accepted a long key for signing");
+  if (!traps(() => sign(priv, msg, longer(enc(7n, N))))) throw new Error("accepted a long k");
+
+  // The unmodified versions still work, so the rejections above are about the extra byte.
+  if (reencode(pub).length !== 65) throw new Error("the genuine point was rejected");
+  if (!verify(pub, msg, sign(priv, msg, enc(7n, N)))) throw new Error("the genuine key stopped working");
+});

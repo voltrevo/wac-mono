@@ -165,3 +165,17 @@ export u8[] cliSend(u8[] state, u8[] data) { return tlsClientSend(state, data); 
 export u8[] cliClose(u8[] state) { return tlsClientClose(state); }
 export i32 cliPhase(u8[] state) { return tlsClientPhase(state); }
 export i32 cliFailure(u8[] state) { return tlsClientFailure(state); }
+
+// The post-quantum hybrid, at the boundary. Reached only through whole handshakes until
+// now, which is why every one of its length guards survived mutation testing.
+import {
+  hybridClientOffer, hybridServerAccept, hybridClientFinish,
+  groupX25519MlKem768, hybridClientShareLen, hybridServerShareLen, hybridSecretLen,
+} from "../../src/hybrid.wac";
+export u8[] hybOffer(u8[] kemSeed, u8[] xPriv) { return hybridClientOffer(kemSeed, xPriv); }
+export u8[] hybAccept(u8[] share, u8[] m, u8[] xPriv) { return hybridServerAccept(share, m, xPriv); }
+export u8[] hybFinish(u8[] offer, u8[] share, u8[] xPriv) { return hybridClientFinish(offer, share, xPriv); }
+export i32 hybGroup() { return groupX25519MlKem768(); }
+export i32 hybClientLen() { return hybridClientShareLen(); }
+export i32 hybServerLen() { return hybridServerShareLen(); }
+export i32 hybSecretLen() { return hybridSecretLen(); }

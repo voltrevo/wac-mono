@@ -43,7 +43,9 @@ import { rsaVerifyPkcs1, rsaVerifyPss } from "../../crypto/src/rsa.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { sha384 } from "../../crypto/src/sha512.wac";
 import {
-  Der, oidBasicConstraints, oidEcPublicKey, oidKeyUsage, oidEcdsaSha256, oidEcdsaSha384, oidEd25519,
+  Der, tagBoolean, tagInteger, tagBitString, tagOctetString, tagOid, tagUtcTime,
+  tagGeneralizedTime, tagSequence, tagContext, tagContextPrim,
+  oidBasicConstraints, oidEcPublicKey, oidKeyUsage, oidEcdsaSha256, oidEcdsaSha384, oidEd25519,
   oidEquals, oidPrime256v1, oidRsaEncryption, oidRsaPss, oidRsaSha256, oidRsaSha384,
   oidRsaSha512, oidSecp384r1, oidSubjectAltName, oidExtKeyUsage, oidServerAuth,
   oidAnyExtKeyUsage, oidNameConstraints, unsignedInteger,
@@ -184,8 +186,8 @@ i64 parseTime(u8[] s, bool generalized) {
 /** Read the two times out of a Validity SEQUENCE. */
 i64 readTime(Der v) {
   i32 tag = v.peekTag();
-  if (tag == 0x17) { return parseTime(v.element(0x17).rest(), false); }
-  if (tag == 0x18) { return parseTime(v.element(0x18).rest(), true); }
+  if (tag == tagUtcTime()) { return parseTime(v.element(tagUtcTime()).rest(), false); }
+  if (tag == tagGeneralizedTime()) { return parseTime(v.element(tagGeneralizedTime()).rest(), true); }
   trap;
 }
 
@@ -198,28 +200,28 @@ i64 readTime(Der v) {
  */
 export Cert parseCert(u8[] der) {
   Der top = Der.create(der);
-  Der cert = top.element(0x30);
+  Der cert = top.element(tagSequence());
 
   // tbsCertificate: keep the bytes, then parse a copy of them.
   u8[] tbs = cert.elementBytes();
   Der tbsOuter = Der.create(tbs);
-  Der t = tbsOuter.element(0x30);
+  Der t = tbsOuter.element(tagSequence());
 
   // version [0] EXPLICIT, absent for v1.
-  if (t.nextIs(0xA0)) { t.skip(); }
+  if (t.nextIs(tagContext(0))) { t.skip(); }
   t.skip();                          // serialNumber
   t.skip();                          // signature AlgorithmIdentifier, checked outside
   u8[] issuer = t.elementBytes();    // issuer Name, kept whole for chaining
 
-  Der validity = t.element(0x30);
+  Der validity = t.element(tagSequence());
   i64 notBefore = readTime(validity);
   i64 notAfter = readTime(validity);
 
   u8[] subject = t.elementBytes();
 
   // subjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey BIT STRING }
-  Der spki = t.element(0x30);
-  Der alg = spki.element(0x30);
+  Der spki = t.element(tagSequence());
+  Der alg = spki.element(tagSequence());
   u8[] algOid = alg.oid();
   i32 keyType = 0;
   u8[] publicKey = u8[0]();
@@ -247,9 +249,9 @@ export Cert parseCert(u8[] der) {
   } else if (oidEquals(algOid, oidRsaEncryption())) {
     // The BIT STRING holds another DER structure: SEQUENCE { modulus, exponent }.
     Der inner = Der.create(spki.bitString());
-    Der seq = inner.element(0x30);
-    publicKey = unsignedInteger(seq.element(0x02).rest());
-    rsaExponent = unsignedInteger(seq.element(0x02).rest());
+    Der seq = inner.element(tagSequence());
+    publicKey = unsignedInteger(seq.element(tagInteger()).rest());
+    rsaExponent = unsignedInteger(seq.element(tagInteger()).rest());
     keyType = 3;
   }
 
@@ -262,13 +264,13 @@ export Cert parseCert(u8[] der) {
   u8[] excludedDns = u8[0]();
   u8[] dnsNames = u8[0]();
 
-  if (t.nextIs(0x81)) { t.skip(); }   // issuerUniqueID
-  if (t.nextIs(0x82)) { t.skip(); }   // subjectUniqueID
-  if (t.nextIs(0xA3)) {
-    Der extsOuter = t.element(0xA3);
-    Der exts = extsOuter.element(0x30);
+  if (t.nextIs(tagContextPrim(1))) { t.skip(); }   // issuerUniqueID
+  if (t.nextIs(tagContextPrim(2))) { t.skip(); }   // subjectUniqueID
+  if (t.nextIs(tagContext(3))) {
+    Der extsOuter = t.element(tagContext(3));
+    Der exts = extsOuter.element(tagSequence());
     while (!exts.empty()) {
-      Der ext = exts.element(0x30);
+      Der ext = exts.element(tagSequence());
       u8[] id = ext.oid();
       // RFC 5280 §4.2: a certificate MUST be rejected if it carries a critical extension
       // the verifier does not recognise. "Critical" is the issuer saying this restriction
@@ -277,17 +279,17 @@ export Cert parseCert(u8[] der) {
       // key algorithm does not trap: a trust store is full of certificates that are merely
       // not for us.
       bool critical = false;
-      if (ext.nextIs(0x01)) { critical = ext.element(0x01).rest()[0] != 0; }
-      u8[] value = ext.element(0x04).rest();
+      if (ext.nextIs(tagBoolean())) { critical = ext.element(tagBoolean()).rest()[0] != 0; }
+      u8[] value = ext.element(tagOctetString()).rest();
 
       if (oidEquals(id, oidBasicConstraints())) {
         Der bc = Der.create(value);
-        Der seq = bc.element(0x30);
-        if (seq.nextIs(0x01)) {
-          isCa = seq.element(0x01).rest()[0] != 0;
+        Der seq = bc.element(tagSequence());
+        if (seq.nextIs(tagBoolean())) {
+          isCa = seq.element(tagBoolean()).rest()[0] != 0;
         }
-        if (seq.nextIs(0x02)) {
-          u8[] pl = seq.element(0x02).rest();
+        if (seq.nextIs(tagInteger())) {
+          u8[] pl = seq.element(tagInteger()).rest();
           // A one- or two-byte integer in practice; anything larger is not a constraint
           // anyone means, so it is treated as absent rather than parsed heroically.
           pathLen = pl.len() == 1 ? pl[0] : (pl.len() == 2 ? ((pl[0] << 8) | pl[1]) : -1);
@@ -297,7 +299,7 @@ export Cert parseCert(u8[] der) {
         // of unused trailing bits, and the bits are numbered from the *most* significant
         // end — so keyCertSign is 0x04 in the first data byte, not 0x20.
         Der ku = Der.create(value);
-        u8[] bits = ku.element(0x03).rest();
+        u8[] bits = ku.element(tagBitString()).rest();
         canSignCerts = bits.len() >= 2 && (bits[1] & 0x04) != 0;
       } else if (oidEquals(id, oidSubjectAltName())) {
         dnsNames = collectDnsNames(value);
@@ -308,7 +310,7 @@ export Cert parseCert(u8[] der) {
         // how a CA's separation between purposes stops meaning anything.
         serverAuth = false;
         Der eku = Der.create(value);
-        Der purposes = eku.element(0x30);
+        Der purposes = eku.element(tagSequence());
         while (!purposes.empty()) {
           u8[] purpose = purposes.oid();
           if (oidEquals(purpose, oidServerAuth()) || oidEquals(purpose, oidAnyExtKeyUsage())) {
@@ -321,8 +323,8 @@ export Cert parseCert(u8[] der) {
         // restriction that would go unapplied, so the certificate is marked unusable
         // rather than being trusted with the part that was understood.
         if (constraintsUnderstood(value)) {
-          permittedDns = subtreeDns(value, 0xA0);
-          excludedDns = subtreeDns(value, 0xA1);
+          permittedDns = subtreeDns(value, tagContext(0));
+          excludedDns = subtreeDns(value, tagContext(1));
         } else {
           badCritical = true;
         }
@@ -334,7 +336,7 @@ export Cert parseCert(u8[] der) {
 
   // signatureAlgorithm, which says how the issuer signed — a different question from
   // what key *this* certificate carries.
-  Der sigAlgSeq = cert.element(0x30);
+  Der sigAlgSeq = cert.element(tagSequence());
   u8[] sigOid = sigAlgSeq.oid();
   i32 sigAlg = 0;
   if (oidEquals(sigOid, oidEd25519())) { sigAlg = 1; }
@@ -365,16 +367,16 @@ export Cert parseCert(u8[] der) {
  */
 bool constraintsUnderstood(u8[] value) {
   Der nc = Der.create(value);
-  Der seq = nc.element(0x30);
+  Der seq = nc.element(tagSequence());
   while (!seq.empty()) {
     i32 tag = seq.peekTag();
     Der subtrees = seq.any();
-    if (tag != 0xA0 && tag != 0xA1) { return false; }
+    if (tag != tagContext(0) && tag != tagContext(1)) { return false; }
     while (!subtrees.empty()) {
-      Der sub = subtrees.element(0x30);
+      Der sub = subtrees.element(tagSequence());
       i32 gtag = sub.peekTag();
       sub.skip();
-      if (gtag != 0x82) { return false; }   // not a dNSName
+      if (gtag != tagContextPrim(2)) { return false; }   // not a dNSName
       if (!sub.empty()) { return false; }   // a minimum or maximum follows the base
     }
   }
@@ -384,17 +386,17 @@ bool constraintsUnderstood(u8[] value) {
 /** The dNSName bases of one side of a nameConstraints extension, NUL-joined. */
 u8[] subtreeDns(u8[] value, i32 want) {
   Der nc = Der.create(value);
-  Der seq = nc.element(0x30);
+  Der seq = nc.element(tagSequence());
   u8[] acc = u8[0]();
   while (!seq.empty()) {
     i32 tag = seq.peekTag();
     Der subtrees = seq.any();
     if (tag == want) {
       while (!subtrees.empty()) {
-        Der sub = subtrees.element(0x30);
+        Der sub = subtrees.element(tagSequence());
         i32 gtag = sub.peekTag();
         Der base = sub.any();
-        if (gtag == 0x82) { acc = joinName(acc, base.rest()); }
+        if (gtag == tagContextPrim(2)) { acc = joinName(acc, base.rest()); }
       }
     }
   }
@@ -472,12 +474,12 @@ bool namesAllowed(Cert leaf, Cert ca) {
 /** The dNSName entries of a SubjectAltName, joined with NUL bytes. */
 u8[] collectDnsNames(u8[] value) {
   Der san = Der.create(value);
-  Der names = san.element(0x30);
+  Der names = san.element(tagSequence());
   u8[] acc = u8[0]();
   while (!names.empty()) {
     i32 tag = names.peekTag();
     Der item = names.any();
-    if (tag == 0x82) {                 // dNSName, IMPLICIT IA5String
+    if (tag == tagContextPrim(2)) {                 // dNSName, IMPLICIT IA5String
       u8[] name = item.rest();
       u8[] joined = u8[acc.len() + (acc.len() > 0 ? 1 : 0) + name.len()]();
       i32 p = 0;
@@ -550,9 +552,9 @@ bool matchesOne(u8[] pat, i32 at, i32 len, u8[] host) {
  */
 u8[] ecdsaFromDer(u8[] der, i32 len) {
   Der outer = Der.create(der);
-  Der seq = outer.element(0x30);
-  u8[] r = unsignedInteger(seq.element(0x02).rest());
-  u8[] s = unsignedInteger(seq.element(0x02).rest());
+  Der seq = outer.element(tagSequence());
+  u8[] r = unsignedInteger(seq.element(tagInteger()).rest());
+  u8[] s = unsignedInteger(seq.element(tagInteger()).rest());
   if (r.len() > len || s.len() > len) { trap; }
   u8[] out = u8[2 * len]();
   for (i32 i = 0; i < r.len(); i++) { out[len - r.len() + i] = r[i]; }

@@ -16,6 +16,20 @@
 export type KnownSurvivor = { name: string; why: string };
 
 export const KNOWN_SURVIVORS: KnownSurvivor[] = [
+  {
+    name: "guard/crypto/ghash:49:31",
+    why:
+      "`data.len() % 16 != 0`. Redundant with the bounds check, not with nothing: for " +
+      "any length that is not a whole number of blocks, the final iteration's " +
+      "`beWord64(data, pos + 8)` reads past the end of the array and traps. Checked " +
+      "against lengths 8, 17 and 24 with the guard removed — all still rejected. The " +
+      "guard is kept because it makes the rejection say what is wrong rather than " +
+      "surfacing as an out-of-range read, and because it stops being redundant the " +
+      "moment the loop is rewritten to bulk-read. " +
+      "Deleted once on 2026-08-02 because a run reported it killed, and restored when " +
+      "that run turned out to be the one with the permissions bug — it had failed its " +
+      "unmutated baseline, so every mutant scored as killed.",
+  },
   // ── inflate's guards that a bounds check already enforces ───────────────────
   //
   // Ten of inflate's twelve `trap` guards survive deletion. That is not the same as

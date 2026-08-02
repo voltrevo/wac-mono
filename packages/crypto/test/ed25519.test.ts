@@ -192,3 +192,55 @@ Deno.test("ed25519: signs messages across SHA-512 block boundaries", async () =>
     if (hex(sign(seed, msg)) !== hex(want)) throw new Error(`length ${n}: ${hex(sign(seed, msg))}`);
   }
 });
+
+Deno.test("ed25519: a seed that is not 32 bytes is refused, long as well as short", () => {
+  // The same asymmetry as P-256's length guards. A short seed runs off the end of the
+  // array inside expandSeed and wasm traps regardless, so the guard looks tested; a long
+  // one is read for its first 32 bytes and the tail ignored, so `ed25519PublicKey` would
+  // happily answer for a 33-byte "seed" and give the same key as its 32-byte prefix. Two
+  // different inputs, one identity — which is the kind of thing that only ever surfaces
+  // as a key that mysteriously already exists.
+  const traps = (f: () => unknown) => { try { f(); return false; } catch { return true; } };
+  const msg = new TextEncoder().encode("seed lengths");
+  const seed = Uint8Array.from({ length: 32 }, (_, i) => i);
+
+  if (publicKey(seed).length !== 32) throw new Error("the genuine seed was rejected");
+  for (const n of [0, 31, 33, 64]) {
+    const bad = new Uint8Array(n);
+    bad.set(seed.subarray(0, Math.min(n, 32)));
+    if (!traps(() => publicKey(bad))) throw new Error(`accepted a ${n}-byte seed for a key`);
+    if (!traps(() => sign(bad, msg))) throw new Error(`accepted a ${n}-byte seed for signing`);
+  }
+});
+
+Deno.test("ed25519: x = 0 with the sign bit set is not a point", () => {
+  // A compressed point is y in the low 255 bits and the sign of x in the top one. When
+  // x is zero it has no sign — zero is neither odd nor even in the sense the encoding
+  // means — so an encoding that claims x is odd while y forces x to zero is not a point,
+  // and must be refused rather than quietly decoded as the one with x = 0.
+  //
+  // The identity is the case that makes this bite. y = 1 gives x = 0, and (0, 1) sits on
+  // the curve, so the usual "is it on the curve" check waves it straight through: the
+  // only thing standing between the two encodings is the explicit test for x = 0. Drop
+  // it and the identity has two accepted encodings, one of which no signer would produce.
+  const recode = mod.edRecode as (p: Uint8Array) => Uint8Array;
+  const rejected = (out: Uint8Array) => out[0] === 0xFF;
+
+  const identity = new Uint8Array(32);
+  identity[0] = 1;                       // y = 1, sign 0
+  if (rejected(recode(identity))) throw new Error("the canonical identity was rejected");
+
+  const signed = Uint8Array.from(identity);
+  signed[31] |= 0x80;                    // y = 1, sign 1 — x would have to be an odd zero
+  if (!rejected(recode(signed))) throw new Error("accepted x = 0 with the sign bit set");
+
+  // The same for the other zero-x point, y = -1, which is the identity's negation.
+  const yNeg1 = new Uint8Array(32);
+  yNeg1.fill(0xFF);
+  yNeg1[0] = 0xEC;                       // p - 1 = 2^255 - 20
+  yNeg1[31] = 0x7F;
+  if (rejected(recode(yNeg1))) throw new Error("y = -1 with sign 0 should decode");
+  const yNeg1Signed = Uint8Array.from(yNeg1);
+  yNeg1Signed[31] |= 0x80;
+  if (!rejected(recode(yNeg1Signed))) throw new Error("accepted y = -1 with the sign bit set");
+});

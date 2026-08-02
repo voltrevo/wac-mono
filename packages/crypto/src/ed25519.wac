@@ -118,7 +118,6 @@ i64[] recoverX(i64[] y, i32 wantSign) {
     }
   }
 
-  if (feIsZero(x) == 1 && wantSign == 1) { return feZero(); }   // x = 0 has no odd root
   if (feIsNegative(x) != wantSign) { x = feNeg(x); }
   return x;
 }
@@ -175,6 +174,15 @@ export Point? ptDecode(u8[] s) {
   // Distinguish by checking the curve equation rather than by trusting the zero.
   Point p = Point(x, y, feOne(), feMul(x, y));
   if (onCurve(p) == 0) { return null; }
+  // RFC 8032 §5.1.3: "if x = 0 and x_0 = 1, decoding fails." Zero has no sign, so an
+  // encoding asserting that x is odd while y forces x to zero is not a point.
+  //
+  // This has to be here rather than inside recoverX, which is where it was and where it
+  // did nothing. recoverX signals failure by returning zero, and the check above then
+  // rebuilds the point and re-validates it — and (0, 1) and (0, -1) are both genuinely on
+  // the curve, so the rejection was recovered from and thrown away. The identity had two
+  // accepted encodings, and the one no signer would ever produce was the second.
+  if (feIsZero(x) == 1 && sign == 1) { return null; }
   return p;
 }
 

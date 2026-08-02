@@ -205,3 +205,83 @@ Deno.test("p384: r or s outside [1, n) is refused", async () => {
   if (verify384(pub, msg, withRS(good.r, good.s)) !== true) throw new Error("the rebuilt genuine signature was rejected");
   if (verify384(pub, msg, new Uint8Array(95))) throw new Error("accepted a 95-byte signature");
 });
+
+Deno.test("p384: a coordinate at or above p is refused, even when it reduces onto the curve", () => {
+  // The same check as P-256's, and worth repeating per curve because the room above p is
+  // wildly different: 2^256 - p256 is about 2^224, so one random 32-byte string in 2^32
+  // is out of range, while 2^384 - p384 is only about 2^128, so it is one in 2^255. That
+  // makes P-384's out-of-range band unreachable by accident and no harder to construct
+  // on purpose — x = 2 is on the curve, and 2 + p fits in 48 bytes.
+  const B = 0xb3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aefn;
+  const modPow = (b: bigint, e: bigint, m: bigint) => {
+    let r = 1n, x = b % m;
+    while (e > 0n) { if (e & 1n) r = r * x % m; x = x * x % m; e >>= 1n; }
+    return r;
+  };
+  let x = 0n, y = 0n;
+  for (let i = 1n; i < 400n; i++) {
+    const rhs = (((i * i % P) * i % P) - 3n * i + B + 3n * P) % P;
+    const r = modPow(rhs, (P + 1n) / 4n, P);
+    if (r * r % P === rhs) { x = i; y = r; break; }
+  }
+  if (x === 0n) throw new Error("no small-x point found; the search bound is too tight");
+  if (x + P >= (1n << 384n)) throw new Error("x + p does not fit; pick a smaller x");
+
+  /** 48 big-endian bytes with no reduction, so an out-of-range value survives encoding. */
+  const raw = (v: bigint) => {
+    const o = new Uint8Array(48);
+    for (let i = 47; i >= 0; i--) { o[i] = Number(v & 0xFFn); v >>= 8n; }
+    return o;
+  };
+  const point = (xv: bigint, yv: bigint) => {
+    const out = new Uint8Array(97);
+    out[0] = 4;
+    out.set(raw(xv), 1);
+    out.set(raw(yv), 49);
+    return out;
+  };
+  const traps = (f: () => unknown) => { try { f(); return false; } catch { return true; } };
+
+  // verify384 decodes the public key, so a refused encoding shows up as a trap. The
+  // canonical point is decoded fine and merely fails to verify a nonsense signature,
+  // which is the difference this test turns on: false, not a throw.
+  const sig = new Uint8Array(96);
+  sig[47] = 1;
+  sig[95] = 1;
+  const msg = new TextEncoder().encode("canonicity");
+  if (traps(() => verify384(point(x, y), msg, sig))) {
+    throw new Error("the canonical point was rejected");
+  }
+  if (!traps(() => verify384(point(x + P, y), msg, sig))) {
+    throw new Error("accepted x + p as x");
+  }
+});
+
+Deno.test("p384 field: a length that is not a curve this file knows is refused", () => {
+  // fieldp.wac picks its prime from the operand's limb count, which makes the length the
+  // only thing distinguishing P-256 arithmetic from P-384 arithmetic. That is what these
+  // guards protect: a 16-byte "field element" has four limbs and no prime, and reducing
+  // it modulo whichever table happened to be returned would be arithmetic in a ring
+  // nobody chose. The guards existed and nothing reached them — every internal caller
+  // passes 32 or 48 — but the probe hands raw byte arrays across, so they are reachable
+  // from the boundary and worth pinning there.
+  const traps = (f: () => unknown) => { try { f(); return false; } catch { return true; } };
+  const bytes = (n: number) => new Uint8Array(n);
+
+  for (const n of [1, 33, 47, 49]) {
+    if (!traps(() => pRoundTrip(bytes(n)))) throw new Error(`accepted a ${n}-byte element`);
+  }
+  // Multiples of four that are not eight or twelve limbs: the second guard, not the first.
+  for (const n of [16, 64, 4]) {
+    if (!traps(() => pRoundTrip(bytes(n)))) throw new Error(`accepted a ${n}-byte element`);
+  }
+  // Two operands from different curves. Nothing mixes them internally — a Curve's b, its
+  // base point and every intermediate come from one decode — so this is the guard that
+  // stops a future caller reducing a P-256 product modulo the P-384 prime in silence.
+  if (!traps(() => pMul(bytes(32), bytes(48)))) throw new Error("multiplied across curves");
+  if (!traps(() => pMul(bytes(48), bytes(32)))) throw new Error("multiplied across curves");
+
+  // The sizes that are curves still work.
+  if (pRoundTrip(bytes(32)).length !== 32) throw new Error("32 bytes stopped working");
+  if (pRoundTrip(bytes(48)).length !== 48) throw new Error("48 bytes stopped working");
+});
