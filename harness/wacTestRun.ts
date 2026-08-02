@@ -35,6 +35,7 @@
 import { wacCompile } from "wac/wacCompile.ts";
 import { wacBindgen } from "wac/wacBindgen.ts";
 import { wacFiles } from "./wacFiles.ts";
+import { checkWacVersion } from "./wacVersion.ts";
 
 const CACHE_DIR = ".cache";
 const tempName = (base: string) => `${base}.${crypto.randomUUID()}.tmp`;
@@ -51,6 +52,12 @@ export async function wacTestRun(
   prefix?: string,
   hostArgs: unknown[] = [],
 ): Promise<void> {
+  // Before the compiler is asked to do anything, so a stale checkout says so itself
+  // rather than surfacing as a parse error in whichever test used a new feature. This was
+  // dropped when the runner was rewritten to go through bindgen, and the gap showed
+  // immediately: a pin bump left every `.test.ts` failing with a clear message and every
+  // wac test passing, which is the wrong way round for a check that exists to explain.
+  checkWacVersion();
   const result = wacCompile(await wacFiles(entry), entry);
   if (!result.ok) {
     const lines = result.diagnostics.map(d =>
