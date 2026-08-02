@@ -10,6 +10,7 @@ import {
   BUF,
   OP_CONTINUE,
   REQ_LEN,
+  REQ_MORE,
   REQ_OP,
   REQ_SEQ,
   RES_LEN,
@@ -27,6 +28,16 @@ export type Handler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
 export type Handlers = Record<number, Handler>;
 
 const enc = new TextEncoder();
+const EMPTY = new Uint8Array(0);
+
+function joined(parts: Uint8Array[], last: Uint8Array): Uint8Array<ArrayBuffer> {
+  const total = parts.reduce((n, p) => n + p.length, 0) + last.length;
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  out.set(last, at);
+  return out;
+}
 
 /**
  * Serve host calls until `stop()` is called or the signal aborts.
@@ -42,6 +53,8 @@ export function serveHostCalls(
 ): { stop(): void; done: Promise<void> } {
   let running = true;
   let pending: Uint8Array | null = null; // the tail of an oversized response
+  let partial: Uint8Array[] = [];        // the head of an oversized request
+  let partialOp = -1;
 
   const reply = (status: number, body: Uint8Array): void => {
     b.res.set(body, 0);
@@ -74,13 +87,30 @@ export function serveHostCalls(
         send(rest);
         continue;
       }
+
+      // A request arriving in pieces. Held here rather than in the worker for the same
+      // reason the response tail is: a caller that abandons a call cannot leak it, and
+      // the accumulation is dropped the moment a different capability asks.
+      if (Atomics.load(b.ctrl, REQ_MORE) === 1) {
+        if (op !== partialOp) { partial = []; partialOp = op; }
+        partial.push(payload);
+        reply(STATUS_OK, EMPTY);
+        continue;
+      }
+      let whole: Uint8Array = payload;
+      if (partial.length > 0) {
+        if (op === partialOp) whole = joined(partial, payload);
+        partial = [];
+        partialOp = -1;
+      }
+
       const h = handlers[op];
       if (h === undefined) {
         reply(STATUS_ERR, enc.encode(`no handler for capability ${op}`));
         continue;
       }
       try {
-        send(await h(payload));
+        send(await h(whole));
       } catch (e) {
         // The worker turns this into a thrown HostCallError, so a capability failing is
         // an error in wac's caller rather than a silent wrong answer.

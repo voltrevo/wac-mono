@@ -12,7 +12,7 @@
 // Node has no permission system, so the grants are enforced by the capability world alone
 // — see `node.ts`.
 
-import { bridgeOf, newBridge } from "./layout.ts";
+import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
 import { nodeWorld } from "./node.ts";
 import { cliOf, coreOf } from "./provider.ts";
@@ -65,6 +65,10 @@ export async function runLauncherNode(
     mkdir(p: string, o: { recursive: boolean }): Promise<unknown>;
     rm(p: string, o: { recursive: boolean; force: boolean }): Promise<void>;
     rename(from: string, to: string): Promise<void>;
+    open(p: string, flags: string): Promise<{
+      read(b: Uint8Array, off: number, len: number): Promise<{ bytesRead: number }>;
+      close(): Promise<void>;
+    }>;
     stat(p: string): Promise<{ isFile(): boolean; isDirectory(): boolean; size: number; mtimeMs: number }>;
     readdir(p: string): Promise<string[]>;
   },
@@ -78,6 +82,7 @@ export async function runLauncherNode(
   workerSource: string,
   grants: Grants = {},
 ): Promise<void> {
+  let stdinIter: AsyncIterator<Uint8Array> | null = null;
   const io = {
     readStdin: async (): Promise<Uint8Array> => {
       const parts: Uint8Array[] = [];
@@ -87,6 +92,24 @@ export async function runLauncherNode(
       let at = 0;
       for (const p of parts) { out.set(p, at); at += p.length; }
       return out;
+    },
+    // Node hands standard input over as an async iterable, which is already the shape a
+    // chunked read wants: one `next()` is one chunk, and `done` is the end.
+    readStdinChunk: async (): Promise<Uint8Array> => {
+      stdinIter ??= proc.stdin[Symbol.asyncIterator]();
+      const r = await stdinIter.next();
+      return r.done === true ? new Uint8Array(0) : r.value;
+    },
+    openFile: async (path: string) => {
+      const h = await fs.open(path, "r");
+      const b = new Uint8Array(CHUNK);
+      return {
+        read: async (): Promise<Uint8Array> => {
+          const { bytesRead } = await h.read(b, 0, CHUNK);
+          return bytesRead === 0 ? new Uint8Array(0) : b.subarray(0, bytesRead);
+        },
+        close: () => h.close(),
+      };
     },
     writeStdout: (b: Uint8Array): Promise<void> =>
       new Promise((res, rej) => proc.stdout.write(b, (e) => (e ? rej(e) : res()))),

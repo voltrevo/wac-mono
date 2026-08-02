@@ -1,12 +1,16 @@
-// Bytes through, unchanged.
+// Bytes through, unchanged — a chunk at a time, so a file larger than memory still works.
 
 import { Cli, Core } from "../../../src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, readInput } from "../lib/input.wac";
+import { Input, openStream } from "../lib/input.wac";
 
 export i32 cat(Core core, Cli cli, Args a) {
-  Input in = readInput(core, cli, a, 0);
+  Input in = openStream(core, cli, a, 0);
   if (!in.ok) { return 1; }
-  cli.write(in.bytes);
+  while (true) {
+    u8[] chunk = cli.readChunk();
+    if (chunk.len() == 0) { return 0; }
+    cli.write(chunk);
+  }
   return 0;
 }

@@ -1,13 +1,17 @@
 // Decompress standard input, or a file, to standard output.
+//
+// The whole applet is one call. `gunzipStream` wants `fn[u8[]()]` and `fn[bool(u8[])]`, which
+// is exactly what `readChunk` and `write` are — so the capabilities are handed over
+// directly. wac has no closures, so if the shapes had not matched there would have been no
+// adapter to write; that they do is why these signatures are what they are.
 
 import { Cli, Core } from "../../../src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, readInput } from "../lib/input.wac";
-import { gunzipBytes } from "../../../../gzip/src/inflate.wac";
+import { Input, openStream } from "../lib/input.wac";
+import { gunzipStream } from "../../../../gzip/src/inflate.wac";
 
 export i32 gunzip(Core core, Cli cli, Args a) {
-  Input in = readInput(core, cli, a, 0);
+  Input in = openStream(core, cli, a, 0);
   if (!in.ok) { return 1; }
-  cli.write(gunzipBytes(in.bytes));
-  return 0;
+  return gunzipStream(cli.readChunk, cli.write);
 }

@@ -17,6 +17,10 @@ import { OP } from "./ops.ts";
 /** Node's pieces, described rather than imported, so this file checks under Deno. */
 export type NodeIo = {
   readStdin(): Promise<Uint8Array>;
+  /** One chunk of standard input, or empty at its end. */
+  readStdinChunk(): Promise<Uint8Array>;
+  /** A file opened for sequential reading; `read` answers empty at the end. */
+  openFile(path: string): Promise<{ read(): Promise<Uint8Array>; close(): Promise<void> }>;
   writeStdout(bytes: Uint8Array): Promise<void>;
   stat(path: string): Promise<{ isFile: boolean; isDirectory: boolean; size: number; mtimeMillis: number }>;
   readDir(path: string): Promise<string[]>;
@@ -51,6 +55,9 @@ export function nodeWorld(
   const args = opts.args ?? proc.argv.slice(2);
   const log = opts.log ?? ((l: string) => console.log(l));
   const warn = opts.warn ?? ((l: string) => console.error(l));
+
+  // The current streaming input; null means standard input. See the note in platform.wac.
+  let source: { read(): Promise<Uint8Array>; close(): Promise<void> } | null = null;
   const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
 
   return {
@@ -121,6 +128,18 @@ export function nodeWorld(
       await fs.writeFile(unstr(p.subarray(4, 4 + n)), p.subarray(4 + n));
       return EMPTY;
     },
+
+    [OP.OPEN_INPUT]: async (p) => {
+      const path = unstr(p);
+      await source?.close();
+      source = null;
+      if (path === "") return EMPTY;
+      if (!opts.fs?.read) deny("filesystem read");
+      source = await io.openFile(path);
+      return EMPTY;
+    },
+    [OP.READ_CHUNK]: async () =>
+      source === null ? await io.readStdinChunk() : await source.read(),
 
     [OP.MKDIR]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");
