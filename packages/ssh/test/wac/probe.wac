@@ -141,3 +141,42 @@ export u8[] sshKexInitFirst(u8[] cookie, bool first) {
   p.firstKexFollows = first;
   return encode(p, cookie);
 }
+
+// ── Key exchange ──────────────────────────────────────────────────────────────
+
+import { EcdhReply, deriveKey, ecdhInit, ephemeralPublic, exchangeHash, msgKexEcdhReply,
+         parseEcdhReply, sharedSecret, verifyEd25519Host } from "../../src/kex.wac";
+
+export i32 sshMsgKexEcdhReply() { return msgKexEcdhReply(); }
+export u8[] sshEphemeralPublic(u8[] secret) { return ephemeralPublic(secret); }
+export u8[] sshEcdhInit(u8[] qc) { return ecdhInit(qc); }
+export bool sshEcdhReplyOk(u8[] payload) { return parseEcdhReply(payload) is not null; }
+
+/** 0 = host key blob, 1 = server public, 2 = signature blob. */
+export u8[] sshEcdhReplyField(u8[] payload, i32 which) {
+  EcdhReply? r = parseEcdhReply(payload);
+  if (r is null) { return u8[0](); }
+  if (which == 0) { return r!.hostKey; }
+  if (which == 1) { return r!.serverPublic; }
+  if (which == 2) { return r!.signature; }
+  return u8[0]();
+}
+
+/** Empty when the peer's point is low-order, which must abort rather than continue. */
+export u8[] sshSharedSecret(u8[] secret, u8[] peerPublic) {
+  u8[]? k = sharedSecret(secret, peerPublic);
+  return k is null ? u8[0]() : k!;
+}
+
+export u8[] sshExchangeHash(u8[] vc, u8[] vs, u8[] ic, u8[] isrv, u8[] ks,
+                            u8[] qc, u8[] qs, u8[] k) {
+  return exchangeHash(vc, vs, ic, isrv, ks, qc, qs, k);
+}
+
+export bool sshVerifyHostKey(u8[] hostKey, u8[] signature, u8[] h) {
+  return verifyEd25519Host(hostKey, signature, h);
+}
+
+export u8[] sshDeriveKey(u8[] k, u8[] h, u8[] sessionId, i32 letter, i32 needed) {
+  return deriveKey(k, h, sessionId, letter, needed);
+}

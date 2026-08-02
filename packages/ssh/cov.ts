@@ -222,4 +222,85 @@ ignoringTraps(() => mAt.sshKexInitFirst(new Uint8Array(15), false));
 ignoringTraps(() => m.sshKexInit(new Uint8Array(0)));
 ignoringTraps(() => m.sshFrame(new Uint8Array(10), new Uint8Array(0), 8));
 
+// ── Key exchange ──────────────────────────────────────────────────────────────
+//
+// Kept to a handful of curve operations: X25519 and Ed25519 are the expensive things in the repo,
+// and the branches here are all in the parsing and checking around them, not inside.
+
+const mKex = run.mod as unknown as {
+  sshMsgKexEcdhReply(): number;
+  sshEphemeralPublic(secret: Uint8Array): Uint8Array;
+  sshEcdhInit(qc: Uint8Array): Uint8Array;
+  sshEcdhReplyOk(payload: Uint8Array): boolean;
+  sshEcdhReplyField(payload: Uint8Array, which: number): Uint8Array;
+  sshSharedSecret(secret: Uint8Array, peerPublic: Uint8Array): Uint8Array;
+  sshExchangeHash(vc: Uint8Array, vs: Uint8Array, ic: Uint8Array, isrv: Uint8Array,
+                  ks: Uint8Array, qc: Uint8Array, qs: Uint8Array, k: Uint8Array): Uint8Array;
+  sshVerifyHostKey(hostKey: Uint8Array, signature: Uint8Array, h: Uint8Array): boolean;
+  sshDeriveKey(k: Uint8Array, h: Uint8Array, sid: Uint8Array, letter: number, needed: number): Uint8Array;
+};
+
+mKex.sshMsgKexEcdhReply();
+const secret = Uint8Array.from({ length: 32 }, (_, i) => i + 1);
+const qc = mKex.sshEphemeralPublic(secret);
+mKex.sshEcdhInit(qc);
+ignoringTraps(() => mKex.sshEphemeralPublic(new Uint8Array(31)));
+
+const str = (b: Uint8Array) => {
+  const out = new Uint8Array(4 + b.length);
+  new DataView(out.buffer).setUint32(0, b.length);
+  out.set(b, 4);
+  return out;
+};
+const join = (...parts: Uint8Array[]) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  return out;
+};
+
+const hostKeyBlob = join(str(bytes("ssh-ed25519")), str(new Uint8Array(32).fill(2)));
+const sigBlob = join(str(bytes("ssh-ed25519")), str(new Uint8Array(64).fill(3)));
+const reply = join(new Uint8Array([31]), str(hostKeyBlob), str(qc), str(sigBlob));
+mKex.sshEcdhReplyOk(reply);
+for (let which = 0; which < 4; which++) mKex.sshEcdhReplyField(reply, which);
+
+for (
+  const bad of [
+    new Uint8Array([20]),                                          // not an ECDH reply
+    new Uint8Array([31]),                                          // truncated immediately
+    reply.slice(0, 20),                                            // truncated mid-field
+    join(new Uint8Array([31]), str(hostKeyBlob), str(new Uint8Array(31)), str(sigBlob)),  // Q_S 31 bytes
+  ]
+) {
+  mKex.sshEcdhReplyOk(bad);
+  mKex.sshEcdhReplyField(bad, 0);
+}
+
+mKex.sshSharedSecret(secret, qc);
+mKex.sshSharedSecret(secret, new Uint8Array(32));                  // all-zero point
+mKex.sshSharedSecret(new Uint8Array(31), qc);                      // wrong secret length
+mKex.sshSharedSecret(secret, new Uint8Array(31));                  // wrong peer length
+
+const h = mKex.sshExchangeHash(bytes("SSH-2.0-a"), bytes("SSH-2.0-b"), new Uint8Array([20]),
+                               new Uint8Array([20]), hostKeyBlob, qc, qc, secret);
+
+// Every rejection in the host key check, then one real verification.
+mKex.sshVerifyHostKey(hostKeyBlob, sigBlob, h);                              // names right, bytes bogus
+mKex.sshVerifyHostKey(join(str(bytes("ssh-rsa")), str(new Uint8Array(32))), sigBlob, h);
+mKex.sshVerifyHostKey(hostKeyBlob, join(str(bytes("ssh-rsa")), str(new Uint8Array(64))), h);
+mKex.sshVerifyHostKey(join(str(bytes("ssh-ed25519")), str(new Uint8Array(31))), sigBlob, h);
+mKex.sshVerifyHostKey(hostKeyBlob, join(str(bytes("ssh-ed25519")), str(new Uint8Array(63))), h);
+mKex.sshVerifyHostKey(new Uint8Array(0), sigBlob, h);
+mKex.sshVerifyHostKey(hostKeyBlob, new Uint8Array(0), h);
+
+// A name the same length as "ssh-ed25519" but not equal. Every other wrong name here differs in
+// length and is rejected before the bytes are compared, so without this the comparison loop never
+// takes its mismatch branch.
+mKex.sshVerifyHostKey(join(str(bytes("ssh-ed25518")), str(new Uint8Array(32))), sigBlob, h);
+mKex.sshVerifyHostKey(hostKeyBlob, join(str(bytes("ssh-ed25518")), str(new Uint8Array(64))), h);
+
+// One hash block, and more than one, so the extension loop is entered as well as skipped.
+for (const needed of [16, 32, 64]) mKex.sshDeriveKey(secret, h, h, 0x41, needed);
+
 report([run], "packages/ssh/", { verbose });
