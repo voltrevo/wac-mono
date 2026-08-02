@@ -114,15 +114,15 @@ export ClientHello parseClientHello(u8[] body, i32 preferredSuite) {
         while (!shares.empty()) {
           i32 group = shares.u16();
           u8[] key = shares.vec16();
-          if (group == 0x11EC && key.len() == 1216) {
+          if (group == groupHybrid() && key.len() == 1216) {
             hybridShare = u8[1218]();
             hybridShare[0] = 0x11; hybridShare[1] = 0xEC;
             for (i32 i = 0; i < 1216; i++) { hybridShare[2 + i] = key[i]; }
-          } else if (group == 0x001d && key.len() == 32) {
+          } else if (group == groupX25519() && key.len() == 32) {
             x25519Share = u8[34]();
             x25519Share[0] = 0x00; x25519Share[1] = 0x1d;
             for (i32 i = 0; i < 32; i++) { x25519Share[2 + i] = key[i]; }
-          } else if (group == 0x0017 && key.len() == 65) {
+          } else if (group == groupP256() && key.len() == 65) {
             p256Share = u8[67]();
             p256Share[0] = 0x00; p256Share[1] = 0x17;
             for (i32 i = 0; i < 65; i++) { p256Share[2 + i] = key[i]; }
@@ -134,7 +134,7 @@ export ClientHello parseClientHello(u8[] body, i32 preferredSuite) {
       } else if (kind == 13) {
         Reader algs = body2.sub16();
         while (!algs.empty()) {
-          if (algs.u16() == 0x0807) { ed = true; }
+          if (algs.u16() == sigEd25519()) { ed = true; }
         }
       } else if (kind == 0) {
         // server_name: a list of names, each a type byte and a length-prefixed string.
@@ -177,28 +177,28 @@ export u8[] serverHello(u8[] random, u8[] sessionId, i32 suite, i32 group, u8[] 
 
   Writer exts = Writer.create();
   // supported_versions: the actual version, and the only place it appears.
-  exts.u16(43);
+  exts.u16(extSupportedVersions());
   Writer sv = Writer.create();
   sv.u16(0x0304);
   exts.vec16(sv.take());
   // key_share: the server's single share, not a list, and in the group the client's
   // share used — a ServerHello that answers in a different group is not a negotiation,
   // it is a HelloRetryRequest, which is a different message.
-  exts.u16(51);
+  exts.u16(extKeyShare());
   Writer ks = Writer.create();
   ks.u16(group);
   ks.vec16(keyShare);
   exts.vec16(ks.take());
 
   body.vec16(exts.take());
-  return handshakeMessage(2, body.take());
+  return handshakeMessage(hsServerHello(), body.take());
 }
 
 /** EncryptedExtensions, with nothing in it. */
 export u8[] encryptedExtensions() {
   Writer body = Writer.create();
   body.vec16(u8[0]());
-  return handshakeMessage(8, body.take());
+  return handshakeMessage(hsEncryptedExtensions(), body.take());
 }
 
 /**
@@ -216,7 +216,7 @@ export u8[] certificate(u8[] der) {
   entry.vec16(u8[0]());           // per-certificate extensions
 
   body.vec24(entry.take());
-  return handshakeMessage(11, body.take());
+  return handshakeMessage(hsCertificate(), body.take());
 }
 
 /**
@@ -242,14 +242,14 @@ export u8[] certificateVerifyContent(u8[] transcriptHash, bool isServer) {
 /** A CertificateVerify carrying an ed25519 signature. */
 export u8[] certificateVerify(u8[] signature) {
   Writer body = Writer.create();
-  body.u16(0x0807);               // ed25519
+  body.u16(sigEd25519());               // ed25519
   body.vec16(signature);
-  return handshakeMessage(15, body.take());
+  return handshakeMessage(hsCertificateVerify(), body.take());
 }
 
 /** A Finished message. */
 export u8[] finished(u8[] verifyData) {
-  return handshakeMessage(20, verifyData);
+  return handshakeMessage(hsFinished(), verifyData);
 }
 
 /** The type of a handshake message, from its header. */

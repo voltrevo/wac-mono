@@ -16,6 +16,15 @@
 export type KnownSurvivor = { name: string; why: string };
 
 export const KNOWN_SURVIVORS: KnownSurvivor[] = [
+  {
+    name: "guard/crypto/rsa:54:23",
+    why:
+      "toBytes' overflow guard, which fires when a value does not fit the length it is " +
+      "being written into. Every caller takes that length from the modulus and passes a " +
+      "value already reduced below it, so it always fits. Defensive against a future " +
+      "caller that computes the length some other way, and recorded in " +
+      "packages/crypto/cov.ts for the same reason.",
+  },
   // ── crypto's remaining guards, after the ones that were real gaps were tested ──
   //
   // Nine survivors, each argued rather than tested. The distinction that matters is that

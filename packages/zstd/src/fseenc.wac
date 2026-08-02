@@ -1,0 +1,287 @@
+// FSE encoding — the inverse of `fse.wac` (RFC 8878, section 4.1).
+//
+// An FSE decoder reads its bitstream *backwards*, so an encoder must produce symbols from last
+// to first: the bits a decoder reads first are the ones written last. Everything here is
+// therefore reversed relative to intuition, and that is the single thing to keep hold of.
+//
+// Encoding one symbol is the decoding step run in reverse. A decoder in state `u` emits
+// `symbol[u]` and moves to `newState[u] + read(nbBits[u])`. So an encoder that knows the symbol
+// and the state it must *arrive* at needs the `u` whose transition range contains that state —
+// and then emits the offset within the range.
+//
+// The states for one symbol partition the whole state space between them, so exactly one `u`
+// qualifies. Finding it is a lookup here, in a table of one entry per (symbol, target state).
+// zstd computes it arithmetically from two per-symbol deltas instead, which is smaller and much
+// harder to be sure of; this is the version that can be checked by eye against `fse.wac`.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { FseTable, buildFromCounts } from "./fse.wac";
+
+i32 highBit(i32 v) {
+  i32 n = -1;
+  i32 x = v;
+  while (x != 0) {
+    n++;
+    x = x >>> 1;
+  }
+  return n;
+}
+
+/**
+ * A bit writer whose output is meant to be read backwards.
+ *
+ * Bits go into increasing positions, least significant first, which is exactly the order that
+ * makes `BackBits` — reading down from the top — see them the other way round. The stream ends
+ * with a single set bit, the marker that tells a decoder where the padding stops.
+ */
+export struct BitOut {
+  Buf bytes;
+  i32 cur;             // bits of the byte being filled
+  i32 used;            // how many of them
+
+  BitOut create() { return BitOut(Buf.create(), 0, 0); }
+
+  /** Append `n` bits of `v`, least significant first. */
+  void write(this, i32 v, i32 n) {
+    for (i32 i = 0; i < n; i++) {
+      this.cur = this.cur | (((v >>> i) & 1) << this.used);
+      this.used++;
+      if (this.used == 8) {
+        this.bytes.push(this.cur);
+        this.cur = 0;
+        this.used = 0;
+      }
+    }
+  }
+
+  /**
+   * Close a byte-aligned field: pad the last byte with zeros and hand it over.
+   *
+   * For a table description, which is read forwards and whose length the reader works out from
+   * the counts themselves. Closing one with `finish` instead would append a marker bit — and if
+   * the description already ended on a boundary, a whole extra byte that the reader would take
+   * for the start of the bitstream.
+   */
+  u8[] flush(this) {
+    if (this.used > 0) {
+      this.bytes.push(this.cur);
+      this.cur = 0;
+      this.used = 0;
+    }
+    return this.bytes.take();
+  }
+
+  /** Close a backwards stream: one set bit as the marker, then whatever byte it lands in. */
+  u8[] finish(this) {
+    this.write(1, 1);
+    if (this.used > 0) {
+      this.bytes.push(this.cur);
+      this.cur = 0;
+      this.used = 0;
+    }
+    return this.bytes.take();
+  }
+}
+
+/**
+ * Scale counts so they sum to exactly `1 << log`, which is what a table description carries.
+ *
+ * Not zstd's normaliser. That one distributes the rounding error using a table of thresholds
+ * and falls back to a second algorithm in a corner case; it wins a fraction of a percent of
+ * ratio and is a great deal of machinery to be sure of. This one rounds proportionally, gives
+ * every symbol that occurs at least one slot, and settles the difference against the largest —
+ * which is correct, produces a valid distribution, and can be read in one sitting.
+ *
+ * A symbol that occurs must never normalise to zero: zero means "cannot appear", and encoding
+ * it afterwards is impossible.
+ */
+export i32[] normalize(i32[] counts, i32 maxSymbol, i32 total, i32 log) {
+  if (total <= 0) { trap; }
+  i32 size = 1 << log;
+  i32[] norm = i32[maxSymbol + 1]();
+
+  i32 assigned = 0;
+  i32 largest = -1;
+  i32 largestCount = 0;
+  for (i32 s = 0; s <= maxSymbol; s++) {
+    if (counts[s] == 0) { continue; }
+    // Proportional share, rounded to nearest, floored at one slot.
+    i32 share = (counts[s] * size + total / 2) / total;
+    if (share < 1) { share = 1; }
+    norm[s] = share;
+    assigned += share;
+    if (counts[s] > largestCount) {
+      largestCount = counts[s];
+      largest = s;
+    }
+  }
+  if (largest < 0) { trap; }             // nothing occurs, so there is nothing to code
+
+  // Settle the rounding against the most frequent symbol, which has the most slots to spare.
+  // Taking slots from a rare symbol could drive it to zero, which would make it unencodable.
+  i32 slack = size - assigned;
+  norm[largest] += slack;
+  if (norm[largest] < 1) {
+    // The largest could not absorb it alone. Give it one slot and take the rest from whoever
+    // has more than one, largest first — slow, and only reached by distributions with many
+    // symbols and a small table.
+    norm[largest] = 1;
+    i32 need = 0;
+    for (i32 s = 0; s <= maxSymbol; s++) {
+      need += norm[s];
+    }
+    need -= size;
+    while (need > 0) {
+      i32 best = -1;
+      for (i32 s = 0; s <= maxSymbol; s++) {
+        if (norm[s] > 1 && (best < 0 || norm[s] > norm[best])) { best = s; }
+      }
+      if (best < 0) { trap; }            // more symbols than slots: the table is too small
+      norm[best]--;
+      need--;
+    }
+  }
+  return norm;
+}
+
+/** How wide a table to use: enough to separate the symbols, no wider than the data justifies. */
+export i32 optimalLog(i32 total, i32 maxSymbol, i32 maxLog) {
+  i32 log = maxLog;
+  // A table wider than the data has entries nothing will ever reach.
+  i32 fromSize = highBit(total) - 2;
+  if (log > fromSize) { log = fromSize; }
+  // ...but it must be wide enough to give every symbol somewhere to live.
+  i32 fromSymbols = highBit(maxSymbol) + 2;
+  if (log < fromSymbols) { log = fromSymbols; }
+  if (log < 5) { log = 5; }
+  if (log > maxLog) { log = maxLog; }
+  return log;
+}
+
+/**
+ * The encoding side of a table: for each symbol and each state it might have to reach, the
+ * state to encode from.
+ *
+ * One entry per (symbol, target) pair, which is `(maxSymbol + 1) << log` entries — 108 KB for
+ * the widest table zstd uses. Built per block, so it is not free, and it is the obvious thing
+ * to replace with zstd's two-delta arithmetic once there is a benchmark saying it matters.
+ */
+export struct CTable {
+  i32 log;
+  i32 size;
+  i32 maxSymbol;
+  i32[] fromState;     // symbol * size + target -> state to encode from
+  i32[] nbBits;        // per state, as in the decoding table
+  i32[] newState;      // per state, as in the decoding table
+  i32[] counts;        // the normalised counts, to refuse a symbol with no states
+}
+
+/** Build the encoding table from the same normalised counts a decoder would be given. */
+export CTable buildCTable(i32[] norm, i32 maxSymbol, i32 log) {
+  FseTable t = buildFromCounts(norm, maxSymbol, log);
+  i32 size = 1 << log;
+  i32[] fromState = i32[(maxSymbol + 1) * size]();
+
+  // Each state covers a contiguous run of targets. Across the states of one symbol those runs
+  // partition the whole space, so every (symbol, target) pair gets exactly one answer and none
+  // is written twice.
+  for (i32 u = 0; u < size; u++) {
+    i32 s = t.symbol[u];
+    i32 span = 1 << t.nbBits[u];
+    i32 base = t.newState[u];
+    for (i32 k = 0; k < span; k++) {
+      fromState[s * size + base + k] = u;
+    }
+  }
+
+  return CTable(log, size, maxSymbol, fromState, t.nbBits, t.newState, norm);
+}
+
+/** One encoding step: which state to move back to, and what to emit getting there. */
+export struct Step {
+  i32 state;           // the state to encode the *previous* symbol from
+  i32 value;
+  i32 bits;
+}
+
+/**
+ * Encode `symbol` given the state the decoder must arrive at.
+ *
+ * Returns the state to continue from — which, because this runs backwards, is the state the
+ * decoder will be in *before* it emits this symbol.
+ */
+export Step encodeStep(CTable c, i32 symbol, i32 target) {
+  if (symbol < 0 || symbol > c.maxSymbol) { trap; }
+  if (c.counts[symbol] == 0) { trap; }   // no state means it, so it cannot be written
+  if (target < 0 || target >= c.size) { trap; }
+  i32 u = c.fromState[symbol * c.size + target];
+  return Step(u, target - c.newState[u], c.nbBits[u]);
+}
+
+/**
+ * The state to start from when encoding the last symbol of a stream.
+ *
+ * Nothing follows it, so nothing constrains which of that symbol's states to use. Any target
+ * gives one, because a symbol's states cover every target between them — target zero keeps it
+ * deterministic.
+ */
+export i32 initialState(CTable c, i32 symbol) {
+  if (symbol < 0 || symbol > c.maxSymbol) { trap; }
+  if (c.counts[symbol] == 0) { trap; }
+  return c.fromState[symbol * c.size];
+}
+
+/**
+ * Write a table description: the accuracy log, then the normalised counts.
+ *
+ * The mirror of `readTable` in `fse.wac`, field for field. The width of each count shrinks as
+ * the remaining probability does, so the layout of a description depends on its whole prefix —
+ * which is why this and the reader have to agree exactly rather than approximately.
+ */
+export void writeDescription(BitOut o, i32[] norm, i32 maxSymbol, i32 log) {
+  i32 size = 1 << log;
+  o.write(log - 5, 4);
+
+  i32 remaining = size + 1;
+  i32 threshold = size;
+  i32 nbBits = log + 1;
+  i32 i = 0;
+
+  while (i <= maxSymbol && remaining > 1) {
+    i32 count = norm[i];
+    i32 stored = count + 1;                // the wire form is offset by one
+    i32 max = (2 * threshold - 1) - remaining;
+
+    if (stored < max) {
+      o.write(stored, nbBits - 1);
+    } else {
+      i32 v = stored;
+      if (v >= threshold) { v += max; }    // the reader subtracts this back off
+      o.write(v, nbBits);
+    }
+
+    i32 weight = count;
+    if (weight < 0) { weight = -weight; }
+    remaining -= weight;
+    while (remaining < threshold) {
+      nbBits--;
+      threshold = threshold >>> 1;
+    }
+    i++;
+
+    // A zero count opens a run, written in threes, and the field appears even when empty.
+    if (count == 0) {
+      i32 zeros = 0;
+      while (i + zeros <= maxSymbol && norm[i + zeros] == 0) {
+        zeros++;
+      }
+      i32 left = zeros;
+      while (left >= 3) {
+        o.write(3, 2);
+        left -= 3;
+      }
+      o.write(left, 2);
+      i += zeros;
+    }
+  }
+}
