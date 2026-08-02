@@ -140,6 +140,58 @@ fi`,
   `echo done`,
   `echo "if true"`,
 
+  // ── case ────────────────────────────────────────────────────────────────────
+  `case a in a) echo hit;; esac`,
+  `case b in a) echo no;; b) echo yes;; esac`,
+  `case x in a|b|x) echo alt;; esac`,
+  `case foo.txt in *.txt) echo text;; esac`,
+  `case foo.log in *.txt) echo text;; *) echo other;; esac`,
+  `case foo in *) echo default;; esac`,
+  `case foo in a) echo no;; esac`,
+  `case foo in a) echo no;; esac; echo $?`,
+  `case abc in a?c) echo q;; esac`,
+  `case "a b" in "a b") echo quoted;; esac`,
+  `case a in (a) echo parens;; esac`,
+  `x=b; case $x in b) echo expanded;; esac`,
+  `case a in a) echo one; echo two;; esac`,
+  `case a in b) echo no;; a) echo yes;; esac`,
+  `case a in a) ;; esac; echo $?`,
+  `case '*' in "*") echo literal;; esac`,
+  `case x in
+  a) echo a ;;
+  x) echo x ;;
+esac`,
+
+  // ── Functions ───────────────────────────────────────────────────────────────
+  `f() { echo in-function; }; f`,
+  `f() { echo "got $1 and $2"; }; f a b`,
+  `f() { echo $#; }; f a b c`,
+  `f() { echo $#; }; f`,
+  `greet() { echo hello $1; }; greet world; greet again`,
+  `f() { echo "$@"; }; f a b c`,
+  `f() { x=set-inside; }; f; echo $x`,
+  `f() { echo $1; }; f one; echo "[$1]"`,
+  `f() { false; }; f; echo $?`,
+  `f() { true; }; f; echo $?`,
+  `f() { echo a; }; f | rev`,
+  `f() { seq 1 3; }; f | wc -l`,
+  `outer() { inner; }; inner() { echo nested; }; outer`,
+  `f() { echo defined; }; echo before; f`,
+  `f() { if test "$1" = x; then echo isx; else echo notx; fi; }; f x; f y`,
+
+  // ── Subshells ───────────────────────────────────────────────────────────────
+  `(echo a)`,
+  `(echo a; echo b)`,
+  `x=1; (x=2; echo inside $x); echo outside $x`,
+  `(exit 3); echo $?`,
+  `(echo sub) | rev`,
+  `(true) && echo ok`,
+  `(false) || echo ko`,
+  `(seq 1 3) | wc -l`,
+  `f() { echo fn; }; (f); f`,
+  `(cd_does_not_exist) 2>/dev/null; echo $?`,
+  `echo $( (echo nested) )`,
+
   // ── Builtins ────────────────────────────────────────────────────────────────
   `echo -n no-newline`,
   `echo -n a; echo b`,

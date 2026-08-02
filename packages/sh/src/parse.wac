@@ -56,6 +56,17 @@ export enum CmdKind {
   For,
   /** `{ …; }` — a group, which this runs in the same shell as everything else. */
   Brace,
+  /** `( …; )` — a group whose variable changes do not escape. */
+  Subshell,
+  Case,
+  /** `name() { …; }` — a definition, which runs nothing when it is reached. */
+  Function,
+}
+
+/** One `pattern|pattern) list ;;` arm of a `case`. */
+export struct CaseArm {
+  Vec<Word> patterns;
+  Vec<AndOr> body;
 }
 
 /**
@@ -80,12 +91,14 @@ export struct Command {
   CmdKind kind;
   Simple simple;
   Vec<Clause> clauses;
-  /** `for`: the words iterated over. */
+  /** `for`: the words iterated over. `case`: the single word being matched. */
   Vec<Word> words;
-  /** `for`: the variable assigned each time round. */
+  /** `for`: the variable assigned each time round. `Function`: the name being defined. */
   string varName;
   /** Redirections attached to a compound command, which apply to the whole of it. */
   Vec<Redir> redirs;
+  /** `case`: its arms, in order — the first whose pattern matches wins. */
+  Vec<CaseArm> arms;
 }
 
 export struct Pipeline {
@@ -213,7 +226,8 @@ string reservedWord(Token t) {
   string w = only.text;
   if (w == "if" || w == "then" || w == "elif" || w == "else" || w == "fi"
       || w == "while" || w == "until" || w == "do" || w == "done"
-      || w == "for" || w == "in" || w == "{" || w == "}") {
+      || w == "for" || w == "in" || w == "{" || w == "}"
+      || w == "case" || w == "esac") {
     return w;
   }
   return "";
@@ -247,6 +261,12 @@ i32 parseListUntil(Vec<Token> toks, i32 at, Vec<AndOr> out, string a, string b, 
     }
     string w = reservedWord(toks.get(p));
     if (w != "" && (w == a || w == b || w == c)) { return p; }
+    // An arm's body ends at `;;` as well as at the word the caller named.
+    match (toks.get(p).kind) {
+      case DSemi: return p;
+      case RParen: return p;
+      else: {}
+    }
 
     AndOr list = AndOr(Vec.create(), false);
     i32 next = parseAndOr(toks, p, list);
@@ -287,7 +307,7 @@ i32 parsePipeline(Vec<Token> toks, i32 at, Pipeline out) {
 
 Command emptyCommand() {
   return Command(CmdKind.Plain, Simple(Vec.create(), Vec.create(), Vec.create()),
-                 Vec.create(), Vec.create(), "", Vec.create());
+                 Vec.create(), Vec.create(), "", Vec.create(), Vec.create());
 }
 
 /** One pipeline stage: a compound command if it starts with a reserved word, else a plain one. */
@@ -300,6 +320,19 @@ i32 parseCommand(Vec<Token> toks, i32 at, Command out) {
   if (w == "until") { out.kind = CmdKind.Until; return parseLoop(toks, at, out, "until"); }
   if (w == "for") { return parseFor(toks, at, out); }
   if (w == "{") { return parseBrace(toks, at, out); }
+  if (w == "case") { return parseCase(toks, at, out); }
+
+  match (toks.get(at).kind) {
+    case LParen: return parseSubshell(toks, at, out);
+    else: {}
+  }
+
+  // `name ( )` followed by a compound command is a definition. Detected here because the two
+  // tokens after the name are the only thing that distinguishes it from running `name`.
+  if (w == "" && at + 2 < toks.len() && isWord(toks.get(at)) && isLParen(toks.get(at + 1))
+      && isRParen(toks.get(at + 2))) {
+    return parseFunction(toks, at, out);
+  }
   // A list-terminating word here means an empty command, which is a syntax error rather than
   // something to run: `if; then` and `while do` reach this.
   if (w != "") { return -1; }
@@ -390,6 +423,129 @@ i32 parseFor(Vec<Token> toks, i32 at, Command out) {
   if (p < 0 || p >= toks.len() || reservedWord(toks.get(p)) != "done") { return -1; }
   out.clauses.push(body);
   return takeRedirs(toks, p + 1, out);
+}
+
+bool isWord(Token t) {
+  match (t.kind) {
+    case Word: return true;
+    else: return false;
+  }
+}
+
+bool isLParen(Token t) {
+  match (t.kind) {
+    case LParen: return true;
+    else: return false;
+  }
+}
+
+bool isRParen(Token t) {
+  match (t.kind) {
+    case RParen: return true;
+    else: return false;
+  }
+}
+
+/**
+ * `case word in (pattern|pattern) list ;; … esac`
+ *
+ * The opening parenthesis of an arm is optional and the closing one is not, which is the one
+ * asymmetry in the shell grammar that reads like a mistake and is not. Inside an arm's pattern
+ * list `|` separates patterns rather than building a pipeline — the same token meaning two
+ * different things a few characters apart.
+ */
+i32 parseCase(Vec<Token> toks, i32 at, Command out) {
+  out.kind = CmdKind.Case;
+  i32 p = at + 1;
+  if (p >= toks.len() || !isWord(toks.get(p))) { return -1; }
+  out.words.push(Word.of(toks.get(p).parts));
+  p = skipSeparators(toks, p + 1);
+  if (p >= toks.len() || reservedWord(toks.get(p)) != "in") { return -1; }
+  p = skipSeparators(toks, p + 1);
+
+  while (p < toks.len()) {
+    if (reservedWord(toks.get(p)) == "esac") { return takeRedirs(toks, p + 1, out); }
+
+    CaseArm arm = CaseArm(Vec.create(), Vec.create());
+    if (isLParen(toks.get(p))) { p++; }                        // the optional opening paren
+    while (p < toks.len()) {
+      if (!isWord(toks.get(p))) { return -1; }
+      arm.patterns.push(Word.of(toks.get(p).parts));
+      p++;
+      if (p < toks.len() && isPipe(toks.get(p))) { p++; continue; }
+      break;
+    }
+    if (p >= toks.len() || !isRParen(toks.get(p))) { return -1; }
+    p++;
+
+    p = parseListUntil(toks, p, arm.body, "esac", "", "");
+    if (p < 0) { return -1; }
+    out.arms.push(arm);
+    if (p >= toks.len()) { return -1; }
+    match (toks.get(p).kind) {
+      case DSemi: { p = skipSeparators(toks, p + 1); }
+      else: {
+        // A final arm may omit its `;;` before `esac`, which is legal and common.
+        if (reservedWord(toks.get(p)) != "esac") { return -1; }
+      }
+    }
+  }
+  return -1;
+}
+
+bool isPipe(Token t) {
+  match (t.kind) {
+    case Pipe: return true;
+    else: return false;
+  }
+}
+
+/** `( list )` — a group whose effects on variables do not escape. */
+i32 parseSubshell(Vec<Token> toks, i32 at, Command out) {
+  out.kind = CmdKind.Subshell;
+  Clause body = Clause(Vec.create(), Vec.create());
+  i32 p = skipSeparators(toks, at + 1);
+  while (p < toks.len() && !isRParen(toks.get(p))) {
+    AndOr list = AndOr(Vec.create(), false);
+    i32 next = parseAndOr(toks, p, list);
+    if (next < 0 || list.items.len() == 0) { return -1; }
+    p = next;
+    if (p < toks.len()) {
+      match (toks.get(p).kind) {
+        case Semi: { p++; }
+        case Newline: { p++; }
+        else: {}
+      }
+    }
+    body.body.push(list);
+    p = skipSeparators(toks, p);
+  }
+  if (p >= toks.len() || !isRParen(toks.get(p))) { return -1; }
+  out.clauses.push(body);
+  return takeRedirs(toks, p + 1, out);
+}
+
+/** `name() compound` — a definition. Its body is stored and nothing runs until it is called. */
+i32 parseFunction(Vec<Token> toks, i32 at, Command out) {
+  out.kind = CmdKind.Function;
+  Token name = toks.get(at);
+  if (name.parts.len() != 1) { return -1; }
+  out.varName = name.parts.get(0).text;
+
+  i32 p = skipSeparators(toks, at + 3);
+  Command body = emptyCommand();
+  i32 next = parseCommand(toks, p, body);
+  if (next < 0) { return -1; }
+  // The body is a command, and a command is not a list — so it is kept as the single item of a
+  // one-item pipeline, which is what the executor already knows how to run.
+  Pipeline pipeline = Pipeline(Vec.create());
+  pipeline.stages.push(body);
+  AndOr list = AndOr(Vec.create(), false);
+  list.items.push(Item(AndOrOp.First, pipeline));
+  Clause clause = Clause(Vec.create(), Vec.create());
+  clause.body.push(list);
+  out.clauses.push(clause);
+  return next;
 }
 
 /** `{ list ; }` — a group, run in this shell rather than a subshell. */

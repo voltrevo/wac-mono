@@ -57,9 +57,14 @@ Stat fakeStat(string path) { return Stat.of(false, false, false, 0, 0); }
 
 string[]? fakeReadDir(string path) {
   if (path == "dir") {
-    string[] names = string[2]();
-    names[0] = "one";
-    names[1] = "two";
+    // Deliberately out of order and with a dotfile: a glob sorts its matches and excludes names
+    // beginning with a dot unless the pattern does too, and neither branch runs against a tidy
+    // directory of two sorted names.
+    string[] names = string[4]();
+    names[0] = "two";
+    names[1] = "one";
+    names[2] = ".hidden";
+    names[3] = "three";
     return names;
   }
   return null;

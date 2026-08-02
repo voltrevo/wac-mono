@@ -79,21 +79,6 @@ export struct Token {
   Token of(Kind kind) { return Token(kind, Vec.create(), -1); }
 }
 
-export struct Lexer {
-  string src;
-  i32 at;
-
-  Lexer create(string src) { return Lexer(src, 0); }
-
-  bool done(const this) { return this.at >= this.src.len(); }
-
-  i32 peek(const this, i32 ahead) {
-    i32 i = this.at + ahead;
-    if (i >= this.src.len()) { return -1; }
-    return this.src.toBytes()[i];
-  }
-}
-
 /** Every token in `src`, ending with `Eof` — or with `Bad` if a quote never closed. */
 export Vec<Token> tokenize(string src) {
   Vec<Token> out = Vec.create();
@@ -323,8 +308,11 @@ i32 lexDollar(u8[] s, i32 at, Token word, bool quoted) {
     return p + 1;
   }
 
-  // `$?`, `$$`, `$#` and `$0`…`$9` are one character each; a name is the usual run.
-  if (c == 0x3f || c == 0x24 || c == 0x23 || c == 0x21 || (c >= 0x30 && c <= 0x39)) {
+  // `$?`, `$$`, `$#`, `$@`, `$*` and `$0`…`$9` are one character each; a name is the usual run.
+  // `@` and `*` were missing here while `lookUp` already understood them, so `"$@"` stayed
+  // literal — the expansion existed and nothing could reach it.
+  if (c == 0x3f || c == 0x24 || c == 0x23 || c == 0x21 || c == 0x40 || c == 0x2a
+      || (c >= 0x30 && c <= 0x39)) {
     word.parts.push(Part.of(PartKind.Var, charOf(c), quoted));
     return p + 1;
   }

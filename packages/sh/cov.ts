@@ -96,6 +96,78 @@ const SCRIPTS: string[] = [
   "if true; then while false; do echo n; done; fi",
   "echo if", "echo then", "echo done", "echo }",
 
+  // ── Reaching what the shapes above miss ─────────────────────────────────────
+  "exit 1; echo never",                            // `exiting` short-circuits a list
+  "f() { exit 2; }; f; echo never",
+  "(exit 1; echo never)",
+  "for x in a b; do exit 1; done; echo never",
+  "while true; do exit 1; done",
+  "if true; then exit 1; fi; echo never",
+  "case a in a) exit 1;; esac; echo never",
+  "{ exit 1; }; echo never",
+  "false && echo skipped",                         // the `And` arm that does not run
+  "true && false && echo skipped",
+  "{ echo a; } >> out.txt",                        // append on a compound
+  "( echo a ) >> out.txt",
+  "if true; then echo a; fi >> out.txt",
+  "{ echo a; } < in.txt",                          // an input redirection on a compound
+  "{ echo a; }",                                   // a compound that writes rather than collects
+  "echo dir/.*",                                   // a pattern that starts with a dot
+  "echo dir/*e",
+  "echo 2>&1",                                     // `2` then a redirection with no space
+  "echo a 2>> out.txt",
+  "echo a 0< in.txt",
+  "echo a 9> out.txt",
+  "test -1 -eq -1",                                // a negative number through atoi
+  "test - -eq 0",                                  // a lone minus
+  "test x -eq 1",                                  // a non-number
+  "test '' -eq 0",
+  "echo \\",                                        // a trailing backslash
+  "echo a\\",
+  "x=$(echo a; exit 3); echo $x$?",
+
+  "for x in a b c; do if test $x = b; then exit 1; fi; done",
+  "until false; do exit 1; done",
+  "case a in a) echo x;; esac | rev",
+  "f() { echo x; }; f | rev",
+  "echo dir/.h*", "echo dir/.*", "echo dir/t*", "echo dir/*e", "echo dir/three",
+
+  "if true; then echo a & fi",                      // `&` inside a compound body
+  "while true; do echo a & done",
+  "for x in do; do echo $x; done",                 // a word that is also a keyword
+  "for x in a do echo",
+  "a1=1; echo $a1",                                // a digit inside a name
+  "_x=1; echo $_x",
+  "$x=1",                                          // first part is an expansion, not a name
+  '"x"=1',                                         // first part is quoted
+  "=1", "1x=1", "x-y=1", "x =1", "x= 1",
+  "case a in a) echo x;; esac",
+  "f() { echo a; } > out.txt",
+
+  // ── The programs' edges ─────────────────────────────────────────────────────
+  //
+  // Comparisons and splitting have cases a shell script reaches only with the right shapes:
+  // equal-length lines that differ, a line with no trailing newline, an empty needle.
+  "echo a | cat - - | uniq",                       // adjacent duplicates
+  "seq 10 11 | uniq",                              // same length, different
+  "seq 1 12 | sort",                               // different lengths, sorted
+  "seq 1 12 | sort -r",
+  "echo -n ab | rev",                              // no trailing newline
+  "echo -n ab | wc -c",
+  "echo -n ab | sort",
+  "echo -n ab | uniq",
+  "echo -n ab | nl",
+  "echo abc | tr abc ''",                          // an empty second set
+  "echo abc | tr '' x",                            // an empty first set
+  "echo a | grep ''",                              // an empty needle
+  "echo a | grep abcdef",                          // needle longer than the line
+  "cat in.txt | grep alpha",
+  "cat in.txt | uniq",
+  "seq 1 3 | head -n 0",
+  "seq 1 3 | tail -n 0",
+  "seq 5 5 | wc -l",
+  "seq 1 1 | sort",
+
   // ── Globbing ────────────────────────────────────────────────────────────────
   //
   // The fake `readDir` answers for `dir` and nothing else, so these reach both the matched and
@@ -106,9 +178,99 @@ const SCRIPTS: string[] = [
   "x=dir/*; echo $x", `x=dir/*; echo "$x"`, "echo dir/* dir/*",
   "echo dir/**", "echo dir/?", "echo ?", "echo dir/",
 
+  // ── case ────────────────────────────────────────────────────────────────────
+  "case a in a) echo hit;; esac", "case b in a) echo no;; b) echo yes;; esac",
+  "case x in a|b|x) echo alt;; esac", "case f.txt in *.txt) echo t;; esac",
+  "case f in *) echo d;; esac", "case f in a) echo no;; esac",
+  "case a in (a) echo p;; esac", "case a in a) ;; esac",
+  "case a in a) echo one; echo two;; esac", "case a in a) echo x;; esac > out.txt",
+  `case "a b" in "a b") echo q;; esac`, `case '*' in "*") echo lit;; esac`,
+  "x=b; case $x in b) echo e;; esac", "case a in a) echo x;; b) echo y;; esac",
+  "case a in\n  a) echo nl ;;\nesac",
+  // Malformed: every way an arm can be wrong.
+  "case", "case a", "case a in", "case a in a", "case a in a)", "case a in a) echo x",
+  "case a in a) echo x;;", "case a in )", "case a in a b) echo x;; esac",
+  "case a in a|) echo x;; esac", "case a in a| ;; esac", "case ;; esac",
+  "case a in esac", "case a in a) echo x;; esac junk",
+
+  // ── Functions ───────────────────────────────────────────────────────────────
+  "f() { echo fn; }; f", "f() { echo $1; }; f arg", "f() { echo $#; }; f a b",
+  "f() { echo $#; }; f", `f() { echo "$@"; }; f a b`, `f() { echo "$*"; }; f a b`,
+  "f() { echo $9; }; f a", "f() { x=1; }; f; echo $x", "f() { false; }; f; echo $?",
+  "f() { echo a; }; f | rev", "f() { seq 1 2; }; f | wc -l",
+  "outer() { inner; }; inner() { echo n; }; outer",
+  "f() { echo a; }; f > out.txt", "f() { exit 4; }; f; echo after",
+  "f() { echo x; }; f; f; f",
+  "f() { if true; then echo t; fi; }; f",
+  // Malformed definitions.
+  "f()", "f( )", "f() ", "f() echo notcompound", "f(x) { echo x; }", "() { echo x; }",
+
+  // ── Subshells ───────────────────────────────────────────────────────────────
+  "(echo a)", "(echo a; echo b)", "x=1; (x=2; echo $x); echo $x", "(exit 3); echo $?",
+  "(echo s) | rev", "(true) && echo ok", "(false) || echo ko", "(seq 1 2) | wc -l",
+  "f() { echo fn; }; (f)", "(f() { echo i; }; f)", "(echo a) > out.txt",
+  "( )", "(", "(echo a", "()", "(;)", "( ; echo a )",
+  "echo $( (echo n) )", "((echo a))",
+
   // A loop that runs past the bound, so the guard that stops it is reached.
   "while true; do :; done",
 ];
+
+/**
+ * Every prefix of a script, cut at whitespace.
+ *
+ * A compound command has a truncation path at each of its keywords — `if`, `if true`, `if true;
+ * then`, and so on — and writing them out by hand misses some and duplicates others. Generating
+ * them reaches every "ran out of tokens" branch in one go.
+ */
+function prefixes(script: string): string[] {
+  const words = script.split(" ");
+  const out: string[] = [];
+  for (let i = 1; i < words.length; i++) out.push(words.slice(0, i).join(" "));
+  // Word boundaries are too coarse for the parser: `f()` and `a|b)` are one word each and their
+  // interesting truncations are inside. Every character cut catches those, and the duplicates
+  // cost nothing.
+  for (let i = 1; i < script.length; i++) out.push(script.slice(0, i));
+  return out;
+}
+
+for (
+  const complete of [
+    "if true; then echo a; elif false; then echo b; else echo c; fi",
+    "while true; do echo a; done",
+    "until true; do echo a; done",
+    "for x in a b; do echo $x; done",
+    "case a in a|b) echo x;; *) echo y;; esac",
+    "{ echo a; echo b; }",
+    "( echo a; echo b )",
+    "f() { echo a; }",
+    "echo a | rev | wc -l",
+    "echo a && echo b || echo c",
+    "echo a > out.txt",
+    "cat < in.txt",
+    "case a in a) echo x ;; b) echo y ;; esac",
+    "f() { echo a; echo b; }",
+    "for x in a b c; do echo $x; done",
+    "if a; then b; elif c; then d; else e; fi",
+  ]
+) {
+  SCRIPTS.push(complete);
+  for (const p of prefixes(complete)) SCRIPTS.push(p);
+}
+
+// Shapes the prefixes do not reach: a bad token where a list may start, and the separators.
+for (
+  const odd of [
+    `"unterminated`, "'unterminated", "; echo a", ";; echo a", "&", "& echo a",
+    "echo a &", "echo a & echo b", "\necho a", "echo a\n\necho b",
+    "if true; then echo a\necho b; fi",
+    "( echo a\necho b )", "( echo a & )", "for x in a\ndo echo $x; done",
+    ") echo a", "esac", "then echo a", "do echo a", "done", "fi", "}",
+    "case a in a) echo x\n;; esac",
+  ]
+) {
+  SCRIPTS.push(odd);
+}
 
 for (const script of SCRIPTS) {
   m.shOut(script);
@@ -116,7 +278,14 @@ for (const script of SCRIPTS) {
   m.shErr(script);
 }
 // The other side of the capture flag: output written through the capability instead of collected.
-for (const script of ["echo written", "echo a | rev", "{ echo grouped; }", "echo x > out.txt"]) {
+for (
+  const script of [
+    "echo written", "echo a | rev", "{ echo grouped; }", "echo x > out.txt",
+    "if true; then echo i; fi", "for x in a; do echo $x; done", "while false; do :; done",
+    "case a in a) echo c;; esac", "( echo s )", "f() { echo f; }; f",
+    "echo dir/*", "exit 1", "nosuchcommand",
+  ]
+) {
   m.shWritten(script);
 }
 
