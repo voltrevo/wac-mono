@@ -12,6 +12,8 @@
 // tests are against zstd's own output rather than against a reading of the specification.
 
 import { Buf } from "../../bytes/src/buf.wac";
+import { Decoder, decodeCompressed } from "./block.wac";
+import { xxh64Low } from "./xxh64.wac";
 
 /** `0xFD2FB528`, little-endian, at the start of every zstd frame. */
 i32 magic() { return 0xFD2FB528; }
@@ -175,22 +177,43 @@ export u8[] decompress(u8[] src) {
     if (m != magic()) { trap; }
 
     FrameHeader h = readHeader(r);
+
+    // A frame that names a dictionary cannot be decoded without it: the dictionary supplies the
+    // starting entropy tables, the starting repeat offsets, and a window of history the first
+    // matches reach into. Refused outright rather than attempted — without it the output is
+    // wrong rather than short, and wrong output that looks plausible is the worst outcome here.
+    //
+    // This does not catch every dictionary. A *raw content* dictionary is just history, and a
+    // frame using one declares no identifier at all — it is indistinguishable from an ordinary
+    // frame until a match reaches back before the start of the output, which the offset check
+    // in `sequences.wac` refuses. That refusal is real but incidental, and a frame whose matches
+    // happen never to reach into the dictionary would decode correctly, which is only to say the
+    // dictionary was not doing anything.
+    if (h.dictId != 0) { trap; }
+
     i32 startLen = out.len;
-    decodeBlocks(r, out);
+    // Per frame, not per file: a second frame starts with no tables and the initial offsets.
+    decodeBlocks(r, out, Decoder.create());
+
+    if (h.contentSize >= 0 && ((out.len - startLen) as i64) != h.contentSize) { trap; }
 
     if (h.hasChecksum) {
-      // Four bytes of XXH64, low bits first. Checking it needs XXH64, which is the next piece
-      // of work; skipping the field keeps the frame walk correct meanwhile.
-      r.skip(4);
+      // The low four bytes of XXH64 over this frame's content, little-endian.
+      //
+      // Checked rather than skipped, because it is the only thing in the format that catches a
+      // frame which decoded without complaint into the wrong bytes. Everything else here
+      // verifies that the *encoding* made sense.
+      u32 want = r.num(4) as@ u32;   // raw: a checksum with the top bit set is negative as an i32
+      u32 got = xxh64Low(out.data, startLen, out.len - startLen);
+      if (got != want) { trap; }
     }
-    if (h.contentSize >= 0 && ((out.len - startLen) as i64) != h.contentSize) { trap; }
   }
 
   return out.take();
 }
 
 /** The block loop: header, content, repeat until the one flagged last. */
-void decodeBlocks(Reader r, Buf out) {
+void decodeBlocks(Reader r, Buf out, Decoder d) {
   bool last = false;
   while (!last) {
     i32 header = r.num(3);
@@ -212,7 +235,9 @@ void decodeBlocks(Reader r, Buf out) {
         out.push(v);
       }
     } else if (blockType == 2) {
-      trap;   // compressed blocks: entropy coding, not yet implemented
+      if (size > r.left()) { trap; }
+      decodeCompressed(r.src, r.pos, size, out, d);
+      r.skip(size);
     } else {
       trap;   // block type 3 is reserved
     }
