@@ -17,6 +17,7 @@
 import { wacCompile } from "wac/wacCompile.ts";
 import { wacBindgen } from "wac/wacBindgen.ts";
 import { wacFiles } from "./wacFiles.ts";
+import { checkWacVersion } from "./wacVersion.ts";
 
 const CACHE_DIR = ".cache";
 
@@ -31,6 +32,9 @@ const CACHE_DIR = ".cache";
 const tempName = (base: string) => `${base}.${crypto.randomUUID()}.tmp`;
 
 export async function wacBind(entry: string): Promise<Record<string, unknown>> {
+  // Before the compiler is asked to do anything, so a stale checkout says so itself
+  // rather than surfacing as a type error in whichever package used a new feature.
+  checkWacVersion();
   const files = await wacFiles(entry);
   const result = wacCompile(files, entry);
 
