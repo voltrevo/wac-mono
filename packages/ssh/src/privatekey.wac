@@ -1,0 +1,167 @@
+// Reading an OpenSSH private key file — the `openssh-key-v1` format, not PKCS#8 or PEM RSA.
+//
+// The file is base64 between two marker lines. Inside:
+//
+//   "openssh-key-v1\0"
+//   string   ciphername          "none", or "aes256-ctr" and friends
+//   string   kdfname             "none" or "bcrypt"
+//   string   kdfoptions          -> string salt, uint32 rounds
+//   uint32   number of keys      always 1 in practice
+//   string   public key blob
+//   string   private section     encrypted when ciphername is not "none"
+//
+// and the private section, once decrypted:
+//
+//   uint32   checkint            the same random value…
+//   uint32   checkint            …twice
+//   string   key type            "ssh-ed25519"
+//   string   public key          32 bytes
+//   string   private key         64 bytes: the 32-byte seed followed by the public key again
+//   string   comment
+//   byte[]   padding             1, 2, 3, … up to the cipher's block size
+//
+// **The doubled checkint is the passphrase check.** There is no MAC over the private section, so
+// a wrong passphrase produces plausible random bytes and the only thing that says so is those two
+// words failing to match. That makes it a 2^-32 false accept, which is the format's design and
+// not something this can improve on — but it does mean the check must not be skipped, because
+// everything after it would then be parsed out of noise.
+//
+// Only `ssh-ed25519` keys and the `aes256-ctr` + `bcrypt` combination are read here. Others parse
+// far enough to be refused by name rather than misread.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { decode } from "../../codec/src/base64.wac";
+import { aesCtr } from "../../crypto/src/aesctr.wac";
+import { bcryptPbkdf } from "../../crypto/src/bcryptpbkdf.wac";
+import { Reader } from "./wire.wac";
+
+/** What went wrong, so a caller can say something useful rather than "bad key". */
+export enum KeyError {
+  Ok,
+  /** Not an `openssh-key-v1` file at all. */
+  NotOpenSsh,
+  /** A cipher or KDF this does not implement. */
+  Unsupported,
+  /** The structure is right but the bytes ran out. */
+  Malformed,
+  /** The check words disagree — almost always a wrong passphrase. */
+  BadPassphrase,
+  /** Parsed, but not an Ed25519 key. */
+  NotEd25519,
+}
+
+export struct PrivateKey {
+  KeyError error;
+  /** The 32-byte Ed25519 seed, which is what `ed25519Sign` takes. */
+  u8[] seed;
+  /** The public key blob, as it goes on the wire in a userauth request. */
+  u8[] publicBlob;
+}
+
+i32 magicLength() { return 15; }
+
+/** Strip the PEM armour and decode the base64 body. */
+u8[]? unarmour(u8[] pem) {
+  Buf body = Buf.create();
+  i32 at = 0;
+  while (at < pem.len()) {
+    i32 stop = at;
+    while (stop < pem.len() && pem[stop] != 10) { stop++; }
+    i32 lineEnd = stop;
+    if (lineEnd > at && pem[lineEnd - 1] == 13) { lineEnd--; }
+    // Marker lines start with '-'. Everything else is base64, including any the writer wrapped.
+    if (lineEnd > at && pem[at] != 0x2d) {
+      body.pushBytes(pem, at, lineEnd - at);
+    }
+    at = stop + 1;
+  }
+  return decode(body.take());
+}
+
+/**
+ * Read `pem`, decrypting with `passphrase` when the file is encrypted.
+ *
+ * An empty passphrase is fine for an unencrypted key and is what a caller passes when it does not
+ * have one; it is not treated as "no passphrase given", because a zero-length passphrase is legal
+ * and the file itself says whether one is needed.
+ */
+export PrivateKey readEd25519(u8[] pem, u8[] passphrase) {
+  u8[]? blobOrNull = unarmour(pem);
+  if (blobOrNull is null) { return fail(KeyError.NotOpenSsh); }
+  u8[] blob = blobOrNull!;
+
+  const u8[] MAGIC = u8[](0x6f, 0x70, 0x65, 0x6e, 0x73, 0x73, 0x68, 0x2d,
+                          0x6b, 0x65, 0x79, 0x2d, 0x76, 0x31, 0x00);   // "openssh-key-v1\0"
+  if (blob.len() < magicLength()) { return fail(KeyError.NotOpenSsh); }
+  for (i32 i = 0; i < magicLength(); i++) {
+    if (blob[i] != MAGIC[i]) { return fail(KeyError.NotOpenSsh); }
+  }
+
+  Reader r = Reader.create(blob, magicLength(), blob.len());
+  u8[] cipherName = r.str();
+  u8[] kdfName = r.str();
+  u8[] kdfOptions = r.str();
+  i32 keyCount = r.u32();
+  u8[] publicBlob = r.str();
+  u8[] section = r.str();
+  if (!r.ok) { return fail(KeyError.Malformed); }
+  if (keyCount != 1) { return fail(KeyError.Unsupported); }
+
+  const u8[] NONE = u8[](0x6e, 0x6f, 0x6e, 0x65);                        // "none"
+  const u8[] AES256CTR = u8[](0x61, 0x65, 0x73, 0x32, 0x35, 0x36, 0x2d,
+                              0x63, 0x74, 0x72);                         // "aes256-ctr"
+  const u8[] BCRYPT = u8[](0x62, 0x63, 0x72, 0x79, 0x70, 0x74);          // "bcrypt"
+
+  u8[] plain = section;
+  if (!same(cipherName, NONE)) {
+    if (!same(cipherName, AES256CTR) || !same(kdfName, BCRYPT)) {
+      return fail(KeyError.Unsupported);
+    }
+    Reader kr = Reader.over(kdfOptions);
+    u8[] salt = kr.str();
+    i32 rounds = kr.u32();
+    if (!kr.ok || salt.len() == 0 || rounds < 1) { return fail(KeyError.Malformed); }
+    if (passphrase.len() == 0) { return fail(KeyError.BadPassphrase); }
+
+    // 32 bytes of key and 16 of IV, in that order, from one derivation.
+    u8[] material = bcryptPbkdf(passphrase, salt, 48, rounds);
+    u8[] key = u8[32]();
+    key.copyFrom(material, 0, 0, 32);
+    u8[] iv = u8[16]();
+    iv.copyFrom(material, 32, 0, 16);
+    plain = aesCtr(key, iv, section);
+  }
+
+  Reader p = Reader.over(plain);
+  i32 check1 = p.u32();
+  i32 check2 = p.u32();
+  if (!p.ok) { return fail(KeyError.Malformed); }
+  // The only thing standing between a wrong passphrase and parsing noise.
+  if (check1 != check2) { return fail(KeyError.BadPassphrase); }
+
+  const u8[] ED25519 = u8[](0x73, 0x73, 0x68, 0x2d, 0x65, 0x64, 0x32,
+                            0x35, 0x35, 0x31, 0x39);                     // "ssh-ed25519"
+  u8[] keyType = p.str();
+  u8[] pub = p.str();
+  u8[] priv = p.str();
+  if (!p.ok) { return fail(KeyError.Malformed); }
+  if (!same(keyType, ED25519)) { return fail(KeyError.NotEd25519); }
+  // The private string is the seed followed by the public key; only the first half is the secret.
+  if (pub.len() != 32 || priv.len() != 64) { return fail(KeyError.Malformed); }
+
+  u8[] seed = u8[32]();
+  seed.copyFrom(priv, 0, 0, 32);
+  return PrivateKey(KeyError.Ok, seed, publicBlob);
+}
+
+PrivateKey fail(KeyError e) {
+  return PrivateKey(e, u8[0](), u8[0]());
+}
+
+bool same(u8[] a, const u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}

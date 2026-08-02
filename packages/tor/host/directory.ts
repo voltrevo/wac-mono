@@ -1,17 +1,14 @@
 // Reading the Tor directory: which relays exist, and what keys they use.
 //
-// ## What this does not do yet
+// ## Parsing is not believing
 //
-// A real client verifies the consensus before believing it: it checks that a majority of
-// the directory authorities signed it, using authority identity keys that are compiled
-// into the client rather than fetched. Skipping that step means anyone who can answer a
-// directory request can name the relays you use and the keys you use to talk to them,
-// which defeats the point of the network.
+// `parseConsensus` reads a document. It says nothing about whether the document is genuine,
+// and on its own it is not safe to build a circuit from: anyone who can answer a directory
+// request could name the relays you use and the keys you use to talk to them.
 //
-// This parses a consensus that came from somewhere already trusted — a local testnet whose
-// files are on the same disk. It is enough to build a circuit and see that the handshake,
-// the framing and the relay crypto are right, and it is not enough to be a Tor client.
-// Consensus signature verification is issue 0003 in this package.
+// `verifyConsensus` in `verify.ts` is the part that decides. Use `relaysFromVerified` below
+// rather than calling the parser directly, unless you specifically want the unchecked
+// document — and if you do, name the variable so the next reader can see that you meant it.
 //
 // ## Microdescriptors
 //
@@ -20,6 +17,8 @@
 // The split exists because the keys are the bulk of the data and change far less often than
 // the flags and bandwidth do, so a client re-downloads the consensus hourly and the
 // microdescriptors almost never.
+
+import { parseCertificates, verifyConsensus } from "./verify.ts";
 
 /** A relay, with everything needed to open a circuit through it. */
 export type Relay = {
@@ -101,14 +100,67 @@ export async function parseMicrodescriptors(text: string): Promise<Map<string, U
   return out;
 }
 
-/** Relays from a running chutney network's on-disk cache, with their onion keys filled in. */
-export async function relaysFromChutney(nodeDir: string): Promise<Relay[]> {
-  const consensus = await Deno.readTextFile(`${nodeDir}/cached-microdesc-consensus`);
+/**
+ * Relays from a consensus, but only if a majority of the trusted authorities signed it.
+ *
+ * Throws rather than returning an empty list. A caller that got no relays back would
+ * reasonably try another directory; a caller whose consensus failed verification has been
+ * lied to, and the two should not look the same.
+ */
+export async function relaysFromVerified(
+  consensus: string, certsText: string, microdescs: string, trusted: Set<string>,
+): Promise<Relay[]> {
+  if (trusted.size === 0) {
+    throw new Error("no trusted authorities: verification would be vacuous");
+  }
+  const certs = parseCertificates(certsText, trusted);
+  const verdict = verifyConsensus(consensus, certs, trusted);
+  if (!verdict.ok) {
+    const why = verdict.rejected.map((r) => `${r.fingerprint.slice(0, 8)}: ${r.why}`).join("; ");
+    throw new Error(
+      `consensus not accepted: ${verdict.signedBy.length} good signatures, ` +
+      `${verdict.needed} needed${why === "" ? "" : ` (${why})`}`,
+    );
+  }
   const relays = parseConsensus(consensus);
-  const micros = await parseMicrodescriptors(
-    await Deno.readTextFile(`${nodeDir}/cached-microdescs.new`)
-      .catch(() => Deno.readTextFile(`${nodeDir}/cached-microdescs`)),
-  );
+  const micros = await parseMicrodescriptors(microdescs);
   for (const r of relays) r.ntorOnionKey = micros.get(r.microdescDigest);
   return relays;
+}
+
+/**
+ * Relays from a running chutney network's on-disk cache.
+ *
+ * Verified when `trusted` is given, and not otherwise — the unchecked form stays available
+ * because a testnet's authority fingerprints are generated fresh on every run and a caller
+ * poking at cell framing has no reason to gather them.
+ */
+export async function relaysFromChutney(
+  nodeDir: string, trusted?: Set<string>,
+): Promise<Relay[]> {
+  const consensus = await Deno.readTextFile(`${nodeDir}/cached-microdesc-consensus`);
+  const microdescs = await Deno.readTextFile(`${nodeDir}/cached-microdescs.new`)
+    .catch(() => Deno.readTextFile(`${nodeDir}/cached-microdescs`));
+  if (trusted !== undefined) {
+    return await relaysFromVerified(
+      consensus, await Deno.readTextFile(`${nodeDir}/cached-certs`), microdescs, trusted,
+    );
+  }
+  const relays = parseConsensus(consensus);
+  const micros = await parseMicrodescriptors(microdescs);
+  for (const r of relays) r.ntorOnionKey = micros.get(r.microdescDigest);
+  return relays;
+}
+
+/** The authority fingerprints a chutney network generated for itself, for tests. */
+export async function chutneyAuthorities(netDir: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  for await (const entry of Deno.readDir(netDir)) {
+    if (!entry.isDirectory) continue;
+    const text = await Deno.readTextFile(`${netDir}/${entry.name}/keys/authority_certificate`)
+      .catch(() => "");
+    const m = text.match(/^fingerprint ([0-9A-F]{40})/m);
+    if (m !== null) out.add(m[1]);
+  }
+  return out;
 }

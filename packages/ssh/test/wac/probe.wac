@@ -211,3 +211,34 @@ export i32 sshOpenUsed(u8[] key, i32 seq, u8[] src, i32 at, i32 end, i32 maxPack
 
 /** A packet that authenticates but whose body is whatever the caller says. */
 export u8[] sshSealBody(u8[] key, i32 seq, u8[] body) { return sealBody(key, seq, body); }
+
+// ── Private keys and authentication ───────────────────────────────────────────
+
+import { KeyError, PrivateKey, readEd25519 } from "../../src/privatekey.wac";
+import { msgServiceAccept, msgUserAuthFailure, msgUserAuthSuccess, publicKeyRequest,
+         serviceRequest, signedData } from "../../src/auth.wac";
+
+/** 0 ok, 1 not-openssh, 2 unsupported, 3 malformed, 4 bad passphrase, 5 not ed25519. */
+export i32 sshReadKeyStatus(u8[] pem, u8[] passphrase) {
+  match (readEd25519(pem, passphrase).error) {
+    case Ok: return 0;
+    case NotOpenSsh: return 1;
+    case Unsupported: return 2;
+    case Malformed: return 3;
+    case BadPassphrase: return 4;
+    else: return 5;
+  }
+}
+export u8[] sshReadKeySeed(u8[] pem, u8[] passphrase) { return readEd25519(pem, passphrase).seed; }
+export u8[] sshReadKeyPublic(u8[] pem, u8[] passphrase) { return readEd25519(pem, passphrase).publicBlob; }
+
+export i32 sshMsgUserAuthSuccess() { return msgUserAuthSuccess(); }
+export i32 sshMsgUserAuthFailure() { return msgUserAuthFailure(); }
+export i32 sshMsgServiceAccept() { return msgServiceAccept(); }
+export u8[] sshServiceRequest() { return serviceRequest(); }
+export u8[] sshSignedData(u8[] sessionId, u8[] user, u8[] publicBlob) {
+  return signedData(sessionId, user, publicBlob);
+}
+export u8[] sshPublicKeyRequest(u8[] sessionId, u8[] user, u8[] publicBlob, u8[] seed) {
+  return publicKeyRequest(sessionId, user, publicBlob, seed);
+}

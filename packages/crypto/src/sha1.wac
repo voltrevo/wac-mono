@@ -124,12 +124,65 @@ export struct Sha1 {
     this.total += data.len() as i64;
   }
 
-  /** The digest of everything so far, leaving this able to continue. */
+  /**
+   * An independent copy of the state.
+   *
+   * Tor's relay layer needs this as well as `peek`: deciding whether an incoming cell
+   * belongs to a hop means hashing it and seeing whether the result matches, but a cell
+   * that turns out *not* to belong must leave the hash untouched — and there is no way to
+   * un-update a SHA-1. So the trial hash happens on a clone.
+   */
+  Sha1 clone(const this) {
+    Sha1 copy = Sha1(u32[5](), u8[64](), this.pending, this.total);
+    for (i32 i = 0; i < 5; i++) { copy.h[i] = this.h[i]; }
+    for (i32 i = 0; i < 64; i++) { copy.buf[i] = this.buf[i]; }
+    return copy;
+  }
+
+  /**
+   * The digest of everything so far, leaving this able to continue.
+   *
+   * The copy is spelt out rather than `this.clone()` because the checker treats anything
+   * returned from a `const this` method as still borrowed from it, so `finish` — which
+   * mutates — cannot be called on the result. Filed as wac issue 0060.
+   */
   u8[] peek(const this) {
     Sha1 copy = Sha1(u32[5](), u8[64](), this.pending, this.total);
     for (i32 i = 0; i < 5; i++) { copy.h[i] = this.h[i]; }
     for (i32 i = 0; i < 64; i++) { copy.buf[i] = this.buf[i]; }
     return copy.finish();
+  }
+
+  /**
+   * The state as 96 bytes: h (20) | buf (64) | pending (4) | total (8).
+   *
+   * For callers that have to put a running hash down and pick it up again — Tor's relay
+   * digest crosses the wasm boundary between every cell, because the host owns the socket.
+   * `peek` cannot serve: it ends a hash, and what has to survive is an unfinished one.
+   */
+  u8[] saveState(const this) {
+    u8[] out = u8[96]();
+    for (i32 i = 0; i < 5; i++) { storeBE32(this.h[i], out, i * 4); }
+    for (i32 i = 0; i < 64; i++) { out[20 + i] = this.buf[i]; }
+    for (i32 i = 0; i < 4; i++) { out[84 + i] = (this.pending >> ((3 - i) * 8)) & 0xFF; }
+    for (i32 i = 0; i < 8; i++) {
+      out[88 + i] = ((this.total >> (((7 - i) * 8) as i64)) & 255) as! i32;
+    }
+    return out;
+  }
+
+  /** The inverse of `saveState`. */
+  Sha1 loadState(u8[] raw) {
+    if (raw.len() != 96) { trap; }
+    u32[] h = u32[5]();
+    for (i32 i = 0; i < 5; i++) { h[i] = beWord32(raw, i * 4); }
+    u8[] buf = u8[64]();
+    for (i32 i = 0; i < 64; i++) { buf[i] = raw[20 + i]; }
+    i32 pending = 0;
+    for (i32 i = 0; i < 4; i++) { pending = (pending << 8) | raw[84 + i]; }
+    i64 total = 0;
+    for (i32 i = 0; i < 8; i++) { total = (total << 8) | (raw[88 + i] as i64); }
+    return Sha1(h, buf, pending, total);
   }
 
   /** The digest, consuming the state. */
