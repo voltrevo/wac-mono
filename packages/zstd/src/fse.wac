@@ -1,0 +1,341 @@
+// Finite State Entropy — the tANS coder zstd uses for sequence codes and Huffman weights
+// (RFC 8878, section 4.1).
+//
+// FSE is an arithmetic-style coder that behaves like a state machine. A decoder holds a state,
+// looks the state up to get a symbol, then reads a few bits to reach the next state. What makes
+// it worth the trouble is that the number of bits read per symbol varies with how probable the
+// symbol is, so a symbol with probability 3/4 can cost well under one bit — which Huffman
+// cannot express, since a Huffman code is a whole number of bits.
+//
+// Three pieces, and they are independent enough to be wrong separately:
+//
+//   1. the **table description**, a forward bitstream of normalised counts;
+//   2. the **table build**, which spreads each symbol across the state space;
+//   3. the **data bitstream**, which is read *backwards* from the end of the block.
+//
+// The backwards read is the part that surprises. An FSE encoder emits states in reverse, so a
+// decoder must start at the last byte and walk down. The final byte carries a marker: its
+// highest set bit is padding, not data, and everything below it is the stream.
+
+/** The position of the highest set bit, or -1 for zero. */
+i32 highBit(i32 v) {
+  i32 n = -1;
+  i32 x = v;
+  while (x != 0) {
+    n++;
+    x = x >>> 1;
+  }
+  return n;
+}
+
+/**
+ * A decoding table: for each state, which symbol it means and how to reach the next state.
+ *
+ * Three parallel arrays rather than an array of structs, because every decode step touches all
+ * three at the same index and a struct per state would be an allocation per state.
+ */
+export struct FseTable {
+  i32 log;             // accuracy log; the table has 1 << log states
+  i32[] symbol;
+  i32[] nbBits;        // bits to read before the next state
+  i32[] newState;      // base of the next state, before those bits are added
+  i32 bytesUsed;       // length of the description this was read from
+}
+
+/**
+ * A forward bit reader, least-significant bit first within a byte.
+ *
+ * Only the table description uses this. The data stream is read the other way round, by
+ * `BackBits` below — which is not a style choice, it is what the format says.
+ */
+struct FwdBits {
+  u8[] src;
+  i32 start;
+  i32 bitPos;          // bits consumed since `start`
+
+  FwdBits create(u8[] src, i32 start) { return FwdBits(src, start, 0); }
+
+  /** The next `n` bits without consuming them, zero-padded past the end. */
+  i32 peek(const this, i32 n) {
+    i32 v = 0;
+    for (i32 i = 0; i < n; i++) {
+      i32 bit = this.bitPos + i;
+      i32 idx = this.start + (bit >>> 3);
+      i32 b = 0;
+      if (idx < this.src.len()) { b = (this.src[idx] >>> (bit & 7)) & 1; }
+      v = v | (b << i);
+    }
+    return v;
+  }
+
+  void skip(this, i32 n) { this.bitPos += n; }
+
+  /** Bytes consumed so far, rounded up — a description ends on a byte boundary. */
+  i32 bytesUsed(const this) { return (this.bitPos + 7) >>> 3; }
+}
+
+/**
+ * Read a table description: the accuracy log, then one normalised count per symbol.
+ *
+ * The counts are written in a variable number of bits that shrinks as the remaining probability
+ * mass does, which is why this cannot be a simple loop over fixed-width fields. A count of -1
+ * means "less than one" — a symbol that is possible but rare, and which the table build places
+ * separately.
+ *
+ * Traps on a description that overruns its budget or names more symbols than the caller allows.
+ */
+export FseTable readTable(u8[] src, i32 at, i32 maxSymbol, i32 maxLog) {
+  FwdBits b = FwdBits.create(src, at);
+
+  i32 log = (b.peek(4) & 15) + 5;
+  b.skip(4);
+  if (log > maxLog) { trap; }
+
+  i32 size = 1 << log;
+  i32[] counts = i32[maxSymbol + 1]();
+
+  i32 remaining = size + 1;
+  i32 threshold = size;
+  i32 nbBits = log + 1;
+  i32 symbol = 0;
+  bool previousZero = false;
+
+  while (remaining > 1 && symbol <= maxSymbol) {
+    if (previousZero) {
+      // A run of symbols with zero probability, in units of three, with 0b11 meaning
+      // "three more, and keep reading". Common because most symbols go unused in a block.
+      i32 zeros = 0;
+      while (b.peek(2) == 3) {
+        zeros += 3;
+        b.skip(2);
+      }
+      zeros += b.peek(2);
+      b.skip(2);
+      for (i32 i = 0; i < zeros; i++) {
+        if (symbol > maxSymbol) { trap; }
+        counts[symbol] = 0;
+        symbol++;
+      }
+      previousZero = false;
+      continue;
+    }
+
+    // The count is written in nbBits-1 bits when it is small enough to fit, and nbBits
+    // otherwise — a prefix code over the counts themselves.
+    i32 max = (2 * threshold - 1) - remaining;
+    i32 count = 0;
+    i32 low = b.peek(nbBits - 1) & (threshold - 1);
+    if (low < max) {
+      count = low;
+      b.skip(nbBits - 1);
+    } else {
+      count = b.peek(nbBits) & (2 * threshold - 1);
+      if (count >= threshold) { count -= max; }
+      b.skip(nbBits);
+    }
+
+    count -= 1;                        // -1 is the "less than one" case
+    i32 weight = count;
+    if (weight < 0) { weight = -weight; }
+    remaining -= weight;
+    // The wire form bounds each count by what is left, so this cannot fire on any bit pattern:
+    // the field is masked to `2 * threshold - 1` and the long branch subtracts `max`, which
+    // together put the count in `[0, remaining]`. Kept because what it guards is not an
+    // out-of-bounds write but a runaway — a negative `remaining` would drive `nbBits` below
+    // zero in the narrowing loop below, and a zero-width read never advances.
+    if (remaining < 0) { trap; }
+
+    // No bound check on `symbol` here: the loop condition above is `symbol <= maxSymbol` and
+    // nothing has moved it since. The zero-run branch needs its own check because the run
+    // advances `symbol` itself.
+    counts[symbol] = count;
+    symbol++;
+    previousZero = count == 0;
+
+    // The field narrows as the remaining mass does.
+    while (remaining < threshold) {
+      nbBits--;
+      threshold = threshold >>> 1;
+    }
+  }
+  if (remaining != 1) { trap; }        // the distribution must account for the whole table
+
+  FseTable t = build(counts, symbol - 1, log);
+  t.bytesUsed = b.bytesUsed();
+  return t;
+}
+
+/**
+ * Spread the symbols across the states and work out each state's transition.
+ *
+ * The spread is deliberately not sequential: stepping by roughly five eighths of the table and
+ * wrapping visits every slot exactly once while scattering each symbol's slots apart, which is
+ * what keeps the bit counts even. Low-probability symbols are placed from the end backwards
+ * instead, because they need to be reachable from states that read the most bits.
+ */
+/**
+ * Build a table from counts that did not come from a description.
+ *
+ * The format defines default distributions for literal lengths, match lengths and offsets; a
+ * block that says `Predefined_Mode` uses them and transmits no table at all. Those counts are
+ * constants, so they arrive here rather than through `readTable`.
+ */
+export FseTable buildFromCounts(i32[] counts, i32 maxSymbol, i32 log) {
+  return build(counts, maxSymbol, log);
+}
+
+FseTable build(i32[] counts, i32 maxSymbol, i32 log) {
+  i32 size = 1 << log;
+  i32 mask = size - 1;
+  i32[] symbol = i32[size]();
+  i32[] nbBits = i32[size]();
+  i32[] newState = i32[size]();
+  i32[] next = i32[maxSymbol + 1]();
+
+  i32 highThreshold = size - 1;
+  for (i32 s = 0; s <= maxSymbol; s++) {
+    if (counts[s] == -1) {
+      symbol[highThreshold] = s;
+      highThreshold--;
+      next[s] = 1;
+    } else {
+      next[s] = counts[s];
+    }
+  }
+
+  i32 step = (size >>> 1) + (size >>> 3) + 3;
+  i32 pos = 0;
+  for (i32 s = 0; s <= maxSymbol; s++) {
+    if (counts[s] <= 0) { continue; }
+    for (i32 i = 0; i < counts[s]; i++) {
+      symbol[pos] = s;
+      pos = (pos + step) & mask;
+      // Step over the slots already taken by the low-probability symbols at the end.
+      while (pos > highThreshold) {
+        pos = (pos + step) & mask;
+      }
+    }
+  }
+  if (pos != 0) { trap; }              // the walk must return to where it started
+
+  for (i32 u = 0; u < size; u++) {
+    i32 s = symbol[u];
+    i32 n = next[s];
+    next[s] = n + 1;
+    i32 bits = log - highBit(n);
+    nbBits[u] = bits;
+    newState[u] = (n << bits) - size;
+  }
+
+  return FseTable(log, symbol, nbBits, newState, 0);
+}
+
+/**
+ * The data bitstream, read backwards from the end.
+ *
+ * The last byte's highest set bit marks where the data stops; everything above it is padding
+ * that a decoder must not read. Bits come out most-significant first, walking down towards
+ * byte zero — the mirror of how the encoder wrote them.
+ *
+ * A bit at a time. The obvious speed-up is a sliding window of several bytes, and it is not
+ * worth having until something measures it: correctness here is fiddly enough on its own, and
+ * a wrong window silently shifts every symbol after it.
+ */
+export struct BackBits {
+  u8[] src;
+  i32 start;
+  i32 left;            // usable bits not yet consumed
+
+  /** Position on `src[start, start+len)`, and find the padding marker. */
+  BackBits create(u8[] src, i32 start, i32 len) {
+    if (len <= 0) { trap; }
+    i32 last = src[start + len - 1];
+    if (last == 0) { trap; }           // the marker bit must be somewhere in the last byte
+    i32 usable = (len - 1) * 8 + highBit(last);
+    return BackBits(src, start, usable);
+  }
+
+  /** The next `n` bits, most significant first. Past the end reads as zeros, as the format allows. */
+  i32 read(this, i32 n) {
+    i32 v = 0;
+    for (i32 i = 0; i < n; i++) {
+      i32 bit = this.left - 1 - i;
+      i32 x = 0;
+      if (bit >= 0) {
+        x = (this.src[this.start + (bit >>> 3)] >>> (bit & 7)) & 1;
+      }
+      v = (v << 1) | x;
+    }
+    this.left -= n;
+    return v;
+  }
+}
+
+/** The initial state: `log` bits straight off the stream. */
+export i32 initState(BackBits b, FseTable t) {
+  return b.read(t.log);
+}
+
+/** The symbol a state stands for. */
+export i32 symbolAt(FseTable t, i32 state) {
+  return t.symbol[state];
+}
+
+/** Advance: read this state's bits and add them to its base. */
+export i32 nextState(FseTable t, i32 state, BackBits b) {
+  return t.newState[state] + b.read(t.nbBits[state]);
+}
+
+/**
+ * Decode a whole FSE-coded blob: a table description, then the bitstream that follows it.
+ *
+ * Two states, alternating. That is not an optimisation — it is the format: an encoder
+ * interleaves two independent FSE states so a decoder can have two lookups in flight, and a
+ * decoder that used one would read every second symbol's bits into the wrong state.
+ *
+ * The stream ends when a read runs past the marker; the state that has not yet been emitted
+ * contributes the final symbol. `maxOut` bounds a corrupt stream that would otherwise decode
+ * for as long as it is fed zeros.
+ *
+ * This is what Huffman weights are coded with, which is where it gets used first.
+ */
+export i32[] decompress(u8[] src, i32 maxSymbol, i32 maxLog, i32 maxOut) {
+  FseTable t = readTable(src, 0, maxSymbol, maxLog);
+  i32 at = t.bytesUsed;
+  if (at >= src.len()) { trap; }       // a description with no stream after it
+
+  BackBits b = BackBits.create(src, at, src.len() - at);
+  i32 s1 = initState(b, t);
+  i32 s2 = initState(b, t);
+
+  // Writing past `maxOut` traps on the array's own bounds check, so there is nothing to test
+  // for here. A corrupt stream that would decode for as long as it is fed zeros stops the same
+  // way a genuinely oversized one does, which is the right outcome for both.
+  i32[] out = i32[maxOut]();
+  i32 n = 0;
+  while (true) {
+    out[n] = symbolAt(t, s1);
+    n++;
+    s1 = nextState(t, s1, b);
+    if (b.left < 0) {
+      out[n] = symbolAt(t, s2);
+      n++;
+      break;
+    }
+
+    out[n] = symbolAt(t, s2);
+    n++;
+    s2 = nextState(t, s2, b);
+    if (b.left < 0) {
+      out[n] = symbolAt(t, s1);
+      n++;
+      break;
+    }
+  }
+
+  i32[] exact = i32[n]();
+  for (i32 i = 0; i < n; i++) {
+    exact[i] = out[i];
+  }
+  return exact;
+}

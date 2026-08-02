@@ -9,6 +9,8 @@
 //   deno task coverage:zstd
 
 import { instrument, report } from "../../harness/wacCoverage.ts";
+import { weightBytes } from "./test/frames.ts";
+import { writeDescription } from "./test/writer.ts";
 
 const verbose = Deno.args.includes("--verbose");
 
@@ -124,4 +126,160 @@ for (const [magic, size, extra] of [
   ignoringTraps(() => m.decompress(new Uint8Array([...head, ...extra])));
 }
 
-report([run], "packages/zstd/", { verbose });
+// ── FSE ───────────────────────────────────────────────────────────────────────
+//
+// Real weight descriptions from zstd's own encoder, plus hand-built ones for the shapes real
+// data does not reach: long runs of unused symbols, a description that claims more probability
+// than the table has, and an accuracy log past what the caller allows.
+
+const fse = await instrument("packages/zstd/src/fse.wac");
+const f = fse.mod as unknown as {
+  decompress(src: Uint8Array, maxSymbol: number, maxLog: number, maxOut: number): Int32Array;
+  buildFromCounts(counts: Int32Array, maxSymbol: number, log: number): unknown;
+  readTable(src: Uint8Array, at: number, maxSymbol: number, maxLog: number): unknown;
+};
+
+for (
+  const text of [
+    "the quick brown fox jumps over the lazy dog, and then does it again. ".repeat(400),
+    JSON.stringify(Array.from({ length: 2000 }, (_, i) => ({ id: i, name: "item" + i }))),
+    // Few distinct bytes, so most symbols are unused and the zero-run path does the work.
+    "abababab".repeat(6000) + "c".repeat(200),
+  ]
+) {
+  const bytes = await weightBytes(text);
+  if (bytes !== null) ignoringTraps(() => f.decompress(bytes, 255, 6, 256));
+}
+
+// Descriptions written from chosen counts, which is the only way to reach the shapes real
+// output does not: runs of unused symbols long enough to need the repeat field more than once,
+// tables built almost entirely of "less than one" symbols, and both ends of the accuracy log.
+for (
+  const [counts, log] of [
+    [[16, 8, 4, 2, 1, 1], 5],
+    [[27, -1, -1, -1, -1, -1], 5],
+    [[32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32], 6],
+    [[16, 0, 0, 0, 16, 0, 0, 0, 32], 6],
+    [[60, 1, 1, 1, 1], 6],
+    [[30, -1, 16, -1, 16], 6],
+    [[200, 100, 100, 56, 24, 16, 8, 4, 2, 1, 1], 9],
+  ] as [number[], number][]
+) {
+  const desc = writeDescription(counts, log);
+  ignoringTraps(() => f.readTable(desc, 0, counts.length - 1, log));
+  // And the same description with a stream behind it, so the decode loop runs over a table
+  // whose shape came from here rather than from zstd.
+  ignoringTraps(() => f.decompress(
+    new Uint8Array([...desc, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x01]),
+    counts.length - 1, log, 64,
+  ));
+}
+
+// The predefined distributions, which are the only place -1 counts are guaranteed to appear.
+for (
+  const [counts, log] of [
+    [[4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1], 6],
+    [[1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1], 5],
+  ] as [number[], number][]
+) {
+  ignoringTraps(() => f.buildFromCounts(Int32Array.from(counts), counts.length - 1, log));
+}
+
+// Refusals that need a *valid* description and an invalid use of it: more symbols than the
+// caller allows, an output bound too small to hold what the stream decodes to, and a stream
+// whose last byte carries no marker bit.
+{
+  const desc = writeDescription([16, 8, 4, 2, 1, 1], 5);
+  const stream = new Uint8Array([0x12, 0x34, 0x56, 0x78, 0x9a]);
+  const blob = new Uint8Array([...desc, ...stream]);
+  ignoringTraps(() => f.readTable(desc, 0, 2, 5));            // six symbols, three allowed
+  ignoringTraps(() => f.decompress(blob, 2, 5, 64));
+  // Every cap from one to a dozen: the decode loop checks the bound in four places, and which
+  // one fires depends on whether it stopped on the first state or the second.
+  for (let cap = 1; cap <= 12; cap++) ignoringTraps(() => f.decompress(blob, 5, 5, cap));
+  const longer = new Uint8Array([...desc, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x81]);
+  for (let cap = 1; cap <= 12; cap++) ignoringTraps(() => f.decompress(longer, 5, 5, cap));
+  ignoringTraps(() => f.decompress(new Uint8Array([...desc, 0x00]), 5, 5, 64));
+
+  // A run of unused symbols that overruns the caller's limit, which is the other place the
+  // symbol bound is checked.
+  const runs = writeDescription([32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32], 6);
+  for (const limit of [0, 1, 2, 4, 8, 15]) ignoringTraps(() => f.readTable(runs, 0, limit, 6));
+  // And a description with no run at all, so the bound is reached on an ordinary count.
+  const dense = writeDescription([8, 8, 8, 8, 8, 8, 8, 8], 6);
+  for (const limit of [0, 1, 2, 3, 5] ) ignoringTraps(() => f.readTable(dense, 0, limit, 6));
+}
+
+// Counts that do not tile the table, so the spread cannot return to where it started.
+for (
+  const [counts, log] of [
+    [[16, 8, 4], 5],                                          // too few
+    [[40, 40], 5],                                            // too many
+    [[1], 5],
+  ] as [number[], number][]
+) {
+  ignoringTraps(() => f.buildFromCounts(Int32Array.from(counts), counts.length - 1, log));
+}
+
+// Rejections: empty, no marker byte, an accuracy log past the limit, a description with no
+// stream behind it, and counts that do not add up.
+for (
+  const [bad, maxLog] of [
+    [new Uint8Array(0), 6],
+    [new Uint8Array([0x00]), 6],
+    [new Uint8Array([0xff]), 6],
+    [new Uint8Array([0x0f, 0xff, 0xff, 0xff]), 6],
+    [new Uint8Array([0x20, 0x00, 0x00, 0x00, 0x00]), 6],
+    [new Uint8Array([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]), 9],
+    [new Uint8Array([0x01, 0x00, 0x01]), 6],
+    [new Uint8Array([0x10, 0x40, 0x01]), 9],
+  ] as [Uint8Array, number][]
+) {
+  ignoringTraps(() => f.decompress(bad, 255, maxLog, 256));
+  ignoringTraps(() => f.decompress(bad, 8, maxLog, 8));
+}
+
+/**
+ * Branches that no input can reach, with the argument for each.
+ *
+ * Excluded rather than counted as covered: a guard that cannot fire is still worth keeping when
+ * what it guards is worse than a wrong answer, but pretending a test reached it would make the
+ * number meaningless. Both entries below are checked against the source, so moving the code
+ * without moving the entry fails loudly instead of silently excluding the wrong line.
+ */
+const UNREACHABLE: { file: string; line: number; snippet: string; why: string }[] = [
+  {
+    file: "packages/zstd/src/fse.wac",
+    line: 146,
+    snippet: "if (remaining < 0) { trap; }",
+    why: "The wire form bounds each count by what is left: the field is masked to " +
+      "2*threshold-1 and the long branch subtracts max, which together put the count in " +
+      "[0, remaining]. Kept because a negative remaining would drive nbBits below zero in the " +
+      "narrowing loop, and a zero-width read never advances — a hang rather than a wrong answer.",
+  },
+  {
+    file: "packages/zstd/src/fse.wac",
+    line: 251,
+    snippet: "if (len <= 0) { trap; }",
+    why: "decompress refuses a description with nothing behind it before constructing a " +
+      "BackBits, so the only caller in this package cannot pass a non-positive length. The " +
+      "struct is exported for the sequences decoder, which is not written yet and will not " +
+      "have that guard for free.",
+  },
+];
+
+report([run, fse], "packages/zstd/", { verbose });
+
+const source = await Deno.readTextFile("packages/zstd/src/fse.wac");
+const lines = source.split("\n");
+let stale = false;
+for (const u of UNREACHABLE) {
+  const at = lines[u.line - 1] ?? "";
+  if (!at.includes(u.snippet)) {
+    console.log(`\n${u.file}:${u.line} no longer holds ${JSON.stringify(u.snippet)} — it holds:\n  ${at.trim()}`);
+    stale = true;
+  } else {
+    console.log(`\nexcluded as unreachable: ${u.file}:${u.line}  ${u.snippet}\n  ${u.why}`);
+  }
+}
+if (stale) Deno.exit(1);
