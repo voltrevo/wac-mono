@@ -13,6 +13,6 @@
   ],
   "commit": "04f6cc41e450a760b94aa287c79d935b74190a1c",
   "shortCommit": "04f6cc4",
-  "reason": "--update",
+  "reason": "emit: a funcref parameter shadows a function of the same name (\u00a7wac-param-shadows-func-5nkq2wp) \u2014 box's HTTP applets hit it",
   "updated": "2026-08-02"
 }
