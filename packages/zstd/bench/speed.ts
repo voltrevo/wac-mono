@@ -40,7 +40,7 @@ function b64(u: Uint8Array): string {
   return btoa(s);
 }
 
-type Timing = { comp: number; decomp: number; gzipComp: number; gzipDecomp: number };
+type Timing = { comp: number; decomp: number; gzipComp: number; gzipDecomp: number; frame: string };
 
 /** zstd and gzip, timed inside Node so the handover is not counted against them. */
 async function hostTimings(samples: Uint8Array[], rounds: number): Promise<Timing[]> {
@@ -62,6 +62,8 @@ async function hostTimings(samples: Uint8Array[], rounds: number): Promise<Timin
           decomp: best(() => z.zstdDecompressSync(z3)),
           gzipComp: best(() => z.gzipSync(b, { level: 6 })),
           gzipDecomp: best(() => z.gunzipSync(gz)),
+          // The very bytes zstd timed itself decoding, so ours can be timed on the same work.
+          frame: z3.toString("base64"),
         };
       })));
     });`;
@@ -93,11 +95,15 @@ for (let i = 0; i < samples.length; i++) {
 }
 
 console.log("\n## Decompression, MB/s\n");
+console.log("Both decoders on the *same* frame — zstd's own output. Decoding our frames instead");
+console.log("would have us verifying a checksum that zstd's default frames do not carry, which is");
+console.log("about a sixth of our decode time and none of theirs.\n");
 console.log("| sample | ours | zstd | gzip | ours vs zstd |");
 console.log("|---|---:|---:|---:|---:|");
+const unb64 = (str: string) => Uint8Array.from(atob(str), c => c.charCodeAt(0));
 for (let i = 0; i < samples.length; i++) {
   const s = samples[i];
-  const frame = enc.compress(s.data);
+  const frame = unb64(host[i].frame);
   const ms = best(() => { dec.decompress(frame); }, ROUNDS);
   const ours = rate(s.data.length, ms);
   const theirs = rate(s.data.length, host[i].decomp);

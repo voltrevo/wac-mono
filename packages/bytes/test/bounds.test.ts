@@ -30,3 +30,12 @@ Deno.test("Buf.get traps outside the written range", () => {
 Deno.test("Buf.get returns the byte when in range", () => {
   if (m.getOk() !== 42) throw new Error(`expected 42, got ${m.getOk()}`);
 });
+
+Deno.test("Buf.pushRepeat traps outside the written range", () => {
+  // The source has to be bytes that exist. Reading before the start or past the length would
+  // copy uninitialised zeros into the output, which for a decompressor means a match that
+  // silently produces the wrong bytes rather than a stream that is refused.
+  assertTraps("pushRepeatBeforeStart");
+  assertTraps("pushRepeatPastEnd");
+  assertTraps("pushRepeatNegativeCount");
+});

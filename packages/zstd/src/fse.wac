@@ -256,25 +256,61 @@ export FseTable rleTable(i32 symbol) {
 export struct BackBits {
   u8[] src;
   i32 start;
-  i32 left;            // usable bits not yet consumed
+  i32 left;            // usable bits not yet consumed; goes negative on an overrun, which is
+                       // how the decoders above learn a stream has ended
+  i32 window;          // bits already pulled out of the array, next to be consumed at the top
+  i32 have;            // how many of them are valid
+  i32 next;            // index of the next byte to pull, counting down
 
   /** Position on `src[start, start+len)`, and find the padding marker. */
   BackBits create(u8[] src, i32 start, i32 len) {
     if (len <= 0) { trap; }
     i32 last = src[start + len - 1];
     if (last == 0) { trap; }           // the marker bit must be somewhere in the last byte
-    i32 usable = (len - 1) * 8 + highBit(last);
-    return BackBits(src, start, usable);
+    i32 marker = highBit(last);
+    // The bits below the marker are the first data; everything above it is padding.
+    return BackBits(src, start, (len - 1) * 8 + marker,
+                    last & ((1 << marker) - 1), marker, len - 2);
+  }
+
+  /** Pull bytes into the window until it holds enough, or the array runs out. */
+  void fill(this, i32 n) {
+    while (this.have < n && this.next >= 0) {
+      this.window = (this.window << 8) | this.src[this.start + this.next];
+      this.have += 8;
+      this.next--;
+    }
   }
 
   /**
    * The next `n` bits without consuming them, most significant first.
    *
+   * The window is what makes decoding bearable. A Huffman lookup takes the table's full width
+   * every time — eleven bits — and a sequence costs six reads between its codes, its extra bits
+   * and its state transitions; reading those a bit at a time, or even re-gathering four bytes
+   * per read, is most of what separated this from zstd's decode speed.
+   *
+   * Capped at 24 bits because the window is an i32 and refilling appends whole bytes: past that
+   * there is no room to shift. Only the widest offset codes ask for more, and they take the slow
+   * path.
+   *
    * Past the end reads as zeros rather than trapping. That is deliberate and the format relies
-   * on it: a Huffman lookup always takes the table's full width even when the symbol it lands
-   * on is shorter, so the last symbol of a stream is routinely indexed with padding.
+   * on it: a Huffman lookup always takes the table's full width even when the symbol it lands on
+   * is shorter, so the last symbol of a stream is routinely indexed with padding.
    */
-  i32 peek(const this, i32 n) {
+  i32 peek(this, i32 n) {
+    if (n <= 0) { return 0; }
+    if (n > 24) { return this.peekSlow(n); }
+    if (this.have < n) { this.fill(n); }
+    if (this.have < n) {
+      // Nothing left to pull: what there is, padded below with zeros.
+      return (this.window << (n - this.have)) & ((1 << n) - 1);
+    }
+    return (this.window >>> (this.have - n)) & ((1 << n) - 1);
+  }
+
+  /** The general case, a bit at a time: the widest offset codes, and reads past the end. */
+  i32 peekSlow(const this, i32 n) {
     i32 v = 0;
     for (i32 i = 0; i < n; i++) {
       i32 bit = this.left - 1 - i;
@@ -293,7 +329,11 @@ export struct BackBits {
    * Overrunning is how a stream announces it is finished — the decoder checks `left` after a
    * symbol rather than before, because the symbol that overruns is still the encoder's.
    */
-  void consume(this, i32 n) { this.left -= n; }
+  void consume(this, i32 n) {
+    this.left -= n;
+    this.have -= n;
+    if (this.have < 0) { this.have = 0; }
+  }
 
   /** Peek and consume together, which is what a fixed-width field needs. */
   i32 read(this, i32 n) {

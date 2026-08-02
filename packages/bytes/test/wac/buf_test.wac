@@ -302,3 +302,55 @@ export string test_drop_front_at_the_edges() {
   t.eqBytes(b.take(), u8[]('q'), "and it is reusable afterwards");
   return t.report();
 }
+
+export string test_push_repeat_copies_from_earlier_in_the_buffer() {
+  T t = T.create();
+  Buf b = Buf.create();
+  b.pushAll(u8[]('a', 'b', 'c', 'd'));
+
+  b.pushRepeat(1, 2);
+  t.eqBytes(b.bytes(), u8[]('a', 'b', 'c', 'd', 'b', 'c'), "a plain copy from the middle");
+
+  b.pushRepeat(0, 0);
+  t.eqI32(b.len, 6, "copying nothing changes nothing");
+  return t.report();
+}
+
+export string test_push_repeat_overlaps_to_make_a_run() {
+  T t = T.create();
+  // The case the method exists for. A match of five bytes from one back is how LZ77 and its
+  // descendants spell "repeat that byte five times" — the copy has to read what it is writing,
+  // one byte at a time, or the run comes out as a stale block instead.
+  Buf b = Buf.create();
+  b.pushAll(u8[]('x'));
+  b.pushRepeat(0, 5);
+  t.eqBytes(b.bytes(), u8[]('x', 'x', 'x', 'x', 'x', 'x'), "distance one is a run of one byte");
+
+  Buf c = Buf.create();
+  c.pushAll(u8[]('a', 'b'));
+  c.pushRepeat(0, 5);
+  t.eqBytes(c.bytes(), u8[]('a', 'b', 'a', 'b', 'a', 'b', 'a'), "distance two alternates");
+
+  // A copy longer than the buffer, which is only possible because it reads as it writes.
+  Buf d = Buf.create();
+  d.pushAll(u8[]('1', '2', '3'));
+  d.pushRepeat(0, 8);
+  t.eqBytes(d.bytes(), u8[]('1', '2', '3', '1', '2', '3', '1', '2', '3', '1', '2'),
+            "and a longer match repeats the whole run");
+  return t.report();
+}
+
+export string test_push_repeat_grows_the_buffer() {
+  T t = T.create();
+  // Past the initial capacity, so the copy happens after a reallocation rather than in place.
+  Buf b = Buf.create();
+  b.pushAll(u8[]('a', 'b', 'c', 'd'));
+  for (i32 i = 0; i < 8; i++) {
+    b.pushRepeat(0, 4);
+  }
+  t.eqI32(b.len, 36, "every copy landed");
+  u8[] out = b.bytes();
+  t.eqI32(out[35], 'd', "and the last byte is right after the growth");
+  t.eqI32(out[16], 'a', "as is one from the middle");
+  return t.report();
+}

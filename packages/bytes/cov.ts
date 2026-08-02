@@ -25,7 +25,13 @@ for (const [name, fn] of Object.entries(run.mod)) {
  * — which is what lets a trapping branch be counted as covered at all.
  */
 const bounds = await instrument("packages/bytes/test/bounds.wac");
-for (const name of ["getPastEnd", "getNegative", "getAtCapacityNotLength", "getOk"]) {
+for (
+  const name of [
+    "getPastEnd", "getNegative", "getAtCapacityNotLength", "getOk",
+    // pushRepeat refusing a source that is not there: before the start, and past the length.
+    "pushRepeatBeforeStart", "pushRepeatPastEnd", "pushRepeatNegativeCount",
+  ]
+) {
   try { (bounds.mod[name] as () => number)(); } catch { /* the trap is the point */ }
 }
 

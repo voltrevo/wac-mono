@@ -786,7 +786,7 @@ const NOT_COVERED: { file: string; line: number; snippet: string; proven: boolea
   },
   {
     file: "packages/zstd/src/fse.wac",
-    line: 263,
+    line: 267,
     proven: true,
     snippet: "if (len <= 0) { trap; }",
     why: "decompress refuses a description with nothing behind it before constructing a " +
