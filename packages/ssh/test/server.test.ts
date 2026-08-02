@@ -113,11 +113,28 @@ Deno.test({
         throw new Error(`stderr was ${JSON.stringify(missing.stderr)}`);
       }
 
-      // Commands that read the filesystem through the capability world.
+      // The command is run by `packages/sh`, so what arrives over the channel is a shell script
+      // rather than a name the server knows. Each of these needs a different part of it.
+      for (const [script, want] of [
+        ["seq 1 100 | grep 7 | wc -l", "19\n"],                       // pipeline, three stages
+        ['x="a b c"; echo "$x" | tr " " "-"', "a-b-c\n"],             // quoting and expansion
+        ['echo "there are $(seq 1 5 | wc -l) lines"', "there are 5 lines\n"],   // substitution
+        ["false || echo fallback", "fallback\n"],                     // and-or
+        ["echo a; echo b", "a\nb\n"],                                 // a list
+      ] as const) {
+        const r = await realSsh(s, script);
+        if (r.stdout !== want) {
+          throw new Error(`${script}\n  got  ${JSON.stringify(r.stdout)}\n  want ${JSON.stringify(want)}`);
+        }
+      }
+
+      // A file read through the capability world, sorted by the shell's own `sort`.
       const cat = await realSsh(s, `cat ${s.dir}/.ssh/authorized_keys`);
       if (!cat.stdout.startsWith("ssh-ed25519 ")) throw new Error(`cat gave ${cat.stdout.slice(0, 40)}`);
-      const ls = await realSsh(s, `ls ${s.dir}`);
-      if (!ls.stdout.includes("clientkey")) throw new Error(`ls gave ${JSON.stringify(ls.stdout)}`);
+
+      // The shell's exit status becomes the channel's, which becomes ssh's.
+      const nomatch = await realSsh(s, "seq 1 3 | grep 9");
+      if (nomatch.code !== 1) throw new Error(`grep with no match exited ${nomatch.code}`);
 
       // A key that is not in authorized_keys does not get in. This is the check that the
       // signature verification and the key lookup are both doing something.

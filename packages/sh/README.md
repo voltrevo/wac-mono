@@ -77,6 +77,19 @@ The stubs become what they should have been: a fallback for when the real progra
 because a shell reports 127 for "no such command" and the program's own code for "ran and failed",
 and one integer cannot say both.
 
+## Over SSH
+
+[`packages/ssh`](../ssh/README.md)'s server runs its commands through this, so a shell script sent
+over a channel behaves like one:
+
+```sh
+ssh -p 2222 user@host 'seq 1 100 | grep 7 | wc -l'
+```
+
+That works because of `Shell.capturing`: standard output collects into a buffer rather than going
+to the process's own terminal. Command substitution needs exactly the same thing, so it is one
+flag rather than two mechanisms.
+
 ## What it does not do
 
 **Pipelines run one stage at a time**, in memory. A real pipeline runs its stages at once, so

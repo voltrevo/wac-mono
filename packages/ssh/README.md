@@ -247,13 +247,28 @@ server offers lists a client negotiates against, *signs* an exchange hash rather
 one, answers the key probe, and picks the channel number the client then uses. A second
 implementation by the same author would agree with itself about a misreading; OpenSSH does not.
 
-**It cannot run a shell**, because the capability world has no way to start a process —
+**The command runs in [`packages/sh`](../sh/README.md)**, so what a client sends is a shell
+script rather than a name the server knows:
+
+```sh
+ssh -p 2222 user@host 'seq 1 100 | grep 7 | wc -l'
+ssh -p 2222 user@host 'x="a b c"; echo "$x" | tr " " "-"'
+```
+
+Pipelines, quoting, `$(…)`, `&&` and redirection all work, because the server knows nothing about
+any of them — it hands the string to a shell running in *capturing* mode, whose standard output
+collects into a buffer instead of going to the server's terminal, and sends that down the channel.
+
+**It still cannot start a process** —
 [issue 0015](../../issues/open/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md).
-So it answers `echo`, `cat`, `ls`, `true`, `false` and `help`, implemented in wac over the
-filesystem capabilities, and reports `command not found` with status 127 for everything else. That
-is the honest form of the restriction rather than a shell that mostly does not work. It is also
-the *only* reason it is not an sshd: the transport, key exchange, cipher and channel layer are the
-same code the client uses.
+The shell's external commands are its own, written in wac; `help` lists them. What changed is that
+there is a shell between the client and them, not that there is a system underneath. That remains
+the *only* reason this is not an sshd: the transport, key exchange, cipher and channel layer are
+the same code the client uses.
+
+The reach is bounded by what the server was granted. With `--allow-read` alone a client can read
+what the server can read and write nothing. That is a real exposure whose size the operator
+chooses, which is the capability world working rather than a gap in it.
 
 Three server-side details that a client never has to get right:
 
