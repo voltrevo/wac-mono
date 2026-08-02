@@ -1,0 +1,102 @@
+// Public-key authentication, RFC 4252 §7.
+//
+//   byte      SSH_MSG_USERAUTH_REQUEST
+//   string    user name
+//   string    service name           always "ssh-connection" here
+//   string    "publickey"
+//   boolean   TRUE                   a signature follows; FALSE only asks whether the key is
+//                                    acceptable, which this does not use
+//   string    public key algorithm
+//   string    public key blob
+//   string    signature
+//
+// The signature is over **the session identifier followed by that same request without its
+// signature field**:
+//
+//   string    session_id
+//   byte      SSH_MSG_USERAUTH_REQUEST
+//   string    user name
+//   … as above, through the public key blob
+//
+// The session identifier is what makes the signature worth anything. Without it a signature is a
+// bearer token: a malicious server could collect one and replay it to a third party as though it
+// were the client. Binding it to the session id — which commits to the exchange hash, and so to
+// the host key of *this* connection — means a signature is worthless anywhere else.
+//
+// Note the session id is length-prefixed as a `string` even though nothing follows it that could
+// be confused with it. Omitting that length is a natural mistake, produces a signature the server
+// rejects, and looks identical to the key being wrong.
+
+import { ed25519Sign } from "../../crypto/src/ed25519.wac";
+import { Writer } from "./wire.wac";
+
+export i32 msgUserAuthRequest() { return 50; }
+export i32 msgUserAuthFailure() { return 51; }
+export i32 msgUserAuthSuccess() { return 52; }
+export i32 msgServiceRequest() { return 5; }
+export i32 msgServiceAccept() { return 6; }
+
+/** SSH_MSG_SERVICE_REQUEST for the authentication service. */
+export u8[] serviceRequest() {
+  const u8[] USERAUTH = u8[](0x73, 0x73, 0x68, 0x2d, 0x75, 0x73, 0x65,
+                             0x72, 0x61, 0x75, 0x74, 0x68);              // "ssh-userauth"
+  Writer w = Writer.create();
+  w.byte(msgServiceRequest());
+  w.str(USERAUTH);
+  return w.take();
+}
+
+/** The fields shared by the request and the thing that gets signed. */
+void common(Writer w, u8[] user, u8[] publicBlob) {
+  const u8[] CONNECTION = u8[](0x73, 0x73, 0x68, 0x2d, 0x63, 0x6f, 0x6e,
+                               0x6e, 0x65, 0x63, 0x74, 0x69, 0x6f, 0x6e);  // "ssh-connection"
+  const u8[] PUBLICKEY = u8[](0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x6b,
+                              0x65, 0x79);                                 // "publickey"
+  const u8[] ED25519 = u8[](0x73, 0x73, 0x68, 0x2d, 0x65, 0x64, 0x32,
+                            0x35, 0x35, 0x31, 0x39);                       // "ssh-ed25519"
+  w.byte(msgUserAuthRequest());
+  w.str(user);
+  w.str(CONNECTION);
+  w.str(PUBLICKEY);
+  w.bool(true);
+  w.str(ED25519);
+  w.str(publicBlob);
+}
+
+/**
+ * What the client signs: the session id, then the request without its signature.
+ *
+ * Exposed because it is worth testing on its own — it is the one value that a server and a client
+ * must construct identically from different code, and a mismatch is indistinguishable from a bad
+ * key at the point where it shows up.
+ */
+export u8[] signedData(u8[] sessionId, u8[] user, u8[] publicBlob) {
+  Writer w = Writer.create();
+  w.str(sessionId);
+  common(w, user, publicBlob);
+  return w.take();
+}
+
+/**
+ * A complete publickey request, signed with the Ed25519 seed.
+ *
+ * `publicBlob` is the key as it appears in the file and on the wire: `string "ssh-ed25519"` then
+ * `string` the 32-byte point. It is *not* the bare point, and sending the bare point produces a
+ * request the server rejects without saying why.
+ */
+export u8[] publicKeyRequest(u8[] sessionId, u8[] user, u8[] publicBlob, u8[] seed) {
+  if (seed.len() != 32) { trap; }
+  const u8[] ED25519 = u8[](0x73, 0x73, 0x68, 0x2d, 0x65, 0x64, 0x32,
+                            0x35, 0x35, 0x31, 0x39);                       // "ssh-ed25519"
+  u8[] signature = ed25519Sign(seed, signedData(sessionId, user, publicBlob));
+
+  // The signature goes on the wire as a blob naming its own algorithm, like the key does.
+  Writer sig = Writer.create();
+  sig.str(ED25519);
+  sig.str(signature);
+
+  Writer w = Writer.create();
+  common(w, user, publicBlob);
+  w.str(sig.take());
+  return w.take();
+}

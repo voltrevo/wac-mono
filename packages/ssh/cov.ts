@@ -15,6 +15,7 @@ import { instrument, report } from "../../harness/wacCoverage.ts";
 
 const verbose = Deno.args.includes("--verbose");
 const bytes = (s: string) => new TextEncoder().encode(s);
+const text = (b: Uint8Array) => new TextDecoder().decode(b);
 
 const run = await instrument("packages/ssh/test/wac/probe.wac");
 const m = run.mod as unknown as {
@@ -359,5 +360,113 @@ ignoringTraps(() => mCipher.sshSeal(new Uint8Array(63), 0, bytes("x"), new Uint8
 ignoringTraps(() => mCipher.sshSeal(ckey, 0, bytes("x"), new Uint8Array(0), 8));
 ignoringTraps(() => mCipher.sshPeekLength(new Uint8Array(63), 0, new Uint8Array(8), 0));
 ignoringTraps(() => mCipher.sshOpenStatus(new Uint8Array(63), 0, new Uint8Array(40), 0, 40, 35000));
+
+// ── Private keys and authentication ───────────────────────────────────────────
+//
+// Key files are built by hand rather than by ssh-keygen: coverage is about reaching the refusals,
+// and every one of them needs a file that is wrong in a specific way.
+
+const mAuth = run.mod as unknown as {
+  sshReadKeyStatus(pem: Uint8Array, passphrase: Uint8Array): number;
+  sshReadKeySeed(pem: Uint8Array, passphrase: Uint8Array): Uint8Array;
+  sshReadKeyPublic(pem: Uint8Array, passphrase: Uint8Array): Uint8Array;
+  sshMsgUserAuthSuccess(): number;
+  sshMsgUserAuthFailure(): number;
+  sshMsgServiceAccept(): number;
+  sshServiceRequest(): Uint8Array;
+  sshSignedData(sessionId: Uint8Array, user: Uint8Array, publicBlob: Uint8Array): Uint8Array;
+  sshPublicKeyRequest(sessionId: Uint8Array, user: Uint8Array, publicBlob: Uint8Array, seed: Uint8Array): Uint8Array;
+};
+
+mAuth.sshMsgUserAuthSuccess();
+mAuth.sshMsgUserAuthFailure();
+mAuth.sshMsgServiceAccept();
+mAuth.sshServiceRequest();
+
+const u32 = (n: number) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+const sstr = (b: Uint8Array) => join(u32(b.length), b);
+const armour = (blob: Uint8Array) => {
+  const b64 = btoa(String.fromCharCode(...blob));
+  const lines = b64.match(/.{1,70}/g) ?? [];
+  return bytes(`-----BEGIN OPENSSH PRIVATE KEY-----\n${lines.join("\n")}\n-----END OPENSSH PRIVATE KEY-----\n`);
+};
+
+/** An openssh-key-v1 file with the given parts, so each refusal can be reached deliberately. */
+function keyFile(opts: {
+  cipher?: string; kdf?: string; kdfOptions?: Uint8Array; keyCount?: number;
+  pubBlob?: Uint8Array; section?: Uint8Array;
+}): Uint8Array {
+  return armour(join(
+    bytes("openssh-key-v1\0"),
+    sstr(bytes(opts.cipher ?? "none")),
+    sstr(bytes(opts.kdf ?? "none")),
+    sstr(opts.kdfOptions ?? new Uint8Array(0)),
+    u32(opts.keyCount ?? 1),
+    sstr(opts.pubBlob ?? join(sstr(bytes("ssh-ed25519")), sstr(new Uint8Array(32).fill(4)))),
+    sstr(opts.section ?? new Uint8Array(0)),
+  ));
+}
+
+/** A private section: two check words, key type, public key, private key, comment. */
+function section(opts: {
+  check1?: number; check2?: number; type?: string; pub?: Uint8Array; priv?: Uint8Array;
+}): Uint8Array {
+  return join(
+    u32(opts.check1 ?? 0x01020304),
+    u32(opts.check2 ?? 0x01020304),
+    sstr(bytes(opts.type ?? "ssh-ed25519")),
+    sstr(opts.pub ?? new Uint8Array(32).fill(4)),
+    sstr(opts.priv ?? new Uint8Array(64).fill(5)),
+    sstr(bytes("comment")),
+    new Uint8Array([1, 2, 3]),
+  );
+}
+
+const noPass = new Uint8Array(0);
+const good = keyFile({ section: section({}) });
+mAuth.sshReadKeyStatus(good, noPass);
+mAuth.sshReadKeySeed(good, noPass);
+mAuth.sshReadKeyPublic(good, noPass);
+
+for (
+  const [pem, pass] of [
+    [bytes(""), noPass],                                                    // nothing at all
+    [bytes("-----BEGIN X-----\nnot base64 ~~~\n-----END X-----\n"), noPass],
+    [armour(bytes("wrong magic!!!!")), noPass],                             // decodes, wrong magic
+    [armour(bytes("openssh-key-v1\0")), noPass],                            // magic then nothing
+    [keyFile({ keyCount: 2, section: section({}) }), noPass],               // more than one key
+    [keyFile({ cipher: "aes128-ctr", kdf: "bcrypt", section: section({}) }), bytes("x")],
+    [keyFile({ cipher: "aes256-ctr", kdf: "none", section: section({}) }), bytes("x")],
+    [keyFile({ cipher: "aes256-ctr", kdf: "bcrypt", kdfOptions: new Uint8Array(0), section: section({}) }), bytes("x")],
+    [keyFile({ cipher: "aes256-ctr", kdf: "bcrypt", kdfOptions: join(sstr(new Uint8Array(16).fill(1)), u32(0)), section: section({}) }), bytes("x")],
+    [keyFile({ cipher: "aes256-ctr", kdf: "bcrypt", kdfOptions: join(sstr(new Uint8Array(0)), u32(4)), section: section({}) }), bytes("x")],
+    // Encrypted, but with no passphrase supplied.
+    [keyFile({ cipher: "aes256-ctr", kdf: "bcrypt", kdfOptions: join(sstr(new Uint8Array(16).fill(1)), u32(2)), section: new Uint8Array(96) }), noPass],
+    // Encrypted with a passphrase: decrypts to noise, so the check words disagree.
+    [keyFile({ cipher: "aes256-ctr", kdf: "bcrypt", kdfOptions: join(sstr(new Uint8Array(16).fill(1)), u32(2)), section: new Uint8Array(96) }), bytes("pw")],
+    [keyFile({ section: section({ check2: 0x99999999 }) }), noPass],        // check words disagree
+    [keyFile({ section: section({ type: "ssh-rsa" }) }), noPass],           // not ed25519
+    [keyFile({ section: section({ pub: new Uint8Array(31) }) }), noPass],   // public key too short
+    [keyFile({ section: section({ priv: new Uint8Array(63) }) }), noPass],  // private key too short
+    [keyFile({ section: new Uint8Array([0, 0, 0, 1]) }), noPass],           // section truncated
+    [armour(join(bytes("openssh-key-v1\0"), sstr(bytes("none")))), noPass], // header truncated
+  ] as const
+) {
+  mAuth.sshReadKeyStatus(pem, pass);
+  mAuth.sshReadKeySeed(pem, pass);
+}
+
+// CR LF line endings, which ssh-keygen does not write but a file copied through Windows has.
+const crlf = bytes(text(good).replace(/\n/g, "\r\n"));
+mAuth.sshReadKeyStatus(crlf, noPass);
+
+// Valid check words, then nothing — the truncation that only the second `ok` test catches.
+mAuth.sshReadKeyStatus(keyFile({ section: join(u32(9), u32(9), new Uint8Array([0, 0])) }), noPass);
+
+const sessionId = new Uint8Array(32).fill(7);
+const pubBlob = join(sstr(bytes("ssh-ed25519")), sstr(new Uint8Array(32).fill(4)));
+mAuth.sshSignedData(sessionId, bytes("user"), pubBlob);
+mAuth.sshPublicKeyRequest(sessionId, bytes("user"), pubBlob, new Uint8Array(32).fill(6));
+ignoringTraps(() => mAuth.sshPublicKeyRequest(sessionId, bytes("user"), pubBlob, new Uint8Array(31)));
 
 report([run], "packages/ssh/", { verbose });

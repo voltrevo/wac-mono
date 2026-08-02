@@ -46,6 +46,16 @@ const mod = await wacBind("packages/ssh/test/wac/probe.wac") as unknown as {
   sshOpenStatus(key: Uint8Array, seq: number, src: Uint8Array, at: number, end: number, maxPacket: number): number;
   sshOpenPayload(key: Uint8Array, seq: number, src: Uint8Array, at: number, end: number, maxPacket: number): Uint8Array;
   sshOpenUsed(key: Uint8Array, seq: number, src: Uint8Array, at: number, end: number, maxPacket: number): number;
+  sshSealBody(key: Uint8Array, seq: number, body: Uint8Array): Uint8Array;
+  sshReadKeyStatus(pem: Uint8Array, passphrase: Uint8Array): number;
+  sshReadKeySeed(pem: Uint8Array, passphrase: Uint8Array): Uint8Array;
+  sshReadKeyPublic(pem: Uint8Array, passphrase: Uint8Array): Uint8Array;
+  sshMsgUserAuthSuccess(): number;
+  sshMsgUserAuthFailure(): number;
+  sshMsgServiceAccept(): number;
+  sshServiceRequest(): Uint8Array;
+  sshSignedData(sessionId: Uint8Array, user: Uint8Array, publicBlob: Uint8Array): Uint8Array;
+  sshPublicKeyRequest(sessionId: Uint8Array, user: Uint8Array, publicBlob: Uint8Array, seed: Uint8Array): Uint8Array;
 };
 
 const text = (b: Uint8Array) => new TextDecoder().decode(b);
@@ -69,7 +79,7 @@ function freePort(): number {
 }
 
 Deno.test({
-  name: "a full encrypted exchange with a real OpenSSH server, through SERVICE_ACCEPT",
+  name: "connect to a real OpenSSH server and authenticate with a public key",
   ignore: !haveSshd,
   sanitizeResources: false,
   fn: async () => {
@@ -83,12 +93,23 @@ Deno.test({
       }).output();
       if (!kg.success) throw new Error("ssh-keygen failed");
       await Deno.chmod(`${dir}/hostkey`, 0o600);
+      // A client key too, and an sshd that accepts it. sshd runs as this user and so can only
+      // authenticate this user, which is exactly what we want to attempt.
+      const kg2 = await new Deno.Command("ssh-keygen", {
+        args: ["-t", "ed25519", "-f", `${dir}/clientkey`, "-N", "", "-q"],
+      }).output();
+      if (!kg2.success) throw new Error("ssh-keygen failed for the client key");
+      await Deno.copyFile(`${dir}/clientkey.pub`, `${dir}/authorized_keys`);
+      await Deno.chmod(`${dir}/authorized_keys`, 0o600);
       await Deno.writeTextFile(`${dir}/sshd_config`, [
         `Port ${port}`,
         "ListenAddress 127.0.0.1",
         `HostKey ${dir}/hostkey`,
+        `AuthorizedKeysFile ${dir}/authorized_keys`,
         "StrictModes no",
         "UsePAM no",
+        "PasswordAuthentication no",
+        "KbdInteractiveAuthentication no",
         "PidFile none",
       ].join("\n"));
 
@@ -271,7 +292,7 @@ Deno.test({
         buf = buf.slice(mod.sshOpenUsed(keyIn, inSeq, buf, 0, buf.length, MAX));
         inSeq++;
         if (p[0] === 7) sawExtInfo = true;                      // SSH_MSG_EXT_INFO
-        if (p[0] === 6) {                                       // SSH_MSG_SERVICE_ACCEPT
+        if (p[0] === mod.sshMsgServiceAccept()) {
           const name = text(mod.sshReadString(p.slice(1)));
           if (name !== "ssh-userauth") throw new Error(`service accepted was ${name}`);
           accepted = true;
@@ -281,6 +302,49 @@ Deno.test({
       if (!sawExtInfo) {
         throw new Error("no EXT_INFO, though we advertised ext-info-c — decryption may be wrong");
       }
+
+      // ── Authenticate ────────────────────────────────────────────────────────
+      //
+      // The private key is read by our own wac code, straight out of the file ssh-keygen wrote.
+      const pem = await Deno.readFile(`${dir}/clientkey`);
+      const empty = new Uint8Array(0);
+      if (mod.sshReadKeyStatus(pem, empty) !== 0) {
+        throw new Error(`could not read the private key: status ${mod.sshReadKeyStatus(pem, empty)}`);
+      }
+      const seed = mod.sshReadKeySeed(pem, empty);
+      const publicBlob = mod.sshReadKeyPublic(pem, empty);
+      if (seed.length !== 32) throw new Error("seed is not 32 bytes");
+
+      // The blob we parsed must be the one in the .pub file, or we would be offering a key the
+      // server has never heard of and reading its refusal as our own bug.
+      const wantPub = (await Deno.readTextFile(`${dir}/clientkey.pub`)).split(" ")[1];
+      if (btoa(String.fromCharCode(...publicBlob)) !== wantPub) {
+        throw new Error("the public blob from the private key does not match clientkey.pub");
+      }
+
+      // session_id is H from the first exchange. Signing over it is what stops a signature being
+      // replayable to another server.
+      const user = bytes(Deno.env.get("USER") ?? "claude");
+      const authRequest = mod.sshPublicKeyRequest(h, user, publicBlob, seed);
+      const arPad = crypto.getRandomValues(
+        new Uint8Array(mod.sshAeadPaddingFor(authRequest.length, block)));
+      await conn.write(mod.sshSeal(keyOut, 1, authRequest, arPad, block));
+
+      let authed = false;
+      for (let i = 0; i < 8 && !authed; i++) {
+        while (mod.sshOpenStatus(keyIn, inSeq, buf, 0, buf.length, MAX) === 1) await read();
+        if (mod.sshOpenStatus(keyIn, inSeq, buf, 0, buf.length, MAX) !== 0) {
+          throw new Error(`packet ${inSeq} did not open while authenticating`);
+        }
+        const p = mod.sshOpenPayload(keyIn, inSeq, buf, 0, buf.length, MAX);
+        buf = buf.slice(mod.sshOpenUsed(keyIn, inSeq, buf, 0, buf.length, MAX));
+        inSeq++;
+        if (p[0] === mod.sshMsgUserAuthFailure()) {
+          throw new Error(`the server rejected our signature: ${text(mod.sshReadString(p.slice(1)))}`);
+        }
+        if (p[0] === mod.sshMsgUserAuthSuccess()) authed = true;
+      }
+      if (!authed) throw new Error("never received SSH_MSG_USERAUTH_SUCCESS");
     } finally {
       try { conn?.close(); } catch { /* already gone */ }
       if (sshd !== undefined) {
@@ -709,4 +773,109 @@ Deno.test("the cipher is pinned to a fixed answer", () => {
   const got = hex(packet);
   if (packet.length !== 36) throw new Error(`packet is ${packet.length} bytes, expected 36`);
   if (got !== want) throw new Error(`cipher output changed:\n  got  ${got}\n  want ${want}`);
+});
+
+// Reading a private key, including an encrypted one — bcrypt_pbkdf and AES-CTR, in wac.
+//
+// The strong form of this test is that the *same* key is read from both an unencrypted and an
+// encrypted file and must yield identical seeds. `ssh-keygen -p` changes only the passphrase, so
+// the key material is unchanged by construction and any difference is ours.
+Deno.test({
+  name: "an OpenSSH private key reads, encrypted or not, and a wrong passphrase is caught",
+  ignore: !haveSshd,
+  fn: async () => {
+    const dir = await Deno.makeTempDir();
+    try {
+      const gen = await new Deno.Command("ssh-keygen", {
+        args: ["-t", "ed25519", "-f", `${dir}/k`, "-N", "", "-q", "-C", "test key"],
+      }).output();
+      if (!gen.success) throw new Error("ssh-keygen failed");
+
+      const plainPem = await Deno.readFile(`${dir}/k`);
+      const empty = new Uint8Array(0);
+      if (mod.sshReadKeyStatus(plainPem, empty) !== 0) throw new Error("unencrypted key did not read");
+      const seed = mod.sshReadKeySeed(plainPem, empty);
+      const pub = mod.sshReadKeyPublic(plainPem, empty);
+      if (seed.length !== 32) throw new Error("seed is not 32 bytes");
+
+      // Same key, now encrypted. `-p` rewrites the file with a passphrase and nothing else.
+      await Deno.copyFile(`${dir}/k`, `${dir}/enc`);
+      const pass = "a passphrase with spaces";
+      const rekey = await new Deno.Command("ssh-keygen", {
+        args: ["-p", "-f", `${dir}/enc`, "-P", "", "-N", pass, "-q", "-a", "8"],
+      }).output();
+      if (!rekey.success) throw new Error(`ssh-keygen -p failed: ${text(rekey.stderr)}`);
+
+      const encPem = await Deno.readFile(`${dir}/enc`);
+      if (text(encPem).includes("aes256-ctr") === false && text(encPem) === text(plainPem)) {
+        throw new Error("the key was not actually encrypted");
+      }
+      const status = mod.sshReadKeyStatus(encPem, bytes(pass));
+      if (status !== 0) throw new Error(`encrypted key did not read: status ${status}`);
+      if (hex(mod.sshReadKeySeed(encPem, bytes(pass))) !== hex(seed)) {
+        throw new Error("the encrypted file yielded a different seed for the same key");
+      }
+      if (hex(mod.sshReadKeyPublic(encPem, bytes(pass))) !== hex(pub)) {
+        throw new Error("the encrypted file yielded a different public blob");
+      }
+
+      // A wrong passphrase must be reported as such. There is no MAC over the private section, so
+      // the doubled check word is the only thing that notices — and if it were skipped, the parse
+      // would continue into random bytes.
+      if (mod.sshReadKeyStatus(encPem, bytes("wrong")) !== 4) {
+        throw new Error("a wrong passphrase was not reported as a bad passphrase");
+      }
+      if (mod.sshReadKeyStatus(encPem, empty) !== 4) {
+        throw new Error("an empty passphrase against an encrypted key was not caught");
+      }
+      // And the right passphrase against an unencrypted key is simply ignored.
+      if (mod.sshReadKeyStatus(plainPem, bytes(pass)) !== 0) {
+        throw new Error("a passphrase broke reading an unencrypted key");
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test("a file that is not an OpenSSH key is refused by shape, not misread", () => {
+  const empty = new Uint8Array(0);
+  const cases: [string, number][] = [
+    ["", 1],
+    ["-----BEGIN OPENSSH PRIVATE KEY-----\n-----END OPENSSH PRIVATE KEY-----\n", 1],
+    ["-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n", 1],
+    ["not base64 at all ~~~\n", 1],
+  ];
+  for (const [pem, want] of cases) {
+    const got = mod.sshReadKeyStatus(bytes(pem), empty);
+    if (got !== want) throw new Error(`${JSON.stringify(pem.slice(0, 30))}: status ${got}, want ${want}`);
+  }
+});
+
+Deno.test("the signed data length-prefixes the session id", () => {
+  // Omitting that length is a natural mistake and produces a signature the server rejects with no
+  // explanation, so the layout is asserted directly rather than only through interop.
+  const sessionId = Uint8Array.from({ length: 32 }, (_, i) => i);
+  const user = bytes("alice");
+  const pub = Uint8Array.from({ length: 51 }, (_, i) => i & 255);
+  const signed = mod.sshSignedData(sessionId, user, pub);
+
+  const dv = new DataView(signed.buffer, signed.byteOffset, signed.byteLength);
+  if (dv.getUint32(0) !== 32) throw new Error("the session id is not length-prefixed");
+  if (hex(signed.slice(4, 36)) !== hex(sessionId)) throw new Error("session id is not first");
+  if (signed[36] !== 50) throw new Error("SSH_MSG_USERAUTH_REQUEST does not follow the session id");
+  if (dv.getUint32(37) !== user.length) throw new Error("the user name is not next");
+
+  // The signed data must be a prefix of the request itself, up to the signature field.
+  const seed = Uint8Array.from({ length: 32 }, (_, i) => (i * 3) & 255);
+  const request = mod.sshPublicKeyRequest(sessionId, user, pub, seed);
+  const withoutSessionId = signed.slice(36);
+  if (hex(request.slice(0, withoutSessionId.length)) !== hex(withoutSessionId)) {
+    throw new Error("the request and the signed data disagree before the signature");
+  }
+  // …and the request carries a signature blob after it, naming its algorithm.
+  const tail = request.slice(withoutSessionId.length);
+  if (text(mod.sshReadString(tail.slice(4))) !== "ssh-ed25519") {
+    throw new Error("the signature blob does not name ssh-ed25519");
+  }
 });
