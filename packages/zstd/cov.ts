@@ -11,6 +11,7 @@
 import { instrument, report } from "../../harness/wacCoverage.ts";
 import { weightBytes } from "./test/frames.ts";
 import { writeDescription } from "./test/writer.ts";
+import { literalsSection } from "./test/frames.ts";
 
 const verbose = Deno.args.includes("--verbose");
 
@@ -239,6 +240,100 @@ for (
   ignoringTraps(() => f.decompress(bad, 8, maxLog, 8));
 }
 
+// ── Huffman literals ──────────────────────────────────────────────────────────
+//
+// Real sections for the FSE-coded tree description and both stream layouts; hand-written
+// direct weights for the shapes a real encoder does not choose, since it only writes the direct
+// form for small alphabets.
+
+const huff = await instrument("packages/zstd/src/huffman.wac");
+const h = huff.mod as unknown as {
+  readTable(src: Uint8Array, at: number): { maxBits: number; bytesUsed: number };
+  decodeLiterals(t: unknown, src: Uint8Array, at: number, len: number, count: number, streams: number): Uint8Array;
+};
+
+for (
+  const text of [
+    "the quick brown fox jumps over the lazy dog, and then does it again. ".repeat(400),
+    JSON.stringify(Array.from({ length: 2000 }, (_, i) => ({ id: i, name: "item" + i, tags: ["a", "b"] }))),
+    "hello hello hello hello hello world",
+    "a".repeat(3000) + "bcdefghij".repeat(50),
+  ]
+) {
+  const found = await literalsSection(text);
+  if (found === null || found.head.type !== 2) continue;
+  const { frame, at, head } = found;
+  ignoringTraps(() => {
+    const t = h.readTable(frame, at + head.hdr);
+    h.decodeLiterals(t, frame, at + head.hdr + t.bytesUsed, head.comp - t.bytesUsed, head.regen, head.streams);
+  });
+}
+
+// Direct weights, including an odd count so the trailing nibble is ignored, and both a shallow
+// and a deep code.
+for (
+  const weights of [
+    [1], [1, 1, 1], [2, 1, 1], [1, 1, 2, 3, 4], [3, 0, 0, 2, 1], [1, 1, 1, 1, 1, 1, 1],
+    [4, 3, 2, 1, 1, 0, 0, 0, 0],
+  ]
+) {
+  const bytes = [128 + weights.length];
+  for (let i = 0; i < weights.length; i += 2) bytes.push((weights[i] << 4) | (weights[i + 1] ?? 0));
+  const desc = new Uint8Array(bytes);
+  ignoringTraps(() => {
+    const t = h.readTable(desc, 0);
+    // A stream of the wrong length, and an unknown stream count, are both refusals.
+    h.decodeLiterals(t, new Uint8Array([...desc, 0x81, 0x42, 0x99]), desc.length, 3, 4, 1);
+  });
+  ignoringTraps(() => h.decodeLiterals(h.readTable(desc, 0), desc, 0, desc.length, 4, 2));
+  ignoringTraps(() => h.decodeLiterals(h.readTable(desc, 0), desc, 0, desc.length, 40, 4));
+}
+
+// Trees that are not trees. Each of these reaches a different refusal, and the byte counts
+// matter: a description one byte short trips the bounds check before anything is inspected.
+for (
+  const bad of [
+    new Uint8Array(0),
+    new Uint8Array([128]),                       // claims a weight, carries none
+    new Uint8Array([129, 0x00]),                 // every weight zero, so no code at all
+    new Uint8Array([129, 0x13]),                 // leaves code space that is not a power of two
+    new Uint8Array([131, 0xbb, 0xbb]),           // weights that need a code longer than allowed
+    new Uint8Array([131, 0xff, 0xff]),           // weights past the maximum outright
+    new Uint8Array([0]),                         // an FSE description of zero length
+    new Uint8Array([10, 0, 0]),                  // an FSE description longer than the input
+    new Uint8Array([4, 0, 0, 0, 0]),             // an FSE description of nonsense
+  ]
+) {
+  ignoringTraps(() => h.readTable(bad, 0));
+}
+
+// Stream shapes that do not add up: a literal count the stream cannot hold, a count too small
+// to split four ways, and a jump table claiming more than the section carries.
+{
+  const desc = new Uint8Array([129, 0x11]);      // two symbols, one bit each
+  const t = h.readTable(desc, 0);
+  const stream = new Uint8Array([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x81]);
+  // 63 bits of stream at one bit a symbol: 63 is exact, 64 overruns on the last symbol, and
+  // 500 overruns long before the end — three different refusals.
+  // Swept rather than chosen: the stream's codes are one and two bits, so which count leaves
+  // the *last* symbol straddling the end depends on the bit pattern. That is a different
+  // refusal from overrunning in the middle, and only some counts reach it.
+  for (let count = 1; count <= 80; count++) {
+    ignoringTraps(() => h.decodeLiterals(t, stream, 0, stream.length, count, 1));
+  }
+  for (const count of [1, 2, 3, 4, 8, 63, 64, 500]) {
+    ignoringTraps(() => h.decodeLiterals(t, stream, 0, stream.length, count, 1));
+    ignoringTraps(() => h.decodeLiterals(t, stream, 0, stream.length, count, 4));
+  }
+  ignoringTraps(() => h.decodeLiterals(t, new Uint8Array([0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x81]), 0, 7, 4, 4));
+  ignoringTraps(() => h.decodeLiterals(t, stream, 0, 3, 4, 4));
+
+  // A jump table that does add up, with a literal count too small to split four ways: three
+  // quarters rounded up already exceed it, so the fourth stream would hold a negative number.
+  const four = new Uint8Array([1, 0, 1, 0, 1, 0, 0x81, 0x81, 0x81, 0x81]);
+  for (const count of [1, 2, 3]) ignoringTraps(() => h.decodeLiterals(t, four, 0, four.length, count, 4));
+}
+
 /**
  * Branches that no input can reach, with the argument for each.
  *
@@ -268,7 +363,7 @@ const UNREACHABLE: { file: string; line: number; snippet: string; why: string }[
   },
 ];
 
-report([run, fse], "packages/zstd/", { verbose });
+report([run, fse, huff], "packages/zstd/", { verbose });
 
 const source = await Deno.readTextFile("packages/zstd/src/fse.wac");
 const lines = source.split("\n");

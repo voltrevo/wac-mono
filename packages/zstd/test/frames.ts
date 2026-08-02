@@ -36,12 +36,51 @@ export function firstCompressedBlock(buf: Uint8Array): { at: number; size: numbe
   }
 }
 
-/** The literals section header: how long it is, and whether the literals are Huffman-coded. */
-export function literalsHeader(buf: Uint8Array, p: number): { type: number; hdr: number } {
+/**
+ * The literals section header: what kind, how big, and how many streams.
+ *
+ * `regen` is how many literal bytes come out and `comp` how many the section occupies; for the
+ * uncompressed kinds those are the same thing. `streams` is 4 unless the section is small
+ * enough that one is cheaper — the jump table costs six bytes.
+ */
+export type LitHeader = { type: number; fmt: number; hdr: number; regen: number; comp: number; streams: number };
+
+export function literalsHeader(buf: Uint8Array, p: number): LitHeader {
   const b0 = buf[p];
   const type = b0 & 3, fmt = (b0 >> 2) & 3;
-  if (type < 2) return { type, hdr: fmt === 1 ? 2 : fmt === 3 ? 3 : 1 };
-  return { type, hdr: fmt === 2 ? 4 : fmt === 3 ? 5 : 3 };
+  if (type < 2) {
+    if (fmt === 1) {
+      const regen = (b0 >> 4) | (buf[p + 1] << 4);
+      return { type, fmt, hdr: 2, regen, comp: type === 1 ? 1 : regen, streams: 1 };
+    }
+    if (fmt === 3) {
+      const regen = (b0 >> 4) | (buf[p + 1] << 4) | (buf[p + 2] << 12);
+      return { type, fmt, hdr: 3, regen, comp: type === 1 ? 1 : regen, streams: 1 };
+    }
+    const regen = b0 >> 3;
+    return { type, fmt, hdr: 1, regen, comp: type === 1 ? 1 : regen, streams: 1 };
+  }
+  const streams = fmt === 0 ? 1 : 4;
+  if (fmt === 0 || fmt === 1) {
+    const v = b0 | (buf[p + 1] << 8) | (buf[p + 2] << 16);
+    return { type, fmt, hdr: 3, regen: (v >> 4) & 0x3ff, comp: (v >> 14) & 0x3ff, streams };
+  }
+  if (fmt === 2) {
+    const v = (b0 | (buf[p + 1] << 8) | (buf[p + 2] << 16) | (buf[p + 3] << 24)) >>> 0;
+    return { type, fmt, hdr: 4, regen: (v >>> 4) & 0x3fff, comp: (v >>> 18) & 0x3fff, streams };
+  }
+  const v = b0 + buf[p + 1] * 256 + buf[p + 2] * 65536 + buf[p + 3] * 16777216 + buf[p + 4] * 4294967296;
+  return { type, fmt, hdr: 5, regen: Math.floor(v / 16) % 262144, comp: Math.floor(v / 4194304) % 262144, streams };
+}
+
+/** The literals section of `text`'s first compressed block, located but not decoded. */
+export async function literalsSection(
+  text: string,
+): Promise<{ frame: Uint8Array; at: number; head: LitHeader } | null> {
+  const frame = await zstd(text);
+  const blk = firstCompressedBlock(frame);
+  if (blk === null) return null;
+  return { frame, at: blk.at, head: literalsHeader(frame, blk.at) };
 }
 
 /** The FSE-coded Huffman weight description in `text`'s first compressed block, if it has one. */

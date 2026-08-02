@@ -15,6 +15,8 @@ how to run things. All commands run from the repo root.
 | Raw blocks (`Block_Type=0`) | done |
 | RLE blocks (`Block_Type=1`) | done |
 | FSE (tANS) tables and bitstream | done |
+| Huffman literals: both tree forms, 1 and 4 streams | done |
+| Treeless literals (reusing the previous block's tree) | not started |
 | Compressed blocks (`Block_Type=2`) | **not implemented — traps** |
 | Content checksum (XXH64) | field skipped, not verified |
 | Dictionaries | not started |
@@ -41,8 +43,9 @@ against my own decoder would have agreed with itself.
 The remaining work is one large piece and three that depend on it:
 
 1. ~~**FSE**~~ — done, in `src/fse.wac`. See below for how it is checked without an oracle.
-2. **Huffman literals** — literals sections come raw, RLE, or Huffman-coded, with the Huffman
-   weights themselves either FSE-compressed or written directly, in one stream or four.
+2. ~~**Huffman literals**~~ — done, in `src/huffman.wac`. What is left of it is *treeless*
+   literals, where a block reuses the previous block's tree and sends no description at all —
+   which needs the decoder to carry state between blocks, so it belongs with the block loop.
 3. **Sequences** — three interleaved FSE streams for literal lengths, match lengths and offsets,
    each of which may be predefined, RLE, freshly transmitted, or repeated from the last block.
 4. **Sequence execution** — copy literals, then a match, with the three repeat-offset slots and
@@ -79,15 +82,26 @@ indirect. Three of them, none of which is a second reading of the specification:
 Deliberately breaking the spread step, the bit width, the state order and the padding marker each
 make these fail, which was checked rather than assumed.
 
+Huffman gets a check of the same kind, and a sharper one. **Literals are a subsequence of the
+block's content** — they are exactly the bytes no match covered, in order — so decoding real
+frames and testing that property catches a symbol decoded wrongly, a symbol dropped, or a stream
+read in the wrong direction. A weaker check like "the same set of bytes" would not. The section
+header supplies two more constraints for free: how many literals there are, and how many bytes
+they occupy. Breaking the rank widths, the code lengths, the span per symbol, the recovered last
+weight, the four-way split and the jump table's endianness each make it fail — checked, again,
+rather than assumed.
+
 ## Layout
 
 | path | what |
 |---|---|
 | `src/frame.wac` | frame headers, the block loop, raw and RLE blocks |
 | `src/fse.wac` | FSE: table descriptions, table building, the backwards bitstream |
+| `src/huffman.wac` | literals: tree descriptions, the decoding table, one and four streams |
 | `test/oracle.mjs` | Node's zstd, both directions, one subprocess per run |
 | `test/frame.test.ts` | against encoder output, and hand-built frames Node validates |
 | `test/fse.test.ts` | the three checks above |
+| `test/huffman.test.ts` | literals as a subsequence, and the table build |
 | `test/frames.ts` | walking a real frame to find its FSE-coded pieces |
 | `test/writer.ts` | the description writer, for round-tripping |
 | `cov.ts` | `deno task coverage:zstd` — 100% of branches |
