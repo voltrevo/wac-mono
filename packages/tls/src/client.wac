@@ -23,7 +23,10 @@
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
 import { p256Ecdh, p256PublicKey } from "../../crypto/src/p256.wac";
-import { hybridClientOffer, hybridClientFinish } from "./hybrid.wac";
+import {
+  hybridClientOffer, hybridClientFinish, groupX25519MlKem768, hybridClientShareLen,
+  hybridServerShareLen,
+} from "./hybrid.wac";
 import { ed25519Verify } from "../../crypto/src/ed25519.wac";
 import {
   deriveSecret, earlySecret, finishedVerify, handshakeSecret, hashLen, masterSecret,
@@ -211,7 +214,7 @@ u8[] clientHello(CConn c) {
   exts.u16(10);
   Writer groups = Writer.create();
   Writer groupList = Writer.create();
-  groupList.u16(0x11EC);          // X25519MLKEM768, first because it is preferred
+  groupList.u16(groupX25519MlKem768());          // X25519MLKEM768, first because it is preferred
   groupList.u16(0x001d);          // x25519
   groupList.u16(0x0017);          // secp256r1
   groups.vec16(groupList.take());
@@ -254,9 +257,9 @@ u8[] clientHello(CConn c) {
   // The hybrid share is 1216 bytes on its own, which makes this hello span two records
   // for most servers. That is the cost of not needing a HelloRetryRequest, and it is
   // what every deployed client does.
-  u8[] hybridShare = u8[1216]();
-  for (i32 i = 0; i < 1216; i++) { hybridShare[i] = c.hybridState[i]; }
-  share.u16(0x11EC);
+  u8[] hybridShare = u8[hybridClientShareLen()]();
+  for (i32 i = 0; i < hybridClientShareLen(); i++) { hybridShare[i] = c.hybridState[i]; }
+  share.u16(groupX25519MlKem768());
   share.vec16(hybridShare);
   share.u16(0x001d);
   share.vec16(x25519Base(c.ephemeralPriv));
@@ -292,10 +295,10 @@ u8[] serverShare(u8[] shBody) {
       if (kind == 51) {
         i32 g = body.u16();
         u8[] key = body.vec16();
-        if (g == 0x11EC && key.len() == 1120) {
+        if (g == groupX25519MlKem768() && key.len() == hybridServerShareLen()) {
           share = u8[1122]();
           share[0] = 0x11; share[1] = 0xEC;
-          for (i32 i = 0; i < 1120; i++) { share[2 + i] = key[i]; }
+          for (i32 i = 0; i < hybridServerShareLen(); i++) { share[2 + i] = key[i]; }
         } else if (g == 0x001d && key.len() == 32) {
           share = u8[34]();
           share[0] = 0x00; share[1] = 0x1d;
@@ -425,7 +428,7 @@ export u8[] tlsClientFeed(u8[] state, u8[] input) {
 
       addTranscript(c, msg);
       u8[] shared = u8[0]();
-      if (group == 0x11EC) {
+      if (group == groupX25519MlKem768()) {
         // 64 bytes rather than 32, and the key schedule takes it unchanged: it is the
         // IKM of an HKDF extract, which has no opinion about length.
         shared = hybridClientFinish(c.hybridState, peerKey, c.ephemeralPriv);

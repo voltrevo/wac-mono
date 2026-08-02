@@ -35,7 +35,9 @@
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
 import { p256Ecdh, p256PublicKey } from "../../crypto/src/p256.wac";
-import { hybridServerAccept } from "./hybrid.wac";
+import {
+  hybridServerAccept, groupX25519MlKem768, hybridServerShareLen, hybridSecretLen,
+} from "./hybrid.wac";
 import { ed25519Sign } from "../../crypto/src/ed25519.wac";
 import {
   deriveSecret, earlySecret, finishedVerify, handshakeSecret, hashLen, masterSecret,
@@ -218,15 +220,15 @@ u8[] serverFlight(Conn c, u8[] clientHelloMsg) {
   // produces both at once; the other two derive the secret separately below.
   u8[] ourShare = u8[0]();
   u8[] hybridSecret = u8[0]();
-  if (group == 0x11EC) {
+  if (group == groupX25519MlKem768()) {
     // The ML-KEM randomness is the server random reused. That is fine here and would not
     // be in a real deployment: it must be unpredictable and unique per handshake, and
     // this host supplies exactly one 32-byte random value per connection.
     u8[] accepted = hybridServerAccept(peerKey, c.serverRandom, c.ephemeralPriv);
-    ourShare = u8[1120]();
-    for (i32 i = 0; i < 1120; i++) { ourShare[i] = accepted[i]; }
+    ourShare = u8[hybridServerShareLen()]();
+    for (i32 i = 0; i < hybridServerShareLen(); i++) { ourShare[i] = accepted[i]; }
     hybridSecret = u8[64]();
-    for (i32 i = 0; i < 64; i++) { hybridSecret[i] = accepted[1120 + i]; }
+    for (i32 i = 0; i < hybridSecretLen(); i++) { hybridSecret[i] = accepted[hybridServerShareLen() + i]; }
   } else if (group == 0x001d) {
     ourShare = x25519Base(c.ephemeralPriv);
   } else {
@@ -239,7 +241,7 @@ u8[] serverFlight(Conn c, u8[] clientHelloMsg) {
   // is exactly ClientHello ++ ServerHello, which is what "CH..SH" means in RFC 8446 §7.1
   // — one message too many or too few here yields keys that are wrong and look fine.
   u8[] shared = u8[0]();
-  if (group == 0x11EC) {
+  if (group == groupX25519MlKem768()) {
     shared = hybridSecret;
   } else if (group == 0x001d) {
     shared = x25519(c.ephemeralPriv, peerKey);
