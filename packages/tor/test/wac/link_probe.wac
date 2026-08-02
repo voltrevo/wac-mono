@@ -61,3 +61,7 @@ export u8[] extend2Body(u8[] ip, i32 port, u8[] id, u8[] hs) { return e2b(ip, po
 export u8[] extended2Reply(u8[] d) { return e2r(d); }
 export i32 cmdRelayExtend2() { return rx2(); }
 export i32 cmdRelayExtended2() { return rx2d(); }
+
+import { hopDigest as hd, sendmeBodyV1 as sb } from "../../src/relay.wac";
+export u8[] hopDigest(u8[] st, bool fwd) { return hd(st, fwd); }
+export u8[] sendmeBodyV1(u8[] d) { return sb(d); }

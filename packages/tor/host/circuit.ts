@@ -16,12 +16,20 @@
 // forwarded the cell — while the digest advances only for the hop the cell came from. That
 // asymmetry is why `hopPeel` and `hopCheck` are separate calls.
 //
-// ## Flow control is not implemented
+// ## Flow control
 //
-// Tor windows both circuits and streams: 1000 cells per circuit and 500 per stream before
-// the sender must stop and wait for a SENDME. This code answers SENDMEs it receives and
-// never sends any, which is fine for responses under 500 cells and wrong above it — the
-// exit will stop sending and the read will hang rather than fail. Issue 0013.
+// Tor windows both directions. A sender may put 1000 cells on a circuit and 500 on any one
+// stream before it must stop and wait for a RELAY_SENDME crediting it more; the receiver
+// sends one every 100 cells (circuit) or 50 (stream).
+//
+// Circuit-level SENDMEs are authenticated: the body carries the running digest at the point
+// the acknowledged cell arrived, so a relay cannot speed the sender up by inventing credit.
+// Only a party that actually received the cells knows that value. Which cell's digest is
+// the fiddly part — it is recorded when the deliver window reaches a multiple of the
+// increment, which is one cell *before* the SENDME goes out.
+//
+// Stream SENDMEs carry nothing: a stream's credit is bounded by its circuit's, so there is
+// nothing there worth forging.
 
 import { wacBind } from "../../../harness/wacBind.ts";
 import { CMD, type Link, readCell } from "./link.ts";
@@ -45,6 +53,8 @@ const ntorClientFinish = mod.ntorClientFinish as (
   identity: Uint8Array, onionKey: Uint8Array, ephemeralPriv: Uint8Array,
   reply: Uint8Array, keyLen: number,
 ) => Uint8Array;
+const hopDigest = mod.hopDigest as (state: Uint8Array, forward: boolean) => Uint8Array;
+const sendmeBodyV1 = mod.sendmeBodyV1 as (digest: Uint8Array) => Uint8Array;
 const hopStateLen = (mod.hopStateLen as () => number)();
 const relayCommand = mod.relayCommand as (body: Uint8Array) => number;
 const relayStreamId = mod.relayStreamId as (body: Uint8Array) => number;
@@ -77,11 +87,28 @@ const END_REASONS: Record<number, string> = {
   14: "not a directory",
 };
 
+/** tor-spec §7.3: the windows, and how often credit is returned. */
+const CIRCUIT_WINDOW = 1000;
+const CIRCUIT_INCREMENT = 100;
+const STREAM_WINDOW = 500;
+const STREAM_INCREMENT = 50;
+
 export class Circuit {
   #link: Link;
   #circId: number;
   #hops: Uint8Array[];
   #nextStreamId = 1;
+
+  // How many more data cells we may send, and how many more we may receive before we owe
+  // the far end a SENDME. Two separate counts in each direction, per circuit and per stream.
+  #packageWindow = CIRCUIT_WINDOW;
+  #deliverWindow = CIRCUIT_WINDOW;
+  #streamPackage = new Map<number, number>();
+  #streamDeliver = new Map<number, number>();
+
+  // The digest to put in the next circuit-level SENDME, captured when the deliver window
+  // hit a multiple of the increment — one cell before the SENDME is due.
+  #pendingSendmeDigest: Uint8Array | null = null;
 
   constructor(link: Link, circId: number, material: Uint8Array) {
     this.#link = link;
@@ -159,10 +186,37 @@ export class Circuit {
         throw new Error("a relay cell was not recognised by any hop — the circuit is dead");
       }
       const command = relayCommand(body);
-      // A SENDME is the peer giving us room to send more. We do not track a window, so
-      // there is nothing to credit; swallow it rather than handing it to the caller as data.
-      if (command === RELAY.sendme) continue;
-      return { command, streamId: relayStreamId(body), data: relayPayload(body) };
+      const streamId = relayStreamId(body);
+
+      // A SENDME is the far end giving us room to send more. Credit it and read on; it is
+      // flow control, not something the caller asked for.
+      if (command === RELAY.sendme) {
+        if (streamId === 0) {
+          this.#packageWindow += CIRCUIT_INCREMENT;
+        } else {
+          this.#streamPackage.set(
+            streamId, (this.#streamPackage.get(streamId) ?? STREAM_WINDOW) + STREAM_INCREMENT,
+          );
+        }
+        continue;
+      }
+
+      // Only data counts against the windows. Control cells are not metered, which is why a
+      // circuit can always be extended and torn down however congested it is.
+      if (command === RELAY.data) {
+        this.#deliverWindow--;
+        if (this.#deliverWindow < 0) {
+          throw new Error("the far end sent past its window — protocol violation");
+        }
+        // Record the digest exactly when the window reaches a multiple of the increment.
+        // This cell is the one the next SENDME will name, and the running hash has to be
+        // read now: one more cell and it is a different value.
+        if (this.#deliverWindow % CIRCUIT_INCREMENT === 0) {
+          this.#pendingSendmeDigest = hopDigest(this.#hops[this.#hops.length - 1], false);
+        }
+        await this.#considerSendmes(streamId);
+      }
+      return { command, streamId, data: relayPayload(body) };
     }
   }
 
@@ -247,9 +301,55 @@ export class Circuit {
     this.#hops.push(hopInit(keys));
   }
 
+  /** Return credit to the far end when we owe it, circuit first then stream. */
+  async #considerSendmes(streamId: number): Promise<void> {
+    while (this.#deliverWindow <= CIRCUIT_WINDOW - CIRCUIT_INCREMENT) {
+      // Version 1 when we have a digest to prove we received the cells, which we always
+      // should — the record happens one cell earlier. Falling back to an empty body would
+      // be silently downgrading to the unauthenticated form, so refuse instead.
+      if (this.#pendingSendmeDigest === null) {
+        throw new Error("a circuit SENDME is due but no cell digest was recorded");
+      }
+      await this.#send(RELAY.sendme, 0, sendmeBodyV1(this.#pendingSendmeDigest));
+      this.#pendingSendmeDigest = null;
+      this.#deliverWindow += CIRCUIT_INCREMENT;
+    }
+    if (streamId === 0) return;
+    const w = (this.#streamDeliver.get(streamId) ?? STREAM_WINDOW) - 1;
+    this.#streamDeliver.set(streamId, w);
+    if (w <= STREAM_WINDOW - STREAM_INCREMENT) {
+      // Stream SENDMEs carry nothing: a stream's credit is bounded by its circuit's.
+      await this.#send(RELAY.sendme, streamId, new Uint8Array(0));
+      this.#streamDeliver.set(streamId, w + STREAM_INCREMENT);
+    }
+  }
+
+  /**
+   * Spend one cell of send credit, waiting for a SENDME if there is none.
+   *
+   * Waiting rather than throwing: running past the window is a protocol violation and the
+   * far end tears the circuit down, so a client that ignored this would work until it sent
+   * 1000 cells and then fail in a way that looked like a network problem.
+   */
+  async #spend(streamId: number): Promise<void> {
+    while (this.#packageWindow <= 0 || (this.#streamPackage.get(streamId) ?? STREAM_WINDOW) <= 0) {
+      // #recv credits any SENDME it sees and returns the next real cell. There is nothing
+      // else to do with that cell here, so this only works because a caller mid-write is
+      // not also mid-read — a limitation worth knowing about rather than hiding.
+      const stray = await this.#recv();
+      throw new Error(
+        `blocked on flow control with a ${stray.command} cell pending — ` +
+        "interleaved read and write is not supported",
+      );
+    }
+    this.#packageWindow--;
+    this.#streamPackage.set(streamId, (this.#streamPackage.get(streamId) ?? STREAM_WINDOW) - 1);
+  }
+
   async write(streamId: number, data: Uint8Array): Promise<void> {
     // 498 bytes is what fits beside the eleven-byte relay header.
     for (let at = 0; at < data.length; at += 498) {
+      await this.#spend(streamId);
       await this.#send(RELAY.data, streamId, data.slice(at, at + 498));
     }
   }
