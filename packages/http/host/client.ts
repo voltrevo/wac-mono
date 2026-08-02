@@ -82,6 +82,54 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array<ArrayBuffer> {
 }
 
 /** One request over a fresh connection. */
+/** The part of `Deno.Conn` this needs — see `Socket` in the tls package for why this shape. */
+type Socket = {
+  read(p: Uint8Array): Promise<number | null>;
+  write(p: Uint8Array): Promise<number>;
+  close(): void;
+};
+
+/**
+ * Do a request over a connection the caller already has.
+ *
+ * Split out from `request` so that anything socket-shaped works: a TLS stream, a stream
+ * inside a Tor circuit, a pipe in a test. The loop was already correct and general; it was
+ * only the `Deno.connect` at the top that made it TCP-specific.
+ *
+ * `authority` is what goes in the Host header, which is not always where the bytes are
+ * going — through a proxy or a Tor exit those differ, and the header must name the origin
+ * the request is *for*.
+ */
+export async function requestOver(
+  conn: Socket,
+  authority: string,
+  target: string,
+  options: Options = {},
+): Promise<Result> {
+  const method = options.method ?? "GET";
+  try {
+    const out = buildRequest(authority, target, options);
+    let at = 0;
+    while (at < out.length) at += await conn.write(out.subarray(at));
+
+    let buffer: Uint8Array<ArrayBuffer> = new Uint8Array(0);
+    while (true) {
+      const chunk = new Uint8Array(16384);
+      const n = await conn.read(chunk);
+      const eof = n === null;
+      if (!eof) buffer = concat(buffer, chunk.subarray(0, n));
+      const result = parseResponse(buffer, method, eof);
+      if (result !== null) return result;
+      // The connection closed and wac still wants more: the response was cut off.
+      if (eof) return { ok: false, reason: "truncated" };
+    }
+  } finally {
+    try {
+      conn.close();
+    } catch { /* already closed */ }
+  }
+}
+
 export async function request(
   hostname: string,
   port: number,

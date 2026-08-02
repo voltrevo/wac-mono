@@ -181,6 +181,20 @@ export async function request(
 }
 
 /**
+ * The part of `Deno.Conn` anything here actually uses.
+ *
+ * Deliberately the same shape rather than a nicer one of our own: `Deno.Conn` satisfies it
+ * structurally with no adapter, and so does anything else written to match — which means a
+ * Tor stream can be handed to code that has never heard of Tor. A prettier interface would
+ * have needed a shim at every boundary and bought nothing.
+ */
+export type Socket = {
+  read(p: Uint8Array): Promise<number | null>;
+  write(p: Uint8Array): Promise<number>;
+  close(): void;
+};
+
+/**
  * A TLS connection as a byte stream you can read and write in any order.
  *
  * `request` above is a one-shot: send this, read until the response ends. That is the
@@ -192,17 +206,23 @@ export async function request(
  * The framing discipline is the same one `request` uses and both servers use: whole
  * records are handed to wac, never partial ones and never two half-records glued.
  */
-export class TlsStream {
-  #conn: Deno.Conn;
+export class TlsStream implements Socket {
+  #below: Socket;
   #state: Uint8Array;
-  #raw = new Uint8Array(0);        // bytes read from the socket, not yet whole records
+  #raw = new Uint8Array(0);        // bytes read from below, not yet whole records
   #plain = new Uint8Array(0);      // decrypted application data, not yet handed out
   #chunk = new Uint8Array(16640);
   #closed = false;
 
-  private constructor(conn: Deno.Conn, state: Uint8Array) {
-    this.#conn = conn;
+  private constructor(below: Socket, state: Uint8Array) {
+    this.#below = below;
     this.#state = state;
+  }
+
+  /** Write everything, since a short write is legal and silently loses data if ignored. */
+  async #writeAll(data: Uint8Array): Promise<void> {
+    let at = 0;
+    while (at < data.length) at += await this.#below.write(data.subarray(at));
   }
 
   /** The connection's failure code: 0 while it is healthy. */
@@ -221,7 +241,20 @@ export class TlsStream {
     hostname: string, port: number, serverName: string,
     roots: { der: Uint8Array; offsets: Int32Array },
   ): Promise<TlsStream> {
-    const conn = await openStream(hostname, port);
+    return await TlsStream.over(await openStream(hostname, port), serverName, roots);
+  }
+
+  /**
+   * Handshake over a socket the caller already has.
+   *
+   * This is the form that matters for Tor: the socket is a stream inside a circuit, the far
+   * end is a real web server, and the trust store must be a real one — see the note on
+   * `noTrustStore` for why the relay links are the opposite case.
+   */
+  static async over(
+    below: Socket, serverName: string,
+    roots: { der: Uint8Array; offsets: Int32Array },
+  ): Promise<TlsStream> {
     const r = unpack(init(
       new TextEncoder().encode(serverName), roots.der, roots.offsets,
       crypto.getRandomValues(new Uint8Array(32)),
@@ -230,8 +263,8 @@ export class TlsStream {
       crypto.getRandomValues(new Uint8Array(32)),
       BigInt(Math.floor(Date.now() / 1000)),
     ));
-    const s = new TlsStream(conn, r.state);
-    await conn.write(r.toSend);
+    const s = new TlsStream(below, r.state);
+    await s.#writeAll(r.toSend);
     while (phase(s.#state) !== 3) {
       if (!await s.#pump()) throw new Error("peer closed during the handshake");
       if (s.failure !== 0) throw new Error(`handshake failed, code ${s.failure}`);
@@ -239,9 +272,9 @@ export class TlsStream {
     return s;
   }
 
-  /** Read once from the socket and feed every whole record to wac. False at end of stream. */
+  /** Read once from below and feed every whole record to wac. False at end of stream. */
   async #pump(): Promise<boolean> {
-    const n = await this.#conn.read(this.#chunk);
+    const n = await this.#below.read(this.#chunk);
     if (n === null) return false;
     const merged = new Uint8Array(this.#raw.length + n);
     merged.set(this.#raw);
@@ -260,7 +293,7 @@ export class TlsStream {
 
     const r = unpack(feedRaw(this.#state, ready));
     this.#state = r.state;
-    if (r.toSend.length > 0) await this.#conn.write(r.toSend);
+    if (r.toSend.length > 0) await this.#writeAll(r.toSend);
     if (r.appData.length > 0) {
       const grown = new Uint8Array(this.#plain.length + r.appData.length);
       grown.set(this.#plain);
@@ -270,34 +303,50 @@ export class TlsStream {
     return true;
   }
 
-  /** Whatever application data has arrived, waiting for at least one byte. Null at EOF. */
-  async read(): Promise<Uint8Array | null> {
+  /**
+   * Decrypted application data into `p`, as a socket would. Null at end of stream.
+   *
+   * Socket-shaped rather than chunk-shaped so that a `TlsStream` *is* a `Socket` and can be
+   * handed to anything that takes one — which is the whole point: the HTTP client does not
+   * need to know whether it is talking to TCP, TLS, or TLS inside a Tor circuit.
+   */
+  async read(p: Uint8Array): Promise<number | null> {
     while (this.#plain.length === 0) {
       if (this.#closed) return null;
       if (!await this.#pump()) return null;
       if (this.failure !== 0) throw new Error(`connection failed, code ${this.failure}`);
     }
-    const out = this.#plain;
-    this.#plain = new Uint8Array(0);
-    return out;
+    const n = Math.min(p.length, this.#plain.length);
+    p.set(this.#plain.subarray(0, n));
+    this.#plain = this.#plain.slice(n);
+    return n;
   }
 
-  async write(data: Uint8Array): Promise<void> {
+  /** Encrypt and send. Always writes everything, so the return is always `data.length`. */
+  async write(data: Uint8Array): Promise<number> {
     const r = unpack(sendRaw(this.#state, data));
     this.#state = r.state;
-    await this.#conn.write(r.toSend);
+    await this.#writeAll(r.toSend);
+    return data.length;
   }
 
-  /** Send close_notify, then drop the socket. */
-  async close(): Promise<void> {
+  /**
+   * Send close_notify, then close what is underneath.
+   *
+   * Synchronous to match `Socket`, so the close_notify is written on a promise nobody
+   * awaits. That is the right trade here: the alternative is an async `close` that no
+   * socket-shaped consumer would await either, and a peer that misses the notify sees a
+   * truncated connection rather than anything worse.
+   */
+  close(): void {
     if (this.#closed) return;
     this.#closed = true;
     try {
       const r = unpack(closeRaw(this.#state));
       this.#state = r.state;
-      await this.#conn.write(r.toSend);
+      this.#writeAll(r.toSend).catch(() => {});
     } catch { /* the peer may have gone first, which is not our problem here */ }
-    try { this.#conn.close(); } catch { /* already closed */ }
+    this.#below.close();
   }
 }
 

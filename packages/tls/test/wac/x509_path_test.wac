@@ -23,8 +23,8 @@
 
 import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
-import { verifyPath, parseCert, Cert, keyP256, keyP384, sigEcdsaSha256, sigEcdsaSha384 }
-  from "../../src/x509.wac";
+import { verifyPath, parseCert, Cert, certMatchesHost, keyP256, keyP384,
+         sigEcdsaSha256, sigEcdsaSha384 } from "../../src/x509.wac";
 
 // Fixture numbering, matching the loader on the host side.
 const i32 ROOT = 0;
@@ -245,5 +245,54 @@ export string test_name_constraints(fn[u8[](i32)] load) {
   // closed, refusing a CA that is genuinely entitled to the name.
   t.eqI32(check(Bundle.of2(leaf, load(NC_UPPER)), roots, "wac.test", NOW, 8), 0,
           "WAC.TEST covers wac.test");
+  return t.report();
+}
+
+// ── Matching an IP address ───────────────────────────────────────────────────
+
+const i32 EC_LEAF = 15;      // DNS:wac.test, DNS:localhost, IP:127.0.0.1
+const i32 IP_AS_DNS = 16;    // DNS:127.0.0.1, DNS:example.test — and no iPAddress at all
+
+export string test_an_ip_literal_matches_an_ip_san(fn[u8[](i32)] fixture) {
+  T t = T.create();
+  Cert c = parseCert(fixture(EC_LEAF));
+  t.isTrue(certMatchesHost(c, "127.0.0.1".toBytes()), "the address in the iPAddress SAN");
+  t.isTrue(!certMatchesHost(c, "127.0.0.2".toBytes()), "and not a neighbouring one");
+  t.isTrue(!certMatchesHost(c, "1.2.3.4".toBytes()), "nor an unrelated one");
+  // The names still work, so adding addresses did not cost the ordinary path.
+  t.isTrue(certMatchesHost(c, "localhost".toBytes()), "a dNSName still matches");
+  t.isTrue(certMatchesHost(c, "wac.test".toBytes()), "and so does the other one");
+  return t.report();
+}
+
+export string test_an_ip_literal_never_matches_a_dns_entry(fn[u8[](i32)] fixture) {
+  // RFC 6125 §6.4: when the reference identity is an address, dNSName entries are not
+  // consulted. This certificate carries `DNS:127.0.0.1` and no iPAddress, which is
+  // something a CA might issue as an ordinary name — treating it as authority over the
+  // address would let it stand in for a host it was never meant to cover.
+  T t = T.create();
+  Cert c = parseCert(fixture(IP_AS_DNS));
+  t.isTrue(!certMatchesHost(c, "127.0.0.1".toBytes()),
+           "a dNSName that looks like an address does not cover the address");
+  t.isTrue(certMatchesHost(c, "example.test".toBytes()), "its real name still matches");
+  return t.report();
+}
+
+export string test_only_a_strict_dotted_quad_is_an_address(fn[u8[](i32)] fixture) {
+  // The parser is deliberately not inet_aton, which accepts octal, hex and short forms —
+  // `0177.0.0.1` and `2130706433` are both 127.0.0.1 to it. Anything it rejects falls
+  // through to name matching, so a loose parser here would let one identity be checked
+  // under the other's rules.
+  T t = T.create();
+  Cert ec = parseCert(fixture(EC_LEAF));
+  string[] notAddresses = string[]("0177.0.0.1", "2130706433", "127.0.0.1.", "127.0.0",
+                                   "127.0.0.256", "127.0.0.01a", "127..0.1", "");
+  for (i32 i = 0; i < notAddresses.len(); i++) {
+    t.isTrue(!certMatchesHost(ec, notAddresses[i].toBytes()),
+             notAddresses[i] + " is not treated as 127.0.0.1");
+  }
+  // And a leading-zero form that is a valid decimal quad is still just that quad.
+  t.isTrue(!certMatchesHost(ec, "127.0.0.001".toBytes()),
+           "127.0.0.001 parses as 1 in the last octet, not as a different notation");
   return t.report();
 }

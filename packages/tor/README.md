@@ -73,6 +73,8 @@ happened to this repo's SHAKE tests until they moved to `node:crypto`.
 | `host/path.ts` | resolving the consensus into candidates, and guards |
 | `host/dirclient.ts` | fetching the directory over Tor, bootstrapping, and refresh |
 | `host/pool.ts` | keeping circuits, and deciding which one a stream goes on |
+| `host/socket.ts` | a stream, shaped like a socket — the integration surface |
+| `host/fetch.ts` | HTTPS over Tor, which is three lines of composition |
 
 The split is the same one the TLS package uses: bytes and state machines in wac, and only
 the socket in TypeScript. One exception is forced rather than chosen — a `Hop` is a struct
@@ -134,6 +136,33 @@ samples a new one to replace it.
 The chooser takes its randomness as an argument. That is what lets the tests sweep the whole
 random space and assert the distribution exactly, instead of sampling it — a statistical
 test loose enough never to flake is loose enough to miss a real bias.
+
+## HTTPS over Tor
+
+```ts
+const socket = await torConnect(pool, "example.com", 443);   // a Tor stream
+const tls    = await TlsStream.over(socket, "example.com", roots);
+const result = await requestOver(tls, "example.com", "/");
+```
+
+Or `torFetch(pool, "https://example.com/")`, which is those three lines.
+
+There is no Tor-specific HTTP code and there should not be. `Deno.Conn`'s read/write/close
+is the shape everything above already accepts, so `TorSocket` matches it exactly and needs
+no adapter anywhere: `TlsStream` takes a socket and *is* one, and `packages/http`'s
+`requestOver` takes a socket. The request loop it uses was already correct and general —
+only the `Deno.connect` at the top of `request` had made it TCP-specific.
+
+Getting this wrong the first time meant writing a third copy of that loop. The socket shape
+is the whole integration, and anything more is a sign of not having looked.
+
+**The exit is the adversary, so certificate validation matters here.** Everywhere else in
+this package the trust store is deliberately empty — a relay is authenticated by ntor, not
+by its self-signed certificate. This is the opposite case: the exit sees plaintext TCP, can
+be anybody, and exits that tamper are observed rather than hypothetical. Tor with an
+unvalidated end-to-end TLS is worse than no Tor, because it takes a connection your ISP
+could read and hands it to a stranger who chose to be there. `torFetch` refuses `http://`
+for the same reason.
 
 ## Bootstrapping is not circular
 
