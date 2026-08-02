@@ -1,0 +1,377 @@
+// A blocking SSH client over `packages/platform`'s capabilities.
+//
+// Everything below this file is functions over bytes, which is the right shape for testing each
+// rule against a real server and the wrong shape for someone who just wants to run a command.
+// This is the shape for that: one struct holding the socket, the keys and the two sequence
+// numbers, with methods that block.
+//
+// It can block because `platform`'s sockets are synchronous — `recv` parks the wac thread while
+// the host reads on another. That is worth pausing on, because it is the whole reason this reads
+// like a straight line rather than a state machine: `packages/tls` had to be a `feed(state, in)`
+// pump precisely because it predates that capability.
+//
+// The one thing the capability world cannot do is wait on two sockets at once, which SSH does not
+// need for a single channel running one command. It would need it for port forwarding.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { Cli, Core, Socket } from "../../platform/src/platform.wac";
+import { Framed, Status, frame, maxPacket, minBlock, paddingFor, unframe } from "./packet.wac";
+import { Found, Version, clientVersion, clientVersionLine, scanVersion, speaksV2 } from "./version.wac";
+import { Opened, Plain, aeadPaddingFor, keyLength, open, seal } from "./cipher.wac";
+import { clientProposal, decode, encode, msgKexInit, negotiate } from "./kexinit.wac";
+import { EcdhReply, deriveKey, ecdhInit, ephemeralPublic, exchangeHash, msgKexEcdhReply,
+         parseEcdhReply, sharedSecret, verifyEd25519Host } from "./kex.wac";
+import { msgServiceAccept, msgUserAuthFailure, msgUserAuthSuccess, publicKeyRequest,
+         serviceRequest } from "./auth.wac";
+import { Incoming, Window, channelClose, defaultMaxPacket, execRequest, extendedDataStderr,
+         msgChannelData, msgChannelExtendedData, msgChannelOpenConfirmation,
+         msgChannelOpenFailure, msgChannelClose, msgChannelRequest, openSession, parse,
+         windowAdjust } from "./channel.wac";
+
+/** SSH_MSG_NEWKEYS, and the transport messages a client must tolerate mid-stream. */
+i32 msgNewKeys() { return 21; }
+i32 msgDisconnect() { return 1; }
+i32 msgIgnore() { return 2; }
+i32 msgDebug() { return 4; }
+i32 msgExtInfo() { return 7; }
+
+/** Our channel number. Any value would do; 0 is what every other client uses. */
+i32 ourChannel() { return 0; }
+
+/**
+ * The receive window we advertise.
+ *
+ * Small enough that the adjustment path runs for any real output rather than only for very large
+ * output — a window nobody ever exhausts is a code path nobody ever tests.
+ */
+i32 windowSize() { return 64 * 1024; }
+
+export struct Client {
+  Core core;
+  Cli cli;
+  i32 sock;
+
+  /** Received and not yet consumed. */
+  Buf buf;
+
+  u8[] keyIn;
+  u8[] keyOut;
+  i32 seqIn;
+  i32 seqOut;
+  bool encrypted;
+
+  /** H from the first exchange, which authentication signatures bind to. */
+  u8[] sessionId;
+  /** The host key the server presented, for the caller to check against known_hosts. */
+  u8[] hostKey;
+
+  /** Empty while nothing has gone wrong. */
+  string error;
+
+  Client create(Core core, Cli cli, i32 sock) {
+    return Client(core, cli, sock, Buf.create(), u8[0](), u8[0](), 0, 0, false,
+                  u8[0](), u8[0](), "");
+  }
+
+  bool failed(const this) { return this.error != ""; }
+
+  void fail(this, string why) {
+    if (this.error == "") { this.error = why; }
+  }
+
+  /** One `recv`, appended. False at end of stream. */
+  bool fill(this) {
+    u8[] chunk = this.cli.recv(this.sock);
+    if (chunk.len() == 0) { return false; }
+    this.buf.pushAll(chunk);
+    return true;
+  }
+
+  /** Send one payload, framed or sealed according to where the handshake has got to. */
+  bool sendPacket(this, u8[] payload) {
+    i32 block = minBlock();
+    if (this.encrypted) {
+      u8[] pad = this.core.randomBytes(aeadPaddingFor(payload.len(), block));
+      u8[] packet = seal(this.keyOut, this.seqOut, payload, pad, block);
+      this.seqOut++;
+      return this.cli.send(this.sock, packet);
+    }
+    u8[] pad = this.core.randomBytes(paddingFor(payload.len(), block));
+    u8[] packet = frame(payload, pad, block);
+    this.seqOut++;
+    return this.cli.send(this.sock, packet);
+  }
+
+  /**
+   * Block until one whole packet has arrived, and hand back its payload.
+   *
+   * Empty means failure, with `error` saying which. Transport housekeeping — IGNORE, DEBUG and
+   * EXT_INFO — is swallowed here rather than left for every caller to remember: a server may send
+   * them at any point, and a client that treats one as the message it was waiting for goes wrong
+   * far from the cause.
+   */
+  u8[] readPacket(this) {
+    while (true) {
+      if (this.failed()) { return u8[0](); }
+      u8[] payload = this.tryOnePacket();
+      if (this.failed()) { return u8[0](); }
+      if (payload.len() > 0) {
+        i32 kind = payload[0];
+        if (kind == msgIgnore() || kind == msgDebug() || kind == msgExtInfo()) { continue; }
+        if (kind == msgDisconnect()) {
+          this.fail("the server disconnected");
+          return u8[0]();
+        }
+        return payload;
+      }
+      if (!this.fill()) {
+        this.fail("the connection closed while waiting for a packet");
+        return u8[0]();
+      }
+    }
+    trap;                     // unreachable: the loop only exits by returning
+  }
+
+  /** One packet if the buffer holds one, empty if it does not yet. */
+  u8[] tryOnePacket(this) {
+    if (this.encrypted) {
+      Plain p = open(this.keyIn, this.seqIn, this.buf.data, 0, this.buf.len, maxPacket());
+      match (p.status) {
+        case Ok: {
+          this.buf.dropFront(p.used);
+          this.seqIn++;
+          // A zero-length payload is a legal packet and not "nothing yet", so it is reported as a
+          // one-byte NOOP rather than as an empty buffer the caller would wait on forever.
+          return p.payload.len() == 0 ? u8[](msgIgnore()) : p.payload;
+        }
+        case Incomplete: { return u8[0](); }
+        else: {
+          this.fail("a packet failed its authentication tag");
+          return u8[0]();
+        }
+      }
+    }
+    Framed f = unframe(this.buf.data, 0, this.buf.len);
+    match (f.status) {
+      case Ok: {
+        this.buf.dropFront(f.used);
+        this.seqIn++;
+        return f.payload.len() == 0 ? u8[](msgIgnore()) : f.payload;
+      }
+      case Incomplete: { return u8[0](); }
+      else: {
+        this.fail("the server sent something that is not a packet");
+        return u8[0]();
+      }
+    }
+  }
+
+  /**
+   * Version exchange, key exchange and NEWKEYS.
+   *
+   * Leaves `sessionId` and `hostKey` set. The caller must check `hostKey` against known_hosts
+   * before sending anything else — this cannot do it, because the file and the policy belong to
+   * whoever is running the program.
+   */
+  void handshake(this) {
+    if (!this.cli.send(this.sock, clientVersionLine())) {
+      this.fail("cannot send the version line");
+      return;
+    }
+
+    // The server may send banner lines first, so this reads until a version line appears.
+    u8[] serverVersion = u8[0]();
+    while (true) {
+      Version v = scanVersion(this.buf.data, 0, this.buf.len);
+      match (v.status) {
+        case Ok: {
+          serverVersion = v.line;
+          this.buf.dropFront(v.used);
+        }
+        case Incomplete: {
+          if (!this.fill()) {
+            this.fail("the connection closed during the version exchange");
+            return;
+          }
+          continue;
+        }
+        else: {
+          this.fail("the server did not send a usable version line");
+          return;
+        }
+      }
+      break;
+    }
+    if (!speaksV2(serverVersion)) {
+      this.fail("the server does not speak SSH-2: " + string.fromBytes(serverVersion));
+      return;
+    }
+
+    u8[] ourKexInit = encode(clientProposal(), this.core.randomBytes(16));
+    if (!this.sendPacket(ourKexInit)) { this.fail("cannot send KEXINIT"); return; }
+
+    u8[] theirKexInit = this.readPacket();
+    if (this.failed()) { return; }
+    if (theirKexInit[0] != msgKexInit()) { this.fail("expected KEXINIT"); return; }
+    if (!this.agreed(theirKexInit)) { return; }
+
+    u8[] secret = this.core.randomBytes(32);
+    u8[] qc = ephemeralPublic(secret);
+    if (!this.sendPacket(ecdhInit(qc))) { this.fail("cannot send the key exchange"); return; }
+
+    u8[] replyPayload = this.readPacket();
+    if (this.failed()) { return; }
+    if (replyPayload[0] != msgKexEcdhReply()) { this.fail("expected the key exchange reply"); return; }
+    EcdhReply? reply = parseEcdhReply(replyPayload);
+    if (reply is null) { this.fail("the key exchange reply did not parse"); return; }
+
+    u8[]? shared = sharedSecret(secret, reply!.serverPublic);
+    if (shared is null) {
+      this.fail("the server sent a low-order point");
+      return;
+    }
+    u8[] h = exchangeHash(clientVersion(), serverVersion, ourKexInit, theirKexInit,
+                          reply!.hostKey, qc, reply!.serverPublic, shared!);
+    if (!verifyEd25519Host(reply!.hostKey, reply!.signature, h)) {
+      this.fail("the server's host key signature did not verify");
+      return;
+    }
+    this.sessionId = h;
+    this.hostKey = reply!.hostKey;
+
+    if (!this.sendPacket(u8[](msgNewKeys()))) { this.fail("cannot send NEWKEYS"); return; }
+    u8[] theirNewKeys = this.readPacket();
+    if (this.failed()) { return; }
+    if (theirNewKeys[0] != msgNewKeys()) { this.fail("expected NEWKEYS"); return; }
+
+    this.keyOut = deriveKey(shared!, h, h, 0x43, keyLength());     // 'C', client to server
+    this.keyIn = deriveKey(shared!, h, h, 0x44, keyLength());      // 'D', server to client
+    this.encrypted = true;
+    // Strict KEX: both counters restart. We only advertise it alongside servers that support it,
+    // and OpenSSH has since 9.6; a server without it would fail its first MAC here rather than
+    // silently continuing, which is the failure worth having.
+    this.seqIn = 0;
+    this.seqOut = 0;
+  }
+
+  /** Whether the server offers everything we require. */
+  bool agreed(this, u8[] theirKexInit) {
+    if (decode(theirKexInit) is null) { this.fail("the server's KEXINIT did not parse"); return false; }
+    clientProposal();
+    if (negotiate(clientProposal().kex, decode(theirKexInit)!.kex).len() == 0) {
+      this.fail("no key exchange in common");
+      return false;
+    }
+    if (negotiate(clientProposal().hostKey, decode(theirKexInit)!.hostKey).len() == 0) {
+      this.fail("no host key algorithm in common — this client only knows ssh-ed25519");
+      return false;
+    }
+    if (negotiate(clientProposal().cipherToServer, decode(theirKexInit)!.cipherToServer).len() == 0) {
+      this.fail("no cipher in common");
+      return false;
+    }
+    return true;
+  }
+
+  /** Request the authentication service and authenticate with an Ed25519 key. */
+  void authenticate(this, u8[] user, u8[] publicBlob, u8[] seed) {
+    if (!this.sendPacket(serviceRequest())) { this.fail("cannot request ssh-userauth"); return; }
+    u8[] accept = this.readPacket();
+    if (this.failed()) { return; }
+    if (accept[0] != msgServiceAccept()) { this.fail("the server refused ssh-userauth"); return; }
+
+    u8[] request = publicKeyRequest(this.sessionId, user, publicBlob, seed);
+    if (!this.sendPacket(request)) { this.fail("cannot send the authentication request"); return; }
+
+    while (true) {
+      u8[] reply = this.readPacket();
+      if (this.failed()) { return; }
+      if (reply[0] == msgUserAuthSuccess()) { return; }
+      if (reply[0] == msgUserAuthFailure()) {
+        this.fail("the server rejected the key");
+        return;
+      }
+      // A banner may arrive before either, and anything else is not ours to interpret.
+    }
+    trap;
+  }
+
+  /**
+   * Run `command`, writing its output through the capabilities, and answer with its exit status.
+   *
+   * -1 means the command never reported one, which a server is allowed not to do.
+   */
+  i32 run(this, u8[] command) {
+    if (!this.sendPacket(openSession(ourChannel(), windowSize(), defaultMaxPacket()))) {
+      this.fail("cannot open a channel");
+      return -1;
+    }
+
+    i32 serverChannel = -1;
+    while (serverChannel < 0) {
+      u8[] p = this.readPacket();
+      if (this.failed()) { return -1; }
+      Incoming m = parse(p);
+      if (!m.ok) { this.fail("a channel message did not parse"); return -1; }
+      if (m.kind == msgChannelOpenFailure()) {
+        this.fail("the server refused the channel: " + string.fromBytes(m.data));
+        return -1;
+      }
+      if (m.kind == msgChannelOpenConfirmation()) { serverChannel = m.senderChannel; }
+    }
+
+    if (!this.sendPacket(execRequest(serverChannel, command, true))) {
+      this.fail("cannot send the command");
+      return -1;
+    }
+
+    Window window = Window.create(windowSize());
+    Buf stderr = Buf.create();
+    i32 status = -1;
+    bool closed = false;
+
+    while (!closed) {
+      u8[] p = this.readPacket();
+      if (this.failed()) { break; }
+      Incoming m = parse(p);
+      if (!m.ok) { this.fail("a channel message did not parse"); break; }
+
+      if (m.kind == msgChannelData()) {
+        this.cli.write(m.data);
+        this.giveCredit(window, serverChannel, m.data.len());
+      } else if (m.kind == msgChannelExtendedData()) {
+        if (m.extra == extendedDataStderr()) { stderr.pushAll(m.data); }
+        this.giveCredit(window, serverChannel, m.data.len());
+      } else if (m.kind == msgChannelRequest()) {
+        // `exit-status` is a request, not a reply, and nothing prompts it.
+        if (string.fromBytes(m.data) == "exit-status") { status = m.extra; }
+      } else if (m.kind == msgChannelClose()) {
+        closed = true;
+      }
+    }
+
+    // Standard error goes out in one piece at the end. The capability world has `write` for
+    // standard output as bytes but only `warn` for the error channel, which is line-oriented — so
+    // interleaving the two exactly as the server sent them is not expressible here.
+    if (stderr.len > 0) {
+      // `warn` adds its own newline, so a trailing one would print a blank line. Trimmed on the
+      // bytes rather than the string: a UTF-8 sequence has no newline byte inside it, so this is
+      // safe where indexing a decoded string would not be.
+      i32 n = stderr.len;
+      while (n > 0 && stderr.get(n - 1) == 10) { n--; }
+      u8[] trimmed = u8[n]();
+      trimmed.copyFrom(stderr.data, 0, 0, n);
+      this.core.warn(string.fromBytes(trimmed));
+    }
+
+    this.sendPacket(channelClose(serverChannel));
+    return status;
+  }
+
+  void giveCredit(this, Window window, i32 channel, i32 n) {
+    i32 increment = window.consume(n);
+    if (increment > 0) {
+      this.sendPacket(windowAdjust(channel, increment));
+    }
+  }
+}

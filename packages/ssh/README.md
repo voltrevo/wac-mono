@@ -1,6 +1,6 @@
 # ssh
 
-An SSH-2 client, in wac. **It runs commands.** Version exchange, the binary packet protocol,
+An SSH-2 client, in wac, **and an `ssh` program built from it.** Version exchange, the binary packet protocol,
 algorithm negotiation, curve25519-sha256 key exchange, `ssh-ed25519` host key verification, the
 `chacha20-poly1305@openssh.com` AEAD, `known_hosts`, reading an OpenSSH private key — encrypted or
 not — publickey authentication, and the connection protocol: session channels, flow control and
@@ -8,6 +8,16 @@ not — publickey authentication, and the connection protocol: session channels,
 
 > **Not for production**, for the same reason [crypto](../crypto/README.md) is not: it is built on
 > primitives that are known to leak timing, and nothing here has been reviewed by anyone.
+
+```sh
+deno task app packages/ssh/src/ssh.wac --allow-read --allow-net --allow-env -- user@host uname -a
+deno task app:build packages/ssh/src/ssh.wac --allow-read --allow-net --allow-env -o wacssh
+./wacssh -p 2222 user@host 'seq 1 100000 | wc -l'
+```
+
+`src/ssh.wac` is the whole program — argument parsing, the key file, known_hosts, the protocol.
+There is no TypeScript in `src/`. Built it is 151K and self-contained, and the shebang is exactly
+its grants.
 
 A package of [wac-mono](../../README.md) — see the root README for layout and how to run things.
 All commands run from the repo root.
@@ -194,6 +204,34 @@ flight.
 
 **The exit status arrives as a request, not a reply** — a `CHANNEL_REQUEST` named `exit-status`
 with `want_reply` false, prompted by nothing.
+
+## The program
+
+`src/client.wac` is the protocol as something that blocks: one struct holding the socket, the keys
+and the two sequence numbers. It reads like a straight line rather than a state machine because
+`packages/platform`'s sockets are synchronous — `recv` parks the wac thread while the host reads
+on another. [tls](../tls/README.md) had to be a `feed(state, input)` pump precisely because it
+predates that capability.
+
+`src/ssh.wac` is the program on top. Three things it deliberately will not do:
+
+**An unknown host is refused**, not accepted with a warning. A real client asks; asking needs a
+terminal this cannot reach, since `readStdin` is the pipe the command's own input comes from and a
+prompt would consume it. The refusal prints the exact line to add, and `-k` writes it — the same
+decision, made deliberately rather than by pressing return. `-k` does *not* override a changed
+key: adding is for unknown hosts.
+
+**An encrypted key needs `SSH_PASSPHRASE` in the environment**, for the same reason. That is worse
+than a prompt in every way except honesty.
+
+**Standard error arrives in one piece at the end**, not interleaved with standard output. The
+capability world has `write` for stdout as bytes but only `warn`, which is line-oriented, for the
+error channel, so byte-exact interleaving is not expressible — [issue
+0014](../../issues/open/0014-platform-has-no-way-to-write-bytes-to-standard-error.md).
+
+Argument joining matches OpenSSH: everything after the host becomes one command string joined with
+spaces, so `ssh host sh -c 'echo hi'` loses its quotes here exactly as it does there. Verified
+against the real client rather than assumed.
 
 ## What is missing
 
