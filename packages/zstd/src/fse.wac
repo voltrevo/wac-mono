@@ -255,8 +255,14 @@ export struct BackBits {
     return BackBits(src, start, usable);
   }
 
-  /** The next `n` bits, most significant first. Past the end reads as zeros, as the format allows. */
-  i32 read(this, i32 n) {
+  /**
+   * The next `n` bits without consuming them, most significant first.
+   *
+   * Past the end reads as zeros rather than trapping. That is deliberate and the format relies
+   * on it: a Huffman lookup always takes the table's full width even when the symbol it lands
+   * on is shorter, so the last symbol of a stream is routinely indexed with padding.
+   */
+  i32 peek(const this, i32 n) {
     i32 v = 0;
     for (i32 i = 0; i < n; i++) {
       i32 bit = this.left - 1 - i;
@@ -266,7 +272,21 @@ export struct BackBits {
       }
       v = (v << 1) | x;
     }
-    this.left -= n;
+    return v;
+  }
+
+  /**
+   * Advance by `n` bits, which may take `left` negative.
+   *
+   * Overrunning is how a stream announces it is finished — the decoder checks `left` after a
+   * symbol rather than before, because the symbol that overruns is still the encoder's.
+   */
+  void consume(this, i32 n) { this.left -= n; }
+
+  /** Peek and consume together, which is what a fixed-width field needs. */
+  i32 read(this, i32 n) {
+    i32 v = this.peek(n);
+    this.consume(n);
     return v;
   }
 }

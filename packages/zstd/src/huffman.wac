@@ -1,0 +1,229 @@
+// Huffman-coded literals (RFC 8878, section 4.2).
+//
+// zstd splits a compressed block in two: the *literals* — the bytes that were not matched —
+// Huffman-coded here, and the *sequences* that say how to interleave them with matches. This
+// file is the first half.
+//
+// The Huffman code is described by weights rather than by lengths, and the difference matters.
+// A weight `w` means the symbol's code is `maxBits + 1 - w` bits long, so a bigger weight is a
+// shorter code. Weight zero means the symbol does not occur. The weight of the *last* symbol is
+// never transmitted: the code space left over after all the others is necessarily one power of
+// two, and its logarithm is that weight. A decoder that does not reconstruct it has an
+// incomplete code and will read past the end of its table.
+//
+// Decoding is a single table lookup per symbol, indexed by the next `maxBits` bits: a symbol
+// whose code is `n` bits long occupies `2^(maxBits - n)` consecutive entries, so every index
+// that starts with its code lands on it. That costs `2^maxBits` entries — at most 2048 — and
+// buys one lookup per literal instead of a walk down a tree.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { BackBits, decompress } from "./fse.wac";
+
+/** The largest code length the format allows, and so the widest table index. */
+i32 maxTableLog() { return 11; }
+
+/** Accuracy log limit for the FSE table that codes the weights. */
+i32 weightLog() { return 6; }
+
+i32 highBit(i32 v) {
+  i32 n = -1;
+  i32 x = v;
+  while (x != 0) {
+    n++;
+    x = x >>> 1;
+  }
+  return n;
+}
+
+/**
+ * A decoding table: `1 << maxBits` entries, indexed by the next `maxBits` bits of the stream.
+ *
+ * `bytesUsed` is how much of the input the tree description took, which the caller needs to
+ * find the streams that follow it.
+ */
+export struct HuffTable {
+  i32 maxBits;
+  i32[] symbol;
+  i32[] nbBits;
+  i32 bytesUsed;
+}
+
+/**
+ * Read a tree description and build the table.
+ *
+ * Two forms, chosen by the first byte. Below 128 it is a byte count and the weights are
+ * FSE-coded; at 128 or above it is `127 + the number of weights`, and they follow as nibbles,
+ * high half of each byte first.
+ */
+export HuffTable readTable(u8[] src, i32 at) {
+  if (at >= src.len()) { trap; }
+  i32 header = src[at];
+
+  i32[] weights = i32[256]();
+  i32 count = 0;
+  i32 used = 1;
+
+  if (header >= 128) {
+    // Direct: one nibble each, and the count is exact rather than implied by a stream ending.
+    // At most 128 weights: the header is one byte, so `header - 127` cannot exceed 128.
+    count = header - 127;
+    i32 bytes = (count + 1) / 2;
+    if (at + 1 + bytes > src.len()) { trap; }
+    for (i32 i = 0; i < count; i++) {
+      i32 b = src[at + 1 + (i / 2)];
+      if (i % 2 == 0) {
+        weights[i] = b >>> 4;
+      } else {
+        weights[i] = b & 15;
+      }
+    }
+    used = 1 + bytes;
+  } else {
+    // FSE-coded. The header is the compressed length, so the stream's extent is known before
+    // anything is decoded — which is what lets the weights be read without knowing how many.
+    if (header == 0) { trap; }
+    if (at + 1 + header > src.len()) { trap; }
+    u8[] blob = u8[header]();
+    for (i32 i = 0; i < header; i++) {
+      blob[i] = src[at + 1 + i];
+    }
+    // 255 weights at most, so a stream that decodes to more stops on the array bound inside
+    // `decompress` rather than being counted and rejected here.
+    i32[] decoded = decompress(blob, 255, weightLog(), 255);
+    count = decoded.len();
+    for (i32 i = 0; i < count; i++) {
+      weights[i] = decoded[i];
+    }
+    used = 1 + header;
+  }
+
+  HuffTable t = build(weights, count);
+  t.bytesUsed = used;
+  return t;
+}
+
+/**
+ * Turn transmitted weights into a table, recovering the weight that was not transmitted.
+ *
+ * The leftover code space is what identifies the last symbol: every weight `w > 0` claims
+ * `2^(w-1)` of a space of `2^maxBits`, and whatever remains must be a single power of two. If
+ * it is not, the weights are not a Huffman code and nothing sensible can be built from them.
+ */
+HuffTable build(i32[] weights, i32 count) {
+  i32 total = 0;
+  for (i32 i = 0; i < count; i++) {
+    i32 w = weights[i];
+    if (w > maxTableLog()) { trap; }
+    if (w > 0) { total += 1 << (w - 1); }
+  }
+  if (total == 0) { trap; }
+
+  i32 maxBits = highBit(total) + 1;
+  if (maxBits > maxTableLog()) { trap; }
+  // Positive by construction — `maxBits` is one past the highest bit of `total` — but not
+  // necessarily a single power of two, and that is the whole check: leftover space that is not
+  // one power of two means the weights are not a Huffman code.
+  i32 left = (1 << maxBits) - total;
+  if ((left & (left - 1)) != 0) { trap; }
+  weights[count] = highBit(left) + 1;
+  i32 symbols = count + 1;
+
+  // Where each weight class starts. A class's block is as wide as its symbols need together,
+  // and the classes run from weight 1 upwards — longest codes first, which is what makes the
+  // resulting code canonical.
+  i32[] rank = i32[maxTableLog() + 2]();
+  for (i32 i = 0; i < symbols; i++) {
+    rank[weights[i]]++;
+  }
+  i32 next = 0;
+  for (i32 w = 1; w <= maxBits; w++) {
+    i32 here = next;
+    next += rank[w] << (w - 1);
+    rank[w] = here;
+  }
+
+  i32 size = 1 << maxBits;
+  i32[] symbol = i32[size]();
+  i32[] nbBits = i32[size]();
+  for (i32 i = 0; i < symbols; i++) {
+    i32 w = weights[i];
+    if (w == 0) { continue; }                 // does not occur, and takes no space
+    i32 span = 1 << (w - 1);
+    i32 bits = maxBits + 1 - w;
+    i32 base = rank[w];
+    for (i32 u = 0; u < span; u++) {
+      symbol[base + u] = i;
+      nbBits[base + u] = bits;
+    }
+    rank[w] = base + span;
+  }
+
+  return HuffTable(maxBits, symbol, nbBits, 0);
+}
+
+/** One symbol: index by the next `maxBits` bits, then consume only what its code needed. */
+i32 decodeOne(HuffTable t, BackBits b, Buf out) {
+  i32 index = b.peek(t.maxBits);
+  b.consume(t.nbBits[index]);
+  out.push(t.symbol[index]);
+  return t.symbol[index];
+}
+
+/**
+ * Decode `count` literals from one stream.
+ *
+ * The stream is read backwards with the same padding marker FSE uses. Running out of bits
+ * before the count is reached is a malformed stream, not a short read: the count comes from the
+ * literals section header and the encoder wrote exactly that many.
+ */
+void decodeStream(HuffTable t, u8[] src, i32 at, i32 len, i32 count, Buf out) {
+  BackBits b = BackBits.create(src, at, len);
+  for (i32 i = 0; i < count; i++) {
+    if (b.left < 0) { trap; }
+    decodeOne(t, b, out);
+  }
+  if (b.left < 0) { trap; }                   // the last symbol read past the end
+}
+
+/**
+ * Decode four streams that share one table.
+ *
+ * Four exists for speed rather than for compression: the streams are independent, so a decoder
+ * can have four lookups in flight. The first six bytes give the compressed size of the first
+ * three; the fourth gets whatever is left. The *decoded* sizes are not transmitted — each of
+ * the first three holds a quarter of the literals, rounded up, and the fourth holds the rest.
+ */
+void decodeFourStreams(HuffTable t, u8[] src, i32 at, i32 len, i32 count, Buf out) {
+  if (len < 6) { trap; }
+  i32 s1 = src[at] | (src[at + 1] << 8);
+  i32 s2 = src[at + 2] | (src[at + 3] << 8);
+  i32 s3 = src[at + 4] | (src[at + 5] << 8);
+  i32 body = at + 6;
+  i32 total = len - 6;
+  i32 s4 = total - s1 - s2 - s3;
+  // `s4 < 0` is the same statement as the three sizes overrunning the section, so there is
+  // nothing else to check here.
+  if (s1 < 0 || s2 < 0 || s3 < 0 || s4 < 0) { trap; }
+
+  i32 quarter = (count + 3) / 4;
+  i32 last = count - 3 * quarter;
+  if (last < 0) { trap; }                     // fewer literals than the split implies
+
+  decodeStream(t, src, body, s1, quarter, out);
+  decodeStream(t, src, body + s1, s2, quarter, out);
+  decodeStream(t, src, body + s1 + s2, s3, quarter, out);
+  decodeStream(t, src, body + s1 + s2 + s3, s4, last, out);
+}
+
+/** Decode `count` literals from `streams` streams sharing one table. */
+export u8[] decodeLiterals(HuffTable t, u8[] src, i32 at, i32 len, i32 count, i32 streams) {
+  Buf out = Buf.withCapacity(count);
+  if (streams == 4) {
+    decodeFourStreams(t, src, at, len, count, out);
+  } else if (streams == 1) {
+    decodeStream(t, src, at, len, count, out);
+  } else {
+    trap;
+  }
+  return out.take();
+}
