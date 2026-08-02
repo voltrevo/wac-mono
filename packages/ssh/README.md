@@ -1,6 +1,6 @@
 # ssh
 
-An SSH-2 client, in wac, **and an `ssh` program built from it.** Version exchange, the binary packet protocol,
+An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them.** Version exchange, the binary packet protocol,
 algorithm negotiation, curve25519-sha256 key exchange, `ssh-ed25519` host key verification, the
 `chacha20-poly1305@openssh.com` AEAD, `known_hosts`, reading an OpenSSH private key — encrypted or
 not — publickey authentication, and the connection protocol: session channels, flow control and
@@ -13,6 +13,9 @@ not — publickey authentication, and the connection protocol: session channels,
 deno task app packages/ssh/src/ssh.wac --allow-read --allow-net --allow-env -- user@host uname -a
 deno task app:build packages/ssh/src/ssh.wac --allow-read --allow-net --allow-env -o wacssh
 ./wacssh -p 2222 user@host 'seq 1 100000 | wc -l'
+
+deno task app:build packages/ssh/src/sshd.wac --allow-read --allow-net --allow-env -o wacsshd
+./wacsshd -p 2222 -h hostkey -a authorized_keys
 ```
 
 `src/ssh.wac` is the whole program — argument parsing, the key file, known_hosts, the protocol.
@@ -233,9 +236,54 @@ Argument joining matches OpenSSH: everything after the host becomes one command 
 spaces, so `ssh host sh -c 'echo hi'` loses its quotes here exactly as it does there. Verified
 against the real client rather than assumed.
 
+## The server
+
+`src/sshd.wac` listens, authenticates and runs a command. **OpenSSH's own client connects to it
+and cannot tell the difference** — until it asks for a shell.
+
+That reversal is the point of having it. Every other test here runs our code against a real
+server; this one runs a real client against ours, and exercises paths nothing else reaches: the
+server offers lists a client negotiates against, *signs* an exchange hash rather than verifying
+one, answers the key probe, and picks the channel number the client then uses. A second
+implementation by the same author would agree with itself about a misreading; OpenSSH does not.
+
+**It cannot run a shell**, because the capability world has no way to start a process —
+[issue 0015](../../issues/open/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md).
+So it answers `echo`, `cat`, `ls`, `true`, `false` and `help`, implemented in wac over the
+filesystem capabilities, and reports `command not found` with status 127 for everything else. That
+is the honest form of the restriction rather than a shell that mostly does not work. It is also
+the *only* reason it is not an sshd: the transport, key exchange, cipher and channel layer are the
+same code the client uses.
+
+Three server-side details that a client never has to get right:
+
+**A publickey request with no signature is a probe** — the client asking whether a key is worth
+signing with. Answering `SSH_MSG_USERAUTH_FAILURE` is not wrong on its face, since the client is
+indeed not authenticated, but it tells the client the key is refused, so it moves on and reports
+`Permission denied (publickey)` for a key the server would have accepted. `SSH_MSG_USERAUTH_PK_OK`
+is what makes it sign.
+
+**A channel closes when both ends have said so.** Closing the socket after our own
+`CHANNEL_CLOSE` makes the client report a clean session end as `Connection closed by remote host`.
+Sending `SSH_MSG_DISCONNECT` instead is worse: the client treats it as abnormal, throws away
+output it has not read, and exits 255. Both were observed before the third version — waiting for
+the client's close — was right. `DISCONNECT` is for refusals, where there is nothing left to
+deliver.
+
+**`C` is client-to-server**, so the server reads with C and writes with D — the opposite of the
+client. It is the one asymmetry whose consequence is a connection where nothing decrypts at all,
+which at least fails immediately.
+
+`src/authorizedkeys.wac` parses the options field respecting quotes, because `command="echo hello
+world"` contains spaces that do not end it — and a naive scan finds a key type where there is
+none, which reads as "this line is not for you" and lets a *restricted* key through as unknown.
+Options are then refused rather than obeyed: a server that reads a restriction and ignores it is
+worse than one that refuses, because the operator wrote it expecting it to hold.
+
 ## What is missing
 
-A client state machine. Everything above is a set of functions over bytes, driven from the test —
+A client state machine for library use — `src/client.wac` blocks, which suits a program and not a
+caller that wants to drive I/O itself. Everything above is a set of functions over bytes, driven from the test —
 which is the right shape for testing each rule against a real server, and the wrong shape for a
 caller who just wants to run a command. `packages/tls` shows what the answer looks like: one
 `cliFeed(state, input)` returning what to send, with the socket and randomness in the host.

@@ -1,0 +1,502 @@
+// `sshd` — an SSH server, entire, in wac.
+//
+//   deno task app packages/ssh/src/sshd.wac --allow-read --allow-net --allow-env -- -p 2222 -h hostkey
+//
+// Usage:
+//
+//   sshd [-p port] [-h hostkey] [-a authorized_keys] [-1]
+//
+//     -p  port to listen on, default 2222
+//     -h  host private key, default $HOME/.ssh/ssh_host_ed25519_key
+//     -a  authorized keys file, default $HOME/.ssh/authorized_keys
+//     -1  serve one connection and exit
+//
+// ## This is not an sshd
+//
+// **It cannot run a shell, or any other program**, because `packages/platform` has no capability
+// that starts a process — see issue 0015. So it answers a small set of commands implemented here
+// in wac and reports `command not found` for the rest, which is the honest version of the
+// restriction rather than a shell that mostly does not work.
+//
+// That is the *only* reason it is not one. The transport, the key exchange, the cipher and the
+// channel layer are the same code the client uses, and OpenSSH's own client connects to it,
+// authenticates and runs commands without knowing the difference.
+//
+// **One connection at a time**, because the world has no `poll`: `accept` blocks, the connection
+// is served to completion, then the next. Fine for what this is for and not a design to copy.
+//
+// **No rekeying, no pty, no port forwarding, no agent forwarding, no subsystems.** A client
+// asking for any of them gets a refusal rather than silence.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { Cli, Core, FileResult, Socket } from "../../platform/src/platform.wac";
+import { Conn, msgNewKeys } from "./conn.wac";
+import { clientVersion, clientVersionLine, Found, scanVersion, speaksV2, Version } from "./version.wac";
+import { keyLength } from "./cipher.wac";
+import { Proposal, decode, encode, msgKexInit, negotiate } from "./kexinit.wac";
+import { deriveKey } from "./kex.wac";
+import { KeyError, PrivateKey, readEd25519 } from "./privatekey.wac";
+import { Match, lookUp } from "./authorizedkeys.wac";
+import { Incoming, msgChannelClose, msgChannelData, msgChannelEof, msgChannelOpen,
+         msgChannelRequest, msgChannelWindowAdjust, parse } from "./channel.wac";
+import { AuthRequest, authFailure, authSuccess, channelClose, channelData, channelEof,
+         pkOk,
+         channelFailure, channelStderr, channelSuccess, ecdhReply, ephemeralPublic, exchangeHash, execCommand,
+         exitStatus, hostKeyBlob, openConfirmation, openFailure, parseAuthRequest, parseEcdhInit,
+         serverProposal, serviceAccept, sharedSecret, verifyAuth,
+         byApplication, disconnect } from "./server.wac";
+
+i32 defaultPort() { return 2222; }
+i32 windowSize() { return 2 * 1024 * 1024; }
+i32 maxPacketSize() { return 32768; }
+i32 ourChannel() { return 0; }
+
+/**
+ * The server's version line.
+ *
+ * `SSH-2.0-` then anything. Announcing what we are matters more than usual here: a client
+ * connecting to this will not get a shell, and the version string is the first place to say so.
+ */
+u8[] serverVersion() { return "SSH-2.0-wacsshd_0.1".toBytes(); }
+
+u8[] serverVersionLine() {
+  Buf b = Buf.create();
+  b.pushAll(serverVersion());
+  b.push(13);
+  b.push(10);
+  return b.take();
+}
+
+export i32 main(Core core, Cli cli) {
+  Options o = parseArgs(core, cli);
+  if (o.exitCode >= 0) { return o.exitCode; }
+
+  FileResult hostFile = cli.readFile(o.hostKey);
+  if (!hostFile.ok) {
+    core.warn("sshd: " + o.hostKey + ": " + hostFile.error);
+    return 1;
+  }
+  PrivateKey host = readEd25519(hostFile.bytes, u8[0]());
+  match (host.error) {
+    case Ok: {}
+    case BadPassphrase: {
+      core.warn("sshd: " + o.hostKey + ": host keys must not be encrypted");
+      return 1;
+    }
+    else: {
+      core.warn("sshd: " + o.hostKey + ": not an Ed25519 private key");
+      return 1;
+    }
+  }
+
+  Socket listener = cli.listen(o.port);
+  if (listener.handle < 0) {
+    core.warn("sshd: listen: " + listener.error);
+    return 1;
+  }
+  core.warn("sshd: listening on port " + itoa(o.port));
+
+  while (true) {
+    Socket c = cli.accept(listener.handle);
+    if (c.handle < 0) {
+      core.warn("sshd: accept: " + c.error);
+      break;
+    }
+    serve(core, cli, c.handle, host, o);
+    cli.closeSocket(c.handle);
+    if (o.once) { break; }
+  }
+  cli.closeSocket(listener.handle);
+  return 0;
+}
+
+/** One connection, to completion. Errors are logged and end the connection, never the server. */
+void serve(Core core, Cli cli, i32 sock, PrivateKey host, Options o) {
+  Conn conn = Conn.create(core, cli, sock);
+  u8[] sessionId = handshake(conn, host);
+  if (conn.failed()) {
+    core.warn("sshd: " + conn.error);
+    // Only worth sending once the transport works; before that the client cannot read it.
+    if (conn.encrypted) { conn.sendPacket(disconnect(byApplication(), conn.error.toBytes())); }
+    return;
+  }
+
+  if (!authenticate(conn, cli, sessionId, o)) {
+    if (conn.failed()) { core.warn("sshd: " + conn.error); }
+    conn.sendPacket(disconnect(byApplication(), "no supported authentication methods".toBytes()));
+    return;
+  }
+
+  session(conn, cli, core);
+  if (conn.failed()) { core.warn("sshd: " + conn.error); }
+}
+
+/** Version exchange, key exchange and NEWKEYS. Returns the session id, which is H. */
+u8[] handshake(Conn conn, PrivateKey host) {
+  if (!conn.cli.send(conn.sock, serverVersionLine())) {
+    conn.fail("cannot send the version line");
+    return u8[0]();
+  }
+
+  u8[] clientVersionLine = u8[0]();
+  while (true) {
+    Version v = scanVersion(conn.buf.data, 0, conn.buf.len);
+    match (v.status) {
+      case Ok: {
+        clientVersionLine = v.line;
+        conn.buf.dropFront(v.used);
+      }
+      case Incomplete: {
+        if (!conn.fill()) {
+          conn.fail("the connection closed during the version exchange");
+          return u8[0]();
+        }
+        continue;
+      }
+      else: {
+        conn.fail("the client did not send a usable version line");
+        return u8[0]();
+      }
+    }
+    break;
+  }
+  if (!speaksV2(clientVersionLine)) {
+    conn.fail("the client does not speak SSH-2");
+    return u8[0]();
+  }
+
+  u8[] ourKexInit = encode(serverProposal(), conn.core.randomBytes(16));
+  if (!conn.sendPacket(ourKexInit)) { conn.fail("cannot send KEXINIT"); return u8[0](); }
+
+  u8[] theirKexInit = conn.readPacket();
+  if (conn.failed()) { return u8[0](); }
+  if (theirKexInit[0] != msgKexInit()) { conn.fail("expected KEXINIT"); return u8[0](); }
+
+  // The *client's* order decides. A server that picked its own favourite would use an algorithm
+  // the client is not using, and every packet after NEWKEYS would fail its tag.
+  Proposal? theirs = decode(theirKexInit);
+  if (theirs is null) { conn.fail("the client's KEXINIT did not parse"); return u8[0](); }
+  if (negotiate(theirs!.kex, serverProposal().kex).len() == 0) {
+    conn.fail("no key exchange in common");
+    return u8[0]();
+  }
+  if (negotiate(theirs!.hostKey, serverProposal().hostKey).len() == 0) {
+    conn.fail("no host key algorithm in common — this server only has an Ed25519 key");
+    return u8[0]();
+  }
+  if (negotiate(theirs!.cipherToServer, serverProposal().cipherToServer).len() == 0) {
+    conn.fail("no cipher in common");
+    return u8[0]();
+  }
+
+  u8[] initPayload = conn.readPacket();
+  if (conn.failed()) { return u8[0](); }
+  u8[] qc = parseEcdhInit(initPayload);
+  if (qc.len() == 0) { conn.fail("expected the key exchange init"); return u8[0](); }
+
+  u8[] secret = conn.core.randomBytes(32);
+  u8[] qs = ephemeralPublic(secret);
+  u8[]? shared = sharedSecret(secret, qc);
+  if (shared is null) {
+    conn.fail("the client sent a low-order point");
+    return u8[0]();
+  }
+
+  u8[] ks = hostKeyBlob(hostPublicPoint(host));
+  u8[] h = exchangeHash(clientVersionLine, serverVersion(), theirKexInit, ourKexInit,
+                        ks, qc, qs, shared!);
+  if (!conn.sendPacket(ecdhReply(ks, qs, h, host.seed))) {
+    conn.fail("cannot send the key exchange reply");
+    return u8[0]();
+  }
+  if (!conn.sendPacket(u8[](msgNewKeys()))) { conn.fail("cannot send NEWKEYS"); return u8[0](); }
+
+  u8[] theirNewKeys = conn.readPacket();
+  if (conn.failed()) { return u8[0](); }
+  if (theirNewKeys[0] != msgNewKeys()) { conn.fail("expected NEWKEYS"); return u8[0](); }
+
+  // 'C' is client-to-server, so the server reads with C and writes with D — the opposite way
+  // round from the client, and the one asymmetry that produces a connection where nothing
+  // decrypts at all.
+  conn.startEncryption(deriveKey(shared!, h, h, 0x43, keyLength()),
+                       deriveKey(shared!, h, h, 0x44, keyLength()));
+  return h;
+}
+
+/** The 32-byte point out of a host key's public blob. */
+u8[] hostPublicPoint(PrivateKey host) {
+  // The blob is `string "ssh-ed25519"` then `string` the point: 4 + 11 + 4 + 32 bytes.
+  if (host.publicBlob.len() < 51) { trap; }
+  u8[] point = u8[32]();
+  point.copyFrom(host.publicBlob, host.publicBlob.len() - 32, 0, 32);
+  return point;
+}
+
+/** Service request and publickey authentication. False when the client did not get in. */
+bool authenticate(Conn conn, Cli cli, u8[] sessionId, Options o) {
+  u8[] request = conn.readPacket();
+  if (conn.failed()) { return false; }
+  if (request[0] != 5) { conn.fail("expected a service request"); return false; }
+  if (!conn.sendPacket(serviceAccept("ssh-userauth".toBytes()))) {
+    conn.fail("cannot accept the service");
+    return false;
+  }
+
+  FileResult keys = cli.readFile(o.authorizedKeys);
+  u8[] allowed = keys.ok ? keys.bytes : u8[0]();
+
+  // A client may try several keys, and the first attempt is usually a probe with no signature.
+  for (i32 attempt = 0; attempt < 16; attempt++) {
+    u8[] payload = conn.readPacket();
+    if (conn.failed()) { return false; }
+    AuthRequest a = parseAuthRequest(payload);
+    if (!a.ok) { conn.fail("the authentication request did not parse"); return false; }
+
+    bool named = false;
+    match (lookUp(allowed, "ssh-ed25519".toBytes(), a.publicBlob)) {
+      case Ok: { named = true; }
+      else: {}
+    }
+    // The signature is checked against bytes we rebuild, never against the client's account of
+    // what it signed, and only after the key is one we would accept at all.
+    if (named && !a.hasSignature) {
+      // A probe. Saying yes is what makes the client sign; saying no makes it give up on a key
+      // this server would have accepted.
+      if (!conn.sendPacket(pkOk(a.keyType, a.publicBlob))) {
+        conn.fail("cannot answer the key probe");
+        return false;
+      }
+      continue;
+    }
+    if (named && a.hasSignature && verifyAuth(a, sessionId)) {
+      if (!conn.sendPacket(authSuccess())) { conn.fail("cannot confirm authentication"); }
+      return !conn.failed();
+    }
+    if (!conn.sendPacket(authFailure())) { conn.fail("cannot refuse authentication"); return false; }
+  }
+  conn.fail("too many authentication attempts");
+  return false;
+}
+
+/** One session channel, one command. */
+void session(Conn conn, Cli cli, Core core) {
+  u8[] payload = conn.readPacket();
+  if (conn.failed()) { return; }
+  Incoming m = parse(payload);
+  if (!m.ok || m.kind != msgChannelOpen()) {
+    conn.fail("expected a channel open");
+    return;
+  }
+  // The client's number is in the open; ours is whatever we say. They need not agree, and the
+  // confirmation is the one message carrying both.
+  i32 clientChannel = readOpenChannel(payload);
+  if (clientChannel < 0) {
+    conn.sendPacket(openFailure(0, 3, "only session channels".toBytes()));
+    return;
+  }
+  if (!conn.sendPacket(openConfirmation(clientChannel, ourChannel(), windowSize(), maxPacketSize()))) {
+    conn.fail("cannot confirm the channel");
+    return;
+  }
+
+  // Requests until one is `exec`. A client may send `env` or ask for a pty first; both get a
+  // refusal rather than silence, because `want_reply` means it is waiting.
+  u8[] command = u8[0]();
+  for (i32 i = 0; i < 16 && command.len() == 0; i++) {
+    u8[] p = conn.readPacket();
+    if (conn.failed()) { return; }
+    Incoming r = parse(p);
+    if (!r.ok) { conn.fail("a channel message did not parse"); return; }
+    if (r.kind == msgChannelClose() || r.kind == msgChannelEof()) { return; }
+    if (r.kind != msgChannelRequest()) { continue; }
+    command = execCommand(p);
+    if (command.len() == 0) {
+      // Not exec — a pty, an environment variable, a shell. None of them are things this can do.
+      conn.sendPacket(channelFailure(clientChannel));
+    }
+  }
+  if (command.len() == 0) {
+    conn.fail("the client never asked to run anything");
+    return;
+  }
+  if (!conn.sendPacket(channelSuccess(clientChannel))) { conn.fail("cannot accept the command"); return; }
+
+  Result result = run(cli, core, command);
+  if (result.out.len() > 0) { conn.sendPacket(channelData(clientChannel, result.out)); }
+  if (result.err.len() > 0) { conn.sendPacket(channelStderr(clientChannel, result.err)); }
+  conn.sendPacket(exitStatus(clientChannel, result.status));
+  conn.sendPacket(channelEof(clientChannel));
+  conn.sendPacket(channelClose(clientChannel));
+
+  // Wait for the client's own CHANNEL_CLOSE before letting the socket go.
+  //
+  // Not politeness: closing first makes the client report the clean end of a session as
+  // "Connection closed by remote host". Sending SSH_MSG_DISCONNECT instead is worse — the client
+  // treats it as an abnormal end, discards the output it has not read and exits 255. A channel
+  // closes when *both* ends have said so, and only then is there nothing left to deliver.
+  for (i32 i = 0; i < 8; i++) {
+    u8[] p = conn.readPacket();
+    if (conn.failed()) {
+      // The client hanging up first is the ordinary case, not a failure to report.
+      conn.error = "";
+      return;
+    }
+    Incoming r = parse(p);
+    if (r.ok && r.kind == msgChannelClose()) { return; }
+  }
+}
+
+/** The client's channel number out of a CHANNEL_OPEN for a session, or -1. */
+i32 readOpenChannel(u8[] payload) {
+  Incoming m = parse(payload);
+  if (!m.ok || m.kind != msgChannelOpen()) { return -1; }
+  // `parse` puts the *type* string first for an open, so the channel number needs reading past
+  // it — the one message where the recipient field is not immediately after the message number.
+  i32 typeLen = (payload[1] << 24) | (payload[2] << 16) | (payload[3] << 8) | payload[4];
+  if (typeLen < 0 || 5 + typeLen + 4 > payload.len()) { return -1; }
+  if (typeLen != 7) { return -1; }                       // "session" and nothing else
+  const u8[] SESSION = u8[](0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e);
+  for (i32 i = 0; i < 7; i++) {
+    if (payload[5 + i] != SESSION[i]) { return -1; }
+  }
+  i32 at = 5 + typeLen;
+  return (payload[at] << 24) | (payload[at + 1] << 16) | (payload[at + 2] << 8) | payload[at + 3];
+}
+
+struct Result {
+  u8[] out;
+  u8[] err;
+  i32 status;
+}
+
+/**
+ * The command set.
+ *
+ * Small and honest: there is no process capability, so this is what a command can be. Anything
+ * else answers the way a shell does when it cannot find a program — 127 and a message — rather
+ * than pretending the command ran and produced nothing.
+ */
+Result run(Cli cli, Core core, u8[] command) {
+  string line = string.fromBytes(command);
+  string name = firstWord(line);
+  string rest = line.slice(name.len(), line.len());
+  while (rest.len() > 0 && rest.slice(0, 1) == " ") { rest = rest.slice(1, rest.len()); }
+
+  if (name == "echo") {
+    return Result((rest + "\n").toBytes(), u8[0](), 0);
+  }
+  if (name == "cat") {
+    if (rest == "") { return Result(u8[0](), "cat: no file\n".toBytes(), 2); }
+    FileResult f = cli.readFile(rest);
+    if (!f.ok) { return Result(u8[0](), ("cat: " + rest + ": " + f.error + "\n").toBytes(), 1); }
+    return Result(f.bytes, u8[0](), 0);
+  }
+  if (name == "ls") {
+    string dir = rest == "" ? "." : rest;
+    string[]? names = cli.readDir(dir);
+    if (names is null) { return Result(u8[0](), ("ls: " + dir + ": not a directory\n").toBytes(), 1); }
+    Buf out = Buf.create();
+    for (i32 i = 0; i < names!.len(); i++) {
+      out.pushAll(names![i].toBytes());
+      out.push(10);
+    }
+    return Result(out.take(), u8[0](), 0);
+  }
+  if (name == "true") { return Result(u8[0](), u8[0](), 0); }
+  if (name == "false") { return Result(u8[0](), u8[0](), 1); }
+  if (name == "help") {
+    return Result(("echo cat ls true false help\n"
+                   + "no shell: this server has no capability to start a process\n").toBytes(),
+                  u8[0](), 0);
+  }
+  return Result(u8[0](), (name + ": command not found — try `help`\n").toBytes(), 127);
+}
+
+string firstWord(string s) {
+  for (i32 i = 0; i < s.len(); i++) {
+    if (s.slice(i, i + 1) == " ") { return s.slice(0, i); }
+  }
+  return s;
+}
+
+struct Options {
+  i32 port;
+  string hostKey;
+  string authorizedKeys;
+  bool once;
+  i32 exitCode;
+}
+
+Options parseArgs(Core core, Cli cli) {
+  string? home = cli.env("HOME");
+  string homeDir = (home is null) ? "" : home!;
+
+  i32 port = defaultPort();
+  string hostKey = "";
+  string authorizedKeys = "";
+  bool once = false;
+
+  i32 i = 0;
+  i32 n = cli.argCount();
+  while (i < n) {
+    string a = cli.arg(i);
+    if (a == "-p" && i + 1 < n) {
+      i++;
+      port = atoi(cli.arg(i));
+      if (port <= 0 || port > 65535) {
+        core.warn("sshd: bad port: " + cli.arg(i));
+        return Options(0, "", "", false, 2);
+      }
+    } else if (a == "-h" && i + 1 < n) {
+      i++;
+      hostKey = cli.arg(i);
+    } else if (a == "-a" && i + 1 < n) {
+      i++;
+      authorizedKeys = cli.arg(i);
+    } else if (a == "-1") {
+      once = true;
+    } else {
+      core.warn("usage: sshd [-p port] [-h hostkey] [-a authorized_keys] [-1]");
+      return Options(0, "", "", false, 2);
+    }
+    i++;
+  }
+
+  if (hostKey == "") {
+    if (homeDir == "") {
+      core.warn("sshd: HOME is unset, so there is no default host key — use -h");
+      return Options(0, "", "", false, 2);
+    }
+    hostKey = homeDir + "/.ssh/ssh_host_ed25519_key";
+  }
+  if (authorizedKeys == "") {
+    if (homeDir == "") {
+      core.warn("sshd: HOME is unset, so there is no default authorized_keys — use -a");
+      return Options(0, "", "", false, 2);
+    }
+    authorizedKeys = homeDir + "/.ssh/authorized_keys";
+  }
+  return Options(port, hostKey, authorizedKeys, once, -1);
+}
+
+i32 atoi(string s) {
+  i32 v = 0;
+  for (i32 i = 0; i < s.len(); i++) {
+    string ch = s[i];
+    if (ch < "0" || ch > "9") { return -1; }
+    v = v * 10 + (ch.toBytes()[0] - 0x30);
+    if (v > 65535) { return -1; }
+  }
+  return s.len() == 0 ? -1 : v;
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  string out = "";
+  i32 x = v;
+  while (x > 0) {
+    out = string.fromCodepoint(0x30 + (x % 10)) + out;
+    x = x / 10;
+  }
+  return out;
+}

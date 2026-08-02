@@ -624,4 +624,170 @@ for (
   mChan.sshIncomingData(p);
 }
 
+// ── The server half ───────────────────────────────────────────────────────────
+
+const mSrv = run.mod as unknown as {
+  sshAuthorized(file: Uint8Array, keyType: Uint8Array, keyBlob: Uint8Array): number;
+  sshServerProposalField(which: number): Uint8Array;
+  sshHostKeyBlob(publicKey: Uint8Array): Uint8Array;
+  sshParseEcdhInit(payload: Uint8Array): Uint8Array;
+  sshEcdhReply(hostKey: Uint8Array, qs: Uint8Array, h: Uint8Array, seed: Uint8Array): Uint8Array;
+  sshServerExchangeHash(vc: Uint8Array, vs: Uint8Array, ic: Uint8Array, isrv: Uint8Array,
+                        ks: Uint8Array, qc: Uint8Array, qs: Uint8Array, k: Uint8Array): Uint8Array;
+  sshAuthRequestField(payload: Uint8Array, which: number): number;
+  sshAuthRequestUser(payload: Uint8Array): Uint8Array;
+  sshAuthRequestMethod(payload: Uint8Array): Uint8Array;
+  sshVerifyAuth(payload: Uint8Array, sessionId: Uint8Array): boolean;
+  sshAuthFailure(): Uint8Array;
+  sshAuthSuccess(): Uint8Array;
+  sshPkOk(keyType: Uint8Array, blob: Uint8Array): Uint8Array;
+  sshServiceAccept(name: Uint8Array): Uint8Array;
+  sshDisconnect(why: Uint8Array): Uint8Array;
+  sshOpenConfirmation(client: number, ours: number, window: number, maxPacket: number): Uint8Array;
+  sshOpenFailure(client: number, reason: number, why: Uint8Array): Uint8Array;
+  sshChannelSuccessMsg(channel: number): Uint8Array;
+  sshServerData(channel: number, data: Uint8Array): Uint8Array;
+  sshServerStderr(channel: number, data: Uint8Array): Uint8Array;
+  sshExitStatus(channel: number, status: number): Uint8Array;
+  sshExecCommand(payload: Uint8Array): Uint8Array;
+  sshEphemeralPublicForSeed(seed: Uint8Array): Uint8Array;
+};
+
+const akBlob = Uint8Array.from({ length: 51 }, (_, i) => (i * 3) & 255);
+const akOther = Uint8Array.from({ length: 51 }, (_, i) => (i * 5) & 255);
+const akB64 = btoa(String.fromCharCode(...akBlob));
+const akType = bytes("ssh-ed25519");
+
+for (
+  const file of [
+    "",
+    "# comment only\n",
+    "\n\n",
+    "   \n",
+    `ssh-ed25519 ${akB64}\n`,
+    `ssh-ed25519 ${akB64}\r\n`,
+    `ssh-ed25519 ${akB64} me@here\n`,
+    `\tssh-ed25519 ${akB64}\n`,                                  // leading tab
+    `ssh-rsa ${akB64}\n`,                                        // another algorithm
+    `ssh-ed2551a ${akB64}\n`,                                    // same length, different
+    `no-pty ssh-ed25519 ${akB64}\n`,                             // an option
+    `restrict,pty ssh-ed25519 ${akB64}\n`,
+    `command="echo hello world" ssh-ed25519 ${akB64}\n`,          // spaces inside quotes
+    `command="a,b c",no-pty ssh-ed25519 ${akB64}\n`,              // a comma inside quotes
+    `command="say \\"hi\\" now" ssh-ed25519 ${akB64}\n`,          // an escaped quote
+    `command="unterminated ssh-ed25519 ${akB64}\n`,               // a quote that never closes
+    `no-pty ssh-rsa ${akB64}\n`,                                 // options then another algorithm
+    `no-pty\n`,                                                  // options and nothing else
+    `ssh-ed25519\n`,                                             // no blob
+    `ssh-ed25519 !!!\n`,                                         // unreadable base64
+    `no-pty ssh-ed25519 ${akB64}\nssh-ed25519 ${akB64}\n`,        // restricted then plain
+  ]
+) {
+  for (const key of [akBlob, akOther]) mSrv.sshAuthorized(bytes(file), akType, key);
+  mSrv.sshAuthorized(bytes(file), bytes("ssh-rsa"), akBlob);
+}
+
+// A line whose key decodes to a *different length*. Every blob above is 51 bytes, so the length
+// check in the comparison never fired — the same shape as the same-length name gaps, inverted.
+mSrv.sshAuthorized(bytes(`ssh-ed25519 ${btoa("short")}\n`), akType, akBlob);
+
+for (let which = 0; which < 4; which++) mSrv.sshServerProposalField(which);
+
+const srvSeed = Uint8Array.from({ length: 32 }, (_, i) => (i * 9 + 1) & 255);
+const srvPoint = mSrv.sshEphemeralPublicForSeed(srvSeed);
+const srvKs = mSrv.sshHostKeyBlob(srvPoint);
+ignoringTraps(() => mSrv.sshHostKeyBlob(new Uint8Array(31)));
+
+const srvQ = mKex.sshEphemeralPublic(Uint8Array.from({ length: 32 }, (_, i) => i + 2));
+mSrv.sshParseEcdhInit(join(new Uint8Array([30]), str(srvQ)));
+mSrv.sshParseEcdhInit(join(new Uint8Array([31]), str(srvQ)));               // wrong message
+mSrv.sshParseEcdhInit(new Uint8Array([30]));                               // truncated
+mSrv.sshParseEcdhInit(join(new Uint8Array([30]), str(new Uint8Array(31)))); // wrong length
+
+const srvH = mSrv.sshServerExchangeHash(bytes("SSH-2.0-a"), bytes("SSH-2.0-b"),
+  new Uint8Array([20]), new Uint8Array([20]), srvKs, srvQ, srvQ, srvSeed);
+mSrv.sshEcdhReply(srvKs, srvQ, srvH, srvSeed);
+ignoringTraps(() => mSrv.sshEcdhReply(srvKs, srvQ, srvH, new Uint8Array(31)));
+
+const srvSession = Uint8Array.from({ length: 32 }, (_, i) => (i * 13) & 255);
+const srvUser = bytes("claude");
+const genuine = mAuth.sshPublicKeyRequest(srvSession, srvUser, srvKs, srvSeed);
+for (let which = 0; which < 4; which++) mSrv.sshAuthRequestField(genuine, which);
+mSrv.sshAuthRequestUser(genuine);
+mSrv.sshAuthRequestMethod(genuine);
+mSrv.sshVerifyAuth(genuine, srvSession);
+mSrv.sshVerifyAuth(genuine, new Uint8Array(32));                            // wrong session
+
+for (
+  const bad of [
+    new Uint8Array(0),
+    new Uint8Array([49]),                                                   // not a userauth request
+    new Uint8Array([50]),                                                   // truncated
+    join(new Uint8Array([50]), str(srvUser), str(bytes("ssh-connection")), str(bytes("password")),
+         new Uint8Array([0]), str(bytes("hunter2"))),                       // another method
+    join(new Uint8Array([50]), str(srvUser), str(bytes("ssh-connection")), str(bytes("publickey")),
+         new Uint8Array([0]), str(bytes("ssh-ed25519")), str(srvKs)),       // a probe
+    join(new Uint8Array([50]), str(srvUser), str(bytes("ssh-connection")), str(bytes("publickey")),
+         new Uint8Array([1]), str(bytes("ssh-rsa")), str(srvKs), str(new Uint8Array(64))),
+    join(new Uint8Array([50]), str(srvUser), str(bytes("ssh-connection")), str(bytes("publickey")),
+         new Uint8Array([1]), str(bytes("ssh-ed25519")), str(new Uint8Array(4)), str(new Uint8Array(64))),
+    join(new Uint8Array([50]), str(srvUser), str(bytes("ssh-connection")), str(bytes("publickey")),
+         new Uint8Array([1]), str(bytes("ssh-ed25519")), str(srvKs),
+         join(str(bytes("ssh-rsa")), str(new Uint8Array(64)))),             // signature names ssh-rsa
+    join(new Uint8Array([50]), str(srvUser), str(bytes("ssh-connection")), str(bytes("publickey")),
+         new Uint8Array([1]), str(bytes("ssh-ed25519")), str(srvKs),
+         join(str(bytes("ssh-ed25519")), str(new Uint8Array(63)))),         // 63-byte signature
+    join(new Uint8Array([50]), str(srvUser), str(bytes("ssh-connection")), str(bytes("publickey")),
+         new Uint8Array([1]), str(bytes("ssh-ed25519")), str(srvKs)),       // signature missing
+  ]
+) {
+  for (let which = 0; which < 4; which++) mSrv.sshAuthRequestField(bad, which);
+  mSrv.sshAuthRequestUser(bad);
+  mSrv.sshVerifyAuth(bad, srvSession);
+}
+
+// The server's own curve operations, which are separate functions from the client's.
+const mSrv2 = run.mod as unknown as {
+  sshServerEphemeral(secret: Uint8Array): Uint8Array;
+  sshServerShared(secret: Uint8Array, peer: Uint8Array): Uint8Array;
+  sshServerChannelFailure(channel: number): Uint8Array;
+  sshServerChannelEof(channel: number): Uint8Array;
+  sshServerChannelClose(channel: number): Uint8Array;
+};
+const srvSecret = Uint8Array.from({ length: 32 }, (_, i) => i + 3);
+const srvPub = mSrv2.sshServerEphemeral(srvSecret);
+mSrv2.sshServerShared(srvSecret, srvPub);
+mSrv2.sshServerShared(srvSecret, new Uint8Array(32));       // all-zero point
+mSrv2.sshServerShared(new Uint8Array(31), srvPub);          // wrong secret length
+mSrv2.sshServerShared(srvSecret, new Uint8Array(31));       // wrong peer length
+ignoringTraps(() => mSrv2.sshServerEphemeral(new Uint8Array(31)));
+mSrv2.sshServerChannelFailure(7);
+mSrv2.sshServerChannelEof(7);
+mSrv2.sshServerChannelClose(7);
+
+// Names the same length as the ones compared, so the byte loops take their mismatch branch —
+// the fourth time this gap has appeared in this package, hence checking for it up front.
+mSrv.sshAuthorized(bytes(`ssh-ed2551a ${akB64}\n`), akType, akBlob);
+mSrv.sshExecCommand(join(new Uint8Array([98]), cu32(0), cstr(bytes("exe0")), new Uint8Array([1]),
+                         cstr(bytes("x"))));
+
+mSrv.sshAuthFailure();
+mSrv.sshAuthSuccess();
+mSrv.sshPkOk(akType, srvKs);
+mSrv.sshServiceAccept(bytes("ssh-userauth"));
+mSrv.sshDisconnect(bytes("done"));
+mSrv.sshOpenConfirmation(11, 22, 4096, 1024);
+mSrv.sshOpenFailure(11, 3, bytes("only session channels"));
+mSrv.sshChannelSuccessMsg(7);
+mSrv.sshServerData(7, bytes("out"));
+mSrv.sshServerStderr(7, bytes("err"));
+mSrv.sshExitStatus(7, 42);
+
+mSrv.sshExecCommand(join(new Uint8Array([98]), cu32(0), cstr(bytes("exec")), new Uint8Array([1]),
+                         cstr(bytes("uname -a"))));
+mSrv.sshExecCommand(join(new Uint8Array([98]), cu32(0), cstr(bytes("pty-req")), new Uint8Array([1])));
+mSrv.sshExecCommand(join(new Uint8Array([98]), cu32(0), cstr(bytes("exec")), new Uint8Array([1])));
+mSrv.sshExecCommand(new Uint8Array([94]));
+mSrv.sshExecCommand(new Uint8Array([98]));
+
 report([run], "packages/ssh/", { verbose });

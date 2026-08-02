@@ -1,0 +1,154 @@
+// The transport plumbing, shared by both ends of a connection.
+//
+// Buffering, framing, sealing and the two sequence numbers are identical for a client and a
+// server — only the handshake differs, and that lives in `client.wac` and `sshd.wac`. This is here
+// so those two do not each carry a copy of the same read loop, which is the sort of duplication
+// that stays in step right up until it does not.
+//
+// It blocks, because `packages/platform`'s sockets are synchronous: `recv` parks the wac thread
+// while the host reads on another. That is the whole reason both ends read as straight lines
+// rather than state machines — `packages/tls` had to be a `feed(state, input)` pump precisely
+// because it predates that capability.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { Cli, Core } from "../../platform/src/platform.wac";
+import { Framed, Status, frame, maxPacket, minBlock, paddingFor, unframe } from "./packet.wac";
+import { Opened, Plain, aeadPaddingFor, open, seal } from "./cipher.wac";
+
+/** Transport messages a peer may send at any point and neither end should mistake for a reply. */
+export i32 msgDisconnect() { return 1; }
+export i32 msgIgnore() { return 2; }
+export i32 msgUnimplemented() { return 3; }
+export i32 msgDebug() { return 4; }
+export i32 msgExtInfo() { return 7; }
+export i32 msgNewKeys() { return 21; }
+
+export struct Conn {
+  Core core;
+  Cli cli;
+  i32 sock;
+
+  /** Received and not yet consumed. */
+  Buf buf;
+
+  u8[] keyIn;
+  u8[] keyOut;
+  i32 seqIn;
+  i32 seqOut;
+  bool encrypted;
+
+  /** Empty while nothing has gone wrong. */
+  string error;
+
+  Conn create(Core core, Cli cli, i32 sock) {
+    return Conn(core, cli, sock, Buf.create(), u8[0](), u8[0](), 0, 0, false, "");
+  }
+
+  bool failed(const this) { return this.error != ""; }
+
+  void fail(this, string why) {
+    if (this.error == "") { this.error = why; }
+  }
+
+  /** One `recv`, appended. False at end of stream. */
+  bool fill(this) {
+    u8[] chunk = this.cli.recv(this.sock);
+    if (chunk.len() == 0) { return false; }
+    this.buf.pushAll(chunk);
+    return true;
+  }
+
+  /** Send one payload, framed or sealed according to where the handshake has got to. */
+  bool sendPacket(this, u8[] payload) {
+    i32 block = minBlock();
+    if (this.encrypted) {
+      u8[] pad = this.core.randomBytes(aeadPaddingFor(payload.len(), block));
+      u8[] packet = seal(this.keyOut, this.seqOut, payload, pad, block);
+      this.seqOut++;
+      return this.cli.send(this.sock, packet);
+    }
+    u8[] pad = this.core.randomBytes(paddingFor(payload.len(), block));
+    u8[] packet = frame(payload, pad, block);
+    this.seqOut++;
+    return this.cli.send(this.sock, packet);
+  }
+
+  /**
+   * Block until one whole packet has arrived, and hand back its payload.
+   *
+   * Empty means failure, with `error` saying which. Transport housekeeping — IGNORE, DEBUG and
+   * EXT_INFO — is swallowed here rather than left for every caller to remember: a peer may send
+   * them at any point, and code that treats one as the message it was waiting for goes wrong far
+   * from the cause.
+   */
+  u8[] readPacket(this) {
+    while (true) {
+      if (this.failed()) { return u8[0](); }
+      u8[] payload = this.tryOnePacket();
+      if (this.failed()) { return u8[0](); }
+      if (payload.len() > 0) {
+        i32 kind = payload[0];
+        if (kind == msgIgnore() || kind == msgDebug() || kind == msgExtInfo()) { continue; }
+        if (kind == msgDisconnect()) {
+          this.fail("the peer disconnected");
+          return u8[0]();
+        }
+        return payload;
+      }
+      if (!this.fill()) {
+        this.fail("the connection closed while waiting for a packet");
+        return u8[0]();
+      }
+    }
+    trap;                     // unreachable: the loop only exits by returning
+  }
+
+  /** One packet if the buffer holds one, empty if it does not yet. */
+  u8[] tryOnePacket(this) {
+    if (this.encrypted) {
+      Plain p = open(this.keyIn, this.seqIn, this.buf.data, 0, this.buf.len, maxPacket());
+      match (p.status) {
+        case Ok: {
+          this.buf.dropFront(p.used);
+          this.seqIn++;
+          // A zero-length payload is a legal packet and not "nothing yet", so it is reported as a
+          // one-byte NOOP rather than as an empty buffer the caller would wait on forever.
+          return p.payload.len() == 0 ? u8[](msgIgnore()) : p.payload;
+        }
+        case Incomplete: { return u8[0](); }
+        else: {
+          this.fail("a packet failed its authentication tag");
+          return u8[0]();
+        }
+      }
+    }
+    Framed f = unframe(this.buf.data, 0, this.buf.len);
+    match (f.status) {
+      case Ok: {
+        this.buf.dropFront(f.used);
+        this.seqIn++;
+        return f.payload.len() == 0 ? u8[](msgIgnore()) : f.payload;
+      }
+      case Incomplete: { return u8[0](); }
+      else: {
+        this.fail("the peer sent something that is not a packet");
+        return u8[0]();
+      }
+    }
+  }
+
+  /**
+   * Switch to the negotiated keys.
+   *
+   * Both counters restart, which is strict KEX. We only advertise it alongside peers that support
+   * it, and a peer without it fails its first MAC here rather than continuing silently — which is
+   * the failure worth having.
+   */
+  void startEncryption(this, u8[] keyIn, u8[] keyOut) {
+    this.keyIn = keyIn;
+    this.keyOut = keyOut;
+    this.encrypted = true;
+    this.seqIn = 0;
+    this.seqOut = 0;
+  }
+}

@@ -144,6 +144,7 @@ export u8[] sshKexInitFirst(u8[] cookie, bool first) {
 
 // ── Key exchange ──────────────────────────────────────────────────────────────
 
+import { ed25519PublicKey } from "../../../crypto/src/ed25519.wac";
 import { EcdhReply, deriveKey, ecdhInit, ephemeralPublic, exchangeHash, msgKexEcdhReply,
          parseEcdhReply, sharedSecret, verifyEd25519Host } from "../../src/kex.wac";
 
@@ -305,3 +306,83 @@ export u8[] sshIncomingData(u8[] payload) { return parse(payload).data; }
 export Window sshWindowCreate(i32 initial) { return Window.create(initial); }
 export i32 sshWindowConsume(Window w, i32 n) { return w.consume(n); }
 export i32 sshWindowLeft(Window w) { return w.left; }
+
+// ── The server half ───────────────────────────────────────────────────────────
+
+import { Match, lookUp as authLookUp } from "../../src/authorizedkeys.wac";
+import { AuthRequest, authFailure, authSuccess, byApplication, channelClose as srvClose,
+         channelData as srvData, channelEof as srvEof, channelFailure as srvChanFailure,
+         channelStderr, channelSuccess, disconnect, ecdhReply, exchangeHash as srvHash,
+         ephemeralPublic as srvEphemeral, sharedSecret as srvShared,
+         execCommand, exitStatus, hostKeyBlob, openConfirmation, openFailure, parseAuthRequest,
+         parseEcdhInit, pkOk, serverProposal, serviceAccept, verifyAuth } from "../../src/server.wac";
+
+/** 0 unknown, 1 ok, 2 restricted. */
+export i32 sshAuthorized(u8[] file, u8[] keyType, u8[] keyBlob) {
+  match (authLookUp(file, keyType, keyBlob)) {
+    case Unknown: return 0;
+    case Ok: return 1;
+    else: return 2;
+  }
+}
+
+export u8[] sshServerProposalField(i32 which) {
+  Proposal p = serverProposal();
+  if (which == 0) { return p.kex; }
+  if (which == 1) { return p.hostKey; }
+  if (which == 2) { return p.cipherToServer; }
+  return p.cipherToClient;
+}
+
+export u8[] sshHostKeyBlob(u8[] publicKey) { return hostKeyBlob(publicKey); }
+export u8[] sshParseEcdhInit(u8[] payload) { return parseEcdhInit(payload); }
+export u8[] sshEcdhReply(u8[] hostKey, u8[] qs, u8[] h, u8[] seed) {
+  return ecdhReply(hostKey, qs, h, seed);
+}
+export u8[] sshServerExchangeHash(u8[] vc, u8[] vs, u8[] ic, u8[] isrv, u8[] ks,
+                                  u8[] qc, u8[] qs, u8[] k) {
+  return srvHash(vc, vs, ic, isrv, ks, qc, qs, k);
+}
+
+/** 0 ok, 1 hasSignature, 2 user len, 3 method len. */
+export i32 sshAuthRequestField(u8[] payload, i32 which) {
+  AuthRequest a = parseAuthRequest(payload);
+  if (which == 0) { return a.ok ? 1 : 0; }
+  if (which == 1) { return a.hasSignature ? 1 : 0; }
+  if (which == 2) { return a.user.len(); }
+  return a.method.len();
+}
+export u8[] sshAuthRequestUser(u8[] payload) { return parseAuthRequest(payload).user; }
+export u8[] sshAuthRequestMethod(u8[] payload) { return parseAuthRequest(payload).method; }
+export bool sshVerifyAuth(u8[] payload, u8[] sessionId) {
+  return verifyAuth(parseAuthRequest(payload), sessionId);
+}
+
+export u8[] sshAuthFailure() { return authFailure(); }
+export u8[] sshAuthSuccess() { return authSuccess(); }
+export u8[] sshPkOk(u8[] keyType, u8[] blob) { return pkOk(keyType, blob); }
+export u8[] sshServiceAccept(u8[] name) { return serviceAccept(name); }
+export u8[] sshDisconnect(u8[] why) { return disconnect(byApplication(), why); }
+export u8[] sshOpenConfirmation(i32 client, i32 ours, i32 window, i32 maxPacket) {
+  return openConfirmation(client, ours, window, maxPacket);
+}
+export u8[] sshOpenFailure(i32 client, i32 reason, u8[] why) {
+  return openFailure(client, reason, why);
+}
+export u8[] sshChannelSuccessMsg(i32 channel) { return channelSuccess(channel); }
+export u8[] sshServerData(i32 channel, u8[] data) { return srvData(channel, data); }
+export u8[] sshServerStderr(i32 channel, u8[] data) { return channelStderr(channel, data); }
+export u8[] sshExitStatus(i32 channel, i32 status) { return exitStatus(channel, status); }
+export u8[] sshExecCommand(u8[] payload) { return execCommand(payload); }
+
+/** The public point for a seed, so a test can build a key pair without leaving wac. */
+export u8[] sshEphemeralPublicForSeed(u8[] seed) { return ed25519PublicKey(seed); }
+
+export u8[] sshServerEphemeral(u8[] secret) { return srvEphemeral(secret); }
+export u8[] sshServerShared(u8[] secret, u8[] peer) {
+  u8[]? k = srvShared(secret, peer);
+  return (k is null) ? u8[0]() : k!;
+}
+export u8[] sshServerChannelFailure(i32 channel) { return srvChanFailure(channel); }
+export u8[] sshServerChannelEof(i32 channel) { return srvEof(channel); }
+export u8[] sshServerChannelClose(i32 channel) { return srvClose(channel); }
