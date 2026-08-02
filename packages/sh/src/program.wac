@@ -1,0 +1,375 @@
+// External programs — or rather, what stands in for them.
+//
+// `packages/platform` cannot start a process (issue 0015), so this shell cannot run `/bin/ls`.
+// Rather than pretend otherwise, external commands go through **one function**, `run`, backed
+// today by a table of programs implemented here in wac.
+//
+// That single function is the point of this file. When the capability lands, `run` gains a branch
+// that calls it and everything above — pipelines, redirections, exit statuses, `&&` — is already
+// written against the same shape and does not change. The stubs then become what they should have
+// been all along: a fallback for when the real program is absent.
+//
+// **The signature is the design decision.** Bytes in, bytes out, a status, and `found` to
+// distinguish "ran and failed" from "no such command" — because a shell must report 127 for one
+// and the program's own code for the other, and a single integer cannot say both.
+//
+// Capturing rather than streaming is the honest limitation of doing it this way: a stage runs to
+// completion before the next begins, so `yes | head -1` does not terminate here where it does in
+// bash. Real processes will not fix that on their own — it needs the shell to run stages
+// concurrently, which needs more than one thread. Noted in the README rather than hidden.
+
+import { Vec } from "../../std/src/vec.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+import { Cli, FileResult } from "../../platform/src/platform.wac";
+
+export struct Output {
+  u8[] out;
+  u8[] err;
+  i32 status;
+  /** False when no program of that name exists, which the shell reports as 127. */
+  bool found;
+
+  Output ok(u8[] out) { return Output(out, u8[0](), 0, true); }
+  Output fail(u8[] err, i32 status) { return Output(u8[0](), err, status, true); }
+  Output missing() { return Output(u8[0](), u8[0](), 127, false); }
+}
+
+/**
+ * Run an external program.
+ *
+ * The one place that knows external commands are not real processes. Everything above it is
+ * written as though they were.
+ */
+export Output run(Cli cli, Vec<string> argv, u8[] stdin) {
+  if (argv.len() == 0) { return Output.missing(); }
+  string name = argv.get(0);
+
+  if (name == "cat") { return cat(cli, argv, stdin); }
+  if (name == "wc") { return wc(argv, stdin); }
+  if (name == "head") { return head(argv, stdin); }
+  if (name == "tail") { return tail(argv, stdin); }
+  if (name == "rev") { return rev(stdin); }
+  if (name == "sort") { return sort(argv, stdin); }
+  if (name == "uniq") { return uniq(stdin); }
+  if (name == "grep") { return grep(argv, stdin); }
+  if (name == "tr") { return tr(argv, stdin); }
+  if (name == "seq") { return seq(argv); }
+  if (name == "nl") { return nl(stdin); }
+
+  return Output.missing();
+}
+
+/** Every name `run` will answer to, so `help` and the tests do not have to guess. */
+export Vec<string> names() {
+  Vec<string> out = Vec.create();
+  out.push("cat"); out.push("wc"); out.push("head"); out.push("tail"); out.push("rev");
+  out.push("sort"); out.push("uniq"); out.push("grep"); out.push("tr"); out.push("seq");
+  out.push("nl");
+  return out;
+}
+
+// ── The programs ──────────────────────────────────────────────────────────────
+
+Output cat(Cli cli, Vec<string> argv, u8[] stdin) {
+  if (argv.len() == 1) { return Output.ok(stdin); }
+  Buf out = Buf.create();
+  for (i32 i = 1; i < argv.len(); i++) {
+    string path = argv.get(i);
+    if (path == "-") { out.pushAll(stdin); continue; }
+    FileResult f = cli.readFile(path);
+    if (!f.ok) {
+      return Output.fail(("cat: " + path + ": " + f.error + "\n").toBytes(), 1);
+    }
+    out.pushAll(f.bytes);
+  }
+  return Output.ok(out.take());
+}
+
+Output wc(Vec<string> argv, u8[] stdin) {
+  i32 lines = 0;
+  i32 words = 0;
+  bool inWord = false;
+  for (i32 i = 0; i < stdin.len(); i++) {
+    i32 c = stdin[i];
+    if (c == 10) { lines++; }
+    bool blank = c == 32 || c == 9 || c == 10;
+    if (blank) { inWord = false; }
+    else if (!inWord) { inWord = true; words++; }
+  }
+
+  bool wantLines = false;
+  bool wantWords = false;
+  bool wantBytes = false;
+  for (i32 i = 1; i < argv.len(); i++) {
+    string a = argv.get(i);
+    if (a == "-l") { wantLines = true; }
+    if (a == "-w") { wantWords = true; }
+    if (a == "-c") { wantBytes = true; }
+  }
+  if (!wantLines && !wantWords && !wantBytes) {
+    wantLines = true; wantWords = true; wantBytes = true;
+  }
+
+  // bash's wc pads its columns; this does not, and a test comparing the two must ask for one
+  // count at a time. Said here because it is the sort of difference that looks like a bug.
+  string s = "";
+  if (wantLines) { s = s + itoa(lines); }
+  if (wantWords) { s = (s == "" ? "" : s + " ") + itoa(words); }
+  if (wantBytes) { s = (s == "" ? "" : s + " ") + itoa(stdin.len()); }
+  return Output.ok((s + "\n").toBytes());
+}
+
+Output head(Vec<string> argv, u8[] stdin) {
+  i32 n = countArg(argv, 10);
+  return Output.ok(firstLines(stdin, n));
+}
+
+Output tail(Vec<string> argv, u8[] stdin) {
+  i32 n = countArg(argv, 10);
+  Vec<u8[]> lines = splitLines(stdin);
+  Buf out = Buf.create();
+  i32 from = lines.len() - n;
+  if (from < 0) { from = 0; }
+  for (i32 i = from; i < lines.len(); i++) {
+    out.pushAll(lines.get(i));
+    out.push(10);
+  }
+  return Output.ok(out.take());
+}
+
+Output rev(u8[] stdin) {
+  Buf out = Buf.create();
+  Vec<u8[]> lines = splitLines(stdin);
+  for (i32 i = 0; i < lines.len(); i++) {
+    u8[] line = lines.get(i);
+    for (i32 j = line.len() - 1; j >= 0; j--) { out.push(line[j]); }
+    out.push(10);
+  }
+  return Output.ok(out.take());
+}
+
+Output sort(Vec<string> argv, u8[] stdin) {
+  bool reverse = false;
+  for (i32 i = 1; i < argv.len(); i++) {
+    if (argv.get(i) == "-r") { reverse = true; }
+  }
+  Vec<u8[]> lines = splitLines(stdin);
+  // Insertion sort: the inputs here are a shell pipeline's worth, and a reader can check it.
+  for (i32 i = 1; i < lines.len(); i++) {
+    u8[] v = lines.get(i);
+    i32 j = i - 1;
+    while (j >= 0 && after(lines.get(j), v, reverse)) {
+      lines.set(j + 1, lines.get(j));
+      j--;
+    }
+    lines.set(j + 1, v);
+  }
+  Buf out = Buf.create();
+  for (i32 i = 0; i < lines.len(); i++) {
+    out.pushAll(lines.get(i));
+    out.push(10);
+  }
+  return Output.ok(out.take());
+}
+
+Output uniq(u8[] stdin) {
+  Vec<u8[]> lines = splitLines(stdin);
+  Buf out = Buf.create();
+  for (i32 i = 0; i < lines.len(); i++) {
+    if (i > 0 && sameBytes(lines.get(i), lines.get(i - 1))) { continue; }
+    out.pushAll(lines.get(i));
+    out.push(10);
+  }
+  return Output.ok(out.take());
+}
+
+/** Substring matching, not a regex — `packages/regex` is the obvious next step and is not wired. */
+Output grep(Vec<string> argv, u8[] stdin) {
+  bool invert = false;
+  string pattern = "";
+  for (i32 i = 1; i < argv.len(); i++) {
+    string a = argv.get(i);
+    if (a == "-v") { invert = true; continue; }
+    if (pattern == "") { pattern = a; }
+  }
+  if (pattern == "") { return Output.fail("grep: no pattern\n".toBytes(), 2); }
+
+  u8[] needle = pattern.toBytes();
+  Vec<u8[]> lines = splitLines(stdin);
+  Buf out = Buf.create();
+  i32 hits = 0;
+  for (i32 i = 0; i < lines.len(); i++) {
+    bool hit = contains(lines.get(i), needle);
+    if (hit != invert) {
+      out.pushAll(lines.get(i));
+      out.push(10);
+      hits++;
+    }
+  }
+  // grep's exit status is its answer, not an error: 1 means "no lines matched", which is what
+  // makes `grep x f && echo found` work.
+  return Output(out.take(), u8[0](), hits > 0 ? 0 : 1, true);
+}
+
+Output tr(Vec<string> argv, u8[] stdin) {
+  if (argv.len() < 3) { return Output.fail("tr: needs two sets\n".toBytes(), 2); }
+  u8[] from = argv.get(1).toBytes();
+  u8[] to = argv.get(2).toBytes();
+  u8[] out = u8[stdin.len()]();
+  for (i32 i = 0; i < stdin.len(); i++) {
+    i32 c = stdin[i];
+    for (i32 j = 0; j < from.len(); j++) {
+      if (from[j] == c) {
+        // A short second set repeats its last character, as tr does.
+        c = j < to.len() ? to[j] : (to.len() > 0 ? to[to.len() - 1] : c);
+        break;
+      }
+    }
+    out[i] = c;
+  }
+  return Output.ok(out);
+}
+
+Output seq(Vec<string> argv) {
+  i32 from = 1;
+  i32 to = 0;
+  if (argv.len() == 2) { to = atoi(argv.get(1)); }
+  else if (argv.len() >= 3) { from = atoi(argv.get(1)); to = atoi(argv.get(2)); }
+  else { return Output.fail("seq: needs a count\n".toBytes(), 2); }
+
+  Buf out = Buf.create();
+  for (i32 i = from; i <= to; i++) {
+    out.pushAll(itoa(i).toBytes());
+    out.push(10);
+  }
+  return Output.ok(out.take());
+}
+
+Output nl(u8[] stdin) {
+  Vec<u8[]> lines = splitLines(stdin);
+  Buf out = Buf.create();
+  for (i32 i = 0; i < lines.len(); i++) {
+    // GNU `nl` right-aligns the number in six columns and then a tab. Matched exactly so this can
+    // be compared against the real one rather than only against itself.
+    string num = itoa(i + 1);
+    string pad = "";
+    for (i32 j = num.len(); j < 6; j++) { pad = pad + " "; }
+    out.pushAll((pad + num + "\t").toBytes());
+    out.pushAll(lines.get(i));
+    out.push(10);
+  }
+  return Output.ok(out.take());
+}
+
+// ── Shared ────────────────────────────────────────────────────────────────────
+
+/**
+ * Split into lines, dropping a single trailing newline.
+ *
+ * Text with a final newline and text without it must produce the same lines, or every filter in a
+ * pipeline gains or loses a blank line at the end depending on what fed it.
+ */
+Vec<u8[]> splitLines(u8[] data) {
+  Vec<u8[]> out = Vec.create();
+  i32 start = 0;
+  for (i32 i = 0; i < data.len(); i++) {
+    if (data[i] == 10) {
+      out.push(sliceOf(data, start, i));
+      start = i + 1;
+    }
+  }
+  if (start < data.len()) { out.push(sliceOf(data, start, data.len())); }
+  return out;
+}
+
+u8[] firstLines(u8[] data, i32 n) {
+  Buf out = Buf.create();
+  i32 seen = 0;
+  i32 start = 0;
+  for (i32 i = 0; i < data.len() && seen < n; i++) {
+    if (data[i] == 10) {
+      out.pushBytes(data, start, i - start + 1);
+      start = i + 1;
+      seen++;
+    }
+  }
+  if (seen < n && start < data.len()) {
+    out.pushBytes(data, start, data.len() - start);
+    out.push(10);
+  }
+  return out.take();
+}
+
+i32 countArg(Vec<string> argv, i32 fallback) {
+  for (i32 i = 1; i < argv.len(); i++) {
+    if (argv.get(i) == "-n" && i + 1 < argv.len()) { return atoi(argv.get(i + 1)); }
+  }
+  return fallback;
+}
+
+bool after(u8[] a, u8[] b, bool reverse) {
+  i32 c = compare(a, b);
+  return reverse ? c < 0 : c > 0;
+}
+
+i32 compare(u8[] a, u8[] b) {
+  i32 n = a.len() < b.len() ? a.len() : b.len();
+  for (i32 i = 0; i < n; i++) {
+    if (a[i] != b[i]) { return a[i] < b[i] ? -1 : 1; }
+  }
+  if (a.len() == b.len()) { return 0; }
+  return a.len() < b.len() ? -1 : 1;
+}
+
+bool contains(u8[] haystack, u8[] needle) {
+  if (needle.len() == 0) { return true; }
+  if (needle.len() > haystack.len()) { return false; }
+  for (i32 i = 0; i + needle.len() <= haystack.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < needle.len(); j++) {
+      if (haystack[i + j] != needle[j]) { hit = false; break; }
+    }
+    if (hit) { return true; }
+  }
+  return false;
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+
+u8[] sliceOf(u8[] s, i32 from, i32 to) {
+  if (to <= from) { return u8[0](); }
+  u8[] out = u8[to - from]();
+  out.copyFrom(s, from, 0, to - from);
+  return out;
+}
+
+export string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  bool negative = v < 0;
+  i32 x = negative ? -v : v;
+  string out = "";
+  while (x > 0) {
+    out = string.fromCodepoint(0x30 + (x % 10)) + out;
+    x = x / 10;
+  }
+  return negative ? "-" + out : out;
+}
+
+export i32 atoi(string s) {
+  i32 v = 0;
+  bool negative = false;
+  i32 start = 0;
+  if (s.len() > 0 && s.slice(0, 1) == "-") { negative = true; start = 1; }
+  for (i32 i = start; i < s.len(); i++) {
+    u8[] b = s.slice(i, i + 1).toBytes();
+    if (b.len() != 1 || b[0] < 0x30 || b[0] > 0x39) { return 0; }
+    v = v * 10 + (b[0] - 0x30);
+  }
+  return negative ? -v : v;
+}

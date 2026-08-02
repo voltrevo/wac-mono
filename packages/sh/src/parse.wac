@@ -1,0 +1,282 @@
+// The shell grammar, as far as this shell goes.
+//
+//   script    := andor ((';' | '&' | newline) andor)*
+//   andor     := pipeline (('&&' | '||') pipeline)*
+//   pipeline  := simple ('|' simple)*
+//   simple    := assign* (word | redirect)+
+//   redirect  := [fd] ('<' | '>' | '>>') word
+//
+// Two shapes of the real grammar are missing and both are noted where they would attach:
+// compound commands (`if`, `while`, `for`, `case`, `{…}`, subshells) and function definitions.
+//
+// **An assignment is only an assignment before the first word.** `a=1 echo b` sets `a` for that
+// command; `echo a=1` prints it. The rule is positional and nothing about the token says which it
+// is, which is why the parser tracks whether it has seen a word yet rather than inspecting the
+// text.
+//
+// **Redirections may appear anywhere in a simple command**, not only at the end: `> out echo hi`
+// and `echo hi > out` are the same command. Treating them as a trailing clause parses the common
+// case and quietly drops the other.
+
+import { Vec } from "../../std/src/vec.wac";
+import { Kind, Part, PartKind, Token, tokenize } from "./lex.wac";
+
+export struct Word {
+  Vec<Part> parts;
+
+  Word of(Vec<Part> parts) { return Word(parts); }
+}
+
+export enum RedirKind { In, Out, Append }
+
+export struct Redir {
+  RedirKind kind;
+  /** The descriptor being redirected: 0 for `<`, 1 for `>`, or whatever `N>` said. */
+  i32 fd;
+  Word target;
+}
+
+export struct Assign {
+  string name;
+  Word value;
+}
+
+export struct Simple {
+  Vec<Assign> assigns;
+  Vec<Word> words;
+  Vec<Redir> redirs;
+}
+
+export struct Pipeline {
+  Vec<Simple> stages;
+}
+
+export enum AndOrOp {
+  /** The first pipeline in a list, run unconditionally. */
+  First,
+  /** `&&` — run only if the one before it succeeded. */
+  And,
+  /** `||` — run only if the one before it failed. */
+  Or,
+}
+
+export struct Item {
+  AndOrOp op;
+  Pipeline pipeline;
+}
+
+export struct AndOr {
+  Vec<Item> items;
+  /** True when the list ended with `&`, which this shell refuses rather than mis-runs. */
+  bool background;
+}
+
+export struct Script {
+  Vec<AndOr> lists;
+  bool ok;
+  string error;
+}
+
+Script bad(string why) {
+  return Script(Vec.create(), false, why);
+}
+
+/** Parse a whole script. */
+export Script parse(string src) {
+  Vec<Token> toks = tokenize(src);
+  Vec<AndOr> lists = Vec.create();
+  i32 at = 0;
+
+  while (at < toks.len()) {
+    Kind k = toks.get(at).kind;
+    match (k) {
+      case Bad: return bad("unterminated quote");
+      case Eof: {
+        return Script(lists, true, "");
+      }
+      case Newline: { at++; continue; }
+      case Semi: { at++; continue; }
+      else: {}
+    }
+
+    AndOr list = AndOr(Vec.create(), false);
+    i32 next = parseAndOr(toks, at, list);
+    if (next < 0) { return bad("syntax error"); }
+    if (list.items.len() == 0) { return bad("syntax error"); }
+    at = next;
+
+    // A separator, or the end. `&` is recorded and refused at run time rather than here, so the
+    // message can say what it was rather than "syntax error".
+    if (at < toks.len()) {
+      match (toks.get(at).kind) {
+        case Amp: { list.background = true; at++; }
+        case Semi: { at++; }
+        case Newline: { at++; }
+        case Eof: {}
+        else: return bad("unexpected token");
+      }
+    }
+    lists.push(list);
+  }
+  return Script(lists, true, "");
+}
+
+/** One `&&`/`||` chain. Returns the position after it, or -1. */
+i32 parseAndOr(Vec<Token> toks, i32 at, AndOr out) {
+  AndOrOp op = AndOrOp.First;
+  i32 p = at;
+  while (true) {
+    Pipeline pipeline = Pipeline(Vec.create());
+    i32 next = parsePipeline(toks, p, pipeline);
+    if (next < 0) { return -1; }
+    out.items.push(Item(op, pipeline));
+    p = next;
+    if (p >= toks.len()) { return p; }
+    match (toks.get(p).kind) {
+      case AndIf: { op = AndOrOp.And; p++; }
+      case OrIf: { op = AndOrOp.Or; p++; }
+      else: return p;
+    }
+    // A newline after `&&` continues the list, which is how multi-line conditions are written.
+    while (p < toks.len() && isNewline(toks.get(p))) { p++; }
+  }
+  trap;
+}
+
+bool isNewline(Token t) {
+  match (t.kind) {
+    case Newline: return true;
+    else: return false;
+  }
+}
+
+/** One pipeline. Returns the position after it, or -1. */
+i32 parsePipeline(Vec<Token> toks, i32 at, Pipeline out) {
+  i32 p = at;
+  while (true) {
+    Simple stage = Simple(Vec.create(), Vec.create(), Vec.create());
+    i32 next = parseSimple(toks, p, stage);
+    if (next < 0) { return -1; }
+    out.stages.push(stage);
+    p = next;
+    if (p >= toks.len()) { return p; }
+    match (toks.get(p).kind) {
+      case Pipe: { p++; }
+      else: return p;
+    }
+    while (p < toks.len() && isNewline(toks.get(p))) { p++; }
+  }
+  trap;
+}
+
+/** One simple command. Returns the position after it, or -1 if it is empty or malformed. */
+i32 parseSimple(Vec<Token> toks, i32 at, Simple out) {
+  i32 p = at;
+  bool sawWord = false;
+
+  while (p < toks.len()) {
+    Token t = toks.get(p);
+    match (t.kind) {
+      case Word: {
+        // Before the first word, `NAME=value` is an assignment; after it, an argument.
+        if (!sawWord) {
+          i32 eq = assignmentAt(t);
+          if (eq >= 0) {
+            out.assigns.push(Assign(nameOf(t, eq), Word.of(valueOf(t, eq))));
+            p++;
+            continue;
+          }
+        }
+        sawWord = true;
+        out.words.push(Word.of(t.parts));
+        p++;
+      }
+      case Less: {
+        i32 next = takeRedir(toks, p, out, RedirKind.In, 0);
+        if (next < 0) { return -1; }
+        p = next;
+      }
+      case Great: {
+        i32 next = takeRedir(toks, p, out, RedirKind.Out, 1);
+        if (next < 0) { return -1; }
+        p = next;
+      }
+      case DGreat: {
+        i32 next = takeRedir(toks, p, out, RedirKind.Append, 1);
+        if (next < 0) { return -1; }
+        p = next;
+      }
+      else: {
+        // Anything else ends the command. A command with neither words nor redirections is a
+        // syntax error — `| foo` and `&& foo` reach here with nothing collected.
+        if (!sawWord && out.redirs.len() == 0 && out.assigns.len() == 0) { return -1; }
+        return p;
+      }
+    }
+  }
+  if (!sawWord && out.redirs.len() == 0 && out.assigns.len() == 0) { return -1; }
+  return p;
+}
+
+/** Consume a redirection operator and its target word. */
+i32 takeRedir(Vec<Token> toks, i32 at, Simple out, RedirKind kind, i32 defaultFd) {
+  Token op = toks.get(at);
+  i32 fd = op.fd < 0 ? defaultFd : op.fd;
+  i32 p = at + 1;
+  if (p >= toks.len()) { return -1; }
+  Token target = toks.get(p);
+  match (target.kind) {
+    case Word: {}
+    else: return -1;                       // `> ;` and `> |` are syntax errors, not empty targets
+  }
+  out.redirs.push(Redir(kind, fd, Word.of(target.parts)));
+  return p + 1;
+}
+
+/**
+ * Where the `=` is, if this word is an assignment — otherwise -1.
+ *
+ * Only an unquoted `=` in the *first* literal part counts, and everything before it must be a
+ * valid name. `a=1` assigns; `"a"=1`, `1a=1` and `=1` do not, and each is a word bash would try
+ * to run. The check is on the first part because `a$x=1` is not an assignment either.
+ */
+i32 assignmentAt(Token t) {
+  if (t.parts.len() == 0) { return -1; }
+  Part first = t.parts.get(0);
+  match (first.kind) {
+    case Lit: {}
+    else: return -1;
+  }
+  if (first.quoted) { return -1; }
+  u8[] s = first.text.toBytes();
+  if (s.len() == 0) { return -1; }
+  if (!isNameStart(s[0])) { return -1; }
+  for (i32 i = 1; i < s.len(); i++) {
+    if (s[i] == 0x3d) { return i; }
+    if (!isNameChar(s[i])) { return -1; }
+  }
+  return -1;
+}
+
+string nameOf(Token t, i32 eq) {
+  return t.parts.get(0).text.slice(0, eq);
+}
+
+/** The value of an assignment: the rest of the first part, then every part after it. */
+Vec<Part> valueOf(Token t, i32 eq) {
+  Vec<Part> out = Vec.create();
+  Part first = t.parts.get(0);
+  string rest = first.text.slice(eq + 1, first.text.len());
+  if (rest != "") { out.push(Part.of(PartKind.Lit, rest, first.quoted)); }
+  for (i32 i = 1; i < t.parts.len(); i++) { out.push(t.parts.get(i)); }
+  if (out.len() == 0) { out.push(Part.of(PartKind.Lit, "", false)); }
+  return out;
+}
+
+bool isNameStart(i32 c) {
+  return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c == 0x5f;
+}
+
+bool isNameChar(i32 c) {
+  return isNameStart(c) || (c >= 0x30 && c <= 0x39);
+}

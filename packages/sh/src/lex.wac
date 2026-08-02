@@ -1,0 +1,351 @@
+// The shell tokenizer.
+//
+// A shell lexer is unusual in that **it cannot throw away the quoting**. `echo "$x"` and
+// `echo $x` tokenize to the same characters and behave differently: the first is one word
+// whatever `x` holds, the second splits on whitespace and may become zero words or ten. So a word
+// is not a string here, it is a list of parts each of which remembers whether it was quoted.
+//
+// Getting that wrong produces a shell that works on every example anyone tries by hand and
+// mangles the first filename with a space in it.
+//
+// The three quoting forms differ in what they suppress:
+//
+//   `\c`      one character, literally — outside quotes only, and a backslash-newline vanishes
+//   `'…'`     everything, including backslashes and dollars; there is no escape inside
+//   `"…"`     word splitting and globbing, but *not* `$` — expansions still happen
+//
+// What this does not do yet: here-documents, backquotes, `${…}` with modifiers, arithmetic, and
+// process substitution. Each is noted where it would go.
+
+import { Vec } from "../../std/src/vec.wac";
+
+export enum Kind {
+  /** A word, in `parts`. */
+  Word,
+  Pipe,
+  AndIf,
+  OrIf,
+  Semi,
+  /** `&` — parsed so it can be refused with a message rather than mis-parsed. */
+  Amp,
+  Less,
+  Great,
+  DGreat,
+  Newline,
+  Eof,
+  /** The input ended inside a quote. */
+  Bad,
+}
+
+export enum PartKind {
+  /** Literal text, already unescaped. */
+  Lit,
+  /** A parameter name: `$x`, `${x}`. */
+  Var,
+  /** A command substitution's text, still unparsed: `$(…)`. */
+  Cmd,
+}
+
+/**
+ * One piece of a word.
+ *
+ * `quoted` means the piece was inside quotes, which is what suppresses splitting and globbing
+ * later. It is a property of the *piece*, not the word: `a"b c"d` is one word whose middle part
+ * is quoted, and `$x"$y"` splits its first expansion and not its second.
+ */
+export struct Part {
+  PartKind kind;
+  string text;
+  bool quoted;
+
+  Part of(PartKind kind, string text, bool quoted) { return Part(kind, text, quoted); }
+}
+
+export struct Token {
+  Kind kind;
+  Vec<Part> parts;
+  /**
+   * The file descriptor written immediately before a redirection operator, as in `2>`, or -1.
+   *
+   * Attached to the operator rather than left as a word, because `echo 2 > f` and `echo 2> f`
+   * differ only in that space and mean different things.
+   */
+  i32 fd;
+
+  Token of(Kind kind) { return Token(kind, Vec.create(), -1); }
+}
+
+export struct Lexer {
+  string src;
+  i32 at;
+
+  Lexer create(string src) { return Lexer(src, 0); }
+
+  bool done(const this) { return this.at >= this.src.len(); }
+
+  i32 peek(const this, i32 ahead) {
+    i32 i = this.at + ahead;
+    if (i >= this.src.len()) { return -1; }
+    return this.src.toBytes()[i];
+  }
+}
+
+/** Every token in `src`, ending with `Eof` — or with `Bad` if a quote never closed. */
+export Vec<Token> tokenize(string src) {
+  Vec<Token> out = Vec.create();
+  u8[] s = src.toBytes();
+  i32 at = 0;
+
+  while (true) {
+    // Skip blanks and comments. A `#` only starts a comment at the beginning of a word, which is
+    // why `echo a#b` prints `a#b` — checked below by only looking here.
+    while (at < s.len() && (s[at] == 32 || s[at] == 9)) { at++; }
+    if (at < s.len() && s[at] == 0x23) {
+      while (at < s.len() && s[at] != 10) { at++; }
+    }
+    if (at >= s.len()) {
+      out.push(Token.of(Kind.Eof));
+      return out;
+    }
+
+    i32 c = s[at];
+
+    if (c == 10) { out.push(Token.of(Kind.Newline)); at++; continue; }
+    if (c == 0x7c) {                                        // '|'
+      if (at + 1 < s.len() && s[at + 1] == 0x7c) { out.push(Token.of(Kind.OrIf)); at += 2; }
+      else { out.push(Token.of(Kind.Pipe)); at++; }
+      continue;
+    }
+    if (c == 0x26) {                                        // '&'
+      if (at + 1 < s.len() && s[at + 1] == 0x26) { out.push(Token.of(Kind.AndIf)); at += 2; }
+      else { out.push(Token.of(Kind.Amp)); at++; }
+      continue;
+    }
+    if (c == 0x3b) { out.push(Token.of(Kind.Semi)); at++; continue; }     // ';'
+    if (c == 0x3c) { out.push(Token.of(Kind.Less)); at++; continue; }     // '<'
+    if (c == 0x3e) {                                        // '>'
+      if (at + 1 < s.len() && s[at + 1] == 0x3e) { out.push(Token.of(Kind.DGreat)); at += 2; }
+      else { out.push(Token.of(Kind.Great)); at++; }
+      continue;
+    }
+
+    // A run of digits immediately followed by a redirection operator is a file descriptor, not a
+    // word: `2>err` redirects, `2 >err` writes `2` and redirects. The lexer decides, because by
+    // the time the parser sees words the space is gone.
+    if (c >= 0x30 && c <= 0x39) {
+      i32 scan = at;
+      while (scan < s.len() && s[scan] >= 0x30 && s[scan] <= 0x39) { scan++; }
+      if (scan < s.len() && (s[scan] == 0x3e || s[scan] == 0x3c)) {
+        i32 fd = 0;
+        for (i32 i = at; i < scan; i++) { fd = fd * 10 + (s[i] - 0x30); }
+        Kind k = Kind.Less;
+        i32 after = scan + 1;
+        if (s[scan] == 0x3e) {
+          if (after < s.len() && s[after] == 0x3e) { k = Kind.DGreat; after++; }
+          else { k = Kind.Great; }
+        }
+        Token t = Token.of(k);
+        t.fd = fd;
+        out.push(t);
+        at = after;
+        continue;
+      }
+    }
+
+    // Otherwise a word, which runs until an unquoted delimiter.
+    Token word = Token.of(Kind.Word);
+    i32 next = lexWord(s, at, word);
+    if (next < 0) {
+      out.push(Token.of(Kind.Bad));
+      return out;
+    }
+    at = next;
+    out.push(word);
+  }
+  trap;                                                     // unreachable
+}
+
+/**
+ * Lex one word starting at `at`, filling `word.parts`. Returns the new position, or -1.
+ *
+ * **A part has uniform quotedness**, so the accumulator is flushed whenever that changes.
+ * Accumulating `x=` and then `"a b c"` into one part and marking the result quoted makes `x="a b
+ * c"` stop being an assignment — the parser looks at the first part and sees a quoted one, which
+ * is a command name. That is not a hypothetical: it is what this did, and bash disagreed on
+ * exactly three of eighty-three scripts.
+ */
+i32 lexWord(u8[] s, i32 at, Token word) {
+  i32 p = at;
+  string lit = "";
+  bool litQuoted = false;
+  bool haveLit = false;
+
+  while (p < s.len()) {
+    i32 c = s[p];
+    if (isDelimiter(c)) { break; }
+
+    if (c == 0x5c) {                                        // '\'
+      if (p + 1 >= s.len()) { p++; continue; }               // a trailing backslash is dropped
+      i32 n = s[p + 1];
+      // A backslash-newline is a line continuation and produces nothing at all.
+      if (n == 10) { p += 2; continue; }
+      // An escaped character never splits, so it belongs to a quoted part.
+      if (haveLit && !litQuoted) { word.parts.push(Part.of(PartKind.Lit, lit, false)); lit = ""; }
+      lit = lit + charOf(n);
+      litQuoted = true;
+      haveLit = true;
+      p += 2;
+      continue;
+    }
+
+    if (c == 0x27) {                                        // '\''
+      if (haveLit && !litQuoted) { word.parts.push(Part.of(PartKind.Lit, lit, false)); lit = ""; }
+      litQuoted = true;
+      haveLit = true;
+      p++;
+      while (p < s.len() && s[p] != 0x27) {
+        lit = lit + charOf(s[p]);
+        p++;
+      }
+      if (p >= s.len()) { return -1; }                       // unterminated
+      p++;
+      continue;
+    }
+
+    if (c == 0x22) {                                        // '"'
+      if (haveLit && !litQuoted) { word.parts.push(Part.of(PartKind.Lit, lit, false)); lit = ""; }
+      litQuoted = true;
+      haveLit = true;
+      p++;
+      while (p < s.len() && s[p] != 0x22) {
+        if (s[p] == 0x5c && p + 1 < s.len() && escapableInDquote(s[p + 1])) {
+          // Inside double quotes a backslash only escapes these four; before anything else it
+          // stays a literal backslash, which is why `"\n"` is a backslash and an n.
+          lit = lit + charOf(s[p + 1]);
+          p += 2;
+          continue;
+        }
+        if (s[p] == 0x24 && p + 1 < s.len()) {               // '$' still expands inside "…"
+          if (lit != "") { word.parts.push(Part.of(PartKind.Lit, lit, true)); lit = ""; }
+          i32 after = lexDollar(s, p, word, true);
+          if (after < 0) { return -1; }
+          if (after == p) { lit = lit + "$"; p++; }           // a lone `$` is literal
+          else { p = after; }
+          continue;
+        }
+        lit = lit + charOf(s[p]);
+        p++;
+      }
+      if (p >= s.len()) { return -1; }                       // unterminated
+      p++;
+      continue;
+    }
+
+    if (c == 0x24) {                                        // '$'
+      if (haveLit) { word.parts.push(Part.of(PartKind.Lit, lit, litQuoted)); lit = ""; haveLit = false; }
+      litQuoted = false;
+      i32 after = lexDollar(s, p, word, false);
+      if (after < 0) { return -1; }
+      if (after == p) { lit = lit + "$"; haveLit = true; p++; }
+      else { p = after; }
+      continue;
+    }
+
+    if (haveLit && litQuoted) { word.parts.push(Part.of(PartKind.Lit, lit, true)); lit = ""; }
+    litQuoted = false;
+    haveLit = true;
+    lit = lit + charOf(c);
+    p++;
+  }
+
+  // An empty word is still a word: `echo ""` passes one empty argument, and dropping it here
+  // would make it pass none.
+  if (haveLit || word.parts.len() == 0) {
+    word.parts.push(Part.of(PartKind.Lit, lit, litQuoted));
+  }
+  return p;
+}
+
+/**
+ * Lex an expansion starting at the `$`. Returns the position after it, or `at` if it is not one.
+ *
+ * `$(…)` is captured whole and left unparsed — a command substitution contains a whole script,
+ * including nested substitutions, and parsing it here would mean the lexer knowing the grammar.
+ * Counting parentheses is enough to find its end.
+ */
+i32 lexDollar(u8[] s, i32 at, Token word, bool quoted) {
+  i32 p = at + 1;
+  if (p >= s.len()) { return at; }
+  i32 c = s[p];
+
+  if (c == 0x28) {                                          // '('
+    i32 depth = 1;
+    i32 start = p + 1;
+    p++;
+    while (p < s.len() && depth > 0) {
+      if (s[p] == 0x28) { depth++; }
+      if (s[p] == 0x29) { depth--; if (depth == 0) { break; } }
+      p++;
+    }
+    if (p >= s.len()) { return -1; }
+    word.parts.push(Part.of(PartKind.Cmd, sliceOf(s, start, p), quoted));
+    return p + 1;
+  }
+
+  if (c == 0x7b) {                                          // '{'
+    i32 start = p + 1;
+    p++;
+    while (p < s.len() && s[p] != 0x7d) { p++; }
+    if (p >= s.len()) { return -1; }
+    // `${x:-default}` and friends are not handled yet; the whole inside is taken as a name, so
+    // they would look up a variable with a strange name and find nothing rather than misbehave.
+    word.parts.push(Part.of(PartKind.Var, sliceOf(s, start, p), quoted));
+    return p + 1;
+  }
+
+  // `$?`, `$$`, `$#` and `$0`…`$9` are one character each; a name is the usual run.
+  if (c == 0x3f || c == 0x24 || c == 0x23 || c == 0x21 || (c >= 0x30 && c <= 0x39)) {
+    word.parts.push(Part.of(PartKind.Var, charOf(c), quoted));
+    return p + 1;
+  }
+
+  if (isNameStart(c)) {
+    i32 start = p;
+    while (p < s.len() && isNameChar(s[p])) { p++; }
+    word.parts.push(Part.of(PartKind.Var, sliceOf(s, start, p), quoted));
+    return p;
+  }
+
+  return at;                                                 // a lone `$`
+}
+
+bool isDelimiter(i32 c) {
+  return c == 32 || c == 9 || c == 10 || c == 0x7c || c == 0x26 || c == 0x3b
+      || c == 0x3c || c == 0x3e || c == 0x28 || c == 0x29;
+}
+
+bool isNameStart(i32 c) {
+  return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c == 0x5f;
+}
+
+bool isNameChar(i32 c) {
+  return isNameStart(c) || (c >= 0x30 && c <= 0x39);
+}
+
+/** The four characters a backslash escapes inside double quotes. Everything else stays literal. */
+bool escapableInDquote(i32 c) {
+  return c == 0x22 || c == 0x5c || c == 0x24 || c == 0x60;   // " \ $ `
+}
+
+string charOf(i32 c) {
+  u8[] one = u8[1]();
+  one[0] = c;
+  return string.fromBytes(one);
+}
+
+string sliceOf(u8[] s, i32 from, i32 to) {
+  if (to <= from) { return ""; }
+  u8[] out = u8[to - from]();
+  out.copyFrom(s, from, 0, to - from);
+  return string.fromBytes(out);
+}
