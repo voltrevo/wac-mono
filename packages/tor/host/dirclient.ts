@@ -165,3 +165,152 @@ export async function bootstrap(
 }
 
 export { chutneyAuthorities };
+
+// ── Keeping the directory current ────────────────────────────────────────────
+
+/**
+ * When to fetch the next consensus, as a unix time — or null if this one has no schedule.
+ *
+ * dir-spec §5.1. Not "when the current one expires": every client would then hit the caches
+ * at the same instant, which is both a thundering herd and a fingerprint, since a client
+ * that downloads at a distinctive moment is distinguishable. So the time is chosen uniformly
+ * in a window opening at `fresh-until` and closing three quarters of the way to
+ * `valid-until`, leaving a quarter of the interval as slack for the download to fail and be
+ * retried before anything expires.
+ */
+export function refreshAt(
+  consensus: string, random: () => number = Math.random,
+): number | null {
+  const at = (field: string) => {
+    const m = consensus.match(new RegExp(`^${field} (.+)$`, "m"));
+    if (m === null) return null;
+    const t = m[1].match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+    return t === null
+      ? null
+      : Date.UTC(+t[1], +t[2] - 1, +t[3], +t[4], +t[5], +t[6]) / 1000;
+  };
+  const fresh = at("fresh-until");
+  const valid = at("valid-until");
+  if (fresh === null || valid === null || valid <= fresh) return null;
+  return Math.floor(fresh + random() * (valid - fresh) * 0.75);
+}
+
+/** Unix time when a consensus stops being acceptable at all. */
+export function validUntil(consensus: string): number | null {
+  const m = consensus.match(/^valid-until (\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/m);
+  return m === null
+    ? null
+    : Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) / 1000;
+}
+
+/**
+ * A consensus that keeps itself current.
+ *
+ * Two rules that matter more than the refreshing does.
+ *
+ * A failed refresh keeps the old consensus rather than falling back to anything unverified.
+ * An attacker who can break your directory fetches should get a client running on stale but
+ * genuine data, not one that shrugs and believes the next thing it is handed.
+ *
+ * Once the current consensus is past `valid-until` with no replacement, `chooser` throws.
+ * Continuing to build paths from an expired document is how a replay of last year's
+ * consensus would work — the relays in it may be long gone, and their keys may not be.
+ */
+export class Directory {
+  #consensus: string;
+  #chooser: PathChooser;
+  #relays: Relay[];
+  #trusted: Set<string>;
+  #refreshAt: number;
+  #validUntil: number;
+
+  private constructor(
+    consensus: string, relays: Relay[], trusted: Set<string>, random: () => number,
+  ) {
+    this.#consensus = consensus;
+    this.#relays = relays;
+    this.#chooser = new PathChooser(relays, consensus);
+    this.#trusted = trusted;
+    this.#refreshAt = refreshAt(consensus, random) ?? Infinity;
+    this.#validUntil = validUntil(consensus) ?? Infinity;
+  }
+
+  static fromBootstrap(
+    boot: Bootstrapped, trusted: Set<string>, random: () => number = Math.random,
+  ): Directory {
+    return new Directory(boot.consensus, boot.relays, trusted, random);
+  }
+
+  get relays(): Relay[] {
+    return this.#relays;
+  }
+
+  get expiresAt(): number {
+    return this.#validUntil;
+  }
+
+  /** The chooser, if the consensus behind it is still valid. */
+  chooser(now: number = Math.floor(Date.now() / 1000)): PathChooser {
+    if (now > this.#validUntil) {
+      throw new Error(
+        "the consensus has expired and no replacement was fetched; " +
+        "building paths from it would mean trusting a document the authorities have retired",
+      );
+    }
+    return this.#chooser;
+  }
+
+  /** Whether it is time to go and get a new one. */
+  dueForRefresh(now: number = Math.floor(Date.now() / 1000)): boolean {
+    return now >= this.#refreshAt;
+  }
+
+  /**
+   * Fetch a replacement over `circ` if one is due.
+   *
+   * Returns whether anything changed. A refusal to verify is reported by throwing, because
+   * it is the interesting case: the caller has just been handed a document that did not
+   * check out, and swallowing that would leave a client quietly running on data it should
+   * have been alarmed about.
+   */
+  async refresh(
+    circ: Circuit, now: number = Math.floor(Date.now() / 1000),
+    random: () => number = Math.random,
+  ): Promise<boolean> {
+    if (!this.dueForRefresh(now)) return false;
+    const dec = new TextDecoder();
+    const consensus = dec.decode(
+      await fetchOverCircuit(circ, "/tor/status-vote/current/consensus-microdesc"),
+    );
+    const certs = dec.decode(
+      await fetchOverCircuit(circ, `/tor/keys/fp/${[...this.#trusted].join("+")}`),
+    );
+    const verdict = verifyConsensus(
+      consensus, parseCertificates(certs, this.#trusted), this.#trusted, now,
+    );
+    if (!verdict.ok) {
+      const why = verdict.stale ?? `${verdict.signedBy.length} of ${verdict.needed} signatures`;
+      throw new Error(`the replacement consensus is not acceptable: ${why}`);
+    }
+    // Only now is anything replaced. Parsing into the live fields before verifying would
+    // mean a rejected document had already half-arrived.
+    const relays = parseConsensus(consensus);
+    const digests = relays.map((r) => r.microdescDigest).filter((d) => d !== "");
+    const micros = new Map<string, Awaited<ReturnType<typeof parseMicrodescriptors>> extends
+      Map<string, infer V> ? V : never>();
+    for (let i = 0; i < digests.length; i += 92) {
+      const text = dec.decode(
+        await fetchOverCircuit(circ, microdescPath(digests.slice(i, i + 92))),
+      );
+      for (const [k, v] of await parseMicrodescriptors(text)) micros.set(k, v);
+    }
+    attachMicrodescriptors(relays, micros);
+
+    this.#consensus = consensus;
+    this.#relays = relays;
+    this.#chooser = new PathChooser(relays, consensus);
+    this.#refreshAt = refreshAt(consensus, random) ?? Infinity;
+    this.#validUntil = validUntil(consensus) ?? Infinity;
+    return true;
+  }
+}

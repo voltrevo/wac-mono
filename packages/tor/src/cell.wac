@@ -265,3 +265,63 @@ export i32 certsCount(u8[] payload) {
   }
   return n;
 }
+
+// ── Link padding ─────────────────────────────────────────────────────────────
+//
+// padding-spec §2. A Tor link between a client and a guard is long-lived and mostly idle,
+// and a middlebox keeping netflow records sees each idle gap as the connection ending and
+// a new one beginning. That record — when your connection to a guard started and stopped —
+// is exactly the timing an end-to-end correlation attack wants, and it is collected by
+// default on a lot of networks by equipment that is not attacking anyone.
+//
+// So the two ends agree to send a PADDING cell whenever the link has been quiet for a
+// randomly chosen interval, and the connection stops looking like it ends. This is *not* a
+// defence against an observer watching the link itself: padding cells are the same size as
+// any other cell and an observer on the wire counts them all the same. It removes a gap in
+// a flow record, and nothing more.
+
+export i32 paddingCommandStop() { return 1; }
+export i32 paddingCommandStart() { return 2; }
+
+/**
+ * A PADDING_NEGOTIATE cell: version | command | ito_low_ms | ito_high_ms.
+ *
+ * The timings are what the *peer* should use when padding towards us, and they are a floor
+ * rather than a setting. tor takes `MAX(consensus, negotiated)` for **both** bounds, so
+ * negotiation can only make padding less frequent than the consensus default of
+ * 1500–9500ms, never more.
+ *
+ * That is the opposite of what the name suggests and it was worth checking rather than
+ * assuming: asking a relay for 1500–3000 and watching it pad at seven-second intervals is
+ * what sent me to `channelpadding_get_netflow_inactive_timeout_ms` to find the MAX. A client
+ * that could ask for one-millisecond padding could ask a relay to flood it, so the asymmetry
+ * is deliberate.
+ */
+export u8[] encodePaddingNegotiate(i32 command, i32 lowMs, i32 highMs) {
+  if (command != paddingCommandStart() && command != paddingCommandStop()) { trap; }
+  if (lowMs < 0 || highMs < 0 || lowMs > 65535 || highMs > 65535) { trap; }
+  // The spec requires the high end not to be below the low one. Sending an inverted pair
+  // makes the peer drop the connection, and the reason is not obvious from this end.
+  if (highMs < lowMs) { trap; }
+  u8[] payload = u8[6]();
+  payload[0] = 0;             // version
+  payload[1] = command;
+  payload[2] = (lowMs >> 8) & 0xFF;
+  payload[3] = lowMs & 0xFF;
+  payload[4] = (highMs >> 8) & 0xFF;
+  payload[5] = highMs & 0xFF;
+  return encodeFixed(0, cmdPaddingNegotiate(), payload);
+}
+
+export i32 cmdPaddingNegotiate() { return 12; }
+
+/**
+ * A PADDING cell: a whole 514-byte cell carrying nothing.
+ *
+ * The payload is zeros rather than random. It is encrypted by the TLS layer before it
+ * reaches the wire, so randomising it would buy nothing an observer could not already not
+ * see — and tor sends zeros, which is the answer that matters for interoperability.
+ */
+export u8[] encodePadding() {
+  return encodeFixed(0, cmdPadding(), u8[0]());
+}

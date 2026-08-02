@@ -65,3 +65,12 @@ export i32 cmdRelayExtended2() { return rx2d(); }
 import { hopDigest as hd, sendmeBodyV1 as sb } from "../../src/relay.wac";
 export u8[] hopDigest(u8[] st, bool fwd) { return hd(st, fwd); }
 export u8[] sendmeBodyV1(u8[] d) { return sb(d); }
+
+import {
+  encodePaddingNegotiate as epn, encodePadding as ep,
+  paddingCommandStart as pcstart, paddingCommandStop as pcstop,
+} from "../../src/cell.wac";
+export u8[] encodePaddingNegotiate(i32 cmd, i32 lo, i32 hi) { return epn(cmd, lo, hi); }
+export u8[] encodePadding() { return ep(); }
+export i32 paddingCommandStart() { return pcstart(); }
+export i32 paddingCommandStop() { return pcstop(); }

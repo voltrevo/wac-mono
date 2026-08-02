@@ -71,7 +71,8 @@ happened to this repo's SHAKE tests until they moved to `node:crypto`.
 | `host/verify.ts` | the authority chain and the majority rule |
 | `src/pathsel.wac` | the weighting and the path constraints |
 | `host/path.ts` | resolving the consensus into candidates, and guards |
-| `host/dirclient.ts` | fetching the directory over Tor, and bootstrapping |
+| `host/dirclient.ts` | fetching the directory over Tor, bootstrapping, and refresh |
+| `host/pool.ts` | keeping circuits, and deciding which one a stream goes on |
 
 The split is the same one the TLS package uses: bytes and state machines in wac, and only
 the socket in TypeScript. One exception is forced rather than chosen — a `Hop` is a struct
@@ -156,6 +157,63 @@ just retries elsewhere.
 the relay exit *something*; the summary says what. Reading a missing summary generously would
 send streams to relays that refuse them.
 
+## Circuits are reused, and retired
+
+Reuse saves three handshakes. That is not why it needs care — "reuse the circuit" and "keep
+the circuit forever" are one step apart, and the second is a real leak: everything on one
+circuit shares an exit, and the exit sees every destination. A circuit that lives all day
+hands one relay the whole day's activity, linked as one person's.
+
+So a circuit stops accepting *new* streams ten minutes after its first one (tor's
+MaxCircuitDirtiness). A download already running keeps its circuit; what stops is anything
+else joining it.
+
+**Isolation is the caller's call.** Two streams that must not be linked must not share a
+circuit, and only the application knows which those are — tor's own default isolates by
+client address and SOCKS credentials but deliberately *not* by destination, because a
+circuit per site would build faster than the network absorbs. Tor Browser layers
+first-party-domain isolation on top. `CircuitPool` guarantees two isolation keys never share
+and does not invent one.
+
+## Keeping the directory current
+
+`Directory` refreshes at a random time between `fresh-until` and three quarters of the way to
+`valid-until`. Random because every client refreshing at one instant is both a herd on the
+caches and a fingerprint; three quarters because the last quarter is slack for a failed
+download to be retried before anything expires.
+
+A failed refresh keeps the old consensus rather than falling back to anything unverified —
+an attacker who can break your directory fetches should get a client on stale but genuine
+data, not one that believes the next thing it is handed. Past `valid-until` with no
+replacement, `chooser()` throws rather than building paths from a retired document.
+
+## Link padding
+
+A client's connection to its guard is long-lived and mostly idle, and a middlebox keeping
+netflow records reads each idle gap as the connection ending and a new one starting. That
+record — when your connection to a guard began and ended — is exactly the timing an
+end-to-end correlation attack wants, and it is collected by default on a great many networks
+by equipment nobody thinks of as an adversary. Padding keeps the flow open.
+
+**It defends against flow records and nothing else.** A padding cell is the same 514 bytes
+as every other cell, so an observer on the wire counts them identically. It is not the
+circuit-level padding that defends against website fingerprinting — that is WTF-PAD,
+negotiated per circuit with RELAY_DROP cells, and it is not here. Confusing the two is how a
+narrow defence becomes a false sense of a broad one.
+
+Two things worth knowing, both learnt from a real relay rather than from the spec:
+
+- **The negotiated range is a floor.** tor takes `MAX(consensus, negotiated)` for both
+  bounds, so a client can ask for *less* padding than the 1500–9500ms default and never for
+  more. Asking for 1500–3000 and watching the relay pad at seven-second intervals is what
+  sent me to read `channelpadding_get_netflow_inactive_timeout_ms`.
+- **A relay only pads a channel it considers in use** — one carrying full circuits or user
+  traffic. Negotiating on a bare link and waiting produces nothing, which looks exactly like
+  the negotiation having failed.
+
+Verified against tor: the relay logs `Negotiated padding=1, lo=1500, hi=3000`, and once a
+three-hop circuit exists, padding cells arrive.
+
 ## Relay cells, and the two things that are easy to get wrong
 
 **The digest is a running hash, not a per-cell one.** Each direction has a SHA-1 seeded at
@@ -198,15 +256,17 @@ network being down rather than as three dead relays. Proposal 271 also ages entr
 the sampled set on a schedule, keeps a confirmed list separate from a primary list, and
 bounds how much of the network a client may ever have sampled. Those are not here.
 
-**Circuits are not reused or rotated.** A real client keeps a few open, assigns streams to
-them by destination, and retires them after ten minutes so that separate activity does not
-share a path. Every circuit here is built for one purpose and dropped.
+**Circuits are not built ahead of demand.** A real client keeps clean circuits ready so a
+stream does not wait three handshakes. Here the first stream after a retirement pays for the
+rebuild.
 
-**No padding, and no defence against traffic analysis.** Cell timing and volume are exactly
-what the application produced.
+**No circuit-level padding.** Link padding is implemented; WTF-PAD — the padding machines
+that defend against website fingerprinting — is not. Cell timing and volume within a circuit
+are exactly what the application produced.
 
-**Directory freshness is not maintained.** The consensus is fetched once at bootstrap; a
-real client re-downloads before the old one expires and keeps working across the boundary.
+**Streams and ports under one isolation key.** The exit is chosen for the port of the stream
+that caused the circuit to be built. A caller mixing ports under one key can be handed an
+exit that refuses a later one.
 
 **Streams to arbitrary destinations, verified.** `RELAY_BEGIN` reaches the exit and is
 parsed by it — the testnet's exit evaluates our address and answers `RELAY_END`, which
