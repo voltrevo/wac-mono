@@ -1,0 +1,149 @@
+// X25519MLKEM768, tested in wac with no oracle.
+//
+// The hybrid needs no independent implementation to be checked, which is worth saying
+// because it is not obvious: the properties that matter are relations between its own
+// outputs. Both sides reaching the same secret, each half moving only when its own input
+// moves, ML-KEM's share coming first — none of those is a value someone else has to tell
+// us. The one thing an outside implementation adds is interoperability, and that is
+// `client.test.ts` negotiating against OpenSSL 3.5, which stays where it is.
+//
+// Everything here was TypeScript this morning, reaching in through a probe. The probe
+// exports remain for the length refusals, which trap and so cannot be asserted in wac.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  hybridClientOffer, hybridServerAccept, hybridClientFinish,
+  groupX25519MlKem768, hybridClientShareLen, hybridServerShareLen, hybridSecretLen,
+} from "../../src/hybrid.wac";
+
+const i32 DK_LEN = 2400;
+const i32 EK_LEN = 1184;
+const i32 CT_LEN = 1088;
+
+u8[] pattern(i32 n, i32 seed) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (i * 31 + seed) & 0xFF; }
+  return out;
+}
+
+u8[] slice(u8[] src, i32 from, i32 to) {
+  u8[] out = u8[to - from]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = src[from + i]; }
+  return out;
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+export string test_the_code_point_and_the_three_lengths() {
+  // Against draft-ietf-tls-ecdhe-mlkem rather than against ourselves. A share length that
+  // agrees with the implementation that produced it says nothing.
+  T t = T.create();
+  t.eqI32(groupX25519MlKem768(), 0x11EC, "the named group code point");
+  t.eqI32(hybridClientShareLen(), EK_LEN + 32, "client share: ML-KEM key plus X25519");
+  t.eqI32(hybridServerShareLen(), CT_LEN + 32, "server share: ciphertext plus X25519");
+  t.eqI32(hybridSecretLen(), 64, "the shared secret is two 32-byte halves");
+  return t.report();
+}
+
+export string test_both_sides_reach_the_same_secret() {
+  T t = T.create();
+  u8[] offer = hybridClientOffer(pattern(64, 1), pattern(32, 2));
+  t.eqI32(offer.len(), hybridClientShareLen() + DK_LEN, "the offer carries its own decap key");
+
+  u8[] share = slice(offer, 0, hybridClientShareLen());
+  u8[] accepted = hybridServerAccept(share, pattern(32, 4), pattern(32, 3));
+  t.eqI32(accepted.len(), hybridServerShareLen() + hybridSecretLen(), "accept returns share and secret");
+
+  u8[] serverSecret = slice(accepted, hybridServerShareLen(), accepted.len());
+  u8[] clientSecret = hybridClientFinish(offer, slice(accepted, 0, hybridServerShareLen()),
+                                         pattern(32, 2));
+  t.eqBytes(clientSecret, serverSecret, "the two sides agree");
+  return t.report();
+}
+
+export string test_the_secret_depends_on_both_halves() {
+  // The property the whole construction exists for, and the one a round trip cannot see.
+  // An implementation that concatenated the ML-KEM secret with a constant, or dropped the
+  // X25519 half entirely, would agree with itself perfectly and be exactly as strong as
+  // the half it kept.
+  T t = T.create();
+  u8[] offer = hybridClientOffer(pattern(64, 5), pattern(32, 6));
+  u8[] share = slice(offer, 0, hybridClientShareLen());
+
+  u8[] base = slice(hybridServerAccept(share, pattern(32, 8), pattern(32, 7)),
+                    hybridServerShareLen(), hybridServerShareLen() + hybridSecretLen());
+
+  // Change only the ML-KEM randomness: the first half must move, the second must not,
+  // because neither X25519 key changed.
+  u8[] otherM = slice(hybridServerAccept(share, pattern(32, 9), pattern(32, 7)),
+                      hybridServerShareLen(), hybridServerShareLen() + hybridSecretLen());
+  t.isFalse(sameBytes(slice(base, 0, 32), slice(otherM, 0, 32)),
+            "a different ML-KEM message moves the ML-KEM half");
+  t.isTrue(sameBytes(slice(base, 32, 64), slice(otherM, 32, 64)),
+           "and leaves the X25519 half alone");
+
+  // Change only the server's X25519 key: the reverse.
+  u8[] otherX = slice(hybridServerAccept(share, pattern(32, 8), pattern(32, 10)),
+                      hybridServerShareLen(), hybridServerShareLen() + hybridSecretLen());
+  t.isFalse(sameBytes(slice(base, 32, 64), slice(otherX, 32, 64)),
+            "a different X25519 key moves the X25519 half");
+  t.isTrue(sameBytes(slice(base, 0, 32), slice(otherX, 0, 32)),
+           "and leaves the ML-KEM half alone");
+  return t.report();
+}
+
+export string test_ml_kem_comes_first_in_both_directions() {
+  // A fact about the registry rather than a principle: SecP256r1MLKEM768 puts its ECDHE
+  // half first. So it is pinned positionally, not inferred from a round trip that agrees
+  // with itself.
+  T t = T.create();
+  u8[] a = hybridClientOffer(pattern(64, 11), pattern(32, 12));
+  u8[] b = hybridClientOffer(pattern(64, 11), pattern(32, 13));
+  t.eqBytes(slice(a, 0, EK_LEN), slice(b, 0, EK_LEN),
+            "changing the X25519 scalar leaves the ML-KEM key untouched");
+  t.isFalse(sameBytes(slice(a, EK_LEN, hybridClientShareLen()),
+                      slice(b, EK_LEN, hybridClientShareLen())),
+            "and does move the X25519 key that follows it");
+
+  u8[] share = slice(a, 0, hybridClientShareLen());
+  u8[] p = hybridServerAccept(share, pattern(32, 14), pattern(32, 15));
+  u8[] q = hybridServerAccept(share, pattern(32, 14), pattern(32, 16));
+  t.eqBytes(slice(p, 0, CT_LEN), slice(q, 0, CT_LEN),
+            "changing the server's X25519 key leaves the ciphertext untouched");
+  t.isFalse(sameBytes(slice(p, CT_LEN, hybridServerShareLen()),
+                      slice(q, CT_LEN, hybridServerShareLen())),
+            "and does move its public key");
+  return t.report();
+}
+
+export string test_a_tampered_share_gives_a_different_secret_not_an_error() {
+  // ML-KEM's implicit rejection, carried up through the hybrid. Decapsulating a bad
+  // ciphertext must return some other secret rather than reporting failure — reporting it
+  // would hand an attacker a decryption oracle — so tampering surfaces later, as a
+  // Finished that does not verify.
+  //
+  // This is the one place where "it does not trap" is the assertion, and wac can make it:
+  // a trap here would fail the test by unwinding, which is the outcome we are forbidding.
+  T t = T.create();
+  u8[] offer = hybridClientOffer(pattern(64, 17), pattern(32, 18));
+  u8[] share = slice(offer, 0, hybridClientShareLen());
+  u8[] accepted = hybridServerAccept(share, pattern(32, 19), pattern(32, 20));
+  u8[] serverShare = slice(accepted, 0, hybridServerShareLen());
+  u8[] good = hybridClientFinish(offer, serverShare, pattern(32, 18));
+
+  i32[] spots = i32[](0, CT_LEN - 1, CT_LEN, hybridServerShareLen() - 1);
+  for (i32 k = 0; k < spots.len(); k++) {
+    u8[] bad = u8[serverShare.len()]();
+    for (i32 i = 0; i < bad.len(); i++) { bad[i] = serverShare[i]; }
+    bad[spots[k]] = bad[spots[k]] ^ 1;
+    u8[] got = hybridClientFinish(offer, bad, pattern(32, 18));
+    t.isFalse(sameBytes(got, good),
+              "tampering at byte " + itoa64(spots[k] as i64) + " changes the secret");
+  }
+  return t.report();
+}
