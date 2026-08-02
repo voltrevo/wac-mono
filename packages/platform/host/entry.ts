@@ -28,6 +28,7 @@ export type AppModule = {
   Core: { of(...a: unknown[]): unknown };
   Cli: { of(...a: unknown[]): unknown };
   FileResult: { of(...a: unknown[]): unknown };
+  Stat: { of(...a: unknown[]): unknown };
   main: (core: unknown, cli: unknown) => number;
 };
 

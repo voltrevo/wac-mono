@@ -22,6 +22,27 @@ export type DenoWorldOptions = {
 
 const EMPTY = new Uint8Array(0);
 
+/** All of standard input. Deno needs no permission for this, and neither does the world. */
+async function readAllStdin(): Promise<Uint8Array> {
+  const parts: Uint8Array[] = [];
+  const buf = new Uint8Array(65536);
+  for (;;) {
+    const n = await Deno.stdin.read(buf);
+    if (n === null) break;
+    parts.push(buf.slice(0, n));
+  }
+  const total = parts.reduce((a, p) => a + p.length, 0);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  return out;
+}
+
+async function writeAllStdout(bytes: Uint8Array): Promise<void> {
+  let at = 0;
+  while (at < bytes.length) at += await Deno.stdout.write(bytes.subarray(at));
+}
+
 /**
  * The handler table for Deno.
  *
@@ -30,6 +51,12 @@ const EMPTY = new Uint8Array(0);
  * application cannot tell the difference between a capability the host declined and one
  * that failed, which is the correct amount for it to know.
  */
+async function denoDir(path: string): Promise<string[]> {
+  const names: string[] = [];
+  for await (const e of Deno.readDir(path)) names.push(e.name);
+  return names.sort();
+}
+
 export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   const args = opts.args ?? [];
   const log = opts.log ?? ((l: string) => console.log(l));
@@ -66,6 +93,31 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     [OP.READ_FILE]: async (p) => {
       if (!opts.fs?.read) deny("filesystem read");
       return await Deno.readFile(unstr(p));
+    },
+
+    // stdin and stdout need no grant: what the user pipes in and what the program prints
+    // are the user's own doing, not a reach into something they did not offer.
+    [OP.READ_STDIN]: async () => await readAllStdin(),
+    [OP.WRITE_STDOUT]: async (p) => { await writeAllStdout(p); return EMPTY; },
+
+    [OP.STAT]: async (p) => {
+      const out = new Uint8Array(19);
+      const dv = new DataView(out.buffer);
+      if (!opts.fs?.read) return out; // not granted reads as "does not exist"
+      try {
+        const st = await Deno.stat(unstr(p));
+        out[0] = 1;
+        out[1] = st.isFile ? 1 : 0;
+        out[2] = st.isDirectory ? 1 : 0;
+        dv.setBigInt64(3, BigInt(st.size), true);
+        dv.setBigInt64(11, BigInt(st.mtime?.getTime() ?? 0), true);
+      } catch { /* absent, and the zeroes say so */ }
+      return out;
+    },
+    [OP.READ_DIR]: async (p) => {
+      if (!opts.fs?.read) deny("filesystem read");
+      const names = await denoDir(unstr(p));
+      return str(names.join("\u0000"));
     },
     [OP.WRITE_FILE]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");

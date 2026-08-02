@@ -1,0 +1,79 @@
+// A filter: bytes in, bytes out. `hexdump < file` or `hexdump file`.
+//
+// It exists to exercise the two capabilities `wc` cannot: reading standard input when
+// there is no argument, and writing *bytes* rather than lines. `log` appends a newline and
+// assumes text, so a program whose output is exact — a compressor, an encoder, this —
+// could not be written before `write`.
+//
+// Also `stat` and `readDir`: given a directory it lists it, which is what turns a
+// file-shaped tool into one that can walk a tree.
+
+import { Cli, Core, FileResult, Stat } from "../src/platform.wac";
+
+export i32 main(Core core, Cli cli) {
+  u8[] data = u8[0]();
+
+  if (cli.argCount() < 1) {
+    data = cli.readStdin();
+  } else {
+    string path = cli.arg(0);
+    Stat st = cli.stat(path);
+    if (!st.exists) {
+      core.warn("hexdump: " + path + ": not found");
+      return 1;
+    }
+    if (st.isDir) {
+      // A directory is not bytes, so list it instead — and prove `readDir` works.
+      string[]? names = cli.readDir(path);
+      if (names is null) {
+        core.warn("hexdump: " + path + ": cannot list");
+        return 1;
+      }
+      string[] found = names!;
+      for (i32 i = 0; i < found.len(); i++) { core.log(found[i]); }
+      return 0;
+    }
+    FileResult f = cli.readFile(path);
+    if (!f.ok) {
+      core.warn("hexdump: " + path + ": " + f.error);
+      return 1;
+    }
+    data = f.bytes;
+  }
+
+  cli.write(dump(data));
+  return 0;
+}
+
+const u8[] HEX = u8[]('0', '1', '2', '3', '4', '5', '6', '7',
+                      '8', '9', 'a', 'b', 'c', 'd', 'e', 'f');
+
+/** `xxd`-style: an offset, sixteen bytes in hex, then the printable ones. */
+u8[] dump(u8[] data) {
+  i32 rows = (data.len() + 15) / 16;
+  // 8 offset + 2 space + 16*3 hex + 1 space + 16 chars + 1 newline
+  i32 width = 8 + 2 + 48 + 1 + 16 + 1;
+  u8[] out = u8[rows * width](fill: ' ');
+  for (i32 r = 0; r < rows; r++) {
+    i32 at = r * width;
+    i32 base = r * 16;
+    hex32(out, at, base);
+    for (i32 i = 0; i < 16; i++) {
+      i32 k = base + i;
+      if (k >= data.len()) { break; }
+      i32 b = data[k];
+      out[at + 10 + i * 3] = HEX[(b >> 4) & 15];
+      out[at + 11 + i * 3] = HEX[b & 15];
+      out[at + 59 + i] = b >= 32 && b < 127 ? b : '.';
+    }
+    out[at + width - 1] = '\n';
+  }
+  return out;
+}
+
+/** Eight hex digits of `v`, big-endian, at `at`. */
+void hex32(u8[] out, i32 at, i32 v) {
+  for (i32 i = 0; i < 8; i++) {
+    out[at + i] = HEX[(v >> ((7 - i) * 4)) & 15];
+  }
+}

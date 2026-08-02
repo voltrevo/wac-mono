@@ -14,6 +14,14 @@ import { type Handlers } from "./respond.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { OP } from "./ops.ts";
 
+/** Node's pieces, described rather than imported, so this file checks under Deno. */
+export type NodeIo = {
+  readStdin(): Promise<Uint8Array>;
+  writeStdout(bytes: Uint8Array): Promise<void>;
+  stat(path: string): Promise<{ isFile: boolean; isDirectory: boolean; size: number; mtimeMillis: number }>;
+  readDir(path: string): Promise<string[]>;
+};
+
 export type NodeWorldOptions = {
   args?: string[];
   log?(line: string): void;
@@ -31,7 +39,12 @@ type NodeFs = {
   writeFile(path: string, data: Uint8Array): Promise<void>;
 };
 
-export function nodeWorld(fs: NodeFs, proc: NodeProcess, opts: NodeWorldOptions = {}): Handlers {
+export function nodeWorld(
+  fs: NodeFs,
+  proc: NodeProcess,
+  io: NodeIo,
+  opts: NodeWorldOptions = {},
+): Handlers {
   const args = opts.args ?? proc.argv.slice(2);
   const log = opts.log ?? ((l: string) => console.log(l));
   const warn = opts.warn ?? ((l: string) => console.error(l));
@@ -73,6 +86,31 @@ export function nodeWorld(fs: NodeFs, proc: NodeProcess, opts: NodeWorldOptions 
       // Node hands back a Buffer, which is a Uint8Array — but a *view* into a pooled
       // allocation, so it is copied rather than parked in the bridge as it came.
       return new Uint8Array(await fs.readFile(unstr(p)));
+    },
+
+    // stdin and stdout need no grant: what the user pipes in and what the program prints
+    // are the user's own doing, not a reach into something they did not offer.
+    [OP.READ_STDIN]: async () => await io.readStdin(),
+    [OP.WRITE_STDOUT]: async (p) => { await io.writeStdout(p); return EMPTY; },
+
+    [OP.STAT]: async (p) => {
+      const out = new Uint8Array(19);
+      const dv = new DataView(out.buffer);
+      if (!opts.fs?.read) return out; // not granted reads as "does not exist"
+      try {
+        const st = await io.stat(unstr(p));
+        out[0] = 1;
+        out[1] = st.isFile ? 1 : 0;
+        out[2] = st.isDirectory ? 1 : 0;
+        dv.setBigInt64(3, BigInt(st.size), true);
+        dv.setBigInt64(11, BigInt(st.mtimeMillis ?? 0), true);
+      } catch { /* absent, and the zeroes say so */ }
+      return out;
+    },
+    [OP.READ_DIR]: async (p) => {
+      if (!opts.fs?.read) deny("filesystem read");
+      const names = await io.readDir(unstr(p));
+      return str(names.join("\u0000"));
     },
     [OP.WRITE_FILE]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");
