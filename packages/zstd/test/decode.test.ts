@@ -296,3 +296,29 @@ Deno.test("a frame that needs a dictionary is refused, not guessed at", async ()
   }
   if (!refused) throw new Error("a frame declaring a dictionary id was decoded anyway");
 });
+
+// Overlapping matches — a match whose offset is shorter than its length, so the copy reads bytes
+// it is itself writing. That is how zstd spells a run, and it is the one case where the bulk move
+// in `Buf.pushRepeat` must not be used.
+//
+// This exists because the corpus above contains no overlapping match at all: every frame in it
+// decoded correctly while `pushRepeat`'s bounds guard was outright wrong. Data that forces the
+// case has to be built deliberately, since ordinary text rarely repeats at distance 1.
+Deno.test("a match that overlaps what it is writing", async () => {
+  const inputs = [
+    new Uint8Array(70000).fill(65),                              // offset 1, one long run
+    new Uint8Array(60000).map((_, i) => 97 + (i % 3)),           // offset 3
+    new Uint8Array(50000).map((_, i) => 88 + (i % 2)),           // offset 2
+    // A run broken up, so runs and ordinary matches alternate within one block.
+    (() => {
+      const a = new Uint8Array(40000).fill(7);
+      for (let i = 0; i < a.length; i += 997) a[i] = i & 255;
+      return a;
+    })(),
+  ];
+  const frames = await compress(inputs);
+  for (let i = 0; i < inputs.length; i++) {
+    const at = same(mod.decompress(frames[i]), inputs[i]);
+    if (at !== -2) throw new Error(`overlapping case ${i} decoded wrongly at byte ${at}`);
+  }
+});
