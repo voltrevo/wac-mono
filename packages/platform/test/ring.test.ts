@@ -68,15 +68,19 @@ const slowHandlers = {
 };
 
 Deno.test("submitting does not block, and calls overlap", async () => {
-  // Three calls of 120ms each. Serially that is 360ms; overlapped it is a little over 120.
-  // The threshold is deliberately loose — this is a claim about concurrency, not a
-  // benchmark, and a tight bound would be flaky on a busy machine.
+  // Three calls of 200ms each: 600ms serially, a little over 200 overlapped. The bound is
+  // 450, which leaves better than two times headroom above the overlapped time and still
+  // could not be met serially.
+  //
+  // Sized that way after a tighter version (120ms units, a 300ms bound) failed once in a
+  // full run and never again in eight. This machine has other agents on it; a timing test
+  // whose margin is smaller than the load it competes with is a coin toss, not a test.
   const out = await onWorker(
     `
       const t0 = Date.now();
-      const a = submit(b, ${SLOW}, i32le(120));
-      const c = submit(b, ${SLOW}, i32le(120));
-      const d = submit(b, ${SLOW}, i32le(120));
+      const a = submit(b, ${SLOW}, i32le(200));
+      const c = submit(b, ${SLOW}, i32le(200));
+      const d = submit(b, ${SLOW}, i32le(200));
       const submitMs = Date.now() - t0;
       const anyDone = isDone(b, a) || isDone(b, c) || isDone(b, d);
       const vals = [collect(b, a), collect(b, c), collect(b, d)].map((r) => readI32le(r));
@@ -85,10 +89,10 @@ Deno.test("submitting does not block, and calls overlap", async () => {
     slowHandlers,
   ) as { submitMs: number; anyDone: boolean; vals: string; totalMs: number };
 
-  assertEquals(out.submitMs < 50, true, `submitting blocked for ${out.submitMs}ms`);
+  assertEquals(out.submitMs < 100, true, `submitting blocked for ${out.submitMs}ms`);
   assertEquals(out.anyDone, false, "nothing can be done immediately after submitting");
-  assertEquals(out.vals, "120,120,120", "each ticket got its own answer");
-  assertEquals(out.totalMs < 300, true, `took ${out.totalMs}ms; serial would be ~360`);
+  assertEquals(out.vals, "200,200,200", "each ticket got its own answer");
+  assertEquals(out.totalMs < 450, true, `took ${out.totalMs}ms; serial would be ~600`);
 });
 
 Deno.test("waitAny returns whichever finishes first, whatever the order they were sent", async () => {
@@ -152,8 +156,9 @@ Deno.test("cancel frees the slot and the answer is discarded", async () => {
     slowHandlers,
   ) as { cancelMs: number; after: number };
   assertEquals(out.after, 1, "the bridge still works after cancels");
-  // Eight cancels through four slots: some waited for a slot, none waited for all the work.
-  assertEquals(out.cancelMs < 400, true, `cancelling took ${out.cancelMs}ms`);
+  // Eight cancels of 80ms work through four slots: the second four wait only for a slot
+  // to free, not for all the work. Serial would be 640ms.
+  assertEquals(out.cancelMs < 500, true, `cancelling took ${out.cancelMs}ms`);
 });
 
 Deno.test("an error in one slot does not disturb the others", async () => {
