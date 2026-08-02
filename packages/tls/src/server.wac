@@ -155,7 +155,7 @@ export u8[] tlsServerInit(u8[] certDer, u8[] seed, u8[] ephemeralPriv, u8[] serv
 
 /** Give up before any key exists: an alert in the clear, and the connection is done. */
 u8[] failPlain(Conn c, i32 desc) {
-  c.phase = 3;
+  c.phase = phaseFailed();
   return plaintextAlert(desc);
 }
 
@@ -304,7 +304,7 @@ u8[] serverFlight(Conn c, u8[] clientHelloMsg) {
 
   c.clientSecret = clientHs;
   c.seqIn = 0;
-  c.phase = 1;
+  c.phase = phaseWaitFinished();
   return out.take();
 }
 
@@ -352,14 +352,14 @@ export u8[] tlsServerFeed(u8[] state, u8[] input) {
     // so counting it would desynchronise every record after it.
     if (outerType == typeChangeCipherSpec()) { continue; }
 
-    if (c.phase == 0) {
+    if (c.phase == phaseStart()) {
       if (outerType != typeHandshake()) { trap; }
       u8[] body = u8[recLen]();
       for (i32 i = 0; i < recLen; i++) { body[i] = record[5 + i]; }
       if (messageLength(body) != body.len()) { trap; }
       if (messageType(body) != 1) { trap; }
       toSend.bytes(serverFlight(c, body));
-    } else if (c.phase == 1) {
+    } else if (c.phase == phaseWaitFinished()) {
       u8[] inner = openWith(c, record);
       if (recordType(inner) != typeHandshake()) { trap; }
       u8[] msg = recordContent(inner);
@@ -376,7 +376,7 @@ export u8[] tlsServerFeed(u8[] state, u8[] input) {
         // The record decrypted, so the keys agree; what failed is the proof that both
         // sides saw the same handshake.
         sealInto(toSend, c, typeAlert(), alertBody(alertDecryptError()));
-        c.phase = 3;
+        c.phase = phaseFailed();
         return result(c, toSend.take(), appData.take());
       }
 
@@ -386,14 +386,14 @@ export u8[] tlsServerFeed(u8[] state, u8[] input) {
       c.serverSecret = c.serverAppSecret;
       c.seqIn = 0;
       c.seqOut = 0;
-      c.phase = 2;
-    } else if (c.phase == 2) {
+      c.phase = phaseEstablished();
+    } else if (c.phase == phaseEstablished()) {
       u8[] inner = openWith(c, record);
       i32 t = recordType(inner);
       if (t == typeApplicationData()) {
         appData.bytes(recordContent(inner));
       } else if (t == typeAlert()) {
-        c.phase = 3;
+        c.phase = phaseFailed();
       } else if (t == typeHandshake()) {
         u8[] msg = recordContent(inner);
         if (messageType(msg) == 24) {
@@ -404,7 +404,7 @@ export u8[] tlsServerFeed(u8[] state, u8[] input) {
           u8[] body = messageBody(msg);
           if (body.len() != 1) {
             sealInto(toSend, c, typeAlert(), alertBody(alertIllegalParameter()));
-            c.phase = 3;
+            c.phase = phaseFailed();
             return result(c, toSend.take(), appData.take());
           }
           c.clientSecret = nextTrafficSecret(c.clientSecret);
@@ -473,12 +473,12 @@ export i32 tlsRecordNeeded(u8[] buf) {
 export u8[] tlsServerClose(u8[] state) {
   Conn c = decodeConn(state);
   Writer out = Writer.create();
-  if (c.phase == 2 || c.phase == 1) {
+  if (c.phase == phaseEstablished() || c.phase == phaseWaitFinished()) {
     sealInto(out, c, typeAlert(), alertBody(alertCloseNotify()));
-  } else if (c.phase == 0) {
+  } else if (c.phase == phaseStart()) {
     out.bytes(plaintextAlert(alertCloseNotify()));
   }
-  c.phase = 3;
+  c.phase = phaseFailed();
   return result(c, out.take(), u8[0]());
 }
 
@@ -486,11 +486,11 @@ export u8[] tlsServerClose(u8[] state) {
 export u8[] tlsServerAlert(u8[] state, i32 desc) {
   Conn c = decodeConn(state);
   Writer out = Writer.create();
-  if (c.phase == 1 || c.phase == 2) {
+  if (c.phase == phaseWaitFinished() || c.phase == phaseEstablished()) {
     sealInto(out, c, typeAlert(), alertBody(desc));
   } else {
     out.bytes(plaintextAlert(desc));
   }
-  c.phase = 3;
+  c.phase = phaseFailed();
   return result(c, out.take(), u8[0]());
 }
