@@ -10,9 +10,12 @@ The consensus is verified before any of that happens: a majority of the director
 authorities must have signed it, checked against identity fingerprints the caller supplies
 out of band, and it must be inside its validity window.
 
-It is still **not an anonymity tool** and should not be pointed at the real network. It has
-no flow control (issue 0013) and picks its path from whatever list it is handed rather than
-by bandwidth-weighted selection with guards.
+Flow control works, including authenticated SENDMEs: 1.2MB over 209 streams on one circuit,
+2.5x the circuit window.
+
+It is still **not an anonymity tool** and should not be pointed at the real network. It
+picks its path from whatever list it is handed rather than by bandwidth-weighted selection
+with guards, and that is the gap that matters most.
 
 ## Why this is possible at all
 
@@ -128,8 +131,10 @@ of those two kinds it is.
 allowlist is by domain, so they answer 403; torproject.org is blocked outright. Everything
 here is verified offline or against a locally built tor.
 
-**Flow control** (issue 0013). No SENDMEs are sent, so a response over about 249KB stops
-and the read hangs rather than failing.
+**Concurrent read and write past the send window.** `#spend` throws rather than blocking if
+the send window empties while a cell is waiting to be read, since draining the read side
+mid-write would reorder what the caller sees. A client that uploads more than 1000 cells
+while reading needs a proper reader loop; one that fetches does not.
 
 **Path selection, guards, and everything about *choosing* a circuit.** A real client weights
 by bandwidth, pins a guard so it is not resampling its first hop every circuit, and avoids

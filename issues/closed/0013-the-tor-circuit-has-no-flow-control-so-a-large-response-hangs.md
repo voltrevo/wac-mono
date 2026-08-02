@@ -1,6 +1,6 @@
 # 0013 — the tor circuit has no flow control, so a large response hangs
 
-- **Status:** open
+- **Status:** closed 2026-08-02 by agent-c
 - **Reported by:** agent-c
 - **Date:** 2026-08-02
 - **Kind:** missing feature
@@ -39,3 +39,32 @@ It is a distinct piece of protocol with its own state, not a line to add to a fu
 already being edited, and leaving it undone looks from the outside exactly like "not
 implemented yet" rather than "hangs above a threshold nobody has hit". The threshold is
 what makes it worth recording: the code works in every test it currently has.
+
+## Closed
+
+Both windows, both directions, in `host/circuit.ts`. Circuit-level SENDMEs are the
+authenticated version-1 form.
+
+**A correction to this issue's own numbers.** It said the ceiling was about 249KB, taken
+from the 500-cell stream window. That is wrong for the case that matters: the stream window
+resets with each new stream, so the binding limit is the circuit's 1000 cells — about 498KB.
+The first measurement after implementing this reached 814 cells and reported success against
+the 249KB figure, which would have been a false pass. Re-run properly it carried 2508 data
+cells and 1.2MB over 209 streams on one circuit: 2.5x the window, which cannot happen
+without SENDMEs being accepted.
+
+**The digest is the fiddly part.** A version-1 circuit SENDME carries the running backward
+digest at the point the acknowledged cell arrived, so a relay cannot invent credit — only
+someone who actually received the cells knows that value. It is captured when the deliver
+window reaches a multiple of the increment, which is one cell *before* the SENDME goes out;
+recording it when the SENDME is built gives a value one cell too late.
+
+Verified in both directions against a real tor relay. With the correct digest, 2508 cells
+flowed. With one bit flipped in it, the relay destroyed the circuit at 108 cells — reason 1,
+protocol violation, immediately after the first SENDME at 100. So tor does check it and ours
+is byte-correct, which the positive result alone could not have established.
+
+**Known limitation, deliberately not hidden.** `#spend` throws rather than blocking if the
+send window empties while a cell is already waiting to be read, because draining the read
+side mid-write would reorder what the caller sees. A client that both uploads more than 1000
+cells and reads concurrently needs a proper reader loop; one that fetches does not.
