@@ -31,6 +31,10 @@ export enum Kind {
   Less,
   Great,
   DGreat,
+  LParen,
+  RParen,
+  /** `;;` — ends a `case` arm. */
+  DSemi,
   Newline,
   Eof,
   /** The input ended inside a quote. */
@@ -121,7 +125,17 @@ export Vec<Token> tokenize(string src) {
       else { out.push(Token.of(Kind.Amp)); at++; }
       continue;
     }
-    if (c == 0x3b) { out.push(Token.of(Kind.Semi)); at++; continue; }     // ';'
+    if (c == 0x3b) {                                        // ';'
+      if (at + 1 < s.len() && s[at + 1] == 0x3b) { out.push(Token.of(Kind.DSemi)); at += 2; }
+      else { out.push(Token.of(Kind.Semi)); at++; }
+      continue;
+    }
+    // Parentheses are operators, not word characters. They were delimiters and nothing else,
+    // so `lexWord` stopped on one without consuming it and `tokenize` looped for ever building
+    // empty words — `echo (` ran until the heap gave out. A delimiter that no branch consumes is
+    // an infinite loop by construction, which is why every one of them now has a case here.
+    if (c == 0x28) { out.push(Token.of(Kind.LParen)); at++; continue; }   // '('
+    if (c == 0x29) { out.push(Token.of(Kind.RParen)); at++; continue; }   // ')'
     if (c == 0x3c) { out.push(Token.of(Kind.Less)); at++; continue; }     // '<'
     if (c == 0x3e) {                                        // '>'
       if (at + 1 < s.len() && s[at + 1] == 0x3e) { out.push(Token.of(Kind.DGreat)); at += 2; }
@@ -156,6 +170,12 @@ export Vec<Token> tokenize(string src) {
     Token word = Token.of(Kind.Word);
     i32 next = lexWord(s, at, word);
     if (next < 0) {
+      out.push(Token.of(Kind.Bad));
+      return out;
+    }
+    // Belt and braces after the parenthesis bug: a word that consumes nothing cannot happen now,
+    // and if it ever does again this ends the scan instead of spinning.
+    if (next <= at) {
       out.push(Token.of(Kind.Bad));
       return out;
     }

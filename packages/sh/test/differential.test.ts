@@ -185,12 +185,29 @@ async function bash(script: string) {
   return { stdout: new TextDecoder().decode(r.stdout), code: r.code };
 }
 
-async function wacsh(script: string) {
+/**
+ * The shell, built once as a standalone program.
+ *
+ * Not `deno task app` per script: that builds every time *and* spawns the result as a child, so a
+ * hundred and thirty scripts become several hundred nested processes. This container ran out of
+ * process ids once already today for a related reason — see wac-mono 0017 — and the build is the
+ * slow part regardless.
+ */
+const wacshBinary = await (async () => {
+  const out = await Deno.makeTempFile({ prefix: "wacsh-" });
   const r = await new Deno.Command("deno", {
     args: [
-      "run", "-A", "packages/platform/app.ts", "packages/sh/src/sh.wac",
-      "--allow-read", "--allow-env", "--", "-c", script,
+      "run", "-A", "packages/platform/build.ts", "packages/sh/src/sh.wac",
+      "--allow-read", "--allow-write", "--allow-env", "-o", out,
     ],
+  }).output();
+  if (!r.success) throw new Error(`building sh failed: ${new TextDecoder().decode(r.stderr)}`);
+  return out;
+})();
+
+async function wacsh(script: string) {
+  const r = await new Deno.Command(wacshBinary, {
+    args: ["-c", script],
     env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin", HOME: Deno.env.get("HOME") ?? "" },
     clearEnv: false,
   }).output();
@@ -231,7 +248,7 @@ Deno.test({
         }
       }
     }
-    await Promise.all(Array.from({ length: 8 }, () => worker()));
+    await Promise.all(Array.from({ length: 4 }, () => worker()));
     if (differences.length > 0) {
       throw new Error(`${differences.length} of ${CASES.length} scripts differ from bash:\n\n` +
                       differences.join("\n\n"));
