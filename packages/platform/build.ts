@@ -111,10 +111,10 @@ export async function buildApp(
         "launcher",
         `import { runLauncherNode } from "${nodeRuntime}";\n` +
           `import * as wt from "node:worker_threads";\n` +
-          `import { readFile, writeFile, stat, readdir, mkdir, rm, rename } from "node:fs/promises";\n` +
+          `import { readFile, writeFile, stat, readdir, mkdir, rm, rename, open } from "node:fs/promises";\n` +
           `await runLauncherNode(\n` +
           `  wt as unknown as Parameters<typeof runLauncherNode>[0],\n` +
-          `  { readFile, writeFile, stat, readdir, mkdir, rm, rename } as unknown as Parameters<typeof runLauncherNode>[1],\n` +
+          `  { readFile, writeFile, stat, readdir, mkdir, rm, rename, open } as unknown as Parameters<typeof runLauncherNode>[1],\n` +
           `  process as unknown as Parameters<typeof runLauncherNode>[2],\n` +
           `  ${JSON.stringify(workerSource)},\n` +
           `  ${JSON.stringify(grants)},\n` +

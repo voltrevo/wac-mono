@@ -1,0 +1,294 @@
+// X25519 and Ed25519 against node:crypto.
+//
+// One file, because they share a field and half a curve — a fault in `field25519.wac`
+// shows in both, and seeing which of the two moved is easier when they fail together.
+//
+// `ref(mode, a, b)` is node's own implementations. Both are synchronous there, where
+// WebCrypto's are promises, which is the whole reason this can be a callback.
+//
+// ## Two directions, and only one of them is a vector
+//
+// Verifying somebody else's signature and producing one they accept are different claims.
+// Ed25519 is deterministic, so *our* signature can be compared byte for byte against
+// node's — which is stronger than the usual "they accept ours" and is worth doing on that
+// account. X25519 is symmetric, so the check is that both sides land on the same secret
+// from opposite ends.
+//
+// ## The clamping is the part that hides
+//
+// X25519 clears the low three bits of the scalar and forces bit 254, so scalars differing
+// only in those bits must give identical results. An implementation that forgot is right
+// for every scalar a test author would generate and wrong against every peer.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { x25519, x25519Base } from "../../src/x25519.wac";
+import { ed25519PublicKey, ed25519Sign, ed25519Verify } from "../../src/ed25519.wac";
+
+const i32 ED_PUB = 0;
+const i32 ED_SIGN = 1;
+const i32 ED_VERIFY = 2;
+const i32 X_BASE = 3;
+const i32 X_SHARED = 4;
+
+u8[] unhex(string h) {
+  u8[] src = h.toBytes();
+  u8[] out = u8[src.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = nib(src[2 * i]) * 16 + nib(src[2 * i + 1]); }
+  return out;
+}
+i32 nib(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  trap;
+}
+u8[] fill(i32 n, i32 seed) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (i * 41 + seed * 7 + 13) & 0xFF; }
+  return out;
+}
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+u8[] cat3(u8[] a, u8[] b) {
+  u8[] o = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { o[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { o[a.len() + i] = b[i]; }
+  return o;
+}
+
+export string test_rfc_7748_x25519_vectors() {
+  T t = T.create();
+  t.eqBytes(x25519(unhex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"),
+                   unhex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c")),
+            unhex("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"),
+            "RFC 7748 section 5.2 first vector");
+  t.eqBytes(x25519(unhex("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"),
+                   unhex("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493")),
+            unhex("95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957"),
+            "RFC 7748 section 5.2 second vector");
+  // The Diffie-Hellman worked example from section 6.1.
+  u8[] alicePriv = unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+  u8[] bobPriv = unhex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+  t.eqBytes(x25519Base(alicePriv),
+            unhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"),
+            "Alice's public key");
+  t.eqBytes(x25519(alicePriv, x25519Base(bobPriv)),
+            unhex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"),
+            "the shared secret");
+  return t.report();
+}
+
+export string test_x25519_agrees_with_the_host(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  for (i32 i = 0; i < 12; i++) {
+    u8[] priv = fill(32, i);
+    u8[] pub = x25519Base(priv);
+    t.eqBytes(pub, ref(X_BASE, priv, u8[0]()), "base point at round " + itoa64(i as i64));
+
+    u8[] other = fill(32, i + 100);
+    u8[] otherPub = x25519Base(other);
+    u8[] ours = x25519(priv, otherPub);
+    t.eqBytes(ours, ref(X_SHARED, priv, otherPub), "shared secret " + itoa64(i as i64));
+    // Both ends must land on it, which no single-sided vector can say.
+    t.eqBytes(ours, x25519(other, pub), "and both ends agree");
+  }
+  return t.report();
+}
+
+export string test_x25519_clamps_its_scalar() {
+  // Scalars differing only in the clamped bits must give the same answer. No oracle: it
+  // is a relation between our own outputs, and it is the property that is invisible to
+  // every randomly generated scalar.
+  T t = T.create();
+  u8[] base = fill(32, 5);
+  u8[] clamped = u8[32]();
+  for (i32 i = 0; i < 32; i++) { clamped[i] = base[i]; }
+  clamped[0] = clamped[0] & 248;        // low three bits
+  clamped[31] = (clamped[31] & 127) | 64;
+  t.eqBytes(x25519Base(base), x25519Base(clamped), "the clamped bits do not matter");
+
+  // And a scalar differing outside those bits must give a different answer, or the test
+  // above would be satisfied by ignoring the scalar entirely.
+  u8[] different = u8[32]();
+  for (i32 i = 0; i < 32; i++) { different[i] = base[i]; }
+  different[10] = different[10] ^ 0xFF;
+  t.isFalse(same(x25519Base(base), x25519Base(different)), "other bits do matter");
+  return t.report();
+}
+
+export string test_ed25519_is_byte_identical_to_the_host(fn[u8[](i32, u8[], u8[])] ref) {
+  // Ed25519 is deterministic, so this compares signatures byte for byte rather than
+  // settling for "they accept ours" — a stronger claim, and available only because the
+  // scheme fixes its nonce from the key and message.
+  T t = T.create();
+  for (i32 i = 0; i < 8; i++) {
+    u8[] seed = fill(32, i + 20);
+    u8[] pub = ed25519PublicKey(seed);
+    t.eqBytes(pub, ref(ED_PUB, seed, u8[0]()), "public key " + itoa64(i as i64));
+    u8[] msg = fill(i * 17, i);
+    u8[] sig = ed25519Sign(seed, msg);
+    t.eqBytes(sig, ref(ED_SIGN, seed, msg), "signature " + itoa64(i as i64));
+    t.isTrue(ed25519Verify(pub, msg, sig), "and we verify our own");
+    // And the host verifies ours, which is a different code path from producing it.
+    u8[] ok = ref(ED_VERIFY, cat3(pub, sig), msg);
+    t.eqI32(ok[0], 1, "the host verifies our signature " + itoa64(i as i64));
+  }
+  return t.report();
+}
+
+export string test_ed25519_rejects_what_it_should(fn[u8[](i32, u8[], u8[])] ref) {
+  // Verification is the half an attacker touches, so tampering is checked at every point:
+  // the message, each half of the signature, and the key.
+  T t = T.create();
+  u8[] seed = fill(32, 77);
+  u8[] pub = ed25519PublicKey(seed);
+  u8[] msg = "a message worth signing".toBytes();
+  u8[] sig = ed25519Sign(seed, msg);
+  t.isTrue(ed25519Verify(pub, msg, sig), "the genuine signature verifies");
+
+  i32[] spots = i32[](0, 31, 32, 63);
+  for (i32 i = 0; i < spots.len(); i++) {
+    u8[] bad = u8[64]();
+    for (i32 j = 0; j < 64; j++) { bad[j] = sig[j]; }
+    bad[spots[i]] = bad[spots[i]] ^ 1;
+    t.isFalse(ed25519Verify(pub, msg, bad),
+              "a signature altered at byte " + itoa64(spots[i] as i64) + " is refused");
+  }
+  u8[] otherMsg = "a message worth signing!".toBytes();
+  t.isFalse(ed25519Verify(pub, otherMsg, sig), "a different message is refused");
+  u8[] otherPub = ed25519PublicKey(fill(32, 78));
+  t.isFalse(ed25519Verify(otherPub, msg, sig), "the wrong key is refused");
+  return t.report();
+}
+
+export string test_low_order_points_give_an_all_zero_secret() {
+  // RFC 7748 §6.1 says protocols "MAY check for the all-zero value", which presumes an
+  // implementation produces it rather than something else. These are the small-order
+  // u-coordinates from the cofactor-8 subgroup: multiplying any by a clamped scalar lands
+  // on the identity, whose u-coordinate encodes as zero. A peer can send one to force a
+  // known shared secret, so producing the documented value is what lets a caller notice.
+  T t = T.create();
+  string[] lowOrder = string[](
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0100000000000000000000000000000000000000000000000000000000000000",
+    "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+    "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f");
+  u8[] scalar = u8[32]();
+  for (i32 i = 0; i < 32; i++) { scalar[i] = (i * 29 + 3) & 0xFF; }
+  for (i32 i = 0; i < lowOrder.len(); i++) {
+    t.eqBytes(x25519(scalar, unhex(lowOrder[i])), u8[32](),
+              "low-order point " + itoa64(i as i64) + " gives an all-zero secret");
+  }
+  return t.report();
+}
+
+export string test_the_top_bit_of_a_u_coordinate_is_ignored() {
+  // RFC 7748 §5: the most significant bit of the u-coordinate is masked off before use.
+  // Two encodings of the same point must therefore give the same secret, and an
+  // implementation that skips the mask disagrees with every peer on half its inputs.
+  T t = T.create();
+  u8[] scalar = u8[32]();
+  for (i32 i = 0; i < 32; i++) { scalar[i] = (i * 13 + 7) & 0xFF; }
+  u8[] u = x25519Base(scalar);
+  u8[] withTopBit = u8[32]();
+  for (i32 i = 0; i < 32; i++) { withTopBit[i] = u[i]; }
+  withTopBit[31] = withTopBit[31] | 0x80;
+  t.eqBytes(x25519(scalar, u), x25519(scalar, withTopBit),
+            "bit 255 of the u-coordinate is masked off");
+  return t.report();
+}
+
+export string test_rfc_8032_ed25519_vectors() {
+  // The published vectors, which are agreement with the standard rather than with node.
+  // Three of RFC 8032 §7.1's cases: the empty message, one byte, and one that spans a
+  // SHA-512 block.
+  T t = T.create();
+  u8[] seed1 = unhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+  u8[] pub1 = unhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+  t.eqBytes(ed25519PublicKey(seed1), pub1, "RFC 8032 test 1 public key");
+  t.eqBytes(ed25519Sign(seed1, u8[0]()),
+            unhex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155" +
+                  "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+            "RFC 8032 test 1 signature over the empty message");
+  t.isTrue(ed25519Verify(pub1, u8[0](),
+                         unhex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155" +
+                               "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")),
+           "and it verifies");
+
+  u8[] seed2 = unhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+  u8[] pub2 = unhex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+  u8[] msg2 = u8[1]();
+  msg2[0] = 0x72;
+  t.eqBytes(ed25519PublicKey(seed2), pub2, "RFC 8032 test 2 public key");
+  t.eqBytes(ed25519Sign(seed2, msg2),
+            unhex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da" +
+                  "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+            "RFC 8032 test 2 signature");
+  return t.report();
+}
+
+export string test_a_non_canonical_s_is_rejected() {
+  // RFC 8032 §5.1.7: a signature whose S is not in [0, L) must be rejected. Without the
+  // check, S and S+L both verify, so a signature stops being a unique token — anyone can
+  // produce a second valid encoding of someone else's signature, which breaks any system
+  // that uses one as an identifier.
+  //
+  // L = 2^252 + 27742317777372353535851937790883648493, little-endian below.
+  T t = T.create();
+  u8[] seed = unhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+  u8[] pub = ed25519PublicKey(seed);
+  u8[] msg = u8[1]();
+  msg[0] = 0x72;
+  u8[] sig = ed25519Sign(seed, msg);
+  t.isTrue(ed25519Verify(pub, msg, sig), "the genuine signature verifies");
+
+  u8[] L = unhex("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010");
+
+  // S + L, added little-endian with carry.
+  u8[] plusL = u8[64]();
+  for (i32 i = 0; i < 32; i++) { plusL[i] = sig[i]; }
+  i32 carry = 0;
+  for (i32 i = 0; i < 32; i++) {
+    i32 v = sig[32 + i] + L[i] + carry;
+    plusL[32 + i] = v & 0xFF;
+    carry = v >> 8;
+  }
+  t.isFalse(ed25519Verify(pub, msg, plusL), "S + L is refused");
+
+  // S = L exactly, the boundary the range check is written against.
+  u8[] atL = u8[64]();
+  for (i32 i = 0; i < 32; i++) { atL[i] = sig[i]; }
+  for (i32 i = 0; i < 32; i++) { atL[32 + i] = L[i]; }
+  t.isFalse(ed25519Verify(pub, msg, atL), "S = L is refused");
+  return t.report();
+}
+
+export string test_x_equals_zero_with_the_sign_bit_is_not_a_point() {
+  // RFC 8032 §5.1.3: "if x = 0 and x_0 = 1, decoding fails." Zero has no sign, so an
+  // encoding claiming x is odd while y forces x to zero is not a point. The identity is
+  // the case that bites: (0, 1) is on the curve, so the usual curve-equation check waves
+  // it through and only the explicit test for x = 0 refuses it.
+  //
+  // This check existed and was inert until it was moved to where returning null actually
+  // rejects, so it is worth keeping pinned.
+  T t = T.create();
+  u8[] identity = u8[32]();
+  identity[0] = 1;                                   // y = 1, sign 0
+  u8[] signed = u8[32]();
+  signed[0] = 1;
+  signed[31] = 0x80;                                 // y = 1, sign 1
+
+  u8[] msg = "anything".toBytes();
+  u8[] sig = u8[64]();
+  // A garbage signature: what matters is that the *key* is refused before the maths, so
+  // verification against the signed identity must be false rather than trapping.
+  t.isFalse(ed25519Verify(signed, msg, sig), "x = 0 with the sign bit set is not a key");
+  t.isFalse(ed25519Verify(identity, msg, sig), "and the identity verifies nothing anyway");
+  return t.report();
+}

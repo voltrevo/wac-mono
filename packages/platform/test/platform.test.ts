@@ -892,3 +892,145 @@ Deno.test("bin/: one applet alone states only the grants it needs", async () => 
     for (const b of built) await Deno.remove(b);
   }
 });
+
+Deno.test("the bridge chunks in both directions", async () => {
+  // It only chunked responses. A `readFile` of ten megabytes worked and a `writeFile` of
+  // two threw `request of 2000000 bytes exceeds the 1048576-byte buffer` — so every applet
+  // whose output is its input died above a megabyte, and `cp` turned that into "cannot
+  // write", blaming the destination for a limit in the transport.
+  //
+  // Sizes here straddle the 1MB buffer deliberately: just under, just over, and several
+  // multiples, plus an exact multiple where the last chunk is empty.
+  const built = await Deno.makeTempFile({ prefix: "wac-big-" });
+  const src = await Deno.makeTempFile({ prefix: "wac-big-src-" });
+  const dst = await Deno.makeTempFile({ prefix: "wac-big-dst-" });
+  try {
+    await buildApp(BOX, built, { read: true, write: true });
+    const MB = 1 << 20;
+    for (const size of [MB - 1, MB, MB + 1, 3 * MB, 2 * MB]) {
+      // Not random: a pattern that a truncation or a doubled chunk would visibly break.
+      const data = new Uint8Array(size);
+      for (let i = 0; i < size; i++) data[i] = (i * 31 + (i >> 13)) & 0xFF;
+      await Deno.writeFile(src, data);
+
+      // Out through `write`: the whole file crosses as the request payload.
+      const cat = new Deno.Command(built, {
+        args: ["cat", src], stdout: "piped", stderr: "piped",
+      }).outputSync();
+      assertEquals(cat.code, 0, new TextDecoder().decode(cat.stderr));
+      assertSameBytes(cat.stdout, data, `cat at ${size} bytes`);
+
+      // And through `writeFile`, which is where `cp` was failing.
+      const cp = new Deno.Command(built, { args: ["cp", src, dst], stderr: "piped" }).outputSync();
+      assertEquals(cp.code, 0, `cp at ${size}: ${new TextDecoder().decode(cp.stderr)}`);
+      assertSameBytes(await Deno.readFile(dst), data, `cp at ${size} bytes`);
+    }
+
+    // Both directions at once, through a compressor, so the request and response halves
+    // are exercised against each other rather than only against a fixture.
+    const data = await Deno.readFile(src);
+    const gz = new Deno.Command(built, { args: ["gzip", src], stdout: "piped" }).outputSync();
+    const back = new Deno.Command(built, {
+      args: ["gunzip"], stdin: "piped", stdout: "piped",
+    }).spawn();
+    const w = back.stdin.getWriter();
+    w.write(gz.stdout).then(() => w.close());
+    assertSameBytes((await back.output()).stdout, data, "gzip and back at 2MB");
+  } finally {
+    for (const f of [built, src, dst]) await Deno.remove(f);
+  }
+});
+
+Deno.test("streaming applets hold a chunk, not the input", async () => {
+  // The point of `openInput`/`readChunk`. Correctness first — a streaming rewrite is easy
+  // to get subtly wrong at a chunk boundary, and every case here is one that a
+  // whole-input loop would have got right for free:
+  //
+  //   wc       a word split across two reads is one word, not two
+  //   strings  a run split across two reads is one run, not two short ones
+  //   crc32    the checksum is order-dependent across every chunk
+  //   tr, hex  per byte, so only the framing can go wrong
+  const built = await Deno.makeTempFile({ prefix: "wac-stream-" });
+  const fixture = await Deno.makeTempFile({ prefix: "wac-stream-in-" });
+  try {
+    await buildApp(BOX, built, { read: true });
+    // Deliberately larger than one 64K chunk and not a multiple of it, so boundaries land
+    // in the middle of words and runs rather than tidily between them.
+    const CHUNK = 1 << 16;
+    const parts: string[] = [];
+    for (let i = 0; i < 5000; i++) parts.push(`word${i} alpha beta gamma delta epsilon\n`);
+    const text = parts.join("");
+    assertEquals(text.length > 3 * CHUNK, true, "the fixture must span several chunks");
+    await Deno.writeTextFile(fixture, text);
+
+    const box = (args: string[]) => {
+      const r = new Deno.Command(built, { args, stdout: "piped", stderr: "piped" }).outputSync();
+      return { code: r.code, out: new TextDecoder().decode(r.stdout) };
+    };
+    const sys = (cmd: string, args: string[]) =>
+      new TextDecoder().decode(
+        new Deno.Command(cmd, { args, stdout: "piped", stderr: "null" }).outputSync().stdout,
+      );
+
+    // The real `wc` pads its columns; the numbers are what is under test.
+    const cols = (s: string) => s.trim().split(/\s+/).slice(0, 3).join(" ");
+    assertEquals(cols(box(["wc", fixture]).out), cols(sys("wc", [fixture])), "wc across chunks");
+    assertEquals(box(["tr", "a-z", "A-Z", fixture]).out, text.toUpperCase(), "tr across chunks");
+
+    // A run that spans several chunks must come out as one string, not several.
+    const spanning = await Deno.makeTempFile({ prefix: "wac-stream-span-" });
+    try {
+      const run = new Uint8Array(200_000 + 2);
+      run[0] = 0;
+      run.fill(65, 1, 200_001);
+      run[200_001] = 0;
+      await Deno.writeFile(spanning, run);
+      assertEquals(
+        box(["strings", spanning]).out,
+        sys("strings", ["-n4", spanning]),
+        "a 200K run spanning three chunks is one string",
+      );
+    } finally {
+      await Deno.remove(spanning);
+    }
+
+    assertEquals(box(["strings", fixture]).out, sys("strings", ["-n4", fixture]), "strings");
+    assertEquals(box(["hex", fixture]).out.length, text.length * 2 + 1, "hex is 2 chars a byte");
+    assertEquals(
+      box(["crc32", fixture]).out.split(" ")[0],
+      (() => {
+        const table = new Uint32Array(256);
+        for (let i = 0; i < 256; i++) {
+          let c = i;
+          for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+          table[i] = c >>> 0;
+        }
+        let crc = 0xFFFFFFFF;
+        for (const b of new TextEncoder().encode(text)) crc = table[(crc ^ b) & 0xFF] ^ (crc >>> 8);
+        return ((crc ^ 0xFFFFFFFF) >>> 0).toString(16).padStart(8, "0");
+      })(),
+      "crc32 across chunks",
+    );
+
+    // The reason the message shape matters: a denied read must still say why, which a
+    // bool-returning `openInput` could not.
+    const noGrant = await Deno.makeTempFile({ prefix: "wac-stream-ro-" });
+    try {
+      await buildApp(BOX, noGrant, {});
+      const r = new Deno.Command(noGrant, {
+        args: ["cat", fixture], stdout: "piped", stderr: "piped",
+      }).outputSync();
+      assertEquals(r.code, 1);
+      assertEquals(
+        new TextDecoder().decode(r.stderr).includes("not granted"),
+        true,
+        new TextDecoder().decode(r.stderr),
+      );
+    } finally {
+      await Deno.remove(noGrant);
+    }
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(fixture);
+  }
+});

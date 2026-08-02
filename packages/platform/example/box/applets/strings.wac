@@ -1,35 +1,38 @@
 // Runs of printable bytes, four or more — `strings -6` for a longer minimum.
+//
+// The run itself is the only thing held, and it carries across a chunk boundary: a string
+// split by a read is one string, not two short ones that both fall under the minimum.
 
 import { Cli, Core } from "../../../src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, readInput } from "../lib/input.wac";
-import { joinLines } from "../lib/lines.wac";
-import { slice } from "../lib/bytes.wac";
+import { Input, openStream } from "../lib/input.wac";
+import { Buf } from "../../../../bytes/src/buf.wac";
 
 export i32 strings(Core core, Cli cli, Args a) {
-  Input in = readInput(core, cli, a, 0);
+  Input in = openStream(core, cli, a, 0);
   if (!in.ok) { return 1; }
   i32 min = a.num == 0 ? 4 : a.num;
-  u8[] data = in.bytes;
 
-  i32 count = 0;
-  i32 run = 0;
-  for (i32 i = 0; i <= data.len(); i++) {
-    bool printable = i < data.len() && data[i] >= 32 && data[i] < 127;
-    if (printable) { run++; continue; }
-    if (run >= min) { count++; }
-    run = 0;
+  Buf run = Buf.create();
+  while (true) {
+    u8[] data = cli.readChunk();
+    if (data.len() == 0) { break; }
+    for (i32 i = 0; i < data.len(); i++) {
+      i32 b = data[i];
+      if (b >= 32 && b < 127) { run.push(b); continue; }
+      emit(cli, run, min);
+    }
   }
-
-  u8[][] out = u8[][count](fill: u8[0]());
-  i32 at = 0;
-  run = 0;
-  for (i32 i = 0; i <= data.len(); i++) {
-    bool printable = i < data.len() && data[i] >= 32 && data[i] < 127;
-    if (printable) { run++; continue; }
-    if (run >= min) { out[at] = slice(data, i - run, i); at++; }
-    run = 0;
-  }
-  cli.write(joinLines(out, at));
+  emit(cli, run, min);
   return 0;
+}
+
+/** The run so far, if it is long enough, and reset either way. */
+void emit(Cli cli, Buf run, i32 min) {
+  if (run.len >= min) {
+    u8[] out = u8[run.len + 1](fill: '\n');
+    out.copyFrom(run.data, 0, 0, run.len);
+    cli.write(out);
+  }
+  run.len = 0;
 }

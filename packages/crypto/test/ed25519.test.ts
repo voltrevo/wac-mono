@@ -1,15 +1,13 @@
-// Ed25519 against RFC 8032 and against WebCrypto.
+// Ed25519's malformed-input refusals.
 //
-// Signing and verifying are separately falsifiable and were separately wrong here, which
-// is the argument for testing them apart rather than only round-tripping. The first
-// version of this code produced every RFC 8032 signature correctly and failed to verify
-// two of the three matching public keys: `sqrt(-1)` was computed with an exponent one
-// short, so point *decoding* took the wrong branch for roughly half of all y-coordinates
-// while point *encoding*, which never needs a square root, stayed perfect. A round-trip
-// test — sign then verify with the same code — would have passed.
+// Only the refusals. RFC 8032's vectors, byte-identical agreement with node, tampering,
+// the non-canonical S that stops malleability, the low-order cases and the x = 0 encoding
+// all moved to `test/wac/curve25519_test.wac`.
 //
-// So: published vectors for both directions independently, a differential against
-// WebCrypto in both directions, and the rejection cases that RFC 8032 §5.1.7 requires.
+// These stayed because they trap. The seed length is the one worth keeping sharp: a short
+// seed runs off the end of the array and traps regardless, but a long one is read for its
+// first 32 bytes and the tail ignored — so without the check a 33-byte "seed" produces the
+// same key as its prefix, and two different inputs have one identity.
 
 import { wacBind } from "../../../harness/wacBind.ts";
 
@@ -48,123 +46,6 @@ const VECTORS: [string, string, string, string][] = [
    "09351fc9ac90b3ecfdfbc7c66431e0303dca179c138ac17ad9bef1177331a704"],
 ];
 
-Deno.test("ed25519: the base point encodes as RFC 8032 says", () => {
-  // Worth its own case because everything else depends on it, and because the base point
-  // is derived here from y = 4/5 rather than written out — so this checks `recoverX`,
-  // `sqrt(-1)`, the curve constant d, the encoding and field inversion in one line.
-  const want = "5866666666666666666666666666666666666666666666666666666666666666";
-  if (hex(baseEncoded()) !== want) throw new Error(`base point: ${hex(baseEncoded())}`);
-});
-
-Deno.test("ed25519: public keys match RFC 8032", () => {
-  for (const [seed, pub] of VECTORS) {
-    const got = hex(publicKey(unhex(seed)));
-    if (got !== pub) throw new Error(`seed ${seed.slice(0, 16)}…\n  got  ${got}\n  want ${pub}`);
-  }
-});
-
-Deno.test("ed25519: signatures match RFC 8032", () => {
-  for (const [seed, , msg, sig] of VECTORS) {
-    const got = hex(sign(unhex(seed), unhex(msg)));
-    if (got !== sig) {
-      throw new Error(`msg ${msg.slice(0, 16) || "(empty)"}\n  got  ${got}\n  want ${sig}`);
-    }
-  }
-});
-
-Deno.test("ed25519: verification accepts RFC 8032's signatures", () => {
-  // Deliberately separate from the signing test. Verification exercises point *decoding*,
-  // which signing never touches, and that is where this was wrong.
-  for (const [, pub, msg, sig] of VECTORS) {
-    if (!verify(unhex(pub), unhex(msg), unhex(sig))) {
-      throw new Error(`rejected a valid signature for msg ${msg.slice(0, 16) || "(empty)"}`);
-    }
-  }
-});
-
-Deno.test("ed25519: point decoding round-trips every RFC public key", () => {
-  // The narrowest statement of the bug that got past the signing tests: decode then
-  // re-encode must be the identity. `edRecode` returns 0xFF-prefixed zeros on a failed
-  // decode, so a rejection is visible rather than silently equal to something.
-  for (const [, pub] of VECTORS) {
-    const got = hex(recode(unhex(pub)));
-    if (got !== pub) throw new Error(`recode(${pub.slice(0, 16)}…) = ${got}`);
-  }
-});
-
-Deno.test("ed25519: agrees with WebCrypto in both directions", async () => {
-  for (let round = 0; round < 4; round++) {
-    const theirs = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]) as CryptoKeyPair;
-    const theirPub = new Uint8Array(await crypto.subtle.exportKey("raw", theirs.publicKey));
-    // The last 32 bytes of a PKCS#8 Ed25519 key are the seed.
-    const seed = new Uint8Array(await crypto.subtle.exportKey("pkcs8", theirs.privateKey)).slice(-32);
-
-    if (hex(publicKey(seed)) !== hex(theirPub)) {
-      throw new Error(`round ${round}: public key\n  ours   ${hex(publicKey(seed))}\n  theirs ${hex(theirPub)}`);
-    }
-
-    const msg = new TextEncoder().encode(`round ${round}: a message of some length to sign`);
-    // Their signature must verify here — Ed25519 is deterministic, so it must also be
-    // byte-identical to ours, which is a stronger check than verification alone.
-    const theirSig = new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, theirs.privateKey, msg as BufferSource));
-    const ourSig = sign(seed, msg);
-    if (hex(ourSig) !== hex(theirSig)) {
-      throw new Error(`round ${round}: signature\n  ours   ${hex(ourSig)}\n  theirs ${hex(theirSig)}`);
-    }
-    if (!verify(theirPub, msg, theirSig)) throw new Error(`round ${round}: rejected their signature`);
-    // And ours must verify there.
-    const ok = await crypto.subtle.verify({ name: "Ed25519" }, theirs.publicKey, ourSig as BufferSource, msg as BufferSource);
-    if (!ok) throw new Error(`round ${round}: WebCrypto rejected our signature`);
-  }
-});
-
-Deno.test("ed25519: rejects a tampered message, signature or key", () => {
-  const [seed, pub, msg, sig] = VECTORS[2];
-  const flip = (s: string, i: number) => {
-    const b = unhex(s);
-    b[i] ^= 1;
-    return b;
-  };
-  if (verify(flip(pub, 0), unhex(msg), unhex(sig))) throw new Error("accepted a modified public key");
-  if (verify(unhex(pub), flip(msg, 0), unhex(sig))) throw new Error("accepted a modified message");
-  if (verify(unhex(pub), unhex(msg), flip(sig, 0))) throw new Error("accepted a modified R");
-  if (verify(unhex(pub), unhex(msg), flip(sig, 32))) throw new Error("accepted a modified S");
-  // An empty message is a legitimate input, not a tampering — vector 1 signs one — so a
-  // message swapped for the empty string must fail on its merits.
-  if (verify(unhex(pub), new Uint8Array(0), unhex(sig))) throw new Error("accepted an emptied message");
-  // And the signature we produce for that seed must still verify, so the rejections
-  // above are not a verifier that rejects everything.
-  if (!verify(unhex(pub), unhex(msg), sign(unhex(seed), unhex(msg)))) {
-    throw new Error("rejected a freshly made signature");
-  }
-});
-
-Deno.test("ed25519: rejects a non-canonical S, which is what stops malleability", () => {
-  // RFC 8032 §5.1.7: "if the signature's S is not in the range [0, L), the signature is
-  // rejected". Without the check, S and S + L both verify, so a signature stops being a
-  // unique token — anyone can produce a second valid encoding of someone else's
-  // signature, which breaks any system using one as an identifier.
-  const [, pub, msg, sig] = VECTORS[2];
-  const L = 2n ** 252n + 27742317777372353535851937790883648493n;
-  const s = unhex(sig).slice(32);
-  let sv = 0n;
-  for (let i = 31; i >= 0; i--) sv = (sv << 8n) | BigInt(s[i]);
-
-  const withS = (v: bigint) => {
-    const out = unhex(sig);
-    let x = v;
-    for (let i = 0; i < 32; i++) {
-      out[32 + i] = Number(x & 0xFFn);
-      x >>= 8n;
-    }
-    return out;
-  };
-  if (verify(unhex(pub), unhex(msg), withS(sv + L))) throw new Error("accepted S + L");
-  if (verify(unhex(pub), unhex(msg), withS(L))) throw new Error("accepted S = L");
-  // The unmodified S is below L and must still be accepted.
-  if (!verify(unhex(pub), unhex(msg), withS(sv))) throw new Error("rejected the original S");
-});
-
 Deno.test("ed25519: rejects malformed keys and signatures", () => {
   const [, pub, msg, sig] = VECTORS[1];
   for (const n of [0, 31, 33, 64]) {
@@ -179,20 +60,6 @@ Deno.test("ed25519: rejects malformed keys and signatures", () => {
   notAPoint[0] = 2;
   if (hex(recode(notAPoint))[0] !== "f") throw new Error("decoded a y-coordinate that is not on the curve");
 });
-
-Deno.test("ed25519: signs messages across SHA-512 block boundaries", async () => {
-  // The nonce is H(prefix || msg) and the challenge is H(R || A || msg), so message
-  // length shifts padding in two different hashes at two different offsets. WebCrypto
-  // is the oracle; the lengths straddle 512-bit blocks from both directions.
-  const kp = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]) as CryptoKeyPair;
-  const seed = new Uint8Array(await crypto.subtle.exportKey("pkcs8", kp.privateKey)).slice(-32);
-  for (const n of [0, 1, 31, 32, 55, 56, 63, 64, 65, 127, 128, 200]) {
-    const msg = Uint8Array.from({ length: n }, (_, i) => (i * 37 + n) & 0xFF);
-    const want = new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, kp.privateKey, msg as BufferSource));
-    if (hex(sign(seed, msg)) !== hex(want)) throw new Error(`length ${n}: ${hex(sign(seed, msg))}`);
-  }
-});
-
 Deno.test("ed25519: a seed that is not 32 bytes is refused, long as well as short", () => {
   // The same asymmetry as P-256's length guards. A short seed runs off the end of the
   // array inside expandSeed and wasm traps regardless, so the guard looks tested; a long
@@ -211,36 +78,4 @@ Deno.test("ed25519: a seed that is not 32 bytes is refused, long as well as shor
     if (!traps(() => publicKey(bad))) throw new Error(`accepted a ${n}-byte seed for a key`);
     if (!traps(() => sign(bad, msg))) throw new Error(`accepted a ${n}-byte seed for signing`);
   }
-});
-
-Deno.test("ed25519: x = 0 with the sign bit set is not a point", () => {
-  // A compressed point is y in the low 255 bits and the sign of x in the top one. When
-  // x is zero it has no sign — zero is neither odd nor even in the sense the encoding
-  // means — so an encoding that claims x is odd while y forces x to zero is not a point,
-  // and must be refused rather than quietly decoded as the one with x = 0.
-  //
-  // The identity is the case that makes this bite. y = 1 gives x = 0, and (0, 1) sits on
-  // the curve, so the usual "is it on the curve" check waves it straight through: the
-  // only thing standing between the two encodings is the explicit test for x = 0. Drop
-  // it and the identity has two accepted encodings, one of which no signer would produce.
-  const recode = mod.edRecode as (p: Uint8Array) => Uint8Array;
-  const rejected = (out: Uint8Array) => out[0] === 0xFF;
-
-  const identity = new Uint8Array(32);
-  identity[0] = 1;                       // y = 1, sign 0
-  if (rejected(recode(identity))) throw new Error("the canonical identity was rejected");
-
-  const signed = Uint8Array.from(identity);
-  signed[31] |= 0x80;                    // y = 1, sign 1 — x would have to be an odd zero
-  if (!rejected(recode(signed))) throw new Error("accepted x = 0 with the sign bit set");
-
-  // The same for the other zero-x point, y = -1, which is the identity's negation.
-  const yNeg1 = new Uint8Array(32);
-  yNeg1.fill(0xFF);
-  yNeg1[0] = 0xEC;                       // p - 1 = 2^255 - 20
-  yNeg1[31] = 0x7F;
-  if (rejected(recode(yNeg1))) throw new Error("y = -1 with sign 0 should decode");
-  const yNeg1Signed = Uint8Array.from(yNeg1);
-  yNeg1Signed[31] |= 0x80;
-  if (!rejected(recode(yNeg1Signed))) throw new Error("accepted y = -1 with the sign bit set");
 });

@@ -1,0 +1,160 @@
+// ML-KEM-768, against WebCrypto vectors generated at run time.
+//
+// The one conversion where the oracle could not become a callback. WebCrypto's ML-KEM is
+// asynchronous and a wasm call cannot await; OpenSSL 3.5 has ML-KEM and can be driven
+// synchronously, but its CLI will not export a key's *seed*, and the seed is what makes
+// this the strongest test in the package.
+//
+// So the host does what only it can — await WebCrypto, generate keys, encapsulate — and
+// passes the results in as data. The checking is all here. That keeps the test in wac
+// without weakening it, and without committing a table: the vectors are made fresh on
+// every run, so they are neither stale nor stored.
+//
+// ## Why the seed matters so much
+//
+// WebCrypto exports an ML-KEM private key as its 64-byte seed, and FIPS 203 key generation
+// is a deterministic function of that seed. So this can compare *bytes*, not behaviour. An
+// encapsulation key matching WebCrypto's across all 1184 bytes means SHA3-512, the seed
+// split, SHAKE128's rejection sampling, the centred binomial noise, the NTT, the matrix
+// multiply and the twelve-bit packing are simultaneously right. Nothing weaker pins the
+// NTT at all — it is an internal representation, and two different transforms produce keys
+// that work perfectly with themselves.
+//
+// ## The layout
+//
+// `vectors` is a run of fixed-size records, since a callback and an argument both carry
+// one flat array:
+//
+//   seed 64 | ek 1184 | ct 1088 | shared 32     = 2368 bytes each
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { mlkemKeyGen, mlkemEncaps, mlkemDecaps } from "../../src/mlkem.wac";
+
+const i32 SEED = 64;
+const i32 EK = 1184;
+const i32 DK = 2400;
+const i32 CT = 1088;
+const i32 SS = 32;
+const i32 RECORD = 2368;
+
+u8[] slice(u8[] src, i32 from, i32 to) {
+  u8[] o = u8[to - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = src[from + i]; }
+  return o;
+}
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+export string test_key_generation_matches_webcrypto_byte_for_byte(u8[] vectors) {
+  T t = T.create();
+  i32 rounds = vectors.len() / RECORD;
+  t.isTrue(rounds > 0, "the host supplied at least one vector");
+  for (i32 r = 0; r < rounds; r++) {
+    i32 at = r * RECORD;
+    u8[] seed = slice(vectors, at, at + SEED);
+    u8[] wantEk = slice(vectors, at + SEED, at + SEED + EK);
+    u8[] ours = mlkemKeyGen(seed);
+    t.eqI32(ours.len(), EK + DK, "keyGen returns ek then dk");
+    t.eqBytes(slice(ours, 0, EK), wantEk,
+              "encapsulation key " + itoa64(r as i64) + " matches WebCrypto");
+  }
+  return t.report();
+}
+
+export string test_webcryptos_ciphertext_decapsulates_here(u8[] vectors) {
+  // The other direction from the one below, and not redundant: encapsulation and
+  // decapsulation are different code, and a transform that is self-consistently wrong
+  // passes one and fails the other.
+  T t = T.create();
+  i32 rounds = vectors.len() / RECORD;
+  for (i32 r = 0; r < rounds; r++) {
+    i32 at = r * RECORD;
+    u8[] seed = slice(vectors, at, at + SEED);
+    u8[] ct = slice(vectors, at + SEED + EK, at + SEED + EK + CT);
+    u8[] wantShared = slice(vectors, at + SEED + EK + CT, at + RECORD);
+    u8[] dk = slice(mlkemKeyGen(seed), EK, EK + DK);
+    t.eqBytes(mlkemDecaps(dk, ct), wantShared,
+              "we decapsulate WebCrypto's ciphertext " + itoa64(r as i64));
+  }
+  return t.report();
+}
+
+export string test_encapsulation_is_deterministic_in_its_randomness(u8[] vectors) {
+  // `m` is a parameter rather than generated inside, for the same reason ECDSA's k is.
+  // The consequence is testable: the same m must give the same ciphertext, and a different
+  // m a different one. An implementation that quietly drew its own randomness would fail
+  // the first and interoperate perfectly.
+  T t = T.create();
+  u8[] seed = slice(vectors, 0, SEED);
+  u8[] ek = slice(mlkemKeyGen(seed), 0, EK);
+  u8[] m1 = u8[32]();
+  for (i32 i = 0; i < 32; i++) { m1[i] = i; }
+  u8[] m2 = u8[32]();
+  for (i32 i = 0; i < 32; i++) { m2[i] = i; }
+  m2[31] = m2[31] ^ 1;
+  t.eqBytes(mlkemEncaps(ek, m1), mlkemEncaps(ek, m1), "encapsulation is deterministic");
+  t.isFalse(same(mlkemEncaps(ek, m1), mlkemEncaps(ek, m2)),
+            "and two messages give two ciphertexts");
+  return t.report();
+}
+
+export string test_our_ciphertext_round_trips(u8[] vectors) {
+  T t = T.create();
+  u8[] seed = slice(vectors, 0, SEED);
+  u8[] both = mlkemKeyGen(seed);
+  u8[] ek = slice(both, 0, EK);
+  u8[] dk = slice(both, EK, EK + DK);
+  u8[] m = u8[32]();
+  for (i32 i = 0; i < 32; i++) { m[i] = (i * 3) & 0xFF; }
+  u8[] out = mlkemEncaps(ek, m);
+  t.eqI32(out.len(), SS + CT, "encaps returns the secret then the ciphertext");
+  t.eqBytes(mlkemDecaps(dk, slice(out, SS, SS + CT)), slice(out, 0, SS),
+            "decapsulating our own ciphertext recovers the secret");
+  return t.report();
+}
+
+export string test_a_corrupted_ciphertext_gives_a_different_secret_not_a_failure(u8[] vectors) {
+  // The Fujisaki-Okamoto transform's whole point. Decapsulation re-encrypts and compares;
+  // a mismatch must return a secret derived from the private key's rejection value, never
+  // an error. Reporting failure would hand an attacker a decryption oracle, which is the
+  // attack the transform exists to deny — so a trap here is a bug, not a defence, and in
+  // wac a trap fails the test by unwinding, which is exactly the outcome being forbidden.
+  T t = T.create();
+  u8[] seed = slice(vectors, 0, SEED);
+  u8[] both = mlkemKeyGen(seed);
+  u8[] ek = slice(both, 0, EK);
+  u8[] dk = slice(both, EK, EK + DK);
+  u8[] m = u8[32]();
+  for (i32 i = 0; i < 32; i++) { m[i] = (i * 7) & 0xFF; }
+  u8[] out = mlkemEncaps(ek, m);
+  u8[] real = slice(out, 0, SS);
+  u8[] ct = slice(out, SS, SS + CT);
+  t.eqBytes(mlkemDecaps(dk, ct), real, "a good ciphertext decapsulates");
+
+  i32[] spots = i32[](0, 1, 500, CT - 1);
+  for (i32 i = 0; i < spots.len(); i++) {
+    u8[] bad = u8[CT]();
+    for (i32 j = 0; j < CT; j++) { bad[j] = ct[j]; }
+    bad[spots[i]] = bad[spots[i]] ^ 1;
+    u8[] got = mlkemDecaps(dk, bad);
+    t.isFalse(same(got, real),
+              "byte " + itoa64(spots[i] as i64) + " flipped changes the secret");
+    // The rejection secret is a function of the key and the ciphertext, so it repeats.
+    t.eqBytes(got, mlkemDecaps(dk, bad),
+              "and the rejection secret at " + itoa64(spots[i] as i64) + " is deterministic");
+  }
+  // Two different corruptions must give two different rejection secrets, or the value is
+  // not bound to the ciphertext at all.
+  u8[] badA = u8[CT]();
+  u8[] badB = u8[CT]();
+  for (i32 j = 0; j < CT; j++) { badA[j] = ct[j]; badB[j] = ct[j]; }
+  badA[0] = badA[0] ^ 1;
+  badB[1] = badB[1] ^ 1;
+  t.isFalse(same(mlkemDecaps(dk, badA), mlkemDecaps(dk, badB)),
+            "the rejection secret depends on the ciphertext");
+  return t.report();
+}

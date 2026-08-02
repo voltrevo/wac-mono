@@ -20,6 +20,14 @@
 /** Bytes for the request and response payloads. One page each is far past any capability. */
 export const BUF = 1 << 20;
 
+/**
+ * What one `readChunk` hands back at most.
+ *
+ * Well under `BUF`, so a chunk never itself needs chunking, and large enough that the
+ * per-call round trip is noise next to the work done on it.
+ */
+export const CHUNK = 1 << 16;
+
 // Int32 slots in the control block.
 export const REQ_SEQ = 0; // bumped by the worker when a request is ready
 export const RES_SEQ = 1; // bumped by the main thread when a response is ready
@@ -27,6 +35,11 @@ export const REQ_OP = 2; // which capability
 export const REQ_LEN = 3; // bytes of request payload
 export const RES_LEN = 4; // bytes of response payload
 export const RES_STATUS = 5; // see STATUS_* below
+// Set on every chunk of a request too large for the buffer except its last. The host
+// accumulates and answers each one with an empty OK; the handler runs on the last.
+// Requests needed this for the same reason responses did — see the note on STATUS_MORE —
+// and until they had it, `cp` of a 2MB file reported "cannot write".
+export const REQ_MORE = 6;
 export const CTRL_INTS = 16;
 
 export const CTRL_BYTES = CTRL_INTS * 4;

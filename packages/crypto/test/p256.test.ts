@@ -1,17 +1,21 @@
-// NIST P-256: the field, the curve, ECDH and ECDSA.
+// P-256's field against BigInt, and the inputs it must refuse.
 //
-// Two layers of oracle, for the same reason the Curve25519 tests have two. BigInt checks
-// the field on its own, which is where a reduction bug lives and where a curve-level
-// failure would tell you only that one of several thousand multiplications was wrong.
-// WebCrypto checks the curve and the protocols, which is where a formula's exceptional
-// cases live and which BigInt cannot reach.
+// The ECDSA differentials, ECDH, the group order and the r/s range checks moved to
+// `test/wac/nistcurve_test.wac`, where P-256 and P-384 are tested together because since
+// the generalisation they are one implementation.
 //
-// The field differential earned its place immediately. P-256's prime is written as eight
-// 32-bit limbs, and in wac today `i64 v = 0xFFFFFFFF` is -1 — a hex literal that fits in
-// 32 bits gets sign-extended when the target is 64-bit (wac issue 0054). Six of the
-// prime's limbs came out as -1, so the comparison against p was wrong, so a value of
-// zero did not survive a round trip through the encoder. Nothing above the field would
-// have located that.
+// What stayed, and why each cannot move:
+//
+// **The field against BigInt.** The same lesson as field25519: a non-canonical
+// representative is congruent, so it satisfies every relation the field can state about
+// itself, and only an outside reference sees that the representative is wrong while the
+// value is right.
+//
+// **The refusals**, which trap — off-curve points, scalars outside [1, n), a coordinate at
+// or above p, and inputs that are too long.
+//
+// **The addition law's exceptional cases**, which are cheap here and would need the
+// internal Jac type exposed to move.
 
 import { wacBind } from "../../../harness/wacBind.ts";
 
@@ -145,72 +149,8 @@ Deno.test("p256: the exceptional cases in the addition law", () => {
   if ((gy + ny) % P !== 0n) throw new Error("(n-1)G is not -G");
 });
 
-Deno.test("p256: ECDH agrees with WebCrypto in both directions", async () => {
-  for (let round = 0; round < 3; round++) {
-    const theirs = await crypto.subtle.generateKey(
-      { name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]) as CryptoKeyPair;
-    const theirPub = new Uint8Array(await crypto.subtle.exportKey("raw", theirs.publicKey));
-    const jwk = await crypto.subtle.exportKey("jwk", theirs.privateKey);
-    const theirPriv = Uint8Array.from(
-      atob(jwk.d!.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
 
-    if (hex(pubKey(theirPriv)) !== hex(theirPub)) {
-      throw new Error(`round ${round}: our public key from their scalar differs`);
-    }
 
-    const ourPriv = enc(BigInt(round * 7919 + 12345), N);
-    const ourPub = pubKey(ourPriv);
-    const imported = await crypto.subtle.importKey(
-      "raw", ourPub as BufferSource, { name: "ECDH", namedCurve: "P-256" }, false, []);
-    const theirSecret = new Uint8Array(await crypto.subtle.deriveBits(
-      { name: "ECDH", public: imported }, theirs.privateKey, 256));
-    if (hex(ecdh(ourPriv, theirPub)) !== hex(theirSecret)) {
-      throw new Error(`round ${round}: shared secrets differ`);
-    }
-  }
-});
-
-Deno.test("p256: verifies WebCrypto's ECDSA signatures and rejects tampering", async () => {
-  const kp = await crypto.subtle.generateKey(
-    { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]) as CryptoKeyPair;
-  const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
-
-  for (const text of ["", "a", "a longer message that crosses no boundary in particular"]) {
-    const msg = new TextEncoder().encode(text);
-    const sig = new Uint8Array(await crypto.subtle.sign(
-      { name: "ECDSA", hash: "SHA-256" }, kp.privateKey, msg as BufferSource));
-    if (!verify(pub, msg, sig)) throw new Error(`rejected a valid signature over ${JSON.stringify(text)}`);
-
-    for (const i of [0, 31, 32, 63]) {
-      const bad = Uint8Array.from(sig);
-      bad[i] ^= 1;
-      if (verify(pub, msg, bad)) throw new Error(`accepted a signature with byte ${i} flipped`);
-    }
-    const otherMsg = new TextEncoder().encode(text + "!");
-    if (verify(pub, otherMsg, sig)) throw new Error("accepted a signature over a different message");
-  }
-});
-
-Deno.test("p256: our signatures verify in WebCrypto", async () => {
-  // The other direction. ECDSA is randomised, so this cannot compare bytes the way the
-  // Ed25519 test does — it has to hand the signature to an independent verifier.
-  const priv = enc(0x1234567890ABCDEFn, N);
-  const pub = pubKey(priv);
-  const imported = await crypto.subtle.importKey(
-    "raw", pub as BufferSource, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
-
-  const msg = new TextEncoder().encode("signed in wac");
-  for (let i = 1; i <= 3; i++) {
-    const k = enc(BigInt(i) * 0x9E3779B97F4A7C15n, N);
-    const sig = sign(priv, msg, k);
-    if (sig.length !== 64) throw new Error(`sign returned ${sig.length} bytes for k #${i}`);
-    const ok = await crypto.subtle.verify(
-      { name: "ECDSA", hash: "SHA-256" }, imported, sig as BufferSource, msg as BufferSource);
-    if (!ok) throw new Error(`WebCrypto rejected our signature with k #${i}`);
-    // And our own verifier agrees, which it must if both are right.
-    if (!verify(pub, msg, sig)) throw new Error(`we rejected our own signature with k #${i}`);
-  }
-});
 
 Deno.test("p256: rejects points that are not on the curve", () => {
   // The invalid-curve attack: a peer sends a point from a different, weaker curve, and a
@@ -249,31 +189,6 @@ Deno.test("p256: rejects scalars outside [1, n)", () => {
   if (!traps(() => pubKey(aboveN))) throw new Error("accepted a private key above n");
 });
 
-Deno.test("p256: an ECDSA signature with r or s out of range is refused", () => {
-  // RFC 6979 and FIPS 186-4 both require 1 <= r, s < n. A verifier that skips the check
-  // accepts a second encoding of the same signature, which breaks anything using one as
-  // an identifier.
-  const priv = enc(999n, N);
-  const pub = pubKey(priv);
-  const msg = new TextEncoder().encode("range check");
-  const sig = sign(priv, msg, enc(0xDEADBEEFn, N));
-  if (!verify(pub, msg, sig)) throw new Error("a freshly made signature did not verify");
-
-  const zeroR = Uint8Array.from(sig);
-  zeroR.set(new Uint8Array(32), 0);
-  if (verify(pub, msg, zeroR)) throw new Error("accepted r = 0");
-  const zeroS = Uint8Array.from(sig);
-  zeroS.set(new Uint8Array(32), 32);
-  if (verify(pub, msg, zeroS)) throw new Error("accepted s = 0");
-
-  const nBytes = unhex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
-  const bigR = Uint8Array.from(sig);
-  bigR.set(nBytes, 0);
-  if (verify(pub, msg, bigR)) throw new Error("accepted r = n");
-  const bigS = Uint8Array.from(sig);
-  bigS.set(nBytes, 32);
-  if (verify(pub, msg, bigS)) throw new Error("accepted s = n");
-});
 
 Deno.test("p256: a coordinate at or above p is refused, even when it reduces onto the curve", () => {
   // The range check in curveDecode, and the reason it is not redundant with the curve

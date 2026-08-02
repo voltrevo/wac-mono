@@ -103,6 +103,7 @@ split is why it is a second struct rather than more fields.
 | `Core` | `nowMillis`, `monotonicNanos`, `randomBytes`, `log`, `warn` | — |
 | `Cli` | `argCount`, `arg`, `env` | — |
 | | `readStdin`, `write` | — |
+| | `openInput`, `readChunk` | `--allow-read` for a file |
 | | `readFile`, `stat`, `readDir` | `--allow-read` |
 | | `writeFile`, `mkdir`, `remove`, `rename` | `--allow-write` |
 
@@ -111,6 +112,35 @@ user pipes in and what the program prints are the user's own doing, not a reach 
 something they did not offer. `write` puts *exactly* those bytes on standard output —
 `log` is for lines of text, and without a byte-level output nothing could emit binary,
 which ruled out every compressor and encoder as a filter.
+
+**`openInput` and `readChunk` are the incremental half.** Everything else answers with the
+whole of something, which is fine for a filename and wrong for a pipe: `cat` of a large
+file held it entirely in memory, and so did every filter. `openInput("")` selects standard
+input and a path selects that file; `readChunk` pulls up to 64K and answers empty at the
+end.
+
+There is one *current input* rather than a handle per file, and that is forced rather than
+chosen: wac has no closures, so nothing can carry a handle into the `fn[u8[]()]` a
+transform expects. The state has to live somewhere and the world is the honest place for
+it.
+
+The signatures are the reason this composes at all. `gzipStream` takes
+`fn[u8[]()]` and `fn[bool(u8[])]`, which is exactly what `readChunk` and `write` are, so
+the whole of `box gzip` is:
+
+```wac
+return gzipStream(cli.readChunk, cli.write);
+```
+
+`write` returns a `bool` for that reason alone — almost every caller discards it. Had the
+shapes not matched there would have been no adapter to write.
+
+Measured on one 300MB file, peak RSS: **94MB streaming (`wc`), 1.5GB buffered
+(`sha256sum`)**, against a 57MB floor for the Deno runtime itself. Before the conversion
+`wc` peaked at 1.5GB on the same input. The streaming ones are `cat`, `wc`, `hex`, `crc32`, `tr`, `strings`, `gzip` and
+`gunzip`. `sort`, `tac` and `tail` cannot stream by nature. `sha256sum` and `sha512sum`
+still buffer because `packages/crypto` hashes a whole message — an incremental API there
+is the next thing worth having.
 
 **`mkdir`, `remove` and `rename` are one tier, not three conveniences.** `writeFile`
 alone cannot express a safe update: it truncates and then fills, so a reader arriving in

@@ -63,7 +63,14 @@ export function cliOf(
     },
     // stdin and stdout, which need no grant — see the note in platform.wac.
     () => hostCall(b, OP.READ_STDIN, new Uint8Array(0)),
-    (bytes: Uint8Array) => { hostCall(b, OP.WRITE_STDOUT, bytes); },
+    (bytes: Uint8Array) => {
+      try {
+        hostCall(b, OP.WRITE_STDOUT, bytes);
+        return true;
+      } catch {
+        return false;   // a closed pipe is an answer, not a crash
+      }
+    },
     (path: string) => {
       try {
         return mk.fileResult(true, hostCall(b, OP.READ_FILE, str(path)), "");
@@ -112,6 +119,21 @@ export function cliOf(
     (path: string, parents: boolean) => tried(b, OP.MKDIR, flagged(parents, path)),
     (path: string, recursive: boolean) => tried(b, OP.REMOVE, flagged(recursive, path)),
     (from: string, to: string) => tried(b, OP.RENAME, twoPaths(from, to)),
+    (path: string) => {
+      try {
+        hostCall(b, OP.OPEN_INPUT, str(path));
+        return "";
+      } catch (e) {
+        return e instanceof Error ? e.message : String(e);
+      }
+    },
+    () => {
+      try {
+        return hostCall(b, OP.READ_CHUNK, new Uint8Array(0));
+      } catch {
+        return new Uint8Array(0);   // unreadable is indistinguishable from ended, as it should be
+      }
+    },
   );
 }
 
