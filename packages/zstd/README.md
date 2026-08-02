@@ -21,7 +21,7 @@ what zstd's own encoder produces and comparing bytes.
 | Sequences: all four modes per code, and the repeat offsets | done |
 | Content checksum (XXH64) | verified, not skipped |
 | Dictionaries | **not implemented** |
-| Compression | **started**: FSE encoding only — see below |
+| Compression | **works**: valid frames zstd decompresses — see below for how good |
 
 ### What "not implemented" means here
 
@@ -53,9 +53,112 @@ and no ordinary encoder emits one unasked. They exist for the opposite case: man
 that share structure, where the shared part is longer than the message. If that is the use, this
 package cannot serve it; if it is not, nothing here is missing.
 
-**Compression.** `src/fseenc.wac` is the first piece: count normalisation, encoding-table
-construction, the backwards bit writer, and table description writing. Nothing yet produces a
-frame.
+**Compression.** `src/encode.wac` produces valid zstd frames — Node's zstd decompresses every
+one of them back to the input, across a corpus and a fuzzer. It finds matches greedily, leaves
+literals uncompressed, and codes every sequence with the format's predefined FSE tables, so it
+never transmits a table of its own.
+
+Where that lands on real data — `deno task bench:zstd`, over source in three languages, prose,
+config, a wasm module, a native executable, Tor directory data, and something already compressed:
+
+| sample | raw | ours | gzip -6 | zstd -3 | zstd -19 |
+|---|---:|---:|---:|---:|---:|
+| wac source | 1,014,867 | 284,753 | 283,810 | 288,004 | 233,786 |
+| typescript | 1,048,576 | **287,426** | 294,001 | 292,769 | 238,497 |
+| python | 1,048,576 | **229,034** | 238,783 | 241,915 | 193,448 |
+| markdown | 252,668 | 98,243 | 96,694 | 98,376 | 85,273 |
+| json | 357,128 | **2,947** | 3,479 | 2,833 | 2,574 |
+| wasm | 12,746 | 5,856 | 5,392 | 5,499 | 5,065 |
+| native binary | 1,048,576 | 184,976 | 181,087 | 169,378 | 147,203 |
+| tor microdescs | 2,097,152 | **290,218** | 922,537 | 240,833 | 231,273 |
+| tor consensus | 2,097,152 | 550,197 | 520,158 | 501,718 | 451,051 |
+| gzipped source | 287,124 | 286,754 | 286,526 | 287,142 | 286,295 |
+| **total** | **9,264,565** | **2,220,404** | 2,832,467 | 2,128,467 | 1,874,465 |
+
+**22% smaller than `gzip -6` across the corpus, 4% larger than `zstd -3`.** We win on source code
+in all three languages and lose on binaries and on Tor's directory data. Already-compressed input
+does not expand.
+
+### The whole of the Tor bootstrap data
+
+The corpus takes 2 MB slices to stay quick. The full files, which is where an encoder bug was
+found that nothing smaller reached:
+
+| entry | raw | ours | ms | MB/s | gzip -6 | zstd -3 | zstd -19 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| microdescs | 38,213,719 | **4,039,712** | 1,139 | 33.6 | 16,899,870 | 3,247,759 | 2,317,304 |
+| consensus-microdesc | 3,422,706 | 902,519 | 250 | 13.7 | 849,782 | 818,482 | 728,222 |
+| authority-certs | 20,442 | 13,140 | 1 | 18.3 | 12,928 | 12,893 | 12,897 |
+
+38 MB of microdescriptors compresses to **a quarter of what gzip manages** and within 24% of
+`zstd -3`, at 34 MB/s. The bug: a literals section of 16 KiB or more uses the widest header form,
+five bytes with neither size on a byte boundary — and ours wrote six bytes with the fields in the
+wrong places. Every test passed, because no sample under 2 MB ever produced a literals section
+that large. `test/encode.test.ts` now builds inputs that land in each of the three widths.
+
+The Tor microdescriptors are the sample worth staring at: **a third of gzip's size**, because
+gzip's window is 32 KiB and the file repeats itself at far greater range than that, while ours
+reaches back a megabyte. It is also, at 1.30x, the furthest we are from `zstd -3`.
+
+Note what changed when the corpus did. The samples this package started with were repeated
+phrases, and against those `zstd -3` looked 2.4x better on json — a property of the generator, not
+of the compressor. **Two of the three conclusions drawn from the synthetic corpus were wrong**,
+which is why `bench/corpus.ts` now builds from files that are actually on the machine.
+
+### Where the bytes go, and what fitted tables were worth
+
+Worth measuring rather than assuming — the obvious answer was wrong twice. On 925 KB of this
+repo's own source, before fitted tables were added:
+
+| | size | ratio |
+|---|---:|---:|
+| ours, predefined tables only | 347,805 | 2.72x |
+| zstd -1 | 309,243 | 3.06x |
+| gzip -6 | 268,471 | 3.53x |
+| zstd -3 | 272,498 | 3.48x |
+| **the matches we already find, coded ideally** | **~269,800** | **3.51x** |
+
+**The matches were not the problem.** Coding the sequences we already produced at the entropy of
+their own distributions was predicted to reach zstd -3 on this data — and adding fitted tables
+landed at **270,049**, within 0.1% of that estimate. Per sequence, before:
+
+| | bits per sequence |
+|---|---:|
+| offset extra bits | 11.0 |
+| the three codes, at the entropy of their actual distributions | 8.1 |
+| length extra bits | 0.0 |
+
+and literals are **10 KB of a 925 KB input** — entropy-coding them would save around 4 KB of 348 KB.
+
+1. ~~**Transmitted FSE tables**~~ — done. Both codings are built per block and the shorter kept,
+   because neither always wins: a block with few sequences cannot recover the cost of describing
+   three tables, and small blocks do still choose the predefined ones.
+
+What is left, in order:
+
+1. ~~**Huffman literals**~~ — done, and worth what the measurement said: the estimate was 24,308
+   bytes on the Tor microdescriptors and it came out at 23,134. Across the corpus it took us from
+   1.07x of `zstd -3` to 1.04x. A section of one repeated byte becomes RLE instead, and a
+   section whose coding would not pay stays raw.
+
+   **With one limitation, and it is why the binaries did not move.** A tree description written
+   directly carries at most 128 weights, because its header byte holds `127 + the count`. Wider
+   alphabets need the FSE-coded form, which needs the two-state interleaved FSE *encoder* this
+   package does not have — the one shape whose termination does not invert cleanly, and which
+   was skipped on the grounds that nothing needed it. Something does now. Literals containing a
+   byte above 128 therefore stay raw, which covers text, base64 and json but not machine code.
+3. **Better matching**, which is what separates us from `zstd -19` — 18% across the corpus — and
+   is most of the remaining gap on the Tor consensus, where offsets alone cost 296 KB of a
+   586 KB output at an average match of only 13 bytes. `zstd -19` reaches 4.25x on the
+   same input against `-3`'s 3.48x, purely by parsing better. Our average match is 8.7 bytes from
+   a greedy search 32 candidates deep; lazy matching and a deeper chain are what raise that.
+2. **Repeat offsets** — deep but narrow. Across the whole corpus exactly one sample wants them:
+   the native executable, where **63% of offsets would hit a repeat slot** and the offset budget
+   would fall from 58 KB to 32 KB. Everywhere else it is 0-8%, including both Tor samples at
+   0-1%. Worth having, but it is one sample rather than a general win — which is the opposite of
+   what the synthetic log lines suggested. Note the interaction: a greedy matcher takes every
+   three-byte match it finds, which *minimises* literals. A better parser skips bad matches and
+   emits more of them, so this grows as (3) lands.
 
 Why that piece first, and not literals: measured on this container, entropy-coding the literals
 of a 102 KB prose sample gets it to 54 KB, while `zstd -3` gets it to 95 bytes. **Almost all of
@@ -181,6 +284,7 @@ encoder stops choosing one, the test says so instead of quietly testing less.
 | `src/block.wac` | a compressed block: literals, sequences, and what carries between blocks |
 | `src/xxh64.wac` | the content checksum |
 | `src/fseenc.wac` | FSE encoding: normalisation, encoding tables, the backwards bit writer |
+| `src/encode.wac` | the compressor: matching, sequences, blocks, frames |
 | `test/oracle.mjs` | Node's zstd, both directions, one subprocess per run |
 | `test/frame.test.ts` | against encoder output, and hand-built frames Node validates |
 | `test/fse.test.ts` | the three checks above |
@@ -188,6 +292,7 @@ encoder stops choosing one, the test says so instead of quietly testing less.
 | `test/decode.test.ts` | whole frames against Node, and which codings were reached |
 | `test/xxh64.test.ts` | the published vectors |
 | `test/fseenc.test.ts` | encode, then decode with the decoder that reads real frames |
+| `test/encode.test.ts` | our frames, decompressed by zstd itself |
 | `test/frames.ts` | walking a real frame to find its FSE-coded pieces |
 | `test/writer.ts` | the description writer, for round-tripping |
 | `cov.ts` | `deno task coverage:zstd` — 100% of branches |

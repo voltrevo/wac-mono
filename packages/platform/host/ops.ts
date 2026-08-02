@@ -15,4 +15,8 @@ export const OP = {
   ENV: 8,
   READ_FILE: 9,
   WRITE_FILE: 10,
+  READ_STDIN: 11,
+  WRITE_STDOUT: 12,
+  STAT: 13,
+  READ_DIR: 14,
 } as const;

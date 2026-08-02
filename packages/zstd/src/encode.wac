@@ -1,0 +1,527 @@
+// A zstd encoder (RFC 8878).
+//
+// Complete and valid, and deliberately unambitious about ratio. It finds matches greedily,
+// leaves literals uncompressed, and codes every sequence with the format's *predefined* FSE
+// tables — which means it never transmits a table of its own. The default distributions can
+// express every literal-length and match-length code and offset codes up to 28, so that is a
+// real encoder rather than a stepping stone, just not a competitive one.
+//
+// Why this shape first: entropy-coding the literals of a 102 KB prose sample gets it to 54 KB,
+// while `zstd -3` gets it to 95 bytes. Almost all of zstd's compression is matches. So matches
+// come first and Huffman literals come later, which is the opposite of the order the format
+// document presents them in.
+//
+// What is deliberately missing, in rough order of what it would be worth:
+//
+//   - Huffman literals. Everything here is a raw literals section.
+//   - Repeat offsets. Every offset is written explicitly, which costs bits on the common case
+//     of a match at the same distance as the last one.
+//   - Lazy matching. A match found at position p is taken, even where starting one byte later
+//     would find a longer one.
+//   - Transmitted tables, and choosing between them per block.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { BitOut, CTable, Step, buildCTable, encodeStep, initialState, normalize, optimalLog, writeDescription } from "./fseenc.wac";
+import {
+  LL_BASE, LL_BITS, ML_BASE, ML_BITS, LL_DEFAULT, ML_DEFAULT, OF_DEFAULT,
+  llMaxSymbol, mlMaxSymbol, ofMaxSymbol,
+} from "./sequences.wac";
+import { xxh64Low } from "./xxh64.wac";
+import { compressLiterals } from "./huffenc.wac";
+
+// ── Parameters ────────────────────────────────────────────────────────────────
+
+/** Uncompressed bytes per block. The format's ceiling is 128 KiB. */
+i32 blockSize() { return 131072; }
+
+/**
+ * How far back a match may reach. Declared in the frame header, so the two must agree.
+ *
+ * A megabyte rather than the format's maximum: the window is what a *decoder* must keep, so
+ * declaring a large one costs every reader memory whether or not this encoder ever reaches back
+ * that far. A greedy matcher with a 32-deep chain rarely finds anything useful at that distance
+ * anyway.
+ */
+i32 windowSize() { return 1 << 20; }
+
+/** The window descriptor for `windowSize()`: exponent 10, mantissa 0, giving 2^20. */
+i32 windowDescriptor() { return 10 << 3; }
+
+i32 minMatch() { return 3; }
+i32 maxMatch() { return 65535; }
+i32 hashBits() { return 15; }
+
+/** Candidate positions examined per match. Bounds the search on repetitive input. */
+i32 chainLimit() { return 32; }
+
+i32 highBit(i32 v) {
+  i32 n = -1;
+  i32 x = v;
+  while (x != 0) {
+    n++;
+    x = x >>> 1;
+  }
+  return n;
+}
+
+// ── Turning lengths and distances into codes ──────────────────────────────────
+//
+// Each is a baseline plus extra bits. Going the other way means finding the largest baseline
+// that does not exceed the value — a scan, because the tables are short and irregular.
+
+/** The literal-length code for `len`, and how many extra bits it carries. */
+i32 llCodeOf(i32 len) {
+  for (i32 c = llMaxSymbol(); c >= 0; c--) {
+    if (LL_BASE[c] <= len) { return c; }
+  }
+  trap;
+}
+
+/** The match-length code for `len`. */
+i32 mlCodeOf(i32 len) {
+  for (i32 c = mlMaxSymbol(); c >= 0; c--) {
+    if (ML_BASE[c] <= len) { return c; }
+  }
+  trap;
+}
+
+// ── Match finding ─────────────────────────────────────────────────────────────
+
+/**
+ * Greedy matching over hash chains: hash three bytes at each position, keep a newest-first
+ * chain per bucket, and walk back through positions with the same three-byte prefix.
+ *
+ * The same shape as `packages/gzip`'s, with a larger window and no lazy step. What it costs in
+ * ratio against a lazy or optimal parser is real — a few percent — and it is the first thing to
+ * change once there is something to measure against.
+ */
+struct Matcher {
+  u8[] data;
+  i32[] head;
+  i32[] prev;
+
+  Matcher create(u8[] data) {
+    i32[] head = i32[1 << hashBits()]();
+    for (i32 i = 0; i < head.len(); i++) {
+      head[i] = -1;
+    }
+    return Matcher(data, head, i32[data.len() + 1]());
+  }
+
+  /** Three bytes into one bucket. The same mixing `packages/gzip` uses, which is enough here. */
+  i32 hash(const this, i32 at) {
+    return ((this.data[at] << 10) ^ (this.data[at + 1] << 5) ^ this.data[at + 2])
+         & ((1 << hashBits()) - 1);
+  }
+
+  void insert(this, i32 at) {
+    i32 h = this.hash(at);
+    this.prev[at] = this.head[h];
+    this.head[h] = at;
+  }
+
+  /** The best match at `at`, or length 0. `best[0]` is the length and `best[1]` the distance. */
+  void find(this, i32 at, i32 limit, i32[] best) {
+    best[0] = 0;
+    best[1] = 0;
+    if (at + minMatch() > limit) { return; }
+
+    i32 candidate = this.head[this.hash(at)];
+    i32 chain = 0;
+    while (candidate >= 0 && chain < chainLimit()) {
+      i32 dist = at - candidate;
+      if (dist > windowSize() || dist <= 0) { break; }
+      i32 len = 0;
+      while (len < maxMatch() && at + len < limit
+             && this.data[candidate + len] == this.data[at + len]) {
+        len++;
+      }
+      if (len > best[0]) {
+        best[0] = len;
+        best[1] = dist;
+      }
+      candidate = this.prev[candidate];
+      chain++;
+    }
+  }
+}
+
+// ── One block ─────────────────────────────────────────────────────────────────
+
+/** The sequences of one block, plus the literals they interleave with. */
+struct Block {
+  Buf literals;
+  i32[] llCode;
+  i32[] llExtra;
+  i32[] mlCode;
+  i32[] mlExtra;
+  i32[] ofCode;
+  i32[] ofExtra;
+  i32 count;
+}
+
+/**
+ * Split `data[from, to)` into sequences.
+ *
+ * A sequence is "copy this many literals, then copy this match" — so the literals between
+ * matches accumulate, and whatever is left after the last match is the block's trailing
+ * literals, which belong to no sequence.
+ */
+Block findSequences(Matcher m, i32 at0, i32 to) {
+  i32 room = to - at0 + 1;
+  Block b = Block(Buf.create(), i32[room](), i32[room](), i32[room](), i32[room](),
+                  i32[room](), i32[room](), 0);
+
+  i32[] best = i32[2]();
+  i32 at = at0;
+  i32 literalStart = at0;
+
+  while (at < to) {
+    m.find(at, to, best);
+    i32 len = best[0];
+    i32 dist = best[1];
+
+    if (len < minMatch()) {
+      // Only where three bytes exist to hash. The last two positions of the input have no
+      // bucket, which costs nothing: nothing can match there anyway.
+      if (at + minMatch() <= m.data.len()) { m.insert(at); }
+      at++;
+      continue;
+    }
+
+    i32 literalLength = at - literalStart;
+    b.literals.pushBytes(m.data, literalStart, literalLength);
+
+    i32 ll = llCodeOf(literalLength);
+    i32 ml = mlCodeOf(len);
+    // The offset value is the distance plus three: one, two and three are reserved for the
+    // repeat slots, which this encoder does not use.
+    i32 offsetValue = dist + 3;
+    i32 of = highBit(offsetValue);
+
+    b.llCode[b.count] = ll;
+    b.llExtra[b.count] = literalLength - LL_BASE[ll];
+    b.mlCode[b.count] = ml;
+    b.mlExtra[b.count] = len - ML_BASE[ml];
+    b.ofCode[b.count] = of;
+    b.ofExtra[b.count] = offsetValue - (1 << of);
+    b.count++;
+
+    // Every covered position still needs hashing, or later matches cannot reference into this
+    // one. That is most of the cost of matching on repetitive input.
+    for (i32 k = 0; k < len; k++) {
+      if (at + k + minMatch() <= m.data.len()) { m.insert(at + k); }
+    }
+    at += len;
+    literalStart = at;
+  }
+
+  b.literals.pushBytes(m.data, literalStart, to - literalStart);
+  return b;
+}
+
+/**
+ * Write the sequences bitstream, backwards.
+ *
+ * The mirror of the decoder, and the orders are the part with no margin. A decoder reads the
+ * initial states literal length, offset, match length; then per sequence the extra bits offset,
+ * match length, literal length; then the transitions literal length, match length, offset. This
+ * writes every one of those in reverse, because the bits a decoder reads first are written last.
+ */
+u8[] writeSequenceStream(Block b, CTable cLL, CTable cOF, CTable cML) {
+  BitOut o = BitOut.create();
+  i32 last = b.count - 1;
+
+  i32 sLL = initialState(cLL, b.llCode[last]);
+  i32 sOF = initialState(cOF, b.ofCode[last]);
+  i32 sML = initialState(cML, b.mlCode[last]);
+
+  o.write(b.llExtra[last], LL_BITS[b.llCode[last]]);
+  o.write(b.mlExtra[last], ML_BITS[b.mlCode[last]]);
+  o.write(b.ofExtra[last], b.ofCode[last]);
+
+  for (i32 i = last - 1; i >= 0; i--) {
+    Step stepOF = encodeStep(cOF, b.ofCode[i], sOF);
+    o.write(stepOF.value, stepOF.bits);
+    Step stepML = encodeStep(cML, b.mlCode[i], sML);
+    o.write(stepML.value, stepML.bits);
+    Step stepLL = encodeStep(cLL, b.llCode[i], sLL);
+    o.write(stepLL.value, stepLL.bits);
+    sOF = stepOF.state;
+    sML = stepML.state;
+    sLL = stepLL.state;
+
+    o.write(b.llExtra[i], LL_BITS[b.llCode[i]]);
+    o.write(b.mlExtra[i], ML_BITS[b.mlCode[i]]);
+    o.write(b.ofExtra[i], b.ofCode[i]);
+  }
+
+  o.write(sML, cML.log);
+  o.write(sOF, cOF.log);
+  o.write(sLL, cLL.log);
+  return o.finish();
+}
+
+// ── Choosing how to code the sequences ────────────────────────────────────────
+//
+// A block may use the format's predefined tables, which cost nothing to transmit and fit
+// nothing in particular, or send its own, which cost bytes and fit exactly. Which wins depends
+// on the block: measured on this repo's own source, fitted tables are worth about 80 KB of 348,
+// because the predefined distributions are generic and a block's own are not.
+//
+// So both are built and the smaller body is kept. That costs a second pass over the sequences,
+// which is cheap next to the match search that produced them.
+
+/** The highest code that actually occurs, which is as much of the alphabet as needs describing. */
+i32 highestUsed(i32[] counts, i32 maxSymbol) {
+  for (i32 s = maxSymbol; s >= 0; s--) {
+    if (counts[s] > 0) { return s; }
+  }
+  return 0;
+}
+
+/** How many distinct codes occur, which is the least a table can have room for. */
+i32 distinctUsed(i32[] counts, i32 maxSymbol) {
+  i32 n = 0;
+  for (i32 s = 0; s <= maxSymbol; s++) {
+    if (counts[s] > 0) { n++; }
+  }
+  return n;
+}
+
+/** A fitted table, and the description that transmits it. */
+struct Fitted {
+  CTable table;
+  u8[] description;
+}
+
+/**
+ * Fit a table to `counts` and write its description.
+ *
+ * The accuracy log is bounded three ways: by what the format allows for this code, by what the
+ * data justifies, and — the one that is easy to miss — by needing at least one slot for every
+ * code that occurs, since a code normalised to zero cannot be written at all.
+ */
+Fitted fit(i32[] counts, i32 maxSymbol, i32 total, i32 maxLog) {
+  i32 top = highestUsed(counts, maxSymbol);
+  i32 log = optimalLog(total, top, maxLog);
+  i32 need = distinctUsed(counts, top);
+  while ((1 << log) < need && log < maxLog) {
+    log++;
+  }
+
+  i32[] norm = normalize(counts, top, total, log);
+  BitOut o = BitOut.create();
+  writeDescription(o, norm, top, log);
+  return Fitted(buildCTable(norm, top, log), o.flush());
+}
+
+/** Count how often each code occurs in a block. */
+i32[] countCodes(i32[] codes, i32 count, i32 maxSymbol) {
+  i32[] counts = i32[maxSymbol + 1]();
+  for (i32 i = 0; i < count; i++) {
+    counts[codes[i]]++;
+  }
+  return counts;
+}
+
+/** The number of sequences, in one, two or three bytes. */
+void writeSequenceCount(Buf out, i32 n) {
+  if (n < 128) {
+    out.push(n);
+  } else if (n < 32512) {
+    out.push(128 + (n >>> 8));
+    out.push(n & 255);
+  } else {
+    out.push(255);
+    i32 v = n - 32512;
+    out.push(v & 255);
+    out.push((v >>> 8) & 255);
+  }
+}
+
+/**
+ * The literals section: Huffman-coded if that is smaller, otherwise raw.
+ *
+ * A section of one repeated byte becomes RLE, which costs two bytes however long it is — worth
+ * checking first because it is both the cheapest case and the one Huffman cannot express, a code
+ * needing at least two symbols.
+ */
+void writeLiterals(Buf out, u8[] literals) {
+  i32 n = literals.len();
+  if (n == 0) {
+    out.push(0);                                       // raw, length zero
+    return;
+  }
+
+  i32[] counts = i32[256]();
+  for (i32 i = 0; i < n; i++) {
+    counts[literals[i]]++;
+  }
+  i32 distinct = 0;
+  for (i32 s = 0; s < 256; s++) {
+    if (counts[s] > 0) { distinct++; }
+  }
+
+  if (distinct == 1) {
+    // RLE: the kind, the length, and the byte.
+    if (n < 32) {
+      out.push(1 | (n << 3));
+    } else if (n < 4096) {
+      out.push(1 | (1 << 2) | ((n & 15) << 4));
+      out.push(n >>> 4);
+    } else {
+      out.push(1 | (3 << 2) | ((n & 15) << 4));
+      out.push((n >>> 4) & 255);
+      out.push((n >>> 12) & 255);
+    }
+    out.push(literals[0]);
+    return;
+  }
+
+  u8[] coded = compressLiterals(literals, counts, 255);
+  if (coded.len() > 0 && coded.len() < rawLiteralsSize(n)) {
+    out.pushBytes(coded, 0, coded.len());
+    return;
+  }
+  writeRawLiterals(out, literals);
+}
+
+/** What a raw section of `n` literals costs, header included. */
+i32 rawLiteralsSize(i32 n) {
+  if (n < 32) { return 1 + n; }
+  if (n < 4096) { return 2 + n; }
+  return 3 + n;
+}
+
+/** A raw literals section: the header, then the bytes. */
+void writeRawLiterals(Buf out, u8[] literals) {
+  i32 n = literals.len();
+  if (n < 32) {
+    out.push(n << 3);                                  // kind 0, one-byte size
+  } else if (n < 4096) {
+    out.push(((n & 15) << 4) | (1 << 2));              // kind 0, two-byte size
+    out.push(n >>> 4);
+  } else {
+    out.push(((n & 15) << 4) | (3 << 2));              // kind 0, three-byte size
+    out.push((n >>> 4) & 255);
+    out.push((n >>> 12) & 255);
+  }
+  out.pushBytes(literals, 0, n);
+}
+
+/** A block body coded with the given tables, and the modes byte and descriptions that go with it. */
+u8[] bodyWith(Block b, u8[] literals, CTable cLL, CTable cOF, CTable cML, i32 modes, u8[] tables) {
+  Buf body = Buf.create();
+  writeLiterals(body, literals);
+  writeSequenceCount(body, b.count);
+
+  if (b.count > 0) {
+    body.push(modes);
+    body.pushBytes(tables, 0, tables.len());
+    u8[] stream = writeSequenceStream(b, cLL, cOF, cML);
+    body.pushBytes(stream, 0, stream.len());
+  }
+  return body.take();
+}
+
+/**
+ * Build the body of a compressed block, or an empty array if raw would be smaller.
+ *
+ * Two codings are built and the shorter kept: the predefined tables, and tables fitted to this
+ * block. Neither is always better — fitted tables pay for their own description, which a block
+ * with few sequences cannot recover.
+ */
+u8[] compressedBody(Block b, CTable cLL, CTable cOF, CTable cML, i32 rawSize) {
+  u8[] literals = b.literals.bytes();
+  u8[] predefined = bodyWith(b, literals, cLL, cOF, cML, 0, u8[0]());
+
+  u8[] best = predefined;
+  if (b.count > 0) {
+    Fitted fLL = fit(countCodes(b.llCode, b.count, llMaxSymbol()), llMaxSymbol(), b.count, 9);
+    Fitted fOF = fit(countCodes(b.ofCode, b.count, ofMaxSymbol()), ofMaxSymbol(), b.count, 8);
+    Fitted fML = fit(countCodes(b.mlCode, b.count, mlMaxSymbol()), mlMaxSymbol(), b.count, 9);
+
+    // The descriptions go in the order the decoder reads them: literal lengths, offsets,
+    // match lengths — which is not the order the modes byte lists them in.
+    Buf tables = Buf.create();
+    tables.pushBytes(fLL.description, 0, fLL.description.len());
+    tables.pushBytes(fOF.description, 0, fOF.description.len());
+    tables.pushBytes(fML.description, 0, fML.description.len());
+
+    i32 modes = (2 << 6) | (2 << 4) | (2 << 2);        // all three FSE_Compressed
+    u8[] fitted = bodyWith(b, literals, fLL.table, fOF.table, fML.table, modes, tables.take());
+    if (fitted.len() < best.len()) { best = fitted; }
+  }
+
+  if (best.len() >= rawSize) { return u8[0](); }       // not worth it
+  return best;
+}
+
+/** A block header: the size, the type, and whether it is the last. */
+void writeBlockHeader(Buf out, i32 size, i32 type, bool last) {
+  i32 h = (size << 3) | (type << 1) | (last ? 1 : 0);
+  out.push(h & 255);
+  out.push((h >>> 8) & 255);
+  out.push((h >>> 16) & 255);
+}
+
+/**
+ * Compress `data` into one zstd frame.
+ *
+ * The output is never larger than a stored member by more than the frame's own overhead: each
+ * block falls back to raw if the compressed form is not smaller, which is the property that
+ * matters most — a compressor that expands its input is worse than no compressor.
+ */
+export u8[] compress(u8[] data) {
+  Buf out = Buf.create();
+
+  // Frame header: not single-segment, so a window descriptor; four bytes of content size.
+  out.push(0x28);
+  out.push(0xB5);
+  out.push(0x2F);
+  out.push(0xFD);
+  out.push((2 << 6) | (1 << 2));                       // 4-byte content size, checksum present
+  out.push(windowDescriptor());
+  i32 n = data.len();
+  out.push(n & 255);
+  out.push((n >>> 8) & 255);
+  out.push((n >>> 16) & 255);
+  out.push((n >>> 24) & 255);
+
+  // The predefined tables, built once for the whole frame — every block uses them.
+  CTable cLL = buildCTable(LL_DEFAULT, LL_DEFAULT.len() - 1, 6);
+  CTable cOF = buildCTable(OF_DEFAULT, OF_DEFAULT.len() - 1, 5);
+  CTable cML = buildCTable(ML_DEFAULT, ML_DEFAULT.len() - 1, 6);
+
+  Matcher m = Matcher.create(data);
+
+  if (n == 0) {
+    // An empty frame still needs a block, or there is nothing to say it ended.
+    writeBlockHeader(out, 0, 0, true);
+  }
+
+  i32 at = 0;
+  while (at < n) {
+    i32 to = at + blockSize();
+    if (to > n) { to = n; }
+    bool last = to == n;
+
+    Block b = findSequences(m, at, to);
+    i32 rawSize = to - at;
+    u8[] body = compressedBody(b, cLL, cOF, cML, rawSize);
+
+    if (body.len() == 0) {
+      writeBlockHeader(out, rawSize, 0, last);
+      out.pushBytes(data, at, rawSize);
+    } else {
+      writeBlockHeader(out, body.len(), 2, last);
+      out.pushBytes(body, 0, body.len());
+    }
+    at = to;
+  }
+
+  u32 sum = xxh64Low(data, 0, n);
+  out.pushU32(sum);
+  return out.take();
+}

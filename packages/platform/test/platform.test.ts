@@ -5,7 +5,7 @@
 // tests are what makes that a measurement — `readFile` really is `await Deno.readFile`,
 // and the wac side really does call it as a function.
 
-import { runApp } from "../host/launch.ts";
+import { buildApp, type Grants } from "../build.ts";
 import { denoWorld } from "../host/deno.ts";
 import { newBridge } from "../host/layout.ts";
 import { serveHostCalls } from "../host/respond.ts";
@@ -23,63 +23,73 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
   }
 }
 
-/** Collect what the application logged instead of letting it reach the console. */
-function collector() {
-  const out: string[] = [];
-  const err: string[] = [];
-  return { out, err, log: (l: string) => out.push(l), warn: (l: string) => err.push(l) };
+/**
+ * Build the application and run it, which is what `deno task app` does and what ships.
+ *
+ * These tests used to call a `runApp` that compiled and spawned a worker by a route of
+ * its own — a second launcher and a second worker, green while the real artifact was
+ * broken. There is one path now, so this is slower and means something.
+ */
+async function runBuilt(
+  args: string[],
+  grants: Grants = {},
+  env: Record<string, string> = {},
+): Promise<{ code: number; out: string[]; err: string[] }> {
+  const built = await Deno.makeTempFile({ prefix: "wac-test-" });
+  try {
+    await buildApp(WC, built, grants);
+    const r = new Deno.Command(built, { args, env, stdout: "piped", stderr: "piped" }).outputSync();
+    const lines = (b: Uint8Array) =>
+      new TextDecoder().decode(b).split("\n").filter((l) => l.length > 0);
+    return { code: r.code, out: lines(r.stdout), err: lines(r.stderr) };
+  } finally {
+    await Deno.remove(built);
+  }
 }
 
 Deno.test("an application written entirely in wac runs, and agrees with wc", async () => {
-  const c = collector();
-  const code = await runApp(WC, { args: [WC], fs: { read: true }, log: c.log, warn: c.warn });
-  assertEquals(code, 0);
-  // Checked against the system `wc` when this was written: 76 455 2588.
-  const [lines, words, bytes] = c.out[0].split(/\s+/);
+  const r = await runBuilt([WC], { read: true });
+  assertEquals(r.code, 0, r.err.join("\n"));
+  const [lines, words, bytes] = r.out[0].split(/\s+/);
   const text = await Deno.readTextFile(WC);
   assertEquals(Number(bytes), new TextEncoder().encode(text).length, "bytes");
   assertEquals(Number(lines), text.split("\n").length - 1, "lines");
   assertEquals(Number(words), text.split(/\s+/).filter((w) => w.length > 0).length, "words");
 });
 
-Deno.test("a capability the host withholds is a failure the application can report", async () => {
-  // No `fs` option at all, so the world has no filesystem. The application gets an
+Deno.test("a capability the build withholds is a failure the application can report", async () => {
+  // Built with no grants, so the world has no filesystem. The application gets an
   // ordinary failed FileResult rather than an exception, and decides what to do.
-  const c = collector();
-  const code = await runApp(WC, { args: [WC], log: c.log, warn: c.warn });
-  assertEquals(code, 1, "the application reported failure");
-  assertEquals(c.err.length, 1);
-  assertEquals(c.err[0].includes("not granted"), true, `got: ${c.err[0]}`);
-  assertEquals(c.out.length, 0, "and printed no counts");
+  const r = await runBuilt([WC]);
+  assertEquals(r.code, 1, "the application reported failure");
+  assertEquals(r.err.length, 1);
+  assertEquals(r.err[0].includes("not granted"), true, `got: ${r.err[0]}`);
+  assertEquals(r.out.length, 0, "and printed no counts");
 });
 
 Deno.test("a missing file reaches the application as its host's message", async () => {
-  const c = collector();
-  const code = await runApp(WC, { args: ["no/such/file"], fs: { read: true }, log: c.log, warn: c.warn });
-  assertEquals(code, 1);
-  assertEquals(c.err[0].includes("no/such/file"), true, `got: ${c.err[0]}`);
+  const r = await runBuilt(["no/such/file"], { read: true });
+  assertEquals(r.code, 1);
+  assertEquals(r.err[0].includes("no/such/file"), true, `got: ${r.err[0]}`);
 });
 
-Deno.test("an application with no arguments says how to be used", async () => {
-  const c = collector();
-  assertEquals(await runApp(WC, { args: [], log: c.log, warn: c.warn }), 2);
-  assertEquals(c.err[0], "usage: wc <file>");
+Deno.test("no arguments means standard input, as wc has always meant it", async () => {
+  // Piped explicitly: a program that reads stdin blocks on a terminal, which is correct
+  // behaviour and a hung test if the pipe is left to chance.
+  const r = await runFilter(WC, [], new TextEncoder().encode("one two\nthree\n"));
+  assertEquals(r.code, 0, r.err);
+  assertEquals(new TextDecoder().decode(r.out).trim(), "2 3 14");
 });
 
 Deno.test("env distinguishes unset from empty", async () => {
-  const c = collector();
-  await runApp(WC, {
-    args: [WC], fs: { read: true }, log: c.log, warn: c.warn,
-    env: (n) => (n === "WC_VERBOSE" ? "" : undefined),
-  });
   // An empty value is still *set*, so the timing line appears. A nullable string is what
   // makes the difference expressible at all — it is why `string?` had to cross.
-  assertEquals(c.out.length, 2, `expected the timing line, got ${JSON.stringify(c.out)}`);
-  assertEquals(c.out[1].startsWith("counted in "), true);
+  const set = await runBuilt([WC], { read: true, env: true }, { WC_VERBOSE: "" });
+  assertEquals(set.out.length, 2, `expected the timing line, got ${JSON.stringify(set.out)}`);
+  assertEquals(set.out[1].startsWith("counted in "), true);
 
-  const c2 = collector();
-  await runApp(WC, { args: [WC], fs: { read: true }, log: c2.log, warn: c2.warn });
-  assertEquals(c2.out.length, 1, "unset means absent");
+  const unset = await runBuilt([WC], { read: true, env: true });
+  assertEquals(unset.out.length, 1, "unset means absent");
 });
 
 // ── The bridge itself ─────────────────────────────────────────────────────────
@@ -187,32 +197,261 @@ Deno.test("an application builds to one executable file and runs repeatedly", as
   const { buildApp } = await import("../build.ts");
   const out = await Deno.makeTempFile({ prefix: "wac-app-" });
   try {
-    await buildApp(WC, out);
+    await buildApp(WC, out, { read: true });
     const stat = await Deno.stat(out);
     assertEquals(stat.mode !== null && (stat.mode & 0o111) !== 0, true, "executable");
-    assertEquals((await Deno.readTextFile(out)).startsWith("#!"), true, "has a shebang");
+    assertEquals(
+      (await Deno.readTextFile(out)).split("\n")[0],
+      "#!/usr/bin/env -S deno run --allow-read",
+      "the shebang states the grants and nothing more",
+    );
 
     for (let i = 0; i < 3; i++) {
-      const r = new Deno.Command(out, {
-        args: ["--allow-read", "--", WC],
-        stdout: "piped",
-        stderr: "piped",
-      }).outputSync();
+      // No permission flags and no separator: a built program takes the arguments a
+      // program takes. What it may *do* was decided at build.
+      const r = new Deno.Command(out, { args: [WC], stdout: "piped", stderr: "piped" })
+        .outputSync();
       const stdout = new TextDecoder().decode(r.stdout).trim();
       assertEquals(r.code, 0, `run ${i}: ${new TextDecoder().decode(r.stderr)}`);
       assertEquals(stdout.endsWith(WC), true, `run ${i} counted the file: ${stdout}`);
     }
 
-    // Capabilities are granted by the flags given to the file, not baked in at build.
-    const denied = new Deno.Command(out, { args: ["--", WC], stdout: "piped", stderr: "piped" })
-      .outputSync();
-    assertEquals(denied.code, 1, "denied a filesystem, the application says so");
-    assertEquals(
-      new TextDecoder().decode(denied.stderr).includes("not granted"),
-      true,
-      new TextDecoder().decode(denied.stderr),
-    );
+    // The same application built without the grant: the capability is simply absent, and
+    // nothing the caller passes can put it back.
+    const bare = await Deno.makeTempFile({ prefix: "wac-app-nofs-" });
+    try {
+      await buildApp(WC, bare);
+      const denied = new Deno.Command(bare, { args: [WC], stdout: "piped", stderr: "piped" })
+        .outputSync();
+      assertEquals(denied.code, 1, "no filesystem, and the application says so");
+      assertEquals(
+        new TextDecoder().decode(denied.stderr).includes("not granted"),
+        true,
+        new TextDecoder().decode(denied.stderr),
+      );
+      // The shebang is exactly the grants, so a program granted nothing asks for nothing.
+      // That is only possible because the worker comes from a blob URL: spawning the file
+      // itself needs --allow-read, which used to sit in every shebang and read as a
+      // filesystem grant to anyone auditing it.
+      assertEquals(
+        (await Deno.readTextFile(bare)).split("\n")[0],
+        "#!/usr/bin/env -S deno run",
+        "no capabilities, no permissions",
+      );
+    } finally {
+      await Deno.remove(bare);
+    }
   } finally {
     await Deno.remove(out);
   }
+});
+
+Deno.test("the same application builds for Node and agrees with the Deno build", async () => {
+  // The bridge, the opcodes and the capability structs are shared; only a dozen closures
+  // and the thread API differ. This is what checks that claim rather than asserting it.
+  const { buildApp } = await import("../build.ts");
+  const denoOut = await Deno.makeTempFile({ prefix: "wac-deno-" });
+  const nodeOut = await Deno.makeTempFile({ prefix: "wac-node-" });
+  try {
+    await buildApp(WC, denoOut, { read: true }, "deno");
+    await buildApp(WC, nodeOut, { read: true }, "node");
+
+    assertEquals(
+      (await Deno.readTextFile(nodeOut)).split("\n")[0],
+      "#!/usr/bin/env node",
+      "Node has no permission system, so its shebang states nothing",
+    );
+
+    const run = (path: string, cmd?: string) => {
+      const r = cmd
+        ? new Deno.Command(cmd, { args: [path, WC], stdout: "piped", stderr: "piped" }).outputSync()
+        : new Deno.Command(path, { args: [WC], stdout: "piped", stderr: "piped" }).outputSync();
+      return {
+        code: r.code,
+        out: new TextDecoder().decode(r.stdout).trim(),
+        err: new TextDecoder().decode(r.stderr).trim(),
+      };
+    };
+
+    const d = run(denoOut);
+    const n = run(nodeOut, "node");
+    assertEquals(d.code, 0, d.err);
+    assertEquals(n.code, 0, n.err);
+    assertEquals(n.out, d.out, "byte for byte, the same answer from both runtimes");
+
+    // And the capability boundary holds on Node, where it is the *only* boundary — there
+    // is no process-level permission behind it.
+    const bare = await Deno.makeTempFile({ prefix: "wac-node-nofs-" });
+    try {
+      await buildApp(WC, bare, {}, "node");
+      const denied = new Deno.Command("node", { args: [bare, WC], stdout: "piped", stderr: "piped" })
+        .outputSync();
+      assertEquals(denied.code, 1);
+      assertEquals(
+        new TextDecoder().decode(denied.stderr).includes("not granted"),
+        true,
+        new TextDecoder().decode(denied.stderr),
+      );
+    } finally {
+      await Deno.remove(bare);
+    }
+  } finally {
+    await Deno.remove(denoOut);
+    await Deno.remove(nodeOut);
+  }
+});
+
+// ── Filters: stdin, byte output, stat, readDir ────────────────────────────────
+
+const HEXDUMP = "packages/platform/example/hexdump.wac";
+
+/** Build once, then run with the given stdin and arguments. */
+async function runFilter(
+  entry: string,
+  args: string[],
+  stdin: Uint8Array,
+  grants: Grants = {},
+): Promise<{ code: number; out: Uint8Array; err: string }> {
+  const built = await Deno.makeTempFile({ prefix: "wac-filter-" });
+  try {
+    await buildApp(entry, built, grants);
+    const child = new Deno.Command(built, {
+      args,
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    const w = child.stdin.getWriter();
+    await w.write(stdin);
+    await w.close();
+    const r = await child.output();
+    return { code: r.code, out: r.stdout, err: new TextDecoder().decode(r.stderr) };
+  } finally {
+    await Deno.remove(built);
+  }
+}
+
+Deno.test("a program can be a filter: stdin in, exact bytes out", async () => {
+  // The gap that mattered most. `log` appends a newline and assumes text, so nothing
+  // could emit binary — every compressor and encoder was a file-to-file tool and could
+  // not go in a pipe. `readStdin` and `write` are what change that, and neither needs a
+  // grant: what the user pipes in and what the program prints are the user's own doing.
+  const input = new TextEncoder().encode("hello, wac");
+  const r = await runFilter(HEXDUMP, [], input);
+  assertEquals(r.code, 0, r.err);
+  const text = new TextDecoder().decode(r.out);
+  assertEquals(text.startsWith("00000000  68 65 6c 6c 6f 2c 20 77 61 63"), true, text);
+  // Exactly one line, ending in a newline — `write` added nothing of its own.
+  assertEquals(text.split("\n").length, 2, JSON.stringify(text));
+
+  // Bytes, not text: 0x00 and 0xFF survive, which a string-shaped output would mangle.
+  const binary = await runFilter(HEXDUMP, [], new Uint8Array([0, 255, 128]));
+  assertEquals(new TextDecoder().decode(binary.out).includes("00 ff 80"), true);
+});
+
+Deno.test("wc reads standard input when given no file", async () => {
+  const text = await Deno.readTextFile(WC);
+  const r = await runFilter(WC, [], new TextEncoder().encode(text));
+  assertEquals(r.code, 0, r.err);
+  const [lines, words, bytes] = new TextDecoder().decode(r.out).trim().split(/\s+/);
+  assertEquals(Number(bytes), new TextEncoder().encode(text).length);
+  assertEquals(Number(lines), text.split("\n").length - 1);
+  assertEquals(Number(words), text.split(/\s+/).filter((w) => w.length > 0).length);
+});
+
+Deno.test("stat and readDir reach the application, and are gated", async () => {
+  const listed = await runFilter(HEXDUMP, ["packages/platform/src"], new Uint8Array(), {
+    read: true,
+  });
+  assertEquals(listed.code, 0, listed.err);
+  assertEquals(new TextDecoder().decode(listed.out).trim(), "platform.wac");
+
+  // Without the grant, `stat` reports "does not exist" rather than throwing: an
+  // application cannot tell a withheld capability from an absent file, which is the
+  // right amount for it to know.
+  const denied = await runFilter(HEXDUMP, ["packages/platform/src"], new Uint8Array());
+  assertEquals(denied.code, 1);
+  assertEquals(denied.err.includes("not found"), true, denied.err);
+});
+
+// ── box: many applets in one program ──────────────────────────────────────────
+
+const BOX = "packages/platform/example/box.wac";
+
+Deno.test("box's applets agree with the system tools they imitate", async () => {
+  // The widest test of the world so far, and a differential one: every applet here is
+  // compared against the real utility rather than against my idea of it. `sha256sum` and
+  // `base64` go through this repo's own crypto and codec packages, so this is also the
+  // first application to compose several packages at once.
+  const built = await Deno.makeTempFile({ prefix: "wac-box-" });
+  const input = "alpha beta\ngamma\ndelta epsilon zeta\n";
+  const fixture = await Deno.makeTempFile({ prefix: "wac-box-in-" });
+  try {
+    await buildApp(BOX, built, { read: true });
+    await Deno.writeTextFile(fixture, input);
+
+    const box = (args: string[]) => {
+      const r = new Deno.Command(built, { args, stdout: "piped", stderr: "piped" }).outputSync();
+      return { code: r.code, out: new TextDecoder().decode(r.stdout) };
+    };
+    const sys = (cmd: string, args: string[]) => {
+      const r = new Deno.Command(cmd, { args, stdout: "piped", stderr: "null" }).outputSync();
+      return new TextDecoder().decode(r.stdout);
+    };
+
+    // Byte-for-byte against the real thing, where the real thing exists here.
+    for (const [applet, cmd] of [["cat", "cat"], ["rev", "rev"], ["nl", "nl"], ["base64", "base64"]]) {
+      assertEquals(box([applet, fixture]).out, sys(cmd, [fixture]), `${applet} differs`);
+    }
+    assertEquals(
+      box(["sha256sum", fixture]).out.split(" ")[0],
+      sys("sha256sum", [fixture]).split(" ")[0],
+      "sha256sum differs",
+    );
+
+    // `wc` prints its columns without padding, so compare the numbers rather than the text.
+    assertEquals(
+      box(["wc", fixture]).out.trim().split(/\s+/).slice(0, 3).join(" "),
+      sys("wc", [fixture]).trim().split(/\s+/).slice(0, 3).join(" "),
+      "wc counts differ",
+    );
+
+    assertEquals(box(["basename", "a/b/c.txt"]).out.trim(), "c.txt");
+    assertEquals(box(["dirname", "a/b/c.txt"]).out.trim(), "a/b");
+    assertEquals(box(["echo", "hello", "wac"]).out.trim(), "hello wac");
+    assertEquals(box(["seq", "3"]).out.trim().split("\n").join(","), "1,2,3");
+    assertEquals(box(["true"]).code, 0);
+    assertEquals(box(["false"]).code, 1);
+    assertEquals(box(["nope"]).code, 2, "an unknown applet is a usage error");
+
+    // head and tail against a file with more lines than they take.
+    const many = await Deno.makeTempFile();
+    try {
+      await Deno.writeTextFile(many, Array.from({ length: 15 }, (_, i) => i + 1).join("\n") + "\n");
+      assertEquals(box(["head", many]).out, sys("head", ["-10", many]), "head differs");
+      assertEquals(box(["tail", many]).out, sys("tail", ["-10", many]), "tail differs");
+    } finally {
+      await Deno.remove(many);
+    }
+  } finally {
+    await Deno.remove(built);
+    await Deno.remove(fixture);
+  }
+});
+
+Deno.test("box works as a filter, and its applets need only what they use", async () => {
+  const input = new TextEncoder().encode("one two\nthree\n");
+  // No grants at all: reading standard input is not a capability, so a pipeline works
+  // even where the filesystem was withheld.
+  const piped = await runFilter(BOX, ["wc"], input);
+  assertEquals(piped.code, 0, piped.err);
+  assertEquals(new TextDecoder().decode(piped.out).trim(), "2 3 14");
+
+  const hashed = await runFilter(BOX, ["sha256sum"], input);
+  assertEquals(new TextDecoder().decode(hashed.out).trim().endsWith("  -"), true, "stdin is '-'");
+
+  // But a file still needs the grant, and says so.
+  const denied = await runFilter(BOX, ["cat", "README.md"], new Uint8Array());
+  assertEquals(denied.code, 1);
+  assertEquals(denied.err.includes("not granted"), true, denied.err);
 });

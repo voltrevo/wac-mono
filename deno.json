@@ -4,6 +4,7 @@
   },
   "tasks": {
     "bench": "deno run -A tools/bench.ts",
+    "bench:zstd": "deno run -A packages/zstd/bench/ratio.ts",
     "bench:json": "deno run -A packages/json/bench/throughput.ts",
     "bench:json-lookup": "deno run -A packages/json/bench/lookup.ts",
     "coverage": "deno run -A tools/coverage.ts",
@@ -30,7 +31,7 @@
     "mutate:operators": "deno run -A tools/mutate.ts --operators",
     "serve": "deno run -A packages/server/host/serve.ts",
     "app:build": "deno run --allow-read --allow-write --allow-run --allow-env packages/platform/build.ts",
-    "app": "deno run --allow-read --allow-write --allow-env --allow-net packages/platform/app.ts",
+    "app": "deno run --allow-read --allow-write --allow-env --allow-run packages/platform/app.ts",
     "wac:pin": "deno run --allow-read --allow-write --allow-run tools/wacPin.ts",
     "test": "deno test --parallel --allow-read --allow-write --allow-run --allow-net --allow-env",
     "validate": "deno run -A tools/validate.ts",

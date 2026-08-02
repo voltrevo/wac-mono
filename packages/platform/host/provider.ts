@@ -42,9 +42,16 @@ export function coreOf(b: Bridge, cls: { Core: PlatformClasses["Core"] }): unkno
  */
 export function cliOf(
   b: Bridge,
-  cls: { Cli: PlatformClasses["Cli"]; FileResult: new (ref: unknown) => unknown },
-  mk: { fileResult(ok: boolean, bytes: Uint8Array, error: string): unknown },
+  cls: {
+    Cli: PlatformClasses["Cli"];
+    FileResult: { of(...a: unknown[]): unknown };
+    Stat: { of(...a: unknown[]): unknown };
+  },
 ): unknown {
+  const mk = {
+    fileResult: (ok: boolean, bytes: Uint8Array, error: string) =>
+      cls.FileResult.of(ok, bytes, error),
+  };
   return cls.Cli.of(
     () => readI32le(hostCall(b, OP.ARG_COUNT, new Uint8Array(0))),
     (i: number) => unstr(hostCall(b, OP.ARG, i32le(i))),
@@ -54,6 +61,9 @@ export function cliOf(
       // different and a bare empty payload cannot say which this is.
       return out[0] === 1 ? unstr(out.subarray(1)) : null;
     },
+    // stdin and stdout, which need no grant — see the note in platform.wac.
+    () => hostCall(b, OP.READ_STDIN, new Uint8Array(0)),
+    (bytes: Uint8Array) => { hostCall(b, OP.WRITE_STDOUT, bytes); },
     (path: string) => {
       try {
         return mk.fileResult(true, hostCall(b, OP.READ_FILE, str(path)), "");
@@ -72,6 +82,29 @@ export function cliOf(
         return true;
       } catch {
         return false;
+      }
+    },
+    (path: string) => {
+      try {
+        const out = hostCall(b, OP.STAT, str(path));
+        // exists, isFile, isDir as bytes, then size and mtime as little-endian i64s.
+        const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
+        return cls.Stat.of(
+          out[0] === 1, out[1] === 1, out[2] === 1,
+          dv.getBigInt64(3, true), dv.getBigInt64(11, true),
+        );
+      } catch {
+        return cls.Stat.of(false, false, false, 0n, 0n);
+      }
+    },
+    (path: string) => {
+      try {
+        const out = hostCall(b, OP.READ_DIR, str(path));
+        if (out.length === 0) return [];
+        // NUL-separated: a filename may contain anything but a NUL or a slash.
+        return unstr(out).split("\u0000");
+      } catch {
+        return null;
       }
     },
   );

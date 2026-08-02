@@ -1,27 +1,35 @@
-// The entry point of a bundled application: one file that is both the launcher and the
-// worker it launches.
+// The two halves of a bundled application: the launcher, and the worker it launches.
 //
-// A self-contained executable cannot reference a sibling `worker.ts`, so the bundle spawns
-// *itself* — `new Worker(import.meta.url)` re-runs the same file, which notices it is on a
-// worker and runs the application instead of launching one. A shebang does not get in the
-// way; that was checked rather than assumed.
+// A built program carries the worker's *source* as a string and spawns it from a blob
+// URL. The obvious alternative — `new Worker(import.meta.url)`, the file spawning itself —
+// works, but needs `--allow-read` on the file, which put a permission in every program's
+// shebang that had nothing to do with what the program could do. A blob URL needs none,
+// so the shebang is now exactly the capabilities the build granted, and a program granted
+// nothing asks for nothing.
 //
-// Detection is `WorkerGlobalScope`, not `import.meta.main`, which is **true in both** — a
-// distinction that would have failed silently, since the bundle would have launched a
-// launcher rather than an application.
+// Worker detection is still `WorkerGlobalScope` rather than `import.meta.main`, which is
+// true in both — the worker bundle has its own entry now, but the check guards the
+// message handler below and getting it wrong would fail silently.
 
 import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
 import { denoWorld } from "./deno.ts";
 import { cliOf, coreOf } from "./provider.ts";
 
-/** The generated module of an application: its classes, and its `App`. */
+/**
+ * The generated module of an application.
+ *
+ * `main(Core, Cli) -> i32` is the whole contract. It was a struct with `start` and `run`
+ * first, which bought nothing: a program that runs once and exits has no state to keep
+ * between calls, so the struct was ceremony around a function. A *service*, called
+ * repeatedly, will want the struct — and can have it then.
+ */
 export type AppModule = {
   Core: { of(...a: unknown[]): unknown };
   Cli: { of(...a: unknown[]): unknown };
-  FileResult: new (ref: unknown) => unknown;
-  fileResult?: (ok: boolean, bytes: Uint8Array, error: string) => unknown;
-  App: { start(...a: unknown[]): { run(): number } };
+  FileResult: { of(...a: unknown[]): unknown };
+  Stat: { of(...a: unknown[]): unknown };
+  main: (core: unknown, cli: unknown) => number;
 };
 
 type Start = { sab: SharedArrayBuffer };
@@ -58,21 +66,35 @@ function firstMessage(): Promise<Start> {
   return new Promise<Start>((res) => { deliver = res; });
 }
 
-const USAGE = `usage: <app> [--allow-read] [--allow-write] [--allow-env] [-- args...]
-
-Capabilities are granted here and nowhere else: without --allow-read the application
-is told the filesystem was not granted, exactly as if it had failed.`;
+/**
+ * What the build granted this application. Baked in, not parsed from the command line.
+ *
+ * A built program should look like any other program: `./wc README.md`, not
+ * `./wc --allow-read -- README.md`. Deciding at build is also the more honest place —
+ * whoever packages the thing chooses what it may do, and the person running it cannot
+ * quietly widen that.
+ */
+export type Grants = { read?: boolean; write?: boolean; env?: boolean };
 
 /**
- * Run a bundled application. Called by the generated entry with its own module.
+ * The worker half: wait for the bridge, build the capabilities, run `main`.
  *
- * On the main thread this parses the command line, grants what it says, spawns the
- * worker and exits with the application's code. On a worker it builds the capability
- * structs and runs the application.
+ * Called by the generated worker entry, which imports this module *before* the
+ * application so the handler above is installed first.
  */
-export async function runBundled(app: AppModule): Promise<void> {
-  if (onWorker()) return runAsWorker(app);
-  await runAsLauncher();
+export async function runAsWorkerEntry(app: AppModule): Promise<void> {
+  await runAsWorker(app);
+}
+
+/**
+ * The launcher half: serve the granted capabilities, spawn the worker, exit with its code.
+ *
+ * `workerSource` is the worker bundle, carried as a string and spawned from a blob URL so
+ * the program needs no filesystem permission of its own. Every argument goes to the
+ * application; the launcher takes none.
+ */
+export async function runLauncher(workerSource: string, grants: Grants = {}): Promise<void> {
+  await runAsLauncher(workerSource, grants);
 }
 
 async function runAsWorker(app: AppModule): Promise<void> {
@@ -82,16 +104,10 @@ async function runAsWorker(app: AppModule): Promise<void> {
     {
       const b = bridgeOf(start.sab);
       try {
-        const mk = {
-          fileResult: (ok: boolean, bytes: Uint8Array, error: string) => {
-            if (typeof app.fileResult !== "function") {
-              throw new Error("the application must export `fileResult` to use readFile");
-            }
-            return app.fileResult(ok, bytes, error);
-          },
-        };
-        const instance = app.App.start(coreOf(b, app), cliOf(b, app, mk));
-        worker.postMessage({ ok: true, code: instance.run() });
+        if (typeof app.main !== "function") {
+          throw new Error("an application must export `main(Core, Cli) -> i32`");
+        }
+        worker.postMessage({ ok: true, code: app.main(coreOf(b, app), cliOf(b, app)) });
       } catch (err) {
         worker.postMessage({ ok: false, error: err instanceof Error ? err.message : String(err) });
       }
@@ -99,25 +115,16 @@ async function runAsWorker(app: AppModule): Promise<void> {
   }
 }
 
-async function runAsLauncher(): Promise<void> {
-  const argv = [...Deno.args];
-  if (argv.includes("--help") || argv.includes("-h")) {
-    console.log(USAGE);
-    Deno.exit(0);
-  }
-  const sep = argv.indexOf("--");
-  const flags = sep < 0 ? argv : argv.slice(0, sep);
-  const appArgs = sep < 0 ? [] : argv.slice(sep + 1);
-  const has = (f: string) => flags.includes(f);
-
+async function runAsLauncher(workerSource: string, grants: Grants): Promise<void> {
   const bridge = newBridge();
   const responder = serveHostCalls(bridge, denoWorld({
-    args: appArgs,
-    fs: { read: has("--allow-read"), write: has("--allow-write") },
-    env: has("--allow-env") ? (n) => Deno.env.get(n) : undefined,
+    args: [...Deno.args],
+    fs: { read: grants.read === true, write: grants.write === true },
+    env: grants.env === true ? (n) => Deno.env.get(n) : undefined,
   }));
 
-  const worker = new Worker(import.meta.url, { type: "module" });
+  const url = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
+  const worker = new Worker(url, { type: "module" });
   const finished = new Promise<number>((resolve, reject) => {
     worker.onmessage = (e: MessageEvent) => {
       const m = e.data as Result;
@@ -136,5 +143,6 @@ async function runAsLauncher(): Promise<void> {
   } finally {
     responder.stop();
     worker.terminate();
+    URL.revokeObjectURL(url);
   }
 }
