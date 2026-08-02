@@ -246,3 +246,53 @@ Deno.test("a corrupted frame fails its checksum", async () => {
     if (!trapped) throw new Error(`a frame with byte ${i} of its checksum flipped was accepted`);
   }
 });
+
+Deno.test("a frame that needs a dictionary is refused, not guessed at", async () => {
+  // Dictionaries are not implemented. What matters is that a frame needing one fails rather
+  // than producing plausible rubbish — so this checks the two shapes such a frame can take.
+  const dict = enc.encode("the quick brown fox jumps over the lazy dog ".repeat(20));
+  const data = enc.encode("the quick brown fox jumps over the lazy dog again and again");
+
+  const script = `
+    const z = require("zlib");
+    const c = [];
+    process.stdin.on("data", d => c.push(d)).on("end", () => {
+      const { dict, data } = JSON.parse(Buffer.concat(c).toString());
+      process.stdout.write(JSON.stringify({
+        withDict: z.zstdCompressSync(Buffer.from(data, "base64"), { dictionary: Buffer.from(dict, "base64") }).toString("base64"),
+        plain: z.zstdCompressSync(Buffer.from(data, "base64")).toString("base64"),
+      }));
+    });`;
+  const cmd = new Deno.Command("node", { args: ["-e", script], stdin: "piped", stdout: "piped" });
+  const child = cmd.spawn();
+  const w = child.stdin.getWriter();
+  await w.write(new TextEncoder().encode(JSON.stringify({ dict: b64(dict), data: b64(data) })));
+  await w.close();
+  const r = JSON.parse(new TextDecoder().decode((await child.output()).stdout)) as { withDict: string; plain: string };
+
+  // The same content without a dictionary still decodes, so the refusal below is about the
+  // dictionary and not about this content.
+  if (same(mod.decompress(unb64(r.plain)), data) !== -2) throw new Error("the plain frame does not decode");
+
+  // A raw-content dictionary declares no identifier, so it cannot be detected from the header.
+  // It is refused because a match reaches back before the start of the output.
+  let trapped = false;
+  try {
+    mod.decompress(unb64(r.withDict));
+  } catch {
+    trapped = true;
+  }
+  if (!trapped) throw new Error("a frame compressed against a dictionary was decoded anyway");
+
+  // A frame that *declares* a dictionary identifier is refused on sight. Built by hand, because
+  // producing one needs a trained dictionary: the header's low two bits give the identifier's
+  // width, and one byte of it is enough.
+  const declared = new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 0x20 | 1, 7, 0x01, ...unb64(r.plain).slice(6)]);
+  let refused = false;
+  try {
+    mod.decompress(declared);
+  } catch {
+    refused = true;
+  }
+  if (!refused) throw new Error("a frame declaring a dictionary id was decoded anyway");
+});

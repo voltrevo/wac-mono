@@ -1,0 +1,76 @@
+// A word-count application, entire. There is no TypeScript in this directory.
+//
+// `deno task app packages/platform/example/wc.wac -- <file>`
+//
+// Two things are worth noticing about it. It reads a file with what looks like an
+// ordinary function call — behind that call the host is doing `await Deno.readFile` on
+// another thread while this one is parked — and it can reach nothing that was not handed
+// to it, so the two capability structs in `start` are the complete list of what it can do.
+
+import { Cli, Core, FileResult } from "../src/platform.wac";
+
+/** The host needs wac to build one of these; a struct has no constructor JS can reach. */
+export FileResult fileResult(bool ok, u8[] bytes, string error) {
+  return FileResult(ok, bytes, error);
+}
+
+export struct App {
+  Core core;
+  Cli cli;
+
+  App start(Core core, Cli cli) { return App(core, cli); }
+
+  i32 run(this) {
+    if (this.cli.argCount() < 1) {
+      this.core.warn("usage: wc <file>");
+      return 2;
+    }
+    string path = this.cli.arg(0);
+    FileResult f = this.cli.readFile(path);
+    if (!f.ok) {
+      this.core.warn("wc: " + path + ": " + f.error);
+      return 1;
+    }
+
+    i64 startedAt = this.core.monotonicNanos();
+    Counts c = count(f.bytes);
+    i64 tookNanos = this.core.monotonicNanos() - startedAt;
+
+    this.core.log(itoa(c.lines) + " " + itoa(c.words) + " " + itoa(c.bytes) + " " + path);
+    string? verbose = this.cli.env("WC_VERBOSE");
+    if (verbose is null) { return 0; }
+    this.core.log("counted in " + itoa((tookNanos / 1000) as~ i32) + "us");
+    return 0;
+  }
+}
+
+struct Counts { i32 lines; i32 words; i32 bytes; }
+
+Counts count(u8[] data) {
+  i32 lines = 0;
+  i32 words = 0;
+  bool inWord = false;
+  for (i32 i = 0; i < data.len(); i++) {
+    // A packed element already reads as an i32, which is what a character literal is.
+    i32 b = data[i];
+    if (b == '\n') { lines++; }
+    bool space = b == ' ' || b == '\n' || b == '\t' || b == '\r';
+    if (space) { inWord = false; }
+    else if (!inWord) { inWord = true; words++; }
+  }
+  return Counts(lines, words, data.len());
+}
+
+/** Decimal, without pulling `fmt` in for a demonstration. */
+string itoa(i32 n) {
+  if (n == 0) { return "0"; }
+  i32 v = n < 0 ? 0 - n : n;
+  u8[] digits = u8[12](fill: 0);
+  i32 at = 12;
+  // An array element takes an i32 and truncates at the store; there is no u8 value form.
+  while (v > 0) { at--; digits[at] = '0' + (v % 10); v = v / 10; }
+  u8[] used = u8[12 - at](fill: 0);
+  used.copyFrom(digits, at, 0, 12 - at);
+  string s = string.fromBytes(used);
+  return n < 0 ? "-" + s : s;
+}
