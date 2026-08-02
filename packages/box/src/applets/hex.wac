@@ -1,0 +1,19 @@
+// Encoded, with a trailing newline. Two characters per byte and no alignment to keep, so
+// each chunk encodes on its own and the newline is the only thing left for the end.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, openStream } from "../lib/input.wac";
+import { encode as hexencode } from "../../../codec/src/hex.wac";
+
+export i32 hex(Core core, Cli cli, Args a) {
+  Input in = openStream(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  while (true) {
+    u8[] chunk = cli.readChunk();
+    if (chunk.len() == 0) { break; }
+    cli.write(hexencode(chunk));
+  }
+  cli.write(u8[1](fill: '\n'));
+  return 0;
+}

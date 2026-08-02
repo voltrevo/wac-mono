@@ -46,6 +46,14 @@ const CASES: Case[] = [
     run: (m, k) => { m.exports.aesExpandKey(bytes(m, k)); } },
   { name: "aesEncrypt", entry: "packages/crypto/src/aes.wac", keys: KEYS16,
     run: (m, k) => { m.exports.aesEncrypt(bytes(m, k), bytes(m, BLOCK)); } },
+  // One round and two passwords: a single bcrypt hash is already 129 key expansions, so the
+  // event count dwarfs everything above and a third password would say nothing more.
+  //
+  // Included even though the answer is known in advance — bcrypt indexes its S-boxes with state
+  // derived from the password, by design — because "we did not measure it" and "it is fine" look
+  // identical in a table that omits the row.
+  { name: "bcryptPbkdf", entry: "packages/crypto/src/bcryptpbkdf.wac", keys: KEYS16.slice(0, 2),
+    run: (m, k) => { m.exports.bcryptPbkdf(bytes(m, k), bytes(m, BLOCK), 32, 1); } },
 ];
 
 console.log("| routine | events per run | result |");
@@ -55,7 +63,15 @@ for (const c of CASES) {
   const m = await ctModule(c.entry);
   const base = traceOf(m, () => c.run(m, c.keys[0]));
   if (base.events.length === 0) throw new Error(`${c.name}: no events — did the call happen?`);
-  if (base.truncated) throw new Error(`${c.name}: trace overflowed; raise TRACE_SLOTS`);
+  // A routine can be too expensive to trace at all. `TRACE_SLOTS` is 2^22 events and lives in the
+  // compiler, so it is not ours to raise; a KDF is *designed* to cost more than that and no
+  // parameter brings it under. Say so in the table rather than dropping the row, because an
+  // omitted routine and a clean one look identical to a reader. See wac issue 0059.
+  if (base.truncated) {
+    console.log(`| \`${c.name}\` | >4,194,304 | **not measured** — trace exceeds the compiler's ` +
+                `event buffer, which a KDF's cost is meant to |`);
+    continue;
+  }
 
   const sites = new Map<string, string>();
   let stopped = false;

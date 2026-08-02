@@ -1,0 +1,109 @@
+// Flags and positional arguments, parsed once for every applet.
+//
+// Without this each applet hardcoded its behaviour — `head` always took ten lines and `wc`
+// could not do `-l`. One parser makes a dozen of them real rather than approximate.
+
+import { Cli } from "../../../platform/src/platform.wac";
+import { slice } from "./bytes.wac";
+import { atoi } from "./num.wac";
+
+export struct Args {
+  /**
+   * What to call this program in its own error messages.
+   *
+   * Under `box` it is the applet name, so `mkdir` says "mkdir: ...". Built alone it is
+   * whatever the entry point in `bin/` passes, because a program in this model genuinely
+   * does not know its own name — argv starts at its first real argument, and nothing
+   * hands it argv[0]. Hardcoding "box: " here would have been a lie in half the builds.
+   */
+  string name;
+  /** The letters of every `-x` flag, concatenated: `-iv` and `-i -v` both give "iv". */
+  string flags;
+  /** `-5`, or `-n 5`. Zero when absent, which each applet reads as its own default. */
+  i32 num;
+  string[] rest;
+}
+
+export bool has(Args a, i32 flag) {
+  u8[] f = a.flags.toBytes();
+  for (i32 i = 0; i < f.len(); i++) { if (f[i] == flag) { return true; } }
+  return false;
+}
+
+/**
+ * The arguments as `box` sees them: index 0 is the applet name, so parsing starts at 1.
+ *
+ * A standalone build of one applet has no name to skip and uses `parseFrom(cli, 0, "wc")`.
+ * The applet itself is identical either way — that is the point of the split, and of
+ * `bin/`.
+ */
+export Args parseArgs(Cli cli) {
+  return parseFrom(cli, 1, cli.arg(0));
+}
+
+export Args parseFrom(Cli cli, i32 first, string name) {
+  // Counted first so the array is the right size: there is no growable list here, and
+  // walking twice is less code than guessing a capacity and copying.
+  i32 count = 0;
+  for (i32 i = first; i < cli.argCount(); i++) {
+    if (!isFlag(cli.arg(i))) { count++; }
+  }
+  string[] rest = string[count](fill: "");
+
+  string flags = "";
+  i32 num = 0;
+  i32 at = 0;
+  i32 i = first;
+  while (i < cli.argCount()) {
+    string s = cli.arg(i);
+    if (!isFlag(s)) { rest[at] = s; at++; i++; continue; }
+    u8[] b = s.toBytes();
+    if (b[1] >= '0' && b[1] <= '9') {
+      num = atoi(string.fromBytes(slice(b, 1, b.len())));          // -5
+    } else {
+      for (i32 k = 1; k < b.len(); k++) {
+        bool takesValue = b[k] == 'n' && i + 1 < cli.argCount() && allDigits(cli.arg(i + 1));
+        if (takesValue) { num = atoi(cli.arg(i + 1)); i++; }       // -n 5
+        else { flags = flags + string.fromBytes(slice(b, k, k + 1)); }
+      }
+    }
+    i++;
+  }
+  return Args(name, flags, num, rest);
+}
+
+/**
+ * The value of a flag that takes one, attached: the `,` of `-d,`.
+ *
+ * Read from argv rather than from the parsed flags, because a flag's *value* cannot be told
+ * from another flag once they are all letters in one string — `-iv` is two booleans and
+ * `-d,` is one flag with an argument, and only the original spelling knows which. An applet
+ * asks for the ones it defines, so no general rule has to guess.
+ *
+ * The detached spelling `-d ,` is deliberately absent. `parseArgs` would already have put
+ * the `,` among the positional arguments, where it is indistinguishable from a filename, so
+ * an applet that accepted it here would read one argument twice. An applet should treat the
+ * empty result as a usage error rather than guess, which is what `cut` does.
+ */
+export string flagValue(Cli cli, i32 letter) {
+  // From 0, which is safe under both layouts: an applet name never begins with a dash,
+  // so `box`'s extra leading argument cannot be mistaken for a flag.
+  for (i32 i = 0; i < cli.argCount(); i++) {
+    u8[] b = cli.arg(i).toBytes();
+    if (b.len() < 2 || b[0] != '-' || b[1] != letter) { continue; }
+    if (b.len() > 2) { return string.fromBytes(slice(b, 2, b.len())); }
+  }
+  return "";
+}
+
+bool isFlag(string s) {
+  u8[] b = s.toBytes();
+  return b.len() > 1 && b[0] == '-';
+}
+
+bool allDigits(string s) {
+  u8[] b = s.toBytes();
+  if (b.len() == 0) { return false; }
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] < '0' || b[i] > '9') { return false; } }
+  return true;
+}

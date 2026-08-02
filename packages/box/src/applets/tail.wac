@@ -1,0 +1,39 @@
+// The last N lines, ten by default.
+//
+// It has to *reach* the end but not *hold* it: a ring of N lines, overwritten as they go
+// by, costs what the flag asks for rather than what the input is. `tail -10` of a
+// gigabyte holds ten lines.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, openStream } from "../lib/input.wac";
+import { Line, Lines, emit, nextLine } from "../lib/reader.wac";
+
+export i32 tail(Core core, Cli cli, Args a) {
+  Input in = openStream(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  i32 want = a.num == 0 ? 10 : a.num;
+  if (want <= 0) { return 0; }
+
+  u8[][] ring = u8[][want](fill: u8[0]());
+  bool[] terminated = bool[want](fill: true);
+  i32 seen = 0;
+  Lines s = Lines.create();
+  while (true) {
+    Line l = nextLine(s, cli);
+    if (!l.ok) { break; }
+    ring[seen % want] = l.bytes;
+    terminated[seen % want] = l.nl;
+    seen++;
+  }
+
+  // Oldest first: when fewer lines arrived than the ring holds, that is index 0; once it
+  // has wrapped, it is wherever the next write would have gone.
+  i32 take = seen < want ? seen : want;
+  i32 first = seen < want ? 0 : seen % want;
+  for (i32 i = 0; i < take; i++) {
+    i32 k = (first + i) % want;
+    emit(cli, ring[k], terminated[k]);
+  }
+  return 0;
+}
