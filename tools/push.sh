@@ -21,21 +21,39 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
-# A stale compiler makes every other package look broken, so rule it out before believing a
-# red suite. The version check in the harness reports it precisely; this just gets ahead of it.
-if [ -d ../wac ]; then
-  git -C ../wac pull --quiet --no-rebase || echo "note: could not pull wac; version check will say if it matters"
-fi
+log="$(mktemp -t push-suite-XXXXXX.log)"
 
 for attempt in 1 2 3; do
+  # Inside the loop, not before it. A merge on a later attempt can bring in a commit that
+  # bumps the compiler pin, and then the next run fails on a stale compiler for a reason
+  # that has nothing to do with the change being pushed. Pulling once at the top misses
+  # exactly that case, which is the one it was put there to catch.
+  if [ -d ../wac ]; then
+    git -C ../wac pull --quiet --no-rebase ||
+      echo "note: could not pull wac; the version check will say if it matters"
+  fi
+
   echo "== running the suite (attempt $attempt) =="
-  if ! deno task test; then
+  # Tee'd rather than swallowed. The first version printed only "tests failed", which is the
+  # one moment the output is worth having — and when this runs unattended the terminal
+  # scrollback is not there to fall back on.
+  #
+  # This is a pipeline guarding a consequential action, which is the mistake the whole file
+  # exists to prevent. It is safe *only* because `pipefail` is set above, so the pipeline
+  # takes the exit code of `deno task test` rather than of `tee`. Remove `pipefail` and this
+  # line silently starts pushing red trees. Do not drop the `set -uo pipefail`.
+  if ! deno task test 2>&1 | tee "$log"; then
+    echo
     echo "== tests failed: not pushing =="
+    echo "-- failures --"
+    grep -E 'FAILED|error:' "$log" | head -20
+    echo "-- full output: $log --"
     exit 1
   fi
 
   if git push --quiet origin master 2>/dev/null; then
     echo "== pushed =="
+    rm -f "$log"
     exit 0
   fi
 
