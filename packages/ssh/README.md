@@ -1,8 +1,9 @@
 # ssh
 
-An SSH-2 client, in wac. **Through to an encrypted connection** — version exchange, the binary
-packet protocol, algorithm negotiation, curve25519-sha256 key exchange, `ssh-ed25519` host key
-verification and the `chacha20-poly1305@openssh.com` AEAD. No authentication yet.
+An SSH-2 client, in wac. **It logs in.** Version exchange, the binary packet protocol, algorithm
+negotiation, curve25519-sha256 key exchange, `ssh-ed25519` host key verification, the
+`chacha20-poly1305@openssh.com` AEAD, reading an OpenSSH private key — encrypted or not — and
+publickey authentication. No channels yet, so it cannot run anything.
 
 > **Not for production**, for the same reason [crypto](../crypto/README.md) is not: it is built on
 > primitives that are known to leak timing, and nothing here has been reviewed by anyone.
@@ -33,6 +34,10 @@ It then sends NEWKEYS, derives the traffic keys, and carries on **encrypted**: a
 SERVICE_REQUEST goes out and the server's EXT_INFO and SERVICE_ACCEPT come back and decrypt. That
 covers the whole transport in both directions at once — a wrong key half, counter, padding rule
 or sequence number and the server drops the connection rather than replying.
+
+It then reads the client private key with its own code, signs the authentication request, and
+receives `SSH_MSG_USERAUTH_SUCCESS`. So the single interop test covers the protocol from the
+first byte to a logged-in session.
 
 Against OpenSSH 9.6 it negotiates `curve25519-sha256`, `ssh-ed25519` and
 `chacha20-poly1305@openssh.com`.
@@ -128,13 +133,33 @@ client learns `rsa-sha2-256` is available rather than the SHA-1 that `ssh-rsa` i
 `kex-strict-c-v00@openssh.com` opts in to strict KEX, which forbids the unrelated messages the
 Terrapin attack (CVE-2023-48795) used to shift sequence numbers.
 
+**`privatekey.wac`** — the `openssh-key-v1` file format, which is not PKCS#8 and not PEM RSA.
+`none` and `aes256-ctr`+`bcrypt` are read; anything else is refused by name rather than misread.
+
+**There is no MAC over the private section.** A wrong passphrase decrypts to plausible random
+bytes, and the *only* thing that notices is a random 32-bit value stored twice at the front
+failing to match itself. That is a 2^-32 false accept by design, and it means the check cannot be
+skipped — everything after it would otherwise be parsed out of noise. The private string is the
+32-byte seed followed by the public key again; only the first half is secret.
+
+**`auth.wac`** — publickey authentication, RFC 4252 §7. The signature covers **the session
+identifier followed by the request without its signature field**, and the session id is what makes
+it worth anything: without it a signature is a bearer token that a malicious server could collect
+and replay to a third party as the client. The session id is length-prefixed as a `string` even
+though nothing follows that could be confused with it — omitting that length produces a signature
+the server rejects, indistinguishable from the key being wrong.
+
 ## What is missing
 
 In the order it is needed:
 
-1. **Authentication** — `publickey` with ed25519. Encrypted private keys are already readable;
-   `bcrypt_pbkdf` landed in crypto for this.
-2. **The connection protocol** — channels, window adjustment, `exec`.
+1. **The connection protocol** — channels, window adjustment, `exec`. That is what turns a
+   logged-in connection into one that can run a command.
+
+Also absent, and worth naming rather than leaving implied: `known_hosts` is not consulted, so the
+host key is verified as *self-consistent* but not as *expected* — the interop test compares it
+against the file it generated, which a real client cannot do. Rekeying is not implemented. Neither
+is any authentication method other than publickey with Ed25519.
 
 `known_hosts` is a byte comparison against the host key blob, so there is no X.509 and no chain
 building — which is the main reason this is a smaller job than the TLS client already in the repo.
