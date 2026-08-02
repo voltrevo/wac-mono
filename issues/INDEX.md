@@ -7,6 +7,7 @@ record of what has been fixed and why.
 |---|---|---|---|
 | [0007](open/0007-json-throughput-bench-half-migrated-to-the-canonical-struct.md) | json's throughput bench is half-migrated to the Canonical struct and cannot run | bug | wrong answer |
 | [0005](open/0005-mutation-testing-found-54-untested-behaviours.md) | surviving mutants: behaviours nothing checks (31 open) | task | wrong answer |
+| [0008](open/0008-constanttime-test-needs-a-compiler-trace-mode-that-does-not-exist-yet.md) | `constanttime.test.ts` needs a compiler trace mode that does not exist yet, so the whole suite fails to type-check | bug | compile error |
 | [0003](open/0003-wacc-parser-does-not-implement-generics.md) | wacc's parser does not implement generics, so `std` is outside its corpus | missing feature | not implemented |
 | [0001](open/0001-the-compiler-is-an-unpinned-dependency.md) | the compiler is an unpinned dependency, and a stale one blames the wrong package | bug | compile error |
 
