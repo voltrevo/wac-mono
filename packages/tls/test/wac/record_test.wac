@@ -1,0 +1,229 @@
+// The TLS 1.3 record layer, in wac, against an AEAD passed in from the host.
+//
+// The oracle is `node:crypto`'s AES-128-GCM and ChaCha20-Poly1305 — the primitives, not a
+// TLS implementation. That is the right seam: what the record layer adds on top of an
+// AEAD is where the mistakes live, and none of it is checkable by an implementation that
+// makes the same assumptions we do.
+//
+// Three things sit on top, and all three are invisible if you only test a round trip:
+//
+//   the nonce      the twelve-byte IV xored with the sequence number, right-aligned. A
+//                  nonce that ignored the counter would round-trip perfectly and let an
+//                  attacker replay or reorder records at will.
+//   the AAD        the five-byte record header, authenticated but not encrypted, so a
+//                  rewritten length is detected rather than acted on.
+//   the type       the real content type is the last non-zero byte *inside* the
+//                  plaintext; the header always says application_data. A reader that
+//                  trusted the header would be reading the cover story.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  recordSeal, recordOpen, recordType, recordContent, suiteAes128Gcm,
+  suiteChaCha20, suiteKeyLen, typeHandshake, typeApplicationData, typeAlert,
+  maxPlaintext,
+} from "../../src/record.wac";
+import {
+  alertBody, alertCloseNotify, alertUnexpectedMessage, alertBadRecordMac,
+  alertHandshakeFailure, alertBadCertificate, alertUnsupportedCertificate,
+  alertCertificateExpired, alertIllegalParameter, alertUnknownCa, alertDecodeError,
+  alertDecryptError, alertProtocolVersion, alertMissingExtension,
+  alertNoApplicationProtocol,
+} from "../../src/record.wac";
+
+u8[] fill(i32 n, i32 seed) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (i * 31 + seed) & 0xFF; }
+  return out;
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+export string test_round_trips_both_suites_at_every_shape() {
+  // No oracle needed: sealing and opening are inverses or they are not.
+  T t = T.create();
+  i32[] suites = i32[](suiteAes128Gcm(), suiteChaCha20());
+  i32[] types = i32[](typeHandshake(), typeApplicationData(), typeAlert(), 20);
+  i32[] lens = i32[](0, 1, 100, 16384);
+  for (i32 s = 0; s < suites.len(); s++) {
+    i32 suite = suites[s];
+    u8[] key = fill(suiteKeyLen(suite), 4);
+    u8[] iv = fill(12, 5);
+    for (i32 ti = 0; ti < types.len(); ti++) {
+      for (i32 li = 0; li < lens.len(); li++) {
+        u8[] content = fill(lens[li], 6);
+        u8[] inner = recordOpen(suite, key, iv, 42, recordSeal(suite, key, iv, 42, types[ti], content, 3));
+        t.eqI32(recordType(inner), types[ti], "content type at len " + itoa64(lens[li] as i64));
+        t.eqBytes(recordContent(inner), content, "content at len " + itoa64(lens[li] as i64));
+      }
+    }
+  }
+  return t.report();
+}
+
+export string test_the_sequence_number_is_part_of_the_nonce() {
+  // The most valuable property here. Nothing on the wire says which record this is, so
+  // the counter is the only thing binding a ciphertext to its position — and a nonce that
+  // ignored it would round-trip, would decrypt under any host AEAD, and would let an
+  // attacker replay or reorder records freely.
+  T t = T.create();
+  u8[] key = fill(16, 7);
+  u8[] iv = fill(12, 8);
+  u8[] content = fill(50, 9);
+  i32 aes = suiteAes128Gcm();
+  u8[] first = recordSeal(aes, key, iv, 0, typeApplicationData(), content, 0);
+  u8[] second = recordSeal(aes, key, iv, 1, typeApplicationData(), content, 0);
+  t.isFalse(same(first, second), "the same content seals differently at two sequence numbers");
+
+  // The counter is right-aligned in the IV, so incrementing it must not disturb the first
+  // four bytes. Left-aligning would still work at sequence number zero and nowhere else.
+  u8[] big = recordSeal(aes, key, iv, 9223372036854775807, typeApplicationData(), content, 0);
+  u8[] back = recordOpen(aes, key, iv, 9223372036854775807, big);
+  t.eqBytes(recordContent(back), content, "a large sequence number round trips");
+  t.isFalse(same(big, first), "and seals differently from sequence number zero");
+  return t.report();
+}
+
+export string test_the_content_type_comes_from_inside_not_the_header() {
+  // TLS 1.3 puts application_data in every header and the real type in the last non-zero
+  // byte of the plaintext. A reader that trusted the header would read the cover story.
+  T t = T.create();
+  u8[] key = fill(16, 11);
+  u8[] iv = fill(12, 12);
+  i32 aes = suiteAes128Gcm();
+  i32[] types = i32[](typeHandshake(), typeAlert(), typeApplicationData());
+  for (i32 i = 0; i < types.len(); i++) {
+    u8[] rec = recordSeal(aes, key, iv, 3, types[i], fill(20, 13), 0);
+    t.eqI32(rec[0], typeApplicationData(), "the header always says application_data");
+    t.eqI32(recordType(recordOpen(aes, key, iv, 3, rec)), types[i], "the inner type survives");
+  }
+  return t.report();
+}
+
+export string test_padding_is_invisible_to_the_reader() {
+  // Padding hides length, so it must change the wire size and nothing else. A reader that
+  // returned the zeros would corrupt every padded message; one that stopped at the first
+  // zero would truncate content that legitimately ends in one.
+  T t = T.create();
+  u8[] key = fill(16, 14);
+  u8[] iv = fill(12, 15);
+  i32 aes = suiteAes128Gcm();
+  u8[] content = fill(30, 16);
+  u8[] bare = recordSeal(aes, key, iv, 0, typeHandshake(), content, 0);
+  u8[] padded = recordSeal(aes, key, iv, 0, typeHandshake(), content, 40);
+  t.eqI32(padded.len(), bare.len() + 40, "padding lengthens the record");
+  t.eqBytes(recordContent(recordOpen(aes, key, iv, 0, padded)), content,
+            "and is stripped on the way out");
+
+  // Content whose own last byte is zero, which is the case a naive strip gets wrong.
+  u8[] endsInZero = u8[8]();
+  for (i32 i = 0; i < 7; i++) { endsInZero[i] = i + 1; }
+  u8[] rec = recordSeal(aes, key, iv, 0, typeHandshake(), endsInZero, 5);
+  t.eqBytes(recordContent(recordOpen(aes, key, iv, 0, rec)), endsInZero,
+            "content ending in a zero byte survives padding");
+  return t.report();
+}
+
+export string test_sealing_agrees_with_the_host_aead(fn[u8[](i32, u8[], u8[], u8[], u8[])] aead) {
+  // `aead(suite, key, nonce, aad, ciphertext)` decrypts, and returns an empty array if
+  // the tag does not verify. Everything the record layer builds — the nonce from the
+  // sequence number, the header as additional data, the type byte appended to the
+  // plaintext — has to be right for this to come back at all.
+  T t = T.create();
+  i32[] suites = i32[](suiteAes128Gcm(), suiteChaCha20());
+  for (i32 s = 0; s < suites.len(); s++) {
+    i32 suite = suites[s];
+    u8[] key = fill(suiteKeyLen(suite), 21);
+    u8[] iv = fill(12, 22);
+    i32[] seqs = i32[](0, 1, 255, 256, 65535);
+    for (i32 q = 0; q < seqs.len(); q++) {
+      i64 seq = seqs[q] as i64;
+      u8[] content = fill(64 + seqs[q] % 7, 23);
+      u8[] rec = recordSeal(suite, key, iv, seq, typeHandshake(), content, 0);
+
+      // Rebuild the nonce the way RFC 8446 §5.3 says: the IV xored with the sequence
+      // number, right-aligned. If our sealing used a different nonce the host cannot
+      // decrypt, which is the whole assertion.
+      u8[] nonce = u8[12]();
+      for (i32 i = 0; i < 12; i++) { nonce[i] = iv[i]; }
+      for (i32 i = 0; i < 8; i++) {
+        nonce[11 - i] = nonce[11 - i] ^ (((seq >> ((i * 8) as i64)) & 255) as! i32);
+      }
+      u8[] aad = u8[5]();
+      for (i32 i = 0; i < 5; i++) { aad[i] = rec[i]; }
+      u8[] ct = u8[rec.len() - 5]();
+      for (i32 i = 0; i < ct.len(); i++) { ct[i] = rec[5 + i]; }
+
+      u8[] plain = aead(suite, key, nonce, aad, ct);
+      t.isTrue(plain.len() > 0, "the host decrypts what we sealed at seq " + itoa64(seq));
+      if (plain.len() > 0) {
+        // The plaintext is the content, then the true type, then any padding.
+        t.eqI32(plain.len(), content.len() + 1, "plaintext is content plus a type byte");
+        t.eqI32(plain[plain.len() - 1], typeHandshake(), "and the type byte is the real type");
+        bool matches = true;
+        for (i32 i = 0; i < content.len(); i++) { if (plain[i] != content[i]) { matches = false; } }
+        t.isTrue(matches, "and the content is unchanged");
+      }
+    }
+  }
+  return t.report();
+}
+
+export string test_the_header_is_authenticated(fn[u8[](i32, u8[], u8[], u8[], u8[])] aead) {
+  // The header is not encrypted, so nothing stops an attacker editing it — the AAD is
+  // what makes the edit detectable. Rewriting the length must break the tag, which the
+  // host oracle can confirm independently of our own opener.
+  T t = T.create();
+  i32 aes = suiteAes128Gcm();
+  u8[] key = fill(16, 31);
+  u8[] iv = fill(12, 32);
+  u8[] rec = recordSeal(aes, key, iv, 0, typeHandshake(), fill(40, 33), 0);
+
+  u8[] nonce = u8[12]();
+  for (i32 i = 0; i < 12; i++) { nonce[i] = iv[i]; }
+  u8[] ct = u8[rec.len() - 5]();
+  for (i32 i = 0; i < ct.len(); i++) { ct[i] = rec[5 + i]; }
+
+  u8[] goodAad = u8[5]();
+  for (i32 i = 0; i < 5; i++) { goodAad[i] = rec[i]; }
+  t.isTrue(aead(aes, key, nonce, goodAad, ct).len() > 0, "the genuine header verifies");
+
+  u8[] badAad = u8[5]();
+  for (i32 i = 0; i < 5; i++) { badAad[i] = goodAad[i]; }
+  badAad[4] = badAad[4] ^ 1;                       // one bit of the length
+  t.eqI32(aead(aes, key, nonce, badAad, ct).len(), 0, "a rewritten length breaks the tag");
+  return t.report();
+}
+
+export string test_the_alert_codes_are_the_ones_rfc_8446_assigns() {
+  // Each of these is used at some point of failure, and no test asserts which alert a
+  // rejection produces — only that it was rejected — so the numbers were unconstrained.
+  // An alert is all the other end learns about why you hung up.
+  T t = T.create();
+  t.eqI32(alertCloseNotify(), 0, "close_notify");
+  t.eqI32(alertUnexpectedMessage(), 10, "unexpected_message");
+  t.eqI32(alertBadRecordMac(), 20, "bad_record_mac");
+  t.eqI32(alertHandshakeFailure(), 40, "handshake_failure");
+  t.eqI32(alertBadCertificate(), 42, "bad_certificate");
+  t.eqI32(alertUnsupportedCertificate(), 43, "unsupported_certificate");
+  t.eqI32(alertCertificateExpired(), 45, "certificate_expired");
+  t.eqI32(alertIllegalParameter(), 47, "illegal_parameter");
+  t.eqI32(alertUnknownCa(), 48, "unknown_ca");
+  t.eqI32(alertDecodeError(), 50, "decode_error");
+  t.eqI32(alertDecryptError(), 51, "decrypt_error");
+  t.eqI32(alertProtocolVersion(), 70, "protocol_version");
+  t.eqI32(alertMissingExtension(), 109, "missing_extension");
+  t.eqI32(alertNoApplicationProtocol(), 120, "no_application_protocol");
+
+  // Only close_notify is a warning. TLS 1.3 treats everything else as fatal whatever the
+  // level says, so this is nearly decorative — but claiming a fatal condition is a
+  // warning is a lie a peer may act on by carrying on.
+  t.eqI32(alertBody(alertCloseNotify())[0], 1, "close_notify is a warning");
+  t.eqI32(alertBody(alertUnknownCa())[0], 2, "unknown_ca is fatal");
+  t.eqI32(alertBody(alertUnknownCa())[1], 48, "and carries its own description");
+  return t.report();
+}

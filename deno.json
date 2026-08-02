@@ -5,6 +5,7 @@
   "tasks": {
     "bench": "deno run -A tools/bench.ts",
     "bench:zstd": "deno run -A packages/zstd/bench/ratio.ts",
+    "bench:zstd-speed": "deno run -A packages/zstd/bench/speed.ts",
     "bench:json": "deno run -A packages/json/bench/throughput.ts",
     "bench:json-lookup": "deno run -A packages/json/bench/lookup.ts",
     "coverage": "deno run -A tools/coverage.ts",

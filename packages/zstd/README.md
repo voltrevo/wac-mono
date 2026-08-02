@@ -79,6 +79,55 @@ config, a wasm module, a native executable, Tor directory data, and something al
 in all three languages and lose on binaries and on Tor's directory data. Already-compressed input
 does not expand.
 
+### Speed
+
+`deno task bench:zstd-speed`. Each side times itself, so neither figure includes the cost of
+getting the data to the other process — but ours does include copying across the wasm boundary,
+which a caller genuinely pays.
+
+Both decoders are timed on the **same frame** — zstd's own output. Timing ours on *our* frames
+would have us verifying a checksum that zstd's default frames do not carry, which is about a
+sixth of our decode time and none of theirs; that mistake was in the first version of this
+benchmark.
+
+| | ours | zstd -3 | gzip -6 |
+|---|---:|---:|---:|
+| compress, source | 15-19 MB/s | 210-300 MB/s | 57-67 MB/s |
+| compress, tor microdescs | 33 MB/s | 798 MB/s | 70 MB/s |
+| decompress, source | 152-166 MB/s | 689-1152 MB/s | 481-619 MB/s |
+| decompress, tor microdescs | 253 MB/s | 2739 MB/s | 379 MB/s |
+
+**Compressing, 13-26x slower than `zstd -3` and 3-5x slower than `gzip -6`. Decompressing, 4.5-11x
+slower than zstd and 2-3x slower than gzip.** This is not like for like — zstd is native code with
+two decades of tuning — but the gap is larger than that alone explains, and both halves have a
+known cause.
+
+*Compressing*, the time is in the match search, and it is doing useful work: cutting the chain
+from 32 candidates to 4 makes source 64% faster and 12% bigger, and makes the Tor
+microdescriptors both **slower and 2x bigger**, because short matches mean more sequences to
+code. The other candidate is cheaper than it looks — building both codings per block and keeping
+the smaller costs 15% of the time and buys 22-29% of ratio, which is the best trade in the
+package.
+
+*Decompressing*, the bitstream reader used to take **one bit at a time**, which was the single
+biggest lever: a Huffman symbol needs an eleven-bit lookahead, so every literal cost eleven loop
+iterations. Caching a window of bits in the reader was worth **+44%** — 105 to 152 MB/s on
+source, 168 to 253 on the Tor microdescriptors.
+
+Two further attempts were worth nothing and are recorded because the reasoning behind them was
+wrong rather than merely unlucky:
+
+- replacing `push(get(i))` per matched byte with one bulk call moved decoding by 4%. The engine
+  was already inlining those calls;
+- hoisting `Buf`'s fields out of its copy loops moved nothing at all. Measured before and after:
+  885 MB/s against 894.
+
+What the same measurements did establish is where the floor is. A byte-at-a-time copy in wac runs
+at about 900 MB/s and the host's `TypedArray.set` at **72 GB/s** on the same work — eighty times
+faster — because wac has no bulk array copy and every byte pays two bounds checks. That is
+`wac` issue 0056, filed for the compressor's accumulation buffer, and it bounds the decompressor
+too. XXH64 runs at 782 MB/s for the same reason: it reads eight bytes with eight array reads.
+
 ### The whole of the Tor bootstrap data
 
 The corpus takes 2 MB slices to stay quick. The full files, which is where an encoder bug was
