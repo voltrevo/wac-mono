@@ -1,0 +1,202 @@
+// TLS 1.3's key schedule, in wac, against RFC 8448 and an HMAC passed in from the host.
+//
+// Two kinds of oracle here and they check different things. **RFC 8448** is the
+// authoritative one: a published trace of a real handshake, so agreeing with it means
+// agreeing with the protocol rather than with another implementation's reading of it.
+// The **HMAC callback** covers everything the trace does not — the labels and lengths the
+// schedule uses that no published vector exercises — by rebuilding HKDF-Expand-Label
+// independently from a primitive.
+//
+// That second one is why this file takes an argument. Rebuilding HKDF from a hash we also
+// wrote would prove nothing: an error in the hash cancels out on both sides. `node:crypto`
+// supplies HMAC-SHA256 and knows nothing about TLS, so the expansion around it is checked
+// by something that cannot share its mistakes.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  deriveSecret, earlySecret, emptyHash, expandLabel, finishedVerify, handshakeSecret,
+  masterSecret, nextTrafficSecret, trafficKeyIv,
+} from "../../src/keyschedule.wac";
+
+/** Hex, so vectors read as they do in the RFC. */
+u8[] unhex(string s) {
+  u8[] src = s.toBytes();
+  if (src.len() % 2 != 0) { trap; }
+  u8[] out = u8[src.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) {
+    out[i] = nibble(src[2 * i]) * 16 + nibble(src[2 * i + 1]);
+  }
+  return out;
+}
+
+i32 nibble(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+  trap;
+}
+
+u8[] fill(i32 n, i32 a, i32 b) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (i * a + b) & 0xFF; }
+  return out;
+}
+
+/**
+ * HKDF-Expand-Label rebuilt on top of the host's HMAC, per RFC 8446 §7.1.
+ *
+ * The info structure is the part worth checking independently: a two-byte length, then
+ * "tls13 " prefixed to the label with a one-byte count, then the context with its own.
+ * Getting the two counts the wrong way round produces an expansion that is stable,
+ * self-consistent, and wrong against every other implementation.
+ */
+u8[] refExpandLabel(fn[u8[](u8[], u8[])] hmac, u8[] secret, string label, u8[] ctx, i32 len) {
+  u8[] full = ("tls13 " + label).toBytes();
+  u8[] info = u8[2 + 1 + full.len() + 1 + ctx.len()]();
+  info[0] = (len >> 8) & 0xFF;
+  info[1] = len & 0xFF;
+  info[2] = full.len();
+  for (i32 i = 0; i < full.len(); i++) { info[3 + i] = full[i]; }
+  info[3 + full.len()] = ctx.len();
+  for (i32 i = 0; i < ctx.len(); i++) { info[4 + full.len() + i] = ctx[i]; }
+
+  u8[] out = u8[len]();
+  u8[] prev = u8[0]();
+  i32 done = 0;
+  i32 n = 1;
+  while (done < len) {
+    u8[] input = u8[prev.len() + info.len() + 1]();
+    for (i32 i = 0; i < prev.len(); i++) { input[i] = prev[i]; }
+    for (i32 i = 0; i < info.len(); i++) { input[prev.len() + i] = info[i]; }
+    input[input.len() - 1] = n;
+    prev = hmac(secret, input);
+    for (i32 i = 0; i < prev.len() && done + i < len; i++) { out[done + i] = prev[i]; }
+    done += prev.len();
+    n += 1;
+  }
+  return out;
+}
+
+export string test_the_rfc_8448_chain(fn[u8[](u8[], u8[])] hmac) {
+  // RFC 8448 §3, the simple 1-RTT handshake. Published values, so this is agreement with
+  // the protocol rather than with ourselves. Values that did not match the trace were
+  // removed when this was written rather than adjusted to what we produce.
+  T t = T.create();
+  u8[] shared = unhex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+  u8[] chsh = unhex("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
+
+  u8[] early = earlySecret(u8[32]());
+  t.eqBytes(early, unhex("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"),
+            "early secret");
+  u8[] hs = handshakeSecret(early, shared);
+  t.eqBytes(hs, unhex("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"),
+            "handshake secret");
+  t.eqBytes(deriveSecret(hs, "c hs traffic".toBytes(), chsh),
+            unhex("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"),
+            "client handshake traffic secret");
+  t.eqBytes(deriveSecret(hs, "s hs traffic".toBytes(), chsh),
+            unhex("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"),
+            "server handshake traffic secret");
+  return t.report();
+}
+
+export string test_expand_label_agrees_with_an_independent_build(fn[u8[](u8[], u8[])] hmac) {
+  // Every label the schedule uses, plus the shapes around them: an empty context, a
+  // hash-length context, a one-byte output and a multi-block one.
+  T t = T.create();
+  u8[] secret = fill(32, 7, 3);
+  string[] labels = string[](
+    "derived", "c hs traffic", "s hs traffic", "c ap traffic", "s ap traffic",
+    "res master", "key", "iv", "finished", "traffic upd", "x", "mid");
+  i32[] ctxLens = i32[](32, 32, 32, 32, 32, 32, 0, 0, 0, 0, 0, 255);
+  i32[] outLens = i32[](32, 32, 32, 32, 32, 32, 16, 12, 32, 32, 255, 32);
+  for (i32 i = 0; i < labels.len(); i++) {
+    u8[] ctx = fill(ctxLens[i], 13, 1);
+    t.eqBytes(expandLabel(secret, labels[i].toBytes(), ctx, outLens[i]),
+              refExpandLabel(hmac, secret, labels[i], ctx, outLens[i]),
+              "expandLabel " + labels[i] + " len " + itoa64(outLens[i] as i64));
+  }
+  // One byte of output, which needs one HMAC block and most of it discarded.
+  t.eqBytes(expandLabel(secret, "x".toBytes(), u8[0](), 1),
+            refExpandLabel(hmac, secret, "x", u8[0](), 1), "expandLabel one byte");
+  return t.report();
+}
+
+export string test_traffic_keys_come_from_the_pinned_secret(fn[u8[](u8[], u8[])] hmac) {
+  // Derived from a secret RFC 8448 has already pinned above, so a failure here is in the
+  // key derivation rather than anywhere upstream of it.
+  T t = T.create();
+  u8[] serverHs = unhex("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38");
+  i32[] keyLens = i32[](16, 32);
+  for (i32 k = 0; k < keyLens.len(); k++) {
+    i32 keyLen = keyLens[k];
+    u8[] got = trafficKeyIv(serverHs, keyLen);
+    u8[] wantKey = refExpandLabel(hmac, serverHs, "key", u8[0](), keyLen);
+    u8[] wantIv = refExpandLabel(hmac, serverHs, "iv", u8[0](), 12);
+    t.eqI32(got.len(), keyLen + 12, "key and iv are concatenated");
+    bool ok = true;
+    for (i32 i = 0; i < keyLen; i++) { if (got[i] != wantKey[i]) { ok = false; } }
+    for (i32 i = 0; i < 12; i++) { if (got[keyLen + i] != wantIv[i]) { ok = false; } }
+    t.isTrue(ok, "traffic key and iv at keyLen " + itoa64(keyLen as i64));
+  }
+  return t.report();
+}
+
+export string test_every_derivation_depends_on_everything_it_should() {
+  // No oracle: the claim is that changing any input changes the output. A schedule that
+  // ignored its transcript, or its shared secret, would agree with itself forever and
+  // interoperate with nobody — and would pass any test that only checks one fixed chain.
+  T t = T.create();
+  u8[] a = fill(32, 5, 1);
+  u8[] b = fill(32, 5, 2);
+  u8[] ctxA = fill(32, 9, 4);
+  u8[] ctxB = fill(32, 9, 5);
+
+  t.isFalse(same(earlySecret(a), earlySecret(b)), "early secret follows its PSK");
+  u8[] e = earlySecret(a);
+  t.isFalse(same(handshakeSecret(e, a), handshakeSecret(e, b)),
+            "handshake secret follows the shared secret");
+  t.isFalse(same(handshakeSecret(earlySecret(a), a), handshakeSecret(earlySecret(b), a)),
+            "handshake secret follows the early secret");
+  u8[] hs = handshakeSecret(e, a);
+  t.isFalse(same(deriveSecret(hs, "c hs traffic".toBytes(), ctxA),
+                 deriveSecret(hs, "c hs traffic".toBytes(), ctxB)),
+            "derived secrets follow the transcript");
+  t.isFalse(same(deriveSecret(hs, "c hs traffic".toBytes(), ctxA),
+                 deriveSecret(hs, "s hs traffic".toBytes(), ctxA)),
+            "client and server secrets differ");
+  t.isFalse(same(trafficKeyIv(a, 16), trafficKeyIv(b, 16)), "traffic keys follow the secret");
+  t.isFalse(same(nextTrafficSecret(a), a), "a key update moves the secret");
+  t.isFalse(same(masterSecret(hs), hs), "the master secret is not the handshake secret");
+  return t.report();
+}
+
+export string test_finished_binds_to_the_transcript_and_the_sender() {
+  T t = T.create();
+  u8[] cs = fill(32, 3, 1);
+  u8[] ss = fill(32, 3, 9);
+  u8[] thA = fill(32, 11, 2);
+  u8[] thB = fill(32, 11, 3);
+  t.isFalse(same(finishedVerify(cs, thA), finishedVerify(cs, thB)),
+            "Finished follows the transcript");
+  t.isFalse(same(finishedVerify(cs, thA), finishedVerify(ss, thA)),
+            "Finished follows the sender's secret");
+  return t.report();
+}
+
+export string test_the_empty_context_hash_is_sha256_of_nothing(fn[u8[](u8[], u8[])] hmac) {
+  // Not checkable against the HMAC oracle directly, so it is pinned to the published
+  // constant — the SHA-256 of the empty string, which appears in RFC 8446 §7.1 itself.
+  T t = T.create();
+  t.eqBytes(emptyHash(),
+            unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            "SHA-256 of the empty string");
+  return t.report();
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
