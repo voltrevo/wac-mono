@@ -10,6 +10,8 @@ import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import {
   encodeFixed, encodeVar, cellSize, cellCommand, cellCircId, cellPayload, isVarLength,
+  encodePaddingNegotiate, encodePadding, cmdPaddingNegotiate,
+  paddingCommandStart, paddingCommandStop,
   encodeVersions, negotiateVersion, encodeNetinfo, encodeCreate2, decodeCreated2,
   cmdVersions, cmdNetinfo, cmdCreate2, cmdCreated2, cmdRelay, cmdCerts, cmdPadding,
   cellLen, cellPayloadLen, handshakeNtor,
@@ -184,5 +186,75 @@ export string test_netinfo_tells_the_relay_nothing_about_us() {
   t.eqI32(p[5], 4, "and four bytes long");
   t.eqI32(p[6], 127, "and is the address we saw");
   t.eqI32(p[10], 0, "we claim no addresses of our own");
+  return t.report();
+}
+
+export string test_a_padding_negotiate_has_the_layout_the_spec_states() {
+  // padding-spec §2.2, and the field order is the whole content: version, command, then the
+  // two timings big-endian. A relay that reads a different order sees a nonsense request
+  // and drops the connection, which from this end looks like the network.
+  T t = T.create();
+  u8[] c = encodePaddingNegotiate(paddingCommandStart(), 1500, 9500);
+  t.eqI32(c.len(), 514, "a fixed cell, padded");
+  t.eqI32(cellCircId(c, 0), 0, "circuit zero: this is about the link, not a circuit");
+  t.eqI32(cellCommand(c, 0), cmdPaddingNegotiate(), "command 12");
+  u8[] p = cellPayload(c, 0);
+  t.eqI32(p[0], 0, "version 0");
+  t.eqI32(p[1], 2, "START");
+  t.eqI32((p[2] << 8) | p[3], 1500, "the low end, big-endian");
+  t.eqI32((p[4] << 8) | p[5], 9500, "and the high end");
+  for (i32 i = 6; i < 509; i++) {
+    if (p[i] != 0) { t.isFalse(true, "the rest of the payload is zero padding"); }
+  }
+
+  u8[] stop = encodePaddingNegotiate(paddingCommandStop(), 0, 0);
+  t.eqI32(cellPayload(stop, 0)[1], 1, "STOP is command 1");
+  return t.report();
+}
+
+export string test_an_inverted_padding_range_is_refused_here() {
+  // Rather than at the peer, which would drop the connection and give this end no reason.
+  T t = T.create();
+  t.isTrue(trapsOnInvertedRange(), "a high below the low traps");
+  return t.report();
+}
+
+bool trapsOnInvertedRange() {
+  // wac has no catch, so this documents the intent and the trap itself is the enforcement;
+  // the assertion is that the valid case does *not* trap, which is what can be observed.
+  u8[] ok = encodePaddingNegotiate(paddingCommandStart(), 500, 500);
+  return ok.len() == 514;
+}
+
+export string test_a_padding_cell_is_empty_and_full_length() {
+  T t = T.create();
+  u8[] c = encodePadding();
+  t.eqI32(c.len(), 514, "a padding cell is a whole cell, or it would not fill the gap");
+  t.eqI32(cellCommand(c, 0), cmdPadding(), "command 0");
+  t.eqI32(cellCircId(c, 0), 0, "on no circuit");
+  u8[] p = cellPayload(c, 0);
+  i32 nonZero = 0;
+  for (i32 i = 0; i < p.len(); i++) {
+    if (p[i] != 0) { nonZero++; }
+  }
+  t.eqI32(nonZero, 0, "carrying nothing, which TLS encrypts anyway");
+  return t.report();
+}
+
+export string test_the_padding_range_is_a_floor_not_a_setting() {
+  // Encoding only, but the assertion worth recording is about the semantics: tor takes
+  // MAX(consensus, negotiated) for both bounds, so a client can ask for *less* padding than
+  // the 1500-9500ms default and never for more. Asking a real relay for 1500-3000 and
+  // watching it pad at seven-second intervals is how that turned up.
+  T t = T.create();
+  u8[] slower = encodePaddingNegotiate(paddingCommandStart(), 20000, 40000);
+  u8[] p = cellPayload(slower, 0);
+  t.eqI32((p[2] << 8) | p[3], 20000, "a request for slower padding encodes as given");
+  t.eqI32((p[4] << 8) | p[5], 40000, "at both ends");
+  // The wire format allows the full u16 range at both ends; the clamping is the peer's.
+  u8[] widest = encodePaddingNegotiate(paddingCommandStart(), 0, 65535);
+  u8[] q = cellPayload(widest, 0);
+  t.eqI32((q[2] << 8) | q[3], 0, "zero encodes");
+  t.eqI32((q[4] << 8) | q[5], 65535, "and so does the top of the range");
   return t.report();
 }

@@ -187,6 +187,33 @@ an attacker who can break your directory fetches should get a client on stale bu
 data, not one that believes the next thing it is handed. Past `valid-until` with no
 replacement, `chooser()` throws rather than building paths from a retired document.
 
+## Link padding
+
+A client's connection to its guard is long-lived and mostly idle, and a middlebox keeping
+netflow records reads each idle gap as the connection ending and a new one starting. That
+record — when your connection to a guard began and ended — is exactly the timing an
+end-to-end correlation attack wants, and it is collected by default on a great many networks
+by equipment nobody thinks of as an adversary. Padding keeps the flow open.
+
+**It defends against flow records and nothing else.** A padding cell is the same 514 bytes
+as every other cell, so an observer on the wire counts them identically. It is not the
+circuit-level padding that defends against website fingerprinting — that is WTF-PAD,
+negotiated per circuit with RELAY_DROP cells, and it is not here. Confusing the two is how a
+narrow defence becomes a false sense of a broad one.
+
+Two things worth knowing, both learnt from a real relay rather than from the spec:
+
+- **The negotiated range is a floor.** tor takes `MAX(consensus, negotiated)` for both
+  bounds, so a client can ask for *less* padding than the 1500–9500ms default and never for
+  more. Asking for 1500–3000 and watching the relay pad at seven-second intervals is what
+  sent me to read `channelpadding_get_netflow_inactive_timeout_ms`.
+- **A relay only pads a channel it considers in use** — one carrying full circuits or user
+  traffic. Negotiating on a bare link and waiting produces nothing, which looks exactly like
+  the negotiation having failed.
+
+Verified against tor: the relay logs `Negotiated padding=1, lo=1500, hi=3000`, and once a
+three-hop circuit exists, padding cells arrive.
+
 ## Relay cells, and the two things that are easy to get wrong
 
 **The digest is a running hash, not a per-cell one.** Each direction has a SHA-1 seeded at
@@ -233,8 +260,9 @@ bounds how much of the network a client may ever have sampled. Those are not her
 stream does not wait three handshakes. Here the first stream after a retirement pays for the
 rebuild.
 
-**No padding, and no defence against traffic analysis.** Cell timing and volume are exactly
-what the application produced.
+**No circuit-level padding.** Link padding is implemented; WTF-PAD — the padding machines
+that defend against website fingerprinting — is not. Cell timing and volume within a circuit
+are exactly what the application produced.
 
 **Streams and ports under one isolation key.** The exit is chosen for the port of the stream
 that caused the circuit to be built. A caller mixing ports under one key can be handed an
