@@ -72,7 +72,7 @@ export i32 main(Core core, Cli cli) {
   Options o = parseArgs(core, cli);
   if (o.exitCode >= 0) { return o.exitCode; }
 
-  FileResult hostFile = cli.readFile(o.hostKey);
+  FileResult hostFile = cli.readFile(o.hostKey).wait();
   if (!hostFile.ok) {
     core.warn("sshd: " + o.hostKey + ": " + hostFile.error);
     return 1;
@@ -90,7 +90,7 @@ export i32 main(Core core, Cli cli) {
     }
   }
 
-  Socket listener = cli.listen(o.port);
+  Socket listener = cli.listen(o.port).wait();
   if (listener.handle < 0) {
     core.warn("sshd: listen: " + listener.error);
     return 1;
@@ -98,7 +98,7 @@ export i32 main(Core core, Cli cli) {
   core.warn("sshd: listening on port " + itoa(o.port));
 
   while (true) {
-    Socket c = cli.accept(listener.handle);
+    Socket c = cli.accept(listener.handle).wait();
     if (c.handle < 0) {
       core.warn("sshd: accept: " + c.error);
       break;
@@ -134,7 +134,7 @@ void serve(Core core, Cli cli, i32 sock, PrivateKey host, Options o) {
 
 /** Version exchange, key exchange and NEWKEYS. Returns the session id, which is H. */
 u8[] handshake(Conn conn, PrivateKey host) {
-  if (!conn.cli.send(conn.sock, serverVersionLine())) {
+  if (!conn.cli.send(conn.sock, serverVersionLine()).wait()) {
     conn.fail("cannot send the version line");
     return u8[0]();
   }
@@ -166,7 +166,7 @@ u8[] handshake(Conn conn, PrivateKey host) {
     return u8[0]();
   }
 
-  u8[] ourKexInit = encode(serverProposal(), conn.core.randomBytes(16));
+  u8[] ourKexInit = encode(serverProposal(), conn.core.randomBytes(16).wait());
   if (!conn.sendPacket(ourKexInit)) { conn.fail("cannot send KEXINIT"); return u8[0](); }
 
   u8[] theirKexInit = conn.readPacket();
@@ -195,7 +195,7 @@ u8[] handshake(Conn conn, PrivateKey host) {
   u8[] qc = parseEcdhInit(initPayload);
   if (qc.len() == 0) { conn.fail("expected the key exchange init"); return u8[0](); }
 
-  u8[] secret = conn.core.randomBytes(32);
+  u8[] secret = conn.core.randomBytes(32).wait();
   u8[] qs = ephemeralPublic(secret);
   u8[]? shared = sharedSecret(secret, qc);
   if (shared is null) {
@@ -243,7 +243,7 @@ bool authenticate(Conn conn, Cli cli, u8[] sessionId, Options o) {
     return false;
   }
 
-  FileResult keys = cli.readFile(o.authorizedKeys);
+  FileResult keys = cli.readFile(o.authorizedKeys).wait();
   u8[] allowed = keys.ok ? keys.bytes : u8[0]();
 
   // A client may try several keys, and the first attempt is usually a probe with no signature.
@@ -477,7 +477,7 @@ struct Options {
 }
 
 Options parseArgs(Core core, Cli cli) {
-  string? home = cli.env("HOME");
+  string? home = cli.env("HOME").wait();
   string homeDir = (home is null) ? "" : home!;
 
   i32 port = defaultPort();
@@ -486,22 +486,22 @@ Options parseArgs(Core core, Cli cli) {
   bool once = false;
 
   i32 i = 0;
-  i32 n = cli.argCount();
+  i32 n = cli.argCount().wait();
   while (i < n) {
-    string a = cli.arg(i);
+    string a = cli.arg(i).wait();
     if (a == "-p" && i + 1 < n) {
       i++;
-      port = atoi(cli.arg(i));
+      port = atoi(cli.arg(i).wait());
       if (port <= 0 || port > 65535) {
-        core.warn("sshd: bad port: " + cli.arg(i));
+        core.warn("sshd: bad port: " + cli.arg(i).wait());
         return Options(0, "", "", false, 2);
       }
     } else if (a == "-h" && i + 1 < n) {
       i++;
-      hostKey = cli.arg(i);
+      hostKey = cli.arg(i).wait();
     } else if (a == "-a" && i + 1 < n) {
       i++;
-      authorizedKeys = cli.arg(i);
+      authorizedKeys = cli.arg(i).wait();
     } else if (a == "-1") {
       once = true;
     } else {

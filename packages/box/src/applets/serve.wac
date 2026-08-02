@@ -16,7 +16,7 @@ import { Served, serve as handle } from "../../../server/src/serve.wac";
 
 export i32 serve(Core core, Cli cli, Args a) {
   i32 port = a.num == 0 ? 8080 : a.num;
-  Socket l = cli.listen(port);
+  Socket l = cli.listen(port).wait();
   if (l.handle < 0) { core.warn(a.name + ": " + itoa(port) + ": " + l.error); return 1; }
   core.warn(a.name + ": listening on port " + itoa(port));
 
@@ -25,7 +25,7 @@ export i32 serve(Core core, Cli cli, Args a) {
   // parser spells a number, so `serve -8080 -1` set the port to 1.
   bool once = has(a, 'o');
   while (true) {
-    Socket c = cli.accept(l.handle);
+    Socket c = cli.accept(l.handle).wait();
     if (c.handle < 0) { core.warn(a.name + ": accept: " + c.error); break; }
     connection(core, cli, c.handle);
     cli.closeSocket(c.handle);
@@ -39,15 +39,15 @@ export i32 serve(Core core, Cli cli, Args a) {
 void connection(Core core, Cli cli, i32 sock) {
   u8[] buffered = u8[0]();
   while (true) {
-    Served s = handle(buffered, core.nowMillis());
+    Served s = handle(buffered, core.nowMillis().wait());
     if (!s.ready) {
       // Not a whole request yet. More bytes, or the peer has gone.
-      u8[] chunk = cli.recv(sock);
+      u8[] chunk = cli.recv(sock).wait();
       if (chunk.len() == 0) { return; }
       buffered = concat(buffered, chunk);
       continue;
     }
-    if (!cli.send(sock, s.response)) { return; }
+    if (!cli.send(sock, s.response).wait()) { return; }
     if (!s.keepAlive) { return; }
     // Whatever the client pipelined after this request stays in the buffer.
     buffered = slice(buffered, s.consumed, buffered.len());

@@ -23,7 +23,7 @@ export i32 httpd(Core core, Cli cli, Args a) {
   i32 port = a.num == 0 ? 8080 : a.num;
   string root = a.rest.len() > 0 ? a.rest[0] : ".";
 
-  Socket l = cli.listen(port);
+  Socket l = cli.listen(port).wait();
   if (l.handle < 0) { core.warn(a.name + ": " + itoa(port) + ": " + l.error); return 1; }
   // The same phrase `serve` prints, deliberately: it is what a caller waits for to know
   // the port is up, and two spellings for it meant a test hung instead of failing.
@@ -35,7 +35,7 @@ export i32 httpd(Core core, Cli cli, Args a) {
   // would be serving it — see `packages/platform`'s browser target.
   bool isolate = has(a, 'x');
   while (true) {
-    Socket c = cli.accept(l.handle);
+    Socket c = cli.accept(l.handle).wait();
     if (c.handle < 0) { core.warn(a.name + ": accept: " + c.error); break; }
     connection(core, cli, c.handle, root, isolate);
     cli.closeSocket(c.handle);
@@ -51,12 +51,12 @@ void connection(Core core, Cli cli, i32 sock, string root, bool isolate) {
   while (true) {
     match (parseRequest(buffered, 1 << 20)) {
       case Incomplete: {
-        u8[] chunk = cli.recv(sock);
+        u8[] chunk = cli.recv(sock).wait();
         if (chunk.len() == 0) { return; }
         buffered = concat(buffered, chunk);
       }
       case Bad(code): {
-        cli.send(sock, writeResponse(Response.create(400), "GET".toBytes(), false));
+        cli.send(sock, writeResponse(Response.create(400), "GET".toBytes(), false)).wait();
         return;
       }
       case Ok(req): {
@@ -70,25 +70,25 @@ void connection(Core core, Cli cli, i32 sock, string root, bool isolate) {
 void answer(Core core, Cli cli, i32 sock, string root, Request req, bool isolate) {
   bool isGet = eq(req.method, "GET") || eq(req.method, "HEAD");
   if (!isGet) {
-    cli.send(sock, writeResponse(Response.create(405), req.method, false));
+    cli.send(sock, writeResponse(Response.create(405), req.method, false)).wait();
     return;
   }
 
   u8[] target = upTo(req.target, '?');           // the query is not part of the path
   if (!safe(target)) {
-    cli.send(sock, writeResponse(Response.create(403), req.method, false));
+    cli.send(sock, writeResponse(Response.create(403), req.method, false)).wait();
     return;
   }
   string path = root + string.fromBytes(target);
-  Stat st = cli.stat(path);
+  Stat st = cli.stat(path).wait();
   if (st.exists && st.isDir) { path = path + (endsWithSlash(target) ? "index.html" : "/index.html"); }
 
-  FileResult f = cli.readFile(path);
+  FileResult f = cli.readFile(path).wait();
   if (!f.ok) {
     Response nf = Response.create(404);
     nf.set("Content-Type", "text/plain; charset=utf-8");
     nf.body = ("not found: " + string.fromBytes(target) + "\n").toBytes();
-    cli.send(sock, writeResponse(nf, req.method, false));
+    cli.send(sock, writeResponse(nf, req.method, false)).wait();
     core.warn("404 " + string.fromBytes(target));
     return;
   }
@@ -102,7 +102,7 @@ void answer(Core core, Cli cli, i32 sock, string root, Request req, bool isolate
     res.set("Cross-Origin-Embedder-Policy", "require-corp");
   }
   res.body = f.bytes;
-  cli.send(sock, writeResponse(res, req.method, false));
+  cli.send(sock, writeResponse(res, req.method, false)).wait();
   core.warn("200 " + string.fromBytes(target) + " " + itoa(f.bytes.len()));
 }
 

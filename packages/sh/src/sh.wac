@@ -20,24 +20,24 @@ import { Shell, runScript } from "./exec.wac";
 export i32 main(Core core, Cli cli) {
   string src = "";
 
-  i32 n = cli.argCount();
-  if (n >= 1 && cli.arg(0) == "-c") {
+  i32 n = cli.argCount().wait();
+  if (n >= 1 && cli.arg(0).wait() == "-c") {
     if (n < 2) {
       core.warn("sh: -c needs a script");
       return 2;
     }
     // Everything after `-c` joined with spaces, as `sh -c` does: the shell re-splits it anyway.
-    src = cli.arg(1);
-    for (i32 i = 2; i < n; i++) { src = src + " " + cli.arg(i); }
+    src = cli.arg(1).wait();
+    for (i32 i = 2; i < n; i++) { src = src + " " + cli.arg(i).wait(); }
   } else if (n >= 1) {
-    FileResult f = cli.readFile(cli.arg(0));
+    FileResult f = cli.readFile(cli.arg(0).wait()).wait();
     if (!f.ok) {
-      core.warn("sh: " + cli.arg(0) + ": " + f.error);
+      core.warn("sh: " + cli.arg(0).wait() + ": " + f.error);
       return 127;
     }
     src = string.fromBytes(f.bytes);
   } else {
-    src = string.fromBytes(cli.readStdin());
+    src = string.fromBytes(cli.readStdin().wait());
   }
 
   Shell sh = Shell.create(core, cli);

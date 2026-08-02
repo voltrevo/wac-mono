@@ -58,7 +58,7 @@ export struct Client {
    * whoever is running the program.
    */
   void handshake(this) {
-    if (!this.conn.cli.send(this.conn.sock, clientVersionLine())) {
+    if (!this.conn.cli.send(this.conn.sock, clientVersionLine()).wait()) {
       this.conn.fail("cannot send the version line");
       return;
     }
@@ -91,7 +91,7 @@ export struct Client {
       return;
     }
 
-    u8[] ourKexInit = encode(clientProposal(), this.conn.core.randomBytes(16));
+    u8[] ourKexInit = encode(clientProposal(), this.conn.core.randomBytes(16).wait());
     if (!this.conn.sendPacket(ourKexInit)) { this.conn.fail("cannot send KEXINIT"); return; }
 
     u8[] theirKexInit = this.conn.readPacket();
@@ -99,7 +99,7 @@ export struct Client {
     if (theirKexInit[0] != msgKexInit()) { this.conn.fail("expected KEXINIT"); return; }
     if (!this.agreed(theirKexInit)) { return; }
 
-    u8[] secret = this.conn.core.randomBytes(32);
+    u8[] secret = this.conn.core.randomBytes(32).wait();
     u8[] qc = ephemeralPublic(secret);
     if (!this.conn.sendPacket(ecdhInit(qc))) { this.conn.fail("cannot send the key exchange"); return; }
 

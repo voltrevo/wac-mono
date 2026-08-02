@@ -38,15 +38,15 @@ export bool has(Args a, i32 flag) {
  * `bin/`.
  */
 export Args parseArgs(Cli cli) {
-  return parseFrom(cli, 1, cli.arg(0));
+  return parseFrom(cli, 1, cli.arg(0).wait());
 }
 
 export Args parseFrom(Cli cli, i32 first, string name) {
   // Counted first so the array is the right size: there is no growable list here, and
   // walking twice is less code than guessing a capacity and copying.
   i32 count = 0;
-  for (i32 i = first; i < cli.argCount(); i++) {
-    if (!isFlag(cli.arg(i))) { count++; }
+  for (i32 i = first; i < cli.argCount().wait(); i++) {
+    if (!isFlag(cli.arg(i).wait())) { count++; }
   }
   string[] rest = string[count](fill: "");
 
@@ -54,16 +54,16 @@ export Args parseFrom(Cli cli, i32 first, string name) {
   i32 num = 0;
   i32 at = 0;
   i32 i = first;
-  while (i < cli.argCount()) {
-    string s = cli.arg(i);
+  while (i < cli.argCount().wait()) {
+    string s = cli.arg(i).wait();
     if (!isFlag(s)) { rest[at] = s; at++; i++; continue; }
     u8[] b = s.toBytes();
     if (b[1] >= '0' && b[1] <= '9') {
       num = atoi(string.fromBytes(slice(b, 1, b.len())));          // -5
     } else {
       for (i32 k = 1; k < b.len(); k++) {
-        bool takesValue = b[k] == 'n' && i + 1 < cli.argCount() && allDigits(cli.arg(i + 1));
-        if (takesValue) { num = atoi(cli.arg(i + 1)); i++; }       // -n 5
+        bool takesValue = b[k] == 'n' && i + 1 < cli.argCount().wait() && allDigits(cli.arg(i + 1).wait());
+        if (takesValue) { num = atoi(cli.arg(i + 1).wait()); i++; }       // -n 5
         else { flags = flags + string.fromBytes(slice(b, k, k + 1)); }
       }
     }
@@ -88,8 +88,8 @@ export Args parseFrom(Cli cli, i32 first, string name) {
 export string flagValue(Cli cli, i32 letter) {
   // From 0, which is safe under both layouts: an applet name never begins with a dash,
   // so `box`'s extra leading argument cannot be mistaken for a flag.
-  for (i32 i = 0; i < cli.argCount(); i++) {
-    u8[] b = cli.arg(i).toBytes();
+  for (i32 i = 0; i < cli.argCount().wait(); i++) {
+    u8[] b = cli.arg(i).wait().toBytes();
     if (b.len() < 2 || b[0] != '-' || b[1] != letter) { continue; }
     if (b.len() > 2) { return string.fromBytes(slice(b, 2, b.len())); }
   }

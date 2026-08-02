@@ -76,7 +76,7 @@ Output cat(Cli cli, Vec<string> argv, u8[] stdin) {
   for (i32 i = 1; i < argv.len(); i++) {
     string path = argv.get(i);
     if (path == "-") { out.pushAll(stdin); continue; }
-    FileResult f = cli.readFile(path);
+    FileResult f = cli.readFile(path).wait();
     if (!f.ok) {
       return Output.fail(("cat: " + path + ": " + f.error + "\n").toBytes(), 1);
     }

@@ -5,6 +5,6 @@ import { Args } from "../lib/args.wac";
 import { format } from "../../../datetime/src/rfc3339.wac";
 
 export i32 date(Core core, Cli cli, Args a) {
-  core.log(string.fromBytes(format(core.nowMillis())));
+  core.log(string.fromBytes(format(core.nowMillis().wait())));
   return 0;
 }

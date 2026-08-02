@@ -14,11 +14,11 @@ export i32 main(Core core, Cli cli) {
   // is the difference between a file-to-file tool and something you can put in a pipe.
   u8[] data = u8[0]();
   string label = "";
-  if (cli.argCount() < 1) {
-    data = cli.readStdin();
+  if (cli.argCount().wait() < 1) {
+    data = cli.readStdin().wait();
   } else {
-    label = cli.arg(0);
-    FileResult f = cli.readFile(label);
+    label = cli.arg(0).wait();
+    FileResult f = cli.readFile(label).wait();
     if (!f.ok) {
       core.warn("wc: " + label + ": " + f.error);
       return 1;
@@ -26,15 +26,15 @@ export i32 main(Core core, Cli cli) {
     data = f.bytes;
   }
 
-  i64 startedAt = core.monotonicNanos();
+  i64 startedAt = core.monotonicNanos().wait();
   Counts c = count(data);
-  i64 tookNanos = core.monotonicNanos() - startedAt;
+  i64 tookNanos = core.monotonicNanos().wait() - startedAt;
 
   string line = itoa(c.lines) + " " + itoa(c.words) + " " + itoa(c.bytes);
   core.log(label == "" ? line : line + " " + label);
 
   // Unset and empty are different things, which is why the capability returns `string?`.
-  string? verbose = cli.env("WC_VERBOSE");
+  string? verbose = cli.env("WC_VERBOSE").wait();
   if (verbose is null) { return 0; }
   core.log("counted in " + itoa((tookNanos / 1000) as~ i32) + "us");
   return 0;
