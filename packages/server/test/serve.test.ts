@@ -224,3 +224,22 @@ Deno.test("responses are well-formed for our own parser", () => {
     }
   }
 });
+
+Deno.test("the status line carries its reason phrase", () => {
+  // Mutation testing found this: `reason` in packages/http could return nothing at all and
+  // every test still passed, because `parseReply` reads the number out of the status line and
+  // throws the rest away. The phrase is decoration — a client reads the code — but "HTTP/1.1
+  // 404 " is a malformed status line, not a terse one, and RFC 9112 requires the space and
+  // the phrase even when the phrase is empty.
+  const cases: Array<[string, string]> = [
+    ["GET / HTTP/1.1\r\nHost: a\r\n\r\n", "HTTP/1.1 200 OK\r\n"],
+    ["GET /nope HTTP/1.1\r\nHost: a\r\n\r\n", "HTTP/1.1 404 Not Found\r\n"],
+    ["POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n", "HTTP/1.1 405 Method Not Allowed\r\n"],
+  ];
+  for (const [request, want] of cases) {
+    const { reply } = get(request);
+    if (!reply.raw.startsWith(want)) {
+      throw new Error(`${JSON.stringify(request)}: status line ${JSON.stringify(reply.raw.slice(0, 40))}, want ${JSON.stringify(want)}`);
+    }
+  }
+});

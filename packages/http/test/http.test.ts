@@ -282,3 +282,43 @@ Deno.test("what the parser consumed is where the next message starts", async () 
   }
   if (bad.length > 0) throw new Error(bad.join("\n  "));
 });
+
+Deno.test("each rejection reports its own reason, not just 'no'", () => {
+  // Mutation testing found this: every `ERR_*` constant could be collapsed to zero and nothing
+  // noticed, because the tests above assert only that a malformed request is refused. Which
+  // parser said *why* is not part of the smuggling property they exist to check — but a code
+  // that is wrong is worse than no code, since it names a cause that did not happen.
+  //
+  // One input per code, each malformed in exactly one way.
+  const cases: [string, number, string][] = [
+    ["method is not a token", 1, "G(ET / HTTP/1.1\r\nHost: h\r\n\r\n"],
+    ["empty target", 2, "GET  HTTP/1.1\r\nHost: h\r\n\r\n"],
+    ["not HTTP/1.x", 3, "GET / HTTP/2.0\r\nHost: h\r\n\r\n"],
+    ["request line is not three parts", 4, "GET /\r\nHost: h\r\n\r\n"],
+    ["space before the colon", 5, "GET / HTTP/1.1\r\nHost : h\r\n\r\n"],
+    ["control byte in a value", 6, "GET / HTTP/1.1\r\nHost: h\x01x\r\n\r\n"],
+    ["a continuation line", 7, "GET / HTTP/1.1\r\nHost: h\r\n  more\r\n\r\n"],
+    ["length and chunked together", 8, "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"],
+    ["a malformed chunk size", 9, "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n\r\n"],
+  ];
+
+  const enc = new TextEncoder();
+  const seen = new Set<number>();
+  for (const [why, code, text] of cases) {
+    const got = wac(enc.encode(text));
+    if (got.outcome !== "bad") throw new Error(`${why}: expected a rejection, got ${got.outcome}`);
+    if (got.code !== code) throw new Error(`${why}: reported code ${got.code}, want ${code}`);
+    seen.add(code);
+  }
+
+  // A body past the limit is the tenth, and needs a limit small enough to hit.
+  const big = dec.decode(mod.parse(enc.encode("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\n\r\n" + "x".repeat(100)), 8)).split("\0");
+  if (big[0] !== "bad" || Number(big[1]) !== 10) {
+    throw new Error(`over the body limit: got ${big[0]} ${big[1]}, want bad 10`);
+  }
+  seen.add(10);
+
+  // Every code the parser can produce is pinned by one of the cases above. If a new one is
+  // added without a case, this is what says so.
+  if (seen.size !== 10) throw new Error(`only ${seen.size} of the 10 error codes are covered`);
+});
