@@ -77,7 +77,7 @@ export i32 main(Core core, Cli cli) {
   Client c = Client.create(core, cli, sock.handle);
   c.handshake();
   if (c.failed()) {
-    core.warn("ssh: " + c.error);
+    core.warn("ssh: " + c.error());
     cli.closeSocket(sock.handle);
     return 1;
   }
@@ -95,7 +95,7 @@ export i32 main(Core core, Cli cli) {
 
   c.authenticate(o.user.toBytes(), key.publicBlob, key.seed);
   if (c.failed()) {
-    core.warn("ssh: " + c.error);
+    core.warn("ssh: " + c.error());
     cli.closeSocket(sock.handle);
     return 1;
   }
@@ -103,7 +103,7 @@ export i32 main(Core core, Cli cli) {
   i32 status = c.run(o.command.toBytes());
   cli.closeSocket(sock.handle);
   if (c.failed()) {
-    core.warn("ssh: " + c.error);
+    core.warn("ssh: " + c.error());
     return 1;
   }
   // A server need not report one. Treating "not reported" as success is what OpenSSH does.

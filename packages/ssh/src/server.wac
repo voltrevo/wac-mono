@@ -1,0 +1,368 @@
+// The server half of the transport, key exchange and authentication.
+//
+// Most of SSH is direction-agnostic and already written: the packet framing, the AEAD, the
+// channel messages. What differs is small and all of it is here.
+//
+// The asymmetries worth naming, because each is a place a server written by copying a client goes
+// wrong:
+//
+//   **The server signs the exchange hash; the client verifies it.** Same eight inputs, same
+//   order, same SHA-256 — and the server computes it from values it mostly received rather than
+//   chose, which is the point: if the two sides disagree about any of them, the signature the
+//   client checks was made over something else.
+//
+//   **Negotiation runs in client order.** The server offers a list and does not choose from it —
+//   the client's first supported preference wins, so a server that picks its own favourite ends
+//   up using an algorithm the client is not.
+//
+//   **The two ends of a channel have different numbers**, and CHANNEL_OPEN_CONFIRMATION is the
+//   one message carrying both: the client's number as recipient, ours as sender.
+//
+//   **The keys swap.** `C` is client-to-server, so a server *reads* with C and writes with D —
+//   the opposite of `client.wac`. Getting this backwards produces a connection where neither side
+//   can decrypt anything, which at least fails immediately.
+
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { ed25519Sign, ed25519Verify } from "../../crypto/src/ed25519.wac";
+import { x25519, x25519Base } from "../../crypto/src/x25519.wac";
+import { Reader, Writer } from "./wire.wac";
+import { Proposal } from "./kexinit.wac";
+import { msgKexEcdhInit, msgKexEcdhReply } from "./kex.wac";
+import { msgUserAuthRequest, signedData } from "./auth.wac";
+import { msgChannelOpenConfirmation, msgChannelOpenFailure, msgChannelRequest,
+         msgChannelSuccess, msgChannelFailure, msgChannelData, msgChannelExtendedData,
+         msgChannelEof, msgChannelClose, extendedDataStderr } from "./channel.wac";
+
+/**
+ * What this server offers.
+ *
+ * The same narrow set the client asks for, and for the same reason — an algorithm we cannot
+ * perform must not be advertised, because the *client* chooses and it will choose it.
+ *
+ * `kex-strict-s-v00@openssh.com` is the server's half of strict KEX. A client that also offers it
+ * expects the sequence numbers to reset at NEWKEYS, so omitting it here while resetting them
+ * would break every such client.
+ */
+export Proposal serverProposal() {
+  return Proposal(
+    ascii("curve25519-sha256,curve25519-sha256@libssh.org,kex-strict-s-v00@openssh.com"),
+    ascii("ssh-ed25519"),
+    ascii("chacha20-poly1305@openssh.com"),
+    ascii("chacha20-poly1305@openssh.com"),
+    ascii("hmac-sha2-256"),
+    ascii("hmac-sha2-256"),
+    ascii("none"),
+    ascii("none"),
+    ascii(""),
+    ascii(""),
+    false);
+}
+
+/** The host key blob as it goes on the wire: `string "ssh-ed25519"` then the 32-byte point. */
+export u8[] hostKeyBlob(u8[] publicKey) {
+  if (publicKey.len() != 32) { trap; }
+  Writer w = Writer.create();
+  w.str(ascii("ssh-ed25519"));
+  w.str(publicKey);
+  return w.take();
+}
+
+/** The client's ephemeral public key out of SSH_MSG_KEX_ECDH_INIT, or empty if it is not one. */
+export u8[] parseEcdhInit(u8[] payload) {
+  Reader r = Reader.over(payload);
+  if (r.byte() != msgKexEcdhInit()) { return u8[0](); }
+  u8[] qc = r.str();
+  if (!r.ok || qc.len() != 32) { return u8[0](); }
+  return qc;
+}
+
+/** Our ephemeral public key from a 32-byte secret. */
+export u8[] ephemeralPublic(u8[] secret) {
+  if (secret.len() != 32) { trap; }
+  return x25519Base(secret);
+}
+
+/** The shared secret, or null when the client sent a low-order point. */
+export u8[]? sharedSecret(u8[] secret, u8[] clientPublic) {
+  if (secret.len() != 32 || clientPublic.len() != 32) { return null; }
+  u8[] k = x25519(secret, clientPublic);
+  i32 acc = 0;
+  for (i32 i = 0; i < 32; i++) { acc = acc | k[i]; }
+  if (acc == 0) { return null; }
+  return k;
+}
+
+/**
+ * H, computed from the server's side.
+ *
+ * Identical to the client's computation, deliberately: it is the same function of the same eight
+ * values, and the whole security of the exchange is that both sides arrive at the same number
+ * from their own view of what happened.
+ */
+export u8[] exchangeHash(u8[] vc, u8[] vs, u8[] clientKexInit, u8[] serverKexInit,
+                         u8[] ks, u8[] qc, u8[] qs, u8[] k) {
+  Writer w = Writer.create();
+  w.str(vc);
+  w.str(vs);
+  w.str(clientKexInit);
+  w.str(serverKexInit);
+  w.str(ks);
+  w.str(qc);
+  w.str(qs);
+  w.mpint(k);
+  return sha256(w.take());
+}
+
+/** SSH_MSG_KEX_ECDH_REPLY: our host key, our ephemeral key, and H signed. */
+export u8[] ecdhReply(u8[] hostKey, u8[] qs, u8[] h, u8[] hostSeed) {
+  if (hostSeed.len() != 32) { trap; }
+  Writer sig = Writer.create();
+  sig.str(ascii("ssh-ed25519"));
+  sig.str(ed25519Sign(hostSeed, h));
+
+  Writer w = Writer.create();
+  w.byte(msgKexEcdhReply());
+  w.str(hostKey);
+  w.str(qs);
+  w.str(sig.take());
+  return w.take();
+}
+
+// ── Authentication ────────────────────────────────────────────────────────────
+
+/** A parsed SSH_MSG_USERAUTH_REQUEST. */
+export struct AuthRequest {
+  bool ok;
+  u8[] user;
+  u8[] service;
+  u8[] method;
+  /** True when a signature is present; false is the "would this key do?" probe. */
+  bool hasSignature;
+  u8[] keyType;
+  u8[] publicBlob;
+  u8[] signature;
+}
+
+AuthRequest noAuth() {
+  return AuthRequest(false, u8[0](), u8[0](), u8[0](), false, u8[0](), u8[0](), u8[0]());
+}
+
+/**
+ * Parse a userauth request.
+ *
+ * Only `publickey` is understood in full. Others parse as far as the method name so a server can
+ * say which it will not do, rather than failing as though the message were malformed.
+ */
+export AuthRequest parseAuthRequest(u8[] payload) {
+  Reader r = Reader.over(payload);
+  if (r.byte() != msgUserAuthRequest()) { return noAuth(); }
+  u8[] user = r.str();
+  u8[] service = r.str();
+  u8[] method = r.str();
+  if (!r.ok) { return noAuth(); }
+  if (!sameBytes(method, ascii("publickey"))) {
+    return AuthRequest(true, user, service, method, false, u8[0](), u8[0](), u8[0]());
+  }
+  bool hasSignature = r.bool();
+  u8[] keyType = r.str();
+  u8[] publicBlob = r.str();
+  u8[] signature = hasSignature ? r.str() : u8[0]();
+  if (!r.ok) { return noAuth(); }
+  return AuthRequest(true, user, service, method, hasSignature, keyType, publicBlob, signature);
+}
+
+/**
+ * Whether a publickey request's signature is good for this session.
+ *
+ * The signed bytes are rebuilt here rather than taken from the request, which is the whole point:
+ * a signature is only worth anything if it covers *our* session id and the fields we read. Taking
+ * the client's word for what was signed would accept a signature made over anything at all.
+ */
+export bool verifyAuth(AuthRequest a, u8[] sessionId) {
+  if (!a.ok || !a.hasSignature) { return false; }
+  if (!sameBytes(a.keyType, ascii("ssh-ed25519"))) { return false; }
+
+  // The blob names its own algorithm and carries the point; both must agree with the request.
+  Reader kr = Reader.over(a.publicBlob);
+  u8[] blobType = kr.str();
+  u8[] point = kr.str();
+  if (!kr.ok || !sameBytes(blobType, ascii("ssh-ed25519")) || point.len() != 32) { return false; }
+
+  Reader sr = Reader.over(a.signature);
+  u8[] sigType = sr.str();
+  u8[] sig = sr.str();
+  if (!sr.ok || !sameBytes(sigType, ascii("ssh-ed25519")) || sig.len() != 64) { return false; }
+
+  return ed25519Verify(point, signedData(sessionId, a.user, a.publicBlob), sig);
+}
+
+/** SSH_MSG_USERAUTH_FAILURE, naming what we would accept and whether this attempt got anywhere. */
+export u8[] authFailure() {
+  Writer w = Writer.create();
+  w.byte(51);
+  w.str(ascii("publickey"));
+  w.bool(false);              // no partial success — there is only the one method
+  return w.take();
+}
+
+/**
+ * SSH_MSG_USERAUTH_PK_OK — "yes, that key would do; sign something".
+ *
+ * The step a server written from the message list forgets. A publickey request with no signature
+ * is a *probe*: the client is asking whether the key is worth the cost of a signature, and
+ * OpenSSH will not sign until it hears this. Answering FAILURE instead is not wrong on its face —
+ * the client is, after all, not authenticated — but it tells the client the key is refused, so it
+ * moves on to the next one and eventually reports "Permission denied (publickey)" for a key the
+ * server would have accepted.
+ */
+export u8[] pkOk(u8[] keyType, u8[] publicBlob) {
+  Writer w = Writer.create();
+  w.byte(60);
+  w.str(keyType);
+  w.str(publicBlob);
+  return w.take();
+}
+
+export u8[] authSuccess() {
+  Writer w = Writer.create();
+  w.byte(52);
+  return w.take();
+}
+
+export u8[] serviceAccept(u8[] name) {
+  Writer w = Writer.create();
+  w.byte(6);
+  w.str(name);
+  return w.take();
+}
+
+/**
+ * SSH_MSG_DISCONNECT — saying goodbye rather than dropping the socket.
+ *
+ * Closing the TCP connection without it works, and every client complains: OpenSSH prints
+ * "Connection closed by remote host", which reads like a fault. The message costs one packet and
+ * is the difference between a clean exit and one that looks like a crash.
+ */
+export u8[] disconnect(i32 reason, u8[] description) {
+  Writer w = Writer.create();
+  w.byte(1);
+  w.u32(reason);
+  w.str(description);
+  w.str(ascii(""));            // language tag
+  return w.take();
+}
+
+/** The reason code for an ordinary, intended shutdown. */
+export i32 byApplication() { return 11; }
+
+// ── Channels, from the other end ──────────────────────────────────────────────
+
+/**
+ * SSH_MSG_CHANNEL_OPEN_CONFIRMATION.
+ *
+ * The one message carrying both numbers: the client's as recipient, ours as sender. Sending our
+ * own in the recipient slot addresses a channel the client does not have, and with both sides
+ * numbering from zero it works anyway — which is why it is worth writing out.
+ */
+export u8[] openConfirmation(i32 clientChannel, i32 ourChannel, i32 window, i32 maxPacket) {
+  Writer w = Writer.create();
+  w.byte(msgChannelOpenConfirmation());
+  w.u32(clientChannel);
+  w.u32(ourChannel);
+  w.u32(window);
+  w.u32(maxPacket);
+  return w.take();
+}
+
+export u8[] openFailure(i32 clientChannel, i32 reason, u8[] description) {
+  Writer w = Writer.create();
+  w.byte(msgChannelOpenFailure());
+  w.u32(clientChannel);
+  w.u32(reason);
+  w.str(description);
+  w.str(ascii(""));            // language tag, always empty in practice
+  return w.take();
+}
+
+export u8[] channelSuccess(i32 channel) {
+  Writer w = Writer.create();
+  w.byte(msgChannelSuccess());
+  w.u32(channel);
+  return w.take();
+}
+
+export u8[] channelFailure(i32 channel) {
+  Writer w = Writer.create();
+  w.byte(msgChannelFailure());
+  w.u32(channel);
+  return w.take();
+}
+
+export u8[] channelData(i32 channel, u8[] data) {
+  Writer w = Writer.create();
+  w.byte(msgChannelData());
+  w.u32(channel);
+  w.str(data);
+  return w.take();
+}
+
+export u8[] channelStderr(i32 channel, u8[] data) {
+  Writer w = Writer.create();
+  w.byte(msgChannelExtendedData());
+  w.u32(channel);
+  w.u32(extendedDataStderr());
+  w.str(data);
+  return w.take();
+}
+
+/**
+ * The exit status, as a request rather than a reply — `want_reply` is false and nothing answers.
+ *
+ * A client that never receives one treats the command as having succeeded, so omitting it is not
+ * an error the client can report.
+ */
+export u8[] exitStatus(i32 channel, i32 status) {
+  Writer w = Writer.create();
+  w.byte(msgChannelRequest());
+  w.u32(channel);
+  w.str(ascii("exit-status"));
+  w.bool(false);
+  w.u32(status);
+  return w.take();
+}
+
+export u8[] channelEof(i32 channel) {
+  Writer w = Writer.create();
+  w.byte(msgChannelEof());
+  w.u32(channel);
+  return w.take();
+}
+
+export u8[] channelClose(i32 channel) {
+  Writer w = Writer.create();
+  w.byte(msgChannelClose());
+  w.u32(channel);
+  return w.take();
+}
+
+/** The command out of a CHANNEL_REQUEST for `exec`, or empty when it is a different request. */
+export u8[] execCommand(u8[] payload) {
+  Reader r = Reader.over(payload);
+  if (r.byte() != msgChannelRequest()) { return u8[0](); }
+  r.u32();                                    // channel, the caller already has it
+  u8[] name = r.str();
+  r.bool();                                   // want_reply
+  if (!r.ok || !sameBytes(name, ascii("exec"))) { return u8[0](); }
+  u8[] command = r.str();
+  return r.ok ? command : u8[0]();
+}
+
+u8[] ascii(string s) { return s.toBytes(); }
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}

@@ -78,6 +78,30 @@ const mod = await wacBind("packages/ssh/test/wac/probe.wac") as unknown as {
   sshWindowCreate(initial: number): unknown;
   sshWindowConsume(w: unknown, n: number): number;
   sshWindowLeft(w: unknown): number;
+  sshAuthorized(file: Uint8Array, keyType: Uint8Array, keyBlob: Uint8Array): number;
+  sshServerProposalField(which: number): Uint8Array;
+  sshHostKeyBlob(publicKey: Uint8Array): Uint8Array;
+  sshParseEcdhInit(payload: Uint8Array): Uint8Array;
+  sshEcdhReply(hostKey: Uint8Array, qs: Uint8Array, h: Uint8Array, seed: Uint8Array): Uint8Array;
+  sshServerExchangeHash(vc: Uint8Array, vs: Uint8Array, ic: Uint8Array, isrv: Uint8Array,
+                        ks: Uint8Array, qc: Uint8Array, qs: Uint8Array, k: Uint8Array): Uint8Array;
+  sshAuthRequestField(payload: Uint8Array, which: number): number;
+  sshAuthRequestUser(payload: Uint8Array): Uint8Array;
+  sshAuthRequestMethod(payload: Uint8Array): Uint8Array;
+  sshVerifyAuth(payload: Uint8Array, sessionId: Uint8Array): boolean;
+  sshAuthFailure(): Uint8Array;
+  sshAuthSuccess(): Uint8Array;
+  sshPkOk(keyType: Uint8Array, blob: Uint8Array): Uint8Array;
+  sshServiceAccept(name: Uint8Array): Uint8Array;
+  sshDisconnect(why: Uint8Array): Uint8Array;
+  sshOpenConfirmation(client: number, ours: number, window: number, maxPacket: number): Uint8Array;
+  sshOpenFailure(client: number, reason: number, why: Uint8Array): Uint8Array;
+  sshChannelSuccessMsg(channel: number): Uint8Array;
+  sshServerData(channel: number, data: Uint8Array): Uint8Array;
+  sshServerStderr(channel: number, data: Uint8Array): Uint8Array;
+  sshExitStatus(channel: number, status: number): Uint8Array;
+  sshExecCommand(payload: Uint8Array): Uint8Array;
+  sshEphemeralPublicForSeed(seed: Uint8Array): Uint8Array;
   sshServiceRequest(): Uint8Array;
   sshSignedData(sessionId: Uint8Array, user: Uint8Array, publicBlob: Uint8Array): Uint8Array;
   sshPublicKeyRequest(sessionId: Uint8Array, user: Uint8Array, publicBlob: Uint8Array, seed: Uint8Array): Uint8Array;
@@ -1190,4 +1214,140 @@ Deno.test("channel messages address the recipient's channel number", () => {
   ] as const) {
     if (dv(msg).getUint32(1) !== 42) throw new Error(`${name} does not address the server's number`);
   }
+});
+
+Deno.test("authorized_keys: a key is found, and options are refused rather than ignored", () => {
+  const blob = Uint8Array.from({ length: 51 }, (_, i) => (i * 3) & 255);
+  const other = Uint8Array.from({ length: 51 }, (_, i) => (i * 5) & 255);
+  const b64 = btoa(String.fromCharCode(...blob));
+  const type = bytes("ssh-ed25519");
+  const check = (file: string, key = blob) => mod.sshAuthorized(bytes(file), type, key);
+
+  if (check(`ssh-ed25519 ${b64} me@here\n`) !== 1) throw new Error("a plain line did not match");
+  if (check(`# comment\n\nssh-ed25519 ${b64}\n`) !== 1) throw new Error("comments broke the scan");
+  if (check(`ssh-ed25519 ${b64}\n`, other) !== 0) throw new Error("a different key matched");
+  if (check("") !== 0) throw new Error("an empty file matched");
+  if (check(`ssh-rsa ${b64}\n`) !== 0) throw new Error("another algorithm matched");
+
+  // Options are parsed and the line is refused, because a server that reads a restriction and
+  // ignores it is worse than one that refuses: the operator wrote it expecting it to hold.
+  if (check(`no-pty ssh-ed25519 ${b64}\n`) !== 2) throw new Error("an option was ignored");
+  if (check(`restrict,pty ssh-ed25519 ${b64}\n`) !== 2) throw new Error("options were ignored");
+
+  // `command="…"` contains spaces and commas. Splitting the options field on the first space
+  // finds a key type where there is none, which reads as "this line is not for you" — so a
+  // restricted key would slip through as *unknown* rather than as restricted.
+  if (check(`command="echo hello world" ssh-ed25519 ${b64}\n`) !== 2) {
+    throw new Error("a quoted option with spaces was mis-parsed");
+  }
+  if (check(`command="a,b c",no-pty ssh-ed25519 ${b64}\n`) !== 2) {
+    throw new Error("a quoted option with a comma was mis-parsed");
+  }
+  if (check(`command="say \\"hi\\" now" ssh-ed25519 ${b64}\n`) !== 2) {
+    throw new Error("an escaped quote inside an option was mis-parsed");
+  }
+
+  // An unrestricted line elsewhere in the file wins: the key is allowed outright.
+  if (check(`no-pty ssh-ed25519 ${b64}\nssh-ed25519 ${b64}\n`) !== 1) {
+    throw new Error("a plain line after a restricted one did not win");
+  }
+  // Junk is skipped rather than fatal.
+  if (check(`garbage\nssh-ed25519 !!!\nssh-ed25519 ${b64}\n`) !== 1) {
+    throw new Error("an unreadable line stopped a later valid one");
+  }
+});
+
+Deno.test("the server's messages carry the fields a client reads", () => {
+  const dv = (b: Uint8Array) => new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const point = Uint8Array.from({ length: 32 }, (_, i) => i + 1);
+
+  // The host key blob: `string "ssh-ed25519"` then the point. 4 + 11 + 4 + 32.
+  const blob = mod.sshHostKeyBlob(point);
+  if (blob.length !== 51) throw new Error(`host key blob is ${blob.length} bytes`);
+  if (text(mod.sshReadString(blob)) !== "ssh-ed25519") throw new Error("blob does not name its type");
+
+  // OPEN_CONFIRMATION is the one message carrying both channel numbers, and they differ here so
+  // reading the wrong one is visible.
+  const conf = mod.sshOpenConfirmation(11, 22, 4096, 1024);
+  if (conf[0] !== 91) throw new Error("not an open confirmation");
+  if (dv(conf).getUint32(1) !== 11) throw new Error("the client's number is not the recipient");
+  if (dv(conf).getUint32(5) !== 22) throw new Error("our number is not the sender");
+  if (dv(conf).getUint32(9) !== 4096) throw new Error("window wrong");
+
+  // exit-status is a request with want_reply false, then the code.
+  const exit = mod.sshExitStatus(7, 42);
+  if (exit[0] !== 98) throw new Error("exit status is not a channel request");
+  if (dv(exit).getUint32(1) !== 7) throw new Error("exit status addresses the wrong channel");
+  if (text(mod.sshReadString(exit.slice(5))) !== "exit-status") throw new Error("wrong request name");
+  if (exit[20] !== 0) throw new Error("want_reply must be false — nothing answers it");
+  if (dv(exit).getUint32(21) !== 42) throw new Error("the status is wrong");
+
+  // PK_OK echoes the algorithm and blob back, which is what makes the client sign.
+  const ok = mod.sshPkOk(bytes("ssh-ed25519"), blob);
+  if (ok[0] !== 60) throw new Error("PK_OK has the wrong message number");
+  if (text(mod.sshReadString(ok.slice(1))) !== "ssh-ed25519") throw new Error("PK_OK type wrong");
+
+  // The exec command comes out of a CHANNEL_REQUEST, and only from an `exec` one.
+  const u32 = (n: number) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+  const str = (b: Uint8Array) => { const o = new Uint8Array(4 + b.length); o.set(u32(b.length)); o.set(b, 4); return o; };
+  const join = (...ps: Uint8Array[]) => {
+    const o = new Uint8Array(ps.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of ps) { o.set(p, at); at += p.length; }
+    return o;
+  };
+  const exec = join(new Uint8Array([98]), u32(0), str(bytes("exec")), new Uint8Array([1]), str(bytes("uname -a")));
+  if (text(mod.sshExecCommand(exec)) !== "uname -a") throw new Error("the command did not parse");
+  const pty = join(new Uint8Array([98]), u32(0), str(bytes("pty-req")), new Uint8Array([1]));
+  if (mod.sshExecCommand(pty).length !== 0) throw new Error("a pty request was read as exec");
+
+  // The server offers what it can do and nothing else — advertising more would have the client
+  // choose it.
+  if (text(mod.sshServerProposalField(1)) !== "ssh-ed25519") throw new Error("host key list wrong");
+  if (!text(mod.sshServerProposalField(0)).includes("kex-strict-s-v00@openssh.com")) {
+    throw new Error("the server does not offer its half of strict KEX");
+  }
+});
+
+Deno.test("a userauth request is verified against bytes we rebuild, not the client's account", () => {
+  const u32 = (n: number) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+  const str = (b: Uint8Array) => { const o = new Uint8Array(4 + b.length); o.set(u32(b.length)); o.set(b, 4); return o; };
+  const join = (...ps: Uint8Array[]) => {
+    const o = new Uint8Array(ps.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of ps) { o.set(p, at); at += p.length; }
+    return o;
+  };
+
+  const seed = Uint8Array.from({ length: 32 }, (_, i) => (i * 9 + 1) & 255);
+  const sessionId = Uint8Array.from({ length: 32 }, (_, i) => (i * 13) & 255);
+  const user = bytes("claude");
+  const publicBlob = mod.sshHostKeyBlob(mod.sshEphemeralPublicForSeed(seed));
+
+  // Build a genuine request with our own client code, then check the server accepts it.
+  const request = mod.sshPublicKeyRequest(sessionId, user, publicBlob, seed);
+  if (!mod.sshVerifyAuth(request, sessionId)) throw new Error("a valid request did not verify");
+
+  // The same request under a different session id must not verify — that binding is the whole
+  // reason a signature cannot be replayed to another server.
+  const otherSession = new Uint8Array(sessionId);
+  otherSession[0] ^= 1;
+  if (mod.sshVerifyAuth(request, otherSession)) {
+    throw new Error("a signature verified under a different session id");
+  }
+
+  // A probe carries no signature and must never be treated as authentication.
+  const probe = join(new Uint8Array([50]), str(user), str(bytes("ssh-connection")),
+                     str(bytes("publickey")), new Uint8Array([0]),
+                     str(bytes("ssh-ed25519")), str(publicBlob));
+  if (mod.sshAuthRequestField(probe, 0) !== 1) throw new Error("a probe did not parse");
+  if (mod.sshAuthRequestField(probe, 1) !== 0) throw new Error("a probe claimed a signature");
+  if (mod.sshVerifyAuth(probe, sessionId)) throw new Error("a probe was accepted as authentication");
+
+  // Another method parses far enough to be named, so a server can say what it will not do.
+  const password = join(new Uint8Array([50]), str(user), str(bytes("ssh-connection")),
+                        str(bytes("password")), new Uint8Array([0]), str(bytes("hunter2")));
+  if (mod.sshAuthRequestField(password, 0) !== 1) throw new Error("a password request did not parse");
+  if (text(mod.sshAuthRequestMethod(password)) !== "password") throw new Error("method name lost");
+  if (mod.sshVerifyAuth(password, sessionId)) throw new Error("a password request verified");
 });

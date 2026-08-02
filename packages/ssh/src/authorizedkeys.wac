@@ -1,0 +1,143 @@
+// `authorized_keys` — deciding whether a client's key may log in.
+//
+// One key per line, `#` starting a comment:
+//
+//   [options] keytype base64-blob [comment]
+//
+// The options field is what makes this more than a list. It is optional, comma-separated, and its
+// values may be quoted — `command="…"` routinely contains commas and spaces — so it cannot be
+// split on commas without respecting the quotes. Distinguishing it from the key type is by shape:
+// the first field is options exactly when the *second* field is not a key type, which is how
+// OpenSSH does it too.
+//
+// **Options are parsed, not obeyed.** `command=`, `restrict`, `no-pty` and the rest describe
+// restrictions a server must enforce, and a server that reads them and ignores them is worse than
+// one that refuses the line outright: the operator wrote them expecting them to hold. So a line
+// carrying any option is *refused* here rather than honoured half way. See `Match.Restricted`.
+
+import { decode } from "../../codec/src/base64.wac";
+
+export enum Match {
+  /** No line names this key. */
+  Unknown,
+  /** A line names this key and imposes nothing. */
+  Ok,
+  /**
+   * A line names this key but carries options this does not enforce.
+   *
+   * Refused rather than allowed: the options are there because someone meant them.
+   */
+  Restricted,
+}
+
+/**
+ * Look a client key up in the contents of an `authorized_keys` file.
+ *
+ * `keyType` is the algorithm name and `keyBlob` the wire-format public key from the userauth
+ * request — the same bytes that appear base64-encoded in the file.
+ */
+export Match lookUp(u8[] file, u8[] keyType, u8[] keyBlob) {
+  Match best = Match.Unknown;
+  i32 at = 0;
+  while (at < file.len()) {
+    i32 stop = at;
+    while (stop < file.len() && file[stop] != 10) { stop++; }
+    i32 lineEnd = stop;
+    if (lineEnd > at && file[lineEnd - 1] == 13) { lineEnd--; }
+
+    match (checkLine(file, at, lineEnd, keyType, keyBlob)) {
+      // A plain line wins outright; nothing later can take the permission away.
+      case Ok: return Match.Ok;
+      case Restricted: { best = Match.Restricted; }
+      else: {}
+    }
+    at = stop + 1;
+  }
+  return best;
+}
+
+Match checkLine(u8[] file, i32 at, i32 end, u8[] keyType, u8[] keyBlob) {
+  i32 p = skipSpace(file, at, end);
+  if (p >= end || file[p] == 0x23) { return Match.Unknown; }          // blank or '#'
+
+  // Is the first field a key type, or an options list? Try it as a key type; if the blob that
+  // should follow is not there or does not decode, treat the first field as options and look for
+  // the key type after it.
+  i32 firstEnd = fieldEnd(file, p, end);
+  bool restricted = false;
+  i32 typeStart = p;
+  if (!region(file, p, firstEnd, keyType)) {
+    // Not our key type. It may still be an options field followed by our key type — or it may be
+    // a line for a different algorithm entirely, which is not our business either way.
+    i32 optionsEnd = optionsFieldEnd(file, p, end);
+    i32 second = skipSpace(file, optionsEnd, end);
+    i32 secondEnd = fieldEnd(file, second, end);
+    if (!region(file, second, secondEnd, keyType)) { return Match.Unknown; }
+    restricted = true;
+    typeStart = second;
+  }
+
+  i32 typeEnd = fieldEnd(file, typeStart, end);
+  i32 blobStart = skipSpace(file, typeEnd, end);
+  i32 blobEnd = fieldEnd(file, blobStart, end);
+  if (blobEnd <= blobStart) { return Match.Unknown; }
+
+  u8[] b64 = u8[blobEnd - blobStart]();
+  b64.copyFrom(file, blobStart, 0, blobEnd - blobStart);
+  u8[]? blob = decode(b64);
+  if (blob is null) { return Match.Unknown; }                          // an unreadable line
+  if (!sameBytes(blob!, keyBlob)) { return Match.Unknown; }
+
+  return restricted ? Match.Restricted : Match.Ok;
+}
+
+/**
+ * The end of an options field, respecting quotes.
+ *
+ * `command="echo hello world"` contains spaces that do not end the field, and a naive scan to the
+ * first space finds a key type where there is none — which reads as "this line is not for you"
+ * and silently lets a restricted key through as unknown.
+ */
+i32 optionsFieldEnd(u8[] src, i32 at, i32 end) {
+  i32 p = at;
+  bool inQuotes = false;
+  while (p < end) {
+    i32 c = src[p];
+    if (c == 0x5c && inQuotes && p + 1 < end) {                        // '\' escapes inside quotes
+      p += 2;
+      continue;
+    }
+    if (c == 0x22) { inQuotes = !inQuotes; }                           // '"'
+    if (!inQuotes && (c == 32 || c == 9)) { return p; }
+    p++;
+  }
+  return end;
+}
+
+i32 skipSpace(u8[] src, i32 at, i32 end) {
+  i32 p = at;
+  while (p < end && (src[p] == 32 || src[p] == 9)) { p++; }
+  return p;
+}
+
+i32 fieldEnd(u8[] src, i32 at, i32 end) {
+  i32 p = at;
+  while (p < end && src[p] != 32 && src[p] != 9) { p++; }
+  return p;
+}
+
+bool region(u8[] src, i32 at, i32 end, u8[] want) {
+  if (end - at != want.len()) { return false; }
+  for (i32 i = 0; i < want.len(); i++) {
+    if (src[at + i] != want[i]) { return false; }
+  }
+  return true;
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
