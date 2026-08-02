@@ -401,6 +401,17 @@ for (const text of wide) {
     await zstd("hello hello hello world", 1),
     await zstd("mixed content, some of it repeated. ".repeat(50) + "\u00ff\u00fe\u00fd", 3, true),
   ];
+  // A frame with treeless literals and Repeat-mode tables, sampled sparsely. Those blocks only
+  // appear in large files, and a large file is expensive to decode thousands of times — the step
+  // is chosen so this stays a second or two rather than a minute.
+  {
+    const big = await zstd(JSON.stringify(Array.from({ length: 20000 }, (_, i) => ({ id: i, name: "item" + i }))), 9);
+    for (let i = 0; i < big.length; i += 997) {
+      const bad = big.slice();
+      bad[i] ^= 0xff;
+      ignoringTraps(() => m.decompress(bad));
+    }
+  }
   for (const frame of frames) {
     for (let i = 0; i <= frame.length; i++) ignoringTraps(() => m.decompress(frame.slice(0, i)));
     for (let i = 0; i < frame.length; i++) {
@@ -507,6 +518,133 @@ const hx = hash.mod as unknown as { xxh64(d: Uint8Array, start: number, len: num
   }
 }
 
+// ── FSE encoding ──────────────────────────────────────────────────────────────
+//
+// Driven the way the tests drive it — encode a symbol stream, decode it back — because that is
+// the only thing that exercises the table build and the backwards writing together. The shapes
+// are chosen for the normaliser: distributions where the rounding cannot be settled against the
+// largest symbol alone, and alphabets wider than the table.
+
+const fsee = await instrument("packages/zstd/src/fseenc.wac");
+const e = fsee.mod as unknown as {
+  normalize(counts: Int32Array, maxSymbol: number, total: number, log: number): Int32Array;
+  optimalLog(total: number, maxSymbol: number, maxLog: number): number;
+  buildCTable(norm: Int32Array, maxSymbol: number, log: number): unknown;
+  encodeStep(c: unknown, symbol: number, target: number): { state: number; value: number; bits: number };
+  initialState(c: unknown, symbol: number): number;
+  writeDescription(o: unknown, norm: Int32Array, maxSymbol: number, log: number): void;
+  BitOut: { create(): { write(v: number, n: number): void; finish(): Uint8Array; flush(): Uint8Array } };
+};
+
+function encodeRoundTrip(symbols: number[], maxSymbol: number, maxLog: number): void {
+  const counts = new Int32Array(maxSymbol + 1);
+  for (const s of symbols) counts[s]++;
+  const log = e.optimalLog(symbols.length, maxSymbol, maxLog);
+  const norm = e.normalize(counts, maxSymbol, symbols.length, log);
+  const c = e.buildCTable(norm, maxSymbol, log);
+
+  const body = e.BitOut.create();
+  let state = e.initialState(c, symbols[symbols.length - 1]);
+  for (let i = symbols.length - 2; i >= 0; i--) {
+    const step = e.encodeStep(c, symbols[i], state);
+    body.write(step.value, step.bits);
+    state = step.state;
+  }
+  body.write(state, log);
+  body.finish();
+
+  const head = e.BitOut.create();
+  e.writeDescription(head, norm, maxSymbol, log);
+  head.flush();
+}
+
+{
+  let seed = 0x1234567 | 0;
+  const rand = (n: number) => {
+    seed ^= seed << 13; seed >>>= 0;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5; seed >>>= 0;
+    return seed % n;
+  };
+  for (let trial = 0; trial < 200; trial++) {
+    const maxSymbol = 1 + rand(50);
+    const n = 20 + rand(3000);
+    const weights: number[] = [];
+    for (let s = 0; s <= maxSymbol; s++) weights.push(rand(10) === 0 ? 0 : 1 + rand(1 << rand(9)));
+    const pool: number[] = [];
+    for (let s = 0; s <= maxSymbol; s++) for (let k = 0; k < weights[s]; k++) pool.push(s);
+    if (pool.length === 0) continue;
+    ignoringTraps(() => encodeRoundTrip(Array.from({ length: n }, () => pool[rand(pool.length)]), maxSymbol, 9));
+  }
+  // Alphabets wider than the smallest table, so the normaliser has to take slots back rather
+  // than settle everything against the largest symbol.
+  for (const maxSymbol of [40, 60, 100]) {
+    const symbols: number[] = [];
+    for (let s = 0; s <= maxSymbol; s++) symbols.push(s);
+    ignoringTraps(() => encodeRoundTrip(symbols, maxSymbol, 5));
+  }
+  // Refusals: a symbol with no states, a target outside the table, an empty distribution.
+  {
+    const norm = e.normalize(Int32Array.from([10, 0, 5]), 2, 15, 5);
+    const c = e.buildCTable(norm, 2, 5);
+    ignoringTraps(() => e.encodeStep(c, 1, 0));
+    ignoringTraps(() => e.initialState(c, 1));
+    ignoringTraps(() => e.encodeStep(c, 0, 1000));
+    ignoringTraps(() => e.encodeStep(c, 99, 0));
+    ignoringTraps(() => e.initialState(c, 99));
+  }
+  // Descriptions for distributions carrying -1 counts, which this normaliser never produces
+  // but the format's own predefined tables are full of.
+  for (
+    const [counts, log] of [
+      [[4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1], 6],
+      [[1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1], 5],
+      [[30, -1, 16, -1, 16], 6],
+    ] as [number[], number][]
+  ) {
+    const o = e.BitOut.create();
+    e.writeDescription(o, Int32Array.from(counts), counts.length - 1, log);
+    o.flush();
+  }
+
+  // Distributions where the rounding cannot be settled against the largest symbol but *can* be
+  // settled at all: enough symbols that they all round up past the table, few enough that the
+  // ones with slots to spare can cover it. 21 equal symbols in 32 slots each round to 2, which
+  // is 42 — ten too many, and twenty symbols have a slot to give.
+  for (const symbols of [21, 25, 30]) {
+    const counts = new Int32Array(symbols);
+    for (let s = 0; s < symbols; s++) counts[s] = 1000;
+    ignoringTraps(() => e.normalize(counts, symbols - 1, 1000 * symbols, 5));
+  }
+  // The same, but unequal, so the search for who can spare a slot actually compares candidates
+  // rather than taking the first.
+  for (const symbols of [21, 26]) {
+    const counts = new Int32Array(symbols);
+    for (let s = 0; s < symbols; s++) counts[s] = 1000 + s * 250;
+    let total = 0;
+    for (const c of counts) total += c;
+    ignoringTraps(() => e.normalize(counts, symbols - 1, total, 5));
+    ignoringTraps(() => e.normalize(counts, symbols - 1, total, 6));
+  }
+
+  // Alphabets far wider than the table, so the normaliser exhausts its first strategy and has
+  // to take slots back one at a time, comparing candidates as it goes.
+  for (const maxSymbol of [70, 120, 200]) {
+    const counts = new Int32Array(maxSymbol + 1);
+    for (let s = 0; s <= maxSymbol; s++) counts[s] = 1 + (s % 3);
+    let total = 0;
+    for (const c of counts) total += c;
+    ignoringTraps(() => e.normalize(counts, maxSymbol, total, 5));
+    ignoringTraps(() => e.normalize(counts, maxSymbol, total, 6));
+  }
+
+  ignoringTraps(() => e.normalize(new Int32Array(4), 3, 0, 5));
+  ignoringTraps(() => e.normalize(new Int32Array(4), 3, 10, 5));
+  for (const total of [1, 2, 10, 1000, 100000]) {
+    for (const maxSymbol of [1, 5, 100, 255]) e.optimalLog(total, maxSymbol, 9);
+  }
+}
+
 /**
  * Branches that no input can reach, with the argument for each.
  *
@@ -536,7 +674,7 @@ const UNREACHABLE: { file: string; line: number; snippet: string; why: string }[
   },
 ];
 
-report([run, fse, huff, hash], "packages/zstd/", { verbose });
+report([run, fse, huff, hash, fsee], "packages/zstd/", { verbose });
 
 const source = await Deno.readTextFile("packages/zstd/src/fse.wac");
 const lines = source.split("\n");
