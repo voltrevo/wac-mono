@@ -41,16 +41,37 @@ export struct BitOut {
 
   BitOut create() { return BitOut(Buf.create(), 0, 0); }
 
-  /** Append `n` bits of `v`, least significant first. */
+  /**
+   * Append `n` bits of `v`, least significant first.
+   *
+   * Whole field at a time rather than bit at a time: `cur` holds a partial byte, so shifting the
+   * field into place above it and draining whole bytes off the bottom gets the same bytes out for
+   * one pass instead of `n`. The count profile had this loop at 4.95 iterations per byte of input.
+   */
   void write(this, i32 v, i32 n) {
-    for (i32 i = 0; i < n; i++) {
-      this.cur = this.cur | (((v >>> i) & 1) << this.used);
-      this.used++;
-      if (this.used == 8) {
-        this.bytes.push(this.cur);
-        this.cur = 0;
-        this.used = 0;
-      }
+    if (n <= 0) { return; }
+    i32 val = v;
+    i32 left = n;
+    // `cur` carries at most 7 bits, so a field of 24 keeps the accumulator inside 31 and away
+    // from the sign bit. Longer fields go in 24-bit instalments; nothing here writes one today,
+    // but an offset code may carry 31 extra bits and silently dropping them would be a
+    // corruption that only shows up on data nobody has yet.
+    while (left > 24) {
+      this.writeUpTo24(val & 0xFFFFFF, 24);
+      val = val >>> 24;
+      left -= 24;
+    }
+    this.writeUpTo24(val, left);
+  }
+
+  /** `n` must be 0..24, and `used` is always under 8 on entry. */
+  void writeUpTo24(this, i32 v, i32 n) {
+    this.cur = this.cur | ((v & ((1 << n) - 1)) << this.used);
+    this.used += n;
+    while (this.used >= 8) {
+      this.bytes.push(this.cur & 255);
+      this.cur = this.cur >>> 8;
+      this.used -= 8;
     }
   }
 

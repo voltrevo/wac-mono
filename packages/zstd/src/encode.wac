@@ -69,8 +69,17 @@ i32 highBit(i32 v) {
 // Each is a baseline plus extra bits. Going the other way means finding the largest baseline
 // that does not exceed the value — a scan, because the tables are short and irregular.
 
+// Both tables start out one apart — every value has its own code — and only spread once the
+// values get large. So the common case is arithmetic and the scan is for the tail, which is what
+// the downward scan below was doing the slow way round: a match of 8 walked from code 52 to code
+// 5, about forty-five comparisons to answer what subtraction answers. The count profile had
+// `mlCodeOf` at 5.3 iterations and `llCodeOf` at 4.0 *per byte of input*.
+
 /** The literal-length code for `len`, and how many extra bits it carries. */
 i32 llCodeOf(i32 len) {
+  if (len < 0) { trap; }
+  // LL_BASE[c] == c for c in 0..16, so any length up to 16 is its own code.
+  if (len <= 16) { return len; }
   for (i32 c = llMaxSymbol(); c >= 0; c--) {
     if (LL_BASE[c] <= len) { return c; }
   }
@@ -79,6 +88,9 @@ i32 llCodeOf(i32 len) {
 
 /** The match-length code for `len`. */
 i32 mlCodeOf(i32 len) {
+  if (len < minMatch()) { trap; }
+  // ML_BASE[c] == c + 3 for c in 0..31, covering lengths 3 to 34.
+  if (len <= 34) { return len - 3; }
   for (i32 c = mlMaxSymbol(); c >= 0; c--) {
     if (ML_BASE[c] <= len) { return c; }
   }
