@@ -53,6 +53,10 @@ import {
   certificate, certificateVerify, certificateVerifyContent, encryptedExtensions,
   finished, handshakeMessage, messageBody, messageLength, messageType, parseClientHello,
   serverHello, ClientHello,
+  hsClientHello, hsServerHello, hsEncryptedExtensions, hsCertificate,
+  hsCertificateVerify, hsFinished, extServerName, extSupportedGroups,
+  extSignatureAlgorithms, extSupportedVersions, extKeyShare, groupX25519, groupP256,
+  groupHybrid, sigEd25519,
 } from "./handshake.wac";
 import { Reader, Writer } from "./wire.wac";
 
@@ -229,7 +233,7 @@ u8[] serverFlight(Conn c, u8[] clientHelloMsg) {
     for (i32 i = 0; i < hybridServerShareLen(); i++) { ourShare[i] = accepted[i]; }
     hybridSecret = u8[64]();
     for (i32 i = 0; i < hybridSecretLen(); i++) { hybridSecret[i] = accepted[hybridServerShareLen() + i]; }
-  } else if (group == 0x001d) {
+  } else if (group == groupX25519()) {
     ourShare = x25519Base(c.ephemeralPriv);
   } else {
     ourShare = p256PublicKey(c.ephemeralPriv);
@@ -243,7 +247,7 @@ u8[] serverFlight(Conn c, u8[] clientHelloMsg) {
   u8[] shared = u8[0]();
   if (group == groupX25519MlKem768()) {
     shared = hybridSecret;
-  } else if (group == 0x001d) {
+  } else if (group == groupX25519()) {
     shared = x25519(c.ephemeralPriv, peerKey);
   } else {
     shared = p256Ecdh(c.ephemeralPriv, peerKey);

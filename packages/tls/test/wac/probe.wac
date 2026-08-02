@@ -179,3 +179,21 @@ export i32 hybGroup() { return groupX25519MlKem768(); }
 export i32 hybClientLen() { return hybridClientShareLen(); }
 export i32 hybServerLen() { return hybridServerShareLen(); }
 export i32 hybSecretLen() { return hybridSecretLen(); }
+
+// The alert registry, so a test can check the numbers against RFC 8446 rather than
+// against a second copy of them written in TypeScript.
+import {
+  alertCloseNotify, alertUnexpectedMessage, alertBadRecordMac, alertHandshakeFailure,
+  alertIllegalParameter, alertDecodeError, alertDecryptError, alertProtocolVersion,
+  alertMissingExtension, alertNoApplicationProtocol, alertBadCertificate,
+  alertUnsupportedCertificate, alertCertificateExpired, alertUnknownCa, alertBody,
+} from "../../src/record.wac";
+export u8[] alertCodes() {
+  return u8[](
+    alertCloseNotify(), alertUnexpectedMessage(), alertBadRecordMac(),
+    alertHandshakeFailure(), alertBadCertificate(), alertUnsupportedCertificate(),
+    alertCertificateExpired(), alertIllegalParameter(), alertUnknownCa(),
+    alertDecodeError(), alertDecryptError(), alertProtocolVersion(),
+    alertMissingExtension(), alertNoApplicationProtocol());
+}
+export u8[] alertEncode(i32 description) { return alertBody(description); }
