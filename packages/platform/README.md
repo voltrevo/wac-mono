@@ -29,10 +29,21 @@ program. Whoever packages it decides what it may do; whoever runs it cannot wide
 The same source built without `--allow-read` reports `filesystem read not granted` and
 exits 1, and no argument can put the capability back.
 
-The shebang mirrors the grants, with one exception worth knowing: `--allow-read` is always
-there and is *not* a grant to the application. The worker has to read its own module to
-start, and Deno cannot give a worker less than its parent without an unstable flag. What
-the application sees is decided by the capability world, not by that line.
+**The shebang is exactly the grants.** A program granted nothing asks for nothing:
+
+```
+#!/usr/bin/env -S deno run                    # no capabilities
+#!/usr/bin/env -S deno run --allow-read       # built with --allow-read
+```
+
+That is worth the trouble it took. The obvious way to spawn the worker is
+`new Worker(import.meta.url)` — the file spawning itself — but that needs `--allow-read`
+on the file, which put a permission in every shebang whatever the program could do, and
+read as a filesystem grant to anyone auditing it. So a built program carries the worker's
+source as a string and spawns it from a blob URL, which needs no permission at all.
+
+The build is two passes for that reason: the worker bundle holds the application and the
+wasm, and the launcher carries it as a string.
 
 The bundle spawns **itself**: a single file cannot reference a sibling worker module, so
 `new Worker(import.meta.url)` re-runs it, and it notices it is on a worker and runs the
@@ -95,7 +106,7 @@ host/provider.ts    builds Core and Cli from a bridge
 host/deno.ts        Deno's implementations. Note how much of it is `await`
 host/worker.ts      loads an application and runs it
 host/launch.ts      compiles, spawns the worker, answers, waits
-host/entry.ts       the bundled application's entry: launcher and worker in one file
+host/entry.ts       the launcher and worker halves of a built program
 build.ts            builds an application into one executable
 app.ts              the command line
 example/wc.wac      an application, entire

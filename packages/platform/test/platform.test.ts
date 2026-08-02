@@ -190,7 +190,11 @@ Deno.test("an application builds to one executable file and runs repeatedly", as
     await buildApp(WC, out, { read: true });
     const stat = await Deno.stat(out);
     assertEquals(stat.mode !== null && (stat.mode & 0o111) !== 0, true, "executable");
-    assertEquals((await Deno.readTextFile(out)).startsWith("#!"), true, "has a shebang");
+    assertEquals(
+      (await Deno.readTextFile(out)).split("\n")[0],
+      "#!/usr/bin/env -S deno run --allow-read",
+      "the shebang states the grants and nothing more",
+    );
 
     for (let i = 0; i < 3; i++) {
       // No permission flags and no separator: a built program takes the arguments a
@@ -215,10 +219,14 @@ Deno.test("an application builds to one executable file and runs repeatedly", as
         true,
         new TextDecoder().decode(denied.stderr),
       );
+      // The shebang is exactly the grants, so a program granted nothing asks for nothing.
+      // That is only possible because the worker comes from a blob URL: spawning the file
+      // itself needs --allow-read, which used to sit in every shebang and read as a
+      // filesystem grant to anyone auditing it.
       assertEquals(
         (await Deno.readTextFile(bare)).split("\n")[0],
-        "#!/usr/bin/env -S deno run --allow-read",
-        "the shebang mirrors the grants — read is the worker loading itself",
+        "#!/usr/bin/env -S deno run",
+        "no capabilities, no permissions",
       );
     } finally {
       await Deno.remove(bare);
