@@ -15,18 +15,24 @@ things. All commands run from the repo root.
 ## Building an executable
 
 ```sh
-deno task app:build packages/platform/example/wc.wac -o wc
-./wc --allow-read -- README.md
+deno task app:build packages/platform/example/wc.wac --allow-read -o wc
+./wc README.md
 ```
 
-29K, self-contained: the wasm is base64 inside it, and so are the bindgen wrappers and the
+27K, self-contained: the wasm is base64 inside it, and so are the bindgen wrappers and the
 whole host. Nothing is read from this repo at run time, so the file can be copied anywhere
 Deno exists.
 
-The shebang asks for what the *launcher* needs — reading its own file, spawning a worker.
-What the *application* may do is decided by the flags given to the file, so a build is not
-a grant: `./wc -- README.md` without `--allow-read` tells the application the filesystem
-was not granted.
+**Capabilities are granted at build, not at run.** The built program takes no permission
+flags of its own and every argument goes to the application, so it behaves like any other
+program. Whoever packages it decides what it may do; whoever runs it cannot widen that.
+The same source built without `--allow-read` reports `filesystem read not granted` and
+exits 1, and no argument can put the capability back.
+
+The shebang mirrors the grants, with one exception worth knowing: `--allow-read` is always
+there and is *not* a grant to the application. The worker has to read its own module to
+start, and Deno cannot give a worker less than its parent without an unstable flag. What
+the application sees is decided by the capability world, not by that line.
 
 The bundle spawns **itself**: a single file cannot reference a sibling worker module, so
 `new Worker(import.meta.url)` re-runs it, and it notices it is on a worker and runs the

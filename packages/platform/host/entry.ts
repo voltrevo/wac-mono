@@ -64,21 +64,27 @@ function firstMessage(): Promise<Start> {
   return new Promise<Start>((res) => { deliver = res; });
 }
 
-const USAGE = `usage: <app> [--allow-read] [--allow-write] [--allow-env] [-- args...]
-
-Capabilities are granted here and nowhere else: without --allow-read the application
-is told the filesystem was not granted, exactly as if it had failed.`;
+/**
+ * What the build granted this application. Baked in, not parsed from the command line.
+ *
+ * A built program should look like any other program: `./wc README.md`, not
+ * `./wc --allow-read -- README.md`. Deciding at build is also the more honest place —
+ * whoever packages the thing chooses what it may do, and the person running it cannot
+ * quietly widen that.
+ */
+export type Grants = { read?: boolean; write?: boolean; env?: boolean };
 
 /**
  * Run a bundled application. Called by the generated entry with its own module.
  *
- * On the main thread this parses the command line, grants what it says, spawns the
- * worker and exits with the application's code. On a worker it builds the capability
- * structs and runs the application.
+ * On the main thread this serves the capabilities the build granted, spawns the worker
+ * and exits with the application's code. On a worker it builds the capability structs
+ * and runs the application. Every argument goes to the application; the launcher takes
+ * none of its own.
  */
-export async function runBundled(app: AppModule): Promise<void> {
+export async function runBundled(app: AppModule, grants: Grants = {}): Promise<void> {
   if (onWorker()) return runAsWorker(app);
-  await runAsLauncher();
+  await runAsLauncher(grants);
 }
 
 async function runAsWorker(app: AppModule): Promise<void> {
@@ -99,22 +105,12 @@ async function runAsWorker(app: AppModule): Promise<void> {
   }
 }
 
-async function runAsLauncher(): Promise<void> {
-  const argv = [...Deno.args];
-  if (argv.includes("--help") || argv.includes("-h")) {
-    console.log(USAGE);
-    Deno.exit(0);
-  }
-  const sep = argv.indexOf("--");
-  const flags = sep < 0 ? argv : argv.slice(0, sep);
-  const appArgs = sep < 0 ? [] : argv.slice(sep + 1);
-  const has = (f: string) => flags.includes(f);
-
+async function runAsLauncher(grants: Grants): Promise<void> {
   const bridge = newBridge();
   const responder = serveHostCalls(bridge, denoWorld({
-    args: appArgs,
-    fs: { read: has("--allow-read"), write: has("--allow-write") },
-    env: has("--allow-env") ? (n) => Deno.env.get(n) : undefined,
+    args: [...Deno.args],
+    fs: { read: grants.read === true, write: grants.write === true },
+    env: grants.env === true ? (n) => Deno.env.get(n) : undefined,
   }));
 
   const worker = new Worker(import.meta.url, { type: "module" });
