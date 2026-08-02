@@ -1,0 +1,57 @@
+// A file cut into pieces of N lines. `box split -1000 big.txt part-`.
+//
+// The first applet that opens more than one output. Everything else opens a file, writes
+// it and closes it; this switches the current output for each piece, which is the part of
+// `openOutput` nothing had exercised.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, openStream } from "../lib/input.wac";
+import { Line, Lines, emit, nextLine } from "../lib/reader.wac";
+import { itoa } from "../lib/num.wac";
+
+export i32 split(Core core, Cli cli, Args a) {
+  if (a.rest.len() < 1) {
+    core.warn("usage: " + a.name + " [-<lines>] <file> [prefix]");
+    return 2;
+  }
+  i32 per = a.num == 0 ? 1000 : a.num;
+  string prefix = a.rest.len() > 1 ? a.rest[1] : "x";
+
+  Input in = openStream(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+
+  Lines s = Lines.create();
+  i32 piece = 0;
+  i32 written = 0;
+  bool open = false;
+  while (true) {
+    Line l = nextLine(s, cli);
+    if (!l.ok) { break; }
+    if (!open) {
+      string name = prefix + suffix(piece);
+      string error = cli.openOutput(name);
+      if (error != "") { core.warn(a.name + ": " + name + ": " + error); return 1; }
+      open = true;
+      written = 0;
+    }
+    emit(cli, l.bytes, l.nl);
+    written++;
+    if (written == per) { piece++; open = false; }
+  }
+  // Back to standard output, which closes the last piece — a file left open is a file that
+  // may not be on disk yet.
+  cli.openOutput("");
+  return 0;
+}
+
+/** `aa`, `ab`, ... `zz`, then three letters, as the real one numbers them. */
+string suffix(i32 n) {
+  if (n < 26 * 26) {
+    u8[] out = u8[2](fill: 'a');
+    out[0] = 'a' + (n / 26);
+    out[1] = 'a' + (n % 26);
+    return string.fromBytes(out);
+  }
+  return "z" + itoa(n);
+}
