@@ -5,6 +5,7 @@
 // know the difference.
 
 import { type Handlers } from "./respond.ts";
+import { CHUNK } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { OP } from "./ops.ts";
 
@@ -62,6 +63,11 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   const log = opts.log ?? ((l: string) => console.log(l));
   const warn = opts.warn ?? ((l: string) => console.error(l));
   const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
+
+  // The current streaming input. One at a time rather than a handle per file, because the
+  // wac side has no closures to carry a handle in — see the note in platform.wac.
+  let source: Deno.FsFile | null = null;   // null means standard input
+  const buf = new Uint8Array(CHUNK);
 
   return {
     [OP.NOW_MILLIS]: () => i64le(BigInt(Date.now())),
@@ -130,6 +136,22 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     // The mutation tier. Each throws on failure and the wac side reads that as `false`,
     // so an application never has to tell "not permitted" from "did not exist" — which
     // is again the correct amount for it to know.
+    [OP.OPEN_INPUT]: async (p) => {
+      const path = unstr(p);
+      source?.close();
+      source = null;
+      if (path === "") return EMPTY;      // standard input, and the default
+      if (!opts.fs?.read) deny("filesystem read");
+      source = await Deno.open(path, { read: true });
+      return EMPTY;
+    },
+    [OP.READ_CHUNK]: async () => {
+      const n = source === null ? await Deno.stdin.read(buf) : await source.read(buf);
+      // A short read is not the end; only null is. Returning the subarray rather than a
+      // slice is safe because `send` copies it into the bridge before we are called again.
+      return n === null ? EMPTY : buf.subarray(0, n);
+    },
+
     [OP.MKDIR]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");
       await Deno.mkdir(unstr(p.subarray(1)), { recursive: p[0] === 1 });

@@ -1,8 +1,11 @@
 // Translate bytes: `tr a-z A-Z`. Ranges expand; sets are matched by position.
+//
+// The 256-entry table is built once and every chunk maps through it, so this holds one
+// chunk however long the input is.
 
 import { Cli, Core } from "../../../src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, readInput } from "../lib/input.wac";
+import { Input, openStream } from "../lib/input.wac";
 
 export i32 tr(Core core, Cli cli, Args a) {
   if (a.rest.len() < 2) { core.warn("usage: " + a.name + " <set1> <set2> [file]"); return 2; }
@@ -10,7 +13,7 @@ export i32 tr(Core core, Cli cli, Args a) {
   u8[] to = expand(a.rest[1].toBytes());
   if (to.len() == 0) { core.warn(a.name + ": empty replacement set"); return 2; }
 
-  Input in = readInput(core, cli, a, 2);
+  Input in = openStream(core, cli, a, 2);
   if (!in.ok) { return 1; }
 
   // A 256-entry table, so the inner loop is one lookup rather than a scan per byte.
@@ -21,9 +24,13 @@ export i32 tr(Core core, Cli cli, Args a) {
     map[from[i]] = i < to.len() ? to[i] : to[to.len() - 1];
   }
 
-  u8[] out = u8[in.bytes.len()](fill: 0);
-  for (i32 i = 0; i < in.bytes.len(); i++) { out[i] = map[in.bytes[i]]; }
-  cli.write(out);
+  while (true) {
+    u8[] chunk = cli.readChunk();
+    if (chunk.len() == 0) { return 0; }
+    u8[] out = u8[chunk.len()](fill: 0);
+    for (i32 i = 0; i < chunk.len(); i++) { out[i] = map[chunk[i]]; }
+    cli.write(out);
+  }
   return 0;
 }
 

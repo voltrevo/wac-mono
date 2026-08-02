@@ -22,4 +22,6 @@ export const OP = {
   MKDIR: 15,
   REMOVE: 16,
   RENAME: 17,
+  OPEN_INPUT: 18,
+  READ_CHUNK: 19,
 } as const;
