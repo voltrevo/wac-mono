@@ -296,3 +296,34 @@ produces.** The tests check the client's internal failure code, not the alert by
 peer is sent, so `unknown_ca` where `bad_certificate` was meant would go unnoticed. The
 values are now pinned; which one each path emits is not. Closing it needs the client's
 output decrypted and parsed, which is the better test and a larger one.
+
+### tls re-measured, 2026-08-02: 160/235, 75 surviving
+
+Was 134. The clusters that were dead constants are gone, and `wire` and `hybrid` dropped
+once they had direct tests rather than only being reached through handshakes.
+
+| operator | module | survivors |
+|---|---|---:|
+| guard | server | 13 |
+| guard | client | 9 |
+| guard | asn1 | 9 |
+| guard | record | 8 |
+| extreme | x509 | 8 |
+| guard | hybrid | 6 |
+| guard | x509 | 4 |
+| guard | wire | 4 |
+| extreme | server | 4 |
+| extreme | asn1 | 4 |
+| guard | handshake | 3 |
+| extreme | keyschedule, handshake, client | 1 each |
+
+The remaining shape is the state machines: `server` and `client` account for 26 between
+them, almost all `guard`. Those are the hardest to reach, because driving a specific
+rejection means constructing a handshake that is well formed up to exactly one wrong
+field — which is a test-fixture problem more than a test-writing one, and the reason they
+have been left while cheaper things were done first.
+
+`guard/asn1`'s nine are more tractable and probably worth doing next: the DER reader is a
+pure function of a byte string, so a malformed-certificate corpus reaches all of them
+without any handshake at all. `wire.wac` went from nine survivors to four exactly that
+way.

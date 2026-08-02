@@ -176,3 +176,43 @@ void hostCall;
 void HostCallError;
 void unstr;
 void denoWorld;
+
+// ── The bundled executable ────────────────────────────────────────────────────
+
+Deno.test("an application builds to one executable file and runs repeatedly", async () => {
+  // Built once, run several times on purpose. The first version of this worked one run
+  // in three: the launcher's `postMessage` reached the worker while the generated module
+  // was suspended at its top-level `await WebAssembly.instantiate`, and was dropped.
+  // A single run would have called that a pass.
+  const { buildApp } = await import("../build.ts");
+  const out = await Deno.makeTempFile({ prefix: "wac-app-" });
+  try {
+    await buildApp(WC, out);
+    const stat = await Deno.stat(out);
+    assertEquals(stat.mode !== null && (stat.mode & 0o111) !== 0, true, "executable");
+    assertEquals((await Deno.readTextFile(out)).startsWith("#!"), true, "has a shebang");
+
+    for (let i = 0; i < 3; i++) {
+      const r = new Deno.Command(out, {
+        args: ["--allow-read", "--", WC],
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      const stdout = new TextDecoder().decode(r.stdout).trim();
+      assertEquals(r.code, 0, `run ${i}: ${new TextDecoder().decode(r.stderr)}`);
+      assertEquals(stdout.endsWith(WC), true, `run ${i} counted the file: ${stdout}`);
+    }
+
+    // Capabilities are granted by the flags given to the file, not baked in at build.
+    const denied = new Deno.Command(out, { args: ["--", WC], stdout: "piped", stderr: "piped" })
+      .outputSync();
+    assertEquals(denied.code, 1, "denied a filesystem, the application says so");
+    assertEquals(
+      new TextDecoder().decode(denied.stderr).includes("not granted"),
+      true,
+      new TextDecoder().decode(denied.stderr),
+    );
+  } finally {
+    await Deno.remove(out);
+  }
+});
