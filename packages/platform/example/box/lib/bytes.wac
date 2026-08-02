@@ -1,0 +1,23 @@
+// Byte-array helpers shared by every applet.
+
+export u8[] concat(u8[] a, u8[] b) {
+  u8[] out = u8[a.len() + b.len()](fill: 0);
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}
+
+/** `a[at..to)`, empty when that range is. */
+export u8[] slice(u8[] a, i32 at, i32 to) {
+  i32 n = to - at;
+  if (n <= 0) { return u8[0](); }
+  u8[] out = u8[n](fill: 0);
+  out.copyFrom(a, at, 0, n);
+  return out;
+}
+
+export u8[] withNewline(u8[] a) {
+  u8[] out = u8[a.len() + 1](fill: '\n');
+  out.copyFrom(a, 0, 0, a.len());
+  return out;
+}

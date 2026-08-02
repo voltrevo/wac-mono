@@ -1,0 +1,22 @@
+// Each line reversed, keeping the line breaks where they are.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { Input, readInput } from "../lib/input.wac";
+
+export i32 rev(Core core, Cli cli, Args a) {
+  Input in = readInput(core, cli, a, 0);
+  if (!in.ok) { return 1; }
+  u8[] data = in.bytes;
+  u8[] out = u8[data.len()](fill: 0);
+  i32 start = 0;
+  for (i32 i = 0; i <= data.len(); i++) {
+    bool end = i == data.len() || data[i] == '\n';
+    if (!end) { continue; }
+    for (i32 k = 0; k < i - start; k++) { out[start + k] = data[i - 1 - k]; }
+    if (i < data.len()) { out[i] = '\n'; }
+    start = i + 1;
+  }
+  cli.write(out);
+  return 0;
+}

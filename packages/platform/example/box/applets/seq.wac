@@ -1,0 +1,12 @@
+// 1 to n, one per line.
+
+import { Cli, Core } from "../../../src/platform.wac";
+import { Args } from "../lib/args.wac";
+import { atoi, itoa } from "../lib/num.wac";
+
+export i32 seq(Core core, Cli cli, Args a) {
+  if (a.rest.len() < 1) { core.warn("usage: box seq <count>"); return 2; }
+  i32 n = atoi(a.rest[0]);
+  for (i32 i = 1; i <= n; i++) { core.log(itoa(i)); }
+  return 0;
+}

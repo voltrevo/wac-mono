@@ -118,7 +118,7 @@ writes exact bytes, and `hexdump <dir>` lists a directory through `stat` and `re
 ## box: twenty-seven applets in one program
 
 ```sh
-deno task app:build packages/platform/example/box.wac --allow-read --allow-write -o box
+deno task app:build packages/platform/example/box/box.wac --allow-read --allow-write -o box
 ./box grep -i wac README.md
 cat README.md | ./box sort -u | ./box wc -l
 ./box du packages
@@ -130,7 +130,16 @@ ls nl rev seq sha256sum sha512sum sort tac tail tee true uniq wc
 ```
 
 74K, drawing on this repo's `crypto`, `codec` and `regex` packages, so it is the widest
-composition here. Its tests are differential against the system tools rather than against
+composition here.
+
+**One applet per file.** `applets/<name>.wac`, always — finding one takes no thought, and
+two people editing different applets do not collide in a 561-line file. `box.wac` is the
+dispatcher and its twenty-four imports are the table of contents; shared parts live in
+`lib/` (`args`, `bytes`, `num`, `lines`, `input`). Splitting thirty files cost 12ms of
+build time, measured before and after.
+
+`true` and `false` are the exception: the dispatcher returning a constant *is* the whole
+applet, and a file containing one `return` would be ceremony rather than clarity. Its tests are differential against the system tools rather than against
 my idea of them: `cat rev nl tac sort sort -r sort -u uniq -c base32 base64 sha256sum
 sha512sum grep grep -i grep -v grep -n grep -c find` all match byte for byte, `du` matches
 `du -sb`, and `head -N`, `tail -n N`, `wc -l/-w/-c` match the real ones' output. `grep`
