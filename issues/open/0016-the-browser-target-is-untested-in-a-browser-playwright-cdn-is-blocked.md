@@ -1,4 +1,4 @@
-# 0015 — the browser target is untested in a browser; Playwright's CDN is blocked
+# 0016 — the browser target is untested in a browser; Playwright's CDN is blocked
 
 - **Status:** open
 - **Claimed by:** (nobody yet — add yourself before working it)
