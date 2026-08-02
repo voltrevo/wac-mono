@@ -1,0 +1,112 @@
+// The byte cursor every TLS message is parsed with.
+//
+// Written in wac and taking nothing from the host, because nothing here needs one: a
+// Reader is a function from bytes to bytes, and every assertion is either a known answer
+// or an invariant. The TypeScript version this replaces existed only because a probe was
+// the way to reach `wire.wac` from a `.test.ts`, and it needed twelve probe exports and a
+// numeric opcode to route between them. Here the calls are just calls.
+//
+// wire.wac had no tests until today. It was covered — the handshake tests drive thousands
+// of reads through it — and every one of its bounds checks survived mutation testing
+// anyway, because a handshake only ever hands it well-formed input. Well-formed input is
+// the one case a wire parser is guaranteed not to get from the network.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { Reader, Writer } from "../../src/wire.wac";
+
+u8[] bytes3(i32 a, i32 b, i32 c) { u8[] o = u8[3](); o[0] = a; o[1] = b; o[2] = c; return o; }
+
+export string test_fixed_width_reads_are_big_endian() {
+  // Every length and code point in TLS is big-endian, and a reader that assembled them
+  // the other way round would still round-trip against a writer that did the same.
+  T t = T.create();
+  u8[] four = u8[4]();
+  four[0] = 0x12; four[1] = 0x34; four[2] = 0x56; four[3] = 0x78;
+  t.eqI32(Reader.create(four).u16(), 0x1234, "u16");
+  t.eqI32(Reader.create(four).u24(), 0x123456, "u24");
+  t.eqI32(Reader.create(four).u32(), 0x12345678, "u32");
+  t.eqI32(Reader.create(four).u8(), 0x12, "u8");
+  return t.report();
+}
+
+export string test_expect_end_measures_what_is_left() {
+  // Trailing data after a well-formed message is not harmless. RFC 8446 §4 messages have
+  // exact lengths, so accepting a suffix means two byte strings parse to the same
+  // handshake — a transcript hash that no longer identifies what was sent.
+  T t = T.create();
+  Reader r = Reader.create(bytes3(1, 2, 3));
+  t.isFalse(r.empty(), "three bytes is not empty");
+  r.take(3);
+  t.isTrue(r.empty(), "consuming everything reaches the end");
+  t.eqI32(r.remaining(), 0, "nothing remains");
+
+  Reader partial = Reader.create(bytes3(1, 2, 3));
+  partial.take(2);
+  t.eqI32(partial.remaining(), 1, "a leftover byte is visible to expectEnd");
+  return t.report();
+}
+
+export string test_sub_readers_cannot_see_past_their_vector() {
+  // The boundary that stops a length inside one extension reaching into the next.
+  T t = T.create();
+  u8[] buf = u8[5]();
+  buf[0] = 2; buf[1] = 0xAA; buf[2] = 0xBB; buf[3] = 0xCC; buf[4] = 0xDD;
+  Reader outer = Reader.create(buf);
+  Reader inner = outer.sub8();
+  t.eqI32(inner.remaining(), 2, "the sub-reader is bounded by its prefix");
+  t.eqI32(outer.remaining(), 2, "and the outer reader advanced past it");
+  t.eqI32(inner.u8(), 0xAA, "the sub-reader starts where it should");
+  t.eqI32(inner.u8(), 0xBB, "and ends where it should");
+  t.isTrue(inner.empty(), "the sub-reader is spent while the outer is not");
+  t.isFalse(outer.empty(), "the outer reader still has the bytes after the vector");
+  return t.report();
+}
+
+export string test_the_writer_round_trips_through_the_reader() {
+  // An invariant rather than a fixed vector: whatever the writer emits with a length
+  // prefix, the reader must recover exactly. That pins the two against each other for
+  // every length, which no table of examples does.
+  T t = T.create();
+  for (i32 n = 0; n < 300; n++) {
+    u8[] payload = u8[n]();
+    for (i32 i = 0; i < n; i++) { payload[i] = (i * 31 + n) & 0xFF; }
+    Writer w = Writer.create();
+    w.vec16(payload);
+    u8[] wire = w.take();
+    t.eqI32(wire.len(), n + 2, "vec16 of " + itoa64(n as i64) + " has a two-byte prefix");
+    t.eqBytes(Reader.create(wire).vec16(), payload, "vec16 round trip at " + itoa64(n as i64));
+  }
+  // vec8 has a byte of prefix and the same obligation.
+  for (i32 n = 0; n < 256; n++) {
+    u8[] payload = u8[n]();
+    for (i32 i = 0; i < n; i++) { payload[i] = (i * 17 + 5) & 0xFF; }
+    Writer w = Writer.create();
+    w.vec8(payload);
+    t.eqBytes(Reader.create(w.take()).vec8(), payload, "vec8 round trip at " + itoa64(n as i64));
+  }
+  return t.report();
+}
+
+export string test_the_writer_grows_without_losing_anything() {
+  // Writer.create starts with 64 bytes and reserves more as it goes. A reallocation that
+  // copied the wrong length would lose the tail, which every short test misses.
+  T t = T.create();
+  Writer w = Writer.create();
+  for (i32 i = 0; i < 5000; i++) { w.u8(i & 0xFF); }
+  u8[] out = w.take();
+  t.eqI32(out.len(), 5000, "everything written is present");
+  bool intact = true;
+  for (i32 i = 0; i < 5000; i++) { if (out[i] != (i & 0xFF)) { intact = false; } }
+  t.isTrue(intact, "and unchanged across every reallocation");
+  return t.report();
+}
+
+// ── What is not here ─────────────────────────────────────────────────────────
+//
+// The rejections themselves — reading past the end, a negative length, a vector too long
+// for its prefix — trap, and a trap unwinds the whole module rather than returning to the
+// caller, so a wac test cannot assert one. Those stay in `wire.test.ts`, where the host
+// can catch the trap, and that file is now only the cases that need catching. It is a
+// real limit of testing in wac and worth stating rather than working around: a test that
+// cannot express "this must be refused" would quietly stop covering the refusals.
