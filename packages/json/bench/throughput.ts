@@ -8,8 +8,8 @@
 import { wacBind } from "../../../harness/wacBind.ts";
 
 const mod = await wacBind("packages/json/src/json.wac") as unknown as {
-  canonicalize(src: Uint8Array): { ok: boolean; text: Uint8Array };
-  errorCode(src: Uint8Array): number;
+  canonicalize(src: Uint8Array): { ok: boolean; code: number; pos: number; text: Uint8Array };
+  parse(src: Uint8Array): unknown;
 };
 
 const MIB = 1048576;
@@ -49,24 +49,32 @@ for (const [label, text] of SHAPES) {
     const t0 = performance.now();
     const out = mod.canonicalize(bytes);
     const dt = performance.now() - t0;
-    if (out[0] !== 0) throw new Error(`${label}: parse failed with code ${out[0]}`);
+    if (!out.ok) throw new Error(`${label}: parse failed with code ${out.code} at ${out.pos}`);
     best = Math.min(best, dt);
   }
   const mbps = bytes.length / MIB / (best / 1000);
   console.log(`| ${label} | ${mbps.toFixed(1)} | ${best.toFixed(1)} |`);
 }
 
-// Parsing alone, without building the output — separates scan cost from emit cost.
-console.log("\n| shape | parse-only MB/s |");
+// The same documents into a tree instead of into bytes.
+//
+// This used to measure scanning with nothing built, through an `errorCode` export that has
+// since been removed — it re-parsed the input to answer a question `canonicalize` already
+// answers. There is no scan-only path left to measure, because `parseDocument` always builds
+// the tree, so the honest comparison is against the other thing you might do with it: the
+// ratio between the two columns is emitting canonical bytes versus allocating a tree.
+console.log("\n| shape | parse-to-tree MB/s |");
 console.log("|---|---:|");
 for (const [label, text] of SHAPES) {
   const bytes = enc.encode(text);
-  for (let i = 0; i < 3; i++) mod.errorCode(bytes);
+  for (let i = 0; i < 3; i++) mod.parse(bytes);
   let best = Infinity;
   for (let i = 0; i < 7; i++) {
     const t0 = performance.now();
-    mod.errorCode(bytes);
-    best = Math.min(best, performance.now() - t0);
+    const v = mod.parse(bytes);
+    const dt = performance.now() - t0;
+    if (v === null) throw new Error(`${label}: parse returned null`);
+    best = Math.min(best, dt);
   }
   console.log(`| ${label} | ${(bytes.length / MIB / (best / 1000)).toFixed(1)} |`);
 }

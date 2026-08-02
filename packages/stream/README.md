@@ -72,10 +72,9 @@ Nothing polls, in either direction.
 
 ## Status
 
-`harness/wacBind.ts` currently patches two conversion helpers into the generated bindings that
-bindgen calls but does not emit — see [`wac` issue 0054](../../../wac/issues/open/). Without it, any
-callback with an array in its signature throws `ReferenceError` on first use. **Delete
-`withArrayHelpers` when 0054 is fixed**; it is written to be inert once the definitions arrive.
+A callback with an array in its signature used to throw `ReferenceError` on first use, because
+bindgen called two conversion helpers it never emitted; `harness/wacBind.ts` patched them in
+meanwhile. That is `wac` issue 0055, now fixed, and the shim has been removed.
 
 The bridge is generic: any export shaped `i32 f(fn[u8[]()] read, fn[bool(u8[])] write)` can be
 streamed through it. [`packages/gzip`](../gzip/README.md) now exports `gunzipStream` in exactly that

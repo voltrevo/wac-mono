@@ -403,8 +403,14 @@ try {
         //
         // --fail-fast: killing needs one failing test, and almost every mutant is killed,
         // so running the rest of the suite afterwards is pure waiting.
+        //
+        // --allow-net and --allow-env because the suite needs them: a permission error does
+        // not skip a test, it fails the run, so the exit code is non-zero and the mutant is
+        // recorded as killed by a mutation nobody detected. crypto, http, server and tls all
+        // failed their *unmutated* baseline without these — 272 mutants, tls's 230 among
+        // them, scoring themselves correct for free.
         args: ["test", "--no-check", "--fail-fast", "--allow-read", "--allow-write",
-               "--allow-run", "--quiet", ...dirs],
+               "--allow-run", "--allow-net", "--allow-env", "--quiet", ...dirs],
         cwd: work,
         stdout: "piped",
         stderr: "piped",

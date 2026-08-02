@@ -63,7 +63,7 @@ like. Keeping the tree at `packages/<name>/src` bounds the depth.
 Everything runs from the repo root, so one command covers every package.
 
 ```sh
-deno task test            # all tests, host-side and wac-written
+deno task test            # all tests, host-side and wac-written (parallel: ~30s, vs ~76s serial)
 deno task coverage        # branch coverage of every package, from its wac-native tests
 deno task coverage:bignum # ...and the host-driven exercises, per package
 deno task coverage:bytes

@@ -28,7 +28,7 @@
     "mutate:diff": "deno run -A tools/mutate.ts --diff --operators",
     "mutate:operators": "deno run -A tools/mutate.ts --operators",
     "serve": "deno run -A packages/server/host/serve.ts",
-    "test": "deno test --allow-read --allow-write --allow-run --allow-net --allow-env",
+    "test": "deno test --parallel --allow-read --allow-write --allow-run --allow-net --allow-env",
     "validate": "deno run -A tools/validate.ts",
     "verify:fmt": "deno run -A packages/fmt/tools/sweep.ts"
   },

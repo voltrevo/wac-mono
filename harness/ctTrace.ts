@@ -27,17 +27,54 @@
 // named source line.
 
 import { wacCompile } from "wac/wacCompile.ts";
-import type { CoveragePoint } from "wac/wacEmitFunc.ts";
 import { wacFiles } from "./wacFiles.ts";
+
+/**
+ * The compiler's point record, described structurally rather than imported.
+ *
+ * Importing `CoveragePoint` would tie this file to the compiler's exact union of
+ * point kinds, and `wac/` resolves to whatever sibling checkout the reader happens
+ * to have. When trace mode added an `"index"` kind, every checkout without it failed
+ * to *type-check* — which took down the whole suite, not just these tests, and scored
+ * a mutation run as all-killed because the runner exited non-zero for the wrong
+ * reason [wac-mono issue 0008]. A structural type and string comparisons work against
+ * a compiler that has the feature and one that does not.
+ */
+export type TracePoint = { index: number; file: string; line: number; col: number; kind: string };
 
 export type CtModule = {
   exports: Record<string, CallableFunction>;
-  points: CoveragePoint[];
+  points: TracePoint[];
 };
+
+/**
+ * Whether the compiler in this checkout has trace mode at all.
+ *
+ * Probed by compiling a program with one branch and one indexed read: with the mode,
+ * the module exports the coverage accessors and the log records both. Without it, the
+ * unknown option is ignored and there is nothing to read. Cached, because it compiles.
+ */
+let available: boolean | undefined;
+export function ctTraceAvailable(): boolean {
+  if (available !== undefined) return available;
+  const src = `const u8[] T = u8[](1, 2);\nexport i32 f(i32 s) { return T[s & 1]; }\n`;
+  try {
+    const r = wacCompile(new Map([["p.wac", src]]), "p.wac", { ctTrace: true } as Record<string, unknown>);
+    if (!r.ok) return (available = false);
+    const kinds = new Set((r.compiled.coverage ?? []).map((p) => p.kind as string));
+    available = kinds.has("index");
+  } catch {
+    available = false;
+  }
+  return available;
+}
 
 /** Compile an entry file with trace instrumentation and instantiate it. */
 export async function ctModule(entry: string): Promise<CtModule> {
-  const r = wacCompile(await wacFiles(entry), entry, { ctTrace: true });
+  // Cast, so this compiles against a compiler whose options type predates `ctTrace`.
+  // A compiler that does not know the option ignores it, which `ctTraceAvailable`
+  // detects rather than letting it look like a clean result.
+  const r = wacCompile(await wacFiles(entry), entry, { ctTrace: true } as Record<string, unknown>);
   if (!r.ok) {
     throw new Error(`ctTrace: ${entry} did not compile:\n` +
       r.diagnostics.map((d) => `  ${d.file}:${d.line} ${d.message}`).join("\n"));
@@ -77,7 +114,7 @@ export type Divergence = {
    * `path-split` — the runs took different paths, and this is merely where one of
    * them stood. Everything after it is incomparable, not clean.
    */
-  kind: CoveragePoint["kind"] | "path-split";
+  kind: string;
   detail: string;
 };
 
