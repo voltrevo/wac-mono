@@ -1,0 +1,61 @@
+// One HTTP GET, written once and used by both `get` and `wget`.
+//
+// The body goes out through `cli.write`, which is the whole reason the two applets differ
+// by three lines: `wget` points the current output at a file first, and the fetch itself
+// does not know the difference.
+
+import { Cli, Core, Socket } from "../../../platform/src/platform.wac";
+import { itoa } from "./num.wac";
+import { concat } from "./bytes.wac";
+import { Incoming, ParsedResponse, parseResponse } from "../../../http/src/incoming.wac";
+
+/** The exit code the applet should return. */
+export i32 fetch(Core core, Cli cli, string name, string host, string path, i32 port, bool headers) {
+  Socket s = cli.connect(host, port);
+  if (s.handle < 0) { core.warn(name + ": " + host + ": " + s.error); return 1; }
+
+  string req = "GET " + path + " HTTP/1.1\r\n"
+    + "Host: " + host + "\r\n"
+    + "User-Agent: box\r\n"
+    + "Connection: close\r\n\r\n";
+  if (!cli.send(s.handle, req.toBytes())) {
+    core.warn(name + ": " + host + ": cannot send");
+    cli.closeSocket(s.handle);
+    return 1;
+  }
+
+  // `Connection: close` means the body ends when the socket does, so this reads to the end
+  // and then parses once with `eof` set — which is what tells the parser a body with no
+  // length is complete rather than truncated.
+  u8[] all = u8[0]();
+  while (true) {
+    u8[] chunk = cli.recv(s.handle);
+    if (chunk.len() == 0) { break; }
+    all = concat(all, chunk);
+  }
+  cli.closeSocket(s.handle);
+
+  match (parseResponse(all, "GET".toBytes(), true, 1 << 26)) {
+    case Incomplete: {
+      core.warn(name + ": the response ended mid-message");
+      return 1;
+    }
+    case Bad(code): {
+      core.warn(name + ": unparseable response (" + itoa(code) + ")");
+      return 1;
+    }
+    case Ok(res): {
+      if (headers) {
+        core.log("HTTP " + itoa(res.status));
+        for (i32 i = 0; i < res.headers.count; i++) {
+          core.log(string.fromBytes(res.headers.nameAt(i)) + ": "
+                 + string.fromBytes(res.headers.valueAt(i)));
+        }
+        core.log("");
+      }
+      cli.write(res.body);
+      return res.status >= 400 ? 1 : 0;
+    }
+  }
+  return 1;
+}

@@ -29,7 +29,7 @@ export const encodeCreate2 = mod.encodeCreate2 as (circ: number, hs: Uint8Array)
 export const decodeCreated2 = mod.decodeCreated2 as (payload: Uint8Array) => Uint8Array;
 
 export const CMD = {
-  relay: 3, destroy: 4, versions: 7, netinfo: 8, create2: 10, created2: 11,
+  relay: 3, destroy: 4, versions: 7, netinfo: 8, relayEarly: 9, create2: 10, created2: 11,
   vpadding: 128, certs: 129, authChallenge: 130,
 } as const;
 

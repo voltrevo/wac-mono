@@ -37,6 +37,7 @@ u8[] reason(i32 status) {
   if (status == 301) { return "Moved Permanently".toBytes(); }
   if (status == 304) { return "Not Modified".toBytes(); }
   if (status == 400) { return "Bad Request".toBytes(); }
+  if (status == 403) { return "Forbidden".toBytes(); }
   if (status == 404) { return "Not Found".toBytes(); }
   if (status == 405) { return "Method Not Allowed".toBytes(); }
   if (status == 408) { return "Request Timeout".toBytes(); }

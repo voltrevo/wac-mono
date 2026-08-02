@@ -22,7 +22,7 @@
 import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import { aesEncrypt, aesDecrypt } from "../../src/aes.wac";
-import { aesCtr } from "../../src/aesctr.wac";
+import { aesCtr, CtrStream } from "../../src/aesctr.wac";
 import { gcmEncrypt, gcmTag, gcmInc32 } from "../../src/aesgcm.wac";
 
 const i32 ECB = 0;
@@ -172,5 +172,75 @@ export string test_the_gcm_counter_wraps_at_32_bits() {
   plain[15] = 7;
   gcmInc32(plain);
   t.eqI32(plain[15], 8, "an ordinary increment advances the last byte");
+  return t.report();
+}
+
+// ── CtrStream ────────────────────────────────────────────────────────────────
+//
+// The oracle is `aesCtr` above, which is checked against the host's AES-CTR. That matters:
+// the obvious test for a resumable keystream is to encrypt with it and decrypt with it, and
+// that test passes for a stream that never advances its counter at all. Two ends sharing
+// one broken cipher agree with each other perfectly.
+//
+// So the property tested is the one that actually pins it down: a stream fed in pieces must
+// produce the same bytes as the one-shot over the whole input, for every way of cutting it
+// up. Nothing that mishandles the counter or the offset within a block can satisfy that.
+
+export string test_a_ctr_stream_in_pieces_matches_the_one_shot() {
+  T t = T.create();
+  u8[] key = u8[16]();
+  u8[] iv = u8[16]();
+  for (i32 i = 0; i < 16; i++) { key[i] = (i * 13 + 1) & 0xFF; }
+  for (i32 i = 0; i < 16; i++) { iv[i] = (i * 7) & 0xFF; }
+
+  u8[] data = u8[1000]();
+  for (i32 i = 0; i < 1000; i++) { data[i] = (i * 31 + 7) & 0xFF; }
+  u8[] want = aesCtr(key, iv, data);
+
+  // Chunk sizes that are not multiples of the 16-byte block, because that is the case a
+  // stream keeping only a counter gets wrong. 509 is Tor's, and the reason this exists.
+  i32[] sizes = i32[](1, 3, 15, 16, 17, 31, 33, 64, 100, 509);
+  for (i32 s = 0; s < sizes.len(); s++) {
+    i32 chunk = sizes[s];
+    CtrStream cs = CtrStream.create(key, iv);
+    u8[] got = u8[1000]();
+    i32 pos = 0;
+    while (pos < 1000) {
+      i32 take = 1000 - pos < chunk ? 1000 - pos : chunk;
+      u8[] piece = u8[take]();
+      for (i32 i = 0; i < take; i++) { piece[i] = data[pos + i]; }
+      u8[] out = cs.apply(piece);
+      for (i32 i = 0; i < take; i++) { got[pos + i] = out[i]; }
+      pos += take;
+    }
+    t.eqBytes(got, want, "fed in chunks of " + itoa64(chunk as i64));
+  }
+  return t.report();
+}
+
+export string test_a_ctr_stream_never_repeats_its_keystream() {
+  // Directly: encrypt zeros twice and require the two outputs to differ. Encrypting zeros
+  // makes the output *be* the keystream, so this is not an approximation of the property.
+  T t = T.create();
+  u8[] key = u8[16]();
+  u8[] iv = u8[16]();
+  for (i32 i = 0; i < 16; i++) { key[i] = (i * 5 + 3) & 0xFF; }
+
+  CtrStream cs = CtrStream.create(key, iv);
+  u8[] first = cs.apply(u8[509]());
+  u8[] second = cs.apply(u8[509]());
+  bool same = true;
+  for (i32 i = 0; i < 509; i++) {
+    if (first[i] != second[i]) { same = false; }
+  }
+  t.isTrue(!same, "the second 509 bytes of keystream differ from the first");
+
+  // And the whole thing is the one-shot's keystream, in order — which pins down not just
+  // that it moved but that it moved to the right place.
+  u8[] whole = aesCtr(key, iv, u8[1018]());
+  u8[] joined = u8[1018]();
+  for (i32 i = 0; i < 509; i++) { joined[i] = first[i]; }
+  for (i32 i = 0; i < 509; i++) { joined[509 + i] = second[i]; }
+  t.eqBytes(joined, whole, "two 509-byte pulls are the first 1018 bytes of the keystream");
   return t.report();
 }

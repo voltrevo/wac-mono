@@ -1,6 +1,6 @@
 # box — a busybox, written in wac
 
-Fifty-two applets in one program, chosen by the first argument. No TypeScript: `src/` is
+Fifty-five applets in one program, chosen by the first argument. No TypeScript: `src/` is
 wac and the only thing outside it is the test suite.
 
 It exists to exercise `packages/platform`'s capability world more widely than a single
@@ -17,9 +17,10 @@ cat README.md | ./box sort -u | ./box wc -l
 
 ```
 base32 base64 basename cat cp crc32 cut date dirname du echo false find
-fold get grep gunzip gzip head hex json ls mkdir mv nl paste rev rm rmdir
-seq serve sha256sum sha512sum shuf sort sponge stat strings tac tail tee
-touch tr true uniq unzstd urldecode urlencode uuid wc yes zstd
+fold get grep gunzip gzip head hex httpd json ls mkdir mv nl paste rev rm
+rmdir
+seq serve sha256sum sha512sum shuf sort split sponge stat strings tac tail
+tee touch tr true uniq unzstd urldecode urlencode uuid wc wget yes zstd
 ```
 
 111K, drawing on this repo's `crypto`, `codec`, `regex`, `gzip`, `datetime` and `url`
@@ -82,12 +83,24 @@ argv[0] — argv starts at its first real argument — so the standalone `wc` wo
 have reported errors as `box:`. Under `box` the name is the applet's; in `bin/` the entry
 point passes it.
 
-## The two that are not filters
+## The four that are not filters
 
 ```sh
-box serve -8080          # an HTTP server
-box get example.com /    # an HTTP client
+box serve -8080                        # the built-in routes
+box httpd -8080 ./public               # a directory, over HTTP
+box get example.com /                  # an HTTP client
+box wget example.com /a.txt out.txt    # ...into a file
 ```
+
+`httpd` is the first applet that composes the **network and the filesystem**: accept,
+parse with `packages/http`, map the path to a file, answer. Its path check is the part to
+read — a request target is the one input here that is *supposed* to be hostile, so `..` is
+refused outright rather than resolved, because resolving is where traversal bugs live.
+
+`wget` is `get` with three lines changed: `openOutput` moves where `cli.write` goes, so
+the fetch itself is unchanged and does not know it is writing to a file. `split` is the
+only applet that opens more than one output — everything else opens a file, writes it and
+closes it.
 
 `serve` is `packages/server`'s `serve(input, now)` — a pure state machine, bytes in and a
 response out — wrapped in a socket loop. `get` sends a request and hands the reply to
