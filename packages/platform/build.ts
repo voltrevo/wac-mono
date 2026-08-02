@@ -26,7 +26,11 @@ import { checkWacVersion } from "../../harness/wacVersion.ts";
  * `--allow-read`, which used to sit in every shebang whatever the program could do, and
  * read as a filesystem grant to anyone auditing it.
  */
-function shebangFor(g: Grants): string {
+function shebangFor(g: Grants, target: Target): string {
+  // Node has no permission system, so its shebang has nothing to state — the capability
+  // world is the whole boundary there. Under Deno the two agree, and a program granted
+  // nothing asks for nothing.
+  if (target === "node") return "#!/usr/bin/env node\n";
   const flags: string[] = [];
   if (g.read) flags.push("--allow-read");
   if (g.write) flags.push("--allow-write");
@@ -36,7 +40,15 @@ function shebangFor(g: Grants): string {
 
 export type Grants = { read?: boolean; write?: boolean; env?: boolean };
 
-export async function buildApp(entry: string, out: string, grants: Grants = {}): Promise<void> {
+/** Which runtime the built program is for. */
+export type Target = "deno" | "node";
+
+export async function buildApp(
+  entry: string,
+  out: string,
+  grants: Grants = {},
+  target: Target = "deno",
+): Promise<void> {
   checkWacVersion();
 
   const r = wacCompile(await wacFiles(entry), entry);
@@ -75,19 +87,46 @@ export async function buildApp(entry: string, out: string, grants: Grants = {}):
     // message handler as a side effect of being evaluated, and the application module
     // below it has a top-level await that would otherwise suspend before any handler
     // existed — which showed up as a program that worked one run in three.
-    const workerSource = await bundle(
-      "worker",
-      `import { runAsWorkerEntry } from "${runtime}";\n` +
-        `import * as app from "${modPath}";\n` +
-        `await runAsWorkerEntry(app as unknown as Parameters<typeof runAsWorkerEntry>[0]);\n`,
-    );
-    const launcher = await bundle(
-      "launcher",
-      `import { runLauncher } from "${runtime}";\n` +
-        `await runLauncher(${JSON.stringify(workerSource)}, ${JSON.stringify(grants)});\n`,
-    );
+    const nodeRuntime = import.meta.resolve("./host/entryNode.ts");
+    const workerSource = target === "node"
+      ? await bundle(
+        "worker",
+        `import { runAsWorkerEntryNode } from "${nodeRuntime}";\n` +
+          `import * as wt from "node:worker_threads";\n` +
+          `import * as app from "${modPath}";\n` +
+          `runAsWorkerEntryNode(\n` +
+          `  wt as unknown as Parameters<typeof runAsWorkerEntryNode>[0],\n` +
+          `  app as unknown as Parameters<typeof runAsWorkerEntryNode>[1],\n` +
+          `);\n`,
+      )
+      : await bundle(
+        "worker",
+        `import { runAsWorkerEntry } from "${runtime}";\n` +
+          `import * as app from "${modPath}";\n` +
+          `await runAsWorkerEntry(app as unknown as Parameters<typeof runAsWorkerEntry>[0]);\n`,
+      );
 
-    await Deno.writeTextFile(out, shebangFor(grants) + launcher);
+    const launcher = target === "node"
+      ? await bundle(
+        "launcher",
+        `import { runLauncherNode } from "${nodeRuntime}";\n` +
+          `import * as wt from "node:worker_threads";\n` +
+          `import { readFile, writeFile } from "node:fs/promises";\n` +
+          `await runLauncherNode(\n` +
+          `  wt as unknown as Parameters<typeof runLauncherNode>[0],\n` +
+          `  { readFile, writeFile } as unknown as Parameters<typeof runLauncherNode>[1],\n` +
+          `  process as unknown as Parameters<typeof runLauncherNode>[2],\n` +
+          `  ${JSON.stringify(workerSource)},\n` +
+          `  ${JSON.stringify(grants)},\n` +
+          `);\n`,
+      )
+      : await bundle(
+        "launcher",
+        `import { runLauncher } from "${runtime}";\n` +
+          `await runLauncher(${JSON.stringify(workerSource)}, ${JSON.stringify(grants)});\n`,
+      );
+
+    await Deno.writeTextFile(out, shebangFor(grants, target) + launcher);
     await Deno.chmod(out, 0o755);
   } finally {
     await Deno.remove(work, { recursive: true });
@@ -102,7 +141,7 @@ if (import.meta.main) {
   if (entry === undefined) {
     console.error(
       "usage: deno task app:build <entry.wac> [-o output] " +
-        "[--allow-read] [--allow-write] [--allow-env]\n\n" +
+        "[--allow-read] [--allow-write] [--allow-env] [--target deno|node]\n\n" +
         "The grants are baked in: the built program takes no permission flags of its own,\n" +
         "and every argument it is given goes to the application.",
     );
@@ -113,9 +152,18 @@ if (import.meta.main) {
     write: argv.includes("--allow-write"),
     env: argv.includes("--allow-env"),
   };
-  const target = out ?? entry.replace(/.*\//, "").replace(/\.wac$/, "");
-  await buildApp(entry, target, grants);
-  const size = (await Deno.stat(target)).size;
+  const ti = argv.indexOf("--target");
+  const target = (ti >= 0 ? argv[ti + 1] : "deno") as Target;
+  if (target !== "deno" && target !== "node") {
+    console.error(`unknown target '${target}' — deno or node`);
+    Deno.exit(2);
+  }
+  const dest = out ?? entry.replace(/.*\//, "").replace(/\.wac$/, "");
+  await buildApp(entry, dest, grants, target);
+  const size = (await Deno.stat(dest)).size;
   const granted = Object.entries(grants).filter(([, v]) => v).map(([k]) => k);
-  console.log(`${target}  ${(size / 1024).toFixed(0)}K  [${granted.join(", ") || "no capabilities"}]`);
+  console.log(
+    `${dest}  ${(size / 1024).toFixed(0)}K  ${target}  ` +
+      `[${granted.join(", ") || "no capabilities"}]`,
+  );
 }

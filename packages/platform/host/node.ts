@@ -1,0 +1,84 @@
+// Node's implementation of the world.
+//
+// The same `Handlers` table as `deno.ts`, over Node's APIs. That the two are
+// interchangeable is the point of the bridge: the wac side, the capability structs and
+// the opcodes are identical, and only these dozen closures differ.
+//
+// **Node has no permission system**, so `grants` here is the whole boundary rather than
+// half of it. Under Deno a build that withholds the filesystem is enforced twice — by the
+// capability world and by the process — and under Node only by the world. That is a real
+// difference and the README says so; it is not a reason to skip the grant, because the
+// world is what an application is written against either way.
+
+import { type Handlers } from "./respond.ts";
+import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
+import { OP } from "./ops.ts";
+
+export type NodeWorldOptions = {
+  args?: string[];
+  log?(line: string): void;
+  warn?(line: string): void;
+  fs?: { read?: boolean; write?: boolean };
+  env?(name: string): string | undefined;
+};
+
+const EMPTY = new Uint8Array(0);
+
+/** Node's globals, described rather than imported, so this file type-checks under Deno. */
+type NodeProcess = { argv: string[]; env: Record<string, string | undefined> };
+type NodeFs = {
+  readFile(path: string): Promise<Uint8Array>;
+  writeFile(path: string, data: Uint8Array): Promise<void>;
+};
+
+export function nodeWorld(fs: NodeFs, proc: NodeProcess, opts: NodeWorldOptions = {}): Handlers {
+  const args = opts.args ?? proc.argv.slice(2);
+  const log = opts.log ?? ((l: string) => console.log(l));
+  const warn = opts.warn ?? ((l: string) => console.error(l));
+  const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
+
+  return {
+    [OP.NOW_MILLIS]: () => i64le(BigInt(Date.now())),
+    [OP.MONOTONIC_NANOS]: () => i64le(BigInt(Math.round(performance.now() * 1e6))),
+    [OP.RANDOM_BYTES]: (p) => {
+      const n = readI32le(p);
+      if (n < 0 || n > 1 << 20) throw new Error(`randomBytes(${n}) out of range`);
+      // getRandomValues caps at 64KiB per call on every engine that has it.
+      const out = new Uint8Array(n);
+      for (let at = 0; at < n; at += 65536) {
+        crypto.getRandomValues(out.subarray(at, Math.min(at + 65536, n)));
+      }
+      return out;
+    },
+    [OP.LOG]: (p) => { log(unstr(p)); return EMPTY; },
+    [OP.WARN]: (p) => { warn(unstr(p)); return EMPTY; },
+
+    [OP.ARG_COUNT]: () => i32le(args.length),
+    [OP.ARG]: (p) => {
+      const i = readI32le(p);
+      return str(i >= 0 && i < args.length ? args[i] : "");
+    },
+    [OP.ENV]: (p) => {
+      const v = opts.env?.(unstr(p));
+      if (v === undefined) return new Uint8Array([0]);
+      const b = str(v);
+      const out = new Uint8Array(1 + b.length);
+      out[0] = 1;
+      out.set(b, 1);
+      return out;
+    },
+
+    [OP.READ_FILE]: async (p) => {
+      if (!opts.fs?.read) deny("filesystem read");
+      // Node hands back a Buffer, which is a Uint8Array — but a *view* into a pooled
+      // allocation, so it is copied rather than parked in the bridge as it came.
+      return new Uint8Array(await fs.readFile(unstr(p)));
+    },
+    [OP.WRITE_FILE]: async (p) => {
+      if (!opts.fs?.write) deny("filesystem write");
+      const n = readI32le(p);
+      await fs.writeFile(unstr(p.subarray(4, 4 + n)), p.subarray(4 + n));
+      return EMPTY;
+    },
+  };
+}

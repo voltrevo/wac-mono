@@ -72,6 +72,7 @@ deno task test            # all tests, host-side and wac-written (parallel: ~30s
 deno task wac:pin         # record the sibling wac checkout as the minimum this repo needs
 deno task app <entry.wac> --allow-read -- args   # run a wac application
 deno task app:build <entry.wac> --allow-read -o wc   # ...or build one executable; then: ./wc FILE
+deno task app:build <entry.wac> --target node -o wc  # ...for Node instead of Deno
 deno task coverage        # branch coverage of every package, from its wac-native tests
 deno task coverage:bignum # ...and the host-driven exercises, per package
 deno task coverage:bytes

@@ -235,3 +235,58 @@ Deno.test("an application builds to one executable file and runs repeatedly", as
     await Deno.remove(out);
   }
 });
+
+Deno.test("the same application builds for Node and agrees with the Deno build", async () => {
+  // The bridge, the opcodes and the capability structs are shared; only a dozen closures
+  // and the thread API differ. This is what checks that claim rather than asserting it.
+  const { buildApp } = await import("../build.ts");
+  const denoOut = await Deno.makeTempFile({ prefix: "wac-deno-" });
+  const nodeOut = await Deno.makeTempFile({ prefix: "wac-node-" });
+  try {
+    await buildApp(WC, denoOut, { read: true }, "deno");
+    await buildApp(WC, nodeOut, { read: true }, "node");
+
+    assertEquals(
+      (await Deno.readTextFile(nodeOut)).split("\n")[0],
+      "#!/usr/bin/env node",
+      "Node has no permission system, so its shebang states nothing",
+    );
+
+    const run = (path: string, cmd?: string) => {
+      const r = cmd
+        ? new Deno.Command(cmd, { args: [path, WC], stdout: "piped", stderr: "piped" }).outputSync()
+        : new Deno.Command(path, { args: [WC], stdout: "piped", stderr: "piped" }).outputSync();
+      return {
+        code: r.code,
+        out: new TextDecoder().decode(r.stdout).trim(),
+        err: new TextDecoder().decode(r.stderr).trim(),
+      };
+    };
+
+    const d = run(denoOut);
+    const n = run(nodeOut, "node");
+    assertEquals(d.code, 0, d.err);
+    assertEquals(n.code, 0, n.err);
+    assertEquals(n.out, d.out, "byte for byte, the same answer from both runtimes");
+
+    // And the capability boundary holds on Node, where it is the *only* boundary — there
+    // is no process-level permission behind it.
+    const bare = await Deno.makeTempFile({ prefix: "wac-node-nofs-" });
+    try {
+      await buildApp(WC, bare, {}, "node");
+      const denied = new Deno.Command("node", { args: [bare, WC], stdout: "piped", stderr: "piped" })
+        .outputSync();
+      assertEquals(denied.code, 1);
+      assertEquals(
+        new TextDecoder().decode(denied.stderr).includes("not granted"),
+        true,
+        new TextDecoder().decode(denied.stderr),
+      );
+    } finally {
+      await Deno.remove(bare);
+    }
+  } finally {
+    await Deno.remove(denoOut);
+    await Deno.remove(nodeOut);
+  }
+});
