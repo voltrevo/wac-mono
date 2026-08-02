@@ -95,7 +95,7 @@ array and copies nothing. Cutting the work down a piece at a time, on 1.056 MB o
 
 The whole-input compressor does the same job in 5.40 ms, so the gap is 1.57 ms and the gather
 is 1.34 of it. It is slow because wac has no bulk array copy, so `Buf.pushBytes` moves a
-megabyte one element at a time at about 790 MB/s — filed as `wac` issue 0055, where the
+megabyte one element at a time at about 790 MB/s — filed as `wac` issue 0056, where the
 finding is that `array.copy` is already emitted by the compiler for its own helpers and simply
 is not reachable from the language. That one change would close most of this gap, and would
 speed up every buffer in the repo rather than only this one.
