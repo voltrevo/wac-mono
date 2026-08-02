@@ -179,6 +179,53 @@ writes exact bytes, and `hexdump <dir>` lists a directory through `stat` and `re
 `packages/box` is the widest consumer of all this — forty-two applets in one program, and
 the differential suite that keeps them honest.
 
+## The browser
+
+```sh
+deno task app:build packages/platform/example/wc.wac --target browser -o wc.html
+box httpd -8080 . -x        # -x sends the two headers a page needs
+```
+
+One self-contained page, 72K for `wc`: the launcher inline, the worker as a string inside
+it, the wasm inside that. The bridge needed **no changes at all** — `layout.ts`, `call.ts`
+and `respond.ts` are shared verbatim and contain no reference to any host, because a page
+with a worker is exactly the shape they already assume: a thread that may block and a
+thread that may not.
+
+What the translation costs is the interesting part, and it is not the plumbing:
+
+| capability | in a page |
+|---|---|
+| `nowMillis`, `monotonicNanos`, `randomBytes`, `log`, `warn` | unchanged |
+| `arg`, `argCount` | from the query string, `?a=first&a=second` |
+| `write` | appends the exact bytes to the page |
+| `readFile`, `writeFile`, `stat`, `readDir`, `mkdir`, `remove`, `openInput`, `readChunk`, `openOutput` | the Origin Private File System |
+| `rename` | **a copy and a delete, so not atomic** |
+| `readStdin` | always empty |
+| `env` | every variable unset |
+| `connect`, `listen`, `accept`, `recv`, `send` | **refused** |
+
+**A page has no TCP**, and that is the finding. `fetch` is not a socket and neither is a
+WebSocket, so `connect` is absent rather than approximated — an application gets an error
+it can report instead of one protocol that works by accident. `box get`, `box gets` and
+`box serve` do not run here, and no amount of shimming would change that.
+
+**`rename` is the promise a page cannot keep.** OPFS has no rename, so it is a copy and a
+delete. Atomicity is the entire reason `rename` exists — `cp` and `sponge` write beside
+their target and move it into place — so those applets are genuinely weaker in a browser
+than on a filesystem, and there is nothing this side can do about it.
+
+`SharedArrayBuffer` needs the page cross-origin isolated, so the launcher checks
+`crossOriginIsolated` first and names the two headers rather than letting `newBridge`
+throw a bare TypeError. `box httpd -x` sends them, which makes the whole loop wac: a wac
+server delivering a wac application to a browser.
+
+**Not run in a browser.** There is none in this container. `test/browser.test.ts` drives
+every handler over an in-memory OPFS, which is where a mapping bug would be; what is
+untested is `SharedArrayBuffer`, `Atomics.wait` on a real worker, and the page's own
+plumbing — all of it shared verbatim with the two targets that *are* tested. That is an
+argument rather than a proof, and it is worth someone opening the page once.
+
 ## How an asynchronous host looks synchronous
 
 `readFile` is `await Deno.readFile` on the main thread. From wac it is a function call:

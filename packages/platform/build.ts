@@ -101,7 +101,36 @@ const nodeNet = {
 `;
 
 /** Which runtime the built program is for. */
-export type Target = "deno" | "node";
+export type Target = "deno" | "node" | "browser";
+
+/**
+ * The page a browser build produces: one file, no server-side templating, nothing fetched.
+ *
+ * `%LAUNCHER%` is the bundled module. It is inlined rather than linked because the whole
+ * point of a built program here is that it is one artefact — the same property `./wc`
+ * has under Deno.
+ *
+ * The page must be served cross-origin isolated or `SharedArrayBuffer` does not exist;
+ * `box httpd` does not send those headers, so this says what is needed rather than
+ * leaving a bare TypeError. Opening it with `file://` will not work either, for the same
+ * reason plus module workers.
+ */
+const PAGE = `<!doctype html>
+<meta charset="utf-8">
+<title>%TITLE%</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, monospace; margin: 2rem; max-width: 60rem; }
+  pre { white-space: pre-wrap; word-break: break-word; }
+  .warn { color: #b00; }
+  .meta { color: #666; }
+</style>
+<h1>%TITLE%</h1>
+<p class="meta">Arguments come from the query string: <code>?a=first&amp;a=second</code>.</p>
+<pre id="out"></pre>
+<script type="module">
+%LAUNCHER%
+</script>
+`;
 
 export async function buildApp(
   entry: string,
@@ -147,8 +176,18 @@ export async function buildApp(
     // message handler as a side effect of being evaluated, and the application module
     // below it has a top-level await that would otherwise suspend before any handler
     // existed — which showed up as a program that worked one run in three.
+    const browserRuntime = import.meta.resolve("./host/entryBrowser.ts");
     const nodeRuntime = import.meta.resolve("./host/entryNode.ts");
-    const workerSource = target === "node"
+    const workerSource = target === "browser"
+      ? await bundle(
+        "worker",
+        `import { runAsWorkerBrowser } from "${browserRuntime}";\n` +
+          // The application is imported *lazily*, so the message handler is installed
+          // before anything can await. See the note above.
+          `runAsWorkerBrowser(() => import("${modPath}").then((m) =>\n` +
+          `  m as unknown as Parameters<Parameters<typeof runAsWorkerBrowser>[0]>[0]));\n`,
+      )
+      : target === "node"
       ? await bundle(
         "worker",
         `import { runAsWorkerEntryNode } from "${nodeRuntime}";\n` +
@@ -166,7 +205,43 @@ export async function buildApp(
           `await runAsWorkerEntry(app as unknown as Parameters<typeof runAsWorkerEntry>[0]);\n`,
       );
 
-    const launcher = target === "node"
+    const launcher = target === "browser"
+      ? await bundle(
+        "launcher",
+        `import { argsFromLocation, runInPage } from "${browserRuntime}";\n` +
+          `const out = document.getElementById("out");\n` +
+          `const line = (t, cls) => {\n` +
+          `  const s = document.createElement("span");\n` +
+          `  if (cls) s.className = cls;\n` +
+          `  s.textContent = t + "\\n";\n` +
+          `  out.appendChild(s);\n` +
+          `};\n` +
+          // A page has no stdout, so `write` appends its bytes as text. Exactly the bytes,
+          // with no newline of its own — which is what the capability promises.
+          `const raw = (b) => {\n` +
+          `  const s = document.createElement("span");\n` +
+          `  s.textContent = new TextDecoder().decode(b);\n` +
+          `  out.appendChild(s);\n` +
+          `};\n` +
+          `try {\n` +
+          (grants.read === true
+            ? `  const root = await navigator.storage.getDirectory();\n`
+            : `  const root = undefined;\n`) +
+          `  const code = await runInPage({\n` +
+          `    workerSource: ${JSON.stringify(workerSource)},\n` +
+          `    args: argsFromLocation(location.search),\n` +
+          `    log: (l) => line(l),\n` +
+          `    warn: (l) => line(l, "warn"),\n` +
+          `    write: raw,\n` +
+          `    root,\n` +
+          `    writable: ${grants.write === true},\n` +
+          `  });\n` +
+          `  line("[exit " + code + "]", "meta");\n` +
+          `} catch (e) {\n` +
+          `  line(String(e && e.message ? e.message : e), "warn");\n` +
+          `}\n`,
+      )
+      : target === "node"
       ? await bundle(
         "launcher",
         (grants.net === true ? NODE_NET : "") +
@@ -188,6 +263,12 @@ export async function buildApp(
           `await runLauncher(${JSON.stringify(workerSource)}, ${JSON.stringify(grants)});\n`,
       );
 
+    if (target === "browser") {
+      // A page, not an executable: no shebang and no execute bit.
+      const title = entry.split("/").pop() ?? "wac";
+      await Deno.writeTextFile(out, PAGE.replaceAll("%TITLE%", title).replace("%LAUNCHER%", launcher));
+      return;
+    }
     await Deno.writeTextFile(out, shebangFor(grants, target) + launcher);
     await Deno.chmod(out, 0o755);
   } finally {
@@ -204,7 +285,7 @@ if (import.meta.main) {
     console.error(
       "usage: deno task app:build <entry.wac> [-o output] " +
         "[--allow-read] [--allow-write] [--allow-env] [--allow-net]\n" +
-      "                        [--target deno|node]\n\n" +
+      "                        [--target deno|node|browser]\n\n" +
         "The grants are baked in: the built program takes no permission flags of its own,\n" +
         "and every argument it is given goes to the application.",
     );
@@ -218,8 +299,8 @@ if (import.meta.main) {
   };
   const ti = argv.indexOf("--target");
   const target = (ti >= 0 ? argv[ti + 1] : "deno") as Target;
-  if (target !== "deno" && target !== "node") {
-    console.error(`unknown target '${target}' — deno or node`);
+  if (target !== "deno" && target !== "node" && target !== "browser") {
+    console.error(`unknown target '${target}' — deno, node or browser`);
     Deno.exit(2);
   }
   const dest = out ?? entry.replace(/.*\//, "").replace(/\.wac$/, "");

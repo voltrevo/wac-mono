@@ -30,10 +30,14 @@ export i32 httpd(Core core, Cli cli, Args a) {
   core.warn(a.name + ": listening on port " + itoa(port) + ", serving " + root);
 
   bool once = has(a, 'o');
+  // `-x` adds the two headers a page needs before `SharedArrayBuffer` exists. A wac
+  // program built for the browser cannot start without them, and this is the server that
+  // would be serving it — see `packages/platform`'s browser target.
+  bool isolate = has(a, 'x');
   while (true) {
     Socket c = cli.accept(l.handle);
     if (c.handle < 0) { core.warn(a.name + ": accept: " + c.error); break; }
-    connection(core, cli, c.handle, root);
+    connection(core, cli, c.handle, root, isolate);
     cli.closeSocket(c.handle);
     if (once) { break; }
   }
@@ -42,7 +46,7 @@ export i32 httpd(Core core, Cli cli, Args a) {
 }
 
 /** One connection: read a request, answer it, close. No keep-alive — one at a time anyway. */
-void connection(Core core, Cli cli, i32 sock, string root) {
+void connection(Core core, Cli cli, i32 sock, string root, bool isolate) {
   u8[] buffered = u8[0]();
   while (true) {
     match (parseRequest(buffered, 1 << 20)) {
@@ -56,14 +60,14 @@ void connection(Core core, Cli cli, i32 sock, string root) {
         return;
       }
       case Ok(req): {
-        answer(core, cli, sock, root, req);
+        answer(core, cli, sock, root, req, isolate);
         return;
       }
     }
   }
 }
 
-void answer(Core core, Cli cli, i32 sock, string root, Request req) {
+void answer(Core core, Cli cli, i32 sock, string root, Request req, bool isolate) {
   bool isGet = eq(req.method, "GET") || eq(req.method, "HEAD");
   if (!isGet) {
     cli.send(sock, writeResponse(Response.create(405), req.method, false));
@@ -93,6 +97,10 @@ void answer(Core core, Cli cli, i32 sock, string root, Request req) {
   // From the *resolved* path, not the request target: `/` resolves to `index.html`, and
   // typing that as application/octet-stream makes a browser download the page.
   res.set("Content-Type", contentType(path.toBytes()));
+  if (isolate) {
+    res.set("Cross-Origin-Opener-Policy", "same-origin");
+    res.set("Cross-Origin-Embedder-Policy", "require-corp");
+  }
   res.body = f.bytes;
   cli.send(sock, writeResponse(res, req.method, false));
   core.warn("200 " + string.fromBytes(target) + " " + itoa(f.bytes.len()));

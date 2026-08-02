@@ -166,7 +166,7 @@ i32 usage(Core core) {
   core.warn("flags: grep -ivnc   sort -ru   uniq -c   wc -lwc   head/tail/fold -N");
   core.warn("       cut -f<n> -d<c>   tr <set1> <set2>   mkdir -p   rm -rf   json -c");
   core.warn("net:   get <host> [path] [-<port>] [-i]   wget <host> <path> <out>\n"
-            + "       serve [-<port>] [-o]   httpd [-<port>] [dir] [-o]\n"
+            + "       serve [-<port>] [-o]   httpd [-<port>] [dir] [-o] [-x]\n"
             + "       gets <host> <path> <root.der> [-<port>]   (TLS 1.3)");
   return 2;
 }
