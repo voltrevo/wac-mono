@@ -158,22 +158,20 @@ and Ed25519 for the handshake.
 
 ## How it is tested
 
-Two kinds of oracle, because they catch different things.
+**Most of the suite is written in wac**, in `test/wac/` — the record layer, the
+key schedule, the wire cursor, the hybrid, and certificate path building. The
+host supplies only what it must: an AEAD or an HMAC as a synchronous callback,
+or, for the certificates, a loader that hands over fixture bytes because wac
+cannot read a file. See [`wactest`](../wactest/) for the shapes that takes.
 
-**Independent implementations.** WebCrypto decrypts records we seal, given a nonce and
-additional data computed from the spec rather than from our code; an HKDF-Expand-Label
-written out separately on WebCrypto's HMAC checks every label and length. A round trip
-would pass with a wrong nonce, a wrong AAD, or the content type read from the wrong end
-— seal and open share every constant, so they agree on any mistake they share.
+What stays in TypeScript, and why:
 
-**RFC 8448's trace.** The published handshake gives every intermediate secret in hex, so
-the *chain* can be checked and not just the primitives: the right derivation applied to
-the wrong secret produces perfectly well-formed keys shared with nobody.
-
-Worth recording that several of those vectors were written from memory first and half of
-them were wrong. They survive here only because the implementation and the independent
-reference agreed against them and forced a re-check; where the two disagreed, the
-recalled value was dropped rather than adjusted to fit.
+- **the refusals.** A rejection here is a `trap`, which unwinds the module rather
+  than returning, so only the host can catch one. That is most of what a record
+  layer and a wire parser owe their callers, so those files are worth reading.
+- **interop.** OpenSSL, rustls and curl. A live peer's next byte depends on ours,
+  which is not something a vector or an invariant can express.
+- **the real trust store**, which reads `/etc/ssl` and reports on 121 real roots.
 
 ## Not for production
 
