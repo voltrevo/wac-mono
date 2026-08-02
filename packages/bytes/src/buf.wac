@@ -167,6 +167,33 @@ export struct Buf {
   }
 
   /**
+   * Copy `count` bytes from position `at` to the end of the buffer.
+   *
+   * For a back-reference: LZ77 and its descendants encode a run as a match that overlaps what it
+   * is writing, so a copy of five bytes from three back is a legitimate way to spell a repeating
+   * triple. Byte at a time for exactly that reason — a bulk move would read the source before the
+   * loop had written it.
+   *
+   * The point is the call, not the loop: a decoder that writes `push(get(i))` per byte pays two
+   * calls for every byte of every match, which measured as a third of zstd's decode time here.
+   */
+  void pushRepeat(this, i32 at, i32 count) {
+    // Only the *start* has to be inside what is written. A copy may run past the old end, and
+    // routinely does — that is what an overlapping match is — because the read index trails the
+    // write index by a fixed distance and every byte it reads was written earlier in this loop.
+    // Requiring `at + count` to fit would refuse every run, which is most of what this is for.
+    if (count < 0 || at < 0) { trap; }
+    if (count > 0 && at >= this.len) { trap; }
+    this.reserveFor(count);
+    u8[] d = this.data;
+    i32 to = this.len;
+    for (i32 k = 0; k < count; k++) {
+      d[to + k] = d[at + k];
+    }
+    this.len = to + count;
+  }
+
+  /**
    * Discard the first `n` bytes and shift the rest to the front.
    *
    * For a sliding window: a decoder that has emitted the front of its output still needs the

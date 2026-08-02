@@ -12,3 +12,33 @@ export i32 getAtCapacityNotLength() {
   return b.get(5);
 }
 export i32 getOk() { Buf b = Buf.create(); b.push(42); return b.get(0); }
+
+/** `pushRepeat` from before the buffer starts. */
+export i32 pushRepeatBeforeStart() {
+  Buf b = Buf.create();
+  b.pushAll(u8[]('a', 'b'));
+  b.pushRepeat(-1, 1);
+  return b.len;
+}
+
+/**
+ * `pushRepeat` whose source starts at the end.
+ *
+ * Not the same as a copy that *runs* past the end, which is legal and is how a run is spelled:
+ * there the first byte read exists and the rest are written before they are read. Here the very
+ * first byte read does not exist.
+ */
+export i32 pushRepeatPastEnd() {
+  Buf b = Buf.create();
+  b.pushAll(u8[]('a', 'b'));
+  b.pushRepeat(2, 1);
+  return b.len;
+}
+
+/** A negative count, which would otherwise just write nothing and hide a caller's arithmetic. */
+export i32 pushRepeatNegativeCount() {
+  Buf b = Buf.create();
+  b.pushAll(u8[]('a', 'b'));
+  b.pushRepeat(0, -1);
+  return b.len;
+}
