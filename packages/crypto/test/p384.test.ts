@@ -1,21 +1,12 @@
-// NIST P-384: the field and ECDSA verification.
+// P-384's field against BigInt, and the inputs it must refuse.
 //
-// P-384 shares every line of its arithmetic with P-256 — the same Jacobian formulas, the
-// same Solinas reduction reading its prime off the limb count — so this file is testing
-// that the *generalisation* holds, not a second implementation. That makes the field
-// differential the important part: if twelve limbs work as well as eight, the shared code
-// is genuinely generic, and if they do not, it is P-256 code with a P-384 door on it.
+// The ECDSA differential, the group order and the r/s range checks moved to
+// `test/wac/nistcurve_test.wac`, alongside P-256's — they are one implementation now, and
+// testing them together is what checks the generalisation rather than one curve twice.
 //
-// The reduction is the specific thing under test. It is derived here rather than
-// transcribed from FIPS 186-4's ten-term table, from the one line
-//
-//   2^384 = 2^128 + 2^96 - 2^32 + 1   (mod p)
-//
-// which is p rearranged. That is much easier to check by eye than a grid of word indices,
-// but "easier to check" is not "checked", and only BigInt over thousands of products can
-// say whether the fold that grows out of it is right. Note it must also handle a negative
-// carry out of the fold, which P-256's positive-heavy vector rarely produces and P-384's
-// -2^32 term produces constantly.
+// What stayed: the field against BigInt, for the representative reason field25519
+// documents; the refusals, which trap; the wrong-key check; and the SHA-256-under-P-384
+// case, where a digest shorter than the order is right-aligned rather than padded.
 
 import { wacBind } from "../../../harness/wacBind.ts";
 
@@ -114,34 +105,7 @@ Deno.test("p384 field: values at or above p are not in range", () => {
   }
 });
 
-Deno.test("p384: the group order is right", () => {
-  if (dec(order384()) !== N) throw new Error("order mismatch");
-});
 
-Deno.test("p384: verifies WebCrypto's ECDSA signatures and rejects tampering", async () => {
-  const kp = await crypto.subtle.generateKey(
-    { name: "ECDSA", namedCurve: "P-384" }, true, ["sign", "verify"]) as CryptoKeyPair;
-  const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
-  if (pub.length !== 97) throw new Error(`expected a 97-byte point, got ${pub.length}`);
-
-  for (let round = 0; round < 3; round++) {
-    const msg = crypto.getRandomValues(new Uint8Array(40 + round));
-    const sig = new Uint8Array(await crypto.subtle.sign(
-      { name: "ECDSA", hash: "SHA-384" }, kp.privateKey, msg as BufferSource));
-    if (sig.length !== 96) throw new Error(`expected a 96-byte signature, got ${sig.length}`);
-    if (!verify384(pub, msg, sig)) throw new Error(`round ${round}: a genuine signature was rejected`);
-
-    // Every byte of the signature matters, and so does every byte of the message.
-    for (const i of [0, 1, 47, 48, 95]) {
-      const bad = Uint8Array.from(sig);
-      bad[i] ^= 1;
-      if (verify384(pub, msg, bad)) throw new Error(`round ${round}: accepted a signature altered at byte ${i}`);
-    }
-    const other = Uint8Array.from(msg);
-    other[0] ^= 1;
-    if (verify384(pub, other, sig)) throw new Error(`round ${round}: accepted a signature over a different message`);
-  }
-});
 
 Deno.test("p384: a signature is rejected under the wrong key", async () => {
   // The check that distinguishes verification from a self-consistent computation: a
@@ -171,40 +135,6 @@ Deno.test("p384: a SHA-256 digest under a P-384 key is right-aligned", async () 
   if (!verify384Digest(pub, digest, sig)) throw new Error("a SHA-256 signature under P-384 was rejected");
 });
 
-Deno.test("p384: r or s outside [1, n) is refused", async () => {
-  const kp = await crypto.subtle.generateKey(
-    { name: "ECDSA", namedCurve: "P-384" }, true, ["sign", "verify"]) as CryptoKeyPair;
-  const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
-  const msg = new TextEncoder().encode("range checks");
-  const sig = new Uint8Array(await crypto.subtle.sign(
-    { name: "ECDSA", hash: "SHA-384" }, kp.privateKey, msg as BufferSource));
-  if (!verify384(pub, msg, sig)) throw new Error("the genuine signature was rejected");
-
-  const withRS = (r: bigint, s: bigint) => {
-    const out = new Uint8Array(96);
-    out.set(enc(r, N), 0);
-    out.set(enc(s, N), 48);
-    return out;
-  };
-  const good = { r: dec(sig.subarray(0, 48)), s: dec(sig.subarray(48)) };
-  // enc() reduces mod N, so n and n+1 have to be laid down without it.
-  const rawRS = (r: bigint, s: bigint) => {
-    const out = new Uint8Array(96);
-    let x = r, y = s;
-    for (let i = 47; i >= 0; i--) { out[i] = Number(x & 0xFFn); x >>= 8n; }
-    for (let i = 47; i >= 0; i--) { out[48 + i] = Number(y & 0xFFn); y >>= 8n; }
-    return out;
-  };
-  for (const [r, s, what] of [
-    [0n, good.s, "r = 0"], [good.r, 0n, "s = 0"],
-    [N, good.s, "r = n"], [good.r, N, "s = n"],
-    [N + 1n, good.s, "r = n+1"], [good.r, N + 1n, "s = n+1"],
-  ] as const) {
-    if (verify384(pub, msg, rawRS(r, s))) throw new Error(`accepted ${what}`);
-  }
-  if (verify384(pub, msg, withRS(good.r, good.s)) !== true) throw new Error("the rebuilt genuine signature was rejected");
-  if (verify384(pub, msg, new Uint8Array(95))) throw new Error("accepted a 95-byte signature");
-});
 
 Deno.test("p384: a coordinate at or above p is refused, even when it reduces onto the curve", () => {
   // The same check as P-256's, and worth repeating per curve because the room above p is
