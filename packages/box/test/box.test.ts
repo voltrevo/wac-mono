@@ -180,6 +180,40 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     }
     await Deno.remove(datum);
 
+    // A missing final newline is a difference. `splitLines` drops the terminator, so files that
+    // differ only there produced identical line lists and `diff` exited 0 — the worst answer a diff
+    // can give, because the caller's next step is to trust it. GitHub wac-mono#22.
+    const withNl = await Deno.makeTempFile({ prefix: "wac-box-nl1-" });
+    const noNl = await Deno.makeTempFile({ prefix: "wac-box-nl2-" });
+    await Deno.writeTextFile(withNl, "x\ny\n");
+    await Deno.writeTextFile(noNl, "x\ny");
+    const near = box(["diff", withNl, noNl]);
+    assertEquals(near.code, 1, "files differing only in a final newline are different");
+    assertEquals(near.out.includes("No newline at end of file"), true, near.out);
+    // The real one agrees about the status, which is the part a script reads.
+    const sysDiff = new Deno.Command("diff", { args: [withNl, noNl], stdout: "null", stderr: "null" })
+      .outputSync();
+    assertEquals(sysDiff.code, 1, "and so does GNU diff");
+    assertEquals(box(["diff", withNl, withNl]).code, 0, "identical files are still identical");
+    await Deno.remove(withNl);
+    await Deno.remove(noNl);
+
+    // `--` ends the options, so an operand may begin with a dash. Without it `cat -- -x` treated
+    // both as flags, found no operand, read empty standard input and exited 0. GitHub wac-mono#11.
+    const dashDir = await Deno.makeTempDir({ prefix: "wac-box-dash-" });
+    await Deno.writeTextFile(`${dashDir}/-x`, "contents\n");
+    assertEquals(box(["cat", "--", `${dashDir}/-x`]).out, "contents\n", "cat -- -x");
+    await Deno.remove(dashDir, { recursive: true });
+
+    // A numeric sort key outside i32. It used to wrap: `4294967296` and `0` compared equal, so
+    // `-nu` dropped one of them. GitHub wac-mono#12.
+    const wide = await Deno.makeTempFile({ prefix: "wac-box-wide-" });
+    await Deno.writeTextFile(wide, "4294967296\n1\n2147483648\n-1\n");
+    assertEquals(box(["sort", "-n", wide]).out, sys("sort", ["-n", wide]), "sort -n past i32");
+    await Deno.writeTextFile(wide, "4294967296\n0\n");
+    assertEquals(box(["sort", "-nu", wide]).out, sys("sort", ["-nu", wide]), "sort -nu past i32");
+    await Deno.remove(wide);
+
     assertEquals(box(["head", "-3", fixture]).out, sys("head", ["-3", fixture]), "head -N");
     assertEquals(box(["tail", "-n", "2", fixture]).out, sys("tail", ["-n", "2", fixture]), "tail -n N");
     assertEquals(box(["wc", "-l", fixture]).out.trim(), sys("wc", ["-l", fixture]).trim().split(/\s+/)[0]);

@@ -113,9 +113,17 @@ export i32 runAt(Program p, u8[] input, i32 at, i32[] caps, i32 budget) {
     if (op == OP_CHAR()) {
       if (sp < input.len() && input[sp] == a) { pc++; sp++; } else { ok = false; }
     } else if (op == OP_ANY()) {
-      // Without the `s` flag, `.` does not match a newline. That is JavaScript's rule and the
-      // one the oracle applies.
-      if (sp < input.len() && input[sp] != 10) { pc++; sp++; } else { ok = false; }
+      // Without the `s` flag, `.` matches anything except a *line terminator*, and JavaScript has
+      // four of them: LF, CR, U+2028 and U+2029. Only LF was excluded here, so `/a.b/` matched
+      // "a\rb" where JavaScript does not — and the oracle could not have caught it, because its
+      // subject list had no carriage return in it. It does now.
+      //
+      // U+2028 and U+2029 remain matched, and cannot honestly be excluded by this engine: it walks
+      // bytes, and those two are three bytes each, so `.` here consumes one byte of a character
+      // rather than the character. That is the same reason every subject in the differential test
+      // is ASCII, and it is a documented limit rather than an oversight.
+      bool terminator = sp < input.len() && (input[sp] == 10 || input[sp] == 13);
+      if (sp < input.len() && !terminator) { pc++; sp++; } else { ok = false; }
     } else if (op == OP_CLASS()) {
       if (sp < input.len() && inClass(p, a, input[sp])) { pc++; sp++; } else { ok = false; }
     } else if (op == OP_MATCH()) {

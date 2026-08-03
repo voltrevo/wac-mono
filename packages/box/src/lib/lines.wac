@@ -96,14 +96,22 @@ export u8[][] mergeSortWith(u8[][] xs, i32 n, fn[i32(u8[], u8[])] cmp) {
  * the `1` and then by nothing, so they stay as they came.
  */
 export i32 cmpNumeric(u8[] a, u8[] b) {
-  i32 x = leadingNumber(a);
-  i32 y = leadingNumber(b);
+  i64 x = leadingNumber(a);
+  i64 y = leadingNumber(b);
   if (x == y) { return 0; }
   return x < y ? -1 : 1;
 }
 
-/** The integer a line starts with, after blanks, or zero if it does not start with one. */
-i32 leadingNumber(u8[] b) {
+/**
+ * The integer a line starts with, after blanks, or zero if it does not start with one.
+ *
+ * **i64, and saturating.** In i32 it wrapped: `sort -n` over `4294967296 1 2147483648 -1` answered
+ * `2147483648 -1 4294967296 1`, and `-nu` merged `4294967296` with `0` because both keys came out
+ * the same — a distinct line silently dropped. Saturation rather than wrapping keeps the order
+ * monotonic for input wider than i64 as well; GNU compares those exactly, which needs arbitrary
+ * precision and is a bigger change than this bug.
+ */
+i64 leadingNumber(u8[] b) {
   i32 i = 0;
   while (i < b.len() && (b[i] == ' ' || b[i] == '\t')) { i++; }
   bool negative = false;
@@ -111,10 +119,14 @@ i32 leadingNumber(u8[] b) {
     negative = b[i] == '-';
     i++;
   }
-  i32 v = 0;
+  i64 v = 0;
+  i64 cap = 922337203685477580;              // i64 max / 10, so the multiply below cannot overflow
+  bool saturated = false;
   while (i < b.len() && b[i] >= '0' && b[i] <= '9') {
-    v = v * 10 + (b[i] - '0');
+    if (v > cap) { saturated = true; }
+    if (!saturated) { v = v * 10 + ((b[i] - '0') as i64); }
     i++;
   }
+  if (saturated) { return negative ? -9223372036854775807 : 9223372036854775807; }
   return negative ? 0 - v : v;
 }

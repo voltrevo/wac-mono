@@ -113,6 +113,10 @@ function checkAll(patterns: string[], inputs: string[]): void {
 const SUBJECTS = [
   "", "a", "b", "ab", "ba", "aa", "abc", "abcabc", "aaa", "aaaa", "xay", "xaby",
   "a b", "  ", "a1b2", "123", "abc123", "_x_", "A", "aA", "\n", "a\nb", "-", "]", "[",
+  // Carriage returns, which JavaScript's `.` excludes as a line terminator and this engine did
+  // not. Nothing here could produce one before, so the disagreement was unreachable by
+  // construction — the fixture, not the engine, was what passed. GitHub wac-mono#28.
+  "\r", "a\rb", "a\r\nb", "\r\n",
   "aaaaaaaaaa", "abababab", "cba", "cab", "xyz",
 ];
 

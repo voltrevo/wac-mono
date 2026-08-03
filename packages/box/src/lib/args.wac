@@ -82,9 +82,15 @@ export Args parseList(string[] argv, i32 first, string name) {
   i32 num = 0;
   bool hasNum = false;
   i32 i = first;
+  bool optionsOver = false;
   while (i < argv.len()) {
     string s = argv[i];
-    if (!isFlag(s)) { scratch[at] = s; at++; i++; continue; }
+    // `--` ends the options, as it does everywhere else. Without it an operand beginning with a
+    // dash could not be named at all: `box cat -- -x` treated both arguments as flags, left `rest`
+    // empty, and `cat` read standard input and succeeded — the file never opened and nothing said
+    // so. Everything after it is an operand, including a later `--`.
+    if (!optionsOver && s == "--") { optionsOver = true; i++; continue; }
+    if (optionsOver || !isFlag(s)) { scratch[at] = s; at++; i++; continue; }
     u8[] b = s.toBytes();
     if (b[1] >= '0' && b[1] <= '9') {
       num = atoi(string.fromBytes(slice(b, 1, b.len())));          // -5

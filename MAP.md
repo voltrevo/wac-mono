@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-24 packages, 42,179 lines of wac, 904 tests,
+24 packages, 42,265 lines of wac, 905 tests,
 22 command-line programs and 4 browser pages.
 
 ## Packages
@@ -13,10 +13,10 @@ In dependency order: nothing here imports anything below it.
 
 | package | what it is | wac lines | tests | builds on |
 |---|---|---|---|---|
-| [`bytes`](packages/bytes/) | `Buf` — a growable byte buffer. | 231 | 24 | — |
+| [`bytes`](packages/bytes/) | `Buf` — a growable byte buffer. | 256 | 25 | — |
 | [`platform`](packages/platform/) | A capability world for wac applications, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell… | 1,993 | 46 | — |
-| [`regex`](packages/regex/) | A backtracking regular expression engine, with JavaScript's semantics. | 924 | 15 | — |
-| [`std`](packages/std/) | Containers and the two sum types every program ends up wanting. | 582 | 37 | — |
+| [`regex`](packages/regex/) | A backtracking regular expression engine, with JavaScript's semantics. | 932 | 15 | — |
+| [`std`](packages/std/) | Containers and the two sum types every program ends up wanting. | 586 | 37 | — |
 | [`unicode`](packages/unicode/) | UTF-8 as code points, and simple case mapping. | 216 | 11 | — |
 | [`bignum`](packages/bignum/) | Arbitrary-precision integers. | 629 | 42 | `bytes` |
 | [`codec`](packages/codec/) | Base16, base32 and base64, from RFC 4648. | 349 | 10 | `bytes` |
@@ -35,7 +35,7 @@ In dependency order: nothing here imports anything below it.
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,565 | 45 | `bytes` `codec` `crypto` `platform` `sh` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,263 | 70 | `crypto` |
-| [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,636 | 22 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
+| [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,685 | 22 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 4,272 | 109 | `codec` `crypto` `datetime` `platform` `std` `tls` |
 
 ## Programs

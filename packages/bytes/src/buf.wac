@@ -61,13 +61,27 @@ export struct Buf {
    * Repeated `push` would reach the same capacity through a series of doublings,
    * each copying everything written so far.
    */
+  /**
+   * Make room for `extra` more bytes.
+   *
+   * **The arithmetic is i64.** In i32 both halves wrapped: `this.len + extra` past the ceiling went
+   * negative, `need <= data.len()` was then true and the buffer silently did not grow; and once the
+   * doubling passed the ceiling `cap` went negative too, so `while (cap < need)` doubled a negative
+   * number for ever. A hang and a silent under-allocation from the same two lines.
+   *
+   * A `need` beyond what an array can hold is impossible rather than merely large — an array's
+   * length is an i32 — so the request is made at that ceiling and the allocation refuses it. That
+   * is the honest end of the path: better a trap saying the array is too large than a buffer that
+   * quietly did not grow.
+   */
   void reserveFor(this, i32 extra) {
-    i32 need = this.len + extra;
-    if (need <= this.data.len()) { return; }
-    i32 cap = this.data.len() * 2;
+    i64 need = (this.len as i64) + (extra as i64);
+    if (need <= (this.data.len() as i64)) { return; }
+    i64 cap = (this.data.len() as i64) * 2;
     if (cap < 16) { cap = 16; }
     while (cap < need) { cap = cap * 2; }
-    u8[] next = u8[cap]();
+    if (cap > 2147483647) { cap = 2147483647; }
+    u8[] next = u8[cap as! i32]();
     next.copyFrom(this.data, 0, 0, this.len);
     this.data = next;
   }
@@ -112,7 +126,18 @@ export struct Buf {
    * UTF-8 form. Kept here rather than in `json` because the encoding is a
    * property of UTF-8, not of JSON.
    */
-  void pushCodepoint(this, i32 cp) {
+  /**
+   * Append one code point as UTF-8.
+   *
+   * **Anything that is not a Unicode scalar becomes U+FFFD**: negative, above U+10FFFF, or in the
+   * surrogate range D800..DFFF, which UTF-8 cannot encode at all. It used to encode them anyway —
+   * `0x110000` produced a five-byte-shaped sequence and a surrogate produced the CESU-8 form that
+   * strict decoders reject — so a `Buf` could end up holding bytes that are not text. Replacing is
+   * what encoders conventionally do, and it keeps this method's promise that what it appends is
+   * valid UTF-8; a caller that wants to know can check the value first.
+   */
+  void pushCodepoint(this, i32 cp0) {
+    i32 cp = (cp0 < 0 || cp0 > 0x10FFFF || (cp0 >= 0xD800 && cp0 <= 0xDFFF)) ? 0xFFFD : cp0;
     if (cp < 0x80) {
       this.push(cp);
     } else if (cp < 0x800) {
