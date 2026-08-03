@@ -80,10 +80,17 @@ for (const f of files) {
 }
 
 /**
- * Count calls, ignoring the declaration itself and anything inside a comment.
+ * Count uses, ignoring the declaration itself and anything inside a comment.
  *
  * Comments matter here: a doc comment naming the function it documents is the normal
  * case, and counting it would hide every dead export behind its own documentation.
+ *
+ * **A use is not always a call.** wac's whole capability design passes functions as values —
+ * `sh.external = boxRun`, `Core.of(fakeLog, fakeWarn, …)`, `gzipStream(cli.readChunk, cli.write)`
+ * — and a bare name is how that is spelled. Counting only `name(` reported `boxRun` and `boxNames`
+ * as dead while a shell was running sixty programs through them, which is the kind of answer that
+ * gets a check like this switched off. So the name alone counts, as long as it is not immediately
+ * followed by something that makes it a different thing (a `.` or a `(`-less declaration keyword).
  */
 function callers(name: string, declFile: string, declLine: number): string[] {
   const hits: string[] = [];
@@ -91,7 +98,20 @@ function callers(name: string, declFile: string, declLine: number): string[] {
   // the original. Missing this reports every aliased import as dead, which is how a
   // check like this earns the reputation that gets it switched off.
   const names = new Set([name, ...aliasesOf(name)]);
-  const call = new RegExp(`(?<![\\w.])(?:${[...names].join("|")})\\s*\\(`);
+  const any = [...names].join("|");
+  const call = new RegExp(`(?<![\\w.])(?:${any})\\s*\\(`);
+  // A value use: what stands before it is an `=`, a `,`, an opening bracket, a `?`/`:` of a
+  // ternary, or `return`. That is narrow on purpose. Accepting a bare name *anywhere* counted the
+  // local `i32 masked = …` in `bitwriter.wac` as a use of the exported `masked`, and the `#wrap` of
+  // a CSS string as a use of `wrap` — trading eight false positives for false negatives, which is
+  // the worse direction for a check whose whole job is to find things nothing uses.
+  //
+  // One false negative survives on purpose, because removing it needs name resolution rather than
+  // a regex: a *local* of the same name, used as a value, counts. `bitwriter.wac` has
+  // `i32 masked = …; this.bitBuf |= masked << …`, which hides the exported `masked` elsewhere. So
+  // this number is a floor, not a census — trust the names it prints, and do not trust that the
+  // list is complete.
+  const value = new RegExp(`(?:[=,(\\[?:]|\\breturn)\\s*(?:${any})(?![\\w(])`);
   for (const f of files) {
     source.get(f)!.split("\n").forEach((line, i) => {
       if (f === declFile && i + 1 === declLine) return;
@@ -99,7 +119,9 @@ function callers(name: string, declFile: string, declLine: number): string[] {
       if (!code.trim() || /^\s*\*/.test(line)) return;
       // An import naming it is not a call — a stale import is exactly as dead.
       if (/^\s*(import|export)\s*\{/.test(code) || /^\s*[\w,\s]+\}\s*from/.test(code)) return;
-      if (call.test(code)) hits.push(`${f}:${i + 1}`);
+      // String literals out first: a name inside one is text, not a reference.
+      const bare = code.replace(/"(?:\\.|[^"\\])*"/g, '""');
+      if (call.test(bare) || value.test(bare)) hits.push(`${f}:${i + 1}`);
     });
   }
   return hits;
