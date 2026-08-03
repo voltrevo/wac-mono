@@ -121,7 +121,10 @@ export struct Shell {
       if (b[0] >= 0x31 && b[0] <= 0x39) { return (b[0] - 0x31) < this.params.len(); }
     }
     if (this.vars.has(name)) { return true; }
-    return this.cli.env(name) is not null;
+    // `.wait()` matters more than it looks: without it this asks whether the *ticket* is null,
+    // which it never is, so every name reads as set and `${x-default}` stops substituting.
+    // The check compiles either way — a `Pending<string?>` is a reference like any other.
+    return this.cli.env(name).wait() is not null;
   }
 
   string lookUp(const this, string name) {
