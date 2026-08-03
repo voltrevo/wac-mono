@@ -354,6 +354,23 @@ export u8[] requestName(u8[] payload) {
   return r.ok ? name : u8[0]();
 }
 
+/**
+ * Whether a CHANNEL_REQUEST asked for a reply.
+ *
+ * The field exists because most channel requests do *not* want one, and answering anyway is worse
+ * than useless: the client matches replies to requests in order, so a reply to something that
+ * expected none is attributed to the next request that did. That is not a hypothetical — see
+ * `wantsReply`'s use in `sshd.wac`.
+ */
+export bool requestWantsReply(u8[] payload) {
+  Reader r = Reader.over(payload);
+  if (r.byte() != msgChannelRequest()) { return false; }
+  r.u32();
+  r.str();
+  bool want = r.bool();
+  return r.ok && want;
+}
+
 /** The command out of a CHANNEL_REQUEST for `exec`, or empty when it is a different request. */
 export u8[] execCommand(u8[] payload) {
   Reader r = Reader.over(payload);

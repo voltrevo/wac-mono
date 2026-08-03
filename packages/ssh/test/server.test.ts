@@ -84,14 +84,28 @@ async function stopWacsshd(s: Wacsshd | undefined): Promise<void> {
   await Deno.remove(s.dir, { recursive: true });
 }
 
-/** The real OpenSSH client, against our server. */
-async function realSsh(s: Wacsshd, command: string, key = `${s.dir}/clientkey`) {
+/**
+ * The real OpenSSH client, against our server.
+ *
+ * **`-F /dev/null` is why a real bug lived here for as long as it did.** Discarding the system
+ * config makes the test reproducible, and it also removes `SendEnv LANG LC_*` — the Debian and
+ * Ubuntu default — so the client never sent the `env` requests that broke the server. `extra`
+ * exists to put them back: see the test named for it below.
+ */
+async function realSsh(
+  s: Wacsshd, command: string, key = `${s.dir}/clientkey`, extra: string[] = [],
+) {
   const r = await new Deno.Command("ssh", {
     args: [
       "-F", "/dev/null", "-i", key, "-p", String(s.port),
       "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-      "-o", "BatchMode=yes", "claude@127.0.0.1", command,
+      "-o", "BatchMode=yes", ...extra, "claude@127.0.0.1", command,
     ],
+    env: {
+      LANG: "C.UTF-8", LC_ALL: "C.UTF-8", HOME: s.dir,
+      PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin",
+    },
+    clearEnv: true,
   }).output();
   // The client writes its host key notice to stderr; it is not the command's output.
   const stderr = text(r.stderr).split("\n")
@@ -269,6 +283,40 @@ Deno.test({
       // Worth being explicit that this proves less than the test above: two implementations that
       // share an author agree with each other about a misreading as readily as about the spec.
       // It is here because it exercises both halves in one process tree, not as evidence.
+    } finally {
+      await stopWacsshd(s);
+    }
+  },
+});
+
+Deno.test({
+  name: "a client that sends environment requests first still gets its command run",
+  ignore: !haveSshd,
+  sanitizeResources: false,
+  async fn() {
+    const s = await startWacsshd();
+    try {
+      // `SendEnv LANG LC_*` is the default in Debian's and Ubuntu's `ssh_config`, so this is what
+      // most clients in the world actually do: two `env` channel requests, both with want_reply
+      // *false*, and then `exec`.
+      //
+      // The server used to treat every request that was not `shell` as an attempt to `exec`,
+      // fail to read a command out of it, and answer CHANNEL_FAILURE. Since the `env` requests
+      // asked for no reply, those answers landed against the *next* request the client had made —
+      // its `exec` — so every command failed with `exec request failed on channel 0` while the
+      // server logged that the client had never asked to run anything.
+      //
+      // It is invisible without this test, because the rest of them pass `-F /dev/null`.
+      const r = await realSsh(s, "echo env-first", undefined, ["-o", "SendEnv=LANG LC_*"]);
+      if (r.stdout !== "env-first\n") {
+        throw new Error(`env-first: got ${JSON.stringify(r.stdout)} code ${r.code}\n${r.stderr}`);
+      }
+      if (r.code !== 0) throw new Error(`env-first: exit ${r.code}\n${r.stderr}`);
+
+      // And the same again with a command whose status is not zero, so the reply pairing is
+      // checked rather than just the happy path.
+      const bad = await realSsh(s, "exit 7", undefined, ["-o", "SendEnv=LANG LC_*"]);
+      if (bad.code !== 7) throw new Error(`env-first status: exit ${bad.code}\n${bad.stderr}`);
     } finally {
       await stopWacsshd(s);
     }
