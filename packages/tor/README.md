@@ -18,6 +18,11 @@ certificates and microdescriptors, verifies them, and every circuit after that i
 from what it learnt — bandwidth-weighted per position, distinct /16s, mutual families
 excluded, an exit whose policy carries the port, through a pinned guard set.
 
+There is a **SOCKS5 proxy**: `src/socks.wac` puts every connection on one circuit as its own
+stream, so `curl --socks5-hostname` and anything else that speaks SOCKS goes over Tor. Against
+the testnet it has carried 3.2MB across eight concurrent streams on one circuit, byte-identical,
+and 400KB back the other way.
+
 It should still not be pointed at the real network — see *What is not here*.
 
 ## Why this is possible at all
@@ -349,6 +354,35 @@ What catches it is in the crypto package, where a chunked `CtrStream` is compare
 the one-shot that the host's own AES already verifies. If you add a relay test, ask which
 of those two kinds it is.
 
+## The SOCKS proxy, and the bug it found immediately
+
+`src/socks.wac` is one worker holding one outstanding `recv` per socket plus an `accept`,
+handing the whole list to `waitAny` and re-issuing whichever answered. Every SOCKS connection
+becomes a stream on the shared circuit; arriving cells are routed by the stream id in the
+relay header. `box nc` is the two-handle version of the same shape.
+
+Uploads are the interesting direction. Tor's package window bounds what may be in flight, so
+a client that uploads faster than credit arrives will outrun the circuit, and the choice is
+to buffer without limit or to stop reading. It stops reading — the outstanding `recv` is not
+re-issued until the queue drains below 32KB — which pushes the problem back to the client,
+where it can be solved.
+
+**The first real transfer through it aborted the client**, and the bug was older than the
+proxy. `tlsClientFeed` takes whole records and says so in its own comment; it does no
+buffering by design, so that only one place decides where a record ends. `link.wac` had been
+handing it whatever `recv` returned since the day it was written.
+
+It worked for a year of directory fetches because a consensus arrives as a few small records
+that a TCP segment does not usually split. The proxy's first 400KB download arrived as 44KB
+in one chunk — some eighty records with the last one cut in half — and it trapped. This is
+the failure mode that shows up on a *fast* connection rather than a slow one, which is the
+opposite of where you look.
+
+`box/src/applets/gets.wac` had the framing right the whole time, with the reason in a comment
+next to it. Two of this repo's TLS callers, one correct and one not, and nothing compared
+them. The fix is `wholeRecordBytes` in `link.wac`, and the test feeds it every prefix of a
+record and the exact eighty-records-plus-a-split-one shape that failed.
+
 ## What is not here
 
 **The real network.** Directory authorities are reached by IP and this sandbox's proxy
@@ -378,8 +412,19 @@ are exactly what the application produced.
 that caused the circuit to be built. A caller mixing ports under one key can be handed an
 exit that refuses a later one.
 
-**Streams to arbitrary destinations, verified.** `RELAY_BEGIN` reaches the exit and is
-parsed by it — the testnet's exit evaluates our address and answers `RELAY_END`, which
-arrives back through the onion layers and decrypts correctly. It has not been seen to carry
-data, because chutney's exits reject private addresses and this sandbox has nowhere else to
-reach. `RELAY_BEGIN_DIR` is the path that is exercised end to end.
+**One circuit for everything.** `socks.wac` builds a single three-hop circuit at start-up
+and puts every stream on it. That is one exit for every destination, one fate shared by
+every stream, and no isolation between them — a real client keeps several circuits and
+chooses between them per destination. It also picks its exit for port 80 before it knows
+what anyone will ask for, so a CONNECT to a port that exit refuses fails where a
+per-destination circuit would have succeeded.
+
+**A circuit that dies is not rebuilt.** `socks.wac` logs it and exits. Rebuilding needs the
+in-flight streams to be reopened on the new circuit or ended honestly, and doing it badly is
+worse than not doing it: a stream silently reattached to a different exit is a stream whose
+destination has quietly changed hands.
+
+**No SOCKS authentication, and no isolation by credential.** Tor uses the SOCKS username and
+password as an isolation key — different credentials get different circuits, which is how
+Tor Browser separates tabs. Here the greeting is answered "no authentication" without reading
+what was offered.
