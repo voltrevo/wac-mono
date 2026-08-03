@@ -45,7 +45,8 @@ void fakeLog(string s) {}
 void fakeWarn(string s) {}
 
 Core fakeCore() {
-  return Core.of(fakeNow, fakeMonotonic, fakeSleep, fakeRandom, fakeLog, fakeWarn);
+  return Core.of(fakeNow, fakeMonotonic, fakeSleep, fakeRandom, fakeLog, fakeWarn,
+                 fakeWaitAny);
 }
 
 // ── Cli ───────────────────────────────────────────────────────────────────────
@@ -174,7 +175,7 @@ Child resolveChild(i32 id) {
 }
 i32 resolveId(i32 id) { return id; }
 
-Pending<Child> fakeSpawn(string source, string[] argv) {
+Pending<Child> fakeSpawn(string source, string[] argv, i32 grants) {
   i32 handle = -1;
   if (source == "runnable") { handle = 7; }
   // Starts, then never reports a status — `exitCode` answers negative for it. The shell calls that
@@ -189,14 +190,19 @@ Pending<i32> fakeExitCode(i32 handle) {
   return Pending.of(0, resolveId, alwaysSettled, ignoreDrop);
 }
 
-/** Every fake ticket is settled the moment it is made, so the first id is as true as any. */
-i32 fakeWaitAny(i32[] ids) { return ids.len() > 0 ? ids[0] : -1; }
+/**
+ * Every fake ticket is settled the moment it is made, so the first id is as true as any.
+ *
+ * `waitAny` moved from `Cli` to `Core` and grew a deadline argument; neither matters here, since
+ * nothing is ever outstanding.
+ */
+i32 fakeWaitAny(i32[] ids, i32 deadlineMillis) { return ids.len() > 0 ? ids[0] : -1; }
 
 Cli fakeCli() {
   return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeReadFile, fakeWriteFile,
                 fakeStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
                 fakeReadChunk, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
-                fakeSend, fakeCloseSocket, fakeWaitAny, fakeSpawn, fakeCloseFeed, fakeExitCode);
+                fakeSend, fakeCloseSocket, fakeSpawn, fakeCloseFeed, fakeExitCode);
 }
 
 // ── What the coverage driver calls ────────────────────────────────────────────

@@ -294,10 +294,10 @@ chooses, which is the capability world working rather than a gap in it.
 **Which channel requests get a reply is decided by the request, not by whether we understood
 it.** This was wrong, and the effect was total: a client whose `ssh_config` contains
 `SendEnv LANG LC_*` — the Debian and Ubuntu default — sends two `env` requests before `exec`,
-both with `want_reply` *false*. The server answered them anyway, the client matched replies to requests
-in order, and it attributed the first spurious answer to its `exec`. Every command failed with
-`exec request failed on channel 0` while the server logged that the client had never asked to run
-anything.
+both with `want_reply` *false*. The server answered them anyway, the client matched replies to
+requests in order, and it attributed the first spurious answer to its `exec`. Every command
+failed with `exec request failed on channel 0` while the server logged that the client had never
+asked to run anything.
 
 The suite did not see it because `test/server.test.ts` runs the client with `-F /dev/null`, which
 is good hygiene for reproducibility and also discards the very config that sends the `env`. It was
@@ -310,8 +310,8 @@ fold it, so the interactive loop strips the carriage return at a line boundary a
 Without that, `exit\r` is not `exit`.
 
 **`ssh -tt` — forcing a pty — does not give a usable session**, which follows from `pty-req`
-being refused rather than being a separate defect: the client prints `PTY allocation request failed` and
-gives up. `ssh -T` and an ordinary terminal session both work.
+being refused rather than being a separate defect: the client prints `PTY allocation request
+failed` and gives up. `ssh -T` and an ordinary terminal session both work.
 
 Three server-side details that a client never has to get right:
 
@@ -337,6 +337,51 @@ world"` contains spaces that do not end it — and a naive scan finds a key type
 none, which reads as "this line is not for you" and lets a *restricted* key through as unknown.
 Options are then refused rather than obeyed: a server that reads a restriction and ignores it is
 worse than one that refuses, because the operator wrote it expecting it to hold.
+
+## How this is tested, and what the numbers mean
+
+Three oracles, because no one of them sees enough.
+
+**A real OpenSSH server** for the client (`test/transport.test.ts`, `test/cli.test.ts`) and **a
+real OpenSSH client** for the server (`test/server.test.ts`). That reversal is the point: every
+other test here runs our code against theirs, and the server tests run theirs against ours, which
+reaches the paths nothing else does — offering lists rather than choosing from them, signing an
+exchange hash rather than verifying one, answering the key probe.
+
+**The RFCs, directly**, wherever a value has no oracle inside the package. All 25 message numbers
+are asserted against RFC 4250 §4.1.2, and the refusal messages byte for byte against RFC 4254 and
+4253. That is not belt-and-braces: a function returning a constant is compared only against itself
+here — `parse` reads a byte and checks it against `msgChannelEof()` — so a wrong number makes
+both sides wrong together and every interop test still passes.
+
+**Mutation testing**, `deno task mutate --package ssh --operators`, about eleven minutes:
+
+```
+135/151 killed, 3 survived, 13 not covered
+```
+
+**The three survivors are deliberate and should stay.** Anyone re-running this needs to know
+that, or they will read a regression:
+
+- `extreme/ssh/ssh/defaultPort` and `extreme/ssh/sshd/defaultPort` — unexported constants in
+  program entry files, 22 and 2222. Reaching them means binding those ports in a shared suite,
+  and buying a flake to pin a constant whose failure is immediately obvious is a bad trade.
+- `guard/ssh/sshd:231:37` — the length check in `hostPublicPoint`. It is now genuinely
+  unreachable, *because* `readEd25519` validates the outer public blob; it guards an invariant
+  maintained in another file, which is the kind worth keeping.
+
+The 13 "not covered" are mostly length preconditions on internal helpers — `if (key.len() !=
+keyLength()) { trap; }` and the like. Note that "not covered" here means **not covered by the
+attributable tests**: the profiler only sees in-process `wacBind` tests, so anything exercised
+solely by the two integration suites reads as uncovered when it is not. See
+[issue 0024](../../issues/open/0024-mutation-selection-is-inert-for-subprocess-tests-and-the-fallback-runs-them-worst-first.md).
+
+There is a design rule underneath those guards worth stating, because it is easy to break by
+accident: **a `trap` guards our own invariants; anything a peer supplies is handled with a
+nullable return instead.** `sharedSecret` takes the client's point and answers `u8[]?` because a
+bad point is the peer's doing, not a bug. The one place that was violated — `hostPublicPoint`
+trapping on data read from a *file* — was a real defect, and the fix was to validate at the parse
+boundary rather than to soften the trap.
 
 ## What is missing
 
