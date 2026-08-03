@@ -279,6 +279,45 @@ non-capability flag in the shebang of every program that spawns. So this is a co
 concurrency primitive, and the grants are meaningful for wac children and advisory for
 anything else. wac-mono issue 0015 has the reasoning.
 
+### Composing them
+
+Two examples exist to show that handles compose without any further capability, and both were
+written against the world unchanged:
+
+`example/pipe.wac` — `stdin -> child -> child -> stdout`, a shell's `|` with no shell. Three
+handles are live at once and the loop waits on whichever moves; it never asks which kind a
+handle is, because standard input at handle 0 answers `recv` exactly as a child does.
+
+```sh
+printf 'b\na\nb\nc\n' | pipe box.worker.js sort uniq      #  a  b  c
+```
+
+Note the deadlock it cannot have: a shell pipeline needs an OS buffer between stages, and a
+stage that stops reading while the one before it keeps writing wedges both. Here all three
+reads are in flight, so a slow second stage parks the *pump* rather than the first child, and
+the ring's four slots are the backpressure. 5MB through `cat | cat` comes out byte-identical.
+
+`example/inetd.wac` — accept a connection, spawn a program, relay bytes until either side
+finishes. The handler knows nothing about networks: it reads standard input and writes standard
+output. Serving `packages/sh`'s shell this way gives a remote shell whose every command runs
+with grants the *server* chose:
+
+```sh
+deno task app:build packages/sh/src/sh.wac --worker -o sh.worker.js
+inetd 9000 sh.worker.js
+```
+```
+$ printf 'seq 1 20 | grep 1 | wc -l\necho $((6*7))\ncat /etc/hostname\n' | nc 127.0.0.1 9000
+11
+42
+                     # nothing: the shell has no filesystem, though its parent does
+```
+
+That last line is the property worth having. It is the artefact issue 0015 predicted — "an SSH
+server offering a sandboxed shell where every command is a wac program with grants the server
+chose is a thing Unix cannot build" — reachable because a socket and a child are the same kind
+of thing.
+
 ## What the boundary is, and is not
 
 The `Cli` and `Core` structs are the complete list of what an application can reach, and
