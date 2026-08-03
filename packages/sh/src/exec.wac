@@ -24,6 +24,7 @@ import { Part, PartKind, Token, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
          RedirKind, Script, Simple, Word, parse } from "./parse.wac";
 import { Output, itoa, names, run } from "./program.wac";
+import { Arith, evaluate } from "./arith.wac";
 
 export struct Shell {
   Core core;
@@ -697,8 +698,50 @@ bool hasUnquotedMeta(u8[] b, u8[] quoted) {
   for (i32 i = 0; i < b.len(); i++) {
     if (quoted[i] != 0) { continue; }
     if (b[i] == 0x2a || b[i] == 0x3f) { return true; }          // '*' '?'
+    // `[` only counts when it closes. `echo [` is a word, not a pattern that matches nothing,
+    // and treating it as one would make it disappear against an empty directory.
+    if (b[i] == 0x5b && closingBracket(b, quoted, i) > 0) { return true; }
   }
   return false;
+}
+
+/**
+ * Where the `]` closing a bracket at `at` is, or -1.
+ *
+ * A `]` immediately after the opening bracket — or after its `!` — is a literal `]` rather than
+ * the close, which is the only way to put one in a set at all.
+ */
+i32 closingBracket(u8[] b, u8[] quoted, i32 at) {
+  i32 i = at + 1;
+  if (i < b.len() && (b[i] == 0x21 || b[i] == 0x5e)) { i++; }   // '!' or '^'
+  if (i < b.len() && b[i] == 0x5d) { i++; }
+  while (i < b.len()) {
+    if (b[i] == 0x5d && quoted[i] == 0) { return i; }
+    i++;
+  }
+  return -1;
+}
+
+/** Whether `c` is in the set written at `pat[at..close]`. */
+bool inBracket(u8[] pat, i32 at, i32 close, i32 c) {
+  i32 i = at + 1;
+  bool negated = false;
+  if (i < close && (pat[i] == 0x21 || pat[i] == 0x5e)) {
+    negated = true;
+    i++;
+  }
+  bool hit = false;
+  while (i < close) {
+    // A `-` between two characters is a range; one at either end is a literal `-`.
+    if (i + 2 < close && pat[i + 1] == 0x2d) {
+      if (c >= pat[i] && c <= pat[i + 2]) { hit = true; }
+      i += 3;
+      continue;
+    }
+    if (pat[i] == c) { hit = true; }
+    i++;
+  }
+  return hit != negated;
 }
 
 /**
@@ -760,6 +803,17 @@ bool globMatch(u8[] pat, u8[] quoted, i32 p, u8[] name, i32 n) {
       }
       return false;
     }
+    if (meta && pat[i] == 0x5b) {                                // '['
+      i32 close = closingBracket(pat, quoted, i);
+      if (close > 0) {
+        if (j >= name.len()) { return false; }
+        if (!inBracket(pat, i, close, name[j])) { return false; }
+        i = close + 1;
+        j++;
+        continue;
+      }
+      // An unclosed `[` is an ordinary character, which is why `echo [` prints one.
+    }
     if (j >= name.len()) { return false; }
     if (meta && pat[i] == 0x3f) { i++; j++; continue; }
     if (pat[i] != name[j]) { return false; }
@@ -782,6 +836,48 @@ u8[] sliceBytes(u8[] b, i32 from, i32 to) {
  * Lexed and expanded rather than taken literally, because a default is routinely another
  * expansion: `${HOME:-/root}` is the boring case and `${EDITOR:-$VISUAL}` is the reason.
  */
+/**
+ * Remove a matching prefix. `longest` picks `##` over `#`.
+ *
+ * Tried by length rather than by matching greedily, because the pattern is a glob and "the
+ * shortest prefix this matches" is not something a glob matcher answers on its own.
+ */
+string trimStart(Shell sh, string value, string pattern, bool longest) {
+  u8[] pat = expandText(sh, pattern).toBytes();
+  u8[] mask = u8[pat.len()]();
+  u8[] v = value.toBytes();
+  i32 hit = -1;
+  for (i32 n = 0; n <= v.len(); n++) {
+    u8[] head = u8[n]();
+    head.copyFrom(v, 0, 0, n);
+    if (globMatch(pat, mask, 0, head, 0)) {
+      hit = n;
+      if (!longest) { break; }
+    }
+  }
+  if (hit < 0) { return value; }
+  return value.slice(hit, value.len());
+}
+
+/** Remove a matching suffix. `longest` picks `%%` over `%`. */
+string trimEnd(Shell sh, string value, string pattern, bool longest) {
+  u8[] pat = expandText(sh, pattern).toBytes();
+  u8[] mask = u8[pat.len()]();
+  u8[] v = value.toBytes();
+  i32 hit = -1;
+  for (i32 n = 0; n <= v.len(); n++) {
+    i32 from = v.len() - n;
+    u8[] tail = u8[n]();
+    tail.copyFrom(v, from, 0, n);
+    if (globMatch(pat, mask, 0, tail, 0)) {
+      hit = from;
+      if (!longest) { break; }
+    }
+  }
+  if (hit < 0) { return value; }
+  return value.slice(0, hit);
+}
+
 string expandText(Shell sh, string text) {
   if (text == "") { return ""; }
   Vec<Token> toks = tokenize(text);
@@ -801,12 +897,131 @@ string expandText(Shell sh, string text) {
   return out;
 }
 
+/**
+ * Evaluate `$((…))` against the shell's variables.
+ *
+ * `arith.wac` takes its lookup as a funcref so it needs to know nothing about a shell — and a
+ * funcref cannot reach one, since wac has no closures. The bridge is that the text is expanded
+ * *first*, so `$x` is already substituted, and the remaining bare names are resolved through a
+ * lookup bound to this call.
+ */
+string expandArith(Shell sh, string text) {
+  Arith state = Arith(u8[0](), 0, false, "");
+  // Names are substituted here rather than by the ordinary expander, because the ordinary
+  // expander *tokenizes* — and inside these parentheses the shell's operators are arithmetic.
+  // Running `3>2` through it produced a redirection of fd 3 and the string `2`; `1&&0` split on
+  // the `&&`. The text has to be treated as an expression from the start.
+  //
+  // Substituting the *raw* value rather than a number is deliberate: `x=1+2; echo $((x))` is 3 in
+  // bash, because the value is re-evaluated as an expression, and putting `1+2` back into the
+  // text reproduces that for free.
+  // Substituted until it stops changing, because a value may itself name a variable: bash gives
+  // 7 for `a=b; b=c; c=7; echo $((a))`. Bounded, because `x=x` is a cycle — bash calls that
+  // "expression recursion level exceeded" and so, in its own words, does this.
+  string expanded = text;
+  bool settled = false;
+  for (i32 round = 0; round < 16 && !settled; round++) {
+    string next = substituteNames(sh, expanded);
+    if (next == expanded) { settled = true; }
+    expanded = next;
+  }
+  // A self-reference reaches a fixed point rather than growing — `x=x` substitutes to `x` and
+  // stops — so "did it settle" is not the test. Nothing should survive substitution: every name
+  // becomes a value or `0`, and one still standing means it resolves to itself.
+  if (settled && hasBareName(expanded)) { settled = false; }
+  if (!settled) {
+    sh.errOut.pushAll(("sh: " + text + ": expression recursion level exceeded\n").toBytes());
+    sh.exiting = true;
+    sh.exitCode = 1;
+    return "";
+  }
+  i32 v = evaluate(expanded, state);
+  if (state.bad) {
+    // Fatal to the script, which is what bash does: `echo $((1/0)); echo after` prints neither
+    // and exits 1. An expansion that cannot produce a value leaves the command with no sensible
+    // argument, so carrying on would mean running it with something invented.
+    sh.errOut.pushAll(("sh: " + text + ": " + state.error + "\n").toBytes());
+    sh.exiting = true;
+    sh.exitCode = 1;
+    return "";
+  }
+  return itoa(v);
+}
+
+/**
+ * Replace bare identifiers with their values, leaving everything else alone.
+ *
+ * An unset or empty variable becomes `0`, which is what makes `$((count+1))` work on the first
+ * pass through a loop — and is also why a mistyped name is silent rather than an error.
+ */
+string substituteNames(Shell sh, string text) {
+  u8[] b = text.toBytes();
+  string out = "";
+  i32 i = 0;
+  while (i < b.len()) {
+    // `$x` and `${x}` mean the same as a bare `x` in here, so all three go the same way.
+    if (b[i] == 0x24) {
+      i32 j = i + 1;
+      bool braced = j < b.len() && b[j] == 0x7b;
+      if (braced) { j++; }
+      i32 start = j;
+      while (j < b.len() && isArithNameChar(b[j])) { j++; }
+      if (j > start) {
+        string value = sh.lookUp(text.slice(start, j));
+        out = out + (value == "" ? "0" : value);
+        if (braced && j < b.len() && b[j] == 0x7d) { j++; }
+        i = j;
+        continue;
+      }
+      // A lone `$`, which the evaluator will refuse.
+      out = out + "$";
+      i++;
+      continue;
+    }
+    if (isArithNameStart(b[i])) {
+      i32 start = i;
+      while (i < b.len() && isArithNameChar(b[i])) { i++; }
+      string name = text.slice(start, i);
+      string value = sh.lookUp(name);
+      out = out + (value == "" ? "0" : value);
+      continue;
+    }
+    // A number is copied across whole, so a digit is never mistaken for the start of a name.
+    if (b[i] >= 0x30 && b[i] <= 0x39) {
+      i32 start = i;
+      while (i < b.len() && b[i] >= 0x30 && b[i] <= 0x39) { i++; }
+      out = out + text.slice(start, i);
+      continue;
+    }
+    out = out + text.slice(i, i + 1);
+    i++;
+  }
+  return out;
+}
+
+/** Whether any identifier survives, which after full substitution means a cycle. */
+bool hasBareName(string text) {
+  u8[] b = text.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (isArithNameStart(b[i])) { return true; }
+  }
+  return false;
+}
+
+bool isArithNameStart(i32 c) {
+  return (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c == 0x5f;
+}
+
+bool isArithNameChar(i32 c) {
+  return isArithNameStart(c) || (c >= 0x30 && c <= 0x39);
+}
+
 string expandPart(Shell sh, Part p) {
   match (p.kind) {
     case Lit: return p.text;
     case Var: {
       if (p.op == "") { return sh.lookUp(p.text); }
-      if (p.op == "#") { return itoa(sh.lookUp(p.text).len()); }
+      if (p.op == "len") { return itoa(sh.lookUp(p.text).len()); }
 
       string value = sh.lookUp(p.text);
       // With a colon, "unset or empty" counts as absent; without one, only "unset" does.
@@ -814,6 +1029,14 @@ string expandPart(Shell sh, Part p) {
         ? value == ""
         : !sh.isSet(p.text);
       string last = p.op.slice(p.op.len() - 1, p.op.len());
+
+      // `#` and `%` trim a *pattern* off an end rather than substituting. They are the reason a
+      // shell can do `${f%.txt}` without calling anything, and the doubled forms take the
+      // longest match instead of the shortest.
+      if (p.op == "#") { return trimStart(sh, value, p.arg, false); }
+      if (p.op == "##") { return trimStart(sh, value, p.arg, true); }
+      if (p.op == "%") { return trimEnd(sh, value, p.arg, false); }
+      if (p.op == "%%") { return trimEnd(sh, value, p.arg, true); }
 
       if (last == "-") { return absent ? expandText(sh, p.arg) : value; }
       if (last == "+") { return absent ? "" : expandText(sh, p.arg); }
@@ -835,6 +1058,7 @@ string expandPart(Shell sh, Part p) {
       }
       return value;
     }
+    case Arith: return expandArith(sh, p.text);
     case Cmd: {
       // A command substitution runs the text as a script and takes its standard output, with
       // trailing newlines removed — the removal is why `x=$(pwd)` does not end in a newline.

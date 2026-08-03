@@ -48,6 +48,8 @@ export enum PartKind {
   Var,
   /** A command substitution's text, still unparsed: `$(…)`. */
   Cmd,
+  /** An arithmetic expression, still unparsed: `$((…))`. */
+  Arith,
 }
 
 /**
@@ -298,6 +300,31 @@ i32 lexDollar(u8[] s, i32 at, Token word, bool quoted) {
   i32 c = s[p];
 
   if (c == 0x28) {                                          // '('
+    // `$((…))` is arithmetic and `$(…)` is a command. They are told apart by the second
+    // character, and the arithmetic form has to be tried first — `$((1+2))` is a valid command
+    // substitution containing a subshell as far as the parenthesis counting is concerned, and
+    // would run `1+2` as a command rather than adding.
+    if (p + 1 < s.len() && s[p + 1] == 0x28) {
+      // Scan the expression itself, from just after `$((`, and stop at the `)` that is not
+      // closing something the expression opened. Counting from the `$((` instead makes the scan
+      // stop on the *second* of the two closing parens, and then the pair is never recognised.
+      i32 depth = 0;
+      i32 start = p + 2;
+      i32 q = start;
+      while (q < s.len()) {
+        if (s[q] == 0x28) { depth++; }
+        else if (s[q] == 0x29) {
+          if (depth == 0) { break; }
+          depth--;
+        }
+        q++;
+      }
+      if (q + 1 < s.len() && s[q] == 0x29 && s[q + 1] == 0x29) {
+        word.parts.push(Part.of(PartKind.Arith, sliceOf(s, start, q), quoted));
+        return q + 2;
+      }
+      // Not arithmetic after all — fall through and read it as a command substitution.
+    }
     i32 depth = 1;
     i32 start = p + 1;
     p++;
@@ -326,7 +353,9 @@ i32 lexDollar(u8[] s, i32 at, Token word, bool quoted) {
     i32 inner = start;
     // `${#x}` is the length of `x`, and the `#` comes before the name rather than after it.
     if (inner < p && s[inner] == 0x23 && p - inner > 1) {
-      word.parts.push(Part.expansion(sliceOf(s, inner + 1, p), quoted, "#", ""));
+      // Tagged `len` rather than `#`, because `#` is also the trim-prefix operator — `${#x}` is
+      // the length of x and `${x#p}` strips a prefix, and one tag cannot mean both.
+      word.parts.push(Part.expansion(sliceOf(s, inner + 1, p), quoted, "len", ""));
       return p + 1;
     }
     // The name runs until something that cannot be in one; whatever follows is the operator.
@@ -342,6 +371,13 @@ i32 lexDollar(u8[] s, i32 at, Token word, bool quoted) {
     i32 opEnd = nameEnd;
     if (s[opEnd] == 0x3a) { opEnd++; }                      // an optional leading ':'
     if (opEnd < p) { opEnd++; }                             // the operator character itself
+    // `#` and `%` double to mean *longest* match rather than shortest, so the pair has to be
+    // taken together — otherwise `${x##a}` reads as operator `#` over the pattern `#a`, which
+    // matches nothing and silently returns the value unchanged.
+    if (opEnd < p && opEnd > nameEnd) {
+      i32 first = s[opEnd - 1];
+      if ((first == 0x23 || first == 0x25) && s[opEnd] == first) { opEnd++; }
+    }
     word.parts.push(Part.expansion(name, quoted, sliceOf(s, nameEnd, opEnd),
                                    sliceOf(s, opEnd, p)));
     return p + 1;

@@ -1,0 +1,185 @@
+// Arithmetic expansion — the inside of `$((…))`.
+//
+// A small recursive-descent evaluator over integers. Worth having its own file because it shares
+// nothing with the rest of the shell: no words, no quoting, no expansion. Inside these
+// parentheses the shell's own rules stop applying, which is the point of them.
+//
+// The differences from the surrounding language are the things to keep straight:
+//
+//   **A bare name is a variable.** `$((x+1))` reads `x` without a dollar, because there is no
+//   word splitting in here for a dollar to protect against. `$x` also works and means the same.
+//
+//   **An unset or non-numeric variable is zero**, not an error. `$((undefined+1))` is 1. That is
+//   what makes `$((count+1))` work on the first pass through a loop, and it is also why a typo
+//   in a name is silent.
+//
+//   **Comparisons yield 1 and 0**, not a status. `$((a<b))` is a number to be used, and it is the
+//   *opposite* polarity to `test a -lt b`, whose success is 0. Two conventions a few characters
+//   apart, and the shell means both.
+//
+// Division by zero is an error rather than a value, because every answer would be a wrong one.
+
+export struct Arith {
+  u8[] src;
+  i32 at;
+  /** Set when something could not be evaluated; the result is then meaningless. */
+  bool bad;
+  string error;
+}
+
+/**
+ * Evaluate `text`. Numbers and operators only — **the caller substitutes variables first.**
+ *
+ * That split is not squeamishness about coupling. Substituting in the caller is what reproduces
+ * bash resolving a value that is itself an expression (`x=1+2` makes `$((x))` 3) and a value that
+ * names another variable (`a=b; b=c; c=7`), both of which need the shell's own lookup and a
+ * repeat pass. By the time anything gets here there are no names left, so an identifier is a
+ * malformed expression rather than something to resolve.
+ *
+ * `bad` on the returned state says whether the answer means anything.
+ */
+export i32 evaluate(string text, Arith state) {
+  state.src = text.toBytes();
+  state.at = 0;
+  state.bad = false;
+  state.error = "";
+
+  // `$(( ))` is zero, not an error. It falls out of `for ((;;))`-shaped code and bash says 0.
+  skipSpace(state);
+  if (state.at >= state.src.len()) { return 0; }
+
+  i32 v = parseOr(state);
+  skipSpace(state);
+  if (!state.bad && state.at < state.src.len()) {
+    fail(state, "unexpected character in arithmetic");
+  }
+  return v;
+}
+
+void fail(Arith a, string why) {
+  if (!a.bad) {
+    a.bad = true;
+    a.error = why;
+  }
+}
+
+void skipSpace(Arith a) {
+  while (a.at < a.src.len() && (a.src[a.at] == 32 || a.src[a.at] == 9)) { a.at++; }
+}
+
+/** Whether the next characters are `text`, and consume them if so. */
+bool eat(Arith a, string text) {
+  skipSpace(a);
+  u8[] want = text.toBytes();
+  if (a.at + want.len() > a.src.len()) { return false; }
+  for (i32 i = 0; i < want.len(); i++) {
+    if (a.src[a.at + i] != want[i]) { return false; }
+  }
+  // No guard against a one-character operator swallowing the first half of a two-character one:
+  // the callers try the longer form first, which is what actually decides it. A guard here as
+  // well was unreachable — `eat("<")` only runs after `eat("<=")` has failed, and `&` and `|`
+  // are never tried alone at all.
+  a.at += want.len();
+  return true;
+}
+
+i32 parseOr(Arith a) {
+  i32 left = parseAnd(a);
+  while (!a.bad && eat(a, "||")) {
+    i32 right = parseAnd(a);
+    left = (left != 0 || right != 0) ? 1 : 0;
+  }
+  return left;
+}
+
+i32 parseAnd(Arith a) {
+  i32 left = parseEquality(a);
+  while (!a.bad && eat(a, "&&")) {
+    i32 right = parseEquality(a);
+    left = (left != 0 && right != 0) ? 1 : 0;
+  }
+  return left;
+}
+
+i32 parseEquality(Arith a) {
+  i32 left = parseCompare(a);
+  while (!a.bad) {
+    if (eat(a, "==")) { left = left == parseCompare(a) ? 1 : 0; }
+    else if (eat(a, "!=")) { left = left != parseCompare(a) ? 1 : 0; }
+    else { return left; }
+  }
+  return left;
+}
+
+i32 parseCompare(Arith a) {
+  i32 left = parseSum(a);
+  while (!a.bad) {
+    // The two-character forms are tried first, or `<` would take the `<` of `<=`.
+    if (eat(a, "<=")) { left = left <= parseSum(a) ? 1 : 0; }
+    else if (eat(a, ">=")) { left = left >= parseSum(a) ? 1 : 0; }
+    else if (eat(a, "<")) { left = left < parseSum(a) ? 1 : 0; }
+    else if (eat(a, ">")) { left = left > parseSum(a) ? 1 : 0; }
+    else { return left; }
+  }
+  return left;
+}
+
+i32 parseSum(Arith a) {
+  i32 left = parseProduct(a);
+  while (!a.bad) {
+    if (eat(a, "+")) { left = left + parseProduct(a); }
+    else if (eat(a, "-")) { left = left - parseProduct(a); }
+    else { return left; }
+  }
+  return left;
+}
+
+i32 parseProduct(Arith a) {
+  i32 left = parseUnary(a);
+  while (!a.bad) {
+    if (eat(a, "*")) { left = left * parseUnary(a); }
+    else if (eat(a, "/")) {
+      i32 d = parseUnary(a);
+      if (d == 0) { fail(a, "division by 0"); return 0; }
+      left = left / d;
+    } else if (eat(a, "%")) {
+      i32 d = parseUnary(a);
+      if (d == 0) { fail(a, "division by 0"); return 0; }
+      left = left % d;
+    } else { return left; }
+  }
+  return left;
+}
+
+i32 parseUnary(Arith a) {
+  skipSpace(a);
+  if (eat(a, "!")) { return parseUnary(a) == 0 ? 1 : 0; }
+  if (eat(a, "-")) { return 0 - parseUnary(a); }
+  if (eat(a, "+")) { return parseUnary(a); }
+  return parsePrimary(a);
+}
+
+i32 parsePrimary(Arith a) {
+  skipSpace(a);
+  if (a.at >= a.src.len()) {
+    fail(a, "arithmetic ended early");
+    return 0;
+  }
+  if (eat(a, "(")) {
+    i32 v = parseOr(a);
+    if (!eat(a, ")")) { fail(a, "missing )"); }
+    return v;
+  }
+
+  i32 c = a.src[a.at];
+  if (c >= 0x30 && c <= 0x39) {
+    i32 v = 0;
+    while (a.at < a.src.len() && a.src[a.at] >= 0x30 && a.src[a.at] <= 0x39) {
+      v = v * 10 + (a.src[a.at] - 0x30);
+      a.at++;
+    }
+    return v;
+  }
+  fail(a, "unexpected character in arithmetic");
+  return 0;
+}

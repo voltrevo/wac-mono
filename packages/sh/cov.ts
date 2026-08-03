@@ -191,6 +191,37 @@ const SCRIPTS: string[] = [
   "x=1 true; echo [$x]", "x=0; x=1 true; echo $x", "x=1 y=2 true", "x=1 nosuchcommand",
   "x=1 exit 0", "x=$(echo v) true; echo [$x]",
 
+  // ── Arithmetic ──────────────────────────────────────────────────────────────
+  "echo $((1+2))", "echo $((5-2))", "echo $((2*3))", "echo $((7/2))", "echo $((7%2))",
+  "echo $(( (1+2)*3 ))", "echo $((2*3+4*5))", "echo $((-5))", "echo $((+5))", "echo $((!0))",
+  "echo $((1<2)) $((2<1)) $((1<=1)) $((2<=1))",
+  "echo $((2>1)) $((1>2)) $((1>=1)) $((1>=2))",
+  "echo $((1==1)) $((1==2)) $((1!=2)) $((1!=1))",
+  "echo $((1&&1)) $((1&&0)) $((0||1)) $((0||0))",
+  "x=5; echo $((x))", "x=5; echo $(($x))", "x=5; echo $((${x}))", "echo $((unset))",
+  "x=abc; echo $((x))", "x=-7; echo $((x))", "x=' 9 '; echo $((x))", "x=1+2; echo $((x))",
+  "echo $(( ))", "echo $((   ))", "echo $((0))",
+  "echo $((1/0))", "echo $((1%0))", "echo $((1+))", "echo $((a b))", "echo $(($))",
+  "echo $((()))", "echo $(((1))", "echo $((1)", "echo $(( (1 ))", "echo $(( (1+2 ))",
+  "echo $((!5))", "echo $((!!0))", "x=' 9 '; echo $((x))", "x='9 '; echo $((x))",
+  "x=' '; echo $((x))", "x=+4; echo $((x))", "x=-; echo $((x))",
+  "i=0; while test $i -lt 3; do i=$((i+1)); done; echo $i",
+  "echo $(echo plain)", "echo $( (echo sub) )",
+
+  // ── Trimming and bracket classes ────────────────────────────────────────────
+  "f=a.txt; echo ${f%.txt}", "f=a.b.c; echo ${f%.*}", "f=a.b.c; echo ${f%%.*}",
+  "p=/x/y/z; echo ${p#*/}", "p=/x/y/z; echo ${p##*/}", "p=/x/y/z; echo ${p%/*}",
+  "x=hello; echo ${x#h}", "x=hello; echo ${x%o}", "x=hello; echo ${x#no}", "x=hello; echo ${x%no}",
+  "x=abc; echo ${x#?}", "x=abc; echo ${x%%?}", "x=; echo [${x#a}]", "echo [${u#a}]",
+  "x=abc; echo ${x#}", "x=abc; echo ${x%}", "y=b; x=abc; echo ${x#$y}", "x=hello; echo ${#x}",
+  "case b in [abc]) echo y;; esac", "case d in [abc]) echo n;; esac",
+  "case q in [a-z]) echo y;; esac", "case Q in [a-z]) echo n;; esac",
+  "case 5 in [0-9]) echo y;; esac", "case x in [!abc]) echo y;; esac",
+  "case a in [!abc]) echo n;; esac", "case a in [^abc]) echo n;; esac",
+  "case - in [a-]) echo y;; esac", "case a in []a]) echo y;; esac",
+  "case a in [) echo n;; esac", "echo [", "echo []", "echo [abc",
+  "echo dir/[ot]*", "echo dir/[!o]*", "echo dir/[a-z]*",
+
   // ── Globbing ────────────────────────────────────────────────────────────────
   //
   // The fake `readDir` answers for `dir` and nothing else, so these reach both the matched and
