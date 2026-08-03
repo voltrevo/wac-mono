@@ -68,11 +68,26 @@ export struct Shell {
    * sets it to 0. Without this the two are indistinguishable by the time the status is chosen.
    */
   bool ranSub;
+  /**
+   * Standard input as a cursor rather than a byte array.
+   *
+   * `read` is the only thing that needs it, and it needs it badly: `while read line` has to see
+   * what is *left* on each turn, so a model where every command is handed the same whole array
+   * makes that loop run for ever on the first line. The position belongs to the shell rather
+   * than to a command because a compound's input is shared by everything inside it.
+   */
+  u8[] stdinBytes;
+  i32 stdinPos;
 
   Shell create(Core core, Cli cli) {
     return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
                  false, Buf.create(), Vec.create(), Map.create(hashString, stringEq),
-                 Vec.create(), Vec.create(), false);
+                 Vec.create(), Vec.create(), false, u8[0](), 0);
+  }
+
+  /** What standard input still has to offer. */
+  u8[] restOfStdin(const this) {
+    return sliceBytes(this.stdinBytes, this.stdinPos, this.stdinBytes.len());
   }
 
   /** Set a variable, remembering the name so the table can be copied later. */
@@ -239,6 +254,41 @@ u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
     case Subshell: { isSubshell = true; }
     else: {}
   }
+  // Standard input belongs to the compound, not to each simple command inside it: that is what
+  // makes `while read x; do …; done < file` advance through the file instead of restarting it.
+  u8[] savedIn = sh.stdinBytes;
+  i32 savedPos = sh.stdinPos;
+  bool ownInput = stdin.len() > 0;
+  if (ownInput) {
+    sh.stdinBytes = stdin;
+    sh.stdinPos = 0;
+  }
+  for (i32 i = 0; i < cmd.redirs.len(); i++) {
+    Redir r = cmd.redirs.get(i);
+    match (r.kind) {
+      case In: {
+        string path = joinWord(sh, r.target);
+        FileResult f = sh.cli.readFile(path).wait();
+        if (!f.ok) {
+          sh.errOut.pushAll(("sh: " + path + ": " + f.error + "\n").toBytes());
+          sh.status = 1;
+          sh.stdinBytes = savedIn;
+          sh.stdinPos = savedPos;
+          return u8[0]();
+        }
+        sh.stdinBytes = f.bytes;
+        sh.stdinPos = 0;
+        ownInput = true;
+      }
+      case Here: {
+        sh.stdinBytes = hereBody(sh, r);
+        sh.stdinPos = 0;
+        ownInput = true;
+      }
+      else: {}
+    }
+  }
+
   bool collect = !last || cmd.redirs.len() > 0 || isSubshell;
   bool savedCapture = sh.capture;
   Buf savedBuf = sh.outBuf;
@@ -305,6 +355,11 @@ u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
       sh.status = 0;
     }
     else: {}
+  }
+
+  if (ownInput) {
+    sh.stdinBytes = savedIn;
+    sh.stdinPos = savedPos;
   }
 
   if (!collect) { return u8[0](); }
@@ -393,7 +448,12 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
   }
 
   // An input redirection replaces whatever the pipeline was carrying.
+  //
+  // `hasInput` distinguishes "nothing came down a pipe" from "a pipe delivered nothing", because
+  // in the first case the shell's own cursor is still the input — that is how a `read` inside
+  // `while … done < file` sees the file rather than an empty stage.
   u8[] input = stdin;
+  bool hasInput = stdin.len() > 0;
   for (i32 i = 0; i < cmd.redirs.len(); i++) {
     Redir r = cmd.redirs.get(i);
     match (r.kind) {
@@ -406,24 +466,32 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
           return u8[0]();
         }
         input = f.bytes;
+        hasInput = true;
       }
       case Here: {
-        // The body is the input. Expansion, when the delimiter was unquoted, is exactly the
-        // inside-double-quotes rules: `$x` substitutes and nothing splits.
-        if (r.bodyExpand) {
-          Vec<Part> parts = lexQuotedText(r.body);
-          string expanded = "";
-          for (i32 j = 0; j < parts.len(); j++) { expanded = expanded + expandPart(sh, parts.get(j)); }
-          input = expanded.toBytes();
-        } else {
-          input = r.body.toBytes();
-        }
+        input = hereBody(sh, r);
+        hasInput = true;
       }
       else: {}
     }
   }
 
-  Output result = dispatch(sh, argv, input);
+  // Saved only when it is about to be replaced. Putting it back unconditionally would undo
+  // `read`'s own advance through it, and `while read` would never reach the end.
+  u8[] savedIn = sh.stdinBytes;
+  i32 savedPos = sh.stdinPos;
+  if (hasInput) {
+    sh.stdinBytes = input;
+    sh.stdinPos = 0;
+  }
+  // A program is handed what is left, not the whole thing, so `read a; cat` gives `cat` the
+  // remainder. It is not marked consumed afterwards: nothing here says which programs read their
+  // input, and guessing wrong in the other direction would silently drop bytes.
+  Output result = dispatch(sh, argv, sh.restOfStdin());
+  if (hasInput) {
+    sh.stdinBytes = savedIn;
+    sh.stdinPos = savedPos;
+  }
 
   // Put the prefix assignments back before anything else looks at them. Done even when the
   // command is exiting, so `x=1 exit` does not leave `x` behind in a shell that outlives it —
@@ -508,6 +576,127 @@ bool patternMatches(Shell sh, Word pattern, string subject) {
   return globMatch(field.bytes(), mask.bytes(), 0, subject.toBytes(), 0);
 }
 
+/**
+ * `read [-r] name…` — one line of standard input, split across the names.
+ *
+ * The last name takes everything left over, which is what makes `read key rest` a way to pull a
+ * field off the front of a line. Without `-r`, a backslash escapes the next character and a
+ * backslash at the end of a line joins the following one on.
+ *
+ * **Status 1 whenever the line was not ended by a newline**, which covers two cases that look
+ * different and are not: nothing left at all, and a partial last line. bash assigns the partial
+ * line *and* reports failure, so `while read x` drops the last line of a file that does not end
+ * in a newline — that is bash's behaviour, not an accident of this one, and matching it matters
+ * more than being kinder than it.
+ */
+Output readLine(Shell sh, Vec<string> argv) {
+  bool raw = false;
+  i32 first = 1;
+  while (first < argv.len() && argv.get(first) == "-r") { raw = true; first++; }
+
+  Vec<string> names = Vec.create();
+  for (i32 i = first; i < argv.len(); i++) { names.push(argv.get(i)); }
+  if (names.len() == 0) { names.push("REPLY"); }
+
+  bool sawAny = sh.stdinPos < sh.stdinBytes.len();
+  bool sawNewline = false;
+  Buf line = Buf.create();
+  // 1 where the byte arrived escaped. An escaped blank is a blank that cannot split, so the
+  // backslash has to survive as far as the splitting below rather than being dropped on the way:
+  // `read x y` over `a\ b` sets x to the whole `a b`, not to `a`.
+  Buf escaped = Buf.create();
+  bool joining = true;
+  while (joining) {
+    joining = false;
+    while (sh.stdinPos < sh.stdinBytes.len()) {
+      i32 c = sh.stdinBytes[sh.stdinPos];
+      sh.stdinPos++;
+      if (c == 10) { sawNewline = true; break; }
+      if (!raw && c == 0x5c && sh.stdinPos < sh.stdinBytes.len()) {
+        i32 n = sh.stdinBytes[sh.stdinPos];
+        sh.stdinPos++;
+        // A backslash-newline is a continuation: the line goes on, and neither character shows.
+        if (n == 10) { joining = true; break; }
+        line.push(n);
+        escaped.push(1);
+        continue;
+      }
+      line.push(c);
+      escaped.push(0);
+    }
+  }
+
+  if (!sawAny) {
+    for (i32 i = 0; i < names.len(); i++) { sh.setVar(names.get(i), ""); }
+    return Output(u8[0](), u8[0](), 1, true);
+  }
+
+  // Splitting is on blanks, and only the *last* name keeps the ones in the middle.
+  u8[] b = line.bytes();
+  u8[] esc = escaped.bytes();
+  i32 p = 0;
+  for (i32 i = 0; i < names.len(); i++) {
+    while (p < b.len() && isBlankAt(b, esc, p)) { p++; }
+    if (i == names.len() - 1) {
+      i32 end = b.len();
+      while (end > p && isBlankAt(b, esc, end - 1)) { end--; }
+      sh.setVar(names.get(i), string.fromBytes(sliceBytes(b, p, end)));
+      p = end;
+    } else {
+      i32 start = p;
+      while (p < b.len() && !isBlankAt(b, esc, p)) { p++; }
+      sh.setVar(names.get(i), string.fromBytes(sliceBytes(b, start, p)));
+    }
+  }
+  return Output(u8[0](), u8[0](), sawNewline ? 0 : 1, true);
+}
+
+/** Whether byte `i` of a read line is a blank that may split — an escaped one may not. */
+bool isBlankAt(u8[] b, u8[] esc, i32 i) {
+  return esc[i] == 0 && (b[i] == 32 || b[i] == 9);
+}
+
+/**
+ * `set` — the positional parameters, and nothing else.
+ *
+ * `set -- a b c` and `set a b c` replace `$1`…; `set --` clears them. The options (`-e`, `-u`,
+ * `-x`) are **refused rather than accepted and ignored**, because a `set -e` that did not stop
+ * on an error would be worse than one that does not exist.
+ *
+ * With no arguments bash lists every shell variable. This lists the ones this shell knows about,
+ * sorted, which is the same idea over a much smaller set — see the README.
+ */
+Output setBuiltin(Shell sh, Vec<string> argv) {
+  if (argv.len() == 1) {
+    Vec<string> sorted = Vec.create();
+    for (i32 i = 0; i < sh.varNames.len(); i++) { sorted.push(sh.varNames.get(i)); }
+    for (i32 i = 1; i < sorted.len(); i++) {
+      string key = sorted.get(i);
+      i32 j = i - 1;
+      while (j >= 0 && sorted.get(j) > key) { sorted.set(j + 1, sorted.get(j)); j--; }
+      sorted.set(j + 1, key);
+    }
+    string out = "";
+    for (i32 i = 0; i < sorted.len(); i++) {
+      Option<string> v = sh.vars.get(sorted.get(i));
+      if (v.isSome()) { out = out + sorted.get(i) + "=" + v.unwrap() + "\n"; }
+    }
+    return Output.ok(out.toBytes());
+  }
+
+  i32 first = 1;
+  string flag = argv.get(1);
+  if (flag == "--") { first = 2; }
+  else if (flag.len() > 0 && flag.toBytes()[0] == 0x2d) {
+    return Output.fail(("sh: set: " + flag + ": not supported\n").toBytes(), 2);
+  }
+
+  Vec<string> params = Vec.create();
+  for (i32 i = first; i < argv.len(); i++) { params.push(argv.get(i)); }
+  sh.params = params;
+  return Output.ok(u8[0]());
+}
+
 /** A function if one is defined, then a builtin, then an external program. */
 Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   string name = argv.get(0);
@@ -537,6 +726,17 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
     for (i32 i = 1; i < argv.len(); i++) { sh.vars.remove(argv.get(i)); }
     return Output.ok(u8[0]());
   }
+  if (name == "read") { return readLine(sh, argv); }
+  if (name == "shift") {
+    // bash: shifting more than there is fails and changes nothing, rather than clearing them.
+    i32 n = argv.len() > 1 ? atoiOr(argv.get(1), 0) : 1;
+    if (n < 0 || n > sh.params.len()) { return Output(u8[0](), u8[0](), 1, true); }
+    Vec<string> rest = Vec.create();
+    for (i32 i = n; i < sh.params.len(); i++) { rest.push(sh.params.get(i)); }
+    sh.params = rest;
+    return Output.ok(u8[0]());
+  }
+  if (name == "set") { return setBuiltin(sh, argv); }
   if (name == "test" || name == "[") { return test(sh, argv); }
   if (name == "help") { return help(); }
 
@@ -844,6 +1044,20 @@ bool globMatch(u8[] pat, u8[] quoted, i32 p, u8[] name, i32 n) {
     j++;
   }
   return j == name.len();
+}
+
+/**
+ * A here-document's body as bytes.
+ *
+ * Expansion happens only when the delimiter was unquoted, and then by exactly the
+ * inside-double-quotes rules: `$x` substitutes and nothing splits.
+ */
+u8[] hereBody(Shell sh, Redir r) {
+  if (!r.bodyExpand) { return r.body.toBytes(); }
+  Vec<Part> parts = lexQuotedText(r.body);
+  string expanded = "";
+  for (i32 i = 0; i < parts.len(); i++) { expanded = expanded + expandPart(sh, parts.get(i)); }
+  return expanded.toBytes();
 }
 
 u8[] sliceBytes(u8[] b, i32 from, i32 to) {

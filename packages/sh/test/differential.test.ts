@@ -325,6 +325,50 @@ esac`,
   `unset x; echo [$x]`,
   `x=1; unset x; echo [$x]`,
 
+  // ── read, set and shift ─────────────────────────────────────────────────────
+  //
+  // `read` is the only builtin that *consumes* standard input, so most of these are about the
+  // cursor: what the next read sees, and whether a loop over it ends. It ends because `read`
+  // fails when the line was not terminated by a newline — which also means bash drops the last
+  // line of input that has no newline, and so do we.
+  "echo x | { read a; echo [$a]; }",
+  "echo a b c | { read x y z; echo \"$x|$y|$z\"; }",
+  "echo a b c d | { read x y; echo \"$x|$y\"; }",
+  "echo a b | { read x; echo [$x]; }",
+  'echo "  a  b  " | { read x y; echo "[$x][$y]"; }',
+  "seq 1 2 | { read a; read b; echo \"$a-$b\"; }",
+  "seq 1 2 | { read a; read b; read c; echo $?; }",
+  "echo x | { read a; echo $?; }",
+  "echo | { read x; echo \"[$x]\" $?; }",
+  "echo -n ab | { read x; echo [$x] $?; }",
+  "echo hi | { read; echo [$REPLY]; }",
+  "seq 1 3 | while read x; do echo n$x; done",
+  "echo -n ab | while read x; do echo [$x]; done",
+  "seq 1 3 | while read x; do echo $x; done | wc -l",
+  "seq 1 4 | while read a b; do echo \"$a/$b\"; done",
+  "seq 1 3 | { read a; while read x; do echo w$x; done; }",
+  "while read x; do echo [$x]; done <<EOF\np\nq\nEOF",
+  "{ read a; cat; } <<EOF\none\ntwo\nthree\nEOF",
+  "read x < /dev/null; echo $?",
+  "echo '\\tt' | { read a b; echo \"[$a][$b]\"; }",
+  "echo 'a\\ b' | { read x y; echo \"[$x][$y]\"; }",
+  "echo 'a\\ b' | { read -r x y; echo \"[$x][$y]\"; }",
+  "echo 'a\\ b c' | { read x y; echo \"[$x][$y]\"; }",
+  "echo 'a\\\\b' | { read x; echo [$x]; }",
+  // The positional parameters, which until now nothing could change.
+  "set -- a b c; echo $# $1 $3",
+  "set a b c; echo \"$@\"",
+  "set -- a b c; shift; echo \"$@\"",
+  "set -- a b c; shift 2; echo \"$@\"",
+  "set -- a; shift 2; echo $?",
+  "set -- a; shift 2; echo \"$@\"",
+  "set --; echo [$#]",
+  "set -- a b c; while test $# -gt 0; do echo $1; shift; done",
+  "f() { shift; echo \"$@\"; }; f 1 2 3",
+  "set -- x; f() { set -- y; echo $1; }; f; echo $1",
+  "set -- a b; echo \"$*\"",
+  "shift; echo $?",
+
   // ── Backquotes ──────────────────────────────────────────────────────────────
   //
   // The same thing as `$(…)` once it is a part, so these are about the reading: where it ends,
