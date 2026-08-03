@@ -1,0 +1,324 @@
+// Reading the Tor directory: which relays exist, and what keys they use.
+//
+// This was TypeScript until the platform grew sockets, and it should never have been. The
+// only thing that ever made it host code was that a socket lived at the other end of it,
+// and parsing a document is not that. `packages/x509` parses DER here, `packages/http`
+// parses HTTP here; a consensus is no different.
+//
+// ## Parsing is not believing
+//
+// `parseConsensus` reads a document. It says nothing about whether the document is genuine,
+// and on its own it is not safe to build a circuit from: whoever answered the directory
+// request chose every byte of it. `consensus.wac` is what decides.
+//
+// ## Microdescriptors
+//
+// A client downloads the *microdescriptor* flavour of the consensus: each relay's entry is
+// a few lines plus the SHA-256 digest of a small separate document holding its keys. The
+// split exists because the keys are the bulk and change far less often than the flags and
+// bandwidth, so a client refetches the consensus hourly and the microdescriptors almost
+// never.
+//
+// The digest is **recomputed** over the microdescriptor text rather than read from any
+// annotation beside it. That recomputation is the only thing tying a key to the consensus
+// entry that named it — trust a cache's own labelling instead and a relay can serve a
+// microdescriptor holding somebody else's key.
+
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { decode } from "../../codec/src/base64.wac";
+import { Vec } from "../../std/src/vec.wac";
+
+/** A policy summary: `accept 80,443` or `reject 25,119,135-139`, ranges inclusive. */
+export struct ExitPolicy {
+  bool isAccept;
+  /** Flattened lo, hi, lo, hi. */
+  i32[] ranges;
+}
+
+/** A relay, with everything needed to open a circuit through it. */
+export struct Relay {
+  string nickname;
+  /** 20 bytes: SHA-1 of its RSA identity key. */
+  u8[] identity;
+  string address;
+  i32 orPort;
+  string[] flags;
+  /** Unpadded base64, the key into the microdescriptor set. */
+  string microdescDigest;
+  i32 bandwidth;
+
+  /** Empty until a microdescriptor is matched up. */
+  u8[] ntorOnionKey;
+  /**
+   * Absent means the relay carries nothing, which is not the same as "no policy".
+   *
+   * A microdescriptor omits the `p` line when the relay exits nowhere, so a missing summary
+   * is a reject-all and tor reads it that way. The Exit flag says the authorities saw it
+   * exit *something*; the summary says what.
+   */
+  ExitPolicy? exitPolicy;
+  /** As written. Only believed when mutual — see `pathsel.wac`. */
+  string[] family;
+}
+
+// ── Line and field scanning ──────────────────────────────────────────────────
+//
+// Byte-level rather than over `string`, because a directory document arrives as bytes and
+// the digests are taken over those same bytes. Turning it into a string first and back
+// again would put a re-encoding between the text that was signed and the text that is
+// hashed, which is exactly where a signature check goes quietly wrong.
+
+/** The end of the line starting at `at`, not counting the newline. */
+i32 lineEnd(u8[] doc, i32 at) {
+  for (i32 i = at; i < doc.len(); i++) {
+    if (doc[i] == '\n') { return i; }
+  }
+  return doc.len();
+}
+
+/** Split `doc[from..to]` on single spaces. */
+string[] fields(u8[] doc, i32 from, i32 to) {
+  Vec<string> out = Vec.create();
+  i32 start = from;
+  for (i32 i = from; i <= to; i++) {
+    if (i == to || doc[i] == ' ') {
+      if (i > start) {
+        u8[] f = u8[i - start]();
+        for (i32 j = 0; j < f.len(); j++) { f[j] = doc[start + j]; }
+        out.push(string.fromBytes(f));
+      }
+      start = i + 1;
+    }
+  }
+  return out.toArray();
+}
+
+bool lineStartsWith(u8[] doc, i32 at, i32 end, string prefix) {
+  u8[] p = prefix.toBytes();
+  if (end - at < p.len()) { return false; }
+  for (i32 i = 0; i < p.len(); i++) {
+    if (doc[at + i] != p[i]) { return false; }
+  }
+  return true;
+}
+
+/** A non-negative decimal, or -1 if `s` is not one. Deliberately not lenient. */
+export i32 parseInt(string s) {
+  u8[] b = s.toBytes();
+  if (b.len() == 0) { return -1; }
+  i32 v = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return -1; }
+    v = v * 10 + (b[i] - '0');
+    if (v > 1000000000) { return -1; }
+  }
+  return v;
+}
+
+/**
+ * Base64 as directory documents write it: unpadded.
+ *
+ * Empty on anything that does not decode, so a malformed field yields a relay that cannot
+ * be used rather than one built from rubbish.
+ */
+export u8[] unpaddedBase64(string s) {
+  i32 pad = (4 - (s.len() % 4)) % 4;
+  string padded = s;
+  for (i32 i = 0; i < pad; i++) { padded = padded + "="; }
+  u8[]? d = decode(padded.toBytes());
+  if (d is null) { return u8[0](); }
+  return d!;
+}
+
+// ── The consensus ────────────────────────────────────────────────────────────
+
+/**
+ * Every relay in a microdescriptor-flavour consensus.
+ *
+ * Lines that do not belong to a relay entry are skipped rather than rejected. A consensus
+ * carries a header, a footer and per-authority blocks this has no interest in, and a client
+ * that refused documents containing anything it did not recognise would break on the next
+ * field the authorities add.
+ */
+export Relay[] parseConsensus(u8[] doc) {
+  Vec<Relay> relays = Vec.create();
+  i32 at = 0;
+  while (at < doc.len()) {
+    i32 end = lineEnd(doc, at);
+
+    if (lineStartsWith(doc, at, end, "r ")) {
+      // r <nickname> <identity> <published> <time> <IP> <ORPort> <DirPort>
+      string[] f = fields(doc, at, end);
+      if (f.len() >= 8) {
+        i32 port = parseInt(f[6]);
+        relays.push(Relay(f[1], unpaddedBase64(f[2]), f[5], port < 0 ? 0 : port,
+                          string[0](), "", 0, u8[0](), null, string[0]()));
+      }
+    } else if (relays.len() > 0) {
+      Relay r = relays.get(relays.len() - 1);
+      if (lineStartsWith(doc, at, end, "m ")) {
+        string[] f = fields(doc, at, end);
+        if (f.len() >= 2) { r.microdescDigest = f[1]; }
+      } else if (lineStartsWith(doc, at, end, "s ")) {
+        string[] f = fields(doc, at, end);
+        Vec<string> flags = Vec.create();
+        for (i32 i = 1; i < f.len(); i++) { flags.push(f[i]); }
+        r.flags = flags.toArray();
+      } else if (lineStartsWith(doc, at, end, "w ")) {
+        string[] f = fields(doc, at, end);
+        for (i32 i = 1; i < f.len(); i++) {
+          if (f[i].len() > 10 && lineStartsWith(f[i].toBytes(), 0, f[i].len(), "Bandwidth=")) {
+            i32 bw = parseInt(f[i].slice(10, f[i].len()));
+            r.bandwidth = bw < 0 ? 0 : bw;
+          }
+        }
+      }
+    }
+    at = end + 1;
+  }
+  return relays.toArray();
+}
+
+/** Whether the relay carries `flag`. */
+export bool hasFlag(Relay r, string flag) {
+  for (i32 i = 0; i < r.flags.len(); i++) {
+    if (r.flags[i] == flag) { return true; }
+  }
+  return false;
+}
+
+// ── Exit policy summaries ────────────────────────────────────────────────────
+
+/**
+ * A `p` line's port list, flattened to lo, hi, lo, hi.
+ *
+ * An unparseable entry is dropped rather than guessed at. Under `accept` that narrows what
+ * the relay is believed to carry and under `reject` it widens it, so the safe direction
+ * differs by polarity and there is no single conservative default. Dropping keeps the
+ * summary honest about the parts that were understood.
+ */
+export ExitPolicy? parsePolicy(string line) {
+  u8[] b = line.toBytes();
+  string[] f = fields(b, 0, b.len());
+  if (f.len() != 3 || f[0] != "p") { return null; }
+  if (f[1] != "accept" && f[1] != "reject") { return null; }
+
+  Vec<i32> ranges = Vec.create();
+  u8[] list = f[2].toBytes();
+  i32 start = 0;
+  for (i32 i = 0; i <= list.len(); i++) {
+    if (i == list.len() || list[i] == ',') {
+      i32 dash = -1;
+      for (i32 j = start; j < i; j++) {
+        if (list[j] == '-' && dash < 0) { dash = j; }
+      }
+      u8[] part = u8[i - start]();
+      for (i32 j = 0; j < part.len(); j++) { part[j] = list[start + j]; }
+      if (dash < 0) {
+        i32 v = parseInt(string.fromBytes(part));
+        if (v >= 0) { ranges.push(v); ranges.push(v); }
+      } else {
+        i32 lo = parseInt(string.fromBytes(part).slice(0, dash - start));
+        i32 hi = parseInt(string.fromBytes(part).slice(dash - start + 1, part.len()));
+        if (lo >= 0 && hi >= 0) { ranges.push(lo); ranges.push(hi); }
+      }
+      start = i + 1;
+    }
+  }
+  return ExitPolicy(f[1] == "accept", ranges.toArray());
+}
+
+// ── Microdescriptors ─────────────────────────────────────────────────────────
+
+/**
+ * Match microdescriptors to the relays that named them, by recomputed digest.
+ *
+ * A cache file interleaves `@`-prefixed annotations that are not part of the digested text,
+ * so they are stripped before hashing. Each descriptor runs from an `onion-key` line to the
+ * next one.
+ */
+export void attachMicrodescriptors(Relay[] relays, u8[] text) {
+  i32 at = 0;
+  i32 bodyStart = -1;
+  while (at <= text.len()) {
+    i32 end = at < text.len() ? lineEnd(text, at) : text.len();
+    bool isStart = at < text.len() && end - at == 9 &&
+                   lineStartsWith(text, at, end, "onion-key");
+    if (isStart || at >= text.len()) {
+      if (bodyStart >= 0) { applyOne(relays, text, bodyStart, at); }
+      bodyStart = at;
+      if (at >= text.len()) { return; }
+    }
+    at = end + 1;
+  }
+}
+
+/** Digest one microdescriptor body and copy its fields onto whichever relay named it. */
+void applyOne(Relay[] relays, u8[] text, i32 from, i32 to) {
+  // Annotations are not part of what is hashed, and the body always ends with exactly one
+  // newline — both are what tor digests, and one byte either way changes the digest.
+  u8[] body = u8[0]();
+  i32 at = from;
+  while (at < to) {
+    i32 end = lineEnd(text, at);
+    if (end > at && text[at] != '@') {
+      u8[] grown = u8[body.len() + (end - at) + 1]();
+      for (i32 i = 0; i < body.len(); i++) { grown[i] = body[i]; }
+      for (i32 i = 0; i < end - at; i++) { grown[body.len() + i] = text[at + i]; }
+      grown[grown.len() - 1] = '\n';
+      body = grown;
+    }
+    at = end + 1;
+  }
+  if (body.len() == 0) { return; }
+
+  string digest = base64NoPad(sha256(body));
+  for (i32 i = 0; i < relays.len(); i++) {
+    if (relays[i].microdescDigest == digest) {
+      fillFrom(relays[i], body);
+    }
+  }
+}
+
+void fillFrom(Relay r, u8[] body) {
+  i32 at = 0;
+  while (at < body.len()) {
+    i32 end = lineEnd(body, at);
+    if (lineStartsWith(body, at, end, "ntor-onion-key ")) {
+      string[] f = fields(body, at, end);
+      if (f.len() >= 2) { r.ntorOnionKey = unpaddedBase64(f[1]); }
+    } else if (lineStartsWith(body, at, end, "p ")) {
+      u8[] line = u8[end - at]();
+      for (i32 i = 0; i < line.len(); i++) { line[i] = body[at + i]; }
+      r.exitPolicy = parsePolicy(string.fromBytes(line));
+    } else if (lineStartsWith(body, at, end, "family ")) {
+      string[] f = fields(body, at, end);
+      Vec<string> fam = Vec.create();
+      for (i32 i = 1; i < f.len(); i++) { fam.push(f[i]); }
+      r.family = fam.toArray();
+    }
+    at = end + 1;
+  }
+}
+
+/** Standard base64 with the padding stripped, which is how a consensus writes a digest. */
+export string base64NoPad(u8[] bytes) {
+  u8[] alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".toBytes();
+  u8[] out = u8[0]();
+  for (i32 i = 0; i < bytes.len(); i += 3) {
+    i32 have = bytes.len() - i;
+    i32 b0 = bytes[i];
+    i32 b1 = have > 1 ? bytes[i + 1] : 0;
+    i32 b2 = have > 2 ? bytes[i + 2] : 0;
+    i32 n = have > 2 ? 4 : (have > 1 ? 3 : 2);
+    u8[] grown = u8[out.len() + n]();
+    for (i32 j = 0; j < out.len(); j++) { grown[j] = out[j]; }
+    grown[out.len()] = alphabet[(b0 >> 2) & 63];
+    if (n > 1) { grown[out.len() + 1] = alphabet[((b0 << 4) | (b1 >> 4)) & 63]; }
+    if (n > 2) { grown[out.len() + 2] = alphabet[((b1 << 2) | (b2 >> 6)) & 63]; }
+    if (n > 3) { grown[out.len() + 3] = alphabet[b2 & 63]; }
+    out = grown;
+  }
+  return string.fromBytes(out);
+}
