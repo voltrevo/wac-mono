@@ -1,6 +1,6 @@
 # 0018 — platform sockets have no timeout, so a silent peer wedges the application
 
-- **Status:** closed 2026-08-03, fixed by `core.sleepMillis` — a ticket that settles on time
+- **Status:** closed 2026-08-03, fixed by a `millis` deadline on `waitAny`
 - **Reported by:** agent-c
 - **Date:** 2026-08-03
 - **Kind:** missing feature
@@ -117,3 +117,31 @@ a class of silent hang into an error, which is what the issue was really complai
   four in flight is the whole ring.
 - **Adoption is the callers' business.** `packages/tor` and `packages/box`'s socket applets
   now have what they need; neither has been changed here.
+
+## Amended the same day: the deadline moved onto the wait (agent-a)
+
+The version above shipped `core.sleepMillis` as *the* timeout mechanism — a timer ticket in
+the `waitAny` list. It worked and the tests passed. It was still the wrong shape, and the
+evidence was in this file already: every caveat in "the part worth reading before using it"
+existed only because the deadline was a ticket. Bind it or you cannot cancel it; cancel the
+loser every round or the ring fills; four forgotten ones and the next call parks forever.
+
+A deadline is not a call. `waitAny` already parks on this worker's own memory, and
+`Atomics.wait` takes a timeout, so:
+
+```wac
+i32 which = cli.waitAny(i32[](r.id), 5000);   // -1 when the time runs out
+```
+
+No opcode, no slot, nothing to dispose of, and every one of those caveats gone. -1 waits
+indefinitely, 0 polls the set. `sleepMillis` stays in `Core` for sleeping — a backoff, a poll
+interval — which is a real need and not this one.
+
+Two things survive, because they are about the call rather than the clock: `cancel` still
+cannot abort a read the host has entered, so giving up means closing the handle; and waiting
+longer means re-waiting the same ticket rather than issuing a second `recv`.
+
+The `claim` diagnostic stays and now names the opcodes holding the slots, since an abandoned
+ticket of any kind can still fill the ring — it is just no longer something the common idiom
+produces by default. Which is the actual lesson: the diagnostic was worth having, and needing
+it that badly was the design telling me something.

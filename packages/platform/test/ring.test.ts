@@ -7,8 +7,8 @@
 // answers do not have to come back in order, and a ticket cannot be confused with the one
 // that reused its slot.
 
-import { newBridge } from "../host/layout.ts";
-import { serveHostCalls } from "../host/respond.ts";
+import { SLOTS } from "../host/layout.ts";
+import { onWorker, SLOW, slowHandlers } from "./worker.ts";
 
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
@@ -19,53 +19,6 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
     );
   }
 }
-
-const CALL = import.meta.resolve("../host/call.ts");
-
-/**
- * Run a snippet on a worker with the bridge attached, and return what it posts back.
- *
- * The worker imports `call.ts` directly: this is a test of that module, not of the
- * capability world above it.
- */
-async function onWorker(body: string, handlers: Record<number, (p: Uint8Array) => Uint8Array | Promise<Uint8Array>>): Promise<unknown> {
-  const bridge = newBridge();
-  const responder = serveHostCalls(bridge, handlers);
-  const src = `
-    import { submit, collect, isDone, waitAny, cancel, hostCall, i32le, readI32le } from ${JSON.stringify(CALL)};
-    import { bridgeOf } from ${JSON.stringify(import.meta.resolve("../host/layout.ts"))};
-    self.onmessage = (e) => {
-      const b = bridgeOf(e.data);
-      try { self.postMessage({ ok: true, value: (() => { ${body} })() }); }
-      catch (err) { self.postMessage({ ok: false, error: String(err && err.message || err) }); }
-    };
-  `;
-  const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
-  const w = new Worker(url, { type: "module" });
-  try {
-    const r = await new Promise<{ ok: boolean; value?: unknown; error?: string }>((res) => {
-      w.onmessage = (e) => res(e.data);
-      w.postMessage(bridge.sab);
-    });
-    if (!r.ok) throw new Error(r.error);
-    return r.value;
-  } finally {
-    w.terminate();
-    responder.stop();
-    await responder.done;
-    URL.revokeObjectURL(url);
-  }
-}
-
-/** A capability that takes as long as its payload says, then answers with that number. */
-const SLOW = 1;
-const slowHandlers = {
-  [SLOW]: async (p: Uint8Array) => {
-    const ms = new DataView(p.buffer, p.byteOffset, p.byteLength).getInt32(0, true);
-    await new Promise((r) => setTimeout(r, ms));
-    return p;
-  },
-};
 
 Deno.test("submitting does not block, and calls overlap", async () => {
   // Three calls of 200ms each: 600ms serially, a little over 200 overlapped. The bound is
@@ -175,4 +128,39 @@ Deno.test("an error in one slot does not disturb the others", async () => {
   ) as { msg: string; good: number };
   assertEquals(out.msg, "deliberate", "the failure reached the caller");
   assertEquals(out.good, 60, "and the other call was unaffected");
+});
+
+Deno.test("as many calls in flight as there are slots, all waited on together", async () => {
+  // The count of slots is a ceiling on how many handles a program can watch: watching N means
+  // N outstanding `recv`s, each holding one. At four slots a program could watch three and
+  // still write — and `example/pipe.wac` watches three, so a three-stage pipeline was not
+  // writable. This is that ceiling, exercised at its new height.
+  //
+  // Worth testing rather than assuming, because nothing else in the suite puts more than four
+  // calls in flight: the slot count could have been decoration above four and no test would
+  // have noticed.
+  const out = await onWorker(
+    `
+    const ts = [];
+    for (let i = 0; i < ${SLOTS}; i++) ts.push(submit(b, ${SLOW}, i32le(60 + i)));
+
+    // Every one of them waited on as a set, taking each as it lands. The last iteration is
+    // the interesting one: a single-ticket list whose answer arrived long ago.
+    const order = [];
+    const live = ts.slice();
+    while (live.length > 0) {
+      const t = waitAny(b, live, -1);
+      order.push(readI32le(collect(b, t)) - 60);
+      live.splice(live.indexOf(t), 1);
+    }
+
+    // And the ring is fully free again, or this would throw rather than answer.
+    return order.join(",") + "|" + readI32le(collect(b, submit(b, ${SLOW}, i32le(7)))); 
+  `,
+    slowHandlers,
+  );
+  // Each call sleeps 60+i ms, so they settle in submission order — which also says the slots
+  // are independent rather than served in lockstep.
+  const expected = Array.from({ length: SLOTS }, (_, i) => i).join(",") + "|7";
+  assertEquals(out, expected, String(out));
 });

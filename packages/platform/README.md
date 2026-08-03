@@ -221,7 +221,7 @@ own memory — the wait is on the completion counter the host bumps, so it consu
 and cannot deadlock the ring. `nc`, an SSH relay and a shell all needed this and none of
 them could be written before it; polling `isDone` in a loop burns a core to avoid parking.
 
-Underneath, the bridge is a ring of four slots rather than one mailbox — see `layout.ts`.
+Underneath, the bridge is a ring of sixteen slots rather than one mailbox — see `layout.ts`.
 `Atomics.wait` takes a single address, so "wait until any of these finishes" is a wait on
 one completion counter followed by a rescan, which is also exactly what `poll` over sockets
 is. `hostCall` is still submit-then-collect and does the same atomics the single mailbox
@@ -230,43 +230,56 @@ package's suite.
 
 ### Deadlines
 
-Nothing bounds how long a capability may take, and a peer that finishes the handshake and
-then says nothing used to stop an application permanently — no error, no log line, no way to
-notice (issue 0018). The fix is not a timeout argument on `recv`. It is one capability,
-`core.sleepMillis`, returning a ticket that settles on *time* instead of on I/O:
+Nothing bounded how long a capability could take, and a peer that finished the handshake and
+then said nothing used to stop an application permanently — no error, no log line, no way to
+notice (issue 0018). The fix is a parameter on the wait:
 
 ```wac
 Pending<u8[]> r = cli.recv(h);
-Pending<i64> t = core.sleepMillis(5000);
-if (cli.waitAny(i32[](r.id, t.id)) == 1) {
+i32 which = cli.waitAny(i32[](r.id), 5000);   // -1 when the five seconds run out
+if (which < 0) {
   r.cancel();                  // stop waiting for the read
   cli.closeSocket(h);          // ...and stop the read itself
-} else {
-  t.cancel();                  // the deadline is moot; give its slot back
-  u8[] said = r.wait();
 }
 ```
 
-One capability rather than a `…Within` variant per call, and it bounds `connect`, `accept`,
-`readFile` or a child's `exitCode` with the same three lines. `example/patience.wac` is a
-worked version.
+`millis` of -1 waits as long as it takes, and 0 is a poll: "which of these is ready now, if
+any". Not a `recvWithin` — a deadline belongs to the wait rather than to each capability, so
+this one parameter bounds `connect`, `accept`, `readFile` or a child's `exitCode` without any
+of them knowing what a deadline is. `example/patience.wac` is a worked version.
 
-**A timeout is a decision the waiter makes.** It reaches neither the read the host has
-already entered nor the tickets `waitAny` did not pick, and both of those are traps:
+It costs nothing: `waitAny` was already a park on this worker's own memory, and `Atomics.wait`
+takes a timeout, so there is no opcode, no ring slot and nothing to dispose of.
 
-- **Bind the timer.** `core.sleepMillis(5000).id` written inline in the list is a leak that
-  cannot be fixed afterwards — there is nothing left to cancel. `waitAny` reports which
-  ticket settled and collects *nothing*, so every loser still holds a slot.
-- **Cancel is not abort** for a socket read; closing the handle is what makes it finish, and
-  the slot returns then. For a timer, cancel is immediate if it has fired and honoured if it
-  has not, which is better than a read manages.
-- **To wait longer, re-wait the same ticket** with a fresh timer. A second `recv` on a handle
-  whose first is outstanding means two reads on one socket and no defined byte order.
+**The first version of this was a timer ticket** — `core.sleepMillis(ms)` in the `waitAny`
+list, whichever settles first wins. It worked, and it was wrong in a way worth recording: the
+ticket cost a slot, could not be written inline (there would be nothing left to cancel), and
+had to be disposed of on every path. Four forgotten ones filled the ring, and the next call
+then parked forever — the same silent hang as the bug being fixed, arrived at from the other
+side. `sleepMillis` remains in `Core` for *sleeping*, which is a real need and a different one.
 
-Four abandoned tickets fill the ring. That used to park the next call forever — the same
-silent hang, reached from the other side — and now raises `all 4 call slots hold answers that
-were never taken`, because a ready slot can only be freed by the thread that submitted it, so
-a submitter finding all four ready is provably stuck rather than merely waiting.
+What stays the caller's problem, because it is about the call rather than the clock:
+
+- **Cancel is not abort** for a read the host has entered. Closing the handle is what makes it
+  finish, and the slot returns then. A timed-out `connect` has no handle yet, so its slot comes
+  back only when the host's own attempt does — worth knowing before retrying in a loop, since
+  four in flight is the whole ring.
+- **To wait longer, re-wait the same ticket.** A second `recv` on a handle whose first is
+  outstanding means two reads on one socket and no defined byte order.
+
+**The slot count is also a ceiling on how many handles a program can watch**, since watching N
+means N outstanding `recv`s holding N slots, and writing needs one more. It is sixteen rather
+than four for that reason: four meant three handles, and `pipe.wac` already watches three, so a
+three-stage pipeline could not be written. Exceeding it is worse than a limit — the held slots
+are RUNNING, not READY, so it is indistinguishable from backpressure and parks silently. The
+buffer per slot halved to pay for it, which costs round trips only on payloads above 128KB;
+interleaved warm runs of a 200MB `sha256sum` are 1.9s either way.
+
+A ticket abandoned rather than cancelled still fills a slot, so the ring keeps its backstop:
+`all 16 call slots hold answers that were never taken, from: RECV, RECV, …`.
+A ready slot can only be freed by the thread that submitted it, so a submitter finding all
+every slot ready is provably stuck rather than merely waiting — an error, not a park. It names
+the opcodes because the call that discovers the full ring is rarely the one that leaked.
 
 ## Spawning
 

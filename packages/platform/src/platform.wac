@@ -115,40 +115,16 @@ export struct Core {
    * monotonic nanoseconds at which it did — so `.wait()` is a sleep that tells you how far
    * it overshot.
    *
-   * Its reason for existing is the other use. Waited on beside another ticket it is a
-   * **timeout**, and one capability covers every call rather than each growing a
-   * `…Within` variant:
+   * **For a deadline, use `Cli.waitAny`'s `millis` instead.** This was originally built to
+   * be that: a timer ticket in the `waitAny` list, whichever lands first wins. It works, and
+   * it is the wrong shape — the ticket costs a ring slot, cannot be written inline (there
+   * would be nothing left to cancel), and has to be disposed of on every path or the ring
+   * fills up and the next call stops the program. `Atomics.wait` already takes a timeout, so
+   * the deadline needs no ticket, no slot and no cleanup at all.
    *
-   *     Pending<u8[]> r = cli.recv(h);
-   *     Pending<i64> t = core.sleepMillis(5000);
-   *     if (cli.waitAny(i32[](r.id, t.id)) == 1) {
-   *       // five seconds with nothing from the peer
-   *       r.cancel();                 // stop waiting on the read
-   *       cli.closeSocket(h);         // ...and stop the read itself
-   *     } else {
-   *       t.cancel();                 // the deadline is moot; give its slot back
-   *       u8[] said = r.wait();
-   *     }
-   *
-   * **Bind the timer.** Writing `core.sleepMillis(5000).id` inline into the list is a leak
-   * that cannot be fixed afterwards, because there is nothing left to cancel — and it is
-   * the shape that reads most naturally, which is why it is called out here. `waitAny`
-   * reports which ticket settled and collects *nothing*: every other ticket in the list is
-   * still holding a slot. Four of those and the next call has nowhere to go, which used to
-   * park forever and now raises "all 4 call slots hold answers that were never taken".
-   *
-   * Two more things, both consequences of a timeout being a decision the waiter makes
-   * rather than something done to the call:
-   *
-   * - **The call underneath is still running.** Nothing here can abort a read the host has
-   *   already entered — see `Pending.cancel`. To stop waiting *and* stop the work, close
-   *   the handle; that makes the read fail, and the cancelled ticket's slot comes back when
-   *   it does. To wait longer instead, wait on the **same** ticket again with a fresh
-   *   timer. Never issue a second `recv` on a handle whose first is outstanding: both would
-   *   read the same socket and the order the bytes arrive in is then anybody's guess.
-   * - **A timer holds a slot** like any other call, so watching three handles on a deadline
-   *   is four of the four in flight. `cancel` is *immediate* on a timer that has already
-   *   fired and honoured on one that has not, which is better than a socket read manages.
+   * What is left is sleeping, which this is good at and which `waitAny` cannot express: a
+   * retry backoff, a poll interval, a deliberate pause. It stays in `Core` because a clock
+   * is not authority and all three hosts have one.
    */
   fn[Pending<i64>(i32)] sleepMillis;
   /** Cryptographically secure random bytes. */
@@ -355,11 +331,11 @@ export struct Cli {
   fn[void(i32)] closeSocket;
 
   /**
-   * Block until one of these calls has an answer, and say which.
+   * Block until one of these calls has an answer, and say which — for at most `millis`.
    *
-   * Takes the `id` of each ticket and returns its index in the list, or -1 if the list is
-   * empty. Every id is accepted whatever its `Pending<T>` — a relay waits on a `recv` and
-   * an `accept` together, and their types differ.
+   * Takes the `id` of each ticket and returns its index in the list. Every id is accepted
+   * whatever its `Pending<T>`: a relay waits on a `recv` and an `accept` together, and
+   * their types differ.
    *
    * **This is the capability the ring exists for.** Overlapping two reads is a
    * convenience; waiting on whichever of two *sockets* speaks first is the difference
@@ -367,11 +343,29 @@ export struct Cli {
    * and `isDone` alone does not give it to them — polling `isDone` in a loop is a spin,
    * which burns a core to avoid parking.
    *
+   * `millis` is the deadline, and **-1 means wait as long as it takes**:
+   *
+   *     i32 w = cli.waitAny(i32[](r.id, a.id), -1);    // until one of them answers
+   *     i32 w = cli.waitAny(i32[](r.id), 5000);        // ...or five seconds, whichever first
+   *     i32 w = cli.waitAny(i32[](r.id), 0);           // which is ready right now, if any
+   *
+   * **Returns -1 when the time ran out**, and also for an empty list, which is the same
+   * statement: nothing settled. That is how a silent peer is survivable — see
+   * `example/patience.wac` — and it is why there is no `recvWithin`. A deadline belongs to
+   * the wait rather than to each capability, so this one parameter bounds `connect`,
+   * `accept`, `readFile` or a child's `exitCode` without any of them knowing about it.
+   *
+   * The deadline **costs nothing**: no opcode, no slot, no ticket to dispose of, because
+   * `Atomics.wait` takes a timeout and the wait is already in this worker's own memory. An
+   * earlier design passed a timer ticket in the list instead; it worked, and every caller
+   * had to remember to cancel the loser or lose a slot for good. `core.sleepMillis` remains
+   * for *sleeping*, which is a different thing from a deadline.
+   *
    * Blocking, and it reaches no further than this worker's own memory: the wait is on the
    * completion counter the host bumps, so it takes no slot and cannot deadlock the ring
    * however many tickets are outstanding.
    */
-  fn[i32(i32[])] waitAny;
+  fn[i32(i32[], i32)] waitAny;
 
   /**
    * Start a worker on `source`, with `args` as its arguments.
@@ -433,7 +427,7 @@ export struct Cli {
     fn[Pending<u8[]>(i32)] recv,
     fn[Pending<bool>(i32, u8[])] send,
     fn[void(i32)] closeSocket,
-    fn[i32(i32[])] waitAny,
+    fn[i32(i32[], i32)] waitAny,
     fn[Pending<Child>(string, string[])] spawn,
     fn[void(i32)] closeFeed,
     fn[Pending<i32>(i32)] exitCode

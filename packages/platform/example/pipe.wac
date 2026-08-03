@@ -17,7 +17,11 @@
 // Note the deadlock this cannot have. A shell pipeline needs an OS buffer between the stages,
 // and a stage that stops reading while the one before it keeps writing wedges both. Here the
 // three reads are in flight together, so a slow second stage parks this loop rather than the
-// first child, and the ring's four slots supply the backpressure.
+// first child, and the ring supplies the backpressure.
+//
+// It does need a slot per watched handle, plus one for the write. Two stages is four of
+// sixteen; it was four of four when the ring had four, which is why a third stage was not
+// something this could grow.
 
 import { Child, Cli, Core, FileResult, Pending } from "../src/platform.wac";
 
@@ -92,7 +96,7 @@ void pump(Cli cli, i32 a, i32 b) {
     if (aLive) { ids[k] = tA.id; from[k] = 1; k++; }
     ids[k] = tB.id; from[k] = 2;
 
-    i32 got = cli.waitAny(ids);
+    i32 got = cli.waitAny(ids, -1);
     if (got < 0) { return; }
 
     if (from[got] == 0) {

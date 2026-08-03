@@ -37,12 +37,25 @@ import {
   STATUS_MORE,
   SUBMIT_SEQ,
 } from "./layout.ts";
+import { OP } from "./ops.ts";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 /** Raised when a capability reports failure. The message is the host's. */
 export class HostCallError extends Error {}
+
+/**
+ * What a slot's opcode was, for diagnostics only.
+ *
+ * Worth the table: the mistake that fills the ring happens several calls before the error, so
+ * naming what is *holding* the slots is most of the way to which line was wrong.
+ */
+const OP_NAMES: Record<number, string> = Object.fromEntries(
+  Object.entries(OP).map(([name, op]) => [op, name]),
+);
+const opName = (op: number): string =>
+  op === OP_CONTINUE ? "a continued response" : (OP_NAMES[op] ?? `op ${op}`);
 
 /**
  * A call in flight.
@@ -60,8 +73,8 @@ function ping(b: Bridge): void {
 }
 
 /** Park until the host changes something, then look again. */
-function parkForHost(b: Bridge, seen: number): void {
-  Atomics.wait(b.ctrl, DONE_SEQ, seen);
+function parkForHost(b: Bridge, seen: number, millis = Infinity): void {
+  Atomics.wait(b.ctrl, DONE_SEQ, seen, millis);
 }
 
 /**
@@ -92,15 +105,17 @@ function claim(b: Bridge): number {
     //
     // Worth an error rather than a hang because the cause is a specific mistake with an
     // obvious fix, and because a silent permanent park is exactly the failure mode issue
-    // 0018 was filed about. `waitAny` returns which ticket settled and collects nothing, so
-    // the tickets that lost — most often a timer used as a deadline — are still holding
-    // slots until they are waited on or cancelled.
+    // 0018 was filed about. `waitAny` says which ticket settled and collects nothing, so a
+    // ticket that lost and was then forgotten keeps its slot for good.
     if (ready === SLOTS) {
+      const held: string[] = [];
+      for (let i = 0; i < SLOTS; i++) held.push(opName(Atomics.load(b.ctrl, slotAt(i) + S_OP)));
       throw new HostCallError(
-        `all ${SLOTS} call slots hold answers that were never taken. A ticket you stopped ` +
-          `waiting on has to be cancelled: waitAny tells you which one settled and collects ` +
-          `nothing, so the losers keep their slots. Bind the ticket and cancel() it — a ` +
-          `timer written inline in the waitAny list cannot be cancelled at all.`,
+        `all ${SLOTS} call slots hold answers that were never taken, from: ${held.join(", ")}. ` +
+          `A ticket you stopped waiting on has to be wait()ed or cancel()led — waitAny reports ` +
+          `which one settled and collects nothing, so the others keep their slots. The call ` +
+          `that failed here is only the first one to find the ring full; the abandoned ticket ` +
+          `is usually earlier.`,
       );
     }
     parkForHost(b, seen);
@@ -182,12 +197,20 @@ export function isDone(b: Bridge, t: Ticket): boolean {
  * address: every completion bumps that counter and the waiter rescans. This is also what
  * `poll` over sockets is — submit a `recv` on each and wait for whichever speaks first.
  */
-export function waitAny(b: Bridge, tickets: Ticket[]): Ticket | null {
+export function waitAny(b: Bridge, tickets: Ticket[], millis = -1): Ticket | null {
   if (tickets.length === 0) return null;
+  // `Atomics.wait` takes a timeout, so a deadline needs nothing from the host: no opcode, no
+  // slot, and nothing to clean up afterwards. A timer *ticket* would need all three, and the
+  // ticket nobody remembers to cancel is how the ring fills up.
+  const deadline = millis < 0 ? Infinity : performance.now() + millis;
   for (;;) {
     const seen = Atomics.load(b.ctrl, DONE_SEQ);
     for (const t of tickets) if (isDone(b, t)) return t;
-    parkForHost(b, seen);
+    // Checked after the scan, so a deadline of 0 is a poll of the set rather than a wait that
+    // always fails, and an already-settled ticket is reported even when the time is up.
+    const left = deadline - performance.now();
+    if (left <= 0) return null;
+    parkForHost(b, seen, left);
   }
 }
 

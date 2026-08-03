@@ -92,15 +92,14 @@ export function coreOf(
     (ms: number) => asI64(submit(b, OP.SLEEP_MILLIS, i32le(ms))),
     /*= randomBytes */
     (n: number) => asBytes(submit(b, OP.RANDOM_BYTES, i32le(n))),
+    /*= log */
     // Submitted *and collected*. A bare submit claims a slot the worker never gives
     // back, so four log lines exhausted the ring and the fifth call parked forever —
     // which showed up as `ls .` failing while `ls somefile` worked, because only the
     // former reached a log loop.
-    /*= log */
     (line: string) => { hostCall(b, OP.LOG, str(line)); },
     /*= warn */
-    (line: string) => { hostCall(b, OP.WARN, str(line)); },
-  );
+    (line: string) => { hostCall(b, OP.WARN, str(line)); });
 }
 
 /**
@@ -155,14 +154,11 @@ export function cliOf(
   const fileResult = (id: number) => {
     try {
       return cls.FileResult.of(true, collect(b, unpack(id)), "");
-    /*= argCount */
     } catch (e) {
       return cls.FileResult.of(false, EMPTY, e instanceof Error ? e.message : String(e));
-    /*= arg */
     }
   };
   const stat = (id: number) => {
-    /*= env */
     try {
       const out = collect(b, unpack(id));
       // exists, isFile, isDir as bytes, then size and mtime as little-endian i64s.
@@ -171,72 +167,50 @@ export function cliOf(
         out[0] === 1, out[1] === 1, out[2] === 1,
         dv.getBigInt64(3, true), dv.getBigInt64(11, true),
       );
-    /*= readStdin */
     } catch {
       return cls.Stat.of(false, false, false, 0n, 0n);
-    /*= write */
     }
   };
   const dirNames = (id: number) => {
-    /*= readFile */
     try {
       const out = collect(b, unpack(id));
       if (out.length === 0) return [];
       // NUL-separated: a filename may contain anything but a NUL or a slash.
       return unstr(out).split("\u0000");
-    /*= writeFile */
     } catch {
       return null;
-    /*= stat */
     }
   };
   const maybeText = (id: number) => {
-    /*= readDir */
     const out = collect(b, unpack(id));
     // One byte of presence in front, because an unset variable and an empty one are
     // different and a bare empty payload cannot say which this is.
-    /*= mkdir */
     return out[0] === 1 ? unstr(out.subarray(1)) : null;
   };
   const child = (id: number) => {
-    /*= remove */
     try {
       return cls.Child.of(readI32le(collect(b, unpack(id))), "");
-    /*= rename */
     } catch (e) {
       return cls.Child.of(-1, e instanceof Error ? e.message : String(e));
-    /*= openInput */
     }
   };
   const socket = (id: number) => {
-    /*= readChunk */
     try {
       return cls.Socket.of(readI32le(collect(b, unpack(id))), "");
-    /*= openOutput */
     } catch (e) {
       return cls.Socket.of(-1, e instanceof Error ? e.message : String(e));
-    /*= connect */
     }
   };
 
   const T = {
-    /*= listen */
     i32: (t: Ticket) => cls.Pending_i32.of(pack(t), i32, settled, drop),
-    /*= accept */
     text: (t: Ticket) => cls.Pending_string.of(pack(t), text, settled, drop),
-    /*= recv */
     outcome: (t: Ticket) => cls.Pending_string.of(pack(t), outcome, settled, drop),
-    /*= send */
     maybeText: (t: Ticket) => cls.Pending_stringOpt.of(pack(t), maybeText, settled, drop),
-    /*= closeSocket */
     bytes: (t: Ticket) => cls.Pending_u8Arr.of(pack(t), bytes, settled, drop),
-    /*= waitAny */
     chunk: (t: Ticket) => cls.Pending_u8Arr.of(pack(t), chunk, settled, drop),
-    /*= spawn */
     ok: (t: Ticket) => cls.Pending_bool.of(pack(t), ok, settled, drop),
-    /*= closeFeed */
     file: (t: Ticket) => cls.Pending_FileResult.of(pack(t), fileResult, settled, drop),
-    /*= exitCode */
     stat: (t: Ticket) => cls.Pending_Stat.of(pack(t), stat, settled, drop),
     dir: (t: Ticket) => cls.Pending_stringArrOpt.of(pack(t), dirNames, settled, drop),
     socket: (t: Ticket) => cls.Pending_Socket.of(pack(t), socket, settled, drop),
@@ -276,12 +250,17 @@ export function cliOf(
   };
 
   return cls.Cli.of(
+    /*= argCount */
     () => T.i32(submit(b, OP.ARG_COUNT, EMPTY)),
+    /*= arg */
     (i: number) => T.text(submit(b, OP.ARG, i32le(i))),
+    /*= env */
     (name: string) => T.maybeText(submit(b, OP.ENV, str(name))),
 
+    /*= readStdin */
     // stdin and stdout, which need no grant — see the note in platform.wac.
     () => T.bytes(submit(b, OP.READ_STDIN, EMPTY)),
+    /*= write */
     // Blocking, matching `platform.wac`: these two act on the current stream, which is
     // ordered anyway, and are handed to the streaming transforms as bare funcrefs.
     (bytes: Uint8Array) => {
@@ -293,16 +272,25 @@ export function cliOf(
       }
     },
 
+    /*= readFile */
     (path: string) => T.file(submit(b, OP.READ_FILE, str(path))),
+    /*= writeFile */
     (path: string, body: Uint8Array) => T.ok(submit(b, OP.WRITE_FILE, prefixed(str(path), body))),
+    /*= stat */
     (path: string) => T.stat(submit(b, OP.STAT, str(path))),
+    /*= readDir */
     (path: string) => T.dir(submit(b, OP.READ_DIR, str(path))),
 
+    /*= mkdir */
     (path: string, parents: boolean) => T.ok(submit(b, OP.MKDIR, flagged(parents, path))),
+    /*= remove */
     (path: string, recursive: boolean) => T.ok(submit(b, OP.REMOVE, flagged(recursive, path))),
+    /*= rename */
     (from: string, to: string) => T.ok(submit(b, OP.RENAME, twoPaths(from, to))),
 
+    /*= openInput */
     (path: string) => T.outcome(submit(b, OP.OPEN_INPUT, str(path))),
+    /*= readChunk */
     () => {
       try {
         return collect(b, submit(b, OP.READ_CHUNK, EMPTY));
@@ -310,33 +298,44 @@ export function cliOf(
         return EMPTY;   // unreadable is indistinguishable from ended, as it should be
       }
     },
+    /*= openOutput */
     (path: string) => T.outcome(submit(b, OP.OPEN_OUTPUT, str(path))),
 
+    /*= connect */
     (host: string, port: number) => T.socket(submit(b, OP.CONNECT, headed(i32le(port), str(host)))),
+    /*= listen */
     (port: number) => T.socket(submit(b, OP.LISTEN, i32le(port))),
+    /*= accept */
     (handle: number) => T.socket(submit(b, OP.ACCEPT, i32le(handle))),
+    /*= recv */
     (handle: number) => T.chunk(submit(b, OP.RECV, i32le(handle))),
+    /*= send */
     (handle: number, body: Uint8Array) => T.ok(submit(b, OP.SEND, headed(i32le(handle), body))),
+    /*= closeSocket */
     (handle: number) => { hostCall(b, OP.CLOSE_SOCKET, i32le(handle)); },
 
+    /*= waitAny */
     // No opcode: the wait is on the completion counter in this worker's own memory, so it
-    // takes no slot and the host is not involved. Returns the *index* rather than the id,
-    // because the caller already knows which ticket it put where.
-    (ids: Int32Array) => {
+    // takes no slot and the host is not involved — including the deadline, which is
+    // `Atomics.wait`'s own timeout. Returns the *index* rather than the id, because the
+    // caller already knows which ticket it put where, and -1 when the time ran out.
+    (ids: Int32Array, millis: number) => {
       const tickets = Array.from(ids, unpack);
-      const settled = waitAny(b, tickets);
+      const settled = waitAny(b, tickets, millis);
       if (settled === null) return -1;
       return tickets.findIndex((t) => t.slot === settled.slot && t.gen === settled.gen);
     },
 
+    /*= spawn */
     (source: string, args: string[]) =>
       // The source, length-prefixed, then the arguments NUL-separated — the same shape
       // `readDir` answers with, for the same reason: a filename or an argument may contain
       // anything but a NUL.
       T.child(submit(b, OP.SPAWN, prefixed(str(source), str(args.join("\u0000"))))),
+    /*= closeFeed */
     (handle: number) => { hostCall(b, OP.CLOSE_FEED, i32le(handle)); },
-    (handle: number) => T.i32(submit(b, OP.EXIT_CODE, i32le(handle))),
-  );
+    /*= exitCode */
+    (handle: number) => T.i32(submit(b, OP.EXIT_CODE, i32le(handle))));
 }
 
 export { HostCallError };

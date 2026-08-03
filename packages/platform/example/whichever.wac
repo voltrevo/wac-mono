@@ -27,7 +27,7 @@ export i32 main(Core core, Cli cli) {
   Pending<u8[]> ra = cli.recv(a.handle);
   Pending<u8[]> rb = cli.recv(b.handle);
 
-  i32 first = cli.waitAny(i32[](ra.id, rb.id));
+  i32 first = cli.waitAny(i32[](ra.id, rb.id), -1);
   core.log("first=" + itoa(first) + " said=" + trim(first == 0 ? ra.wait() : rb.wait()));
 
   // And the other one, which was never cancelled and is still running.

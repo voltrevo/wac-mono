@@ -27,26 +27,49 @@
 /**
  * How many calls one worker may have outstanding.
  *
- * Four rather than more because each slot costs its own payload space both ways, and the
- * point is to overlap a handful of operations rather than to queue hundreds. Submitting
- * with no free slot waits for one, which is backpressure rather than an error.
+ * **The count is a ceiling on how many handles a program can watch**, which is why it is
+ * sixteen rather than four. Watching N handles means N outstanding `recv`s holding N slots,
+ * and a program that also writes needs a slot for that — so four slots meant three handles,
+ * and `example/pipe.wac` already watches three. A three-stage pipeline was not writable:
+ * four reads in flight and the send has nowhere to go.
+ *
+ * That failure is worse than a limit, because it is not diagnosable. Held slots are RUNNING
+ * rather than READY — the host *will* answer each read, once the peer speaks, and the peer
+ * is waiting for the write that cannot be submitted. Indistinguishable from backpressure
+ * from inside `claim`, so it parks silently and forever. Raising the ceiling does not remove
+ * that shape; it moves it out to where real programs do not meet it.
+ *
+ * Submitting with no free slot still waits, which is backpressure rather than an error, and
+ * is correct whenever the outstanding calls will finish on their own.
  */
-export const SLOTS = 4;
+export const SLOTS = 16;
 
 /**
  * Payload bytes per slot, each way.
  *
- * `SLOTS * 2 * SLOT_BUF` is 2MB, which is exactly what the single mailbox cost, so a worker
- * is no more expensive than it was. Anything larger chunks, as it did when the buffer was
- * one megabyte — that machinery is per slot now.
+ * `SLOTS * 2 * SLOT_BUF` is 4MB. Sixteen slots at the old 256KB would have been 8MB, and
+ * halving the buffer to pay for four times the slots is the right side of that trade: the
+ * buffer only decides how many round trips a *large* payload takes, while the slot count
+ * decides which programs can be written at all.
+ *
+ * It must stay comfortably above `CHUNK`, not merely equal to it. A `send` of a full 64KB
+ * chunk carries a four-byte handle in front, so a 64KB buffer would chunk every streaming
+ * write in two — a round trip added to the hot path to save memory on the cold one.
+ *
+ * Measured on a 200MB file, which is the payload this actually governs — `sha256sum` reads it
+ * whole through the chunked response path. Interleaved runs of the old and new sizes are
+ * indistinguishable once the file is in page cache: 1.99, 1.92, 1.91s against 2.04, 2.00,
+ * 1.99s. The first run of either is three to five times that and is disk, which is why the
+ * comparison has to be interleaved and warm to say anything at all.
  */
-export const SLOT_BUF = 1 << 18;
+export const SLOT_BUF = 1 << 17;
 
 /**
  * What one `readChunk` hands back at most.
  *
- * Well under `SLOT_BUF`, so a chunk never itself needs chunking, and large enough that the
- * per-call round trip is noise next to the work done on it.
+ * Half of `SLOT_BUF`, so a chunk plus any header a capability puts in front of it never
+ * itself needs chunking, and large enough that the per-call round trip is noise next to the
+ * work done on it.
  */
 export const CHUNK = 1 << 16;
 
