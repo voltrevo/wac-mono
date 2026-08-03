@@ -325,6 +325,128 @@ esac`,
   `unset x; echo [$x]`,
   `x=1; unset x; echo [$x]`,
 
+  // ── Case conversion, and the special parameters' set-ness ───────────────────
+  //
+  // The doubled forms do every character and the single ones only the *first* — `${x^b}` of `abc`
+  // is unchanged rather than reaching forward to the `b`, which is a position and not a search.
+  // The argument is a pattern selecting which characters are eligible, and an absent one matches
+  // anything.
+  "x=abc; echo [${x^}]",
+  "x=Abc; echo [${x^}]",
+  "x=abc; echo [${x^^}]",
+  "x=ABC; echo [${x,}]",
+  "x=aBC; echo [${x,}]",
+  "x=ABC; echo [${x,,}]",
+  "x=abc; echo [${x^a}]",
+  "x=abc; echo [${x^b}]",
+  "x=abc; echo [${x,c}]",
+  "x=abc; echo [${x^^[ab]}]",
+  "x=abc; echo [${x,,[AB]}]",
+  "x=abc; echo [${x^^?}]",
+  'x=""; echo [${x^}]',
+  "x=a-b; echo [${x^^}]",
+  // `$?` and `$#` always have a value; `$@` and `$*` do not when there are no parameters. And
+  // `${#@}` counts them rather than measuring them joined, the one place `${#…}` is not a length.
+  "echo [${?-x}]",
+  "echo [${#-x}]",
+  "echo [${@-x}]",
+  "echo [${*-x}]",
+  "set -- a; echo [${@-x}]",
+  "set -- a; echo [${*-x}]",
+  "set -- a b; echo [${#@}]",
+  "set -- a b; echo [${#*}]",
+  "echo [${#@}]",
+  "set -- a; echo [${1-x}]",
+  "set -- a; echo [${2-x}]",
+  // An operator nothing implements is a bad substitution, not the value unchanged.
+  "x=abc; echo [${x!}]; echo after",
+
+  // ── Substrings ──────────────────────────────────────────────────────────────
+  //
+  // The only thing separating `${x:1:2}` from the `${x:-w}` family is what follows the colon,
+  // which is why `${x:-1}` is a default of `-1` and `${x: -1}` is the last character. Both are
+  // below, a space apart, because that is the whole difference and bash requires it for the same
+  // reason we do.
+  //
+  // A negative offset that reaches past the start gives the empty string rather than clamping to
+  // zero, and a negative *length* is a position rather than a count — which is why `${x:1:-1}` is
+  // the idiom for dropping the last character.
+  "x=abcdef; echo ${x:1:2}",
+  "x=abcdef; echo ${x:2}",
+  "x=abcdef; echo ${x:0:3}",
+  "x=abcdef; echo ${x:0}",
+  "x=abc; echo [${x::2}]",
+  "x=abc; echo [${x:1:}]",
+  "x=abcdef; echo ${x: -2}",
+  "x=abc; echo [${x: -9}]",
+  "x=abc; echo [${x:-9}]",
+  "x=abcdef; echo ${x:1:-1}",
+  "x=abc; echo ${x:9}",
+  "x=abc; echo ${x:1:0}",
+  "x=abc; echo [${x:1:9}]",
+  "x=abc; echo [${x:abc}]",
+  "x=abcdef; n=2; echo [${x:n}]",
+  "x=abcdef; n=2; echo [${x:n:n}]",
+  "x=abcdef; n=2; echo [${x:$n}]",
+  "x=abcdef; echo [${x:1+1}]",
+  "x=abcdef; a=1; b=3; echo [${x:a+b}]",
+  "x=abcdef; echo [${x:$((1+1)):2}]",
+  "set -- a b c; echo [${1:0:1}]",
+  "f=name.tar.gz; echo ${f:0:4}${f: -3}",
+  // A bad substitution is fatal: nothing printed, exit 1, and the rest of the line abandoned.
+  "x=abc; echo [${x:}]; echo after",
+  "x=abc; echo [${x:1:-9}]; echo after",
+  "x=abc; echo ${#x:1}; echo after",
+
+  // ── printf, which has a language of its own ──────────────────────────────────
+  //
+  // The three rules that are not guessable: the format is *reused* until the arguments run out, a
+  // missing argument is not an error, and a bad *number* is reported and then used as zero anyway
+  // while a bad *format* aborts. That last pair is the one worth having cases for — bash prints
+  // the `ab` of `printf "ab%z"` before giving up, so it is an abort and not a discard.
+  String.raw`printf "hi\n"`,
+  `printf hi`,
+  String.raw`printf "%s\n" a b c`,
+  String.raw`printf "%s-%s\n" a b c d`,
+  String.raw`printf "%s-%s\n" a`,
+  String.raw`printf "%d %d\n" 1`,
+  String.raw`printf "no args %s|\n"`,
+  String.raw`printf "%s\n" ""`,
+  `printf ""`,
+  `printf "%s"`,
+  `printf`,
+  String.raw`printf "%d\n" 42`,
+  String.raw`printf "%d\n" -42`,
+  String.raw`printf "%d\n" abc`,
+  String.raw`printf "%5s|\n" ab`,
+  String.raw`printf "%-5s|\n" ab`,
+  String.raw`printf "%03d\n" 7`,
+  String.raw`printf "%03d\n" -7`,
+  String.raw`printf "%.2s|\n" abcdef`,
+  String.raw`printf "%x %X %o\n" 255 255 8`,
+  String.raw`printf "%c" abc`,
+  String.raw`printf "%%\n"`,
+  String.raw`printf "a\tb\n"`,
+  String.raw`printf "\x41\n"`,
+  String.raw`printf "\x4a\n"`,
+  String.raw`printf "\x4A\n"`,
+  String.raw`printf "\xZ\n"`,
+  String.raw`printf "%x\n" abc`,
+  String.raw`printf "\101\n"`,
+  String.raw`printf "a\qb\n"`,
+  // A bad format aborts, keeping what came before it.
+  String.raw`printf "%z\n" x`,
+  `printf "%"`,
+  `printf "ab%"`,
+  String.raw`printf "ab%z\n" x`,
+  `printf "%s%z" a b`,
+  // And it composes, which is why it was worth having: input with no trailing newline.
+  String.raw`printf "%s\n" a | wc -l`,
+  String.raw`printf "a\nb\n" | rev`,
+  String.raw`printf "b\na\nb\n" | sort | uniq`,
+  String.raw`printf "one two\n" | { read a b; echo "[$a][$b]"; }`,
+  String.raw`printf "no-newline" | { read x; echo "[$x]" $?; }`,
+
   // ── Pattern substitution ────────────────────────────────────────────────────
   //
   // Three things here are not guessable from the shorter forms, and each has a pair below:

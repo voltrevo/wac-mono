@@ -59,6 +59,32 @@ export function importPaths(src: string): string[] {
   return out;
 }
 
+/**
+ * The same walk over sources already in memory, with no I/O.
+ *
+ * For callers holding a whole tree — the mutation harness holds every `.wac` file in the repo,
+ * and patches them in place — handing all of it to `wacCompile` is both slower and *wrong*: one
+ * unrelated file that does not parse then fails every compilation, whatever the entry was. This
+ * narrows the map to what the entry actually imports, so a broken file matters only to the
+ * entries that reach it.
+ *
+ * A missing import is left out rather than thrown on, so the compiler reports it against the
+ * import that asked for it instead of this walk failing somewhere less useful.
+ */
+export function wacFilesIn(all: Map<string, string>, entry: string): Map<string, string> {
+  const files = new Map<string, string>();
+  const queue = [entry];
+  while (queue.length > 0) {
+    const path = queue.shift()!;
+    if (files.has(path)) continue;
+    const src = all.get(path);
+    if (src === undefined) continue;
+    files.set(path, src);
+    for (const spec of importPaths(src)) queue.push(resolveFrom(path, spec));
+  }
+  return files;
+}
+
 export async function wacFiles(entry: string): Promise<Map<string, string>> {
   const files = new Map<string, string>();
   const queue = [entry];

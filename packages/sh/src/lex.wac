@@ -535,7 +535,11 @@ i32 lexDollar(u8[] s, i32 at, Token word, bool quoted) {
 
     i32 inner = start;
     // `${#x}` is the length of `x`, and the `#` comes before the name rather than after it.
-    if (inner < p && s[inner] == 0x23 && p - inner > 1) {
+    //
+    // But `${#-x}` is *not* a length — it is the parameter `#` with a default, because what
+    // follows the `#` is an operator rather than a name. bash answers `0` there, so this cannot
+    // take everything up to the brace and call it a name.
+    if (inner < p && s[inner] == 0x23 && p - inner > 1 && isNameRun(s, inner + 1, p)) {
       // Tagged `len` rather than `#`, because `#` is also the trim-prefix operator — `${#x}` is
       // the length of x and `${x#p}` strips a prefix, and one tag cannot mean both.
       word.parts.push(Part.expansion(sliceOf(s, inner + 1, p), quoted, "len", ""));
@@ -552,15 +556,27 @@ i32 lexDollar(u8[] s, i32 at, Token word, bool quoted) {
       return p + 1;
     }
     i32 opEnd = nameEnd;
-    if (s[opEnd] == 0x3a) { opEnd++; }                      // an optional leading ':'
+    if (s[opEnd] == 0x3a) {
+      // `${x:1:2}` is a substring, and the *only* thing that distinguishes it from the `${x:-w}`
+      // family is what follows the colon. Deciding it here is what keeps `${x:-1}` (a default of
+      // `-1`) apart from `${x: -1}` (the last character) — the space is the whole difference, and
+      // bash needs it for exactly this reason.
+      i32 after = opEnd + 1;
+      if (after >= p || !isColonOp(s[after])) {
+        word.parts.push(Part.expansion(name, quoted, ":", sliceOf(s, after, p)));
+        return p + 1;
+      }
+      opEnd++;
+    }
     if (opEnd < p) { opEnd++; }                             // the operator character itself
-    // `#`, `%` and `/` all double, and the pair has to be taken together — otherwise `${x##a}`
+    // `#`, `%`, `/`, `^` and `,` all double, and the pair has to be taken together — otherwise `${x##a}`
     // reads as operator `#` over the pattern `#a`, which matches nothing and silently returns the
     // value unchanged. `#` and `%` doubled mean *longest* match rather than shortest; `/` doubled
     // means *every* match rather than the first.
     if (opEnd < p && opEnd > nameEnd) {
       i32 first = s[opEnd - 1];
-      if ((first == 0x23 || first == 0x25 || first == 0x2f) && s[opEnd] == first) { opEnd++; }
+      if ((first == 0x23 || first == 0x25 || first == 0x2f || first == 0x5e || first == 0x2c)
+          && s[opEnd] == first) { opEnd++; }
     }
     word.parts.push(Part.expansion(name, quoted, sliceOf(s, nameEnd, opEnd),
                                    sliceOf(s, opEnd, p)));
@@ -619,6 +635,22 @@ bool escapableInBackquote(i32 c) {
 bool isDelimiter(i32 c) {
   return c == 32 || c == 9 || c == 10 || c == 0x7c || c == 0x26 || c == 0x3b
       || c == 0x3c || c == 0x3e || c == 0x28 || c == 0x29;
+}
+
+/** Whether `s[from..to]` is a name, or one of the parameters that may stand in for one. */
+bool isNameRun(u8[] s, i32 from, i32 to) {
+  if (to <= from) { return false; }
+  if (to - from == 1 && (s[from] == 0x40 || s[from] == 0x2a)) { return true; }   // @ *
+  if (!isNameStart(s[from])) { return false; }
+  for (i32 i = from + 1; i < to; i++) {
+    if (!isNameChar(s[i])) { return false; }
+  }
+  return true;
+}
+
+/** The four operators a colon may introduce. Anything else after a colon is a substring. */
+bool isColonOp(i32 c) {
+  return c == 0x2d || c == 0x3d || c == 0x3f || c == 0x2b;   // - = ? +
 }
 
 bool isNameStart(i32 c) {

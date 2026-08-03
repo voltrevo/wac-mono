@@ -71,6 +71,19 @@ const SCRIPTS: string[] = [
   "echo hello | tr a-z A-Z", "echo abc | tr a- X", "echo a-c | tr -- - _", "echo abc | tr z-a X",
   'echo abc | tr a-c ""', 'echo abc | tr "" X', "echo abc | tr -- a b", "echo abc | tr X z-a",
   "seq 3", "seq 2 4", "seq 4 2", "seq", "seq 1 3 | nl", "echo -n '' | nl",
+  String.raw`printf "hi\n"`, "printf", String.raw`printf "%s\n" a b c`,
+  String.raw`printf "%d\n" abc`, String.raw`printf "%d\n" -1`, String.raw`printf "%d\n" +1`,
+  String.raw`printf "%d\n" -`, String.raw`printf "%d\n" ""`, String.raw`printf "%s-%s\n" a`,
+  String.raw`printf "%5s|" ab`, String.raw`printf "%-5s|" ab`, String.raw`printf "%03d" 7`,
+  String.raw`printf "%03d" -7`, String.raw`printf "%05s" ab`, String.raw`printf "%.2s" abc`,
+  String.raw`printf "%.0s" abc`, String.raw`printf "%x %X %o" 255 255 8`,
+  String.raw`printf "%x" 0`, String.raw`printf "%x" -255`, String.raw`printf "%c" abc`,
+  String.raw`printf "%c" ""`, String.raw`printf "%%"`, String.raw`printf "%z" x`,
+  "printf '%'", "printf 'ab%'", String.raw`printf "\n\t\r\\\\\a\b\f\v\e"`,
+  String.raw`printf "\x41"`, String.raw`printf "\x4a"`, String.raw`printf "\x4A"`,
+  String.raw`printf "\x"`, String.raw`printf "\xZ"`, String.raw`printf "%x" abc`,
+  String.raw`printf "\101"`, String.raw`printf "\0101"`, String.raw`printf "\q"`,
+  "printf '\\'", String.raw`printf "%s" a b c d`,
 
   // ── Command substitution ────────────────────────────────────────────────────
   "echo $(echo a)", `echo "$(echo a)"`, "echo $(false)", "echo $(seq 1 3)",
@@ -192,6 +205,22 @@ const SCRIPTS: string[] = [
   // Prefix assignments, which are restored afterwards — including the unset case.
   "x=1 true; echo [$x]", "x=0; x=1 true; echo $x", "x=1 y=2 true", "x=1 nosuchcommand",
   "x=1 exit 0", "x=$(echo v) true; echo [$x]",
+
+  // ── Case conversion ─────────────────────────────────────────────────────────
+  "x=abc; echo ${x^}", "x=abc; echo ${x^^}", "x=ABC; echo ${x,}", "x=ABC; echo ${x,,}",
+  "x=abc; echo ${x^a}", "x=abc; echo ${x^b}", "x=abc; echo ${x^^[ab]}", "x=abc; echo ${x,,[AB]}",
+  "x=; echo ${x^}", "x=abc; echo ${x!}", "x=abc; echo ${x&}", "x=abc; echo ${x^^?}",
+  "echo ${?-x}", "echo ${#-x}", "echo ${@-x}", "echo ${*-x}", "set -- a; echo ${@-x}",
+  "set -- a b; echo ${#@}", "set -- a b; echo ${#*}",
+
+  // ── Substrings ──────────────────────────────────────────────────────────────
+  "x=abcdef; echo ${x:1:2}", "x=abcdef; echo ${x:2}", "x=abc; echo ${x::2}",
+  "x=abc; echo ${x:1:}", "x=abcdef; echo ${x: -2}", "x=abc; echo ${x: -9}",
+  "x=abcdef; echo ${x:1:-1}", "x=abc; echo ${x:1:-9}", "x=abc; echo ${x:9}",
+  "x=abc; echo ${x:1:9}", "x=abc; echo ${x:}", "x=abc; echo ${x:abc}",
+  "x=abcdef; n=2; echo ${x:n:n}", "x=abcdef; echo ${x:$((1+1)):2}", "x=abc; echo ${x:0}",
+  "echo ${x:1}", "x=abc; echo ${#x:1}", "x=abc; echo ${#x}", "echo ${#?}", "echo ${#1}",
+  "echo ${#@}", "echo ${#nosuch}", "echo ${#1x}", 'echo "${#x-}"',
 
   // ── Arithmetic ──────────────────────────────────────────────────────────────
   "echo $((1+2))", "echo $((5-2))", "echo $((2*3))", "echo $((7/2))", "echo $((7%2))",

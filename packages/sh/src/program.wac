@@ -55,6 +55,7 @@ export Output run(Cli cli, Vec<string> argv, u8[] stdin) {
   if (name == "tr") { return tr(argv, stdin); }
   if (name == "seq") { return seq(argv); }
   if (name == "nl") { return nl(stdin); }
+  if (name == "printf") { return printf(argv); }
 
   return Output.missing();
 }
@@ -64,11 +65,217 @@ export Vec<string> names() {
   Vec<string> out = Vec.create();
   out.push("cat"); out.push("wc"); out.push("head"); out.push("tail"); out.push("rev");
   out.push("sort"); out.push("uniq"); out.push("grep"); out.push("tr"); out.push("seq");
-  out.push("nl");
+  out.push("nl"); out.push("printf");
   return out;
 }
 
 // ── The programs ──────────────────────────────────────────────────────────────
+
+/**
+ * `printf FORMAT [ARGS]` — the only one of these with a language of its own.
+ *
+ * Three rules do most of the work and none of them is guessable:
+ *
+ *   **The format is reused until the arguments run out.** `printf "%s-%s\n" a b c d` prints two
+ *   lines, not one. Only a format that actually consumed something repeats, or one with no
+ *   conversions in it would loop for ever.
+ *
+ *   **A missing argument is not an error.** `printf "%s-%s\n" a` prints `a-` — the second
+ *   conversion gets the empty string, and `%d` gets zero. That is what makes a format safe to
+ *   write once and feed a variable number of values.
+ *
+ *   **A bad number is reported and then used anyway.** `printf "%d" abc` writes `0` to standard
+ *   output, complains on standard error, and exits 1. All three, not one of them.
+ *
+ * A bad *format* is different from a bad argument: an unknown conversion character, or a `%` with
+ * nothing after it, stops the whole thing. What was already produced still goes out — bash prints
+ * the `ab` of `printf "ab%z"` and then gives up — so this is an abort, not a discard.
+ *
+ * Escapes are processed in the *format*, which is why `printf` is the way to emit a line with no
+ * trailing newline and `echo` is not.
+ */
+Output printf(Vec<string> argv) {
+  if (argv.len() < 2) {
+    return Output.fail("printf: usage: printf format [arguments]\n".toBytes(), 2);
+  }
+  u8[] f = argv.get(1).toBytes();
+  Buf out = Buf.create();
+  Buf err = Buf.create();
+  i32 status = 0;
+  i32 arg = 2;
+  bool again = true;
+  bool fatal = false;
+
+  while (again && !fatal) {
+    again = false;
+    i32 consumedThisPass = 0;
+    i32 i = 0;
+    while (i < f.len() && !fatal) {
+      if (f[i] == 0x5c) { i = escapeInto(out, f, i); continue; }
+      if (f[i] != 0x25) { out.push(f[i]); i++; continue; }
+
+      i32 j = i + 1;
+      if (j < f.len() && f[j] == 0x25) { out.push(0x25); i = j + 1; continue; }
+
+      bool left = false;
+      bool zero = false;
+      while (j < f.len() && (f[j] == 0x2d || f[j] == 0x30)) {
+        if (f[j] == 0x2d) { left = true; } else { zero = true; }
+        j++;
+      }
+      i32 width = 0;
+      while (j < f.len() && f[j] >= 0x30 && f[j] <= 0x39) { width = width * 10 + (f[j] - 0x30); j++; }
+      i32 prec = -1;
+      if (j < f.len() && f[j] == 0x2e) {
+        j++;
+        prec = 0;
+        while (j < f.len() && f[j] >= 0x30 && f[j] <= 0x39) { prec = prec * 10 + (f[j] - 0x30); j++; }
+      }
+      // A `%` with nothing after it is a format error, not a literal `%`.
+      if (j >= f.len()) {
+        err.pushAll("printf: `%': missing format character\n".toBytes());
+        status = 1;
+        fatal = true;
+        continue;
+      }
+
+      i32 conv = f[j];
+      string a = arg < argv.len() ? argv.get(arg) : "";
+      string text = "";
+      bool numeric = false;
+      bool known = true;
+
+      if (conv == 0x73) {                                   // 's'
+        text = (prec >= 0 && prec < a.len()) ? a.slice(0, prec) : a;
+      } else if (conv == 0x63) {                            // 'c'
+        text = a.len() > 0 ? a.slice(0, 1) : "";
+      } else if (conv == 0x64 || conv == 0x69) {            // 'd', 'i'
+        numeric = true;
+        if (a != "" && !isNumber(a)) {
+          err.pushAll(("printf: " + a + ": invalid number\n").toBytes());
+          status = 1;
+        }
+        text = itoa(atoi(a));
+      } else if (conv == 0x78 || conv == 0x58 || conv == 0x6f) {   // 'x', 'X', 'o'
+        numeric = true;
+        if (a != "" && !isNumber(a)) {
+          err.pushAll(("printf: " + a + ": invalid number\n").toBytes());
+          status = 1;
+        }
+        text = inBase(atoi(a), conv == 0x6f ? 8 : 16, conv == 0x58);
+      } else {
+        known = false;
+      }
+
+      if (!known) {
+        err.pushAll(("printf: `%" + charFor(conv) + "': invalid format character\n").toBytes());
+        status = 1;
+        fatal = true;
+        continue;
+      }
+      arg++;
+      consumedThisPass++;
+      // Zero-padding is a numeric thing: `%05s` pads with spaces, as it does in bash.
+      padInto(out, text, width, left, zero && numeric);
+      i = j + 1;
+    }
+    if (!fatal && consumedThisPass > 0 && arg < argv.len()) { again = true; }
+  }
+  return Output(out.take(), err.take(), status, true);
+}
+
+/** One backslash escape from the format, appended. Returns the index after it. */
+i32 escapeInto(Buf out, u8[] f, i32 at) {
+  if (at + 1 >= f.len()) { out.push(0x5c); return at + 1; }
+  i32 c = f[at + 1];
+  if (c == 0x6e) { out.push(10); return at + 2; }            // \n
+  if (c == 0x74) { out.push(9); return at + 2; }             // \t
+  if (c == 0x72) { out.push(13); return at + 2; }            // \r
+  if (c == 0x5c) { out.push(0x5c); return at + 2; }          // \\
+  if (c == 0x61) { out.push(7); return at + 2; }             // \a
+  if (c == 0x62) { out.push(8); return at + 2; }             // \b
+  if (c == 0x66) { out.push(12); return at + 2; }            // \f
+  if (c == 0x76) { out.push(11); return at + 2; }            // \v
+  if (c == 0x65) { out.push(27); return at + 2; }            // \e
+  if (c == 0x78) {                                           // \xHH
+    i32 p = at + 2;
+    i32 v = 0;
+    i32 n = 0;
+    while (p < f.len() && n < 2 && hexValue(f[p]) >= 0) { v = v * 16 + hexValue(f[p]); p++; n++; }
+    if (n == 0) { out.push(0x5c); out.push(0x78); return at + 2; }
+    out.push(v);
+    return p;
+  }
+  if (c >= 0x30 && c <= 0x37) {                              // \NNN, and \0NNN for the same thing
+    i32 p = at + 1;
+    if (f[p] == 0x30 && p + 1 < f.len() && f[p + 1] >= 0x30 && f[p + 1] <= 0x37) { p++; }
+    i32 v = 0;
+    i32 n = 0;
+    while (p < f.len() && n < 3 && f[p] >= 0x30 && f[p] <= 0x37) { v = v * 8 + (f[p] - 0x30); p++; n++; }
+    out.push(v & 0xFF);
+    return p;
+  }
+  // Anything else keeps its backslash, as bash does — `\q` is two characters.
+  out.push(0x5c);
+  return at + 1;
+}
+
+i32 hexValue(i32 c) {
+  if (c >= 0x30 && c <= 0x39) { return c - 0x30; }
+  if (c >= 0x61 && c <= 0x66) { return c - 0x61 + 10; }
+  if (c >= 0x41 && c <= 0x46) { return c - 0x41 + 10; }
+  return -1;
+}
+
+/** Whether the whole string is a number, so `%d` can say so before using it as zero. */
+bool isNumber(string s) {
+  u8[] b = s.toBytes();
+  i32 i = 0;
+  if (i < b.len() && (b[i] == 0x2d || b[i] == 0x2b)) { i++; }
+  if (i >= b.len()) { return false; }
+  for (; i < b.len(); i++) {
+    if (b[i] < 0x30 || b[i] > 0x39) { return false; }
+  }
+  return true;
+}
+
+/** A non-negative number in base 8 or 16. Negatives keep their sign rather than wrapping. */
+string inBase(i32 v, i32 base, bool upper) {
+  if (v == 0) { return "0"; }
+  bool neg = v < 0;
+  i32 n = neg ? 0 - v : v;
+  string out = "";
+  while (n > 0) {
+    i32 d = n % base;
+    i32 c = d < 10 ? 0x30 + d : (upper ? 0x41 + d - 10 : 0x61 + d - 10);
+    out = charFor(c) + out;
+    n = n / base;
+  }
+  return neg ? "-" + out : out;
+}
+
+string charFor(i32 c) {
+  u8[] one = u8[1]();
+  one[0] = c;
+  return string.fromBytes(one);
+}
+
+/** `text` padded to `width`, on the right if `left`, with zeros if `zero`. */
+void padInto(Buf out, string text, i32 width, bool left, bool zero) {
+  i32 gap = width - text.len();
+  if (gap <= 0) { out.pushAll(text.toBytes()); return; }
+  if (left) {
+    out.pushAll(text.toBytes());
+    for (i32 i = 0; i < gap; i++) { out.push(32); }
+    return;
+  }
+  // A zero-padded negative number keeps its sign in front of the zeros: `-007`, not `00-7`.
+  u8[] b = text.toBytes();
+  i32 from = 0;
+  if (zero && b.len() > 0 && b[0] == 0x2d) { out.push(0x2d); from = 1; }
+  for (i32 i = 0; i < gap; i++) { out.push(zero ? 0x30 : 32); }
+  for (i32 i = from; i < b.len(); i++) { out.push(b[i]); }
+}
 
 Output cat(Cli cli, Vec<string> argv, u8[] stdin) {
   if (argv.len() == 1) { return Output.ok(stdin); }
