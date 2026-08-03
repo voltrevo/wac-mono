@@ -39,11 +39,13 @@ u8[] resolveBytes(i32 id) { return u8[id](); }
 Pending<i64> fakeNow() { return Pending.of(0, resolveZero, alwaysSettled, ignoreDrop); }
 Pending<i64> fakeMonotonic() { return Pending.of(0, resolveZero, alwaysSettled, ignoreDrop); }
 Pending<u8[]> fakeRandom(i32 n) { return Pending.of(n, resolveBytes, alwaysSettled, ignoreDrop); }
+/** Time does not pass here, so a sleep is already over. The shell never asks for one anyway. */
+Pending<i64> fakeSleep(i32 millis) { return Pending.of(0, resolveZero, alwaysSettled, ignoreDrop); }
 void fakeLog(string s) {}
 void fakeWarn(string s) {}
 
 Core fakeCore() {
-  return Core.of(fakeNow, fakeMonotonic, fakeRandom, fakeLog, fakeWarn);
+  return Core.of(fakeNow, fakeMonotonic, fakeSleep, fakeRandom, fakeLog, fakeWarn);
 }
 
 // ── Cli ───────────────────────────────────────────────────────────────────────
