@@ -452,11 +452,24 @@ enter it. Concurrency means more instances.
 
 ## What is not here yet
 
-- **A browser provider.** Deno and Node are done; a browser needs cross-origin isolation
-  for `SharedArrayBuffer`, and has no filesystem or argv, so it is `Core` alone.
+- **Grants for children.** A spawned child gets nothing. That is the safe end of the range
+  and not the useful middle: `example/inetd.wac` cannot serve a shell that may read one
+  directory. The narrowing is the whole point of preferring `spawn` to process spawn, so
+  this is the next thing worth doing here. Note that a child's own build-time grants are
+  already irrelevant — the world it is handed decides — so this is a change to `OP.SPAWN`'s
+  request, not to the shebang.
+- **`spawn` on Node.** Deno only. `host/children.ts` takes `startWorld` as a parameter
+  precisely so Node can follow without editing it, and nobody has written that side.
+  Browser is a separate question: `Worker` exists there, but a page has no filesystem to
+  read a bundle from, so what `spawn` should even take is undecided.
 - **A service shape.** `run(this) -> i32` is the CLI application. A long-running server
   wants `onBytes(this, u8[]) -> Served`, which `packages/server` already defines and drives
   from its own host; folding it into the launcher is the next step.
-- **Outbound network.** Nothing prevents it — the bridge makes `fetch` expressible — but no
-  capability for it has been designed, and it is the one most in need of a considered
-  answer about what an application should be able to reach.
+- **An OS process.** Deliberately not here, and not planned — see wac-mono issue 0015,
+  closed `wontfix`. Running arbitrary host programs is a non-goal: it makes every grant
+  transitive, and the interesting artefact turned out to be the other one, where a child is
+  a wac program with grants its parent chose.
+
+Two things this section used to list are done: the browser provider (`--target browser`,
+though see issue 0016 — it has never run in an actual browser) and outbound network
+(`connect`/`listen`/`accept`).

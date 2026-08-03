@@ -178,3 +178,62 @@ export string test_the_windows_stop_a_sender_that_gets_no_credit() {
 }
 
 i32 relayStreamOf(u8[] body) { return (body[3] << 8) | body[4]; }
+
+export string test_a_hop_cannot_crash_us_with_a_bad_length_field() {
+  // Found by fuzzing. `relayPayload` used to trap when the two-byte length field exceeded
+  // the 498 bytes a body holds, and `receive` called it on every recognised cell — so one
+  // malformed cell from a hop in our own path aborted the client.
+  //
+  // "Authenticated" is not "friendly": a hop is chosen from a public directory and is
+  // exactly the adversary the three-hop design assumes. The circuit is finished either way;
+  // what this pins down is that saying so is a verdict and not a crash.
+  T t = T.create();
+  u8[] m = material(41);
+  Circuit c = Circuit.create(11, m);
+  Hop relay = Hop.create(swapped(m));
+
+  // A body the relay digests correctly, carrying a length no body could hold.
+  u8[] body = u8[509]();
+  body[0] = relayData();
+  body[3] = 0;
+  body[4] = 1;
+  body[9] = 0xFF;
+  body[10] = 0xFF;
+  // Encrypt it the way the relay would, so it passes the digest check and reaches the parse.
+  u8[] wire = encodeFixed(11, cmdRelay(), encryptRelayRaw(relay, body));
+
+  Received r = c.receive(wire);
+  t.eqI32(r.kind, gotBroken(), "a length past the end is a dead circuit, not an abort");
+
+  // And the boundary is where the spec puts it, not one either side.
+  t.isTrue(lengthAccepted(498), "498 bytes is the whole body and is fine");
+  t.isTrue(!lengthAccepted(499), "499 is one too many");
+  return t.report();
+}
+
+/** Whether a body claiming `len` bytes is accepted. */
+bool lengthAccepted(i32 len) {
+  u8[] m = material(42);
+  Circuit c = Circuit.create(12, m);
+  Hop relay = Hop.create(swapped(m));
+  u8[] body = u8[509]();
+  body[0] = relayData();
+  body[4] = 1;
+  body[9] = (len >> 8) & 0xFF;
+  body[10] = len & 0xFF;
+  Received r = c.receive(encodeFixed(12, cmdRelay(), encryptRelayRaw(relay, body)));
+  return r.kind != gotBroken();
+}
+
+/**
+ * Digest and encrypt a body the relay has already built.
+ *
+ * `encryptRelay` builds its own body from a command and data, which cannot express a length
+ * field that disagrees with the data — which is the whole point of this test.
+ */
+u8[] encryptRelayRaw(Hop hop, u8[] body) {
+  hop.forwardDigest.update(body);
+  u8[] digest = hop.forwardDigest.peek();
+  for (i32 i = 0; i < 4; i++) { body[5 + i] = digest[i]; }
+  return hop.forwardCipher.apply(body);
+}

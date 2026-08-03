@@ -106,8 +106,14 @@ path would therefore turn every working command into a spawn failure, which is a
 the one we already had. It also makes the whole thing opt-in: with `$WACPATH` unset nothing is
 spawned and the behaviour is exactly what it was.
 
-Then a **table of programs written in wac**, when nothing was spawned — which is the fallback the
-seam was designed for, and still the only thing available when there is no bundle to run:
+There is no `/bin/ls`, and there is not going to be:
+[issue 0015](../../issues/closed/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md)
+was closed `wontfix`, so running host programs is a settled non-goal rather than a pending gap.
+What replaces it is a wac program run with grants the parent chooses — which is more than this
+package expected to settle for.
+
+Then a **table of programs written in wac**, when nothing was spawned — the fallback the seam was
+designed for, and still the only thing available where there is no bundle to run:
 
 ```
 cat wc head tail rev sort uniq grep tr seq nl
@@ -117,12 +123,10 @@ The single seam was the point, and it paid off: wiring `spawn` in changed no par
 redirection, status or `&&` handling, because all of it was already written against `Output`. The
 stubs became what they were meant to be — a fallback for when the real program is absent.
 
-What is still missing is a *process*: `spawn` runs wac, not `/bin/ls`, and grants a child nothing
-but its two streams. See
-[issue 0015](../../issues/open/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md)
-for what remains, and
-[0020](../../issues/open/0020-a-spawned-worker-that-does-not-parse-kills-the-parent.md) for the
-first thing a shell trips over — a bundle that does not parse takes the shell down with it instead
+A child is granted nothing but its two streams, so a program that needs the filesystem cannot be
+run as one yet — that is `packages/platform`'s roadmap rather than an issue here. And see
+[0021](../../issues/open/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md) for the
+first thing a shell trips over: a bundle that does not parse takes the shell down with it instead
 of coming back as a failed command.
 
 **The signature is the design decision.** Bytes in, bytes out, a status, and a `found` flag —

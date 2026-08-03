@@ -280,12 +280,12 @@ prints `PTY allocation request failed on channel 0` and carries on with the clie
 editing, which is the same thing a real sshd gives you when no pty is available. No prompt is
 written, because without a pty a real shell is not interactive and prints none.
 
-**It still cannot start a process** —
-[issue 0015](../../issues/open/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md).
-The shell's external commands are its own, written in wac; `help` lists them. What changed is that
-there is a shell between the client and them, not that there is a system underneath. That remains
-the *only* reason this is not an sshd: the transport, key exchange, cipher and channel layer are
-the same code the client uses.
+**It still cannot start a process, and now it never will** —
+[issue 0015](../../issues/closed/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md)
+is closed `wontfix`, because running host programs is a non-goal. The shell's external commands are
+its own, written in wac; `help` lists them. What changed is that there is a shell between the client
+and them, not that there is a system underneath. That remains the *only* reason this is not an
+sshd: the transport, key exchange, cipher and channel layer are the same code the client uses.
 
 The reach is bounded by what the server was granted. With `--allow-read` alone a client can read
 what the server can read and write nothing. That is a real exposure whose size the operator

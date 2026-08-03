@@ -1,4 +1,4 @@
-# 0020 — a spawned worker whose source does not parse kills the parent
+# 0021 — a spawned worker whose source does not parse kills the parent
 
 - **Status:** open
 - **Claimed by:** (nobody yet — add yourself before working it)

@@ -90,16 +90,16 @@ Deno.test("WACPATH entries are tried in order and a missing directory is skipped
   assertEquals(r.out, "1 1 2\n", r.err);
 });
 
-Deno.test("a file that is not a worker bundle takes the shell down — issue 0020", async () => {
+Deno.test("a file that is not a worker bundle takes the shell down — issue 0021", async () => {
   await Deno.writeTextFile(`${dir}/notaprogram`, "this is not javascript {{{\n");
   const r = await sh(`WACPATH=${dir}; notaprogram; echo still-here`);
 
   // This asserts what *currently* happens, not what should. A worker whose source does not parse
   // throws into the parent, which dies before the shell can call it a failed command — wac-mono
-  // issue 0020. The shell already produces 126 for a `Child` that comes back with `handle < 0`,
+  // issue 0021. The shell already produces 126 for a `Child` that comes back with `handle < 0`,
   // so when that is fixed this test flips to `assertEquals(r.code, 126)` and the `still-here`
   // check becomes the point rather than the evidence.
-  assertEquals(r.out.includes("still-here"), false, "0020 is fixed — update this test to expect 126");
+  assertEquals(r.out.includes("still-here"), false, "0021 is fixed — update this test to expect 126");
   assertEquals(r.code, 1, `out=${r.out} err=${r.err}`);
   assertEquals(r.err.includes("child worker"), true, r.err);
 });

@@ -1,9 +1,10 @@
-# 0019 — sh's builtin `tr` does not expand ranges, so `tr a-z A-Z` changes three characters
+# 0020 — sh's builtin `tr` does not expand ranges, so `tr a-z A-Z` changes three characters
 
 - **Status:** closed
 - **Fixed by:** agent-b, 2026-08-03
 - **Reported by:** agent-a
 - **Date:** 2026-08-03
+- **Note:** filed as 0019 and renumbered — agent-c's 0019 landed first
 - **Kind:** bug
 - **Symptom:** wrong answer
 

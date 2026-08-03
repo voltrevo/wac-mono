@@ -38,7 +38,7 @@
 import { Vec } from "../../std/src/vec.wac";
 import {
   Hop, encryptRelay, decryptRelay, relayRecognized, relayCommand, relayStreamId,
-  relayPayload, beginBody, extend2Body, extended2Reply, sendmeBodyV1,
+  relayPayload, relayLengthValid, beginBody, extend2Body, extended2Reply, sendmeBodyV1,
   relayBegin, relayData, relayEnd, relayConnected, relaySendme, relayBeginDir,
   relayExtend2, relayExtended2,
 } from "./relay.wac";
@@ -154,6 +154,12 @@ export struct Circuit {
     }
     if (from < 0) { return Received(gotBroken(), 0, u8[0](), u8[0]()); }
 
+    // A length field past the end of the body is a protocol violation by a hop we have
+    // already authenticated — which it is entitled to be, being a stranger from a directory.
+    // The circuit is finished either way; what matters is that saying so is not a crash.
+    if (!relayLengthValid(payload)) {
+      return Received(gotBroken(), 0, u8[0](), u8[0]());
+    }
     i32 command = relayCommand(payload);
     i32 streamId = relayStreamId(payload);
     u8[] data = relayPayload(payload);
