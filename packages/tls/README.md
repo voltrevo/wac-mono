@@ -188,3 +188,30 @@ composes both ways: TLS over a socket, TLS over a Tor stream, HTTP over either. 
 `Deno.Conn`'s rather than a nicer one of our own precisely so that no adapter is needed at
 any boundary — a real socket satisfies it structurally, and so does anything written to
 match.
+
+## Fuzzing
+
+`test/wac/fuzz_test.wac` feeds the record layer, the wire reader and the whole client bytes
+a server chose. This is a stricter position than most parsing in the repo: nothing has
+authenticated when these run, and `parseCert` in particular runs on a chain *before* the
+chain is verified, because you cannot check a signature you have not parsed.
+
+It found one thing. `tlsClientFeed` aborted when handed anything after the connection had
+already failed — nothing below the failure check expects to run without keys, so a record
+arriving late reached the decrypt path and trapped. An unknown content type followed by any
+record at all was enough.
+
+Being accurate about it: a peer can cause the failure but not the second call, and every
+caller in this repo checks the failure code first, so it was a footgun and not a remote
+crash. It is fixed because an undocumented precondition whose penalty is killing the process
+is too sharp an edge on the one function a caller drives in a loop.
+
+Two things the fuzzer flagged were **my assumptions, not bugs**: `recordLength` answers with
+the length a header *claims*, which is deliberately not bounded by what has arrived, and
+`recordType` traps on an all-padding record because RFC 8446 §5.4 says to treat that as
+`unexpected_message` — and `recordOpen` refuses such a record before it is reached. Both
+tests now assert the real contract.
+
+`tlsClientFeed` requires whole records and traps otherwise. That is a precondition rather
+than something to be lenient about: a parser that guessed at a partial record would have to
+buffer, and then two places would decide where a record ends.

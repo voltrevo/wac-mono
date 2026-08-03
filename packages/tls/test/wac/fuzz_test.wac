@@ -1,0 +1,202 @@
+// Feeding the TLS parsers bytes a server chose.
+//
+// A stricter position than the Tor package's. A Tor hop is authenticated before its relay
+// cells are parsed — badly, as it turns out, but authenticated. Here nothing is: the record
+// layer and the certificate parser run on bytes from a peer that has not yet proved
+// anything, and `parseCert` in particular runs on a chain *before* the chain is verified.
+// It has to: you cannot check a signature you have not parsed.
+//
+// So every byte reaching these is chosen by whoever answered the connection, which on the
+// public internet is whoever won the race to answer it.
+//
+// ## What a trap means
+//
+// wac bounds-checks, so a length-field bug aborts rather than reading past the end. That is
+// the difference between a crash and a disclosure, and it is why this file asserts mostly
+// that control reached the end — a trap fails the test by killing it, which is the signal.
+//
+// Deterministic PRNG, so a finding is reproducible from its seed.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { recordLength, recordType, maxPlaintext, typeHandshake, typeAlert } from "../../src/record.wac";
+import { Reader } from "../../src/wire.wac";
+import { tlsClientInit, tlsClientFeed, tlsClientFailure, tlsClientPhase }
+  from "../../src/client.wac";
+
+struct Rng { i64 s; }
+Rng rng(i64 seed) { return Rng(seed == 0 ? 88172645463325252 : seed); }
+i32 next(Rng r) {
+  i64 x = r.s;
+  x = x ^ (x << 13);
+  x = x ^ (x >> 7);
+  x = x ^ (x << 17);
+  r.s = x;
+  return (x & 0x7FFFFFFF) as! i32;
+}
+u8[] randomBytes(Rng r, i32 n) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = next(r) & 0xFF; }
+  return out;
+}
+
+export string test_record_framing_survives_arbitrary_bytes() {
+  // `recordLength` is the very first thing to touch a TLS peer's bytes — before the
+  // handshake, before any key, before any identity. It decides how much the rest will read.
+  T t = T.create();
+  Rng r = rng(11);
+  i32 complete = 0;
+  for (i32 i = 0; i < 4000; i++) {
+    u8[] buf = randomBytes(r, next(r) % 200);
+    i32 n = recordLength(buf);
+    // It answers with the length the *header claims*, which is not bounded by what arrived —
+    // that is the point of it, since a reader uses it to decide how long to keep waiting. I
+    // asserted otherwise first and was wrong about the contract, not about the code.
+    t.isTrue(n == -1 || (n >= 0 && n <= 65535), "a claimed length, or -1 for a short header");
+    t.isTrue((n < 0) == (buf.len() < 5), "-1 exactly when there are fewer than five bytes");
+    if (n >= 0 && 5 + n <= buf.len()) { complete++; }
+  }
+  t.isTrue(complete > 0, "some random buffers held a whole record");
+
+  u8[] head = u8[](22, 3, 3, 0xFF, 0xFF);
+  t.eqI32(recordLength(head), 65535, "a header may claim more than ever arrived");
+  return t.report();
+}
+
+export string test_record_framing_at_every_truncation() {
+  T t = T.create();
+  Rng r = rng(12);
+  u8[] whole = randomBytes(r, 300);
+  whole[0] = 23;
+  whole[1] = 3;
+  whole[2] = 3;
+  whole[3] = 1;      // 256 bytes of payload, so the record is 261
+  whole[4] = 0;
+  for (i32 cut = 0; cut <= 300; cut++) {
+    u8[] part = u8[cut]();
+    for (i32 i = 0; i < cut; i++) { part[i] = whole[i]; }
+    i32 n = recordLength(part);
+    if (cut < 5) { t.eqI32(n, -1, "no header yet at " + itoa64(cut as i64)); }
+    else { t.eqI32(n, 256, "the claimed length does not change as more arrives"); }
+  }
+  return t.report();
+}
+
+export string test_the_wire_reader_stops_at_its_end() {
+  // `Reader` traps on overrun rather than returning short, which makes checking `remaining`
+  // the caller's job. This pins that contract: reads inside the buffer work, and the reader
+  // knows when it is spent.
+  T t = T.create();
+  Rng r = rng(13);
+  for (i32 i = 0; i < 3000; i++) {
+    u8[] b = randomBytes(r, next(r) % 120);
+    Reader rd = Reader.create(b);
+    i32 steps = 0;
+    while (!rd.empty() && steps < 40) {
+      i32 pick = next(r) % 4;
+      if (pick == 0 && rd.remaining() >= 1) { rd.u8(); }
+      else if (pick == 1 && rd.remaining() >= 2) { rd.u16(); }
+      else if (pick == 2 && rd.remaining() >= 3) { rd.u24(); }
+      else {
+        i32 want = next(r) % 30;
+        if (rd.remaining() >= want) { rd.take(want); }
+        else { rd.take(rd.remaining()); }
+      }
+      steps++;
+    }
+    t.isTrue(rd.remaining() >= 0, "the reader never goes past its end");
+  }
+  return t.report();
+}
+
+export string test_the_client_survives_whatever_a_server_sends(fn[u8[](i32)] entropy) {
+  // The real exposure, and the reason this file exists. `tlsClientFeed` is the whole of what
+  // a TLS peer can reach before it has proved anything: record framing, handshake messages,
+  // extensions, a certificate chain. Every length in all of it is a number the peer wrote.
+  //
+  // A failure code is a fine outcome and so is ignoring the bytes. Aborting is not: it hands
+  // anyone who can answer a connection the ability to kill the client.
+  T t = T.create();
+  Rng r = rng(14);
+  for (i32 i = 0; i < 300; i++) {
+    //  on init too — it returns the same three-part blob as feed does, and
+    // forgetting that fed the whole blob back in as state. The trap that produced was in
+    // decodeConn and looked exactly like a client bug until the stack was read.
+    u8[] state = firstField(tlsClientInit("example.com".toBytes(), u8[0](), i32[0](),
+                            entropy(0), entropy(1), entropy(2), entropy(3), 1785715200));
+    // Between one and four records of noise, sometimes with a plausible header so the
+    // framing accepts them and the handshake parser gets a turn.
+    for (i32 k = 0; k < 4; k++) {
+      i32 bodyLen = next(r) % 300;
+      u8[] rec = u8[5 + bodyLen]();
+      rec[0] = (next(r) % 4) == 0 ? 22 : (next(r) & 0xFF);
+      rec[1] = 3;
+      rec[2] = (next(r) % 2) == 0 ? 3 : (next(r) & 0xFF);
+      rec[3] = (bodyLen >> 8) & 0xFF;
+      rec[4] = bodyLen & 0xFF;
+      for (i32 j = 0; j < bodyLen; j++) { rec[5 + j] = next(r) & 0xFF; }
+      state = firstField(tlsClientFeed(state, rec));
+      if (tlsClientFailure(state) != 0) { k = 4; }
+    }
+  }
+  t.isTrue(true, "three hundred servers' worth of noise, and the client is still here");
+  return t.report();
+}
+
+/** The state out of a `[state][toSend][appData]` blob. */
+u8[] firstField(u8[] blob) {
+  i32 n = (blob[0] << 24) | (blob[1] << 16) | (blob[2] << 8) | blob[3];
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = blob[4 + i]; }
+  return out;
+}
+
+export string test_inner_plaintext_type_from_arbitrary_bytes() {
+  T t = T.create();
+  // Only over inputs with a non-zero byte. An all-padding record has no content type and
+  // `recordType` traps on it deliberately — RFC 8446 §5.4 calls that `unexpected_message` —
+  // and `recordOpen` refuses such a record before this is ever reached. I asserted it
+  // returned -1 and was wrong about the design.
+  Rng r = rng(14);
+  for (i32 i = 0; i < 2000; i++) {
+    u8[] inner = randomBytes(r, 1 + next(r) % 50);
+    inner[next(r) % inner.len()] = 1 + (next(r) % 255);
+    recordType(inner);
+  }
+  return t.report();
+}
+
+export string test_feeding_a_failed_connection_is_answered_not_fatal(fn[u8[](i32)] entropy) {
+  // The bug the fuzzer found, pinned. Nothing below the failure check expects to run without
+  // keys, so a record arriving after a failure reached the decrypt path and aborted the
+  // process. An unknown content type followed by anything at all was enough.
+  //
+  // It was a caller error rather than a remote crash — a peer can cause the failure but not
+  // the second call, and every caller in this repo checks first. That is still an
+  // undocumented precondition whose penalty is killing the process, on the one function a
+  // caller drives in a loop.
+  //
+  // The general fuzz loop above stops at the first failure, exactly as a careful caller
+  // does, so it no longer reaches this. Removing the guard leaves it green; this test is
+  // what notices.
+  T t = T.create();
+  u8[] state = firstField(tlsClientInit("example.com".toBytes(), u8[0](), i32[0](),
+                          entropy(0), entropy(1), entropy(2), entropy(3), 1785715200));
+
+  // Content type 126 is not one TLS defines, so the client gives up here.
+  state = firstField(tlsClientFeed(state, u8[](126, 3, 3, 0, 1, 9)));
+  i32 code = tlsClientFailure(state);
+  t.isTrue(code != 0, "an unknown content type fails the connection");
+  t.eqI32(tlsClientPhase(state), 4, "and the connection is over");
+
+  // Anything at all after that, including well-formed records.
+  u8[][] after = u8[][](u8[](22, 3, 3, 0, 1, 1),
+                        u8[](23, 3, 3, 0, 0),
+                        u8[](20, 3, 3, 0, 1, 1));
+  for (i32 i = 0; i < after.len(); i++) {
+    state = firstField(tlsClientFeed(state, after[i]));
+    t.eqI32(tlsClientFailure(state), code, "the failure is unchanged, and nothing aborted");
+    t.eqI32(tlsClientPhase(state), 4, "and so is the phase");
+  }
+  return t.report();
+}
