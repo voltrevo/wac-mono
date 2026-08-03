@@ -14,7 +14,6 @@ record of what has been fixed and why.
 | [0005](open/0005-mutation-testing-found-54-untested-behaviours.md) | surviving mutants: behaviours nothing checks (crypto finished; tls at 75, five other packages unmeasured) | task | wrong answer |
 | [0003](open/0003-wacc-parser-does-not-implement-generics.md) | wacc's parser does not implement generics, so `std` is outside its corpus | missing feature | not implemented |
 | [0021](open/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md) | a spawned worker whose source does not parse kills the parent | bug | trap |
-| [0018](open/0018-platform-sockets-have-no-timeout-so-a-silent-peer-wedges-the-app.md) | platform sockets have no timeout, so a silent peer wedges the application permanently | missing feature | not implemented |
 
 An empty list is the expected state most of the time — see `README.md`: something you
 can fix in a package you are already working in should just be fixed, and a package's
