@@ -19,13 +19,16 @@ export i32 seq(Core core, Cli cli, Args a) {
   // the step swallowed and its sign already discarded — `a.num` holds 3, and nothing anywhere
   // remembers the minus. GNU's counting-down form is not expressible through that parser, and
   // `seq` has no flags of its own to lose by skipping it.
-  i32 n = cli.argCount().wait() - 1;
+  // `--` ends the options, as it does in GNU's. Without this it reached `atoi` as a number, which
+  // is zero, and `seq -- -5 -1` printed a stray 0 before the range.
+  i32 skip = cli.argCount().wait() > 1 && cli.arg(1).wait() == "--" ? 2 : 1;
+  i32 n = cli.argCount().wait() - skip;
   if (n < 1 || n > 3) {
     core.warn("usage: " + a.name + " [first [step]] last");
     return 2;
   }
   string[] args = string[n](fill: "");
-  for (i32 i = 0; i < n; i++) { args[i] = cli.arg(i + 1).wait(); }
+  for (i32 i = 0; i < n; i++) { args[i] = cli.arg(i + skip).wait(); }
 
   i32 first = n == 1 ? 1 : atoi(args[0]);
   i32 step = n == 3 ? atoi(args[1]) : 1;
@@ -38,10 +41,23 @@ export i32 seq(Core core, Cli cli, Args a) {
   }
 
   // An empty range prints nothing and succeeds — `seq 5 1` is not an error, it is no numbers.
-  if (step > 0) {
-    for (i32 i = first; i <= last; i = i + step) { core.log(itoa(i)); }
-  } else {
-    for (i32 i = first; i >= last; i = i + step) { core.log(itoa(i)); }
+  //
+  // Counted rather than compared, because `i = i + step` wraps: `seq 2147483647 2147483647` printed
+  // its endpoint, wrapped to negative, and carried on from there — the comparison `i <= last` is
+  // true again on the far side of the overflow. How many numbers there are is knowable before
+  // printing any, and a count cannot wrap the way an accumulator can.
+  //
+  // The count itself is computed in i64 for the same reason: `last - first` overflows i32 for a
+  // range that spans zero, and `seq -2000000000 2000000000` is a legal thing to ask for.
+  i64 span = (last as i64) - (first as i64);
+  i64 by = step as i64;
+  if ((by > 0 && span < 0) || (by < 0 && span > 0)) { return 0; }   // empty range
+  i64 count = span / by + 1;
+
+  i32 value = first;
+  for (i64 k = 0; k < count; k++) {
+    core.log(itoa(value));
+    value = value + step;
   }
   return 0;
 }

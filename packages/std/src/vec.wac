@@ -147,7 +147,19 @@ export struct Vec<T> {
   }
 
   /** Append every element of `other`, which is left alone. */
+  /**
+   * Append everything in `other`.
+   *
+   * The length is read **once**, before anything is appended, because `other` may be `this`:
+   * `v.extend(v)` re-read `other.n` every iteration, so the bound grew as fast as the index and it
+   * ran until `requested new array is too large`. Self-append is a reasonable thing to write — it
+   * doubles a buffer — and it should double it.
+   *
+   * `data` is re-read through `other` each time on purpose: `push` may reallocate, and when `other`
+   * is `this` the old array is the stale one.
+   */
   void extend(this, const Vec<T> other) {
-    for (i32 i = 0; i < other.n; i++) { this.push(other.data[i]); }
+    i32 upTo = other.n;
+    for (i32 i = 0; i < upTo; i++) { this.push(other.data[i]); }
   }
 }

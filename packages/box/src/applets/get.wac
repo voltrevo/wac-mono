@@ -13,5 +13,5 @@ export i32 get(Core core, Cli cli, Args a) {
   }
   return fetch(core, cli, a.name, a.rest[0],
                a.rest.len() > 1 ? a.rest[1] : "/",
-               a.num == 0 ? 80 : a.num, has(a, 'i'));
+               a.hasNum ? a.num : 80, has(a, 'i'));
 }

@@ -15,7 +15,7 @@ export i32 split(Core core, Cli cli, Args a) {
     core.warn("usage: " + a.name + " [-<lines>] <file> [prefix]");
     return 2;
   }
-  i32 per = a.num == 0 ? 1000 : a.num;
+  i32 per = a.hasNum ? a.num : 1000;
   string prefix = a.rest.len() > 1 ? a.rest[1] : "x";
 
   Input in = openStream(core, cli, a, 0);

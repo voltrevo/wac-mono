@@ -1,0 +1,22 @@
+import { Vec } from "../packages/std/src/vec.wac";
+
+/** wac-mono 0037: doubling a vector by extending it with itself. */
+export i32 selfExtend() {
+  Vec<i32> v = Vec.create();
+  v.push(1);
+  v.push(2);
+  v.extend(v);
+  // Want 4 elements: 1 2 1 2 — so 1*1000 + 2*100 + 1*10 + 2 = 1212, and the length in front.
+  return v.len() * 10000 + v.get(0) * 1000 + v.get(1) * 100 + v.get(2) * 10 + v.get(3);
+}
+
+/** And that extending a *different* vector still works. */
+export i32 other() {
+  Vec<i32> a = Vec.create();
+  Vec<i32> b = Vec.create();
+  a.push(7);
+  b.push(8);
+  b.push(9);
+  a.extend(b);
+  return a.len() * 100 + a.get(1) * 10 + a.get(2);
+}

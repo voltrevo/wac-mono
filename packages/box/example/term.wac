@@ -168,6 +168,10 @@ export i32 page(Core core, Cli cli, Page page) {
 
 string itoa(i32 v) {
   if (v == 0) { return "0"; }
+  // `i32::MIN` has no positive counterpart — negating it wraps back to itself — so without this the
+  // loop below never runs and the answer is the sign alone. GitHub wac-mono#6 found it in `box`;
+  // these copies had it too.
+  if (v == -2147483648) { return "-2147483648"; }
   i32 x = v < 0 ? 0 - v : v;
   u8[] digits = u8[12](fill: 0);
   i32 at = 12;

@@ -1,0 +1,52 @@
+// Splitting a path the way `basename` and `dirname` do.
+//
+// Here rather than in either applet because they have to agree: every rule below is about trailing
+// slashes, and two copies of that would disagree on `a//b//` within the week. GNU's own answers are
+// the specification, and the surprising ones are the point of the tests:
+//
+//   basename a/b/    b        dirname a/b/     a
+//   basename a//     a        dirname a//      .
+//   basename /       /        dirname /        /
+//   basename //      /        dirname //       /
+//   basename ""      ""       dirname ""       .
+//   basename /a      a        dirname /a       /
+//   basename a//b//  b        dirname a//b//   a
+
+import { slice } from "./bytes.wac";
+
+/** A path with its trailing slashes removed. `"//"` becomes empty, which callers handle. */
+export u8[] stripTrailing(u8[] b) {
+  i32 end = b.len();
+  while (end > 0 && b[end - 1] == '/') { end--; }
+  return slice(b, 0, end);
+}
+
+/**
+ * The last component.
+ *
+ * The trailing slashes go first, which is the whole bug this replaces: scanning for the last `/` in
+ * `a/b/` finds the one at the end and answers with what follows it, which is nothing.
+ */
+export u8[] baseName(u8[] path) {
+  u8[] b = stripTrailing(path);
+  // Only slashes: `/` and `//` are the root, and the root's name is itself.
+  if (b.len() == 0) { return path.len() == 0 ? u8[0]() : "/".toBytes(); }
+  i32 cut = 0;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == '/') { cut = i + 1; } }
+  return slice(b, cut, b.len());
+}
+
+/** Everything before the last component, or `.` when there is nothing before it. */
+export u8[] dirName(u8[] path) {
+  u8[] b = stripTrailing(path);
+  if (b.len() == 0) { return path.len() == 0 ? ".".toBytes() : "/".toBytes(); }
+
+  i32 cut = -1;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == '/') { cut = i; } }
+  if (cut < 0) { return ".".toBytes(); }        // a single component: `a`
+  if (cut == 0) { return "/".toBytes(); }       // `/a`
+
+  // The prefix's own trailing slashes go too, so `a//b` is `a` and not `a/`.
+  u8[] head = stripTrailing(slice(b, 0, cut));
+  return head.len() == 0 ? "/".toBytes() : head;
+}

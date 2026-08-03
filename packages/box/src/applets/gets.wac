@@ -43,7 +43,7 @@ export i32 gets(Core core, Cli cli, Args a) {
   }
   string host = a.rest[0];
   string path = a.rest[1];
-  i32 port = a.num == 0 ? 443 : a.num;
+  i32 port = a.hasNum ? a.num : 443;
 
   FileResult rootFile = cli.readFile(a.rest[2]).wait();
   if (!rootFile.ok) { core.warn(a.name + ": " + a.rest[2] + ": " + rootFile.error); return 1; }

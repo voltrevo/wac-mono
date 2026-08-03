@@ -19,6 +19,9 @@ record of what has been fixed and why.
 | [0028](open/0028-sh-decides-nothing-about-what-wacpath-programs-may-do.md) | `sh` passes `GRANT_NONE` to `$WACPATH` programs, which is a decision nobody has made | task | not implemented |
 | [0029](open/0029-gets-hand-rolls-tls-record-framing-that-now-lives-in-the-package.md) | `box gets` hand-rolls TLS record framing that now lives in the package | bug | no error |
 | [0030](open/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md) | a page cannot `spawn`, so the browser shell runs applets in-process instead | missing feature | not implemented |
+| [0038](open/0038-datetime-formatting-corrupts-years-outside-00009999.md) | datetime formatting corrupts years outside 0000..9999 | bug | wrong answer |
+| [0039](open/0039-http-framing-length-arithmetic-wraps-i32.md) | HTTP framing length arithmetic wraps i32 | bug | trap |
+| [0040](open/0040-bignum-shifts-by-int32min-recurse-until-stack-overflow.md) | bignum shifts by INT32_MIN recurse until stack overflow | bug | trap |
 
 An empty list is the expected state most of the time — see `README.md`: something you
 can fix in a package you are already working in should just be fixed, and a package's

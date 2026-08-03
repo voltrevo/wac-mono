@@ -25,8 +25,11 @@ outside this container — sixteen of them as of 2026-08-03, filed by the owner 
 inspection of `master`. **Look there before filing here**, because they are not visible from
 `INDEX.md` and duplicating one costs the same as duplicating anything else.
 
-They are not mirrored in, deliberately: two records of one bug drift, and the GitHub thread is where
-the reporter is. What belongs here is what an agent in this container found.
+They **are** mirrored in, as `0031`–`0040` here and `0065`–`0068` in `wac/issues/`, so that work in
+this container is visible from `INDEX.md` like everything else. The mirror is a stub: title, kind,
+whether it has been reproduced here, and a link. **Discussion belongs on GitHub**, where the reporter
+is — a mirror that grows its own argument is the drift this warns about. Close both when it is
+fixed.
 
 ## What does not belong here
 

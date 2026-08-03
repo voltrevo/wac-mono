@@ -129,6 +129,57 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     }
     await Deno.remove(numbers);
 
+    // Paths, against GNU's own answers. Every case here is a trailing slash, because that is the
+    // whole of both applets and `basename a/b/` used to answer with what follows the final slash:
+    // nothing. GitHub wac-mono#10.
+    for (const path of ["a/b/", "a/b", "/", "//", "a//", "a", "/a", "a//b//", "/usr/lib/"]) {
+      for (const applet of ["basename", "dirname"]) {
+        assertEquals(
+          box([applet, path]).out,
+          sys(applet, [path]),
+          `${applet} ${JSON.stringify(path)}`,
+        );
+      }
+    }
+
+    // A numeric option that was asked for, versus one that was never given. `Args.num` used to say
+    // zero for both, so `head -0` printed the default ten. GitHub wac-mono#8.
+    for (const args of [["head", "-0"], ["head", "-n", "0"], ["tail", "-0"], ["tail", "-n", "0"]]) {
+      assertEquals(box([...args, fixture]).out, "", `${args.join(" ")} prints nothing`);
+      assertEquals(sys(args[0], [...args.slice(1), fixture]), "", `and so does the real one`);
+    }
+
+    // `-n` is a value for `head` and `tail` and a boolean everywhere else. It used to be a value
+    // everywhere, so a numeric operand vanished into it: `grep -n 123` searched for its filename
+    // and stopped numbering. GitHub wac-mono#5.
+    const numeric = await Deno.makeTempFile({ prefix: "wac-box-num2-" });
+    await Deno.writeTextFile(numeric, "123\nabc\n");
+    assertEquals(box(["grep", "-n", "123", numeric]).out, sys("grep", ["-n", "123", numeric]), "grep -n <number>");
+    assertEquals(box(["sort", "-n", numeric]).out, sys("sort", ["-n", numeric]), "sort -n <file>");
+    await Deno.remove(numeric);
+
+    // The ends of the range, where the counter used to wrap and print for ever, and where the
+    // formatter used to answer with a bare "-". GitHub wac-mono#7 and #6.
+    assertEquals(box(["seq", "2147483647", "2147483647"]).out, "2147483647\n", "seq at i32 max");
+    assertEquals(box(["seq", "--", "-2147483648", "-2147483648"]).out, "-2147483648\n", "seq at i32 min");
+    assertEquals(box(["seq", "1", "5"]).out, sys("seq", ["1", "5"]), "seq still counts");
+    assertEquals(box(["seq", "10", "-3", "1"]).out, sys("seq", ["10", "-3", "1"]), "seq counts down");
+
+    // A component, not a path: `/` has to become `%2F` or the output cannot be pasted into a URL.
+    // Checked against fixed answers rather than a system tool, since there is not a portable one.
+    // GitHub wac-mono#9.
+    const datum = await Deno.makeTempFile({ prefix: "wac-box-url-" });
+    for (const [given, want] of [
+      ["a/b", "a%2Fb"],
+      ["a b&c=d", "a%20b%26c%3Dd"],
+      ["%20", "%2520"],
+      ["plain-text_1.2~", "plain-text_1.2~"],
+    ]) {
+      await Deno.writeTextFile(datum, given);
+      assertEquals(box(["urlencode", datum]).out.trim(), want, `urlencode ${JSON.stringify(given)}`);
+    }
+    await Deno.remove(datum);
+
     assertEquals(box(["head", "-3", fixture]).out, sys("head", ["-3", fixture]), "head -N");
     assertEquals(box(["tail", "-n", "2", fixture]).out, sys("tail", ["-n", "2", fixture]), "tail -n N");
     assertEquals(box(["wc", "-l", fixture]).out.trim(), sys("wc", ["-l", fixture]).trim().split(/\s+/)[0]);
