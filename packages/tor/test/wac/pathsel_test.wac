@@ -13,7 +13,7 @@ import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import {
   weightedChoice, weightedBandwidths, positionWeight, pathAllows, sameSubnet16, choose,
   positionGuard, positionMiddle, positionExit, portPermitted,
-  parseWeights, resolveFamilies, eligible, pick, Families,
+  parseWeights, resolveFamilies, eligible, exitsAnything, pick, Families,
 } from "../../src/pathsel.wac";
 import { Relay, ExitPolicy } from "../../src/directory.wac";
 
@@ -468,5 +468,65 @@ export string test_wge_is_zero_because_nobody_publishes_it() {
   // The consequence, spelled out: an exit-only relay weighs nothing at the guard position.
   t.eqI64(positionWeight(positionGuard(), false, true, parseWeights("x\n".toBytes())), 0,
           "an exit-only relay has no weight as a guard");
+  return t.report();
+}
+
+/**
+ * `exitsAnything` versus `eligible(r, positionExit(), 0)`.
+ *
+ * These look interchangeable and are not, which is the whole reason the function exists. A
+ * port of 0 means "no stream is planned" — true of a directory circuit — so it deliberately
+ * skips the policy check and passes for a relay whose summary is `reject 1-65535`, which is
+ * most of the network.
+ *
+ * Written after a guard-selection check used the wrong one. It was meant to refuse a guard
+ * that would leave no exit to build through, it asked with port 0, every Exit-flagged relay
+ * answered yes, and it pinned the one relay that made every later circuit impossible. The
+ * check ran, logged nothing, and protected nothing.
+ */
+Relay withPolicy(string name, string[] flags, bool isAccept, i32[] ranges) {
+  return Relay(name, u8[20](), "10.0.0.1", 9001, flags, "", 1000, u8[32](),
+               ExitPolicy(isAccept, ranges), string[0]());
+}
+
+export string test_exits_anything_is_not_eligible_with_port_zero() {
+  T t = T.create();
+
+  Relay rejectAll = withPolicy("rejects", exitFlags(), false, i32[](1, 65535));
+  t.isTrue(eligible(rejectAll, positionExit(), 0),
+           "port 0 passes a reject-all relay — no stream is planned, so no policy is read");
+  t.isFalse(exitsAnything(rejectAll),
+            "but it exits nothing, which is the question a guard check must ask");
+
+  Relay web = withPolicy("web", exitFlags(), true, i32[](80, 80, 443, 443));
+  t.isTrue(exitsAnything(web), "an accept list with ranges exits something");
+  t.isTrue(eligible(web, positionExit(), 443), "and 443 is in it");
+  t.isFalse(eligible(web, positionExit(), 25), "and 25 is not");
+
+  Relay acceptNothing = withPolicy("empty", exitFlags(), true, i32[0]());
+  t.isFalse(exitsAnything(acceptNothing), "an accept list with no ranges accepts nothing");
+
+  // The reject cases. Something is permitted unless the ranges cover all of 1-65535, and the
+  // gaps can only start at 1 or just past some range's end.
+  Relay rejectMost = withPolicy("most", exitFlags(), false, i32[](1, 442, 444, 65535));
+  t.isTrue(exitsAnything(rejectMost), "443 is the one port left, and it counts");
+  t.isTrue(eligible(rejectMost, positionExit(), 443), "and it is the port that gets through");
+
+  Relay rejectTail = withPolicy("tail", exitFlags(), false, i32[](2, 65535));
+  t.isTrue(exitsAnything(rejectTail), "port 1 is uncovered");
+
+  Relay rejectSplit = withPolicy("split", exitFlags(), false, i32[](1, 100, 101, 65535));
+  t.isFalse(exitsAnything(rejectSplit), "two ranges that abut still cover everything");
+
+  Relay noSummary = Relay("none", u8[20](), "10.0.0.1", 9001, exitFlags(), "", 1000,
+                          u8[32](), null, string[0]());
+  t.isFalse(exitsAnything(noSummary), "a missing summary is a reject-all, not 'no policy'");
+
+  Relay notAnExit = withPolicy("plain", noFlags(), true, i32[](1, 65535));
+  t.isFalse(exitsAnything(notAnExit), "no Exit flag, whatever the policy says");
+
+  Relay bad = withPolicy("bad", string[]("Running", "Valid", "Exit", "BadExit"),
+                         true, i32[](1, 65535));
+  t.isFalse(exitsAnything(bad), "BadExit means the authorities said not to");
   return t.report();
 }
