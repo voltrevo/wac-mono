@@ -44,6 +44,7 @@ import { AuthRequest, authFailure, authSuccess, channelClose, channelData, chann
          pkOk,
          channelFailure, channelStderr, channelSuccess, ecdhReply, ephemeralPublic, exchangeHash, execCommand,
          exitStatus, hostKeyBlob, openConfirmation, openFailure, parseAuthRequest, parseEcdhInit,
+         requestWantsReply,
          requestName, serverProposal, serviceAccept, sharedSecret, verifyAuth,
          byApplication, disconnect } from "./server.wac";
 
@@ -300,7 +301,17 @@ void session(Conn conn, Cli cli, Core core) {
     return;
   }
 
-  // Requests until one asks us to run something. A client may send `env` or ask for a pty first.
+  // Requests until one asks us to run something. A client sends several first, and **which of them
+  // get a reply is decided by the request, not by whether we understood it.**
+  //
+  // Getting that wrong is not subtle in its effect and is invisible in a test. A client whose
+  // `ssh_config` has `SendEnv LANG LC_*` — the Debian and Ubuntu default — sends two `env`
+  // requests before `exec`, both with want_reply *false*. Answering them puts two extra replies in
+  // the stream, the client matches replies to requests in order, and it attributes the first of
+  // them to its `exec`. Every command then fails with `exec request failed on channel 0` while the
+  // server logs that it ran nothing. This code did exactly that; the suite missed it because it
+  // runs the client with `-F /dev/null`, which discards the config that sends the `env` in the
+  // first place.
   //
   // **`pty-req` is refused deliberately.** Accepting it makes the client put its terminal in raw
   // mode and stop echoing locally, expecting the server to echo every keystroke back — which
@@ -309,7 +320,7 @@ void session(Conn conn, Cli cli, Core core) {
   // and plain `ssh host` still works with the client's own line editing.
   u8[] command = u8[0]();
   bool interactive = false;
-  for (i32 i = 0; i < 16 && command.len() == 0 && !interactive; i++) {
+  for (i32 i = 0; i < 32 && command.len() == 0 && !interactive; i++) {
     u8[] p = conn.readPacket();
     if (conn.failed()) { return; }
     Incoming r = parse(p);
@@ -317,11 +328,19 @@ void session(Conn conn, Cli cli, Core core) {
     if (r.kind == msgChannelClose() || r.kind == msgChannelEof()) { return; }
     if (r.kind != msgChannelRequest()) { continue; }
 
-    if (sameBytes(requestName(p), "shell".toBytes())) { interactive = true; break; }
-    command = execCommand(p);
-    if (command.len() == 0) {
-      conn.sendPacket(channelFailure(clientChannel));
+    u8[] name = requestName(p);
+    if (sameBytes(name, "shell".toBytes())) { interactive = true; break; }
+    if (sameBytes(name, "exec".toBytes())) {
+      command = execCommand(p);
+      // An `exec` we cannot read the command out of is a refusal, and it did want an answer.
+      if (command.len() == 0 && requestWantsReply(p)) {
+        conn.sendPacket(channelFailure(clientChannel));
+      }
+      continue;
     }
+    // Anything else — `env`, `pty-req`, `signal`, `window-change` — is not honoured, and is
+    // answered only if it asked to be.
+    if (requestWantsReply(p)) { conn.sendPacket(channelFailure(clientChannel)); }
   }
   if (command.len() == 0 && !interactive) {
     conn.fail("the client never asked to run anything");
@@ -396,8 +415,13 @@ Result interactiveSession(Conn conn, Cli cli, Core core, i32 channel) {
         if (pending.get(i) == 10) { nl = i; break; }
       }
       if (nl < 0) { break; }
-      u8[] line = u8[nl]();
-      line.copyFrom(pending.data, 0, 0, nl);
+      // A line ends CRLF over SSH whenever the client has a terminal, and there is no terminal
+      // driver here to fold it — so the carriage return would end up *in* the command, and
+      // `exit\r` is not `exit`. Only the one at the line boundary goes; a `\r` anywhere else is
+      // data the shell should see.
+      i32 end = (nl > 0 && pending.get(nl - 1) == 13) ? nl - 1 : nl;
+      u8[] line = u8[end]();
+      line.copyFrom(pending.data, 0, 0, end);
       pending.dropFront(nl + 1);
 
       runScript(sh, string.fromBytes(line));
