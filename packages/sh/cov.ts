@@ -266,6 +266,24 @@ const SCRIPTS: string[] = [
   "( )", "(", "(echo a", "()", "(;)", "( ; echo a )",
   "echo $( (echo n) )", "((echo a))",
 
+  // ── read, set and shift ─────────────────────────────────────────────────────
+  "echo x | { read a; echo [$a]; }", "echo a b c | { read x y z; echo $x$y$z; }",
+  "echo a b c d | { read x y; echo $y; }", "echo a b | { read x; echo $x; }",
+  "seq 1 2 | { read a; read b; read c; echo $?; }", "echo -n ab | { read x; echo $x $?; }",
+  "echo hi | { read; echo $REPLY; }", "read x; echo $?",
+  "seq 1 3 | while read x; do echo $x; done",
+  "while read x; do echo $x; done <<EOF\np\nq\nEOF",
+  "{ read a; cat; } <<EOF\n1\n2\nEOF", "while read x; do echo $x; done < in.txt",
+  "while read x; do echo $x; done < nosuch.txt",
+  "read a b < in.txt", "read -r a < in.txt", "read -r -r a < in.txt",
+  "echo 'a\\ b' | { read x y; echo $x; }", "echo 'a\\ b' | { read -r x y; echo $x; }",
+  "echo 'a\\' | { read x; echo $x; }", "echo '\\tt' | { read a b; echo $b; }",
+  'echo "a b  " | { read x y; echo $y; }',      // trailing blanks the last name must lose
+  "set -- a b c; echo $#", "set a b c; echo $1", "set", "set -e", "set -- ", "set --",
+  "x=1; y=2; set",                              // bare `set` with something to list
+  "set -- a b c; shift; echo $1", "set -- a b c; shift 2; echo $1", "set -- a; shift 2; echo $?",
+  "shift; echo $?", "set -- a; shift x; echo $?", "f() { shift; echo $1; }; f 1 2",
+
   // ── Backquotes ──────────────────────────────────────────────────────────────
   "echo `echo hi`", "echo a`echo b`c", 'echo "`echo hi`"', "echo \'`echo hi`\'",
   "x=`echo v`; echo $x", "echo `seq 1 3`", 'echo "`seq 1 3`"', "echo ``", 'echo ""``',

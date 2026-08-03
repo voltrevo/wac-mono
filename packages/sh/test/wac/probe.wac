@@ -23,7 +23,8 @@
 // picks an id from the path; `resolveFile` turns the id back into a `FileResult`. It reads
 // oddly and it is the only way to build a resolved ticket without state.
 
-import { Cli, Core, FileResult, Pending, Socket, Stat } from "../../../platform/src/platform.wac";
+import { Child, Cli, Core, FileResult, Pending, Socket, Stat }
+  from "../../../platform/src/platform.wac";
 import { Shell, runScript } from "../../src/exec.wac";
 
 /** A ticket is always ready here, and dropping one does nothing. */
@@ -139,6 +140,20 @@ Pending<bool> fakeSend(i32 handle, u8[] data) {
 }
 void fakeCloseSocket(i32 handle) {}
 
+// Spawning is refused here, which is the branch worth covering: `program.wac` falls back to its
+// own implementations when there is no process to run, and that is the path this shell takes
+// everywhere it is embedded rather than run from a terminal.
+Child refuseSpawn(i32 id) { return Child(-1, "spawn not available"); }
+i32 resolveId(i32 id) { return id; }
+
+Pending<Child> fakeSpawn(string path, string[] argv) {
+  return Pending.of(0, refuseSpawn, alwaysSettled, ignoreDrop);
+}
+void fakeCloseFeed(i32 handle) {}
+Pending<i32> fakeExitCode(i32 handle) {
+  return Pending.of(127, resolveId, alwaysSettled, ignoreDrop);
+}
+
 /** Every fake ticket is settled the moment it is made, so the first id is as true as any. */
 i32 fakeWaitAny(i32[] ids) { return ids.len() > 0 ? ids[0] : -1; }
 
@@ -146,7 +161,7 @@ Cli fakeCli() {
   return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeReadFile, fakeWriteFile,
                 fakeStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
                 fakeReadChunk, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
-                fakeSend, fakeCloseSocket, fakeWaitAny);
+                fakeSend, fakeCloseSocket, fakeWaitAny, fakeSpawn, fakeCloseFeed, fakeExitCode);
 }
 
 // ── What the coverage driver calls ────────────────────────────────────────────

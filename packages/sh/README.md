@@ -1,9 +1,9 @@
 # sh
 
 A shell, in wac. Quoting, parameter expansion with the `:-`/`:=`/`:?`/`:+` operators, command
-substitution in both spellings, arithmetic, here-documents, pipelines, redirection, `&&`/`||`,
-`if`/`while`/`until`/`for`/`case`, functions, subshells, globbing, exit statuses — checked against
-GNU bash, script for script.
+substitution in both spellings, arithmetic, here-documents, `read`, pipelines, redirection,
+`&&`/`||`, `if`/`while`/`until`/`for`/`case`, functions, subshells, globbing, positional parameters,
+exit statuses — checked against GNU bash, script for script.
 
 ```sh
 deno task app packages/sh/src/sh.wac --allow-read --allow-env -- -c 'seq 1 10 | grep 1 | wc -l'
@@ -120,11 +120,20 @@ flag rather than two mechanisms.
 
 ## What it does not do
 
+**`set` does the positional parameters and nothing else.** `set --`, `set a b c` and `shift`
+work. The options — `-e`, `-u`, `-x` — are **refused rather than accepted and ignored**, because a
+`set -e` that did not stop on an error is worse than one that does not exist. Bare `set` lists this
+shell's own variables sorted, which is the same idea as bash's over a much smaller set and so
+cannot be compared with it.
+
+**Only `read` consumes standard input.** It advances a cursor the whole command shares, which is
+what makes `while read line` terminate rather than see the first line for ever. The external
+programs are handed whatever is left but are *not* charged for it, because nothing here knows
+which of them read their input — so `{ cat; cat; }` gives both copies of the whole thing where
+bash gives the second nothing.
+
 **No process substitution.** `<(…)` needs a pipe with a name, which the capability world does
 not offer.
-
-**No `set`, `shift` or `read`.** Positional parameters exist and `$1` works, but nothing can
-change them from inside a script.
 
 **Pipelines run one stage at a time**, in memory. A real pipeline runs its stages at once, so
 `yes | head -1` terminates in bash and would not here. Real processes will not fix that by

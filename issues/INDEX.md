@@ -15,6 +15,7 @@ record of what has been fixed and why.
 | [0005](open/0005-mutation-testing-found-54-untested-behaviours.md) | surviving mutants: behaviours nothing checks (crypto finished; tls at 75, five other packages unmeasured) | task | wrong answer |
 | [0003](open/0003-wacc-parser-does-not-implement-generics.md) | wacc's parser does not implement generics, so `std` is outside its corpus | missing feature | not implemented |
 | [0018](open/0018-platform-sockets-have-no-timeout-so-a-silent-peer-wedges-the-app.md) | platform sockets have no timeout, so a silent peer wedges the application permanently | missing feature | not implemented |
+| [0019](open/0019-shs-builtin-tr-does-not-expand-ranges.md) | sh's builtin `tr` does not expand ranges, so `tr a-z A-Z` changes three characters | bug | wrong answer |
 
 An empty list is the expected state most of the time — see `README.md`: something you
 can fix in a package you are already working in should just be fixed, and a package's
