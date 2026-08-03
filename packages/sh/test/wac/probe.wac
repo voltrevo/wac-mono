@@ -139,11 +139,14 @@ Pending<bool> fakeSend(i32 handle, u8[] data) {
 }
 void fakeCloseSocket(i32 handle) {}
 
+/** Every fake ticket is settled the moment it is made, so the first id is as true as any. */
+i32 fakeWaitAny(i32[] ids) { return ids.len() > 0 ? ids[0] : -1; }
+
 Cli fakeCli() {
   return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeReadFile, fakeWriteFile,
                 fakeStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
                 fakeReadChunk, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
-                fakeSend, fakeCloseSocket);
+                fakeSend, fakeCloseSocket, fakeWaitAny);
 }
 
 // ── What the coverage driver calls ────────────────────────────────────────────

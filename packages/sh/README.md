@@ -1,8 +1,8 @@
 # sh
 
 A shell, in wac. Quoting, parameter expansion with the `:-`/`:=`/`:?`/`:+` operators, command
-substitution, pipelines, redirection, `&&`/`||`, `if`/`while`/`until`/`for`/`case`, functions,
-subshells, globbing, exit statuses — checked against GNU bash, script for script.
+substitution, arithmetic, pipelines, redirection, `&&`/`||`, `if`/`while`/`until`/`for`/`case`,
+functions, subshells, globbing, exit statuses — checked against GNU bash, script for script.
 
 ```sh
 deno task app packages/sh/src/sh.wac --allow-read --allow-env -- -c 'seq 1 10 | grep 1 | wc -l'
@@ -57,6 +57,18 @@ splits everything, gets `x="a b"; echo $x` or `echo "$x"` wrong. An unquoted exp
 only whitespace disappears entirely: `x=""; echo $x` passes no arguments where `echo "$x"` passes
 one empty one.
 
+**`arith.wac`** — the inside of `$((…))`, where the shell's own rules stop applying. A bare name
+is a variable, an unset one is zero, and comparisons yield 1 and 0 — the *opposite* polarity to
+`test a -lt b`, whose success is 0. Two conventions a few characters apart and the shell means
+both.
+
+It evaluates numbers and operators only: **the caller substitutes variables first**, repeatedly.
+That split is not squeamishness about coupling. It is what reproduces bash resolving a value that
+is itself an expression (`x=1+2` makes `$((x))` 3) and one that names another variable
+(`a=b; b=c; c=7` gives 7) — both need the shell's own lookup and a repeat pass. A self-reference
+reaches a fixed point rather than growing, so the cycle test is that *no name survives*
+substitution, not that the text stopped changing.
+
 **`program.wac`** — see below. It is the one interesting thing here.
 
 ## External programs, and the seam
@@ -108,8 +120,7 @@ not implemented — only `*` and `?`.
 which matters because the shell runs inside a server that has no way to be interrupted. That is a
 deliberate difference and the only one where this refuses to do what bash does.
 
-**No here-documents, backquotes, or arithmetic.** Each is noted in the lexer where it would
-attach. `${x#pattern}` and the other trimming forms are also absent — the operators implemented
+**No here-documents or backquotes.** Both are noted in the lexer where they would attach. `${x#pattern}` and the other trimming forms are also absent — the operators implemented
 are `:-`, `-`, `:=`, `=`, `:+`, `+`, `:?`, `?` and `${#x}`.
 
 **`2>` is refused rather than approximated.** Only standard output is captured, so there is

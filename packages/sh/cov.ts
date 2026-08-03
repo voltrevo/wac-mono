@@ -191,6 +191,23 @@ const SCRIPTS: string[] = [
   "x=1 true; echo [$x]", "x=0; x=1 true; echo $x", "x=1 y=2 true", "x=1 nosuchcommand",
   "x=1 exit 0", "x=$(echo v) true; echo [$x]",
 
+  // ── Arithmetic ──────────────────────────────────────────────────────────────
+  "echo $((1+2))", "echo $((5-2))", "echo $((2*3))", "echo $((7/2))", "echo $((7%2))",
+  "echo $(( (1+2)*3 ))", "echo $((2*3+4*5))", "echo $((-5))", "echo $((+5))", "echo $((!0))",
+  "echo $((1<2)) $((2<1)) $((1<=1)) $((2<=1))",
+  "echo $((2>1)) $((1>2)) $((1>=1)) $((1>=2))",
+  "echo $((1==1)) $((1==2)) $((1!=2)) $((1!=1))",
+  "echo $((1&&1)) $((1&&0)) $((0||1)) $((0||0))",
+  "x=5; echo $((x))", "x=5; echo $(($x))", "x=5; echo $((${x}))", "echo $((unset))",
+  "x=abc; echo $((x))", "x=-7; echo $((x))", "x=' 9 '; echo $((x))", "x=1+2; echo $((x))",
+  "echo $(( ))", "echo $((   ))", "echo $((0))",
+  "echo $((1/0))", "echo $((1%0))", "echo $((1+))", "echo $((a b))", "echo $(($))",
+  "echo $((()))", "echo $(((1))", "echo $((1)", "echo $(( (1 ))", "echo $(( (1+2 ))",
+  "echo $((!5))", "echo $((!!0))", "x=' 9 '; echo $((x))", "x='9 '; echo $((x))",
+  "x=' '; echo $((x))", "x=+4; echo $((x))", "x=-; echo $((x))",
+  "i=0; while test $i -lt 3; do i=$((i+1)); done; echo $i",
+  "echo $(echo plain)", "echo $( (echo sub) )",
+
   // ── Globbing ────────────────────────────────────────────────────────────────
   //
   // The fake `readDir` answers for `dir` and nothing else, so these reach both the matched and
