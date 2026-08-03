@@ -20,7 +20,7 @@ import { Option } from "../../std/src/option.wac";
 import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Cli, Core, FileResult } from "../../platform/src/platform.wac";
-import { Part, PartKind, Token, tokenize } from "./lex.wac";
+import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
          RedirKind, Script, Simple, Word, parse } from "./parse.wac";
 import { Output, itoa, names, run } from "./program.wac";
@@ -60,11 +60,19 @@ export struct Shell {
   Vec<string> funcNames;
   /** `$1`, `$2`, … inside a function call. Empty at the top level. */
   Vec<string> params;
+  /**
+   * Whether a command substitution ran while expanding the current simple command.
+   *
+   * Only one thing needs it, and only in one place: a command with no command name reports the
+   * status of its *last command substitution*, so `x=$(false)` sets `$?` to 1 while a bare `x=1`
+   * sets it to 0. Without this the two are indistinguishable by the time the status is chosen.
+   */
+  bool ranSub;
 
   Shell create(Core core, Cli cli) {
     return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
                  false, Buf.create(), Vec.create(), Map.create(hashString, stringEq),
-                 Vec.create(), Vec.create());
+                 Vec.create(), Vec.create(), false);
   }
 
   /** Set a variable, remembering the name so the table can be copied later. */
@@ -349,6 +357,7 @@ void runLoop(Shell sh, Clause c, bool untilForm) {
  * status is kept.
  */
 u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
+  sh.ranSub = false;
   Vec<string> argv = Vec.create();
   for (i32 i = 0; i < cmd.words.len(); i++) {
     expandInto(sh, cmd.words.get(i), argv);
@@ -362,7 +371,9 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
       Assign a = cmd.assigns.get(i);
       sh.setVar(a.name, joinWord(sh, a.value));
     }
-    sh.status = 0;
+    // With no command name the status is the last command substitution's, or zero if there was
+    // none: `x=$(false)` reports 1, `x=1` reports 0, and a bare `$(exit 3)` reports 3.
+    if (!sh.ranSub) { sh.status = 0; }
     return u8[0]();
   }
   // A prefix assignment applies to *this command only*: `x=1 cmd` leaves `x` as it was
@@ -395,6 +406,18 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
           return u8[0]();
         }
         input = f.bytes;
+      }
+      case Here: {
+        // The body is the input. Expansion, when the delimiter was unquoted, is exactly the
+        // inside-double-quotes rules: `$x` substitutes and nothing splits.
+        if (r.bodyExpand) {
+          Vec<Part> parts = lexQuotedText(r.body);
+          string expanded = "";
+          for (i32 j = 0; j < parts.len(); j++) { expanded = expanded + expandPart(sh, parts.get(j)); }
+          input = expanded.toBytes();
+        } else {
+          input = r.body.toBytes();
+        }
       }
       else: {}
     }
@@ -1064,8 +1087,11 @@ string expandPart(Shell sh, Part p) {
       // trailing newlines removed — the removal is why `x=$(pwd)` does not end in a newline.
       Shell inner = Shell.capturing(sh.core, sh.cli);
       inner.vars = sh.vars;
-      runScript(inner, p.text);
-      sh.status = inner.status;
+      // The *returned* status, not `inner.status`: `$(exit 3)` leaves the inner shell exiting
+      // with a code rather than with a status, and only `runScript` reconciles the two. The exit
+      // itself stops there — it ends the substitution, not the shell that asked for it.
+      sh.status = runScript(inner, p.text);
+      sh.ranSub = true;
       sh.errOut.pushAll(inner.errOut.bytes());
       u8[] out = inner.outBuf.take();
       i32 n = out.len();

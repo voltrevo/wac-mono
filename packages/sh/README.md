@@ -1,8 +1,9 @@
 # sh
 
 A shell, in wac. Quoting, parameter expansion with the `:-`/`:=`/`:?`/`:+` operators, command
-substitution, arithmetic, pipelines, redirection, `&&`/`||`, `if`/`while`/`until`/`for`/`case`,
-functions, subshells, globbing, exit statuses — checked against GNU bash, script for script.
+substitution in both spellings, arithmetic, here-documents, pipelines, redirection, `&&`/`||`,
+`if`/`while`/`until`/`for`/`case`, functions, subshells, globbing, exit statuses — checked against
+GNU bash, script for script.
 
 ```sh
 deno task app packages/sh/src/sh.wac --allow-read --allow-env -- -c 'seq 1 10 | grep 1 | wc -l'
@@ -44,6 +45,14 @@ stays a literal backslash, which is why `"\n"` is two characters.
 A run of digits immediately before a redirection is a file descriptor, not a word: `2>err`
 redirects and `2 >err` writes `2` and redirects. The lexer has to decide, because by the time the
 parser sees words the space is gone.
+
+Here-documents are the one construct whose meaning lives on the *following* lines, so they are the
+one place the lexer does not read strictly left to right. `<<WORD` parks a request; the next
+newline pays all the parked requests off in order, reading body lines until one equals the
+delimiter. That ordering is what makes `cat <<A <<B` take A's body first even though both operators
+were on the same line. Quoting the delimiter — `<<'E'`, `<<"E"` or `<<\E`, which are the same
+thing — turns expansion off for the whole body; an unquoted body is expanded by exactly the
+inside-double-quotes rules, and shares the code path with them rather than restating them.
 
 **`parse.wac`** — an assignment is only an assignment *before the first word*. `a=1 echo b` sets
 `a` for that command; `echo a=1` prints it. Nothing about the token says which, so the parser
@@ -111,12 +120,15 @@ flag rather than two mechanisms.
 
 ## What it does not do
 
+**No process substitution.** `<(…)` needs a pipe with a name, which the capability world does
+not offer.
+
+**No `set`, `shift` or `read`.** Positional parameters exist and `$1` works, but nothing can
+change them from inside a script.
+
 **Pipelines run one stage at a time**, in memory. A real pipeline runs its stages at once, so
 `yes | head -1` terminates in bash and would not here. Real processes will not fix that by
 themselves: it needs the shell to run stages concurrently, which needs more than one thread.
-
-**No `case`, no subshells, no functions.** `if`, `while`, `until`, `for` and `{…}` are there;
-`case` and `( … )` are not, and neither are function definitions.
 
 **Globbing is last-component only.** A pattern in the final path component works; one in a leading
 component does not, because that needs walking every directory that matches.
@@ -125,8 +137,9 @@ component does not, because that needs walking every directory that matches.
 which matters because the shell runs inside a server that has no way to be interrupted. That is a
 deliberate difference and the only one where this refuses to do what bash does.
 
-**No here-documents or backquotes.** Both are noted in the lexer where they would attach. The parameter operators implemented are `:-`, `-`, `:=`, `=`, `:+`, `+`, `:?`, `?`, `#`, `##`,
-`%`, `%%` and `${#x}`. Absent: `${x/a/b}` substitution, indirection and the array forms.
+**Some parameter expansions are missing.** Implemented: `:-`, `-`, `:=`, `=`, `:+`, `+`, `:?`,
+`?`, `#`, `##`, `%`, `%%` and `${#x}`. Absent: `${x/a/b}` substitution, indirection and the array
+forms.
 
 **`2>` is refused rather than approximated.** Only standard output is captured, so there is
 nothing of the error stream to redirect, and saying so beats writing the wrong bytes to the file.

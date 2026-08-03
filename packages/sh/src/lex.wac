@@ -14,7 +14,7 @@
 //   `'…'`     everything, including backslashes and dollars; there is no escape inside
 //   `"…"`     word splitting and globbing, but *not* `$` — expansions still happen
 //
-// What this does not do yet: here-documents, backquotes, `${…}` with modifiers, arithmetic, and
+// What this does not do yet: `${x/a/b}` substitution, indirection, and
 // process substitution. Each is noted where it would go.
 
 import { Vec } from "../../std/src/vec.wac";
@@ -31,6 +31,8 @@ export enum Kind {
   Less,
   Great,
   DGreat,
+  /** `<<WORD` or `<<-WORD`, with the body already collected. */
+  DLess,
   LParen,
   RParen,
   /** `;;` — ends a `case` arm. */
@@ -85,6 +87,20 @@ export struct Token {
   Kind kind;
   Vec<Part> parts;
   /**
+   * A here-document's body, collected from the lines *after* the command.
+   *
+   * This is why the lexer knows about lines at all. `cat <<EOF` says nothing about where the text
+   * is — it is whatever follows the current line — so the token cannot be finished when it is
+   * read. It is parked and filled in when the newline arrives.
+   */
+  string body;
+  /**
+   * Whether the body expands. An unquoted delimiter means it does, and the body then behaves
+   * exactly like the inside of double quotes: `$x` substitutes, and nothing splits or globs.
+   * `<<'EOF'` makes it literal.
+   */
+  bool bodyExpand;
+  /**
    * The file descriptor written immediately before a redirection operator, as in `2>`, or -1.
    *
    * Attached to the operator rather than left as a word, because `echo 2 > f` and `echo 2> f`
@@ -92,7 +108,7 @@ export struct Token {
    */
   i32 fd;
 
-  Token of(Kind kind) { return Token(kind, Vec.create(), -1); }
+  Token of(Kind kind) { return Token(kind, Vec.create(), "", false, -1); }
 }
 
 /** Every token in `src`, ending with `Eof` — or with `Bad` if a quote never closed. */
@@ -100,6 +116,11 @@ export Vec<Token> tokenize(string src) {
   Vec<Token> out = Vec.create();
   u8[] s = src.toBytes();
   i32 at = 0;
+  // Here-documents opened but not yet fed. Three lists rather than a struct because they are
+  // only ever appended and drained together.
+  Vec<i32> pendingAt = Vec.create();
+  Vec<string> pendingDelim = Vec.create();
+  Vec<bool> pendingStrip = Vec.create();
 
   while (true) {
     // Skip blanks and comments. A `#` only starts a comment at the beginning of a word, which is
@@ -109,13 +130,25 @@ export Vec<Token> tokenize(string src) {
       while (at < s.len() && s[at] != 10) { at++; }
     }
     if (at >= s.len()) {
+      if (pendingAt.len() > 0) {
+        at = collectBodies(s, at, out, pendingAt, pendingDelim, pendingStrip);
+      }
       out.push(Token.of(Kind.Eof));
       return out;
     }
 
     i32 c = s[at];
 
-    if (c == 10) { out.push(Token.of(Kind.Newline)); at++; continue; }
+    if (c == 10) {
+      out.push(Token.of(Kind.Newline));
+      at++;
+      // Any here-document opened on the line just ended takes its body from here, in the order
+      // the operators appeared — `cat <<A <<B` reads A's body first.
+      if (pendingAt.len() > 0) {
+        at = collectBodies(s, at, out, pendingAt, pendingDelim, pendingStrip);
+      }
+      continue;
+    }
     if (c == 0x7c) {                                        // '|'
       if (at + 1 < s.len() && s[at + 1] == 0x7c) { out.push(Token.of(Kind.OrIf)); at += 2; }
       else { out.push(Token.of(Kind.Pipe)); at++; }
@@ -137,7 +170,17 @@ export Vec<Token> tokenize(string src) {
     // an infinite loop by construction, which is why every one of them now has a case here.
     if (c == 0x28) { out.push(Token.of(Kind.LParen)); at++; continue; }   // '('
     if (c == 0x29) { out.push(Token.of(Kind.RParen)); at++; continue; }   // ')'
-    if (c == 0x3c) { out.push(Token.of(Kind.Less)); at++; continue; }     // '<'
+    if (c == 0x3c) {                                        // '<'
+      if (at + 1 < s.len() && s[at + 1] == 0x3c) {
+        i32 next = takeHereDoc(s, at, out, pendingAt, pendingDelim, pendingStrip, -1);
+        if (next < 0) { out.push(Token.of(Kind.Bad)); return out; }
+        at = next;
+        continue;
+      }
+      out.push(Token.of(Kind.Less));
+      at++;
+      continue;
+    }
     if (c == 0x3e) {                                        // '>'
       if (at + 1 < s.len() && s[at + 1] == 0x3e) { out.push(Token.of(Kind.DGreat)); at += 2; }
       else { out.push(Token.of(Kind.Great)); at++; }
@@ -153,6 +196,12 @@ export Vec<Token> tokenize(string src) {
       if (scan < s.len() && (s[scan] == 0x3e || s[scan] == 0x3c)) {
         i32 fd = 0;
         for (i32 i = at; i < scan; i++) { fd = fd * 10 + (s[i] - 0x30); }
+        if (s[scan] == 0x3c && scan + 1 < s.len() && s[scan + 1] == 0x3c) {
+          i32 next = takeHereDoc(s, scan, out, pendingAt, pendingDelim, pendingStrip, fd);
+          if (next < 0) { out.push(Token.of(Kind.Bad)); return out; }
+          at = next;
+          continue;
+        }
         Kind k = Kind.Less;
         i32 after = scan + 1;
         if (s[scan] == 0x3e) {
@@ -184,6 +233,124 @@ export Vec<Token> tokenize(string src) {
     out.push(word);
   }
   trap;                                                     // unreachable
+}
+
+/**
+ * Lex `text` as if it were inside double quotes: expansions active, nothing splits.
+ *
+ * That is precisely what an unquoted here-document body is, so it is the same code path rather
+ * than a second set of rules that could drift from it.
+ */
+export Vec<Part> lexQuotedText(string text) {
+  u8[] s = text.toBytes();
+  Token holder = Token.of(Kind.Word);
+  string lit = "";
+  i32 p = 0;
+  while (p < s.len()) {
+    if (s[p] == 0x5c && p + 1 < s.len() && escapableInDquote(s[p + 1])) {
+      lit = lit + charOf(s[p + 1]);
+      p += 2;
+      continue;
+    }
+    if (s[p] == 0x60) {
+      if (lit != "") { holder.parts.push(Part.of(PartKind.Lit, lit, true)); lit = ""; }
+      i32 tick = takeBackquote(s, p, holder, true);
+      if (tick < 0) { return holder.parts; }
+      p = tick;
+      continue;
+    }
+    if (s[p] == 0x24 && p + 1 < s.len()) {
+      if (lit != "") { holder.parts.push(Part.of(PartKind.Lit, lit, true)); lit = ""; }
+      i32 after = lexDollar(s, p, holder, true);
+      if (after < 0) { return holder.parts; }
+      if (after == p) { lit = lit + "$"; p++; }
+      else { p = after; }
+      continue;
+    }
+    lit = lit + charOf(s[p]);
+    p++;
+  }
+  if (lit != "") { holder.parts.push(Part.of(PartKind.Lit, lit, true)); }
+  return holder.parts;
+}
+
+/**
+ * Read `<<WORD` or `<<-WORD` and park it. Returns the position after the delimiter, or -1.
+ *
+ * The delimiter is lexed as an ordinary word so quoting is detected the same way as everywhere
+ * else — and whether it was quoted is the whole difference between a body that expands and one
+ * that does not.
+ */
+i32 takeHereDoc(u8[] s, i32 at, Vec<Token> out, Vec<i32> pendingAt, Vec<string> pendingDelim,
+                Vec<bool> pendingStrip, i32 fd) {
+  i32 p = at + 2;
+  bool strip = false;
+  if (p < s.len() && s[p] == 0x2d) {                        // `<<-`
+    strip = true;
+    p++;
+  }
+  while (p < s.len() && (s[p] == 32 || s[p] == 9)) { p++; }
+
+  Token delim = Token.of(Kind.Word);
+  i32 after = lexWord(s, p, delim);
+  if (after < 0 || after == p) { return -1; }
+
+  string name = "";
+  bool quoted = false;
+  for (i32 i = 0; i < delim.parts.len(); i++) {
+    Part part = delim.parts.get(i);
+    name = name + part.text;
+    if (part.quoted) { quoted = true; }
+  }
+  if (name == "") { return -1; }
+
+  Token t = Token.of(Kind.DLess);
+  t.fd = fd;
+  t.bodyExpand = !quoted;
+  pendingAt.push(out.len());
+  pendingDelim.push(name);
+  pendingStrip.push(strip);
+  out.push(t);
+  return after;
+}
+
+/**
+ * Fill every parked here-document from the lines starting at `at`. Returns the new position.
+ *
+ * A body ends at a line equal to the delimiter — the *whole* line, which is why `EOFX` does not
+ * end an `EOF` body. Running out of input ends it too: bash warns and uses what it has, and so
+ * does this, because the alternative is discarding text the author clearly meant.
+ */
+i32 collectBodies(u8[] s, i32 at, Vec<Token> out, Vec<i32> pendingAt, Vec<string> pendingDelim,
+                  Vec<bool> pendingStrip) {
+  i32 p = at;
+  for (i32 i = 0; i < pendingAt.len(); i++) {
+    string delim = pendingDelim.get(i);
+    bool strip = pendingStrip.get(i);
+    string body = "";
+    while (p < s.len()) {
+      i32 lineEnd = p;
+      while (lineEnd < s.len() && s[lineEnd] != 10) { lineEnd++; }
+      i32 from = p;
+      // `<<-` strips leading tabs from the body *and* from the terminator, which is what lets a
+      // here-document be indented along with the code around it.
+      if (strip) {
+        while (from < lineEnd && s[from] == 9) { from++; }
+      }
+      string line = sliceOf(s, from, lineEnd);
+      p = lineEnd < s.len() ? lineEnd + 1 : lineEnd;
+      if (line == delim) { break; }
+      body = body + line + "\n";
+    }
+    Token t = out.get(pendingAt.get(i));
+    t.body = body;
+  }
+  while (pendingAt.len() > 0) {
+    pendingAt.pop();
+    pendingDelim.pop();
+    pendingStrip.pop();
+  }
+  return p;
 }
 
 /**
@@ -246,6 +413,13 @@ i32 lexWord(u8[] s, i32 at, Token word) {
           p += 2;
           continue;
         }
+        if (s[p] == 0x60) {                                  // `…` expands inside "…" too
+          if (lit != "") { word.parts.push(Part.of(PartKind.Lit, lit, true)); lit = ""; }
+          i32 after = takeBackquote(s, p, word, true);
+          if (after < 0) { return -1; }
+          p = after;
+          continue;
+        }
         if (s[p] == 0x24 && p + 1 < s.len()) {               // '$' still expands inside "…"
           if (lit != "") { word.parts.push(Part.of(PartKind.Lit, lit, true)); lit = ""; }
           i32 after = lexDollar(s, p, word, true);
@@ -259,6 +433,15 @@ i32 lexWord(u8[] s, i32 at, Token word) {
       }
       if (p >= s.len()) { return -1; }                       // unterminated
       p++;
+      continue;
+    }
+
+    if (c == 0x60) {                                        // '`'
+      if (haveLit) { word.parts.push(Part.of(PartKind.Lit, lit, litQuoted)); lit = ""; haveLit = false; }
+      litQuoted = false;
+      i32 after = takeBackquote(s, p, word, false);
+      if (after < 0) { return -1; }
+      p = after;
       continue;
     }
 
@@ -400,6 +583,36 @@ i32 lexDollar(u8[] s, i32 at, Token word, bool quoted) {
   }
 
   return at;                                                 // a lone `$`
+}
+
+/**
+ * Read `` `command` `` from `at`, appending a Cmd part. Returns the index after the closing
+ * backquote, or -1 if the text runs out first.
+ *
+ * `$(…)` and this mean the same thing, and by the time the part is built they are the same part —
+ * only the reading differs. Backquotes cannot nest (there is one character for both ends, so
+ * there is nothing to count), and the backslash rules inside them are their own: only `` ` ``,
+ * `$` and `\` are escapable, and a backslash before anything else stays a backslash.
+ */
+i32 takeBackquote(u8[] s, i32 at, Token word, bool quoted) {
+  i32 p = at + 1;
+  string cmd = "";
+  while (p < s.len() && s[p] != 0x60) {
+    if (s[p] == 0x5c && p + 1 < s.len() && escapableInBackquote(s[p + 1])) {
+      cmd = cmd + charOf(s[p + 1]);
+      p += 2;
+      continue;
+    }
+    cmd = cmd + charOf(s[p]);
+    p++;
+  }
+  if (p >= s.len()) { return -1; }                           // unterminated
+  word.parts.push(Part.of(PartKind.Cmd, cmd, quoted));
+  return p + 1;
+}
+
+bool escapableInBackquote(i32 c) {
+  return c == 0x60 || c == 0x5c || c == 0x24;               // ` \ $
 }
 
 bool isDelimiter(i32 c) {

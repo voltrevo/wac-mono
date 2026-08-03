@@ -27,13 +27,22 @@ export struct Word {
   Word of(Vec<Part> parts) { return Word(parts); }
 }
 
-export enum RedirKind { In, Out, Append }
+export enum RedirKind {
+  In,
+  Out,
+  Append,
+  /** `<<WORD` — the input is in the script, not in a file. */
+  Here,
+}
 
 export struct Redir {
   RedirKind kind;
   /** The descriptor being redirected: 0 for `<`, 1 for `>`, or whatever `N>` said. */
   i32 fd;
   Word target;
+  /** `Here` only: the body, and whether it expands. */
+  string body;
+  bool bodyExpand;
 }
 
 export struct Assign {
@@ -579,6 +588,12 @@ i32 takeRedirs(Vec<Token> toks, i32 at, Command out) {
         if (next < 0) { return -1; }
         p = next;
       }
+      case DLess: {
+        Vec<Part> noTarget = Vec.create();
+        out.redirs.push(Redir(RedirKind.Here, toks.get(p).fd < 0 ? 0 : toks.get(p).fd,
+                              Word.of(noTarget), toks.get(p).body, toks.get(p).bodyExpand));
+        p++;
+      }
       else: return p;
     }
   }
@@ -626,6 +641,13 @@ i32 parseSimple(Vec<Token> toks, i32 at, Simple out) {
         if (next < 0) { return -1; }
         p = next;
       }
+      case DLess: {
+        // No target word to consume: the lexer already read the body off the following lines.
+        Vec<Part> noTarget = Vec.create();
+        out.redirs.push(Redir(RedirKind.Here, t.fd < 0 ? 0 : t.fd,
+                              Word.of(noTarget), t.body, t.bodyExpand));
+        p++;
+      }
       else: {
         // Anything else ends the command. A command with neither words nor redirections is a
         // syntax error — `| foo` and `&& foo` reach here with nothing collected.
@@ -654,7 +676,7 @@ i32 takeRedirInto(Vec<Token> toks, i32 at, Vec<Redir> into, RedirKind kind, i32 
     case Word: {}
     else: return -1;                       // `> ;` and `> |` are syntax errors, not empty targets
   }
-  into.push(Redir(kind, fd, Word.of(target.parts)));
+  into.push(Redir(kind, fd, Word.of(target.parts), "", false));
   return p + 1;
 }
 
