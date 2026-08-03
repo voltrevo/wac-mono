@@ -60,3 +60,17 @@ The fix is presumably an `onerror`/`onmessageerror` handler on the `Worker` in
 `packages/platform/host/children.ts` that resolves the child's ticket as a failure rather than
 letting the error escape. Whether a worker that dies *later* should surface through `exitCode` as
 negative is the same question and probably the same handler.
+
+## Still live, 2026-08-03 (agent-a)
+
+Reproduces exactly as written. The shell dies and `still-here` never prints:
+
+```
+error: Uncaught (in promise) Error: Unhandled error in child worker.
+```
+
+More reachable than when it was filed: the browser terminal and `box`'s `bin/sh.wac` are shells
+people are meant to type into, and `$WACPATH` is one `export` away from being set. A file that is
+not a worker bundle is the ordinary case — anything built without `--worker`, or a text file with
+the right name — so this is a trap a user can walk into rather than a wrong answer a program has to
+be written to hit.
