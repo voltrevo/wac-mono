@@ -20,7 +20,7 @@ import { encodeVersions, negotiateVersion, encodeNetinfo, encodeCreate2, decodeC
          cmdVersions, cmdNetinfo, cmdCerts, cmdAuthChallenge, cmdVpadding, cmdCreated2,
          cmdDestroy } from "./cell.wac";
 import { ntorClientRequest, ntorClientFinish } from "./ntor.wac";
-import { recordLength } from "../../tls/src/record.wac";
+import { recordsReady } from "../../tls/src/record.wac";
 import { tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientPhase, tlsClientFailure }
   from "../../tls/src/client.wac";
 
@@ -137,23 +137,6 @@ export bool pump(Link l) {
  * a local client wanting attention while the relay is quiet is the ordinary case. Such a
  * program does its own `waitAny` over every handle it holds and hands the bytes to this.
  */
-/**
- * How much of `raw` is a whole number of TLS records — 0 if not even one has arrived.
- *
- * The answer is a prefix length rather than a count, because that is what the caller needs:
- * feed this many bytes, keep the rest. A record whose header is present but whose body is
- * not stops the scan, and so does a header that is not yet five bytes long.
- */
-export i32 wholeRecordBytes(u8[] raw) {
-  i32 ready = 0;
-  while (raw.len() - ready >= 5) {
-    i32 n = recordLength(sliceOf(raw, ready, raw.len()));
-    if (n < 0 || raw.len() - ready < 5 + n) { break; }
-    ready = ready + 5 + n;
-  }
-  return ready;
-}
-
 export bool feedLink(Link l, u8[] chunk) {
   if (chunk.len() == 0) { return false; }
 
@@ -166,8 +149,12 @@ export bool feedLink(Link l, u8[] chunk) {
   // a real transfer gets 44KB in a chunk, some eighty records with the last one cut in half,
   // and traps. `gets.wac` had the framing right and put the reason in a comment: this is how
   // a reader that mostly works fails on a fast connection rather than a slow one.
+  //
+  // The loop that used to be here now lives in `record.wac` as `recordsReady`, next to the
+  // framing it belongs to and next to the server's `tlsRecordNeeded`, so there is one copy
+  // rather than one per caller.
   l.raw = concat(l.raw, chunk);
-  i32 ready = wholeRecordBytes(l.raw);
+  i32 ready = recordsReady(l.raw);
   if (ready == 0) { return true; }
   u8[] whole = sliceOf(l.raw, 0, ready);
   l.raw = sliceOf(l.raw, ready, l.raw.len());

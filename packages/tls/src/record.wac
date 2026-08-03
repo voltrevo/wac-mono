@@ -127,6 +127,30 @@ export i32 recordLength(u8[] buf) {
 }
 
 /**
+ * How much of `buf` is a whole number of records — 0 if not even one has arrived yet.
+ *
+ * The counterpart to `recordLength` for a reader holding a socket buffer, and the answer is
+ * a prefix length rather than a count because that is what the caller does with it: feed
+ * this many bytes to `tlsClientFeed`, keep the rest for next time.
+ *
+ * This exists because the package asked every client-side caller to do it and gave them
+ * nothing to do it with, while the server side has had `tlsRecordNeeded` all along. Both
+ * callers hand-rolled the loop; one of them got it wrong and stayed wrong for a year,
+ * because a fetch of a few small records never splits one and only bulk traffic does. An
+ * asymmetric API is how you get one correct copy and one incorrect copy of the same six
+ * lines.
+ */
+export i32 recordsReady(u8[] buf) {
+  i32 ready = 0;
+  while (buf.len() - ready >= 5) {
+    i32 n = (buf[ready + 3] << 8) | buf[ready + 4];
+    if (buf.len() - ready < 5 + n) { break; }
+    ready = ready + 5 + n;
+  }
+  return ready;
+}
+
+/**
  * Open one record, returning the inner plaintext with the content type as its last byte.
  *
  * Traps if the tag does not verify, if the framing is wrong, or if the plaintext is all

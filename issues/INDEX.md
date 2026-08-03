@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0026](open/0026-gets-hand-rolls-tls-record-framing-that-now-lives-in-the-package.md) | `box gets` hand-rolls TLS record framing that now lives in the package | bug | no error |
 | [0025](open/0025-listen-takes-no-address-so-every-server-binds-every-interface.md) | `listen` takes no address, so every server binds every interface | missing feature | not implemented |
 | [0017](open/0017-deno-task-app-orphans-the-application-when-the-launcher-is-killed.md) | `deno task app` orphans the application when the launcher is killed | bug | wrong answer |
 | [0014](open/0014-platform-has-no-way-to-write-bytes-to-standard-error.md) | platform has no way to write bytes to standard error | missing feature | not implemented |
