@@ -172,7 +172,6 @@ export struct Client {
       }
       // A banner may arrive before either, and anything else is not ours to interpret.
     }
-    trap;
   }
 
   /**
