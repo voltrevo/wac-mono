@@ -46,7 +46,7 @@ import { Network, Guard, Building, bootstrap, connectGuard, startCircuit, advanc
          circuitReady, circuitFailed } from "./bootstrap.wac";
 import { Circuit, Received, gotData, gotEnd, gotConnected, gotBroken, gotDestroyed }
   from "./circuit.wac";
-import { cellCircId } from "./cell.wac";
+import { cellCircId, encodeDestroy, destroyRequested } from "./cell.wac";
 import { Link, feedLink, takeCell, sendCells, sliceOf, concat, itoa } from "./link.wac";
 import { socksReply, replyForEndReason, endReasonName, targetOf, requestLength,
          repOk, repFailure, repNotAllowed, repBadCommand, repBadAddress } from "./socks5.wac";
@@ -394,7 +394,37 @@ export i32 main(Core core, Cli cli) {
         if (b.port == want && b.state != circuitFailed()) { use = i; }
       }
       if (use < 0) {
-        if (circuits.len() >= MAX_CIRCUITS) {
+        // A failed circuit's slot is free. Every client on it was dropped when it failed, so
+        // nothing holds the index and it can be written over — which matters because the
+        // slots are otherwise permanent: six requests for ports no exit carries would fill
+        // the table with corpses and refuse everything after, for the life of the process.
+        // With `listen` binding every interface (issue 0025), six connections from anywhere.
+        i32 slot = -1;
+        for (i32 i = 0; i < circuits.len(); i++) {
+          if (circuits.get(i).state == circuitFailed()) { slot = i; }
+        }
+        // Still nothing, and full: reclaim a circuit nobody is using. Without this, six
+        // requests for six different ports wedge the proxy for good — and those six all
+        // *succeeded*, which is the awkward part. A working circuit that no longer has a
+        // stream on it is exactly the thing to take.
+        if (slot < 0 && circuits.len() >= MAX_CIRCUITS) {
+          for (i32 i = 0; i < circuits.len() && slot < 0; i++) {
+            bool busy = false;
+            for (i32 j = 0; j < clients.len(); j++) {
+              if (clients.get(j).circIdx == i) { busy = true; }
+            }
+            if (!busy) { slot = i; }
+          }
+          if (slot >= 0) {
+            // Told, not dropped. The three relays hold key material and the exit holds an
+            // open connection until they hear otherwise.
+            core.log("retiring idle circuit " + itoa(slot) + " (port " +
+                     itoa(circuits.get(slot).port) + ") to make room for " + itoa(want));
+            sendCells(guard.link,
+                      encodeDestroy(circuits.get(slot).circId, destroyRequested()));
+          }
+        }
+        if (slot < 0 && circuits.len() >= MAX_CIRCUITS) {
           core.warn("tor: " + itoa(MAX_CIRCUITS) + " circuits already, refusing port " +
                     itoa(want));
           cli.send(c.sock, socksReply(repFailure())).wait();
@@ -404,9 +434,16 @@ export i32 main(Core core, Cli cli) {
         }
         Building fresh = startCircuit(core, net, guard, want, nextCircId);
         nextCircId += 1;
-        circuits.push(fresh);
-        use = circuits.len() - 1;
+        if (slot < 0) {
+          circuits.push(fresh);
+          use = circuits.len() - 1;
+        } else {
+          circuits.set(slot, fresh);
+          use = slot;
+        }
         if (fresh.state == circuitFailed()) {
+          // It never reached the wire — no exit carries the port. The slot stays free for
+          // the next attempt, which is the whole point of looking for one above.
           cli.send(c.sock, socksReply(repNotAllowed())).wait();
           dropClient(cli, guard, circuits, clients, who);
           if (!accepting) { acc = cli.accept(listener.handle); accepting = true; }

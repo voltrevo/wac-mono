@@ -22,6 +22,7 @@
 // finds something on Tuesday and cannot reproduce it on Wednesday is a rumour.
 
 import { T } from "../../../wactest/src/assert.wac";
+import { targetOf, requestLength, replyForEndReason, endReasonName } from "../../src/socks5.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import { cellSize, cellCommand, cellCircId, cellPayload, isVarLength, certsCount,
          decodeCreated2, negotiateVersion } from "../../src/cell.wac";
@@ -230,4 +231,87 @@ u8[] padTo(u8[] b, i32 n) {
   u8[] o = u8[n]();
   for (i32 i = 0; i < b.len() && i < n; i++) { o[i] = b[i]; }
   return o;
+}
+
+// ── The SOCKS request parser ─────────────────────────────────────────────────
+//
+// Newly attacker-facing, and more so than it looks. `socks.wac` binds every interface
+// because `listen` takes no address (issue 0025), so these bytes come from anyone who can
+// reach the host — not from a local client that could be assumed well behaved.
+//
+// The parser answers one of three things and the distinction is load-bearing: a target, ""
+// for "not all here yet", or "!" for "cannot be carried". Confusing the last two leaves a
+// client waiting for a reply that will never come, and confusing either with a target sends
+// a stream somewhere nobody asked for.
+
+export string test_fuzz_socks_requests() {
+  T t = T.create();
+  Rng r = rng(0x50C5);
+  for (i32 iter = 0; iter < 4000; iter++) {
+    i32 n = next(r) % 40;
+    u8[] req = u8[n]();
+    for (i32 i = 0; i < n; i++) { req[i] = next(r) % 256; }
+    string out = targetOf(req);
+    // `requestLength` reads fields `targetOf` has already bounds-checked, and is only ever
+    // called after a target comes back — so the pairing is what is being fuzzed, not the
+    // function alone.
+    if (out != "" && out != "!") {
+      i32 len = requestLength(req);
+      t.isTrue(len > 0 && len <= req.len(),
+               "a parsed request must lie inside the bytes it was parsed from");
+    }
+  }
+  t.isTrue(true, "no trap on 4000 random requests");
+  return t.report();
+}
+
+/**
+ * The same bytes, arriving one at a time.
+ *
+ * This is how a request actually turns up, and it is the case a whole-buffer test cannot
+ * reach: for every prefix, the answer must be "" — never a target, never a refusal — until
+ * the byte that completes it.
+ */
+export string test_fuzz_socks_requests_arriving_in_pieces() {
+  T t = T.create();
+  Rng r = rng(0x9AB1);
+  for (i32 iter = 0; iter < 600; iter++) {
+    i32 n = 8 + next(r) % 24;
+    u8[] req = u8[n]();
+    req[0] = 5;
+    req[1] = 1;
+    req[2] = 0;
+    req[3] = next(r) % 4 + 1;
+    for (i32 i = 4; i < n; i++) { req[i] = next(r) % 256; }
+
+    string whole = targetOf(req);
+    bool settled = false;
+    for (i32 cut = 0; cut <= n; cut++) {
+      u8[] part = u8[cut]();
+      for (i32 i = 0; i < cut; i++) { part[i] = req[i]; }
+      string got = targetOf(part);
+      if (got == "") { continue; }
+      // Once it answers, it must keep answering the same thing. An answer that changes as
+      // more bytes arrive is one that was given too early.
+      if (!settled) { settled = true; }
+      t.eqStr(got, whole, "an answer at " + itoa64(cut as i64) + " bytes must be final");
+    }
+  }
+  return t.report();
+}
+
+/** RELAY_END reasons, which arrive from an exit and are shown to a person. */
+export string test_fuzz_end_reason_mapping() {
+  T t = T.create();
+  Rng r = rng(0xE9D);
+  for (i32 iter = 0; iter < 2000; iter++) {
+    i32 n = next(r) % 6;
+    u8[] body = u8[n]();
+    for (i32 i = 0; i < n; i++) { body[i] = next(r) % 256; }
+    i32 code = replyForEndReason(body);
+    // RFC 1928 defines 0 through 8. A code outside that is one no client can interpret.
+    t.isTrue(code >= 0 && code <= 8, "the reply code must be one RFC 1928 defines");
+    t.isTrue(endReasonName(body).len() > 0, "and the log line must say something");
+  }
+  return t.report();
 }

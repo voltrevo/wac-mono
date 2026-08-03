@@ -448,8 +448,10 @@ circuit is marked failed so nothing new lands there; the next request for that p
 fresh one. What is not done is reattaching an in-flight stream, and deliberately: a stream
 silently moved to a different exit is a stream whose destination has quietly changed hands.
 
-**Circuits are never retired.** No `MaxCircuitDirtiness`, so a long-lived proxy keeps using
-the same path for a port for as long as it runs. `pool.wac` has the retirement logic; the
+**Circuits are retired for space, not for age.** An idle circuit is destroyed to make room
+when the table is full, which is what stops six requests for six ports wedging the proxy for
+good. There is no `MaxCircuitDirtiness`: a busy port keeps the same path for as long as the
+process runs, so a long session is linkable to itself. `pool.wac` has the age logic and the
 proxy does not use it.
 
 **No SOCKS authentication, and no isolation by credential.** Tor uses the SOCKS username and
