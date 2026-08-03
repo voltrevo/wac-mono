@@ -1,0 +1,138 @@
+// Directory request shapes and refresh scheduling.
+//
+// The refresh *time* is worth testing because getting it wrong is not a crash: fetch too
+// late and the client runs on an expired consensus, fetch at a fixed offset and every client
+// hits the caches together, which is both a herd and a fingerprint.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { microdescPath, certificatePath, splitResponse, isIdentity, refreshAt,
+         validUntil, microdescBatches, Response } from "../../src/dirclient.wac";
+
+u8[] doc(string after, string fresh, string until) {
+  return ("network-status-version 3\nvalid-after " + after +
+          "\nfresh-until " + fresh + "\nvalid-until " + until + "\n").toBytes();
+}
+
+// An hour fresh, three hours valid — a typical consensus.
+u8[] hourly() {
+  return doc("2026-08-02 10:00:00", "2026-08-02 11:00:00", "2026-08-02 13:00:00");
+}
+const i64 FRESH = 1785668400;   // 2026-08-02 11:00:00 UTC
+const i64 VALID = 1785675600;   // 2026-08-02 13:00:00 UTC
+
+export string test_request_paths() {
+  T t = T.create();
+  t.eqStr(microdescPath(string[]("aaa", "bbb", "ccc")), "/tor/micro/d/aaa-bbb-ccc",
+          "digests joined with dashes, as tor expects");
+  t.eqStr(microdescPath(string[]("only")), "/tor/micro/d/only", "one digest has no separator");
+  t.eqStr(certificatePath(string[]("AAA", "BBB")), "/tor/keys/fp/AAA+BBB",
+          "fingerprints joined with plus");
+  return t.report();
+}
+
+export string test_valid_until_is_read_as_utc() {
+  // Directory timestamps carry no zone. Reading them as local shifts every validity window
+  // by the host's offset, silently and differently per machine.
+  T t = T.create();
+  t.eqI64(validUntil(hourly()), VALID, "the epoch second, in UTC");
+  t.eqI64(validUntil("network-status-version 3\n".toBytes()), -1, "absent is -1, not zero");
+  return t.report();
+}
+
+export string test_the_refresh_window_opens_at_fresh_until_and_keeps_slack() {
+  T t = T.create();
+  t.eqI64(refreshAt(hourly(), 0), FRESH, "at the very start of the window");
+  i64 latest = refreshAt(hourly(), 9999);
+  t.isTrue(latest < VALID, "and never later than the consensus is valid");
+  t.isTrue(latest <= FRESH + ((VALID - FRESH) * 3) / 4,
+           "the last quarter is slack, so a failed download can be retried before expiry");
+  return t.report();
+}
+
+export string test_the_refresh_time_is_spread_across_the_window() {
+  // Every client refreshing at one instant is a herd on the caches and a fingerprint on the
+  // client — downloading at a distinctive moment is distinguishing.
+  T t = T.create();
+  i64 first = refreshAt(hourly(), 0);
+  i64 last = first;
+  i32 distinct = 0;
+  for (i32 i = 0; i < 20; i++) {
+    i64 v = refreshAt(hourly(), i * 500);
+    t.isTrue(v >= FRESH && v < VALID, "sample " + itoa64(i as i64) + " is inside the window");
+    if (v != last) { distinct++; }
+    last = v;
+  }
+  t.isTrue(distinct > 15, "and the samples are spread, not fixed");
+  return t.report();
+}
+
+export string test_a_consensus_with_no_schedule_gets_no_refresh_time() {
+  T t = T.create();
+  t.eqI64(refreshAt("network-status-version 3\n".toBytes(), 0), -1, "no fields at all");
+  t.eqI64(refreshAt(doc("2026-08-02 10:00:00", "2026-08-02 11:00:00", "nonsense"), 0), -1,
+          "an unparseable valid-until");
+  t.eqI64(refreshAt(doc("2026-08-02 10:00:00", "2026-08-02 13:00:00", "2026-08-02 11:00:00"), 0),
+          -1, "fresh-until after valid-until is nonsense, and refusing beats a negative window");
+  return t.report();
+}
+
+export string test_a_short_lived_consensus_still_lands_inside_its_life() {
+  // Chutney's are forty seconds long, and that is where an off-by-a-factor in the window
+  // arithmetic shows up as a refresh scheduled after expiry.
+  T t = T.create();
+  u8[] short_ = doc("2026-08-02 10:00:00", "2026-08-02 10:00:20", "2026-08-02 10:00:40");
+  i64 open = validUntil(short_) - 20;
+  i64 close = validUntil(short_);
+  for (i32 i = 0; i <= 10; i++) {
+    i64 v = refreshAt(short_, i * 1000);
+    t.isTrue(v >= open && v < close, "sample " + itoa64(i as i64) + " is inside forty seconds");
+  }
+  return t.report();
+}
+
+export string test_an_http_response_splits_at_the_blank_line() {
+  T t = T.create();
+  Response r = splitResponse(
+    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nthe body\n".toBytes());
+  t.eqI32(r.status, 200, "the status");
+  t.eqBytes(r.body, "the body\n".toBytes(), "and the body, exactly");
+  t.isTrue(isIdentity(r), "no Content-Encoding means identity");
+
+  Response e = splitResponse("HTTP/1.0 404 Not Found\r\n\r\n".toBytes());
+  t.eqI32(e.status, 404, "an error status");
+  t.eqI32(e.body.len(), 0, "with an empty body");
+
+  Response cut = splitResponse("HTTP/1.0 200 OK\r\nContent-Type: text".toBytes());
+  t.eqI32(cut.status, -1, "no terminator is a truncated response, not a bad one");
+  return t.report();
+}
+
+export string test_a_body_we_did_not_ask_to_be_compressed_is_noticed() {
+  // `Accept-Encoding: identity` is sent; a cache that compresses anyway must be detected
+  // rather than have its bytes handed to a parser as if they were a document.
+  T t = T.create();
+  Response gz = splitResponse(
+    "HTTP/1.0 200 OK\r\nContent-Encoding: deflate\r\n\r\nxxxx".toBytes());
+  t.isTrue(!isIdentity(gz), "deflate is not identity");
+  Response id = splitResponse(
+    "HTTP/1.0 200 OK\r\nContent-Encoding: identity\r\n\r\nxxxx".toBytes());
+  t.isTrue(isIdentity(id), "and identity is");
+  Response mixed = splitResponse(
+    "HTTP/1.0 200 OK\r\nCONTENT-ENCODING:   identity\r\n\r\nxxxx".toBytes());
+  t.isTrue(isIdentity(mixed), "header names are case-insensitive and the space is optional");
+  return t.report();
+}
+
+export string test_microdescriptors_are_batched_so_a_url_stays_answerable() {
+  T t = T.create();
+  string[] many = string[200](fill: "d");
+  string[][] batches = microdescBatches(many);
+  t.eqI32(batches.len(), 3, "two hundred digests is three batches");
+  t.eqI32(batches[0].len(), 92, "ninety-two, which is what tor uses");
+  t.eqI32(batches[2].len(), 16, "and the remainder in the last");
+
+  t.eqI32(microdescBatches(string[5](fill: "d")).len(), 1, "a small network is one batch");
+  t.eqI32(microdescBatches(string[0]()).len(), 0, "and none at all is none");
+  return t.report();
+}

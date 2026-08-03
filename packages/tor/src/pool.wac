@@ -1,0 +1,91 @@
+// Keeping circuits, and deciding which one a stream goes on.
+//
+// This was `host/pool.ts`, and it is the clearest case of the whole port: I had already
+// pulled `selectCircuit` and `retirable` out as pure functions and written in the comment
+// that they were separated "so it can be tested without a network or a clock" — having
+// noticed they were pure logic, and left them in TypeScript regardless.
+//
+// ## Why circuits are retired
+//
+// Reuse saves three handshakes, which is not why it needs care. "Reuse the circuit" and
+// "keep the circuit forever" are one step apart, and the second is a real leak: everything
+// on one circuit shares an exit, and that exit sees every destination. A circuit alive all
+// day hands one relay the whole day's activity, linked as one person's.
+//
+// So a circuit stops accepting *new* streams ten minutes after its first one — tor's
+// MaxCircuitDirtiness, and the default has been ten minutes for as long as it has existed.
+// A download already running keeps its circuit; what stops is anything else joining it.
+//
+// ## Isolation
+//
+// Two streams that must not be linked must not share a circuit, and only the application
+// knows which those are. tor's own default isolates by client address, SOCKS credentials and
+// protocol but deliberately *not* by destination — a circuit per site would build faster
+// than the network absorbs — and Tor Browser layers first-party-domain isolation on top.
+//
+// So an isolation key comes from the caller. This guarantees two different keys never share
+// and does not invent one.
+
+import { Vec } from "../../std/src/vec.wac";
+
+/** tor's MaxCircuitDirtiness. A bound on correlation, not a timeout. */
+export i64 maxDirtinessMs() { return 600000; }
+
+/**
+ * One circuit's place in the pool.
+ *
+ * `firstUsed` is -1 while the circuit is still clean: dirtiness is measured from first use,
+ * not from construction, so a circuit built ahead of demand does not age on the shelf.
+ */
+export struct Entry {
+  i32 id;
+  string isolation;
+  i64 firstUsed;
+  bool broken;
+  i32 openStreams;
+}
+
+/**
+ * Which existing circuit a stream may use, or -1.
+ *
+ * Usable means: matching isolation key, not broken, and either never used or first used
+ * less than MaxCircuitDirtiness ago.
+ *
+ * Dirty before clean, oldest first. A clean circuit is worth saving for a stream that finds
+ * nothing else, and among dirty ones the oldest is closest to retirement anyway — preferring
+ * the clean one would keep it permanently warm while the rest expired unused, which means
+ * more circuits built and more relays seeing a piece of the traffic.
+ */
+export i32 selectCircuit(Entry[] entries, string isolation, i64 now) {
+  i32 best = -1;
+  for (i32 i = 0; i < entries.len(); i++) {
+    Entry e = entries[i];
+    if (e.broken || e.isolation != isolation) { continue; }
+    if (e.firstUsed >= 0 && now - e.firstUsed >= maxDirtinessMs()) { continue; }
+    if (best < 0) { best = i; continue; }
+    Entry b = entries[best];
+    // A clean circuit sorts after every dirty one; between two dirty ones, older wins.
+    bool better = b.firstUsed < 0
+      ? e.firstUsed >= 0
+      : (e.firstUsed >= 0 && e.firstUsed < b.firstUsed);
+    if (better) { best = i; }
+  }
+  return best;
+}
+
+/**
+ * The circuits that can no longer take a stream and are carrying none.
+ *
+ * A broken circuit is retired even with a stream open on it: it cannot carry anything
+ * anyway — the digest is out of step or the peer is gone — so holding it open leaks a socket
+ * and hides the failure.
+ */
+export i32[] retirable(Entry[] entries, i64 now) {
+  Vec<i32> out = Vec.create();
+  for (i32 i = 0; i < entries.len(); i++) {
+    Entry e = entries[i];
+    bool expired = e.firstUsed >= 0 && now - e.firstUsed >= maxDirtinessMs();
+    if (e.broken || (expired && e.openStreams == 0)) { out.push(i); }
+  }
+  return out.toArray();
+}

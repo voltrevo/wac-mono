@@ -1,0 +1,174 @@
+// Fetching the directory over Tor: what to ask for, and when to ask again.
+//
+// This was `host/dirclient.ts` minus the socket. What remains there is a loop; everything
+// that decides anything is here.
+//
+// ## The bootstrap problem, and why it is not circular
+//
+// To build a circuit you need relay keys. To get relay keys you need the directory. To fetch
+// the directory privately you want a circuit. That resolves because the first fetch does not
+// need to be private: the consensus is a public document every client has, and downloading
+// it reveals only that you are a Tor user — which connecting to a relay revealed anyway.
+//
+// What matters is that the download's *source* is irrelevant, and that is what verification
+// buys. A client ships with hardcoded authority fingerprints and fallback mirrors, fetches
+// from one directly, and refuses anything a majority did not sign.
+
+import { Vec } from "../../std/src/vec.wac";
+import { parseInt } from "./directory.wac";
+import { parseUtc, findFrom } from "./consensus.wac";
+
+/** The URL for a batch of microdescriptors, by their base64 digests. */
+export string microdescPath(string[] digests) {
+  string out = "/tor/micro/d/";
+  for (i32 i = 0; i < digests.len(); i++) {
+    out = i == 0 ? out + digests[i] : out + "-" + digests[i];
+  }
+  return out;
+}
+
+export string consensusPath() { return "/tor/status-vote/current/consensus-microdesc"; }
+
+/**
+ * The URL for the certificates of the authorities we name.
+ *
+ * Asking by fingerprint rather than taking whatever the cache volunteers: we know which
+ * authorities we trust, and a cache that omits one should look like a missing signature
+ * rather than like an authority that does not exist.
+ */
+export string certificatePath(string[] fingerprints) {
+  string out = "/tor/keys/fp/";
+  for (i32 i = 0; i < fingerprints.len(); i++) {
+    out = i == 0 ? out + fingerprints[i] : out + "+" + fingerprints[i];
+  }
+  return out;
+}
+
+/** An HTTP/1.0 response split into its status and body. */
+export struct Response {
+  i32 status;
+  /** Lowercased header block, for looking at Content-Encoding. */
+  string headers;
+  u8[] body;
+}
+
+/**
+ * Split a directory response.
+ *
+ * Directory responses are simple enough not to want a real HTTP client: no chunking, no
+ * keep-alive, and the stream ends when the body does. `Content-Length` is not even always
+ * present, which is why the body is "whatever arrived" rather than a counted read.
+ *
+ * A status of -1 means there was no header terminator at all, which is a truncated response
+ * rather than a bad one.
+ */
+export Response splitResponse(u8[] bytes) {
+  i32 at = findFrom(bytes, "\r\n\r\n", 0);
+  if (at < 0) { return Response(-1, "", u8[0]()); }
+  u8[] head = u8[at]();
+  for (i32 i = 0; i < at; i++) { head[i] = bytes[i]; }
+  u8[] body = u8[bytes.len() - at - 4]();
+  for (i32 i = 0; i < body.len(); i++) { body[i] = bytes[at + 4 + i]; }
+
+  // "HTTP/1.0 200 OK" — the status is the second space-separated field.
+  i32 firstSpace = -1;
+  i32 secondSpace = -1;
+  for (i32 i = 0; i < at; i++) {
+    if (head[i] == ' ') {
+      if (firstSpace < 0) { firstSpace = i; }
+      else if (secondSpace < 0) { secondSpace = i; }
+    }
+    if (head[i] == '\r') { i = at; }
+  }
+  i32 status = -1;
+  if (firstSpace >= 0) {
+    i32 end = secondSpace < 0 ? at : secondSpace;
+    u8[] f = u8[end - firstSpace - 1]();
+    for (i32 i = 0; i < f.len(); i++) { f[i] = head[firstSpace + 1 + i]; }
+    status = parseInt(string.fromBytes(f));
+  }
+  return Response(status, lower(head), body);
+}
+
+string lower(u8[] b) {
+  u8[] o = u8[b.len()]();
+  for (i32 i = 0; i < b.len(); i++) {
+    o[i] = b[i] >= 'A' && b[i] <= 'Z' ? b[i] + 32 : b[i];
+  }
+  return string.fromBytes(o);
+}
+
+/** Whether the response says it compressed the body, which we did not ask for. */
+export bool isIdentity(Response r) {
+  u8[] h = r.headers.toBytes();
+  i32 at = findFrom(h, "content-encoding:", 0);
+  if (at < 0) { return true; }
+  i32 v = at + 17;
+  while (v < h.len() && h[v] == ' ') { v++; }
+  return v + 8 <= h.len() && startsAt(h, v, "identity");
+}
+
+bool startsAt(u8[] b, i32 at, string s) {
+  u8[] w = s.toBytes();
+  if (at + w.len() > b.len()) { return false; }
+  for (i32 i = 0; i < w.len(); i++) {
+    if (b[at + i] != w[i]) { return false; }
+  }
+  return true;
+}
+
+// ── Keeping it current ───────────────────────────────────────────────────────
+
+/**
+ * When to fetch the next consensus, as a unix second — or -1 if this one has no schedule.
+ *
+ * dir-spec §5.1. Not "when the current one expires": every client would then hit the caches
+ * at the same instant, which is both a thundering herd and a fingerprint, since a client
+ * downloading at a distinctive moment is distinguishable. The time is chosen uniformly in a
+ * window opening at `fresh-until` and closing three quarters of the way to `valid-until`,
+ * leaving a quarter of the interval as slack for the download to fail and be retried before
+ * anything expires.
+ *
+ * `r01` is a fraction in [0, 10000), supplied rather than drawn so the schedule is testable.
+ */
+export i64 refreshAt(u8[] doc, i32 r01) {
+  i64 fresh = timeOf(doc, "fresh-until");
+  i64 valid = timeOf(doc, "valid-until");
+  if (fresh < 0 || valid < 0 || valid <= fresh) { return -1; }
+  i64 span = ((valid - fresh) * 3) / 4;
+  return fresh + (span * (r01 as i64)) / 10000;
+}
+
+/** Unix second at which a consensus stops being acceptable at all, or -1. */
+export i64 validUntil(u8[] doc) { return timeOf(doc, "valid-until"); }
+
+i64 timeOf(u8[] doc, string field) {
+  i32 at = findFrom(doc, "\n" + field + " ", 0);
+  i32 from = -1;
+  if (at >= 0) { from = at + field.len() + 2; }
+  else if (startsAt(doc, 0, field + " ")) { from = field.len() + 1; }
+  if (from < 0) { return -1; }
+  i32 end = from;
+  while (end < doc.len() && doc[end] != '\n') { end++; }
+  return parseUtc(doc, from, end);
+}
+
+/**
+ * Batches of microdescriptor digests, sized so a URL stays within what a cache will answer.
+ *
+ * Ninety-two is what tor uses. The loop exists so that a small network is one batch as a
+ * property of the data rather than of the code — the version of this that only ever ran once
+ * looked identical and was untested for the case that matters.
+ */
+export string[][] microdescBatches(string[] digests) {
+  Vec<string[]> out = Vec.create();
+  i32 at = 0;
+  while (at < digests.len()) {
+    i32 n = digests.len() - at < 92 ? digests.len() - at : 92;
+    string[] batch = string[n](fill: "");
+    for (i32 i = 0; i < n; i++) { batch[i] = digests[at + i]; }
+    out.push(batch);
+    at += n;
+  }
+  return out.toArray();
+}
