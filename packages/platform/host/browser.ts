@@ -34,8 +34,17 @@ import { type Handlers } from "./respond.ts";
 import { CHUNK } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { OP } from "./ops.ts";
+import { ChildStack, packCaptured, unpackPush } from "./child.ts";
 
 const EMPTY = new Uint8Array(0);
+
+/** A `warn` payload as a line of a captured error stream: its bytes, then a newline. */
+function lineOf(p: Uint8Array): Uint8Array {
+  const out = new Uint8Array(p.length + 1);
+  out.set(p, 0);
+  out[p.length] = 10;
+  return out;
+}
 
 // The File System Access API, described rather than imported — the same discipline
 // `node.ts` uses for `node:worker_threads`, and for the same reason: this file has to
@@ -138,6 +147,11 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     return [unstr(p.subarray(4, 4 + n)), unstr(p.subarray(4 + n))];
   };
 
+  // A program running inside this one. Both path walkers above go through `kids.path`, so a
+  // child's relative paths resolve from where the shell put it; with nothing pushed it is the
+  // identity and every path means exactly what it did before.
+  const kids = new ChildStack();
+
   const canWrite = (): void => {
     if (opts.root === undefined || opts.writable !== true) deny("filesystem write");
   };
@@ -150,7 +164,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    * for them to be absolute about.
    */
   const resolve = async (path: string, create: boolean): Promise<Resolved> => {
-    const parts = path.split("/").filter((p) => p !== "" && p !== ".");
+    const parts = kids.path(path).split("/").filter((p) => p !== "" && p !== ".");
     if (parts.length === 0) throw new Error("empty path");
     let dir = root();
     for (let i = 0; i < parts.length - 1; i++) {
@@ -179,7 +193,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    * listing, so portable code asked the obvious question and silently got nothing.
    */
   const dirOf = async (path: string, create: boolean): Promise<DirHandle> => {
-    const parts = path.split("/").filter((x) => x !== "" && x !== ".");
+    const parts = kids.path(path).split("/").filter((x) => x !== "" && x !== ".");
     let dir = root();
     for (const part of parts) dir = await dir.getDirectoryHandle(part, { create });
     return dir;
@@ -258,19 +272,47 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       if (n < 0 || n > 1 << 20) throw new Error(`randomBytes(${n}) out of range`);
       return crypto.getRandomValues(new Uint8Array(n));
     },
-    [OP.LOG]: (p) => { log(unstr(p)); return EMPTY; },
-    [OP.WARN]: (p) => { warn(unstr(p)); return EMPTY; },
+    // `log` is standard output, so a child's lines are kept with the rest of its output rather
+    // than appearing on the parent's terminal. Thirty of `box`'s applets write this way.
+    [OP.LOG]: (p) => {
+      if (kids.active) { kids.write(lineOf(p)); return EMPTY; }
+      log(unstr(p));
+      return EMPTY;
+    },
+    [OP.WARN]: (p) => {
+      if (kids.warn(lineOf(p))) return EMPTY;
+      warn(unstr(p));
+      return EMPTY;
+    },
 
-    [OP.ARG_COUNT]: () => i32le(args.length),
+    [OP.PUSH_CHILD]: (p) => {
+      const { argv, stdin, cwd } = unpackPush(p);
+      kids.push(argv, stdin, cwd);
+      return EMPTY;
+    },
+    [OP.POP_CHILD]: () => {
+      const { out, err } = kids.pop();
+      return packCaptured(out, err);
+    },
+
+    // A child has its own command line: an applet reading `cli.arg(1)` must see what the shell
+    // typed, not what the shell itself was started with.
+    [OP.ARG_COUNT]: () => i32le((kids.args() ?? args).length),
     [OP.ARG]: (p) => {
+      const own = kids.args() ?? args;
       const i = readI32le(p);
-      return str(i >= 0 && i < args.length ? args[i] : "");
+      return str(i >= 0 && i < own.length ? own[i] : "");
     },
     // Unset, always. One byte of presence says so, as it does everywhere else.
     [OP.ENV]: () => new Uint8Array([0]),
 
-    [OP.READ_STDIN]: () => EMPTY,
+    // A page has no standard input of its own; a child running inside it does.
+    [OP.READ_STDIN]: () => kids.readAll() ?? EMPTY,
     [OP.WRITE_STDOUT]: async (p) => {
+      if (kids.active) {
+        if (!kids.write(p)) throw new Error("the child's output buffer is full");
+        return EMPTY;
+      }
       if (sink === null) { write(p); return EMPTY; }
       await sink.write(p);
       return EMPTY;
@@ -365,6 +407,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       return EMPTY;
     },
     [OP.READ_CHUNK]: async () => {
+      const fed = source === null ? kids.readChunk() : null;
+      if (fed !== null) return fed;
       if (source === null) return EMPTY;
       const end = Math.min(source.at + CHUNK, source.blob.size);
       if (end <= source.at) return EMPTY;

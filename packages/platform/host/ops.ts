@@ -46,6 +46,8 @@ export const OP = {
   NEXT_FILE: 39,
   OFFER_DOWNLOAD: 40,
   CWD: 41,
+  PUSH_CHILD: 42,
+  POP_CHILD: 43,
 } as const;
 
 /**

@@ -115,6 +115,20 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
         `${args.join(" ")} differs`,
       );
     }
+    // `-n`, against a fixture that has numbers in it. The words fixture above cannot catch a
+    // missing `-n`: every line counts as zero, so ignoring the flag and honouring it agree.
+    // Ignoring it is exactly what this did until `seq 1 20 | sort -n` answered 1, 10, 11.
+    const numbers = await Deno.makeTempFile({ prefix: "wac-box-num-" });
+    await Deno.writeTextFile(numbers, ["10", "9", "100", "-5", "9", "0", "1000", "07"].join("\n") + "\n");
+    for (const flags of [["-n"], ["-n", "-r"], ["-n", "-u"]]) {
+      assertEquals(
+        box(["sort", ...flags, numbers]).out,
+        sys("sort", [...flags, numbers]),
+        `sort ${flags.join(" ")} differs`,
+      );
+    }
+    await Deno.remove(numbers);
+
     assertEquals(box(["head", "-3", fixture]).out, sys("head", ["-3", fixture]), "head -N");
     assertEquals(box(["tail", "-n", "2", fixture]).out, sys("tail", ["-n", "2", fixture]), "tail -n N");
     assertEquals(box(["wc", "-l", fixture]).out.trim(), sys("wc", ["-l", fixture]).trim().split(/\s+/)[0]);

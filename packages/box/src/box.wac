@@ -88,8 +88,31 @@ import { zstd } from "./applets/zstd.wac";
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 1) { return usage(core); }
   string applet = cli.arg(0).wait();
-  Args a = parseArgs(cli);
+  i32 code = dispatch(core, cli, parseArgs(cli), applet);
+  if (code != UNKNOWN) { return code; }
 
+  core.warn("box: unknown applet '" + applet + "'");
+  return usage(core);
+}
+
+/**
+ * What `dispatch` answers for a name it does not have, distinct from any applet's own status.
+ *
+ * -1 because no applet returns it: statuses here are 0, 1, 2 and occasionally an exit code from
+ * something else, all non-negative. A caller that cannot tell "no such applet" from "it ran and
+ * failed" reports the wrong thing — which is the same distinction `packages/sh` needs `found` for.
+ */
+export const i32 UNKNOWN = -1;
+
+/**
+ * The table, and the only copy of it.
+ *
+ * Split out of `main` when `packages/sh` began running applets in-process: the shell has argv and
+ * standard input of its own, so it cannot go through `main`, and a second table would have been
+ * two lists of sixty names drifting apart. `main` is now the argv-reading half and this is the
+ * choosing half.
+ */
+export i32 dispatch(Core core, Cli cli, Args a, string applet) {
   if (applet == "base32")    { return base32(core, cli, a); }
   if (applet == "base64")    { return base64(core, cli, a); }
   if (applet == "basename")  { return basename(core, cli, a); }
@@ -154,8 +177,7 @@ export i32 main(Core core, Cli cli) {
   if (applet == "true")      { return 0; }
   if (applet == "false")     { return 1; }
 
-  core.warn("box: unknown applet '" + applet + "'");
-  return usage(core);
+  return UNKNOWN;
 }
 
 i32 usage(Core core) {
@@ -165,7 +187,7 @@ i32 usage(Core core) {
   core.warn("  paste rev rm rmdir seq serve sha256sum sha512sum shuf sort split sponge");
   core.warn("  stat strings tac tail tar tee touch tr true uniq unzstd urldecode");
   core.warn("  urlencode uuid wc wget yes zstd");
-  core.warn("flags: grep -ivnc   sort -ru   uniq -c   wc -lwc   head/tail/fold -N");
+  core.warn("flags: grep -ivnc   sort -run   uniq -c   wc -lwc   head/tail/fold -N");
   core.warn("       cut -f<n> -d<c>   tr <set1> <set2>   mkdir -p   rm -rf   json -c");
   core.warn("net:   get <host> [path] [-<port>] [-i]   wget <host> <path> <out>\n"
             + "       serve [-<port>] [-o]   httpd [-<port>] [dir] [-o] [-x]\n"

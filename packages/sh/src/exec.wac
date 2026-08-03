@@ -49,6 +49,22 @@ export struct Shell {
   Buf outBuf;
 
   /**
+   * What to try for a command that is not a builtin, before the small implementations in
+   * `program.wac`.
+   *
+   * A funcref rather than an import, because the table of real programs is in `packages/box` and
+   * `box` already depends on this package — importing it back would be a cycle. So the wiring goes
+   * the other way: whoever has both hands one to the other. `box/example/term.wac` is nine
+   * characters of it.
+   *
+   * `Output.missing()` means "not mine", and the caller falls through, so an unset hook and a hook
+   * that does not recognise the name take the same path. `noExternal` is the default and does
+   * exactly that: a `Shell` built by anything that has never heard of `box` behaves as it always
+   * did, which is what keeps this package testable on its own.
+   */
+  fn[Output(Core, Cli, string, Vec<string>, u8[])] external;
+
+  /**
    * Every name ever set, so the table can be copied.
    *
    * `Map` offers no iteration, and a subshell has to start from a *copy* of its parent's
@@ -96,7 +112,8 @@ export struct Shell {
     // guess. A browser answers "/" — the root of its Origin Private File System — which is the
     // true answer there rather than a stand-in.
     return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
-                 false, Buf.create(), Vec.create(), Map.create(hashString, stringEq),
+                 false, Buf.create(), noExternal, Vec.create(),
+                 Map.create(hashString, stringEq),
                  Vec.create(), Vec.create(), false, u8[0](), 0, cli.cwd().wait());
   }
 
@@ -922,7 +939,19 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   // started, and now that something can they are the fallback rather than the answer.
   Output spawned = trySpawn(sh, argv, stdin);
   if (spawned.found) { return spawned; }
+  // Then whatever was handed to us — `packages/box`'s applets, when something wired them in.
+  // After `spawn` because a separate worker with its own grants is a real boundary and this is
+  // not: an applet running here is the same wasm instance with the same authority. Before the
+  // table below because these are the programs someone finished, and those are the ones I wrote
+  // to stand in for them.
+  Output given = sh.external(sh.core, sh.cli, sh.cwd, argv, stdin);
+  if (given.found) { return given; }
   return run(sh.cli, sh.cwd, argv, stdin);
+}
+
+/** The default `Shell.external`: nothing is wired in, so every name falls through. */
+Output noExternal(Core core, Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
+  return Output.missing();
 }
 
 /**

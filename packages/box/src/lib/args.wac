@@ -22,6 +22,16 @@ export struct Args {
   /** `-5`, or `-n 5`. Zero when absent, which each applet reads as its own default. */
   i32 num;
   string[] rest;
+  /**
+   * The arguments exactly as they were spelled, which `flagValue` needs and the fields above
+   * cannot reconstruct: `-iv` and `-d,` are both "letters after a dash" once parsed.
+   *
+   * Kept here rather than read back from the `Cli` so that an `Args` means the same thing however
+   * it was built. It used to come from `cli.arg(i)`, which was fine while the only arguments in
+   * existence were the process's own — and wrong the moment `packages/sh` began running applets
+   * in-process with a command line of its own.
+   */
+  string[] argv;
 }
 
 export bool has(Args a, i32 flag) {
@@ -42,11 +52,23 @@ export Args parseArgs(Cli cli) {
 }
 
 export Args parseFrom(Cli cli, i32 first, string name) {
+  // Materialised, then parsed by the list form below. The parser used to read `cli.arg(i)` inside
+  // its loops, which meant it could only ever parse *this process's* arguments — and the shell
+  // running an applet in-process has a `Vec<string>` of its own to hand over. Same parser, so a
+  // flag cannot come to mean one thing under `box` and another under `sh`.
+  i32 n = cli.argCount().wait();
+  string[] argv = string[n](fill: "");
+  for (i32 i = 0; i < n; i++) { argv[i] = cli.arg(i).wait(); }
+  return parseList(argv, first, name);
+}
+
+/** The same, over arguments somebody already has. `first` is where the applet's own begin. */
+export Args parseList(string[] argv, i32 first, string name) {
   // Counted first so the array is the right size: there is no growable list here, and
   // walking twice is less code than guessing a capacity and copying.
   i32 count = 0;
-  for (i32 i = first; i < cli.argCount().wait(); i++) {
-    if (!isFlag(cli.arg(i).wait())) { count++; }
+  for (i32 i = first; i < argv.len(); i++) {
+    if (!isFlag(argv[i])) { count++; }
   }
   string[] rest = string[count](fill: "");
 
@@ -54,22 +76,22 @@ export Args parseFrom(Cli cli, i32 first, string name) {
   i32 num = 0;
   i32 at = 0;
   i32 i = first;
-  while (i < cli.argCount().wait()) {
-    string s = cli.arg(i).wait();
+  while (i < argv.len()) {
+    string s = argv[i];
     if (!isFlag(s)) { rest[at] = s; at++; i++; continue; }
     u8[] b = s.toBytes();
     if (b[1] >= '0' && b[1] <= '9') {
       num = atoi(string.fromBytes(slice(b, 1, b.len())));          // -5
     } else {
       for (i32 k = 1; k < b.len(); k++) {
-        bool takesValue = b[k] == 'n' && i + 1 < cli.argCount().wait() && allDigits(cli.arg(i + 1).wait());
-        if (takesValue) { num = atoi(cli.arg(i + 1).wait()); i++; }       // -n 5
+        bool takesValue = b[k] == 'n' && i + 1 < argv.len() && allDigits(argv[i + 1]);
+        if (takesValue) { num = atoi(argv[i + 1]); i++; }                 // -n 5
         else { flags = flags + string.fromBytes(slice(b, k, k + 1)); }
       }
     }
     i++;
   }
-  return Args(name, flags, num, rest);
+  return Args(name, flags, num, rest, argv);
 }
 
 /**
@@ -85,11 +107,11 @@ export Args parseFrom(Cli cli, i32 first, string name) {
  * an applet that accepted it here would read one argument twice. An applet should treat the
  * empty result as a usage error rather than guess, which is what `cut` does.
  */
-export string flagValue(Cli cli, i32 letter) {
+export string flagValue(Args a, i32 letter) {
   // From 0, which is safe under both layouts: an applet name never begins with a dash,
   // so `box`'s extra leading argument cannot be mistaken for a flag.
-  for (i32 i = 0; i < cli.argCount().wait(); i++) {
-    u8[] b = cli.arg(i).wait().toBytes();
+  for (i32 i = 0; i < a.argv.len(); i++) {
+    u8[] b = a.argv[i].toBytes();
     if (b.len() < 2 || b[0] != '-' || b[1] != letter) { continue; }
     if (b.len() > 2) { return string.fromBytes(slice(b, 2, b.len())); }
   }

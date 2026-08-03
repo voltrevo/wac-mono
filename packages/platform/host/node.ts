@@ -13,6 +13,7 @@
 import { type Handlers } from "./respond.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { OP } from "./ops.ts";
+import { ChildStack, packCaptured, unpackPush } from "./child.ts";
 
 /** Node's pieces, described rather than imported, so this file checks under Deno. */
 export type NodeIo = {
@@ -60,6 +61,14 @@ export type NodeWorldOptions = {
 
 const EMPTY = new Uint8Array(0);
 
+/** A `warn` payload as a line of a captured error stream: its bytes, then a newline. */
+function lineOf(p: Uint8Array): Uint8Array {
+  const out = new Uint8Array(p.length + 1);
+  out.set(p, 0);
+  out[p.length] = 10;
+  return out;
+}
+
 /** Node's globals, described rather than imported, so this file type-checks under Deno. */
 type NodeProcess = { argv: string[]; env: Record<string, string | undefined> };
 type NodeFs = {
@@ -89,6 +98,10 @@ export function nodeWorld(
   let nextHandle = 1;
   const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
 
+  // A program running inside this one. `P` is the identity when nothing is pushed.
+  const kids = new ChildStack();
+  const P = (path: string) => kids.path(path);
+
   return {
     [OP.NOW_MILLIS]: () => i64le(BigInt(Date.now())),
     [OP.MONOTONIC_NANOS]: () => i64le(BigInt(Math.round(performance.now() * 1e6))),
@@ -113,13 +126,36 @@ export function nodeWorld(
       }
       return out;
     },
-    [OP.LOG]: (p) => { log(unstr(p)); return EMPTY; },
-    [OP.WARN]: (p) => { warn(unstr(p)); return EMPTY; },
+    // `log` is standard output, so a child's lines are kept with the rest of its output rather
+    // than appearing on the parent's terminal. Thirty of `box`'s applets write this way.
+    [OP.LOG]: (p) => {
+      if (kids.active) { kids.write(lineOf(p)); return EMPTY; }
+      log(unstr(p));
+      return EMPTY;
+    },
+    [OP.WARN]: (p) => {
+      if (kids.warn(lineOf(p))) return EMPTY;
+      warn(unstr(p));
+      return EMPTY;
+    },
 
-    [OP.ARG_COUNT]: () => i32le(args.length),
+    [OP.PUSH_CHILD]: (p) => {
+      const { argv, stdin, cwd } = unpackPush(p);
+      kids.push(argv, stdin, cwd);
+      return EMPTY;
+    },
+    [OP.POP_CHILD]: () => {
+      const { out, err } = kids.pop();
+      return packCaptured(out, err);
+    },
+
+    // A child has its own command line: an applet reading `cli.arg(1)` must see what the shell
+    // typed, not what the shell itself was started with.
+    [OP.ARG_COUNT]: () => i32le((kids.args() ?? args).length),
     [OP.ARG]: (p) => {
+      const own = kids.args() ?? args;
       const i = readI32le(p);
-      return str(i >= 0 && i < args.length ? args[i] : "");
+      return str(i >= 0 && i < own.length ? own[i] : "");
     },
     [OP.ENV]: (p) => {
       const v = opts.env?.(unstr(p));
@@ -135,13 +171,17 @@ export function nodeWorld(
       if (!opts.fs?.read) deny("filesystem read");
       // Node hands back a Buffer, which is a Uint8Array — but a *view* into a pooled
       // allocation, so it is copied rather than parked in the bridge as it came.
-      return new Uint8Array(await fs.readFile(unstr(p)));
+      return new Uint8Array(await fs.readFile(P(unstr(p))));
     },
 
     // stdin and stdout need no grant: what the user pipes in and what the program prints
     // are the user's own doing, not a reach into something they did not offer.
-    [OP.READ_STDIN]: async () => await io.readStdin(),
+    [OP.READ_STDIN]: async () => kids.readAll() ?? await io.readStdin(),
     [OP.WRITE_STDOUT]: async (p) => {
+      if (kids.active) {
+        if (!kids.write(p)) throw new Error("the child's output buffer is full");
+        return EMPTY;
+      }
       if (sink === null) { await io.writeStdout(p); return EMPTY; }
       await sink.write(p);
       return EMPTY;
@@ -152,7 +192,7 @@ export function nodeWorld(
       const dv = new DataView(out.buffer);
       if (!opts.fs?.read) return out; // not granted reads as "does not exist"
       try {
-        const st = await io.stat(unstr(p));
+        const st = await io.stat(P(unstr(p)));
         out[0] = 1;
         out[1] = st.isFile ? 1 : 0;
         out[2] = st.isDirectory ? 1 : 0;
@@ -163,13 +203,13 @@ export function nodeWorld(
     },
     [OP.READ_DIR]: async (p) => {
       if (!opts.fs?.read) deny("filesystem read");
-      const names = await io.readDir(unstr(p));
+      const names = await io.readDir(P(unstr(p)));
       return str(names.join("\u0000"));
     },
     [OP.WRITE_FILE]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");
       const n = readI32le(p);
-      await fs.writeFile(unstr(p.subarray(4, 4 + n)), p.subarray(4 + n));
+      await fs.writeFile(P(unstr(p.subarray(4, 4 + n))), p.subarray(4 + n));
       return EMPTY;
     },
 
@@ -179,11 +219,14 @@ export function nodeWorld(
       source = null;
       if (path === "") return EMPTY;
       if (!opts.fs?.read) deny("filesystem read");
-      source = await io.openFile(path);
+      source = await io.openFile(P(path));
       return EMPTY;
     },
-    [OP.READ_CHUNK]: async () =>
-      source === null ? await io.readStdinChunk() : await source.read(),
+    [OP.READ_CHUNK]: async () => {
+      const fed = source === null ? kids.readChunk() : null;
+      if (fed !== null) return fed;
+      return source === null ? await io.readStdinChunk() : await source.read();
+    },
 
     [OP.OPEN_OUTPUT]: async (p) => {
       const path = unstr(p);
@@ -191,7 +234,7 @@ export function nodeWorld(
       sink = null;
       if (path === "") return EMPTY;
       if (!opts.fs?.write) deny("filesystem write");
-      sink = await io.createFile(path);
+      sink = await io.createFile(P(path));
       return EMPTY;
     },
 
@@ -242,20 +285,20 @@ export function nodeWorld(
 
     [OP.MKDIR]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");
-      await fs.mkdir(unstr(p.subarray(1)), { recursive: p[0] === 1 });
+      await fs.mkdir(P(unstr(p.subarray(1))), { recursive: p[0] === 1 });
       return EMPTY;
     },
     [OP.REMOVE]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");
       // `force: false` so that removing something absent fails, as `Deno.remove` does.
       // Node's `rm` is otherwise happy to report success for a path that was never there.
-      await fs.rm(unstr(p.subarray(1)), { recursive: p[0] === 1, force: false });
+      await fs.rm(P(unstr(p.subarray(1))), { recursive: p[0] === 1, force: false });
       return EMPTY;
     },
     [OP.RENAME]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");
       const n = readI32le(p);
-      await fs.rename(unstr(p.subarray(4, 4 + n)), unstr(p.subarray(4 + n)));
+      await fs.rename(P(unstr(p.subarray(4, 4 + n))), P(unstr(p.subarray(4 + n))));
       return EMPTY;
     },
   };

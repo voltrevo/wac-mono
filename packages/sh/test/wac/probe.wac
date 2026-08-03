@@ -23,7 +23,7 @@
 // picks an id from the path; `resolveFile` turns the id back into a `FileResult`. It reads
 // oddly and it is the only way to build a resolved ticket without state.
 
-import { Child, Cli, Core, FileResult, Pending, Socket, Stat }
+import { Captured, Child, Cli, Core, FileResult, Pending, Socket, Stat }
   from "../../../platform/src/platform.wac";
 import { Shell, runScript } from "../../src/exec.wac";
 
@@ -207,12 +207,27 @@ i32 fakeWaitAny(i32[] ids, i32 deadlineMillis) { return ids.len() > 0 ? ids[0] :
 Pending<string> fakeCwd() { return Pending.of(0, resolveRoot, alwaysSettled, ignoreDrop); }
 string resolveRoot(i32 id) { return "/"; }
 
+/**
+ * A child pushed here runs and writes nothing, which is what the shell alone should see.
+ *
+ * The probe has no `box` to hand the shell — that wiring is in `box/example/term.wac` — so the
+ * hook is never installed and these are reached only if something calls them directly. Answering
+ * with two empty streams keeps that a no-op rather than a crash.
+ */
+Pending<bool> fakePushChild(string[] argv, u8[] stdin, string cwd) {
+  return Pending.of(1, resolveFromId, alwaysSettled, ignoreDrop);
+}
+Captured resolveNothing(i32 id) { return Captured.of(u8[0](), u8[0]()); }
+Pending<Captured> fakePopChild() {
+  return Pending.of(0, resolveNothing, alwaysSettled, ignoreDrop);
+}
+
 Cli fakeCli() {
   return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeReadFile, fakeWriteFile,
                 fakeStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
                 fakeReadChunk, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
                 fakeSend, fakeCloseSocket, fakeSpawn, fakeCloseFeed, fakeExitCode,
-                fakeCwd);
+                fakeCwd, fakePushChild, fakePopChild);
 }
 
 // ── What the coverage driver calls ────────────────────────────────────────────

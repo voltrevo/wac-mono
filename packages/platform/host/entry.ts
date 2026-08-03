@@ -43,6 +43,8 @@ export type AppModule = {
   Pending_Socket: { of(...a: unknown[]): unknown };
   Pending_Child: { of(...a: unknown[]): unknown };
   Child: { of(...a: unknown[]): unknown };
+  Captured: { of(...a: unknown[]): unknown };
+  Pending_Captured: { of(...a: unknown[]): unknown };
   main: (core: unknown, cli: unknown) => number;
 
   // Only an interactive browser application has these, and bindgen emits a class only for a

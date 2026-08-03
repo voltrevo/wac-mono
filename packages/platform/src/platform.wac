@@ -142,6 +142,19 @@ export struct Event {
  * did not choose and usually wants — to echo it, to derive an output name from it, or to decide
  * what it is.
  */
+/**
+ * What a child program wrote, once it has finished.
+ *
+ * Both streams, because a shell needs them apart: a program's diagnostics go to the terminal
+ * even when its output is piped into the next stage, and one buffer cannot say which was which.
+ */
+export struct Captured {
+  u8[] out;
+  u8[] err;
+
+  Captured of(u8[] out, u8[] err) { return Captured(out, err); }
+}
+
 export struct Picked {
   bool ok;
   string name;
@@ -616,6 +629,46 @@ export struct Cli {
    */
   fn[Pending<string>()] cwd;
 
+  /**
+   * Run a program *inside* this one: the world a child sees, pushed and then popped.
+   *
+   * `pushChild` says what the next stretch of work is called and was given, what it reads, where
+   * its relative paths resolve from, and that its output is to be kept rather than written. `popChild` ends that and
+   * answers with what it wrote. Between the two, `arg` and `argCount` answer from `argv`,
+   * `readChunk` returns `stdin` and then end of input, `Core.log`, `write` and `Core.warn`
+   * accumulate, and every path is taken relative to `cwd`.
+   *
+   * `argv` is in the layout `box` uses — the program's own name first — because an applet that
+   * reads its arguments positionally rather than through a parser is reading that layout already.
+   * `Core.log` is captured along with `write` for the same kind of reason: it is where thirty of
+   * those applets send their output, so a capture that took only `write` would lose most of them
+   * silently. That is exactly what the first working version of this did.
+   *
+   * **Why this exists.** A shell has to run a program and keep its output, and in wac it cannot
+   * do that by handing the program a different `Cli`: there are no closures, so a substitute
+   * capability has nowhere to put what it collected. `packages/sh` therefore had its own small
+   * `cat`, `wc`, `grep` and nine more — implementations that existed only because the real ones
+   * could not be called. With this, `packages/box`'s applets run in the shell unchanged, and one
+   * `grep` serves both.
+   *
+   * **Why a scope rather than a `chdir`.** `cwd` above refuses to be settable because a mutable
+   * working directory changes what every relative path in a program means. This does not
+   * contradict that: it is a *child's* view, bounded by a matching `popChild`, and what the
+   * parent's own paths mean is unchanged before and after. That is also the honest fix for
+   * something `spawn` gets wrong today — a spawned program inherits the host's directory rather
+   * than the shell's, so `cd sub; prog f` looks in the wrong place.
+   *
+   * Nesting is a stack, so a program that runs a program that runs a program is fine. A
+   * `popChild` with nothing pushed answers with two empty arrays rather than failing: the
+   * caller has nothing to clean up, and there is no state to corrupt.
+   *
+   * This is *not* isolation. The child is the same wasm instance with the same authority; it can
+   * still open any file the parent could. A real boundary is `spawn`, which is a separate worker
+   * with its own grants — and which a browser cannot do yet.
+   */
+  fn[Pending<bool>(string[], u8[], string)] pushChild;
+  fn[Pending<Captured>()] popChild;
+
 
   Cli of(
     fn[Pending<i32>()] argCount,
@@ -642,12 +695,15 @@ export struct Cli {
     fn[Pending<Child>(string, string[], i32)] spawn,
     fn[void(i32)] closeFeed,
     fn[Pending<i32>(i32)] exitCode,
-    fn[Pending<string>()] cwd
+    fn[Pending<string>()] cwd,
+    fn[Pending<bool>(string[], u8[], string)] pushChild,
+    fn[Pending<Captured>()] popChild
   ) {
     return Cli(
       argCount, arg, env, readStdin, write, readFile, writeFile, stat, readDir,
       mkdir, remove, rename, openInput, readChunk, openOutput,
-      connect, listen, accept, recv, send, closeSocket, spawn, closeFeed, exitCode, cwd
+      connect, listen, accept, recv, send, closeSocket, spawn, closeFeed, exitCode, cwd,
+      pushChild, popChild
     );
   }
 }

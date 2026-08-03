@@ -112,12 +112,35 @@ was closed `wontfix`, so running host programs is a settled non-goal rather than
 What replaces it is a wac program run with grants the parent chooses — which is more than this
 package expected to settle for.
 
-Then a **table of programs written in wac**, when nothing was spawned — the fallback the seam was
-designed for, and still the only thing available where there is no bundle to run:
+Then **whatever was handed to the shell**, through `Shell.external`. `packages/box` has sixty
+applets and this package is one of its dependencies, so it cannot import them — the wiring goes the
+other way, and it is one line:
+
+```wac
+Shell sh = Shell.create(core, cli);
+sh.external = boxRun;              // from packages/box/src/shrun.wac
+```
+
+With that, `sort`, `sha256sum`, `gzip`, `cut`, `diff`, `shuf`, `tar` and the rest are commands you
+can type, running the same code `box` runs on a command line. They are not spawned — `platform`'s
+`pushChild`/`popChild` let the shell give a function its own argv, standard input and working
+directory and keep what it wrote — so there is no isolation between them and the shell, which is
+[issue 0030](../../issues/open/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md).
+It is what makes the browser terminal useful, because a page cannot spawn at all.
+
+Then a **table of programs written in wac**, when nothing else answered:
 
 ```
 cat wc head tail rev sort uniq grep tr seq nl printf
 ```
+
+Those twelve exist because, when they were written, nothing could be started and nothing could be
+handed over. Both of those are now false, and they have become what the seam always said they
+were: a fallback. They are also visibly weaker than `box`'s — this `grep` matches substrings where
+`box`'s takes `-ivnc`, this `sort` is an insertion sort — so the sensible end state is to delete
+them once something checks that `box`'s pass the same differential scripts against bash. Kept for
+now because 539 of those scripts currently agree with bash *through these*, and swapping the
+implementation under a passing suite without measuring it first is how a green suite starts lying.
 
 The single seam was the point, and it paid off: wiring `spawn` in changed no part of the pipeline,
 redirection, status or `&&` handling, because all of it was already written against `Output`. The

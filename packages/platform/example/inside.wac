@@ -1,0 +1,99 @@
+// Running a program inside another one, with a world of its own.
+//
+//   inside <a writable directory>
+//
+// `pushChild` and `popChild` are what a shell needs and nothing else does: something has to run
+// `grep`, keep what it printed, and hand it to the next stage. In wac that cannot be done by
+// giving the program a different `Cli` — there are no closures, so a substitute capability has
+// nowhere to put what it collected. So the host holds the child's world instead, for as long as
+// the child is running.
+//
+// The "child" here is `shout`, an ordinary function in this file. That is the point worth seeing:
+// it reads `cli.readStdin()`, writes `cli.write(...)`, complains with `core.warn(...)` and opens a
+// file by a relative path — all the things a program does, none of them written for this — and it
+// is the *caller* that decides what those mean. `packages/box`'s sixty applets are wired into
+// `packages/sh` this way, unchanged.
+//
+// What it is not is isolation: `shout` runs with everything this program was granted. A real
+// boundary is `spawn`, a separate worker with its own grants, which a browser cannot do yet
+// (issue 0030).
+
+import { Captured, Cli, Core, FileResult } from "../src/platform.wac";
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount().wait() < 1) {
+    core.warn("usage: inside <a writable directory>");
+    return 2;
+  }
+  string dir = cli.arg(0).wait();
+
+  // Something for the child to find by a *relative* name, which is the whole of the cwd claim.
+  cli.writeFile(dir + "/note.txt", "from the file\n".toBytes()).wait();
+
+  // The world the child sees: its name and arguments, its standard input, and where it stands.
+  cli.pushChild(string[]("shout", "-x", "note.txt"), "from stdin\n".toBytes(), dir).wait();
+  i32 status = shout(core, cli);
+  Captured got = cli.popChild().wait();
+
+  // None of the child's output reached this terminal; all of it came back here.
+  core.log("status " + itoa(status));
+  core.log("out   " + oneLine(got.out));
+  core.log("err   " + oneLine(got.err));
+  return 0;
+}
+
+/**
+ * The child: reads its input, reads a file it was told about, and writes both back loudly.
+ *
+ * Nothing here knows it is a child. It asks for its arguments, its input and a file by name, the
+ * same as any program — which is what makes running it inside another one possible at all.
+ */
+i32 shout(Core core, Cli cli) {
+  // `arg(0)` is its own name and `arg(1)` its first argument, the layout `box` uses.
+  bool loud = cli.argCount().wait() > 1 && cli.arg(1).wait() == "-x";
+  string named = cli.arg(2).wait();
+
+  u8[] input = cli.readStdin().wait();
+  cli.write(upper(input));
+
+  FileResult f = cli.readFile(named).wait();
+  if (!f.ok) {
+    // Goes to the child's own error stream, not this terminal's.
+    core.warn("shout: " + named + ": " + f.error);
+    return 1;
+  }
+  cli.write(loud ? upper(f.bytes) : f.bytes);
+
+  // `log` is standard output too, and is captured with the rest.
+  core.log("read " + itoa(f.bytes.len()) + " bytes");
+  core.warn("shout: nothing wrong, just talking");
+  return 0;
+}
+
+u8[] upper(u8[] b) {
+  u8[] out = u8[b.len()](fill: 0);
+  for (i32 i = 0; i < b.len(); i++) {
+    out[i] = b[i] >= 'a' && b[i] <= 'z' ? b[i] - 32 : b[i];
+  }
+  return out;
+}
+
+/** Newlines shown as `\n`, so a multi-line capture is one line of output to compare. */
+string oneLine(u8[] b) {
+  string out = "";
+  for (i32 i = 0; i < b.len(); i++) {
+    out = out + (b[i] == 10 ? "\\n" : string.fromCodepoint(b[i]));
+  }
+  return out;
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  i32 x = v < 0 ? 0 - v : v;
+  string out = "";
+  while (x > 0) {
+    out = string.fromCodepoint('0' + (x % 10)) + out;
+    x = x / 10;
+  }
+  return (v < 0 ? "-" : "") + out;
+}

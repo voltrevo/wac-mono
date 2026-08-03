@@ -62,6 +62,7 @@ export type PendingClasses = {
   Pending_Stat: PendingClass;
   Pending_Socket: PendingClass;
   Pending_Child: PendingClass;
+  Pending_Captured: PendingClass;
 };
 
 /**
@@ -133,6 +134,7 @@ export function cliOf(
     Stat: { of(...a: unknown[]): unknown };
     Socket: { of(...a: unknown[]): unknown };
     Child: { of(...a: unknown[]): unknown };
+    Captured: { of(...a: unknown[]): unknown };
   } & PendingClasses,
 ): unknown {
   const settled = (id: number) => isDone(b, unpack(id));
@@ -211,6 +213,17 @@ export function cliOf(
       return cls.Child.of(-1, e instanceof Error ? e.message : String(e));
     }
   };
+  const captured = (id: number) => {
+    try {
+      const out = collect(b, unpack(id));
+      // The two streams in one answer, standard output length-prefixed. One call rather than two
+      // because they are one fact: what the child wrote before it stopped.
+      const n = readI32le(out);
+      return cls.Captured.of(out.subarray(4, 4 + n), out.subarray(4 + n));
+    } catch {
+      return cls.Captured.of(EMPTY, EMPTY);
+    }
+  };
   const socket = (id: number) => {
     try {
       return cls.Socket.of(readI32le(collect(b, unpack(id))), "");
@@ -231,6 +244,7 @@ export function cliOf(
     stat: (t: Ticket) => cls.Pending_Stat.of(pack(t), stat, settled, drop),
     dir: (t: Ticket) => cls.Pending_stringArrOpt.of(pack(t), dirNames, settled, drop),
     socket: (t: Ticket) => cls.Pending_Socket.of(pack(t), socket, settled, drop),
+    captured: (t: Ticket) => cls.Pending_Captured.of(pack(t), captured, settled, drop),
     child: (t: Ticket) => cls.Pending_Child.of(pack(t), child, settled, drop),
   };
 
@@ -348,7 +362,18 @@ export function cliOf(
     /*= exitCode */
     (handle: number) => T.i32(submit(b, OP.EXIT_CODE, i32le(handle))),
     /*= cwd */
-    () => T.text(submit(b, OP.CWD, EMPTY)));
+    () => T.text(submit(b, OP.CWD, EMPTY)),
+
+    /*= pushChild */
+    // Everything the child's world is, in one payload, so a push is one round trip.
+    (argv: string[], stdin: Uint8Array, cwd: string) =>
+      T.ok(submit(
+        b,
+        OP.PUSH_CHILD,
+        headed(i32le(argv.length), prefixed(str(argv.join("\u0000")), prefixed(str(cwd), stdin))),
+      )),
+    /*= popChild */
+    () => T.captured(submit(b, OP.POP_CHILD, EMPTY)));
 }
 
 /**

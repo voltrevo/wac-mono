@@ -249,14 +249,47 @@ Deno.test({
       // And the centre of the default view is inside the set, so it never escapes.
       assertEquals(pos.includes("never (inside)"), true, pos);
 
-      // A file in and the same file back out, which is one exchange proving both directions.
+      // A file in and a file back out, checked against this runtime's own crypto and gzip rather
+      // than against more wac. It drives `box/example/hash.wac`, which is where `nextFile` lives
+      // now: a page that hashes a file you drop on it has a reason to want one, and a Mandelbrot
+      // viewer never did.
+      await buildApp(
+        "packages/box/example/hash.wac",
+        `${dir}/hash.html`,
+        {},
+        "browser",
+      );
+      await page.goto(`http://127.0.0.1:${port}/hash.html`, { waitUntil: "load" });
+      await page.waitForSelector("#in", { timeout: 30_000 });
+
       const given = `${dir}/given.txt`;
-      await Deno.writeTextFile(given, "handed to the page\n");
-      const coming = page.waitForEvent("download", { timeout: 30_000 });
+      const body = "handed to the page\n".repeat(500);
+      await Deno.writeTextFile(given, body);
+      const wanted = [...new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)),
+      )].map((b) => b.toString(16).padStart(2, "0")).join("");
+
       await page.setInputFiles("#f", given);
+      await page.waitForFunction(
+        "document.getElementById('note').textContent.startsWith('from ')",
+        null,
+        { timeout: 30_000 },
+      );
+      assertEquals(await page.textContent("#sha"), wanted, "the page's SHA-256 of the file");
+      assertEquals(await page.textContent("#len"), String(body.length));
+
+      const coming = page.waitForEvent("download", { timeout: 30_000 });
+      await page.click("#save");
       const back = await coming;
-      assertEquals(back.suggestedFilename(), "given.txt.copy");
-      assertEquals((await page.textContent("#info"))?.includes("19 bytes"), true, await page.textContent("#info") ?? "");
+      assertEquals(back.suggestedFilename(), "given.txt.gz");
+      // Decompressed by the runtime, so the claim is "a real gzip container" and not "our gzip
+      // agrees with our gunzip" — the two ends of a round trip running the same code test only
+      // that the code is symmetrical.
+      const gz = await Deno.readFile((await back.path())!);
+      const plain = new Response(
+        new Blob([gz as BlobPart]).stream().pipeThrough(new DecompressionStream("gzip")),
+      );
+      assertEquals(await plain.text(), body, "what the page compressed, ungzipped");
 
       // And the shell, which is `packages/sh` unchanged with a keyboard in front of it.
       await buildApp(

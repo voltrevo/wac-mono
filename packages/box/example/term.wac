@@ -13,10 +13,20 @@
 // exited immediately, because a page's standard input is empty and a shell with no input has
 // nothing to do. All that was missing was a keyboard.
 //
-// What runs here is what `sh` implements itself: its own table of built-ins, which now includes
-// `cd`, `pwd` and `ls`. `$WACPATH` finds anything else as a spawned program, and a page cannot
-// spawn — `spawn` is Deno-only — so on this page that half is missing. It is a real limit and
-// worth seeing plainly rather than discovering later.
+// What runs here is the shell's own built-ins — including `cd`, `pwd` and `ls` — and then every
+// applet in `packages/box`, wired in with `sh.external = boxRun`. `sort`, `sha256sum`, `gzip`,
+// `cut`, `diff`, `shuf`, `strings`, `tar`: the same code the command-line `box` runs, in the page.
+//
+// It is not spawning them. `spawn` is Deno-only, so `platform` grew `pushChild`/`popChild` — the
+// host holds a child's stdin, its captured output and its working directory for the duration of a
+// call, which is what lets an applet that reads `cli.readChunk()` and writes `cli.write(...)` run
+// inside another program without being written differently. What is missing here is therefore
+// isolation rather than the programs: an applet runs with the page's own authority. The honest fix
+// is `spawn` in a browser — nested workers can do it — and that is issue 0030.
+//
+// The other real limit is unchanged: pipeline stages run one at a time, so `yes | head -1` does
+// not terminate the way it does in bash. It does now *stop*, because a child's captured output is
+// capped and `yes` is written to notice a write that fails.
 //
 // ## Why the terminal is built the way it is
 //
@@ -31,6 +41,7 @@
 
 import { Cli, Core, Event, Page } from "../../platform/src/platform.wac";
 import { Shell, runScript } from "../../sh/src/exec.wac";
+import { boxRun } from "../src/shrun.wac";
 
 /** How many commands to remember. A ring, so the oldest falls off rather than growing forever. */
 const i32 HISTORY = 64;
@@ -46,8 +57,13 @@ const string BANNER =
   "  echo hello | tr a-z A-Z          for i in 1 2 3; do echo $i; done\n" +
   "  echo hi > f; cat f               x=world; echo \"hey $x\"\n" +
   "\n" +
+  "Every packages/box applet is here too:\n" +
+  "\n" +
+  "  ls | sort -r                      seq 1 100 | shuf | head -3\n" +
+  "  echo wac | sha256sum              gzip < f | base64 | head -2\n" +
+  "\n" +
   "Up and Down walk the history. `clear` empties the screen. `cd`, `pwd` and `ls` work; the\n" +
-  "filesystem starts empty at / and is yours.\n" +
+  "filesystem starts empty at / and is yours. `help` lists the built-ins.\n" +
   "\n";
 
 export i32 page(Core core, Cli cli, Page page) {
@@ -93,6 +109,10 @@ export i32 page(Core core, Cli cli, Page page) {
   // the page's log rather than the screen being drawn.
   Shell sh = Shell.create(core, cli);
   sh.capture = true;
+  // Every `box` applet, as a command you can type. The shell tries a real spawned program first
+  // and a page cannot spawn, so in this tab this is what answers — `sort`, `sha256sum`, `gzip`,
+  // `cut`, `shuf` and fifty more, the same code `box` runs on a command line.
+  sh.external = boxRun;
 
   string[] history = string[HISTORY](fill: "");
   i32 count = 0;      // how many commands have been run, ever

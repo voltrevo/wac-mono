@@ -9,6 +9,7 @@ import { ByteQueue, type Child, spawnChild } from "./children.ts";
 import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
+import { ChildStack, packCaptured, unpackPush } from "./child.ts";
 
 export type DenoWorldOptions = {
   /** Arguments the application sees. Defaults to none, not to the launcher's own. */
@@ -34,6 +35,14 @@ export type DenoWorldOptions = {
 };
 
 const EMPTY = new Uint8Array(0);
+
+/** A `warn` payload as a line of a captured error stream: its bytes, then a newline. */
+function lineOf(p: Uint8Array): Uint8Array {
+  const out = new Uint8Array(p.length + 1);
+  out.set(p, 0);
+  out[p.length] = 10;
+  return out;
+}
 
 /**
  * `recv(0)` reads standard input.
@@ -119,6 +128,11 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   const children = new Map<number, Child>();
   let nextHandle = 1;
 
+  // A program running inside this one: what it reads, what it writes, and where it stands.
+  // `P` is applied to every path below and is the identity when nothing is pushed.
+  const kids = new ChildStack();
+  const P = (path: string) => kids.path(path);
+
   return {
     [OP.NOW_MILLIS]: () => i64le(BigInt(Date.now())),
     [OP.MONOTONIC_NANOS]: () => i64le(BigInt(Math.round(performance.now() * 1e6))),
@@ -141,13 +155,39 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       if (n < 0 || n > 1 << 20) throw new Error(`randomBytes(${n}) out of range`);
       return crypto.getRandomValues(new Uint8Array(n));
     },
-    [OP.LOG]: (p) => { log(unstr(p)); return EMPTY; },
-    [OP.WARN]: (p) => { warn(unstr(p)); return EMPTY; },
+    // `log` is standard output, so a child's lines are kept with the rest of its output rather
+    // than appearing on the parent's terminal. Thirty of `box`'s applets write this way.
+    [OP.LOG]: (p) => {
+      if (kids.active) { kids.write(lineOf(p)); return EMPTY; }
+      log(unstr(p));
+      return EMPTY;
+    },
+    // `warn` is standard error, so a child's diagnostics are kept with its output rather than
+    // landing on the parent's terminal in the middle of a pipeline. A newline is added because
+    // `warn` is a line-at-a-time capability and a captured stream is bytes.
+    [OP.WARN]: (p) => {
+      if (kids.warn(lineOf(p))) return EMPTY;
+      warn(unstr(p));
+      return EMPTY;
+    },
 
-    [OP.ARG_COUNT]: () => i32le(args.length),
+    [OP.PUSH_CHILD]: (p) => {
+      const { argv, stdin, cwd } = unpackPush(p);
+      kids.push(argv, stdin, cwd);
+      return EMPTY;
+    },
+    [OP.POP_CHILD]: () => {
+      const { out, err } = kids.pop();
+      return packCaptured(out, err);
+    },
+
+    // A child has its own command line: an applet reading `cli.arg(1)` must see what the shell
+    // typed, not what the shell itself was started with.
+    [OP.ARG_COUNT]: () => i32le((kids.args() ?? args).length),
     [OP.ARG]: (p) => {
+      const own = kids.args() ?? args;
       const i = readI32le(p);
-      return str(i >= 0 && i < args.length ? args[i] : "");
+      return str(i >= 0 && i < own.length ? own[i] : "");
     },
     [OP.ENV]: (p) => {
       const v = opts.env?.(unstr(p));
@@ -162,13 +202,18 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     // Genuinely asynchronous, and the wac side calls it like a function.
     [OP.READ_FILE]: async (p) => {
       if (!opts.fs?.read) deny("filesystem read");
-      return await Deno.readFile(unstr(p));
+      return await Deno.readFile(P(unstr(p)));
     },
 
     // stdin and stdout need no grant: what the user pipes in and what the program prints
     // are the user's own doing, not a reach into something they did not offer.
-    [OP.READ_STDIN]: async () => readIn === undefined ? await readAllStdin() : await readIn(),
+    [OP.READ_STDIN]: async () =>
+      kids.readAll() ?? (readIn === undefined ? await readAllStdin() : await readIn()),
     [OP.WRITE_STDOUT]: async (p) => {
+      if (kids.active) {
+        if (!kids.write(p)) throw new Error("the child's output buffer is full");
+        return EMPTY;
+      }
       if (writeOut !== undefined) { writeOut(p.slice()); return EMPTY; }
       if (sink === null) { await writeAllStdout(p); return EMPTY; }
       let at = 0;
@@ -181,7 +226,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       const dv = new DataView(out.buffer);
       if (!opts.fs?.read) return out; // not granted reads as "does not exist"
       try {
-        const st = await Deno.stat(unstr(p));
+        const st = await Deno.stat(P(unstr(p)));
         out[0] = 1;
         out[1] = st.isFile ? 1 : 0;
         out[2] = st.isDirectory ? 1 : 0;
@@ -192,13 +237,13 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     },
     [OP.READ_DIR]: async (p) => {
       if (!opts.fs?.read) deny("filesystem read");
-      const names = await denoDir(unstr(p));
+      const names = await denoDir(P(unstr(p)));
       return str(names.join("\u0000"));
     },
     [OP.WRITE_FILE]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");
       const n = readI32le(p);
-      const path = unstr(p.subarray(4, 4 + n));
+      const path = P(unstr(p.subarray(4, 4 + n)));
       await Deno.writeFile(path, p.subarray(4 + n));
       return EMPTY;
     },
@@ -212,10 +257,14 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       source = null;
       if (path === "") return EMPTY;      // standard input, and the default
       if (!opts.fs?.read) deny("filesystem read");
-      source = await Deno.open(path, { read: true });
+      source = await Deno.open(P(path), { read: true });
       return EMPTY;
     },
     [OP.READ_CHUNK]: async () => {
+      // A pushed child reads what it was fed and then end of input — never the parent's own
+      // standard input, which would let a filter inside a shell swallow the terminal.
+      const fed = source === null ? kids.readChunk() : null;
+      if (fed !== null) return fed;
       if (source === null && readIn !== undefined) return await readIn();
       const into = fresh();
       const n = source === null ? await Deno.stdin.read(into) : await source.read(into);
@@ -231,7 +280,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       sink = null;
       if (path === "") return EMPTY;
       if (!opts.fs?.write) deny("filesystem write");
-      sink = await Deno.open(path, { write: true, create: true, truncate: true });
+      sink = await Deno.open(P(path), { write: true, create: true, truncate: true });
       return EMPTY;
     },
 
@@ -371,18 +420,18 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
 
     [OP.MKDIR]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");
-      await Deno.mkdir(unstr(p.subarray(1)), { recursive: p[0] === 1 });
+      await Deno.mkdir(P(unstr(p.subarray(1))), { recursive: p[0] === 1 });
       return EMPTY;
     },
     [OP.REMOVE]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");
-      await Deno.remove(unstr(p.subarray(1)), { recursive: p[0] === 1 });
+      await Deno.remove(P(unstr(p.subarray(1))), { recursive: p[0] === 1 });
       return EMPTY;
     },
     [OP.RENAME]: async (p) => {
       if (!opts.fs?.write) deny("filesystem write");
       const n = readI32le(p);
-      await Deno.rename(unstr(p.subarray(4, 4 + n)), unstr(p.subarray(4 + n)));
+      await Deno.rename(P(unstr(p.subarray(4, 4 + n))), P(unstr(p.subarray(4 + n))));
       return EMPTY;
     },
   };

@@ -19,6 +19,7 @@ record of what has been fixed and why.
 | [0027](open/0027-writefile-cannot-say-why-it-failed.md) | `writeFile` and friends answer `bool`, so a failure cannot say why | missing feature | wrong answer |
 | [0028](open/0028-sh-decides-nothing-about-what-wacpath-programs-may-do.md) | `sh` passes `GRANT_NONE` to `$WACPATH` programs, which is a decision nobody has made | task | not implemented |
 | [0029](open/0029-gets-hand-rolls-tls-record-framing-that-now-lives-in-the-package.md) | `box gets` hand-rolls TLS record framing that now lives in the package | bug | no error |
+| [0030](open/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md) | a page cannot `spawn`, so the browser shell runs applets in-process instead | missing feature | not implemented |
 
 An empty list is the expected state most of the time — see `README.md`: something you
 can fix in a package you are already working in should just be fixed, and a package's

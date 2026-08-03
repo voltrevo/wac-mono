@@ -70,8 +70,8 @@ in `box sha256sum`.
 
 `packages/sh` with a keyboard in front of it: quoting, parameter expansion, command substitution,
 arithmetic, pipelines, redirection, `&&`/`||`, `if`/`while`/`for`/`case`, functions, subshells,
-globbing, and the built-ins including `cd`, `pwd`, `ls`, `mkdir` and `rm`. Up and Down walk a
-64-entry history; `clear` empties the screen.
+globbing, the built-ins including `cd`, `pwd`, `ls`, `mkdir` and `rm` — and all sixty applets from
+this package. Up and Down walk a 64-entry history; `clear` empties the screen.
 
 ```sh
 deno task app:build packages/box/example/term.wac --target browser \
@@ -84,10 +84,26 @@ reach the [Origin Private File System](https://developer.mozilla.org/en-US/docs/
 rather than a disk, so what you write survives a reload and is visible to nothing outside the tab.
 Drop the two flags and the same page builds with no filesystem, and every redirection fails.
 
-Nothing in `packages/sh` was changed for the browser. What it is missing here is what it never
-had: `$WACPATH` finds external commands by spawning them, a page cannot spawn, so on this page the
-built-ins are all there is. That is a real limit and worth seeing plainly rather than discovering
-later.
+Nothing in `packages/sh` was changed for the browser, and every applet in this package is a command
+you can type there:
+
+```
+ls | sort -r                      seq 1 100 | shuf | sort -n | head -3
+echo wac | sha256sum              gzip < f | base64 | head -2
+printf 'a,b,c\n' | cut -f2 -d,    diff old new
+```
+
+That is one line of wiring — `sh.external = boxRun` — and no change to any applet. They are not
+spawned: `spawn` is Deno-only, so `platform` has `pushChild`/`popChild`, which give a function its
+own argv, standard input and working directory and keep what it writes. An applet asks for its
+arguments and its input the same way it always did, and the caller decides what those mean.
+
+Two real limits remain, and both are worth seeing plainly. There is **no isolation** between an
+applet and the shell — same wasm instance, same authority, which is
+[issue 0030](../../../issues/open/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md).
+And pipeline stages run one at a time, so `yes | head -1` does not terminate the way it does in
+bash; it does now *stop*, because a child's captured output is capped and `yes` is written to
+notice a write that fails.
 
 ## The rest of `box`
 

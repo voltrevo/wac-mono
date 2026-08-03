@@ -1,24 +1,40 @@
-// Lines in byte order. `-r` reverses, `-u` drops duplicates.
+// Lines in byte order. `-r` reverses, `-u` drops duplicates, `-n` orders by the number a line
+// begins with.
+//
+// `-n` was missing and *silently* so: the flag parsed, nothing read it, and `seq 1 20 | sort -n`
+// answered 1, 10, 11 — which is the right answer to a question nobody asked. Found by typing it
+// into the browser shell the day `box`'s applets became commands there.
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
 import { Input, readInput } from "../lib/input.wac";
-import { cmpBytes, joinLines, mergeSort, splitLines } from "../lib/lines.wac";
+import { cmpBytes, cmpNumeric, joinLines, mergeSortWith, splitLines } from "../lib/lines.wac";
 
 export i32 sort(Core core, Cli cli, Args a) {
   Input in = readInput(core, cli, a, 0);
   if (!in.ok) { return 1; }
   bool reverse = has(a, 'r');
   bool unique = has(a, 'u');
+  bool numeric = has(a, 'n');
 
   u8[][] lines = splitLines(in.bytes);
   i32 n = lines.len();
-  u8[][] sorted = mergeSort(lines, n);
+  u8[][] sorted = mergeSortWith(lines, n, numeric ? cmpNumeric : cmpBytes);
 
   u8[][] out = u8[][n](fill: u8[0]());
   i32 at = 0;
   for (i32 i = 0; i < n; i++) {
-    if (unique && i > 0 && cmpBytes(sorted[i], sorted[i - 1]) == 0) { continue; }
+    // `-u` drops what the *sort* considers equal, so `-nu` over `1` and `01` keeps one of them,
+    // as GNU does. Comparing bytes here instead would have made `-nu` mean two different things
+    // depending on how the duplicates were spelled.
+    // `i > 0` first: the comparison reads `sorted[i - 1]`, so hoisting it above the guard reads
+    // index -1 on the first line. It did, and every `sort` in the suite went from a listing to
+    // "array element access out of bounds".
+    bool same = i > 0 &&
+      (numeric
+        ? cmpNumeric(sorted[i], sorted[i - 1]) == 0
+        : cmpBytes(sorted[i], sorted[i - 1]) == 0);
+    if (unique && same) { continue; }
     out[at] = sorted[i];
     at++;
   }

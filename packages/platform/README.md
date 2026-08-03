@@ -113,8 +113,17 @@ split is why it is a second struct rather than more fields.
 | | `openOutput` (to a file) | `--allow-write` |
 | | `connect`, `listen`, `accept`, `recv`, `send`, `closeSocket` | `--allow-net` |
 | | `spawn`, `closeFeed`, `exitCode` | — (the child gets what you pass, never more) |
+| | `cwd` | — (a read; there is no `chdir`) |
+| | `pushChild`, `popChild` | — (a child *inside* this program, with this program's authority) |
 | `Page` | `render`, `setText`, `setValue`, `getValue`, `on`, `nextEvent`, `title` | browser only |
 | | `drawPixels`, `nextFile`, `offerDownload` | browser only |
+
+`pushChild` and `popChild` need no grant because they add no authority: they change what `arg`,
+`readChunk`, `write`, `log`, `warn` and every path mean *for the program itself*, between two
+calls it makes. A shell uses them to run a program and keep its output — see
+[`example/inside.wac`](example/inside.wac), and `packages/box`'s applets running inside
+`packages/sh`. They are emphatically **not** isolation: the child is the same wasm instance with
+the same grants, and the thing with a real boundary is `spawn`.
 
 `waitAny` is in `Core` because it grants nothing — it cannot start work, only notice that some
 has finished — and `spawn` needs no grant of its own for the same reason the child's grants are
