@@ -39,7 +39,8 @@
     "wac:pin": "deno run --allow-read --allow-write --allow-run tools/wacPin.ts",
     "test": "deno test --parallel --allow-read --allow-write --allow-run --allow-net --allow-env",
     "validate": "deno run -A tools/validate.ts",
-    "verify:fmt": "deno run -A packages/fmt/tools/sweep.ts"
+    "verify:fmt": "deno run -A packages/fmt/tools/sweep.ts",
+    "map": "deno run --allow-read --allow-write tools/map.ts"
   },
   "exclude": [
     ".cache"

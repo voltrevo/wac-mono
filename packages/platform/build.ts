@@ -126,6 +126,9 @@ const PAGE = `<!doctype html>
 </style>
 <h1>%TITLE%</h1>
 <p class="meta">Arguments come from the query string: <code>?a=first&amp;a=second</code>.</p>
+<!-- What page.render replaces. Above the log rather than instead of it, so an interactive
+     application can still log and be seen, and a non-interactive one leaves it empty. -->
+<div id="app"></div>
 <pre id="out"></pre>
 <script type="module">
 %LAUNCHER%
@@ -209,7 +212,7 @@ export async function buildApp(
     const launcher = target === "browser"
       ? await bundle(
         "launcher",
-        `import { argsFromLocation, runInPage } from "${browserRuntime}";\n` +
+        `import { argsFromLocation, pageDom, runInPage } from "${browserRuntime}";\n` +
           `const out = document.getElementById("out");\n` +
           `const line = (t, cls) => {\n` +
           `  const s = document.createElement("span");\n` +
@@ -236,6 +239,17 @@ export async function buildApp(
           `    write: raw,\n` +
           `    root,\n` +
           `    writable: ${grants.write === true},\n` +
+          // The page itself. Always offered: unlike the filesystem or the network, a page is
+          // not authority over anything the user has not already given by opening it, and the
+          // application only reaches it if it exported `page` to begin with.
+          `    dom: pageDom(document.getElementById("app"), document, (name, bytes) => {\n` +
+          `      const url = URL.createObjectURL(new Blob([bytes]));\n` +
+          `      const a = document.createElement("a");\n` +
+          `      a.href = url; a.download = name; a.click();\n` +
+          // Revoked on a turn of the event loop rather than at once: revoking
+          // synchronously after click() races the download and yields an empty file.
+          `      setTimeout(() => URL.revokeObjectURL(url), 10000);\n` +
+          `    }),\n` +
           `  });\n` +
           `  line("[exit " + code + "]", "meta");\n` +
           `} catch (e) {\n` +

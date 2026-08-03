@@ -1,0 +1,92 @@
+// A page that hashes and compresses what you type, as you type it.
+//
+//   deno task app:build packages/box/example/hash.wac --target browser -o page/index.html
+//   box httpd -8080 page -x
+//
+// Here rather than in `packages/platform/example/` because of which way the imports point:
+// this needs `crypto` and `gzip`, and platform is the package they both sit on top of. A
+// platform example that reached up into a leaf would invert the layering for the sake of a
+// demonstration.
+//
+// The demonstration is the point, though. Every byte of the work below is wac compiled to
+// WebAssembly — SHA-256 from `packages/crypto`, DEFLATE from `packages/gzip`, both written for
+// a command line and neither changed for this — running on a worker so the typing stays smooth,
+// and reaching the page through the same capability boundary a terminal program reaches a file
+// through. There is no JavaScript here that anybody wrote.
+
+import { Cli, Core, Event, Page } from "../../platform/src/platform.wac";
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { gzipBest } from "../../gzip/src/gzip.wac";
+
+export i32 page(Core core, Cli cli, Page page) {
+  page.title("wac: hash and compress").wait();
+  page.render(
+    "<p>Type, and watch a compiled SHA-256 and DEFLATE keep up.</p>" +
+    "<textarea id=\"in\" rows=\"6\" style=\"width:100%\" " +
+      "placeholder=\"type here, or paste something long\"></textarea>" +
+    "<table>" +
+    "<tr><td>bytes</td><td><b id=\"len\">0</b></td></tr>" +
+    "<tr><td>sha&#8209;256</td><td><code id=\"sha\"></code></td></tr>" +
+    "<tr><td>gzip</td><td><b id=\"gz\">0</b> bytes <span id=\"ratio\" class=\"meta\"></span></td></tr>" +
+    "<tr><td>took</td><td class=\"meta\"><span id=\"ms\">0</span> ms</td></tr>" +
+    "</table>"
+  ).wait();
+  page.on("#in", "input").wait();
+
+  update(core, page, "");
+  while (true) {
+    Event e = page.nextEvent().wait();
+    if (e.kind == "input") { update(core, page, e.value); }
+  }
+}
+
+/** Everything the page shows, recomputed from scratch. It is fast enough not to be clever. */
+void update(Core core, Page page, string text) {
+  u8[] bytes = text.toBytes();
+  i64 began = core.monotonicNanos().wait();
+
+  u8[] digest = sha256(bytes);
+  u8[] packed = gzipBest(bytes);
+
+  i64 took = (core.monotonicNanos().wait() - began) / 1000000;
+
+  page.setText("len", itoa(bytes.len())).wait();
+  page.setText("sha", hex(digest)).wait();
+  page.setText("gz", itoa(packed.len())).wait();
+  page.setText("ms", itoa(took as~ i32)).wait();
+  // The ratio is the interesting number and the one that needs care. Two things bite: gzip of
+  // nothing is still twenty bytes of header and trailer, so the percentage of zero is not a
+  // percentage; and integer division reported eighteen kilobytes down to 131 bytes as "0%",
+  // which is arithmetically true and the least informative way to say it. Tenths, from
+  // per-mille, because wac has floats and a ratio does not need them.
+  page.setText("ratio", bytes.len() == 0 ? "(header only)" : "(" + tenths(packed.len(), bytes.len()) + "% of the input)").wait();
+}
+
+/** Packed types cannot be returned, so the nibble is inlined rather than named. */
+/** `part` as a percentage of `whole`, to one decimal place, without floating point. */
+string tenths(i32 part, i32 whole) {
+  i32 permille = part * 1000 / whole;
+  return itoa(permille / 10) + "." + itoa(permille % 10);
+}
+
+string hex(u8[] b) {
+  u8[] out = u8[b.len() * 2](fill: 0);
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 hi = b[i] >> 4;
+    i32 lo = b[i] & 15;
+    out[i * 2] = hi < 10 ? '0' + hi : 'a' + (hi - 10);
+    out[i * 2 + 1] = lo < 10 ? '0' + lo : 'a' + (lo - 10);
+  }
+  return string.fromBytes(out);
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  i32 x = v < 0 ? 0 - v : v;
+  u8[] digits = u8[12](fill: 0);
+  i32 at = 12;
+  while (x > 0) { at--; digits[at] = '0' + (x % 10); x = x / 10; }
+  u8[] used = u8[12 - at](fill: 0);
+  used.copyFrom(digits, at, 0, 12 - at);
+  return (v < 0 ? "-" : "") + string.fromBytes(used);
+}

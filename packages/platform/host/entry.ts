@@ -44,6 +44,17 @@ export type AppModule = {
   Pending_Child: { of(...a: unknown[]): unknown };
   Child: { of(...a: unknown[]): unknown };
   main: (core: unknown, cli: unknown) => number;
+
+  // Only an interactive browser application has these, and bindgen emits a class only for a
+  // struct the module actually mentions — so a `wc` that never names `Page` has no `Page`
+  // here, and the browser launcher checks for `page` before offering one.
+  Page?: { of(...a: unknown[]): unknown };
+  Event?: { of(...a: unknown[]): unknown };
+  Picked?: { of(...a: unknown[]): unknown };
+  Pending_Event?: { of(...a: unknown[]): unknown };
+  Pending_Picked?: { of(...a: unknown[]): unknown };
+  /** The interactive entry point: draw, subscribe, and loop on `nextEvent`. */
+  page?: (core: unknown, cli: unknown, page: unknown) => number;
 };
 
 type Start = { sab: SharedArrayBuffer };

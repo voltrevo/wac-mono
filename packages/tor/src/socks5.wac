@@ -1,0 +1,104 @@
+// SOCKS5, as bytes — RFC 1928, and tor-spec's end reasons on the way back.
+//
+// Separated from `socks.wac` because everything here is a function of its arguments: a
+// request in, a target or a refusal out. The program that owns the sockets is the part that
+// cannot be tested without a network, and it is smaller for not containing this.
+
+import { sliceOf, itoa } from "./link.wac";
+
+// SOCKS5 reply codes, RFC 1928 §6.
+export i32 repOk() { return 0; }
+export i32 repFailure() { return 1; }
+export i32 repNotAllowed() { return 2; }
+export i32 repUnreachable() { return 4; }
+export i32 repRefused() { return 5; }
+export i32 repNetUnreachable() { return 3; }
+export i32 repTtlExpired() { return 6; }
+export i32 repBadCommand() { return 7; }
+export i32 repBadAddress() { return 8; }
+
+/**
+ * A SOCKS5 reply. The bound address is always 0.0.0.0:0.
+ *
+ * Honest rather than lazy: the address a stream left from is the exit's, we are not told it,
+ * and inventing something plausible would be inventing the one field a client might use to
+ * learn where it appears to be coming from. Clients that only check the reply code — which
+ * is all of them, for CONNECT — do not look.
+ */
+export u8[] socksReply(i32 code) {
+  return u8[](0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0);
+}
+
+/**
+ * Tor's RELAY_END reason, as the nearest SOCKS reply code.
+ *
+ * The mapping matters because a client shows it to a person. "Connection refused" and "not
+ * allowed by ruleset" send someone to look in different places, and collapsing both to a
+ * general failure sends them nowhere.
+ */
+export i32 replyForEndReason(u8[] body) {
+  if (body.len() == 0) { return repFailure(); }
+  i32 reason = body[0];
+  if (reason == 2) { return repUnreachable(); }   // RESOLVEFAILED
+  if (reason == 3) { return repRefused(); }       // CONNECTREFUSED
+  if (reason == 4) { return repNotAllowed(); }    // EXITPOLICY
+  if (reason == 7) { return repTtlExpired(); }    // TIMEOUT
+  if (reason == 8) { return repNetUnreachable(); }  // NOROUTE
+  if (reason == 12) { return repRefused(); }      // CONNRESET
+  // MISC, DESTROY, DONE, HIBERNATING, INTERNAL, RESOURCELIMIT, TORPROTOCOL, NOTDIRECTORY.
+  // None of these describes the destination, which is all a SOCKS code can say.
+  return repFailure();
+}
+
+/** The reason, named, for the log. A number here sends someone to tor-spec for no reason. */
+export string endReasonName(u8[] body) {
+  if (body.len() == 0) { return "no reason given"; }
+  i32 r = body[0];
+  if (r == 1) { return "misc"; }
+  if (r == 2) { return "could not resolve the name"; }
+  if (r == 3) { return "connection refused"; }
+  if (r == 4) { return "against the exit policy"; }
+  if (r == 5) { return "the circuit was destroyed"; }
+  if (r == 6) { return "done"; }
+  if (r == 7) { return "timed out"; }
+  if (r == 8) { return "no route"; }
+  if (r == 9) { return "the relay is hibernating"; }
+  if (r == 10) { return "internal error at the exit"; }
+  if (r == 11) { return "the exit is out of resources"; }
+  if (r == 12) { return "connection reset"; }
+  if (r == 13) { return "tor protocol violation"; }
+  if (r == 14) { return "not a directory"; }
+  return "reason " + itoa(r);
+}
+
+/** `host:port` from a SOCKS5 request, or "" if the request is not yet whole. */
+export string targetOf(u8[] r) {
+  if (r.len() < 5) { return ""; }
+  i32 atyp = r[3];
+  i32 at = 4;
+  string host = "";
+  if (atyp == 0x01) {
+    if (r.len() < 10) { return ""; }
+    host = itoa(r[4]) + "." + itoa(r[5]) + "." + itoa(r[6]) + "." + itoa(r[7]);
+    at = 8;
+  } else if (atyp == 0x03) {
+    i32 n = r[4];
+    if (r.len() < 5 + n + 2) { return ""; }
+    host = string.fromBytes(sliceOf(r, 5, 5 + n));
+    at = 5 + n;
+  } else if (atyp == 0x04) {
+    // IPv6. Tor carries it, but this client has no IPv6 path to a relay and the exit policy
+    // check in `pathsel` is v4-only, so a circuit chosen for it could not honour it.
+    return "!";
+  } else {
+    return "!";
+  }
+  i32 port = (r[at] << 8) | r[at + 1];
+  return host + ":" + itoa(port);
+}
+
+/** How many bytes the whole request occupies, once `targetOf` has said it is whole. */
+export i32 requestLength(u8[] r) {
+  if (r[3] == 0x01) { return 10; }
+  return 5 + r[4] + 2;
+}

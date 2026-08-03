@@ -19,8 +19,9 @@
 // arm64 builds had been unavailable, and they are not any more.
 //
 // What this proves that nothing else does: `SharedArrayBuffer` under genuine cross-origin
-// isolation, `Atomics.wait` on a real `Worker`, and the page's own plumbing — the blob-URL
-// worker, the `crossOriginIsolated` check, and the `<pre>` that `write` appends to.
+// isolation, `Atomics.wait` on a real `Worker`, the page's own plumbing — the blob-URL worker,
+// the `crossOriginIsolated` check, the `<pre>` that `write` appends to — and, since `Page`
+// landed, an interactive application driven by real clicks and real typing.
 
 import { buildApp } from "../build.ts";
 
@@ -151,6 +152,116 @@ Deno.test({
       assertEquals(rt.includes("same bytes back"), true, rt);
       assertEquals(rt.includes("including roundtrip.txt"), true, rt);
       assertEquals(rt.includes("[exit 0]"), true, rt);
+
+      // An interactive application, driven by real clicks. This is the part no double reaches:
+      // delegated listeners surviving a `render`, an event queue feeding a parked worker, and
+      // state kept in a local across events because the program is a loop rather than a set of
+      // callbacks.
+      await buildApp("packages/platform/example/counter.wac", `${dir}/counter.html`, {}, "browser");
+      await page.goto(`http://127.0.0.1:${port}/counter.html`, { waitUntil: "load" });
+      await page.waitForSelector("#up", { timeout: 30_000 });
+
+      await page.click("#up");
+      await page.click("#up");
+      await page.click("#up");
+      await page.click("#down");
+      assertEquals(await page.textContent("#n"), "2", "three up and one down");
+
+      // Typing, which arrives as `input` events carrying the value.
+      await page.fill("#echo", "typed");
+      assertEquals(await page.textContent("#said"), "you typed: typed");
+
+      await page.click("#reset");
+      assertEquals(await page.textContent("#n"), "0", "reset");
+      assertEquals(await page.inputValue("#echo"), "", "reset clears the box too");
+
+      // And the loop ends when the program decides to return, not when the page decides.
+      await page.click("#up");
+      await page.click("#quit");
+      await page.waitForFunction(
+        "document.body.innerText.includes('[exit')",
+        null,
+        { timeout: 30_000 },
+      );
+      const done = (await page.evaluate("document.body.innerText")) as string;
+      assertEquals(done.includes("counted to 1"), true, done);
+      assertEquals(done.includes("[exit 0]"), true, done);
+
+      // Pixels, a pointer and files — the three that only a browser can answer for.
+      await buildApp("packages/platform/example/pixels.wac", `${dir}/pixels.html`, {}, "browser");
+      await page.goto(`http://127.0.0.1:${port}/pixels.html`, { waitUntil: "load" });
+      await page.waitForFunction(
+        "document.getElementById('c') && document.getElementById('c').width === 240",
+        null,
+        { timeout: 30_000 },
+      );
+
+      // A canvas with real content: every pixel opaque, and more than a handful of colours.
+      // A blank buffer would satisfy "a canvas exists" and nothing else here.
+      const drawn = await page.evaluate(`(() => {
+        const c = document.getElementById('c');
+        const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+        const seen = new Set();
+        let opaque = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          seen.add(d[i] + ',' + d[i + 1] + ',' + d[i + 2]);
+          if (d[i + 3] === 255) opaque++;
+        }
+        return { colours: seen.size, opaque, total: d.length / 4 };
+      })()`) as { colours: number; opaque: number; total: number };
+      assertEquals(drawn.total, 240 * 160, "the buffer is the size wac asked for");
+      assertEquals(drawn.opaque, drawn.total, "every pixel was written");
+      assertEquals(drawn.colours > 20, true, `only ${drawn.colours} colours — is it blank?`);
+
+      // Pointer coordinates, in the canvas's own pixels. The canvas has a 1px border, so the
+      // page coordinate and the element coordinate differ by one — which is the whole reason
+      // to report `offsetX` rather than something the application would have to correct.
+      const box = (await page.locator("#c").boundingBox())!;
+      await page.mouse.move(box.x + 120, box.y + 80);
+      await page.waitForFunction(
+        "document.getElementById('pos').textContent.includes('x=119')",
+        null,
+        { timeout: 30_000 },
+      );
+      assertEquals(
+        (await page.textContent("#pos"))?.includes("never (inside)"),
+        true,
+        "the middle of the set never escapes",
+      );
+
+      // A file in and the same file back out, which is one exchange proving both directions.
+      const given = `${dir}/given.txt`;
+      await Deno.writeTextFile(given, "handed to the page\n");
+      const coming = page.waitForEvent("download", { timeout: 30_000 });
+      await page.setInputFiles("#f", given);
+      const back = await coming;
+      assertEquals(back.suggestedFilename(), "given.txt.copy");
+      assertEquals((await page.textContent("#info"))?.includes("19 bytes"), true, await page.textContent("#info") ?? "");
+
+      // And the shell, which is `packages/sh` unchanged with a keyboard in front of it.
+      await buildApp(
+        "packages/box/example/term.wac",
+        `${dir}/term.html`,
+        { read: true, write: true },
+        "browser",
+      );
+      await page.goto(`http://127.0.0.1:${port}/term.html`, { waitUntil: "load" });
+      await page.waitForSelector("#cmd", { timeout: 30_000 });
+      const command = async (line: string): Promise<string> => {
+        const before = (await page.textContent("#scr")) ?? "";
+        await page.fill("#cmd", line);
+        await page.press("#cmd", "Enter");
+        await page.waitForFunction(
+          `document.getElementById('scr').textContent !== ${JSON.stringify(before)}`,
+          null,
+          { timeout: 30_000 },
+        );
+        return ((await page.textContent("#scr")) ?? "").slice(before.length).trim();
+      };
+      assertEquals((await command("echo hello | tr a-z A-Z")).endsWith("HELLO"), true);
+      assertEquals((await command("for i in 1 2 3; do echo $i; done")).endsWith("1\n2\n3"), true);
+      // Redirection into OPFS and back out again: a shell with a real filesystem under it.
+      assertEquals((await command("echo kept > note.txt; cat note.txt")).endsWith("kept"), true);
 
       assertEquals(failures.join("\n"), "", "the page raised errors");
     } finally {

@@ -426,6 +426,35 @@ i32 upperHex(i32 c) { return c >= 'a' && c <= 'f' ? c - 32 : c; }
  * `port` of 0 means no stream is planned, which is the truth for a directory circuit and
  * is not the same as "any port will do".
  */
+/**
+ * Whether this relay's policy permits *any* port — a different question from `eligible`
+ * with a port of 0, which asks whether a circuit can be built with no stream in mind and is
+ * true of every Exit-flagged relay including one that rejects everything.
+ *
+ * Needed because "is this relay an exit at all" has no other spelling here, and getting it
+ * wrong is quiet: a check written as `eligible(r, positionExit(), 0)` passes for a relay
+ * whose summary is `reject 1-65535`, which is most of the network.
+ *
+ * Exact rather than sampled. For an accept list, any range at all permits something. For a
+ * reject list, something is permitted unless the ranges cover 1-65535 — and the only ports
+ * that can be uncovered are 1 and the port after some range's end, so those are the only
+ * ones worth asking about.
+ */
+export bool exitsAnything(Relay r) {
+  if (!hasFlag(r, "Exit") || hasFlag(r, "BadExit")) { return false; }
+  if (r.exitPolicy is null) { return false; }
+  i32[] ranges = r.exitPolicy!.ranges;
+  if (r.exitPolicy!.isAccept) { return ranges.len() > 0; }
+  if (!portPermitted(false, ranges, 1)) {
+    for (i32 i = 1; i < ranges.len(); i += 2) {
+      i32 after = ranges[i] + 1;
+      if (after <= 65535 && portPermitted(false, ranges, after)) { return true; }
+    }
+    return false;
+  }
+  return true;
+}
+
 export bool eligible(Relay r, i32 position, i32 port) {
   if (r.ntorOnionKey.len() == 0) { return false; }
   if (!hasFlag(r, "Running") || !hasFlag(r, "Valid")) { return false; }

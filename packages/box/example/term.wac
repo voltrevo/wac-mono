@@ -1,0 +1,85 @@
+// A shell, in a browser tab.
+//
+//   deno task app:build packages/box/example/term.wac --target browser --allow-read --allow-write -o page/index.html
+//   box httpd -8080 page -x
+//
+// `packages/sh` unchanged: quoting, parameter expansion, command substitution, arithmetic,
+// pipelines, redirection, `&&`/`||`, `if`/`while`/`for`/`case`, functions, subshells, globbing.
+// It was written for a terminal and tested against GNU bash script for script, and none of that
+// is different here — what is different is that its `Cli` reaches the Origin Private File
+// System instead of a disk, and its output goes to a `<pre>` instead of a pipe.
+//
+// The shell was already able to run in a page before any of this existed: it built, started, and
+// exited immediately, because a page's standard input is empty and a shell with no input has
+// nothing to do. All that was missing was a keyboard.
+//
+// It lives in `box` rather than in `sh` because `sh` belongs to someone else, and because the
+// commands it runs are box's: `sh`'s own table of built-ins is small, and `$WACPATH` finds the
+// rest as spawned programs — which a page cannot do, since `spawn` is Deno-only. So what runs
+// here is what `sh` implements itself. That is a real limit and it is worth seeing plainly
+// rather than discovering later.
+
+import { Cli, Core, Event, Page } from "../../platform/src/platform.wac";
+import { Shell, runScript } from "../../sh/src/exec.wac";
+
+export i32 page(Core core, Cli cli, Page page) {
+  page.title("sh").wait();
+  // The banner is the initial value of `screen`, not markup inside the `<pre>`. One source of
+  // truth: `setText` replaces the element's whole content, so a banner written into the markup
+  // vanished the moment the first command was run — which looked like the terminal clearing
+  // itself and was really just two places both claiming to own that text.
+  string screen =
+    "wac sh — the shell from packages/sh, in a tab.\n" +
+    "Its filesystem is the Origin Private File System, and it survives a reload.\n" +
+    "Try: echo hello | tr a-z A-Z   |   for i in 1 2 3; do echo $i; done   |   " +
+    "echo hi > f; cat f\n\n";
+
+  page.render(
+    "<pre id=\"scr\" style=\"background:#111;color:#eee;padding:.75rem;min-height:18rem;" +
+      "overflow:auto\"></pre>" +
+    "<p>$ <input id=\"cmd\" size=\"70\" autofocus " +
+      "placeholder=\"a command, then Enter\"></p>"
+  ).wait();
+  page.setText("scr", screen).wait();
+  page.on("#cmd", "keydown").wait();
+
+  // One shell for the whole session, so variables, functions and the working directory persist
+  // between commands exactly as they would in a terminal. `capture` is what `packages/ssh`'s
+  // server uses for the same reason: the output has to be collected rather than written, since
+  // "written" here would mean the page's log rather than the terminal being drawn.
+  Shell sh = Shell.create(core, cli);
+  sh.capture = true;
+
+  while (true) {
+    Event e = page.nextEvent().wait();
+    if (e.kind != "keydown" || e.value != "Enter") { continue; }
+
+    string line = page.getValue("cmd").wait();
+    page.setValue("cmd", "").wait();
+    if (line == "") { continue; }
+
+    screen = screen + "$ " + line + "\n";
+    i32 status = runScript(sh, line);
+    screen = screen + string.fromBytes(sh.outBuf.take()) + string.fromBytes(sh.errOut.take());
+    // A non-zero status is worth showing: without a prompt that displays `$?`, a command that
+    // failed silently and one that printed nothing look identical.
+    if (status != 0) { screen = screen + "[exit " + itoa(status) + "]\n"; }
+
+    page.setText("scr", screen).wait();
+    if (sh.exiting) {
+      page.setText("scr", screen + "[the shell exited]\n").wait();
+      return sh.exitCode;
+    }
+  }
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  i32 x = v < 0 ? 0 - v : v;
+  u8[] digits = u8[12](fill: 0);
+  i32 at = 12;
+  while (x > 0) { at--; digits[at] = '0' + (x % 10); x = x / 10; }
+  u8[] used = u8[12 - at](fill: 0);
+  used.copyFrom(digits, at, 0, 12 - at);
+  return (v < 0 ? "-" : "") + string.fromBytes(used);
+}

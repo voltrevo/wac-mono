@@ -1,0 +1,413 @@
+// The Tor client's reusable half: a link to a relay, and a circuit through relays.
+//
+// This is everything `app.wac` had inside it before there was a second program that wanted
+// it. Nothing here decides what the circuit is *for* — `app.wac` fetches one path and exits,
+// `socks.wac` carries whatever a local client sends — so the split is between building the
+// circuit and using it.
+//
+// The one piece of policy that stayed: every read and every dial is bounded, because a relay
+// is a stranger from a public directory and one that answers the TCP handshake and then says
+// nothing is not hypothetical.
+
+import { Core, Cli, Socket, Pending } from "../../platform/src/platform.wac";
+import { Vec } from "../../std/src/vec.wac";
+import { Relay } from "./directory.wac";
+import { Circuit, Received, gotData, gotEnd, gotConnected, gotExtended, gotBroken,
+         gotDestroyed, extendedReply } from "./circuit.wac";
+import { splitResponse, isIdentity, Response } from "./dirclient.wac";
+import { encodeVersions, negotiateVersion, encodeNetinfo, encodeCreate2, decodeCreated2,
+         cellSize, cellCommand, cellPayload, certsCount, handshakeNtor,
+         cmdVersions, cmdNetinfo, cmdCerts, cmdAuthChallenge, cmdVpadding, cmdCreated2,
+         cmdDestroy } from "./cell.wac";
+import { ntorClientRequest, ntorClientFinish } from "./ntor.wac";
+import { recordLength } from "../../tls/src/record.wac";
+import { tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientPhase, tlsClientFailure }
+  from "../../tls/src/client.wac";
+
+/** `[state][toSend][appData]`, each behind a big-endian u32 length. */
+struct Step { u8[] state; u8[] toSend; u8[] appData; }
+
+Step unpack(u8[] r) {
+  i32 at = 0;
+  u8[][] parts = u8[][3](fill: u8[0]());
+  for (i32 i = 0; i < 3; i++) {
+    i32 n = (r[at] << 24) | (r[at + 1] << 16) | (r[at + 2] << 8) | r[at + 3];
+    parts[i] = sliceOf(r, at + 4, at + 4 + n);
+    at = at + 4 + n;
+  }
+  return Step(parts[0], parts[1], parts[2]);
+}
+
+export u8[] sliceOf(u8[] s, i32 from, i32 to) {
+  i32 hi = to > s.len() ? s.len() : to;
+  if (hi <= from) { return u8[0](); }
+  u8[] o = u8[hi - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = s[from + i]; }
+  return o;
+}
+
+export u8[] concat(u8[] a, u8[] b) {
+  if (a.len() == 0) { return b; }
+  if (b.len() == 0) { return a; }
+  u8[] o = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { o[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { o[a.len() + i] = b[i]; }
+  return o;
+}
+
+/**
+ * A TLS connection to a relay, carrying Tor cells.
+ *
+ * The trust store is empty on purpose. A relay's certificate is self-signed with a random
+ * CN and its identity is established by ntor against a key from the consensus, so validating
+ * it would fail and passing would prove nothing. It is spelt as an empty store rather than a
+ * flag because a boolean is one typo from disabling this everywhere.
+ */
+export struct Link {
+  Core core;
+  Cli cli;
+  i32 sock;
+  u8[] tls;
+  /** Cell bytes decrypted but not yet consumed. */
+  u8[] buffered;
+  bool dead;
+  /** Socket bytes that do not yet make up a whole TLS record. See `feedLink`. */
+  u8[] raw;
+}
+
+/** How long a relay gets to answer. Generous: this is a bound on wedging, not a deadline. */
+const i32 CONNECT_TIMEOUT_MS = 15000;
+const i32 READ_TIMEOUT_MS = 30000;
+
+export Link connectRelay(Core core, Cli cli, string host, i32 port) {
+  Pending<Socket> dial = cli.connect(host, port);
+  if (core.waitAny(i32[](dial.id), CONNECT_TIMEOUT_MS) < 0) {
+    // Nothing to close — there is no handle yet — so cancelling the dial is all there is.
+    // The host may still be inside the connect; what this guarantees is that we stop waiting.
+    dial.cancel();
+    core.warn("tor: " + host + " did not answer within " + itoa(CONNECT_TIMEOUT_MS) + "ms");
+    return Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]());
+  }
+  Socket s = dial.wait();
+  if (s.handle < 0) {
+    core.warn("tor: " + host + ": " + s.error);
+    return Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]());
+  }
+  Step st = unpack(tlsClientInit(
+    host.toBytes(), u8[0](), i32[0](),
+    core.randomBytes(32).wait(), core.randomBytes(32).wait(),
+    core.randomBytes(64).wait(), core.randomBytes(32).wait(),
+    core.nowMillis().wait() / 1000));
+  Link l = Link(core, cli, s.handle, st.state, u8[0](), false, u8[0]());
+  if (!cli.send(s.handle, st.toSend).wait()) { l.dead = true; }
+  return l;
+}
+
+/** Pump the socket until the TLS handshake completes or the link dies. */
+export void handshakeTls(Link l) {
+  while (!l.dead && tlsClientPhase(l.tls) != 3) {
+    if (!pump(l)) { l.dead = true; }
+  }
+}
+
+/**
+ * One read from the socket, fed to TLS. False at end of stream or on a timeout.
+ *
+ * The read is bounded by the deadline. If it expires, the socket is closed as well as the
+ * ticket cancelled — cancelling stops us waiting and does not stop the host's read, and a
+ * cancelled ticket keeps its slot until the call underneath finishes. Closing the handle is
+ * what makes it finish.
+ */
+export bool pump(Link l) {
+  Pending<u8[]> read = l.cli.recv(l.sock);
+  if (l.core.waitAny(i32[](read.id), READ_TIMEOUT_MS) < 0) {
+    read.cancel();
+    l.cli.closeSocket(l.sock);
+    l.core.warn("tor: a relay went silent for " + itoa(READ_TIMEOUT_MS) + "ms");
+    return false;
+  }
+  return feedLink(l, read.wait());
+}
+
+/**
+ * The half of `pump` after the read: bytes from the relay's socket into TLS.
+ *
+ * Split out for a program that cannot afford to sit in `pump`. `pump` owns the wait, which
+ * is right when the relay is the only thing worth waiting for — and wrong for a proxy, where
+ * a local client wanting attention while the relay is quiet is the ordinary case. Such a
+ * program does its own `waitAny` over every handle it holds and hands the bytes to this.
+ */
+/**
+ * How much of `raw` is a whole number of TLS records — 0 if not even one has arrived.
+ *
+ * The answer is a prefix length rather than a count, because that is what the caller needs:
+ * feed this many bytes, keep the rest. A record whose header is present but whose body is
+ * not stops the scan, and so does a header that is not yet five bytes long.
+ */
+export i32 wholeRecordBytes(u8[] raw) {
+  i32 ready = 0;
+  while (raw.len() - ready >= 5) {
+    i32 n = recordLength(sliceOf(raw, ready, raw.len()));
+    if (n < 0 || raw.len() - ready < 5 + n) { break; }
+    ready = ready + 5 + n;
+  }
+  return ready;
+}
+
+export bool feedLink(Link l, u8[] chunk) {
+  if (chunk.len() == 0) { return false; }
+
+  // Whole records only. `tlsClientFeed` says so in its own comment — it does no buffering,
+  // by design, so that only one place decides where a record ends — and this fed it whatever
+  // `recv` happened to return for as long as it has existed.
+  //
+  // It worked because it was only ever asked to fetch directory documents, whose responses
+  // arrive in a few small records that a TCP segment does not usually split. A proxy carrying
+  // a real transfer gets 44KB in a chunk, some eighty records with the last one cut in half,
+  // and traps. `gets.wac` had the framing right and put the reason in a comment: this is how
+  // a reader that mostly works fails on a fast connection rather than a slow one.
+  l.raw = concat(l.raw, chunk);
+  i32 ready = wholeRecordBytes(l.raw);
+  if (ready == 0) { return true; }
+  u8[] whole = sliceOf(l.raw, 0, ready);
+  l.raw = sliceOf(l.raw, ready, l.raw.len());
+
+  Step st = unpack(tlsClientFeed(l.tls, whole));
+  l.tls = st.state;
+  if (st.toSend.len() > 0) {
+    if (!l.cli.send(l.sock, st.toSend).wait()) { return false; }
+  }
+  if (st.appData.len() > 0) { l.buffered = concat(l.buffered, st.appData); }
+  if (tlsClientFailure(l.tls) != 0) {
+    l.core.warn("tor: TLS to the relay failed, code " + itoa(tlsClientFailure(l.tls)));
+    return false;
+  }
+  return true;
+}
+
+export void sendCells(Link l, u8[] bytes) {
+  if (l.dead || bytes.len() == 0) { return; }
+  Step st = unpack(tlsClientSend(l.tls, bytes));
+  l.tls = st.state;
+  if (!l.cli.send(l.sock, st.toSend).wait()) { l.dead = true; }
+}
+
+/** The next whole cell, or an empty array if the link ended. */
+export u8[] nextCell(Link l) {
+  while (!l.dead) {
+    u8[] cell = takeCell(l);
+    if (cell.len() > 0) { return cell; }
+    if (!pump(l)) { l.dead = true; }
+  }
+  return u8[0]();
+}
+
+/**
+ * A whole cell out of what has already been decrypted, or empty if there is not one yet.
+ *
+ * The non-blocking counterpart to `nextCell`, and the reason both exist: one read from the
+ * socket can carry several cells or half of one, so a caller that waits per read rather than
+ * per cell has to be able to ask "is there another" and be told no without waiting.
+ */
+export u8[] takeCell(Link l) {
+  if (l.buffered.len() == 0) { return u8[0](); }
+  // `cellSize` returns -1 for "not all here yet", and never a length beyond what it was
+  // given, so a positive answer is a cell that can be sliced.
+  i32 n = cellSize(l.buffered, 0);
+  if (n <= 0) { return u8[0](); }
+  u8[] cell = sliceOf(l.buffered, 0, n);
+  l.buffered = sliceOf(l.buffered, n, l.buffered.len());
+  return cell;
+}
+
+/**
+ * The link handshake: VERSIONS, then read until NETINFO, then answer.
+ *
+ * A client sends no AUTHENTICATE. Relay-to-client authentication is what ntor does, against
+ * a key from the consensus, so proving possession of the TLS certificate would prove nothing
+ * anybody needs.
+ */
+export bool linkHandshake(Link l, string host) {
+  sendCells(l, encodeVersions(i32[](3, 4, 5)));
+  u8[] versions = nextCell(l);
+  if (versions.len() == 0 || cellCommand(versions, 0) != cmdVersions()) { return false; }
+  if (negotiateVersion(cellPayload(versions, 0), i32[](3, 4, 5)) < 4) { return false; }
+
+  while (true) {
+    u8[] cell = nextCell(l);
+    if (cell.len() == 0) { return false; }
+    i32 cmd = cellCommand(cell, 0);
+    if (cmd == cmdNetinfo()) { break; }
+    if (cmd == cmdCerts()) {
+      if (certsCount(cellPayload(cell, 0)) < 0) { return false; }
+    } else if (cmd != cmdAuthChallenge() && cmd != cmdVpadding()) {
+      return false;
+    }
+  }
+  sendCells(l, encodeNetinfo(ipv4Of(host)));
+  return !l.dead;
+}
+
+export u8[] ipv4Of(string host) {
+  u8[] b = host.toBytes();
+  u8[] out = u8[](127, 0, 0, 1);
+  i32 part = 0;
+  i32 v = 0;
+  i32 digits = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == '.') {
+      if (digits == 0 || v > 255 || part > 3) { return u8[](127, 0, 0, 1); }
+      out[part] = v;
+      part++;
+      v = 0;
+      digits = 0;
+    } else if (b[i] >= '0' && b[i] <= '9') {
+      v = v * 10 + (b[i] - '0');
+      digits++;
+    } else { return u8[](127, 0, 0, 1); }
+  }
+  return part == 4 ? out : u8[](127, 0, 0, 1);
+}
+
+/** CREATE2 with an ntor handshake, and the key material it produces. */
+export u8[] createCircuit(Link l, Circuit c, u8[] identity, u8[] onionKey, u8[] ephemeral) {
+  sendCells(l, encodeCreate2(c.circId, handshakeNtor(),
+                             ntorClientRequest(identity, onionKey, ephemeral)));
+  u8[] cell = nextCell(l);
+  if (cell.len() == 0) { return u8[0](); }
+  if (cellCommand(cell, 0) == cmdDestroy()) {
+    l.core.warn("tor: the relay refused the circuit");
+    return u8[0]();
+  }
+  if (cellCommand(cell, 0) != cmdCreated2()) { return u8[0](); }
+  return ntorClientFinish(identity, onionKey, ephemeral,
+                          decodeCreated2(cellPayload(cell, 0)), 72);
+}
+
+/** Extend to one more relay, through the hops already built. */
+export bool extendTo(Link l, Circuit c, Relay r, u8[] ephemeral) {
+  u8[] req = ntorClientRequest(r.identity, r.ntorOnionKey, ephemeral);
+  sendCells(l, c.extendCell(ipv4Of(r.address), r.orPort, r.identity, req));
+  while (true) {
+    u8[] cell = nextCell(l);
+    if (cell.len() == 0) { return false; }
+    Received got = c.receive(cell);
+    if (got.kind == gotBroken() || got.kind == gotDestroyed()) { return false; }
+    if (got.kind == gotExtended()) {
+      u8[] keys = ntorClientFinish(r.identity, r.ntorOnionKey, ephemeral,
+                                   extendedReply(got.data), 72);
+      // An empty return is how ntor reports failure: the AUTH did not match, or the reply
+      // was a small-order point. Either way the party at the other end does not hold the
+      // key the consensus named, and there is nothing to negotiate.
+      if (keys.len() == 0) {
+        l.core.warn("tor: " + r.nickname + " did not authenticate");
+        return false;
+      }
+      c.addHop(keys);
+      return true;
+    }
+  }
+}
+
+/** GET a directory document over the circuit, and return the body. */
+export u8[] fetchOverCircuit(Link l, Circuit c, string path) {
+  i32 sid = c.beginStream();
+  sendCells(l, c.beginDirCell(sid));
+  u8[] raw = u8[0]();
+  bool connected = false;
+  while (!l.dead) {
+    u8[] cell = nextCell(l);
+    if (cell.len() == 0) { break; }
+    Received got = c.receive(cell);
+    if (got.toSend.len() > 0) { sendCells(l, got.toSend); }
+    if (got.kind == gotBroken() || got.kind == gotDestroyed()) { return u8[0](); }
+    if (got.kind == gotConnected() && !connected) {
+      connected = true;
+      sendCells(l, c.dataCell(sid, ("GET " + path + " HTTP/1.0\r\n" +
+                                    "Accept-Encoding: identity\r\n\r\n").toBytes()));
+    } else if (got.kind == gotData()) {
+      raw = concat(raw, got.data);
+    } else if (got.kind == gotEnd()) {
+      break;
+    }
+  }
+  Response r = splitResponse(raw);
+  if (r.status != 200) {
+    l.core.warn("tor: the directory answered " + itoa(r.status) + " for " + path);
+    return u8[0]();
+  }
+  if (!isIdentity(r)) {
+    l.core.warn("tor: the directory compressed a body we asked it not to");
+    return u8[0]();
+  }
+  return r.body;
+}
+
+export string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  bool neg = v < 0;
+  i32 x = neg ? -v : v;
+  u8[] buf = u8[12]();
+  i32 n = 0;
+  while (x > 0) {
+    buf[n] = '0' + (x % 10);
+    n++;
+    x = x / 10;
+  }
+  u8[] out = u8[n + (neg ? 1 : 0)]();
+  if (neg) { out[0] = '-'; }
+  for (i32 i = 0; i < n; i++) { out[(neg ? 1 : 0) + i] = buf[n - 1 - i]; }
+  return string.fromBytes(out);
+}
+
+export string[] lines(u8[] b) {
+  Vec<string> out = Vec.create();
+  i32 at = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == '\n') {
+      if (i > at) { out.push(string.fromBytes(sliceOf(b, at, i))); }
+      at = i + 1;
+    }
+  }
+  return out.toArray();
+}
+
+export string[] words(string s) {
+  u8[] b = s.toBytes();
+  Vec<string> out = Vec.create();
+  i32 at = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == ' ') {
+      if (i > at) { out.push(string.fromBytes(sliceOf(b, at, i))); }
+      at = i + 1;
+    }
+  }
+  return out.toArray();
+}
+
+export u8[] fromHex(string s) {
+  u8[] h = s.toBytes();
+  if (h.len() % 2 != 0) { return u8[0](); }
+  u8[] out = u8[h.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) {
+    i32 hi = hexDigit(h[2 * i]);
+    i32 lo = hexDigit(h[2 * i + 1]);
+    if (hi < 0 || lo < 0) { return u8[0](); }
+    out[i] = hi * 16 + lo;
+  }
+  return out;
+}
+
+export i32 hexDigit(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+  return -1;
+}
+/** A non-negative i64 from the world's entropy, for the chooser. */
+export i64 randomI64(Core core) {
+  u8[] b = core.randomBytes(8).wait();
+  i64 v = 0;
+  for (i32 i = 0; i < 8; i++) { v = (v << 8) | (b[i] as i64); }
+  return v < 0 ? -v : v;
+}

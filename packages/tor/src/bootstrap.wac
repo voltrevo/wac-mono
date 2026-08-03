@@ -1,0 +1,348 @@
+// Getting to the point where there is a usable circuit.
+//
+// Two steps, and they are separate because the second is repeatable and the first is not.
+// `bootstrap` asks a seed relay for a consensus and checks it against the authorities, which
+// is expensive and good for hours. `buildCircuit` picks a path from that consensus and builds
+// it, which a long-running program does again every time a circuit dies or gets old.
+
+import { Core, Cli } from "../../platform/src/platform.wac";
+import { Vec } from "../../std/src/vec.wac";
+import {
+  Relay, parseConsensus, attachMicrodescriptors, parseInt, unpaddedBase64,
+} from "./directory.wac";
+import { AuthorityCert, Verdict, parseCertificates, verifyConsensus } from "./consensus.wac";
+import { parseWeights, resolveFamilies, Families, pick, positionGuard, positionMiddle,
+         positionExit, exitsAnything } from "./pathsel.wac";
+import { Circuit, Received, gotExtended, gotBroken, gotDestroyed,
+         extendedReply } from "./circuit.wac";
+import { encodeCreate2, decodeCreated2, cellCommand, cellPayload, handshakeNtor,
+         cmdCreated2, cmdDestroy } from "./cell.wac";
+import { ntorClientRequest, ntorClientFinish } from "./ntor.wac";
+import { consensusPath, certificatePath, microdescPath, microdescBatches } from "./dirclient.wac";
+import { Link, connectRelay, handshakeTls, linkHandshake, createCircuit, extendTo,
+         fetchOverCircuit, sendCells, ipv4Of, itoa, lines, words, fromHex,
+         randomI64 } from "./link.wac";
+
+/** A verified view of the network: who is out there, and how to weight them. */
+export struct Network {
+  bool ok;
+  Relay[] relays;
+  i64[] weights;
+  Families families;
+  /**
+   * Waived on a testnet, where every relay is on 127.0.0.1 and the /16 rule would reject
+   * every possible path. A field rather than a default so that reaching it takes saying so.
+   */
+  bool sameSubnetOk;
+}
+
+/** A built circuit and the link it runs over. The two travel together or not at all. */
+export struct Session {
+  bool ok;
+  Link link;
+  Circuit circ;
+  string description;
+}
+
+/**
+ * One hop to the seed, a consensus, and a check of it against the authorities.
+ *
+ * The seed is somewhere to ask, not somebody to trust: whatever it returns is verified
+ * against the fingerprints the caller chose, which is what makes asking a stranger fine.
+ */
+export Network bootstrap(Core core, Cli cli, u8[] seedBytes, u8[] authBytes, bool sameSubnetOk) {
+  Network bad = Network(false, Relay[0](), i64[0](), Families(i32[0](), i32[0]()), sameSubnetOk);
+
+  string[] seedLines = lines(seedBytes);
+  if (seedLines.len() == 0) { core.warn("tor: the seed file is empty"); return bad; }
+  string[] seedWords = words(seedLines[0]);
+  if (seedWords.len() < 4) { core.warn("tor: the seed line needs four fields"); return bad; }
+  string seedHost = seedWords[0];
+  i32 seedPort = parseInt(seedWords[1]);
+  u8[] seedIdentity = fromHex(seedWords[2]);
+  u8[] seedOnionKey = unpaddedBase64(seedWords[3]);
+
+  string[] trusted = lines(authBytes);
+  if (trusted.len() == 0) {
+    core.warn("tor: no authorities named, so verification would be vacuous");
+    return bad;
+  }
+
+  Link l = connectRelay(core, cli, seedHost, seedPort);
+  if (l.dead) { return bad; }
+  handshakeTls(l);
+  if (l.dead || !linkHandshake(l, seedHost)) {
+    core.warn("tor: the link handshake with the seed relay failed");
+    return bad;
+  }
+
+  Circuit boot = Circuit.create(0x80000001, u8[72]());
+  u8[] keys = createCircuit(l, boot, seedIdentity, seedOnionKey, core.randomBytes(32).wait());
+  if (keys.len() == 0) {
+    core.warn("tor: the seed relay did not authenticate");
+    cli.closeSocket(l.sock);
+    return bad;
+  }
+  boot = Circuit.create(0x80000001, keys);
+
+  u8[] consensus = fetchOverCircuit(l, boot, consensusPath());
+  if (consensus.len() == 0) { cli.closeSocket(l.sock); return bad; }
+  u8[] certs = fetchOverCircuit(l, boot, certificatePath(trusted));
+  if (certs.len() == 0) { cli.closeSocket(l.sock); return bad; }
+
+  AuthorityCert[] checked = parseCertificates(certs, trusted);
+  Verdict v = verifyConsensus(consensus, checked, trusted, core.nowMillis().wait() / 1000);
+  if (!v.ok) {
+    core.warn("tor: the consensus is not acceptable — " + itoa(v.goodSignatures) +
+              " of " + itoa(v.needed) + " signatures" +
+              (v.stale == "" ? "" : ", " + v.stale));
+    cli.closeSocket(l.sock);
+    return bad;
+  }
+  core.log("consensus verified: " + itoa(v.goodSignatures) + " of " + itoa(trusted.len()) +
+           " authorities signed");
+
+  Relay[] relays = parseConsensus(consensus);
+  Vec<string> digests = Vec.create();
+  for (i32 i = 0; i < relays.len(); i++) {
+    if (relays[i].microdescDigest != "") { digests.push(relays[i].microdescDigest); }
+  }
+  string[][] batches = microdescBatches(digests.toArray());
+  for (i32 i = 0; i < batches.len(); i++) {
+    u8[] micro = fetchOverCircuit(l, boot, microdescPath(batches[i]));
+    if (micro.len() == 0) { cli.closeSocket(l.sock); return bad; }
+    attachMicrodescriptors(relays, micro);
+  }
+
+  // The bootstrap link has done its job. Circuits after this one are built through a guard
+  // chosen by weight, not through whoever happened to be in the seed file.
+  cli.closeSocket(l.sock);
+
+  return Network(true, relays, parseWeights(consensus), resolveFamilies(relays), sameSubnetOk);
+}
+
+/**
+ * Pick a three-hop path and build it.
+ *
+ * `port` constrains the exit's policy — 0 accepts any exit, which is what a directory fetch
+ * wants and what a proxy must not use, since a circuit built without knowing the port is a
+ * circuit that may not be able to carry the stream.
+ */
+export Session buildCircuit(Core core, Cli cli, Network n, i32 port, i32 circId) {
+  Session bad = Session(false, Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]()),
+                        Circuit.create(circId, u8[72]()), "");
+
+  i32 exit = pick(n.relays, n.weights, n.families, positionExit(), i32[0](), port,
+                  n.sameSubnetOk, randomI64(core));
+  if (exit < 0) { core.warn("tor: no usable exit"); return bad; }
+  i32 guard = pick(n.relays, n.weights, n.families, positionGuard(), i32[](exit), 0,
+                   n.sameSubnetOk, randomI64(core));
+  if (guard < 0) { core.warn("tor: no usable guard"); return bad; }
+  i32 middle = pick(n.relays, n.weights, n.families, positionMiddle(), i32[](exit, guard), 0,
+                    n.sameSubnetOk, randomI64(core));
+  if (middle < 0) { core.warn("tor: no usable middle relay"); return bad; }
+
+  string desc = n.relays[guard].nickname + " -> " + n.relays[middle].nickname +
+                " -> " + n.relays[exit].nickname;
+
+  Link l = connectRelay(core, cli, n.relays[guard].address, n.relays[guard].orPort);
+  if (l.dead) { return bad; }
+  handshakeTls(l);
+  if (l.dead || !linkHandshake(l, n.relays[guard].address)) {
+    core.warn("tor: the link handshake with the guard failed");
+    cli.closeSocket(l.sock);
+    return bad;
+  }
+  u8[] gk = createCircuit(l, Circuit.create(circId, u8[72]()),
+                          n.relays[guard].identity, n.relays[guard].ntorOnionKey,
+                          core.randomBytes(32).wait());
+  if (gk.len() == 0) {
+    core.warn("tor: the guard did not authenticate");
+    cli.closeSocket(l.sock);
+    return bad;
+  }
+  Circuit c = Circuit.create(circId, gk);
+  if (!extendTo(l, c, n.relays[middle], core.randomBytes(32).wait())) {
+    cli.closeSocket(l.sock);
+    return bad;
+  }
+  if (!extendTo(l, c, n.relays[exit], core.randomBytes(32).wait())) {
+    cli.closeSocket(l.sock);
+    return bad;
+  }
+  return Session(true, l, c, desc);
+}
+
+// ── Several circuits on one guard ────────────────────────────────────────────
+//
+// A proxy needs a circuit per destination, and the guard must stay the same for all of them:
+// the whole point of pinning a guard is that a client presents one entry point to the network
+// rather than a fresh one per connection. Tor puts many circuits on one TLS connection to the
+// guard, told apart by the circuit id in every cell's header, and so does this.
+//
+// The consequence is that building can no longer block. `buildCircuit` above sits in
+// `nextCell` until its handshake answers, which is correct when it owns the link and wrong
+// here — the cells it would swallow belong to other circuits. So a build is a state machine
+// the caller drives one cell at a time, and `buildCircuit` stays for `app.wac`, which does own
+// its link and is clearer for blocking.
+
+/** The pinned guard, and the link every circuit runs over. */
+export struct Guard {
+  bool ok;
+  Link link;
+  i32 index;
+  string nickname;
+}
+
+/** A circuit, mid-build or finished. */
+export struct Building {
+  i32 circId;
+  Circuit circ;
+  /** The port its exit was chosen to carry. Circuits are reused only for the same port. */
+  i32 port;
+  /** 0 awaiting CREATED2, 1 and 2 awaiting EXTENDED2, 3 ready, -1 failed. */
+  i32 state;
+  i32 middleIdx;
+  i32 exitIdx;
+  /** The private key of the handshake currently outstanding. */
+  u8[] ephemeral;
+  string description;
+}
+
+export i32 circuitReady() { return 3; }
+export i32 circuitFailed() { return -1; }
+
+/** How many guards to consider before giving up. Tor keeps a primary list of three. */
+const i32 GUARD_TRIES = 8;
+
+export Guard connectGuard(Core core, Cli cli, Network n) {
+  Guard bad = Guard(false, Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]()), -1, "");
+
+  // A guard through which no circuit can ever be built is not a guard. The exit is chosen
+  // excluding the guard, so a relay that is the only usable exit leaves nothing to exit
+  // through if it is also where we enter — and every circuit then fails at path selection
+  // rather than on the wire, which reads like a bug in the client.
+  //
+  // Real tor does not hit this because it keeps a primary list of several guards and because
+  // the network has thousands of exits. It bites immediately on a five-relay testnet with one
+  // exit, which is the argument for checking rather than assuming.
+  i32 g = -1;
+  for (i32 attempt = 0; attempt < GUARD_TRIES && g < 0; attempt++) {
+    i32 cand = pick(n.relays, n.weights, n.families, positionGuard(), i32[0](), 0,
+                    n.sameSubnetOk, randomI64(core));
+    if (cand < 0) { break; }
+    bool anotherExitExists = false;
+    for (i32 i = 0; i < n.relays.len(); i++) {
+      if (i != cand && exitsAnything(n.relays[i])) { anotherExitExists = true; }
+    }
+    if (anotherExitExists) {
+      g = cand;
+    } else {
+      core.warn("tor: " + n.relays[cand].nickname +
+                " would leave no exit to build through; trying another guard");
+    }
+  }
+  if (g < 0) { core.warn("tor: no usable guard"); return bad; }
+
+  Link l = connectRelay(core, cli, n.relays[g].address, n.relays[g].orPort);
+  if (l.dead) { return bad; }
+  handshakeTls(l);
+  if (l.dead || !linkHandshake(l, n.relays[g].address)) {
+    core.warn("tor: the link handshake with the guard failed");
+    cli.closeSocket(l.sock);
+    return bad;
+  }
+  return Guard(true, l, g, n.relays[g].nickname);
+}
+
+/**
+ * Choose a path for `port` and send the first handshake.
+ *
+ * The exit is picked for the port that is actually wanted, which is the difference between
+ * this and one circuit for everything: an exit chosen before anyone has asked may refuse the
+ * first thing they ask for, and there is nothing to be done about it by then.
+ */
+export Building startCircuit(Core core, Network n, Guard g, i32 port, i32 circId) {
+  Building bad = Building(circId, Circuit.create(circId, u8[72]()), port, -1, -1, -1,
+                          u8[0](), "");
+
+  i32 exit = pick(n.relays, n.weights, n.families, positionExit(), i32[](g.index), port,
+                  n.sameSubnetOk, randomI64(core));
+  if (exit < 0) {
+    core.warn("tor: no exit will carry port " + itoa(port));
+    return bad;
+  }
+  i32 middle = pick(n.relays, n.weights, n.families, positionMiddle(), i32[](g.index, exit), 0,
+                    n.sameSubnetOk, randomI64(core));
+  if (middle < 0) { core.warn("tor: no usable middle relay"); return bad; }
+
+  u8[] eph = core.randomBytes(32).wait();
+  sendCells(g.link, encodeCreate2(circId, handshakeNtor(),
+                                  ntorClientRequest(n.relays[g.index].identity,
+                                                    n.relays[g.index].ntorOnionKey, eph)));
+  return Building(circId, Circuit.create(circId, u8[72]()), port, 0, middle, exit, eph,
+                  g.nickname + " -> " + n.relays[middle].nickname + " -> " +
+                  n.relays[exit].nickname);
+}
+
+/**
+ * One cell towards finishing the build. Returns the new state.
+ *
+ * Only called for cells whose circuit id is this one's, and only while it is still building —
+ * the caller owns the dispatch, because it is the only thing that knows every circuit.
+ */
+export i32 advanceCircuit(Core core, Network n, Guard g, Building b, u8[] cell) {
+  if (b.state == 0) {
+    if (cellCommand(cell, 0) == cmdDestroy()) {
+      core.warn("tor: the guard refused a circuit");
+      b.state = -1;
+      return b.state;
+    }
+    if (cellCommand(cell, 0) != cmdCreated2()) { return b.state; }
+    u8[] keys = ntorClientFinish(n.relays[g.index].identity, n.relays[g.index].ntorOnionKey,
+                                 b.ephemeral, decodeCreated2(cellPayload(cell, 0)), 72);
+    if (keys.len() == 0) {
+      core.warn("tor: the guard did not authenticate");
+      b.state = -1;
+      return b.state;
+    }
+    b.circ = Circuit.create(b.circId, keys);
+    b.state = 1;
+    extendToward(core, n, g, b, n.relays[b.middleIdx]);
+    return b.state;
+  }
+
+  Received got = b.circ.receive(cell);
+  if (got.kind == gotBroken() || got.kind == gotDestroyed()) {
+    core.warn("tor: a circuit died while it was being built");
+    b.state = -1;
+    return b.state;
+  }
+  if (got.kind != gotExtended()) { return b.state; }
+
+  Relay r = b.state == 1 ? n.relays[b.middleIdx] : n.relays[b.exitIdx];
+  u8[] keys = ntorClientFinish(r.identity, r.ntorOnionKey, b.ephemeral,
+                               extendedReply(got.data), 72);
+  // An empty return is how ntor reports failure: the party at the other end does not hold
+  // the key the consensus named, so there is nothing to negotiate.
+  if (keys.len() == 0) {
+    core.warn("tor: " + r.nickname + " did not authenticate");
+    b.state = -1;
+    return b.state;
+  }
+  b.circ.addHop(keys);
+  if (b.state == 1) {
+    b.state = 2;
+    extendToward(core, n, g, b, n.relays[b.exitIdx]);
+  } else {
+    b.state = 3;
+  }
+  return b.state;
+}
+
+void extendToward(Core core, Network n, Guard g, Building b, Relay r) {
+  b.ephemeral = core.randomBytes(32).wait();
+  sendCells(g.link, b.circ.extendCell(ipv4Of(r.address), r.orPort, r.identity,
+                                      ntorClientRequest(r.identity, r.ntorOnionKey,
+                                                        b.ephemeral)));
+}

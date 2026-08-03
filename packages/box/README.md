@@ -101,7 +101,7 @@ the same primitive — two `recv` calls in flight and a park on whichever answer
 ```wac
 Pending<u8[]> fromPeer = cli.recv(peer.handle);
 Pending<u8[]> fromUser = cli.recv(0);
-i32 which = cli.waitAny(i32[](fromPeer.id, fromUser.id));
+i32 which = core.waitAny(i32[](fromPeer.id, fromUser.id), -1);
 ```
 
 The test makes the peer greet *before* reading, so a relay that serviced standard input

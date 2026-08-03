@@ -18,6 +18,11 @@ certificates and microdescriptors, verifies them, and every circuit after that i
 from what it learnt — bandwidth-weighted per position, distinct /16s, mutual families
 excluded, an exit whose policy carries the port, through a pinned guard set.
 
+There is a **SOCKS5 proxy**: `src/socks.wac` puts every connection on one circuit as its own
+stream, so `curl --socks5-hostname` and anything else that speaks SOCKS goes over Tor. Against
+the testnet it has carried 3.2MB across eight concurrent streams on one circuit, byte-identical,
+and 400KB back the other way.
+
 It should still not be pointed at the real network — see *What is not here*.
 
 ## Why this is possible at all
@@ -349,6 +354,60 @@ What catches it is in the crypto package, where a chunked `CtrStream` is compare
 the one-shot that the host's own AES already verifies. If you add a relay test, ask which
 of those two kinds it is.
 
+## The SOCKS proxy
+
+`src/socks.wac` is one worker holding one outstanding `recv` per socket plus an `accept`,
+handing the whole list to `waitAny` and re-issuing whichever answered. `box nc` is the
+two-handle version of the same shape.
+
+**Circuits are per port, on one pinned guard.** A circuit is built when the first client asks
+for a port and reused by everyone after; clients arriving mid-build park and get their
+`RELAY_BEGIN` when the last hop answers. Every circuit runs over the *same* TLS connection to
+the *same* guard, told apart by the circuit id in each cell's header, because that is what a
+guard is for — a client should present the network one entry point, not a fresh one per
+destination.
+
+Choosing the exit for the port that was actually asked for is the point. An exit picked before
+anyone has asked may refuse the first thing they want, and by then three handshakes have been
+spent finding out.
+
+Sharing a link means the build cannot block. `bootstrap.wac` has both: `buildCircuit` sits in
+`nextCell` until each handshake answers, which is right for `app.wac`, which owns its link;
+`startCircuit`/`advanceCircuit` are a state machine the caller drives one cell at a time,
+because a blocking build on a shared link would swallow cells belonging to other circuits and
+advance the wrong ciphers — from which there is no recovering.
+
+**A guard that leaves no exit is not a guard.** The exit is chosen excluding the guard, so a
+relay that is the only usable exit leaves nothing to exit through if it is also the entrance,
+and every circuit then fails at path selection rather than on the wire. `connectGuard` checks
+before pinning. Real tor never notices this because it keeps several guards and the network
+has thousands of exits; the testnet here has five relays and exactly one exit, so it happened
+on the first run that drew badly.
+
+## The bug the proxy found immediately
+
+Uploads are the interesting direction. Tor's package window bounds what may be in flight, so
+a client that uploads faster than credit arrives will outrun the circuit, and the choice is
+to buffer without limit or to stop reading. It stops reading — the outstanding `recv` is not
+re-issued until the queue drains below 32KB — which pushes the problem back to the client,
+where it can be solved.
+
+**The first real transfer through it aborted the client**, and the bug was older than the
+proxy. `tlsClientFeed` takes whole records and says so in its own comment; it does no
+buffering by design, so that only one place decides where a record ends. `link.wac` had been
+handing it whatever `recv` returned since the day it was written.
+
+It worked for a year of directory fetches because a consensus arrives as a few small records
+that a TCP segment does not usually split. The proxy's first 400KB download arrived as 44KB
+in one chunk — some eighty records with the last one cut in half — and it trapped. This is
+the failure mode that shows up on a *fast* connection rather than a slow one, which is the
+opposite of where you look.
+
+`box/src/applets/gets.wac` had the framing right the whole time, with the reason in a comment
+next to it. Two of this repo's TLS callers, one correct and one not, and nothing compared
+them. The fix is `wholeRecordBytes` in `link.wac`, and the test feeds it every prefix of a
+record and the exact eighty-records-plus-a-split-one shape that failed.
+
 ## What is not here
 
 **The real network.** Directory authorities are reached by IP and this sandbox's proxy
@@ -378,8 +437,24 @@ are exactly what the application produced.
 that caused the circuit to be built. A caller mixing ports under one key can be handed an
 exit that refuses a later one.
 
-**Streams to arbitrary destinations, verified.** `RELAY_BEGIN` reaches the exit and is
-parsed by it — the testnet's exit evaluates our address and answers `RELAY_END`, which
-arrives back through the onion layers and decrypts correctly. It has not been seen to carry
-data, because chutney's exits reject private addresses and this sandbox has nowhere else to
-reach. `RELAY_BEGIN_DIR` is the path that is exercised end to end.
+**Isolation is by port, not by destination.** Two sites on port 443 share a circuit and so
+share an exit, which is enough to link them. Tor's default is stronger — it isolates by SOCKS
+credential, so a client that wants separation can ask for it — and neither that nor
+`IsolateDestAddr` is here. Port is the coarsest useful key and the one the exit policy forces
+anyway.
+
+**A circuit that dies takes its streams with it.** The clients on it are dropped and the
+circuit is marked failed so nothing new lands there; the next request for that port builds a
+fresh one. What is not done is reattaching an in-flight stream, and deliberately: a stream
+silently moved to a different exit is a stream whose destination has quietly changed hands.
+
+**Circuits are retired for space, not for age.** An idle circuit is destroyed to make room
+when the table is full, which is what stops six requests for six ports wedging the proxy for
+good. There is no `MaxCircuitDirtiness`: a busy port keeps the same path for as long as the
+process runs, so a long session is linkable to itself. `pool.wac` has the age logic and the
+proxy does not use it.
+
+**No SOCKS authentication, and no isolation by credential.** Tor uses the SOCKS username and
+password as an isolation key — different credentials get different circuits, which is how
+Tor Browser separates tabs. Here the greeting is answered "no authentication" without reading
+what was offered.

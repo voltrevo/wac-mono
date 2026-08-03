@@ -100,6 +100,160 @@ export struct FileResult {
 }
 
 /**
+ * Something the user did.
+ *
+ * `id` is the `id` attribute of the element it happened on, and empty when it has none —
+ * which is why the examples give ids to everything they care about. Matching on ids rather
+ * than handing back an element reference keeps the boundary to strings: an element is a live
+ * object on the other side of a thread, and a handle to one would have to be freed.
+ *
+ * `value` carries whatever the event's kind makes useful — an input's text for `input` and
+ * `change`, the key's name for `keydown`, and empty otherwise. One field rather than a union
+ * because the alternative is four structs to say the same thing.
+ */
+export struct Event {
+  /** "click", "input", "change", "keydown", "submit", "pointermove", "pointerdown", "drop". */
+  string kind;
+  string id;
+  string value;
+  /**
+   * Where in the element it happened, in its own pixels. Zero for anything not pointer-shaped.
+   *
+   * The element's own coordinates rather than the page's, because the caller of `drawPixels`
+   * thinks in the buffer it drew and would otherwise have to subtract a position it has no way
+   * to ask for.
+   */
+  i32 x;
+  i32 y;
+
+  Event of(string kind, string id, string value, i32 x, i32 y) {
+    return Event(kind, id, value, x, y);
+  }
+}
+
+/**
+ * A file the user handed over, by picking it or dropping it.
+ *
+ * Separate from `FileResult` because a file that arrived this way has a *name* the application
+ * did not choose and usually wants — to echo it, to derive an output name from it, or to decide
+ * what it is.
+ */
+export struct Picked {
+  bool ok;
+  string name;
+  u8[] bytes;
+  string error;
+
+  Picked of(bool ok, string name, u8[] bytes, string error) {
+    return Picked(ok, name, bytes, error);
+  }
+}
+
+/**
+ * A page to draw on and events to answer, for `--target browser`.
+ *
+ * A third profile beside `Core` and `Cli`, and only a browser provides it: a page capability
+ * that pretended to work in a terminal would be a lie, and the whole point of these structs is
+ * that reading one tells you what a program can reach.
+ *
+ * **An interactive application is a loop, not a set of callbacks:**
+ *
+ * ```wac
+ * page.render("<button id=\'go\'>go</button><p id=\'out\'></p>");
+ * page.on("#go", "click");
+ * while (true) {
+ *   Event e = page.nextEvent().wait();
+ *   if (e.id == "go") { page.setText("out", "hello"); }
+ * }
+ * ```
+ *
+ * That works because an event is just another ticket. `nextEvent` parks the worker exactly as
+ * `recv` parks it on a socket, and the page's main thread — which is the *host* — stays free to
+ * run the real event loop and queue what arrives. So `waitAny` composes over it: a click or a
+ * five-second deadline is `waitAny(i32[](e.id), 5000)`, which is the thing callbacks make hard.
+ *
+ * The operations are coarse for the reason given at the top of this file. `render` replaces the
+ * application's whole root in one call, which suits building strings; `setText` and `setValue`
+ * are for the targeted updates that would otherwise mean re-rendering to change a word. There
+ * is deliberately no `querySelector`-shaped surface: every property poke would be a round trip
+ * across a thread boundary, to arrive at an object this side cannot hold.
+ */
+export struct Page {
+  /** Replace the application root's markup. The application builds it; nothing escapes it. */
+  fn[Pending<bool>(string)] render;
+  /**
+   * Set an element's *text*, by id.
+   *
+   * Text, not markup: this is `textContent`, so a value that happens to contain `<script>`
+   * lands as those characters. `render` is the one that parses, and the difference is where
+   * every injection bug in a page like this would come from.
+   */
+  fn[Pending<bool>(string, string)] setText;
+  /** Set an input's value, by id. */
+  fn[Pending<bool>(string, string)] setValue;
+  /** Read an input's value, by id. Empty if there is no such element. */
+  fn[Pending<string>(string)] getValue;
+  /**
+   * Ask for an event kind on everything matching a CSS selector.
+   *
+   * Delegated from the document, so it keeps working after `render` replaces the elements it
+   * was asked about — which it otherwise would not, and the bug would look like "the second
+   * click does nothing".
+   */
+  fn[Pending<bool>(string, string)] on;
+  /** The next event, waiting for one. */
+  fn[Pending<Event>()] nextEvent;
+  /** The document title. */
+  fn[Pending<bool>(string)] title;
+  /**
+   * Blit a pixel buffer into a `<canvas>`, by id: width, height, then `w * h * 4` bytes of
+   * RGBA. The canvas is resized to match.
+   *
+   * One coarse capability instead of a drawing API, and it is the whole of the raster story on
+   * purpose. A 2D context would be dozens of calls, each a round trip across a thread boundary
+   * to touch an object this side cannot hold; a buffer is one call, and wac is *good* at
+   * filling a buffer. Anything a drawing API would do — lines, text, sprites, a plot, a
+   * fractal, a decoded image — is a loop over bytes here, and that loop is compiled.
+   */
+  fn[Pending<bool>(string, i32, i32, u8[])] drawPixels;
+  /**
+   * The next file the user hands over, waiting for one.
+   *
+   * The user does the handing: a `<input type="file">` in the application's own markup, or a
+   * file dropped anywhere on it. There is deliberately no "open a file dialog" capability,
+   * because a browser will only open one during a real user gesture and by the time a request
+   * has crossed to the worker and back that gesture is over — an `openDialog` would work when
+   * tested by hand and fail in the field, which is the worst kind of capability.
+   */
+  fn[Pending<Picked>()] nextFile;
+  /**
+   * Offer bytes to the user as a download, under a name.
+   *
+   * The counterpart to `nextFile`, and the reason both are needed: a page that can read the
+   * user's file but cannot give one back can only ever be a viewer.
+   */
+  fn[Pending<bool>(string, u8[])] offerDownload;
+
+  Page of(
+    fn[Pending<bool>(string)] render,
+    fn[Pending<bool>(string, string)] setText,
+    fn[Pending<bool>(string, string)] setValue,
+    fn[Pending<string>(string)] getValue,
+    fn[Pending<bool>(string, string)] on,
+    fn[Pending<Event>()] nextEvent,
+    fn[Pending<bool>(string)] title,
+    fn[Pending<bool>(string, i32, i32, u8[])] drawPixels,
+    fn[Pending<Picked>()] nextFile,
+    fn[Pending<bool>(string, u8[])] offerDownload
+  ) {
+    return Page(
+      render, setText, setValue, getValue, on, nextEvent, title,
+      drawPixels, nextFile, offerDownload
+    );
+  }
+}
+
+/**
  * What every host can do, synchronously or made to look so.
  *
  * Deno, Node and a browser all provide these, which is what makes an application that
@@ -134,15 +288,59 @@ export struct Core {
   /** A line of output on the error channel. */
   fn[void(string)] warn;
 
+  /**
+   * Block until one of these calls has an answer, and say which — for at most `millis`.
+   *
+   * Takes the `id` of each ticket and returns its index in the list. Every id is accepted
+   * whatever its `Pending<T>`: a relay waits on a `recv` and an `accept` together, and
+   * their types differ.
+   *
+   * **This is the capability the ring exists for.** Overlapping two reads is a
+   * convenience; waiting on whichever of two *sockets* speaks first is the difference
+   * between a program being writable and not. `nc`, an SSH relay and a shell all need it,
+   * and `isDone` alone does not give it to them — polling `isDone` in a loop is a spin,
+   * which burns a core to avoid parking.
+   *
+   * `millis` is the deadline, and **-1 means wait as long as it takes**:
+   *
+   *     i32 w = core.waitAny(i32[](r.id, a.id), -1);   // until one of them answers
+   *     i32 w = core.waitAny(i32[](r.id), 5000);       // ...or five seconds, whichever first
+   *     i32 w = core.waitAny(i32[](click.id, file.id), 0);   // which is ready right now
+   *
+   * **Returns -1 when the time ran out**, and also for an empty list, which is the same
+   * statement: nothing settled. That is how a silent peer is survivable — see
+   * `example/patience.wac` — and it is why there is no `recvWithin`. A deadline belongs to
+   * the wait rather than to each capability, so this one parameter bounds `connect`,
+   * `accept`, `readFile` or a child's `exitCode` without any of them knowing about it.
+   *
+   * The deadline **costs nothing**: no opcode, no slot, no ticket to dispose of, because
+   * `Atomics.wait` takes a timeout and the wait is already in this worker's own memory. An
+   * earlier design passed a timer ticket in the list instead; it worked, and every caller
+   * had to remember to cancel the loser or lose a slot for good. `core.sleepMillis` remains
+   * for *sleeping*, which is a different thing from a deadline.
+   *
+   * Blocking, and it reaches no further than this worker's own memory: the wait is on the
+   * completion counter the host bumps, so it takes no slot and cannot deadlock the ring
+   * however many tickets are outstanding.
+   *
+   * **In `Core` rather than `Cli`**, which it was not at first and should have been. It grants
+   * nothing — it cannot start work, only notice that some has finished — and it is the same in
+   * every host, which is what `Core` means. Keeping it beside the filesystem left an
+   * interactive page unable to wait on a click *or* a dropped file, and that is exactly the
+   * question this exists to answer.
+   */
+  fn[i32(i32[], i32)] waitAny;
+
   Core of(
     fn[Pending<i64>()] nowMillis,
     fn[Pending<i64>()] monotonicNanos,
     fn[Pending<i64>(i32)] sleepMillis,
     fn[Pending<u8[]>(i32)] randomBytes,
     fn[void(string)] log,
-    fn[void(string)] warn
+    fn[void(string)] warn,
+    fn[i32(i32[], i32)] waitAny
   ) {
-    return Core(nowMillis, monotonicNanos, sleepMillis, randomBytes, log, warn);
+    return Core(nowMillis, monotonicNanos, sleepMillis, randomBytes, log, warn, waitAny);
   }
 }
 
@@ -349,42 +547,6 @@ export struct Cli {
   fn[Pending<bool>(i32, u8[])] send;
   fn[void(i32)] closeSocket;
 
-  /**
-   * Block until one of these calls has an answer, and say which — for at most `millis`.
-   *
-   * Takes the `id` of each ticket and returns its index in the list. Every id is accepted
-   * whatever its `Pending<T>`: a relay waits on a `recv` and an `accept` together, and
-   * their types differ.
-   *
-   * **This is the capability the ring exists for.** Overlapping two reads is a
-   * convenience; waiting on whichever of two *sockets* speaks first is the difference
-   * between a program being writable and not. `nc`, an SSH relay and a shell all need it,
-   * and `isDone` alone does not give it to them — polling `isDone` in a loop is a spin,
-   * which burns a core to avoid parking.
-   *
-   * `millis` is the deadline, and **-1 means wait as long as it takes**:
-   *
-   *     i32 w = cli.waitAny(i32[](r.id, a.id), -1);    // until one of them answers
-   *     i32 w = cli.waitAny(i32[](r.id), 5000);        // ...or five seconds, whichever first
-   *     i32 w = cli.waitAny(i32[](r.id), 0);           // which is ready right now, if any
-   *
-   * **Returns -1 when the time ran out**, and also for an empty list, which is the same
-   * statement: nothing settled. That is how a silent peer is survivable — see
-   * `example/patience.wac` — and it is why there is no `recvWithin`. A deadline belongs to
-   * the wait rather than to each capability, so this one parameter bounds `connect`,
-   * `accept`, `readFile` or a child's `exitCode` without any of them knowing about it.
-   *
-   * The deadline **costs nothing**: no opcode, no slot, no ticket to dispose of, because
-   * `Atomics.wait` takes a timeout and the wait is already in this worker's own memory. An
-   * earlier design passed a timer ticket in the list instead; it worked, and every caller
-   * had to remember to cancel the loser or lose a slot for good. `core.sleepMillis` remains
-   * for *sleeping*, which is a different thing from a deadline.
-   *
-   * Blocking, and it reaches no further than this worker's own memory: the wait is on the
-   * completion counter the host bumps, so it takes no slot and cannot deadlock the ring
-   * however many tickets are outstanding.
-   */
-  fn[i32(i32[], i32)] waitAny;
 
   /**
    * Start a worker on `source`, with `args` as its arguments.
@@ -459,7 +621,6 @@ export struct Cli {
     fn[Pending<u8[]>(i32)] recv,
     fn[Pending<bool>(i32, u8[])] send,
     fn[void(i32)] closeSocket,
-    fn[i32(i32[], i32)] waitAny,
     fn[Pending<Child>(string, string[], i32)] spawn,
     fn[void(i32)] closeFeed,
     fn[Pending<i32>(i32)] exitCode
@@ -467,7 +628,7 @@ export struct Cli {
     return Cli(
       argCount, arg, env, readStdin, write, readFile, writeFile, stat, readDir,
       mkdir, remove, rename, openInput, readChunk, openOutput,
-      connect, listen, accept, recv, send, closeSocket, waitAny, spawn, closeFeed, exitCode
+      connect, listen, accept, recv, send, closeSocket, spawn, closeFeed, exitCode
     );
   }
 }

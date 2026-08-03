@@ -324,6 +324,21 @@ export i32 cmdPaddingNegotiate() { return 12; }
  * reaches the wire, so randomising it would buy nothing an observer could not already not
  * see — and tor sends zeros, which is the answer that matters for interoperability.
  */
+/**
+ * DESTROY, with a reason. tor-spec §5.4.
+ *
+ * Sent when a circuit is finished with rather than dropped: the relays hold state for it —
+ * key material, windows, an open TCP connection at the exit — until they are told or it
+ * times out. A client that abandons circuits silently leaves that behind at three relays
+ * each time.
+ */
+export u8[] encodeDestroy(i32 circId, i32 reason) {
+  return encodeFixed(circId, cmdDestroy(), u8[](reason));
+}
+
+/** REASON_REQUESTED — we are done with it, nothing went wrong. */
+export i32 destroyRequested() { return 1; }
+
 export u8[] encodePadding() {
   return encodeFixed(0, cmdPadding(), u8[0]());
 }

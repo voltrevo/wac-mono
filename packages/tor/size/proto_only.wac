@@ -2,6 +2,7 @@
 import { encodeFixed, cellSize, cellCommand, cellPayload, encodeVersions, negotiateVersion,
          encodeNetinfo, encodeCreate2, decodeCreated2, encodePadding } from "../src/cell.wac";
 import { weightedBandwidths, choose, portPermitted } from "../src/pathsel.wac";
+import { Relay } from "../src/directory.wac";
 export u8[] a(i32 c, i32 k, u8[] p) { return encodeFixed(c, k, p); }
 export i32 b(u8[] x, i32 y) { return cellSize(x, y); }
 export i32 b2(u8[] x, i32 y) { return cellCommand(x, y); }
@@ -12,6 +13,7 @@ export u8[] b6(u8[] i) { return encodeNetinfo(i); }
 export u8[] b7(i32 c, i32 h, u8[] d) { return encodeCreate2(c, h, d); }
 export u8[] b8(u8[] p) { return decodeCreated2(p); }
 export u8[] b9() { return encodePadding(); }
-export i64[] f1(i64[] b, bool[] g, bool[] e, i32 p, i64[] w) { return weightedBandwidths(b, g, e, p, w); }
-export i32 f2(i64[] w, i32[] c, u8[] a, i32[] s, i32[] o, bool m, i64 r) { return choose(w, c, a, s, o, m, r); }
+// `Relay[]` does not marshal; an empty list keeps the code reachable to be measured.
+export i32 f1(i32 p, i64[] w) { return weightedBandwidths(Relay[0](), p, w).len(); }
+export i32 f2(i64[] w, i32[] c, i32[] s, i32[] o, bool m, i64 r) { return choose(Relay[0](), w, c, s, o, m, r); }
 export bool f3(bool a, i32[] r, i32 p) { return portPermitted(a, r, p); }
