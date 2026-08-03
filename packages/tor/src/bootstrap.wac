@@ -12,11 +12,16 @@ import {
 } from "./directory.wac";
 import { AuthorityCert, Verdict, parseCertificates, verifyConsensus } from "./consensus.wac";
 import { parseWeights, resolveFamilies, Families, pick, positionGuard, positionMiddle,
-         positionExit } from "./pathsel.wac";
-import { Circuit } from "./circuit.wac";
+         positionExit, exitsAnything } from "./pathsel.wac";
+import { Circuit, Received, gotExtended, gotBroken, gotDestroyed,
+         extendedReply } from "./circuit.wac";
+import { encodeCreate2, decodeCreated2, cellCommand, cellPayload, handshakeNtor,
+         cmdCreated2, cmdDestroy } from "./cell.wac";
+import { ntorClientRequest, ntorClientFinish } from "./ntor.wac";
 import { consensusPath, certificatePath, microdescPath, microdescBatches } from "./dirclient.wac";
 import { Link, connectRelay, handshakeTls, linkHandshake, createCircuit, extendTo,
-         fetchOverCircuit, itoa, lines, words, fromHex, randomI64 } from "./link.wac";
+         fetchOverCircuit, sendCells, ipv4Of, itoa, lines, words, fromHex,
+         randomI64 } from "./link.wac";
 
 /** A verified view of the network: who is out there, and how to weight them. */
 export struct Network {
@@ -166,4 +171,178 @@ export Session buildCircuit(Core core, Cli cli, Network n, i32 port, i32 circId)
     return bad;
   }
   return Session(true, l, c, desc);
+}
+
+// ── Several circuits on one guard ────────────────────────────────────────────
+//
+// A proxy needs a circuit per destination, and the guard must stay the same for all of them:
+// the whole point of pinning a guard is that a client presents one entry point to the network
+// rather than a fresh one per connection. Tor puts many circuits on one TLS connection to the
+// guard, told apart by the circuit id in every cell's header, and so does this.
+//
+// The consequence is that building can no longer block. `buildCircuit` above sits in
+// `nextCell` until its handshake answers, which is correct when it owns the link and wrong
+// here — the cells it would swallow belong to other circuits. So a build is a state machine
+// the caller drives one cell at a time, and `buildCircuit` stays for `app.wac`, which does own
+// its link and is clearer for blocking.
+
+/** The pinned guard, and the link every circuit runs over. */
+export struct Guard {
+  bool ok;
+  Link link;
+  i32 index;
+  string nickname;
+}
+
+/** A circuit, mid-build or finished. */
+export struct Building {
+  i32 circId;
+  Circuit circ;
+  /** The port its exit was chosen to carry. Circuits are reused only for the same port. */
+  i32 port;
+  /** 0 awaiting CREATED2, 1 and 2 awaiting EXTENDED2, 3 ready, -1 failed. */
+  i32 state;
+  i32 middleIdx;
+  i32 exitIdx;
+  /** The private key of the handshake currently outstanding. */
+  u8[] ephemeral;
+  string description;
+}
+
+export i32 circuitReady() { return 3; }
+export i32 circuitFailed() { return -1; }
+
+/** How many guards to consider before giving up. Tor keeps a primary list of three. */
+const i32 GUARD_TRIES = 8;
+
+export Guard connectGuard(Core core, Cli cli, Network n) {
+  Guard bad = Guard(false, Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]()), -1, "");
+
+  // A guard through which no circuit can ever be built is not a guard. The exit is chosen
+  // excluding the guard, so a relay that is the only usable exit leaves nothing to exit
+  // through if it is also where we enter — and every circuit then fails at path selection
+  // rather than on the wire, which reads like a bug in the client.
+  //
+  // Real tor does not hit this because it keeps a primary list of several guards and because
+  // the network has thousands of exits. It bites immediately on a five-relay testnet with one
+  // exit, which is the argument for checking rather than assuming.
+  i32 g = -1;
+  for (i32 attempt = 0; attempt < GUARD_TRIES && g < 0; attempt++) {
+    i32 cand = pick(n.relays, n.weights, n.families, positionGuard(), i32[0](), 0,
+                    n.sameSubnetOk, randomI64(core));
+    if (cand < 0) { break; }
+    bool anotherExitExists = false;
+    for (i32 i = 0; i < n.relays.len(); i++) {
+      if (i != cand && exitsAnything(n.relays[i])) { anotherExitExists = true; }
+    }
+    if (anotherExitExists) {
+      g = cand;
+    } else {
+      core.warn("tor: " + n.relays[cand].nickname +
+                " would leave no exit to build through; trying another guard");
+    }
+  }
+  if (g < 0) { core.warn("tor: no usable guard"); return bad; }
+
+  Link l = connectRelay(core, cli, n.relays[g].address, n.relays[g].orPort);
+  if (l.dead) { return bad; }
+  handshakeTls(l);
+  if (l.dead || !linkHandshake(l, n.relays[g].address)) {
+    core.warn("tor: the link handshake with the guard failed");
+    cli.closeSocket(l.sock);
+    return bad;
+  }
+  return Guard(true, l, g, n.relays[g].nickname);
+}
+
+/**
+ * Choose a path for `port` and send the first handshake.
+ *
+ * The exit is picked for the port that is actually wanted, which is the difference between
+ * this and one circuit for everything: an exit chosen before anyone has asked may refuse the
+ * first thing they ask for, and there is nothing to be done about it by then.
+ */
+export Building startCircuit(Core core, Network n, Guard g, i32 port, i32 circId) {
+  Building bad = Building(circId, Circuit.create(circId, u8[72]()), port, -1, -1, -1,
+                          u8[0](), "");
+
+  i32 exit = pick(n.relays, n.weights, n.families, positionExit(), i32[](g.index), port,
+                  n.sameSubnetOk, randomI64(core));
+  if (exit < 0) {
+    core.warn("tor: no exit will carry port " + itoa(port));
+    return bad;
+  }
+  i32 middle = pick(n.relays, n.weights, n.families, positionMiddle(), i32[](g.index, exit), 0,
+                    n.sameSubnetOk, randomI64(core));
+  if (middle < 0) { core.warn("tor: no usable middle relay"); return bad; }
+
+  u8[] eph = core.randomBytes(32).wait();
+  sendCells(g.link, encodeCreate2(circId, handshakeNtor(),
+                                  ntorClientRequest(n.relays[g.index].identity,
+                                                    n.relays[g.index].ntorOnionKey, eph)));
+  return Building(circId, Circuit.create(circId, u8[72]()), port, 0, middle, exit, eph,
+                  g.nickname + " -> " + n.relays[middle].nickname + " -> " +
+                  n.relays[exit].nickname);
+}
+
+/**
+ * One cell towards finishing the build. Returns the new state.
+ *
+ * Only called for cells whose circuit id is this one's, and only while it is still building —
+ * the caller owns the dispatch, because it is the only thing that knows every circuit.
+ */
+export i32 advanceCircuit(Core core, Network n, Guard g, Building b, u8[] cell) {
+  if (b.state == 0) {
+    if (cellCommand(cell, 0) == cmdDestroy()) {
+      core.warn("tor: the guard refused a circuit");
+      b.state = -1;
+      return b.state;
+    }
+    if (cellCommand(cell, 0) != cmdCreated2()) { return b.state; }
+    u8[] keys = ntorClientFinish(n.relays[g.index].identity, n.relays[g.index].ntorOnionKey,
+                                 b.ephemeral, decodeCreated2(cellPayload(cell, 0)), 72);
+    if (keys.len() == 0) {
+      core.warn("tor: the guard did not authenticate");
+      b.state = -1;
+      return b.state;
+    }
+    b.circ = Circuit.create(b.circId, keys);
+    b.state = 1;
+    extendToward(core, n, g, b, n.relays[b.middleIdx]);
+    return b.state;
+  }
+
+  Received got = b.circ.receive(cell);
+  if (got.kind == gotBroken() || got.kind == gotDestroyed()) {
+    core.warn("tor: a circuit died while it was being built");
+    b.state = -1;
+    return b.state;
+  }
+  if (got.kind != gotExtended()) { return b.state; }
+
+  Relay r = b.state == 1 ? n.relays[b.middleIdx] : n.relays[b.exitIdx];
+  u8[] keys = ntorClientFinish(r.identity, r.ntorOnionKey, b.ephemeral,
+                               extendedReply(got.data), 72);
+  // An empty return is how ntor reports failure: the party at the other end does not hold
+  // the key the consensus named, so there is nothing to negotiate.
+  if (keys.len() == 0) {
+    core.warn("tor: " + r.nickname + " did not authenticate");
+    b.state = -1;
+    return b.state;
+  }
+  b.circ.addHop(keys);
+  if (b.state == 1) {
+    b.state = 2;
+    extendToward(core, n, g, b, n.relays[b.exitIdx]);
+  } else {
+    b.state = 3;
+  }
+  return b.state;
+}
+
+void extendToward(Core core, Network n, Guard g, Building b, Relay r) {
+  b.ephemeral = core.randomBytes(32).wait();
+  sendCells(g.link, b.circ.extendCell(ipv4Of(r.address), r.orPort, r.identity,
+                                      ntorClientRequest(r.identity, r.ntorOnionKey,
+                                                        b.ephemeral)));
 }

@@ -354,12 +354,37 @@ What catches it is in the crypto package, where a chunked `CtrStream` is compare
 the one-shot that the host's own AES already verifies. If you add a relay test, ask which
 of those two kinds it is.
 
-## The SOCKS proxy, and the bug it found immediately
+## The SOCKS proxy
 
 `src/socks.wac` is one worker holding one outstanding `recv` per socket plus an `accept`,
-handing the whole list to `waitAny` and re-issuing whichever answered. Every SOCKS connection
-becomes a stream on the shared circuit; arriving cells are routed by the stream id in the
-relay header. `box nc` is the two-handle version of the same shape.
+handing the whole list to `waitAny` and re-issuing whichever answered. `box nc` is the
+two-handle version of the same shape.
+
+**Circuits are per port, on one pinned guard.** A circuit is built when the first client asks
+for a port and reused by everyone after; clients arriving mid-build park and get their
+`RELAY_BEGIN` when the last hop answers. Every circuit runs over the *same* TLS connection to
+the *same* guard, told apart by the circuit id in each cell's header, because that is what a
+guard is for — a client should present the network one entry point, not a fresh one per
+destination.
+
+Choosing the exit for the port that was actually asked for is the point. An exit picked before
+anyone has asked may refuse the first thing they want, and by then three handshakes have been
+spent finding out.
+
+Sharing a link means the build cannot block. `bootstrap.wac` has both: `buildCircuit` sits in
+`nextCell` until each handshake answers, which is right for `app.wac`, which owns its link;
+`startCircuit`/`advanceCircuit` are a state machine the caller drives one cell at a time,
+because a blocking build on a shared link would swallow cells belonging to other circuits and
+advance the wrong ciphers — from which there is no recovering.
+
+**A guard that leaves no exit is not a guard.** The exit is chosen excluding the guard, so a
+relay that is the only usable exit leaves nothing to exit through if it is also the entrance,
+and every circuit then fails at path selection rather than on the wire. `connectGuard` checks
+before pinning. Real tor never notices this because it keeps several guards and the network
+has thousands of exits; the testnet here has five relays and exactly one exit, so it happened
+on the first run that drew badly.
+
+## The bug the proxy found immediately
 
 Uploads are the interesting direction. Tor's package window bounds what may be in flight, so
 a client that uploads faster than credit arrives will outrun the circuit, and the choice is
@@ -412,17 +437,20 @@ are exactly what the application produced.
 that caused the circuit to be built. A caller mixing ports under one key can be handed an
 exit that refuses a later one.
 
-**One circuit for everything.** `socks.wac` builds a single three-hop circuit at start-up
-and puts every stream on it. That is one exit for every destination, one fate shared by
-every stream, and no isolation between them — a real client keeps several circuits and
-chooses between them per destination. It also picks its exit for port 80 before it knows
-what anyone will ask for, so a CONNECT to a port that exit refuses fails where a
-per-destination circuit would have succeeded.
+**Isolation is by port, not by destination.** Two sites on port 443 share a circuit and so
+share an exit, which is enough to link them. Tor's default is stronger — it isolates by SOCKS
+credential, so a client that wants separation can ask for it — and neither that nor
+`IsolateDestAddr` is here. Port is the coarsest useful key and the one the exit policy forces
+anyway.
 
-**A circuit that dies is not rebuilt.** `socks.wac` logs it and exits. Rebuilding needs the
-in-flight streams to be reopened on the new circuit or ended honestly, and doing it badly is
-worse than not doing it: a stream silently reattached to a different exit is a stream whose
-destination has quietly changed hands.
+**A circuit that dies takes its streams with it.** The clients on it are dropped and the
+circuit is marked failed so nothing new lands there; the next request for that port builds a
+fresh one. What is not done is reattaching an in-flight stream, and deliberately: a stream
+silently moved to a different exit is a stream whose destination has quietly changed hands.
+
+**Circuits are never retired.** No `MaxCircuitDirtiness`, so a long-lived proxy keeps using
+the same path for a port for as long as it runs. `pool.wac` has the retirement logic; the
+proxy does not use it.
 
 **No SOCKS authentication, and no isolation by credential.** Tor uses the SOCKS username and
 password as an isolation key — different credentials get different circuits, which is how
