@@ -177,3 +177,277 @@ export bool verifyKeyCertification(u8[] cert, u8[] identityKeyDer, u8[] signatur
   return signatureMatches(rsaModulus(identityKeyDer), rsaExponent(identityKeyDer),
                           sha1(signed), signature);
 }
+
+// ── Believing one: the authority chain, the majority, and the clock ──────────
+//
+// This half was TypeScript. It is parsing and bookkeeping, which is not a reason to be
+// host code — the same argument as `directory.wac`.
+//
+// The shape of the argument, which is the part worth getting right:
+//
+//   1. the caller names the authorities it trusts, by identity key fingerprint;
+//   2. a key certificate is believed only if its identity key hashes to one of those
+//      fingerprints *and* its signing key is certified by that identity key;
+//   3. a consensus signature counts only if it came from a signing key certified that way;
+//   4. more than half of the *named* authorities must have signed;
+//   5. the document must be current.
+//
+// Step 1 is the whole basis, and a caller that reads its fingerprints out of the directory
+// it is checking has verified nothing. A real client compiles them in.
+//
+// Step 4 says "of the named authorities", not "of the signatures present" — the second is
+// no test at all, since whoever wrote the document also chose how many signatures to hang
+// off it.
+//
+// Step 5 is not an afterthought. A correctly signed consensus from last year is still a lie
+// about who the relays are, and replaying one costs an attacker nothing.
+
+import { Vec } from "../../std/src/vec.wac";
+import { daysFromCivil } from "../../datetime/src/civil.wac";
+import { decode } from "../../codec/src/base64.wac";
+import { parseInt } from "./directory.wac";
+
+/** An authority's certificate, once it has been checked. */
+export struct AuthorityCert {
+  /** Uppercase hex of the identity key's SHA-1 — what a client hardcodes. */
+  string fingerprint;
+  u8[] signingKey;
+  /** Uppercase hex of the signing key's SHA-1: how a signature names which key made it. */
+  string signingKeyDigest;
+}
+
+export struct Verdict {
+  bool ok;
+  i32 goodSignatures;
+  i32 needed;
+  /** Empty when the document is current; otherwise why it is not. */
+  string stale;
+}
+
+export string toHex(u8[] b) {
+  u8[] digits = "0123456789ABCDEF".toBytes();
+  u8[] out = u8[b.len() * 2]();
+  for (i32 i = 0; i < b.len(); i++) {
+    out[i * 2] = digits[(b[i] >> 4) & 15];
+    out[i * 2 + 1] = digits[b[i] & 15];
+  }
+  return string.fromBytes(out);
+}
+
+/** The DER inside a PEM block, or empty if there is none. */
+u8[] pemBody(u8[] doc, i32 from, i32 to) {
+  Vec<i32> chars = Vec.create();
+  i32 at = from;
+  bool inside = false;
+  while (at < to) {
+    i32 end = at;
+    while (end < to && doc[end] != '\n') { end++; }
+    bool marker = end - at >= 5 && doc[at] == '-' && doc[at + 1] == '-';
+    if (marker) {
+      if (inside) { break; }
+      inside = true;
+    } else if (inside) {
+      for (i32 i = at; i < end; i++) {
+        if (doc[i] != '\r' && doc[i] != ' ') { chars.push(doc[i]); }
+      }
+    }
+    at = end + 1;
+  }
+  i32[] cs = chars.toArray();
+  u8[] b64 = u8[cs.len()]();
+  for (i32 i = 0; i < cs.len(); i++) { b64[i] = cs[i]; }
+  u8[]? d = decode(b64);
+  if (d is null) { return u8[0](); }
+  return d!;
+}
+
+/** Where `needle` starts at or after `from`, or -1. */
+export i32 findFrom(u8[] doc, string needle, i32 from) {
+  u8[] n = needle.toBytes();
+  if (n.len() == 0) { return -1; }
+  for (i32 i = from; i + n.len() <= doc.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < n.len(); j++) {
+      if (doc[i + j] != n[j]) { hit = false; }
+    }
+    if (hit) { return i; }
+  }
+  return -1;
+}
+
+/**
+ * The certificates in a `cached-certs` document that this caller should believe.
+ *
+ * Two checks, and the second is the tempting one to skip. The identity key must hash to a
+ * fingerprint the caller trusts — otherwise this is a stranger's certificate. And the
+ * signing key must be certified *by that identity key* — otherwise the consensus signature
+ * would verify happily against a signing key anybody could have written into the file.
+ */
+export AuthorityCert[] parseCertificates(u8[] doc, string[] trusted) {
+  Vec<AuthorityCert> out = Vec.create();
+  i32 at = 0;
+  while (at < doc.len()) {
+    i32 start = findFrom(doc, "dir-key-certificate-version ", at);
+    if (start < 0) { return out.toArray(); }
+    i32 next = findFrom(doc, "dir-key-certificate-version ", start + 1);
+    i32 end = next < 0 ? doc.len() : next;
+
+    i32 idAt = findFrom(doc, "dir-identity-key\n", start);
+    i32 skAt = findFrom(doc, "dir-signing-key\n", start);
+    i32 sigAt = findFrom(doc, "dir-key-certification\n", start);
+    if (idAt >= 0 && skAt >= 0 && sigAt >= 0 && idAt < end && skAt < end && sigAt < end) {
+      u8[] identityKey = pemBody(doc, idAt, skAt);
+      u8[] signingKey = pemBody(doc, skAt, end);
+      u8[] certSig = pemBody(doc, sigAt, end);
+      string fp = toHex(keyFingerprint(identityKey));
+      if (identityKey.len() > 0 && isTrusted(fp, trusted)) {
+        u8[] cert = u8[end - start]();
+        for (i32 i = 0; i < cert.len(); i++) { cert[i] = doc[start + i]; }
+        if (verifyKeyCertification(cert, identityKey, certSig)) {
+          out.push(AuthorityCert(fp, signingKey, toHex(keyFingerprint(signingKey))));
+        }
+      }
+    }
+    at = end;
+  }
+  return out.toArray();
+}
+
+bool isTrusted(string fp, string[] trusted) {
+  for (i32 i = 0; i < trusted.len(); i++) {
+    if (trusted[i] == fp) { return true; }
+  }
+  return false;
+}
+
+/** A directory timestamp, "YYYY-MM-DD HH:MM:SS", always UTC. -1 if it is not one. */
+export i64 parseUtc(u8[] doc, i32 at, i32 end) {
+  if (end - at < 19) { return -1; }
+  if (doc[at + 4] != '-' || doc[at + 7] != '-' || doc[at + 10] != ' ') { return -1; }
+  if (doc[at + 13] != ':' || doc[at + 16] != ':') { return -1; }
+  i32[] parts = i32[6]();
+  i32[] offs = i32[](0, 5, 8, 11, 14, 17);
+  i32[] lens = i32[](4, 2, 2, 2, 2, 2);
+  for (i32 i = 0; i < 6; i++) {
+    u8[] f = u8[lens[i]]();
+    for (i32 j = 0; j < lens[i]; j++) { f[j] = doc[at + offs[i] + j]; }
+    parts[i] = parseInt(string.fromBytes(f));
+    if (parts[i] < 0) { return -1; }
+  }
+  i64 days = daysFromCivil(parts[0], parts[1], parts[2]);
+  return days * 86400 + (parts[3] as i64) * 3600 + (parts[4] as i64) * 60 + (parts[5] as i64);
+}
+
+/** The value of a `key value` line at the start of a line, parsed as a UTC time. */
+i64 timeField(u8[] doc, string field) {
+  i32 at = findFrom(doc, "\n" + field + " ", 0);
+  i32 from = at < 0 ? findFrom(doc, field + " ", 0) : at + 1;
+  if (from < 0) { return -1; }
+  if (from != 0 && at < 0) { return -1; }
+  i32 valueAt = from + field.len() + 1;
+  i32 end = valueAt;
+  while (end < doc.len() && doc[end] != '\n') { end++; }
+  return parseUtc(doc, valueAt, end);
+}
+
+/**
+ * Whether a majority of the trusted authorities signed this consensus, and it is current.
+ *
+ * `now` is passed rather than read so the decision is testable and so a caller with a
+ * better clock than the system's can use it.
+ */
+export Verdict verifyConsensus(u8[] doc, AuthorityCert[] certs, string[] trusted, i64 now) {
+  i32 needed = trusted.len() / 2 + 1;
+  if (trusted.len() == 0) { return Verdict(false, 0, 1, "no trusted authorities"); }
+  if (signedLength(doc) < 0) { return Verdict(false, 0, needed, "no signatures"); }
+
+  Vec<string> signedBy = Vec.create();
+  i32 at = 0;
+  while (true) {
+    i32 line = findFrom(doc, "\ndirectory-signature ", at);
+    if (line < 0) { break; }
+    i32 valueAt = line + 21;
+    i32 end = valueAt;
+    while (end < doc.len() && doc[end] != '\n') { end++; }
+    at = end;
+
+    // "directory-signature [algorithm] <identity> <signing key digest>". The algorithm is
+    // absent on old signatures, which meant sha1.
+    string[] f = splitSpaces(doc, valueAt, end);
+    bool sha256Flavour = false;
+    i32 idIdx = 0;
+    if (f.len() == 3) {
+      if (f[0] != "sha1" && f[0] != "sha256") { continue; }
+      sha256Flavour = f[0] == "sha256";
+      idIdx = 1;
+    } else if (f.len() != 2) {
+      continue;
+    }
+    string identity = upper(f[idIdx]);
+    string keyDigest = upper(f[idIdx + 1]);
+    if (!isTrusted(identity, trusted) || contains(signedBy, identity)) { continue; }
+
+    // Both must match. Matching only the identity would accept a signature made with a key
+    // that identity never certified.
+    i32 which = -1;
+    for (i32 i = 0; i < certs.len(); i++) {
+      if (certs[i].fingerprint == identity && certs[i].signingKeyDigest == keyDigest) {
+        which = i;
+      }
+    }
+    if (which < 0) { continue; }
+
+    i32 sigStart = findFrom(doc, "-----BEGIN SIGNATURE-----", end);
+    if (sigStart < 0) { continue; }
+    i32 sigEnd = findFrom(doc, "-----END SIGNATURE-----", sigStart);
+    if (sigEnd < 0) { continue; }
+    u8[] sig = pemBody(doc, sigStart, sigEnd + 23);
+    if (verifyDocumentSignature(doc, sha256Flavour, certs[which].signingKey, sig)) {
+      signedBy.push(identity);
+    }
+  }
+
+  // Freshness last, so a stale-but-genuine document is distinguishable from a forged one.
+  // Both are refused; they mean different things and a caller may want to say which.
+  string stale = "";
+  i64 after = timeField(doc, "valid-after");
+  i64 until = timeField(doc, "valid-until");
+  if (after < 0 || until < 0) { stale = "no valid-after/valid-until"; }
+  else if (now < after) { stale = "not valid yet"; }
+  else if (now > until) { stale = "expired"; }
+
+  i32 good = signedBy.len();
+  return Verdict(good >= needed && stale == "", good, needed, stale);
+}
+
+string[] splitSpaces(u8[] doc, i32 from, i32 to) {
+  Vec<string> out = Vec.create();
+  i32 start = from;
+  for (i32 i = from; i <= to; i++) {
+    if (i == to || doc[i] == ' ') {
+      if (i > start) {
+        u8[] f = u8[i - start]();
+        for (i32 j = 0; j < f.len(); j++) { f[j] = doc[start + j]; }
+        out.push(string.fromBytes(f));
+      }
+      start = i + 1;
+    }
+  }
+  return out.toArray();
+}
+
+string upper(string s) {
+  u8[] b = s.toBytes();
+  u8[] o = u8[b.len()]();
+  for (i32 i = 0; i < b.len(); i++) {
+    o[i] = b[i] >= 'a' && b[i] <= 'z' ? b[i] - 32 : b[i];
+  }
+  return string.fromBytes(o);
+}
+
+bool contains(Vec<string> v, string s) {
+  for (i32 i = 0; i < v.len(); i++) {
+    if (v.get(i) == s) { return true; }
+  }
+  return false;
+}
