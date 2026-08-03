@@ -139,7 +139,10 @@ export struct Shell {
    * returns the empty string for both.
    */
   bool isSet(const this, string name) {
-    if (name == "?" || name == "#" || name == "@" || name == "*") { return true; }
+    // `$?` and `$#` always have a value. `$@` and `$*` do *not* — with no positional parameters
+    // they are unset, which is why `${@-x}` substitutes and `${#-x}` does not.
+    if (name == "?" || name == "#") { return true; }
+    if (name == "@" || name == "*") { return this.params.len() > 0; }
     if (name.len() == 1) {
       u8[] b = name.toBytes();
       if (b[0] >= 0x31 && b[0] <= 0x39) { return (b[0] - 0x31) < this.params.len(); }
@@ -1188,6 +1191,122 @@ string trimStart(Shell sh, string value, string pattern, bool longest) {
 }
 
 /**
+ * `${x^}`, `${x^^}`, `${x,}`, `${x,,}` — case conversion, over the characters a pattern selects.
+ *
+ * The doubled forms do every character and the single ones only the first. The pattern is the
+ * unexpected part: `${x^^[ab]}` upper-cases only a's and b's, and an absent pattern matches
+ * anything at all.
+ */
+string convertCase(Shell sh, string value, string pattern, bool up, bool all) {
+  u8[] pat = expandQuoted(sh, pattern).toBytes();
+  u8[] mask = u8[pat.len()]();
+  u8[] v = value.toBytes();
+  Buf out = Buf.create();
+  for (i32 i = 0; i < v.len(); i++) {
+    i32 c = v[i];
+    // The single form looks at the first character and *only* the first: `${x^b}` of `abc` is
+    // unchanged rather than reaching forward to the `b`. It is a position, not a search.
+    bool eligible = all || i == 0;
+    if (eligible && pat.len() > 0) {
+      u8[] one = u8[1]();
+      one[0] = c;
+      eligible = globMatch(pat, mask, 0, one, 0);
+    }
+    if (eligible) {
+      if (up && c >= 0x61 && c <= 0x7a) { c = c - 32; }
+      else if (!up && c >= 0x41 && c <= 0x5a) { c = c + 32; }
+    }
+    out.push(c);
+  }
+  return string.fromBytes(out.bytes());
+}
+
+/**
+ * `${x:off}` and `${x:off:len}` — a substring.
+ *
+ * Both numbers are *arithmetic*, so a bare name works (`${x:n}`) and so does `$((…))`, on the
+ * same rules as inside `$((…))` itself. And both may be negative, meaning different things:
+ *
+ *   **A negative offset counts from the end**, and one that reaches past the start gives the
+ *   empty string rather than being clamped to zero — `${x: -9}` of `abc` is empty, not `abc`.
+ *
+ *   **A negative length is a position, not a count.** `${x:1:-1}` is "from 1 to one before the
+ *   end", which is why it is the idiom for dropping the last character. A negative length that
+ *   lands before the offset is an error rather than an empty string.
+ *
+ * An empty specification — `${x:}` — is a bad substitution, and a bad substitution is *fatal*:
+ * bash prints nothing, exits 1, and does not run the rest of the line.
+ */
+string substring(Shell sh, string name, string value, string spec) {
+  if (spec == "") { return badSubstitution(sh, "${" + name + ":}"); }
+
+  // Split on the first colon outside parentheses, so `${x:$((a))}` keeps its own colons if it
+  // ever grows any.
+  u8[] b = spec.toBytes();
+  i32 depth = 0;
+  i32 cut = -1;
+  for (i32 i = 0; i < b.len() && cut < 0; i++) {
+    if (b[i] == 0x28) { depth++; }
+    else if (b[i] == 0x29) { depth--; }
+    else if (b[i] == 0x3a && depth == 0) { cut = i; }
+  }
+  string offText = cut < 0 ? spec : spec.slice(0, cut);
+  bool haveLen = cut >= 0;
+  string lenText = haveLen ? spec.slice(cut + 1, spec.len()) : "";
+
+  i32 n = value.len();
+  // An empty offset is zero, which is what makes `${x::2}` mean the first two characters.
+  // Expanded, *then* evaluated. The offset may contain `$((…))` or `$x` of its own, and
+  // `expandArith` takes the inside of an arithmetic expansion rather than something still
+  // containing one — feeding it `$((1+1))` unexpanded is a syntax error in arithmetic.
+  i32 off = offText == "" ? 0 : atoiOr(expandArith(sh, expandQuoted(sh, offText)), 0);
+  if (off < 0) {
+    off = n + off;
+    if (off < 0) { return ""; }
+  }
+  if (off > n) { return ""; }
+
+  i32 end = n;
+  if (haveLen && lenText != "") {
+    i32 count = atoiOr(expandArith(sh, expandQuoted(sh, lenText)), 0);
+    if (count < 0) {
+      end = n + count;
+      if (end < off) {
+        sh.errOut.pushAll(("sh: " + itoa(count) + ": substring expression < 0\n").toBytes());
+        sh.exiting = true;
+        sh.exitCode = 1;
+        return "";
+      }
+    } else {
+      end = off + count;
+      if (end > n) { end = n; }
+    }
+  } else if (haveLen) {
+    // `${x:1:}` — an empty length is zero characters, not "to the end".
+    end = off;
+  }
+  return value.slice(off, end);
+}
+
+/**
+ * Report a malformed expansion and stop the shell.
+ *
+ * Fatal on purpose, because bash is: a bad substitution prints nothing, exits 1, and abandons
+ * the rest of the line. Treating it as an empty string instead is the failure mode this whole
+ * package is trying to avoid — something that looks like it worked.
+ */
+string badSubstitution(Shell sh, string what) {
+  sh.errOut.pushAll(("sh: " + what + ": bad substitution\n").toBytes());
+  sh.exiting = true;
+  sh.exitCode = 1;
+  return "";
+}
+
+
+
+
+
+/**
  * `${x/pat/rep}` and `${x//pat/rep}` — pattern substitution.
  *
  * Three things here are not guessable from the shorter forms:
@@ -1473,7 +1592,13 @@ string expandPart(Shell sh, Part p) {
     case Lit: return p.text;
     case Var: {
       if (p.op == "") { return sh.lookUp(p.text); }
-      if (p.op == "len") { return itoa(sh.lookUp(p.text).len()); }
+      if (p.op == "len") {
+        // `${#@}` is how *many* parameters there are, not how long they are when joined — the one
+        // place where `${#…}` counts rather than measures.
+        if (p.text == "@" || p.text == "*") { return itoa(sh.params.len()); }
+        return itoa(sh.lookUp(p.text).len());
+      }
+      if (p.op == ":") { return substring(sh, p.text, sh.lookUp(p.text), p.arg); }
 
       string value = sh.lookUp(p.text);
       // With a colon, "unset or empty" counts as absent; without one, only "unset" does.
@@ -1494,6 +1619,14 @@ string expandPart(Shell sh, Part p) {
       if (p.op == "/") { return substitutePattern(sh, value, p.arg, false); }
       if (p.op == "//") { return substitutePattern(sh, value, p.arg, true); }
 
+      // Case conversion. `^`/`,` do the first character and `^^`/`,,` all of them, and the
+      // argument is a *pattern* selecting which characters are eligible — `${x^^[ab]}` upper-cases
+      // only a's and b's. An absent pattern matches anything.
+      if (p.op == "^") { return convertCase(sh, value, p.arg, true, false); }
+      if (p.op == "^^") { return convertCase(sh, value, p.arg, true, true); }
+      if (p.op == ",") { return convertCase(sh, value, p.arg, false, false); }
+      if (p.op == ",,") { return convertCase(sh, value, p.arg, false, true); }
+
       if (last == "-") { return absent ? expandText(sh, p.arg) : value; }
       if (last == "+") { return absent ? "" : expandText(sh, p.arg); }
       if (last == "=") {
@@ -1512,7 +1645,10 @@ string expandPart(Shell sh, Part p) {
         sh.exitCode = 127;
         return "";
       }
-      return value;
+      // An operator nothing above recognised. Reporting it beats returning the value unchanged,
+      // which is what this did before and which makes a typo look like a working expansion —
+      // `${#x:1}` came back as `0`. bash calls it a bad substitution and so do we.
+      return badSubstitution(sh, "${" + p.text + p.op + p.arg + "}");
     }
     case Arith: return expandArith(sh, p.text);
     case Cmd: {

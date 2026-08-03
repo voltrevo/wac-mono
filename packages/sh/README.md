@@ -175,9 +175,15 @@ which matters because the shell runs inside a server that has no way to be inter
 deliberate difference and the only one where this refuses to do what bash does.
 
 **Some parameter expansions are missing.** Implemented: `:-`, `-`, `:=`, `=`, `:+`, `+`, `:?`,
-`?`, `#`, `##`, `%`, `%%`, `${#x}`, and `/`, `//` with the `/#` and `/%` anchors — including `&` in
-the replacement standing for the matched text, which bash grew in 5.2. Absent: indirection,
-substrings (`${x:1:2}`) and the array forms.
+`?`, `#`, `##`, `%`, `%%`, `${#x}`, substrings (`${x:off:len}`, both numbers arithmetic and both
+allowed to be negative), case conversion (`^`, `^^`, `,`, `,,`, with the pattern that selects which
+characters are eligible), and `/`, `//` with the `/#` and `/%` anchors — including `&` in the
+replacement standing for the matched text, which bash grew in 5.2. Absent: indirection, the `@`
+transformations (`${x@Q}` and friends) and the array forms.
+
+A malformed expansion is **fatal**, as it is in bash: `${x:}` prints nothing, exits 1, and
+abandons the rest of the line rather than quietly expanding to the empty string. Quietly
+expanding to something plausible is the failure mode this package exists to avoid.
 
 **`2>` is refused rather than approximated.** Only standard output is captured, so there is
 nothing of the error stream to redirect, and saying so beats writing the wrong bytes to the file.

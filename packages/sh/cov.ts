@@ -206,6 +206,22 @@ const SCRIPTS: string[] = [
   "x=1 true; echo [$x]", "x=0; x=1 true; echo $x", "x=1 y=2 true", "x=1 nosuchcommand",
   "x=1 exit 0", "x=$(echo v) true; echo [$x]",
 
+  // ── Case conversion ─────────────────────────────────────────────────────────
+  "x=abc; echo ${x^}", "x=abc; echo ${x^^}", "x=ABC; echo ${x,}", "x=ABC; echo ${x,,}",
+  "x=abc; echo ${x^a}", "x=abc; echo ${x^b}", "x=abc; echo ${x^^[ab]}", "x=abc; echo ${x,,[AB]}",
+  "x=; echo ${x^}", "x=abc; echo ${x!}", "x=abc; echo ${x&}", "x=abc; echo ${x^^?}",
+  "echo ${?-x}", "echo ${#-x}", "echo ${@-x}", "echo ${*-x}", "set -- a; echo ${@-x}",
+  "set -- a b; echo ${#@}", "set -- a b; echo ${#*}",
+
+  // ── Substrings ──────────────────────────────────────────────────────────────
+  "x=abcdef; echo ${x:1:2}", "x=abcdef; echo ${x:2}", "x=abc; echo ${x::2}",
+  "x=abc; echo ${x:1:}", "x=abcdef; echo ${x: -2}", "x=abc; echo ${x: -9}",
+  "x=abcdef; echo ${x:1:-1}", "x=abc; echo ${x:1:-9}", "x=abc; echo ${x:9}",
+  "x=abc; echo ${x:1:9}", "x=abc; echo ${x:}", "x=abc; echo ${x:abc}",
+  "x=abcdef; n=2; echo ${x:n:n}", "x=abcdef; echo ${x:$((1+1)):2}", "x=abc; echo ${x:0}",
+  "echo ${x:1}", "x=abc; echo ${#x:1}", "x=abc; echo ${#x}", "echo ${#?}", "echo ${#1}",
+  "echo ${#@}", "echo ${#nosuch}", "echo ${#1x}", 'echo "${#x-}"',
+
   // ── Arithmetic ──────────────────────────────────────────────────────────────
   "echo $((1+2))", "echo $((5-2))", "echo $((2*3))", "echo $((7/2))", "echo $((7%2))",
   "echo $(( (1+2)*3 ))", "echo $((2*3+4*5))", "echo $((-5))", "echo $((+5))", "echo $((!0))",
