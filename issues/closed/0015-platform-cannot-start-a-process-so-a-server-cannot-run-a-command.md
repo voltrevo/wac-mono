@@ -220,9 +220,12 @@ Two things remained when the OS process came off the list, and neither is this i
 both are `packages/platform`'s own roadmap, so they are in its README's *What is not here
 yet* rather than kept open here:
 
-- **Passing a subset of the parent's grants to a child.** A child gets nothing, which is
-  the safe end of the range and not the useful middle: `inetd` cannot serve a shell that
-  may read one directory. Independent of OS processes, and the next thing worth doing.
+- **Passing a subset of the parent's grants to a child.** ~~A child gets nothing, which is
+  the safe end of the range and not the useful middle.~~ **Done, 2026-08-03:** `spawn` takes
+  `GRANT_*` flags and the host intersects them with its own authority, so a parent can hand
+  over one capability and can never hand over one it lacks. That completes the recursive
+  capability model this issue argued for — the thing `--allow-run` cannot express at any
+  granularity.
 - **`spawn` is Deno-only.** `children.ts` takes `startWorld` as a parameter so Node can
   follow without editing it; nobody has written that side. Browser is undecided — `Worker`
   exists, but a page has no filesystem to read a bundle from.

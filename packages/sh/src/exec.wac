@@ -19,7 +19,7 @@ import { Map } from "../../std/src/map.wac";
 import { Option } from "../../std/src/option.wac";
 import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
-import { Child, Cli, Core, FileResult } from "../../platform/src/platform.wac";
+import { Child, Cli, Core, FileResult, GRANT_NONE } from "../../platform/src/platform.wac";
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
          RedirKind, Script, Simple, Word, parse } from "./parse.wac";
@@ -779,7 +779,13 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
   string[] args = string[argv.len() - 1](fill: "");
   for (i32 i = 1; i < argv.len(); i++) { args[i - 1] = argv.get(i); }
 
-  Child child = sh.cli.spawn(string.fromBytes(prog.bytes), args).wait();
+  // `GRANT_NONE` keeps exactly the behaviour this was written against: an external program is a
+  // filter, with standard input and output and no other authority. `spawn` grew a grants
+  // argument on 2026-08-03 and the host intersects it with the shell's own, so handing a child
+  // `GRANT_READ` — so that `$WACPATH` grep could open the file it is given — is now a one-word
+  // change here. Left to whoever owns this package to decide, since it widens what a script can
+  // reach and no test says which is wanted. (agent-a, forced by the signature change)
+  Child child = sh.cli.spawn(string.fromBytes(prog.bytes), args, GRANT_NONE).wait();
   if (child.handle < 0) {
     // It exists and would not start: that is 126, distinct from the 127 of not existing. One
     // integer cannot say both, which is why `found` is a separate field.

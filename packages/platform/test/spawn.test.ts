@@ -91,3 +91,43 @@ Deno.test("a child is granted nothing, even by a parent that has it", async () =
     for (const f of [runner, direct, child]) await Deno.remove(f);
   }
 });
+
+Deno.test("a parent hands a child a subset of its own grants, and cannot exceed them", async () => {
+  // The middle of the range, which is the useful part: a child granted nothing is safe and
+  // cannot do the job, and a child granted everything is process spawn with extra steps.
+  //
+  // Four measurements against one program, because the interesting claim is comparative. The
+  // last is the one that matters: a parent asking for a capability it does not have gets a
+  // child without it, rather than an error or — the thing that would be a hole — the
+  // capability. That the request is *allowed* to exceed is deliberate, so a parent forwarding a
+  // request it received does not have to vet it first.
+  const readOnly = await Deno.makeTempFile({ prefix: "wac-parent-r-" });
+  const readNet = await Deno.makeTempFile({ prefix: "wac-parent-rn-" });
+  const child = await Deno.makeTempFile({ prefix: "wac-probe-", suffix: ".worker.js" });
+  try {
+    await buildApp("packages/platform/example/runner.wac", readOnly, { read: true });
+    await buildApp("packages/platform/example/runner.wac", readNet, { read: true, net: true });
+    await buildApp("packages/platform/example/probe.wac", child, {}, "deno", true);
+
+    const ask = (parent: string, grants: string): string => {
+      const r = new Deno.Command(parent, {
+        args: [child, "", grants],
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      assertEquals(r.code, 0, new TextDecoder().decode(r.stderr));
+      return new TextDecoder().decode(r.stdout).trim();
+    };
+
+    // Grants are opt-in, not inherited: a parent with both, passing nothing, hands over nothing.
+    assertEquals(ask(readNet, ""), "read=denied net=denied");
+    // A subset, from a parent that has it. `failed` rather than `ok` for the network because
+    // nothing is listening on port 1 — which is the probe distinguishing "denied" from "tried".
+    assertEquals(ask(readOnly, "read"), "read=ok net=denied");
+    assertEquals(ask(readNet, "read,net"), "read=ok net=failed");
+    // The ceiling. Same request as the line above, from a parent without the network.
+    assertEquals(ask(readOnly, "read,net"), "read=ok net=denied");
+  } finally {
+    for (const f of [readOnly, readNet, child]) await Deno.remove(f);
+  }
+});

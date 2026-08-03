@@ -351,7 +351,26 @@ probe, built --allow-read --allow-net, run directly   ->  read=ok     net=failed
 the same worker, spawned by a parent that has read    ->  read=denied net=denied
 ```
 
-Passing a *subset* of the parent's grants through is the next step and is not here yet.
+**A subset is what `grants` is for.** `GRANT_READ | GRANT_NET` and friends, and the host
+intersects the request with its own authority rather than trusting it — a parent built without
+`--allow-net` cannot hand the network to anyone, and asking is not an error, it simply arrives
+denied. Measured four ways in `test/spawn.test.ts`, against one probe:
+
+```
+parent --allow-read --allow-net, child asks for nothing     ->  read=denied net=denied
+parent --allow-read,            child asks for read         ->  read=ok     net=denied
+parent --allow-read --allow-net, child asks for read,net    ->  read=ok     net=failed
+parent --allow-read,            child asks for read,net     ->  read=ok     net=denied
+```
+
+The first line is the one people expect to be different: grants are opt-in, not inherited. The
+last is the ceiling. `failed` rather than `denied` for the third is the probe reporting that it
+was allowed to dial and nothing was listening — which is the distinction that makes the table
+mean anything.
+
+That is the whole argument for spawning a worker rather than a process. `--allow-run=/bin/sh`
+cannot express one readable directory and no network, because there the child inherits the
+operating system's authority instead of the parent's.
 
 **It is not a sandbox against arbitrary JavaScript.** A wac child cannot reach past what it
 was handed because wac has no ambient anything; JavaScript in a spawned worker inherits the
@@ -533,12 +552,6 @@ enter it. Concurrency means more instances.
 
 ## What is not here yet
 
-- **Grants for children.** A spawned child gets nothing. That is the safe end of the range
-  and not the useful middle: `example/inetd.wac` cannot serve a shell that may read one
-  directory. The narrowing is the whole point of preferring `spawn` to process spawn, so
-  this is the next thing worth doing here. Note that a child's own build-time grants are
-  already irrelevant — the world it is handed decides — so this is a change to `OP.SPAWN`'s
-  request, not to the shebang.
 - **`spawn` on Node.** Deno only. `host/children.ts` takes `startWorld` as a parameter
   precisely so Node can follow without editing it, and nobody has written that side.
   Browser is a separate question: `Worker` exists there, but a page has no filesystem to
