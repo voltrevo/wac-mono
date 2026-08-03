@@ -39,7 +39,7 @@
 // one as soon as mutants are generated mechanically.
 
 import { wacCompile } from "wac/wacCompile.ts";
-import { wacFiles } from "../harness/wacFiles.ts";
+import { wacFiles, wacFilesIn } from "../harness/wacFiles.ts";
 import { CURATED } from "./mutate/curated.ts";
 import { KNOWN_SURVIVORS } from "./mutate/known.ts";
 import {
@@ -222,7 +222,11 @@ if (mutants.length === 0) {
  * thing whose bytes can answer "did this change anything at all".
  */
 function wasmHash(files: Map<string, string>, entry: string): string | null {
-  const result = wacCompile(files, entry);
+  // Narrowed to the entry's own import graph. Handing `wacCompile` every file in the repo means
+  // a single unrelated file that does not parse makes *every* mutant in *every* package report
+  // "did not compile" — which is exactly what `packages/tor/size/tor_only.wac` did, silently, and
+  // for a one-line syntax error nothing else in the suite reaches.
+  const result = wacCompile(wacFilesIn(files, entry), entry);
   if (!result.ok) return null;
   const bytes = result.compiled.wasm;
   // Two 32-bit FNV-1a lanes with different offset bases, combined with the length.
@@ -242,6 +246,19 @@ for (const m of mutants) {
   for (const e of m.edits) {
     if (!baseline.has(e.file)) baseline.set(e.file, wasmHash(sources, e.file));
   }
+}
+
+// A file that does not compile *before* being mutated is not a mutation result, and reporting it
+// as one is how mutation testing dies quietly: every mutant in the file comes back INVALID, which
+// reads as "the mutations were bad" rather than "the baseline is broken". Say so and stop.
+const brokenBaseline = [...baseline.entries()].filter(([, h]) => h === null).map(([f]) => f);
+if (brokenBaseline.length > 0) {
+  console.error(
+    `these file(s) do not compile before any mutation, so nothing here can be measured:\n` +
+    brokenBaseline.map((f) => `  - ${f}`).join("\n") +
+    `\n\nFix them, or narrow the run with --package / --diff.`,
+  );
+  Deno.exit(1);
 }
 
 type Triage =
