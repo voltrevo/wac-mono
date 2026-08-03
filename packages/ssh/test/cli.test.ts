@@ -27,15 +27,55 @@ async function makeHome(s: Server, knownHost: boolean): Promise<string> {
   return home;
 }
 
-/** Run the application the way a user would, and hand back everything it produced. */
-async function ssh(home: string, args: string[], grants: string[] = []):
-  Promise<{ code: number; stdout: Uint8Array; stderr: string }> {
+/**
+ * The client, built once as a standalone program.
+ *
+ * Not `platform/app.ts` per invocation, which builds and then *spawns* the result: it waits with
+ * `outputSync` and forwards no signals, so the launcher exiting leaves the application running
+ * with nothing to reap it. `server.test.ts` already says this about the *server* binary and does
+ * the right thing; the client calls here were left behind, and they leaked a launcher-plus-app
+ * pair on every run. Eleven were sitting on this machine, all parented by init, the oldest nearly
+ * five hours old. See wac-mono issue 0017.
+ *
+ * Building once is also just faster: one compile instead of one per invocation.
+ */
+async function buildSsh(extra: string[]): Promise<string> {
+  const out = await Deno.makeTempFile({ prefix: "wac-ssh-" });
   const r = await new Deno.Command("deno", {
     args: [
-      "run", "-A", "packages/platform/app.ts", "packages/ssh/src/ssh.wac",
-      "--allow-read", "--allow-net", "--allow-env", ...grants, "--", ...args,
+      "run", "-A", "packages/platform/build.ts", "packages/ssh/src/ssh.wac",
+      "--allow-read", "--allow-net", "--allow-env", ...extra, "-o", out,
     ],
-    env: { HOME: home, USER: Deno.env.get("USER") ?? "claude" },
+  }).output();
+  if (!r.success) throw new Error(`building ssh failed: ${new TextDecoder().decode(r.stderr)}`);
+  return out;
+}
+
+/**
+ * The client, built once per grant set rather than launched through `platform/app.ts` each time.
+ *
+ * `app.ts` builds and then *spawns* the result: it waits with `outputSync` and forwards no
+ * signals, so the launcher exiting leaves the application running with nothing to reap it. Eleven
+ * of those were sitting on this machine, all parented by init, the oldest nearly five hours old.
+ * `server.test.ts` already avoided it for the server binary; these client calls were left behind.
+ * See wac-mono issue 0017.
+ *
+ * **Two binaries, because the grants are the point of two of these tests.** They are baked in at
+ * build time, so a single permissive binary would quietly pass the case that checks `-k` is
+ * refused *without* `--allow-write` — the test would still be green and would no longer be
+ * testing anything. That is the mistake this comment exists to stop someone repeating: my first
+ * version took the grants argument and ignored it.
+ */
+const sshPlain = await buildSsh([]);
+const sshWritable = await buildSsh(["--allow-write"]);
+
+/** Run the application the way a user would, and hand back everything it produced. */
+async function ssh(
+  home: string, args: string[], grants: string[] = [], env: Record<string, string> = {},
+): Promise<{ code: number; stdout: Uint8Array; stderr: string }> {
+  const r = await new Deno.Command(grants.includes("--allow-write") ? sshWritable : sshPlain, {
+    args,
+    env: { HOME: home, USER: Deno.env.get("USER") ?? "claude", ...env },
     clearEnv: false,
   }).output();
   return { code: r.code, stdout: r.stdout, stderr: text(r.stderr) };
@@ -207,31 +247,17 @@ Deno.test({
         throw new Error(`the message does not say how to supply one: ${noPass.stderr}`);
       }
 
-      const withPass = await new Deno.Command("deno", {
-        args: [
-          "run", "-A", "packages/platform/app.ts", "packages/ssh/src/ssh.wac",
-          "--allow-read", "--allow-net", "--allow-env", "--", ...p, "echo", "decrypted",
-        ],
-        env: { HOME: home, USER: Deno.env.get("USER") ?? "claude", SSH_PASSPHRASE: pass },
-        clearEnv: false,
-      }).output();
-      if (withPass.code !== 0) throw new Error(`with the passphrase: ${text(withPass.stderr)}`);
+      const withPass = await ssh(home, [...p, "echo", "decrypted"], [], { SSH_PASSPHRASE: pass });
+      if (withPass.code !== 0) throw new Error(`with the passphrase: ${withPass.stderr}`);
       if (text(withPass.stdout) !== "decrypted\n") {
         throw new Error(`stdout was ${JSON.stringify(text(withPass.stdout))}`);
       }
 
       // A wrong one is a wrong passphrase, not a corrupt file.
-      const wrong = await new Deno.Command("deno", {
-        args: [
-          "run", "-A", "packages/platform/app.ts", "packages/ssh/src/ssh.wac",
-          "--allow-read", "--allow-net", "--allow-env", "--", ...p, "echo", "no",
-        ],
-        env: { HOME: home, USER: Deno.env.get("USER") ?? "claude", SSH_PASSPHRASE: "wrong" },
-        clearEnv: false,
-      }).output();
+      const wrong = await ssh(home, [...p, "echo", "no"], [], { SSH_PASSPHRASE: "wrong" });
       if (wrong.code !== 1) throw new Error("a wrong passphrase was accepted");
-      if (!text(wrong.stderr).includes("wrong or missing passphrase")) {
-        throw new Error(`unhelpful message: ${text(wrong.stderr)}`);
+      if (!wrong.stderr.includes("wrong or missing passphrase")) {
+        throw new Error(`unhelpful message: ${wrong.stderr}`);
       }
     } finally {
       await stopServer(s);
