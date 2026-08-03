@@ -307,6 +307,30 @@ Deno.test("shifts: match BigInt including negative values", () => {
   }
 });
 
+Deno.test("shifts: the most negative count does not recurse for ever", () => {
+  // `-i32::MIN` is still `i32::MIN`, so `shl` handed it to `shr`, which handed it back:
+  // "Maximum call stack size exceeded". GitHub wac-mono#4.
+  const MIN = -2147483648;
+
+  // Shifting *right* by 2^31 bits takes everything out of any value that fits in memory, and the
+  // sign decides what is left — the same answer this package already gives for that case.
+  if (s(mod.opShl(b(1n), MIN)) !== "0") throw new Error("1 shl i32::MIN should be 0");
+  if (s(mod.opShl(b(-5n), MIN)) !== "-1") throw new Error("-5 shl i32::MIN should be -1");
+
+  // The other direction has no answer that fits, and must fail rather than hang. It used to be
+  // routed through the largest legal left shift, whose allocation succeeds and then zeroes 256MB —
+  // a stack overflow in a second became a hang of minutes.
+  let threw = "";
+  try {
+    mod.opShr(b(1n), MIN);
+  } catch (e) {
+    threw = e instanceof Error ? e.message : String(e);
+  }
+  if (!threw.includes("too large")) {
+    throw new Error(`shr by i32::MIN should refuse immediately, got ${JSON.stringify(threw)}`);
+  }
+});
+
 Deno.test("shifts: a negative count reverses direction", () => {
   const next = makeRng(0x44332211);
   for (let t = 0; t < 60; t++) {

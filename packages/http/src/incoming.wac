@@ -195,12 +195,19 @@ export ParsedResponse parseResponse(u8[] input, u8[] method, bool eof, i32 maxBo
   if (clCount == 1) {
     u8[] cl = res.headers.first("Content-Length");
     if (cl.len() == 0) { return ParsedResponse.Bad(ERR_FRAMING()); }
-    i32 length = 0;
+    i64 acc = 0;
     for (i32 i = 0; i < cl.len(); i++) {
       if (!isDigit(cl[i])) { return ParsedResponse.Bad(ERR_FRAMING()); }
-      length = length * 10 + (cl[i] - '0');
-      if (length > maxBody) { return ParsedResponse.Bad(ERR_TOO_LARGE()); }
+      // Accumulated in i64, because the check below cannot work on a value that has already
+      // wrapped: `Content-Length: 4294967296` overflowed an i32 to exactly zero, `length > maxBody`
+      // was false, and an incomplete request was accepted as a complete one with an empty body.
+      // The i64 cannot overflow in turn — every digit is followed by the check, so the largest it
+      // ever holds is `maxBody * 10 + 9`.
+      acc = acc * 10 + ((cl[i] - '0') as i64);
+      if (acc > (maxBody as i64)) { return ParsedResponse.Bad(ERR_TOO_LARGE()); }
     }
+    // Known to be at most `maxBody`, so it fits — and `as!` says so rather than assuming it.
+    i32 length = acc as! i32;
     if (input.len() - at < length) { return ParsedResponse.Incomplete; }
     res.body = slice(input, at, at + length);
     res.consumed = at + length;
@@ -228,27 +235,34 @@ ParsedResponse readChunked(u8[] input, i32 start, Incoming res, i32 maxBody) {
     if (end < 0) { return ParsedResponse.Incomplete; }
     if (end == at) { return ParsedResponse.Bad(ERR_CHUNK()); }
 
-    i32 size = 0;
+    i64 acc = 0;
     i32 i = at;
     i32 digitsSeen = 0;
     while (i < end && hexValue(input[i]) >= 0) {
-      size = size * 16 + hexValue(input[i]);
+      // In i64, for the reason given where `Content-Length` is parsed: a check against `maxBody`
+      // is meaningless once the accumulation has wrapped.
+      acc = acc * 16 + (hexValue(input[i]) as i64);
       digitsSeen++;
-      if (size > maxBody) { return ParsedResponse.Bad(ERR_TOO_LARGE()); }
+      if (acc > (maxBody as i64)) { return ParsedResponse.Bad(ERR_TOO_LARGE()); }
       i++;
     }
+    i32 size = acc as! i32;
     if (digitsSeen == 0) { return ParsedResponse.Bad(ERR_CHUNK()); }
     if (i < end && input[i] != ';') { return ParsedResponse.Bad(ERR_CHUNK()); }
 
     at = end + 2;
     if (size == 0) { break; }
 
-    if (input.len() < at + size + 2) { return ParsedResponse.Incomplete; }
+    // In i64: `at + size + 2` with a size near i32's ceiling wraps negative, and a negative bound
+    // is below `input.len()`, so an oversized chunk read as though it had arrived.
+    if ((input.len() as i64) < (at as i64) + (acc) + 2) { return ParsedResponse.Incomplete; }
     if (input[at + size] != 13 || input[at + size + 1] != 10) {
       return ParsedResponse.Bad(ERR_CHUNK());
     }
+    // Checked before adding rather than after: both operands are bounded by `maxBody`, so their
+    // sum is not, and a `maxBody` above half of i32 makes the addition itself wrap.
+    if (size > maxBody - total) { return ParsedResponse.Bad(ERR_TOO_LARGE()); }
     total = total + size;
-    if (total > maxBody) { return ParsedResponse.Bad(ERR_TOO_LARGE()); }
     u8[] grown = u8[total]();
     for (i32 k = 0; k < bodyLen; k++) { grown[k] = body[k]; }
     for (i32 k = 0; k < size; k++) { grown[bodyLen + k] = input[at + k]; }

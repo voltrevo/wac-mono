@@ -185,6 +185,19 @@ Deno.test("format matches Date.toISOString", () => {
     const ms = BigInt(next() % 4000000) * 100000n - 200000000000n;
     cases.push(ms);
   }
+  // Outside 0000..9999, where the year needs a sign and six digits. The random spread above cannot
+  // reach here — it covers about 1963 to 1976 — so a four-digit year that silently took the value
+  // modulo ten thousand passed for as long as it existed: year 10000 printed `0000`.
+  // GitHub wac-mono#1.
+  cases.push(
+    253402300800000n,   // +010000-01-01, the first year that needs the expanded form
+    253402300799999n,   // and the last that does not
+    -62167219200000n,   // 0000-01-01
+    -62167219200001n,   // -000001-12-31, one millisecond before year zero
+    8640000000000000n,  // +275760-09-13, the largest instant Date supports
+    -8640000000000000n, // -271821-04-20, the smallest
+  );
+
   for (const ms of cases) {
     const want = new Date(Number(ms)).toISOString();
     const got = dec.decode(mod.formatMillis(ms));

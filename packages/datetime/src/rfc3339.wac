@@ -125,6 +125,26 @@ void pad(Buf out, i32 value, i32 width) {
 }
 
 /**
+ * The year, in the form `Date.toISOString` uses.
+ *
+ * Four digits inside 0000..9999, and outside it a sign and six — `+010000`, `-000001`. Written this
+ * way because `pad(out, year, 4)` takes the year modulo ten thousand: year 10000 came out as `0000`,
+ * which is not a near miss but a different millennium, and a negative year produced bytes below
+ * `'0'` entirely. A timestamp that silently means something else is worse than one that is refused.
+ *
+ * The expanded form is ISO 8601's, and it is what every `Date.toISOString` in the extremes prints,
+ * which is the oracle the tests use.
+ */
+void padYear(Buf out, i32 year) {
+  if (year >= 0 && year <= 9999) { pad(out, year, 4); return; }
+  out.push(year < 0 ? '-' : '+');
+  // Six digits of the magnitude. `i32::MIN` cannot arrive here — `civilFromDays` is bounded by the
+  // instant range long before that — but the negation is written to survive it anyway.
+  i32 mag = year < 0 ? 0 - year : year;
+  pad(out, mag, 6);
+}
+
+/**
  * Format as `YYYY-MM-DDTHH:MM:SS.sssZ`, which is exactly what `Date.toISOString` produces.
  *
  * Milliseconds are always written, including `.000`, because that is what makes the output a
@@ -142,7 +162,7 @@ export u8[] format(i64 millis) {
 
   Civil c = civilFromDays(days);
   Buf out = Buf.create();
-  pad(out, c.year, 4);
+  padYear(out, c.year);
   out.push('-');
   pad(out, c.month, 2);
   out.push('-');

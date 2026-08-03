@@ -322,3 +322,39 @@ Deno.test("each rejection reports its own reason, not just 'no'", () => {
   // added without a case, this is what says so.
   if (seen.size !== 10) throw new Error(`only ${seen.size} of the 10 error codes are covered`);
 });
+
+Deno.test("a framing length too large for an i32 is refused, not wrapped", () => {
+  const enc = new TextEncoder();
+  // The limit checks were there all along and tested the value *after* it had wrapped, so they
+  // never fired: `Content-Length: 4294967296` overflows an i32 to exactly zero, and a request with
+  // no body at all was accepted as complete — the worst possible answer, because the bytes that
+  // follow are then read as the next request. GitHub wac-mono#3.
+  const MAX = 2147483647;
+  for (const value of ["4294967296", "2147483648", "4294967295", "9".repeat(40)]) {
+    const got = dec.decode(
+      mod.parse(enc.encode(`POST / HTTP/1.1\r\nHost: h\r\nContent-Length: ${value}\r\n\r\n`), MAX),
+    ).split("\0");
+    if (got[0] !== "bad" || Number(got[1]) !== 10) {
+      throw new Error(`Content-Length: ${value}: got ${got[0]} ${got[1]}, want bad 10 (too large)`);
+    }
+  }
+
+  // The same for a chunk size, in hex, where the accumulator multiplied by sixteen.
+  for (const size of ["100000000", "FFFFFFFF", "7FFFFFFFF"]) {
+    const got = dec.decode(
+      mod.parse(
+        enc.encode(`POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n${size}\r\n`),
+        MAX,
+      ),
+    ).split("\0");
+    if (got[0] !== "bad" || Number(got[1]) !== 10) {
+      throw new Error(`chunk size ${size}: got ${got[0]} ${got[1]}, want bad 10 (too large)`);
+    }
+  }
+
+  // And a length that fits is still accepted, so the guard has not simply refused everything.
+  const fine = dec.decode(
+    mod.parse(enc.encode("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nhi"), MAX),
+  ).split("\0");
+  if (fine[0] !== "ok") throw new Error(`a two-byte body should still parse, got ${fine[0]}`);
+});
