@@ -11,8 +11,8 @@
     "See 'Keeping the compiler pin current' in README.md. Checked by",
     "harness/wacVersion.ts on the first wacBind of a run."
   ],
-  "commit": "4098849df59ddd493fa3d80a81fd5de5c558b586",
-  "shortCommit": "4098849",
-  "reason": "--update",
-  "updated": "2026-08-02"
+  "commit": "29a5d90d449c1361104da5dace2f123504a13116",
+  "shortCommit": "29a5d90",
+  "reason": "0063: a null test against a non-nullable type now warns (§wac-nonnull-isnull-warn-2mkq7np)",
+  "updated": "2026-08-03"
 }
