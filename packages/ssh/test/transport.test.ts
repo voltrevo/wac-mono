@@ -10,6 +10,7 @@ import { wacBind } from "../../../harness/wacBind.ts";
 import { freePort, haveSshd, type Server, startServer, stopServer } from "./server.ts";
 
 const mod = await wacBind("packages/ssh/test/wac/probe.wac") as unknown as {
+  sshMessageNumbers(): Int32Array;
   sshClientVersion(): Uint8Array;
   sshClientVersionLine(): Uint8Array;
   sshScanStatus(buf: Uint8Array): number;
@@ -1350,4 +1351,52 @@ Deno.test("a userauth request is verified against bytes we rebuild, not the clie
   if (mod.sshAuthRequestField(password, 0) !== 1) throw new Error("a password request did not parse");
   if (text(mod.sshAuthRequestMethod(password)) !== "password") throw new Error("method name lost");
   if (mod.sshVerifyAuth(password, sessionId)) throw new Error("a password request verified");
+});
+
+Deno.test("every message number is the one the RFC assigns", () => {
+  // A function returning a constant has no oracle inside this package: `parse` reads a byte and
+  // compares it against `msgChannelEof()`, so both move together if the number is wrong and every
+  // test still passes. Mutation testing found exactly that — six of these could be replaced with
+  // zero without reddening anything, including `msgIgnore`, `msgDebug` and `msgUnimplemented`,
+  // which no test sends at all.
+  //
+  // So the oracle has to come from outside: RFC 4250 §4.1.2, with EXT_INFO from RFC 8308 §2.3 and
+  // the ECDH pair from RFC 5656 §7.1. Written out rather than derived, because a table generated
+  // from the same source it checks is the self-comparison this exists to escape.
+  const want: [string, number][] = [
+    ["SSH_MSG_DISCONNECT", 1],
+    ["SSH_MSG_IGNORE", 2],
+    ["SSH_MSG_UNIMPLEMENTED", 3],
+    ["SSH_MSG_DEBUG", 4],
+    ["SSH_MSG_SERVICE_REQUEST", 5],
+    ["SSH_MSG_SERVICE_ACCEPT", 6],
+    ["SSH_MSG_EXT_INFO", 7],
+    ["SSH_MSG_KEXINIT", 20],
+    ["SSH_MSG_NEWKEYS", 21],
+    ["SSH_MSG_KEX_ECDH_INIT", 30],
+    ["SSH_MSG_KEX_ECDH_REPLY", 31],
+    ["SSH_MSG_USERAUTH_REQUEST", 50],
+    ["SSH_MSG_USERAUTH_FAILURE", 51],
+    ["SSH_MSG_USERAUTH_SUCCESS", 52],
+    ["SSH_MSG_CHANNEL_OPEN", 90],
+    ["SSH_MSG_CHANNEL_OPEN_CONFIRMATION", 91],
+    ["SSH_MSG_CHANNEL_OPEN_FAILURE", 92],
+    ["SSH_MSG_CHANNEL_WINDOW_ADJUST", 93],
+    ["SSH_MSG_CHANNEL_DATA", 94],
+    ["SSH_MSG_CHANNEL_EXTENDED_DATA", 95],
+    ["SSH_MSG_CHANNEL_EOF", 96],
+    ["SSH_MSG_CHANNEL_CLOSE", 97],
+    ["SSH_MSG_CHANNEL_REQUEST", 98],
+    ["SSH_MSG_CHANNEL_SUCCESS", 99],
+    ["SSH_MSG_CHANNEL_FAILURE", 100],
+  ];
+  const got = Array.from(mod.sshMessageNumbers());
+  if (got.length !== want.length) {
+    throw new Error(`expected ${want.length} numbers, got ${got.length}`);
+  }
+  for (let i = 0; i < want.length; i++) {
+    if (got[i] !== want[i][1]) {
+      throw new Error(`${want[i][0]}: expected ${want[i][1]}, got ${got[i]}`);
+    }
+  }
 });
