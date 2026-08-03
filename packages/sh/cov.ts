@@ -168,6 +168,29 @@ const SCRIPTS: string[] = [
   "seq 5 5 | wc -l",
   "seq 1 1 | sort",
 
+  // ── Parameter expansion ─────────────────────────────────────────────────────
+  //
+  // Every operator, on both sides of set/unset/empty — which is three states, not two, and the
+  // colon is what tells the last two apart.
+  "echo ${u:-d}", "x=v; echo ${x:-d}", "x=; echo ${x:-d}",
+  "echo ${u-d}", "x=v; echo ${x-d}", "x=; echo ${x-d}",
+  "echo ${u:+a}", "x=v; echo ${x:+a}", "x=; echo ${x:+a}",
+  "echo ${u+a}", "x=v; echo ${x+a}", "x=; echo ${x+a}",
+  "echo ${u:=a}", "x=v; echo ${x:=a}", "x=; echo ${x:=a}",
+  "echo ${u=a}", "x=v; echo ${x=a}",
+  "echo ${u:?}", "echo ${u:?why}", "x=v; echo ${x:?why}",
+  "echo ${u?}", "x=v; echo ${x?}",
+  "echo ${#u}", "x=hello; echo ${#x}", "x=; echo ${#x}",
+  "echo ${#}", "echo ${@}", "echo ${*}", "echo ${?}", "echo ${1}",
+  "y=i; echo ${x:-$y}", "y=i; echo ${x:-${y}}", "echo ${x:-a b}", 'echo "${x:-a b}"',
+  "echo ${x}", "x=v; echo ${x}tail", "echo ${}", "echo ${:-d}", "echo ${x:", "echo ${",
+  "echo ${x:-}", "echo ${x-}", "echo ${x:+}",
+  "f() { echo ${1:-d}; }; f; f given",
+
+  // Prefix assignments, which are restored afterwards — including the unset case.
+  "x=1 true; echo [$x]", "x=0; x=1 true; echo $x", "x=1 y=2 true", "x=1 nosuchcommand",
+  "x=1 exit 0", "x=$(echo v) true; echo [$x]",
+
   // ── Globbing ────────────────────────────────────────────────────────────────
   //
   // The fake `readDir` answers for `dir` and nothing else, so these reach both the matched and
