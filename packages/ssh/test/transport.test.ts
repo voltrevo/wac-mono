@@ -10,6 +10,11 @@ import { wacBind } from "../../../harness/wacBind.ts";
 import { freePort, haveSshd, type Server, startServer, stopServer } from "./server.ts";
 
 const mod = await wacBind("packages/ssh/test/wac/probe.wac") as unknown as {
+  sshMessageNumbers(): Int32Array;
+  sshServerChannelFailure(channel: number): Uint8Array;
+  sshServerDisconnect(reason: number, description: Uint8Array): Uint8Array;
+  sshServerOpenFailure(channel: number, reason: number, description: Uint8Array): Uint8Array;
+  sshByApplication(): number;
   sshClientVersion(): Uint8Array;
   sshClientVersionLine(): Uint8Array;
   sshScanStatus(buf: Uint8Array): number;
@@ -1350,4 +1355,143 @@ Deno.test("a userauth request is verified against bytes we rebuild, not the clie
   if (mod.sshAuthRequestField(password, 0) !== 1) throw new Error("a password request did not parse");
   if (text(mod.sshAuthRequestMethod(password)) !== "password") throw new Error("method name lost");
   if (mod.sshVerifyAuth(password, sessionId)) throw new Error("a password request verified");
+});
+
+Deno.test("every message number is the one the RFC assigns", () => {
+  // A function returning a constant has no oracle inside this package: `parse` reads a byte and
+  // compares it against `msgChannelEof()`, so both move together if the number is wrong and every
+  // test still passes. Mutation testing found exactly that — six of these could be replaced with
+  // zero without reddening anything, including `msgIgnore`, `msgDebug` and `msgUnimplemented`,
+  // which no test sends at all.
+  //
+  // So the oracle has to come from outside: RFC 4250 §4.1.2, with EXT_INFO from RFC 8308 §2.3 and
+  // the ECDH pair from RFC 5656 §7.1. Written out rather than derived, because a table generated
+  // from the same source it checks is the self-comparison this exists to escape.
+  const want: [string, number][] = [
+    ["SSH_MSG_DISCONNECT", 1],
+    ["SSH_MSG_IGNORE", 2],
+    ["SSH_MSG_UNIMPLEMENTED", 3],
+    ["SSH_MSG_DEBUG", 4],
+    ["SSH_MSG_SERVICE_REQUEST", 5],
+    ["SSH_MSG_SERVICE_ACCEPT", 6],
+    ["SSH_MSG_EXT_INFO", 7],
+    ["SSH_MSG_KEXINIT", 20],
+    ["SSH_MSG_NEWKEYS", 21],
+    ["SSH_MSG_KEX_ECDH_INIT", 30],
+    ["SSH_MSG_KEX_ECDH_REPLY", 31],
+    ["SSH_MSG_USERAUTH_REQUEST", 50],
+    ["SSH_MSG_USERAUTH_FAILURE", 51],
+    ["SSH_MSG_USERAUTH_SUCCESS", 52],
+    ["SSH_MSG_CHANNEL_OPEN", 90],
+    ["SSH_MSG_CHANNEL_OPEN_CONFIRMATION", 91],
+    ["SSH_MSG_CHANNEL_OPEN_FAILURE", 92],
+    ["SSH_MSG_CHANNEL_WINDOW_ADJUST", 93],
+    ["SSH_MSG_CHANNEL_DATA", 94],
+    ["SSH_MSG_CHANNEL_EXTENDED_DATA", 95],
+    ["SSH_MSG_CHANNEL_EOF", 96],
+    ["SSH_MSG_CHANNEL_CLOSE", 97],
+    ["SSH_MSG_CHANNEL_REQUEST", 98],
+    ["SSH_MSG_CHANNEL_SUCCESS", 99],
+    ["SSH_MSG_CHANNEL_FAILURE", 100],
+  ];
+  const got = Array.from(mod.sshMessageNumbers());
+  if (got.length !== want.length) {
+    throw new Error(`expected ${want.length} numbers, got ${got.length}`);
+  }
+  for (let i = 0; i < want.length; i++) {
+    if (got[i] !== want[i][1]) {
+      throw new Error(`${want[i][0]}: expected ${want[i][1]}, got ${got[i]}`);
+    }
+  }
+});
+
+Deno.test("the refusal messages are laid out as the RFC says, byte for byte", () => {
+  // `channelFailure`, `openFailure` and `disconnect` all survived mutation testing with their
+  // bodies replaced, because a client only sees them when something has gone wrong and nothing in
+  // the suite makes anything go wrong at this layer. They are pure functions over integers and
+  // bytes, so the fix is not a harder integration test — it is to assert the bytes.
+  //
+  // Layouts: RFC 4254 §5.1 (CHANNEL_OPEN_FAILURE), §5.4 (CHANNEL_FAILURE) and RFC 4253 §11.1
+  // (DISCONNECT). Note all three end with an empty language tag, which is a `string` and so four
+  // zero bytes, not nothing — the field a hand-rolled encoder forgets.
+  const enc = new TextEncoder();
+  const hex = (b: Uint8Array) => Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join(" ");
+  const check = (name: string, got: Uint8Array, want: string) => {
+    if (hex(got) !== want) throw new Error(`${name}\n  got:  ${hex(got)}\n  want: ${want}`);
+  };
+
+  // byte 100, uint32 recipient channel. Nothing else — a CHANNEL_FAILURE carries no reason.
+  check("channelFailure(7)", mod.sshServerChannelFailure(7), "64 00 00 00 07");
+
+  // byte 1, uint32 reason, string description, string language tag.
+  check(
+    "disconnect(11, bye)",
+    mod.sshServerDisconnect(11, enc.encode("bye")),
+    "01 00 00 00 0b 00 00 00 03 62 79 65 00 00 00 00",
+  );
+
+  // byte 92, uint32 recipient channel, uint32 reason code, string description, string language.
+  check(
+    "openFailure(3, 4, no)",
+    mod.sshServerOpenFailure(3, 4, enc.encode("no")),
+    "5c 00 00 00 03 00 00 00 04 00 00 00 02 6e 6f 00 00 00 00",
+  );
+
+  // SSH_DISCONNECT_BY_APPLICATION, RFC 4253 §11.1. The one reason code this server sends.
+  if (mod.sshByApplication() !== 11) {
+    throw new Error(`byApplication: expected 11, got ${mod.sshByApplication()}`);
+  }
+});
+
+Deno.test("a key whose two public halves disagree is refused, not carried out", async () => {
+  // An OpenSSH private key states its public key *twice*: once in the outer envelope and again
+  // inside the private section. Every other field here was validated and the outer blob was not,
+  // so a file where the two disagree parsed cleanly — and `sshd.wac`'s `hostPublicPoint`, which
+  // slices the last 32 bytes of that blob, then trapped on a short one. A crafted or corrupt host
+  // key crashed the server at startup instead of being reported.
+  //
+  // Found by following a surviving `trap;` mutant rather than by reading the parser, which is the
+  // argument for mutation testing in one line: the trap was flagged as untested, and the reason
+  // it was untested is that nothing could reach it *through a valid file*.
+  const dir = await Deno.makeTempDir({ prefix: "wac-badkey-" });
+  try {
+    const path = `${dir}/k`;
+    await new Deno.Command("ssh-keygen", {
+      args: ["-t", "ed25519", "-f", path, "-N", "", "-q"],
+    }).output();
+    const pem = await Deno.readTextFile(path);
+
+    // Decode the base64 body, then rewrite the outer public-key string to something short. Every
+    // field is length-prefixed, so shortening one keeps the rest parseable — which is exactly why
+    // the file used to survive parsing.
+    const b64 = pem.split("\n").filter((l) => !l.startsWith("-----")).join("");
+    const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const view = new DataView(raw.buffer);
+    let at = "openssh-key-v1\0".length;
+    const skip = () => { const n = view.getUint32(at); at += 4 + n; };
+    skip(); skip(); skip();          // ciphername, kdfname, kdfoptions
+    at += 4;                          // keycount
+    const pubAt = at;
+    const pubLen = view.getUint32(pubAt);
+
+    const short = new Uint8Array(4 + 8);
+    new DataView(short.buffer).setUint32(0, 8);
+    const mangled = new Uint8Array(raw.length - (4 + pubLen) + short.length);
+    mangled.set(raw.subarray(0, pubAt), 0);
+    mangled.set(short, pubAt);
+    mangled.set(raw.subarray(pubAt + 4 + pubLen), pubAt + short.length);
+
+    const body = btoa(String.fromCharCode(...mangled)).match(/.{1,70}/g)!.join("\n");
+    const bad = `-----BEGIN OPENSSH PRIVATE KEY-----\n${body}\n-----END OPENSSH PRIVATE KEY-----\n`;
+
+    // 3 is Malformed. Anything else means it was accepted, and an accepted one traps later.
+    const got = mod.sshReadKeyStatus(bytes(bad), new Uint8Array(0));
+    if (got !== 3) throw new Error(`a mangled public blob gave status ${got}, want 3 (malformed)`);
+
+    // And the untouched key still reads, so the new check is not refusing everything.
+    const good = mod.sshReadKeyStatus(bytes(pem), new Uint8Array(0));
+    if (good !== 0) throw new Error(`the real key now gives status ${good}, want 0`);
+  } finally {
+    await Deno.remove(dir, { recursive: true }).catch(() => {});
+  }
 });

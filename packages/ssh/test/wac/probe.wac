@@ -311,6 +311,7 @@ export i32 sshWindowLeft(Window w) { return w.left; }
 
 import { Match, lookUp as authLookUp } from "../../src/authorizedkeys.wac";
 import { AuthRequest, authFailure, authSuccess, byApplication, channelClose as srvClose,
+         disconnect as srvDisconnect, openFailure as srvOpenFailure,
          channelData as srvData, channelEof as srvEof, channelFailure as srvChanFailure,
          channelStderr, channelSuccess, disconnect, ecdhReply, exchangeHash as srvHash,
          ephemeralPublic as srvEphemeral, sharedSecret as srvShared,
@@ -386,3 +387,62 @@ export u8[] sshServerShared(u8[] secret, u8[] peer) {
 export u8[] sshServerChannelFailure(i32 channel) { return srvChanFailure(channel); }
 export u8[] sshServerChannelEof(i32 channel) { return srvEof(channel); }
 export u8[] sshServerChannelClose(i32 channel) { return srvClose(channel); }
+
+// ── Every message number, so the constants have an oracle ─────────────────────
+//
+// A function returning a constant is invisible to a test that only ever compares it against
+// itself: `parse` reads a byte and checks it against `msgChannelEof()`, and both sides move
+// together if the number is wrong. Mutation testing found six of these unkilled — `msgIgnore`,
+// `msgDebug`, `msgUnimplemented`, `msgDisconnect`, `msgUserAuthFailure`, `msgChannelEof` — all
+// replaceable with zero while every test stayed green.
+//
+// The oracle is RFC 4250 §4.1.2, plus RFC 8308 for EXT_INFO and RFC 5656 for the ECDH pair. A
+// number is exported here and asserted against the RFC on the TypeScript side, which is the one
+// comparison that is not against ourselves.
+
+import { msgDisconnect, msgIgnore, msgUnimplemented, msgDebug, msgExtInfo, msgNewKeys }
+  from "../../src/conn.wac";
+import { msgKexEcdhInit } from "../../src/kex.wac";
+import { msgKexInit } from "../../src/kexinit.wac";
+import { msgUserAuthRequest, msgServiceRequest } from "../../src/auth.wac";
+import { msgChannelOpen, msgChannelFailure } from "../../src/channel.wac";
+
+/** Every message number, in a fixed order the test knows. */
+export i32[] sshMessageNumbers() {
+  i32[] out = i32[25](fill: 0);
+  out[0] = msgDisconnect();
+  out[1] = msgIgnore();
+  out[2] = msgUnimplemented();
+  out[3] = msgDebug();
+  out[4] = msgServiceRequest();
+  out[5] = msgServiceAccept();
+  out[6] = msgExtInfo();
+  out[7] = msgKexInit();
+  out[8] = msgNewKeys();
+  out[9] = msgKexEcdhInit();
+  out[10] = msgKexEcdhReply();
+  out[11] = msgUserAuthRequest();
+  out[12] = msgUserAuthFailure();
+  out[13] = msgUserAuthSuccess();
+  out[14] = msgChannelOpen();
+  out[15] = msgChannelOpenConfirmation();
+  out[16] = msgChannelOpenFailure();
+  out[17] = msgChannelWindowAdjust();
+  out[18] = msgChannelData();
+  out[19] = msgChannelExtendedData();
+  out[20] = msgChannelEof();
+  out[21] = msgChannelClose();
+  out[22] = msgChannelRequest();
+  out[23] = msgChannelSuccess();
+  out[24] = msgChannelFailure();
+  return out;
+}
+
+/** The two refusal messages a client only sees when something has gone wrong. */
+export u8[] sshServerDisconnect(i32 reason, u8[] description) {
+  return srvDisconnect(reason, description);
+}
+export u8[] sshServerOpenFailure(i32 channel, i32 reason, u8[] description) {
+  return srvOpenFailure(channel, reason, description);
+}
+export i32 sshByApplication() { return byApplication(); }

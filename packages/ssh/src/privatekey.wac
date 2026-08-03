@@ -149,6 +149,29 @@ export PrivateKey readEd25519(u8[] pem, u8[] passphrase) {
   // The private string is the seed followed by the public key; only the first half is the secret.
   if (pub.len() != 32 || priv.len() != 64) { return fail(KeyError.Malformed); }
 
+  // The *outer* public blob, which until now nothing checked. Every other field in this file is
+  // validated and this one was carried straight out, so a key whose two halves disagree parsed
+  // cleanly. `sshd.wac`'s `hostPublicPoint` then trapped on it — and the failure mode is worse
+  // than a crash: the server starts, reports that it is listening, stays up, and fails *every*
+  // connection with `error: unreachable` and nothing else. The client sees only
+  // `Connection closed`. Neither end says the host key is the problem.
+  //
+  // Found by following a surviving mutant on that trap, not by reading the parser.
+  //
+  // Checked by shape *and* by agreement: an `ssh-ed25519` blob is `string "ssh-ed25519"` then the
+  // 32-byte point, and the point has to be the same key the private half describes. A file where
+  // they differ is not a key with a cosmetic flaw — it is two different keys in one file, and
+  // which one is "the" key is not ours to guess.
+  Reader pubReader = Reader.over(publicBlob);
+  u8[] blobType = pubReader.str();
+  u8[] blobPoint = pubReader.str();
+  if (!pubReader.ok || !same(blobType, ED25519) || blobPoint.len() != 32) {
+    return fail(KeyError.Malformed);
+  }
+  for (i32 i = 0; i < 32; i++) {
+    if (blobPoint[i] != pub[i]) { return fail(KeyError.Malformed); }
+  }
+
   u8[] seed = u8[32]();
   seed.copyFrom(priv, 0, 0, 32);
   return PrivateKey(KeyError.Ok, seed, publicBlob);
