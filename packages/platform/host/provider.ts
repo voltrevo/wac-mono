@@ -22,6 +22,7 @@ import {
   HostCallError,
   i32le,
   isDone,
+  waitAny,
   readI32le,
   readI64le,
   str,
@@ -275,6 +276,16 @@ export function cliOf(
     (handle: number) => T.chunk(submit(b, OP.RECV, i32le(handle))),
     (handle: number, body: Uint8Array) => T.ok(submit(b, OP.SEND, headed(i32le(handle), body))),
     (handle: number) => { hostCall(b, OP.CLOSE_SOCKET, i32le(handle)); },
+
+    // No opcode: the wait is on the completion counter in this worker's own memory, so it
+    // takes no slot and the host is not involved. Returns the *index* rather than the id,
+    // because the caller already knows which ticket it put where.
+    (ids: Int32Array) => {
+      const tickets = Array.from(ids, unpack);
+      const settled = waitAny(b, tickets);
+      if (settled === null) return -1;
+      return tickets.findIndex((t) => t.slot === settled.slot && t.gen === settled.gen);
+    },
   );
 }
 

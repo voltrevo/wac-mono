@@ -258,6 +258,7 @@ export struct Cli {
    */
   fn[Pending<string>(string)] openOutput;
 
+
   /**
    * The network. `--allow-net`, and nothing without it.
    *
@@ -276,6 +277,26 @@ export struct Cli {
   fn[Pending<u8[]>(i32)] recv;
   fn[Pending<bool>(i32, u8[])] send;
   fn[void(i32)] closeSocket;
+
+  /**
+   * Block until one of these calls has an answer, and say which.
+   *
+   * Takes the `id` of each ticket and returns its index in the list, or -1 if the list is
+   * empty. Every id is accepted whatever its `Pending<T>` — a relay waits on a `recv` and
+   * an `accept` together, and their types differ.
+   *
+   * **This is the capability the ring exists for.** Overlapping two reads is a
+   * convenience; waiting on whichever of two *sockets* speaks first is the difference
+   * between a program being writable and not. `nc`, an SSH relay and a shell all need it,
+   * and `isDone` alone does not give it to them — polling `isDone` in a loop is a spin,
+   * which burns a core to avoid parking.
+   *
+   * Blocking, and it reaches no further than this worker's own memory: the wait is on the
+   * completion counter the host bumps, so it takes no slot and cannot deadlock the ring
+   * however many tickets are outstanding.
+   */
+  fn[i32(i32[])] waitAny;
+
 
   Cli of(
     fn[Pending<i32>()] argCount,
@@ -298,12 +319,13 @@ export struct Cli {
     fn[Pending<Socket>(i32)] accept,
     fn[Pending<u8[]>(i32)] recv,
     fn[Pending<bool>(i32, u8[])] send,
-    fn[void(i32)] closeSocket
+    fn[void(i32)] closeSocket,
+    fn[i32(i32[])] waitAny
   ) {
     return Cli(
       argCount, arg, env, readStdin, write, readFile, writeFile, stat, readDir,
       mkdir, remove, rename, openInput, readChunk, openOutput,
-      connect, listen, accept, recv, send, closeSocket
+      connect, listen, accept, recv, send, closeSocket, waitAny
     );
   }
 }

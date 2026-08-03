@@ -179,6 +179,55 @@ writes exact bytes, and `hexdump <dir>` lists a directory through `stat` and `re
 `packages/box` is the widest consumer of all this — forty-two applets in one program, and
 the differential suite that keeps them honest.
 
+## Calls are tickets
+
+Every capability that produces a value hands back a `Pending<T>` rather than the value:
+
+```wac
+Pending<FileResult> a = cli.readFile("one");
+Pending<FileResult> b = cli.readFile("two");   // both are already running
+FileResult ra = a.wait();
+FileResult rb = b.wait();
+```
+
+`.wait()` blocks and takes the answer, `.isDone()` never blocks, `.cancel()` detaches. The
+swap from the old surface was `x(…)` to `x(…).wait()` and nothing more, across 178 call
+sites.
+
+Two capabilities are **not** tickets, and the second reason is the binding one. `log` and
+`warn` return nothing — a ticket for a line of output is noise at 114 call sites for
+something no program will overlap. `readChunk` and `write` stay blocking because they act
+on the *current* stream, which the world keeps in order anyway, and because they are handed
+to this repo's streaming transforms as bare function references —
+`gzipStream(cli.readChunk, cli.write)` wants `fn[u8[]()]` and `fn[bool(u8[])]`. A
+ticket-returning capability does not match those, and wac has no closures, so there would
+be no adapter to write.
+
+The rule that fell out: the capabilities worth a ticket are the ones that **name their
+target** — `readFile(path)`, `stat(path)`, `recv(handle)`, `connect(host)`.
+
+**`waitAny` is the point of all of it.** Overlapping two reads is a convenience; parking
+until whichever of two *sockets* speaks first is the difference between a program being
+writable and not:
+
+```wac
+Pending<u8[]> ra = cli.recv(a);
+Pending<u8[]> rb = cli.recv(b);
+i32 first = cli.waitAny(i32[](ra.id, rb.id));   // parks; returns 0 or 1
+```
+
+It takes ticket ids of any mixed `Pending<T>`, and it reaches no further than this worker's
+own memory — the wait is on the completion counter the host bumps, so it consumes no slot
+and cannot deadlock the ring. `nc`, an SSH relay and a shell all needed this and none of
+them could be written before it; polling `isDone` in a loop burns a core to avoid parking.
+
+Underneath, the bridge is a ring of four slots rather than one mailbox — see `layout.ts`.
+`Atomics.wait` takes a single address, so "wait until any of these finishes" is a wait on
+one completion counter followed by a rescan, which is also exactly what `poll` over sockets
+is. `hostCall` is still submit-then-collect and does the same atomics the single mailbox
+did, so nothing that has no reason to overlap pays for the ability to: about 3% on this
+package's suite.
+
 ## What the boundary is, and is not
 
 The `Cli` and `Core` structs are the complete list of what an application can reach, and
