@@ -7,7 +7,9 @@
 - **Kind:** performance
 - **Symptom:** wrong answer
 
-Two separate things, and the second is cheap to fix and probably the bigger win.
+Two separate things. I originally wrote that the second was "cheap to fix and probably the bigger
+win"; it is cheap and it is done, and measured it is worth about a tenth. The first is the large
+one and is still open. Both claims below are now numbers rather than expectations.
 
 ## 1. Per-test selection cannot see subprocess tests
 
@@ -32,7 +34,22 @@ selection: 0/117 mutant(s) ran only the tests that reach them, 117 fell back to 
 ```
 
 That is `--package sh`, where **every** test is subprocess-based, so the headline optimisation
-contributed exactly nothing. `ssh` is better only in that one of its three files is attributable.
+contributed exactly nothing.
+
+**Correction to the first version of this issue, which overstated the reach of the problem.** I
+implied `ssh` was in similar shape. It is not — measured, it narrows most of its mutants:
+
+```
+ssh:  88/154 narrowed, 51 fell back     (before the ssh test work of 2026-08-03)
+ssh: 100/151 narrowed, 38 fell back     (after)
+sh:    0/117 narrowed, 117 fell back
+```
+
+One attributable file is enough when it covers enough lines: `transport.test.ts` accounts for
+1022 covered lines, so two thirds of `ssh`'s mutants can be narrowed even though the two
+integration suites contribute nothing. The problem is real and total for `sh`, and partial for
+`ssh`. Worth being precise about, because it changes which fix matters: for `sh` nothing but
+subprocess attribution will help, while for `ssh` the ordering below is most of the win.
 
 This is structural rather than a misconfiguration — you cannot read a counter that lives in
 another process. Fixing it properly means a built binary dumping its counters on exit when
@@ -66,18 +83,18 @@ these tests bind ports and a clash would corrupt live verdicts):
 
 ### Suggested fix, in order of value
 
-**Order the files cheapest-first and pass files rather than a directory.** `buildProfile` already
+**Done, 2026-08-03: order the files cheapest-first and pass files rather than a directory.** `buildProfile` already
 runs each test file as its own `Deno.Command`; timing it there is free, and the order can be
 cached alongside the profile. Cheapest-first is a strict improvement under fail-fast and changes
 no verdict, because a killed mutant is killed whichever test kills it.
 
-**Then bias by likelihood, which is the "hint" idea.** Where attribution exists, put attributed
+**Still open: bias by likelihood, which is the "hint" idea.** Where attribution exists, put attributed
 tests first. Where it does not, a decent proxy is proximity — a mutant in `packages/ssh/src/wire.wac`
 is most likely killed by the test file whose name shares the most path with it, and unit-style
 files beat integration ones. This only reorders; it never excludes, so it cannot cause a false
 survivor the way narrowing can.
 
-**Only then consider the subprocess attribution in (1).** It is much more work and the ordering
+**Still open, and the only thing that helps `sh`: the subprocess attribution in (1).** It is much more work and the ordering
 change may capture most of the benefit.
 
 ## Notes
@@ -88,3 +105,41 @@ this and it is why the fallback exists. Reordering is safe on that test; excludi
 
 The tool's header should also say that selection is inert for subprocess-based suites, so the next
 person reading `0/117` knows it is a property of the tests and not a bug in the run.
+
+## What the ordering change did, measured
+
+`buildProfile` already runs each test file on its own, so timing it is free; `byCost` sorts on
+that and the runner passes the files instead of the directory. The order it found in `ssh` is the
+exact reverse of alphabetical, which is what `deno test <dir>` was using:
+
+```
+order: transport.test.ts 2240ms -> server.test.ts 5837ms -> cli.test.ts 12175ms
+```
+
+So a mutant that `transport.test.ts` kills used to pay 18 seconds of real OpenSSH handshakes
+before reaching the suite that would kill it in two.
+
+Verdicts are unchanged — 135/151 killed, the same three survivors, the same 13 not covered —
+which is the property that makes ordering safe where narrowing is not: it can only change how
+long a verdict takes, never what it is.
+
+**And it is worth 9.5%, not the multiple I predicted.** Two runs of identical code, ordering the
+only difference, back to back on an otherwise idle box:
+
+```
+A  cheapest-first   666s   135/151 killed   100/151 narrowed
+B  directory order  736s   135/151 killed   100/151 narrowed
+```
+
+The reason is in the third column and I should have seen it before predicting: **selection already
+narrows 100 of the 151**, so ordering can only affect the 38 that fall back. Of those, the three
+survivors and thirteen uncovered gain nothing by construction — a survivor runs every test
+whatever the order — and some of the remainder are killed by `cli` or `server` anyway. The
+18-seconds-per-mutant saving applies to far fewer mutants than the raw file costs suggest.
+
+A ran first and warmed the caches, which biases toward B, so the real gap is if anything slightly
+wider than 9.5% — not narrower.
+
+Worth keeping anyway: it is free at run time, it cannot change a verdict, and it will matter more
+in a package where selection cannot narrow. But it is not the fix for this issue. The fix for this
+issue is subprocess attribution, and `sh` at 0/117 is where that shows.
