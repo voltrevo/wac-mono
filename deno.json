@@ -8,6 +8,7 @@
     "bench:zstd-speed": "deno run -A packages/zstd/bench/speed.ts",
     "bench:json": "deno run -A packages/json/bench/throughput.ts",
     "bench:json-lookup": "deno run -A packages/json/bench/lookup.ts",
+    "bindgen": "deno run -A tools/emitgen.ts",
     "coverage": "deno run -A tools/coverage.ts",
     "size": "deno run -A tools/size.ts",
     "coverage:bignum": "deno run -A packages/bignum/cov.ts",
