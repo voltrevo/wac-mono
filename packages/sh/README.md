@@ -187,17 +187,21 @@ reason — [issue 0014](../../issues/open/0014-platform-has-no-way-to-write-byte
 
 ## Coverage
 
-`deno task coverage:sh` drives about four hundred scripts through the lexer, parser and executor
+`deno task coverage:sh` drives some four hundred and fifty scripts through the lexer, parser and executor
 with the capabilities faked inside wac — `test/wac/probe.wac` builds a `Core` and a `Cli` out of
 pure functions, since wac has no mutable module-level state and a funcref cannot close over
 anything. A fixed answer per path is enough to reach both sides of every branch that asks.
 
-**It stands at 96%**, not the 100% the rest of this repo holds to, and the shape of what is left
-is worth stating rather than leaving as a number. Roughly half of the remainder is `p >=
-toks.len()` guards that **cannot execute**: `tokenize` always ends with `Eof`, so the parser stops
-at that token rather than running off the end of the list. They are real safety against a future
-caller that does not go through `tokenize`, and no script will ever reach them. Most of the rest
-are defensive guards of the same character.
+**It stands at 96.7%**, not the 100% the rest of this repo holds to, and the shape of what is left
+is worth stating rather than leaving as a number.
+
+`parse.wac` is the laggard at 94%, and **every one of its fifteen remaining points is a guard on an
+invariant something else already maintains.** Half are `p >= toks.len()`, which cannot execute:
+`tokenize` always ends with `Eof`, so the parser stops at that token rather than running off the
+end of the list. The rest are the same character — a token with no parts, an empty name, a list
+that parsed successfully and came back empty. They are real safety against a caller that does not
+come through `tokenize`, and no script reaches them. Worth saying plainly: pushing this number
+higher would mean deleting guards, not writing tests.
 
 One point is not a guard and is worth naming, because it is a genuine limit of the probe rather
 than dead code: **the branch that appends a chunk from a spawned child**. `test/wac/probe.wac`'s

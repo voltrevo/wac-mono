@@ -343,6 +343,24 @@ const SCRIPTS: string[] = [
   "cat <<EOF\na $ b\nEOF", "cat <<EOF\n${}\nEOF", "cat <<EOF\n${unclosed\nEOF",
   "cat <<EOF\ntrailing $\nEOF",
 
+  // ── The parser's refusals ───────────────────────────────────────────────────
+  //
+  // Malformed input, which is most of what is left uncovered in `parse.wac`: the differential
+  // suite cannot reach a refusal, because bash and this agree on what works and differ by
+  // construction on what this declines to do.
+  "{ cat; } 0<<EOF\nx\nEOF",                     // an explicit fd on a compound's here-doc
+  "{ cat; } 3<<EOF\nx\nEOF",
+  "{ echo a; } >", "{ echo a; } <", "{ echo a; } >>", "{ echo a; } > ;",
+  "echo a >>", "echo a >> ;",                     // `>>` with no target, in a simple command
+  "(echo a; }", "(echo a } )", "case a in a b esac", "case a in a|b esac",
+  "for a$b in x; do echo; done",                  // a variable name that is not one part
+  "a$b() { echo; }",                              // and a function name that is not
+  "case a in a echo x;; esac",                    // an arm with no `)`
+  "case a in", "case", "case a", "case a in a", "case a in a)",
+  ")", "&&", ";", "( )", "{ }", "{ ;}",
+  "if true; then ) fi", "while ) ; do :; done", "for x in a; do ) ; done",
+  "(echo a) )", "{ echo a; } )",
+
   // A loop that runs past the bound, so the guard that stops it is reached.
   "while true; do :; done",
 ];
