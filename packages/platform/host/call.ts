@@ -74,11 +74,34 @@ function parkForHost(b: Bridge, seen: number): void {
 function claim(b: Bridge): number {
   for (;;) {
     const seen = Atomics.load(b.ctrl, DONE_SEQ);
+    let ready = 0;
     for (let i = 0; i < SLOTS; i++) {
       const at = slotAt(i);
       if (Atomics.compareExchange(b.ctrl, at + S_STATUS, ST_FREE, ST_PENDING) === ST_FREE) {
         return i;
       }
+      if (Atomics.load(b.ctrl, at + S_STATUS) === ST_READY) ready++;
+    }
+    // Parking here is normal backpressure — every slot is busy and the host will finish one.
+    //
+    // Every slot being `ST_READY` is not that. A ready slot holds an answer, and only *this*
+    // thread frees one, by collecting or cancelling; the host cannot. So this thread is
+    // waiting for something that can only happen after it stops waiting, and parking would
+    // be permanent. Safe to conclude without a race, because `ST_READY` moves only from
+    // here: the host's transitions all end at it.
+    //
+    // Worth an error rather than a hang because the cause is a specific mistake with an
+    // obvious fix, and because a silent permanent park is exactly the failure mode issue
+    // 0018 was filed about. `waitAny` returns which ticket settled and collects nothing, so
+    // the tickets that lost — most often a timer used as a deadline — are still holding
+    // slots until they are waited on or cancelled.
+    if (ready === SLOTS) {
+      throw new HostCallError(
+        `all ${SLOTS} call slots hold answers that were never taken. A ticket you stopped ` +
+          `waiting on has to be cancelled: waitAny tells you which one settled and collects ` +
+          `nothing, so the losers keep their slots. Bind the ticket and cancel() it — a ` +
+          `timer written inline in the waitAny list cannot be cancelled at all.`,
+      );
     }
     parkForHost(b, seen);
   }

@@ -34,4 +34,5 @@ export const OP = {
   SPAWN: 27,
   EXIT_CODE: 28,
   CLOSE_FEED: 29,
+  SLEEP_MILLIS: 30,
 } as const;

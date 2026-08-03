@@ -228,6 +228,46 @@ is. `hostCall` is still submit-then-collect and does the same atomics the single
 did, so nothing that has no reason to overlap pays for the ability to: about 3% on this
 package's suite.
 
+### Deadlines
+
+Nothing bounds how long a capability may take, and a peer that finishes the handshake and
+then says nothing used to stop an application permanently — no error, no log line, no way to
+notice (issue 0018). The fix is not a timeout argument on `recv`. It is one capability,
+`core.sleepMillis`, returning a ticket that settles on *time* instead of on I/O:
+
+```wac
+Pending<u8[]> r = cli.recv(h);
+Pending<i64> t = core.sleepMillis(5000);
+if (cli.waitAny(i32[](r.id, t.id)) == 1) {
+  r.cancel();                  // stop waiting for the read
+  cli.closeSocket(h);          // ...and stop the read itself
+} else {
+  t.cancel();                  // the deadline is moot; give its slot back
+  u8[] said = r.wait();
+}
+```
+
+One capability rather than a `…Within` variant per call, and it bounds `connect`, `accept`,
+`readFile` or a child's `exitCode` with the same three lines. `example/patience.wac` is a
+worked version.
+
+**A timeout is a decision the waiter makes.** It reaches neither the read the host has
+already entered nor the tickets `waitAny` did not pick, and both of those are traps:
+
+- **Bind the timer.** `core.sleepMillis(5000).id` written inline in the list is a leak that
+  cannot be fixed afterwards — there is nothing left to cancel. `waitAny` reports which
+  ticket settled and collects *nothing*, so every loser still holds a slot.
+- **Cancel is not abort** for a socket read; closing the handle is what makes it finish, and
+  the slot returns then. For a timer, cancel is immediate if it has fired and honoured if it
+  has not, which is better than a read manages.
+- **To wait longer, re-wait the same ticket** with a fresh timer. A second `recv` on a handle
+  whose first is outstanding means two reads on one socket and no defined byte order.
+
+Four abandoned tickets fill the ring. That used to park the next call forever — the same
+silent hang, reached from the other side — and now raises `all 4 call slots hold answers that
+were never taken`, because a ready slot can only be freed by the thread that submitted it, so
+a submitter finding all four ready is provably stuck rather than merely waiting.
+
 ## Spawning
 
 ```wac
