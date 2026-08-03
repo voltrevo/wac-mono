@@ -340,6 +340,10 @@ export string test_bandwidth_weights_are_read_or_defaulted() {
 
   i64[] none = parseWeights("network-status-version 3\n".toBytes());
   for (i32 i = 0; i < 12; i++) {
+    // Wge is the one exception and has its own test below: the authorities never publish it
+    // and tor hardcodes it to zero. This assertion said "all twelve" until a real consensus
+    // was checked, which is to say it encoded the bug rather than catching it.
+    if (i == 2) { continue; }
     t.eqI64(none[i], 10000, "no line at all means plain bandwidth, not no bandwidth");
   }
   return t.report();
@@ -439,4 +443,30 @@ string hexOf(u8[] b) {
     out[i * 2 + 1] = digits[b[i] & 15];
   }
   return string.fromBytes(out);
+}
+
+export string test_wge_is_zero_because_nobody_publishes_it() {
+  // The authorities publish nineteen bandwidth weights and Wge is not one of them. tor
+  // hardcodes `We = 0` for the guard position, so an exit-only relay is never chosen as a
+  // guard on bandwidth grounds.
+  //
+  // This defaulted to 10000 with the others until a real consensus was checked against the
+  // parser. It was invisible, and would have stayed invisible: `eligible` rejects a relay
+  // without the Guard flag before the weight is ever consulted, so two independent things
+  // gave the same answer. The day the flag check moves or loosens, the weight is what would
+  // have been holding the line — and at 10000 it would not have been.
+  T t = T.create();
+  i64[] w = parseWeights("network-status-version 3\n".toBytes());
+  t.eqI64(w[2], 0, "Wge defaults to zero, not to the neutral 10000");
+  t.eqI64(w[0], 10000, "while a weight that simply was not published stays neutral");
+
+  // Present in the document, it is still read — the default is not a hardcode.
+  i64[] given = parseWeights("bandwidth-weights Wge=1234 Wgg=5983\n".toBytes());
+  t.eqI64(given[2], 1234, "an explicit Wge is honoured");
+  t.eqI64(given[0], 5983, "and so is a real Wgg");
+
+  // The consequence, spelled out: an exit-only relay weighs nothing at the guard position.
+  t.eqI64(positionWeight(positionGuard(), false, true, parseWeights("x\n".toBytes())), 0,
+          "an exit-only relay has no weight as a guard");
+  return t.report();
 }

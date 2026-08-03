@@ -327,11 +327,17 @@ export function cliOf(
     },
 
     /*= spawn */
-    (source: string, args: string[]) =>
-      // The source, length-prefixed, then the arguments NUL-separated — the same shape
-      // `readDir` answers with, for the same reason: a filename or an argument may contain
-      // anything but a NUL.
-      T.child(submit(b, OP.SPAWN, prefixed(str(source), str(args.join("\u0000"))))),
+    (source: string, args: string[], grants: number) =>
+      // The grant flags, then the source length-prefixed, then the arguments NUL-separated —
+      // the same shape `readDir` answers with, for the same reason: a filename or an argument
+      // may contain anything but a NUL.
+      T.child(
+        submit(
+          b,
+          OP.SPAWN,
+          headed(i32le(grants), prefixed(str(source), str(args.join("\u0000")))),
+        ),
+      ),
     /*= closeFeed */
     (handle: number) => { hostCall(b, OP.CLOSE_FEED, i32le(handle)); },
     /*= exitCode */

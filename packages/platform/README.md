@@ -228,6 +228,34 @@ is. `hostCall` is still submit-then-collect and does the same atomics the single
 did, so nothing that has no reason to overlap pays for the ability to: about 3% on this
 package's suite.
 
+### Who owns a slot
+
+Every state change on a slot is a compare-and-exchange, not a store, and every answer is
+checked against the slot's **generation** before it is written. That is not defensive style; it
+is four bugs, all the same shape — the host and the worker disagreeing about whose call a slot
+holds — and all four were live in a bridge whose tests passed:
+
+| what happened | how it showed |
+|---|---|
+| `claim` published a slot as pending before the opcode was written | `no handler for capability 0` |
+| a cancelled call's answer written into the slot another call had claimed | issue 0023: a 30-second bound expiring after 15 |
+| `take` overwrote a cancel with `RUNNING`, so nobody owned the slot | a slot lost for the life of the program |
+| `reply` overwrote a cancel with `READY`, same result | a slot lost, and the answer unclaimable |
+
+The last two are invisible until the ring runs out, and then the failure is a park in whatever
+call happens to be next. The first was unhittable at four slots and appeared within three suite
+runs at sixteen. Only the second was ever reported from the field, and only because a tor client
+was dropping healthy relays.
+
+So `test/fuzz.test.ts` exists: a seeded random sequence of submit, cancel, collect and waitAny
+against a host that answers at delays and sizes the request itself specifies, so the whole thing
+is deterministic and a failure replays from its seed. Every request carries a nonce the handler
+echoes, which turns cross-talk from something you infer into something the harness catches, and
+the run ends by checking that every slot came back free. It caught the third and fourth bugs and
+catches all four when they are put back — each with its own signature. Eight seeds in the suite,
+about a second; `WAC_FUZZ_SEEDS=250` for a deep sweep, which is what to run after touching
+`call.ts`, `respond.ts` or `layout.ts`. The fourth bug was at the eighth seed.
+
 ### Deadlines
 
 Nothing bounded how long a capability could take, and a peer that finished the handshake and
@@ -323,7 +351,26 @@ probe, built --allow-read --allow-net, run directly   ->  read=ok     net=failed
 the same worker, spawned by a parent that has read    ->  read=denied net=denied
 ```
 
-Passing a *subset* of the parent's grants through is the next step and is not here yet.
+**A subset is what `grants` is for.** `GRANT_READ | GRANT_NET` and friends, and the host
+intersects the request with its own authority rather than trusting it — a parent built without
+`--allow-net` cannot hand the network to anyone, and asking is not an error, it simply arrives
+denied. Measured four ways in `test/spawn.test.ts`, against one probe:
+
+```
+parent --allow-read --allow-net, child asks for nothing     ->  read=denied net=denied
+parent --allow-read,            child asks for read         ->  read=ok     net=denied
+parent --allow-read --allow-net, child asks for read,net    ->  read=ok     net=failed
+parent --allow-read,            child asks for read,net     ->  read=ok     net=denied
+```
+
+The first line is the one people expect to be different: grants are opt-in, not inherited. The
+last is the ceiling. `failed` rather than `denied` for the third is the probe reporting that it
+was allowed to dial and nothing was listening — which is the distinction that makes the table
+mean anything.
+
+That is the whole argument for spawning a worker rather than a process. `--allow-run=/bin/sh`
+cannot express one readable directory and no network, because there the child inherits the
+operating system's authority instead of the parent's.
 
 **It is not a sandbox against arbitrary JavaScript.** A wac child cannot reach past what it
 was handed because wac has no ambient anything; JavaScript in a spawned worker inherits the
@@ -505,12 +552,6 @@ enter it. Concurrency means more instances.
 
 ## What is not here yet
 
-- **Grants for children.** A spawned child gets nothing. That is the safe end of the range
-  and not the useful middle: `example/inetd.wac` cannot serve a shell that may read one
-  directory. The narrowing is the whole point of preferring `spawn` to process spawn, so
-  this is the next thing worth doing here. Note that a child's own build-time grants are
-  already irrelevant — the world it is handed decides — so this is a change to `OP.SPAWN`'s
-  request, not to the shebang.
 - **`spawn` on Node.** Deno only. `host/children.ts` takes `startWorld` as a parameter
   precisely so Node can follow without editing it, and nobody has written that side.
   Browser is a separate question: `Worker` exists there, but a page has no filesystem to
