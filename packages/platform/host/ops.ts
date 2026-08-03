@@ -36,3 +36,15 @@ export const OP = {
   CLOSE_FEED: 29,
   SLEEP_MILLIS: 30,
 } as const;
+
+/**
+ * Grant flags for `OP.SPAWN`, matching the `GRANT_*` constants in `platform.wac`.
+ *
+ * Here rather than in a world because both sides of the bridge read them, and because a
+ * fourth copy of these numbers — wac, worker, each host — is three too many already. The
+ * host intersects a request with its own authority; see `deno.ts`.
+ */
+export const GRANT_READ = 1;
+export const GRANT_WRITE = 2;
+export const GRANT_NET = 4;
+export const GRANT_ENV = 8;

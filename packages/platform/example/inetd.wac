@@ -19,9 +19,10 @@
 //   printf 'hello\n' | nc 127.0.0.1 9000     ->  olleh
 //
 // The child is granted nothing but those two streams, so `inetd 9000 box.worker.js cat /etc/passwd`
-// serves an error rather than the file. The handler cannot exceed what this program hands it.
+// serves an error rather than the file. The handler cannot exceed what this program hands it — and
+// what it hands over is the `GRANT_NONE` below, which is where to change that.
 
-import { Child, Cli, Core, FileResult, Pending, Socket } from "../src/platform.wac";
+import { Child, Cli, Core, FileResult, GRANT_NONE, Pending, Socket } from "../src/platform.wac";
 
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 2) {
@@ -60,7 +61,10 @@ export i32 main(Core core, Cli cli) {
     return 1;
   }
 
-  Child kid = cli.spawn(source, childArgs).wait();
+  // Nothing granted: the handler gets the socket's bytes and no other authority. Passing
+  // GRANT_READ here is what would make this an `inetd` that can serve a shell with one
+  // readable directory, and is the parent's decision to make rather than the handler's.
+  Child kid = cli.spawn(source, childArgs, GRANT_NONE).wait();
   if (kid.handle < 0) {
     core.warn("inetd: " + kid.error);
     cli.closeSocket(c.handle);

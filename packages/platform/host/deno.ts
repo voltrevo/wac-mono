@@ -8,7 +8,7 @@ import { type Handlers, serveHostCalls } from "./respond.ts";
 import { ByteQueue, type Child, spawnChild } from "./children.ts";
 import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
-import { OP } from "./ops.ts";
+import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 
 export type DenoWorldOptions = {
   /** Arguments the application sees. Defaults to none, not to the launcher's own. */
@@ -311,15 +311,36 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
      * sends. See the notes in `children.ts` and `platform.wac`.
      */
     [OP.SPAWN]: (p) => {
-      const n = readI32le(p);
-      const source = unstr(p.subarray(4, 4 + n));
-      const rest = unstr(p.subarray(4 + n));
+      const want = readI32le(p);
+      const n = readI32le(p.subarray(4));
+      const source = unstr(p.subarray(8, 8 + n));
+      const rest = unstr(p.subarray(8 + n));
       const childArgs = rest.length === 0 ? [] : rest.split("\u0000");
+
+      // Intersected with what *this* world has, not taken as given. `opts` is the whole of
+      // this world's authority — a capability is granted here by its option being present —
+      // so the intersection is a presence test and there is no second list to keep in step.
+      //
+      // Asking for more than the parent has is not an error. The child finds the capability
+      // denied, exactly as it would if the parent had asked for nothing, and a parent
+      // forwarding a request it received does not have to check it first.
+      const give = {
+        read: (want & GRANT_READ) !== 0 && opts.fs?.read === true,
+        write: (want & GRANT_WRITE) !== 0 && opts.fs?.write === true,
+        net: (want & GRANT_NET) !== 0 && opts.net === true,
+        env: (want & GRANT_ENV) !== 0 && opts.env !== undefined,
+      };
+
       const h = nextHandle++;
       children.set(h, spawnChild(source, childArgs, (sab, cargs, out, input) => {
         const enc = new TextEncoder();
         return serveHostCalls(bridgeOf(sab), denoWorld({
           args: cargs,
+          // Absent rather than false where nothing is granted: the world reads a missing
+          // option as "no such capability", and `fs: {}` is not the same as no `fs`.
+          ...(give.read || give.write ? { fs: { read: give.read, write: give.write } } : {}),
+          ...(give.net ? { net: true } : {}),
+          ...(give.env ? { env: opts.env } : {}),
           // A line of output is bytes on the handle, with the newline `log` implies. The
           // parent cannot tell `log` from `write` — nor can a pipe, which is the point.
           log: (l: string) => out.push(enc.encode(l + "\n")),

@@ -191,6 +191,25 @@ export struct Socket {
  * `a | b` reads one handle and writes another, and watching a child beside a socket is
  * `waitAny` over two handles that happen to have different origins.
  */
+/**
+ * What a spawned child may do, for `Cli.spawn`.
+ *
+ * Bit flags, combined with `|`. The host intersects them with its own grants, so these are a
+ * request rather than an instruction and a parent can never widen what it was given.
+ *
+ * There is deliberately no flag for standard input and output: a child always has those, they
+ * are how a parent talks to it at all, and they reach nothing the parent did not hand over.
+ */
+export const i32 GRANT_NONE = 0;
+/** `readFile`, `stat`, `readDir`, `openInput` on a path. */
+export const i32 GRANT_READ = 1;
+/** `writeFile`, `mkdir`, `remove`, `rename`, `openOutput` to a path. */
+export const i32 GRANT_WRITE = 2;
+/** `connect`, `listen`, `accept` — the child's own sockets, not the parent's. */
+export const i32 GRANT_NET = 4;
+/** `env`, which reports every variable unset without it. */
+export const i32 GRANT_ENV = 8;
+
 export struct Child {
   i32 handle;      // negative when `error` is set
   string error;
@@ -379,10 +398,23 @@ export struct Cli {
    * `send(handle, bytes)` carries becomes its standard input; `closeSocket(handle)` stops
    * it. `exitCode(handle)` waits for it to finish.
    *
-   * **It is granted nothing but those streams.** Every other capability is denied to it.
-   * Passing a subset of the parent's grants through is the next step and is not here — a
-   * child that could be handed the filesystem is a larger decision than one that can only
-   * speak.
+   * **`grants` is what the child may do beyond those streams**, as `GRANT_*` flags — and it
+   * is a *ceiling of the parent's own*, intersected by the host rather than trusted. A parent
+   * built without `--allow-net` cannot hand `GRANT_NET` to anyone; asking is not an error, and
+   * the child simply finds the capability denied. `GRANT_NONE` is the honest default and what
+   * every example passes.
+   *
+   *     cli.spawn(source, args, GRANT_NONE)                // stdin and stdout, nothing else
+   *     cli.spawn(source, args, GRANT_READ | GRANT_NET)     // ...if the parent has both
+   *
+   * This is the reason to prefer spawning a worker to spawning a process. What the child may
+   * do is the *parent's* choice; `--allow-run=/bin/sh` cannot express it at any granularity,
+   * because there the child inherits the operating system's authority instead. A shell served
+   * over a socket can be given one directory and no network.
+   *
+   * Flags rather than a struct because no capability takes a struct *parameter* anywhere in
+   * this world — every one of them returns structs — so this would have been the first, and a
+   * bitmask needs nothing from the boundary that is not already exercised.
    *
    * **The confinement is this language's, not the runtime's.** A wac child cannot reach
    * past what it was handed because wac has no ambient anything. Arbitrary JavaScript in a
@@ -390,7 +422,7 @@ export struct Cli {
    * Deno flag that would appear in the shebang of every program that spawns. So this is a
    * composition and concurrency primitive rather than a sandbox. See wac-mono issue 0015.
    */
-  fn[Pending<Child>(string, string[])] spawn;
+  fn[Pending<Child>(string, string[], i32)] spawn;
 
   /**
    * End a spawned worker's standard input without stopping it.
@@ -428,7 +460,7 @@ export struct Cli {
     fn[Pending<bool>(i32, u8[])] send,
     fn[void(i32)] closeSocket,
     fn[i32(i32[], i32)] waitAny,
-    fn[Pending<Child>(string, string[])] spawn,
+    fn[Pending<Child>(string, string[], i32)] spawn,
     fn[void(i32)] closeFeed,
     fn[Pending<i32>(i32)] exitCode
   ) {

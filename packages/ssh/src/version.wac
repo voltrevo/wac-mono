@@ -69,6 +69,13 @@ export Version scanVersion(u8[] src, i32 at, i32 end) {
   if (at < 0 || end > src.len() || at > end) { return Version(Found.Bad, u8[0](), 0); }
 
   i32 lineStart = at;
+  // No `trap;` after this loop, though it never falls through and one would compile.
+  //
+  // The compiler already proves the end unreachable — a function ending in a `while (true)` that
+  // only returns needs nothing after it. Writing `trap;` anyway is worse than redundant: it
+  // *satisfies* the return checker, so bounding this loop later would compile silently and turn
+  // what should be "not all paths return" into a crash at run time. Leaving it off means the
+  // compiler catches that change.
   while (true) {
     // Find the end of this line.
     i32 nl = -1;
@@ -97,7 +104,6 @@ export Version scanVersion(u8[] src, i32 at, i32 end) {
     }
     lineStart = nl + 1;      // a banner line; keep looking
   }
-  trap;                      // unreachable: the loop only exits by returning
 }
 
 /**

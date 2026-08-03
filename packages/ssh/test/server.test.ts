@@ -19,7 +19,7 @@ function freePort(): number {
   return port;
 }
 
-type Wacsshd = { dir: string; port: number; proc: Deno.ChildProcess };
+type Wacsshd = { dir: string; port: number; proc: Deno.ChildProcess; stderr: Promise<string> };
 
 /**
  * The server, built once as a standalone program.
@@ -61,15 +61,22 @@ async function startWacsshd(): Promise<Wacsshd> {
     env: { HOME: dir },
     clearEnv: false,
     stdout: "null",
-    stderr: "null",
+    // Captured rather than discarded so a test can read what the server said about itself. The
+    // startup line is the only place `sshd.wac`'s `itoa` is observable at all, and it survived
+    // mutation testing as `return ""` — a server announcing "listening on port " with no number.
+    stderr: "piped",
   }).spawn();
+
+  // Drained concurrently: a server that filled the pipe would block, and nothing reads it until
+  // the process ends.
+  const stderr = new Response(proc.stderr).text();
 
   // Poll rather than sleep: the first run compiles the wac and the rest do not.
   for (let i = 0; i < 200; i++) {
     try {
       const probe = await Deno.connect({ hostname: "127.0.0.1", port });
       probe.close();
-      return { dir, port, proc };
+      return { dir, port, proc, stderr };
     } catch {
       await new Promise(r => setTimeout(r, 100));
     }
@@ -319,6 +326,69 @@ Deno.test({
       if (bad.code !== 7) throw new Error(`env-first status: exit ${bad.code}\n${bad.stderr}`);
     } finally {
       await stopWacsshd(s);
+    }
+  },
+});
+
+Deno.test({
+  name: "a refused pty-req is answered, because that request did want a reply",
+  ignore: !haveSshd,
+  sanitizeResources: false,
+  async fn() {
+    const s = await startWacsshd();
+    try {
+      // The other half of the `want_reply` rule, and the half the `SendEnv` test above cannot
+      // reach. That one proves we stay *silent* for requests that asked for nothing; this proves
+      // we still *answer* one that asked. Without it, `requestWantsReply` could return a constant
+      // `false` and the whole suite stayed green — which is exactly what mutation testing found.
+      //
+      // `ssh -tt` forces `pty-req` with want_reply set. We refuse it deliberately (no terminal
+      // modes to honour), and the client prints the refusal. No answer at all and there is
+      // nothing for it to print.
+      const r = await new Deno.Command("ssh", {
+        args: [
+          "-tt", "-F", "/dev/null", "-i", `${s.dir}/clientkey`, "-p", String(s.port),
+          "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+          "-o", "BatchMode=yes", "claude@127.0.0.1",
+        ],
+        stdin: "null",
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      const err = text(r.stderr);
+      if (!err.includes("PTY allocation request failed")) {
+        throw new Error(`no refusal reached the client. stderr: ${JSON.stringify(err)}`);
+      }
+    } finally {
+      await stopWacsshd(s);
+    }
+  },
+});
+
+Deno.test({
+  name: "the server announces the port it is actually listening on",
+  ignore: !haveSshd,
+  sanitizeResources: false,
+  async fn() {
+    const s = await startWacsshd();
+    let said: string;
+    try {
+      // `itoa` in `sshd.wac` has exactly one observable: this line. It survived mutation testing
+      // replaced by `return ""`, which yields `sshd: listening on port ` — a server that has
+      // forgotten to say where it is. Harmless-looking, and the first thing anyone reads when a
+      // connection will not go through.
+      //
+      // Asserted against the port the *test* chose, not against whatever the line contains, so a
+      // number that is merely present but wrong fails too.
+      await stopWacsshd(s);
+      said = await s.stderr;
+    } catch (e) {
+      await stopWacsshd(s);
+      throw e;
+    }
+    const want = `sshd: listening on port ${s.port}`;
+    if (!said.includes(want)) {
+      throw new Error(`expected ${JSON.stringify(want)}, server said ${JSON.stringify(said.trim())}`);
     }
   },
 });

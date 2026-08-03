@@ -100,7 +100,6 @@ export struct Conn {
         return u8[0]();
       }
     }
-    trap;                     // unreachable: the loop only exits by returning
   }
 
   /** One packet if the buffer holds one, empty if it does not yet. */

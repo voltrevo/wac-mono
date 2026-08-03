@@ -351,7 +351,26 @@ probe, built --allow-read --allow-net, run directly   ->  read=ok     net=failed
 the same worker, spawned by a parent that has read    ->  read=denied net=denied
 ```
 
-Passing a *subset* of the parent's grants through is the next step and is not here yet.
+**A subset is what `grants` is for.** `GRANT_READ | GRANT_NET` and friends, and the host
+intersects the request with its own authority rather than trusting it — a parent built without
+`--allow-net` cannot hand the network to anyone, and asking is not an error, it simply arrives
+denied. Measured four ways in `test/spawn.test.ts`, against one probe:
+
+```
+parent --allow-read --allow-net, child asks for nothing     ->  read=denied net=denied
+parent --allow-read,            child asks for read         ->  read=ok     net=denied
+parent --allow-read --allow-net, child asks for read,net    ->  read=ok     net=failed
+parent --allow-read,            child asks for read,net     ->  read=ok     net=denied
+```
+
+The first line is the one people expect to be different: grants are opt-in, not inherited. The
+last is the ceiling. `failed` rather than `denied` for the third is the probe reporting that it
+was allowed to dial and nothing was listening — which is the distinction that makes the table
+mean anything.
+
+That is the whole argument for spawning a worker rather than a process. `--allow-run=/bin/sh`
+cannot express one readable directory and no network, because there the child inherits the
+operating system's authority instead of the parent's.
 
 **It is not a sandbox against arbitrary JavaScript.** A wac child cannot reach past what it
 was handed because wac has no ambient anything; JavaScript in a spawned worker inherits the
@@ -460,11 +479,22 @@ than on a filesystem, and there is nothing this side can do about it.
 throw a bare TypeError. `box httpd -x` sends them, which makes the whole loop wac: a wac
 server delivering a wac application to a browser.
 
-**Not run in a browser.** There is none in this container. `test/browser.test.ts` drives
-every handler over an in-memory OPFS, which is where a mapping bug would be; what is
-untested is `SharedArrayBuffer`, `Atomics.wait` on a real worker, and the page's own
-plumbing — all of it shared verbatim with the two targets that *are* tested. That is an
-argument rather than a proof, and it is worth someone opening the page once.
+**Run in a real browser**, on Chromium 151 — `test/browser_live.test.ts`, which builds the
+page, serves it with the two headers, and drives it with Playwright. It is *ignored* unless a
+browser is installed, so the suite stays zero-dependency and offline by default; the file says
+how to install one in three commands, and the skip costs 3ms and no network.
+
+It was worth the trouble immediately. `readDir(".")` had passed against the in-memory OPFS for
+a week and answered **"not a directory"** in Chromium: OPFS has no `.` entry, and the double's
+path handling had been written from the same assumption as the code it was checking, so it
+agreed with the bug. Deno and Node both answer `.` with the listing, so portable code asked the
+obvious question and silently got nothing. Fixed, and `browser.test.ts` now has the case —
+which fails against the old code, in the double as well.
+
+The argument that the rest was safe held up: `SharedArrayBuffer` under genuine cross-origin
+isolation, `Atomics.wait` on a real `Worker`, and the blob-URL worker all worked first time,
+because they are shared verbatim with the targets that were already tested. It was the
+browser-specific part that was wrong, which is the part a double cannot check.
 
 ## How an asynchronous host looks synchronous
 
@@ -533,12 +563,6 @@ enter it. Concurrency means more instances.
 
 ## What is not here yet
 
-- **Grants for children.** A spawned child gets nothing. That is the safe end of the range
-  and not the useful middle: `example/inetd.wac` cannot serve a shell that may read one
-  directory. The narrowing is the whole point of preferring `spawn` to process spawn, so
-  this is the next thing worth doing here. Note that a child's own build-time grants are
-  already irrelevant — the world it is handed decides — so this is a change to `OP.SPAWN`'s
-  request, not to the shebang.
 - **`spawn` on Node.** Deno only. `host/children.ts` takes `startWorld` as a parameter
   precisely so Node can follow without editing it, and nobody has written that side.
   Browser is a separate question: `Worker` exists there, but a page has no filesystem to
@@ -552,5 +576,5 @@ enter it. Concurrency means more instances.
   a wac program with grants its parent chose.
 
 Two things this section used to list are done: the browser provider (`--target browser`,
-though see issue 0016 — it has never run in an actual browser) and outbound network
+and it now runs in one, see `test/browser_live.test.ts`) and outbound network
 (`connect`/`listen`/`accept`).

@@ -132,6 +132,23 @@ remember, because the suite says so — and acting on it is a green run plus `wa
 that lags a long way behind is not wrong, but it has stopped saying anything useful about
 what this repo needs.
 
+## Dependencies: none, and the one exception
+
+Nothing here imports a third-party package. Every test file writes its own `assertEquals`
+for that reason, which is why you will see the same eight lines in thirty files, and it is
+deliberate: a repo whose only inputs are Deno and the wac compiler pin can be checked out
+and run in five years.
+
+`deno.lock` exists for exactly one exception, and names it: `npm:playwright`, imported
+*dynamically inside* `packages/platform/test/browser_live.test.ts`, which runs the browser
+target in a real browser. That test is ignored unless a browser is installed and the run has
+`--allow-sys`, so `deno task test` skips it in milliseconds and fetches nothing. The lockfile
+is there to pin the version and its integrity hash rather than resolve whatever is newest at
+the moment somebody happens to run it — an unpinned dynamic import would be the worse
+position to be in, not the purer one.
+
+No package's own code imports it, and nothing else in the suite needs the network.
+
 ## Two kinds of test
 
 **Host-side (`test/*.test.ts`)** for anything needing an external oracle or the

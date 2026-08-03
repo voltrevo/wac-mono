@@ -23,7 +23,7 @@
 // sixteen; it was four of four when the ring had four, which is why a third stage was not
 // something this could grow.
 
-import { Child, Cli, Core, FileResult, Pending } from "../src/platform.wac";
+import { Child, Cli, Core, FileResult, GRANT_NONE, Pending } from "../src/platform.wac";
 
 /** Standard input, in the same handle space as sockets and children. */
 const i32 STDIN = 0;
@@ -44,8 +44,8 @@ export i32 main(Core core, Cli cli) {
 
   // The same bundle twice, differing only in argv. Nothing stops them being different
   // programs — one bundle just makes the example short.
-  Child a = cli.spawn(source, argv(cli.arg(1).wait())).wait();
-  Child b = cli.spawn(source, argv(cli.arg(2).wait())).wait();
+  Child a = cli.spawn(source, argv(cli.arg(1).wait()), GRANT_NONE).wait();
+  Child b = cli.spawn(source, argv(cli.arg(2).wait()), GRANT_NONE).wait();
   if (a.handle < 0 || b.handle < 0) {
     core.warn("pipe: " + (a.handle < 0 ? a.error : b.error));
     return 1;
