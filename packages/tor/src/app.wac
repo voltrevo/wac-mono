@@ -1,0 +1,468 @@
+// A Tor client, entire.
+//
+//   deno task app packages/tor/src/app.wac --allow-net --allow-read -- \
+//     <seed-file> <authorities-file> <path>
+//
+// No TypeScript. The socket comes from the platform world, and everything above it —
+// the link handshake, ntor, the onion, the directory and its verification, path selection —
+// is the wac in this package. `Core` and `Cli` are the complete list of what this can reach,
+// so the shebang of a built copy states it: `--allow-net --allow-read` and nothing else.
+//
+// ## What the two files are
+//
+// `<seed-file>` is one line: `host port identityHex ntorOnionKeyBase64`. It is this
+// program's stand-in for the fallback directory mirrors a real client compiles in, and it
+// is *not* trusted — it is somewhere to ask, and the answer is checked against the
+// authorities regardless of who gave it.
+//
+// `<authorities-file>` is one uppercase hex fingerprint per line. That list is the whole
+// basis of trust, which is why it is a file the user chooses rather than something read out
+// of the directory being checked. A real client compiles it in.
+//
+// ## What this is not
+//
+// Not an anonymity tool. There is no SOCKS port — that needs waiting on several sockets at
+// once, which today can only be done by spinning a core (issue 0019) — and no timeouts,
+// because nothing bounds a socket capability (issue 0018). Neither is worked around here.
+
+import { Core, Cli, Socket, FileResult } from "../../platform/src/platform.wac";
+import { Vec } from "../../std/src/vec.wac";
+import {
+  Relay, parseConsensus, attachMicrodescriptors, hasFlag, parseInt, base64NoPad,
+  unpaddedBase64,
+} from "./directory.wac";
+import { AuthorityCert, Verdict, parseCertificates, verifyConsensus, toHex } from "./consensus.wac";
+import { parseWeights, resolveFamilies, Families, pick, positionGuard, positionMiddle,
+         positionExit } from "./pathsel.wac";
+import { Circuit, Received, gotData, gotEnd, gotConnected, gotExtended, gotBroken,
+         gotDestroyed, extendedReply } from "./circuit.wac";
+import { consensusPath, certificatePath, microdescPath, microdescBatches, splitResponse,
+         isIdentity, Response } from "./dirclient.wac";
+import { encodeVersions, negotiateVersion, encodeNetinfo, encodeCreate2, decodeCreated2,
+         cellSize, cellCommand, cellPayload, certsCount, handshakeNtor,
+         cmdVersions, cmdNetinfo, cmdCerts, cmdAuthChallenge, cmdVpadding, cmdCreated2,
+         cmdDestroy } from "./cell.wac";
+import { ntorClientRequest, ntorClientFinish } from "./ntor.wac";
+import { tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientPhase, tlsClientFailure }
+  from "../../tls/src/client.wac";
+
+/** `[state][toSend][appData]`, each behind a big-endian u32 length. */
+struct Step { u8[] state; u8[] toSend; u8[] appData; }
+
+Step unpack(u8[] r) {
+  i32 at = 0;
+  u8[][] parts = u8[][3](fill: u8[0]());
+  for (i32 i = 0; i < 3; i++) {
+    i32 n = (r[at] << 24) | (r[at + 1] << 16) | (r[at + 2] << 8) | r[at + 3];
+    parts[i] = sliceOf(r, at + 4, at + 4 + n);
+    at = at + 4 + n;
+  }
+  return Step(parts[0], parts[1], parts[2]);
+}
+
+u8[] sliceOf(u8[] s, i32 from, i32 to) {
+  i32 hi = to > s.len() ? s.len() : to;
+  if (hi <= from) { return u8[0](); }
+  u8[] o = u8[hi - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = s[from + i]; }
+  return o;
+}
+
+u8[] concat(u8[] a, u8[] b) {
+  if (a.len() == 0) { return b; }
+  if (b.len() == 0) { return a; }
+  u8[] o = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { o[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { o[a.len() + i] = b[i]; }
+  return o;
+}
+
+/**
+ * A TLS connection to a relay, carrying Tor cells.
+ *
+ * The trust store is empty on purpose. A relay's certificate is self-signed with a random
+ * CN and its identity is established by ntor against a key from the consensus, so validating
+ * it would fail and passing would prove nothing. It is spelt as an empty store rather than a
+ * flag because a boolean is one typo from disabling this everywhere.
+ */
+struct Link {
+  Core core;
+  Cli cli;
+  i32 sock;
+  u8[] tls;
+  /** Cell bytes decrypted but not yet consumed. */
+  u8[] buffered;
+  bool dead;
+}
+
+Link connectRelay(Core core, Cli cli, string host, i32 port) {
+  Socket s = cli.connect(host, port).wait();
+  if (s.handle < 0) {
+    core.warn("tor: " + host + ": " + s.error);
+    return Link(core, cli, -1, u8[0](), u8[0](), true);
+  }
+  Step st = unpack(tlsClientInit(
+    host.toBytes(), u8[0](), i32[0](),
+    core.randomBytes(32).wait(), core.randomBytes(32).wait(),
+    core.randomBytes(64).wait(), core.randomBytes(32).wait(),
+    core.nowMillis().wait() / 1000));
+  Link l = Link(core, cli, s.handle, st.state, u8[0](), false);
+  if (!cli.send(s.handle, st.toSend).wait()) { l.dead = true; }
+  return l;
+}
+
+/** Pump the socket until the TLS handshake completes or the link dies. */
+void handshakeTls(Link l) {
+  while (!l.dead && tlsClientPhase(l.tls) != 3) {
+    if (!pump(l)) { l.dead = true; }
+  }
+}
+
+/** One read from the socket, fed to TLS. False at end of stream. */
+bool pump(Link l) {
+  u8[] chunk = l.cli.recv(l.sock).wait();
+  if (chunk.len() == 0) { return false; }
+  Step st = unpack(tlsClientFeed(l.tls, chunk));
+  l.tls = st.state;
+  if (st.toSend.len() > 0) {
+    if (!l.cli.send(l.sock, st.toSend).wait()) { return false; }
+  }
+  if (st.appData.len() > 0) { l.buffered = concat(l.buffered, st.appData); }
+  if (tlsClientFailure(l.tls) != 0) {
+    l.core.warn("tor: TLS to the relay failed, code " + itoa(tlsClientFailure(l.tls)));
+    return false;
+  }
+  return true;
+}
+
+void sendCells(Link l, u8[] bytes) {
+  if (l.dead || bytes.len() == 0) { return; }
+  Step st = unpack(tlsClientSend(l.tls, bytes));
+  l.tls = st.state;
+  if (!l.cli.send(l.sock, st.toSend).wait()) { l.dead = true; }
+}
+
+/** The next whole cell, or an empty array if the link ended. */
+u8[] nextCell(Link l) {
+  while (!l.dead) {
+    if (l.buffered.len() > 0) {
+      i32 n = cellSize(l.buffered, 0);
+      if (n > 0) {
+        u8[] cell = sliceOf(l.buffered, 0, n);
+        l.buffered = sliceOf(l.buffered, n, l.buffered.len());
+        return cell;
+      }
+    }
+    if (!pump(l)) { l.dead = true; }
+  }
+  return u8[0]();
+}
+
+/**
+ * The link handshake: VERSIONS, then read until NETINFO, then answer.
+ *
+ * A client sends no AUTHENTICATE. Relay-to-client authentication is what ntor does, against
+ * a key from the consensus, so proving possession of the TLS certificate would prove nothing
+ * anybody needs.
+ */
+bool linkHandshake(Link l, string host) {
+  sendCells(l, encodeVersions(i32[](3, 4, 5)));
+  u8[] versions = nextCell(l);
+  if (versions.len() == 0 || cellCommand(versions, 0) != cmdVersions()) { return false; }
+  if (negotiateVersion(cellPayload(versions, 0), i32[](3, 4, 5)) < 4) { return false; }
+
+  while (true) {
+    u8[] cell = nextCell(l);
+    if (cell.len() == 0) { return false; }
+    i32 cmd = cellCommand(cell, 0);
+    if (cmd == cmdNetinfo()) { break; }
+    if (cmd == cmdCerts()) {
+      if (certsCount(cellPayload(cell, 0)) < 0) { return false; }
+    } else if (cmd != cmdAuthChallenge() && cmd != cmdVpadding()) {
+      return false;
+    }
+  }
+  sendCells(l, encodeNetinfo(ipv4Of(host)));
+  return !l.dead;
+}
+
+u8[] ipv4Of(string host) {
+  u8[] b = host.toBytes();
+  u8[] out = u8[](127, 0, 0, 1);
+  i32 part = 0;
+  i32 v = 0;
+  i32 digits = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == '.') {
+      if (digits == 0 || v > 255 || part > 3) { return u8[](127, 0, 0, 1); }
+      out[part] = v;
+      part++;
+      v = 0;
+      digits = 0;
+    } else if (b[i] >= '0' && b[i] <= '9') {
+      v = v * 10 + (b[i] - '0');
+      digits++;
+    } else { return u8[](127, 0, 0, 1); }
+  }
+  return part == 4 ? out : u8[](127, 0, 0, 1);
+}
+
+/** CREATE2 with an ntor handshake, and the key material it produces. */
+u8[] createCircuit(Link l, Circuit c, u8[] identity, u8[] onionKey, u8[] ephemeral) {
+  sendCells(l, encodeCreate2(c.circId, handshakeNtor(),
+                             ntorClientRequest(identity, onionKey, ephemeral)));
+  u8[] cell = nextCell(l);
+  if (cell.len() == 0) { return u8[0](); }
+  if (cellCommand(cell, 0) == cmdDestroy()) {
+    l.core.warn("tor: the relay refused the circuit");
+    return u8[0]();
+  }
+  if (cellCommand(cell, 0) != cmdCreated2()) { return u8[0](); }
+  return ntorClientFinish(identity, onionKey, ephemeral,
+                          decodeCreated2(cellPayload(cell, 0)), 72);
+}
+
+/** Extend to one more relay, through the hops already built. */
+bool extendTo(Link l, Circuit c, Relay r, u8[] ephemeral) {
+  u8[] req = ntorClientRequest(r.identity, r.ntorOnionKey, ephemeral);
+  sendCells(l, c.extendCell(ipv4Of(r.address), r.orPort, r.identity, req));
+  while (true) {
+    u8[] cell = nextCell(l);
+    if (cell.len() == 0) { return false; }
+    Received got = c.receive(cell);
+    if (got.kind == gotBroken() || got.kind == gotDestroyed()) { return false; }
+    if (got.kind == gotExtended()) {
+      u8[] keys = ntorClientFinish(r.identity, r.ntorOnionKey, ephemeral,
+                                   extendedReply(got.data), 72);
+      // An empty return is how ntor reports failure: the AUTH did not match, or the reply
+      // was a small-order point. Either way the party at the other end does not hold the
+      // key the consensus named, and there is nothing to negotiate.
+      if (keys.len() == 0) {
+        l.core.warn("tor: " + r.nickname + " did not authenticate");
+        return false;
+      }
+      c.addHop(keys);
+      return true;
+    }
+  }
+}
+
+/** GET a directory document over the circuit, and return the body. */
+u8[] fetchOverCircuit(Link l, Circuit c, string path) {
+  i32 sid = c.beginStream();
+  sendCells(l, c.beginDirCell(sid));
+  u8[] raw = u8[0]();
+  bool connected = false;
+  while (!l.dead) {
+    u8[] cell = nextCell(l);
+    if (cell.len() == 0) { break; }
+    Received got = c.receive(cell);
+    if (got.toSend.len() > 0) { sendCells(l, got.toSend); }
+    if (got.kind == gotBroken() || got.kind == gotDestroyed()) { return u8[0](); }
+    if (got.kind == gotConnected() && !connected) {
+      connected = true;
+      sendCells(l, c.dataCell(sid, ("GET " + path + " HTTP/1.0\r\n" +
+                                    "Accept-Encoding: identity\r\n\r\n").toBytes()));
+    } else if (got.kind == gotData()) {
+      raw = concat(raw, got.data);
+    } else if (got.kind == gotEnd()) {
+      break;
+    }
+  }
+  Response r = splitResponse(raw);
+  if (r.status != 200) {
+    l.core.warn("tor: the directory answered " + itoa(r.status) + " for " + path);
+    return u8[0]();
+  }
+  if (!isIdentity(r)) {
+    l.core.warn("tor: the directory compressed a body we asked it not to");
+    return u8[0]();
+  }
+  return r.body;
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  bool neg = v < 0;
+  i32 x = neg ? -v : v;
+  u8[] buf = u8[12]();
+  i32 n = 0;
+  while (x > 0) {
+    buf[n] = '0' + (x % 10);
+    n++;
+    x = x / 10;
+  }
+  u8[] out = u8[n + (neg ? 1 : 0)]();
+  if (neg) { out[0] = '-'; }
+  for (i32 i = 0; i < n; i++) { out[(neg ? 1 : 0) + i] = buf[n - 1 - i]; }
+  return string.fromBytes(out);
+}
+
+string[] lines(u8[] b) {
+  Vec<string> out = Vec.create();
+  i32 at = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == '\n') {
+      if (i > at) { out.push(string.fromBytes(sliceOf(b, at, i))); }
+      at = i + 1;
+    }
+  }
+  return out.toArray();
+}
+
+string[] words(string s) {
+  u8[] b = s.toBytes();
+  Vec<string> out = Vec.create();
+  i32 at = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == ' ') {
+      if (i > at) { out.push(string.fromBytes(sliceOf(b, at, i))); }
+      at = i + 1;
+    }
+  }
+  return out.toArray();
+}
+
+u8[] fromHex(string s) {
+  u8[] h = s.toBytes();
+  if (h.len() % 2 != 0) { return u8[0](); }
+  u8[] out = u8[h.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) {
+    i32 hi = hexDigit(h[2 * i]);
+    i32 lo = hexDigit(h[2 * i + 1]);
+    if (hi < 0 || lo < 0) { return u8[0](); }
+    out[i] = hi * 16 + lo;
+  }
+  return out;
+}
+
+i32 hexDigit(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+  return -1;
+}
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount().wait() < 3) {
+    core.warn("usage: tor <seed-file> <authorities-file> <path>");
+    core.warn("  seed-file:        one line, `host port identityHex ntorOnionKeyBase64`");
+    core.warn("  authorities-file: one uppercase hex fingerprint per line");
+    return 2;
+  }
+  FileResult seedFile = cli.readFile(cli.arg(0).wait()).wait();
+  if (!seedFile.ok) { core.warn("tor: " + seedFile.error); return 1; }
+  FileResult authFile = cli.readFile(cli.arg(1).wait()).wait();
+  if (!authFile.ok) { core.warn("tor: " + authFile.error); return 1; }
+  string path = cli.arg(2).wait();
+
+  string[] seedWords = words(lines(seedFile.bytes)[0]);
+  if (seedWords.len() < 4) { core.warn("tor: the seed line needs four fields"); return 1; }
+  string seedHost = seedWords[0];
+  i32 seedPort = parseInt(seedWords[1]);
+  u8[] seedIdentity = fromHex(seedWords[2]);
+  u8[] seedOnionKey = unpaddedBase64(seedWords[3]);
+  string[] trusted = lines(authFile.bytes);
+  if (trusted.len() == 0) {
+    core.warn("tor: no authorities named, so verification would be vacuous");
+    return 1;
+  }
+
+  // ── Bootstrap: one hop to the seed, and a consensus we check for ourselves ──
+  //
+  // The seed is somewhere to ask, not somebody to trust. Whatever it returns is verified
+  // against the authorities, which is what makes an unencrypted-looking first fetch fine.
+  Link l = connectRelay(core, cli, seedHost, seedPort);
+  if (l.dead) { return 1; }
+  handshakeTls(l);
+  if (l.dead || !linkHandshake(l, seedHost)) {
+    core.warn("tor: the link handshake with the seed relay failed");
+    return 1;
+  }
+
+  Circuit boot = Circuit.create(0x80000001, u8[72]());
+  u8[] keys = createCircuit(l, boot, seedIdentity, seedOnionKey, core.randomBytes(32).wait());
+  if (keys.len() == 0) { core.warn("tor: the seed relay did not authenticate"); return 1; }
+  boot = Circuit.create(0x80000001, keys);
+
+  u8[] consensus = fetchOverCircuit(l, boot, consensusPath());
+  if (consensus.len() == 0) { return 1; }
+  u8[] certs = fetchOverCircuit(l, boot, certificatePath(trusted));
+  if (certs.len() == 0) { return 1; }
+
+  AuthorityCert[] checked = parseCertificates(certs, trusted);
+  Verdict v = verifyConsensus(consensus, checked, trusted, core.nowMillis().wait() / 1000);
+  if (!v.ok) {
+    core.warn("tor: the consensus is not acceptable — " + itoa(v.goodSignatures) +
+              " of " + itoa(v.needed) + " signatures" +
+              (v.stale == "" ? "" : ", " + v.stale));
+    return 1;
+  }
+  core.log("consensus verified: " + itoa(v.goodSignatures) + " of " + itoa(trusted.len()) +
+           " authorities signed");
+
+  Relay[] relays = parseConsensus(consensus);
+  Vec<string> digests = Vec.create();
+  for (i32 i = 0; i < relays.len(); i++) {
+    if (relays[i].microdescDigest != "") { digests.push(relays[i].microdescDigest); }
+  }
+  string[][] batches = microdescBatches(digests.toArray());
+  for (i32 i = 0; i < batches.len(); i++) {
+    u8[] micro = fetchOverCircuit(l, boot, microdescPath(batches[i]));
+    if (micro.len() == 0) { return 1; }
+    attachMicrodescriptors(relays, micro);
+  }
+
+  // ── A path, and a circuit through it ────────────────────────────────────────
+  //
+  // Same-subnet is waived because a testnet puts every relay on 127.0.0.1 and the /16 rule
+  // would reject every possible path. It is a flag rather than a default so that reaching it
+  // takes saying so.
+  i64[] weights = parseWeights(consensus);
+  Families fam = resolveFamilies(relays);
+  bool sameSubnetOk = true;
+
+  i32 exit = pick(relays, weights, fam, positionExit(), i32[0](), 0, sameSubnetOk,
+                  randomI64(core));
+  if (exit < 0) { core.warn("tor: no usable exit"); return 1; }
+  i32 guard = pick(relays, weights, fam, positionGuard(), i32[](exit), 0, sameSubnetOk,
+                   randomI64(core));
+  if (guard < 0) { core.warn("tor: no usable guard"); return 1; }
+  i32 middle = pick(relays, weights, fam, positionMiddle(), i32[](exit, guard), 0,
+                    sameSubnetOk, randomI64(core));
+  if (middle < 0) { core.warn("tor: no usable middle relay"); return 1; }
+
+  core.log("path: " + relays[guard].nickname + " -> " + relays[middle].nickname +
+           " -> " + relays[exit].nickname);
+
+  Link l2 = connectRelay(core, cli, relays[guard].address, relays[guard].orPort);
+  if (l2.dead) { return 1; }
+  handshakeTls(l2);
+  if (l2.dead || !linkHandshake(l2, relays[guard].address)) {
+    core.warn("tor: the link handshake with the guard failed");
+    return 1;
+  }
+  u8[] gk = createCircuit(l2, Circuit.create(0x80000002, u8[72]()),
+                          relays[guard].identity, relays[guard].ntorOnionKey,
+                          core.randomBytes(32).wait());
+  if (gk.len() == 0) { core.warn("tor: the guard did not authenticate"); return 1; }
+  Circuit c = Circuit.create(0x80000002, gk);
+  if (!extendTo(l2, c, relays[middle], core.randomBytes(32).wait())) { return 1; }
+  if (!extendTo(l2, c, relays[exit], core.randomBytes(32).wait())) { return 1; }
+  core.log("circuit built, " + itoa(c.length()) + " hops");
+
+  u8[] body = fetchOverCircuit(l2, c, path);
+  if (body.len() == 0) { return 1; }
+  cli.write(body);
+  cli.closeSocket(l2.sock);
+  cli.closeSocket(l.sock);
+  return 0;
+}
+
+/** A non-negative i64 from the world's entropy, for the chooser. */
+i64 randomI64(Core core) {
+  u8[] b = core.randomBytes(8).wait();
+  i64 v = 0;
+  for (i32 i = 0; i < 8; i++) { v = (v << 8) | (b[i] as i64); }
+  return v < 0 ? -v : v;
+}
