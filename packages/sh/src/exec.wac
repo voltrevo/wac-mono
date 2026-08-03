@@ -65,6 +65,18 @@ export struct Shell {
   fn[Output(Core, Cli, string, Vec<string>, u8[])] external;
 
   /**
+   * What `external` will answer to, for `help` to list.
+   *
+   * A second funcref rather than asking `external` itself, because "run this" and "what do you
+   * have" are different questions and encoding the second as a magic argv would make a command
+   * named `--list` unrunnable. Empty by default, and `help` then says only what it has.
+   *
+   * `help` existing and being wrong is worse than `help` being short: the browser terminal
+   * advertised sixty programs while this listed twelve and blamed a closed issue for it.
+   */
+  fn[string[]()] externalNames;
+
+  /**
    * Every name ever set, so the table can be copied.
    *
    * `Map` offers no iteration, and a subshell has to start from a *copy* of its parent's
@@ -112,7 +124,7 @@ export struct Shell {
     // guess. A browser answers "/" — the root of its Origin Private File System — which is the
     // true answer there rather than a stand-in.
     return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
-                 false, Buf.create(), noExternal, Vec.create(),
+                 false, Buf.create(), noExternal, noExternalNames, Vec.create(),
                  Map.create(hashString, stringEq),
                  Vec.create(), Vec.create(), false, u8[0](), 0, cli.cwd().wait());
   }
@@ -932,7 +944,7 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   }
   if (name == "set") { return setBuiltin(sh, argv); }
   if (name == "test" || name == "[") { return test(sh, argv); }
-  if (name == "help") { return help(); }
+  if (name == "help") { return help(sh); }
 
   // A real program if `$WACPATH` has one, and the wac implementation if it does not. That order
   // is the whole point of the table in `program.wac`: those exist because nothing could be
@@ -948,6 +960,9 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   if (given.found) { return given; }
   return run(sh.cli, sh.cwd, argv, stdin);
 }
+
+/** The default `Shell.externalNames`: nothing is wired in, so there is nothing to list. */
+string[] noExternalNames() { return string[0](fill: ""); }
 
 /** The default `Shell.external`: nothing is wired in, so every name falls through. */
 Output noExternal(Core core, Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
@@ -1126,13 +1141,49 @@ Output test(Shell sh, Vec<string> argv) {
   return Output(u8[0](), u8[0](), result ? 0 : 1, true);
 }
 
-Output help() {
+/**
+ * What this shell can run, in the order it would try it.
+ *
+ * Takes the shell because the interesting half is no longer a constant: which programs exist
+ * depends on what was wired into `Shell.external`, and the old version listed the twelve in
+ * `program.wac` and cited issue 0015 — which was closed `wontfix` and is now the wrong reason for
+ * a smaller list than the truth.
+ */
+Output help(Shell sh) {
   string s = "builtins: : true false echo exit export unset test [ help cd pwd ls mkdir rm\n";
-  Vec<string> ns = names();
-  s = s + "programs:";
-  for (i32 i = 0; i < ns.len(); i++) { s = s + " " + ns.get(i); }
-  s = s + "\nno process capability, so these are implemented in wac — see issue 0015\n";
+
+  string[] wired = sh.externalNames();
+  if (wired.len() > 0) {
+    s = s + "programs: " + wrapNames(wired) + "\n";
+  }
+
+  // Named as what they are. They are tried last, and every one of them is also in the list above
+  // when something has been wired in — where the other implementation is the better one.
+  Vec<string> own = names();
+  s = s + (wired.len() > 0 ? "built in:" : "programs:");
+  for (i32 i = 0; i < own.len(); i++) { s = s + " " + own.get(i); }
+  s = s + "\n";
+
+  if (wired.len() > 0) {
+    s = s + "$WACPATH programs are tried first, then the list above, then the built-in ones.\n";
+  } else {
+    s = s + "set $WACPATH to run programs, or hand this shell a table — see the README.\n";
+  }
   return Output.ok(s.toBytes());
+}
+
+/** Names in lines of at most 76 characters, continuation lines lined up under the first. */
+string wrapNames(string[] ns) {
+  string out = "";
+  string line = "";
+  for (i32 i = 0; i < ns.len(); i++) {
+    if (line.len() > 0 && line.len() + 1 + ns[i].len() > 66) {
+      out = out + line + "\n          ";
+      line = "";
+    }
+    line = line == "" ? ns[i] : line + " " + ns[i];
+  }
+  return out + line;
 }
 
 // ── Expansion ─────────────────────────────────────────────────────────────────

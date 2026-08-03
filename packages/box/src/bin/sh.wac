@@ -15,10 +15,11 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Shell } from "../../../sh/src/exec.wac";
 import { shellMain } from "../../../sh/src/entry.wac";
-import { boxRun } from "../shrun.wac";
+import { boxNames, boxRun } from "../shrun.wac";
 
 export i32 main(Core core, Cli cli) {
   Shell sh = Shell.create(core, cli);
   sh.external = boxRun;
+  sh.externalNames = boxNames;   // so `help` lists them
   return shellMain(core, cli, sh, 0);
 }

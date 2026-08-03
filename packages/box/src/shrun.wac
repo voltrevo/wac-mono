@@ -32,7 +32,7 @@
 import { Captured, Cli, Core } from "../../platform/src/platform.wac";
 import { Vec } from "../../std/src/vec.wac";
 import { Args, parseList } from "./lib/args.wac";
-import { UNKNOWN, dispatch } from "./box.wac";
+import { UNKNOWN, appletNames, dispatch } from "./box.wac";
 import { Output } from "../../sh/src/program.wac";
 
 /**
@@ -67,3 +67,11 @@ export Output boxRun(Core core, Cli cli, string cwd, Vec<string> argv, u8[] stdi
   if (code == UNKNOWN) { return Output.missing(); }
   return Output(got.out, got.err, code, true);
 }
+
+/**
+ * Every name `boxRun` answers to, for `Shell.externalNames`.
+ *
+ * The same list `box`'s own usage prints, so the shell's `help` and `box` with no arguments cannot
+ * disagree about what exists.
+ */
+export string[] boxNames() { return appletNames(); }

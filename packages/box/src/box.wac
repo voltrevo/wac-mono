@@ -180,13 +180,28 @@ export i32 dispatch(Core core, Cli cli, Args a, string applet) {
   return UNKNOWN;
 }
 
+/**
+ * Every name `dispatch` answers to, in one place.
+ *
+ * `usage` wraps this rather than spelling the names out again, and `packages/sh`'s `help` shows it
+ * when the applets have been wired into a shell — so a new applet cannot be missing from either.
+ * It was five hand-typed lines of `core.warn` before, which is exactly the shape that goes stale:
+ * the browser terminal advertised sixty programs and `help` listed twelve.
+ */
+export string[] appletNames() {
+  return string[](
+    "base32", "base64", "basename", "cat", "cp", "crc32", "cut", "date", "diff", "dirname",
+    "du", "echo", "false", "find", "fold", "get", "gets", "grep", "gunzip", "gzip", "head",
+    "hex", "httpd", "json", "ls", "mkdir", "mv", "nc", "nl", "paste", "rev", "rm", "rmdir",
+    "seq", "serve", "sha256sum", "sha512sum", "shuf", "sort", "split", "sponge", "stat",
+    "strings", "tac", "tail", "tar", "tee", "touch", "tr", "true", "uniq", "unzstd",
+    "urldecode", "urlencode", "uuid", "wc", "wget", "yes", "zstd"
+  );
+}
+
 i32 usage(Core core) {
   core.warn("usage: box <applet> [-flags] [args]");
-  core.warn("  base32 base64 basename cat cp crc32 cut date diff dirname du echo false");
-  core.warn("  find fold get gets grep gunzip gzip head hex httpd json ls mkdir mv nc nl");
-  core.warn("  paste rev rm rmdir seq serve sha256sum sha512sum shuf sort split sponge");
-  core.warn("  stat strings tac tail tar tee touch tr true uniq unzstd urldecode");
-  core.warn("  urlencode uuid wc wget yes zstd");
+  core.warn(wrapped(appletNames(), "  ", 74));
   core.warn("flags: grep -ivnc   sort -run   uniq -c   wc -lwc   head/tail/fold -N");
   core.warn("       cut -f<n> -d<c>   tr <set1> <set2>   mkdir -p   rm -rf   json -c");
   core.warn("net:   get <host> [path] [-<port>] [-i]   wget <host> <path> <out>\n"
@@ -194,4 +209,19 @@ i32 usage(Core core) {
             + "       gets <host> <path> <root.der> [-<port>]   (TLS 1.3)\n"
             + "       nc <host> <port>   nc -<port> -l");
   return 2;
+}
+
+/** Names in lines no wider than `width`, each indented with `lead`. */
+export string wrapped(string[] ns, string lead, i32 width) {
+  string out = "";
+  string line = lead;
+  for (i32 i = 0; i < ns.len(); i++) {
+    // The first name on a line always goes on it, however long: wrapping to nothing would loop.
+    if (line.len() > lead.len() && line.len() + 1 + ns[i].len() > width) {
+      out = out + line + "\n";
+      line = lead;
+    }
+    line = line == lead ? line + ns[i] : line + " " + ns[i];
+  }
+  return line == lead ? out : out + line;
 }
