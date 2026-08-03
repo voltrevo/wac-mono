@@ -685,7 +685,7 @@ void globInto(Shell sh, u8[] pattern, u8[] quoted, Vec<string> argv) {
   u8[] tail = sliceBytes(pattern, slash + 1, pattern.len());
   u8[] tailMask = sliceBytes(quoted, slash + 1, quoted.len());
 
-  string[]? names = sh.cli.readDir(dir);
+  string[]? names = sh.cli.readDir(dir).wait();
   if (names is null) { return; }
 
   Vec<string> hits = Vec.create();
