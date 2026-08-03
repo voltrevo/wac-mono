@@ -1,0 +1,304 @@
+// A circuit: the onion, the windows, and the streams on top.
+//
+// This was `host/circuit.ts`, and it is the layer whose move pays for the whole port. Not
+// because it was long, but because of what it dragged along: a `Hop` could not reach a
+// TypeScript driver, so `relay.wac` grew `hopSave`, `hopLoad`, `hopSend`, `hopRecv`,
+// `hopPeel`, `hopWrap`, `hopCheck` and `hopDigest` — a 290-byte serialisation of a struct,
+// written down and read back for every cell in both directions. `Sha1.saveState` and
+// `CtrStream.resume` exist for the same reason. None of it was protocol. It was a struct
+// crossing a boundary that did not need to be there, and it goes with the boundary.
+//
+// ## A state machine, not a socket
+//
+// Nothing here knows what a socket is. `send` returns the bytes to put on the wire and
+// `receive` takes a cell and says what it meant, the same discipline `packages/tls`'s client
+// and `packages/server` use — which is why `box gets` could drive TLS over a platform socket
+// without the tls package changing at all.
+//
+// ## The onion
+//
+// A cell for hop N is encrypted N times: with hop N's key first, then N-1's, out to hop 1's,
+// which is the only layer the first relay can remove. Each relay peels one and forwards what
+// it finds, so no relay sees more than its two neighbours.
+//
+// Receiving inverts it: peel with hop 1 and ask whether it is hop 1's cell; if not, peel with
+// hop 2 and ask again. The peel always happens — every hop's cipher advanced when it
+// forwarded the cell — while the digest advances only for the hop the cell came from. That
+// asymmetry is why peeling and recognising are separate steps.
+//
+// ## Flow control
+//
+// A sender may put 1000 cells on a circuit and 500 on any one stream before it must wait for
+// a RELAY_SENDME; the receiver sends one every 100 cells, or 50 per stream. Circuit-level
+// SENDMEs are authenticated: the body carries the running digest at the point the
+// acknowledged cell arrived, so a relay cannot invent credit — only a party that actually
+// received the cells knows that value. It is captured when the deliver window reaches a
+// multiple of the increment, which is one cell *before* the SENDME goes out.
+
+import { Vec } from "../../std/src/vec.wac";
+import {
+  Hop, encryptRelay, decryptRelay, relayRecognized, relayCommand, relayStreamId,
+  relayPayload, beginBody, extend2Body, extended2Reply, sendmeBodyV1,
+  relayBegin, relayData, relayEnd, relayConnected, relaySendme, relayBeginDir,
+  relayExtend2, relayExtended2,
+} from "./relay.wac";
+import { encodeFixed, cmdRelay, cmdRelayEarly, cmdDestroy, cellCommand, cellPayload } from "./cell.wac";
+
+/** tor-spec §7.3: the windows, and how often credit is returned. */
+const i32 CIRCUIT_WINDOW = 1000;
+const i32 CIRCUIT_INCREMENT = 100;
+const i32 STREAM_WINDOW = 500;
+const i32 STREAM_INCREMENT = 50;
+
+/** What a received cell turned out to be. */
+export i32 gotNothing() { return 0; }
+export i32 gotData() { return 1; }
+export i32 gotEnd() { return 2; }
+export i32 gotConnected() { return 3; }
+export i32 gotExtended() { return 4; }
+export i32 gotDestroyed() { return 5; }
+export i32 gotBroken() { return 6; }
+
+/**
+ * The outcome of feeding one cell in.
+ *
+ * `toSend` is whatever the circuit owes the far end as a result — a SENDME, usually — and
+ * the caller is expected to put it on the wire. Returning it rather than sending it is what
+ * keeps this a state machine.
+ */
+export struct Received {
+  i32 kind;
+  i32 streamId;
+  u8[] data;
+  u8[] toSend;
+}
+
+export struct Stream {
+  i32 id;
+  i32 packageWindow;
+  i32 deliverWindow;
+  bool ended;
+}
+
+export struct Circuit {
+  i32 circId;
+  Vec<Hop> hops;
+  i32 packageWindow;
+  i32 deliverWindow;
+  Vec<Stream> streams;
+  i32 nextStreamId;
+  /**
+   * The digest for the next circuit-level SENDME, captured when the deliver window hit a
+   * multiple of the increment. Empty when none is owed.
+   */
+  u8[] pendingSendmeDigest;
+
+  Circuit create(i32 circId, u8[] material) {
+    Vec<Hop> hops = Vec.create();
+    hops.push(Hop.create(material));
+    return Circuit(circId, hops, CIRCUIT_WINDOW, CIRCUIT_WINDOW, Vec.create(), 1, u8[0]());
+  }
+
+  /** How many relays the circuit runs through. */
+  i32 length(const this) { return this.hops.len(); }
+
+  /** Add a hop from the key material an EXTENDED2 produced. */
+  void addHop(this, u8[] material) { this.hops.push(Hop.create(material)); }
+
+  /**
+   * A relay cell for hop `target`, wrapped in the layers between us and it.
+   *
+   * `early` sends it as RELAY_EARLY, which EXTEND2 must use: the count of those a circuit
+   * may carry is capped, and that cap is what bounds how long a circuit can be made.
+   */
+  u8[] send(this, i32 command, i32 streamId, u8[] data, i32 target, bool early) {
+    u8[] payload = encryptRelay(this.hops.get(target), command, streamId, data);
+    // Then one layer per hop between us and the target, nearest last: hop 1's layer
+    // outermost, because hop 1 is the only relay that can remove it.
+    //
+    // The order is written for the spec and not for the arithmetic. Every layer is a CTR
+    // keystream and XOR commutes, so applying them the other way round produces byte-identical
+    // output — measured, not assumed, and no test can tell the two apart because there is
+    // nothing to tell apart. Keep the spec order anyway: it says what is meant, and it stops
+    // being equivalent the moment a layer is anything but a stream cipher.
+    for (i32 i = target - 1; i >= 0; i--) {
+      payload = this.hops.get(i).forwardCipher.apply(payload);
+    }
+    return encodeFixed(this.circId, early ? cmdRelayEarly() : cmdRelay(), payload);
+  }
+
+  /** The same, to the last hop, as an ordinary RELAY cell. */
+  u8[] sendToEnd(this, i32 command, i32 streamId, u8[] data) {
+    return this.send(command, streamId, data, this.hops.len() - 1, false);
+  }
+
+  /**
+   * Feed one cell in.
+   *
+   * A cell no hop recognises is fatal. Every hop's cipher has advanced by the time we know,
+   * so there is no state to roll back to and no way to resynchronise; tor's own client tears
+   * the circuit down here for the same reason.
+   */
+  Received receive(this, u8[] cell) {
+    i32 cmd = cellCommand(cell, 0);
+    if (cmd == cmdDestroy()) {
+      return Received(gotDestroyed(), 0, cellPayload(cell, 0), u8[0]());
+    }
+    if (cmd != cmdRelay()) { return Received(gotNothing(), 0, u8[0](), u8[0]()); }
+
+    u8[] payload = cellPayload(cell, 0);
+    i32 from = -1;
+    for (i32 i = 0; i < this.hops.len() && from < 0; i++) {
+      payload = decryptRelay(this.hops.get(i), payload);
+      if (relayRecognized(this.hops.get(i), payload)) { from = i; }
+    }
+    if (from < 0) { return Received(gotBroken(), 0, u8[0](), u8[0]()); }
+
+    i32 command = relayCommand(payload);
+    i32 streamId = relayStreamId(payload);
+    u8[] data = relayPayload(payload);
+
+    if (command == relaySendme()) {
+      // Credit, not content. The caller never sees it.
+      if (streamId == 0) { this.packageWindow += CIRCUIT_INCREMENT; }
+      else {
+        Stream s = this.stream(streamId);
+        s.packageWindow += STREAM_INCREMENT;
+      }
+      return Received(gotNothing(), streamId, u8[0](), u8[0]());
+    }
+
+    u8[] owed = u8[0]();
+    if (command == relayData()) {
+      this.deliverWindow -= 1;
+      if (this.deliverWindow < 0) {
+        return Received(gotBroken(), streamId, u8[0](), u8[0]());
+      }
+      // Record the digest exactly when the window reaches a multiple of the increment. This
+      // cell is the one the next SENDME will name, and the hash has to be read now: one more
+      // cell and it is a different value.
+      if (this.deliverWindow % CIRCUIT_INCREMENT == 0) {
+        this.pendingSendmeDigest = this.hops.get(from).backwardDigest.peek();
+      }
+      owed = this.creditOwed(streamId);
+    }
+
+    i32 kind = gotData();
+    if (command == relayEnd()) {
+      kind = gotEnd();
+      Stream ending = this.stream(streamId);
+      ending.ended = true;
+    } else if (command == relayConnected()) { kind = gotConnected(); }
+    else if (command == relayExtended2()) { kind = gotExtended(); }
+    else if (command != relayData()) { kind = gotNothing(); }
+
+    return Received(kind, streamId, data, owed);
+  }
+
+  /** SENDMEs we now owe, circuit first then stream, as cells ready for the wire. */
+  u8[] creditOwed(this, i32 streamId) {
+    u8[] out = u8[0]();
+    while (this.deliverWindow <= CIRCUIT_WINDOW - CIRCUIT_INCREMENT) {
+      // Version 1 needs the digest that proves we received the cells. It is recorded one
+      // cell earlier, so it should always be here; falling back to the unauthenticated form
+      // would be a silent downgrade, so refuse instead.
+      if (this.pendingSendmeDigest.len() == 0) { trap; }
+      out = join(out, this.sendToEnd(relaySendme(), 0, sendmeBodyV1(this.pendingSendmeDigest)));
+      this.pendingSendmeDigest = u8[0]();
+      this.deliverWindow += CIRCUIT_INCREMENT;
+    }
+    if (streamId != 0) {
+      Stream s = this.stream(streamId);
+      s.deliverWindow -= 1;
+      if (s.deliverWindow <= STREAM_WINDOW - STREAM_INCREMENT) {
+        // Stream SENDMEs carry nothing: a stream's credit is bounded by its circuit's, so
+        // there is nothing there worth forging.
+        out = join(out, this.sendToEnd(relaySendme(), streamId, u8[0]()));
+        s.deliverWindow += STREAM_INCREMENT;
+      }
+    }
+    return out;
+  }
+
+  Stream stream(this, i32 id) {
+    for (i32 i = 0; i < this.streams.len(); i++) {
+      if (this.streams.get(i).id == id) { return this.streams.get(i); }
+    }
+    Stream s = Stream(id, STREAM_WINDOW, STREAM_WINDOW, false);
+    this.streams.push(s);
+    return s;
+  }
+
+  /** Whether a data cell may be sent now, or the windows say wait for credit. */
+  bool maySend(const this, i32 streamId) {
+    if (this.packageWindow <= 0) { return false; }
+    for (i32 i = 0; i < this.streams.len(); i++) {
+      if (this.streams.get(i).id == streamId) {
+        return this.streams.get(i).packageWindow > 0;
+      }
+    }
+    return true;
+  }
+
+  /** Spend one cell of credit. The caller must have asked `maySend` first. */
+  void spend(this, i32 streamId) {
+    this.packageWindow -= 1;
+    Stream s = this.stream(streamId);
+    s.packageWindow -= 1;
+  }
+
+  /** Open a stream to `hostPort` through the exit; returns the cell and the stream id. */
+  i32 beginStream(this) {
+    i32 id = this.nextStreamId;
+    this.nextStreamId += 1;
+    return id;
+  }
+
+  u8[] beginCell(this, i32 streamId, string hostPort) {
+    return this.sendToEnd(relayBegin(), streamId, beginBody(hostPort));
+  }
+
+  /**
+   * A stream to this relay's own directory cache.
+   *
+   * No address and no exit policy involved, which makes it the one stream a one-hop circuit
+   * can always open — and so the honest end-to-end test of everything below it.
+   */
+  u8[] beginDirCell(this, i32 streamId) {
+    return this.sendToEnd(relayBeginDir(), streamId, u8[0]());
+  }
+
+  /** RELAY_DATA, already split to what fits beside the eleven-byte relay header. */
+  u8[] dataCell(this, i32 streamId, u8[] chunk) {
+    return this.sendToEnd(relayData(), streamId, chunk);
+  }
+
+  u8[] endCell(this, i32 streamId, i32 reason) {
+    return this.sendToEnd(relayEnd(), streamId, u8[](reason));
+  }
+
+  /**
+   * Ask the last hop to extend to `relay`, as a RELAY_EARLY cell.
+   *
+   * We authenticate the new relay ourselves rather than trusting the hop that connected us:
+   * the AUTH check in `ntorClientFinish` is against the onion key the consensus named, so a
+   * hop that dialled somewhere else cannot produce a reply that verifies.
+   */
+  u8[] extendCell(this, u8[] ipv4, i32 port, u8[] identity, u8[] handshake) {
+    // Stream id 0: EXTEND2 addresses the hop, not a stream on it.
+    return this.send(relayExtend2(), 0, extend2Body(ipv4, port, identity, handshake),
+                     this.hops.len() - 1, true);
+  }
+}
+
+u8[] join(u8[] a, u8[] b) {
+  if (a.len() == 0) { return b; }
+  if (b.len() == 0) { return a; }
+  u8[] out = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
+  return out;
+}
+
+/** The ntor reply out of an EXTENDED2 body. */
+export u8[] extendedReply(u8[] data) { return extended2Reply(data); }

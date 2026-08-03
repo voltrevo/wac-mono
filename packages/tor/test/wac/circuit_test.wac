@@ -1,0 +1,180 @@
+// The circuit state machine: onion layers, windows, streams.
+//
+// The relay side is built from the same key material with the directions swapped, which is
+// a real oracle for the Df/Db/Kf/Kb split and — as `relay_test.wac` says at length — no
+// oracle at all for the cipher and hash both ends share. What is new here is that whole
+// cells go through: `send` produces wire bytes and `receive` consumes them, so the layering
+// and the window arithmetic are exercised rather than described.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { Circuit, Received, gotData, gotEnd, gotConnected, gotBroken, gotDestroyed,
+         gotNothing } from "../../src/circuit.wac";
+import { Hop, encryptRelay, decryptRelay, relayRecognized, relayPayload, relayCommand,
+         relayData, relayEnd, relayConnected, relaySendme } from "../../src/relay.wac";
+import { encodeFixed, cmdRelay, cmdDestroy, cellPayload } from "../../src/cell.wac";
+
+u8[] material(i32 seed) {
+  u8[] m = u8[72]();
+  for (i32 i = 0; i < 72; i++) { m[i] = (i * 61 + seed * 17) & 0xFF; }
+  return m;
+}
+
+/** The same material as the other end of the circuit sees it. */
+u8[] swapped(u8[] m) {
+  u8[] out = u8[72]();
+  for (i32 i = 0; i < 20; i++) { out[i] = m[20 + i]; }
+  for (i32 i = 0; i < 20; i++) { out[20 + i] = m[i]; }
+  for (i32 i = 0; i < 16; i++) { out[40 + i] = m[56 + i]; }
+  for (i32 i = 0; i < 16; i++) { out[56 + i] = m[40 + i]; }
+  return out;
+}
+
+u8[] fill(i32 n, i32 seed) {
+  u8[] o = u8[n]();
+  for (i32 i = 0; i < n; i++) { o[i] = (i * 37 + seed) & 0xFF; }
+  return o;
+}
+
+/** A cell the relay sends us. */
+u8[] fromRelay(Hop relay, i32 circId, i32 command, i32 streamId, u8[] data) {
+  return encodeFixed(circId, cmdRelay(), encryptRelay(relay, command, streamId, data));
+}
+
+export string test_a_stream_carries_data_both_ways() {
+  T t = T.create();
+  u8[] m = material(1);
+  Circuit c = Circuit.create(7, m);
+  Hop relay = Hop.create(swapped(m));
+
+  i32 sid = c.beginStream();
+  t.eqI32(sid, 1, "stream ids start at one");
+  u8[] begin = c.beginCell(sid, "example.com:443");
+  u8[] body = decryptRelay(relay, cellPayload(begin, 0));
+  t.isTrue(relayRecognized(relay, body), "the relay recognises the BEGIN");
+  t.eqI32(relayStreamOf(body), sid, "on our stream");
+
+  Received r = c.receive(fromRelay(relay, 7, relayConnected(), sid, u8[0]()));
+  t.eqI32(r.kind, gotConnected(), "and answers CONNECTED");
+
+  u8[] payload = fill(400, 3);
+  Received d = c.receive(fromRelay(relay, 7, relayData(), sid, payload));
+  t.eqI32(d.kind, gotData(), "then data");
+  t.eqBytes(d.data, payload, "which arrives intact");
+  t.eqI32(d.streamId, sid, "on the right stream");
+
+  Received e = c.receive(fromRelay(relay, 7, relayEnd(), sid, u8[](6)));
+  t.eqI32(e.kind, gotEnd(), "and the far end closes it");
+  return t.report();
+}
+
+export string test_three_layers_go_on_and_come_off() {
+  // A cell for hop 3 is encrypted three times, hop 1's layer outermost. Getting the order
+  // backwards produces something hop 1 cannot read at all.
+  T t = T.create();
+  u8[] m1 = material(21);
+  u8[] m2 = material(22);
+  u8[] m3 = material(23);
+  Circuit c = Circuit.create(9, m1);
+  c.addHop(m2);
+  c.addHop(m3);
+  t.eqI32(c.length(), 3, "three hops");
+
+  Hop r1 = Hop.create(swapped(m1));
+  Hop r2 = Hop.create(swapped(m2));
+  Hop r3 = Hop.create(swapped(m3));
+
+  for (i32 i = 0; i < 5; i++) {
+    u8[] data = fill(120 + i, i);
+    u8[] wire = c.sendToEnd(relayData(), 4, data);
+    u8[] atR1 = decryptRelay(r1, cellPayload(wire, 0));
+    t.isTrue(!relayRecognized(r1, atR1), "hop 1 does not recognise a cell for hop 3");
+    u8[] atR2 = decryptRelay(r2, atR1);
+    t.isTrue(!relayRecognized(r2, atR2), "nor does hop 2");
+    u8[] atR3 = decryptRelay(r3, atR2);
+    t.isTrue(relayRecognized(r3, atR3), "hop 3 does, on round " + itoa64(i as i64));
+    t.eqBytes(relayPayload(atR3), data, "and reads the data");
+  }
+  return t.report();
+}
+
+export string test_a_cell_no_hop_recognises_kills_the_circuit() {
+  // Every hop's cipher has advanced by the time we know, so there is nothing to roll back
+  // to. Reporting it as dead is the only honest answer.
+  T t = T.create();
+  Circuit c = Circuit.create(3, material(5));
+  u8[] junk = u8[509]();
+  for (i32 i = 0; i < 509; i++) { junk[i] = (i * 11 + 5) & 0xFF; }
+  Received r = c.receive(encodeFixed(3, cmdRelay(), junk));
+  t.eqI32(r.kind, gotBroken(), "an unrecognised cell is fatal, not skippable");
+  return t.report();
+}
+
+export string test_a_destroy_is_reported_rather_than_decrypted() {
+  T t = T.create();
+  Circuit c = Circuit.create(3, material(6));
+  Received r = c.receive(encodeFixed(3, cmdDestroy(), u8[](1)));
+  t.eqI32(r.kind, gotDestroyed(), "DESTROY is not a relay cell");
+  t.eqI32(r.data[0], 1, "and carries its reason");
+  return t.report();
+}
+
+export string test_a_sendme_arrives_after_a_hundred_data_cells() {
+  // The receiver owes credit every hundred cells, and the SENDME must be authenticated with
+  // the running digest as it stood one cell earlier.
+  T t = T.create();
+  u8[] m = material(11);
+  Circuit c = Circuit.create(4, m);
+  Hop relay = Hop.create(swapped(m));
+  i32 sid = c.beginStream();
+
+  i32 circuitSendmes = 0;
+  i32 streamSendmes = 0;
+  // What the relay will expect the SENDME to name: its own forward digest as it stood after
+  // sending the hundredth cell. Recording it here is what makes this a check rather than a
+  // count — tor validates this field and tears the circuit down when it is wrong, which was
+  // confirmed against a real relay before this test existed.
+  u8[] expected = u8[0]();
+  for (i32 i = 0; i < 120; i++) {
+    Received r = c.receive(fromRelay(relay, 4, relayData(), sid, fill(10, i)));
+    t.eqI32(r.kind, gotData(), "cell " + itoa64(i as i64) + " is data");
+    if (i == 99) { expected = relay.forwardDigest.peek(); }
+
+    // Anything owed comes back as whole cells; peel them with the relay's key.
+    i32 at = 0;
+    while (at < r.toSend.len()) {
+      u8[] body = decryptRelay(relay, cellPayload(r.toSend, at));
+      t.isTrue(relayRecognized(relay, body), "the SENDME verifies at the relay");
+      t.eqI32(relayCommand(body), relaySendme(), "and is a SENDME");
+      if (relayStreamOf(body) == 0) {
+        circuitSendmes++;
+        u8[] payload = relayPayload(body);
+        t.eqI32(payload.len(), 23, "a version 1 body");
+        t.eqI32(payload[0], 1, "version 1");
+        u8[] carried = u8[20]();
+        for (i32 j = 0; j < 20; j++) { carried[j] = payload[3 + j]; }
+        t.eqBytes(carried, expected,
+                  "and it names the digest as of the cell that triggered it, not the next");
+      } else { streamSendmes++; }
+      at += 514;
+    }
+  }
+  t.eqI32(circuitSendmes, 1, "one circuit SENDME in a hundred and twenty cells");
+  t.eqI32(streamSendmes, 2, "and two stream SENDMEs, at fifty apiece");
+  return t.report();
+}
+
+export string test_the_windows_stop_a_sender_that_gets_no_credit() {
+  T t = T.create();
+  Circuit c = Circuit.create(5, material(12));
+  i32 sid = c.beginStream();
+  t.isTrue(c.maySend(sid), "there is credit to begin with");
+  // A stream's window is the smaller, so it runs out first.
+  for (i32 i = 0; i < 500; i++) { c.spend(sid); }
+  t.isTrue(!c.maySend(sid), "and it runs out after five hundred cells on the stream");
+  i32 other = c.beginStream();
+  t.isTrue(c.maySend(other), "a fresh stream has its own window");
+  return t.report();
+}
+
+i32 relayStreamOf(u8[] body) { return (body[3] << 8) | body[4]; }
