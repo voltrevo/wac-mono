@@ -324,6 +324,85 @@ esac`,
   `echo before; exit 4; echo after`,
   `unset x; echo [$x]`,
   `x=1; unset x; echo [$x]`,
+
+  // ── Backquotes ──────────────────────────────────────────────────────────────
+  //
+  // The same thing as `$(…)` once it is a part, so these are about the reading: where it ends,
+  // and the backslash rules inside, which are its own and not the ones outside it.
+  "echo `echo hi`",
+  "echo a`echo b`c",
+  'echo "`echo hi`"',
+  "echo '`echo hi`'",
+  "x=`echo v`; echo $x",
+  "echo `seq 1 3`",
+  'echo "`seq 1 3`"',
+  "echo `echo a; echo b`",
+  "echo `echo one two` | wc -w",
+  "echo ``",
+  "echo `",
+  "echo `false`; echo $?",
+  "if `true`; then echo y; fi",
+  "echo $(echo `echo inner`)",
+  "echo `echo $(echo inner)`",
+  "echo `echo \\`nested\\``",
+  'echo "\\`not a sub\\`"',
+  "echo `echo \\$x`",
+  "cat <<EOF\n`echo from-heredoc`\nEOF",
+
+  // ── The status of a command with no command name ────────────────────────────
+  //
+  // POSIX: it is the status of the *last command substitution*, or zero if there was none. So
+  // `x=$(false)` reports 1 where a bare `x=1` reports 0, and the two are a character apart.
+  "x=$(false); echo $?",
+  "x=$(exit 3); echo $?",
+  "x=$(true); echo $?",
+  "x=1; echo $?",
+  "false; x=1; echo $?",
+  "$(exit 3); echo $?",
+  "a=$(true) b=$(false); echo $?",
+  "a=$(false) b=$(true); echo $?",
+  "echo $(exit 3)$?",
+  "echo `exit 3`$?",
+  "x=$(echo v; exit 3); echo $x $?",
+  "echo before; x=$(exit 5); echo after $?",
+
+  // ── Here-documents ──────────────────────────────────────────────────────────
+  //
+  // The only construct where a token's meaning depends on the *following* lines, so most of
+  // these are about where the body starts and stops rather than about what it contains.
+  //
+  // Quoting the delimiter — in any of its three spellings — turns expansion off for the whole
+  // body. That is the one thing here that is easy to get subtly wrong, so all three appear.
+  `cat <<EOF\nhello\nEOF`,
+  `cat <<EOF\none\ntwo\nEOF`,
+  `cat <<EOF\nEOF`,
+  `x=world; cat <<EOF\nhello $x\nEOF`,
+  `x=world; cat <<'EOF'\nhello $x\nEOF`,
+  `x=world; cat <<"EOF"\nhello $x\nEOF`,
+  `x=world; cat <<\\EOF\nhello $x\nEOF`,
+  `x=world; cat <<E"O"F\nhello $x\nEOF`,
+  `cat <<EOF\n$(echo sub) and $((2 + 3))\nEOF`,
+  `x=hi; cat <<EOF\n\\$x and "q"\nEOF`,
+  // The delimiter is a whole line or it is body text.
+  `cat <<EOF\nEOFX is not the end\nEOF`,
+  `cat <<EOF\nxEOF is not the end\nEOF`,
+  // `<<-` strips leading tabs from the body *and* from the closing delimiter, spaces never.
+  `cat <<-EOF\n\ttabbed\n\tEOF`,
+  `cat <<-EOF\n\t\tdouble\nnone\n\tEOF`,
+  // Where it sits relative to everything else on the line.
+  `cat <<EOF | rev\nabc\nEOF`,
+  `cat <<EOF > /dev/null; echo done\nignored\nEOF`,
+  `wc -l <<EOF\na\nb\nc\nEOF`,
+  `echo before; cat <<EOF\nbody\nEOF\necho after`,
+  `cat <<A <<B\nfirst\nA\nsecond\nB`,
+  `cat <<A\nfirst\nA\ncat <<B\nsecond\nB`,
+  `if true; then cat <<EOF\ninside\nEOF\nfi`,
+  `for i in 1 2; do cat <<EOF\niter $i\nEOF\ndone`,
+  `f() { cat <<EOF\nfrom a function\nEOF\n}; f; f`,
+  `v=$(cat <<EOF\ncaptured\nEOF\n); echo "[$v]"`,
+  // Bash warns on stderr about an unterminated body but still runs the command, exit 0.
+  `cat <<EOF`,
+  `cat <<EOF\nno terminator`,
 ];
 
 /**

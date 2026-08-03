@@ -266,6 +266,39 @@ const SCRIPTS: string[] = [
   "( )", "(", "(echo a", "()", "(;)", "( ; echo a )",
   "echo $( (echo n) )", "((echo a))",
 
+  // ── Backquotes ──────────────────────────────────────────────────────────────
+  "echo `echo hi`", "echo a`echo b`c", 'echo "`echo hi`"', "echo \'`echo hi`\'",
+  "x=`echo v`; echo $x", "echo `seq 1 3`", 'echo "`seq 1 3`"', "echo ``", 'echo ""``',
+  "echo `", 'echo "`"', "echo `echo \\`in\\``", "echo `echo \\$x`", "echo `echo \\\\`",
+  "echo `echo \\q`", "cat <<EOF\n`echo hd`\nEOF", "cat <<EOF\n`unterminated\nEOF",
+  // Literal text before the backquote, which is a different flush from starting a part with it.
+  'echo "a`echo b`"', "cat <<EOF\nx `echo y`\nEOF",
+  "x=$(false); echo $?", "x=$(exit 3); echo $?", "x=1; echo $?", "$(exit 3); echo $?",
+  "a=$(false) b=$(true); echo $?",
+
+  // ── Here-documents ──────────────────────────────────────────────────────────
+  //
+  // Weighted towards the malformed ones. The well-formed shapes are covered by the differential
+  // suite, which can check them against bash; these are the ones bash and we agree to reject or
+  // where there is nothing to compare, and they are what reaches the lexer's error paths.
+  "cat <<EOF\nhello\nEOF", "cat <<EOF\na\nb\nEOF", "cat <<EOF\nEOF",
+  "x=1; cat <<EOF\nv=$x\nEOF", "x=1; cat <<'EOF'\nv=$x\nEOF", "x=1; cat <<\"EOF\"\nv=$x\nEOF",
+  "x=1; cat <<\\EOF\nv=$x\nEOF", "x=1; cat <<E'O'F\nv=$x\nEOF",
+  "cat <<EOF\n$(echo s) $((1+1)) ${x-d}\nEOF",
+  "cat <<EOF\n\\$x \\\\ \\n \\\"\nEOF",
+  "cat <<-EOF\n\ttab\n\tEOF", "cat <<-EOF\n\t\ta\n  spaces\n\tEOF", "cat <<-EOF\nEOF",
+  "cat <<EOF | rev\nabc\nEOF", "cat <<EOF > out.txt\nx\nEOF", "wc -l <<EOF\na\nb\nEOF",
+  "cat <<A <<B\n1\nA\n2\nB", "cat 0<<EOF\nfd\nEOF", "cat 3<<EOF\nodd fd\nEOF",
+  "if true; then cat <<EOF\nin\nEOF\nfi", "for i in 1 2; do cat <<EOF\n$i\nEOF\ndone",
+  "f() { cat <<EOF\nfn\nEOF\n}; f", "v=$(cat <<EOF\nc\nEOF\n); echo $v",
+  // Nothing closes these, or nothing opens them properly.
+  "cat <<EOF", "cat <<EOF\nunterminated", "cat <<", "cat <<\n", "cat << ", "cat <<;",
+  "cat <<-", "cat <<EOF\nEOFX\nxEOF", "cat <<'EOF'\nno end",
+  "<<EOF\nno command\nEOF", "cat <<EOF EOF\nboth\nEOF", "cat 3<<", "cat <<''\nempty delim",
+  // A body is lexed as if double-quoted, so it has the same malformed-expansion cases a "…" has.
+  "cat <<EOF\na $ b\nEOF", "cat <<EOF\n${}\nEOF", "cat <<EOF\n${unclosed\nEOF",
+  "cat <<EOF\ntrailing $\nEOF",
+
   // A loop that runs past the bound, so the guard that stops it is reached.
   "while true; do :; done",
 ];
