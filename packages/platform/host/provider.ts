@@ -346,7 +346,9 @@ export function cliOf(
     /*= closeFeed */
     (handle: number) => { hostCall(b, OP.CLOSE_FEED, i32le(handle)); },
     /*= exitCode */
-    (handle: number) => T.i32(submit(b, OP.EXIT_CODE, i32le(handle))));
+    (handle: number) => T.i32(submit(b, OP.EXIT_CODE, i32le(handle))),
+    /*= cwd */
+    () => T.text(submit(b, OP.CWD, EMPTY)));
 }
 
 /**

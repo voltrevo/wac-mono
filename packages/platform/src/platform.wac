@@ -601,6 +601,20 @@ export struct Cli {
 
   /** Wait for a spawned worker to finish. Negative if it failed to run at all. */
   fn[Pending<i32>(i32)] exitCode;
+  /**
+   * Where relative paths are resolved from, as the host sees it.
+   *
+   * A *read*, and nothing more: there is no `chdir`, because a mutable working directory is
+   * ambient state — it changes what every relative path in the program means, from anywhere, and
+   * that is the shape this world exists to avoid. A program that wants to move around keeps its
+   * own idea of where it is and passes whole paths, which is what `packages/sh` does.
+   *
+   * It is here because a program cannot otherwise answer "where am I", and the first thing
+   * anybody types into a new shell is `pwd`. Under Deno and Node it is the process's directory;
+   * in a browser it is `/`, the root of the Origin Private File System, because that is the
+   * honest answer rather than a fiction.
+   */
+  fn[Pending<string>()] cwd;
 
 
   Cli of(
@@ -627,12 +641,13 @@ export struct Cli {
     fn[void(i32)] closeSocket,
     fn[Pending<Child>(string, string[], i32)] spawn,
     fn[void(i32)] closeFeed,
-    fn[Pending<i32>(i32)] exitCode
+    fn[Pending<i32>(i32)] exitCode,
+    fn[Pending<string>()] cwd
   ) {
     return Cli(
       argCount, arg, env, readStdin, write, readFile, writeFile, stat, readDir,
       mkdir, remove, rename, openInput, readChunk, openOutput,
-      connect, listen, accept, recv, send, closeSocket, spawn, closeFeed, exitCode
+      connect, listen, accept, recv, send, closeSocket, spawn, closeFeed, exitCode, cwd
     );
   }
 }

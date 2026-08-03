@@ -13,11 +13,10 @@
 // exited immediately, because a page's standard input is empty and a shell with no input has
 // nothing to do. All that was missing was a keyboard.
 //
-// It lives in `box` rather than in `sh` because `sh` belongs to someone else, and because the
-// commands it runs are box's: `sh`'s own table of built-ins is small, and `$WACPATH` finds the
-// rest as spawned programs — which a page cannot do, since `spawn` is Deno-only. So what runs
-// here is what `sh` implements itself. That is a real limit and it is worth seeing plainly
-// rather than discovering later.
+// What runs here is what `sh` implements itself: its own table of built-ins, which now includes
+// `cd`, `pwd` and `ls`. `$WACPATH` finds anything else as a spawned program, and a page cannot
+// spawn — `spawn` is Deno-only — so on this page that half is missing. It is a real limit and
+// worth seeing plainly rather than discovering later.
 //
 // ## Why the terminal is built the way it is
 //
@@ -43,8 +42,8 @@ const string BANNER =
   "  echo hello | tr a-z A-Z          for i in 1 2 3; do echo $i; done\n" +
   "  echo hi > f; cat f               x=world; echo \"hey $x\"\n" +
   "\n" +
-  "Up and Down walk the history. `clear` empties the screen. What `sh` does not implement\n" +
-  "itself is not here: `ls` needs a spawned program, and a page cannot spawn.\n" +
+  "Up and Down walk the history. `clear` empties the screen. `cd`, `pwd` and `ls` work; the\n" +
+  "filesystem starts empty at / and is yours.\n" +
   "\n";
 
 export i32 page(Core core, Cli cli, Page page) {

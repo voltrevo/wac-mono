@@ -198,11 +198,21 @@ Pending<i32> fakeExitCode(i32 handle) {
  */
 i32 fakeWaitAny(i32[] ids, i32 deadlineMillis) { return ids.len() > 0 ? ids[0] : -1; }
 
+/**
+ * The shell asks once, at startup, where relative paths land.
+ *
+ * A root, because a fake filesystem has no better answer and because it makes every path the
+ * probe resolves absolute and predictable — `resolvePath("/", "f")` is `/f`.
+ */
+Pending<string> fakeCwd() { return Pending.of(0, resolveRoot, alwaysSettled, ignoreDrop); }
+string resolveRoot(i32 id) { return "/"; }
+
 Cli fakeCli() {
   return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeReadFile, fakeWriteFile,
                 fakeStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
                 fakeReadChunk, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
-                fakeSend, fakeCloseSocket, fakeSpawn, fakeCloseFeed, fakeExitCode);
+                fakeSend, fakeCloseSocket, fakeSpawn, fakeCloseFeed, fakeExitCode,
+                fakeCwd);
 }
 
 // ── What the coverage driver calls ────────────────────────────────────────────

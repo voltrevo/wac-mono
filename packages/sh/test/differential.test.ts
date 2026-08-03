@@ -645,9 +645,8 @@ esac`,
 /**
  * A directory to glob against, made once and used by the pattern cases below.
  *
- * Absolute paths, because this shell has no working directory of its own — there is no `cd` and
- * no capability to ask where it is — so a relative pattern would mean different things to the two
- * shells and the comparison would prove nothing.
+ * Absolute paths here, so a pattern means the same thing to both shells wherever the suite is run
+ * from. Relative ones are covered by the `cd` cases below, which move both shells first.
  */
 const globDir = await Deno.makeTempDir();
 for (const name of ["a.txt", "b.txt", "c.log", ".hidden"]) {
@@ -666,6 +665,70 @@ CASES.push(`echo "${globDir}/*.txt"`);
 CASES.push(`echo '${globDir}/*.txt'`);
 CASES.push(`echo ${globDir}/"*".txt`);
 CASES.push(`x="${globDir}/*.txt"; echo "$x"`);
+
+/**
+ * `cd`, `pwd` and `ls`.
+ *
+ * The three things everybody types into a new shell, and the ones most able to be subtly wrong:
+ * a `cd` that moves the prompt but not the next `cat` is worse than no `cd`. Every case moves
+ * first and then does something that has to notice — read a file, glob, redirect, list.
+ *
+ * bash resolves these against the process's directory and this shell against its own idea of one,
+ * which is exactly the thing under test: if the two disagree about where "here" is, the output
+ * differs and the case fails.
+ */
+for (const script of [
+  `cd ${globDir}; pwd`,
+  `cd ${globDir}; cd sub; pwd`,
+  `cd ${globDir}/sub; cd ..; pwd`,
+  `cd ${globDir}; cd ./sub/../sub; pwd`,
+  `cd /; pwd`,
+  `cd /; cd ..; pwd`,                                  // `..` above the root stays at the root
+  `cd ${globDir}; ls`,
+  `cd ${globDir}; ls sub`,
+  `cd ${globDir}; ls -a | sort`,                        // the dotfile shows only with -a
+  `cd ${globDir}; ls nosuchthing; echo status=$?`,
+  `cd ${globDir}; cat sub/x.txt; echo read=$?`,         // a relative read after moving
+  `cd ${globDir}/sub; cat ../a.txt; echo read=$?`,      // ...and one through `..`
+  `cd ${globDir}; echo ${"${globDir}"}/*.txt | tr " " "\n" | wc -l`,
+  `cd ${globDir}; echo *.txt`,                          // a *relative* glob, resolved by cwd
+  `cd ${globDir}/sub; echo *.txt`,
+  `cd nosuchdir; echo status=$?`,                       // a failed cd changes nothing
+  `cd ${globDir}; cd nosuchdir; pwd`,
+  `cd ${globDir}; OLDPWD=; cd sub; cd - >/dev/null; pwd`,
+]) {
+  CASES.push(script);
+}
+
+/**
+ * `mkdir` and `rm`.
+ *
+ * They are here because `cd` needs somewhere to go: in a browser the filesystem starts empty, so
+ * a shell with `cd` and no `mkdir` looks broken when it is merely alone. Each case works in a
+ * directory of its own, since these ones write.
+ *
+ * Only stdout and the exit status are compared, which matters here: bash's `mkdir` is `/bin/mkdir`
+ * and reports its refusals on stderr, and this shell collects stderr and emits it at the end — so
+ * the messages appear in a different order and neither is wrong.
+ */
+for (const [i, script] of [
+  `mkdir one; ls`,
+  `mkdir -p one/two/three; ls one/two`,
+  `mkdir one; mkdir one; echo status=$?`,
+  `mkdir -p one; mkdir -p one; echo status=$?`,
+  `mkdir one; echo hi > one/f; cat one/f`,
+  `mkdir one; cd one; pwd`,
+  `mkdir one; echo x > one/f; rm -r one; ls; echo status=$?`,
+  `rm nothing; echo status=$?`,
+  `rm -f nothing; echo status=$?`,
+  `mkdir one; rm one; echo status=$?`,
+].entries()) {
+  // A directory per case, made by the harness rather than the script, so one failure cannot
+  // leave a mess that changes what the next case sees.
+  const dir = `${globDir}/w${i}`;
+  Deno.mkdirSync(dir);
+  CASES.push(`cd ${dir}; ${script}`);
+}
 
 async function bash(script: string) {
   const r = await new Deno.Command("bash", {

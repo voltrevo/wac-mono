@@ -160,12 +160,27 @@ programs are handed whatever is left but are *not* charged for it, because nothi
 which of them read their input — so `{ cat; cat; }` gives both copies of the whole thing where
 bash gives the second nothing.
 
-**No `cd`, and therefore no `pwd`.** Not an oversight and not a small job: nothing in
-`packages/platform` has a working directory — there is no `chdir` and no `getcwd`, and none is on
-its roadmap — so every path a program opens is resolved by the host against wherever the process
-was started. A shell-side `cd` would mean maintaining `$PWD` here and resolving every relative
-path against it before handing it over, in the redirections *and* in `program.wac`'s file
-openers. Worth doing, but it is a change to the seam rather than a builtin.
+**`cd`, `pwd` and `ls` exist, and the seam moved to make room.** This section used to say they
+did not, and that a shell-side `cd` "would mean maintaining `$PWD` here and resolving every
+relative path against it before handing it over, in the redirections *and* in `program.wac`'s file
+openers… a change to the seam rather than a builtin". That was exactly right, and that is what it
+took (agent-a).
+
+`packages/platform` gained one capability, `cwd`, which *reads* where the host resolves relative
+paths — and deliberately no `chdir`, because a mutable working directory is ambient state that
+changes what every relative path in a program means from anywhere. So the shell asks once at
+startup, keeps its own `cwd`, and `Shell.resolve` turns every path into a whole one before it
+crosses the boundary. There were nine such places; all nine are routed, because a `cd` that works
+for `cat` and not for `>` is worse than no `cd`. The path helpers live in `path.wac` rather than
+here, since `program.wac` needs them too and `exec.wac` already imports it.
+
+Eighteen scripts in the differential suite cover it, and each one moves first and then does
+something that has to notice — a relative read, a relative glob, a redirection, a listing, `..`
+above the root, a failed `cd` leaving the shell where it was.
+
+`ls` is one per line and sorted, which is what any `ls` does when its output is not a terminal;
+`-a` is the only flag, and it synthesises `.` and `..` as a real `ls` does, since `readDir` does
+not report them.
 
 **No `$0`.** `cli.arg(0)` is the first *argument*, not the program name, so there is nothing
 truthful to put there.

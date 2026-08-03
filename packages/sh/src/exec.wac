@@ -19,11 +19,12 @@ import { Map } from "../../std/src/map.wac";
 import { Option } from "../../std/src/option.wac";
 import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
-import { Child, Cli, Core, FileResult, GRANT_NONE } from "../../platform/src/platform.wac";
+import { Child, Cli, Core, FileResult, GRANT_NONE, Stat } from "../../platform/src/platform.wac";
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
          RedirKind, Script, Simple, Word, parse } from "./parse.wac";
 import { Output, itoa, names, run } from "./program.wac";
+import { resolvePath } from "./path.wac";
 import { Arith, evaluate } from "./arith.wac";
 
 export struct Shell {
@@ -78,12 +79,35 @@ export struct Shell {
    */
   u8[] stdinBytes;
   i32 stdinPos;
+  /**
+   * Where this shell believes it is.
+   *
+   * The shell's own, not the host's: `packages/platform` has a `cwd` to *read* and deliberately
+   * no `chdir`, because a mutable working directory is ambient state that changes what every
+   * relative path in the program means. So `cd` moves this string and `resolve` below turns
+   * every path the shell touches into a whole one before it crosses the boundary.
+   *
+   * Always absolute and never with a trailing slash, except the root, which is exactly "/".
+   */
+  string cwd;
 
   Shell create(Core core, Cli cli) {
+    // Asked once, at the start: the host knows where relative paths land and the shell cannot
+    // guess. A browser answers "/" — the root of its Origin Private File System — which is the
+    // true answer there rather than a stand-in.
     return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
                  false, Buf.create(), Vec.create(), Map.create(hashString, stringEq),
-                 Vec.create(), Vec.create(), false, u8[0](), 0);
+                 Vec.create(), Vec.create(), false, u8[0](), 0, cli.cwd().wait());
   }
+
+  /**
+   * A path as the host should see it: absolute, with `.` and `..` collapsed.
+   *
+   * Every path the shell hands to a capability goes through here — there are nine such places and
+   * they are all routed, because a `cd` that works for `cat` and not for `>` is worse than no
+   * `cd` at all. An already-absolute path is returned normalised and otherwise untouched.
+   */
+  string resolve(const this, string path) { return resolvePath(this.cwd, path); }
 
   /** What standard input still has to offer. */
   u8[] restOfStdin(const this) {
@@ -270,7 +294,7 @@ u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
     Redir r = cmd.redirs.get(i);
     match (r.kind) {
       case In: {
-        string path = joinWord(sh, r.target);
+        string path = sh.resolve(joinWord(sh, r.target));
         FileResult f = sh.cli.readFile(path).wait();
         if (!f.ok) {
           sh.errOut.pushAll(("sh: " + path + ": " + f.error + "\n").toBytes());
@@ -461,7 +485,7 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
     Redir r = cmd.redirs.get(i);
     match (r.kind) {
       case In: {
-        string path = joinWord(sh, r.target);
+        string path = sh.resolve(joinWord(sh, r.target));
         FileResult f = sh.cli.readFile(path).wait();
         if (!f.ok) {
           sh.errOut.pushAll(("sh: " + path + ": " + f.error + "\n").toBytes());
@@ -536,7 +560,7 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
 
 /** Write a redirection's target. False when it failed, which is already reported. */
 bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
-  string path = joinWord(sh, r.target);
+  string path = sh.resolve(joinWord(sh, r.target));
   // Only standard output is captured, so `2>` has nothing of its own to write. Saying so beats
   // writing the wrong stream to the file.
   if (r.fd != 1) {
@@ -700,6 +724,151 @@ Output setBuiltin(Shell sh, Vec<string> argv) {
   return Output.ok(u8[0]());
 }
 
+/**
+ * `cd` — move the shell's own idea of where it is.
+ *
+ * Checked before it is believed: `cd nowhere` must fail and leave the shell where it was, which
+ * is the difference between a working directory and a variable. `cd` with no argument goes to
+ * `$HOME` as bash does, and `cd -` to the previous directory, which is the one bit of `cd` people
+ * use without thinking about it.
+ */
+Output cd(Shell sh, Vec<string> argv) {
+  string want = argv.len() > 1 ? argv.get(1) : sh.vars.get("HOME").orElse("");
+  if (want == "") { return Output.fail("cd: HOME not set\n".toBytes(), 1); }
+
+  string previous = sh.cwd;
+  string target = want == "-" ? sh.vars.get("OLDPWD").orElse(sh.cwd) : sh.resolve(want);
+
+  Stat st = sh.cli.stat(target).wait();
+  if (!st.exists) { return Output.fail(("cd: " + want + ": no such file or directory\n").toBytes(), 1); }
+  if (!st.isDir) { return Output.fail(("cd: " + want + ": not a directory\n").toBytes(), 1); }
+
+  sh.cwd = target;
+  sh.setVar("OLDPWD", previous);
+  sh.setVar("PWD", target);
+  // `cd -` prints where it went, as bash does; a plain `cd` says nothing.
+  return want == "-" ? Output.ok((target + "\n").toBytes()) : Output.ok(u8[0]());
+}
+
+/**
+ * `mkdir [-p] dir…` — because in a browser the filesystem starts empty.
+ *
+ * Without this, `cd` has nowhere to go on a fresh Origin Private File System, which makes the
+ * three builtins above look broken when they are merely alone. `-p` is the usual "and its parents,
+ * and no complaint if it exists".
+ */
+Output mkdir(Shell sh, Vec<string> argv) {
+  bool parents = false;
+  Vec<string> paths = Vec.create();
+  for (i32 i = 1; i < argv.len(); i++) {
+    string a = argv.get(i);
+    if (a == "-p") { parents = true; } else { paths.push(a); }
+  }
+  if (paths.len() == 0) { return Output.fail("mkdir: missing operand\n".toBytes(), 1); }
+
+  Buf err = Buf.create();
+  i32 status = 0;
+  for (i32 i = 0; i < paths.len(); i++) {
+    string given = paths.get(i);
+    if (!sh.cli.mkdir(sh.resolve(given), parents).wait()) {
+      err.pushAll(("mkdir: cannot create directory '" + given + "'\n").toBytes());
+      status = 1;
+    }
+  }
+  return status == 0 ? Output.ok(u8[0]()) : Output.fail(err.take(), status);
+}
+
+/**
+ * `rm [-r] path…`
+ *
+ * `-f` is accepted and means what it means everywhere: say nothing about what was not there. The
+ * platform's `remove` reports only success or failure, so a missing path and a non-empty directory
+ * are the same answer here — which is why the message says "cannot remove" rather than guessing.
+ */
+Output rm(Shell sh, Vec<string> argv) {
+  bool recursive = false;
+  bool force = false;
+  Vec<string> paths = Vec.create();
+  for (i32 i = 1; i < argv.len(); i++) {
+    string a = argv.get(i);
+    if (a == "-r" || a == "-rf" || a == "-fr") { recursive = true; force = a != "-r"; }
+    else if (a == "-f") { force = true; }
+    else { paths.push(a); }
+  }
+  if (paths.len() == 0) { return force ? Output.ok(u8[0]()) : Output.fail("rm: missing operand\n".toBytes(), 1); }
+
+  Buf err = Buf.create();
+  i32 status = 0;
+  for (i32 i = 0; i < paths.len(); i++) {
+    string given = paths.get(i);
+    string path = sh.resolve(given);
+    // A real `rm` refuses a directory without `-r`, and the platform's `remove` does not: it takes
+    // a recursive flag, and without it still removes an *empty* directory. So the check is here.
+    // Differential testing found this: `mkdir one; rm one` succeeded where bash exits 1.
+    if (!recursive && sh.cli.stat(path).wait().isDir) {
+      if (!force) {
+        err.pushAll(("rm: cannot remove '" + given + "': Is a directory\n").toBytes());
+        status = 1;
+      }
+      continue;
+    }
+    if (!sh.cli.remove(path, recursive).wait() && !force) {
+      err.pushAll(("rm: cannot remove '" + given + "'\n").toBytes());
+      status = 1;
+    }
+  }
+  return status == 0 ? Output.ok(u8[0]()) : Output.fail(err.take(), status);
+}
+
+/**
+ * `ls` — names in a directory, one per line, sorted.
+ *
+ * One per line unconditionally, which is what every `ls` does when its output is not a terminal;
+ * the columns are a terminal affordance and this has no terminal. `-a` is the only flag, because
+ * the platform's `readDir` does not report a leading dot as special and hiding them would mean
+ * inventing a rule.
+ */
+Output ls(Shell sh, Vec<string> argv) {
+  Vec<string> paths = Vec.create();
+  bool all = false;
+  for (i32 i = 1; i < argv.len(); i++) {
+    string a = argv.get(i);
+    if (a == "-a") { all = true; } else { paths.push(a); }
+  }
+  if (paths.len() == 0) { paths.push("."); }
+
+  Buf out = Buf.create();
+  i32 status = 0;
+  for (i32 i = 0; i < paths.len(); i++) {
+    string given = paths.get(i);
+    string path = sh.resolve(given);
+    string[]? names = sh.cli.readDir(path).wait();
+    if (names is null) {
+      // Not a directory, or unreadable. A plain file is listed as itself, which is what `ls` does
+      // and is why this is not simply an error.
+      if (sh.cli.stat(path).wait().exists) {
+        out.pushAll((given + "\n").toBytes());
+      } else {
+        out.pushAll(("ls: " + given + ": no such file or directory\n").toBytes());
+        status = 2;
+      }
+      continue;
+    }
+    if (paths.len() > 1) { out.pushAll((given + ":\n").toBytes()); }
+    // `ls -a` lists `.` and `..` as well. The platform's `readDir` does not report them — they are
+    // not entries, they are a convention about how paths are written — so a real `ls` synthesises
+    // them and so does this. Without them `ls -a | sort` differed from bash by exactly two lines.
+    if (all) { out.pushAll(".\n..\n".toBytes()); }
+    string[] listed = names!;
+    for (i32 j = 0; j < listed.len(); j++) {
+      if (!all && listed[j].len() > 0 && listed[j].toBytes()[0] == '.') { continue; }
+      out.pushAll((listed[j] + "\n").toBytes());
+    }
+    if (paths.len() > 1 && i + 1 < paths.len()) { out.pushAll("\n".toBytes()); }
+  }
+  return status == 0 ? Output.ok(out.take()) : Output.fail(out.take(), status);
+}
+
 /** A function if one is defined, then a builtin, then an external program. */
 Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   string name = argv.get(0);
@@ -729,6 +898,11 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
     for (i32 i = 1; i < argv.len(); i++) { sh.vars.remove(argv.get(i)); }
     return Output.ok(u8[0]());
   }
+  if (name == "cd") { return cd(sh, argv); }
+  if (name == "pwd") { return Output.ok((sh.cwd + "\n").toBytes()); }
+  if (name == "ls") { return ls(sh, argv); }
+  if (name == "mkdir") { return mkdir(sh, argv); }
+  if (name == "rm") { return rm(sh, argv); }
   if (name == "read") { return readLine(sh, argv); }
   if (name == "shift") {
     // bash: shifting more than there is fails and changes nothing, rather than clearing them.
@@ -748,7 +922,7 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   // started, and now that something can they are the fallback rather than the answer.
   Output spawned = trySpawn(sh, argv, stdin);
   if (spawned.found) { return spawned; }
-  return run(sh.cli, argv, stdin);
+  return run(sh.cli, sh.cwd, argv, stdin);
 }
 
 /**
@@ -773,7 +947,7 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
   string where = containsSlash(name) ? name : searchWacPath(sh, name);
   if (where == "") { return Output.missing(); }
 
-  FileResult prog = sh.cli.readFile(where).wait();
+  FileResult prog = sh.cli.readFile(sh.resolve(where)).wait();
   if (!prog.ok) { return Output.missing(); }
 
   string[] args = string[argv.len() - 1](fill: "");
@@ -825,7 +999,7 @@ string searchWacPath(Shell sh, string name) {
       // rather than turned into a bare `/name`.
       if (i > start) {
         string candidate = string.fromBytes(sliceBytes(b, start, i)) + "/" + name;
-        if (sh.cli.stat(candidate).wait().exists) { return candidate; }
+        if (sh.cli.stat(sh.resolve(candidate)).wait().exists) { return candidate; }
       }
       start = i + 1;
     }
@@ -924,7 +1098,7 @@ Output test(Shell sh, Vec<string> argv) {
 }
 
 Output help() {
-  string s = "builtins: : true false echo exit export unset test [ help\n";
+  string s = "builtins: : true false echo exit export unset test [ help cd pwd ls mkdir rm\n";
   Vec<string> ns = names();
   s = s + "programs:";
   for (i32 i = 0; i < ns.len(); i++) { s = s + " " + ns.get(i); }
@@ -1088,7 +1262,7 @@ void globInto(Shell sh, u8[] pattern, u8[] quoted, Vec<string> argv) {
   u8[] tail = sliceBytes(pattern, slash + 1, pattern.len());
   u8[] tailMask = sliceBytes(quoted, slash + 1, quoted.len());
 
-  string[]? names = sh.cli.readDir(dir).wait();
+  string[]? names = sh.cli.readDir(sh.resolve(dir)).wait();
   if (names is null) { return; }
 
   Vec<string> hits = Vec.create();

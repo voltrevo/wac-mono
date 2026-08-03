@@ -45,6 +45,7 @@ export const OP = {
   DRAW_PIXELS: 38,
   NEXT_FILE: 39,
   OFFER_DOWNLOAD: 40,
+  CWD: 41,
 } as const;
 
 /**

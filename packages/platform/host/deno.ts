@@ -128,6 +128,10 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     //
     // `unrefTimer` is deliberately absent: an outstanding timer holding the event loop open
     // is what keeps a worker parked on it from waiting forever.
+    // A read of where the host resolves relative paths. Not granted: it names a directory
+    // rather than opening one, and a program that cannot read a file there learns nothing
+    // useful from its name.
+    [OP.CWD]: () => str(Deno.cwd()),
     [OP.SLEEP_MILLIS]: (p) =>
       new Promise<Uint8Array>((ok) =>
         setTimeout(() => ok(i64le(BigInt(Math.round(performance.now() * 1e6)))), readI32le(p))

@@ -246,6 +246,9 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       return EMPTY;
     },
 
+    // A page has no process directory. The root of the Origin Private File System is where its
+    // relative paths land, so that is the true answer and not a placeholder.
+    [OP.CWD]: () => str("/"),
     [OP.SLEEP_MILLIS]: (p) =>
       new Promise<Uint8Array>((ok) =>
         setTimeout(() => ok(i64le(BigInt(Math.round(performance.now() * 1e6)))), readI32le(p))
