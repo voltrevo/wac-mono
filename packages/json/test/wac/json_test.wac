@@ -369,6 +369,59 @@ export string test_hand_built_tree_serializes() {
   return t.report();
 }
 
+export string test_hand_built_values_stay_valid_json() {
+  T t = T.create();
+
+  // NaN and the infinities have no JSON spelling, and the float formatter wrote the JavaScript
+  // ones — so a hand-built tree serialised to text this package's own parser rejects.
+  // `JSON.stringify` writes null for them. GitHub wac-mono#29.
+  Buf a = Buf.create();
+  writeValue(a, numberOf(0.0 / 0.0));
+  t.eqBytes(a.bytes(), "null".toBytes(), "NaN is null, as JSON.stringify has it");
+
+  Buf b = Buf.create();
+  writeValue(b, numberOf(1.0 / 0.0));
+  t.eqBytes(b.bytes(), "null".toBytes(), "positive infinity is null");
+
+  Buf c = Buf.create();
+  writeValue(c, numberOf(-1.0 / 0.0));
+  t.eqBytes(c.bytes(), "null".toBytes(), "and so is negative infinity");
+
+  Buf d = Buf.create();
+  writeValue(d, numberOf(1.5));
+  t.eqBytes(d.bytes(), "1.5".toBytes(), "a finite number is still written as itself");
+
+  // `Str` takes raw bytes, so a hand-built one may hold anything. Each ill-formed byte becomes
+  // U+FFFD rather than being copied into output that is not UTF-8. GitHub wac-mono#30.
+  Buf e = Buf.create();
+  writeValue(e, JsonValue.Str(u8[](0xFF)));
+  t.eqBytes(e.bytes(), u8[]('"', 0xEF, 0xBF, 0xBD, '"'), "a lone 0xFF is replaced");
+
+  Buf f = Buf.create();
+  writeValue(f, JsonValue.Str(u8[](0xED, 0xA0, 0x80)));
+  t.eqBytes(f.bytes(), u8[]('"', 0xEF, 0xBF, 0xBD, 0xEF, 0xBF, 0xBD, 0xEF, 0xBF, 0xBD, '"'),
+    "an encoded surrogate is three ill-formed bytes");
+
+  Buf g = Buf.create();
+  writeValue(g, JsonValue.Str(u8[](0xC3, 0xA9)));
+  t.eqBytes(g.bytes(), u8[]('"', 0xC3, 0xA9, '"'), "well-formed UTF-8 is copied whole");
+
+  Buf h = Buf.create();
+  writeValue(h, JsonValue.Str(u8[](0xF0, 0x9F, 0x98, 0x80)));
+  t.eqBytes(h.bytes(), u8[]('"', 0xF0, 0x9F, 0x98, 0x80, '"'), "including four-byte sequences");
+
+  Buf i = Buf.create();
+  writeValue(i, JsonValue.Str(u8[](0xC3)));
+  t.eqBytes(i.bytes(), u8[]('"', 0xEF, 0xBF, 0xBD, '"'), "a truncated sequence is ill-formed");
+
+  Buf j = Buf.create();
+  writeValue(j, JsonValue.Str(u8[](0xC0, 0xAF)));
+  t.eqBytes(j.bytes(), u8[]('"', 0xEF, 0xBF, 0xBD, 0xEF, 0xBF, 0xBD, '"'),
+    "and so is an overlong encoding of '/'");
+
+  return t.report();
+}
+
 export string test_parsed_numbers_keep_their_span() {
   T t = T.create();
   // The other half of the rule: a parsed number is written back verbatim, so

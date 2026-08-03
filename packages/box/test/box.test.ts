@@ -214,6 +214,71 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     assertEquals(box(["sort", "-nu", wide]).out, sys("sort", ["-nu", wide]), "sort -nu past i32");
     await Deno.remove(wide);
 
+    // `split`'s suffixes past `zz`. GNU reserves a leading `z` as the marker that the suffix has
+    // grown, so two letters run `aa`..`yz` and the next name is `zaaa` — this used to leave the
+    // alphabet entirely and emit `z676`, which sorts nowhere near where it was written.
+    // GitHub wac-mono#14.
+    const seven = await Deno.makeTempFile({ prefix: "wac-box-many-" });
+    await Deno.writeTextFile(seven, Array.from({ length: 700 }, (_, i) => String(i)).join("\n") + "\n");
+    const ours = await Deno.makeTempDir({ prefix: "wac-box-split-a-" });
+    const theirs = await Deno.makeTempDir({ prefix: "wac-box-split-b-" });
+    // Its own binary: `built` above is granted read only, and `split` has to open its pieces for
+    // writing. Without this it wrote nothing, and the comparison was "" against 700 names.
+    const writer = await Deno.makeTempFile({ prefix: "wac-box-splitw-" });
+    await buildApp(BOX, writer, { read: true, write: true });
+    new Deno.Command(writer, { args: ["split", "-1", seven], cwd: ours, stdout: "null" }).outputSync();
+    new Deno.Command("split", { args: ["-l", "1", seven], cwd: theirs, stdout: "null" }).outputSync();
+    const names = (dir: string) => [...Deno.readDirSync(dir)].map((e) => e.name).sort();
+    assertEquals(names(ours).join(" "), names(theirs).join(" "), "every split suffix, all 700");
+    await Deno.remove(seven);
+    await Deno.remove(writer);
+    await Deno.remove(ours, { recursive: true });
+    await Deno.remove(theirs, { recursive: true });
+
+    // A pattern that exhausts the backtracking budget is not a match. It used to be counted as one,
+    // because only NO_MATCH was checked. GitHub wac-mono#26.
+    const patho = await Deno.makeTempFile({ prefix: "wac-box-patho-" });
+    await Deno.writeTextFile(patho, "a".repeat(30) + "\n");
+    const gave = box(["grep", "(a|a)*b", patho]);
+    assertEquals(gave.code, 2, `budget exhaustion should exit 2, got ${gave.code}`);
+    assertEquals(gave.out, "", "and should print no matches");
+    await Deno.remove(patho);
+
+    // A name that does not fit a ustar header is refused, which is what tar.wac has always claimed.
+    // There was no check, so the header writer copied the first 100 bytes and archived the entry
+    // under a different name. GitHub wac-mono#23.
+    const deep = await Deno.makeTempDir({ prefix: "wac-box-tar-" });
+    const longDir = `${deep}/${"d".repeat(40)}`;
+    await Deno.mkdir(longDir);
+    await Deno.writeTextFile(`${longDir}/${"f".repeat(70)}`, "x");
+    const tarred = new Deno.Command(built, {
+      args: ["tar", "."],
+      cwd: deep,
+      stdout: "null",
+      stderr: "piped",
+    }).outputSync();
+    assertEquals(tarred.code, 1, "an unarchivable name is a failure");
+    assertEquals(
+      new TextDecoder().decode(tarred.stderr).includes("longer than the 100 bytes"),
+      true,
+      "and says why",
+    );
+    await Deno.remove(deep, { recursive: true });
+
+    // An unreadable directory is not an empty one. `find` printed a partial listing and exited 0,
+    // and `du` undercounted the total and exited 0 — a wrong number that looks like an answer.
+    // GitHub wac-mono#20.
+    const unreadable = await Deno.makeTempDir({ prefix: "wac-box-unread-" });
+    await Deno.mkdir(`${unreadable}/shut`);
+    await Deno.writeTextFile(`${unreadable}/shut/inside`, "x");
+    await Deno.chmod(`${unreadable}/shut`, 0o000);
+    const found = box(["find", unreadable]);
+    const counted = box(["du", unreadable]);
+    await Deno.chmod(`${unreadable}/shut`, 0o755);
+    await Deno.remove(unreadable, { recursive: true });
+    assertEquals(found.code, 1, "find over an unreadable subtree fails");
+    assertEquals(counted.code, 1, "and so does du");
+
     assertEquals(box(["head", "-3", fixture]).out, sys("head", ["-3", fixture]), "head -N");
     assertEquals(box(["tail", "-n", "2", fixture]).out, sys("tail", ["-n", "2", fixture]), "tail -n N");
     assertEquals(box(["wc", "-l", fixture]).out.trim(), sys("wc", ["-l", fixture]).trim().split(/\s+/)[0]);

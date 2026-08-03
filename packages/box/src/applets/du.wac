@@ -1,27 +1,57 @@
 // Total bytes under a path — `stat` and `readDir` doing real work together.
+//
+// **A total that is short is not a total.** An unreadable directory and the depth bound both used to
+// contribute zero and leave the exit status at 0, so `du` reported a number that looked like an
+// answer and was not. Anything that could not be counted is now said out loud and the status is
+// nonzero, while the partial figure is still printed — which is what GNU's does.
 
 import { Cli, Core, Stat } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { itoa64 } from "../lib/num.wac";
+import { itoa, itoa64 } from "../lib/num.wac";
+
+/** As in `find`: a bound rather than a cycle check, because `stat` cannot see a symlink. */
+i32 MAX_DEPTH() { return 64; }
+
+/** A subtotal, and whether everything under it was actually counted. */
+struct Sum { i64 bytes; bool complete; }
 
 export i32 du(Core core, Cli cli, Args a) {
   string root = a.rest.len() < 1 ? "." : a.rest[0];
   Stat st = cli.stat(root).wait();
   if (!st.exists) { core.warn(a.name + ": " + root + ": not found"); return 1; }
-  core.log(itoa64(st.isDir ? sizeOf(cli, root, 0) : st.size) + "\t" + root);
-  return 0;
+  if (!st.isDir) {
+    core.log(itoa64(st.size) + "\t" + root);
+    return 0;
+  }
+  Sum s = sizeOf(core, cli, a.name, root, 0);
+  core.log(itoa64(s.bytes) + "\t" + root);
+  return s.complete ? 0 : 1;
 }
 
-i64 sizeOf(Cli cli, string dir, i32 depth) {
-  if (depth > 32) { return 0; }
+Sum sizeOf(Core core, Cli cli, string name, string dir, i32 depth) {
+  if (depth > MAX_DEPTH()) {
+    core.warn(name + ": " + dir + ": deeper than " + itoa(MAX_DEPTH()) +
+      " levels, not counting further");
+    return Sum(0, false);
+  }
   string[]? names = cli.readDir(dir).wait();
-  if (names is null) { return 0; }
+  if (names is null) {
+    core.warn(name + ": " + dir + ": cannot read directory");
+    return Sum(0, false);
+  }
   string[] found = names!;
   i64 total = 0;
+  bool complete = true;
   for (i32 i = 0; i < found.len(); i++) {
     string path = dir + "/" + found[i];
     Stat st = cli.stat(path).wait();
-    total = total + (st.isDir ? sizeOf(cli, path, depth + 1) : st.size);
+    if (st.isDir) {
+      Sum sub = sizeOf(core, cli, name, path, depth + 1);
+      total = total + sub.bytes;
+      if (!sub.complete) { complete = false; }
+    } else {
+      total = total + st.size;
+    }
   }
-  return total;
+  return Sum(total, complete);
 }

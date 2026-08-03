@@ -30,6 +30,7 @@ const mod = await wacBind("packages/datetime/test/probe.wac") as unknown as {
   accepts(s: Uint8Array): boolean;
   parseMillis(s: Uint8Array): bigint;
   parseOffset(s: Uint8Array): number;
+  parseOffsetKnown(s: Uint8Array): number;
   formatMillis(ms: bigint): Uint8Array;
 };
 
@@ -307,5 +308,24 @@ Deno.test("parse and format round-trip", () => {
     if (!mod.accepts(text)) throw new Error(`${dec.decode(text)} did not parse back`);
     const back = mod.parseMillis(text);
     if (back !== ms) throw new Error(`${dec.decode(text)}: parsed back as ${back}, want ${ms}`);
+  }
+});
+
+Deno.test("-00:00 is an unknown offset, not zero", () => {
+  // RFC 3339 §4.3: `-00:00` says the instant is known and the local offset is not. `Z` and `+00:00`
+  // both assert zero. All three used to arrive as offsetMin == 0 and were indistinguishable, so the
+  // one thing `offsetMin` exists to preserve was the thing lost. GitHub wac-mono#15.
+  const enc = new TextEncoder();
+  const known = (s: string) => mod.parseOffsetKnown(enc.encode(s));
+  const offset = (s: string) => mod.parseOffset(enc.encode(s));
+
+  if (known("1970-01-01T00:00:00-00:00") !== 0) throw new Error("-00:00 should be unknown");
+  if (known("1970-01-01T00:00:00+00:00") !== 1) throw new Error("+00:00 asserts zero");
+  if (known("1970-01-01T00:00:00Z") !== 1) throw new Error("Z asserts zero");
+  if (known("1970-01-01T00:00:00+05:30") !== 1) throw new Error("a real offset is known");
+
+  // And all of them still describe the same instant, which is the part that was never wrong.
+  for (const s of ["1970-01-01T00:00:00-00:00", "1970-01-01T00:00:00+00:00", "1970-01-01T00:00:00Z"]) {
+    if (offset(s) !== 0) throw new Error(`${s}: offset should be 0, got ${offset(s)}`);
   }
 });

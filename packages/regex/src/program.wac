@@ -163,11 +163,12 @@ export i32 runAt(Program p, u8[] input, i32 at, i32[] caps, i32 budget) {
       marks[a] = sp;
       pc++;
     } else if (op == OP_CLEAR()) {
-      bool room = true;
-      for (i32 slot = a; slot <= b; slot++) {
-        if (undoLen >= cap) { room = false; }
-      }
-      if (!room) { return BUDGET(); }
+      // Room for *all* of them, checked once. The loop below appends one entry per slot, and this
+      // used to compare the unchanged `undoLen` against `cap` once per slot — which only ever
+      // catches a log that is already full, never one about to be overrun. A quantified group with
+      // enough captures then wrote past the undo arrays and trapped, where the whole point of the
+      // check is to return BUDGET instead.
+      if (undoLen + (b - a + 1) > cap) { return BUDGET(); }
       for (i32 slot = a; slot <= b; slot++) {
         undoSlot[undoLen] = slot;
         undoVal[undoLen] = caps[slot];

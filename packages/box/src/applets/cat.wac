@@ -1,4 +1,5 @@
-// Bytes through, unchanged — a chunk at a time, so a file larger than memory still works.
+// Bytes through, unchanged — a chunk at a time, so a file larger than memory still works, and
+// stopping as soon as nobody is reading.
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
@@ -10,7 +11,11 @@ export i32 cat(Core core, Cli cli, Args a) {
   while (true) {
     u8[] chunk = cli.readChunk();
     if (chunk.len() == 0) { return 0; }
-    cli.write(chunk);
+    // `write` answers false when the other end has gone, which is the only signal there is — this
+    // used to discard it and keep reading, so `cat` of an endless source went on for ever after
+    // whatever was reading it had exited. Success, as it is for every filter: a downstream that
+    // stopped listening is that downstream's business, and `yes` ends the same way.
+    if (!cli.write(chunk)) { return 0; }
   }
   return 0;
 }

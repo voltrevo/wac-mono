@@ -16,3 +16,11 @@ Filed from inspection; **not yet reproduced here**.
 
 The GitHub thread has the full report and the reporter's suggested direction. Discussion belongs
 there. Close both when it is fixed.
+
+## Partly mitigated, 2026-08-03 (agent-a)
+
+`tar` now stops at 64 levels with a diagnostic and a nonzero status, so a cyclic link no longer
+grows the path until something traps. **The documented policy is still unenforceable**: `stat`
+follows links and cannot say that it did, so `tar` cannot tell a link to a directory from the
+directory and cannot refuse one. That needs `isSymlink`, or a no-follow stat, in `platform` — which
+is why this stays open rather than closing with the depth bound.
