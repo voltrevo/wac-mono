@@ -19,17 +19,32 @@
 // basis of trust, which is why it is a file the user chooses rather than something read out
 // of the directory being checked. A real client compiles it in.
 //
+// ## Timeouts
+//
+// Every read and every dial is bounded, by racing it against `sleepMillis` under `waitAny`.
+// A relay that completes a TCP handshake and then says nothing is not a hypothetical: relays
+// are strangers chosen from a public directory, and one that can hold a client indefinitely
+// is in a position worth paying for.
+//
+// Two things the platform is explicit about and this depends on. Cancelling a ticket stops
+// the *waiting*, not the work — so a timed-out read also closes the socket, which is what
+// actually ends it. And the timer must be bound to a name rather than inlined into the
+// `waitAny` list, because an inlined one cannot be cancelled and holds a call slot until it
+// fires; four of those and the next call has nowhere to go.
+//
+// **These currently fire early — see issue 0023.** A cancelled timer's expiry wakes a later,
+// unrelated `waitAny`, so the 30-second read bound expires after 15: the interval left over
+// from the connect timer. The values below are the ones that are *correct*, not the ones
+// that hide it. Tuning around a platform bug would leave the next reader a puzzle with no
+// note attached, and the bug is not mine to work around.
+//
 // ## What this is not
 //
-// Not an anonymity tool. There are no timeouts, because nothing bounds a socket capability
-// (issue 0018): a relay that accepts and then says nothing wedges this permanently, and that
-// is not fixable above the boundary. Not worked around here.
-//
-// There is no SOCKS port either, but that is no longer blocked — `waitAny` landed, so
-// watching a listener beside several relay sockets is now expressible. `box nc` is the
-// precedent. It is the next thing worth building on top of this.
+// Not an anonymity tool. There is no SOCKS port — `waitAny` makes one expressible now, and
+// `box nc` is the precedent, but it is not written. That is the next thing worth building on
+// top of this.
 
-import { Core, Cli, Socket, FileResult } from "../../platform/src/platform.wac";
+import { Core, Cli, Socket, FileResult, Pending } from "../../platform/src/platform.wac";
 import { Vec } from "../../std/src/vec.wac";
 import {
   Relay, parseConsensus, attachMicrodescriptors, hasFlag, parseInt, base64NoPad,
@@ -99,8 +114,22 @@ struct Link {
   bool dead;
 }
 
+/** How long a relay gets to answer. Generous: this is a bound on wedging, not a deadline. */
+const i32 CONNECT_TIMEOUT_MS = 15000;
+const i32 READ_TIMEOUT_MS = 30000;
+
 Link connectRelay(Core core, Cli cli, string host, i32 port) {
-  Socket s = cli.connect(host, port).wait();
+  Pending<Socket> dial = cli.connect(host, port);
+  Pending<i64> timer = core.sleepMillis(CONNECT_TIMEOUT_MS);
+  if (cli.waitAny(i32[](dial.id, timer.id)) == 1) {
+    // Nothing to close — there is no handle yet — so cancelling the dial is all there is.
+    // The host may still be inside the connect; what this guarantees is that we stop waiting.
+    dial.cancel();
+    core.warn("tor: " + host + " did not answer within " + itoa(CONNECT_TIMEOUT_MS) + "ms");
+    return Link(core, cli, -1, u8[0](), u8[0](), true);
+  }
+  timer.cancel();
+  Socket s = dial.wait();
   if (s.handle < 0) {
     core.warn("tor: " + host + ": " + s.error);
     return Link(core, cli, -1, u8[0](), u8[0](), true);
@@ -122,9 +151,25 @@ void handshakeTls(Link l) {
   }
 }
 
-/** One read from the socket, fed to TLS. False at end of stream. */
+/**
+ * One read from the socket, fed to TLS. False at end of stream or on a timeout.
+ *
+ * The read is raced against a timer. If the timer wins, the socket is closed as well as the
+ * ticket cancelled — cancelling stops us waiting and does not stop the host's read, and a
+ * cancelled ticket keeps its slot until the call underneath finishes. Closing the handle is
+ * what makes it finish.
+ */
 bool pump(Link l) {
-  u8[] chunk = l.cli.recv(l.sock).wait();
+  Pending<u8[]> read = l.cli.recv(l.sock);
+  Pending<i64> timer = l.core.sleepMillis(READ_TIMEOUT_MS);
+  if (l.cli.waitAny(i32[](read.id, timer.id)) == 1) {
+    read.cancel();
+    l.cli.closeSocket(l.sock);
+    l.core.warn("tor: a relay went silent for " + itoa(READ_TIMEOUT_MS) + "ms");
+    return false;
+  }
+  timer.cancel();
+  u8[] chunk = read.wait();
   if (chunk.len() == 0) { return false; }
   Step st = unpack(tlsClientFeed(l.tls, chunk));
   l.tls = st.state;
