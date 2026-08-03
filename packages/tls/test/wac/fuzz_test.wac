@@ -23,6 +23,7 @@ import { recordLength, recordType, maxPlaintext, typeHandshake, typeAlert } from
 import { Reader } from "../../src/wire.wac";
 import { tlsClientInit, tlsClientFeed, tlsClientFailure, tlsClientPhase }
   from "../../src/client.wac";
+import { parseCert, verifyChain, Cert } from "../../src/x509.wac";
 
 struct Rng { i64 s; }
 Rng rng(i64 seed) { return Rng(seed == 0 ? 88172645463325252 : seed); }
@@ -199,4 +200,85 @@ export string test_feeding_a_failed_connection_is_answered_not_fatal(fn[u8[](i32
     t.eqI32(tlsClientPhase(state), 4, "and so is the phase");
   }
   return t.report();
+}
+
+// ── Certificates ─────────────────────────────────────────────────────────────
+
+export string test_a_certificate_parser_never_aborts(
+  fn[u8[](i32)] entropy, fn[u8[](i32)] fixture
+) {
+  // The most exposed parser in the repo. A chain is parsed *before* it is verified — it has
+  // to be, since a signature cannot be checked before it is found — so every byte reaching
+  // `parseCert` was chosen by whoever answered the connection. No handshake has completed,
+  // nothing has authenticated, and on the public internet that is whoever won the race to
+  // answer.
+  //
+  // It used to abort on every truncation of a real certificate and on all five hundred of
+  // the first random inputs tried. That was a remote crash needing no credentials at all.
+  T t = T.create();
+  Rng r = rng(21);
+  u8[] real = fixture(0);
+  t.isTrue(parseCert(real).wellFormed, "the genuine certificate parses");
+
+  for (i32 n = 0; n <= real.len(); n++) { parseCert(prefix(real, n)); }
+  for (i32 i = 0; i < real.len(); i++) {
+    u8[] c = copyOf(real);
+    c[i] = c[i] ^ 0xFF;
+    parseCert(c);
+  }
+  for (i32 i = 0; i < 1500; i++) {
+    u8[] c = copyOf(real);
+    for (i32 k = 0; k < 3; k++) { c[next(r) % c.len()] = next(r) & 0xFF; }
+    parseCert(c);
+  }
+  for (i32 i = 0; i < 1500; i++) { parseCert(randomBytes(r, next(r) % 400)); }
+  t.isTrue(true, "every truncation, mutation and noise sample parsed or was refused");
+  return t.report();
+}
+
+export string test_a_malformed_certificate_is_refused_on_its_own_terms(
+  fn[u8[](i32)] entropy, fn[u8[](i32)] fixture
+) {
+  // Total is not the same as permissive. Every tampered certificate must still be rejected,
+  // and an unparseable one must be rejected as unparseable rather than as a bad signature —
+  // the signature check would catch it, but reporting "the signature did not verify" about
+  // bytes that were never a certificate is the wrong answer, and a caller that only wanted
+  // to read a name never reaches that check at all.
+  T t = T.create();
+  Rng r = rng(22);
+  u8[] real = fixture(0);
+  u8[] ca = fixture(1);
+
+  t.eqI32(verifyChain(parseCert(real), parseCert(ca), "wac.test".toBytes(), 1785715200), 0,
+          "the genuine chain verifies");
+
+  i32 accepted = 0;
+  i32 unparseable = 0;
+  for (i32 i = 0; i < real.len(); i++) {
+    u8[] c = copyOf(real);
+    c[i] = c[i] ^ 0xFF;
+    Cert parsed = parseCert(c);
+    i32 v = verifyChain(parsed, parseCert(ca), "wac.test".toBytes(), 1785715200);
+    if (v == 0) { accepted++; }
+    if (!parsed.wellFormed) {
+      unparseable++;
+      t.eqI32(v, 13, "an unparseable certificate is refused as unparseable");
+    }
+  }
+  t.eqI32(accepted, 0, "no single-byte tampering is accepted");
+  t.isTrue(unparseable > 0,
+           "and some of those mutations genuinely broke the encoding rather than the signature");
+  return t.report();
+}
+
+u8[] prefix(u8[] b, i32 n) {
+  u8[] o = u8[n]();
+  for (i32 i = 0; i < n; i++) { o[i] = b[i]; }
+  return o;
+}
+
+u8[] copyOf(u8[] b) {
+  u8[] o = u8[b.len()]();
+  for (i32 i = 0; i < b.len(); i++) { o[i] = b[i]; }
+  return o;
 }
