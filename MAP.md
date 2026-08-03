@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-24 packages, 40,917 lines of wac, 897 tests,
+24 packages, 40,917 lines of wac, 898 tests,
 20 command-line programs and 4 browser pages.
 
 ## Packages
