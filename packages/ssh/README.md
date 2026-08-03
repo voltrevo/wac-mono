@@ -291,6 +291,28 @@ The reach is bounded by what the server was granted. With `--allow-read` alone a
 what the server can read and write nothing. That is a real exposure whose size the operator
 chooses, which is the capability world working rather than a gap in it.
 
+**Which channel requests get a reply is decided by the request, not by whether we understood
+it.** This was wrong, and the effect was total: a client whose `ssh_config` contains
+`SendEnv LANG LC_*` — the Debian and Ubuntu default — sends two `env` requests before `exec`,
+both with `want_reply` *false*. The server answered them anyway, the client matched replies to requests
+in order, and it attributed the first spurious answer to its `exec`. Every command failed with
+`exec request failed on channel 0` while the server logged that the client had never asked to run
+anything.
+
+The suite did not see it because `test/server.test.ts` runs the client with `-F /dev/null`, which
+is good hygiene for reproducibility and also discards the very config that sends the `env`. It was
+found by running the server by hand and connecting to it normally, which is worth remembering: a
+test that controls the client's configuration is not testing the clients that exist. There is now a
+case that puts `SendEnv` back, and it fails without the fix.
+
+**A line ends CRLF whenever the client has a terminal**, and there is no terminal driver here to
+fold it, so the interactive loop strips the carriage return at a line boundary and nowhere else.
+Without that, `exit\r` is not `exit`.
+
+**`ssh -tt` — forcing a pty — does not give a usable session**, which follows from `pty-req`
+being refused rather than being a separate defect: the client prints `PTY allocation request failed` and
+gives up. `ssh -T` and an ordinary terminal session both work.
+
 Three server-side details that a client never has to get right:
 
 **A publickey request with no signature is a probe** — the client asking whether a key is worth

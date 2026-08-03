@@ -27,6 +27,8 @@
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { decode } from "../../codec/src/base64.wac";
 import { Vec } from "../../std/src/vec.wac";
+import { Map } from "../../std/src/map.wac";
+import { hashString, stringEq } from "../../std/src/hash.wac";
 
 /** A policy summary: `accept 80,443` or `reject 25,119,135-139`, ranges inclusive. */
 export struct ExitPolicy {
@@ -238,6 +240,14 @@ export ExitPolicy? parsePolicy(string line) {
  * next one.
  */
 export void attachMicrodescriptors(Relay[] relays, u8[] text) {
+  // Indexed by digest first. Scanning every relay per microdescriptor is the same quadratic
+  // that cost eleven seconds in `resolveFamilies` — it is only a second here because a
+  // base64 digest usually differs in its first byte, which is luck rather than a design.
+  Map<string, i32> byDigest = Map.withCapacity(relays.len(), hashString, stringEq);
+  for (i32 i = 0; i < relays.len(); i++) {
+    if (relays[i].microdescDigest != "") { byDigest.set(relays[i].microdescDigest, i); }
+  }
+
   i32 at = 0;
   i32 bodyStart = -1;
   while (at <= text.len()) {
@@ -245,7 +255,7 @@ export void attachMicrodescriptors(Relay[] relays, u8[] text) {
     bool isStart = at < text.len() && end - at == 9 &&
                    lineStartsWith(text, at, end, "onion-key");
     if (isStart || at >= text.len()) {
-      if (bodyStart >= 0) { applyOne(relays, text, bodyStart, at); }
+      if (bodyStart >= 0) { applyOne(relays, byDigest, text, bodyStart, at); }
       bodyStart = at;
       if (at >= text.len()) { return; }
     }
@@ -254,7 +264,7 @@ export void attachMicrodescriptors(Relay[] relays, u8[] text) {
 }
 
 /** Digest one microdescriptor body and copy its fields onto whichever relay named it. */
-void applyOne(Relay[] relays, u8[] text, i32 from, i32 to) {
+void applyOne(Relay[] relays, Map<string, i32> byDigest, u8[] text, i32 from, i32 to) {
   // Annotations are not part of what is hashed, and the body always ends with exactly one
   // newline — both are what tor digests, and one byte either way changes the digest.
   u8[] body = u8[0]();
@@ -272,12 +282,8 @@ void applyOne(Relay[] relays, u8[] text, i32 from, i32 to) {
   }
   if (body.len() == 0) { return; }
 
-  string digest = base64NoPad(sha256(body));
-  for (i32 i = 0; i < relays.len(); i++) {
-    if (relays[i].microdescDigest == digest) {
-      fillFrom(relays[i], body);
-    }
-  }
+  i32 who = byDigest.getOr(base64NoPad(sha256(body)), -1);
+  if (who >= 0) { fillFrom(relays[who], body); }
 }
 
 void fillFrom(Relay r, u8[] body) {

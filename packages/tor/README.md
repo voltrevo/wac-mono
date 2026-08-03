@@ -127,6 +127,27 @@ value of known length, never searched within.
 **The signed portion ends mid-line**, at `directory-signature ` inclusive of the trailing
 space, with the signatures outside it. The leading newline in that search is load-bearing.
 
+## Measured against the real network
+
+The testnet is five relays on 127.0.0.1. The real consensus is 9566 relays, 3.26MB, with
+36MB of microdescriptors and 458762 mutual family edges — and running against a captured
+copy of it found something no amount of testnet work could:
+
+| | before | after |
+| --- | --- | --- |
+| `parseConsensus` | 47ms | 47ms |
+| `attachMicrodescriptors` | 852ms | 739ms |
+| `resolveFamilies` | **11039ms** | **379ms** |
+| a path, after setup | | 13ms |
+
+Both slow paths were the same mistake: resolving a name by scanning every relay. That is
+fine at five relays and ruinous at ten thousand, and it is invisible on a network small
+enough to develop against. An index built once turns each lookup into a hash.
+
+Eleven seconds on every bootstrap would not have been a subtle degradation — it is the
+difference between a usable client and one nobody would run. Worth remembering that the
+testnet cannot show it, and neither can any test written against the testnet.
+
 ## Choosing a path
 
 The part whose failures are silent. A wrong handshake breaks the circuit; a wrong path
