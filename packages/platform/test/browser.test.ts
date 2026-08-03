@@ -230,6 +230,63 @@ Deno.test('the root is reachable as "." and as ""', async () => {
   }
 });
 
+Deno.test("the page capabilities, against a document that only records", async () => {
+  // The `Dom` is injected exactly as the OPFS root is, so this drives the handlers without a
+  // browser. What it cannot check is delegation and the real event plumbing — those live in
+  // `entryBrowser.ts` and are covered by `browser_live.test.ts` clicking real buttons, which
+  // is the split this file learned the hard way with `readDir(".")`.
+  const did: string[] = [];
+  const events: { kind: string; id: string; value: string }[] = [
+    { kind: "click", id: "go", value: "" },
+    { kind: "input", id: "box", value: "typed" },
+  ];
+  const w = browserWorld({
+    dom: {
+      render: (html) => did.push(`render:${html}`),
+      setText: (id, t) => did.push(`setText:${id}=${t}`),
+      setValue: (id, v) => did.push(`setValue:${id}=${v}`),
+      value: (id) => (id === "box" ? "in the box" : ""),
+      on: (sel, kind) => did.push(`on:${sel}/${kind}`),
+      title: (t) => did.push(`title:${t}`),
+      next: () => Promise.resolve(events.shift() ?? { kind: "", id: "", value: "" }),
+    },
+  });
+  const call = async (op: number, payload: Uint8Array<ArrayBufferLike> = new Uint8Array(0)) =>
+    await w[op](payload as Uint8Array) as Uint8Array;
+  const two = (a: string, b: string) => {
+    const x = str(a);
+    const y = str(b);
+    const out = new Uint8Array(4 + x.length + y.length);
+    out.set(i32le(x.length), 0);
+    out.set(x, 4);
+    out.set(y, 4 + x.length);
+    return out;
+  };
+
+  await call(OP.RENDER, str("<b>hi</b>"));
+  await call(OP.SET_TEXT, two("out", "answer"));
+  await call(OP.SET_VALUE, two("box", "seeded"));
+  await call(OP.ON, two("button", "click"));
+  await call(OP.TITLE, str("demo"));
+  assertEquals(
+    did.join(" "),
+    "render:<b>hi</b> setText:out=answer setValue:box=seeded on:button/click title:demo",
+  );
+  assertEquals(unstr(await call(OP.GET_VALUE, str("box"))), "in the box");
+
+  // Three NUL-separated fields, in the order `Event` declares them.
+  assertEquals(unstr(await call(OP.NEXT_EVENT)).split("\u0000").join("|"), "click|go|");
+  assertEquals(unstr(await call(OP.NEXT_EVENT)).split("\u0000").join("|"), "input|box|typed");
+});
+
+Deno.test("a page with no dom refuses to draw, rather than doing nothing", async () => {
+  // The same shape as withholding the filesystem: an application that believes it has drawn
+  // something and has not is worse off than one told plainly that it cannot.
+  const w = browserWorld({});
+  await rejects(() => w[OP.RENDER](str("<b>hi</b>")) as Promise<Uint8Array>, "not granted");
+  await rejects(() => w[OP.NEXT_EVENT](new Uint8Array(0)) as Promise<Uint8Array>, "not granted");
+});
+
 Deno.test("the browser world refuses what a page cannot do", async () => {
   const w = browserWorld({ root: memDir(), writable: true });
   const call = async (op: number, payload: Uint8Array<ArrayBufferLike> = new Uint8Array(0)) =>

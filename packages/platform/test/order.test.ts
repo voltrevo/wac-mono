@@ -127,7 +127,7 @@ Deno.test("Cli's fields and the provider's arguments are in the same order", asy
   const wac = await Deno.readTextFile("packages/platform/src/platform.wac");
   const prov = await Deno.readTextFile("packages/platform/host/provider.ts");
 
-  for (const struct of ["Cli", "Core"] as const) {
+  for (const struct of ["Cli", "Core", "Page"] as const) {
     const declared = wacOrder(wac, struct);
     const passed = providerOrder(prov, struct);
     assertEquals(
@@ -138,7 +138,7 @@ Deno.test("Cli's fields and the provider's arguments are in the same order", asy
         `  provider.ts:  ${passed.join(", ")}`,
     );
     // A guard against the parser silently finding nothing and the comparison passing on two
-    // empty lists. Core has five capabilities, Cli twenty-five.
+    // empty lists. Core has six capabilities, Page seven, Cli twenty-five.
     assertEquals(declared.length >= 5, true, `only ${declared.length} parsed for ${struct}`);
   }
 });

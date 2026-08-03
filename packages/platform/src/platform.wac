@@ -100,6 +100,97 @@ export struct FileResult {
 }
 
 /**
+ * Something the user did.
+ *
+ * `id` is the `id` attribute of the element it happened on, and empty when it has none —
+ * which is why the examples give ids to everything they care about. Matching on ids rather
+ * than handing back an element reference keeps the boundary to strings: an element is a live
+ * object on the other side of a thread, and a handle to one would have to be freed.
+ *
+ * `value` carries whatever the event's kind makes useful — an input's text for `input` and
+ * `change`, the key's name for `keydown`, and empty otherwise. One field rather than a union
+ * because the alternative is four structs to say the same thing.
+ */
+export struct Event {
+  /** "click", "input", "change", "keydown", "submit". */
+  string kind;
+  string id;
+  string value;
+
+  Event of(string kind, string id, string value) { return Event(kind, id, value); }
+}
+
+/**
+ * A page to draw on and events to answer, for `--target browser`.
+ *
+ * A third profile beside `Core` and `Cli`, and only a browser provides it: a page capability
+ * that pretended to work in a terminal would be a lie, and the whole point of these structs is
+ * that reading one tells you what a program can reach.
+ *
+ * **An interactive application is a loop, not a set of callbacks:**
+ *
+ * ```wac
+ * page.render("<button id=\'go\'>go</button><p id=\'out\'></p>");
+ * page.on("#go", "click");
+ * while (true) {
+ *   Event e = page.nextEvent().wait();
+ *   if (e.id == "go") { page.setText("out", "hello"); }
+ * }
+ * ```
+ *
+ * That works because an event is just another ticket. `nextEvent` parks the worker exactly as
+ * `recv` parks it on a socket, and the page's main thread — which is the *host* — stays free to
+ * run the real event loop and queue what arrives. So `waitAny` composes over it: a click or a
+ * five-second deadline is `waitAny(i32[](e.id), 5000)`, which is the thing callbacks make hard.
+ *
+ * The operations are coarse for the reason given at the top of this file. `render` replaces the
+ * application's whole root in one call, which suits building strings; `setText` and `setValue`
+ * are for the targeted updates that would otherwise mean re-rendering to change a word. There
+ * is deliberately no `querySelector`-shaped surface: every property poke would be a round trip
+ * across a thread boundary, to arrive at an object this side cannot hold.
+ */
+export struct Page {
+  /** Replace the application root's markup. The application builds it; nothing escapes it. */
+  fn[Pending<bool>(string)] render;
+  /**
+   * Set an element's *text*, by id.
+   *
+   * Text, not markup: this is `textContent`, so a value that happens to contain `<script>`
+   * lands as those characters. `render` is the one that parses, and the difference is where
+   * every injection bug in a page like this would come from.
+   */
+  fn[Pending<bool>(string, string)] setText;
+  /** Set an input's value, by id. */
+  fn[Pending<bool>(string, string)] setValue;
+  /** Read an input's value, by id. Empty if there is no such element. */
+  fn[Pending<string>(string)] getValue;
+  /**
+   * Ask for an event kind on everything matching a CSS selector.
+   *
+   * Delegated from the document, so it keeps working after `render` replaces the elements it
+   * was asked about — which it otherwise would not, and the bug would look like "the second
+   * click does nothing".
+   */
+  fn[Pending<bool>(string, string)] on;
+  /** The next event, waiting for one. */
+  fn[Pending<Event>()] nextEvent;
+  /** The document title. */
+  fn[Pending<bool>(string)] title;
+
+  Page of(
+    fn[Pending<bool>(string)] render,
+    fn[Pending<bool>(string, string)] setText,
+    fn[Pending<bool>(string, string)] setValue,
+    fn[Pending<string>(string)] getValue,
+    fn[Pending<bool>(string, string)] on,
+    fn[Pending<Event>()] nextEvent,
+    fn[Pending<bool>(string)] title
+  ) {
+    return Page(render, setText, setValue, getValue, on, nextEvent, title);
+  }
+}
+
+/**
  * What every host can do, synchronously or made to look so.
  *
  * Deno, Node and a browser all provide these, which is what makes an application that

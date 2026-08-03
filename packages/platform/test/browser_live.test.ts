@@ -19,8 +19,9 @@
 // arm64 builds had been unavailable, and they are not any more.
 //
 // What this proves that nothing else does: `SharedArrayBuffer` under genuine cross-origin
-// isolation, `Atomics.wait` on a real `Worker`, and the page's own plumbing — the blob-URL
-// worker, the `crossOriginIsolated` check, and the `<pre>` that `write` appends to.
+// isolation, `Atomics.wait` on a real `Worker`, the page's own plumbing — the blob-URL worker,
+// the `crossOriginIsolated` check, the `<pre>` that `write` appends to — and, since `Page`
+// landed, an interactive application driven by real clicks and real typing.
 
 import { buildApp } from "../build.ts";
 
@@ -151,6 +152,40 @@ Deno.test({
       assertEquals(rt.includes("same bytes back"), true, rt);
       assertEquals(rt.includes("including roundtrip.txt"), true, rt);
       assertEquals(rt.includes("[exit 0]"), true, rt);
+
+      // An interactive application, driven by real clicks. This is the part no double reaches:
+      // delegated listeners surviving a `render`, an event queue feeding a parked worker, and
+      // state kept in a local across events because the program is a loop rather than a set of
+      // callbacks.
+      await buildApp("packages/platform/example/counter.wac", `${dir}/counter.html`, {}, "browser");
+      await page.goto(`http://127.0.0.1:${port}/counter.html`, { waitUntil: "load" });
+      await page.waitForSelector("#up", { timeout: 30_000 });
+
+      await page.click("#up");
+      await page.click("#up");
+      await page.click("#up");
+      await page.click("#down");
+      assertEquals(await page.textContent("#n"), "2", "three up and one down");
+
+      // Typing, which arrives as `input` events carrying the value.
+      await page.fill("#echo", "typed");
+      assertEquals(await page.textContent("#said"), "you typed: typed");
+
+      await page.click("#reset");
+      assertEquals(await page.textContent("#n"), "0", "reset");
+      assertEquals(await page.inputValue("#echo"), "", "reset clears the box too");
+
+      // And the loop ends when the program decides to return, not when the page decides.
+      await page.click("#up");
+      await page.click("#quit");
+      await page.waitForFunction(
+        "document.body.innerText.includes('[exit')",
+        null,
+        { timeout: 30_000 },
+      );
+      const done = (await page.evaluate("document.body.innerText")) as string;
+      assertEquals(done.includes("counted to 1"), true, done);
+      assertEquals(done.includes("[exit 0]"), true, done);
 
       assertEquals(failures.join("\n"), "", "the page raised errors");
     } finally {

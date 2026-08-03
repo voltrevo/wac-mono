@@ -77,6 +77,34 @@ export type BrowserWorldOptions = {
   root?: DirHandle;
   /** Whether writes are allowed, when a root is granted at all. */
   writable?: boolean;
+  /**
+   * The page itself, if the application is an interactive one.
+   *
+   * Injected rather than reached for, the same way `root` is, and for the same two reasons:
+   * this module then contains no reference to `document` and can be tested against a double,
+   * and a page that wants to give an application one corner of itself can pass a `Dom` scoped
+   * to that corner. Absent means every `Page` capability is refused.
+   */
+  dom?: Dom;
+};
+
+/**
+ * What a page has to be able to do for an interactive application.
+ *
+ * Deliberately small and string-shaped. An element is a live object on the other side of a
+ * thread; a capability that handed one back would be handing back something this side cannot
+ * hold, so everything here is named by id or selector and answers with text.
+ */
+export type Dom = {
+  render(html: string): void;
+  setText(id: string, text: string): void;
+  setValue(id: string, value: string): void;
+  value(id: string): string;
+  /** Subscribe, delegated from the document so it survives a `render`. */
+  on(selector: string, kind: string): void;
+  title(text: string): void;
+  /** The next event, waiting for one. One waiter, like a child's output queue. */
+  next(): Promise<{ kind: string; id: string; value: string }>;
 };
 
 /** A path resolved to the directory that holds it, and its last component. */
@@ -92,6 +120,18 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   };
 
   const root = (): DirHandle => opts.root ?? deny("filesystem read");
+  /** The page, or a refusal naming what is missing rather than a TypeError. */
+  const dom = (): Dom => {
+    if (opts.dom === undefined) deny("the page");
+    return opts.dom as Dom;
+  };
+
+  /** A length-prefixed string followed by the rest, which is how two strings cross. */
+  const twoStrings = (p: Uint8Array): [string, string] => {
+    const n = readI32le(p);
+    return [unstr(p.subarray(4, 4 + n)), unstr(p.subarray(4 + n))];
+  };
+
   const canWrite = (): void => {
     if (opts.root === undefined || opts.writable !== true) deny("filesystem write");
   };
@@ -150,6 +190,22 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     // A timer, which is what makes a timeout expressible: waited on beside another ticket,
     // whichever lands first decides. Resolves to the monotonic nanoseconds at which it fired
     // rather than to nothing, so a caller can see the overshoot.
+    // ── The page ──────────────────────────────────────────────────────────────
+    // Refused rather than ignored when no `dom` was given: an application that thinks it has
+    // drawn something and has not is worse off than one told it cannot draw.
+    [OP.RENDER]: (p) => { dom().render(unstr(p)); return EMPTY; },
+    [OP.SET_TEXT]: (p) => { const [a, b] = twoStrings(p); dom().setText(a, b); return EMPTY; },
+    [OP.SET_VALUE]: (p) => { const [a, b] = twoStrings(p); dom().setValue(a, b); return EMPTY; },
+    [OP.GET_VALUE]: (p) => str(dom().value(unstr(p))),
+    [OP.ON]: (p) => { const [a, b] = twoStrings(p); dom().on(a, b); return EMPTY; },
+    [OP.TITLE]: (p) => { dom().title(unstr(p)); return EMPTY; },
+    [OP.NEXT_EVENT]: async () => {
+      const e = await dom().next();
+      // Three NUL-separated strings. None of them can contain a NUL: two are an id and an
+      // event kind, and the third is an input's value, which cannot hold one either.
+      return str(`${e.kind}\u0000${e.id}\u0000${e.value}`);
+    },
+
     [OP.SLEEP_MILLIS]: (p) =>
       new Promise<Uint8Array>((ok) =>
         setTimeout(() => ok(i64le(BigInt(Math.round(performance.now() * 1e6)))), readI32le(p))

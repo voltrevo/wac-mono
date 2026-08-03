@@ -12,8 +12,8 @@
 
 import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
-import { browserWorld, type BrowserWorldOptions } from "./browser.ts";
-import { cliOf, coreOf } from "./provider.ts";
+import { browserWorld, type BrowserWorldOptions, type Dom } from "./browser.ts";
+import { cliOf, coreOf, type PageClasses, pageOf } from "./provider.ts";
 import type { AppModule } from "./entry.ts";
 
 type Start = { sab: SharedArrayBuffer };
@@ -40,7 +40,14 @@ export function runAsWorkerBrowser(load: () => Promise<AppModule>): void {
       const b = bridgeOf(start.sab);
       try {
         const app = await load();
-        scope.postMessage({ ok: true, code: app.main(coreOf(b, app), cliOf(b, app)) });
+        // A module with a `page` export is an interactive application, and gets `Page`
+        // instead of `Cli`. Chosen by which export exists rather than by inspecting `main`'s
+        // parameter types: the name says which kind of program this is, at a glance, in the
+        // source and here.
+        const code = app.page !== undefined
+          ? app.page(coreOf(b, app), pageOf(b, app as unknown as PageClasses))
+          : app.main(coreOf(b, app), cliOf(b, app));
+        scope.postMessage({ ok: true, code });
       } catch (e) {
         scope.postMessage({
           ok: false,
@@ -48,6 +55,104 @@ export function runAsWorkerBrowser(load: () => Promise<AppModule>): void {
         });
       }
     })();
+  };
+}
+
+/**
+ * The little of the DOM this needs, declared here rather than by pulling in a whole library.
+ *
+ * Deno's default types do not describe a document, and the alternative — a `lib.dom` reference
+ * — would put every browser global in scope for a file that runs under Deno's type checker.
+ * Structural types keep the surface honest: these six members are precisely what is used.
+ */
+type El = {
+  id: string;
+  innerHTML: string;
+  textContent: string | null;
+  value?: string;
+  closest(selector: string): El | null;
+};
+type Ev = { target: El | null; key?: string; preventDefault(): void };
+type Doc = {
+  title: string;
+  getElementById(id: string): El | null;
+  addEventListener(kind: string, fn: (ev: Ev) => void): void;
+};
+
+/**
+ * The document, as the small string-shaped thing `browser.ts` asks for.
+ *
+ * Here rather than in `browser.ts` so that module names no browser global and can be tested
+ * against a double — the same split as the Origin Private File System root.
+ *
+ * Events are **delegated from the document**: one listener per kind, and `closest(selector)`
+ * decides whether a given event is one the application asked for. Listeners attached to the
+ * matching elements themselves would stop working the moment `render` replaced them, and the
+ * symptom — the first click works and the second does not — sends you looking in the wrong
+ * place entirely.
+ */
+export function pageDom(root: El, doc: Doc): Dom {
+  const queue: { kind: string; id: string; value: string }[] = [];
+  let waiting: ((e: { kind: string; id: string; value: string }) => void) | null = null;
+  const wanted = new Map<string, string[]>();   // event kind -> the selectors asked for
+
+  const deliver = (e: { kind: string; id: string; value: string }) => {
+    if (waiting !== null) {
+      const w = waiting;
+      waiting = null;
+      w(e);
+      return;
+    }
+    queue.push(e);
+  };
+
+  return {
+    render: (html) => { root.innerHTML = html; },
+    setText: (id, text) => {
+      const el = doc.getElementById(id);
+      if (el !== null) el.textContent = text;
+    },
+    setValue: (id, value) => {
+      const el = doc.getElementById(id);
+      if (el !== null) el.value = value;
+    },
+    value: (id) => doc.getElementById(id)?.value ?? "",
+    title: (text) => { doc.title = text; },
+    on: (selector, kind) => {
+      const already = wanted.get(kind);
+      if (already !== undefined) {
+        already.push(selector);
+        return;   // one listener per kind; the selector list grows instead
+      }
+      wanted.set(kind, [selector]);
+      doc.addEventListener(kind, (ev: Ev) => {
+        const target = ev.target;
+        if (target === null) return;
+        for (const sel of wanted.get(kind) ?? []) {
+          const hit = target.closest(sel);
+          if (hit === null) continue;
+          // A form's `submit` would reload the page, which ends the application mid-answer.
+          if (kind === "submit") ev.preventDefault();
+          deliver({
+            kind,
+            id: hit.id,
+            value: kind === "keydown" ? (ev.key ?? "") : (target.value ?? ""),
+          });
+          return;
+        }
+      });
+    },
+    next: () =>
+      new Promise((resolve) => {
+        const queued = queue.shift();
+        if (queued !== undefined) {
+          resolve(queued);
+          return;
+        }
+        // One waiter, because there is one worker asking. A second `nextEvent` before the
+        // first is answered would be the application's bug rather than something to buffer.
+        waiting = resolve;
+      }),
   };
 }
 
