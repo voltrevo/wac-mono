@@ -53,6 +53,7 @@ import { json } from "./applets/json.wac";
 import { ls } from "./applets/ls.wac";
 import { mkdir } from "./applets/mkdir.wac";
 import { mv } from "./applets/mv.wac";
+import { nc } from "./applets/nc.wac";
 import { nl } from "./applets/nl.wac";
 import { paste } from "./applets/paste.wac";
 import { rev } from "./applets/rev.wac";
@@ -116,6 +117,7 @@ export i32 main(Core core, Cli cli) {
   if (applet == "ls")        { return ls(core, cli, a); }
   if (applet == "mkdir")     { return mkdir(core, cli, a); }
   if (applet == "mv")        { return mv(core, cli, a); }
+  if (applet == "nc")        { return nc(core, cli, a); }
   if (applet == "nl")        { return nl(core, cli, a); }
   if (applet == "paste")     { return paste(core, cli, a); }
   if (applet == "rev")       { return rev(core, cli, a); }
@@ -159,7 +161,7 @@ export i32 main(Core core, Cli cli) {
 i32 usage(Core core) {
   core.warn("usage: box <applet> [-flags] [args]");
   core.warn("  base32 base64 basename cat cp crc32 cut date diff dirname du echo false");
-  core.warn("  find fold get gets grep gunzip gzip head hex httpd json ls mkdir mv nl");
+  core.warn("  find fold get gets grep gunzip gzip head hex httpd json ls mkdir mv nc nl");
   core.warn("  paste rev rm rmdir seq serve sha256sum sha512sum shuf sort split sponge");
   core.warn("  stat strings tac tail tar tee touch tr true uniq unzstd urldecode");
   core.warn("  urlencode uuid wc wget yes zstd");
@@ -167,6 +169,7 @@ i32 usage(Core core) {
   core.warn("       cut -f<n> -d<c>   tr <set1> <set2>   mkdir -p   rm -rf   json -c");
   core.warn("net:   get <host> [path] [-<port>] [-i]   wget <host> <path> <out>\n"
             + "       serve [-<port>] [-o]   httpd [-<port>] [dir] [-o] [-x]\n"
-            + "       gets <host> <path> <root.der> [-<port>]   (TLS 1.3)");
+            + "       gets <host> <path> <root.der> [-<port>]   (TLS 1.3)\n"
+            + "       nc <host> <port>   nc -<port> -l");
   return 2;
 }
