@@ -45,7 +45,7 @@ export i32 gets(Core core, Cli cli, Args a) {
   string path = a.rest[1];
   i32 port = a.num == 0 ? 443 : a.num;
 
-  FileResult rootFile = cli.readFile(a.rest[2]);
+  FileResult rootFile = cli.readFile(a.rest[2]).wait();
   if (!rootFile.ok) { core.warn(a.name + ": " + a.rest[2] + ": " + rootFile.error); return 1; }
   u8[] root = rootFile.bytes;
   // The store is DER certificates end to end, indexed by (start, end) pairs. One here.
@@ -53,19 +53,19 @@ export i32 gets(Core core, Cli cli, Args a) {
 
   Step s = unpack(tlsClientInit(
     host.toBytes(), root, offsets,
-    core.randomBytes(32),      // X25519 ephemeral
-    core.randomBytes(32),      // P-256 ephemeral
-    core.randomBytes(64),      // ML-KEM seed, for the hybrid group
-    core.randomBytes(32),      // client random
+    core.randomBytes(32).wait(),      // X25519 ephemeral
+    core.randomBytes(32).wait(),      // P-256 ephemeral
+    core.randomBytes(64).wait(),      // ML-KEM seed, for the hybrid group
+    core.randomBytes(32).wait(),      // client random
     // Seconds, not milliseconds. `notBefore`/`notAfter` are parsed from the certificate
     // as seconds since the epoch, and handing this the millisecond clock puts "now"
     // around the year 57000, where every certificate has expired — which arrives as a
     // bad_certificate alert and looks like a chain problem.
-    core.nowMillis() / 1000));
+    core.nowMillis().wait() / 1000));
 
-  Socket sock = cli.connect(host, port);
+  Socket sock = cli.connect(host, port).wait();
   if (sock.handle < 0) { core.warn(a.name + ": " + host + ": " + sock.error); return 1; }
-  if (!cli.send(sock.handle, s.toSend)) {
+  if (!cli.send(sock.handle, s.toSend).wait()) {
     core.warn(a.name + ": cannot send the client hello");
     cli.closeSocket(sock.handle);
     return 1;
@@ -97,11 +97,11 @@ export i32 gets(Core core, Cli cli, Args a) {
         + "Connection: close\r\n\r\n";
       Step out = unpack(tlsClientSend(s.state, req.toBytes()));
       s = Step(out.state, out.toSend, u8[0]());
-      if (!cli.send(sock.handle, s.toSend)) { break; }
+      if (!cli.send(sock.handle, s.toSend).wait()) { break; }
       requested = true;
     }
 
-    u8[] chunk = cli.recv(sock.handle);
+    u8[] chunk = cli.recv(sock.handle).wait();
     if (chunk.len() == 0) { break; }          // the peer closed
     buffered = concat(buffered, chunk);
 
@@ -119,7 +119,7 @@ export i32 gets(Core core, Cli cli, Args a) {
     Step step = unpack(tlsClientFeed(s.state, slice(buffered, 0, ready)));
     buffered = slice(buffered, ready, buffered.len());
     s = step;
-    if (s.toSend.len() > 0 && !cli.send(sock.handle, s.toSend)) { break; }
+    if (s.toSend.len() > 0 && !cli.send(sock.handle, s.toSend).wait()) { break; }
     if (s.appData.len() > 0) { body = concat(body, s.appData); }
   }
 

@@ -30,7 +30,7 @@ export i32 split(Core core, Cli cli, Args a) {
     if (!l.ok) { break; }
     if (!open) {
       string name = prefix + suffix(piece);
-      string error = cli.openOutput(name);
+      string error = cli.openOutput(name).wait();
       if (error != "") { core.warn(a.name + ": " + name + ": " + error); return 1; }
       open = true;
       written = 0;
@@ -41,7 +41,7 @@ export i32 split(Core core, Cli cli, Args a) {
   }
   // Back to standard output, which closes the last piece — a file left open is a file that
   // may not be on disk yet.
-  cli.openOutput("");
+  cli.openOutput("").wait();
   return 0;
 }
 

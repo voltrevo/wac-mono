@@ -30,6 +30,17 @@ export type AppModule = {
   FileResult: { of(...a: unknown[]): unknown };
   Stat: { of(...a: unknown[]): unknown };
   Socket: { of(...a: unknown[]): unknown };
+  /** The monomorphised `Pending<T>`s — one per capability return type. */
+  Pending_i32: { of(...a: unknown[]): unknown };
+  Pending_i64: { of(...a: unknown[]): unknown };
+  Pending_string: { of(...a: unknown[]): unknown };
+  Pending_stringOpt: { of(...a: unknown[]): unknown };
+  Pending_u8Arr: { of(...a: unknown[]): unknown };
+  Pending_bool: { of(...a: unknown[]): unknown };
+  Pending_stringArrOpt: { of(...a: unknown[]): unknown };
+  Pending_FileResult: { of(...a: unknown[]): unknown };
+  Pending_Stat: { of(...a: unknown[]): unknown };
+  Pending_Socket: { of(...a: unknown[]): unknown };
   main: (core: unknown, cli: unknown) => number;
 };
 

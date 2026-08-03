@@ -146,7 +146,7 @@ export struct Shell {
     if (v.isNone()) {
       // A variable the shell has not set falls back to the environment, which is what makes
       // `echo $HOME` work without an assignment.
-      string? env = this.cli.env(name);
+      string? env = this.cli.env(name).wait();
       return (env is null) ? "" : env!;
     }
     return v.unwrap();
@@ -384,7 +384,7 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
     match (r.kind) {
       case In: {
         string path = joinWord(sh, r.target);
-        FileResult f = sh.cli.readFile(path);
+        FileResult f = sh.cli.readFile(path).wait();
         if (!f.ok) {
           sh.errOut.pushAll(("sh: " + path + ": " + f.error + "\n").toBytes());
           sh.status = 1;
@@ -450,7 +450,7 @@ bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
   }
   u8[] payload = data;
   if (append) {
-    FileResult existing = sh.cli.readFile(path);
+    FileResult existing = sh.cli.readFile(path).wait();
     if (existing.ok) {
       Buf both = Buf.create();
       both.pushAll(existing.bytes);
@@ -458,7 +458,7 @@ bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
       payload = both.take();
     }
   }
-  if (!sh.cli.writeFile(path, payload)) {
+  if (!sh.cli.writeFile(path, payload).wait()) {
     sh.errOut.pushAll(("sh: " + path + ": cannot write\n").toBytes());
     sh.status = 1;
   }
@@ -721,7 +721,7 @@ void globInto(Shell sh, u8[] pattern, u8[] quoted, Vec<string> argv) {
   u8[] tail = sliceBytes(pattern, slash + 1, pattern.len());
   u8[] tailMask = sliceBytes(quoted, slash + 1, quoted.len());
 
-  string[]? names = sh.cli.readDir(dir);
+  string[]? names = sh.cli.readDir(dir).wait();
   if (names is null) { return; }
 
   Vec<string> hits = Vec.create();

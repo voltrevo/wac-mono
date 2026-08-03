@@ -5,10 +5,10 @@ import { Args } from "../lib/args.wac";
 
 export i32 ls(Core core, Cli cli, Args a) {
   string path = a.rest.len() < 1 ? "." : a.rest[0];
-  string[]? names = cli.readDir(path);
+  string[]? names = cli.readDir(path).wait();
   if (names is null) {
     // Not a directory, or not permitted — the application cannot tell, by design.
-    Stat st = cli.stat(path);
+    Stat st = cli.stat(path).wait();
     if (st.exists) { core.log(path); return 0; }
     core.warn(a.name + ": " + path + ": cannot list");
     return 1;

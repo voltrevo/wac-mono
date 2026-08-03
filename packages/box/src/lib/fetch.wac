@@ -11,14 +11,14 @@ import { Incoming, ParsedResponse, parseResponse } from "../../../http/src/incom
 
 /** The exit code the applet should return. */
 export i32 fetch(Core core, Cli cli, string name, string host, string path, i32 port, bool headers) {
-  Socket s = cli.connect(host, port);
+  Socket s = cli.connect(host, port).wait();
   if (s.handle < 0) { core.warn(name + ": " + host + ": " + s.error); return 1; }
 
   string req = "GET " + path + " HTTP/1.1\r\n"
     + "Host: " + host + "\r\n"
     + "User-Agent: box\r\n"
     + "Connection: close\r\n\r\n";
-  if (!cli.send(s.handle, req.toBytes())) {
+  if (!cli.send(s.handle, req.toBytes()).wait()) {
     core.warn(name + ": " + host + ": cannot send");
     cli.closeSocket(s.handle);
     return 1;
@@ -29,7 +29,7 @@ export i32 fetch(Core core, Cli cli, string name, string host, string path, i32 
   // length is complete rather than truncated.
   u8[] all = u8[0]();
   while (true) {
-    u8[] chunk = cli.recv(s.handle);
+    u8[] chunk = cli.recv(s.handle).wait();
     if (chunk.len() == 0) { break; }
     all = concat(all, chunk);
   }

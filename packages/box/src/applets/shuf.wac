@@ -35,7 +35,7 @@ export i32 shuf(Core core, Cli cli, Args a) {
 i32 below(Core core, i32 bound) {
   i64 limit = 4294967296 - (4294967296 % (bound as i64));
   while (true) {
-    u8[] r = core.randomBytes(4);
+    u8[] r = core.randomBytes(4).wait();
     i64 v = (r[0] as i64) | ((r[1] as i64) << 8) | ((r[2] as i64) << 16) | ((r[3] as i64) << 24);
     if (v < limit) { return (v % (bound as i64)) as~ i32; }
   }

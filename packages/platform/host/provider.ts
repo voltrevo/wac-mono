@@ -5,10 +5,38 @@
 // never frees a slot, so a fresh closure per call dies on the seventeenth with a
 // `RangeError` a long way from its cause. `packages/stream` hit this and its README says
 // the same thing: hold stable functions and put the varying part in their arguments.
+//
+// That rule is why a ticket carries an `i32` and three *shared* resolvers rather than a
+// closure over its own answer. Every `readFile` in a program hands back the same three
+// functions with a different number in front of them.
+//
+// A ticket's number is its slot and its generation packed together, so nothing has to be
+// kept in a table here and a ticket dropped on the floor leaks nothing on this side. Four
+// slots is two bits; the generation takes the rest.
 
-import { type Bridge } from "./layout.ts";
-import { hostCall, i32le, readI32le, readI64le, str, unstr } from "./call.ts";
+import { type Bridge, SLOTS } from "./layout.ts";
+import {
+  cancel,
+  collect,
+  hostCall,
+  HostCallError,
+  i32le,
+  isDone,
+  readI32le,
+  readI64le,
+  str,
+  submit,
+  type Ticket,
+  unstr,
+} from "./call.ts";
 import { OP } from "./ops.ts";
+
+const EMPTY = new Uint8Array(0);
+const SLOT_BITS = Math.ceil(Math.log2(SLOTS));
+const SLOT_MASK = (1 << SLOT_BITS) - 1;
+
+const pack = (t: Ticket): number => t.slot | (t.gen << SLOT_BITS);
+const unpack = (id: number): Ticket => ({ slot: id & SLOT_MASK, gen: id >>> SLOT_BITS });
 
 /** The generated classes this needs from a module that imports `platform.wac`. */
 export type PlatformClasses = {
@@ -17,18 +45,50 @@ export type PlatformClasses = {
   FileResult: { of?(...a: unknown[]): unknown };
 };
 
+/** One monomorphised `Pending<T>`. bindgen names them `Pending_FileResult` and so on. */
+type PendingClass = { of(id: number, resolve: unknown, settled: unknown, drop: unknown): unknown };
+
+/** Every `Pending<T>` the world hands out. */
+export type PendingClasses = {
+  Pending_i32: PendingClass;
+  Pending_i64: PendingClass;
+  Pending_string: PendingClass;
+  Pending_stringOpt: PendingClass;
+  Pending_u8Arr: PendingClass;
+  Pending_bool: PendingClass;
+  Pending_stringArrOpt: PendingClass;
+  Pending_FileResult: PendingClass;
+  Pending_Stat: PendingClass;
+  Pending_Socket: PendingClass;
+};
+
 /**
  * `Core`, built from the bridge.
  *
- * Each capability is an ordinary JavaScript function as far as wac is concerned. That it
- * parks a thread and waits for another one to answer is invisible from the wac side,
- * which is the entire point: the application is straight-line code.
+ * `log` and `warn` hand back nothing. A ticket for a line of output would be noise at
+ * every call site for a capability no program will overlap, and the world keeps writes to
+ * one destination in order anyway, so a caller loses nothing by not being able to wait.
  */
-export function coreOf(b: Bridge, cls: { Core: PlatformClasses["Core"] }): unknown {
+export function coreOf(
+  b: Bridge,
+  cls: { Core: PlatformClasses["Core"] } & PendingClasses,
+): unknown {
+  const settled = (id: number) => isDone(b, unpack(id));
+  const drop = (id: number) => { cancel(b, unpack(id)); };
+  const i64 = (id: number) => readI64le(collect(b, unpack(id)));
+  const bytes = (id: number) => collect(b, unpack(id));
+
+  const asI64 = (t: Ticket) => cls.Pending_i64.of(pack(t), i64, settled, drop);
+  const asBytes = (t: Ticket) => cls.Pending_u8Arr.of(pack(t), bytes, settled, drop);
+
   return cls.Core.of(
-    () => readI64le(hostCall(b, OP.NOW_MILLIS, new Uint8Array(0))),
-    () => readI64le(hostCall(b, OP.MONOTONIC_NANOS, new Uint8Array(0))),
-    (n: number) => hostCall(b, OP.RANDOM_BYTES, i32le(n)),
+    () => asI64(submit(b, OP.NOW_MILLIS, EMPTY)),
+    () => asI64(submit(b, OP.MONOTONIC_NANOS, EMPTY)),
+    (n: number) => asBytes(submit(b, OP.RANDOM_BYTES, i32le(n))),
+    // Submitted *and collected*. A bare submit claims a slot the worker never gives
+    // back, so four log lines exhausted the ring and the fifth call parked forever —
+    // which showed up as `ls .` failing while `ls somefile` worked, because only the
+    // former reached a log loop.
     (line: string) => { hostCall(b, OP.LOG, str(line)); },
     (line: string) => { hostCall(b, OP.WARN, str(line)); },
   );
@@ -47,173 +107,175 @@ export function cliOf(
     FileResult: { of(...a: unknown[]): unknown };
     Stat: { of(...a: unknown[]): unknown };
     Socket: { of(...a: unknown[]): unknown };
-  },
+  } & PendingClasses,
 ): unknown {
-  const mk = {
-    fileResult: (ok: boolean, bytes: Uint8Array, error: string) =>
-      cls.FileResult.of(ok, bytes, error),
+  const settled = (id: number) => isDone(b, unpack(id));
+  const drop = (id: number) => { cancel(b, unpack(id)); };
+
+  // One resolver per return shape, hoisted for the reason in the file header.
+  const bytes = (id: number) => collect(b, unpack(id));
+  const i32 = (id: number) => readI32le(collect(b, unpack(id)));
+  const text = (id: number) => unstr(collect(b, unpack(id)));
+  /** Empty means it worked; anything else is the host's message. */
+  const outcome = (id: number) => {
+    try {
+      collect(b, unpack(id));
+      return "";
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
   };
+  /** True when it worked. A failure is an answer here, not an exception. */
+  const ok = (id: number) => {
+    try {
+      collect(b, unpack(id));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  /** Bytes, or empty where a broken source is indistinguishable from an ended one. */
+  const chunk = (id: number) => {
+    try {
+      return collect(b, unpack(id));
+    } catch {
+      return EMPTY;
+    }
+  };
+  const fileResult = (id: number) => {
+    try {
+      return cls.FileResult.of(true, collect(b, unpack(id)), "");
+    } catch (e) {
+      return cls.FileResult.of(false, EMPTY, e instanceof Error ? e.message : String(e));
+    }
+  };
+  const stat = (id: number) => {
+    try {
+      const out = collect(b, unpack(id));
+      // exists, isFile, isDir as bytes, then size and mtime as little-endian i64s.
+      const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
+      return cls.Stat.of(
+        out[0] === 1, out[1] === 1, out[2] === 1,
+        dv.getBigInt64(3, true), dv.getBigInt64(11, true),
+      );
+    } catch {
+      return cls.Stat.of(false, false, false, 0n, 0n);
+    }
+  };
+  const dirNames = (id: number) => {
+    try {
+      const out = collect(b, unpack(id));
+      if (out.length === 0) return [];
+      // NUL-separated: a filename may contain anything but a NUL or a slash.
+      return unstr(out).split("\u0000");
+    } catch {
+      return null;
+    }
+  };
+  const maybeText = (id: number) => {
+    const out = collect(b, unpack(id));
+    // One byte of presence in front, because an unset variable and an empty one are
+    // different and a bare empty payload cannot say which this is.
+    return out[0] === 1 ? unstr(out.subarray(1)) : null;
+  };
+  const socket = (id: number) => {
+    try {
+      return cls.Socket.of(readI32le(collect(b, unpack(id))), "");
+    } catch (e) {
+      return cls.Socket.of(-1, e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const T = {
+    i32: (t: Ticket) => cls.Pending_i32.of(pack(t), i32, settled, drop),
+    text: (t: Ticket) => cls.Pending_string.of(pack(t), text, settled, drop),
+    outcome: (t: Ticket) => cls.Pending_string.of(pack(t), outcome, settled, drop),
+    maybeText: (t: Ticket) => cls.Pending_stringOpt.of(pack(t), maybeText, settled, drop),
+    bytes: (t: Ticket) => cls.Pending_u8Arr.of(pack(t), bytes, settled, drop),
+    chunk: (t: Ticket) => cls.Pending_u8Arr.of(pack(t), chunk, settled, drop),
+    ok: (t: Ticket) => cls.Pending_bool.of(pack(t), ok, settled, drop),
+    file: (t: Ticket) => cls.Pending_FileResult.of(pack(t), fileResult, settled, drop),
+    stat: (t: Ticket) => cls.Pending_Stat.of(pack(t), stat, settled, drop),
+    dir: (t: Ticket) => cls.Pending_stringArrOpt.of(pack(t), dirNames, settled, drop),
+    socket: (t: Ticket) => cls.Pending_Socket.of(pack(t), socket, settled, drop),
+  };
+
+  const twoPaths = (from: string, to: string): Uint8Array => {
+    const a = str(from);
+    const bs = str(to);
+    const out = new Uint8Array(4 + a.length + bs.length);
+    out.set(i32le(a.length), 0);
+    out.set(a, 4);
+    out.set(bs, 4 + a.length);
+    return out;
+  };
+  const flagged = (on: boolean, path: string): Uint8Array => {
+    const p = str(path);
+    const out = new Uint8Array(1 + p.length);
+    out[0] = on ? 1 : 0;
+    out.set(p, 1);
+    return out;
+  };
+  /** `head` then `body`, with nothing in between — what `connect` and `send` expect. */
+  const headed = (head: Uint8Array, body: Uint8Array): Uint8Array => {
+    const out = new Uint8Array(head.length + body.length);
+    out.set(head, 0);
+    out.set(body, head.length);
+    return out;
+  };
+  /** A length-prefixed head, so the host can tell where it ends — `writeFile` and `rename`. */
+  const prefixed = (head: Uint8Array, body: Uint8Array): Uint8Array => {
+    const out = new Uint8Array(4 + head.length + body.length);
+    out.set(i32le(head.length), 0);
+    out.set(head, 4);
+    out.set(body, 4 + head.length);
+    return out;
+  };
+
   return cls.Cli.of(
-    () => readI32le(hostCall(b, OP.ARG_COUNT, new Uint8Array(0))),
-    (i: number) => unstr(hostCall(b, OP.ARG, i32le(i))),
-    (name: string) => {
-      const out = hostCall(b, OP.ENV, str(name));
-      // One byte of presence in front, because an unset variable and an empty one are
-      // different and a bare empty payload cannot say which this is.
-      return out[0] === 1 ? unstr(out.subarray(1)) : null;
-    },
+    () => T.i32(submit(b, OP.ARG_COUNT, EMPTY)),
+    (i: number) => T.text(submit(b, OP.ARG, i32le(i))),
+    (name: string) => T.maybeText(submit(b, OP.ENV, str(name))),
+
     // stdin and stdout, which need no grant — see the note in platform.wac.
-    () => hostCall(b, OP.READ_STDIN, new Uint8Array(0)),
+    () => T.bytes(submit(b, OP.READ_STDIN, EMPTY)),
+    // Blocking, matching `platform.wac`: these two act on the current stream, which is
+    // ordered anyway, and are handed to the streaming transforms as bare funcrefs.
     (bytes: Uint8Array) => {
       try {
-        hostCall(b, OP.WRITE_STDOUT, bytes);
+        collect(b, submit(b, OP.WRITE_STDOUT, bytes));
         return true;
       } catch {
         return false;   // a closed pipe is an answer, not a crash
       }
     },
-    (path: string) => {
-      try {
-        return mk.fileResult(true, hostCall(b, OP.READ_FILE, str(path)), "");
-      } catch (e) {
-        return mk.fileResult(false, new Uint8Array(0), e instanceof Error ? e.message : String(e));
-      }
-    },
-    (path: string, bytes: Uint8Array) => {
-      const p = str(path);
-      const payload = new Uint8Array(4 + p.length + bytes.length);
-      payload.set(i32le(p.length), 0);
-      payload.set(p, 4);
-      payload.set(bytes, 4 + p.length);
-      try {
-        hostCall(b, OP.WRITE_FILE, payload);
-        return true;
-      } catch {
-        return false;
-      }
-    },
-    (path: string) => {
-      try {
-        const out = hostCall(b, OP.STAT, str(path));
-        // exists, isFile, isDir as bytes, then size and mtime as little-endian i64s.
-        const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
-        return cls.Stat.of(
-          out[0] === 1, out[1] === 1, out[2] === 1,
-          dv.getBigInt64(3, true), dv.getBigInt64(11, true),
-        );
-      } catch {
-        return cls.Stat.of(false, false, false, 0n, 0n);
-      }
-    },
-    (path: string) => {
-      try {
-        const out = hostCall(b, OP.READ_DIR, str(path));
-        if (out.length === 0) return [];
-        // NUL-separated: a filename may contain anything but a NUL or a slash.
-        return unstr(out).split("\u0000");
-      } catch {
-        return null;
-      }
-    },
-    // A leading flag byte rather than two opcodes: `mkdir -p` and `mkdir` differ in one
-    // bit of intent, and one handler that reads it keeps them from drifting apart.
-    (path: string, parents: boolean) => tried(b, OP.MKDIR, flagged(parents, path)),
-    (path: string, recursive: boolean) => tried(b, OP.REMOVE, flagged(recursive, path)),
-    (from: string, to: string) => tried(b, OP.RENAME, twoPaths(from, to)),
-    (path: string) => {
-      try {
-        hostCall(b, OP.OPEN_INPUT, str(path));
-        return "";
-      } catch (e) {
-        return e instanceof Error ? e.message : String(e);
-      }
-    },
+
+    (path: string) => T.file(submit(b, OP.READ_FILE, str(path))),
+    (path: string, body: Uint8Array) => T.ok(submit(b, OP.WRITE_FILE, prefixed(str(path), body))),
+    (path: string) => T.stat(submit(b, OP.STAT, str(path))),
+    (path: string) => T.dir(submit(b, OP.READ_DIR, str(path))),
+
+    (path: string, parents: boolean) => T.ok(submit(b, OP.MKDIR, flagged(parents, path))),
+    (path: string, recursive: boolean) => T.ok(submit(b, OP.REMOVE, flagged(recursive, path))),
+    (from: string, to: string) => T.ok(submit(b, OP.RENAME, twoPaths(from, to))),
+
+    (path: string) => T.outcome(submit(b, OP.OPEN_INPUT, str(path))),
     () => {
       try {
-        return hostCall(b, OP.READ_CHUNK, new Uint8Array(0));
+        return collect(b, submit(b, OP.READ_CHUNK, EMPTY));
       } catch {
-        return new Uint8Array(0);   // unreadable is indistinguishable from ended, as it should be
+        return EMPTY;   // unreadable is indistinguishable from ended, as it should be
       }
     },
-    (path: string) => {
-      try {
-        hostCall(b, OP.OPEN_OUTPUT, str(path));
-        return "";
-      } catch (e) {
-        return e instanceof Error ? e.message : String(e);
-      }
-    },
+    (path: string) => T.outcome(submit(b, OP.OPEN_OUTPUT, str(path))),
 
-    // The network. A failure carries the host's message for the same reason `openInput`
-    // does: "connection refused" and "network not granted" are different problems.
-    (host: string, port: number) => {
-      const h = str(host);
-      const payload = new Uint8Array(4 + h.length);
-      payload.set(i32le(port), 0);
-      payload.set(h, 4);
-      return socketOf(b, cls.Socket, OP.CONNECT, payload);
-    },
-    (port: number) => socketOf(b, cls.Socket, OP.LISTEN, i32le(port)),
-    (handle: number) => socketOf(b, cls.Socket, OP.ACCEPT, i32le(handle)),
-    (handle: number) => {
-      try {
-        return hostCall(b, OP.RECV, i32le(handle));
-      } catch {
-        return new Uint8Array(0);   // a broken connection reads as a closed one
-      }
-    },
-    (handle: number, bytes: Uint8Array) => {
-      const payload = new Uint8Array(4 + bytes.length);
-      payload.set(i32le(handle), 0);
-      payload.set(bytes, 4);
-      try {
-        hostCall(b, OP.SEND, payload);
-        return true;
-      } catch {
-        return false;
-      }
-    },
-    (handle: number) => { try { hostCall(b, OP.CLOSE_SOCKET, i32le(handle)); } catch { /* already gone */ } },
+    (host: string, port: number) => T.socket(submit(b, OP.CONNECT, headed(i32le(port), str(host)))),
+    (port: number) => T.socket(submit(b, OP.LISTEN, i32le(port))),
+    (handle: number) => T.socket(submit(b, OP.ACCEPT, i32le(handle))),
+    (handle: number) => T.chunk(submit(b, OP.RECV, i32le(handle))),
+    (handle: number, body: Uint8Array) => T.ok(submit(b, OP.SEND, headed(i32le(handle), body))),
+    (handle: number) => { hostCall(b, OP.CLOSE_SOCKET, i32le(handle)); },
   );
 }
 
-function socketOf(
-  b: Bridge,
-  cls: { of(...a: unknown[]): unknown },
-  op: number,
-  payload: Uint8Array,
-): unknown {
-  try {
-    return cls.of(readI32le(hostCall(b, op, payload)), "");
-  } catch (e) {
-    return cls.of(-1, e instanceof Error ? e.message : String(e));
-  }
-}
-
-/** An op whose only answer is whether it worked. */
-function tried(b: Bridge, op: number, payload: Uint8Array): boolean {
-  try {
-    hostCall(b, op, payload);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function flagged(on: boolean, path: string): Uint8Array {
-  const p = str(path);
-  const out = new Uint8Array(1 + p.length);
-  out[0] = on ? 1 : 0;
-  out.set(p, 1);
-  return out;
-}
-
-function twoPaths(from: string, to: string): Uint8Array {
-  const a = str(from);
-  const bs = str(to);
-  const out = new Uint8Array(4 + a.length + bs.length);
-  out.set(i32le(a.length), 0);
-  out.set(a, 4);
-  out.set(bs, 4 + a.length);
-  return out;
-}
+export { HostCallError };

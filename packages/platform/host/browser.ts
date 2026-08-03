@@ -186,7 +186,9 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       const h = await dir.getDirectoryHandle(name);
       const names: string[] = [];
       for await (const key of h.keys()) { names.push(key); }
-      return str(names.sort().join(" "));
+      // NUL, as the other two worlds do. Joining on a space would split "my file"
+      // into two entries, and only in a browser — the worst place for it to differ.
+      return str(names.sort().join("\u0000"));
     },
 
     [OP.MKDIR]: async (p) => {
