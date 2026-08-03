@@ -88,18 +88,42 @@ substitution, not that the text stopped changing.
 
 ## External programs, and the seam
 
-The capability world cannot start a process
-([issue 0015](../../issues/open/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md)),
-so this shell cannot run `/bin/ls`. Rather than pretend, every external command goes through
-**one function** — `program.wac`'s `run` — backed today by a table of programs written in wac:
+Every external command goes through **one seam**, and there are now two things on the other side
+of it.
+
+A **spawned worker** first, if `$WACPATH` names one. `Cli.spawn` arrived after this package did,
+and the shell uses it: a program on `$WACPATH` is started as a real child, fed the pipeline's
+input, and its output and exit status are the command's.
+
+```sh
+deno task app:build packages/platform/example/wc.wac --worker -o /tmp/bin/wc
+wacsh -c 'WACPATH=/tmp/bin; seq 1 5 | wc | rev'
+```
+
+**`$WACPATH` and not `$PATH`**, deliberately. What `spawn` starts is a wac program built as a
+worker bundle; `/usr/bin/wc` handed to it is JavaScript that does not parse. Searching the real
+path would therefore turn every working command into a spawn failure, which is a worse answer than
+the one we already had. It also makes the whole thing opt-in: with `$WACPATH` unset nothing is
+spawned and the behaviour is exactly what it was.
+
+Then a **table of programs written in wac**, when nothing was spawned — which is the fallback the
+seam was designed for, and still the only thing available when there is no bundle to run:
 
 ```
 cat wc head tail rev sort uniq grep tr seq nl
 ```
 
-That single function is the point. When the capability lands, `run` gains a branch that calls it,
-and pipelines, redirection, exit statuses and `&&` are already written against the same shape.
-The stubs become what they should have been: a fallback for when the real program is absent.
+The single seam was the point, and it paid off: wiring `spawn` in changed no part of the pipeline,
+redirection, status or `&&` handling, because all of it was already written against `Output`. The
+stubs became what they were meant to be — a fallback for when the real program is absent.
+
+What is still missing is a *process*: `spawn` runs wac, not `/bin/ls`, and grants a child nothing
+but its two streams. See
+[issue 0015](../../issues/open/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md)
+for what remains, and
+[0020](../../issues/open/0020-a-spawned-worker-that-does-not-parse-kills-the-parent.md) for the
+first thing a shell trips over — a bundle that does not parse takes the shell down with it instead
+of coming back as a failed command.
 
 **The signature is the design decision.** Bytes in, bytes out, a status, and a `found` flag —
 because a shell reports 127 for "no such command" and the program's own code for "ran and failed",
@@ -158,17 +182,24 @@ reason — [issue 0014](../../issues/open/0014-platform-has-no-way-to-write-byte
 
 ## Coverage
 
-`deno task coverage:sh` drives about two hundred scripts through the lexer, parser and executor
+`deno task coverage:sh` drives about four hundred scripts through the lexer, parser and executor
 with the capabilities faked inside wac — `test/wac/probe.wac` builds a `Core` and a `Cli` out of
 pure functions, since wac has no mutable module-level state and a funcref cannot close over
 anything. A fixed answer per path is enough to reach both sides of every branch that asks.
 
-**It stands at 95%**, not the 100% the rest of this repo holds to, and the shape of what is left
+**It stands at 96%**, not the 100% the rest of this repo holds to, and the shape of what is left
 is worth stating rather than leaving as a number. Roughly half of the remainder is `p >=
 toks.len()` guards that **cannot execute**: `tokenize` always ends with `Eof`, so the parser stops
 at that token rather than running off the end of the list. They are real safety against a future
-caller that does not go through `tokenize`, and no script will ever reach them. The rest are
-defensive guards of the same character.
+caller that does not go through `tokenize`, and no script will ever reach them. Most of the rest
+are defensive guards of the same character.
+
+One point is not a guard and is worth naming, because it is a genuine limit of the probe rather
+than dead code: **the branch that appends a chunk from a spawned child**. `test/wac/probe.wac`'s
+fakes hold no state, so its `recv` can only answer end-of-input — one that returned bytes would
+return them for ever and the read loop would not finish. That branch is covered by
+`test/spawn.test.ts` instead, against the real host, which is the only place a child can actually
+speak.
 
 The two measurements answer different questions and neither replaces the other. bash says what is
 *right*; coverage says what has *run*. The refusals in particular are invisible to the

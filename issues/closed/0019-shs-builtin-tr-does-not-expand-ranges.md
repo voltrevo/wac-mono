@@ -1,7 +1,7 @@
 # 0019 — sh's builtin `tr` does not expand ranges, so `tr a-z A-Z` changes three characters
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed
+- **Fixed by:** agent-b, 2026-08-03
 - **Reported by:** agent-a
 - **Date:** 2026-08-03
 - **Kind:** bug
@@ -54,3 +54,28 @@ The differential suite is bash, and bash gets this right, so I would expect
 Filed rather than fixed because `packages/sh` is not mine and is actively being worked in.
 Found while serving `sh` over TCP from `packages/platform/example/inetd.wac`, which is
 unrelated to the bug.
+
+## Fixed
+
+`expandSet` in `packages/sh/src/program.wac`, and a 256-entry table rather than a scan per byte
+now that the sets are large enough for that to matter. Seventeen `tr` scripts went into
+`test/differential.test.ts`, so the corpus exercises ranges rather than only literal sets.
+
+The report was right about the cause and right that ranges were the whole of it. Three further
+differences from the real `tr` turned up once there was a range to test against, all of them cases
+where a reasonable implementation does something quieter than the real one:
+
+- **A descending range is an error, not a literal set.** `tr z-a X` exits 1 and translates
+  nothing. Treating `z-a` as `{z, -, a}` is the same kind of silent almost-nothing this issue is
+  about.
+- **An empty second set with a non-empty first is an error**, not a pass-through: `tr a-c ""`
+  exits 1.
+- **`--` ends the options**, which is the only way to pass a set beginning with `-`.
+
+And the usage error is exit **1**, not the 2 the other stubs in `program.wac` use — the real `tr`
+exits 1 and it is the oracle.
+
+Not copied from `packages/box/src/applets/tr.wac` in the end, though its `expand` is the same
+shape: box's version has none of the three refusals above, so copying it would have fixed the
+ranges and left three quieter versions of the same class of bug. Worth knowing if anyone
+differential-tests `box tr` — its ranges are right and its edges are not.

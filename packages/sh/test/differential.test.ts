@@ -325,6 +325,32 @@ esac`,
   `unset x; echo [$x]`,
   `x=1; unset x; echo [$x]`,
 
+  // ── tr, whose sets have their own small language ─────────────────────────────
+  //
+  // Ranges were missing entirely and `a-z` was the three-character set `{a, -, z}` — issue 0019,
+  // which cost the agent who found it twenty minutes because `tr a-z A-Z` on `hello a` *does*
+  // translate the `a`, so it looks like something happened. Everything below is here because the
+  // real `tr` does something a reasonable implementation would not: a `-` that cannot begin a
+  // range is literal, a descending range is an error rather than a literal set, and an empty
+  // second set is an error rather than a pass-through.
+  "echo hello | tr a-z A-Z",
+  'echo "hello a" | tr a-z A-Z',
+  "echo HELLO | tr A-Z a-z",
+  "echo abcz | tr a-c 1-3",
+  "echo 5 | tr 0-9 a-j",
+  "echo hi | tr h-i H-I",
+  "echo abc | tr ab xy",
+  "echo abc | tr abc x",
+  "echo abc | tr a- X",
+  "echo a-c | tr -- - _",
+  'echo abc | tr z-a X',
+  'echo abc | tr a-c ""',
+  'echo abc | tr "" X',
+  "echo x | tr",
+  "echo x | tr a",
+  "echo hello world | tr a-z A-Z | rev",
+  "echo x-y | tr x-y a-c",
+
   // ── read, set and shift ─────────────────────────────────────────────────────
   //
   // `read` is the only builtin that *consumes* standard input, so most of these are about the

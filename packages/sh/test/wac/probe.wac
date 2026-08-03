@@ -73,6 +73,11 @@ FileResult resolveFile(i32 id) {
   if (id == 1) { return FileResult.of(true, "alpha\nbeta\n".toBytes(), ""); }
   if (id == 2) { return FileResult.of(true, "b\na\nc\n".toBytes(), ""); }
   if (id == 3) { return FileResult.of(true, "existing\n".toBytes(), ""); }
+  // Two "worker bundles", distinguished only by their contents, so `fakeSpawn` can start one and
+  // refuse the other without holding any state. See the spawn section below.
+  if (id == 4) { return FileResult.of(true, "runnable".toBytes(), ""); }
+  if (id == 5) { return FileResult.of(true, "unrunnable".toBytes(), ""); }
+  if (id == 6) { return FileResult.of(true, "vanishing".toBytes(), ""); }
   return FileResult.of(false, u8[0](), "no such file");
 }
 Pending<FileResult> fakeReadFile(string path) {
@@ -80,6 +85,12 @@ Pending<FileResult> fakeReadFile(string path) {
   if (path == "in.txt") { which = 1; }
   if (path == "words.txt") { which = 2; }
   if (path == "out.txt") { which = 3; }
+  if (path == "/bin/prog") { which = 4; }
+  if (path == "/bin/badprog") { which = 5; }
+  if (path == "/bin/goneprog") { which = 6; }
+  // `/bin/ghost` exists as far as `stat` is concerned and cannot be read, which is not a
+  // contrived case: another process removing it between the two calls is the ordinary race, and
+  // the shell has to answer "no such command" rather than treat it as a failure to execute.
   return Pending.of(which, resolveFile, alwaysSettled, ignoreDrop);
 }
 
@@ -88,8 +99,13 @@ Pending<bool> fakeWriteFile(string path, u8[] data) {
   return Pending.of(path == "readonly.txt" ? 0 : 1, resolveFromId, alwaysSettled, ignoreDrop);
 }
 
-Stat resolveStat(i32 id) { return Stat.of(false, false, false, 0, 0); }
-Pending<Stat> fakeStat(string path) { return Pending.of(0, resolveStat, alwaysSettled, ignoreDrop); }
+/** Only the two programs under `/bin` exist, which is what makes a `$WACPATH` search decide. */
+Stat resolveStat(i32 id) { return Stat.of(id == 1, id == 1, false, 0, 0); }
+Pending<Stat> fakeStat(string path) {
+  i32 there = (path == "/bin/prog" || path == "/bin/badprog" || path == "/bin/goneprog"
+               || path == "/bin/ghost") ? 1 : 0;
+  return Pending.of(there, resolveStat, alwaysSettled, ignoreDrop);
+}
 
 string[]? resolveDir(i32 id) {
   if (id == 0) { return null; }
@@ -140,18 +156,35 @@ Pending<bool> fakeSend(i32 handle, u8[] data) {
 }
 void fakeCloseSocket(i32 handle) {}
 
-// Spawning is refused here, which is the branch worth covering: `program.wac` falls back to its
-// own implementations when there is no process to run, and that is the path this shell takes
-// everywhere it is embedded rather than run from a terminal.
-Child refuseSpawn(i32 id) { return Child(-1, "spawn not available"); }
+// ── Spawning ──────────────────────────────────────────────────────────────────
+//
+// Nothing can actually run here, so what is faked is the *decision*: `runnable` starts and gets a
+// handle, `unrunnable` does not, and the shell's two answers — a status from a child, and 126 for
+// a child that would not start — are both reached. Which one it is comes from the source text,
+// because a fake cannot hold state and the source is the only thing it is handed.
+//
+// **What this cannot reach is a child that says anything.** `fakeRecv` is stateless, so it can
+// only answer end-of-input; a fake that returned bytes would return them for ever and the read
+// loop would not finish. The branch that appends a chunk is covered by `test/spawn.test.ts`
+// against the real host instead, which is the only place a child can actually speak.
+Child resolveChild(i32 id) {
+  return id > 0 ? Child(id, "") : Child(-1, "spawn not available");
+}
 i32 resolveId(i32 id) { return id; }
 
-Pending<Child> fakeSpawn(string path, string[] argv) {
-  return Pending.of(0, refuseSpawn, alwaysSettled, ignoreDrop);
+Pending<Child> fakeSpawn(string source, string[] argv) {
+  i32 handle = -1;
+  if (source == "runnable") { handle = 7; }
+  // Starts, then never reports a status — `exitCode` answers negative for it. The shell calls that
+  // 126 rather than success, because by then it is a host problem and not the program's answer.
+  if (source == "vanishing") { handle = 8; }
+  return Pending.of(handle, resolveChild, alwaysSettled, ignoreDrop);
 }
 void fakeCloseFeed(i32 handle) {}
+i32 resolveNegative(i32 id) { return -1; }
 Pending<i32> fakeExitCode(i32 handle) {
-  return Pending.of(127, resolveId, alwaysSettled, ignoreDrop);
+  if (handle == 8) { return Pending.of(0, resolveNegative, alwaysSettled, ignoreDrop); }
+  return Pending.of(0, resolveId, alwaysSettled, ignoreDrop);
 }
 
 /** Every fake ticket is settled the moment it is made, so the first id is as true as any. */

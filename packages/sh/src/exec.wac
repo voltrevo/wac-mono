@@ -19,7 +19,7 @@ import { Map } from "../../std/src/map.wac";
 import { Option } from "../../std/src/option.wac";
 import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
-import { Cli, Core, FileResult } from "../../platform/src/platform.wac";
+import { Child, Cli, Core, FileResult } from "../../platform/src/platform.wac";
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
          RedirKind, Script, Simple, Word, parse } from "./parse.wac";
@@ -740,7 +740,96 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   if (name == "test" || name == "[") { return test(sh, argv); }
   if (name == "help") { return help(); }
 
+  // A real program if `$WACPATH` has one, and the wac implementation if it does not. That order
+  // is the whole point of the table in `program.wac`: those exist because nothing could be
+  // started, and now that something can they are the fallback rather than the answer.
+  Output spawned = trySpawn(sh, argv, stdin);
+  if (spawned.found) { return spawned; }
   return run(sh.cli, argv, stdin);
+}
+
+/**
+ * Run `argv` as a spawned worker, if `$WACPATH` names one.
+ *
+ * **`$WACPATH` and not `$PATH`.** What `spawn` starts is a wac program built as a worker bundle,
+ * not an executable — `/usr/bin/cat` handed to it is JavaScript that does not parse. Searching the
+ * real `$PATH` would therefore turn every working `cat` into a spawn failure, which is a worse
+ * answer than the one we already had. A separate variable also makes this opt-in: an unset
+ * `$WACPATH` behaves exactly as before.
+ *
+ * `spawn` takes the source rather than a path, so finding a program is two steps — locate it and
+ * read it. There is no notion of an executable bit here for the same reason: a program is a file
+ * whose contents the host is willing to run.
+ *
+ * `found` false means "no such program", and the caller falls back to the wac implementations.
+ */
+Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
+  string name = argv.get(0);
+  if (name == "") { return Output.missing(); }
+  // A name with a slash is a path already, as in bash — `./prog` is not searched for.
+  string where = containsSlash(name) ? name : searchWacPath(sh, name);
+  if (where == "") { return Output.missing(); }
+
+  FileResult prog = sh.cli.readFile(where).wait();
+  if (!prog.ok) { return Output.missing(); }
+
+  string[] args = string[argv.len() - 1](fill: "");
+  for (i32 i = 1; i < argv.len(); i++) { args[i - 1] = argv.get(i); }
+
+  Child child = sh.cli.spawn(string.fromBytes(prog.bytes), args).wait();
+  if (child.handle < 0) {
+    // It exists and would not start: that is 126, distinct from the 127 of not existing. One
+    // integer cannot say both, which is why `found` is a separate field.
+    return Output.fail(("sh: " + name + ": " + child.error + "\n").toBytes(), 126);
+  }
+
+  // The input in one go, then the *end* — `closeFeed`, not `closeSocket`. A program that reads to
+  // the end before it answers, which is `wc` and `sort` and most of the interesting ones, needs
+  // the end to arrive while it is still running; stopping it instead means it never speaks.
+  if (stdin.len() > 0) { sh.cli.send(child.handle, stdin).wait(); }
+  sh.cli.closeFeed(child.handle);
+
+  Buf out = Buf.create();
+  bool reading = true;
+  while (reading) {
+    u8[] chunk = sh.cli.recv(child.handle).wait();
+    if (chunk.len() == 0) { reading = false; }
+    else { out.pushAll(chunk); }
+  }
+
+  i32 code = sh.cli.exitCode(child.handle).wait();
+  sh.cli.closeSocket(child.handle);
+  // Negative means it never ran at all, which by then is a host problem rather than the
+  // program's status, so it is reported as "could not execute" rather than as success.
+  return Output(out.bytes(), u8[0](), code < 0 ? 126 : code, true);
+}
+
+/** The first `dir/name` on `$WACPATH` that exists, or "" when none does. */
+string searchWacPath(Shell sh, string name) {
+  string path = sh.lookUp("WACPATH");
+  if (path == "") { return ""; }
+  u8[] b = path.toBytes();
+  i32 start = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == 0x3a) {
+      // An empty entry means the current directory, as it does in `$PATH`, and is skipped here
+      // rather than turned into a bare `/name`.
+      if (i > start) {
+        string candidate = string.fromBytes(sliceBytes(b, start, i)) + "/" + name;
+        if (sh.cli.stat(candidate).wait().exists) { return candidate; }
+      }
+      start = i + 1;
+    }
+  }
+  return "";
+}
+
+bool containsSlash(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == 0x2f) { return true; }
+  }
+  return false;
 }
 
 /**

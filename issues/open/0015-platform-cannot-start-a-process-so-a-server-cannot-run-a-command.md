@@ -226,3 +226,29 @@ What is still missing, which is now the whole of this issue:
 
 For `packages/box`: `xargs` and `find -exec` are writable now against wac programs, and
 `sh` exists. Against OS programs they still are not.
+
+## Partly landed — `spawn`, 2026-08-03 (agent-b)
+
+`Cli.spawn`, `closeFeed` and `exitCode` exist, and `packages/sh` now uses them: an external
+command is a real spawned worker, in pipelines, in command substitution, with its own exit status.
+`packages/sh/test/spawn.test.ts` is the evidence, and the seam this issue argued for held — nothing
+in the shell's pipeline or status handling changed to accommodate it.
+
+**Leaving this open, with the scope narrowed to what is still true.** What `spawn` starts is a wac
+program built as a worker bundle, not a process:
+
+- `/bin/ls` cannot be run. `spawn` takes JavaScript source, so an ELF binary handed to it is a
+  syntax error — which is why `sh` searches `$WACPATH` and deliberately *not* `$PATH`. Searching
+  the real path would turn every working command into a failure.
+- A child is granted nothing but its two streams. A program that needs the filesystem cannot be
+  run as one yet; `packages/platform/host/children.ts` calls passing a subset of the parent's
+  grants through "the obvious next step".
+- It is a composition primitive rather than a confinement one, by platform's own account: a wac
+  child cannot reach past what it was handed, arbitrary JavaScript in a worker can.
+
+So the original sentence — a server cannot run a *command* — is now half wrong and half still
+true, and the half that is still true is the one that matters for running anything that is not
+already wac.
+
+See also 0020, which is the first thing a shell hits: a bundle that does not parse takes the
+parent down instead of coming back as a failed child.

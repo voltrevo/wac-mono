@@ -68,6 +68,8 @@ const SCRIPTS: string[] = [
   "echo -n '' | sort", "printf | uniq", "cat in.txt | uniq",
   "echo aa | grep a", "echo aa | grep z", "echo aa | grep -v z", "echo aa | grep",
   "echo abc | tr ab xy", "echo abc | tr abc x", "echo abc | tr", "echo abc | tr a",
+  "echo hello | tr a-z A-Z", "echo abc | tr a- X", "echo a-c | tr -- - _", "echo abc | tr z-a X",
+  'echo abc | tr a-c ""', 'echo abc | tr "" X', "echo abc | tr -- a b", "echo abc | tr X z-a",
   "seq 3", "seq 2 4", "seq 4 2", "seq", "seq 1 3 | nl", "echo -n '' | nl",
 
   // ── Command substitution ────────────────────────────────────────────────────
@@ -281,6 +283,7 @@ const SCRIPTS: string[] = [
   'echo "a b  " | { read x y; echo $y; }',      // trailing blanks the last name must lose
   "set -- a b c; echo $#", "set a b c; echo $1", "set", "set -e", "set -- ", "set --",
   "x=1; y=2; set",                              // bare `set` with something to list
+  "z=1; a=2; set",                              // and out of order, so the sort has work to do
   "set -- a b c; shift; echo $1", "set -- a b c; shift 2; echo $1", "set -- a; shift 2; echo $?",
   "shift; echo $?", "set -- a; shift x; echo $?", "f() { shift; echo $1; }; f 1 2",
 
@@ -293,6 +296,19 @@ const SCRIPTS: string[] = [
   'echo "a`echo b`"', "cat <<EOF\nx `echo y`\nEOF",
   "x=$(false); echo $?", "x=$(exit 3); echo $?", "x=1; echo $?", "$(exit 3); echo $?",
   "a=$(false) b=$(true); echo $?",
+
+  // ── Spawning an external program ────────────────────────────────────────────
+  //
+  // The fake world has `/bin/prog`, which starts, and `/bin/badprog`, which does not. See the
+  // spawn section of `test/wac/probe.wac` for why those are the only two outcomes reachable here.
+  "WACPATH=/bin; prog", "WACPATH=/bin; prog a b", "echo x | { WACPATH=/bin; prog; }",
+  "WACPATH=/bin; badprog", "WACPATH=/bin; nosuchprog",
+  "WACPATH=/nowhere:/bin; prog", "WACPATH=::/bin; prog", "WACPATH=/nowhere; prog",
+  "WACPATH=; prog", "prog",
+  "/bin/prog", "/bin/badprog", "./nosuch/prog", "WACPATH=/bin; /bin/prog",
+  "WACPATH=/bin; goneprog",                     // starts, then reports no status: 126, not 0
+  "WACPATH=/bin; ghost",                        // stat says yes, read says no: 127
+  '"" x',                                       // an empty command name
 
   // ── Here-documents ──────────────────────────────────────────────────────────
   //
