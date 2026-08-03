@@ -16,7 +16,7 @@ All commands run from the repo root.
 
 ## The oracle is bash
 
-`test/differential.test.ts` runs every script through GNU bash and through this, and requires the
+`test/differential.test.ts` runs 499 scripts through GNU bash and through this, and requires the
 same standard output *and* the same exit status. For a shell that is the only test worth much:
 the behaviour is defined by what the real one does, and nearly every rule has a case where the
 obvious implementation is subtly wrong.
@@ -149,8 +149,8 @@ flag rather than two mechanisms.
 ## What it does not do
 
 **`set` does the positional parameters and nothing else.** `set --`, `set a b c` and `shift`
-work. The options — `-e`, `-u`, `-x` — are **refused rather than accepted and ignored**, because a
-`set -e` that did not stop on an error is worse than one that does not exist. Bare `set` lists this
+work. The options — `-e`, `-u`, `-x` — are **refused rather than accepted and ignored**, because
+a `set -e` that did not stop on an error is worse than one that does not exist. Bare `set` lists this
 shell's own variables sorted, which is the same idea as bash's over a much smaller set and so
 cannot be compared with it.
 
@@ -159,6 +159,16 @@ what makes `while read line` terminate rather than see the first line for ever. 
 programs are handed whatever is left but are *not* charged for it, because nothing here knows
 which of them read their input — so `{ cat; cat; }` gives both copies of the whole thing where
 bash gives the second nothing.
+
+**No `cd`, and therefore no `pwd`.** Not an oversight and not a small job: nothing in
+`packages/platform` has a working directory — there is no `chdir` and no `getcwd`, and none is on
+its roadmap — so every path a program opens is resolved by the host against wherever the process
+was started. A shell-side `cd` would mean maintaining `$PWD` here and resolving every relative
+path against it before handing it over, in the redirections *and* in `program.wac`'s file
+openers. Worth doing, but it is a change to the seam rather than a builtin.
+
+**No `$0`.** `cli.arg(0)` is the first *argument*, not the program name, so there is nothing
+truthful to put there.
 
 **No process substitution.** `<(…)` needs a pipe with a name, which the capability world does
 not offer.
@@ -193,7 +203,7 @@ reason — [issue 0014](../../issues/open/0014-platform-has-no-way-to-write-byte
 
 ## Coverage
 
-`deno task coverage:sh` drives some five hundred scripts through the lexer, parser and executor
+`deno task coverage:sh` drives about 380 scripts through the lexer, parser and executor
 with the capabilities faked inside wac — `test/wac/probe.wac` builds a `Core` and a `Cli` out of
 pure functions, since wac has no mutable module-level state and a funcref cannot close over
 anything. A fixed answer per path is enough to reach both sides of every branch that asks.
@@ -216,7 +226,23 @@ return them for ever and the read loop would not finish. That branch is covered 
 `test/spawn.test.ts` instead, against the real host, which is the only place a child can actually
 speak.
 
-The two measurements answer different questions and neither replaces the other. bash says what is
-*right*; coverage says what has *run*. The refusals in particular are invisible to the
+### Mutation testing
+
+`deno task mutate --package sh --operators` generates 117 mutants and **all 117 are killed.** That
+is a much stronger statement than either number above, and it is the one worth re-running after any
+change to this package: coverage says a line ran, mutation says that breaking it on purpose is
+noticed. It takes about ten minutes.
+
+Two caveats to keep it honest. It is the guard-and-extreme operator set; `--operators=all` adds
+relational and literal mutants and is **3052 mutants**, which has never been run here. And the
+per-test selection in `tools/mutate.ts` does nothing at all for this package — every test file
+builds a binary and runs it as a child, so the coverage counters are in the wrong process and the
+tool reports `0/117 ran only the tests that reach them`. See
+[issue 0024](../../issues/open/0024-mutation-selection-is-inert-for-subprocess-tests-and-the-fallback-runs-them-worst-first.md).
+
+The three measurements answer different questions and none replaces the others. bash says what is
+*right*; coverage says what has *run*; mutation says what is *noticed*.
+
+The refusals in particular are invisible to the
 differential suite by construction — bash and this agree on what works, and differ on what this
 declines to do.
