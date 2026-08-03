@@ -267,6 +267,15 @@ string weightName(i32 i) {
 export i64[] parseWeights(u8[] doc) {
   i64[] out = i64[WEIGHT_COUNT]();
   for (i32 i = 0; i < WEIGHT_COUNT; i++) { out[i] = 10000; }
+  // Wge is the exception, and it is not an omission by the authorities: they publish
+  // nineteen weights and this is not one of them. tor hardcodes `We = 0` for the guard
+  // position, so an exit-only relay is never chosen as a guard on bandwidth grounds.
+  //
+  // Defaulting it to 10000 with the rest was wrong and currently invisible, because
+  // `eligible` rejects a relay without the Guard flag before the weight is consulted. Two
+  // independent reasons for the same answer, and the day someone relaxes the flag check the
+  // weight would have been the one holding the line. It is not doing that at 10000.
+  out[2] = 0;
 
   i32 at = findLine(doc, "bandwidth-weights ");
   if (at < 0) { return out; }
