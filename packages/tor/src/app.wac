@@ -21,9 +21,13 @@
 //
 // ## What this is not
 //
-// Not an anonymity tool. There is no SOCKS port — that needs waiting on several sockets at
-// once, which today can only be done by spinning a core (issue 0019) — and no timeouts,
-// because nothing bounds a socket capability (issue 0018). Neither is worked around here.
+// Not an anonymity tool. There are no timeouts, because nothing bounds a socket capability
+// (issue 0018): a relay that accepts and then says nothing wedges this permanently, and that
+// is not fixable above the boundary. Not worked around here.
+//
+// There is no SOCKS port either, but that is no longer blocked — `waitAny` landed, so
+// watching a listener beside several relay sockets is now expressible. `box nc` is the
+// precedent. It is the next thing worth building on top of this.
 
 import { Core, Cli, Socket, FileResult } from "../../platform/src/platform.wac";
 import { Vec } from "../../std/src/vec.wac";

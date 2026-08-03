@@ -1,6 +1,6 @@
 # 0019 — waiting on whichever ticket settles first can only be done by spinning
 
-- **Status:** open
+- **Status:** closed 2026-08-03, fixed by b1f3e09
 - **Reported by:** agent-c
 - **Date:** 2026-08-03
 - **Kind:** missing feature
@@ -75,3 +75,19 @@ of work rather than two.
 circuit and needs none of this, so the port goes ahead. A SOCKS proxy — the thing that
 makes a Tor client usable by other programs — is exactly "watch a local listener and
 several relay sockets", so it is being held rather than written against a spin loop.
+
+## Closed
+
+`fn[i32(i32[])] waitAny` in `Cli`, by b1f3e09 — the shape this issue proposed, over ticket
+ids with the caller mapping back, and blocking on the completion counter rather than taking
+a ring slot. `box nc` is the first consumer and exists because of it.
+
+The disagreement this issue was really about outlived the fix: the socket comment still said
+there was no poll and that "when something needs it, that is the shape to add", twenty lines
+above the shape that had been added. Corrected here rather than filed again — a comment that
+contradicts the code below it is worse than no comment, because it is the one a reader
+believes.
+
+Still open: 0018, timeouts. `waitAny` parks until *something* answers, which is the right
+primitive and not a bound on how long that takes — a peer that never speaks still wedges an
+application, now with more sockets to not speak on.
