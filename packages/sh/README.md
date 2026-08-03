@@ -116,7 +116,7 @@ Then a **table of programs written in wac**, when nothing was spawned — the fa
 designed for, and still the only thing available where there is no bundle to run:
 
 ```
-cat wc head tail rev sort uniq grep tr seq nl
+cat wc head tail rev sort uniq grep tr seq nl printf
 ```
 
 The single seam was the point, and it paid off: wiring `spawn` in changed no part of the pipeline,
@@ -187,12 +187,12 @@ reason — [issue 0014](../../issues/open/0014-platform-has-no-way-to-write-byte
 
 ## Coverage
 
-`deno task coverage:sh` drives some four hundred and fifty scripts through the lexer, parser and executor
+`deno task coverage:sh` drives some five hundred scripts through the lexer, parser and executor
 with the capabilities faked inside wac — `test/wac/probe.wac` builds a `Core` and a `Cli` out of
 pure functions, since wac has no mutable module-level state and a funcref cannot close over
 anything. A fixed answer per path is enough to reach both sides of every branch that asks.
 
-**It stands at 96.7%**, not the 100% the rest of this repo holds to, and the shape of what is left
+**It stands at 97.2%**, not the 100% the rest of this repo holds to, and the shape of what is left
 is worth stating rather than leaving as a number.
 
 `parse.wac` is the laggard at 94%, and **every one of its fifteen remaining points is a guard on an

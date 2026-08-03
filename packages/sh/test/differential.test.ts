@@ -325,6 +325,55 @@ esac`,
   `unset x; echo [$x]`,
   `x=1; unset x; echo [$x]`,
 
+  // ── printf, which has a language of its own ──────────────────────────────────
+  //
+  // The three rules that are not guessable: the format is *reused* until the arguments run out, a
+  // missing argument is not an error, and a bad *number* is reported and then used as zero anyway
+  // while a bad *format* aborts. That last pair is the one worth having cases for — bash prints
+  // the `ab` of `printf "ab%z"` before giving up, so it is an abort and not a discard.
+  String.raw`printf "hi\n"`,
+  `printf hi`,
+  String.raw`printf "%s\n" a b c`,
+  String.raw`printf "%s-%s\n" a b c d`,
+  String.raw`printf "%s-%s\n" a`,
+  String.raw`printf "%d %d\n" 1`,
+  String.raw`printf "no args %s|\n"`,
+  String.raw`printf "%s\n" ""`,
+  `printf ""`,
+  `printf "%s"`,
+  `printf`,
+  String.raw`printf "%d\n" 42`,
+  String.raw`printf "%d\n" -42`,
+  String.raw`printf "%d\n" abc`,
+  String.raw`printf "%5s|\n" ab`,
+  String.raw`printf "%-5s|\n" ab`,
+  String.raw`printf "%03d\n" 7`,
+  String.raw`printf "%03d\n" -7`,
+  String.raw`printf "%.2s|\n" abcdef`,
+  String.raw`printf "%x %X %o\n" 255 255 8`,
+  String.raw`printf "%c" abc`,
+  String.raw`printf "%%\n"`,
+  String.raw`printf "a\tb\n"`,
+  String.raw`printf "\x41\n"`,
+  String.raw`printf "\x4a\n"`,
+  String.raw`printf "\x4A\n"`,
+  String.raw`printf "\xZ\n"`,
+  String.raw`printf "%x\n" abc`,
+  String.raw`printf "\101\n"`,
+  String.raw`printf "a\qb\n"`,
+  // A bad format aborts, keeping what came before it.
+  String.raw`printf "%z\n" x`,
+  `printf "%"`,
+  `printf "ab%"`,
+  String.raw`printf "ab%z\n" x`,
+  `printf "%s%z" a b`,
+  // And it composes, which is why it was worth having: input with no trailing newline.
+  String.raw`printf "%s\n" a | wc -l`,
+  String.raw`printf "a\nb\n" | rev`,
+  String.raw`printf "b\na\nb\n" | sort | uniq`,
+  String.raw`printf "one two\n" | { read a b; echo "[$a][$b]"; }`,
+  String.raw`printf "no-newline" | { read x; echo "[$x]" $?; }`,
+
   // ── Pattern substitution ────────────────────────────────────────────────────
   //
   // Three things here are not guessable from the shorter forms, and each has a pair below:
