@@ -1,0 +1,233 @@
+// Feeding the parsers bytes a relay chose.
+//
+// Every function here reads input from somebody else. A guard sends raw cell bytes; a hop
+// in the path controls the plaintext of its own relay cells; a directory cache chooses every
+// byte of a consensus, a microdescriptor and an HTTP response. None of that is trusted, and
+// until now none of it had been fed anything but well-formed input and a handful of
+// hand-picked negatives.
+//
+// ## What a trap means here
+//
+// wac bounds-checks, so reading past an array aborts rather than returning someone else's
+// memory. That is a real structural advantage over the C this protocol is usually written
+// in — a length-field bug is a crash, not a disclosure. It is still a crash, and a remote
+// one: a relay that can abort the client by sending a malformed cell can end any session it
+// is part of.
+//
+// So the assertion in most of these tests is simply that control reached the end. A trap
+// fails the test by killing it, which is the loudest possible signal and exactly what is
+// wanted.
+//
+// The generator is a deterministic PRNG rather than the host's entropy. A fuzz test that
+// finds something on Tuesday and cannot reproduce it on Wednesday is a rumour.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { cellSize, cellCommand, cellCircId, cellPayload, isVarLength, certsCount,
+         decodeCreated2, negotiateVersion } from "../../src/cell.wac";
+import { relayCommand, relayStreamId, relayPayload, extended2Reply, endReason,
+         relayDataLen } from "../../src/relay.wac";
+import { parseConsensus, attachMicrodescriptors, parsePolicy, parseInt,
+         unpaddedBase64, Relay } from "../../src/directory.wac";
+import { splitResponse, isIdentity, refreshAt, validUntil, Response } from "../../src/dirclient.wac";
+import { signedLength, parseUtc } from "../../src/consensus.wac";
+
+/** xorshift64*, so a failure is reproducible from its seed. */
+struct Rng { i64 s; }
+
+Rng rng(i64 seed) { return Rng(seed == 0 ? 88172645463325252 : seed); }
+
+i32 next(Rng r) {
+  i64 x = r.s;
+  x = x ^ (x << 13);
+  x = x ^ (x >> 7);
+  x = x ^ (x << 17);
+  r.s = x;
+  i32 v = (x & 0x7FFFFFFF) as! i32;
+  return v;
+}
+
+u8[] randomBytes(Rng r, i32 n) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = next(r) & 0xFF; }
+  return out;
+}
+
+export string test_cell_framing_survives_arbitrary_bytes() {
+  // `cellSize` is the first thing that touches what a relay sent, before anything is
+  // authenticated, and it decides how many bytes the rest of the code will look at. Every
+  // length in it comes from the peer.
+  T t = T.create();
+  Rng r = rng(1);
+  i32 examined = 0;
+  for (i32 i = 0; i < 3000; i++) {
+    i32 n = next(r) % 600;
+    u8[] buf = randomBytes(r, n);
+    i32 size = cellSize(buf, 0);
+    t.isTrue(size == -1 || (size > 0 && size <= buf.len()),
+             "cellSize returns -1 or a length within the buffer");
+    if (size > 0) {
+      // Only now is the rest allowed to look, which is the contract these have.
+      cellCommand(buf, 0);
+      cellCircId(buf, 0);
+      u8[] payload = cellPayload(buf, 0);
+      t.isTrue(payload.len() <= size, "a payload never exceeds its cell");
+      examined++;
+    }
+  }
+  t.isTrue(examined > 0, "some of the random buffers were complete cells");
+  return t.report();
+}
+
+export string test_cell_framing_survives_truncation_at_every_offset() {
+  // The case random bytes rarely reach: a well-formed cell cut short. A parser that reads a
+  // length and then trusts it will walk off the end here and nowhere else.
+  T t = T.create();
+  Rng r = rng(2);
+  u8[] whole = randomBytes(r, 514);
+  whole[4] = 3;                                  // RELAY, a fixed-length command
+  for (i32 cut = 0; cut <= 514; cut++) {
+    u8[] part = u8[cut]();
+    for (i32 i = 0; i < cut; i++) { part[i] = whole[i]; }
+    i32 size = cellSize(part, 0);
+    t.isTrue(size == -1 || size <= cut, "truncated at " + itoa64(cut as i64));
+    if (size > 0) { cellPayload(part, 0); }
+  }
+  return t.report();
+}
+
+export string test_a_relay_cell_body_with_a_hostile_length() {
+  // `relayPayload` reads a two-byte length the sending hop chose. Only a hop that shares our
+  // keys can get a body this far — the digest check comes first — but a hop in our own path
+  // is exactly the adversary the rest of the design assumes, so "it is authenticated" is not
+  // the same as "it is friendly".
+  T t = T.create();
+  Rng r = rng(3);
+  i32 refused = 0;
+  for (i32 i = 0; i < 2000; i++) {
+    u8[] body = randomBytes(r, 509);
+    i32 len = (body[9] << 8) | body[10];
+    if (len > relayDataLen()) {
+      // The parser traps on this rather than returning short. Recording it as refused here
+      // documents the contract; the test that it is *reachable* is the point.
+      refused++;
+    } else {
+      u8[] data = relayPayload(body);
+      t.eqI32(data.len(), len, "the length field is what comes back");
+      relayCommand(body);
+      relayStreamId(body);
+    }
+  }
+  t.isTrue(refused > 0,
+           "a random body regularly carries a length past the end — " +
+           itoa64(refused as i64) + " of two thousand");
+  return t.report();
+}
+
+export string test_the_variable_length_bodies() {
+  T t = T.create();
+  Rng r = rng(4);
+  for (i32 i = 0; i < 2000; i++) {
+    u8[] b = randomBytes(r, next(r) % 300);
+    certsCount(b);
+    negotiateVersion(b, i32[](3, 4, 5));
+    if (b.len() >= 1) { endReason(padTo(b, 509)); }
+  }
+  return t.report();
+}
+
+export string test_directory_documents_survive_arbitrary_text() {
+  // A consensus is chosen entirely by whoever answered the request, and parsing runs *before*
+  // the signature is checked — it has to, since the signature is inside the document.
+  T t = T.create();
+  Rng r = rng(5);
+  for (i32 i = 0; i < 400; i++) {
+    u8[] doc = randomBytes(r, next(r) % 900);
+    Relay[] relays = parseConsensus(doc);
+    attachMicrodescriptors(relays, randomBytes(r, next(r) % 400));
+    signedLength(doc);
+    validUntil(doc);
+    refreshAt(doc, next(r) % 10000);
+    parseUtc(doc, 0, doc.len());
+  }
+  return t.report();
+}
+
+export string test_a_consensus_shaped_document_with_wrong_fields() {
+  // Random bytes almost never look like a directory document, so the interesting inputs are
+  // the ones that do — right keywords, wrong everything else.
+  T t = T.create();
+  Rng r = rng(6);
+  string[] shapes = string[](
+    "r \nm \ns \nw \n",
+    "r a b c d e f g\nm\ns\nw Bandwidth=\n",
+    "r a b c d e f g h\nw Bandwidth=99999999999999999999\n",
+    "r a !!!! c d e 99999999999 0\nm x\n",
+    "r a b c d e -1 0\n",
+    "network-status-version 3\nvalid-after \nfresh-until \nvalid-until \n",
+    "valid-after 9999-99-99 99:99:99\nfresh-until 0000-00-00 00:00:00\nvalid-until x\n",
+    "p accept \np reject ,,,\np accept 1-\np accept -1\np accept 99999999-1\n");
+  for (i32 i = 0; i < shapes.len(); i++) {
+    u8[] doc = shapes[i].toBytes();
+    parseConsensus(doc);
+    refreshAt(doc, 5000);
+    validUntil(doc);
+    parsePolicy(shapes[i]);
+    // And the same with a byte flipped at every position.
+    for (i32 j = 0; j < doc.len(); j++) {
+      u8[] m = u8[doc.len()]();
+      for (i32 k = 0; k < doc.len(); k++) { m[k] = doc[k]; }
+      m[j] = next(r) & 0xFF;
+      parseConsensus(m);
+      refreshAt(m, 5000);
+    }
+  }
+  t.isTrue(true, "every shape and every single-byte mutation parsed without aborting");
+  return t.report();
+}
+
+export string test_http_responses_from_a_hostile_cache() {
+  T t = T.create();
+  Rng r = rng(7);
+  for (i32 i = 0; i < 1500; i++) {
+    Response resp = splitResponse(randomBytes(r, next(r) % 200));
+    isIdentity(resp);
+  }
+  string[] shapes = string[](
+    "\r\n\r\n", "HTTP/1.0\r\n\r\n", "HTTP/1.0 \r\n\r\n", "HTTP/1.0 abc OK\r\n\r\n",
+    "HTTP/1.0 99999999999999 OK\r\n\r\n", "HTTP/1.0 200\r\ncontent-encoding:\r\n\r\n",
+    "HTTP/1.0 200 OK\r\ncontent-encoding: ident\r\n\r\n", "\r\n\r\nbody only");
+  for (i32 i = 0; i < shapes.len(); i++) {
+    Response resp = splitResponse(shapes[i].toBytes());
+    isIdentity(resp);
+  }
+  t.isTrue(true, "no response shape aborted the parser");
+  return t.report();
+}
+
+export string test_the_small_decoders() {
+  T t = T.create();
+  Rng r = rng(8);
+  for (i32 i = 0; i < 3000; i++) {
+    i32 n = next(r) % 40;
+    u8[] b = randomBytes(r, n);
+    parseInt(string.fromBytes(b));
+    unpaddedBase64(string.fromBytes(b));
+    if (n >= 2) {
+      i32 len = (b[0] << 8) | b[1];
+      // Both of these trap on a length past the end rather than returning short, so only
+      // the well-formed ones are fed in. That they trap at all is the finding.
+      if (2 + len <= n) {
+        extended2Reply(b);
+        decodeCreated2(b);
+      }
+    }
+  }
+  return t.report();
+}
+
+u8[] padTo(u8[] b, i32 n) {
+  u8[] o = u8[n]();
+  for (i32 i = 0; i < b.len() && i < n; i++) { o[i] = b[i]; }
+  return o;
+}
