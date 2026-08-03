@@ -1508,3 +1508,51 @@ Deno.test("the README states the applet count the dispatcher actually has", asyn
     "the `bin/` section names the count too, in words",
   );
 });
+
+Deno.test("seq matches GNU seq, in all three spellings", async () => {
+  // Filed under "a tool named after a real one either matches it or says where it does not".
+  // `seq 1 5` used to print `1`: the first argument was taken as a count and the second was
+  // dropped, which is the worst shape a divergence can take — a plausible answer, silently. It
+  // was found by running the same command in a browser and in a terminal side by side.
+  const real = await new Deno.Command("seq", { args: ["--version"], stdout: "null", stderr: "null" })
+    .output().then((r) => r.success).catch(() => false);
+  if (!real) return;   // no oracle, no test
+
+  const built = await Deno.makeTempFile({ prefix: "wac-seq-" });
+  try {
+    await buildApp(BOX, built, {});
+    const box = (args: string[]) => {
+      const r = new Deno.Command(built, { args, stdout: "piped", stderr: "piped" }).outputSync();
+      return {
+        code: r.code,
+        out: new TextDecoder().decode(r.stdout),
+        err: new TextDecoder().decode(r.stderr),
+      };
+    };
+
+    for (
+      const args of [
+        ["5"],
+        ["1", "5"],
+        ["3", "7"],
+        ["1", "2", "9"],
+        ["10", "-3", "1"],   // counting down
+        ["5", "1"],          // an empty range: nothing, and not an error
+        ["0"],
+        ["-3", "3"],
+      ]
+    ) {
+      const sys = new Deno.Command("seq", { args, stdout: "piped", stderr: "piped" }).outputSync();
+      const ours = box(["seq", ...args]);
+      assertEquals(ours.out, new TextDecoder().decode(sys.stdout), `seq ${args.join(" ")}`);
+      assertEquals(ours.code, sys.code, `seq ${args.join(" ")} exit status`);
+    }
+
+    // A zero step loops forever if nobody checks, so it is refused rather than attempted.
+    const zero = box(["seq", "1", "0", "9"]);
+    assertEquals(zero.code, 1);
+    assertEquals(zero.err.includes("must not be zero"), true, zero.err);
+  } finally {
+    await Deno.remove(built);
+  }
+});

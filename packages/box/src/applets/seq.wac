@@ -1,12 +1,47 @@
-// 1 to n, one per line.
+// Numbers in a range, one per line — `seq LAST`, `seq FIRST LAST`, `seq FIRST STEP LAST`.
+//
+// The three spellings are GNU's, and they were worth matching because the one-argument version
+// alone was *silently* wrong for the commonest use: `seq 1 5` took the 1 as a count, printed a
+// single line, and dropped the 5 on the floor. A tool named after a real one either matches it
+// or says where it does not; this said nothing, and the divergence only surfaced when the same
+// command was run side by side with the real one.
+//
+// Integers only, where GNU also does floats and `-w` and `-s`. That much is a genuine shortfall
+// and is stated rather than hidden.
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { atoi, itoa } from "../lib/num.wac";
 
 export i32 seq(Core core, Cli cli, Args a) {
-  if (a.rest.len() < 1) { core.warn("usage: " + a.name + " <count>"); return 2; }
-  i32 n = atoi(a.rest[0]);
-  for (i32 i = 1; i <= n; i++) { core.log(itoa(i)); }
+  // Read positionally, not from `a.rest`, and that is forced rather than preferred: to box's
+  // argument parser a leading `-` is a flag, so `seq 10 -3 1` arrives as *two* arguments with
+  // the step swallowed and its sign already discarded — `a.num` holds 3, and nothing anywhere
+  // remembers the minus. GNU's counting-down form is not expressible through that parser, and
+  // `seq` has no flags of its own to lose by skipping it.
+  i32 n = cli.argCount().wait() - 1;
+  if (n < 1 || n > 3) {
+    core.warn("usage: " + a.name + " [first [step]] last");
+    return 2;
+  }
+  string[] args = string[n](fill: "");
+  for (i32 i = 0; i < n; i++) { args[i] = cli.arg(i + 1).wait(); }
+
+  i32 first = n == 1 ? 1 : atoi(args[0]);
+  i32 step = n == 3 ? atoi(args[1]) : 1;
+  i32 last = atoi(args[n - 1]);
+
+  // GNU refuses a zero step rather than looping forever, and so does this.
+  if (step == 0) {
+    core.warn(a.name + ": step must not be zero");
+    return 1;
+  }
+
+  // An empty range prints nothing and succeeds — `seq 5 1` is not an error, it is no numbers.
+  if (step > 0) {
+    for (i32 i = first; i <= last; i = i + step) { core.log(itoa(i)); }
+  } else {
+    for (i32 i = first; i >= last; i = i + step) { core.log(itoa(i)); }
+  }
   return 0;
 }

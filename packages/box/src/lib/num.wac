@@ -25,11 +25,25 @@ export string itoa64(i64 n) {
 /** Leading digits only, zero when there are none — a command line is not a parser. */
 export i32 atoi(string s) {
   u8[] b = s.toBytes();
+  if (b.len() == 0) { return 0; }
+
+  // A sign, which this used to ignore — a leading `-` failed the digit test on the first
+  // character and the answer was 0. Latent for a long time because every applet that reached
+  // here wanted a count: it surfaced as `seq 10 -3 1` refusing a step of zero it had invented
+  // itself. Safe to add, and checked: the one caller that passes a string beginning with `-` is
+  // `args.wac`, which strips the sign itself before asking, because there `-5` is a flag.
+  i32 at = 0;
+  bool neg = false;
+  if (b[0] == '-' || b[0] == '+') {
+    neg = b[0] == '-';
+    at = 1;
+  }
+
   i32 v = 0;
-  for (i32 i = 0; i < b.len(); i++) {
+  for (i32 i = at; i < b.len(); i++) {
     i32 c = b[i];
     if (c < '0' || c > '9') { break; }
     v = v * 10 + (c - '0');
   }
-  return v;
+  return neg ? 0 - v : v;
 }

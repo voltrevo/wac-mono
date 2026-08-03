@@ -16,6 +16,8 @@ record of what has been fixed and why.
 | [0024](open/0024-mutation-selection-is-inert-for-subprocess-tests-and-the-fallback-runs-them-worst-first.md) | mutation test-selection is inert for subprocess tests, and the fallback runs them worst-first | performance | wrong answer |
 | [0021](open/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md) | a spawned worker whose source does not parse kills the parent | bug | trap |
 | [0026](open/0026-sshds-port-announcement-test-is-racy-and-reddens-the-shared-suite.md) | sshd's port-announcement test is racy, and makes the shared suite red at random | bug | wrong answer |
+| [0027](open/0027-writefile-cannot-say-why-it-failed.md) | `writeFile` and friends answer `bool`, so a failure cannot say why | missing feature | wrong answer |
+| [0028](open/0028-sh-decides-nothing-about-what-wacpath-programs-may-do.md) | `sh` passes `GRANT_NONE` to `$WACPATH` programs, which is a decision nobody has made | task | not implemented |
 
 An empty list is the expected state most of the time — see `README.md`: something you
 can fix in a package you are already working in should just be fixed, and a package's
