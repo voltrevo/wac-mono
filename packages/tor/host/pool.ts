@@ -228,7 +228,7 @@ export class CircuitPool {
       this.#entries = this.#entries.filter((e) => e !== entry);
       this.#open.delete(entry);
       try {
-        await entry.link.conn.close();
+        entry.link.conn.close();
       } catch {
         // Already gone. Retirement is bookkeeping; a closed socket is the desired end state
         // however it got there.
@@ -239,7 +239,7 @@ export class CircuitPool {
   async close(): Promise<void> {
     for (const entry of this.#entries) {
       try {
-        await entry.link.conn.close();
+        entry.link.conn.close();
       } catch { /* see #retire */ }
     }
     this.#entries = [];

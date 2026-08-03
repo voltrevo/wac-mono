@@ -111,6 +111,13 @@ export struct Cert {
   /** The dNSName entries in subjectAltName, NUL-separated. */
   u8[] dnsNames;
   /**
+   * The iPAddress entries in subjectAltName, four bytes each, concatenated.
+   *
+   * Separate from `dnsNames` and not merged with them, because the matching rule differs:
+   * an IP literal must be matched against these and *only* these. See `certMatchesHost`.
+   */
+  u8[] ipAddresses;
+  /**
    * Whether extKeyUsage permits TLS server authentication, or true when it is absent.
    *
    * Absent means unrestricted, the same rule as `canSignCerts`. Present means the listed
@@ -263,6 +270,7 @@ export Cert parseCert(u8[] der) {
   u8[] permittedDns = u8[0]();
   u8[] excludedDns = u8[0]();
   u8[] dnsNames = u8[0]();
+  u8[] ipAddresses = u8[0]();
 
   if (t.nextIs(tagContextPrim(1))) { t.skip(); }   // issuerUniqueID
   if (t.nextIs(tagContextPrim(2))) { t.skip(); }   // subjectUniqueID
@@ -303,6 +311,7 @@ export Cert parseCert(u8[] der) {
         canSignCerts = bits.len() >= 2 && (bits[1] & 0x04) != 0;
       } else if (oidEquals(id, oidSubjectAltName())) {
         dnsNames = collectDnsNames(value);
+        ipAddresses = collectIpAddresses(value);
       } else if (oidEquals(id, oidExtKeyUsage())) {
         // Present means the enumerated purposes are the only ones allowed, so serverAuth
         // has to be among them. A certificate issued for e-mail or code signing is a
@@ -351,7 +360,7 @@ export Cert parseCert(u8[] der) {
   u8[] signature = cert.bitString();
 
   return Cert(tbs, signature, sigAlg, keyType, publicKey, rsaExponent, issuer, subject,
-              notBefore, notAfter, isCa, pathLen, canSignCerts, dnsNames,
+              notBefore, notAfter, isCa, pathLen, canSignCerts, dnsNames, ipAddresses,
               serverAuth, badCritical, permittedDns, excludedDns);
 }
 
@@ -472,6 +481,29 @@ bool namesAllowed(Cert leaf, Cert ca) {
 }
 
 /** The dNSName entries of a SubjectAltName, joined with NUL bytes. */
+/** The four-byte iPAddress entries of a subjectAltName, concatenated. */
+u8[] collectIpAddresses(u8[] value) {
+  Der san = Der.create(value);
+  Der names = san.element(tagSequence());
+  u8[] acc = u8[0]();
+  while (!names.empty()) {
+    i32 tag = names.peekTag();
+    Der item = names.any();
+    if (tag == tagContextPrim(7)) {                 // iPAddress, IMPLICIT OCTET STRING
+      u8[] addr = item.rest();
+      // Four bytes is IPv4 and sixteen is IPv6. Only IPv4 is matched, so the rest are
+      // dropped here rather than stored and silently never compared.
+      if (addr.len() == 4) {
+        u8[] joined = u8[acc.len() + 4]();
+        for (i32 i = 0; i < acc.len(); i++) { joined[i] = acc[i]; }
+        for (i32 i = 0; i < 4; i++) { joined[acc.len() + i] = addr[i]; }
+        acc = joined;
+      }
+    }
+  }
+  return acc;
+}
+
 u8[] collectDnsNames(u8[] value) {
   Der san = Der.create(value);
   Der names = san.element(tagSequence());
@@ -506,14 +538,67 @@ bool eqHost(u8[] a, i32 aFrom, i32 aLen, u8[] b) {
 }
 
 /**
- * Whether `host` matches one of the certificate's dNSName entries.
+ * The four octets of `host` if it is a dotted-quad IPv4 literal, or an empty array.
  *
- * Wildcards are handled for the leftmost label only, which is what RFC 6125 §6.4.3
- * allows: `*.example.com` matches `a.example.com` and not `a.b.example.com` and not
- * `example.com`. A wildcard anywhere else, or one matching a bare dot-less name, is the
- * shape that lets one certificate cover a whole registry.
+ * Deliberately strict: exactly four parts, every part digits, every value under 256. Not
+ * `inet_aton` — that accepts octal, hex and fewer than four parts, so `0177.0.0.1` and
+ * `2130706433` are both 127.0.0.1 to it. A permissive parser here would let a name that
+ * some other component treats as a hostname be matched as an address, or the reverse.
+ */
+u8[] parseIpv4(u8[] host) {
+  u8[] out = u8[4]();
+  i32 part = 0;
+  i32 value = 0;
+  i32 digits = 0;
+  bool leadingZero = false;
+  for (i32 i = 0; i <= host.len(); i++) {
+    if (i == host.len() || host[i] == '.') {
+      // A leading zero is a parse failure, not an octal prefix. `127.0.0.001` is the case:
+      // this parser would read it as 127.0.0.1 while the URL spec rejects it outright, and
+      // a disagreement about whether a string is an address or a name is the whole reason
+      // to be strict here.
+      if (digits == 0 || digits > 3 || value > 255 || part > 3 || leadingZero) {
+        return u8[0]();
+      }
+      out[part] = value;
+      part++;
+      value = 0;
+      digits = 0;
+      leadingZero = false;
+    } else if (host[i] >= '0' && host[i] <= '9') {
+      if (digits == 1 && value == 0) { leadingZero = true; }
+      value = value * 10 + (host[i] - '0');
+      digits++;
+    } else {
+      return u8[0]();
+    }
+  }
+  return part == 4 ? out : u8[0]();
+}
+
+/**
+ * Whether the certificate covers `host`.
+ *
+ * An IP literal is matched against iPAddress entries and **nothing else**. RFC 6125 §6.4:
+ * when the reference identity is an address, dNSName entries are not consulted at all. That
+ * is not pedantry — a certificate carrying `DNS:127.0.0.1` is something a CA might well
+ * issue as an ordinary name, and treating it as authority over the address would let it
+ * stand in for a host it was never meant to cover.
+ *
+ * A name is matched against dNSName entries, with wildcards on the leftmost label only,
+ * which is what RFC 6125 §6.4.3 allows: `*.example.com` matches `a.example.com` and not
+ * `a.b.example.com` and not `example.com`. A wildcard anywhere else, or one matching a bare
+ * dot-less name, is the shape that lets one certificate cover a whole registry.
  */
 export bool certMatchesHost(Cert c, u8[] host) {
+  u8[] ip = parseIpv4(host);
+  if (ip.len() == 4) {
+    for (i32 i = 0; i + 4 <= c.ipAddresses.len(); i += 4) {
+      if (c.ipAddresses[i] == ip[0] && c.ipAddresses[i + 1] == ip[1] &&
+          c.ipAddresses[i + 2] == ip[2] && c.ipAddresses[i + 3] == ip[3]) { return true; }
+    }
+    return false;
+  }
   i32 start = 0;
   for (i32 i = 0; i <= c.dnsNames.len(); i++) {
     if (i == c.dnsNames.len() || c.dnsNames[i] == 0) {

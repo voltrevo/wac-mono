@@ -21,6 +21,27 @@ function freePort(): number {
 
 type Wacsshd = { dir: string; port: number; proc: Deno.ChildProcess };
 
+/**
+ * The server, built once as a standalone program.
+ *
+ * Not `deno task app`, which builds and then *spawns* the result: it waits with `outputSync`,
+ * so killing the launcher leaves the application running with nothing to reap it. Doing that
+ * once per test leaked 57 servers and 13,736 zombie children before anything noticed, and the
+ * container ran out of process ids. Running the built binary directly means the handle we hold
+ * is the process we kill.
+ */
+const wacsshdBinary = await (async () => {
+  const out = await Deno.makeTempFile({ prefix: "wacsshd-" });
+  const r = await new Deno.Command("deno", {
+    args: [
+      "run", "-A", "packages/platform/build.ts", "packages/ssh/src/sshd.wac",
+      "--allow-read", "--allow-net", "--allow-env", "-o", out,
+    ],
+  }).output();
+  if (!r.success) throw new Error(`building sshd failed: ${new TextDecoder().decode(r.stderr)}`);
+  return out;
+})();
+
 /** Our server, running, with a host key and one authorized client key. */
 async function startWacsshd(): Promise<Wacsshd> {
   const dir = await Deno.makeTempDir();
@@ -35,11 +56,8 @@ async function startWacsshd(): Promise<Wacsshd> {
   await Deno.copyFile(`${dir}/clientkey.pub`, `${dir}/.ssh/authorized_keys`);
 
   const port = freePort();
-  const proc = new Deno.Command("deno", {
-    args: [
-      "run", "-A", "packages/platform/app.ts", "packages/ssh/src/sshd.wac",
-      "--allow-read", "--allow-net", "--allow-env", "--", "-p", String(port),
-    ],
+  const proc = new Deno.Command(wacsshdBinary, {
+    args: ["-p", String(port)],
     env: { HOME: dir },
     clearEnv: false,
     stdout: "null",

@@ -12,6 +12,9 @@ const FIXTURES = [
   "p384_leaf_crit", "p384_leaf_noncrit", "p384_leaf_clientauth", "p384_leaf_serverauth",
   "p384_nc_ok", "p384_nc_bad", "p384_nc_excl", "p384_nc_ip", "p384_nc_suffix",
   "p384_nc_upper",
+  // For the IP-address matching rule: `ec_leaf` carries both DNS and iPAddress SANs,
+  // `ip_as_dns` names an address as a dNSName only and must never match it.
+  "ec_leaf", "ip_as_dns",
 ];
 
 const der: Uint8Array[] = [];

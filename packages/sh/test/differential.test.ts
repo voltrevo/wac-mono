@@ -100,6 +100,98 @@ const CASES: string[] = [
   `echo a$(echo b)c`,
   `echo $(echo a b c | wc -l)`,
 
+  // ── Compound commands ───────────────────────────────────────────────────────
+  //
+  // Every loop here must terminate, because bash runs these too and a runaway would hang the
+  // suite rather than fail it. Ours has a bound; bash does not.
+  `if true; then echo yes; fi`,
+  `if false; then echo no; fi`,
+  `if false; then echo no; else echo fallback; fi`,
+  `if false; then echo a; elif true; then echo b; else echo c; fi`,
+  `if false; then echo a; elif false; then echo b; else echo c; fi`,
+  `if true; then echo a; elif true; then echo b; fi`,
+  `if echo cond; then echo body; fi`,
+  `if false; then echo no; fi; echo $?`,
+  `if true; then false; fi; echo $?`,
+  `if
+true
+then
+echo multiline
+fi`,
+  `for x in a b c; do echo $x; done`,
+  `for x in a b c; do echo -n $x; done; echo`,
+  `for x in; do echo $x; done; echo empty`,
+  `for x in 1 2 3; do echo $x; done | wc -l`,
+  `for f in one two; do echo "[$f]"; done`,
+  `x=outer; for x in a; do echo $x; done; echo $x`,
+  `for x in $(seq 1 3); do echo n$x; done`,
+  `for x in a b; do for y in 1 2; do echo $x$y; done; done`,
+  `x=1; while test $x -lt 4; do echo $x; x=$(seq $x $x | tr 123 234); done`,
+  `while false; do echo never; done; echo done`,
+  `x=1; until test $x -gt 2; do echo n$x; x=3; done`,
+  `until true; do echo never; done; echo after`,
+  `{ echo a; echo b; }`,
+  `{ echo a; echo b; } | rev`,
+  `{ echo a; } && echo ok`,
+  `for x in a b; do if test $x = b; then echo found; fi; done`,
+  `if true; then for x in 1 2; do echo $x; done; fi`,
+  `if test -z ""; then echo empty; fi`,
+  `echo if`,
+  `echo done`,
+  `echo "if true"`,
+
+  // ── case ────────────────────────────────────────────────────────────────────
+  `case a in a) echo hit;; esac`,
+  `case b in a) echo no;; b) echo yes;; esac`,
+  `case x in a|b|x) echo alt;; esac`,
+  `case foo.txt in *.txt) echo text;; esac`,
+  `case foo.log in *.txt) echo text;; *) echo other;; esac`,
+  `case foo in *) echo default;; esac`,
+  `case foo in a) echo no;; esac`,
+  `case foo in a) echo no;; esac; echo $?`,
+  `case abc in a?c) echo q;; esac`,
+  `case "a b" in "a b") echo quoted;; esac`,
+  `case a in (a) echo parens;; esac`,
+  `x=b; case $x in b) echo expanded;; esac`,
+  `case a in a) echo one; echo two;; esac`,
+  `case a in b) echo no;; a) echo yes;; esac`,
+  `case a in a) ;; esac; echo $?`,
+  `case '*' in "*") echo literal;; esac`,
+  `case x in
+  a) echo a ;;
+  x) echo x ;;
+esac`,
+
+  // ── Functions ───────────────────────────────────────────────────────────────
+  `f() { echo in-function; }; f`,
+  `f() { echo "got $1 and $2"; }; f a b`,
+  `f() { echo $#; }; f a b c`,
+  `f() { echo $#; }; f`,
+  `greet() { echo hello $1; }; greet world; greet again`,
+  `f() { echo "$@"; }; f a b c`,
+  `f() { x=set-inside; }; f; echo $x`,
+  `f() { echo $1; }; f one; echo "[$1]"`,
+  `f() { false; }; f; echo $?`,
+  `f() { true; }; f; echo $?`,
+  `f() { echo a; }; f | rev`,
+  `f() { seq 1 3; }; f | wc -l`,
+  `outer() { inner; }; inner() { echo nested; }; outer`,
+  `f() { echo defined; }; echo before; f`,
+  `f() { if test "$1" = x; then echo isx; else echo notx; fi; }; f x; f y`,
+
+  // ── Subshells ───────────────────────────────────────────────────────────────
+  `(echo a)`,
+  `(echo a; echo b)`,
+  `x=1; (x=2; echo inside $x); echo outside $x`,
+  `(exit 3); echo $?`,
+  `(echo sub) | rev`,
+  `(true) && echo ok`,
+  `(false) || echo ko`,
+  `(seq 1 3) | wc -l`,
+  `f() { echo fn; }; (f); f`,
+  `(cd_does_not_exist) 2>/dev/null; echo $?`,
+  `echo $( (echo nested) )`,
+
   // ── Builtins ────────────────────────────────────────────────────────────────
   `echo -n no-newline`,
   `echo -n a; echo b`,
@@ -111,6 +203,31 @@ const CASES: string[] = [
   `x=1; unset x; echo [$x]`,
 ];
 
+/**
+ * A directory to glob against, made once and used by the pattern cases below.
+ *
+ * Absolute paths, because this shell has no working directory of its own — there is no `cd` and
+ * no capability to ask where it is — so a relative pattern would mean different things to the two
+ * shells and the comparison would prove nothing.
+ */
+const globDir = await Deno.makeTempDir();
+for (const name of ["a.txt", "b.txt", "c.log", ".hidden"]) {
+  await Deno.writeTextFile(`${globDir}/${name}`, "");
+}
+await Deno.mkdir(`${globDir}/sub`);
+await Deno.writeTextFile(`${globDir}/sub/x.txt`, "");
+
+for (const pattern of [
+  "*.txt", "*", "?.log", "*.log", "nomatch*", "sub/*", "a?txt", "*.t?t", "sub/x.*",
+]) {
+  CASES.push(`echo ${globDir}/${pattern}`);
+}
+// Quoted patterns must not glob, and neither must a quoted metacharacter next to an unquoted one.
+CASES.push(`echo "${globDir}/*.txt"`);
+CASES.push(`echo '${globDir}/*.txt'`);
+CASES.push(`echo ${globDir}/"*".txt`);
+CASES.push(`x="${globDir}/*.txt"; echo "$x"`);
+
 async function bash(script: string) {
   const r = await new Deno.Command("bash", {
     args: ["-c", script],
@@ -120,12 +237,29 @@ async function bash(script: string) {
   return { stdout: new TextDecoder().decode(r.stdout), code: r.code };
 }
 
-async function wacsh(script: string) {
+/**
+ * The shell, built once as a standalone program.
+ *
+ * Not `deno task app` per script: that builds every time *and* spawns the result as a child, so a
+ * hundred and thirty scripts become several hundred nested processes. This container ran out of
+ * process ids once already today for a related reason — see wac-mono 0017 — and the build is the
+ * slow part regardless.
+ */
+const wacshBinary = await (async () => {
+  const out = await Deno.makeTempFile({ prefix: "wacsh-" });
   const r = await new Deno.Command("deno", {
     args: [
-      "run", "-A", "packages/platform/app.ts", "packages/sh/src/sh.wac",
-      "--allow-read", "--allow-env", "--", "-c", script,
+      "run", "-A", "packages/platform/build.ts", "packages/sh/src/sh.wac",
+      "--allow-read", "--allow-write", "--allow-env", "-o", out,
     ],
+  }).output();
+  if (!r.success) throw new Error(`building sh failed: ${new TextDecoder().decode(r.stderr)}`);
+  return out;
+})();
+
+async function wacsh(script: string) {
+  const r = await new Deno.Command(wacshBinary, {
+    args: ["-c", script],
     env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin", HOME: Deno.env.get("HOME") ?? "" },
     clearEnv: false,
   }).output();
@@ -166,7 +300,7 @@ Deno.test({
         }
       }
     }
-    await Promise.all(Array.from({ length: 8 }, () => worker()));
+    await Promise.all(Array.from({ length: 4 }, () => worker()));
     if (differences.length > 0) {
       throw new Error(`${differences.length} of ${CASES.length} scripts differ from bash:\n\n` +
                       differences.join("\n\n"));

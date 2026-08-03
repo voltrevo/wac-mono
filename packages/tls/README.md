@@ -180,3 +180,11 @@ README](../crypto/README.md). Beyond that, this has not been reviewed by anyone,
 protection against the implementation mistakes TLS deployments spend their lives
 avoiding, and exists because building it is how you find out what the packages
 underneath are missing.
+
+## Not only sockets
+
+`TlsStream` runs over anything with `Deno.Conn`'s read/write/close, and is itself one, so it
+composes both ways: TLS over a socket, TLS over a Tor stream, HTTP over either. The shape is
+`Deno.Conn`'s rather than a nicer one of our own precisely so that no adapter is needed at
+any boundary — a real socket satisfies it structurally, and so does anything written to
+match.

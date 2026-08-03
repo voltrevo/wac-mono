@@ -101,6 +101,13 @@ export class Circuit {
 
   // How many more data cells we may send, and how many more we may receive before we owe
   // the far end a SENDME. Two separate counts in each direction, per circuit and per stream.
+  // Data that has arrived for each stream but not been asked for yet, and which streams the
+  // far end has finished with. Needed because one circuit carries several streams and a cell
+  // for one arrives while a caller is waiting on another — dropping it would be a silent
+  // loss, and handing it to the wrong caller worse.
+  #inbox = new Map<number, Uint8Array[]>();
+  #ended = new Set<number>();
+
   #packageWindow = CIRCUIT_WINDOW;
   #deliverWindow = CIRCUIT_WINDOW;
   #streamPackage = new Map<number, number>();
@@ -354,14 +361,44 @@ export class Circuit {
     }
   }
 
+  /** Take one cell off the wire and file it under the stream it belongs to. */
+  async #dispatch(): Promise<void> {
+    const cell = await this.#recv();
+    if (cell.command === RELAY.end) {
+      this.#ended.add(cell.streamId);
+      return;
+    }
+    if (cell.command !== RELAY.data) return;
+    const queue = this.#inbox.get(cell.streamId);
+    if (queue === undefined) this.#inbox.set(cell.streamId, [cell.data]);
+    else queue.push(cell.data);
+  }
+
+  /**
+   * The next data on a stream, or null once the far end has closed it.
+   *
+   * Incremental rather than read-to-end, because anything layered on top of a stream needs
+   * to answer before the stream finishes — TLS cannot complete a handshake if the only way
+   * to read is to wait for the connection to close.
+   */
+  async read(streamId: number): Promise<Uint8Array | null> {
+    for (;;) {
+      const queue = this.#inbox.get(streamId);
+      if (queue !== undefined && queue.length > 0) return queue.shift()!;
+      // Only after the queue is drained: a stream can end with data still unread, and
+      // reporting the end first would lose it.
+      if (this.#ended.has(streamId)) return null;
+      await this.#dispatch();
+    }
+  }
+
   /** Read the stream until the far end closes it. */
   async readToEnd(streamId: number): Promise<Uint8Array> {
     const parts: Uint8Array[] = [];
     for (;;) {
-      const cell = await this.#recv();
-      if (cell.streamId !== streamId) continue;
-      if (cell.command === RELAY.end) break;
-      if (cell.command === RELAY.data) parts.push(cell.data);
+      const chunk = await this.read(streamId);
+      if (chunk === null) break;
+      parts.push(chunk);
     }
     const total = parts.reduce((n, p) => n + p.length, 0);
     const out = new Uint8Array(total);
@@ -371,5 +408,13 @@ export class Circuit {
       at += p.length;
     }
     return out;
+  }
+
+  /** Tell the far end we are done sending on a stream. */
+  async endStream(streamId: number, reason = 6): Promise<void> {
+    // Reason 6 is DONE. Sending an END rather than dropping the stream lets the exit close
+    // its TCP connection cleanly instead of waiting for a timeout.
+    await this.#send(RELAY.end, streamId, Uint8Array.from([reason]));
+    this.#ended.add(streamId);
   }
 }

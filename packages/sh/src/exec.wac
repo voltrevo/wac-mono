@@ -21,8 +21,8 @@ import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Cli, Core, FileResult } from "../../platform/src/platform.wac";
 import { Part, PartKind } from "./lex.wac";
-import { AndOr, AndOrOp, Assign, Item, Pipeline, Redir, RedirKind, Script, Simple, Word,
-         parse } from "./parse.wac";
+import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
+         RedirKind, Script, Simple, Word, parse } from "./parse.wac";
 import { Output, itoa, names, run } from "./program.wac";
 
 export struct Shell {
@@ -46,9 +46,59 @@ export struct Shell {
   bool capture;
   Buf outBuf;
 
+  /**
+   * Every name ever set, so the table can be copied.
+   *
+   * `Map` offers no iteration, and a subshell has to start from a *copy* of its parent's
+   * variables — so the names are kept alongside. Appended only when a name is new, so it is a set
+   * in spite of being a list.
+   */
+  Vec<string> varNames;
+  /** Function bodies, by name, with their names alongside for the same reason as `varNames`. */
+  Map<string, Command> funcs;
+  Vec<string> funcNames;
+  /** `$1`, `$2`, … inside a function call. Empty at the top level. */
+  Vec<string> params;
+
   Shell create(Core core, Cli cli) {
     return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
-                 false, Buf.create());
+                 false, Buf.create(), Vec.create(), Map.create(hashString, stringEq),
+                 Vec.create(), Vec.create());
+  }
+
+  /** Set a variable, remembering the name so the table can be copied later. */
+  void setVar(this, string name, string value) {
+    if (!this.vars.has(name)) { this.varNames.push(name); }
+    this.vars.set(name, value);
+  }
+
+  void defineFunc(this, string name, Command body) {
+    if (!this.funcs.has(name)) { this.funcNames.push(name); }
+    this.funcs.set(name, body);
+  }
+
+  /**
+   * A shell with the same variables and functions, whose changes do not reach back.
+   *
+   * What a subshell is. The copy is why `varNames` exists at all.
+   */
+  Shell fork(this) {
+    Shell out = Shell.create(this.core, this.cli);
+    for (i32 i = 0; i < this.varNames.len(); i++) {
+      string name = this.varNames.get(i);
+      Option<string> v = this.vars.get(name);
+      if (v.isSome()) { out.setVar(name, v.unwrap()); }
+    }
+    // Copied, not shared: a function defined inside a subshell does not exist outside it.
+    for (i32 i = 0; i < this.funcNames.len(); i++) {
+      string name = this.funcNames.get(i);
+      Option<Command> f = this.funcs.get(name);
+      if (f.isSome()) { out.defineFunc(name, f.unwrap()); }
+    }
+    out.params = this.params;
+    out.status = this.status;
+    out.capture = true;
+    return out;
   }
 
   /** A shell whose output is collected in `outBuf` rather than written. */
@@ -60,6 +110,22 @@ export struct Shell {
 
   string lookUp(const this, string name) {
     if (name == "?") { return itoa(this.status); }
+    if (name == "#") { return itoa(this.params.len()); }
+    if (name == "@" || name == "*") {
+      string all = "";
+      for (i32 i = 0; i < this.params.len(); i++) {
+        all = (i == 0) ? this.params.get(i) : all + " " + this.params.get(i);
+      }
+      return all;
+    }
+    // `$1` through `$9`. `$0` is the shell's own name, which this does not have.
+    if (name.len() == 1) {
+      u8[] b = name.toBytes();
+      if (b[0] >= 0x31 && b[0] <= 0x39) {
+        i32 i = b[0] - 0x31;
+        return i < this.params.len() ? this.params.get(i) : "";
+      }
+    }
     Option<string> v = this.vars.get(name);
     if (v.isNone()) {
       // A variable the shell has not set falls back to the environment, which is what makes
@@ -78,11 +144,16 @@ export i32 runScript(Shell sh, string src) {
     sh.errOut.pushAll(("sh: " + script.error + "\n").toBytes());
     return 2;
   }
-  for (i32 i = 0; i < script.lists.len(); i++) {
-    if (sh.exiting) { break; }
-    runAndOr(sh, script.lists.get(i));
-  }
+  runList(sh, script.lists);
   return sh.exiting ? sh.exitCode : sh.status;
+}
+
+/** A sequence of `&&`/`||` lists — a script, or the body of a compound command. */
+void runList(Shell sh, Vec<AndOr> lists) {
+  for (i32 i = 0; i < lists.len(); i++) {
+    if (sh.exiting) { return; }
+    runAndOr(sh, lists.get(i));
+  }
 }
 
 void runAndOr(Shell sh, AndOr list) {
@@ -115,9 +186,140 @@ void runPipeline(Shell sh, Pipeline pipeline) {
   u8[] carried = u8[0]();
   for (i32 i = 0; i < pipeline.stages.len(); i++) {
     bool last = i == pipeline.stages.len() - 1;
-    carried = runSimple(sh, pipeline.stages.get(i), carried, last);
+    carried = runCommand(sh, pipeline.stages.get(i), carried, last);
     if (sh.exiting) { return; }
   }
+}
+
+/**
+ * One pipeline stage, plain or compound.
+ *
+ * A compound stage that is not last, or that carries a redirection, has to have its output
+ * *collected* rather than written — and the shell already has a flag for that, so this borrows
+ * it and puts it back. Without this `{ echo a; } | rev` would print `a` and pipe nothing.
+ */
+u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
+  match (cmd.kind) {
+    case Plain: return runSimple(sh, cmd.simple, stdin, last);
+    else: {}
+  }
+
+  // A subshell always collects: its output is produced in a *child* shell's buffer, so there is
+  // something to hand back even when this stage is last and would otherwise write as it goes.
+  bool isSubshell = false;
+  match (cmd.kind) {
+    case Subshell: { isSubshell = true; }
+    else: {}
+  }
+  bool collect = !last || cmd.redirs.len() > 0 || isSubshell;
+  bool savedCapture = sh.capture;
+  Buf savedBuf = sh.outBuf;
+  if (collect) {
+    sh.capture = true;
+    sh.outBuf = Buf.create();
+  }
+
+  match (cmd.kind) {
+    case If: {
+      for (i32 i = 0; i < cmd.clauses.len(); i++) {
+        Clause c = cmd.clauses.get(i);
+        // A clause with no condition is the `else` branch, which always runs if it is reached.
+        if (c.cond.len() == 0) { runList(sh, c.body); break; }
+        runList(sh, c.cond);
+        if (sh.exiting) { break; }
+        if (sh.status == 0) { runList(sh, c.body); break; }
+        // Nothing matched: an `if` whose condition failed and which has no `else` succeeds, so
+        // the status of the last *condition* must not leak out as the statement's.
+        if (i == cmd.clauses.len() - 1) { sh.status = 0; }
+      }
+    }
+    case While: { runLoop(sh, cmd.clauses.get(0), false); }
+    case Until: { runLoop(sh, cmd.clauses.get(0), true); }
+    case For: {
+      Vec<string> items = Vec.create();
+      for (i32 i = 0; i < cmd.words.len(); i++) { expandInto(sh, cmd.words.get(i), items); }
+      // A `for` over nothing runs its body zero times and succeeds, which is why the status is
+      // set before the loop rather than left as whatever ran last.
+      sh.status = 0;
+      for (i32 i = 0; i < items.len() && !sh.exiting; i++) {
+        sh.setVar(cmd.varName, items.get(i));
+        runList(sh, cmd.clauses.get(0).body);
+      }
+    }
+    case Brace: { runList(sh, cmd.clauses.get(0).body); }
+    case Subshell: {
+      // A copy, so assignments inside do not reach back out. Its output still belongs to us.
+      Shell inner = sh.fork();
+      runList(inner, cmd.clauses.get(0).body);
+      sh.outBuf.pushAll(inner.outBuf.take());
+      sh.errOut.pushAll(inner.errOut.bytes());
+      sh.status = inner.exiting ? inner.exitCode : inner.status;
+    }
+    case Case: {
+      string subject = joinWord(sh, cmd.words.get(0));
+      sh.status = 0;
+      for (i32 i = 0; i < cmd.arms.len(); i++) {
+        CaseArm arm = cmd.arms.get(i);
+        bool hit = false;
+        for (i32 j = 0; j < arm.patterns.len() && !hit; j++) {
+          if (patternMatches(sh, arm.patterns.get(j), subject)) { hit = true; }
+        }
+        if (hit) {
+          runList(sh, arm.body);
+          break;
+        }
+      }
+    }
+    case Function: {
+      // A definition runs nothing. Storing it is the whole effect.
+      sh.defineFunc(cmd.varName,
+                    cmd.clauses.get(0).body.get(0).items.get(0).pipeline.stages.get(0));
+      sh.status = 0;
+    }
+    else: {}
+  }
+
+  if (!collect) { return u8[0](); }
+  u8[] produced = sh.outBuf.take();
+  sh.capture = savedCapture;
+  sh.outBuf = savedBuf;
+
+  for (i32 i = 0; i < cmd.redirs.len(); i++) {
+    Redir r = cmd.redirs.get(i);
+    match (r.kind) {
+      case Out: { writeTo(sh, r, produced, false); return u8[0](); }
+      case Append: { writeTo(sh, r, produced, true); return u8[0](); }
+      else: {}
+    }
+  }
+  if (last) {
+    if (sh.capture) { sh.outBuf.pushAll(produced); }
+    else { sh.cli.write(produced); }
+    return u8[0]();
+  }
+  return produced;
+}
+
+/**
+ * `while` and `until`, which differ only in the sense of the test.
+ *
+ * Bounded, because a shell with no way to interrupt it should not be able to hang the server it
+ * is running inside. bash would loop forever; this stops and says why, which is a difference
+ * worth having until there is a way to send it a signal.
+ */
+void runLoop(Shell sh, Clause c, bool untilForm) {
+  i32 limit = 100000;
+  sh.status = 0;
+  for (i32 i = 0; i < limit; i++) {
+    if (sh.exiting) { return; }
+    runList(sh, c.cond);
+    if (sh.exiting) { return; }
+    bool go = untilForm ? sh.status != 0 : sh.status == 0;
+    if (!go) { sh.status = 0; return; }
+    runList(sh, c.body);
+  }
+  sh.errOut.pushAll("sh: loop ran 100000 times and was stopped\n".toBytes());
+  sh.status = 2;
 }
 
 /**
@@ -138,14 +340,14 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
   if (argv.len() == 0) {
     for (i32 i = 0; i < cmd.assigns.len(); i++) {
       Assign a = cmd.assigns.get(i);
-      sh.vars.set(a.name, joinWord(sh, a.value));
+      sh.setVar(a.name, joinWord(sh, a.value));
     }
     sh.status = 0;
     return u8[0]();
   }
   for (i32 i = 0; i < cmd.assigns.len(); i++) {
     Assign a = cmd.assigns.get(i);
-    sh.vars.set(a.name, joinWord(sh, a.value));
+    sh.setVar(a.name, joinWord(sh, a.value));
   }
 
   // An input redirection replaces whatever the pipeline was carrying.
@@ -204,8 +406,10 @@ bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
   // Only standard output is captured, so `2>` has nothing of its own to write. Saying so beats
   // writing the wrong stream to the file.
   if (r.fd != 1) {
+    // Said, not silently skipped — but the command's own status is left alone. Overwriting it
+    // made `cmd 2>/dev/null; echo $?` report the refusal instead of what the command did, which
+    // is a second wrong answer on top of the first.
     sh.errOut.pushAll(("sh: redirecting fd " + itoa(r.fd) + " is not supported\n").toBytes());
-    sh.status = 2;
     return true;
   }
   u8[] payload = data;
@@ -225,9 +429,28 @@ bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
   return true;
 }
 
-/** A builtin if there is one, otherwise an external program. */
+/**
+ * Whether a `case` pattern matches, with quoting respected.
+ *
+ * The same matcher pathname expansion uses, over the subject rather than over a directory — which
+ * is why `case $f in *.txt)` and `echo *.txt` agree about what a pattern means.
+ */
+bool patternMatches(Shell sh, Word pattern, string subject) {
+  Buf field = Buf.create();
+  Buf mask = Buf.create();
+  for (i32 i = 0; i < pattern.parts.len(); i++) {
+    Part p = pattern.parts.get(i);
+    appendMasked(field, mask, expandPart(sh, p), p.quoted ? 1 : 0);
+  }
+  return globMatch(field.bytes(), mask.bytes(), 0, subject.toBytes(), 0);
+}
+
+/** A function if one is defined, then a builtin, then an external program. */
 Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   string name = argv.get(0);
+
+  // Functions shadow builtins, as they do in bash for everything but the special builtins.
+  if (sh.funcs.has(name)) { return callFunction(sh, argv); }
 
   if (name == ":" || name == "true") { return Output.ok(u8[0]()); }
   if (name == "false") { return Output(u8[0](), u8[0](), 1, true); }
@@ -243,7 +466,7 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
     for (i32 i = 1; i < argv.len(); i++) {
       string a = argv.get(i);
       i32 eq = indexOfEq(a);
-      if (eq >= 0) { sh.vars.set(a.slice(0, eq), a.slice(eq + 1, a.len())); }
+      if (eq >= 0) { sh.setVar(a.slice(0, eq), a.slice(eq + 1, a.len())); }
     }
     return Output.ok(u8[0]());
   }
@@ -255,6 +478,34 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   if (name == "help") { return help(); }
 
   return run(sh.cli, argv, stdin);
+}
+
+/**
+ * Call a function: bind `$1`… to the arguments, run the body, restore.
+ *
+ * The parameters are saved and put back rather than forked, because a function *does* see and
+ * change the caller's variables — only the positional parameters are its own.
+ */
+Output callFunction(Shell sh, Vec<string> argv) {
+  Command body = sh.funcs.get(argv.get(0)).unwrap();
+  Vec<string> saved = sh.params;
+  Vec<string> params = Vec.create();
+  for (i32 i = 1; i < argv.len(); i++) { params.push(argv.get(i)); }
+  sh.params = params;
+
+  bool savedCapture = sh.capture;
+  Buf savedBuf = sh.outBuf;
+  sh.capture = true;
+  sh.outBuf = Buf.create();
+
+  runCommand(sh, body, u8[0](), true);
+
+  u8[] produced = sh.outBuf.take();
+  sh.capture = savedCapture;
+  sh.outBuf = savedBuf;
+  sh.params = saved;
+  // `exit` inside a function ends the shell, not just the call, which is what bash does.
+  return Output(produced, u8[0](), sh.status, true);
 }
 
 Output echo(Vec<string> argv) {
@@ -329,7 +580,11 @@ Output help() {
  * that yields only whitespace disappears. `echo "$x"` passes one empty argument. Both matter.
  */
 void expandInto(Shell sh, Word word, Vec<string> argv) {
-  string current = "";
+  // The field is built as bytes *and* a mask saying which of them were quoted. Globbing needs
+  // that per character, not per word: in `echo "*"a` the star is literal and the `a` is not, so a
+  // flag on the whole field would either glob a filename nobody asked for or refuse one they did.
+  Buf field = Buf.create();
+  Buf mask = Buf.create();
   bool started = false;
 
   for (i32 i = 0; i < word.parts.len(); i++) {
@@ -337,19 +592,19 @@ void expandInto(Shell sh, Word word, Vec<string> argv) {
     string text = expandPart(sh, p);
 
     if (p.quoted) {
-      current = current + text;
+      appendMasked(field, mask, text, 1);
       started = true;
       continue;
     }
     match (p.kind) {
       case Lit: {
         // Literal text never splits, whatever is in it — `echo a b` is two words because the
-        // *lexer* split it, not because expansion did.
-        current = current + text;
+        // *lexer* split it, not because expansion did. It can still glob.
+        appendMasked(field, mask, text, 0);
         started = true;
       }
       else: {
-        // An unquoted expansion splits on whitespace.
+        // An unquoted expansion splits on whitespace, and its pieces glob.
         u8[] b = text.toBytes();
         i32 start = 0;
         for (i32 j = 0; j <= b.len(); j++) {
@@ -357,12 +612,13 @@ void expandInto(Shell sh, Word word, Vec<string> argv) {
           bool blank = !end && (b[j] == 32 || b[j] == 9 || b[j] == 10);
           if (end || blank) {
             if (j > start) {
-              current = current + sliceString(text, start, j);
+              appendMasked(field, mask, text.slice(start, j), 0);
               started = true;
             }
             if (!end) {
-              if (started) { argv.push(current); }
-              current = "";
+              if (started) { emitField(sh, field, mask, argv); }
+              field = Buf.create();
+              mask = Buf.create();
               started = false;
             }
             start = j + 1;
@@ -371,7 +627,114 @@ void expandInto(Shell sh, Word word, Vec<string> argv) {
       }
     }
   }
-  if (started) { argv.push(current); }
+  if (started) { emitField(sh, field, mask, argv); }
+}
+
+void appendMasked(Buf field, Buf mask, string text, i32 quoted) {
+  u8[] b = text.toBytes();
+  field.pushAll(b);
+  for (i32 i = 0; i < b.len(); i++) { mask.push(quoted); }
+}
+
+/**
+ * Finish one field: glob it if it has an unquoted metacharacter, otherwise pass it through.
+ *
+ * A pattern that matches nothing is passed through unchanged, which is bash's default — so the
+ * difference between globbing and not only shows when something would have matched.
+ */
+void emitField(Shell sh, Buf field, Buf mask, Vec<string> argv) {
+  u8[] bytes = field.bytes();
+  u8[] quoted = mask.bytes();
+  if (!hasUnquotedMeta(bytes, quoted)) {
+    argv.push(string.fromBytes(bytes));
+    return;
+  }
+  i32 before = argv.len();
+  globInto(sh, bytes, quoted, argv);
+  if (argv.len() == before) { argv.push(string.fromBytes(bytes)); }
+}
+
+bool hasUnquotedMeta(u8[] b, u8[] quoted) {
+  for (i32 i = 0; i < b.len(); i++) {
+    if (quoted[i] != 0) { continue; }
+    if (b[i] == 0x2a || b[i] == 0x3f) { return true; }          // '*' '?'
+  }
+  return false;
+}
+
+/**
+ * Pathname expansion, for a pattern in the last path component only.
+ *
+ * A pattern in the final component works; one in a leading component does not, because that needs
+ * walking every directory that matches — a different and much larger job. Splitting at the last
+ * slash keeps this to a single `readDir`.
+ *
+ * (Written out in words rather than shown, because the obvious example contains the two
+ * characters that end this comment.)
+ *
+ * Matches are sorted, because a shell's glob is ordered and `readDir` makes no promise.
+ */
+void globInto(Shell sh, u8[] pattern, u8[] quoted, Vec<string> argv) {
+  i32 slash = -1;
+  for (i32 i = 0; i < pattern.len(); i++) {
+    if (pattern[i] == 0x2f) { slash = i; }                      // '/'
+  }
+  string dir = slash < 0 ? "." : string.fromBytes(sliceBytes(pattern, 0, slash));
+  if (slash == 0) { dir = "/"; }
+  string prefix = slash < 0 ? "" : string.fromBytes(sliceBytes(pattern, 0, slash + 1));
+  u8[] tail = sliceBytes(pattern, slash + 1, pattern.len());
+  u8[] tailMask = sliceBytes(quoted, slash + 1, quoted.len());
+
+  string[]? names = sh.cli.readDir(dir);
+  if (names is null) { return; }
+
+  Vec<string> hits = Vec.create();
+  for (i32 i = 0; i < names!.len(); i++) {
+    u8[] name = names![i].toBytes();
+    // A leading dot is only matched by a pattern that starts with one, which is why `echo *` does
+    // not list every dotfile in the directory.
+    if (name.len() > 0 && name[0] == 0x2e && !(tail.len() > 0 && tail[0] == 0x2e)) { continue; }
+    if (globMatch(tail, tailMask, 0, name, 0)) { hits.push(prefix + names![i]); }
+  }
+
+  for (i32 i = 1; i < hits.len(); i++) {
+    string v = hits.get(i);
+    i32 j = i - 1;
+    while (j >= 0 && hits.get(j) > v) {
+      hits.set(j + 1, hits.get(j));
+      j--;
+    }
+    hits.set(j + 1, v);
+  }
+  for (i32 i = 0; i < hits.len(); i++) { argv.push(hits.get(i)); }
+}
+
+/** `*` any run, `?` one character — and only where the pattern character was unquoted. */
+bool globMatch(u8[] pat, u8[] quoted, i32 p, u8[] name, i32 n) {
+  i32 i = p;
+  i32 j = n;
+  while (i < pat.len()) {
+    bool meta = quoted[i] == 0;
+    if (meta && pat[i] == 0x2a) {
+      for (i32 k = j; k <= name.len(); k++) {
+        if (globMatch(pat, quoted, i + 1, name, k)) { return true; }
+      }
+      return false;
+    }
+    if (j >= name.len()) { return false; }
+    if (meta && pat[i] == 0x3f) { i++; j++; continue; }
+    if (pat[i] != name[j]) { return false; }
+    i++;
+    j++;
+  }
+  return j == name.len();
+}
+
+u8[] sliceBytes(u8[] b, i32 from, i32 to) {
+  if (to <= from) { return u8[0](); }
+  u8[] out = u8[to - from]();
+  out.copyFrom(b, from, 0, to - from);
+  return out;
 }
 
 string expandPart(Shell sh, Part p) {
@@ -404,10 +767,6 @@ string joinWord(Shell sh, Word word) {
     s = s + expandPart(sh, word.parts.get(i));
   }
   return s;
-}
-
-string sliceString(string s, i32 from, i32 to) {
-  return s.slice(from, to);
 }
 
 i32 indexOfEq(string s) {

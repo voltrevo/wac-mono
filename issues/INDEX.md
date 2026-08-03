@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0017](open/0017-deno-task-app-orphans-the-application-when-the-launcher-is-killed.md) | `deno task app` orphans the application when the launcher is killed | bug | wrong answer |
 | [0016](open/0016-the-browser-target-is-untested-in-a-browser-playwright-cdn-is-blocked.md) | the browser target is untested in a browser; Playwright's CDN is blocked | task | not implemented |
 | [0015](open/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md) | platform cannot start a process, so a server cannot run a command | missing feature | not implemented |
 | [0014](open/0014-platform-has-no-way-to-write-bytes-to-standard-error.md) | platform has no way to write bytes to standard error | missing feature | not implemented |

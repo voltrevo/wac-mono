@@ -62,11 +62,12 @@ export async function readCell(conn: TlsStream, buf: Buffered): Promise<Uint8Arr
         return cell;
       }
     }
-    const got = await conn.read();
+    const chunk = new Uint8Array(8192);
+    const got = await conn.read(chunk);
     if (got === null) return null;
-    const merged = new Uint8Array(buf.data.length + got.length);
+    const merged = new Uint8Array(buf.data.length + got);
     merged.set(buf.data);
-    merged.set(got, buf.data.length);
+    merged.set(chunk.subarray(0, got), buf.data.length);
     buf.data = merged;
   }
 }
