@@ -12,9 +12,10 @@
 // real event loop. So the program keeps its state in ordinary locals across events, which is
 // the thing a callback shape cannot do without somewhere to put it.
 
-import { Core, Event, Page } from "../src/platform.wac";
+import { Cli, Core, Event, Page } from "../src/platform.wac";
 
-export i32 page(Core core, Page page) {
+// `Cli` comes too, unused here: a page has a filesystem and arguments like any other program.
+export i32 page(Core core, Cli cli, Page page) {
   page.title("counter").wait();
   page.render(
     "<p>Clicks: <b id=\"n\">0</b></p>" +

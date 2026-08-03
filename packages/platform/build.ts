@@ -242,7 +242,14 @@ export async function buildApp(
           // The page itself. Always offered: unlike the filesystem or the network, a page is
           // not authority over anything the user has not already given by opening it, and the
           // application only reaches it if it exported `page` to begin with.
-          `    dom: pageDom(document.getElementById("app"), document),\n` +
+          `    dom: pageDom(document.getElementById("app"), document, (name, bytes) => {\n` +
+          `      const url = URL.createObjectURL(new Blob([bytes]));\n` +
+          `      const a = document.createElement("a");\n` +
+          `      a.href = url; a.download = name; a.click();\n` +
+          // Revoked on a turn of the event loop rather than at once: revoking
+          // synchronously after click() races the download and yields an empty file.
+          `      setTimeout(() => URL.revokeObjectURL(url), 10000);\n` +
+          `    }),\n` +
           `  });\n` +
           `  line("[exit " + code + "]", "meta");\n` +
           `} catch (e) {\n` +

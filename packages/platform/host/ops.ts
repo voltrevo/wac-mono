@@ -42,6 +42,9 @@ export const OP = {
   ON: 35,
   NEXT_EVENT: 36,
   TITLE: 37,
+  DRAW_PIXELS: 38,
+  NEXT_FILE: 39,
+  OFFER_DOWNLOAD: 40,
 } as const;
 
 /**

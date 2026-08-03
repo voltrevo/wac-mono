@@ -10,7 +10,7 @@
 // SSH-server discussion on issue 0015 was reaching for. What makes it writable is that a
 // socket and a child are both handles, so waiting on whichever speaks first is one call:
 //
-//   i32 which = cli.waitAny(i32[](fromNet.id, fromKid.id), -1);
+//   i32 which = core.waitAny(i32[](fromNet.id, fromKid.id), -1);
 //
 // Try it with `box` as the handler, which needs no grants for a text applet:
 //
@@ -94,8 +94,8 @@ void relay(Core core, Cli cli, i32 net, i32 kid) {
 
   while (true) {
     i32 which = netDone
-      ? cli.waitAny(i32[](fromKid.id), -1)
-      : cli.waitAny(i32[](fromNet.id, fromKid.id), -1);
+      ? core.waitAny(i32[](fromKid.id), -1)
+      : core.waitAny(i32[](fromNet.id, fromKid.id), -1);
     if (which < 0) { return; }
 
     // With the network done there is one ticket in the list, so index 0 is the child.

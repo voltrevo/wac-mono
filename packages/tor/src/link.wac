@@ -81,7 +81,7 @@ const i32 READ_TIMEOUT_MS = 30000;
 
 export Link connectRelay(Core core, Cli cli, string host, i32 port) {
   Pending<Socket> dial = cli.connect(host, port);
-  if (cli.waitAny(i32[](dial.id), CONNECT_TIMEOUT_MS) < 0) {
+  if (core.waitAny(i32[](dial.id), CONNECT_TIMEOUT_MS) < 0) {
     // Nothing to close — there is no handle yet — so cancelling the dial is all there is.
     // The host may still be inside the connect; what this guarantees is that we stop waiting.
     dial.cancel();
@@ -120,7 +120,7 @@ export void handshakeTls(Link l) {
  */
 export bool pump(Link l) {
   Pending<u8[]> read = l.cli.recv(l.sock);
-  if (l.cli.waitAny(i32[](read.id), READ_TIMEOUT_MS) < 0) {
+  if (l.core.waitAny(i32[](read.id), READ_TIMEOUT_MS) < 0) {
     read.cancel();
     l.cli.closeSocket(l.sock);
     l.core.warn("tor: a relay went silent for " + itoa(READ_TIMEOUT_MS) + "ms");

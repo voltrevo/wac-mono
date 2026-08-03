@@ -14,11 +14,11 @@
 // and reaching the page through the same capability boundary a terminal program reaches a file
 // through. There is no JavaScript here that anybody wrote.
 
-import { Core, Event, Page } from "../../platform/src/platform.wac";
+import { Cli, Core, Event, Page } from "../../platform/src/platform.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { gzipBest } from "../../gzip/src/gzip.wac";
 
-export i32 page(Core core, Page page) {
+export i32 page(Core core, Cli cli, Page page) {
   page.title("wac: hash and compress").wait();
   page.render(
     "<p>Type, and watch a compiled SHA-256 and DEFLATE keep up.</p>" +

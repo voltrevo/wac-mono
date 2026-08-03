@@ -44,8 +44,12 @@ export function runAsWorkerBrowser(load: () => Promise<AppModule>): void {
         // instead of `Cli`. Chosen by which export exists rather than by inspecting `main`'s
         // parameter types: the name says which kind of program this is, at a glance, in the
         // source and here.
+        // An interactive application gets all three profiles, not two. A page has a
+        // filesystem and arguments like any other program — `packages/sh` in a terminal needs
+        // `Cli` to be a shell at all — and withholding it would have meant a second way to ask
+        // for the same things.
         const code = app.page !== undefined
-          ? app.page(coreOf(b, app), pageOf(b, app as unknown as PageClasses))
+          ? app.page(coreOf(b, app), cliOf(b, app), pageOf(b, app as unknown as PageClasses))
           : app.main(coreOf(b, app), cliOf(b, app));
         scope.postMessage({ ok: true, code });
       } catch (e) {
@@ -70,9 +74,27 @@ type El = {
   innerHTML: string;
   textContent: string | null;
   value?: string;
+  width?: number;
+  height?: number;
+  files?: { length: number; item(i: number): FileLike | null };
   closest(selector: string): El | null;
+  getContext?(kind: string): Ctx | null;
+  addEventListener(kind: string, fn: (ev: Ev) => void): void;
 };
-type Ev = { target: El | null; key?: string; preventDefault(): void };
+type FileLike = { name: string; arrayBuffer(): Promise<ArrayBuffer> };
+type Ctx = {
+  putImageData(data: ImageDataLike, x: number, y: number): void;
+  createImageData(w: number, h: number): ImageDataLike;
+};
+type ImageDataLike = { data: { set(src: Uint8Array, at?: number): void } };
+type Ev = {
+  target: El | null;
+  key?: string;
+  offsetX?: number;
+  offsetY?: number;
+  dataTransfer?: { files: { length: number; item(i: number): FileLike | null } };
+  preventDefault(): void;
+};
 type Doc = {
   title: string;
   getElementById(id: string): El | null;
@@ -91,12 +113,51 @@ type Doc = {
  * symptom — the first click works and the second does not — sends you looking in the wrong
  * place entirely.
  */
-export function pageDom(root: El, doc: Doc): Dom {
-  const queue: { kind: string; id: string; value: string }[] = [];
-  let waiting: ((e: { kind: string; id: string; value: string }) => void) | null = null;
+export function pageDom(root: El, doc: Doc, make: MakeDownload): Dom {
+  type PageEvent = { kind: string; id: string; value: string; x: number; y: number };
+  type PickedFile = { ok: boolean; name: string; bytes: Uint8Array; error: string };
+
+  const queue: PageEvent[] = [];
+  let waiting: ((e: PageEvent) => void) | null = null;
   const wanted = new Map<string, string[]>();   // event kind -> the selectors asked for
 
-  const deliver = (e: { kind: string; id: string; value: string }) => {
+  // Files arrive whether or not the application has asked yet, so they queue like events. The
+  // listeners below are attached once and unconditionally: a file the user has already dropped
+  // must not be lost because the program had not got to `nextFile` yet.
+  const files: PickedFile[] = [];
+  let wantsFile: ((f: PickedFile) => void) | null = null;
+  const gotFile = (f: PickedFile) => {
+    if (wantsFile !== null) {
+      const w = wantsFile;
+      wantsFile = null;
+      w(f);
+      return;
+    }
+    files.push(f);
+  };
+  const takeFiles = (list: { length: number; item(i: number): FileLike | null } | undefined) => {
+    for (let i = 0; i < (list?.length ?? 0); i++) {
+      const f = list?.item(i);
+      if (f == null) continue;
+      // Read here rather than handing the application a handle: a `File` is a live object on
+      // this thread, and everything across the bridge is bytes.
+      f.arrayBuffer()
+        .then((buf) => gotFile({ ok: true, name: f.name, bytes: new Uint8Array(buf), error: "" }))
+        .catch((e) =>
+          gotFile({ ok: false, name: f.name, bytes: new Uint8Array(0), error: String(e?.message ?? e) })
+        );
+    }
+  };
+  doc.addEventListener("change", (ev: Ev) => takeFiles(ev.target?.files));
+  // Dropping needs both: without `dragover` being prevented the browser navigates to the file
+  // instead, which unloads the application mid-run and looks like a crash.
+  doc.addEventListener("dragover", (ev: Ev) => ev.preventDefault());
+  doc.addEventListener("drop", (ev: Ev) => {
+    ev.preventDefault();
+    takeFiles(ev.dataTransfer?.files);
+  });
+
+  const deliver = (e: PageEvent) => {
     if (waiting !== null) {
       const w = waiting;
       waiting = null;
@@ -137,6 +198,8 @@ export function pageDom(root: El, doc: Doc): Dom {
             kind,
             id: hit.id,
             value: kind === "keydown" ? (ev.key ?? "") : (target.value ?? ""),
+            x: Math.round(ev.offsetX ?? 0),
+            y: Math.round(ev.offsetY ?? 0),
           });
           return;
         }
@@ -153,8 +216,40 @@ export function pageDom(root: El, doc: Doc): Dom {
         // first is answered would be the application's bug rather than something to buffer.
         waiting = resolve;
       }),
+    drawPixels: (id, w, h, rgba) => {
+      const el = doc.getElementById(id);
+      const ctx = el?.getContext?.("2d");
+      if (el === null || el === undefined || ctx == null) {
+        throw new Error(`drawPixels: no canvas with id ${JSON.stringify(id)}`);
+      }
+      // Resizing clears the canvas, so it is done before the blit and only when it changes —
+      // setting width every frame would flicker and cost a reallocation per frame.
+      if (el.width !== w) el.width = w;
+      if (el.height !== h) el.height = h;
+      const img = ctx.createImageData(w, h);
+      img.data.set(rgba);
+      ctx.putImageData(img, 0, 0);
+    },
+    nextFile: () =>
+      new Promise((resolve) => {
+        const queued = files.shift();
+        if (queued !== undefined) {
+          resolve(queued);
+          return;
+        }
+        wantsFile = resolve;
+      }),
+    offerDownload: (name, bytes) => make(name, bytes),
   };
 }
+
+/**
+ * How a page hands bytes back to the user.
+ *
+ * A parameter rather than code here because it is the one thing in this file that needs
+ * `Blob`, `URL` and an anchor, and passing it in keeps `pageDom` testable without any of them.
+ */
+export type MakeDownload = (name: string, bytes: Uint8Array) => void;
 
 /** What a page needs to say about the environment it is offering. */
 export type PageOptions = BrowserWorldOptions & {

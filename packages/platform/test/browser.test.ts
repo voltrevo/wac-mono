@@ -236,9 +236,14 @@ Deno.test("the page capabilities, against a document that only records", async (
   // `entryBrowser.ts` and are covered by `browser_live.test.ts` clicking real buttons, which
   // is the split this file learned the hard way with `readDir(".")`.
   const did: string[] = [];
-  const events: { kind: string; id: string; value: string }[] = [
-    { kind: "click", id: "go", value: "" },
-    { kind: "input", id: "box", value: "typed" },
+  const events = [
+    { kind: "click", id: "go", value: "", x: 0, y: 0 },
+    { kind: "input", id: "box", value: "typed", x: 0, y: 0 },
+    { kind: "pointermove", id: "c", value: "", x: 17, y: 42 },
+  ];
+  const files = [
+    { ok: true, name: "given.txt", bytes: str("its bytes"), error: "" },
+    { ok: false, name: "bad.bin", bytes: new Uint8Array(0), error: "unreadable" },
   ];
   const w = browserWorld({
     dom: {
@@ -248,7 +253,11 @@ Deno.test("the page capabilities, against a document that only records", async (
       value: (id) => (id === "box" ? "in the box" : ""),
       on: (sel, kind) => did.push(`on:${sel}/${kind}`),
       title: (t) => did.push(`title:${t}`),
-      next: () => Promise.resolve(events.shift() ?? { kind: "", id: "", value: "" }),
+      next: () => Promise.resolve(events.shift() ?? { kind: "", id: "", value: "", x: 0, y: 0 }),
+      drawPixels: (id, w, h, rgba) => did.push(`draw:${id}/${w}x${h}/${rgba.length}b`),
+      nextFile: () =>
+        Promise.resolve(files.shift() ?? { ok: false, name: "", bytes: new Uint8Array(0), error: "none" }),
+      offerDownload: (name, bytes) => did.push(`download:${name}/${bytes.length}b`),
     },
   });
   const call = async (op: number, payload: Uint8Array<ArrayBufferLike> = new Uint8Array(0)) =>
@@ -274,9 +283,53 @@ Deno.test("the page capabilities, against a document that only records", async (
   );
   assertEquals(unstr(await call(OP.GET_VALUE, str("box"))), "in the box");
 
-  // Three NUL-separated fields, in the order `Event` declares them.
-  assertEquals(unstr(await call(OP.NEXT_EVENT)).split("\u0000").join("|"), "click|go|");
-  assertEquals(unstr(await call(OP.NEXT_EVENT)).split("\u0000").join("|"), "input|box|typed");
+  // NUL-separated fields, in the order `Event` declares them, coordinates included.
+  assertEquals(unstr(await call(OP.NEXT_EVENT)).split("\u0000").join("|"), "click|go||0|0");
+  assertEquals(unstr(await call(OP.NEXT_EVENT)).split("\u0000").join("|"), "input|box|typed|0|0");
+  assertEquals(unstr(await call(OP.NEXT_EVENT)).split("\u0000").join("|"), "pointermove|c||17|42");
+
+  // A pixel buffer: width, height, the id length-prefixed, then the bytes.
+  const blit = new Uint8Array(12 + 1 + 2 * 3 * 4);
+  blit.set(i32le(2), 0);
+  blit.set(i32le(3), 4);
+  blit.set(i32le(1), 8);
+  blit.set(str("c"), 12);
+  await call(OP.DRAW_PIXELS, blit);
+  assertEquals(did[did.length - 1], "draw:c/2x3/24b");
+  // A buffer that does not match the size is caught here rather than several layers down.
+  const short = new Uint8Array(12 + 1 + 4);
+  short.set(i32le(2), 0);
+  short.set(i32le(3), 4);
+  short.set(i32le(1), 8);
+  short.set(str("c"), 12);
+  await rejects(() => call(OP.DRAW_PIXELS, short), "needs 24 bytes, got 4");
+
+  // A file in: a flag, the name, the error, then the bytes.
+  // Offsets computed rather than written out: the first attempt hardcoded them and was four
+  // bytes off, which read as the file's own bytes being wrong.
+  const unpick = (b: Uint8Array) => {
+    const nameLen = readI32le(b.subarray(1));
+    const errLen = readI32le(b.subarray(5 + nameLen));
+    return {
+      ok: b[0] === 1,
+      name: unstr(b.subarray(5, 5 + nameLen)),
+      error: unstr(b.subarray(9 + nameLen, 9 + nameLen + errLen)),
+      bytes: unstr(b.subarray(9 + nameLen + errLen)),
+    };
+  };
+  assertEquals(JSON.stringify(unpick(await call(OP.NEXT_FILE))),
+    JSON.stringify({ ok: true, name: "given.txt", error: "", bytes: "its bytes" }));
+  // And one that could not be read, which is a `Picked` carrying a reason rather than a throw.
+  assertEquals(JSON.stringify(unpick(await call(OP.NEXT_FILE))),
+    JSON.stringify({ ok: false, name: "bad.bin", error: "unreadable", bytes: "" }));
+
+  // A file out.
+  const out = new Uint8Array(4 + 5 + 3);
+  out.set(i32le(5), 0);
+  out.set(str("a.txt"), 4);
+  out.set(str("xyz"), 9);
+  await call(OP.OFFER_DOWNLOAD, out);
+  assertEquals(did[did.length - 1], "download:a.txt/3b");
 });
 
 Deno.test("a page with no dom refuses to draw, rather than doing nothing", async () => {

@@ -50,9 +50,11 @@ export type AppModule = {
   // here, and the browser launcher checks for `page` before offering one.
   Page?: { of(...a: unknown[]): unknown };
   Event?: { of(...a: unknown[]): unknown };
+  Picked?: { of(...a: unknown[]): unknown };
   Pending_Event?: { of(...a: unknown[]): unknown };
+  Pending_Picked?: { of(...a: unknown[]): unknown };
   /** The interactive entry point: draw, subscribe, and loop on `nextEvent`. */
-  page?: (core: unknown, page: unknown) => number;
+  page?: (core: unknown, cli: unknown, page: unknown) => number;
 };
 
 type Start = { sab: SharedArrayBuffer };
