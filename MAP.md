@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-24 packages, 40,968 lines of wac, 899 tests,
+24 packages, 41,486 lines of wac, 899 tests,
 20 command-line programs and 4 browser pages.
 
 ## Packages
@@ -14,7 +14,7 @@ In dependency order: nothing here imports anything below it.
 | package | what it is | wac lines | tests | builds on |
 |---|---|---|---|---|
 | [`bytes`](packages/bytes/) | `Buf` — a growable byte buffer. | 231 | 24 | — |
-| [`platform`](packages/platform/) | A capability world for wac applications, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell… | 1,737 | 44 | — |
+| [`platform`](packages/platform/) | A capability world for wac applications, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell… | 1,829 | 44 | — |
 | [`regex`](packages/regex/) | A backtracking regular expression engine, with JavaScript's semantics. | 924 | 15 | — |
 | [`std`](packages/std/) | Containers and the two sum types every program ends up wanting. | 570 | 36 | — |
 | [`unicode`](packages/unicode/) | UTF-8 as code points, and simple case mapping. | 216 | 11 | — |
@@ -24,7 +24,7 @@ In dependency order: nothing here imports anything below it.
 | [`fmt`](packages/fmt/) | Numbers to and from text. | 1,132 | 25 | `bytes` |
 | [`gzip`](packages/gzip/) | gzip (RFC 1952) and DEFLATE (RFC 1951) written in wac. | 1,990 | 83 | `bytes` |
 | [`http`](packages/http/) | HTTP/1.1: parsing requests and responses, and writing both. | 885 | 26 | `bytes` |
-| [`sh`](packages/sh/) | A shell, in wac. | 4,015 | 12 | `bytes` `platform` `std` |
+| [`sh`](packages/sh/) | A shell, in wac. | 4,243 | 12 | `bytes` `platform` `std` |
 | [`stream`](packages/stream/) | Run a wac transform as a `ReadableStream`/`WritableStream` pair, so it consumes input as it arrives instead of taking the whole thing at once. | 76 | 14 | `bytes` `unicode` |
 | [`url`](packages/url/) | A WHATWG URL parser: parse, serialize, and resolve a reference against a base. | 1,229 | 27 | `bytes` `std` |
 | [`wacc`](packages/wacc/) | Porting the wac compiler to wac, so it can eventually compile itself. | 3,467 | 11 | `bytes` |
@@ -35,7 +35,7 @@ In dependency order: nothing here imports anything below it.
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,565 | 45 | `bytes` `codec` `crypto` `platform` `sh` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,263 | 70 | `crypto` |
-| [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,091 | 22 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `tls` `unicode` `url` `zstd` |
+| [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,289 | 22 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `tls` `unicode` `url` `zstd` |
 | [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 4,272 | 109 | `codec` `crypto` `datetime` `platform` `std` `tls` |
 
 ## Programs
@@ -85,6 +85,6 @@ box httpd -8080 page -x
 | page | what it does |
 |---|---|
 | `packages/platform/example/counter.wac` | An interactive page: draw something, then answer what the user does. |
-| `packages/platform/example/pixels.wac` | Pixels, a pointer, and files in and out. |
+| `packages/platform/example/pixels.wac` | Pixels, a pointer, and a frame you can keep. |
 | `packages/box/example/hash.wac` | A page that hashes and compresses what you type, as you type it. |
 | `packages/box/example/term.wac` | A shell, in a browser tab. |

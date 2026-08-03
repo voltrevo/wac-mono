@@ -161,14 +161,19 @@ async function runAsLauncher(workerSource: string, grants: Grants): Promise<void
   });
   worker.postMessage({ sab: bridge.sab });
 
+  // The code leaves the block rather than being exited with inside it, because `Deno.exit` does
+  // not run `finally` — so this cleanup used to read as though it happened and never did. Here the
+  // process was ending anyway and the operating system took care of it; the same spelling in
+  // `app.ts` leaked a built executable per run until /tmp had 1.4GB of them.
+  let code = 70;
   try {
-    Deno.exit(await finished);
+    code = await finished;
   } catch (e) {
     console.error(`error: ${e instanceof Error ? e.message : String(e)}`);
-    Deno.exit(70);
   } finally {
     responder.stop();
     worker.terminate();
     URL.revokeObjectURL(url);
   }
+  Deno.exit(code);
 }
