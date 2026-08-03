@@ -11,14 +11,33 @@
 // for one directory and not for others — which is all coverage needs, and all a test of the
 // *shell* should depend on anyway.
 
-import { Cli, Core, FileResult, Socket, Stat } from "../../../platform/src/platform.wac";
+
+// ── Faking a capability world ─────────────────────────────────────────────────
+//
+// Every capability that produces a value now hands back a `Pending<T>` — a ticket carrying its
+// own resolver, because a struct method cannot reach the `Cli` it came from and wac has no
+// closures.
+//
+// That last point is what shapes this file. A fake cannot capture the answer it wants to give,
+// so **the answer is encoded in the ticket's id** and a top-level resolver decodes it. `readFile`
+// picks an id from the path; `resolveFile` turns the id back into a `FileResult`. It reads
+// oddly and it is the only way to build a resolved ticket without state.
+
+import { Cli, Core, FileResult, Pending, Socket, Stat } from "../../../platform/src/platform.wac";
 import { Shell, runScript } from "../../src/exec.wac";
+
+/** A ticket is always ready here, and dropping one does nothing. */
+bool alwaysSettled(i32 id) { return true; }
+void ignoreDrop(i32 id) {}
 
 // ── Core ──────────────────────────────────────────────────────────────────────
 
-i64 fakeNow() { return 0; }
-i64 fakeMonotonic() { return 0; }
-u8[] fakeRandom(i32 n) { return u8[n](); }
+i64 resolveZero(i32 id) { return 0; }
+u8[] resolveBytes(i32 id) { return u8[id](); }
+
+Pending<i64> fakeNow() { return Pending.of(0, resolveZero, alwaysSettled, ignoreDrop); }
+Pending<i64> fakeMonotonic() { return Pending.of(0, resolveZero, alwaysSettled, ignoreDrop); }
+Pending<u8[]> fakeRandom(i32 n) { return Pending.of(n, resolveBytes, alwaysSettled, ignoreDrop); }
 void fakeLog(string s) {}
 void fakeWarn(string s) {}
 
@@ -28,59 +47,96 @@ Core fakeCore() {
 
 // ── Cli ───────────────────────────────────────────────────────────────────────
 
-i32 fakeArgCount() { return 0; }
-string fakeArg(i32 i) { return ""; }
+i32 resolveZeroI32(i32 id) { return 0; }
+string resolveEmpty(i32 id) { return ""; }
+bool resolveTrue(i32 id) { return true; }
+bool resolveFromId(i32 id) { return id != 0; }
+u8[] resolveStdin(i32 id) { return "piped\n".toBytes(); }
 
-/** One name is set and one is not, so both sides of the environment fallback are reachable. */
-string? fakeEnv(string name) {
-  if (name == "SET_IN_ENV") { return "from-env"; }
-  return null;
-}
-
-u8[] fakeStdin() { return "piped\n".toBytes(); }
+Pending<i32> fakeArgCount() { return Pending.of(0, resolveZeroI32, alwaysSettled, ignoreDrop); }
+Pending<string> fakeArg(i32 i) { return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop); }
+Pending<u8[]> fakeStdin() { return Pending.of(0, resolveStdin, alwaysSettled, ignoreDrop); }
 bool fakeWrite(u8[] data) { return true; }
 
-/** `in.txt` and `words.txt` exist; nothing else does. */
-FileResult fakeReadFile(string path) {
-  if (path == "in.txt") { return FileResult.of(true, "alpha\nbeta\n".toBytes(), ""); }
-  if (path == "words.txt") { return FileResult.of(true, "b\na\nc\n".toBytes(), ""); }
-  if (path == "out.txt") { return FileResult.of(true, "existing\n".toBytes(), ""); }
+/** One name is set and one is not, so both sides of the environment fallback are reachable. */
+string? resolveEnv(i32 id) {
+  if (id == 1) { return "from-env"; }
+  return null;
+}
+Pending<string?> fakeEnv(string name) {
+  return Pending.of(name == "SET_IN_ENV" ? 1 : 0, resolveEnv, alwaysSettled, ignoreDrop);
+}
+
+/** `in.txt`, `words.txt` and `out.txt` exist; nothing else does. */
+FileResult resolveFile(i32 id) {
+  if (id == 1) { return FileResult.of(true, "alpha\nbeta\n".toBytes(), ""); }
+  if (id == 2) { return FileResult.of(true, "b\na\nc\n".toBytes(), ""); }
+  if (id == 3) { return FileResult.of(true, "existing\n".toBytes(), ""); }
   return FileResult.of(false, u8[0](), "no such file");
+}
+Pending<FileResult> fakeReadFile(string path) {
+  i32 which = 0;
+  if (path == "in.txt") { which = 1; }
+  if (path == "words.txt") { which = 2; }
+  if (path == "out.txt") { which = 3; }
+  return Pending.of(which, resolveFile, alwaysSettled, ignoreDrop);
 }
 
 /** `out.txt` is writable and `readonly.txt` is not, so both paths through a redirection run. */
-bool fakeWriteFile(string path, u8[] data) {
-  return path != "readonly.txt";
+Pending<bool> fakeWriteFile(string path, u8[] data) {
+  return Pending.of(path == "readonly.txt" ? 0 : 1, resolveFromId, alwaysSettled, ignoreDrop);
 }
 
-Stat fakeStat(string path) { return Stat.of(false, false, false, 0, 0); }
+Stat resolveStat(i32 id) { return Stat.of(false, false, false, 0, 0); }
+Pending<Stat> fakeStat(string path) { return Pending.of(0, resolveStat, alwaysSettled, ignoreDrop); }
 
-string[]? fakeReadDir(string path) {
-  if (path == "dir") {
-    // Deliberately out of order and with a dotfile: a glob sorts its matches and excludes names
-    // beginning with a dot unless the pattern does too, and neither branch runs against a tidy
-    // directory of two sorted names.
-    string[] names = string[4]();
-    names[0] = "two";
-    names[1] = "one";
-    names[2] = ".hidden";
-    names[3] = "three";
-    return names;
-  }
-  return null;
+string[]? resolveDir(i32 id) {
+  if (id == 0) { return null; }
+  // Deliberately out of order and with a dotfile: a glob sorts its matches and excludes names
+  // beginning with a dot unless the pattern does too, and neither branch runs against a tidy
+  // directory of two sorted names.
+  string[] names = string[4]();
+  names[0] = "two";
+  names[1] = "one";
+  names[2] = ".hidden";
+  names[3] = "three";
+  return names;
+}
+Pending<string[]?> fakeReadDir(string path) {
+  return Pending.of(path == "dir" ? 1 : 0, resolveDir, alwaysSettled, ignoreDrop);
 }
 
-bool fakeMkdir(string path, bool parents) { return true; }
-bool fakeRemove(string path, bool recursive) { return true; }
-bool fakeRename(string from, string to) { return true; }
-string fakeOpenInput(string path) { return ""; }
+Pending<bool> fakeMkdir(string path, bool parents) {
+  return Pending.of(1, resolveTrue, alwaysSettled, ignoreDrop);
+}
+Pending<bool> fakeRemove(string path, bool recursive) {
+  return Pending.of(1, resolveTrue, alwaysSettled, ignoreDrop);
+}
+Pending<bool> fakeRename(string from, string to) {
+  return Pending.of(1, resolveTrue, alwaysSettled, ignoreDrop);
+}
+Pending<string> fakeOpenInput(string path) {
+  return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
+}
 u8[] fakeReadChunk() { return u8[0](); }
-string fakeOpenOutput(string path) { return ""; }
-Socket fakeConnect(string host, i32 port) { return Socket(-1, "no network"); }
-Socket fakeListen(i32 port) { return Socket(-1, "no network"); }
-Socket fakeAccept(i32 handle) { return Socket(-1, "no network"); }
-u8[] fakeRecv(i32 handle) { return u8[0](); }
-bool fakeSend(i32 handle, u8[] data) { return false; }
+Pending<string> fakeOpenOutput(string path) {
+  return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
+}
+
+Socket resolveSocket(i32 id) { return Socket(-1, "no network"); }
+Pending<Socket> fakeConnect(string host, i32 port) {
+  return Pending.of(0, resolveSocket, alwaysSettled, ignoreDrop);
+}
+Pending<Socket> fakeListen(i32 port) {
+  return Pending.of(0, resolveSocket, alwaysSettled, ignoreDrop);
+}
+Pending<Socket> fakeAccept(i32 handle) {
+  return Pending.of(0, resolveSocket, alwaysSettled, ignoreDrop);
+}
+Pending<u8[]> fakeRecv(i32 handle) { return Pending.of(0, resolveBytes, alwaysSettled, ignoreDrop); }
+Pending<bool> fakeSend(i32 handle, u8[] data) {
+  return Pending.of(0, resolveFromId, alwaysSettled, ignoreDrop);
+}
 void fakeCloseSocket(i32 handle) {}
 
 Cli fakeCli() {
@@ -127,25 +183,26 @@ export i32 shWritten(string src) {
  */
 export i32 shTouchStubs() {
   Cli c = fakeCli();
-  i32 n = c.argCount() + c.arg(0).len() + c.readStdin().len() + c.readChunk().len();
-  if (c.env("SET_IN_ENV") is not null) { n++; }
-  if (c.env("NOT_SET") is null) { n++; }
+  i32 n = c.argCount().wait() + c.arg(0).wait().len() + c.readStdin().wait().len()
+        + c.readChunk().len();
+  if (c.env("SET_IN_ENV").wait() is not null) { n++; }
+  if (c.env("NOT_SET").wait() is null) { n++; }
   if (c.write(u8[0]())) { n++; }
-  if (c.stat("x").exists) { n++; }
-  if (c.readDir("dir") is not null) { n++; }
-  if (c.readDir("nope") is null) { n++; }
-  if (c.mkdir("d", true)) { n++; }
-  if (c.remove("d", true)) { n++; }
-  if (c.rename("a", "b")) { n++; }
-  n += c.openInput("x").len() + c.openOutput("x").len();
-  n += c.connect("h", 1).handle + c.listen(1).handle + c.accept(1).handle;
-  n += c.recv(1).len();
-  if (c.send(1, u8[0]())) { n++; }
+  if (c.stat("x").wait().exists) { n++; }
+  if (c.readDir("dir").wait() is not null) { n++; }
+  if (c.readDir("nope").wait() is null) { n++; }
+  if (c.mkdir("d", true).wait()) { n++; }
+  if (c.remove("d", true).wait()) { n++; }
+  if (c.rename("a", "b").wait()) { n++; }
+  n += c.openInput("x").wait().len() + c.openOutput("x").wait().len();
+  n += c.connect("h", 1).wait().handle + c.listen(1).wait().handle + c.accept(1).wait().handle;
+  n += c.recv(1).wait().len();
+  if (c.send(1, u8[0]()).wait()) { n++; }
   c.closeSocket(1);
 
   Core k = fakeCore();
-  n += (k.nowMillis() + k.monotonicNanos()) as~ i32;
-  n += k.randomBytes(2).len();
+  n += (k.nowMillis().wait() + k.monotonicNanos().wait()) as~ i32;
+  n += k.randomBytes(2).wait().len();
   k.log("");
   k.warn("");
   return n;
