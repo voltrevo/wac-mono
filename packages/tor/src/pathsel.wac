@@ -35,6 +35,8 @@
 // your candidate set by claiming kinship with relays they do not run. That check is the
 // difference between a family list and an attack.
 
+import { Relay, hasFlag } from "./directory.wac";
+
 /**
  * Where in the circuit a relay is being chosen for.
  *
@@ -66,21 +68,20 @@ export i64 positionWeight(i32 position, bool isGuard, bool isExit, i64[] weights
 }
 
 /**
- * Each candidate's weighted bandwidth for a position: bandwidth * weight / 10000.
+ * Each relay's weighted bandwidth for a position: bandwidth * weight / 10000.
  *
  * Kept as i64 throughout. A consensus bandwidth is in kilobytes and the weights reach
  * 10000, so a large relay's product overflows 32 bits — and the failure is silent, giving a
  * negative weight that the chooser skips, which means the biggest relays are never picked
  * and nothing looks wrong.
  */
-export i64[] weightedBandwidths(
-  i64[] bandwidth, bool[] isGuard, bool[] isExit, i32 position, i64[] weights
-) {
-  if (bandwidth.len() != isGuard.len() || bandwidth.len() != isExit.len()) { trap; }
-  i64[] out = i64[bandwidth.len()]();
-  for (i32 i = 0; i < bandwidth.len(); i++) {
-    i64 w = positionWeight(position, isGuard[i], isExit[i], weights);
-    out[i] = (bandwidth[i] * w) / 10000;
+export i64[] weightedBandwidths(Relay[] relays, i32 position, i64[] weights) {
+  i64[] out = i64[relays.len()]();
+  for (i32 i = 0; i < relays.len(); i++) {
+    bool guard = hasFlag(relays[i], "Guard");
+    bool exit = hasFlag(relays[i], "Exit") && !hasFlag(relays[i], "BadExit");
+    i64 w = positionWeight(position, guard, exit, weights);
+    out[i] = ((relays[i].bandwidth as i64) * w) / 10000;
   }
   return out;
 }
@@ -115,10 +116,37 @@ export i32 weightedChoice(i64[] weights, i64 r) {
 
 // ── Path constraints ─────────────────────────────────────────────────────────
 
-/** Whether two IPv4 addresses share a /16. */
-export bool sameSubnet16(u8[] a, u8[] b) {
-  if (a.len() != 4 || b.len() != 4) { trap; }
-  return a[0] == b[0] && a[1] == b[1];
+/**
+ * Whether two dotted-quad addresses share a /16.
+ *
+ * Over the text a consensus actually carries, rather than four parsed bytes. An address
+ * this cannot read is treated as sharing nothing, which is the permissive direction and is
+ * deliberate: the alternative is excluding relays because of a field we failed to parse,
+ * and a client that quietly shrinks its own candidate set is worse off than one that
+ * occasionally allows a path it should not have.
+ */
+export bool sameSubnet16(string a, string b) {
+  u8[] x = a.toBytes();
+  u8[] y = b.toBytes();
+  i32 xd = secondDot(x);
+  i32 yd = secondDot(y);
+  if (xd < 0 || yd < 0 || xd != yd) { return false; }
+  for (i32 i = 0; i < xd; i++) {
+    if (x[i] != y[i]) { return false; }
+  }
+  return true;
+}
+
+/** The index of the second dot, or -1 if there are not two. */
+i32 secondDot(u8[] a) {
+  i32 seen = 0;
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] == '.') {
+      seen++;
+      if (seen == 2) { return i; }
+    }
+  }
+  return -1;
 }
 
 /**
@@ -135,19 +163,15 @@ export bool sameSubnet16(u8[] a, u8[] b) {
  * cannot be reached by forgetting a flag.
  */
 export bool pathAllows(
-  i32[] chosen, i32 candidate, u8[] addresses,
-  i32[] familyStart, i32[] familyOf, bool allowSameSubnet
+  Relay[] relays, i32[] chosen, i32 candidate, i32[] familyStart, i32[] familyOf,
+  bool allowSameSubnet
 ) {
   for (i32 i = 0; i < chosen.len(); i++) {
     i32 other = chosen[i];
     if (other == candidate) { return false; }
 
-    if (!allowSameSubnet) {
-      u8[] a = u8[4]();
-      u8[] b = u8[4]();
-      for (i32 j = 0; j < 4; j++) { a[j] = addresses[candidate * 4 + j]; }
-      for (i32 j = 0; j < 4; j++) { b[j] = addresses[other * 4 + j]; }
-      if (sameSubnet16(a, b)) { return false; }
+    if (!allowSameSubnet && sameSubnet16(relays[candidate].address, relays[other].address)) {
+      return false;
     }
 
     // Both directions, though the caller has already resolved mutuality: this is cheap, and
@@ -166,16 +190,16 @@ export bool pathAllows(
  * Choose one relay for a position, respecting the path built so far.
  *
  * Zeroing the weight of anything the path forbids, rather than filtering and re-indexing,
- * so the returned index still refers to the caller's arrays. It also keeps the "no eligible
+ * so the returned index still refers to the caller's array. It also keeps the "no eligible
  * relay" case as `weightedChoice` returning -1 instead of an empty-array special case.
  */
 export i32 choose(
-  i64[] weighted, i32[] chosen, u8[] addresses,
-  i32[] familyStart, i32[] familyOf, bool allowSameSubnet, i64 r
+  Relay[] relays, i64[] weighted, i32[] chosen, i32[] familyStart, i32[] familyOf,
+  bool allowSameSubnet, i64 r
 ) {
   i64[] eligible = i64[weighted.len()]();
   for (i32 i = 0; i < weighted.len(); i++) {
-    eligible[i] = pathAllows(chosen, i, addresses, familyStart, familyOf, allowSameSubnet)
+    eligible[i] = pathAllows(relays, chosen, i, familyStart, familyOf, allowSameSubnet)
       ? weighted[i]
       : 0;
   }
@@ -197,8 +221,8 @@ export i32 choose(
  * then retries elsewhere.
  *
  * An empty accept list permits nothing; an empty reject list permits everything. Both fall
- * out of the loop, and both are the right answer: a relay that accepts no ports is not an
- * exit, and one that rejects none is an open one.
+ * out of the loop, and both are right: a relay accepting no ports is not an exit, and one
+ * rejecting none is an open one.
  */
 export bool portPermitted(bool isAccept, i32[] ranges, i32 port) {
   if (ranges.len() % 2 != 0) { trap; }
@@ -207,4 +231,218 @@ export bool portPermitted(bool isAccept, i32[] ranges, i32 port) {
     if (port >= ranges[i] && port <= ranges[i + 1]) { listed = true; }
   }
   return isAccept ? listed : !listed;
+}
+
+// ── Resolving a consensus into candidates ────────────────────────────────────
+//
+// This was `host/path.ts`. Everything here is arithmetic over a document already parsed,
+// which is not host work; the flattened arrays it used to take across the boundary are gone
+// with it, because a `Relay[]` is just a `Relay[]` on this side.
+
+import { Vec } from "../../std/src/vec.wac";
+import { parseInt } from "./directory.wac";
+
+/** The weights in the order `positionWeight` expects: four per position. */
+const i32 WEIGHT_COUNT = 12;
+
+string weightName(i32 i) {
+  string[] names = string[]("Wgg", "Wgd", "Wge", "Wgm",
+                            "Wmg", "Wmd", "Wme", "Wmm",
+                            "Weg", "Wed", "Wee", "Wem");
+  return names[i];
+}
+
+/**
+ * The `bandwidth-weights` line, or neutral weights if the consensus carries none.
+ *
+ * Falling back to 10000 everywhere — plain bandwidth, no position balancing — rather than
+ * refusing. A consensus without weights is old rather than hostile, and the values it would
+ * have carried are public information an attacker gains nothing by withholding.
+ *
+ * A negative value is clamped to zero. The authorities do not publish them; a peer that
+ * does is broken or probing, and `weightedChoice` traps on a negative weight.
+ */
+export i64[] parseWeights(u8[] doc) {
+  i64[] out = i64[WEIGHT_COUNT]();
+  for (i32 i = 0; i < WEIGHT_COUNT; i++) { out[i] = 10000; }
+
+  i32 at = findLine(doc, "bandwidth-weights ");
+  if (at < 0) { return out; }
+  i32 end = at;
+  while (end < doc.len() && doc[end] != '\n') { end++; }
+
+  i32 from = at + 18;
+  i32 start = from;
+  for (i32 i = from; i <= end; i++) {
+    if (i == end || doc[i] == ' ') {
+      i32 eq = -1;
+      for (i32 j = start; j < i; j++) {
+        if (doc[j] == '=' && eq < 0) { eq = j; }
+      }
+      if (eq > start) {
+        u8[] name = u8[eq - start]();
+        for (i32 j = 0; j < name.len(); j++) { name[j] = doc[start + j]; }
+        u8[] value = u8[i - eq - 1]();
+        for (i32 j = 0; j < value.len(); j++) { value[j] = doc[eq + 1 + j]; }
+        string n = string.fromBytes(name);
+        i32 v = parseInt(string.fromBytes(value));
+        for (i32 k = 0; k < WEIGHT_COUNT; k++) {
+          if (weightName(k) == n) { out[k] = v < 0 ? 0 : (v as i64); }
+        }
+      }
+      start = i + 1;
+    }
+  }
+  return out;
+}
+
+/** Where a line beginning with `prefix` starts, or -1. */
+i32 findLine(u8[] doc, string prefix) {
+  u8[] p = prefix.toBytes();
+  for (i32 i = 0; i + p.len() <= doc.len(); i++) {
+    if (i == 0 || doc[i - 1] == '\n') {
+      bool hit = true;
+      for (i32 j = 0; j < p.len(); j++) {
+        if (doc[i + j] != p[j]) { hit = false; }
+      }
+      if (hit) { return i; }
+    }
+  }
+  return -1;
+}
+
+/**
+ * Mutual families, flattened to a start index per relay and a list of indices.
+ *
+ * One-sided declarations are dropped. A relay claiming kinship it is not owed would
+ * otherwise shrink everyone's candidate set for free, which is a cheap way to push clients
+ * onto the relays an attacker does run.
+ */
+export struct Families {
+  i32[] start;
+  i32[] of;
+}
+
+export Families resolveFamilies(Relay[] relays) {
+  // Each relay's claims, as indices. A claim naming nobody in this consensus is dropped
+  // here rather than carried as a name that can never match.
+  Vec<i32>[] claims = Vec<i32>[relays.len()](fill: Vec.create());
+  for (i32 i = 0; i < relays.len(); i++) {
+    Vec<i32> mine = Vec.create();
+    for (i32 j = 0; j < relays[i].family.len(); j++) {
+      i32 who = resolveName(relays, relays[i].family[j]);
+      if (who >= 0 && who != i) { mine.push(who); }
+    }
+    claims[i] = mine;
+  }
+
+  i32[] start = i32[relays.len() + 1]();
+  Vec<i32> of = Vec.create();
+  for (i32 i = 0; i < relays.len(); i++) {
+    start[i] = of.len();
+    for (i32 k = 0; k < claims[i].len(); k++) {
+      i32 j = claims[i].get(k);
+      if (mentions(claims[j], i)) { of.push(j); }
+    }
+  }
+  start[relays.len()] = of.len();
+  return Families(start, of.toArray());
+}
+
+bool mentions(Vec<i32> v, i32 x) {
+  for (i32 i = 0; i < v.len(); i++) {
+    if (v.get(i) == x) { return true; }
+  }
+  return false;
+}
+
+/**
+ * A family entry as a nickname or a `$FINGERPRINT` — with `=name` or `~name` suffixes,
+ * which a consensus uses to say whether the naming is verified.
+ */
+i32 resolveName(Relay[] relays, string token) {
+  u8[] t = token.toBytes();
+  if (t.len() > 0 && t[0] == '$') {
+    i32 end = t.len();
+    for (i32 i = 1; i < t.len(); i++) {
+      if ((t[i] == '=' || t[i] == '~') && end == t.len()) { end = i; }
+    }
+    u8[] hexPart = u8[end - 1]();
+    for (i32 i = 0; i < hexPart.len(); i++) { hexPart[i] = t[1 + i]; }
+    u8[] want = fromHex(string.fromBytes(hexPart));
+    for (i32 i = 0; i < relays.len(); i++) {
+      if (bytesEqual(relays[i].identity, want)) { return i; }
+    }
+    return -1;
+  }
+  for (i32 i = 0; i < relays.len(); i++) {
+    if (relays[i].nickname == token) { return i; }
+  }
+  return -1;
+}
+
+bool bytesEqual(u8[] a, u8[] b) {
+  if (a.len() != b.len() || a.len() == 0) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+
+u8[] fromHex(string s) {
+  u8[] h = s.toBytes();
+  if (h.len() % 2 != 0) { return u8[0](); }
+  u8[] out = u8[h.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) {
+    i32 hi = hexDigit(h[2 * i]);
+    i32 lo = hexDigit(h[2 * i + 1]);
+    if (hi < 0 || lo < 0) { return u8[0](); }
+    out[i] = hi * 16 + lo;
+  }
+  return out;
+}
+
+i32 hexDigit(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+  return -1;
+}
+
+/**
+ * Whether a relay may be used at all, and at this position.
+ *
+ * `Running` and `Valid` are what say a relay is usable; a client ignoring them keeps
+ * choosing relays the authorities have already written off. A relay with no onion key
+ * cannot be handshaked with whatever its flags say — its microdescriptor simply has not
+ * arrived.
+ *
+ * `port` of 0 means no stream is planned, which is the truth for a directory circuit and
+ * is not the same as "any port will do".
+ */
+export bool eligible(Relay r, i32 position, i32 port) {
+  if (r.ntorOnionKey.len() == 0) { return false; }
+  if (!hasFlag(r, "Running") || !hasFlag(r, "Valid")) { return false; }
+  if (position == positionGuard() && !hasFlag(r, "Guard")) { return false; }
+  if (position == positionExit()) {
+    if (!hasFlag(r, "Exit") || hasFlag(r, "BadExit")) { return false; }
+    if (port != 0) {
+      // A missing summary is a reject-all, not "no policy" — see `Relay.exitPolicy`.
+      if (r.exitPolicy is null) { return false; }
+      if (!portPermitted(r.exitPolicy!.isAccept, r.exitPolicy!.ranges, port)) { return false; }
+    }
+  }
+  return true;
+}
+
+/** Pick one relay for a position, or -1 when nothing is eligible. */
+export i32 pick(
+  Relay[] relays, i64[] weights, Families fam, i32 position, i32[] chosen,
+  i32 port, bool allowSameSubnet, i64 r
+) {
+  i64[] weighted = weightedBandwidths(relays, position, weights);
+  for (i32 i = 0; i < relays.len(); i++) {
+    if (!eligible(relays[i], position, port)) { weighted[i] = 0; }
+  }
+  return choose(relays, weighted, chosen, fam.start, fam.of, allowSameSubnet, r);
 }
