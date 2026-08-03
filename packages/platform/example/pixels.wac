@@ -1,0 +1,155 @@
+// Pixels, a pointer, and files in and out.
+//
+//   deno task app:build packages/platform/example/pixels.wac --target browser -o page/index.html
+//   box httpd -8080 page -x
+//
+// Everything a raster application needs, and it is three capabilities: `drawPixels` blits a
+// buffer wac filled, `Event.x`/`Event.y` say where in that buffer the pointer is, and
+// `nextFile`/`offerDownload` carry bytes between the user and the program.
+//
+// The picture is a Mandelbrot set, which is here because it is the honest demonstration: 38400
+// pixels, each an iteration loop, recomputed on every zoom, in compiled code on a worker while
+// the page stays responsive. A drawing API would have made this the slow way to do it.
+
+import { Cli, Core, Event, Page, Pending, Picked } from "../src/platform.wac";
+
+const i32 W = 240;
+const i32 H = 160;
+const i32 MAX = 120;
+
+export i32 page(Core core, Cli cli, Page page) {
+  page.title("pixels").wait();
+  page.render(
+    "<canvas id=\"c\" style=\"border:1px solid #ccc\"></canvas>" +
+    "<p id=\"pos\" class=\"meta\">move the pointer over it</p>" +
+    "<p><button id=\"in\">zoom in</button> <button id=\"out\">zoom out</button> " +
+    "<button id=\"save\">download as PPM</button></p>" +
+    "<p>Or hand it a file: <input type=\"file\" id=\"f\"> " +
+    "<span id=\"info\" class=\"meta\">nothing yet</span></p>"
+  ).wait();
+  page.on("#c", "pointermove").wait();
+  page.on("button", "click").wait();
+
+  // The view, in fixed point: thousandths of a unit in the complex plane.
+  i32 spanX = 3500;
+  i32 centreX = -700;
+  i32 centreY = 0;
+  draw(page, spanX, centreX, centreY);
+
+  // Two things to wait on, and one call that waits on both. `nextEvent` and `nextFile` are
+  // ordinary tickets, so this is the same `waitAny` a relay uses over two sockets — which is
+  // the whole argument for events being tickets rather than callbacks.
+  Pending<Event> ev = page.nextEvent();
+  Pending<Picked> file = page.nextFile();
+
+  while (true) {
+    i32 which = core.waitAny(i32[](ev.id, file.id), -1);
+    if (which < 0) { return 0; }
+
+    if (which == 1) {
+      Picked f = file.wait();
+      file = page.nextFile();
+      if (!f.ok) {
+        page.setText("info", "could not read it: " + f.error).wait();
+      } else {
+        page.setText("info", f.name + ", " + itoa(f.bytes.len()) + " bytes — sending it back").wait();
+        // Straight back out again, which proves both directions with one file.
+        page.offerDownload(f.name + ".copy", f.bytes).wait();
+      }
+      continue;
+    }
+
+    Event e = ev.wait();
+    ev = page.nextEvent();
+
+    if (e.kind == "pointermove") {
+      // The escape count under the cursor, which is the check that x and y are the *canvas's*
+      // coordinates rather than the page's — an off-by-a-scroll would show up here at once.
+      i32 n = escapes(e.x, e.y, spanX, centreX, centreY);
+      page.setText("pos", "x=" + itoa(e.x) + " y=" + itoa(e.y) + " escapes at " +
+        (n >= MAX ? "never (inside)" : itoa(n))).wait();
+    } else if (e.id == "in") {
+      spanX = spanX / 2;
+      draw(page, spanX, centreX, centreY);
+    } else if (e.id == "out") {
+      spanX = spanX * 2;
+      draw(page, spanX, centreX, centreY);
+    } else if (e.id == "save") {
+      page.offerDownload("mandelbrot.ppm", ppm(spanX, centreX, centreY)).wait();
+    }
+  }
+}
+
+/** Fill a buffer and hand it over. One call, whatever is in the buffer. */
+void draw(Page page, i32 spanX, i32 centreX, i32 centreY) {
+  u8[] rgba = u8[W * H * 4](fill: 0);
+  for (i32 py = 0; py < H; py++) {
+    for (i32 px = 0; px < W; px++) {
+      i32 n = escapes(px, py, spanX, centreX, centreY);
+      i32 at = (py * W + px) * 4;
+      if (n >= MAX) {
+        rgba[at] = 20; rgba[at + 1] = 20; rgba[at + 2] = 30;
+      } else {
+        // A cheap ramp: blue into orange, so the bands are visible without a palette table.
+        rgba[at] = (n * 255 / MAX);
+        rgba[at + 1] = (n * 140 / MAX);
+        rgba[at + 2] = 255 - (n * 200 / MAX);
+      }
+      rgba[at + 3] = 255;
+    }
+  }
+  page.drawPixels("c", W, H, rgba).wait();
+}
+
+/**
+ * How long the point at this pixel takes to escape, up to `MAX`.
+ *
+ * Fixed point in thousandths, because the whole of this runs in i32 and a scaled integer says
+ * what it means where a float would invite the question of which precision.
+ */
+i32 escapes(i32 px, i32 py, i32 spanX, i32 centreX, i32 centreY) {
+  i32 spanY = spanX * H / W;
+  i32 cx = centreX - spanX / 2 + px * spanX / W;
+  i32 cy = centreY - spanY / 2 + py * spanY / H;
+  i32 zx = 0;
+  i32 zy = 0;
+  for (i32 i = 0; i < MAX; i++) {
+    i32 xx = zx * zx / 1000;
+    i32 yy = zy * zy / 1000;
+    if (xx + yy > 4000) { return i; }
+    i32 nx = xx - yy + cx;
+    zy = 2 * zx * zy / 1000 + cy;
+    zx = nx;
+  }
+  return MAX;
+}
+
+/** The same image as a PPM, which is a header and then the bytes — no encoder needed. */
+u8[] ppm(i32 spanX, i32 centreX, i32 centreY) {
+  string head = "P6\n" + itoa(W) + " " + itoa(H) + "\n255\n";
+  u8[] h = head.toBytes();
+  u8[] out = u8[h.len() + W * H * 3](fill: 0);
+  out.copyFrom(h, 0, 0, h.len());
+  i32 at = h.len();
+  for (i32 py = 0; py < H; py++) {
+    for (i32 px = 0; px < W; px++) {
+      i32 n = escapes(px, py, spanX, centreX, centreY);
+      out[at] = n >= MAX ? 20 : (n * 255 / MAX);
+      out[at + 1] = n >= MAX ? 20 : (n * 140 / MAX);
+      out[at + 2] = n >= MAX ? 30 : 255 - (n * 200 / MAX);
+      at = at + 3;
+    }
+  }
+  return out;
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  i32 x = v < 0 ? 0 - v : v;
+  u8[] digits = u8[12](fill: 0);
+  i32 at = 12;
+  while (x > 0) { at--; digits[at] = '0' + (x % 10); x = x / 10; }
+  u8[] used = u8[12 - at](fill: 0);
+  used.copyFrom(digits, at, 0, 12 - at);
+  return (v < 0 ? "-" : "") + string.fromBytes(used);
+}

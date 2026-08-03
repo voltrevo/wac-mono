@@ -168,7 +168,7 @@ export i32 main(Core core, Cli cli) {
       }
     }
 
-    i32 w = cli.waitAny(ids.toArray(), -1);
+    i32 w = core.waitAny(ids.toArray(), -1);
     if (w < 0) { break; }
     i32 who = owner.get(w);
 

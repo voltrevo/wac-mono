@@ -104,7 +104,13 @@ export type Dom = {
   on(selector: string, kind: string): void;
   title(text: string): void;
   /** The next event, waiting for one. One waiter, like a child's output queue. */
-  next(): Promise<{ kind: string; id: string; value: string }>;
+  next(): Promise<{ kind: string; id: string; value: string; x: number; y: number }>;
+  /** Blit `w * h * 4` bytes of RGBA into a canvas, resizing it to match. */
+  drawPixels(id: string, w: number, h: number, rgba: Uint8Array): void;
+  /** The next file the user picks or drops, waiting for one. */
+  nextFile(): Promise<{ ok: boolean; name: string; bytes: Uint8Array; error: string }>;
+  /** Hand bytes back to the user as a download. */
+  offerDownload(name: string, bytes: Uint8Array): void;
 };
 
 /** A path resolved to the directory that holds it, and its last component. */
@@ -201,9 +207,43 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     [OP.TITLE]: (p) => { dom().title(unstr(p)); return EMPTY; },
     [OP.NEXT_EVENT]: async () => {
       const e = await dom().next();
-      // Three NUL-separated strings. None of them can contain a NUL: two are an id and an
-      // event kind, and the third is an input's value, which cannot hold one either.
-      return str(`${e.kind}\u0000${e.id}\u0000${e.value}`);
+      // NUL-separated fields, in the order `Event` declares them. None can contain a NUL: two
+      // are an id and an event kind, one is an input's value, and two are numbers.
+      return str(`${e.kind}\u0000${e.id}\u0000${e.value}\u0000${e.x}\u0000${e.y}`);
+    },
+    [OP.DRAW_PIXELS]: (p) => {
+      const w = readI32le(p);
+      const h = readI32le(p.subarray(4));
+      const n = readI32le(p.subarray(8));
+      const id = unstr(p.subarray(12, 12 + n));
+      const rgba = p.subarray(12 + n);
+      // Checked here rather than trusted: a short buffer would otherwise be a confusing
+      // DOMException from `putImageData`, several layers from the wac that got it wrong.
+      if (rgba.length !== w * h * 4) {
+        throw new Error(`drawPixels: ${w}x${h} needs ${w * h * 4} bytes, got ${rgba.length}`);
+      }
+      dom().drawPixels(id, w, h, rgba);
+      return EMPTY;
+    },
+    [OP.NEXT_FILE]: async () => {
+      const f = await dom().nextFile();
+      // A flag, the name length-prefixed, then the bytes — the name can hold anything but a
+      // NUL, and so can an error message, so neither can be a separator here.
+      const name = str(f.name);
+      const err = str(f.error);
+      const out = new Uint8Array(1 + 4 + name.length + 4 + err.length + f.bytes.length);
+      out[0] = f.ok ? 1 : 0;
+      out.set(i32le(name.length), 1);
+      out.set(name, 5);
+      out.set(i32le(err.length), 5 + name.length);
+      out.set(err, 9 + name.length);
+      out.set(f.bytes, 9 + name.length + err.length);
+      return out;
+    },
+    [OP.OFFER_DOWNLOAD]: (p) => {
+      const n = readI32le(p);
+      dom().offerDownload(unstr(p.subarray(4, 4 + n)), p.subarray(4 + n));
+      return EMPTY;
     },
 
     [OP.SLEEP_MILLIS]: (p) =>

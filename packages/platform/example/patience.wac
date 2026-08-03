@@ -8,7 +8,7 @@
 //
 // The deadline is a parameter of the wait:
 //
-//   i32 which = cli.waitAny(i32[](r.id), ms);   // -1 when the time ran out
+//   i32 which = core.waitAny(i32[](r.id), ms);   // -1 when the time ran out
 //
 // Not a `recvWithin`, and not a timer in the list. `waitAny` already parks on this worker's own
 // memory and `Atomics.wait` takes a timeout, so the deadline costs no opcode, no ring slot and
@@ -50,7 +50,7 @@ export i32 main(Core core, Cli cli) {
   // Even connecting is bounded, and the shape is identical — which is the point of putting the
   // deadline on the waiter rather than on each capability.
   Pending<Socket> pc = cli.connect(host, port);
-  if (cli.waitAny(i32[](pc.id), ms) < 0) {
+  if (core.waitAny(i32[](pc.id), ms) < 0) {
     core.warn("patience: connect to " + host + " did not answer within " + itoa(ms) + "ms");
     // The connect is still in flight and there is no handle to close, so its slot comes back
     // only when the host's own attempt finishes — cancelling says "discard the answer", not
@@ -70,7 +70,7 @@ export i32 main(Core core, Cli cli) {
   i32 waited = 0;
 
   for (i32 round = 0; round < ROUNDS; round++) {
-    i32 which = cli.waitAny(i32[](r.id), ms);
+    i32 which = core.waitAny(i32[](r.id), ms);
     waited = waited + ms;
 
     if (which == 0) {

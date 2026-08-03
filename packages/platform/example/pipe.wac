@@ -51,7 +51,7 @@ export i32 main(Core core, Cli cli) {
     return 1;
   }
 
-  pump(cli, a.handle, b.handle);
+  pump(core, cli, a.handle, b.handle);
 
   i32 ca = cli.exitCode(a.handle).wait();
   i32 cb = cli.exitCode(b.handle).wait();
@@ -78,7 +78,7 @@ string[] argv(string s) {
  * Each source's end is passed on rather than ending the pipeline: `sort` emits nothing until
  * its input closes, so a stage's own end is the only thing that finishes it.
  */
-void pump(Cli cli, i32 a, i32 b) {
+void pump(Core core, Cli cli, i32 a, i32 b) {
   Pending<u8[]> tIn = cli.recv(STDIN);
   Pending<u8[]> tA = cli.recv(a);
   Pending<u8[]> tB = cli.recv(b);
@@ -96,7 +96,7 @@ void pump(Cli cli, i32 a, i32 b) {
     if (aLive) { ids[k] = tA.id; from[k] = 1; k++; }
     ids[k] = tB.id; from[k] = 2;
 
-    i32 got = cli.waitAny(ids, -1);
+    i32 got = core.waitAny(ids, -1);
     if (got < 0) { return; }
 
     if (from[got] == 0) {

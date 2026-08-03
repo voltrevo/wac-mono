@@ -99,7 +99,24 @@ export function coreOf(
     // former reached a log loop.
     (line: string) => { hostCall(b, OP.LOG, str(line)); },
     /*= warn */
-    (line: string) => { hostCall(b, OP.WARN, str(line)); });
+    (line: string) => { hostCall(b, OP.WARN, str(line)); },
+
+    /*= waitAny */
+    // No opcode, and no slot: the wait is on the completion counter in this worker's own
+    // memory, and the deadline is `Atomics.wait`'s own timeout, so the host is not involved at
+    // all. Returns the *index* rather than the id, because the caller already knows which
+    // ticket it put where, and -1 when nothing settled in time.
+    //
+    // In `Core` because it grants nothing — it cannot start work, only notice that some has
+    // finished. It began on `Cli`, which left an interactive page unable to wait on a click or
+    // a dropped file, and that is precisely the question it exists to answer.
+    (ids: Int32Array, millis: number) => {
+      const tickets = Array.from(ids, unpack);
+      const settled = waitAny(b, tickets, millis);
+      if (settled === null) return -1;
+      return tickets.findIndex((t) => t.slot === settled.slot && t.gen === settled.gen);
+    },
+  );
 }
 
 /**
@@ -314,18 +331,6 @@ export function cliOf(
     /*= closeSocket */
     (handle: number) => { hostCall(b, OP.CLOSE_SOCKET, i32le(handle)); },
 
-    /*= waitAny */
-    // No opcode: the wait is on the completion counter in this worker's own memory, so it
-    // takes no slot and the host is not involved — including the deadline, which is
-    // `Atomics.wait`'s own timeout. Returns the *index* rather than the id, because the
-    // caller already knows which ticket it put where, and -1 when the time ran out.
-    (ids: Int32Array, millis: number) => {
-      const tickets = Array.from(ids, unpack);
-      const settled = waitAny(b, tickets, millis);
-      if (settled === null) return -1;
-      return tickets.findIndex((t) => t.slot === settled.slot && t.gen === settled.gen);
-    },
-
     /*= spawn */
     (source: string, args: string[], grants: number) =>
       // The grant flags, then the source length-prefixed, then the arguments NUL-separated —
@@ -354,7 +359,9 @@ export type PageClasses = {
   // `PendingClass` is the four-argument ticket shape; a struct's `of` takes its own fields.
   Page: { of(...a: unknown[]): unknown };
   Event: { of(...a: unknown[]): unknown };
+  Picked: { of(...a: unknown[]): unknown };
   Pending_Event: PendingClass;
+  Pending_Picked: PendingClass;
   Pending_bool: PendingClass;
   Pending_string: PendingClass;
 };
@@ -366,7 +373,26 @@ export function pageOf(b: Bridge, cls: PageClasses): unknown {
   const text = (id: number) => unstr(collect(b, unpack(id)));
   const event = (id: number) => {
     const parts = unstr(collect(b, unpack(id))).split("\u0000");
-    return cls.Event.of(parts[0] ?? "", parts[1] ?? "", parts[2] ?? "");
+    return cls.Event.of(
+      parts[0] ?? "",
+      parts[1] ?? "",
+      parts[2] ?? "",
+      Number(parts[3] ?? 0),
+      Number(parts[4] ?? 0),
+    );
+  };
+  const picked = (id: number) => {
+    const out = collect(b, unpack(id));
+    const nameLen = readI32le(out.subarray(1));
+    const errLen = readI32le(out.subarray(5 + nameLen));
+    return cls.Picked.of(
+      out[0] === 1,
+      unstr(out.subarray(5, 5 + nameLen)),
+      // A copy, because `collect` already gave us one and a subarray of it would keep the
+      // whole file alive for the sake of its name.
+      out.slice(9 + nameLen + errLen),
+      unstr(out.subarray(9 + nameLen, 9 + nameLen + errLen)),
+    );
   };
 
   /** A length-prefixed string and then the rest: how two strings cross as one payload. */
@@ -383,6 +409,7 @@ export function pageOf(b: Bridge, cls: PageClasses): unknown {
   const asOk = (t: Ticket) => cls.Pending_bool.of(pack(t), ok, settled, drop);
   const asText = (t: Ticket) => cls.Pending_string.of(pack(t), text, settled, drop);
   const asEvent = (t: Ticket) => cls.Pending_Event.of(pack(t), event, settled, drop);
+  const asPicked = (t: Ticket) => cls.Pending_Picked.of(pack(t), picked, settled, drop);
 
   return cls.Page.of(
     /*= render */
@@ -399,6 +426,28 @@ export function pageOf(b: Bridge, cls: PageClasses): unknown {
     () => asEvent(submit(b, OP.NEXT_EVENT, EMPTY)),
     /*= title */
     (t: string) => asOk(submit(b, OP.TITLE, str(t))),
+    /*= drawPixels */
+    (id: string, w: number, h: number, rgba: Uint8Array) => {
+      const name = str(id);
+      const out = new Uint8Array(12 + name.length + rgba.length);
+      out.set(i32le(w), 0);
+      out.set(i32le(h), 4);
+      out.set(i32le(name.length), 8);
+      out.set(name, 12);
+      out.set(rgba, 12 + name.length);
+      return asOk(submit(b, OP.DRAW_PIXELS, out));
+    },
+    /*= nextFile */
+    () => asPicked(submit(b, OP.NEXT_FILE, EMPTY)),
+    /*= offerDownload */
+    (name: string, bytes: Uint8Array) => {
+      const n = str(name);
+      const out = new Uint8Array(4 + n.length + bytes.length);
+      out.set(i32le(n.length), 0);
+      out.set(n, 4);
+      out.set(bytes, 4 + n.length);
+      return asOk(submit(b, OP.OFFER_DOWNLOAD, out));
+    },
   );
 }
 
