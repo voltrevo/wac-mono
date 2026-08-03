@@ -4,12 +4,11 @@
 // wrong if the mapping were wrong: the handlers themselves, driven with the payloads the
 // bridge would carry, over an in-memory Origin Private File System.
 //
-// What that leaves untested is stated rather than glossed: `SharedArrayBuffer` under
-// cross-origin isolation, `Atomics.wait` on a real worker, and the page's own plumbing.
-// Those are the same code paths Deno and Node already exercise — `layout.ts`, `call.ts`
-// and `respond.ts` are shared verbatim and contain no reference to any host — so the
-// untested part is the part that is not browser-specific. That is an argument, not a
-// proof, and it is worth someone running the page in an actual browser once.
+// A double is not the thing, and the difference showed: `readDir(".")` passed here for a week
+// and answered "not a directory" in Chromium, because OPFS has no `.` entry and this double's
+// path handling was written from the same assumption as the code it was checking. The browser
+// is in the container now — see `browser_live.test.ts`, which runs the page for real — and the
+// case below is the one it caught.
 
 import { browserWorld, type DirHandle, type FileHandle } from "../host/browser.ts";
 import { i32le, readI32le, str, unstr } from "../host/call.ts";
@@ -196,6 +195,39 @@ Deno.test("the browser world honours the capabilities a page can honour", async 
 
   await call(OP.REMOVE, new Uint8Array([0, ...str("renamed.txt")]));
   assertEquals((await call(OP.STAT, str("renamed.txt")))[0], 0, "removed");
+});
+
+Deno.test('the root is reachable as "." and as ""', async () => {
+  // Deno and Node both answer `.` with the listing, so portable code says `.` and a page has to
+  // mean the same thing by it. OPFS has no such entry: the root is a handle you are given, not
+  // a name you can look up, so every spelling of "here" has to resolve to nothing at all and
+  // then to that handle.
+  const w = browserWorld({ root: memDir(), writable: true });
+  const call = async (op: number, payload: Uint8Array<ArrayBufferLike> = new Uint8Array(0)) =>
+    await w[op](payload as Uint8Array) as Uint8Array;
+
+  const name = str("a.txt");
+  const body = str("one");
+  const put = new Uint8Array(4 + name.length + body.length);
+  put.set(i32le(name.length), 0);
+  put.set(name, 4);
+  put.set(body, 4 + name.length);
+  await call(OP.WRITE_FILE, put);
+
+  const mk = new Uint8Array(1 + 3);
+  mk.set(str("sub"), 1);
+  await call(OP.MKDIR, mk);
+
+  for (const here of [".", "", "./", "/"]) {
+    assertEquals(
+      unstr(await call(OP.READ_DIR, str(here))).split("\u0000").join(","),
+      "a.txt,sub",
+      `readDir(${JSON.stringify(here)})`,
+    );
+    const st = await call(OP.STAT, str(here));
+    assertEquals(st[0], 1, `stat(${JSON.stringify(here)}).exists`);
+    assertEquals(st[2], 1, `stat(${JSON.stringify(here)}).isDir`);
+  }
 });
 
 Deno.test("the browser world refuses what a page cannot do", async () => {

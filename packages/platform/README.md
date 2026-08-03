@@ -479,11 +479,22 @@ than on a filesystem, and there is nothing this side can do about it.
 throw a bare TypeError. `box httpd -x` sends them, which makes the whole loop wac: a wac
 server delivering a wac application to a browser.
 
-**Not run in a browser.** There is none in this container. `test/browser.test.ts` drives
-every handler over an in-memory OPFS, which is where a mapping bug would be; what is
-untested is `SharedArrayBuffer`, `Atomics.wait` on a real worker, and the page's own
-plumbing — all of it shared verbatim with the two targets that *are* tested. That is an
-argument rather than a proof, and it is worth someone opening the page once.
+**Run in a real browser**, on Chromium 151 — `test/browser_live.test.ts`, which builds the
+page, serves it with the two headers, and drives it with Playwright. It is *ignored* unless a
+browser is installed, so the suite stays zero-dependency and offline by default; the file says
+how to install one in three commands, and the skip costs 3ms and no network.
+
+It was worth the trouble immediately. `readDir(".")` had passed against the in-memory OPFS for
+a week and answered **"not a directory"** in Chromium: OPFS has no `.` entry, and the double's
+path handling had been written from the same assumption as the code it was checking, so it
+agreed with the bug. Deno and Node both answer `.` with the listing, so portable code asked the
+obvious question and silently got nothing. Fixed, and `browser.test.ts` now has the case —
+which fails against the old code, in the double as well.
+
+The argument that the rest was safe held up: `SharedArrayBuffer` under genuine cross-origin
+isolation, `Atomics.wait` on a real `Worker`, and the blob-URL worker all worked first time,
+because they are shared verbatim with the targets that were already tested. It was the
+browser-specific part that was wrong, which is the part a double cannot check.
 
 ## How an asynchronous host looks synchronous
 
@@ -565,5 +576,5 @@ enter it. Concurrency means more instances.
   a wac program with grants its parent chose.
 
 Two things this section used to list are done: the browser provider (`--target browser`,
-though see issue 0016 — it has never run in an actual browser) and outbound network
+and it now runs in one, see `test/browser_live.test.ts`) and outbound network
 (`connect`/`listen`/`accept`).
