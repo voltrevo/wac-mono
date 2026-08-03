@@ -89,8 +89,9 @@ substitution, not that the text stopped changing.
 ## External programs, and the seam
 
 The capability world cannot start a process
-([issue 0015](../../issues/open/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md)),
-so this shell cannot run `/bin/ls`. Rather than pretend, every external command goes through
+([issue 0015](../../issues/closed/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md)),
+so this shell cannot run `/bin/ls`, and closing that issue `wontfix` makes it settled rather
+than pending. Rather than pretend, every external command goes through
 **one function** — `program.wac`'s `run` — backed today by a table of programs written in wac:
 
 ```

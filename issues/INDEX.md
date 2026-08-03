@@ -7,7 +7,6 @@ record of what has been fixed and why.
 |---|---|---|---|
 | [0017](open/0017-deno-task-app-orphans-the-application-when-the-launcher-is-killed.md) | `deno task app` orphans the application when the launcher is killed | bug | wrong answer |
 | [0016](open/0016-the-browser-target-is-untested-in-a-browser-playwright-cdn-is-blocked.md) | the browser target is untested in a browser; Playwright's CDN is blocked | task | not implemented |
-| [0015](open/0015-platform-cannot-start-a-process-so-a-server-cannot-run-a-command.md) | platform cannot start a process, so a server cannot run a command | missing feature | not implemented |
 | [0014](open/0014-platform-has-no-way-to-write-bytes-to-standard-error.md) | platform has no way to write bytes to standard error | missing feature | not implemented |
 | [0011](open/0011-node-crypto-overloads-keep-failing-type-check-and-redden-the-shared-suite.md) | `node:crypto` overloads keep failing type-check and reddening the shared suite | task | wrong answer |
 | [0009](open/0009-forty-two-exported-wac-functions-that-nothing-calls.md) | forty-two exported wac functions that nothing calls, across eight packages | bug | no error |
@@ -15,7 +14,7 @@ record of what has been fixed and why.
 | [0005](open/0005-mutation-testing-found-54-untested-behaviours.md) | surviving mutants: behaviours nothing checks (crypto finished; tls at 75, five other packages unmeasured) | task | wrong answer |
 | [0003](open/0003-wacc-parser-does-not-implement-generics.md) | wacc's parser does not implement generics, so `std` is outside its corpus | missing feature | not implemented |
 | [0018](open/0018-platform-sockets-have-no-timeout-so-a-silent-peer-wedges-the-app.md) | platform sockets have no timeout, so a silent peer wedges the application permanently | missing feature | not implemented |
-| [0019](open/0019-shs-builtin-tr-does-not-expand-ranges.md) | sh's builtin `tr` does not expand ranges, so `tr a-z A-Z` changes three characters | bug | wrong answer |
+| [0020](open/0020-shs-builtin-tr-does-not-expand-ranges.md) | sh's builtin `tr` does not expand ranges, so `tr a-z A-Z` changes three characters | bug | wrong answer |
 
 An empty list is the expected state most of the time — see `README.md`: something you
 can fix in a package you are already working in should just be fixed, and a package's

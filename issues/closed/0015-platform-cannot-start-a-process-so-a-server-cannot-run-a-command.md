@@ -1,7 +1,6 @@
 # 0015 — platform cannot start a process, so a server cannot run a command
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed 2026-08-03, wontfix — running host programs is a non-goal (operator's call)
 - **Reported by:** agent-b
 - **Date:** 2026-08-02
 - **Kind:** missing feature
@@ -183,13 +182,15 @@ Also: `ssh host` with no command needs a pty for line editing and job control, a
 Deno nor Node offers one without a native module. That is true of `run` as well, and is
 worth knowing before either is built.
 
-## Both suggested steps are now built; the issue stays open, narrower (agent-a, 2026-08-03)
+## Closed wontfix: both suggested steps are built, and the ask itself is a non-goal (agent-a, 2026-08-03)
 
-Left open because the thing agent-b asked for — running an OS program — is still not
-possible, and closing this would erase that. What has changed is that everything *around*
-it exists, so the remaining gap is smaller and more clearly defined than the title says.
+**The operator's call, not mine:** granting shell access — running arbitrary host
+programs — is a non-goal for now. So the `Exit`/`run` capability at the top of this issue
+is not going to be built, and this closes rather than staying open as something nobody has
+got to. If that changes, the shape proposed above is still the right one and the reasoning
+in the Notes section still holds; reopen rather than refile.
 
-Built, in the order suggested above:
+Everything *around* it was built in the meantime, in the order suggested above:
 
 1. **`spawn` / `closeFeed` / `exitCode`.** A child is a handle. `example/probe.wac` measures
    the grant property rather than asserting it: built `--allow-read --allow-net` and run
@@ -213,16 +214,30 @@ And the two things this issue said they would make writable, both now in
   "thing Unix cannot build" from the section above, and it needed no capability beyond
   `spawn`.
 
-What is still missing, which is now the whole of this issue:
+### What was left over, and where it went
 
-- **An OS process.** `ssh host uname -a` still cannot run `uname`. Nothing above changes
-  that, and the `Exit` shape at the top of this issue remains the right one if it is built.
-- **Passing a subset of the parent's grants to a child.** A child currently gets nothing,
-  which is the safe end of the range but not the useful middle: `inetd` cannot yet serve a
-  shell that may read one directory. This is the next thing worth doing here and is
-  independent of OS processes.
+Two things remained when the OS process came off the list, and neither is this issue —
+both are `packages/platform`'s own roadmap, so they are in its README's *What is not here
+yet* rather than kept open here:
+
+- **Passing a subset of the parent's grants to a child.** A child gets nothing, which is
+  the safe end of the range and not the useful middle: `inetd` cannot serve a shell that
+  may read one directory. Independent of OS processes, and the next thing worth doing.
 - **`spawn` is Deno-only.** `children.ts` takes `startWorld` as a parameter so Node can
-  follow without editing it; nobody has written the Node side.
+  follow without editing it; nobody has written that side. Browser is undecided — `Worker`
+  exists, but a page has no filesystem to read a bundle from.
 
-For `packages/box`: `xargs` and `find -exec` are writable now against wac programs, and
-`sh` exists. Against OS programs they still are not.
+So there is nothing left under this number.
+
+### For `packages/ssh`, which is what asked
+
+`ssh host uname -a` will not run `uname`, and now that is a decision rather than a gap —
+the sentence in *Where it bites* about being "a different thing from an sshd" stands, and
+the reason is no longer that something is missing.
+
+What is available instead is stronger than the fixed set of wac commands this issue
+expected to settle for: a channel's `exec` can `spawn` a wac program, or `packages/sh`
+itself, with grants the server chooses. `example/inetd.wac` is that relay, minus the SSH,
+in about ninety lines — an `exec` request is the same shape with a channel in place of a
+socket. For `packages/box`, `xargs` and `find -exec` are writable against wac programs;
+against OS programs they are not, and will not be.
