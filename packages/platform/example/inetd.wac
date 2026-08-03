@@ -1,0 +1,139 @@
+// A network service whose handler is another wac program.
+//
+//   inetd <port> <worker.js> [args...]
+//
+// Accept a connection, spawn the program, and relay bytes between the socket and the child
+// until either side finishes. The handler needs to know nothing about networks: it reads
+// standard input and writes standard output, and this connects the two.
+//
+// That is `inetd`, and it is the shape a shell served over the network takes — the thing the
+// SSH-server discussion on issue 0015 was reaching for. What makes it writable is that a
+// socket and a child are both handles, so waiting on whichever speaks first is one call:
+//
+//   i32 which = cli.waitAny(i32[](fromNet.id, fromKid.id));
+//
+// Try it with `box` as the handler, which needs no grants for a text applet:
+//
+//   deno task app:build packages/box/src/box.wac --worker -o box.worker.js
+//   inetd 9000 box.worker.js rev
+//   printf 'hello\n' | nc 127.0.0.1 9000     ->  olleh
+//
+// The child is granted nothing but those two streams, so `inetd 9000 box.worker.js cat /etc/passwd`
+// serves an error rather than the file. The handler cannot exceed what this program hands it.
+
+import { Child, Cli, Core, FileResult, Pending, Socket } from "../src/platform.wac";
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount().wait() < 2) {
+    core.warn("usage: inetd <port> <worker.js> [args...]");
+    return 2;
+  }
+  i32 port = atoi(cli.arg(0).wait());
+  string workerPath = cli.arg(1).wait();
+
+  FileResult prog = cli.readFile(workerPath).wait();
+  if (!prog.ok) {
+    core.warn("inetd: " + workerPath + ": " + prog.error);
+    return 1;
+  }
+  string source = string.fromBytes(prog.bytes);
+
+  // Everything after the worker path is the handler's own argv.
+  i32 extra = cli.argCount().wait() - 2;
+  string[] childArgs = string[extra < 0 ? 0 : extra](fill: "");
+  for (i32 i = 0; i < extra; i++) { childArgs[i] = cli.arg(i + 2).wait(); }
+
+  Socket l = cli.listen(port).wait();
+  if (l.handle < 0) {
+    core.warn("inetd: " + itoa(port) + ": " + l.error);
+    return 1;
+  }
+  core.warn("inetd: listening on port " + itoa(port));
+
+  // One connection, then exit. A loop would need `accept` and the live child watched
+  // together, which `waitAny` can do — but serving one is what makes this testable, and
+  // concurrency across connections is a different design decision from this one.
+  Socket c = cli.accept(l.handle).wait();
+  cli.closeSocket(l.handle);
+  if (c.handle < 0) {
+    core.warn("inetd: accept: " + c.error);
+    return 1;
+  }
+
+  Child kid = cli.spawn(source, childArgs).wait();
+  if (kid.handle < 0) {
+    core.warn("inetd: " + kid.error);
+    cli.closeSocket(c.handle);
+    return 1;
+  }
+
+  relay(core, cli, c.handle, kid.handle);
+
+  i32 code = cli.exitCode(kid.handle).wait();
+  cli.closeSocket(kid.handle);
+  cli.closeSocket(c.handle);
+  return code < 0 ? 1 : 0;
+}
+
+/**
+ * Bytes both ways until one side is done.
+ *
+ * The only subtlety is the end of the *network* side: the client closing means no more input
+ * for the handler, not that the handler is finished. `rev` and `wc` both answer only after
+ * their input ends, so treating a closed socket as the end of the exchange would serve
+ * nothing at all. The child's own end is what finishes it.
+ */
+void relay(Core core, Cli cli, i32 net, i32 kid) {
+  Pending<u8[]> fromNet = cli.recv(net);
+  Pending<u8[]> fromKid = cli.recv(kid);
+  bool netDone = false;
+
+  while (true) {
+    i32 which = netDone
+      ? cli.waitAny(i32[](fromKid.id))
+      : cli.waitAny(i32[](fromNet.id, fromKid.id));
+    if (which < 0) { return; }
+
+    // With the network done there is one ticket in the list, so index 0 is the child.
+    bool kidSpoke = netDone || which == 1;
+
+    if (kidSpoke) {
+      u8[] out = fromKid.wait();
+      if (out.len() == 0) { return; }              // the handler has finished
+      if (!cli.send(net, out).wait()) { return; }  // the client hung up
+      fromKid = cli.recv(kid);
+      continue;
+    }
+
+    u8[] in = fromNet.wait();
+    if (in.len() == 0) {
+      // The client stopped talking. Tell the handler, and keep reading its answer.
+      cli.closeFeed(kid);
+      netDone = true;
+      continue;
+    }
+    if (!cli.send(kid, in).wait()) { return; }
+    fromNet = cli.recv(net);
+  }
+}
+
+i32 atoi(string s) {
+  u8[] b = s.toBytes();
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return n; }
+    n = n * 10 + (b[i] - '0');
+  }
+  return n;
+}
+
+string itoa(i32 n) {
+  if (n == 0) { return "0"; }
+  i32 v = n < 0 ? 0 - n : n;
+  u8[] digits = u8[12](fill: 0);
+  i32 at = 12;
+  while (v > 0) { at--; digits[at] = '0' + (v % 10); v = v / 10; }
+  u8[] used = u8[12 - at](fill: 0);
+  used.copyFrom(digits, at, 0, 12 - at);
+  return (n < 0 ? "-" : "") + string.fromBytes(used);
+}

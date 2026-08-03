@@ -300,10 +300,10 @@ export struct Cli {
    * arrives. `recv` answers with at most `CHUNK` bytes and with an empty array when the
    * peer has closed — a short read means nothing, exactly as it does for a file.
    *
-   * There is no `poll`, so a program can wait on one socket at a time. That is enough for
-   * a request/response protocol and for a server that handles one connection at a time; it
-   * is not enough for a proxy, or for anything that must watch two sockets at once. When
-   * something needs it, that is the shape to add.
+   * Watching two sockets at once is `waitAny` below, over the ids of two tickets in flight.
+   * This comment used to say there was no way to do that and that "when something needs it,
+   * that is the shape to add" — it was left behind when the shape was added, twenty lines
+   * further down, and contradicting it.
    */
   fn[Pending<Socket>(string, i32)] connect;
   fn[Pending<Socket>(i32)] listen;
