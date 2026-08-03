@@ -80,21 +80,45 @@ async function startWacsshd(): Promise<Wacsshd> {
     stderr: "piped",
   }).spawn();
 
-  // Drained concurrently: a server that filled the pipe would block, and nothing reads it until
-  // the process ends.
-  const stderr = new Response(proc.stderr).text();
+  // Drained as it arrives, rather than with `new Response(proc.stderr).text()`, which only resolves
+  // at end of stream. Two things need it: a server that filled the pipe would block, and startup
+  // has to be able to wait for a *particular* line.
+  let said = "";
+  let announced = () => {};
+  const hasAnnounced = new Promise<void>((r) => { announced = r; });
+  const stderr = (async () => {
+    const dec = new TextDecoder();
+    for await (const chunk of proc.stderr) {
+      said += dec.decode(chunk, { stream: true });
+      if (said.includes("listening on port")) announced();
+    }
+    announced();          // the process ended without saying it; the waiter must not hang
+    return said;
+  })();
 
   // Poll rather than sleep: the first run compiles the wac and the rest do not.
-  for (let i = 0; i < 200; i++) {
+  let accepted = false;
+  for (let i = 0; i < 200 && !accepted; i++) {
     try {
       const probe = await Deno.connect({ hostname: "127.0.0.1", port });
       probe.close();
-      return { dir, port, proc, stderr };
+      accepted = true;
     } catch {
-      await new Promise(r => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 100));
     }
   }
-  throw new Error("our sshd never accepted a connection");
+  if (!accepted) throw new Error("our sshd never accepted a connection");
+
+  // **And wait for the announcement, not just for the socket.** A successful connect only proves
+  // the listener is bound; the startup line is written around the same moment and read here a
+  // moment later. Returning on the connect alone meant a test could `SIGKILL` the server before
+  // that line had been drained, and then assert on an empty string — which is what made this file
+  // fail about one full parallel run in ten, always in the one test that reads stderr. Issue 0026.
+  await Promise.race([
+    hasAnnounced,
+    new Promise((r) => setTimeout(r, 20_000)),
+  ]);
+  return { dir, port, proc, stderr };
 }
 
 async function stopWacsshd(s: Wacsshd | undefined): Promise<void> {
