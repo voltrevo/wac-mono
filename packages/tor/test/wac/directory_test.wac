@@ -1,0 +1,135 @@
+// Directory parsing, against the TypeScript implementation it replaces.
+//
+// A differential during a port is the one time the old code is worth keeping around: it
+// encodes every case that was ever fixed in it, including the ones nobody wrote a test for.
+// `ref(kind)` hands back what `host/directory.ts` made of the same bytes, so a disagreement
+// is a real regression rather than a difference of opinion about a format.
+//
+// The fixtures are a real chutney consensus and its microdescriptors, captured to
+// `test/data/` — the same documents the client verified and built circuits from.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { parseConsensus, attachMicrodescriptors, parsePolicy, base64NoPad, hasFlag,
+         parseInt, Relay, ExitPolicy } from "../../src/directory.wac";
+import { sha256 } from "../../../crypto/src/sha256.wac";
+
+export string test_relays_match_the_typescript_parser(fn[u8[](i32)] fixture) {
+  T t = T.create();
+  Relay[] r = parseConsensus(fixture(0));
+  // fixture(2) is the TypeScript parser's summary: one line per relay,
+  // "nickname|address|orPort|flags,joined|microdescDigest|bandwidth".
+  string[] want = splitLines(fixture(2));
+  t.eqI32(r.len(), want.len(), "the same number of relays");
+  for (i32 i = 0; i < r.len() && i < want.len(); i++) {
+    t.eqStr(summarise(r[i]), want[i], "relay " + itoa64(i as i64));
+  }
+  return t.report();
+}
+
+export string test_onion_keys_and_policies_match(fn[u8[](i32)] fixture) {
+  T t = T.create();
+  Relay[] r = parseConsensus(fixture(0));
+  attachMicrodescriptors(r, fixture(1));
+  string[] want = splitLines(fixture(3));
+  t.eqI32(r.len(), want.len(), "same relay count after attaching");
+  for (i32 i = 0; i < r.len() && i < want.len(); i++) {
+    t.eqStr(describeKeys(r[i]), want[i], "relay " + itoa64(i as i64) + " keys");
+  }
+  return t.report();
+}
+
+export string test_a_digest_that_does_not_match_attaches_nothing() {
+  // The property the whole recomputation exists for: a microdescriptor is only believed by
+  // the relay whose consensus entry named its digest. Corrupt the body and it belongs to
+  // nobody, rather than to whoever happened to be next in the list.
+  T t = T.create();
+  u8[] doc = ("network-status-version 3\n" +
+    "r alpha AAAAAAAAAAAAAAAAAAAAAAAAAAA 2026-01-01 00:00:00 10.0.0.1 9001 0\n" +
+    "m " + base64NoPad(sha256("onion-key\nntor-onion-key AAAA\n".toBytes())) + "\n" +
+    "s Fast Running Valid\n").toBytes();
+  Relay[] good = parseConsensus(doc);
+  attachMicrodescriptors(good, "onion-key\nntor-onion-key AAAA\n".toBytes());
+  t.isTrue(good[0].ntorOnionKey.len() > 0, "the matching descriptor attaches");
+
+  Relay[] bad = parseConsensus(doc);
+  attachMicrodescriptors(bad, "onion-key\nntor-onion-key BBBB\n".toBytes());
+  t.eqI32(bad[0].ntorOnionKey.len(), 0, "one changed byte and it attaches to nobody");
+  return t.report();
+}
+
+export string test_policy_summaries() {
+  T t = T.create();
+  ExitPolicy? a = parsePolicy("p accept 80,443,8000-8100");
+  t.isTrue(a is not null, "an accept line parses");
+  t.isTrue(a!.isAccept, "and is an accept");
+  t.eqI32(a!.ranges.len(), 6, "three ranges, flattened");
+  t.eqI32(a!.ranges[0], 80, "a single port is a range of one");
+  t.eqI32(a!.ranges[1], 80, "at both ends");
+  t.eqI32(a!.ranges[4], 8000, "and a real range keeps its bounds");
+  t.eqI32(a!.ranges[5], 8100, "both of them");
+
+  ExitPolicy? r = parsePolicy("p reject 1-65535");
+  t.isTrue((r is not null) && !r!.isAccept, "a reject line parses as reject");
+  t.isTrue(parsePolicy("p accept") is null, "a line with no port list is refused");
+  t.isTrue(parsePolicy("s Fast Running") is null, "and so is a line that is not a policy");
+  return t.report();
+}
+
+export string test_an_integer_field_is_not_lenient() {
+  T t = T.create();
+  t.eqI32(parseInt("9001"), 9001, "a plain number");
+  t.eqI32(parseInt("0"), 0, "zero");
+  t.eqI32(parseInt(""), -1, "empty is not a number");
+  t.eqI32(parseInt("90a1"), -1, "nor is a number with a letter in it");
+  t.eqI32(parseInt("-1"), -1, "nor a negative, which no field here may be");
+  t.eqI32(parseInt(" 9001"), -1, "nor one with a space");
+  return t.report();
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+string summarise(Relay r) {
+  string flags = "";
+  for (i32 i = 0; i < r.flags.len(); i++) {
+    flags = i == 0 ? r.flags[i] : flags + "," + r.flags[i];
+  }
+  return r.nickname + "|" + r.address + "|" + itoa64(r.orPort as i64) + "|" + flags +
+         "|" + r.microdescDigest + "|" + itoa64(r.bandwidth as i64);
+}
+
+string describeKeys(Relay r) {
+  string policy = "none";
+  if (r.exitPolicy is not null) {
+    ExitPolicy p = r.exitPolicy!;
+    policy = p.isAccept ? "accept" : "reject";
+    for (i32 i = 0; i < p.ranges.len(); i += 2) {
+      policy = policy + " " + itoa64(p.ranges[i] as i64) + "-" + itoa64(p.ranges[i + 1] as i64);
+    }
+  }
+  string fam = "";
+  for (i32 i = 0; i < r.family.len(); i++) {
+    fam = i == 0 ? r.family[i] : fam + "," + r.family[i];
+  }
+  return r.nickname + "|" + base64NoPad(r.ntorOnionKey) + "|" + policy + "|" + fam;
+}
+
+string[] splitLines(u8[] b) {
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == '\n') { n++; }
+  }
+  string[] out = string[n](fill: "");
+  i32 at = 0;
+  i32 line = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == '\n') {
+      u8[] s = u8[i - at]();
+      for (i32 j = 0; j < s.len(); j++) { s[j] = b[at + j]; }
+      out[line] = string.fromBytes(s);
+      line++;
+      at = i + 1;
+    }
+  }
+  return out;
+}

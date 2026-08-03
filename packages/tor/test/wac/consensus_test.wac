@@ -13,6 +13,7 @@ import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import {
   signedLength, signedDigest, keyFingerprint, rsaModulus, rsaExponent, signatureMatches,
+  parseCertificates, verifyConsensus, parseUtc, AuthorityCert, Verdict,
 } from "../../src/consensus.wac";
 import { sha1 } from "../../../crypto/src/sha1.wac";
 import { sha256 } from "../../../crypto/src/sha256.wac";
@@ -179,4 +180,126 @@ export string test_a_fingerprint_is_the_sha1_of_the_key(fn[u8[](i32)] keyPart) {
   t.eqBytes(keyFingerprint(der), sha1(der), "the fingerprint is sha1 over the whole DER");
   t.eqI32(keyFingerprint(der).len(), 20, "twenty bytes");
   return t.report();
+}
+
+// ── The chain, ported from TypeScript ────────────────────────────────────────
+
+export string test_the_chain_accepts_a_genuine_consensus(
+  fn[u8[](i32)] keyPart, fn[u8[](u8[])] sign, fn[u8[](i32)] otherKeyPart,
+  fn[u8[](i32)] doc, fn[u8[](i32)] names
+) {
+  // doc(0) consensus, doc(1) certs; lines(names(0)) the trusted fingerprints. The documents are
+  // built by the registrar with real RSA keys, so this is the whole chain: identity key
+  // hashes to a trusted fingerprint, certifies a signing key, signing key signs the
+  // consensus, majority, freshness.
+  T t = T.create();
+  AuthorityCert[] certs = parseCertificates(doc(1), lines(names(0)));
+  t.eqI32(certs.len(), 3, "three certificates check out");
+  Verdict v = verifyConsensus(doc(0), certs, lines(names(0)), 1785715200);
+  t.isTrue(v.ok, "and the consensus is accepted");
+  t.eqI32(v.goodSignatures, 3, "three good signatures");
+  t.eqI32(v.needed, 2, "of the two needed from three authorities");
+  t.eqStr(v.stale, "", "and it is current");
+  return t.report();
+}
+
+export string test_everything_the_chain_must_refuse(
+  fn[u8[](i32)] keyPart, fn[u8[](u8[])] sign, fn[u8[](i32)] otherKeyPart,
+  fn[u8[](i32)] doc, fn[u8[](i32)] names
+) {
+  // A verifier that accepts everything also accepts a genuine consensus, so this is where
+  // the value is. Each case is a thing an attacker would actually try.
+  T t = T.create();
+  string[] trusted = lines(names(0));
+  AuthorityCert[] certs = parseCertificates(doc(1), trusted);
+
+  t.isTrue(!verifyConsensus(doc(2), certs, trusted, 1785715200).ok,
+           "a consensus with one relay's flags changed");
+  t.isTrue(!verifyConsensus(doc(3), certs, trusted, 1785715200).ok,
+           "a consensus with a microdescriptor digest swapped");
+  t.isTrue(!verifyConsensus(doc(0), certs, string[0](), 1785715200).ok,
+           "an empty trust set, where a majority of nobody is not a test");
+  t.eqI32(parseCertificates(doc(1), lines(names(1))).len(), 0,
+          "certificates from authorities we do not name");
+  t.isTrue(!verifyConsensus(doc(0), AuthorityCert[0](), trusted, 1785715200).ok,
+           "no certificates, so no signature can be attributed");
+
+  // Freshness: correctly signed and outside its window is still refused, and says so
+  // differently from a forgery.
+  Verdict old = verifyConsensus(doc(0), certs, trusted, 1); 
+  t.isTrue(!old.ok, "a consensus from before it was valid");
+  t.eqStr(old.stale, "not valid yet", "reported as staleness, not as a bad signature");
+  t.eqI32(old.goodSignatures, 3, "with its signatures still good");
+  Verdict future = verifyConsensus(doc(0), certs, trusted, 4000000000);
+  t.eqStr(future.stale, "expired", "and an expired one says expired");
+  return t.report();
+}
+
+export string test_a_signing_key_its_identity_never_certified(
+  fn[u8[](i32)] keyPart, fn[u8[](u8[])] sign, fn[u8[](i32)] otherKeyPart,
+  fn[u8[](i32)] doc, fn[u8[](i32)] names
+) {
+  // The check it is tempting to skip. doc(4) is the certificate file with one authority's
+  // signing key replaced by another's — the consensus signature would still verify against
+  // it, so only the certification check catches this.
+  T t = T.create();
+  AuthorityCert[] swapped = parseCertificates(doc(4), lines(names(0)));
+  t.eqI32(swapped.len(), 2, "the tampered certificate is dropped, the others stand");
+  Verdict v = verifyConsensus(doc(0), swapped, lines(names(0)), 1785715200);
+  t.eqI32(v.goodSignatures, 2, "so that authority's signature cannot be attributed");
+  return t.report();
+}
+
+export string test_a_signature_names_which_signing_key_made_it(
+  fn[u8[](i32)] keyPart, fn[u8[](u8[])] sign, fn[u8[](i32)] otherKeyPart,
+  fn[u8[](i32)] doc, fn[u8[](i32)] names
+) {
+  // doc(5) holds two certificates for one authority — its rotated signing key last. The
+  // consensus names the first key's digest. A chain that matched on the identity alone
+  // would land on the rotated certificate and lose a good signature, so this is what makes
+  // the digest half of the match load-bearing rather than decoration.
+  T t = T.create();
+  string[] trusted = lines(names(0));
+  AuthorityCert[] certs = parseCertificates(doc(5), trusted);
+  t.eqI32(certs.len(), 4, "four certificates, two of them the same authority");
+  Verdict v = verifyConsensus(doc(0), certs, trusted, 1785715200);
+  t.eqI32(v.goodSignatures, 3, "all three signatures still attributed");
+  t.isTrue(v.ok, "and the consensus is accepted");
+  return t.report();
+}
+
+export string test_a_utc_timestamp_is_not_read_as_local() {
+  // Directory timestamps carry no zone. Reading them as local time shifts every validity
+  // window by the host's offset, silently and differently per machine.
+  T t = T.create();
+  u8[] s = "2026-08-03 10:00:00".toBytes();
+  t.eqI64(parseUtc(s, 0, s.len()), 1785751200, "the epoch second, in UTC");
+  u8[] epoch = "1970-01-01 00:00:00".toBytes();
+  t.eqI64(parseUtc(epoch, 0, epoch.len()), 0, "the epoch itself");
+  u8[] bad = "2026-08-03T10:00:00".toBytes();
+  t.eqI64(parseUtc(bad, 0, bad.len()), -1, "a T separator is not this format");
+  u8[] short_ = "2026-08-03".toBytes();
+  t.eqI64(parseUtc(short_, 0, short_.len()), -1, "and neither is a date alone");
+  return t.report();
+}
+
+/** Newline-joined fingerprints, as the registrar sends them. */
+string[] lines(u8[] b) {
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == '\n') { n++; }
+  }
+  string[] out = string[n](fill: "");
+  i32 at = 0;
+  i32 line = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == '\n') {
+      u8[] s = u8[i - at]();
+      for (i32 j = 0; j < s.len(); j++) { s[j] = b[at + j]; }
+      out[line] = string.fromBytes(s);
+      line++;
+      at = i + 1;
+    }
+  }
+  return out;
 }

@@ -207,7 +207,10 @@ export function nodeWorld(
       return i32le(h);
     },
     [OP.RECV]: async (p) => {
-      const c = sockets.get(readI32le(p));
+      const h = readI32le(p);
+      // Handle 0 is standard input — see the note in `deno.ts`.
+      if (h === 0) return await io.readStdinChunk();
+      const c = sockets.get(h);
       if (c === undefined) throw new Error("not an open socket");
       return await c.recv();
     },

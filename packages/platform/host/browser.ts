@@ -261,7 +261,9 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     [OP.CONNECT]: () => deny("network access"),
     [OP.LISTEN]: () => deny("network access"),
     [OP.ACCEPT]: () => deny("network access"),
-    [OP.RECV]: () => deny("network access"),
+    // Handle 0 is standard input everywhere else; a page has none, so it ends immediately
+    // rather than refusing. Any other handle is a socket, which a page cannot have.
+    [OP.RECV]: (p) => (readI32le(p) === 0 ? EMPTY : deny("network access")),
     [OP.SEND]: () => deny("network access"),
     [OP.CLOSE_SOCKET]: () => EMPTY,
   };

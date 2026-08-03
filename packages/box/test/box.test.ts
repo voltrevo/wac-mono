@@ -1405,3 +1405,90 @@ function pemToDer(pem: string): Uint8Array {
   const b64 = pem.split("\n").filter((l) => !l.startsWith("-----")).join("");
   return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 }
+
+Deno.test("nc relays both directions at once", async () => {
+  // The applet that could not be written until `waitAny` existed. A relay has to watch the
+  // socket *and* standard input: wait on the socket alone and a client that speaks first is
+  // never heard; wait on stdin alone and a server that greets you is never printed. Standard
+  // input is handle 0, so both sides are the same primitive — two `recv` in flight and a
+  // park on whichever answers.
+  //
+  // The peer here greets *before* reading, so a relay that serviced stdin first would hang
+  // and a relay that serviced the socket first would never send. Only watching both passes.
+  const built = await Deno.makeTempFile({ prefix: "wac-nc-" });
+  try {
+    await buildApp(BOX, built, { net: true });
+
+    const port = freePort();
+    const seen: string[] = [];
+    const peer = (async () => {
+      const l = Deno.listen({ hostname: "127.0.0.1", port });
+      try {
+        const c = await l.accept();
+        await c.write(new TextEncoder().encode("peer speaks first\n"));
+        const buf = new Uint8Array(4096);
+        const n = await c.read(buf);
+        seen.push(new TextDecoder().decode(buf.subarray(0, n ?? 0)).trimEnd());
+        c.close();
+      } catch { /* the client may have closed first */ }
+      try { l.close(); } catch { /* already closed */ }
+    })();
+
+    const nc = new Deno.Command(built, {
+      args: ["nc", "127.0.0.1", `${port}`],
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    const w = nc.stdin.getWriter();
+    await w.write(new TextEncoder().encode("client speaks second\n"));
+    await w.close();
+
+    const out = await nc.output();
+    await peer;
+    assertEquals(out.code, 0, new TextDecoder().decode(out.stderr));
+    // Downstream: the greeting arrived even though stdin had something waiting.
+    assertEquals(
+      new TextDecoder().decode(out.stdout).trimEnd(),
+      "peer speaks first",
+      "the peer's greeting did not reach standard output",
+    );
+    // Upstream: and what stdin held was sent.
+    assertEquals(seen.join(""), "client speaks second", "standard input did not reach the peer");
+  } finally {
+    await Deno.remove(built);
+  }
+});
+
+Deno.test("nc -l takes one connection", async () => {
+  const built = await Deno.makeTempFile({ prefix: "wac-ncl-" });
+  try {
+    await buildApp(BOX, built, { net: true });
+    const port = freePort();
+    const server = new Deno.Command(built, {
+      args: ["nc", `-${port}`, "-l"],
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    // It prints the same "listening on port" line `serve` and `httpd` do, which is what a
+    // caller waits for rather than sleeping.
+    await waitForListening(server, port);
+    server.stderr.cancel();
+
+    const conn = await Deno.connect({ hostname: "127.0.0.1", port });
+    await conn.write(new TextEncoder().encode("over the wire\n"));
+    conn.close();
+    const sw = server.stdin.getWriter();
+    await sw.close();
+
+    const out = await server.output();
+    assertEquals(
+      new TextDecoder().decode(out.stdout).trimEnd(),
+      "over the wire",
+      "the listener did not relay what it was sent",
+    );
+  } finally {
+    await Deno.remove(built);
+  }
+});
