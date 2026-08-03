@@ -48,6 +48,8 @@ export enum PartKind {
   Var,
   /** A command substitution's text, still unparsed: `$(…)`. */
   Cmd,
+  /** An arithmetic expression, still unparsed: `$((…))`. */
+  Arith,
 }
 
 /**
@@ -298,6 +300,31 @@ i32 lexDollar(u8[] s, i32 at, Token word, bool quoted) {
   i32 c = s[p];
 
   if (c == 0x28) {                                          // '('
+    // `$((…))` is arithmetic and `$(…)` is a command. They are told apart by the second
+    // character, and the arithmetic form has to be tried first — `$((1+2))` is a valid command
+    // substitution containing a subshell as far as the parenthesis counting is concerned, and
+    // would run `1+2` as a command rather than adding.
+    if (p + 1 < s.len() && s[p + 1] == 0x28) {
+      // Scan the expression itself, from just after `$((`, and stop at the `)` that is not
+      // closing something the expression opened. Counting from the `$((` instead makes the scan
+      // stop on the *second* of the two closing parens, and then the pair is never recognised.
+      i32 depth = 0;
+      i32 start = p + 2;
+      i32 q = start;
+      while (q < s.len()) {
+        if (s[q] == 0x28) { depth++; }
+        else if (s[q] == 0x29) {
+          if (depth == 0) { break; }
+          depth--;
+        }
+        q++;
+      }
+      if (q + 1 < s.len() && s[q] == 0x29 && s[q + 1] == 0x29) {
+        word.parts.push(Part.of(PartKind.Arith, sliceOf(s, start, q), quoted));
+        return q + 2;
+      }
+      // Not arithmetic after all — fall through and read it as a command substitution.
+    }
     i32 depth = 1;
     i32 start = p + 1;
     p++;
