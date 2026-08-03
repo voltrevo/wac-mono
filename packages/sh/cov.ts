@@ -297,6 +297,16 @@ const SCRIPTS: string[] = [
   "x=$(false); echo $?", "x=$(exit 3); echo $?", "x=1; echo $?", "$(exit 3); echo $?",
   "a=$(false) b=$(true); echo $?",
 
+  // ── Pattern substitution ────────────────────────────────────────────────────
+  "x=abcabc; echo ${x/b/Z}", "x=abcabc; echo ${x//b/Z}", "x=aaa; echo ${x/a*/X}",
+  "x=abc; echo ${x/#a/Z}", "x=abc; echo ${x/#z/Z}", "x=abc; echo ${x/%c/Z}",
+  "x=abc; echo ${x/%z/Z}", "x=abc; echo ${x/z/Z}", "x=abc; echo ${x//z/Z}",
+  "x=abc; echo ${x/b}", "x=abc; echo ${x//}", "x=abc; echo ${x/}",
+  'x=abc; echo "${x//""/-}"', "x=; echo ${x/a/b}", "x=a/b; echo ${x/\\//-}",
+  'x=abc; echo "${x//?/[&]}"', 'x=abc; echo "${x/b/\\&}"', 'x=abc; echo "${x/b/&}"',
+  "x=abc; echo ${x/#/Z}", "x=abc; echo ${x/%/Z}", "x=abc; echo ${x//*/X}",
+  'x="a b"; echo "${x#a }"', 'x="a b"; echo "${x%% b}"',
+
   // ── Spawning an external program ────────────────────────────────────────────
   //
   // The fake world has `/bin/prog`, which starts, and `/bin/badprog`, which does not. See the

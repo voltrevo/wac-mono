@@ -325,6 +325,51 @@ esac`,
   `unset x; echo [$x]`,
   `x=1; unset x; echo [$x]`,
 
+  // ── Pattern substitution ────────────────────────────────────────────────────
+  //
+  // Three things here are not guessable from the shorter forms, and each has a pair below:
+  // `#`/`%` right after the slash anchor the match rather than saying which end to trim; `&` in
+  // the replacement is the text that matched, and `\&` is a literal one, which bash grew in 5.2;
+  // and an empty match does not substitute, so `${x//""/-}` leaves the value alone rather than
+  // inserting between every character.
+  "x=abcabc; echo ${x/b/Z}",
+  "x=abcabc; echo ${x//b/Z}",
+  "x=aaa; echo ${x/a*/X}",
+  'x=abc; echo "${x/b*/Z}"',
+  "x=abc; echo ${x//*/X}",
+  "x=abc; echo ${x/#a/Z}",
+  "x=abc; echo ${x/#b/Z}",
+  "x=abc; echo ${x/%c/Z}",
+  "x=abc; echo ${x/%a/Z}",
+  "x=abc; echo ${x/b}",
+  "x=abc; echo ${x/c/}",
+  "x=abc; echo ${x//}",
+  'x=abc; echo "${x//""/-}"',
+  "x=; echo [${x/a/b}]",
+  "x=aaa; echo ${x//a/}",
+  "x=aXbXc; echo ${x//X/}",
+  "x=a.b; echo ${x/./X}",
+  "x=abc; echo ${x/?/X}",
+  "x=abc; echo ${x/[ab]/Z}",
+  "x=abc; echo ${x//[ab]/Z}",
+  "x=a/b; echo ${x/\\//-}",
+  "x=foo.txt; echo ${x/.txt/.md}",
+  'x="a b"; echo "${x/ /_}"',
+  'x="a b c"; echo "${x// /_}"',
+  'x=abc; echo "${x//?/[&]}"',
+  'x=abc; echo "${x/b/[&]}"',
+  'x=abc; echo "${x/b/\\&}"',
+  'x=abc; echo "${x/a/&&}"',
+  'x=abc; echo "${x/b/&x&}"',
+  "p=b; x=abc; echo ${x/$p/Z}",
+  "r=Z; x=abc; echo ${x/b/$r}",
+  "x=abc; echo ${x/b/$(echo Q)}",
+  // A trim pattern is not split either, which was wrong in the same way until now.
+  'x="a b"; echo "${x#a }"',
+  'x="a b"; echo "${x%% b}"',
+  'x=" lead"; echo "[${x# }]"',
+  'x="trail "; echo "[${x% }]"',
+
   // ── tr, whose sets have their own small language ─────────────────────────────
   //
   // Ranges were missing entirely and `a-z` was the three-character set `{a, -, z}` — issue 0019,

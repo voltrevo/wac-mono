@@ -554,12 +554,13 @@ i32 lexDollar(u8[] s, i32 at, Token word, bool quoted) {
     i32 opEnd = nameEnd;
     if (s[opEnd] == 0x3a) { opEnd++; }                      // an optional leading ':'
     if (opEnd < p) { opEnd++; }                             // the operator character itself
-    // `#` and `%` double to mean *longest* match rather than shortest, so the pair has to be
-    // taken together — otherwise `${x##a}` reads as operator `#` over the pattern `#a`, which
-    // matches nothing and silently returns the value unchanged.
+    // `#`, `%` and `/` all double, and the pair has to be taken together — otherwise `${x##a}`
+    // reads as operator `#` over the pattern `#a`, which matches nothing and silently returns the
+    // value unchanged. `#` and `%` doubled mean *longest* match rather than shortest; `/` doubled
+    // means *every* match rather than the first.
     if (opEnd < p && opEnd > nameEnd) {
       i32 first = s[opEnd - 1];
-      if ((first == 0x23 || first == 0x25) && s[opEnd] == first) { opEnd++; }
+      if ((first == 0x23 || first == 0x25 || first == 0x2f) && s[opEnd] == first) { opEnd++; }
     }
     word.parts.push(Part.expansion(name, quoted, sliceOf(s, nameEnd, opEnd),
                                    sliceOf(s, opEnd, p)));

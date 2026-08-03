@@ -175,8 +175,9 @@ which matters because the shell runs inside a server that has no way to be inter
 deliberate difference and the only one where this refuses to do what bash does.
 
 **Some parameter expansions are missing.** Implemented: `:-`, `-`, `:=`, `=`, `:+`, `+`, `:?`,
-`?`, `#`, `##`, `%`, `%%` and `${#x}`. Absent: `${x/a/b}` substitution, indirection and the array
-forms.
+`?`, `#`, `##`, `%`, `%%`, `${#x}`, and `/`, `//` with the `/#` and `/%` anchors — including `&` in
+the replacement standing for the matched text, which bash grew in 5.2. Absent: indirection,
+substrings (`${x:1:2}`) and the array forms.
 
 **`2>` is refused rather than approximated.** Only standard output is captured, so there is
 nothing of the error stream to redirect, and saying so beats writing the wrong bytes to the file.
