@@ -122,6 +122,10 @@ export struct Event {
    * The element's own coordinates rather than the page's, because the caller of `drawPixels`
    * thinks in the buffer it drew and would otherwise have to subtract a position it has no way
    * to ask for.
+   *
+   * For a `<canvas>` that means the *backing store*, not the CSS box: one drawn 480 wide and
+   * shown at `width: 100%` reports 0..479 whatever the window is doing. Anything else would make
+   * click-to-zoom land near the click at one window size and visibly wrong at every other.
    */
   i32 x;
   i32 y;

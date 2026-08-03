@@ -115,7 +115,14 @@ export type Target = "deno" | "node" | "browser";
  * leaving a bare TypeError. Opening it with `file://` will not work either, for the same
  * reason plus module workers.
  */
-const PAGE = `<!doctype html>
+/**
+ * The page for a command-line program run in a browser.
+ *
+ * This one is a harness and reads as one: the entry point's name as a heading, and a note about
+ * the query string, because `?a=…` is genuinely how you pass arguments to a `main` here and there
+ * is nowhere else to say so.
+ */
+const PAGE_CLI = `<!doctype html>
 <meta charset="utf-8">
 <title>%TITLE%</title>
 <style>
@@ -126,8 +133,40 @@ const PAGE = `<!doctype html>
 </style>
 <h1>%TITLE%</h1>
 <p class="meta">Arguments come from the query string: <code>?a=first&amp;a=second</code>.</p>
-<!-- What page.render replaces. Above the log rather than instead of it, so an interactive
-     application can still log and be seen, and a non-interactive one leaves it empty. -->
+<div id="app"></div>
+<pre id="out"></pre>
+<script type="module">
+%LAUNCHER%
+</script>
+`;
+
+/**
+ * The page for an interactive application — one that exports \`page\`.
+ *
+ * Bare on purpose. The chrome above is furniture for a harness, and on an application it was
+ * worse than noise: every one of them opened with its own filename as a heading and a sentence
+ * about a query string it never reads. An interactive program owns the document, so it gets an
+ * empty one, and \`render\` may bring its own \`<style>\` — innerHTML applies it.
+ *
+ * The log stays, because \`core.log\` has to go somewhere and a program that warns before it
+ * draws would otherwise do so invisibly. It is empty until something is written to it.
+ */
+const PAGE_APP = `<!doctype html>
+<meta charset="utf-8">
+<title>%TITLE%</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; padding: 0;
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: Canvas; color: CanvasText;
+  }
+  #out { margin: 0; padding: 0 1rem; white-space: pre-wrap; word-break: break-word;
+         font: 13px/1.5 ui-monospace, monospace; }
+  #out:empty { display: none; }
+  .warn { color: #b00; }
+  .meta { opacity: 0.6; }
+</style>
 <div id="app"></div>
 <pre id="out"></pre>
 <script type="module">
@@ -291,7 +330,11 @@ export async function buildApp(
     if (target === "browser") {
       // A page, not an executable: no shebang and no execute bit.
       const title = entry.split("/").pop() ?? "wac";
-      await Deno.writeTextFile(out, PAGE.replaceAll("%TITLE%", title).replace("%LAUNCHER%", launcher));
+      // Which document depends on which entry point the module has. The compiler already told
+      // us: a `page` export is an interactive application and gets the bare one.
+      const interactive = r.compiled.exports.some((e) => e.name === "page");
+      const template = interactive ? PAGE_APP : PAGE_CLI;
+      await Deno.writeTextFile(out, template.replaceAll("%TITLE%", title).replace("%LAUNCHER%", launcher));
       return;
     }
     // Written beside the destination and renamed into place, rather than written where it

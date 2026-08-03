@@ -20,16 +20,46 @@ import { gzipBest } from "../../gzip/src/gzip.wac";
 
 export i32 page(Core core, Cli cli, Page page) {
   page.title("wac: hash and compress").wait();
+  // Styled here rather than by the launcher: an interactive application owns its document, and
+  // `render` sets innerHTML, so a `<style>` in the markup applies. Light and dark both, because
+  // the page has no idea which one the reader is in and `color-scheme` alone only paints chrome.
   page.render(
-    "<p>Type, and watch a compiled SHA-256 and DEFLATE keep up.</p>" +
-    "<textarea id=\"in\" rows=\"6\" style=\"width:100%\" " +
-      "placeholder=\"type here, or paste something long\"></textarea>" +
-    "<table>" +
-    "<tr><td>bytes</td><td><b id=\"len\">0</b></td></tr>" +
-    "<tr><td>sha&#8209;256</td><td><code id=\"sha\"></code></td></tr>" +
-    "<tr><td>gzip</td><td><b id=\"gz\">0</b> bytes <span id=\"ratio\" class=\"meta\"></span></td></tr>" +
-    "<tr><td>took</td><td class=\"meta\"><span id=\"ms\">0</span> ms</td></tr>" +
-    "</table>"
+    "<style>" +
+    "  :root { --ink: #f7f9f9; --slab: #fff; --line: #dbe4e3; --text: #0b1a1d;" +
+    "          --dim: #5b7073; --key: #0e8c78; }" +
+    "  @media (prefers-color-scheme: dark) {" +
+    "    :root { --ink: #0b1416; --slab: #101f23; --line: #1e363c; --text: #dce8e7;" +
+    "            --dim: #8ba3a4; --key: #46d9c0; } }" +
+    "  body { background: var(--ink); color: var(--text); }" +
+    "  #tool { max-width: 46rem; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }" +
+    "  h1 { font-size: 1.35rem; margin: 0 0 .3rem; letter-spacing: -0.02em; }" +
+    "  p.sub { margin: 0 0 1.4rem; color: var(--dim); font-size: .95rem; }" +
+    "  textarea { width: 100%; box-sizing: border-box; min-height: 8.5rem; resize: vertical;" +
+    "             background: var(--slab); color: var(--text); border: 1px solid var(--line);" +
+    "             border-radius: 6px; padding: .8rem; font: 13px/1.6 ui-monospace, monospace; }" +
+    "  textarea:focus { outline: 2px solid var(--key); outline-offset: 1px; }" +
+    "  dl { display: grid; grid-template-columns: max-content 1fr; gap: .55rem 1.1rem;" +
+    "       margin: 1.4rem 0 0; align-items: baseline; }" +
+    "  dt { color: var(--dim); font-size: .78rem; letter-spacing: .09em;" +
+    "       text-transform: uppercase; }" +
+    "  dd { margin: 0; font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }" +
+    "  dd#sha { word-break: break-all; color: var(--key); font-size: .82rem; line-height: 1.5; }" +
+    "  .dim { color: var(--dim); }" +
+    "</style>" +
+    "<div id=\"tool\">" +
+    "  <h1>hash &amp; compress</h1>" +
+    "  <p class=\"sub\">SHA-256 from <code>packages/crypto</code> and DEFLATE from" +
+    "    <code>packages/gzip</code>, both compiled to WebAssembly and neither written for a" +
+    "    browser. Type, and they keep up.</p>" +
+    "  <textarea id=\"in\" spellcheck=\"false\"" +
+    "            placeholder=\"type here, or paste something long\"></textarea>" +
+    "  <dl>" +
+    "    <dt>input</dt><dd><b id=\"len\">0</b> bytes <span id=\"chars\" class=\"dim\"></span></dd>" +
+    "    <dt>sha-256</dt><dd id=\"sha\"></dd>" +
+    "    <dt>gzip</dt><dd><b id=\"gz\">0</b> bytes <span id=\"ratio\" class=\"dim\"></span></dd>" +
+    "    <dt>took</dt><dd class=\"dim\"><span id=\"ms\">0</span> ms</dd>" +
+    "  </dl>" +
+    "</div>"
   ).wait();
   page.on("#in", "input").wait();
 
@@ -51,6 +81,17 @@ void update(Core core, Page page, string text) {
   i64 took = (core.monotonicNanos().wait() - began) / 1000000;
 
   page.setText("len", itoa(bytes.len())).wait();
+  // Characters as well as bytes, because they differ the moment anything is not ASCII — paste an
+  // emoji and this line explains why the byte count jumped further than you expected.
+  //
+  // Counted here rather than asked for: `string.len()` is the *byte* length, which the spec says
+  // plainly and I assumed otherwise for one build — so comparing it with `bytes.len()` could
+  // never differ. Code points are the bytes that are not UTF-8 continuations.
+  i32 chars = 0;
+  for (i32 i = 0; i < bytes.len(); i++) {
+    if ((bytes[i] & 192) != 128) { chars = chars + 1; }
+  }
+  page.setText("chars", chars == bytes.len() ? "" : "(" + itoa(chars) + " characters)").wait();
   page.setText("sha", hex(digest)).wait();
   page.setText("gz", itoa(packed.len())).wait();
   page.setText("ms", itoa(took as~ i32)).wait();

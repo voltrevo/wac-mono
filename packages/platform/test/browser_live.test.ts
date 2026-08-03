@@ -190,11 +190,25 @@ Deno.test({
       // Pixels, a pointer and files — the three that only a browser can answer for.
       await buildApp("packages/platform/example/pixels.wac", `${dir}/pixels.html`, {}, "browser");
       await page.goto(`http://127.0.0.1:${port}/pixels.html`, { waitUntil: "load" });
+      // Wait for the canvas to have been *drawn into*, which is the actual precondition, rather
+      // than for a particular size. Two wrong versions preceded this: pinning `width === 240`
+      // failed as a timeout when the picture was made bigger, and `width > 0` passed instantly
+      // because an undrawn canvas is already 300x150 by default — so the pixel checks below ran
+      // on a blank one and reported zero opaque pixels out of 45,000.
       await page.waitForFunction(
-        "document.getElementById('c') && document.getElementById('c').width === 240",
+        `(() => {
+          const c = document.getElementById("c");
+          if (c === null) return false;
+          const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+          for (let i = 3; i < d.length; i += 4) if (d[i] === 255) return true;
+          return false;
+        })()`,
         null,
         { timeout: 30_000 },
       );
+      const size = await page.evaluate(
+        "({ w: document.getElementById('c').width, h: document.getElementById('c').height })",
+      ) as { w: number; h: number };
 
       // A canvas with real content: every pixel opaque, and more than a handful of colours.
       // A blank buffer would satisfy "a canvas exists" and nothing else here.
@@ -209,25 +223,31 @@ Deno.test({
         }
         return { colours: seen.size, opaque, total: d.length / 4 };
       })()`) as { colours: number; opaque: number; total: number };
-      assertEquals(drawn.total, 240 * 160, "the buffer is the size wac asked for");
+      assertEquals(drawn.total, size.w * size.h, "the buffer is the size wac asked for");
       assertEquals(drawn.opaque, drawn.total, "every pixel was written");
       assertEquals(drawn.colours > 20, true, `only ${drawn.colours} colours — is it blank?`);
 
-      // Pointer coordinates, in the canvas's own pixels. The canvas has a 1px border, so the
-      // page coordinate and the element coordinate differ by one — which is the whole reason
-      // to report `offsetX` rather than something the application would have to correct.
+      // Pointer coordinates, in the canvas's *backing store* — not its CSS box. This canvas is
+      // drawn at one size and displayed at another, so the two differ, and the invariant worth
+      // asserting is the one an application depends on: the middle of the element is the middle
+      // of the buffer it drew. Pinning a literal (it was `x=119`) tested the window size.
       const box = (await page.locator("#c").boundingBox())!;
-      await page.mouse.move(box.x + 120, box.y + 80);
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
       await page.waitForFunction(
-        "document.getElementById('pos').textContent.includes('x=119')",
+        "document.getElementById('pos').textContent.startsWith('x=')",
         null,
         { timeout: 30_000 },
       );
+      const pos = (await page.textContent("#pos")) ?? "";
+      const at = pos.match(/x=(\d+) y=(\d+)/);
+      assertEquals(at !== null, true, pos);
       assertEquals(
-        (await page.textContent("#pos"))?.includes("never (inside)"),
+        Math.abs(Number(at![1]) - size.w / 2) <= 3 && Math.abs(Number(at![2]) - size.h / 2) <= 3,
         true,
-        "the middle of the set never escapes",
+        `the centre of the element should be the centre of the ${size.w}x${size.h} buffer: ${pos}`,
       );
+      // And the centre of the default view is inside the set, so it never escapes.
+      assertEquals(pos.includes("never (inside)"), true, pos);
 
       // A file in and the same file back out, which is one exchange proving both directions.
       const given = `${dir}/given.txt`;

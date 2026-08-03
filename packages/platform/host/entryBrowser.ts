@@ -78,6 +78,7 @@ type El = {
   height?: number;
   files?: { length: number; item(i: number): FileLike | null };
   closest(selector: string): El | null;
+  getBoundingClientRect?(): { width: number; height: number };
   getContext?(kind: string): Ctx | null;
   addEventListener(kind: string, fn: (ev: Ev) => void): void;
 };
@@ -194,12 +195,25 @@ export function pageDom(root: El, doc: Doc, make: MakeDownload): Dom {
           if (hit === null) continue;
           // A form's `submit` would reload the page, which ends the application mid-answer.
           if (kind === "submit") ev.preventDefault();
+          // `offsetX` is in CSS pixels of the element. For a canvas that is not what the
+          // application drew into: a `<canvas width="480">` shown at `width: 100%` reports 0..504
+          // on a wide screen and 0..320 on a phone, while the buffer is always 480 across. The
+          // capability promises the element's *own* pixels, so a canvas gets scaled to its
+          // backing store — without this, click-to-zoom landed near where you clicked at one
+          // window size and visibly wrong at every other, which is the worst kind of nearly.
+          const rect = target.getBoundingClientRect?.();
+          const sx = target.width !== undefined && rect !== undefined && rect.width > 0
+            ? target.width / rect.width
+            : 1;
+          const sy = target.height !== undefined && rect !== undefined && rect.height > 0
+            ? target.height / rect.height
+            : 1;
           deliver({
             kind,
             id: hit.id,
             value: kind === "keydown" ? (ev.key ?? "") : (target.value ?? ""),
-            x: Math.round(ev.offsetX ?? 0),
-            y: Math.round(ev.offsetY ?? 0),
+            x: Math.round((ev.offsetX ?? 0) * sx),
+            y: Math.round((ev.offsetY ?? 0) * sy),
           });
           return;
         }
