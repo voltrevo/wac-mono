@@ -1169,7 +1169,9 @@ u8[] sliceBytes(u8[] b, i32 from, i32 to) {
  * shortest prefix this matches" is not something a glob matcher answers on its own.
  */
 string trimStart(Shell sh, string value, string pattern, bool longest) {
-  u8[] pat = expandText(sh, pattern).toBytes();
+  // `expandQuoted`, because a trim pattern is never subject to word splitting: `${x#a }` has a
+  // trailing space in its pattern and `expandText` tokenizes it away.
+  u8[] pat = expandQuoted(sh, pattern).toBytes();
   u8[] mask = u8[pat.len()]();
   u8[] v = value.toBytes();
   i32 hit = -1;
@@ -1185,9 +1187,133 @@ string trimStart(Shell sh, string value, string pattern, bool longest) {
   return value.slice(hit, value.len());
 }
 
+/**
+ * `${x/pat/rep}` and `${x//pat/rep}` — pattern substitution.
+ *
+ * Three things here are not guessable from the shorter forms:
+ *
+ *   **`#` and `%` immediately after the slash anchor the match** to the start or the end, so
+ *   `${x/#a/Z}` is a prefix replacement and `${x/%a/Z}` a suffix one. That is the only place in
+ *   the shell where those two characters mean *position* rather than *which end to trim*.
+ *
+ *   **`&` in the replacement is the text that matched**, and `\&` is a literal ampersand. bash
+ *   grew this in 5.2 and it is easy to miss, but the oracle here is bash 5.2, so a replacement
+ *   containing `&` has to mean what it means there.
+ *
+ *   **An empty match does not substitute.** Without that rule `${x//*(a)/-}`-shaped patterns
+ *   would either loop for ever or insert the replacement between every character, and bash does
+ *   neither: it leaves the value alone.
+ *
+ * The longest match at each position wins, and matching moves left to right, which together are
+ * what make `${x/a*\/X}` take everything rather than the first `a`.
+ */
+string substitutePattern(Shell sh, string value, string arg, bool all) {
+  u8[] raw = arg.toBytes();
+  // The pattern runs to the first *unescaped* slash, so `${x/\//-}` can replace a slash at all.
+  Buf patBuf = Buf.create();
+  i32 at = 0;
+  bool split = false;
+  while (at < raw.len() && !split) {
+    if (raw[at] == 0x5c && at + 1 < raw.len() && raw[at + 1] == 0x2f) { patBuf.push(0x2f); at += 2; }
+    else if (raw[at] == 0x2f) { split = true; at++; }
+    else { patBuf.push(raw[at]); at++; }
+  }
+  string patText = string.fromBytes(patBuf.bytes());
+  string repText = split ? string.fromBytes(sliceBytes(raw, at, raw.len())) : "";
+
+  bool atStart = false;
+  bool atEnd = false;
+  if (patText.len() > 0) {
+    string head = patText.slice(0, 1);
+    if (head == "#") { atStart = true; patText = patText.slice(1, patText.len()); }
+    else if (head == "%") { atEnd = true; patText = patText.slice(1, patText.len()); }
+  }
+
+  // `expandQuoted` and not `expandText`: neither of these is subject to word splitting, and
+  // `expandText` tokenizes, so a replacement of `[&]` came back as `[ ]` — `&` is a shell
+  // delimiter and got split on. The same argument covers a pattern containing a space.
+  u8[] pat = expandQuoted(sh, patText).toBytes();
+  u8[] mask = u8[pat.len()]();
+  string rep = expandQuoted(sh, repText);
+  u8[] v = value.toBytes();
+  // An empty pattern matches nothing rather than matching everywhere.
+  if (pat.len() == 0) { return value; }
+
+  if (atStart) {
+    i32 end = longestMatchAt(pat, mask, v, 0);
+    if (end <= 0) { return value; }
+    return applyReplacement(rep, sliceBytes(v, 0, end)) + value.slice(end, value.len());
+  }
+  if (atEnd) {
+    // The leftmost start whose match reaches the end, so the match is as long as it can be.
+    for (i32 i = 0; i < v.len(); i++) {
+      if (longestMatchAt(pat, mask, v, i) == v.len()) {
+        return value.slice(0, i) + applyReplacement(rep, sliceBytes(v, i, v.len()));
+      }
+    }
+    return value;
+  }
+
+  Buf out = Buf.create();
+  i32 i = 0;
+  bool more = true;
+  while (i < v.len()) {
+    i32 end = more ? longestMatchAt(pat, mask, v, i) : -1;
+    // `end == i` is an empty match: replacing it would either loop here for ever or put the
+    // replacement between every pair of characters, and bash does neither.
+    if (end > i) {
+      out.pushAll(applyReplacement(rep, sliceBytes(v, i, end)).toBytes());
+      i = end;
+      if (!all) { more = false; }
+    } else {
+      out.push(v[i]);
+      i++;
+    }
+  }
+  return string.fromBytes(out.bytes());
+}
+
+/**
+ * Expand `text` the way the inside of double quotes is expanded: substitutions happen, nothing
+ * splits, and every other character is itself.
+ *
+ * Which is what the pattern and the replacement of a `${x/…/…}` need. `expandText` tokenizes as
+ * the shell would, and inside braces that is wrong — it splits on `&`, on spaces, and on anything
+ * else the tokenizer treats as an operator.
+ */
+string expandQuoted(Shell sh, string text) {
+  if (text == "") { return ""; }
+  Vec<Part> parts = lexQuotedText(text);
+  string out = "";
+  for (i32 i = 0; i < parts.len(); i++) { out = out + expandPart(sh, parts.get(i)); }
+  return out;
+}
+
+/** How far the pattern reaches from `at`, taking the longest, or -1 if it does not match. */
+i32 longestMatchAt(u8[] pat, u8[] mask, u8[] v, i32 at) {
+  for (i32 end = v.len(); end >= at; end--) {
+    if (globMatch(pat, mask, 0, sliceBytes(v, at, end), 0)) { return end; }
+  }
+  return -1;
+}
+
+/** The replacement with `&` standing for what matched, and `\&` for an ampersand. */
+string applyReplacement(string rep, u8[] matched) {
+  u8[] r = rep.toBytes();
+  Buf out = Buf.create();
+  for (i32 i = 0; i < r.len(); i++) {
+    if (r[i] == 0x5c && i + 1 < r.len() && r[i + 1] == 0x26) { out.push(0x26); i++; }
+    else if (r[i] == 0x26) { out.pushAll(matched); }
+    else { out.push(r[i]); }
+  }
+  return string.fromBytes(out.bytes());
+}
+
 /** Remove a matching suffix. `longest` picks `%%` over `%`. */
 string trimEnd(Shell sh, string value, string pattern, bool longest) {
-  u8[] pat = expandText(sh, pattern).toBytes();
+  // `expandQuoted`, because a trim pattern is never subject to word splitting: `${x#a }` has a
+  // trailing space in its pattern and `expandText` tokenizes it away.
+  u8[] pat = expandQuoted(sh, pattern).toBytes();
   u8[] mask = u8[pat.len()]();
   u8[] v = value.toBytes();
   i32 hit = -1;
@@ -1363,6 +1489,10 @@ string expandPart(Shell sh, Part p) {
       if (p.op == "##") { return trimStart(sh, value, p.arg, true); }
       if (p.op == "%") { return trimEnd(sh, value, p.arg, false); }
       if (p.op == "%%") { return trimEnd(sh, value, p.arg, true); }
+
+      // `${x/pat/rep}` replaces the first match, `${x//pat/rep}` every one.
+      if (p.op == "/") { return substitutePattern(sh, value, p.arg, false); }
+      if (p.op == "//") { return substitutePattern(sh, value, p.arg, true); }
 
       if (last == "-") { return absent ? expandText(sh, p.arg) : value; }
       if (last == "+") { return absent ? "" : expandText(sh, p.arg); }
