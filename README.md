@@ -6,46 +6,86 @@ C-family language for WebAssembly GC. One repo so packages can import each other
 Deliberately separate from the wac repo: that one is the language and its
 compiler, this one is things built with it.
 
-## Packages
+## The map
 
-| package | what it is |
-|---|---|
-| [`bytes`](packages/bytes/) | `Buf`, the growable byte buffer both other packages build on |
-| [`fmt`](packages/fmt/) | `f64` to its shortest decimal, matching JavaScript exactly |
-| [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, HMAC, HKDF, ChaCha20-Poly1305, AES-CTR, AES-GCM — checked against WebCrypto, a BigInt reference and the published vectors |
-| [`gzip`](packages/gzip/) | gzip and DEFLATE, both directions — compresses at or under `gzip -6` |
-| [`json`](packages/json/) | JSON parse and serialize, verified against the host's own JSON |
-| [`bignum`](packages/bignum/) | arbitrary-precision integers, semantics identical to `BigInt` |
-| [`url`](packages/url/) | WHATWG URL parsing, serialization and relative resolution |
-| [`codec`](packages/codec/) | base16, base32 and base64 from RFC 4648, strict on decode |
-| [`regex`](packages/regex/) | a backtracking regex engine with JavaScript's semantics |
-| [`datetime`](packages/datetime/) | the proleptic Gregorian calendar and RFC 3339 timestamps |
-| [`http`](packages/http/) | HTTP/1.1 request parsing, strict about framing |
-| [`unicode`](packages/unicode/) | UTF-8 as code points, and simple case mapping |
-| [`stream`](packages/stream/) | run a wac transform as a stream, with the host doing the blocking wac cannot |
-| [`platform`](packages/platform/) | a capability world, so an application can be written **entirely in wac** — no TypeScript of its own |
-| [`zstd`](packages/zstd/) | Zstandard, both directions — 22% smaller than `gzip -6`, within 4% of `zstd -3` |
-| [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) — **not for production**, see its README |
-| [`ssh`](packages/ssh/) | SSH-2 both ways — `ssh` runs commands on OpenSSH, `sshd` serves OpenSSH's client |
-| [`sh`](packages/sh/) | a shell — quoting, expansion, pipelines and redirection, checked against bash |
-| [`wacc`](packages/wacc/) | the wac compiler, in wac, so it can eventually compile itself |
-| [`server`](packages/server/) | an HTTP server in wac — the packages, composed and running |
-| [`std`](packages/std/) | `Vec<T>`, `Map<K, V>`, `Option<T>`, `Result<T, E>` — the containers generics made writable |
-| [`wactest`](packages/wactest/) | assertions for writing tests in wac |
+**[MAP.md](MAP.md)** is the bird's-eye view: every package with its size, its tests and what
+it builds on, and every program and page you can build, each with a line on what it does. It
+is generated from the tree by `deno task map` and checked by the suite, so it cannot drift.
+
+Today: **24 packages, 40,917 lines of wac, 896 tests, 20 command-line programs and 4 browser
+pages.** Those numbers are in MAP.md too, and that copy is the one that stays true.
+
+## What is actually in here
+
+The libraries are the boring half and the reason the rest exists — `bytes`, `std`, `fmt`,
+`unicode`, `codec`, `json`, `url`, `regex`, `datetime`, `http`, `bignum`. Each is checked
+against something outside itself: JSON against the host's own parser, `fmt` over 500k doubles
+in both directions, `url` against WHATWG's test suite, `bignum` against `BigInt`.
+
+What they add up to is more interesting:
+
+**`box` — a busybox.** Fifty-nine applets in one program, chosen by the first argument, each
+differential-tested against the real tool where one exists. `cat`, `grep`, `sort`, `gzip`,
+`sha256sum`, `tar`, `diff`, `httpd`, `nc`. It streams: 300MB through `wc` peaks at 94MB of RSS.
+
+```sh
+deno task app:build packages/box/src/box.wac --allow-read --allow-write --allow-net -o box
+./box tar somedir | ./box gzip > out.tgz     # and GNU tar extracts it
+```
+
+**`sh` — a shell**, checked against GNU bash script for script: quoting, expansion, command
+substitution, arithmetic, pipelines, redirection, `if`/`while`/`for`/`case`, functions,
+subshells, globbing.
+
+**`ssh` — both ends.** `ssh` runs commands on a real OpenSSH server; `sshd` serves OpenSSH's
+own client, hosting the shell above. Curve25519, Ed25519, chacha20-poly1305, `known_hosts`,
+encrypted private keys.
+
+**`tls` — TLS 1.3**, interoperating with OpenSSL and rustls. **`tor`** is a Tor client on top
+of it, with a SOCKS5 proxy. **`crypto`** is what they stand on: SHA-2, SHA-3, HMAC, HKDF,
+AES-GCM, ChaCha20-Poly1305, X25519, Ed25519, P-256, P-384, RSA verification, ML-KEM-768 — all
+in wac, all against published vectors.
+
+**`gzip` and `zstd`** compress at or under the reference tools. **`wacc`** is the wac compiler
+being ported to wac, so it can eventually compile itself.
+
+**`platform` — a capability world**, and the reason a wac program can be an *application*
+rather than a library. Two structs say everything a program may do, because wac has no ambient
+access and there is nowhere else to reach. Files, sockets, spawning other wac programs with
+grants narrower than your own, deadlines, and a browser target.
+
+## In a browser
+
+The same compiled wac runs in a page: a worker for the program, the page's own thread for the
+capabilities, and `SharedArrayBuffer` between them.
+
+```sh
+deno task app:build packages/box/example/term.wac --target browser --allow-read --allow-write -o page/index.html
+./box httpd -8080 page -x        # -x sends the two isolation headers a page needs
+```
+
+That one is **`packages/sh` in a browser tab** — pipelines, loops, redirection into a
+filesystem that survives a reload — with the shell unchanged. `box/example/hash.wac` hashes and
+compresses as you type, with `crypto` and `gzip` unchanged. `platform/example/pixels.wac` is a
+Mandelbrot set recomputed on every zoom, with the escape count under the pointer and a dropped
+file handed straight back.
 
 ## Layout
 
 ```
 deno.json          import map + tasks; the only config
+MAP.md             generated: every package, program and page — `deno task map`
 harness/           TypeScript for driving the compiler
   wacFiles.ts        read an entry file and its transitive imports
   wacBind.ts         compile -> bindgen -> importable JS module
   wacTestRun.ts      run wac-written tests as Deno tests
   wacCoverage.ts     instrument an entry point and report branch coverage
-tools/             check.ts, validate.ts, coverage.ts, mutate.ts, mutate/
+tools/             check.ts, validate.ts, coverage.ts, mutate.ts, map.ts, push.sh
 issues/            bug reports and cross-cutting tasks; see issues/README.md
 packages/<name>/
   src/               wac source
+  src/bin/           optional: applets built as standalone programs
+  example/           optional: runnable programs and browser pages
   test/              host-side tests (.test.ts)
   test/wac/          tests written in wac (*_test.wac)
   cov.ts             optional: drives this package's branch coverage
@@ -75,6 +115,9 @@ deno task wac:pin         # record the sibling wac checkout as the minimum this 
 deno task app <entry.wac> --allow-read -- args   # run a wac application
 deno task app:build <entry.wac> --allow-read -o wc   # ...or build one executable; then: ./wc FILE
 deno task app:build <entry.wac> --target node -o wc  # ...for Node instead of Deno
+deno task app:build <entry.wac> --target browser -o page/index.html  # ...or a browser page
+deno task app:build <entry.wac> --worker -o child.worker.js  # ...or something `spawn` can run
+deno task map             # regenerate MAP.md; the suite fails if it is stale
 deno task coverage        # branch coverage of every package, from its wac-native tests
 deno task coverage:bignum # ...and the host-driven exercises, per package
 deno task coverage:bytes
@@ -100,7 +143,12 @@ deno task verify:fmt      # fmt exactness over 500k doubles, both directions
 
 deno run --allow-read tools/check.ts <entry.wac>    # type-check one file, no run
 deno run -A tools/validate.ts <entry.wac>          # ...and check the wasm validates
+tools/push.sh             # run the suite, then push only if it passed
 ```
+
+`deno task test` skips one test: the browser target running in an actual browser, which needs
+Chromium installed and `deno test -A`. `packages/platform/test/browser_live.test.ts` says how
+in three commands, and skips in milliseconds without them.
 
 ## Keeping the compiler pin current
 

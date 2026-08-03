@@ -32,9 +32,40 @@ export type Profile = {
   /** Test name to the file that defines it, for building the run command. */
   home: Map<string, string>;
   testFiles: string[];
+  /**
+   * How long each test file took, in milliseconds, measured while profiling.
+   *
+   * Free to collect — the profile already runs every file once, on its own — and it is what
+   * lets the runner put the cheap files first. With `--fail-fast`, the order decides how much
+   * of a scope a killed mutant actually pays for, and Deno's own discovery order is
+   * alphabetical, which in `packages/ssh` puts the one in-process suite behind two that each
+   * spawn a real OpenSSH client.
+   */
+  cost: Map<string, number>;
 };
 
 type Raw = { entry: string; all: string[]; tests: Record<string, string[]> };
+
+/**
+ * Test files cheapest first, so `--fail-fast` stops early as often as possible.
+ *
+ * Ordering only ever changes *when* a verdict is reached, never what it is: a killed mutant is
+ * killed by whichever test notices, and every file still runs when nothing does. That is what
+ * makes this safe where narrowing is not — under-selection is a wrong answer, a bad order is
+ * only a slow one.
+ *
+ * An unmeasured file sorts last rather than first. If the profile never ran it, the honest
+ * assumption is that it is the expensive or awkward one.
+ */
+export function byCost(files: string[], profile: Profile | undefined): string[] {
+  const sorted = [...files].sort();
+  if (profile === undefined) return sorted;
+  return sorted.sort((a, b) => {
+    const ca = profile.cost.get(a) ?? Number.POSITIVE_INFINITY;
+    const cb = profile.cost.get(b) ?? Number.POSITIVE_INFINITY;
+    return ca === cb ? a.localeCompare(b) : ca - cb;
+  });
+}
 
 /** Every test file under the given package directories. */
 export async function testFilesIn(dirs: string[]): Promise<string[]> {
@@ -67,8 +98,10 @@ export async function buildProfile(
   log: (s: string) => void,
 ): Promise<Profile> {
   const dir = await Deno.makeTempDir({ prefix: "wac-profile-" });
+  const cost = new Map<string, number>();
   try {
     for (const f of testFiles) {
+      const began = performance.now();
       const cmd = new Deno.Command("deno", {
         args: ["test", "--no-check", "--allow-read", "--allow-write", "--allow-run",
                "--allow-net", "--allow-env", "--quiet", f],
@@ -78,6 +111,9 @@ export async function buildProfile(
         stderr: "piped",
       });
       const { code } = await cmd.output();
+      // Timed even when it fails: a file that dies early is cheap, and ordering it first costs
+      // nothing. The number is only ever used to sort.
+      cost.set(f, performance.now() - began);
       // A file that fails while profiling still contributes whatever it covered before
       // it failed. The baseline check is what decides whether a red suite is usable; this
       // is only attribution.
@@ -102,7 +138,7 @@ export async function buildProfile(
         }
       }
     }
-    return { lines, known, home, testFiles };
+    return { lines, known, home, testFiles, cost };
   } finally {
     await Deno.remove(dir, { recursive: true }).catch(() => {});
   }

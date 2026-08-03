@@ -43,7 +43,7 @@ import { wacFiles, wacFilesIn } from "../harness/wacFiles.ts";
 import { CURATED } from "./mutate/curated.ts";
 import { KNOWN_SURVIVORS } from "./mutate/known.ts";
 import {
-  buildProfile, filterFor, selectTests, testFilesIn, type Profile,
+  buildProfile, byCost, filterFor, selectTests, testFilesIn, type Profile,
 } from "./mutate/profile.ts";
 import { ALL_OPERATORS, generate, type OperatorName } from "./mutate/operators.ts";
 import { applyEdits, packagesOf, type Curated, type Edit, type Mutant } from "./mutate/types.ts";
@@ -507,6 +507,35 @@ try {
       `${profile.known.size} covered line(s)`);
   }
 
+  // ── Cheapest first, so `--fail-fast` stops early ──────────────────────────
+  //
+  // One entry per distinct scope, built once rather than per mutant. Passing the files instead of
+  // the directory is the whole change: `deno test <dir>` discovers them itself, alphabetically,
+  // and alphabetical is not correlated with cost. In `packages/ssh` it is close to the worst
+  // order available — `cli` and `server` each spawn a real OpenSSH client, `transport` is
+  // in-process, and `transport` sorts last.
+  //
+  // Ordering can only change how long a verdict takes, never what it is. Every file still runs
+  // when nothing fails, and a mutant killed by the last file is killed either way.
+  const scopeFiles = new Map<string, string[]>();
+  {
+    const scopes = new Set(measurable.map((t) => testDirs(t.mutant).join(" ")));
+    for (const key of scopes) {
+      const dirs = key.split(" ").filter(Boolean);
+      if (dirs.length === 0) continue;
+      const abs = await testFilesIn(dirs.map((d) => `${workDirs[0]}/${d}`));
+      const rel = abs.map((f) => f.slice(workDirs[0].length + 1));
+      if (rel.length > 0) scopeFiles.set(key, byCost(rel, profile ?? undefined));
+    }
+    if (profile) {
+      const shown = [...scopeFiles.values()][0] ?? [];
+      if (shown.length > 1) {
+        const ms = (f: string) => Math.round(profile!.cost.get(f) ?? 0);
+        console.log(`  order: ${shown.map((f) => `${f.split("/").pop()} ${ms(f)}ms`).join(" -> ")}`);
+      }
+    }
+  }
+
   let next = 0;
   const worker = async (work: string) => {
     while (true) {
@@ -522,7 +551,12 @@ try {
       // Narrow to the tests that actually execute the mutated lines, when the profile
       // knows them. `null` means it does not, and the full scope runs — see profile.ts
       // for why that fallback is the safe direction.
-      let runDirs = dirs;
+      //
+      // The fallback is not the whole scope in *discovery* order any more. Handing `deno test` a
+      // directory lets it choose, and it chooses alphabetically, so the cheap in-process suites
+      // end up behind the ones that spawn real clients. `--fail-fast` only pays when the killer
+      // runs early, so the same files go in cheapest-first instead.
+      let runDirs = scopeFiles.get(dirs.join(" ")) ?? dirs;
       let filter: string | undefined;
       let notCovered = false;
       if (profile) {
@@ -535,7 +569,7 @@ try {
           } else {
             const f = filterFor(picked);
             const files = [...new Set(picked.map((t) => profile!.home.get(t)!))].sort();
-            if (f && files.every(Boolean)) { filter = f; runDirs = files; narrowed++; }
+            if (f && files.every(Boolean)) { filter = f; runDirs = byCost(files, profile); narrowed++; }
             else widened++;
           }
         }
