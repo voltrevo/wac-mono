@@ -1442,3 +1442,56 @@ Deno.test("the refusal messages are laid out as the RFC says, byte for byte", ()
     throw new Error(`byApplication: expected 11, got ${mod.sshByApplication()}`);
   }
 });
+
+Deno.test("a key whose two public halves disagree is refused, not carried out", async () => {
+  // An OpenSSH private key states its public key *twice*: once in the outer envelope and again
+  // inside the private section. Every other field here was validated and the outer blob was not,
+  // so a file where the two disagree parsed cleanly — and `sshd.wac`'s `hostPublicPoint`, which
+  // slices the last 32 bytes of that blob, then trapped on a short one. A crafted or corrupt host
+  // key crashed the server at startup instead of being reported.
+  //
+  // Found by following a surviving `trap;` mutant rather than by reading the parser, which is the
+  // argument for mutation testing in one line: the trap was flagged as untested, and the reason
+  // it was untested is that nothing could reach it *through a valid file*.
+  const dir = await Deno.makeTempDir({ prefix: "wac-badkey-" });
+  try {
+    const path = `${dir}/k`;
+    await new Deno.Command("ssh-keygen", {
+      args: ["-t", "ed25519", "-f", path, "-N", "", "-q"],
+    }).output();
+    const pem = await Deno.readTextFile(path);
+
+    // Decode the base64 body, then rewrite the outer public-key string to something short. Every
+    // field is length-prefixed, so shortening one keeps the rest parseable — which is exactly why
+    // the file used to survive parsing.
+    const b64 = pem.split("\n").filter((l) => !l.startsWith("-----")).join("");
+    const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const view = new DataView(raw.buffer);
+    let at = "openssh-key-v1\0".length;
+    const skip = () => { const n = view.getUint32(at); at += 4 + n; };
+    skip(); skip(); skip();          // ciphername, kdfname, kdfoptions
+    at += 4;                          // keycount
+    const pubAt = at;
+    const pubLen = view.getUint32(pubAt);
+
+    const short = new Uint8Array(4 + 8);
+    new DataView(short.buffer).setUint32(0, 8);
+    const mangled = new Uint8Array(raw.length - (4 + pubLen) + short.length);
+    mangled.set(raw.subarray(0, pubAt), 0);
+    mangled.set(short, pubAt);
+    mangled.set(raw.subarray(pubAt + 4 + pubLen), pubAt + short.length);
+
+    const body = btoa(String.fromCharCode(...mangled)).match(/.{1,70}/g)!.join("\n");
+    const bad = `-----BEGIN OPENSSH PRIVATE KEY-----\n${body}\n-----END OPENSSH PRIVATE KEY-----\n`;
+
+    // 3 is Malformed. Anything else means it was accepted, and an accepted one traps later.
+    const got = mod.sshReadKeyStatus(bytes(bad), new Uint8Array(0));
+    if (got !== 3) throw new Error(`a mangled public blob gave status ${got}, want 3 (malformed)`);
+
+    // And the untouched key still reads, so the new check is not refusing everything.
+    const good = mod.sshReadKeyStatus(bytes(pem), new Uint8Array(0));
+    if (good !== 0) throw new Error(`the real key now gives status ${good}, want 0`);
+  } finally {
+    await Deno.remove(dir, { recursive: true }).catch(() => {});
+  }
+});
