@@ -122,7 +122,7 @@ input and a path selects that file; `readChunk` pulls up to 64K and answers empt
 end.
 
 There is one *current input* rather than a handle per file, and that is forced rather than
-chosen: wac has no closures, so nothing can carry a handle into the `fn[u8[]()]` a
+chosen: the transforms take `fn[u8[]()]`, which has no parameter to carry a handle into. A
 transform expects. The state has to live somewhere and the world is the honest place for
 it.
 
@@ -145,7 +145,7 @@ still buffer because `packages/crypto` hashes a whole message — an incremental
 is the next thing worth having.
 
 **Sockets are handles, not a current-socket.** `openInput` and `openOutput` are
-one-at-a-time because the wac side has no closures to carry a handle into the `fn[u8[]()]`
+one-at-a-time because the transforms take `fn[u8[]()]`, which has no parameter to carry a
 a transform expects; an `i32` in a struct has no such problem, and a server needs a
 listener and a connection open at the same time, so a current-socket could not express it.
 
@@ -200,7 +200,7 @@ something no program will overlap. `readChunk` and `write` stay blocking because
 on the *current* stream, which the world keeps in order anyway, and because they are handed
 to this repo's streaming transforms as bare function references —
 `gzipStream(cli.readChunk, cli.write)` wants `fn[u8[]()]` and `fn[bool(u8[])]`. A
-ticket-returning capability does not match those, and wac has no closures, so there would
+ticket-returning capability does not match those, and `fn[u8[]()]` has no parameter, so
 be no adapter to write.
 
 The rule that fell out: the capabilities worth a ticket are the ones that **name their

@@ -37,10 +37,20 @@
  * program watches two sockets at once, and is the only reason `nc`, an SSH relay and a
  * shell were not writable before.
  *
- * **The ticket carries its own resolver.** A struct method cannot reach the `Cli` it came
- * from — wac has no closures and no ambient anything — so whatever `.wait()` calls has to
- * be inside the ticket. That is what the three funcref fields are, and why they are not an
- * implementation detail that could be hidden.
+ * **The ticket carries its own resolver, and an `id` rather than a closure.** The reason is
+ * the host boundary, not the language: a JS closure is not a wasm function, so bindgen
+ * registers one wasm function per host function and only *sixteen per signature* can be
+ * live at once — see `spec/spec/bindgen.md`. A resolver closed over its own answer would
+ * burn a slot per call and die on the seventeenth outstanding read. So one resolver is
+ * registered per signature and the `id` selects which call it is for.
+ *
+ * This comment used to say "wac has no closures, so whatever `.wait()` calls has to be
+ * inside the ticket". The first half is true and the second does not follow — context can
+ * travel *beside* a funcref, as an unbound method reference with the receiver as its first
+ * parameter (`[§wac-fnref-method-h9pd3wn]`; only the *bound* form `c.inc` is refused, at
+ * `[§wac-fnref-nocapture-j4wk8pm]`). Read as written it says callbacks cannot carry
+ * context in wac, which cost agent-b an hour of threading it by hand. Corrected on their
+ * report.
  *
  * A ticket is good once. Waiting on a spent one is an error rather than a plausible wrong
  * answer, because the slot underneath is reused and its generation has moved on.
@@ -144,7 +154,9 @@ export struct Stat {
  * A socket, or why there isn't one.
  *
  * A handle rather than a current-socket, unlike `openInput` and `openOutput`. Those are
- * one-at-a-time because the wac side has no closures to carry a handle *into a funcref*;
+ * one-at-a-time because the transforms take `fn[u8[]()]`, which has no parameter to
+ * carry a handle *in* — not because wac cannot pass context beside a funcref, which it
+ * can;
  * an `i32` in a struct has no such problem, and a server needs a listener and a
  * connection open at the same time, so a current-socket could not express it.
  */
@@ -170,7 +182,7 @@ export struct Cli {
    * Answers with whether the write succeeded, which most callers discard. The type is not
    * for them: `fn[bool(u8[])]` is the shape every streaming transform in this repo takes
    * for its sink, so `write` can be handed to one directly instead of through an adapter
-   * — and wac has no closures, so an adapter is not a thing that could have been written.
+   * — and `fn[bool(u8[])]` has no spare parameter, so an adapter has nowhere to keep one.
    */
   fn[bool(u8[])] write;
 
@@ -208,10 +220,14 @@ export struct Cli {
    *
    * `openInput("")` selects standard input, which is also where a program starts, so an
    * applet that only ever filters need not call it at all. A path selects that file
-   * instead, and the previous source is closed. There is one current input rather than a
-   * handle per file, because a program with no closures cannot carry a handle into the
-   * `fn[u8[]()]` a transform wants — the state has to live somewhere, and the world is
-   * the honest place for it.
+   * instead, and the previous source is closed.
+   *
+   * There is one current input rather than a handle per file because the transforms take
+   * `fn[u8[]()]`, which has no parameter to carry a handle in. That is a choice in those
+   * packages, not a limit of the language — wac can pass context beside a funcref, and a
+   * transform taking `fn[u8[](i32)]` could be handed a real file handle. Worth knowing
+   * before anyone repeats the design: `recv(handle)` is what it looks like done that way,
+   * and standard input has a handle now precisely so `waitAny` can watch it.
    *
    * `readChunk` answers with an empty array at end of input, and with at most
    * `CHUNK` bytes otherwise. A short chunk does not mean the end.
@@ -232,8 +248,13 @@ export struct Cli {
    * `readChunk`s in flight is not a faster read, it is an undefined one. And they are
    * passed as bare function references to the streaming transforms in this repo —
    * `gzipStream(cli.readChunk, cli.write)` — which expect `fn[u8[]()]` and `fn[bool(u8[])]`.
-   * A ticket-returning capability does not match those, and wac has no closures, so there
-   * would be no adapter to write.
+   * A ticket-returning capability does not match those, and `fn[u8[]()]` takes no
+   * parameter, so there is nowhere for an adapter to carry a ticket either.
+   *
+   * Note what that does *not* say. Context can travel beside a funcref in wac, as an
+   * unbound method reference — `fn[u8[](Reader)]` would work fine. What forbids it here is
+   * the transforms' own signature, which is a choice in `packages/gzip` and
+   * `packages/stream` rather than anything about the language.
    *
    * The capabilities worth a ticket are the ones that *name their target*: `readFile(path)`,
    * `stat(path)`, `recv(handle)`, `connect(host)`. Those are the ones a program has reason

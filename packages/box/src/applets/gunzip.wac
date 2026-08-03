@@ -2,8 +2,12 @@
 //
 // The whole applet is one call. `gunzipStream` wants `fn[u8[]()]` and `fn[bool(u8[])]`, which
 // is exactly what `readChunk` and `write` are — so the capabilities are handed over
-// directly. wac has no closures, so if the shapes had not matched there would have been no
-// adapter to write; that they do is why these signatures are what they are.
+// directly. `fn[u8[]()]` has no parameter, so an adapter would have nowhere to keep a
+// ticket or a handle — which is why those two capabilities stayed blocking rather than
+// joining the rest on the ticket surface.
+//
+// wac *can* carry context beside a funcref, as an unbound method reference. It is this
+// signature that has no room for it, not the language.
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
