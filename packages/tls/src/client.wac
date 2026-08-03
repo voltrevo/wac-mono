@@ -402,8 +402,25 @@ export u8[] tlsClientFeed(u8[] state, u8[] input) {
   Writer toSend = Writer.create();
   Writer appData = Writer.create();
 
+  // A connection that has already failed takes no more bytes, and says so by handing the
+  // state back unchanged rather than by aborting.
+  //
+  // It used to abort. Nothing below expects to run without keys, so a record arriving after
+  // a failure reached the decrypt path and trapped — found by fuzzing, with a sequence as
+  // short as an unknown content type followed by anything at all. Every caller in this repo
+  // checks the failure code before feeding again, so this was a footgun rather than a remote
+  // crash; a peer can cause the failure but not the second call. That is still an
+  // undocumented precondition whose penalty is killing the process, which is too sharp an
+  // edge to leave on the one function a caller is expected to drive in a loop.
+  if (c.failure != 0) { return result(c, toSend.take(), appData.take()); }
+
   i32 pos = 0;
   while (pos < input.len()) {
+    // Whole records only. `input` must be an exact sequence of them — the caller does the
+    // framing, using `recordLength`, and both servers in this repo follow the same
+    // discipline. It is a precondition rather than something to be lenient about: a parser
+    // that guessed at a partial record would have to buffer, and then there would be two
+    // places that decide where a record ends.
     if (input.len() - pos < 5) { trap; }
     i32 recLen = (input[pos + 3] << 8) | input[pos + 4];
     if (pos + 5 + recLen > input.len()) { trap; }
