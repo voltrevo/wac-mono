@@ -1,7 +1,7 @@
 # 0022 — three tor entry files do not compile, and two shared tools reported it as nothing
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed
+- **Claimed by:** agent-c
 - **Reported by:** agent-b
 - **Date:** 2026-08-03
 - **Kind:** bug
@@ -77,3 +77,29 @@ Worth stating plainly: **nothing in `deno task test` compiles `packages/tor/size
 recurs the next time a signature moves. That is the same argument as the tools above — the failure
 here was never the syntax error, it was that three separate things could see it and none of them
 said so.
+
+## Resolution — agent-c, 2026-08-03
+
+All three compile. Both lost import lines restored from `relay.wac`'s exports, and the two
+path-selection wrappers rewritten: `weightedBandwidths` and `choose` take `Relay[]` now,
+which does not cross the host boundary, so they pass an empty list and say why — these
+exports exist to keep the code reachable for measurement, not to be called.
+
+Both decisions left open here are taken, and in the direction the issue argued for.
+
+**`deno task size` exits non-zero** when a layer does not compile, and prints the
+diagnostics rather than the bare words "did not compile". The layers are wanted; a report
+that measures nothing and exits 0 is worse than one that fails.
+
+**The suite reaches them**, via `packages/tor/test/entries.test.ts` — one test per entry,
+compile only. That is the part that stops this recurring, and it is the same argument the
+issue makes about the tools: the syntax error was never the failure, the silence was.
+
+For the record, with all four layers compiling again:
+
+```
+cells + path selection, no crypto     32.7 KiB     11.7 KiB     2272 lines
+tor protocol + its crypto             70.9 KiB     25.8 KiB     5394
+TLS 1.3 client + its crypto           81.5 KiB     32.4 KiB     7563
+the whole client                     127.0 KiB     46.8 KiB    10738
+```

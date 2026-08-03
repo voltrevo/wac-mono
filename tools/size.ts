@@ -32,10 +32,18 @@ console.log(
   "layer".padEnd(36) + "     wasm     gzipped     lines    compile",
 );
 console.log("-".repeat(76));
+const broken: string[] = [];
 for (const [entry, label] of TARGETS) {
   const warm = await wacCompile(await wacFiles(entry) as never, entry) as Compiled;
   if (!warm.ok || warm.compiled === undefined) {
+    // Loudly, and non-zero at the end. A size report that prints "did not compile" and
+    // exits 0 is green to everything that checks exit codes while measuring nothing —
+    // three of these four layers were broken for some time and this is what said so.
     console.log(`${label.padEnd(36)}  did not compile`);
+    for (const d of warm.diagnostics ?? []) {
+      console.log(`    ${d.file}:${d.line}:${d.col} [${d.phase}] ${d.message}`);
+    }
+    broken.push(entry);
     continue;
   }
 
@@ -61,4 +69,10 @@ for (const [entry, label] of TARGETS) {
     `${String(lines).padStart(10)}` +
     `${times[2].toFixed(0).padStart(9)} ms`,
   );
+}
+
+if (broken.length > 0) {
+  console.error(`\n${broken.length} of ${TARGETS.length} layers did not compile:`);
+  for (const b of broken) console.error(`  ${b}`);
+  Deno.exit(1);
 }

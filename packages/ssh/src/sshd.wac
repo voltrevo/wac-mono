@@ -44,7 +44,7 @@ import { AuthRequest, authFailure, authSuccess, channelClose, channelData, chann
          pkOk,
          channelFailure, channelStderr, channelSuccess, ecdhReply, ephemeralPublic, exchangeHash, execCommand,
          exitStatus, hostKeyBlob, openConfirmation, openFailure, parseAuthRequest, parseEcdhInit,
-         requestWantsReply,
+         readOpenChannel, requestWantsReply,
          requestName, serverProposal, serviceAccept, sharedSecret, verifyAuth,
          byApplication, disconnect } from "./server.wac";
 
@@ -445,22 +445,6 @@ Result interactiveSession(Conn conn, Cli cli, Core core, i32 channel) {
 }
 
 /** The client's channel number out of a CHANNEL_OPEN for a session, or -1. */
-i32 readOpenChannel(u8[] payload) {
-  Incoming m = parse(payload);
-  if (!m.ok || m.kind != msgChannelOpen()) { return -1; }
-  // `parse` puts the *type* string first for an open, so the channel number needs reading past
-  // it — the one message where the recipient field is not immediately after the message number.
-  i32 typeLen = (payload[1] << 24) | (payload[2] << 16) | (payload[3] << 8) | payload[4];
-  if (typeLen < 0 || 5 + typeLen + 4 > payload.len()) { return -1; }
-  if (typeLen != 7) { return -1; }                       // "session" and nothing else
-  const u8[] SESSION = u8[](0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e);
-  for (i32 i = 0; i < 7; i++) {
-    if (payload[5 + i] != SESSION[i]) { return -1; }
-  }
-  i32 at = 5 + typeLen;
-  return (payload[at] << 24) | (payload[at + 1] << 16) | (payload[at + 2] << 8) | payload[at + 3];
-}
-
 struct Result {
   u8[] out;
   u8[] err;

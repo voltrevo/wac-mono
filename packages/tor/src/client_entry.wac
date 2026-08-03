@@ -10,11 +10,13 @@ import { encodeFixed, encodeVar, cellSize, cellCommand, cellCircId, cellPayload,
          encodeVersions, negotiateVersion, encodeNetinfo, encodeCreate2, decodeCreated2,
          certsCount, encodePaddingNegotiate, encodePadding } from "./cell.wac";
 import { ntorClientRequest, ntorClientFinish } from "./ntor.wac";
+import { encryptRelay, decryptRelay, relayRecognized,
          relayCommand, relayStreamId, relayPayload, beginBody, extend2Body, extended2Reply,
          sendmeBodyV1, endReason } from "./relay.wac";
 import { signedLength, signedDigest, keyFingerprint, rsaModulus, rsaExponent,
          verifyDocumentSignature, verifyKeyCertification } from "./consensus.wac";
 import { weightedBandwidths, choose, portPermitted } from "./pathsel.wac";
+import { Relay } from "./directory.wac";
 
 // TLS
 export u8[] tlsInit(u8[] h, u8[] roots, i32[] offs, u8[] e, u8[] p, u8[] k, u8[] r, i64 now) {
@@ -70,10 +72,14 @@ export bool torVerifySignature(u8[] d, bool s, u8[] k, u8[] g) {
 export bool torVerifyCert(u8[] c, u8[] i, u8[] s) { return verifyKeyCertification(c, i, s); }
 
 // Path selection
-export i64[] torWeights(i64[] b, bool[] g, bool[] e, i32 p, i64[] w) {
-  return weightedBandwidths(b, g, e, p, w);
+//
+// `weightedBandwidths` and `choose` take `Relay[]`, which does not cross the host boundary —
+// these exist to keep the code reachable so it is counted, not to be called. An empty relay
+// list is enough for that and says so.
+export i32 torWeights(i32 p, i64[] w) {
+  return weightedBandwidths(Relay[0](), p, w).len();
 }
-export i32 torChoose(i64[] w, i32[] c, u8[] a, i32[] fs, i32[] fo, bool s, i64 r) {
-  return choose(w, c, a, fs, fo, s, r);
+export i32 torChoose(i64[] w, i32[] c, i32[] fs, i32[] fo, bool s, i64 r) {
+  return choose(Relay[0](), w, c, fs, fo, s, r);
 }
 export bool torPortPermitted(bool a, i32[] r, i32 p) { return portPermitted(a, r, p); }

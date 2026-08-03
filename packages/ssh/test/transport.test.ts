@@ -12,6 +12,7 @@ import { freePort, haveSshd, type Server, startServer, stopServer } from "./serv
 const mod = await wacBind("packages/ssh/test/wac/probe.wac") as unknown as {
   sshMessageNumbers(): Int32Array;
   sshServerChannelFailure(channel: number): Uint8Array;
+  sshServerReadOpenChannel(payload: Uint8Array): number;
   sshServerDisconnect(reason: number, description: Uint8Array): Uint8Array;
   sshServerOpenFailure(channel: number, reason: number, description: Uint8Array): Uint8Array;
   sshByApplication(): number;
@@ -1493,5 +1494,58 @@ Deno.test("a key whose two public halves disagree is refused, not carried out", 
     if (good !== 0) throw new Error(`the real key now gives status ${good}, want 0`);
   } finally {
     await Deno.remove(dir, { recursive: true }).catch(() => {});
+  }
+});
+
+Deno.test("a channel open is read for its number, whatever the number is", () => {
+  // This survived mutation testing as `return 0`, and the reason is worth keeping: OpenSSH's
+  // first channel *is* zero, so the only witness the suite had always agreed with the constant.
+  // A parser whose every test supplies the same answer is not being tested.
+  //
+  // SSH_MSG_CHANNEL_OPEN, RFC 4254 §5.1: byte 90, string channel type, uint32 sender channel,
+  // uint32 initial window, uint32 maximum packet size. Note the sender's number comes *after* the
+  // type string, which is the one message where it is not immediately after the byte — reading it
+  // at a fixed offset is the mistake this function exists to avoid.
+  const open = (type: string, channel: number) => {
+    const t = new TextEncoder().encode(type);
+    const b = new Uint8Array(1 + 4 + t.length + 12);
+    const v = new DataView(b.buffer);
+    b[0] = 90;
+    v.setUint32(1, t.length);
+    b.set(t, 5);
+    v.setUint32(5 + t.length, channel);
+    v.setUint32(5 + t.length + 4, 2 * 1024 * 1024);
+    v.setUint32(5 + t.length + 8, 32768);
+    return b;
+  };
+
+  for (const n of [0, 1, 7, 258, 0x7fffffff]) {
+    const got = mod.sshServerReadOpenChannel(open("session", n));
+    if (got !== n) throw new Error(`session channel ${n}: read back ${got}`);
+  }
+
+  // Anything that is not a session is refused rather than served on a guessed channel.
+  for (const bad of ["x11", "direct-tcpip", "", "sessionx", "sessio"]) {
+    const got = mod.sshServerReadOpenChannel(open(bad, 3));
+    if (got !== -1) throw new Error(`channel type ${JSON.stringify(bad)}: got ${got}, want -1`);
+  }
+
+  // Truncated so the *channel number itself* is incomplete. Cutting less than that is not a
+  // truncation as far as this function is concerned: it needs `5 + typeLen + 4` bytes and reads
+  // nothing beyond them, so lopping off the window and max-packet fields is legitimately fine.
+  // My first version of this case cut two bytes and asserted -1, which failed for that reason —
+  // the test was wrong, not the parser.
+  const full = open("session", 5);
+  if (mod.sshServerReadOpenChannel(full.subarray(0, 15)) !== -1) {
+    throw new Error("an open with an incomplete channel number was read anyway");
+  }
+  if (mod.sshServerReadOpenChannel(full.subarray(0, 16)) !== 5) {
+    throw new Error("an open carrying exactly the channel number was refused");
+  }
+  // A different message entirely.
+  const notOpen = open("session", 5).slice();
+  notOpen[0] = 98;
+  if (mod.sshServerReadOpenChannel(notOpen) !== -1) {
+    throw new Error("a CHANNEL_REQUEST was read as a CHANNEL_OPEN");
   }
 });

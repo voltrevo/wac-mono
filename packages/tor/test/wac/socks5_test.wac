@@ -1,0 +1,184 @@
+// SOCKS5 request parsing, and the end-reason mapping a person reads.
+//
+// The parsing tests are about one thing: a request that is not all here yet must be
+// distinguishable from one that is malformed. A proxy reads from a socket, so *every*
+// request arrives in pieces at least sometimes, and a parser that treats "short" as
+// "invalid" fails on a slow client rather than a wrong one — which is a bug that passes
+// every test written against a whole buffer.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { targetOf, requestLength, replyForEndReason, endReasonName, socksReply,
+         repOk, repFailure, repNotAllowed, repNetUnreachable, repUnreachable,
+         repRefused, repTtlExpired } from "../../src/socks5.wac";
+import { wholeRecordBytes } from "../../src/link.wac";
+
+/** CONNECT to an IPv4 address. */
+u8[] v4(i32 a, i32 b, i32 c, i32 d, i32 port) {
+  return u8[](0x05, 0x01, 0x00, 0x01, a, b, c, d, port >> 8, port & 255);
+}
+
+/** CONNECT to a name. */
+u8[] byName(string host, i32 port) {
+  u8[] h = host.toBytes();
+  u8[] out = u8[4 + 1 + h.len() + 2]();
+  out[0] = 0x05; out[1] = 0x01; out[2] = 0x00; out[3] = 0x03;
+  out[4] = h.len();
+  for (i32 i = 0; i < h.len(); i++) { out[5 + i] = h[i]; }
+  out[5 + h.len()] = port >> 8;
+  out[6 + h.len()] = port & 255;
+  return out;
+}
+
+u8[] prefix(u8[] b, i32 n) {
+  u8[] o = u8[n]();
+  for (i32 i = 0; i < n; i++) { o[i] = b[i]; }
+  return o;
+}
+
+export string test_addresses_and_names_parse() {
+  T t = T.create();
+  t.eqStr(targetOf(v4(127, 0, 0, 1, 8899)), "127.0.0.1:8899", "an address");
+  t.eqStr(targetOf(v4(10, 20, 30, 255, 443)), "10.20.30.255:443", "the whole octet range");
+  t.eqStr(targetOf(byName("example.com", 80)), "example.com:80", "a name");
+  t.eqStr(targetOf(byName("a", 65535)), "a:65535", "the top port, which needs both bytes");
+  t.eqI32(requestLength(v4(1, 2, 3, 4, 80)), 10, "a v4 request is always ten bytes");
+  t.eqI32(requestLength(byName("example.com", 80)), 18, "a name request is 7 plus the name");
+  return t.report();
+}
+
+/**
+ * The one that matters. Every prefix of a valid request must be "wait", never a target and
+ * never a refusal — a proxy that answers early has committed to a destination it has not
+ * finished reading.
+ */
+export string test_every_short_prefix_says_wait() {
+  T t = T.create();
+  u8[] full = byName("example.com", 80);
+  for (i32 i = 0; i < full.len(); i++) {
+    t.eqStr(targetOf(prefix(full, i)), "", "a name request cut at " + itoa(i));
+  }
+  t.eqStr(targetOf(full), "example.com:80", "and the whole thing parses");
+
+  u8[] addr = v4(127, 0, 0, 1, 8899);
+  for (i32 i = 0; i < addr.len(); i++) {
+    t.eqStr(targetOf(prefix(addr, i)), "", "an address request cut at " + itoa(i));
+  }
+  t.eqStr(targetOf(addr), "127.0.0.1:8899", "and the whole thing parses");
+  return t.report();
+}
+
+export string test_unusable_address_types_are_refused_not_awaited() {
+  T t = T.create();
+  // "!" rather than "" — the distinction is the whole point. A refusal that reads as
+  // "incomplete" leaves the client waiting for a reply that will never come.
+  u8[] v6 = u8[](0x05, 0x01, 0x00, 0x04, 0, 0, 0, 0, 0, 0, 0, 0,
+                 0, 0, 0, 0, 0, 0, 0, 0, 0, 80);
+  t.eqStr(targetOf(v6), "!", "IPv6 is refused rather than awaited");
+  u8[] junk = u8[](0x05, 0x01, 0x00, 0x09, 1, 2, 3, 4, 0, 80);
+  t.eqStr(targetOf(junk), "!", "an unknown address type is refused");
+  return t.report();
+}
+
+export string test_end_reasons_map_to_what_a_person_can_act_on() {
+  T t = T.create();
+  t.eqI32(replyForEndReason(u8[](2)), repUnreachable(), "resolve failed -> host unreachable");
+  t.eqI32(replyForEndReason(u8[](3)), repRefused(), "refused -> refused");
+  t.eqI32(replyForEndReason(u8[](4)), repNotAllowed(), "exit policy -> not allowed by ruleset");
+  t.eqI32(replyForEndReason(u8[](7)), repTtlExpired(), "timeout -> TTL expired");
+  t.eqI32(replyForEndReason(u8[](8)), repNetUnreachable(), "no route -> network unreachable");
+  t.eqI32(replyForEndReason(u8[](12)), repRefused(), "connection reset -> refused");
+
+  // The ones that say nothing about the destination. Reason 5 is DESTROY — the circuit
+  // died, which is our problem and not the host's. An earlier version of this mapping had
+  // it as "host unreachable", which would have sent someone to check a host that was fine.
+  t.eqI32(replyForEndReason(u8[](1)), repFailure(), "misc -> general failure");
+  t.eqI32(replyForEndReason(u8[](5)), repFailure(), "destroy is not the destination's fault");
+  t.eqI32(replyForEndReason(u8[](10)), repFailure(), "an exit's internal error -> general");
+  t.eqI32(replyForEndReason(u8[0]()), repFailure(), "an empty body -> general failure");
+  t.eqI32(replyForEndReason(u8[](200)), repFailure(), "an unknown reason -> general failure");
+
+  t.eqStr(endReasonName(u8[](5)), "the circuit was destroyed", "and the log says which");
+  t.eqStr(endReasonName(u8[](200)), "reason 200", "an unknown reason still prints");
+  return t.report();
+}
+
+export string test_the_reply_is_ten_bytes_of_socks5() {
+  T t = T.create();
+  u8[] r = socksReply(repOk());
+  t.eqI32(r.len(), 10, "VER REP RSV ATYP, four address bytes, two port bytes");
+  t.eqI32(r[0], 5, "version 5");
+  t.eqI32(r[1], repOk(), "the code");
+  t.eqI32(r[3], 1, "declared as an IPv4 bound address");
+  return t.report();
+}
+
+/**
+ * TLS record framing.
+ *
+ * `tlsClientFeed` takes whole records only and traps otherwise, and for as long as this
+ * package existed the Tor link handed it whatever `recv` returned. It survived because a
+ * directory fetch is a few small records; the first real transfer through the proxy arrived
+ * as 44KB in one chunk with the last record cut in half, and the client aborted.
+ */
+u8[] record(i32 bodyLen) {
+  u8[] r = u8[5 + bodyLen]();
+  r[0] = 23; r[1] = 3; r[2] = 3;
+  r[3] = bodyLen >> 8; r[4] = bodyLen & 255;
+  return r;
+}
+
+u8[] join(u8[] a, u8[] b) {
+  u8[] o = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { o[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { o[a.len() + i] = b[i]; }
+  return o;
+}
+
+export string test_only_whole_records_are_offered() {
+  T t = T.create();
+  t.eqI32(wholeRecordBytes(u8[0]()), 0, "nothing yet");
+  t.eqI32(wholeRecordBytes(u8[](23, 3, 3)), 0, "not even a header");
+  t.eqI32(wholeRecordBytes(u8[](23, 3, 3, 0, 100)), 0, "a header promising a body that is absent");
+
+  u8[] one = record(100);
+  t.eqI32(wholeRecordBytes(one), 105, "exactly one record");
+  for (i32 i = 0; i < 105; i++) {
+    t.eqI32(wholeRecordBytes(prefix(one, i)), 0, "one record cut at " + itoa(i));
+  }
+
+  u8[] three = join(join(record(10), record(20)), record(30));
+  t.eqI32(wholeRecordBytes(three), 15 + 25 + 35, "three records back to back");
+  t.eqI32(wholeRecordBytes(join(three, u8[](23, 3, 3, 0, 200))), 75,
+       "three whole ones, and a fourth whose body has not arrived");
+  t.eqI32(wholeRecordBytes(join(three, u8[](23))), 75, "a fourth that is one byte of header");
+  return t.report();
+}
+
+/** The failing case as it actually arrived: many records and a split one, in one chunk. */
+export string test_a_chunk_of_eighty_records_with_the_last_one_split() {
+  T t = T.create();
+  u8[] many = u8[0]();
+  for (i32 i = 0; i < 80; i++) { many = join(many, record(542)); }
+  t.eqI32(wholeRecordBytes(many), 80 * 547, "eighty whole records");
+
+  // The 81st, arriving as its first nine bytes and no more. This is the shape that trapped:
+  // a header that says 542 and a body that is nine bytes into arriving.
+  t.eqI32(wholeRecordBytes(join(many, prefix(record(542), 9))), 80 * 547,
+       "the split record is held back, not fed");
+
+  // And once the rest of it turns up, it is offered along with everything else.
+  t.eqI32(wholeRecordBytes(join(many, record(542))), 81 * 547,
+       "the completed record joins the batch");
+  return t.report();
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  u8[] buf = u8[12]();
+  i32 n = 0;
+  i32 x = v;
+  while (x > 0) { buf[n] = '0' + (x % 10); n++; x = x / 10; }
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = buf[n - 1 - i]; }
+  return string.fromBytes(out);
+}

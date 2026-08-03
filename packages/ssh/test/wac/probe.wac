@@ -312,6 +312,7 @@ export i32 sshWindowLeft(Window w) { return w.left; }
 import { Match, lookUp as authLookUp } from "../../src/authorizedkeys.wac";
 import { AuthRequest, authFailure, authSuccess, byApplication, channelClose as srvClose,
          disconnect as srvDisconnect, openFailure as srvOpenFailure,
+         readOpenChannel as srvReadOpenChannel,
          channelData as srvData, channelEof as srvEof, channelFailure as srvChanFailure,
          channelStderr, channelSuccess, disconnect, ecdhReply, exchangeHash as srvHash,
          ephemeralPublic as srvEphemeral, sharedSecret as srvShared,
@@ -446,3 +447,5 @@ export u8[] sshServerOpenFailure(i32 channel, i32 reason, u8[] description) {
   return srvOpenFailure(channel, reason, description);
 }
 export i32 sshByApplication() { return byApplication(); }
+
+export i32 sshServerReadOpenChannel(u8[] payload) { return srvReadOpenChannel(payload); }
