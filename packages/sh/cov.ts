@@ -208,6 +208,20 @@ const SCRIPTS: string[] = [
   "i=0; while test $i -lt 3; do i=$((i+1)); done; echo $i",
   "echo $(echo plain)", "echo $( (echo sub) )",
 
+  // ── Trimming and bracket classes ────────────────────────────────────────────
+  "f=a.txt; echo ${f%.txt}", "f=a.b.c; echo ${f%.*}", "f=a.b.c; echo ${f%%.*}",
+  "p=/x/y/z; echo ${p#*/}", "p=/x/y/z; echo ${p##*/}", "p=/x/y/z; echo ${p%/*}",
+  "x=hello; echo ${x#h}", "x=hello; echo ${x%o}", "x=hello; echo ${x#no}", "x=hello; echo ${x%no}",
+  "x=abc; echo ${x#?}", "x=abc; echo ${x%%?}", "x=; echo [${x#a}]", "echo [${u#a}]",
+  "x=abc; echo ${x#}", "x=abc; echo ${x%}", "y=b; x=abc; echo ${x#$y}", "x=hello; echo ${#x}",
+  "case b in [abc]) echo y;; esac", "case d in [abc]) echo n;; esac",
+  "case q in [a-z]) echo y;; esac", "case Q in [a-z]) echo n;; esac",
+  "case 5 in [0-9]) echo y;; esac", "case x in [!abc]) echo y;; esac",
+  "case a in [!abc]) echo n;; esac", "case a in [^abc]) echo n;; esac",
+  "case - in [a-]) echo y;; esac", "case a in []a]) echo y;; esac",
+  "case a in [) echo n;; esac", "echo [", "echo []", "echo [abc",
+  "echo dir/[ot]*", "echo dir/[!o]*", "echo dir/[a-z]*",
+
   // ── Globbing ────────────────────────────────────────────────────────────────
   //
   // The fake `readDir` answers for `dir` and nothing else, so these reach both the matched and

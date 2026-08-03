@@ -276,6 +276,45 @@ esac`,
   `echo $(echo not-arithmetic)`,
   `echo $( (echo subshell) )`,
 
+  // ── Trimming a prefix or suffix ─────────────────────────────────────────────
+  //
+  // `#` and `%` strip a glob pattern off an end; doubled, they take the longest match. The
+  // single/double pairs are here together because that is the only difference between them.
+  `f=a.txt; echo \${f%.txt}`,
+  `f=a.b.c; echo \${f%.*}`,
+  `f=a.b.c; echo \${f%%.*}`,
+  `p=/x/y/z; echo \${p##*/}`,
+  `p=/x/y/z; echo \${p#*/}`,
+  `p=/x/y/z; echo \${p%/*}`,
+  `p=/x/y/z; echo \${p%%/*}`,
+  `x=hello; echo \${x#h}`,
+  `x=hello; echo \${x%o}`,
+  `x=hello; echo \${x#nomatch}`,
+  `x=hello; echo \${x%nomatch}`,
+  `x=abc; echo \${x#?}`,
+  `x=abc; echo \${x%%?}`,
+  `x=aaa; echo \${x#a} \${x##a*}`,
+  `y=b; x=abc; echo \${x#$y}`,
+  `x=abc; echo \${x#a}\${x%c}`,
+  `x=hello; echo \${#x}`,
+  `x=; echo [\${x#a}]`,
+  `echo [\${undefined#a}]`,
+
+  // ── Bracket classes ─────────────────────────────────────────────────────────
+  `case b in [abc]) echo hit;; esac`,
+  `case d in [abc]) echo no;; *) echo miss;; esac`,
+  `case q in [a-z]) echo lower;; esac`,
+  `case Q in [a-z]) echo no;; *) echo other;; esac`,
+  `case 5 in [0-9]) echo digit;; esac`,
+  `case x in [!abc]) echo negated;; esac`,
+  `case a in [!abc]) echo no;; *) echo in-set;; esac`,
+  `case - in [a-]) echo dash;; esac`,
+  `case a in []a]) echo bracket-first;; esac`,
+  `echo [`,
+  `echo []`,
+  `x=a1; echo \${x#[a-z]}`,
+  `x=a1; echo \${x%[0-9]}`,
+
   // ── Builtins ────────────────────────────────────────────────────────────────
   `echo -n no-newline`,
   `echo -n a; echo b`,

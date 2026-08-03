@@ -698,8 +698,50 @@ bool hasUnquotedMeta(u8[] b, u8[] quoted) {
   for (i32 i = 0; i < b.len(); i++) {
     if (quoted[i] != 0) { continue; }
     if (b[i] == 0x2a || b[i] == 0x3f) { return true; }          // '*' '?'
+    // `[` only counts when it closes. `echo [` is a word, not a pattern that matches nothing,
+    // and treating it as one would make it disappear against an empty directory.
+    if (b[i] == 0x5b && closingBracket(b, quoted, i) > 0) { return true; }
   }
   return false;
+}
+
+/**
+ * Where the `]` closing a bracket at `at` is, or -1.
+ *
+ * A `]` immediately after the opening bracket — or after its `!` — is a literal `]` rather than
+ * the close, which is the only way to put one in a set at all.
+ */
+i32 closingBracket(u8[] b, u8[] quoted, i32 at) {
+  i32 i = at + 1;
+  if (i < b.len() && (b[i] == 0x21 || b[i] == 0x5e)) { i++; }   // '!' or '^'
+  if (i < b.len() && b[i] == 0x5d) { i++; }
+  while (i < b.len()) {
+    if (b[i] == 0x5d && quoted[i] == 0) { return i; }
+    i++;
+  }
+  return -1;
+}
+
+/** Whether `c` is in the set written at `pat[at..close]`. */
+bool inBracket(u8[] pat, i32 at, i32 close, i32 c) {
+  i32 i = at + 1;
+  bool negated = false;
+  if (i < close && (pat[i] == 0x21 || pat[i] == 0x5e)) {
+    negated = true;
+    i++;
+  }
+  bool hit = false;
+  while (i < close) {
+    // A `-` between two characters is a range; one at either end is a literal `-`.
+    if (i + 2 < close && pat[i + 1] == 0x2d) {
+      if (c >= pat[i] && c <= pat[i + 2]) { hit = true; }
+      i += 3;
+      continue;
+    }
+    if (pat[i] == c) { hit = true; }
+    i++;
+  }
+  return hit != negated;
 }
 
 /**
@@ -761,6 +803,17 @@ bool globMatch(u8[] pat, u8[] quoted, i32 p, u8[] name, i32 n) {
       }
       return false;
     }
+    if (meta && pat[i] == 0x5b) {                                // '['
+      i32 close = closingBracket(pat, quoted, i);
+      if (close > 0) {
+        if (j >= name.len()) { return false; }
+        if (!inBracket(pat, i, close, name[j])) { return false; }
+        i = close + 1;
+        j++;
+        continue;
+      }
+      // An unclosed `[` is an ordinary character, which is why `echo [` prints one.
+    }
     if (j >= name.len()) { return false; }
     if (meta && pat[i] == 0x3f) { i++; j++; continue; }
     if (pat[i] != name[j]) { return false; }
@@ -783,6 +836,48 @@ u8[] sliceBytes(u8[] b, i32 from, i32 to) {
  * Lexed and expanded rather than taken literally, because a default is routinely another
  * expansion: `${HOME:-/root}` is the boring case and `${EDITOR:-$VISUAL}` is the reason.
  */
+/**
+ * Remove a matching prefix. `longest` picks `##` over `#`.
+ *
+ * Tried by length rather than by matching greedily, because the pattern is a glob and "the
+ * shortest prefix this matches" is not something a glob matcher answers on its own.
+ */
+string trimStart(Shell sh, string value, string pattern, bool longest) {
+  u8[] pat = expandText(sh, pattern).toBytes();
+  u8[] mask = u8[pat.len()]();
+  u8[] v = value.toBytes();
+  i32 hit = -1;
+  for (i32 n = 0; n <= v.len(); n++) {
+    u8[] head = u8[n]();
+    head.copyFrom(v, 0, 0, n);
+    if (globMatch(pat, mask, 0, head, 0)) {
+      hit = n;
+      if (!longest) { break; }
+    }
+  }
+  if (hit < 0) { return value; }
+  return value.slice(hit, value.len());
+}
+
+/** Remove a matching suffix. `longest` picks `%%` over `%`. */
+string trimEnd(Shell sh, string value, string pattern, bool longest) {
+  u8[] pat = expandText(sh, pattern).toBytes();
+  u8[] mask = u8[pat.len()]();
+  u8[] v = value.toBytes();
+  i32 hit = -1;
+  for (i32 n = 0; n <= v.len(); n++) {
+    i32 from = v.len() - n;
+    u8[] tail = u8[n]();
+    tail.copyFrom(v, from, 0, n);
+    if (globMatch(pat, mask, 0, tail, 0)) {
+      hit = from;
+      if (!longest) { break; }
+    }
+  }
+  if (hit < 0) { return value; }
+  return value.slice(0, hit);
+}
+
 string expandText(Shell sh, string text) {
   if (text == "") { return ""; }
   Vec<Token> toks = tokenize(text);
@@ -926,7 +1021,7 @@ string expandPart(Shell sh, Part p) {
     case Lit: return p.text;
     case Var: {
       if (p.op == "") { return sh.lookUp(p.text); }
-      if (p.op == "#") { return itoa(sh.lookUp(p.text).len()); }
+      if (p.op == "len") { return itoa(sh.lookUp(p.text).len()); }
 
       string value = sh.lookUp(p.text);
       // With a colon, "unset or empty" counts as absent; without one, only "unset" does.
@@ -934,6 +1029,14 @@ string expandPart(Shell sh, Part p) {
         ? value == ""
         : !sh.isSet(p.text);
       string last = p.op.slice(p.op.len() - 1, p.op.len());
+
+      // `#` and `%` trim a *pattern* off an end rather than substituting. They are the reason a
+      // shell can do `${f%.txt}` without calling anything, and the doubled forms take the
+      // longest match instead of the shortest.
+      if (p.op == "#") { return trimStart(sh, value, p.arg, false); }
+      if (p.op == "##") { return trimStart(sh, value, p.arg, true); }
+      if (p.op == "%") { return trimEnd(sh, value, p.arg, false); }
+      if (p.op == "%%") { return trimEnd(sh, value, p.arg, true); }
 
       if (last == "-") { return absent ? expandText(sh, p.arg) : value; }
       if (last == "+") { return absent ? "" : expandText(sh, p.arg); }
