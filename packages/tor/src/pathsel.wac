@@ -240,6 +240,8 @@ export bool portPermitted(bool isAccept, i32[] ranges, i32 port) {
 // with it, because a `Relay[]` is just a `Relay[]` on this side.
 
 import { Vec } from "../../std/src/vec.wac";
+import { Map } from "../../std/src/map.wac";
+import { hashString, stringEq } from "../../std/src/hash.wac";
 import { parseInt } from "./directory.wac";
 
 /** The weights in the order `positionWeight` expects: four per position. */
@@ -324,13 +326,25 @@ export struct Families {
 }
 
 export Families resolveFamilies(Relay[] relays) {
+  // An index first, because the obvious shape is quadratic and the testnet cannot show it.
+  //
+  // Resolving each family entry by scanning every relay is fine at five relays and ruinous
+  // at ten thousand: measured against a real consensus — 9566 relays, 458762 family edges —
+  // it took eleven seconds, on every bootstrap. Built once, the same work is a hash lookup.
+  Map<string, i32> byName = Map.withCapacity(relays.len(), hashString, stringEq);
+  Map<string, i32> byFingerprint = Map.withCapacity(relays.len(), hashString, stringEq);
+  for (i32 i = 0; i < relays.len(); i++) {
+    byName.set(relays[i].nickname, i);
+    byFingerprint.set(hexOf(relays[i].identity), i);
+  }
+
   // Each relay's claims, as indices. A claim naming nobody in this consensus is dropped
   // here rather than carried as a name that can never match.
   Vec<i32>[] claims = Vec<i32>[relays.len()](fill: Vec.create());
   for (i32 i = 0; i < relays.len(); i++) {
     Vec<i32> mine = Vec.create();
     for (i32 j = 0; j < relays[i].family.len(); j++) {
-      i32 who = resolveName(relays, relays[i].family[j]);
+      i32 who = lookupName(byName, byFingerprint, relays[i].family[j]);
       if (who >= 0 && who != i) { mine.push(who); }
     }
     claims[i] = mine;
@@ -357,10 +371,14 @@ bool mentions(Vec<i32> v, i32 x) {
 }
 
 /**
- * A family entry as a nickname or a `$FINGERPRINT` — with `=name` or `~name` suffixes,
- * which a consensus uses to say whether the naming is verified.
+ * A family entry as a nickname or a `$FINGERPRINT`, with the `=name` or `~name` suffix a
+ * consensus uses to say whether the naming is verified.
+ *
+ * Both indexes are consulted rather than one: a token is a fingerprint if it starts with
+ * `$`, and a nickname otherwise, and the two namespaces are separate — a relay may not
+ * stand in for another by being named like it.
  */
-i32 resolveName(Relay[] relays, string token) {
+i32 lookupName(Map<string, i32> byName, Map<string, i32> byFingerprint, string token) {
   u8[] t = token.toBytes();
   if (t.len() > 0 && t[0] == '$') {
     i32 end = t.len();
@@ -368,46 +386,25 @@ i32 resolveName(Relay[] relays, string token) {
       if ((t[i] == '=' || t[i] == '~') && end == t.len()) { end = i; }
     }
     u8[] hexPart = u8[end - 1]();
-    for (i32 i = 0; i < hexPart.len(); i++) { hexPart[i] = t[1 + i]; }
-    u8[] want = fromHex(string.fromBytes(hexPart));
-    for (i32 i = 0; i < relays.len(); i++) {
-      if (bytesEqual(relays[i].identity, want)) { return i; }
-    }
-    return -1;
+    for (i32 i = 0; i < hexPart.len(); i++) { hexPart[i] = upperHex(t[1 + i]); }
+    return byFingerprint.getOr(string.fromBytes(hexPart), -1);
   }
-  for (i32 i = 0; i < relays.len(); i++) {
-    if (relays[i].nickname == token) { return i; }
-  }
-  return -1;
+  return byName.getOr(token, -1);
 }
 
-bool bytesEqual(u8[] a, u8[] b) {
-  if (a.len() != b.len() || a.len() == 0) { return false; }
-  for (i32 i = 0; i < a.len(); i++) {
-    if (a[i] != b[i]) { return false; }
+/** Uppercase hex of an identity, which is how a consensus writes a fingerprint. */
+string hexOf(u8[] b) {
+  u8[] digits = "0123456789ABCDEF".toBytes();
+  u8[] out = u8[b.len() * 2]();
+  for (i32 i = 0; i < b.len(); i++) {
+    out[i * 2] = digits[(b[i] >> 4) & 15];
+    out[i * 2 + 1] = digits[b[i] & 15];
   }
-  return true;
+  return string.fromBytes(out);
 }
 
-u8[] fromHex(string s) {
-  u8[] h = s.toBytes();
-  if (h.len() % 2 != 0) { return u8[0](); }
-  u8[] out = u8[h.len() / 2]();
-  for (i32 i = 0; i < out.len(); i++) {
-    i32 hi = hexDigit(h[2 * i]);
-    i32 lo = hexDigit(h[2 * i + 1]);
-    if (hi < 0 || lo < 0) { return u8[0](); }
-    out[i] = hi * 16 + lo;
-  }
-  return out;
-}
-
-i32 hexDigit(i32 c) {
-  if (c >= '0' && c <= '9') { return c - '0'; }
-  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
-  if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
-  return -1;
-}
+/** Fingerprints are written in either case; the index holds one of them. */
+i32 upperHex(i32 c) { return c >= 'a' && c <= 'f' ? c - 32 : c; }
 
 /**
  * Whether a relay may be used at all, and at this position.
