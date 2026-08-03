@@ -90,6 +90,9 @@ export i32 main(Core core, Cli cli) { … }
 Reading `main`'s parameters tells you the application reads the clock, prints, and touches
 the filesystem. Nothing else is reachable, because there is nowhere else to reach.
 
+An interactive browser application exports `page(Core, Cli, Page)` instead, and the entry
+point's name is how a program says which kind it is. A module may export both.
+
 It was a struct with `start` and `run` at first. That bought nothing: a program that runs
 once and exits has no state to keep between calls, so the struct was ceremony around a
 function. A *service*, called repeatedly, will want one — and can have it then.
@@ -100,7 +103,8 @@ split is why it is a second struct rather than more fields.
 
 | | capability | grant |
 |---|---|---|
-| `Core` | `nowMillis`, `monotonicNanos`, `randomBytes`, `log`, `warn` | — |
+| `Core` | `nowMillis`, `monotonicNanos`, `sleepMillis`, `randomBytes`, `log`, `warn` | — |
+| | `waitAny` | — |
 | `Cli` | `argCount`, `arg`, `env` | — |
 | | `readStdin`, `write` | — |
 | | `openInput`, `readChunk` | `--allow-read` for a file |
@@ -108,6 +112,16 @@ split is why it is a second struct rather than more fields.
 | | `writeFile`, `mkdir`, `remove`, `rename` | `--allow-write` |
 | | `openOutput` (to a file) | `--allow-write` |
 | | `connect`, `listen`, `accept`, `recv`, `send`, `closeSocket` | `--allow-net` |
+| | `spawn`, `closeFeed`, `exitCode` | — (the child gets what you pass, never more) |
+| `Page` | `render`, `setText`, `setValue`, `getValue`, `on`, `nextEvent`, `title` | browser only |
+| | `drawPixels`, `nextFile`, `offerDownload` | browser only |
+
+`waitAny` is in `Core` because it grants nothing — it cannot start work, only notice that some
+has finished — and `spawn` needs no grant of its own for the same reason the child's grants are
+an argument to it: what a child may do is a subset of what its parent already had.
+
+`Page` is a third profile and only a browser provides it. A page capability that pretended to
+work in a terminal would be a lie, which is the whole reason these are separate structs.
 
 **`readStdin` and `write` need no grant**, for the same reason `arg` does not: what the
 user pipes in and what the program prints are the user's own doing, not a reach into
@@ -137,12 +151,16 @@ return gzipStream(cli.readChunk, cli.write);
 `write` returns a `bool` for that reason alone — almost every caller discards it. Had the
 shapes not matched there would have been no adapter to write.
 
-Measured on one 300MB file, peak RSS: **94MB streaming (`wc`), 1.5GB buffered
-(`sha256sum`)**, against a 57MB floor for the Deno runtime itself. Before the conversion
-`wc` peaked at 1.5GB on the same input. The streaming ones are `cat`, `wc`, `hex`, `crc32`, `tr`, `strings`, `gzip` and
-`gunzip`. `sort`, `tac` and `tail` cannot stream by nature. `sha256sum` and `sha512sum`
-still buffer because `packages/crypto` hashes a whole message — an incremental API there
-is the next thing worth having.
+Measured on one 300MB file, peak RSS: **94MB streaming (`wc`)**, against a 57MB floor for the
+Deno runtime itself. Before the conversion `wc` peaked at **1.5GB** on the same input.
+
+Most of `box` streams — through `openInput`/`readChunk` directly, or through its own line reader
+built on them. Two joined later and are worth naming because the reason was never the transport:
+`sha256sum` and `sha512sum` buffered until `packages/crypto` grew `create`/`update`/`finish`, and
+`tail` buffered until it was clear that a ring of N lines is not the same as holding the file.
+What genuinely cannot stream is what has to see everything before it can answer a single byte —
+`sort`, `tac`. Each applet's header says which it is and why, which is the copy that stays
+current; an enumeration here went stale twice.
 
 **Sockets are handles, not a current-socket.** `openInput` and `openOutput` are
 one-at-a-time because the transforms take `fn[u8[]()]`, which has no parameter to carry a
@@ -643,9 +661,17 @@ enter it. Concurrency means more instances.
   precisely so Node can follow without editing it, and nobody has written that side.
   Browser is a separate question: `Worker` exists there, but a page has no filesystem to
   read a bundle from, so what `spawn` should even take is undecided.
-- **A service shape.** `run(this) -> i32` is the CLI application. A long-running server
-  wants `onBytes(this, u8[]) -> Served`, which `packages/server` already defines and drives
-  from its own host; folding it into the launcher is the next step.
+- **A service shape.** `main(Core, Cli) -> i32` is the CLI application and
+  `page(Core, Cli, Page) -> i32` is the interactive one; both run once and return. A
+  long-running *server* wants `onBytes(this, u8[]) -> Served`, which `packages/server` already
+  defines and drives from its own host; folding it into the launcher is the next step.
+- **A page has no network at all.** No TCP, which is structural — `fetch` is not a socket, so
+  `connect` is refused rather than approximated — but no `fetch` capability either, which is
+  merely unwritten. It would be request/response rather than a stream, so it revives none of
+  `http`, `tls`, `tor` or `ssh` in a page; the browser does that layer itself.
+- **`Event` carries no modifiers and no pointer button.** Enough for clicks, typing and
+  `pointermove`, so a canvas application can draw; not enough to tell a left-drag from a
+  right-click, or to read Shift. The first thing anyone building on `drawPixels` will want.
 - **An OS process.** Deliberately not here, and not planned — see wac-mono issue 0015,
   closed `wontfix`. Running arbitrary host programs is a non-goal: it makes every grant
   transitive, and the interesting artefact turned out to be the other one, where a child is

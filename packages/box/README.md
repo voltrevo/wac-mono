@@ -1,7 +1,12 @@
 # box — a busybox, written in wac
 
-Fifty-nine applets in one program, chosen by the first argument. No TypeScript: `src/` is
+60 applets in one program, chosen by the first argument. No TypeScript: `src/` is
 wac and the only thing outside it is the test suite.
+
+That number is a digit rather than a word because it kept going stale: it said fifty-nine when
+the dispatcher had sixty, and before that forty-two in one paragraph and something else in
+another. `test/box.test.ts` now compares it to the dispatcher, so adding an applet and
+forgetting the sentence is a failing test.
 
 It exists to exercise `packages/platform`'s capability world more widely than a single
 example could, and to be honest about what that world cannot yet do. Where an applet
@@ -58,8 +63,26 @@ half-written destination.
 **It also shows what a multicall binary costs.** `box`'s grants are the *union* of what
 its applets need, so `box echo` carries the filesystem access `box cat` wants. Built as
 separate executables, each would state its own: `wc` needs nothing at all and its shebang
-would say `deno run` with no flags. One binary with forty-two entry points is the shape
+would say `deno run` with no flags. One binary with sixty entry points is the shape
 BusyBox has to take; it is not the shape this model is best at.
+
+## In a browser
+
+`example/` holds two browser pages, built with `--target browser` and served with the two
+cross-origin isolation headers `SharedArrayBuffer` needs — `box httpd -x` sends them, which
+makes the whole loop wac.
+
+**`example/term.wac` is `packages/sh` in a tab**: pipelines, loops, variables, arithmetic and
+redirection into a filesystem that survives a reload, with the shell unchanged. What it cannot
+run is `$WACPATH` programs, because those need `spawn` and `spawn` is Deno-only — `ls` reports
+`command not found`, which is honest rather than hidden.
+
+**`example/hash.wac`** hashes and compresses what you type as you type it, from `crypto` and
+`gzip` unchanged: 18KB of text to a SHA-256 and 131 gzipped bytes in about a millisecond, on a
+worker, so the typing stays smooth.
+
+They live here rather than in `packages/platform/example/` because they need `crypto`, `gzip`
+and `sh`, and platform is the package all three sit on top of.
 
 `bin/` shows the other shape, and measures it rather than asserting it. Four applets are
 also built alone — the entry point is four lines and imports the applet file unchanged:

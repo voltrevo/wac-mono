@@ -10,8 +10,15 @@
 // summary is each package's own README, the sizes are line counts, the dependencies are the
 // relative imports, and the runnable list is every `main` or `page` export there is.
 //
-// `--check` is what keeps it honest. It runs in the suite, so adding a package and forgetting
-// the map is a failing test rather than a stale document nobody notices.
+// `--check` is what keeps it honest, and it compares **structure, not counts**: the package
+// list, the summaries, the dependency edges and the programs, with every number blurred out.
+//
+// That is not laziness. Three agents share this repo, and a check that included the test count
+// failed on every merge that added a test anywhere — which it did, twice, blocking pushes that
+// had nothing to do with the map. A guard that cries wolf on other people\'s work gets deleted,
+// and deserves to be. So the numbers refresh whenever anyone runs `deno task map` and are
+// allowed to lag by a few; adding a package, a program or a dependency still fails, because
+// those are the claims a reader actually navigates by.
 
 const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
@@ -224,9 +231,12 @@ for await (const e of Deno.readDir(`${ROOT}/packages`)) {
 const pkgs = await Promise.all(names.sort().map(survey));
 const text = render(pkgs);
 
+/** Every run of digits blurred, so counts do not gate the check. See the note at the top. */
+const structure = (md: string) => md.replace(/\d[\d,]*/g, "#");
+
 if (Deno.args.includes("--check")) {
   const have = await read(`${ROOT}/MAP.md`);
-  if (have !== text) {
+  if (structure(have) !== structure(text)) {
     console.error("MAP.md is out of date — run `deno task map`");
     Deno.exit(1);
   }

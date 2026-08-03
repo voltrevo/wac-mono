@@ -1492,3 +1492,19 @@ Deno.test("nc -l takes one connection", async () => {
     await Deno.remove(built);
   }
 });
+
+Deno.test("the README states the applet count the dispatcher actually has", async () => {
+  // Prose numbers drift silently. This one said fifty-nine when there were sixty, and
+  // forty-two in a paragraph further down, both written by someone who had just counted.
+  const dispatch = await Deno.readTextFile("packages/box/src/box.wac");
+  const readme = await Deno.readTextFile("packages/box/README.md");
+  const actual = [...dispatch.matchAll(/if \(applet == "[a-z0-9-]+"/g)].length;
+  const claimed = Number(readme.match(/^(\d+) applets/m)?.[1] ?? 0);
+  assertEquals(claimed, actual, `the README says ${claimed} applets, box.wac dispatches ${actual}`);
+  // And the aside in the `bin/` section, which drifted independently of the first line.
+  assertEquals(
+    readme.includes("with sixty entry points"),
+    actual === 60,
+    "the `bin/` section names the count too, in words",
+  );
+});

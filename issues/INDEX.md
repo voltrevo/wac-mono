@@ -16,6 +16,7 @@ record of what has been fixed and why.
 | [0003](open/0003-wacc-parser-does-not-implement-generics.md) | wacc's parser does not implement generics, so `std` is outside its corpus | missing feature | not implemented |
 | [0024](open/0024-mutation-selection-is-inert-for-subprocess-tests-and-the-fallback-runs-them-worst-first.md) | mutation test-selection is inert for subprocess tests, and the fallback runs them worst-first | performance | wrong answer |
 | [0021](open/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md) | a spawned worker whose source does not parse kills the parent | bug | trap |
+| [0026](open/0026-sshds-port-announcement-test-is-racy-and-reddens-the-shared-suite.md) | sshd's port-announcement test is racy, and makes the shared suite red at random | bug | wrong answer |
 
 An empty list is the expected state most of the time — see `README.md`: something you
 can fix in a package you are already working in should just be fixed, and a package's
