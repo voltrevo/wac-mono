@@ -311,6 +311,7 @@ export i32 sshWindowLeft(Window w) { return w.left; }
 
 import { Match, lookUp as authLookUp } from "../../src/authorizedkeys.wac";
 import { AuthRequest, authFailure, authSuccess, byApplication, channelClose as srvClose,
+         disconnect as srvDisconnect, openFailure as srvOpenFailure,
          channelData as srvData, channelEof as srvEof, channelFailure as srvChanFailure,
          channelStderr, channelSuccess, disconnect, ecdhReply, exchangeHash as srvHash,
          ephemeralPublic as srvEphemeral, sharedSecret as srvShared,
@@ -436,3 +437,12 @@ export i32[] sshMessageNumbers() {
   out[24] = msgChannelFailure();
   return out;
 }
+
+/** The two refusal messages a client only sees when something has gone wrong. */
+export u8[] sshServerDisconnect(i32 reason, u8[] description) {
+  return srvDisconnect(reason, description);
+}
+export u8[] sshServerOpenFailure(i32 channel, i32 reason, u8[] description) {
+  return srvOpenFailure(channel, reason, description);
+}
+export i32 sshByApplication() { return byApplication(); }

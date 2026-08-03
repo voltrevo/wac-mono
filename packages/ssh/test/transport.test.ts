@@ -11,6 +11,10 @@ import { freePort, haveSshd, type Server, startServer, stopServer } from "./serv
 
 const mod = await wacBind("packages/ssh/test/wac/probe.wac") as unknown as {
   sshMessageNumbers(): Int32Array;
+  sshServerChannelFailure(channel: number): Uint8Array;
+  sshServerDisconnect(reason: number, description: Uint8Array): Uint8Array;
+  sshServerOpenFailure(channel: number, reason: number, description: Uint8Array): Uint8Array;
+  sshByApplication(): number;
   sshClientVersion(): Uint8Array;
   sshClientVersionLine(): Uint8Array;
   sshScanStatus(buf: Uint8Array): number;
@@ -1398,5 +1402,43 @@ Deno.test("every message number is the one the RFC assigns", () => {
     if (got[i] !== want[i][1]) {
       throw new Error(`${want[i][0]}: expected ${want[i][1]}, got ${got[i]}`);
     }
+  }
+});
+
+Deno.test("the refusal messages are laid out as the RFC says, byte for byte", () => {
+  // `channelFailure`, `openFailure` and `disconnect` all survived mutation testing with their
+  // bodies replaced, because a client only sees them when something has gone wrong and nothing in
+  // the suite makes anything go wrong at this layer. They are pure functions over integers and
+  // bytes, so the fix is not a harder integration test — it is to assert the bytes.
+  //
+  // Layouts: RFC 4254 §5.1 (CHANNEL_OPEN_FAILURE), §5.4 (CHANNEL_FAILURE) and RFC 4253 §11.1
+  // (DISCONNECT). Note all three end with an empty language tag, which is a `string` and so four
+  // zero bytes, not nothing — the field a hand-rolled encoder forgets.
+  const enc = new TextEncoder();
+  const hex = (b: Uint8Array) => Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join(" ");
+  const check = (name: string, got: Uint8Array, want: string) => {
+    if (hex(got) !== want) throw new Error(`${name}\n  got:  ${hex(got)}\n  want: ${want}`);
+  };
+
+  // byte 100, uint32 recipient channel. Nothing else — a CHANNEL_FAILURE carries no reason.
+  check("channelFailure(7)", mod.sshServerChannelFailure(7), "64 00 00 00 07");
+
+  // byte 1, uint32 reason, string description, string language tag.
+  check(
+    "disconnect(11, bye)",
+    mod.sshServerDisconnect(11, enc.encode("bye")),
+    "01 00 00 00 0b 00 00 00 03 62 79 65 00 00 00 00",
+  );
+
+  // byte 92, uint32 recipient channel, uint32 reason code, string description, string language.
+  check(
+    "openFailure(3, 4, no)",
+    mod.sshServerOpenFailure(3, 4, enc.encode("no")),
+    "5c 00 00 00 03 00 00 00 04 00 00 00 02 6e 6f 00 00 00 00",
+  );
+
+  // SSH_DISCONNECT_BY_APPLICATION, RFC 4253 §11.1. The one reason code this server sends.
+  if (mod.sshByApplication() !== 11) {
+    throw new Error(`byApplication: expected 11, got ${mod.sshByApplication()}`);
   }
 });
