@@ -11,8 +11,8 @@
     "See 'Keeping the compiler pin current' in README.md. Checked by",
     "harness/wacVersion.ts on the first wacBind of a run."
   ],
-  "commit": "b9fa8c5842b16733b2c4f721598a22314c6d074c",
-  "shortCommit": "b9fa8c5",
-  "reason": "0057 shift-amount widths and 0058 the wasm name section — zstd can drop its hand-widening, and a profile names functions",
+  "commit": "4098849df59ddd493fa3d80a81fd5de5c558b586",
+  "shortCommit": "4098849",
+  "reason": "--update",
   "updated": "2026-08-02"
 }

@@ -17,6 +17,64 @@
 // `readFile`, never `readByte`.
 
 /**
+ * A call that has been started but not yet collected.
+ *
+ * Every capability that produces a value hands back one of these instead of the value.
+ * `.wait()` blocks until the answer is there and gives it to you, which is what almost
+ * every caller wants and is why the swap from the old surface is `x(…)` to `x(…).wait()`
+ * and nothing more.
+ *
+ * What the shape buys is the calls you *do not* wait for immediately:
+ *
+ * ```wac
+ * Pending<FileResult> a = cli.readFile("one");
+ * Pending<FileResult> b = cli.readFile("two");   // both are already running
+ * FileResult ra = a.wait();
+ * FileResult rb = b.wait();
+ * ```
+ *
+ * and, more importantly, waiting on whichever of several answers first — which is how a
+ * program watches two sockets at once, and is the only reason `nc`, an SSH relay and a
+ * shell were not writable before.
+ *
+ * **The ticket carries its own resolver.** A struct method cannot reach the `Cli` it came
+ * from — wac has no closures and no ambient anything — so whatever `.wait()` calls has to
+ * be inside the ticket. That is what the three funcref fields are, and why they are not an
+ * implementation detail that could be hidden.
+ *
+ * A ticket is good once. Waiting on a spent one is an error rather than a plausible wrong
+ * answer, because the slot underneath is reused and its generation has moved on.
+ */
+export struct Pending<T> {
+  i32 id;
+  fn[T(i32)] resolve;
+  fn[bool(i32)] settled;
+  fn[void(i32)] drop;
+
+  Pending<T> of(i32 id, fn[T(i32)] resolve, fn[bool(i32)] settled, fn[void(i32)] drop) {
+    return Pending<T>(id, resolve, settled, drop);
+  }
+
+  /**
+   * Block until the answer is here, and take it. The ticket is spent afterwards.
+   *
+   * `const this` because it writes nothing — the spending happens on the host side of the
+   * resolver. It has to be const to be callable at all from a `const this` method, which
+   * is where half the capability calls in `packages/sh` and `packages/ssh` live.
+   */
+  T wait(const this) { return this.resolve(this.id); }
+
+  /** Whether `wait` would return immediately. Never blocks. */
+  bool isDone(const this) { return this.settled(this.id); }
+
+  /**
+   * Stop caring. **Detach, not abort**: the host may already be inside the work and
+   * generally cannot be interrupted. What this guarantees is that the answer is discarded.
+   */
+  void cancel(const this) { this.drop(this.id); }
+}
+
+/**
  * A file that may not have been there. `bytes` is empty when `ok` is false.
  *
  * The static exists so the *host* can build one. A struct has no constructor JavaScript
@@ -39,20 +97,20 @@ export struct FileResult {
  */
 export struct Core {
   /** Wall clock, milliseconds since the epoch. Moves backwards; do not measure with it. */
-  fn[i64()] nowMillis;
+  fn[Pending<i64>()] nowMillis;
   /** Monotonic nanoseconds from an arbitrary origin. For measuring, never for dating. */
-  fn[i64()] monotonicNanos;
+  fn[Pending<i64>()] monotonicNanos;
   /** Cryptographically secure random bytes. */
-  fn[u8[](i32)] randomBytes;
+  fn[Pending<u8[]>(i32)] randomBytes;
   /** A line of output. */
   fn[void(string)] log;
   /** A line of output on the error channel. */
   fn[void(string)] warn;
 
   Core of(
-    fn[i64()] nowMillis,
-    fn[i64()] monotonicNanos,
-    fn[u8[](i32)] randomBytes,
+    fn[Pending<i64>()] nowMillis,
+    fn[Pending<i64>()] monotonicNanos,
+    fn[Pending<u8[]>(i32)] randomBytes,
     fn[void(string)] log,
     fn[void(string)] warn
   ) {
@@ -96,13 +154,13 @@ export struct Socket {
 }
 
 export struct Cli {
-  fn[i32()] argCount;
-  fn[string(i32)] arg;
+  fn[Pending<i32>()] argCount;
+  fn[Pending<string>(i32)] arg;
   /** Null when the variable is unset, which is not the same as empty. */
-  fn[string?(string)] env;
+  fn[Pending<string?>(string)] env;
 
   /** All of standard input, to the end. Empty when there is none. */
-  fn[u8[]()] readStdin;
+  fn[Pending<u8[]>()] readStdin;
   /**
    * Exactly these bytes on standard output — no newline, no encoding.
    *
@@ -116,13 +174,13 @@ export struct Cli {
    */
   fn[bool(u8[])] write;
 
-  fn[FileResult(string)] readFile;
+  fn[Pending<FileResult>(string)] readFile;
   /** True when the write succeeded. */
-  fn[bool(string, u8[])] writeFile;
+  fn[Pending<bool>(string, u8[])] writeFile;
   /** What a path is. `exists` is false where the filesystem was not granted. */
-  fn[Stat(string)] stat;
+  fn[Pending<Stat>(string)] stat;
   /** Names within a directory, or null if it is not one — or not permitted. */
-  fn[string[]?(string)] readDir;
+  fn[Pending<string[]?>(string)] readDir;
 
   /**
    * Making, unmaking and moving. All three answer with whether they worked.
@@ -137,9 +195,9 @@ export struct Cli {
    * caller has to ask for the recursive form, because the recursive form is the one that
    * can destroy something it was not pointed at.
    */
-  fn[bool(string, bool)] mkdir;
-  fn[bool(string, bool)] remove;
-  fn[bool(string, string)] rename;
+  fn[Pending<bool>(string, bool)] mkdir;
+  fn[Pending<bool>(string, bool)] remove;
+  fn[Pending<bool>(string, string)] rename;
 
   /**
    * Streaming input: `openInput` chooses the source, `readChunk` pulls from it.
@@ -165,7 +223,22 @@ export struct Cli {
    * distinction between "no such file" and "you were not given the filesystem" is the one
    * thing a person needs from this message.
    */
-  fn[string(string)] openInput;
+  fn[Pending<string>(string)] openInput;
+  /**
+   * **Blocking, unlike its neighbours**, and so is `write`.
+   *
+   * Two reasons, and the second is the binding one. They act on the *current* stream,
+   * which the world keeps in order regardless, so there is nothing to overlap: two
+   * `readChunk`s in flight is not a faster read, it is an undefined one. And they are
+   * passed as bare function references to the streaming transforms in this repo —
+   * `gzipStream(cli.readChunk, cli.write)` — which expect `fn[u8[]()]` and `fn[bool(u8[])]`.
+   * A ticket-returning capability does not match those, and wac has no closures, so there
+   * would be no adapter to write.
+   *
+   * The capabilities worth a ticket are the ones that *name their target*: `readFile(path)`,
+   * `stat(path)`, `recv(handle)`, `connect(host)`. Those are the ones a program has reason
+   * to have several of at once.
+   */
   fn[u8[]()] readChunk;
 
   /**
@@ -183,7 +256,7 @@ export struct Cli {
    *
    * Answers with the empty string on success and the host's message otherwise.
    */
-  fn[string(string)] openOutput;
+  fn[Pending<string>(string)] openOutput;
 
   /**
    * The network. `--allow-net`, and nothing without it.
@@ -197,34 +270,34 @@ export struct Cli {
    * is not enough for a proxy, or for anything that must watch two sockets at once. When
    * something needs it, that is the shape to add.
    */
-  fn[Socket(string, i32)] connect;
-  fn[Socket(i32)] listen;
-  fn[Socket(i32)] accept;
-  fn[u8[](i32)] recv;
-  fn[bool(i32, u8[])] send;
+  fn[Pending<Socket>(string, i32)] connect;
+  fn[Pending<Socket>(i32)] listen;
+  fn[Pending<Socket>(i32)] accept;
+  fn[Pending<u8[]>(i32)] recv;
+  fn[Pending<bool>(i32, u8[])] send;
   fn[void(i32)] closeSocket;
 
   Cli of(
-    fn[i32()] argCount,
-    fn[string(i32)] arg,
-    fn[string?(string)] env,
-    fn[u8[]()] readStdin,
+    fn[Pending<i32>()] argCount,
+    fn[Pending<string>(i32)] arg,
+    fn[Pending<string?>(string)] env,
+    fn[Pending<u8[]>()] readStdin,
     fn[bool(u8[])] write,
-    fn[FileResult(string)] readFile,
-    fn[bool(string, u8[])] writeFile,
-    fn[Stat(string)] stat,
-    fn[string[]?(string)] readDir,
-    fn[bool(string, bool)] mkdir,
-    fn[bool(string, bool)] remove,
-    fn[bool(string, string)] rename,
-    fn[string(string)] openInput,
+    fn[Pending<FileResult>(string)] readFile,
+    fn[Pending<bool>(string, u8[])] writeFile,
+    fn[Pending<Stat>(string)] stat,
+    fn[Pending<string[]?>(string)] readDir,
+    fn[Pending<bool>(string, bool)] mkdir,
+    fn[Pending<bool>(string, bool)] remove,
+    fn[Pending<bool>(string, string)] rename,
+    fn[Pending<string>(string)] openInput,
     fn[u8[]()] readChunk,
-    fn[string(string)] openOutput,
-    fn[Socket(string, i32)] connect,
-    fn[Socket(i32)] listen,
-    fn[Socket(i32)] accept,
-    fn[u8[](i32)] recv,
-    fn[bool(i32, u8[])] send,
+    fn[Pending<string>(string)] openOutput,
+    fn[Pending<Socket>(string, i32)] connect,
+    fn[Pending<Socket>(i32)] listen,
+    fn[Pending<Socket>(i32)] accept,
+    fn[Pending<u8[]>(i32)] recv,
+    fn[Pending<bool>(i32, u8[])] send,
     fn[void(i32)] closeSocket
   ) {
     return Cli(

@@ -52,7 +52,7 @@ export struct Conn {
 
   /** One `recv`, appended. False at end of stream. */
   bool fill(this) {
-    u8[] chunk = this.cli.recv(this.sock);
+    u8[] chunk = this.cli.recv(this.sock).wait();
     if (chunk.len() == 0) { return false; }
     this.buf.pushAll(chunk);
     return true;
@@ -62,15 +62,15 @@ export struct Conn {
   bool sendPacket(this, u8[] payload) {
     i32 block = minBlock();
     if (this.encrypted) {
-      u8[] pad = this.core.randomBytes(aeadPaddingFor(payload.len(), block));
+      u8[] pad = this.core.randomBytes(aeadPaddingFor(payload.len(), block)).wait();
       u8[] packet = seal(this.keyOut, this.seqOut, payload, pad, block);
       this.seqOut++;
-      return this.cli.send(this.sock, packet);
+      return this.cli.send(this.sock, packet).wait();
     }
-    u8[] pad = this.core.randomBytes(paddingFor(payload.len(), block));
+    u8[] pad = this.core.randomBytes(paddingFor(payload.len(), block)).wait();
     u8[] packet = frame(payload, pad, block);
     this.seqOut++;
-    return this.cli.send(this.sock, packet);
+    return this.cli.send(this.sock, packet).wait();
   }
 
   /**

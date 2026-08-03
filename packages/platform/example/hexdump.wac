@@ -13,18 +13,18 @@ import { Cli, Core, FileResult, Stat } from "../src/platform.wac";
 export i32 main(Core core, Cli cli) {
   u8[] data = u8[0]();
 
-  if (cli.argCount() < 1) {
-    data = cli.readStdin();
+  if (cli.argCount().wait() < 1) {
+    data = cli.readStdin().wait();
   } else {
-    string path = cli.arg(0);
-    Stat st = cli.stat(path);
+    string path = cli.arg(0).wait();
+    Stat st = cli.stat(path).wait();
     if (!st.exists) {
       core.warn("hexdump: " + path + ": not found");
       return 1;
     }
     if (st.isDir) {
       // A directory is not bytes, so list it instead — and prove `readDir` works.
-      string[]? names = cli.readDir(path);
+      string[]? names = cli.readDir(path).wait();
       if (names is null) {
         core.warn("hexdump: " + path + ": cannot list");
         return 1;
@@ -33,7 +33,7 @@ export i32 main(Core core, Cli cli) {
       for (i32 i = 0; i < found.len(); i++) { core.log(found[i]); }
       return 0;
     }
-    FileResult f = cli.readFile(path);
+    FileResult f = cli.readFile(path).wait();
     if (!f.ok) {
       core.warn("hexdump: " + path + ": " + f.error);
       return 1;

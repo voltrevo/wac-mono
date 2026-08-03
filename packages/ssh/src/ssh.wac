@@ -38,12 +38,12 @@ export i32 main(Core core, Cli cli) {
   if (o.exitCode >= 0) { return o.exitCode; }
 
   // ── The private key ─────────────────────────────────────────────────────────
-  FileResult keyFile = cli.readFile(o.identity);
+  FileResult keyFile = cli.readFile(o.identity).wait();
   if (!keyFile.ok) {
     core.warn("ssh: " + o.identity + ": " + keyFile.error);
     return 1;
   }
-  string? passphrase = cli.env("SSH_PASSPHRASE");
+  string? passphrase = cli.env("SSH_PASSPHRASE").wait();
   u8[] pass = (passphrase is null) ? u8[0]() : passphrase!.toBytes();
   PrivateKey key = readEd25519(keyFile.bytes, pass);
   match (key.error) {
@@ -68,7 +68,7 @@ export i32 main(Core core, Cli cli) {
   }
 
   // ── Connect and hand over to the transport ──────────────────────────────────
-  Socket sock = cli.connect(o.host, o.port);
+  Socket sock = cli.connect(o.host, o.port).wait();
   if (sock.handle < 0) {
     core.warn("ssh: " + o.host + ": " + sock.error);
     return 1;
@@ -117,7 +117,7 @@ export i32 main(Core core, Cli cli) {
  */
 i32 checkHost(Core core, Cli cli, Options o, u8[] hostKey) {
   string path = o.home + "/.ssh/known_hosts";
-  FileResult f = cli.readFile(path);
+  FileResult f = cli.readFile(path).wait();
   u8[] contents = f.ok ? f.bytes : u8[0]();
 
   string name = o.port == defaultPort() ? o.host : "[" + o.host + "]:" + itoa(o.port);
@@ -149,7 +149,7 @@ i32 checkHost(Core core, Cli cli, Options o, u8[] hostKey) {
       u8[] updated = (contents.len() > 0 && contents[contents.len() - 1] != 10)
         ? joinBytes(contents, ("\n" + line + "\n").toBytes())
         : joinBytes(contents, (line + "\n").toBytes());
-      if (!cli.writeFile(path, updated)) {
+      if (!cli.writeFile(path, updated).wait()) {
         core.warn("ssh: cannot write " + path + " — was --allow-write granted?");
         return 1;
       }
@@ -175,7 +175,7 @@ struct Options {
 Options bad(i32 code) { return Options("", "", 0, "", "", "", false, code); }
 
 Options parseArgs(Core core, Cli cli) {
-  string? home = cli.env("HOME");
+  string? home = cli.env("HOME").wait();
   string homeDir = (home is null) ? "" : home!;
 
   i32 port = defaultPort();
@@ -185,19 +185,19 @@ Options parseArgs(Core core, Cli cli) {
   string command = "";
 
   i32 i = 0;
-  i32 n = cli.argCount();
+  i32 n = cli.argCount().wait();
   while (i < n) {
-    string a = cli.arg(i);
+    string a = cli.arg(i).wait();
     if (a == "-p" && i + 1 < n) {
       i++;
-      port = atoi(cli.arg(i));
+      port = atoi(cli.arg(i).wait());
       if (port <= 0 || port > 65535) {
-        core.warn("ssh: bad port: " + cli.arg(i));
+        core.warn("ssh: bad port: " + cli.arg(i).wait());
         return bad(2);
       }
     } else if (a == "-i" && i + 1 < n) {
       i++;
-      identity = cli.arg(i);
+      identity = cli.arg(i).wait();
     } else if (a == "-k") {
       addHost = true;
     } else if (target == "") {
@@ -222,7 +222,7 @@ Options parseArgs(Core core, Cli cli) {
     user = target.slice(0, at);
     host = target.slice(at + 1, target.len());
   } else {
-    string? envUser = cli.env("USER");
+    string? envUser = cli.env("USER").wait();
     user = (envUser is null) ? "" : envUser!;
   }
   if (user == "") {

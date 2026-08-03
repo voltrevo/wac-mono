@@ -30,13 +30,13 @@ export i32 tar(Core core, Cli cli, Args a) {
 
 /** One path, and everything under it if it is a directory. */
 bool add(Core core, Cli cli, string path, string name) {
-  Stat st = cli.stat(path);
+  Stat st = cli.stat(path).wait();
   if (!st.exists) { core.warn(name + ": " + path + ": not found"); return false; }
 
   if (st.isDir) {
     // The directory's own entry first, so an empty one survives the round trip.
     cli.write(header(path + "/", 0, st.modifiedMillis, '5'));
-    string[]? names = cli.readDir(path);
+    string[]? names = cli.readDir(path).wait();
     if (names is null) { core.warn(name + ": " + path + ": cannot list"); return false; }
     string[] found = names!;
     bool ok = true;
@@ -46,7 +46,7 @@ bool add(Core core, Cli cli, string path, string name) {
     return ok;
   }
 
-  FileResult f = cli.readFile(path);
+  FileResult f = cli.readFile(path).wait();
   if (!f.ok) { core.warn(name + ": " + path + ": " + f.error); return false; }
   cli.write(header(path, f.bytes.len(), st.modifiedMillis, '0'));
   cli.write(f.bytes);

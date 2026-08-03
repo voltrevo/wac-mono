@@ -20,7 +20,7 @@ export struct Input { bool ok; u8[] bytes; string label; }
  */
 export Input openStream(Core core, Cli cli, Args a, i32 n) {
   string path = a.rest.len() <= n ? "" : a.rest[n];
-  string error = cli.openInput(path);
+  string error = cli.openInput(path).wait();
   if (error == "") { return Input(true, u8[0](), path); }
   core.warn(a.name + ": " + path + ": " + error);
   return Input(false, u8[0](), path);
@@ -28,9 +28,9 @@ export Input openStream(Core core, Cli cli, Args a, i32 n) {
 
 /** Positional argument `n` names a file; without one, standard input. */
 export Input readInput(Core core, Cli cli, Args a, i32 n) {
-  if (a.rest.len() <= n) { return Input(true, cli.readStdin(), ""); }
+  if (a.rest.len() <= n) { return Input(true, cli.readStdin().wait(), ""); }
   string path = a.rest[n];
-  FileResult f = cli.readFile(path);
+  FileResult f = cli.readFile(path).wait();
   if (!f.ok) {
     core.warn(a.name + ": " + path + ": " + f.error);
     return Input(false, u8[0](), path);

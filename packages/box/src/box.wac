@@ -85,8 +85,8 @@ import { yes } from "./applets/yes.wac";
 import { zstd } from "./applets/zstd.wac";
 
 export i32 main(Core core, Cli cli) {
-  if (cli.argCount() < 1) { return usage(core); }
-  string applet = cli.arg(0);
+  if (cli.argCount().wait() < 1) { return usage(core); }
+  string applet = cli.arg(0).wait();
   Args a = parseArgs(cli);
 
   if (applet == "base32")    { return base32(core, cli, a); }
