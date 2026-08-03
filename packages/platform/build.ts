@@ -280,8 +280,20 @@ export async function buildApp(
       await Deno.writeTextFile(out, PAGE.replaceAll("%TITLE%", title).replace("%LAUNCHER%", launcher));
       return;
     }
-    await Deno.writeTextFile(out, shebangFor(grants, target) + launcher);
-    await Deno.chmod(out, 0o755);
+    // Written beside the destination and renamed into place, rather than written where it
+    // will be run from.
+    //
+    // Two reasons, one of which cost a red suite. A path that has just been open for writing
+    // can fail to execute with `ETXTBSY` — `Text file busy` — and the window is small enough
+    // that a test which builds and immediately spawns hits it only under load, which is
+    // exactly when it is least welcome: `box`'s TCP test failed that way once in a full run
+    // and passed alone every time. A rename means the executable was never the file being
+    // written. It is also atomic, so a build interrupted halfway leaves the previous binary
+    // rather than a truncated one that starts and then stops making sense.
+    const partial = out + ".partial";
+    await Deno.writeTextFile(partial, shebangFor(grants, target) + launcher);
+    await Deno.chmod(partial, 0o755);
+    await Deno.rename(partial, out);
   } finally {
     await Deno.remove(work, { recursive: true });
   }
