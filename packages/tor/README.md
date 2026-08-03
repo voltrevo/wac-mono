@@ -148,6 +148,24 @@ Eleven seconds on every bootstrap would not have been a subtle degradation — i
 difference between a usable client and one nobody would run. Worth remembering that the
 testnet cannot show it, and neither can any test written against the testnet.
 
+`audit/audit.ts` is the same idea for *behaviour* rather than speed, and it found the other
+thing the testnet could not. The authorities publish nineteen bandwidth weights and `Wge` is
+not among them; tor hardcodes `We = 0` for the guard position. This defaulted it to 10000
+with the rest — invisible, because `eligible` rejects a relay without the Guard flag before
+the weight is consulted, so two independent things gave the same answer. The day the flag
+check moves, the weight is what would have been holding the line, and at 10000 it would not
+have been.
+
+What the audit reports on a real consensus, all as it should be:
+
+- all eighteen published weights parsed, `Wgg=5983` rather than the neutral default
+- guard selection matches the weighted bandwidths to within sampling noise across every
+  decile of weight — 0.997, 1.000, 1.016, … for the deciles that carry the mass
+- no relay with zero weight ever chosen
+- 5341 relays in a family, the largest 357 members, 3.7% of the network
+- paths build 200 out of 200 for ports 443, 80, 22 and 25, always three distinct addresses,
+  though port 25 has only 108 usable exits — mail is widely refused
+
 ## Choosing a path
 
 The part whose failures are silent. A wrong handshake breaks the circuit; a wrong path

@@ -1,0 +1,63 @@
+// Path selection's behaviour on a real consensus, not just its speed.
+import { Relay, parseConsensus, attachMicrodescriptors, hasFlag } from "../src/directory.wac";
+import { parseWeights, resolveFamilies, Families, pick, weightedBandwidths, eligible,
+         positionGuard, positionMiddle, positionExit } from "../src/pathsel.wac";
+
+export i64[] weightsOf(u8[] doc) { return parseWeights(doc); }
+
+/** The weighted bandwidth each relay gets at `position` — what selection is proportional to. */
+export i64[] weightedAt(u8[] doc, u8[] micros, i32 position, i32 port) {
+  Relay[] r = parseConsensus(doc);
+  attachMicrodescriptors(r, micros);
+  i64[] w = weightedBandwidths(r, position, parseWeights(doc));
+  for (i32 i = 0; i < r.len(); i++) {
+    if (!eligible(r[i], position, port)) { w[i] = 0; }
+  }
+  return w;
+}
+
+/** How often each relay is chosen as a guard over `samples` draws. */
+export i32[] guardHistogram(u8[] doc, u8[] micros, i32 samples) {
+  Relay[] r = parseConsensus(doc);
+  attachMicrodescriptors(r, micros);
+  Families f = resolveFamilies(r);
+  i64[] w = parseWeights(doc);
+  i32[] counts = i32[r.len()]();
+  for (i32 i = 0; i < samples; i++) {
+    i32 g = pick(r, w, f, positionGuard(), i32[0](), 0, false, (i as i64) * 2654435761 + 11);
+    if (g >= 0) { counts[g]++; }
+  }
+  return counts;
+}
+
+/** Family sizes, as an edge count per relay — to see whether any family is pathological. */
+export i32[] familySizes(u8[] doc, u8[] micros) {
+  Relay[] r = parseConsensus(doc);
+  attachMicrodescriptors(r, micros);
+  Families f = resolveFamilies(r);
+  i32[] sizes = i32[r.len()]();
+  for (i32 i = 0; i < r.len(); i++) { sizes[i] = f.start[i + 1] - f.start[i]; }
+  return sizes;
+}
+
+/** Full paths for a port: how many of `n` succeed, and whether hops ever repeat a /16. */
+export i32[] pathAudit(u8[] doc, u8[] micros, i32 n, i32 port) {
+  Relay[] r = parseConsensus(doc);
+  attachMicrodescriptors(r, micros);
+  Families f = resolveFamilies(r);
+  i64[] w = parseWeights(doc);
+  i32 built = 0;
+  i32 distinctSubnets = 0;
+  for (i32 i = 0; i < n; i++) {
+    i64 rnd = (i as i64) * 6364136223846793005 + 1442695040888963407;
+    i32 e = pick(r, w, f, positionExit(), i32[0](), port, false, rnd < 0 ? -rnd : rnd);
+    if (e < 0) { continue; }
+    i32 g = pick(r, w, f, positionGuard(), i32[](e), 0, false, (rnd < 0 ? -rnd : rnd) + 7);
+    if (g < 0) { continue; }
+    i32 m = pick(r, w, f, positionMiddle(), i32[](e, g), 0, false, (rnd < 0 ? -rnd : rnd) + 13);
+    if (m < 0) { continue; }
+    built++;
+    if (r[e].address != r[g].address && r[g].address != r[m].address) { distinctSubnets++; }
+  }
+  return i32[](built, distinctSubnets);
+}
