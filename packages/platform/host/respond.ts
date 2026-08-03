@@ -83,7 +83,23 @@ export function serveHostCalls(
     b.res(slot).set(body, 0);
     Atomics.store(b.ctrl, at + S_RES_LEN, body.length);
     Atomics.store(b.ctrl, at + S_RES_STATUS, status);
-    Atomics.store(b.ctrl, at + S_STATUS, ST_READY);
+
+    // Published with a compare-and-exchange, for the same reason `take` takes with one, and it
+    // is the last store rather than the first because it is what makes the rest visible.
+    //
+    // A cancel can land between the ownership check above and this line. A plain store then
+    // overwrote `ST_CANCELLED` with `ST_READY`, and the slot was stranded: the worker's ticket
+    // is dead so it will never collect, and the sweep only ever looks at pending and cancelled
+    // slots, so it would never hand it back either. One slot gone for the life of the program,
+    // per losing race. The mirror image of the `take` case, and the fuzzer found this one too —
+    // at the eighth seed, where four seeds had passed.
+    //
+    // The payload is written before the exchange, which is safe rather than tidy: only the host
+    // writes a response, and the worker reads one only after seeing `ST_READY`. So a losing
+    // exchange leaves bytes in a buffer that the slot's next owner overwrites before publishing.
+    if (Atomics.compareExchange(b.ctrl, at + S_STATUS, ST_RUNNING, ST_READY) !== ST_RUNNING) {
+      return;   // no longer ours; the sweep hands the slot back
+    }
     Atomics.add(b.ctrl, DONE_SEQ, 1);
     Atomics.notify(b.ctrl, DONE_SEQ);
   };
@@ -118,7 +134,21 @@ export function serveHostCalls(
     const op = Atomics.load(b.ctrl, at + S_OP);
     const len = Atomics.load(b.ctrl, at + S_REQ_LEN);
     const payload = b.req(slot).slice(0, len);
-    Atomics.store(b.ctrl, at + S_STATUS, ST_RUNNING);
+
+    // Taken with a compare-and-exchange, not a store.
+    //
+    // The sweep saw `ST_PENDING` a moment ago and the worker may have cancelled since. A plain
+    // store would overwrite `ST_CANCELLED` with `ST_RUNNING`, and then nobody owns the slot:
+    // the worker believes it is cancelled and will not collect, the sweep never sees a
+    // cancelled slot to hand back, and the answer is dropped because the generation moved. The
+    // slot stays `RUNNING` for the life of the program — one fewer for good, and four of those
+    // is a ring that cannot be used. Found by `fuzz.test.ts` on its first run, in the
+    // end-of-run check that every slot came back free.
+    if (
+      Atomics.compareExchange(b.ctrl, at + S_STATUS, ST_PENDING, ST_RUNNING) !== ST_PENDING
+    ) {
+      return;   // cancelled between the sweep and here; the next sweep hands it back
+    }
 
     if (op === OP_CONTINUE) {
       send(slot, pending[slot] ?? EMPTY);

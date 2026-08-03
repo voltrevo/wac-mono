@@ -228,6 +228,34 @@ is. `hostCall` is still submit-then-collect and does the same atomics the single
 did, so nothing that has no reason to overlap pays for the ability to: about 3% on this
 package's suite.
 
+### Who owns a slot
+
+Every state change on a slot is a compare-and-exchange, not a store, and every answer is
+checked against the slot's **generation** before it is written. That is not defensive style; it
+is four bugs, all the same shape — the host and the worker disagreeing about whose call a slot
+holds — and all four were live in a bridge whose tests passed:
+
+| what happened | how it showed |
+|---|---|
+| `claim` published a slot as pending before the opcode was written | `no handler for capability 0` |
+| a cancelled call's answer written into the slot another call had claimed | issue 0023: a 30-second bound expiring after 15 |
+| `take` overwrote a cancel with `RUNNING`, so nobody owned the slot | a slot lost for the life of the program |
+| `reply` overwrote a cancel with `READY`, same result | a slot lost, and the answer unclaimable |
+
+The last two are invisible until the ring runs out, and then the failure is a park in whatever
+call happens to be next. The first was unhittable at four slots and appeared within three suite
+runs at sixteen. Only the second was ever reported from the field, and only because a tor client
+was dropping healthy relays.
+
+So `test/fuzz.test.ts` exists: a seeded random sequence of submit, cancel, collect and waitAny
+against a host that answers at delays and sizes the request itself specifies, so the whole thing
+is deterministic and a failure replays from its seed. Every request carries a nonce the handler
+echoes, which turns cross-talk from something you infer into something the harness catches, and
+the run ends by checking that every slot came back free. It caught the third and fourth bugs and
+catches all four when they are put back — each with its own signature. Eight seeds in the suite,
+about a second; `WAC_FUZZ_SEEDS=250` for a deep sweep, which is what to run after touching
+`call.ts`, `respond.ts` or `layout.ts`. The fourth bug was at the eighth seed.
+
 ### Deadlines
 
 Nothing bounded how long a capability could take, and a peer that finished the handshake and
