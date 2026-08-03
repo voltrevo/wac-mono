@@ -30,6 +30,19 @@ type Wacsshd = { dir: string; port: number; proc: Deno.ChildProcess; stderr: Pro
  * container ran out of process ids. Running the built binary directly means the handle we hold
  * is the process we kill.
  */
+/** The client, built once, for the both-ends-in-wac test. See the note in `cli.test.ts`. */
+const sshBinary = await (async () => {
+  const out = await Deno.makeTempFile({ prefix: "wac-ssh-" });
+  const r = await new Deno.Command("deno", {
+    args: [
+      "run", "-A", "packages/platform/build.ts", "packages/ssh/src/ssh.wac",
+      "--allow-read", "--allow-net", "--allow-env", "-o", out,
+    ],
+  }).output();
+  if (!r.success) throw new Error(`building ssh failed: ${new TextDecoder().decode(r.stderr)}`);
+  return out;
+})();
+
 const wacsshdBinary = await (async () => {
   const out = await Deno.makeTempFile({ prefix: "wacsshd-" });
   const r = await new Deno.Command("deno", {
@@ -273,12 +286,11 @@ Deno.test({
       await Deno.writeTextFile(`${home}/.ssh/known_hosts`,
         `[127.0.0.1]:${s.port} ssh-ed25519 ${hostBlob}\n`);
 
-      const r = await new Deno.Command("deno", {
-        args: [
-          "run", "-A", "packages/platform/app.ts", "packages/ssh/src/ssh.wac",
-          "--allow-read", "--allow-net", "--allow-env", "--",
-          "-p", String(s.port), "127.0.0.1", "echo", "both", "ends", "in", "wac",
-        ],
+      // The built client, not `platform/app.ts`: the launcher spawns the application and forwards
+      // no signals, so each call left an orphan behind. Same reason the server binary above is
+      // built once — wac-mono issue 0017.
+      const r = await new Deno.Command(sshBinary, {
+        args: ["-p", String(s.port), "127.0.0.1", "echo", "both", "ends", "in", "wac"],
         env: { HOME: home, USER: "claude" },
         clearEnv: false,
       }).output();

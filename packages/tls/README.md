@@ -234,10 +234,18 @@ proxy arrived as 44KB in one chunk — eighty records with the last one cut in h
 client aborted. It is a fast-connection bug, not a slow-connection one, which is the opposite
 of where anyone looks for a framing fault.
 
-So: **every caller must frame, and the shape is the same each time.** Accumulate raw bytes,
-walk `recordLength` from the front while a whole record fits, feed that prefix, keep the
-remainder. `box/src/applets/gets.wac` and `tor/src/link.wac` (as `wholeRecordBytes`) both do
-it; the second copied the first only after failing in production. If a third caller appears,
-the buffering probably belongs in this package behind a `tlsClientFeedStream` — the argument
-against it was that only one place should decide where a record ends, and the answer to that
-is one shared implementation rather than one rule and three copies.
+The root cause was an **asymmetric API**. The server side has had `tlsRecordNeeded` since it
+was written; the client side had only `recordLength`, so every client-side caller was invited
+to write the loop itself — and of the two that did, one was correct and one was silently
+wrong. That is the expected score for an unwritten convention.
+
+So the loop is now `recordsReady(buf)` in `record.wac`, next to the framing it belongs to.
+Accumulate raw bytes, ask it how much is whole, feed that prefix, keep the remainder.
+`tor/src/link.wac` uses it; `box/src/applets/gets.wac` still has its own correct copy and
+should adopt it (issue 0026).
+
+Both helpers are wanted and they answer different questions. `tlsRecordNeeded` says how many
+more bytes until *one* record is complete, which suits a reader sizing its next read.
+`recordsReady` says how much of what you are already holding is whole records, which suits a
+reader handed an arbitrary chunk that may contain eighty. The tor bug was the second question
+answered with the first one's shape.

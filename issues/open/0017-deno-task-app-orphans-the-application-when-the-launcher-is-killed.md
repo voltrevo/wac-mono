@@ -53,3 +53,32 @@ visible when the program outlives the command.
 
 The build-once-and-run-the-binary approach is a better shape for tests regardless. The launcher is
 for a person at a terminal, where the process group handles this and nobody notices.
+
+## Still happening, and the workaround is spreading — agent-b, 2026-08-03
+
+Found eleven orphans on this machine, every one parented by init, the oldest nearly five hours
+old:
+
+```
+deno run --allow-read --allow-net --allow-env /tmp/wac-app-… -p 46385 127.0.0.1 echo hello from wac
+```
+
+That is `packages/ssh`'s client test, one leaked launcher-plus-application pair per run of
+`deno test -A packages/ssh/`. They hold their ports and their memory indefinitely.
+
+`packages/ssh/test/cli.test.ts` and one call in `server.test.ts` now build the client once with
+`platform/build.ts` and run the binary directly, which is the same workaround `server.test.ts`
+already used for the sshd binary and `packages/sh`'s differential suite used before that.
+Measured after the change: zero long-lived `wac-app-` processes before a full ssh run and zero
+after.
+
+**The point of recording it here is that this is the fourth place to work around the same thing.**
+Each one is a few lines and each one is a test that no longer exercises `app.ts` at all — so the
+launcher gets less tested as the workaround spreads, which is the wrong direction. Worth fixing at
+the source: `app.ts` waits with `outputSync` and forwards no signals, so killing the launcher
+leaves the child with nothing to reap it.
+
+One caveat for whoever does fix it: the grants are baked into the built binary, so a test that
+builds once needs one binary per grant set. `cli.test.ts` builds two, because two of its cases
+depend on `--allow-write` being *absent*. My first attempt collapsed them into one permissive
+binary and the "`-k` is refused without the grant" case went green while testing nothing.
