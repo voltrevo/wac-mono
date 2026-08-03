@@ -261,6 +261,30 @@ Two things worth knowing, both learnt from a real relay rather than from the spe
 Verified against tor: the relay logs `Negotiated padding=1, lo=1500, hi=3000`, and once a
 three-hop circuit exists, padding cells arrive.
 
+## Fuzzing found a remote crash
+
+`test/wac/fuzz_test.wac` feeds every parser bytes a relay chose: cell framing, relay cell
+bodies, consensus and microdescriptor text, HTTP responses, the small length-prefixed
+decoders. It found one real bug on the first run.
+
+A relay cell body carries a two-byte length field, which reaches 65535 while the body holds
+498. `relayPayload` trapped on the difference, and `Circuit.receive` calls it on every
+recognised cell — so a single malformed cell from a hop in our own path aborted the client.
+`decodeCreated2` and `extended2Reply` had the same shape.
+
+The lesson is not the arithmetic, it is who gets to choose. A hop is authenticated by ntor,
+and authenticated is not friendly: it is a stranger from a public directory, and it is
+exactly the adversary the three-hop design assumes. All three are total functions now, and a
+bad length is a dead circuit rather than a dead process.
+
+**wac made this a crash rather than a disclosure.** Bounds checks turn a length-field bug
+into a deterministic abort instead of a read into whatever is next in memory — a real
+advantage over the C this protocol is usually written in, and still not something to leave
+reachable.
+
+The generator is a deterministic PRNG, because a fuzz test that finds something on Tuesday
+and cannot reproduce it on Wednesday is a rumour.
+
 ## Relay cells, and the two things that are easy to get wrong
 
 **The digest is a running hash, not a per-cell one.** Each direction has a SHA-1 seeded at

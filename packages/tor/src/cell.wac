@@ -235,9 +235,11 @@ export u8[] encodeCreate2(i32 circId, i32 hType, u8[] handshake) {
  * the ntor code 445 bytes of padding.
  */
 export u8[] decodeCreated2(u8[] payload) {
-  if (payload.len() < 2) { trap; }
+  if (payload.len() < 2) { return u8[0](); }
   i32 len = (payload[0] << 8) | payload[1];
-  if (2 + len > payload.len()) { trap; }
+  // Empty rather than a trap: the relay chose this length, and an empty handshake reply
+  // fails ntor's AUTH check, which is the right outcome and does not abort the process.
+  if (2 + len > payload.len()) { return u8[0](); }
   u8[] out = u8[len]();
   for (i32 i = 0; i < len; i++) { out[i] = payload[2 + i]; }
   return out;
