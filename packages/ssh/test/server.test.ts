@@ -322,3 +322,38 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "a refused pty-req is answered, because that request did want a reply",
+  ignore: !haveSshd,
+  sanitizeResources: false,
+  async fn() {
+    const s = await startWacsshd();
+    try {
+      // The other half of the `want_reply` rule, and the half the `SendEnv` test above cannot
+      // reach. That one proves we stay *silent* for requests that asked for nothing; this proves
+      // we still *answer* one that asked. Without it, `requestWantsReply` could return a constant
+      // `false` and the whole suite stayed green — which is exactly what mutation testing found.
+      //
+      // `ssh -tt` forces `pty-req` with want_reply set. We refuse it deliberately (no terminal
+      // modes to honour), and the client prints the refusal. No answer at all and there is
+      // nothing for it to print.
+      const r = await new Deno.Command("ssh", {
+        args: [
+          "-tt", "-F", "/dev/null", "-i", `${s.dir}/clientkey`, "-p", String(s.port),
+          "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+          "-o", "BatchMode=yes", "claude@127.0.0.1",
+        ],
+        stdin: "null",
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      const err = text(r.stderr);
+      if (!err.includes("PTY allocation request failed")) {
+        throw new Error(`no refusal reached the client. stderr: ${JSON.stringify(err)}`);
+      }
+    } finally {
+      await stopWacsshd(s);
+    }
+  },
+});
