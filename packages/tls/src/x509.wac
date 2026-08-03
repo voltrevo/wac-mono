@@ -51,6 +51,14 @@ import {
   oidAnyExtKeyUsage, oidNameConstraints, unsignedInteger,
 } from "./asn1.wac";
 
+/**
+ * The time a certificate carries when its date could not be read.
+ *
+ * Far in the past, so `notBefore` comparisons refuse it and `notAfter` comparisons refuse it
+ * too — an unreadable date is never inside a validity window, whichever end it was on.
+ */
+const i64 TIME_UNREADABLE = -62135596800;
+
 /** Key types this understands. */
 export i32 keyEd25519() { return 1; }
 export i32 keyP256() { return 2; }
@@ -134,6 +142,16 @@ export struct Cert {
    */
   bool badCritical;
   /**
+   * Whether the DER read cleanly.
+   *
+   * A malformed certificate produces a `Cert` full of harmless defaults rather than a trap,
+   * so something has to say that it did. Every tampered certificate the fuzzer produced was
+   * rejected anyway — by the signature check, which cannot pass over bytes that were not
+   * what was signed — but relying on that would make the parser's honesty depend on a later
+   * step, and a caller that only wanted to read a name would get no warning at all.
+   */
+  bool wellFormed;
+  /**
    * nameConstraints dNSName subtrees, NUL-separated. Empty means no constraint.
    *
    * These limit what a CA may vouch for. A sub-CA constrained to `example.com` that can
@@ -159,7 +177,12 @@ i64 daysFromCivil(i32 y, i32 m, i32 d) {
   return (era as i64) * 146097 + (doe as i64) - 719468;
 }
 
-i32 twoDigits(u8[] s, i32 at) { return (s[at] - '0') * 10 + (s[at + 1] - '0'); }
+/** Two ASCII digits, or -1 if they are not there or are not digits. */
+i32 twoDigits(u8[] s, i32 at) {
+  if (at < 0 || at + 1 >= s.len()) { return -1; }
+  if (s[at] < '0' || s[at] > '9' || s[at + 1] < '0' || s[at + 1] > '9') { return -1; }
+  return (s[at] - '0') * 10 + (s[at + 1] - '0');
+}
 
 /**
  * A UTCTime or GeneralizedTime, as seconds since the epoch.
@@ -184,8 +207,11 @@ i64 parseTime(u8[] s, bool generalized) {
   i32 hour = twoDigits(s, at + 4);
   i32 minute = twoDigits(s, at + 6);
   i32 second = twoDigits(s, at + 8);
-  if (month < 1 || month > 12 || day < 1 || day > 31) { trap; }
-  if (hour > 23 || minute > 59 || second > 60) { trap; }
+  // A date nobody could have meant. Returning a sentinel rather than trapping: this is
+  // parsing a certificate a stranger sent, and every validity comparison treats the sentinel
+  // as "not valid now", which is the answer an unreadable date deserves.
+  if (month < 1 || month > 12 || day < 1 || day > 31) { return TIME_UNREADABLE; }
+  if (hour > 23 || minute > 59 || second > 60) { return TIME_UNREADABLE; }
   return daysFromCivil(year, month, day) * 86400
        + (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64);
 }
@@ -195,7 +221,7 @@ i64 readTime(Der v) {
   i32 tag = v.peekTag();
   if (tag == tagUtcTime()) { return parseTime(v.element(tagUtcTime()).rest(), false); }
   if (tag == tagGeneralizedTime()) { return parseTime(v.element(tagGeneralizedTime()).rest(), true); }
-  trap;
+  return TIME_UNREADABLE;
 }
 
 /**
@@ -361,7 +387,7 @@ export Cert parseCert(u8[] der) {
 
   return Cert(tbs, signature, sigAlg, keyType, publicKey, rsaExponent, issuer, subject,
               notBefore, notAfter, isCa, pathLen, canSignCerts, dnsNames, ipAddresses,
-              serverAuth, badCritical, permittedDns, excludedDns);
+              serverAuth, badCritical, !top.failed(), permittedDns, excludedDns);
 }
 
 /**
@@ -640,7 +666,9 @@ u8[] ecdsaFromDer(u8[] der, i32 len) {
   Der seq = outer.element(tagSequence());
   u8[] r = unsignedInteger(seq.element(tagInteger()).rest());
   u8[] s = unsignedInteger(seq.element(tagInteger()).rest());
-  if (r.len() > len || s.len() > len) { trap; }
+  // An integer wider than the curve is a malformed signature, not a program error. Empty
+  // here means "no signature to check", and every caller treats that as a failed check.
+  if (r.len() > len || s.len() > len) { return u8[0](); }
   u8[] out = u8[2 * len]();
   for (i32 i = 0; i < r.len(); i++) { out[len - r.len() + i] = r[i]; }
   for (i32 i = 0; i < s.len(); i++) { out[2 * len - s.len() + i] = s[i]; }
@@ -705,6 +733,11 @@ bool nameEquals(u8[] a, u8[] b) { return oidEquals(a, b); }
  * alert to send differs, and so does the advice to a human.
  */
 export i32 verifyChain(Cert leaf, Cert root, u8[] host, i64 now) {
+  // Refused first, and on its own footing. A malformed certificate would fail the signature
+  // check a few lines down anyway, but "the signature did not verify" is the wrong thing to
+  // report about bytes that were never a certificate — and it makes the parser's honesty
+  // depend on a step some callers do not reach.
+  if (!leaf.wellFormed || !root.wellFormed) { return 13; }
   if (now < leaf.notBefore) { return 1; }        // not yet valid
   if (now > leaf.notAfter) { return 2; }         // expired
   if (now < root.notBefore || now > root.notAfter) { return 3; }
@@ -854,9 +887,9 @@ export i32 verifyPath(u8[] chain, i32[] chainOffsets, u8[] roots, i32[] rootOffs
   return 9;                                      // ran past the depth limit
 }
 
-/** A copy of `[start, end)`. */
+/** A copy of `[start, end)`, or empty if that is not a range within `b`. */
 u8[] slice(u8[] b, i32 start, i32 end) {
-  if (start < 0 || end > b.len() || start > end) { trap; }
+  if (start < 0 || end > b.len() || start > end) { return u8[0](); }
   u8[] out = u8[end - start]();
   for (i32 i = 0; i < out.len(); i++) { out[i] = b[start + i]; }
   return out;
