@@ -1,0 +1,40 @@
+// Two reads in flight at once — what the ticket surface is actually for.
+//
+// `readFile` returns before the read has happened. Both are running while this program is
+// between the two lines, and `wait()` collects whichever it asks for.
+
+import { Cli, Core, FileResult, Pending } from "../src/platform.wac";
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount().wait() < 2) {
+    core.warn("usage: overlap <file> <file>");
+    return 2;
+  }
+
+  Pending<FileResult> a = cli.readFile(cli.arg(0).wait());
+  Pending<FileResult> b = cli.readFile(cli.arg(1).wait());
+
+  // Nothing has been waited for yet. Both reads are in the host's hands.
+  core.log(a.isDone() || b.isDone() ? "one finished already" : "both still running");
+
+  FileResult ra = a.wait();
+  FileResult rb = b.wait();
+  if (!ra.ok || !rb.ok) {
+    core.warn("overlap: " + (ra.ok ? rb.error : ra.error));
+    return 1;
+  }
+  core.log(itoa(ra.bytes.len()) + " + " + itoa(rb.bytes.len()) + " bytes");
+  return 0;
+}
+
+/** Decimal, without pulling `fmt` in for a demonstration. */
+string itoa(i32 n) {
+  if (n == 0) { return "0"; }
+  i32 v = n;
+  u8[] digits = u8[12](fill: 0);
+  i32 at = 12;
+  while (v > 0) { at--; digits[at] = '0' + (v % 10); v = v / 10; }
+  u8[] used = u8[12 - at](fill: 0);
+  used.copyFrom(digits, at, 0, 12 - at);
+  return string.fromBytes(used);
+}
