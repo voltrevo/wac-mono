@@ -41,6 +41,8 @@ export type AppModule = {
   Pending_FileResult: { of(...a: unknown[]): unknown };
   Pending_Stat: { of(...a: unknown[]): unknown };
   Pending_Socket: { of(...a: unknown[]): unknown };
+  Pending_Child: { of(...a: unknown[]): unknown };
+  Child: { of(...a: unknown[]): unknown };
   main: (core: unknown, cli: unknown) => number;
 };
 

@@ -1,0 +1,93 @@
+// Spawning a wac program from a wac program.
+//
+// The design claim under test is that **a child is a handle**: `send` is its standard input,
+// `recv` is its output, `closeFeed` ends its input without stopping it, `exitCode` waits, and
+// `waitAny` works across a child and a socket together because neither knows what the other
+// is. If any of that needed a child-shaped special case, the design would be wrong.
+
+import { buildApp } from "../build.ts";
+
+/** Local, because this repo has no third-party dependencies. */
+function assertEquals<T>(got: T, want: T, msg?: string): void {
+  if (got !== want) {
+    throw new Error(
+      `assertEquals failed${msg === undefined ? "" : ` — ${msg}`}\n` +
+        `  got:  ${JSON.stringify(got)}\n  want: ${JSON.stringify(want)}`,
+    );
+  }
+}
+
+Deno.test("a wac program runs another wac program as a worker", async () => {
+  const runner = await Deno.makeTempFile({ prefix: "wac-runner-" });
+  const child = await Deno.makeTempFile({ prefix: "wac-child-", suffix: ".worker.js" });
+  try {
+    await buildApp("packages/platform/example/runner.wac", runner, { read: true });
+    // `--worker` emits the worker bundle alone — the half that expects a SharedArrayBuffer by
+    // postMessage. That is what `spawn` takes, and it is how a wac program becomes a child.
+    await buildApp("packages/platform/example/wc.wac", child, {}, "deno", true);
+
+    // No shebang and not executable: a worker bundle is not a program of its own, and giving
+    // it one would invite someone to run it and get silence.
+    const head = (await Deno.readTextFile(child)).slice(0, 2);
+    assertEquals(head === "#!", false, "a worker bundle must not look runnable");
+
+    const r = new Deno.Command(runner, {
+      args: [child, "one two three"],
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+
+    assertEquals(r.code, 0, new TextDecoder().decode(r.stderr));
+    // The child counted what the parent sent it, and its output came back through the handle
+    // rather than to the terminal — which is the whole of the plumbing being right.
+    assertEquals(
+      new TextDecoder().decode(r.stdout).trim(),
+      "1 3 14",
+      new TextDecoder().decode(r.stdout),
+    );
+  } finally {
+    await Deno.remove(runner);
+    await Deno.remove(child);
+  }
+});
+
+Deno.test("a child is granted nothing, even by a parent that has it", async () => {
+  // The property that makes `spawn` worth having over process spawn: what the child may do
+  // is the *parent's* choice, not the operating system's. `--allow-run=/bin/sh` cannot
+  // express this at any granularity, because the child there inherits the OS's authority.
+  //
+  // Compared against the same program run directly, so the difference is the only variable.
+  // It is not a sandbox against arbitrary JavaScript — see the note in platform.wac — but for
+  // a wac child the language makes it hold, because wac cannot reach past what it was handed.
+  const runner = await Deno.makeTempFile({ prefix: "wac-grant-" });
+  const direct = await Deno.makeTempFile({ prefix: "wac-probe-" });
+  const child = await Deno.makeTempFile({ prefix: "wac-probe-c-", suffix: ".worker.js" });
+  try {
+    await buildApp("packages/platform/example/runner.wac", runner, { read: true });
+    await buildApp("packages/platform/example/probe.wac", direct, { read: true, net: true });
+    await buildApp("packages/platform/example/probe.wac", child, { read: true, net: true }, "deno", true);
+
+    // Directly, with both grants: the read works. The connection fails because nothing is
+    // listening on port 1, which the probe reports as `failed` rather than `denied` — the
+    // distinction being the point of reporting the host's message at all.
+    const alone = new Deno.Command(direct, { stdout: "piped", stderr: "piped" }).outputSync();
+    assertEquals(alone.code, 0, new TextDecoder().decode(alone.stderr));
+    assertEquals(new TextDecoder().decode(alone.stdout).trim(), "read=ok net=failed");
+
+    // The same program, as a child of a parent that *does* have the filesystem. Its own
+    // build grants are irrelevant: the world it is given decides, and it is given nothing.
+    const spawned = new Deno.Command(runner, {
+      args: [child, ""],
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    assertEquals(spawned.code, 0, new TextDecoder().decode(spawned.stderr));
+    assertEquals(
+      new TextDecoder().decode(spawned.stdout).trim(),
+      "read=denied net=denied",
+      new TextDecoder().decode(spawned.stdout),
+    );
+  } finally {
+    for (const f of [runner, direct, child]) await Deno.remove(f);
+  }
+});

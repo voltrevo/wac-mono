@@ -165,6 +165,19 @@ export struct Socket {
   string error;
 }
 
+/**
+ * A spawned worker, or why there isn't one.
+ *
+ * The handle goes to `recv`, `send`, `waitAny` and `closeSocket` exactly as a socket's does.
+ * That is the point of the design: a child is not a new kind of thing, so a shell running
+ * `a | b` reads one handle and writes another, and watching a child beside a socket is
+ * `waitAny` over two handles that happen to have different origins.
+ */
+export struct Child {
+  i32 handle;      // negative when `error` is set
+  string error;
+}
+
 export struct Cli {
   fn[Pending<i32>()] argCount;
   fn[Pending<string>(i32)] arg;
@@ -318,6 +331,43 @@ export struct Cli {
    */
   fn[i32(i32[])] waitAny;
 
+  /**
+   * Start a worker on `source`, with `args` as its arguments.
+   *
+   * `source` is JavaScript — a worker bundle that expects the bridge protocol. Running a
+   * *program* is therefore two steps, read it and spawn it, which is why there is no
+   * registry of launchable things here: the capability is "run this", and where the code
+   * came from is the caller's business and the filesystem's.
+   *
+   * The child talks through its handle. What it writes arrives at `recv(handle)`; what
+   * `send(handle, bytes)` carries becomes its standard input; `closeSocket(handle)` stops
+   * it. `exitCode(handle)` waits for it to finish.
+   *
+   * **It is granted nothing but those streams.** Every other capability is denied to it.
+   * Passing a subset of the parent's grants through is the next step and is not here — a
+   * child that could be handed the filesystem is a larger decision than one that can only
+   * speak.
+   *
+   * **The confinement is this language's, not the runtime's.** A wac child cannot reach
+   * past what it was handed because wac has no ambient anything. Arbitrary JavaScript in a
+   * worker can: it inherits the process's permissions, and dropping them needs an unstable
+   * Deno flag that would appear in the shebang of every program that spawns. So this is a
+   * composition and concurrency primitive rather than a sandbox. See wac-mono issue 0015.
+   */
+  fn[Pending<Child>(string, string[])] spawn;
+
+  /**
+   * End a spawned worker's standard input without stopping it.
+   *
+   * Distinct from `closeSocket`, which stops the child outright. A program that reads to the
+   * end before answering — `wc` is the obvious one — needs the end to arrive while it is
+   * still running, and killing it instead means it never speaks.
+   */
+  fn[void(i32)] closeFeed;
+
+  /** Wait for a spawned worker to finish. Negative if it failed to run at all. */
+  fn[Pending<i32>(i32)] exitCode;
+
 
   Cli of(
     fn[Pending<i32>()] argCount,
@@ -341,12 +391,15 @@ export struct Cli {
     fn[Pending<u8[]>(i32)] recv,
     fn[Pending<bool>(i32, u8[])] send,
     fn[void(i32)] closeSocket,
-    fn[i32(i32[])] waitAny
+    fn[i32(i32[])] waitAny,
+    fn[Pending<Child>(string, string[])] spawn,
+    fn[void(i32)] closeFeed,
+    fn[Pending<i32>(i32)] exitCode
   ) {
     return Cli(
       argCount, arg, env, readStdin, write, readFile, writeFile, stat, readDir,
       mkdir, remove, rename, openInput, readChunk, openOutput,
-      connect, listen, accept, recv, send, closeSocket, waitAny
+      connect, listen, accept, recv, send, closeSocket, waitAny, spawn, closeFeed, exitCode
     );
   }
 }

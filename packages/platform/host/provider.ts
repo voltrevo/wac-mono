@@ -61,6 +61,7 @@ export type PendingClasses = {
   Pending_FileResult: PendingClass;
   Pending_Stat: PendingClass;
   Pending_Socket: PendingClass;
+  Pending_Child: PendingClass;
 };
 
 /**
@@ -83,14 +84,19 @@ export function coreOf(
   const asBytes = (t: Ticket) => cls.Pending_u8Arr.of(pack(t), bytes, settled, drop);
 
   return cls.Core.of(
+    /*= nowMillis */
     () => asI64(submit(b, OP.NOW_MILLIS, EMPTY)),
+    /*= monotonicNanos */
     () => asI64(submit(b, OP.MONOTONIC_NANOS, EMPTY)),
+    /*= randomBytes */
     (n: number) => asBytes(submit(b, OP.RANDOM_BYTES, i32le(n))),
     // Submitted *and collected*. A bare submit claims a slot the worker never gives
     // back, so four log lines exhausted the ring and the fifth call parked forever —
     // which showed up as `ls .` failing while `ls somefile` worked, because only the
     // former reached a log loop.
+    /*= log */
     (line: string) => { hostCall(b, OP.LOG, str(line)); },
+    /*= warn */
     (line: string) => { hostCall(b, OP.WARN, str(line)); },
   );
 }
@@ -108,6 +114,7 @@ export function cliOf(
     FileResult: { of(...a: unknown[]): unknown };
     Stat: { of(...a: unknown[]): unknown };
     Socket: { of(...a: unknown[]): unknown };
+    Child: { of(...a: unknown[]): unknown };
   } & PendingClasses,
 ): unknown {
   const settled = (id: number) => isDone(b, unpack(id));
@@ -146,11 +153,14 @@ export function cliOf(
   const fileResult = (id: number) => {
     try {
       return cls.FileResult.of(true, collect(b, unpack(id)), "");
+    /*= argCount */
     } catch (e) {
       return cls.FileResult.of(false, EMPTY, e instanceof Error ? e.message : String(e));
+    /*= arg */
     }
   };
   const stat = (id: number) => {
+    /*= env */
     try {
       const out = collect(b, unpack(id));
       // exists, isFile, isDir as bytes, then size and mtime as little-endian i64s.
@@ -159,46 +169,76 @@ export function cliOf(
         out[0] === 1, out[1] === 1, out[2] === 1,
         dv.getBigInt64(3, true), dv.getBigInt64(11, true),
       );
+    /*= readStdin */
     } catch {
       return cls.Stat.of(false, false, false, 0n, 0n);
+    /*= write */
     }
   };
   const dirNames = (id: number) => {
+    /*= readFile */
     try {
       const out = collect(b, unpack(id));
       if (out.length === 0) return [];
       // NUL-separated: a filename may contain anything but a NUL or a slash.
       return unstr(out).split("\u0000");
+    /*= writeFile */
     } catch {
       return null;
+    /*= stat */
     }
   };
   const maybeText = (id: number) => {
+    /*= readDir */
     const out = collect(b, unpack(id));
     // One byte of presence in front, because an unset variable and an empty one are
     // different and a bare empty payload cannot say which this is.
+    /*= mkdir */
     return out[0] === 1 ? unstr(out.subarray(1)) : null;
   };
+  const child = (id: number) => {
+    /*= remove */
+    try {
+      return cls.Child.of(readI32le(collect(b, unpack(id))), "");
+    /*= rename */
+    } catch (e) {
+      return cls.Child.of(-1, e instanceof Error ? e.message : String(e));
+    /*= openInput */
+    }
+  };
   const socket = (id: number) => {
+    /*= readChunk */
     try {
       return cls.Socket.of(readI32le(collect(b, unpack(id))), "");
+    /*= openOutput */
     } catch (e) {
       return cls.Socket.of(-1, e instanceof Error ? e.message : String(e));
+    /*= connect */
     }
   };
 
   const T = {
+    /*= listen */
     i32: (t: Ticket) => cls.Pending_i32.of(pack(t), i32, settled, drop),
+    /*= accept */
     text: (t: Ticket) => cls.Pending_string.of(pack(t), text, settled, drop),
+    /*= recv */
     outcome: (t: Ticket) => cls.Pending_string.of(pack(t), outcome, settled, drop),
+    /*= send */
     maybeText: (t: Ticket) => cls.Pending_stringOpt.of(pack(t), maybeText, settled, drop),
+    /*= closeSocket */
     bytes: (t: Ticket) => cls.Pending_u8Arr.of(pack(t), bytes, settled, drop),
+    /*= waitAny */
     chunk: (t: Ticket) => cls.Pending_u8Arr.of(pack(t), chunk, settled, drop),
+    /*= spawn */
     ok: (t: Ticket) => cls.Pending_bool.of(pack(t), ok, settled, drop),
+    /*= closeFeed */
     file: (t: Ticket) => cls.Pending_FileResult.of(pack(t), fileResult, settled, drop),
+    /*= exitCode */
     stat: (t: Ticket) => cls.Pending_Stat.of(pack(t), stat, settled, drop),
     dir: (t: Ticket) => cls.Pending_stringArrOpt.of(pack(t), dirNames, settled, drop),
     socket: (t: Ticket) => cls.Pending_Socket.of(pack(t), socket, settled, drop),
+    child: (t: Ticket) => cls.Pending_Child.of(pack(t), child, settled, drop),
   };
 
   const twoPaths = (from: string, to: string): Uint8Array => {
@@ -286,6 +326,14 @@ export function cliOf(
       if (settled === null) return -1;
       return tickets.findIndex((t) => t.slot === settled.slot && t.gen === settled.gen);
     },
+
+    (source: string, args: string[]) =>
+      // The source, length-prefixed, then the arguments NUL-separated — the same shape
+      // `readDir` answers with, for the same reason: a filename or an argument may contain
+      // anything but a NUL.
+      T.child(submit(b, OP.SPAWN, prefixed(str(source), str(args.join("\u0000"))))),
+    (handle: number) => { hostCall(b, OP.CLOSE_FEED, i32le(handle)); },
+    (handle: number) => T.i32(submit(b, OP.EXIT_CODE, i32le(handle))),
   );
 }
 

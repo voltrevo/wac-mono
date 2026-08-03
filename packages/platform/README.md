@@ -228,6 +228,57 @@ is. `hostCall` is still submit-then-collect and does the same atomics the single
 did, so nothing that has no reason to overlap pays for the ability to: about 3% on this
 package's suite.
 
+## Spawning
+
+```wac
+FileResult prog = cli.readFile("wc.worker.js").wait();
+Child kid = cli.spawn(string.fromBytes(prog.bytes), string[]()).wait();
+
+cli.send(kid.handle, "one two three\n".toBytes()).wait();   // its standard input
+cli.closeFeed(kid.handle);                                   // ...ends
+u8[] said = cli.recv(kid.handle).wait();                     // what it wrote
+i32 code = cli.exitCode(kid.handle).wait();
+```
+
+**A child is a handle**, like a socket and like standard input. That is the whole design:
+`recv`, `send`, `closeSocket` and `waitAny` already worked on handles, so spawning added
+`spawn`, `closeFeed` and `exitCode` and nothing else. A shell running `a | b` reads one
+handle and writes another; watching a child *and* a socket at once is `waitAny` over two
+handles that happen to have different origins.
+
+`spawn` takes JavaScript — a worker bundle, which `--worker` emits:
+
+```sh
+deno task app:build packages/platform/example/wc.wac --worker -o wc.worker.js
+```
+
+Running a *program* is therefore two steps, read it and spawn it, which is why there is no
+registry of launchable things: the capability is "run this", and where the code came from is
+the filesystem's business.
+
+`closeFeed` is distinct from `closeSocket` because they differ in a way that matters:
+`closeFeed` ends the child's standard input, `closeSocket` stops the child. A program that
+reads to the end before answering — `wc` — needs the end while it is still alive.
+
+**A child is granted nothing but those streams**, and that is the point of preferring this to
+process spawn: what the child may do is the *parent's* choice rather than the operating
+system's. `--allow-run=/bin/sh` cannot express that at any granularity. `example/probe.wac`
+reports what it can reach, and the difference is measured rather than asserted:
+
+```
+probe, built --allow-read --allow-net, run directly   ->  read=ok     net=failed
+the same worker, spawned by a parent that has read    ->  read=denied net=denied
+```
+
+Passing a *subset* of the parent's grants through is the next step and is not here yet.
+
+**It is not a sandbox against arbitrary JavaScript.** A wac child cannot reach past what it
+was handed because wac has no ambient anything; JavaScript in a spawned worker inherits the
+process's permissions, and dropping them needs `--unstable-worker-options`, which would put a
+non-capability flag in the shebang of every program that spawns. So this is a composition and
+concurrency primitive, and the grants are meaningful for wac children and advisory for
+anything else. wac-mono issue 0015 has the reasoning.
+
 ## What the boundary is, and is not
 
 The `Cli` and `Core` structs are the complete list of what an application can reach, and
