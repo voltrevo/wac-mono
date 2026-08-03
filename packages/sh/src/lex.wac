@@ -61,8 +61,22 @@ export struct Part {
   PartKind kind;
   string text;
   bool quoted;
+  /**
+   * For `${x:-word}`: the operator between the name and the word — `:-`, `-`, `:+`, `+`, `:=`,
+   * `=`, `:?`, `?` — or `#` for the length form. Empty for a plain expansion.
+   *
+   * The colon is not decoration. `${x-w}` substitutes only when `x` is *unset*; `${x:-w}` also
+   * substitutes when it is set but empty. A shell that treats them alike is right until someone
+   * writes `x=`, which is exactly when the distinction was wanted.
+   */
+  string op;
+  /** The word after the operator, still unexpanded — it may itself contain expansions. */
+  string arg;
 
-  Part of(PartKind kind, string text, bool quoted) { return Part(kind, text, quoted); }
+  Part of(PartKind kind, string text, bool quoted) { return Part(kind, text, quoted, "", ""); }
+  Part expansion(string name, bool quoted, string op, string arg) {
+    return Part(PartKind.Var, name, quoted, op, arg);
+  }
 }
 
 export struct Token {
@@ -300,11 +314,36 @@ i32 lexDollar(u8[] s, i32 at, Token word, bool quoted) {
   if (c == 0x7b) {                                          // '{'
     i32 start = p + 1;
     p++;
-    while (p < s.len() && s[p] != 0x7d) { p++; }
+    // Nesting counted, so `${x:-${y}}` finds its own closing brace rather than the inner one.
+    i32 depth = 1;
+    while (p < s.len()) {
+      if (s[p] == 0x7b) { depth++; }
+      if (s[p] == 0x7d) { depth--; if (depth == 0) { break; } }
+      p++;
+    }
     if (p >= s.len()) { return -1; }
-    // `${x:-default}` and friends are not handled yet; the whole inside is taken as a name, so
-    // they would look up a variable with a strange name and find nothing rather than misbehave.
-    word.parts.push(Part.of(PartKind.Var, sliceOf(s, start, p), quoted));
+
+    i32 inner = start;
+    // `${#x}` is the length of `x`, and the `#` comes before the name rather than after it.
+    if (inner < p && s[inner] == 0x23 && p - inner > 1) {
+      word.parts.push(Part.expansion(sliceOf(s, inner + 1, p), quoted, "#", ""));
+      return p + 1;
+    }
+    // The name runs until something that cannot be in one; whatever follows is the operator.
+    i32 nameEnd = inner;
+    if (nameEnd < p && isSpecialName(s[nameEnd])) { nameEnd++; }
+    else { while (nameEnd < p && isNameChar(s[nameEnd])) { nameEnd++; } }
+
+    string name = sliceOf(s, inner, nameEnd);
+    if (nameEnd >= p) {
+      word.parts.push(Part.of(PartKind.Var, name, quoted));
+      return p + 1;
+    }
+    i32 opEnd = nameEnd;
+    if (s[opEnd] == 0x3a) { opEnd++; }                      // an optional leading ':'
+    if (opEnd < p) { opEnd++; }                             // the operator character itself
+    word.parts.push(Part.expansion(name, quoted, sliceOf(s, nameEnd, opEnd),
+                                   sliceOf(s, opEnd, p)));
     return p + 1;
   }
 
@@ -338,6 +377,12 @@ bool isNameStart(i32 c) {
 
 bool isNameChar(i32 c) {
   return isNameStart(c) || (c >= 0x30 && c <= 0x39);
+}
+
+/** The one-character parameters: `$?`, `$#`, `$@`, `$*`, `$$`, `$!` and `$1`…`$9`. */
+bool isSpecialName(i32 c) {
+  return c == 0x3f || c == 0x24 || c == 0x23 || c == 0x21 || c == 0x40 || c == 0x2a
+      || (c >= 0x30 && c <= 0x39);
 }
 
 /** The four characters a backslash escapes inside double quotes. Everything else stays literal. */

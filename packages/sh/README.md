@@ -1,8 +1,8 @@
 # sh
 
-A shell, in wac. Quoting, parameter expansion, command substitution, pipelines, redirection,
-`&&`/`||`, `if`/`while`/`until`/`for`, globbing, exit statuses — checked against GNU bash, script
-for script.
+A shell, in wac. Quoting, parameter expansion with the `:-`/`:=`/`:?`/`:+` operators, command
+substitution, pipelines, redirection, `&&`/`||`, `if`/`while`/`until`/`for`/`case`, functions,
+subshells, globbing, exit statuses — checked against GNU bash, script for script.
 
 ```sh
 deno task app packages/sh/src/sh.wac --allow-read --allow-env -- -c 'seq 1 10 | grep 1 | wc -l'
@@ -108,12 +108,9 @@ not implemented — only `*` and `?`.
 which matters because the shell runs inside a server that has no way to be interrupted. That is a
 deliberate difference and the only one where this refuses to do what bash does.
 
-**No here-documents, backquotes, `${x:-default}`, or arithmetic.** Each is noted in the lexer where
-it would attach.
-
-**`a=1 cmd` leaks.** A prefix assignment should apply to that command only; here it is set and
-left. The parser distinguishes the two cases correctly, so this is an execution gap rather than a
-parsing one.
+**No here-documents, backquotes, or arithmetic.** Each is noted in the lexer where it would
+attach. `${x#pattern}` and the other trimming forms are also absent — the operators implemented
+are `:-`, `-`, `:=`, `=`, `:+`, `+`, `:?`, `?` and `${#x}`.
 
 **`2>` is refused rather than approximated.** Only standard output is captured, so there is
 nothing of the error stream to redirect, and saying so beats writing the wrong bytes to the file.
@@ -128,9 +125,12 @@ with the capabilities faked inside wac — `test/wac/probe.wac` builds a `Core` 
 pure functions, since wac has no mutable module-level state and a funcref cannot close over
 anything. A fixed answer per path is enough to reach both sides of every branch that asks.
 
-**It stands at 88%**, not the 100% the rest of this repo holds to. The gap is enumerated by
-`--verbose` and is mostly parse-error paths: malformed compound commands have many ways to be
-wrong and the driver reaches some of them. Finishing it is the next job on this package.
+**It stands at 95%**, not the 100% the rest of this repo holds to, and the shape of what is left
+is worth stating rather than leaving as a number. Roughly half of the remainder is `p >=
+toks.len()` guards that **cannot execute**: `tokenize` always ends with `Eof`, so the parser stops
+at that token rather than running off the end of the list. They are real safety against a future
+caller that does not go through `tokenize`, and no script will ever reach them. The rest are
+defensive guards of the same character.
 
 The two measurements answer different questions and neither replaces the other. bash says what is
 *right*; coverage says what has *run*. The refusals in particular are invisible to the

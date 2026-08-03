@@ -192,6 +192,47 @@ esac`,
   `(cd_does_not_exist) 2>/dev/null; echo $?`,
   `echo $( (echo nested) )`,
 
+  // ── Prefix assignments are scoped to their command ──────────────────────────
+  `x=outer; x=inner true; echo $x`,
+  `x=inner true; echo [$x]`,
+  `x=1; x=2 true; echo $x`,
+  `x=a y=b true; echo [$x][$y]`,
+  `x=1; x=2 echo hello; echo $x`,
+  `x=1; echo $x`,
+
+  // ── Parameter expansion ─────────────────────────────────────────────────────
+  //
+  // The colon is the whole point: `\${x-w}` substitutes only when x is unset, `\${x:-w}` also
+  // when it is set but empty. Every pair below is there to hold that apart.
+  `echo \${undefined:-fallback}`,
+  `x=set; echo \${x:-fallback}`,
+  `x=; echo \${x:-fallback}`,
+  `x=; echo \${x-fallback}`,
+  `echo \${undefined-fallback}`,
+  `x=v; echo \${x:+yes}`,
+  `x=; echo \${x:+yes}`,
+  `x=; echo \${x+yes}`,
+  `echo \${undefined:+yes}`,
+  `echo \${undefined+yes}`,
+  `echo \${undefined:=assigned}; echo $undefined`,
+  `x=keep; echo \${x:=assigned}; echo $x`,
+  `echo \${#undefined}`,
+  `x=hello; echo \${#x}`,
+  `x=; echo \${#x}`,
+  `y=inner; echo \${x:-$y}`,
+  `y=inner; echo \${x:-\${y}}`,
+  `echo \${x:-a b}`,
+  `echo "\${x:-a b}"`,
+  `x=1; echo "\${x:-no}"`,
+  `echo \${x:?}`,
+  `echo \${x:?custom message}`,
+  `x=ok; echo \${x:?msg}`,
+  `echo before; echo \${x:?stop}; echo after`,
+  `f() { echo \${1:-default}; }; f; f given`,
+  `f() { echo \${#}; }; f a b`,
+  `echo \${x}`,
+  `x=v; echo \${x}tail`,
+
   // ── Builtins ────────────────────────────────────────────────────────────────
   `echo -n no-newline`,
   `echo -n a; echo b`,
