@@ -31,7 +31,8 @@ import { msgKexEcdhInit, msgKexEcdhReply } from "./kex.wac";
 import { msgUserAuthRequest, signedData } from "./auth.wac";
 import { msgChannelOpenConfirmation, msgChannelOpenFailure, msgChannelRequest,
          msgChannelSuccess, msgChannelFailure, msgChannelData, msgChannelExtendedData,
-         msgChannelEof, msgChannelClose, extendedDataStderr } from "./channel.wac";
+         msgChannelEof, msgChannelClose, extendedDataStderr,
+         Incoming, msgChannelOpen, parse } from "./channel.wac";
 
 /**
  * What this server offers.
@@ -352,6 +353,31 @@ export u8[] requestName(u8[] payload) {
   r.u32();
   u8[] name = r.str();
   return r.ok ? name : u8[0]();
+}
+
+/**
+ * The client's channel number out of a CHANNEL_OPEN for a session, or -1 for anything else.
+ *
+ * Lives here with the other server-side readers rather than in `sshd.wac`, where it was
+ * untestable: mutation testing replaced its whole body with `return 0` and every test passed,
+ * because OpenSSH's first channel *is* zero. A parser whose only witness always supplies the same
+ * answer is not being tested, and the fix is to put it somewhere a test can hand it other
+ * answers.
+ */
+export i32 readOpenChannel(u8[] payload) {
+  Incoming m = parse(payload);
+  if (!m.ok || m.kind != msgChannelOpen()) { return -1; }
+  // `parse` puts the *type* string first for an open, so the channel number needs reading past
+  // it — the one message where the recipient field is not immediately after the message number.
+  i32 typeLen = (payload[1] << 24) | (payload[2] << 16) | (payload[3] << 8) | payload[4];
+  if (typeLen < 0 || 5 + typeLen + 4 > payload.len()) { return -1; }
+  if (typeLen != 7) { return -1; }                       // "session" and nothing else
+  const u8[] SESSION = u8[](0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e);
+  for (i32 i = 0; i < 7; i++) {
+    if (payload[5 + i] != SESSION[i]) { return -1; }
+  }
+  i32 at = 5 + typeLen;
+  return (payload[at] << 24) | (payload[at + 1] << 16) | (payload[at + 2] << 8) | payload[at + 3];
 }
 
 /**
