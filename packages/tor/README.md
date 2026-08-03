@@ -18,10 +18,14 @@ certificates and microdescriptors, verifies them, and every circuit after that i
 from what it learnt — bandwidth-weighted per position, distinct /16s, mutual families
 excluded, an exit whose policy carries the port, through a pinned guard set.
 
-There is a **SOCKS5 proxy**: `src/socks.wac` puts every connection on one circuit as its own
-stream, so `curl --socks5-hostname` and anything else that speaks SOCKS goes over Tor. Against
-the testnet it has carried 3.2MB across eight concurrent streams on one circuit, byte-identical,
+There is a **SOCKS5 proxy**: `src/socks.wac`, so `curl --socks5-hostname` and anything else
+that speaks SOCKS goes over Tor. It keeps a circuit per destination port, built on demand and
+all sharing one pinned guard, and every connection becomes a stream on the circuit for its
+port. Against the testnet it has carried 3.2MB across eight concurrent streams, byte-identical,
 and 400KB back the other way.
+
+Built, it is **386.7 KiB** as a self-contained executable — 234.2 KiB of wasm, 71.8 KiB
+gzipped — of which the proxy costs 14.4 KiB over the fetch-and-exit program.
 
 It should still not be pointed at the real network — see *What is not here*.
 
@@ -91,7 +95,15 @@ building with `tools/tor.sh`. The binary is looked for under `$HOME/tor-build`, 
 | `src/pathsel.wac` | bandwidth weighting, families, guards, exit policies |
 | `src/pool.wac` | circuit reuse and retirement |
 | `src/dirclient.wac` | request paths and the refresh schedule |
-| `src/app.wac` | the program: sockets from the platform, everything else from the above |
+| `src/link.wac` | a TLS link to a relay, and cells over it — TLS record framing lives here |
+| `src/bootstrap.wac` | a verified consensus, and building circuits through a pinned guard |
+| `src/socks5.wac` | SOCKS5 as pure functions: a request in, a target or a refusal out |
+| `src/app.wac` | a program: fetch one path over a fresh circuit and exit |
+| `src/socks.wac` | a program: the SOCKS5 proxy |
+
+The two programs are thin — `app.wac` is 77 lines — because everything they share was moved
+below them. It did not start that way: `app.wac` was 510 lines with the whole client inside
+`main`, which was fine until there was a second program and none of it could be reused.
 
 There is no `host/` directory. There was, and it was 1368 lines against 722 of wac — in a
 repo where `tls` is 0.17x TypeScript and `ssh`, a client and a server, is zero. The excuse
@@ -201,30 +213,40 @@ test loose enough never to flake is loose enough to miss a real bias.
 
 ## HTTPS over Tor
 
-```ts
-const socket = await torConnect(pool, "example.com", 443);   // a Tor stream
-const tls    = await TlsStream.over(socket, "example.com", roots);
-const result = await requestOver(tls, "example.com", "/");
+Point any HTTPS client at the SOCKS port:
+
+```sh
+deno task app packages/tor/src/socks.wac --allow-net --allow-read -- seed.txt auth.txt 9050
+curl --socks5-hostname 127.0.0.1:9050 https://example.com/
 ```
 
-Or `torFetch(pool, "https://example.com/")`, which is those three lines.
+**`--socks5-hostname` and not `--socks5`.** The two differ by who resolves the name. With
+`--socks5` curl resolves it locally first, in plaintext, over whatever network it is on —
+which announces the destination before a single byte enters the circuit, and nothing later
+undoes it. The proxy carries both, because refusing an address would break clients that
+cannot be fixed from here, but only one of these is private.
 
-There is no Tor-specific HTTP code and there should not be. `Deno.Conn`'s read/write/close
-is the shape everything above already accepts, so `TorSocket` matches it exactly and needs
-no adapter anywhere: `TlsStream` takes a socket and *is* one, and `packages/http`'s
-`requestOver` takes a socket. The request loop it uses was already correct and general —
-only the `Deno.connect` at the top of `request` had made it TCP-specific.
+There used to be an in-process route as well — `torFetch(pool, "https://…")`, a `TorSocket`
+shaped like a `Deno.Conn` so that `packages/http`'s existing request loop worked over a Tor
+stream with no adapter. It went when the TypeScript went, and it is worth recording what it
+demonstrated, because the point outlived the code: the socket shape was the whole
+integration. Anything more than matching it was a sign of not having looked for the loop
+that already existed.
 
-Getting this wrong the first time meant writing a third copy of that loop. The socket shape
-is the whole integration, and anything more is a sign of not having looked.
+The SOCKS proxy is the same idea one level down. Instead of matching `Deno.Conn` so one
+runtime's clients work, it matches a protocol so every client does, in any language, with no
+code here at all.
 
 **The exit is the adversary, so certificate validation matters here.** Everywhere else in
 this package the trust store is deliberately empty — a relay is authenticated by ntor, not
 by its self-signed certificate. This is the opposite case: the exit sees plaintext TCP, can
 be anybody, and exits that tamper are observed rather than hypothetical. Tor with an
 unvalidated end-to-end TLS is worse than no Tor, because it takes a connection your ISP
-could read and hands it to a stranger who chose to be there. `torFetch` refuses `http://`
-for the same reason.
+could read and hands it to a stranger who chose to be there.
+
+A SOCKS proxy cannot enforce that — it carries bytes and never sees whether they are TLS.
+`torFetch` used to refuse `http://` outright; nothing does now, and the responsibility has
+moved to the client. Use `https://`.
 
 ## Bootstrapping is not circular
 

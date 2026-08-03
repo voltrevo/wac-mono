@@ -166,9 +166,20 @@ cannot read a file. See [`wactest`](../wactest/) for the shapes that takes.
 
 What stays in TypeScript, and why:
 
-- **the refusals.** A rejection here is a `trap`, which unwinds the module rather
-  than returning, so only the host can catch one. That is most of what a record
-  layer and a wire parser owe their callers, so those files are worth reading.
+- **the refusals.** Where a rejection is a `trap` it unwinds the module rather
+  than returning, so only the host can catch one. That is still true of the
+  record layer, and deliberately — see the precondition discussion below.
+
+  It is **no longer true of the certificate path**, and the difference is who
+  sends the bytes. `recordOpen` runs on input that has already authenticated;
+  `parseCert` runs on a chain handed over by anyone who can complete a TCP
+  handshake, so a trap there is a remote crash rather than a refusal. `Der`
+  carries a shared failure cell that every cursor over the same buffer sees,
+  `Cert` carries `wellFormed`, and `verifyChain` answers 13 for a chain it could
+  not parse. Nine traps came out of `asn1.wac` for this.
+
+  The rule that came out of it: **a trap is a fine way to refuse input you have
+  authenticated, and never a way to refuse input from a stranger.**
 - **interop.** OpenSSL, rustls and curl. A live peer's next byte depends on ours,
   which is not something a vector or an invariant can express.
 - **the real trust store**, which reads `/etc/ssl` and reports on 121 real roots.
@@ -215,3 +226,18 @@ tests now assert the real contract.
 `tlsClientFeed` requires whole records and traps otherwise. That is a precondition rather
 than something to be lenient about: a parser that guessed at a partial record would have to
 buffer, and then two places would decide where a record ends.
+
+**A caller got this wrong for a year.** `packages/tor`'s link layer handed `tlsClientFeed`
+whatever `recv` returned, and survived because directory fetches arrive as a few small
+records that a TCP segment does not usually split. The first bulk transfer through its SOCKS
+proxy arrived as 44KB in one chunk — eighty records with the last one cut in half — and the
+client aborted. It is a fast-connection bug, not a slow-connection one, which is the opposite
+of where anyone looks for a framing fault.
+
+So: **every caller must frame, and the shape is the same each time.** Accumulate raw bytes,
+walk `recordLength` from the front while a whole record fits, feed that prefix, keep the
+remainder. `box/src/applets/gets.wac` and `tor/src/link.wac` (as `wholeRecordBytes`) both do
+it; the second copied the first only after failing in production. If a third caller appears,
+the buffering probably belongs in this package behind a `tlsClientFeedStream` — the argument
+against it was that only one place should decide where a record ends, and the answer to that
+is one shared implementation rather than one rule and three copies.
