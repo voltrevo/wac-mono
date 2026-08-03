@@ -12,7 +12,6 @@
 // relay whose microdescriptor never arrives.
 
 import { wacTestRun } from "../../../harness/wacTestRun.ts";
-import { attachMicrodescriptors, parseConsensus, parseMicrodescriptors } from "../host/directory.ts";
 
 const enc = new TextEncoder();
 const b64 = (b: Uint8Array) => btoa(String.fromCharCode(...b)).replace(/=+$/, "");
@@ -64,24 +63,28 @@ const consensus = [
 // relay is listed but unusable.
 const microText = micros.slice(0, 3).map((m) => `@last-listed 2026-08-03\n${m}`).join("");
 
-// The oracle: what the TypeScript makes of the same bytes.
-const relays = parseConsensus(consensus);
-const summary = relays.map((r) =>
-  `${r.nickname}|${r.address}|${r.orPort}|${r.flags.join(",")}|${r.microdescDigest}|` +
-  // bandwidth is not on the TS Relay type; it is read straight from the document
-  (consensus.match(new RegExp(`^r ${r.nickname} [\\s\\S]*?^w Bandwidth=(\\d+)`, "m"))?.[1] ?? "0")
-).join("\n") + "\n";
+// What the TypeScript parser made of these same bytes, frozen.
+//
+// This was a live differential while `host/directory.ts` existed — the outgoing
+// implementation checking the incoming one, which is worth doing during a port and only
+// during a port. The TypeScript is gone now, so these are fixed vectors: they still pin the
+// behaviour exactly, and what they no longer do is notice a case neither implementation
+// ever considered. Anything new needs a test of its own rather than an addition here.
+const summary = [
+  `alpha|10.0.0.1|9001|Authority,Fast,Running,Stable,V2Dir,Valid|${digests[0]}|100`,
+  `beta|10.1.0.1|9002|Exit,Fast,Guard,HSDir,Running,Stable,Valid|${digests[1]}|200`,
+  `gamma|10.2.0.1|9003|Exit,Fast,Guard,Running,Stable,Valid|${digests[2]}|300`,
+  `delta|10.3.0.1|9004|Fast,Running,Valid|${digests[3]}|400`,
+].join("\n") + "\n";
 
-attachMicrodescriptors(relays, await parseMicrodescriptors(microText));
-const keys = relays.map((r) => {
-  const p = r.exitPolicy;
-  const policy = p === undefined
-    ? "none"
-    : (p.isAccept ? "accept" : "reject") +
-      p.ranges.reduce((s, v, i) => i % 2 === 0 ? `${s} ${v}` : `${s}-${v}`, "");
-  return `${r.nickname}|${r.ntorOnionKey ? b64(r.ntorOnionKey) : ""}|${policy}|` +
-    (r.family ?? []).join(",");
-}).join("\n") + "\n";
+const keys = [
+  `alpha|${onionKey(1)}|none|`,
+  `beta|${onionKey(2)}|accept 1-65535|gamma`,
+  `gamma|${onionKey(3)}|accept 80-80 443-443 8000-8100|beta`,
+  // delta's microdescriptor is never served, so it keeps an unmatched digest — the case
+  // where a relay is listed but unusable.
+  `delta||none|`,
+].join("\n") + "\n";
 
 const fixtures = [enc.encode(consensus), enc.encode(microText), enc.encode(summary), enc.encode(keys)];
 

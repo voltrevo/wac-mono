@@ -2,7 +2,6 @@
 import { encodeFixed, cellSize, cellCommand, cellPayload, encodeVersions, negotiateVersion,
          encodeNetinfo, encodeCreate2, decodeCreated2, encodePadding } from "../src/cell.wac";
 import { ntorClientRequest, ntorClientFinish } from "../src/ntor.wac";
-import { hopInit, hopSend, hopRecv, hopPeel, hopWrap, hopCheck, hopDigest, beginBody,
          extend2Body, extended2Reply, sendmeBodyV1 } from "../src/relay.wac";
 import { signedDigest, keyFingerprint, verifyDocumentSignature } from "../src/consensus.wac";
 import { weightedBandwidths, choose, portPermitted } from "../src/pathsel.wac";
@@ -18,13 +17,6 @@ export u8[] b8(u8[] p) { return decodeCreated2(p); }
 export u8[] b9() { return encodePadding(); }
 export u8[] c1(u8[] i, u8[] o, u8[] p) { return ntorClientRequest(i, o, p); }
 export u8[] c2(u8[] i, u8[] o, u8[] p, u8[] r, i32 n) { return ntorClientFinish(i, o, p, r, n); }
-export u8[] d1(u8[] m) { return hopInit(m); }
-export u8[] d2(u8[] s, i32 c, i32 i, u8[] x) { return hopSend(s, c, i, x); }
-export u8[] d3(u8[] s, u8[] p) { return hopRecv(s, p); }
-export u8[] d4(u8[] s, u8[] p) { return hopPeel(s, p); }
-export u8[] d5(u8[] s, u8[] p) { return hopWrap(s, p); }
-export u8[] d6(u8[] s, u8[] b) { return hopCheck(s, b); }
-export u8[] d7(u8[] s, bool f) { return hopDigest(s, f); }
 export u8[] d8(string h) { return beginBody(h); }
 export u8[] d9(u8[] i, i32 p, u8[] x, u8[] h) { return extend2Body(i, p, x, h); }
 export u8[] da(u8[] d) { return extended2Reply(d); }
