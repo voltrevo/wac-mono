@@ -52,10 +52,26 @@ against **tor's own C implementation** — `test-ntor-cl server1`, built by `too
 That last one is the only test that could notice all the others being consistently wrong,
 and it checks byte-identical key material rather than mere agreement.
 
-When the binary is missing the suite **fails** rather than skipping. A differential that
-silently stops running leaves everything green while checking nothing, which is what
-happened to this repo's SHAKE tests until they moved to `node:crypto`.
-`TOR_SKIP_INTEROP=1` opts out deliberately.
+tor's answers are **committed** as vectors in `test/data/ntor_vectors.json`, so that
+differential runs on any machine with no binary and no network. When the binary is present
+its live answer is used instead, so the check also sees changes in tor.
+
+It did not start that way, and the failure is worth recording. The test used to shell out to
+the binary and fail when it was missing — right principle, since a differential that
+silently stops running leaves everything green while checking nothing. But the binary lived
+in `/tmp`, and when the container was recreated the fixture vanished and this package turned
+the shared suite red for three agents who had not touched it. "Fail forever" is not the fix
+for "might silently stop running"; durable is.
+
+A recorded answer is not the weaker option here. Each vector is a complete (reply, keys)
+pair that tor produced, and the assertion is that our client derives *those keys* from *that
+reply* — the same assertion either way. The vector is an input from tor, not an expected
+output of ours. Note also that tor picks a fresh ephemeral key per handshake, so its reply
+differs every run: there is deliberately no recorded-versus-live comparison, because it
+would fail constantly and detect nothing.
+
+Regenerate with `TOR_NTOR_REGEN=1 deno test -A packages/tor/test/ntor_wac.test.ts` after
+building with `tools/tor.sh`. The binary is looked for under `$HOME/tor-build`, not `/tmp`.
 
 ## The layers, and where each lives
 
