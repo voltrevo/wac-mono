@@ -35,6 +35,10 @@ import { Shell, runScript } from "../../sh/src/exec.wac";
 /** How many commands to remember. A ring, so the oldest falls off rather than growing forever. */
 const i32 HISTORY = 64;
 
+/** Where this page came from. A demonstration nobody can rebuild is a screenshot. */
+const string SOURCE =
+  "https://github.com/voltrevo/wac-mono/blob/master/packages/box/example/README.md#termwac";
+
 const string BANNER =
   "wac sh — packages/sh, unchanged, in a browser tab.\n" +
   "The filesystem is the Origin Private File System: what you write survives a reload.\n" +
@@ -66,12 +70,16 @@ export i32 page(Core core, Cli cli, Page page) {
     "         font: inherit; padding: 2px 0; }" +
     "  #cmd::placeholder { color: #4a5f62; }" +
     "  .k { color: #46d9c0; }" +
+    "  #src { color: #46d9c0; font-size: 12px; text-decoration: none; opacity: .8;" +
+    "         white-space: nowrap; }" +
+    "  #src:hover { opacity: 1; text-decoration: underline; }" +
     "</style>" +
     "<div id=\"term\">" +
     "  <div id=\"wrap\"><pre id=\"scr\"></pre></div>" +
     "  <div id=\"bar\"><span id=\"ps1\">$</span>" +
     "    <input id=\"cmd\" autofocus autocomplete=\"off\" spellcheck=\"false\"" +
-    "           placeholder=\"a command, then Enter\"></div>" +
+    "           placeholder=\"a command, then Enter\">" +
+    "    <a id=\"src\" href=\"" + SOURCE + "\">source &amp; build it</a></div>" +
     "</div>"
   ).wait();
 

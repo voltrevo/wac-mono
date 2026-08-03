@@ -1,21 +1,31 @@
-// Pixels, a pointer, and files in and out.
+// Pixels, a pointer, and a frame you can keep.
 //
 //   deno task app:build packages/platform/example/pixels.wac --target browser -o page/index.html
 //   box httpd -8080 page -x
 //
 // Everything a raster application needs, and it is three capabilities: `drawPixels` blits a
 // buffer wac filled, `Event.x`/`Event.y` say where in that buffer the pointer is, and
-// `nextFile`/`offerDownload` carry bytes between the user and the program.
+// `offerDownload` hands the frame back as a file.
+//
+// It used to accept a dropped file too, and hand it straight back as `.copy`. That was coverage
+// wearing a demonstration's clothes — `nextFile` arrived in the same commit as the raster
+// capabilities, and this was the page that happened to have a `Page` profile plumbed. A fractal
+// viewer has no use for a file you give it. It lives in `box/example/hash.wac` now, where a
+// dropped file is the first thing anyone reaches for.
 //
 // The picture is a Mandelbrot set, which is here because it is the honest demonstration: 38400
 // pixels, each an iteration loop, recomputed on every zoom, in compiled code on a worker while
 // the page stays responsive. A drawing API would have made this the slow way to do it.
 
-import { Cli, Core, Event, Page, Pending, Picked } from "../src/platform.wac";
+import { Cli, Core, Event, Page } from "../src/platform.wac";
 
 const i32 W = 480;
 const i32 H = 300;
 const i32 MAX = 160;
+
+/** Where this page came from. A demonstration nobody can rebuild is a screenshot. */
+const string SOURCE =
+  "https://github.com/voltrevo/wac-mono/blob/master/packages/platform/example/README.md#pixelswac";
 
 export i32 page(Core core, Cli cli, Page page) {
   page.title("wac: pixels").wait();
@@ -44,7 +54,8 @@ export i32 page(Core core, Cli cli, Page page) {
     "       text-transform: uppercase; }" +
     "  dd { margin: 0; font-family: ui-monospace, monospace;" +
     "       font-variant-numeric: tabular-nums; }" +
-    "  input[type=file] { font: inherit; font-size: .85rem; color: var(--dim); }" +
+    "  footer { margin-top: 2rem; font-size: .85rem; color: var(--dim); }" +
+    "  footer a { color: var(--key); }" +
     "</style>" +
     "<div id=\"tool\">" +
     "  <h1>pixels</h1>" +
@@ -61,9 +72,9 @@ export i32 page(Core core, Cli cli, Page page) {
     "    <dt>pointer</dt><dd id=\"pos\">move over it</dd>" +
     "    <dt>view</dt><dd id=\"view\"></dd>" +
     "    <dt>drawn in</dt><dd id=\"ms\">—</dd>" +
-    "    <dt>a file</dt><dd><input type=\"file\" id=\"f\">" +
-    "      <span id=\"info\" style=\"color:var(--dim)\">handed straight back</span></dd>" +
     "  </dl>" +
+    "  <footer>Every pixel here is wac. " +
+    "    <a href=\"" + SOURCE + "\">source, and how to build it yourself</a>.</footer>" +
     "</div>"
   ).wait();
   page.on("#c", "pointermove").wait();
@@ -76,31 +87,8 @@ export i32 page(Core core, Cli cli, Page page) {
   i32 centreY = 0;
   drawAndReport(core, page, spanX, centreX, centreY);
 
-  // Two things to wait on, and one call that waits on both. `nextEvent` and `nextFile` are
-  // ordinary tickets, so this is the same `waitAny` a relay uses over two sockets — which is
-  // the whole argument for events being tickets rather than callbacks.
-  Pending<Event> ev = page.nextEvent();
-  Pending<Picked> file = page.nextFile();
-
   while (true) {
-    i32 which = core.waitAny(i32[](ev.id, file.id), -1);
-    if (which < 0) { return 0; }
-
-    if (which == 1) {
-      Picked f = file.wait();
-      file = page.nextFile();
-      if (!f.ok) {
-        page.setText("info", "could not read it: " + f.error).wait();
-      } else {
-        page.setText("info", f.name + ", " + itoa(f.bytes.len()) + " bytes — sending it back").wait();
-        // Straight back out again, which proves both directions with one file.
-        page.offerDownload(f.name + ".copy", f.bytes).wait();
-      }
-      continue;
-    }
-
-    Event e = ev.wait();
-    ev = page.nextEvent();
+    Event e = page.nextEvent().wait();
 
     // A click on the canvas: the point under the cursor becomes the centre, and the view halves.
     // This is what `Event.x` and `Event.y` are for — without them the only zoom possible is the
