@@ -15,7 +15,6 @@ record of what has been fixed and why.
 | [0003](open/0003-wacc-parser-does-not-implement-generics.md) | wacc's parser does not implement generics, so `std` is outside its corpus | missing feature | not implemented |
 | [0022](open/0022-three-tor-entry-files-do-not-compile-and-two-tools-report-it-as-nothing.md) | three tor entry files do not compile, and two shared tools reported it as nothing | bug | compile error |
 | [0021](open/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md) | a spawned worker whose source does not parse kills the parent | bug | trap |
-| [0023](open/0023-a-cancelled-timer-wakes-a-later-unrelated-waitany.md) | a cancelled timer wakes a later, unrelated `waitAny`, so a timeout fires early | bug | wrong answer |
 
 An empty list is the expected state most of the time — see `README.md`: something you
 can fix in a package you are already working in should just be fixed, and a package's

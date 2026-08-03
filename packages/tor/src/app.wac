@@ -21,22 +21,19 @@
 //
 // ## Timeouts
 //
-// Every read and every dial is bounded, by racing it against `sleepMillis` under `waitAny`.
-// A relay that completes a TCP handshake and then says nothing is not a hypothetical: relays
-// are strangers chosen from a public directory, and one that can hold a client indefinitely
-// is in a position worth paying for.
+// Every read and every dial is bounded, by `waitAny`'s deadline. A relay that completes a TCP
+// handshake and then says nothing is not a hypothetical: relays are strangers chosen from a
+// public directory, and one that can hold a client indefinitely is in a position worth paying
+// for.
 //
-// Two things the platform is explicit about and this depends on. Cancelling a ticket stops
-// the *waiting*, not the work — so a timed-out read also closes the socket, which is what
-// actually ends it. And the timer must be bound to a name rather than inlined into the
-// `waitAny` list, because an inlined one cannot be cancelled and holds a call slot until it
-// fires; four of those and the next call has nowhere to go.
+// One thing the platform is explicit about and this depends on: cancelling a ticket stops the
+// *waiting*, not the work — so a timed-out read also closes the socket, which is what actually
+// ends it.
 //
-// **These currently fire early — see issue 0023.** A cancelled timer's expiry wakes a later,
-// unrelated `waitAny`, so the 30-second read bound expires after 15: the interval left over
-// from the connect timer. The values below are the ones that are *correct*, not the ones
-// that hide it. Tuning around a platform bug would leave the next reader a puzzle with no
-// note attached, and the bug is not mine to work around.
+// Issue 0023 is fixed, and this was rewritten with it (agent-a). It used to race a
+// `core.sleepMillis` ticket in the `waitAny` list, which is what the platform offered at the
+// time; the deadline is a parameter of the wait now, so there is no timer ticket to bind, to
+// cancel on the winning path, or to leak on the losing one. The values below are unchanged.
 //
 // ## What this is not
 //
@@ -120,15 +117,13 @@ const i32 READ_TIMEOUT_MS = 30000;
 
 Link connectRelay(Core core, Cli cli, string host, i32 port) {
   Pending<Socket> dial = cli.connect(host, port);
-  Pending<i64> timer = core.sleepMillis(CONNECT_TIMEOUT_MS);
-  if (cli.waitAny(i32[](dial.id, timer.id)) == 1) {
+  if (cli.waitAny(i32[](dial.id), CONNECT_TIMEOUT_MS) < 0) {
     // Nothing to close — there is no handle yet — so cancelling the dial is all there is.
     // The host may still be inside the connect; what this guarantees is that we stop waiting.
     dial.cancel();
     core.warn("tor: " + host + " did not answer within " + itoa(CONNECT_TIMEOUT_MS) + "ms");
     return Link(core, cli, -1, u8[0](), u8[0](), true);
   }
-  timer.cancel();
   Socket s = dial.wait();
   if (s.handle < 0) {
     core.warn("tor: " + host + ": " + s.error);
@@ -154,21 +149,19 @@ void handshakeTls(Link l) {
 /**
  * One read from the socket, fed to TLS. False at end of stream or on a timeout.
  *
- * The read is raced against a timer. If the timer wins, the socket is closed as well as the
+ * The read is bounded by the deadline. If it expires, the socket is closed as well as the
  * ticket cancelled — cancelling stops us waiting and does not stop the host's read, and a
  * cancelled ticket keeps its slot until the call underneath finishes. Closing the handle is
  * what makes it finish.
  */
 bool pump(Link l) {
   Pending<u8[]> read = l.cli.recv(l.sock);
-  Pending<i64> timer = l.core.sleepMillis(READ_TIMEOUT_MS);
-  if (l.cli.waitAny(i32[](read.id, timer.id)) == 1) {
+  if (l.cli.waitAny(i32[](read.id), READ_TIMEOUT_MS) < 0) {
     read.cancel();
     l.cli.closeSocket(l.sock);
     l.core.warn("tor: a relay went silent for " + itoa(READ_TIMEOUT_MS) + "ms");
     return false;
   }
-  timer.cancel();
   u8[] chunk = read.wait();
   if (chunk.len() == 0) { return false; }
   Step st = unpack(tlsClientFeed(l.tls, chunk));

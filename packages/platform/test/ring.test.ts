@@ -164,3 +164,50 @@ Deno.test("as many calls in flight as there are slots, all waited on together", 
   const expected = Array.from({ length: SLOTS }, (_, i) => i).join(",") + "|7";
   assertEquals(out, expected, String(out));
 });
+
+Deno.test("a cancelled call's answer does not land on whatever took its slot", async () => {
+  // wac-mono issue 0023, reported by agent-c: a 30-second bound expiring after 15 because a
+  // 15-second timer had been cancelled earlier. Not id recycling — they checked that — and
+  // not about timers at all. The slot is what gets recycled.
+  //
+  // `cancel` bumps the generation and the sweep hands the slot back at once, but the host's
+  // handler is still running. When it finished, the only check was whether the slot was
+  // *still* `ST_CANCELLED`; by then the slot had been claimed by another call, so the stale
+  // answer was written into it and marked ready. The new call's `waitAny` then reported a
+  // ticket that had not settled — early, which is worse than late, because a bound that
+  // fires at half its interval drops connections that were about to succeed.
+  //
+  // Reproduced by making the reuse deliberate rather than waiting for luck: cancel a call,
+  // let the sweep free its slot, then put a long call in the same slot and check that the
+  // cancelled call's completion does not settle it.
+  const out = await onWorker(
+    `
+    const doomed = submit(b, ${SLOW}, i32le(300));
+    // Waited on first, and deliberately not long enough: the host has to have *taken* the
+    // call before it is cancelled, or the sweep sees it cancelled while still pending and
+    // the handler never runs — there is then no stale completion and nothing to reproduce.
+    // That is how the first version of this test passed against the bug.
+    waitAny(b, [doomed], 40);
+    cancel(b, doomed);
+
+    // Two quick round trips, which park and so let the host sweep and free the slot. The
+    // second lands in the freed slot, proving it is back in circulation.
+    hostCall(b, ${SLOW}, i32le(0));
+    hostCall(b, ${SLOW}, i32le(0));
+
+    // The long call now occupies the slot the cancelled one had.
+    const real = submit(b, ${SLOW}, i32le(2000));
+
+    // 800ms is after the cancelled call's 300ms and well before the real one's 2000ms. If the
+    // stale answer lands on this slot, waitAny reports index 0 at about 300ms.
+    const began = performance.now();
+    const got = waitAny(b, [real], 800);
+    const waited = Math.round(performance.now() - began);
+    return "slots " + doomed.slot + "/" + real.slot + ": " + (got === null ? "nothing-settled" : "settled") + " after " + (waited < 600 ? "early" : "the full deadline");
+  `,
+    slowHandlers,
+  );
+  // The slot numbers are in the answer so a run that failed to reuse the slot is
+  // distinguishable from one where the reuse was harmless — the first would prove nothing.
+  assertEquals(out, "slots 0/0: nothing-settled after the full deadline", String(out));
+});

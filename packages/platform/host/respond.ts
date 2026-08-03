@@ -21,6 +21,7 @@ import {
   DONE_SEQ,
   OP_CONTINUE,
   OP_PUSH,
+  S_GEN,
   S_OP,
   S_REQ_LEN,
   S_RES_LEN,
@@ -109,6 +110,11 @@ export function serveHostCalls(
 
   const take = (slot: number): void => {
     const at = slotAt(slot);
+    // Whose call this is. A slot outlives the call in it: `cancel` bumps the generation and
+    // the sweep hands the slot straight back, while the handler here is still running. When
+    // it finishes, the slot may belong to somebody else, and the answer has to be dropped
+    // rather than written — see `stillOurs`.
+    const gen = Atomics.load(b.ctrl, at + S_GEN);
     const op = Atomics.load(b.ctrl, at + S_OP);
     const len = Atomics.load(b.ctrl, at + S_REQ_LEN);
     const payload = b.req(slot).slice(0, len);
@@ -139,13 +145,26 @@ export function serveHostCalls(
     }
     // Dispatched, not awaited: the loop goes back to watching immediately, so a slow
     // capability in one slot does not hold up the others.
+    // Whether this answer still belongs in this slot.
+    //
+    // The generation, not the status. Checking for `ST_CANCELLED` was the same idea and did
+    // not work: by the time a slow handler finishes, a cancelled slot has usually been swept
+    // free *and claimed by another call*, so the status is `RUNNING` and the check passes —
+    // and the stale answer is written into somebody else's slot and marked ready. Their
+    // `waitAny` then reports a ticket that has not settled, which is wac-mono issue 0023: a
+    // 30-second bound expiring after 15 because a 15-second timer was cancelled earlier.
+    //
+    // Nothing is freed on the way out. A cancelled slot is the sweep's to hand back, and if
+    // the slot has been reused, touching it is the whole bug.
+    const stillOurs = (): boolean => Atomics.load(b.ctrl, at + S_GEN) === gen;
+
     void (async () => {
       try {
         const out = await h(whole);
-        if (Atomics.load(b.ctrl, at + S_STATUS) === ST_CANCELLED) { abandon(slot); return; }
+        if (!stillOurs()) return;
         send(slot, out);
       } catch (e) {
-        if (Atomics.load(b.ctrl, at + S_STATUS) === ST_CANCELLED) { abandon(slot); return; }
+        if (!stillOurs()) return;
         // The worker turns this into a thrown HostCallError, so a capability failing is
         // an error in wac's caller rather than a silent wrong answer.
         reply(slot, STATUS_ERR, enc.encode(e instanceof Error ? e.message : String(e)));

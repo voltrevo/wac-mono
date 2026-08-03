@@ -109,6 +109,20 @@ export const ST_RUNNING = 2;
 export const ST_READY = 3;
 /** The worker abandoned it; the host frees the slot when the work lands. */
 export const ST_CANCELLED = 4;
+/**
+ * Taken by the worker, and not yet a request: the opcode and payload are still being written.
+ *
+ * Separate from `ST_PENDING` because the host takes *anything* pending, and between claiming a
+ * slot and writing the opcode into it there is nothing to take. Sharing one state left a window
+ * where a sweep could dispatch a slot whose `S_OP` was still whatever the previous call left —
+ * zero on a slot's first use, which surfaced as `no handler for capability 0`.
+ *
+ * The window was always there and was very hard to hit while the ring had four slots, because
+ * the host was usually parked and the wake-up came from the `ping` *after* the write. At sixteen
+ * it is already awake and sweeping when the next claim happens, and it showed up within three
+ * full runs of the suite.
+ */
+export const ST_CLAIMED = 5;
 
 /** The response is complete. */
 export const STATUS_OK = 0;

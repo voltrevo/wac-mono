@@ -30,6 +30,7 @@ import {
   SLOTS,
   slotAt,
   ST_CANCELLED,
+  ST_CLAIMED,
   ST_FREE,
   ST_PENDING,
   ST_READY,
@@ -90,7 +91,9 @@ function claim(b: Bridge): number {
     let ready = 0;
     for (let i = 0; i < SLOTS; i++) {
       const at = slotAt(i);
-      if (Atomics.compareExchange(b.ctrl, at + S_STATUS, ST_FREE, ST_PENDING) === ST_FREE) {
+      // Claimed rather than pending: `submit` publishes it as pending once the opcode and
+      // payload are in, and until then the host must not take it.
+      if (Atomics.compareExchange(b.ctrl, at + S_STATUS, ST_FREE, ST_CLAIMED) === ST_FREE) {
         return i;
       }
       if (Atomics.load(b.ctrl, at + S_STATUS) === ST_READY) ready++;
