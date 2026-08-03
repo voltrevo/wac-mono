@@ -25,6 +25,16 @@ export type DenoWorldOptions = {
 
 const EMPTY = new Uint8Array(0);
 
+/**
+ * `recv(0)` reads standard input.
+ *
+ * Socket handles count from 1, so zero is free and can never collide. It exists so
+ * `waitAny` can watch standard input beside a socket: `readChunk` is deliberately blocking
+ * and ticketless — the streaming transforms take it as a bare funcref — so without this a
+ * relay could wait on one side or the other but not both.
+ */
+export const STDIN_HANDLE = 0;
+
 /** All of standard input. Deno needs no permission for this, and neither does the world. */
 async function readAllStdin(): Promise<Uint8Array> {
   const parts: Uint8Array[] = [];
@@ -70,7 +80,22 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   // wac side has no closures to carry a handle in — see the note in platform.wac.
   let source: Deno.FsFile | null = null;   // null means standard input
   let sink: Deno.FsFile | null = null;     // null means standard output
-  const buf = new Uint8Array(CHUNK);
+  /**
+   * A destination for one read. **Never shared between reads.**
+   *
+   * A single buffer was safe while exactly one call could be outstanding, and is not now
+   * that the bridge has a ring: two reads in flight both hand the kernel the same memory,
+   * so the second write lands on top of the first and whichever resolves later returns a
+   * length spanning both. Slicing after the read does not help — the corruption happens
+   * during it.
+   *
+   * That failure looked like this, in `nc`: the peer received `"peer speaks first\nnd"`,
+   * its own greeting with the tail of the client's message behind it. Eighteen bytes from
+   * the socket read overlaid twenty-one from the standard-input read, in one buffer.
+   *
+   * One allocation per chunk, against a copy of the same size that was already happening.
+   */
+  const fresh = () => new Uint8Array(CHUNK);
 
   // Sockets by handle. A plain counter rather than reusing slots: a handle that has been
   // closed must never come back as a different connection, which is the kind of bug that
@@ -161,10 +186,10 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       return EMPTY;
     },
     [OP.READ_CHUNK]: async () => {
-      const n = source === null ? await Deno.stdin.read(buf) : await source.read(buf);
-      // A short read is not the end; only null is. Returning the subarray rather than a
-      // slice is safe because `send` copies it into the bridge before we are called again.
-      return n === null ? EMPTY : buf.subarray(0, n);
+      const into = fresh();
+      const n = source === null ? await Deno.stdin.read(into) : await source.read(into);
+      // A short read is not the end; only null is.
+      return n === null ? EMPTY : into.subarray(0, n);
     },
 
     [OP.OPEN_OUTPUT]: async (p) => {
@@ -203,10 +228,19 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       return i32le(h);
     },
     [OP.RECV]: async (p) => {
-      const c = sockets.get(readI32le(p));
+      const h = readI32le(p);
+      // Handle 0 is standard input. Handles count from 1, so it can never be a socket, and
+      // giving stdin one means `waitAny` can watch it beside a socket — which is what a
+      // relay like `nc` needs and could not express while stdin was only `readChunk`.
+      const into = fresh();
+      if (h === STDIN_HANDLE) {
+        const n = await Deno.stdin.read(into);
+        return n === null ? EMPTY : into.subarray(0, n);
+      }
+      const c = sockets.get(h);
       if (c === undefined) throw new Error("not an open socket");
-      const n = await c.read(buf);
-      return n === null ? EMPTY : buf.subarray(0, n);
+      const n = await c.read(into);
+      return n === null ? EMPTY : into.subarray(0, n);
     },
     [OP.SEND]: async (p) => {
       const c = sockets.get(readI32le(p));

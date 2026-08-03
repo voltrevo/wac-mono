@@ -1,6 +1,6 @@
 # box — a busybox, written in wac
 
-Fifty-eight applets in one program, chosen by the first argument. No TypeScript: `src/` is
+Fifty-nine applets in one program, chosen by the first argument. No TypeScript: `src/` is
 wac and the only thing outside it is the test suite.
 
 It exists to exercise `packages/platform`'s capability world more widely than a single
@@ -17,9 +17,9 @@ cat README.md | ./box sort -u | ./box wc -l
 
 ```
 base32 base64 basename cat cp crc32 cut date diff dirname du echo false find
-fold get gets grep gunzip gzip head hex httpd json ls mkdir mv nl paste rev
-rm rmdir
-seq serve sha256sum sha512sum shuf sort split sponge stat strings tac tail
+fold get gets grep gunzip gzip head hex httpd json ls mkdir mv nl paste
+nc rev rm rmdir seq serve sha256sum sha512sum shuf sort split sponge stat
+strings tac tail
 tar tee touch tr true uniq unzstd urldecode urlencode uuid wc wget yes zstd
 ```
 
@@ -82,6 +82,31 @@ That is also why `Args` carries a `name`. A program in this model is never hande
 argv[0] — argv starts at its first real argument — so the standalone `wc` would otherwise
 have reported errors as `box:`. Under `box` the name is the applet's; in `bin/` the entry
 point passes it.
+
+## nc, and why it took this long
+
+```sh
+box nc host 80              # stdin to the socket, socket to stdout, both at once
+box nc -8080 -l             # or listen, and relay one connection
+```
+
+I refused to write this three times, and the reason each time was the same: a relay has to
+watch **two** sources. Wait on the socket alone and a client that speaks first is never
+heard; wait on standard input alone and a server that greets you is never printed. Polling
+both with `isDone` spins a core to avoid parking.
+
+`packages/platform` grew `waitAny`, and standard input became handle 0, so both sides are
+the same primitive — two `recv` calls in flight and a park on whichever answers:
+
+```wac
+Pending<u8[]> fromPeer = cli.recv(peer.handle);
+Pending<u8[]> fromUser = cli.recv(0);
+i32 which = cli.waitAny(i32[](fromPeer.id, fromUser.id));
+```
+
+The test makes the peer greet *before* reading, so a relay that serviced standard input
+first would hang and one that serviced the socket first would never send. Only watching
+both passes.
 
 ## The five that are not filters
 

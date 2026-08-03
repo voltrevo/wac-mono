@@ -1,0 +1,97 @@
+// Standard input to a socket and the socket back to standard output, both at once.
+//
+//   box nc host 80
+//   box nc -8080 -l          # listen instead, and serve one connection
+//
+// **The applet that could not be written until `waitAny` existed.** A relay has to watch
+// two sources: the socket, and standard input. Waiting on either one alone means the other
+// is blocked — read the socket first and a client that speaks first is never heard; read
+// stdin first and a server that greets you is never printed. Polling both with `isDone`
+// spins a core to avoid parking.
+//
+// Standard input is handle 0, so both sides are the same primitive: two `recv` calls in
+// flight and a park on whichever answers. That is the whole loop, and it is why stdin was
+// given a handle rather than a second ticket-returning read of its own.
+
+import { Cli, Core, Pending, Socket } from "../../../platform/src/platform.wac";
+import { Args, has } from "../lib/args.wac";
+import { itoa } from "../lib/num.wac";
+
+/** Standard input, as a handle `recv` accepts. See `deno.ts`. */
+i32 STDIN() { return 0; }
+
+export i32 nc(Core core, Cli cli, Args a) {
+  Socket peer = has(a, 'l') ? accepted(core, cli, a) : dialled(core, cli, a);
+  if (peer.handle < 0) { return 1; }
+
+  // Both reads are in flight from here, and stay that way: whichever answers is replaced
+  // and the other is left running. Cancelling and resubmitting the untouched one would
+  // lose whatever had already arrived on it.
+  Pending<u8[]> fromPeer = cli.recv(peer.handle);
+  Pending<u8[]> fromUser = cli.recv(STDIN());
+  bool userDone = false;
+
+  while (true) {
+    i32 which = userDone
+      ? cli.waitAny(i32[](fromPeer.id))
+      : cli.waitAny(i32[](fromPeer.id, fromUser.id));
+    if (which < 0) { break; }
+
+    if (which == 0) {
+      u8[] down = fromPeer.wait();
+      if (down.len() == 0) { break; }          // the peer closed; we are done
+      cli.write(down);
+      fromPeer = cli.recv(peer.handle);
+      continue;
+    }
+
+    u8[] up = fromUser.wait();
+    if (up.len() == 0) {
+      // Standard input ended. Keep reading the socket — a request has been sent and the
+      // answer has not arrived yet, which is exactly what `box nc host 80 < request` does.
+      userDone = true;
+      continue;
+    }
+    if (!cli.send(peer.handle, up).wait()) { break; }
+    fromUser = cli.recv(STDIN());
+  }
+
+  cli.closeSocket(peer.handle);
+  return 0;
+}
+
+/** `nc host port`, or `nc host -port`. */
+Socket dialled(Core core, Cli cli, Args a) {
+  if (a.rest.len() < 1) {
+    core.warn("usage: " + a.name + " <host> <port>   |   " + a.name + " -<port> -l");
+    return Socket(-1, "");
+  }
+  i32 port = a.num == 0 && a.rest.len() > 1 ? atoi(a.rest[1]) : a.num;
+  Socket s = cli.connect(a.rest[0], port).wait();
+  if (s.handle < 0) { core.warn(a.name + ": " + a.rest[0] + ": " + s.error); }
+  return s;
+}
+
+/** `nc -<port> -l`: bind, take one connection, relay it. */
+Socket accepted(Core core, Cli cli, Args a) {
+  Socket l = cli.listen(a.num).wait();
+  if (l.handle < 0) {
+    core.warn(a.name + ": " + itoa(a.num) + ": " + l.error);
+    return Socket(-1, "");
+  }
+  core.warn(a.name + ": listening on port " + itoa(a.num));
+  Socket c = cli.accept(l.handle).wait();
+  cli.closeSocket(l.handle);
+  if (c.handle < 0) { core.warn(a.name + ": accept: " + c.error); }
+  return c;
+}
+
+i32 atoi(string s) {
+  u8[] b = s.toBytes();
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return n; }
+    n = n * 10 + (b[i] - '0');
+  }
+  return n;
+}

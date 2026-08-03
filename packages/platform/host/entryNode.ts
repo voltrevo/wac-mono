@@ -127,9 +127,12 @@ export async function runLauncherNode(
     },
     openFile: async (path: string) => {
       const h = await fs.open(path, "r");
-      const b = new Uint8Array(CHUNK);
       return {
         read: async (): Promise<Uint8Array> => {
+          // A buffer per read, not one per handle: two reads on one handle can overlap now
+          // that the bridge has a ring, and sharing the destination means the kernel writes
+          // both into the same memory. See the note on `fresh` in `deno.ts`.
+          const b = new Uint8Array(CHUNK);
           const { bytesRead } = await h.read(b, 0, CHUNK);
           return bytesRead === 0 ? new Uint8Array(0) : b.subarray(0, bytesRead);
         },
