@@ -1,0 +1,82 @@
+// Circuit reuse and retirement.
+//
+// No network and no clock: every input is explicit, which is what the policy being pure
+// buys. Most of it is about what must *not* happen — sharing across isolation keys, and a
+// circuit staying usable past its lifetime — because those are the failures that leave a
+// working client.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Entry, selectCircuit, retirable, maxDirtinessMs } from "../../src/pool.wac";
+
+const i64 T0 = 1000000000000;
+
+Entry e(i32 id, string iso, i64 firstUsed) { return Entry(id, iso, firstUsed, false, 0); }
+
+export string test_two_isolation_keys_never_share_a_circuit() {
+  // The guarantee the whole mechanism exists for. A caller that separates two activities
+  // must get separate exits, or the exit links them.
+  T t = T.create();
+  Entry[] es = Entry[](e(0, "alpha", T0), e(1, "beta", T0));
+  t.eqI32(selectCircuit(es, "alpha", T0), 0, "alpha gets its own");
+  t.eqI32(selectCircuit(es, "beta", T0), 1, "beta gets its own");
+  t.eqI32(selectCircuit(es, "gamma", T0), -1,
+          "and an unseen key gets nothing rather than the nearest circuit");
+  return t.report();
+}
+
+export string test_a_circuit_stops_taking_streams_at_max_dirtiness() {
+  T t = T.create();
+  Entry[] es = Entry[](e(0, "x", T0));
+  t.eqI32(selectCircuit(es, "x", T0 + maxDirtinessMs() - 1), 0, "usable just before");
+  t.eqI32(selectCircuit(es, "x", T0 + maxDirtinessMs()), -1,
+          "and not at the boundary — the bound is on how much one exit gets to correlate");
+  t.eqI32(selectCircuit(es, "x", T0 + maxDirtinessMs() * 2), -1, "nor later");
+  return t.report();
+}
+
+export string test_a_clean_circuit_never_expires() {
+  T t = T.create();
+  Entry[] es = Entry[](e(0, "x", -1));
+  t.eqI32(selectCircuit(es, "x", T0 + maxDirtinessMs() * 100), 0,
+          "dirtiness is measured from first use, not from construction");
+  return t.report();
+}
+
+export string test_a_broken_circuit_is_never_handed_out() {
+  T t = T.create();
+  Entry[] es = Entry[](Entry(0, "x", -1, true, 0), e(1, "x", T0));
+  t.eqI32(selectCircuit(es, "x", T0), 1, "the good one");
+  Entry[] onlyBad = Entry[](Entry(0, "x", -1, true, 0));
+  t.eqI32(selectCircuit(onlyBad, "x", T0), -1, "and nothing when only the broken one is left");
+  return t.report();
+}
+
+export string test_dirty_circuits_are_used_before_clean_ones_oldest_first() {
+  T t = T.create();
+  Entry[] es = Entry[](e(0, "x", -1), e(1, "x", T0 + 1000), e(2, "x", T0));
+  t.eqI32(selectCircuit(es, "x", T0 + 2000), 2, "the oldest dirty one");
+  Entry[] two = Entry[](e(0, "x", -1), e(1, "x", T0));
+  t.eqI32(selectCircuit(two, "x", T0 + maxDirtinessMs()), 0,
+          "and the clean one once the dirty one is past its life");
+  return t.report();
+}
+
+export string test_a_busy_circuit_is_not_retired_under_its_stream() {
+  // Retirement is about new streams. A download running for an hour keeps its circuit; what
+  // stops is anything else joining it.
+  T t = T.create();
+  Entry[] es = Entry[](Entry(0, "x", T0, false, 1), Entry(1, "x", T0, false, 0));
+  i32[] due = retirable(es, T0 + maxDirtinessMs());
+  t.eqI32(due.len(), 1, "only the idle one");
+  t.eqI32(due[0], 1, "and it is the idle one");
+  t.eqI32(retirable(es, T0 + 1000).len(), 0, "nothing is retired before its time");
+  return t.report();
+}
+
+export string test_a_broken_circuit_is_retired_even_while_busy() {
+  T t = T.create();
+  Entry[] es = Entry[](Entry(0, "x", T0, true, 3));
+  i32[] due = retirable(es, T0);
+  t.eqI32(due.len(), 1, "it cannot carry anything anyway, so holding it open leaks a socket");
+  return t.report();
+}
