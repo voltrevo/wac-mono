@@ -126,6 +126,13 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   return {
     [OP.NOW_MILLIS]: () => i64le(BigInt(Date.now())),
     [OP.MONOTONIC_NANOS]: () => i64le(BigInt(Math.round(performance.now() * 1e6))),
+    // A timer, which is what makes a timeout expressible: waited on beside another ticket,
+    // whichever lands first decides. Resolves to the monotonic nanoseconds at which it fired
+    // rather than to nothing, so a caller can see the overshoot.
+    [OP.SLEEP_MILLIS]: (p) =>
+      new Promise<Uint8Array>((ok) =>
+        setTimeout(() => ok(i64le(BigInt(Math.round(performance.now() * 1e6)))), readI32le(p))
+      ),
     [OP.RANDOM_BYTES]: (p) => {
       const n = readI32le(p);
       if (n < 0 || n > 1 << 20) throw new Error(`randomBytes(${n}) out of range`);

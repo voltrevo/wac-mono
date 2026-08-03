@@ -88,6 +88,8 @@ export function coreOf(
     () => asI64(submit(b, OP.NOW_MILLIS, EMPTY)),
     /*= monotonicNanos */
     () => asI64(submit(b, OP.MONOTONIC_NANOS, EMPTY)),
+    /*= sleepMillis */
+    (ms: number) => asI64(submit(b, OP.SLEEP_MILLIS, i32le(ms))),
     /*= randomBytes */
     (n: number) => asBytes(submit(b, OP.RANDOM_BYTES, i32le(n))),
     // Submitted *and collected*. A bare submit claims a slot the worker never gives

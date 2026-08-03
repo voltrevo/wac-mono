@@ -1,0 +1,131 @@
+// Bounding how long a call may take.
+//
+//   patience <host> <port> <millis>
+//
+// Connect, then wait that long for the peer to say something. A peer that completes the
+// handshake and then says nothing used to stop the application permanently — no error, no log
+// line, no way to notice (wac-mono issue 0018).
+//
+// The fix is not a timeout on `recv`. It is one capability, `core.sleepMillis`, which hands
+// back a ticket that settles on time instead of on I/O; `waitAny` then does the rest, and the
+// same three lines bound `connect`, `accept`, `readFile` or a child's `exitCode`:
+//
+//   Pending<i64> t = core.sleepMillis(ms);
+//   i32 which = cli.waitAny(i32[](r.id, t.id));
+//   if (which == 1) { /* it ran out */ }
+//
+// What this example is really for is the part that is easy to get wrong. A timeout is a
+// decision the *waiter* makes, and nothing about it reaches either the read the host has
+// already entered or the tickets `waitAny` did not pick. So each round has to dispose of what
+// it is finished with, and there are three distinct things to know:
+//
+//   * the loser  — `waitAny` collects nothing, so cancel the ticket that did not win. A timer
+//                  left uncancelled holds a ring slot for good; four and the program stops.
+//   * wait more  — wait on the **same** read ticket again with a fresh timer. Do not issue a
+//                  second `recv`: two reads on one socket, and the byte order is anyone's guess.
+//   * give up    — cancel *and* close the handle. Cancelling discards the answer; closing is
+//                  what makes the read finish, which is what returns its slot.
+//
+// Six rounds, deliberately more than the ring has slots, so a run that leaked would stop
+// rather than finish:
+//
+//   patience 127.0.0.1 9000 100
+//   waited 100ms, nothing yet
+//   ...
+//   giving up after 600ms
+
+import { Cli, Core, Pending, Socket } from "../src/platform.wac";
+
+const i32 ROUNDS = 6;   // more than SLOTS, so a leaked ticket would show up as a stall
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount().wait() < 3) {
+    core.warn("usage: patience <host> <port> <millis>");
+    return 2;
+  }
+  string host = cli.arg(0).wait();
+  i32 port = atoi(cli.arg(1).wait());
+  i32 ms = atoi(cli.arg(2).wait());
+
+  // Even connecting is bounded, and the shape is identical — which is the point of putting
+  // the deadline on the waiter rather than on each capability.
+  Pending<Socket> pc = cli.connect(host, port);
+  Pending<i64> ct = core.sleepMillis(ms);
+  if (cli.waitAny(i32[](pc.id, ct.id)) == 1) {
+    core.warn("patience: connect to " + host + " did not answer within " + itoa(ms) + "ms");
+    // The connect is still in flight and there is no handle to close, so its slot comes back
+    // only when the host's own attempt finishes — cancelling says "discard the answer", not
+    // "stop trying". Worth knowing before doing this in a loop.
+    pc.cancel();
+    return 1;
+  }
+  ct.cancel();
+  Socket s = pc.wait();
+  if (s.handle < 0) {
+    core.warn("patience: " + s.error);
+    return 1;
+  }
+
+  // One read, waited on more than once. Re-issuing `recv` here instead would be the bug the
+  // header warns about, and it would not look like one.
+  Pending<u8[]> r = cli.recv(s.handle);
+  i32 waited = 0;
+
+  for (i32 round = 0; round < ROUNDS; round++) {
+    Pending<i64> t = core.sleepMillis(ms);
+    i32 which = cli.waitAny(i32[](r.id, t.id));
+    waited = waited + ms;
+
+    if (which == 0) {
+      // The peer spoke. The timer is still out there; cancelling it is worth doing because a
+      // timer *does* honour cancellation — it always lands, so its slot comes back.
+      t.cancel();
+      u8[] said = r.wait();
+      if (said.len() == 0) {
+        core.log("peer closed after " + itoa(waited) + "ms");
+      } else {
+        core.log("peer sent " + itoa(said.len()) + " bytes after " + itoa(waited) + "ms");
+      }
+      cli.closeSocket(s.handle);
+      return 0;
+    }
+
+    // The timer fired, and `waitAny` did not collect it. Cancelling a fired ticket releases
+    // its slot at once; leaving it holds one for good, and three rounds of that fills the
+    // ring and stops the program dead. This line is the whole lesson of the example.
+    t.cancel();
+
+    if (round + 1 < ROUNDS) {
+      core.log("waited " + itoa(waited) + "ms, nothing yet");
+    }
+  }
+
+  core.log("giving up after " + itoa(waited) + "ms");
+  // Giving up for real. Cancelling says the answer is unwanted; closing the socket is what
+  // makes the read actually finish, and the slot returns when it does. Without the close, the
+  // ring is short a slot for as long as the peer keeps the connection open.
+  r.cancel();
+  cli.closeSocket(s.handle);
+  return 1;
+}
+
+i32 atoi(string s) {
+  u8[] b = s.toBytes();
+  i32 n = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return n; }
+    n = n * 10 + (b[i] - '0');
+  }
+  return n;
+}
+
+string itoa(i32 n) {
+  if (n == 0) { return "0"; }
+  i32 v = n < 0 ? 0 - n : n;
+  u8[] digits = u8[12](fill: 0);
+  i32 at = 12;
+  while (v > 0) { at--; digits[at] = '0' + (v % 10); v = v / 10; }
+  u8[] used = u8[12 - at](fill: 0);
+  used.copyFrom(digits, at, 0, 12 - at);
+  return (n < 0 ? "-" : "") + string.fromBytes(used);
+}
