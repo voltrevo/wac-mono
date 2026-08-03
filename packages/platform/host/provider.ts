@@ -344,4 +344,62 @@ export function cliOf(
     (handle: number) => T.i32(submit(b, OP.EXIT_CODE, i32le(handle))));
 }
 
+/**
+ * The `Page` capabilities, for an interactive application in a browser.
+ *
+ * Built like `Cli`: positionally, with one hoisted resolver per return shape, and every
+ * argument tagged so `order.test.ts` can check this list against `platform.wac`.
+ */
+export type PageClasses = {
+  // `PendingClass` is the four-argument ticket shape; a struct's `of` takes its own fields.
+  Page: { of(...a: unknown[]): unknown };
+  Event: { of(...a: unknown[]): unknown };
+  Pending_Event: PendingClass;
+  Pending_bool: PendingClass;
+  Pending_string: PendingClass;
+};
+
+export function pageOf(b: Bridge, cls: PageClasses): unknown {
+  const settled = (id: number) => isDone(b, unpack(id));
+  const drop = (id: number) => { cancel(b, unpack(id)); };
+  const ok = (id: number) => { collect(b, unpack(id)); return true; };
+  const text = (id: number) => unstr(collect(b, unpack(id)));
+  const event = (id: number) => {
+    const parts = unstr(collect(b, unpack(id))).split("\u0000");
+    return cls.Event.of(parts[0] ?? "", parts[1] ?? "", parts[2] ?? "");
+  };
+
+  /** A length-prefixed string and then the rest: how two strings cross as one payload. */
+  const two = (a: string, bs: string): Uint8Array => {
+    const x = str(a);
+    const y = str(bs);
+    const out = new Uint8Array(4 + x.length + y.length);
+    out.set(i32le(x.length), 0);
+    out.set(x, 4);
+    out.set(y, 4 + x.length);
+    return out;
+  };
+
+  const asOk = (t: Ticket) => cls.Pending_bool.of(pack(t), ok, settled, drop);
+  const asText = (t: Ticket) => cls.Pending_string.of(pack(t), text, settled, drop);
+  const asEvent = (t: Ticket) => cls.Pending_Event.of(pack(t), event, settled, drop);
+
+  return cls.Page.of(
+    /*= render */
+    (html: string) => asOk(submit(b, OP.RENDER, str(html))),
+    /*= setText */
+    (id: string, t: string) => asOk(submit(b, OP.SET_TEXT, two(id, t))),
+    /*= setValue */
+    (id: string, v: string) => asOk(submit(b, OP.SET_VALUE, two(id, v))),
+    /*= getValue */
+    (id: string) => asText(submit(b, OP.GET_VALUE, str(id))),
+    /*= on */
+    (sel: string, kind: string) => asOk(submit(b, OP.ON, two(sel, kind))),
+    /*= nextEvent */
+    () => asEvent(submit(b, OP.NEXT_EVENT, EMPTY)),
+    /*= title */
+    (t: string) => asOk(submit(b, OP.TITLE, str(t))),
+  );
+}
+
 export { HostCallError };

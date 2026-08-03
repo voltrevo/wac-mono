@@ -469,6 +469,56 @@ WebSocket, so `connect` is absent rather than approximated — an application ge
 it can report instead of one protocol that works by accident. `box get`, `box gets` and
 `box serve` do not run here, and no amount of shimming would change that.
 
+### Interactive pages
+
+A third profile beside `Core` and `Cli`, and only a browser provides it. The entry point says
+which kind of program this is: a module exporting `page` gets `Page`, one exporting `main` gets
+`Cli`, and a module may export both.
+
+```wac
+export i32 page(Core core, Page page) {
+  page.render("<button id=\"go\">go</button><p id=\"out\"></p>").wait();
+  page.on("button", "click").wait();
+  i32 clicks = 0;                                  // state, in a local
+  while (true) {
+    Event e = page.nextEvent().wait();
+    clicks = clicks + 1;
+    page.setText("out", itoa(clicks)).wait();
+  }
+}
+```
+
+**An event is just another ticket.** `nextEvent` parks the worker exactly as `recv` parks it on
+a socket, while the page's own thread — the host — stays free to run the real event loop and
+queue what arrives. Three things follow, and they are the reason for the shape:
+
+- **It is a loop, so state lives in locals.** Callbacks would need somewhere to put `clicks`,
+  and wac has no mutable globals; the alternative is threading a state struct through every
+  handler, which is the service shape and is heavier than this needs to be.
+- **`waitAny` composes over it.** A click *or* a five-second deadline is
+  `cli.waitAny(i32[](e.id), 5000)`. That is the thing callbacks make hard.
+- **The application decides when it is over.** Returning from `page` ends it and the launcher
+  prints the exit line; the document stays as the program left it.
+
+The operations are coarse, for the reason at the top of `platform.wac`. `render` replaces the
+application root in one call; `setText` and `setValue` are for the targeted updates that would
+otherwise mean re-rendering to change a word. There is no `querySelector`-shaped surface — every
+property poke would be a round trip across a thread boundary, to reach an object this side
+cannot hold. `setText` is `textContent`, so a value carrying `<script>` lands as those
+characters; `render` is the one that parses, and that difference is where an injection bug in a
+page like this would come from.
+
+Subscriptions are **delegated from the document**, so they survive a `render` that replaces the
+elements they were asked about. Attaching to the elements themselves would break on the next
+redraw, and the symptom — the first click works and the second does not — sends you looking in
+the wrong place.
+
+`example/counter.wac` is the small one, and `packages/box/example/hash.wac` is the one worth
+seeing: type into a box and watch SHA-256 from `packages/crypto` and DEFLATE from
+`packages/gzip` keep up, both written for a command line and neither changed for this. 18KB of
+text hashes and compresses to 131 bytes in about a millisecond, on a worker, so the typing stays
+smooth. No JavaScript was written by anybody.
+
 **`rename` is the promise a page cannot keep.** OPFS has no rename, so it is a copy and a
 delete. Atomicity is the entire reason `rename` exists — `cp` and `sponge` write beside
 their target and move it into place — so those applets are genuinely weaker in a browser

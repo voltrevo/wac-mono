@@ -35,6 +35,13 @@ export const OP = {
   EXIT_CODE: 28,
   CLOSE_FEED: 29,
   SLEEP_MILLIS: 30,
+  RENDER: 31,
+  SET_TEXT: 32,
+  SET_VALUE: 33,
+  GET_VALUE: 34,
+  ON: 35,
+  NEXT_EVENT: 36,
+  TITLE: 37,
 } as const;
 
 /**

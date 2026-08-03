@@ -1,0 +1,68 @@
+// An interactive page: draw something, then answer what the user does.
+//
+//   deno task app:build packages/platform/example/counter.wac --target browser -o page/index.html
+//   box httpd -8080 page -x
+//
+// The entry point is `page`, not `main`, and that is the whole of how a program says it is
+// interactive: the launcher hands `Page` to one and `Cli` to the other. A module may export
+// both, and then it is a command-line program that also knows how to be a page.
+//
+// **It is a loop, not a set of callbacks.** `nextEvent().wait()` parks the worker exactly as
+// `recv` parks it on a socket, while the page's own thread — the host — stays free to run the
+// real event loop. So the program keeps its state in ordinary locals across events, which is
+// the thing a callback shape cannot do without somewhere to put it.
+
+import { Core, Event, Page } from "../src/platform.wac";
+
+export i32 page(Core core, Page page) {
+  page.title("counter").wait();
+  page.render(
+    "<p>Clicks: <b id=\"n\">0</b></p>" +
+    "<button id=\"up\">+1</button> " +
+    "<button id=\"down\">-1</button> " +
+    "<button id=\"reset\">reset</button>" +
+    "<p>Type here: <input id=\"echo\" size=\"24\"></p>" +
+    "<p id=\"said\" class=\"meta\"></p>" +
+    "<p><button id=\"quit\">quit</button></p>"
+  ).wait();
+
+  // Delegated, so these survive the `render` above and any later one.
+  page.on("button", "click").wait();
+  page.on("#echo", "input").wait();
+
+  i32 n = 0;                       // state, in a local, because this is a loop
+  while (true) {
+    Event e = page.nextEvent().wait();
+
+    if (e.kind == "input") {
+      page.setText("said", e.value == "" ? "" : "you typed: " + e.value).wait();
+    } else if (e.id == "up") {
+      n = n + 1;
+      page.setText("n", itoa(n)).wait();
+    } else if (e.id == "down") {
+      n = n - 1;
+      page.setText("n", itoa(n)).wait();
+    } else if (e.id == "reset") {
+      n = 0;
+      page.setText("n", "0").wait();
+      page.setValue("echo", "").wait();
+      page.setText("said", "").wait();
+    } else if (e.id == "quit") {
+      // Returning ends the application, and the launcher prints the exit line. The page stays
+      // on screen: nothing here owns the document once the program is done with it.
+      core.log("counted to " + itoa(n));
+      return 0;
+    }
+  }
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  i32 x = v < 0 ? 0 - v : v;
+  u8[] digits = u8[12](fill: 0);
+  i32 at = 12;
+  while (x > 0) { at--; digits[at] = '0' + (x % 10); x = x / 10; }
+  u8[] used = u8[12 - at](fill: 0);
+  used.copyFrom(digits, at, 0, 12 - at);
+  return (v < 0 ? "-" : "") + string.fromBytes(used);
+}
