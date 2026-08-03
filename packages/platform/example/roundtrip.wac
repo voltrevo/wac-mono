@@ -1,0 +1,85 @@
+// The filesystem, wherever it happens to be.
+//
+//   roundtrip <text>
+//
+// Write a file, stat it, read it back, list the directory, rename it, and remove it — printing
+// what each step answered. On Deno and Node that is the real filesystem. In a browser it is the
+// Origin Private File System, which is the same nine capabilities behind a very different
+// implementation, and this is what says so out loud:
+//
+//   deno task app:build packages/platform/example/roundtrip.wac --target browser -o page/index.html
+//   box httpd -8080 page -x
+//   http://127.0.0.1:8080/?a=hello
+//
+// The interesting line is `rename`. OPFS has no rename, so the browser world does a copy and a
+// delete — the one place where a capability is *weaker* in a page rather than absent, and the
+// only kind of difference this program cannot show you, since a non-atomic rename looks exactly
+// like an atomic one until two of them race.
+
+import { Cli, Core, FileResult, Stat } from "../src/platform.wac";
+
+export i32 main(Core core, Cli cli) {
+  string text = cli.argCount().wait() > 0 ? cli.arg(0).wait() : "round trip";
+  string a = "roundtrip.txt";
+  string b = "roundtrip.moved";
+
+  // A previous run's files, if the store persists — which in a browser it does, across reloads
+  // and across visits, and that is worth seeing rather than tidying away silently.
+  Stat before = cli.stat(a).wait();
+  if (before.exists) { core.log("note: " + a + " was already here from an earlier run"); }
+  cli.remove(a, false).wait();
+  cli.remove(b, false).wait();
+
+  if (!cli.writeFile(a, text.toBytes()).wait()) {
+    core.warn("roundtrip: cannot write " + a);
+    return 1;
+  }
+  core.log("wrote " + a);
+
+  Stat s = cli.stat(a).wait();
+  core.log("stat: exists=" + yn(s.exists) + " isFile=" + yn(s.isFile) + " size=" + itoa(s.size as~ i32));
+
+  FileResult back = cli.readFile(a).wait();
+  if (!back.ok) {
+    core.warn("roundtrip: cannot read back: " + back.error);
+    return 1;
+  }
+  string got = string.fromBytes(back.bytes);
+  core.log("read: " + got);
+  core.log(got == text ? "same bytes back" : "DIFFERENT: wrote " + text + ", read " + got);
+
+  string[]? names = cli.readDir(".").wait();
+  core.log("readDir: " + (names is null ? "not a directory" : itoa(names!.len()) + " entries, " +
+    (contains(names!, a) ? "including " + a : "but not " + a)));
+
+  // Not atomic in a browser. Everything else here behaves identically on all three hosts.
+  if (!cli.rename(a, b).wait()) {
+    core.warn("roundtrip: cannot rename");
+    return 1;
+  }
+  Stat moved = cli.stat(b).wait();
+  Stat gone = cli.stat(a).wait();
+  core.log("rename: " + b + " exists=" + yn(moved.exists) + ", " + a + " exists=" + yn(gone.exists));
+
+  cli.remove(b, false).wait();
+  core.log("removed, " + b + " exists=" + yn(cli.stat(b).wait().exists));
+  return 0;
+}
+
+string yn(bool b) { return b ? "yes" : "no"; }
+
+bool contains(string[] names, string want) {
+  for (i32 i = 0; i < names.len(); i++) { if (names[i] == want) { return true; } }
+  return false;
+}
+
+string itoa(i32 n) {
+  if (n == 0) { return "0"; }
+  i32 v = n < 0 ? 0 - n : n;
+  u8[] digits = u8[12](fill: 0);
+  i32 at = 12;
+  while (v > 0) { at--; digits[at] = '0' + (v % 10); v = v / 10; }
+  u8[] used = u8[12 - at](fill: 0);
+  used.copyFrom(digits, at, 0, 12 - at);
+  return (n < 0 ? "-" : "") + string.fromBytes(used);
+}

@@ -118,6 +118,27 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     return await (await dir.getFileHandle(name)).getFile();
   };
 
+  /**
+   * The directory a path names, where naming nothing names the root.
+   *
+   * Separate from `resolve`, which answers with a directory and a *last component* and so
+   * cannot express the root at all — it throws "empty path". That is right for `readFile` and
+   * `writeFile`, which always have a component to open, and wrong for `readDir` and `stat`,
+   * where `.` is the ordinary way to say "here".
+   *
+   * `readDir(".")` returning "not a directory" is what running this in a real browser found,
+   * after the in-memory double in `browser.test.ts` had been happy for a week: OPFS has no `.`
+   * entry, so the filter dropped it, the parts list came out empty, and the throw became a null
+   * the application read as "no such directory". Deno and Node both answer `.` with the
+   * listing, so portable code asked the obvious question and silently got nothing.
+   */
+  const dirOf = async (path: string, create: boolean): Promise<DirHandle> => {
+    const parts = path.split("/").filter((x) => x !== "" && x !== ".");
+    let dir = root();
+    for (const part of parts) dir = await dir.getDirectoryHandle(part, { create });
+    return dir;
+  };
+
   // The current streaming input and output: the same one-at-a-time model the other worlds
   // use, for the reason given in platform.wac — a handle cannot be carried into a funcref.
   let source: { blob: Blob; at: number } | null = null;
@@ -181,16 +202,14 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
         return out;
       } catch { /* not a file; try a directory */ }
       try {
-        const { dir, name } = await resolve(path, false);
-        await dir.getDirectoryHandle(name);
+        await dirOf(path, false);   // the root included, which `resolve` cannot express
         out[0] = 1;
         out[2] = 1;
       } catch { /* absent, and the zeroes say so */ }
       return out;
     },
     [OP.READ_DIR]: async (p) => {
-      const { dir, name } = await resolve(unstr(p), false);
-      const h = await dir.getDirectoryHandle(name);
+      const h = await dirOf(unstr(p), false);
       const names: string[] = [];
       for await (const key of h.keys()) { names.push(key); }
       // NUL, as the other two worlds do. Joining on a space would split "my file"

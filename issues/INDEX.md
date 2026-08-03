@@ -6,7 +6,6 @@ record of what has been fixed and why.
 | # | summary | kind | symptom |
 |---|---|---|---|
 | [0017](open/0017-deno-task-app-orphans-the-application-when-the-launcher-is-killed.md) | `deno task app` orphans the application when the launcher is killed | bug | wrong answer |
-| [0016](open/0016-the-browser-target-is-untested-in-a-browser-playwright-cdn-is-blocked.md) | the browser target is untested in a browser; Playwright's CDN is blocked | task | not implemented |
 | [0014](open/0014-platform-has-no-way-to-write-bytes-to-standard-error.md) | platform has no way to write bytes to standard error | missing feature | not implemented |
 | [0011](open/0011-node-crypto-overloads-keep-failing-type-check-and-redden-the-shared-suite.md) | `node:crypto` overloads keep failing type-check and reddening the shared suite | task | wrong answer |
 | [0009](open/0009-forty-two-exported-wac-functions-that-nothing-calls.md) | forty-two exported wac functions that nothing calls, across eight packages | bug | no error |
