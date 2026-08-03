@@ -10,7 +10,6 @@ import { encodeFixed, encodeVar, cellSize, cellCommand, cellCircId, cellPayload,
          encodeVersions, negotiateVersion, encodeNetinfo, encodeCreate2, decodeCreated2,
          certsCount, encodePaddingNegotiate, encodePadding } from "./cell.wac";
 import { ntorClientRequest, ntorClientFinish } from "./ntor.wac";
-import { hopInit, hopSend, hopRecv, hopPeel, hopWrap, hopCheck, hopStateLen, hopDigest,
          relayCommand, relayStreamId, relayPayload, beginBody, extend2Body, extended2Reply,
          sendmeBodyV1, endReason } from "./relay.wac";
 import { signedLength, signedDigest, keyFingerprint, rsaModulus, rsaExponent,
@@ -50,14 +49,6 @@ export u8[] torNtorFinish(u8[] i, u8[] o, u8[] p, u8[] r, i32 n) {
 }
 
 // Relay layer
-export u8[] torHopInit(u8[] m) { return hopInit(m); }
-export u8[] torHopSend(u8[] s, i32 c, i32 i, u8[] d) { return hopSend(s, c, i, d); }
-export u8[] torHopRecv(u8[] s, u8[] p) { return hopRecv(s, p); }
-export u8[] torHopPeel(u8[] s, u8[] p) { return hopPeel(s, p); }
-export u8[] torHopWrap(u8[] s, u8[] p) { return hopWrap(s, p); }
-export u8[] torHopCheck(u8[] s, u8[] b) { return hopCheck(s, b); }
-export i32 torHopStateLen() { return hopStateLen(); }
-export u8[] torHopDigest(u8[] s, bool f) { return hopDigest(s, f); }
 export i32 torRelayCommand(u8[] b) { return relayCommand(b); }
 export i32 torRelayStreamId(u8[] b) { return relayStreamId(b); }
 export u8[] torRelayPayload(u8[] b) { return relayPayload(b); }

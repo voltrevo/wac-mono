@@ -4,8 +4,9 @@
 // are things wac could have called directly, and with the bridge the wac side does not
 // know the difference.
 
-import { type Handlers } from "./respond.ts";
-import { CHUNK } from "./layout.ts";
+import { type Handlers, serveHostCalls } from "./respond.ts";
+import { ByteQueue, type Child, spawnChild } from "./children.ts";
+import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { OP } from "./ops.ts";
 
@@ -21,6 +22,15 @@ export type DenoWorldOptions = {
   net?: boolean;
   /** Environment lookups, or leave it out to report every variable unset. */
   env?(name: string): string | undefined;
+  /**
+   * Where exact bytes go, and where standard input comes from.
+   *
+   * Absent means the real ones. A *spawned* world is given queues instead, which is how a
+   * child's output reaches its parent through a handle rather than the terminal — the only
+   * reason these exist.
+   */
+  write?(bytes: Uint8Array): void;
+  readStdin?(): Promise<Uint8Array>;
 };
 
 const EMPTY = new Uint8Array(0);
@@ -75,6 +85,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   const log = opts.log ?? ((l: string) => console.log(l));
   const warn = opts.warn ?? ((l: string) => console.error(l));
   const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
+  const writeOut = opts.write;
+  const readIn = opts.readStdin;
 
   // The current streaming input. One at a time rather than a handle per file, because the
   // wac side has no closures to carry a handle in — see the note in platform.wac.
@@ -102,6 +114,9 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   // shows up as one request's answer arriving on another's socket.
   const sockets = new Map<number, Deno.Conn>();
   const listeners = new Map<number, Deno.Listener>();
+  // Children share the handle space with sockets, so `recv`, `send` and `waitAny` need no
+  // idea which they are holding — which is the whole reason a child is a handle.
+  const children = new Map<number, Child>();
   let nextHandle = 1;
 
   return {
@@ -138,8 +153,9 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
 
     // stdin and stdout need no grant: what the user pipes in and what the program prints
     // are the user's own doing, not a reach into something they did not offer.
-    [OP.READ_STDIN]: async () => await readAllStdin(),
+    [OP.READ_STDIN]: async () => readIn === undefined ? await readAllStdin() : await readIn(),
     [OP.WRITE_STDOUT]: async (p) => {
+      if (writeOut !== undefined) { writeOut(p.slice()); return EMPTY; }
       if (sink === null) { await writeAllStdout(p); return EMPTY; }
       let at = 0;
       while (at < p.length) at += await sink.write(p.subarray(at));
@@ -186,6 +202,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       return EMPTY;
     },
     [OP.READ_CHUNK]: async () => {
+      if (source === null && readIn !== undefined) return await readIn();
       const into = fresh();
       const n = source === null ? await Deno.stdin.read(into) : await source.read(into);
       // A short read is not the end; only null is.
@@ -232,18 +249,24 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       // Handle 0 is standard input. Handles count from 1, so it can never be a socket, and
       // giving stdin one means `waitAny` can watch it beside a socket — which is what a
       // relay like `nc` needs and could not express while stdin was only `readChunk`.
+      if (h === STDIN_HANDLE && readIn !== undefined) return await readIn();
       const into = fresh();
       if (h === STDIN_HANDLE) {
         const n = await Deno.stdin.read(into);
         return n === null ? EMPTY : into.subarray(0, n);
       }
+      const kid = children.get(h);
+      if (kid !== undefined) return await kid.out.next();
       const c = sockets.get(h);
       if (c === undefined) throw new Error("not an open socket");
       const n = await c.read(into);
       return n === null ? EMPTY : into.subarray(0, n);
     },
     [OP.SEND]: async (p) => {
-      const c = sockets.get(readI32le(p));
+      const h = readI32le(p);
+      const kid = children.get(h);
+      if (kid !== undefined) { kid.in.push(p.slice(4)); return EMPTY; }
+      const c = sockets.get(h);
       if (c === undefined) throw new Error("not an open socket");
       const body = p.subarray(4);
       let at = 0;
@@ -256,9 +279,59 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       // every path would otherwise have to track which paths had already done it.
       try { sockets.get(h)?.close(); } catch { /* already closed */ }
       try { listeners.get(h)?.close(); } catch { /* already closed */ }
+      // Closing a child's handle ends its standard input *and* stops it. A program that
+      // wants only the first should stop sending and wait for its output to end.
+      try { children.get(h)?.in.end(); children.get(h)?.kill(); } catch { /* gone */ }
       sockets.delete(h);
       listeners.delete(h);
+      children.delete(h);
       return EMPTY;
+    },
+
+    /**
+     * A worker on the source it is handed, wired to queues.
+     *
+     * The child gets its own bridge and its own world — nothing is shared, and each needs
+     * its own world *instance* because these handlers close over the current input, the
+     * current output and the socket map. One table between two children would hand one of
+     * them the other's socket.
+     *
+     * Its world is granted nothing: no filesystem, no network. `log`, `warn` and `write` all
+     * arrive at the parent through the handle, and its reads come from what the parent
+     * sends. See the notes in `children.ts` and `platform.wac`.
+     */
+    [OP.SPAWN]: (p) => {
+      const n = readI32le(p);
+      const source = unstr(p.subarray(4, 4 + n));
+      const rest = unstr(p.subarray(4 + n));
+      const childArgs = rest.length === 0 ? [] : rest.split("\u0000");
+      const h = nextHandle++;
+      children.set(h, spawnChild(source, childArgs, (sab, cargs, out, input) => {
+        const enc = new TextEncoder();
+        return serveHostCalls(bridgeOf(sab), denoWorld({
+          args: cargs,
+          // A line of output is bytes on the handle, with the newline `log` implies. The
+          // parent cannot tell `log` from `write` — nor can a pipe, which is the point.
+          log: (l: string) => out.push(enc.encode(l + "\n")),
+          warn: (l: string) => out.push(enc.encode(l + "\n")),
+          write: (b: Uint8Array) => out.push(b),
+          readStdin: () => input.next(),
+        }));
+      }, newBridge));
+      return i32le(h);
+    },
+
+    [OP.CLOSE_FEED]: (p) => {
+      // Input only. `closeSocket` is what stops a child; a program that reads to the end
+      // before answering needs that end while it is still alive.
+      children.get(readI32le(p))?.in.end();
+      return EMPTY;
+    },
+
+    [OP.EXIT_CODE]: async (p) => {
+      const c = children.get(readI32le(p));
+      if (c === undefined) throw new Error("not a spawned worker");
+      return i32le(await c.exit);
     },
 
     [OP.MKDIR]: async (p) => {

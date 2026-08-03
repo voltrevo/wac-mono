@@ -31,4 +31,7 @@ export const OP = {
   RECV: 24,
   SEND: 25,
   CLOSE_SOCKET: 26,
+  SPAWN: 27,
+  EXIT_CODE: 28,
+  CLOSE_FEED: 29,
 } as const;

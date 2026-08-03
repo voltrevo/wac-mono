@@ -77,20 +77,22 @@ building with `tools/tor.sh`. The binary is looked for under `$HOME/tor-build`, 
 
 | | |
 | --- | --- |
-| `src/cell.wac` | cell framing, VERSIONS, NETINFO, CREATE2/CREATED2 |
+| `src/cell.wac` | cell framing, VERSIONS, NETINFO, CREATE2/CREATED2, padding |
 | `src/ntor.wac` | the handshake |
 | `src/relay.wac` | relay cells: the running digest, the onion layers, EXTEND2 |
-| `host/link.ts` | the link handshake — owns the socket |
-| `host/circuit.ts` | the circuit: layering, extending, streams |
-| `src/consensus.wac` | the signature crypto behind believing a directory |
-| `host/directory.ts` | parsing a consensus and its microdescriptors |
-| `host/verify.ts` | the authority chain and the majority rule |
-| `src/pathsel.wac` | the weighting and the path constraints |
-| `host/path.ts` | resolving the consensus into candidates, and guards |
-| `host/dirclient.ts` | fetching the directory over Tor, bootstrapping, and refresh |
-| `host/pool.ts` | keeping circuits, and deciding which one a stream goes on |
-| `host/socket.ts` | a stream, shaped like a socket — the integration surface |
-| `host/fetch.ts` | HTTPS over Tor, which is three lines of composition |
+| `src/circuit.wac` | the circuit: layering, windows, streams — a state machine over cells |
+| `src/directory.wac` | parsing a consensus and its microdescriptors |
+| `src/consensus.wac` | the authority chain, the majority rule, freshness |
+| `src/pathsel.wac` | bandwidth weighting, families, guards, exit policies |
+| `src/pool.wac` | circuit reuse and retirement |
+| `src/dirclient.wac` | request paths and the refresh schedule |
+| `src/app.wac` | the program: sockets from the platform, everything else from the above |
+
+There is no `host/` directory. There was, and it was 1368 lines against 722 of wac — in a
+repo where `tls` is 0.17x TypeScript and `ssh`, a client and a server, is zero. The excuse
+was that the host owns the socket, and it was already false: platform sockets landed
+seventeen minutes before the first of those files was written, and `box gets` was already
+doing TLS 1.3 in wac over one.
 
 The split is the same one the TLS package uses: bytes and state machines in wac, and only
 the socket in TypeScript. One exception is forced rather than chosen — a `Hop` is a struct

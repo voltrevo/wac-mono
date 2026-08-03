@@ -137,6 +137,7 @@ export async function buildApp(
   out: string,
   grants: Grants = {},
   target: Target = "deno",
+  workerOnly = false,
 ): Promise<void> {
   checkWacVersion();
 
@@ -263,6 +264,16 @@ export async function buildApp(
           `await runLauncher(${JSON.stringify(workerSource)}, ${JSON.stringify(grants)});\n`,
       );
 
+    // `--worker` emits the worker bundle alone: the half that expects a `SharedArrayBuffer`
+    // by `postMessage` and runs the application on it. That is exactly what `spawn` takes,
+    // so this is how a wac program becomes a *child* rather than a program of its own.
+    //
+    // No shebang and no execute bit — it is not runnable by itself, and pretending otherwise
+    // would invite someone to try.
+    if (workerOnly) {
+      await Deno.writeTextFile(out, workerSource);
+      return;
+    }
     if (target === "browser") {
       // A page, not an executable: no shebang and no execute bit.
       const title = entry.split("/").pop() ?? "wac";
@@ -285,12 +296,13 @@ if (import.meta.main) {
     console.error(
       "usage: deno task app:build <entry.wac> [-o output] " +
         "[--allow-read] [--allow-write] [--allow-env] [--allow-net]\n" +
-      "                        [--target deno|node|browser]\n\n" +
+      "                        [--target deno|node|browser] [--worker]\n\n" +
         "The grants are baked in: the built program takes no permission flags of its own,\n" +
         "and every argument it is given goes to the application.",
     );
     Deno.exit(2);
   }
+  const workerOnly = argv.includes("--worker");
   const grants: Grants = {
     read: argv.includes("--allow-read"),
     write: argv.includes("--allow-write"),
@@ -304,7 +316,7 @@ if (import.meta.main) {
     Deno.exit(2);
   }
   const dest = out ?? entry.replace(/.*\//, "").replace(/\.wac$/, "");
-  await buildApp(entry, dest, grants, target);
+  await buildApp(entry, dest, grants, target, workerOnly);
   const size = (await Deno.stat(dest)).size;
   const granted = Object.entries(grants).filter(([, v]) => v).map(([k]) => k);
   console.log(

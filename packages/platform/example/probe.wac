@@ -1,0 +1,46 @@
+// A program that reports what it is allowed to do, for testing what a child is granted.
+//
+// It attempts one capability of each kind and prints the outcome, so running it directly and
+// running it as a spawned child can be compared without reading any host code.
+//
+//   probe                  ->  read=ok net=ok        (built with --allow-read --allow-net)
+//   runner probe.worker.js  ->  read=denied net=denied
+
+import { Cli, Core, FileResult, Socket } from "../src/platform.wac";
+
+export i32 main(Core core, Cli cli) {
+  // A file that certainly exists when run from the repository root. A denial and a missing
+  // file are deliberately not distinguished by the world, so the *message* is what says
+  // which — and either way the answer is "not readable", which is what a caller acts on.
+  FileResult f = cli.readFile("README.md").wait();
+  string read = f.ok ? "ok" : (f.error == "" ? "denied" : f.error);
+
+  // Port 1 is privileged and nothing is listening, so a *grant* failure and a connection
+  // failure differ in their message rather than in whether they failed.
+  Socket s = cli.connect("127.0.0.1", 1).wait();
+  string net = s.handle < 0 ? s.error : "ok";
+  if (s.handle >= 0) { cli.closeSocket(s.handle); }
+
+  core.log("read=" + summary(read) + " net=" + summary(net));
+  return 0;
+}
+
+/** "ok", or "denied" when the message says the capability was withheld, or "failed". */
+string summary(string outcome) {
+  if (outcome == "ok") { return "ok"; }
+  return contains(outcome, "not granted") ? "denied" : "failed";
+}
+
+bool contains(string haystack, string needle) {
+  u8[] h = haystack.toBytes();
+  u8[] n = needle.toBytes();
+  if (n.len() == 0 || n.len() > h.len()) { return false; }
+  for (i32 i = 0; i + n.len() <= h.len(); i++) {
+    bool same = true;
+    for (i32 j = 0; j < n.len(); j++) {
+      if (h[i + j] != n[j]) { same = false; }
+    }
+    if (same) { return true; }
+  }
+  return false;
+}

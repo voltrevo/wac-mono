@@ -27,8 +27,15 @@ cd "$DIR"
 cd torproject-tor-*
 
 [ -f configure ] || ./autogen.sh
+# Relay mode stays *enabled*. `--disable-module-relay` builds a client-only tor, which is
+# fine for the ntor oracle and useless for a testnet — chutney is all relays and directory
+# authorities, and the failure is `This tor was built with relay mode disabled` from a
+# `--list-fingerprint` deep inside chutney's Python, which reads as a chutney problem.
+# I have now hit this twice: once building the oracle, and once rebuilding after the
+# container was recreated, because the first time I fixed the build by hand and not the
+# script. Check `relay: yes, dirauth: yes` in configure's summary.
 [ -f Makefile ] || ./configure --disable-asciidoc --disable-manpage \
-  --disable-html-manual --disable-module-relay
+  --disable-html-manual
 make -j"$(nproc)" src/test/test-ntor-cl
 
 echo
