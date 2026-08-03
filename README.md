@@ -12,7 +12,7 @@ compiler, this one is things built with it.
 it builds on, and every program and page you can build, each with a line on what it does. It
 is generated from the tree by `deno task map` and checked by the suite, so it cannot drift.
 
-Today: **24 packages, 40,917 lines of wac, 896 tests, 20 command-line programs and 4 browser
+Today: **24 packages, 40,917 lines of wac, 897 tests, 20 command-line programs and 4 browser
 pages.** Those numbers are in MAP.md too, and that copy is the one that stays true.
 
 ## What is actually in here
