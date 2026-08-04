@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0031](open/0031-a-mutation-sweep-starves-every-other-agent-on-this-machine.md) | a mutation sweep starves every other agent on this machine | performance | wrong answer |
 | [0025](open/0025-listen-takes-no-address-so-every-server-binds-every-interface.md) | `listen` takes no address, so every server binds every interface | missing feature | not implemented |
 | [0017](open/0017-deno-task-app-orphans-the-application-when-the-launcher-is-killed.md) | `deno task app` orphans the application when the launcher is killed | bug | wrong answer |
 | [0011](open/0011-node-crypto-overloads-keep-failing-type-check-and-redden-the-shared-suite.md) | `node:crypto` overloads keep failing type-check and reddening the shared suite | task | wrong answer |

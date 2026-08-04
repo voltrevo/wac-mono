@@ -33,7 +33,13 @@ for attempt in 1 2 3; do
       echo "note: could not pull wac; the version check will say if it matters"
   fi
 
+  # What the machine was doing, before and after. This container is shared with other agents,
+  # and a mutation sweep next door turns a fifty-second suite into half an hour — which looks
+  # exactly like a hang if nothing says otherwise. Twice now that has cost time to diagnose, so
+  # the numbers are printed rather than remembered.
   echo "== running the suite (attempt $attempt) =="
+  echo "   load $(cut -d' ' -f1-3 /proc/loadavg) on $(nproc) cores"
+  started=$SECONDS
   # Tee'd rather than swallowed. The first version printed only "tests failed", which is the
   # one moment the output is worth having — and when this runs unattended the terminal
   # scrollback is not there to fall back on.
@@ -44,11 +50,17 @@ for attempt in 1 2 3; do
   # line silently starts pushing red trees. Do not drop the `set -uo pipefail`.
   if ! deno task test 2>&1 | tee "$log"; then
     echo
-    echo "== tests failed: not pushing =="
+    echo "== tests failed after $((SECONDS - started))s: not pushing =="
     echo "-- failures --"
     grep -E 'FAILED|error:' "$log" | head -20
     echo "-- full output: $log --"
     exit 1
+  fi
+
+  elapsed=$((SECONDS - started))
+  echo "== suite passed in ${elapsed}s (load now $(cut -d' ' -f1-3 /proc/loadavg)) =="
+  if [ "$elapsed" -gt 180 ]; then
+    echo "   that is several times the usual ~50s: the machine was busy, not the suite"
   fi
 
   if git push --quiet origin master 2>/dev/null; then
