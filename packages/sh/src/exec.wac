@@ -131,6 +131,22 @@ export struct Shell {
   u8[] stdinBytes;
   i32 stdinPos;
   /**
+   * Whether this shell's standard input is *the program's* standard input, to be read on first need.
+   *
+   * False by default, and that is the safe direction. A shell embedded in something else does not own
+   * the process's input: `packages/ssh`'s server would be reading the daemon's own standard input,
+   * which is not the remote command's and may never end; the browser terminal has none at all. Only
+   * an entry point invoked *as* a shell can say this, so `shellMain` sets it and nothing else does —
+   * the same shape as `externalSpawnable`.
+   *
+   * Without it, `printf x | sh -c 'cat'` printed nothing: `stdinBytes` was only ever filled by a
+   * redirection, a here-document or a pipeline, so a command asking for the shell's input got an empty
+   * array and every applet dutifully reported nothing. Issue 0032.
+   */
+  bool ownsStdin;
+  /** Whether the read below has already happened. `readStdin` answers once and is empty after. */
+  bool triedStdin;
+  /**
    * Where this shell believes it is.
    *
    * The shell's own, not the host's: `packages/platform` has a `cwd` to *read* and deliberately
@@ -149,7 +165,8 @@ export struct Shell {
     return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
                  false, Buf.create(), noExternal, noExternalNames, false, Vec.create(),
                  Map.create(hashString, stringEq),
-                 Vec.create(), Vec.create(), false, u8[0](), 0, cli.cwd().wait());
+                 Vec.create(), Vec.create(), false, u8[0](), 0, false, false,
+                 cli.cwd().wait());
   }
 
   /**
@@ -177,8 +194,22 @@ export struct Shell {
     if (this.capture) { this.errOut.pushAll(bytes); } else { this.cli.writeErr(bytes); }
   }
 
-  /** What standard input still has to offer. */
-  u8[] restOfStdin(const this) {
+  /**
+   * What standard input still has to offer, reading the program's own on first need.
+   *
+   * Lazy rather than read at startup, because most scripts never ask: `sh -c 'echo hi'` should not
+   * wait for a terminal to be closed before it can print. It is read *once* — `readStdin` answers with
+   * everything and is empty afterwards — and only when this shell owns it.
+   *
+   * A shell attached to a terminal does block here, on a `cat` with nothing piped in, exactly as bash
+   * does: `cat` waits for end of input, and that is the program working rather than the shell hanging.
+   */
+  u8[] restOfStdin(this) {
+    if (this.ownsStdin && !this.triedStdin && this.stdinPos >= this.stdinBytes.len()) {
+      this.triedStdin = true;
+      this.stdinBytes = this.cli.readStdin().wait();
+      this.stdinPos = 0;
+    }
     return sliceBytes(this.stdinBytes, this.stdinPos, this.stdinBytes.len());
   }
 

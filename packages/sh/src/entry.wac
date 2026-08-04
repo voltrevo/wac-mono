@@ -39,8 +39,18 @@ export i32 shellMain(Core core, Cli cli, Shell sh, i32 first) {
     }
     src = string.fromBytes(f.bytes);
   } else {
+    // No script argument: the script *is* standard input, and reading it consumes it. So a command
+    // inside it has nothing left to read, exactly as in bash — `echo cat | sh` runs `cat` with no
+    // input rather than feeding it the rest of the script.
     src = string.fromBytes(cli.readStdin().wait());
+    sh.triedStdin = true;
   }
+
+  // **This shell owns the program's standard input.** Only an entry point invoked *as* a shell can say
+  // that: `packages/ssh`'s server and the browser terminal build a `Shell` too, and theirs is not the
+  // process's input to read. Set before the script runs, and lazily acted on — see `restOfStdin`.
+  // Issue 0032.
+  sh.ownsStdin = true;
 
   i32 status = runScript(sh, src);
 

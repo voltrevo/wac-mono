@@ -760,6 +760,11 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
 async function bash(script: string) {
   const r = await new Deno.Command("bash", {
     args: ["-c", script],
+    // No standard input for either shell, and said rather than inherited. A script that reads — `cat`
+    // or `read` with nothing redirected into it — now reads the *shell's* input, since `sh` claims it
+    // (issue 0032). Inheriting the test runner's would mean both shells waiting on a terminal that
+    // never ends, which is a hang rather than a difference.
+    stdin: "null",
     env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
     clearEnv: true,
   }).output();
@@ -789,6 +794,7 @@ const wacshBinary = await (async () => {
 async function wacsh(script: string) {
   const r = await new Deno.Command(wacshBinary, {
     args: ["-c", script],
+    stdin: "null",   // as for bash above: the comparison is of scripts, not of terminals
     env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin", HOME: Deno.env.get("HOME") ?? "" },
     clearEnv: false,
   }).output();
@@ -885,5 +891,83 @@ Deno.test({
     const raw = odd.stderr;
     assertEquals(raw.includes(0xff) && raw.includes(0xfe), true,
       `the bytes reached standard error unchanged: ${Array.from(raw).join(",")}`);
+  },
+});
+
+/**
+ * The shell's *own* standard input, which nothing else here exercises.
+ *
+ * Every case above is a script with no input piped in, which is why issue 0032 survived so long:
+ * `printf x | sh -c 'cat'` printed nothing, because `stdinBytes` was only ever filled by a
+ * redirection, a here-document or a pipeline. These pass the same bytes to both shells and compare
+ * what comes out, so the cursor (`read` then `cat`), the empty case, and a command that consumes
+ * everything are all pinned against bash rather than against my idea of bash.
+ *
+ * `cat; cat` is *not* here, and its absence is the honest part: this shell prints the input twice where
+ * bash prints it once. A shell hands each command what is left of the input and cannot know how much a
+ * program read — bash does not need to know, because both `cat`s share a file descriptor and the second
+ * finds it at the end. Modelling that means letting a child inherit the shell's standard input instead
+ * of being fed a copy of it, which is issue 0042. Everything that does not turn on *who consumed what*
+ * agrees today, including `echo hi; cat` and `seq 1 2; cat`, where a program that ignores its input
+ * must leave it for the next one.
+ */
+const STDIN_CASES: [string, string][] = [
+  ["cat", "a b c\nd\n"],
+  ["read x; echo \"[$x]\"; cat", "a b c\nd\n"],
+  ["read x; read y; echo \"[$x][$y]\"", "one\ntwo\nthree\n"],
+  ["cat", ""],
+  ["read x; echo \"[$x]\"", ""],
+  ["while read line; do echo \"got $line\"; done", "a\nb\nc\n"],
+  ["echo before; cat; echo after", "middle\n"],
+];
+
+Deno.test({
+  name: "the shell reads its own standard input, as bash does",
+  ignore: !haveBash,
+  fn: async () => {
+    for (const [script, input] of STDIN_CASES) {
+      const fed = async (cmd: string, args: string[]) => {
+        const p = new Deno.Command(cmd, {
+          args,
+          stdin: "piped",
+          stdout: "piped",
+          stderr: "null",
+          env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+          clearEnv: true,
+        }).spawn();
+        const w = p.stdin.getWriter();
+        await w.write(new TextEncoder().encode(input));
+        await w.close();
+        const out = await p.output();
+        return { out: new TextDecoder().decode(out.stdout), code: out.code };
+      };
+      const theirs = await fed("bash", ["-c", script]);
+      const ours = await fed(wacshBinary, ["-c", script]);
+      assertEquals(
+        ours.out,
+        theirs.out,
+        `${JSON.stringify(script)} over ${JSON.stringify(input)}`,
+      );
+      assertEquals(ours.code, theirs.code, `${JSON.stringify(script)}: exit status`);
+    }
+
+    // A script *read from* standard input consumes it, so a command inside it has nothing left —
+    // `echo cat | sh` runs `cat` with no input rather than feeding it the rest of the script.
+    const script = "cat\n";
+    const asScript = async (cmd: string, args: string[]) => {
+      const p = new Deno.Command(cmd, {
+        args,
+        stdin: "piped",
+        stdout: "piped",
+        stderr: "null",
+        env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+        clearEnv: true,
+      }).spawn();
+      const w = p.stdin.getWriter();
+      await w.write(new TextEncoder().encode(script));
+      await w.close();
+      return new TextDecoder().decode((await p.output()).stdout);
+    };
+    assertEquals(await asScript(wacshBinary, []), await asScript("bash", []), "script from stdin");
   },
 });
