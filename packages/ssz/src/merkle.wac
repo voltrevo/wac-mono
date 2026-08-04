@@ -1,0 +1,287 @@
+// SSZ merkleization, and the Merkle-branch checks an Ethereum light client verifies proofs with.
+//
+// Everything a beacon chain signs is a `hash_tree_root`, and every root is the same shape: cut the
+// value into 32-byte chunks, pad the *number* of chunks up to a power of two, and hash pairwise with
+// SHA-256 until one is left.
+//
+// Two details carry most of the bugs, and both are about padding:
+//
+// **The pad target is the type's limit, not the data's length.** A `Bitlist[512]` holding fifteen
+// bits still merkleizes over a tree deep enough for 512 bits — two chunks — because the root has to
+// mean the same thing for every value of the type. Padding to the data instead produces a root that
+// is self-consistent, matches for full-length values, and is wrong for every short one. `merkleize`
+// therefore takes a chunk *limit* separately from the chunks.
+//
+// **A padded subtree is entirely zeros, so its hash is a constant.** `zeroHash(d)` is the root of a
+// zero subtree of depth `d`, computed once. Without it a large limit means hashing the same empty
+// subtrees over and over — and `Bitlist` limits in Ethereum run to 2²⁰ and beyond, where naive
+// padding is not slow but impossible.
+//
+// Written against `ethereum/consensus-spec-tests` v1.6.0-beta.0, vendored in `test/vendor` — see the
+// package README for what those fixtures were checked to mean before anything here was written.
+
+import { sha256 } from "../../crypto/src/sha256.wac";
+
+/** Bytes per chunk. A chunk is a SHA-256 output, and SSZ leaves are the same width by construction. */
+const i32 CHUNK = 32;
+
+/** `hash(a || b)` for two 32-byte chunks, which is every internal node in an SSZ tree. */
+export u8[] hashPair(u8[] a, u8[] b) {
+  u8[] buf = u8[CHUNK * 2]();
+  for (i32 i = 0; i < CHUNK; i++) {
+    buf[i] = a[i];
+    buf[CHUNK + i] = b[i];
+  }
+  return sha256(buf);
+}
+
+/**
+ * The root of an all-zero subtree of depth `d`: `zeroHash(0)` is 32 zero bytes, and each level up is
+ * that hashed with itself.
+ *
+ * Recomputed per call rather than cached, because wac has no mutable module state to cache it in and
+ * the depths in play are small — a depth of 40 is forty hashes, against the millions of leaves it
+ * stands in for.
+ */
+export u8[] zeroHash(i32 d) {
+  u8[] h = u8[CHUNK]();
+  for (i32 i = 0; i < d; i++) { h = hashPair(h, h); }
+  return h;
+}
+
+/** How many chunks `n` bytes occupy, rounding up. */
+export i32 chunkCount(i32 n) { return (n + CHUNK - 1) / CHUNK; }
+
+/** The smallest power of two at least `n`, and at least 1. */
+export i32 nextPowerOfTwo(i32 n) {
+  i32 p = 1;
+  while (p < n) { p = p * 2; }
+  return p;
+}
+
+/** `log2` of a power of two — the depth of a tree with that many leaves. */
+export i32 depthFor(i32 leaves) {
+  i32 d = 0;
+  i32 p = 1;
+  while (p < leaves) { p = p * 2; d = d + 1; }
+  return d;
+}
+
+/**
+ * `chunks` right-padded with zero bytes to a whole number of chunks.
+ *
+ * SSZ packs basic types end to end and pads only the final chunk, so this is the whole of `pack` for
+ * a serialized basic vector or bitfield — the bytes are already in order.
+ */
+export u8[] padToChunks(u8[] data) {
+  i32 n = chunkCount(data.len());
+  if (n == 0) { n = 1; }
+  u8[] out = u8[n * CHUNK]();
+  for (i32 i = 0; i < data.len(); i++) { out[i] = data[i]; }
+  return out;
+}
+
+/**
+ * The Merkle root of `data` — already chunk-padded — over a tree sized for `limit` chunks.
+ *
+ * `limit` is the maximum number of chunks the *type* can hold, which is what fixes the tree depth.
+ * Passing the actual chunk count instead is the classic error: correct for full values, wrong for
+ * every short one, and self-consistent either way.
+ *
+ * Zero-padding is not materialised. At each level the nodes present are hashed pairwise, and a
+ * missing right sibling is `zeroHash` at that level, so a limit of 2²⁰ costs twenty hashes rather
+ * than a million chunks of memory.
+ */
+export u8[] merkleize(u8[] data, i32 limit) {
+  i32 have = chunkCount(data.len());
+  i32 leaves = nextPowerOfTwo((limit > have) ? limit : have);
+  i32 depth = depthFor(leaves);
+
+  // Level 0: the chunks that actually exist. Everything to their right is a zero subtree.
+  u8[] level = u8[have * CHUNK]();
+  for (i32 i = 0; i < have * CHUNK && i < data.len(); i++) { level[i] = data[i]; }
+
+  for (i32 d = 0; d < depth; d++) {
+    i32 n = level.len() / CHUNK;
+    if (n == 0) { return zeroHash(depth - d); }        // nothing left but padding
+    i32 pairs = (n + 1) / 2;
+    u8[] next = u8[pairs * CHUNK]();
+    for (i32 p = 0; p < pairs; p++) {
+      u8[] left = u8[CHUNK]();
+      for (i32 i = 0; i < CHUNK; i++) { left[i] = level[p * 2 * CHUNK + i]; }
+      u8[] right = zeroHash(d);                        // the padded sibling, if there is no real one
+      if (p * 2 + 1 < n) {
+        right = u8[CHUNK]();
+        for (i32 i = 0; i < CHUNK; i++) { right[i] = level[(p * 2 + 1) * CHUNK + i]; }
+      }
+      u8[] h = hashPair(left, right);
+      for (i32 i = 0; i < CHUNK; i++) { next[p * CHUNK + i] = h[i]; }
+    }
+    level = next;
+  }
+  if (level.len() == 0) { return zeroHash(depth); }
+  u8[] root = u8[CHUNK]();
+  for (i32 i = 0; i < CHUNK; i++) { root[i] = level[i]; }
+  return root;
+}
+
+/**
+ * `hash(root || length)` with the length as a little-endian uint256 — how a list commits to its size.
+ *
+ * A list and a vector holding the same elements have different roots because of this, which is the
+ * point: without it a `List[uint8, 8]` of three items would be indistinguishable from one of three
+ * items followed by five zeros.
+ */
+export u8[] mixInLength(u8[] root, i32 length) {
+  u8[] len = u8[CHUNK]();
+  i32 v = length;
+  for (i32 i = 0; i < 4; i++) {
+    len[i] = v & 0xFF;
+    v = v >> 8;
+  }
+  return hashPair(root, len);
+}
+
+// ── hash_tree_root for the types that need no schema ──────────────────────────
+
+/**
+ * A basic type — any uintN or boolean — is its serialization in one chunk.
+ *
+ * True for every width SSZ has, since the widest basic type is `uint256` at exactly 32 bytes.
+ */
+export u8[] rootBasic(u8[] serialized) { return padToChunks(serialized); }
+
+/**
+ * `Vector[T, N]` of a basic `T`: pack, then merkleize over the chunks the full vector would need.
+ *
+ * `chunkLimit` is `ceil(N * sizeof(T) / 32)`. A full vector has exactly that many chunks, so the
+ * limit only bites for the last partial chunk — but it is the type's number, not the data's.
+ */
+export u8[] rootBasicVector(u8[] serialized, i32 chunkLimit) {
+  return merkleize(padToChunks(serialized), chunkLimit);
+}
+
+/**
+ * `Bitvector[N]`: the serialization is already the packed bits, so this is `rootBasicVector` with the
+ * limit in bits. No length is mixed in — the length is in the type.
+ */
+export u8[] rootBitvector(u8[] serialized, i32 n) {
+  return merkleize(padToChunks(serialized), chunkCount((n + 7) / 8));
+}
+
+/**
+ * The number of bits in a serialized `Bitlist`, from its delimiter.
+ *
+ * A bitlist's serialization appends a single set bit after the data, so the length is the position of
+ * the highest set bit in the last byte. That delimiter is what makes the encoding self-describing and
+ * it is **not** part of the value: a bitlist of eight zero bits is nine bytes' worth of bits in one
+ * byte plus a delimiter byte, and merkleizing the delimiter in would corrupt every root.
+ *
+ * −1 if there is no delimiter, which is a malformed bitlist rather than an empty one.
+ */
+export i32 bitlistLength(u8[] serialized) {
+  if (serialized.len() == 0) { return -1; }
+  i32 last = serialized[serialized.len() - 1];
+  if (last == 0) { return -1; }                       // the final byte must carry the delimiter
+  i32 top = 0;
+  for (i32 b = 7; b >= 0; b--) {
+    if ((last & (1 << b)) != 0) { top = b; break; }
+  }
+  return (serialized.len() - 1) * 8 + top;
+}
+
+/**
+ * `Bitlist[limit]`: strip the delimiter, merkleize over the tree the limit implies, mix in the length.
+ */
+export u8[]? rootBitlist(u8[] serialized, i32 limit) {
+  i32 bits = bitlistLength(serialized);
+  if (bits < 0 || bits > limit) { return null; }
+  i32 bytes = (bits + 7) / 8;
+  u8[] data = u8[bytes]();
+  for (i32 i = 0; i < bytes; i++) { data[i] = serialized[i]; }
+  // Clear anything above the last real bit, including the delimiter if it shared the final byte.
+  i32 spare = bits & 7;
+  if (spare != 0) {
+    i32 mask = 1;
+    for (i32 i = 0; i < spare; i++) { mask = mask * 2; }
+    data[bytes - 1] = data[bytes - 1] & (mask - 1);
+  }
+  return mixInLength(merkleize(padToChunks(data), chunkCount((limit + 7) / 8)), bits);
+}
+
+/**
+ * `List[T, N]` of a basic `T`: as the vector, then the length in *elements*.
+ *
+ * `chunkLimit` is `ceil(N * sizeof(T) / 32)` and `count` is how many elements are present, which the
+ * caller knows from the serialized length and the element size.
+ */
+export u8[] rootBasicList(u8[] serialized, i32 chunkLimit, i32 count) {
+  return mixInLength(merkleize(padToChunks(serialized), chunkLimit), count);
+}
+
+// ── Merkle branch verification ────────────────────────────────────────────────
+
+/** `floorlog2` of a generalized index: the depth of the tree it addresses. */
+export i32 floorLog2(u64 x) {
+  i32 d = 0;
+  u64 v = x;
+  while (v > 1) { v = v >> 1; d = d + 1; }
+  return d;
+}
+
+/** The index of `gindex` within its own level: `gindex % 2^floorlog2(gindex)`. */
+export u64 subtreeIndex(u64 gindex) {
+  i32 d = floorLog2(gindex);
+  u64 pow = 1;
+  for (i32 i = 0; i < d; i++) { pow = pow * 2; }
+  return gindex - pow;
+}
+
+/**
+ * The standard branch check: fold `leaf` up through `branch` and compare against `root`.
+ *
+ * `index` decides the side at each level — bit `i` of it says whether the node is the right child at
+ * level `i`, which is why the loop reads the bit rather than tracking a path.
+ */
+export bool isValidMerkleBranch(u8[] leaf, u8[] branch, i32 depth, u64 index, u8[] root) {
+  if (leaf.len() != CHUNK || root.len() != CHUNK) { return false; }
+  if (branch.len() != depth * CHUNK) { return false; }
+  u8[] node = u8[CHUNK]();
+  for (i32 i = 0; i < CHUNK; i++) { node[i] = leaf[i]; }
+  for (i32 d = 0; d < depth; d++) {
+    u8[] sib = u8[CHUNK]();
+    for (i32 i = 0; i < CHUNK; i++) { sib[i] = branch[d * CHUNK + i]; }
+    u64 bit = (index >> (d as@ u32)) & 1;
+    bool onRight = bit != 0;
+    node = onRight ? hashPair(sib, node) : hashPair(node, sib);
+  }
+  for (i32 i = 0; i < CHUNK; i++) {
+    if (node[i] != root[i]) { return false; }
+  }
+  return true;
+}
+
+/**
+ * The light client's branch check: a branch longer than the generalized index needs must carry zeros
+ * in the extra leading positions.
+ *
+ * The extra nodes exist because a fork can move a field deeper without changing the wire format of
+ * the proof — the branch is sized for the deepest fork, and the shallower one leaves the surplus
+ * empty. **The zero check is a validity condition, not padding to trim.** Accepting a non-zero
+ * surplus would let a prover attach an unrelated subtree below the field it is proving, which is why
+ * `sync-protocol.md` returns false rather than slicing.
+ */
+export bool isValidNormalizedMerkleBranch(u8[] leaf, u8[] branch, u64 gindex, u8[] root) {
+  i32 depth = floorLog2(gindex);
+  u64 index = subtreeIndex(gindex);
+  i32 have = branch.len() / CHUNK;
+  if (branch.len() != have * CHUNK) { return false; }
+  i32 extra = have - depth;
+  if (extra < 0) { return false; }                    // too short to prove anything
+  for (i32 i = 0; i < extra * CHUNK; i++) {
+    if (branch[i] != 0) { return false; }
+  }
+  u8[] rest = u8[depth * CHUNK]();
+  for (i32 i = 0; i < depth * CHUNK; i++) { rest[i] = branch[extra * CHUNK + i]; }
+  return isValidMerkleBranch(leaf, rest, depth, index, root);
+}
