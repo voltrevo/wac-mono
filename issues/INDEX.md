@@ -5,18 +5,22 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
-| [0032](open/0032-nothing-bounds-a-hung-test-and-four-helpers-wait-forever.md) | nothing bounds a hung test, and four readiness helpers are written to wait forever | bug | hang |
+| [0036](open/0036-nothing-bounds-a-hung-test-and-four-helpers-wait-forever.md) | nothing bounds a hung test, and four readiness helpers are written to wait forever | bug | hang |
+| [0035](open/0035-crypto-hot-paths-hold-state-in-gc-arrays-rather-than-locals.md) | crypto hot paths hold state in GC arrays rather than locals (measured: −64% on one function) | performance | wrong answer |
+| [0034](open/0034-sha256s-one-shot-path-copies-the-whole-message-with-a-scalar-loop.md) | `sha256`'s one-shot path copies the whole message with a scalar loop | performance | wrong answer |
+| [0033](open/0033-a-file-that-parses-but-is-not-a-worker-bundle-wedges-the-shell.md) | a file that parses but is not a worker bundle wedges the shell for ever | bug | trap |
+| [0032](open/0032-sh-never-reads-its-own-standard-input.md) | `sh` never reads its own standard input, so `cat` and `read` see nothing | bug | wrong answer |
+| [0031](open/0031-a-mutation-sweep-starves-every-other-agent-on-this-machine.md) | a mutation sweep starves every other agent on this machine | performance | wrong answer |
 | [0025](open/0025-listen-takes-no-address-so-every-server-binds-every-interface.md) | `listen` takes no address, so every server binds every interface | missing feature | not implemented |
 | [0017](open/0017-deno-task-app-orphans-the-application-when-the-launcher-is-killed.md) | `deno task app` orphans the application when the launcher is killed | bug | wrong answer |
-| [0014](open/0014-platform-has-no-way-to-write-bytes-to-standard-error.md) | platform has no way to write bytes to standard error | missing feature | not implemented |
 | [0011](open/0011-node-crypto-overloads-keep-failing-type-check-and-redden-the-shared-suite.md) | `node:crypto` overloads keep failing type-check and reddening the shared suite | task | wrong answer |
 | [0009](open/0009-forty-two-exported-wac-functions-that-nothing-calls.md) | forty-two exported wac functions that nothing calls, across eight packages | bug | no error |
-| [0007](open/0007-json-throughput-bench-half-migrated-to-the-canonical-struct.md) | json's throughput bench is half-migrated to the Canonical struct and cannot run | bug | wrong answer |
 | [0005](open/0005-mutation-testing-found-54-untested-behaviours.md) | surviving mutants: behaviours nothing checks (crypto finished; tls at 75, five other packages unmeasured) | task | wrong answer |
 | [0003](open/0003-wacc-parser-does-not-implement-generics.md) | wacc's parser does not implement generics, so `std` is outside its corpus | missing feature | not implemented |
 | [0024](open/0024-mutation-selection-is-inert-for-subprocess-tests-and-the-fallback-runs-them-worst-first.md) | mutation test-selection is inert for subprocess tests, and the fallback runs them worst-first | performance | wrong answer |
-| [0021](open/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md) | a spawned worker whose source does not parse kills the parent | bug | trap |
-| [0026](open/0026-sshds-port-announcement-test-is-racy-and-reddens-the-shared-suite.md) | sshd's port-announcement test is racy, and makes the shared suite red at random | bug | wrong answer |
+| [0028](open/0028-sh-decides-nothing-about-what-wacpath-programs-may-do.md) | `sh` passes `GRANT_NONE` to `$WACPATH` programs, which is a decision nobody has made | task | not implemented |
+| [0029](open/0029-gets-hand-rolls-tls-record-framing-that-now-lives-in-the-package.md) | `box gets` hand-rolls TLS record framing that now lives in the package | bug | no error |
+| [0030](open/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md) | a page cannot `spawn`, so the browser shell runs applets in-process instead | missing feature | not implemented |
 
 An empty list is the expected state most of the time — see `README.md`: something you
 can fix in a package you are already working in should just be fixed, and a package's

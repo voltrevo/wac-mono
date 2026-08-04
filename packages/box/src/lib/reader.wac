@@ -28,12 +28,18 @@ import { Buf } from "../../../bytes/src/buf.wac";
 export struct Line { bool ok; u8[] bytes; bool nl; }
 
 export struct Lines {
+  /**
+   * Empty unless a read failed, in which case this is the host's message and the lines seen so far
+   * are all there are. An applet that ignores it reports success over a truncated file — which is
+   * what the `u8[]` answer used to force on everybody.
+   */
+  string broken;
   Buf pending;    // bytes read but not yet handed out; doubles, so appending is amortised
   i32 at;         // where the line being built starts
   i32 scanned;    // no newline anywhere in pending[at..scanned) — never re-examined
   bool ended;     // the input said so; `pending` may still hold a last line
 
-  Lines create() { return Lines(Buf.create(), 0, 0, false); }
+  Lines create() { return Lines("", Buf.create(), 0, 0, false); }
 }
 
 /**
@@ -75,9 +81,13 @@ export Line nextLine(Lines s, Cli cli) {
       s.at = 0;
     }
 
-    u8[] chunk = cli.readChunk();
-    if (chunk.len() == 0) { s.ended = true; continue; }
-    s.pending.pushAll(chunk);
+    // A broken read is not the end of the input. `Lines.broken` carries that up to the applet,
+    // which is the only place that knows whether a half-read file is worth acting on.
+    match (cli.readChunk()) {
+      case Data(bytes): { s.pending.pushAll(bytes); }
+      case End: { s.ended = true; }
+      case Failed(why): { s.ended = true; s.broken = why; }
+    }
   }
   return Line(false, u8[0](), false);
 }

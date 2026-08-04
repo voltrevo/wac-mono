@@ -29,6 +29,16 @@ export const STATUS = 6;                       // its return value, or an error 
 // after the load changes the value, and `Atomics.wait` on a stale value returns at once.
 export const IN_SEQ = 7;                       // input published, or input finished
 export const OUT_SEQ = 8;                      // output published, or the transform returned
+/**
+ * The producer's source *failed*, as distinct from having finished — slot 9 of the sixteen.
+ *
+ * Both used to be `IN_EOF`, because the transform's `read()` answered bytes and an empty array was
+ * the only thing it could say. So a producer that threw halfway looked exactly like one that had
+ * finished: the transform completed, the stream closed cleanly, and the consumer was handed a
+ * truncated result with nothing to indicate it. `Read.Failed` is what the transform sees now, and
+ * this is how the producer says it.
+ */
+export const IN_ERR = 9;
 export const CTRL_INTS = 16;
 
 export const CTRL_BYTES = CTRL_INTS * 4;

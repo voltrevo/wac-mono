@@ -28,3 +28,25 @@ export i32[] execFlags(u8[] pattern, u8[] input, i32 at, bool ignoreCase) {
 
 /** Whether the pattern compiles at all, separated so a rejection is not read as a non-match. */
 export bool accepts(u8[] pattern) { return !(compile(pattern) is null); }
+
+/**
+ * As `exec`, with the step budget chosen by the caller.
+ *
+ * The budget also sizes the undo log, so a small one is how a capture-heavy pattern is made to run
+ * out of room rather than out of steps. `OP_CLEAR` used to overrun those arrays and trap instead of
+ * answering -2 — the check tested the unchanged length once per slot, which only catches a log that
+ * is already full. Exposed here because a trap is not something a differential test can compare.
+ */
+export i32[] execBudget(u8[] pattern, u8[] input, i32 at, i32 budget) {
+  Program? p = compile(pattern);
+  if (p is null) { return i32[1](fill: -1); }
+  i32 n = slotCount(p!);
+  i32[] caps = i32[n]();
+  i32 r = search(p!, input, at, caps, budget);
+  if (r == BUDGET()) { return i32[1](fill: -2); }
+  if (r == NO_MATCH()) { return i32[1](fill: 0); }
+  i32[] out = i32[n + 1]();
+  out[0] = 1;
+  for (i32 i = 0; i < n; i++) { out[i + 1] = caps[i]; }
+  return out;
+}

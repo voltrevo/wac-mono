@@ -230,6 +230,12 @@ export Big mulSmall(Big a, u32 m) {
 // ── Shifts ─────────────────────────────────────────────────────────────────────────
 
 export Big shl(Big a, i32 bits) {
+  // `-i32::MIN` is still `i32::MIN`, so a shift by it used to bounce between here and `shr` until
+  // the stack ran out. Handled before the negation rather than inside it: shifting *right* by 2^31
+  // bits takes everything out of any value that fits in memory, and the answer is the same one this
+  // file already gives for that case below — zero, or -1 for a negative value, since the shift is
+  // arithmetic.
+  if (bits == -2147483648) { return a.neg ? Big.fromI64(-1) : Big.zero(); }
   if (bits < 0) { return shr(a, -bits); }
   if (a.n == 0 || bits == 0) { return copy(a); }
   i32 words = bits / 32;
@@ -260,6 +266,14 @@ export Big shl(Big a, i32 bits) {
  * (added to the magnitude) when anything was discarded.
  */
 export Big shr(Big a, i32 bits) {
+  // The mirror of the case in `shl`, and there is no value to return: shifting *left* by 2^31 bits
+  // needs 256MB of limbs before any arithmetic happens, and no correct answer fits.
+  //
+  // Refused immediately, by asking for an array that cannot exist. Handing it to `shl(a, MAX)`
+  // instead looked tidier and was worse: that allocation *succeeds* and the zeroing loop then runs
+  // for minutes, so a stack overflow in a second became a hang — measured, not guessed. A trap that
+  // says "requested new array is too large" is the honest answer to an impossible request.
+  if (bits == -2147483648) { return Big.withCap(2147483647); }
   if (bits < 0) { return shl(a, -bits); }
   if (bits == 0 || a.n == 0) { return copy(a); }
   i32 words = bits / 32;

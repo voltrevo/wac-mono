@@ -15,7 +15,7 @@ export i32 split(Core core, Cli cli, Args a) {
     core.warn("usage: " + a.name + " [-<lines>] <file> [prefix]");
     return 2;
   }
-  i32 per = a.num == 0 ? 1000 : a.num;
+  i32 per = a.hasNum ? a.num : 1000;
   string prefix = a.rest.len() > 1 ? a.rest[1] : "x";
 
   Input in = openStream(core, cli, a, 0);
@@ -45,13 +45,40 @@ export i32 split(Core core, Cli cli, Args a) {
   return 0;
 }
 
-/** `aa`, `ab`, ... `zz`, then three letters, as the real one numbers them. */
+/**
+ * `aa`, `ab`, … `yz`, `zaaa`, `zaab`, … — the suffixes GNU's `split` actually produces.
+ *
+ * The rule is not "two letters, then three": a leading `z` is **reserved** as the marker that the
+ * suffix has grown, so two-letter names run `aa` to `yz` and the next one is `zaaa`. Measured
+ * against the real thing rather than guessed, because the guess here was `"z" + itoa(n)` — which
+ * left the alphabet entirely after 676 pieces and produced `z676`, a name the real one never emits
+ * and a sort order that no longer matches the split order. GitHub wac-mono#14.
+ *
+ * So at level k the name is k `z`s followed by k+2 counter letters, whose first letter runs `a` to
+ * `y` for the same reason. That gives 25·26^(k+1) names per level: 650, then 16900, then 439400.
+ */
 string suffix(i32 n) {
-  if (n < 26 * 26) {
-    u8[] out = u8[2](fill: 'a');
-    out[0] = 'a' + (n / 26);
-    out[1] = 'a' + (n % 26);
-    return string.fromBytes(out);
+  i32 level = 0;
+  i32 remaining = n;
+  i32 span = 650;                       // 25 * 26, the two-letter names
+  while (remaining >= span) {
+    remaining = remaining - span;
+    level++;
+    span = span * 26;
+    // A suffix this long means billions of pieces; the arithmetic would overflow before the
+    // filesystem obliged, so stop pretending and let the caller see a name it can complain about.
+    if (span <= 0) { return "z" + itoa(n); }
   }
-  return "z" + itoa(n);
+
+  i32 digits = level + 2;
+  u8[] out = u8[level + digits](fill: 'z');
+  // The counter, least significant last. Every position but the first is base 26; the first is
+  // base 25 because `z` there would be indistinguishable from the marker.
+  i32 rest = remaining;
+  for (i32 i = level + digits - 1; i > level; i--) {
+    out[i] = 'a' + (rest % 26);
+    rest = rest / 26;
+  }
+  out[level] = 'a' + rest;
+  return string.fromBytes(out);
 }

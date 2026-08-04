@@ -144,6 +144,33 @@ export string test_push_codepoint_widths() {
   return t.report();
 }
 
+export string test_push_codepoint_rejects_non_scalars() {
+  T t = T.create();
+  // Not Unicode scalars, and UTF-8 has no encoding for any of them. They used to be encoded
+  // anyway: a surrogate came out as the CESU-8 form that strict decoders reject, and 0x110000 as a
+  // sequence with a five-byte lead. Each becomes U+FFFD — EF BF BD. GitHub wac-mono#16.
+  u8[] replacement = u8[](0xEF, 0xBF, 0xBD);
+  Buf a = Buf.create(); a.pushCodepoint(-1);
+  t.eqBytes(a.bytes(), replacement, "a negative value");
+  Buf b = Buf.create(); b.pushCodepoint(0xD800);
+  t.eqBytes(b.bytes(), replacement, "the first surrogate");
+  Buf c = Buf.create(); c.pushCodepoint(0xDFFF);
+  t.eqBytes(c.bytes(), replacement, "the last surrogate");
+  Buf d = Buf.create(); d.pushCodepoint(0x110000);
+  t.eqBytes(d.bytes(), replacement, "one past the last code point");
+
+  // And the values either side of each hole are untouched.
+  Buf e = Buf.create(); e.pushCodepoint(0xD7FF);
+  t.eqBytes(e.bytes(), u8[](0xED, 0x9F, 0xBF), "U+D7FF is below the surrogates");
+  Buf f = Buf.create(); f.pushCodepoint(0xE000);
+  t.eqBytes(f.bytes(), u8[](0xEE, 0x80, 0x80), "U+E000 is above them");
+  Buf g = Buf.create(); g.pushCodepoint(0x10FFFF);
+  t.eqBytes(g.bytes(), u8[](0xF4, 0x8F, 0xBF, 0xBF), "U+10FFFF is the last one");
+  Buf h = Buf.create(); h.pushCodepoint(0);
+  t.eqBytes(h.bytes(), u8[](0x00), "and NUL is a scalar like any other");
+  return t.report();
+}
+
 export string test_take_avoids_the_copy_when_exactly_full() {
   T t = T.create();
   // take() returns the buffer's own storage when len == capacity, so the caller

@@ -86,6 +86,14 @@ substitution, not that the text stopped changing.
 
 **`program.wac`** — see below. It is the one interesting thing here.
 
+## `rm -f` and what the platform can say
+
+`-f` ignores what is already gone, not everything that fails. That distinction needed the platform:
+`remove` used to answer `bool`, so "no such file" and "permission denied" were the same answer and
+`-f` could only swallow both — it said nothing, exited 0, and left the file where it was. The
+capabilities carry the host's message now, and existence is a separate question, so the two cases are
+told apart without reading the message's words.
+
 ## External programs, and the seam
 
 Every external command goes through **one seam**, and there are now two things on the other side
@@ -112,22 +120,51 @@ was closed `wontfix`, so running host programs is a settled non-goal rather than
 What replaces it is a wac program run with grants the parent chooses — which is more than this
 package expected to settle for.
 
-Then a **table of programs written in wac**, when nothing was spawned — the fallback the seam was
-designed for, and still the only thing available where there is no bundle to run:
+Then **whatever was handed to the shell**, through `Shell.external`. `packages/box` has sixty
+applets and this package is one of its dependencies, so it cannot import them — the wiring goes the
+other way, and it is one line:
+
+```wac
+Shell sh = Shell.create(core, cli);
+sh.external = boxRun;              // from packages/box/src/shrun.wac
+```
+
+With that, `sort`, `sha256sum`, `gzip`, `cut`, `diff`, `shuf`, `tar` and the rest are commands you
+can type, running the same code `box` runs on a command line. They are not spawned — `platform`'s
+`pushChild`/`popChild` let the shell give a function its own argv, standard input and working
+directory and keep what it wrote — so there is no isolation between them and the shell, which is
+[issue 0030](../../issues/open/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md).
+It is what makes the browser terminal useful, because a page cannot spawn at all.
+
+Then a **table of programs written in wac**, when nothing else answered:
 
 ```
 cat wc head tail rev sort uniq grep tr seq nl printf
 ```
+
+Those twelve exist because, when they were written, nothing could be started and nothing could be
+handed over. Both of those are now false, and they have become what the seam always said they
+were: a fallback. They are also visibly weaker than `box`'s — this `grep` matches substrings where
+`box`'s takes `-ivnc`, this `sort` is an insertion sort — so the sensible end state is to delete
+them once something checks that `box`'s pass the same differential scripts against bash. Kept for
+now because 539 of those scripts currently agree with bash *through these*, and swapping the
+implementation under a passing suite without measuring it first is how a green suite starts lying.
 
 The single seam was the point, and it paid off: wiring `spawn` in changed no part of the pipeline,
 redirection, status or `&&` handling, because all of it was already written against `Output`. The
 stubs became what they were meant to be — a fallback for when the real program is absent.
 
 A child is granted nothing but its two streams, so a program that needs the filesystem cannot be
-run as one yet — that is `packages/platform`'s roadmap rather than an issue here. And see
-[0021](../../issues/open/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md) for the
-first thing a shell trips over: a bundle that does not parse takes the shell down with it instead
-of coming back as a failed command.
+run as one yet — that is `packages/platform`'s roadmap rather than an issue here.
+
+The first thing a shell trips over is a file on `$WACPATH` that is not a worker bundle, and there
+are two of those. One that does not parse is now a failed command with the host's reason and status
+126, distinct from the 127 of not existing —
+[0021](../../issues/closed/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md), where it
+used to take the shell down with it. One that *parses* and never speaks the bridge protocol — a
+built program rather than a `--worker` bundle, most likely — still hangs:
+[0033](../../issues/open/0033-a-file-that-parses-but-is-not-a-worker-bundle-wedges-the-shell.md) has
+why that is a harder question than it looks.
 
 **The signature is the design decision.** Bytes in, bytes out, a status, and a `found` flag —
 because a shell reports 127 for "no such command" and the program's own code for "ran and failed",
@@ -160,12 +197,27 @@ programs are handed whatever is left but are *not* charged for it, because nothi
 which of them read their input — so `{ cat; cat; }` gives both copies of the whole thing where
 bash gives the second nothing.
 
-**No `cd`, and therefore no `pwd`.** Not an oversight and not a small job: nothing in
-`packages/platform` has a working directory — there is no `chdir` and no `getcwd`, and none is on
-its roadmap — so every path a program opens is resolved by the host against wherever the process
-was started. A shell-side `cd` would mean maintaining `$PWD` here and resolving every relative
-path against it before handing it over, in the redirections *and* in `program.wac`'s file
-openers. Worth doing, but it is a change to the seam rather than a builtin.
+**`cd`, `pwd` and `ls` exist, and the seam moved to make room.** This section used to say they
+did not, and that a shell-side `cd` "would mean maintaining `$PWD` here and resolving every
+relative path against it before handing it over, in the redirections *and* in `program.wac`'s file
+openers… a change to the seam rather than a builtin". That was exactly right, and that is what it
+took (agent-a).
+
+`packages/platform` gained one capability, `cwd`, which *reads* where the host resolves relative
+paths — and deliberately no `chdir`, because a mutable working directory is ambient state that
+changes what every relative path in a program means from anywhere. So the shell asks once at
+startup, keeps its own `cwd`, and `Shell.resolve` turns every path into a whole one before it
+crosses the boundary. There were nine such places; all nine are routed, because a `cd` that works
+for `cat` and not for `>` is worse than no `cd`. The path helpers live in `path.wac` rather than
+here, since `program.wac` needs them too and `exec.wac` already imports it.
+
+Eighteen scripts in the differential suite cover it, and each one moves first and then does
+something that has to notice — a relative read, a relative glob, a redirection, a listing, `..`
+above the root, a failed `cd` leaving the shell where it was.
+
+`ls` is one per line and sorted, which is what any `ls` does when its output is not a terminal;
+`-a` is the only flag, and it synthesises `.` and `..` as a real `ls` does, since `readDir` does
+not report them.
 
 **No `$0`.** `cli.arg(0)` is the first *argument*, not the program name, so there is nothing
 truthful to put there.
@@ -198,8 +250,13 @@ expanding to something plausible is the failure mode this package exists to avoi
 **`2>` is refused rather than approximated.** Only standard output is captured, so there is
 nothing of the error stream to redirect, and saying so beats writing the wrong bytes to the file.
 
-**Standard error arrives in one piece at the end**, as with `packages/ssh` and for the same
-reason — [issue 0014](../../issues/open/0014-platform-has-no-way-to-write-bytes-to-standard-error.md).
+**Standard error arrives when it happened**, interleaved with standard output as bash's is, which
+is what `2>&1` has to show. It used to be collected and flushed at the end through `Core.warn` —
+the world had no byte-level error stream — so `echo one; nope; echo two` printed the complaint
+last however early it happened. `Shell.err` is the one place that decides: a capturing shell keeps
+the bytes for whoever asked for the capture, and a shell attached to a terminal writes them out.
+[Issue 0014](../../issues/closed/0014-platform-has-no-way-to-write-bytes-to-standard-error.md) is
+the capability that made it possible.
 
 ## Coverage
 

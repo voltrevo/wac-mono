@@ -19,11 +19,14 @@ import { Map } from "../../std/src/map.wac";
 import { Option } from "../../std/src/option.wac";
 import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
-import { Child, Cli, Core, FileResult, GRANT_NONE } from "../../platform/src/platform.wac";
+import { Read } from "../../bytes/src/read.wac";
+import { Change, Child, Cli, Core, FileResult, GRANT_NONE, Stat }
+  from "../../platform/src/platform.wac";
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
          RedirKind, Script, Simple, Word, parse } from "./parse.wac";
 import { Output, itoa, names, run } from "./program.wac";
+import { resolvePath } from "./path.wac";
 import { Arith, evaluate } from "./arith.wac";
 
 export struct Shell {
@@ -34,7 +37,12 @@ export struct Shell {
   i32 status;
   bool exiting;
   i32 exitCode;
-  /** Everything written to standard error, emitted in one piece at the end. See the README. */
+  /**
+   * Standard error, for a shell that is *capturing*. Empty otherwise — see `err` below.
+   *
+   * `packages/ssh`'s server and command substitution both need the bytes rather than the terminal,
+   * which is what this is for. A shell attached to a terminal writes them out as it produces them.
+   */
   Buf errOut;
   /**
    * Collect standard output instead of writing it out.
@@ -46,6 +54,34 @@ export struct Shell {
    */
   bool capture;
   Buf outBuf;
+
+  /**
+   * What to try for a command that is not a builtin, before the small implementations in
+   * `program.wac`.
+   *
+   * A funcref rather than an import, because the table of real programs is in `packages/box` and
+   * `box` already depends on this package — importing it back would be a cycle. So the wiring goes
+   * the other way: whoever has both hands one to the other. `box/example/term.wac` is nine
+   * characters of it.
+   *
+   * `Output.missing()` means "not mine", and the caller falls through, so an unset hook and a hook
+   * that does not recognise the name take the same path. `noExternal` is the default and does
+   * exactly that: a `Shell` built by anything that has never heard of `box` behaves as it always
+   * did, which is what keeps this package testable on its own.
+   */
+  fn[Output(Core, Cli, string, Vec<string>, u8[])] external;
+
+  /**
+   * What `external` will answer to, for `help` to list.
+   *
+   * A second funcref rather than asking `external` itself, because "run this" and "what do you
+   * have" are different questions and encoding the second as a magic argv would make a command
+   * named `--list` unrunnable. Empty by default, and `help` then says only what it has.
+   *
+   * `help` existing and being wrong is worse than `help` being short: the browser terminal
+   * advertised sixty programs while this listed twelve and blamed a closed issue for it.
+   */
+  fn[string[]()] externalNames;
 
   /**
    * Every name ever set, so the table can be copied.
@@ -78,11 +114,51 @@ export struct Shell {
    */
   u8[] stdinBytes;
   i32 stdinPos;
+  /**
+   * Where this shell believes it is.
+   *
+   * The shell's own, not the host's: `packages/platform` has a `cwd` to *read* and deliberately
+   * no `chdir`, because a mutable working directory is ambient state that changes what every
+   * relative path in the program means. So `cd` moves this string and `resolve` below turns
+   * every path the shell touches into a whole one before it crosses the boundary.
+   *
+   * Always absolute and never with a trailing slash, except the root, which is exactly "/".
+   */
+  string cwd;
 
   Shell create(Core core, Cli cli) {
+    // Asked once, at the start: the host knows where relative paths land and the shell cannot
+    // guess. A browser answers "/" — the root of its Origin Private File System — which is the
+    // true answer there rather than a stand-in.
     return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
-                 false, Buf.create(), Vec.create(), Map.create(hashString, stringEq),
-                 Vec.create(), Vec.create(), false, u8[0](), 0);
+                 false, Buf.create(), noExternal, noExternalNames, Vec.create(),
+                 Map.create(hashString, stringEq),
+                 Vec.create(), Vec.create(), false, u8[0](), 0, cli.cwd().wait());
+  }
+
+  /**
+   * A path as the host should see it: absolute, with `.` and `..` collapsed.
+   *
+   * Every path the shell hands to a capability goes through here — there are nine such places and
+   * they are all routed, because a `cd` that works for `cat` and not for `>` is worse than no
+   * `cd` at all. An already-absolute path is returned normalised and otherwise untouched.
+   */
+  string resolve(const this, string path) { return resolvePath(this.cwd, path); }
+
+  /**
+   * A diagnostic, in bytes.
+   *
+   * Written straight out unless this shell is capturing, in which case it joins `errOut` for
+   * whoever asked for the capture. Everything the shell says about itself goes through here, so
+   * that "when is standard error emitted" is answered in one place.
+   *
+   * It used to be *only* the buffer, flushed once at the end through `Core.warn` with the trailing
+   * newline shaved off by hand — because the world had no byte-level error stream. So `echo a; nope`
+   * printed the complaint after the output no matter which came first, and a diagnostic containing a
+   * filename that is not valid UTF-8 came out mangled. `writeErr` is what fixed it. Issue 0014.
+   */
+  void err(this, u8[] bytes) {
+    if (this.capture) { this.errOut.pushAll(bytes); } else { this.cli.writeErr(bytes); }
   }
 
   /** What standard input still has to offer. */
@@ -187,7 +263,7 @@ export struct Shell {
 export i32 runScript(Shell sh, string src) {
   Script script = parse(src);
   if (!script.ok) {
-    sh.errOut.pushAll(("sh: " + script.error + "\n").toBytes());
+    sh.err(("sh: " + script.error + "\n").toBytes());
     return 2;
   }
   runList(sh, script.lists);
@@ -205,7 +281,7 @@ void runList(Shell sh, Vec<AndOr> lists) {
 void runAndOr(Shell sh, AndOr list) {
   if (list.background) {
     // Refused rather than run in the foreground, which would look like it worked.
-    sh.errOut.pushAll("sh: background commands are not supported\n".toBytes());
+    sh.err("sh: background commands are not supported\n".toBytes());
     sh.status = 2;
     return;
   }
@@ -270,10 +346,10 @@ u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
     Redir r = cmd.redirs.get(i);
     match (r.kind) {
       case In: {
-        string path = joinWord(sh, r.target);
+        string path = sh.resolve(joinWord(sh, r.target));
         FileResult f = sh.cli.readFile(path).wait();
         if (!f.ok) {
-          sh.errOut.pushAll(("sh: " + path + ": " + f.error + "\n").toBytes());
+          sh.err(("sh: " + path + ": " + f.error + "\n").toBytes());
           sh.status = 1;
           sh.stdinBytes = savedIn;
           sh.stdinPos = savedPos;
@@ -333,7 +409,7 @@ u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
       Shell inner = sh.fork();
       runList(inner, cmd.clauses.get(0).body);
       sh.outBuf.pushAll(inner.outBuf.take());
-      sh.errOut.pushAll(inner.errOut.bytes());
+      sh.err(inner.errOut.bytes());
       sh.status = inner.exiting ? inner.exitCode : inner.status;
     }
     case Case: {
@@ -404,7 +480,7 @@ void runLoop(Shell sh, Clause c, bool untilForm) {
     if (!go) { sh.status = 0; return; }
     runList(sh, c.body);
   }
-  sh.errOut.pushAll("sh: loop ran 100000 times and was stopped\n".toBytes());
+  sh.err("sh: loop ran 100000 times and was stopped\n".toBytes());
   sh.status = 2;
 }
 
@@ -461,10 +537,10 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
     Redir r = cmd.redirs.get(i);
     match (r.kind) {
       case In: {
-        string path = joinWord(sh, r.target);
+        string path = sh.resolve(joinWord(sh, r.target));
         FileResult f = sh.cli.readFile(path).wait();
         if (!f.ok) {
-          sh.errOut.pushAll(("sh: " + path + ": " + f.error + "\n").toBytes());
+          sh.err(("sh: " + path + ": " + f.error + "\n").toBytes());
           sh.status = 1;
           return u8[0]();
         }
@@ -507,12 +583,12 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
   if (sh.exiting) { return u8[0](); }
 
   if (!result.found) {
-    sh.errOut.pushAll((argv.get(0) + ": command not found\n").toBytes());
+    sh.err((argv.get(0) + ": command not found\n").toBytes());
     sh.status = 127;
     return u8[0]();
   }
   sh.status = result.status;
-  if (result.err.len() > 0) { sh.errOut.pushAll(result.err); }
+  if (result.err.len() > 0) { sh.err(result.err); }
 
   // Output redirection wins over the pipeline and over standard output.
   u8[] out = result.out;
@@ -536,14 +612,14 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
 
 /** Write a redirection's target. False when it failed, which is already reported. */
 bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
-  string path = joinWord(sh, r.target);
+  string path = sh.resolve(joinWord(sh, r.target));
   // Only standard output is captured, so `2>` has nothing of its own to write. Saying so beats
   // writing the wrong stream to the file.
   if (r.fd != 1) {
     // Said, not silently skipped — but the command's own status is left alone. Overwriting it
     // made `cmd 2>/dev/null; echo $?` report the refusal instead of what the command did, which
     // is a second wrong answer on top of the first.
-    sh.errOut.pushAll(("sh: redirecting fd " + itoa(r.fd) + " is not supported\n").toBytes());
+    sh.err(("sh: redirecting fd " + itoa(r.fd) + " is not supported\n").toBytes());
     return true;
   }
   u8[] payload = data;
@@ -556,8 +632,9 @@ bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
       payload = both.take();
     }
   }
-  if (!sh.cli.writeFile(path, payload).wait()) {
-    sh.errOut.pushAll(("sh: " + path + ": cannot write\n").toBytes());
+  Change wrote = sh.cli.writeFile(path, payload).wait();
+  if (!wrote.ok()) {
+    sh.err(("sh: " + path + ": " + wrote.message + "\n").toBytes());
     sh.status = 1;
   }
   return true;
@@ -700,6 +777,156 @@ Output setBuiltin(Shell sh, Vec<string> argv) {
   return Output.ok(u8[0]());
 }
 
+/**
+ * `cd` — move the shell's own idea of where it is.
+ *
+ * Checked before it is believed: `cd nowhere` must fail and leave the shell where it was, which
+ * is the difference between a working directory and a variable. `cd` with no argument goes to
+ * `$HOME` as bash does, and `cd -` to the previous directory, which is the one bit of `cd` people
+ * use without thinking about it.
+ */
+Output cd(Shell sh, Vec<string> argv) {
+  string want = argv.len() > 1 ? argv.get(1) : sh.vars.get("HOME").orElse("");
+  if (want == "") { return Output.fail("cd: HOME not set\n".toBytes(), 1); }
+
+  string previous = sh.cwd;
+  string target = want == "-" ? sh.vars.get("OLDPWD").orElse(sh.cwd) : sh.resolve(want);
+
+  Stat st = sh.cli.stat(target).wait();
+  if (!st.exists) { return Output.fail(("cd: " + want + ": no such file or directory\n").toBytes(), 1); }
+  if (!st.isDir) { return Output.fail(("cd: " + want + ": not a directory\n").toBytes(), 1); }
+
+  sh.cwd = target;
+  sh.setVar("OLDPWD", previous);
+  sh.setVar("PWD", target);
+  // `cd -` prints where it went, as bash does; a plain `cd` says nothing.
+  return want == "-" ? Output.ok((target + "\n").toBytes()) : Output.ok(u8[0]());
+}
+
+/**
+ * `mkdir [-p] dir…` — because in a browser the filesystem starts empty.
+ *
+ * Without this, `cd` has nowhere to go on a fresh Origin Private File System, which makes the
+ * three builtins above look broken when they are merely alone. `-p` is the usual "and its parents,
+ * and no complaint if it exists".
+ */
+Output mkdir(Shell sh, Vec<string> argv) {
+  bool parents = false;
+  Vec<string> paths = Vec.create();
+  for (i32 i = 1; i < argv.len(); i++) {
+    string a = argv.get(i);
+    if (a == "-p") { parents = true; } else { paths.push(a); }
+  }
+  if (paths.len() == 0) { return Output.fail("mkdir: missing operand\n".toBytes(), 1); }
+
+  Buf err = Buf.create();
+  i32 status = 0;
+  for (i32 i = 0; i < paths.len(); i++) {
+    string given = paths.get(i);
+    Change made = sh.cli.mkdir(sh.resolve(given), parents).wait();
+    if (!made.ok()) {
+      err.pushAll(("mkdir: cannot create directory '" + given + "': " + made.message + "\n").toBytes());
+      status = 1;
+    }
+  }
+  return status == 0 ? Output.ok(u8[0]()) : Output.fail(err.take(), status);
+}
+
+/**
+ * `rm [-r] path…`
+ *
+ * `-f` is accepted and means what it means everywhere: say nothing about what was not there —
+ * exactly the `NotFound` fault that `remove` now reports, and nothing wider. A directory without
+ * `-r` is still checked here, because the platform's `remove` will happily take an empty one.
+ */
+Output rm(Shell sh, Vec<string> argv) {
+  bool recursive = false;
+  bool force = false;
+  Vec<string> paths = Vec.create();
+  for (i32 i = 1; i < argv.len(); i++) {
+    string a = argv.get(i);
+    if (a == "-r" || a == "-rf" || a == "-fr") { recursive = true; force = a != "-r"; }
+    else if (a == "-f") { force = true; }
+    else { paths.push(a); }
+  }
+  if (paths.len() == 0) { return force ? Output.ok(u8[0]()) : Output.fail("rm: missing operand\n".toBytes(), 1); }
+
+  Buf err = Buf.create();
+  i32 status = 0;
+  for (i32 i = 0; i < paths.len(); i++) {
+    string given = paths.get(i);
+    string path = sh.resolve(given);
+    // A real `rm` refuses a directory without `-r`, and the platform's `remove` does not: it takes
+    // a recursive flag, and without it still removes an *empty* directory. So the check is here.
+    // Differential testing found this: `mkdir one; rm one` succeeded where bash exits 1.
+    if (!recursive && sh.cli.stat(path).wait().isDir) {
+      if (!force) {
+        err.pushAll(("rm: cannot remove '" + given + "': Is a directory\n").toBytes());
+        status = 1;
+      }
+      continue;
+    }
+    // `-f` is about what is already gone, which is one fault category and not the others: a file
+    // that exists and will not be removed is reported whatever the flags say. Asked in the answer
+    // rather than by a `stat` first, so there is no window for the file to vanish in between.
+    Change gone = sh.cli.remove(path, recursive).wait();
+    if (!gone.ok() && !(force && gone.absent())) {
+      err.pushAll(("rm: cannot remove '" + given + "': " + gone.message + "\n").toBytes());
+      status = 1;
+    }
+  }
+  return status == 0 ? Output.ok(u8[0]()) : Output.fail(err.take(), status);
+}
+
+/**
+ * `ls` — names in a directory, one per line, sorted.
+ *
+ * One per line unconditionally, which is what every `ls` does when its output is not a terminal;
+ * the columns are a terminal affordance and this has no terminal. `-a` is the only flag, because
+ * the platform's `readDir` does not report a leading dot as special and hiding them would mean
+ * inventing a rule.
+ */
+Output ls(Shell sh, Vec<string> argv) {
+  Vec<string> paths = Vec.create();
+  bool all = false;
+  for (i32 i = 1; i < argv.len(); i++) {
+    string a = argv.get(i);
+    if (a == "-a") { all = true; } else { paths.push(a); }
+  }
+  if (paths.len() == 0) { paths.push("."); }
+
+  Buf out = Buf.create();
+  i32 status = 0;
+  for (i32 i = 0; i < paths.len(); i++) {
+    string given = paths.get(i);
+    string path = sh.resolve(given);
+    string[]? names = sh.cli.readDir(path).wait();
+    if (names is null) {
+      // Not a directory, or unreadable. A plain file is listed as itself, which is what `ls` does
+      // and is why this is not simply an error.
+      if (sh.cli.stat(path).wait().exists) {
+        out.pushAll((given + "\n").toBytes());
+      } else {
+        out.pushAll(("ls: " + given + ": no such file or directory\n").toBytes());
+        status = 2;
+      }
+      continue;
+    }
+    if (paths.len() > 1) { out.pushAll((given + ":\n").toBytes()); }
+    // `ls -a` lists `.` and `..` as well. The platform's `readDir` does not report them — they are
+    // not entries, they are a convention about how paths are written — so a real `ls` synthesises
+    // them and so does this. Without them `ls -a | sort` differed from bash by exactly two lines.
+    if (all) { out.pushAll(".\n..\n".toBytes()); }
+    string[] listed = names!;
+    for (i32 j = 0; j < listed.len(); j++) {
+      if (!all && listed[j].len() > 0 && listed[j].toBytes()[0] == '.') { continue; }
+      out.pushAll((listed[j] + "\n").toBytes());
+    }
+    if (paths.len() > 1 && i + 1 < paths.len()) { out.pushAll("\n".toBytes()); }
+  }
+  return status == 0 ? Output.ok(out.take()) : Output.fail(out.take(), status);
+}
+
 /** A function if one is defined, then a builtin, then an external program. */
 Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   string name = argv.get(0);
@@ -729,6 +956,11 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
     for (i32 i = 1; i < argv.len(); i++) { sh.vars.remove(argv.get(i)); }
     return Output.ok(u8[0]());
   }
+  if (name == "cd") { return cd(sh, argv); }
+  if (name == "pwd") { return Output.ok((sh.cwd + "\n").toBytes()); }
+  if (name == "ls") { return ls(sh, argv); }
+  if (name == "mkdir") { return mkdir(sh, argv); }
+  if (name == "rm") { return rm(sh, argv); }
   if (name == "read") { return readLine(sh, argv); }
   if (name == "shift") {
     // bash: shifting more than there is fails and changes nothing, rather than clearing them.
@@ -741,14 +973,29 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   }
   if (name == "set") { return setBuiltin(sh, argv); }
   if (name == "test" || name == "[") { return test(sh, argv); }
-  if (name == "help") { return help(); }
+  if (name == "help") { return help(sh); }
 
   // A real program if `$WACPATH` has one, and the wac implementation if it does not. That order
   // is the whole point of the table in `program.wac`: those exist because nothing could be
   // started, and now that something can they are the fallback rather than the answer.
   Output spawned = trySpawn(sh, argv, stdin);
   if (spawned.found) { return spawned; }
-  return run(sh.cli, argv, stdin);
+  // Then whatever was handed to us — `packages/box`'s applets, when something wired them in.
+  // After `spawn` because a separate worker with its own grants is a real boundary and this is
+  // not: an applet running here is the same wasm instance with the same authority. Before the
+  // table below because these are the programs someone finished, and those are the ones I wrote
+  // to stand in for them.
+  Output given = sh.external(sh.core, sh.cli, sh.cwd, argv, stdin);
+  if (given.found) { return given; }
+  return run(sh.cli, sh.cwd, argv, stdin);
+}
+
+/** The default `Shell.externalNames`: nothing is wired in, so there is nothing to list. */
+string[] noExternalNames() { return string[0](fill: ""); }
+
+/** The default `Shell.external`: nothing is wired in, so every name falls through. */
+Output noExternal(Core core, Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
+  return Output.missing();
 }
 
 /**
@@ -773,7 +1020,7 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
   string where = containsSlash(name) ? name : searchWacPath(sh, name);
   if (where == "") { return Output.missing(); }
 
-  FileResult prog = sh.cli.readFile(where).wait();
+  FileResult prog = sh.cli.readFile(sh.resolve(where)).wait();
   if (!prog.ok) { return Output.missing(); }
 
   string[] args = string[argv.len() - 1](fill: "");
@@ -786,6 +1033,11 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
   // change here. Left to whoever owns this package to decide, since it widens what a script can
   // reach and no test says which is wanted. (agent-a, forced by the signature change)
   Child child = sh.cli.spawn(string.fromBytes(prog.bytes), args, GRANT_NONE).wait();
+  // No `spawn` in this world at all: nothing was attempted, so this is not a failure of the program
+  // and must not be reported as one. Falling through is what keeps `packages/box`'s sixty applets
+  // working in the browser terminal, where a page cannot spawn — before this, setting `$WACPATH` to
+  // a directory holding a file called `wc` hid the `wc` that works behind exit 126.
+  if (child.unavailable()) { return Output.missing(); }
   if (child.handle < 0) {
     // It exists and would not start: that is 126, distinct from the 127 of not existing. One
     // integer cannot say both, which is why `found` is a separate field.
@@ -800,16 +1052,24 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
 
   Buf out = Buf.create();
   bool reading = true;
+  string broke = "";
   while (reading) {
-    u8[] chunk = sh.cli.recv(child.handle).wait();
-    if (chunk.len() == 0) { reading = false; }
-    else { out.pushAll(chunk); }
+    match (sh.cli.recv(child.handle).wait()) {
+      case Data(bytes): { out.pushAll(bytes); }
+      case End: { reading = false; }
+      // A child whose pipe failed is not a child that finished quietly. Reported as 126 below,
+      // beside "could not execute", because both mean the shell cannot vouch for the output.
+      case Failed(why): { reading = false; broke = why; }
+    }
   }
 
   i32 code = sh.cli.exitCode(child.handle).wait();
   sh.cli.closeSocket(child.handle);
   // Negative means it never ran at all, which by then is a host problem rather than the
   // program's status, so it is reported as "could not execute" rather than as success.
+  if (broke != "") {
+    return Output(out.bytes(), ("sh: " + name + ": " + broke + "\n").toBytes(), 126, true);
+  }
   return Output(out.bytes(), u8[0](), code < 0 ? 126 : code, true);
 }
 
@@ -825,7 +1085,7 @@ string searchWacPath(Shell sh, string name) {
       // rather than turned into a bare `/name`.
       if (i > start) {
         string candidate = string.fromBytes(sliceBytes(b, start, i)) + "/" + name;
-        if (sh.cli.stat(candidate).wait().exists) { return candidate; }
+        if (sh.cli.stat(sh.resolve(candidate)).wait().exists) { return candidate; }
       }
       start = i + 1;
     }
@@ -923,13 +1183,49 @@ Output test(Shell sh, Vec<string> argv) {
   return Output(u8[0](), u8[0](), result ? 0 : 1, true);
 }
 
-Output help() {
-  string s = "builtins: : true false echo exit export unset test [ help\n";
-  Vec<string> ns = names();
-  s = s + "programs:";
-  for (i32 i = 0; i < ns.len(); i++) { s = s + " " + ns.get(i); }
-  s = s + "\nno process capability, so these are implemented in wac — see issue 0015\n";
+/**
+ * What this shell can run, in the order it would try it.
+ *
+ * Takes the shell because the interesting half is no longer a constant: which programs exist
+ * depends on what was wired into `Shell.external`, and the old version listed the twelve in
+ * `program.wac` and cited issue 0015 — which was closed `wontfix` and is now the wrong reason for
+ * a smaller list than the truth.
+ */
+Output help(Shell sh) {
+  string s = "builtins: : true false echo exit export unset test [ help cd pwd ls mkdir rm\n";
+
+  string[] wired = sh.externalNames();
+  if (wired.len() > 0) {
+    s = s + "programs: " + wrapNames(wired) + "\n";
+  }
+
+  // Named as what they are. They are tried last, and every one of them is also in the list above
+  // when something has been wired in — where the other implementation is the better one.
+  Vec<string> own = names();
+  s = s + (wired.len() > 0 ? "built in:" : "programs:");
+  for (i32 i = 0; i < own.len(); i++) { s = s + " " + own.get(i); }
+  s = s + "\n";
+
+  if (wired.len() > 0) {
+    s = s + "$WACPATH programs are tried first, then the list above, then the built-in ones.\n";
+  } else {
+    s = s + "set $WACPATH to run programs, or hand this shell a table — see the README.\n";
+  }
   return Output.ok(s.toBytes());
+}
+
+/** Names in lines of at most 76 characters, continuation lines lined up under the first. */
+string wrapNames(string[] ns) {
+  string out = "";
+  string line = "";
+  for (i32 i = 0; i < ns.len(); i++) {
+    if (line.len() > 0 && line.len() + 1 + ns[i].len() > 66) {
+      out = out + line + "\n          ";
+      line = "";
+    }
+    line = line == "" ? ns[i] : line + " " + ns[i];
+  }
+  return out + line;
 }
 
 // ── Expansion ─────────────────────────────────────────────────────────────────
@@ -1088,7 +1384,7 @@ void globInto(Shell sh, u8[] pattern, u8[] quoted, Vec<string> argv) {
   u8[] tail = sliceBytes(pattern, slash + 1, pattern.len());
   u8[] tailMask = sliceBytes(quoted, slash + 1, quoted.len());
 
-  string[]? names = sh.cli.readDir(dir).wait();
+  string[]? names = sh.cli.readDir(sh.resolve(dir)).wait();
   if (names is null) { return; }
 
   Vec<string> hits = Vec.create();
@@ -1278,7 +1574,7 @@ string substring(Shell sh, string name, string value, string spec) {
     if (count < 0) {
       end = n + count;
       if (end < off) {
-        sh.errOut.pushAll(("sh: " + itoa(count) + ": substring expression < 0\n").toBytes());
+        sh.err(("sh: " + itoa(count) + ": substring expression < 0\n").toBytes());
         sh.exiting = true;
         sh.exitCode = 1;
         return "";
@@ -1302,7 +1598,7 @@ string substring(Shell sh, string name, string value, string spec) {
  * package is trying to avoid — something that looks like it worked.
  */
 string badSubstitution(Shell sh, string what) {
-  sh.errOut.pushAll(("sh: " + what + ": bad substitution\n").toBytes());
+  sh.err(("sh: " + what + ": bad substitution\n").toBytes());
   sh.exiting = true;
   sh.exitCode = 1;
   return "";
@@ -1507,7 +1803,7 @@ string expandArith(Shell sh, string text) {
   // becomes a value or `0`, and one still standing means it resolves to itself.
   if (settled && hasBareName(expanded)) { settled = false; }
   if (!settled) {
-    sh.errOut.pushAll(("sh: " + text + ": expression recursion level exceeded\n").toBytes());
+    sh.err(("sh: " + text + ": expression recursion level exceeded\n").toBytes());
     sh.exiting = true;
     sh.exitCode = 1;
     return "";
@@ -1517,7 +1813,7 @@ string expandArith(Shell sh, string text) {
     // Fatal to the script, which is what bash does: `echo $((1/0)); echo after` prints neither
     // and exits 1. An expansion that cannot produce a value leaves the command with no sensible
     // argument, so carrying on would mean running it with something invented.
-    sh.errOut.pushAll(("sh: " + text + ": " + state.error + "\n").toBytes());
+    sh.err(("sh: " + text + ": " + state.error + "\n").toBytes());
     sh.exiting = true;
     sh.exitCode = 1;
     return "";
@@ -1644,7 +1940,7 @@ string expandPart(Shell sh, Part p) {
       if (last == "?") {
         if (!absent) { return value; }
         string why = p.arg == "" ? "parameter null or not set" : expandText(sh, p.arg);
-        sh.errOut.pushAll(("sh: " + p.text + ": " + why + "\n").toBytes());
+        sh.err(("sh: " + p.text + ": " + why + "\n").toBytes());
         sh.exiting = true;
         // 127, which is what bash exits with here — not 1, and not the 2 a syntax error gets.
         // Measured rather than reasoned about: 127 usually means "command not found".
@@ -1667,7 +1963,7 @@ string expandPart(Shell sh, Part p) {
       // itself stops there — it ends the substitution, not the shell that asked for it.
       sh.status = runScript(inner, p.text);
       sh.ranSub = true;
-      sh.errOut.pushAll(inner.errOut.bytes());
+      sh.err(inner.errOut.bytes());
       u8[] out = inner.outBuf.take();
       i32 n = out.len();
       while (n > 0 && out[n - 1] == 10) { n--; }

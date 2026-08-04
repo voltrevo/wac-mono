@@ -12,7 +12,8 @@ import { Line, Lines, emit, nextLine } from "../lib/reader.wac";
 export i32 head(Core core, Cli cli, Args a) {
   Input in = openStream(core, cli, a, 0);
   if (!in.ok) { return 1; }
-  i32 want = a.num == 0 ? 10 : a.num;
+  // `hasNum`, not `num == 0`: `head -0` and `head -n 0` mean no lines, as GNU's do.
+  i32 want = a.hasNum ? a.num : 10;
 
   Lines s = Lines.create();
   for (i32 i = 0; i < want; i++) {

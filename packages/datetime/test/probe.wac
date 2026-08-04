@@ -24,3 +24,15 @@ export i32 parseOffset(u8[] s) {
   return p.ok ? p.offsetMin : 0;
 }
 export u8[] formatMillis(i64 millis) { return format(millis); }
+
+/**
+ * Whether the parsed offset is known: false only for `-00:00`.
+ *
+ * Separate from `parseOffset` because the two answers are both zero for the case that matters, which
+ * is the whole of GitHub wac-mono#15.
+ */
+export i32 parseOffsetKnown(u8[] s) {
+  Parsed p = parse(s);
+  if (!p.ok) { return -1; }
+  return p.offsetKnown ? 1 : 0;
+}

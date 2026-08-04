@@ -46,22 +46,25 @@ export type PlatformClasses = {
   FileResult: { of?(...a: unknown[]): unknown };
 };
 
-/** One monomorphised `Pending<T>`. bindgen names them `Pending_FileResult` and so on. */
+/** One monomorphised `Pending<T>`. bindgen names them `Pending$FileResult` and so on. */
 type PendingClass = { of(id: number, resolve: unknown, settled: unknown, drop: unknown): unknown };
 
 /** Every `Pending<T>` the world hands out. */
 export type PendingClasses = {
-  Pending_i32: PendingClass;
-  Pending_i64: PendingClass;
-  Pending_string: PendingClass;
-  Pending_stringOpt: PendingClass;
-  Pending_u8Arr: PendingClass;
-  Pending_bool: PendingClass;
-  Pending_stringArrOpt: PendingClass;
-  Pending_FileResult: PendingClass;
-  Pending_Stat: PendingClass;
-  Pending_Socket: PendingClass;
-  Pending_Child: PendingClass;
+  Pending$i32: PendingClass;
+  Pending$i64: PendingClass;
+  Pending$string: PendingClass;
+  Pending$stringOpt: PendingClass;
+  Pending$u8Arr: PendingClass;
+  Pending$bool: PendingClass;
+  Pending$stringArrOpt: PendingClass;
+  Pending$FileResult: PendingClass;
+  Pending$Stat: PendingClass;
+  Pending$Socket: PendingClass;
+  Pending$Child: PendingClass;
+  Pending$Captured: PendingClass;
+  Pending$Read: PendingClass;
+  Pending$Change: PendingClass;
 };
 
 /**
@@ -80,8 +83,8 @@ export function coreOf(
   const i64 = (id: number) => readI64le(collect(b, unpack(id)));
   const bytes = (id: number) => collect(b, unpack(id));
 
-  const asI64 = (t: Ticket) => cls.Pending_i64.of(pack(t), i64, settled, drop);
-  const asBytes = (t: Ticket) => cls.Pending_u8Arr.of(pack(t), bytes, settled, drop);
+  const asI64 = (t: Ticket) => cls.Pending$i64.of(pack(t), i64, settled, drop);
+  const asBytes = (t: Ticket) => cls.Pending$u8Arr.of(pack(t), bytes, settled, drop);
 
   return cls.Core.of(
     /*= nowMillis */
@@ -133,6 +136,13 @@ export function cliOf(
     Stat: { of(...a: unknown[]): unknown };
     Socket: { of(...a: unknown[]): unknown };
     Child: { of(...a: unknown[]): unknown };
+    Captured: { of(...a: unknown[]): unknown };
+    Change: { of(...a: unknown[]): unknown };
+    Read: {
+      Data(bytes: Uint8Array): unknown;
+      End(): unknown;
+      Failed(why: string): unknown;
+    };
   } & PendingClasses,
 ): unknown {
   const settled = (id: number) => isDone(b, unpack(id));
@@ -178,14 +188,16 @@ export function cliOf(
   const stat = (id: number) => {
     try {
       const out = collect(b, unpack(id));
-      // exists, isFile, isDir as bytes, then size and mtime as little-endian i64s.
+      // exists, isFile, isDir as bytes, then size and mtime as little-endian i64s, then isSymlink —
+      // appended rather than inserted, so the offsets above did not have to move.
       const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
       return cls.Stat.of(
         out[0] === 1, out[1] === 1, out[2] === 1,
         dv.getBigInt64(3, true), dv.getBigInt64(11, true),
+        out[19] === 1,
       );
     } catch {
-      return cls.Stat.of(false, false, false, 0n, 0n);
+      return cls.Stat.of(false, false, false, 0n, 0n, false);
     }
   };
   const dirNames = (id: number) => {
@@ -206,9 +218,63 @@ export function cliOf(
   };
   const child = (id: number) => {
     try {
-      return cls.Child.of(readI32le(collect(b, unpack(id))), "");
+      // A handle, then — when the handle is negative — why it never started. The host waits for the
+      // source to load before answering, so "it is not a worker bundle" arrives here as a `Child`
+      // with a reason rather than as an error that killed this program. wac-mono issue 0021.
+      const out = collect(b, unpack(id));
+      const handle = readI32le(out);
+      return cls.Child.of(handle, handle < 0 ? unstr(out.subarray(4)) : "");
     } catch (e) {
       return cls.Child.of(-1, e instanceof Error ? e.message : String(e));
+    }
+  };
+  const captured = (id: number) => {
+    try {
+      const out = collect(b, unpack(id));
+      // The two streams in one answer, standard output length-prefixed. One call rather than two
+      // because they are one fact: what the child wrote before it stopped.
+      const n = readI32le(out);
+      return cls.Captured.of(out.subarray(4, 4 + n), out.subarray(4 + n));
+    } catch {
+      return cls.Captured.of(EMPTY, EMPTY);
+    }
+  };
+  /**
+   * A `Read`, from a payload whose first byte is the state: 0 data, 1 end, 2 failed.
+   *
+   * A tag rather than "empty means end", which is the ambiguity the enum exists to remove — the wire
+   * had the same hole as the signature did.
+   */
+  const readOf = (out: Uint8Array) => {
+    if (out.length === 0 || out[0] === 1) return cls.Read.End();
+    if (out[0] === 2) return cls.Read.Failed(unstr(out.subarray(1)));
+    return cls.Read.Data(out.subarray(1));
+  };
+  /** For the ticket-taking `recv`. A bridge failure is itself a failed read. */
+  const read = (id: number) => {
+    try {
+      return readOf(collect(b, unpack(id)));
+    } catch (e) {
+      return cls.Read.Failed(e instanceof Error ? e.message : String(e));
+    }
+  };
+  /** For the blocking `readChunk`, which has a ticket in hand rather than a packed id. */
+  const readNow = (t: Ticket) => {
+    try {
+      return readOf(collect(b, t));
+    } catch (e) {
+      return cls.Read.Failed(e instanceof Error ? e.message : String(e));
+    }
+  };
+  /** A `Change`: the fault category, then the host's message. */
+  const change = (id: number) => {
+    try {
+      const out = collect(b, unpack(id));
+      if (out.length === 0) return cls.Change.of(0, "");
+      return cls.Change.of(out[0], unstr(out.subarray(1)));
+    } catch (e) {
+      // The bridge itself failed, which is not a category this world names.
+      return cls.Change.of(5, e instanceof Error ? e.message : String(e));
     }
   };
   const socket = (id: number) => {
@@ -220,18 +286,21 @@ export function cliOf(
   };
 
   const T = {
-    i32: (t: Ticket) => cls.Pending_i32.of(pack(t), i32, settled, drop),
-    text: (t: Ticket) => cls.Pending_string.of(pack(t), text, settled, drop),
-    outcome: (t: Ticket) => cls.Pending_string.of(pack(t), outcome, settled, drop),
-    maybeText: (t: Ticket) => cls.Pending_stringOpt.of(pack(t), maybeText, settled, drop),
-    bytes: (t: Ticket) => cls.Pending_u8Arr.of(pack(t), bytes, settled, drop),
-    chunk: (t: Ticket) => cls.Pending_u8Arr.of(pack(t), chunk, settled, drop),
-    ok: (t: Ticket) => cls.Pending_bool.of(pack(t), ok, settled, drop),
-    file: (t: Ticket) => cls.Pending_FileResult.of(pack(t), fileResult, settled, drop),
-    stat: (t: Ticket) => cls.Pending_Stat.of(pack(t), stat, settled, drop),
-    dir: (t: Ticket) => cls.Pending_stringArrOpt.of(pack(t), dirNames, settled, drop),
-    socket: (t: Ticket) => cls.Pending_Socket.of(pack(t), socket, settled, drop),
-    child: (t: Ticket) => cls.Pending_Child.of(pack(t), child, settled, drop),
+    i32: (t: Ticket) => cls.Pending$i32.of(pack(t), i32, settled, drop),
+    text: (t: Ticket) => cls.Pending$string.of(pack(t), text, settled, drop),
+    outcome: (t: Ticket) => cls.Pending$string.of(pack(t), outcome, settled, drop),
+    maybeText: (t: Ticket) => cls.Pending$stringOpt.of(pack(t), maybeText, settled, drop),
+    bytes: (t: Ticket) => cls.Pending$u8Arr.of(pack(t), bytes, settled, drop),
+    chunk: (t: Ticket) => cls.Pending$u8Arr.of(pack(t), chunk, settled, drop),
+    ok: (t: Ticket) => cls.Pending$bool.of(pack(t), ok, settled, drop),
+    file: (t: Ticket) => cls.Pending$FileResult.of(pack(t), fileResult, settled, drop),
+    stat: (t: Ticket) => cls.Pending$Stat.of(pack(t), stat, settled, drop),
+    dir: (t: Ticket) => cls.Pending$stringArrOpt.of(pack(t), dirNames, settled, drop),
+    socket: (t: Ticket) => cls.Pending$Socket.of(pack(t), socket, settled, drop),
+    captured: (t: Ticket) => cls.Pending$Captured.of(pack(t), captured, settled, drop),
+    read: (t: Ticket) => cls.Pending$Read.of(pack(t), read, settled, drop),
+    change: (t: Ticket) => cls.Pending$Change.of(pack(t), change, settled, drop),
+    child: (t: Ticket) => cls.Pending$Child.of(pack(t), child, settled, drop),
   };
 
   const twoPaths = (from: string, to: string): Uint8Array => {
@@ -289,32 +358,46 @@ export function cliOf(
       }
     },
 
+    /*= writeErr */
+    // Standard error as bytes, the same shape as `write` and failing the same way. `warn` is still
+    // the right thing for a diagnostic line; this is for a program relaying someone else's output.
+    (bytes: Uint8Array) => {
+      try {
+        collect(b, submit(b, OP.WRITE_STDERR, bytes));
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
     /*= readFile */
     (path: string) => T.file(submit(b, OP.READ_FILE, str(path))),
     /*= writeFile */
-    (path: string, body: Uint8Array) => T.ok(submit(b, OP.WRITE_FILE, prefixed(str(path), body))),
+    // `change`, not `ok`: the answer is a fault category and the host's message.
+    (path: string, body: Uint8Array) =>
+      T.change(submit(b, OP.WRITE_FILE, prefixed(str(path), body))),
     /*= stat */
     (path: string) => T.stat(submit(b, OP.STAT, str(path))),
+    /*= linkStat */
+    (path: string) => T.stat(submit(b, OP.LINK_STAT, str(path))),
     /*= readDir */
     (path: string) => T.dir(submit(b, OP.READ_DIR, str(path))),
 
     /*= mkdir */
-    (path: string, parents: boolean) => T.ok(submit(b, OP.MKDIR, flagged(parents, path))),
+    (path: string, parents: boolean) => T.change(submit(b, OP.MKDIR, flagged(parents, path))),
     /*= remove */
-    (path: string, recursive: boolean) => T.ok(submit(b, OP.REMOVE, flagged(recursive, path))),
+    (path: string, recursive: boolean) => T.change(submit(b, OP.REMOVE, flagged(recursive, path))),
     /*= rename */
-    (from: string, to: string) => T.ok(submit(b, OP.RENAME, twoPaths(from, to))),
+    (from: string, to: string) => T.change(submit(b, OP.RENAME, twoPaths(from, to))),
 
     /*= openInput */
     (path: string) => T.outcome(submit(b, OP.OPEN_INPUT, str(path))),
     /*= readChunk */
-    () => {
-      try {
-        return collect(b, submit(b, OP.READ_CHUNK, EMPTY));
-      } catch {
-        return EMPTY;   // unreadable is indistinguishable from ended, as it should be
-      }
-    },
+    // Blocking, and it answers the three states directly — no ticket, and no way to mistake a broken
+    // read for the end of the input.
+    () => readNow(submit(b, OP.READ_CHUNK, EMPTY)),
+    /*= outputError */
+    () => T.text(submit(b, OP.OUTPUT_ERROR, EMPTY)),
     /*= openOutput */
     (path: string) => T.outcome(submit(b, OP.OPEN_OUTPUT, str(path))),
 
@@ -325,7 +408,7 @@ export function cliOf(
     /*= accept */
     (handle: number) => T.socket(submit(b, OP.ACCEPT, i32le(handle))),
     /*= recv */
-    (handle: number) => T.chunk(submit(b, OP.RECV, i32le(handle))),
+    (handle: number) => T.read(submit(b, OP.RECV, i32le(handle))),
     /*= send */
     (handle: number, body: Uint8Array) => T.ok(submit(b, OP.SEND, headed(i32le(handle), body))),
     /*= closeSocket */
@@ -343,10 +426,28 @@ export function cliOf(
           headed(i32le(grants), prefixed(str(source), str(args.join("\u0000")))),
         ),
       ),
+    /*= spawnSelf */
+    // No source: the host has this program's own bundle, because it is what started it. The payload
+    // is the grants and the arguments, in the shape `spawn` uses minus the part that is already here.
+    (args: string[], grants: number) =>
+      T.child(submit(b, OP.SPAWN_SELF, headed(i32le(grants), str(args.join("\u0000"))))),
     /*= closeFeed */
     (handle: number) => { hostCall(b, OP.CLOSE_FEED, i32le(handle)); },
     /*= exitCode */
-    (handle: number) => T.i32(submit(b, OP.EXIT_CODE, i32le(handle))));
+    (handle: number) => T.i32(submit(b, OP.EXIT_CODE, i32le(handle))),
+    /*= cwd */
+    () => T.text(submit(b, OP.CWD, EMPTY)),
+
+    /*= pushChild */
+    // Everything the child's world is, in one payload, so a push is one round trip.
+    (argv: string[], stdin: Uint8Array, cwd: string) =>
+      T.ok(submit(
+        b,
+        OP.PUSH_CHILD,
+        headed(i32le(argv.length), prefixed(str(argv.join("\u0000")), prefixed(str(cwd), stdin))),
+      )),
+    /*= popChild */
+    () => T.captured(submit(b, OP.POP_CHILD, EMPTY)));
 }
 
 /**
@@ -360,10 +461,10 @@ export type PageClasses = {
   Page: { of(...a: unknown[]): unknown };
   Event: { of(...a: unknown[]): unknown };
   Picked: { of(...a: unknown[]): unknown };
-  Pending_Event: PendingClass;
-  Pending_Picked: PendingClass;
-  Pending_bool: PendingClass;
-  Pending_string: PendingClass;
+  Pending$Event: PendingClass;
+  Pending$Picked: PendingClass;
+  Pending$bool: PendingClass;
+  Pending$string: PendingClass;
 };
 
 export function pageOf(b: Bridge, cls: PageClasses): unknown {
@@ -406,10 +507,10 @@ export function pageOf(b: Bridge, cls: PageClasses): unknown {
     return out;
   };
 
-  const asOk = (t: Ticket) => cls.Pending_bool.of(pack(t), ok, settled, drop);
-  const asText = (t: Ticket) => cls.Pending_string.of(pack(t), text, settled, drop);
-  const asEvent = (t: Ticket) => cls.Pending_Event.of(pack(t), event, settled, drop);
-  const asPicked = (t: Ticket) => cls.Pending_Picked.of(pack(t), picked, settled, drop);
+  const asOk = (t: Ticket) => cls.Pending$bool.of(pack(t), ok, settled, drop);
+  const asText = (t: Ticket) => cls.Pending$string.of(pack(t), text, settled, drop);
+  const asEvent = (t: Ticket) => cls.Pending$Event.of(pack(t), event, settled, drop);
+  const asPicked = (t: Ticket) => cls.Pending$Picked.of(pack(t), picked, settled, drop);
 
   return cls.Page.of(
     /*= render */

@@ -1,68 +1,105 @@
-// Pixels, a pointer, and files in and out.
+// Pixels, a pointer, and a frame you can keep.
 //
 //   deno task app:build packages/platform/example/pixels.wac --target browser -o page/index.html
 //   box httpd -8080 page -x
 //
 // Everything a raster application needs, and it is three capabilities: `drawPixels` blits a
 // buffer wac filled, `Event.x`/`Event.y` say where in that buffer the pointer is, and
-// `nextFile`/`offerDownload` carry bytes between the user and the program.
+// `offerDownload` hands the frame back as a file.
+//
+// It used to accept a dropped file too, and hand it straight back as `.copy`. That was coverage
+// wearing a demonstration's clothes — `nextFile` arrived in the same commit as the raster
+// capabilities, and this was the page that happened to have a `Page` profile plumbed. A fractal
+// viewer has no use for a file you give it. It lives in `box/example/hash.wac` now, where a
+// dropped file is the first thing anyone reaches for.
 //
 // The picture is a Mandelbrot set, which is here because it is the honest demonstration: 38400
 // pixels, each an iteration loop, recomputed on every zoom, in compiled code on a worker while
 // the page stays responsive. A drawing API would have made this the slow way to do it.
 
-import { Cli, Core, Event, Page, Pending, Picked } from "../src/platform.wac";
+import { Cli, Core, Event, Page } from "../src/platform.wac";
 
-const i32 W = 240;
-const i32 H = 160;
-const i32 MAX = 120;
+const i32 W = 480;
+const i32 H = 300;
+const i32 MAX = 160;
+
+/** Where this page came from. A demonstration nobody can rebuild is a screenshot. */
+const string SOURCE =
+  "https://github.com/voltrevo/wac-mono/blob/master/packages/platform/example/README.md#pixelswac";
 
 export i32 page(Core core, Cli cli, Page page) {
-  page.title("pixels").wait();
+  page.title("wac: pixels").wait();
   page.render(
-    "<canvas id=\"c\" style=\"border:1px solid #ccc\"></canvas>" +
-    "<p id=\"pos\" class=\"meta\">move the pointer over it</p>" +
-    "<p><button id=\"in\">zoom in</button> <button id=\"out\">zoom out</button> " +
-    "<button id=\"save\">download as PPM</button></p>" +
-    "<p>Or hand it a file: <input type=\"file\" id=\"f\"> " +
-    "<span id=\"info\" class=\"meta\">nothing yet</span></p>"
+    "<style>" +
+    "  :root { --ink: #f7f9f9; --slab: #fff; --line: #dbe4e3; --text: #0b1a1d;" +
+    "          --dim: #5b7073; --key: #0e8c78; }" +
+    "  @media (prefers-color-scheme: dark) {" +
+    "    :root { --ink: #0b1416; --slab: #101f23; --line: #1e363c; --text: #dce8e7;" +
+    "            --dim: #8ba3a4; --key: #46d9c0; } }" +
+    "  body { background: var(--ink); color: var(--text); }" +
+    "  #tool { max-width: 34rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }" +
+    "  h1 { font-size: 1.35rem; margin: 0 0 .3rem; letter-spacing: -0.02em; }" +
+    "  p.sub { margin: 0 0 1.2rem; color: var(--dim); font-size: .95rem; }" +
+    "  canvas { display: block; width: 100%; height: auto; image-rendering: pixelated;" +
+    "           border: 1px solid var(--line); border-radius: 6px; cursor: crosshair;" +
+    "           background: var(--slab); }" +
+    "  #bar { display: flex; gap: .5rem; flex-wrap: wrap; margin: .8rem 0 .5rem; }" +
+    "  button { font: inherit; font-size: .88rem; padding: .3rem .8rem; cursor: pointer;" +
+    "           color: var(--text); background: var(--slab); border: 1px solid var(--line);" +
+    "           border-radius: 5px; }" +
+    "  button:hover { border-color: var(--key); color: var(--key); }" +
+    "  dl { display: grid; grid-template-columns: max-content 1fr; gap: .4rem 1.1rem;" +
+    "       margin: .9rem 0 0; align-items: baseline; font-size: .9rem; }" +
+    "  dt { color: var(--dim); font-size: .74rem; letter-spacing: .09em;" +
+    "       text-transform: uppercase; }" +
+    "  dd { margin: 0; font-family: ui-monospace, monospace;" +
+    "       font-variant-numeric: tabular-nums; }" +
+    "  footer { margin-top: 2rem; font-size: .85rem; color: var(--dim); }" +
+    "  footer a { color: var(--key); }" +
+    "</style>" +
+    "<div id=\"tool\">" +
+    "  <h1>pixels</h1>" +
+    "  <p class=\"sub\">Every pixel is an iteration loop in wac, compiled to WebAssembly and" +
+    "    blitted in one call. <b>Click the picture</b> to centre there and zoom.</p>" +
+    "  <canvas id=\"c\"></canvas>" +
+    "  <div id=\"bar\">" +
+    "    <button id=\"in\">zoom in</button>" +
+    "    <button id=\"out\">zoom out</button>" +
+    "    <button id=\"reset\">reset</button>" +
+    "    <button id=\"save\">download PPM</button>" +
+    "  </div>" +
+    "  <dl>" +
+    "    <dt>pointer</dt><dd id=\"pos\">move over it</dd>" +
+    "    <dt>view</dt><dd id=\"view\"></dd>" +
+    "    <dt>drawn in</dt><dd id=\"ms\">—</dd>" +
+    "  </dl>" +
+    "  <footer>Every pixel here is wac. " +
+    "    <a href=\"" + SOURCE + "\">source, and how to build it yourself</a>.</footer>" +
+    "</div>"
   ).wait();
   page.on("#c", "pointermove").wait();
+  page.on("#c", "click").wait();
   page.on("button", "click").wait();
 
   // The view, in fixed point: thousandths of a unit in the complex plane.
   i32 spanX = 3500;
   i32 centreX = -700;
   i32 centreY = 0;
-  draw(page, spanX, centreX, centreY);
-
-  // Two things to wait on, and one call that waits on both. `nextEvent` and `nextFile` are
-  // ordinary tickets, so this is the same `waitAny` a relay uses over two sockets — which is
-  // the whole argument for events being tickets rather than callbacks.
-  Pending<Event> ev = page.nextEvent();
-  Pending<Picked> file = page.nextFile();
+  drawAndReport(core, page, spanX, centreX, centreY);
 
   while (true) {
-    i32 which = core.waitAny(i32[](ev.id, file.id), -1);
-    if (which < 0) { return 0; }
+    Event e = page.nextEvent().wait();
 
-    if (which == 1) {
-      Picked f = file.wait();
-      file = page.nextFile();
-      if (!f.ok) {
-        page.setText("info", "could not read it: " + f.error).wait();
-      } else {
-        page.setText("info", f.name + ", " + itoa(f.bytes.len()) + " bytes — sending it back").wait();
-        // Straight back out again, which proves both directions with one file.
-        page.offerDownload(f.name + ".copy", f.bytes).wait();
-      }
-      continue;
-    }
-
-    Event e = ev.wait();
-    ev = page.nextEvent();
-
-    if (e.kind == "pointermove") {
+    // A click on the canvas: the point under the cursor becomes the centre, and the view halves.
+    // This is what `Event.x` and `Event.y` are for — without them the only zoom possible is the
+    // middle of the picture, which is the least interesting part of any fractal.
+    if (e.kind == "click" && e.id == "c") {
+      i32 spanY = spanX * H / W;
+      centreX = centreX - spanX / 2 + e.x * spanX / W;
+      centreY = centreY - spanY / 2 + e.y * spanY / H;
+      spanX = spanX / 2;
+      drawAndReport(core, page, spanX, centreX, centreY);
+    } else if (e.kind == "pointermove") {
       // The escape count under the cursor, which is the check that x and y are the *canvas's*
       // coordinates rather than the page's — an off-by-a-scroll would show up here at once.
       i32 n = escapes(e.x, e.y, spanX, centreX, centreY);
@@ -70,14 +107,50 @@ export i32 page(Core core, Cli cli, Page page) {
         (n >= MAX ? "never (inside)" : itoa(n))).wait();
     } else if (e.id == "in") {
       spanX = spanX / 2;
-      draw(page, spanX, centreX, centreY);
+      drawAndReport(core, page, spanX, centreX, centreY);
     } else if (e.id == "out") {
       spanX = spanX * 2;
-      draw(page, spanX, centreX, centreY);
+      drawAndReport(core, page, spanX, centreX, centreY);
+    } else if (e.id == "reset") {
+      spanX = 3500;
+      centreX = -700;
+      centreY = 0;
+      drawAndReport(core, page, spanX, centreX, centreY);
     } else if (e.id == "save") {
       page.offerDownload("mandelbrot.ppm", ppm(spanX, centreX, centreY)).wait();
     }
   }
+}
+
+/**
+ * Draw, and say how long it took and where we are.
+ *
+ * The timing is on the page because it is the answer to the obvious question about a fractal
+ * recomputed on every click, and because it is the number that makes the case for compiling.
+ */
+void drawAndReport(Core core, Page page, i32 spanX, i32 centreX, i32 centreY) {
+  i64 began = core.monotonicNanos().wait();
+  draw(page, spanX, centreX, centreY);
+  i64 took = (core.monotonicNanos().wait() - began) / 1000000;
+  page.setText("ms", itoa(took as~ i32) + " ms  ·  " + itoa(W * H) + " pixels").wait();
+  page.setText(
+    "view",
+    "span " + thousandths(spanX) + "  centre " + thousandths(centreX) + ", " + thousandths(centreY)
+  ).wait();
+}
+
+/** Fixed point, printed as a decimal — the view is in thousandths of a unit. */
+string thousandths(i32 v) {
+  bool neg = v < 0;
+  i32 x = neg ? 0 - v : v;
+  return (neg ? "-" : "") + itoa(x / 1000) + "." + pad3(x % 1000);
+}
+
+string pad3(i32 v) {
+  string s = itoa(v);
+  if (v < 10) { return "00" + s; }
+  if (v < 100) { return "0" + s; }
+  return s;
 }
 
 /** Fill a buffer and hand it over. One call, whatever is in the buffer. */
@@ -145,6 +218,10 @@ u8[] ppm(i32 spanX, i32 centreX, i32 centreY) {
 
 string itoa(i32 v) {
   if (v == 0) { return "0"; }
+  // `i32::MIN` has no positive counterpart — negating it wraps back to itself — so without this the
+  // loop below never runs and the answer is the sign alone. GitHub wac-mono#6 found it in `box`;
+  // these copies had it too.
+  if (v == -2147483648) { return "-2147483648"; }
   i32 x = v < 0 ? 0 - v : v;
   u8[] digits = u8[12](fill: 0);
   i32 at = 12;

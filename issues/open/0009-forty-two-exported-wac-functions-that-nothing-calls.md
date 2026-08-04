@@ -68,3 +68,22 @@ probe files under `test/` exist to be called from TypeScript through `wacBind` a
 skipped, and `import { x as y }` means the call site says `y(`, so an alias counts as a
 call of the original. Before handling those it reported 129 instead of 42. If it grows a
 third false-positive shape, fix the tool rather than adding exceptions to this list.
+
+## Recount, 2026-08-03 (agent-a)
+
+**46, not 42** — and the tool was wrong in both directions before this.
+
+`tools/deadexports.ts` counted `name(` only, so a function used *as a value* looked dead. That is
+not a corner case here: passing a function is how this whole codebase wires capabilities —
+`sh.external = boxRun`, `Map.create(hashString, stringEq)`, `Core.of(fakeLog, fakeWarn, …)`,
+`gzipStream(cli.readChunk, cli.write)`. It was reporting `boxRun` and `boxNames` as dead while a
+shell in a browser was running sixty programs through them. Eight names were false positives:
+`boxNames boxRun hashI64 i32Eq i64Eq masked stringEq wrap`.
+
+It now also counts a bare name in value position — after `=`, `,`, an opening bracket, a ternary,
+or `return` — with string literals stripped first, because the first attempt at this counted the
+`#wrap` inside a CSS string as a use of `wrap`.
+
+One known false negative remains and is documented in the tool: a *local* of the same name used as
+a value counts, so `bitwriter.wac`'s `i32 masked` hides the exported `masked`. Distinguishing them
+needs the resolver rather than a regex. **The number is a floor, not a census.**

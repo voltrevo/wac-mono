@@ -14,6 +14,7 @@
 
 import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
 import { type NodeListener, type NodeSock } from "./node.ts";
+import { type WorkerLike } from "./children.ts";
 
 /** Supplied by the generated launcher, which is where `node:net` can be imported. */
 export type NodeNet = {
@@ -37,7 +38,32 @@ type WorkerThreads = {
   Worker: new (src: string, opts: { eval: boolean }) => NodeWorker;
 };
 
-type Start = { sab: SharedArrayBuffer };
+/**
+ * A `WorkerLike` from Node's `worker_threads`, for `spawn`.
+ *
+ * Here rather than in `node.ts` because that file describes Node's pieces instead of importing them,
+ * so it type-checks under Deno; `wt` only exists where the launcher runs. Node's `on("error")` is
+ * containment already — nothing propagates to the parent thread — so unlike the web worker there is
+ * no default to prevent.
+ */
+function workerFrom(wt: WorkerThreads): (source: string) => WorkerLike {
+  return (source: string) => {
+    const w = new wt.Worker(source, { eval: true });
+    return {
+      post: (m: unknown) => w.postMessage(m),
+      onMessage: (f: (data: unknown) => void) => w.on("message", f as (m: never) => void),
+      onError: (f: (message: string) => void) =>
+        w.on(
+          "error",
+          ((e: Error) => f(e instanceof Error ? e.message : String(e))) as (m: never) => void,
+        ),
+      terminate: () => { void w.terminate(); },
+    };
+  };
+}
+
+/** `child` is set by `spawnChild`: a spawned program runs `main`, never `page`. */
+type Start = { sab: SharedArrayBuffer; child?: boolean };
 type Result = { ok: true; code: number } | { ok: false; error: string };
 
 /**
@@ -50,6 +76,10 @@ type Result = { ok: true; code: number } | { ok: false; error: string };
 export function runAsWorkerEntryNode(wt: WorkerThreads, app: AppModule): void {
   const port = wt.parentPort;
   if (port === null) throw new Error("runAsWorkerEntryNode called off a worker");
+  // "This bundle loaded", before the bridge arrives and before the application runs — the one fact a
+  // parent cannot otherwise learn, and what `spawn` waits for so that a source which is not
+  // JavaScript is a failed child rather than a dead parent. wac-mono issue 0021.
+  port.postMessage({ ready: true });
   port.on("message", (m: unknown) => {
     const b = bridgeOf((m as Start).sab);
     try {
@@ -78,6 +108,11 @@ export async function runLauncherNode(
       close(): Promise<void>;
     }>;
     stat(p: string): Promise<{ isFile(): boolean; isDirectory(): boolean; size: number; mtimeMs: number }>;
+    lstat(
+      p: string,
+    ): Promise<
+      { isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean; size: number; mtimeMs: number }
+    >;
     readdir(p: string): Promise<string[]>;
   },
   proc: {
@@ -86,6 +121,7 @@ export async function runLauncherNode(
     exit(code: number): never;
     stdin: AsyncIterable<Uint8Array>;
     stdout: { write(b: Uint8Array, cb: (e?: unknown) => void): void };
+    stderr: { write(b: Uint8Array, cb: (e?: unknown) => void): void };
   },
   workerSource: string,
   grants: Grants = {},
@@ -141,11 +177,21 @@ export async function runLauncherNode(
     },
     writeStdout: (b: Uint8Array): Promise<void> =>
       new Promise((res, rej) => proc.stdout.write(b, (e) => (e ? rej(e) : res()))),
+    writeStderr: (b: Uint8Array): Promise<void> =>
+      new Promise((res, rej) => proc.stderr.write(b, (e) => (e ? rej(e) : res()))),
     stat: async (path: string) => {
       const st = await fs.stat(path);
       return {
         isFile: st.isFile(), isDirectory: st.isDirectory(),
         size: st.size, mtimeMillis: Math.round(st.mtimeMs),
+      };
+    },
+    linkStat: async (path: string) => {
+      const st = await fs.lstat(path);
+      return {
+        isFile: st.isFile(), isDirectory: st.isDirectory(),
+        size: st.size, mtimeMillis: Math.round(st.mtimeMs),
+        isSymlink: st.isSymbolicLink(),
       };
     },
     readDir: async (path: string) => (await fs.readdir(path)).sort(),
@@ -156,6 +202,8 @@ export async function runLauncherNode(
     fs: { read: grants.read === true, write: grants.write === true },
     net: grants.net === true,
     env: grants.env === true ? (n) => proc.env[n] : undefined,
+    makeWorker: workerFrom(wt),
+    selfSource: workerSource,
   }));
 
   const worker = new wt.Worker(workerSource, { eval: true });
@@ -163,7 +211,8 @@ export async function runLauncherNode(
   // this cannot be posted too early — but it does have to be posted at all.
   worker.postMessage({ sab: bridge.sab } satisfies Start);
   const code = await new Promise<number>((resolve, reject) => {
-    worker.on("message", ((m: Result) => {
+    worker.on("message", ((m: Result | { ready: true }) => {
+      if ("ready" in m) return;   // the load notice; only `spawn` has a use for it
       if (m.ok) resolve(m.code);
       else reject(new Error(m.error));
     }) as (m: never) => void);

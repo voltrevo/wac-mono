@@ -113,7 +113,8 @@ like. Keeping the tree at `packages/<name>/src` bounds the depth.
 Everything runs from the repo root, so one command covers every package.
 
 ```sh
-deno task test            # all tests, host-side and wac-written (parallel: ~30s, vs ~76s serial)
+deno task test            # all tests, host-side and wac-written (~50s on five cores)
+deno task test:changed    # ...only the packages you have touched, for the loop before that
 deno task wac:pin         # record the sibling wac checkout as the minimum this repo needs
 deno task app <entry.wac> --allow-read -- args   # run a wac application
 deno task app:build <entry.wac> --allow-read -o wc   # ...or build one executable; then: ./wc FILE
@@ -152,6 +153,28 @@ tools/push.sh             # run the suite, then push only if it passed
 `deno task test` skips one test: the browser target running in an actual browser, which needs
 Chromium installed and `deno test -A`. `packages/platform/test/browser_live.test.ts` says how
 in three commands, and skips in milliseconds without them.
+
+### What the suite costs, and where
+
+Measured on five cores: **~50 seconds** for all 910 tests in parallel, about 160 seconds of CPU. One
+file at a time in its own process is 6.5 minutes, and most of that is a hundred and forty deno
+startups; the heaviest single files are `packages/box` (25s, three hundred subprocesses comparing
+applets against the GNU tools) and `packages/regex` (17s, differential fuzzing against `RegExp`).
+Nothing hangs and nothing is pathological — it is a lot of tests, most of them differential against
+something real.
+
+If a run takes many minutes, the cause is almost certainly *load* rather than the suite: several
+agents share this machine, and five cores between three of them turns fifty seconds into whatever
+you like. `nproc` and `/proc/loadavg` answer that question before a bisect does.
+
+**Builds are cached by content** in `.cache/`, which is what took the suite's CPU down by a sixth and
+`packages/box` from 38 seconds to 26. A wac program compiled with a given compiler, or bundled into an
+application with given grants, is produced once and then copied: the key is a SHA-256 over every
+reachable `.wac` file, every `.ts` file of the compiler, the harness, `packages/platform`'s host, the
+Deno version and the build's arguments — never a timestamp, because `git checkout` of an older file is
+a new input with an older mtime. `harness/buildCache.ts` has the reasoning and
+`harness/buildCache.test.ts` pins the parts of the key that would be silently wrong if dropped.
+Deleting `.cache` is always safe and is the whole of the invalidation story.
 
 ## Keeping the compiler pin current
 

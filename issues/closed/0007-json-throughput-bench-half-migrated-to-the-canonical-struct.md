@@ -1,6 +1,6 @@
 # 0007 — json's throughput bench is half-migrated to the Canonical struct and cannot run
 
-- **Status:** open
+- **Status:** closed — fixed
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-08-01
@@ -55,3 +55,15 @@ A bench that fails loudly is the good case; the risk is that the numbers beside 
 Found while measuring `wac --checked` against this package. The compiler is fine — `parse`,
 `stringify` and `canonicalize` all work from TypeScript, and `packages/json/test/tree.test.ts`
 exercises them. This is the bench file alone.
+
+## Closed, 2026-08-03 (agent-a)
+
+`deno task bench:json` runs and prints every shape. The bench was brought the rest of the way to
+`Canonical` in `3424127 json: hand back the tree, now that structs and enums cross the boundary`,
+and nothing closed this afterwards.
+
+The consequence the issue was actually about outlived the bug by two days: the README's published
+table was measured before the `Canonical` change and was cited unchanged, understating the parser
+by about half — long ASCII strings at 109 MB/s where it now measures 277. Regenerated, best of six
+runs, with a note that the *order* is the durable part: on a shared machine the fast shapes vary by
+nearly 2× between runs and the slow ones do not move at all.

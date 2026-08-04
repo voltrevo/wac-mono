@@ -14,7 +14,7 @@
 
 import { Cli, Core, FileResult, Stat } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { itoa64 } from "../lib/num.wac";
+import { itoa, itoa64 } from "../lib/num.wac";
 
 export i32 tar(Core core, Cli cli, Args a) {
   if (a.rest.len() < 1) { core.warn("usage: " + a.name + " <path>..."); return 2; }
@@ -28,10 +28,51 @@ export i32 tar(Core core, Cli cli, Args a) {
   return code;
 }
 
+/**
+ * How deep the walk goes.
+ *
+ * `stat` follows symbolic links and cannot say that it did, so a link to a directory is descended as
+ * though it were one and a cycle grows the path for ever. This bounds it. Refusing links outright is
+ * what the header of this file claims and needs link-aware metadata in `platform` to enforce —
+ * GitHub wac-mono#25, which stays open for that reason. What is fixed here is the unbounded part.
+ */
+i32 MAX_DEPTH() { return 64; }
+
 /** One path, and everything under it if it is a directory. */
 bool add(Core core, Cli cli, string path, string name) {
+  return addAt(core, cli, path, name, 0);
+}
+
+bool addAt(Core core, Cli cli, string path, string name, i32 depth) {
+  // **The link, before what it points at.** `stat` follows, so a link to a directory looked exactly
+  // like the directory: this walked into it, stored its contents under the link's name, and a cycle
+  // grew the path until something trapped. The header of this file has always said links are
+  // refused; `linkStat` is what made saying so possible. GitHub wac-mono#25.
+  Stat link = cli.linkStat(path).wait();
+  if (link.exists && link.isSymlink) {
+    core.warn(name + ": " + path + ": symbolic link, which a ustar header cannot describe");
+    return false;
+  }
+
   Stat st = cli.stat(path).wait();
   if (!st.exists) { core.warn(name + ": " + path + ": not found"); return false; }
+
+  // A name that does not fit is refused, which is what this file has always said it does — there
+  // was no check, so the header writer copied the first 100 bytes and archived the entry under a
+  // different name than the one asked for. A tar that quietly renames what it stores is worse than
+  // one that declines: the mistake is only discovered when the archive is unpacked.
+  // GitHub wac-mono#23.
+  string entry = st.isDir ? path + "/" : path;
+  if (entry.toBytes().len() > 100) {
+    core.warn(name + ": " + path + ": name is longer than the 100 bytes a ustar header holds");
+    return false;
+  }
+
+  if (depth > MAX_DEPTH()) {
+    core.warn(name + ": " + path + ": deeper than " + itoa(MAX_DEPTH()) +
+      " levels, not descending (a symlink loop, or a genuinely deep tree)");
+    return false;
+  }
 
   if (st.isDir) {
     // The directory's own entry first, so an empty one survives the round trip.
@@ -41,7 +82,7 @@ bool add(Core core, Cli cli, string path, string name) {
     string[] found = names!;
     bool ok = true;
     for (i32 i = 0; i < found.len(); i++) {
-      if (!add(core, cli, path + "/" + found[i], name)) { ok = false; }
+      if (!addAt(core, cli, path + "/" + found[i], name, depth + 1)) { ok = false; }
     }
     return ok;
   }

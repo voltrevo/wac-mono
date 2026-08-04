@@ -53,10 +53,14 @@ export struct Map<K, V> {
   Map<K, V> withCapacity(i32 capacity, fn[i32(K)] hash, fn[bool(K, K)] eq) {
     // Slots are a power of two so the mask replaces a modulo, and the load factor is 3/4, so
     // the array has to be a third larger than the capacity asked for.
-    i32 want = capacity + capacity / 3 + 1;
-    i32 size = 8;
-    while (size < want) { size = size * 2; }
-    return Map(MapEntry<K, V>?[size](), 0, hash, eq);
+    // In i64, because both lines wrapped in i32: a large `capacity` made `want` negative, and once
+    // the doubling passed the ceiling `size` went negative and the loop ran for ever. Clamped at the
+    // largest power of two an array can hold, so an impossible request fails on the allocation
+    // rather than hanging before it.
+    i64 want = (capacity as i64) + ((capacity as i64) / 3) + 1;
+    i64 size = 8;
+    while (size < want && size < 1073741824) { size = size * 2; }
+    return Map(MapEntry<K, V>?[size as! i32](), 0, hash, eq);
   }
 
   i32 len(const this) { return this.n; }

@@ -14,8 +14,8 @@
 import { allDivergentSites, ctModule, type CtModule, traceOf } from "../../harness/ctTrace.ts";
 
 const bytes = (m: CtModule, b: number[]): unknown => {
-  const a = m.exports.__bind_arr_u8_new(b.length);
-  b.forEach((v, i) => m.exports.__bind_arr_u8_set(a, i, v));
+  const a = m.exports.$bind$arr_u8_new(b.length);
+  b.forEach((v, i) => m.exports.$bind$arr_u8_set(a, i, v));
   return a;
 };
 

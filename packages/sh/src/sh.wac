@@ -10,48 +10,16 @@
 //   sh file             run the file
 //   sh                  run standard input
 //
-// External commands are implemented in wac, because the capability world cannot start a process
-// (issue 0015). `help` lists what there is. Everything else — quoting, expansion, pipelines,
-// redirection, `&&`, `$(…)`, exit statuses — is a shell.
+// External commands are a spawned `$WACPATH` program, then whatever was wired into
+// `Shell.external`, then the small table in `program.wac`. This entry wires nothing, so it is the
+// third — `help` lists what there is. `packages/box/src/bin/sh.wac` is the same shell with sixty
+// applets wired in, and it is four lines, because the shell being handed its programs rather than
+// containing them is the point of the seam.
 
-import { Cli, Core, FileResult } from "../../platform/src/platform.wac";
-import { Shell, runScript } from "./exec.wac";
+import { Cli, Core } from "../../platform/src/platform.wac";
+import { Shell } from "./exec.wac";
+import { shellMain } from "./entry.wac";
 
 export i32 main(Core core, Cli cli) {
-  string src = "";
-
-  i32 n = cli.argCount().wait();
-  if (n >= 1 && cli.arg(0).wait() == "-c") {
-    if (n < 2) {
-      core.warn("sh: -c needs a script");
-      return 2;
-    }
-    // Everything after `-c` joined with spaces, as `sh -c` does: the shell re-splits it anyway.
-    src = cli.arg(1).wait();
-    for (i32 i = 2; i < n; i++) { src = src + " " + cli.arg(i).wait(); }
-  } else if (n >= 1) {
-    FileResult f = cli.readFile(cli.arg(0).wait()).wait();
-    if (!f.ok) {
-      core.warn("sh: " + cli.arg(0).wait() + ": " + f.error);
-      return 127;
-    }
-    src = string.fromBytes(f.bytes);
-  } else {
-    src = string.fromBytes(cli.readStdin().wait());
-  }
-
-  Shell sh = Shell.create(core, cli);
-  i32 status = runScript(sh, src);
-
-  // Standard error goes out in one piece at the end, because the capability world has no
-  // byte-level error channel — issue 0014. `warn` adds its own newline, so a trailing one would
-  // print a blank line.
-  if (sh.errOut.len > 0) {
-    i32 len = sh.errOut.len;
-    while (len > 0 && sh.errOut.get(len - 1) == 10) { len--; }
-    u8[] trimmed = u8[len]();
-    trimmed.copyFrom(sh.errOut.data, 0, 0, len);
-    core.warn(string.fromBytes(trimmed));
-  }
-  return status;
+  return shellMain(core, cli, Shell.create(core, cli), 0);
 }

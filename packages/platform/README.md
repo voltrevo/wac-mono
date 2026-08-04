@@ -106,15 +106,72 @@ split is why it is a second struct rather than more fields.
 | `Core` | `nowMillis`, `monotonicNanos`, `sleepMillis`, `randomBytes`, `log`, `warn` | — |
 | | `waitAny` | — |
 | `Cli` | `argCount`, `arg`, `env` | — |
-| | `readStdin`, `write` | — |
-| | `openInput`, `readChunk` | `--allow-read` for a file |
-| | `readFile`, `stat`, `readDir` | `--allow-read` |
+| | `readStdin`, `write`, `writeErr` | — |
+| | `openInput`, `readChunk`, `outputError` | `--allow-read` for a file |
+| | `readFile`, `stat`, `linkStat`, `readDir` | `--allow-read` |
 | | `writeFile`, `mkdir`, `remove`, `rename` | `--allow-write` |
 | | `openOutput` (to a file) | `--allow-write` |
 | | `connect`, `listen`, `accept`, `recv`, `send`, `closeSocket` | `--allow-net` |
 | | `spawn`, `closeFeed`, `exitCode` | — (the child gets what you pass, never more) |
+| | `cwd` | — (a read; there is no `chdir`) |
+| | `pushChild`, `popChild` | — (a child *inside* this program, with this program's authority) |
 | `Page` | `render`, `setText`, `setValue`, `getValue`, `on`, `nextEvent`, `title` | browser only |
 | | `drawPixels`, `nextFile`, `offerDownload` | browser only |
+
+**Anything that can fail says why.** `writeFile`, `mkdir`, `remove` and `rename` answer a **`Change`**:
+a fault category and the host's own words. A `bool` could report that a write failed and never what
+went wrong, so `rm -f` had to suppress every failure or none. A message alone was better and still not
+enough — "was it merely absent?" could only be answered by matching English, which is a guess about
+three operating systems, so `rm -f` asked `stat` first instead and raced with whoever else was
+deleting. The category answers it in the reply: `ok()`, `absent()`, and `fault` against `FAULT_DENIED`,
+`FAULT_EXISTS`, `FAULT_NOT_EMPTY`, `FAULT_OTHER`. The classification is one file,
+[`host/faults.ts`](host/faults.ts), shared by all three hosts — Deno's typed errors, Node's `code`s and
+the browser's `DOMException` names are three vocabularies for the same five facts, and `rm -f` must
+mean the same thing on all of them.
+
+The categories are deliberately few, and `FAULT_OTHER` is not an embarrassment: a full errno table is
+a taxonomy nobody branches on. What a program branches on is "was it already gone"; what a person
+reads is the message.
+
+**In a browser the message is the category's own short phrase**, not the `DOMException`'s. Deno and
+Node say "No such file or directory (os error 2), remove '/tmp/x'" — terse, and it names the path and
+the operation, so it is worth passing on verbatim. A browser says "A requested file or directory could
+not be found at the time an operation was processed.", which is prose for a developer console and
+names neither; after `rm: cannot remove 'f': ` it reads as a defect. Since the category is already
+established by then, the short form loses nothing — and `FAULT_OTHER` still keeps the message, because
+there the message is the only information there is. Checked against a real Chromium and not only
+against the in-memory double, since this is exactly the sort of thing a double agrees with itself
+about.
+
+**`readChunk` and `recv` answer a `Read`**, which is `Data(bytes)`, `End`, or `Failed(why)` — three
+states in the type, so a caller cannot mistake a broken read for the end of the input. `match` is
+exhaustive; ignoring `Failed` does not compile.
+
+That is the second design. The first added a companion `inputError()` to ask *after* an empty answer,
+which was cheaper and wrong: it left the ordinary path looking exactly as correct as it had been, so
+anybody who forgot to ask got the old bug back — a filter over a disk that gave out exiting 0 having
+written half the answer. Removing a failure mode is worth more than the twenty call sites it cost,
+and in a young codebase those call sites are a schedule rather than an objection.
+
+`Read` lives in `packages/bytes`, not here, because `gzipStream(cli.readChunk, cli.write)` hands the
+capability straight to a transform — wac has no closures, so no adapter can sit between them, and
+`gzip` has no business depending on a capability world. The lowest package in the tree is where both
+sides can reach it.
+
+`write` keeps its `bool` and has `outputError()` beside it, because its two outcomes are *not* the
+same shape of question: a reader that went away is a normal ending a filter should exit 0 on, and a
+failed write is not. That one is a companion on purpose rather than by inertia.
+
+`stat` follows symbolic links, so it describes what a name leads to; `linkStat` describes the name.
+Both questions are real — `find` wants the first, `tar` wants the second — and a flag would have made
+every caller decide something most of them do not care about.
+
+`pushChild` and `popChild` need no grant because they add no authority: they change what `arg`,
+`readChunk`, `write`, `log`, `warn` and every path mean *for the program itself*, between two
+calls it makes. A shell uses them to run a program and keep its output — see
+[`example/inside.wac`](example/inside.wac), and `packages/box`'s applets running inside
+`packages/sh`. They are emphatically **not** isolation: the child is the same wasm instance with
+the same grants, and the thing with a real boundary is `spawn`.
 
 `waitAny` is in `Core` because it grants nothing — it cannot start work, only notice that some
 has finished — and `spawn` needs no grant of its own for the same reason the child's grants are
@@ -123,11 +180,20 @@ an argument to it: what a child may do is a subset of what its parent already ha
 `Page` is a third profile and only a browser provides it. A page capability that pretended to
 work in a terminal would be a lie, which is the whole reason these are separate structs.
 
-**`readStdin` and `write` need no grant**, for the same reason `arg` does not: what the
+**`readStdin`, `write` and `writeErr` need no grant**, for the same reason `arg` does not: what the
 user pipes in and what the program prints are the user's own doing, not a reach into
 something they did not offer. `write` puts *exactly* those bytes on standard output —
 `log` is for lines of text, and without a byte-level output nothing could emit binary,
 which ruled out every compressor and encoder as a filter.
+
+`writeErr` is that for standard error, and `warn` is the line. The two are different jobs: `warn` is
+the program talking about itself, which is what every applet in `packages/box` does and should keep
+doing; `writeErr` is the program passing someone else's bytes through. `packages/ssh` is why it
+exists — a remote command's two streams arrive interleaved and tagged, and with only `warn` the
+client could reproduce standard output exactly and standard error not at all, since a per-packet
+`warn` inserts a newline at every packet boundary and buffering to the end loses the order. Both
+`packages/sh` and `packages/ssh` used to flush the whole error stream at the end with its trailing
+newline shaved off by hand; both now write it when it happens. Issue 0014.
 
 **`openInput` and `readChunk` are the incremental half.** Everything else answers with the
 whole of something, which is fine for a filename and wrong for a pipe: `cat` of a large
@@ -359,6 +425,50 @@ deno task app:build packages/platform/example/wc.wac --worker -o wc.worker.js
 Running a *program* is therefore two steps, read it and spawn it, which is why there is no
 registry of launchable things: the capability is "run this", and where the code came from is
 the filesystem's business.
+
+**Every host spawns through one implementation.** `host/children.ts` holds it: the queues that are
+the child's stdio, the load notice, the grace period, when to stop the responder. What differs between
+the three is how a *worker* is made — a page and Deno take a module from a blob URL, Node takes a
+source string with `eval` and reports errors through an emitter — so that is an argument, thirty lines
+in total, and everything else is shared. The child's world is the other argument, which is how a page
+gives its children a page's world and Deno gives them Deno's.
+
+A page could always have done this; nothing about a browser forbade it. A worker can create a worker,
+each program needs its own `SharedArrayBuffer` and a responder for it, and the page's own thread hosts
+the second as easily as the first — the parent is parked in `Atomics.wait` while its child runs, and
+that is fine precisely because the child's calls are answered by the *page*. A child gets no `Page`
+profile: its output goes to the parent through the handle, and a child that could draw would be
+drawing over the program that started it.
+
+**`spawn` answers only once the source has loaded**, so a file that is not a worker bundle is a
+failed child rather than a dead parent. That took two things. Deno re-raises an unhandled worker
+error as the *host's* own uncaught error, so a `SyntaxError` in the child killed the program that
+spawned it — a shell handed a text file exited 1 with Deno's message and never got to call it a
+failed command. And the handle used to be answered before the failure could happen, so `Child.error`
+was always empty. The worker now posts a notice as soon as its bundle evaluates, and `spawn` waits
+for either that or the load error: a handle means it is running, and -1 with a message means it never
+started. Issue 0021.
+
+The grace period on that wait resolves as *alive*, never as failed — a slow load on a busy machine
+must not be reported as a program that would not start. Which leaves the case where a file parses and
+then says nothing at all, and that still hangs: issue 0033, where the trade-off is written down.
+
+**`spawnSelf` is how a page has programs at all.** `spawn` takes a worker bundle, and a bundle comes
+from a filesystem — fine on a command line, impossible in a browser tab, where there is no directory
+of programs and nothing to have put one there. So a page could spawn and had nothing to spawn.
+
+Every built program already carries its own bundle: the launcher holds it as a string, because that is
+how it started the program. `spawnSelf(args, grants)` runs it again with different arguments, needing
+no file, no path and no grant of its own — and a program whose `main` dispatches on argv is therefore
+sixty programs. That is what `packages/box` is: `box sort` is `box` reading its first argument.
+
+```wac
+Child kid = cli.spawnSelf(string[]("sort", "-n"), GRANT_READ).wait();
+```
+
+A child runs `main` even when the program also exports `page`, because it was spawned: it has a handle
+and nowhere to draw. One bundle can therefore be both a terminal and the programs the terminal runs —
+see `packages/platform/example/twin.wac`, which is the whole idea in forty lines, and issue 0030.
 
 `closeFeed` is distinct from `closeSocket` because they differ in a way that matters:
 `closeFeed` ends the child's standard input, `closeSocket` stops the child. A program that

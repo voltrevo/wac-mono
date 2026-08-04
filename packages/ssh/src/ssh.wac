@@ -25,7 +25,7 @@
 // `write` for standard output as bytes but only `warn`, which is line-oriented, for the error
 // channel — so byte-exact interleaving is not expressible. Filed as wac-mono 0014.
 
-import { Cli, Core, FileResult, Socket } from "../../platform/src/platform.wac";
+import { Change, Cli, Core, FileResult, Socket } from "../../platform/src/platform.wac";
 import { Client } from "./client.wac";
 import { KeyError, PrivateKey, readEd25519 } from "./privatekey.wac";
 import { Verdict, lookUp } from "./knownhosts.wac";
@@ -149,8 +149,9 @@ i32 checkHost(Core core, Cli cli, Options o, u8[] hostKey) {
       u8[] updated = (contents.len() > 0 && contents[contents.len() - 1] != 10)
         ? joinBytes(contents, ("\n" + line + "\n").toBytes())
         : joinBytes(contents, (line + "\n").toBytes());
-      if (!cli.writeFile(path, updated).wait()) {
-        core.warn("ssh: cannot write " + path + " — was --allow-write granted?");
+      Change wrote = cli.writeFile(path, updated).wait();
+      if (!wrote.ok()) {
+        core.warn("ssh: cannot write " + path + ": " + wrote.message);
         return 1;
       }
       core.warn("ssh: added " + name + " to " + path);

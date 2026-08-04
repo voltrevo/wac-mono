@@ -55,6 +55,11 @@
  * A ticket is good once. Waiting on a spent one is an error rather than a plausible wrong
  * answer, because the slot underneath is reused and its generation has moved on.
  */
+// The one type this world does not define itself. `Read` lives in `packages/bytes` because the
+// streaming transforms in `gzip` and `stream` must name it too, and they have no business depending
+// on a capability world — see the note at the top of `bytes/src/read.wac`.
+import { Read } from "../../bytes/src/read.wac";
+
 export struct Pending<T> {
   i32 id;
   fn[T(i32)] resolve;
@@ -122,6 +127,10 @@ export struct Event {
    * The element's own coordinates rather than the page's, because the caller of `drawPixels`
    * thinks in the buffer it drew and would otherwise have to subtract a position it has no way
    * to ask for.
+   *
+   * For a `<canvas>` that means the *backing store*, not the CSS box: one drawn 480 wide and
+   * shown at `width: 100%` reports 0..479 whatever the window is doing. Anything else would make
+   * click-to-zoom land near the click at one window size and visibly wrong at every other.
    */
   i32 x;
   i32 y;
@@ -138,6 +147,19 @@ export struct Event {
  * did not choose and usually wants — to echo it, to derive an output name from it, or to decide
  * what it is.
  */
+/**
+ * What a child program wrote, once it has finished.
+ *
+ * Both streams, because a shell needs them apart: a program's diagnostics go to the terminal
+ * even when its output is piped into the next stage, and one buffer cannot say which was which.
+ */
+export struct Captured {
+  u8[] out;
+  u8[] err;
+
+  Captured of(u8[] out, u8[] err) { return Captured(out, err); }
+}
+
 export struct Picked {
   bool ok;
   string name;
@@ -345,6 +367,49 @@ export struct Core {
 }
 
 /** What a path is, if it is anything. Everything is zero or false when `exists` is false. */
+/**
+ * Why a filesystem change did not happen, in a form a program can act on.
+ *
+ * **Integers rather than an enum**, which is the opposite of `Read` above and for a reason that
+ * survives asking: a fault is *compared* (`rm -f` wants to know whether it was merely absent), and a
+ * wac enum is a reference type with no `==` — payload-less variants allocate, so even `is` would be
+ * false between two `NotFound`s. `ERR_*` in `packages/http` and `GRANT_*` below are the same shape
+ * for the same reason. If enums ever compare by value, this becomes one.
+ *
+ * A category *and* the host's message, because neither replaces the other: the category is what a
+ * program branches on, and the message is what a person reads. Matching the message's words to
+ * recover the category — which is what an applet had to do before this existed — is a guess about
+ * three operating systems.
+ */
+export i32 FAULT_NONE() { return 0; }
+export i32 FAULT_NOT_FOUND() { return 1; }
+export i32 FAULT_DENIED() { return 2; }
+export i32 FAULT_EXISTS() { return 3; }
+export i32 FAULT_NOT_EMPTY() { return 4; }
+/** The host said something this world has no category for; the message is all there is. */
+export i32 FAULT_OTHER() { return 5; }
+
+/** What a filesystem change answered. */
+export struct Change {
+  /** `FAULT_NONE` when it worked. */
+  i32 fault;
+  /** The host's own words, and empty when it worked. */
+  string message;
+
+  Change of(i32 fault, string message) { return Change(fault, message); }
+
+  bool ok(const this) { return this.fault == FAULT_NONE(); }
+
+  /**
+   * Whether the thing was simply not there — the one case `rm -f` is allowed to ignore.
+   *
+   * Before this, `remove` answered a message and `rm -f` had to ask `stat` first, which is both an
+   * extra call and a race: a file can vanish between the two. Asking the failure itself cannot race
+   * with anything.
+   */
+  bool absent(const this) { return this.fault == FAULT_NOT_FOUND(); }
+}
+
 export struct Stat {
   bool exists;
   bool isFile;
@@ -352,9 +417,18 @@ export struct Stat {
   i64 size;
   /** Milliseconds since the epoch, or 0 where the host does not say. */
   i64 modifiedMillis;
+  /**
+   * Whether the path itself is a symbolic link.
+   *
+   * **Always false from `stat`**, which follows links and therefore describes what one leads to.
+   * `linkStat` is the one that answers this. Both exist because both questions are real: `find`
+   * wants to know whether to descend into what a name leads to, and `tar` wants to know whether the
+   * name is a link before it stores anything.
+   */
+  bool isSymlink;
 
-  Stat of(bool exists, bool isFile, bool isDir, i64 size, i64 modifiedMillis) {
-    return Stat(exists, isFile, isDir, size, modifiedMillis);
+  Stat of(bool exists, bool isFile, bool isDir, i64 size, i64 modifiedMillis, bool isSymlink) {
+    return Stat(exists, isFile, isDir, size, modifiedMillis, isSymlink);
   }
 }
 
@@ -379,6 +453,15 @@ export struct Stat {
 export struct Socket {
   i32 handle;      // negative when `error` is set
   string error;
+
+  /**
+   * Declared here rather than left to bindgen, because the host builds these.
+   *
+   * bindgen emits a constructor for a struct that has none, and its name carries the `$` that marks
+   * a generated identifier — so relying on it means the host reaches for a name no wac source
+   * mentions. Two lines here and the capability world states its own construction API.
+   */
+  Socket of(i32 handle, string error) { return Socket(handle, error); }
 }
 
 /**
@@ -409,8 +492,29 @@ export const i32 GRANT_NET = 4;
 export const i32 GRANT_ENV = 8;
 
 export struct Child {
-  i32 handle;      // negative when `error` is set
+  /**
+   * The child's handle, or a negative number and an `error`.
+   *
+   * Two negatives, and the difference is the caller's whole decision:
+   *
+   *   -1  this program exists and would not start — `packages/sh` reports 126, as a shell does for
+   *       a file that is not executable
+   *   -2  **this world has no `spawn` at all**, so nothing was attempted and nothing is wrong with
+   *       the program. A caller with another route should take it
+   *
+   * Without the second, a world that cannot spawn made every spawnable name *fail* rather than fall
+   * through: in the browser shell, `WACPATH=/b` with a file named `wc` in it reported
+   * "no handler for capability 27" and exit 126, hiding `packages/box`'s own `wc`, which was sitting
+   * right there and works. A missing capability is not a broken program.
+   */
+  i32 handle;
   string error;
+
+  /** As `Socket.of`: the host builds these, so the constructor is declared rather than generated. */
+  Child of(i32 handle, string error) { return Child(handle, error); }
+
+  /** Whether this world can spawn at all. False says nothing about the program. */
+  bool unavailable(const this) { return this.handle == -2; }
 }
 
 export struct Cli {
@@ -433,17 +537,59 @@ export struct Cli {
    * — and `fn[bool(u8[])]` has no spare parameter, so an adapter has nowhere to keep one.
    */
   fn[bool(u8[])] write;
+  /**
+   * Exactly these bytes on standard error, with the same shape and the same absence of a grant.
+   *
+   * `warn` is the program talking about itself: a diagnostic *line*, which is what every applet in
+   * `packages/box` wants and what it should keep using. This is the program passing bytes through,
+   * and the two are different jobs rather than one with a redundant spelling.
+   *
+   * `packages/ssh` is why it exists. A remote command's two streams arrive interleaved and tagged,
+   * in the order the command wrote them, and with only `warn` the client could reproduce standard
+   * output exactly and standard error not at all: emitting per packet inserted a newline at every
+   * boundary, so it had to buffer to the end, which lost the ordering — and mangled anything that
+   * was not valid UTF-8, since `warn` takes a string. wac-mono issue 0014.
+   *
+   * No grant, for the reason `write` has none: what a program prints is the user's own doing.
+   */
+  fn[bool(u8[])] writeErr;
 
   fn[Pending<FileResult>(string)] readFile;
-  /** True when the write succeeded. */
-  fn[Pending<bool>(string, u8[])] writeFile;
+  /**
+   * **Answers a `Change`**: a fault category and the host's message. A `bool` could say that a write
+   * failed and never why, and a bare message could say why to a person but not to a program.
+   *
+   * That mattered more than it looks. `rm -f` could only suppress every failure or none, because
+   * "no such file" and "permission denied" arrived as the same `false`; `find` could report that a
+   * directory was unreadable but not that it was a mount point rather than a typo; and every
+   * `writeFile` diagnostic in this repo was the applet's guess at what had gone wrong. The message
+   * is the host's own, which is the only one that knows.
+   */
+  fn[Pending<Change>(string, u8[])] writeFile;
   /** What a path is. `exists` is false where the filesystem was not granted. */
   fn[Pending<Stat>(string)] stat;
+  /**
+   * `stat` without following the last component: the link, not its target.
+   *
+   * A separate capability rather than a flag on `stat`, and rather than making `stat` stop
+   * following, because every caller in this repo wants the followed answer — `find` and `du` ask
+   * "is this a directory I should walk into", and that is a question about the target. Doing both
+   * syscalls inside `stat` would have doubled the cost of every directory walk to serve the one
+   * applet that cares.
+   *
+   * `tar` is that applet: its header says symbolic links are refused, and until this existed it
+   * could not tell one from the thing it points at, so a link to a directory was archived as the
+   * directory and a cycle grew the path until something trapped.
+   *
+   * A host with no links answers exactly as `stat` does, `isSymlink` false — that is true rather
+   * than a stand-in, since the Origin Private File System has none.
+   */
+  fn[Pending<Stat>(string)] linkStat;
   /** Names within a directory, or null if it is not one — or not permitted. */
   fn[Pending<string[]?>(string)] readDir;
 
   /**
-   * Making, unmaking and moving. All three answer with whether they worked.
+   * Making, unmaking and moving. All three answer a `Change`, as `writeFile` does.
    *
    * `writeFile` alone cannot express a safe update: it truncates and then fills, so a
    * reader arriving in between sees a half-written file, and a crash leaves one. With
@@ -455,9 +601,9 @@ export struct Cli {
    * caller has to ask for the recursive form, because the recursive form is the one that
    * can destroy something it was not pointed at.
    */
-  fn[Pending<bool>(string, bool)] mkdir;
-  fn[Pending<bool>(string, bool)] remove;
-  fn[Pending<bool>(string, string)] rename;
+  fn[Pending<Change>(string, bool)] mkdir;
+  fn[Pending<Change>(string, bool)] remove;
+  fn[Pending<Change>(string, string)] rename;
 
   /**
    * Streaming input: `openInput` chooses the source, `readChunk` pulls from it.
@@ -508,7 +654,21 @@ export struct Cli {
    * `stat(path)`, `recv(handle)`, `connect(host)`. Those are the ones a program has reason
    * to have several of at once.
    */
-  fn[u8[]()] readChunk;
+  fn[Read()] readChunk;
+  /**
+   * Why the last `write` or `writeErr` answered false: the empty string when the other end simply
+   * went away, and the host's message when the write itself failed.
+   *
+   * One question for both streams rather than two, because no caller has ever needed to know *which*
+   * stream failed — a program asks this to decide between exiting 0 and reporting a real failure, and
+   * that decision is the same either way. If one ever does need to tell them apart, that is the point
+   * to split it, and the split will be visible rather than guessed at.
+   *
+   * A closed pipe is an answer rather than an error — `yes | head -1` ends that way and should exit
+   * 0 — so the two have to be distinguishable. Without this a full disk and a departed reader were
+   * the same `false`, and every filter treated both as "my work here is done".
+   */
+  fn[Pending<string>()] outputError;
 
   /**
    * Where `write` goes. `openOutput("")` is standard output, which is where it starts.
@@ -543,7 +703,7 @@ export struct Cli {
   fn[Pending<Socket>(string, i32)] connect;
   fn[Pending<Socket>(i32)] listen;
   fn[Pending<Socket>(i32)] accept;
-  fn[Pending<u8[]>(i32)] recv;
+  fn[Pending<Read>(i32)] recv;
   fn[Pending<bool>(i32, u8[])] send;
   fn[void(i32)] closeSocket;
 
@@ -587,6 +747,29 @@ export struct Cli {
   fn[Pending<Child>(string, string[], i32)] spawn;
 
   /**
+   * **This same program again, as a child**, with these arguments and at most these grants.
+   *
+   * `spawn` needs a worker bundle from somewhere, and somewhere is a filesystem — which is fine on a
+   * command line and impossible in a browser tab, where there is no directory of programs and
+   * nothing to have put one there. So a page could spawn and had nothing to spawn, and
+   * `packages/box`'s applets ran *inside* the shell's own wasm instance with no boundary at all.
+   *
+   * Every built program already carries its own worker bundle: the launcher holds it as a string,
+   * because that is how it started the program in the first place. So "run me again" needs no file,
+   * no path and no grant of its own — the code is already here, and the argument is what decides
+   * which program it becomes. `box sort` is `box` with `sort` as its first argument, which is exactly
+   * what a multi-call binary is; a shell that can say that has sixty real programs instead of sixty
+   * function calls.
+   *
+   * The child runs `main`, never `page`, even when the program has both. A page is the top-level
+   * thing a person opened; a child is a program with a handle, and there is nowhere for it to draw.
+   *
+   * Grants are a ceiling of the parent's own, as with `spawn`: a shell that may read hands its
+   * children reading, and a program granted nothing cannot widen itself by spawning.
+   */
+  fn[Pending<Child>(string[], i32)] spawnSelf;
+
+  /**
    * End a spawned worker's standard input without stopping it.
    *
    * Distinct from `closeSocket`, which stops the child outright. A program that reads to the
@@ -597,6 +780,60 @@ export struct Cli {
 
   /** Wait for a spawned worker to finish. Negative if it failed to run at all. */
   fn[Pending<i32>(i32)] exitCode;
+  /**
+   * Where relative paths are resolved from, as the host sees it.
+   *
+   * A *read*, and nothing more: there is no `chdir`, because a mutable working directory is
+   * ambient state — it changes what every relative path in the program means, from anywhere, and
+   * that is the shape this world exists to avoid. A program that wants to move around keeps its
+   * own idea of where it is and passes whole paths, which is what `packages/sh` does.
+   *
+   * It is here because a program cannot otherwise answer "where am I", and the first thing
+   * anybody types into a new shell is `pwd`. Under Deno and Node it is the process's directory;
+   * in a browser it is `/`, the root of the Origin Private File System, because that is the
+   * honest answer rather than a fiction.
+   */
+  fn[Pending<string>()] cwd;
+
+  /**
+   * Run a program *inside* this one: the world a child sees, pushed and then popped.
+   *
+   * `pushChild` says what the next stretch of work is called and was given, what it reads, where
+   * its relative paths resolve from, and that its output is to be kept rather than written. `popChild` ends that and
+   * answers with what it wrote. Between the two, `arg` and `argCount` answer from `argv`,
+   * `readChunk` returns `stdin` and then end of input, `Core.log`, `write` and `Core.warn`
+   * accumulate, and every path is taken relative to `cwd`.
+   *
+   * `argv` is in the layout `box` uses — the program's own name first — because an applet that
+   * reads its arguments positionally rather than through a parser is reading that layout already.
+   * `Core.log` is captured along with `write` for the same kind of reason: it is where thirty of
+   * those applets send their output, so a capture that took only `write` would lose most of them
+   * silently. That is exactly what the first working version of this did.
+   *
+   * **Why this exists.** A shell has to run a program and keep its output, and in wac it cannot
+   * do that by handing the program a different `Cli`: there are no closures, so a substitute
+   * capability has nowhere to put what it collected. `packages/sh` therefore had its own small
+   * `cat`, `wc`, `grep` and nine more — implementations that existed only because the real ones
+   * could not be called. With this, `packages/box`'s applets run in the shell unchanged, and one
+   * `grep` serves both.
+   *
+   * **Why a scope rather than a `chdir`.** `cwd` above refuses to be settable because a mutable
+   * working directory changes what every relative path in a program means. This does not
+   * contradict that: it is a *child's* view, bounded by a matching `popChild`, and what the
+   * parent's own paths mean is unchanged before and after. That is also the honest fix for
+   * something `spawn` gets wrong today — a spawned program inherits the host's directory rather
+   * than the shell's, so `cd sub; prog f` looks in the wrong place.
+   *
+   * Nesting is a stack, so a program that runs a program that runs a program is fine. A
+   * `popChild` with nothing pushed answers with two empty arrays rather than failing: the
+   * caller has nothing to clean up, and there is no state to corrupt.
+   *
+   * This is *not* isolation. The child is the same wasm instance with the same authority; it can
+   * still open any file the parent could. A real boundary is `spawn`, which is a separate worker
+   * with its own grants — and which a browser cannot do yet.
+   */
+  fn[Pending<bool>(string[], u8[], string)] pushChild;
+  fn[Pending<Captured>()] popChild;
 
 
   Cli of(
@@ -605,30 +842,38 @@ export struct Cli {
     fn[Pending<string?>(string)] env,
     fn[Pending<u8[]>()] readStdin,
     fn[bool(u8[])] write,
+    fn[bool(u8[])] writeErr,
     fn[Pending<FileResult>(string)] readFile,
-    fn[Pending<bool>(string, u8[])] writeFile,
+    fn[Pending<Change>(string, u8[])] writeFile,
     fn[Pending<Stat>(string)] stat,
+    fn[Pending<Stat>(string)] linkStat,
     fn[Pending<string[]?>(string)] readDir,
-    fn[Pending<bool>(string, bool)] mkdir,
-    fn[Pending<bool>(string, bool)] remove,
-    fn[Pending<bool>(string, string)] rename,
+    fn[Pending<Change>(string, bool)] mkdir,
+    fn[Pending<Change>(string, bool)] remove,
+    fn[Pending<Change>(string, string)] rename,
     fn[Pending<string>(string)] openInput,
-    fn[u8[]()] readChunk,
+    fn[Read()] readChunk,
+    fn[Pending<string>()] outputError,
     fn[Pending<string>(string)] openOutput,
     fn[Pending<Socket>(string, i32)] connect,
     fn[Pending<Socket>(i32)] listen,
     fn[Pending<Socket>(i32)] accept,
-    fn[Pending<u8[]>(i32)] recv,
+    fn[Pending<Read>(i32)] recv,
     fn[Pending<bool>(i32, u8[])] send,
     fn[void(i32)] closeSocket,
     fn[Pending<Child>(string, string[], i32)] spawn,
+    fn[Pending<Child>(string[], i32)] spawnSelf,
     fn[void(i32)] closeFeed,
-    fn[Pending<i32>(i32)] exitCode
+    fn[Pending<i32>(i32)] exitCode,
+    fn[Pending<string>()] cwd,
+    fn[Pending<bool>(string[], u8[], string)] pushChild,
+    fn[Pending<Captured>()] popChild
   ) {
     return Cli(
-      argCount, arg, env, readStdin, write, readFile, writeFile, stat, readDir,
-      mkdir, remove, rename, openInput, readChunk, openOutput,
-      connect, listen, accept, recv, send, closeSocket, spawn, closeFeed, exitCode
+      argCount, arg, env, readStdin, write, writeErr, readFile, writeFile, stat, linkStat, readDir,
+      mkdir, remove, rename, openInput, readChunk, outputError, openOutput,
+      connect, listen, accept, recv, send, closeSocket, spawn, spawnSelf, closeFeed, exitCode, cwd,
+      pushChild, popChild
     );
   }
 }

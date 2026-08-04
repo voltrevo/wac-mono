@@ -69,3 +69,16 @@ The hazard to know about: `cov.ts` is a second workload written by hand, so it d
 from the test suite it is meant to measure. Twice now it has reported a branch as
 uncovered that the tests do cover, and once the reverse. When it disagrees with the
 suite, the suite is right and `cov.ts` needs the input adding.
+
+## `Read`, and why it lives here
+
+`src/read.wac` holds one enum: `Data(bytes)`, `End`, `Failed(why)` — what a read answered.
+
+It is here rather than in `packages/platform` because of who has to name it. The streaming transforms
+in `gzip` and `stream` take their source as a funcref, and `platform` hands `cli.readChunk` to them
+directly; wac has no closures, so nothing can sit in between converting one shape to another.
+Whatever a read answers is therefore a type that both a capability world and two pure algorithm
+packages must name — and `bytes` is the only package below all of them.
+
+The shape exists because `u8[]` had a hole in it: an empty array meant both "finished" and "failed",
+so every filter in the repo treated a dying disk as a completed file and exited 0.

@@ -33,6 +33,13 @@ export void writeValue(Buf out, JsonValue v) {
       // has no span and is formatted to its shortest round-tripping decimal.
       if (raw.len() > 0) {
         out.pushAll(raw);
+      } else if (value - value != 0.0) {
+        // NaN and ±Infinity, which that subtraction is false for and every finite value is true
+        // for. JSON has no spelling for either, and the float formatter happily wrote the
+        // JavaScript ones — `NaN`, `Infinity` — so a hand-built tree serialised to text this
+        // package's own parser rejects. `JSON.stringify` writes `null` for them, and being judged
+        // against `JSON.stringify` is the claim this file makes, so it writes `null` too.
+        out.pushAll(u8[]('n', 'u', 'l', 'l'));
       } else {
         writeF64(out, value);
       }
@@ -67,9 +74,32 @@ export void writeValue(Buf out, JsonValue v) {
 // Quote and escape a UTF-8 byte string. Only the characters JSON requires are
 // escaped — quote, backslash, and anything below a space — so multi-byte UTF-8
 // passes through untouched, which matches what JSON.stringify emits.
+/**
+ * A JSON string literal.
+ *
+ * **Not every `u8[]` is text.** A parsed string was UTF-8 by the time it got here, but
+ * `JsonValue.Str` takes raw bytes, so a hand-built one may hold anything — and every byte at or
+ * above space used to be copied through unchanged. `Str(u8[](0xFF))` therefore produced output that
+ * this package's own parser rejects, which is the one thing a serialiser must not do. Each
+ * ill-formed byte becomes U+FFFD, matching what `Buf.pushCodepoint` does with a non-scalar.
+ *
+ * Well-formed multi-byte sequences are copied whole rather than byte by byte, because the escaping
+ * below only concerns ASCII and a continuation byte must never be looked at as though it were a
+ * character.
+ */
 export void writeString(Buf out, u8[] bytes) {
   out.push('"');
   for (i32 i = 0; i < bytes.len(); i++) {
+    i32 width = sequenceLen(bytes, i);
+    if (width == 0) {
+      out.pushAll(u8[](0xEF, 0xBF, 0xBD));       // U+FFFD, for one ill-formed byte
+      continue;
+    }
+    if (width > 1) {
+      for (i32 k = 0; k < width; k++) { out.push(bytes[i + k]); }
+      i = i + width - 1;
+      continue;
+    }
     i32 c = bytes[i];
     switch (c) {
       case '"':  { out.push('\\'); out.push('"'); }
@@ -105,4 +135,38 @@ void writeUnicodeEscape(Buf out, i32 c) {
 i32 hexChar(i32 nibble) {
   if (nibble < 10) { return '0' + nibble; }
   return 'a' + (nibble - 10);
+}
+
+/**
+ * The length of the well-formed UTF-8 sequence starting at `i`, or 0 if there is not one.
+ *
+ * The lead-byte ranges are the ones RFC 3629 actually allows, which is narrower than "any byte with
+ * the right high bits": C0 and C1 could only ever encode something overlong, ED A0..BF is a
+ * surrogate, and F4 90.. is past U+10FFFF. Accepting those is how a validator lets through the
+ * sequences that make two decoders disagree.
+ */
+i32 sequenceLen(u8[] b, i32 i) {
+  i32 c = b[i];
+  if (c < 0x80) { return 1; }
+  if (c >= 0xC2 && c <= 0xDF) { return cont(b, i, 1) ? 2 : 0; }
+  if (c == 0xE0) { return between(b, i + 1, 0xA0, 0xBF) && cont(b, i, 2) ? 3 : 0; }
+  if (c >= 0xE1 && c <= 0xEC) { return cont(b, i, 2) ? 3 : 0; }
+  if (c == 0xED) { return between(b, i + 1, 0x80, 0x9F) && cont(b, i, 2) ? 3 : 0; }
+  if (c >= 0xEE && c <= 0xEF) { return cont(b, i, 2) ? 3 : 0; }
+  if (c == 0xF0) { return between(b, i + 1, 0x90, 0xBF) && cont(b, i, 3) ? 4 : 0; }
+  if (c >= 0xF1 && c <= 0xF3) { return cont(b, i, 3) ? 4 : 0; }
+  if (c == 0xF4) { return between(b, i + 1, 0x80, 0x8F) && cont(b, i, 3) ? 4 : 0; }
+  return 0;
+}
+
+/** Whether the `n` bytes after `i` are all continuations, and all present. */
+bool cont(u8[] b, i32 i, i32 n) {
+  for (i32 k = 1; k <= n; k++) {
+    if (!between(b, i + k, 0x80, 0xBF)) { return false; }
+  }
+  return true;
+}
+
+bool between(u8[] b, i32 at, i32 lo, i32 hi) {
+  return at < b.len() && b[at] >= lo && b[at] <= hi;
 }

@@ -17,6 +17,13 @@ import { wacCompile } from "wac/wacCompile.ts";
 import { wacBindgen } from "wac/wacBindgen.ts";
 import { wacFiles } from "../../harness/wacFiles.ts";
 import { checkWacVersion } from "../../harness/wacVersion.ts";
+import {
+  cached,
+  compilerKeyParts,
+  contentKey,
+  filesParts,
+  harnessKeyParts,
+} from "../../harness/buildCache.ts";
 
 /**
  * What the built file asks Deno for: exactly the capabilities granted, and nothing else.
@@ -115,7 +122,14 @@ export type Target = "deno" | "node" | "browser";
  * leaving a bare TypeError. Opening it with `file://` will not work either, for the same
  * reason plus module workers.
  */
-const PAGE = `<!doctype html>
+/**
+ * The page for a command-line program run in a browser.
+ *
+ * This one is a harness and reads as one: the entry point's name as a heading, and a note about
+ * the query string, because `?a=…` is genuinely how you pass arguments to a `main` here and there
+ * is nowhere else to say so.
+ */
+const PAGE_CLI = `<!doctype html>
 <meta charset="utf-8">
 <title>%TITLE%</title>
 <style>
@@ -126,8 +140,6 @@ const PAGE = `<!doctype html>
 </style>
 <h1>%TITLE%</h1>
 <p class="meta">Arguments come from the query string: <code>?a=first&amp;a=second</code>.</p>
-<!-- What page.render replaces. Above the log rather than instead of it, so an interactive
-     application can still log and be seen, and a non-interactive one leaves it empty. -->
 <div id="app"></div>
 <pre id="out"></pre>
 <script type="module">
@@ -135,6 +147,104 @@ const PAGE = `<!doctype html>
 </script>
 `;
 
+/**
+ * The page for an interactive application — one that exports \`page\`.
+ *
+ * Bare on purpose. The chrome above is furniture for a harness, and on an application it was
+ * worse than noise: every one of them opened with its own filename as a heading and a sentence
+ * about a query string it never reads. An interactive program owns the document, so it gets an
+ * empty one, and \`render\` may bring its own \`<style>\` — innerHTML applies it.
+ *
+ * The log stays, because \`core.log\` has to go somewhere and a program that warns before it
+ * draws would otherwise do so invisibly. It is empty until something is written to it.
+ */
+const PAGE_APP = `<!doctype html>
+<meta charset="utf-8">
+<title>%TITLE%</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; padding: 0;
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: Canvas; color: CanvasText;
+  }
+  #out { margin: 0; padding: 0 1rem; white-space: pre-wrap; word-break: break-word;
+         font: 13px/1.5 ui-monospace, monospace; }
+  #out:empty { display: none; }
+  .warn { color: #b00; }
+  .meta { opacity: 0.6; }
+</style>
+<div id="app"></div>
+<pre id="out"></pre>
+<script type="module">
+%LAUNCHER%
+</script>
+`;
+
+/**
+ * The cache key for a built application, or null when it cannot be computed.
+ *
+ * `host/` is in the key because the bundle *is* that code: a fix to `deno.ts` changes every built
+ * program, and a cache that missed it would hand back binaries with the old host and report a pass.
+ * Null — an unreadable compiler or harness — means do not cache at all, rather than assume.
+ */
+export async function appKeyParts(
+  entry: string,
+  files: Map<string, string>,
+  grants: Grants,
+  target: Target,
+  workerOnly: boolean,
+): Promise<string[] | null> {
+  const compiler = await compilerKeyParts();
+  const harness = await harnessKeyParts();
+  if (compiler === null || harness === null) return null;
+  let host: string[];
+  try {
+    const dir = decodeURIComponent(new URL("./host/", import.meta.url).pathname);
+    const names: string[] = [];
+    for await (const e of Deno.readDir(dir)) {
+      if (e.isFile && e.name.endsWith(".ts")) names.push(e.name);
+    }
+    names.sort();
+    host = [];
+    for (const name of names) host.push(name, await Deno.readTextFile(dir + name));
+    host.push("build.ts", await Deno.readTextFile(new URL(import.meta.url)));
+  } catch {
+    return null;
+  }
+  return [
+    "app",
+    entry,
+    JSON.stringify(grants),
+    target,
+    String(workerOnly),
+    ...compiler,
+    ...harness,
+    ...host,
+    ...filesParts(files),
+  ];
+}
+
+async function appKey(
+  entry: string,
+  files: Map<string, string>,
+  grants: Grants,
+  target: Target,
+  workerOnly: boolean,
+): Promise<string | null> {
+  const parts = await appKeyParts(entry, files, grants, target, workerOnly);
+  return parts === null ? null : await contentKey(parts);
+}
+
+/**
+ * Build a wac program into a self-contained application at `out`.
+ *
+ * The build itself is cached by the content of everything that goes into it — see
+ * `harness/buildCache.ts`. That matters more here than anywhere: a build is a whole-program compile
+ * plus two `deno bundle` subprocesses, `packages/box`'s tests want twenty-seven of them from the
+ * same source with different grants baked in, and five other test files ask for programs that were
+ * already built. Cold, this is what it always was; warm, it is a file copy.
+ */
 export async function buildApp(
   entry: string,
   out: string,
@@ -143,8 +253,49 @@ export async function buildApp(
   workerOnly = false,
 ): Promise<void> {
   checkWacVersion();
+  const files = await wacFiles(entry);
+  // A page and a worker bundle are not runnable by themselves, so neither gets the execute bit.
+  const executable = !workerOnly && target !== "browser";
 
-  const r = wacCompile(await wacFiles(entry), entry);
+  const key = await appKey(entry, files, grants, target, workerOnly);
+  if (key !== null) {
+    const artifact = await cached("app", key, "", async (tmp) => {
+      await Deno.writeTextFile(tmp, await produceApp(entry, files, grants, target, workerOnly));
+    });
+    await place(await Deno.readTextFile(artifact), out, executable);
+    return;
+  }
+  await place(await produceApp(entry, files, grants, target, workerOnly), out, executable);
+}
+
+/**
+ * Write the finished text where it was asked for.
+ *
+ * Written beside the destination and renamed into place, rather than written where it will be run
+ * from. Two reasons, one of which cost a red suite. A path that has just been open for writing can
+ * fail to execute with `ETXTBSY` — `Text file busy` — and the window is small enough that a test
+ * which builds and immediately spawns hits it only under load, which is exactly when it is least
+ * welcome: `box`'s TCP test failed that way once in a full run and passed alone every time. A rename
+ * means the executable was never the file being written. It is also atomic, so a build interrupted
+ * halfway leaves the previous binary rather than a truncated one that starts and then stops making
+ * sense.
+ */
+async function place(text: string, out: string, executable: boolean): Promise<void> {
+  const partial = out + ".partial";
+  await Deno.writeTextFile(partial, text);
+  if (executable) await Deno.chmod(partial, 0o755);
+  await Deno.rename(partial, out);
+}
+
+/** Compile, bundle and assemble — everything a build does before it is put anywhere. */
+async function produceApp(
+  entry: string,
+  files: Map<string, string>,
+  grants: Grants,
+  target: Target,
+  workerOnly: boolean,
+): Promise<string> {
+  const r = wacCompile(files, entry);
   if (!r.ok) {
     throw new Error(
       `${entry} did not compile:\n` +
@@ -282,32 +433,19 @@ export async function buildApp(
     // by `postMessage` and runs the application on it. That is exactly what `spawn` takes,
     // so this is how a wac program becomes a *child* rather than a program of its own.
     //
-    // No shebang and no execute bit — it is not runnable by itself, and pretending otherwise
-    // would invite someone to try.
-    if (workerOnly) {
-      await Deno.writeTextFile(out, workerSource);
-      return;
-    }
+    // No shebang — it is not runnable by itself, and pretending otherwise would invite
+    // someone to try.
+    if (workerOnly) return workerSource;
     if (target === "browser") {
-      // A page, not an executable: no shebang and no execute bit.
+      // A page, not an executable.
       const title = entry.split("/").pop() ?? "wac";
-      await Deno.writeTextFile(out, PAGE.replaceAll("%TITLE%", title).replace("%LAUNCHER%", launcher));
-      return;
+      // Which document depends on which entry point the module has. The compiler already told
+      // us: a `page` export is an interactive application and gets the bare one.
+      const interactive = r.compiled.exports.some((e) => e.name === "page");
+      const template = interactive ? PAGE_APP : PAGE_CLI;
+      return template.replaceAll("%TITLE%", title).replace("%LAUNCHER%", launcher);
     }
-    // Written beside the destination and renamed into place, rather than written where it
-    // will be run from.
-    //
-    // Two reasons, one of which cost a red suite. A path that has just been open for writing
-    // can fail to execute with `ETXTBSY` — `Text file busy` — and the window is small enough
-    // that a test which builds and immediately spawns hits it only under load, which is
-    // exactly when it is least welcome: `box`'s TCP test failed that way once in a full run
-    // and passed alone every time. A rename means the executable was never the file being
-    // written. It is also atomic, so a build interrupted halfway leaves the previous binary
-    // rather than a truncated one that starts and then stops making sense.
-    const partial = out + ".partial";
-    await Deno.writeTextFile(partial, shebangFor(grants, target) + launcher);
-    await Deno.chmod(partial, 0o755);
-    await Deno.rename(partial, out);
+    return shebangFor(grants, target) + launcher;
   } finally {
     await Deno.remove(work, { recursive: true });
   }

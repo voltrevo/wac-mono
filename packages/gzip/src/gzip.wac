@@ -7,6 +7,7 @@
 // starts.
 
 import { Buf } from "../../bytes/src/buf.wac";
+import { Read } from "../../bytes/src/read.wac";
 import { crc32, crc32Start, crc32Finish, crc32Update, crcTable8 } from "./crc32.wac";
 import { deflateFixed, deflateDynamic, lz77Range, writeDynamicBlock, Tokens } from "./deflate.wac";
 import { BitWriter } from "./bitwriter.wac";
@@ -186,7 +187,7 @@ i32 historyBytes() { return 32768; }
  *
  * Returns 0. Traps on nothing: any byte sequence is compressible.
  */
-export i32 gzipStream(fn[u8[]()] read, fn[bool(u8[])] write) {
+export i32 gzipStream(fn[Read()] read, fn[bool(u8[])] write) {
   BitWriter w = BitWriter.create();
   Tables t = Tables.create();
   header(w.out);
@@ -199,19 +200,24 @@ export i32 gzipStream(fn[u8[]()] read, fn[bool(u8[])] write) {
   Buf buf = Buf.create();
   i32 history = 0;             // bytes of `buf` that are history rather than fresh input
   bool done = false;           // the source is spent
+  bool broken = false;         // ...because it failed, not because it ended
   bool wroteFinal = false;     // the block with BFINAL set has been written
 
   while (!wroteFinal) {
     // Fill up to a chunk of fresh input. A short read is not end of input; only an empty
     // one is, so this keeps asking until there is enough or the source is spent.
     while (buf.len - history < chunkBytes() && !done) {
-      u8[] next = read();
-      if (next.len() == 0) {
-        done = true;
-      } else {
-        buf.pushAll(next);
-        crc = crc32Update(table, crc, next);
-        isize += next.len();
+      // Three states, and `broken` is the one that used to be invisible: an empty answer meant
+      // both "finished" and "the read failed", so a compressor over a dying disk produced a
+      // *valid* gzip of half the input, with a CRC over half the input, and said nothing.
+      match (read()) {
+        case Data(bytes): {
+          buf.pushAll(bytes);
+          crc = crc32Update(table, crc, bytes);
+          isize += bytes.len();
+        }
+        case End: { done = true; }
+        case Failed(why): { done = true; broken = true; }
       }
     }
 
@@ -274,7 +280,9 @@ export i32 gzipStream(fn[u8[]()] read, fn[bool(u8[])] write) {
   w.out.pushU32(crc32Finish(crc));
   w.out.pushU32(isize as@ u32);
   write(w.out.take());
-  return 0;
+  // The archive is well-formed either way; `broken` is the difference between "this is your data
+  // compressed" and "this is the first part of your data compressed".
+  return broken ? 1 : 0;
 }
 
 i32 imin32(i32 a, i32 b) {

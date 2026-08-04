@@ -1,0 +1,49 @@
+// Paths, as a shell has to think about them.
+//
+// `packages/platform` has a `cwd` to read and deliberately no `chdir`: a mutable working directory
+// is ambient state, and changing it would change what every relative path in the program means
+// from anywhere. So the shell keeps its own idea of where it is and turns every path into a whole
+// one before it crosses the boundary.
+//
+// These live in their own file because both `exec.wac` and `program.wac` need them and `exec.wac`
+// already imports `program.wac` — putting them in either would be a cycle or a copy.
+
+/**
+ * Collapse `.`, `..` and repeated slashes in an absolute path.
+ *
+ * `..` above the root stays at the root, as every shell does: `cd /; cd ..; pwd` is `/` and not an
+ * error, and treating it as one would be a novelty nobody asked for.
+ */
+export string normalise(string path) {
+  u8[] b = path.toBytes();
+  string[] parts = string[64](fill: "");
+  i32 n = 0;
+  i32 at = 0;
+  while (at < b.len()) {
+    i32 end = at;
+    while (end < b.len() && b[end] != '/') { end++; }
+    if (end > at) {
+      u8[] seg = u8[end - at](fill: 0);
+      seg.copyFrom(b, at, 0, end - at);
+      string name = string.fromBytes(seg);
+      if (name == "..") {
+        if (n > 0) { n = n - 1; }
+      } else if (name != "." && n < 64) {
+        parts[n] = name;
+        n = n + 1;
+      }
+    }
+    at = end + 1;
+  }
+  if (n == 0) { return "/"; }
+  string out = "";
+  for (i32 i = 0; i < n; i++) { out = out + "/" + parts[i]; }
+  return out;
+}
+
+/** `path` as the host should see it: absolute, normalised, relative to `cwd`. */
+export string resolvePath(string cwd, string path) {
+  if (path == "") { return cwd; }
+  bool absolute = path.toBytes()[0] == '/';
+  return normalise(absolute ? path : (cwd == "/" ? "/" + path : cwd + "/" + path));
+}

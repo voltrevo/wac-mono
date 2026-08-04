@@ -31,18 +31,24 @@ export type AppModule = {
   Stat: { of(...a: unknown[]): unknown };
   Socket: { of(...a: unknown[]): unknown };
   /** The monomorphised `Pending<T>`s — one per capability return type. */
-  Pending_i32: { of(...a: unknown[]): unknown };
-  Pending_i64: { of(...a: unknown[]): unknown };
-  Pending_string: { of(...a: unknown[]): unknown };
-  Pending_stringOpt: { of(...a: unknown[]): unknown };
-  Pending_u8Arr: { of(...a: unknown[]): unknown };
-  Pending_bool: { of(...a: unknown[]): unknown };
-  Pending_stringArrOpt: { of(...a: unknown[]): unknown };
-  Pending_FileResult: { of(...a: unknown[]): unknown };
-  Pending_Stat: { of(...a: unknown[]): unknown };
-  Pending_Socket: { of(...a: unknown[]): unknown };
-  Pending_Child: { of(...a: unknown[]): unknown };
+  Pending$i32: { of(...a: unknown[]): unknown };
+  Pending$i64: { of(...a: unknown[]): unknown };
+  Pending$string: { of(...a: unknown[]): unknown };
+  Pending$stringOpt: { of(...a: unknown[]): unknown };
+  Pending$u8Arr: { of(...a: unknown[]): unknown };
+  Pending$bool: { of(...a: unknown[]): unknown };
+  Pending$stringArrOpt: { of(...a: unknown[]): unknown };
+  Pending$FileResult: { of(...a: unknown[]): unknown };
+  Pending$Stat: { of(...a: unknown[]): unknown };
+  Pending$Socket: { of(...a: unknown[]): unknown };
+  Pending$Child: { of(...a: unknown[]): unknown };
   Child: { of(...a: unknown[]): unknown };
+  Captured: { of(...a: unknown[]): unknown };
+  Pending$Captured: { of(...a: unknown[]): unknown };
+  Read: { Data(...a: unknown[]): unknown; End(): unknown; Failed(...a: unknown[]): unknown };
+  Change: { of(...a: unknown[]): unknown };
+  Pending$Change: { of(...a: unknown[]): unknown };
+  Pending$Read: { of(...a: unknown[]): unknown };
   main: (core: unknown, cli: unknown) => number;
 
   // Only an interactive browser application has these, and bindgen emits a class only for a
@@ -51,13 +57,14 @@ export type AppModule = {
   Page?: { of(...a: unknown[]): unknown };
   Event?: { of(...a: unknown[]): unknown };
   Picked?: { of(...a: unknown[]): unknown };
-  Pending_Event?: { of(...a: unknown[]): unknown };
-  Pending_Picked?: { of(...a: unknown[]): unknown };
+  Pending$Event?: { of(...a: unknown[]): unknown };
+  Pending$Picked?: { of(...a: unknown[]): unknown };
   /** The interactive entry point: draw, subscribe, and loop on `nextEvent`. */
   page?: (core: unknown, cli: unknown, page: unknown) => number;
 };
 
-type Start = { sab: SharedArrayBuffer };
+/** `child` is set by `spawnChild`: a spawned program runs `main`, never `page`. */
+type Start = { sab: SharedArrayBuffer; child?: boolean };
 type Result = { ok: true; code: number } | { ok: false; error: string };
 
 const onWorker = (): boolean =>
@@ -84,6 +91,12 @@ if (onWorker()) {
     if (deliver !== null) deliver(s);
     else buffered = s;
   };
+  // "This bundle parsed and evaluated." Sent before the application has done anything, and before
+  // the bridge has even arrived, because that is the one fact a parent cannot otherwise learn: a
+  // source that is not JavaScript fails at load, and until this existed the failure reached the
+  // parent as its own uncaught error and killed it. `children.ts` waits for either this or the
+  // load error before answering `spawn`. wac-mono issue 0021.
+  (self as unknown as { postMessage(m: unknown): void }).postMessage({ ready: true });
 }
 
 function firstMessage(): Promise<Start> {
@@ -147,28 +160,42 @@ async function runAsLauncher(workerSource: string, grants: Grants): Promise<void
     fs: { read: grants.read === true, write: grants.write === true },
     net: grants.net === true,
     env: grants.env === true ? (n) => Deno.env.get(n) : undefined,
+    // The program's own bundle, so `spawnSelf` has something to run. The launcher is the only
+    // place that has it: it is what started the program.
+    selfSource: workerSource,
   }));
 
   const url = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
   const worker = new Worker(url, { type: "module" });
   const finished = new Promise<number>((resolve, reject) => {
     worker.onmessage = (e: MessageEvent) => {
-      const m = e.data as Result;
+      const m = e.data as Result | { ready: true };
+      if ("ready" in m) return;    // the load notice; the launcher has nothing to do with it
       if (m.ok) resolve(m.code);
       else reject(new Error(m.error));
     };
-    worker.onerror = (e) => reject(new Error(e.message));
+    worker.onerror = (e) => {
+      // Contained, or Deno reports it a second time as *this* process's uncaught error — two
+      // messages for one failure, the second naming the launcher rather than the program.
+      e.preventDefault();
+      reject(new Error(e.message));
+    };
   });
   worker.postMessage({ sab: bridge.sab });
 
+  // The code leaves the block rather than being exited with inside it, because `Deno.exit` does
+  // not run `finally` — so this cleanup used to read as though it happened and never did. Here the
+  // process was ending anyway and the operating system took care of it; the same spelling in
+  // `app.ts` leaked a built executable per run until /tmp had 1.4GB of them.
+  let code = 70;
   try {
-    Deno.exit(await finished);
+    code = await finished;
   } catch (e) {
     console.error(`error: ${e instanceof Error ? e.message : String(e)}`);
-    Deno.exit(70);
   } finally {
     responder.stop();
     worker.terminate();
     URL.revokeObjectURL(url);
   }
+  Deno.exit(code);
 }

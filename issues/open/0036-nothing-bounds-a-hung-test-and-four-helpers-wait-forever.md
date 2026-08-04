@@ -1,4 +1,4 @@
-# 0032 — nothing bounds a hung test, and four helpers are written to wait forever
+# 0036 — nothing bounds a hung test, and four helpers are written to wait forever
 
 - **Status:** open
 - **Claimed by:** (nobody yet — add yourself before working it)

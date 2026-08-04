@@ -51,6 +51,17 @@ export i32 cmpBytes(u8[] a, u8[] b) {
  * real file. Stable, which `sort -u` then relies on to drop only adjacent equals.
  */
 export u8[][] mergeSort(u8[][] xs, i32 n) {
+  return mergeSortWith(xs, n, cmpBytes);
+}
+
+/**
+ * The same, ordered by whatever comparison you hand it.
+ *
+ * The comparison is a parameter because `sort -n` needs a different one and the merge itself is
+ * identical — the alternative was a second copy of a recursive sort differing in one call, which
+ * is where the stability bug would eventually have gone.
+ */
+export u8[][] mergeSortWith(u8[][] xs, i32 n, fn[i32(u8[], u8[])] cmp) {
   if (n <= 1) { return xs; }
   i32 mid = n / 2;
   i32 right = n - mid;
@@ -58,15 +69,64 @@ export u8[][] mergeSort(u8[][] xs, i32 n) {
   u8[][] r = u8[][right](fill: u8[0]());
   for (i32 i = 0; i < mid; i++) { l[i] = xs[i]; }
   for (i32 i = 0; i < right; i++) { r[i] = xs[mid + i]; }
-  u8[][] ls = mergeSort(l, mid);
-  u8[][] rs = mergeSort(r, right);
+  u8[][] ls = mergeSortWith(l, mid, cmp);
+  u8[][] rs = mergeSortWith(r, right, cmp);
 
   u8[][] out = u8[][n](fill: u8[0]());
   i32 li = 0;
   i32 ri = 0;
   for (i32 i = 0; i < n; i++) {
-    bool takeLeft = ri >= right || (li < mid && cmpBytes(ls[li], rs[ri]) <= 0);
+    // `<= 0` keeps the sort stable, which `-n` depends on: two lines with the same number come
+    // out in the order they arrived, as GNU's does.
+    bool takeLeft = ri >= right || (li < mid && cmp(ls[li], rs[ri]) <= 0);
     if (takeLeft) { out[i] = ls[li]; li++; } else { out[i] = rs[ri]; ri++; }
   }
   return out;
+}
+
+/**
+ * Lines by the number they begin with, for `sort -n`.
+ *
+ * Leading blanks and a sign are part of the number, as GNU has them. A line with no number at all
+ * counts as zero rather than sorting apart, which is also GNU's rule and the reason `sort -n` on
+ * mixed input looks stable rather than sorted — the non-numbers keep their order among the zeroes.
+ *
+ * **Integers only.** GNU compares decimals and thousands separators too. That is a real shortfall
+ * and is written down rather than discovered: `sort -n` over `1.5` and `1.25` here orders them by
+ * the `1` and then by nothing, so they stay as they came.
+ */
+export i32 cmpNumeric(u8[] a, u8[] b) {
+  i64 x = leadingNumber(a);
+  i64 y = leadingNumber(b);
+  if (x == y) { return 0; }
+  return x < y ? -1 : 1;
+}
+
+/**
+ * The integer a line starts with, after blanks, or zero if it does not start with one.
+ *
+ * **i64, and saturating.** In i32 it wrapped: `sort -n` over `4294967296 1 2147483648 -1` answered
+ * `2147483648 -1 4294967296 1`, and `-nu` merged `4294967296` with `0` because both keys came out
+ * the same — a distinct line silently dropped. Saturation rather than wrapping keeps the order
+ * monotonic for input wider than i64 as well; GNU compares those exactly, which needs arbitrary
+ * precision and is a bigger change than this bug.
+ */
+i64 leadingNumber(u8[] b) {
+  i32 i = 0;
+  while (i < b.len() && (b[i] == ' ' || b[i] == '\t')) { i++; }
+  bool negative = false;
+  if (i < b.len() && (b[i] == '-' || b[i] == '+')) {
+    negative = b[i] == '-';
+    i++;
+  }
+  i64 v = 0;
+  i64 cap = 922337203685477580;              // i64 max / 10, so the multiply below cannot overflow
+  bool saturated = false;
+  while (i < b.len() && b[i] >= '0' && b[i] <= '9') {
+    if (v > cap) { saturated = true; }
+    if (!saturated) { v = v * 10 + ((b[i] - '0') as i64); }
+    i++;
+  }
+  if (saturated) { return negative ? -9223372036854775807 : 9223372036854775807; }
+  return negative ? 0 - v : v;
 }

@@ -53,9 +53,9 @@ Deno.test("wacTestRun: a failing wac assertion surfaces its message", async () =
   const { instance } = await WebAssembly.instantiate(r.compiled.wasm as BufferSource, {});
   const ex = instance.exports as Record<string, CallableFunction>;
   const ref = ex.test_deliberately_fails();
-  const len = ex.__bind_str_len(ref) as number;
+  const len = ex.$bind$str_len(ref) as number;
   const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) bytes[i] = ex.__bind_str_get(ref, i) as number;
+  for (let i = 0; i < len; i++) bytes[i] = ex.$bind$str_get(ref, i) as number;
   const report = new TextDecoder().decode(bytes);
 
   if (report !== "1 failed: deliberate: got 1, want 2") {

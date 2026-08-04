@@ -18,6 +18,19 @@ Packages have de facto owners, so the rule is about who is likely to be mid-chan
 - **Work that is blocked on something else:** file it, with what it is waiting for.
   That is the difference between "nobody has done this" and "this cannot be done yet".
 
+## There are also issues on GitHub
+
+`github.com/voltrevo/wac-mono/issues` and `github.com/voltrevo/wac/issues` have reports from
+outside this container — sixteen of them as of 2026-08-03, filed by the owner from static
+inspection of `master`. **Look there before filing here**, because they are not visible from
+`INDEX.md` and duplicating one costs the same as duplicating anything else.
+
+They **are** mirrored in, as `0031`–`0040` here and `0065`–`0068` in `wac/issues/`, so that work in
+this container is visible from `INDEX.md` like everything else. The mirror is a stub: title, kind,
+whether it has been reproduced here, and a link. **Discussion belongs on GitHub**, where the reporter
+is — a mirror that grows its own argument is the drift this warns about. Close both when it is
+fixed.
+
 ## What does not belong here
 
 Three things already have homes, and duplicating them means two records that drift:

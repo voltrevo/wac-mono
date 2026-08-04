@@ -2,13 +2,13 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { slice } from "../lib/bytes.wac";
+import { baseName } from "../lib/path.wac";
 
 export i32 basename(Core core, Cli cli, Args a) {
   if (a.rest.len() < 1) { core.warn("usage: " + a.name + " <path>"); return 2; }
-  u8[] b = a.rest[0].toBytes();
-  i32 cut = 0;
-  for (i32 i = 0; i < b.len(); i++) { if (b[i] == '/') { cut = i + 1; } }
-  core.log(string.fromBytes(slice(b, cut, b.len())));
+  // The rules live in `lib/path.wac`, with `dirname`'s, because trailing slashes are the whole of
+  // both and they have to agree. This used to scan for the last `/` here, so `a/b/` answered with
+  // what follows the final slash: nothing.
+  core.log(string.fromBytes(baseName(a.rest[0].toBytes())));
   return 0;
 }

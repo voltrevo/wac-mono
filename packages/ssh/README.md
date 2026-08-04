@@ -227,10 +227,13 @@ key: adding is for unknown hosts.
 **An encrypted key needs `SSH_PASSPHRASE` in the environment**, for the same reason. That is worse
 than a prompt in every way except honesty.
 
-**Standard error arrives in one piece at the end**, not interleaved with standard output. The
-capability world has `write` for stdout as bytes but only `warn`, which is line-oriented, for the
-error channel, so byte-exact interleaving is not expressible — [issue
-0014](../../issues/open/0014-platform-has-no-way-to-write-bytes-to-standard-error.md).
+**Both streams arrive in the order the remote command wrote them.** The server tags them and sends
+them interleaved; the client puts each packet straight out, standard output through `write` and
+standard error through `writeErr`. It used to buffer standard error to the end of the run and emit it
+as one `warn`, because the world had no byte-level error stream: a per-packet `warn` inserted a
+newline at every packet boundary, the whole-run form lost the ordering, and output that was not valid
+UTF-8 was mangled by going through a string.
+[Issue 0014](../../issues/closed/0014-platform-has-no-way-to-write-bytes-to-standard-error.md).
 
 Argument joining matches OpenSSH: everything after the host becomes one command string joined with
 spaces, so `ssh host sh -c 'echo hi'` loses its quotes here exactly as it does there. Verified

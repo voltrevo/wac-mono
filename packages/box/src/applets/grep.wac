@@ -9,7 +9,7 @@ import { Input, openStream } from "../lib/input.wac";
 import { Line, Lines, nextLine } from "../lib/reader.wac";
 import { itoa } from "../lib/num.wac";
 import { compile, compileIgnoreCase, search, slotCount } from "../../../regex/src/regex.wac";
-import { Program, NO_MATCH } from "../../../regex/src/program.wac";
+import { Program, BUDGET, NO_MATCH } from "../../../regex/src/program.wac";
 
 export i32 grep(Core core, Cli cli, Args a) {
   if (a.rest.len() < 1) { core.warn("usage: " + a.name + " [-ivnc] <pattern> [file]"); return 2; }
@@ -33,7 +33,17 @@ export i32 grep(Core core, Cli cli, Args a) {
     Line l = nextLine(s, cli);
     if (!l.ok) { break; }
     n++;
-    bool hit = search(p, l.bytes, 0, caps, 1000000) != NO_MATCH();
+    i32 found = search(p, l.bytes, 0, caps, 1000000);
+    // Three answers, not two. `BUDGET` means the engine gave up backtracking on this line, and
+    // testing `!= NO_MATCH()` counted that as a match — so a pathological pattern reported hits it
+    // had never found, and `grep -c` counted them. Exiting 2 is what the real one does when it
+    // cannot answer, and it is the only honest status: neither "matched" nor "did not match" is
+    // known.
+    if (found == BUDGET()) {
+      core.warn(a.name + ": " + itoa(n) + ": pattern too expensive on this line, giving up");
+      return 2;
+    }
+    bool hit = found != NO_MATCH();
     if (hit == invert) { continue; }
     matches++;
     if (countOnly) { continue; }

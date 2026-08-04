@@ -23,8 +23,9 @@
 // picks an id from the path; `resolveFile` turns the id back into a `FileResult`. It reads
 // oddly and it is the only way to build a resolved ticket without state.
 
-import { Child, Cli, Core, FileResult, Pending, Socket, Stat }
-  from "../../../platform/src/platform.wac";
+import { Captured, Change, Child, Cli, Core, FAULT_DENIED, FAULT_NONE, FAULT_NOT_FOUND, FileResult,
+  Pending, Socket, Stat } from "../../../platform/src/platform.wac";
+import { Read } from "../../../bytes/src/read.wac";
 import { Shell, runScript } from "../../src/exec.wac";
 
 /** A ticket is always ready here, and dropping one does nothing. */
@@ -61,6 +62,7 @@ Pending<i32> fakeArgCount() { return Pending.of(0, resolveZeroI32, alwaysSettled
 Pending<string> fakeArg(i32 i) { return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop); }
 Pending<u8[]> fakeStdin() { return Pending.of(0, resolveStdin, alwaysSettled, ignoreDrop); }
 bool fakeWrite(u8[] data) { return true; }
+bool fakeWriteErr(u8[] data) { return true; }
 
 /** One name is set and one is not, so both sides of the environment fallback are reachable. */
 string? resolveEnv(i32 id) {
@@ -81,6 +83,7 @@ FileResult resolveFile(i32 id) {
   if (id == 4) { return FileResult.of(true, "runnable".toBytes(), ""); }
   if (id == 5) { return FileResult.of(true, "unrunnable".toBytes(), ""); }
   if (id == 6) { return FileResult.of(true, "vanishing".toBytes(), ""); }
+  if (id == 7) { return FileResult.of(true, "nospawnworld".toBytes(), ""); }
   return FileResult.of(false, u8[0](), "no such file");
 }
 Pending<FileResult> fakeReadFile(string path) {
@@ -91,6 +94,9 @@ Pending<FileResult> fakeReadFile(string path) {
   if (path == "/bin/prog") { which = 4; }
   if (path == "/bin/badprog") { which = 5; }
   if (path == "/bin/goneprog") { which = 6; }
+  // A name that also exists as one of the shell's own implementations, so that falling through can
+  // be told from failing: in a world with no `spawn` this must run `echo`, not report 126.
+  if (path == "/bin/echo") { which = 7; }
   // `/bin/ghost` exists as far as `stat` is concerned and cannot be read, which is not a
   // contrived case: another process removing it between the two calls is the ordinary race, and
   // the shell has to answer "no such command" rather than treat it as a failure to execute.
@@ -98,16 +104,44 @@ Pending<FileResult> fakeReadFile(string path) {
 }
 
 /** `out.txt` is writable and `readonly.txt` is not, so both paths through a redirection run. */
-Pending<bool> fakeWriteFile(string path, u8[] data) {
-  return Pending.of(path == "readonly.txt" ? 0 : 1, resolveFromId, alwaysSettled, ignoreDrop);
+/**
+ * The write outcome, as a `Change`.
+ *
+ * `readonly.txt` fails, so both branches of every caller are reachable — the fake cannot hold the
+ * answer itself, so it goes in the ticket's id and `resolveChange` decodes it.
+ */
+Pending<Change> fakeWriteFile(string path, u8[] data) {
+  return Pending.of(path == "readonly.txt" ? 2 : 0, resolveChange, alwaysSettled, ignoreDrop);
+}
+
+/**
+ * A change, by id: 0 worked, 1 was not there, 2 was refused.
+ *
+ * The ids are the fault numbers themselves, so this is the identity on the category and only the
+ * words are invented — a fake host is entitled to its own wording but not to its own taxonomy.
+ */
+Change resolveChange(i32 id) {
+  if (id == FAULT_NOT_FOUND()) { return Change.of(id, "no such file or directory"); }
+  if (id == FAULT_DENIED()) { return Change.of(id, "permission denied"); }
+  return Change.of(FAULT_NONE(), "");
 }
 
 /** Only the two programs under `/bin` exist, which is what makes a `$WACPATH` search decide. */
-Stat resolveStat(i32 id) { return Stat.of(id == 1, id == 1, false, 0, 0); }
+Stat resolveStat(i32 id) { return Stat.of(id == 1, id == 1, false, 0, 0, false); }
+
+/** Nothing here is a symbolic link, which a fake filesystem is entitled to say. */
+Pending<Stat> fakeLinkStat(string path) { return fakeStat(path); }
+
+/** Nothing went wrong with the last write, and nothing with the last recv. */
+Pending<string> fakeOutputError() { return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop); }
 Pending<Stat> fakeStat(string path) {
-  i32 there = (path == "/bin/prog" || path == "/bin/badprog" || path == "/bin/goneprog"
-               || path == "/bin/ghost") ? 1 : 0;
-  return Pending.of(there, resolveStat, alwaysSettled, ignoreDrop);
+  return Pending.of(present(path) ? 1 : 0, resolveStat, alwaysSettled, ignoreDrop);
+}
+
+/** What this filesystem has, in one place, so `stat` and `remove` cannot disagree. */
+bool present(string path) {
+  return path == "/bin/prog" || path == "/bin/badprog" || path == "/bin/goneprog"
+      || path == "/bin/ghost" || path == "/bin/echo";
 }
 
 string[]? resolveDir(i32 id) {
@@ -126,19 +160,35 @@ Pending<string[]?> fakeReadDir(string path) {
   return Pending.of(path == "dir" ? 1 : 0, resolveDir, alwaysSettled, ignoreDrop);
 }
 
-Pending<bool> fakeMkdir(string path, bool parents) {
-  return Pending.of(1, resolveTrue, alwaysSettled, ignoreDrop);
+Pending<Change> fakeMkdir(string path, bool parents) {
+  return Pending.of(FAULT_NONE(), resolveChange, alwaysSettled, ignoreDrop);
 }
-Pending<bool> fakeRemove(string path, bool recursive) {
-  return Pending.of(1, resolveTrue, alwaysSettled, ignoreDrop);
+
+/**
+ * Removing something this fake filesystem does not have is `NotFound`, exactly as `stat` reports it.
+ *
+ * Kept consistent with `fakeStat` on purpose: `rm -f` asks the *answer* whether the path was merely
+ * absent rather than asking `stat` first, so a fake that removed anything successfully would hide
+ * the branch that matters.
+ */
+Pending<Change> fakeRemove(string path, bool recursive) {
+  return Pending.of(present(path) ? FAULT_NONE() : FAULT_NOT_FOUND(), resolveChange, alwaysSettled,
+                    ignoreDrop);
 }
-Pending<bool> fakeRename(string from, string to) {
-  return Pending.of(1, resolveTrue, alwaysSettled, ignoreDrop);
+Pending<Change> fakeRename(string from, string to) {
+  return Pending.of(FAULT_NONE(), resolveChange, alwaysSettled, ignoreDrop);
 }
 Pending<string> fakeOpenInput(string path) {
   return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
 }
-u8[] fakeReadChunk() { return u8[0](); }
+/**
+ * A `Read`, always `End` — this fake filesystem has nothing to stream.
+ *
+ * The answer is built by a top-level resolver because a funcref cannot close over anything, which is
+ * the constraint this whole file is shaped by. `End` rather than `Data(empty)`: an empty `Data` is
+ * not a state the type admits.
+ */
+Read fakeReadChunk() { return Read.End; }
 Pending<string> fakeOpenOutput(string path) {
   return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
 }
@@ -153,7 +203,10 @@ Pending<Socket> fakeListen(i32 port) {
 Pending<Socket> fakeAccept(i32 handle) {
   return Pending.of(0, resolveSocket, alwaysSettled, ignoreDrop);
 }
-Pending<u8[]> fakeRecv(i32 handle) { return Pending.of(0, resolveBytes, alwaysSettled, ignoreDrop); }
+Read resolveEnd(i32 id) { return Read.End; }
+Pending<Read> fakeRecv(i32 handle) {
+  return Pending.of(0, resolveEnd, alwaysSettled, ignoreDrop);
+}
 Pending<bool> fakeSend(i32 handle, u8[] data) {
   return Pending.of(0, resolveFromId, alwaysSettled, ignoreDrop);
 }
@@ -170,8 +223,17 @@ void fakeCloseSocket(i32 handle) {}
 // only answer end-of-input; a fake that returned bytes would return them for ever and the read
 // loop would not finish. The branch that appends a chunk is covered by `test/spawn.test.ts`
 // against the real host instead, which is the only place a child can actually speak.
+/**
+ * A child, by id — and two ways of failing, because the shell must tell them apart.
+ *
+ * -1 is "it would not start", which is 126. -2 is "this world has no `spawn`", which is not a fact
+ * about the program at all: the shell falls through to its own implementations, as it does in a
+ * browser tab where a page cannot spawn.
+ */
 Child resolveChild(i32 id) {
-  return id > 0 ? Child(id, "") : Child(-1, "spawn not available");
+  if (id > 0) { return Child(id, ""); }
+  if (id == -2) { return Child(-2, "no spawn in this world"); }
+  return Child(-1, "spawn not available");
 }
 i32 resolveId(i32 id) { return id; }
 
@@ -181,7 +243,18 @@ Pending<Child> fakeSpawn(string source, string[] argv, i32 grants) {
   // Starts, then never reports a status — `exitCode` answers negative for it. The shell calls that
   // 126 rather than success, because by then it is a host problem and not the program's answer.
   if (source == "vanishing") { handle = 8; }
+  // A world with no `spawn` at all, which every host but Deno currently is.
+  if (source == "nospawnworld") { handle = -2; }
   return Pending.of(handle, resolveChild, alwaysSettled, ignoreDrop);
+}
+/**
+ * Running this program again, which the fake world cannot do — so it says so rather than pretending.
+ *
+ * -2 is "there is no `spawn` here", the answer every world that cannot gives, and the one a caller is
+ * expected to have another route for.
+ */
+Pending<Child> fakeSpawnSelf(string[] argv, i32 grants) {
+  return Pending.of(-2, resolveChild, alwaysSettled, ignoreDrop);
 }
 void fakeCloseFeed(i32 handle) {}
 i32 resolveNegative(i32 id) { return -1; }
@@ -198,11 +271,36 @@ Pending<i32> fakeExitCode(i32 handle) {
  */
 i32 fakeWaitAny(i32[] ids, i32 deadlineMillis) { return ids.len() > 0 ? ids[0] : -1; }
 
+/**
+ * The shell asks once, at startup, where relative paths land.
+ *
+ * A root, because a fake filesystem has no better answer and because it makes every path the
+ * probe resolves absolute and predictable — `resolvePath("/", "f")` is `/f`.
+ */
+Pending<string> fakeCwd() { return Pending.of(0, resolveRoot, alwaysSettled, ignoreDrop); }
+string resolveRoot(i32 id) { return "/"; }
+
+/**
+ * A child pushed here runs and writes nothing, which is what the shell alone should see.
+ *
+ * The probe has no `box` to hand the shell — that wiring is in `box/example/term.wac` — so the
+ * hook is never installed and these are reached only if something calls them directly. Answering
+ * with two empty streams keeps that a no-op rather than a crash.
+ */
+Pending<bool> fakePushChild(string[] argv, u8[] stdin, string cwd) {
+  return Pending.of(1, resolveFromId, alwaysSettled, ignoreDrop);
+}
+Captured resolveNothing(i32 id) { return Captured.of(u8[0](), u8[0]()); }
+Pending<Captured> fakePopChild() {
+  return Pending.of(0, resolveNothing, alwaysSettled, ignoreDrop);
+}
+
 Cli fakeCli() {
-  return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeReadFile, fakeWriteFile,
-                fakeStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
-                fakeReadChunk, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
-                fakeSend, fakeCloseSocket, fakeSpawn, fakeCloseFeed, fakeExitCode);
+  return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeWriteErr, fakeReadFile, fakeWriteFile,
+                fakeStat, fakeLinkStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
+                fakeReadChunk, fakeOutputError, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
+                fakeSend, fakeCloseSocket, fakeSpawn, fakeSpawnSelf, fakeCloseFeed, fakeExitCode,
+                fakeCwd, fakePushChild, fakePopChild);
 }
 
 // ── What the coverage driver calls ────────────────────────────────────────────
@@ -242,20 +340,31 @@ export i32 shWritten(string src) {
  */
 export i32 shTouchStubs() {
   Cli c = fakeCli();
-  i32 n = c.argCount().wait() + c.arg(0).wait().len() + c.readStdin().wait().len()
-        + c.readChunk().len();
+  i32 n = c.argCount().wait() + c.arg(0).wait().len() + c.readStdin().wait().len();
+  // Every state of a read, so the coverage driver touches all three arms rather than whichever one
+  // the fake happens to produce.
+  match (c.readChunk()) {
+    case Data(bytes): { n = n + bytes.len(); }
+    case End: { n++; }
+    case Failed(why): { n = n + why.len(); }
+  }
+  match (c.recv(1).wait()) {
+    case Data(bytes): { n = n + bytes.len(); }
+    case End: { n++; }
+    case Failed(why): { n = n + why.len(); }
+  }
   if (c.env("SET_IN_ENV").wait() is not null) { n++; }
   if (c.env("NOT_SET").wait() is null) { n++; }
   if (c.write(u8[0]())) { n++; }
   if (c.stat("x").wait().exists) { n++; }
   if (c.readDir("dir").wait() is not null) { n++; }
   if (c.readDir("nope").wait() is null) { n++; }
-  if (c.mkdir("d", true).wait()) { n++; }
-  if (c.remove("d", true).wait()) { n++; }
-  if (c.rename("a", "b").wait()) { n++; }
+  // The three answer a `Change`: a fault category beside the host's own words.
+  if (c.mkdir("d", true).wait().ok()) { n++; }
+  if (c.remove("d", true).wait().ok()) { n++; }
+  if (c.rename("a", "b").wait().ok()) { n++; }
   n += c.openInput("x").wait().len() + c.openOutput("x").wait().len();
   n += c.connect("h", 1).wait().handle + c.listen(1).wait().handle + c.accept(1).wait().handle;
-  n += c.recv(1).wait().len();
   if (c.send(1, u8[0]()).wait()) { n++; }
   c.closeSocket(1);
 

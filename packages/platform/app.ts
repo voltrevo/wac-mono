@@ -47,6 +47,12 @@ if (target !== "deno" && target !== "node") {
 }
 
 const built = await Deno.makeTempFile({ prefix: "wac-app-" });
+// The exit code, carried out of the block rather than exited with inside it. `Deno.exit` does not
+// run `finally` — so the obvious spelling of this leaked one built executable per invocation, and
+// after several thousand runs across the agents sharing this machine that was 1.4GB of /tmp and a
+// disk with nothing left on it. The build that then failed reported "No space left on device" from
+// `makeTempDir`, which points at the disk rather than at the thing filling it.
+let code = 1;
 try {
   await buildApp(entry, built, grants, target);
   // Inherited, not piped: the application's output is the point, and `outputSync`
@@ -55,8 +61,8 @@ try {
   const cmd = target === "node"
     ? new Deno.Command("node", { args: [built, ...appArgs], ...stdio })
     : new Deno.Command(built, { args: appArgs, ...stdio });
-  const { code } = cmd.outputSync();
-  Deno.exit(code);
+  code = cmd.outputSync().code;
 } finally {
   await Deno.remove(built).catch(() => {});
 }
+Deno.exit(code);

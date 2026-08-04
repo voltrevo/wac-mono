@@ -35,6 +35,7 @@
 //   giving up after 600ms
 
 import { Cli, Core, Pending, Socket } from "../src/platform.wac";
+import { Read } from "../../bytes/src/read.wac";
 
 const i32 ROUNDS = 6;   // more than SLOTS, so a leaked ticket would show up as a stall
 
@@ -66,7 +67,7 @@ export i32 main(Core core, Cli cli) {
 
   // One read, waited on more than once. Re-issuing `recv` per round instead would be the bug
   // the header warns about, and it would not look like one.
-  Pending<u8[]> r = cli.recv(s.handle);
+  Pending<Read> r = cli.recv(s.handle);
   i32 waited = 0;
 
   for (i32 round = 0; round < ROUNDS; round++) {
@@ -74,11 +75,14 @@ export i32 main(Core core, Cli cli) {
     waited = waited + ms;
 
     if (which == 0) {
-      u8[] said = r.wait();
-      if (said.len() == 0) {
-        core.log("peer closed after " + itoa(waited) + "ms");
-      } else {
-        core.log("peer sent " + itoa(said.len()) + " bytes after " + itoa(waited) + "ms");
+      // Three outcomes, and a deadline is exactly the situation where they differ: a peer that
+      // closed, a connection that broke, and bytes that arrived all used to be two cases.
+      match (r.wait()) {
+        case Data(bytes): {
+          core.log("peer sent " + itoa(bytes.len()) + " bytes after " + itoa(waited) + "ms");
+        }
+        case End: { core.log("peer closed after " + itoa(waited) + "ms"); }
+        case Failed(why): { core.log("connection failed after " + itoa(waited) + "ms: " + why); }
       }
       cli.closeSocket(s.handle);
       return 0;

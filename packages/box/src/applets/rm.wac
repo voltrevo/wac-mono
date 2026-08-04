@@ -1,7 +1,13 @@
 // Files removed; `-r` for a directory and everything under it, `-f` to say nothing
 // about what was not there.
+//
+// **`-f` means "ignore what is already gone", not "ignore everything".** It used to mean the
+// second, because `remove` answered `bool` and a missing file was indistinguishable from a
+// permission denied — so `rm -f` on a file it could not delete said nothing and exited 0, and the
+// file was still there. `remove` answers a `Change` now: a fault category beside the message, so
+// `-f` ignores `absent()` and nothing else, in one call with nothing to race against.
 
-import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Change, Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
 
 export i32 rm(Core core, Cli cli, Args a) {
@@ -14,9 +20,12 @@ export i32 rm(Core core, Cli cli, Args a) {
   bool recursive = has(a, 'r');
   i32 code = 0;
   for (i32 i = 0; i < a.rest.len(); i++) {
-    if (cli.remove(a.rest[i], recursive).wait()) { continue; }
-    if (force) { continue; }
-    core.warn(a.name + ": " + a.rest[i] + ": cannot remove");
+    Change c = cli.remove(a.rest[i], recursive).wait();
+    if (c.ok()) { continue; }
+    // The only fault `-f` forgives. Everything else — denied, a non-empty directory, a disk that
+    // is full — happened to a file that was there, and `-f` does not get to hide that.
+    if (force && c.absent()) { continue; }
+    core.warn(a.name + ": " + a.rest[i] + ": " + c.message);
     code = 1;
   }
   return code;

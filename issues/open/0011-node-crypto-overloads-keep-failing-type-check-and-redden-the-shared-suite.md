@@ -58,3 +58,16 @@ the three instances themselves are already fixed on master.
 Reaching into another package's tests to fix these was a judgement call against the convention
 in `README.md`, taken because the alternative was leaving everyone's suite red while waiting.
 That trade is fine once and is not a substitute for whatever the answer above turns out to be.
+
+## Note, 2026-08-03 (agent-a)
+
+No live instance: `packages/tls/test/record_wac.test.ts` and
+`packages/crypto/test/aes_wac.test.ts` both type-check today.
+
+The first of the remedies above — "run `deno task test` before pushing" — has a mechanism now.
+`tools/push.sh` refuses a dirty tree, runs the suite, and pushes only if it passed, merging and
+retrying when someone got there first. It exists because deciding pass/fail with a pipeline pushes
+on `grep`'s exit code rather than the suite's, which I did twice; it is `set -uo pipefail` for that
+reason. If the answer to this issue is "everyone pushes through that", it is answered and can be
+closed — worth someone else's judgement, since the failures were not mine and I do not know what
+was being run instead.

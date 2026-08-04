@@ -18,6 +18,17 @@ export struct Parsed {
   bool ok;
   i64 millis;       // since 1970-01-01T00:00:00Z
   i32 offsetMin;    // the offset as written, kept because it is not recoverable from `millis`
+  /**
+   * Whether the offset is known.
+   *
+   * RFC 3339 §4.3 gives `-00:00` a meaning of its own: the instant is known and the local offset is
+   * *not*. `Z` and `+00:00` both assert an offset of zero. All three arrived here as `offsetMin == 0`
+   * and were indistinguishable, so the one piece of information this field exists to preserve — the
+   * offset as written, because it cannot be recovered from `millis` — was exactly the piece lost.
+   *
+   * True for `Z` and for every explicit numeric offset including `+00:00`; false only for `-00:00`.
+   */
+  bool offsetKnown;
 }
 
 bool isDigit(i32 c) { return c >= '0' && c <= '9'; }
@@ -45,7 +56,7 @@ i32 digits(u8[] s, i32 at, i32 n) {
  * licence to do that.
  */
 export Parsed parse(u8[] s) {
-  Parsed bad = Parsed(false, 0, 0);
+  Parsed bad = Parsed(false, 0, 0, true);
   i32 year = digits(s, 0, 4);
   if (year < 0 || s.len() < 20) { return bad; }
   if (s[4] != '-') { return bad; }
@@ -88,6 +99,7 @@ export Parsed parse(u8[] s) {
   }
 
   i32 offsetMin = 0;
+  bool offsetKnown = true;
   if (at >= s.len()) { return bad; }
   i32 z = s[at];
   if (z == 'Z' || z == 'z') {
@@ -99,7 +111,11 @@ export Parsed parse(u8[] s) {
     if (om < 0) { return bad; }
     if (oh > 23 || om > 59) { return bad; }
     offsetMin = oh * 60 + om;
-    if (z == '-') { offsetMin = -offsetMin; }
+    if (z == '-') {
+      // `-00:00` is the unknown-offset spelling, and the only negative zero there is.
+      if (offsetMin == 0) { offsetKnown = false; }
+      offsetMin = -offsetMin;
+    }
     at = at + 6;
   } else {
     return bad;
@@ -111,7 +127,7 @@ export Parsed parse(u8[] s) {
   i64 days = daysFromCivil(year, month, day);
   i64 secs = days * 86400 + (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64);
   secs = secs - (offsetMin as i64) * 60;
-  return Parsed(true, secs * 1000 + (millis as i64), offsetMin);
+  return Parsed(true, secs * 1000 + (millis as i64), offsetMin, offsetKnown);
 }
 
 void pad(Buf out, i32 value, i32 width) {
@@ -122,6 +138,26 @@ void pad(Buf out, i32 value, i32 width) {
     out.push(48 + (v / divisor) % 10);
     divisor = divisor / 10;
   }
+}
+
+/**
+ * The year, in the form `Date.toISOString` uses.
+ *
+ * Four digits inside 0000..9999, and outside it a sign and six — `+010000`, `-000001`. Written this
+ * way because `pad(out, year, 4)` takes the year modulo ten thousand: year 10000 came out as `0000`,
+ * which is not a near miss but a different millennium, and a negative year produced bytes below
+ * `'0'` entirely. A timestamp that silently means something else is worse than one that is refused.
+ *
+ * The expanded form is ISO 8601's, and it is what every `Date.toISOString` in the extremes prints,
+ * which is the oracle the tests use.
+ */
+void padYear(Buf out, i32 year) {
+  if (year >= 0 && year <= 9999) { pad(out, year, 4); return; }
+  out.push(year < 0 ? '-' : '+');
+  // Six digits of the magnitude. `i32::MIN` cannot arrive here — `civilFromDays` is bounded by the
+  // instant range long before that — but the negation is written to survive it anyway.
+  i32 mag = year < 0 ? 0 - year : year;
+  pad(out, mag, 6);
 }
 
 /**
@@ -142,7 +178,7 @@ export u8[] format(i64 millis) {
 
   Civil c = civilFromDays(days);
   Buf out = Buf.create();
-  pad(out, c.year, 4);
+  padYear(out, c.year);
   out.push('-');
   pad(out, c.month, 2);
   out.push('-');

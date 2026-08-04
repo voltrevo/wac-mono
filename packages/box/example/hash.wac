@@ -8,41 +8,152 @@
 // platform example that reached up into a leaf would invert the layering for the sake of a
 // demonstration.
 //
+// A file dropped anywhere on the page is hashed and compressed as itself, and the gzip output
+// can be saved. That is where `nextFile` and `offerDownload` belong: hashing a file you have is
+// the first thing anyone wants from a hash tool, and DEFLATE that only ever reports a byte count
+// is a compressor you cannot check. Save the `.gz` and your own `gunzip` will open it.
+//
 // The demonstration is the point, though. Every byte of the work below is wac compiled to
 // WebAssembly — SHA-256 from `packages/crypto`, DEFLATE from `packages/gzip`, both written for
 // a command line and neither changed for this — running on a worker so the typing stays smooth,
 // and reaching the page through the same capability boundary a terminal program reaches a file
 // through. There is no JavaScript here that anybody wrote.
 
-import { Cli, Core, Event, Page } from "../../platform/src/platform.wac";
+import { Cli, Core, Event, Page, Pending, Picked } from "../../platform/src/platform.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { gzipBest } from "../../gzip/src/gzip.wac";
 
+/** Where this page came from. A demonstration nobody can rebuild is a screenshot. */
+const string SOURCE =
+  "https://github.com/voltrevo/wac-mono/blob/master/packages/box/example/README.md#hashwac";
+
+/**
+ * The largest file this page will take on, in bytes.
+ *
+ * Not a limit of anything below it — `gzip` compresses whatever it is handed. It is a limit on
+ * how long a demonstration may sit silent.
+ */
+const i32 LIMIT = 8388608;
+
 export i32 page(Core core, Cli cli, Page page) {
   page.title("wac: hash and compress").wait();
+  // Styled here rather than by the launcher: an interactive application owns its document, and
+  // `render` sets innerHTML, so a `<style>` in the markup applies. Light and dark both, because
+  // the page has no idea which one the reader is in and `color-scheme` alone only paints chrome.
   page.render(
-    "<p>Type, and watch a compiled SHA-256 and DEFLATE keep up.</p>" +
-    "<textarea id=\"in\" rows=\"6\" style=\"width:100%\" " +
-      "placeholder=\"type here, or paste something long\"></textarea>" +
-    "<table>" +
-    "<tr><td>bytes</td><td><b id=\"len\">0</b></td></tr>" +
-    "<tr><td>sha&#8209;256</td><td><code id=\"sha\"></code></td></tr>" +
-    "<tr><td>gzip</td><td><b id=\"gz\">0</b> bytes <span id=\"ratio\" class=\"meta\"></span></td></tr>" +
-    "<tr><td>took</td><td class=\"meta\"><span id=\"ms\">0</span> ms</td></tr>" +
-    "</table>"
+    "<style>" +
+    "  :root { --ink: #f7f9f9; --slab: #fff; --line: #dbe4e3; --text: #0b1a1d;" +
+    "          --dim: #5b7073; --key: #0e8c78; }" +
+    "  @media (prefers-color-scheme: dark) {" +
+    "    :root { --ink: #0b1416; --slab: #101f23; --line: #1e363c; --text: #dce8e7;" +
+    "            --dim: #8ba3a4; --key: #46d9c0; } }" +
+    "  body { background: var(--ink); color: var(--text); }" +
+    "  #tool { max-width: 46rem; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }" +
+    "  h1 { font-size: 1.35rem; margin: 0 0 .3rem; letter-spacing: -0.02em; }" +
+    "  p.sub { margin: 0 0 1.4rem; color: var(--dim); font-size: .95rem; }" +
+    "  textarea { width: 100%; box-sizing: border-box; min-height: 8.5rem; resize: vertical;" +
+    "             background: var(--slab); color: var(--text); border: 1px solid var(--line);" +
+    "             border-radius: 6px; padding: .8rem; font: 13px/1.6 ui-monospace, monospace; }" +
+    "  textarea:focus { outline: 2px solid var(--key); outline-offset: 1px; }" +
+    "  dl { display: grid; grid-template-columns: max-content 1fr; gap: .55rem 1.1rem;" +
+    "       margin: 1.4rem 0 0; align-items: baseline; }" +
+    "  dt { color: var(--dim); font-size: .78rem; letter-spacing: .09em;" +
+    "       text-transform: uppercase; }" +
+    "  dd { margin: 0; font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }" +
+    "  dd#sha { word-break: break-all; color: var(--key); font-size: .82rem; line-height: 1.5; }" +
+    "  .dim { color: var(--dim); }" +
+    "  #row { display: flex; gap: .7rem; align-items: center; flex-wrap: wrap;" +
+    "         margin-top: .9rem; font-size: .9rem; }" +
+    "  input[type=file] { font: inherit; font-size: .85rem; color: var(--dim); }" +
+    "  button { font: inherit; font-size: .88rem; padding: .3rem .8rem; cursor: pointer;" +
+    "           color: var(--text); background: var(--slab); border: 1px solid var(--line);" +
+    "           border-radius: 5px; }" +
+    "  button:hover { border-color: var(--key); color: var(--key); }" +
+    "  footer { margin-top: 2.2rem; font-size: .85rem; color: var(--dim); }" +
+    "  footer a { color: var(--key); }" +
+    "</style>" +
+    "<div id=\"tool\">" +
+    "  <h1>hash &amp; compress</h1>" +
+    "  <p class=\"sub\">SHA-256 from <code>packages/crypto</code> and DEFLATE from" +
+    "    <code>packages/gzip</code>, both compiled to WebAssembly and neither written for a" +
+    "    browser. Type, and they keep up.</p>" +
+    "  <textarea id=\"in\" spellcheck=\"false\"" +
+    "            placeholder=\"type here, or paste something long\"></textarea>" +
+    "  <div id=\"row\">" +
+    "    <input type=\"file\" id=\"f\">" +
+    "    <button id=\"save\">download the .gz</button>" +
+    "    <span id=\"note\" class=\"dim\">or drop a file anywhere on this page</span>" +
+    "  </div>" +
+    "  <dl>" +
+    "    <dt>input</dt><dd><b id=\"len\">0</b> bytes <span id=\"chars\" class=\"dim\"></span></dd>" +
+    "    <dt>sha-256</dt><dd id=\"sha\"></dd>" +
+    "    <dt>gzip</dt><dd><b id=\"gz\">0</b> bytes <span id=\"ratio\" class=\"dim\"></span></dd>" +
+    "    <dt>took</dt><dd class=\"dim\"><span id=\"ms\">0</span> ms</dd>" +
+    "  </dl>" +
+    "  <footer>Both algorithms and this page are wac. " +
+    "    <a href=\"" + SOURCE + "\">source, and how to build it yourself</a>.</footer>" +
+    "</div>"
   ).wait();
   page.on("#in", "input").wait();
+  page.on("#save", "click").wait();
 
-  update(core, page, "");
+  // What the save button would write, and what to call it. Held across iterations because a
+  // download is a second act: gzip already ran when the input changed, and compressing it again
+  // to answer a click would be work the page has already done.
+  u8[] packed = u8[0]();
+  string saveName = "typed.txt";
+
+  // Two things to wait on and one call that waits on both. `nextEvent` and `nextFile` are
+  // ordinary tickets, so this is the same `waitAny` a relay uses over two sockets — which is the
+  // argument for events being tickets rather than callbacks.
+  Pending<Event> ev = page.nextEvent();
+  Pending<Picked> file = page.nextFile();
+
+  packed = update(core, page, "".toBytes(), "");
   while (true) {
-    Event e = page.nextEvent().wait();
-    if (e.kind == "input") { update(core, page, e.value); }
+    i32 which = core.waitAny(i32[](ev.id, file.id), -1);
+    if (which < 0) { return 0; }
+
+    if (which == 1) {
+      Picked f = file.wait();
+      file = page.nextFile();
+      if (!f.ok) {
+        page.setText("note", "could not read it: " + f.error).wait();
+      } else if (f.bytes.len() > LIMIT) {
+        // Said rather than attempted. DEFLATE on a hundred megabytes would hold the worker for
+        // minutes with nothing on screen, and a page that looks hung is worse than one that
+        // declines — the point being demonstrated is that the *page* stays live, so proving it
+        // by wedging the thing behind it would be self-defeating.
+        page.setText("note", f.name + " is " + itoa(f.bytes.len()) +
+          " bytes; this page stops at " + itoa(LIMIT) + " so it never looks hung").wait();
+      } else {
+        saveName = f.name;
+        packed = update(core, page, f.bytes, f.name);
+      }
+      continue;
+    }
+
+    Event e = ev.wait();
+    ev = page.nextEvent();
+    if (e.kind == "input") {
+      saveName = "typed.txt";
+      packed = update(core, page, e.value.toBytes(), "");
+    } else if (e.kind == "click" && e.id == "save") {
+      // A real gzip container, header and trailer and CRC — so this is checkable with whatever
+      // is already on your machine, which is the only reason a byte count is worth trusting.
+      page.offerDownload(saveName + ".gz", packed).wait();
+    }
   }
 }
 
-/** Everything the page shows, recomputed from scratch. It is fast enough not to be clever. */
-void update(Core core, Page page, string text) {
-  u8[] bytes = text.toBytes();
+/**
+ * Everything the page shows, recomputed from scratch, returning the compressed bytes so the save
+ * button has something to offer. It is fast enough not to be clever.
+ *
+ * Takes bytes rather than a string because a file is not text: a PNG dropped here has no `string`
+ * form worth constructing, and SHA-256 does not care.
+ */
+u8[] update(Core core, Page page, u8[] bytes, string from) {
   i64 began = core.monotonicNanos().wait();
 
   u8[] digest = sha256(bytes);
@@ -51,6 +162,17 @@ void update(Core core, Page page, string text) {
   i64 took = (core.monotonicNanos().wait() - began) / 1000000;
 
   page.setText("len", itoa(bytes.len())).wait();
+  // Characters as well as bytes, because they differ the moment anything is not ASCII — paste an
+  // emoji and this line explains why the byte count jumped further than you expected.
+  //
+  // Counted here rather than asked for: `string.len()` is the *byte* length, which the spec says
+  // plainly and I assumed otherwise for one build — so comparing it with `bytes.len()` could
+  // never differ. Code points are the bytes that are not UTF-8 continuations.
+  i32 chars = 0;
+  for (i32 i = 0; i < bytes.len(); i++) {
+    if ((bytes[i] & 192) != 128) { chars = chars + 1; }
+  }
+  page.setText("chars", chars == bytes.len() ? "" : "(" + itoa(chars) + " characters)").wait();
   page.setText("sha", hex(digest)).wait();
   page.setText("gz", itoa(packed.len())).wait();
   page.setText("ms", itoa(took as~ i32)).wait();
@@ -60,6 +182,8 @@ void update(Core core, Page page, string text) {
   // which is arithmetically true and the least informative way to say it. Tenths, from
   // per-mille, because wac has floats and a ratio does not need them.
   page.setText("ratio", bytes.len() == 0 ? "(header only)" : "(" + tenths(packed.len(), bytes.len()) + "% of the input)").wait();
+  page.setText("note", from == "" ? "or drop a file anywhere on this page" : "from " + from).wait();
+  return packed;
 }
 
 /** Packed types cannot be returned, so the nibble is inlined rather than named. */

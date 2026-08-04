@@ -15,7 +15,8 @@
 
 import { Cli, Core, Pending, Socket } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
-import { itoa } from "../lib/num.wac";
+import { atoi, itoa } from "../lib/num.wac";
+import { Read } from "../../../bytes/src/read.wac";
 
 /** Standard input, as a handle `recv` accepts. See `deno.ts`. */
 i32 STDIN() { return 0; }
@@ -27,8 +28,8 @@ export i32 nc(Core core, Cli cli, Args a) {
   // Both reads are in flight from here, and stay that way: whichever answers is replaced
   // and the other is left running. Cancelling and resubmitting the untouched one would
   // lose whatever had already arrived on it.
-  Pending<u8[]> fromPeer = cli.recv(peer.handle);
-  Pending<u8[]> fromUser = cli.recv(STDIN());
+  Pending<Read> fromPeer = cli.recv(peer.handle);
+  Pending<Read> fromUser = cli.recv(STDIN());
   bool userDone = false;
 
   while (true) {
@@ -38,22 +39,30 @@ export i32 nc(Core core, Cli cli, Args a) {
     if (which < 0) { break; }
 
     if (which == 0) {
-      u8[] down = fromPeer.wait();
-      if (down.len() == 0) { break; }          // the peer closed; we are done
-      cli.write(down);
-      fromPeer = cli.recv(peer.handle);
+      bool over = false;
+      match (fromPeer.wait()) {
+        case Data(bytes): { cli.write(bytes); fromPeer = cli.recv(peer.handle); }
+        case End: { over = true; }             // the peer closed; we are done
+        // A relay that reports success after the connection broke is telling the user their data
+        // arrived. It did not, so this is worth both a word and a status.
+        case Failed(why): { core.warn(a.name + ": " + why); cli.closeSocket(peer.handle); return 1; }
+      }
+      if (over) { break; }
       continue;
     }
 
-    u8[] up = fromUser.wait();
-    if (up.len() == 0) {
-      // Standard input ended. Keep reading the socket — a request has been sent and the
-      // answer has not arrived yet, which is exactly what `box nc host 80 < request` does.
-      userDone = true;
-      continue;
+    bool inputOver = false;
+    match (fromUser.wait()) {
+      case Data(bytes): {
+        if (!cli.send(peer.handle, bytes).wait()) { break; }
+        fromUser = cli.recv(STDIN());
+      }
+      // Standard input ended. Keep reading the socket — a request has been sent and the answer has
+      // not arrived yet, which is exactly what `box nc host 80 < request` does.
+      case End: { inputOver = true; }
+      case Failed(why): { core.warn(a.name + ": " + why); cli.closeSocket(peer.handle); return 1; }
     }
-    if (!cli.send(peer.handle, up).wait()) { break; }
-    fromUser = cli.recv(STDIN());
+    if (inputOver) { userDone = true; continue; }
   }
 
   cli.closeSocket(peer.handle);
@@ -66,7 +75,7 @@ Socket dialled(Core core, Cli cli, Args a) {
     core.warn("usage: " + a.name + " <host> <port>   |   " + a.name + " -<port> -l");
     return Socket(-1, "");
   }
-  i32 port = a.num == 0 && a.rest.len() > 1 ? atoi(a.rest[1]) : a.num;
+  i32 port = !a.hasNum && a.rest.len() > 1 ? atoi(a.rest[1]) : a.num;
   Socket s = cli.connect(a.rest[0], port).wait();
   if (s.handle < 0) { core.warn(a.name + ": " + a.rest[0] + ": " + s.error); }
   return s;
@@ -86,12 +95,3 @@ Socket accepted(Core core, Cli cli, Args a) {
   return c;
 }
 
-i32 atoi(string s) {
-  u8[] b = s.toBytes();
-  i32 n = 0;
-  for (i32 i = 0; i < b.len(); i++) {
-    if (b[i] < '0' || b[i] > '9') { return n; }
-    n = n * 10 + (b[i] - '0');
-  }
-  return n;
-}

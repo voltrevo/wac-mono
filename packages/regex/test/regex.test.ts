@@ -20,6 +20,7 @@ const mod = await wacBind("packages/regex/test/probe.wac") as unknown as {
   exec(pattern: Uint8Array, input: Uint8Array, at: number): Int32Array;
   execFlags(pattern: Uint8Array, input: Uint8Array, at: number, ignoreCase: boolean): Int32Array;
   accepts(pattern: Uint8Array): boolean;
+  execBudget(pattern: Uint8Array, input: Uint8Array, at: number, budget: number): Int32Array;
 };
 
 const enc = new TextEncoder();
@@ -113,6 +114,10 @@ function checkAll(patterns: string[], inputs: string[]): void {
 const SUBJECTS = [
   "", "a", "b", "ab", "ba", "aa", "abc", "abcabc", "aaa", "aaaa", "xay", "xaby",
   "a b", "  ", "a1b2", "123", "abc123", "_x_", "A", "aA", "\n", "a\nb", "-", "]", "[",
+  // Carriage returns, which JavaScript's `.` excludes as a line terminator and this engine did
+  // not. Nothing here could produce one before, so the disagreement was unreachable by
+  // construction — the fixture, not the engine, was what passed. GitHub wac-mono#28.
+  "\r", "a\rb", "a\r\nb", "\r\n",
   "aaaaaaaaaa", "abababab", "cba", "cab", "xyz",
 ];
 
@@ -397,4 +402,24 @@ Deno.test("the i flag changes nothing when nothing is cased", () => {
       }
     }
   }
+});
+
+Deno.test("a capture-heavy quantifier runs out of room without trapping", () => {
+  // The undo log is sized from the budget, so a small budget and many captures inside one
+  // quantified body is the shape that overruns it. `OP_CLEAR` appends one entry per slot and used
+  // to check the *unchanged* length once per slot, which only catches a log that is already full —
+  // so it wrote past the arrays and trapped. -2 (budget exhausted) is a documented answer; a trap
+  // is not. GitHub wac-mono#27.
+  const pattern = b("(" + "(a)".repeat(33) + ")*");
+  for (const budget of [64, 96, 128, 256]) {
+    const out = mod.execBudget(pattern, b("aaa"), 0, budget);
+    // Either it matched or it gave up; both are answers. The bug was neither.
+    if (out[0] !== 1 && out[0] !== 0 && out[0] !== -2) {
+      throw new Error(`budget ${budget}: unexpected status ${out[0]}`);
+    }
+  }
+
+  // And a generous budget still matches, so the reservation has not simply refused everything.
+  const plenty = mod.execBudget(b("((a)(a))*"), b("aa"), 0, 200000);
+  if (plenty[0] !== 1) throw new Error(`a reasonable pattern should still match, got ${plenty[0]}`);
 });

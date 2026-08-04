@@ -33,9 +33,45 @@
 import { type Handlers } from "./respond.ts";
 import { CHUNK } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
-import { OP } from "./ops.ts";
+import { GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
+import { ChildStack, packCaptured, unpackPush } from "./child.ts";
+import { type Child, failedChild, noSpawnHere, spawnChild } from "./children.ts";
+import { bridgeOf, newBridge } from "./layout.ts";
+import { serveHostCalls } from "./respond.ts";
+import {
+  changeBytes,
+  changed,
+  FAULT_DENIED,
+  FAULT_EXISTS,
+  Faulted,
+  phraseOf,
+} from "./faults.ts";
 
 const EMPTY = new Uint8Array(0);
+
+/** A read answer, tagged: 0 data, 1 end, 2 failed. See `Read` in platform.wac. */
+function data(bytes: Uint8Array): Uint8Array {
+  const out = new Uint8Array(bytes.length + 1);
+  out[0] = 0;
+  out.set(bytes, 1);
+  return out;
+}
+const END = new Uint8Array([1]);
+function failed(why: string): Uint8Array {
+  const message = new TextEncoder().encode(why);
+  const out = new Uint8Array(message.length + 1);
+  out[0] = 2;
+  out.set(message, 1);
+  return out;
+}
+
+/** A `warn` payload as a line of a captured error stream: its bytes, then a newline. */
+function lineOf(p: Uint8Array): Uint8Array {
+  const out = new Uint8Array(p.length + 1);
+  out.set(p, 0);
+  out[p.length] = 10;
+  return out;
+}
 
 // The File System Access API, described rather than imported — the same discipline
 // `node.ts` uses for `node:worker_threads`, and for the same reason: this file has to
@@ -67,6 +103,26 @@ export type BrowserWorldOptions = {
   warn?(line: string): void;
   /** Where `write` goes — exact bytes, no newline. Defaults to the console, as text. */
   write?(bytes: Uint8Array): void;
+  /**
+   * Where `writeErr` goes — exact bytes on the error stream, no newline.
+   *
+   * Defaults to `warn`'s destination decoded as text, because a page that has somewhere to put
+   * diagnostics has somewhere to put these; a page that wants them apart passes this.
+   */
+  writeErr?(bytes: Uint8Array): void;
+  /**
+   * Where standard input comes from. A page has none; a *spawned child* does — what its parent
+   * sent — and this is how the queue reaches it. The same option the Deno host takes, for the same
+   * reason and with the same shape.
+   */
+  readStdin?(): Promise<Uint8Array>;
+  /**
+   * This program's own worker bundle, for `spawnSelf`.
+   *
+   * The launcher has it — it is what started the program — and `runInPage` passes it along. Absent
+   * means `spawnSelf` says there is no spawn here rather than failing a program.
+   */
+  selfSource?: string;
   /**
    * The Origin Private File System root, if the page is willing to grant one.
    *
@@ -121,6 +177,61 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   const log = opts.log ?? ((l: string) => console.log(l));
   const warn = opts.warn ?? ((l: string) => console.warn(l));
   const write = opts.write ?? ((b: Uint8Array) => console.log(new TextDecoder().decode(b)));
+  const readIn = opts.readStdin;
+
+  /**
+   * The children this page has started, by handle.
+   *
+   * Numbered from 1 so that 0 is standard input, as it is in every host — handles are one namespace
+   * and `waitAny` watches them without knowing which is which.
+   */
+  const children = new Map<number, Child>();
+  let nextHandle = 1;
+
+  /**
+   * Start a child on `source`, with `want` narrowed to what this page itself was given.
+   *
+   * Shared by `spawn` and `spawnSelf`, which differ only in where the source comes from. A child
+   * gets no `dom`: its output reaches the parent through its handle, and a child that could draw
+   * would be drawing over the program that started it.
+   */
+  const startChild = async (
+    source: string,
+    childArgs: string[],
+    want: number,
+  ): Promise<Uint8Array> => {
+    const give = {
+      read: (want & GRANT_READ) !== 0 && opts.root !== undefined,
+      write: (want & GRANT_WRITE) !== 0 && opts.root !== undefined && opts.writable === true,
+    };
+    const h = nextHandle++;
+    const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
+      const enc = new TextEncoder();
+      return serveHostCalls(bridgeOf(sab), browserWorld({
+        args: cargs,
+        // A line of output is bytes on the handle, with the newline `log` implies. The parent cannot
+        // tell `log` from `write`, and neither can a pipe — which is the point.
+        log: (l: string) => out.push(enc.encode(l + "\n")),
+        warn: (l: string) => out.push(enc.encode(l + "\n")),
+        write: (b: Uint8Array) => out.push(b),
+        writeErr: (b: Uint8Array) => out.push(b),
+        readStdin: () => input.next(),
+        ...(give.read ? { root: opts.root, writable: give.write } : {}),
+        // So that a child can run itself too: the bundle is the same one.
+        selfSource: opts.selfSource,
+      }));
+    }, newBridge);
+
+    const why = await child.loaded;
+    if (why !== "") {
+      child.kill();
+      return failedChild(why);
+    }
+    children.set(h, child);
+    return i32le(h);
+  };
+  const writeErr = opts.writeErr ??
+    ((b: Uint8Array) => warn(new TextDecoder().decode(b)));
   const deny = (what: string): never => {
     throw new Error(`${what} not granted to this application`);
   };
@@ -138,9 +249,41 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     return [unstr(p.subarray(4, 4 + n)), unstr(p.subarray(4 + n))];
   };
 
+  // A program running inside this one. Both path walkers above go through `kids.path`, so a
+  // child's relative paths resolve from where the shell put it; with nothing pushed it is the
+  // identity and every path means exactly what it did before.
+  const kids = new ChildStack();
+  // `write` answers a bool and cannot carry a reason, so this is recorded for `outputError`. The
+  // reads no longer need an equivalent: `Read` carries theirs.
+  let outputFailure = "";
+
   const canWrite = (): void => {
     if (opts.root === undefined || opts.writable !== true) deny("filesystem write");
   };
+
+  /**
+   * How this host says a failure: the category's phrase where it has one, and the exception's own
+   * message where it does not.
+   *
+   * A `DOMException` message is written for a developer console — "A requested file or directory
+   * could not be found at the time an operation was processed." — and a shell prints it after
+   * `rm: cannot remove 'f': `, where it reads as a defect rather than as a diagnostic. The category
+   * is already known by then, so the short form loses nothing. `FAULT_OTHER` keeps the message,
+   * because there the message is the only information there is.
+   */
+  const describeAsPhrase = (fault: number, message: string): string => {
+    const phrase = phraseOf(fault);
+    return phrase === "" ? message : phrase;
+  };
+
+  /**
+   * The same question as `canWrite`, for the four operations that answer with a `Change` instead of
+   * throwing: a refusal is a `Denied` fault said in the ordinary shape, not an exception.
+   */
+  const writeRefused = (): Uint8Array | null =>
+    opts.root === undefined || opts.writable !== true
+      ? changeBytes(FAULT_DENIED, "filesystem write not granted")
+      : null;
 
   /**
    * Walk a path to the directory holding its last component.
@@ -150,7 +293,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    * for them to be absolute about.
    */
   const resolve = async (path: string, create: boolean): Promise<Resolved> => {
-    const parts = path.split("/").filter((p) => p !== "" && p !== ".");
+    const parts = kids.path(path).split("/").filter((p) => p !== "" && p !== ".");
     if (parts.length === 0) throw new Error("empty path");
     let dir = root();
     for (let i = 0; i < parts.length - 1; i++) {
@@ -179,10 +322,31 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    * listing, so portable code asked the obvious question and silently got nothing.
    */
   const dirOf = async (path: string, create: boolean): Promise<DirHandle> => {
-    const parts = path.split("/").filter((x) => x !== "" && x !== ".");
+    const parts = kids.path(path).split("/").filter((x) => x !== "" && x !== ".");
     let dir = root();
     for (const part of parts) dir = await dir.getDirectoryHandle(part, { create });
     return dir;
+  };
+
+  /** What `stat` and `linkStat` both answer with: the twenty bytes `provider.ts` decodes. */
+  const statBytes = async (path: string): Promise<Uint8Array> => {
+    const out = new Uint8Array(20);
+    const dv = new DataView(out.buffer);
+    if (opts.root === undefined) return out;   // not granted reads as "does not exist"
+    try {
+      const f = await fileOf(path);
+      out[0] = 1;
+      out[1] = 1;
+      dv.setBigInt64(3, BigInt(f.size), true);
+      dv.setBigInt64(11, BigInt(f.lastModified), true);
+      return out;
+    } catch { /* not a file; try a directory */ }
+    try {
+      await dirOf(path, false);   // the root included, which `resolve` cannot express
+      out[0] = 1;
+      out[2] = 1;
+    } catch { /* absent, and the zeroes say so */ }
+    return out;
   };
 
   // The current streaming input and output: the same one-at-a-time model the other worlds
@@ -246,6 +410,9 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       return EMPTY;
     },
 
+    // A page has no process directory. The root of the Origin Private File System is where its
+    // relative paths land, so that is the true answer and not a placeholder.
+    [OP.CWD]: () => str("/"),
     [OP.SLEEP_MILLIS]: (p) =>
       new Promise<Uint8Array>((ok) =>
         setTimeout(() => ok(i64le(BigInt(Math.round(performance.now() * 1e6)))), readI32le(p))
@@ -255,55 +422,144 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       if (n < 0 || n > 1 << 20) throw new Error(`randomBytes(${n}) out of range`);
       return crypto.getRandomValues(new Uint8Array(n));
     },
-    [OP.LOG]: (p) => { log(unstr(p)); return EMPTY; },
-    [OP.WARN]: (p) => { warn(unstr(p)); return EMPTY; },
+    // `log` is standard output, so a child's lines are kept with the rest of its output rather
+    // than appearing on the parent's terminal. Thirty of `box`'s applets write this way.
+    [OP.LOG]: (p) => {
+      if (kids.active) { kids.write(lineOf(p)); return EMPTY; }
+      log(unstr(p));
+      return EMPTY;
+    },
+    [OP.WARN]: (p) => {
+      if (kids.warn(lineOf(p))) return EMPTY;
+      warn(unstr(p));
+      return EMPTY;
+    },
 
-    [OP.ARG_COUNT]: () => i32le(args.length),
+    [OP.PUSH_CHILD]: (p) => {
+      const { argv, stdin, cwd } = unpackPush(p);
+      kids.push(argv, stdin, cwd);
+      return EMPTY;
+    },
+    [OP.POP_CHILD]: () => {
+      const { out, err } = kids.pop();
+      return packCaptured(out, err);
+    },
+
+    // A child has its own command line: an applet reading `cli.arg(1)` must see what the shell
+    // typed, not what the shell itself was started with.
+    [OP.ARG_COUNT]: () => i32le((kids.args() ?? args).length),
     [OP.ARG]: (p) => {
+      const own = kids.args() ?? args;
       const i = readI32le(p);
-      return str(i >= 0 && i < args.length ? args[i] : "");
+      return str(i >= 0 && i < own.length ? own[i] : "");
     },
     // Unset, always. One byte of presence says so, as it does everywhere else.
     [OP.ENV]: () => new Uint8Array([0]),
 
-    [OP.READ_STDIN]: () => EMPTY,
+    // A page has no standard input of its own; a child running inside it does.
+    [OP.READ_STDIN]: async () => kids.readAll() ?? (readIn === undefined ? EMPTY : await readIn()),
     [OP.WRITE_STDOUT]: async (p) => {
-      if (sink === null) { write(p); return EMPTY; }
-      await sink.write(p);
+      if (kids.active) {
+        if (!kids.write(p)) throw new Error("the child's output buffer is full");
+        return EMPTY;
+      }
+      try {
+        if (sink === null) { write(p); return EMPTY; }
+        await sink.write(p);
+        return EMPTY;
+      } catch (e) {
+        // A page has no pipe to break, so any failure here is a real one — a quota exceeded, or a
+        // handle the browser took back. Recorded so `outputError` can say which.
+        outputFailure = e instanceof Error ? e.message : String(e);
+        throw e;
+      }
+    },
+
+    /**
+     * Standard error as bytes. A page has one place for text, so this reaches the same sink `warn`
+     * does — but without a newline, and without going through a string, so bytes that are not valid
+     * UTF-8 survive as far as the page's own decoder rather than being mangled here.
+     */
+    [OP.WRITE_STDERR]: (p) => {
+      if (kids.active) { kids.warn(p); return EMPTY; }
+      writeErr(p);
       return EMPTY;
     },
 
-    [OP.READ_FILE]: async (p) => new Uint8Array(await (await fileOf(unstr(p))).arrayBuffer()),
-    [OP.WRITE_FILE]: async (p) => {
-      canWrite();
-      const n = readI32le(p);
-      const { dir, name } = await resolve(unstr(p.subarray(4, 4 + n)), true);
-      const h = await dir.getFileHandle(name, { create: true });
-      const w = await h.createWritable();
-      await w.write(p.subarray(4 + n));
-      await w.close();
+    /**
+     * A worker on the source it is handed, with a world of its own. Issue 0030.
+     *
+     * Nothing about a page forbade this: a worker can create a worker, each program needs its own
+     * `SharedArrayBuffer` and a responder for it, and the page's own thread can host a second
+     * responder as easily as the first. The parent is parked in `Atomics.wait` while its child runs,
+     * and that is fine precisely because the child's calls are answered *here*, by the page, not by
+     * the parent.
+     *
+     * The same `spawnChild` the Deno host uses, with a browser world instead of a Deno one — which
+     * is the whole reason that function takes its world and its worker as arguments. What differs
+     * between the two hosts is which world a child gets, and that is one expression.
+     *
+     * **A child gets no page.** Its `log`, `warn`, `write` and `writeErr` go to the parent through
+     * the handle, its reads come from what the parent sends, and `dom` is deliberately absent: a
+     * child that could draw would be drawing over the program that started it, and a handle is not
+     * a place to put a canvas.
+     */
+    [OP.SPAWN]: (p) => {
+      const want = readI32le(p);
+      const n = readI32le(p.subarray(4));
+      const source = unstr(p.subarray(8, 8 + n));
+      const rest = unstr(p.subarray(8 + n));
+      return startChild(source, rest.length === 0 ? [] : rest.split("\u0000"), want);
+    },
+
+    /**
+     * This same page's program again, with different arguments. See `spawnSelf` in platform.wac.
+     *
+     * **This is what gives a page programs to run at all.** `spawn` needs a bundle from a filesystem,
+     * and a browser tab has no directory of programs — so a page could spawn and had nothing to
+     * spawn. The launcher already holds this program's bundle, because it is what started it, and
+     * `packages/box` decides which applet it is from its first argument. Issue 0030.
+     */
+    [OP.SPAWN_SELF]: (p) => {
+      const want = readI32le(p);
+      const rest = unstr(p.subarray(4));
+      if (opts.selfSource === undefined) {
+        return noSpawnHere("this page did not pass the program its own source");
+      }
+      return startChild(opts.selfSource, rest.length === 0 ? [] : rest.split("\u0000"), want);
+    },
+
+    [OP.CLOSE_FEED]: (p) => {
+      // Input only. `closeSocket` is what stops a child; a program that reads to the end before
+      // answering needs that end while it is still alive.
+      children.get(readI32le(p))?.in.end();
       return EMPTY;
     },
-    [OP.STAT]: async (p) => {
-      const out = new Uint8Array(19);
-      const dv = new DataView(out.buffer);
-      if (opts.root === undefined) return out;   // not granted reads as "does not exist"
-      const path = unstr(p);
-      try {
-        const f = await fileOf(path);
-        out[0] = 1;
-        out[1] = 1;
-        dv.setBigInt64(3, BigInt(f.size), true);
-        dv.setBigInt64(11, BigInt(f.lastModified), true);
-        return out;
-      } catch { /* not a file; try a directory */ }
-      try {
-        await dirOf(path, false);   // the root included, which `resolve` cannot express
-        out[0] = 1;
-        out[2] = 1;
-      } catch { /* absent, and the zeroes say so */ }
-      return out;
+    [OP.EXIT_CODE]: async (p) => {
+      const c = children.get(readI32le(p));
+      if (c === undefined) throw new Error("not a spawned worker");
+      return i32le(await c.exit);
     },
+
+    [OP.READ_FILE]: async (p) => new Uint8Array(await (await fileOf(unstr(p))).arrayBuffer()),
+    [OP.WRITE_FILE]: (p) => {
+      const no = writeRefused();
+      if (no !== null) return no;
+      const n = readI32le(p);
+      return changed(async () => {
+        const { dir, name } = await resolve(unstr(p.subarray(4, 4 + n)), true);
+        const h = await dir.getFileHandle(name, { create: true });
+        const w = await h.createWritable();
+        await w.write(p.subarray(4 + n));
+        await w.close();
+      }, describeAsPhrase);
+    },
+    [OP.STAT]: (p) => statBytes(unstr(p)),
+    // The Origin Private File System has no symbolic links, so this *is* `stat`, and `isSymlink`
+    // stays false. That is true rather than a stand-in — and it is why `tar` can refuse links in a
+    // page as well, without knowing which host it is on.
+    [OP.LINK_STAT]: (p) => statBytes(unstr(p)),
+
     [OP.READ_DIR]: async (p) => {
       const h = await dirOf(unstr(p), false);
       const names: string[] = [];
@@ -313,45 +569,54 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       return str(names.sort().join("\u0000"));
     },
 
-    [OP.MKDIR]: async (p) => {
-      canWrite();
+    [OP.MKDIR]: (p) => {
+      const no = writeRefused();
+      if (no !== null) return no;
       const path = unstr(p.subarray(1));
       if (p[0] === 1) {
-        const { dir, name } = await resolve(path, true);   // -p: every component
-        await dir.getDirectoryHandle(name, { create: true });
-        return EMPTY;
+        return changed(async () => {
+          const { dir, name } = await resolve(path, true);   // -p: every component
+          await dir.getDirectoryHandle(name, { create: true });
+        }, describeAsPhrase);
       }
-      const { dir, name } = await resolve(path, false);
-      // Without `-p`, a missing parent must fail — which `resolve(false)` does — and so
-      // must an existing directory. OPFS has no exclusive create, so it is asked first.
-      let exists = true;
-      try { await dir.getDirectoryHandle(name); } catch { exists = false; }
-      if (exists) throw new Error("already exists");
-      await dir.getDirectoryHandle(name, { create: true });
-      return EMPTY;
+      return changed(async () => {
+        const { dir, name } = await resolve(path, false);
+        // Without `-p`, a missing parent must fail — which `resolve(false)` does — and so
+        // must an existing directory. OPFS has no exclusive create, so it is asked first.
+        let exists = true;
+        try { await dir.getDirectoryHandle(name); } catch { exists = false; }
+        // `AlreadyExists` by name, because OPFS reports nothing here and the message is mine:
+        // a caller asking "did it already exist" must not have to read my English.
+        if (exists) throw new Faulted(FAULT_EXISTS, "already exists");
+        await dir.getDirectoryHandle(name, { create: true });
+      }, describeAsPhrase);
     },
-    [OP.REMOVE]: async (p) => {
-      canWrite();
-      const { dir, name } = await resolve(unstr(p.subarray(1)), false);
-      await dir.removeEntry(name, { recursive: p[0] === 1 });
-      return EMPTY;
+    [OP.REMOVE]: (p) => {
+      const no = writeRefused();
+      if (no !== null) return no;
+      return changed(async () => {
+        const { dir, name } = await resolve(unstr(p.subarray(1)), false);
+        await dir.removeEntry(name, { recursive: p[0] === 1 });
+      }, describeAsPhrase);
     },
-    [OP.RENAME]: async (p) => {
-      canWrite();
+    [OP.RENAME]: (p) => {
+      const no = writeRefused();
+      if (no !== null) return no;
       const n = readI32le(p);
       const from = unstr(p.subarray(4, 4 + n));
       const to = unstr(p.subarray(4 + n));
-      // OPFS has no rename, so this is a copy and a delete — **not atomic**, which is the
-      // one promise a page cannot keep. See the file header.
-      const bytes = new Uint8Array(await (await fileOf(from)).arrayBuffer());
-      const dst = await resolve(to, true);
-      const h = await dst.dir.getFileHandle(dst.name, { create: true });
-      const w = await h.createWritable();
-      await w.write(bytes);
-      await w.close();
-      const src = await resolve(from, false);
-      await src.dir.removeEntry(src.name);
-      return EMPTY;
+      return changed(async () => {
+        // OPFS has no rename, so this is a copy and a delete — **not atomic**, which is the
+        // one promise a page cannot keep. See the file header.
+        const bytes = new Uint8Array(await (await fileOf(from)).arrayBuffer());
+        const dst = await resolve(to, true);
+        const h = await dst.dir.getFileHandle(dst.name, { create: true });
+        const w = await h.createWritable();
+        await w.write(bytes);
+        await w.close();
+        const src = await resolve(from, false);
+        await src.dir.removeEntry(src.name);
+      }, describeAsPhrase);
     },
 
     [OP.OPEN_INPUT]: async (p) => {
@@ -362,13 +627,28 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       return EMPTY;
     },
     [OP.READ_CHUNK]: async () => {
-      if (source === null) return EMPTY;
-      const end = Math.min(source.at + CHUNK, source.blob.size);
-      if (end <= source.at) return EMPTY;
-      const slice = source.blob.slice(source.at, end);
-      source.at = end;
-      return new Uint8Array(await slice.arrayBuffer());
+      const fed = source === null ? kids.readChunk() : null;
+      if (fed !== null) return fed.length === 0 ? END : data(fed);
+      // A spawned child's standard input is a queue its parent fills, which is the same shape a
+      // fed child has and a different source: `pushChild` hands over a buffer, `send` arrives over
+      // time. Both end, and the end is what `readChunk` has to be able to say.
+      if (source === null && readIn !== undefined) {
+        const piped = await readIn();
+        return piped.length === 0 ? END : data(piped);
+      }
+      if (source === null) return END;
+      try {
+        const end = Math.min(source.at + CHUNK, source.blob.size);
+        if (end <= source.at) return END;
+        const slice = source.blob.slice(source.at, end);
+        source.at = end;
+        return data(new Uint8Array(await slice.arrayBuffer()));
+      } catch (e) {
+        return failed(e instanceof Error ? e.message : String(e));
+      }
     },
+    // Why the last read gave nothing — see `inputError` in platform.wac.
+    [OP.OUTPUT_ERROR]: () => str(outputFailure),
     [OP.OPEN_OUTPUT]: async (p) => {
       const path = unstr(p);
       if (sink !== null) { await sink.close(); sink = null; }
@@ -385,8 +665,42 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     [OP.ACCEPT]: () => deny("network access"),
     // Handle 0 is standard input everywhere else; a page has none, so it ends immediately
     // rather than refusing. Any other handle is a socket, which a page cannot have.
-    [OP.RECV]: (p) => (readI32le(p) === 0 ? EMPTY : deny("network access")),
-    [OP.SEND]: () => deny("network access"),
-    [OP.CLOSE_SOCKET]: () => EMPTY,
+    // A page has no standard input and no sockets, so handle 0 is immediately at its end and
+    // anything else is refused — as a `Read`, so a caller cannot read the refusal as "finished".
+    [OP.RECV]: async (p) => {
+      const h = readI32le(p);
+      // Handle 0 is standard input, as everywhere: it exists so `waitAny` can watch it beside a
+      // child. A page's own standard input is empty; a child's is what its parent sent.
+      if (h === 0) {
+        if (readIn === undefined) return END;
+        const piped = await readIn();
+        return piped.length === 0 ? END : data(piped);
+      }
+      const kid = children.get(h);
+      if (kid !== undefined) {
+        const fromChild = await kid.out.next();
+        return fromChild.length === 0 ? END : data(fromChild);
+      }
+      return failed("network access is not granted");
+    },
+    // A child's standard input. Sockets are a page's other missing capability, and asking for one
+    // is still a denial — but a handle that names a child is not a socket, and the check has to come
+    // first or a page could spawn a program it can never feed.
+    [OP.SEND]: (p) => {
+      const kid = children.get(readI32le(p));
+      if (kid !== undefined) { kid.in.push(p.slice(4)); return EMPTY; }
+      return deny("network access");
+    },
+    [OP.CLOSE_SOCKET]: (p) => {
+      const h = readI32le(p);
+      // Closing a child's handle ends its standard input *and* stops it. A program that wants only
+      // the first should stop sending and wait for its output to end — that is `closeFeed`.
+      const kid = children.get(h);
+      if (kid !== undefined) {
+        try { kid.in.end(); kid.kill(); } catch { /* already gone */ }
+        children.delete(h);
+      }
+      return EMPTY;
+    },
   };
 }

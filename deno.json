@@ -8,6 +8,7 @@
     "bench:zstd-speed": "deno run -A packages/zstd/bench/speed.ts",
     "bench:json": "deno run -A packages/json/bench/throughput.ts",
     "bench:json-lookup": "deno run -A packages/json/bench/lookup.ts",
+    "bindgen": "deno run -A tools/emitgen.ts",
     "coverage": "deno run -A tools/coverage.ts",
     "size": "deno run -A tools/size.ts",
     "coverage:bignum": "deno run -A packages/bignum/cov.ts",
@@ -39,6 +40,7 @@
     "app": "deno run --allow-read --allow-write --allow-env --allow-run packages/platform/app.ts",
     "wac:pin": "deno run --allow-read --allow-write --allow-run tools/wacPin.ts",
     "test": "deno test --parallel --allow-read --allow-write --allow-run --allow-net --allow-env",
+    "test:changed": "deno run -A tools/testChanged.ts",
     "validate": "deno run -A tools/validate.ts",
     "verify:fmt": "deno run -A packages/fmt/tools/sweep.ts",
     "map": "deno run --allow-read --allow-write tools/map.ts"

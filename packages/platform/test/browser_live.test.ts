@@ -190,11 +190,25 @@ Deno.test({
       // Pixels, a pointer and files — the three that only a browser can answer for.
       await buildApp("packages/platform/example/pixels.wac", `${dir}/pixels.html`, {}, "browser");
       await page.goto(`http://127.0.0.1:${port}/pixels.html`, { waitUntil: "load" });
+      // Wait for the canvas to have been *drawn into*, which is the actual precondition, rather
+      // than for a particular size. Two wrong versions preceded this: pinning `width === 240`
+      // failed as a timeout when the picture was made bigger, and `width > 0` passed instantly
+      // because an undrawn canvas is already 300x150 by default — so the pixel checks below ran
+      // on a blank one and reported zero opaque pixels out of 45,000.
       await page.waitForFunction(
-        "document.getElementById('c') && document.getElementById('c').width === 240",
+        `(() => {
+          const c = document.getElementById("c");
+          if (c === null) return false;
+          const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+          for (let i = 3; i < d.length; i += 4) if (d[i] === 255) return true;
+          return false;
+        })()`,
         null,
         { timeout: 30_000 },
       );
+      const size = await page.evaluate(
+        "({ w: document.getElementById('c').width, h: document.getElementById('c').height })",
+      ) as { w: number; h: number };
 
       // A canvas with real content: every pixel opaque, and more than a handful of colours.
       // A blank buffer would satisfy "a canvas exists" and nothing else here.
@@ -209,34 +223,73 @@ Deno.test({
         }
         return { colours: seen.size, opaque, total: d.length / 4 };
       })()`) as { colours: number; opaque: number; total: number };
-      assertEquals(drawn.total, 240 * 160, "the buffer is the size wac asked for");
+      assertEquals(drawn.total, size.w * size.h, "the buffer is the size wac asked for");
       assertEquals(drawn.opaque, drawn.total, "every pixel was written");
       assertEquals(drawn.colours > 20, true, `only ${drawn.colours} colours — is it blank?`);
 
-      // Pointer coordinates, in the canvas's own pixels. The canvas has a 1px border, so the
-      // page coordinate and the element coordinate differ by one — which is the whole reason
-      // to report `offsetX` rather than something the application would have to correct.
+      // Pointer coordinates, in the canvas's *backing store* — not its CSS box. This canvas is
+      // drawn at one size and displayed at another, so the two differ, and the invariant worth
+      // asserting is the one an application depends on: the middle of the element is the middle
+      // of the buffer it drew. Pinning a literal (it was `x=119`) tested the window size.
       const box = (await page.locator("#c").boundingBox())!;
-      await page.mouse.move(box.x + 120, box.y + 80);
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
       await page.waitForFunction(
-        "document.getElementById('pos').textContent.includes('x=119')",
+        "document.getElementById('pos').textContent.startsWith('x=')",
         null,
         { timeout: 30_000 },
       );
+      const pos = (await page.textContent("#pos")) ?? "";
+      const at = pos.match(/x=(\d+) y=(\d+)/);
+      assertEquals(at !== null, true, pos);
       assertEquals(
-        (await page.textContent("#pos"))?.includes("never (inside)"),
+        Math.abs(Number(at![1]) - size.w / 2) <= 3 && Math.abs(Number(at![2]) - size.h / 2) <= 3,
         true,
-        "the middle of the set never escapes",
+        `the centre of the element should be the centre of the ${size.w}x${size.h} buffer: ${pos}`,
       );
+      // And the centre of the default view is inside the set, so it never escapes.
+      assertEquals(pos.includes("never (inside)"), true, pos);
 
-      // A file in and the same file back out, which is one exchange proving both directions.
+      // A file in and a file back out, checked against this runtime's own crypto and gzip rather
+      // than against more wac. It drives `box/example/hash.wac`, which is where `nextFile` lives
+      // now: a page that hashes a file you drop on it has a reason to want one, and a Mandelbrot
+      // viewer never did.
+      await buildApp(
+        "packages/box/example/hash.wac",
+        `${dir}/hash.html`,
+        {},
+        "browser",
+      );
+      await page.goto(`http://127.0.0.1:${port}/hash.html`, { waitUntil: "load" });
+      await page.waitForSelector("#in", { timeout: 30_000 });
+
       const given = `${dir}/given.txt`;
-      await Deno.writeTextFile(given, "handed to the page\n");
-      const coming = page.waitForEvent("download", { timeout: 30_000 });
+      const body = "handed to the page\n".repeat(500);
+      await Deno.writeTextFile(given, body);
+      const wanted = [...new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)),
+      )].map((b) => b.toString(16).padStart(2, "0")).join("");
+
       await page.setInputFiles("#f", given);
+      await page.waitForFunction(
+        "document.getElementById('note').textContent.startsWith('from ')",
+        null,
+        { timeout: 30_000 },
+      );
+      assertEquals(await page.textContent("#sha"), wanted, "the page's SHA-256 of the file");
+      assertEquals(await page.textContent("#len"), String(body.length));
+
+      const coming = page.waitForEvent("download", { timeout: 30_000 });
+      await page.click("#save");
       const back = await coming;
-      assertEquals(back.suggestedFilename(), "given.txt.copy");
-      assertEquals((await page.textContent("#info"))?.includes("19 bytes"), true, await page.textContent("#info") ?? "");
+      assertEquals(back.suggestedFilename(), "given.txt.gz");
+      // Decompressed by the runtime, so the claim is "a real gzip container" and not "our gzip
+      // agrees with our gunzip" — the two ends of a round trip running the same code test only
+      // that the code is symmetrical.
+      const gz = await Deno.readFile((await back.path())!);
+      const plain = new Response(
+        new Blob([gz as BlobPart]).stream().pipeThrough(new DecompressionStream("gzip")),
+      );
+      assertEquals(await plain.text(), body, "what the page compressed, ungzipped");
 
       // And the shell, which is `packages/sh` unchanged with a keyboard in front of it.
       await buildApp(
@@ -262,6 +315,73 @@ Deno.test({
       assertEquals((await command("for i in 1 2 3; do echo $i; done")).endsWith("1\n2\n3"), true);
       // Redirection into OPFS and back out again: a shell with a real filesystem under it.
       assertEquals((await command("echo kept > note.txt; cat note.txt")).endsWith("kept"), true);
+
+      // A page spawning a program of its own: issue 0030's whole claim, in a real browser.
+      //
+      // The child is a `--worker` bundle built for the browser, put into the Origin Private File
+      // System by this test — because that is the honest gap 0030 names. A page has no filesystem
+      // full of programs, so somebody has to put one there, and once it is there `spawn` reads it
+      // like any other file. What this proves that the double cannot: a worker created *by a
+      // worker*, its own `SharedArrayBuffer`, and its calls answered by the page while its parent is
+      // parked in `Atomics.wait`.
+      const childBundle = await Deno.makeTempFile({ prefix: "wac-child-", suffix: ".worker.js" });
+      await buildApp("packages/platform/example/wc.wac", childBundle, {}, "browser", true);
+      await buildApp(
+        "packages/platform/example/runner.wac",
+        `${dir}/runner.html`,
+        { read: true },
+        "browser",
+      );
+      const bundleSource = await Deno.readTextFile(childBundle);
+      await Deno.remove(childBundle);
+
+      // Written straight into OPFS from the page's own thread, which is the only way in: there is
+      // no other route to a page's private filesystem, and that is the point of it.
+      await page.goto(`http://127.0.0.1:${port}/runner.html`, { waitUntil: "load" });
+      await page.evaluate(
+        `(async (source) => {
+          const root = await navigator.storage.getDirectory();
+          const handle = await root.getFileHandle("wc.worker.js", { create: true });
+          const w = await handle.createWritable();
+          await w.write(source);
+          await w.close();
+        })(${JSON.stringify(bundleSource)})`,
+      );
+
+      await page.goto(
+        `http://127.0.0.1:${port}/runner.html?a=wc.worker.js&a=${encodeURIComponent("one two three")}`,
+        { waitUntil: "load" },
+      );
+      await page.waitForFunction(
+        "document.body.innerText.includes('[exit')",
+        null,
+        { timeout: 30_000 },
+      );
+      const spawned = (await page.evaluate("document.body.innerText")) as string;
+      // `wc` of "one two three\n": one line, three words, fourteen bytes. Compared against the same
+      // program run natively rather than against a literal, which is the differential this file is
+      // for — the child is the same source built for a different host.
+      const nativeWc = new Deno.Command(native, {
+        args: [],
+        stdin: "piped",
+        stdout: "piped",
+      }).spawn();
+      const wr = nativeWc.stdin.getWriter();
+      await wr.write(new TextEncoder().encode("one two three\n"));
+      await wr.close();
+      const nativeOut = new TextDecoder().decode((await nativeWc.output()).stdout).trim();
+      assertEquals(spawned.includes(nativeOut), true, `page: ${spawned}\nnative: ${nativeOut}`);
+      assertEquals(spawned.includes("[exit 0]"), true, spawned);
+
+      // And the same page running *itself* as a child, which is the half of 0030 that matters for a
+      // browser: there is no filesystem of programs in a tab, so the only program a page reliably has
+      // is the one it already is. No file was written for this one — that is the whole point.
+      await buildApp("packages/platform/example/twin.wac", `${dir}/twin.html`, {}, "browser");
+      const twin = await run("twin.html");
+      assertEquals(twin.includes("parent: about to run myself"), true, twin);
+      assertEquals(twin.includes("SHOUT: HELLO TWIN"), true, twin);
+      assertEquals(twin.includes("parent: the child exited 0"), true, twin);
+      assertEquals(twin.includes("[exit 0]"), true, twin);
 
       assertEquals(failures.join("\n"), "", "the page raised errors");
     } finally {

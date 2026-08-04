@@ -51,6 +51,121 @@ Deno.test("a wac program runs another wac program as a worker", async () => {
   }
 });
 
+Deno.test("a source that is not a program is a failed child, not a dead parent — 0021", async () => {
+  // Not a shell test. `packages/sh` was where this was found, but the parent here is platform's
+  // own example: a worker whose source does not parse throws while loading, and that error is not
+  // contained by default — it reached the parent, which died with Deno's own message on stderr
+  // before it could call the child failed. wac-mono issue 0021.
+  const runner = await Deno.makeTempFile({ prefix: "wac-runner-" });
+  const notAProgram = await Deno.makeTempFile({ prefix: "wac-bad-", suffix: ".worker.js" });
+  try {
+    await buildApp("packages/platform/example/runner.wac", runner, { read: true });
+    await Deno.writeTextFile(notAProgram, "this is not javascript {{{\n");
+
+    const r = new Deno.Command(runner, {
+      args: [notAProgram, "anything"],
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    const err = new TextDecoder().decode(r.stderr);
+
+    // 1, because that is what `runner.wac` returns for a child it could not start. The point is
+    // that the *program* decided it: before this, the process died with 1 and nothing of its own.
+    assertEquals(r.code, 1, err);
+    assertEquals(err.includes("runner: "), true, `the program reported it, not the runtime: ${err}`);
+    assertEquals(err.includes("SyntaxError"), true, `with the host's reason: ${err}`);
+    // The line that used to be there, and is the parent dying rather than reporting.
+    assertEquals(err.includes("Unhandled error in child worker"), false, err);
+
+    // The worker's *own* isolate still prints its uncaught error, which no parent can prevent —
+    // `preventDefault` stops the propagation, not the child's own report. So stderr holds two
+    // accounts of one failure, and only one of them is ours. Asserted rather than lamented: if
+    // Deno ever stops printing it, this is where to notice.
+    assertEquals(err.includes("Uncaught (in worker"), true, err);
+  } finally {
+    await Deno.remove(runner);
+    await Deno.remove(notAProgram);
+  }
+});
+
+Deno.test("a program runs itself, with no file to read and nothing to find", async () => {
+  // `spawnSelf` is what makes a *browser tab* able to run programs at all — there is no directory of
+  // bundles there — and it is the same capability everywhere, so this checks it where it is easiest
+  // to see. The child is this program with different arguments, which is what a multi-call binary is.
+  const twin = await Deno.makeTempFile({ prefix: "wac-twin-" });
+  const nodeTwin = await Deno.makeTempFile({ prefix: "wac-twin-node-" });
+  try {
+    await buildApp("packages/platform/example/twin.wac", twin, {});
+    const r = new Deno.Command(twin, { stdout: "piped", stderr: "piped" }).outputSync();
+    const err = new TextDecoder().decode(r.stderr);
+    assertEquals(r.code, 0, err);
+    assertEquals(
+      new TextDecoder().decode(r.stdout),
+      "parent: about to run myself\nSHOUT: HELLO TWIN\nparent: the child exited 0\n",
+      err,
+    );
+    // No grant of any kind: the program was built with none, and running itself needs none.
+    assertEquals((await Deno.readTextFile(twin)).split("\n")[0], "#!/usr/bin/env -S deno run", "no flags");
+
+    // And the same source, the same behaviour, on Node — where the worker is made a different way.
+    await buildApp("packages/platform/example/twin.wac", nodeTwin, {}, "node");
+    const n = new Deno.Command("node", { args: [nodeTwin], stdout: "piped", stderr: "piped" })
+      .outputSync();
+    assertEquals(n.code, 0, new TextDecoder().decode(n.stderr));
+    assertEquals(
+      new TextDecoder().decode(n.stdout),
+      new TextDecoder().decode(r.stdout),
+      "byte for byte what Deno said",
+    );
+  } finally {
+    await Deno.remove(twin);
+    await Deno.remove(nodeTwin);
+  }
+});
+
+Deno.test("Node spawns the same way, from the same code", async () => {
+  // The point is not that Node can spawn — it is that it spawns through the *same* `spawnChild`.
+  // Only how a worker is made differs there (a source string with `eval`, rather than a module from
+  // a blob URL), which is why that is an argument rather than a third copy of the queues, the load
+  // notice and the grace period.
+  const runner = await Deno.makeTempFile({ prefix: "wac-node-runner-" });
+  const child = await Deno.makeTempFile({ prefix: "wac-node-child-", suffix: ".worker.js" });
+  try {
+    await buildApp("packages/platform/example/runner.wac", runner, { read: true }, "node");
+    await buildApp("packages/platform/example/wc.wac", child, {}, "node", true);
+
+    const r = new Deno.Command("node", {
+      args: [runner, child, "one two three"],
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    const err = new TextDecoder().decode(r.stderr);
+    assertEquals(r.code, 0, err);
+    // `wc` of "one two three\n" — one line, three words, fourteen bytes — counted by a child
+    // worker whose output came back through its handle.
+    assertEquals(new TextDecoder().decode(r.stdout).trim(), "1 3 14", err);
+
+    // And a source that is not a program is a failed child here too, with a reason and no crash.
+    const notAProgram = await Deno.makeTempFile({ prefix: "wac-node-bad-" });
+    try {
+      await Deno.writeTextFile(notAProgram, "this is not javascript {{{\n");
+      const bad = new Deno.Command("node", {
+        args: [runner, notAProgram, "anything"],
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      const badErr = new TextDecoder().decode(bad.stderr);
+      assertEquals(bad.code, 1, badErr);
+      assertEquals(badErr.includes("runner: "), true, badErr);
+    } finally {
+      await Deno.remove(notAProgram);
+    }
+  } finally {
+    await Deno.remove(runner);
+    await Deno.remove(child);
+  }
+});
+
 Deno.test("a child is granted nothing, even by a parent that has it", async () => {
   // The property that makes `spawn` worth having over process spawn: what the child may do
   // is the *parent's* choice, not the operating system's. `--allow-run=/bin/sh` cannot

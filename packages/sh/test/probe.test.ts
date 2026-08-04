@@ -17,8 +17,19 @@ import { wacBind } from "../../../harness/wacBind.ts";
 Deno.test("the coverage probe compiles against the current platform", async () => {
   const mod = await wacBind("packages/sh/test/wac/probe.wac") as unknown as {
     shStatus(src: string): number;
+    shOut(src: string): Uint8Array;
   };
   // And it runs, so a probe that compiles but cannot build its fake world is caught too.
   const status = mod.shStatus("exit 3");
   if (status !== 3) throw new Error(`the probe ran 'exit 3' and reported ${status}`);
+
+  // A world with no `spawn` falls through to the shell's own implementations rather than reporting
+  // the program broken. The fake world answers -2 for `/bin/echo`, which is both a name on
+  // `$WACPATH` and a builtin — so "hi" proves the fallthrough and 126 would prove the bug. This is
+  // the browser terminal's case: a page cannot spawn, and sixty applets work there anyway.
+  const out = new TextDecoder().decode(mod.shOut("WACPATH=/bin; echo hi"));
+  if (out !== "hi\n") throw new Error(`a world without spawn did not fall through: ${JSON.stringify(out)}`);
+  if (mod.shStatus("WACPATH=/bin; echo hi") !== 0) {
+    throw new Error("...and its status was not 0");
+  }
 });

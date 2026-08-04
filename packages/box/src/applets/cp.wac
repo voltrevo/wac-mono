@@ -2,7 +2,7 @@
 // an interruption partway can hurt. See `lib/safe.wac` for why the temporary name is
 // worth the extra step.
 
-import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Change, Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
 import { streamAtomic } from "../lib/safe.wac";
@@ -11,7 +11,8 @@ export i32 cp(Core core, Cli cli, Args a) {
   if (a.rest.len() < 2) { core.warn("usage: " + a.name + " <src> <dst>"); return 2; }
   Input in = openStream(core, cli, a, 0);
   if (!in.ok) { return 1; }
-  if (streamAtomic(core, cli, a.rest[1])) { return 0; }
-  core.warn(a.name + ": " + a.rest[1] + ": cannot write");
+  Change wrote = streamAtomic(core, cli, a.rest[1]);
+  if (wrote.ok()) { return 0; }
+  core.warn(a.name + ": " + a.rest[1] + ": " + wrote.message);
   return 1;
 }

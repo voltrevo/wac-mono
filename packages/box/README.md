@@ -73,9 +73,28 @@ cross-origin isolation headers `SharedArrayBuffer` needs — `box httpd -x` send
 makes the whole loop wac.
 
 **`example/term.wac` is `packages/sh` in a tab**: pipelines, loops, variables, arithmetic and
-redirection into a filesystem that survives a reload, with the shell unchanged. What it cannot
-run is `$WACPATH` programs, because those need `spawn` and `spawn` is Deno-only — `ls` reports
-`command not found`, which is honest rather than hidden.
+redirection into a filesystem that survives a reload, with the shell unchanged — **and every
+applet in this package as a command you can type**, which is `src/shrun.wac` and one line of
+wiring:
+
+```wac
+sh.external = boxRun;
+```
+
+`sort`, `sha256sum`, `gzip`, `cut`, `diff`, `shuf`, `strings`, `tar`: the same code that runs on a
+command line, in the page. It is not spawning them — `spawn` is Deno-only, so `platform` grew
+`pushChild`/`popChild`, which give a function its own argv, standard input and working directory
+and keep what it writes. An applet needs no change to run that way and cannot tell.
+
+What is missing is therefore isolation rather than the programs: an applet running in the shell has
+the page's own authority, and
+[issue 0030](../../issues/open/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md)
+is the honest fix. A real `$WACPATH` program still needs `spawn` and so still does not run here.
+
+Typing into that terminal is also how `sort -n` was found missing: the flag parsed, nothing read
+it, and `seq 1 20 | sort -n` answered 1, 10, 11. The words fixture in the differential test could
+not catch it — every line counts as zero, so honouring the flag and ignoring it agree. There are
+numbers in that test now.
 
 **`example/hash.wac`** hashes and compresses what you type as you type it, from `crypto` and
 `gzip` unchanged: 18KB of text to a SHA-256 and 131 gzipped bytes in about a millisecond, on a

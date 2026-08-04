@@ -1,0 +1,53 @@
+// Everything `sh` does once it has a shell, so that a caller which built one differently can reuse
+// it.
+//
+// A separate file for a blunt reason: `bindgen` generates a host binding for every export of the
+// module being built, and this function takes a `Shell` — which, since it gained a funcref field,
+// is a struct `bindgen` cannot currently express. Exporting it from `sh.wac` made every build of
+// `sh.wac` emit wasm that would not compile, and the shell failed all 539 differential scripts at
+// once with `Unknown heap type -34`. Here it is exported for wac to import and `sh.wac` exports
+// only `main`, which binds cleanly. wac issue 0062, filed by agent-b the day before this hit it.
+
+import { Cli, Core, FileResult } from "../../platform/src/platform.wac";
+import { Shell, runScript } from "./exec.wac";
+
+/**
+ * The whole of `main`, over a shell somebody else built.
+ *
+ * `first` is where this program's own arguments begin: 0 when it *is* `sh`, and 1 under `box`,
+ * whose first argument is the applet name. Split out so that a caller which has wired something
+ * into `Shell.external` — `box`'s applets, say — gets argument handling, the file-or-`-c`-or-stdin
+ * choice and the standard-error flush rather than reimplementing them and drifting.
+ */
+export i32 shellMain(Core core, Cli cli, Shell sh, i32 first) {
+  string src = "";
+
+  i32 n = cli.argCount().wait() - first;
+  if (n >= 1 && cli.arg(first).wait() == "-c") {
+    if (n < 2) {
+      core.warn("sh: -c needs a script");
+      return 2;
+    }
+    // Everything after `-c` joined with spaces, as `sh -c` does: the shell re-splits it anyway.
+    src = cli.arg(first + 1).wait();
+    for (i32 i = first + 2; i < first + n; i++) { src = src + " " + cli.arg(i).wait(); }
+  } else if (n >= 1) {
+    FileResult f = cli.readFile(cli.arg(first).wait()).wait();
+    if (!f.ok) {
+      core.warn("sh: " + cli.arg(first).wait() + ": " + f.error);
+      return 127;
+    }
+    src = string.fromBytes(f.bytes);
+  } else {
+    src = string.fromBytes(cli.readStdin().wait());
+  }
+
+  i32 status = runScript(sh, src);
+
+  // A non-capturing shell has already written its diagnostics, in the order it produced them —
+  // `Shell.err` does that now, where the whole buffer used to be flushed here through `Core.warn`
+  // with its trailing newline shaved off by hand. What remains is a *capturing* shell's buffer,
+  // which only reaches a terminal if this is where it ends up. Issue 0014.
+  if (sh.errOut.len > 0) { cli.writeErr(sh.errOut.bytes()); }
+  return status;
+}

@@ -21,7 +21,7 @@ import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import {
   recordSeal, recordOpen, recordType, recordContent, suiteAes128Gcm,
   suiteChaCha20, suiteKeyLen, typeHandshake, typeApplicationData, typeAlert,
-  maxPlaintext,
+  maxPlaintext, recordsReady,
 } from "../../src/record.wac";
 import {
   alertBody, alertCloseNotify, alertUnexpectedMessage, alertBadRecordMac,
@@ -225,5 +225,71 @@ export string test_the_alert_codes_are_the_ones_rfc_8446_assigns() {
   t.eqI32(alertBody(alertCloseNotify())[0], 1, "close_notify is a warning");
   t.eqI32(alertBody(alertUnknownCa())[0], 2, "unknown_ca is fatal");
   t.eqI32(alertBody(alertUnknownCa())[1], 48, "and carries its own description");
+  return t.report();
+}
+
+
+u8[] cut(u8[] b, i32 n) {
+  u8[] o = u8[n]();
+  for (i32 i = 0; i < n; i++) { o[i] = b[i]; }
+  return o;
+}
+/**
+ * TLS record framing.
+ *
+ * `tlsClientFeed` takes whole records only and traps otherwise, and for as long as this
+ * package existed the Tor link handed it whatever `recv` returned. It survived because a
+ * directory fetch is a few small records; the first real transfer through the proxy arrived
+ * as 44KB in one chunk with the last record cut in half, and the client aborted.
+ */
+u8[] record(i32 bodyLen) {
+  u8[] r = u8[5 + bodyLen]();
+  r[0] = 23; r[1] = 3; r[2] = 3;
+  r[3] = bodyLen >> 8; r[4] = bodyLen & 255;
+  return r;
+}
+
+u8[] join(u8[] a, u8[] b) {
+  u8[] o = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { o[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { o[a.len() + i] = b[i]; }
+  return o;
+}
+
+export string test_only_whole_records_are_offered() {
+  T t = T.create();
+  t.eqI32(recordsReady(u8[0]()), 0, "nothing yet");
+  t.eqI32(recordsReady(u8[](23, 3, 3)), 0, "not even a header");
+  t.eqI32(recordsReady(u8[](23, 3, 3, 0, 100)), 0, "a header promising a body that is absent");
+
+  u8[] one = record(100);
+  t.eqI32(recordsReady(one), 105, "exactly one record");
+  for (i32 i = 0; i < 105; i++) {
+    t.eqI32(recordsReady(cut(one, i)), 0, "one record cut at " + itoa64(i as i64));
+  }
+
+  u8[] three = join(join(record(10), record(20)), record(30));
+  t.eqI32(recordsReady(three), 15 + 25 + 35, "three records back to back");
+  t.eqI32(recordsReady(join(three, u8[](23, 3, 3, 0, 200))), 75,
+       "three whole ones, and a fourth whose body has not arrived");
+  t.eqI32(recordsReady(join(three, u8[](23))), 75, "a fourth that is one byte of header");
+  return t.report();
+}
+
+/** The failing case as it actually arrived: many records and a split one, in one chunk. */
+export string test_a_chunk_of_eighty_records_with_the_last_one_split() {
+  T t = T.create();
+  u8[] many = u8[0]();
+  for (i32 i = 0; i < 80; i++) { many = join(many, record(542)); }
+  t.eqI32(recordsReady(many), 80 * 547, "eighty whole records");
+
+  // The 81st, arriving as its first nine bytes and no more. This is the shape that trapped:
+  // a header that says 542 and a body that is nine bytes into arriving.
+  t.eqI32(recordsReady(join(many, cut(record(542), 9))), 80 * 547,
+       "the split record is held back, not fed");
+
+  // And once the rest of it turns up, it is offered along with everything else.
+  t.eqI32(recordsReady(join(many, record(542))), 81 * 547,
+       "the completed record joins the batch");
   return t.report();
 }

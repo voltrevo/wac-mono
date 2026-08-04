@@ -19,9 +19,26 @@ export struct Args {
   string name;
   /** The letters of every `-x` flag, concatenated: `-iv` and `-i -v` both give "iv". */
   string flags;
-  /** `-5`, or `-n 5`. Zero when absent, which each applet reads as its own default. */
+  /** `-5`, or `-n 5` where the applet takes one. Meaningless unless `hasNum`. */
   i32 num;
+  /**
+   * Whether a numeric option was actually given.
+   *
+   * Zero used to mean both "absent" and "the user asked for zero", so `head -0` printed ten lines:
+   * every applet spelled its default as `a.num == 0 ? 10 : a.num`, and there was no way to say zero.
+   */
+  bool hasNum;
   string[] rest;
+  /**
+   * The arguments exactly as they were spelled, which `flagValue` needs and the fields above
+   * cannot reconstruct: `-iv` and `-d,` are both "letters after a dash" once parsed.
+   *
+   * Kept here rather than read back from the `Cli` so that an `Args` means the same thing however
+   * it was built. It used to come from `cli.arg(i)`, which was fine while the only arguments in
+   * existence were the process's own — and wrong the moment `packages/sh` began running applets
+   * in-process with a command line of its own.
+   */
+  string[] argv;
 }
 
 export bool has(Args a, i32 flag) {
@@ -42,35 +59,71 @@ export Args parseArgs(Cli cli) {
 }
 
 export Args parseFrom(Cli cli, i32 first, string name) {
-  // Counted first so the array is the right size: there is no growable list here, and
-  // walking twice is less code than guessing a capacity and copying.
-  i32 count = 0;
-  for (i32 i = first; i < cli.argCount().wait(); i++) {
-    if (!isFlag(cli.arg(i).wait())) { count++; }
-  }
-  string[] rest = string[count](fill: "");
+  // Materialised, then parsed by the list form below. The parser used to read `cli.arg(i)` inside
+  // its loops, which meant it could only ever parse *this process's* arguments — and the shell
+  // running an applet in-process has a `Vec<string>` of its own to hand over. Same parser, so a
+  // flag cannot come to mean one thing under `box` and another under `sh`.
+  i32 n = cli.argCount().wait();
+  string[] argv = string[n](fill: "");
+  for (i32 i = 0; i < n; i++) { argv[i] = cli.arg(i).wait(); }
+  return parseList(argv, first, name);
+}
+
+/** The same, over arguments somebody already has. `first` is where the applet's own begin. */
+export Args parseList(string[] argv, i32 first, string name) {
+  // **One pass.** It used to count positionals, allocate, then fill — and the two walks disagreed
+  // about whether `-n 2` consumes the `2`, so `tail -n 2 file` allocated two slots and wrote one,
+  // leaving a phantom `""` that reached `openStream` as an empty path. A scratch array of the
+  // largest it could be, then a copy of exactly what was written, cannot drift that way.
+  string[] scratch = string[argv.len()](fill: "");
+  i32 at = 0;
 
   string flags = "";
   i32 num = 0;
-  i32 at = 0;
+  bool hasNum = false;
   i32 i = first;
-  while (i < cli.argCount().wait()) {
-    string s = cli.arg(i).wait();
-    if (!isFlag(s)) { rest[at] = s; at++; i++; continue; }
+  bool optionsOver = false;
+  while (i < argv.len()) {
+    string s = argv[i];
+    // `--` ends the options, as it does everywhere else. Without it an operand beginning with a
+    // dash could not be named at all: `box cat -- -x` treated both arguments as flags, left `rest`
+    // empty, and `cat` read standard input and succeeded — the file never opened and nothing said
+    // so. Everything after it is an operand, including a later `--`.
+    if (!optionsOver && s == "--") { optionsOver = true; i++; continue; }
+    if (optionsOver || !isFlag(s)) { scratch[at] = s; at++; i++; continue; }
     u8[] b = s.toBytes();
     if (b[1] >= '0' && b[1] <= '9') {
       num = atoi(string.fromBytes(slice(b, 1, b.len())));          // -5
+      hasNum = true;
     } else {
       for (i32 k = 1; k < b.len(); k++) {
-        bool takesValue = b[k] == 'n' && i + 1 < cli.argCount().wait() && allDigits(cli.arg(i + 1).wait());
-        if (takesValue) { num = atoi(cli.arg(i + 1).wait()); i++; }       // -n 5
+        bool takesValue = b[k] == 'n' && nTakesValue(name) &&
+          i + 1 < argv.len() && allDigits(argv[i + 1]);
+        if (takesValue) { num = atoi(argv[i + 1]); hasNum = true; i++; }  // -n 5
         else { flags = flags + string.fromBytes(slice(b, k, k + 1)); }
       }
     }
     i++;
   }
-  return Args(name, flags, num, rest);
+
+  string[] rest = string[at](fill: "");
+  for (i32 k = 0; k < at; k++) { rest[k] = scratch[k]; }
+  return Args(name, flags, num, hasNum, rest, argv);
 }
+
+/**
+ * Whether this applet's `-n` takes the next argument as a value.
+ *
+ * It used to be every applet's, on the reasoning that only `tail` had one — so `grep -n 123 file`
+ * put 123 in `num`, left `n` out of the flags, and searched for `file`. Two silent wrong answers
+ * from one rule: `grep -n` stopped numbering, and its pattern became its filename.
+ *
+ * A list rather than a schema because there are two. `head` and `tail` take `-n N`, as GNU's do;
+ * `fold` takes `-N` attached and `-w` in GNU, and everything else — `grep -n`, `sort -n`, `uniq -c`
+ * — is a boolean. If a third applet ever wants a detached value, this is where it says so, and the
+ * cost of forgetting is a wrong answer rather than a compile error. Prefer attached `-5`.
+ */
+bool nTakesValue(string name) { return name == "head" || name == "tail"; }
 
 /**
  * The value of a flag that takes one, attached: the `,` of `-d,`.
@@ -85,11 +138,11 @@ export Args parseFrom(Cli cli, i32 first, string name) {
  * an applet that accepted it here would read one argument twice. An applet should treat the
  * empty result as a usage error rather than guess, which is what `cut` does.
  */
-export string flagValue(Cli cli, i32 letter) {
+export string flagValue(Args a, i32 letter) {
   // From 0, which is safe under both layouts: an applet name never begins with a dash,
   // so `box`'s extra leading argument cannot be mistaken for a flag.
-  for (i32 i = 0; i < cli.argCount().wait(); i++) {
-    u8[] b = cli.arg(i).wait().toBytes();
+  for (i32 i = 0; i < a.argv.len(); i++) {
+    u8[] b = a.argv[i].toBytes();
     if (b.len() < 2 || b[0] != '-' || b[1] != letter) { continue; }
     if (b.len() > 2) { return string.fromBytes(slice(b, 2, b.len())); }
   }

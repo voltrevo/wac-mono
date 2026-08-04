@@ -30,6 +30,7 @@ const mod = await wacBind("packages/datetime/test/probe.wac") as unknown as {
   accepts(s: Uint8Array): boolean;
   parseMillis(s: Uint8Array): bigint;
   parseOffset(s: Uint8Array): number;
+  parseOffsetKnown(s: Uint8Array): number;
   formatMillis(ms: bigint): Uint8Array;
 };
 
@@ -185,6 +186,19 @@ Deno.test("format matches Date.toISOString", () => {
     const ms = BigInt(next() % 4000000) * 100000n - 200000000000n;
     cases.push(ms);
   }
+  // Outside 0000..9999, where the year needs a sign and six digits. The random spread above cannot
+  // reach here — it covers about 1963 to 1976 — so a four-digit year that silently took the value
+  // modulo ten thousand passed for as long as it existed: year 10000 printed `0000`.
+  // GitHub wac-mono#1.
+  cases.push(
+    253402300800000n,   // +010000-01-01, the first year that needs the expanded form
+    253402300799999n,   // and the last that does not
+    -62167219200000n,   // 0000-01-01
+    -62167219200001n,   // -000001-12-31, one millisecond before year zero
+    8640000000000000n,  // +275760-09-13, the largest instant Date supports
+    -8640000000000000n, // -271821-04-20, the smallest
+  );
+
   for (const ms of cases) {
     const want = new Date(Number(ms)).toISOString();
     const got = dec.decode(mod.formatMillis(ms));
@@ -294,5 +308,24 @@ Deno.test("parse and format round-trip", () => {
     if (!mod.accepts(text)) throw new Error(`${dec.decode(text)} did not parse back`);
     const back = mod.parseMillis(text);
     if (back !== ms) throw new Error(`${dec.decode(text)}: parsed back as ${back}, want ${ms}`);
+  }
+});
+
+Deno.test("-00:00 is an unknown offset, not zero", () => {
+  // RFC 3339 §4.3: `-00:00` says the instant is known and the local offset is not. `Z` and `+00:00`
+  // both assert zero. All three used to arrive as offsetMin == 0 and were indistinguishable, so the
+  // one thing `offsetMin` exists to preserve was the thing lost. GitHub wac-mono#15.
+  const enc = new TextEncoder();
+  const known = (s: string) => mod.parseOffsetKnown(enc.encode(s));
+  const offset = (s: string) => mod.parseOffset(enc.encode(s));
+
+  if (known("1970-01-01T00:00:00-00:00") !== 0) throw new Error("-00:00 should be unknown");
+  if (known("1970-01-01T00:00:00+00:00") !== 1) throw new Error("+00:00 asserts zero");
+  if (known("1970-01-01T00:00:00Z") !== 1) throw new Error("Z asserts zero");
+  if (known("1970-01-01T00:00:00+05:30") !== 1) throw new Error("a real offset is known");
+
+  // And all of them still describe the same instant, which is the part that was never wrong.
+  for (const s of ["1970-01-01T00:00:00-00:00", "1970-01-01T00:00:00+00:00", "1970-01-01T00:00:00Z"]) {
+    if (offset(s) !== 0) throw new Error(`${s}: offset should be 0, got ${offset(s)}`);
   }
 });

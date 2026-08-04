@@ -14,6 +14,33 @@ import { browserWorld, type DirHandle, type FileHandle } from "../host/browser.t
 import { i32le, readI32le, str, unstr } from "../host/call.ts";
 import { OP } from "../host/ops.ts";
 
+/**
+ * The bytes out of a `Read` payload: tag 0 is data, 1 is the end, 2 is a failure.
+ *
+ * These tests speak the wire format directly, so they see the tag that `provider.ts` decodes into a
+ * `Read`. Worth decoding rather than ignoring: a test that skipped the tag byte would pass while
+ * reporting one byte too many, and one that treated "end" as "no bytes" would loop for ever — which
+ * is exactly what the first version of this change did.
+ */
+function readBytes(p: Uint8Array): Uint8Array {
+  if (p.length === 0 || p[0] === 1) return new Uint8Array(0);
+  if (p[0] === 2) {
+    throw new Error(`the read failed: ${new TextDecoder().decode(p.subarray(1))}`);
+  }
+  return p.subarray(1);
+}
+
+
+/**
+ * A `Change` payload: the fault category, and the message it carries.
+ *
+ * The four mutations do not reject — they answer, because their category is the thing a caller
+ * branches on and an exception has nowhere to put one.
+ */
+function change(p: Uint8Array): { fault: number; message: string } {
+  return { fault: p[0], message: new TextDecoder().decode(p.subarray(1)) };
+}
+
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
   if (got !== want) {
@@ -39,13 +66,40 @@ async function rejects(fn: () => unknown | Promise<unknown>, contains: string): 
 // Only the four methods `browser.ts` uses. A fake rather than a mock: it really stores
 // bytes and really has a hierarchy, so a path bug shows up as a wrong answer here too.
 
-function memDir(): DirHandle {
+/**
+ * What a real Origin Private File System rejects with: a `DOMException`, named.
+ *
+ * The name is the whole point. `host/faults.ts` classifies a browser failure by
+ * `DOMException.name` — there are no errno codes here — so a double that rejected with a plain
+ * `Error` would put every failure in `FAULT_OTHER` and quietly agree with itself: `rm -f` would look
+ * tested and would not be. This is the shape of mistake `browser_live.test.ts`'s header warns about,
+ * where a double's assumptions came from the same place as the code's.
+ */
+function opfsError(name: string, message: string): Error {
+  // `DOMException` exists in Deno, so this is the real class rather than an impression of it.
+  return new DOMException(message, name);
+}
+
+/**
+ * A double with one extra question: is it empty?
+ *
+ * A real `FileSystemDirectoryHandle` answers that only asynchronously, through `keys()`, but the
+ * *parent* needs it synchronously inside `removeEntry` to decide between "not empty" and "removed".
+ * A browser has the answer in memory; this double gives itself the same shortcut rather than
+ * pretending `removeEntry` is more asynchronous than it is.
+ */
+type MemDir = DirHandle & { emptyNow(): boolean };
+
+function memDir(): MemDir {
   const files = new Map<string, Uint8Array>();
-  const dirs = new Map<string, DirHandle>();
-  const self: DirHandle = {
+  const dirs = new Map<string, MemDir>();
+  const self: MemDir = {
+    emptyNow: () => files.size === 0 && dirs.size === 0,
     getFileHandle(name, opts) {
       if (!files.has(name)) {
-        if (opts?.create !== true) return Promise.reject(new Error(`no file ${name}`));
+        if (opts?.create !== true) {
+          return Promise.reject(opfsError("NotFoundError", `no file ${name}`));
+        }
         files.set(name, new Uint8Array(0));
       }
       const h: FileHandle = {
@@ -78,14 +132,22 @@ function memDir(): DirHandle {
     },
     getDirectoryHandle(name, opts) {
       if (!dirs.has(name)) {
-        if (opts?.create !== true) return Promise.reject(new Error(`no directory ${name}`));
+        if (opts?.create !== true) {
+          return Promise.reject(opfsError("NotFoundError", `no directory ${name}`));
+        }
         dirs.set(name, memDir());
       }
       return Promise.resolve(dirs.get(name)!);
     },
-    removeEntry(name) {
+    removeEntry(name, opts) {
+      // A directory with anything in it is `InvalidModificationError` without `recursive`, which is
+      // how a browser says "not empty" — it has no errno to say it with.
+      const dir = dirs.get(name);
+      if (dir !== undefined && opts?.recursive !== true && !dir.emptyNow()) {
+        return Promise.reject(opfsError("InvalidModificationError", `${name} is not empty`));
+      }
       if (!files.delete(name) && !dirs.delete(name)) {
-        return Promise.reject(new Error(`no entry ${name}`));
+        return Promise.reject(opfsError("NotFoundError", `no entry ${name}`));
       }
       return Promise.resolve();
     },
@@ -155,9 +217,34 @@ Deno.test("the browser world honours the capabilities a page can honour", async 
 
   assertEquals(unstr(await call(OP.READ_DIR, str("a"))), "b");
 
-  // Without -p a missing parent fails, and so does an existing directory.
-  await rejects(() => call(OP.MKDIR, new Uint8Array([0, ...str("x/y")])), "no directory");
-  await rejects(() => call(OP.MKDIR, new Uint8Array([0, ...str("a")])), "already exists");
+  // Without -p a missing parent fails, and so does an existing directory. Both answer a `Change`
+  // rather than throwing, and the second is `FAULT_EXISTS` by category — which matters here more
+  // than anywhere, because OPFS has no exclusive create and the *host* decided that fault.
+  const missingParent = change(await call(OP.MKDIR, new Uint8Array([0, ...str("x/y")])));
+  assertEquals(missingParent.fault, 1, "a missing parent is FAULT_NOT_FOUND");
+  assertEquals(missingParent.message, "no such file or directory", missingParent.message);
+  const already = change(await call(OP.MKDIR, new Uint8Array([0, ...str("a")])));
+  assertEquals(already.fault, 3, "already exists is FAULT_EXISTS");
+  assertEquals(already.message, "already exists", already.message);
+
+  // This host says a known category in its own short words rather than passing on the
+  // `DOMException` message, which is written for a console: "A requested file or directory could
+  // not be found at the time an operation was processed." reads as a defect after
+  // `rm: cannot remove 'f': `. Checked against a real browser, not only this double — the demo page
+  // is where it shows.
+  const absent = change(await call(OP.REMOVE, new Uint8Array([0, ...str("nothing-here")])));
+  assertEquals(absent.fault, 1, "FAULT_NOT_FOUND");
+  assertEquals(absent.message, "no such file or directory", absent.message);
+  // A directory with something in it, without `recursive`: `InvalidModificationError` in a browser,
+  // which has no errno to say "not empty" with.
+  const notEmpty = change(await call(OP.REMOVE, new Uint8Array([0, ...str("a")])));
+  assertEquals(notEmpty.fault, 4, "FAULT_NOT_EMPTY");
+  assertEquals(notEmpty.message, "directory not empty", notEmpty.message);
+  // ...and a fault with no category keeps the message, because there it is the only information
+  // there is. "" names no component at all, which is this host's own complaint rather than OPFS's.
+  const empty = change(await call(OP.MKDIR, new Uint8Array([0])));
+  assertEquals(empty.fault, 5, "FAULT_OTHER");
+  assertEquals(empty.message, "empty path", empty.message);
 
   // Streaming input, in CHUNK-sized pieces out of a Blob.
   await put("big.txt", "x".repeat(200_000));
@@ -165,7 +252,7 @@ Deno.test("the browser world honours the capabilities a page can honour", async 
   let total = 0;
   let chunks = 0;
   for (;;) {
-    const c = await call(OP.READ_CHUNK);
+    const c = readBytes(await call(OP.READ_CHUNK));
     if (c.length === 0) break;
     total += c.length;
     chunks++;
@@ -348,14 +435,58 @@ Deno.test("the browser world refuses what a page cannot do", async () => {
   // The finding this whole exercise was for: a page has no TCP. `fetch` is not a socket
   // and neither is a WebSocket, so `connect` is absent rather than approximated — an
   // application gets an error it can report, not one protocol that works by accident.
-  for (const op of [OP.CONNECT, OP.LISTEN, OP.ACCEPT, OP.RECV, OP.SEND]) {
+  for (const op of [OP.CONNECT, OP.LISTEN, OP.ACCEPT, OP.SEND]) {
     await rejects(() => call(op, i32le(1)), "network access not granted");
   }
+  // `recv` answers rather than rejects, because its answer is a `Read` and "there is no network" is
+  // a `Failed` — a refusal the caller must handle, in the same shape as a connection that broke.
+  const refused = await call(OP.RECV, i32le(1));
+  assertEquals(refused[0], 2, "recv on a page answers Failed");
+  assertEquals(
+    new TextDecoder().decode(refused.subarray(1)).includes("network access"),
+    true,
+    new TextDecoder().decode(refused.subarray(1)),
+  );
 
   // No standard input, and no environment. Both are answers rather than errors, because
   // a program with nothing piped in and no variables set already handles them.
   assertEquals((await call(OP.READ_STDIN)).length, 0);
   assertEquals((await call(OP.ENV, str("PATH")))[0], 0, "every variable is unset");
+});
+
+/** The payload `spawn` takes: grants, then the source length-prefixed, then NUL-joined arguments. */
+function spawnPayload(source: string, args: string[], grants = 0): Uint8Array {
+  const src = str(source);
+  const rest = str(args.join("\u0000"));
+  const out = new Uint8Array(8 + src.length + rest.length);
+  out.set(i32le(grants), 0);
+  out.set(i32le(src.length), 4);
+  out.set(src, 8);
+  out.set(rest, 8 + src.length);
+  return out;
+}
+
+Deno.test("a page spawns a worker of its own — 0030", async () => {
+  // The unit of this is the *plumbing*: a worker is created, its load notice is waited for, its
+  // handle comes back, and its exit code arrives. A child that speaks the bridge and writes output
+  // is a whole wac program, and that is tested in a real browser by `browser_live.test.ts` — here a
+  // handful of lines of JavaScript playing the same protocol is what keeps this test a unit.
+  const w = browserWorld({});
+  const child = `
+    self.postMessage({ ready: true });
+    self.onmessage = () => self.postMessage({ ok: true, code: 7 });
+  `;
+  const spawned = await w[OP.SPAWN](spawnPayload(child, ["one"])) as Uint8Array;
+  const handle = readI32le(spawned);
+  assertEquals(handle >= 1, true, `a handle, not ${handle}: ${unstr(spawned.subarray(4))}`);
+  const code = readI32le(await w[OP.EXIT_CODE](i32le(handle)) as Uint8Array);
+  assertEquals(code, 7, "the child's own exit code");
+
+  // A source that is not JavaScript is a failed child with a reason, not an error that takes the
+  // page down with it — the same contract the Deno host has. Issue 0021.
+  const bad = await w[OP.SPAWN](spawnPayload("this is not javascript {{{", [])) as Uint8Array;
+  assertEquals(readI32le(bad), -1, "would not start");
+  assertEquals(unstr(bad.subarray(4)).length > 0, true, "and says why");
 });
 
 Deno.test("the browser world denies the filesystem when the page grants none", async () => {
@@ -372,7 +503,17 @@ Deno.test("the browser world denies the filesystem when the page grants none", a
   const ro = browserWorld({ root: memDir() });
   const roCall = async (op: number, payload: Uint8Array<ArrayBufferLike> = new Uint8Array(0)) =>
     await ro[op](payload as Uint8Array) as Uint8Array;
-  await rejects(() => roCall(OP.MKDIR, new Uint8Array([1, ...str("d")])), "write not granted");
-  await rejects(() => roCall(OP.REMOVE, new Uint8Array([0, ...str("d")])), "write not granted");
+  // A refusal for want of a grant is `FAULT_DENIED` said in the ordinary shape, not an exception:
+  // one code path in the applet for "the page said no" and "the filesystem said no".
+  for (const [op, payload] of [
+    [OP.MKDIR, new Uint8Array([1, ...str("d")])],
+    [OP.REMOVE, new Uint8Array([0, ...str("d")])],
+    [OP.WRITE_FILE, new Uint8Array([1, 0, 0, 0, ...str("f"), 120])],
+    [OP.RENAME, new Uint8Array([1, 0, 0, 0, ...str("f"), ...str("g")])],
+  ] as [number, Uint8Array][]) {
+    const c = change(await roCall(op, payload));
+    assertEquals(c.fault, 2, `op ${op} is FAULT_DENIED`);
+    assertEquals(c.message.includes("write not granted"), true, c.message);
+  }
   await rejects(() => roCall(OP.OPEN_OUTPUT, str("f")), "write not granted");
 });

@@ -1,0 +1,25 @@
+// The shell, with every applet in this package as a command.
+//
+//   deno task app:build packages/box/src/bin/sh.wac --allow-read --allow-write --allow-env -o wacsh
+//   ./wacsh -c 'seq 1 20 | shuf | sort -n | head -3'
+//   ./wacsh script.sh
+//
+// `packages/sh` built on its own has twelve small programs of its own and nothing else, because it
+// cannot import this package — `box` depends on `sh`, so the wiring has to come from here. This is
+// all of it: build a shell, hand it the table, run it.
+//
+// Here rather than as a `box sh` applet because `box.wac` imports every applet, and an applet that
+// wired in `boxRun` would import `box.wac` back. A `bin/` entry is imported by nothing, so the
+// cycle does not arise.
+
+import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Shell } from "../../../sh/src/exec.wac";
+import { shellMain } from "../../../sh/src/entry.wac";
+import { boxNames, boxRun } from "../shrun.wac";
+
+export i32 main(Core core, Cli cli) {
+  Shell sh = Shell.create(core, cli);
+  sh.external = boxRun;
+  sh.externalNames = boxNames;   // so `help` lists them
+  return shellMain(core, cli, sh, 0);
+}

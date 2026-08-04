@@ -4,6 +4,11 @@ import { slice } from "./bytes.wac";
 
 export string itoa(i32 n) {
   if (n == 0) { return "0"; }
+  // The minimum has no positive counterpart: `0 - i32::MIN` wraps back to `i32::MIN`, which is still
+  // negative, so the digit loop below never runs and the answer was the sign on its own — `"-"`.
+  // Spelled out rather than computed, as `packages/fmt/src/itoa.wac` does, because the alternative
+  // is unsigned arithmetic for one input.
+  if (n == -2147483648) { return "-2147483648"; }
   i32 v = n < 0 ? 0 - n : n;
   u8[] digits = u8[12](fill: 0);
   i32 at = 12;
@@ -14,6 +19,9 @@ export string itoa(i32 n) {
 
 export string itoa64(i64 n) {
   if (n == 0) { return "0"; }
+  // As above, for 64 bits. `packages/wactest/src/itoa64.wac` formats the wrapped magnitude as
+  // unsigned instead; one literal is less machinery for the one value that needs it.
+  if (n == -9223372036854775808) { return "-9223372036854775808"; }
   i64 v = n < 0 ? 0 - n : n;
   u8[] digits = u8[24](fill: 0);
   i32 at = 24;
@@ -25,11 +33,25 @@ export string itoa64(i64 n) {
 /** Leading digits only, zero when there are none — a command line is not a parser. */
 export i32 atoi(string s) {
   u8[] b = s.toBytes();
+  if (b.len() == 0) { return 0; }
+
+  // A sign, which this used to ignore — a leading `-` failed the digit test on the first
+  // character and the answer was 0. Latent for a long time because every applet that reached
+  // here wanted a count: it surfaced as `seq 10 -3 1` refusing a step of zero it had invented
+  // itself. Safe to add, and checked: the one caller that passes a string beginning with `-` is
+  // `args.wac`, which strips the sign itself before asking, because there `-5` is a flag.
+  i32 at = 0;
+  bool neg = false;
+  if (b[0] == '-' || b[0] == '+') {
+    neg = b[0] == '-';
+    at = 1;
+  }
+
   i32 v = 0;
-  for (i32 i = 0; i < b.len(); i++) {
+  for (i32 i = at; i < b.len(); i++) {
     i32 c = b[i];
     if (c < '0' || c > '9') { break; }
     v = v * 10 + (c - '0');
   }
-  return v;
+  return neg ? 0 - v : v;
 }

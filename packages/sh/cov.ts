@@ -347,6 +347,7 @@ const SCRIPTS: string[] = [
   "/bin/prog", "/bin/badprog", "./nosuch/prog", "WACPATH=/bin; /bin/prog",
   "WACPATH=/bin; goneprog",                     // starts, then reports no status: 126, not 0
   "WACPATH=/bin; ghost",                        // stat says yes, read says no: 127
+  "WACPATH=/bin; echo hi",                      // a world with no spawn at all: falls through
   '"" x',                                       // an empty command name
 
   // ── Here-documents ──────────────────────────────────────────────────────────

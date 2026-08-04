@@ -16,7 +16,8 @@ import { browserWorld, type BrowserWorldOptions, type Dom } from "./browser.ts";
 import { cliOf, coreOf, type PageClasses, pageOf } from "./provider.ts";
 import type { AppModule } from "./entry.ts";
 
-type Start = { sab: SharedArrayBuffer };
+/** `child` is set by `spawnChild`: a spawned program runs `main`, never `page`. */
+type Start = { sab: SharedArrayBuffer; child?: boolean };
 type Result = { ok: true; code: number } | { ok: false; error: string };
 
 /**
@@ -34,6 +35,11 @@ export function runAsWorkerBrowser(load: () => Promise<AppModule>): void {
     onmessage: ((e: MessageEvent) => void) | null;
     postMessage(m: Result): void;
   };
+  // "This bundle parsed and evaluated", before the bridge has arrived and before the application
+  // runs. It is the one fact a parent cannot otherwise learn, and `children.ts` waits for it or for
+  // the load error before answering `spawn` — so a page that spawns a source which is not
+  // JavaScript gets a failed child rather than a dead parent. wac-mono issue 0021.
+  (scope as unknown as { postMessage(m: unknown): void }).postMessage({ ready: true });
   scope.onmessage = (ev: MessageEvent) => {
     const start = ev.data as Start;
     void (async () => {
@@ -48,7 +54,11 @@ export function runAsWorkerBrowser(load: () => Promise<AppModule>): void {
         // filesystem and arguments like any other program — `packages/sh` in a terminal needs
         // `Cli` to be a shell at all — and withholding it would have meant a second way to ask
         // for the same things.
-        const code = app.page !== undefined
+        // A child runs `main` even when this program also exports `page`: it was spawned, so it has
+        // a handle and no canvas, and its output belongs to whoever started it. That is what lets one
+        // bundle be both a terminal and the sixty programs the terminal runs.
+        const asChild = (start as unknown as { child?: boolean }).child === true;
+        const code = app.page !== undefined && !asChild
           ? app.page(coreOf(b, app), cliOf(b, app), pageOf(b, app as unknown as PageClasses))
           : app.main(coreOf(b, app), cliOf(b, app));
         scope.postMessage({ ok: true, code });
@@ -78,6 +88,7 @@ type El = {
   height?: number;
   files?: { length: number; item(i: number): FileLike | null };
   closest(selector: string): El | null;
+  getBoundingClientRect?(): { width: number; height: number };
   getContext?(kind: string): Ctx | null;
   addEventListener(kind: string, fn: (ev: Ev) => void): void;
 };
@@ -194,12 +205,25 @@ export function pageDom(root: El, doc: Doc, make: MakeDownload): Dom {
           if (hit === null) continue;
           // A form's `submit` would reload the page, which ends the application mid-answer.
           if (kind === "submit") ev.preventDefault();
+          // `offsetX` is in CSS pixels of the element. For a canvas that is not what the
+          // application drew into: a `<canvas width="480">` shown at `width: 100%` reports 0..504
+          // on a wide screen and 0..320 on a phone, while the buffer is always 480 across. The
+          // capability promises the element's *own* pixels, so a canvas gets scaled to its
+          // backing store — without this, click-to-zoom landed near where you clicked at one
+          // window size and visibly wrong at every other, which is the worst kind of nearly.
+          const rect = target.getBoundingClientRect?.();
+          const sx = target.width !== undefined && rect !== undefined && rect.width > 0
+            ? target.width / rect.width
+            : 1;
+          const sy = target.height !== undefined && rect !== undefined && rect.height > 0
+            ? target.height / rect.height
+            : 1;
           deliver({
             kind,
             id: hit.id,
             value: kind === "keydown" ? (ev.key ?? "") : (target.value ?? ""),
-            x: Math.round(ev.offsetX ?? 0),
-            y: Math.round(ev.offsetY ?? 0),
+            x: Math.round((ev.offsetX ?? 0) * sx),
+            y: Math.round((ev.offsetY ?? 0) * sy),
           });
           return;
         }
@@ -277,18 +301,26 @@ export async function runInPage(opts: PageOptions): Promise<number> {
   }
 
   const bridge = newBridge();
-  const responder = serveHostCalls(bridge, browserWorld(opts));
+  // `selfSource` so `spawnSelf` has something to run: a page has no filesystem of programs, and
+  // this is the program. `opts` already carries the bundle — it is what the launcher starts.
+  const responder = serveHostCalls(bridge, browserWorld({ ...opts, selfSource: opts.workerSource }));
 
   const url = URL.createObjectURL(new Blob([opts.workerSource], { type: "text/javascript" }));
   const worker = new Worker(url, { type: "module" });
   try {
     const code = await new Promise<number>((resolve, reject) => {
       worker.addEventListener("message", (ev: MessageEvent) => {
-        const r = ev.data as Result;
+        const r = ev.data as Result | { ready: true };
+        if ("ready" in r) return;   // the load notice, which the launcher has no use for
         if (r.ok) resolve(r.code);
         else reject(new Error(r.error));
       });
-      worker.addEventListener("error", (e: ErrorEvent) => reject(new Error(e.message)));
+      worker.addEventListener("error", (e: ErrorEvent) => {
+        // Contained, or the page reports it twice: once as the program's failure and once as an
+        // uncaught error of its own.
+        e.preventDefault();
+        reject(new Error(e.message));
+      });
       worker.postMessage({ sab: bridge.sab } as Start);
     });
     return code;

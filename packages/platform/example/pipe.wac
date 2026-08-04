@@ -24,6 +24,7 @@
 // something this could grow.
 
 import { Child, Cli, Core, FileResult, GRANT_NONE, Pending } from "../src/platform.wac";
+import { Read } from "../../bytes/src/read.wac";
 
 /** Standard input, in the same handle space as sockets and children. */
 const i32 STDIN = 0;
@@ -79,9 +80,9 @@ string[] argv(string s) {
  * its input closes, so a stage's own end is the only thing that finishes it.
  */
 void pump(Core core, Cli cli, i32 a, i32 b) {
-  Pending<u8[]> tIn = cli.recv(STDIN);
-  Pending<u8[]> tA = cli.recv(a);
-  Pending<u8[]> tB = cli.recv(b);
+  Pending<Read> tIn = cli.recv(STDIN);
+  Pending<Read> tA = cli.recv(a);
+  Pending<Read> tB = cli.recv(b);
   bool inLive = true;
   bool aLive = true;
 
@@ -99,29 +100,28 @@ void pump(Core core, Cli cli, i32 a, i32 b) {
     i32 got = core.waitAny(ids, -1);
     if (got < 0) { return; }
 
+    // A failed read ends that leg the way its end does, and says so — a pipeline that loses a stage
+    // to a broken pipe and reports success is the reason `Read` has three cases.
     if (from[got] == 0) {
-      u8[] c = tIn.wait();
-      if (c.len() == 0) {
-        cli.closeFeed(a);
-        inLive = false;
-      } else {
-        cli.send(a, c).wait();
-        tIn = cli.recv(STDIN);
+      match (tIn.wait()) {
+        case Data(bytes): { cli.send(a, bytes).wait(); tIn = cli.recv(STDIN); }
+        case End: { cli.closeFeed(a); inLive = false; }
+        case Failed(why): { core.warn("pipe: input: " + why); cli.closeFeed(a); inLive = false; }
       }
     } else if (from[got] == 1) {
-      u8[] c = tA.wait();
-      if (c.len() == 0) {
-        cli.closeFeed(b);
-        aLive = false;
-      } else {
-        cli.send(b, c).wait();
-        tA = cli.recv(a);
+      match (tA.wait()) {
+        case Data(bytes): { cli.send(b, bytes).wait(); tA = cli.recv(a); }
+        case End: { cli.closeFeed(b); aLive = false; }
+        case Failed(why): { core.warn("pipe: first stage: " + why); cli.closeFeed(b); aLive = false; }
       }
     } else {
-      u8[] c = tB.wait();
-      if (c.len() == 0) { return; }
-      cli.write(c);
-      tB = cli.recv(b);
+      bool over = false;
+      match (tB.wait()) {
+        case Data(bytes): { cli.write(bytes); tB = cli.recv(b); }
+        case End: { over = true; }
+        case Failed(why): { core.warn("pipe: second stage: " + why); over = true; }
+      }
+      if (over) { return; }
     }
   }
 }

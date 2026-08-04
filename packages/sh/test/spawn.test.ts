@@ -90,18 +90,27 @@ Deno.test("WACPATH entries are tried in order and a missing directory is skipped
   assertEquals(r.out, "1 1 2\n", r.err);
 });
 
-Deno.test("a file that is not a worker bundle takes the shell down — issue 0021", async () => {
+Deno.test("a file that is not a worker bundle is a failed command, not a dead shell — 0021", async () => {
   await Deno.writeTextFile(`${dir}/notaprogram`, "this is not javascript {{{\n");
   const r = await sh(`WACPATH=${dir}; notaprogram; echo still-here`);
 
-  // This asserts what *currently* happens, not what should. A worker whose source does not parse
-  // throws into the parent, which dies before the shell can call it a failed command — wac-mono
-  // issue 0021. The shell already produces 126 for a `Child` that comes back with `handle < 0`,
-  // so when that is fixed this test flips to `assertEquals(r.code, 126)` and the `still-here`
-  // check becomes the point rather than the evidence.
-  assertEquals(r.out.includes("still-here"), false, "0021 is fixed — update this test to expect 126");
-  assertEquals(r.code, 1, `out=${r.out} err=${r.err}`);
-  assertEquals(r.err.includes("child worker"), true, r.err);
+  // `still-here` is the whole point: the shell survives a file that is not a program. It used to
+  // not — the worker's load error escaped into the parent, which died with Deno's own message and
+  // no chance to report a failed command. wac-mono issue 0021.
+  assertEquals(r.out.includes("still-here"), true, `out=${r.out} err=${r.err}`);
+  // 126, not 127: it exists and would not start, which is a different answer from "no such
+  // command". The status of the *script* is `echo`'s, so 0 — the same as it is in bash.
+  assertEquals(r.code, 0, `out=${r.out} err=${r.err}`);
+  assertEquals(r.err.includes("notaprogram"), true, r.err);
+  // The reason, from the host, on one line. Without this the shell says only that something went
+  // wrong, and "it is not a worker bundle" is exactly the thing a person needs told.
+  assertEquals(r.err.includes("SyntaxError"), true, r.err);
+});
+
+Deno.test("...and the status of that command alone is 126 — 0021", async () => {
+  await Deno.writeTextFile(`${dir}/notaprogram2`, "}{ not javascript either\n");
+  const r = await sh(`WACPATH=${dir}; notaprogram2; echo $?`);
+  assertEquals(r.out, "126\n", `out=${r.out} err=${r.err}`);
 });
 
 Deno.test("a spawned program reads all of its input before answering", async () => {

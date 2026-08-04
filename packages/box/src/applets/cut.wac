@@ -8,9 +8,9 @@ import { slice } from "../lib/bytes.wac";
 import { atoi } from "../lib/num.wac";
 
 export i32 cut(Core core, Cli cli, Args a) {
-  string d = flagValue(cli, 'd');
+  string d = flagValue(a, 'd');
   i32 delim = d == "" ? '\t' : d.toBytes()[0];
-  i32 field = atoi(flagValue(cli, 'f'));
+  i32 field = atoi(flagValue(a, 'f'));
   // The value has to be attached to its flag — see `flagValue`. `-f 2` arrives here as no
   // value at all, so the usage message is what a detached spelling gets.
   if (field < 1) { core.warn("usage: " + a.name + " -f<n> [-d<c>] [file]   (attached, as -f2 -d,)"); return 2; }

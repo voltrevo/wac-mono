@@ -33,7 +33,13 @@ for attempt in 1 2 3; do
       echo "note: could not pull wac; the version check will say if it matters"
   fi
 
+  # What the machine was doing, before and after. This container is shared with other agents,
+  # and a mutation sweep next door turns a fifty-second suite into half an hour — which looks
+  # exactly like a hang if nothing says otherwise. Twice now that has cost time to diagnose, so
+  # the numbers are printed rather than remembered.
   echo "== running the suite (attempt $attempt) =="
+  echo "   load $(cut -d' ' -f1-3 /proc/loadavg) on $(nproc) cores"
+  started=$SECONDS
   # Tee'd rather than swallowed. The first version printed only "tests failed", which is the
   # one moment the output is worth having — and when this runs unattended the terminal
   # scrollback is not there to fall back on.
@@ -61,24 +67,33 @@ for attempt in 1 2 3; do
   status=${PIPESTATUS[0]}
   if [ "$status" -ne 0 ]; then
     echo
+    # Elapsed on every branch, because "how long did it take" is the first thing anyone asks and
+    # the answer distinguishes the two failure modes that look alike.
     if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
       echo "== the suite did not finish in 45m: not pushing =="
-      echo "   This is a hang, not slowness. Deno never kills a blocked test, so the run would"
-      echo "   have continued indefinitely. The tests below were still running when it was cut:"
+      echo "   This is a hang, not slowness — see issue 0036. Deno never kills a blocked test, so"
+      echo "   the run would have continued indefinitely. Still running when it was cut:"
       grep -oE "'[^']+' has been running for over[^)]*.\)" "$log" | sort -u | head -10
     else
-      echo "== tests failed: not pushing =="
+      echo "== tests failed after $((SECONDS - started))s: not pushing =="
       echo "-- failures --"
       grep -E 'FAILED|error:' "$log" | head -20
-    fi
-    # Any test that outstayed Deno's warning threshold is worth naming even on a plain failure:
-    # it is the most likely cause of a slow run somebody else is about to blame on their own work.
-    if [ "$status" -ne 124 ] && [ "$status" -ne 137 ]; then
+      # Any test that outstayed Deno's warning threshold is worth naming even on a plain failure:
+      # it is the likeliest cause of a slow run somebody is about to blame on their own change.
       slow=$(grep -oE "'[^']+' has been running for over[^)]*.\)" "$log" | sort -u | head -5)
       [ -n "$slow" ] && { echo "-- tests that ran unusually long --"; echo "$slow"; }
     fi
     echo "-- full output: $log --"
     exit 1
+  fi
+
+  elapsed=$((SECONDS - started))
+  echo "== suite passed in ${elapsed}s (load now $(cut -d' ' -f1-3 /proc/loadavg)) =="
+  if [ "$elapsed" -gt 180 ]; then
+    echo "   that is several times the usual ~50s. Usually the machine was busy rather than the"
+    echo "   suite — but check for a hung test too (issue 0036); the load above tells you which."
+    slow=$(grep -oE "'[^']+' has been running for over[^)]*.\)" "$log" | sort -u | head -5)
+    [ -n "$slow" ] && { echo "-- tests that ran unusually long --"; echo "$slow"; }
   fi
 
   if git push --quiet origin master 2>/dev/null; then

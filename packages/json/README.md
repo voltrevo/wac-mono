@@ -163,17 +163,29 @@ and slow on numbers and still look reasonable.
 
 | shape | MB/s |
 |---|---:|
-| strings with escapes | 132 |
-| long ASCII strings | 109 |
-| structure only | 42 |
-| multi-byte UTF-8 strings | 96 |
-| objects, long keys | 88 |
-| realistic mixed | 80 |
-| simple decimals | 76 |
-| small integers | 64 |
-| objects, short keys | 40 |
-| long-mantissa numbers | 21 |
+| long ASCII strings | 277 |
+| strings with escapes | 265 |
+| short ASCII strings | 207 |
+| multi-byte UTF-8 strings | 160 |
+| objects, long keys | 158 |
+| realistic mixed | 132 |
+| simple decimals | 119 |
+| small integers | 100 |
+| structure only (nested empties) | 59 |
+| objects, short keys | 54 |
+| long-mantissa numbers | 23 |
 | exponent-form numbers | 9 |
+
+Best of six runs, and **read the order rather than the digits**. On a machine shared with other
+work the fast shapes swing by nearly a factor of two between runs — long ASCII strings measured
+153 to 277 — because they finish quickly enough for contention to dominate. The slow shapes barely
+move at all: exponent-form numbers were 9 in every run, because that one is genuinely computing.
+The ranking is the durable measurement and the reason for splitting by shape in the first place.
+
+These figures replace a table that had gone stale by roughly half: it was measured before
+`canonicalize` began handing back a `Canonical` struct, after which `deno task bench:json` threw on
+its first shape and could not regenerate them — [issue 0007](../../issues/closed/0007-json-throughput-bench-half-migrated-to-the-canonical-struct.md),
+which warned that the numbers beside a broken bench keep being cited. They were, for two days.
 
 Numbers used to be the whole story — 19 MB/s for small integers, 0.5 for
 exponent-form — and the fixes were in `packages/fmt`; see its README.

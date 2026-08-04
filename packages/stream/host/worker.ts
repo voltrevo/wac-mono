@@ -17,6 +17,7 @@ import {
   IN_HEAD,
   IN_SEQ,
   IN_TAIL,
+  IN_ERR,
   OUT_DONE,
   OUT_HEAD,
   OUT_SEQ,
@@ -51,15 +52,30 @@ const start: Start = pending ?? await new Promise<Start>(resolve => {
 });
 
 const mod = await wacBind(start.modulePath) as unknown as Record<string, unknown>;
+// `Read` comes from the module the transform lives in, since a wac enum crosses as a class with a
+// static per variant. A producer on this side now has to say which of the three it means — the whole
+// point of the type, and the reason this file can no longer answer "nothing" ambiguously.
+const Read = mod.Read as {
+  Data(bytes: Uint8Array): unknown;
+  End(): unknown;
+  Failed(why: string): unknown;
+};
 const transform = mod[start.entry] as (
-  read: () => Uint8Array,
+  read: () => unknown,
   write: (b: Uint8Array) => boolean,
 ) => number;
 
 const { ctrl, inBytes, outBytes } = rings(start.sab);
 
-/** Block until input is available, then take as much as is there. Empty means end of input. */
-function read(): Uint8Array {
+/**
+ * Block until input is available, then take as much as is there.
+ *
+ * Answers a `Read`: `End` when the producer has said it is finished, and `Failed` if it reported an
+ * error. It used to answer an empty array for the first and had no way to say the second, so a
+ * producer whose source threw looked exactly like one that had finished — the transform completed,
+ * the stream closed cleanly, and the consumer got a truncated result with no indication.
+ */
+function read(): unknown {
   while (true) {
     const seq = Atomics.load(ctrl, IN_SEQ);      // before the checks below, never after
     const head = Atomics.load(ctrl, IN_HEAD);
@@ -69,9 +85,10 @@ function read(): Uint8Array {
       const chunk = ringRead(inBytes, tail, available);
       Atomics.store(ctrl, IN_TAIL, tail + available);
       Atomics.notify(ctrl, IN_TAIL);          // the producer may be waiting for space
-      return chunk;
+      return Read.Data(chunk);
     }
-    if (Atomics.load(ctrl, IN_EOF) === 1) return new Uint8Array(0);
+    if (Atomics.load(ctrl, IN_ERR) === 1) return Read.Failed("the producer reported an error");
+    if (Atomics.load(ctrl, IN_EOF) === 1) return Read.End();
     // Nothing to take and not finished: sleep until the producer publishes more. The wasm frame
     // stays on this thread's stack across the wait.
     Atomics.wait(ctrl, IN_SEQ, seq);

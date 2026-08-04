@@ -1,0 +1,92 @@
+// A program that runs itself.
+//
+//   twin              ->  parent, then the child's line, then the child's status
+//   twin shout hello  ->  SHOUT: HELLO
+//
+// `spawnSelf` needs no file and no path: the launcher already has this program's worker bundle,
+// because it is what started the program. So "run me again with these arguments" is available to
+// every built program, on every host — and it is the only way a *browser tab* can have programs at
+// all, since a page has no directory of them to read from.
+//
+// That makes this the shape of a multi-call binary. `packages/box` is one already: `box sort` is
+// `box` deciding from its first argument which of sixty applets it is. A shell that can say
+// `spawnSelf(["sort", "-n"])` therefore has sixty real programs — separate workers, own grants,
+// concurrent — rather than sixty function calls inside its own instance.
+//
+// The child runs `main` even when a program also exports `page`. It was spawned, so it has a handle
+// and nowhere to draw; `packages/box/example/term.wac` is both a terminal and the programs it runs
+// for exactly that reason.
+
+import { Child, Cli, Core, GRANT_NONE } from "../src/platform.wac";
+import { Read } from "../../bytes/src/read.wac";
+
+export i32 main(Core core, Cli cli) {
+  i32 n = cli.argCount().wait();
+
+  // With arguments, this *is* the child: shout them and stop. One `main`, two behaviours, chosen by
+  // argv — which is what a multi-call program is.
+  if (n > 0 && cli.arg(0).wait() == "shout") {
+    string said = "";
+    for (i32 i = 1; i < n; i++) {
+      said = said + (i > 1 ? " " : "") + cli.arg(i).wait();
+    }
+    cli.write(("SHOUT: " + upper(said) + "\n").toBytes());
+    return 0;
+  }
+
+  core.log("parent: about to run myself");
+
+  // No source, no path, no grant: the same program, with different arguments. `GRANT_NONE` because
+  // shouting needs nothing — and a child could not have more than this program has anyway.
+  Child kid = cli.spawnSelf(string[]("shout", "hello", "twin"), GRANT_NONE).wait();
+  if (kid.unavailable()) {
+    core.warn("twin: this world cannot spawn: " + kid.error);
+    return 2;
+  }
+  if (kid.handle < 0) {
+    core.warn("twin: " + kid.error);
+    return 1;
+  }
+
+  // A child is a handle, so reading it is `recv` — the same call a socket takes. Nothing here knows
+  // it is talking to a copy of itself.
+  cli.closeFeed(kid.handle);
+  bool reading = true;
+  while (reading) {
+    match (cli.recv(kid.handle).wait()) {
+      case Data(bytes): { cli.write(bytes); }
+      case End: { reading = false; }
+      case Failed(why): {
+        core.warn("twin: reading the child: " + why);
+        return 1;
+      }
+    }
+  }
+
+  i32 code = cli.exitCode(kid.handle).wait();
+  cli.closeSocket(kid.handle);
+  core.log("parent: the child exited " + itoa(code));
+  return code;
+}
+
+u8[] upperBytes(u8[] b) {
+  u8[] out = u8[b.len()](fill: 0);
+  for (i32 i = 0; i < b.len(); i++) {
+    out[i] = b[i] >= 'a' && b[i] <= 'z' ? b[i] - 32 : b[i];
+  }
+  return out;
+}
+
+string upper(string s) { return string.fromBytes(upperBytes(s.toBytes())); }
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  if (v == -2147483648) { return "-2147483648"; }
+  i32 x = v < 0 ? 0 - v : v;
+  string out = "";
+  while (x > 0) {
+    out = string.fromCodepoint('0' + (x % 10)) + out;
+    x = x / 10;
+  }
+  return (v < 0 ? "-" : "") + out;
+}

@@ -38,13 +38,44 @@ export i32 diff(Core core, Cli cli, Args a) {
   i32[] ops = script(old, new);
   bool same = true;
   for (i32 i = 0; i < ops.len(); i++) { if (ops[i] != 0) { same = false; } }
-  if (same) { return 0; }
+
+  // Whether each side ends with its terminator, which `splitLines` deliberately drops: it returns
+  // line *contents*, so "x\ny\n" and "x\ny" give identical lists. Two files differing only there
+  // compared equal and exited 0, where the real `diff` exits 1 and says
+  // `\ No newline at end of file`. A diff that reports "no difference" about files that differ is
+  // the worst answer it can give, because the caller's next step is to trust it.
+  bool oldNl = endsWithNewline(x.bytes);
+  bool newNl = endsWithNewline(y.bytes);
+  if (same && oldNl == newNl) { return 0; }
 
   core.log("--- " + x.label);
   core.log("+++ " + y.label);
+  if (same) {
+    // Only the terminator differs, so there is no edit script to walk: report the last line as
+    // changed, which is what the real one does.
+    i32 last = old.len() - 1;
+    if (last >= 0) {
+      core.log("-" + string.fromBytes(old[last]));
+      if (!oldNl) { core.log(NO_NEWLINE()); }
+      core.log("+" + string.fromBytes(new[last]));
+      if (!newNl) { core.log(NO_NEWLINE()); }
+    }
+    return 1;
+  }
+
   emit(core, ops, old, new);
+  // The marker goes after the hunk rather than immediately after the line it belongs to, which is
+  // where the real one puts it, and it says which side — so the information is present and
+  // unambiguous even though the placement is not GNU's.
+  if (!oldNl) { core.log(NO_NEWLINE() + " (old)"); }
+  if (!newNl) { core.log(NO_NEWLINE() + " (new)"); }
   return 1;
 }
+
+string NO_NEWLINE() { return "\\ No newline at end of file"; }
+
+/** Whether the last byte is a newline. An empty file has no missing terminator to report. */
+bool endsWithNewline(u8[] b) { return b.len() == 0 || b[b.len() - 1] == 10; }
 
 /**
  * The edit script, from a longest-common-subsequence table.

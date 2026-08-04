@@ -161,6 +161,21 @@ export string test_extend() {
   return t.report();
 }
 
+export string test_extend_with_itself() {
+  T t = T.create();
+  Vec<i32> v = Vec.create();
+  v.push(1);
+  v.push(2);
+  // Doubling a buffer by appending it to itself. The bound used to be re-read every iteration, so
+  // it grew as fast as the index and this ran until "requested new array is too large".
+  v.extend(v);
+  t.eqI32(v.len(), 4, "self-append doubles the length");
+  t.eqI32(v.get(0), 1, "the original elements stay put");
+  t.eqI32(v.get(2), 1, "and repeat from the start");
+  t.eqI32(v.get(3), 2, "to the end of the original");
+  return t.report();
+}
+
 export string test_element_types() {
   T t = T.create();
   // Four instantiations, four copies of the generated code. A bug in one need not be a bug

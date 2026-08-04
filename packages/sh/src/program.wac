@@ -19,6 +19,7 @@
 // concurrently, which needs more than one thread. Noted in the README rather than hidden.
 
 import { Vec } from "../../std/src/vec.wac";
+import { resolvePath } from "./path.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Cli, FileResult } from "../../platform/src/platform.wac";
 
@@ -40,11 +41,11 @@ export struct Output {
  * The one place that knows external commands are not real processes. Everything above it is
  * written as though they were.
  */
-export Output run(Cli cli, Vec<string> argv, u8[] stdin) {
+export Output run(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
   if (argv.len() == 0) { return Output.missing(); }
   string name = argv.get(0);
 
-  if (name == "cat") { return cat(cli, argv, stdin); }
+  if (name == "cat") { return cat(cli, cwd, argv, stdin); }
   if (name == "wc") { return wc(argv, stdin); }
   if (name == "head") { return head(argv, stdin); }
   if (name == "tail") { return tail(argv, stdin); }
@@ -277,13 +278,16 @@ void padInto(Buf out, string text, i32 width, bool left, bool zero) {
   for (i32 i = from; i < b.len(); i++) { out.push(b[i]); }
 }
 
-Output cat(Cli cli, Vec<string> argv, u8[] stdin) {
+Output cat(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
   if (argv.len() == 1) { return Output.ok(stdin); }
   Buf out = Buf.create();
   for (i32 i = 1; i < argv.len(); i++) {
     string path = argv.get(i);
     if (path == "-") { out.pushAll(stdin); continue; }
-    FileResult f = cli.readFile(path).wait();
+    // Through the shell's working directory, not the host's. `cat` is the only thing here that
+    // opens a file, and it is the reason `run` takes a `cwd` at all: without it, `cd sub; cat f`
+    // looked in whichever directory the process had started in.
+    FileResult f = cli.readFile(resolvePath(cwd, path)).wait();
     if (!f.ok) {
       return Output.fail(("cat: " + path + ": " + f.error + "\n").toBytes(), 1);
     }

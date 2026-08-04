@@ -6,57 +6,150 @@
 // `packages/sh` unchanged: quoting, parameter expansion, command substitution, arithmetic,
 // pipelines, redirection, `&&`/`||`, `if`/`while`/`for`/`case`, functions, subshells, globbing.
 // It was written for a terminal and tested against GNU bash script for script, and none of that
-// is different here — what is different is that its `Cli` reaches the Origin Private File
-// System instead of a disk, and its output goes to a `<pre>` instead of a pipe.
+// is different here — what is different is that its `Cli` reaches the Origin Private File System
+// instead of a disk, and its output goes to an element instead of a pipe.
 //
 // The shell was already able to run in a page before any of this existed: it built, started, and
 // exited immediately, because a page's standard input is empty and a shell with no input has
 // nothing to do. All that was missing was a keyboard.
 //
-// It lives in `box` rather than in `sh` because `sh` belongs to someone else, and because the
-// commands it runs are box's: `sh`'s own table of built-ins is small, and `$WACPATH` finds the
-// rest as spawned programs — which a page cannot do, since `spawn` is Deno-only. So what runs
-// here is what `sh` implements itself. That is a real limit and it is worth seeing plainly
-// rather than discovering later.
+// What runs here is the shell's own built-ins — including `cd`, `pwd` and `ls` — and then every
+// applet in `packages/box`, wired in with `sh.external = boxRun`. `sort`, `sha256sum`, `gzip`,
+// `cut`, `diff`, `shuf`, `strings`, `tar`: the same code the command-line `box` runs, in the page.
+//
+// It is not spawning them. `spawn` is Deno-only, so `platform` grew `pushChild`/`popChild` — the
+// host holds a child's stdin, its captured output and its working directory for the duration of a
+// call, which is what lets an applet that reads `cli.readChunk()` and writes `cli.write(...)` run
+// inside another program without being written differently. What is missing here is therefore
+// isolation rather than the programs: an applet runs with the page's own authority. The honest fix
+// is `spawn` in a browser — nested workers can do it — and that is issue 0030.
+//
+// The other real limit is unchanged: pipeline stages run one at a time, so `yes | head -1` does
+// not terminate the way it does in bash. It does now *stop*, because a child's captured output is
+// capped and `yes` is written to notice a write that fails.
+//
+// ## Why the terminal is built the way it is
+//
+// **The scrollback pins itself with CSS, not with a capability.** A terminal has to show the
+// newest line, and `setText` cannot scroll anything. Rather than adding a `scrollToEnd`
+// capability for one caller, the scroller is `flex-direction: column-reverse`, which anchors it
+// to the end — the browser keeps a reversed column scrolled to its bottom for free.
+//
+// **History is a ring in a local.** Up and Down arrive as `keydown` events with the key in
+// `Event.value`, so the whole feature is a `string[]` and two integers in the loop — no state
+// outside the program, and nothing the page has to know about.
 
 import { Cli, Core, Event, Page } from "../../platform/src/platform.wac";
 import { Shell, runScript } from "../../sh/src/exec.wac";
+import { boxNames, boxRun } from "../src/shrun.wac";
+
+/** How many commands to remember. A ring, so the oldest falls off rather than growing forever. */
+const i32 HISTORY = 64;
+
+/** Where this page came from. A demonstration nobody can rebuild is a screenshot. */
+const string SOURCE =
+  "https://github.com/voltrevo/wac-mono/blob/master/packages/box/example/README.md#termwac";
+
+const string BANNER =
+  "wac sh — packages/sh with every packages/box applet, in a browser tab.\n" +
+  "Sixty programs and a shell, all of it wac compiled to WebAssembly. `help` lists them.\n" +
+  "\n" +
+  "  echo wac | sha256sum             seq 1 20 | shuf | sort -n | head -3\n" +
+  "  echo hello | tr a-z A-Z          printf 'a,b,c\\n' | cut -f2 -d,\n" +
+  "  echo hi > f; gzip < f | base64   for i in 1 2 3; do echo $i; done\n" +
+  "  mkdir d; cd d; pwd               x=world; echo \"hey $x\"\n" +
+  "\n" +
+  "The filesystem is the Origin Private File System, empty at / and yours: what you write\n" +
+  "survives a reload and is visible to nothing outside this tab. Up and Down walk the\n" +
+  "history, `clear` empties the screen.\n" +
+  "\n";
 
 export i32 page(Core core, Cli cli, Page page) {
-  page.title("sh").wait();
-  // The banner is the initial value of `screen`, not markup inside the `<pre>`. One source of
-  // truth: `setText` replaces the element's whole content, so a banner written into the markup
-  // vanished the moment the first command was run — which looked like the terminal clearing
-  // itself and was really just two places both claiming to own that text.
-  string screen =
-    "wac sh — the shell from packages/sh, in a tab.\n" +
-    "Its filesystem is the Origin Private File System, and it survives a reload.\n" +
-    "Try: echo hello | tr a-z A-Z   |   for i in 1 2 3; do echo $i; done   |   " +
-    "echo hi > f; cat f\n\n";
+  page.title("wac sh").wait();
 
+  // The style travels with the markup: `render` sets innerHTML, and a `<style>` in there applies.
+  // That is why the launcher's page is bare now — an application dresses itself.
   page.render(
-    "<pre id=\"scr\" style=\"background:#111;color:#eee;padding:.75rem;min-height:18rem;" +
-      "overflow:auto\"></pre>" +
-    "<p>$ <input id=\"cmd\" size=\"70\" autofocus " +
-      "placeholder=\"a command, then Enter\"></p>"
+    "<style>" +
+    "  #term { position: fixed; inset: 0; display: flex; flex-direction: column;" +
+    "          background: #0b0f10; color: #d7e2e0;" +
+    "          font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }" +
+    "  #wrap { flex: 1; min-height: 0; overflow-y: auto; display: flex;" +
+    "          flex-direction: column-reverse; padding: 0 1rem; }" +
+    "  #scr { margin: 0; white-space: pre-wrap; word-break: break-word; }" +
+    "  #bar { display: flex; align-items: center; gap: .5rem; padding: .5rem 1rem;" +
+    "         border-top: 1px solid #1c3238; background: #0e1d21; }" +
+    "  #ps1 { color: #46d9c0; user-select: none; }" +
+    "  #cmd { flex: 1; background: transparent; border: 0; outline: 0; color: inherit;" +
+    "         font: inherit; padding: 2px 0; }" +
+    "  #cmd::placeholder { color: #4a5f62; }" +
+    "  .k { color: #46d9c0; }" +
+    "  #src { color: #46d9c0; font-size: 12px; text-decoration: none; opacity: .8;" +
+    "         white-space: nowrap; }" +
+    "  #src:hover { opacity: 1; text-decoration: underline; }" +
+    "</style>" +
+    "<div id=\"term\">" +
+    "  <div id=\"wrap\"><pre id=\"scr\"></pre></div>" +
+    "  <div id=\"bar\"><span id=\"ps1\">$</span>" +
+    "    <input id=\"cmd\" autofocus autocomplete=\"off\" spellcheck=\"false\"" +
+    "           placeholder=\"a command, then Enter\">" +
+    "    <a id=\"src\" href=\"" + SOURCE + "\">source &amp; build it</a></div>" +
+    "</div>"
   ).wait();
+
+  string screen = BANNER;
   page.setText("scr", screen).wait();
   page.on("#cmd", "keydown").wait();
 
-  // One shell for the whole session, so variables, functions and the working directory persist
-  // between commands exactly as they would in a terminal. `capture` is what `packages/ssh`'s
-  // server uses for the same reason: the output has to be collected rather than written, since
-  // "written" here would mean the page's log rather than the terminal being drawn.
+  // One shell for the whole session, so variables and functions persist between commands exactly
+  // as they would in a terminal. `capture` is what `packages/ssh`'s server uses for the same
+  // reason: the output has to be collected rather than written, since "written" here would mean
+  // the page's log rather than the screen being drawn.
   Shell sh = Shell.create(core, cli);
   sh.capture = true;
+  // Every `box` applet, as a command you can type. The shell tries a real spawned program first
+  // and a page cannot spawn, so in this tab this is what answers — `sort`, `sha256sum`, `gzip`,
+  // `cut`, `shuf` and fifty more, the same code `box` runs on a command line.
+  sh.external = boxRun;
+  sh.externalNames = boxNames;   // so `help` lists them
+
+  string[] history = string[HISTORY](fill: "");
+  i32 count = 0;      // how many commands have been run, ever
+  i32 cursor = 0;     // how far back Up has walked; 0 means "at the prompt"
 
   while (true) {
     Event e = page.nextEvent().wait();
-    if (e.kind != "keydown" || e.value != "Enter") { continue; }
+    if (e.kind != "keydown") { continue; }
+
+    // Up and Down walk the ring. Held here rather than in the page because the history *is*
+    // program state: it is what this shell has been asked to do.
+    if (e.value == "ArrowUp" || e.value == "ArrowDown") {
+      i32 depth = e.value == "ArrowUp" ? cursor + 1 : cursor - 1;
+      i32 have = count < HISTORY ? count : HISTORY;
+      if (depth > have) { depth = have; }
+      if (depth < 0) { depth = 0; }
+      cursor = depth;
+      page.setValue("cmd", depth == 0 ? "" : history[(count - depth) % HISTORY]).wait();
+      continue;
+    }
+
+    if (e.value != "Enter") { continue; }
 
     string line = page.getValue("cmd").wait();
     page.setValue("cmd", "").wait();
+    cursor = 0;
     if (line == "") { continue; }
+
+    history[count % HISTORY] = line;
+    count = count + 1;
+
+    // `clear` is the terminal's, not the shell's: `sh` has no notion of a screen to clear, and
+    // implementing it here costs one branch and is what everybody reaches for first.
+    if (line == "clear") {
+      screen = "";
+      page.setText("scr", screen).wait();
+      continue;
+    }
 
     screen = screen + "$ " + line + "\n";
     i32 status = runScript(sh, line);
@@ -67,7 +160,7 @@ export i32 page(Core core, Cli cli, Page page) {
 
     page.setText("scr", screen).wait();
     if (sh.exiting) {
-      page.setText("scr", screen + "[the shell exited]\n").wait();
+      page.setText("scr", screen + "\n[the shell exited " + itoa(sh.exitCode) + "]\n").wait();
       return sh.exitCode;
     }
   }
@@ -75,6 +168,10 @@ export i32 page(Core core, Cli cli, Page page) {
 
 string itoa(i32 v) {
   if (v == 0) { return "0"; }
+  // `i32::MIN` has no positive counterpart — negating it wraps back to itself — so without this the
+  // loop below never runs and the answer is the sign alone. GitHub wac-mono#6 found it in `box`;
+  // these copies had it too.
+  if (v == -2147483648) { return "-2147483648"; }
   i32 x = v < 0 ? 0 - v : v;
   u8[] digits = u8[12](fill: 0);
   i32 at = 12;

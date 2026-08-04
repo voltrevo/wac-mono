@@ -45,6 +45,13 @@ export const OP = {
   DRAW_PIXELS: 38,
   NEXT_FILE: 39,
   OFFER_DOWNLOAD: 40,
+  CWD: 41,
+  PUSH_CHILD: 42,
+  POP_CHILD: 43,
+  OUTPUT_ERROR: 45,
+  LINK_STAT: 47,
+  WRITE_STDERR: 48,
+  SPAWN_SELF: 49,
 } as const;
 
 /**
