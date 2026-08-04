@@ -241,8 +241,13 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
         // ...and its error output goes to the *other* stream, which `recv(errHandle)` reads. A
         // program has two, and merging them made a shell count an error message in `cat x | wc -c`.
         warn: (l: string) => cerr.push(enc.encode(l + "\n")),
-        write: (b: Uint8Array) => out.push(b),
-        writeErr: (b: Uint8Array) => cerr.push(b),
+        // A full queue has to *fail* the write, or a program written to stop when the other end
+        // goes away never learns: `box yes` is `while (cli.write(block)) {}`. Throwing is how the
+        // host says false — the same shape `pushChild`'s cap uses.
+        write: (b: Uint8Array) => {
+          if (!out.push(b)) throw new Error("the child's output is not being read");
+        },
+        writeErr: (b: Uint8Array) => { cerr.push(b); },
         readStdin: () => input.next(),
         ...(give.read ? { root: opts.root, writable: give.write } : {}),
         // So that a child can run itself too: the bundle is the same one.

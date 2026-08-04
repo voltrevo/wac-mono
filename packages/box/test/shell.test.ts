@@ -103,3 +103,13 @@ Deno.test("...and a redirection of standard error still refuses rather than appr
   const r = await sh("cat nosuchfile 2>/dev/null");
   assertEquals(r.err.includes("redirecting fd 2"), true, r.err);
 });
+
+Deno.test("an endless producer stops at the cap rather than filling memory", async () => {
+  // `yes` writes for ever by design, and `head -1` wants one line. A real shell ends this because
+  // `head` closing its input stops `yes`; this shell runs its stages one at a time, so what ends it
+  // is the 8 MiB cap on a queue nobody is reading — `write` starts answering false and `yes` is
+  // written to notice. Before the cap existed on a *spawned* child's queue, a browser tab died of
+  // this: the in-process route had one and the new route did not. Issue 0038 is the real fix.
+  const r = await sh("yes | head -1; echo status=$?");
+  assertEquals(r.out, "y\nstatus=0\n", r.err);
+});

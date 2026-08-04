@@ -194,7 +194,10 @@ export function nodeWorld(
         ...io,
         readStdin: () => input.next(),
         readStdinChunk: () => input.next(),
-        writeStdout: async (b: Uint8Array) => { out.push(b); },
+        writeStdout: async (b: Uint8Array) => {
+          // See the note in `deno.ts`: a full queue must fail the write rather than growing.
+          if (!out.push(b)) throw new Error("the child's output is not being read");
+        },
         writeStderr: async (b: Uint8Array) => { cerr.push(b); },
       };
       return serveHostCalls(bridgeOf(sab), nodeWorld(fs, proc, childIo, {

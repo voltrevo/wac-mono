@@ -27,22 +27,47 @@
 // confinement one, and the grants it takes are meaningful for wac children and advisory for
 // anything else. See wac-mono issue 0015.
 
+/**
+ * How much may sit in a queue nobody is reading before a writer is told to stop.
+ *
+ * The same 8 MiB `child.ts` caps a *called* child's output at, and for the same reason: the program
+ * deciding how much to produce is not the one holding it. `box yes` writes for ever by design.
+ *
+ * This became load-bearing when a shell started *spawning* its applets rather than calling them.
+ * `yes | head -1` used to stop at the cap, because the in-process route had one; a spawned `yes`
+ * wrote into an unbounded queue that nothing drained once `head` had finished, and a browser tab
+ * died of it. A pipeline that ran its stages at once would end `yes` properly — `head` closing its
+ * input is what stops it — and until then this is the backstop rather than the mechanism. Issue 0038.
+ */
+const QUEUE_CAP = 8 << 20;
+
 /** A queue of byte chunks with an end, read one chunk at a time. */
 export class ByteQueue {
   #chunks: Uint8Array[] = [];
   #ended = false;
+  #held = 0;
   #waiting: ((v: Uint8Array) => void) | null = null;
 
-  push(b: Uint8Array): void {
-    if (this.#ended) return;
+  /**
+   * Take these bytes, or answer false when the queue is full.
+   *
+   * False is the answer `write` in `platform.wac` already has a meaning for — "the other end is not
+   * taking it" — and `box yes` is written as `while (cli.write(block)) {}` precisely so that it
+   * stops. The host's job is to turn this into a failed `write`, which is what the caller does.
+   */
+  push(b: Uint8Array): boolean {
+    if (this.#ended) return false;
     // Straight to a waiter if there is one, so nothing is buffered that is already wanted.
     if (this.#waiting !== null) {
       const w = this.#waiting;
       this.#waiting = null;
       w(b);
-      return;
+      return true;
     }
+    if (this.#held + b.length > QUEUE_CAP) return false;
     this.#chunks.push(b);
+    this.#held += b.length;
+    return true;
   }
 
   /** No more will arrive. A reader waiting now gets the empty array that means "ended". */
@@ -58,6 +83,7 @@ export class ByteQueue {
   /** The next chunk, or empty once ended and drained. */
   next(): Promise<Uint8Array> {
     const c = this.#chunks.shift();
+    if (c !== undefined) this.#held -= c.length;
     if (c !== undefined) return Promise.resolve(c);
     if (this.#ended) return Promise.resolve(new Uint8Array(0));
     return new Promise((res) => {
