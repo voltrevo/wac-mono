@@ -1606,12 +1606,14 @@ Output test(Shell sh, Vec<string> argv) {
   bool result = false;
   if (a.len() == 0) { result = false; }
   else if (a.len() == 1) { result = a.get(0) != ""; }
-  else if (a.len() == 2) {
-    string op = a.get(0);
-    if (op == "-z") { result = a.get(1) == ""; }
-    else if (op == "-n") { result = a.get(1) != ""; }
-    else if (op == "!") { result = a.get(1) == ""; }
-    else { return Output.fail(("test: unknown operator " + op + "\n").toBytes(), 2); }
+  else if (a.len() == 2) { return unaryTest(sh, a.get(0), a.get(1)); }
+  else if (a.len() == 3 && a.get(0) == "!") {
+    // `! -f x` and `! -z "$x"`: the negation of a unary test, which is how a script asks whether a
+    // file is *missing*. Without this the `!` was read as the left operand of a binary operator and
+    // `-f` as the operator, so the most ordinary use of `test` reported "unknown operator".
+    Output inner = unaryTest(sh, a.get(1), a.get(2));
+    if (!inner.found || inner.status == 2) { return inner; }
+    return testResult(inner.status != 0);
   } else if (a.len() == 3) {
     string op = a.get(1);
     string l = a.get(0);
@@ -1628,7 +1630,40 @@ Output test(Shell sh, Vec<string> argv) {
   } else {
     return Output.fail("test: too many arguments\n".toBytes(), 2);
   }
-  return Output(u8[0](), u8[0](), result ? 0 : 1, true);
+  return testResult(result);
+}
+
+/** A `test` answer: nothing on either stream, and true is 0 because that is what a shell means by it. */
+Output testResult(bool v) { return Output(u8[0](), u8[0](), v ? 0 : 1, true); }
+
+/**
+ * The one-operand forms, including the ones that ask the filesystem.
+ *
+ * `test -f f` was "unknown operator" until now, which is the single most common thing a script asks:
+ * `if test -f config; then`. The shell has `stat` and has had it since `cd` arrived, so the answer was
+ * one capability call away — and asking `cat` instead, which is what a script has to do without this,
+ * tells you nothing about a directory.
+ *
+ * `-r`, `-w` and `-x` are *not* here and still refuse: `Stat` carries no mode bits, and a shell that
+ * answered "yes, readable" from the mere existence of a file would be wrong exactly when it matters.
+ */
+Output unaryTest(Shell sh, string op, string operand) {
+  if (op == "-z") { return testResult(operand == ""); }
+  if (op == "-n") { return testResult(operand != ""); }
+  if (op == "!") { return testResult(operand == ""); }
+
+  if (op == "-h" || op == "-L") {
+    // The link itself, not what it leads to — `stat` follows, which is why there are two.
+    return testResult(sh.cli.linkStat(sh.resolve(operand)).wait().isSymlink);
+  }
+  if (op == "-e" || op == "-f" || op == "-d" || op == "-s") {
+    Stat st = sh.cli.stat(sh.resolve(operand)).wait();
+    if (op == "-e") { return testResult(st.exists); }
+    if (op == "-f") { return testResult(st.isFile); }
+    if (op == "-d") { return testResult(st.isDir); }
+    return testResult(st.exists && st.size > 0);
+  }
+  return Output.fail(("test: unknown operator " + op + "\n").toBytes(), 2);
 }
 
 /**

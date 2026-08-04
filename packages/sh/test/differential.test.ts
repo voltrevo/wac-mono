@@ -80,6 +80,48 @@ const CASES: string[] = [
   `seq 1 10 | grep 1`,
   `seq 1 3 | nl`,
   `echo one two three | tr ' ' ','`,
+  // `tr`'s flags, its escapes and its character classes — none of which it had. `tr -d 12` used to
+  // read `-d` as a *set* and translate, `tr : '\n'` produced a backslash and an `n`, and
+  // `[:digit:]` was eight literal characters. Every one of those reported success.
+  `printf 'a1b2\n' | tr -d 12`,
+  `printf 'a\nb\n' | tr -d '\n'; echo END`,
+  `printf 'a  b\n' | tr -s ' '`,
+  `printf 'ab\n' | tr -s 'ab' 'x'`,
+  `printf 'aabb\n' | tr -ds a b`,
+  `printf 'a1b2\n' | tr -c 'a-z' '.'`,
+  `printf 'a1b2\n' | tr -c 'a-z' 'xy'`,
+  `printf 'a1b2\n' | tr -cd 'a-z'; echo`,
+  `printf 'a1b\n' | tr -cs 'a-z' 'xy'`,
+  `printf 'abc\n' | tr -t 'abc' 'xy'`,
+  `printf 'abc\n' | tr -ts 'abc' 'x'`,
+  `printf 'a:b:c\n' | tr ':' '\n'`,
+  `printf 'a\tb\n' | tr '\t' ':'`,
+  `printf 'abc\n' | tr 'a\\142c' xyz`,
+  `printf 'q\n' | tr '\\q' X`,
+  `printf 'x\n' | tr '\\x41' X`,
+  `printf 'a1b\n' | tr '[:digit:]' 'x'`,
+  `printf 'ABC\n' | tr '[:upper:]' '[:lower:]'`,
+  `printf 'a1\n' | tr '[:alnum:]' 'x'`,
+  `printf 'a b\n' | tr '[:blank:]' '_'`,
+  `printf 'a.b\n' | tr '[:punct:]' '_'`,
+  `printf 'aFb\n' | tr '[:xdigit:]' '_'`,
+  `printf 'a  b\n' | tr -s '[:space:]' ' '`,
+  `printf 'a-d\n' | tr -- -d x`,
+  `printf 'ab\n' | tr '' ''; echo status=$?`,
+  `printf 'ab\n' | tr -d ''; echo status=$?`,
+  `printf 'aab\n' | tr -s '' 'x'; echo status=$?`,
+  `printf 'ab\n' | tr 'abc' 'xy'`,
+  `printf 'abc\n' | tr 'ab' 'xyz'`,
+  // The usage errors, which are GNU's own status 1 rather than a shell's 2. Only stdout and the
+  // status are compared here, which is what makes them comparable at all: GNU adds a second line of
+  // advice to stderr that this does not.
+  `printf 'abc\n' | tr -q a b; echo status=$?`,
+  `printf 'ab\n' | tr -d; echo status=$?`,
+  `printf 'ab\n' | tr -d a b; echo status=$?`,
+  `printf 'ab\n' | tr a; echo status=$?`,
+  `printf 'ab\n' | tr 'z-a' 'x'; echo status=$?`,
+  `printf 'ab\n' | tr a ''; echo status=$?`,
+  `printf 'ab\n' | tr '[:nope:]' 'x'; echo status=$?`,
   `echo abc | tr abc xyz`,
   `seq 1 5 | sort -r`,
   `seq 3 1 | sort`,
@@ -749,6 +791,24 @@ for (const [i, script] of [
   `rm nothing; echo status=$?`,
   `rm -f nothing; echo status=$?`,
   `mkdir one; rm one; echo status=$?`,
+  // `test`'s file operators, which need something to look at — the reason they are in this group and
+  // not among the string tests above. `test -f f` was "unknown operator" until it was compared with
+  // bash: the most ordinary line a script contains, answered with a usage error.
+  `echo x > f; test -f f && echo isfile`,
+  `echo x > f; test -d f || echo notdir`,
+  `mkdir one; test -d one && echo isdir`,
+  `mkdir one; test -f one || echo notfile`,
+  `echo x > f; test -e f && echo exists`,
+  `test -e nothing || echo absent`,
+  `test -f nothing; echo status=$?`,
+  `echo x > f; [ -f f ] && echo bracket`,
+  `echo x > f; test ! -f f; echo status=$?`,
+  `test ! -f nothing && echo missing`,
+  `echo x > f; test -s f && echo nonempty`,
+  `: > empty; test -s empty; echo status=$?`,
+  `test -s nothing; echo status=$?`,
+  `echo x > f; test -h f; echo status=$?`,       // not a link, and `stat` would have said "file"
+  `test -q f; echo status=$?`,                   // still refused, and it is a *usage* error: 2
 ].entries()) {
   // A directory per case, made by the harness rather than the script, so one failure cannot
   // leave a mess that changes what the next case sees.

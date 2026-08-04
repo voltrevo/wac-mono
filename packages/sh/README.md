@@ -16,7 +16,7 @@ All commands run from the repo root.
 
 ## The oracle is bash
 
-`test/differential.test.ts` runs 499 scripts through GNU bash and through this, and requires the
+`test/differential.test.ts` runs 598 scripts through GNU bash and through this, and requires the
 same standard output *and* the same exit status. For a shell that is the only test worth much:
 the behaviour is defined by what the real one does, and nearly every rule has a case where the
 obvious implementation is subtly wrong.
@@ -147,18 +147,31 @@ handed over. Both of those are now false, and they have become what the seam alw
 were: a fallback. They are also visibly weaker than `box`'s — this `grep` matches substrings where
 `box`'s takes `-ivnc`, this `sort` is an insertion sort — so the sensible end state is to delete
 them once something checks that `box`'s pass the same differential scripts against bash. Kept for
-now because 539 of those scripts currently agree with bash *through these*, and swapping the
+now because 598 of those scripts currently agree with bash *through these*, and swapping the
 implementation under a passing suite without measuring it first is how a green suite starts lying.
+
+**`tr` takes `-c`, `-d`, `-s` and `-t`**, interprets `\n`-style escapes and `[:alpha:]`-style
+classes, and *refuses* an option it does not have. It did none of that until bash was asked: `-d`
+was read as the two-character set `{-, d}`, so `tr -d 12` translated digits into a dash and a `d`
+and reported success; `tr : '\n'` produced a backslash and an `n`; `[:digit:]` was eight literal
+characters. `[c*n]` and `[=c=]` are refused rather than approximated, which is the one place this
+`tr` says no to something GNU does.
 
 The single seam was the point, and it paid off: wiring `spawn` in changed no part of the pipeline,
 redirection, status or `&&` handling, because all of it was already written against `Output`. The
 stubs became what they were meant to be — a fallback for when the real program is absent.
 
 **A pipeline runs its stages at once**, where every stage is a program the shell can spawn.
-`seq 1 200000 | head -1` takes 0.15 seconds rather than 11.8, because `head` closing its input is what
-stops `seq` — and 0.07 seconds in a browser tab, which is the same code. One `recv` in flight per open
-stream, `waitAny` over all of them, and a stage whose reader has finished is stopped, which is what a
-real pipe does with `SIGPIPE`.
+`seq 1 200000 | head -1` takes 0.15 seconds rather than 11.8, and 0.07 seconds in a browser tab, which
+is the same code. One `recv` in flight per open stream, `waitAny` over all of them, and a stage whose
+reader has finished is stopped.
+
+That is *not* `SIGPIPE`, and this paragraph used to say it was. Stopping a stage stops the worker; it
+does not shorten the work the worker has already been asked to do, because the seam is bytes in and
+bytes out — a program has produced nothing until it has produced all of it. Measured at twenty
+million lines: `seq | head -1` takes 2.02s, `seq | wc -l` 2.37s, and `seq` alone about the same. The
+difference is the *reader's* work, not the writer's, and `seq 1 2000000000 | head -1` still dies
+where bash prints one line. [Issue 0061](../../issues/open/0061-sh-applets-return-all-their-output-at-once-so-a-large-stage-dies.md).
 
 `canStream` decides before anything is expanded, because expansion runs command substitutions and
 asking twice would run them twice: every stage must be a plain command whose name is a bare literal
