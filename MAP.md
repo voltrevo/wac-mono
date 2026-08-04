@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-25 packages, 48,638 lines of wac, 978 tests,
+26 packages, 48,646 lines of wac, 981 tests,
 26 command-line programs and 4 browser pages.
 
 ## Packages
@@ -15,6 +15,7 @@ In dependency order: nothing here imports anything below it.
 |---|---|---|---|---|
 | [`bytes`](packages/bytes/) | `Buf` — a growable byte buffer. | 283 | 25 | — |
 | [`regex`](packages/regex/) | A backtracking regular expression engine, with JavaScript's semantics. | 971 | 16 | — |
+| [`ssz`](packages/ssz/) | **Nothing is implemented yet. | 0 | 3 | — |
 | [`std`](packages/std/) | Containers and the two sum types every program ends up wanting. | 586 | 37 | — |
 | [`unicode`](packages/unicode/) | UTF-8 as code points, and simple case mapping. | 216 | 11 | — |
 | [`bignum`](packages/bignum/) | Arbitrary-precision integers. | 629 | 42 | `bytes` |
@@ -36,7 +37,7 @@ In dependency order: nothing here imports anything below it.
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,567 | 45 | `bytes` `codec` `crypto` `platform` `sh` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,263 | 70 | `crypto` |
-| [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 4,162 | 31 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
+| [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 4,170 | 31 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 4,301 | 109 | `bytes` `codec` `crypto` `datetime` `platform` `std` `tls` |
 
 ## Programs

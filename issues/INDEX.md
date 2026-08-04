@@ -5,6 +5,8 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0064](open/0064-an-ethereum-light-client-blocked-on-ssz.md) | an Ethereum light client — **blocked on 0063** | missing feature | not implemented |
+| [0063](open/0063-no-ssz-so-nothing-can-verify-an-ethereum-merkle-proof.md) | no SSZ, so nothing here can verify an Ethereum Merkle proof | missing feature | not implemented |
 | [0062](open/0062-a-read-failure-has-no-fault-category-so-nine-programs-print-the-hosts-wording.md) | a read failure has no fault category, so nine programs print the host's wording | diagnostic | wrong answer |
 | [0061](open/0061-sh-applets-return-all-their-output-at-once-so-a-large-stage-dies.md) | `sh`'s applets return all their output at once, so a large stage dies instead of streaming | bug | trap |
 | [0036](open/0036-nothing-bounds-a-hung-test-and-four-helpers-wait-forever.md) | nothing bounds a hung test, and four readiness helpers are written to wait forever | bug | hang |
