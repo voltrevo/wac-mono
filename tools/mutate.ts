@@ -14,6 +14,8 @@
 //   deno task mutate --jobs=2            # how many to test at once (default: cores - 1, max 4)
 //   deno task mutate --no-select         # skip per-test selection, run every test in scope
 //   deno task mutate --no-sample         # mutate every integer literal, not one per repeated shape
+//   deno task mutate --sample=150        # run a random 150 of the selected mutants (see --seed)
+//   deno task mutate --seed=12345        # reproduce a particular --sample draw
 //   deno task mutate --operators --dry-run   # what would run, without running it
 //
 // Four things make this affordable enough to run over more than one package.
@@ -65,6 +67,7 @@ import { wacCompile } from "wac/wacCompile.ts";
 import { wacFiles, wacFilesIn } from "../harness/wacFiles.ts";
 import { CURATED } from "./mutate/curated.ts";
 import { KNOWN_SURVIVORS } from "./mutate/known.ts";
+import { fileCount, sampleMutants } from "./mutate/sample.ts";
 import {
   buildProfile, byCost, filterFor, selectTests, testFilesIn, type Profile,
 } from "./mutate/profile.ts";
@@ -228,6 +231,24 @@ if (diffOnly) {
 }
 if (pkgArg !== undefined) mutants = mutants.filter((m) => packagesOf(m).includes(pkgArg));
 if (filter !== undefined) mutants = mutants.filter((m) => m.name.includes(filter));
+
+// `--sample=N`: run a random N of the selected mutants, stratified by file. See `mutate/sample.ts`
+// for why stratified and why seeded; the seed is printed so a surprising draw can be reproduced.
+const sampleFlag = args.find((a) => a.startsWith("--sample="));
+const seedFlag = args.find((a) => a.startsWith("--seed="));
+const seed = seedFlag !== undefined ? Number(seedFlag.split("=")[1]) : (Date.now() & 0x7fffffff);
+if (sampleFlag !== undefined) {
+  const n = Number(sampleFlag.split("=")[1]);
+  const before = mutants.length;
+  mutants = sampleMutants(mutants, n, seed);
+  if (mutants.length < before) {
+    console.log(
+      `sample: ${mutants.length} of ${before} mutant(s), stratified across ` +
+        `${fileCount(mutants)} file(s) — the score below estimates the whole set rather than ` +
+        `being it. Reproduce this draw with --seed=${seed}`,
+    );
+  }
+}
 
 // Say what the literal operator sampled rather than leaving it to be inferred from a small number.
 // 0024's `0/117 fell back` is the precedent: a count nobody explains gets read as good news, and a

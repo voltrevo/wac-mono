@@ -118,3 +118,63 @@ Deno.test("--no-sample generates one mutant per literal", () => {
     if (!full.has(n)) throw new Error(`sampling invented a mutant the full run does not emit: ${n}`);
   }
 });
+
+// --- --sample -------------------------------------------------------------------------------
+
+import { sampleMutants } from "./mutate/sample.ts";
+import type { Mutant } from "./mutate/types.ts";
+
+const fake = (file: string, i: number): Mutant => ({
+  name: `m/${file}/${i}`,
+  origin: "operator",
+  edits: [{ file, start: i, end: i + 1, replacement: "1", was: "0" }],
+});
+
+// Deliberately lopsided, the shape that makes stratification matter: one file holds 96% of them.
+const population = [
+  ...Array.from({ length: 480 }, (_, i) => fake("packages/p/src/big.wac", i)),
+  ...Array.from({ length: 10 }, (_, i) => fake("packages/p/src/small.wac", i)),
+  ...Array.from({ length: 10 }, (_, i) => fake("packages/p/src/tiny.wac", i)),
+];
+
+Deno.test("a sample is the requested size and drawn from the population", () => {
+  const got = sampleMutants(population, 30, 1);
+  if (got.length !== 30) throw new Error(`expected 30, got ${got.length}`);
+  const names = new Set(population.map((m) => m.name));
+  for (const m of got) {
+    if (!names.has(m.name)) throw new Error(`sample contains a mutant not in the population: ${m.name}`);
+  }
+  if (new Set(got.map((m) => m.name)).size !== got.length) throw new Error("sample repeats a mutant");
+});
+
+Deno.test("the same seed reproduces a draw and a different seed changes it", () => {
+  const key = (ms: Mutant[]) => ms.map((m) => m.name).join("|");
+  if (key(sampleMutants(population, 30, 7)) !== key(sampleMutants(population, 30, 7))) {
+    throw new Error("same seed gave two different draws — --seed= cannot reproduce anything");
+  }
+  if (key(sampleMutants(population, 30, 7)) === key(sampleMutants(population, 30, 8))) {
+    throw new Error("different seeds gave the same draw — the seed is not being used");
+  }
+});
+
+Deno.test("small files are represented, which a uniform draw would not guarantee", () => {
+  // A uniform draw of 9 from this population picks from small.wac with probability 10/500 per
+  // mutant, so it would usually return nine from big.wac and nothing about the other two files.
+  const got = sampleMutants(population, 9, 3);
+  const files = new Set(got.map((m) => m.edits[0].file));
+  if (files.size !== 3) {
+    throw new Error(`sample of 9 spans ${files.size} file(s), not 3: ${[...files].join(", ")}`);
+  }
+});
+
+Deno.test("asking for the whole population, or more, returns it unchanged", () => {
+  if (sampleMutants(population, population.length, 1).length !== population.length) {
+    throw new Error("sampling the full size did not return everything");
+  }
+  if (sampleMutants(population, 99999, 1).length !== population.length) {
+    throw new Error("sampling more than the population did not return everything");
+  }
+  if (sampleMutants(population, 0, 1).length !== population.length) {
+    throw new Error("--sample=0 should be treated as no sampling, not an empty run");
+  }
+});
