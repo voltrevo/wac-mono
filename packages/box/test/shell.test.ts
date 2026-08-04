@@ -192,3 +192,51 @@ Deno.test("...and every stage still gets its whole input, in order", async () =>
     assertEquals(ours.out, new TextDecoder().decode(theirs.stdout), script);
   }
 });
+
+Deno.test("a spawned command is handed the shell's own standard input, not a copy", async () => {
+  // `cat; cat` prints the input once between the two, because both children read the *same* stream and
+  // the second finds what the first left. This shell printed it twice until issue 0042: a shell hands
+  // each command what is left of the input and cannot know how much a program read — with an inherited
+  // descriptor it does not have to, which is how every real shell answers this.
+  const twice = await sh("cat; cat", "once\ntwice\n");
+  assertEquals(twice.out, "once\ntwice\n", twice.err);
+
+  const theirs = new Deno.Command("bash", {
+    args: ["-c", "cat; cat"],
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "null",
+  }).spawn();
+  const w = theirs.stdin.getWriter();
+  await w.write(new TextEncoder().encode("once\ntwice\n"));
+  await w.close();
+  assertEquals(twice.out, new TextDecoder().decode((await theirs.output()).stdout), "and bash agrees");
+
+  // A command that ignores its input leaves it for the next one, which is the other half of the same
+  // claim and the reason "assume it read everything" is not a fix.
+  const kept = await sh("seq 1 2; cat", "kept\n");
+  assertEquals(kept.out, "1\n2\nkept\n", kept.err);
+
+  // And `read` — a builtin, so it runs *in* the shell — still takes one line and leaves the rest,
+  // whether the next command is spawned or not.
+  const mixed = await sh('read x; echo "[$x]"; cat', "one\ntwo\n");
+  assertEquals(mixed.out, "[one]\ntwo\n", mixed.err);
+});
+
+Deno.test("...and an inherited input streams rather than being read into memory first", async () => {
+  // The other thing an inherited descriptor buys. Feeding a child means having the bytes first, so this
+  // used to read *all* of standard input before `head` saw any of it — unbounded for a pipe that never
+  // ends. `yes` writes for ever; `head -1` takes one line and the pipeline ends.
+  // GNU `yes` as the producer, plumbed by bash: an endless standard input is the whole test, and
+  // `Deno.Command` cannot supply one without something on the other end of the pipe.
+  const started = Date.now();
+  const r = new Deno.Command("bash", {
+    args: ["-c", `yes | "$0" -c 'head -1'`, shell],
+    stdout: "piped",
+    stderr: "piped",
+  }).outputSync();
+  const took = Date.now() - started;
+  const out = new TextDecoder().decode(r.stdout);
+  assertEquals(out, "y\n", new TextDecoder().decode(r.stderr));
+  assertEquals(took < 15_000, true, `${took} ms — reading all of an endless input would never finish`);
+});

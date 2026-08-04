@@ -330,6 +330,9 @@ export function cliOf(
     return out;
   };
   /** A length-prefixed head, so the host can tell where it ends — `writeFile` and `rename`. */
+  /** One byte, so a boolean can travel where a length prefix would be overkill. */
+  const flag = (on: boolean): Uint8Array => new Uint8Array([on ? 1 : 0]);
+
   const prefixed = (head: Uint8Array, body: Uint8Array): Uint8Array => {
     const out = new Uint8Array(4 + head.length + body.length);
     out.set(i32le(head.length), 0);
@@ -418,7 +421,7 @@ export function cliOf(
     (handle: number) => { hostCall(b, OP.CLOSE_SOCKET, i32le(handle)); },
 
     /*= spawn */
-    (source: string, args: string[], grants: number, cwd: string) =>
+    (source: string, args: string[], grants: number, cwd: string, inheritIn: boolean) =>
       // The grant flags, then the source length-prefixed, then the arguments length-prefixed and
       // NUL-separated — the same shape `readDir` answers with, for the same reason: a filename or an
       // argument may contain anything but a NUL — and then the child's directory.
@@ -428,19 +431,25 @@ export function cliOf(
           OP.SPAWN,
           headed(
             i32le(grants),
-            prefixed(str(source), prefixed(str(args.join("\u0000")), str(cwd))),
+            prefixed(
+              str(source),
+              prefixed(str(args.join("\u0000")), prefixed(str(cwd), flag(inheritIn))),
+            ),
           ),
         ),
       ),
     /*= spawnSelf */
     // No source: the host has this program's own bundle, because it is what started it. The payload
     // is the grants and the arguments, in the shape `spawn` uses minus the part that is already here.
-    (args: string[], grants: number, cwd: string) =>
+    (args: string[], grants: number, cwd: string, inheritIn: boolean) =>
       T.child(
         submit(
           b,
           OP.SPAWN_SELF,
-          headed(i32le(grants), prefixed(str(args.join("\u0000")), str(cwd))),
+          headed(
+            i32le(grants),
+            prefixed(str(args.join("\u0000")), prefixed(str(cwd), flag(inheritIn))),
+          ),
         ),
       ),
     /*= closeFeed */

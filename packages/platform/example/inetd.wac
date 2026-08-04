@@ -65,7 +65,7 @@ export i32 main(Core core, Cli cli) {
   // Nothing granted: the handler gets the socket's bytes and no other authority. Passing
   // GRANT_READ here is what would make this an `inetd` that can serve a shell with one
   // readable directory, and is the parent's decision to make rather than the handler's.
-  Child kid = cli.spawn(source, childArgs, GRANT_NONE, "").wait();
+  Child kid = cli.spawn(source, childArgs, GRANT_NONE, "", false).wait();
   if (kid.handle < 0) {
     core.warn("inetd: " + kid.error);
     cli.closeSocket(c.handle);

@@ -903,17 +903,22 @@ Deno.test({
  * what comes out, so the cursor (`read` then `cat`), the empty case, and a command that consumes
  * everything are all pinned against bash rather than against my idea of bash.
  *
- * `cat; cat` is *not* here, and its absence is the honest part: this shell prints the input twice where
- * bash prints it once. A shell hands each command what is left of the input and cannot know how much a
- * program read — bash does not need to know, because both `cat`s share a file descriptor and the second
- * finds it at the end. Modelling that means letting a child inherit the shell's standard input instead
- * of being fed a copy of it, which is issue 0042. Everything that does not turn on *who consumed what*
- * agrees today, including `echo hi; cat` and `seq 1 2; cat`, where a program that ignores its input
- * must leave it for the next one.
+ * `cat; cat` is **not** here, and where it lives is the point. This binary is `packages/sh` alone, whose
+ * `cat` is one of the small wac implementations in `program.wac` — a function call inside the shell,
+ * handed a byte array. Nothing can tell how much of it that call read, so the shell cannot mark the
+ * input consumed and the second `cat` sees it again. Where the commands are *real programs* — the shell
+ * in `packages/box`, whose applets are spawned — the child is handed the shell's own descriptor and the
+ * second finds what the first left, exactly as in bash. That case is pinned in
+ * `packages/box/test/shell.test.ts`, and issue 0042 is where the reasoning is.
+ *
+ * `echo hi; cat` and `seq 1 2; cat` are the other side of it and belong here: a command that ignores its
+ * input must leave it for the next one, in-process or not.
  */
 const STDIN_CASES: [string, string][] = [
   ["cat", "a b c\nd\n"],
   ["read x; echo \"[$x]\"; cat", "a b c\nd\n"],
+  ["echo hi; cat", "kept\n"],
+  ["seq 1 2; cat", "kept\n"],
   ["read x; read y; echo \"[$x][$y]\"", "one\ntwo\nthree\n"],
   ["cat", ""],
   ["read x; echo \"[$x]\"", ""],

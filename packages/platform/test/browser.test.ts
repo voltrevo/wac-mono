@@ -461,17 +461,26 @@ Deno.test("the browser world refuses what a page cannot do", async () => {
  * than imported because this test is checking the *host*, and a test that built its input with the
  * same helper the host parses with would agree with itself about the format.
  */
-function spawnPayload(source: string, args: string[], grants = 0, cwd = ""): Uint8Array {
+function spawnPayload(
+  source: string,
+  args: string[],
+  grants = 0,
+  cwd = "",
+  inheritIn = false,
+): Uint8Array {
   const src = str(source);
   const rest = str(args.join("\u0000"));
   const dir = str(cwd);
-  const out = new Uint8Array(12 + src.length + rest.length + dir.length);
+  const out = new Uint8Array(17 + src.length + rest.length + dir.length);
   out.set(i32le(grants), 0);
   out.set(i32le(src.length), 4);
   out.set(src, 8);
   out.set(i32le(rest.length), 8 + src.length);
   out.set(rest, 12 + src.length);
-  out.set(dir, 12 + src.length + rest.length);
+  out.set(i32le(dir.length), 12 + src.length + rest.length);
+  out.set(dir, 16 + src.length + rest.length);
+  // One byte: whether the child reads the page's own standard input rather than a queue. Issue 0042.
+  out[16 + src.length + rest.length + dir.length] = inheritIn ? 1 : 0;
   return out;
 }
 

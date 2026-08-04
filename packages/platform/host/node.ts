@@ -174,6 +174,7 @@ export function nodeWorld(
     childArgs: string[],
     wanted: number,
     childCwd: string,
+    inheritIn: boolean,
   ): Promise<Uint8Array> => {
     const makeWorker = opts.makeWorker;
     if (makeWorker === undefined) {
@@ -190,10 +191,14 @@ export function nodeWorld(
       const enc = new TextEncoder();
       // The child's stdio is the parent's queues. Everything else about its world — files, sockets,
       // the clock — is this world's, narrowed by `give`.
+      // An inheriting child keeps `io`'s own readers, which are the process's standard input: it reads
+      // the same stream its parent would have, streaming and shared. Issue 0042.
       const childIo: NodeIo = {
         ...io,
-        readStdin: () => input.rest(),
-        readStdinChunk: () => input.next(),
+        ...(inheritIn ? {} : {
+          readStdin: () => input.rest(),
+          readStdinChunk: () => input.next(),
+        }),
         writeStdout: async (b: Uint8Array) => {
           // See the note in `deno.ts`: a full queue must fail the write rather than growing.
           if (!out.push(b)) throw new Error("the child's output is not being read");
@@ -352,8 +357,8 @@ export function nodeWorld(
      * act on: -2, "there is no spawn here", which is not a fact about the program.
      */
     [OP.SPAWN]: (p) => {
-      const { source, args, cwd } = unpackSpawn(p);
-      return startChild(source, args, want(p), cwd);
+      const { source, args, cwd, inheritIn } = unpackSpawn(p);
+      return startChild(source, args, want(p), cwd, inheritIn);
     },
 
     /** This same program again, with different arguments. See `spawnSelf` in platform.wac. */
@@ -363,8 +368,8 @@ export function nodeWorld(
           noSpawnHere("this launcher did not pass the program its own source"),
         );
       }
-      const { args, cwd } = unpackSpawnSelf(p);
-      return startChild(opts.selfSource, args, want(p), cwd);
+      const { args, cwd, inheritIn } = unpackSpawnSelf(p);
+      return startChild(opts.selfSource, args, want(p), cwd, inheritIn);
     },
     [OP.CLOSE_FEED]: (p) => {
       children.get(readI32le(p))?.in.end();

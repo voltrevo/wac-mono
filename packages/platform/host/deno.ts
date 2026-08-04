@@ -171,6 +171,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     childArgs: string[],
     wanted: number,
     childCwd: string,
+    inheritIn: boolean,
   ): Promise<Uint8Array> => {
     const give = {
       read: (wanted & GRANT_READ) !== 0 && opts.fs?.read === true,
@@ -204,8 +205,14 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
         // `readStdin` means *all* of it, which for a child means waiting for its input to end: the
         // bytes arrive over time. Serving it with one chunk made `seq 1 5 | sort -r` print `1`, since
         // `sort` reads to the end before sorting. `readChunk` and `recv` still take one chunk.
-        readStdin: () => input.rest(),
-        readStdinChunk: () => input.next(),
+        // **An inheriting child reads the real thing.** Leaving these out is what hands it over: a
+        // world with no `readStdin` option falls back to the process's own input, so the child reads
+        // the same stream its parent would have — streaming rather than buffered, and *shared*, which
+        // is why `cat; cat` sees one line between them rather than one each. Issue 0042.
+        ...(inheritIn ? {} : {
+          readStdin: () => input.rest(),
+          readStdinChunk: () => input.next(),
+        }),
         // So that a child can run itself as well: the bundle is the same one.
         selfSource: opts.selfSource,
         // Where its relative paths resolve from, and what its own `cwd()` reports. Empty means the
@@ -589,8 +596,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
      * started, which is what `Child.error` is for. wac-mono issue 0021.
      */
     [OP.SPAWN]: (p) => {
-      const { source, args, cwd } = unpackSpawn(p);
-      return startChild(source, args, want(p), cwd);
+      const { source, args, cwd, inheritIn } = unpackSpawn(p);
+      return startChild(source, args, want(p), cwd, inheritIn);
     },
 
     /**
@@ -603,8 +610,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       if (selfSource === undefined) {
         return noSpawnHere("this launcher did not pass the program its own source");
       }
-      const { args, cwd } = unpackSpawnSelf(p);
-      return startChild(selfSource, args, want(p), cwd);
+      const { args, cwd, inheritIn } = unpackSpawnSelf(p);
+      return startChild(selfSource, args, want(p), cwd, inheritIn);
     },
 
     [OP.CLOSE_FEED]: (p) => {

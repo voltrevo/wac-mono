@@ -205,12 +205,24 @@ export struct Shell {
    * does: `cat` waits for end of input, and that is the program working rather than the shell hanging.
    */
   u8[] restOfStdin(this) {
+    this.ensureStdin();
+    return sliceBytes(this.stdinBytes, this.stdinPos, this.stdinBytes.len());
+  }
+
+  /**
+   * Pull the program's standard input in, if this shell owns it and has not already.
+   *
+   * Separate from `restOfStdin` because `read` walks `stdinBytes` and `stdinPos` itself — it has to,
+   * since it consumes a line and leaves the rest — so it needs the input *loaded* without wanting a
+   * slice of it. Calling only `restOfStdin` left `read` looking at an empty array while a `cat` after
+   * it saw everything, which is neither the old behaviour nor bash's.
+   */
+  void ensureStdin(this) {
     if (this.ownsStdin && !this.triedStdin && this.stdinPos >= this.stdinBytes.len()) {
       this.triedStdin = true;
       this.stdinBytes = this.cli.readStdin().wait();
       this.stdinPos = 0;
     }
-    return sliceBytes(this.stdinBytes, this.stdinPos, this.stdinBytes.len());
   }
 
   /** Set a variable, remembering the name so the table can be copied later. */
@@ -448,8 +460,11 @@ void streamPipeline(Shell sh, Pipeline pipeline) {
     }
     string[] args = string[argv.len()](fill: "");
     for (i32 a = 0; a < argv.len(); a++) { args[a] = argv.get(a); }
-    Child kid = sh.cli.spawnSelf(args, GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV, sh.cwd)
-      .wait();
+    // The first stage could inherit the shell's input, and deliberately does not: this loop `send`s
+    // to every stage, including the first, and a stage reading the real descriptor *as well* would
+    // race the shell for the same bytes. Feeding it is what makes the pipeline one shape.
+    Child kid = sh.cli
+      .spawnSelf(args, GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV, sh.cwd, false).wait();
     if (kid.handle < 0) {
       // Whatever started before this must not be left running: they would write into nothing and
       // their workers would outlive the script.
@@ -860,10 +875,18 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
     sh.stdinBytes = input;
     sh.stdinPos = 0;
   }
-  // A program is handed what is left, not the whole thing, so `read a; cat` gives `cat` the
-  // remainder. It is not marked consumed afterwards: nothing here says which programs read their
-  // input, and guessing wrong in the other direction would silently drop bytes.
-  Output result = dispatch(sh, argv, sh.restOfStdin());
+  // **Whether a spawned command may take the shell's own standard input rather than a copy of it.**
+  //
+  // True only when there is nothing else to give it: no pipeline stage's output, no redirection, no
+  // here-document — and when this shell owns the process's input and has not already read it. Then a
+  // child reads the real stream, which streams instead of buffering and is *shared*, so `cat; cat`
+  // prints one line between them as it does in bash. Issue 0042.
+  //
+  // Anything the shell runs itself still takes what is left: `read a; cat` gives `cat` the remainder,
+  // and once `read` has pulled the input in, `mayInherit` is false for everything after it — the bytes
+  // are the shell's by then, and handing over a descriptor already drained would lose them.
+  bool mayInherit = !hasInput && sh.ownsStdin && !sh.triedStdin;
+  Output result = dispatch(sh, argv, mayInherit);
   if (hasInput) {
     sh.stdinBytes = savedIn;
     sh.stdinPos = savedPos;
@@ -967,6 +990,9 @@ bool patternMatches(Shell sh, Word pattern, string subject) {
  * more than being kinder than it.
  */
 Output readLine(Shell sh, Vec<string> argv) {
+  // The shell's own input, if that is where this is coming from: `read` is the one builtin that reads,
+  // and it walks the buffer directly rather than through `restOfStdin`.
+  sh.ensureStdin();
   bool raw = false;
   i32 first = 1;
   while (first < argv.len() && argv.get(first) == "-r") { raw = true; first++; }
@@ -1224,8 +1250,15 @@ Output ls(Shell sh, Vec<string> argv) {
   return status == 0 ? Output.ok(out.take()) : Output.fail(out.take(), status);
 }
 
-/** A function if one is defined, then a builtin, then an external program. */
-Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
+/**
+ * A function if one is defined, then a builtin, then an external program.
+ *
+ * `mayInherit` says the shell's own standard input is available *undrained*, so a spawned child can be
+ * handed the descriptor rather than a copy — see `runSimple`. Everything that runs inside this shell
+ * asks for bytes with `sh.restOfStdin()` instead, which reads the input at that moment if it has not
+ * been read; the two are exclusive, and which one happens depends on what the name turns out to be.
+ */
+Output dispatch(Shell sh, Vec<string> argv, bool mayInherit) {
   string name = argv.get(0);
 
   // Functions shadow builtins, as they do in bash for everything but the special builtins.
@@ -1275,18 +1308,20 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   // A real program if `$WACPATH` has one, and the wac implementation if it does not. That order
   // is the whole point of the table in `program.wac`: those exist because nothing could be
   // started, and now that something can they are the fallback rather than the answer.
-  Output spawned = trySpawn(sh, argv, stdin);
+  Output spawned = trySpawn(sh, argv, mayInherit);
   if (spawned.found) { return spawned; }
   // Then this program's own applets as *children*, where that is possible: `packages/box` decides
   // which applet it is from its first argument, so running one is running this bundle again. That is
   // a real boundary — its own instance, its own grants — where calling it is not.
-  Output asChild = trySelf(sh, argv, stdin);
+  Output asChild = trySelf(sh, argv, mayInherit);
   if (asChild.found) { return asChild; }
   // Then the same applets *called*, which is what happens in a world that cannot spawn — a page
   // could not until issue 0030, and something has to answer there.
-  Output given = sh.external(sh.core, sh.cli, sh.cwd, argv, stdin);
+  // The two in-process routes run *here*, so they need the bytes: reading the input now is what a
+  // program reading it would have done.
+  Output given = sh.external(sh.core, sh.cli, sh.cwd, argv, sh.restOfStdin());
   if (given.found) { return given; }
-  return run(sh.cli, sh.cwd, argv, stdin);
+  return run(sh.cli, sh.cwd, argv, sh.restOfStdin());
 }
 
 /** The default `Shell.externalNames`: nothing is wired in, so there is nothing to list. */
@@ -1312,7 +1347,7 @@ Output noExternal(Core core, Cli cli, string cwd, Vec<string> argv, u8[] stdin) 
  *
  * `found` false means "no such program", and the caller falls back to the wac implementations.
  */
-Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
+Output trySpawn(Shell sh, Vec<string> argv, bool mayInherit) {
   string name = argv.get(0);
   if (name == "") { return Output.missing(); }
   // A name with a slash is a path already, as in bash — `./prog` is not searched for.
@@ -1333,7 +1368,8 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
   // reach and no test says which is wanted. (agent-a, forced by the signature change)
   // The shell's own directory, so `cd sub; prog f` opens `sub/f`. A spawned program used to inherit
   // the *host's* directory, which meant the shell's `cd` was invisible to everything it ran.
-  Child child = sh.cli.spawn(string.fromBytes(prog.bytes), args, GRANT_NONE, sh.cwd).wait();
+  Child child = sh.cli
+    .spawn(string.fromBytes(prog.bytes), args, GRANT_NONE, sh.cwd, mayInherit).wait();
   // No `spawn` in this world at all: nothing was attempted, so this is not a failure of the program
   // and must not be reported as one. Falling through is what keeps `packages/box`'s sixty applets
   // working in the browser terminal, where a page cannot spawn — before this, setting `$WACPATH` to
@@ -1345,7 +1381,7 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
     return Output.fail(("sh: " + name + ": " + child.error + "\n").toBytes(), 126);
   }
 
-  return collectChild(sh, name, child, stdin);
+  return collectChild(sh, name, child, mayInherit);
 }
 
 /**
@@ -1361,12 +1397,17 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
  * `waitAny` — what would fix it is a pipeline that starts every stage first and shuttles between
  * them. Issue 0038.
  */
-Output collectChild(Shell sh, string name, Child child, u8[] stdin) {
-  // The input in one go, then the *end* — `closeFeed`, not `closeSocket`. A program that reads to
-  // the end before it answers, which is `wc` and `sort` and most of the interesting ones, needs
-  // the end to arrive while it is still running; stopping it instead means it never speaks.
-  if (stdin.len() > 0) { sh.cli.send(child.handle, stdin).wait(); }
-  sh.cli.closeFeed(child.handle);
+Output collectChild(Shell sh, string name, Child child, bool inherited) {
+  // A child given the real descriptor feeds itself; sending it anything would be sending it bytes the
+  // shell does not have. Otherwise: the input in one go, then the *end* — `closeFeed`, not
+  // `closeSocket`. A program that reads to the end before it answers, which is `wc` and `sort` and
+  // most of the interesting ones, needs the end to arrive while it is still running; stopping it
+  // instead means it never speaks.
+  if (!inherited) {
+    u8[] stdin = sh.restOfStdin();
+    if (stdin.len() > 0) { sh.cli.send(child.handle, stdin).wait(); }
+    sh.cli.closeFeed(child.handle);
+  }
 
   Buf out = Buf.create();
   bool reading = true;
@@ -1420,7 +1461,7 @@ Output collectChild(Shell sh, string name, Child child, u8[] stdin) {
  * process. A world that cannot spawn answers the same way, so the shell degrades to what it did
  * before rather than reporting a program broken.
  */
-Output trySelf(Shell sh, Vec<string> argv, u8[] stdin) {
+Output trySelf(Shell sh, Vec<string> argv, bool mayInherit) {
   if (!sh.externalSpawnable) { return Output.missing(); }
   string name = argv.get(0);
   if (name == "" || containsSlash(name)) { return Output.missing(); }
@@ -1437,13 +1478,13 @@ Output trySelf(Shell sh, Vec<string> argv, u8[] stdin) {
   // Everything this shell has, which the host narrows to what it actually holds. An applet run in
   // process had the shell's whole authority implicitly; asking for it explicitly is the same
   // authority said out loud, and a shell granted nothing hands its children nothing.
-  Child child = sh.cli.spawnSelf(args, GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV, sh.cwd)
-    .wait();
+  Child child = sh.cli
+    .spawnSelf(args, GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV, sh.cwd, mayInherit).wait();
   if (child.unavailable()) { return Output.missing(); }
   if (child.handle < 0) {
     return Output.fail(("sh: " + name + ": " + child.error + "\n").toBytes(), 126);
   }
-  return collectChild(sh, name, child, stdin);
+  return collectChild(sh, name, child, mayInherit);
 }
 
 /** The first `dir/name` on `$WACPATH` that exists, or "" when none does. */

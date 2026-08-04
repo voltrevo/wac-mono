@@ -38,7 +38,7 @@ export i32 main(Core core, Cli cli) {
 
   // No source, no path, no grant: the same program, with different arguments. `GRANT_NONE` because
   // shouting needs nothing — and a child could not have more than this program has anyway.
-  Child kid = cli.spawnSelf(string[]("shout", "hello", "twin"), GRANT_NONE, "").wait();
+  Child kid = cli.spawnSelf(string[]("shout", "hello", "twin"), GRANT_NONE, "", false).wait();
   if (kid.unavailable()) {
     core.warn("twin: this world cannot spawn: " + kid.error);
     return 2;

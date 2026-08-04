@@ -45,8 +45,8 @@ export i32 main(Core core, Cli cli) {
 
   // The same bundle twice, differing only in argv. Nothing stops them being different
   // programs — one bundle just makes the example short.
-  Child a = cli.spawn(source, argv(cli.arg(1).wait()), GRANT_NONE, "").wait();
-  Child b = cli.spawn(source, argv(cli.arg(2).wait()), GRANT_NONE, "").wait();
+  Child a = cli.spawn(source, argv(cli.arg(1).wait()), GRANT_NONE, "", false).wait();
+  Child b = cli.spawn(source, argv(cli.arg(2).wait()), GRANT_NONE, "", false).wait();
   if (a.handle < 0 || b.handle < 0) {
     core.warn("pipe: " + (a.handle < 0 ? a.error : b.error));
     return 1;

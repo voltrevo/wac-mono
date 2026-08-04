@@ -739,8 +739,8 @@ export struct Cli {
    * the child simply finds the capability denied. `GRANT_NONE` is the honest default and what
    * every example passes.
    *
-   *     cli.spawn(source, args, GRANT_NONE, "")                 // stdin and stdout, nothing else
-   *     cli.spawn(source, args, GRANT_READ | GRANT_NET, dir)     // ...if the parent has both
+   *     cli.spawn(source, args, GRANT_NONE, "", false)                 // fed; nothing else
+   *     cli.spawn(source, args, GRANT_READ | GRANT_NET, dir, true)     // ...if the parent has both
    *
    * This is the reason to prefer spawning a worker to spawning a process. What the child may
    * do is the *parent's* choice; `--allow-run=/bin/sh` cannot express it at any granularity,
@@ -762,8 +762,22 @@ export struct Cli {
    * has an opinion: without this, `cd sub; prog f` looked in the wrong place, because a spawned
    * program inherited the *host's* directory rather than the shell's. `pushChild` took a directory
    * from the start for exactly this reason and `spawn` did not.
+   *
+   * **`inheritIn` gives the child this program's own standard input** instead of the queue that
+   * `send` fills. Two things follow from it, and both are the difference between modelling a
+   * process and imitating one:
+   *
+   *   - it *streams*. A parent that feeds a child must first have the bytes, so `yes | sh -c
+   *     'head -1'` buffered without bound; an inherited input is read by the child as it goes, and
+   *     the child closing it ends the producer.
+   *   - it is *shared*. Two children that inherit read the same stream, so the second finds what
+   *     the first left — which is why `cat; cat` prints one line in every real shell and printed
+   *     two here. A shell cannot know how much a program read, and with this it does not have to.
+   *
+   * False is the ordinary case: a child fed from a pipeline, a redirection or a here-document gets
+   * exactly the bytes its parent chose, and `send` is how they arrive.
    */
-  fn[Pending<Child>(string, string[], i32, string)] spawn;
+  fn[Pending<Child>(string, string[], i32, string, bool)] spawn;
 
   /**
    * **This same program again, as a child**, with these arguments and at most these grants.
@@ -785,9 +799,11 @@ export struct Cli {
    *
    * Grants are a ceiling of the parent's own, as with `spawn`: a shell that may read hands its
    * children reading, and a program granted nothing cannot widen itself by spawning. `cwd` is where
-   * the child's relative paths resolve from, empty for the host's own directory.
+   * the child's relative paths resolve from, empty for the host's own directory, and `inheritIn`
+   * hands over this program's own standard input rather than a queue — see `spawn` above for what
+   * that buys.
    */
-  fn[Pending<Child>(string[], i32, string)] spawnSelf;
+  fn[Pending<Child>(string[], i32, string, bool)] spawnSelf;
 
   /**
    * End a spawned worker's standard input without stopping it.
@@ -881,8 +897,8 @@ export struct Cli {
     fn[Pending<Read>(i32)] recv,
     fn[Pending<bool>(i32, u8[])] send,
     fn[void(i32)] closeSocket,
-    fn[Pending<Child>(string, string[], i32, string)] spawn,
-    fn[Pending<Child>(string[], i32, string)] spawnSelf,
+    fn[Pending<Child>(string, string[], i32, string, bool)] spawn,
+    fn[Pending<Child>(string[], i32, string, bool)] spawnSelf,
     fn[void(i32)] closeFeed,
     fn[Pending<i32>(i32)] exitCode,
     fn[Pending<string>()] cwd,

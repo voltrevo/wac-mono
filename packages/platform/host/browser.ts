@@ -234,6 +234,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     childArgs: string[],
     wanted: number,
     childCwd: string,
+    inheritIn: boolean,
   ): Promise<Uint8Array> => {
     const give = {
       read: (wanted & GRANT_READ) !== 0 && opts.root !== undefined,
@@ -260,8 +261,14 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
         // `readStdin` means *all* of it, which for a child means waiting for its input to end: the
         // bytes arrive over time. Serving it with one chunk made `seq 1 5 | sort -r` print `1`, since
         // `sort` reads to the end before sorting. `readChunk` and `recv` still take one chunk.
-        readStdin: () => input.rest(),
-        readStdinChunk: () => input.next(),
+        // **An inheriting child reads the real thing.** Leaving these out is what hands it over: a
+        // world with no `readStdin` option falls back to the process's own input, so the child reads
+        // the same stream its parent would have — streaming rather than buffered, and *shared*, which
+        // is why `cat; cat` sees one line between them rather than one each. Issue 0042.
+        ...(inheritIn ? {} : {
+          readStdin: () => input.rest(),
+          readStdinChunk: () => input.next(),
+        }),
         ...(give.read ? { root: opts.root, writable: give.write } : {}),
         // So that a child can run itself too: the bundle is the same one.
         selfSource: opts.selfSource,
@@ -558,8 +565,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
      * a place to put a canvas.
      */
     [OP.SPAWN]: (p) => {
-      const { source, args, cwd } = unpackSpawn(p);
-      return startChild(source, args, want(p), cwd);
+      const { source, args, cwd, inheritIn } = unpackSpawn(p);
+      return startChild(source, args, want(p), cwd, inheritIn);
     },
 
     /**
@@ -574,8 +581,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       if (opts.selfSource === undefined) {
         return noSpawnHere("this page did not pass the program its own source");
       }
-      const { args, cwd } = unpackSpawnSelf(p);
-      return startChild(opts.selfSource, args, want(p), cwd);
+      const { args, cwd, inheritIn } = unpackSpawnSelf(p);
+      return startChild(opts.selfSource, args, want(p), cwd, inheritIn);
     },
 
     [OP.CLOSE_FEED]: (p) => {

@@ -239,7 +239,7 @@ Child resolveChild(i32 id) {
 }
 i32 resolveId(i32 id) { return id; }
 
-Pending<Child> fakeSpawn(string source, string[] argv, i32 grants, string cwd) {
+Pending<Child> fakeSpawn(string source, string[] argv, i32 grants, string cwd, bool inheritIn) {
   i32 handle = -1;
   if (source == "runnable") { handle = 7; }
   // Starts, then never reports a status — `exitCode` answers negative for it. The shell calls that
@@ -255,7 +255,7 @@ Pending<Child> fakeSpawn(string source, string[] argv, i32 grants, string cwd) {
  * -2 is "there is no `spawn` here", the answer every world that cannot gives, and the one a caller is
  * expected to have another route for.
  */
-Pending<Child> fakeSpawnSelf(string[] argv, i32 grants, string cwd) {
+Pending<Child> fakeSpawnSelf(string[] argv, i32 grants, string cwd, bool inheritIn) {
   return Pending.of(-2, resolveChild, alwaysSettled, ignoreDrop);
 }
 void fakeCloseFeed(i32 handle) {}

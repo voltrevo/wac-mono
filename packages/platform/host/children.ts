@@ -402,7 +402,9 @@ export function want(p: Uint8Array): number {
  * Here rather than in each host because it is the wire format, and three copies of a length-prefixed
  * walk is three chances to disagree about it. `provider.ts` writes it; this reads it.
  */
-export function unpackSpawn(p: Uint8Array): { source: string; args: string[]; cwd: string } {
+export function unpackSpawn(
+  p: Uint8Array,
+): { source: string; args: string[]; cwd: string; inheritIn: boolean } {
   const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
   const dec = new TextDecoder();
   const sourceLen = dv.getInt32(4, true);
@@ -410,21 +412,29 @@ export function unpackSpawn(p: Uint8Array): { source: string; args: string[]; cw
   const argsAt = 8 + sourceLen;
   const argsLen = dv.getInt32(argsAt, true);
   const joined = dec.decode(p.subarray(argsAt + 4, argsAt + 4 + argsLen));
+  const cwdAt = argsAt + 4 + argsLen;
+  const cwdLen = dv.getInt32(cwdAt, true);
   return {
     source,
     args: joined.length === 0 ? [] : joined.split("\u0000"),
-    cwd: dec.decode(p.subarray(argsAt + 4 + argsLen)),
+    cwd: dec.decode(p.subarray(cwdAt + 4, cwdAt + 4 + cwdLen)),
+    inheritIn: p[cwdAt + 4 + cwdLen] === 1,
   };
 }
 
 /** The same, for `spawnSelf`, which needs no source: grants, arguments, directory. */
-export function unpackSpawnSelf(p: Uint8Array): { args: string[]; cwd: string } {
+export function unpackSpawnSelf(
+  p: Uint8Array,
+): { args: string[]; cwd: string; inheritIn: boolean } {
   const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
   const dec = new TextDecoder();
   const argsLen = dv.getInt32(4, true);
   const joined = dec.decode(p.subarray(8, 8 + argsLen));
+  const cwdAt = 8 + argsLen;
+  const cwdLen = dv.getInt32(cwdAt, true);
   return {
     args: joined.length === 0 ? [] : joined.split("\u0000"),
-    cwd: dec.decode(p.subarray(8 + argsLen)),
+    cwd: dec.decode(p.subarray(cwdAt + 4, cwdAt + 4 + cwdLen)),
+    inheritIn: p[cwdAt + 4 + cwdLen] === 1,
   };
 }
