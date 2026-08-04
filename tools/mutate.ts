@@ -13,9 +13,10 @@
 //   deno task mutate --package gzip      # only mutants in one package
 //   deno task mutate --jobs=2            # how many to test at once (default: cores - 1, max 4)
 //   deno task mutate --no-select         # skip per-test selection, run every test in scope
+//   deno task mutate --no-sample         # mutate every integer literal, not one per repeated shape
 //   deno task mutate --operators --dry-run   # what would run, without running it
 //
-// Three things make this affordable enough to run over more than one package.
+// Four things make this affordable enough to run over more than one package.
 //
 // **Trivial Compiler Equivalence.** Every mutant is compiled before any test runs. If
 // its wasm is byte-identical to the original's, the mutation provably changed nothing
@@ -31,6 +32,28 @@
 //
 // **Stage once.** The project is copied to a scratch directory a single time, then each
 // mutant patches and restores the files it touches, rather than re-copying the tree.
+//
+// **One literal mutant per repeated statement shape.** `--operators=all` bumps every integer
+// literal by one, and this repo is full of code where that is the same experiment over and over: a
+// constant table is one question ("would anything notice a corrupted entry?") asked once per entry,
+// and unrolled arithmetic is one question asked once per limb. Measured across `packages/`:
+//
+//     packages/unicode/src/tables.wac    8787 literal mutants -> 47
+//     packages/bls/src/fpkernel.wac      1221 -> 156
+//     packages/crypto/src/blowfish.wac   1128 -> 130
+//     packages/crypto/src/aes.wac         643 -> 119
+//     packages/sh/src/exec.wac            429 -> 416     <- logic, correctly almost untouched
+//     repo total                        28226 -> 13376
+//
+// A whole-package sweep of `unicode` went from about nine thousand mutants to 251. See `shapeKey`
+// in `mutate/operators.ts` for what counts as the same shape and why it is scoped per function and
+// per module-level `const`. The run prints what it sampled — a sweep that declines to ask a question
+// must not look like one that asked and got an answer.
+//
+// **This can hide a survivor**, and that is the trade: a table entry that only the five-hundredth
+// element would have exposed is no longer tested, where the previous behaviour was merely slow. It
+// is why the sample is three spread through each class rather than one, and why the header says so.
+// `--no-sample` restores the old behaviour for a deliberate deep run.
 //
 // Outcomes are three, not two. A mutant that fails to compile is INVALID, not killed:
 // it tested nothing about the test suite, and counting it as a kill inflates the score.
@@ -186,11 +209,15 @@ const located = CURATED.map(locate);
 const broken = located.filter((l): l is { name: string; problem: string } => "problem" in l);
 let mutants = located.filter((l): l is { mutant: Mutant } => "mutant" in l).map((l) => l.mutant);
 
+const genStats = { literalSampled: 0, literalSkipped: 0, shapes: 0 };
+// `--no-sample`: mutate every integer literal, as this did before shape sampling existed. Slow by
+// design — it is the flag for "I want the survivor that sampling might have hidden".
+const perShape = args.includes("--no-sample") ? Number.POSITIVE_INFINITY : 3;
 if (useOperators) {
   for (const [file, text] of sources) {
     // Test fixtures and benchmarks are not the code under test.
     if (/\/(test|bench)\//.test(file)) continue;
-    mutants.push(...generate(file, text, operators));
+    mutants.push(...generate(file, text, operators, genStats, perShape));
   }
 }
 
@@ -201,6 +228,18 @@ if (diffOnly) {
 }
 if (pkgArg !== undefined) mutants = mutants.filter((m) => packagesOf(m).includes(pkgArg));
 if (filter !== undefined) mutants = mutants.filter((m) => m.name.includes(filter));
+
+// Say what the literal operator sampled rather than leaving it to be inferred from a small number.
+// 0024's `0/117 fell back` is the precedent: a count nobody explains gets read as good news, and a
+// sweep that quietly declines to ask a question must not look like one that asked and got an answer.
+if (genStats.literalSkipped > 0) {
+  const total = genStats.literalSampled + genStats.literalSkipped;
+  console.log(
+    `literal: ${genStats.literalSampled} of ${total} integer literals mutated — ` +
+      `at most ${perShape} per repeated statement shape, across ${genStats.shapes} shapes. ` +
+      `Constant tables and unrolled code repeat one experiment; see tools/mutate/operators.ts.`,
+  );
+}
 
 if (broken.length > 0) {
   console.log(`${broken.length} curated mutation(s) could not be located:`);
@@ -333,10 +372,26 @@ if (dryRun) {
  * there is a control mutation.
  */
 async function stageProject(dest: string): Promise<void> {
-  for (const entry of ["packages", "harness", "deno.json"]) {
+  // `packages` and `harness` are the code. Every *file* at the repo root comes too, and that is not
+  // tidiness: `packages/box/test/box.test.ts` reads `README.md` as its input — a real file of real
+  // text to run `wc`, `sort` and `head` over — and staging without it made five box tests fail.
+  //
+  // The consequence was invisible and expensive. A red scope means every mutant in it is reported
+  // as *unmeasurable* rather than killed, correctly and by design; but `box` depends on a dozen
+  // packages, so one missing file silently withdrew a large part of the repo from measurement. A
+  // `--package unicode --operators=all` run excluded 150 of 251 mutants for this reason, and said
+  // so in a line easy to read as bookkeeping.
+  //
+  // Root files are a handful of kilobytes, so copying all of them is cheaper than maintaining a
+  // list of which ones some test happens to read.
+  for (const entry of ["packages", "harness"]) {
     const cmd = new Deno.Command("cp", { args: ["-r", entry, `${dest}/`] });
     const { code, stderr } = await cmd.output();
     if (code !== 0) throw new Error(`copy ${entry} failed: ${new TextDecoder().decode(stderr)}`);
+  }
+  for await (const e of Deno.readDir(".")) {
+    if (!e.isFile) continue;
+    await Deno.copyFile(e.name, `${dest}/${e.name}`);
   }
   const configPath = `${dest}/deno.json`;
   const config = JSON.parse(await Deno.readTextFile(configPath));
