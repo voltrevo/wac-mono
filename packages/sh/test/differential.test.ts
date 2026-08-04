@@ -988,6 +988,59 @@ Deno.test({
 });
 
 /**
+ * `cd` with an environment, which every case above runs without.
+ *
+ * The harness clears the environment and sets `LC_ALL` and `PATH`, deliberately: a script whose answer
+ * depends on the machine's `$USER` is not a comparison. But `cd` and `cd -` read `HOME` and `OLDPWD`,
+ * and with those cleared *bash* refuses too — so the corpus agreed with bash about the failure and
+ * never asked about the success. `cd` alone went nowhere and said "HOME not set" while `echo $HOME` in
+ * the same shell printed it, because expansion fell back to the environment and `cd` looked only at
+ * variables this shell had assigned.
+ *
+ * Two named variables, both set to a temporary directory, so the answer is still the shell's and not
+ * the machine's.
+ */
+Deno.test({
+  name: "cd and `cd -` read HOME and OLDPWD from the environment, as bash does",
+  ignore: !haveBash,
+  fn: async () => {
+    const home = await Deno.makeTempDir({ prefix: "sh-home-" });
+    const old = await Deno.makeTempDir({ prefix: "sh-old-" });
+    const from = await Deno.makeTempDir({ prefix: "sh-from-" });
+    try {
+      const cases = [
+        "cd; pwd",                     // HOME from the environment
+        "cd -",                        // OLDPWD from the environment, and `cd -` prints where it went
+        'cd ""; pwd',                  // present but empty: a no-op, not "go home"
+        "cd; cd -; pwd",               // and OLDPWD as this shell set it, not as it inherited it
+        "HOME=; cd; pwd",              // assigned empty in this shell, which is not the same as unset
+        "cd nowhere; pwd",             // still where it was, and status 1
+        "cd; echo st=$?",
+      ];
+      for (const script of cases) {
+        const run = (cmd: string, args: string[]) =>
+          new Deno.Command(cmd, {
+            args,
+            cwd: from,
+            stdin: "null",
+            stdout: "piped",
+            stderr: "null",
+            env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin", HOME: home, OLDPWD: old },
+            clearEnv: true,
+          }).outputSync();
+        const theirs = run("bash", ["-c", script]);
+        const ours = run(wacshBinary, ["-c", script]);
+        const text = (r: Deno.CommandOutput) => new TextDecoder().decode(r.stdout);
+        assertEquals(text(ours), text(theirs), `${JSON.stringify(script)}: output`);
+        assertEquals(ours.code, theirs.code, `${JSON.stringify(script)}: exit status`);
+      }
+    } finally {
+      for (const d of [home, old, from]) await Deno.remove(d, { recursive: true });
+    }
+  },
+});
+
+/**
  * The builtins' *diagnostics*, against GNU's own.
  *
  * Every case above compares standard output, which is the right default — a shell's job is what it

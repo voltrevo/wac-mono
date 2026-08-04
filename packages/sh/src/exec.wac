@@ -1108,13 +1108,25 @@ Output setBuiltin(Shell sh, Vec<string> argv) {
  * is the difference between a working directory and a variable. `cd` with no argument goes to
  * `$HOME` as bash does, and `cd -` to the previous directory, which is the one bit of `cd` people
  * use without thinking about it.
+ *
+ * Both of those come from `lookUp`, not from `vars`. Reading `vars` alone meant they had to have been
+ * *assigned in this shell*: `HOME=/etc; cd` worked and a plain `cd` said "HOME not set" while `echo
+ * $HOME` printed it, because expansion falls back to the environment and this did not. The corpus
+ * could not see it — it runs both shells with `HOME` cleared, so bash says "HOME not set" too.
  */
 Output cd(Shell sh, Vec<string> argv) {
-  string want = argv.len() > 1 ? argv.get(1) : sh.vars.get("HOME").orElse("");
-  if (want == "") { return Output.fail("cd: HOME not set\n".toBytes(), 1); }
+  // An argument that is present but empty is not the same as no argument: bash's `cd ""` stays where
+  // it is and succeeds, rather than going home.
+  bool given = argv.len() > 1;
+  string want = given ? argv.get(1) : sh.lookUp("HOME");
+  if (!given && want == "") { return Output.fail("cd: HOME not set\n".toBytes(), 1); }
+  if (given && want == "") { return Output.ok(u8[0]()); }
 
   string previous = sh.cwd;
-  string target = want == "-" ? sh.vars.get("OLDPWD").orElse(sh.cwd) : sh.resolve(want);
+  string back = want == "-" ? sh.lookUp("OLDPWD") : "";
+  // Nowhere to go back to, and bash refuses rather than staying quietly put.
+  if (want == "-" && back == "") { return Output.fail("cd: OLDPWD not set\n".toBytes(), 1); }
+  string target = want == "-" ? back : sh.resolve(want);
 
   Stat st = sh.cli.stat(target).wait();
   if (!st.exists) { return Output.fail(("cd: " + want + ": no such file or directory\n").toBytes(), 1); }
