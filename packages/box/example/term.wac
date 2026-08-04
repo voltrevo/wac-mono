@@ -41,7 +41,7 @@
 
 import { Cli, Core, Event, Page } from "../../platform/src/platform.wac";
 import { Shell, runScript } from "../../sh/src/exec.wac";
-import { boxNames, boxRun } from "../src/shrun.wac";
+import { boxApplet, boxNames, boxRun } from "../src/shrun.wac";
 
 /** How many commands to remember. A ring, so the oldest falls off rather than growing forever. */
 const i32 HISTORY = 64;
@@ -63,6 +63,18 @@ const string BANNER =
   "survives a reload and is visible to nothing outside this tab. Up and Down walk the\n" +
   "history, `clear` empties the screen.\n" +
   "\n";
+
+/**
+ * The same bundle, as one of its own programs.
+ *
+ * A tab is a `page`; a *child* of that tab is a `main`. When the shell runs `sort` it spawns this very
+ * bundle with `sort` as the first argument — there is no filesystem of programs in a browser, so the
+ * only program a page reliably has is the one it already is — and the child starts here. Which of the
+ * two exports runs is decided by how the program was started, not by guessing.
+ *
+ * Without this, `externalSpawnable` below would spawn a child with nothing to run.
+ */
+export i32 main(Core core, Cli cli) { return boxApplet(core, cli); }
 
 export i32 page(Core core, Cli cli, Page page) {
   page.title("wac sh").wait();
