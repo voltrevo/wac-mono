@@ -5,8 +5,7 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
-import { Line, Lines, emitTo, nextLine } from "../lib/reader.wac";
-import { Sink } from "../../../platform/src/stream.wac";
+import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
 import { itoa } from "../lib/num.wac";
 
 export i32 nl(Core core, Cli cli, Args a) {
@@ -14,10 +13,11 @@ export i32 nl(Core core, Cli cli, Args a) {
   if (!in.ok) { return 1; }
 
   Lines s = Lines.create();
+  Feed fed = Feed.fromStdin(cli);
   Sink out = Sink.create(cli);
   i32 n = 0;
   while (true) {
-    Line l = nextLine(s, cli);
+    Line l = nextLine(s, fed);
     if (!l.ok) { out.flush(); return 0; }
     if (l.bytes.len() == 0) {
       // Seven spaces where the number and its tab would be, which is what the real one

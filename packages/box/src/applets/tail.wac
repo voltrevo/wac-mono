@@ -7,8 +7,7 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
-import { Line, Lines, emitTo, nextLine } from "../lib/reader.wac";
-import { Sink } from "../../../platform/src/stream.wac";
+import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
 
 export i32 tail(Core core, Cli cli, Args a) {
   Input in = openStream(core, cli, a, 0);
@@ -20,8 +19,9 @@ export i32 tail(Core core, Cli cli, Args a) {
   bool[] terminated = bool[want](fill: true);
   i32 seen = 0;
   Lines s = Lines.create();
+  Feed fed = Feed.fromStdin(cli);
   while (true) {
-    Line l = nextLine(s, cli);
+    Line l = nextLine(s, fed);
     if (!l.ok) { break; }
     ring[seen % want] = l.bytes;
     terminated[seen % want] = l.nl;

@@ -167,12 +167,14 @@ export struct Feed {
   u8[] held;
   i32 at;
   bool ended;
+  /** Why a read failed, or empty. */
+  string why;
 
   /** Standard input, pulled a chunk at a time through the capability. */
-  Feed fromStdin(Cli cli) { return Feed(cli, true, u8[0](), 0, false); }
+  Feed fromStdin(Cli cli) { return Feed(cli, true, u8[0](), 0, false, ""); }
 
   /** Bytes somebody already has — a here-document, a pipeline stage's collected output. */
-  Feed of(Cli cli, u8[] bytes) { return Feed(cli, false, bytes, 0, false); }
+  Feed of(Cli cli, u8[] bytes) { return Feed(cli, false, bytes, 0, false, ""); }
 
   /**
    * The next chunk, empty at the end.
@@ -194,9 +196,11 @@ export struct Feed {
         return u8[0]();
       }
       case Failed(why): {
-        // A read that failed is the end of the input as far as a filter is concerned; the *reason* is
-        // available to a caller that asks the capability for it, which is where a diagnostic belongs.
+        // A read that failed *ends* the input as far as a filter is concerned, and the reason is kept:
+        // a program that reported success over a half-read file would be the worst of the three
+        // possible answers.
         this.ended = true;
+        this.why = why;
         return u8[0]();
       }
     }
@@ -215,6 +219,9 @@ export struct Feed {
     return all.take();
   }
 
+  /** Why a read failed, or the empty string. Empty is the ordinary case, including at the end. */
+  string failure(const this) { return this.why; }
+
   /** What a buffered feed has not handed over yet. */
   u8[] remaining(this) {
     if (this.at >= this.held.len()) { return u8[0](); }
@@ -223,4 +230,130 @@ export struct Feed {
     this.at = this.held.len();
     return out;
   }
+}
+
+// ── Lines ─────────────────────────────────────────────────────────────────────
+
+/**
+ * One line, or `ok: false` at the end of the input.
+ *
+ * `nl` says whether the line was newline-terminated, which only the last line of an input can fail to
+ * be. Carrying it is what lets a filter match the real tools on a file that does not end in a newline:
+ * `tail -1` of one prints `b`, not `b\n`.
+ */
+export struct Line { bool ok; u8[] bytes; bool nl; }
+
+/**
+ * Lines pulled from a `Feed`, one at a time.
+ *
+ * Splitting the whole input needs the whole input in memory, which is what streaming is for. This holds
+ * one chunk plus one partial line, so a line-oriented program costs whatever its own state costs and
+ * nothing for the input's size. A very long line still grows `pending` to hold it — the line is the
+ * unit, and no line-oriented tool can promise better.
+ *
+ * **It has to be linear as well as bounded**, which the first version of this was not: it appended with
+ * `concat` and rescanned from the start after every refill, so a 300 MB file with no newlines in it
+ * copied and scanned the whole buffer once per 64 KiB chunk. O(n²), and it had not finished after two
+ * minutes. A doubling `Buf` for the append and a `scanned` watermark for the search make both halves
+ * linear.
+ *
+ * It reads from a `Feed` rather than from `Cli` directly, which is what lets one line reader serve a
+ * program running as a worker and the same program called in process over bytes somebody already holds.
+ */
+export struct Lines {
+  /**
+   * Empty unless a read failed, in which case this is the host's message and the lines seen so far are
+   * all there are. A program that ignores it reports success over a truncated file.
+   */
+  string broken;
+  Buf pending;    // bytes read but not yet handed out; doubles, so appending is amortised
+  i32 at;         // where the line being built starts
+  i32 scanned;    // no newline anywhere in pending[at..scanned) — never re-examined
+  bool ended;     // the input said so; `pending` may still hold a last line
+
+  Lines create() { return Lines("", Buf.create(), 0, 0, false); }
+}
+
+/**
+ * The next line, without its newline.
+ *
+ * The final line is returned even without a trailing newline, and an input that ends with one does not
+ * produce a trailing empty line — so a program behaves the same whether it reads lines or splits bytes.
+ */
+export Line nextLine(Lines s, Feed in) {
+  while (true) {
+    // From the watermark, not from `at`: bytes already looked at cannot become newlines.
+    for (i32 i = s.scanned; i < s.pending.len; i++) {
+      if (s.pending.data[i] != '\n') { continue; }
+      u8[] line = sliceOf(s.pending.data, s.at, i);
+      s.at = i + 1;
+      s.scanned = s.at;
+      return Line(true, line, true);
+    }
+    s.scanned = s.pending.len;
+
+    // No newline in what is left, so it is either the start of a longer line or the last line.
+    if (s.ended) {
+      u8[] rest = sliceOf(s.pending.data, s.at, s.pending.len);
+      s.pending.len = 0;
+      s.at = 0;
+      s.scanned = 0;
+      return rest.len() > 0 ? Line(true, rest, false) : Line(false, u8[0](), false);
+    }
+
+    // Drop what has already been handed out before growing. `copyFrom` is a memmove, so a downward
+    // overlapping shift is exactly what it is for.
+    if (s.at > 0) {
+      i32 live = s.pending.len - s.at;
+      s.pending.data.copyFrom(s.pending.data, s.at, 0, live);
+      s.pending.len = live;
+      s.scanned = s.scanned - s.at;
+      s.at = 0;
+    }
+
+    u8[] more = in.next();
+    if (more.len() == 0) {
+      s.ended = true;
+      if (in.failure().len() > 0) { s.broken = in.failure(); }
+    } else {
+      s.pending.pushAll(more);
+    }
+  }
+  return Line(false, u8[0](), false);
+}
+
+/**
+ * A line into a `Sink`, terminated only if the one it came from was.
+ *
+ * The one to use in a loop: a `write` per line is a park and a wake per line, which cost `seq` fourteen
+ * seconds for two hundred thousand of them. Answers false once the reader has gone away, so a filter
+ * stops rather than producing into nothing.
+ */
+export bool emitTo(Sink out, u8[] line, bool nl) {
+  if (!nl) { return out.bytes(line); }
+  return out.lineBytes(line);
+}
+
+/**
+ * A line written *now*, terminated only if the one it came from was.
+ *
+ * Unbuffered, for the handful of places that write once and return — `emitTo` is the one to use in a
+ * loop, since a `write` per line is a park and a wake per line.
+ */
+export void emit(Cli cli, u8[] line, bool nl) {
+  if (!nl) {
+    cli.write(line);
+    return;
+  }
+  u8[] out = u8[line.len() + 1](fill: '\n');
+  out.copyFrom(line, 0, 0, line.len());
+  cli.write(out);
+}
+
+/** `b[at..to)`. */
+u8[] sliceOf(u8[] b, i32 at, i32 to) {
+  if (to <= at) { return u8[0](); }
+  u8[] out = u8[to - at](fill: 0);
+  out.copyFrom(b, at, 0, to - at);
+  return out;
 }

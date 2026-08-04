@@ -5,9 +5,8 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
-import { Sink } from "../../../platform/src/stream.wac";
+import { Feed, Line, Lines, Sink, nextLine } from "../../../platform/src/stream.wac";
 import { Input, openStream } from "../lib/input.wac";
-import { Line, Lines, nextLine } from "../lib/reader.wac";
 import { itoa } from "../lib/num.wac";
 import { compile, compileIgnoreCase, search, slotCount } from "../../../regex/src/regex.wac";
 import { Program, BUDGET, NO_MATCH } from "../../../regex/src/program.wac";
@@ -30,9 +29,10 @@ export i32 grep(Core core, Cli cli, Args a) {
   i32 matches = 0;
   i32 n = 0;
   Lines s = Lines.create();
+  Feed fed = Feed.fromStdin(cli);
   Sink out = Sink.create(cli);
   while (true) {
-    Line l = nextLine(s, cli);
+    Line l = nextLine(s, fed);
     if (!l.ok) { break; }
     n++;
     i32 found = search(p, l.bytes, 0, caps, 1000000);

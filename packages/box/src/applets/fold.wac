@@ -3,8 +3,7 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
-import { Line, Lines, emitTo, nextLine } from "../lib/reader.wac";
-import { Sink } from "../../../platform/src/stream.wac";
+import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
 import { slice } from "../lib/bytes.wac";
 
 export i32 fold(Core core, Cli cli, Args a) {
@@ -13,9 +12,10 @@ export i32 fold(Core core, Cli cli, Args a) {
   i32 width = a.hasNum ? a.num : 80;
 
   Lines s = Lines.create();
+  Feed fed = Feed.fromStdin(cli);
   Sink out = Sink.create(cli);
   while (true) {
-    Line l = nextLine(s, cli);
+    Line l = nextLine(s, fed);
     if (!l.ok) { out.flush(); return 0; }
     u8[] line = l.bytes;
     if (line.len() == 0) { emitTo(out, line, l.nl); continue; }
