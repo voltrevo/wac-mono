@@ -484,6 +484,32 @@ function spawnPayload(
   return out;
 }
 
+Deno.test("a failed read says what a failed change says", async () => {
+  // One tab should not speak with two voices. A change reports through `Change`, whose category the
+  // host turns into a short phrase; a read reports by *throwing*, and its message went out as the
+  // `DOMException`'s own prose — so `rm nosuchfile` said "no such file or directory" while
+  // `cat nosuchfile` said "A requested file or directory could not be found at the time an operation
+  // was processed." Found by driving the terminal, not by reading the code.
+  const w = browserWorld({ root: memDir() });
+  let said = "";
+  try {
+    await w[OP.READ_FILE](str("nothing-here")) as Uint8Array;
+  } catch (e) {
+    said = e instanceof Error ? e.message : String(e);
+  }
+  assertEquals(said, "no such file or directory", said);
+
+  // `openInput` reports the same failure as a message rather than a throw, one layer up, and has to
+  // agree with it.
+  let opened = "";
+  try {
+    await w[OP.OPEN_INPUT](str("nothing-here")) as Uint8Array;
+  } catch (e) {
+    opened = e instanceof Error ? e.message : String(e);
+  }
+  assertEquals(opened, "no such file or directory", opened);
+});
+
 Deno.test("a page spawns a worker of its own — 0030", async () => {
   // The unit of this is the *plumbing*: a worker is created, its load notice is waited for, its
   // handle comes back, and its exit code arrives. A child that speaks the bridge and writes output

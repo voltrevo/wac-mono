@@ -20,8 +20,9 @@ import { Option } from "../../std/src/option.wac";
 import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Read } from "../../bytes/src/read.wac";
-import { Change, Child, Cli, Core, FileResult, GRANT_ENV, GRANT_NET, GRANT_NONE, GRANT_READ,
-  GRANT_WRITE, Pending, Stat } from "../../platform/src/platform.wac";
+import { Change, Child, Cli, Core, FAULT_EXISTS, FAULT_NOT_EMPTY, FAULT_NOT_FOUND, FileResult,
+  GRANT_ENV, GRANT_NET, GRANT_NONE, GRANT_READ, GRANT_WRITE, Pending, Stat }
+  from "../../platform/src/platform.wac";
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
          RedirKind, Script, Simple, Word, parse } from "./parse.wac";
@@ -1148,7 +1149,8 @@ Output mkdir(Shell sh, Vec<string> argv) {
     string given = paths.get(i);
     Change made = sh.cli.mkdir(sh.resolve(given), parents).wait();
     if (!made.ok()) {
-      err.pushAll(("mkdir: cannot create directory '" + given + "': " + made.message + "\n").toBytes());
+      err.pushAll(("mkdir: cannot create directory '" + given + "': " + reasonOf(made) + "\n")
+        .toBytes());
       status = 1;
     }
   }
@@ -1194,7 +1196,7 @@ Output rm(Shell sh, Vec<string> argv) {
     // rather than by a `stat` first, so there is no window for the file to vanish in between.
     Change gone = sh.cli.remove(path, recursive).wait();
     if (!gone.ok() && !(force && gone.absent())) {
-      err.pushAll(("rm: cannot remove '" + given + "': " + gone.message + "\n").toBytes());
+      err.pushAll(("rm: cannot remove '" + given + "': " + reasonOf(gone) + "\n").toBytes());
       status = 1;
     }
   }
@@ -1485,6 +1487,26 @@ Output trySelf(Shell sh, Vec<string> argv, bool mayInherit) {
     return Output.fail(("sh: " + name + ": " + child.error + "\n").toBytes(), 126);
   }
   return collectChild(sh, name, child, mayInherit);
+}
+
+/**
+ * Why a change failed, in the words the tool this shell imitates uses.
+ *
+ * A fault the world has a *category* for gets the category's phrase; anything else keeps the host's
+ * own message, which is the only thing that knows. That distinction is the point of the fault numbers:
+ * the host's words differ per platform and per runtime — "File exists (os error 17): mkdir '/tmp/x'"
+ * under Deno, "EEXIST: file already exists, mkdir '/tmp/x'" under Node, "already exists" in a browser —
+ * while what happened does not.
+ *
+ * bash's `mkdir` and `rm` are `/bin/mkdir` and `/bin/rm`, so these lines are compared against GNU's own
+ * stderr in `test/differential.test.ts`. Before this they carried an errno and an absolute path that
+ * GNU does not print, in a shell whose whole suite is a comparison with bash.
+ */
+string reasonOf(Change c) {
+  if (c.fault == FAULT_NOT_FOUND()) { return "No such file or directory"; }
+  if (c.fault == FAULT_EXISTS()) { return "File exists"; }
+  if (c.fault == FAULT_NOT_EMPTY()) { return "Directory not empty"; }
+  return c.message;
 }
 
 /** The first `dir/name` on `$WACPATH` that exists, or "" when none does. */

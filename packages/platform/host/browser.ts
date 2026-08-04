@@ -51,6 +51,7 @@ import { serveHostCalls } from "./respond.ts";
 import {
   changeBytes,
   changed,
+  faultOf,
   FAULT_DENIED,
   FAULT_EXISTS,
   Faulted,
@@ -292,8 +293,16 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   };
   const writeErr = opts.writeErr ??
     ((b: Uint8Array) => warn(new TextDecoder().decode(b)));
+  /**
+   * A capability this page was not given, said in the host's own words and *kept* in them.
+   *
+   * `Faulted` rather than a plain `Error` so that the phrase policy below can tell the two apart. This
+   * is a `Denied`, and rephrasing it to "permission denied" loses the only useful thing about it: that
+   * the *page* withheld the capability, not that a filesystem refused an operation. The existing
+   * denial test caught exactly that when the read path started rephrasing.
+   */
   const deny = (what: string): never => {
-    throw new Error(`${what} not granted to this application`);
+    throw new Faulted(FAULT_DENIED, `${what} not granted to this application`);
   };
 
   const root = (): DirHandle => opts.root ?? deny("filesystem read");
@@ -334,6 +343,28 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   const describeAsPhrase = (fault: number, message: string): string => {
     const phrase = phraseOf(fault);
     return phrase === "" ? message : phrase;
+  };
+
+  /**
+   * Run a read, and say a failure the way a change says it.
+   *
+   * A read reports by *throwing*: the bridge turns that into an error reply and the worker decodes it
+   * into `FileResult.error` or `openInput`'s message. So the rephrasing has to happen here, and without
+   * it a page spoke with two voices — `rm nosuchfile` said "no such file or directory" while
+   * `cat nosuchfile` said "A requested file or directory could not be found at the time an operation was
+   * processed.", which is the same failure in the same tab. Found by driving the browser terminal after
+   * the change side was done. Issue 0025's phrase policy, one layer over.
+   */
+  const readOrPhrase = async <T>(work: () => Promise<T>): Promise<T> => {
+    try {
+      return await work();
+    } catch (e) {
+      // A fault this host named itself keeps its own words: those are chosen, and the phrase would be
+      // a worse version of them. Everything else is the browser's boilerplate.
+      if (e instanceof Faulted) throw e;
+      const message = e instanceof Error ? e.message : String(e);
+      throw new Error(describeAsPhrase(faultOf(e), message));
+    }
   };
 
   /**
@@ -597,7 +628,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       return i32le(await c.exit);
     },
 
-    [OP.READ_FILE]: async (p) => new Uint8Array(await (await fileOf(unstr(p))).arrayBuffer()),
+    [OP.READ_FILE]: (p) =>
+      readOrPhrase(async () => new Uint8Array(await (await fileOf(unstr(p))).arrayBuffer())),
     [OP.WRITE_FILE]: (p) => {
       const no = writeRefused();
       if (no !== null) return no;
@@ -675,13 +707,14 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       }, describeAsPhrase);
     },
 
-    [OP.OPEN_INPUT]: async (p) => {
-      const path = unstr(p);
-      source = null;
-      if (path === "") return EMPTY;             // "standard input", which is empty here
-      source = { blob: await fileOf(path), at: 0 };
-      return EMPTY;
-    },
+    [OP.OPEN_INPUT]: (p) =>
+      readOrPhrase(async () => {
+        const path = unstr(p);
+        source = null;
+        if (path === "") return EMPTY;             // "standard input", which is empty here
+        source = { blob: await fileOf(path), at: 0 };
+        return EMPTY;
+      }),
     [OP.READ_CHUNK]: async () => {
       const fed = source === null ? kids.readChunk() : null;
       if (fed !== null) return fed.length === 0 ? END : data(fed);

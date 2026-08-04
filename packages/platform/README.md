@@ -133,7 +133,12 @@ The categories are deliberately few, and `FAULT_OTHER` is not an embarrassment: 
 a taxonomy nobody branches on. What a program branches on is "was it already gone"; what a person
 reads is the message.
 
-**In a browser the message is the category's own short phrase**, not the `DOMException`'s. Deno and
+**In a browser the message is the category's own short phrase**, not the `DOMException`'s — for a
+failed *read* as much as a failed change, since one tab speaking two ways about the same failure is
+worse than either way. A read reports by throwing, so the rephrasing happens where the throw does; a
+fault the host *named itself* keeps its own words, because "filesystem read not granted to this
+application" says the page withheld the capability and "permission denied" says a filesystem refused an
+operation, and only one of those is true. Deno and
 Node say "No such file or directory (os error 2), remove '/tmp/x'" — terse, and it names the path and
 the operation, so it is worth passing on verbatim. A browser says "A requested file or directory could
 not be found at the time an operation was processed.", which is prose for a developer console and

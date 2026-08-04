@@ -976,3 +976,57 @@ Deno.test({
     assertEquals(await asScript(wacshBinary, []), await asScript("bash", []), "script from stdin");
   },
 });
+
+/**
+ * The builtins' *diagnostics*, against GNU's own.
+ *
+ * Every case above compares standard output, which is the right default — a shell's job is what it
+ * prints — and it means the wording of a failure was never checked against anything. `mkdir` and `rm`
+ * are the two builtins here that GNU also ships as programs, so their lines are comparable, and they
+ * were not comparable at all: they carried the host's errno and an absolute path GNU does not print
+ * ("File exists (os error 17): mkdir '/tmp/…'"), which also differed by runtime — Node says
+ * "EEXIST: file already exists" for the same fault.
+ *
+ * `LC_ALL=C` matters here and is why the harness above sets it: GNU quotes the path with typographic
+ * marks in a UTF-8 locale and with apostrophes in C.
+ */
+Deno.test({
+  name: "mkdir and rm say what GNU says when they fail",
+  ignore: !haveBash,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "sh-diag-" });
+    try {
+      await Deno.mkdir(`${dir}/full/inner`, { recursive: true });
+      await Deno.mkdir(`${dir}/taken`);
+
+      // Builtins only. This binary is `packages/sh` alone, so `rmdir` here is "command not found" —
+      // it is `packages/box`'s applet, and its "Directory not empty" is compared against GNU in
+      // `box/test/shell.test.ts` where that applet exists.
+      const cases = [
+        "mkdir taken",      // exists
+        "rm nosuchthing",   // absent
+        "rm full",          // a directory, without -r
+      ];
+      for (const script of cases) {
+        const run = (cmd: string, args: string[]) =>
+          new Deno.Command(cmd, {
+            args,
+            cwd: dir,
+            stdin: "null",
+            stdout: "null",
+            stderr: "piped",
+            env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+            clearEnv: true,
+          }).outputSync();
+        const theirs = new TextDecoder().decode(run("bash", ["-c", script]).stderr).trim();
+        const ours = new TextDecoder().decode(run(wacshBinary, ["-c", script]).stderr).trim();
+        // The reason, which is the part a person reads and the part that was wrong. Compared rather than
+        // the whole line because a prefix can legitimately differ in shape; the reason cannot.
+        const reason = (line: string) => line.slice(line.lastIndexOf(": ") + 2);
+        assertEquals(reason(ours), reason(theirs), `${script}\n  ours:  ${ours}\n  theirs: ${theirs}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
