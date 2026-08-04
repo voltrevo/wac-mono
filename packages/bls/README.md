@@ -10,7 +10,10 @@ different file with `ctTrace` over it, not bolted onto these functions.
 
 ## Status
 
-Under construction, built in stages with an external oracle gating each one. What exists:
+**Working.** `verify(pubkey, message, signature)` agrees with all 29 `ethereum/bls12-381-tests`
+verify fixtures and all 28 deserialization fixtures, at about **109 ms** per signature.
+
+Built in stages with an external oracle gating each one:
 
 | stage | state |
 | ----- | ----- |
@@ -23,8 +26,9 @@ Under construction, built in stages with an external oracle gating each one. Wha
 | `expand_message_xmd` + `hash_to_field` | **done**, against the CFRG vectors |
 | `map_to_curve` — SSWU and the 3-isogeny | **done**, against `Q0`/`Q1` |
 | `clear_cofactor` and `hash_to_G2` | **done**, against `P` and Ethereum's fixtures |
-| Miller loop and final exponentiation | not started |
-| `verify` — against the Ethereum vectors | not started |
+| Miller loop | **done**, against `@noble/curves` via Python |
+| Final exponentiation | **done**, via the verification identity |
+| `verify` | **done** — all 29 Ethereum fixtures, plus 28 deserialization |
 
 ## Why none of `crypto/src/fieldp.wac` is reused
 
@@ -62,9 +66,15 @@ Vectors are vendored rather than fetched, so the tests need no network.
 
 ## Speed, stated up front
 
-This will not be fast. Wasm has no 64×64→128 multiply and no carry flag, so `Fp` uses twelve
-32-bit limbs with a 64-bit accumulator — 144 partial products per multiply — because `i64` is the
-widest multiply the machine has. A verification is two pairings sharing a final exponentiation,
-order 20,000 field multiplications. Expect tens to low hundreds of milliseconds. `blst` does about
-one. That is the price of a portable implementation with no assembly, and it is worth knowing
-before anyone puts this on a hot path.
+**Measured: 109 ms per verification.** That is within the range predicted before any of it was
+written — tens to low hundreds of milliseconds — and it is roughly a hundred times `blst`, which
+does about one. Wasm has no 64×64→128 multiply and no carry flag, so `Fp` uses twelve 32-bit limbs
+with a 64-bit accumulator, 144 partial products per multiply, because `i64` is the widest multiply
+the machine has. A verification is two Miller loops sharing one final exponentiation, order 20,000
+field multiplications.
+
+Nothing here is optimised, and the three biggest levers are known and untaken: `g1InSubgroup` and
+`g2InSubgroup` multiply by r rather than using the endomorphism checks, `clearCofactorG2`
+multiplies by a 636-bit `h_eff` rather than using Budroni–Pintore, and the final exponentiation
+uses plain squaring rather than the cyclotomic kind. Each is noted where it appears. Do not put
+this on a hot path without measuring first.

@@ -286,3 +286,30 @@ export Fp12 fp12Frobenius(Fp12 a, i32 n) {
   Fp2 k = (n == 1) ? frob12C1_1() : ((n == 2) ? frob12C1_2() : frob12C1_3());
   return Fp12(b0, Fp6(fp2Mul(b1.c0, k), fp2Mul(b1.c1, k), fp2Mul(b1.c2, k)));
 }
+
+/**
+ * `f · (o0 + o1·v + o4·v·w)` — the sparse multiply a line evaluation needs.
+ *
+ * Three of the six Fp2 coefficients are zero, so this is three sparse Fp6 multiplies rather than
+ * the three full ones `fp12Mul` would do. On a Miller loop of ~64 iterations with one or two line
+ * evaluations each, that is most of the pairing's cost.
+ *
+ * The naming is the convention the pairing literature uses: 0, 1 and 4 are the indices of the
+ * non-zero coefficients when Fp12 is read as six Fp2 values.
+ */
+export Fp12 fp12MulBy014(Fp12 f, Fp2 o0, Fp2 o1, Fp2 o4) {
+  Fp6 t0 = fp6MulBy01(f.c0, o0, o1);
+  Fp6 t1 = fp6MulBy1(f.c1, o4);
+  Fp6 t2 = fp6MulBy01(fp6Add(f.c0, f.c1), o0, fp2Add(o1, o4));
+  return Fp12(fp6Add(fp6MulByV(t1), t0), fp6Sub(fp6Sub(t2, t0), t1));
+}
+
+/**
+ * `f^(p⁶)`, by composing the cube-power Frobenius with itself.
+ *
+ * Needed by the final exponentiation's easy part, where `f` is not yet in the cyclotomic subgroup
+ * and so conjugation is *not* yet the same thing as this. Once past the easy part they coincide,
+ * which is what makes the rest of the chain cheap — and mistaking one for the other before that
+ * point is a bug the vectors would catch and bilinearity would not.
+ */
+export Fp12 fp12FrobeniusP6(Fp12 a) { return fp12Frobenius(fp12Frobenius(a, 3), 3); }
