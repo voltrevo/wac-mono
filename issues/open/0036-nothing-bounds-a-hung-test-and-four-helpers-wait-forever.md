@@ -5,7 +5,7 @@
 - **Reported by:** agent-b
 - **Date:** 2026-08-04
 - **Kind:** bug
-- **Symptom:** hang
+- **Symptom:** hang (observed once, not reproduced since; the missing deadlines are the confirmed part)
 
 `deno task test` hung. Two tests sat at over eight minutes and **zero tests completed** before I
 killed the run at about ten:
@@ -61,18 +61,35 @@ take the same port. `deno task test` passes `--parallel`, so test *files* run co
 window is real rather than theoretical. This is the same shape as **0026** (sshd's port-announcement
 test is racy), which suggests one underlying pattern rather than three separate flakes.
 
-**Evidence is suggestive rather than conclusive, and the asymmetry is worth stating**: four runs of
-bare `deno test -A` (no `--parallel`) completed today in 2m36s–3m0s with 937–947 passing, and the one
-`--parallel` run hung. That is one observation of the hang. It could also be a leftover from my
-having killed a TLS test server earlier in the same session — I could not rule that out.
+**It did not reproduce, and that has to be said plainly.** After merging `origin/master` — which
+brought agent-a's content-addressed build cache — the same `deno task test` ran in **50.3s, 967
+passed, zero long-running warnings**. One attempt, so not a disproof, but the hang is not currently
+reachable and the issue should not be read as a live fault.
+
+So the standing of each claim is different, and worth separating:
+
+- **Confirmed by reading the code, independent of any run:** Deno has no per-test timeout, and the
+  four helpers below have no deadline. That is the defect, and it is what makes an unbounded wait
+  *possible* whatever triggers it.
+- **Observed once, not reproduced:** the actual hang, on a pre-merge tree, two tests past eight
+  minutes with zero completing.
+
+The likeliest mechanism for the difference is the build cache. Without it every test that builds a
+binary rebuilds it, which lengthens the window in which bind-then-release can lose the port — so the
+cache may have made a latent race much rarer without addressing it. It could equally have been a
+leftover from my having killed a TLS test server earlier in the same session; I could not rule that
+out either.
 
 ## Two different numbers both called "the suite"
 
 Worth recording because it is how this keeps getting misdiagnosed. `deno task test` is
-`deno test --parallel …`; a bare `deno test -A` is not parallel. The first is ~50s (agent-a's
-measurement, 0031); the second is ~3 minutes. I spent a session quoting the second as "the full
-suite" while 0031 quotes the first. Same words, different command, 3.5× apart, and neither figure is
-wrong.
+`deno test --parallel …`; a bare `deno test -A` is not parallel. I spent a session quoting ~3 minutes
+for the second while 0031 quotes ~50s for the first, both of us calling it "the full suite".
+
+**Two differences were confounded there, not one.** My 3-minute figures predate agent-a's build
+cache, so the gap is `--parallel` *and* a cold rebuild every run, in unknown proportion. The honest
+statement is only that the two commands are not the same measurement and the names do not
+distinguish them.
 
 ## What to do
 
