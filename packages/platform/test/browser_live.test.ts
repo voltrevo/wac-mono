@@ -316,6 +316,63 @@ Deno.test({
       // Redirection into OPFS and back out again: a shell with a real filesystem under it.
       assertEquals((await command("echo kept > note.txt; cat note.txt")).endsWith("kept"), true);
 
+      // A page spawning a program of its own: issue 0030's whole claim, in a real browser.
+      //
+      // The child is a `--worker` bundle built for the browser, put into the Origin Private File
+      // System by this test — because that is the honest gap 0030 names. A page has no filesystem
+      // full of programs, so somebody has to put one there, and once it is there `spawn` reads it
+      // like any other file. What this proves that the double cannot: a worker created *by a
+      // worker*, its own `SharedArrayBuffer`, and its calls answered by the page while its parent is
+      // parked in `Atomics.wait`.
+      const childBundle = await Deno.makeTempFile({ prefix: "wac-child-", suffix: ".worker.js" });
+      await buildApp("packages/platform/example/wc.wac", childBundle, {}, "browser", true);
+      await buildApp(
+        "packages/platform/example/runner.wac",
+        `${dir}/runner.html`,
+        { read: true },
+        "browser",
+      );
+      const bundleSource = await Deno.readTextFile(childBundle);
+      await Deno.remove(childBundle);
+
+      // Written straight into OPFS from the page's own thread, which is the only way in: there is
+      // no other route to a page's private filesystem, and that is the point of it.
+      await page.goto(`http://127.0.0.1:${port}/runner.html`, { waitUntil: "load" });
+      await page.evaluate(
+        `(async (source) => {
+          const root = await navigator.storage.getDirectory();
+          const handle = await root.getFileHandle("wc.worker.js", { create: true });
+          const w = await handle.createWritable();
+          await w.write(source);
+          await w.close();
+        })(${JSON.stringify(bundleSource)})`,
+      );
+
+      await page.goto(
+        `http://127.0.0.1:${port}/runner.html?a=wc.worker.js&a=${encodeURIComponent("one two three")}`,
+        { waitUntil: "load" },
+      );
+      await page.waitForFunction(
+        "document.body.innerText.includes('[exit')",
+        null,
+        { timeout: 30_000 },
+      );
+      const spawned = (await page.evaluate("document.body.innerText")) as string;
+      // `wc` of "one two three\n": one line, three words, fourteen bytes. Compared against the same
+      // program run natively rather than against a literal, which is the differential this file is
+      // for — the child is the same source built for a different host.
+      const nativeWc = new Deno.Command(native, {
+        args: [],
+        stdin: "piped",
+        stdout: "piped",
+      }).spawn();
+      const wr = nativeWc.stdin.getWriter();
+      await wr.write(new TextEncoder().encode("one two three\n"));
+      await wr.close();
+      const nativeOut = new TextDecoder().decode((await nativeWc.output()).stdout).trim();
+      assertEquals(spawned.includes(nativeOut), true, `page: ${spawned}\nnative: ${nativeOut}`);
+      assertEquals(spawned.includes("[exit 0]"), true, spawned);
+
       assertEquals(failures.join("\n"), "", "the page raised errors");
     } finally {
       await browser?.close();

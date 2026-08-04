@@ -426,6 +426,20 @@ Running a *program* is therefore two steps, read it and spawn it, which is why t
 registry of launchable things: the capability is "run this", and where the code came from is
 the filesystem's business.
 
+**Every host spawns through one implementation.** `host/children.ts` holds it: the queues that are
+the child's stdio, the load notice, the grace period, when to stop the responder. What differs between
+the three is how a *worker* is made — a page and Deno take a module from a blob URL, Node takes a
+source string with `eval` and reports errors through an emitter — so that is an argument, thirty lines
+in total, and everything else is shared. The child's world is the other argument, which is how a page
+gives its children a page's world and Deno gives them Deno's.
+
+A page could always have done this; nothing about a browser forbade it. A worker can create a worker,
+each program needs its own `SharedArrayBuffer` and a responder for it, and the page's own thread hosts
+the second as easily as the first — the parent is parked in `Atomics.wait` while its child runs, and
+that is fine precisely because the child's calls are answered by the *page*. A child gets no `Page`
+profile: its output goes to the parent through the handle, and a child that could draw would be
+drawing over the program that started it.
+
 **`spawn` answers only once the source has loaded**, so a file that is not a worker bundle is a
 failed child rather than a dead parent. That took two things. Deno re-raises an unhandled worker
 error as the *host's* own uncaught error, so a `SyntaxError` in the child killed the program that

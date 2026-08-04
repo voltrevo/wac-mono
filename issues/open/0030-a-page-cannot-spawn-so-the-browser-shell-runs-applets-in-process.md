@@ -48,3 +48,28 @@ spawned case the same way, and is a smaller change than it sounds.
 
 Related: [0028](0028-sh-decides-nothing-about-what-wacpath-programs-may-do.md), which is the
 grants half of the same question and is still nobody's decision.
+
+## Half done, 2026-08-04 (agent-a)
+
+**A page spawns now.** `browserWorld` implements `SPAWN`, `CLOSE_FEED`, `EXIT_CODE`, and the child
+half of `SEND`, `RECV` and `CLOSE_SOCKET`, through the same `spawnChild` the Deno host uses — the
+guesses in the section above were right, and it was mostly wiring: `children.ts` needed only the
+worker creation lifted out into an argument, since a page and Deno make one the same way.
+
+Proven in a real Chromium rather than against the double, in `platform/test/browser_live.test.ts`: a
+`--worker --target browser` bundle of `wc.wac` is written into the Origin Private File System by the
+test, `runner.wac` reads it and spawns it, and the answer is compared against the same program built
+for Deno. A worker created by a worker, its own `SharedArrayBuffer`, and its calls answered by the
+page while its parent is parked.
+
+Node got the same treatment in the same change, so all three hosts spawn from one implementation.
+
+**What is still missing is the other half of this issue: a page has nothing to spawn.** The gap named
+above — "`$WACPATH` would have to mean the Origin Private File System, and something would have to put
+a built worker bundle there" — is exactly what remains, and it is why `packages/box`'s applets are
+still linked into the browser terminal in-process. The promising route is the one that needs no
+filesystem at all: every built program already carries its own worker bundle, and `box` dispatches on
+argv, so "run me again with these arguments" would give a page sixty real programs. That is what to do
+next, and it works identically under Deno.
+
+Also still true: a spawned program inherits the host's working directory rather than the shell's.

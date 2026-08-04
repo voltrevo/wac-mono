@@ -12,9 +12,17 @@
 
 import { type Handlers } from "./respond.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
-import { OP } from "./ops.ts";
+import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 import { ChildStack, packCaptured, unpackPush } from "./child.ts";
-import { noSpawnHere } from "./children.ts";
+import {
+  type Child,
+  failedChild,
+  noSpawnHere,
+  spawnChild,
+  type WorkerLike,
+} from "./children.ts";
+import { bridgeOf, newBridge } from "./layout.ts";
+import { serveHostCalls } from "./respond.ts";
 import { changeBytes, changed, FAULT_DENIED } from "./faults.ts";
 
 /** Node's pieces, described rather than imported, so this file checks under Deno. */
@@ -63,6 +71,15 @@ export type NodeListener = {
 
 export type NodeWorldOptions = {
   args?: string[];
+  /**
+   * How to start a worker, when this launcher can.
+   *
+   * Injected because `node:worker_threads` is not importable from here — this file describes Node's
+   * pieces rather than importing them, so that it type-checks under Deno — and because it is the
+   * only part of spawning that differs between the hosts. `entryNode.ts` has `wt` and passes the
+   * three lines that wrap it; absent, `spawn` says so rather than failing the program.
+   */
+  makeWorker?: (source: string) => WorkerLike;
   log?(line: string): void;
   warn?(line: string): void;
   fs?: { read?: boolean; write?: boolean };
@@ -122,6 +139,8 @@ export function nodeWorld(
 
   const sockets = new Map<number, NodeSock>();
   const listeners = new Map<number, NodeListener>();
+  /** Children by handle, in the same namespace as sockets: `waitAny` does not care which is which. */
+  const children = new Map<number, Child>();
   let nextHandle = 1;
   const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
 
@@ -241,14 +260,74 @@ export function nodeWorld(
     },
 
     /**
-     * No `spawn` here yet — said in the shape a caller can act on.
+     * A worker on the source it is handed, with a world of its own.
      *
-     * -2 rather than an error, so a caller with another route takes it instead of reporting the
-     * program broken: see `Child` in platform.wac. Node *can* run a worker — `entryNode.ts` runs the
-     * application in one — so this is unimplemented rather than impossible, and `children.ts` is
-     * where the work would go.
+     * The same `spawnChild` the Deno and browser hosts use. What differs here is only how a worker
+     * is made — Node takes a source string with `eval` rather than a module from a blob URL — which
+     * is why that is an argument. A launcher that did not pass one says so in the shape a caller can
+     * act on: -2, "there is no spawn here", which is not a fact about the program.
      */
-    [OP.SPAWN]: () => noSpawnHere("spawning is not implemented in the Node host"),
+    [OP.SPAWN]: async (p) => {
+      const makeWorker = opts.makeWorker;
+      if (makeWorker === undefined) {
+        return noSpawnHere("this Node launcher was built without a way to start a worker");
+      }
+      const want = readI32le(p);
+      const n = readI32le(p.subarray(4));
+      const source = unstr(p.subarray(8, 8 + n));
+      const rest = unstr(p.subarray(8 + n));
+      const childArgs = rest.length === 0 ? [] : rest.split("\u0000");
+
+      // Intersected with this world's own authority, as everywhere: asking for more than the parent
+      // has is not an error, the child simply finds the capability denied.
+      const give = {
+        read: (want & GRANT_READ) !== 0 && opts.fs?.read === true,
+        write: (want & GRANT_WRITE) !== 0 && opts.fs?.write === true,
+        net: (want & GRANT_NET) !== 0 && opts.net === true,
+        env: (want & GRANT_ENV) !== 0 && opts.env !== undefined,
+      };
+
+      const h = nextHandle++;
+      const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
+        const enc = new TextEncoder();
+        // The child's stdio is the parent's queues. Everything else about its world — files,
+        // sockets, the clock — is this world's, narrowed by `give`.
+        const childIo: NodeIo = {
+          ...io,
+          readStdin: () => input.next(),
+          readStdinChunk: () => input.next(),
+          writeStdout: async (b: Uint8Array) => { out.push(b); },
+          writeStderr: async (b: Uint8Array) => { out.push(b); },
+        };
+        return serveHostCalls(bridgeOf(sab), nodeWorld(fs, proc, childIo, {
+          args: cargs,
+          ...(give.read || give.write ? { fs: { read: give.read, write: give.write } } : {}),
+          ...(give.net ? { net: true } : {}),
+          ...(give.env ? { env: opts.env } : {}),
+          // A line of output is bytes on the handle, with the newline `log` implies.
+          log: (l: string) => out.push(enc.encode(l + "\n")),
+          warn: (l: string) => out.push(enc.encode(l + "\n")),
+          makeWorker,
+        }));
+      }, newBridge, makeWorker);
+
+      const why = await child.loaded;
+      if (why !== "") {
+        child.kill();
+        return failedChild(why);
+      }
+      children.set(h, child);
+      return i32le(h);
+    },
+    [OP.CLOSE_FEED]: (p) => {
+      children.get(readI32le(p))?.in.end();
+      return EMPTY;
+    },
+    [OP.EXIT_CODE]: async (p) => {
+      const c = children.get(readI32le(p));
+      if (c === undefined) throw new Error("not a spawned worker");
+      return i32le(await c.exit);
+    },
 
     [OP.STAT]: async (p) => {
       const out = new Uint8Array(20);
@@ -354,6 +433,11 @@ export function nodeWorld(
         const piped = await io.readStdinChunk();
         return piped.length === 0 ? END : data(piped);
       }
+      const kid = children.get(h);
+      if (kid !== undefined) {
+        const fromChild = await kid.out.next();
+        return fromChild.length === 0 ? END : data(fromChild);
+      }
       const c = sockets.get(h);
       if (c === undefined) return failed("not an open socket");
       try {
@@ -364,6 +448,8 @@ export function nodeWorld(
       }
     },
     [OP.SEND]: async (p) => {
+      const kid = children.get(readI32le(p));
+      if (kid !== undefined) { kid.in.push(p.slice(4)); return EMPTY; }
       const c = sockets.get(readI32le(p));
       if (c === undefined) throw new Error("not an open socket");
       await c.send(p.subarray(4));
@@ -373,8 +459,12 @@ export function nodeWorld(
       const h = readI32le(p);
       try { sockets.get(h)?.close(); } catch { /* already closed */ }
       try { listeners.get(h)?.close(); } catch { /* already closed */ }
+      // A child's handle ends its input and stops it, as in every host: `closeFeed` is the one that
+      // ends the input alone.
+      try { children.get(h)?.in.end(); children.get(h)?.kill(); } catch { /* gone */ }
       sockets.delete(h);
       listeners.delete(h);
+      children.delete(h);
       return EMPTY;
     },
 

@@ -34,6 +34,11 @@ export function runAsWorkerBrowser(load: () => Promise<AppModule>): void {
     onmessage: ((e: MessageEvent) => void) | null;
     postMessage(m: Result): void;
   };
+  // "This bundle parsed and evaluated", before the bridge has arrived and before the application
+  // runs. It is the one fact a parent cannot otherwise learn, and `children.ts` waits for it or for
+  // the load error before answering `spawn` — so a page that spawns a source which is not
+  // JavaScript gets a failed child rather than a dead parent. wac-mono issue 0021.
+  (scope as unknown as { postMessage(m: unknown): void }).postMessage({ ready: true });
   scope.onmessage = (ev: MessageEvent) => {
     const start = ev.data as Start;
     void (async () => {
@@ -298,11 +303,17 @@ export async function runInPage(opts: PageOptions): Promise<number> {
   try {
     const code = await new Promise<number>((resolve, reject) => {
       worker.addEventListener("message", (ev: MessageEvent) => {
-        const r = ev.data as Result;
+        const r = ev.data as Result | { ready: true };
+        if ("ready" in r) return;   // the load notice, which the launcher has no use for
         if (r.ok) resolve(r.code);
         else reject(new Error(r.error));
       });
-      worker.addEventListener("error", (e: ErrorEvent) => reject(new Error(e.message)));
+      worker.addEventListener("error", (e: ErrorEvent) => {
+        // Contained, or the page reports it twice: once as the program's failure and once as an
+        // uncaught error of its own.
+        e.preventDefault();
+        reject(new Error(e.message));
+      });
       worker.postMessage({ sab: bridge.sab } as Start);
     });
     return code;

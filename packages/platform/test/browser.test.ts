@@ -454,14 +454,39 @@ Deno.test("the browser world refuses what a page cannot do", async () => {
   assertEquals((await call(OP.ENV, str("PATH")))[0], 0, "every variable is unset");
 });
 
-Deno.test("a page says it cannot spawn, rather than failing the program — 0030", async () => {
+/** The payload `spawn` takes: grants, then the source length-prefixed, then NUL-joined arguments. */
+function spawnPayload(source: string, args: string[], grants = 0): Uint8Array {
+  const src = str(source);
+  const rest = str(args.join("\u0000"));
+  const out = new Uint8Array(8 + src.length + rest.length);
+  out.set(i32le(grants), 0);
+  out.set(i32le(src.length), 4);
+  out.set(src, 8);
+  out.set(rest, 8 + src.length);
+  return out;
+}
+
+Deno.test("a page spawns a worker of its own — 0030", async () => {
+  // The unit of this is the *plumbing*: a worker is created, its load notice is waited for, its
+  // handle comes back, and its exit code arrives. A child that speaks the bridge and writes output
+  // is a whole wac program, and that is tested in a real browser by `browser_live.test.ts` — here a
+  // handful of lines of JavaScript playing the same protocol is what keeps this test a unit.
   const w = browserWorld({});
-  const out = await w[OP.SPAWN](new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0])) as Uint8Array;
-  // -2, not -1: "there is no `spawn` here" is not a fact about the program, so `packages/sh` falls
-  // through to its own implementations instead of reporting 126. Before this the opcode had no
-  // handler at all, and `WACPATH=/b` with a file named `wc` in it hid the `wc` that works.
-  assertEquals(readI32le(out), -2, "the handle says the capability is absent");
-  assertEquals(unstr(out.subarray(4)).includes("cannot spawn"), true, unstr(out.subarray(4)));
+  const child = `
+    self.postMessage({ ready: true });
+    self.onmessage = () => self.postMessage({ ok: true, code: 7 });
+  `;
+  const spawned = await w[OP.SPAWN](spawnPayload(child, ["one"])) as Uint8Array;
+  const handle = readI32le(spawned);
+  assertEquals(handle >= 1, true, `a handle, not ${handle}: ${unstr(spawned.subarray(4))}`);
+  const code = readI32le(await w[OP.EXIT_CODE](i32le(handle)) as Uint8Array);
+  assertEquals(code, 7, "the child's own exit code");
+
+  // A source that is not JavaScript is a failed child with a reason, not an error that takes the
+  // page down with it — the same contract the Deno host has. Issue 0021.
+  const bad = await w[OP.SPAWN](spawnPayload("this is not javascript {{{", [])) as Uint8Array;
+  assertEquals(readI32le(bad), -1, "would not start");
+  assertEquals(unstr(bad.subarray(4)).length > 0, true, "and says why");
 });
 
 Deno.test("the browser world denies the filesystem when the page grants none", async () => {

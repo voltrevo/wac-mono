@@ -33,9 +33,11 @@
 import { type Handlers } from "./respond.ts";
 import { CHUNK } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
-import { OP } from "./ops.ts";
+import { GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 import { ChildStack, packCaptured, unpackPush } from "./child.ts";
-import { noSpawnHere } from "./children.ts";
+import { type Child, failedChild, spawnChild } from "./children.ts";
+import { bridgeOf, newBridge } from "./layout.ts";
+import { serveHostCalls } from "./respond.ts";
 import {
   changeBytes,
   changed,
@@ -109,6 +111,12 @@ export type BrowserWorldOptions = {
    */
   writeErr?(bytes: Uint8Array): void;
   /**
+   * Where standard input comes from. A page has none; a *spawned child* does — what its parent
+   * sent — and this is how the queue reaches it. The same option the Deno host takes, for the same
+   * reason and with the same shape.
+   */
+  readStdin?(): Promise<Uint8Array>;
+  /**
    * The Origin Private File System root, if the page is willing to grant one.
    *
    * Absent means no filesystem at all, exactly as omitting `fs` does under Deno. Passing
@@ -162,6 +170,16 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   const log = opts.log ?? ((l: string) => console.log(l));
   const warn = opts.warn ?? ((l: string) => console.warn(l));
   const write = opts.write ?? ((b: Uint8Array) => console.log(new TextDecoder().decode(b)));
+  const readIn = opts.readStdin;
+
+  /**
+   * The children this page has started, by handle.
+   *
+   * Numbered from 1 so that 0 is standard input, as it is in every host — handles are one namespace
+   * and `waitAny` watches them without knowing which is which.
+   */
+  const children = new Map<number, Child>();
+  let nextHandle = 1;
   const writeErr = opts.writeErr ??
     ((b: Uint8Array) => warn(new TextDecoder().decode(b)));
   const deny = (what: string): never => {
@@ -389,7 +407,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     [OP.ENV]: () => new Uint8Array([0]),
 
     // A page has no standard input of its own; a child running inside it does.
-    [OP.READ_STDIN]: () => kids.readAll() ?? EMPTY,
+    [OP.READ_STDIN]: async () => kids.readAll() ?? (readIn === undefined ? EMPTY : await readIn()),
     [OP.WRITE_STDOUT]: async (p) => {
       if (kids.active) {
         if (!kids.write(p)) throw new Error("the child's output buffer is full");
@@ -419,14 +437,75 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     },
 
     /**
-     * No `spawn` in a page yet — said in the shape a caller can act on.
+     * A worker on the source it is handed, with a world of its own. Issue 0030.
      *
-     * -2 rather than an error, because "there is no `spawn` here" is not a fact about the program:
-     * `packages/sh` falls through to its own implementations, which is what keeps sixty applets
-     * working in the browser terminal. Before this, `WACPATH=/b` with a file called `wc` in it
-     * reported "no handler for capability 27" and exit 126, hiding a `wc` that works. Issue 0030.
+     * Nothing about a page forbade this: a worker can create a worker, each program needs its own
+     * `SharedArrayBuffer` and a responder for it, and the page's own thread can host a second
+     * responder as easily as the first. The parent is parked in `Atomics.wait` while its child runs,
+     * and that is fine precisely because the child's calls are answered *here*, by the page, not by
+     * the parent.
+     *
+     * The same `spawnChild` the Deno host uses, with a browser world instead of a Deno one — which
+     * is the whole reason that function takes its world and its worker as arguments. What differs
+     * between the two hosts is which world a child gets, and that is one expression.
+     *
+     * **A child gets no page.** Its `log`, `warn`, `write` and `writeErr` go to the parent through
+     * the handle, its reads come from what the parent sends, and `dom` is deliberately absent: a
+     * child that could draw would be drawing over the program that started it, and a handle is not
+     * a place to put a canvas.
      */
-    [OP.SPAWN]: () => noSpawnHere("a page cannot spawn yet — see wac-mono issue 0030"),
+    [OP.SPAWN]: async (p) => {
+      const want = readI32le(p);
+      const n = readI32le(p.subarray(4));
+      const source = unstr(p.subarray(8, 8 + n));
+      const rest = unstr(p.subarray(8 + n));
+      const childArgs = rest.length === 0 ? [] : rest.split("\u0000");
+
+      // Intersected with what *this* page has, not taken as given: a page granted no filesystem
+      // cannot hand one to a child, and asking for more than the parent has is not an error — the
+      // child simply finds the capability denied. The same rule as the Deno host's, expressed
+      // against a page's options rather than Deno's.
+      const give = {
+        read: (want & GRANT_READ) !== 0 && opts.root !== undefined,
+        write: (want & GRANT_WRITE) !== 0 && opts.root !== undefined && opts.writable === true,
+      };
+
+      const h = nextHandle++;
+      const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
+        const enc = new TextEncoder();
+        return serveHostCalls(bridgeOf(sab), browserWorld({
+          args: cargs,
+          // A line of output is bytes on the handle, with the newline `log` implies. The parent
+          // cannot tell `log` from `write`, and neither can a pipe — which is the point.
+          log: (l: string) => out.push(enc.encode(l + "\n")),
+          warn: (l: string) => out.push(enc.encode(l + "\n")),
+          write: (b: Uint8Array) => out.push(b),
+          writeErr: (b: Uint8Array) => out.push(b),
+          readStdin: () => input.next(),
+          ...(give.read ? { root: opts.root, writable: give.write } : {}),
+        }));
+      }, newBridge);
+
+      const why = await child.loaded;
+      if (why !== "") {
+        child.kill();
+        return failedChild(why);
+      }
+      children.set(h, child);
+      return i32le(h);
+    },
+
+    [OP.CLOSE_FEED]: (p) => {
+      // Input only. `closeSocket` is what stops a child; a program that reads to the end before
+      // answering needs that end while it is still alive.
+      children.get(readI32le(p))?.in.end();
+      return EMPTY;
+    },
+    [OP.EXIT_CODE]: async (p) => {
+      const c = children.get(readI32le(p));
+      if (c === undefined) throw new Error("not a spawned worker");
+      return i32le(await c.exit);
+    },
 
     [OP.READ_FILE]: async (p) => new Uint8Array(await (await fileOf(unstr(p))).arrayBuffer()),
     [OP.WRITE_FILE]: (p) => {
@@ -516,6 +595,13 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     [OP.READ_CHUNK]: async () => {
       const fed = source === null ? kids.readChunk() : null;
       if (fed !== null) return fed.length === 0 ? END : data(fed);
+      // A spawned child's standard input is a queue its parent fills, which is the same shape a
+      // fed child has and a different source: `pushChild` hands over a buffer, `send` arrives over
+      // time. Both end, and the end is what `readChunk` has to be able to say.
+      if (source === null && readIn !== undefined) {
+        const piped = await readIn();
+        return piped.length === 0 ? END : data(piped);
+      }
       if (source === null) return END;
       try {
         const end = Math.min(source.at + CHUNK, source.blob.size);
@@ -547,8 +633,40 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     // rather than refusing. Any other handle is a socket, which a page cannot have.
     // A page has no standard input and no sockets, so handle 0 is immediately at its end and
     // anything else is refused — as a `Read`, so a caller cannot read the refusal as "finished".
-    [OP.RECV]: (p) => (readI32le(p) === 0 ? END : failed("network access is not granted")),
-    [OP.SEND]: () => deny("network access"),
-    [OP.CLOSE_SOCKET]: () => EMPTY,
+    [OP.RECV]: async (p) => {
+      const h = readI32le(p);
+      // Handle 0 is standard input, as everywhere: it exists so `waitAny` can watch it beside a
+      // child. A page's own standard input is empty; a child's is what its parent sent.
+      if (h === 0) {
+        if (readIn === undefined) return END;
+        const piped = await readIn();
+        return piped.length === 0 ? END : data(piped);
+      }
+      const kid = children.get(h);
+      if (kid !== undefined) {
+        const fromChild = await kid.out.next();
+        return fromChild.length === 0 ? END : data(fromChild);
+      }
+      return failed("network access is not granted");
+    },
+    // A child's standard input. Sockets are a page's other missing capability, and asking for one
+    // is still a denial — but a handle that names a child is not a socket, and the check has to come
+    // first or a page could spawn a program it can never feed.
+    [OP.SEND]: (p) => {
+      const kid = children.get(readI32le(p));
+      if (kid !== undefined) { kid.in.push(p.slice(4)); return EMPTY; }
+      return deny("network access");
+    },
+    [OP.CLOSE_SOCKET]: (p) => {
+      const h = readI32le(p);
+      // Closing a child's handle ends its standard input *and* stops it. A program that wants only
+      // the first should stop sending and wait for its output to end — that is `closeFeed`.
+      const kid = children.get(h);
+      if (kid !== undefined) {
+        try { kid.in.end(); kid.kill(); } catch { /* already gone */ }
+        children.delete(h);
+      }
+      return EMPTY;
+    },
   };
 }

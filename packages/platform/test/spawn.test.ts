@@ -88,6 +88,49 @@ Deno.test("a source that is not a program is a failed child, not a dead parent �
   }
 });
 
+Deno.test("Node spawns the same way, from the same code", async () => {
+  // The point is not that Node can spawn — it is that it spawns through the *same* `spawnChild`.
+  // Only how a worker is made differs there (a source string with `eval`, rather than a module from
+  // a blob URL), which is why that is an argument rather than a third copy of the queues, the load
+  // notice and the grace period.
+  const runner = await Deno.makeTempFile({ prefix: "wac-node-runner-" });
+  const child = await Deno.makeTempFile({ prefix: "wac-node-child-", suffix: ".worker.js" });
+  try {
+    await buildApp("packages/platform/example/runner.wac", runner, { read: true }, "node");
+    await buildApp("packages/platform/example/wc.wac", child, {}, "node", true);
+
+    const r = new Deno.Command("node", {
+      args: [runner, child, "one two three"],
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    const err = new TextDecoder().decode(r.stderr);
+    assertEquals(r.code, 0, err);
+    // `wc` of "one two three\n" — one line, three words, fourteen bytes — counted by a child
+    // worker whose output came back through its handle.
+    assertEquals(new TextDecoder().decode(r.stdout).trim(), "1 3 14", err);
+
+    // And a source that is not a program is a failed child here too, with a reason and no crash.
+    const notAProgram = await Deno.makeTempFile({ prefix: "wac-node-bad-" });
+    try {
+      await Deno.writeTextFile(notAProgram, "this is not javascript {{{\n");
+      const bad = new Deno.Command("node", {
+        args: [runner, notAProgram, "anything"],
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      const badErr = new TextDecoder().decode(bad.stderr);
+      assertEquals(bad.code, 1, badErr);
+      assertEquals(badErr.includes("runner: "), true, badErr);
+    } finally {
+      await Deno.remove(notAProgram);
+    }
+  } finally {
+    await Deno.remove(runner);
+    await Deno.remove(child);
+  }
+});
+
 Deno.test("a child is granted nothing, even by a parent that has it", async () => {
   // The property that makes `spawn` worth having over process spawn: what the child may do
   // is the *parent's* choice, not the operating system's. `--allow-run=/bin/sh` cannot

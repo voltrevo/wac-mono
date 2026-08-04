@@ -108,11 +108,62 @@ export type Child = {
 type Result = { ok: true; code: number } | { ok: false; error: string } | { ready: true };
 
 /**
+ * The little of a worker this file needs, so that one implementation serves every host.
+ *
+ * A page and Deno both take a module from a blob URL; Node takes a source string with `eval` and
+ * reports through an emitter rather than through handler properties. Those are three lines of
+ * difference in how a worker is *made*, and everything after — the queues, the load notice, the
+ * grace period, what a message means, when to stop the responder — is the same everywhere and was
+ * worth having in one place rather than three.
+ */
+export type WorkerLike = {
+  post(message: unknown): void;
+  onMessage(f: (data: unknown) => void): void;
+  /** A load or runtime error the parent must *contain*: see the note in `spawnChild`. */
+  onError(f: (message: string) => void): void;
+  terminate(): void;
+};
+
+/**
+ * A worker from a module source, the way a page and Deno both do it.
+ *
+ * Exported because both hosts pass it and neither should have to write it. Node cannot use it —
+ * there is no `Blob` URL to load a module from there — and passes its own.
+ */
+export function blobWorker(source: string): WorkerLike {
+  const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+  const worker = new Worker(url, { type: "module" });
+  return {
+    post: (m) => worker.postMessage(m),
+    onMessage: (f) => { worker.onmessage = (e: MessageEvent) => f(e.data); },
+    onError: (f) => {
+      worker.onerror = (e: ErrorEvent) => {
+        // **Contained here or not at all.** Without `preventDefault` the runtime re-raises a
+        // worker's error as the *parent's* uncaught error and the parent dies — a shell handed a
+        // file that is not a worker bundle exited 1 with the runtime's message and never got to
+        // report a failed command. A handler that does not prevent the default is an observer.
+        e.preventDefault();
+        f(e.message === "" ? "the worker failed to load" : e.message);
+      };
+      worker.onmessageerror = (e: Event) => {
+        e.preventDefault?.();
+        f("the worker sent a message that could not be read");
+      };
+    },
+    terminate: () => {
+      worker.terminate();
+      URL.revokeObjectURL(url);
+    },
+  };
+}
+
+/**
  * Start a worker on `source` and wire its standard streams to queues.
  *
- * `startWorld` is supplied by the caller rather than imported, so this file needs no opinion
- * about which world a child gets — the Deno world passes its own, and Node's could pass
- * theirs. It receives the queues and must return a `stop()` for the responder it starts.
+ * `startWorld` is supplied by the caller rather than imported, so this file needs no opinion about
+ * which world a child gets: the Deno host passes its own, the browser host passes a page's, and
+ * neither is visible from here. `makeWorker` is the other injection, and between them this function
+ * is the whole of spawning for every host.
  */
 export function spawnChild(
   source: string,
@@ -124,21 +175,20 @@ export function spawnChild(
     input: ByteQueue,
   ) => { stop(): void },
   makeBridge: () => { sab: SharedArrayBuffer },
+  makeWorker: (source: string) => WorkerLike = blobWorker,
 ): Child {
   const out = new ByteQueue();
   const input = new ByteQueue();
   const bridge = makeBridge();
   const responder = startWorld(bridge.sab, args, out, input);
 
-  const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
-  const worker = new Worker(url, { type: "module" });
+  const worker = makeWorker(source);
   let stopped = false;
   const shutdown = () => {
     if (stopped) return;
     stopped = true;
     responder.stop();
     worker.terminate();
-    URL.revokeObjectURL(url);
     // Whatever the child had written is already queued; this only says no more is coming.
     out.end();
   };
@@ -156,8 +206,9 @@ export function spawnChild(
   };
 
   const exit = new Promise<number>((resolve) => {
-    worker.onmessage = (e: MessageEvent) => {
-      const r = e.data as Result;
+    worker.onMessage((data) => {
+      const r = data as Result;
+      // The load notice, which says only that the bundle evaluated.
       if ("ready" in r) {
         done("");
         return;
@@ -165,28 +216,15 @@ export function spawnChild(
       done("");
       shutdown();
       resolve(r.ok ? r.code : -1);
-    };
-    worker.onerror = (e: ErrorEvent) => {
-      // **This is the fix.** Without `preventDefault` the error is re-raised as the *parent's*
-      // uncaught error and the parent dies: a shell handed a file that is not a worker bundle
-      // exited 1 with Deno's message, rather than reporting a command that could not be executed.
-      // A handler that does not prevent the default is an observer, not a handler.
-      e.preventDefault();
-      done(e.message === "" ? "the worker failed to load" : e.message);
+    });
+    worker.onError((message) => {
+      done(message);
       shutdown();
       resolve(-1);
-    };
-    // A message that cannot be deserialised is the same kind of failure and would escape the same
-    // way. Nothing here posts anything but plain objects, so this is a guard rather than a case.
-    worker.onmessageerror = (e: Event) => {
-      e.preventDefault?.();
-      done("the worker sent a message that could not be read");
-      shutdown();
-      resolve(-1);
-    };
+    });
   });
 
-  worker.postMessage({ sab: bridge.sab });
+  worker.post({ sab: bridge.sab });
   return { out, in: input, exit, loaded, kill: shutdown };
 }
 
