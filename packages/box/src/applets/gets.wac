@@ -17,7 +17,7 @@ import { Cli, Core, FileResult, Socket } from "../../../platform/src/platform.wa
 import { Args, has } from "../lib/args.wac";
 import { itoa } from "../lib/num.wac";
 import { concat, slice } from "../lib/bytes.wac";
-import { recordLength } from "../../../tls/src/record.wac";
+import { recordsReady } from "../../../tls/src/record.wac";
 import { tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientClose,
          tlsClientPhase, tlsClientFailure } from "../../../tls/src/client.wac";
 import { Incoming, ParsedResponse, parseResponse } from "../../../http/src/incoming.wac";
@@ -114,15 +114,15 @@ export i32 gets(Core core, Cli cli, Args a) {
     }
     if (closed) { break; }
 
-    // Feed whole records only. A record's length is in its first five bytes, so a partial
-    // one has to wait — handing the state machine half a record is how a reader that
-    // "mostly works" fails on a slow connection rather than a fast one.
-    i32 ready = 0;
-    while (buffered.len() - ready >= 5) {
-      i32 n = recordLength(slice(buffered, ready, buffered.len()));
-      if (n < 0 || buffered.len() - ready < 5 + n) { break; }
-      ready = ready + 5 + n;
-    }
+    // Feed whole records only: a record's length is in its first five bytes, so a partial one has to
+    // wait, and handing the state machine half a record is how a reader that "mostly works" fails on a
+    // fast connection rather than a slow one.
+    //
+    // `recordsReady` is that rule, in the package that owns it. This file had its own copy of the six
+    // lines and `packages/tor`'s link layer had the same six with the framing left out entirely — one
+    // correct and one silently broken, which is the argument for a function rather than a convention.
+    // wac-mono issue 0029.
+    i32 ready = recordsReady(buffered);
     if (ready == 0) { continue; }
 
     Step step = unpack(tlsClientFeed(s.state, slice(buffered, 0, ready)));

@@ -16,7 +16,6 @@ record of what has been fixed and why.
 | [0003](open/0003-wacc-parser-does-not-implement-generics.md) | wacc's parser does not implement generics, so `std` is outside its corpus | missing feature | not implemented |
 | [0024](open/0024-mutation-selection-is-inert-for-subprocess-tests-and-the-fallback-runs-them-worst-first.md) | mutation test-selection is inert for subprocess tests, and the fallback runs them worst-first | performance | wrong answer |
 | [0028](open/0028-sh-decides-nothing-about-what-wacpath-programs-may-do.md) | `sh` passes `GRANT_NONE` to `$WACPATH` programs, which is a decision nobody has made | task | not implemented |
-| [0029](open/0029-gets-hand-rolls-tls-record-framing-that-now-lives-in-the-package.md) | `box gets` hand-rolls TLS record framing that now lives in the package | bug | no error |
 | [0030](open/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md) | a page cannot `spawn`, so the browser shell runs applets in-process instead | missing feature | not implemented |
 
 An empty list is the expected state most of the time — see `README.md`: something you

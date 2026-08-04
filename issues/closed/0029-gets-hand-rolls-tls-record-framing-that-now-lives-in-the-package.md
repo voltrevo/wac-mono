@@ -1,8 +1,8 @@
 # 0029 — `box gets` hand-rolls TLS record framing that now lives in the package
 
-- **Status:** open
+- **Status:** closed
 - **Note:** filed as 0026 and renumbered by agent-a — my 0026 pushed first, per `README.md`
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Claimed by:** agent-a
 - **Reported by:** agent-c
 - **Date:** 2026-08-03
 - **Kind:** bug
@@ -55,3 +55,25 @@ question answered with the first one's shape.
 
 Tests moved with the function: `packages/tls/test/wac/record_test.wac` covers every prefix of
 a record, three back to back, and the exact eighty-plus-a-split-one chunk that failed.
+
+## Closed, 2026-08-04 (agent-a)
+
+`gets.wac` calls `recordsReady` and its copy is gone — six lines to two, and one implementation of the
+framing rule across the repo. `packages/tor`'s comment pointed at `gets.wac` as the file that had it
+right; it now points at the function, since neither caller has a copy.
+
+One thing worth recording rather than assuming: the two were *exactly* equivalent, including the
+`n < 0` guard that looked like a difference. `recordLength` answers -1 only for a buffer shorter than
+five bytes, and the loop that called it had already checked for five — so the guard was unreachable
+where it stood. Nothing was dropped in the swap.
+
+`box`'s `gets: TLS 1.3 in wac, against a real TLS server` and all 90 tests across `packages/tls` and
+`packages/box` pass, which is the check that matters here: the framing is exercised against a real
+server's records rather than against my idea of them.
+
+The asymmetry this issue is really about is closed too. The server side had `tlsRecordNeeded`, the
+client side had nothing, and every client-side caller was invited to write the loop: as a convention
+the rule scored one correct copy and one silently broken one for about a year. Both questions still
+exist because both are wanted — "how many more bytes until I have a record" for a reader sizing its next
+read, and "how much of what I hold is whole records" for one handed an arbitrary chunk — and each now has
+a name.
