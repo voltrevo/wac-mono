@@ -1,9 +1,40 @@
 # ssz — Ethereum's SimpleSerialize, and the Merkle proofs built on it
 
-**Nothing is implemented yet.** This directory currently holds the *oracle*: Ethereum's own test
-vectors, reshaped so the tests need no network. That ordering is deliberate — see below.
+**Merkleization and Merkle-branch verification work.** Serialization by type — the `containers` half —
+does not exist yet. Tracked as wac-mono issue **0063**; its consumer is **0064**, an Altair light
+client.
 
-Tracked as wac-mono issue **0063**, and its consumer is **0064**, an Altair light client.
+| | state |
+| --- | --- |
+| `merkleize`, `mixInLength`, `zeroHash`, chunking | **done** |
+| `hash_tree_root` of uints, booleans, bitvectors, bitlists, basic vectors and lists | **done** — 745 Ethereum `ssz_generic` cases |
+| `isValidMerkleBranch`, `isValidNormalizedMerkleBranch` | **done** |
+| `hash_tree_root` of containers | **not started** — needs a field layout per type; 403 vectors waiting |
+| the nine light-client containers | **not started** — 45 vectors waiting |
+
+`src/merkle.wac` is the whole of it so far. The two things it says loudest, because they are where
+implementations go wrong: **the pad target is the type's limit, not the data's length**, and **a
+bitlist's trailing delimiter bit is measured, not merkleized**.
+
+## What the tests establish
+
+`deno test -A packages/ssz/` — 9 tests, and the numbers rather than the names:
+
+- **745 of the 1,148 `ssz_generic` cases** produce Ethereum's root exactly. The other 403 are
+  `containers`. Counts are asserted per type (48 uints, 2 boolean, 54 bitvector, 450 bitlist, 191
+  basic_vector), so a name-matching regex that stops matching shows up as a gap and not as a pass.
+- **The limit is load-bearing, checked by planting the fault.** Making `merkleize` pad to its input
+  instead of the type's limit fails the fixtures *and* a separate property test. That is the mistake
+  that produces a merkleizer which is right for every full-length value and wrong for every short one.
+- **`zeroHash(d)` equals the zero subtree it stands in for**, at every depth up to 6, so the
+  optimisation and the thing it replaces cannot drift.
+- **Branch verification is tested against a tree built with the *host's* SHA-256**, via Web Crypto —
+  not against this package's merkleizer. Building the tree with wac and then checking it with wac
+  would be a symmetric oracle: both halves wrong together would still agree. Every leaf position is
+  verified, and a wrong index, a flipped byte and a short branch are each refused.
+- **The normalized branch's surplus nodes must be zero.** A zero-padded branch is accepted, a branch
+  with non-zero surplus is refused rather than trimmed. That is a validity condition — accepting it
+  would let a prover hang an unrelated subtree below the field being proved.
 
 ## Why the vectors came first
 
@@ -65,7 +96,7 @@ valuable half — a decoder that accepts a malformed offset is the bug that matt
 expected root, only the requirement that decoding fails, so they need the decoder to exist first to be
 worth anything. Next after the encoder round-trips.
 
-## Scope, when it is written
+## Scope of the rest
 
 Read off `consensus-specs/specs/altair/light-client/sync-protocol.md`:
 

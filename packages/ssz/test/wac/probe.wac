@@ -1,0 +1,34 @@
+// Every export of `packages/ssz` reachable from TypeScript, so the tests drive the real code.
+
+import { hashPair, zeroHash, merkleize, mixInLength, padToChunks, chunkCount, nextPowerOfTwo,
+         depthFor, rootBasic, rootBasicVector, rootBitvector, rootBitlist, rootBasicList,
+         bitlistLength, floorLog2, subtreeIndex, isValidMerkleBranch,
+         isValidNormalizedMerkleBranch } from "../../src/merkle.wac";
+
+export u8[] sszHashPair(u8[] a, u8[] b) { return hashPair(a, b); }
+export u8[] sszZeroHash(i32 d) { return zeroHash(d); }
+export u8[] sszMerkleize(u8[] data, i32 limit) { return merkleize(data, limit); }
+export u8[] sszMixInLength(u8[] root, i32 n) { return mixInLength(root, n); }
+export u8[] sszPadToChunks(u8[] d) { return padToChunks(d); }
+export i32 sszChunkCount(i32 n) { return chunkCount(n); }
+export i32 sszNextPowerOfTwo(i32 n) { return nextPowerOfTwo(n); }
+export i32 sszDepthFor(i32 n) { return depthFor(n); }
+
+export u8[] sszRootBasic(u8[] s) { return rootBasic(s); }
+export u8[] sszRootBasicVector(u8[] s, i32 limit) { return rootBasicVector(s, limit); }
+export u8[] sszRootBitvector(u8[] s, i32 n) { return rootBitvector(s, n); }
+export u8[] sszRootBitlist(u8[] s, i32 limit) {
+  u8[]? r = rootBitlist(s, limit);
+  return (r is null) ? u8[0]() : r!;
+}
+export u8[] sszRootBasicList(u8[] s, i32 limit, i32 count) { return rootBasicList(s, limit, count); }
+export i32 sszBitlistLength(u8[] s) { return bitlistLength(s); }
+
+export i32 sszFloorLog2(i32 x) { return floorLog2(x as! u64); }
+export i32 sszSubtreeIndex(i32 g) { return subtreeIndex(g as! u64) as! i32; }
+export bool sszValidBranch(u8[] leaf, u8[] branch, i32 depth, i32 index, u8[] root) {
+  return isValidMerkleBranch(leaf, branch, depth, index as! u64, root);
+}
+export bool sszValidNormalizedBranch(u8[] leaf, u8[] branch, i32 gindex, u8[] root) {
+  return isValidNormalizedMerkleBranch(leaf, branch, gindex as! u64, root);
+}
