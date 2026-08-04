@@ -117,6 +117,61 @@ Deno.test("an endless producer stops at the cap rather than filling memory", asy
   // applied to every queue including a child's input, and on a loaded machine this came back as
   // "status=0" with no `y` at all: 8 MiB went into `head`'s input before `head` began reading, and
   // the overflow was discarded in silence. A cap belongs where a producer can be told to stop.
-  const big = await sh("seq 1 200000 | tail -1");
-  assertEquals(big.out.trim(), "200000", big.err);
+  // Fifty thousand lines rather than the million it would take to reach 8 MiB: the exact size is not
+  // the point, and a million `seq` writes costs half a minute of bridge round trips (issue 0039).
+  // What this pins is that a large payload crosses a pipeline intact, which is what silently failed.
+  const big = await sh("seq 1 50000 | tail -1");
+  assertEquals(big.out.trim(), "50000", big.err);
+});
+
+Deno.test("a pipeline runs its stages at once, so a consumer can end a producer", async () => {
+  // The measurement issue 0038 was filed on: `seq 1 200000 | head -1` took 11.8 seconds, because
+  // every stage ran to completion and handed its whole output to the next. Streaming makes it
+  // 0.15 seconds — `head` closing its input is what stops `seq`.
+  //
+  // Bounded in time rather than compared against a stopwatch, because a shared machine makes any
+  // exact figure a lie. Half a million lines is the discriminator: producing them all costs well
+  // over thirty seconds, and not producing them costs nothing, so a fifteen-second bound tells the
+  // two apart with room to spare even under load.
+  const started = Date.now();
+  const r = await sh("seq 1 500000 | head -1");
+  const took = Date.now() - started;
+  assertEquals(r.out, "1\n", r.err);
+  assertEquals(
+    took < 15_000,
+    true,
+    `${took} ms — a pipeline that gathers would still be producing lines`,
+  );
+});
+
+Deno.test("...and every stage still gets its whole input, in order", async () => {
+  // What streaming can break, and did: `readStdin` promises *all* of standard input, and a child's
+  // input arrives over time. Served with one chunk, `seq 1 5 | sort -r` printed `1` — `sort` reads to
+  // the end before sorting, and the end came after one line. Every stage below reads its input
+  // whole, which is the shape that fails.
+  const cases: [string, string][] = [
+    ["seq 1 5 | sort -r", "5\n4\n3\n2\n1\n"],
+    ["seq 1 5 | tac", "5\n4\n3\n2\n1\n"],
+    ["seq 1 5 | sort -r | head -2", "5\n4\n"],
+    ["seq 1 5 | wc -l", "5\n"],
+    ["printf 'b\\na\\nb\\n' | sort | uniq", "a\nb\n"],
+    ["seq 1 1000 | tail -1", "1000\n"],
+    ["seq 1 100 | sort -n | tail -1", "100\n"],
+  ];
+  for (const [script, want] of cases) {
+    const r = await sh(script);
+    assertEquals(r.out, want, `${script}: ${r.err}`);
+  }
+
+  // And against bash, which is the only opinion that matters about what a pipeline means.
+  for (const script of ["seq 1 20 | sort -r | head -3", "seq 1 50 | tac | tail -2"]) {
+    const ours = await sh(script);
+    const theirs = new Deno.Command("bash", {
+      args: ["-c", script],
+      cwd: dir,
+      stdout: "piped",
+      stderr: "null",
+    }).outputSync();
+    assertEquals(ours.out, new TextDecoder().decode(theirs.stdout), script);
+  }
 });

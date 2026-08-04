@@ -27,6 +27,22 @@
 // confinement one, and the grants it takes are meaningful for wac children and advisory for
 // anything else. See wac-mono issue 0015.
 
+import { CHUNK } from "./layout.ts";
+
+/** One array from several, for a reader that asked for more than one chunk's worth. */
+function join(parts: Uint8Array[]): Uint8Array {
+  if (parts.length === 1) return parts[0];
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+
 /**
  * How much may sit in a queue nobody is reading before a writer is told to stop.
  *
@@ -84,6 +100,52 @@ export class ByteQueue {
     return true;
   }
 
+  /**
+   * Everything, to the end — for `readStdin`, which promises exactly that.
+   *
+   * A child's standard input arrives over time, so "all of it" means waiting for the end rather than
+   * taking what is there. Serving `readStdin` with one chunk is the bug this exists to fix:
+   * `seq 1 5 | sort -r` printed `1`, because `sort` read to the end before sorting and the end came
+   * after one line. Nothing showed it earlier — a sequential pipeline sent the whole input in one
+   * `send`, so one chunk *was* everything.
+   */
+  async rest(): Promise<Uint8Array> {
+    const parts: Uint8Array[] = [];
+    for (;;) {
+      const c = await this.next();
+      if (c.length === 0) return join(parts);
+      parts.push(c);
+    }
+  }
+
+  /** Up to `limit` bytes of what is queued, or null when nothing is. */
+  private take(limit: number): Uint8Array | null {
+    if (this.#chunks.length === 0) return null;
+    if (this.#chunks.length === 1 && this.#chunks[0].length <= limit) {
+      const only = this.#chunks.shift()!;
+      this.#held -= only.length;
+      return only;
+    }
+    const parts: Uint8Array[] = [];
+    let taken = 0;
+    while (this.#chunks.length > 0 && taken < limit) {
+      const head = this.#chunks[0];
+      if (taken + head.length <= limit) {
+        this.#chunks.shift();
+        parts.push(head);
+        taken += head.length;
+      } else {
+        // Split it: the rest stays at the front, so nothing is reordered and nothing is lost.
+        const room = limit - taken;
+        parts.push(head.subarray(0, room));
+        this.#chunks[0] = head.subarray(room);
+        taken += room;
+      }
+    }
+    this.#held -= taken;
+    return join(parts);
+  }
+
   /** No more will arrive. A reader waiting now gets the empty array that means "ended". */
   end(): void {
     this.#ended = true;
@@ -94,11 +156,18 @@ export class ByteQueue {
     }
   }
 
-  /** The next chunk, or empty once ended and drained. */
+  /**
+   * The next chunk, or empty once ended and drained.
+   *
+   * **Everything queued, up to `CHUNK`** — not literally the next thing pushed. A writer that emits a
+   * line at a time and a reader on the other side of a bridge is one round trip per line otherwise:
+   * `seq 1 200000 | wc -l` took forty-five seconds that way, almost all of it in two hundred thousand
+   * parks and wakes. Coalescing is free here and legal by the protocol, which promises *at most*
+   * `CHUNK` bytes and says a short read means nothing.
+   */
   next(): Promise<Uint8Array> {
-    const c = this.#chunks.shift();
-    if (c !== undefined) this.#held -= c.length;
-    if (c !== undefined) return Promise.resolve(c);
+    const c = this.take(CHUNK);
+    if (c !== null) return Promise.resolve(c);
     if (this.#ended) return Promise.resolve(new Uint8Array(0));
     return new Promise((res) => {
       // One reader at a time. Two concurrent `recv`s on the same handle are a program bug

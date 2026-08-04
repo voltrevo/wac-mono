@@ -61,6 +61,14 @@ export type DenoWorldOptions = {
    */
   selfSource?: string;
   readStdin?(): Promise<Uint8Array>;
+  /**
+   * One chunk of standard input, for `readChunk` and `recv(0)`.
+   *
+   * Separate from `readStdin` because they promise different things — everything, and something —
+   * and for a spawned child the difference is the difference between sorting its input and sorting
+   * the first line of it.
+   */
+  readStdinChunk?(): Promise<Uint8Array>;
 };
 
 const EMPTY = new Uint8Array(0);
@@ -148,6 +156,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   const writeErrOut = opts.writeErr;
   const selfSource = opts.selfSource;
   const readIn = opts.readStdin;
+  const readChunkIn = opts.readStdinChunk ?? opts.readStdin;
 
   /**
    * Start a child on `source`, with `want` narrowed to this world's own authority.
@@ -192,7 +201,11 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
           if (!out.push(b)) throw new Error("the child's output is not being read");
         },
         writeErr: (b: Uint8Array) => { cerr.push(b); },
-        readStdin: () => input.next(),
+        // `readStdin` means *all* of it, which for a child means waiting for its input to end: the
+        // bytes arrive over time. Serving it with one chunk made `seq 1 5 | sort -r` print `1`, since
+        // `sort` reads to the end before sorting. `readChunk` and `recv` still take one chunk.
+        readStdin: () => input.rest(),
+        readStdinChunk: () => input.next(),
         // So that a child can run itself as well: the bundle is the same one.
         selfSource: opts.selfSource,
         // Where its relative paths resolve from, and what its own `cwd()` reports. Empty means the
@@ -443,8 +456,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       // standard input, which would let a filter inside a shell swallow the terminal.
       const fed = source === null ? kids.readChunk() : null;
       if (fed !== null) return fed.length === 0 ? END : data(fed);
-      if (source === null && readIn !== undefined) {
-        const piped = await readIn();
+      if (source === null && readChunkIn !== undefined) {
+        const piped = await readChunkIn();
         return piped.length === 0 ? END : data(piped);
       }
       try {
@@ -500,8 +513,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       // Handle 0 is standard input. Handles count from 1, so it can never be a socket, and
       // giving stdin one means `waitAny` can watch it beside a socket — which is what a
       // relay like `nc` needs and could not express while stdin was only `readChunk`.
-      if (h === STDIN_HANDLE && readIn !== undefined) {
-        const piped = await readIn();
+      if (h === STDIN_HANDLE && readChunkIn !== undefined) {
+        const piped = await readChunkIn();
         return piped.length === 0 ? END : data(piped);
       }
       const into = fresh();

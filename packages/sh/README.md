@@ -154,6 +154,19 @@ The single seam was the point, and it paid off: wiring `spawn` in changed no par
 redirection, status or `&&` handling, because all of it was already written against `Output`. The
 stubs became what they were meant to be — a fallback for when the real program is absent.
 
+**A pipeline runs its stages at once**, where every stage is a program the shell can spawn.
+`seq 1 200000 | head -1` takes 0.15 seconds rather than 11.8, because `head` closing its input is what
+stops `seq` — and 0.07 seconds in a browser tab, which is the same code. One `recv` in flight per open
+stream, `waitAny` over all of them, and a stage whose reader has finished is stopped, which is what a
+real pipe does with `SIGPIPE`.
+
+`canStream` decides before anything is expanded, because expansion runs command substitutions and
+asking twice would run them twice: every stage must be a plain command whose name is a bare literal
+naming one of this program's applets, with no redirection and no prefix assignment. Everything else
+takes the sequential path — a builtin *is* the shell, a function lives in its table — which is
+unchanged and still gathers. That boundary is visible rather than silent: `{ echo a; } | rev` gathering
+is fine, `seq | head` gathering was the bug. Issue 0038.
+
 **An applet of the shell's own program is spawned, not called.** `Shell.externalSpawnable` says the
 names in `externalNames` are applets of *this very bundle* — true for `packages/box`, whose `main`
 dispatches on its first argument — and then `trySelf` runs one with `spawnSelf`: its own wasm

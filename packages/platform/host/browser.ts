@@ -127,6 +127,14 @@ export type BrowserWorldOptions = {
    */
   readStdin?(): Promise<Uint8Array>;
   /**
+   * One chunk of standard input, for `readChunk` and `recv(0)`.
+   *
+   * Separate from `readStdin` because they promise different things — everything, and something —
+   * and for a spawned child the difference is the difference between sorting its input and sorting
+   * the first line of it.
+   */
+  readStdinChunk?(): Promise<Uint8Array>;
+  /**
    * This program's own worker bundle, for `spawnSelf`.
    *
    * The launcher has it — it is what started the program — and `runInPage` passes it along. Absent
@@ -195,6 +203,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   const warn = opts.warn ?? ((l: string) => console.warn(l));
   const write = opts.write ?? ((b: Uint8Array) => console.log(new TextDecoder().decode(b)));
   const readIn = opts.readStdin;
+  const readChunkIn = opts.readStdinChunk ?? opts.readStdin;
 
   /**
    * The children this page has started, by handle.
@@ -248,7 +257,11 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
           if (!out.push(b)) throw new Error("the child's output is not being read");
         },
         writeErr: (b: Uint8Array) => { cerr.push(b); },
-        readStdin: () => input.next(),
+        // `readStdin` means *all* of it, which for a child means waiting for its input to end: the
+        // bytes arrive over time. Serving it with one chunk made `seq 1 5 | sort -r` print `1`, since
+        // `sort` reads to the end before sorting. `readChunk` and `recv` still take one chunk.
+        readStdin: () => input.rest(),
+        readStdinChunk: () => input.next(),
         ...(give.read ? { root: opts.root, writable: give.write } : {}),
         // So that a child can run itself too: the bundle is the same one.
         selfSource: opts.selfSource,
@@ -668,8 +681,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       // A spawned child's standard input is a queue its parent fills, which is the same shape a
       // fed child has and a different source: `pushChild` hands over a buffer, `send` arrives over
       // time. Both end, and the end is what `readChunk` has to be able to say.
-      if (source === null && readIn !== undefined) {
-        const piped = await readIn();
+      if (source === null && readChunkIn !== undefined) {
+        const piped = await readChunkIn();
         return piped.length === 0 ? END : data(piped);
       }
       if (source === null) return END;
@@ -708,8 +721,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       // Handle 0 is standard input, as everywhere: it exists so `waitAny` can watch it beside a
       // child. A page's own standard input is empty; a child's is what its parent sent.
       if (h === 0) {
-        if (readIn === undefined) return END;
-        const piped = await readIn();
+        if (readChunkIn === undefined) return END;
+        const piped = await readChunkIn();
         return piped.length === 0 ? END : data(piped);
       }
       const kid = children.get(h);

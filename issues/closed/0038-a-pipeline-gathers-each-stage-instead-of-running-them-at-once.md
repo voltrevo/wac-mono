@@ -1,6 +1,6 @@
 # 0038 — a pipeline gathers each stage's output instead of running the stages at once
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** agent-a
 - **Reported by:** agent-a
 - **Date:** 2026-08-04
@@ -64,3 +64,42 @@ Start every stage, then move bytes between them until each has ended:
 Not only a browser question: under Deno the same pipeline gathers, because box's applets were called
 in process there too. One fix serves both, which is the point of doing it in `sh` rather than in a
 host.
+
+## Closed, 2026-08-04 (agent-a)
+
+`runPipeline` starts every stage at once and shuttles bytes between them, where every stage is a
+program it can spawn. Measured, on the same machine as the numbers above:
+
+| command | before | after |
+|---|---|---|
+| `seq 1 200000 \| head -1` | 11.8 s | **0.15 s** |
+| the same, in the browser demo | 11.8 s | **0.07 s** |
+| `yes \| head -1` | 0.28 s (the 8 MiB cap) | 0.16 s (`head` ends `seq`) |
+
+The loop is `packages/box/src/applets/nc.wac`'s relay widened: one `recv` in flight per open stream,
+`waitAny` over all of them, whichever answers is served and re-armed. Two streams per stage, since a
+child's output and its error output are separate handles, so a complaint never lands in the pipe.
+
+**What makes it terminate** is that a stage whose output has ended has a predecessor with nowhere left
+to write, so that predecessor is stopped. That is `head -1` ending `seq`, and it is what a real pipe
+does with `SIGPIPE`. The 8 MiB cap is still there and no longer does the work.
+
+`canStream` decides from the *parse tree*, before anything is expanded — expansion runs command
+substitutions, so asking twice would run them twice. Every stage must be a plain command whose name is
+a bare literal naming a spawnable applet, with no redirection and no prefix assignment. Anything else
+takes the sequential path, unchanged: a builtin is the shell itself, a function lives in its table, and
+a redirection changes what a stage reads.
+
+Two bugs this uncovered, both of which had been invisible:
+
+- **`readStdin` served a child one chunk.** It promises *all* of standard input, and a child's input
+  arrives over time — so `seq 1 5 | sort -r` printed `1`, because `sort` reads to the end before
+  sorting and the end came after one line. Nothing showed it before: a sequential pipeline sent the
+  whole input in one `send`, so one chunk *was* everything.
+- **A read cost a round trip per write.** `ByteQueue.next` handed back literally the next chunk, so a
+  producer writing a line at a time meant a park and a wake per line: `seq 1 200000 | wc -l` took
+  forty-five seconds. It now returns everything queued up to `CHUNK`, which the protocol always
+  allowed.
+
+What remains is not the pipeline: `box seq 1 200000` costs 14.5 seconds *on its own*, because the
+applet writes once per line and every write crosses the bridge. Filed as 0039.

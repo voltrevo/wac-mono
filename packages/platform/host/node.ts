@@ -192,7 +192,7 @@ export function nodeWorld(
       // the clock — is this world's, narrowed by `give`.
       const childIo: NodeIo = {
         ...io,
-        readStdin: () => input.next(),
+        readStdin: () => input.rest(),
         readStdinChunk: () => input.next(),
         writeStdout: async (b: Uint8Array) => {
           // See the note in `deno.ts`: a full queue must fail the write rather than growing.

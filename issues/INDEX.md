@@ -5,7 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
-| [0038](open/0038-a-pipeline-gathers-each-stage-instead-of-running-them-at-once.md) | a pipeline gathers each stage's output instead of running the stages at once | missing feature | wrong answer |
+| [0039](open/0039-an-applet-writes-a-line-at-a-time-so-every-line-is-a-bridge-round-trip.md) | an applet writes a line at a time, so every line is a bridge round trip | performance | wrong answer |
 | [0036](open/0036-nothing-bounds-a-hung-test-and-four-helpers-wait-forever.md) | nothing bounds a hung test, and four readiness helpers are written to wait forever | bug | hang |
 | [0035](open/0035-crypto-hot-paths-hold-state-in-gc-arrays-rather-than-locals.md) | crypto hot paths hold state in GC arrays rather than locals (measured: −64% on one function) | performance | wrong answer |
 | [0034](open/0034-sha256s-one-shot-path-copies-the-whole-message-with-a-scalar-loop.md) | `sha256`'s one-shot path copies the whole message with a scalar loop | performance | wrong answer |

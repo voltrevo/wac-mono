@@ -21,7 +21,7 @@ import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Read } from "../../bytes/src/read.wac";
 import { Change, Child, Cli, Core, FileResult, GRANT_ENV, GRANT_NET, GRANT_NONE, GRANT_READ,
-  GRANT_WRITE, Stat } from "../../platform/src/platform.wac";
+  GRANT_WRITE, Pending, Stat } from "../../platform/src/platform.wac";
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
          RedirKind, Script, Simple, Word, parse } from "./parse.wac";
@@ -314,19 +314,269 @@ void runAndOr(Shell sh, AndOr list) {
 }
 
 /**
- * Run a pipeline, feeding each stage's output to the next.
+ * Run a pipeline — every stage at once where that is possible, and one at a time otherwise.
  *
- * Sequentially and in memory, which is not what a shell does: a real pipeline runs its stages at
- * once, so `yes | head -1` finishes. Here every stage runs to completion first. The difference is
- * invisible for finite inputs and total for infinite ones.
+ * `seq 1 200000 | head -1` used to take twelve seconds, because each stage ran to completion and
+ * handed its whole output to the next. A real shell returns at once: `head` closing its input is what
+ * stops `seq`. The difference is invisible for small inputs and total for endless ones — `yes | head`
+ * only ended at all because a queue nobody reads is capped at 8 MiB. Issue 0038.
+ *
+ * Streaming needs every stage to be a real program, which is why this could not be done until a
+ * program could spawn *itself*: `packages/box`'s applets were function calls inside the shell's own
+ * instance, and a function call cannot run beside another one. `canStream` is the test, and anything
+ * it refuses — a builtin, a function, a compound, a redirection — takes the sequential path, which is
+ * unchanged and still correct.
  */
 void runPipeline(Shell sh, Pipeline pipeline) {
+  if (canStream(sh, pipeline)) {
+    streamPipeline(sh, pipeline);
+    return;
+  }
   u8[] carried = u8[0]();
   for (i32 i = 0; i < pipeline.stages.len(); i++) {
     bool last = i == pipeline.stages.len() - 1;
     carried = runCommand(sh, pipeline.stages.get(i), carried, last);
     if (sh.exiting) { return; }
   }
+}
+
+/**
+ * Whether every stage of this pipeline is a program that can be spawned.
+ *
+ * Decided from the *parse tree*, before anything is expanded, and that is deliberate: expansion runs
+ * command substitutions, so asking twice would run them twice. So the command word of each stage has
+ * to be a plain literal — `sort`, not `$cmd` — which every pipeline anybody types is.
+ *
+ * Everything refused here still works; it takes the sequential path. A builtin cannot be spawned
+ * because it is the shell itself (`cd` in a child would change nothing); a function cannot because it
+ * lives in this shell's own table; a redirection or a prefix assignment changes what a stage reads and
+ * writes, and getting that wrong is worse than not streaming.
+ */
+bool canStream(Shell sh, Pipeline pipeline) {
+  if (pipeline.stages.len() < 2) { return false; }
+  if (!sh.externalSpawnable) { return false; }
+  for (i32 i = 0; i < pipeline.stages.len(); i++) {
+    Command cmd = pipeline.stages.get(i);
+    bool plain = false;
+    match (cmd.kind) {
+      case Plain: { plain = true; }
+      else: {}
+    }
+    if (!plain) { return false; }
+    Simple simple = cmd.simple;
+    if (simple.redirs.len() > 0 || simple.assigns.len() > 0) { return false; }
+    if (simple.words.len() == 0) { return false; }
+    Word first = simple.words.get(0);
+    if (first.parts.len() != 1) { return false; }
+    Part only = first.parts.get(0);
+    bool literal = false;
+    match (only.kind) {
+      case Lit: { literal = true; }
+      else: {}
+    }
+    if (!literal) { return false; }
+    if (!spawnableName(sh, only.text)) { return false; }
+  }
+  return true;
+}
+
+/**
+ * Run every stage at once, moving bytes between them as they arrive.
+ *
+ * The shape is `packages/box/src/applets/nc.wac`'s relay, widened: one `recv` in flight per open
+ * stream, `waitAny` over all of them, and whichever answers is served and re-armed. Two streams per
+ * stage — its output and its error output are separate handles — so a complaint never lands in the
+ * pipe. Standard error goes where the shell's own does, in the order it arrives.
+ *
+ * **What makes it terminate.** When a stage's output ends, the stage before it has nowhere left to
+ * write, so it is stopped: that is `head -1` ending `seq`, and it is what a pipe does with `SIGPIPE`.
+ * Without it `yes | head -1` would fill the 8 MiB cap and stop there instead — right answer, wrong
+ * reason, and eleven seconds slower.
+ *
+ * The status of a pipeline is its last stage's, as in bash. A stage stopped early has no status worth
+ * reading, and its own exit code is discarded rather than reported as a failure of the script.
+ */
+void streamPipeline(Shell sh, Pipeline pipeline) {
+  i32 n = pipeline.stages.len();
+
+  // Spawn them all, first to last, expanding each stage's arguments as it goes. Expansion happens
+  // exactly once and in order, which is what a command substitution in an argument requires.
+  i32[] outH = i32[n](fill: -1);
+  i32[] errH = i32[n](fill: -1);
+  for (i32 i = 0; i < n; i++) {
+    Simple simple = pipeline.stages.get(i).simple;
+    Vec<string> argv = Vec.create();
+    for (i32 w = 0; w < simple.words.len(); w++) { expandInto(sh, simple.words.get(w), argv); }
+    if (argv.len() == 0) {
+      // An expansion that vanished — `$empty | wc` — is not a program. Nothing has been spawned
+      // that this stage would feed, so stopping here is safe.
+      stopAll(sh, outH, errH, n);
+      sh.err("sh: a pipeline stage expanded to nothing\n".toBytes());
+      sh.status = 1;
+      return;
+    }
+    string[] args = string[argv.len()](fill: "");
+    for (i32 a = 0; a < argv.len(); a++) { args[a] = argv.get(a); }
+    Child kid = sh.cli.spawnSelf(args, GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV, sh.cwd)
+      .wait();
+    if (kid.handle < 0) {
+      // Whatever started before this must not be left running: they would write into nothing and
+      // their workers would outlive the script.
+      stopAll(sh, outH, errH, n);
+      sh.err(("sh: " + args[0] + ": " + kid.error + "\n").toBytes());
+      sh.status = 126;
+      return;
+    }
+    outH[i] = kid.handle;
+    errH[i] = kid.errHandle;
+  }
+
+  // The shell's own input goes to the first stage, and then its input ends. `closeFeed`, not
+  // `closeSocket`: a program that reads to the end before answering needs that end while alive.
+  u8[] first = sh.restOfStdin();
+  if (first.len() > 0) { sh.cli.send(outH[0], first).wait(); }
+  sh.cli.closeFeed(outH[0]);
+
+  // One read in flight per open stream. `alive` says which stages still have a handle worth reading;
+  // a stage that is stopped or finished is dropped from the wait list rather than polled.
+  Vec<Pending<Read>> outT = Vec.create();
+  Vec<Pending<Read>> errT = Vec.create();
+  bool[] outOpen = bool[n](fill: true);
+  bool[] errOpen = bool[n](fill: true);
+  // A stage stopped for want of a reader is *gone*: its handles are closed, so its exit code cannot
+  // be asked for afterwards. `head -1` ending `seq` is the ordinary case, not an error.
+  bool[] stopped = bool[n](fill: false);
+  for (i32 i = 0; i < n; i++) {
+    outT.push(sh.cli.recv(outH[i]));
+    errT.push(sh.cli.recv(errH[i]));
+  }
+
+  while (true) {
+    // The ids of every stream still open, and what each position in that list means. Rebuilt each
+    // time round because the set shrinks; `waitAny` takes ids and answers with a position.
+    i32 live = 0;
+    for (i32 i = 0; i < n; i++) {
+      if (outOpen[i]) { live++; }
+      if (errOpen[i]) { live++; }
+    }
+    if (live == 0) { break; }
+    i32[] ids = i32[live](fill: 0);
+    i32[] stage = i32[live](fill: 0);
+    bool[] isErr = bool[live](fill: false);
+    i32 at = 0;
+    for (i32 i = 0; i < n; i++) {
+      if (outOpen[i]) { ids[at] = outT.get(i).id; stage[at] = i; isErr[at] = false; at++; }
+      if (errOpen[i]) { ids[at] = errT.get(i).id; stage[at] = i; isErr[at] = true; at++; }
+    }
+
+    i32 which = sh.core.waitAny(ids, -1);
+    if (which < 0) { break; }
+    i32 i = stage[which];
+
+    if (isErr[which]) {
+      match (errT.get(i).wait()) {
+        case Data(bytes): { sh.err(bytes); errT.set(i, sh.cli.recv(errH[i])); }
+        case End: { errOpen[i] = false; }
+        case Failed(why): { errOpen[i] = false; }
+      }
+      continue;
+    }
+
+    match (outT.get(i).wait()) {
+      case Data(bytes): {
+        if (i + 1 < n) {
+          // Downstream may have finished while this arrived, and then there is nowhere for these
+          // bytes to go: stop this stage rather than buffering for a reader that will never come.
+          if (!sh.cli.send(outH[i + 1], bytes).wait()) {
+            stopStage(sh, outH, errH, outOpen, errOpen, stopped, i);
+          } else {
+            outT.set(i, sh.cli.recv(outH[i]));
+          }
+        } else if (sh.capture) {
+          sh.outBuf.pushAll(bytes);
+          outT.set(i, sh.cli.recv(outH[i]));
+        } else {
+          // Straight out as it arrives, which is the whole point: a long pipeline prints its first
+          // line before its last stage has seen the rest.
+          sh.cli.write(bytes);
+          outT.set(i, sh.cli.recv(outH[i]));
+        }
+      }
+      case End: {
+        outOpen[i] = false;
+        // Its own input is over, so tell the next stage that *its* input is over too.
+        if (i + 1 < n) { sh.cli.closeFeed(outH[i + 1]); }
+        // And the stage before it has nowhere to write: stop it. `head -1` ends `seq` here.
+        if (i > 0 && outOpen[i - 1]) { stopStage(sh, outH, errH, outOpen, errOpen, stopped, i - 1); }
+      }
+      case Failed(why): {
+        sh.err(("sh: " + why + "\n").toBytes());
+        outOpen[i] = false;
+      }
+    }
+  }
+
+  // The last stage's status is the pipeline's, as in bash. A stage that was *stopped* has no status
+  // worth asking for — its handle is gone, and asking is an error rather than an answer — so only the
+  // ones that ran to their own end are collected.
+  i32 status = 0;
+  for (i32 i = 0; i < n; i++) {
+    if (stopped[i]) { continue; }
+    i32 code = sh.cli.exitCode(outH[i]).wait();
+    if (i == n - 1) { status = code < 0 ? 126 : code; }
+    sh.cli.closeSocket(outH[i]);
+    if (errH[i] >= 0) { sh.cli.closeSocket(errH[i]); }
+  }
+  sh.status = status;
+}
+
+/** Stop one stage and stop reading it: it has nowhere to write, so it is finished whether or not it agrees. */
+void stopStage(Shell sh, i32[] outH, i32[] errH, bool[] outOpen, bool[] errOpen, bool[] stopped,
+               i32 i) {
+  sh.cli.closeSocket(outH[i]);
+  if (errH[i] >= 0) { sh.cli.closeSocket(errH[i]); }
+  outOpen[i] = false;
+  errOpen[i] = false;
+  stopped[i] = true;
+}
+
+/** Stop everything started so far, for a pipeline that could not be assembled. */
+void stopAll(Shell sh, i32[] outH, i32[] errH, i32 n) {
+  for (i32 i = 0; i < n; i++) {
+    if (outH[i] >= 0) { sh.cli.closeSocket(outH[i]); }
+    if (errH[i] >= 0) { sh.cli.closeSocket(errH[i]); }
+  }
+}
+
+/** Whether this name would reach `trySelf` — not a function, not a builtin, and one of ours. */
+bool spawnableName(Shell sh, string name) {
+  if (name == "" || containsSlash(name)) { return false; }
+  if (sh.funcs.has(name)) { return false; }
+  if (isBuiltin(name)) { return false; }
+  string[] mine = sh.externalNames();
+  for (i32 i = 0; i < mine.len(); i++) {
+    if (mine[i] == name) { return true; }
+  }
+  return false;
+}
+
+/**
+ * The names `dispatch` answers itself, before any program is looked for.
+ *
+ * A list rather than a lookup because `dispatch` is a chain of comparisons and this has to agree with
+ * it; keeping them adjacent in the file is the only thing keeping them honest. A name missing from
+ * here would be spawned as a program and then not found — which is why `echo`, which is both a
+ * builtin and a `box` applet, has to be listed.
+ */
+bool isBuiltin(string name) {
+  // Exactly the eighteen `dispatch` answers above, in the order it asks — nothing more, so that a
+  // name added there and forgotten here would be *spawned* and reported not found rather than
+  // silently changing meaning. `echo` is the one worth noticing: it is a builtin here and an applet
+  // in `box`, and the builtin wins.
+  return name == ":" || name == "true" || name == "false" || name == "echo" || name == "exit"
+      || name == "export" || name == "unset" || name == "cd" || name == "pwd" || name == "ls"
+      || name == "mkdir" || name == "rm" || name == "read" || name == "shift" || name == "set"
+      || name == "test" || name == "[" || name == "help";
 }
 
 /**
