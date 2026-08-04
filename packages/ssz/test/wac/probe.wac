@@ -5,7 +5,9 @@ import { hashPair, zeroHash, merkleize, mixInLength, padToChunks, chunkCount, ne
          bitlistLength, floorLog2, subtreeIndex, isValidMerkleBranch,
          isValidNormalizedMerkleBranch } from "../../src/merkle.wac";
 import { hashTreeRoot, isFixed, fixedSize } from "../../src/container.wac";
-import { beaconTypes, beaconFields, TY_BEACON_BLOCK_HEADER, TY_SIGNING_DATA, TY_SYNC_COMMITTEE,
+import { beaconTypes, beaconFields, TY_UINT8, TY_UINT64, TY_BYTES32, TY_BYTES48, TY_BYTES96,
+         TY_PUBKEY_VECTOR, TY_SYNC_COMMITTEE_BITS, TY_SYNC_BRANCH, TY_FINALITY_BRANCH,
+         TY_BEACON_BLOCK_HEADER, TY_SIGNING_DATA, TY_SYNC_COMMITTEE,
          TY_SYNC_AGGREGATE, TY_LIGHT_CLIENT_HEADER, TY_LIGHT_CLIENT_BOOTSTRAP,
          TY_LIGHT_CLIENT_UPDATE, TY_LIGHT_CLIENT_FINALITY_UPDATE,
          TY_LIGHT_CLIENT_OPTIMISTIC_UPDATE } from "../../src/beacon.wac";
@@ -69,4 +71,32 @@ export i32 sszTyFor(i32 which) {
   if (which == 6) { return TY_LIGHT_CLIENT_UPDATE(); }
   if (which == 7) { return TY_LIGHT_CLIENT_FINALITY_UPDATE(); }
   return TY_LIGHT_CLIENT_OPTIMISTIC_UPDATE();
+}
+
+/**
+ * Every `TY_*` accessor, by position, so each one is reachable from a test.
+ *
+ * They exist for `packages/lightclient` to name intermediate types with — a branch is
+ * `Vector[Bytes32, N]` and a proof needs to say so — but until that exists they are exported and
+ * uncalled, which a mutation sweep reported as eight uncovered functions. An index typed one out
+ * would then have gone unnoticed until the light client misbehaved.
+ */
+export i32 sszTyAt(i32 which) {
+  if (which == 0) { return TY_UINT8(); }
+  if (which == 1) { return TY_UINT64(); }
+  if (which == 2) { return TY_BYTES32(); }
+  if (which == 3) { return TY_BYTES48(); }
+  if (which == 4) { return TY_BYTES96(); }
+  if (which == 5) { return TY_PUBKEY_VECTOR(); }
+  if (which == 6) { return TY_SYNC_COMMITTEE_BITS(); }
+  if (which == 7) { return TY_SYNC_BRANCH(); }
+  return TY_FINALITY_BRANCH();
+}
+
+/** `kind, param, child, count` for a type, so a test can assert its shape rather than its index. */
+export i32[] sszTypeRow(i32 ty) {
+  i32[] t = beaconTypes();
+  i32[] row = i32[4]();
+  for (i32 i = 0; i < 4; i++) { row[i] = t[ty * 4 + i]; }
+  return row;
 }

@@ -24,6 +24,8 @@ const mod = await wacBind("packages/ssz/test/wac/probe.wac") as unknown as {
   sszBeaconFixedSize(ty: number): number;
   sszBeaconIsFixed(ty: number): boolean;
   sszTyFor(which: number): number;
+  sszTyAt(which: number): number;
+  sszTypeRow(ty: number): Int32Array;
 };
 
 /** In the order `sszTyFor` expects. */
@@ -128,5 +130,44 @@ Deno.test("a wrong-length update is refused rather than merkleized", () => {
   const short = bytes(sc.ssz).slice(0, bytes(sc.ssz).length - 48);
   if (mod.sszBeaconRoot(TY.SyncCommittee, short).length !== 0) {
     throw new Error("a SyncCommittee missing a pubkey was accepted");
+  }
+});
+
+
+Deno.test("every named intermediate type is the shape its name claims", () => {
+  // The `TY_*` accessors for intermediate types are exported for `packages/lightclient` to name
+  // things with — a branch is `Vector[Bytes32, N]`, and proving into one means saying so. Until that
+  // package exists nothing calls them, which a mutation sweep reported as eight uncovered functions:
+  // an index typed one out would have gone unnoticed until the light client misbehaved.
+  //
+  // Asserted by *shape* rather than by index, because the index is the thing most likely to be wrong
+  // and checking it against itself would prove nothing.
+  const KIND = { BASIC: 0, BITVECTOR: 1, VECTOR: 3, CONTAINER: 5 };
+  const want: [string, number, number, number][] = [
+    // name, position in sszTyAt, expected kind, expected param
+    ["uint8", 0, KIND.BASIC, 1],
+    ["uint64", 1, KIND.BASIC, 8],
+    ["Bytes32", 2, KIND.VECTOR, 32],
+    ["BLSPubkey (Bytes48)", 3, KIND.VECTOR, 48],
+    ["BLSSignature (Bytes96)", 4, KIND.VECTOR, 96],
+    ["Vector[BLSPubkey, 512]", 5, KIND.VECTOR, 512],
+    ["Bitvector[512]", 6, KIND.BITVECTOR, 512],
+    ["sync committee branch", 7, KIND.VECTOR, 5],
+    ["finality branch", 8, KIND.VECTOR, 6],
+  ];
+  const seen = new Set<number>();
+  for (const [name, at, kind, param] of want) {
+    const ty = mod.sszTyAt(at);
+    if (seen.has(ty)) throw new Error(`${name} shares a type index with an earlier one`);
+    seen.add(ty);
+    const [k, p] = mod.sszTypeRow(ty);
+    if (k !== kind) throw new Error(`${name}: kind ${k}, expected ${kind}`);
+    if (p !== param) throw new Error(`${name}: param ${p}, expected ${param}`);
+  }
+  // The byte vectors must all point at uint8 as their element, or their roots are over the wrong
+  // packing. That is the one cross-reference the shapes above cannot catch.
+  for (const at of [2, 3, 4]) {
+    const [, , child] = mod.sszTypeRow(mod.sszTyAt(at));
+    if (child !== mod.sszTyAt(0)) throw new Error(`byte vector at ${at} does not have uint8 elements`);
   }
 });

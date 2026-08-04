@@ -39,7 +39,7 @@
 // container cases are theirs — see the package README.
 
 import { merkleize, mixInLength, padToChunks, chunkCount, rootBasic, rootBitvector,
-         rootBitlist } from "./merkle.wac";
+         rootBitlist, rootBasicVector, rootBasicList } from "./merkle.wac";
 
 export const i32 KIND_BASIC = 0;
 export const i32 KIND_BITVECTOR = 1;
@@ -137,13 +137,15 @@ export u8[]? rootAt(i32[] t, i32[] fields, i32 i, u8[] data, i32 start, i32 end)
       i32 size = paramOf(t, elem);
       if (span % size != 0) { return null; }
       i32 n = span / size;
+      // Delegated rather than reimplemented. These two lines were the same expressions as
+      // `rootBasicList` and `rootBasicVector`, written out again — which mutation testing found by
+      // gutting `rootBasicList` and nothing noticing, because nothing called it.
       if (isList) {
         if (n > limit) { return null; }
-        return mixInLength(merkleize(padToChunks(slice(data, start, end)),
-                                     basicChunkLimit(limit, size)), n);
+        return rootBasicList(slice(data, start, end), basicChunkLimit(limit, size), n);
       }
       if (n != limit) { return null; }
-      return merkleize(padToChunks(slice(data, start, end)), basicChunkLimit(limit, size));
+      return rootBasicVector(slice(data, start, end), basicChunkLimit(limit, size));
     }
 
     // Composite elements: one leaf per element, merkleized over the type's own length or limit.
