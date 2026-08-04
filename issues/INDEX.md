@@ -5,6 +5,8 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0037](open/0037-deno-task-test-can-hang-with-no-per-test-timeout.md) | `deno task test` can hang, and a hang looks exactly like a slow machine | bug | trap |
+| [0036](open/0036-a-pipeline-gathers-each-stage-instead-of-running-them-at-once.md) | a pipeline gathers each stage's output instead of running the stages at once | missing feature | wrong answer |
 | [0035](open/0035-crypto-hot-paths-hold-state-in-gc-arrays-rather-than-locals.md) | crypto hot paths hold state in GC arrays rather than locals (measured: −64% on one function) | performance | wrong answer |
 | [0034](open/0034-sha256s-one-shot-path-copies-the-whole-message-with-a-scalar-loop.md) | `sha256`'s one-shot path copies the whole message with a scalar loop | performance | wrong answer |
 | [0033](open/0033-a-file-that-parses-but-is-not-a-worker-bundle-wedges-the-shell.md) | a file that parses but is not a worker bundle wedges the shell for ever | bug | trap |

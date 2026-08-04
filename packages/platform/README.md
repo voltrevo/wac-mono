@@ -470,6 +470,18 @@ A child runs `main` even when the program also exports `page`, because it was sp
 and nowhere to draw. One bundle can therefore be both a terminal and the programs the terminal runs —
 see `packages/platform/example/twin.wac`, which is the whole idea in forty lines, and issue 0030.
 
+**A child has two handles, because a program has two output streams.** `recv(handle)` is its output
+and `recv(errHandle)` is its error output. Merged — which they were until a shell tried it — a
+complaint arrives in the pipe: `cat nosuch | wc -c` counted the error message, and `cat nosuch` alone
+printed it to standard *output*. A second handle rather than a second capability, so everything that
+already works on handles goes on working, `waitAny` above all: a parent can watch a child's two
+streams and a socket in one call without knowing which is which.
+
+**A child stands where its parent says.** Both spawn capabilities take a directory: it is where the
+child's relative paths resolve from and what its own `cwd()` reports. Empty means the host's own,
+which is what a program with no opinion passes. A shell has an opinion, and without this its `cd` was
+invisible to everything it ran — `cd sub; prog f` opened `f`.
+
 `closeFeed` is distinct from `closeSocket` because they differ in a way that matters:
 `closeFeed` ends the child's standard input, `closeSocket` stops the child. A program that
 reads to the end before answering — `wc` — needs the end while it is still alive.

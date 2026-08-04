@@ -81,8 +81,16 @@ const LOAD_GRACE_MS = 500;
 
 /** One spawned worker, from the parent's side. */
 export type Child = {
-  /** What the child wrote, in order. */
+  /** What the child wrote to standard output, in order. */
   out: ByteQueue;
+  /**
+   * What it wrote to standard error, in order — a stream of its own.
+   *
+   * Kept apart because a shell must be able to keep them apart: merged, `cat nosuch | wc -c` counts
+   * the error message. `pushChild`/`popChild` have always answered with both, and a spawned child had
+   * one stream until this existed.
+   */
+  err: ByteQueue;
   /** What the parent sent, which the child reads as its standard input. */
   in: ByteQueue;
   /** Resolves with the exit code, or a negative number if it failed to run. */
@@ -173,14 +181,16 @@ export function spawnChild(
     args: string[],
     out: ByteQueue,
     input: ByteQueue,
+    err: ByteQueue,
   ) => { stop(): void },
   makeBridge: () => { sab: SharedArrayBuffer },
   makeWorker: (source: string) => WorkerLike = blobWorker,
 ): Child {
   const out = new ByteQueue();
+  const err = new ByteQueue();
   const input = new ByteQueue();
   const bridge = makeBridge();
-  const responder = startWorld(bridge.sab, args, out, input);
+  const responder = startWorld(bridge.sab, args, out, input, err);
 
   const worker = makeWorker(source);
   let stopped = false;
@@ -191,6 +201,7 @@ export function spawnChild(
     worker.terminate();
     // Whatever the child had written is already queued; this only says no more is coming.
     out.end();
+    err.end();
   };
 
   // Resolved by whichever comes first: the load notice, a load error, or the child finishing
@@ -228,7 +239,7 @@ export function spawnChild(
   // person opened it and a program when something spawned it — a child has a handle, not a canvas,
   // and `packages/box`'s terminal exports both for exactly that reason.
   worker.post({ sab: bridge.sab, child: true });
-  return { out, in: input, exit, loaded, kill: shutdown };
+  return { out, err, in: input, exit, loaded, kill: shutdown };
 }
 
 /**
@@ -239,17 +250,23 @@ export function spawnChild(
  * something, and `packages/sh` already turns it into 126: "it exists and would not start",
  * distinct from the 127 of not existing.
  */
+export function twoHandles(handle: number, errHandle: number, why: string): Uint8Array {
+  const text = new TextEncoder().encode(why.split("\n")[0]);
+  const out = new Uint8Array(8 + text.length);
+  const dv = new DataView(out.buffer);
+  dv.setInt32(0, handle, true);
+  dv.setInt32(4, errHandle, true);
+  out.set(text, 8);
+  return out;
+}
+
 export function failedChild(why: string): Uint8Array {
   // The first line only. A `SyntaxError` from a worker arrives with a code frame attached, which is
   // several lines and belongs on a terminal rather than inside `Child.error` — a shell puts this
   // after `sh: name: ` and expects one line, as every other diagnostic here is. The frame is not
   // lost: the worker's own isolate has already printed the whole of it to stderr, which is also why
   // a `preventDefault` in the parent cannot make that output go away.
-  const text = new TextEncoder().encode(why.split("\n")[0]);
-  const out = new Uint8Array(4 + text.length);
-  new DataView(out.buffer).setInt32(0, -1, true);
-  out.set(text, 4);
-  return out;
+  return twoHandles(-1, -1, why);
 }
 
 /**
@@ -261,9 +278,43 @@ export function failedChild(why: string): Uint8Array {
  * page cannot spawn. Reporting 126 instead hid them behind a capability the world never had.
  */
 export function noSpawnHere(why: string): Uint8Array {
-  const text = new TextEncoder().encode(why);
-  const out = new Uint8Array(4 + text.length);
-  new DataView(out.buffer).setInt32(0, -2, true);
-  out.set(text, 4);
-  return out;
+  return twoHandles(-2, -2, why);
+}
+
+/** The grants a `spawn` or `spawnSelf` payload asks for: always the first four bytes. */
+export function want(p: Uint8Array): number {
+  return new DataView(p.buffer, p.byteOffset, p.byteLength).getInt32(0, true);
+}
+
+/**
+ * A `spawn` payload: grants, then the source, then the arguments, then the child's directory.
+ *
+ * Here rather than in each host because it is the wire format, and three copies of a length-prefixed
+ * walk is three chances to disagree about it. `provider.ts` writes it; this reads it.
+ */
+export function unpackSpawn(p: Uint8Array): { source: string; args: string[]; cwd: string } {
+  const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+  const dec = new TextDecoder();
+  const sourceLen = dv.getInt32(4, true);
+  const source = dec.decode(p.subarray(8, 8 + sourceLen));
+  const argsAt = 8 + sourceLen;
+  const argsLen = dv.getInt32(argsAt, true);
+  const joined = dec.decode(p.subarray(argsAt + 4, argsAt + 4 + argsLen));
+  return {
+    source,
+    args: joined.length === 0 ? [] : joined.split("\u0000"),
+    cwd: dec.decode(p.subarray(argsAt + 4 + argsLen)),
+  };
+}
+
+/** The same, for `spawnSelf`, which needs no source: grants, arguments, directory. */
+export function unpackSpawnSelf(p: Uint8Array): { args: string[]; cwd: string } {
+  const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+  const dec = new TextDecoder();
+  const argsLen = dv.getInt32(4, true);
+  const joined = dec.decode(p.subarray(8, 8 + argsLen));
+  return {
+    args: joined.length === 0 ? [] : joined.split("\u0000"),
+    cwd: dec.decode(p.subarray(8 + argsLen)),
+  };
 }

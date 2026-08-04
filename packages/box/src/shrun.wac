@@ -69,6 +69,28 @@ export Output boxRun(Core core, Cli cli, string cwd, Vec<string> argv, u8[] stdi
 }
 
 /**
+ * Run one applet as *this program's* `main` would, writing to the real streams.
+ *
+ * The other half of `Shell.externalSpawnable`. When the shell runs an applet as a child — a worker of
+ * its own, through `spawnSelf` — the child starts at `main` with the applet's name as its first
+ * argument, and `main` has to know what to do with that. `box.wac`'s already does; a program that
+ * *embeds* the shell needs this to do the same thing.
+ *
+ * No `pushChild` here, unlike `boxRun`: a child's output is already its own, and its `cli.write` goes
+ * to the handle its parent reads. Capturing would be capturing from itself.
+ *
+ * Answers `UNKNOWN` for a name that is not an applet, so a caller can be a shell instead.
+ */
+export i32 boxApplet(Core core, Cli cli) {
+  i32 n = cli.argCount().wait();
+  if (n < 1) { return UNKNOWN; }
+  string[] args = string[n](fill: "");
+  for (i32 i = 0; i < n; i++) { args[i] = cli.arg(i).wait(); }
+  string name = args[0];
+  return dispatch(core, cli, parseList(args, 1, name), name);
+}
+
+/**
  * Every name `boxRun` answers to, for `Shell.externalNames`.
  *
  * The same list `box`'s own usage prints, so the shell's `help` and `box` with no arguments cannot

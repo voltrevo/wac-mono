@@ -15,11 +15,28 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Shell } from "../../../sh/src/exec.wac";
 import { shellMain } from "../../../sh/src/entry.wac";
-import { boxNames, boxRun } from "../shrun.wac";
+import { boxApplet, boxNames, boxRun } from "../shrun.wac";
+import { UNKNOWN } from "../box.wac";
 
 export i32 main(Core core, Cli cli) {
+  // **This program is also its own applets.** When the shell runs `sort` as a child it spawns *this*
+  // bundle with `sort` as the first argument, so `main` has to be a multi-call entry: an applet if
+  // the name is one, a shell otherwise. Without it a spawned applet would start another shell and
+  // hand it a script file named `sort`.
+  //
+  // Ambiguity is possible in principle — `sh sort` now runs the applet rather than a script called
+  // `sort` — and is worth it: the alternative is that the shell's own programs cannot be programs.
+  // `sh ./sort` still reads the file, because a name with a slash is a path.
+  i32 asApplet = boxApplet(core, cli);
+  if (asApplet != UNKNOWN) { return asApplet; }
+
   Shell sh = Shell.create(core, cli);
   sh.external = boxRun;
   sh.externalNames = boxNames;   // so `help` lists them
+  // ...and they are applets of *this very program*, so the shell can run them as real children
+  // rather than calling them: `spawnSelf(["sort", "-n"])` re-enters `main` above, which dispatches
+  // on the first argument. Its own instance, its own grants — and in a page this is the only route
+  // to a real program at all.
+  sh.externalSpawnable = true;
   return shellMain(core, cli, sh, 0);
 }

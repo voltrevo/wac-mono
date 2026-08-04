@@ -20,8 +20,8 @@ import { Option } from "../../std/src/option.wac";
 import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Read } from "../../bytes/src/read.wac";
-import { Change, Child, Cli, Core, FileResult, GRANT_NONE, Stat }
-  from "../../platform/src/platform.wac";
+import { Change, Child, Cli, Core, FileResult, GRANT_ENV, GRANT_NET, GRANT_NONE, GRANT_READ,
+  GRANT_WRITE, Stat } from "../../platform/src/platform.wac";
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
          RedirKind, Script, Simple, Word, parse } from "./parse.wac";
@@ -84,6 +84,22 @@ export struct Shell {
   fn[string[]()] externalNames;
 
   /**
+   * Whether `externalNames` are applets of *this very program*, so they can be spawned rather than
+   * called.
+   *
+   * Set by whoever wires `external`, because only they know: `packages/box`'s `main` dispatches on
+   * its first argument, so `spawnSelf(["sort", "-n"])` runs `sort` in a worker of its own — but a
+   * standalone `sh` whose `main` is the shell would spawn *another shell* and hand it a script named
+   * `sort`. The shell cannot tell those apart and does not guess.
+   *
+   * True is the better answer wherever it is true, because an applet spawned is a real program: its
+   * own instance, its own grants, and — once pipelines run their stages at once — actually concurrent.
+   * An applet *called* is the same wasm instance with the same authority, which is convenient and is
+   * not a boundary. False, or a world that cannot spawn, and the call is exactly what it was.
+   */
+  bool externalSpawnable;
+
+  /**
    * Every name ever set, so the table can be copied.
    *
    * `Map` offers no iteration, and a subshell has to start from a *copy* of its parent's
@@ -131,7 +147,7 @@ export struct Shell {
     // guess. A browser answers "/" — the root of its Origin Private File System — which is the
     // true answer there rather than a stand-in.
     return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
-                 false, Buf.create(), noExternal, noExternalNames, Vec.create(),
+                 false, Buf.create(), noExternal, noExternalNames, false, Vec.create(),
                  Map.create(hashString, stringEq),
                  Vec.create(), Vec.create(), false, u8[0](), 0, cli.cwd().wait());
   }
@@ -980,11 +996,13 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   // started, and now that something can they are the fallback rather than the answer.
   Output spawned = trySpawn(sh, argv, stdin);
   if (spawned.found) { return spawned; }
-  // Then whatever was handed to us — `packages/box`'s applets, when something wired them in.
-  // After `spawn` because a separate worker with its own grants is a real boundary and this is
-  // not: an applet running here is the same wasm instance with the same authority. Before the
-  // table below because these are the programs someone finished, and those are the ones I wrote
-  // to stand in for them.
+  // Then this program's own applets as *children*, where that is possible: `packages/box` decides
+  // which applet it is from its first argument, so running one is running this bundle again. That is
+  // a real boundary — its own instance, its own grants — where calling it is not.
+  Output asChild = trySelf(sh, argv, stdin);
+  if (asChild.found) { return asChild; }
+  // Then the same applets *called*, which is what happens in a world that cannot spawn — a page
+  // could not until issue 0030, and something has to answer there.
   Output given = sh.external(sh.core, sh.cli, sh.cwd, argv, stdin);
   if (given.found) { return given; }
   return run(sh.cli, sh.cwd, argv, stdin);
@@ -1032,7 +1050,9 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
   // `GRANT_READ` — so that `$WACPATH` grep could open the file it is given — is now a one-word
   // change here. Left to whoever owns this package to decide, since it widens what a script can
   // reach and no test says which is wanted. (agent-a, forced by the signature change)
-  Child child = sh.cli.spawn(string.fromBytes(prog.bytes), args, GRANT_NONE).wait();
+  // The shell's own directory, so `cd sub; prog f` opens `sub/f`. A spawned program used to inherit
+  // the *host's* directory, which meant the shell's `cd` was invisible to everything it ran.
+  Child child = sh.cli.spawn(string.fromBytes(prog.bytes), args, GRANT_NONE, sh.cwd).wait();
   // No `spawn` in this world at all: nothing was attempted, so this is not a failure of the program
   // and must not be reported as one. Falling through is what keeps `packages/box`'s sixty applets
   // working in the browser terminal, where a page cannot spawn — before this, setting `$WACPATH` to
@@ -1044,6 +1064,23 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
     return Output.fail(("sh: " + name + ": " + child.error + "\n").toBytes(), 126);
   }
 
+  return collectChild(sh, name, child, stdin);
+}
+
+/**
+ * Feed a child, read everything it wrote, and wait for its status.
+ *
+ * Shared by both routes to a real program — a bundle named by `$WACPATH`, and this program run again
+ * — because a child is a handle and neither route can tell which kind it has. That is the claim
+ * `packages/platform` makes about handles, and this function is what it buys.
+ *
+ * **This is where a pipeline stops streaming.** Everything the child writes is gathered before the
+ * next stage begins, so `seq 1 200000 | head -1` waits for all 200,000 lines: `Output` is bytes in
+ * and bytes out. Now that stages *can* be concurrent — separate workers, watchable together by
+ * `waitAny` — what would fix it is a pipeline that starts every stage first and shuttles between
+ * them. Issue 0036.
+ */
+Output collectChild(Shell sh, string name, Child child, u8[] stdin) {
   // The input in one go, then the *end* — `closeFeed`, not `closeSocket`. A program that reads to
   // the end before it answers, which is `wc` and `sort` and most of the interesting ones, needs
   // the end to arrive while it is still running; stopping it instead means it never speaks.
@@ -1063,14 +1100,69 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
     }
   }
 
+  // Its error stream, which is a *different handle*: a shell has to keep the two apart, or
+  // `cat nosuch | wc -c` counts the complaint. Read after the output rather than interleaved with it
+  // because both are queues that the host has already collected — nothing is lost by the order, and
+  // a pipeline that wants them interleaved wants `2>&1`, which is a redirection this shell refuses
+  // outright rather than approximating.
+  Buf err = Buf.create();
+  bool complaining = child.errHandle >= 0;
+  while (complaining) {
+    match (sh.cli.recv(child.errHandle).wait()) {
+      case Data(bytes): { err.pushAll(bytes); }
+      case End: { complaining = false; }
+      case Failed(why): { complaining = false; }
+    }
+  }
+
   i32 code = sh.cli.exitCode(child.handle).wait();
   sh.cli.closeSocket(child.handle);
+  if (child.errHandle >= 0) { sh.cli.closeSocket(child.errHandle); }
   // Negative means it never ran at all, which by then is a host problem rather than the
   // program's status, so it is reported as "could not execute" rather than as success.
   if (broke != "") {
-    return Output(out.bytes(), ("sh: " + name + ": " + broke + "\n").toBytes(), 126, true);
+    err.pushAll(("sh: " + name + ": " + broke + "\n").toBytes());
+    return Output(out.bytes(), err.bytes(), 126, true);
   }
-  return Output(out.bytes(), u8[0](), code < 0 ? 126 : code, true);
+  return Output(out.bytes(), err.bytes(), code < 0 ? 126 : code, true);
+}
+
+/**
+ * Run `argv` as a child of this same program, if this program has that applet.
+ *
+ * The difference from `trySpawn` is only where the code comes from: there, a file named by
+ * `$WACPATH`; here, the bundle this program was started with, which the host already holds. So there
+ * is no path to search, no file to read, and nothing that can be missing — which is why this is the
+ * route that works in a browser tab, where there is no directory of programs at all.
+ *
+ * `found` false means "not one of mine", and the caller falls through to calling the applet in
+ * process. A world that cannot spawn answers the same way, so the shell degrades to what it did
+ * before rather than reporting a program broken.
+ */
+Output trySelf(Shell sh, Vec<string> argv, u8[] stdin) {
+  if (!sh.externalSpawnable) { return Output.missing(); }
+  string name = argv.get(0);
+  if (name == "" || containsSlash(name)) { return Output.missing(); }
+  string[] mine = sh.externalNames();
+  bool ours = false;
+  for (i32 i = 0; i < mine.len(); i++) {
+    if (mine[i] == name) { ours = true; }
+  }
+  if (!ours) { return Output.missing(); }
+
+  string[] args = string[argv.len()](fill: "");
+  for (i32 i = 0; i < argv.len(); i++) { args[i] = argv.get(i); }
+
+  // Everything this shell has, which the host narrows to what it actually holds. An applet run in
+  // process had the shell's whole authority implicitly; asking for it explicitly is the same
+  // authority said out loud, and a shell granted nothing hands its children nothing.
+  Child child = sh.cli.spawnSelf(args, GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV, sh.cwd)
+    .wait();
+  if (child.unavailable()) { return Output.missing(); }
+  if (child.handle < 0) {
+    return Output.fail(("sh: " + name + ": " + child.error + "\n").toBytes(), 126);
+  }
+  return collectChild(sh, name, child, stdin);
 }
 
 /** The first `dir/name` on `$WACPATH` that exists, or "" when none does. */

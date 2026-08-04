@@ -112,6 +112,11 @@ export i32 page(Core core, Cli cli, Page page) {
   // `cut`, `shuf` and fifty more, the same code `box` runs on a command line.
   sh.external = boxRun;
   sh.externalNames = boxNames;   // so `help` lists them
+  // ...and they are applets of *this very program*, so the shell can run them as real children
+  // rather than calling them: `spawnSelf(["sort", "-n"])` re-enters `main` above, which dispatches
+  // on the first argument. Its own instance, its own grants — and in a page this is the only route
+  // to a real program at all.
+  sh.externalSpawnable = true;
 
   string[] history = string[HISTORY](fill: "");
   i32 count = 0;      // how many commands have been run, ever

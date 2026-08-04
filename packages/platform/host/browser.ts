@@ -34,8 +34,18 @@ import { type Handlers } from "./respond.ts";
 import { CHUNK } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
-import { ChildStack, packCaptured, unpackPush } from "./child.ts";
-import { type Child, failedChild, noSpawnHere, spawnChild } from "./children.ts";
+import { ChildStack, joinPath, packCaptured, unpackPush } from "./child.ts";
+import {
+  ByteQueue,
+  type Child,
+  failedChild,
+  noSpawnHere,
+  spawnChild,
+  twoHandles,
+  unpackSpawn,
+  unpackSpawnSelf,
+  want,
+} from "./children.ts";
 import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
 import {
@@ -124,6 +134,13 @@ export type BrowserWorldOptions = {
    */
   selfSource?: string;
   /**
+   * Where relative paths resolve from, and what `cwd` reports.
+   *
+   * A page's own is `/`, the root of its Origin Private File System. A *child's* is whatever started
+   * it said, which is how `cd sub; prog f` means `sub/f` in a browser terminal too.
+   */
+  cwd?: string;
+  /**
    * The Origin Private File System root, if the page is willing to grant one.
    *
    * Absent means no filesystem at all, exactly as omitting `fs` does under Deno. Passing
@@ -186,6 +203,14 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    * and `waitAny` watches them without knowing which is which.
    */
   const children = new Map<number, Child>();
+  /**
+   * A child's error stream, by its own handle.
+   *
+   * Separate from `children` because it is a separate stream, and reading it is `recv` like anything
+   * else — a handle is a handle, which is what lets `waitAny` watch a child's two streams and a
+   * socket in one call.
+   */
+  const errStreams = new Map<number, ByteQueue>();
   let nextHandle = 1;
 
   /**
@@ -198,27 +223,33 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   const startChild = async (
     source: string,
     childArgs: string[],
-    want: number,
+    wanted: number,
+    childCwd: string,
   ): Promise<Uint8Array> => {
     const give = {
-      read: (want & GRANT_READ) !== 0 && opts.root !== undefined,
-      write: (want & GRANT_WRITE) !== 0 && opts.root !== undefined && opts.writable === true,
+      read: (wanted & GRANT_READ) !== 0 && opts.root !== undefined,
+      write: (wanted & GRANT_WRITE) !== 0 && opts.root !== undefined && opts.writable === true,
     };
     const h = nextHandle++;
-    const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
+    const child = spawnChild(source, childArgs, (sab, cargs, out, input, cerr) => {
       const enc = new TextEncoder();
       return serveHostCalls(bridgeOf(sab), browserWorld({
         args: cargs,
         // A line of output is bytes on the handle, with the newline `log` implies. The parent cannot
         // tell `log` from `write`, and neither can a pipe — which is the point.
         log: (l: string) => out.push(enc.encode(l + "\n")),
-        warn: (l: string) => out.push(enc.encode(l + "\n")),
+        // ...and its error output goes to the *other* stream, which `recv(errHandle)` reads. A
+        // program has two, and merging them made a shell count an error message in `cat x | wc -c`.
+        warn: (l: string) => cerr.push(enc.encode(l + "\n")),
         write: (b: Uint8Array) => out.push(b),
-        writeErr: (b: Uint8Array) => out.push(b),
+        writeErr: (b: Uint8Array) => cerr.push(b),
         readStdin: () => input.next(),
         ...(give.read ? { root: opts.root, writable: give.write } : {}),
         // So that a child can run itself too: the bundle is the same one.
         selfSource: opts.selfSource,
+        // Where its relative paths resolve from. A shell in a tab that has done `cd sub` starts its
+        // children there, exactly as it would on a command line.
+        cwd: childCwd === "" ? opts.cwd : childCwd,
       }));
     }, newBridge);
 
@@ -227,8 +258,12 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       child.kill();
       return failedChild(why);
     }
+    // Two handles for one child: its output and its error stream. Numbered from the same counter, so
+    // `waitAny` can watch both beside a socket without knowing which is which.
+    const eh = nextHandle++;
     children.set(h, child);
-    return i32le(h);
+    errStreams.set(eh, child.err);
+    return twoHandles(h, eh, "");
   };
   const writeErr = opts.writeErr ??
     ((b: Uint8Array) => warn(new TextDecoder().decode(b)));
@@ -293,7 +328,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    * for them to be absolute about.
    */
   const resolve = async (path: string, create: boolean): Promise<Resolved> => {
-    const parts = kids.path(path).split("/").filter((p) => p !== "" && p !== ".");
+    const parts = joinPath(opts.cwd ?? "", kids.path(path)).split("/").filter((p) => p !== "" && p !== ".");
     if (parts.length === 0) throw new Error("empty path");
     let dir = root();
     for (let i = 0; i < parts.length - 1; i++) {
@@ -322,7 +357,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    * listing, so portable code asked the obvious question and silently got nothing.
    */
   const dirOf = async (path: string, create: boolean): Promise<DirHandle> => {
-    const parts = kids.path(path).split("/").filter((x) => x !== "" && x !== ".");
+    const parts = joinPath(opts.cwd ?? "", kids.path(path)).split("/").filter((x) => x !== "" && x !== ".");
     let dir = root();
     for (const part of parts) dir = await dir.getDirectoryHandle(part, { create });
     return dir;
@@ -412,7 +447,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
 
     // A page has no process directory. The root of the Origin Private File System is where its
     // relative paths land, so that is the true answer and not a placeholder.
-    [OP.CWD]: () => str("/"),
+    [OP.CWD]: () => str(opts.cwd !== undefined && opts.cwd !== "" ? opts.cwd : "/"),
     [OP.SLEEP_MILLIS]: (p) =>
       new Promise<Uint8Array>((ok) =>
         setTimeout(() => ok(i64le(BigInt(Math.round(performance.now() * 1e6)))), readI32le(p))
@@ -505,11 +540,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
      * a place to put a canvas.
      */
     [OP.SPAWN]: (p) => {
-      const want = readI32le(p);
-      const n = readI32le(p.subarray(4));
-      const source = unstr(p.subarray(8, 8 + n));
-      const rest = unstr(p.subarray(8 + n));
-      return startChild(source, rest.length === 0 ? [] : rest.split("\u0000"), want);
+      const { source, args, cwd } = unpackSpawn(p);
+      return startChild(source, args, want(p), cwd);
     },
 
     /**
@@ -521,12 +553,11 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
      * `packages/box` decides which applet it is from its first argument. Issue 0030.
      */
     [OP.SPAWN_SELF]: (p) => {
-      const want = readI32le(p);
-      const rest = unstr(p.subarray(4));
       if (opts.selfSource === undefined) {
         return noSpawnHere("this page did not pass the program its own source");
       }
-      return startChild(opts.selfSource, rest.length === 0 ? [] : rest.split("\u0000"), want);
+      const { args, cwd } = unpackSpawnSelf(p);
+      return startChild(opts.selfSource, args, want(p), cwd);
     },
 
     [OP.CLOSE_FEED]: (p) => {
@@ -680,6 +711,11 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       if (kid !== undefined) {
         const fromChild = await kid.out.next();
         return fromChild.length === 0 ? END : data(fromChild);
+      }
+      const complaint = errStreams.get(h);
+      if (complaint !== undefined) {
+        const said = await complaint.next();
+        return said.length === 0 ? END : data(said);
       }
       return failed("network access is not granted");
     },

@@ -154,8 +154,17 @@ The single seam was the point, and it paid off: wiring `spawn` in changed no par
 redirection, status or `&&` handling, because all of it was already written against `Output`. The
 stubs became what they were meant to be — a fallback for when the real program is absent.
 
-A child is granted nothing but its two streams, so a program that needs the filesystem cannot be
-run as one yet — that is `packages/platform`'s roadmap rather than an issue here.
+**An applet of the shell's own program is spawned, not called.** `Shell.externalSpawnable` says the
+names in `externalNames` are applets of *this very bundle* — true for `packages/box`, whose `main`
+dispatches on its first argument — and then `trySelf` runs one with `spawnSelf`: its own wasm
+instance, its own grants, its own two streams, standing in the shell's own directory. That is a real
+boundary where calling was merely convenient, and it is the same route in a browser tab, where it is
+the *only* route to a real program. A world that cannot spawn falls through to calling the applet, so
+nothing regresses where the capability is missing.
+
+A child is granted what the shell has, which the host narrows to what it actually holds: an applet
+run in process had the shell's whole authority implicitly, and asking for it explicitly is the same
+authority said out loud.
 
 The first thing a shell trips over is a file on `$WACPATH` that is not a worker bundle, and there
 are two of those. One that does not parse is now a failed command with the host's reason and status

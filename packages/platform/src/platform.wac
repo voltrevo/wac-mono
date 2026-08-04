@@ -508,10 +508,23 @@ export struct Child {
    * right there and works. A missing capability is not a broken program.
    */
   i32 handle;
+  /**
+   * The child's *error* stream, as a handle of its own — `recv(errHandle)` reads it.
+   *
+   * A program has two output streams and a handle carries one, so a child needs two. Without this
+   * they were merged: a shell running `cat nosuch | wc -c` counted the error message, because the
+   * child's complaint arrived on the same handle as its output, and `cat nosuch` alone printed to
+   * *standard output*. Both are wrong in the same way, and a second handle rather than a second
+   * capability keeps everything that already works on handles working — `waitAny` most of all, which
+   * is what lets a parent watch a child's two streams and a socket together.
+   *
+   * Negative when `handle` is: there is nothing to read from a child that never started.
+   */
+  i32 errHandle;
   string error;
 
   /** As `Socket.of`: the host builds these, so the constructor is declared rather than generated. */
-  Child of(i32 handle, string error) { return Child(handle, error); }
+  Child of(i32 handle, i32 errHandle, string error) { return Child(handle, errHandle, error); }
 
   /** Whether this world can spawn at all. False says nothing about the program. */
   bool unavailable(const this) { return this.handle == -2; }
@@ -726,8 +739,8 @@ export struct Cli {
    * the child simply finds the capability denied. `GRANT_NONE` is the honest default and what
    * every example passes.
    *
-   *     cli.spawn(source, args, GRANT_NONE)                // stdin and stdout, nothing else
-   *     cli.spawn(source, args, GRANT_READ | GRANT_NET)     // ...if the parent has both
+   *     cli.spawn(source, args, GRANT_NONE, "")                 // stdin and stdout, nothing else
+   *     cli.spawn(source, args, GRANT_READ | GRANT_NET, dir)     // ...if the parent has both
    *
    * This is the reason to prefer spawning a worker to spawning a process. What the child may
    * do is the *parent's* choice; `--allow-run=/bin/sh` cannot express it at any granularity,
@@ -743,8 +756,14 @@ export struct Cli {
    * worker can: it inherits the process's permissions, and dropping them needs an unstable
    * Deno flag that would appear in the shebang of every program that spawns. So this is a
    * composition and concurrency primitive rather than a sandbox. See wac-mono issue 0015.
+   *
+   * `cwd` is where the child's relative paths resolve from, and what its own `cwd()` reports. Empty
+   * means "wherever the host already was", which is what a program with no opinion wants. A shell
+   * has an opinion: without this, `cd sub; prog f` looked in the wrong place, because a spawned
+   * program inherited the *host's* directory rather than the shell's. `pushChild` took a directory
+   * from the start for exactly this reason and `spawn` did not.
    */
-  fn[Pending<Child>(string, string[], i32)] spawn;
+  fn[Pending<Child>(string, string[], i32, string)] spawn;
 
   /**
    * **This same program again, as a child**, with these arguments and at most these grants.
@@ -765,9 +784,10 @@ export struct Cli {
    * thing a person opened; a child is a program with a handle, and there is nowhere for it to draw.
    *
    * Grants are a ceiling of the parent's own, as with `spawn`: a shell that may read hands its
-   * children reading, and a program granted nothing cannot widen itself by spawning.
+   * children reading, and a program granted nothing cannot widen itself by spawning. `cwd` is where
+   * the child's relative paths resolve from, empty for the host's own directory.
    */
-  fn[Pending<Child>(string[], i32)] spawnSelf;
+  fn[Pending<Child>(string[], i32, string)] spawnSelf;
 
   /**
    * End a spawned worker's standard input without stopping it.
@@ -861,8 +881,8 @@ export struct Cli {
     fn[Pending<Read>(i32)] recv,
     fn[Pending<bool>(i32, u8[])] send,
     fn[void(i32)] closeSocket,
-    fn[Pending<Child>(string, string[], i32)] spawn,
-    fn[Pending<Child>(string[], i32)] spawnSelf,
+    fn[Pending<Child>(string, string[], i32, string)] spawn,
+    fn[Pending<Child>(string[], i32, string)] spawnSelf,
     fn[void(i32)] closeFeed,
     fn[Pending<i32>(i32)] exitCode,
     fn[Pending<string>()] cwd,

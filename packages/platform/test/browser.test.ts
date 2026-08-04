@@ -454,15 +454,24 @@ Deno.test("the browser world refuses what a page cannot do", async () => {
   assertEquals((await call(OP.ENV, str("PATH")))[0], 0, "every variable is unset");
 });
 
-/** The payload `spawn` takes: grants, then the source length-prefixed, then NUL-joined arguments. */
-function spawnPayload(source: string, args: string[], grants = 0): Uint8Array {
+/**
+ * The payload `spawn` takes: grants, the source, the arguments, the child's directory.
+ *
+ * Length-prefixed the way `provider.ts` writes it and `children.ts` reads it. Written out here rather
+ * than imported because this test is checking the *host*, and a test that built its input with the
+ * same helper the host parses with would agree with itself about the format.
+ */
+function spawnPayload(source: string, args: string[], grants = 0, cwd = ""): Uint8Array {
   const src = str(source);
   const rest = str(args.join("\u0000"));
-  const out = new Uint8Array(8 + src.length + rest.length);
+  const dir = str(cwd);
+  const out = new Uint8Array(12 + src.length + rest.length + dir.length);
   out.set(i32le(grants), 0);
   out.set(i32le(src.length), 4);
   out.set(src, 8);
-  out.set(rest, 8 + src.length);
+  out.set(i32le(rest.length), 8 + src.length);
+  out.set(rest, 12 + src.length);
+  out.set(dir, 12 + src.length + rest.length);
   return out;
 }
 
@@ -478,7 +487,11 @@ Deno.test("a page spawns a worker of its own — 0030", async () => {
   `;
   const spawned = await w[OP.SPAWN](spawnPayload(child, ["one"])) as Uint8Array;
   const handle = readI32le(spawned);
-  assertEquals(handle >= 1, true, `a handle, not ${handle}: ${unstr(spawned.subarray(4))}`);
+  const errHandle = readI32le(spawned.subarray(4));
+  assertEquals(handle >= 1, true, `a handle, not ${handle}: ${unstr(spawned.subarray(8))}`);
+  // Two handles: a program has two output streams, and merging them made a shell count an error
+  // message in `cat nosuch | wc -c`. Both are readable with `recv`, because a handle is a handle.
+  assertEquals(errHandle >= 1 && errHandle !== handle, true, `a second handle, not ${errHandle}`);
   const code = readI32le(await w[OP.EXIT_CODE](i32le(handle)) as Uint8Array);
   assertEquals(code, 7, "the child's own exit code");
 
@@ -486,7 +499,8 @@ Deno.test("a page spawns a worker of its own — 0030", async () => {
   // page down with it — the same contract the Deno host has. Issue 0021.
   const bad = await w[OP.SPAWN](spawnPayload("this is not javascript {{{", [])) as Uint8Array;
   assertEquals(readI32le(bad), -1, "would not start");
-  assertEquals(unstr(bad.subarray(4)).length > 0, true, "and says why");
+  assertEquals(readI32le(bad.subarray(4)), -1, "and has no error stream to read either");
+  assertEquals(unstr(bad.subarray(8)).length > 0, true, "and says why");
 });
 
 Deno.test("the browser world denies the filesystem when the page grants none", async () => {

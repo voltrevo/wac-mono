@@ -221,11 +221,14 @@ export function cliOf(
       // A handle, then — when the handle is negative — why it never started. The host waits for the
       // source to load before answering, so "it is not a worker bundle" arrives here as a `Child`
       // with a reason rather than as an error that killed this program. wac-mono issue 0021.
+      // Two handles, then — when they are negative — why there is nothing to read. The output stream
+      // and the error stream are separate because a program has two of them; see `Child`.
       const out = collect(b, unpack(id));
       const handle = readI32le(out);
-      return cls.Child.of(handle, handle < 0 ? unstr(out.subarray(4)) : "");
+      const errHandle = readI32le(out.subarray(4));
+      return cls.Child.of(handle, errHandle, handle < 0 ? unstr(out.subarray(8)) : "");
     } catch (e) {
-      return cls.Child.of(-1, e instanceof Error ? e.message : String(e));
+      return cls.Child.of(-1, -1, e instanceof Error ? e.message : String(e));
     }
   };
   const captured = (id: number) => {
@@ -415,22 +418,31 @@ export function cliOf(
     (handle: number) => { hostCall(b, OP.CLOSE_SOCKET, i32le(handle)); },
 
     /*= spawn */
-    (source: string, args: string[], grants: number) =>
-      // The grant flags, then the source length-prefixed, then the arguments NUL-separated —
-      // the same shape `readDir` answers with, for the same reason: a filename or an argument
-      // may contain anything but a NUL.
+    (source: string, args: string[], grants: number, cwd: string) =>
+      // The grant flags, then the source length-prefixed, then the arguments length-prefixed and
+      // NUL-separated — the same shape `readDir` answers with, for the same reason: a filename or an
+      // argument may contain anything but a NUL — and then the child's directory.
       T.child(
         submit(
           b,
           OP.SPAWN,
-          headed(i32le(grants), prefixed(str(source), str(args.join("\u0000")))),
+          headed(
+            i32le(grants),
+            prefixed(str(source), prefixed(str(args.join("\u0000")), str(cwd))),
+          ),
         ),
       ),
     /*= spawnSelf */
     // No source: the host has this program's own bundle, because it is what started it. The payload
     // is the grants and the arguments, in the shape `spawn` uses minus the part that is already here.
-    (args: string[], grants: number) =>
-      T.child(submit(b, OP.SPAWN_SELF, headed(i32le(grants), str(args.join("\u0000"))))),
+    (args: string[], grants: number, cwd: string) =>
+      T.child(
+        submit(
+          b,
+          OP.SPAWN_SELF,
+          headed(i32le(grants), prefixed(str(args.join("\u0000")), str(cwd))),
+        ),
+      ),
     /*= closeFeed */
     (handle: number) => { hostCall(b, OP.CLOSE_FEED, i32le(handle)); },
     /*= exitCode */
