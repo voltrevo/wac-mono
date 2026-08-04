@@ -35,6 +35,7 @@ import { CHUNK } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { OP } from "./ops.ts";
 import { ChildStack, packCaptured, unpackPush } from "./child.ts";
+import { changeBytes, changed, FAULT_DENIED, FAULT_EXISTS, Faulted } from "./faults.ts";
 
 const EMPTY = new Uint8Array(0);
 
@@ -174,6 +175,15 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   const canWrite = (): void => {
     if (opts.root === undefined || opts.writable !== true) deny("filesystem write");
   };
+
+  /**
+   * The same question as `canWrite`, for the four operations that answer with a `Change` instead of
+   * throwing: a refusal is a `Denied` fault said in the ordinary shape, not an exception.
+   */
+  const writeRefused = (): Uint8Array | null =>
+    opts.root === undefined || opts.writable !== true
+      ? changeBytes(FAULT_DENIED, "filesystem write not granted")
+      : null;
 
   /**
    * Walk a path to the directory holding its last component.
@@ -366,15 +376,17 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     },
 
     [OP.READ_FILE]: async (p) => new Uint8Array(await (await fileOf(unstr(p))).arrayBuffer()),
-    [OP.WRITE_FILE]: async (p) => {
-      canWrite();
+    [OP.WRITE_FILE]: (p) => {
+      const no = writeRefused();
+      if (no !== null) return no;
       const n = readI32le(p);
-      const { dir, name } = await resolve(unstr(p.subarray(4, 4 + n)), true);
-      const h = await dir.getFileHandle(name, { create: true });
-      const w = await h.createWritable();
-      await w.write(p.subarray(4 + n));
-      await w.close();
-      return EMPTY;
+      return changed(async () => {
+        const { dir, name } = await resolve(unstr(p.subarray(4, 4 + n)), true);
+        const h = await dir.getFileHandle(name, { create: true });
+        const w = await h.createWritable();
+        await w.write(p.subarray(4 + n));
+        await w.close();
+      });
     },
     [OP.STAT]: (p) => statBytes(unstr(p)),
     // The Origin Private File System has no symbolic links, so this *is* `stat`, and `isSymlink`
@@ -391,45 +403,54 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       return str(names.sort().join("\u0000"));
     },
 
-    [OP.MKDIR]: async (p) => {
-      canWrite();
+    [OP.MKDIR]: (p) => {
+      const no = writeRefused();
+      if (no !== null) return no;
       const path = unstr(p.subarray(1));
       if (p[0] === 1) {
-        const { dir, name } = await resolve(path, true);   // -p: every component
-        await dir.getDirectoryHandle(name, { create: true });
-        return EMPTY;
+        return changed(async () => {
+          const { dir, name } = await resolve(path, true);   // -p: every component
+          await dir.getDirectoryHandle(name, { create: true });
+        });
       }
-      const { dir, name } = await resolve(path, false);
-      // Without `-p`, a missing parent must fail — which `resolve(false)` does — and so
-      // must an existing directory. OPFS has no exclusive create, so it is asked first.
-      let exists = true;
-      try { await dir.getDirectoryHandle(name); } catch { exists = false; }
-      if (exists) throw new Error("already exists");
-      await dir.getDirectoryHandle(name, { create: true });
-      return EMPTY;
+      return changed(async () => {
+        const { dir, name } = await resolve(path, false);
+        // Without `-p`, a missing parent must fail — which `resolve(false)` does — and so
+        // must an existing directory. OPFS has no exclusive create, so it is asked first.
+        let exists = true;
+        try { await dir.getDirectoryHandle(name); } catch { exists = false; }
+        // `AlreadyExists` by name, because OPFS reports nothing here and the message is mine:
+        // a caller asking "did it already exist" must not have to read my English.
+        if (exists) throw new Faulted(FAULT_EXISTS, path + ": already exists");
+        await dir.getDirectoryHandle(name, { create: true });
+      });
     },
-    [OP.REMOVE]: async (p) => {
-      canWrite();
-      const { dir, name } = await resolve(unstr(p.subarray(1)), false);
-      await dir.removeEntry(name, { recursive: p[0] === 1 });
-      return EMPTY;
+    [OP.REMOVE]: (p) => {
+      const no = writeRefused();
+      if (no !== null) return no;
+      return changed(async () => {
+        const { dir, name } = await resolve(unstr(p.subarray(1)), false);
+        await dir.removeEntry(name, { recursive: p[0] === 1 });
+      });
     },
-    [OP.RENAME]: async (p) => {
-      canWrite();
+    [OP.RENAME]: (p) => {
+      const no = writeRefused();
+      if (no !== null) return no;
       const n = readI32le(p);
       const from = unstr(p.subarray(4, 4 + n));
       const to = unstr(p.subarray(4 + n));
-      // OPFS has no rename, so this is a copy and a delete — **not atomic**, which is the
-      // one promise a page cannot keep. See the file header.
-      const bytes = new Uint8Array(await (await fileOf(from)).arrayBuffer());
-      const dst = await resolve(to, true);
-      const h = await dst.dir.getFileHandle(dst.name, { create: true });
-      const w = await h.createWritable();
-      await w.write(bytes);
-      await w.close();
-      const src = await resolve(from, false);
-      await src.dir.removeEntry(src.name);
-      return EMPTY;
+      return changed(async () => {
+        // OPFS has no rename, so this is a copy and a delete — **not atomic**, which is the
+        // one promise a page cannot keep. See the file header.
+        const bytes = new Uint8Array(await (await fileOf(from)).arrayBuffer());
+        const dst = await resolve(to, true);
+        const h = await dst.dir.getFileHandle(dst.name, { create: true });
+        const w = await h.createWritable();
+        await w.write(bytes);
+        await w.close();
+        const src = await resolve(from, false);
+        await src.dir.removeEntry(src.name);
+      });
     },
 
     [OP.OPEN_INPUT]: async (p) => {

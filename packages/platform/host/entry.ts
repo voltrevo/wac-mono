@@ -46,6 +46,8 @@ export type AppModule = {
   Captured: { of(...a: unknown[]): unknown };
   Pending$Captured: { of(...a: unknown[]): unknown };
   Read: { Data(...a: unknown[]): unknown; End(): unknown; Failed(...a: unknown[]): unknown };
+  Change: { of(...a: unknown[]): unknown };
+  Pending$Change: { of(...a: unknown[]): unknown };
   Pending$Read: { of(...a: unknown[]): unknown };
   main: (core: unknown, cli: unknown) => number;
 

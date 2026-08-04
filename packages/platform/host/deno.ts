@@ -10,6 +10,7 @@ import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 import { ChildStack, packCaptured, unpackPush } from "./child.ts";
+import { changeBytes, changed, FAULT_DENIED } from "./faults.ts";
 
 export type DenoWorldOptions = {
   /** Arguments the application sees. Defaults to none, not to the launcher's own. */
@@ -285,12 +286,13 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       const names = await denoDir(P(unstr(p)));
       return str(names.join("\u0000"));
     },
-    [OP.WRITE_FILE]: async (p) => {
-      if (!opts.fs?.write) deny("filesystem write");
+    // The four changes answer a `Change` rather than throwing: a fault category and the host's own
+    // words. A refusal for want of a grant is a `Denied` like any other, said in the same shape.
+    [OP.WRITE_FILE]: (p) => {
+      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
       const n = readI32le(p);
       const path = P(unstr(p.subarray(4, 4 + n)));
-      await Deno.writeFile(path, p.subarray(4 + n));
-      return EMPTY;
+      return changed(() => Deno.writeFile(path, p.subarray(4 + n)));
     },
 
     // The mutation tier. Each throws on failure and the wac side reads that as `false`,
@@ -486,21 +488,20 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       return i32le(await c.exit);
     },
 
-    [OP.MKDIR]: async (p) => {
-      if (!opts.fs?.write) deny("filesystem write");
-      await Deno.mkdir(P(unstr(p.subarray(1))), { recursive: p[0] === 1 });
-      return EMPTY;
+    [OP.MKDIR]: (p) => {
+      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      return changed(() => Deno.mkdir(P(unstr(p.subarray(1))), { recursive: p[0] === 1 }));
     },
-    [OP.REMOVE]: async (p) => {
-      if (!opts.fs?.write) deny("filesystem write");
-      await Deno.remove(P(unstr(p.subarray(1))), { recursive: p[0] === 1 });
-      return EMPTY;
+    [OP.REMOVE]: (p) => {
+      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      return changed(() => Deno.remove(P(unstr(p.subarray(1))), { recursive: p[0] === 1 }));
     },
-    [OP.RENAME]: async (p) => {
-      if (!opts.fs?.write) deny("filesystem write");
+    [OP.RENAME]: (p) => {
+      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
       const n = readI32le(p);
-      await Deno.rename(P(unstr(p.subarray(4, 4 + n))), P(unstr(p.subarray(4 + n))));
-      return EMPTY;
+      return changed(() =>
+        Deno.rename(P(unstr(p.subarray(4, 4 + n))), P(unstr(p.subarray(4 + n))))
+      );
     },
   };
 }

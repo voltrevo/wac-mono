@@ -1,0 +1,108 @@
+// Which of `platform.wac`'s fault categories a host error belongs to.
+//
+// One file rather than three, because the classification is the interesting part and three copies of
+// it would drift — and because the *same* wac program runs on all three, so `rm -f` must mean the
+// same thing whether the filesystem underneath is Deno's, Node's, or the Origin Private File System.
+//
+// The categories are deliberately few. A program branches on "was it simply not there" and little
+// else; everything finer is in the message, which is the host's own words and the only text worth
+// showing a person. Inventing a taxonomy of thirty errno values would be a taxonomy nobody consults.
+
+/** Matching `FAULT_*` in platform.wac. */
+export const FAULT_NONE = 0;
+export const FAULT_NOT_FOUND = 1;
+export const FAULT_DENIED = 2;
+export const FAULT_EXISTS = 3;
+export const FAULT_NOT_EMPTY = 4;
+export const FAULT_OTHER = 5;
+
+/**
+ * A fault a host had to name itself, because its filesystem does not report one.
+ *
+ * OPFS is the case that needs it: it has no exclusive create, so "already exists" is a question the
+ * browser host asks and answers, and if it threw a plain `Error` the category would have to be
+ * recovered from my own English below. Thrown, it arrives here intact.
+ */
+export class Faulted extends Error {
+  readonly fault: number;
+  constructor(fault: number, message: string) {
+    super(message);
+    this.name = "Faulted";
+    this.fault = fault;
+  }
+}
+
+/**
+ * The category of a thrown error, by whatever the host makes available.
+ *
+ * Deno gives typed errors, Node gives `code`, and the File System Access API gives `DOMException`
+ * names — so each is asked in its own terms and the message is only a last resort. Reading the
+ * *message* for a category is what an applet had to do before this existed, and it is a guess about
+ * three operating systems: "No such file or directory" is not what any of them promises to say.
+ */
+export function faultOf(e: unknown): number {
+  if (e instanceof Faulted) return e.fault;
+
+  // Deno's typed errors, if this is Deno. `Deno.errors` is absent under Node, hence the guard.
+  const denoErrors = (globalThis as { Deno?: { errors?: Record<string, unknown> } }).Deno?.errors;
+  if (denoErrors !== undefined) {
+    if (isInstance(e, denoErrors.NotFound)) return FAULT_NOT_FOUND;
+    if (isInstance(e, denoErrors.PermissionDenied)) return FAULT_DENIED;
+    if (isInstance(e, denoErrors.AlreadyExists)) return FAULT_EXISTS;
+  }
+
+  // Node's errno codes, and Deno's too where it sets them.
+  const code = (e as { code?: unknown }).code;
+  if (typeof code === "string") {
+    if (code === "ENOENT") return FAULT_NOT_FOUND;
+    if (code === "EACCES" || code === "EPERM") return FAULT_DENIED;
+    if (code === "EEXIST") return FAULT_EXISTS;
+    if (code === "ENOTEMPTY") return FAULT_NOT_EMPTY;
+  }
+
+  // The File System Access API throws `DOMException`s with names rather than codes.
+  const name = (e as { name?: unknown }).name;
+  if (typeof name === "string") {
+    if (name === "NotFoundError") return FAULT_NOT_FOUND;
+    if (name === "NotAllowedError" || name === "NoModificationAllowedError" || name === "SecurityError") {
+      return FAULT_DENIED;
+    }
+    // Removing a directory that still has entries in it, without `recursive`.
+    if (name === "InvalidModificationError") return FAULT_NOT_EMPTY;
+  }
+
+  // Last: the text. Only for the two cases no host above reports structurally — a non-empty
+  // directory under Deno arrives as a plain `Error`, and its os error number is the only marker.
+  const message = e instanceof Error ? e.message : String(e);
+  if (/not empty|os error 39|os error 66/i.test(message)) return FAULT_NOT_EMPTY;
+  if (/not granted/i.test(message)) return FAULT_DENIED;
+  return FAULT_OTHER;
+}
+
+/** The payload a `Change` is decoded from: the category, then the message. */
+export function changeBytes(fault: number, message: string): Uint8Array {
+  const text = new TextEncoder().encode(message);
+  const out = new Uint8Array(text.length + 1);
+  out[0] = fault;
+  out.set(text, 1);
+  return out;
+}
+
+/** The answer for something that worked. */
+export const CHANGED_OK = new Uint8Array([FAULT_NONE]);
+
+/** Run a change and answer with its outcome rather than throwing. */
+// `unknown` rather than `void` because some of these answer something — Node's recursive
+// `mkdir` returns the first directory it made — and none of it belongs in the reply.
+export async function changed(work: () => Promise<unknown>): Promise<Uint8Array> {
+  try {
+    await work();
+    return CHANGED_OK;
+  } catch (e) {
+    return changeBytes(faultOf(e), e instanceof Error ? e.message : String(e));
+  }
+}
+
+function isInstance(e: unknown, ctor: unknown): boolean {
+  return typeof ctor === "function" && e instanceof (ctor as new () => unknown);
+}

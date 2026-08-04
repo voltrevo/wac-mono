@@ -367,6 +367,49 @@ export struct Core {
 }
 
 /** What a path is, if it is anything. Everything is zero or false when `exists` is false. */
+/**
+ * Why a filesystem change did not happen, in a form a program can act on.
+ *
+ * **Integers rather than an enum**, which is the opposite of `Read` above and for a reason that
+ * survives asking: a fault is *compared* (`rm -f` wants to know whether it was merely absent), and a
+ * wac enum is a reference type with no `==` — payload-less variants allocate, so even `is` would be
+ * false between two `NotFound`s. `ERR_*` in `packages/http` and `GRANT_*` below are the same shape
+ * for the same reason. If enums ever compare by value, this becomes one.
+ *
+ * A category *and* the host's message, because neither replaces the other: the category is what a
+ * program branches on, and the message is what a person reads. Matching the message's words to
+ * recover the category — which is what an applet had to do before this existed — is a guess about
+ * three operating systems.
+ */
+export i32 FAULT_NONE() { return 0; }
+export i32 FAULT_NOT_FOUND() { return 1; }
+export i32 FAULT_DENIED() { return 2; }
+export i32 FAULT_EXISTS() { return 3; }
+export i32 FAULT_NOT_EMPTY() { return 4; }
+/** The host said something this world has no category for; the message is all there is. */
+export i32 FAULT_OTHER() { return 5; }
+
+/** What a filesystem change answered. */
+export struct Change {
+  /** `FAULT_NONE` when it worked. */
+  i32 fault;
+  /** The host's own words, and empty when it worked. */
+  string message;
+
+  Change of(i32 fault, string message) { return Change(fault, message); }
+
+  bool ok(const this) { return this.fault == FAULT_NONE(); }
+
+  /**
+   * Whether the thing was simply not there — the one case `rm -f` is allowed to ignore.
+   *
+   * Before this, `remove` answered a message and `rm -f` had to ask `stat` first, which is both an
+   * extra call and a race: a file can vanish between the two. Asking the failure itself cannot race
+   * with anything.
+   */
+  bool absent(const this) { return this.fault == FAULT_NOT_FOUND(); }
+}
+
 export struct Stat {
   bool exists;
   bool isFile;
@@ -480,8 +523,8 @@ export struct Cli {
   fn[Pending<FileResult>(string)] readFile;
   /** True when the write succeeded. */
   /**
-   * **Answers with the empty string on success and the host's message otherwise**, as `openInput`
-   * and `openOutput` do — a `bool` could say that a write failed and never why.
+   * **Answers a `Change`**: a fault category and the host's message. A `bool` could say that a write
+   * failed and never why, and a bare message could say why to a person but not to a program.
    *
    * That mattered more than it looks. `rm -f` could only suppress every failure or none, because
    * "no such file" and "permission denied" arrived as the same `false`; `find` could report that a
@@ -489,7 +532,7 @@ export struct Cli {
    * `writeFile` diagnostic in this repo was the applet's guess at what had gone wrong. The message
    * is the host's own, which is the only one that knows.
    */
-  fn[Pending<string>(string, u8[])] writeFile;
+  fn[Pending<Change>(string, u8[])] writeFile;
   /** What a path is. `exists` is false where the filesystem was not granted. */
   fn[Pending<Stat>(string)] stat;
   /**
@@ -525,9 +568,9 @@ export struct Cli {
    * caller has to ask for the recursive form, because the recursive form is the one that
    * can destroy something it was not pointed at.
    */
-  fn[Pending<string>(string, bool)] mkdir;
-  fn[Pending<string>(string, bool)] remove;
-  fn[Pending<string>(string, string)] rename;
+  fn[Pending<Change>(string, bool)] mkdir;
+  fn[Pending<Change>(string, bool)] remove;
+  fn[Pending<Change>(string, string)] rename;
 
   /**
    * Streaming input: `openInput` chooses the source, `readChunk` pulls from it.
@@ -739,13 +782,13 @@ export struct Cli {
     fn[Pending<u8[]>()] readStdin,
     fn[bool(u8[])] write,
     fn[Pending<FileResult>(string)] readFile,
-    fn[Pending<string>(string, u8[])] writeFile,
+    fn[Pending<Change>(string, u8[])] writeFile,
     fn[Pending<Stat>(string)] stat,
     fn[Pending<Stat>(string)] linkStat,
     fn[Pending<string[]?>(string)] readDir,
-    fn[Pending<string>(string, bool)] mkdir,
-    fn[Pending<string>(string, bool)] remove,
-    fn[Pending<string>(string, string)] rename,
+    fn[Pending<Change>(string, bool)] mkdir,
+    fn[Pending<Change>(string, bool)] remove,
+    fn[Pending<Change>(string, string)] rename,
     fn[Pending<string>(string)] openInput,
     fn[Read()] readChunk,
     fn[Pending<string>()] outputError,

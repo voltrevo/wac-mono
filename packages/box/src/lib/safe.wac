@@ -7,18 +7,21 @@
 //
 // This is why the mutation tier exists at all, and `cp` uses it.
 
-import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Change, Cli, Core, FAULT_OTHER } from "../../../platform/src/platform.wac";
 
 /**
- * `bytes` at `path`, atomically. False if either step failed.
+ * `bytes` at `path`, atomically. The `Change` says which step failed, and why.
  *
  * The temporary name is random because two copies of this program running at once must
  * not pick the same one — the whole point is to be safe under concurrency, and a fixed
  * `.tmp` suffix would trade one race for another.
  */
-export bool writeAtomic(Core core, Cli cli, string path, u8[] bytes) {
+export Change writeAtomic(Core core, Cli cli, string path, u8[] bytes) {
   string tmp = tempName(core, path);
-  if (cli.writeFile(tmp, bytes).wait() != "") { return false; }
+  Change wrote = cli.writeFile(tmp, bytes).wait();
+  // The temporary is the failure, but the *path* the caller asked about is the one worth naming, so
+  // the fault is passed on as it arrived rather than re-worded around a name nobody chose.
+  if (!wrote.ok()) { return wrote; }
   return finish(cli, tmp, path);
 }
 
@@ -29,26 +32,31 @@ export bool writeAtomic(Core core, Cli cli, string path, u8[] bytes) {
  * makes it possible: the bytes go straight to the temporary file rather than being
  * gathered first, and the rename still happens only once all of them are there.
  */
-export bool streamAtomic(Core core, Cli cli, string path) {
+export Change streamAtomic(Core core, Cli cli, string path) {
   string tmp = tempName(core, path);
-  if (cli.openOutput(tmp).wait() != "") { return false; }
+  string opened = cli.openOutput(tmp).wait();
+  if (opened != "") { return Change.of(FAULT_OTHER(), opened); }
   bool copying = true;
-  bool intact = true;
+  string broke = "";
   while (copying) {
     match (cli.readChunk()) {
       case Data(bytes): {
-        if (!cli.write(bytes)) { copying = false; intact = false; }
+        if (!cli.write(bytes)) {
+          copying = false;
+          broke = cli.outputError().wait();
+          if (broke == "") { broke = "could not write " + tmp; }
+        }
       }
       case End: { copying = false; }
       // Half a file renamed over the original is the worst outcome available here, so a failed read
       // abandons the temporary and leaves the target alone.
-      case Failed(why): { copying = false; intact = false; }
+      case Failed(why): { copying = false; broke = why; }
     }
   }
-  if (!intact) {
+  if (broke != "") {
     cli.openOutput("").wait();
     cli.remove(tmp, false).wait();
-    return false;
+    return Change.of(FAULT_OTHER(), broke);
   }
   // Back to standard output, which closes the temporary file — a rename over a file still
   // open would move it half-written.
@@ -57,12 +65,13 @@ export bool streamAtomic(Core core, Cli cli, string path) {
 }
 
 /** The rename, and the cleanup if it fails. */
-bool finish(Cli cli, string tmp, string path) {
-  if (cli.rename(tmp, path).wait() == "") { return true; }
+Change finish(Cli cli, string tmp, string path) {
+  Change moved = cli.rename(tmp, path).wait();
+  if (moved.ok()) { return moved; }
   // The rename is the only step that can leave litter, so clean up after it and not
   // before: until it succeeds, the temporary file is the only copy of the new contents.
   cli.remove(tmp, false).wait();
-  return false;
+  return moved;
 }
 
 /** A sibling of `path` that no concurrent copy of this program will also pick. */

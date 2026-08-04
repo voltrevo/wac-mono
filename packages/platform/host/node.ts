@@ -14,6 +14,7 @@ import { type Handlers } from "./respond.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { OP } from "./ops.ts";
 import { ChildStack, packCaptured, unpackPush } from "./child.ts";
+import { changeBytes, changed, FAULT_DENIED } from "./faults.ts";
 
 /** Node's pieces, described rather than imported, so this file checks under Deno. */
 export type NodeIo = {
@@ -257,11 +258,10 @@ export function nodeWorld(
       const names = await io.readDir(P(unstr(p)));
       return str(names.join("\u0000"));
     },
-    [OP.WRITE_FILE]: async (p) => {
-      if (!opts.fs?.write) deny("filesystem write");
+    [OP.WRITE_FILE]: (p) => {
+      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
       const n = readI32le(p);
-      await fs.writeFile(P(unstr(p.subarray(4, 4 + n))), p.subarray(4 + n));
-      return EMPTY;
+      return changed(() => fs.writeFile(P(unstr(p.subarray(4, 4 + n))), p.subarray(4 + n)));
     },
 
     [OP.OPEN_INPUT]: async (p) => {
@@ -348,23 +348,22 @@ export function nodeWorld(
       return EMPTY;
     },
 
-    [OP.MKDIR]: async (p) => {
-      if (!opts.fs?.write) deny("filesystem write");
-      await fs.mkdir(P(unstr(p.subarray(1))), { recursive: p[0] === 1 });
-      return EMPTY;
+    [OP.MKDIR]: (p) => {
+      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      return changed(() => fs.mkdir(P(unstr(p.subarray(1))), { recursive: p[0] === 1 }));
     },
-    [OP.REMOVE]: async (p) => {
-      if (!opts.fs?.write) deny("filesystem write");
-      // `force: false` so that removing something absent fails, as `Deno.remove` does.
-      // Node's `rm` is otherwise happy to report success for a path that was never there.
-      await fs.rm(P(unstr(p.subarray(1))), { recursive: p[0] === 1, force: false });
-      return EMPTY;
+    [OP.REMOVE]: (p) => {
+      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      // `force: false` so that removing something absent fails, as `Deno.remove` does — and now that
+      // the failure carries a category, `rm -f` can ignore exactly that one rather than all of them.
+      return changed(() => fs.rm(P(unstr(p.subarray(1))), { recursive: p[0] === 1, force: false }));
     },
-    [OP.RENAME]: async (p) => {
-      if (!opts.fs?.write) deny("filesystem write");
+    [OP.RENAME]: (p) => {
+      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
       const n = readI32le(p);
-      await fs.rename(P(unstr(p.subarray(4, 4 + n))), P(unstr(p.subarray(4 + n))));
-      return EMPTY;
+      return changed(() =>
+        fs.rename(P(unstr(p.subarray(4, 4 + n))), P(unstr(p.subarray(4 + n))))
+      );
     },
   };
 }

@@ -91,6 +91,8 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
       const r = new Deno.Command(built, { args, stdout: "piped", stderr: "piped" }).outputSync();
       return { code: r.code, out: new TextDecoder().decode(r.stdout) };
     };
+    const sysCode = (cmd: string, args: string[]) =>
+      new Deno.Command(cmd, { args, stdout: "null", stderr: "null" }).outputSync().code;
     const sys = (cmd: string, args: string[]) => {
       const r = new Deno.Command(cmd, { args, stdout: "piped", stderr: "null" }).outputSync();
       return new TextDecoder().decode(r.stdout);
@@ -210,18 +212,38 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     // `-f` ignores what is already gone, not everything that fails. `remove` answered `bool`, so
     // "no such file" and "permission denied" arrived identically and `-f` had to swallow both: it
     // said nothing, exited 0, and left the file there. GitHub wac-mono#17.
+    //
+    // Its own binary, granted write: `built` above may only read, and a read-only program is refused
+    // *every* removal, so both cases below would come back denied and neither would test `-f`. That
+    // is what the first version of this did — it asserted the right numbers for the wrong reason.
+    const rmBin = await Deno.makeTempFile({ prefix: "wac-box-rmw-" });
+    await buildApp(BOX, rmBin, { read: true, write: true });
+    const rm = (args: string[]) => {
+      const r = new Deno.Command(rmBin, { args, stdout: "piped", stderr: "piped" }).outputSync();
+      return { code: r.code, err: new TextDecoder().decode(r.stderr) };
+    };
     const guarded = await Deno.makeTempDir({ prefix: "wac-box-rmf-" });
     await Deno.mkdir(`${guarded}/sub`);
     await Deno.writeTextFile(`${guarded}/sub/kept`, "x");
     await Deno.chmod(`${guarded}/sub`, 0o500);          // may not be unlinked from
-    const stubborn = box(["rm", "-f", `${guarded}/sub/kept`]);
+    const stubborn = rm(["rm", "-f", `${guarded}/sub/kept`]);
     await Deno.chmod(`${guarded}/sub`, 0o700);
     assertEquals(stubborn.code, 1, "rm -f reports a file it could not remove");
     assertEquals(await exists(`${guarded}/sub/kept`), true, "and the file is indeed still there");
-    // While a file that was never there is still silent, as it is in GNU.
-    const absent = box(["rm", "-f", `${guarded}/nothing-here`]);
-    assertEquals(absent.code, 0, "rm -f on a missing file succeeds");
+    // While a file that was never there is still silent, as it is in GNU. This is the assertion the
+    // fault category is for: the two failures above and here differ only in their category, and `-f`
+    // now asks the answer rather than asking `stat` first and racing with whoever else is deleting.
+    assertEquals(rm(["rm", "-f", `${guarded}/nothing-here`]).code, 0, "rm -f on a missing file is 0");
+    assertEquals(sysCode("rm", ["-f", `${guarded}/nothing-here`]), 0, "and GNU rm -f agrees");
+    // Without `-f` it is an error, and the message is the host's own words rather than a guess.
+    const loud = rm(["rm", `${guarded}/nothing-here`]);
+    assertEquals(loud.code, 1, "rm without -f reports a missing file");
+    assertEquals(loud.err.includes("No such file"), true, loud.err);
+    // A program that may not write at all is refused rather than forgiven, which is a different
+    // answer from "there was nothing to do" and should not be flattened into it.
+    assertEquals(box(["rm", "-f", `${guarded}/nothing-here`]).code, 1, "no write grant is denial");
     await Deno.remove(guarded, { recursive: true });
+    await Deno.remove(rmBin);
 
     // Symbolic links are refused, which tar.wac's header has always claimed. `stat` follows, so a
     // link to a directory was indistinguishable from the directory: it was walked into, stored under

@@ -23,8 +23,8 @@
 // picks an id from the path; `resolveFile` turns the id back into a `FileResult`. It reads
 // oddly and it is the only way to build a resolved ticket without state.
 
-import { Captured, Child, Cli, Core, FileResult, Pending, Socket, Stat }
-  from "../../../platform/src/platform.wac";
+import { Captured, Change, Child, Cli, Core, FAULT_DENIED, FAULT_NONE, FAULT_NOT_FOUND, FileResult,
+  Pending, Socket, Stat } from "../../../platform/src/platform.wac";
 import { Read } from "../../../bytes/src/read.wac";
 import { Shell, runScript } from "../../src/exec.wac";
 
@@ -100,15 +100,26 @@ Pending<FileResult> fakeReadFile(string path) {
 
 /** `out.txt` is writable and `readonly.txt` is not, so both paths through a redirection run. */
 /**
- * The write outcome, as a message: empty for success.
+ * The write outcome, as a `Change`.
  *
  * `readonly.txt` fails, so both branches of every caller are reachable — the fake cannot hold the
- * answer itself, so it goes in the ticket's id and `resolveWriteOutcome` decodes it.
+ * answer itself, so it goes in the ticket's id and `resolveChange` decodes it.
  */
-Pending<string> fakeWriteFile(string path, u8[] data) {
-  return Pending.of(path == "readonly.txt" ? 1 : 0, resolveWriteOutcome, alwaysSettled, ignoreDrop);
+Pending<Change> fakeWriteFile(string path, u8[] data) {
+  return Pending.of(path == "readonly.txt" ? 2 : 0, resolveChange, alwaysSettled, ignoreDrop);
 }
-string resolveWriteOutcome(i32 id) { return id == 1 ? "permission denied" : ""; }
+
+/**
+ * A change, by id: 0 worked, 1 was not there, 2 was refused.
+ *
+ * The ids are the fault numbers themselves, so this is the identity on the category and only the
+ * words are invented — a fake host is entitled to its own wording but not to its own taxonomy.
+ */
+Change resolveChange(i32 id) {
+  if (id == FAULT_NOT_FOUND()) { return Change.of(id, "no such file or directory"); }
+  if (id == FAULT_DENIED()) { return Change.of(id, "permission denied"); }
+  return Change.of(FAULT_NONE(), "");
+}
 
 /** Only the two programs under `/bin` exist, which is what makes a `$WACPATH` search decide. */
 Stat resolveStat(i32 id) { return Stat.of(id == 1, id == 1, false, 0, 0, false); }
@@ -119,9 +130,13 @@ Pending<Stat> fakeLinkStat(string path) { return fakeStat(path); }
 /** Nothing went wrong with the last write, and nothing with the last recv. */
 Pending<string> fakeOutputError() { return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop); }
 Pending<Stat> fakeStat(string path) {
-  i32 there = (path == "/bin/prog" || path == "/bin/badprog" || path == "/bin/goneprog"
-               || path == "/bin/ghost") ? 1 : 0;
-  return Pending.of(there, resolveStat, alwaysSettled, ignoreDrop);
+  return Pending.of(present(path) ? 1 : 0, resolveStat, alwaysSettled, ignoreDrop);
+}
+
+/** What this filesystem has, in one place, so `stat` and `remove` cannot disagree. */
+bool present(string path) {
+  return path == "/bin/prog" || path == "/bin/badprog" || path == "/bin/goneprog"
+      || path == "/bin/ghost";
 }
 
 string[]? resolveDir(i32 id) {
@@ -140,14 +155,23 @@ Pending<string[]?> fakeReadDir(string path) {
   return Pending.of(path == "dir" ? 1 : 0, resolveDir, alwaysSettled, ignoreDrop);
 }
 
-Pending<string> fakeMkdir(string path, bool parents) {
-  return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
+Pending<Change> fakeMkdir(string path, bool parents) {
+  return Pending.of(FAULT_NONE(), resolveChange, alwaysSettled, ignoreDrop);
 }
-Pending<string> fakeRemove(string path, bool recursive) {
-  return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
+
+/**
+ * Removing something this fake filesystem does not have is `NotFound`, exactly as `stat` reports it.
+ *
+ * Kept consistent with `fakeStat` on purpose: `rm -f` asks the *answer* whether the path was merely
+ * absent rather than asking `stat` first, so a fake that removed anything successfully would hide
+ * the branch that matters.
+ */
+Pending<Change> fakeRemove(string path, bool recursive) {
+  return Pending.of(present(path) ? FAULT_NONE() : FAULT_NOT_FOUND(), resolveChange, alwaysSettled,
+                    ignoreDrop);
 }
-Pending<string> fakeRename(string from, string to) {
-  return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
+Pending<Change> fakeRename(string from, string to) {
+  return Pending.of(FAULT_NONE(), resolveChange, alwaysSettled, ignoreDrop);
 }
 Pending<string> fakeOpenInput(string path) {
   return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
@@ -310,10 +334,10 @@ export i32 shTouchStubs() {
   if (c.stat("x").wait().exists) { n++; }
   if (c.readDir("dir").wait() is not null) { n++; }
   if (c.readDir("nope").wait() is null) { n++; }
-  // The three answer a message now: empty means it worked.
-  if (c.mkdir("d", true).wait() == "") { n++; }
-  if (c.remove("d", true).wait() == "") { n++; }
-  if (c.rename("a", "b").wait() == "") { n++; }
+  // The three answer a `Change`: a fault category beside the host's own words.
+  if (c.mkdir("d", true).wait().ok()) { n++; }
+  if (c.remove("d", true).wait().ok()) { n++; }
+  if (c.rename("a", "b").wait().ok()) { n++; }
   n += c.openInput("x").wait().len() + c.openOutput("x").wait().len();
   n += c.connect("h", 1).wait().handle + c.listen(1).wait().handle + c.accept(1).wait().handle;
   if (c.send(1, u8[0]()).wait()) { n++; }

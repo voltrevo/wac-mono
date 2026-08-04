@@ -64,6 +64,7 @@ export type PendingClasses = {
   Pending$Child: PendingClass;
   Pending$Captured: PendingClass;
   Pending$Read: PendingClass;
+  Pending$Change: PendingClass;
 };
 
 /**
@@ -136,6 +137,7 @@ export function cliOf(
     Socket: { of(...a: unknown[]): unknown };
     Child: { of(...a: unknown[]): unknown };
     Captured: { of(...a: unknown[]): unknown };
+    Change: { of(...a: unknown[]): unknown };
     Read: {
       Data(bytes: Uint8Array): unknown;
       End(): unknown;
@@ -259,6 +261,17 @@ export function cliOf(
       return cls.Read.Failed(e instanceof Error ? e.message : String(e));
     }
   };
+  /** A `Change`: the fault category, then the host's message. */
+  const change = (id: number) => {
+    try {
+      const out = collect(b, unpack(id));
+      if (out.length === 0) return cls.Change.of(0, "");
+      return cls.Change.of(out[0], unstr(out.subarray(1)));
+    } catch (e) {
+      // The bridge itself failed, which is not a category this world names.
+      return cls.Change.of(5, e instanceof Error ? e.message : String(e));
+    }
+  };
   const socket = (id: number) => {
     try {
       return cls.Socket.of(readI32le(collect(b, unpack(id))), "");
@@ -281,6 +294,7 @@ export function cliOf(
     socket: (t: Ticket) => cls.Pending$Socket.of(pack(t), socket, settled, drop),
     captured: (t: Ticket) => cls.Pending$Captured.of(pack(t), captured, settled, drop),
     read: (t: Ticket) => cls.Pending$Read.of(pack(t), read, settled, drop),
+    change: (t: Ticket) => cls.Pending$Change.of(pack(t), change, settled, drop),
     child: (t: Ticket) => cls.Pending$Child.of(pack(t), child, settled, drop),
   };
 
@@ -344,7 +358,7 @@ export function cliOf(
     /*= writeFile */
     // `outcome`, not `ok`: the answer is the host's message, empty when it worked.
     (path: string, body: Uint8Array) =>
-      T.outcome(submit(b, OP.WRITE_FILE, prefixed(str(path), body))),
+      T.change(submit(b, OP.WRITE_FILE, prefixed(str(path), body))),
     /*= stat */
     (path: string) => T.stat(submit(b, OP.STAT, str(path))),
     /*= linkStat */
@@ -353,11 +367,11 @@ export function cliOf(
     (path: string) => T.dir(submit(b, OP.READ_DIR, str(path))),
 
     /*= mkdir */
-    (path: string, parents: boolean) => T.outcome(submit(b, OP.MKDIR, flagged(parents, path))),
+    (path: string, parents: boolean) => T.change(submit(b, OP.MKDIR, flagged(parents, path))),
     /*= remove */
-    (path: string, recursive: boolean) => T.outcome(submit(b, OP.REMOVE, flagged(recursive, path))),
+    (path: string, recursive: boolean) => T.change(submit(b, OP.REMOVE, flagged(recursive, path))),
     /*= rename */
-    (from: string, to: string) => T.outcome(submit(b, OP.RENAME, twoPaths(from, to))),
+    (from: string, to: string) => T.change(submit(b, OP.RENAME, twoPaths(from, to))),
 
     /*= openInput */
     (path: string) => T.outcome(submit(b, OP.OPEN_INPUT, str(path))),

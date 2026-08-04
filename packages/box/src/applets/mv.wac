@@ -1,13 +1,13 @@
 // A file or directory moved. A rename within a filesystem, which is why this needs no
 // read grant at all — nothing is copied through the program.
 
-import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Change, Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 
 export i32 mv(Core core, Cli cli, Args a) {
   if (a.rest.len() < 2) { core.warn("usage: " + a.name + " <src> <dst>"); return 2; }
-  string err = cli.rename(a.rest[0], a.rest[1]).wait();
-  if (err == "") { return 0; }
-  core.warn(a.name + ": " + a.rest[0] + ": cannot move");
+  Change c = cli.rename(a.rest[0], a.rest[1]).wait();
+  if (c.ok()) { return 0; }
+  core.warn(a.name + ": " + a.rest[0] + ": " + c.message);
   return 1;
 }

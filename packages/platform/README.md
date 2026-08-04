@@ -118,10 +118,22 @@ split is why it is a second struct rather than more fields.
 | `Page` | `render`, `setText`, `setValue`, `getValue`, `on`, `nextEvent`, `title` | browser only |
 | | `drawPixels`, `nextFile`, `offerDownload` | browser only |
 
-**Anything that can fail says why.** `writeFile`, `mkdir`, `remove` and `rename` answer with the
-empty string on success and the host's own message otherwise, as `openInput` and `openOutput` already
-did — a `bool` could report that a write failed and never what went wrong, so `rm -f` had to suppress
-every failure or none, and each applet's diagnostic was its own guess. **`readChunk` and `recv` answer a `Read`**, which is `Data(bytes)`, `End`, or `Failed(why)` — three
+**Anything that can fail says why.** `writeFile`, `mkdir`, `remove` and `rename` answer a **`Change`**:
+a fault category and the host's own words. A `bool` could report that a write failed and never what
+went wrong, so `rm -f` had to suppress every failure or none. A message alone was better and still not
+enough — "was it merely absent?" could only be answered by matching English, which is a guess about
+three operating systems, so `rm -f` asked `stat` first instead and raced with whoever else was
+deleting. The category answers it in the reply: `ok()`, `absent()`, and `fault` against `FAULT_DENIED`,
+`FAULT_EXISTS`, `FAULT_NOT_EMPTY`, `FAULT_OTHER`. The classification is one file,
+[`host/faults.ts`](host/faults.ts), shared by all three hosts — Deno's typed errors, Node's `code`s and
+the browser's `DOMException` names are three vocabularies for the same five facts, and `rm -f` must
+mean the same thing on all of them.
+
+The categories are deliberately few, and `FAULT_OTHER` is not an embarrassment: a full errno table is
+a taxonomy nobody branches on. What a program branches on is "was it already gone"; what a person
+reads is the message.
+
+**`readChunk` and `recv` answer a `Read`**, which is `Data(bytes)`, `End`, or `Failed(why)` — three
 states in the type, so a caller cannot mistake a broken read for the end of the input. `match` is
 exhaustive; ignoring `Failed` does not compile.
 

@@ -31,6 +31,16 @@ function readBytes(p: Uint8Array): Uint8Array {
 }
 
 
+/**
+ * A `Change` payload: the fault category, and the message it carries.
+ *
+ * The four mutations do not reject — they answer, because their category is the thing a caller
+ * branches on and an exception has nowhere to put one.
+ */
+function change(p: Uint8Array): { fault: number; message: string } {
+  return { fault: p[0], message: new TextDecoder().decode(p.subarray(1)) };
+}
+
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
   if (got !== want) {
@@ -172,9 +182,14 @@ Deno.test("the browser world honours the capabilities a page can honour", async 
 
   assertEquals(unstr(await call(OP.READ_DIR, str("a"))), "b");
 
-  // Without -p a missing parent fails, and so does an existing directory.
-  await rejects(() => call(OP.MKDIR, new Uint8Array([0, ...str("x/y")])), "no directory");
-  await rejects(() => call(OP.MKDIR, new Uint8Array([0, ...str("a")])), "already exists");
+  // Without -p a missing parent fails, and so does an existing directory. Both answer a `Change`
+  // rather than throwing, and the second is `FAULT_EXISTS` by category — which matters here more
+  // than anywhere, because OPFS has no exclusive create and the *host* decided that fault.
+  const missingParent = change(await call(OP.MKDIR, new Uint8Array([0, ...str("x/y")])));
+  assertEquals(missingParent.message.includes("no directory"), true, missingParent.message);
+  const already = change(await call(OP.MKDIR, new Uint8Array([0, ...str("a")])));
+  assertEquals(already.fault, 3, "already exists is FAULT_EXISTS");
+  assertEquals(already.message.includes("already exists"), true, already.message);
 
   // Streaming input, in CHUNK-sized pieces out of a Blob.
   await put("big.txt", "x".repeat(200_000));
@@ -398,7 +413,17 @@ Deno.test("the browser world denies the filesystem when the page grants none", a
   const ro = browserWorld({ root: memDir() });
   const roCall = async (op: number, payload: Uint8Array<ArrayBufferLike> = new Uint8Array(0)) =>
     await ro[op](payload as Uint8Array) as Uint8Array;
-  await rejects(() => roCall(OP.MKDIR, new Uint8Array([1, ...str("d")])), "write not granted");
-  await rejects(() => roCall(OP.REMOVE, new Uint8Array([0, ...str("d")])), "write not granted");
+  // A refusal for want of a grant is `FAULT_DENIED` said in the ordinary shape, not an exception:
+  // one code path in the applet for "the page said no" and "the filesystem said no".
+  for (const [op, payload] of [
+    [OP.MKDIR, new Uint8Array([1, ...str("d")])],
+    [OP.REMOVE, new Uint8Array([0, ...str("d")])],
+    [OP.WRITE_FILE, new Uint8Array([1, 0, 0, 0, ...str("f"), 120])],
+    [OP.RENAME, new Uint8Array([1, 0, 0, 0, ...str("f"), ...str("g")])],
+  ] as [number, Uint8Array][]) {
+    const c = change(await roCall(op, payload));
+    assertEquals(c.fault, 2, `op ${op} is FAULT_DENIED`);
+    assertEquals(c.message.includes("write not granted"), true, c.message);
+  }
   await rejects(() => roCall(OP.OPEN_OUTPUT, str("f")), "write not granted");
 });

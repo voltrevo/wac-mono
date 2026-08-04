@@ -20,7 +20,8 @@ import { Option } from "../../std/src/option.wac";
 import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Read } from "../../bytes/src/read.wac";
-import { Child, Cli, Core, FileResult, GRANT_NONE, Stat } from "../../platform/src/platform.wac";
+import { Change, Child, Cli, Core, FileResult, GRANT_NONE, Stat }
+  from "../../platform/src/platform.wac";
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
          RedirKind, Script, Simple, Word, parse } from "./parse.wac";
@@ -610,8 +611,9 @@ bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
       payload = both.take();
     }
   }
-  if (sh.cli.writeFile(path, payload).wait() != "") {
-    sh.errOut.pushAll(("sh: " + path + ": cannot write\n").toBytes());
+  Change wrote = sh.cli.writeFile(path, payload).wait();
+  if (!wrote.ok()) {
+    sh.errOut.pushAll(("sh: " + path + ": " + wrote.message + "\n").toBytes());
     sh.status = 1;
   }
   return true;
@@ -800,8 +802,9 @@ Output mkdir(Shell sh, Vec<string> argv) {
   i32 status = 0;
   for (i32 i = 0; i < paths.len(); i++) {
     string given = paths.get(i);
-    if (sh.cli.mkdir(sh.resolve(given), parents).wait() != "") {
-      err.pushAll(("mkdir: cannot create directory '" + given + "'\n").toBytes());
+    Change made = sh.cli.mkdir(sh.resolve(given), parents).wait();
+    if (!made.ok()) {
+      err.pushAll(("mkdir: cannot create directory '" + given + "': " + made.message + "\n").toBytes());
       status = 1;
     }
   }
@@ -811,9 +814,9 @@ Output mkdir(Shell sh, Vec<string> argv) {
 /**
  * `rm [-r] path…`
  *
- * `-f` is accepted and means what it means everywhere: say nothing about what was not there. The
- * platform's `remove` reports only success or failure, so a missing path and a non-empty directory
- * are the same answer here — which is why the message says "cannot remove" rather than guessing.
+ * `-f` is accepted and means what it means everywhere: say nothing about what was not there —
+ * exactly the `NotFound` fault that `remove` now reports, and nothing wider. A directory without
+ * `-r` is still checked here, because the platform's `remove` will happily take an empty one.
  */
 Output rm(Shell sh, Vec<string> argv) {
   bool recursive = false;
@@ -842,19 +845,12 @@ Output rm(Shell sh, Vec<string> argv) {
       }
       continue;
     }
-    // `-f` is about what is already gone. A file that exists and will not be removed is reported
-    // whatever the flags say, with the host's own message — `remove` answered `bool` before, so
-    // "no such file" and "permission denied" were the same answer and `-f` had to swallow both.
-    if (!sh.cli.stat(path).wait().exists) {
-      if (!force) {
-        err.pushAll(("rm: cannot remove '" + given + "': No such file or directory\n").toBytes());
-        status = 1;
-      }
-      continue;
-    }
-    string failed = sh.cli.remove(path, recursive).wait();
-    if (failed != "") {
-      err.pushAll(("rm: cannot remove '" + given + "': " + failed + "\n").toBytes());
+    // `-f` is about what is already gone, which is one fault category and not the others: a file
+    // that exists and will not be removed is reported whatever the flags say. Asked in the answer
+    // rather than by a `stat` first, so there is no window for the file to vanish in between.
+    Change gone = sh.cli.remove(path, recursive).wait();
+    if (!gone.ok() && !(force && gone.absent())) {
+      err.pushAll(("rm: cannot remove '" + given + "': " + gone.message + "\n").toBytes());
       status = 1;
     }
   }

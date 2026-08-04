@@ -16,7 +16,7 @@
 // only kind of difference this program cannot show you, since a non-atomic rename looks exactly
 // like an atomic one until two of them race.
 
-import { Cli, Core, FileResult, Stat } from "../src/platform.wac";
+import { Change, Cli, Core, FileResult, Stat } from "../src/platform.wac";
 
 export i32 main(Core core, Cli cli) {
   string text = cli.argCount().wait() > 0 ? cli.arg(0).wait() : "round trip";
@@ -30,8 +30,9 @@ export i32 main(Core core, Cli cli) {
   cli.remove(a, false).wait();
   cli.remove(b, false).wait();
 
-  if (cli.writeFile(a, text.toBytes()).wait() != "") {
-    core.warn("roundtrip: cannot write " + a);
+  Change wrote = cli.writeFile(a, text.toBytes()).wait();
+  if (!wrote.ok()) {
+    core.warn("roundtrip: cannot write " + a + ": " + wrote.message);
     return 1;
   }
   core.log("wrote " + a);
@@ -53,8 +54,9 @@ export i32 main(Core core, Cli cli) {
     (contains(names!, a) ? "including " + a : "but not " + a)));
 
   // Not atomic in a browser. Everything else here behaves identically on all three hosts.
-  if (cli.rename(a, b).wait() != "") {
-    core.warn("roundtrip: cannot rename");
+  Change moving = cli.rename(a, b).wait();
+  if (!moving.ok()) {
+    core.warn("roundtrip: cannot rename: " + moving.message);
     return 1;
   }
   Stat moved = cli.stat(b).wait();

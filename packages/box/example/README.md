@@ -31,7 +31,7 @@ calls, so it needs a `SharedArrayBuffer`, and a browser only supplies one to a
 page — two response headers. `box`'s own web server sends them with `-x`:
 
 ```sh
-deno task app:build packages/box/src/main.wac --allow-read --allow-net -o box
+deno task app:build packages/box/src/box.wac --allow-read --allow-net -o box
 ./box httpd -8080 page -x        # -x adds COOP and COEP
 ```
 
