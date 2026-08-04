@@ -9,12 +9,22 @@ client.
 | `merkleize`, `mixInLength`, `zeroHash`, chunking | **done** |
 | `hash_tree_root` of uints, booleans, bitvectors, bitlists, basic vectors and lists | **done** — 745 Ethereum `ssz_generic` cases |
 | `isValidMerkleBranch`, `isValidNormalizedMerkleBranch` | **done** |
-| `hash_tree_root` of containers | **not started** — needs a field layout per type; 403 vectors waiting |
-| the nine light-client containers | **not started** — 45 vectors waiting |
+| `hash_tree_root` of containers, lists and vectors of composites | **done** — 303 Ethereum `containers` cases, schema-driven |
+| progressive lists | **out of scope** — a different merkleization scheme; 100 cases |
+| the nine light-client containers | **not started** — 45 vectors waiting, and now only descriptors away |
 
-`src/merkle.wac` is the whole of it so far. The two things it says loudest, because they are where
-implementations go wrong: **the pad target is the type's limit, not the data's length**, and **a
-bitlist's trailing delimiter bit is measured, not merkleized**.
+`src/merkle.wac` is merkleization; `src/container.wac` is a **schema-driven** `hash_tree_root` — a type
+is four `i32`s in a flat table (`kind, param, child, count`), so a container is described rather than
+hand-written and the whole descriptor crosses the JS boundary as an `i32[]`. The nine light-client
+containers are now nine descriptors, not nine functions.
+
+Four things this says loudest, because they are where implementations go wrong:
+
+- **the pad target is the type's limit, not the data's length**
+- **a bitlist's trailing delimiter bit is measured, not merkleized**
+- **a variable field's extent comes from the *next* offset**, and the last runs to the container's end
+- **the first offset must equal the fixed part's size** — a serialization saying otherwise is
+  malformed, not unusual
 
 ## What the tests establish
 
@@ -35,6 +45,26 @@ bitlist's trailing delimiter bit is measured, not merkleized**.
 - **The normalized branch's surplus nodes must be zero.** A zero-padded branch is accepted, a branch
   with non-zero surplus is refused rather than trimmed. That is a validity condition — accepting it
   would let a prover hang an unrelated subtree below the field being proved.
+- **303 of the 403 `containers` cases** produce Ethereum's root, driven by descriptors transcribed from
+  the generator's own definitions in `consensus-specs/tests/formats/ssz_generic/README.md`.
+  `ComplexTestStruct` is the one that earns its keep: seven fields, four variable, a nested container,
+  a vector of fixed containers and a vector of *variable* ones.
+- **Both offset checks were confirmed load-bearing by removing them**, and one of those attempts found
+  a vacuous test. Details below, because the second is the more useful finding.
+
+### Two bugs the vectors caught, and one the tests nearly missed
+
+**Offsets going backwards were compared against the wrong field.** The check read
+`abs < finish[prevVar]`, and `finish[prevVar]` is still the *provisional* container end — the very
+value the new offset is about to narrow. So every well-formed container with two variable fields was
+refused. `BitsStruct` has offsets 11 then 12 against an end of 13, and 12 < 13 looked backwards. The
+comment above the line said "must not go backwards" and was right; the line was wrong.
+
+**Removing the first-offset check broke nothing**, which meant that test was vacuous. `VarTestStruct`'s
+variable field is a `List[uint16, 1024]`, so the offsets I had picked (6 and 8) left an *odd* number of
+bytes and were refused by the element-size check rather than the offset check. Parity-preserving
+offsets (5, 9, 11 — matching the 7-byte fixed part) close that escape, and with them removing the
+check fails as it should. Worth writing down because the test looked exactly like a test that worked.
 
 ## Why the vectors came first
 

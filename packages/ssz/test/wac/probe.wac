@@ -4,6 +4,7 @@ import { hashPair, zeroHash, merkleize, mixInLength, padToChunks, chunkCount, ne
          depthFor, rootBasic, rootBasicVector, rootBitvector, rootBitlist, rootBasicList,
          bitlistLength, floorLog2, subtreeIndex, isValidMerkleBranch,
          isValidNormalizedMerkleBranch } from "../../src/merkle.wac";
+import { hashTreeRoot, isFixed, fixedSize } from "../../src/container.wac";
 
 export u8[] sszHashPair(u8[] a, u8[] b) { return hashPair(a, b); }
 export u8[] sszZeroHash(i32 d) { return zeroHash(d); }
@@ -32,3 +33,12 @@ export bool sszValidBranch(u8[] leaf, u8[] branch, i32 depth, i32 index, u8[] ro
 export bool sszValidNormalizedBranch(u8[] leaf, u8[] branch, i32 gindex, u8[] root) {
   return isValidNormalizedMerkleBranch(leaf, branch, gindex as! u64, root);
 }
+
+/** `hash_tree_root` over a flat type descriptor; empty when the value is refused. */
+export u8[] sszHashTreeRoot(i32[] types, i32[] fields, i32 root, u8[] data) {
+  u8[]? r = hashTreeRoot(types, fields, root, data);
+  return (r is null) ? u8[0]() : r!;
+}
+
+export bool sszIsFixed(i32[] types, i32[] fields, i32 i) { return isFixed(types, fields, i); }
+export i32 sszFixedSize(i32[] types, i32[] fields, i32 i) { return fixedSize(types, fields, i); }
