@@ -1,0 +1,60 @@
+// Listen, take one connection, and say who it came from.
+//
+//   greet <address> <port>        # "" as the address means every interface
+//
+// Small on purpose: it is the shortest program that uses all three of `listen`'s address, `accept`'s
+// peer, and `send`. `platform/test/node_net.test.ts` builds it for Deno *and* for Node and compares
+// what the two say, which is the only way to notice that a change to one runtime's socket shim broke
+// the other — the Node network path had no test at all until this existed, and the shim was edited
+// three times before anybody looked at it with a client attached.
+//
+// The peer is what `accept` answers with beside the handle. A server could not previously log who
+// connected, rate-limit by source, or refuse a connection that did not come from this machine, which
+// is the check that makes binding every interface survivable. wac-mono issue 0025.
+
+import { Cli, Core, Socket } from "../src/platform.wac";
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount().wait() < 2) {
+    core.warn("usage: greet <address> <port>");
+    return 2;
+  }
+  string address = cli.arg(0).wait();
+  i32 port = atoi(cli.arg(1).wait());
+
+  Socket listener = cli.listen(address, port).wait();
+  if (listener.handle < 0) {
+    core.warn("greet: cannot listen: " + listener.error);
+    return 1;
+  }
+  // The line the test waits for: a server that has not finished binding is a server a client cannot
+  // reach, and racing that is how a test becomes flaky rather than failing.
+  core.log("greet: listening");
+
+  Socket peer = cli.accept(listener.handle).wait();
+  if (peer.handle < 0) {
+    core.warn("greet: cannot accept: " + peer.error);
+    cli.closeSocket(listener.handle);
+    return 1;
+  }
+
+  // Both the wire and the log, because they are two different claims: that the peer's address crossed
+  // the boundary, and that a program can act on it.
+  cli.send(peer.handle, ("hello " + peer.peer + "\n").toBytes()).wait();
+  core.log("greet: peer " + peer.peer + (peer.fromLoopback() ? " (loopback)" : " (elsewhere)"));
+
+  cli.closeSocket(peer.handle);
+  cli.closeSocket(listener.handle);
+  return 0;
+}
+
+/** Digits to an i32, and 0 for anything else — a port is all this needs. */
+i32 atoi(string s) {
+  u8[] b = s.toBytes();
+  i32 out = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return 0; }
+    out = out * 10 + (b[i] - '0');
+  }
+  return out;
+}
