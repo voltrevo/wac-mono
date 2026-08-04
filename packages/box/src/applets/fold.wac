@@ -1,4 +1,4 @@
-// Lines wrapped at a width, eighty by default: `fold -40`.
+// Lines wrapped at a width, eighty by default: `fold -w 40`, or `fold -40`.
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";

@@ -278,3 +278,19 @@ hand-written expectation would have enshrined both.
 It also caught that a missing final newline is not handled uniformly by the real tools —
 `head`, `tail` and `rev` preserve it, `nl` and `uniq` add one — which no amount of
 reasoning from first principles would have produced.
+
+**A flag's value attaches or not**, as GNU's do: `cut -f2 -d,` and `cut -f 2 -d ,` are one
+command, `fold -w 40` works as well as `fold -40`, and `head -n 2` as well as `head -2`.
+Only the attached form used to parse, because a detached value would have been left among
+the operands where a filename lives — so `cut -f 2`, which is how `cut` is documented
+everywhere, was a usage error. `takesValue` in `lib/args.wac` is the per-applet table that
+makes the difference: a letter listed there consumes its value, and a letter not listed
+stays a boolean, which is what keeps `grep -n pattern` from swallowing its pattern and
+`sort -n` from swallowing a filename.
+
+Two answers changed with it, both found by the same sweep. `sort -n` over lines with equal
+numeric keys is byte order, not input order — GNU's *last-resort comparison*, which `-u`
+alone skips, since uniqueness is the key's and `1` and `01` are one line. And `shuf -n 0`
+printed everything, because "absent" and "none" were the same value: the bug closed as
+0034 for `head` and `tail`, surviving in the one applet where nothing could reach it until
+a detached `-n 0` parsed at all.

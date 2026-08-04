@@ -20,7 +20,11 @@ export i32 shuf(Core core, Cli cli, Args a) {
     lines[i] = lines[j];
     lines[j] = t;
   }
-  i32 take = a.num == 0 || a.num > n ? n : a.num;
+  // `hasNum`, not `num == 0`: zero means zero. `shuf -n 0` printed every line, because "absent" and
+  // "the user asked for none" were the same value — the bug closed as 0034 for `head` and `tail`, in
+  // the one applet where nothing could reach it until `-n 0` began parsing at all.
+  i32 take = !a.hasNum || a.num > n ? n : a.num;
+  if (take < 0) { take = 0; }
   cli.write(joinLines(lines, take));
   return 0;
 }

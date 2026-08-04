@@ -88,18 +88,35 @@ export u8[][] mergeSortWith(u8[][] xs, i32 n, fn[i32(u8[], u8[])] cmp) {
  * Lines by the number they begin with, for `sort -n`.
  *
  * Leading blanks and a sign are part of the number, as GNU has them. A line with no number at all
- * counts as zero rather than sorting apart, which is also GNU's rule and the reason `sort -n` on
- * mixed input looks stable rather than sorted — the non-numbers keep their order among the zeroes.
+ * counts as zero rather than sorting apart, which is also GNU's rule.
+ *
+ * It is *not* the whole of `sort -n`, and this comment used to say it was: "the non-numbers keep their
+ * order among the zeroes" is what happens with a stable sort and no tie-break, and GNU breaks the tie
+ * by comparing the whole line. `sort -n` over `b`, `a`, `1` answers `a b 1` there and answered the
+ * input's order here. `cmpNumericThenBytes` is the comparison a sort wants; this one is the *key*, and
+ * `-u` is where the difference shows.
  *
  * **Integers only.** GNU compares decimals and thousands separators too. That is a real shortfall
  * and is written down rather than discovered: `sort -n` over `1.5` and `1.25` here orders them by
- * the `1` and then by nothing, so they stay as they came.
+ * the `1` and then by their bytes, where GNU orders them by the fraction.
  */
 export i32 cmpNumeric(u8[] a, u8[] b) {
   i64 x = leadingNumber(a);
   i64 y = leadingNumber(b);
   if (x == y) { return 0; }
   return x < y ? -1 : 1;
+}
+
+/**
+ * The numeric key, then the whole line — GNU's *last-resort comparison*, which is what makes `sort -n`
+ * over lines with equal keys deterministic instead of merely stable.
+ *
+ * Separate from `cmpNumeric` because `-u` must not use it: uniqueness is the key's, so `1` and `01` are
+ * one line, and the survivor is the first in input order rather than the first in byte order.
+ */
+export i32 cmpNumericThenBytes(u8[] a, u8[] b) {
+  i32 c = cmpNumeric(a, b);
+  return c != 0 ? c : cmpBytes(a, b);
 }
 
 /**

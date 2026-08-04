@@ -8,7 +8,7 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
 import { Input, readInput } from "../lib/input.wac";
-import { cmpBytes, cmpNumeric, joinLines, mergeSortWith, splitLines } from "../lib/lines.wac";
+import { cmpBytes, cmpNumeric, cmpNumericThenBytes, joinLines, mergeSortWith, splitLines } from "../lib/lines.wac";
 
 export i32 sort(Core core, Cli cli, Args a) {
   Input in = readInput(core, cli, a, 0);
@@ -19,7 +19,14 @@ export i32 sort(Core core, Cli cli, Args a) {
 
   u8[][] lines = splitLines(in.bytes);
   i32 n = lines.len();
-  u8[][] sorted = mergeSortWith(lines, n, numeric ? cmpNumeric : cmpBytes);
+  // GNU's *last-resort comparison*: lines whose keys compare equal are ordered by their whole bytes, so
+  // `sort -n` over `b`, `a`, `1` answers `a b 1` where this answered the input's order and called it
+  // stability. `-u` is the exception, and the reason the comparison is chosen here rather than inside
+  // `cmpNumeric`: uniqueness is the key's alone, so `1` and `01` are one line and the survivor is the
+  // first in input order — which is the stable sort's answer with no last resort applied.
+  fn[i32(u8[], u8[])] order = cmpBytes;
+  if (numeric) { order = unique ? cmpNumeric : cmpNumericThenBytes; }
+  u8[][] sorted = mergeSortWith(lines, n, order);
 
   u8[][] out = u8[][n](fill: u8[0]());
   i32 at = 0;

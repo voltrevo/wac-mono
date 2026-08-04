@@ -12,9 +12,10 @@ export i32 cut(Core core, Cli cli, Args a) {
   string d = flagValue(a, 'd');
   i32 delim = d == "" ? '\t' : d.toBytes()[0];
   i32 field = atoi(flagValue(a, 'f'));
-  // The value has to be attached to its flag — see `flagValue`. `-f 2` arrives here as no
-  // value at all, so the usage message is what a detached spelling gets.
-  if (field < 1) { core.warn("usage: " + a.name + " -f<n> [-d<c>] [file]   (attached, as -f2 -d,)"); return 2; }
+  // Either spelling: `-f2` and `-f 2` are the same, since `takesValue` in `args.wac` knows that `-d`
+  // and `-f` have values and consumes them. The detached form used to arrive here as no value at all
+  // and got this message, which is how GNU's own documented spelling was a usage error.
+  if (field < 1) { core.warn("usage: " + a.name + " -f<n> [-d<c>] [file]"); return 2; }
 
   Input in = openStream(core, cli, a, 0);
   if (!in.ok) { return 1; }
