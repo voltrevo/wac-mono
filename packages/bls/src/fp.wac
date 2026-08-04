@@ -248,3 +248,79 @@ export u8[] fpToBytes(u32[] a) {
   }
   return out;
 }
+
+/**
+ * `a^e mod p`, square-and-multiply over the exponent's bits, most significant first.
+ *
+ * Not constant-time, and it does not need to be: this package verifies signatures, so every
+ * value it handles is public. The exponent is always a fixed constant here — p−2 for
+ * inversion, (p+1)/4 for square roots — so there is no secret to leak in the first place.
+ */
+u32[] powRaw(u32[] a, u32[] e) {
+  u32[] acc = fpOne();
+  for (i32 i = LIMBS - 1; i >= 0; i--) {
+    for (i32 b = 31; b >= 0; b--) {
+      acc = fpSquare(acc);
+      if (((e[i] >> (b as@ u32)) & 1) != 0) { acc = fpMul(acc, a); }
+    }
+  }
+  return acc;
+}
+
+/** p − 2, the Fermat inversion exponent. */
+u32[] pMinusTwo() {
+  u32[] e = modulus();
+  e[0] = 0xffffaaa9;            // p ends in ...aaab, so p−2 ends in ...aaa9
+  return e;
+}
+
+/**
+ * `a⁻¹ mod p` by Fermat, or null for zero.
+ *
+ * Fermat rather than extended Euclid: it is ~570 multiplications against a few hundred
+ * conditional subtractions, which is slower, but it is a dozen lines that reuse the multiply
+ * already tested to death rather than a new algorithm with its own edge cases. Inversion is
+ * off the hot path — point decompression and the final exponentiation's easy part — so the
+ * trade is the right way round here.
+ */
+export u32[]? fpInvert(u32[] a) {
+  if (fpIsZero(a)) { return null; }
+  return powRaw(a, pMinusTwo());
+}
+
+/** (p + 1)/4, the square-root exponent. Valid because p ≡ 3 (mod 4). */
+u32[] pPlusOneOverFour() {
+  u32[] e = u32[LIMBS]();
+  e[0] = 0xffffeaab; e[1] = 0xee7fbfff; e[2] = 0xac54ffff; e[3] = 0x07aaffff;
+  e[4] = 0x3dac3d89; e[5] = 0xd9cc34a8; e[6] = 0x3ce144af; e[7] = 0xd91dd2e1;
+  e[8] = 0x90d2eb35; e[9] = 0x92c6e9ed; e[10] = 0x8e5ff9a6; e[11] = 0x0680447a;
+  return e;
+}
+
+/**
+ * A square root of `a`, or null when `a` is not a square.
+ *
+ * p ≡ 3 (mod 4), so `a^((p+1)/4)` is a root whenever one exists — and squaring the answer is
+ * the only way to find out, since the exponentiation returns *something* either way. Checking
+ * is not optional: point decompression is fed attacker-controlled bytes, and a routine that
+ * returns a non-root for a non-square would put a point that is not on the curve into the
+ * pairing.
+ */
+export u32[]? fpSqrt(u32[] a) {
+  u32[] r = powRaw(a, pPlusOneOverFour());
+  if (!fpEquals(fpSquare(r), a)) { return null; }
+  return r;
+}
+
+/** Whether the plain-form value is greater than (p−1)/2 — the sign convention for encodings. */
+export bool fpIsLexicographicallyLarger(u32[] a) {
+  u32[] v = fromMont(a);
+  u32[] half = u32[LIMBS]();
+  half[0] = 0xffffd555; half[1] = 0xdcff7fff; half[2] = 0x58a9ffff; half[3] = 0x0f55ffff;
+  half[4] = 0x7b587b12; half[5] = 0xb3986950; half[6] = 0x79c2895f; half[7] = 0xb23ba5c2;
+  half[8] = 0x21a5d66b; half[9] = 0x258dd3db; half[10] = 0x1cbff34d; half[11] = 0x0d0088f5;
+  for (i32 i = LIMBS - 1; i >= 0; i--) {
+    if (v[i] != half[i]) { return (v[i] as u64) > (half[i] as u64); }
+  }
+  return false;
+}

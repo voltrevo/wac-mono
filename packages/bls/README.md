@@ -15,7 +15,9 @@ Under construction, built in stages with an external oracle gating each one. Wha
 | stage | state |
 | ----- | ----- |
 | `Fp` — the 381-bit base field, Montgomery form | **done**, against Python |
-| `Fp2` / `Fp6` / `Fp12` — the tower | not started |
+| `Fp` inversion and square roots | **done**, against Python |
+| `Fp2` — the quadratic extension | **done**, against Python |
+| `Fp6` / `Fp12` — the rest of the tower | not started |
 | `G1` / `G2` — points, subgroup checks, compressed encoding | not started |
 | `hash_to_G2` — RFC 9380 | not started |
 | Miller loop and final exponentiation | not started |

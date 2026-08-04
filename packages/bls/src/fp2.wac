@@ -1,0 +1,106 @@
+// Fp2 = Fp[u]/(u² + 1) — the quadratic extension BLS12-381's G2 lives over.
+//
+// An element is `c0 + c1·u` with `u² = −1`, held as two field elements. That choice of
+// modulus is what makes the arithmetic cheap: multiplying out gives
+//
+//   (a0 + a1u)(b0 + b1u) = (a0b0 − a1b1) + (a0b1 + a1b0)u
+//
+// and the subtraction is the whole of the reduction. Karatsuba turns the four multiplications
+// into three, which matters because everything above this file is counted in Fp2 multiplies:
+// an Fp12 multiply is eighteen of them, and a pairing is thousands of those.
+//
+// ## The conjugation is not decoration
+//
+// `fp2Conjugate` negates c1, and it appears in the pairing's Frobenius maps and in the final
+// exponentiation, where it stands in for an inversion that would otherwise cost a modular
+// inverse. Getting its sign wrong produces a pairing that is self-consistent and disagrees
+// with every published vector — which is exactly why this package checks against external
+// values rather than against itself.
+
+import { fpAdd, fpSub, fpMul, fpNeg, fpSquare, fpZero, fpOne, fpIsZero, fpEquals, fpCopy,
+         fpFromBytes, fpToBytes } from "./fp.wac";
+
+/** `c0 + c1·u`. Both coefficients are in Montgomery form; see `fp.wac`. */
+export struct Fp2 {
+  u32[] c0;
+  u32[] c1;
+}
+
+export Fp2 fp2Zero() { return Fp2(fpZero(), fpZero()); }
+export Fp2 fp2One() { return Fp2(fpOne(), fpZero()); }
+export Fp2 fp2Copy(Fp2 a) { return Fp2(fpCopy(a.c0), fpCopy(a.c1)); }
+
+export bool fp2IsZero(Fp2 a) { return fpIsZero(a.c0) && fpIsZero(a.c1); }
+export bool fp2Equals(Fp2 a, Fp2 b) { return fpEquals(a.c0, b.c0) && fpEquals(a.c1, b.c1); }
+
+export Fp2 fp2Add(Fp2 a, Fp2 b) { return Fp2(fpAdd(a.c0, b.c0), fpAdd(a.c1, b.c1)); }
+export Fp2 fp2Sub(Fp2 a, Fp2 b) { return Fp2(fpSub(a.c0, b.c0), fpSub(a.c1, b.c1)); }
+export Fp2 fp2Neg(Fp2 a) { return Fp2(fpNeg(a.c0), fpNeg(a.c1)); }
+
+/** `c0 − c1·u`. Also the inverse of the p-power Frobenius on Fp2. */
+export Fp2 fp2Conjugate(Fp2 a) { return Fp2(fpCopy(a.c0), fpNeg(a.c1)); }
+
+/**
+ * Karatsuba: three Fp multiplications rather than four.
+ *
+ *   v0 = a0·b0,  v1 = a1·b1
+ *   c0 = v0 − v1
+ *   c1 = (a0 + a1)(b0 + b1) − v0 − v1
+ */
+export Fp2 fp2Mul(Fp2 a, Fp2 b) {
+  u32[] v0 = fpMul(a.c0, b.c0);
+  u32[] v1 = fpMul(a.c1, b.c1);
+  u32[] mid = fpMul(fpAdd(a.c0, a.c1), fpAdd(b.c0, b.c1));
+  return Fp2(fpSub(v0, v1), fpSub(fpSub(mid, v0), v1));
+}
+
+/**
+ * Squaring, in two multiplications rather than three.
+ *
+ *   c0 = (a0 + a1)(a0 − a1)      because a0² − a1² factors
+ *   c1 = 2·a0·a1
+ */
+export Fp2 fp2Square(Fp2 a) {
+  u32[] sum = fpAdd(a.c0, a.c1);
+  u32[] diff = fpSub(a.c0, a.c1);
+  u32[] prod = fpMul(a.c0, a.c1);
+  return Fp2(fpMul(sum, diff), fpAdd(prod, prod));
+}
+
+/** `a·u`, which is `(a0 + a1u)·u = −a1 + a0·u`. */
+export Fp2 fp2MulByU(Fp2 a) { return Fp2(fpNeg(a.c1), fpCopy(a.c0)); }
+
+/**
+ * `a·(1 + u)` — the non-residue ξ that builds Fp6 out of Fp2.
+ *
+ * Written out rather than composed from `fp2Mul` with a constant, because it is on the hot
+ * path of every Fp6 multiply and costs two additions this way instead of three
+ * multiplications.
+ */
+export Fp2 fp2MulByNonresidue(Fp2 a) {
+  return Fp2(fpSub(a.c0, a.c1), fpAdd(a.c0, a.c1));
+}
+
+/** `a·k` for a base-field scalar, used by the isogeny maps and the SSWU constants. */
+export Fp2 fp2MulByFp(Fp2 a, u32[] k) { return Fp2(fpMul(a.c0, k), fpMul(a.c1, k)); }
+
+export Fp2 fp2Double(Fp2 a) { return fp2Add(a, a); }
+
+/**
+ * The norm `a0² + a1²`, an element of Fp.
+ *
+ * This is `a · conjugate(a)`, whose u-part cancels — which is what makes inversion in Fp2
+ * one Fp inversion rather than a linear solve.
+ */
+export u32[] fp2Norm(Fp2 a) { return fpAdd(fpSquare(a.c0), fpSquare(a.c1)); }
+
+/** Two 48-byte coefficients, `c1` first as the Ethereum encodings order them. */
+export Fp2? fp2FromBytes(u8[] c1, u8[] c0) {
+  u32[]? x1 = fpFromBytes(c1);
+  u32[]? x0 = fpFromBytes(c0);
+  if ((x1 is null) || (x0 is null)) { return null; }
+  return Fp2(x0!, x1!);
+}
+
+export u8[] fp2C0Bytes(Fp2 a) { return fpToBytes(a.c0); }
+export u8[] fp2C1Bytes(Fp2 a) { return fpToBytes(a.c1); }

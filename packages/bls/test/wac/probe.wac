@@ -57,3 +57,62 @@ export bool blsFpIsZeroBytes(u8[] a) {
   u32[]? x = fpFromBytes(a);
   return (x is null) ? false : fpIsZero(x!);
 }
+
+// ── Inversion, roots, and Fp2 ─────────────────────────────────────────────────
+
+import { fpInvert, fpSqrt, fpIsLexicographicallyLarger } from "../../src/fp.wac";
+import { Fp2, fp2Add, fp2Sub, fp2Mul, fp2Square, fp2Conjugate, fp2MulByU,
+         fp2MulByNonresidue, fp2Norm, fp2FromBytes, fp2C0Bytes, fp2C1Bytes,
+         fp2Equals, fp2One, fp2Zero } from "../../src/fp2.wac";
+
+/** `a⁻¹`, or empty when `a` is zero. */
+export u8[] blsFpInvert(u8[] a) {
+  u32[]? x = fpFromBytes(a);
+  if (x is null) { return u8[0](); }
+  u32[]? r = fpInvert(x!);
+  return (r is null) ? u8[0]() : fpToBytes(r!);
+}
+
+/** A square root, or empty when there is none — the two cases a caller must tell apart. */
+export u8[] blsFpSqrt(u8[] a) {
+  u32[]? x = fpFromBytes(a);
+  if (x is null) { return u8[0](); }
+  u32[]? r = fpSqrt(x!);
+  return (r is null) ? u8[0]() : fpToBytes(r!);
+}
+
+export bool blsFpLarger(u8[] a) {
+  u32[]? x = fpFromBytes(a);
+  return (x is null) ? false : fpIsLexicographicallyLarger(x!);
+}
+
+Fp2? read2(u8[] c0, u8[] c1) { return fp2FromBytes(c1, c0); }
+
+/** Every Fp2 operation, selected by `op`, returning `c0 || c1` as 96 bytes. */
+export u8[] blsFp2Op(u8[] ac0, u8[] ac1, u8[] bc0, u8[] bc1, i32 op) {
+  Fp2? a = read2(ac0, ac1);
+  Fp2? b = read2(bc0, bc1);
+  if ((a is null) || (b is null)) { return u8[0](); }
+  Fp2 r = fp2Zero();
+  if (op == 0) { r = fp2Add(a!, b!); }
+  else if (op == 1) { r = fp2Sub(a!, b!); }
+  else if (op == 2) { r = fp2Mul(a!, b!); }
+  else if (op == 3) { r = fp2Square(a!); }
+  else if (op == 4) { r = fp2Conjugate(a!); }
+  else if (op == 5) { r = fp2MulByU(a!); }
+  else if (op == 6) { r = fp2MulByNonresidue(a!); }
+  else { return u8[0](); }
+  u8[] out = u8[96]();
+  u8[] lo = fp2C0Bytes(r);
+  u8[] hi = fp2C1Bytes(r);
+  for (i32 i = 0; i < 48; i++) { out[i] = lo[i]; out[48 + i] = hi[i]; }
+  return out;
+}
+
+export u8[] blsFp2Norm(u8[] ac0, u8[] ac1) {
+  Fp2? a = read2(ac0, ac1);
+  return (a is null) ? u8[0]() : fpToBytes(fp2Norm(a!));
+}
+
+/** `1·1 == 1` in Fp2 — a shape check on the identity, not a correctness claim. */
+export bool blsFp2OneIsIdempotent() { return fp2Equals(fp2Mul(fp2One(), fp2One()), fp2One()); }

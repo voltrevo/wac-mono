@@ -98,3 +98,80 @@ Deno.test("a value at or above p is refused, not reduced", () => {
     throw new Error("a 47-byte value was accepted");
   }
 });
+
+// ── Inversion, roots, and Fp2 ─────────────────────────────────────────────────
+
+const mod2 = mod as unknown as {
+  blsFpInvert(a: Uint8Array): Uint8Array;
+  blsFpSqrt(a: Uint8Array): Uint8Array;
+  blsFpLarger(a: Uint8Array): boolean;
+  blsFp2Op(ac0: Uint8Array, ac1: Uint8Array, bc0: Uint8Array, bc1: Uint8Array, op: number): Uint8Array;
+  blsFp2Norm(ac0: Uint8Array, ac1: Uint8Array): Uint8Array;
+  blsFp2OneIsIdempotent(): boolean;
+};
+type More = {
+  inv: { a: string; inv: string }[];
+  roots: { a: string; sqrt: string | null }[];
+  fp2: Record<string, { c0: string; c1: string } | string>[];
+};
+const w = v as unknown as Vectors & More;
+
+Deno.test("inversion agrees with Python, and zero has none", () => {
+  for (const c of w.inv) {
+    const got = hex(mod2.blsFpInvert(bytes(c.a)));
+    if (got !== c.inv) throw new Error(`inv(${c.a.slice(0, 12)}…)\n  got  ${got}\n  want ${c.inv}`);
+  }
+  if (mod2.blsFpInvert(bytes(v.unary[0].a)).length !== 0) {
+    throw new Error("zero was inverted");
+  }
+});
+
+Deno.test("square roots are found where they exist and refused where they do not", () => {
+  // Sixteen of thirty-three of these are squares. A routine that returned its exponentiation
+  // without checking would pass on those sixteen and hand a non-root back for the rest — and
+  // point decompression is fed attacker-controlled bytes, so that is a point off the curve
+  // going into a pairing.
+  let squares = 0;
+  for (const r of w.roots) {
+    const got = mod2.blsFpSqrt(bytes(r.a));
+    if (r.sqrt === null) {
+      if (got.length !== 0) throw new Error(`sqrt(${r.a.slice(0, 12)}…) returned a non-root`);
+    } else {
+      squares++;
+      // Either root is correct; the vector holds a^((p+1)/4), and the other is p − that.
+      const h = hex(got);
+      if (h !== r.sqrt) {
+        const neg = ((BigInt("0x" + w.p) - BigInt("0x" + h)) % BigInt("0x" + w.p))
+          .toString(16).padStart(96, "0");
+        if (neg !== r.sqrt) {
+          throw new Error(`sqrt(${r.a.slice(0, 12)}…)\n  got  ${h}\n  want ${r.sqrt} (or its negation)`);
+        }
+      }
+    }
+  }
+  if (squares === 0) throw new Error("no squares in the corpus — the vectors are wrong");
+});
+
+Deno.test("Fp2 arithmetic agrees with Python", () => {
+  const ops: [string, number][] = [
+    ["add", 0], ["sub", 1], ["mul", 2], ["sq", 3], ["conj", 4], ["mulByU", 5], ["mulByXi", 6],
+  ];
+  for (const c of w.fp2) {
+    const a = c.a as { c0: string; c1: string };
+    const b = c.b as { c0: string; c1: string };
+    for (const [name, op] of ops) {
+      const want = c[name] as { c0: string; c1: string };
+      const got = mod2.blsFp2Op(bytes(a.c0), bytes(a.c1), bytes(b.c0), bytes(b.c1), op);
+      const gotC0 = hex(got.subarray(0, 48));
+      const gotC1 = hex(got.subarray(48));
+      if (gotC0 !== want.c0 || gotC1 !== want.c1) {
+        throw new Error(`fp2 ${name}\n  got  c0=${gotC0} c1=${gotC1}\n  want c0=${want.c0} c1=${want.c1}`);
+      }
+    }
+    const norm = hex(mod2.blsFp2Norm(bytes(a.c0), bytes(a.c1)));
+    if (norm !== c.norm as string) {
+      throw new Error(`fp2 norm\n  got  ${norm}\n  want ${c.norm}`);
+    }
+  }
+  if (!mod2.blsFp2OneIsIdempotent()) throw new Error("1·1 != 1 in Fp2");
+});

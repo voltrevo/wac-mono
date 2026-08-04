@@ -38,7 +38,43 @@ def main() -> None:
     # Every one of these is a valid 48-byte string and an invalid field element.
     bad = [h(P), h(P + 1), h((1 << 384) - 1), h(P + 12345)]
 
-    print(json.dumps({"p": h(P), "one": h(1), "cases": cases, "unary": unary, "bad": bad}, indent=0))
+    # Inversion and square roots. `sqrt` is None where the value is not a square, which is
+    # roughly half of them — and the implementation must say so rather than return a non-root,
+    # because point decompression feeds it attacker-controlled bytes.
+    inv = [{"a": h(a), "inv": h(pow(a, -1, P))} for a in vals if a != 0]
+    roots = []
+    for a in vals:
+        r = pow(a, (P + 1) // 4, P)
+        roots.append({"a": h(a), "sqrt": h(r) if r * r % P == a else None})
+
+    # Fp2 = Fp[u]/(u²+1). Coefficients as (c0, c1), so a = c0 + c1·u.
+    def f2mul(x, y):
+        return ((x[0] * y[0] - x[1] * y[1]) % P, (x[0] * y[1] + x[1] * y[0]) % P)
+
+    def f2(x):
+        return {"c0": h(x[0]), "c1": h(x[1])}
+
+    pairs = [(vals[i], vals[(i * 7 + 3) % len(vals)]) for i in range(len(vals))]
+    fp2 = []
+    for i in range(len(pairs)):
+        a = pairs[i]
+        b = pairs[(i * 5 + 1) % len(pairs)]
+        # ξ = 1 + u, the non-residue that builds Fp6 over Fp2.
+        xi = f2mul(a, (1, 1))
+        fp2.append({
+            "a": f2(a), "b": f2(b),
+            "add": f2(((a[0] + b[0]) % P, (a[1] + b[1]) % P)),
+            "sub": f2(((a[0] - b[0]) % P, (a[1] - b[1]) % P)),
+            "mul": f2(f2mul(a, b)),
+            "sq": f2(f2mul(a, a)),
+            "conj": f2((a[0], (-a[1]) % P)),
+            "mulByU": f2(f2mul(a, (0, 1))),
+            "mulByXi": f2(xi),
+            "norm": h((a[0] * a[0] + a[1] * a[1]) % P),
+        })
+
+    print(json.dumps({"p": h(P), "one": h(1), "cases": cases, "unary": unary, "bad": bad,
+                      "inv": inv, "roots": roots, "fp2": fp2}, indent=0))
 
 
 if __name__ == "__main__":
