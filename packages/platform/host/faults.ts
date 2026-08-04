@@ -80,6 +80,17 @@ export function faultOf(e: unknown): number {
 }
 
 /** The payload a `Change` is decoded from: the category, then the message. */
+/**
+ * A failed *call's* payload: the category, then the host's message.
+ *
+ * The same shape `changeBytes` gives a mutation's answer, and for the same reason — a caller has to be
+ * able to branch on the category without reading English. This one rides the bridge's error envelope,
+ * so it covers every capability rather than the two that answer with a `Change`. wac-mono 0062.
+ */
+export function faultedBytes(fault: number, message: string): Uint8Array {
+  return changeBytes(fault, message);
+}
+
 export function changeBytes(fault: number, message: string): Uint8Array {
   const text = new TextEncoder().encode(message);
   const out = new Uint8Array(text.length + 1);

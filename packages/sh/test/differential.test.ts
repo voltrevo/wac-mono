@@ -1224,6 +1224,53 @@ Deno.test({
  * marks in a UTF-8 locale and with apostrophes in C.
  */
 Deno.test({
+  name: "a file that cannot be read is reported in GNU's own words",
+  ignore: !haveBash,
+  fn: async () => {
+    // The *reason* used to be the host's: "No such file or directory (os error 2): readfile
+    // '/tmp/x/missing'" under Deno, and "ENOENT: no such file or directory, open '…'" under Node — one
+    // fact, three spellings, none of them GNU's four words. `FileResult` carries a fault category now
+    // (wac-mono 0062), so each program translates the category rather than printing the sentence.
+    //
+    // The whole line is compared, not just the reason: each of these tools words the *prefix*
+    // differently too — `head` says "cannot open 'x' for reading", `sort` says "cannot read: x", `rev`
+    // says "cannot open x" — and those were already matched, which is what makes the whole line
+    // comparable now that the reason is.
+    const dir = await Deno.makeTempDir({ prefix: "sh-unread-" });
+    try {
+      const cases = [
+        "cat missing",
+        "wc -l missing",
+        "head -1 missing",
+        "tail -1 missing",
+        "sort missing",
+        "uniq missing",
+        "rev missing",
+        "nl missing",
+        "grep x missing",
+      ];
+      for (const script of cases) {
+        const run = (cmd: string, args: string[]) =>
+          new Deno.Command(cmd, {
+            args,
+            cwd: dir,
+            stdin: "null",
+            stdout: "null",
+            stderr: "piped",
+            env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+            clearEnv: true,
+          }).outputSync();
+        const theirs = new TextDecoder().decode(run("bash", ["-c", script]).stderr).trim();
+        const ours = new TextDecoder().decode(run(wacshBinary, ["-c", script]).stderr).trim();
+        assertEquals(ours, theirs, script);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "mkdir and rm say what GNU says when they fail",
   ignore: !haveBash,
   fn: async () => {

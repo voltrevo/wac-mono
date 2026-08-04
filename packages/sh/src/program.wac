@@ -21,7 +21,8 @@
 import { Vec } from "../../std/src/vec.wac";
 import { resolvePath } from "./path.wac";
 import { Buf } from "../../bytes/src/buf.wac";
-import { Cli, FileResult } from "../../platform/src/platform.wac";
+import { Cli, FAULT_DENIED, FAULT_NOT_EMPTY, FAULT_NOT_FOUND, FileResult }
+  from "../../platform/src/platform.wac";
 
 export struct Output {
   u8[] out;
@@ -309,8 +310,24 @@ Vec<string> inputsOf(Vec<string> operands) {
 Reading readOne(Cli cli, string cwd, string name, u8[] stdin) {
   if (name == "" || name == "-") { return Reading(true, name, stdin, ""); }
   FileResult f = cli.readFile(resolvePath(cwd, name)).wait();
-  if (!f.ok) { return Reading(false, name, u8[0](), f.error); }
+  if (!f.ok) { return Reading(false, name, u8[0](), whyUnread(f)); }
   return Reading(true, name, f.bytes, "");
+}
+
+/**
+ * Why a file could not be read, in GNU's words where the category is one GNU has a phrase for.
+ *
+ * The host's own sentence carried an errno and an absolute path — "No such file or directory (os error
+ * 2): readfile '/tmp/x/missing'" — and differed by runtime, where GNU says four words. `FileResult`
+ * carries the category now (wac-mono 0062), so this is the same translation `reasonOf` does for a
+ * mutation, on the side that reads. Anything uncategorised keeps the host's sentence, which is the only
+ * text left that says anything.
+ */
+string whyUnread(FileResult f) {
+  if (f.fault == FAULT_NOT_FOUND()) { return "No such file or directory"; }
+  if (f.fault == FAULT_DENIED()) { return "Permission denied"; }
+  if (f.fault == FAULT_NOT_EMPTY()) { return "Directory not empty"; }
+  return f.error;
 }
 
 /**
@@ -479,7 +496,7 @@ Output cat(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
     // looked in whichever directory the process had started in.
     FileResult f = cli.readFile(resolvePath(cwd, path)).wait();
     if (!f.ok) {
-      return Output.fail(("cat: " + path + ": " + f.error + "\n").toBytes(), 1);
+      return Output.fail(("cat: " + path + ": " + whyUnread(f) + "\n").toBytes(), 1);
     }
     out.pushAll(f.bytes);
   }

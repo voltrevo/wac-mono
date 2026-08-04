@@ -44,7 +44,31 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 /** Raised when a capability reports failure. The message is the host's. */
-export class HostCallError extends Error {}
+/**
+ * A capability that failed, with the *category* of the failure beside its message.
+ *
+ * The category travels because the message cannot be branched on: "No such file or directory (os error
+ * 2)" from Deno, "ENOENT: no such file or directory" from Node and `NotFoundError` from OPFS are three
+ * spellings of one fact, and a program that wants to say what GNU says about a missing file had to
+ * either parse English or print the host's sentence. The mutating side of the world has had a category
+ * since `Change` existed; this is the same one, for everything that fails. wac-mono 0062.
+ *
+ * `FAULT_OTHER` when the host said nothing a classifier could use, which is what an unclassified error
+ * has always meant.
+ */
+export class HostCallError extends Error {
+  readonly fault: number;
+  constructor(message: string, fault = 5) {
+    super(message);
+    this.fault = fault;
+  }
+}
+
+/** Split an error payload into its category byte and its message. */
+export function faultedMessage(bytes: Uint8Array): { fault: number; message: string } {
+  if (bytes.length === 0) return { fault: 5, message: "" };
+  return { fault: bytes[0], message: new TextDecoder().decode(bytes.subarray(1)) };
+}
 
 /**
  * What a slot's opcode was, for diagnostics only.
@@ -169,9 +193,9 @@ export function submit(b: Bridge, op: number, payload: Uint8Array): Ticket {
     ping(b);
     awaitReady(b, slot);
     if (Atomics.load(b.ctrl, at + S_RES_STATUS) === STATUS_ERR) {
-      const msg = dec.decode(b.res(slot).slice(0, Atomics.load(b.ctrl, at + S_RES_LEN)));
+      const said = faultedMessage(b.res(slot).slice(0, Atomics.load(b.ctrl, at + S_RES_LEN)));
       release(b, slot);
-      throw new HostCallError(msg);
+      throw new HostCallError(said.message, said.fault);
     }
     sent += SLOT_BUF;   // acknowledged; the host is waiting for the next piece
   }
@@ -236,7 +260,8 @@ export function collect(b: Bridge, t: Ticket): Uint8Array {
     const chunk = b.res(t.slot).slice(0, len);   // a copy: the slot gets reused
     if (status === STATUS_ERR) {
       release(b, t.slot);
-      throw new HostCallError(dec.decode(chunk));
+      const said = faultedMessage(chunk);
+      throw new HostCallError(said.message, said.fault);
     }
     parts.push(chunk);
     if (status !== STATUS_MORE) break;

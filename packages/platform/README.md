@@ -133,6 +133,16 @@ The categories are deliberately few, and `FAULT_OTHER` is not an embarrassment: 
 a taxonomy nobody branches on. What a program branches on is "was it already gone"; what a person
 reads is the message.
 
+**Everything that fails carries one, not only the four that answer with a `Change`.** A capability that
+fails does so by throwing, and the bridge's error envelope now begins with the category byte — so
+`HostCallError` has a `fault`, `FileResult` has a `fault`, and the classification happens once in
+`respond.ts` rather than at each of the forty handlers. The reads needed it as much as the writes:
+`packages/sh`'s nine file-reading programs printed "No such file or directory (os error 2): readfile
+'/tmp/x/missing'" where GNU prints four words, and the sentence differed by runtime — Node says
+"ENOENT: no such file or directory, open '…'" for the same fact. All nine now match GNU's stderr line
+for line, which a differential test checks against the installed coreutils.
+[0062](../../issues/closed/0062-a-read-failure-has-no-fault-category-so-nine-programs-print-the-hosts-wording.md).
+
 **In a browser the message is the category's own short phrase**, not the `DOMException`'s — for a
 failed *read* as much as a failed change, since one tab speaking two ways about the same failure is
 worse than either way. A read reports by throwing, so the rephrasing happens where the throw does; a

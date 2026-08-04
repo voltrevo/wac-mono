@@ -99,9 +99,23 @@ export struct Pending<T> {
 export struct FileResult {
   bool ok;
   u8[] bytes;
+  /** The host's own sentence, which is the only text worth showing a person. */
   string error;
+  /**
+   * Which `FAULT_*` this was — `FAULT_NONE` when `ok`.
+   *
+   * The message cannot be branched on: "No such file or directory (os error 2)" from Deno, "ENOENT: no
+   * such file or directory" from Node and a `NotFoundError` from the Origin Private File System are
+   * three spellings of one fact. A program that wanted to say what GNU says about a missing file had to
+   * parse English or print the host's sentence, and nine programs in `packages/sh` printed the
+   * sentence. The mutating side has had a category since `Change` existed; this is the same one, on the
+   * side that reads. wac-mono 0062.
+   */
+  i32 fault;
 
-  FileResult of(bool ok, u8[] bytes, string error) { return FileResult(ok, bytes, error); }
+  FileResult of(bool ok, u8[] bytes, string error, i32 fault) {
+    return FileResult(ok, bytes, error, fault);
+  }
 }
 
 /**

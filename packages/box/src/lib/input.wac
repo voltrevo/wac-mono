@@ -3,10 +3,19 @@
 // That an applet works in a pipe at all is this file: without `readStdin` every one of
 // them would be a file-to-file tool.
 
-import { Cli, Core, FileResult } from "../../../platform/src/platform.wac";
+import { Cli, Core, FAULT_DENIED, FAULT_NOT_EMPTY, FAULT_NOT_FOUND, FileResult }
+  from "../../../platform/src/platform.wac";
 import { Args } from "./args.wac";
 
 export struct Input { bool ok; u8[] bytes; string label; }
+
+/** Why a file could not be read, in the words the real tools use. */
+export string whyUnread(FileResult f) {
+  if (f.fault == FAULT_NOT_FOUND()) { return "No such file or directory"; }
+  if (f.fault == FAULT_DENIED()) { return "Permission denied"; }
+  if (f.fault == FAULT_NOT_EMPTY()) { return "Directory not empty"; }
+  return f.error;
+}
 
 /**
  * The same choice, for the streaming pair.
@@ -32,7 +41,10 @@ export Input readInput(Core core, Cli cli, Args a, i32 n) {
   string path = a.rest[n];
   FileResult f = cli.readFile(path).wait();
   if (!f.ok) {
-    core.warn(a.name + ": " + path + ": " + f.error);
+    // GNU's words where the category has them, and the host's sentence where it does not: "No such file
+    // or directory (os error 2): readfile '/tmp/x'" is one runtime's spelling of four words, and it
+    // differed by runtime. `FileResult.fault` is what makes the translation possible — wac-mono 0062.
+    core.warn(a.name + ": " + path + ": " + whyUnread(f));
     return Input(false, u8[0](), path);
   }
   return Input(true, f.bytes, path);

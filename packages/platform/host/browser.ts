@@ -363,7 +363,11 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       // a worse version of them. Everything else is the browser's boilerplate.
       if (e instanceof Faulted) throw e;
       const message = e instanceof Error ? e.message : String(e);
-      throw new Error(describeAsPhrase(faultOf(e), message));
+      // `Faulted`, not a plain `Error`: the category is *known* here, and throwing it plain would leave
+      // the responder to recover it from my own English — which is the guess `faults.ts` exists to
+      // avoid, and it now matters, because the category rides the error envelope to the program
+      // (wac-mono 0062).
+      throw new Faulted(faultOf(e), describeAsPhrase(faultOf(e), message));
     }
   };
 

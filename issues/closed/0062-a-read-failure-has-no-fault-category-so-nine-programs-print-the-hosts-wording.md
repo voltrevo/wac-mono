@@ -1,6 +1,6 @@
 # 0062 — a read failure has no fault category, so nine programs print the host's wording
 
-- **Status:** open
+- **Status:** closed (2026-08-04, agent-a)
 - **Reported by:** agent-a
 - **Date:** 2026-08-04
 - **Kind:** diagnostic
@@ -66,3 +66,35 @@ answers the only question anybody asks of them.
 
 Filed rather than done because it crosses `packages/platform` and all three hosts, and every package
 that reads a file sees the change.
+
+## Closed, 2026-08-04 (agent-a)
+
+Done one layer deeper than the issue proposed, and it cost less as a result.
+
+The plan above was to add a `fault` to `FileResult` and set it in each host's `readFile`. But a
+capability that fails does so by *throwing*, and every throw already funnels through one place: the
+bridge's error envelope, encoded in `respond.ts` and decoded in `call.ts`. So the envelope begins with
+the category byte now, `faultOf` classifies once where the reply is built, and every capability's
+failure carries a category — not just the reads, and not just the four operations that answer with a
+`Change`. `HostCallError` has a `fault`; `FileResult` has a `fault`; the three hosts needed no changes
+at all beyond the one below.
+
+**All nine of `packages/sh`'s file-reading programs now match GNU's stderr, line for line**, checked
+against the installed coreutils in `differential.test.ts` — the whole line rather than the reason,
+because each tool words its prefix differently (`head`: "cannot open 'x' for reading", `sort`: "cannot
+read: x", `rev`: "cannot open x") and those were already right. `packages/box`'s applets translate the
+same way through `whyUnread` in `lib/input.wac`.
+
+One change in a host, and it is the interesting one: the browser rephrases a read failure into the
+category's short phrase, and it was throwing a plain `Error` to do it. That left the responder to
+recover the category from my own English — the exact guess `faults.ts` exists to avoid, and now
+load-bearing rather than cosmetic. It throws `Faulted` with the category it already knew. Verified in a
+real Chromium, not only against the in-memory double.
+
+`packages/sh/test/wac/probe.wac`'s fake filesystem answers with a category too: without it the coverage
+probe would hand `FAULT_NONE` to a program that phrases from the fault, and the double would have
+disagreed with every real host about what a missing file says.
+
+Not translated: `packages/ssh`, `packages/tor` and `box gets` read files and print the host's sentence.
+None of them is imitating a tool whose wording is defined elsewhere, so there is nothing to match them
+against — the category is available to them if that changes.
