@@ -5,6 +5,10 @@ import { hashPair, zeroHash, merkleize, mixInLength, padToChunks, chunkCount, ne
          bitlistLength, floorLog2, subtreeIndex, isValidMerkleBranch,
          isValidNormalizedMerkleBranch } from "../../src/merkle.wac";
 import { hashTreeRoot, isFixed, fixedSize } from "../../src/container.wac";
+import { beaconTypes, beaconFields, TY_BEACON_BLOCK_HEADER, TY_SIGNING_DATA, TY_SYNC_COMMITTEE,
+         TY_SYNC_AGGREGATE, TY_LIGHT_CLIENT_HEADER, TY_LIGHT_CLIENT_BOOTSTRAP,
+         TY_LIGHT_CLIENT_UPDATE, TY_LIGHT_CLIENT_FINALITY_UPDATE,
+         TY_LIGHT_CLIENT_OPTIMISTIC_UPDATE } from "../../src/beacon.wac";
 
 export u8[] sszHashPair(u8[] a, u8[] b) { return hashPair(a, b); }
 export u8[] sszZeroHash(i32 d) { return zeroHash(d); }
@@ -42,3 +46,27 @@ export u8[] sszHashTreeRoot(i32[] types, i32[] fields, i32 root, u8[] data) {
 
 export bool sszIsFixed(i32[] types, i32[] fields, i32 i) { return isFixed(types, fields, i); }
 export i32 sszFixedSize(i32[] types, i32[] fields, i32 i) { return fixedSize(types, fields, i); }
+
+/** `hash_tree_root` of a beacon type, named by index; empty when refused. */
+export u8[] sszBeaconRoot(i32 ty, u8[] data) {
+  u8[]? r = hashTreeRoot(beaconTypes(), beaconFields(), ty, data);
+  return (r is null) ? u8[0]() : r!;
+}
+
+export i32 sszBeaconFixedSize(i32 ty) {
+  return fixedSize(beaconTypes(), beaconFields(), ty);
+}
+export bool sszBeaconIsFixed(i32 ty) { return isFixed(beaconTypes(), beaconFields(), ty); }
+
+/** The type index for each container name the fixtures use. */
+export i32 sszTyFor(i32 which) {
+  if (which == 0) { return TY_BEACON_BLOCK_HEADER(); }
+  if (which == 1) { return TY_SIGNING_DATA(); }
+  if (which == 2) { return TY_SYNC_COMMITTEE(); }
+  if (which == 3) { return TY_SYNC_AGGREGATE(); }
+  if (which == 4) { return TY_LIGHT_CLIENT_HEADER(); }
+  if (which == 5) { return TY_LIGHT_CLIENT_BOOTSTRAP(); }
+  if (which == 6) { return TY_LIGHT_CLIENT_UPDATE(); }
+  if (which == 7) { return TY_LIGHT_CLIENT_FINALITY_UPDATE(); }
+  return TY_LIGHT_CLIENT_OPTIMISTIC_UPDATE();
+}

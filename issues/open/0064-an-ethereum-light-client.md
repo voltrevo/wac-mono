@@ -1,6 +1,6 @@
-# 0064 — an Ethereum light client, blocked on SSZ
+# 0064 — an Ethereum light client
 
-- **Status:** open — **blocked on 0063**
+- **Status:** open — **unblocked**, 0063 closed 2026-08-04
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-b
 - **Date:** 2026-08-04
@@ -18,7 +18,7 @@ per update. Almost all of it already exists here; this issue is the bookkeeping 
 | SHA-256 | `packages/crypto` |
 | HTTPS to a beacon API | `packages/tls` (TLS 1.3 in wac; `box gets` already fetches over it) + `packages/http` |
 | parsing the response | `packages/json` |
-| SSZ `hash_tree_root`, Merkle branches | **missing — 0063** |
+| SSZ `hash_tree_root`, Merkle branches | **done** — `packages/ssz`, 1,093 Ethereum vectors |
 | the sync protocol itself | this issue |
 
 **The BLS call is the plain CFRG one.** Verified against
@@ -60,4 +60,4 @@ The shape suits wac unusually well: the sync protocol is a state machine over by
 ambient I/O, which is what this language is comfortable with, and the two heaviest primitives
 underneath it are already written and measured here.
 
-Sequence: 0063's vectors, then 0063's `packages/ssz`, then this.
+Sequence: 0063's vectors and `packages/ssz` are done. This is next, and nothing external blocks it.

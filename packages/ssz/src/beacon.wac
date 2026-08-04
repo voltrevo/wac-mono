@@ -1,0 +1,141 @@
+// The SSZ types an Altair light client touches, as descriptors for `container.wac`.
+//
+// Nine containers and the byte-vector types they are built from, laid out as one flat table so a
+// caller passes `beaconTypes()` and `beaconFields()` to `hashTreeRoot` and names a root with one of
+// the `TY_*` functions. That is the whole of it — no per-container code — which is what the
+// schema-driven root in `container.wac` bought.
+//
+// Layouts transcribed from the specs rather than recalled:
+//
+//   BeaconBlockHeader, SigningData    specs/phase0/beacon-chain.md
+//   SyncCommittee, SyncAggregate      specs/altair/beacon-chain.md
+//   LightClient*                      specs/altair/light-client/sync-protocol.md
+//
+// **Every one of these is fixed-size**, which is worth knowing before debugging: there is no list
+// anywhere in a light client's types, so the offset machinery in `container.wac` is not exercised by
+// them at all. A wrong root here is a wrong descriptor, not a wrong offset.
+//
+// The serialized sizes fall out of the table and match Ethereum's own vectors byte for byte, which is
+// the cheapest possible check that the descriptors are right:
+//
+//   BeaconBlockHeader              112
+//   LightClientOptimisticUpdate    280
+//   LightClientFinalityUpdate      584
+//   LightClientBootstrap        24,896
+//   LightClientUpdate           25,368
+//
+// `mainnet`: SYNC_COMMITTEE_SIZE is 512. Under `minimal` it is 32 and every SyncCommittee-bearing
+// root differs, so a descriptor table is per-config and this one says which.
+
+/** Sync committee size, mainnet. The one number here that is a config choice rather than a type. */
+export const i32 SYNC_COMMITTEE_SIZE = 512;
+
+// Branch lengths are `floorlog2` of the generalized index the branch proves, so they are derived from
+// the BeaconState layout rather than chosen: FINALIZED_ROOT_GINDEX 105 -> 6,
+// CURRENT_SYNC_COMMITTEE_GINDEX 54 -> 5, NEXT_SYNC_COMMITTEE_GINDEX 55 -> 5.
+export const i32 FINALITY_BRANCH_DEPTH = 6;
+export const i32 SYNC_COMMITTEE_BRANCH_DEPTH = 5;
+
+// ── Type indices ──────────────────────────────────────────────────────────────
+//
+// Hand-numbered, and deliberately checked by 45 Ethereum vectors rather than by care: an index typed
+// one out gives a root that is wrong and self-consistent, which is the failure this package keeps
+// finding. `test/beacon_wac.test.ts` also asserts every serialized size above.
+
+export i32 TY_UINT8() { return 0; }
+export i32 TY_UINT64() { return 1; }
+export i32 TY_BYTES32() { return 2; }
+export i32 TY_BYTES48() { return 3; }
+export i32 TY_BYTES96() { return 4; }
+export i32 TY_BEACON_BLOCK_HEADER() { return 5; }
+export i32 TY_SIGNING_DATA() { return 6; }
+export i32 TY_PUBKEY_VECTOR() { return 7; }
+export i32 TY_SYNC_COMMITTEE() { return 8; }
+export i32 TY_SYNC_COMMITTEE_BITS() { return 9; }
+export i32 TY_SYNC_AGGREGATE() { return 10; }
+export i32 TY_LIGHT_CLIENT_HEADER() { return 11; }
+export i32 TY_SYNC_BRANCH() { return 12; }
+export i32 TY_FINALITY_BRANCH() { return 13; }
+export i32 TY_LIGHT_CLIENT_BOOTSTRAP() { return 14; }
+export i32 TY_LIGHT_CLIENT_UPDATE() { return 15; }
+export i32 TY_LIGHT_CLIENT_FINALITY_UPDATE() { return 16; }
+export i32 TY_LIGHT_CLIENT_OPTIMISTIC_UPDATE() { return 17; }
+
+/**
+ * The type table: four `i32`s per entry — kind, param, child, count.
+ *
+ * Kinds match `container.wac`: 0 basic, 1 bitvector, 2 bitlist, 3 vector, 4 list, 5 container.
+ */
+export i32[] beaconTypes() {
+  i32[] t = i32[18 * 4]();
+
+  //                    kind  param                     child                 count
+  put(t, 0,             0,    1,                        0,                    0);   // uint8
+  put(t, 1,             0,    8,                        0,                    0);   // uint64 (Slot, ValidatorIndex)
+  put(t, 2,             3,    32,                       0,                    0);   // Bytes32 = Vector[uint8, 32]
+  put(t, 3,             3,    48,                       0,                    0);   // BLSPubkey = Bytes48
+  put(t, 4,             3,    96,                       0,                    0);   // BLSSignature = Bytes96
+
+  // BeaconBlockHeader: slot, proposer_index, parent_root, state_root, body_root
+  put(t, 5,             5,    0,                        0,                    5);
+  // SigningData: object_root, domain
+  put(t, 6,             5,    0,                        5,                    2);
+  // Vector[BLSPubkey, SYNC_COMMITTEE_SIZE]
+  put(t, 7,             3,    SYNC_COMMITTEE_SIZE,      3,                    0);
+  // SyncCommittee: pubkeys, aggregate_pubkey
+  put(t, 8,             5,    0,                        7,                    2);
+  // BitVector[SYNC_COMMITTEE_SIZE]
+  put(t, 9,             1,    SYNC_COMMITTEE_SIZE,      0,                    0);
+  // SyncAggregate: sync_committee_bits, sync_committee_signature
+  put(t, 10,            5,    0,                        9,                    2);
+  // LightClientHeader: beacon
+  put(t, 11,            5,    0,                        11,                   1);
+  // Vector[Bytes32, 5] and Vector[Bytes32, 6] — the two branch shapes
+  put(t, 12,            3,    SYNC_COMMITTEE_BRANCH_DEPTH, 2,                 0);
+  put(t, 13,            3,    FINALITY_BRANCH_DEPTH,    2,                    0);
+  // LightClientBootstrap: header, current_sync_committee, current_sync_committee_branch
+  put(t, 14,            5,    0,                        12,                   3);
+  // LightClientUpdate: attested_header, next_sync_committee, next_sync_committee_branch,
+  //                    finalized_header, finality_branch, sync_aggregate, signature_slot
+  put(t, 15,            5,    0,                        15,                   7);
+  // LightClientFinalityUpdate: attested_header, finalized_header, finality_branch,
+  //                            sync_aggregate, signature_slot
+  put(t, 16,            5,    0,                        22,                   5);
+  // LightClientOptimisticUpdate: attested_header, sync_aggregate, signature_slot
+  put(t, 17,            5,    0,                        27,                   3);
+  return t;
+}
+
+void put(i32[] t, i32 i, i32 kind, i32 param, i32 child, i32 count) {
+  t[i * 4 + 0] = kind;
+  t[i * 4 + 1] = param;
+  t[i * 4 + 2] = child;
+  t[i * 4 + 3] = count;
+}
+
+/**
+ * Every container's field types, concatenated. A container's `child` is where its run starts and
+ * `count` is how long it is.
+ */
+export i32[] beaconFields() {
+  i32[] f = i32[30]();
+  // 0..4  BeaconBlockHeader
+  f[0] = 1;  f[1] = 1;  f[2] = 2;  f[3] = 2;  f[4] = 2;
+  // 5..6  SigningData
+  f[5] = 2;  f[6] = 2;
+  // 7..8  SyncCommittee
+  f[7] = 7;  f[8] = 3;
+  // 9..10 SyncAggregate
+  f[9] = 9;  f[10] = 4;
+  // 11    LightClientHeader
+  f[11] = 5;
+  // 12..14 LightClientBootstrap
+  f[12] = 11; f[13] = 8;  f[14] = 12;
+  // 15..21 LightClientUpdate
+  f[15] = 11; f[16] = 8;  f[17] = 12; f[18] = 11; f[19] = 13; f[20] = 10; f[21] = 1;
+  // 22..26 LightClientFinalityUpdate
+  f[22] = 11; f[23] = 11; f[24] = 13; f[25] = 10; f[26] = 1;
+  // 27..29 LightClientOptimisticUpdate
+  f[27] = 11; f[28] = 10; f[29] = 1;
+  return f;
+}
