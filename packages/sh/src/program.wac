@@ -23,6 +23,7 @@ import { resolvePath } from "./path.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Cli, FAULT_DENIED, FAULT_NOT_EMPTY, FAULT_NOT_FOUND, FileResult }
   from "../../platform/src/platform.wac";
+import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../platform/src/stream.wac";
 
 export struct Output {
   u8[] out;
@@ -42,24 +43,80 @@ export struct Output {
  * The one place that knows external commands are not real processes. Everything above it is
  * written as though they were.
  */
+/**
+ * The seam, for a caller that has the input as bytes and wants the output as bytes.
+ *
+ * Unchanged in signature and in behaviour: a shell that cannot spawn calls this, and the sinks it
+ * passes collect rather than write. What changed is underneath — a program now *writes as it goes*, so
+ * the same body streams when it is spawned as a worker. wac-mono 0061.
+ */
 export Output run(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
   if (argv.len() == 0) { return Output.missing(); }
+  if (!isProgram(argv.get(0))) { return Output.missing(); }
+  Sink sink = Sink.toBuffer(cli);
+  Sink errs = Sink.toBuffer(cli);
+  Feed fed = Feed.of(cli, stdin);
+  i32 status = dispatchProgram(cli, cwd, argv, fed, sink, errs);
+  return Output(sink.taken(), errs.taken(), status, true);
+}
+
+/**
+ * The same programs, streaming: input pulled a chunk at a time, output written as it is produced.
+ *
+ * This is what a *spawned* one runs. `sh.wac`'s `main` dispatches to it when its first argument names
+ * one of these, which makes the shell a multi-call program — `packages/box` is one already — and that is
+ * what lets the shell run its own twelve as real children. Two entry points over one dispatcher rather
+ * than two implementations, which is the whole reason `Sink` can also collect.
+ */
+export i32 runStreaming(Cli cli, string cwd, Vec<string> argv) {
+  if (argv.len() == 0) { return 127; }
+  if (!isProgram(argv.get(0))) { return 127; }
+  Sink sink = Sink.toOutput(cli);
+  Sink errs = Sink.toErr(cli);
+  Feed fed = Feed.fromStdin(cli);
+  i32 status = dispatchProgram(cli, cwd, argv, fed, sink, errs);
+  sink.flush();
+  errs.flush();
+  return status;
+}
+
+/** Whether this name is one of the twelve. */
+export bool isProgram(string name) {
+  Vec<string> mine = names();
+  for (i32 i = 0; i < mine.len(); i++) {
+    if (mine.get(i) == name) { return true; }
+  }
+  return false;
+}
+
+i32 dispatchProgram(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
   string name = argv.get(0);
+  if (name == "cat") { return cat(cli, cwd, argv, fed, sink, errs); }
+  if (name == "wc") { return wc(cli, cwd, argv, fed, sink, errs); }
+  if (name == "head") { return head(cli, cwd, argv, fed, sink, errs); }
+  if (name == "tail") { return tail(cli, cwd, argv, fed, sink, errs); }
+  if (name == "rev") { return rev(cli, cwd, argv, fed, sink, errs); }
+  if (name == "sort") { return sort(cli, cwd, argv, fed, sink, errs); }
+  if (name == "uniq") { return uniq(cli, cwd, argv, fed, sink, errs); }
+  if (name == "grep") { return grep(cli, cwd, argv, fed, sink, errs); }
+  if (name == "tr") { return tr(argv, fed, sink, errs); }
+  if (name == "seq") { return seq(argv, sink, errs); }
+  if (name == "nl") { return nl(cli, cwd, argv, fed, sink, errs); }
+  if (name == "printf") { return printf(argv, sink, errs); }
+  return 127;
+}
 
-  if (name == "cat") { return cat(cli, cwd, argv, stdin); }
-  if (name == "wc") { return wc(cli, cwd, argv, stdin); }
-  if (name == "head") { return head(cli, cwd, argv, stdin); }
-  if (name == "tail") { return tail(cli, cwd, argv, stdin); }
-  if (name == "rev") { return rev(cli, cwd, argv, stdin); }
-  if (name == "sort") { return sort(cli, cwd, argv, stdin); }
-  if (name == "uniq") { return uniq(cli, cwd, argv, stdin); }
-  if (name == "grep") { return grep(cli, cwd, argv, stdin); }
-  if (name == "tr") { return tr(argv, stdin); }
-  if (name == "seq") { return seq(argv); }
-  if (name == "nl") { return nl(cli, cwd, argv, stdin); }
-  if (name == "printf") { return printf(argv); }
-
-  return Output.missing();
+/**
+ * The same twelve as a `string[]`, which is the shape `Shell.externalNames` wants.
+ *
+ * Two spellings of one list rather than a conversion at the call site: `names()` is what the tests and
+ * `isProgram` read, and a funcref field cannot take a `Vec`-returning function.
+ */
+export string[] programNames() {
+  Vec<string> mine = names();
+  string[] out = string[mine.len()](fill: "");
+  for (i32 i = 0; i < mine.len(); i++) { out[i] = mine.get(i); }
+  return out;
 }
 
 /** Every name `run` will answer to, so `help` and the tests do not have to guess. */
@@ -96,9 +153,9 @@ export Vec<string> names() {
  * Escapes are processed in the *format*, which is why `printf` is the way to emit a line with no
  * trailing newline and `echo` is not.
  */
-Output printf(Vec<string> argv) {
+i32 printf(Vec<string> argv, Sink sink, Sink errs) {
   if (argv.len() < 2) {
-    return Output.fail("printf: usage: printf format [arguments]\n".toBytes(), 2);
+    { errs.bytes("printf: usage: printf format [arguments]\n".toBytes()); errs.flush(); sink.flush(); return 2; }
   }
   u8[] f = argv.get(1).toBytes();
   Buf out = Buf.create();
@@ -183,7 +240,7 @@ Output printf(Vec<string> argv) {
     }
     if (!fatal && consumedThisPass > 0 && arg < argv.len()) { again = true; }
   }
-  return Output(out.take(), err.take(), status, true);
+  { sink.bytes(out.take()); errs.bytes(err.take()); sink.flush(); errs.flush(); return status; }
 }
 
 /** One backslash escape from the format, appended. Returns the index after it. */
@@ -485,8 +542,9 @@ Counted countOf(Vec<string> argv, i32 fallback) {
   return Counted(n, operands, "");
 }
 
-Output cat(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
-  if (argv.len() == 1) { return Output.ok(stdin); }
+i32 cat(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+  u8[] stdin = fed.rest();
+  if (argv.len() == 1) { { sink.bytes(stdin); sink.flush(); return 0; } }
   Buf out = Buf.create();
   for (i32 i = 1; i < argv.len(); i++) {
     string path = argv.get(i);
@@ -496,11 +554,11 @@ Output cat(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
     // looked in whichever directory the process had started in.
     FileResult f = cli.readFile(resolvePath(cwd, path)).wait();
     if (!f.ok) {
-      return Output.fail(("cat: " + path + ": " + whyUnread(f) + "\n").toBytes(), 1);
+      { errs.bytes(("cat: " + path + ": " + whyUnread(f) + "\n").toBytes()); errs.flush(); sink.flush(); return 1; }
     }
     out.pushAll(f.bytes);
   }
-  return Output.ok(out.take());
+  { sink.bytes(out.take()); sink.flush(); return 0; }
 }
 
 /**
@@ -513,10 +571,11 @@ Output cat(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
  * A file that cannot be read is reported and the rest are still counted, with a status of 1 at the
  * end: GNU prints the `total` line even then, over the files it managed.
  */
-Output wc(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
+i32 wc(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+  u8[] stdin = fed.rest();
   Options o = options(argv, "lwc");
   if (o.bad != "") {
-    return Output.fail(optionRefusal("wc", o.bad).toBytes(), 1);
+    { errs.bytes(optionRefusal("wc", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
   }
   bool wantLines = sawOption(o, "l");
   bool wantWords = sawOption(o, "w");
@@ -558,7 +617,7 @@ Output wc(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
   if (names.len() > 1) {
     out.pushAll(countLine(wantLines, wantWords, wantBytes, allLines, allWords, allBytes, "total").toBytes());
   }
-  return Output(out.take(), err.take(), status, true);
+  { sink.bytes(out.take()); errs.bytes(err.take()); sink.flush(); errs.flush(); return status; }
 }
 
 /**
@@ -582,21 +641,33 @@ string countLine(bool l, bool w, bool c, i32 lines, i32 words, i32 bytes, string
  * With more than one operand each block carries a `==> name <==` header and a blank line between them,
  * as GNU's do. A file that cannot be opened is reported and the others are still printed.
  */
-Output head(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
-  return headOrTail(cli, cwd, argv, stdin, true);
+i32 head(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+  return headOrTail(cli, cwd, argv, fed, sink, errs, true);
 }
 
-Output tail(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
-  return headOrTail(cli, cwd, argv, stdin, false);
+i32 tail(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+  return headOrTail(cli, cwd, argv, fed, sink, errs, false);
 }
 
-Output headOrTail(Cli cli, string cwd, Vec<string> argv, u8[] stdin, bool front) {
+i32 headOrTail(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs, bool front) {
   string who = front ? "head" : "tail";
   Counted c = countOf(argv, 10);
   if (c.bad != "") {
-    return Output.fail(optionRefusal(who, c.bad).toBytes(), 1);
+    errs.bytes(optionRefusal(who, c.bad).toBytes());
+    errs.flush();
+    sink.flush();
+    return 1;
   }
 
+  // Standard input and nothing else — which is what a pipeline stage is — takes the streaming path.
+  // `head` stops reading as soon as it has its lines, and that is what stops the stage feeding it;
+  // `tail` holds `n` lines rather than the whole input. With an operand the file is read whole, which
+  // is bounded by the file and is not what 0061 was reported against.
+  if (c.operands.len() == 0) {
+    return front ? headStream(fed, sink, c.n) : tailStream(fed, sink, c.n);
+  }
+
+  u8[] stdin = fed.rest();
   Vec<string> names = inputsOf(c.operands);
   Buf out = Buf.create();
   Buf err = Buf.create();
@@ -616,7 +687,58 @@ Output headOrTail(Cli cli, string cwd, Vec<string> argv, u8[] stdin, bool front)
     out.pushAll(front ? firstLines(r.bytes, c.n) : lastLines(r.bytes, c.n));
     printed = true;
   }
-  return Output(out.take(), err.take(), status, true);
+  { sink.bytes(out.take()); errs.bytes(err.take()); sink.flush(); errs.flush(); return status; }
+}
+
+/**
+ * The first `n` lines, and then *stop*.
+ *
+ * Stopping is the point. `seq 1 2000000000 | head -1` printed one line in bash and trapped here, and
+ * the reason was not the pipeline — it was that this asked for every line before answering. A producer
+ * learns that nobody is reading when its own write is refused, so the sooner this stops reading the
+ * sooner that happens.
+ */
+i32 headStream(Feed fed, Sink sink, i32 n) {
+  Lines lines = Lines.create();
+  i32 seen = 0;
+  while (seen < n) {
+    Line l = nextLine(lines, fed);
+    if (!l.ok) { break; }
+    if (!emitTo(sink, l.bytes, l.nl)) { return 0; }
+    seen++;
+  }
+  sink.flush();
+  return 0;
+}
+
+/**
+ * The last `n` lines, holding only those.
+ *
+ * A ring of `n`, so `tail -1` of a hundred million lines costs one line of memory rather than a hundred
+ * million. It still has to *read* all of them — that is what "last" means — but reading is not holding.
+ */
+i32 tailStream(Feed fed, Sink sink, i32 n) {
+  if (n <= 0) {
+    sink.flush();
+    return 0;
+  }
+  u8[][] ring = u8[][n](fill: u8[0]());
+  u8[] ended = u8[n](fill: 0);
+  i32 count = 0;
+  Lines lines = Lines.create();
+  while (true) {
+    Line l = nextLine(lines, fed);
+    if (!l.ok) { break; }
+    ring[count % n] = l.bytes;
+    ended[count % n] = l.nl ? 1 : 0;
+    count++;
+  }
+  i32 first = count > n ? count - n : 0;
+  for (i32 i = first; i < count; i++) {
+    if (!emitTo(sink, ring[i % n], ended[i % n] != 0)) { return 0; }
+  }
+  sink.flush();
+  return 0;
 }
 
 /** The last `n` lines, each with its newline. */
@@ -632,10 +754,11 @@ u8[] lastLines(u8[] data, i32 n) {
   return out.take();
 }
 
-Output rev(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
+i32 rev(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+  u8[] stdin = fed.rest();
   Options o = options(argv, "");
   if (o.bad != "") {
-    return Output.fail(optionRefusal("rev", o.bad).toBytes(), 1);
+    { errs.bytes(optionRefusal("rev", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
   }
   Gathered in = gather(cli, cwd, o.operands, stdin);
   Buf err = Buf.create();
@@ -649,21 +772,21 @@ Output rev(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
     for (i32 j = line.len() - 1; j >= 0; j--) { out.push(line[j]); }
     out.push(10);
   }
-  return Output(out.take(), err.take(), in.failed.len() > 0 ? 1 : 0, true);
+  { sink.bytes(out.take()); errs.bytes(err.take()); sink.flush(); errs.flush(); return in.failed.len() > 0 ? 1 : 0; }
 }
 
-Output sort(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
+i32 sort(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+  u8[] stdin = fed.rest();
   Options o = options(argv, "r");
   if (o.bad != "") {
     // 2, not 1: GNU sort's usage status is its own, and a script testing for it is testing for that.
-    return Output.fail(optionRefusal("sort", o.bad).toBytes(), 2);
+    { errs.bytes(optionRefusal("sort", o.bad).toBytes()); errs.flush(); sink.flush(); return 2; }
   }
   bool reverse = sawOption(o, "r");
   Gathered in = gather(cli, cwd, o.operands, stdin);
   // `sort` is the one that gives up rather than sorting what it managed to read.
   if (in.failed.len() > 0) {
-    return Output.fail(
-      ("sort: cannot read: " + in.failed.get(0) + ": " + in.reasons.get(0) + "\n").toBytes(), 2);
+    { errs.bytes(("sort: cannot read: " + in.failed.get(0) + ": " + in.reasons.get(0) + "\n").toBytes()); errs.flush(); sink.flush(); return 2; }
   }
   Vec<u8[]> lines = splitLines(in.bytes);
   // Insertion sort: the inputs here are a shell pipeline's worth, and a reader can check it.
@@ -681,7 +804,7 @@ Output sort(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
     out.pushAll(lines.get(i));
     out.push(10);
   }
-  return Output.ok(out.take());
+  { sink.bytes(out.take()); sink.flush(); return 0; }
 }
 
 /**
@@ -690,20 +813,21 @@ Output sort(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
  * One operand only. GNU's *second* one is an output file, which it writes: guessing that from an
  * argument this program never read before would be a write nobody asked for, so it is refused.
  */
-Output uniq(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
+i32 uniq(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+  u8[] stdin = fed.rest();
   Options o = options(argv, "");
   if (o.bad != "") {
-    return Output.fail(optionRefusal("uniq", o.bad).toBytes(), 1);
+    { errs.bytes(optionRefusal("uniq", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
   }
   if (o.operands.len() > 1) {
     // GNU's second operand is an output *file*, which it writes. Not implemented rather than refused on
     // principle: the distinction matters to whoever reads this next, and "not supported" reads as a
     // decision somebody made.
-    return Output.fail("uniq: writing to a second operand is not implemented\n".toBytes(), 1);
+    { errs.bytes("uniq: writing to a second operand is not implemented\n".toBytes()); errs.flush(); sink.flush(); return 1; }
   }
   Gathered in = gather(cli, cwd, o.operands, stdin);
   if (in.failed.len() > 0) {
-    return Output.fail(("uniq: " + in.failed.get(0) + ": " + in.reasons.get(0) + "\n").toBytes(), 1);
+    { errs.bytes(("uniq: " + in.failed.get(0) + ": " + in.reasons.get(0) + "\n").toBytes()); errs.flush(); sink.flush(); return 1; }
   }
   Vec<u8[]> lines = splitLines(in.bytes);
   Buf out = Buf.create();
@@ -712,7 +836,7 @@ Output uniq(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
     out.pushAll(lines.get(i));
     out.push(10);
   }
-  return Output.ok(out.take());
+  { sink.bytes(out.take()); sink.flush(); return 0; }
 }
 
 /**
@@ -724,12 +848,13 @@ Output uniq(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
  * script reads as "no match" rather than "you asked for something I do not do". With several operands
  * each line is labelled with the file it came from, as GNU's is, and `-c` counts per file.
  */
-Output grep(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
+i32 grep(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+  u8[] stdin = fed.rest();
   Options o = options(argv, "cinqvx");
   if (o.bad != "") {
-    return Output.fail(optionRefusal("grep", o.bad).toBytes(), 2);
+    { errs.bytes(optionRefusal("grep", o.bad).toBytes()); errs.flush(); sink.flush(); return 2; }
   }
-  if (o.operands.len() == 0) { return Output.fail("grep: no pattern\n".toBytes(), 2); }
+  if (o.operands.len() == 0) { { errs.bytes("grep: no pattern\n".toBytes()); errs.flush(); sink.flush(); return 2; } }
 
   bool invert = sawOption(o, "v");
   bool fold = sawOption(o, "i");
@@ -779,8 +904,8 @@ Output grep(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
 
   // grep's exit status is its answer, not an error: 1 means "no lines matched", which is what makes
   // `grep x f && echo found` work. A file it could not read is a real error and outranks both.
-  if (status != 0) { return Output(out.take(), err.take(), status, true); }
-  return Output(out.take(), err.take(), hits > 0 ? 0 : 1, true);
+  if (status != 0) { { sink.bytes(out.take()); errs.bytes(err.take()); sink.flush(); errs.flush(); return status; } }
+  { sink.bytes(out.take()); errs.bytes(err.take()); sink.flush(); errs.flush(); return hits > 0 ? 0 : 1; }
 }
 
 /** ASCII lower case, for `-i`. The C locale is what the shell and its tests run in. */
@@ -792,7 +917,8 @@ u8[] lowered(u8[] b) {
   return out;
 }
 
-Output tr(Vec<string> argv, u8[] stdin) {
+i32 tr(Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+  u8[] stdin = fed.rest();
   bool del = false;
   bool squeeze = false;
   bool comp = false;
@@ -813,35 +939,35 @@ Output tr(Vec<string> argv, u8[] stdin) {
       else if (b[i] == 't') { trunc = true; }
       else {
         u8[] one = u8[1](fill: b[i]);
-        return Output.fail(optionRefusal("tr", string.fromBytes(one)).toBytes(), 1);
+        { errs.bytes(optionRefusal("tr", string.fromBytes(one)).toBytes()); errs.flush(); sink.flush(); return 1; }
       }
     }
     first++;
   }
 
   i32 sets = argv.len() - first;
-  if (sets == 0) { return Output.fail("tr: missing operand\n".toBytes(), 1); }
+  if (sets == 0) { { errs.bytes("tr: missing operand\n".toBytes()); errs.flush(); sink.flush(); return 1; } }
   if (sets > 2) {
-    return Output.fail(("tr: extra operand '" + argv.get(first + 2) + "'\n").toBytes(), 1);
+    { errs.bytes(("tr: extra operand '" + argv.get(first + 2) + "'\n").toBytes()); errs.flush(); sink.flush(); return 1; }
   }
   // Two sets to translate, one to delete or squeeze on its own, and two to do both.
   if (!del && !squeeze && sets != 2) {
-    return Output.fail(("tr: missing operand after '" + argv.get(first) + "'\n").toBytes(), 1);
+    { errs.bytes(("tr: missing operand after '" + argv.get(first) + "'\n").toBytes()); errs.flush(); sink.flush(); return 1; }
   }
   if (del && !squeeze && sets != 1) {
-    return Output.fail(("tr: extra operand '" + argv.get(first + 1) + "'\n").toBytes(), 1);
+    { errs.bytes(("tr: extra operand '" + argv.get(first + 1) + "'\n").toBytes()); errs.flush(); sink.flush(); return 1; }
   }
 
   Set s1 = parseSet(argv.get(first), -1);
-  if (!s1.ok) { return Output.fail(s1.message.toBytes(), 1); }
+  if (!s1.ok) { { errs.bytes(s1.message.toBytes()); errs.flush(); sink.flush(); return 1; } }
   // Set2 is parsed knowing set1's length, which is what `[x*]` pads out to.
   Set s2 = sets == 2 ? parseSet(argv.get(first + 1), s1.bytes.len()) : Set(true, u8[0](), "");
-  if (!s2.ok) { return Output.fail(s2.message.toBytes(), 1); }
+  if (!s2.ok) { { errs.bytes(s2.message.toBytes()); errs.flush(); sink.flush(); return 1; } }
 
   u8[] from = comp ? complementOf(s1.bytes) : s1.bytes;
   u8[] to = s2.bytes;
   if (!del && s1.bytes.len() > 0 && sets == 2 && to.len() == 0) {
-    return Output.fail("tr: when not truncating set1, string2 must be non-empty\n".toBytes(), 1);
+    { errs.bytes("tr: when not truncating set1, string2 must be non-empty\n".toBytes()); errs.flush(); sink.flush(); return 1; }
   }
   // `-t`: the pairs stop where set2 does, instead of set2's last character standing in for the rest.
   if (trunc && to.len() < from.len()) {
@@ -882,7 +1008,7 @@ Output tr(Vec<string> argv, u8[] stdin) {
     out.push(v);
     previous = v;
   }
-  return Output.ok(out.take());
+  { sink.bytes(out.take()); sink.flush(); return 0; }
 }
 
 /** A parsed set: the bytes it names, or why it could not be read. */
@@ -1162,25 +1288,35 @@ u8[] sliceBytes(u8[] b, i32 from, i32 to) {
   return out;
 }
 
-Output seq(Vec<string> argv) {
+/**
+ * `seq [from] to` — the program 0061 was reported against.
+ *
+ * It used to build every line in memory and hand back the lot: `seq 1 2000000000` ran for five seconds
+ * and trapped with "requested new array is too large", and `seq 1 2000000000 | head -1` did the same
+ * where bash prints one line. Writing through the sink fixes both halves — the memory is one 64 KiB
+ * block, and **the answer is checked**, so when the reader has gone this stops instead of counting to
+ * two billion into nothing. That check is the whole of what `head` closing its input does to a producer
+ * in a real shell.
+ */
+i32 seq(Vec<string> argv, Sink sink, Sink errs) {
   i32 from = 1;
   i32 to = 0;
   if (argv.len() == 2) { to = atoi(argv.get(1)); }
   else if (argv.len() >= 3) { from = atoi(argv.get(1)); to = atoi(argv.get(2)); }
-  else { return Output.fail("seq: needs a count\n".toBytes(), 2); }
+  else { errs.bytes("seq: needs a count\n".toBytes()); errs.flush(); sink.flush(); return 2; }
 
-  Buf out = Buf.create();
   for (i32 i = from; i <= to; i++) {
-    out.pushAll(itoa(i).toBytes());
-    out.push(10);
+    if (!sink.line(itoa(i))) { return 0; }
   }
-  return Output.ok(out.take());
+  sink.flush();
+  return 0;
 }
 
-Output nl(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
+i32 nl(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+  u8[] stdin = fed.rest();
   Options nlo = options(argv, "");
   if (nlo.bad != "") {
-    return Output.fail(optionRefusal("nl", nlo.bad).toBytes(), 1);
+    { errs.bytes(optionRefusal("nl", nlo.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
   }
   Gathered nli = gather(cli, cwd, nlo.operands, stdin);
   Buf nlerr = Buf.create();
@@ -1199,7 +1335,7 @@ Output nl(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
     out.pushAll(lines.get(i));
     out.push(10);
   }
-  return Output(out.take(), nlerr.take(), nli.failed.len() > 0 ? 1 : 0, true);
+  { sink.bytes(out.take()); errs.bytes(nlerr.take()); sink.flush(); errs.flush(); return nli.failed.len() > 0 ? 1 : 0; }
 }
 
 // ── Shared ────────────────────────────────────────────────────────────────────

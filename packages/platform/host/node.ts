@@ -223,9 +223,12 @@ export function nodeWorld(
         }),
         writeStdout: async (b: Uint8Array) => {
           // See the note in `deno.ts`: a full queue must fail the write rather than growing.
-          if (!out.push(b)) throw new Error("the child's output is not being read");
+          // Awaited: a full queue *waits* for the parent to read, and only a queue that has ended
+          // refuses. The two were one answer, and a producer told to stop when it should have waited
+          // truncated a redirection silently — see `ByteQueue.push`.
+          if (!await out.push(b)) throw new Error("the child's output is not being read");
         },
-        writeStderr: async (b: Uint8Array) => { cerr.push(b); },
+        writeStderr: async (b: Uint8Array) => { await cerr.push(b); },
       };
       return serveHostCalls(bridgeOf(sab), nodeWorld(fs, proc, childIo, {
         args: cargs,
@@ -233,8 +236,8 @@ export function nodeWorld(
         ...(give.net ? { net: true } : {}),
         ...(give.env ? { env: opts.env } : {}),
         // A line of output is bytes on the handle, with the newline `log` implies.
-        log: (l: string) => out.push(enc.encode(l + "\n")),
-        warn: (l: string) => cerr.push(enc.encode(l + "\n")),
+        log: async (l: string) => { await out.push(enc.encode(l + "\n")); },
+        warn: async (l: string) => { await cerr.push(enc.encode(l + "\n")); },
         makeWorker,
         selfSource: opts.selfSource,
         cwd: childCwd === "" ? opts.cwd : childCwd,

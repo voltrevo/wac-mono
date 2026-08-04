@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-26 packages, 50,152 lines of wac, 996 tests,
+26 packages, 50,325 lines of wac, 996 tests,
 26 command-line programs and 4 browser pages.
 
 ## Packages
@@ -30,7 +30,7 @@ In dependency order: nothing here imports anything below it.
 | [`zstd`](packages/zstd/) | Zstandard (RFC 8878) in wac. | 2,690 | 42 | `bytes` |
 | [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, bcrypt_pbkdf, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519, NIST P-256 and P-384, RSA… | 4,942 | 133 | `bignum` |
 | [`json`](packages/json/) | JSON (RFC 8259) parsing and serialization, written in wac. | 967 | 51 | `bytes` `fmt` `std` |
-| [`sh`](packages/sh/) | A shell, in wac. | 5,663 | 22 | `bytes` `platform` `std` |
+| [`sh`](packages/sh/) | A shell, in wac. | 5,836 | 22 | `bytes` `platform` `std` |
 | [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 237 | 16 | `fmt` |
 | [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 4,076 | 43 | `crypto` |
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
