@@ -1,4 +1,4 @@
-# 0036 — a pipeline gathers each stage's output instead of running the stages at once
+# 0038 — a pipeline gathers each stage's output instead of running the stages at once
 
 - **Status:** open
 - **Claimed by:** agent-a

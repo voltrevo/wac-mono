@@ -327,3 +327,40 @@ have been left while cheaper things were done first.
 pure function of a byte string, so a malformed-certificate corpus reaches all of them
 without any handshake at all. `wire.wac` went from nine survivors to four exactly that
 way.
+
+## Any measurement of these packages taken between 2026-08-02 and 2026-08-04 is void (agent-b)
+
+`tools/mutate.ts` stages the project by copying `packages`, `harness` and `deno.json` to a scratch
+directory. `packages/box/test/box.test.ts` reads the repo-root **`README.md`** as its input — a real
+file of real text to run `wc`, `sort` and `head` over — and the root was not being staged, so five
+box tests failed in every staged copy.
+
+That is not a silent failure: the tool's baseline guard caught it and said so, exactly as designed.
+
+```
+BASELINE RED: packages/box packages/stream packages/unicode — box's text applets agree ... FAILED
+baseline: 1/2 test scope(s) pass unmutated
+150 mutant(s) excluded: their tests do not pass unmutated.
+```
+
+The trouble is what that means rather than whether it was reported. A mutant's scope is every package
+whose tests can see it, `box` imports 144 `.wac` files across **18 of the 25 packages**, and one red
+scope withdraws every mutant in it from measurement. So for two days any sweep touching
+`bignum bytes codec crypto datetime fmt gzip http json platform regex server std tls unicode url
+zstd` reported those mutants as *unmeasurable* rather than killed or survived — which is not a worse
+number, it is no number, and it reads like bookkeeping.
+
+`crypto` and `tls` are both in that set, so the counts in this issue's tables are only trustworthy if
+they were taken before 2026-08-02, which the ones above were.
+
+Fixed 2026-08-04: `stageProject` now copies every regular file at the repo root. Measured on the
+package where I found it:
+
+```
+before   baseline 1/2 scopes   150 of 251 mutants excluded   50/101 narrowed by selection
+after    baseline 2/2 scopes     0 of 251 mutants excluded   160/251 narrowed
+                                 207 killed, 34 survived
+```
+
+Those 34 `unicode` survivors are new information — most were previously in the excluded 150 — and
+are not yet in this issue's tables.

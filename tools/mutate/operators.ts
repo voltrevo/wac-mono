@@ -145,14 +145,57 @@ function functions(tokens: Token[]): { retType: string[]; name: string; open: nu
   return out;
 }
 
+/**
+ * How many literal mutants to emit per repeated statement shape. See `shapeKey`.
+ *
+ * Three rather than one because a table's entries are not interchangeable: a binary search notices
+ * a corrupted first key and may never reach the five-hundredth. Three spread through the run is
+ * cheap insurance against sampling only the part the tests happen to cover.
+ */
+const LITERAL_PER_SHAPE = 3;
+
+/**
+ * A key identifying "the same kind of literal, in the same place, in the same function".
+ *
+ * The literal operator's cost is dominated by code that repeats one statement: a constant table
+ * (`v[0] = 0x...; v[1] = 0x...;` twelve times, or `u8[](0x63, 0x7c, ...)` two hundred and fifty-six
+ * times) and unrolled arithmetic (`acc = t3 + 0x1eabfffe * m + carry;` a hundred and forty-four
+ * times). Bumping the third entry of a table and bumping the fourth are not two experiments; they
+ * are one experiment run twice, and the answer is the same both times because the same assertions
+ * decide it.
+ *
+ * The key is the enclosing function plus the *kinds* of the four tokens either side — the literal's
+ * syntactic neighbourhood with names and values erased. Function-scoped on purpose: `map.wac` has
+ * three dozen separate constant tables written identically, and collapsing them to one class would
+ * throw away thirty-five real questions to save nothing. Two tables in two functions are two
+ * classes; twelve words of one table are one.
+ *
+ * This is the tool's own stated principle applied to itself — see the header comment at the top of
+ * this file. Unproductive mutants cost human attention, and a report with 8792 literal mutants of
+ * `unicode/src/tables.wac` in it is a report nobody reads.
+ */
+function shapeKey(tokens: Token[], i: number, fn: string): string {
+  const kinds: string[] = [];
+  for (let k = i - 4; k <= i + 4; k++) {
+    if (k === i) continue;
+    kinds.push(tokens[k]?.kind ?? "^");
+  }
+  return `${fn}|${kinds.join(" ")}`;
+}
+
 export type OperatorName = "relational" | "literal" | "guard" | "extreme";
 export const ALL_OPERATORS: OperatorName[] = ["relational", "literal", "guard", "extreme"];
 
 /** Generate every mutant the requested operators produce for one file. */
+/** What `generate` chose not to emit, so the caller can report it rather than hide it. */
+export type GenerateStats = { literalSampled: number; literalSkipped: number; shapes: number };
+
 export function generate(
   file: string,
   source: string,
   operators: OperatorName[] = ALL_OPERATORS,
+  stats?: GenerateStats,
+  perShape: number = LITERAL_PER_SHAPE,
 ): Mutant[] {
   const { tokens, errors } = wacLex(source);
   if (errors.length > 0) return [];   // not our problem to report; the suite will say so
@@ -161,6 +204,59 @@ export function generate(
   const want = new Set(operators);
 
   const bodySpans = functions(tokens);
+
+  // Token index -> the declaration a literal belongs to, for `shapeKey`: the enclosing top-level
+  // function, or for module-level code the `const` being initialised.
+  //
+  // The `const` half is not a detail. The largest tables in the repo are module-level
+  // `const u8[] SBOX = u8[](...)` initialisers, which are outside every function span; keying them
+  // all to one empty scope put `unicode/src/tables.wac`'s six separate tables into a single class
+  // of 8758 members and sampled three literals for the lot. Six tables are six questions.
+  const scope = new Array<string>(tokens.length).fill("");
+  for (const f of bodySpans) {
+    for (let k = f.open; k <= f.close; k++) scope[k] = f.name;
+  }
+  let lastConst = "";
+  for (let k = 0; k < tokens.length; k++) {
+    if (scope[k] !== "") continue;                       // inside a function; already named
+    if (tokens[k].kind === "const") {
+      // `const <type> <ident> = ...` — the identifier is the one just before the `=`.
+      for (let j = k + 1; j < tokens.length && tokens[j].kind !== ";"; j++) {
+        if (tokens[j].kind === "=") {
+          if (tokens[j - 1]?.kind === "ident") lastConst = tokens[j - 1].text;
+          break;
+        }
+      }
+    }
+    scope[k] = lastConst;
+  }
+  // Which literal tokens to mutate, decided before emitting any: see `shapeKey`. Two passes are
+  // needed because "three spread through the run" cannot be known on the way past the first one,
+  // and taking the first three instead would sample a 1459-entry table at entries 0, 1 and 2 —
+  // three adjacent ASCII code points, all covered by the same test. The first, middle and last of
+  // each class is the cheapest way to reach the parts of a table the tests may never touch.
+  const shapeMembers = new Map<string, number[]>();
+  if (want.has("literal")) {
+    for (let i = 0; i < tokens.length; i++) {
+      if (!isIntLiteral(tokens[i]) || bumpLiteral(tokens[i].text) === null) continue;
+      const key = shapeKey(tokens, i, scope[i]);
+      const list = shapeMembers.get(key);
+      if (list === undefined) shapeMembers.set(key, [i]);
+      else list.push(i);
+    }
+  }
+  const literalWanted = new Set<number>();
+  for (const members of shapeMembers.values()) {
+    if (members.length <= perShape) {
+      for (const i of members) literalWanted.add(i);
+      continue;
+    }
+    for (let k = 0; k < perShape; k++) {
+      // k/(n-1) through the run: 0, middle, end for three.
+      literalWanted.add(members[Math.round((k * (members.length - 1)) / (perShape - 1))]);
+    }
+  }
+  if (stats !== undefined) stats.shapes += shapeMembers.size;
 
   if (want.has("extreme")) {
     for (const f of bodySpans) {
@@ -203,6 +299,12 @@ export function generate(
     if (want.has("literal") && isIntLiteral(t)) {
       const bumped = bumpLiteral(t.text);
       if (bumped !== null) {
+        // One experiment per repeated shape, not one per occurrence.
+        if (!literalWanted.has(i)) {
+          if (stats !== undefined) stats.literalSkipped++;
+          continue;
+        }
+        if (stats !== undefined) stats.literalSampled++;
         out.push({
           name: `literal/${short(file)}:${t.line}:${t.col}/${t.text}→${bumped}`,
           origin: "operator",

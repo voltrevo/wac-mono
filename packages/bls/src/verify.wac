@@ -1,0 +1,91 @@
+// `verify(pubkey, message, signature)` — the Ethereum minimal-pubkey-size scheme.
+//
+// The whole package reduces to one identity. With a public key `pk = sk·G1` in G1, a signature
+// `sig = sk·H(m)` in G2, and `H` the hash-to-curve of the message:
+//
+//     e(pk, H(m)) · e(−G1, sig) == 1
+//
+// which holds because pairings are bilinear: e(sk·G1, H) · e(−G1, sk·H) = e(G1,H)^sk · e(G1,H)^−sk.
+//
+// Written as a product against one rather than as two pairings compared to each other, for two
+// reasons. It shares a single final exponentiation between both Miller loops, which is most of the
+// cost. And it is why this package's non-canonical final exponentiation is harmless: a constant
+// power applied to a product that should be one still gives one.
+//
+// ## What is checked before any arithmetic
+//
+// Every input is decoded with the full set of checks — canonical encoding, on the curve, in the
+// order-r subgroup. `g1FromBytes` and `g2FromBytes` do all three, and skipping the subgroup check
+// is a small-subgroup attack rather than an optimisation.
+//
+// **The infinity cases are decided here, not by the arithmetic.** An infinity public key is
+// refused: it is `sk = 0`, for which every message verifies under the signature at infinity, and
+// the Ethereum fixtures require rejection. That is a policy the pairing cannot express, because
+// e(O, H) is not defined.
+
+import { fpOne } from "./fp.wac";
+import { Fp12, fp12Mul, fp12IsOne } from "./fp12.wac";
+import { G1, g1FromBytes, g1Generator, g1Negate, g1IsInfinity, g1AffineX, g1AffineY } from "./g1.wac";
+import { G2, g2FromBytes, g2IsInfinity, g2AffineX, g2AffineY } from "./g2.wac";
+import { Fp2 } from "./fp2.wac";
+import { millerLoop, millerLoopTwo, finalExponentiate } from "./pairing.wac";
+import { hashToG2 } from "./map.wac";
+
+/** The domain separation tag Ethereum signatures use. */
+export u8[] ethDst() {
+  const u8[] DST = u8[](0x42, 0x4c, 0x53, 0x5f, 0x53, 0x49, 0x47, 0x5f, 0x42, 0x4c, 0x53, 0x31,
+                        0x32, 0x33, 0x38, 0x31, 0x47, 0x32, 0x5f, 0x58, 0x4d, 0x44, 0x3a, 0x53,
+                        0x48, 0x41, 0x2d, 0x32, 0x35, 0x36, 0x5f, 0x53, 0x53, 0x57, 0x55, 0x5f,
+                        0x52, 0x4f, 0x5f, 0x50, 0x4f, 0x50, 0x5f);
+  u8[] out = u8[DST.len()]();
+  for (i32 i = 0; i < DST.len(); i++) { out[i] = DST[i]; }
+  return out;
+}
+
+/** One Miller loop for an affine pair, or null if either point is the identity. */
+Fp12? loopFor(G1 p, G2 q) {
+  u32[]? px = g1AffineX(p);
+  u32[]? py = g1AffineY(p);
+  Fp2? qx = g2AffineX(q);
+  Fp2? qy = g2AffineY(q);
+  if ((px is null) || (py is null) || (qx is null) || (qy is null)) { return null; }
+  return millerLoop(px!, py!, qx!, qy!);
+}
+
+/**
+ * Whether `signature` is a valid signature on `message` under `pubkey`.
+ *
+ * False for anything malformed as well as anything merely wrong — a verifier has one bit to
+ * return and "I could not read this" is not an acceptance.
+ */
+export bool verify(u8[] pubkey, u8[] message, u8[] signature) {
+  G1? pk = g1FromBytes(pubkey);
+  G2? sig = g2FromBytes(signature);
+  if ((pk is null) || (sig is null)) { return false; }
+
+  // An infinity public key means a zero secret key, under which everything verifies. Refused
+  // outright; the fixtures require it and the pairing could not express it.
+  if (g1IsInfinity(pk!)) { return false; }
+  if (g2IsInfinity(sig!)) { return false; }
+
+  G2 h = hashToG2(message, ethDst());
+  if (g2IsInfinity(h)) { return false; }
+
+  // e(pk, H) · e(−G₁, sig), as one Miller loop over both pairs and one final exponentiation.
+  G1 ng = g1Negate(g1Generator());
+  u32[]? ax = g1AffineX(pk!);
+  u32[]? ay = g1AffineY(pk!);
+  Fp2? aqx = g2AffineX(h);
+  Fp2? aqy = g2AffineY(h);
+  u32[]? bx = g1AffineX(ng);
+  u32[]? by = g1AffineY(ng);
+  Fp2? bqx = g2AffineX(sig!);
+  Fp2? bqy = g2AffineY(sig!);
+  if ((ax is null) || (ay is null) || (aqx is null) || (aqy is null)) { return false; }
+  if ((bx is null) || (by is null) || (bqx is null) || (bqy is null)) { return false; }
+
+  Fp12? e = finalExponentiate(
+    millerLoopTwo(ax!, ay!, aqx!, aqy!, bx!, by!, bqx!, bqy!));
+  if (e is null) { return false; }
+  return fp12IsOne(e!);
+}

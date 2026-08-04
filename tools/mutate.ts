@@ -13,9 +13,13 @@
 //   deno task mutate --package gzip      # only mutants in one package
 //   deno task mutate --jobs=2            # how many to test at once (default: cores - 1, max 4)
 //   deno task mutate --no-select         # skip per-test selection, run every test in scope
+//   deno task mutate --no-sample         # mutate every integer literal, not one per repeated shape
+//   deno task mutate --no-nice           # do not yield to other work (only on a machine you own)
+//   deno task mutate --sample=150        # run a random 150 of the selected mutants (see --seed)
+//   deno task mutate --seed=12345        # reproduce a particular --sample draw
 //   deno task mutate --operators --dry-run   # what would run, without running it
 //
-// Three things make this affordable enough to run over more than one package.
+// Four things make this affordable enough to run over more than one package.
 //
 // **Trivial Compiler Equivalence.** Every mutant is compiled before any test runs. If
 // its wasm is byte-identical to the original's, the mutation provably changed nothing
@@ -32,6 +36,28 @@
 // **Stage once.** The project is copied to a scratch directory a single time, then each
 // mutant patches and restores the files it touches, rather than re-copying the tree.
 //
+// **One literal mutant per repeated statement shape.** `--operators=all` bumps every integer
+// literal by one, and this repo is full of code where that is the same experiment over and over: a
+// constant table is one question ("would anything notice a corrupted entry?") asked once per entry,
+// and unrolled arithmetic is one question asked once per limb. Measured across `packages/`:
+//
+//     packages/unicode/src/tables.wac    8787 literal mutants -> 47
+//     packages/bls/src/fpkernel.wac      1221 -> 156
+//     packages/crypto/src/blowfish.wac   1128 -> 130
+//     packages/crypto/src/aes.wac         643 -> 119
+//     packages/sh/src/exec.wac            429 -> 416     <- logic, correctly almost untouched
+//     repo total                        28226 -> 13376
+//
+// A whole-package sweep of `unicode` went from about nine thousand mutants to 251. See `shapeKey`
+// in `mutate/operators.ts` for what counts as the same shape and why it is scoped per function and
+// per module-level `const`. The run prints what it sampled — a sweep that declines to ask a question
+// must not look like one that asked and got an answer.
+//
+// **This can hide a survivor**, and that is the trade: a table entry that only the five-hundredth
+// element would have exposed is no longer tested, where the previous behaviour was merely slow. It
+// is why the sample is three spread through each class rather than one, and why the header says so.
+// `--no-sample` restores the old behaviour for a deliberate deep run.
+//
 // Outcomes are three, not two. A mutant that fails to compile is INVALID, not killed:
 // it tested nothing about the test suite, and counting it as a kill inflates the score.
 // That distinction barely mattered for a hand-written list where every mutation was
@@ -42,6 +68,7 @@ import { wacCompile } from "wac/wacCompile.ts";
 import { wacFiles, wacFilesIn } from "../harness/wacFiles.ts";
 import { CURATED } from "./mutate/curated.ts";
 import { KNOWN_SURVIVORS } from "./mutate/known.ts";
+import { fileCount, sampleMutants } from "./mutate/sample.ts";
 import {
   buildProfile, byCost, filterFor, selectTests, testFilesIn, type Profile,
 } from "./mutate/profile.ts";
@@ -75,8 +102,49 @@ const diffOnly = args.includes("--diff");
 const dryRun = args.includes("--dry-run");
 const pkgArg = args.includes("--package") ? args[args.indexOf("--package") + 1] : undefined;
 const filter = args.find((a) => !a.startsWith("--") && a !== pkgArg);
-/** A mutant that hangs the suite is a real outcome, not a reason to wait forever. */
-const TEST_TIMEOUT_MS = 180_000;
+/**
+ * A mutant that hangs the suite is a real outcome, not a reason to wait forever — but the deadline
+ * has to be relative to how fast this machine is *right now*, not a fixed wall-clock.
+ *
+ * This is the whole reason a sweep may be `nice`d. A timeout is scored as a **kill**, on the sound
+ * argument that an infinite loop is a detected defect. The unsound consequence, if the deadline is
+ * absolute, is that anything slowing the sweep down converts survivors into kills: the sweep reports
+ * a *better* score for running on a loaded machine, or for being polite to other processes. That is
+ * the worst direction for a measurement error, and it is why wac-mono issue 0031 was filed rather
+ * than fixed — you cannot make a sweep yield until its clock stops depending on getting the machine
+ * to itself.
+ *
+ * So the deadline is `max(FLOOR, observed baseline for this scope x MULTIPLIER)`. `mutate.ts` already
+ * runs every scope unmutated before mutating anything, in the same conditions and the same staged
+ * tree; timing that run is free and it is the only honest yardstick available. Under load the
+ * baseline is slow too, so the deadline stretches with it and no verdict changes.
+ *
+ * The multiplier is generous on purpose. A mutant is either detected — usually in the first failing
+ * test, with `--fail-fast` — or it runs to completion in about baseline time. Ten times baseline is
+ * not "a bit slow", it is hung.
+ */
+const TIMEOUT_MULTIPLIER = 10;
+const TIMEOUT_FLOOR_MS = 30_000;
+const TIMEOUT_CAP_MS = 600_000;
+
+/**
+ * `nice`, so a sweep yields to whatever somebody is waiting on.
+ *
+ * A mutation sweep is background work by definition: nobody is watching an individual mutant. An
+ * ordinary `deno task test` next door is the opposite. On five shared cores, a sweep at four
+ * concurrent scopes — each a whole `deno test`, and `box.test.ts` alone spawns about three hundred
+ * built binaries — took another agent's fifty-second suite to over half an hour, at load average
+ * 10.55. They killed it at thirty minutes believing it had deadlocked and spent an hour proving it
+ * had not. See wac-mono issue 0031.
+ *
+ * `--no-nice` exists for a sweep on a machine you have to yourself, where it is pure overhead.
+ */
+const NICE = !args.includes("--no-nice");
+
+/** The deadline for a mutant whose scope took `baseline` ms unmutated. */
+function deadlineFor(baseline: number): number {
+  return Math.min(TIMEOUT_CAP_MS, Math.max(TIMEOUT_FLOOR_MS, baseline * TIMEOUT_MULTIPLIER));
+}
 
 // ── The source universe ───────────────────────────────────────────────────────
 
@@ -186,11 +254,15 @@ const located = CURATED.map(locate);
 const broken = located.filter((l): l is { name: string; problem: string } => "problem" in l);
 let mutants = located.filter((l): l is { mutant: Mutant } => "mutant" in l).map((l) => l.mutant);
 
+const genStats = { literalSampled: 0, literalSkipped: 0, shapes: 0 };
+// `--no-sample`: mutate every integer literal, as this did before shape sampling existed. Slow by
+// design — it is the flag for "I want the survivor that sampling might have hidden".
+const perShape = args.includes("--no-sample") ? Number.POSITIVE_INFINITY : 3;
 if (useOperators) {
   for (const [file, text] of sources) {
     // Test fixtures and benchmarks are not the code under test.
     if (/\/(test|bench)\//.test(file)) continue;
-    mutants.push(...generate(file, text, operators));
+    mutants.push(...generate(file, text, operators, genStats, perShape));
   }
 }
 
@@ -201,6 +273,36 @@ if (diffOnly) {
 }
 if (pkgArg !== undefined) mutants = mutants.filter((m) => packagesOf(m).includes(pkgArg));
 if (filter !== undefined) mutants = mutants.filter((m) => m.name.includes(filter));
+
+// `--sample=N`: run a random N of the selected mutants, stratified by file. See `mutate/sample.ts`
+// for why stratified and why seeded; the seed is printed so a surprising draw can be reproduced.
+const sampleFlag = args.find((a) => a.startsWith("--sample="));
+const seedFlag = args.find((a) => a.startsWith("--seed="));
+const seed = seedFlag !== undefined ? Number(seedFlag.split("=")[1]) : (Date.now() & 0x7fffffff);
+if (sampleFlag !== undefined) {
+  const n = Number(sampleFlag.split("=")[1]);
+  const before = mutants.length;
+  mutants = sampleMutants(mutants, n, seed);
+  if (mutants.length < before) {
+    console.log(
+      `sample: ${mutants.length} of ${before} mutant(s), stratified across ` +
+        `${fileCount(mutants)} file(s) — the score below estimates the whole set rather than ` +
+        `being it. Reproduce this draw with --seed=${seed}`,
+    );
+  }
+}
+
+// Say what the literal operator sampled rather than leaving it to be inferred from a small number.
+// 0024's `0/117 fell back` is the precedent: a count nobody explains gets read as good news, and a
+// sweep that quietly declines to ask a question must not look like one that asked and got an answer.
+if (genStats.literalSkipped > 0) {
+  const total = genStats.literalSampled + genStats.literalSkipped;
+  console.log(
+    `literal: ${genStats.literalSampled} of ${total} integer literals mutated — ` +
+      `at most ${perShape} per repeated statement shape, across ${genStats.shapes} shapes. ` +
+      `Constant tables and unrolled code repeat one experiment; see tools/mutate/operators.ts.`,
+  );
+}
 
 if (broken.length > 0) {
   console.log(`${broken.length} curated mutation(s) could not be located:`);
@@ -333,10 +435,26 @@ if (dryRun) {
  * there is a control mutation.
  */
 async function stageProject(dest: string): Promise<void> {
-  for (const entry of ["packages", "harness", "deno.json"]) {
+  // `packages` and `harness` are the code. Every *file* at the repo root comes too, and that is not
+  // tidiness: `packages/box/test/box.test.ts` reads `README.md` as its input — a real file of real
+  // text to run `wc`, `sort` and `head` over — and staging without it made five box tests fail.
+  //
+  // The consequence was invisible and expensive. A red scope means every mutant in it is reported
+  // as *unmeasurable* rather than killed, correctly and by design; but `box` depends on a dozen
+  // packages, so one missing file silently withdrew a large part of the repo from measurement. A
+  // `--package unicode --operators=all` run excluded 150 of 251 mutants for this reason, and said
+  // so in a line easy to read as bookkeeping.
+  //
+  // Root files are a handful of kilobytes, so copying all of them is cheaper than maintaining a
+  // list of which ones some test happens to read.
+  for (const entry of ["packages", "harness"]) {
     const cmd = new Deno.Command("cp", { args: ["-r", entry, `${dest}/`] });
     const { code, stderr } = await cmd.output();
     if (code !== 0) throw new Error(`copy ${entry} failed: ${new TextDecoder().decode(stderr)}`);
+  }
+  for await (const e of Deno.readDir(".")) {
+    if (!e.isFile) continue;
+    await Deno.copyFile(e.name, `${dest}/${e.name}`);
   }
   const configPath = `${dest}/deno.json`;
   const config = JSON.parse(await Deno.readTextFile(configPath));
@@ -376,14 +494,19 @@ function testDirs(m: Mutant): string[] {
  * skip a test, it fails the run.
  */
 function testCommand(work: string, dirs: string[], filter?: string): Deno.Command {
-  return new Deno.Command("deno", {
-    args: ["test", "--no-check", "--fail-fast", "--allow-read", "--allow-write",
-           "--allow-run", "--allow-net", "--allow-env", "--quiet",
-           ...(filter ? ["--filter", filter] : []), ...dirs],
-    cwd: work,
-    stdout: "piped",
-    stderr: "piped",
-  });
+  const denoArgs = ["test", "--no-check", "--fail-fast", "--allow-read", "--allow-write",
+                    "--allow-run", "--allow-net", "--allow-env", "--quiet",
+                    ...(filter ? ["--filter", filter] : []), ...dirs];
+  // `nice` wraps the whole `deno test`, and the niceness is inherited by every subprocess it
+  // spawns — which is the point, since those subprocesses are most of the load.
+  return NICE
+    ? new Deno.Command("nice", {
+      args: ["-n", "19", "deno", ...denoArgs],
+      cwd: work,
+      stdout: "piped",
+      stderr: "piped",
+    })
+    : new Deno.Command("deno", { args: denoArgs, cwd: work, stdout: "piped", stderr: "piped" });
 }
 
 const runTests = (work: string, dirs: string[]) => testCommand(work, dirs).output();
@@ -454,6 +577,21 @@ try {
     await stageProject(dir);
   }
   if (jobs > 1) console.log(`  running ${jobs} at a time`);
+  // Print the load, because this is the number that explains a slow sweep *and* a slow suite next
+  // door, and because the alternative is somebody spending an hour proving the suite has not hung.
+  // A job is a whole `deno test`, and several test files are themselves swarms of subprocesses, so
+  // `jobs` understates the load by a lot — `box.test.ts` alone spawns about three hundred binaries.
+  try {
+    const load = (await Deno.readTextFile("/proc/loadavg")).split(" ").slice(0, 3).join(" ");
+    const cores = navigator.hardwareConcurrency || 0;
+    console.log(`  load before starting: ${load} on ${cores} core(s)`);
+    if (Number(load.split(" ")[0]) > cores * 0.7) {
+      console.log(
+        "  NOTE: this machine is already busy. A sweep is background work — it is niced, so it " +
+          "should yield,\n        but somebody may still be waiting on a suite. See issue 0031.",
+      );
+    }
+  } catch { /* not Linux; the sweep does not depend on knowing */ }
 
   // ── The unmutated baseline ───────────────────────────────────────────────
   //
@@ -471,12 +609,18 @@ try {
   // worth measuring — and refusing to run at all would mean any red package anywhere
   // blocks every sweep, which is how a guard gets switched off.
   const redScopes = new Set<string>();
+  // How long each scope takes unmutated, in these conditions. The mutant deadline is a multiple of
+  // this rather than a fixed wall-clock, so a slow machine stretches the deadline instead of
+  // converting survivors into false kills. See TIMEOUT_MULTIPLIER.
+  const baselineMs = new Map<string, number>();
   {
     const scopes = new Set(toRun.map((t) => testDirs(t.mutant).join(" ")));
     for (const key of [...scopes].sort()) {
       const dirs = key.split(" ").filter(Boolean);
       if (dirs.length === 0) continue;
+      const started = performance.now();
       const { code, stdout, stderr } = await runTests(workDirs[0], dirs);
+      baselineMs.set(key, performance.now() - started);
       if (code !== 0) {
         redScopes.add(key);
         const out = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
@@ -486,6 +630,13 @@ try {
     }
     const clean = scopes.size - redScopes.size;
     console.log(`  baseline: ${clean}/${scopes.size} test scope(s) pass unmutated`);
+    const slowest = Math.max(0, ...baselineMs.values());
+    console.log(
+      `  deadline: ${TIMEOUT_MULTIPLIER}x each scope's own baseline ` +
+        `(slowest ${(slowest / 1000).toFixed(1)}s -> ${(deadlineFor(slowest) / 1000).toFixed(0)}s), ` +
+        `so load stretches it rather than manufacturing kills` +
+        (NICE ? "; running under nice -n 19" : "; NOT niced (--no-nice)"),
+    );
     if (clean === 0) {
       console.log("\nNothing is measurable: every scope this run touches is already failing.");
       console.log("Each mutant would be recorded as killed and the run would report a perfect");
@@ -586,10 +737,14 @@ try {
       const cmd = testCommand(work, runDirs, filter);
       const child = cmd.spawn();
       let timedOut = false;
+      // The full scope's baseline, not the narrowed run's: a narrowed run is a subset and therefore
+      // faster, so this errs towards a longer deadline, which is the safe direction for a scoring
+      // rule that counts a timeout as a kill.
+      const deadline = deadlineFor(baselineMs.get(dirs.join(" ")) ?? 0);
       const timer = setTimeout(() => {
         timedOut = true;
         try { child.kill("SIGKILL"); } catch { /* already gone */ }
-      }, TEST_TIMEOUT_MS);
+      }, deadline);
       const { code, stdout, stderr } = await child.output();
       clearTimeout(timer);
 
@@ -603,7 +758,7 @@ try {
         killed,
         timedOut,
         dirs,
-        detail: timedOut ? `timed out after ${TEST_TIMEOUT_MS / 1000}s` : (firstFail ?? "").trim().slice(0, 90),
+        detail: timedOut ? `timed out after ${(deadline / 1000).toFixed(0)}s` : (firstFail ?? "").trim().slice(0, 90),
       });
       const mark = timedOut ? "TO " : killed ? "ok " : "!! ";
       console.log(`  ${mark} ${mutant.name.padEnd(52)} ${killed ? "killed" : "SURVIVED"}`);

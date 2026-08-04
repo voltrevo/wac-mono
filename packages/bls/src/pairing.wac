@@ -1,0 +1,267 @@
+// The optimal ate pairing on BLS12-381, and the signature verification built on it.
+//
+// ## How this was got right, because it is the part that goes wrong quietly
+//
+// A pairing that satisfies bilinearity, is non-degenerate and lands in the order-r subgroup can
+// still be the *wrong* pairing. My first attempt at this had all three properties and disagreed
+// with every other implementation — so bilinearity is not the oracle here, and no amount of
+// self-consistency would have caught it.
+//
+// What settled it was reading a reference implementation rather than recalling formulas from a
+// paper. Two things were wrong and both came from memory: the point operations below are
+// **homogeneous projective** with a `mulByB` and a halving, not the Jacobian ones the better-known
+// write-ups use; and the loop runs over a **NAF decomposition** with signed digits, negating Q on
+// a −1. `test/pairing.py` reproduces this algorithm in plain Python and is checked against
+// `@noble/curves` coefficient by coefficient, so the wac below has a per-step oracle.
+//
+// ## The final exponentiation is deliberately not canonical
+//
+// It raises to a fixed multiple of (p¹²−1)/r rather than to that exponent itself, which is what
+// the standard chain computes and is why this pairing's *value* differs from other libraries'.
+// That is harmless and worth stating plainly: verification compares a **product** of pairings
+// against one, so any constant power cancels. What must hold is
+//
+//     e(pk, H(m)) · e(−G1, sig) == 1
+//
+// and that is what the Ethereum fixtures check.
+
+import { fpNeg, fpZero, fpOne, fpIsZero, fpAdd, fpSub, fpHalf } from "./fp.wac";
+import { Fp2, fp2Add, fp2Sub, fp2Mul, fp2Square, fp2Neg, fp2Zero, fp2One, fp2IsZero,
+         fp2Equals, fp2Copy, fp2MulByFp, fp2Invert } from "./fp2.wac";
+import { Fp12, fp12Mul, fp12Square, fp12CyclotomicSquare, fp12Conjugate, fp12Invert, fp12Frobenius, fp12One,
+         fp12Equals, fp12IsOne, fp12MulBy014, fp12FrobeniusP6 } from "./fp12.wac";
+import { G1, g1Generator, g1IsInfinity, g1Negate, g1AffineX, g1AffineY } from "./g1.wac";
+import { G2, g2IsInfinity, g2AffineX, g2AffineY } from "./g2.wac";
+
+/**
+ * The NAF digits of |x|, most significant first — 64 of them, 5 non-zero.
+ *
+ * Non-adjacent form rather than plain binary: each digit is 0, 1 or −1, and a −1 digit means the
+ * addition step uses −Q. It represents the same |x| with fewer non-zero digits, so the loop does
+ * fewer additions. Generated, because a hand-written table of 64 signed digits is a typo
+ * looking for somewhere to happen.
+ */
+i32[] ateNaf() {
+  i32[] d = i32[64]();
+  d[0] = 0; d[1] = -1; d[2] = 0; d[3] = 1; d[4] = 0; d[5] = 0; d[6] = 1; d[7] = 0; d[8] = 0; d[9] = 0; d[10] = 0; d[11] = 0;
+  d[12] = 0; d[13] = 0; d[14] = 0; d[15] = 1; d[16] = 0; d[17] = 0; d[18] = 0; d[19] = 0; d[20] = 0; d[21] = 0; d[22] = 0; d[23] = 0;
+  d[24] = 0; d[25] = 0; d[26] = 0; d[27] = 0; d[28] = 0; d[29] = 0; d[30] = 0; d[31] = 0; d[32] = 0; d[33] = 0; d[34] = 0; d[35] = 0;
+  d[36] = 0; d[37] = 0; d[38] = 0; d[39] = 0; d[40] = 0; d[41] = 0; d[42] = 0; d[43] = 0; d[44] = 0; d[45] = 0; d[46] = 0; d[47] = 1;
+  d[48] = 0; d[49] = 0; d[50] = 0; d[51] = 0; d[52] = 0; d[53] = 0; d[54] = 0; d[55] = 0; d[56] = 0; d[57] = 0; d[58] = 0; d[59] = 0;
+  d[60] = 0; d[61] = 0; d[62] = 0; d[63] = 0;
+  return d;
+}
+/** `a · B` where B = 4(1 + u) is the twist's curve constant. */
+Fp2 mulByB(Fp2 a) {
+  u32[] t0 = fpAdd(fpAdd(a.c0, a.c0), fpAdd(a.c0, a.c0));
+  u32[] t1 = fpAdd(fpAdd(a.c1, a.c1), fpAdd(a.c1, a.c1));
+  return Fp2(fpSub(t0, t1), fpAdd(t0, t1));
+}
+
+Fp2 triple(Fp2 a) { return fp2Add(fp2Add(a, a), a); }
+
+/** `a / 2`. Uses `fp.wac`'s constant; see the note there about what this cost before. */
+Fp2 halve(Fp2 a) { return fp2MulByFp(a, fpHalf()); }
+
+/** A point in homogeneous projective coordinates, as the pairing's inner loop wants it. */
+struct Rp {
+  Fp2 x;
+  Fp2 y;
+  Fp2 z;
+}
+
+/** The three Fp2 coefficients of one line evaluation. */
+struct Line {
+  Fp2 c0;
+  Fp2 c1;
+  Fp2 c2;
+}
+
+/**
+ * One doubling of the loop point, and the line through it.
+ *
+ * Homogeneous projective, so no inversion. These are not the Jacobian formulas — see the note at
+ * the top of the file about where that assumption cost an afternoon.
+ */
+Rp doubleStep(Rp r, Line out) {
+  Fp2 t0 = fp2Square(r.y);
+  Fp2 t1 = fp2Square(r.z);
+  Fp2 t2 = mulByB(triple(t1));
+  Fp2 t3 = triple(t2);
+  Fp2 t4 = fp2Sub(fp2Sub(fp2Square(fp2Add(r.y, r.z)), t1), t0);
+
+  out.c0 = fp2Sub(t2, t0);
+  out.c1 = triple(fp2Square(r.x));
+  out.c2 = fp2Neg(t4);
+
+  Fp2 nx = halve(fp2Mul(fp2Mul(fp2Sub(t0, t3), r.x), r.y));
+  Fp2 ny = fp2Sub(fp2Square(halve(fp2Add(t0, t3))), triple(fp2Square(t2)));
+  Fp2 nz = fp2Mul(t0, t4);
+  return Rp(nx, ny, nz);
+}
+
+/** One addition of Q into the loop point, and the line through the two. */
+Rp addStep(Rp r, Fp2 qx, Fp2 qy, Line out) {
+  Fp2 t0 = fp2Sub(r.y, fp2Mul(qy, r.z));
+  Fp2 t1 = fp2Sub(r.x, fp2Mul(qx, r.z));
+
+  out.c0 = fp2Sub(fp2Mul(t0, qx), fp2Mul(t1, qy));
+  out.c1 = fp2Neg(t0);
+  out.c2 = fp2Copy(t1);
+
+  Fp2 t2 = fp2Square(t1);
+  Fp2 t3 = fp2Mul(t2, t1);
+  Fp2 t4 = fp2Mul(t2, r.x);
+  Fp2 t5 = fp2Add(fp2Sub(t3, fp2Add(t4, t4)), fp2Mul(fp2Square(t0), r.z));
+  Fp2 nx = fp2Mul(t1, t5);
+  Fp2 ny = fp2Sub(fp2Mul(fp2Sub(t4, t5), t0), fp2Mul(t3, r.y));
+  Fp2 nz = fp2Mul(r.z, t3);
+  return Rp(nx, ny, nz);
+}
+
+/** `f · line`, with the line's two variable coefficients scaled by P's coordinates. */
+Fp12 applyLine(Fp12 f, Line l, u32[] px, u32[] py) {
+  return fp12MulBy014(f, l.c0, fp2MulByFp(l.c1, px), fp2MulByFp(l.c2, py));
+}
+
+/**
+ * `f_{|x|}(Q, P)`, conjugated because BLS12-381's x is negative.
+ *
+ * Both points affine: P from G1, Q from G2. The conjugation at the end is not cosmetic — without
+ * it the result is the pairing of the negated point, which still satisfies bilinearity.
+ */
+export Fp12 millerLoop(u32[] px, u32[] py, Fp2 qx, Fp2 qy) {
+  i32[] naf = ateNaf();
+  Fp2 negQy = fp2Neg(qy);
+  Rp r = Rp(fp2Copy(qx), fp2Copy(qy), fp2One());
+  Fp12 f = fp12One();
+
+  for (i32 i = 0; i < naf.len(); i++) {
+    if (i != 0) { f = fp12Square(f); }
+    Line l = Line(fp2Zero(), fp2Zero(), fp2Zero());
+    r = doubleStep(r, l);
+    f = applyLine(f, l, px, py);
+    if (naf[i] != 0) {
+      Line m = Line(fp2Zero(), fp2Zero(), fp2Zero());
+      r = addStep(r, qx, (naf[i] == -1) ? negQy : qy, m);
+      f = applyLine(f, m, px, py);
+    }
+  }
+  return fp12Conjugate(f);
+}
+
+/** `f^|x|`, then conjugated — the exponentiation the hard part is built from. */
+Fp12 expByX(Fp12 f) {
+  // |x| = 0xd201000000010000, 64 bits with six set. Square-and-multiply, most significant first.
+  const i32[] BITS = i32[](63, 62, 60, 57, 48, 16);
+  Fp12 acc = fp12One();
+  bool started = false;
+  for (i32 b = 63; b >= 0; b--) {
+    if (started) { acc = fp12CyclotomicSquare(acc); }
+    bool set = false;
+    for (i32 k = 0; k < BITS.len(); k++) {
+      if (BITS[k] == b) { set = true; }
+    }
+    if (set) {
+      if (!started) { started = true; acc = f; }
+      else { acc = fp12Mul(acc, f); }
+    }
+  }
+  return fp12Conjugate(acc);
+}
+
+/**
+ * The final exponentiation, as the easy part and then the hard part.
+ *
+ * Easy: `f^((p⁶−1)(p²+1))`, which lands in the cyclotomic subgroup — and only *after* that does
+ * conjugation coincide with inversion, which is why `fp12FrobeniusP6` is used above rather than a
+ * conjugate.
+ *
+ * Hard: the standard BLS12 chain over `expByX`. It computes a fixed multiple of (p¹²−1)/r, not
+ * that exponent, so the value differs from other libraries' by a constant — see the note at the
+ * top of the file for why verification does not care.
+ */
+export Fp12? finalExponentiate(Fp12 f) {
+  Fp12? inv = fp12Invert(f);
+  if (inv is null) { return null; }
+  Fp12 t2 = fp12Mul(fp12FrobeniusP6(f), inv!);
+  Fp12 t1 = t2;
+  t2 = fp12Mul(fp12Frobenius(t2, 2), t1);
+
+  t1 = fp12Conjugate(fp12CyclotomicSquare(t2));
+  Fp12 t3 = expByX(t2);
+  Fp12 t4 = fp12CyclotomicSquare(t3);
+  Fp12 t5 = fp12Mul(t1, t3);
+  t1 = expByX(t5);
+  Fp12 t0 = expByX(t1);
+  Fp12 t6 = expByX(t0);
+  t6 = fp12Mul(t6, t4);
+  t4 = expByX(t6);
+  t5 = fp12Conjugate(t5);
+  t4 = fp12Mul(t4, fp12Mul(t5, t2));
+  t5 = fp12Conjugate(t2);
+  t1 = fp12Mul(t1, t2);
+  t1 = fp12Frobenius(t1, 3);
+  t6 = fp12Mul(t6, t5);
+  t6 = fp12Frobenius(t6, 1);
+  t3 = fp12Mul(t3, t0);
+  t3 = fp12Frobenius(t3, 2);
+  t3 = fp12Mul(t3, t1);
+  t3 = fp12Mul(t3, t6);
+  return fp12Mul(t3, t4);
+}
+
+/**
+ * Two Miller loops sharing one accumulator: `f_{|x|}(Q₁,P₁) · f_{|x|}(Q₂,P₂)`.
+ *
+ * A verification is a product of two pairings, and a product of Miller loops does not need two
+ * accumulators — at each step the one accumulator is squared once and both lines are multiplied in.
+ * That pays the 64 Fp12 squarings once rather than twice, which is the single largest shared cost
+ * between the two loops. The per-point work (`doubleStep`, `addStep`, the line multiplications) is
+ * unavoidably doubled and is untouched here.
+ *
+ * The final conjugation stays valid because conjugation is the p⁶ Frobenius, a homomorphism, so
+ * conj(f₁)·conj(f₂) = conj(f₁·f₂). `pairing_wac.test.ts` checks the two spellings agree rather than
+ * taking that on trust.
+ */
+export Fp12 millerLoopTwo(u32[] px1, u32[] py1, Fp2 qx1, Fp2 qy1,
+                          u32[] px2, u32[] py2, Fp2 qx2, Fp2 qy2) {
+  i32[] naf = ateNaf();
+  Fp2 negQy1 = fp2Neg(qy1);
+  Fp2 negQy2 = fp2Neg(qy2);
+  Rp r1 = Rp(fp2Copy(qx1), fp2Copy(qy1), fp2One());
+  Rp r2 = Rp(fp2Copy(qx2), fp2Copy(qy2), fp2One());
+  Fp12 f = fp12One();
+
+  for (i32 i = 0; i < naf.len(); i++) {
+    if (i != 0) { f = fp12Square(f); }
+
+    Line l1 = Line(fp2Zero(), fp2Zero(), fp2Zero());
+    r1 = doubleStep(r1, l1);
+    f = applyLine(f, l1, px1, py1);
+    Line l2 = Line(fp2Zero(), fp2Zero(), fp2Zero());
+    r2 = doubleStep(r2, l2);
+    f = applyLine(f, l2, px2, py2);
+
+    if (naf[i] != 0) {
+      Line m1 = Line(fp2Zero(), fp2Zero(), fp2Zero());
+      r1 = addStep(r1, qx1, (naf[i] == -1) ? negQy1 : qy1, m1);
+      f = applyLine(f, m1, px1, py1);
+      Line m2 = Line(fp2Zero(), fp2Zero(), fp2Zero());
+      r2 = addStep(r2, qx2, (naf[i] == -1) ? negQy2 : qy2, m2);
+      f = applyLine(f, m2, px2, py2);
+    }
+  }
+  return fp12Conjugate(f);
+}
+
+/** `e(P, Q)` for affine inputs, or null if either is the identity. */
+export Fp12? pairing(G1 p, G2 q) {
+  if (g1IsInfinity(p) || g2IsInfinity(q)) { return null; }
+  u32[]? px = g1AffineX(p);
+  u32[]? py = g1AffineY(p);
+  Fp2? qx = g2AffineX(q);
+  Fp2? qy = g2AffineY(q);
+  if ((px is null) || (py is null) || (qx is null) || (qy is null)) { return null; }
+  return finalExponentiate(millerLoop(px!, py!, qx!, qy!));
+}

@@ -1,0 +1,180 @@
+// Fp2 = Fp[u]/(u² + 1) — the quadratic extension BLS12-381's G2 lives over.
+//
+// An element is `c0 + c1·u` with `u² = −1`, held as two field elements. That choice of
+// modulus is what makes the arithmetic cheap: multiplying out gives
+//
+//   (a0 + a1u)(b0 + b1u) = (a0b0 − a1b1) + (a0b1 + a1b0)u
+//
+// and the subtraction is the whole of the reduction. Karatsuba turns the four multiplications
+// into three, which matters because everything above this file is counted in Fp2 multiplies:
+// an Fp12 multiply is eighteen of them, and a pairing is thousands of those.
+//
+// ## The conjugation is not decoration
+//
+// `fp2Conjugate` negates c1, and it appears in the pairing's Frobenius maps and in the final
+// exponentiation, where it stands in for an inversion that would otherwise cost a modular
+// inverse. Getting its sign wrong produces a pairing that is self-consistent and disagrees
+// with every published vector — which is exactly why this package checks against external
+// values rather than against itself.
+
+import { fpAdd, fpSub, fpMul, fpNeg, fpSquare, fpZero, fpOne, fpIsZero, fpEquals, fpCopy,
+         fpFromBytes, fpToBytes, fpInvert, fpSqrt, fpSgn0, fpHalf } from "./fp.wac";
+
+/** `c0 + c1·u`. Both coefficients are in Montgomery form; see `fp.wac`. */
+export struct Fp2 {
+  u32[] c0;
+  u32[] c1;
+}
+
+export Fp2 fp2Zero() { return Fp2(fpZero(), fpZero()); }
+export Fp2 fp2One() { return Fp2(fpOne(), fpZero()); }
+export Fp2 fp2Copy(Fp2 a) { return Fp2(fpCopy(a.c0), fpCopy(a.c1)); }
+
+export bool fp2IsZero(Fp2 a) { return fpIsZero(a.c0) && fpIsZero(a.c1); }
+export bool fp2Equals(Fp2 a, Fp2 b) { return fpEquals(a.c0, b.c0) && fpEquals(a.c1, b.c1); }
+
+export Fp2 fp2Add(Fp2 a, Fp2 b) { return Fp2(fpAdd(a.c0, b.c0), fpAdd(a.c1, b.c1)); }
+export Fp2 fp2Sub(Fp2 a, Fp2 b) { return Fp2(fpSub(a.c0, b.c0), fpSub(a.c1, b.c1)); }
+export Fp2 fp2Neg(Fp2 a) { return Fp2(fpNeg(a.c0), fpNeg(a.c1)); }
+
+/** `c0 − c1·u`. Also the inverse of the p-power Frobenius on Fp2. */
+export Fp2 fp2Conjugate(Fp2 a) { return Fp2(fpCopy(a.c0), fpNeg(a.c1)); }
+
+/**
+ * Karatsuba: three Fp multiplications rather than four.
+ *
+ *   v0 = a0·b0,  v1 = a1·b1
+ *   c0 = v0 − v1
+ *   c1 = (a0 + a1)(b0 + b1) − v0 − v1
+ */
+export Fp2 fp2Mul(Fp2 a, Fp2 b) {
+  u32[] v0 = fpMul(a.c0, b.c0);
+  u32[] v1 = fpMul(a.c1, b.c1);
+  u32[] mid = fpMul(fpAdd(a.c0, a.c1), fpAdd(b.c0, b.c1));
+  return Fp2(fpSub(v0, v1), fpSub(fpSub(mid, v0), v1));
+}
+
+/**
+ * Squaring, in two multiplications rather than three.
+ *
+ *   c0 = (a0 + a1)(a0 − a1)      because a0² − a1² factors
+ *   c1 = 2·a0·a1
+ */
+export Fp2 fp2Square(Fp2 a) {
+  u32[] sum = fpAdd(a.c0, a.c1);
+  u32[] diff = fpSub(a.c0, a.c1);
+  u32[] prod = fpMul(a.c0, a.c1);
+  return Fp2(fpMul(sum, diff), fpAdd(prod, prod));
+}
+
+/** `a·u`, which is `(a0 + a1u)·u = −a1 + a0·u`. */
+export Fp2 fp2MulByU(Fp2 a) { return Fp2(fpNeg(a.c1), fpCopy(a.c0)); }
+
+/**
+ * `a·(1 + u)` — the non-residue ξ that builds Fp6 out of Fp2.
+ *
+ * Written out rather than composed from `fp2Mul` with a constant, because it is on the hot
+ * path of every Fp6 multiply and costs two additions this way instead of three
+ * multiplications.
+ */
+export Fp2 fp2MulByNonresidue(Fp2 a) {
+  return Fp2(fpSub(a.c0, a.c1), fpAdd(a.c0, a.c1));
+}
+
+/** `a·k` for a base-field scalar, used by the isogeny maps and the SSWU constants. */
+export Fp2 fp2MulByFp(Fp2 a, u32[] k) { return Fp2(fpMul(a.c0, k), fpMul(a.c1, k)); }
+
+export Fp2 fp2Double(Fp2 a) { return fp2Add(a, a); }
+
+/**
+ * The norm `a0² + a1²`, an element of Fp.
+ *
+ * This is `a · conjugate(a)`, whose u-part cancels — which is what makes inversion in Fp2
+ * one Fp inversion rather than a linear solve.
+ */
+export u32[] fp2Norm(Fp2 a) { return fpAdd(fpSquare(a.c0), fpSquare(a.c1)); }
+
+/**
+ * `a⁻¹`, or null when `a` is zero.
+ *
+ * One Fp inversion, not a linear solve: `a · conjugate(a)` is the norm `a0² + a1²`, whose u-part
+ * cancels, so `a⁻¹ = conjugate(a) / norm(a)`. Zero is the only non-invertible element because the
+ * norm is a sum of two squares in a field where −1 is not a square.
+ */
+export Fp2? fp2Invert(Fp2 a) {
+  u32[]? n = fpInvert(fp2Norm(a));
+  if (n is null) { return null; }
+  return Fp2(fpMul(a.c0, n!), fpMul(fpNeg(a.c1), n!));
+}
+
+/**
+ * A square root in Fp2, or null when there is none.
+ *
+ * Fp2 is `Fp[u]/(u²+1)` with p ≡ 3 (mod 4), so the standard algorithm applies: raise to
+ * (p−3)/4 and adjust. Written the direct way instead — solve for the two coefficients through
+ * the norm — because it needs only Fp roots, which are already tested, rather than a new
+ * exponentiation with its own edge cases.
+ *
+ * For `a = a0 + a1·u`, a root `y = y0 + y1·u` satisfies y0² − y1² = a0 and 2·y0·y1 = a1. With
+ * `n = √(a0² + a1²)` that gives y0² = (a0 + n)/2, and y1 = a1/(2·y0). The result is verified by
+ * squaring, so a wrong branch is caught rather than returned.
+ */
+export Fp2? fp2Sqrt(Fp2 a) {
+  if (fp2IsZero(a)) { return fp2Zero(); }
+  if (fpIsZero(a.c1)) {
+    // Purely real: either a0 is a square, or −a0 is and the root is purely imaginary.
+    u32[]? r = fpSqrt(a.c0);
+    if (r is not null) { return Fp2(r!, fpZero()); }
+    u32[]? ri = fpSqrt(fpNeg(a.c0));
+    if (ri is null) { return null; }
+    return Fp2(fpZero(), ri!);
+  }
+  u32[] normSq = fpAdd(fpSquare(a.c0), fpSquare(a.c1));
+  u32[]? n = fpSqrt(normSq);
+  if (n is null) { return null; }
+  u32[] half = fpHalf();
+  u32[] cand = fpMul(fpAdd(a.c0, n!), half);
+  u32[]? y0 = fpSqrt(cand);
+  if (y0 is null) {
+    // The other sign of the norm.
+    cand = fpMul(fpSub(a.c0, n!), half);
+    y0 = fpSqrt(cand);
+    if (y0 is null) { return null; }
+  }
+  u32[]? inv = fpInvert(fpAdd(y0!, y0!));
+  if (inv is null) { return null; }
+  Fp2 out = Fp2(y0!, fpMul(a.c1, inv!));
+  if (!fp2Equals(fp2Square(out), a)) { return null; }
+  return out;
+}
+
+/**
+ * `sgn0` from RFC 9380 §4.1, lifted to Fp2: the parity of c0, or of c1 when c0 is zero.
+ *
+ * Not the point-compression sign convention — see `fpSgn0`. This one decides which root
+ * hash-to-curve picks, and the wrong one lands on the right curve at the wrong y.
+ */
+export bool fp2Sgn0(Fp2 a) {
+  if (fpIsZero(a.c0)) { return fpSgn0(a.c1); }
+  return fpSgn0(a.c0);
+}
+
+/** `a⁻¹` with zero mapping to zero — RFC 9380's `inv0`. */
+export Fp2 fp2Inv0(Fp2 a) {
+  Fp2? r = fp2Invert(a);
+  return (r is null) ? fp2Zero() : r!;
+}
+
+/** Whether `a` has a square root in Fp2. */
+export bool fp2IsSquare(Fp2 a) { return fp2Sqrt(a) is not null; }
+
+/** Two 48-byte coefficients, `c1` first as the Ethereum encodings order them. */
+export Fp2? fp2FromBytes(u8[] c1, u8[] c0) {
+  u32[]? x1 = fpFromBytes(c1);
+  u32[]? x0 = fpFromBytes(c0);
+  if ((x1 is null) || (x0 is null)) { return null; }
+  return Fp2(x0!, x1!);
+}
+
+export u8[] fp2C0Bytes(Fp2 a) { return fpToBytes(a.c0); }
+export u8[] fp2C1Bytes(Fp2 a) { return fpToBytes(a.c1); }

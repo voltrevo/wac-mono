@@ -1,0 +1,404 @@
+// RFC 9380 §6.6.2 simplified SWU, and the 3-isogeny that carries its output back to G2.
+//
+// The map lands on E': y² = x³ + 240u·x + 1012(1 + u), which is 3-isogenous to the curve
+// signatures actually live on. That indirection is not an optimisation — the real curve has
+// A = 0, and simplified SWU needs A and B both non-zero, so the isogeny is how the construction
+// applies at all.
+//
+// ## Every constant here came out of the draft by script
+//
+// The thirteen isogeny coefficients were parsed from RFC 9380's appendix, shape-checked against
+// the 4/2/4/3 the 3-isogeny must have, and emitted in Montgomery form. My first parse silently
+// merged them with G1's *11*-isogeny — a single-digit regex turned `k_(1,11)` into `k_(1,1)` —
+// and produced forty plausible-looking coefficients. The shape assertion caught it; the spot
+// checks I had written did not, because the collision missed the ones they tested.
+//
+// That is the whole argument for the arrangement of this package: wrong constants give
+// arithmetic that is entirely self-consistent and disagrees only with published vectors.
+
+import { fpZero, fpOne } from "./fp.wac";
+import { Fp2, fp2Add, fp2Sub, fp2Mul, fp2Square, fp2Neg, fp2Zero, fp2One, fp2IsZero, fp2Equals,
+         fp2Copy, fp2Invert, fp2Sqrt, fp2Sgn0, fp2Inv0, fp2IsSquare } from "./fp2.wac";
+import { G2, g2Add, g2Mul, g2Double, g2Negate, g2Psi,
+         absX as absXScalar } from "./g2.wac";
+import { hashToFieldFp2 } from "./hash.wac";
+
+/** A' = 240·u, the isogenous curve's A. */
+Fp2 swuA() {
+  u32[] a = u32[12]();
+  a[0] = 0x00000000; a[1] = 0x00000000; a[2] = 0x00000000; a[3] = 0x00000000;
+  a[4] = 0x00000000; a[5] = 0x00000000; a[6] = 0x00000000; a[7] = 0x00000000;
+  a[8] = 0x00000000; a[9] = 0x00000000; a[10] = 0x00000000; a[11] = 0x00000000;
+  u32[] b = u32[12]();
+  b[0] = 0x03135242; b[1] = 0xe53a0000; b[2] = 0xdef80285; b[3] = 0x01080c0f;
+  b[4] = 0xe340f6bd; b[5] = 0xe7889edb; b[6] = 0x26310601; b[7] = 0x0b513751;
+  b[8] = 0x17c744ab; b[9] = 0x02d69857; b[10] = 0x79ea5467; b[11] = 0x1220b4e9;
+  return Fp2(a, b);
+}
+
+/** B' = 1012(1 + u), its B. */
+Fp2 swuB() {
+  u32[] a = u32[12]();
+  a[0] = 0x0cf89db2; a[1] = 0x22ea0000; a[2] = 0x71380aa4; a[3] = 0x6ec832df;
+  a[4] = 0x3db5a66e; a[5] = 0x6e1b9440; a[6] = 0xa79473ba; a[7] = 0x75bf3c53;
+  a[8] = 0x412c0a34; a[9] = 0x3dd3a569; a[10] = 0x74dc4fd1; a[11] = 0x125cdb5e;
+  u32[] b = u32[12]();
+  b[0] = 0x0cf89db2; b[1] = 0x22ea0000; b[2] = 0x71380aa4; b[3] = 0x6ec832df;
+  b[4] = 0x3db5a66e; b[5] = 0x6e1b9440; b[6] = 0xa79473ba; b[7] = 0x75bf3c53;
+  b[8] = 0x412c0a34; b[9] = 0x3dd3a569; b[10] = 0x74dc4fd1; b[11] = 0x125cdb5e;
+  return Fp2(a, b);
+}
+
+/** Z = −(2 + u), the SSWU parameter. */
+Fp2 swuZ() {
+  u32[] a = u32[12]();
+  a[0] = 0xfff9555c; a[1] = 0x87ebffff; a[2] = 0xda8ffffa; a[3] = 0x656fffe5;
+  a[4] = 0x45d33ad2; a[5] = 0x0fd07493; a[6] = 0x066576f4; a[7] = 0xd951e663;
+  a[8] = 0x41e980d3; a[9] = 0xde291a3d; a[10] = 0x7dfe040d; a[11] = 0x0815664c;
+  u32[] b = u32[12]();
+  b[0] = 0xfffcaaae; b[1] = 0x43f5ffff; b[2] = 0xed47fffd; b[3] = 0x32b7fff2;
+  b[4] = 0xa2e99d69; b[5] = 0x07e83a49; b[6] = 0x8332bb7a; b[7] = 0xeca8f331;
+  b[8] = 0xa0f4c069; b[9] = 0xef148d1e; b[10] = 0x3eff0206; b[11] = 0x040ab326;
+  return Fp2(a, b);
+}
+
+/** k(1,0) — the x_num coefficient on x'^0. */
+Fp2 isoK10() {
+  u32[] a = u32[12]();
+  a[0] = 0x1ce05e62; a[1] = 0x47f671c7; a[2] = 0x1206393e; a[3] = 0x06dd5707;
+  a[4] = 0xf3fd71a2; a[5] = 0x7c80cd2a; a[6] = 0x9e6cd062; a[7] = 0x048103ea;
+  a[8] = 0xc8d037f6; a[9] = 0xc54516ac; a[10] = 0x0920ea41; a[11] = 0x13808f55;
+  u32[] b = u32[12]();
+  b[0] = 0x1ce05e62; b[1] = 0x47f671c7; b[2] = 0x1206393e; b[3] = 0x06dd5707;
+  b[4] = 0xf3fd71a2; b[5] = 0x7c80cd2a; b[6] = 0x9e6cd062; b[7] = 0x048103ea;
+  b[8] = 0xc8d037f6; b[9] = 0xc54516ac; b[10] = 0x0920ea41; b[11] = 0x13808f55;
+  return Fp2(a, b);
+}
+
+/** k(1,1) — the x_num coefficient on x'^1. */
+Fp2 isoK11() {
+  u32[] a = u32[12]();
+  a[0] = 0x00000000; a[1] = 0x00000000; a[2] = 0x00000000; a[3] = 0x00000000;
+  a[4] = 0x00000000; a[5] = 0x00000000; a[6] = 0x00000000; a[7] = 0x00000000;
+  a[8] = 0x00000000; a[9] = 0x00000000; a[10] = 0x00000000; a[11] = 0x00000000;
+  u32[] b = u32[12]();
+  b[0] = 0x554c71d0; b[1] = 0x5fe55555; b[2] = 0x236aaaa3; b[3] = 0x873fffdd;
+  b[4] = 0xb26ef918; b[5] = 0x6a6b4619; b[6] = 0x08874945; b[7] = 0x21c28884;
+  b[8] = 0x028cabc5; b[9] = 0x2836cda7; b[10] = 0xa7fd5abd; b[11] = 0x0ac73310;
+  return Fp2(a, b);
+}
+
+/** k(1,2) — the x_num coefficient on x'^2. */
+Fp2 isoK12() {
+  u32[] a = u32[12]();
+  a[0] = 0x555971c3; a[1] = 0x0a0c5555; a[2] = 0x1f9eaaae; a[3] = 0xdb0c0010;
+  a[4] = 0x1d797997; a[5] = 0xb1fb2f94; a[6] = 0xef416e1c; a[7] = 0xd3960742;
+  a[8] = 0xc20556f4; a[9] = 0xb70040e2; a[10] = 0xe581393b; a[11] = 0x149d7861;
+  u32[] b = u32[12]();
+  b[0] = 0xaaa638e8; b[1] = 0xaff2aaaa; b[2] = 0x91b55551; b[3] = 0x439fffee;
+  b[4] = 0xd9377c8c; b[5] = 0xb535a30c; b[6] = 0x0443a4a2; b[7] = 0x90e14442;
+  b[8] = 0x814655e2; b[9] = 0x941b66d3; b[10] = 0x53fead5e; b[11] = 0x05639988;
+  return Fp2(a, b);
+}
+
+/** k(1,3) — the x_num coefficient on x'^3. */
+Fp2 isoK13() {
+  u32[] a = u32[12]();
+  a[0] = 0x71c725ed; a[1] = 0x40aac71c; a[2] = 0x7a84e38e; a[3] = 0x19095555;
+  a[4] = 0x8f41abc3; a[5] = 0xd817050a; a[6] = 0xc87f6fb1; a[7] = 0xd86485d4;
+  a[8] = 0xf885d059; a[9] = 0x696eb479; a[10] = 0x328002d2; a[11] = 0x198e1a74;
+  u32[] b = u32[12]();
+  b[0] = 0x00000000; b[1] = 0x00000000; b[2] = 0x00000000; b[3] = 0x00000000;
+  b[4] = 0x00000000; b[5] = 0x00000000; b[6] = 0x00000000; b[7] = 0x00000000;
+  b[8] = 0x00000000; b[9] = 0x00000000; b[10] = 0x00000000; b[11] = 0x00000000;
+  return Fp2(a, b);
+}
+
+/** k(2,0) — the x_den coefficient on x'^0. */
+Fp2 isoK20() {
+  u32[] a = u32[12]();
+  a[0] = 0x00000000; a[1] = 0x00000000; a[2] = 0x00000000; a[3] = 0x00000000;
+  a[4] = 0x00000000; a[5] = 0x00000000; a[6] = 0x00000000; a[7] = 0x00000000;
+  a[8] = 0x00000000; a[9] = 0x00000000; a[10] = 0x00000000; a[11] = 0x00000000;
+  u32[] b = u32[12]();
+  b[0] = 0xff13ab97; b[1] = 0x1f3affff; b[2] = 0x1da3ff3e; b[3] = 0xf25bfc61;
+  b[4] = 0x3819b208; b[5] = 0xca3757cb; b[6] = 0x6f8cec18; b[7] = 0x3e642736;
+  b[8] = 0x6095b089; b[9] = 0x03977bc8; b[10] = 0x3f39a952; b[11] = 0x04f69db1;
+  return Fp2(a, b);
+}
+
+/** k(2,1) — the x_den coefficient on x'^1. */
+Fp2 isoK21() {
+  u32[] a = u32[12]();
+  a[0] = 0x0027552e; a[1] = 0x44760000; a[2] = 0x43480020; a[3] = 0xdcb8009a;
+  a[4] = 0x4a6e8b59; a[5] = 0x6f7ee9ce; a[6] = 0xc0a95bc6; a[7] = 0xb10330b7;
+  a[8] = 0xfb1e54b7; a[9] = 0x6140b1fc; a[10] = 0x7f0bb4e1; a[11] = 0x0381be09;
+  u32[] b = u32[12]();
+  b[0] = 0xffd8557d; b[1] = 0x7588ffff; b[2] = 0x6e0bffdf; b[3] = 0x41f3ff64;
+  b[4] = 0xac426aca; b[5] = 0xf7b1e8d2; b[6] = 0x32dbb6f8; b[7] = 0xb3741acd;
+  b[8] = 0x482d581f; b[9] = 0xe9daf5b9; b[10] = 0xba7431b8; b[11] = 0x167f53e0;
+  return Fp2(a, b);
+}
+
+/** k(3,0) — the y_num coefficient on x'^0. */
+Fp2 isoK30() {
+  u32[] a = u32[12]();
+  a[0] = 0xbdfc77be; a[1] = 0x96d8f684; a[2] = 0x3b66d0e2; a[3] = 0xb530e4f4;
+  a[4] = 0x379652fd; a[5] = 0x184a88ff; a[6] = 0xfae804e1; a[7] = 0x57cb23ec;
+  a[8] = 0xada3eba9; a[9] = 0x0fd2e39e; a[10] = 0x31c5d5c3; a[11] = 0x08c8055e;
+  u32[] b = u32[12]();
+  b[0] = 0xbdfc77be; b[1] = 0x96d8f684; b[2] = 0x3b66d0e2; b[3] = 0xb530e4f4;
+  b[4] = 0x379652fd; b[5] = 0x184a88ff; b[6] = 0xfae804e1; b[7] = 0x57cb23ec;
+  b[8] = 0xada3eba9; b[9] = 0x0fd2e39e; b[10] = 0x31c5d5c3; b[11] = 0x08c8055e;
+  return Fp2(a, b);
+}
+
+/** k(3,1) — the y_num coefficient on x'^1. */
+Fp2 isoK31() {
+  u32[] a = u32[12]();
+  a[0] = 0x00000000; a[1] = 0x00000000; a[2] = 0x00000000; a[3] = 0x00000000;
+  a[4] = 0x00000000; a[5] = 0x00000000; a[6] = 0x00000000; a[7] = 0x00000000;
+  a[8] = 0x00000000; a[9] = 0x00000000; a[10] = 0x00000000; a[11] = 0x00000000;
+  u32[] b = u32[12]();
+  b[0] = 0x1c91b406; b[1] = 0xbf0a71c7; b[2] = 0x8b7638fd; b[3] = 0x4d6d55d2;
+  b[4] = 0x5f205aee; b[5] = 0x9d82f98e; b[6] = 0x1d1a18d5; b[7] = 0xa27aa27b;
+  b[8] = 0xd2938e86; b[9] = 0x02c3b2b2; b[10] = 0x0b09807f; b[11] = 0x0c7d1342;
+  return Fp2(a, b);
+}
+
+/** k(3,2) — the y_num coefficient on x'^2. */
+Fp2 isoK32() {
+  u32[] a = u32[12]();
+  a[0] = 0x55531c74; a[1] = 0xd7f95555; a[2] = 0x48daaaa8; a[3] = 0x21cffff7;
+  a[4] = 0x6c9bbe46; a[5] = 0x5a9ad186; a[6] = 0x0221d251; a[7] = 0x4870a221;
+  a[8] = 0xc0a32af1; a[9] = 0x4a0db369; a[10] = 0x29ff56af; a[11] = 0x02b1ccc4;
+  u32[] b = u32[12]();
+  b[0] = 0xaaac8e37; b[1] = 0xe205aaaa; b[2] = 0x68795556; b[3] = 0xfcdc0007;
+  b[4] = 0x8a1537dd; b[5] = 0x0c96011a; b[6] = 0xf163406e; b[7] = 0x1c06a963;
+  b[8] = 0x82a881e6; b[9] = 0x010df44c; b[10] = 0x0f808feb; b[11] = 0x174f4526;
+  return Fp2(a, b);
+}
+
+/** k(3,3) — the y_num coefficient on x'^3. */
+Fp2 isoK33() {
+  u32[] a = u32[12]();
+  a[0] = 0x2f67f35c; a[1] = 0xa470bda1; a[2] = 0x3327b425; a[3] = 0xc0fe38e2;
+  a[4] = 0xc6f0678d; a[5] = 0xc9d3d0f2; a[6] = 0x5b5a982e; a[7] = 0x1c55c993;
+  a[8] = 0xf0746764; a[9] = 0x27f6c0e2; a[10] = 0x28aa9054; a[11] = 0x117c5e6e;
+  u32[] b = u32[12]();
+  b[0] = 0x00000000; b[1] = 0x00000000; b[2] = 0x00000000; b[3] = 0x00000000;
+  b[4] = 0x00000000; b[5] = 0x00000000; b[6] = 0x00000000; b[7] = 0x00000000;
+  b[8] = 0x00000000; b[9] = 0x00000000; b[10] = 0x00000000; b[11] = 0x00000000;
+  return Fp2(a, b);
+}
+
+/** k(4,0) — the y_den coefficient on x'^0. */
+Fp2 isoK40() {
+  u32[] a = u32[12]();
+  a[0] = 0xfa765adf; a[1] = 0x0162ffff; a[2] = 0x0083fb75; a[3] = 0x8f7bea48;
+  a[4] = 0x59e93611; a[5] = 0x561b3c22; a[6] = 0xa9c875d5; a[7] = 0x11e19fc1;
+  a[8] = 0x00367660; a[9] = 0xca713efc; a[10] = 0x41da1151; a[11] = 0x03c6a03d;
+  u32[] b = u32[12]();
+  b[0] = 0xfa765adf; b[1] = 0x0162ffff; b[2] = 0x0083fb75; b[3] = 0x8f7bea48;
+  b[4] = 0x59e93611; b[5] = 0x561b3c22; b[6] = 0xa9c875d5; b[7] = 0x11e19fc1;
+  b[8] = 0x00367660; b[9] = 0xca713efc; b[10] = 0x41da1151; b[11] = 0x03c6a03d;
+  return Fp2(a, b);
+}
+
+/** k(4,1) — the y_den coefficient on x'^1. */
+Fp2 isoK41() {
+  u32[] a = u32[12]();
+  a[0] = 0x00000000; a[1] = 0x00000000; a[2] = 0x00000000; a[3] = 0x00000000;
+  a[4] = 0x00000000; a[5] = 0x00000000; a[6] = 0x00000000; a[7] = 0x00000000;
+  a[8] = 0x00000000; a[9] = 0x00000000; a[10] = 0x00000000; a[11] = 0x00000000;
+  u32[] b = u32[12]();
+  b[0] = 0xfd3b02c5; b[1] = 0x5db0ffff; b[2] = 0x58ebfdba; b[3] = 0xd713f523;
+  b[4] = 0xa84d161a; b[5] = 0x5ea60761; b[6] = 0x4ea6c44a; b[7] = 0xbb2c75a3;
+  b[8] = 0x21c1119b; b[9] = 0x0ac67359; b[10] = 0xbdacfbf6; b[11] = 0x0ee3d913;
+  return Fp2(a, b);
+}
+
+/** k(4,2) — the y_den coefficient on x'^2. */
+Fp2 isoK42() {
+  u32[] a = u32[12]();
+  a[0] = 0x003affc5; a[1] = 0x66b10000; a[2] = 0x64ec0030; a[3] = 0xcb1400e7;
+  a[4] = 0x6fa5d106; a[5] = 0xa73e5eb5; a[6] = 0xa0fe09a9; a[7] = 0x8984c913;
+  a[8] = 0x78ad7f13; a[9] = 0x11e10afb; a[10] = 0x3e918f52; a[11] = 0x05429d0e;
+  u32[] b = u32[12]();
+  b[0] = 0xffc4aae6; b[1] = 0x534dffff; b[2] = 0x4c67ffcf; b[3] = 0x5397ff17;
+  b[4] = 0x870b251d; b[5] = 0xbff273eb; b[6] = 0x52870915; b[7] = 0xdaf28271;
+  b[8] = 0xca9e2dc3; b[9] = 0x393a9cba; b[10] = 0xfaee5748; b[11] = 0x14be74db;
+  return Fp2(a, b);
+}
+
+/** -B'/A', a constant the map needs on every call. */
+Fp2 swuNegBOverA() {
+  u32[] a = u32[12]();
+  a[0] = 0x55474fb3; a[1] = 0x903c5555; a[2] = 0xce451105; a[3] = 0x5f98cc95;
+  a[4] = 0xefe0fade; a[5] = 0x9f8e582e; a[6] = 0xaebbd062; a[7] = 0xc68946b6;
+  a[8] = 0x0ee6de53; a[9] = 0x467a4ad1; a[10] = 0x83e23a05; a[11] = 0x0e7146f4;
+  u32[] b = u32[12]();
+  b[0] = 0xaab85af8; b[1] = 0x29c2aaaa; b[2] = 0xe30eeefa; b[3] = 0xbf133368;
+  b[4] = 0x06cffb45; b[5] = 0xc7a27a72; b[6] = 0x44c9425c; b[7] = 0x9dee04ce;
+  b[8] = 0x3464ce83; b[9] = 0x04a15ce5; b[10] = 0xb59dac95; b[11] = 0x0b8fcaf5;
+  return Fp2(a, b);
+}
+/** -1/Z, the value substituted when the SSWU denominator vanishes. */
+Fp2 swuNegInvZ() {
+  u32[] a = u32[12]();
+  a[0] = 0x00011110; a[1] = 0xacd00000; a[2] = 0xc88ccccd; a[3] = 0x9dd9999d;
+  a[4] = 0xb76352bf; a[5] = 0xb5ca2ac9; a[6] = 0xf4bc90ce; a[7] = 0xf1b574bc;
+  a[8] = 0x28a77081; a[9] = 0x42dab41f; a[10] = 0x14cd1e12; a[11] = 0x132fc6ac;
+  u32[] b = u32[12]();
+  b[0] = 0xffff2223; b[1] = 0xe396ffff; b[2] = 0xcd0d9998; b[3] = 0x4fbf332f;
+  b[4] = 0x1aff4cc4; b[5] = 0x0c4bbd3c; b[6] = 0x7926ca58; b[7] = 0x6b9c9126;
+  b[8] = 0xaef7f496; b[9] = 0x29ae4da6; b[10] = 0x2f195791; b[11] = 0x10692e94;
+  return Fp2(a, b);
+}
+
+/**
+ * Simplified SWU onto E', returning affine (x, y).
+ *
+ * Follows RFC 9380 §6.6.2 step for step, including the two branches that look like edge cases
+ * and are not: when `Z²u⁴ + Zu²` is zero the formula would divide by zero and the constant
+ * `−1/Z` stands in, and when `g(x1)` is not a square the map uses `x2` instead. Both happen for
+ * real inputs, and a version that ignored either would work for almost every message.
+ */
+Fp2[] mapToCurveSswu(Fp2 u) {
+  Fp2 a = swuA();
+  Fp2 b = swuB();
+  Fp2 z = swuZ();
+
+  Fp2 tv1 = fp2Mul(z, fp2Square(u));                 // Z·u²
+  Fp2 tv2 = fp2Square(tv1);                          // Z²·u⁴
+  Fp2 x1 = fp2Add(tv1, tv2);
+  x1 = fp2Inv0(x1);
+  bool degenerate = fp2IsZero(x1);
+  x1 = fp2Add(x1, fp2One());
+  // −1/Z, the value the RFC substitutes when the denominator vanishes. A constant: the first
+  // version inverted Z here on every call, and Z is `swuZ()`.
+  if (degenerate) { x1 = swuNegInvZ(); }
+  // x1 = (−B/A)·(1 + 1/(Z²u⁴ + Zu²)). −B/A is likewise a constant, and was likewise being
+  // recomputed with a 570-multiplication inversion every time through.
+  x1 = fp2Mul(x1, swuNegBOverA());
+
+  Fp2 gx1 = fp2Add(fp2Mul(fp2Add(fp2Square(x1), a), x1), b);   // x1³ + A·x1 + B
+  Fp2 x2 = fp2Mul(tv1, x1);                                    // Z·u²·x1
+  Fp2 gx2 = fp2Mul(gx1, fp2Mul(tv1, tv2));                     // (Z·u²)³·gx1
+
+  // One square root, not two. `fp2IsSquare` *is* an attempted root, so asking whether gx1 is a
+  // square and then taking its root computed the same expensive thing twice — and a root is a
+  // square-root exponentiation plus two inversions.
+  Fp2? root1 = fp2Sqrt(gx1);
+  bool square = root1 is not null;
+  Fp2 x = square ? x1 : x2;
+  Fp2 y = fp2Zero();
+  if (square) { y = root1!; }
+  else {
+    Fp2? root2 = fp2Sqrt(gx2);
+    if (root2 is not null) { y = root2!; }
+  }
+
+  // The sign of y follows the sign of u, by `sgn0` — parity, not the compression convention.
+  if (fp2Sgn0(y) != fp2Sgn0(u)) { y = fp2Neg(y); }
+
+  Fp2[] out = Fp2[2]();
+  out[0] = x;
+  out[1] = y;
+  return out;
+}
+
+/**
+ * The 3-isogeny E' → E, as four polynomial evaluations.
+ *
+ *   x = x_num / x_den  where x_num is cubic in x' and x_den quadratic with leading 1
+ *   y = y' · y_num / y_den  where y_num is cubic and y_den cubic with leading 1
+ *
+ * Horner in each, and one shared inversion for the two denominators would save a little; it is
+ * written the plain way because this runs twice per signature and correctness was the scarce
+ * thing.
+ */
+G2 isogenyMap(Fp2 xp, Fp2 yp) {
+  Fp2 x2 = fp2Square(xp);
+  Fp2 x3 = fp2Mul(x2, xp);
+
+  Fp2 xNum = fp2Add(fp2Add(fp2Mul(isoK13(), x3), fp2Mul(isoK12(), x2)),
+                    fp2Add(fp2Mul(isoK11(), xp), isoK10()));
+  Fp2 xDen = fp2Add(fp2Add(x2, fp2Mul(isoK21(), xp)), isoK20());
+
+  Fp2 yNum = fp2Add(fp2Add(fp2Mul(isoK33(), x3), fp2Mul(isoK32(), x2)),
+                    fp2Add(fp2Mul(isoK31(), xp), isoK30()));
+  Fp2 yDen = fp2Add(fp2Add(x3, fp2Mul(isoK42(), x2)),
+                    fp2Add(fp2Mul(isoK41(), xp), isoK40()));
+
+  // A zero denominator is the isogeny's kernel, which maps to the point at infinity.
+  if (fp2IsZero(xDen) || fp2IsZero(yDen)) { return G2(fp2One(), fp2One(), fp2Zero()); }
+
+  // Jacobian directly, so no inversion is needed. With Z = xDen·yDen:
+  //
+  //   X = xNum·xDen·yDen²          X/Z² = xNum/xDen                    ✓
+  //   Y = yp·yNum·xDen³·yDen²      Y/Z³ = yp·yNum/yDen                 ✓
+  //
+  // The `yDen²` on Y is the part I got wrong first time round, and it is worth keeping the
+  // arithmetic written out. Without it, Y/Z³ comes to yp·yNum/yDen³ — x was correct, y was
+  // cubed, and the point sat off the curve. The CFRG vectors named it immediately: Q0's x
+  // matched to the byte and its y did not, which is a far smaller search than "hash_to_G2 is
+  // wrong".
+  Fp2 z = fp2Mul(xDen, yDen);
+  Fp2 yDen2 = fp2Square(yDen);
+  Fp2 x = fp2Mul(fp2Mul(xNum, xDen), yDen2);
+  Fp2 xDen3 = fp2Mul(fp2Square(xDen), xDen);
+  Fp2 y = fp2Mul(fp2Mul(fp2Mul(yp, yNum), xDen3), yDen2);
+  return G2(x, y, z);
+}
+
+/** `map_to_curve` for G2: simplified SWU onto E', then the isogeny back to E. */
+export G2 mapToCurveG2(Fp2 u) {
+  Fp2[] p = mapToCurveSswu(u);
+  return isogenyMap(p[0], p[1]);
+}
+
+/**
+ * `clear_cofactor` by Budroni–Pintore (eprint 2017/419), rather than by multiplying by `h_eff`.
+ *
+ * The RFC defines the operation as `h_eff · P` with `h_eff` 636 bits, which is 636 doublings. This
+ * computes the same subgroup element as
+ *
+ *     [x²−x−1]P + [x−1]Ψ(P) + Ψ²(2P)
+ *
+ * using the ψ endomorphism and two multiplications by the 64-bit |x| — measured, 12 ms of the
+ * original 109. Ψ² is ψ applied twice; a dedicated ψ² map would save one Frobenius pair and is not
+ * worth the second constant table.
+ *
+ * The signs are the whole difficulty. BLS12-381's x is **negative**, so `absXScalar()` is |x| and
+ * each multiplication by it is followed by a negation. I first wrote this chain from memory and got
+ * exactly that wrong — dropping both negations — which produces a point that is on the curve, in a
+ * subgroup, and not the right one. Bilinearity would not have noticed. The version here follows
+ * `@noble/curves` line for line, and what checks it is RFC 9380 §J.10's final `P` values together
+ * with Ethereum's `hash_to_G2` fixtures, neither of which this implementation had any hand in.
+ */
+export G2 clearCofactorG2(G2 p) {
+  G2 t1 = g2Negate(g2Mul(p, absXScalar()));            // [−x]P
+  G2 t2 = g2Psi(p);                                    // Ψ(P)
+  G2 t3 = g2Psi(g2Psi(g2Double(p)));                   // Ψ²(2P)
+  t3 = g2Add(t3, g2Negate(t2));                        // Ψ²(2P) − Ψ(P)
+  t2 = g2Negate(g2Mul(g2Add(t1, t2), absXScalar()));   // [x²]P − [x]Ψ(P)
+  t3 = g2Add(t3, t2);
+  t3 = g2Add(t3, g2Negate(t1));
+  return g2Add(t3, g2Negate(p));
+}
+
+/**
+ * `hash_to_G2(msg, DST)` — RFC 9380's random-oracle encoding.
+ *
+ * Two field elements, each mapped to the curve, added, then cofactor-cleared. The addition is
+ * what makes it a *random oracle* rather than merely a map onto the curve: one `map_to_curve`
+ * alone has a distinguishable image, which is the difference between `_RO_` and `_NU_` in the
+ * suite name and matters for the security proof of anything built on it.
+ */
+export G2 hashToG2(u8[] msg, u8[] dst) {
+  Fp2[] u = hashToFieldFp2(msg, dst);
+  G2 q0 = mapToCurveG2(u[0]);
+  G2 q1 = mapToCurveG2(u[1]);
+  return clearCofactorG2(g2Add(q0, q1));
+}

@@ -1,0 +1,463 @@
+// Arithmetic modulo the BLS12-381 base field prime, in Montgomery form.
+//
+//   p = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f624
+//         1eabfffeb153ffffb9feffffffffaaab
+//
+// 381 bits, held in twelve 32-bit limbs least-significant first.
+//
+// ## Why not `crypto/src/fieldp.wac`
+//
+// That file does P-256 and P-384 from one implementation because both are *Solinas* primes:
+// reduction is limb shuffles and additions with no multiplication at all. This prime has no
+// such structure — it is not a sum of a few powers of two — so reduction needs a real
+// multiply, and the whole design of that file does not transfer. Nothing here is shared
+// with it, which is a fact worth stating rather than a duplication to feel bad about.
+//
+// ## Montgomery form, and what that means for every value here
+//
+// A field element is held as `a·R mod p` with `R = 2^384`. That is what makes reduction
+// cheap: `montMul(x, y)` computes `x·y·R⁻¹`, so multiplying two values already in the form
+// lands back in the form with no division anywhere. Addition and subtraction are unaffected
+// — the form is linear — which is why only multiplication needs the trick.
+//
+// **The form is not visible in the API and must not leak.** `fromBytes` multiplies by R²
+// to enter it and `toBytes` multiplies by 1 to leave, so a caller never sees a Montgomery
+// value. The cost of getting this wrong is an implementation that passes every internal
+// consistency check and disagrees with every test vector, which is the failure this whole
+// package is arranged to avoid.
+//
+// ## The multiply is CIOS
+//
+// Coarsely Integrated Operand Scanning: one pass per limb of `b`, accumulating `a·b[i]` into
+// the running total and immediately folding in the multiple of `p` that clears the bottom
+// limb. Twelve passes of twelve 32×32 products, so 144 of them per multiply, accumulated in
+// 64 bits because `i64` is the widest multiply wasm has — the same reason `bignum` uses
+// 32-bit limbs. There is no 64×64→128 on this machine, so 64-bit limbs would need four
+// products each and buy nothing.
+
+import { montMul, montAdd, montSub, atLeastP, subPInPlace, pWord } from "./fpkernel.wac";
+
+const i32 LIMBS = 12;
+
+/** p, least-significant limb first. */
+u32[] modulus() {
+  u32[] p = u32[LIMBS]();
+  p[0] = 0xffffaaab; p[1] = 0xb9feffff; p[2] = 0xb153ffff; p[3] = 0x1eabfffe;
+  p[4] = 0xf6b0f624; p[5] = 0x6730d2a0; p[6] = 0xf38512bf; p[7] = 0x64774b84;
+  p[8] = 0x434bacd7; p[9] = 0x4b1ba7b6; p[10] = 0x397fe69a; p[11] = 0x1a0111ea;
+  return p;
+}
+
+/** R² mod p, for entering Montgomery form. */
+u32[] r2() {
+  u32[] v = u32[LIMBS]();
+  v[0] = 0x1c341746; v[1] = 0xf4df1f34; v[2] = 0x09d104f1; v[3] = 0x0a76e6a6;
+  v[4] = 0x4c95b6d5; v[5] = 0x8de5476c; v[6] = 0x939d83c0; v[7] = 0x67eb88a9;
+  v[8] = 0xb519952d; v[9] = 0x9a793e85; v[10] = 0x92cae3aa; v[11] = 0x11988fe5;
+  return v;
+}
+
+/**
+ * −p⁻¹ mod 2³², the CIOS multiplier.
+ *
+ * Chosen so that `m = t[0] · INV mod 2³²` makes `t + m·p` end in a zero limb, which is the
+ * one step that makes the reduction work.
+ */
+const u64 INV = 0xfffcfffd;
+
+/** One, in Montgomery form: R mod p. */
+export u32[] fpOne() {
+  u32[] v = u32[LIMBS]();
+  v[0] = 0x0002fffd; v[1] = 0x76090000; v[2] = 0xc40c0002; v[3] = 0xebf4000b;
+  v[4] = 0x53c758ba; v[5] = 0x5f489857; v[6] = 0x70525745; v[7] = 0x77ce5853;
+  v[8] = 0xa256ec6d; v[9] = 0x5c071a97; v[10] = 0xfa80e493; v[11] = 0x15f65ec3;
+  return v;
+}
+
+export u32[] fpZero() { return u32[LIMBS](); }
+
+export u32[] fpCopy(u32[] a) {
+  u32[] out = u32[LIMBS]();
+  for (i32 i = 0; i < LIMBS; i++) { out[i] = a[i]; }
+  return out;
+}
+
+export bool fpIsZero(u32[] a) {
+  for (i32 i = 0; i < LIMBS; i++) {
+    if (a[i] != 0) { return false; }
+  }
+  return true;
+}
+
+export bool fpEquals(u32[] a, u32[] b) {
+  for (i32 i = 0; i < LIMBS; i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+
+
+/**
+ * That `modulus()` and `fpkernel.wac`'s immediates are the same p.
+ *
+ * p is spelled twice in this package: as the array below, for the one caller that indexes it in a
+ * loop, and as immediates throughout the generated kernel. Nothing else would notice them drifting,
+ * because every operation uses them together and a consistently wrong pair is still self-consistent.
+ * A single wrong word gives arithmetic that is correct for almost every input and wrong for a narrow
+ * band of them — the fault random vectors miss and that surfaces months later.
+ *
+ * Exported so the probe can reach it; `fp_wac.test.ts` runs it.
+ */
+export bool fpModulusConstantsAgree() {
+  u32[] p = modulus();
+  if (!atLeastP(p)) { return false; }                  // p >= p
+  u32[] zero = fpCopy(p);
+  subPInPlace(zero);
+  if (!fpIsZero(zero)) { return false; }               // p − p == 0, limb by limb
+  u32[] below = fpCopy(p);
+  below[0] = p[0] - 1;                                 // p's low limb is 0xffffaaab, so no borrow
+  if (atLeastP(below)) { return false; }               // p − 1 < p
+  for (i32 i = 0; i < LIMBS; i++) {
+    if (p[i] != pWord(i)) { return false; }            // limb for limb, array against immediates
+  }
+  return true;
+}
+
+/**
+ * `(a + b) mod p` and `(a − b) mod p`.
+ *
+ * Bodies in `fpkernel.wac`, generated — unrolled with p as immediates, which measured 20% and 17%
+ * against the loops that used to be here. Small numbers each; between them these two account for as
+ * much of a verification as multiplication does, which is why they were worth unrolling at all.
+ */
+export u32[] fpAdd(u32[] a, u32[] b) { return montAdd(a, b); }
+
+export u32[] fpSub(u32[] a, u32[] b) { return montSub(a, b); }
+
+export u32[] fpNeg(u32[] a) {
+  if (fpIsZero(a)) { return fpZero(); }
+  return fpSub(fpZero(), a);
+}
+
+/**
+ * Montgomery multiplication: `a·b·R⁻¹ mod p`.
+ *
+ * The accumulator is `LIMBS + 2` wide. The extra two are not slack: the running total after
+ * a pass can exceed 384 bits, and dropping the top word is the classic way to get a routine
+ * that is right for most inputs and wrong for the ones near p.
+ */
+/**
+ * `a · b · R⁻¹ mod p`, the Montgomery product.
+ *
+ * The body lives in `fpmul.wac`, generated by `tools/genfpmul.py` — a thousand lines of unrolled
+ * CIOS with the modulus as immediates. It was two nested loops here, which read like the published
+ * algorithm and cost three times as much: measured, two thirds of a field multiplication was loop
+ * overhead, bounds checks and array traffic rather than arithmetic. The generator's docstring has
+ * the numbers, and the variant table that also shows why 384-bit Karatsuba would be a loss.
+ */
+export u32[] fpMul(u32[] a, u32[] b) { return montMul(a, b); }
+
+export u32[] fpSquare(u32[] a) { return fpMul(a, a); }
+
+/** Enter Montgomery form: `a·R mod p`, given `a` in plain form. */
+u32[] toMont(u32[] a) { return fpMul(a, r2()); }
+
+/** Leave it: `a·R⁻¹ mod p`, which is `fpMul` against plain 1. */
+u32[] fromMont(u32[] a) {
+  u32[] one = u32[LIMBS]();
+  one[0] = 1;
+  return fpMul(a, one);
+}
+
+/**
+ * A 48-byte big-endian value into a field element, or null if it is not below p.
+ *
+ * Rejecting rather than reducing is the point: a non-canonical encoding of a valid point is
+ * a different byte string for the same group element, and accepting both is how signature
+ * malleability gets in.
+ */
+export u32[]? fpFromBytes(u8[] s) {
+  if (s.len() != 48) { return null; }
+  u32[] v = u32[LIMBS]();
+  for (i32 i = 0; i < LIMBS; i++) {
+    i32 at = 48 - 4 * (i + 1);
+    v[i] = (((s[at] as@ u32) << 24) | ((s[at + 1] as@ u32) << 16)
+          | ((s[at + 2] as@ u32) << 8) | (s[at + 3] as@ u32));
+  }
+  if (atLeastP(v)) { return null; }
+  return toMont(v);
+}
+
+/** The 48-byte big-endian encoding, canonical because the value is reduced. */
+export u8[] fpToBytes(u32[] a) {
+  u32[] v = fromMont(a);
+  u8[] out = u8[48]();
+  for (i32 i = 0; i < LIMBS; i++) {
+    i32 at = 48 - 4 * (i + 1);
+    out[at] = ((v[i] >> 24) & 0xFF) as! i32;
+    out[at + 1] = ((v[i] >> 16) & 0xFF) as! i32;
+    out[at + 2] = ((v[i] >> 8) & 0xFF) as! i32;
+    out[at + 3] = (v[i] & 0xFF) as! i32;
+  }
+  return out;
+}
+
+/**
+ * `a^e mod p`, square-and-multiply over the exponent's bits, most significant first.
+ *
+ * Not constant-time, and it does not need to be: this package verifies signatures, so every
+ * value it handles is public. The exponent is always a fixed constant here — p−2 for
+ * inversion, (p+1)/4 for square roots — so there is no secret to leak in the first place.
+ */
+u32[] powRaw(u32[] a, u32[] e) {
+  u32[] acc = fpOne();
+  for (i32 i = LIMBS - 1; i >= 0; i--) {
+    for (i32 b = 31; b >= 0; b--) {
+      acc = fpSquare(acc);
+      if (((e[i] >> (b as@ u32)) & 1) != 0) { acc = fpMul(acc, a); }
+    }
+  }
+  return acc;
+}
+
+// --- Inversion by binary extended GCD ------------------------------------------------------
+//
+// Fermat's little theorem gives inversion for free once you have exponentiation — a^(p−2) — and
+// that is what this used to do. It costs 381 squarings and about 190 multiplications, which
+// measured is 3.1 ms of a 19 ms signature verification: roughly a sixth of the total, spent in
+// about ten calls hidden inside affine conversion, `fp2Invert` and the SSWU map.
+//
+// Binary extended GCD replaces all of it with shifts, compares and additions. There are no
+// multiplications at all, and the loop runs at most about 2·381 halvings.
+//
+// This is *not* constant time — the iteration count depends on the value. That is deliberate and
+// safe here: every inversion in this package is applied to public data (a public key, a signature,
+// a hashed message, a point being decompressed). Nothing secret is ever inverted, because nothing
+// in signature verification is secret. A signing implementation could not reuse this as it stands,
+// which is why it says so here rather than in a commit message.
+
+bool isEvenRaw(u32[] a) { return (a[0] & 1) == 0; }
+
+bool isOneRaw(u32[] a) {
+  if (a[0] != 1) { return false; }
+  for (i32 i = 1; i < LIMBS; i++) {
+    if (a[i] != 0) { return false; }
+  }
+  return true;
+}
+
+/** `a >>= 1`. */
+void shr1Raw(u32[] a) {
+  for (i32 i = 0; i < LIMBS - 1; i++) {
+    a[i] = (a[i] >> 1) | ((a[i + 1] & 1) << 31);
+  }
+  a[LIMBS - 1] = a[LIMBS - 1] >> 1;
+}
+
+/**
+ * `a = (a + p) >> 1`, used when `a` is odd and must be halved modulo p.
+ *
+ * The sum needs no thirteenth limb. `a` is always below p here — it starts at 1, and every update
+ * is either a halving or a `subModRaw`, both of which stay below p — so `a + p < 2p < 2^382`, and
+ * a 381-bit prime in 384 bits leaves the three spare bits that makes that fit. I wrote a carry
+ * branch first and then checked whether it was reachable: it is not, across every inversion in the
+ * suite, which agrees with the arithmetic rather than merely failing to contradict it.
+ */
+void halveWithModulus(u32[] a) {
+  u64 carry = 0;
+  for (i32 i = 0; i < LIMBS; i++) {
+    u64 t = (a[i] as u64) + (pWord(i) as u64) + carry;
+    a[i] = (t & 0xFFFFFFFF) as@ u32;
+    carry = t >> 32;
+  }
+  shr1Raw(a);
+}
+
+/** Whether `a >= b`, as plain integers. */
+bool geRaw(u32[] a, u32[] b) {
+  for (i32 i = LIMBS - 1; i >= 0; i--) {
+    if (a[i] != b[i]) { return (a[i] as u64) > (b[i] as u64); }
+  }
+  return true;
+}
+
+/** `a -= b`, wrapping. Only called when `a >= b`. */
+void subRaw(u32[] a, u32[] b) {
+  i64 borrow = 0;
+  for (i32 i = 0; i < LIMBS; i++) {
+    i64 d = (a[i] as i64) - (b[i] as i64) - borrow;
+    a[i] = (d & 0xFFFFFFFF) as@ u32;
+    borrow = (d < 0) ? 1 : 0;
+  }
+}
+
+/** `a = (a − b) mod p`, for `a`, `b` already below p. */
+void subModRaw(u32[] a, u32[] b) {
+  if (geRaw(a, b)) { subRaw(a, b); return; }
+  // a < b, so a − b + p, computed as a + (p − b).
+  u32[] t = fpCopy(b);
+  u32[] p = modulus();
+  subRaw(p, t);            // p − b
+  u64 carry = 0;
+  for (i32 i = 0; i < LIMBS; i++) {
+    u64 s = (a[i] as u64) + (p[i] as u64) + carry;
+    a[i] = (s & 0xFFFFFFFF) as@ u32;
+    carry = s >> 32;
+  }
+  if (carry != 0 || atLeastP(a)) { subPInPlace(a); }
+}
+
+/**
+ * `a⁻¹` in Montgomery form, or null for zero.
+ *
+ * The GCD below works on plain integers, so it inverts the *stored* value: given A = aR it returns
+ * A⁻¹ = a⁻¹R⁻¹, and the answer wanted is a⁻¹R. Two factors of R are missing, which is exactly two
+ * applications of `toMont`. Getting that wrong gives an answer off by a factor of R — self-
+ * consistent, and wrong against every vector, which is how the fixtures would report it.
+ */
+export u32[]? fpInvert(u32[] a) {
+  if (fpIsZero(a)) { return null; }
+  u32[] u = fpCopy(a);
+  u32[] v = modulus();
+  u32[] x1 = fpZero();
+  x1[0] = 1;
+  u32[] x2 = fpZero();
+
+  while (!isOneRaw(u) && !isOneRaw(v)) {
+    while (isEvenRaw(u)) {
+      shr1Raw(u);
+      if (isEvenRaw(x1)) { shr1Raw(x1); } else { halveWithModulus(x1); }
+    }
+    while (isEvenRaw(v)) {
+      shr1Raw(v);
+      if (isEvenRaw(x2)) { shr1Raw(x2); } else { halveWithModulus(x2); }
+    }
+    if (geRaw(u, v)) {
+      subRaw(u, v);
+      subModRaw(x1, x2);
+    } else {
+      subRaw(v, u);
+      subModRaw(x2, x1);
+    }
+  }
+
+  u32[] inv = isOneRaw(u) ? x1 : x2;
+  return toMont(toMont(inv));
+}
+
+/** (p + 1)/4, the square-root exponent. Valid because p ≡ 3 (mod 4). */
+u32[] pPlusOneOverFour() {
+  u32[] e = u32[LIMBS]();
+  e[0] = 0xffffeaab; e[1] = 0xee7fbfff; e[2] = 0xac54ffff; e[3] = 0x07aaffff;
+  e[4] = 0x3dac3d89; e[5] = 0xd9cc34a8; e[6] = 0x3ce144af; e[7] = 0xd91dd2e1;
+  e[8] = 0x90d2eb35; e[9] = 0x92c6e9ed; e[10] = 0x8e5ff9a6; e[11] = 0x0680447a;
+  return e;
+}
+
+/**
+ * A square root of `a`, or null when `a` is not a square.
+ *
+ * p ≡ 3 (mod 4), so `a^((p+1)/4)` is a root whenever one exists — and squaring the answer is
+ * the only way to find out, since the exponentiation returns *something* either way. Checking
+ * is not optional: point decompression is fed attacker-controlled bytes, and a routine that
+ * returns a non-root for a non-square would put a point that is not on the curve into the
+ * pairing.
+ */
+export u32[]? fpSqrt(u32[] a) {
+  u32[] r = powRaw(a, pPlusOneOverFour());
+  if (!fpEquals(fpSquare(r), a)) { return null; }
+  return r;
+}
+
+/** Whether the plain-form value is greater than (p−1)/2 — the sign convention for encodings. */
+export bool fpIsLexicographicallyLarger(u32[] a) {
+  u32[] v = fromMont(a);
+  u32[] half = u32[LIMBS]();
+  half[0] = 0xffffd555; half[1] = 0xdcff7fff; half[2] = 0x58a9ffff; half[3] = 0x0f55ffff;
+  half[4] = 0x7b587b12; half[5] = 0xb3986950; half[6] = 0x79c2895f; half[7] = 0xb23ba5c2;
+  half[8] = 0x21a5d66b; half[9] = 0x258dd3db; half[10] = 0x1cbff34d; half[11] = 0x0d0088f5;
+  for (i32 i = LIMBS - 1; i >= 0; i--) {
+    if (v[i] != half[i]) { return (v[i] as u64) > (half[i] as u64); }
+  }
+  return false;
+}
+
+/**
+ * Any-length big-endian bytes reduced mod p, for `hash_to_field`.
+ *
+ * `fpFromBytes` refuses anything at or above p because a *point encoding* must be canonical.
+ * This is the opposite situation: RFC 9380 hands 64 bytes of hash output and asks for it modulo
+ * p, where reducing is the specified behaviour and refusing would be wrong. Two functions rather
+ * than a flag, so no caller can reach for the lenient one by accident.
+ *
+ * Horner over 32-bit chunks: `acc = acc·2³² + word`. Sixteen multiplies for a 64-byte input,
+ * which is nothing beside the pairing that follows, and it reuses the multiply already checked
+ * against 462 Python-computed pairs rather than introducing a wide-reduction routine with its
+ * own carry edges.
+ */
+export u32[] fpFromWideBytes(u8[] s) {
+  u32[] shift = u32[LIMBS]();
+  shift[1] = 1;                          // 2³², in plain form
+  u32[] radix = toMont(shift);
+  u32[] acc = fpZero();
+  i32 at = 0;
+  // A leading partial chunk first, so the rest divides evenly into four-byte words.
+  i32 lead = s.len() % 4;
+  if (lead != 0) {
+    u32[] head = u32[LIMBS]();
+    u32 w = 0;
+    for (i32 i = 0; i < lead; i++) { w = (w << 8) | (s[i] as@ u32); }
+    head[0] = w;
+    acc = toMont(head);
+    at = lead;
+  }
+  while (at < s.len()) {
+    u32[] word = u32[LIMBS]();
+    word[0] = (((s[at] as@ u32) << 24) | ((s[at + 1] as@ u32) << 16)
+             | ((s[at + 2] as@ u32) << 8) | (s[at + 3] as@ u32));
+    acc = fpAdd(fpMul(acc, radix), toMont(word));
+    at += 4;
+  }
+  return acc;
+}
+
+/**
+ * `sgn0` from RFC 9380 §4.1 — the *parity* of the plain-form value.
+ *
+ * **Not the same as `fpIsLexicographicallyLarger`**, which is the point-compression sign
+ * convention. One is `x mod 2`, the other is `x > (p−1)/2`. They agree on some values and
+ * disagree on others, and using the wrong one gives a hash-to-curve that lands on the right
+ * curve at the wrong y for about half of all inputs — which the CFRG vectors catch and no
+ * self-consistency check ever would.
+ */
+export bool fpSgn0(u32[] a) {
+  u32[] v = fromMont(a);
+  return (v[0] & 1) != 0;
+}
+
+/** `a⁻¹`, with zero mapping to zero — RFC 9380's `inv0`. */
+export u32[] fpInv0(u32[] a) {
+  u32[]? r = fpInvert(a);
+  return (r is null) ? fpZero() : r!;
+}
+
+/** Whether `a` is a square, by the Legendre symbol. Zero counts as a square. */
+export bool fpIsSquare(u32[] a) {
+  if (fpIsZero(a)) { return true; }
+  return fpSqrt(a) is not null;
+}
+
+/**
+ * 1/2, in Montgomery form.
+ *
+ * A constant because three separate places were computing it with `fpInvert` — a 570-multiplication
+ * Fermat exponentiation — on every call. One of them was inside a Miller loop and cost 28 ms of a
+ * 36 ms loop. Halving is common enough in curve formulas that it belongs here once.
+ */
+export u32[] fpHalf() {
+  u32[] v = u32[12]();
+  v[0] = 0x00015554; v[1] = 0x18040000; v[2] = 0x3ab00001; v[3] = 0x85500005;
+  v[4] = 0x253c276f; v[5] = 0x633cb57c; v[6] = 0x31ebb502; v[7] = 0x6e22d1ec;
+  v[8] = 0xf2d14ca2; v[9] = 0xd3916126; v[10] = 0x1a006596; v[11] = 0x17fbb857;
+  return v;
+}

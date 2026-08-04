@@ -1078,7 +1078,7 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
  * next stage begins, so `seq 1 200000 | head -1` waits for all 200,000 lines: `Output` is bytes in
  * and bytes out. Now that stages *can* be concurrent — separate workers, watchable together by
  * `waitAny` — what would fix it is a pipeline that starts every stage first and shuttles between
- * them. Issue 0036.
+ * them. Issue 0038.
  */
 Output collectChild(Shell sh, string name, Child child, u8[] stdin) {
   // The input in one go, then the *end* — `closeFeed`, not `closeSocket`. A program that reads to
