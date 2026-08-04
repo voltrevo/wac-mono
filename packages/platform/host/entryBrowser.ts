@@ -16,7 +16,8 @@ import { browserWorld, type BrowserWorldOptions, type Dom } from "./browser.ts";
 import { cliOf, coreOf, type PageClasses, pageOf } from "./provider.ts";
 import type { AppModule } from "./entry.ts";
 
-type Start = { sab: SharedArrayBuffer };
+/** `child` is set by `spawnChild`: a spawned program runs `main`, never `page`. */
+type Start = { sab: SharedArrayBuffer; child?: boolean };
 type Result = { ok: true; code: number } | { ok: false; error: string };
 
 /**
@@ -53,7 +54,11 @@ export function runAsWorkerBrowser(load: () => Promise<AppModule>): void {
         // filesystem and arguments like any other program — `packages/sh` in a terminal needs
         // `Cli` to be a shell at all — and withholding it would have meant a second way to ask
         // for the same things.
-        const code = app.page !== undefined
+        // A child runs `main` even when this program also exports `page`: it was spawned, so it has
+        // a handle and no canvas, and its output belongs to whoever started it. That is what lets one
+        // bundle be both a terminal and the sixty programs the terminal runs.
+        const asChild = (start as unknown as { child?: boolean }).child === true;
+        const code = app.page !== undefined && !asChild
           ? app.page(coreOf(b, app), cliOf(b, app), pageOf(b, app as unknown as PageClasses))
           : app.main(coreOf(b, app), cliOf(b, app));
         scope.postMessage({ ok: true, code });
@@ -296,7 +301,9 @@ export async function runInPage(opts: PageOptions): Promise<number> {
   }
 
   const bridge = newBridge();
-  const responder = serveHostCalls(bridge, browserWorld(opts));
+  // `selfSource` so `spawnSelf` has something to run: a page has no filesystem of programs, and
+  // this is the program. `opts` already carries the bundle — it is what the launcher starts.
+  const responder = serveHostCalls(bridge, browserWorld({ ...opts, selfSource: opts.workerSource }));
 
   const url = URL.createObjectURL(new Blob([opts.workerSource], { type: "text/javascript" }));
   const worker = new Worker(url, { type: "module" });

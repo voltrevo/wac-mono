@@ -453,6 +453,23 @@ The grace period on that wait resolves as *alive*, never as failed — a slow lo
 must not be reported as a program that would not start. Which leaves the case where a file parses and
 then says nothing at all, and that still hangs: issue 0033, where the trade-off is written down.
 
+**`spawnSelf` is how a page has programs at all.** `spawn` takes a worker bundle, and a bundle comes
+from a filesystem — fine on a command line, impossible in a browser tab, where there is no directory
+of programs and nothing to have put one there. So a page could spawn and had nothing to spawn.
+
+Every built program already carries its own bundle: the launcher holds it as a string, because that is
+how it started the program. `spawnSelf(args, grants)` runs it again with different arguments, needing
+no file, no path and no grant of its own — and a program whose `main` dispatches on argv is therefore
+sixty programs. That is what `packages/box` is: `box sort` is `box` reading its first argument.
+
+```wac
+Child kid = cli.spawnSelf(string[]("sort", "-n"), GRANT_READ).wait();
+```
+
+A child runs `main` even when the program also exports `page`, because it was spawned: it has a handle
+and nowhere to draw. One bundle can therefore be both a terminal and the programs the terminal runs —
+see `packages/platform/example/twin.wac`, which is the whole idea in forty lines, and issue 0030.
+
 `closeFeed` is distinct from `closeSocket` because they differ in a way that matters:
 `closeFeed` ends the child's standard input, `closeSocket` stops the child. A program that
 reads to the end before answering — `wc` — needs the end while it is still alive.

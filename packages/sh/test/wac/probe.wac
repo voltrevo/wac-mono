@@ -247,6 +247,15 @@ Pending<Child> fakeSpawn(string source, string[] argv, i32 grants) {
   if (source == "nospawnworld") { handle = -2; }
   return Pending.of(handle, resolveChild, alwaysSettled, ignoreDrop);
 }
+/**
+ * Running this program again, which the fake world cannot do — so it says so rather than pretending.
+ *
+ * -2 is "there is no `spawn` here", the answer every world that cannot gives, and the one a caller is
+ * expected to have another route for.
+ */
+Pending<Child> fakeSpawnSelf(string[] argv, i32 grants) {
+  return Pending.of(-2, resolveChild, alwaysSettled, ignoreDrop);
+}
 void fakeCloseFeed(i32 handle) {}
 i32 resolveNegative(i32 id) { return -1; }
 Pending<i32> fakeExitCode(i32 handle) {
@@ -290,7 +299,7 @@ Cli fakeCli() {
   return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeWriteErr, fakeReadFile, fakeWriteFile,
                 fakeStat, fakeLinkStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
                 fakeReadChunk, fakeOutputError, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
-                fakeSend, fakeCloseSocket, fakeSpawn, fakeCloseFeed, fakeExitCode,
+                fakeSend, fakeCloseSocket, fakeSpawn, fakeSpawnSelf, fakeCloseFeed, fakeExitCode,
                 fakeCwd, fakePushChild, fakePopChild);
 }
 

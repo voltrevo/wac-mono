@@ -747,6 +747,29 @@ export struct Cli {
   fn[Pending<Child>(string, string[], i32)] spawn;
 
   /**
+   * **This same program again, as a child**, with these arguments and at most these grants.
+   *
+   * `spawn` needs a worker bundle from somewhere, and somewhere is a filesystem — which is fine on a
+   * command line and impossible in a browser tab, where there is no directory of programs and
+   * nothing to have put one there. So a page could spawn and had nothing to spawn, and
+   * `packages/box`'s applets ran *inside* the shell's own wasm instance with no boundary at all.
+   *
+   * Every built program already carries its own worker bundle: the launcher holds it as a string,
+   * because that is how it started the program in the first place. So "run me again" needs no file,
+   * no path and no grant of its own — the code is already here, and the argument is what decides
+   * which program it becomes. `box sort` is `box` with `sort` as its first argument, which is exactly
+   * what a multi-call binary is; a shell that can say that has sixty real programs instead of sixty
+   * function calls.
+   *
+   * The child runs `main`, never `page`, even when the program has both. A page is the top-level
+   * thing a person opened; a child is a program with a handle, and there is nowhere for it to draw.
+   *
+   * Grants are a ceiling of the parent's own, as with `spawn`: a shell that may read hands its
+   * children reading, and a program granted nothing cannot widen itself by spawning.
+   */
+  fn[Pending<Child>(string[], i32)] spawnSelf;
+
+  /**
    * End a spawned worker's standard input without stopping it.
    *
    * Distinct from `closeSocket`, which stops the child outright. A program that reads to the
@@ -839,6 +862,7 @@ export struct Cli {
     fn[Pending<bool>(i32, u8[])] send,
     fn[void(i32)] closeSocket,
     fn[Pending<Child>(string, string[], i32)] spawn,
+    fn[Pending<Child>(string[], i32)] spawnSelf,
     fn[void(i32)] closeFeed,
     fn[Pending<i32>(i32)] exitCode,
     fn[Pending<string>()] cwd,
@@ -848,7 +872,7 @@ export struct Cli {
     return Cli(
       argCount, arg, env, readStdin, write, writeErr, readFile, writeFile, stat, linkStat, readDir,
       mkdir, remove, rename, openInput, readChunk, outputError, openOutput,
-      connect, listen, accept, recv, send, closeSocket, spawn, closeFeed, exitCode, cwd,
+      connect, listen, accept, recv, send, closeSocket, spawn, spawnSelf, closeFeed, exitCode, cwd,
       pushChild, popChild
     );
   }

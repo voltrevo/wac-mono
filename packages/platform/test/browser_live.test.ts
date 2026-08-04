@@ -373,6 +373,16 @@ Deno.test({
       assertEquals(spawned.includes(nativeOut), true, `page: ${spawned}\nnative: ${nativeOut}`);
       assertEquals(spawned.includes("[exit 0]"), true, spawned);
 
+      // And the same page running *itself* as a child, which is the half of 0030 that matters for a
+      // browser: there is no filesystem of programs in a tab, so the only program a page reliably has
+      // is the one it already is. No file was written for this one — that is the whole point.
+      await buildApp("packages/platform/example/twin.wac", `${dir}/twin.html`, {}, "browser");
+      const twin = await run("twin.html");
+      assertEquals(twin.includes("parent: about to run myself"), true, twin);
+      assertEquals(twin.includes("SHOUT: HELLO TWIN"), true, twin);
+      assertEquals(twin.includes("parent: the child exited 0"), true, twin);
+      assertEquals(twin.includes("[exit 0]"), true, twin);
+
       assertEquals(failures.join("\n"), "", "the page raised errors");
     } finally {
       await browser?.close();

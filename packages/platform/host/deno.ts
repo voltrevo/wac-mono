@@ -5,7 +5,7 @@
 // know the difference.
 
 import { type Handlers, serveHostCalls } from "./respond.ts";
-import { ByteQueue, type Child, failedChild, spawnChild } from "./children.ts";
+import { ByteQueue, type Child, failedChild, noSpawnHere, spawnChild } from "./children.ts";
 import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
@@ -34,6 +34,14 @@ export type DenoWorldOptions = {
   write?(bytes: Uint8Array): void;
   /** Where exact bytes on the *error* stream go. A spawned world sends both to its parent. */
   writeErr?(bytes: Uint8Array): void;
+  /**
+   * This program's own worker bundle, for `spawnSelf`.
+   *
+   * Passed by the launcher, which has it because it is what started the program. Absent means
+   * `spawnSelf` answers "there is no spawn here" rather than failing — a world assembled by hand,
+   * as the tests do, has no bundle to speak of.
+   */
+  selfSource?: string;
   readStdin?(): Promise<Uint8Array>;
 };
 
@@ -120,7 +128,61 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
   const writeOut = opts.write;
   const writeErrOut = opts.writeErr;
+  const selfSource = opts.selfSource;
   const readIn = opts.readStdin;
+
+  /**
+   * Start a child on `source`, with `want` narrowed to this world's own authority.
+   *
+   * Shared by `spawn` and `spawnSelf`, which differ only in where the source comes from. The
+   * intersection is a presence test against `opts`, which *is* the whole of this world's authority —
+   * so there is no second list to keep in step. Asking for more than the parent has is not an error:
+   * the child finds the capability denied, exactly as it would if the parent had asked for nothing.
+   */
+  const startChild = async (
+    source: string,
+    childArgs: string[],
+    want: number,
+  ): Promise<Uint8Array> => {
+    const give = {
+      read: (want & GRANT_READ) !== 0 && opts.fs?.read === true,
+      write: (want & GRANT_WRITE) !== 0 && opts.fs?.write === true,
+      net: (want & GRANT_NET) !== 0 && opts.net === true,
+      env: (want & GRANT_ENV) !== 0 && opts.env !== undefined,
+    };
+    const h = nextHandle++;
+    const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
+      const enc = new TextEncoder();
+      return serveHostCalls(bridgeOf(sab), denoWorld({
+        args: cargs,
+        // Absent rather than false where nothing is granted: the world reads a missing option as
+        // "no such capability", and `fs: {}` is not the same as no `fs`.
+        ...(give.read || give.write ? { fs: { read: give.read, write: give.write } } : {}),
+        ...(give.net ? { net: true } : {}),
+        ...(give.env ? { env: opts.env } : {}),
+        // A line of output is bytes on the handle, with the newline `log` implies. The parent
+        // cannot tell `log` from `write` — nor can a pipe, which is the point.
+        log: (l: string) => out.push(enc.encode(l + "\n")),
+        warn: (l: string) => out.push(enc.encode(l + "\n")),
+        write: (b: Uint8Array) => out.push(b),
+        // The child has one stream back to its parent, which is what `recv(handle)` reads. Its
+        // error output joins it in the order it was written rather than being dropped.
+        writeErr: (b: Uint8Array) => out.push(b),
+        readStdin: () => input.next(),
+        // So that a child can run itself as well: the bundle is the same one.
+        selfSource: opts.selfSource,
+      }));
+    }, newBridge);
+
+    const why = await child.loaded;
+    if (why !== "") {
+      // Never registered, so there is no handle to close and nothing for the parent to clean up.
+      child.kill();
+      return failedChild(why);
+    }
+    children.set(h, child);
+    return i32le(h);
+  };
 
   // The current streaming input. One at a time rather than a handle per file, because the
   // wac side has no closures to carry a handle in — see the note in platform.wac.
@@ -466,57 +528,27 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
      * process. A handle and no message means it is running; -1 and a message means it never
      * started, which is what `Child.error` is for. wac-mono issue 0021.
      */
-    [OP.SPAWN]: async (p) => {
+    [OP.SPAWN]: (p) => {
       const want = readI32le(p);
       const n = readI32le(p.subarray(4));
       const source = unstr(p.subarray(8, 8 + n));
       const rest = unstr(p.subarray(8 + n));
-      const childArgs = rest.length === 0 ? [] : rest.split("\u0000");
+      return startChild(source, rest.length === 0 ? [] : rest.split("\u0000"), want);
+    },
 
-      // Intersected with what *this* world has, not taken as given. `opts` is the whole of
-      // this world's authority — a capability is granted here by its option being present —
-      // so the intersection is a presence test and there is no second list to keep in step.
-      //
-      // Asking for more than the parent has is not an error. The child finds the capability
-      // denied, exactly as it would if the parent had asked for nothing, and a parent
-      // forwarding a request it received does not have to check it first.
-      const give = {
-        read: (want & GRANT_READ) !== 0 && opts.fs?.read === true,
-        write: (want & GRANT_WRITE) !== 0 && opts.fs?.write === true,
-        net: (want & GRANT_NET) !== 0 && opts.net === true,
-        env: (want & GRANT_ENV) !== 0 && opts.env !== undefined,
-      };
-
-      const h = nextHandle++;
-      const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
-        const enc = new TextEncoder();
-        return serveHostCalls(bridgeOf(sab), denoWorld({
-          args: cargs,
-          // Absent rather than false where nothing is granted: the world reads a missing
-          // option as "no such capability", and `fs: {}` is not the same as no `fs`.
-          ...(give.read || give.write ? { fs: { read: give.read, write: give.write } } : {}),
-          ...(give.net ? { net: true } : {}),
-          ...(give.env ? { env: opts.env } : {}),
-          // A line of output is bytes on the handle, with the newline `log` implies. The
-          // parent cannot tell `log` from `write` — nor can a pipe, which is the point.
-          log: (l: string) => out.push(enc.encode(l + "\n")),
-          warn: (l: string) => out.push(enc.encode(l + "\n")),
-          write: (b: Uint8Array) => out.push(b),
-          // The child has one stream back to its parent, which is what `recv(handle)` reads. Its
-          // error output joins it in the order it was written rather than being dropped.
-          writeErr: (b: Uint8Array) => out.push(b),
-          readStdin: () => input.next(),
-        }));
-      }, newBridge);
-
-      const why = await child.loaded;
-      if (why !== "") {
-        // Never registered, so there is no handle to close and nothing for the parent to clean up.
-        child.kill();
-        return failedChild(why);
+    /**
+     * This same program again, with different arguments. See `spawnSelf` in platform.wac.
+     *
+     * The source is the one the launcher started this program with — no file, no path, no grant. A
+     * child spawned this way is handed it too, so a program that runs itself can go on doing so.
+     */
+    [OP.SPAWN_SELF]: (p) => {
+      const want = readI32le(p);
+      const rest = unstr(p.subarray(4));
+      if (selfSource === undefined) {
+        return noSpawnHere("this launcher did not pass the program its own source");
       }
-      children.set(h, child);
-      return i32le(h);
+      return startChild(selfSource, rest.length === 0 ? [] : rest.split("\u0000"), want);
     },
 
     [OP.CLOSE_FEED]: (p) => {

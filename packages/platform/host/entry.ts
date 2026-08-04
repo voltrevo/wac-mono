@@ -63,7 +63,8 @@ export type AppModule = {
   page?: (core: unknown, cli: unknown, page: unknown) => number;
 };
 
-type Start = { sab: SharedArrayBuffer };
+/** `child` is set by `spawnChild`: a spawned program runs `main`, never `page`. */
+type Start = { sab: SharedArrayBuffer; child?: boolean };
 type Result = { ok: true; code: number } | { ok: false; error: string };
 
 const onWorker = (): boolean =>
@@ -159,6 +160,9 @@ async function runAsLauncher(workerSource: string, grants: Grants): Promise<void
     fs: { read: grants.read === true, write: grants.write === true },
     net: grants.net === true,
     env: grants.env === true ? (n) => Deno.env.get(n) : undefined,
+    // The program's own bundle, so `spawnSelf` has something to run. The launcher is the only
+    // place that has it: it is what started the program.
+    selfSource: workerSource,
   }));
 
   const url = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));

@@ -62,7 +62,8 @@ function workerFrom(wt: WorkerThreads): (source: string) => WorkerLike {
   };
 }
 
-type Start = { sab: SharedArrayBuffer };
+/** `child` is set by `spawnChild`: a spawned program runs `main`, never `page`. */
+type Start = { sab: SharedArrayBuffer; child?: boolean };
 type Result = { ok: true; code: number } | { ok: false; error: string };
 
 /**
@@ -202,6 +203,7 @@ export async function runLauncherNode(
     net: grants.net === true,
     env: grants.env === true ? (n) => proc.env[n] : undefined,
     makeWorker: workerFrom(wt),
+    selfSource: workerSource,
   }));
 
   const worker = new wt.Worker(workerSource, { eval: true });

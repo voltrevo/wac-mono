@@ -51,6 +51,7 @@ export const OP = {
   OUTPUT_ERROR: 45,
   LINK_STAT: 47,
   WRITE_STDERR: 48,
+  SPAWN_SELF: 49,
 } as const;
 
 /**

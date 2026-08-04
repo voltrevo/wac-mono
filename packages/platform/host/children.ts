@@ -224,7 +224,10 @@ export function spawnChild(
     });
   });
 
-  worker.post({ sab: bridge.sab });
+  // `child: true` so the worker runs `main` rather than `page`. A program with both is a page when a
+  // person opened it and a program when something spawned it — a child has a handle, not a canvas,
+  // and `packages/box`'s terminal exports both for exactly that reason.
+  worker.post({ sab: bridge.sab, child: true });
   return { out, in: input, exit, loaded, kill: shutdown };
 }
 

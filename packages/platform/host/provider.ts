@@ -426,6 +426,11 @@ export function cliOf(
           headed(i32le(grants), prefixed(str(source), str(args.join("\u0000")))),
         ),
       ),
+    /*= spawnSelf */
+    // No source: the host has this program's own bundle, because it is what started it. The payload
+    // is the grants and the arguments, in the shape `spawn` uses minus the part that is already here.
+    (args: string[], grants: number) =>
+      T.child(submit(b, OP.SPAWN_SELF, headed(i32le(grants), str(args.join("\u0000"))))),
     /*= closeFeed */
     (handle: number) => { hostCall(b, OP.CLOSE_FEED, i32le(handle)); },
     /*= exitCode */

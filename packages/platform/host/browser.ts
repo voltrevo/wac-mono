@@ -35,7 +35,7 @@ import { CHUNK } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 import { ChildStack, packCaptured, unpackPush } from "./child.ts";
-import { type Child, failedChild, spawnChild } from "./children.ts";
+import { type Child, failedChild, noSpawnHere, spawnChild } from "./children.ts";
 import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
 import {
@@ -117,6 +117,13 @@ export type BrowserWorldOptions = {
    */
   readStdin?(): Promise<Uint8Array>;
   /**
+   * This program's own worker bundle, for `spawnSelf`.
+   *
+   * The launcher has it — it is what started the program — and `runInPage` passes it along. Absent
+   * means `spawnSelf` says there is no spawn here rather than failing a program.
+   */
+  selfSource?: string;
+  /**
    * The Origin Private File System root, if the page is willing to grant one.
    *
    * Absent means no filesystem at all, exactly as omitting `fs` does under Deno. Passing
@@ -180,6 +187,49 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    */
   const children = new Map<number, Child>();
   let nextHandle = 1;
+
+  /**
+   * Start a child on `source`, with `want` narrowed to what this page itself was given.
+   *
+   * Shared by `spawn` and `spawnSelf`, which differ only in where the source comes from. A child
+   * gets no `dom`: its output reaches the parent through its handle, and a child that could draw
+   * would be drawing over the program that started it.
+   */
+  const startChild = async (
+    source: string,
+    childArgs: string[],
+    want: number,
+  ): Promise<Uint8Array> => {
+    const give = {
+      read: (want & GRANT_READ) !== 0 && opts.root !== undefined,
+      write: (want & GRANT_WRITE) !== 0 && opts.root !== undefined && opts.writable === true,
+    };
+    const h = nextHandle++;
+    const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
+      const enc = new TextEncoder();
+      return serveHostCalls(bridgeOf(sab), browserWorld({
+        args: cargs,
+        // A line of output is bytes on the handle, with the newline `log` implies. The parent cannot
+        // tell `log` from `write`, and neither can a pipe — which is the point.
+        log: (l: string) => out.push(enc.encode(l + "\n")),
+        warn: (l: string) => out.push(enc.encode(l + "\n")),
+        write: (b: Uint8Array) => out.push(b),
+        writeErr: (b: Uint8Array) => out.push(b),
+        readStdin: () => input.next(),
+        ...(give.read ? { root: opts.root, writable: give.write } : {}),
+        // So that a child can run itself too: the bundle is the same one.
+        selfSource: opts.selfSource,
+      }));
+    }, newBridge);
+
+    const why = await child.loaded;
+    if (why !== "") {
+      child.kill();
+      return failedChild(why);
+    }
+    children.set(h, child);
+    return i32le(h);
+  };
   const writeErr = opts.writeErr ??
     ((b: Uint8Array) => warn(new TextDecoder().decode(b)));
   const deny = (what: string): never => {
@@ -454,45 +504,29 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
      * child that could draw would be drawing over the program that started it, and a handle is not
      * a place to put a canvas.
      */
-    [OP.SPAWN]: async (p) => {
+    [OP.SPAWN]: (p) => {
       const want = readI32le(p);
       const n = readI32le(p.subarray(4));
       const source = unstr(p.subarray(8, 8 + n));
       const rest = unstr(p.subarray(8 + n));
-      const childArgs = rest.length === 0 ? [] : rest.split("\u0000");
+      return startChild(source, rest.length === 0 ? [] : rest.split("\u0000"), want);
+    },
 
-      // Intersected with what *this* page has, not taken as given: a page granted no filesystem
-      // cannot hand one to a child, and asking for more than the parent has is not an error — the
-      // child simply finds the capability denied. The same rule as the Deno host's, expressed
-      // against a page's options rather than Deno's.
-      const give = {
-        read: (want & GRANT_READ) !== 0 && opts.root !== undefined,
-        write: (want & GRANT_WRITE) !== 0 && opts.root !== undefined && opts.writable === true,
-      };
-
-      const h = nextHandle++;
-      const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
-        const enc = new TextEncoder();
-        return serveHostCalls(bridgeOf(sab), browserWorld({
-          args: cargs,
-          // A line of output is bytes on the handle, with the newline `log` implies. The parent
-          // cannot tell `log` from `write`, and neither can a pipe — which is the point.
-          log: (l: string) => out.push(enc.encode(l + "\n")),
-          warn: (l: string) => out.push(enc.encode(l + "\n")),
-          write: (b: Uint8Array) => out.push(b),
-          writeErr: (b: Uint8Array) => out.push(b),
-          readStdin: () => input.next(),
-          ...(give.read ? { root: opts.root, writable: give.write } : {}),
-        }));
-      }, newBridge);
-
-      const why = await child.loaded;
-      if (why !== "") {
-        child.kill();
-        return failedChild(why);
+    /**
+     * This same page's program again, with different arguments. See `spawnSelf` in platform.wac.
+     *
+     * **This is what gives a page programs to run at all.** `spawn` needs a bundle from a filesystem,
+     * and a browser tab has no directory of programs — so a page could spawn and had nothing to
+     * spawn. The launcher already holds this program's bundle, because it is what started it, and
+     * `packages/box` decides which applet it is from its first argument. Issue 0030.
+     */
+    [OP.SPAWN_SELF]: (p) => {
+      const want = readI32le(p);
+      const rest = unstr(p.subarray(4));
+      if (opts.selfSource === undefined) {
+        return noSpawnHere("this page did not pass the program its own source");
       }
-      children.set(h, child);
-      return i32le(h);
+      return startChild(opts.selfSource, rest.length === 0 ? [] : rest.split("\u0000"), want);
     },
 
     [OP.CLOSE_FEED]: (p) => {

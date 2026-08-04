@@ -80,6 +80,11 @@ export type NodeWorldOptions = {
    * three lines that wrap it; absent, `spawn` says so rather than failing the program.
    */
   makeWorker?: (source: string) => WorkerLike;
+  /**
+   * This program's own worker bundle, for `spawnSelf`. Passed by the launcher, which has it because
+   * it is what started the program.
+   */
+  selfSource?: string;
   log?(line: string): void;
   warn?(line: string): void;
   fs?: { read?: boolean; write?: boolean };
@@ -142,6 +147,61 @@ export function nodeWorld(
   /** Children by handle, in the same namespace as sockets: `waitAny` does not care which is which. */
   const children = new Map<number, Child>();
   let nextHandle = 1;
+
+  /**
+   * Start a child on `source`, with `want` narrowed to this world's own authority.
+   *
+   * Shared by `spawn` and `spawnSelf`, which differ only in where the source comes from. Asking for
+   * more than the parent has is not an error: the child finds the capability denied.
+   */
+  const startChild = async (
+    source: string,
+    childArgs: string[],
+    want: number,
+  ): Promise<Uint8Array> => {
+    const makeWorker = opts.makeWorker;
+    if (makeWorker === undefined) {
+      return noSpawnHere("this Node launcher was built without a way to start a worker");
+    }
+    const give = {
+      read: (want & GRANT_READ) !== 0 && opts.fs?.read === true,
+      write: (want & GRANT_WRITE) !== 0 && opts.fs?.write === true,
+      net: (want & GRANT_NET) !== 0 && opts.net === true,
+      env: (want & GRANT_ENV) !== 0 && opts.env !== undefined,
+    };
+    const h = nextHandle++;
+    const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
+      const enc = new TextEncoder();
+      // The child's stdio is the parent's queues. Everything else about its world — files, sockets,
+      // the clock — is this world's, narrowed by `give`.
+      const childIo: NodeIo = {
+        ...io,
+        readStdin: () => input.next(),
+        readStdinChunk: () => input.next(),
+        writeStdout: async (b: Uint8Array) => { out.push(b); },
+        writeStderr: async (b: Uint8Array) => { out.push(b); },
+      };
+      return serveHostCalls(bridgeOf(sab), nodeWorld(fs, proc, childIo, {
+        args: cargs,
+        ...(give.read || give.write ? { fs: { read: give.read, write: give.write } } : {}),
+        ...(give.net ? { net: true } : {}),
+        ...(give.env ? { env: opts.env } : {}),
+        // A line of output is bytes on the handle, with the newline `log` implies.
+        log: (l: string) => out.push(enc.encode(l + "\n")),
+        warn: (l: string) => out.push(enc.encode(l + "\n")),
+        makeWorker,
+        selfSource: opts.selfSource,
+      }));
+    }, newBridge, makeWorker);
+
+    const why = await child.loaded;
+    if (why !== "") {
+      child.kill();
+      return failedChild(why);
+    }
+    children.set(h, child);
+    return i32le(h);
+  };
   const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
 
   // A program running inside this one. `P` is the identity when nothing is pushed.
@@ -267,57 +327,24 @@ export function nodeWorld(
      * is why that is an argument. A launcher that did not pass one says so in the shape a caller can
      * act on: -2, "there is no spawn here", which is not a fact about the program.
      */
-    [OP.SPAWN]: async (p) => {
-      const makeWorker = opts.makeWorker;
-      if (makeWorker === undefined) {
-        return noSpawnHere("this Node launcher was built without a way to start a worker");
-      }
+    [OP.SPAWN]: (p) => {
       const want = readI32le(p);
       const n = readI32le(p.subarray(4));
       const source = unstr(p.subarray(8, 8 + n));
       const rest = unstr(p.subarray(8 + n));
-      const childArgs = rest.length === 0 ? [] : rest.split("\u0000");
+      return startChild(source, rest.length === 0 ? [] : rest.split("\u0000"), want);
+    },
 
-      // Intersected with this world's own authority, as everywhere: asking for more than the parent
-      // has is not an error, the child simply finds the capability denied.
-      const give = {
-        read: (want & GRANT_READ) !== 0 && opts.fs?.read === true,
-        write: (want & GRANT_WRITE) !== 0 && opts.fs?.write === true,
-        net: (want & GRANT_NET) !== 0 && opts.net === true,
-        env: (want & GRANT_ENV) !== 0 && opts.env !== undefined,
-      };
-
-      const h = nextHandle++;
-      const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
-        const enc = new TextEncoder();
-        // The child's stdio is the parent's queues. Everything else about its world — files,
-        // sockets, the clock — is this world's, narrowed by `give`.
-        const childIo: NodeIo = {
-          ...io,
-          readStdin: () => input.next(),
-          readStdinChunk: () => input.next(),
-          writeStdout: async (b: Uint8Array) => { out.push(b); },
-          writeStderr: async (b: Uint8Array) => { out.push(b); },
-        };
-        return serveHostCalls(bridgeOf(sab), nodeWorld(fs, proc, childIo, {
-          args: cargs,
-          ...(give.read || give.write ? { fs: { read: give.read, write: give.write } } : {}),
-          ...(give.net ? { net: true } : {}),
-          ...(give.env ? { env: opts.env } : {}),
-          // A line of output is bytes on the handle, with the newline `log` implies.
-          log: (l: string) => out.push(enc.encode(l + "\n")),
-          warn: (l: string) => out.push(enc.encode(l + "\n")),
-          makeWorker,
-        }));
-      }, newBridge, makeWorker);
-
-      const why = await child.loaded;
-      if (why !== "") {
-        child.kill();
-        return failedChild(why);
+    /** This same program again, with different arguments. See `spawnSelf` in platform.wac. */
+    [OP.SPAWN_SELF]: (p) => {
+      const want = readI32le(p);
+      const rest = unstr(p.subarray(4));
+      if (opts.selfSource === undefined) {
+        return Promise.resolve(
+          noSpawnHere("this launcher did not pass the program its own source"),
+        );
       }
-      children.set(h, child);
-      return i32le(h);
+      return startChild(opts.selfSource, rest.length === 0 ? [] : rest.split("\u0000"), want);
     },
     [OP.CLOSE_FEED]: (p) => {
       children.get(readI32le(p))?.in.end();

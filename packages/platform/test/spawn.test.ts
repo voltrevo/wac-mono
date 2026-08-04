@@ -88,6 +88,41 @@ Deno.test("a source that is not a program is a failed child, not a dead parent �
   }
 });
 
+Deno.test("a program runs itself, with no file to read and nothing to find", async () => {
+  // `spawnSelf` is what makes a *browser tab* able to run programs at all — there is no directory of
+  // bundles there — and it is the same capability everywhere, so this checks it where it is easiest
+  // to see. The child is this program with different arguments, which is what a multi-call binary is.
+  const twin = await Deno.makeTempFile({ prefix: "wac-twin-" });
+  const nodeTwin = await Deno.makeTempFile({ prefix: "wac-twin-node-" });
+  try {
+    await buildApp("packages/platform/example/twin.wac", twin, {});
+    const r = new Deno.Command(twin, { stdout: "piped", stderr: "piped" }).outputSync();
+    const err = new TextDecoder().decode(r.stderr);
+    assertEquals(r.code, 0, err);
+    assertEquals(
+      new TextDecoder().decode(r.stdout),
+      "parent: about to run myself\nSHOUT: HELLO TWIN\nparent: the child exited 0\n",
+      err,
+    );
+    // No grant of any kind: the program was built with none, and running itself needs none.
+    assertEquals((await Deno.readTextFile(twin)).split("\n")[0], "#!/usr/bin/env -S deno run", "no flags");
+
+    // And the same source, the same behaviour, on Node — where the worker is made a different way.
+    await buildApp("packages/platform/example/twin.wac", nodeTwin, {}, "node");
+    const n = new Deno.Command("node", { args: [nodeTwin], stdout: "piped", stderr: "piped" })
+      .outputSync();
+    assertEquals(n.code, 0, new TextDecoder().decode(n.stderr));
+    assertEquals(
+      new TextDecoder().decode(n.stdout),
+      new TextDecoder().decode(r.stdout),
+      "byte for byte what Deno said",
+    );
+  } finally {
+    await Deno.remove(twin);
+    await Deno.remove(nodeTwin);
+  }
+});
+
 Deno.test("Node spawns the same way, from the same code", async () => {
   // The point is not that Node can spawn — it is that it spawns through the *same* `spawnChild`.
   // Only how a worker is made differs there (a source string with `eval`, rather than a module from
