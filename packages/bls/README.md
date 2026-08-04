@@ -21,8 +21,8 @@ Under construction, built in stages with an external oracle gating each one. Wha
 | `G1` — points, subgroup check, compressed encoding | **done**, against Python |
 | `G2` — the same over Fp2, and Fp2 square roots | **done**, against Python |
 | `expand_message_xmd` + `hash_to_field` | **done**, against the CFRG vectors |
-| `map_to_curve` — SSWU and the 3-isogeny | not started |
-| `clear_cofactor` and `hash_to_G2` | not started |
+| `map_to_curve` — SSWU and the 3-isogeny | **done**, against `Q0`/`Q1` |
+| `clear_cofactor` and `hash_to_G2` | **done**, against `P` and Ethereum's fixtures |
 | Miller loop and final exponentiation | not started |
 | `verify` — against the Ethereum vectors | not started |
 

@@ -371,3 +371,57 @@ export u8[] blsHashToField(u8[] msg, u8[] dst) {
   }
   return out;
 }
+
+// ── map_to_curve ──────────────────────────────────────────────────────────────
+
+import { mapToCurveG2, hashToG2 } from "../../src/map.wac";
+
+/** `map_to_curve(u)` as affine x || y, 192 bytes, each Fp2 as c0 || c1. */
+export u8[] blsMapToCurve(u8[] uc0, u8[] uc1) {
+  Fp2? u = fp2FromBytes(uc1, uc0);
+  if (u is null) { return u8[0](); }
+  G2 q = mapToCurveG2(u!);
+  Fp2? x = g2AffineX(q);
+  Fp2? y = g2AffineY(q);
+  if ((x is null) || (y is null)) { return u8[0](); }
+  u8[] out = u8[192]();
+  u8[] xc0 = fp2C0Bytes(x!);
+  u8[] xc1 = fp2C1Bytes(x!);
+  u8[] yc0 = fp2C0Bytes(y!);
+  u8[] yc1 = fp2C1Bytes(y!);
+  for (i32 i = 0; i < 48; i++) {
+    out[i] = xc0[i]; out[48 + i] = xc1[i];
+    out[96 + i] = yc0[i]; out[144 + i] = yc1[i];
+  }
+  return out;
+}
+
+/** Whether `map_to_curve(u)` lands on the real curve — it must, after the isogeny. */
+export bool blsMapLandsOnCurve(u8[] uc0, u8[] uc1) {
+  Fp2? u = fp2FromBytes(uc1, uc0);
+  if (u is null) { return false; }
+  return g2IsOnCurve(mapToCurveG2(u!));
+}
+
+/** `hash_to_G2(msg, dst)` as affine x || y, 192 bytes. */
+export u8[] blsHashToG2(u8[] msg, u8[] dst) {
+  G2 p = hashToG2(msg, dst);
+  Fp2? x = g2AffineX(p);
+  Fp2? y = g2AffineY(p);
+  if ((x is null) || (y is null)) { return u8[0](); }
+  u8[] out = u8[192]();
+  u8[] xc0 = fp2C0Bytes(x!);
+  u8[] xc1 = fp2C1Bytes(x!);
+  u8[] yc0 = fp2C0Bytes(y!);
+  u8[] yc1 = fp2C1Bytes(y!);
+  for (i32 i = 0; i < 48; i++) {
+    out[i] = xc0[i]; out[48 + i] = xc1[i];
+    out[96 + i] = yc0[i]; out[144 + i] = yc1[i];
+  }
+  return out;
+}
+
+/** Whether the hashed point is in the order-r subgroup, which is the point of clearing. */
+export bool blsHashToG2InSubgroup(u8[] msg, u8[] dst) {
+  return g2InSubgroup(hashToG2(msg, dst));
+}

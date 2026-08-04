@@ -18,7 +18,7 @@
 // values rather than against itself.
 
 import { fpAdd, fpSub, fpMul, fpNeg, fpSquare, fpZero, fpOne, fpIsZero, fpEquals, fpCopy,
-         fpFromBytes, fpToBytes, fpInvert } from "./fp.wac";
+         fpFromBytes, fpToBytes, fpInvert, fpSqrt, fpSgn0 } from "./fp.wac";
 
 /** `c0 + c1·u`. Both coefficients are in Montgomery form; see `fp.wac`. */
 export struct Fp2 {
@@ -106,6 +106,69 @@ export Fp2? fp2Invert(Fp2 a) {
   if (n is null) { return null; }
   return Fp2(fpMul(a.c0, n!), fpMul(fpNeg(a.c1), n!));
 }
+
+/**
+ * A square root in Fp2, or null when there is none.
+ *
+ * Fp2 is `Fp[u]/(u²+1)` with p ≡ 3 (mod 4), so the standard algorithm applies: raise to
+ * (p−3)/4 and adjust. Written the direct way instead — solve for the two coefficients through
+ * the norm — because it needs only Fp roots, which are already tested, rather than a new
+ * exponentiation with its own edge cases.
+ *
+ * For `a = a0 + a1·u`, a root `y = y0 + y1·u` satisfies y0² − y1² = a0 and 2·y0·y1 = a1. With
+ * `n = √(a0² + a1²)` that gives y0² = (a0 + n)/2, and y1 = a1/(2·y0). The result is verified by
+ * squaring, so a wrong branch is caught rather than returned.
+ */
+export Fp2? fp2Sqrt(Fp2 a) {
+  if (fp2IsZero(a)) { return fp2Zero(); }
+  if (fpIsZero(a.c1)) {
+    // Purely real: either a0 is a square, or −a0 is and the root is purely imaginary.
+    u32[]? r = fpSqrt(a.c0);
+    if (r is not null) { return Fp2(r!, fpZero()); }
+    u32[]? ri = fpSqrt(fpNeg(a.c0));
+    if (ri is null) { return null; }
+    return Fp2(fpZero(), ri!);
+  }
+  u32[] normSq = fpAdd(fpSquare(a.c0), fpSquare(a.c1));
+  u32[]? n = fpSqrt(normSq);
+  if (n is null) { return null; }
+  u32[]? half = fpInvert(fpAdd(fpOne(), fpOne()));
+  if (half is null) { return null; }
+
+  u32[] cand = fpMul(fpAdd(a.c0, n!), half!);
+  u32[]? y0 = fpSqrt(cand);
+  if (y0 is null) {
+    // The other sign of the norm.
+    cand = fpMul(fpSub(a.c0, n!), half!);
+    y0 = fpSqrt(cand);
+    if (y0 is null) { return null; }
+  }
+  u32[]? inv = fpInvert(fpAdd(y0!, y0!));
+  if (inv is null) { return null; }
+  Fp2 out = Fp2(y0!, fpMul(a.c1, inv!));
+  if (!fp2Equals(fp2Square(out), a)) { return null; }
+  return out;
+}
+
+/**
+ * `sgn0` from RFC 9380 §4.1, lifted to Fp2: the parity of c0, or of c1 when c0 is zero.
+ *
+ * Not the point-compression sign convention — see `fpSgn0`. This one decides which root
+ * hash-to-curve picks, and the wrong one lands on the right curve at the wrong y.
+ */
+export bool fp2Sgn0(Fp2 a) {
+  if (fpIsZero(a.c0)) { return fpSgn0(a.c1); }
+  return fpSgn0(a.c0);
+}
+
+/** `a⁻¹` with zero mapping to zero — RFC 9380's `inv0`. */
+export Fp2 fp2Inv0(Fp2 a) {
+  Fp2? r = fp2Invert(a);
+  return (r is null) ? fp2Zero() : r!;
+}
+
+/** Whether `a` has a square root in Fp2. */
+export bool fp2IsSquare(Fp2 a) { return fp2Sqrt(a) is not null; }
 
 /** Two 48-byte coefficients, `c1` first as the Ethereum encodings order them. */
 export Fp2? fp2FromBytes(u8[] c1, u8[] c0) {

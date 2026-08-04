@@ -16,7 +16,7 @@
 
 import { fpZero, fpOne, fpToBytes } from "./fp.wac";
 import { Fp2, fp2Add, fp2Sub, fp2Mul, fp2Square, fp2Neg, fp2Zero, fp2One, fp2IsZero, fp2Equals,
-         fp2Copy, fp2Invert, fp2FromBytes, fp2C0Bytes, fp2C1Bytes } from "./fp2.wac";
+         fp2Copy, fp2Invert, fp2FromBytes, fp2C0Bytes, fp2C1Bytes, fp2Sqrt } from "./fp2.wac";
 import { fpIsZero, fpIsLexicographicallyLarger, fpSqrt, fpNeg, fpEquals, fpAdd, fpSub,
          fpMul, fpSquare, fpInvert } from "./fp.wac";
 import { groupOrder } from "./g1.wac";
@@ -229,49 +229,6 @@ export G2? g2Decompress(u8[] s) {
   Fp2 chosen = y!;
   if (fp2IsLarger(chosen) != wantLarger) { chosen = fp2Neg(chosen); }
   return G2(x!, chosen, fp2One());
-}
-
-/**
- * A square root in Fp2, or null when there is none.
- *
- * Fp2 is `Fp[u]/(u²+1)` with p ≡ 3 (mod 4), so the standard algorithm applies: raise to
- * (p−3)/4 and adjust. Written the direct way instead — solve for the two coefficients through
- * the norm — because it needs only Fp roots, which are already tested, rather than a new
- * exponentiation with its own edge cases.
- *
- * For `a = a0 + a1·u`, a root `y = y0 + y1·u` satisfies y0² − y1² = a0 and 2·y0·y1 = a1. With
- * `n = √(a0² + a1²)` that gives y0² = (a0 + n)/2, and y1 = a1/(2·y0). The result is verified by
- * squaring, so a wrong branch is caught rather than returned.
- */
-Fp2? fp2Sqrt(Fp2 a) {
-  if (fp2IsZero(a)) { return fp2Zero(); }
-  if (fpIsZero(a.c1)) {
-    // Purely real: either a0 is a square, or −a0 is and the root is purely imaginary.
-    u32[]? r = fpSqrt(a.c0);
-    if (r is not null) { return Fp2(r!, fpZero()); }
-    u32[]? ri = fpSqrt(fpNeg(a.c0));
-    if (ri is null) { return null; }
-    return Fp2(fpZero(), ri!);
-  }
-  u32[] normSq = fpAdd(fpSquare(a.c0), fpSquare(a.c1));
-  u32[]? n = fpSqrt(normSq);
-  if (n is null) { return null; }
-  u32[]? half = fpInvert(fpAdd(fpOne(), fpOne()));
-  if (half is null) { return null; }
-
-  u32[] cand = fpMul(fpAdd(a.c0, n!), half!);
-  u32[]? y0 = fpSqrt(cand);
-  if (y0 is null) {
-    // The other sign of the norm.
-    cand = fpMul(fpSub(a.c0, n!), half!);
-    y0 = fpSqrt(cand);
-    if (y0 is null) { return null; }
-  }
-  u32[]? inv = fpInvert(fpAdd(y0!, y0!));
-  if (inv is null) { return null; }
-  Fp2 out = Fp2(y0!, fpMul(a.c1, inv!));
-  if (!fp2Equals(fp2Square(out), a)) { return null; }
-  return out;
 }
 
 /** Decompress and check the encoding, the curve and the subgroup. */
