@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-24 packages, 42,843 lines of wac, 908 tests,
+24 packages, 42,916 lines of wac, 909 tests,
 22 command-line programs and 4 browser pages.
 
 ## Packages
@@ -23,19 +23,19 @@ In dependency order: nothing here imports anything below it.
 | [`fmt`](packages/fmt/) | Numbers to and from text. | 1,132 | 25 | `bytes` |
 | [`gzip`](packages/gzip/) | gzip (RFC 1952) and DEFLATE (RFC 1951) written in wac. | 2,014 | 83 | `bytes` |
 | [`http`](packages/http/) | HTTP/1.1: parsing requests and responses, and writing both. | 914 | 27 | `bytes` |
-| [`platform`](packages/platform/) | A capability world for wac applications, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell… | 2,098 | 46 | `bytes` |
+| [`platform`](packages/platform/) | A capability world for wac applications, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell… | 2,164 | 46 | `bytes` |
 | [`stream`](packages/stream/) | Run a wac transform as a `ReadableStream`/`WritableStream` pair, so it consumes input as it arrives instead of taking the whole thing at once. | 97 | 14 | `bytes` `unicode` |
 | [`url`](packages/url/) | A WHATWG URL parser: parse, serialize, and resolve a reference against a base. | 1,229 | 27 | `bytes` `std` |
 | [`wacc`](packages/wacc/) | Porting the wac compiler to wac, so it can eventually compile itself. | 3,467 | 11 | `bytes` |
 | [`zstd`](packages/zstd/) | Zstandard (RFC 8878) in wac. | 2,690 | 42 | `bytes` |
 | [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, bcrypt_pbkdf, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519, NIST P-256 and P-384, RSA… | 4,942 | 133 | `bignum` |
 | [`json`](packages/json/) | JSON (RFC 8259) parsing and serialization, written in wac. | 967 | 51 | `bytes` `fmt` `std` |
-| [`sh`](packages/sh/) | A shell, in wac. | 4,370 | 12 | `bytes` `platform` `std` |
+| [`sh`](packages/sh/) | A shell, in wac. | 4,382 | 13 | `bytes` `platform` `std` |
 | [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 237 | 16 | `fmt` |
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
-| [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,575 | 45 | `bytes` `codec` `crypto` `platform` `sh` |
+| [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,565 | 45 | `bytes` `codec` `crypto` `platform` `sh` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,263 | 70 | `crypto` |
-| [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,947 | 22 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
+| [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,952 | 22 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 4,300 | 109 | `bytes` `codec` `crypto` `datetime` `platform` `std` `tls` |
 
 ## Programs

@@ -13,12 +13,19 @@
 // runs in parallel and several test files bind the same entry. Writing the final path
 // directly means one worker can import what another is halfway through writing, which
 // fails as a syntax error in generated code and looks like a compiler bug.
+//
+// The result is cached by the content of everything that produced it — see `buildCache.ts`. A hit
+// skips the compiler entirely, which is most of what this repo's suite used to spend its time on:
+// twenty test files bind the same handful of entries, and each one compiled the whole import graph
+// again. Profile mode never caches, because it wants the compiler's coverage table rather than only
+// its output.
 
 import { wacCompile } from "wac/wacCompile.ts";
 import { wacBindgen } from "wac/wacBindgen.ts";
 import { wacFiles } from "./wacFiles.ts";
 import { checkWacVersion } from "./wacVersion.ts";
 import { profileDir, registerProfiled } from "./wacProfile.ts";
+import { cached, compilerKeyParts, contentKey, filesParts, harnessKeyParts } from "./buildCache.ts";
 
 const CACHE_DIR = ".cache";
 
@@ -32,11 +39,51 @@ const CACHE_DIR = ".cache";
  */
 const tempName = (base: string) => `${base}.${crypto.randomUUID()}.tmp`;
 
+/**
+ * The cache key for a binding, or null when it cannot be computed.
+ *
+ * Null means "do not cache", which is the honest answer when the compiler's own sources cannot be
+ * read: that is the case where a stale artifact does the most damage, since whoever is editing the
+ * compiler would be shown their previous build and told their fix did nothing.
+ */
+async function bindKey(entry: string, files: Map<string, string>): Promise<string | null> {
+  const compiler = await compilerKeyParts();
+  const harness = await harnessKeyParts();
+  if (compiler === null || harness === null) return null;
+  return await contentKey(["bind", entry, ...compiler, ...harness, ...filesParts(files)]);
+}
+
+/** Compile and bind, throwing with the diagnostics a person needs. Shared by both paths. */
+function generate(files: Map<string, string>, entry: string): string {
+  const result = wacCompile(files, entry);
+  if (!result.ok) {
+    const lines = result.diagnostics.map((d) =>
+      `  ${d.file}:${d.line}:${d.col} [${d.phase}] ${d.message}`);
+    throw new Error(`wac compile failed for ${entry}:\n${lines.join("\n")}`);
+  }
+  for (const d of result.diagnostics) {
+    console.warn(`warning: ${d.file}:${d.line}:${d.col} ${d.message}`);
+  }
+  return wacBindgen(result.compiled);
+}
+
 export async function wacBind(entry: string): Promise<Record<string, unknown>> {
   // Before the compiler is asked to do anything, so a stale checkout says so itself
   // rather than surfacing as a type error in whichever package used a new feature.
   checkWacVersion();
   const files = await wacFiles(entry);
+
+  // The fast path: this exact program, compiled by this exact compiler, is already on disk.
+  if (!profileDir) {
+    const key = await bindKey(entry, files);
+    if (key !== null) {
+      const path = await cached("bind", key, ".gen.ts", async (tmp) => {
+        await Deno.writeTextFile(tmp, generate(files, entry));
+      });
+      return await import(`${Deno.cwd()}/${path}`) as Record<string, unknown>;
+    }
+  }
+
   // Profile mode compiles with coverage instrumentation so wacProfile can record which
   // tests reach which lines. Off by default and invisible to a normal run: the
   // instrumented build is a different binary, and it is used for attribution only, never
