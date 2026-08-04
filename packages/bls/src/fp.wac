@@ -1,0 +1,250 @@
+// Arithmetic modulo the BLS12-381 base field prime, in Montgomery form.
+//
+//   p = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f624
+//         1eabfffeb153ffffb9feffffffffaaab
+//
+// 381 bits, held in twelve 32-bit limbs least-significant first.
+//
+// ## Why not `crypto/src/fieldp.wac`
+//
+// That file does P-256 and P-384 from one implementation because both are *Solinas* primes:
+// reduction is limb shuffles and additions with no multiplication at all. This prime has no
+// such structure — it is not a sum of a few powers of two — so reduction needs a real
+// multiply, and the whole design of that file does not transfer. Nothing here is shared
+// with it, which is a fact worth stating rather than a duplication to feel bad about.
+//
+// ## Montgomery form, and what that means for every value here
+//
+// A field element is held as `a·R mod p` with `R = 2^384`. That is what makes reduction
+// cheap: `montMul(x, y)` computes `x·y·R⁻¹`, so multiplying two values already in the form
+// lands back in the form with no division anywhere. Addition and subtraction are unaffected
+// — the form is linear — which is why only multiplication needs the trick.
+//
+// **The form is not visible in the API and must not leak.** `fromBytes` multiplies by R²
+// to enter it and `toBytes` multiplies by 1 to leave, so a caller never sees a Montgomery
+// value. The cost of getting this wrong is an implementation that passes every internal
+// consistency check and disagrees with every test vector, which is the failure this whole
+// package is arranged to avoid.
+//
+// ## The multiply is CIOS
+//
+// Coarsely Integrated Operand Scanning: one pass per limb of `b`, accumulating `a·b[i]` into
+// the running total and immediately folding in the multiple of `p` that clears the bottom
+// limb. Twelve passes of twelve 32×32 products, so 144 of them per multiply, accumulated in
+// 64 bits because `i64` is the widest multiply wasm has — the same reason `bignum` uses
+// 32-bit limbs. There is no 64×64→128 on this machine, so 64-bit limbs would need four
+// products each and buy nothing.
+
+const i32 LIMBS = 12;
+
+/** p, least-significant limb first. */
+u32[] modulus() {
+  u32[] p = u32[LIMBS]();
+  p[0] = 0xffffaaab; p[1] = 0xb9feffff; p[2] = 0xb153ffff; p[3] = 0x1eabfffe;
+  p[4] = 0xf6b0f624; p[5] = 0x6730d2a0; p[6] = 0xf38512bf; p[7] = 0x64774b84;
+  p[8] = 0x434bacd7; p[9] = 0x4b1ba7b6; p[10] = 0x397fe69a; p[11] = 0x1a0111ea;
+  return p;
+}
+
+/** R² mod p, for entering Montgomery form. */
+u32[] r2() {
+  u32[] v = u32[LIMBS]();
+  v[0] = 0x1c341746; v[1] = 0xf4df1f34; v[2] = 0x09d104f1; v[3] = 0x0a76e6a6;
+  v[4] = 0x4c95b6d5; v[5] = 0x8de5476c; v[6] = 0x939d83c0; v[7] = 0x67eb88a9;
+  v[8] = 0xb519952d; v[9] = 0x9a793e85; v[10] = 0x92cae3aa; v[11] = 0x11988fe5;
+  return v;
+}
+
+/**
+ * −p⁻¹ mod 2³², the CIOS multiplier.
+ *
+ * Chosen so that `m = t[0] · INV mod 2³²` makes `t + m·p` end in a zero limb, which is the
+ * one step that makes the reduction work.
+ */
+const u64 INV = 0xfffcfffd;
+
+/** One, in Montgomery form: R mod p. */
+export u32[] fpOne() {
+  u32[] v = u32[LIMBS]();
+  v[0] = 0x0002fffd; v[1] = 0x76090000; v[2] = 0xc40c0002; v[3] = 0xebf4000b;
+  v[4] = 0x53c758ba; v[5] = 0x5f489857; v[6] = 0x70525745; v[7] = 0x77ce5853;
+  v[8] = 0xa256ec6d; v[9] = 0x5c071a97; v[10] = 0xfa80e493; v[11] = 0x15f65ec3;
+  return v;
+}
+
+export u32[] fpZero() { return u32[LIMBS](); }
+
+export u32[] fpCopy(u32[] a) {
+  u32[] out = u32[LIMBS]();
+  for (i32 i = 0; i < LIMBS; i++) { out[i] = a[i]; }
+  return out;
+}
+
+export bool fpIsZero(u32[] a) {
+  for (i32 i = 0; i < LIMBS; i++) {
+    if (a[i] != 0) { return false; }
+  }
+  return true;
+}
+
+export bool fpEquals(u32[] a, u32[] b) {
+  for (i32 i = 0; i < LIMBS; i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+
+/** Whether `a` is at least `p`, so the caller knows to subtract it. */
+bool atLeastModulus(u32[] a) {
+  u32[] p = modulus();
+  for (i32 i = LIMBS - 1; i >= 0; i--) {
+    if (a[i] != p[i]) { return (a[i] as u64) > (p[i] as u64); }
+  }
+  return true;                    // exactly p
+}
+
+/** `a − p`, wrapping. Only called when `a >= p`. */
+u32[] subModulus(u32[] a) {
+  u32[] p = modulus();
+  u32[] out = u32[LIMBS]();
+  i64 borrow = 0;
+  for (i32 i = 0; i < LIMBS; i++) {
+    i64 d = (a[i] as i64) - (p[i] as i64) - borrow;
+    out[i] = (d & 0xFFFFFFFF) as@ u32;
+    borrow = (d < 0) ? 1 : 0;
+  }
+  return out;
+}
+
+export u32[] fpAdd(u32[] a, u32[] b) {
+  u32[] out = u32[LIMBS]();
+  u64 carry = 0;
+  for (i32 i = 0; i < LIMBS; i++) {
+    u64 t = (a[i] as u64) + (b[i] as u64) + carry;
+    out[i] = (t & 0xFFFFFFFF) as@ u32;
+    carry = t >> 32;
+  }
+  // A 381-bit prime in 384 bits leaves three spare bits, so a sum of two reduced values
+  // cannot overflow the array — but it can exceed p, and once only.
+  if (carry != 0 || atLeastModulus(out)) { return subModulus(out); }
+  return out;
+}
+
+export u32[] fpSub(u32[] a, u32[] b) {
+  u32[] out = u32[LIMBS]();
+  i64 borrow = 0;
+  for (i32 i = 0; i < LIMBS; i++) {
+    i64 d = (a[i] as i64) - (b[i] as i64) - borrow;
+    out[i] = (d & 0xFFFFFFFF) as@ u32;
+    borrow = (d < 0) ? 1 : 0;
+  }
+  if (borrow == 0) { return out; }
+  // Underflowed: add p back, which is the same as working modulo 2^384 and correcting.
+  u32[] p = modulus();
+  u32[] fixed = u32[LIMBS]();
+  u64 carry = 0;
+  for (i32 i = 0; i < LIMBS; i++) {
+    u64 t = (out[i] as u64) + (p[i] as u64) + carry;
+    fixed[i] = (t & 0xFFFFFFFF) as@ u32;
+    carry = t >> 32;
+  }
+  return fixed;
+}
+
+export u32[] fpNeg(u32[] a) {
+  if (fpIsZero(a)) { return fpZero(); }
+  return fpSub(fpZero(), a);
+}
+
+/**
+ * Montgomery multiplication: `a·b·R⁻¹ mod p`.
+ *
+ * The accumulator is `LIMBS + 2` wide. The extra two are not slack: the running total after
+ * a pass can exceed 384 bits, and dropping the top word is the classic way to get a routine
+ * that is right for most inputs and wrong for the ones near p.
+ */
+export u32[] fpMul(u32[] a, u32[] b) {
+  u32[] p = modulus();
+  u64[] t = u64[LIMBS + 2]();
+
+  for (i32 i = 0; i < LIMBS; i++) {
+    // t += a · b[i]
+    u64 bi = b[i] as u64;
+    u64 carry = 0;
+    for (i32 j = 0; j < LIMBS; j++) {
+      u64 acc = t[j] + (a[j] as u64) * bi + carry;
+      t[j] = acc & 0xFFFFFFFF;
+      carry = acc >> 32;
+    }
+    u64 hi = t[LIMBS] + carry;
+    t[LIMBS] = hi & 0xFFFFFFFF;
+    t[LIMBS + 1] = t[LIMBS + 1] + (hi >> 32);
+
+    // m clears the bottom limb: t + m·p ≡ t (mod p) and ends in zero.
+    u64 m = ((t[0] * INV) & 0xFFFFFFFF);
+    carry = 0;
+    for (i32 j = 0; j < LIMBS; j++) {
+      u64 acc = t[j] + (p[j] as u64) * m + carry;
+      t[j] = acc & 0xFFFFFFFF;
+      carry = acc >> 32;
+    }
+    hi = t[LIMBS] + carry;
+    t[LIMBS] = hi & 0xFFFFFFFF;
+    t[LIMBS + 1] = t[LIMBS + 1] + (hi >> 32);
+
+    // Shift down one limb, which is the division by 2³² that Montgomery form pays for.
+    for (i32 j = 0; j <= LIMBS; j++) { t[j] = t[j + 1]; }
+    t[LIMBS + 1] = 0;
+  }
+
+  u32[] out = u32[LIMBS]();
+  for (i32 i = 0; i < LIMBS; i++) { out[i] = (t[i] & 0xFFFFFFFF) as@ u32; }
+  // One conditional subtraction: the result is below 2p, never more.
+  if (t[LIMBS] != 0 || atLeastModulus(out)) { return subModulus(out); }
+  return out;
+}
+
+export u32[] fpSquare(u32[] a) { return fpMul(a, a); }
+
+/** Enter Montgomery form: `a·R mod p`, given `a` in plain form. */
+u32[] toMont(u32[] a) { return fpMul(a, r2()); }
+
+/** Leave it: `a·R⁻¹ mod p`, which is `fpMul` against plain 1. */
+u32[] fromMont(u32[] a) {
+  u32[] one = u32[LIMBS]();
+  one[0] = 1;
+  return fpMul(a, one);
+}
+
+/**
+ * A 48-byte big-endian value into a field element, or null if it is not below p.
+ *
+ * Rejecting rather than reducing is the point: a non-canonical encoding of a valid point is
+ * a different byte string for the same group element, and accepting both is how signature
+ * malleability gets in.
+ */
+export u32[]? fpFromBytes(u8[] s) {
+  if (s.len() != 48) { return null; }
+  u32[] v = u32[LIMBS]();
+  for (i32 i = 0; i < LIMBS; i++) {
+    i32 at = 48 - 4 * (i + 1);
+    v[i] = (((s[at] as@ u32) << 24) | ((s[at + 1] as@ u32) << 16)
+          | ((s[at + 2] as@ u32) << 8) | (s[at + 3] as@ u32));
+  }
+  if (atLeastModulus(v)) { return null; }
+  return toMont(v);
+}
+
+/** The 48-byte big-endian encoding, canonical because the value is reduced. */
+export u8[] fpToBytes(u32[] a) {
+  u32[] v = fromMont(a);
+  u8[] out = u8[48]();
+  for (i32 i = 0; i < LIMBS; i++) {
+    i32 at = 48 - 4 * (i + 1);
+    out[at] = ((v[i] >> 24) & 0xFF) as! i32;
+    out[at + 1] = ((v[i] >> 16) & 0xFF) as! i32;
+    out[at + 2] = ((v[i] >> 8) & 0xFF) as! i32;
+    out[at + 3] = (v[i] & 0xFF) as! i32;
+  }
+  return out;
+}

@@ -1,0 +1,59 @@
+// The field at the TypeScript boundary, so a test can hand it bytes and read bytes back.
+//
+// Only `toBytes`/`fromBytes` cross, deliberately: Montgomery form is an internal
+// representation and a test that could see it would be testing the representation rather
+// than the arithmetic. Everything below takes canonical 48-byte big-endian values.
+
+import { fpAdd, fpSub, fpMul, fpNeg, fpSquare, fpFromBytes, fpToBytes, fpOne, fpIsZero,
+         fpEquals } from "../../src/fp.wac";
+
+/** 0 ok, 1 a is not canonical, 2 b is not canonical. */
+export i32 blsFpStatus(u8[] a, u8[] b) {
+  if (fpFromBytes(a) is null) { return 1; }
+  if (fpFromBytes(b) is null) { return 2; }
+  return 0;
+}
+
+u8[] binary(u8[] a, u8[] b, i32 op) {
+  u32[]? x = fpFromBytes(a);
+  u32[]? y = fpFromBytes(b);
+  if ((x is null) || (y is null)) { return u8[0](); }
+  if (op == 0) { return fpToBytes(fpAdd(x!, y!)); }
+  if (op == 1) { return fpToBytes(fpSub(x!, y!)); }
+  return fpToBytes(fpMul(x!, y!));
+}
+
+export u8[] blsFpAdd(u8[] a, u8[] b) { return binary(a, b, 0); }
+export u8[] blsFpSub(u8[] a, u8[] b) { return binary(a, b, 1); }
+export u8[] blsFpMul(u8[] a, u8[] b) { return binary(a, b, 2); }
+
+export u8[] blsFpNeg(u8[] a) {
+  u32[]? x = fpFromBytes(a);
+  return (x is null) ? u8[0]() : fpToBytes(fpNeg(x!));
+}
+
+export u8[] blsFpSquare(u8[] a) {
+  u32[]? x = fpFromBytes(a);
+  return (x is null) ? u8[0]() : fpToBytes(fpSquare(x!));
+}
+
+/** One's canonical encoding, which is also a check that Montgomery form round-trips. */
+export u8[] blsFpOneBytes() { return fpToBytes(fpOne()); }
+
+/** `a` round-tripped through the form and back, which must be the identity. */
+export u8[] blsFpRoundTrip(u8[] a) {
+  u32[]? x = fpFromBytes(a);
+  return (x is null) ? u8[0]() : fpToBytes(x!);
+}
+
+/** Whether `a·1 == a` in the form — the one internal invariant worth asserting from here. */
+export bool blsFpMulByOneIsIdentity(u8[] a) {
+  u32[]? x = fpFromBytes(a);
+  if (x is null) { return false; }
+  return fpEquals(fpMul(x!, fpOne()), x!);
+}
+
+export bool blsFpIsZeroBytes(u8[] a) {
+  u32[]? x = fpFromBytes(a);
+  return (x is null) ? false : fpIsZero(x!);
+}
