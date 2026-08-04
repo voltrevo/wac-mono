@@ -220,17 +220,20 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
         ...(give.env ? { env: opts.env } : {}),
         // A line of output is bytes on the handle, with the newline `log` implies. The parent
         // cannot tell `log` from `write` — nor can a pipe, which is the point.
-        log: (l: string) => out.push(enc.encode(l + "\n")),
+        log: async (l: string) => { await out.push(enc.encode(l + "\n")); },
         // ...and its error output goes to the *other* stream, which `recv(errHandle)` reads. A
         // program has two, and merging them made a shell count an error message in `cat x | wc -c`.
-        warn: (l: string) => cerr.push(enc.encode(l + "\n")),
+        warn: async (l: string) => { await cerr.push(enc.encode(l + "\n")); },
         // A full queue has to *fail* the write, or a program written to stop when the other end
         // goes away never learns: `box yes` is `while (cli.write(block)) {}`. Throwing is how the
         // host says false — the same shape `pushChild`'s cap uses.
-        write: (b: Uint8Array) => {
-          if (!out.push(b)) throw new Error("the child's output is not being read");
+        write: async (b: Uint8Array) => {
+          // Awaited: a full queue *waits* for the parent to read, and only a queue that has ended
+          // refuses. The two were one answer, and a producer told to stop when it should have waited
+          // truncated a redirection silently — see `ByteQueue.push`.
+          if (!await out.push(b)) throw new Error("the child's output is not being read");
         },
-        writeErr: (b: Uint8Array) => { cerr.push(b); },
+        writeErr: async (b: Uint8Array) => { await cerr.push(b); },
         // `readStdin` means *all* of it, which for a child means waiting for its input to end: the
         // bytes arrive over time. Serving it with one chunk made `seq 1 5 | sort -r` print `1`, since
         // `sort` reads to the end before sorting. `readChunk` and `recv` still take one chunk.

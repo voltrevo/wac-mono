@@ -73,31 +73,59 @@ export class ByteQueue {
   #held = 0;
   #cap: number;
   #waiting: ((v: Uint8Array) => void) | null = null;
+  /** Writers parked because the queue is full, with the bytes they are trying to send. */
+  #roomWanted: { bytes: Uint8Array; res: (ok: boolean) => void }[] = [];
 
   constructor(cap = 0) {
     this.#cap = cap;
   }
 
   /**
-   * Take these bytes, or answer false when the queue is full.
+   * Take these bytes, waiting for room if the queue is full, and answering false once it has ended.
    *
-   * False is the answer `write` in `platform.wac` already has a meaning for — "the other end is not
-   * taking it" — and `box yes` is written as `while (cli.write(block)) {}` precisely so that it
-   * stops. The host's job is to turn this into a failed `write`, which is what the caller does.
+   * **Full and gone are different answers**, and conflating them truncated a file silently. `write` in
+   * `platform.wac` answers false for "the other end is not taking it", and a producer is written to
+   * stop on that — `box yes` is `while (cli.write(b)) {}`. So refusing a write because the reader is
+   * merely *behind* tells the producer to stop when it should have waited: `seq 1 2000000000 > out`
+   * wrote 276 MB, exited 0, and left a file two per cent of the size bash writes. Nothing said so.
+   *
+   * A real pipe blocks a writer whose reader is behind and fails one whose reader has gone. This does
+   * the same: the promise resolves when `take` makes room, and `end` resolves the waiters false. The
+   * child is parked in `Atomics.wait` on its own `write` call meanwhile, which is exactly the shape a
+   * blocking write has on the other side of a bridge.
    */
-  push(b: Uint8Array): boolean {
-    if (this.#ended) return false;
+  push(b: Uint8Array): Promise<boolean> {
+    if (this.#ended) return Promise.resolve(false);
     // Straight to a waiter if there is one, so nothing is buffered that is already wanted.
     if (this.#waiting !== null) {
       const w = this.#waiting;
       this.#waiting = null;
       w(b);
-      return true;
+      return Promise.resolve(true);
     }
-    if (this.#cap > 0 && this.#held + b.length > this.#cap) return false;
+    if (this.#cap > 0 && this.#held + b.length > this.#cap) {
+      return new Promise<boolean>((res) => { this.#roomWanted.push({ bytes: b, res }); });
+    }
     this.#chunks.push(b);
     this.#held += b.length;
-    return true;
+    return Promise.resolve(true);
+  }
+
+  /**
+   * Hand queued bytes to the writers waiting for room, in the order they arrived.
+   *
+   * Called from `take`, which is the only thing that makes room. In arrival order because a stream is
+   * ordered: releasing the smallest first would interleave one producer's output with another's.
+   */
+  private releaseRoom(): void {
+    while (this.#roomWanted.length > 0) {
+      const first = this.#roomWanted[0];
+      if (this.#cap > 0 && this.#held + first.bytes.length > this.#cap) return;
+      this.#roomWanted.shift();
+      this.#chunks.push(first.bytes);
+      this.#held += first.bytes.length;
+      first.res(true);
+    }
   }
 
   /**
@@ -124,6 +152,7 @@ export class ByteQueue {
     if (this.#chunks.length === 1 && this.#chunks[0].length <= limit) {
       const only = this.#chunks.shift()!;
       this.#held -= only.length;
+      this.releaseRoom();
       return only;
     }
     const parts: Uint8Array[] = [];
@@ -143,16 +172,25 @@ export class ByteQueue {
       }
     }
     this.#held -= taken;
+    this.releaseRoom();
     return join(parts);
   }
 
-  /** No more will arrive. A reader waiting now gets the empty array that means "ended". */
+  /**
+   * No more will arrive. A reader waiting now gets the empty array that means "ended", and a *writer*
+   * waiting for room is refused — which is how a producer learns its reader has gone rather than is
+   * merely slow. `head -1` stopping `seq` is this path: the shell stops the stage, which ends the
+   * queue, which fails the write the producer is parked on.
+   */
   end(): void {
     this.#ended = true;
     if (this.#waiting !== null) {
       const w = this.#waiting;
       this.#waiting = null;
       w(new Uint8Array(0));
+    }
+    while (this.#roomWanted.length > 0) {
+      this.#roomWanted.shift()!.res(false);
     }
   }
 

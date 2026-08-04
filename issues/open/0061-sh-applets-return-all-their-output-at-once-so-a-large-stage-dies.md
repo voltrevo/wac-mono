@@ -65,3 +65,45 @@ Two decisions belong to whoever takes it, and neither is obvious:
 
 Until then the README says what happens, in the section that used to claim pipelines ran one stage
 at a time.
+
+## Half done, 2026-08-04 (agent-a)
+
+**The programs stream now**, and one of the two reproductions above is fixed:
+
+```
+seq 1 2000000000 | head -1     ->  1, in 0.13s   (was: five seconds, then a trap)
+seq 1 20000000 | wc -l         ->  20000000, in 2.9s
+seq 1 2000000 | tail -1        ->  2000000, in 0.36s, holding one line
+```
+
+What that took:
+
+- `Sink` and `Feed` moved into `packages/platform` (with the line reader, `Lines`), because box had them
+  and sh could not use them — box depends on sh. One implementation, and `box/src/lib/out.wac` and
+  `lib/reader.wac` are deleted rather than left to drift.
+- The seam is `(Feed in, Sink out, Sink err) -> i32` and `run` keeps its old signature by passing
+  *buffering* sinks, so a shell that cannot spawn behaves exactly as before. One body per program serves
+  both ways of being run, which is what a collecting sink is for.
+- `seq` writes as it counts and **checks the answer**, so a refused write stops it. `head` reads lines
+  and stops at `n`. `tail` keeps a ring of `n` rather than the whole input.
+- A child's output queue now *waits* for room instead of refusing when it is merely full. Full and gone
+  were one answer, and a producer told to stop when it should have waited truncated `seq … > out` to
+  276 MB, silently, with status 0. `end()` still refuses, which is how `head -1` stops `seq`.
+
+**What is left is the second reproduction**, `seq 1 2000000000 > out`, and it is now a loud trap rather
+than a silent truncation. Two things block it, both platform bugs that the shell's twelve exposed rather
+than caused, and both filed:
+
+- [0065](0065-a-spawned-programs-arguments-are-not-byte-exact.md) — a non-UTF-8 argument does not survive
+  a spawn.
+- [0066](0066-a-spawned-child-does-not-get-what-the-shell-has-left-of-its-input.md) — a spawned child
+  does not receive the shell's remaining standard input.
+
+`packages/sh/src/sh.wac` is a multi-call program now — `wacsh seq 1 5` runs `seq` — so the only thing
+standing between here and the fix is `sh.externalSpawnable = true`, which is present and commented out
+with those two issue numbers. With it on, two differential scripts disagree with bash; with it off, the
+twelve are called in process as before.
+
+Beyond those: a redirection collects a spawned child's output in the shell before writing the file, so
+`> out` is bounded by memory even once spawning works. `openOutput` is the capability for that, and
+`packages/box`'s `cp` and `split` already use it.
