@@ -60,12 +60,24 @@ Fp2 mulByB(Fp2 a) {
 
 Fp2 triple(Fp2 a) { return fp2Add(fp2Add(a, a), a); }
 
-/** `a / 2`, by multiplying with the inverse of two. Cheap enough at two per doubling step. */
-Fp2 halve(Fp2 a) {
-  u32[]? h = fpInvert(fpAdd(fpOne(), fpOne()));
-  if (h is null) { return fp2Zero(); }
-  return fp2MulByFp(a, h!);
+/**
+ * 1/2, in Montgomery form.
+ *
+ * A constant, because the first version of `halve` called `fpInvert` — a 570-multiplication
+ * Fermat exponentiation — on every invocation. Twice per doubling step and 64 doubling steps to a
+ * Miller loop, that was about 28 ms of a 36 ms loop spent repeatedly computing the same number.
+ * Measured, after guessing wrong about allocation being the cost.
+ */
+u32[] oneHalf() {
+  u32[] v = u32[12]();
+  v[0] = 0x00015554; v[1] = 0x18040000; v[2] = 0x3ab00001; v[3] = 0x85500005;
+  v[4] = 0x253c276f; v[5] = 0x633cb57c; v[6] = 0x31ebb502; v[7] = 0x6e22d1ec;
+  v[8] = 0xf2d14ca2; v[9] = 0xd3916126; v[10] = 0x1a006596; v[11] = 0x17fbb857;
+  return v;
 }
+
+/** `a / 2`. */
+Fp2 halve(Fp2 a) { return fp2MulByFp(a, oneHalf()); }
 
 /** A point in homogeneous projective coordinates, as the pairing's inner loop wants it. */
 struct Rp {

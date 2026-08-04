@@ -11,7 +11,7 @@ different file with `ctTrace` over it, not bolted onto these functions.
 ## Status
 
 **Working.** `verify(pubkey, message, signature)` agrees with all 29 `ethereum/bls12-381-tests`
-verify fixtures and all 28 deserialization fixtures, at about **109 ms** per signature.
+verify fixtures and all 28 deserialization fixtures, at about **51 ms** per signature.
 
 Built in stages with an external oracle gating each one:
 
@@ -66,14 +66,17 @@ Vectors are vendored rather than fetched, so the tests need no network.
 
 ## Speed, stated up front
 
-**Measured: 109 ms per verification.** That is within the range predicted before any of it was
-written — tens to low hundreds of milliseconds — and it is roughly a hundred times `blst`, which
-does about one. Wasm has no 64×64→128 multiply and no carry flag, so `Fp` uses twelve 32-bit limbs
+**Measured: 51 ms per verification**, against 14.6 ms for `@noble/curves` on the same machine and
+about 1 ms for `blst`. That is within the range predicted before any of it was written — tens to
+low hundreds of milliseconds. Wasm has no 64×64→128 multiply and no carry flag, so `Fp` uses twelve 32-bit limbs
 with a 64-bit accumulator, 144 partial products per multiply, because `i64` is the widest multiply
 the machine has. A verification is two Miller loops sharing one final exponentiation, order 20,000
 field multiplications.
 
-Nothing here is optimised, and the three biggest levers are known and untaken: `g1InSubgroup` and
+The current split is roughly 26 ms for the two Miller loops and one final exponentiation, 18 ms
+for `hash_to_G2`, and 8 ms for decoding and subgroup checks. Nothing is optimised beyond one
+blunder found by profiling — `halve` used to recompute 1/2 by Fermat inversion on every call, which
+was 28 ms of the original 109 — and the remaining levers are known and untaken: `g1InSubgroup` and
 `g2InSubgroup` multiply by r rather than using the endomorphism checks, `clearCofactorG2`
 multiplies by a 636-bit `h_eff` rather than using Budroni–Pintore, and the final exponentiation
 uses plain squaring rather than the cyclotomic kind. Each is noted where it appears. Do not put
