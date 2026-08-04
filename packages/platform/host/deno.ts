@@ -133,6 +133,11 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   const kids = new ChildStack();
   // Empty until a read fails; `inputError` hands it back. See platform.wac.
   let inputFailure = "";
+  // The same for the other two directions: a `write` that failed, and the last failure per socket.
+  // Recorded rather than only thrown, because `write` answers a bool and `recv` answers bytes —
+  // neither can carry a reason. See `outputError` and `socketError` in platform.wac.
+  let outputFailure = "";
+  const socketFailure = new Map<number, string>();
   const P = (path: string) => kids.path(path);
 
   return {
@@ -217,14 +222,22 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
         return EMPTY;
       }
       if (writeOut !== undefined) { writeOut(p.slice()); return EMPTY; }
-      if (sink === null) { await writeAllStdout(p); return EMPTY; }
-      let at = 0;
-      while (at < p.length) at += await sink.write(p.subarray(at));
-      return EMPTY;
+      try {
+        if (sink === null) { await writeAllStdout(p); return EMPTY; }
+        let at = 0;
+        while (at < p.length) at += await sink.write(p.subarray(at));
+        return EMPTY;
+      } catch (e) {
+        // Recorded and then rethrown: the throw is what makes `write` answer false, and the record
+        // is what lets a caller tell a full disk from a reader that went away.
+        const message = e instanceof Error ? e.message : String(e);
+        outputFailure = /broken pipe|os error 32/i.test(message) ? "" : message;
+        throw e;
+      }
     },
 
     [OP.STAT]: async (p) => {
-      const out = new Uint8Array(19);
+      const out = new Uint8Array(20);
       const dv = new DataView(out.buffer);
       if (!opts.fs?.read) return out; // not granted reads as "does not exist"
       try {
@@ -234,9 +247,27 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
         out[2] = st.isDirectory ? 1 : 0;
         dv.setBigInt64(3, BigInt(st.size), true);
         dv.setBigInt64(11, BigInt(st.mtime?.getTime() ?? 0), true);
+        // `stat` follows, so what it describes is never itself a link. `linkStat` is the one that
+        // answers that, and it is the only difference between these two handlers.
       } catch { /* absent, and the zeroes say so */ }
       return out;
     },
+    [OP.LINK_STAT]: async (p) => {
+      const out = new Uint8Array(20);
+      const dv = new DataView(out.buffer);
+      if (!opts.fs?.read) return out;
+      try {
+        const st = await Deno.lstat(P(unstr(p)));
+        out[0] = 1;
+        out[1] = st.isFile ? 1 : 0;
+        out[2] = st.isDirectory ? 1 : 0;
+        dv.setBigInt64(3, BigInt(st.size), true);
+        dv.setBigInt64(11, BigInt(st.mtime?.getTime() ?? 0), true);
+        out[19] = st.isSymlink ? 1 : 0;
+      } catch { /* absent, and the zeroes say so */ }
+      return out;
+    },
+
     [OP.READ_DIR]: async (p) => {
       if (!opts.fs?.read) deny("filesystem read");
       const names = await denoDir(P(unstr(p)));
@@ -281,6 +312,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       }
     },
     [OP.INPUT_ERROR]: () => str(inputFailure),
+    [OP.OUTPUT_ERROR]: () => str(outputFailure),
+    [OP.SOCKET_ERROR]: (p) => str(socketFailure.get(readI32le(p)) ?? ""),
 
     [OP.OPEN_OUTPUT]: async (p) => {
       const path = unstr(p);
@@ -332,8 +365,17 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       if (kid !== undefined) return await kid.out.next();
       const c = sockets.get(h);
       if (c === undefined) throw new Error("not an open socket");
-      const n = await c.read(into);
-      return n === null ? EMPTY : into.subarray(0, n);
+      try {
+        const n = await c.read(into);
+        // null is the peer closing, which is an answer and not a failure — so the recorded reason
+        // stays empty and `socketError` says "it ended".
+        return n === null ? EMPTY : into.subarray(0, n);
+      } catch (e) {
+        // A reset or a timeout, which `recv` can only report as "nothing". Kept so the caller can
+        // tell a truncated stream from a complete one.
+        socketFailure.set(h, e instanceof Error ? e.message : String(e));
+        return EMPTY;
+      }
     },
     [OP.SEND]: async (p) => {
       const h = readI32le(p);

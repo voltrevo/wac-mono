@@ -44,6 +44,16 @@ bool add(Core core, Cli cli, string path, string name) {
 }
 
 bool addAt(Core core, Cli cli, string path, string name, i32 depth) {
+  // **The link, before what it points at.** `stat` follows, so a link to a directory looked exactly
+  // like the directory: this walked into it, stored its contents under the link's name, and a cycle
+  // grew the path until something trapped. The header of this file has always said links are
+  // refused; `linkStat` is what made saying so possible. GitHub wac-mono#25.
+  Stat link = cli.linkStat(path).wait();
+  if (link.exists && link.isSymlink) {
+    core.warn(name + ": " + path + ": symbolic link, which a ustar header cannot describe");
+    return false;
+  }
+
   Stat st = cli.stat(path).wait();
   if (!st.exists) { core.warn(name + ": " + path + ": not found"); return false; }
 

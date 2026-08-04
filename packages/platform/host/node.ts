@@ -35,6 +35,13 @@ export type NodeIo = {
   listen(port: number): Promise<NodeListener>;
   writeStdout(bytes: Uint8Array): Promise<void>;
   stat(path: string): Promise<{ isFile: boolean; isDirectory: boolean; size: number; mtimeMillis: number }>;
+  /**
+   * `stat` without following the last component. Optional: a host that cannot tell answers as `stat`
+   * does, which is honest for a filesystem with no links and wrong for nothing.
+   */
+  linkStat?(
+    path: string,
+  ): Promise<{ isFile: boolean; isDirectory: boolean; size: number; mtimeMillis: number; isSymlink: boolean }>;
   readDir(path: string): Promise<string[]>;
 };
 
@@ -102,6 +109,11 @@ export function nodeWorld(
   const kids = new ChildStack();
   // Empty until a read fails; `inputError` hands it back. See platform.wac.
   let inputFailure = "";
+  // The same for the other two directions: a `write` that failed, and the last failure per socket.
+  // Recorded rather than only thrown, because `write` answers a bool and `recv` answers bytes —
+  // neither can carry a reason. See `outputError` and `socketError` in platform.wac.
+  let outputFailure = "";
+  const socketFailure = new Map<number, string>();
   const P = (path: string) => kids.path(path);
 
   return {
@@ -184,13 +196,19 @@ export function nodeWorld(
         if (!kids.write(p)) throw new Error("the child's output buffer is full");
         return EMPTY;
       }
-      if (sink === null) { await io.writeStdout(p); return EMPTY; }
-      await sink.write(p);
-      return EMPTY;
+      try {
+        if (sink === null) { await io.writeStdout(p); return EMPTY; }
+        await sink.write(p);
+        return EMPTY;
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        outputFailure = /EPIPE|broken pipe/i.test(message) ? "" : message;
+        throw e;
+      }
     },
 
     [OP.STAT]: async (p) => {
-      const out = new Uint8Array(19);
+      const out = new Uint8Array(20);
       const dv = new DataView(out.buffer);
       if (!opts.fs?.read) return out; // not granted reads as "does not exist"
       try {
@@ -203,6 +221,25 @@ export function nodeWorld(
       } catch { /* absent, and the zeroes say so */ }
       return out;
     },
+    [OP.LINK_STAT]: async (p) => {
+      const out = new Uint8Array(20);
+      const dv = new DataView(out.buffer);
+      if (!opts.fs?.read) return out;
+      try {
+        const path = P(unstr(p));
+        const st = io.linkStat === undefined
+          ? { ...(await io.stat(path)), isSymlink: false }
+          : await io.linkStat(path);
+        out[0] = 1;
+        out[1] = st.isFile ? 1 : 0;
+        out[2] = st.isDirectory ? 1 : 0;
+        dv.setBigInt64(3, BigInt(st.size), true);
+        dv.setBigInt64(11, BigInt(st.mtimeMillis ?? 0), true);
+        out[19] = st.isSymlink ? 1 : 0;
+      } catch { /* absent, and the zeroes say so */ }
+      return out;
+    },
+
     [OP.READ_DIR]: async (p) => {
       if (!opts.fs?.read) deny("filesystem read");
       const names = await io.readDir(P(unstr(p)));
@@ -235,6 +272,8 @@ export function nodeWorld(
       }
     },
     [OP.INPUT_ERROR]: () => str(inputFailure),
+    [OP.OUTPUT_ERROR]: () => str(outputFailure),
+    [OP.SOCKET_ERROR]: (p) => str(socketFailure.get(readI32le(p)) ?? ""),
 
     [OP.OPEN_OUTPUT]: async (p) => {
       const path = unstr(p);

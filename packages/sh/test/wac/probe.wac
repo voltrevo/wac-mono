@@ -110,7 +110,16 @@ Pending<string> fakeWriteFile(string path, u8[] data) {
 string resolveWriteOutcome(i32 id) { return id == 1 ? "permission denied" : ""; }
 
 /** Only the two programs under `/bin` exist, which is what makes a `$WACPATH` search decide. */
-Stat resolveStat(i32 id) { return Stat.of(id == 1, id == 1, false, 0, 0); }
+Stat resolveStat(i32 id) { return Stat.of(id == 1, id == 1, false, 0, 0, false); }
+
+/** Nothing here is a symbolic link, which a fake filesystem is entitled to say. */
+Pending<Stat> fakeLinkStat(string path) { return fakeStat(path); }
+
+/** Nothing went wrong with the last write, and nothing with the last recv. */
+Pending<string> fakeOutputError() { return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop); }
+Pending<string> fakeSocketError(i32 handle) {
+  return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
+}
 Pending<Stat> fakeStat(string path) {
   i32 there = (path == "/bin/prog" || path == "/bin/badprog" || path == "/bin/goneprog"
                || path == "/bin/ghost") ? 1 : 0;
@@ -233,8 +242,8 @@ Pending<Captured> fakePopChild() {
 
 Cli fakeCli() {
   return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeReadFile, fakeWriteFile,
-                fakeStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
-                fakeReadChunk, fakeInputError, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
+                fakeStat, fakeLinkStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
+                fakeReadChunk, fakeInputError, fakeOutputError, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv, fakeSocketError,
                 fakeSend, fakeCloseSocket, fakeSpawn, fakeCloseFeed, fakeExitCode,
                 fakeCwd, fakePushChild, fakePopChild);
 }

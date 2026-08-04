@@ -107,11 +107,11 @@ split is why it is a second struct rather than more fields.
 | | `waitAny` | — |
 | `Cli` | `argCount`, `arg`, `env` | — |
 | | `readStdin`, `write` | — |
-| | `openInput`, `readChunk`, `inputError` | `--allow-read` for a file |
-| | `readFile`, `stat`, `readDir` | `--allow-read` |
+| | `openInput`, `readChunk`, `inputError`, `outputError` | `--allow-read` for a file |
+| | `readFile`, `stat`, `linkStat`, `readDir` | `--allow-read` |
 | | `writeFile`, `mkdir`, `remove`, `rename` | `--allow-write` |
 | | `openOutput` (to a file) | `--allow-write` |
-| | `connect`, `listen`, `accept`, `recv`, `send`, `closeSocket` | `--allow-net` |
+| | `connect`, `listen`, `accept`, `recv`, `socketError`, `send`, `closeSocket` | `--allow-net` |
 | | `spawn`, `closeFeed`, `exitCode` | — (the child gets what you pass, never more) |
 | | `cwd` | — (a read; there is no `chdir`) |
 | | `pushChild`, `popChild` | — (a child *inside* this program, with this program's authority) |
@@ -121,11 +121,18 @@ split is why it is a second struct rather than more fields.
 **Anything that can fail says why.** `writeFile`, `mkdir`, `remove` and `rename` answer with the
 empty string on success and the host's own message otherwise, as `openInput` and `openOutput` already
 did — a `bool` could report that a write failed and never what went wrong, so `rm -f` had to suppress
-every failure or none, and each applet's diagnostic was its own guess. `readChunk` keeps its
-`fn[u8[]()]` shape, because the streaming transforms take it as a bare funcref, and `inputError`
-answers the question it cannot: empty for a clean end, the host's message when the read broke. Ask it
-once when the chunks stop — without it a filter over a disk that gave out exits 0 having written half
-the answer.
+every failure or none, and each applet's diagnostic was its own guess. `readChunk`, `write` and `recv` keep their shapes — the first two because the streaming transforms
+take them as bare funcrefs, the third because a `Chunk` struct would change every caller in `tls`,
+`ssh` and `tor` — so each has a companion that answers what its return cannot: `inputError`,
+`outputError` and `socketError(handle)`. Empty means the ordinary ending (input finished, reader went
+away, peer closed); anything else is the host's message. Ask once, when the bytes stop.
+
+Without them a filter over a disk that gave out exits 0 having written half the answer, a full disk
+is indistinguishable from a closed pipe, and a truncated download from a complete one.
+
+`stat` follows symbolic links, so it describes what a name leads to; `linkStat` describes the name.
+Both questions are real — `find` wants the first, `tar` wants the second — and a flag would have made
+every caller decide something most of them do not care about.
 
 `pushChild` and `popChild` need no grant because they add no authority: they change what `arg`,
 `readChunk`, `write`, `log`, `warn` and every path mean *for the program itself*, between two

@@ -1,6 +1,6 @@
 # 0055 — box tar follows symbolic-link directories and can recurse until failure on a cycle
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** voltrevo, on GitHub — [https://github.com/voltrevo/wac-mono/issues/25](https://github.com/voltrevo/wac-mono/issues/25)
 - **Mirrored by:** agent-a
@@ -24,3 +24,23 @@ grows the path until something traps. **The documented policy is still unenforce
 follows links and cannot say that it did, so `tar` cannot tell a link to a directory from the
 directory and cannot refuse one. That needs `isSymlink`, or a no-follow stat, in `platform` — which
 is why this stays open rather than closing with the depth bound.
+
+## Closed, 2026-08-04 (agent-a)
+
+`linkStat` answers the question `stat` cannot: it does not follow the last component, and `Stat` now
+carries `isSymlink`. `tar` asks before it stores anything, so a link is refused by name — the policy
+its own header has claimed since it was written.
+
+A separate capability rather than a flag on `stat`, and rather than making `stat` stop following:
+every caller in this repo wants the followed answer, since `find` and `du` are asking "is this a
+directory I should walk into", which is a question about the target. Doing both syscalls inside
+`stat` would have doubled the cost of every directory walk to serve the one applet that cares.
+
+Verified against a tree holding a link to a directory, a link to a file and a self-referential one:
+all three are refused by name, the ordinary file is still archived, and GNU tar lists and extracts
+the result. The depth bound stays as a second line of defence — a filesystem can nest deeply with no
+link anywhere.
+
+The Origin Private File System has no links, so the browser host answers exactly as `stat` does with
+`isSymlink` false. That is true rather than a stand-in, which is why `tar` needs no idea which host
+it is on.

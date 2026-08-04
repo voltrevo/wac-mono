@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-24 packages, 42,560 lines of wac, 908 tests,
+24 packages, 42,617 lines of wac, 908 tests,
 22 command-line programs and 4 browser pages.
 
 ## Packages
@@ -14,7 +14,7 @@ In dependency order: nothing here imports anything below it.
 | package | what it is | wac lines | tests | builds on |
 |---|---|---|---|---|
 | [`bytes`](packages/bytes/) | `Buf` — a growable byte buffer. | 256 | 25 | — |
-| [`platform`](packages/platform/) | A capability world for wac applications, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell… | 2,030 | 46 | — |
+| [`platform`](packages/platform/) | A capability world for wac applications, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell… | 2,077 | 46 | — |
 | [`regex`](packages/regex/) | A backtracking regular expression engine, with JavaScript's semantics. | 933 | 16 | — |
 | [`std`](packages/std/) | Containers and the two sum types every program ends up wanting. | 586 | 37 | — |
 | [`unicode`](packages/unicode/) | UTF-8 as code points, and simple case mapping. | 216 | 11 | — |
@@ -35,7 +35,7 @@ In dependency order: nothing here imports anything below it.
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,565 | 45 | `bytes` `codec` `crypto` `platform` `sh` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,263 | 70 | `crypto` |
-| [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,851 | 22 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
+| [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,861 | 22 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 4,272 | 109 | `codec` `crypto` `datetime` `platform` `std` `tls` |
 
 ## Programs

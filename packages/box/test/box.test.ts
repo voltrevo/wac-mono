@@ -223,6 +223,41 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     assertEquals(absent.code, 0, "rm -f on a missing file succeeds");
     await Deno.remove(guarded, { recursive: true });
 
+    // Symbolic links are refused, which tar.wac's header has always claimed. `stat` follows, so a
+    // link to a directory was indistinguishable from the directory: it was walked into, stored under
+    // the link's name, and a self-referential one grew the path until something trapped. `linkStat`
+    // is what made the claim enforceable. GitHub wac-mono#25.
+    const linked = await Deno.makeTempDir({ prefix: "wac-box-link-" });
+    await Deno.mkdir(`${linked}/real`);
+    await Deno.writeTextFile(`${linked}/real/f`, "x");
+    await Deno.symlink("real", `${linked}/toDir`);
+    await Deno.symlink("real/f", `${linked}/toFile`);
+    await Deno.symlink("loop", `${linked}/loop`);          // points at itself
+    const tarred2 = new Deno.Command(built, {
+      args: ["tar", "."],
+      cwd: linked,
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    const said = new TextDecoder().decode(tarred2.stderr);
+    assertEquals(tarred2.code, 1, "a refused entry is a failure");
+    for (const name of ["toDir", "toFile", "loop"]) {
+      assertEquals(said.includes(name), true, `${name} should be refused: ${said}`);
+    }
+    // And the archive it did produce is a real one: GNU tar lists the ordinary file and no link.
+    const listing = await Deno.makeTempFile({ prefix: "wac-box-tar-", suffix: ".tar" });
+    await Deno.writeFile(listing, tarred2.stdout);
+    const listed = new Deno.Command("tar", { args: ["-tf", listing], stdout: "piped" }).outputSync();
+    const inArchive = new TextDecoder().decode(listed.stdout);
+    assertEquals(inArchive.includes("./real/f"), true, inArchive);
+    assertEquals(
+      inArchive.includes("toDir"),
+      false,
+      `a refused link must not be in the archive: ${inArchive}`,
+    );
+    await Deno.remove(listing);
+    await Deno.remove(linked, { recursive: true });
+
     // `--` ends the options, so an operand may begin with a dash. Without it `cat -- -x` treated
     // both as flags, found no operand, read empty standard input and exited 0. GitHub wac-mono#11.
     const dashDir = await Deno.makeTempDir({ prefix: "wac-box-dash-" });

@@ -180,14 +180,16 @@ export function cliOf(
   const stat = (id: number) => {
     try {
       const out = collect(b, unpack(id));
-      // exists, isFile, isDir as bytes, then size and mtime as little-endian i64s.
+      // exists, isFile, isDir as bytes, then size and mtime as little-endian i64s, then isSymlink —
+      // appended rather than inserted, so the offsets above did not have to move.
       const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
       return cls.Stat.of(
         out[0] === 1, out[1] === 1, out[2] === 1,
         dv.getBigInt64(3, true), dv.getBigInt64(11, true),
+        out[19] === 1,
       );
     } catch {
-      return cls.Stat.of(false, false, false, 0n, 0n);
+      return cls.Stat.of(false, false, false, 0n, 0n, false);
     }
   };
   const dirNames = (id: number) => {
@@ -311,6 +313,8 @@ export function cliOf(
       T.outcome(submit(b, OP.WRITE_FILE, prefixed(str(path), body))),
     /*= stat */
     (path: string) => T.stat(submit(b, OP.STAT, str(path))),
+    /*= linkStat */
+    (path: string) => T.stat(submit(b, OP.LINK_STAT, str(path))),
     /*= readDir */
     (path: string) => T.dir(submit(b, OP.READ_DIR, str(path))),
 
@@ -333,6 +337,8 @@ export function cliOf(
     },
     /*= inputError */
     () => T.text(submit(b, OP.INPUT_ERROR, EMPTY)),
+    /*= outputError */
+    () => T.text(submit(b, OP.OUTPUT_ERROR, EMPTY)),
     /*= openOutput */
     (path: string) => T.outcome(submit(b, OP.OPEN_OUTPUT, str(path))),
 
@@ -344,6 +350,8 @@ export function cliOf(
     (handle: number) => T.socket(submit(b, OP.ACCEPT, i32le(handle))),
     /*= recv */
     (handle: number) => T.chunk(submit(b, OP.RECV, i32le(handle))),
+    /*= socketError */
+    (handle: number) => T.text(submit(b, OP.SOCKET_ERROR, i32le(handle))),
     /*= send */
     (handle: number, body: Uint8Array) => T.ok(submit(b, OP.SEND, headed(i32le(handle), body))),
     /*= closeSocket */

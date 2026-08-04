@@ -153,6 +153,11 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   const kids = new ChildStack();
   // Empty until a read fails; `inputError` hands it back. See platform.wac.
   let inputFailure = "";
+  // The same for the other two directions: a `write` that failed, and the last failure per socket.
+  // Recorded rather than only thrown, because `write` answers a bool and `recv` answers bytes —
+  // neither can carry a reason. See `outputError` and `socketError` in platform.wac.
+  let outputFailure = "";
+  const socketFailure = new Map<number, string>();
 
   const canWrite = (): void => {
     if (opts.root === undefined || opts.writable !== true) deny("filesystem write");
@@ -199,6 +204,27 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     let dir = root();
     for (const part of parts) dir = await dir.getDirectoryHandle(part, { create });
     return dir;
+  };
+
+  /** What `stat` and `linkStat` both answer with: the twenty bytes `provider.ts` decodes. */
+  const statBytes = async (path: string): Promise<Uint8Array> => {
+    const out = new Uint8Array(20);
+    const dv = new DataView(out.buffer);
+    if (opts.root === undefined) return out;   // not granted reads as "does not exist"
+    try {
+      const f = await fileOf(path);
+      out[0] = 1;
+      out[1] = 1;
+      dv.setBigInt64(3, BigInt(f.size), true);
+      dv.setBigInt64(11, BigInt(f.lastModified), true);
+      return out;
+    } catch { /* not a file; try a directory */ }
+    try {
+      await dirOf(path, false);   // the root included, which `resolve` cannot express
+      out[0] = 1;
+      out[2] = 1;
+    } catch { /* absent, and the zeroes say so */ }
+    return out;
   };
 
   // The current streaming input and output: the same one-at-a-time model the other worlds
@@ -315,9 +341,16 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
         if (!kids.write(p)) throw new Error("the child's output buffer is full");
         return EMPTY;
       }
-      if (sink === null) { write(p); return EMPTY; }
-      await sink.write(p);
-      return EMPTY;
+      try {
+        if (sink === null) { write(p); return EMPTY; }
+        await sink.write(p);
+        return EMPTY;
+      } catch (e) {
+        // A page has no pipe to break, so any failure here is a real one — a quota exceeded, or a
+        // handle the browser took back. Recorded so `outputError` can say which.
+        outputFailure = e instanceof Error ? e.message : String(e);
+        throw e;
+      }
     },
 
     [OP.READ_FILE]: async (p) => new Uint8Array(await (await fileOf(unstr(p))).arrayBuffer()),
@@ -331,26 +364,12 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       await w.close();
       return EMPTY;
     },
-    [OP.STAT]: async (p) => {
-      const out = new Uint8Array(19);
-      const dv = new DataView(out.buffer);
-      if (opts.root === undefined) return out;   // not granted reads as "does not exist"
-      const path = unstr(p);
-      try {
-        const f = await fileOf(path);
-        out[0] = 1;
-        out[1] = 1;
-        dv.setBigInt64(3, BigInt(f.size), true);
-        dv.setBigInt64(11, BigInt(f.lastModified), true);
-        return out;
-      } catch { /* not a file; try a directory */ }
-      try {
-        await dirOf(path, false);   // the root included, which `resolve` cannot express
-        out[0] = 1;
-        out[2] = 1;
-      } catch { /* absent, and the zeroes say so */ }
-      return out;
-    },
+    [OP.STAT]: (p) => statBytes(unstr(p)),
+    // The Origin Private File System has no symbolic links, so this *is* `stat`, and `isSymlink`
+    // stays false. That is true rather than a stand-in — and it is why `tar` can refuse links in a
+    // page as well, without knowing which host it is on.
+    [OP.LINK_STAT]: (p) => statBytes(unstr(p)),
+
     [OP.READ_DIR]: async (p) => {
       const h = await dirOf(unstr(p), false);
       const names: string[] = [];
@@ -425,6 +444,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     },
     // Why the last read gave nothing — see `inputError` in platform.wac.
     [OP.INPUT_ERROR]: () => str(inputFailure),
+    [OP.OUTPUT_ERROR]: () => str(outputFailure),
+    [OP.SOCKET_ERROR]: (p) => str(socketFailure.get(readI32le(p)) ?? ""),
     [OP.OPEN_OUTPUT]: async (p) => {
       const path = unstr(p);
       if (sink !== null) { await sink.close(); sink = null; }

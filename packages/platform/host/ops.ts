@@ -49,6 +49,9 @@ export const OP = {
   PUSH_CHILD: 42,
   POP_CHILD: 43,
   INPUT_ERROR: 44,
+  OUTPUT_ERROR: 45,
+  SOCKET_ERROR: 46,
+  LINK_STAT: 47,
 } as const;
 
 /**
