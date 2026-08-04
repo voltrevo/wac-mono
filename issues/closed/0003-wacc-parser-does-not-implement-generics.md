@@ -1,6 +1,6 @@
 # 0003 — wacc's parser does not implement generics, so `std` is outside its corpus
 
-- **Status:** open
+- **Status:** closed (2026-08-04, agent-a)
 - **Claimed by:** agent-a (2026-08-04)
 - **Reported by:** agent-a
 - **Date:** 2026-07-31
@@ -53,3 +53,42 @@ The corpus is the whole value of the differential test, and `std` is now the mos
 generics-dense wac code in existence. Skipping it means rung 3 and later inherit a blind
 spot in exactly the part of the language that is newest — and the parser's own generic
 lookahead is where the reference implementation has had two of its bugs.
+
+## Closed, 2026-08-04 (agent-a)
+
+**All 217 files in the corpus now parse and agree with the reference, node for node, positions
+included.** Nothing is skipped: `usesGenerics` and `loadCorpus`'s `skipGenerics` option are deleted
+rather than left switched off, because a filter that exists is a filter somebody will turn back on.
+
+The three pieces above were the three pieces, and each behaved as predicted:
+
+1. **`typeParams`** — one `parseTypeParams` used by the struct, enum and function parsers, recorded as
+   name tokens on the declaration.
+2. **`typeArgs`** — `parseTypeArgs` in `parseType` and at every construction site, with `splitGt` for
+   the munched close. `>>` is rewritten in place to `>` at one byte and one column further on, which is
+   exactly what the reference's `replaceCurrent` does and therefore what the differential compares.
+   `>>>` closes three lists.
+3. **The lookaheads** — `afterTypeArgs` is one function serving both, because they ask the same
+   question and the reference has had a bug in each of them separately. Proven load-bearing by
+   removing each and watching specific cases fail: without the declaration scan, `Vec<i32> v = …`
+   disagrees; without `splitGt`, four corpus files do.
+
+**Two more constructs came with the same files**, and the issue did not name them because the readable
+half of the corpus happens to contain neither:
+
+- **`match` as an expression.** `Option<T>` is written with it — `return match (this) { case Some(v):
+  v, else: d }` — and this parser had only the statement form. `Arm` gained a nullable `value`, so one
+  arm type serves both: a body for the statement, a value for the expression. The reference does the
+  same, which keeps the two printers symmetric.
+- **Methods in an enum body.** `Option<T>` has six. A method is told from a variant by shape, and
+  `override` on one is refused, as the reference refuses it. Both ASTs hold enum methods and neither
+  prints them, so they are compared at rung 3 rather than here.
+
+Twenty-one hand-written cases went in beside the corpus, for the shapes no working file contains: a
+triple close, `Box<fn[i32(i32)]>`, `E<i32, i32>?[8]()`, a generic static call, `a < b` and
+`(a < b) == (b > c)` and `a >> 2` — the comparisons and shifts that must *not* be read as type
+arguments — and five match-expression shapes including one nested in its own arm.
+
+The count in the issue's own reproduction is now stale in a way worth recording: it said seven skipped
+files, and by the time this was picked up it was twenty-five. A skip that is reported rather than
+silent still grows.

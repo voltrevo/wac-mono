@@ -42,13 +42,21 @@ function escapeStr(value: string): string {
 function ty(t: any): string {
   switch (t.kind) {
     case "prim":     return `(prim${pos(t)} ${t.name})`;
-    case "struct":   return `(named${pos(t)} ${t.name})`;
+    // The argument list is always printed, empty or not: a shape that disappears when empty would let
+    // the two implementations agree by both leaving `Vec<i32>`'s arguments out.
+    case "struct":
+      return `(named${pos(t)} ${t.name} (${(t.typeArgs ?? []).map(ty).join(" ")}))`;
     case "array":    return `(arr${pos(t)} ${ty(t.elem)})`;
     case "nullable": return `(nullable${pos(t)} ${ty(t.inner)})`;
     case "funcref":
       return `(funcref${pos(t)} ${ty(t.ret)} (${t.params.map(ty).join(" ")}))`;
   }
   throw new Error(`unknown type kind ${t.kind}`);
+}
+
+/** ` <T U>` after a declaration's name, and ` <>` when it has none. */
+function typeParams(ps: string[] | undefined): string {
+  return ` <${(ps ?? []).join(" ")}>`;
 }
 
 function exprList(items: any[]): string {
@@ -75,6 +83,15 @@ function expr(e: any): string {
         ? "null"
         : TYPES.includes(e.rhs.kind) ? ty(e.rhs) : expr(e.rhs);
       return `(is${pos(e)} ${neg} ${expr(e.expr)} ${rhs})`;
+    }
+    case "matchExpr": {
+      // An arm has a value where the statement form's has a body. Same arm syntax, different
+      // position — which is how the language reads it too.
+      const arms = e.arms.map((a: any) => {
+        const name = a.variant === null ? "else" : a.variant;
+        return `(arm ${name} (${a.bindings.join(" ")}) ${expr(a.value)})`;
+      }).join(" ");
+      return `(matchexpr${pos(e)} ${expr(e.subject)} (${arms}))`;
     }
     case "ternary":
       return `(ternary${pos(e)} ${expr(e.cond)} ${expr(e.then)} ${expr(e.else_)})`;
@@ -181,7 +198,8 @@ function decl(d: any): string {
       return `(import${pos(d)} ${escapeStr(d.path)} (${items}))`;
     }
     case "func":
-      return `(func${pos(d)} ${d.exported ? "export" : "local"} ${d.name} ` +
+      return `(func${pos(d)} ${d.exported ? "export" : "local"} ${d.name}` +
+        `${typeParams(d.typeParams)} ` +
         `${ty(d.returnType)}${params(d.params)}${stmtList(d.body.stmts)})`;
     case "struct": {
       const fields = d.fields.map((f: any) =>
@@ -192,13 +210,16 @@ function decl(d: any): string {
           `${ty(m.returnType)}${params(m.params)}${stmtList(m.body.stmts)})`;
       }).join(" ");
       return `(struct${pos(d)} ${d.exported ? "export" : "local"} ` +
-        `${d.isConst ? "const" : "mut"} ${d.name} ${d.parent ?? "-"} ` +
+        `${d.isConst ? "const" : "mut"} ${d.name}${typeParams(d.typeParams)} ${d.parent ?? "-"} ` +
         `(${fields}) (${methods}))`;
     }
     case "enum": {
       const variants = d.variants.map((v: any) =>
         `(variant ${v.name}${params(v.fields)})`).join(" ");
-      return `(enum${pos(d)} ${d.exported ? "export" : "local"} ${d.name} (${variants}))`;
+      // An enum's methods are held by both ASTs and printed by neither: they are compared through rung
+      // 3's diagnostics, and printing them here would only test this file against itself.
+      return `(enum${pos(d)} ${d.exported ? "export" : "local"} ${d.name}` +
+        `${typeParams(d.typeParams)} (${variants}))`;
     }
     case "const":
       return `(const${pos(d)} ${d.exported ? "export" : "local"} ${d.name} ` +
@@ -244,7 +265,7 @@ function check(name: string, source: string): void {
 // ── Corpus ────────────────────────────────────────────────────────────────────
 
 Deno.test("parse: agrees with the reference on every .wac file in the repo", async () => {
-  const files = await loadCorpus("parse", { skipGenerics: true });
+  const files = await loadCorpus("parse");
   let failures = 0;
   const messages: string[] = [];
   for (const [name, source] of files) {
@@ -311,6 +332,49 @@ Deno.test("parse: agrees on constructs a working corpus does not contain", () =>
       `enum E { A(i32 v), B } i32 f(E e) { match (e) { case A(_): return 1; else: return 0; } }`],
     ["match on a non-variable subject",
       `enum E { A, B } i32 f(E[] es) { match (es[0]) { case A: return 1; case B: return 0; } }`],
+    // ── Generics ─────────────────────────────────────────────────────────────
+    //
+    // The corpus has twenty-five files that use these and none that use the awkward shapes: a triple
+    // close, a funcref inside a type argument, a comparison that must *not* be read as one. Both of
+    // the parser's generic lookaheads have had bugs in the reference, and these are those bugs.
+    ["generic struct and a use of it",
+      `struct Vec<T> { T[] items; i32 n; } i32 f(Vec<i32> v) { return v.n; }`],
+    ["generic function",
+      `T max<T>(T a, T b) { return a; } i32 f() { return max(1, 2); }`],
+    ["generic enum with methods",
+      `enum Option<T> { None, Some(T v) bool isSome(const this) { return match (this) { case Some(v): true, else: false }; } }`],
+    ["two type parameters and a nested argument",
+      `struct Map<K, V> { K[] keys; } i32 f(Map<string, Vec<i32>> m) { return 0; }`],
+    ["a nested close that the lexer munched into one token",
+      `struct Vec<T> { T[] items; } i32 f(Vec<Vec<i32>> v) { return 0; }`],
+    ["a triple close", `struct V<T> { T[] i; } i32 f(V<V<V<i32>>> v) { return 0; }`],
+    ["a funcref inside a type argument",
+      `struct Box<T> { T v; } i32 f(Box<fn[i32(i32)]> b) { return 0; }`],
+    ["a generic declared and constructed",
+      `struct Vec<T> { i32 n; Vec<T> create() { return Vec<T>(0); } }`],
+    ["an array of nullable instantiations",
+      `struct E<K, V> { K k; } E<i32, i32>?[] f() { return E<i32, i32>?[8](); }`],
+    ["a generic element type in a sized construction",
+      `struct Vec<T> { i32 n; } Vec<i32>[] f() { return Vec<i32>[2](fill: Vec<i32>(0)); }`],
+    ["a comparison that is not a type argument list", `bool f(i32 a, i32 b) { return a < b; }`],
+    ["a comparison chain that could look like one",
+      `bool f(i32 a, i32 b, i32 c) { return (a < b) == (b > c); }`],
+    ["a shift that is not a close", `i32 f(i32 a) { return a >> 2; }`],
+    ["a generic local declaration",
+      `struct Vec<T> { i32 n; } i32 f() { Vec<i32> v = Vec<i32>(0); return v.n; }`],
+    ["a generic static call",
+      `struct Vec<T> { i32 n; Vec<T> create() { return Vec<T>(0); } } i32 f() { return Vec<i32>.create().n; }`],
+    // ── match as an expression ───────────────────────────────────────────────
+    ["match in expression position",
+      `enum E { A, B(i32 v) } i32 f(E e) { return match (e) { case A: 0, case B(v): v }; }`],
+    ["match expression with an else arm and a trailing comma",
+      `enum E { A, B } i32 f(E e) { return match (e) { case A: 1, else: 0, }; }`],
+    ["match expression nested in one of its own arms",
+      `enum E { A, B } i32 f(E e) { return match (e) { case A: match (e) { case A: 1, else: 2 }, else: 0 }; }`],
+    ["match expression as an initialiser",
+      `enum E { A, B } i32 f(E e) { i32 x = match (e) { case A: 1, else: 2 }; return x; }`],
+    ["match statement and match expression in one function",
+      `enum E { A, B } i32 f(E e) { match (e) { case A: { return 1; } case B: { } } return match (e) { case A: 1, else: 0 }; }`],
     ["exported and const struct with a parent",
       `struct Base { i32 a; } export const struct Derived : Base { i32 b; }`],
     ["struct with override and const this",

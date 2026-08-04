@@ -548,6 +548,104 @@ i64 q6(i32 a, i32 b, i32 c, i32 d, i32 e, i32 f) {
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+/**
+ * Split a munched `>>` or `>>>` so a nested type-argument list can close.
+ *
+ * `Vec<Vec<i32>>` ends in what the lexer read as one shift operator, and the lexer is a pure token
+ * stream that knows nothing about nesting. So the parser consumes one `>` worth and rewrites the rest
+ * in place — the same trick the reference calls `replaceCurrent`, and the reason `P.toks` is mutable.
+ *
+ * The position moves with it: the remaining `>` begins one byte later and one column further on, which
+ * is what the reference records and therefore what the differential compares.
+ */
+void splitGt(P p) {
+  i32 base = p.abs(0) * tokenStride();
+  p.toks[base] = p.kindAt(0) == kShrU() ? kShr() : kGt();
+  p.toks[base + 1] = p.toks[base + 1] + 1;
+  p.toks[base + 2] = p.toks[base + 2] - 1;
+  p.toks[base + 4] = p.toks[base + 4] + 1;
+}
+
+/** Whether the current token closes a type-argument list, in any of its munched forms. */
+bool atTypeArgEnd(P p) {
+  return p.at1(kGt()) || p.at1(kShr()) || p.at1(kShrU());
+}
+
+/**
+ * `<i32>` or `<string, Vec<i32>>` after a name — empty when there is no `<` at all.
+ *
+ * Type arguments are what made `packages/std` unreadable here: twenty-five files in the corpus use
+ * them, and a parser that stops at `Vec<` cannot compare against anything. wac-mono 0003.
+ */
+Ty[] parseTypeArgs(P p) {
+  TyList args = TyList.create();
+  if (!p.at1(kLt())) { return args.take(); }
+  p.advance();
+  if (!atTypeArgEnd(p)) {
+    args.push(parseType(p));
+    while (p.eat(kComma())) {
+      if (atTypeArgEnd(p)) { break; }              // trailing comma, as in every other list
+      args.push(parseType(p));
+    }
+  }
+  // `>>` closes two lists and `>>>` three: take one `>` worth and leave the rest for the caller.
+  if (p.at1(kShr()) || p.at1(kShrU())) { splitGt(p); } else { p.expect(kGt()); }
+  return args.take();
+}
+
+/** `<T>` or `<T, U>` after a declaration's name: the name tokens, empty when there are none. */
+i32[] parseTypeParams(P p) {
+  I32List params = I32List.create();
+  if (!p.at1(kLt())) { return params.take(); }
+  p.advance();
+  if (!p.at1(kGt())) {
+    while (true) {
+      if (p.at1(kGt())) { break; }                 // trailing comma
+      if (p.at1(kIdent())) { params.push(p.advance()); } else { p.fail(perrExpected()); }
+      if (!p.eat(kComma())) { break; }
+    }
+  }
+  p.expect(kGt());
+  return params.take();
+}
+
+/**
+ * Skip a balanced `<…>` starting at `from`, or return -1 when there is not one.
+ *
+ * Shared by the two lookaheads that need it — a declaration against an expression statement, and a
+ * construction against a comparison — because they ask the same question about the same shape and the
+ * reference had a bug in each of them separately. Parentheses and brackets are tracked, since
+ * `Box<fn[i32(i32)]>` contains both and a scan that stopped at the funcref's own `)` read the whole
+ * declaration as an expression. A `;` or `{` ends the scan: neither can appear inside a type.
+ */
+i32 afterTypeArgs(P p, i32 from) {
+  if (p.kindAt(from) != kLt()) { return -1; }
+  i32 depth = 0;
+  i32 group = 0;
+  i32 k = from;
+  while (p.kindAt(k) != kEof()) {
+    i32 kind = p.kindAt(k);
+    if (kind == kLparen() || kind == kLbrack()) { group++; }
+    else if (kind == kRparen() || kind == kRbrack()) {
+      if (group == 0) { break; }                   // a closer nothing opened: not a type list
+      group--;
+    } else if (kind == kLt()) { depth++; }
+    else if (kind == kGt()) {
+      depth--;
+      if (depth == 0) { k++; break; }
+    } else if (kind == kShr()) {
+      depth -= 2;
+      if (depth <= 0) { k++; break; }
+    } else if (kind == kShrU()) {
+      depth -= 3;
+      if (depth <= 0) { k++; break; }
+    } else if (kind == kSemi() || kind == kLbrace()) { break; }
+    k++;
+  }
+  if (depth <= 0 && k > from) { return k; }
+  return -1;
+}
+
 export Ty parseType(P p) {
   i32 line = p.lineAt(0);
   i32 col = p.colAt(0);
@@ -572,7 +670,9 @@ export Ty parseType(P p) {
   } else if (p.at1(kIdent()) || p.at1(kVoid())) {
     bool prim = identIsPrim(p, 0);
     i32 t = p.advance();
-    node = prim ? tyPrim(t, line, col) : tyNamed(t, line, col);
+    // A primitive takes no arguments and must not eat a `<`: `i32 < n` is a comparison.
+    Ty[] args = prim ? Ty[]() : parseTypeArgs(p);
+    node = prim ? tyPrim(t, line, col) : tyNamed(t, args, line, col);
   } else {
     // The reference reports the error and *substitutes* `i32` without consuming
     // anything, then goes on to parse suffixes. Advancing here instead would desync
@@ -917,6 +1017,11 @@ Expr parsePrimary(P p) {
   if (p.at1(kInt()))   { return Expr(ExprKind.IntLit(p.advance()), line, col); }
   if (p.at1(kFloat())) { return Expr(ExprKind.FloatLit(p.advance()), line, col); }
   if (p.at1(kString())) { return Expr(ExprKind.StrLit(p.advance()), line, col); }
+  // `match (subject) { case P: value, … }` as an expression. The arm syntax is the statement's, so
+  // there is one of it in the language; which form is being parsed is decided by *position* — this is
+  // expression position — and nothing is ambiguous.
+  if (p.at1(kMatch())) { return parseMatchExpr(p); }
+
   // `this` is an identifier expression, as in the reference.
   if (p.at1(kThis()))  { return Expr(ExprKind.Ident(p.advance()), line, col); }
 
@@ -988,6 +1093,17 @@ bool looksLikeConstructionOrCall(P p) {
 
   if (next == kDot() || next == kLparen() || next == kLbrace()) { return true; }
 
+  // `Vec<i32>(…)`, `Vec<i32>[0]()`, `Map<K, V>.create()`, `MapEntry<K, V>?[8]()` — skip the argument
+  // list and ask what follows it. `?` belongs in that set as much as `[`: an array of nullable
+  // instantiations is how a hash table spells an empty slot.
+  if (next == kLt()) {
+    i32 after = afterTypeArgs(p, 1);
+    if (after < 0) { return false; }
+    i32 following = p.kindAt(after);
+    return following == kLbrack() || following == kLparen() || following == kLbrace()
+        || following == kQuestion();
+  }
+
   if (next == kLbrack() || next == kQuestion()) {
     i32 j = 1;                        // relative offset of the `[` or `?`
     // Skip element-type suffixes: `[]` pairs and `?`.
@@ -1036,6 +1152,10 @@ bool spanIsFill(u8[] s, i32 start, i32 len) {
 Expr parseConstructionOrCall(P p, i32 line, i32 col) {
   bool prim = identIsPrim(p, 0);
   i32 nameTok = p.advance();
+  // `Vec<i32>(…)`, `Map<string, i32>.create()`, `MapEntry<K, V>?[8]()` — the one place type arguments
+  // appear in something that reads like an expression, and unambiguous because what follows is a
+  // construction rather than an operand. A primitive never takes them: `i32 < n` is a comparison.
+  Ty[] nameArgs = prim ? Ty[]() : parseTypeArgs(p);
 
   // `Type.method(...)`, or `Type.method` as a funcref.
   if (p.at1(kDot())) {
@@ -1054,9 +1174,9 @@ Expr parseConstructionOrCall(P p, i32 line, i32 col) {
   }
 
   // Array construction. The element type may carry its own suffixes:
-  // `i32[][3]()`, `Node?[5]()`.
+  // `i32[][3]()`, `Node?[5]()`, and its own type arguments: `MapEntry<K, V>?[8]()`.
   if (p.at1(kLbrack()) || p.at1(kQuestion())) {
-    Ty elem = prim ? tyPrim(nameTok, line, col) : tyNamed(nameTok, line, col);
+    Ty elem = prim ? tyPrim(nameTok, line, col) : tyNamed(nameTok, nameArgs, line, col);
     if (p.at1(kQuestion())) {
       i32 nLine = p.lineAt(0); i32 nCol = p.colAt(0);
       p.advance();
@@ -1111,7 +1231,7 @@ Expr parseConstructionOrCall(P p, i32 line, i32 col) {
     }
     p.expect(kRbrace());
     Expr[] empty = Expr[]();
-    return Expr(ExprKind.Construct(tyNamed(nameTok, line, col), empty, named.take()),
+    return Expr(ExprKind.Construct(tyNamed(nameTok, nameArgs, line, col), empty, named.take()),
       line, col);
   }
 
@@ -1120,7 +1240,7 @@ Expr parseConstructionOrCall(P p, i32 line, i32 col) {
     p.advance();
     Expr[] args = parseArgList(p);
     p.expect(kRparen());
-    Ty t = prim ? tyPrim(nameTok, line, col) : tyNamed(nameTok, line, col);
+    Ty t = prim ? tyPrim(nameTok, line, col) : tyNamed(nameTok, nameArgs, line, col);
     NamedArg[] empty = NamedArg[]();
     return Expr(ExprKind.Construct(t, args, empty), line, col);
   }
@@ -1219,6 +1339,13 @@ bool looksLikeVarDecl(P p) {
   if (k == kFn()) { return true; }
   if (k != kIdent() && k != kVoid()) { return false; }
   i32 j = i + 1;
+  // A type-argument list first: `Vec<i32> v = …` is a declaration, and without this the statement
+  // parsed as the expression `Vec < i32` and failed at the `=`. This is where the classic C++
+  // ambiguity would live, and wac gets off lightly — the scan wants a *balanced* `<…>` followed by a
+  // name, so `a < b;` and `f(a < b)` are untouched. It does claim `a < b > c` as a declaration, which
+  // as an expression would compare a bool, which wac rejects anyway.
+  i32 afterArgs = afterTypeArgs(p, j);
+  if (afterArgs > 0) { j = afterArgs; }
   while (true) {
     if (p.kindAt(j) == kLbrack() && p.kindAt(j + 1) == kRbrack()) { j += 2; }
     else if (p.kindAt(j) == kQuestion()) { j++; }
@@ -1460,6 +1587,56 @@ Stmt[] parseArmBody(P p) {
   return out.take();
 }
 
+/**
+ * `match (x) { case A(v): expr, else: expr }` in expression position.
+ *
+ * The same grammar as the statement, with a value per arm instead of a body, and the arms
+ * comma-separated because each one is an expression. Only the statement form existed here, which is
+ * why `packages/std`'s `Option<T>` could not be read at all: `T orElse(const this, T d) { return
+ * match (this) { … }; }` is the shape half that file is written in.
+ */
+Expr parseMatchExpr(P p) {
+  i32 line = p.lineAt(0);
+  i32 col = p.colAt(0);
+  p.expect(kMatch());
+  p.expect(kLparen());
+  Expr subject = parseExpr(p);
+  p.expect(kRparen());
+  p.expect(kLbrace());
+
+  ArmList arms = ArmList.create();
+  while (!p.at1(kRbrace()) && !p.at1(kEof())) {
+    if (p.eat(kElse())) {
+      p.expect(kColon());
+      arms.push(Arm(-1, i32[0](), Stmt[](), parseExpr(p)));
+    } else if (p.eat(kCase())) {
+      i32 variantTok = -1;
+      if (p.at1(kIdent())) { variantTok = p.advance(); } else { p.fail(perrExpected()); }
+      I32List bindings = I32List.create();
+      if (p.eat(kLparen())) {
+        if (!p.at1(kRparen())) {
+          while (true) {
+            if (p.at1(kRparen())) { break; }             // trailing comma
+            if (p.at1(kIdent())) { bindings.push(p.advance()); } else { p.fail(perrExpected()); }
+            if (!p.eat(kComma())) { break; }
+          }
+        }
+        p.expect(kRparen());
+      }
+      p.expect(kColon());
+      arms.push(Arm(variantTok, bindings.take(), Stmt[](), parseExpr(p)));
+    } else {
+      p.fail(perrExpected());
+      p.advance();
+      continue;
+    }
+    // A trailing comma after the last arm is allowed, as in every other list.
+    if (!p.eat(kComma())) { break; }
+  }
+  p.expect(kRbrace());
+  return Expr(ExprKind.MatchExpr(subject, arms.take()), line, col);
+}
+
 Stmt parseMatchStmt(P p) {
   i32 line = p.lineAt(0);
   i32 col = p.colAt(0);
@@ -1473,7 +1650,7 @@ Stmt parseMatchStmt(P p) {
   while (!p.at1(kRbrace()) && !p.at1(kEof())) {
     if (p.eat(kElse())) {
       p.expect(kColon());
-      arms.push(Arm(-1, i32[0](), parseArmBody(p)));
+      arms.push(Arm(-1, i32[0](), parseArmBody(p), null));
       continue;
     }
     if (!p.eat(kCase())) {
@@ -1495,7 +1672,7 @@ Stmt parseMatchStmt(P p) {
       p.expect(kRparen());
     }
     p.expect(kColon());
-    arms.push(Arm(variantTok, bindings.take(), parseArmBody(p)));
+    arms.push(Arm(variantTok, bindings.take(), parseArmBody(p), null));
   }
   p.expect(kRbrace());
   return Stmt(StmtKind.Match(subject, arms.take()), line, col);
@@ -1550,6 +1727,7 @@ Decl parseStructDecl(P p, bool exported) {
   p.advance();                                     // struct
   i32 nameTok = -1;
   nameTok = declName(p, perrExpected());
+  i32[] typeParams = parseTypeParams(p);
   i32 parentTok = -1;
   if (p.eat(kColon())) {
     if (p.at1(kIdent())) { parentTok = p.advance(); } else { p.fail(perrExpected()); }
@@ -1603,18 +1781,32 @@ Decl parseStructDecl(P p, bool exported) {
   }
   p.expect(kRbrace());
   return Decl(DeclKind.StructDecl(nameTok, parentTok, fields.take(), methods.take(),
-    exported, isConst), line, col);
+    exported, isConst, typeParams), line, col);
 }
 
+/**
+ * `enum Name<T> { Variant, Variant(payload), … methods }`.
+ *
+ * Variants first, then methods — and the two are told apart by shape rather than by a keyword, because
+ * a variant can never look like `type name(this, …)`. This parser had no methods at all until the
+ * corpus needed them: every enum in the readable half of the corpus happens to have none, and
+ * `Option<T>` — which has six — was skipped for using generics, so the gap was invisible. Both halves
+ * of that are wac-mono 0003.
+ */
 Decl parseEnumDecl(P p, bool exported) {
   i32 line = p.lineAt(0);
   i32 col = p.colAt(0);
   p.expect(kEnum());
   i32 nameTok = -1;
   nameTok = declName(p, perrExpected());
+  // As on a struct, and for the same reason: the parameters are in scope for every variant's payload
+  // types and every method below.
+  i32[] typeParams = parseTypeParams(p);
   p.expect(kLbrace());
   VariantList variants = VariantList.create();
+  MethodList methods = MethodList.create();
   while (!p.at1(kRbrace()) && !p.at1(kEof())) {
+    if (looksLikeEnumMethod(p)) { break; }
     i32 vTok = -1;
     if (p.at1(kIdent())) { vTok = p.advance(); } else { p.fail(perrExpected()); }
     ParamList fields = ParamList.create();
@@ -1625,8 +1817,66 @@ Decl parseEnumDecl(P p, bool exported) {
     variants.push(Variant(vTok, fields.take()));
     if (!p.eat(kComma())) { break; }
   }
+
+  while (!p.at1(kRbrace()) && !p.at1(kEof())) {
+    // `override` means nothing here — the variants are the compiler's own subtypes, so an override
+    // would be per-variant dispatch, a different feature. Refused rather than quietly accepted.
+    if (p.at1(kOverride())) {
+      p.fail(perrExpected());
+      p.advance();
+    }
+    Ty returnType = parseType(p);
+    i32 mTok = -1;
+    if (p.at1(kIdent())) { mTok = p.advance(); } else { p.fail(perrMethodName()); }
+    p.expect(kLparen());
+    bool hasThis = false;
+    bool thisConst = false;
+    ParamList params = ParamList.create();
+    if (!p.at1(kRparen())) {
+      if (p.at1(kConst()) && p.kindAt(1) == kThis()) {
+        thisConst = true;
+        hasThis = true;
+        p.advance();
+        p.advance();
+        if (p.eat(kComma())) { parseParams(p, params); }
+      } else if (p.at1(kThis())) {
+        hasThis = true;
+        p.advance();
+        if (p.eat(kComma())) { parseParams(p, params); }
+      } else {
+        parseParams(p, params);
+      }
+    }
+    p.expect(kRparen());
+    // A static method would be spelled `Shape.make()`, which is already how a variant is constructed,
+    // so one is refused until that ambiguity is decided deliberately.
+    if (!hasThis) { p.fail(perrMethodName()); }
+    methods.push(Method(mTok, returnType, params.take(), parseBlock(p), false, hasThis, thisConst));
+  }
+
   p.expect(kRbrace());
-  return Decl(DeclKind.EnumDecl(nameTok, variants.take(), exported), line, col);
+  return Decl(DeclKind.EnumDecl(nameTok, variants.take(), exported, methods.take(), typeParams),
+    line, col);
+}
+
+/**
+ * Does a method start here, rather than another variant?
+ *
+ * A variant is `IDENT` or `IDENT(…)`; a method is a *type* followed by a name and a parameter list. So
+ * the question is what follows the first identifier — another identifier and a `(` is a method, and
+ * anything else is a variant. `override`, `void` and `fn` can only begin a method.
+ */
+bool looksLikeEnumMethod(P p) {
+  if (p.at1(kOverride()) || p.at1(kVoid()) || p.at1(kFn())) { return true; }
+  if (!p.at1(kIdent())) { return false; }
+  i32 j = 1;
+  // The type's own suffixes: `i32[] name(…)`, `Node? name(…)`.
+  while (true) {
+    if (p.kindAt(j) == kLbrack() && p.kindAt(j + 1) == kRbrack()) { j += 2; }
+    else if (p.kindAt(j) == kQuestion()) { j++; }
+    else { break; }
+  }
+  return p.kindAt(j) == kIdent() && p.kindAt(j + 1) == kLparen();
 }
 
 Decl parseFuncDecl(P p) {
@@ -1636,12 +1886,13 @@ Decl parseFuncDecl(P p) {
   Ty ret = parseType(p);
   i32 nameTok = -1;
   nameTok = declName(p, perrExpected());
+  i32[] typeParams = parseTypeParams(p);
   p.expect(kLparen());
   ParamList params = ParamList.create();
   if (!p.at1(kRparen())) { parseParams(p, params); }
   p.expect(kRparen());
-  return Decl(DeclKind.Func(nameTok, ret, params.take(), parseBlock(p), exported),
-    line, col);
+  return Decl(DeclKind.Func(nameTok, ret, params.take(), parseBlock(p), exported,
+    typeParams), line, col);
 }
 
 Decl parseConstDecl(P p, bool exported) {
