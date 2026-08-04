@@ -26,7 +26,7 @@ rather than arithmetic — CIOS does 288 multiply-accumulate steps, and each was
 three array accesses and a loop test. End to end this took a signature verification from 15.3 ms to
 under 9 ms.
 
-## Two things this measurement ruled out
+## Three things this measurement ruled out
 
 **384-bit Karatsuba.** The obvious next move looked like cutting 144 limb products to about 108.
 But a limb addition costs about what a limb multiply-accumulate costs here, and Karatsuba pays
@@ -38,6 +38,17 @@ twice, and a squaring would take the multiply half from 144 steps to 78. Measure
 `fpSquare` do its work twice and timing a whole verification, all of `fpSquare` is 0.59 ms of 8.65,
 so the ceiling on a squaring is about 0.14 ms — 1.6% — for several hundred lines of carry handling
 that is exactly where squaring implementations go wrong. Not taken, and worth not re-litigating.
+
+**Lazy-carry product scanning (FIPS) on narrower limbs.** The remaining idea after the two above:
+narrower limbs leave headroom in the u64 accumulator, so a whole column of products can accumulate
+before one normalisation instead of normalising after every product. Fourteen 29-bit limbs give 392
+products at about two operations each against 288 at about five — **38% fewer operations.** Measured,
+it is **56% slower**: 179 ns against 114. Register pressure and multiply throughput were both tested
+and are not the explanation. `tools/genfips-experiment.py` regenerates it and records what is known.
+
+Three rejections, one shared moral: **operation counts do not predict runtime here, in either
+direction.** Unrolling this file was worth 64% at an *unchanged* op count, and FIPS lost 56% while
+cutting the count by 38%.
 
 ## Why the modulus lives only here
 
@@ -70,7 +81,7 @@ HEADER = """// GENERATED FILE — do not edit. Produced by `packages/bls/tools/g
 // machine-written arithmetic and `fp.wac` is meant to be read.
 //
 // Read `packages/bls/tools/genfpkernel.py` before changing anything here. It has the measurements
-// that made this unrolled, and the two optimisations they ruled out.
+// that made this unrolled, and the three optimisations they ruled out.
 //
 // Everything that mentions p mentions it here. `fp.wac` keeps one array copy for the single caller
 // that indexes it in a loop, and checks it against these immediates.

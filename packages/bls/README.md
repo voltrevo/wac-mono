@@ -118,6 +118,16 @@ Recorded because each was expensive to hold, and because three of them were abou
 - **A dedicated squaring was worth writing.** `fpSquare` is `fpMul(a, a)` and computes every
   off-diagonal product twice. All of `fpSquare` is 0.59 ms of 8.65, so the ceiling is ~0.14 ms —
   1.6% — for several hundred lines of the carry handling that squaring implementations get wrong.
+- **Lazy-carry product scanning would help.** Narrower limbs leave headroom to accumulate a whole
+  column before normalising, which is 38% fewer operations. Built and measured: **56% slower**, 179 ns
+  against 114. Register pressure and multiply throughput were both tested and neither explains it.
+  `tools/genfips-experiment.py` regenerates it. The one finding that outlived it: 30-bit limbs are
+  faster and can *provably* overflow the accumulator at 2^64.304, while 43 random pairs including
+  (p−1)² peaked at 2^63.1 and looked safe.
+
+Four wrong predictions from operation counts, and one case where the same arithmetic under-predicted
+by a mile — unrolling the kernel, 64% faster at an unchanged op count. **In this environment op
+counts do not predict runtime in either direction.** Measure.
 
 The trick that sized the last two, and the inversion before them: make the function do its work
 **twice** and time a whole verification. The delta is the time spent in it, which is otherwise hard

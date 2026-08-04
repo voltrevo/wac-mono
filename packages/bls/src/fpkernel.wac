@@ -7,7 +7,7 @@
 // machine-written arithmetic and `fp.wac` is meant to be read.
 //
 // Read `packages/bls/tools/genfpkernel.py` before changing anything here. It has the measurements
-// that made this unrolled, and the two optimisations they ruled out.
+// that made this unrolled, and the three optimisations they ruled out.
 //
 // Everything that mentions p mentions it here. `fp.wac` keeps one array copy for the single caller
 // that indexes it in a loop, and checks it against these immediates.

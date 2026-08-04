@@ -14,6 +14,7 @@
 //   deno task mutate --jobs=2            # how many to test at once (default: cores - 1, max 4)
 //   deno task mutate --no-select         # skip per-test selection, run every test in scope
 //   deno task mutate --no-sample         # mutate every integer literal, not one per repeated shape
+//   deno task mutate --no-nice           # do not yield to other work (only on a machine you own)
 //   deno task mutate --sample=150        # run a random 150 of the selected mutants (see --seed)
 //   deno task mutate --seed=12345        # reproduce a particular --sample draw
 //   deno task mutate --operators --dry-run   # what would run, without running it
@@ -101,8 +102,49 @@ const diffOnly = args.includes("--diff");
 const dryRun = args.includes("--dry-run");
 const pkgArg = args.includes("--package") ? args[args.indexOf("--package") + 1] : undefined;
 const filter = args.find((a) => !a.startsWith("--") && a !== pkgArg);
-/** A mutant that hangs the suite is a real outcome, not a reason to wait forever. */
-const TEST_TIMEOUT_MS = 180_000;
+/**
+ * A mutant that hangs the suite is a real outcome, not a reason to wait forever — but the deadline
+ * has to be relative to how fast this machine is *right now*, not a fixed wall-clock.
+ *
+ * This is the whole reason a sweep may be `nice`d. A timeout is scored as a **kill**, on the sound
+ * argument that an infinite loop is a detected defect. The unsound consequence, if the deadline is
+ * absolute, is that anything slowing the sweep down converts survivors into kills: the sweep reports
+ * a *better* score for running on a loaded machine, or for being polite to other processes. That is
+ * the worst direction for a measurement error, and it is why wac-mono issue 0031 was filed rather
+ * than fixed — you cannot make a sweep yield until its clock stops depending on getting the machine
+ * to itself.
+ *
+ * So the deadline is `max(FLOOR, observed baseline for this scope x MULTIPLIER)`. `mutate.ts` already
+ * runs every scope unmutated before mutating anything, in the same conditions and the same staged
+ * tree; timing that run is free and it is the only honest yardstick available. Under load the
+ * baseline is slow too, so the deadline stretches with it and no verdict changes.
+ *
+ * The multiplier is generous on purpose. A mutant is either detected — usually in the first failing
+ * test, with `--fail-fast` — or it runs to completion in about baseline time. Ten times baseline is
+ * not "a bit slow", it is hung.
+ */
+const TIMEOUT_MULTIPLIER = 10;
+const TIMEOUT_FLOOR_MS = 30_000;
+const TIMEOUT_CAP_MS = 600_000;
+
+/**
+ * `nice`, so a sweep yields to whatever somebody is waiting on.
+ *
+ * A mutation sweep is background work by definition: nobody is watching an individual mutant. An
+ * ordinary `deno task test` next door is the opposite. On five shared cores, a sweep at four
+ * concurrent scopes — each a whole `deno test`, and `box.test.ts` alone spawns about three hundred
+ * built binaries — took another agent's fifty-second suite to over half an hour, at load average
+ * 10.55. They killed it at thirty minutes believing it had deadlocked and spent an hour proving it
+ * had not. See wac-mono issue 0031.
+ *
+ * `--no-nice` exists for a sweep on a machine you have to yourself, where it is pure overhead.
+ */
+const NICE = !args.includes("--no-nice");
+
+/** The deadline for a mutant whose scope took `baseline` ms unmutated. */
+function deadlineFor(baseline: number): number {
+  return Math.min(TIMEOUT_CAP_MS, Math.max(TIMEOUT_FLOOR_MS, baseline * TIMEOUT_MULTIPLIER));
+}
 
 // ── The source universe ───────────────────────────────────────────────────────
 
@@ -452,14 +494,19 @@ function testDirs(m: Mutant): string[] {
  * skip a test, it fails the run.
  */
 function testCommand(work: string, dirs: string[], filter?: string): Deno.Command {
-  return new Deno.Command("deno", {
-    args: ["test", "--no-check", "--fail-fast", "--allow-read", "--allow-write",
-           "--allow-run", "--allow-net", "--allow-env", "--quiet",
-           ...(filter ? ["--filter", filter] : []), ...dirs],
-    cwd: work,
-    stdout: "piped",
-    stderr: "piped",
-  });
+  const denoArgs = ["test", "--no-check", "--fail-fast", "--allow-read", "--allow-write",
+                    "--allow-run", "--allow-net", "--allow-env", "--quiet",
+                    ...(filter ? ["--filter", filter] : []), ...dirs];
+  // `nice` wraps the whole `deno test`, and the niceness is inherited by every subprocess it
+  // spawns — which is the point, since those subprocesses are most of the load.
+  return NICE
+    ? new Deno.Command("nice", {
+      args: ["-n", "19", "deno", ...denoArgs],
+      cwd: work,
+      stdout: "piped",
+      stderr: "piped",
+    })
+    : new Deno.Command("deno", { args: denoArgs, cwd: work, stdout: "piped", stderr: "piped" });
 }
 
 const runTests = (work: string, dirs: string[]) => testCommand(work, dirs).output();
@@ -530,6 +577,21 @@ try {
     await stageProject(dir);
   }
   if (jobs > 1) console.log(`  running ${jobs} at a time`);
+  // Print the load, because this is the number that explains a slow sweep *and* a slow suite next
+  // door, and because the alternative is somebody spending an hour proving the suite has not hung.
+  // A job is a whole `deno test`, and several test files are themselves swarms of subprocesses, so
+  // `jobs` understates the load by a lot — `box.test.ts` alone spawns about three hundred binaries.
+  try {
+    const load = (await Deno.readTextFile("/proc/loadavg")).split(" ").slice(0, 3).join(" ");
+    const cores = navigator.hardwareConcurrency || 0;
+    console.log(`  load before starting: ${load} on ${cores} core(s)`);
+    if (Number(load.split(" ")[0]) > cores * 0.7) {
+      console.log(
+        "  NOTE: this machine is already busy. A sweep is background work — it is niced, so it " +
+          "should yield,\n        but somebody may still be waiting on a suite. See issue 0031.",
+      );
+    }
+  } catch { /* not Linux; the sweep does not depend on knowing */ }
 
   // ── The unmutated baseline ───────────────────────────────────────────────
   //
@@ -547,12 +609,18 @@ try {
   // worth measuring — and refusing to run at all would mean any red package anywhere
   // blocks every sweep, which is how a guard gets switched off.
   const redScopes = new Set<string>();
+  // How long each scope takes unmutated, in these conditions. The mutant deadline is a multiple of
+  // this rather than a fixed wall-clock, so a slow machine stretches the deadline instead of
+  // converting survivors into false kills. See TIMEOUT_MULTIPLIER.
+  const baselineMs = new Map<string, number>();
   {
     const scopes = new Set(toRun.map((t) => testDirs(t.mutant).join(" ")));
     for (const key of [...scopes].sort()) {
       const dirs = key.split(" ").filter(Boolean);
       if (dirs.length === 0) continue;
+      const started = performance.now();
       const { code, stdout, stderr } = await runTests(workDirs[0], dirs);
+      baselineMs.set(key, performance.now() - started);
       if (code !== 0) {
         redScopes.add(key);
         const out = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
@@ -562,6 +630,13 @@ try {
     }
     const clean = scopes.size - redScopes.size;
     console.log(`  baseline: ${clean}/${scopes.size} test scope(s) pass unmutated`);
+    const slowest = Math.max(0, ...baselineMs.values());
+    console.log(
+      `  deadline: ${TIMEOUT_MULTIPLIER}x each scope's own baseline ` +
+        `(slowest ${(slowest / 1000).toFixed(1)}s -> ${(deadlineFor(slowest) / 1000).toFixed(0)}s), ` +
+        `so load stretches it rather than manufacturing kills` +
+        (NICE ? "; running under nice -n 19" : "; NOT niced (--no-nice)"),
+    );
     if (clean === 0) {
       console.log("\nNothing is measurable: every scope this run touches is already failing.");
       console.log("Each mutant would be recorded as killed and the run would report a perfect");
@@ -662,10 +737,14 @@ try {
       const cmd = testCommand(work, runDirs, filter);
       const child = cmd.spawn();
       let timedOut = false;
+      // The full scope's baseline, not the narrowed run's: a narrowed run is a subset and therefore
+      // faster, so this errs towards a longer deadline, which is the safe direction for a scoring
+      // rule that counts a timeout as a kill.
+      const deadline = deadlineFor(baselineMs.get(dirs.join(" ")) ?? 0);
       const timer = setTimeout(() => {
         timedOut = true;
         try { child.kill("SIGKILL"); } catch { /* already gone */ }
-      }, TEST_TIMEOUT_MS);
+      }, deadline);
       const { code, stdout, stderr } = await child.output();
       clearTimeout(timer);
 
@@ -679,7 +758,7 @@ try {
         killed,
         timedOut,
         dirs,
-        detail: timedOut ? `timed out after ${TEST_TIMEOUT_MS / 1000}s` : (firstFail ?? "").trim().slice(0, 90),
+        detail: timedOut ? `timed out after ${(deadline / 1000).toFixed(0)}s` : (firstFail ?? "").trim().slice(0, 90),
       });
       const mark = timedOut ? "TO " : killed ? "ok " : "!! ";
       console.log(`  ${mark} ${mutant.name.padEnd(52)} ${killed ? "killed" : "SURVIVED"}`);

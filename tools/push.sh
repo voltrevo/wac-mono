@@ -42,11 +42,41 @@ for attempt in 1 2 3; do
   # exists to prevent. It is safe *only* because `pipefail` is set above, so the pipeline
   # takes the exit code of `deno task test` rather than of `tee`. Remove `pipefail` and this
   # line silently starts pushing red trees. Do not drop the `set -uo pipefail`.
-  if ! deno task test 2>&1 | tee "$log"; then
+  # `timeout` is a backstop against a *hang*, not a performance gate.
+  #
+  # Deno 2.9 has no per-test timeout — none at all, and none configurable. When a test blocks
+  # forever it prints "has been running for over (4m0s)" and keeps printing it, and the run never
+  # ends. Several tests here wait on a subprocess announcing readiness with no deadline of their
+  # own (`waitForListening` in box's tests, three separate `serveOnce` helpers), and the ports come
+  # from bind-then-release, which races under `--parallel`. So an unbounded wait is reachable, and
+  # this script is the push gate: unbounded here means an agent sits for an hour with nothing to
+  # read but a warning.
+  #
+  # The value is deliberately far above any legitimate run — the suite is about fifty seconds
+  # alone, and the worst honest figure anybody has recorded on a loaded machine is half an hour.
+  # Anything past this is not slow, it is stuck. Picking a tighter bound would recreate the
+  # false-failure problem that kept issue 0031 open: a guard that fires on a busy machine gets
+  # switched off.
+  timeout --kill-after=30s 45m deno task test 2>&1 | tee "$log"
+  status=${PIPESTATUS[0]}
+  if [ "$status" -ne 0 ]; then
     echo
-    echo "== tests failed: not pushing =="
-    echo "-- failures --"
-    grep -E 'FAILED|error:' "$log" | head -20
+    if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+      echo "== the suite did not finish in 45m: not pushing =="
+      echo "   This is a hang, not slowness. Deno never kills a blocked test, so the run would"
+      echo "   have continued indefinitely. The tests below were still running when it was cut:"
+      grep -oE "'[^']+' has been running for over[^)]*.\)" "$log" | sort -u | head -10
+    else
+      echo "== tests failed: not pushing =="
+      echo "-- failures --"
+      grep -E 'FAILED|error:' "$log" | head -20
+    fi
+    # Any test that outstayed Deno's warning threshold is worth naming even on a plain failure:
+    # it is the most likely cause of a slow run somebody else is about to blame on their own work.
+    if [ "$status" -ne 124 ] && [ "$status" -ne 137 ]; then
+      slow=$(grep -oE "'[^']+' has been running for over[^)]*.\)" "$log" | sort -u | head -5)
+      [ -n "$slow" ] && { echo "-- tests that ran unusually long --"; echo "$slow"; }
+    fi
     echo "-- full output: $log --"
     exit 1
   fi
