@@ -13,6 +13,16 @@
 // locale decides and the two disagree on case.
 
 const CASES: string[] = [
+  // `head`/`tail` with the traditional count, which nothing here asked for until `head -2` was found
+  // printing every line: a flag ignored rather than refused. GNU takes both spellings and so must this.
+  "seq 1 5 | head -2",
+  "seq 1 5 | head -n 2",
+  "seq 1 5 | tail -2",
+  "seq 1 5 | tail -n 2",
+  "seq 1 5 | head",
+  "seq 1 5 | head -0",
+  "printf 'a\\nb\\nc\\n' | head -1",
+  "printf 'a\\nb\\nc\\n' | tail -1",
   // ── Words and quoting ───────────────────────────────────────────────────────
   `echo hello`,
   `echo hello world`,

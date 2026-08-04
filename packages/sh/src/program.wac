@@ -570,9 +570,26 @@ u8[] firstLines(u8[] data, i32 n) {
   return out.take();
 }
 
+/**
+ * How many lines `head` and `tail` were asked for: `-n N`, or the traditional `-N`.
+ *
+ * Both, because GNU accepts both and `head -2` is the form people type — it is in this repo's own
+ * documentation and in `packages/box`'s usage line. Only `-n N` was read here, so `seq 1 5 | head -2`
+ * printed all five lines: a flag ignored rather than refused, which is the failure mode that looks like
+ * the program working. Found by running the differential corpus through the Node build and noticing that
+ * *both* builds disagreed with bash — the corpus had no `-N` case in it, so nothing had ever asked.
+ *
+ * A digit is what distinguishes the count from a flag. `-n` is not a count and neither is `-r`; only
+ * `-` followed by digits is, which is exactly what GNU accepts — and that is the same thing as being
+ * spelled like a negative number, which `isNumber` already answers.
+ */
 i32 countArg(Vec<string> argv, i32 fallback) {
   for (i32 i = 1; i < argv.len(); i++) {
-    if (argv.get(i) == "-n" && i + 1 < argv.len()) { return atoi(argv.get(i + 1)); }
+    string a = argv.get(i);
+    if (a == "-n" && i + 1 < argv.len()) { return atoi(argv.get(i + 1)); }
+    // `-2` reads as -2, so the count is its negation. `-` alone is not a number, and `-n` is not
+    // either, so neither reaches here.
+    if (a.len() > 1 && a.slice(0, 1) == "-" && isNumber(a)) { return -atoi(a); }
   }
   return fallback;
 }
