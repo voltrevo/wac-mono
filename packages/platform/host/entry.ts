@@ -31,20 +31,20 @@ export type AppModule = {
   Stat: { of(...a: unknown[]): unknown };
   Socket: { of(...a: unknown[]): unknown };
   /** The monomorphised `Pending<T>`s — one per capability return type. */
-  Pending_i32: { of(...a: unknown[]): unknown };
-  Pending_i64: { of(...a: unknown[]): unknown };
-  Pending_string: { of(...a: unknown[]): unknown };
-  Pending_stringOpt: { of(...a: unknown[]): unknown };
-  Pending_u8Arr: { of(...a: unknown[]): unknown };
-  Pending_bool: { of(...a: unknown[]): unknown };
-  Pending_stringArrOpt: { of(...a: unknown[]): unknown };
-  Pending_FileResult: { of(...a: unknown[]): unknown };
-  Pending_Stat: { of(...a: unknown[]): unknown };
-  Pending_Socket: { of(...a: unknown[]): unknown };
-  Pending_Child: { of(...a: unknown[]): unknown };
+  Pending$i32: { of(...a: unknown[]): unknown };
+  Pending$i64: { of(...a: unknown[]): unknown };
+  Pending$string: { of(...a: unknown[]): unknown };
+  Pending$stringOpt: { of(...a: unknown[]): unknown };
+  Pending$u8Arr: { of(...a: unknown[]): unknown };
+  Pending$bool: { of(...a: unknown[]): unknown };
+  Pending$stringArrOpt: { of(...a: unknown[]): unknown };
+  Pending$FileResult: { of(...a: unknown[]): unknown };
+  Pending$Stat: { of(...a: unknown[]): unknown };
+  Pending$Socket: { of(...a: unknown[]): unknown };
+  Pending$Child: { of(...a: unknown[]): unknown };
   Child: { of(...a: unknown[]): unknown };
   Captured: { of(...a: unknown[]): unknown };
-  Pending_Captured: { of(...a: unknown[]): unknown };
+  Pending$Captured: { of(...a: unknown[]): unknown };
   main: (core: unknown, cli: unknown) => number;
 
   // Only an interactive browser application has these, and bindgen emits a class only for a
@@ -53,8 +53,8 @@ export type AppModule = {
   Page?: { of(...a: unknown[]): unknown };
   Event?: { of(...a: unknown[]): unknown };
   Picked?: { of(...a: unknown[]): unknown };
-  Pending_Event?: { of(...a: unknown[]): unknown };
-  Pending_Picked?: { of(...a: unknown[]): unknown };
+  Pending$Event?: { of(...a: unknown[]): unknown };
+  Pending$Picked?: { of(...a: unknown[]): unknown };
   /** The interactive entry point: draw, subscribe, and loop on `nextEvent`. */
   page?: (core: unknown, cli: unknown, page: unknown) => number;
 };

@@ -396,6 +396,15 @@ export struct Stat {
 export struct Socket {
   i32 handle;      // negative when `error` is set
   string error;
+
+  /**
+   * Declared here rather than left to bindgen, because the host builds these.
+   *
+   * bindgen emits a constructor for a struct that has none, and its name carries the `$` that marks
+   * a generated identifier — so relying on it means the host reaches for a name no wac source
+   * mentions. Two lines here and the capability world states its own construction API.
+   */
+  Socket of(i32 handle, string error) { return Socket(handle, error); }
 }
 
 /**
@@ -428,6 +437,9 @@ export const i32 GRANT_ENV = 8;
 export struct Child {
   i32 handle;      // negative when `error` is set
   string error;
+
+  /** As `Socket.of`: the host builds these, so the constructor is declared rather than generated. */
+  Child of(i32 handle, string error) { return Child(handle, error); }
 }
 
 export struct Cli {
