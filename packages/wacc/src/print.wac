@@ -184,10 +184,18 @@ void printTy(Pr w, Ty t) {
       if (tok < 0) { w.s("i32"); } else { w.tok(tok); }
       w.close();
     }
-    case Named(tok): {
+    case Named(tok, typeArgs): {
       w.open("named", t.line, t.col);
       w.sp();
       w.tok(tok);
+      // The argument list is always printed, empty or not: one shape for `Vec<i32>` and for `Node`
+      // means the two sides of the differential cannot agree by both omitting something.
+      w.s(" (");
+      for (i32 i = 0; i < typeArgs.len(); i++) {
+        if (i > 0) { w.sp(); }
+        printTy(w, typeArgs[i]);
+      }
+      w.out.push(')');
       w.close();
     }
     case Arr(elem): {
@@ -272,6 +280,27 @@ void printExpr(Pr w, Expr e) {
       else if (other is not null) { printExpr(w, other!); }
       else                        { w.s("null"); }
       w.close();
+    }
+    // A `match` in expression position: an arm has a value where the statement's has a body.
+    case MatchExpr(subject, arms): {
+      w.open("matchexpr", e.line, e.col);
+      w.sp(); printExpr(w, subject);
+      w.s(" (");
+      for (i32 i = 0; i < arms.len(); i++) {
+        if (i > 0) { w.sp(); }
+        w.s("(arm ");
+        if (arms[i].variantTok < 0) { w.s("else"); } else { w.tok(arms[i].variantTok); }
+        w.s(" (");
+        for (i32 j = 0; j < arms[i].bindingToks.len(); j++) {
+          if (j > 0) { w.sp(); }
+          w.tok(arms[i].bindingToks[j]);
+        }
+        w.out.push(')');
+        w.sp();
+        printExpr(w, arms[i].value!);
+        w.out.push(')');
+      }
+      w.s("))");
     }
     case Ternary(cond, then, els): {
       w.open("ternary", e.line, e.col);
@@ -494,6 +523,21 @@ void printStmtList(Pr w, Stmt[] items) {
 
 // ── Declarations ──────────────────────────────────────────────────────────────
 
+/**
+ * ` <T U>` after a declaration's name, and ` <>` when it has none.
+ *
+ * Always printed, for the same reason the type-argument list is: a shape that disappears when it is
+ * empty lets two implementations agree by both leaving it out.
+ */
+void printTypeParams(Pr w, i32[] params) {
+  w.s(" <");
+  for (i32 i = 0; i < params.len(); i++) {
+    if (i > 0) { w.sp(); }
+    w.tok(params[i]);
+  }
+  w.out.push('>');
+}
+
 void printParams(Pr w, Param[] params) {
   w.s(" (");
   for (i32 i = 0; i < params.len(); i++) {
@@ -524,20 +568,22 @@ void printDecl(Pr w, Decl d) {
       }
       w.s("))");
     }
-    case Func(nameTok, returnType, params, body, exported): {
+    case Func(nameTok, returnType, params, body, exported, typeParams): {
       w.open("func", d.line, d.col);
       w.sp(); w.s(exported ? "export" : "local");
       w.sp(); w.tok(nameTok);
+      printTypeParams(w, typeParams);
       w.sp(); printTy(w, returnType);
       printParams(w, params);
       printStmtList(w, body);
       w.close();
     }
-    case StructDecl(nameTok, parentTok, fields, methods, exported, isConst): {
+    case StructDecl(nameTok, parentTok, fields, methods, exported, isConst, typeParams): {
       w.open("struct", d.line, d.col);
       w.sp(); w.s(exported ? "export" : "local");
       w.sp(); w.s(isConst ? "const" : "mut");
       w.sp(); w.tok(nameTok);
+      printTypeParams(w, typeParams);
       w.sp();
       if (parentTok < 0) { w.s("-"); } else { w.tok(parentTok); }
       w.s(" (");
@@ -567,10 +613,13 @@ void printDecl(Pr w, Decl d) {
       }
       w.s("))");
     }
-    case EnumDecl(nameTok, variants, exported): {
+    // Methods are held by the AST and *not* printed, which is what the reference does too — an enum's
+    // methods are compared through rung 3's diagnostics rather than here.
+    case EnumDecl(nameTok, variants, exported, methods, typeParams): {
       w.open("enum", d.line, d.col);
       w.sp(); w.s(exported ? "export" : "local");
       w.sp(); w.tok(nameTok);
+      printTypeParams(w, typeParams);
       w.s(" (");
       for (i32 i = 0; i < variants.len(); i++) {
         if (i > 0) { w.sp(); }

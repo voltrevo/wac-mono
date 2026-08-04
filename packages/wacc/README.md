@@ -61,33 +61,54 @@ become ~80 zero-argument functions. Mechanical, but it is the clearest measureme
 yet of that gap: an enum of 80 variants costs 80 function declarations, and the
 numbering has to be kept in sync with the harness by hand.
 
-## Known gap: three constructs added to wac after rung 2
+## Generics, and two constructs that came with them
 
-The parser here is behind the reference on three things that landed in wac on 2026-07-31, and
-the corpus does not use any of them yet — which is the only reason the differential test is
-green:
+The parser reads type parameters and type arguments — `struct Vec<T>`, `T max<T>(T a, T b)`,
+`Map<string, Vec<i32>>`, `Vec<i32>[2](fill: …)` — which is
+[wac-mono 0003](../../issues/closed/0003-wacc-parser-does-not-implement-generics.md). Until it did,
+twenty-five files were skipped by name, including all of `packages/std`, which is the most
+generics-dense wac in existence: the corpus is the whole value of a differential test, and a blind
+spot in the newest part of the language is the worst place to have one.
 
-- **`match` as an expression** (`case P: value,` arms) — wac issue 0026
-- **methods in an enum body** — wac issue 0028
-- **`const` on a parameter** — already tracked; the AST field exists here, the parser accepts it
+Three pieces, and the awkwardness is all in the third:
 
-The first two need `ast.wac`, `parse.wac` and `print.wac` extending, and the reference printer
-in `test/parse.test.ts` to match. Until then, the moment any `.wac` file in this repo uses one,
-`parse: agrees with the reference` fails — loudly, and pointing at the file, which is the
-intended behaviour rather than a problem. Noting it here so the failure is recognised as a
-known gap rather than a regression.
+- **`typeParams` on a declaration** — an optional `<A, B>` after the name of a struct, an enum or a
+  function. One parser, three callers.
+- **`typeArgs` in a type** — and the lexer has already munched `Vec<Vec<i32>>`'s close into a single
+  `>>`, so the parser consumes one `>` worth and rewrites the rest in place, position included.
+  `>>>` closes three. `P.toks` being mutable is what makes that possible.
+- **Two lookaheads.** `Vec<i32> v = …` is a declaration and `a < b > c` is not; `Vec<i32>(…)` is a
+  construction and `a < b` is not. Both scan for a *balanced* `<…>` followed by something that settles
+  it, and both track parentheses and brackets, because `Box<fn[i32(i32)]>` contains both and a scan
+  that stopped at the funcref's own `)` read the declaration as an expression. The reference has had a
+  bug in each of them separately, which is why `afterTypeArgs` is one function here.
+
+Two more constructs came with the same corpus, both of which the working half of the corpus happened
+not to contain:
+
+- **`match` as an expression** (`case P: value,` arms), which is how half of `Option<T>` is written.
+  `Arm` gained a `value`, so one arm type serves both forms — a body for the statement, a value for
+  the expression.
+- **methods in an enum body**, which `Option<T>` has six of. A method is told from a variant by shape
+  (`type name(this, …)` is not something a variant can look like), and `override` on one is refused as
+  the reference refuses it.
+
+`const` on a parameter is the one thing still behind, and only in the language rather than in this
+parser: the AST field exists and the parser accepts it, but wac itself does not allow `const` on a
+free function's parameter, so the read-only intent of the lookahead helpers here cannot be stated.
 
 ## Status
 
-**Rung 2 (parser) passes.** The AST it builds agrees with the reference node for
-node, positions included, on all 42 `.wac` files in the repo plus the language tour,
-and on 48 hand-written cases a working corpus cannot contain (every precedence level,
-every cast, `else if` chains, bare-statement `switch` bodies, trailing commas
-everywhere, char and string escapes, malformed types).
+**Rung 2 (parser) passes.** The AST it builds agrees with the reference node for node, positions
+included, on all 217 `.wac` files in the repo plus the language tour — nothing is skipped any more —
+and on 74 hand-written cases a working corpus cannot contain (every precedence level, every cast,
+`else if` chains, bare-statement `switch` bodies, trailing commas everywhere, char and string escapes,
+malformed types, a nested `>>>` close, a funcref inside a type argument, and the comparisons that must
+*not* be read as type arguments).
 
-**Rung 1 (lexer) passes.** Token for token, position for position, against the
-reference on 24 `.wac` files plus 31 adversarial cases the corpus cannot cover
-(unterminated everything, every escape, greedy operator runs, non-ASCII columns).
+**Rung 1 (lexer) passes.** Token for token, position for position, against the reference on the same
+217 files plus 32 adversarial cases the corpus cannot cover (unterminated everything, every escape,
+greedy operator runs, non-ASCII columns).
 
 Next: rung 3, the type checker.
 

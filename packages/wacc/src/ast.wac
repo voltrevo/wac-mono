@@ -37,8 +37,14 @@ export struct Ty {
 export enum TyKind {
   /** `i32`, `bool`, `string`, … — `tok` is the name token. */
   Prim(i32 tok),
-  /** A named struct, enum or variant. */
-  Named(i32 tok),
+  /**
+   * A named struct, enum or variant, with its type arguments.
+   *
+   * `Vec<i32>` is one of these with one argument, `Map<string, Vec<i32>>` with two. Empty for a plain
+   * name, which is what every non-generic reference is. The resolver substitutes them and nothing after
+   * it sees a non-empty list — but a *parser* has to record them, which is the whole of wac-mono 0003.
+   */
+  Named(i32 tok, Ty[] typeArgs),
   Arr(Ty elem),
   Nullable(Ty inner),
   Funcref(Ty ret, Ty[] params),
@@ -47,8 +53,8 @@ export enum TyKind {
 export Ty tyPrim(i32 tok, i32 line, i32 col) {
   return Ty(TyKind.Prim(tok), line, col);
 }
-export Ty tyNamed(i32 tok, i32 line, i32 col) {
-  return Ty(TyKind.Named(tok), line, col);
+export Ty tyNamed(i32 tok, Ty[] typeArgs, i32 line, i32 col) {
+  return Ty(TyKind.Named(tok, typeArgs), line, col);
 }
 export Ty tyArr(Ty elem, i32 line, i32 col) {
   return Ty(TyKind.Arr(elem), line, col);
@@ -75,6 +81,14 @@ export struct NamedArg {
 }
 
 export enum ExprKind {
+  /**
+   * `match (x) { case A: 1, else: 2 }` in expression position.
+   *
+   * The statement form is `StmtKind.Match`; this one has a value per arm rather than a body, which is
+   * what `Arm.value` is for. `packages/std`'s `Option<T>` is written with it, and nothing here could
+   * read that file — the parser had the statement and not the expression.
+   */
+  MatchExpr(Expr subject, Arm[] arms),
   /** `tok` is the literal token; the value is read from the source span. */
   IntLit(i32 tok),
   FloatLit(i32 tok),
@@ -165,6 +179,13 @@ export struct Arm {
   i32 variantTok;
   i32[] bindingToks;
   Stmt[] body;
+  /**
+   * The arm's value, for a `match` used as an *expression* — null for the statement form.
+   *
+   * One arm type for both, as the reference has it: an expression arm has a value and no body, a
+   * statement arm a body and no value. Two types would mean two of everything that walks them.
+   */
+  Expr? value;
 }
 
 export enum StmtKind {
@@ -235,11 +256,21 @@ export struct Decl {
 
 export enum DeclKind {
   Import(i32 pathTok, ImportItem[] items),
-  Func(i32 nameTok, Ty returnType, Param[] params, Stmt[] body, bool exported),
+  /**
+   * `typeParams` are the name tokens of `<T, U>` after the declaration's name, empty when there are
+   * none. A generic function, struct or enum is the same declaration with those recorded.
+   */
+  Func(i32 nameTok, Ty returnType, Param[] params, Stmt[] body, bool exported,
+       i32[] typeParams),
   /** `parentTok` is -1 when the struct has no parent. */
   StructDecl(i32 nameTok, i32 parentTok, Field[] fields, Method[] methods,
-             bool exported, bool isConst),
-  EnumDecl(i32 nameTok, Variant[] variants, bool exported),
+             bool exported, bool isConst, i32[] typeParams),
+  /**
+   * An enum's methods are held and not printed, exactly as the reference holds them: `Option<T>` has
+   * six, and a parser that stopped at the first one could not read the file at all.
+   */
+  EnumDecl(i32 nameTok, Variant[] variants, bool exported, Method[] methods,
+           i32[] typeParams),
   /** `[export] const <type> <name> = <expr>;` at file scope. */
   ConstDecl(i32 nameTok, Ty type, Expr init, bool exported),
 }

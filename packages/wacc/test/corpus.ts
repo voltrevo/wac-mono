@@ -78,83 +78,21 @@ export async function corpus(): Promise<Corpus> {
  * pass. `caller` appears in the message because the same failure from two test files
  * otherwise looks like one flaky test.
  */
-/**
- * Does this file use generics?
- *
- * Asked of the *reference* parser rather than of the text, because a regex over `<` finds
- * every comparison in the repo. wacc's parser does not implement type parameters yet
- * (issue 0003), so the rungs that parse skip these and say so; the lexer is unaffected,
- * since `<` and `>` were always ordinary tokens.
- */
-export function usesGenerics(source: string): boolean {
-  const { program } = wacParse(wacLex(source).tokens, source);
-  let found = false;
-  const inType = (t: WacType): void => {
-    if (found) return;
-    switch (t.kind) {
-      case "struct":
-        if (t.typeArgs !== undefined && t.typeArgs.length > 0) { found = true; return; }
-        return;
-      case "array":    return inType(t.elem);
-      case "nullable": return inType(t.inner);
-      case "funcref":  t.params.forEach(inType); return inType(t.ret);
-      default: return;
-    }
-  };
-  for (const item of program.items) {
-    if (item.tag === "import") continue;
-    if (item.tag !== "const" && item.typeParams.length > 0) return true;
-    // A file may *use* a generic without declaring one — every consumer of `std` does — and
-    // the parser has to read `Vec<i32>` in a type position to get through it.
-    if (item.tag === "func") { inType(item.returnType); item.params.forEach((p) => inType(p.type)); }
-    else if (item.tag === "struct") { item.fields.forEach((f) => inType(f.type)); }
-    else if (item.tag === "enum") {
-      item.variants.forEach((v) => v.fields.forEach((f) => inType(f.type)));
-    } else if (item.tag === "const") inType(item.type);
-    if (found) return true;
-  }
-  // A generic used only inside a body — `Vec<i32> v = Vec.create();` in a function — is the
-  // common case and the declaration walk above does not reach it, so fall back to the tokens:
-  // an `ident <` pair that a comparison could not be, because a type is what follows.
-  const { tokens } = wacLex(source);
-  for (let i = 0; i + 2 < tokens.length; i++) {
-    if (tokens[i].kind !== "ident" || tokens[i + 1].kind !== "<") continue;
-    const after = tokens[i + 2].kind;
-    if (after !== "ident" && !PRIM_NAMES.has(after)) continue;
-    // `a < b > c` is legal arithmetic; a type argument list is followed by an identifier,
-    // `?`, `[`, `(` or `>`-then-identifier. Requiring the closer to be adjacent to a name
-    // keeps this from claiming comparisons.
-    for (let j = i + 2; j < tokens.length && j < i + 12; j++) {
-      const k = tokens[j].kind;
-      if (k === ">" || k === ">>") {
-        const next = tokens[j + 1]?.kind;
-        if (next === "ident" || next === "?" || next === "[" || next === ".") return true;
-        break;
-      }
-      if (k !== "ident" && k !== "," && k !== "[" && k !== "]" && k !== "?" &&
-          !PRIM_NAMES.has(k)) break;
-    }
-  }
-  return false;
-}
-
 const PRIM_NAMES = new Set([
   "i32", "i64", "u8", "u32", "u64", "i8", "i16", "u16", "f32", "f64", "bool", "string",
 ]);
 
-export async function loadCorpus(
-  caller: string,
-  opts: { skipGenerics?: boolean } = {},
-): Promise<Entry[]> {
+/**
+ * Every entry, with nothing filtered out.
+ *
+ * There used to be a `skipGenerics` option and a `usesGenerics` predicate that asked the reference
+ * parser which files to leave out — twenty-five of them by the end, including all of `packages/std`,
+ * which is the most generics-dense wac in existence. Both are gone: wacc's parser reads type
+ * parameters and type arguments now, so the corpus is the corpus. Issue 0003.
+ */
+export async function loadCorpus(caller: string): Promise<Entry[]> {
   const { files: all, skipped } = await corpus();
-  const files: Entry[] = [];
-  for (const [name, source] of all) {
-    if (opts.skipGenerics === true && usesGenerics(source)) {
-      skipped.push({ name, reason: "uses generics, which wacc's parser does not implement (issue 0003)" });
-      continue;
-    }
-    files.push([name, source]);
-  }
+  const files: Entry[] = [...all];
   if (files.length < 10) {
     throw new Error(
       `${caller}: corpus is only ${files.length} files — the walk is probably wrong. ` +
