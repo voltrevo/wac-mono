@@ -131,6 +131,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   // A program running inside this one: what it reads, what it writes, and where it stands.
   // `P` is applied to every path below and is the identity when nothing is pushed.
   const kids = new ChildStack();
+  // Empty until a read fails; `inputError` hands it back. See platform.wac.
+  let inputFailure = "";
   const P = (path: string) => kids.path(path);
 
   return {
@@ -266,11 +268,19 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       const fed = source === null ? kids.readChunk() : null;
       if (fed !== null) return fed;
       if (source === null && readIn !== undefined) return await readIn();
-      const into = fresh();
-      const n = source === null ? await Deno.stdin.read(into) : await source.read(into);
-      // A short read is not the end; only null is.
-      return n === null ? EMPTY : into.subarray(0, n);
+      try {
+        const into = fresh();
+        const n = source === null ? await Deno.stdin.read(into) : await source.read(into);
+        // A short read is not the end; only null is.
+        return n === null ? EMPTY : into.subarray(0, n);
+      } catch (e) {
+        // Kept, not thrown: `readChunk` answers with bytes and cannot carry a reason, so a failed
+        // read looks exactly like the end of input until somebody asks `inputError`.
+        inputFailure = e instanceof Error ? e.message : String(e);
+        return EMPTY;
+      }
     },
+    [OP.INPUT_ERROR]: () => str(inputFailure),
 
     [OP.OPEN_OUTPUT]: async (p) => {
       const path = unstr(p);

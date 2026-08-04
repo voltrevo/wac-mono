@@ -151,6 +151,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   // child's relative paths resolve from where the shell put it; with nothing pushed it is the
   // identity and every path means exactly what it did before.
   const kids = new ChildStack();
+  // Empty until a read fails; `inputError` hands it back. See platform.wac.
+  let inputFailure = "";
 
   const canWrite = (): void => {
     if (opts.root === undefined || opts.writable !== true) deny("filesystem write");
@@ -410,12 +412,19 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       const fed = source === null ? kids.readChunk() : null;
       if (fed !== null) return fed;
       if (source === null) return EMPTY;
-      const end = Math.min(source.at + CHUNK, source.blob.size);
-      if (end <= source.at) return EMPTY;
-      const slice = source.blob.slice(source.at, end);
-      source.at = end;
-      return new Uint8Array(await slice.arrayBuffer());
+      try {
+        const end = Math.min(source.at + CHUNK, source.blob.size);
+        if (end <= source.at) return EMPTY;
+        const slice = source.blob.slice(source.at, end);
+        source.at = end;
+        return new Uint8Array(await slice.arrayBuffer());
+      } catch (e) {
+        inputFailure = e instanceof Error ? e.message : String(e);
+        return EMPTY;
+      }
     },
+    // Why the last read gave nothing — see `inputError` in platform.wac.
+    [OP.INPUT_ERROR]: () => str(inputFailure),
     [OP.OPEN_OUTPUT]: async (p) => {
       const path = unstr(p);
       if (sink !== null) { await sink.close(); sink = null; }

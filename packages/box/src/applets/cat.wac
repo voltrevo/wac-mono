@@ -3,14 +3,14 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, openStream } from "../lib/input.wac";
+import { Input, openStream, inputEnded } from "../lib/input.wac";
 
 export i32 cat(Core core, Cli cli, Args a) {
   Input in = openStream(core, cli, a, 0);
   if (!in.ok) { return 1; }
   while (true) {
     u8[] chunk = cli.readChunk();
-    if (chunk.len() == 0) { return 0; }
+    if (chunk.len() == 0) { return inputEnded(core, cli, a) ? 0 : 1; }
     // `write` answers false when the other end has gone, which is the only signal there is — this
     // used to discard it and keep reading, so `cat` of an endless source went on for ever after
     // whatever was reading it had exited. Success, as it is for every filter: a downstream that

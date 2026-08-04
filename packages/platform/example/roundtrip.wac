@@ -30,7 +30,7 @@ export i32 main(Core core, Cli cli) {
   cli.remove(a, false).wait();
   cli.remove(b, false).wait();
 
-  if (!cli.writeFile(a, text.toBytes()).wait()) {
+  if (cli.writeFile(a, text.toBytes()).wait() != "") {
     core.warn("roundtrip: cannot write " + a);
     return 1;
   }
@@ -53,7 +53,7 @@ export i32 main(Core core, Cli cli) {
     (contains(names!, a) ? "including " + a : "but not " + a)));
 
   // Not atomic in a browser. Everything else here behaves identically on all three hosts.
-  if (!cli.rename(a, b).wait()) {
+  if (cli.rename(a, b).wait() != "") {
     core.warn("roundtrip: cannot rename");
     return 1;
   }

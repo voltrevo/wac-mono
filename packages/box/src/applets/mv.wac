@@ -6,7 +6,8 @@ import { Args } from "../lib/args.wac";
 
 export i32 mv(Core core, Cli cli, Args a) {
   if (a.rest.len() < 2) { core.warn("usage: " + a.name + " <src> <dst>"); return 2; }
-  if (cli.rename(a.rest[0], a.rest[1]).wait()) { return 0; }
+  string err = cli.rename(a.rest[0], a.rest[1]).wait();
+  if (err == "") { return 0; }
   core.warn(a.name + ": " + a.rest[0] + ": cannot move");
   return 1;
 }

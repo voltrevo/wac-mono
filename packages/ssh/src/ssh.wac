@@ -149,7 +149,7 @@ i32 checkHost(Core core, Cli cli, Options o, u8[] hostKey) {
       u8[] updated = (contents.len() > 0 && contents[contents.len() - 1] != 10)
         ? joinBytes(contents, ("\n" + line + "\n").toBytes())
         : joinBytes(contents, (line + "\n").toBytes());
-      if (!cli.writeFile(path, updated).wait()) {
+      if (cli.writeFile(path, updated).wait() != "") {
         core.warn("ssh: cannot write " + path + " — was --allow-write granted?");
         return 1;
       }

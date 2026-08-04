@@ -107,7 +107,7 @@ split is why it is a second struct rather than more fields.
 | | `waitAny` | — |
 | `Cli` | `argCount`, `arg`, `env` | — |
 | | `readStdin`, `write` | — |
-| | `openInput`, `readChunk` | `--allow-read` for a file |
+| | `openInput`, `readChunk`, `inputError` | `--allow-read` for a file |
 | | `readFile`, `stat`, `readDir` | `--allow-read` |
 | | `writeFile`, `mkdir`, `remove`, `rename` | `--allow-write` |
 | | `openOutput` (to a file) | `--allow-write` |
@@ -117,6 +117,15 @@ split is why it is a second struct rather than more fields.
 | | `pushChild`, `popChild` | — (a child *inside* this program, with this program's authority) |
 | `Page` | `render`, `setText`, `setValue`, `getValue`, `on`, `nextEvent`, `title` | browser only |
 | | `drawPixels`, `nextFile`, `offerDownload` | browser only |
+
+**Anything that can fail says why.** `writeFile`, `mkdir`, `remove` and `rename` answer with the
+empty string on success and the host's own message otherwise, as `openInput` and `openOutput` already
+did — a `bool` could report that a write failed and never what went wrong, so `rm -f` had to suppress
+every failure or none, and each applet's diagnostic was its own guess. `readChunk` keeps its
+`fn[u8[]()]` shape, because the streaming transforms take it as a bare funcref, and `inputError`
+answers the question it cannot: empty for a clean end, the host's message when the read broke. Ask it
+once when the chunks stop — without it a filter over a disk that gave out exits 0 having written half
+the answer.
 
 `pushChild` and `popChild` need no grant because they add no authority: they change what `arg`,
 `readChunk`, `write`, `log`, `warn` and every path mean *for the program itself*, between two

@@ -86,6 +86,14 @@ substitution, not that the text stopped changing.
 
 **`program.wac`** — see below. It is the one interesting thing here.
 
+## `rm -f` and what the platform can say
+
+`-f` ignores what is already gone, not everything that fails. That distinction needed the platform:
+`remove` used to answer `bool`, so "no such file" and "permission denied" were the same answer and
+`-f` could only swallow both — it said nothing, exited 0, and left the file where it was. The
+capabilities carry the host's message now, and existence is a separate question, so the two cases are
+told apart without reading the message's words.
+
 ## External programs, and the seam
 
 Every external command goes through **one seam**, and there are now two things on the other side

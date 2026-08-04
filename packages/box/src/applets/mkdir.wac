@@ -8,7 +8,8 @@ export i32 mkdir(Core core, Cli cli, Args a) {
   bool parents = has(a, 'p');
   i32 code = 0;
   for (i32 i = 0; i < a.rest.len(); i++) {
-    if (cli.mkdir(a.rest[i], parents).wait()) { continue; }
+    string err = cli.mkdir(a.rest[i], parents).wait();
+    if (err == "") { continue; }
     core.warn(a.name + ": " + a.rest[i] + ": cannot create");
     code = 1;
   }

@@ -66,6 +66,15 @@ function assertSameBytes(got: Uint8Array, want: Uint8Array, msg: string): void {
 
 
 
+async function exists(path: string): Promise<boolean> {
+  try {
+    await Deno.stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 Deno.test("box's applets agree with the system tools they imitate", async () => {
   // The widest test of the world so far, and a differential one: every applet here is
   // compared against the real utility rather than against my idea of it. `sha256sum` and
@@ -198,6 +207,22 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     await Deno.remove(withNl);
     await Deno.remove(noNl);
 
+    // `-f` ignores what is already gone, not everything that fails. `remove` answered `bool`, so
+    // "no such file" and "permission denied" arrived identically and `-f` had to swallow both: it
+    // said nothing, exited 0, and left the file there. GitHub wac-mono#17.
+    const guarded = await Deno.makeTempDir({ prefix: "wac-box-rmf-" });
+    await Deno.mkdir(`${guarded}/sub`);
+    await Deno.writeTextFile(`${guarded}/sub/kept`, "x");
+    await Deno.chmod(`${guarded}/sub`, 0o500);          // may not be unlinked from
+    const stubborn = box(["rm", "-f", `${guarded}/sub/kept`]);
+    await Deno.chmod(`${guarded}/sub`, 0o700);
+    assertEquals(stubborn.code, 1, "rm -f reports a file it could not remove");
+    assertEquals(await exists(`${guarded}/sub/kept`), true, "and the file is indeed still there");
+    // While a file that was never there is still silent, as it is in GNU.
+    const absent = box(["rm", "-f", `${guarded}/nothing-here`]);
+    assertEquals(absent.code, 0, "rm -f on a missing file succeeds");
+    await Deno.remove(guarded, { recursive: true });
+
     // `--` ends the options, so an operand may begin with a dash. Without it `cat -- -x` treated
     // both as flags, found no operand, read empty standard input and exited 0. GitHub wac-mono#11.
     const dashDir = await Deno.makeTempDir({ prefix: "wac-box-dash-" });
@@ -278,6 +303,22 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     await Deno.remove(unreadable, { recursive: true });
     assertEquals(found.code, 1, "find over an unreadable subtree fails");
     assertEquals(counted.code, 1, "and so does du");
+
+    // A read that fails is not an end of input. `readChunk` answers with bytes and cannot say
+    // "broken", so every filter treated a half-read as a whole one and exited 0 — the failure mode
+    // where the program is the last thing suspected. `inputError` is the reason, asked once when the
+    // chunks stop. A directory is the portable way to get an open that succeeds and a read that does
+    // not. GitHub wac-mono#18.
+    for (const applet of ["cat", "wc", "hex", "crc32", "sha256sum", "strings"]) {
+      const r = box([applet, "/tmp"]);
+      assertEquals(r.code, 1, `${applet} of a directory should fail, got ${r.code}`);
+    }
+    // And the real ones agree that it is a failure.
+    assertEquals(
+      new Deno.Command("cat", { args: ["/tmp"], stdout: "null", stderr: "null" }).outputSync().code,
+      1,
+      "GNU cat agrees",
+    );
 
     assertEquals(box(["head", "-3", fixture]).out, sys("head", ["-3", fixture]), "head -N");
     assertEquals(box(["tail", "-n", "2", fixture]).out, sys("tail", ["-n", "2", fixture]), "tail -n N");

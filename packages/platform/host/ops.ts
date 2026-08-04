@@ -48,6 +48,7 @@ export const OP = {
   CWD: 41,
   PUSH_CHILD: 42,
   POP_CHILD: 43,
+  INPUT_ERROR: 44,
 } as const;
 
 /**

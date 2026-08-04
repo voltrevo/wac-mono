@@ -465,7 +465,17 @@ export struct Cli {
 
   fn[Pending<FileResult>(string)] readFile;
   /** True when the write succeeded. */
-  fn[Pending<bool>(string, u8[])] writeFile;
+  /**
+   * **Answers with the empty string on success and the host's message otherwise**, as `openInput`
+   * and `openOutput` do — a `bool` could say that a write failed and never why.
+   *
+   * That mattered more than it looks. `rm -f` could only suppress every failure or none, because
+   * "no such file" and "permission denied" arrived as the same `false`; `find` could report that a
+   * directory was unreadable but not that it was a mount point rather than a typo; and every
+   * `writeFile` diagnostic in this repo was the applet's guess at what had gone wrong. The message
+   * is the host's own, which is the only one that knows.
+   */
+  fn[Pending<string>(string, u8[])] writeFile;
   /** What a path is. `exists` is false where the filesystem was not granted. */
   fn[Pending<Stat>(string)] stat;
   /** Names within a directory, or null if it is not one — or not permitted. */
@@ -484,9 +494,9 @@ export struct Cli {
    * caller has to ask for the recursive form, because the recursive form is the one that
    * can destroy something it was not pointed at.
    */
-  fn[Pending<bool>(string, bool)] mkdir;
-  fn[Pending<bool>(string, bool)] remove;
-  fn[Pending<bool>(string, string)] rename;
+  fn[Pending<string>(string, bool)] mkdir;
+  fn[Pending<string>(string, bool)] remove;
+  fn[Pending<string>(string, string)] rename;
 
   /**
    * Streaming input: `openInput` chooses the source, `readChunk` pulls from it.
@@ -538,6 +548,20 @@ export struct Cli {
    * to have several of at once.
    */
   fn[u8[]()] readChunk;
+  /**
+   * Why the last `readChunk` answered with nothing: the empty string for a clean end of input, and
+   * the host's message when the read failed.
+   *
+   * A separate question rather than a richer answer, because `readChunk` is handed to the streaming
+   * transforms as a bare `fn[u8[]()]` — `gzipStream(cli.readChunk, cli.write)` — and a `Chunk` struct
+   * carrying data, end and error would not fit that signature. So the shape stays and the reason is
+   * asked for afterwards, which costs one host call per *stream* rather than one per chunk.
+   *
+   * Worth asking. Without it a truncated read is indistinguishable from a complete one, so a filter
+   * over a disk that gave out exits 0 having written half the answer — the failure mode where the
+   * program is the last thing anybody suspects.
+   */
+  fn[Pending<string>()] inputError;
 
   /**
    * Where `write` goes. `openOutput("")` is standard output, which is where it starts.
@@ -689,14 +713,15 @@ export struct Cli {
     fn[Pending<u8[]>()] readStdin,
     fn[bool(u8[])] write,
     fn[Pending<FileResult>(string)] readFile,
-    fn[Pending<bool>(string, u8[])] writeFile,
+    fn[Pending<string>(string, u8[])] writeFile,
     fn[Pending<Stat>(string)] stat,
     fn[Pending<string[]?>(string)] readDir,
-    fn[Pending<bool>(string, bool)] mkdir,
-    fn[Pending<bool>(string, bool)] remove,
-    fn[Pending<bool>(string, string)] rename,
+    fn[Pending<string>(string, bool)] mkdir,
+    fn[Pending<string>(string, bool)] remove,
+    fn[Pending<string>(string, string)] rename,
     fn[Pending<string>(string)] openInput,
     fn[u8[]()] readChunk,
+    fn[Pending<string>()] inputError,
     fn[Pending<string>(string)] openOutput,
     fn[Pending<Socket>(string, i32)] connect,
     fn[Pending<Socket>(i32)] listen,
@@ -713,7 +738,7 @@ export struct Cli {
   ) {
     return Cli(
       argCount, arg, env, readStdin, write, readFile, writeFile, stat, readDir,
-      mkdir, remove, rename, openInput, readChunk, openOutput,
+      mkdir, remove, rename, openInput, readChunk, inputError, openOutput,
       connect, listen, accept, recv, send, closeSocket, spawn, closeFeed, exitCode, cwd,
       pushChild, popChild
     );

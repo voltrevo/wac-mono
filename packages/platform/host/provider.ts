@@ -306,18 +306,20 @@ export function cliOf(
     /*= readFile */
     (path: string) => T.file(submit(b, OP.READ_FILE, str(path))),
     /*= writeFile */
-    (path: string, body: Uint8Array) => T.ok(submit(b, OP.WRITE_FILE, prefixed(str(path), body))),
+    // `outcome`, not `ok`: the answer is the host's message, empty when it worked.
+    (path: string, body: Uint8Array) =>
+      T.outcome(submit(b, OP.WRITE_FILE, prefixed(str(path), body))),
     /*= stat */
     (path: string) => T.stat(submit(b, OP.STAT, str(path))),
     /*= readDir */
     (path: string) => T.dir(submit(b, OP.READ_DIR, str(path))),
 
     /*= mkdir */
-    (path: string, parents: boolean) => T.ok(submit(b, OP.MKDIR, flagged(parents, path))),
+    (path: string, parents: boolean) => T.outcome(submit(b, OP.MKDIR, flagged(parents, path))),
     /*= remove */
-    (path: string, recursive: boolean) => T.ok(submit(b, OP.REMOVE, flagged(recursive, path))),
+    (path: string, recursive: boolean) => T.outcome(submit(b, OP.REMOVE, flagged(recursive, path))),
     /*= rename */
-    (from: string, to: string) => T.ok(submit(b, OP.RENAME, twoPaths(from, to))),
+    (from: string, to: string) => T.outcome(submit(b, OP.RENAME, twoPaths(from, to))),
 
     /*= openInput */
     (path: string) => T.outcome(submit(b, OP.OPEN_INPUT, str(path))),
@@ -329,6 +331,8 @@ export function cliOf(
         return EMPTY;   // unreadable is indistinguishable from ended, as it should be
       }
     },
+    /*= inputError */
+    () => T.text(submit(b, OP.INPUT_ERROR, EMPTY)),
     /*= openOutput */
     (path: string) => T.outcome(submit(b, OP.OPEN_OUTPUT, str(path))),
 

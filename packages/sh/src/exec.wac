@@ -609,7 +609,7 @@ bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
       payload = both.take();
     }
   }
-  if (!sh.cli.writeFile(path, payload).wait()) {
+  if (sh.cli.writeFile(path, payload).wait() != "") {
     sh.errOut.pushAll(("sh: " + path + ": cannot write\n").toBytes());
     sh.status = 1;
   }
@@ -799,7 +799,7 @@ Output mkdir(Shell sh, Vec<string> argv) {
   i32 status = 0;
   for (i32 i = 0; i < paths.len(); i++) {
     string given = paths.get(i);
-    if (!sh.cli.mkdir(sh.resolve(given), parents).wait()) {
+    if (sh.cli.mkdir(sh.resolve(given), parents).wait() != "") {
       err.pushAll(("mkdir: cannot create directory '" + given + "'\n").toBytes());
       status = 1;
     }
@@ -841,8 +841,19 @@ Output rm(Shell sh, Vec<string> argv) {
       }
       continue;
     }
-    if (!sh.cli.remove(path, recursive).wait() && !force) {
-      err.pushAll(("rm: cannot remove '" + given + "'\n").toBytes());
+    // `-f` is about what is already gone. A file that exists and will not be removed is reported
+    // whatever the flags say, with the host's own message — `remove` answered `bool` before, so
+    // "no such file" and "permission denied" were the same answer and `-f` had to swallow both.
+    if (!sh.cli.stat(path).wait().exists) {
+      if (!force) {
+        err.pushAll(("rm: cannot remove '" + given + "': No such file or directory\n").toBytes());
+        status = 1;
+      }
+      continue;
+    }
+    string failed = sh.cli.remove(path, recursive).wait();
+    if (failed != "") {
+      err.pushAll(("rm: cannot remove '" + given + "': " + failed + "\n").toBytes());
       status = 1;
     }
   }

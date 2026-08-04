@@ -1,6 +1,6 @@
 # 0027 — `writeFile` and friends answer `bool`, so a failure cannot say why
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-08-03
@@ -57,3 +57,11 @@ for a different and defensible reason — a closed pipe is an answer, not a cras
 depends on that — so probably not.
 
 `stat` needs nothing: absence is a legitimate answer there, and `exists` false says it.
+
+## Closed, 2026-08-04 (agent-a)
+
+`writeFile`, `mkdir`, `remove` and `rename` answer `Pending<string>` — empty on success, the host's message otherwise — which is the convention `openInput` and `openOutput` already used. No new struct, no new opcode for the four: the host already threw, and the worker-side `outcome` decoder already turned a thrown message into a string, so only the signature and one decoder call per capability changed.
+
+The decision was the owner's: platform results carry a reason. What made it cheap was that the shape
+already existed in this world — `openInput` has answered with a message since it was written, so this
+is one convention applied consistently rather than a new one invented.

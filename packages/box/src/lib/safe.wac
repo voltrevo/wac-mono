@@ -18,7 +18,7 @@ import { Cli, Core } from "../../../platform/src/platform.wac";
  */
 export bool writeAtomic(Core core, Cli cli, string path, u8[] bytes) {
   string tmp = tempName(core, path);
-  if (!cli.writeFile(tmp, bytes).wait()) { return false; }
+  if (cli.writeFile(tmp, bytes).wait() != "") { return false; }
   return finish(cli, tmp, path);
 }
 
@@ -45,7 +45,7 @@ export bool streamAtomic(Core core, Cli cli, string path) {
 
 /** The rename, and the cleanup if it fails. */
 bool finish(Cli cli, string tmp, string path) {
-  if (cli.rename(tmp, path).wait()) { return true; }
+  if (cli.rename(tmp, path).wait() == "") { return true; }
   // The rename is the only step that can leave litter, so clean up after it and not
   // before: until it succeeds, the temporary file is the only copy of the new contents.
   cli.remove(tmp, false).wait();

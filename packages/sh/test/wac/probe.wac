@@ -98,9 +98,16 @@ Pending<FileResult> fakeReadFile(string path) {
 }
 
 /** `out.txt` is writable and `readonly.txt` is not, so both paths through a redirection run. */
-Pending<bool> fakeWriteFile(string path, u8[] data) {
-  return Pending.of(path == "readonly.txt" ? 0 : 1, resolveFromId, alwaysSettled, ignoreDrop);
+/**
+ * The write outcome, as a message: empty for success.
+ *
+ * `readonly.txt` fails, so both branches of every caller are reachable — the fake cannot hold the
+ * answer itself, so it goes in the ticket's id and `resolveWriteOutcome` decodes it.
+ */
+Pending<string> fakeWriteFile(string path, u8[] data) {
+  return Pending.of(path == "readonly.txt" ? 1 : 0, resolveWriteOutcome, alwaysSettled, ignoreDrop);
 }
+string resolveWriteOutcome(i32 id) { return id == 1 ? "permission denied" : ""; }
 
 /** Only the two programs under `/bin` exist, which is what makes a `$WACPATH` search decide. */
 Stat resolveStat(i32 id) { return Stat.of(id == 1, id == 1, false, 0, 0); }
@@ -126,19 +133,21 @@ Pending<string[]?> fakeReadDir(string path) {
   return Pending.of(path == "dir" ? 1 : 0, resolveDir, alwaysSettled, ignoreDrop);
 }
 
-Pending<bool> fakeMkdir(string path, bool parents) {
-  return Pending.of(1, resolveTrue, alwaysSettled, ignoreDrop);
+Pending<string> fakeMkdir(string path, bool parents) {
+  return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
 }
-Pending<bool> fakeRemove(string path, bool recursive) {
-  return Pending.of(1, resolveTrue, alwaysSettled, ignoreDrop);
+Pending<string> fakeRemove(string path, bool recursive) {
+  return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
 }
-Pending<bool> fakeRename(string from, string to) {
-  return Pending.of(1, resolveTrue, alwaysSettled, ignoreDrop);
+Pending<string> fakeRename(string from, string to) {
+  return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
 }
 Pending<string> fakeOpenInput(string path) {
   return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
 }
 u8[] fakeReadChunk() { return u8[0](); }
+/** Nothing went wrong; the input simply ended. */
+Pending<string> fakeInputError() { return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop); }
 Pending<string> fakeOpenOutput(string path) {
   return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
 }
@@ -225,7 +234,7 @@ Pending<Captured> fakePopChild() {
 Cli fakeCli() {
   return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeReadFile, fakeWriteFile,
                 fakeStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
-                fakeReadChunk, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
+                fakeReadChunk, fakeInputError, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
                 fakeSend, fakeCloseSocket, fakeSpawn, fakeCloseFeed, fakeExitCode,
                 fakeCwd, fakePushChild, fakePopChild);
 }
@@ -275,9 +284,11 @@ export i32 shTouchStubs() {
   if (c.stat("x").wait().exists) { n++; }
   if (c.readDir("dir").wait() is not null) { n++; }
   if (c.readDir("nope").wait() is null) { n++; }
-  if (c.mkdir("d", true).wait()) { n++; }
-  if (c.remove("d", true).wait()) { n++; }
-  if (c.rename("a", "b").wait()) { n++; }
+  // The three answer a message now: empty means it worked.
+  if (c.mkdir("d", true).wait() == "") { n++; }
+  if (c.remove("d", true).wait() == "") { n++; }
+  if (c.rename("a", "b").wait() == "") { n++; }
+  n += c.inputError().wait().len();
   n += c.openInput("x").wait().len() + c.openOutput("x").wait().len();
   n += c.connect("h", 1).wait().handle + c.listen(1).wait().handle + c.accept(1).wait().handle;
   n += c.recv(1).wait().len();

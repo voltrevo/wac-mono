@@ -100,6 +100,8 @@ export function nodeWorld(
 
   // A program running inside this one. `P` is the identity when nothing is pushed.
   const kids = new ChildStack();
+  // Empty until a read fails; `inputError` hands it back. See platform.wac.
+  let inputFailure = "";
   const P = (path: string) => kids.path(path);
 
   return {
@@ -225,8 +227,14 @@ export function nodeWorld(
     [OP.READ_CHUNK]: async () => {
       const fed = source === null ? kids.readChunk() : null;
       if (fed !== null) return fed;
-      return source === null ? await io.readStdinChunk() : await source.read();
+      try {
+        return source === null ? await io.readStdinChunk() : await source.read();
+      } catch (e) {
+        inputFailure = e instanceof Error ? e.message : String(e);
+        return EMPTY;
+      }
     },
+    [OP.INPUT_ERROR]: () => str(inputFailure),
 
     [OP.OPEN_OUTPUT]: async (p) => {
       const path = unstr(p);

@@ -3,7 +3,7 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, openStream } from "../lib/input.wac";
+import { Input, openStream, inputEnded } from "../lib/input.wac";
 import { encode as hexencode } from "../../../codec/src/hex.wac";
 
 export i32 hex(Core core, Cli cli, Args a) {
@@ -11,7 +11,7 @@ export i32 hex(Core core, Cli cli, Args a) {
   if (!in.ok) { return 1; }
   while (true) {
     u8[] chunk = cli.readChunk();
-    if (chunk.len() == 0) { break; }
+    if (chunk.len() == 0) { if (!inputEnded(core, cli, a)) { return 1; } break; }
     cli.write(hexencode(chunk));
   }
   cli.write(u8[1](fill: '\n'));

@@ -37,3 +37,20 @@ export Input readInput(Core core, Cli cli, Args a, i32 n) {
   }
   return Input(true, f.bytes, path);
 }
+
+/**
+ * Whether the stream that just stopped had actually finished — ask once, after the chunks run out.
+ *
+ * `readChunk` answers with bytes, so it has no way to say "the read failed" and says "nothing left"
+ * instead. Every filter here therefore treated a disk that gave out halfway as a complete input and
+ * exited 0, having written half an answer: the failure mode where the program is the last thing
+ * anybody suspects. `inputError` is the reason, and this is the one line each applet needs.
+ *
+ * Reports and answers false when the input broke, so a caller can `return 1` and be done.
+ */
+export bool inputEnded(Core core, Cli cli, Args a) {
+  string err = cli.inputError().wait();
+  if (err == "") { return true; }
+  core.warn(a.name + ": " + err);
+  return false;
+}
