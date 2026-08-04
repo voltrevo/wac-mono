@@ -47,15 +47,15 @@ export i32 cmpBytes(u8[] a, u8[] b) {
 }
 
 /**
- * Merge sort, because an insertion sort looks fine on a fixture and takes minutes on a
+ * Merge sort, ordered by whatever comparison you hand it.
+ *
+ * Merge rather than insertion because an insertion sort looks fine on a fixture and takes minutes on a
  * real file. Stable, which `sort -u` then relies on to drop only adjacent equals.
- */
-export u8[][] mergeSort(u8[][] xs, i32 n) {
-  return mergeSortWith(xs, n, cmpBytes);
-}
-
-/**
- * The same, ordered by whatever comparison you hand it.
+ *
+ * There was a `mergeSort(xs, n)` beside this that passed `cmpBytes` for you, and nothing ever called
+ * it: `sort` is the only caller and it always chooses a comparison, because `sort -n` needs a different
+ * one. A wrapper saving one argument, for one caller that does not want it, is a name that documents
+ * nothing — issue 0009.
  *
  * The comparison is a parameter because `sort -n` needs a different one and the merge itself is
  * identical — the alternative was a second copy of a recursive sort differing in one call, which

@@ -245,6 +245,45 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     await Deno.remove(guarded, { recursive: true });
     await Deno.remove(rmBin);
 
+    // The two failures `mkdir` and `rmdir` exist to distinguish, said the way GNU says them. The
+    // *reason* is compared, not the whole line: box prefixes `applet: path: ` where GNU writes
+    // `mkdir: cannot create directory 'd': `, and that difference is house style rather than a defect.
+    // What matters is that the reason is the category's own words and not the host's, which vary per
+    // platform — "os error 17" under Deno, "already exists" in a browser. Issue 0009.
+    const faults = await Deno.makeTempDir({ prefix: "wac-box-faults-" });
+    await Deno.mkdir(`${faults}/full/inner`, { recursive: true });
+    const mkdirTwice = box(["mkdir", `${faults}/full`]);
+    assertEquals(mkdirTwice.code, 1, "mkdir over an existing directory fails");
+    const rmdirFull = box(["rmdir", `${faults}/full`]);
+    assertEquals(rmdirFull.code, 1, "rmdir of a non-empty directory fails");
+    // GNU's wording for each, which is where these two strings come from.
+    const gnuMkdir = new Deno.Command("mkdir", { args: [`${faults}/full`], stderr: "piped", stdout: "null" })
+      .outputSync();
+    const gnuRmdir = new Deno.Command("rmdir", { args: [`${faults}/full`], stderr: "piped", stdout: "null" })
+      .outputSync();
+    const complaint = (r: { stderr: Uint8Array }) => new TextDecoder().decode(r.stderr);
+    assertEquals(complaint(gnuMkdir).includes("File exists"), true, complaint(gnuMkdir));
+    assertEquals(complaint(gnuRmdir).includes("Directory not empty"), true, complaint(gnuRmdir));
+    // ...and box says the same reason, in its own shape.
+    //
+    // Its own binary, granted write: `built` above may only read, so every mutation comes back
+    // "filesystem write not granted" and both assertions below would pass for the wrong reason —
+    // which is exactly how the `rm -f` case above was wrong before somebody looked.
+    const faultBin = await Deno.makeTempFile({ prefix: "wac-box-faultw-" });
+    await buildApp(BOX, faultBin, { read: true, write: true });
+    const boxErr = (args: string[]) => {
+      const r = new Deno.Command(faultBin, { args, stdout: "null", stderr: "piped" }).outputSync();
+      return new TextDecoder().decode(r.stderr);
+    };
+    assertEquals(boxErr(["mkdir", `${faults}/full`]).includes("File exists"), true, "mkdir's reason");
+    assertEquals(
+      boxErr(["rmdir", `${faults}/full`]).includes("Directory not empty"),
+      true,
+      "rmdir's reason",
+    );
+    await Deno.remove(faultBin);
+    await Deno.remove(faults, { recursive: true });
+
     // Symbolic links are refused, which tar.wac's header has always claimed. `stat` follows, so a
     // link to a directory was indistinguishable from the directory: it was walked into, stored under
     // the link's name, and a self-referential one grew the path until something trapped. `linkStat`

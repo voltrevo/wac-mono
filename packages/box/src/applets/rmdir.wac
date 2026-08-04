@@ -1,7 +1,7 @@
 // Empty directories removed. Never recursive — that is `rm -r`, and the difference
 // between them is the whole reason `rmdir` is a separate command.
 
-import { Change, Cli, Core } from "../../../platform/src/platform.wac";
+import { Change, Cli, Core, FAULT_NOT_EMPTY } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 
 export i32 rmdir(Core core, Cli cli, Args a) {
@@ -10,7 +10,12 @@ export i32 rmdir(Core core, Cli cli, Args a) {
   for (i32 i = 0; i < a.rest.len(); i++) {
     Change c = cli.remove(a.rest[i], false).wait();
     if (c.ok()) { continue; }
-    core.warn(a.name + ": " + a.rest[i] + ": " + c.message);
+    // The one failure `rmdir` exists to distinguish, said the way GNU says it. The host's own words
+    // differ per platform — "Directory not empty (os error 39)" under Deno, "The object can not be
+    // modified in this way." in a browser — and the *category* is the same on both, which is what the
+    // fault numbers are for. Everything else keeps the host's message, since only it knows. Issue 0009.
+    string why = c.fault == FAULT_NOT_EMPTY() ? "Directory not empty" : c.message;
+    core.warn(a.name + ": " + a.rest[i] + ": " + why);
     code = 1;
   }
   return code;

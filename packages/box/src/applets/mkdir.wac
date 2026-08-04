@@ -1,6 +1,6 @@
 // Directories made. `-p` makes the parents too, and forgives one that already exists.
 
-import { Change, Cli, Core } from "../../../platform/src/platform.wac";
+import { Change, Cli, Core, FAULT_EXISTS } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
 
 export i32 mkdir(Core core, Cli cli, Args a) {
@@ -10,7 +10,10 @@ export i32 mkdir(Core core, Cli cli, Args a) {
   for (i32 i = 0; i < a.rest.len(); i++) {
     Change c = cli.mkdir(a.rest[i], parents).wait();
     if (c.ok()) { continue; }
-    core.warn(a.name + ": " + a.rest[i] + ": " + c.message);
+    // "File exists" is what GNU says, and the category is the same on every host where the message is
+    // not: "already exists" in a browser, "File exists (os error 17)" under Deno. Issue 0009.
+    string why = c.fault == FAULT_EXISTS() ? "File exists" : c.message;
+    core.warn(a.name + ": " + a.rest[i] + ": " + why);
     code = 1;
   }
   return code;
