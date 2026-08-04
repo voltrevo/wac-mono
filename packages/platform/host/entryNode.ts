@@ -91,6 +91,7 @@ export async function runLauncherNode(
     exit(code: number): never;
     stdin: AsyncIterable<Uint8Array>;
     stdout: { write(b: Uint8Array, cb: (e?: unknown) => void): void };
+    stderr: { write(b: Uint8Array, cb: (e?: unknown) => void): void };
   },
   workerSource: string,
   grants: Grants = {},
@@ -146,6 +147,8 @@ export async function runLauncherNode(
     },
     writeStdout: (b: Uint8Array): Promise<void> =>
       new Promise((res, rej) => proc.stdout.write(b, (e) => (e ? rej(e) : res()))),
+    writeStderr: (b: Uint8Array): Promise<void> =>
+      new Promise((res, rej) => proc.stderr.write(b, (e) => (e ? rej(e) : res()))),
     stat: async (path: string) => {
       const st = await fs.stat(path);
       return {

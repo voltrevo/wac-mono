@@ -35,6 +35,8 @@ export type NodeIo = {
   connect(host: string, port: number): Promise<NodeSock>;
   listen(port: number): Promise<NodeListener>;
   writeStdout(bytes: Uint8Array): Promise<void>;
+  /** The error stream as bytes. Optional: a host without one falls back to `warn`'s line. */
+  writeStderr?(bytes: Uint8Array): Promise<void>;
   stat(path: string): Promise<{ isFile: boolean; isDirectory: boolean; size: number; mtimeMillis: number }>;
   /**
    * `stat` without following the last component. Optional: a host that cannot tell answers as `stat`
@@ -212,6 +214,23 @@ export function nodeWorld(
       try {
         if (sink === null) { await io.writeStdout(p); return EMPTY; }
         await sink.write(p);
+        return EMPTY;
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        outputFailure = /EPIPE|broken pipe/i.test(message) ? "" : message;
+        throw e;
+      }
+    },
+
+    /**
+     * Standard error as bytes. Not through `sink`, which is standard output's redirection: a `2>`
+     * that followed a `1>` would leave a program no way to separate them.
+     */
+    [OP.WRITE_STDERR]: async (p) => {
+      if (kids.active) { kids.warn(p); return EMPTY; }
+      try {
+        if (io.writeStderr === undefined) { warn(unstr(p)); return EMPTY; }
+        await io.writeStderr(p);
         return EMPTY;
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);

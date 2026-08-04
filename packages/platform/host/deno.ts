@@ -32,6 +32,8 @@ export type DenoWorldOptions = {
    * reason these exist.
    */
   write?(bytes: Uint8Array): void;
+  /** Where exact bytes on the *error* stream go. A spawned world sends both to its parent. */
+  writeErr?(bytes: Uint8Array): void;
   readStdin?(): Promise<Uint8Array>;
 };
 
@@ -92,6 +94,11 @@ async function writeAllStdout(bytes: Uint8Array): Promise<void> {
   while (at < bytes.length) at += await Deno.stdout.write(bytes.subarray(at));
 }
 
+async function writeAllStderr(bytes: Uint8Array): Promise<void> {
+  let at = 0;
+  while (at < bytes.length) at += await Deno.stderr.write(bytes.subarray(at));
+}
+
 /**
  * The handler table for Deno.
  *
@@ -112,6 +119,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   const warn = opts.warn ?? ((l: string) => console.error(l));
   const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
   const writeOut = opts.write;
+  const writeErrOut = opts.writeErr;
   const readIn = opts.readStdin;
 
   // The current streaming input. One at a time rather than a handle per file, because the
@@ -243,6 +251,26 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       } catch (e) {
         // Recorded and then rethrown: the throw is what makes `write` answer false, and the record
         // is what lets a caller tell a full disk from a reader that went away.
+        const message = e instanceof Error ? e.message : String(e);
+        outputFailure = /broken pipe|os error 32/i.test(message) ? "" : message;
+        throw e;
+      }
+    },
+
+    /**
+     * Standard error as bytes, beside `warn`'s line.
+     *
+     * Deliberately *not* through `sink`: `openOutput` redirects standard output, and a redirection
+     * that took the error stream with it would make the two impossible to separate — which is the
+     * whole reason a program has two of them.
+     */
+    [OP.WRITE_STDERR]: async (p) => {
+      if (kids.active) { kids.warn(p); return EMPTY; }
+      if (writeErrOut !== undefined) { writeErrOut(p.slice()); return EMPTY; }
+      try {
+        await writeAllStderr(p);
+        return EMPTY;
+      } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         outputFailure = /broken pipe|os error 32/i.test(message) ? "" : message;
         throw e;
@@ -469,6 +497,9 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
           log: (l: string) => out.push(enc.encode(l + "\n")),
           warn: (l: string) => out.push(enc.encode(l + "\n")),
           write: (b: Uint8Array) => out.push(b),
+          // The child has one stream back to its parent, which is what `recv(handle)` reads. Its
+          // error output joins it in the order it was written rather than being dropped.
+          writeErr: (b: Uint8Array) => out.push(b),
           readStdin: () => input.next(),
         }));
       }, newBridge));

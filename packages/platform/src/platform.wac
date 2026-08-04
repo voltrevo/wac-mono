@@ -519,9 +519,24 @@ export struct Cli {
    * — and `fn[bool(u8[])]` has no spare parameter, so an adapter has nowhere to keep one.
    */
   fn[bool(u8[])] write;
+  /**
+   * Exactly these bytes on standard error, with the same shape and the same absence of a grant.
+   *
+   * `warn` is the program talking about itself: a diagnostic *line*, which is what every applet in
+   * `packages/box` wants and what it should keep using. This is the program passing bytes through,
+   * and the two are different jobs rather than one with a redundant spelling.
+   *
+   * `packages/ssh` is why it exists. A remote command's two streams arrive interleaved and tagged,
+   * in the order the command wrote them, and with only `warn` the client could reproduce standard
+   * output exactly and standard error not at all: emitting per packet inserted a newline at every
+   * boundary, so it had to buffer to the end, which lost the ordering — and mangled anything that
+   * was not valid UTF-8, since `warn` takes a string. wac-mono issue 0014.
+   *
+   * No grant, for the reason `write` has none: what a program prints is the user's own doing.
+   */
+  fn[bool(u8[])] writeErr;
 
   fn[Pending<FileResult>(string)] readFile;
-  /** True when the write succeeded. */
   /**
    * **Answers a `Change`**: a fault category and the host's message. A `bool` could say that a write
    * failed and never why, and a bare message could say why to a person but not to a program.
@@ -556,7 +571,7 @@ export struct Cli {
   fn[Pending<string[]?>(string)] readDir;
 
   /**
-   * Making, unmaking and moving. All three answer with whether they worked.
+   * Making, unmaking and moving. All three answer a `Change`, as `writeFile` does.
    *
    * `writeFile` alone cannot express a safe update: it truncates and then fills, so a
    * reader arriving in between sees a half-written file, and a crash leaves one. With
@@ -623,8 +638,13 @@ export struct Cli {
    */
   fn[Read()] readChunk;
   /**
-   * Why the last `write` answered false: the empty string when the other end simply went away, and
-   * the host's message when the write itself failed.
+   * Why the last `write` or `writeErr` answered false: the empty string when the other end simply
+   * went away, and the host's message when the write itself failed.
+   *
+   * One question for both streams rather than two, because no caller has ever needed to know *which*
+   * stream failed — a program asks this to decide between exiting 0 and reporting a real failure, and
+   * that decision is the same either way. If one ever does need to tell them apart, that is the point
+   * to split it, and the split will be visible rather than guessed at.
    *
    * A closed pipe is an answer rather than an error — `yes | head -1` ends that way and should exit
    * 0 — so the two have to be distinguishable. Without this a full disk and a departed reader were
@@ -781,6 +801,7 @@ export struct Cli {
     fn[Pending<string?>(string)] env,
     fn[Pending<u8[]>()] readStdin,
     fn[bool(u8[])] write,
+    fn[bool(u8[])] writeErr,
     fn[Pending<FileResult>(string)] readFile,
     fn[Pending<Change>(string, u8[])] writeFile,
     fn[Pending<Stat>(string)] stat,
@@ -807,7 +828,7 @@ export struct Cli {
     fn[Pending<Captured>()] popChild
   ) {
     return Cli(
-      argCount, arg, env, readStdin, write, readFile, writeFile, stat, linkStat, readDir,
+      argCount, arg, env, readStdin, write, writeErr, readFile, writeFile, stat, linkStat, readDir,
       mkdir, remove, rename, openInput, readChunk, outputError, openOutput,
       connect, listen, accept, recv, send, closeSocket, spawn, closeFeed, exitCode, cwd,
       pushChild, popChild

@@ -353,10 +353,22 @@ export function cliOf(
       }
     },
 
+    /*= writeErr */
+    // Standard error as bytes, the same shape as `write` and failing the same way. `warn` is still
+    // the right thing for a diagnostic line; this is for a program relaying someone else's output.
+    (bytes: Uint8Array) => {
+      try {
+        collect(b, submit(b, OP.WRITE_STDERR, bytes));
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
     /*= readFile */
     (path: string) => T.file(submit(b, OP.READ_FILE, str(path))),
     /*= writeFile */
-    // `outcome`, not `ok`: the answer is the host's message, empty when it worked.
+    // `change`, not `ok`: the answer is a fault category and the host's message.
     (path: string, body: Uint8Array) =>
       T.change(submit(b, OP.WRITE_FILE, prefixed(str(path), body))),
     /*= stat */

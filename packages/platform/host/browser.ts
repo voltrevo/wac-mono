@@ -94,6 +94,13 @@ export type BrowserWorldOptions = {
   /** Where `write` goes — exact bytes, no newline. Defaults to the console, as text. */
   write?(bytes: Uint8Array): void;
   /**
+   * Where `writeErr` goes — exact bytes on the error stream, no newline.
+   *
+   * Defaults to `warn`'s destination decoded as text, because a page that has somewhere to put
+   * diagnostics has somewhere to put these; a page that wants them apart passes this.
+   */
+  writeErr?(bytes: Uint8Array): void;
+  /**
    * The Origin Private File System root, if the page is willing to grant one.
    *
    * Absent means no filesystem at all, exactly as omitting `fs` does under Deno. Passing
@@ -147,6 +154,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   const log = opts.log ?? ((l: string) => console.log(l));
   const warn = opts.warn ?? ((l: string) => console.warn(l));
   const write = opts.write ?? ((b: Uint8Array) => console.log(new TextDecoder().decode(b)));
+  const writeErr = opts.writeErr ??
+    ((b: Uint8Array) => warn(new TextDecoder().decode(b)));
   const deny = (what: string): never => {
     throw new Error(`${what} not granted to this application`);
   };
@@ -373,6 +382,17 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
         outputFailure = e instanceof Error ? e.message : String(e);
         throw e;
       }
+    },
+
+    /**
+     * Standard error as bytes. A page has one place for text, so this reaches the same sink `warn`
+     * does — but without a newline, and without going through a string, so bytes that are not valid
+     * UTF-8 survive as far as the page's own decoder rather than being mangled here.
+     */
+    [OP.WRITE_STDERR]: (p) => {
+      if (kids.active) { kids.warn(p); return EMPTY; }
+      writeErr(p);
+      return EMPTY;
     },
 
     [OP.READ_FILE]: async (p) => new Uint8Array(await (await fileOf(unstr(p))).arrayBuffer()),

@@ -44,15 +44,10 @@ export i32 shellMain(Core core, Cli cli, Shell sh, i32 first) {
 
   i32 status = runScript(sh, src);
 
-  // Standard error goes out in one piece at the end, because the capability world has no
-  // byte-level error channel — issue 0014. `warn` adds its own newline, so a trailing one would
-  // print a blank line.
-  if (sh.errOut.len > 0) {
-    i32 len = sh.errOut.len;
-    while (len > 0 && sh.errOut.get(len - 1) == 10) { len--; }
-    u8[] trimmed = u8[len]();
-    trimmed.copyFrom(sh.errOut.data, 0, 0, len);
-    core.warn(string.fromBytes(trimmed));
-  }
+  // A non-capturing shell has already written its diagnostics, in the order it produced them —
+  // `Shell.err` does that now, where the whole buffer used to be flushed here through `Core.warn`
+  // with its trailing newline shaved off by hand. What remains is a *capturing* shell's buffer,
+  // which only reaches a terminal if this is where it ends up. Issue 0014.
+  if (sh.errOut.len > 0) { cli.writeErr(sh.errOut.bytes()); }
   return status;
 }

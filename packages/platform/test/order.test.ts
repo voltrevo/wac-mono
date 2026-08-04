@@ -117,11 +117,11 @@ function providerOrder(src: string, struct: string): string[] {
 /**
  * Capabilities whose name is not their opcode in camelCase.
  *
- * Only one, and it earns the exception: `write` goes to standard output, and the opcode says
- * so. `waitAny` submits no opcode at all — the wait is in this worker's own memory — so it is
- * checked by position and marker alone.
+ * Two, and both earn it: the opcodes say which stream they write, and the capabilities are named
+ * after what a program calls them — `write` and `writeErr`. `waitAny` submits no opcode at all —
+ * the wait is in this worker's own memory — so it is checked by position and marker alone.
  */
-const OP_NAME: Record<string, string> = { WRITE_STDOUT: "write" };
+const OP_NAME: Record<string, string> = { WRITE_STDOUT: "write", WRITE_STDERR: "writeErr" };
 
 Deno.test("Cli's fields and the provider's arguments are in the same order", async () => {
   const wac = await Deno.readTextFile("packages/platform/src/platform.wac");

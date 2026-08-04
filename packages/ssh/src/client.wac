@@ -8,7 +8,6 @@
 // The one thing the capability world cannot do is wait on two sockets at once, which SSH does not
 // need for a single channel running one command. It would need it for port forwarding.
 
-import { Buf } from "../../bytes/src/buf.wac";
 import { Cli, Core } from "../../platform/src/platform.wac";
 import { Conn, msgNewKeys } from "./conn.wac";
 import { Found, Version, clientVersion, clientVersionLine, scanVersion, speaksV2 } from "./version.wac";
@@ -204,7 +203,6 @@ export struct Client {
     }
 
     Window window = Window.create(windowSize());
-    Buf stderr = Buf.create();
     i32 status = -1;
     bool closed = false;
 
@@ -218,7 +216,12 @@ export struct Client {
         this.conn.cli.write(m.data);
         this.giveCredit(window, serverChannel, m.data.len());
       } else if (m.kind == msgChannelExtendedData()) {
-        if (m.extra == extendedDataStderr()) { stderr.pushAll(m.data); }
+        // Straight through, in the order the server sent it, so the two streams interleave here as
+        // they did on the remote host. This used to be buffered to the end of the run and emitted as
+        // one `warn`: `warn` writes a line of *text*, so a per-packet call inserted a newline at
+        // every packet boundary and the whole-run form lost the ordering and mangled anything that
+        // was not valid UTF-8. `writeErr` takes bytes. wac-mono issue 0014.
+        if (m.extra == extendedDataStderr()) { this.conn.cli.writeErr(m.data); }
         this.giveCredit(window, serverChannel, m.data.len());
       } else if (m.kind == msgChannelRequest()) {
         // `exit-status` is a request, not a reply, and nothing prompts it.
@@ -226,20 +229,6 @@ export struct Client {
       } else if (m.kind == msgChannelClose()) {
         closed = true;
       }
-    }
-
-    // Standard error goes out in one piece at the end. The capability world has `write` for
-    // standard output as bytes but only `warn` for the error channel, which is line-oriented — so
-    // interleaving the two exactly as the server sent them is not expressible here.
-    if (stderr.len > 0) {
-      // `warn` adds its own newline, so a trailing one would print a blank line. Trimmed on the
-      // bytes rather than the string: a UTF-8 sequence has no newline byte inside it, so this is
-      // safe where indexing a decoded string would not be.
-      i32 n = stderr.len;
-      while (n > 0 && stderr.get(n - 1) == 10) { n--; }
-      u8[] trimmed = u8[n]();
-      trimmed.copyFrom(stderr.data, 0, 0, n);
-      this.conn.core.warn(string.fromBytes(trimmed));
     }
 
     this.conn.sendPacket(channelClose(serverChannel));

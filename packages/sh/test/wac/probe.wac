@@ -62,6 +62,7 @@ Pending<i32> fakeArgCount() { return Pending.of(0, resolveZeroI32, alwaysSettled
 Pending<string> fakeArg(i32 i) { return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop); }
 Pending<u8[]> fakeStdin() { return Pending.of(0, resolveStdin, alwaysSettled, ignoreDrop); }
 bool fakeWrite(u8[] data) { return true; }
+bool fakeWriteErr(u8[] data) { return true; }
 
 /** One name is set and one is not, so both sides of the environment fallback are reachable. */
 string? resolveEnv(i32 id) {
@@ -271,7 +272,7 @@ Pending<Captured> fakePopChild() {
 }
 
 Cli fakeCli() {
-  return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeReadFile, fakeWriteFile,
+  return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeWriteErr, fakeReadFile, fakeWriteFile,
                 fakeStat, fakeLinkStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
                 fakeReadChunk, fakeOutputError, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
                 fakeSend, fakeCloseSocket, fakeSpawn, fakeCloseFeed, fakeExitCode,

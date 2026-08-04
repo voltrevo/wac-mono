@@ -50,6 +50,7 @@ export const OP = {
   POP_CHILD: 43,
   OUTPUT_ERROR: 45,
   LINK_STAT: 47,
+  WRITE_STDERR: 48,
 } as const;
 
 /**

@@ -37,7 +37,12 @@ export struct Shell {
   i32 status;
   bool exiting;
   i32 exitCode;
-  /** Everything written to standard error, emitted in one piece at the end. See the README. */
+  /**
+   * Standard error, for a shell that is *capturing*. Empty otherwise — see `err` below.
+   *
+   * `packages/ssh`'s server and command substitution both need the bytes rather than the terminal,
+   * which is what this is for. A shell attached to a terminal writes them out as it produces them.
+   */
   Buf errOut;
   /**
    * Collect standard output instead of writing it out.
@@ -139,6 +144,22 @@ export struct Shell {
    * `cd` at all. An already-absolute path is returned normalised and otherwise untouched.
    */
   string resolve(const this, string path) { return resolvePath(this.cwd, path); }
+
+  /**
+   * A diagnostic, in bytes.
+   *
+   * Written straight out unless this shell is capturing, in which case it joins `errOut` for
+   * whoever asked for the capture. Everything the shell says about itself goes through here, so
+   * that "when is standard error emitted" is answered in one place.
+   *
+   * It used to be *only* the buffer, flushed once at the end through `Core.warn` with the trailing
+   * newline shaved off by hand — because the world had no byte-level error stream. So `echo a; nope`
+   * printed the complaint after the output no matter which came first, and a diagnostic containing a
+   * filename that is not valid UTF-8 came out mangled. `writeErr` is what fixed it. Issue 0014.
+   */
+  void err(this, u8[] bytes) {
+    if (this.capture) { this.errOut.pushAll(bytes); } else { this.cli.writeErr(bytes); }
+  }
 
   /** What standard input still has to offer. */
   u8[] restOfStdin(const this) {
@@ -242,7 +263,7 @@ export struct Shell {
 export i32 runScript(Shell sh, string src) {
   Script script = parse(src);
   if (!script.ok) {
-    sh.errOut.pushAll(("sh: " + script.error + "\n").toBytes());
+    sh.err(("sh: " + script.error + "\n").toBytes());
     return 2;
   }
   runList(sh, script.lists);
@@ -260,7 +281,7 @@ void runList(Shell sh, Vec<AndOr> lists) {
 void runAndOr(Shell sh, AndOr list) {
   if (list.background) {
     // Refused rather than run in the foreground, which would look like it worked.
-    sh.errOut.pushAll("sh: background commands are not supported\n".toBytes());
+    sh.err("sh: background commands are not supported\n".toBytes());
     sh.status = 2;
     return;
   }
@@ -328,7 +349,7 @@ u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
         string path = sh.resolve(joinWord(sh, r.target));
         FileResult f = sh.cli.readFile(path).wait();
         if (!f.ok) {
-          sh.errOut.pushAll(("sh: " + path + ": " + f.error + "\n").toBytes());
+          sh.err(("sh: " + path + ": " + f.error + "\n").toBytes());
           sh.status = 1;
           sh.stdinBytes = savedIn;
           sh.stdinPos = savedPos;
@@ -388,7 +409,7 @@ u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
       Shell inner = sh.fork();
       runList(inner, cmd.clauses.get(0).body);
       sh.outBuf.pushAll(inner.outBuf.take());
-      sh.errOut.pushAll(inner.errOut.bytes());
+      sh.err(inner.errOut.bytes());
       sh.status = inner.exiting ? inner.exitCode : inner.status;
     }
     case Case: {
@@ -459,7 +480,7 @@ void runLoop(Shell sh, Clause c, bool untilForm) {
     if (!go) { sh.status = 0; return; }
     runList(sh, c.body);
   }
-  sh.errOut.pushAll("sh: loop ran 100000 times and was stopped\n".toBytes());
+  sh.err("sh: loop ran 100000 times and was stopped\n".toBytes());
   sh.status = 2;
 }
 
@@ -519,7 +540,7 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
         string path = sh.resolve(joinWord(sh, r.target));
         FileResult f = sh.cli.readFile(path).wait();
         if (!f.ok) {
-          sh.errOut.pushAll(("sh: " + path + ": " + f.error + "\n").toBytes());
+          sh.err(("sh: " + path + ": " + f.error + "\n").toBytes());
           sh.status = 1;
           return u8[0]();
         }
@@ -562,12 +583,12 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
   if (sh.exiting) { return u8[0](); }
 
   if (!result.found) {
-    sh.errOut.pushAll((argv.get(0) + ": command not found\n").toBytes());
+    sh.err((argv.get(0) + ": command not found\n").toBytes());
     sh.status = 127;
     return u8[0]();
   }
   sh.status = result.status;
-  if (result.err.len() > 0) { sh.errOut.pushAll(result.err); }
+  if (result.err.len() > 0) { sh.err(result.err); }
 
   // Output redirection wins over the pipeline and over standard output.
   u8[] out = result.out;
@@ -598,7 +619,7 @@ bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
     // Said, not silently skipped — but the command's own status is left alone. Overwriting it
     // made `cmd 2>/dev/null; echo $?` report the refusal instead of what the command did, which
     // is a second wrong answer on top of the first.
-    sh.errOut.pushAll(("sh: redirecting fd " + itoa(r.fd) + " is not supported\n").toBytes());
+    sh.err(("sh: redirecting fd " + itoa(r.fd) + " is not supported\n").toBytes());
     return true;
   }
   u8[] payload = data;
@@ -613,7 +634,7 @@ bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
   }
   Change wrote = sh.cli.writeFile(path, payload).wait();
   if (!wrote.ok()) {
-    sh.errOut.pushAll(("sh: " + path + ": " + wrote.message + "\n").toBytes());
+    sh.err(("sh: " + path + ": " + wrote.message + "\n").toBytes());
     sh.status = 1;
   }
   return true;
@@ -1548,7 +1569,7 @@ string substring(Shell sh, string name, string value, string spec) {
     if (count < 0) {
       end = n + count;
       if (end < off) {
-        sh.errOut.pushAll(("sh: " + itoa(count) + ": substring expression < 0\n").toBytes());
+        sh.err(("sh: " + itoa(count) + ": substring expression < 0\n").toBytes());
         sh.exiting = true;
         sh.exitCode = 1;
         return "";
@@ -1572,7 +1593,7 @@ string substring(Shell sh, string name, string value, string spec) {
  * package is trying to avoid — something that looks like it worked.
  */
 string badSubstitution(Shell sh, string what) {
-  sh.errOut.pushAll(("sh: " + what + ": bad substitution\n").toBytes());
+  sh.err(("sh: " + what + ": bad substitution\n").toBytes());
   sh.exiting = true;
   sh.exitCode = 1;
   return "";
@@ -1777,7 +1798,7 @@ string expandArith(Shell sh, string text) {
   // becomes a value or `0`, and one still standing means it resolves to itself.
   if (settled && hasBareName(expanded)) { settled = false; }
   if (!settled) {
-    sh.errOut.pushAll(("sh: " + text + ": expression recursion level exceeded\n").toBytes());
+    sh.err(("sh: " + text + ": expression recursion level exceeded\n").toBytes());
     sh.exiting = true;
     sh.exitCode = 1;
     return "";
@@ -1787,7 +1808,7 @@ string expandArith(Shell sh, string text) {
     // Fatal to the script, which is what bash does: `echo $((1/0)); echo after` prints neither
     // and exits 1. An expansion that cannot produce a value leaves the command with no sensible
     // argument, so carrying on would mean running it with something invented.
-    sh.errOut.pushAll(("sh: " + text + ": " + state.error + "\n").toBytes());
+    sh.err(("sh: " + text + ": " + state.error + "\n").toBytes());
     sh.exiting = true;
     sh.exitCode = 1;
     return "";
@@ -1914,7 +1935,7 @@ string expandPart(Shell sh, Part p) {
       if (last == "?") {
         if (!absent) { return value; }
         string why = p.arg == "" ? "parameter null or not set" : expandText(sh, p.arg);
-        sh.errOut.pushAll(("sh: " + p.text + ": " + why + "\n").toBytes());
+        sh.err(("sh: " + p.text + ": " + why + "\n").toBytes());
         sh.exiting = true;
         // 127, which is what bash exits with here — not 1, and not the 2 a syntax error gets.
         // Measured rather than reasoned about: 127 usually means "command not found".
@@ -1937,7 +1958,7 @@ string expandPart(Shell sh, Part p) {
       // itself stops there — it ends the substitution, not the shell that asked for it.
       sh.status = runScript(inner, p.text);
       sh.ranSub = true;
-      sh.errOut.pushAll(inner.errOut.bytes());
+      sh.err(inner.errOut.bytes());
       u8[] out = inner.outBuf.take();
       i32 n = out.len();
       while (n > 0 && out[n - 1] == 10) { n--; }

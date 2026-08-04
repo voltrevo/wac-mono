@@ -707,9 +707,9 @@ for (const script of [
  * a shell with `cd` and no `mkdir` looks broken when it is merely alone. Each case works in a
  * directory of its own, since these ones write.
  *
- * Only stdout and the exit status are compared, which matters here: bash's `mkdir` is `/bin/mkdir`
- * and reports its refusals on stderr, and this shell collects stderr and emits it at the end — so
- * the messages appear in a different order and neither is wrong.
+ * Only stdout and the exit status are compared: bash's `mkdir` is `/bin/mkdir` and its wording is
+ * its own, so comparing the text of a refusal would be comparing two dialects. The *order* of the
+ * two streams is compared, in its own test at the end of this file.
  */
 for (const [i, script] of [
   `mkdir one; ls`,
@@ -728,6 +728,16 @@ for (const [i, script] of [
   const dir = `${globDir}/w${i}`;
   Deno.mkdirSync(dir);
   CASES.push(`cd ${dir}; ${script}`);
+}
+
+/** Local, because this repo has no third-party dependencies. */
+function assertEquals<T>(got: T, want: T, msg?: string): void {
+  if (got !== want) {
+    throw new Error(
+      `assertEquals failed${msg === undefined ? "" : ` \u2014 ${msg}`}\n` +
+        `  got:  ${JSON.stringify(got)}\n  want: ${JSON.stringify(want)}`,
+    );
+  }
 }
 
 async function bash(script: string) {
@@ -807,5 +817,56 @@ Deno.test({
       throw new Error(`${differences.length} of ${CASES.length} scripts differ from bash:\n\n` +
                       differences.join("\n\n"));
     }
+  },
+});
+
+/**
+ * Standard error arrives when it happened, not at the end of the run.
+ *
+ * Its own test rather than a case above, because the two shells word their diagnostics differently —
+ * bash says `bash: line 1: nope: command not found` — so what is comparable is *where* the line
+ * lands, not what it says. That is the whole of what issue 0014 was about: the shell used to collect
+ * standard error in a buffer and flush it through `Core.warn` at the end, because the capability
+ * world had no byte-level error stream, so `echo one; nope; echo two 2>&1` put the complaint after
+ * both lines of output no matter when it happened.
+ */
+Deno.test({
+  name: "standard error interleaves with standard output, as bash does",
+  ignore: !haveBash,
+  fn: async () => {
+    const script = "echo one; nope; echo two";
+    // Both streams into one file, which is the only way to observe their order. The redirection is
+    // done by bash rather than by `Deno.Command`, which will not take a file handle for either.
+    const both = async (cmd: string) => {
+      const out = await Deno.makeTempFile({ prefix: "sh-order-" });
+      const r = await new Deno.Command("bash", {
+        args: ["-c", '"$0" -c "$1" >"$2" 2>&1', cmd, script, out],
+        env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+        clearEnv: true,
+      }).output();
+      const text = await Deno.readTextFile(out);
+      await Deno.remove(out);
+      return { lines: text.trimEnd().split("\n"), code: r.code };
+    };
+
+    const theirs = await both("bash");
+    const ours = await both(wacshBinary);
+    const at = (lines: string[]) => lines.findIndex((l) => l.includes("not found"));
+    assertEquals(ours.lines.length, 3, ours.lines.join(" | "));
+    assertEquals(at(ours.lines), at(theirs.lines), `ours: ${ours.lines.join(" | ")}`);
+    assertEquals(at(ours.lines), 1, "the complaint is between the two outputs");
+    assertEquals(ours.lines[0], "one");
+    assertEquals(ours.lines[2], "two");
+
+    // And a diagnostic naming a file whose bytes are not valid UTF-8 survives, which the old flush
+    // through a string could not do: `string.fromBytes` of an invalid sequence is not the bytes back.
+    const odd = await new Deno.Command(wacshBinary, {
+      args: ["-c", "cat $(printf '\\xff\\xfe')"],
+      env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+      clearEnv: true,
+    }).output();
+    const raw = odd.stderr;
+    assertEquals(raw.includes(0xff) && raw.includes(0xfe), true,
+      `the bytes reached standard error unchanged: ${Array.from(raw).join(",")}`);
   },
 });

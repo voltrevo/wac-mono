@@ -106,12 +106,12 @@ split is why it is a second struct rather than more fields.
 | `Core` | `nowMillis`, `monotonicNanos`, `sleepMillis`, `randomBytes`, `log`, `warn` | — |
 | | `waitAny` | — |
 | `Cli` | `argCount`, `arg`, `env` | — |
-| | `readStdin`, `write` | — |
-| | `openInput`, `readChunk`, `inputError`, `outputError` | `--allow-read` for a file |
+| | `readStdin`, `write`, `writeErr` | — |
+| | `openInput`, `readChunk`, `outputError` | `--allow-read` for a file |
 | | `readFile`, `stat`, `linkStat`, `readDir` | `--allow-read` |
 | | `writeFile`, `mkdir`, `remove`, `rename` | `--allow-write` |
 | | `openOutput` (to a file) | `--allow-write` |
-| | `connect`, `listen`, `accept`, `recv`, `socketError`, `send`, `closeSocket` | `--allow-net` |
+| | `connect`, `listen`, `accept`, `recv`, `send`, `closeSocket` | `--allow-net` |
 | | `spawn`, `closeFeed`, `exitCode` | — (the child gets what you pass, never more) |
 | | `cwd` | — (a read; there is no `chdir`) |
 | | `pushChild`, `popChild` | — (a child *inside* this program, with this program's authority) |
@@ -170,11 +170,20 @@ an argument to it: what a child may do is a subset of what its parent already ha
 `Page` is a third profile and only a browser provides it. A page capability that pretended to
 work in a terminal would be a lie, which is the whole reason these are separate structs.
 
-**`readStdin` and `write` need no grant**, for the same reason `arg` does not: what the
+**`readStdin`, `write` and `writeErr` need no grant**, for the same reason `arg` does not: what the
 user pipes in and what the program prints are the user's own doing, not a reach into
 something they did not offer. `write` puts *exactly* those bytes on standard output —
 `log` is for lines of text, and without a byte-level output nothing could emit binary,
 which ruled out every compressor and encoder as a filter.
+
+`writeErr` is that for standard error, and `warn` is the line. The two are different jobs: `warn` is
+the program talking about itself, which is what every applet in `packages/box` does and should keep
+doing; `writeErr` is the program passing someone else's bytes through. `packages/ssh` is why it
+exists — a remote command's two streams arrive interleaved and tagged, and with only `warn` the
+client could reproduce standard output exactly and standard error not at all, since a per-packet
+`warn` inserts a newline at every packet boundary and buffering to the end loses the order. Both
+`packages/sh` and `packages/ssh` used to flush the whole error stream at the end with its trailing
+newline shaved off by hand; both now write it when it happens. Issue 0014.
 
 **`openInput` and `readChunk` are the incremental half.** Everything else answers with the
 whole of something, which is fine for a filename and wrong for a pipe: `cat` of a large

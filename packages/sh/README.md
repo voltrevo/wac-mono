@@ -244,8 +244,13 @@ expanding to something plausible is the failure mode this package exists to avoi
 **`2>` is refused rather than approximated.** Only standard output is captured, so there is
 nothing of the error stream to redirect, and saying so beats writing the wrong bytes to the file.
 
-**Standard error arrives in one piece at the end**, as with `packages/ssh` and for the same
-reason — [issue 0014](../../issues/open/0014-platform-has-no-way-to-write-bytes-to-standard-error.md).
+**Standard error arrives when it happened**, interleaved with standard output as bash's is, which
+is what `2>&1` has to show. It used to be collected and flushed at the end through `Core.warn` —
+the world had no byte-level error stream — so `echo one; nope; echo two` printed the complaint
+last however early it happened. `Shell.err` is the one place that decides: a capturing shell keeps
+the bytes for whoever asked for the capture, and a shell attached to a terminal writes them out.
+[Issue 0014](../../issues/closed/0014-platform-has-no-way-to-write-bytes-to-standard-error.md) is
+the capability that made it possible.
 
 ## Coverage
 
