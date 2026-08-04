@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Turn Ethereum's SSZ test vectors into compact JSON this repo can commit.
 
-    python3 packages/ssz/tools/vendor.py static   # light-client containers, fetched case by case
-    python3 packages/ssz/tools/vendor.py generic  # ssz_generic, from a downloaded general.tar.gz
+    python3 packages/ssz/tools/vendor.py ssz_static_altair_mainnet --stdout
+    python3 packages/ssz/tools/vendor.py ssz_generic_valid --stdout
 
-Writes `packages/ssz/test/vendor/*.json`. **Run this by hand, not from a test.** The committed JSON
-is the fixture; the tests never touch the network, so a download that fails cannot make them pass.
+Writes the fixture set to stdout. `harness/fixtures.ts` runs this on a cold cache, checks the output
+against the SHA-256 committed in `test/fixtures.json`, and caches it under `.cache/fixtures`.
+
+**The data is not committed; the manifest is.** git holds this generator and a pinned commit SHA plus
+the expected hash of each set — see `harness/fixtures.ts` for why, and for the rule that a fixture
+which cannot be produced is an error and never a skip.
 
 ## Why the vectors are reshaped rather than committed as they come
 
@@ -33,9 +37,9 @@ decoder would have rejected the first byte.
 ## Sizes, because this repo shares a disk
 
 The release tarballs are 211 MB (`general`), 468 MB (`minimal`) and 679 MB (`mainnet`), and the git
-repo is 2.47 GB. Do not clone it. `ssz_static` is fetched case by case over
-`raw.githubusercontent.com` — the light-client containers are about forty cases — while `ssz_generic`
-has over a thousand and is taken from `general.tar.gz` in one request instead of thousands.
+repo is 2.47 GB. Do not clone it. `ssz_static` is fetched case by case over `raw.githubusercontent.com` — 90 files, no API calls, see
+the note by `SUITE` — while `ssz_generic` has over a thousand cases and comes from `general.tar.gz`
+in one request instead of thousands.
 
 The repo is archived as of 2025-10-21; `v1.6.0-beta.0` is the last release, so this is a fixed target.
 """
@@ -46,9 +50,11 @@ import sys
 import tarfile
 
 REPO = "ethereum/consensus-spec-tests"
-REF = "master"
+# A commit SHA, not a tag: `v1.6.0-beta.0` resolves to this, and a tag can be moved where a commit
+# cannot. The repo is archived as of 2025-10-21, so this is also simply the last state it will have.
+COMMIT = "bc5c1a7fb2a8871aaffd4b16ee4dd9c72bb81908"
+REF = COMMIT
 RAW = f"https://raw.githubusercontent.com/{REPO}/{REF}"
-API = f"https://api.github.com/repos/{REPO}/contents"
 
 # The containers an Altair light client merkleizes or verifies a branch into. Read off
 # `consensus-specs/specs/altair/light-client/sync-protocol.md` rather than chosen by eye.
@@ -140,42 +146,50 @@ def root_of(yaml_bytes: bytes) -> str:
     return val
 
 
-def do_static() -> None:
+# The case layout at the pinned commit: one suite, five cases per container. Enumerated rather than
+# listed, and that is the point of pinning — at a fixed commit the tree cannot change, so asking
+# GitHub what is in a directory buys nothing and costs a lot.
+#
+# **The API is 60 requests an hour unauthenticated.** Listing nine containers plus their suites is
+# ~10 of those per rebuild, so a few cold rebuilds in an hour exhaust the quota and every one after
+# that fails with a 403 that looks nothing like a rate limit. Found by doing exactly that. Raw file
+# fetches go to `raw.githubusercontent.com`, which is a different service and not subject to it —
+# verified while the API quota was at zero.
+SUITE = "ssz_random"
+CASES = ["case_0", "case_1", "case_2", "case_3", "case_4"]
+
+
+def do_static() -> dict:
     cases = []
     for container in LIGHT_CLIENT:
-        base = f"tests/{CONFIG}/{FORK}/ssz_static/{container}"
-        suites = json.loads(fetch(f"{API}/{base}?ref={REF}"))
-        for suite in sorted(x["name"] for x in suites):
-            listing = json.loads(fetch(f"{API}/{base}/{suite}?ref={REF}"))
-            for case in sorted(x["name"] for x in listing):
-                d = f"{base}/{suite}/{case}"
-                ssz = snappy_block(fetch(f"{RAW}/{d}/serialized.ssz_snappy"))
-                root = root_of(fetch(f"{RAW}/{d}/roots.yaml"))
-                cases.append({
-                    "container": container,
-                    "case": f"{suite}/{case}",
-                    "ssz": ssz.hex(),
-                    "root": root[2:],
-                })
-                print(f"  {container}/{suite}/{case}: {len(ssz)} bytes", file=sys.stderr)
-    write("ssz_static_altair_mainnet.json", {
-        "source": f"{REPO} v1.6.0-beta.0, {CONFIG}/{FORK}/ssz_static",
+        base = f"tests/{CONFIG}/{FORK}/ssz_static/{container}/{SUITE}"
+        for case in CASES:
+            d = f"{base}/{case}"
+            # A 404 here means the pinned tree is not shaped as expected, which is a real error
+            # rather than a case to skip — `fetch` raises.
+            ssz = snappy_block(fetch(f"{RAW}/{d}/serialized.ssz_snappy"))
+            root = root_of(fetch(f"{RAW}/{d}/roots.yaml"))
+            cases.append({
+                "container": container,
+                "case": f"{SUITE}/{case}",
+                "ssz": ssz.hex(),
+                "root": root[2:],
+            })
+            print(f"  {container}/{SUITE}/{case}: {len(ssz)} bytes", file=sys.stderr)
+    return {
+        "source": f"{REPO} @ {COMMIT[:12]}, {CONFIG}/{FORK}/ssz_static",
         "cases": cases,
-    })
+    }
 
 
-# Cases above this many serialized bytes are dropped. The whole `ssz_generic` valid set is 47 MB of
-# JSON, essentially all of it `containers`: 463 cases totalling 24 MB, the largest a single 1.76 MB
-# `ComplexTestStruct`. Those long-list cases repeat structure the small ones already cover — offsets,
-# nesting, variable-size members — so the cap costs coverage of *length* rather than of shape.
-#
-# 8 KB keeps 1148 of 1217 cases in about 930 KB, against `packages/bls/test/vendor`'s 68 KB. The
-# script reports what it dropped rather than trimming quietly, and raising the cap and re-running is
-# the way to test long-list merkleization if that turns out to matter.
-SIZE_CAP = 8192
+# No size cap any more. It existed because the output went into git, where the full 47 MB set was out
+# of the question; the cache has no such limit, so the 69 cases previously dropped — including a
+# 1.76 MB `ComplexTestStruct` that is the only real exercise of long-list merkleization — are back.
+# Kept as a knob rather than deleted, because a future set may need one.
+SIZE_CAP = 1 << 30
 
 
-def do_generic(tarball: str) -> None:
+def do_generic(tarball: str) -> dict:
     """`ssz_generic` from a downloaded `general.tar.gz`: one request rather than thousands."""
     want = ("uints", "bitlist", "bitvector", "boolean", "basic_vector", "containers")
     found: dict[tuple[str, str, str], dict] = {}
@@ -200,18 +214,15 @@ def do_generic(tarball: str) -> None:
                 e["ssz"] = snappy_block(data).hex()
     complete = [v for v in found.values() if "root" in v and "ssz" in v]
     cases = [c for c in complete if len(c["ssz"]) // 2 <= SIZE_CAP]
-    dropped = [c for c in complete if len(c["ssz"]) // 2 > SIZE_CAP]
+    dropped = len(complete) - len(cases)
     cases.sort(key=lambda c: (c["type"], c["case"]))
-    biggest = max((len(c["ssz"]) // 2 for c in dropped), default=0)
     print(f"  {len(complete)} valid cases across {len(want)} types; kept {len(cases)}, "
-          f"dropped {len(dropped)} over {SIZE_CAP} bytes (largest {biggest})", file=sys.stderr)
-    write("ssz_generic_valid.json", {
-        "source": f"{REPO} v1.6.0-beta.0, general/phase0/ssz_generic (valid only)",
-        "sizeCap": SIZE_CAP,
-        "dropped": len(dropped),
-        "droppedLargestBytes": biggest,
+          f"dropped {dropped}", file=sys.stderr)
+    return {
+        "source": f"{REPO} @ {COMMIT[:12]}, general/phase0/ssz_generic (valid only)",
+        "dropped": dropped,
         "cases": cases,
-    })
+    }
 
 
 def write(name: str, payload: dict) -> None:
@@ -222,13 +233,57 @@ def write(name: str, payload: dict) -> None:
     print(f"{path.relative_to(pathlib.Path.cwd())}: {len(payload['cases'])} cases, {kb:.0f} KB")
 
 
+def write(name: str, payload: dict) -> None:
+    """Kept for running this by hand; the harness uses --stdout."""
+    OUT.mkdir(parents=True, exist_ok=True)
+    path = OUT / name
+    path.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=False))
+    print(f"{path}: {len(payload['cases'])} cases, {path.stat().st_size / 1024:.0f} KB",
+          file=sys.stderr)
+
+
+def tarball_path() -> str:
+    """Where `general.tar.gz` is cached, downloading it if this is the first time.
+
+    211 MB, once per machine. It is not kept in `.cache/fixtures` with the derived sets because it is
+    an input rather than a fixture, and because deleting it should not invalidate anything.
+    """
+    cache = pathlib.Path(".cache/upstream")
+    cache.mkdir(parents=True, exist_ok=True)
+    tar = cache / f"general-{COMMIT[:12]}.tar.gz"
+    if not tar.exists():
+        url = (f"https://github.com/{REPO}/releases/download/v1.6.0-beta.0/general.tar.gz")
+        print(f"  fetching {url} (211 MB, once)", file=sys.stderr)
+        r = subprocess.run(["curl", "-sSfL", "-o", str(tar), url])
+        if r.returncode != 0:
+            if tar.exists():
+                tar.unlink()
+            raise RuntimeError("could not download general.tar.gz")
+    return str(tar)
+
+
+BUILDERS = {
+    "ssz_static_altair_mainnet": lambda: do_static(),
+    "ssz_generic_valid": lambda: do_generic(tarball_path()),
+}
+
+
 if __name__ == "__main__":
-    what = sys.argv[1] if len(sys.argv) > 1 else "static"
-    if what == "static":
-        do_static()
-    elif what == "generic":
-        if len(sys.argv) < 3:
-            sys.exit("usage: vendor.py generic <path to general.tar.gz>")
-        do_generic(sys.argv[2])
+    args = [a for a in sys.argv[1:]]
+    if "--commit" in args:
+        i = args.index("--commit")
+        want = args[i + 1]
+        if want != COMMIT:
+            sys.exit(f"manifest pins {want[:12]}, this generator is pinned to {COMMIT[:12]}")
+        del args[i:i + 2]
+    to_stdout = "--stdout" in args
+    if to_stdout:
+        args.remove("--stdout")
+    if not args or args[0] not in BUILDERS:
+        sys.exit(f"usage: vendor.py <{'|'.join(BUILDERS)}> [--commit SHA] [--stdout]")
+    payload = BUILDERS[args[0]]()
+    text = json.dumps(payload, separators=(",", ":"), sort_keys=False)
+    if to_stdout:
+        sys.stdout.write(text)
     else:
-        sys.exit(f"unknown target {what!r}; expected 'static' or 'generic'")
+        write(f"{args[0]}.json", payload)

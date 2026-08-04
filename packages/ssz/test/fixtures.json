@@ -1,0 +1,15 @@
+{
+  "source": "ethereum/consensus-spec-tests (MIT), tag v1.6.0-beta.0",
+  "commit": "bc5c1a7fb2a8871aaffd4b16ee4dd9c72bb81908",
+  "rebuild": "python3 packages/ssz/tools/vendor.py <set> --stdout   (needs network on a cold cache; ssz_generic_valid downloads a 211 MB release tarball once)",
+  "sets": {
+    "ssz_static_altair_mainnet": {
+      "sha256": "05dd4b79e9098ef48e09de2bfb1a8f2452c7cd2529e16be909ba29a08755e7d7",
+      "note": "45 cases, the nine light-client containers, mainnet Altair"
+    },
+    "ssz_generic_valid": {
+      "sha256": "07c01bec7a10cbc0a26f19f52359fa2be62a78a881ebcf345cb8837b203b0904",
+      "note": "1217 cases across uints, boolean, bitlist, bitvector, basic_vector, containers"
+    }
+  }
+}

@@ -1,9 +1,8 @@
 // Merkleization against Ethereum's `ssz_generic` vectors.
 //
-// 745 of the 1,148 vendored cases need no schema, because the case *name* carries the type:
+// 754 of the 1,217 cases need no schema, because the case *name* carries the type:
 // `uint_128_max`, `bitvec_513_random`, `bitlist_512_lengthy_3`, `vec_uint256_5_zero`. Those are driven
-// here. The remaining 403 are `containers`, which need a field layout per struct type and wait for the
-// container work.
+// here. The remaining 463 are `containers`, handled in `container_wac.test.ts`.
 //
 // The interesting parameter in every case is the **limit**, not the data. A `Bitlist[512]` holding
 // fifteen bits merkleizes over a tree sized for 512 bits, so an implementation that pads to the data
@@ -12,6 +11,12 @@
 // the counts below are asserted per type rather than in total.
 
 import { wacBind } from "../../../harness/wacBind.ts";
+import { fixtureJson, type FixtureManifest } from "../../../harness/fixtures.ts";
+
+const manifest = JSON.parse(
+  await Deno.readTextFile(new URL("fixtures.json", import.meta.url)),
+) as FixtureManifest;
+
 
 const mod = await wacBind("packages/ssz/test/wac/probe.wac") as unknown as {
   sszRootBasic(s: Uint8Array): Uint8Array;
@@ -34,9 +39,7 @@ const mod = await wacBind("packages/ssz/test/wac/probe.wac") as unknown as {
 };
 
 type Case = { type: string; case: string; ssz: string; root: string };
-const fixture = JSON.parse(
-  await Deno.readTextFile(new URL("vendor/ssz_generic_valid.json", import.meta.url)),
-) as { cases: Case[] };
+const fixture = await fixtureJson<{ cases: Case[] }>("ssz", "ssz_generic_valid", manifest);
 
 const bytes = (h: string) => Uint8Array.from(h.match(/../g) ?? [], (x) => parseInt(x, 16));
 const hex = (b: Uint8Array) => Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -81,7 +84,7 @@ Deno.test("every schema-free ssz_generic case merkleizes to Ethereum's root", ()
     throw new Error(`${failures.length}+ root mismatches:\n  ${failures.join("\n  ")}`);
   }
   // Per type, so a regex that stops matching shows up as a gap rather than as a pass.
-  const want = { uints: 48, boolean: 2, bitvector: 54, bitlist: 450, basic_vector: 191 };
+  const want = { uints: 48, boolean: 2, bitvector: 54, bitlist: 450, basic_vector: 200 };
   for (const [t, n] of Object.entries(want)) {
     if (perType[t] !== n) throw new Error(`drove ${perType[t] ?? 0} ${t} cases, expected ${n}`);
   }

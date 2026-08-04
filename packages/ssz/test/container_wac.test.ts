@@ -1,8 +1,8 @@
 // Container merkleization against Ethereum's `ssz_generic` container vectors.
 //
-// 303 of the 403 container cases: `SingleFieldTestStruct`, `SmallTestStruct`, `FixedTestStruct`,
+// 303 of the 463 container cases: `SingleFieldTestStruct`, `SmallTestStruct`, `FixedTestStruct`,
 // `VarTestStruct`, `ComplexTestStruct`, `BitsStruct`. The other 100 are `ProgressiveTestStruct` and
-// `ProgressiveBitsStruct`, which merkleize under the progressive-list scheme — a different algorithm
+// `ProgressiveBitsStruct` (160 cases), which merkleize under the progressive-list scheme — a different algorithm
 // that an Altair light client does not use. Out of scope and said so in the README, not skipped
 // quietly.
 //
@@ -13,6 +13,12 @@
 // says so.
 
 import { wacBind } from "../../../harness/wacBind.ts";
+import { fixtureJson, type FixtureManifest } from "../../../harness/fixtures.ts";
+
+const manifest = JSON.parse(
+  await Deno.readTextFile(new URL("fixtures.json", import.meta.url)),
+) as FixtureManifest;
+
 
 const mod = await wacBind("packages/ssz/test/wac/probe.wac") as unknown as {
   sszHashTreeRoot(types: Int32Array, fields: Int32Array, root: number, data: Uint8Array): Uint8Array;
@@ -84,9 +90,7 @@ const ROOT: Record<string, number> = {
 };
 
 type Case = { type: string; case: string; ssz: string; root: string };
-const fixture = JSON.parse(
-  await Deno.readTextFile(new URL("vendor/ssz_generic_valid.json", import.meta.url)),
-) as { cases: Case[] };
+const fixture = await fixtureJson<{ cases: Case[] }>("ssz", "ssz_generic_valid", manifest);
 
 const bytes = (h: string) => Uint8Array.from(h.match(/../g) ?? [], (x) => parseInt(x, 16));
 const hex = (b: Uint8Array) => Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");

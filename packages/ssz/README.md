@@ -1,16 +1,16 @@
 # ssz — Ethereum's SimpleSerialize, and the Merkle proofs built on it
 
-**Everything an Altair light client needs is done and checked against Ethereum's vectors.** 1,093 of
-them: 1,048 `ssz_generic` and all 45 `ssz_static`. Issue **0063** is closed; **0064**, the light client
+**Everything an Altair light client needs is done and checked against Ethereum's vectors.** 1,102 of
+them: 1,057 `ssz_generic` and all 45 `ssz_static`. Issue **0063** is closed; **0064**, the light client
 itself, is unblocked.
 
 | | state |
 | --- | --- |
 | `merkleize`, `mixInLength`, `zeroHash`, chunking | **done** |
-| `hash_tree_root` of uints, booleans, bitvectors, bitlists, basic vectors and lists | **done** — 745 Ethereum `ssz_generic` cases |
+| `hash_tree_root` of uints, booleans, bitvectors, bitlists, basic vectors and lists | **done** — 754 Ethereum `ssz_generic` cases |
 | `isValidMerkleBranch`, `isValidNormalizedMerkleBranch` | **done** |
 | `hash_tree_root` of containers, lists and vectors of composites | **done** — 303 Ethereum `containers` cases, schema-driven |
-| progressive lists | **out of scope** — a different merkleization scheme; 100 cases |
+| progressive lists | **out of scope** — a different merkleization scheme; 160 cases |
 | the nine light-client containers | **done** — all 45 Ethereum `ssz_static` cases |
 
 `src/merkle.wac` is merkleization; `src/container.wac` is a **schema-driven** `hash_tree_root` — a type
@@ -30,7 +30,7 @@ Four things this says loudest, because they are where implementations go wrong:
 
 `deno test -A packages/ssz/` — 9 tests, and the numbers rather than the names:
 
-- **745 of the 1,148 `ssz_generic` cases** produce Ethereum's root exactly. The other 403 are
+- **754 of the 1,217 `ssz_generic` cases** produce Ethereum's root exactly. The other 403 are
   `containers`. Counts are asserted per type (48 uints, 2 boolean, 54 bitvector, 450 bitlist, 191
   basic_vector), so a name-matching regex that stops matching shows up as a gap and not as a pass.
 - **The limit is load-bearing, checked by planting the fault.** Making `merkleize` pad to its input
@@ -45,7 +45,7 @@ Four things this says loudest, because they are where implementations go wrong:
 - **The normalized branch's surplus nodes must be zero.** A zero-padded branch is accepted, a branch
   with non-zero surplus is refused rather than trimmed. That is a validity condition — accepting it
   would let a prover hang an unrelated subtree below the field being proved.
-- **303 of the 403 `containers` cases** produce Ethereum's root, driven by descriptors transcribed from
+- **303 of the 463 `containers` cases** produce Ethereum's root, driven by descriptors transcribed from
   the generator's own definitions in `consensus-specs/tests/formats/ssz_generic/README.md`.
   `ComplexTestStruct` is the one that earns its keep: seven fields, four variable, a nested container,
   a vector of fixed containers and a vector of *variable* ones.
@@ -83,15 +83,26 @@ pairing*, and a cofactor-clearing chain with both of its sign flips dropped. Bot
 recollection and both passed every self-consistency check available. So the first commit here is the
 thing that makes a wrong implementation fail: 1,193 cases the Ethereum project generated.
 
-## What is vendored
+## Where the vectors come from
 
-`test/vendor/`, 1.7 MB, produced by `tools/vendor.py` from `ethereum/consensus-spec-tests`
-v1.6.0-beta.0 (MIT). Committed rather than fetched, so a failed download cannot make the tests pass.
+**Not from git.** `test/fixtures.json` is a manifest — a pinned upstream commit SHA and the SHA-256 of
+each derived set — and `harness/fixtures.ts` produces the data into `.cache/fixtures` on a cold cache,
+verifying it against that hash. `tools/vendor.py` is the generator. See `harness/fixtures.ts` for the
+reasoning; the short version is that the sets worth having next (about 2,100 invalid cases, other
+forks, other configs) are far larger than the 1.7 MB that used to sit in the repo.
 
-| file | cases | what |
+| set | cases | what |
 | --- | --- | --- |
-| `ssz_static_altair_mainnet.json` | 45 | the nine containers an Altair light client touches, `mainnet` config |
-| `ssz_generic_valid.json` | 1,148 | `uints`, `boolean`, `bitlist`, `bitvector`, `basic_vector`, `containers` |
+| `ssz_static_altair_mainnet` | 45 | the nine containers an Altair light client touches, `mainnet` config |
+| `ssz_generic_valid` | 1,217 | `uints`, `boolean`, `bitlist`, `bitvector`, `basic_vector`, `containers` |
+
+The property vendoring bought is kept: **a fixture that cannot be produced is an error, never a
+skip.** A suite that quietly drops its oracle when the network is unavailable reports a better number
+for checking less. And the committed hash makes it *stronger* than vendoring — nothing previously
+checked that the committed JSON still matched upstream, so a case mis-decompressed at vendoring time
+would have been baked in for ever.
+
+Cold-cache cost: one 211 MB release-tarball download for `ssz_generic_valid`, once per machine.
 
 Each case is `{ssz, root}` in hex. The assertion they support is
 
@@ -120,12 +131,10 @@ something else that happens to be 32 bytes.
 
 ### What was left out, and why
 
-**69 of the 1,217 valid `ssz_generic` cases are dropped**, every one of them over 8 KB serialized.
-The full set is 47 MB of JSON, almost all of it `containers` — 463 cases totalling 24 MB, the largest
-a single 1.76 MB `ComplexTestStruct`. Those cases repeat structure the small ones already cover
-(offsets, nesting, variable-size members), so the cap costs coverage of *length* rather than of shape.
-`SIZE_CAP` in `tools/vendor.py` is the knob, and the fixture records `dropped` and
-`droppedLargestBytes` so the omission is visible in the data rather than only in this paragraph.
+**Nothing is dropped any more.** The old 8 KB cap existed only because the output went into git; the
+cache has no such constraint, so all 1,217 valid cases are used — including the 1.76 MB
+`ComplexTestStruct` that is the only real exercise of long-list merkleization. `SIZE_CAP` survives as
+a knob in `tools/vendor.py`, set high.
 
 **Invalid cases are not vendored yet.** `ssz_generic` ships about 2,100 of them, and they are the more
 valuable half — a decoder that accepts a malformed offset is the bug that matters. They carry no
@@ -165,9 +174,11 @@ python3 packages/ssz/tools/vendor.py static                      # ~135 requests
 python3 packages/ssz/tools/vendor.py generic <general.tar.gz>     # one 211 MB download
 ```
 
-`ssz_static` is fetched case by case because the light-client containers are only about forty cases.
-`ssz_generic` has over a thousand, so it comes from the release tarball — one request instead of
-thousands. **Do not clone the repo**: it is 2.47 GB, and this machine's disk has been sitting near
+`ssz_static` is fetched case by case — 90 raw files, **no GitHub API calls**. The API is 60 requests
+an hour unauthenticated, and listing directories exhausted it after a few cold rebuilds, failing with
+a 403 that looks nothing like a rate limit. Pinning a commit is what makes listing unnecessary: at a
+fixed SHA the tree cannot change, so the case names are enumerated in the generator. `ssz_generic`
+comes from the release tarball — one request instead of thousands. **Do not clone the repo**: it is 2.47 GB, and this machine's disk has been sitting near
 90%. The tarball is transient and belongs in a scratch directory.
 
 The upstream repo is **archived** as of 2025-10-21, so `v1.6.0-beta.0` is the last release and this is

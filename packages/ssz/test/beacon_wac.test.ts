@@ -12,6 +12,12 @@
 // checkable against the fixtures rather than against my arithmetic.
 
 import { wacBind } from "../../../harness/wacBind.ts";
+import { fixtureJson, type FixtureManifest } from "../../../harness/fixtures.ts";
+
+const manifest = JSON.parse(
+  await Deno.readTextFile(new URL("fixtures.json", import.meta.url)),
+) as FixtureManifest;
+
 
 const mod = await wacBind("packages/ssz/test/wac/probe.wac") as unknown as {
   sszBeaconRoot(ty: number, data: Uint8Array): Uint8Array;
@@ -36,9 +42,7 @@ const TY: Record<string, number> = {};
 CONTAINERS.forEach((n, i) => TY[n] = mod.sszTyFor(i));
 
 type Case = { container: string; case: string; ssz: string; root: string };
-const fixture = JSON.parse(
-  await Deno.readTextFile(new URL("vendor/ssz_static_altair_mainnet.json", import.meta.url)),
-) as { cases: Case[] };
+const fixture = await fixtureJson<{ cases: Case[] }>("ssz", "ssz_static_altair_mainnet", manifest);
 
 const bytes = (h: string) => Uint8Array.from(h.match(/../g) ?? [], (x) => parseInt(x, 16));
 const hex = (b: Uint8Array) => Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
