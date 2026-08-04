@@ -222,3 +222,67 @@ export bool blsFp12InverseIsInverse(u8[] a) {
   if (r is null) { return false; }
   return fp12IsOne(fp12Mul(x!, r!));
 }
+
+// ── G1 ────────────────────────────────────────────────────────────────────────
+
+import { G1, g1Generator, g1Infinity, g1IsInfinity, g1Add, g1Double, g1Mul, g1Negate,
+         g1IsOnCurve, g1InSubgroup, g1Compress, g1Decompress, g1FromBytes, g1AffineX,
+         g1AffineY, groupOrder } from "../../src/g1.wac";
+
+/**
+ * What a decompression attempt produced, as a single number a test can assert on.
+ *
+ * 0 accepted, 1 the encoding was refused, 2 it decoded but is off the curve, 3 it decoded and
+ * is on the curve but outside the order-r subgroup. Distinguishing 1 from 2 from 3 is the point:
+ * they are three different bugs and a bool would hide which.
+ */
+export i32 blsG1Status(u8[] s) {
+  G1? p = g1Decompress(s);
+  if (p is null) { return 1; }
+  if (!g1IsOnCurve(p!)) { return 2; }
+  if (!g1InSubgroup(p!)) { return 3; }
+  return 0;
+}
+
+/** The affine x of a decompressed point, or empty. */
+export u8[] blsG1X(u8[] s) {
+  G1? p = g1FromBytes(s);
+  if (p is null) { return u8[0](); }
+  u32[]? x = g1AffineX(p!);
+  return (x is null) ? u8[0]() : fpToBytes(x!);
+}
+
+export u8[] blsG1Y(u8[] s) {
+  G1? p = g1FromBytes(s);
+  if (p is null) { return u8[0](); }
+  u32[]? y = g1AffineY(p!);
+  return (y is null) ? u8[0]() : fpToBytes(y!);
+}
+
+/** Re-compressing a decompressed point must give the same bytes back. */
+export u8[] blsG1RoundTrip(u8[] s) {
+  G1? p = g1FromBytes(s);
+  return (p is null) ? u8[0]() : g1Compress(p!);
+}
+
+/** `k·G` compressed, for a scalar given as eight little-endian words. */
+export u8[] blsG1MulGenerator(u32[] k) { return g1Compress(g1Mul(g1Generator(), k)); }
+
+/** The generator's compressed form. */
+export u8[] blsG1GeneratorBytes() { return g1Compress(g1Generator()); }
+
+/** `P + (−P)` must be infinity, and `P + P` must equal `2P` — the two degenerate paths. */
+export bool blsG1DegenerateAddition() {
+  G1 g = g1Generator();
+  if (!g1IsInfinity(g1Add(g, g1Negate(g)))) { return false; }
+  u8[] viaAdd = g1Compress(g1Add(g, g));
+  u8[] viaDouble = g1Compress(g1Double(g));
+  if (viaAdd.len() != viaDouble.len()) { return false; }
+  for (i32 i = 0; i < viaAdd.len(); i++) {
+    if (viaAdd[i] != viaDouble[i]) { return false; }
+  }
+  return true;
+}
+
+/** `r·G == O`, which is the subgroup check applied to the generator itself. */
+export bool blsG1OrderIsR() { return g1IsInfinity(g1Mul(g1Generator(), groupOrder())); }

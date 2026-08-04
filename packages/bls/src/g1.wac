@@ -1,0 +1,283 @@
+// G1: the subgroup of order r on y² = x³ + 4 over Fp.
+//
+// Points are Jacobian — (X, Y, Z) standing for the affine (X/Z², Y/Z³) — so addition and
+// doubling need no field inversion. Inversion costs about 570 multiplications here, and a
+// scalar multiplication does 255 doublings, so doing it once at the end instead of every step
+// is the difference between usable and not.
+//
+// **Z = 0 is the point at infinity.** There is no separate flag: every routine that could
+// produce it does, and every routine that consumes a point checks. The alternative — a bool
+// beside the coordinates — gives two representations of infinity that can disagree.
+//
+// ## What a verifier must check about an incoming point
+//
+// Three separate things, and skipping any of them is a known attack rather than a rough edge:
+//
+//   1. the encoding is canonical — each coordinate below p, flags consistent
+//   2. the point satisfies the curve equation
+//   3. the point is in the order-r subgroup, not merely on the curve
+//
+// The curve has a cofactor, so (2) does not imply (3). A point on the curve but in a small
+// subgroup is exactly what small-subgroup attacks are made of, and it will pass a naive
+// pairing check. `g1InSubgroup` is not optional.
+
+import { fpAdd, fpSub, fpMul, fpSquare, fpNeg, fpZero, fpOne, fpIsZero, fpEquals, fpCopy,
+         fpInvert, fpSqrt, fpFromBytes, fpToBytes, fpIsLexicographicallyLarger } from "./fp.wac";
+
+/** A point in Jacobian coordinates. `z` zero means the point at infinity. */
+export struct G1 {
+  u32[] x;
+  u32[] y;
+  u32[] z;
+}
+
+/** The G1 generator's x, in Montgomery form. */
+u32[] g1x() {
+  u32[] v = u32[12]();
+  v[0] = 0xfd530c16; v[1] = 0x5cb38790; v[2] = 0x9976fff5; v[3] = 0x7817fc67;
+  v[4] = 0x143ba1c1; v[5] = 0x154f95c7; v[6] = 0xf3d0e747; v[7] = 0xf0ae6acd;
+  v[8] = 0x21dbf440; v[9] = 0xedce6ecc; v[10] = 0x9e0bfb75; v[11] = 0x12017741;
+  return v;
+}
+
+/** And its y. */
+u32[] g1y() {
+  u32[] v = u32[12]();
+  v[0] = 0x0ce72271; v[1] = 0xbaac93d5; v[2] = 0x7918fd8e; v[3] = 0x8c22631a;
+  v[4] = 0x570725ce; v[5] = 0xdd595f13; v[6] = 0x50405194; v[7] = 0x51ac5829;
+  v[8] = 0xad0059c0; v[9] = 0x0e1c8c3f; v[10] = 0x5008a26a; v[11] = 0x0bbc3efc;
+  return v;
+}
+
+/** b = 4, the curve constant for y² = x³ + 4. */
+u32[] curveB() {
+  u32[] v = u32[12]();
+  v[0] = 0x000cfff3; v[1] = 0xaa270000; v[2] = 0xfc34000a; v[3] = 0x53cc0032;
+  v[4] = 0x6b0a807f; v[5] = 0x478fe97a; v[6] = 0xe6ba24d7; v[7] = 0xb1d37ebe;
+  v[8] = 0xbf78ab2f; v[9] = 0x8ec9733b; v[10] = 0x3d83de7e; v[11] = 0x09d64551;
+  return v;
+}
+
+/**
+ * The group order r, plainly — not in Montgomery form, because it is a scalar and not a field
+ * element. 255 bits in eight 32-bit words.
+ */
+export u32[] groupOrder() {
+  u32[] v = u32[8]();
+  v[0] = 0x00000001; v[1] = 0xffffffff; v[2] = 0xfffe5bfe; v[3] = 0x53bda402;
+  v[4] = 0x09a1d805; v[5] = 0x3339d808; v[6] = 0x299d7d48; v[7] = 0x73eda753;
+  return v;
+}
+/** The point at infinity. */
+export G1 g1Infinity() { return G1(fpOne(), fpOne(), fpZero()); }
+
+export bool g1IsInfinity(G1 p) { return fpIsZero(p.z); }
+
+/** The standard generator. */
+export G1 g1Generator() { return G1(g1x(), g1y(), fpOne()); }
+
+export G1 g1Negate(G1 p) { return G1(fpCopy(p.x), fpNeg(p.y), fpCopy(p.z)); }
+
+/**
+ * Doubling, for a curve with a = 0 — the `dbl-2009-l` formulas.
+ *
+ * Cheaper than the general form because every term with `a` in it disappears, which is one of
+ * the reasons pairing-friendly curves are chosen with a = 0.
+ */
+export G1 g1Double(G1 p) {
+  if (g1IsInfinity(p)) { return g1Infinity(); }
+  u32[] a = fpSquare(p.x);
+  u32[] b = fpSquare(p.y);
+  u32[] c = fpSquare(b);
+  u32[] t = fpSquare(fpAdd(p.x, b));
+  u32[] d = fpAdd(fpSub(fpSub(t, a), c), fpSub(fpSub(t, a), c));
+  u32[] e = fpAdd(fpAdd(a, a), a);
+  u32[] f = fpSquare(e);
+
+  u32[] x3 = fpSub(f, fpAdd(d, d));
+  u32[] eightC = fpAdd(fpAdd(fpAdd(c, c), fpAdd(c, c)), fpAdd(fpAdd(c, c), fpAdd(c, c)));
+  u32[] y3 = fpSub(fpMul(e, fpSub(d, x3)), eightC);
+  u32[] z3 = fpAdd(fpMul(p.y, p.z), fpMul(p.y, p.z));
+  return G1(x3, y3, z3);
+}
+
+/**
+ * Addition, `add-2007-bl`, with the two degenerate cases handled explicitly.
+ *
+ * `h == 0` means the x-coordinates agree: either the points are equal, which needs doubling
+ * because the chord is a tangent, or they are inverses, which gives infinity. A formula that
+ * ignores this returns zero coordinates for `P + P` and is wrong in a way that only shows up
+ * when it matters.
+ */
+export G1 g1Add(G1 p, G1 q) {
+  if (g1IsInfinity(p)) { return G1(fpCopy(q.x), fpCopy(q.y), fpCopy(q.z)); }
+  if (g1IsInfinity(q)) { return G1(fpCopy(p.x), fpCopy(p.y), fpCopy(p.z)); }
+
+  u32[] z1z1 = fpSquare(p.z);
+  u32[] z2z2 = fpSquare(q.z);
+  u32[] u1 = fpMul(p.x, z2z2);
+  u32[] u2 = fpMul(q.x, z1z1);
+  u32[] s1 = fpMul(fpMul(p.y, q.z), z2z2);
+  u32[] s2 = fpMul(fpMul(q.y, p.z), z1z1);
+
+  u32[] h = fpSub(u2, u1);
+  u32[] rr = fpSub(s2, s1);
+  if (fpIsZero(h)) {
+    if (fpIsZero(rr)) { return g1Double(p); }
+    return g1Infinity();
+  }
+
+  u32[] i = fpSquare(fpAdd(h, h));
+  u32[] j = fpMul(h, i);
+  u32[] r2 = fpAdd(rr, rr);
+  u32[] vv = fpMul(u1, i);
+
+  u32[] x3 = fpSub(fpSub(fpSquare(r2), j), fpAdd(vv, vv));
+  u32[] s1j = fpMul(s1, j);
+  u32[] y3 = fpSub(fpMul(r2, fpSub(vv, x3)), fpAdd(s1j, s1j));
+  u32[] z3 = fpMul(fpSub(fpSub(fpSquare(fpAdd(p.z, q.z)), z1z1), z2z2), h);
+  return G1(x3, y3, z3);
+}
+
+/**
+ * `k·P`, double-and-add over the scalar's bits, most significant first.
+ *
+ * Not constant-time and does not need to be: this package verifies signatures, so the only
+ * scalar it ever multiplies by is the public group order r during the subgroup check.
+ */
+export G1 g1Mul(G1 p, u32[] k) {
+  G1 acc = g1Infinity();
+  for (i32 i = k.len() - 1; i >= 0; i--) {
+    for (i32 b = 31; b >= 0; b--) {
+      acc = g1Double(acc);
+      if (((k[i] >> (b as@ u32)) & 1) != 0) { acc = g1Add(acc, p); }
+    }
+  }
+  return acc;
+}
+
+/** Whether the point satisfies y² = x³ + 4, in Jacobian form: Y² = X³ + 4·Z⁶. */
+export bool g1IsOnCurve(G1 p) {
+  if (g1IsInfinity(p)) { return true; }
+  u32[] z2 = fpSquare(p.z);
+  u32[] z6 = fpSquare(fpMul(z2, p.z));
+  u32[] lhs = fpSquare(p.y);
+  u32[] rhs = fpAdd(fpMul(fpSquare(p.x), p.x), fpMul(curveB(), z6));
+  return fpEquals(lhs, rhs);
+}
+
+/**
+ * Whether the point has order dividing r.
+ *
+ * By multiplication, which is the slow way — 255 doublings — but the one that is obviously
+ * correct. There are endomorphism-based checks perhaps ten times faster; they are also where
+ * subtle acceptance bugs live, and this is a verifier, so the boring version wins until there
+ * is a benchmark saying it must not.
+ */
+export bool g1InSubgroup(G1 p) {
+  if (g1IsInfinity(p)) { return true; }
+  return g1IsInfinity(g1Mul(p, groupOrder()));
+}
+
+/** Affine x and y, or null for infinity, which has neither. */
+export u32[]? g1AffineX(G1 p) {
+  if (g1IsInfinity(p)) { return null; }
+  u32[]? zi = fpInvert(p.z);
+  if (zi is null) { return null; }
+  return fpMul(p.x, fpSquare(zi!));
+}
+
+export u32[]? g1AffineY(G1 p) {
+  if (g1IsInfinity(p)) { return null; }
+  u32[]? zi = fpInvert(p.z);
+  if (zi is null) { return null; }
+  u32[] z2 = fpSquare(zi!);
+  return fpMul(p.y, fpMul(z2, zi!));
+}
+
+// ── The compressed encoding ───────────────────────────────────────────────────
+//
+// 48 bytes: the x-coordinate big-endian, with three flags in the top bits of byte 0, which is
+// possible only because the field is 381 bits and leaves three spare.
+//
+//   0x80  compression — always set in this format
+//   0x40  infinity    — the rest must then be zero
+//   0x20  sign of y   — set when y is the lexicographically larger of the two roots
+//
+// **Every combination that is not exactly one of the two valid shapes is rejected.** This is
+// the surface an attacker actually reaches, and the Ethereum test fixtures are mostly about
+// exactly this: an uncompressed flag, an infinity flag with a non-zero x, a sign bit set on
+// infinity, an x at or above p. Each of those is a byte string that a careless reader turns
+// into a valid point, and each one is a signature that verifies when it should not.
+
+/** The compressed form of `p`. */
+export u8[] g1Compress(G1 p) {
+  u8[] out = u8[48]();
+  if (g1IsInfinity(p)) {
+    out[0] = 0xc0;                       // compressed | infinity, x zero
+    return out;
+  }
+  u32[]? ax = g1AffineX(p);
+  u32[]? ay = g1AffineY(p);
+  if ((ax is null) || (ay is null)) { return out; }
+  u8[] xb = fpToBytes(ax!);
+  for (i32 i = 0; i < 48; i++) { out[i] = xb[i]; }
+  i32 flags = 0x80;
+  if (fpIsLexicographicallyLarger(ay!)) { flags = flags | 0x20; }
+  out[0] = out[0] | flags;
+  return out;
+}
+
+/**
+ * A compressed point, or null if the bytes are not exactly one valid encoding of one.
+ *
+ * The order of the checks is the order an attacker would probe them in, and every one of them
+ * returns null rather than a "best effort" point.
+ */
+export G1? g1Decompress(u8[] s) {
+  if (s.len() != 48) { return null; }
+  i32 b0 = s[0];
+  if ((b0 & 0x80) == 0) { return null; }              // not compressed
+  bool infinity = (b0 & 0x40) != 0;
+  bool wantLarger = (b0 & 0x20) != 0;
+
+  if (infinity) {
+    // The sign bit is meaningless for infinity, so a set one is a second encoding of the same
+    // point — refused, because two encodings of one value is where malleability starts.
+    if (wantLarger) { return null; }
+    if ((b0 & 0x1F) != 0) { return null; }
+    for (i32 i = 1; i < 48; i++) {
+      if (s[i] != 0) { return null; }
+    }
+    return g1Infinity();
+  }
+
+  u8[] xb = u8[48]();
+  for (i32 i = 0; i < 48; i++) { xb[i] = s[i]; }
+  xb[0] = xb[0] & 0x1F;                                // strip the flags before reading
+  u32[]? x = fpFromBytes(xb);
+  if (x is null) { return null; }                      // x was at or above p
+
+  // y² = x³ + 4. No root means the x is simply not on the curve.
+  u32[] y2 = fpAdd(fpMul(fpSquare(x!), x!), curveB());
+  u32[]? y = fpSqrt(y2);
+  if (y is null) { return null; }
+
+  u32[] chosen = y!;
+  if (fpIsLexicographicallyLarger(chosen) != wantLarger) { chosen = fpNeg(chosen); }
+  return G1(x!, chosen, fpOne());
+}
+
+/**
+ * Decompress and check everything a verifier must: encoding, curve, subgroup.
+ *
+ * The three are separate functions above so a test can reach each one, and one function here so
+ * a caller cannot use two of the three by accident.
+ */
+export G1? g1FromBytes(u8[] s) {
+  G1? p = g1Decompress(s);
+  if (p is null) { return null; }
+  if (!g1IsOnCurve(p!)) { return null; }
+  if (!g1InSubgroup(p!)) { return null; }
+  return p!;
+}
