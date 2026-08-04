@@ -24,7 +24,8 @@ import { wacBind } from "../../../harness/wacBind.ts";
 
 const mod = await wacBind("packages/gzip/src/inflate.wac") as unknown as {
   gunzipBytes(gz: Uint8Array): Uint8Array;
-  gunzipStream(read: () => Uint8Array, write: (b: Uint8Array) => boolean): number;
+  gunzipStream(read: () => unknown, write: (b: Uint8Array) => boolean): number;
+  Read: { Data(bytes: Uint8Array): unknown; End(): unknown; Failed(why: string): unknown };
 };
 
 // One reader and one writer for the whole file: bindgen keeps 16 callback identities per
@@ -33,8 +34,18 @@ let queue: Uint8Array[] = [];
 let next = 0;
 let parts: Uint8Array[] = [];
 
-function read(): Uint8Array {
-  return next < queue.length ? queue[next++] : new Uint8Array(0);
+// A `Read`, not bytes: the source has to say whether it finished or broke, and a test that could
+// only say "no more" is what let the two be confused in the first place.
+function read(): unknown {
+  return next < queue.length ? mod.Read.Data(queue[next++]) : mod.Read.End();
+}
+
+/** The same, but the source fails after `n` chunks — the state that had no spelling before. */
+function readFailingAfter(n: number): () => unknown {
+  return () => {
+    if (next >= n) return mod.Read.Failed("the disk gave out");
+    return next < queue.length ? mod.Read.Data(queue[next++]) : mod.Read.End();
+  };
 }
 
 function write(b: Uint8Array): boolean {
@@ -247,7 +258,8 @@ Deno.test("truncated input traps rather than returning what it managed", async (
 import { gunzip } from "./util.ts";
 
 const zip = await wacBind("packages/gzip/src/gzip.wac") as unknown as {
-  gzipStream(read: () => Uint8Array, write: (b: Uint8Array) => boolean): number;
+  gzipStream(read: () => unknown, write: (b: Uint8Array) => boolean): number;
+  Read: { Data(bytes: Uint8Array): unknown; End(): unknown; Failed(why: string): unknown };
   gzipBest(d: Uint8Array): Uint8Array;
 };
 
@@ -255,8 +267,8 @@ let zqueue: Uint8Array[] = [];
 let znext = 0;
 let zparts: Uint8Array[] = [];
 
-function zread(): Uint8Array {
-  return znext < zqueue.length ? zqueue[znext++] : new Uint8Array(0);
+function zread(): unknown {
+  return znext < zqueue.length ? zip.Read.Data(zqueue[znext++]) : zip.Read.End();
 }
 
 function zwrite(b: Uint8Array): boolean {

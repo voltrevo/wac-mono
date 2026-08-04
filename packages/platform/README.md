@@ -121,14 +121,24 @@ split is why it is a second struct rather than more fields.
 **Anything that can fail says why.** `writeFile`, `mkdir`, `remove` and `rename` answer with the
 empty string on success and the host's own message otherwise, as `openInput` and `openOutput` already
 did — a `bool` could report that a write failed and never what went wrong, so `rm -f` had to suppress
-every failure or none, and each applet's diagnostic was its own guess. `readChunk`, `write` and `recv` keep their shapes — the first two because the streaming transforms
-take them as bare funcrefs, the third because a `Chunk` struct would change every caller in `tls`,
-`ssh` and `tor` — so each has a companion that answers what its return cannot: `inputError`,
-`outputError` and `socketError(handle)`. Empty means the ordinary ending (input finished, reader went
-away, peer closed); anything else is the host's message. Ask once, when the bytes stop.
+every failure or none, and each applet's diagnostic was its own guess. **`readChunk` and `recv` answer a `Read`**, which is `Data(bytes)`, `End`, or `Failed(why)` — three
+states in the type, so a caller cannot mistake a broken read for the end of the input. `match` is
+exhaustive; ignoring `Failed` does not compile.
 
-Without them a filter over a disk that gave out exits 0 having written half the answer, a full disk
-is indistinguishable from a closed pipe, and a truncated download from a complete one.
+That is the second design. The first added a companion `inputError()` to ask *after* an empty answer,
+which was cheaper and wrong: it left the ordinary path looking exactly as correct as it had been, so
+anybody who forgot to ask got the old bug back — a filter over a disk that gave out exiting 0 having
+written half the answer. Removing a failure mode is worth more than the twenty call sites it cost,
+and in a young codebase those call sites are a schedule rather than an objection.
+
+`Read` lives in `packages/bytes`, not here, because `gzipStream(cli.readChunk, cli.write)` hands the
+capability straight to a transform — wac has no closures, so no adapter can sit between them, and
+`gzip` has no business depending on a capability world. The lowest package in the tree is where both
+sides can reach it.
+
+`write` keeps its `bool` and has `outputError()` beside it, because its two outcomes are *not* the
+same shape of question: a reader that went away is a normal ending a filter should exit 0 on, and a
+failed write is not. That one is a companion on purpose rather than by inertia.
 
 `stat` follows symbolic links, so it describes what a name leads to; `linkStat` describes the name.
 Both questions are real — `find` wants the first, `tar` wants the second — and a flag would have made

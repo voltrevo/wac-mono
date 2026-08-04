@@ -63,6 +63,7 @@ export type PendingClasses = {
   Pending$Socket: PendingClass;
   Pending$Child: PendingClass;
   Pending$Captured: PendingClass;
+  Pending$Read: PendingClass;
 };
 
 /**
@@ -135,6 +136,11 @@ export function cliOf(
     Socket: { of(...a: unknown[]): unknown };
     Child: { of(...a: unknown[]): unknown };
     Captured: { of(...a: unknown[]): unknown };
+    Read: {
+      Data(bytes: Uint8Array): unknown;
+      End(): unknown;
+      Failed(why: string): unknown;
+    };
   } & PendingClasses,
 ): unknown {
   const settled = (id: number) => isDone(b, unpack(id));
@@ -226,6 +232,33 @@ export function cliOf(
       return cls.Captured.of(EMPTY, EMPTY);
     }
   };
+  /**
+   * A `Read`, from a payload whose first byte is the state: 0 data, 1 end, 2 failed.
+   *
+   * A tag rather than "empty means end", which is the ambiguity the enum exists to remove — the wire
+   * had the same hole as the signature did.
+   */
+  const readOf = (out: Uint8Array) => {
+    if (out.length === 0 || out[0] === 1) return cls.Read.End();
+    if (out[0] === 2) return cls.Read.Failed(unstr(out.subarray(1)));
+    return cls.Read.Data(out.subarray(1));
+  };
+  /** For the ticket-taking `recv`. A bridge failure is itself a failed read. */
+  const read = (id: number) => {
+    try {
+      return readOf(collect(b, unpack(id)));
+    } catch (e) {
+      return cls.Read.Failed(e instanceof Error ? e.message : String(e));
+    }
+  };
+  /** For the blocking `readChunk`, which has a ticket in hand rather than a packed id. */
+  const readNow = (t: Ticket) => {
+    try {
+      return readOf(collect(b, t));
+    } catch (e) {
+      return cls.Read.Failed(e instanceof Error ? e.message : String(e));
+    }
+  };
   const socket = (id: number) => {
     try {
       return cls.Socket.of(readI32le(collect(b, unpack(id))), "");
@@ -247,6 +280,7 @@ export function cliOf(
     dir: (t: Ticket) => cls.Pending$stringArrOpt.of(pack(t), dirNames, settled, drop),
     socket: (t: Ticket) => cls.Pending$Socket.of(pack(t), socket, settled, drop),
     captured: (t: Ticket) => cls.Pending$Captured.of(pack(t), captured, settled, drop),
+    read: (t: Ticket) => cls.Pending$Read.of(pack(t), read, settled, drop),
     child: (t: Ticket) => cls.Pending$Child.of(pack(t), child, settled, drop),
   };
 
@@ -328,15 +362,9 @@ export function cliOf(
     /*= openInput */
     (path: string) => T.outcome(submit(b, OP.OPEN_INPUT, str(path))),
     /*= readChunk */
-    () => {
-      try {
-        return collect(b, submit(b, OP.READ_CHUNK, EMPTY));
-      } catch {
-        return EMPTY;   // unreadable is indistinguishable from ended, as it should be
-      }
-    },
-    /*= inputError */
-    () => T.text(submit(b, OP.INPUT_ERROR, EMPTY)),
+    // Blocking, and it answers the three states directly — no ticket, and no way to mistake a broken
+    // read for the end of the input.
+    () => readNow(submit(b, OP.READ_CHUNK, EMPTY)),
     /*= outputError */
     () => T.text(submit(b, OP.OUTPUT_ERROR, EMPTY)),
     /*= openOutput */
@@ -349,9 +377,7 @@ export function cliOf(
     /*= accept */
     (handle: number) => T.socket(submit(b, OP.ACCEPT, i32le(handle))),
     /*= recv */
-    (handle: number) => T.chunk(submit(b, OP.RECV, i32le(handle))),
-    /*= socketError */
-    (handle: number) => T.text(submit(b, OP.SOCKET_ERROR, i32le(handle))),
+    (handle: number) => T.read(submit(b, OP.RECV, i32le(handle))),
     /*= send */
     (handle: number, body: Uint8Array) => T.ok(submit(b, OP.SEND, headed(i32le(handle), body))),
     /*= closeSocket */

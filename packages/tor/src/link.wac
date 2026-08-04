@@ -23,6 +23,7 @@ import { ntorClientRequest, ntorClientFinish } from "./ntor.wac";
 import { recordsReady } from "../../tls/src/record.wac";
 import { tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientPhase, tlsClientFailure }
   from "../../tls/src/client.wac";
+import { Read } from "../../bytes/src/read.wac";
 
 /** `[state][toSend][appData]`, each behind a big-endian u32 length. */
 struct Step { u8[] state; u8[] toSend; u8[] appData; }
@@ -119,14 +120,23 @@ export void handshakeTls(Link l) {
  * what makes it finish.
  */
 export bool pump(Link l) {
-  Pending<u8[]> read = l.cli.recv(l.sock);
+  Pending<Read> read = l.cli.recv(l.sock);
   if (l.core.waitAny(i32[](read.id), READ_TIMEOUT_MS) < 0) {
     read.cancel();
     l.cli.closeSocket(l.sock);
     l.core.warn("tor: a relay went silent for " + itoa(READ_TIMEOUT_MS) + "ms");
     return false;
   }
-  return feedLink(l, read.wait());
+  // A relay that broke and a relay that closed are both "no more circuit", but only the first is
+  // worth a line — and a Tor client that reports a clean close for a reset connection is hiding the
+  // one fact an operator needs.
+  bool live = false;
+  match (read.wait()) {
+    case Data(bytes): { live = feedLink(l, bytes); }
+    case End: { }
+    case Failed(why): { l.core.warn("tor: the relay connection failed: " + why); }
+  }
+  return live;
 }
 
 /**

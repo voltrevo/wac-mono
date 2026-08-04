@@ -5,7 +5,7 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, openStream, inputEnded } from "../lib/input.wac";
+import { Chunk, Input, openStream, nextChunk } from "../lib/input.wac";
 import { Buf } from "../../../bytes/src/buf.wac";
 
 export i32 strings(Core core, Cli cli, Args a) {
@@ -15,8 +15,10 @@ export i32 strings(Core core, Cli cli, Args a) {
 
   Buf run = Buf.create();
   while (true) {
-    u8[] data = cli.readChunk();
-    if (data.len() == 0) { if (!inputEnded(core, cli, a)) { return 1; } break; }
+    Chunk got = nextChunk(core, cli, a);
+    if (!got.ok) { return 1; }
+    if (!got.more) { break; }
+    u8[] data = got.bytes;
     for (i32 i = 0; i < data.len(); i++) {
       i32 b = data[i];
       if (b >= 32 && b < 127) { run.push(b); continue; }

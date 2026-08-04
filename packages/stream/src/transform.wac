@@ -13,17 +13,30 @@
 import { Scalar, decode, encode, encodedLength } from "../../unicode/src/utf8.wac";
 import { toUpper } from "../../unicode/src/case.wac";
 import { Buf } from "../../bytes/src/buf.wac";
+import { Read } from "../../bytes/src/read.wac";
 
-/** Bytes in, same bytes out. The control: any failure here is the bridge, not a transform. */
-export i32 passthrough(fn[u8[]()] read, fn[bool(u8[])] write) {
+/**
+ * Bytes in, same bytes out. The control: any failure here is the bridge, not a transform.
+ *
+ * Returns the byte count, or -2 if the input broke — which is not the same as ending. `read`
+ * answering `u8[]` could not tell the two apart, so this used to return a plausible total for half a
+ * stream and the bridge closed it cleanly.
+ */
+export i32 passthrough(fn[Read()] read, fn[bool(u8[])] write) {
   i32 total = 0;
-  while (true) {
-    u8[] chunk = read();
-    if (chunk.len() == 0) { break; }
-    total = total + chunk.len();
-    if (!write(chunk)) { break; }
+  bool going = true;
+  bool broke = false;
+  while (going) {
+    match (read()) {
+      case Data(bytes): {
+        total = total + bytes.len();
+        if (!write(bytes)) { going = false; }
+      }
+      case End: { going = false; }
+      case Failed(why): { going = false; broke = true; }
+    }
   }
-  return total;
+  return broke ? -2 : total;
 }
 
 /**
@@ -33,12 +46,19 @@ export i32 passthrough(fn[u8[]()] read, fn[bool(u8[])] write) {
  * than emitted, which is the whole difficulty: a two-byte `é` split across a chunk boundary must
  * not become two replacement characters, and must not be emitted twice either.
  */
-export i32 upperCase(fn[u8[]()] read, fn[bool(u8[])] write) {
+export i32 upperCase(fn[Read()] read, fn[bool(u8[])] write) {
   u8[] held = u8[0]();
   i32 total = 0;
-  while (true) {
-    u8[] chunk = read();
-    if (chunk.len() == 0) { break; }
+  bool going = true;
+  bool broke = false;
+  while (going) {
+    u8[] chunk = u8[0]();
+    match (read()) {
+      case Data(bytes): { chunk = bytes; }
+      case End: { going = false; }
+      case Failed(why): { going = false; broke = true; }
+    }
+    if (!going) { break; }
 
     // Whatever was left over joins the front of this chunk.
     u8[] input = u8[held.len() + chunk.len()]();
@@ -71,5 +91,6 @@ export i32 upperCase(fn[u8[]()] read, fn[bool(u8[])] write) {
   }
   // A held tail at end of input is a truncated scalar: the input was not valid UTF-8.
   if (held.len() > 0) { return -1; }
-  return total;
+  // As in `passthrough`: a broken input is its own answer, not a smaller total.
+  return broke ? -2 : total;
 }

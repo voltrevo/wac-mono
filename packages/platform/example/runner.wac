@@ -13,6 +13,7 @@
 //   runner probe.worker.js "" read          ->  the child may read, if this program may
 
 import { Child, Cli, Core, FileResult, GRANT_ENV, GRANT_NET, GRANT_NONE, GRANT_READ, GRANT_WRITE, Pending } from "../src/platform.wac";
+import { Read } from "../../bytes/src/read.wac";
 
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 2) {
@@ -44,7 +45,12 @@ export i32 main(Core core, Cli cli) {
 
   // Everything it wrote, until it stops writing.
   while (true) {
-    u8[] chunk = cli.recv(kid.handle).wait();
+    u8[] chunk = u8[0]();
+    match (cli.recv(kid.handle).wait()) {
+      case Data(bytes): { chunk = bytes; }
+      case End: { }                              // the child has finished writing
+      case Failed(why): { core.warn("runner: " + why); return 1; }
+    }
     if (chunk.len() == 0) { break; }
     cli.write(chunk);
   }

@@ -38,6 +38,22 @@ import { ChildStack, packCaptured, unpackPush } from "./child.ts";
 
 const EMPTY = new Uint8Array(0);
 
+/** A read answer, tagged: 0 data, 1 end, 2 failed. See `Read` in platform.wac. */
+function data(bytes: Uint8Array): Uint8Array {
+  const out = new Uint8Array(bytes.length + 1);
+  out[0] = 0;
+  out.set(bytes, 1);
+  return out;
+}
+const END = new Uint8Array([1]);
+function failed(why: string): Uint8Array {
+  const message = new TextEncoder().encode(why);
+  const out = new Uint8Array(message.length + 1);
+  out[0] = 2;
+  out.set(message, 1);
+  return out;
+}
+
 /** A `warn` payload as a line of a captured error stream: its bytes, then a newline. */
 function lineOf(p: Uint8Array): Uint8Array {
   const out = new Uint8Array(p.length + 1);
@@ -151,13 +167,9 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   // child's relative paths resolve from where the shell put it; with nothing pushed it is the
   // identity and every path means exactly what it did before.
   const kids = new ChildStack();
-  // Empty until a read fails; `inputError` hands it back. See platform.wac.
-  let inputFailure = "";
-  // The same for the other two directions: a `write` that failed, and the last failure per socket.
-  // Recorded rather than only thrown, because `write` answers a bool and `recv` answers bytes —
-  // neither can carry a reason. See `outputError` and `socketError` in platform.wac.
+  // `write` answers a bool and cannot carry a reason, so this is recorded for `outputError`. The
+  // reads no longer need an equivalent: `Read` carries theirs.
   let outputFailure = "";
-  const socketFailure = new Map<number, string>();
 
   const canWrite = (): void => {
     if (opts.root === undefined || opts.writable !== true) deny("filesystem write");
@@ -429,23 +441,20 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     },
     [OP.READ_CHUNK]: async () => {
       const fed = source === null ? kids.readChunk() : null;
-      if (fed !== null) return fed;
-      if (source === null) return EMPTY;
+      if (fed !== null) return fed.length === 0 ? END : data(fed);
+      if (source === null) return END;
       try {
         const end = Math.min(source.at + CHUNK, source.blob.size);
-        if (end <= source.at) return EMPTY;
+        if (end <= source.at) return END;
         const slice = source.blob.slice(source.at, end);
         source.at = end;
-        return new Uint8Array(await slice.arrayBuffer());
+        return data(new Uint8Array(await slice.arrayBuffer()));
       } catch (e) {
-        inputFailure = e instanceof Error ? e.message : String(e);
-        return EMPTY;
+        return failed(e instanceof Error ? e.message : String(e));
       }
     },
     // Why the last read gave nothing — see `inputError` in platform.wac.
-    [OP.INPUT_ERROR]: () => str(inputFailure),
     [OP.OUTPUT_ERROR]: () => str(outputFailure),
-    [OP.SOCKET_ERROR]: (p) => str(socketFailure.get(readI32le(p)) ?? ""),
     [OP.OPEN_OUTPUT]: async (p) => {
       const path = unstr(p);
       if (sink !== null) { await sink.close(); sink = null; }
@@ -462,7 +471,9 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     [OP.ACCEPT]: () => deny("network access"),
     // Handle 0 is standard input everywhere else; a page has none, so it ends immediately
     // rather than refusing. Any other handle is a socket, which a page cannot have.
-    [OP.RECV]: (p) => (readI32le(p) === 0 ? EMPTY : deny("network access")),
+    // A page has no standard input and no sockets, so handle 0 is immediately at its end and
+    // anything else is refused — as a `Read`, so a caller cannot read the refusal as "finished".
+    [OP.RECV]: (p) => (readI32le(p) === 0 ? END : failed("network access is not granted")),
     [OP.SEND]: () => deny("network access"),
     [OP.CLOSE_SOCKET]: () => EMPTY,
   };

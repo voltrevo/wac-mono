@@ -8,6 +8,7 @@ import { Cli, Core, Socket } from "../../../platform/src/platform.wac";
 import { itoa } from "./num.wac";
 import { concat } from "./bytes.wac";
 import { Incoming, ParsedResponse, parseResponse } from "../../../http/src/incoming.wac";
+import { Read } from "../../../bytes/src/read.wac";
 
 /** The exit code the applet should return. */
 export i32 fetch(Core core, Cli cli, string name, string host, string path, i32 port, bool headers) {
@@ -28,12 +29,25 @@ export i32 fetch(Core core, Cli cli, string name, string host, string path, i32 
   // and then parses once with `eof` set — which is what tells the parser a body with no
   // length is complete rather than truncated.
   u8[] all = u8[0]();
-  while (true) {
-    u8[] chunk = cli.recv(s.handle).wait();
-    if (chunk.len() == 0) { break; }
-    all = concat(all, chunk);
+  bool reading = true;
+  bool broke = false;
+  while (reading) {
+    match (cli.recv(s.handle).wait()) {
+      case Data(bytes): { all = concat(all, bytes); }
+      case End: { reading = false; }
+      // A connection that failed halfway is not a short body — and with `Connection: close` the
+      // body's end *is* the socket's end, so this is precisely the case that used to be invisible:
+      // half a page would have parsed as a whole one.
+      case Failed(why): {
+        core.warn(name + ": " + host + ": " + why);
+        reading = false;
+        broke = true;
+      }
+    }
   }
   cli.closeSocket(s.handle);
+  // Reported above; the exit code is what a script reads.
+  if (broke) { return 1; }
 
   match (parseResponse(all, "GET".toBytes(), true, 1 << 26)) {
     case Incomplete: {

@@ -32,10 +32,23 @@ export bool writeAtomic(Core core, Cli cli, string path, u8[] bytes) {
 export bool streamAtomic(Core core, Cli cli, string path) {
   string tmp = tempName(core, path);
   if (cli.openOutput(tmp).wait() != "") { return false; }
-  while (true) {
-    u8[] chunk = cli.readChunk();
-    if (chunk.len() == 0) { break; }
-    if (!cli.write(chunk)) { cli.openOutput("").wait(); cli.remove(tmp, false).wait(); return false; }
+  bool copying = true;
+  bool intact = true;
+  while (copying) {
+    match (cli.readChunk()) {
+      case Data(bytes): {
+        if (!cli.write(bytes)) { copying = false; intact = false; }
+      }
+      case End: { copying = false; }
+      // Half a file renamed over the original is the worst outcome available here, so a failed read
+      // abandons the temporary and leaves the target alone.
+      case Failed(why): { copying = false; intact = false; }
+    }
+  }
+  if (!intact) {
+    cli.openOutput("").wait();
+    cli.remove(tmp, false).wait();
+    return false;
   }
   // Back to standard output, which closes the temporary file — a rename over a file still
   // open would move it half-written.

@@ -68,6 +68,22 @@ export type NodeWorldOptions = {
 
 const EMPTY = new Uint8Array(0);
 
+/** A read answer, tagged: 0 data, 1 end, 2 failed. See `Read` in platform.wac. */
+function data(bytes: Uint8Array): Uint8Array {
+  const out = new Uint8Array(bytes.length + 1);
+  out[0] = 0;
+  out.set(bytes, 1);
+  return out;
+}
+const END = new Uint8Array([1]);
+function failed(why: string): Uint8Array {
+  const message = new TextEncoder().encode(why);
+  const out = new Uint8Array(message.length + 1);
+  out[0] = 2;
+  out.set(message, 1);
+  return out;
+}
+
 /** A `warn` payload as a line of a captured error stream: its bytes, then a newline. */
 function lineOf(p: Uint8Array): Uint8Array {
   const out = new Uint8Array(p.length + 1);
@@ -107,13 +123,9 @@ export function nodeWorld(
 
   // A program running inside this one. `P` is the identity when nothing is pushed.
   const kids = new ChildStack();
-  // Empty until a read fails; `inputError` hands it back. See platform.wac.
-  let inputFailure = "";
-  // The same for the other two directions: a `write` that failed, and the last failure per socket.
-  // Recorded rather than only thrown, because `write` answers a bool and `recv` answers bytes —
-  // neither can carry a reason. See `outputError` and `socketError` in platform.wac.
+  // `write` answers a bool and cannot carry a reason, so this is recorded for `outputError`. The
+  // reads no longer need an equivalent: `Read` carries theirs.
   let outputFailure = "";
-  const socketFailure = new Map<number, string>();
   const P = (path: string) => kids.path(path);
 
   return {
@@ -263,17 +275,15 @@ export function nodeWorld(
     },
     [OP.READ_CHUNK]: async () => {
       const fed = source === null ? kids.readChunk() : null;
-      if (fed !== null) return fed;
+      if (fed !== null) return fed.length === 0 ? END : data(fed);
       try {
-        return source === null ? await io.readStdinChunk() : await source.read();
+        const got = source === null ? await io.readStdinChunk() : await source.read();
+        return got.length === 0 ? END : data(got);
       } catch (e) {
-        inputFailure = e instanceof Error ? e.message : String(e);
-        return EMPTY;
+        return failed(e instanceof Error ? e.message : String(e));
       }
     },
-    [OP.INPUT_ERROR]: () => str(inputFailure),
     [OP.OUTPUT_ERROR]: () => str(outputFailure),
-    [OP.SOCKET_ERROR]: (p) => str(socketFailure.get(readI32le(p)) ?? ""),
 
     [OP.OPEN_OUTPUT]: async (p) => {
       const path = unstr(p);
@@ -310,10 +320,18 @@ export function nodeWorld(
     [OP.RECV]: async (p) => {
       const h = readI32le(p);
       // Handle 0 is standard input — see the note in `deno.ts`.
-      if (h === 0) return await io.readStdinChunk();
+      if (h === 0) {
+        const piped = await io.readStdinChunk();
+        return piped.length === 0 ? END : data(piped);
+      }
       const c = sockets.get(h);
-      if (c === undefined) throw new Error("not an open socket");
-      return await c.recv();
+      if (c === undefined) return failed("not an open socket");
+      try {
+        const got = await c.recv();
+        return got.length === 0 ? END : data(got);
+      } catch (e) {
+        return failed(e instanceof Error ? e.message : String(e));
+      }
     },
     [OP.SEND]: async (p) => {
       const c = sockets.get(readI32le(p));

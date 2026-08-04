@@ -50,6 +50,7 @@ import { cellCircId, encodeDestroy, destroyRequested } from "./cell.wac";
 import { Link, feedLink, takeCell, sendCells, sliceOf, concat, itoa } from "./link.wac";
 import { socksReply, replyForEndReason, endReasonName, targetOf, requestLength,
          repOk, repFailure, repNotAllowed, repBadCommand, repBadAddress } from "./socks5.wac";
+import { Read } from "../../bytes/src/read.wac";
 
 /** Below the ring's sixteen slots: one `accept`, one relay `recv`, and one per client. */
 const i32 MAX_CLIENTS = 12;
@@ -94,7 +95,7 @@ struct Client {
   u8[] pending;
   /** Whether `read` is a live ticket. False while we are refusing to read, for backlog. */
   bool reading;
-  Pending<u8[]> read;
+  Pending<Read> read;
   /** The destination, kept from phase 1 so BEGIN can be sent once the circuit is up. */
   string target;
 }
@@ -189,7 +190,7 @@ export i32 main(Core core, Cli cli) {
   i32 nextCircId = 0x80000002;
   Pending<Socket> acc = cli.accept(listener.handle);
   bool accepting = true;
-  Pending<u8[]> linkRead = cli.recv(guard.link.sock);
+  Pending<Read> linkRead = cli.recv(guard.link.sock);
 
   while (true) {
     // The wait list, and beside it what each entry belongs to: -2 the guard, -1 the
@@ -213,7 +214,16 @@ export i32 main(Core core, Cli cli) {
 
     // ── The guard ────────────────────────────────────────────────────────────
     if (who == -2) {
-      if (!feedLink(guard.link, linkRead.wait())) {
+      bool linkLive = false;
+      match (linkRead.wait()) {
+        case Data(bytes): { linkLive = feedLink(guard.link, bytes); }
+        case End: { }
+        // A guard that closed and a guard whose connection failed are both fatal to this proxy, but
+        // an operator reading the log needs to know which — one is a relay going away, the other is
+        // the network under us.
+        case Failed(why): { core.warn("tor: the link to the guard failed: " + why); }
+      }
+      if (!linkLive) {
         core.warn("tor: the link to the guard is gone");
         break;
       }
@@ -339,9 +349,17 @@ export i32 main(Core core, Cli cli) {
 
     // ── A SOCKS client sent something ────────────────────────────────────────
     Client c = clients.get(who);
-    u8[] chunk = c.read.wait();
+    u8[] chunk = u8[0]();
+    bool gone = false;
+    match (c.read.wait()) {
+      case Data(bytes): { chunk = bytes; }
+      case End: { gone = true; }
+      // A client whose connection failed is dropped like one that closed; the warning is what
+      // distinguishes a browser that navigated away from a network that broke under it.
+      case Failed(why): { core.warn("tor: a client connection failed: " + why); gone = true; }
+    }
     c.reading = false;
-    if (chunk.len() == 0) {
+    if (gone) {
       dropClient(cli, guard, circuits, clients, who);
       if (!accepting) { acc = cli.accept(listener.handle); accepting = true; }
       continue;

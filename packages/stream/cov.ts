@@ -17,9 +17,11 @@ const verbose = Deno.args.includes("--verbose");
 const enc = new TextEncoder();
 
 const run = await instrument("packages/stream/src/transform.wac");
+const modRead = run.mod.Read as { Data(b: Uint8Array): unknown; End(): unknown };
 const m = run.mod as unknown as {
-  passthrough(read: () => Uint8Array, write: (b: Uint8Array) => boolean): number;
-  upperCase(read: () => Uint8Array, write: (b: Uint8Array) => boolean): number;
+  passthrough(read: () => unknown, write: (b: Uint8Array) => boolean): number;
+  Read: { Data(bytes: Uint8Array): unknown; End(): unknown; Failed(why: string): unknown };
+  upperCase(read: () => unknown, write: (b: Uint8Array) => boolean): number;
 };
 
 // One reader and one writer for the whole run, not a closure per call: bindgen keeps 16 slots per
@@ -29,11 +31,12 @@ let at = 0;
 let step = 1;
 let accept = true;
 
-function read(): Uint8Array {
+function read(): unknown {
   const n = Math.min(step, src.length - at);
+  if (n === 0) return modRead.End();
   const chunk = src.subarray(at, at + n);
   at += n;
-  return chunk;
+  return modRead.Data(chunk);
 }
 
 function write(): boolean {

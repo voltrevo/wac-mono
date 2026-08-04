@@ -23,6 +23,7 @@
 // what it hands over is the `GRANT_NONE` below, which is where to change that.
 
 import { Child, Cli, Core, FileResult, GRANT_NONE, Pending, Socket } from "../src/platform.wac";
+import { Read } from "../../bytes/src/read.wac";
 
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 2) {
@@ -88,8 +89,8 @@ export i32 main(Core core, Cli cli) {
  * nothing at all. The child's own end is what finishes it.
  */
 void relay(Core core, Cli cli, i32 net, i32 kid) {
-  Pending<u8[]> fromNet = cli.recv(net);
-  Pending<u8[]> fromKid = cli.recv(kid);
+  Pending<Read> fromNet = cli.recv(net);
+  Pending<Read> fromKid = cli.recv(kid);
   bool netDone = false;
 
   while (true) {
@@ -102,22 +103,36 @@ void relay(Core core, Cli cli, i32 net, i32 kid) {
     bool kidSpoke = netDone || which == 1;
 
     if (kidSpoke) {
-      u8[] out = fromKid.wait();
-      if (out.len() == 0) { return; }              // the handler has finished
-      if (!cli.send(net, out).wait()) { return; }  // the client hung up
-      fromKid = cli.recv(kid);
+      bool over = false;
+      match (fromKid.wait()) {
+        case Data(bytes): {
+          if (!cli.send(net, bytes).wait()) { return; }   // the client hung up
+          fromKid = cli.recv(kid);
+        }
+        case End: { over = true; }                       // the handler has finished
+        // A handler whose pipe broke has not finished, and serving what it managed as though it had
+        // is how a client gets half an answer with no indication.
+        case Failed(why): { core.warn("inetd: handler: " + why); over = true; }
+      }
+      if (over) { return; }
       continue;
     }
 
-    u8[] in = fromNet.wait();
-    if (in.len() == 0) {
+    bool clientDone = false;
+    match (fromNet.wait()) {
+      case Data(bytes): {
+        if (!cli.send(kid, bytes).wait()) { return; }
+        fromNet = cli.recv(net);
+      }
       // The client stopped talking. Tell the handler, and keep reading its answer.
+      case End: { clientDone = true; }
+      case Failed(why): { core.warn("inetd: client: " + why); clientDone = true; }
+    }
+    if (clientDone) {
       cli.closeFeed(kid);
       netDone = true;
       continue;
     }
-    if (!cli.send(kid, in).wait()) { return; }
-    fromNet = cli.recv(net);
   }
 }
 

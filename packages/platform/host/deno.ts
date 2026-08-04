@@ -36,6 +36,22 @@ export type DenoWorldOptions = {
 
 const EMPTY = new Uint8Array(0);
 
+/** A read answer, tagged: 0 data, 1 end, 2 failed. See `Read` in platform.wac. */
+function data(bytes: Uint8Array): Uint8Array {
+  const out = new Uint8Array(bytes.length + 1);
+  out[0] = 0;
+  out.set(bytes, 1);
+  return out;
+}
+const END = new Uint8Array([1]);
+function failed(why: string): Uint8Array {
+  const message = new TextEncoder().encode(why);
+  const out = new Uint8Array(message.length + 1);
+  out[0] = 2;
+  out.set(message, 1);
+  return out;
+}
+
 /** A `warn` payload as a line of a captured error stream: its bytes, then a newline. */
 function lineOf(p: Uint8Array): Uint8Array {
   const out = new Uint8Array(p.length + 1);
@@ -131,13 +147,9 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   // A program running inside this one: what it reads, what it writes, and where it stands.
   // `P` is applied to every path below and is the identity when nothing is pushed.
   const kids = new ChildStack();
-  // Empty until a read fails; `inputError` hands it back. See platform.wac.
-  let inputFailure = "";
-  // The same for the other two directions: a `write` that failed, and the last failure per socket.
-  // Recorded rather than only thrown, because `write` answers a bool and `recv` answers bytes —
-  // neither can carry a reason. See `outputError` and `socketError` in platform.wac.
+  // `write` answers a bool and cannot carry a reason, so this is recorded for `outputError`. The
+  // reads no longer need an equivalent: `Read` carries theirs.
   let outputFailure = "";
-  const socketFailure = new Map<number, string>();
   const P = (path: string) => kids.path(path);
 
   return {
@@ -297,23 +309,23 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       // A pushed child reads what it was fed and then end of input — never the parent's own
       // standard input, which would let a filter inside a shell swallow the terminal.
       const fed = source === null ? kids.readChunk() : null;
-      if (fed !== null) return fed;
-      if (source === null && readIn !== undefined) return await readIn();
+      if (fed !== null) return fed.length === 0 ? END : data(fed);
+      if (source === null && readIn !== undefined) {
+        const piped = await readIn();
+        return piped.length === 0 ? END : data(piped);
+      }
       try {
         const into = fresh();
         const n = source === null ? await Deno.stdin.read(into) : await source.read(into);
         // A short read is not the end; only null is.
-        return n === null ? EMPTY : into.subarray(0, n);
+        return n === null ? END : data(into.subarray(0, n));
       } catch (e) {
-        // Kept, not thrown: `readChunk` answers with bytes and cannot carry a reason, so a failed
-        // read looks exactly like the end of input until somebody asks `inputError`.
-        inputFailure = e instanceof Error ? e.message : String(e);
-        return EMPTY;
+        // The third state, said out loud. This used to answer with nothing, which the caller could
+        // only read as "finished".
+        return failed(e instanceof Error ? e.message : String(e));
       }
     },
-    [OP.INPUT_ERROR]: () => str(inputFailure),
     [OP.OUTPUT_ERROR]: () => str(outputFailure),
-    [OP.SOCKET_ERROR]: (p) => str(socketFailure.get(readI32le(p)) ?? ""),
 
     [OP.OPEN_OUTPUT]: async (p) => {
       const path = unstr(p);
@@ -355,26 +367,30 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       // Handle 0 is standard input. Handles count from 1, so it can never be a socket, and
       // giving stdin one means `waitAny` can watch it beside a socket — which is what a
       // relay like `nc` needs and could not express while stdin was only `readChunk`.
-      if (h === STDIN_HANDLE && readIn !== undefined) return await readIn();
+      if (h === STDIN_HANDLE && readIn !== undefined) {
+        const piped = await readIn();
+        return piped.length === 0 ? END : data(piped);
+      }
       const into = fresh();
       if (h === STDIN_HANDLE) {
         const n = await Deno.stdin.read(into);
-        return n === null ? EMPTY : into.subarray(0, n);
+        return n === null ? END : data(into.subarray(0, n));
       }
       const kid = children.get(h);
-      if (kid !== undefined) return await kid.out.next();
+      if (kid !== undefined) {
+        const fromChild = await kid.out.next();
+        return fromChild.length === 0 ? END : data(fromChild);
+      }
       const c = sockets.get(h);
-      if (c === undefined) throw new Error("not an open socket");
+      if (c === undefined) return failed("not an open socket");
       try {
         const n = await c.read(into);
-        // null is the peer closing, which is an answer and not a failure — so the recorded reason
-        // stays empty and `socketError` says "it ended".
-        return n === null ? EMPTY : into.subarray(0, n);
+        // null is the peer closing: an answer, not a failure.
+        return n === null ? END : data(into.subarray(0, n));
       } catch (e) {
-        // A reset or a timeout, which `recv` can only report as "nothing". Kept so the caller can
-        // tell a truncated stream from a complete one.
-        socketFailure.set(h, e instanceof Error ? e.message : String(e));
-        return EMPTY;
+        // A reset or a timeout. `recv` used to report this as "nothing", so a truncated stream and a
+        // complete one were the same answer.
+        return failed(e instanceof Error ? e.message : String(e));
       }
     },
     [OP.SEND]: async (p) => {

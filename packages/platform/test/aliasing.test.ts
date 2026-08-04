@@ -18,6 +18,23 @@ import { denoWorld } from "../host/deno.ts";
 import { i32le, readI32le, str } from "../host/call.ts";
 import { OP } from "../host/ops.ts";
 
+/**
+ * The bytes out of a `Read` payload: tag 0 is data, 1 is the end, 2 is a failure.
+ *
+ * These tests speak the wire format directly, so they see the tag that `provider.ts` decodes into a
+ * `Read`. Worth decoding rather than ignoring: a test that skipped the tag byte would pass while
+ * reporting one byte too many, and one that treated "end" as "no bytes" would loop for ever — which
+ * is exactly what the first version of this change did.
+ */
+function readBytes(p: Uint8Array): Uint8Array {
+  if (p.length === 0 || p[0] === 1) return new Uint8Array(0);
+  if (p[0] === 2) {
+    throw new Error(`the read failed: ${new TextDecoder().decode(p.subarray(1))}`);
+  }
+  return p.subarray(1);
+}
+
+
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
   if (got !== want) {
@@ -75,8 +92,8 @@ Deno.test("two concurrent recvs each get their own bytes", async () => {
       call(OP.RECV, i32le(ha)),
       call(OP.RECV, i32le(hb)),
     ]);
-    const sa = new TextDecoder().decode(ra);
-    const sb = new TextDecoder().decode(rb);
+    const sa = new TextDecoder().decode(readBytes(ra));
+    const sb = new TextDecoder().decode(readBytes(rb));
 
     assertEquals(/^A+$/.test(sa), true, `socket A's bytes were overlaid: ${sa.slice(0, 80)}`);
     assertEquals(/^B+$/.test(sb), true, `socket B's bytes were overlaid: ${sb.slice(0, 80)}`);
@@ -114,8 +131,8 @@ Deno.test("a recv and a chunked file read do not collide either", async () => {
       call(OP.READ_CHUNK),
       call(OP.RECV, i32le(hp)),
     ]);
-    const sf = new TextDecoder().decode(fromFile);
-    const sp = new TextDecoder().decode(fromPeer);
+    const sf = new TextDecoder().decode(readBytes(fromFile));
+    const sp = new TextDecoder().decode(readBytes(fromPeer));
 
     assertEquals(/^F+$/.test(sf), true, `the file read was overlaid: ${sf.slice(0, 80)}`);
     assertEquals(/^P+$/.test(sp), true, `the socket read was overlaid: ${sp.slice(0, 80)}`);

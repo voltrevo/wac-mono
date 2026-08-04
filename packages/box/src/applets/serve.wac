@@ -13,6 +13,7 @@ import { Args, has } from "../lib/args.wac";
 import { itoa } from "../lib/num.wac";
 import { concat, slice } from "../lib/bytes.wac";
 import { Served, serve as handle } from "../../../server/src/serve.wac";
+import { Read } from "../../../bytes/src/read.wac";
 
 export i32 serve(Core core, Cli cli, Args a) {
   i32 port = a.num == 0 ? 8080 : a.num;
@@ -42,9 +43,11 @@ void connection(Core core, Cli cli, i32 sock) {
     Served s = handle(buffered, core.nowMillis().wait());
     if (!s.ready) {
       // Not a whole request yet. More bytes, or the peer has gone.
-      u8[] chunk = cli.recv(sock).wait();
-      if (chunk.len() == 0) { return; }
-      buffered = concat(buffered, chunk);
+      match (cli.recv(sock).wait()) {
+        case Data(bytes): { buffered = concat(buffered, bytes); }
+        case End: { return; }
+        case Failed(why): { core.warn("serve: " + why); return; }
+      }
       continue;
     }
     if (!cli.send(sock, s.response).wait()) { return; }

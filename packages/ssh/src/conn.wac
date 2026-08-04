@@ -14,6 +14,7 @@ import { Buf } from "../../bytes/src/buf.wac";
 import { Cli, Core } from "../../platform/src/platform.wac";
 import { Framed, Status, frame, maxPacket, minBlock, paddingFor, unframe } from "./packet.wac";
 import { Opened, Plain, aeadPaddingFor, open, seal } from "./cipher.wac";
+import { Read } from "../../bytes/src/read.wac";
 
 /** Transport messages a peer may send at any point and neither end should mistake for a reply. */
 export i32 msgDisconnect() { return 1; }
@@ -50,12 +51,21 @@ export struct Conn {
     if (this.error == "") { this.error = why; }
   }
 
-  /** One `recv`, appended. False at end of stream. */
+  /**
+   * One `recv`, appended. False at end of stream — and `error` is set when it was not an end.
+   *
+   * The distinction is the difference between "the client hung up" and "the connection broke", which
+   * a server logs differently and which used to arrive here as the same empty chunk. Every caller
+   * already checks `failed()`, so nothing else had to change.
+   */
   bool fill(this) {
-    u8[] chunk = this.cli.recv(this.sock).wait();
-    if (chunk.len() == 0) { return false; }
-    this.buf.pushAll(chunk);
-    return true;
+    bool more = false;
+    match (this.cli.recv(this.sock).wait()) {
+      case Data(bytes): { this.buf.pushAll(bytes); more = true; }
+      case End: { }
+      case Failed(why): { this.fail(why); }
+    }
+    return more;
   }
 
   /** Send one payload, framed or sealed according to where the handshake has got to. */

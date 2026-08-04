@@ -18,6 +18,7 @@ import { itoa, itoa64 } from "../lib/num.wac";
 import { concat, slice } from "../lib/bytes.wac";
 import { Parsed, Request, parseRequest } from "../../../http/src/request.wac";
 import { Response, write as writeResponse } from "../../../http/src/response.wac";
+import { Read } from "../../../bytes/src/read.wac";
 
 export i32 httpd(Core core, Cli cli, Args a) {
   i32 port = a.num == 0 ? 8080 : a.num;
@@ -51,9 +52,13 @@ void connection(Core core, Cli cli, i32 sock, string root, bool isolate) {
   while (true) {
     match (parseRequest(buffered, 1 << 20)) {
       case Incomplete: {
-        u8[] chunk = cli.recv(sock).wait();
-        if (chunk.len() == 0) { return; }
-        buffered = concat(buffered, chunk);
+        // A client that vanished mid-request and a socket that failed are both "this connection is
+        // over", but only the second is worth a line in the log.
+        match (cli.recv(sock).wait()) {
+          case Data(bytes): { buffered = concat(buffered, bytes); }
+          case End: { return; }
+          case Failed(why): { core.warn("httpd: " + why); return; }
+        }
       }
       case Bad(code): {
         cli.send(sock, writeResponse(Response.create(400), "GET".toBytes(), false)).wait();

@@ -25,6 +25,7 @@
 
 import { Captured, Child, Cli, Core, FileResult, Pending, Socket, Stat }
   from "../../../platform/src/platform.wac";
+import { Read } from "../../../bytes/src/read.wac";
 import { Shell, runScript } from "../../src/exec.wac";
 
 /** A ticket is always ready here, and dropping one does nothing. */
@@ -117,9 +118,6 @@ Pending<Stat> fakeLinkStat(string path) { return fakeStat(path); }
 
 /** Nothing went wrong with the last write, and nothing with the last recv. */
 Pending<string> fakeOutputError() { return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop); }
-Pending<string> fakeSocketError(i32 handle) {
-  return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
-}
 Pending<Stat> fakeStat(string path) {
   i32 there = (path == "/bin/prog" || path == "/bin/badprog" || path == "/bin/goneprog"
                || path == "/bin/ghost") ? 1 : 0;
@@ -154,9 +152,14 @@ Pending<string> fakeRename(string from, string to) {
 Pending<string> fakeOpenInput(string path) {
   return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
 }
-u8[] fakeReadChunk() { return u8[0](); }
-/** Nothing went wrong; the input simply ended. */
-Pending<string> fakeInputError() { return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop); }
+/**
+ * A `Read`, always `End` — this fake filesystem has nothing to stream.
+ *
+ * The answer is built by a top-level resolver because a funcref cannot close over anything, which is
+ * the constraint this whole file is shaped by. `End` rather than `Data(empty)`: an empty `Data` is
+ * not a state the type admits.
+ */
+Read fakeReadChunk() { return Read.End; }
 Pending<string> fakeOpenOutput(string path) {
   return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
 }
@@ -171,7 +174,10 @@ Pending<Socket> fakeListen(i32 port) {
 Pending<Socket> fakeAccept(i32 handle) {
   return Pending.of(0, resolveSocket, alwaysSettled, ignoreDrop);
 }
-Pending<u8[]> fakeRecv(i32 handle) { return Pending.of(0, resolveBytes, alwaysSettled, ignoreDrop); }
+Read resolveEnd(i32 id) { return Read.End; }
+Pending<Read> fakeRecv(i32 handle) {
+  return Pending.of(0, resolveEnd, alwaysSettled, ignoreDrop);
+}
 Pending<bool> fakeSend(i32 handle, u8[] data) {
   return Pending.of(0, resolveFromId, alwaysSettled, ignoreDrop);
 }
@@ -243,7 +249,7 @@ Pending<Captured> fakePopChild() {
 Cli fakeCli() {
   return Cli.of(fakeArgCount, fakeArg, fakeEnv, fakeStdin, fakeWrite, fakeReadFile, fakeWriteFile,
                 fakeStat, fakeLinkStat, fakeReadDir, fakeMkdir, fakeRemove, fakeRename, fakeOpenInput,
-                fakeReadChunk, fakeInputError, fakeOutputError, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv, fakeSocketError,
+                fakeReadChunk, fakeOutputError, fakeOpenOutput, fakeConnect, fakeListen, fakeAccept, fakeRecv,
                 fakeSend, fakeCloseSocket, fakeSpawn, fakeCloseFeed, fakeExitCode,
                 fakeCwd, fakePushChild, fakePopChild);
 }
@@ -285,8 +291,19 @@ export i32 shWritten(string src) {
  */
 export i32 shTouchStubs() {
   Cli c = fakeCli();
-  i32 n = c.argCount().wait() + c.arg(0).wait().len() + c.readStdin().wait().len()
-        + c.readChunk().len();
+  i32 n = c.argCount().wait() + c.arg(0).wait().len() + c.readStdin().wait().len();
+  // Every state of a read, so the coverage driver touches all three arms rather than whichever one
+  // the fake happens to produce.
+  match (c.readChunk()) {
+    case Data(bytes): { n = n + bytes.len(); }
+    case End: { n++; }
+    case Failed(why): { n = n + why.len(); }
+  }
+  match (c.recv(1).wait()) {
+    case Data(bytes): { n = n + bytes.len(); }
+    case End: { n++; }
+    case Failed(why): { n = n + why.len(); }
+  }
   if (c.env("SET_IN_ENV").wait() is not null) { n++; }
   if (c.env("NOT_SET").wait() is null) { n++; }
   if (c.write(u8[0]())) { n++; }
@@ -297,10 +314,8 @@ export i32 shTouchStubs() {
   if (c.mkdir("d", true).wait() == "") { n++; }
   if (c.remove("d", true).wait() == "") { n++; }
   if (c.rename("a", "b").wait() == "") { n++; }
-  n += c.inputError().wait().len();
   n += c.openInput("x").wait().len() + c.openOutput("x").wait().len();
   n += c.connect("h", 1).wait().handle + c.listen(1).wait().handle + c.accept(1).wait().handle;
-  n += c.recv(1).wait().len();
   if (c.send(1, u8[0]()).wait()) { n++; }
   c.closeSocket(1);
 

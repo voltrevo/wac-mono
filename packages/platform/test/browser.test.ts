@@ -14,6 +14,23 @@ import { browserWorld, type DirHandle, type FileHandle } from "../host/browser.t
 import { i32le, readI32le, str, unstr } from "../host/call.ts";
 import { OP } from "../host/ops.ts";
 
+/**
+ * The bytes out of a `Read` payload: tag 0 is data, 1 is the end, 2 is a failure.
+ *
+ * These tests speak the wire format directly, so they see the tag that `provider.ts` decodes into a
+ * `Read`. Worth decoding rather than ignoring: a test that skipped the tag byte would pass while
+ * reporting one byte too many, and one that treated "end" as "no bytes" would loop for ever — which
+ * is exactly what the first version of this change did.
+ */
+function readBytes(p: Uint8Array): Uint8Array {
+  if (p.length === 0 || p[0] === 1) return new Uint8Array(0);
+  if (p[0] === 2) {
+    throw new Error(`the read failed: ${new TextDecoder().decode(p.subarray(1))}`);
+  }
+  return p.subarray(1);
+}
+
+
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
   if (got !== want) {
@@ -165,7 +182,7 @@ Deno.test("the browser world honours the capabilities a page can honour", async 
   let total = 0;
   let chunks = 0;
   for (;;) {
-    const c = await call(OP.READ_CHUNK);
+    const c = readBytes(await call(OP.READ_CHUNK));
     if (c.length === 0) break;
     total += c.length;
     chunks++;
@@ -348,9 +365,18 @@ Deno.test("the browser world refuses what a page cannot do", async () => {
   // The finding this whole exercise was for: a page has no TCP. `fetch` is not a socket
   // and neither is a WebSocket, so `connect` is absent rather than approximated — an
   // application gets an error it can report, not one protocol that works by accident.
-  for (const op of [OP.CONNECT, OP.LISTEN, OP.ACCEPT, OP.RECV, OP.SEND]) {
+  for (const op of [OP.CONNECT, OP.LISTEN, OP.ACCEPT, OP.SEND]) {
     await rejects(() => call(op, i32le(1)), "network access not granted");
   }
+  // `recv` answers rather than rejects, because its answer is a `Read` and "there is no network" is
+  // a `Failed` — a refusal the caller must handle, in the same shape as a connection that broke.
+  const refused = await call(OP.RECV, i32le(1));
+  assertEquals(refused[0], 2, "recv on a page answers Failed");
+  assertEquals(
+    new TextDecoder().decode(refused.subarray(1)).includes("network access"),
+    true,
+    new TextDecoder().decode(refused.subarray(1)),
+  );
 
   // No standard input, and no environment. Both are answers rather than errors, because
   // a program with nothing piped in and no variables set already handles them.

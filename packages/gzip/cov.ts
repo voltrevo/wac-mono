@@ -41,6 +41,7 @@ function ignoringTraps(call: () => unknown): void {
 // ── The compressor ────────────────────────────────────────────────────────────
 
 const gz = await instrument("packages/gzip/src/gzip.wac");
+const gzRead = gz.mod.Read as { Data(b: Uint8Array): unknown; End(): unknown };
 const gzipStored = gz.mod.gzipStored as (d: Uint8Array) => Uint8Array;
 const gzipFixed = gz.mod.gzipFixed as (d: Uint8Array) => Uint8Array;
 const gzipDynamic = gz.mod.gzipDynamic as (d: Uint8Array) => Uint8Array;
@@ -66,6 +67,8 @@ for (const n of [0, 1, 2, 3, 258, 65535, 65536, 131071]) {
 // ── The decompressor ──────────────────────────────────────────────────────────
 
 const inf = await instrument("packages/gzip/src/inflate.wac");
+/** `Read`'s variant constructors, from each instrumented module — a wac enum crosses as a class. */
+const infRead = inf.mod.Read as { Data(b: Uint8Array): unknown; End(): unknown };
 const gunzipBytes = inf.mod.gunzipBytes as (gz: Uint8Array) => Uint8Array;
 const inflate = inf.mod.inflate as (d: Uint8Array) => Uint8Array;
 
@@ -296,7 +299,7 @@ function uncoveredLines(): Set<string> {
 // buffer on nearly every call; a single huge chunk never exhausts it at all.
 
 const gunzipStream = inf.mod.gunzipStream as (
-  read: () => Uint8Array,
+  read: () => unknown,
   write: (b: Uint8Array) => boolean,
 ) => number;
 
@@ -306,7 +309,7 @@ let feedAt = 0;
 let sinkAccepts = true;
 
 function covRead(): Uint8Array {
-  return feedAt < feed.length ? feed[feedAt++] : new Uint8Array(0);
+  return feedAt < feed.length ? infRead.Data(feed[feedAt++]) : infRead.End();
 }
 
 function covWrite(): boolean {
@@ -420,7 +423,7 @@ for (let i = 0; i < goodStream.length; i += 5) stream(goodStream.slice(0, i), 1 
 // for the next block, which is a different path through the same code.
 
 const gzipStream = gz.mod.gzipStream as (
-  read: () => Uint8Array,
+  read: () => unknown,
   write: (b: Uint8Array) => boolean,
 ) => number;
 
@@ -428,7 +431,7 @@ let zfeed: Uint8Array[] = [];
 let zfeedAt = 0;
 
 function zcovRead(): Uint8Array {
-  return zfeedAt < zfeed.length ? zfeed[zfeedAt++] : new Uint8Array(0);
+  return zfeedAt < zfeed.length ? gzRead.Data(zfeed[zfeedAt++]) : gzRead.End();
 }
 
 function zcovWrite(): boolean {

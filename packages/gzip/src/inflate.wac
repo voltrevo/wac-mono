@@ -5,6 +5,7 @@
 // input must trap rather than read out of bounds or loop forever.
 
 import { Buf } from "../../bytes/src/buf.wac";
+import { Read } from "../../bytes/src/read.wac";
 import { Tables } from "./tables.wac";
 import { crc32, crc32Start, crc32Finish, crc32Update, crcTable8 } from "./crc32.wac";
 
@@ -34,16 +35,18 @@ struct BitReader {
   // it. This is the only difference between decoding a buffer and decoding a stream: the
   // decoder above never asks where a bit came from, so nothing else in the file changes
   // shape. `drained` remembers that the source said "no more", so it is asked once.
-  fn[u8[]()]? source;
+  fn[Read()]? source;
   bool drained;
+  /** Empty unless a read failed: the host's message, so a caller can say why it stopped. */
+  string broken;
 
   BitReader create(u8[] data, i32 start) {
-    return BitReader(data, start, 0, 0, null, false);
+    return BitReader(data, start, 0, 0, null, false, "");
   }
 
-  /** A reader fed by `source`, which returns an empty array to mean end of input. */
-  BitReader streaming(fn[u8[]()] source) {
-    return BitReader(u8[0](), 0, 0, 0, source, false);
+  /** A reader fed by `source`, which says whether it ended or broke. */
+  BitReader streaming(fn[Read()] source) {
+    return BitReader(u8[0](), 0, 0, 0, source, false, "");
   }
 
   /** Pull bytes in until at least `need` bits are buffered, or input runs out. */
@@ -54,10 +57,14 @@ struct BitReader {
         // pads with zeros, so this returns rather than trapping. Consuming those bits is
         // what traps, in `skip`.
         if ((this.source is null) || this.drained) { return; }
-        u8[] next = this.source!();
-        if (next.len() == 0) { this.drained = true; return; }
-        this.data = next;
-        this.pos = 0;
+        // A failed read is treated as the source being spent, and the *caller* is told through
+        // `broken` — trapping here would turn a disk error into an "invalid archive", which is a
+        // diagnosis of the wrong thing.
+        match (this.source!()) {
+          case Data(bytes): { this.data = bytes; this.pos = 0; }
+          case End: { this.drained = true; return; }
+          case Failed(why): { this.drained = true; this.broken = why; return; }
+        }
       }
       this.bitBuf |= this.data[this.pos] << this.bitCount;
       this.pos++;
@@ -137,10 +144,13 @@ struct BitReader {
       if (this.pos >= this.data.len()) {
         // Running out here is a truncated block, not a legitimate end of stream.
         if ((this.source is null) || this.drained) { trap; }
-        u8[] next = this.source!();
-        if (next.len() == 0) { this.drained = true; trap; }
-        this.data = next;
-        this.pos = 0;
+        match (this.source!()) {
+          case Data(bytes): { this.data = bytes; this.pos = 0; }
+          // Running out mid-block is a truncated archive; a failed read is a failed read. Both stop,
+          // and `broken` is what tells them apart afterwards.
+          case End: { this.drained = true; trap; }
+          case Failed(why): { this.drained = true; this.broken = why; trap; }
+        }
       }
       i32 n = this.data.len() - this.pos;
       if (n > left) { n = left; }
@@ -720,15 +730,19 @@ export u8[] gunzipBytes(u8[] gz) {
  * until it gets there, so it checksums as it goes and checks at the end. Same guarantees,
  * opposite order.
  *
- * `read` returns an empty array to mean end of input; `write` returns false to stop caring
- * about the rest. Returns 0 on success, and traps on a malformed member or a failed
- * integrity check, exactly as `gunzipBytes` does — returning data that failed its own
- * checksum would defeat the point of carrying one.
+ * `read` says whether the input ended or broke; `write` returns false to stop caring about the rest.
+ * **Returns 0 on success and 1 when the input failed**, and traps on a malformed member or a failed
+ * integrity check, exactly as `gunzipBytes` does — returning data that failed its own checksum would
+ * defeat the point of carrying one.
+ *
+ * A read that fails and a member that is truncated are different things, and only the first is worth
+ * reporting as an I/O error: the second is a corrupt archive. `Read` is what tells them apart, and
+ * before it existed both arrived as "no more bytes" and this trapped for either.
  *
  * The shape is the one `wac-mono/packages/stream` drives, so this streams through a
  * `wacTransformStream` with no glue.
  */
-export i32 gunzipStream(fn[u8[]()] read, fn[bool(u8[])] write) {
+export i32 gunzipStream(fn[Read()] read, fn[bool(u8[])] write) {
   BitReader br = BitReader.streaming(read);
 
   if (br.readByte() != 0x1F || br.readByte() != 0x8B) { trap; }   // magic
@@ -767,5 +781,7 @@ export i32 gunzipStream(fn[u8[]()] read, fn[bool(u8[])] write) {
 
   if (crc32Finish(out.crc) != wantCrc) { trap; }
   if (out.total() != wantSize) { trap; }
-  return 0;
+  // The member decoded and checked out. If the *source* broke along the way, that is a separate
+  // fact — one that a caller which just wrote the output somewhere needs before it reports success.
+  return br.broken == "" ? 0 : 1;
 }

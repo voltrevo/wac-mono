@@ -15,6 +15,7 @@
 
 import {
   IN_EOF,
+  IN_ERR,
   IN_HEAD,
   IN_SEQ,
   IN_TAIL,
@@ -113,7 +114,13 @@ export function wacTransformStream(options: TransformOptions): WacStream {
       signal(ctrl, IN_SEQ);                   // wake a transform waiting for input that will not come
     },
     abort() {
-      worker.terminate();
+      // A writable is aborted when whatever was feeding it failed, which is exactly the case the
+      // transform could not previously distinguish from a clean close. Say so, wake it, and let it
+      // return a nonzero status of its own accord — terminating the worker outright would lose both
+      // the status and any output already produced.
+      Atomics.store(ctrl, IN_ERR, 1);
+      Atomics.store(ctrl, IN_EOF, 1);
+      signal(ctrl, IN_SEQ);
     },
   });
 
@@ -164,12 +171,18 @@ export function wacTransformStream(options: TransformOptions): WacStream {
 //
 // Safe because the transform runs to completion synchronously before `runWhole` returns, so there
 // is never a second job in flight.
-let job: { input: Uint8Array; given: boolean; parts: Uint8Array[] } | null = null;
+let job: {
+  input: Uint8Array;
+  given: boolean;
+  parts: Uint8Array[];
+  Read: { Data(b: Uint8Array): unknown; End(): unknown };
+} | null = null;
 
-function readWhole(): Uint8Array {
-  if (job === null || job.given) return new Uint8Array(0);
+function readWhole(): unknown {
+  if (job === null) return null;
+  if (job.given) return job.Read.End();
   job.given = true;
-  return job.input;
+  return job.Read.Data(job.input);
 }
 
 function writeWhole(b: Uint8Array): boolean {
@@ -181,11 +194,18 @@ export async function runWhole(options: TransformOptions, input: Uint8Array): Pr
   const { wacBind } = await import("../../../harness/wacBind.ts");
   const mod = await wacBind(options.modulePath) as unknown as Record<string, unknown>;
   const transform = mod[options.entry] as (
-    read: () => Uint8Array,
+    read: () => unknown,
     write: (b: Uint8Array) => boolean,
   ) => number;
 
-  job = { input, given: false, parts: [] };
+  // The variant constructors come from the module being driven, since a wac enum crosses as a class
+  // with one static per variant — and a source on this side must now say which state it means.
+  job = {
+    input,
+    given: false,
+    parts: [],
+    Read: mod.Read as { Data(b: Uint8Array): unknown; End(): unknown },
+  };
   const status = transform(readWhole, writeWhole);
   const parts = job.parts;
   job = null;

@@ -21,6 +21,7 @@ import { recordLength } from "../../../tls/src/record.wac";
 import { tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientClose,
          tlsClientPhase, tlsClientFailure } from "../../../tls/src/client.wac";
 import { Incoming, ParsedResponse, parseResponse } from "../../../http/src/incoming.wac";
+import { Read } from "../../../bytes/src/read.wac";
 
 /** `[state][toSend][appData]`, each behind a big-endian u32 length. */
 struct Step { u8[] state; u8[] toSend; u8[] appData; }
@@ -101,9 +102,17 @@ export i32 gets(Core core, Cli cli, Args a) {
       requested = true;
     }
 
-    u8[] chunk = cli.recv(sock.handle).wait();
-    if (chunk.len() == 0) { break; }          // the peer closed
-    buffered = concat(buffered, chunk);
+    bool closed = false;
+    match (cli.recv(sock.handle).wait()) {
+      case Data(bytes): { buffered = concat(buffered, bytes); }
+      case End: { closed = true; }            // the peer closed
+      case Failed(why): {
+        core.warn(a.name + ": " + host + ": " + why);
+        cli.closeSocket(sock.handle);
+        return 1;
+      }
+    }
+    if (closed) { break; }
 
     // Feed whole records only. A record's length is in its first five bytes, so a partial
     // one has to wait — handing the state machine half a record is how a reader that

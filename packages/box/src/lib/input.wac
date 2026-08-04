@@ -39,18 +39,25 @@ export Input readInput(Core core, Cli cli, Args a, i32 n) {
 }
 
 /**
- * Whether the stream that just stopped had actually finished — ask once, after the chunks run out.
+ * One chunk, for the applets whose loop is "read, work, repeat".
  *
- * `readChunk` answers with bytes, so it has no way to say "the read failed" and says "nothing left"
- * instead. Every filter here therefore treated a disk that gave out halfway as a complete input and
- * exited 0, having written half an answer: the failure mode where the program is the last thing
- * anybody suspects. `inputError` is the reason, and this is the one line each applet needs.
+ * `Read` has three states and every caller has to handle all three, which is the point — the old
+ * `u8[]` answer let "finished" and "broken" look identical, and the first fix for that was a
+ * companion `inputError()` to ask afterwards, which any forgetful caller simply did not ask.
  *
- * Reports and answers false when the input broke, so a caller can `return 1` and be done.
+ * This keeps that exhaustiveness while giving the eight filters here one shape: `ok` false with a
+ * message already reported means stop and exit 1; `ok` true with no bytes means the input finished.
  */
-export bool inputEnded(Core core, Cli cli, Args a) {
-  string err = cli.inputError().wait();
-  if (err == "") { return true; }
-  core.warn(a.name + ": " + err);
-  return false;
+export struct Chunk { bool ok; bool more; u8[] bytes; }
+
+/** The next chunk, reporting a failure to standard error as it goes. */
+export Chunk nextChunk(Core core, Cli cli, Args a) {
+  match (cli.readChunk()) {
+    case Data(bytes): { return Chunk(true, true, bytes); }
+    case End: { return Chunk(true, false, u8[0]()); }
+    case Failed(why): {
+      core.warn(a.name + ": " + why);
+      return Chunk(false, false, u8[0]());
+    }
+  }
 }

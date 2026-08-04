@@ -5,7 +5,7 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, openStream, inputEnded } from "../lib/input.wac";
+import { Chunk, Input, openStream, nextChunk } from "../lib/input.wac";
 import { crc32Start, crc32Update, crc32Finish, crcTable8 } from "../../../gzip/src/crc32.wac";
 
 export i32 crc32(Core core, Cli cli, Args a) {
@@ -15,8 +15,10 @@ export i32 crc32(Core core, Cli cli, Args a) {
   u32[] table = crcTable8();
   u32 acc = crc32Start();
   while (true) {
-    u8[] chunk = cli.readChunk();
-    if (chunk.len() == 0) { if (!inputEnded(core, cli, a)) { return 1; } break; }
+    Chunk got = nextChunk(core, cli, a);
+    if (!got.ok) { return 1; }
+    if (!got.more) { break; }
+    u8[] chunk = got.bytes;
     acc = crc32Update(table, acc, chunk);
   }
 

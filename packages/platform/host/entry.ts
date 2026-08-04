@@ -45,6 +45,8 @@ export type AppModule = {
   Child: { of(...a: unknown[]): unknown };
   Captured: { of(...a: unknown[]): unknown };
   Pending$Captured: { of(...a: unknown[]): unknown };
+  Read: { Data(...a: unknown[]): unknown; End(): unknown; Failed(...a: unknown[]): unknown };
+  Pending$Read: { of(...a: unknown[]): unknown };
   main: (core: unknown, cli: unknown) => number;
 
   // Only an interactive browser application has these, and bindgen emits a class only for a
