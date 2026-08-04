@@ -10,6 +10,14 @@
 // application contract had to be made twice.
 //
 // The build costs a few hundred milliseconds. Worth it to be running the thing itself.
+//
+// **What this cannot promise is that killing it kills the application.** It spawns the built artifact
+// as a child and forwards `SIGINT` and `SIGTERM`, so Ctrl-C and an ordinary `kill` reach the program.
+// `SIGKILL` cannot be caught by anyone, so a caller that must be *certain* the application dies with
+// its launcher should build once and run the artifact directly — which is faster anyway when a test
+// starts several of them. `packages/ssh`'s server tests do exactly that, after this gap left 57
+// orphaned servers and 13,736 zombies behind them against a container limit of 14,180 process ids.
+// Issue 0017.
 
 import { buildApp, type Grants, type Target } from "./build.ts";
 
@@ -61,7 +69,30 @@ try {
   const cmd = target === "node"
     ? new Deno.Command("node", { args: [built, ...appArgs], ...stdio })
     : new Deno.Command(built, { args: appArgs, ...stdio });
-  code = cmd.outputSync().code;
+
+  // Spawned and awaited rather than `outputSync`, so that a signal arriving here can be passed on.
+  // `outputSync` blocks the isolate outright: the listeners below would never run, and killing this
+  // launcher left the application alive with no handle left to stop it.
+  const child = cmd.spawn();
+  const forward = (sig: Deno.Signal) => {
+    try {
+      child.kill(sig);
+    } catch {
+      // Already gone. A signal racing the child's own exit is the ordinary case, not a problem.
+    }
+  };
+  const onInt = () => forward("SIGINT");
+  const onTerm = () => forward("SIGTERM");
+  Deno.addSignalListener("SIGINT", onInt);
+  Deno.addSignalListener("SIGTERM", onTerm);
+  try {
+    code = (await child.status).code;
+  } finally {
+    // Removed, or this process never exits: a signal listener keeps Deno's event loop alive, and the
+    // `Deno.exit` below would be reached with two of them still registered.
+    Deno.removeSignalListener("SIGINT", onInt);
+    Deno.removeSignalListener("SIGTERM", onTerm);
+  }
 } finally {
   await Deno.remove(built).catch(() => {});
 }

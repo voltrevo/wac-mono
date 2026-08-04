@@ -1,0 +1,32 @@
+// A program that does not end by itself.
+//
+//   waiter [millis]
+//
+// Prints one line, then sleeps until somebody stops it — a minute at a time, so that a stopped one
+// is a stopped one and not a program that quietly gave up while nobody was looking.
+//
+// It exists to be *killed*. `deno task app` builds an application and spawns it, and until wac-mono
+// issue 0017 nothing forwarded signals: killing the launcher left the application running with no
+// handle left to stop it, which is invisible for a program that ends on its own and permanent for one
+// that does not. `platform/test/app.test.ts` starts this through the launcher, kills the launcher, and
+// looks for a survivor.
+//
+// The first line matters as much as the sleeping. A test that only killed the launcher could not tell
+// "the child was reaped" from "the child never started", and both look like a passing test.
+
+import { Cli, Core } from "../src/platform.wac";
+
+export i32 main(Core core, Cli cli) {
+  core.log("waiter: running");
+
+  // Sixty seconds at a time, for as long as anyone lets it. A single enormous sleep would be the same
+  // thing until the test is slow, and then it would be a test that hangs rather than one that fails.
+  for (i32 i = 0; i < 60; i++) {
+    core.sleepMillis(60000).wait();
+  }
+
+  // An hour without being stopped is a failure of whatever was supposed to stop it, and saying so is
+  // cheaper than a silent success.
+  core.warn("waiter: nobody stopped me");
+  return 1;
+}

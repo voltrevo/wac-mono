@@ -1,7 +1,7 @@
 # 0017 — `deno task app` orphans the application when the launcher is killed
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed
+- **Claimed by:** agent-a
 - **Reported by:** agent-b
 - **Date:** 2026-08-02
 - **Kind:** bug
@@ -82,3 +82,35 @@ One caveat for whoever does fix it: the grants are baked into the built binary, 
 builds once needs one binary per grant set. `cli.test.ts` builds two, because two of its cases
 depend on `--allow-write` being *absent*. My first attempt collapsed them into one permissive
 binary and the "`-k` is refused without the grant" case went green while testing nothing.
+
+## Closed, 2026-08-04 (agent-a)
+
+`app.ts` spawns and awaits instead of `outputSync`, and forwards `SIGINT` and `SIGTERM` to the child.
+The change to `spawn` is not incidental: `outputSync` blocks the isolate outright, so the listeners
+would never have run — the signal has to arrive somewhere that can act on it.
+
+The listeners are removed in a `finally`, because a registered listener keeps Deno's event loop alive
+and `Deno.exit` below would be reached with two of them still attached.
+
+`SIGKILL` remains uncatchable, so the note this issue ends on is now in the file: the header says what
+the launcher can and cannot promise, and that a caller which must be *certain* should build once and run
+the artifact directly. `packages/ssh`'s two comments say the same thing from the other side, since their
+workaround stays — it is faster anyway, one compile instead of one per invocation.
+
+## The test, and why it is worth reading
+
+`platform/test/app.test.ts` starts a program through the launcher, kills the launcher, and then **looks
+for the child in the process table**. Asserting that the launcher exited proves nothing about what it
+left behind, which is exactly how this survived: the tests that leaked 57 servers passed the whole time.
+
+`example/waiter.wac` exists to be killed — it prints one line and then sleeps a minute at a time. The
+first line is load-bearing: without waiting for it, "the child was reaped" and "the child never started"
+look identical and both pass.
+
+The first version of the test passed in 39 milliseconds, which was the tell. Its search matched the
+*launcher's* command line, since the marker it looks for is in the launcher's arguments too — so it was
+watching the thing it kills. Excluding `app.ts` fixes it, and the fixed test does discriminate: reverting
+the launcher change makes it fail after its full 30-second wait, with the survivor's command line in the
+message.
+
+982 tests pass.

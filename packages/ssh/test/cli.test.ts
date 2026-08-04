@@ -49,12 +49,11 @@ async function makeHome(s: Server, knownHost: boolean): Promise<string> {
 /**
  * The client, built once as a standalone program.
  *
- * Not `platform/app.ts` per invocation, which builds and then *spawns* the result: it waits with
- * `outputSync` and forwards no signals, so the launcher exiting leaves the application running
- * with nothing to reap it. `server.test.ts` already says this about the *server* binary and does
- * the right thing; the client calls here were left behind, and they leaked a launcher-plus-app
- * pair on every run. Eleven were sitting on this machine, all parented by init, the oldest nearly
- * five hours old. See wac-mono issue 0017.
+ * Not `platform/app.ts` per invocation, which builds and then *spawns* the result. It forwards
+ * `SIGINT` and `SIGTERM` to that child now (issue 0017 — it forwarded nothing, and eleven
+ * launcher-plus-app pairs were sitting on this machine parented by init, the oldest nearly five hours
+ * old), but `SIGKILL` cannot be caught by anyone, so a test that must be *certain* nothing survives
+ * still runs the artifact directly.
  *
  * Building once is also just faster: one compile instead of one per invocation.
  */
@@ -74,11 +73,10 @@ async function buildSsh(extra: string[]): Promise<string> {
 /**
  * The client, built once per grant set rather than launched through `platform/app.ts` each time.
  *
- * `app.ts` builds and then *spawns* the result: it waits with `outputSync` and forwards no
- * signals, so the launcher exiting leaves the application running with nothing to reap it. Eleven
- * of those were sitting on this machine, all parented by init, the oldest nearly five hours old.
- * `server.test.ts` already avoided it for the server binary; these client calls were left behind.
- * See wac-mono issue 0017.
+ * `app.ts` builds and then *spawns* the result, and forwards `SIGINT` and `SIGTERM` to it since issue
+ * 0017 — before that it forwarded nothing, and eleven launcher-plus-app pairs were left on this
+ * machine, parented by init, the oldest nearly five hours old. `SIGKILL` is still uncatchable, so
+ * running the artifact directly is what makes a test certain rather than merely tidy.
  *
  * **Two binaries, because the grants are the point of two of these tests.** They are baked in at
  * build time, so a single permissive binary would quietly pass the case that checks `-k` is
