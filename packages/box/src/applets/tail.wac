@@ -7,7 +7,8 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
-import { Line, Lines, emit, nextLine } from "../lib/reader.wac";
+import { Line, Lines, emitTo, nextLine } from "../lib/reader.wac";
+import { Sink } from "../lib/out.wac";
 
 export i32 tail(Core core, Cli cli, Args a) {
   Input in = openStream(core, cli, a, 0);
@@ -29,11 +30,13 @@ export i32 tail(Core core, Cli cli, Args a) {
 
   // Oldest first: when fewer lines arrived than the ring holds, that is index 0; once it
   // has wrapped, it is wherever the next write would have gone.
+  Sink out = Sink.create(cli);
   i32 take = seen < want ? seen : want;
   i32 first = seen < want ? 0 : seen % want;
   for (i32 i = 0; i < take; i++) {
     i32 k = (first + i) % want;
-    emit(cli, ring[k], terminated[k]);
+    if (!emitTo(out, ring[k], terminated[k])) { return 0; }
   }
+  out.flush();
   return 0;
 }

@@ -15,6 +15,7 @@
 // `scanned` watermark for the search make both halves linear.
 
 import { Cli } from "../../../platform/src/platform.wac";
+import { Sink } from "./out.wac";
 import { slice } from "./bytes.wac";
 import { Buf } from "../../../bytes/src/buf.wac";
 
@@ -90,6 +91,20 @@ export Line nextLine(Lines s, Cli cli) {
     }
   }
   return Line(false, u8[0](), false);
+}
+
+/**
+ * A line into a `Sink`, terminated only if the one it came from was.
+ *
+ * The buffered twin of `emit` below, and the one to use in a loop: a `write` per line is a park and a
+ * wake per line, which cost `seq` fourteen seconds for two hundred thousand of them (issue 0039).
+ * Answers false once the reader has gone away, so a filter stops rather than producing into nothing.
+ *
+ * `emit` stays for the handful of places that write once and return.
+ */
+export bool emitTo(Sink out, u8[] line, bool nl) {
+  if (!nl) { return out.bytes(line); }
+  return out.lineBytes(line);
 }
 
 /** A line, terminated only if the one it came from was. */

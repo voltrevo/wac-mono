@@ -1,0 +1,97 @@
+// Output in blocks, because a write is a round trip.
+//
+// `cli.write` parks this worker on `Atomics.wait` until the host answers. That is fine once and
+// ruinous per line: `box seq 1 200000` spent **14.5 seconds** making two hundred thousand of them,
+// where GNU `seq` takes two milliseconds and the arithmetic is not the difference. Issue 0039.
+//
+// It used to be hidden. An applet called *in process* by the shell wrote into a buffer in the same
+// wasm instance — a function call — and only became a bridge crossing when the shell started running
+// its applets as real spawned children. Every real program buffers for this reason; it is what
+// `stdio` is.
+//
+// ## Using it
+//
+//     Sink out = Sink.create(cli);
+//     while (…) { if (!out.line(text)) { break; } }
+//     out.flush();
+//
+// **Every path out of an applet has to flush.** There are no destructors here, so a forgotten flush
+// is a program that prints nothing — a worse bug than a slow one. What keeps that honest is
+// `test/box.test.ts`, which compares against the real tool byte for byte: a missing flush is an empty
+// answer where GNU has output, and it fails loudly rather than drifting.
+//
+// ## Why the answer matters
+//
+// `write` answers false when the other end has gone away, and `box yes` is written as
+// `while (cli.write(block)) {}` precisely so that it stops. A buffer must pass that on rather than
+// swallowing it, so every method here answers "keep going", and once a write has been refused the
+// sink is `broken` and stays that way — a producer that ignores the answer would otherwise fill
+// memory with output nobody will read.
+
+import { Cli } from "../../../platform/src/platform.wac";
+import { Buf } from "../../../bytes/src/buf.wac";
+
+/**
+ * How much to hold before writing it out.
+ *
+ * 64 KiB, which is `CHUNK` in the bridge — what a read answers with at most, and the size the ring
+ * is built to move. Larger buys nothing because the host splits it again; much smaller gives the
+ * round trips back.
+ */
+i32 BLOCK() { return 65536; }
+
+export struct Sink {
+  Cli cli;
+  Buf held;
+  /** A write was refused: the reader has gone. Nothing more will be sent. */
+  bool broken;
+
+  Sink create(Cli cli) { return Sink(cli, Buf.create(), false); }
+
+  /** Bytes, exactly as given. False once the reader has gone away. */
+  bool bytes(this, u8[] b) {
+    if (this.broken) { return false; }
+    this.held.pushAll(b);
+    if (this.held.len >= BLOCK()) { return this.flush(); }
+    return true;
+  }
+
+  /** A line and its newline — what `core.log` did, without the round trip. */
+  bool line(this, string text) {
+    if (this.broken) { return false; }
+    this.held.pushAll(text.toBytes());
+    this.held.push('\n');
+    if (this.held.len >= BLOCK()) { return this.flush(); }
+    return true;
+  }
+
+  /**
+   * Bytes and a newline, for a line that is not text.
+   *
+   * Separate from `line` because a line of a file is bytes: decoding it to a string to add a newline
+   * would mangle anything that is not valid UTF-8, which is the bug `emit` was written to avoid.
+   */
+  bool lineBytes(this, u8[] b) {
+    if (this.broken) { return false; }
+    this.held.pushAll(b);
+    this.held.push('\n');
+    if (this.held.len >= BLOCK()) { return this.flush(); }
+    return true;
+  }
+
+  /**
+   * Send what is held. False if the write was refused, and then this sink is finished.
+   *
+   * Safe to call with nothing held, and safe to call twice — an applet with several ways out should
+   * flush on each of them rather than reasoning about which one already did.
+   */
+  bool flush(this) {
+    if (this.broken) { return false; }
+    if (this.held.len == 0) { return true; }
+    if (!this.cli.write(this.held.take())) {
+      this.broken = true;
+      return false;
+    }
+    return true;
+  }
+}

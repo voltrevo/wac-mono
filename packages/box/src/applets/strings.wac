@@ -5,6 +5,7 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
+import { Sink } from "../lib/out.wac";
 import { Chunk, Input, openStream, nextChunk } from "../lib/input.wac";
 import { Buf } from "../../../bytes/src/buf.wac";
 
@@ -13,28 +14,36 @@ export i32 strings(Core core, Cli cli, Args a) {
   if (!in.ok) { return 1; }
   i32 min = a.hasNum ? a.num : 4;
 
+  Sink out = Sink.create(cli);
   Buf run = Buf.create();
   while (true) {
     Chunk got = nextChunk(core, cli, a);
-    if (!got.ok) { return 1; }
+    if (!got.ok) { out.flush(); return 1; }
     if (!got.more) { break; }
     u8[] data = got.bytes;
     for (i32 i = 0; i < data.len(); i++) {
       i32 b = data[i];
       if (b >= 32 && b < 127) { run.push(b); continue; }
-      emit(cli, run, min);
+      emit(out, run, min);
     }
   }
-  emit(cli, run, min);
+  emit(out, run, min);
+  out.flush();
   return 0;
 }
 
-/** The run so far, if it is long enough, and reset either way. */
-void emit(Cli cli, Buf run, i32 min) {
+/**
+ * The run so far, if it is long enough, and reset either way.
+ *
+ * Its own `emit` rather than `reader.wac`'s: this one decides *whether* to emit, from a length, and
+ * the third argument is that length rather than a newline flag. Buffered through a `Sink` for the
+ * reason issue 0039 gives — a binary of any size has a great many short runs in it.
+ */
+void emit(Sink into, Buf run, i32 min) {
   if (run.len >= min) {
-    u8[] out = u8[run.len + 1](fill: '\n');
-    out.copyFrom(run.data, 0, 0, run.len);
-    cli.write(out);
+    u8[] line = u8[run.len](fill: 0);
+    line.copyFrom(run.data, 0, 0, run.len);
+    into.lineBytes(line);
   }
   run.len = 0;
 }
