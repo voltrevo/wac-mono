@@ -17,6 +17,16 @@ export type KnownSurvivor = { name: string; why: string };
 
 export const KNOWN_SURVIVORS: KnownSurvivor[] = [
   {
+    name: "extreme/bls/fp/isEvenRaw",
+    why:
+      "Binary extended GCD's halving test. Forcing it false removes every halving step, which " +
+      "leaves plain subtractive Euclid — still correct, because the invariant x1·a ≡ u (mod p) is " +
+      "preserved by the subtraction steps alone, and still fast, because Euclid's quotients are " +
+      "small on average. Verified: the 32 inversion vectors pass in 51ms with it gutted. A genuine " +
+      "equivalent mutant on correctness, differing only in worst-case speed, which no vector can " +
+      "distinguish.",
+  },
+  {
     name: "guard/crypto/rsa:54:23",
     why:
       "toBytes' overflow guard, which fires when a value does not fit the length it is " +

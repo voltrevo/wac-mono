@@ -18,7 +18,7 @@
 
 import { fpZero, fpOne } from "./fp.wac";
 import { Fp2, fp2Add, fp2Sub, fp2Mul, fp2Square, fp2Neg, fp2Zero, fp2One, fp2IsZero, fp2Equals,
-         fp2Copy, fp2Invert, fp2Sqrt, fp2Sgn0, fp2Inv0, fp2IsSquare } from "./fp2.wac";
+         fp2Copy, fp2Invert, fp2Sqrt, fp2Sgn0, fp2Inv0 } from "./fp2.wac";
 import { G2, g2Add, g2Mul, g2Double, g2Negate, g2Psi,
          absX as absXScalar } from "./g2.wac";
 import { hashToFieldFp2 } from "./hash.wac";

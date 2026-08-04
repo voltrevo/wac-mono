@@ -30,7 +30,7 @@ import { G1, g1FromBytes, g1Generator, g1Negate, g1IsInfinity, g1AffineX, g1Affi
 import { G2, g2FromBytes, g2IsInfinity, g2AffineX, g2AffineY,
          g2Add, g2Mul, g2Infinity, g2Compress } from "./g2.wac";
 import { Fp2 } from "./fp2.wac";
-import { Pair, millerLoop, millerLoopTwo, millerLoopMulti, finalExponentiate } from "./pairing.wac";
+import { Pair, millerLoopMulti, finalExponentiate } from "./pairing.wac";
 import { hashToG2 } from "./map.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
 
@@ -43,16 +43,6 @@ export u8[] ethDst() {
   u8[] out = u8[DST.len()]();
   for (i32 i = 0; i < DST.len(); i++) { out[i] = DST[i]; }
   return out;
-}
-
-/** One Miller loop for an affine pair, or null if either point is the identity. */
-Fp12? loopFor(G1 p, G2 q) {
-  u32[]? px = g1AffineX(p);
-  u32[]? py = g1AffineY(p);
-  Fp2? qx = g2AffineX(q);
-  Fp2? qy = g2AffineY(q);
-  if ((px is null) || (py is null) || (qx is null) || (qy is null)) { return null; }
-  return millerLoop(px!, py!, qx!, qy!);
 }
 
 /**
@@ -250,7 +240,7 @@ export bool aggregateVerify(u8[][] pubkeys, u8[][] messages, u8[] signature) {
  * scalar multiplication costs its bit length — full-width scalars would make batching slower than
  * verifying one at a time.
  */
-u32[] batchScalar(u8[] transcript, i32 i) {
+export u32[] batchScalar(u8[] transcript, i32 i) {
   u8[] tagged = u8[transcript.len() + 4]();
   for (i32 j = 0; j < transcript.len(); j++) { tagged[j] = transcript[j]; }
   tagged[transcript.len() + 0] = (i >> 24) & 0xFF;
@@ -273,7 +263,7 @@ u32[] batchScalar(u8[] transcript, i32 i) {
 }
 
 /** Everything the batch commits to, in order, so no term's weight can be chosen after the fact. */
-u8[] batchTranscript(u8[][] pubkeys, u8[][] messages, u8[][] signatures, u8[] entropy) {
+export u8[] batchTranscript(u8[][] pubkeys, u8[][] messages, u8[][] signatures, u8[] entropy) {
   i32 total = entropy.len();
   for (i32 i = 0; i < pubkeys.len(); i++) {
     total = total + pubkeys[i].len() + messages[i].len() + signatures[i].len();

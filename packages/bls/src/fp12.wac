@@ -37,7 +37,6 @@ export struct Fp12 {
 
 export Fp6 fp6Zero() { return Fp6(fp2Zero(), fp2Zero(), fp2Zero()); }
 export Fp6 fp6One() { return Fp6(fp2One(), fp2Zero(), fp2Zero()); }
-export bool fp6IsZero(Fp6 a) { return fp2IsZero(a.c0) && fp2IsZero(a.c1) && fp2IsZero(a.c2); }
 export bool fp6Equals(Fp6 a, Fp6 b) {
   return fp2Equals(a.c0, b.c0) && fp2Equals(a.c1, b.c1) && fp2Equals(a.c2, b.c2);
 }
@@ -243,7 +242,6 @@ export Fp6 fp6Frobenius(Fp6 a, i32 n) {
 
 export Fp12 fp12Zero() { return Fp12(fp6Zero(), fp6Zero()); }
 export Fp12 fp12One() { return Fp12(fp6One(), fp6Zero()); }
-export bool fp12IsZero(Fp12 a) { return fp6IsZero(a.c0) && fp6IsZero(a.c1); }
 export bool fp12Equals(Fp12 a, Fp12 b) {
   return fp6Equals(a.c0, b.c0) && fp6Equals(a.c1, b.c1);
 }

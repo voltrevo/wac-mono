@@ -32,6 +32,9 @@ const mod = await wacBind("packages/bls/test/wac/probe.wac") as unknown as {
     entropy: Uint8Array,
   ): boolean;
   blsVerify(pk: Uint8Array, msg: Uint8Array, sig: Uint8Array): boolean;
+  blsBatchScalar(
+    pks: Uint8Array[], msgs: Uint8Array[], sigs: Uint8Array[], entropy: Uint8Array, i: number,
+  ): Uint32Array;
 };
 
 const bytes = (h: string) =>
@@ -173,4 +176,56 @@ Deno.test("aggregation refuses an empty list and a bad member, and round-trips o
   if (hex(agg) !== hex(sig)) {
     throw new Error(`aggregating one signature changed it\n  in  ${hex(sig)}\n  out ${hex(agg)}`);
   }
+});
+
+Deno.test("a batch weight depends on the whole batch, not just its position", async () => {
+  // Gutting `batchTranscript` to return nothing survived a mutation sweep: with an empty transcript
+  // the weights become `H(i)`, still non-trivial and still enough to reject the vendored forged set —
+  // but *predictable*, which is precisely what the weights exist to prevent. An adversary who knows
+  // the implementation can then choose a forgery that survives the product.
+  //
+  // No fixture can catch that, because catching it needs an adversary who adapts to the weights. So
+  // the property is asserted directly: change any part of the batch and the weights must move.
+  const cases = await load("eth_batch_verify") as Record<
+    string,
+    { input: { pubkeys: string[]; messages: string[]; signatures: string[] }; output: boolean }
+  >;
+  const c = Object.values(cases).find((x) => x.output && x.input.pubkeys.length >= 2);
+  if (c === undefined) throw new Error("no valid multi-signature fixture");
+  const pks = c.input.pubkeys.map(bytes);
+  const msgs = c.input.messages.map(bytes);
+  const sigs = c.input.signatures.map(bytes);
+  const w = (p = pks, m = msgs, s = sigs, e = NO_ENTROPY, i = 0) =>
+    Array.from(mod.blsBatchScalar(p, m, s, e, i)).join(",");
+
+  const base = w();
+  if (base === "0,0") throw new Error("the weight is zero, which would drop the term entirely");
+
+  // Every input to the transcript must move it. A flipped bit in any of the three lists, or in the
+  // entropy, or a different index.
+  const flip = (list: Uint8Array[], at: number) => {
+    const copy = list.map((x) => x.slice());
+    copy[at][0] ^= 1;
+    return copy;
+  };
+  const moved: [string, string][] = [
+    ["a public key", w(flip(pks, 0))],
+    ["a later public key", w(flip(pks, 1))],
+    ["a message", w(pks, flip(msgs, 0))],
+    ["a signature", w(pks, msgs, flip(sigs, 0))],
+    ["a later signature", w(pks, msgs, flip(sigs, 1))],
+    ["the entropy", w(pks, msgs, sigs, new Uint8Array([7]))],
+    ["the term index", w(pks, msgs, sigs, NO_ENTROPY, 1)],
+  ];
+  for (const [what, got] of moved) {
+    if (got === base) {
+      throw new Error(
+        `changing ${what} left the weight unchanged — the batch is not bound into it, so the ` +
+          `weights are predictable and the forgery defence is gone`,
+      );
+    }
+  }
+  // Distinct weights per term, too: identical weights would collapse the batch to an unweighted sum.
+  const perTerm = new Set([0, 1].map((i) => w(pks, msgs, sigs, NO_ENTROPY, i)));
+  if (perTerm.size !== 2) throw new Error("terms 0 and 1 got the same weight");
 });

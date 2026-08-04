@@ -435,18 +435,6 @@ export bool fpSgn0(u32[] a) {
   return (v[0] & 1) != 0;
 }
 
-/** `a⁻¹`, with zero mapping to zero — RFC 9380's `inv0`. */
-export u32[] fpInv0(u32[] a) {
-  u32[]? r = fpInvert(a);
-  return (r is null) ? fpZero() : r!;
-}
-
-/** Whether `a` is a square, by the Legendre symbol. Zero counts as a square. */
-export bool fpIsSquare(u32[] a) {
-  if (fpIsZero(a)) { return true; }
-  return fpSqrt(a) is not null;
-}
-
 /**
  * 1/2, in Montgomery form.
  *

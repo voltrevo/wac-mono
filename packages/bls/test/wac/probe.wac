@@ -468,7 +468,7 @@ export bool blsPairingInverse(u8[] g1c, u8[] g2c) {
 // ── verify ────────────────────────────────────────────────────────────────────
 
 import { verify, aggregate, fastAggregateVerify,
-         aggregateVerify, batchVerify } from "../../src/verify.wac";
+         aggregateVerify, batchVerify, batchScalar, batchTranscript } from "../../src/verify.wac";
 
 export bool blsVerify(u8[] pubkey, u8[] message, u8[] signature) {
   return verify(pubkey, message, signature);
@@ -513,4 +513,23 @@ export bool blsAggregateVerify(u8[][] pks, u8[][] msgs, u8[] sig) {
 /** `BatchVerify` — n signatures in one randomised pairing product. */
 export bool blsBatchVerify(u8[][] pks, u8[][] msgs, u8[][] sigs, u8[] entropy) {
   return batchVerify(pks, msgs, sigs, entropy);
+}
+
+/** The weight term `i` gets for a batch — so a test can check it depends on the whole batch. */
+export u32[] blsBatchScalar(u8[][] pks, u8[][] msgs, u8[][] sigs, u8[] entropy, i32 i) {
+  return batchScalar(batchTranscript(pks, msgs, sigs, entropy), i);
+}
+
+/**
+ * `(r−1)·G` is *not* infinity, in G1 and G2.
+ *
+ * The companion to `blsG1OrderIsR`, and the half that makes it mean something: `r·G == O` passes for
+ * an empty scalar too, because multiplying by nothing leaves the accumulator at infinity. A mutation
+ * sweep found that by gutting `groupOrder` and watching the order tests stay green.
+ */
+export bool blsOrderIsNotSmaller() {
+  u32[] rm1 = groupOrder();
+  rm1[0] = rm1[0] - 1;                       // r's low word is 0x00000001, so no borrow
+  if (g1IsInfinity(g1Mul(g1Generator(), rm1))) { return false; }
+  return !g2IsInfinity(g2Mul(g2Generator(), rm1));
 }

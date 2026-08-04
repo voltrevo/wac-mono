@@ -20,6 +20,7 @@ const mod = await wacBind("packages/bls/test/wac/probe.wac") as unknown as {
   blsG1GeneratorBytes(): Uint8Array;
   blsG1DegenerateAddition(): boolean;
   blsG1OrderIsR(): boolean;
+  blsOrderIsNotSmaller(): boolean;
 };
 
 type G1Vectors = {
@@ -88,4 +89,14 @@ Deno.test("scalar multiples of the generator match Python", () => {
   if (gen !== v.good[1].hex) throw new Error(`generator\n  got  ${gen}\n  want ${v.good[1].hex}`);
   if (hex(mod.blsG1MulGenerator(scalar(2n))) !== v.good[2].hex) throw new Error("2·G wrong");
   if (hex(mod.blsG1MulGenerator(scalar(3n))) !== v.good[3].hex) throw new Error("3·G wrong");
+});
+
+// `r·G == O` on its own is satisfied by an empty scalar — multiplying by nothing leaves infinity —
+// so it passed while `groupOrder` returned nothing at all. Found by a mutation sweep. The order is
+// only pinned by checking both directions.
+Deno.test("the group order is r exactly, not merely a multiple of it", () => {
+  if (!mod.blsG1OrderIsR()) throw new Error("r·G1 is not the point at infinity");
+  if (!mod.blsOrderIsNotSmaller()) {
+    throw new Error("(r−1)·G is infinity, so the scalar being used is not r");
+  }
 });
