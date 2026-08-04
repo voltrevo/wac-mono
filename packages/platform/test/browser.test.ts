@@ -454,6 +454,16 @@ Deno.test("the browser world refuses what a page cannot do", async () => {
   assertEquals((await call(OP.ENV, str("PATH")))[0], 0, "every variable is unset");
 });
 
+Deno.test("a page says it cannot spawn, rather than failing the program — 0030", async () => {
+  const w = browserWorld({});
+  const out = await w[OP.SPAWN](new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0])) as Uint8Array;
+  // -2, not -1: "there is no `spawn` here" is not a fact about the program, so `packages/sh` falls
+  // through to its own implementations instead of reporting 126. Before this the opcode had no
+  // handler at all, and `WACPATH=/b` with a file named `wc` in it hid the `wc` that works.
+  assertEquals(readI32le(out), -2, "the handle says the capability is absent");
+  assertEquals(unstr(out.subarray(4)).includes("cannot spawn"), true, unstr(out.subarray(4)));
+});
+
 Deno.test("the browser world denies the filesystem when the page grants none", async () => {
   const w = browserWorld({});
   const call = async (op: number, payload: Uint8Array<ArrayBufferLike> = new Uint8Array(0)) =>

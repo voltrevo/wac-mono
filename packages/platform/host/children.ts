@@ -210,3 +210,19 @@ export function failedChild(why: string): Uint8Array {
   out.set(text, 4);
   return out;
 }
+
+/**
+ * The payload for a world that cannot spawn: -2, then why.
+ *
+ * Distinct from `failedChild`'s -1 on purpose. "There is no `spawn` here" is not a fact about the
+ * program, so a caller that has another way to run it should use it — `packages/sh` falls through to
+ * its own implementations, which is how the browser shell keeps sixty working applets even though a
+ * page cannot spawn. Reporting 126 instead hid them behind a capability the world never had.
+ */
+export function noSpawnHere(why: string): Uint8Array {
+  const text = new TextEncoder().encode(why);
+  const out = new Uint8Array(4 + text.length);
+  new DataView(out.buffer).setInt32(0, -2, true);
+  out.set(text, 4);
+  return out;
+}

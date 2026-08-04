@@ -14,6 +14,7 @@ import { type Handlers } from "./respond.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { OP } from "./ops.ts";
 import { ChildStack, packCaptured, unpackPush } from "./child.ts";
+import { noSpawnHere } from "./children.ts";
 import { changeBytes, changed, FAULT_DENIED } from "./faults.ts";
 
 /** Node's pieces, described rather than imported, so this file checks under Deno. */
@@ -238,6 +239,16 @@ export function nodeWorld(
         throw e;
       }
     },
+
+    /**
+     * No `spawn` here yet — said in the shape a caller can act on.
+     *
+     * -2 rather than an error, so a caller with another route takes it instead of reporting the
+     * program broken: see `Child` in platform.wac. Node *can* run a worker — `entryNode.ts` runs the
+     * application in one — so this is unimplemented rather than impossible, and `children.ts` is
+     * where the work would go.
+     */
+    [OP.SPAWN]: () => noSpawnHere("spawning is not implemented in the Node host"),
 
     [OP.STAT]: async (p) => {
       const out = new Uint8Array(20);

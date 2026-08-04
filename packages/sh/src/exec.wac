@@ -1033,6 +1033,11 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
   // change here. Left to whoever owns this package to decide, since it widens what a script can
   // reach and no test says which is wanted. (agent-a, forced by the signature change)
   Child child = sh.cli.spawn(string.fromBytes(prog.bytes), args, GRANT_NONE).wait();
+  // No `spawn` in this world at all: nothing was attempted, so this is not a failure of the program
+  // and must not be reported as one. Falling through is what keeps `packages/box`'s sixty applets
+  // working in the browser terminal, where a page cannot spawn — before this, setting `$WACPATH` to
+  // a directory holding a file called `wc` hid the `wc` that works behind exit 126.
+  if (child.unavailable()) { return Output.missing(); }
   if (child.handle < 0) {
     // It exists and would not start: that is 126, distinct from the 127 of not existing. One
     // integer cannot say both, which is why `found` is a separate field.

@@ -35,6 +35,7 @@ import { CHUNK } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { OP } from "./ops.ts";
 import { ChildStack, packCaptured, unpackPush } from "./child.ts";
+import { noSpawnHere } from "./children.ts";
 import {
   changeBytes,
   changed,
@@ -416,6 +417,16 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       writeErr(p);
       return EMPTY;
     },
+
+    /**
+     * No `spawn` in a page yet — said in the shape a caller can act on.
+     *
+     * -2 rather than an error, because "there is no `spawn` here" is not a fact about the program:
+     * `packages/sh` falls through to its own implementations, which is what keeps sixty applets
+     * working in the browser terminal. Before this, `WACPATH=/b` with a file called `wc` in it
+     * reported "no handler for capability 27" and exit 126, hiding a `wc` that works. Issue 0030.
+     */
+    [OP.SPAWN]: () => noSpawnHere("a page cannot spawn yet — see wac-mono issue 0030"),
 
     [OP.READ_FILE]: async (p) => new Uint8Array(await (await fileOf(unstr(p))).arrayBuffer()),
     [OP.WRITE_FILE]: (p) => {

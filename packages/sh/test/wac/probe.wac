@@ -83,6 +83,7 @@ FileResult resolveFile(i32 id) {
   if (id == 4) { return FileResult.of(true, "runnable".toBytes(), ""); }
   if (id == 5) { return FileResult.of(true, "unrunnable".toBytes(), ""); }
   if (id == 6) { return FileResult.of(true, "vanishing".toBytes(), ""); }
+  if (id == 7) { return FileResult.of(true, "nospawnworld".toBytes(), ""); }
   return FileResult.of(false, u8[0](), "no such file");
 }
 Pending<FileResult> fakeReadFile(string path) {
@@ -93,6 +94,9 @@ Pending<FileResult> fakeReadFile(string path) {
   if (path == "/bin/prog") { which = 4; }
   if (path == "/bin/badprog") { which = 5; }
   if (path == "/bin/goneprog") { which = 6; }
+  // A name that also exists as one of the shell's own implementations, so that falling through can
+  // be told from failing: in a world with no `spawn` this must run `echo`, not report 126.
+  if (path == "/bin/echo") { which = 7; }
   // `/bin/ghost` exists as far as `stat` is concerned and cannot be read, which is not a
   // contrived case: another process removing it between the two calls is the ordinary race, and
   // the shell has to answer "no such command" rather than treat it as a failure to execute.
@@ -137,7 +141,7 @@ Pending<Stat> fakeStat(string path) {
 /** What this filesystem has, in one place, so `stat` and `remove` cannot disagree. */
 bool present(string path) {
   return path == "/bin/prog" || path == "/bin/badprog" || path == "/bin/goneprog"
-      || path == "/bin/ghost";
+      || path == "/bin/ghost" || path == "/bin/echo";
 }
 
 string[]? resolveDir(i32 id) {
@@ -219,8 +223,17 @@ void fakeCloseSocket(i32 handle) {}
 // only answer end-of-input; a fake that returned bytes would return them for ever and the read
 // loop would not finish. The branch that appends a chunk is covered by `test/spawn.test.ts`
 // against the real host instead, which is the only place a child can actually speak.
+/**
+ * A child, by id — and two ways of failing, because the shell must tell them apart.
+ *
+ * -1 is "it would not start", which is 126. -2 is "this world has no `spawn`", which is not a fact
+ * about the program at all: the shell falls through to its own implementations, as it does in a
+ * browser tab where a page cannot spawn.
+ */
 Child resolveChild(i32 id) {
-  return id > 0 ? Child(id, "") : Child(-1, "spawn not available");
+  if (id > 0) { return Child(id, ""); }
+  if (id == -2) { return Child(-2, "no spawn in this world"); }
+  return Child(-1, "spawn not available");
 }
 i32 resolveId(i32 id) { return id; }
 
@@ -230,6 +243,8 @@ Pending<Child> fakeSpawn(string source, string[] argv, i32 grants) {
   // Starts, then never reports a status — `exitCode` answers negative for it. The shell calls that
   // 126 rather than success, because by then it is a host problem and not the program's answer.
   if (source == "vanishing") { handle = 8; }
+  // A world with no `spawn` at all, which every host but Deno currently is.
+  if (source == "nospawnworld") { handle = -2; }
   return Pending.of(handle, resolveChild, alwaysSettled, ignoreDrop);
 }
 void fakeCloseFeed(i32 handle) {}

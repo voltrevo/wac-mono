@@ -492,11 +492,29 @@ export const i32 GRANT_NET = 4;
 export const i32 GRANT_ENV = 8;
 
 export struct Child {
-  i32 handle;      // negative when `error` is set
+  /**
+   * The child's handle, or a negative number and an `error`.
+   *
+   * Two negatives, and the difference is the caller's whole decision:
+   *
+   *   -1  this program exists and would not start — `packages/sh` reports 126, as a shell does for
+   *       a file that is not executable
+   *   -2  **this world has no `spawn` at all**, so nothing was attempted and nothing is wrong with
+   *       the program. A caller with another route should take it
+   *
+   * Without the second, a world that cannot spawn made every spawnable name *fail* rather than fall
+   * through: in the browser shell, `WACPATH=/b` with a file named `wc` in it reported
+   * "no handler for capability 27" and exit 126, hiding `packages/box`'s own `wc`, which was sitting
+   * right there and works. A missing capability is not a broken program.
+   */
+  i32 handle;
   string error;
 
   /** As `Socket.of`: the host builds these, so the constructor is declared rather than generated. */
   Child of(i32 handle, string error) { return Child(handle, error); }
+
+  /** Whether this world can spawn at all. False says nothing about the program. */
+  bool unavailable(const this) { return this.handle == -2; }
 }
 
 export struct Cli {
