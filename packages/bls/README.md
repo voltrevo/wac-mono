@@ -11,7 +11,7 @@ different file with `ctTrace` over it, not bolted onto these functions.
 ## Status
 
 **Working.** `verify(pubkey, message, signature)` agrees with all 29 `ethereum/bls12-381-tests`
-verify fixtures and all 28 deserialization fixtures, at about **51 ms** per signature.
+verify fixtures and all 28 deserialization fixtures, at about **15 ms** per signature.
 
 Built in stages with an external oracle gating each one:
 
@@ -66,18 +66,64 @@ Vectors are vendored rather than fetched, so the tests need no network.
 
 ## Speed, stated up front
 
-**Measured: 51 ms per verification**, against 14.6 ms for `@noble/curves` on the same machine and
-about 1 ms for `blst`. That is within the range predicted before any of it was written — tens to
-low hundreds of milliseconds. Wasm has no 64×64→128 multiply and no carry flag, so `Fp` uses twelve 32-bit limbs
-with a 64-bit accumulator, 144 partial products per multiply, because `i64` is the widest multiply
-the machine has. A verification is two Miller loops sharing one final exponentiation, order 20,000
-field multiplications.
+**Measured: 15.2 ms per verification**, against 14.6 ms for `@noble/curves` on the same machine and
+about 1 ms for `blst`. It started at 109 ms. Wasm has no 64×64→128 multiply and no carry flag, so
+`Fp` uses twelve 32-bit limbs with a 64-bit accumulator, 144 partial products per multiply, because
+`i64` is the widest multiply the machine has. A verification is two Miller loops sharing one
+accumulator and one final exponentiation, order 20,000 field multiplications.
 
-The current split is roughly 26 ms for the two Miller loops and one final exponentiation, 18 ms
-for `hash_to_G2`, and 8 ms for decoding and subgroup checks. Nothing is optimised beyond one
-blunder found by profiling — `halve` used to recompute 1/2 by Fermat inversion on every call, which
-was 28 ms of the original 109 — and the remaining levers are known and untaken: `g1InSubgroup` and
-`g2InSubgroup` multiply by r rather than using the endomorphism checks, `clearCofactorG2`
-multiplies by a 636-bit `h_eff` rather than using Budroni–Pintore, and the final exponentiation
-uses plain squaring rather than the cyclotomic kind. Each is noted where it appears. Do not put
-this on a hot path without measuring first.
+Run `deno run -A packages/bls/test/bench.ts` for the current split. As of 2026-08-04:
+
+| stage | | |
+| ----- | --- | --- |
+| Miller loop, both pairs | 7.8 ms | 51% |
+| final exponentiation | 4.3 ms | 28% |
+| `hash_to_G2` | 2.8 ms | 18% |
+| G2 decode + subgroup check | 1.2 ms | 8% |
+| G1 decode + subgroup check | 0.7 ms | 4% |
+
+### What the 109 → 15 ms came from, and what it cost to find
+
+Every one of these was chosen by the profile, and three of them contradicted what I expected before
+measuring. They are listed with their sizes because the sizes are the useful part:
+
+| change | saved |
+| ------ | ----- |
+| `halve` recomputed 1/2 by Fermat inversion on every call | 58 ms |
+| Budroni–Pintore cofactor clearing instead of a 636-bit `h_eff` | 12 ms |
+| one square root in SSWU instead of two, and complex `fp12Square` | 10 ms |
+| `fpInvert` by binary extended GCD instead of Fermat | 2.6 ms |
+| Granger–Scott cyclotomic squaring in the final exponentiation | 3.9 ms |
+| `g1InSubgroup` by the φ endomorphism instead of multiplying by r | 1.3 ms |
+| one Miller loop over both pairs, sharing the 64 Fp12 squarings | 1.1 ms |
+| CIOS reduction storing to `t[j-1]`, so no separate shift pass | 1.1 ms |
+| reducing against `P0..P11` constants instead of a rebuilt array | 1.0 ms |
+
+Two hypotheses that did **not** survive measurement, recorded because they were expensive to hold:
+
+- **Allocation was going to dominate.** It does not. A `u32[12]` costs 5–7 ns to allocate, so the
+  tree of 21 objects behind an `Fp12` is about 1 ms of a 36 ms Miller loop. `test/wac/flat.wac`
+  re-tested this properly by rewriting the Montgomery multiply three ways, and a fully flat
+  zero-allocation version came out *slower* than the allocating one. The same experiment found the
+  opposite for addition — 44% — which is where the `P0..P11` change came from.
+- **Reordering the mutation suite was worth a multiple.** Measured, 9.5%. See wac-mono issue 0024.
+
+### Still untaken, roughly in order of what the profile says they are worth
+
+- The Miller loop's per-pair work is half the total and has had no attention beyond using the
+  sparse `mul014` line function. 384-bit Karatsuba inside `fpMul` would cut 144 limb products to
+  about 108 and is the largest single item left.
+- Three scalar multiplications by 64-bit |x| remain per verification — one in `g2InSubgroup`, two
+  in `clearCofactorG2` — at roughly 0.5 ms each. The doublings are irreducible for a fixed scalar,
+  so only a cheaper `g2Double` helps.
+- Karabina compressed squaring would beat Granger–Scott in the final exponentiation, at the cost of
+  a decompression step.
+- Batch and aggregate verification share one final exponentiation across many signatures. The
+  fixtures are already vendored (`eth_batch_verify.json`, `eth_aggregate_verify.json`) and unused.
+
+### A caveat that is not about speed
+
+`fpInvert` is no longer constant time — binary extended GCD branches on the value. That is safe
+here because nothing secret is ever inverted: a verifier handles public keys, signatures and
+messages only. A **signing** implementation must not reuse it as it stands. It says so at the
+function too.

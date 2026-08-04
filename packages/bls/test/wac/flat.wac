@@ -1,0 +1,339 @@
+// An experiment, not part of the package: what would fixed-size arrays be worth here?
+//
+// Every field element in `src/` is a `u32[12]` — a WasmGC array, separately allocated, reached
+// through a pointer. An Fp12 is a tree of 21 such objects. The proposed language feature is a
+// fixed-size array type that the compiler can lay out inline (as N fields, or a flat block inside
+// its parent) rather than as an independent heap object.
+//
+// This file measures the *upper bound* on what that could win, by writing the same Montgomery
+// multiplication three ways and changing nothing else:
+//
+//   A  as `src/fp.wac` has it — allocates the result, the u64 accumulator, and the modulus
+//   B  accumulator and modulus hoisted to caller-owned buffers — allocates only the result
+//   C  fully flat — operands and result are offsets into one caller-owned u32 buffer, no allocation
+//
+// A→B is what hoisting temporaries buys and needs no language change. B→C is the part that only a
+// value-typed or inline-allocated array can give you, because it removes the result object itself.
+//
+// It is an upper bound rather than a prediction: C also loses the bounds checks that separate small
+// arrays imply, and gains index arithmetic that a real fixed-size array would fold into constant
+// offsets. Both effects point the same way as the feature, so C flatters it slightly. What C does
+// *not* model is scalarisation into locals, which would be better still.
+//
+// ## What it measured, 2026-08-04
+//
+//   multiplication      A 357.9 ns    B 349.3 ns  (−2.4%)   C 378.2 ns  (+5.7%, i.e. slower)
+//   addition            A  27.6 ns    B  20.4 ns  (−26.2%)  C  15.4 ns  (−44.2%)
+//
+// The answer depends entirely on which operation you ask about, and the honest summary is that a
+// fixed-size array type would not pay for itself in `fpMul` and would pay handsomely everywhere
+// else.
+//
+// A multiply does 144 limb products. Against that, three allocations are 2% — and the fully flat
+// version is *slower* than the allocating one, because the index arithmetic on a shared buffer
+// costs more per access than the allocation it avoided. A real fixed-size array would fold those
+// offsets into constants and so would not lose that 8%, but it would only be winning back the same
+// 2%. This is the second time in this package that an allocation hypothesis has failed to survive
+// being measured, and both times the reason was the same: an operation with a hundred-odd
+// multiplications in it does not care what its result is stored in.
+//
+// An addition does 12 additions and a comparison, and there allocation is most of the cost: 44%,
+// of which 26 points came from not rebuilding the modulus and 18 from not allocating the result.
+// This matters more than the multiply figure suggests it should, because the tower is mostly
+// additions — Karatsuba over Fp2 trades a multiplication for three additions, `fp12Square` and the
+// line functions are dense with them, and `fpAdd` is called several times as often as `fpMul`.
+//
+// The 26 points that needed no language feature were taken: `src/fp.wac` now reduces against
+// `P0..P11` constants instead of a freshly built array, which was worth 6% of a whole
+// verification. The remaining 18 points are the ones only the language can give, and they are
+// worth having — but they are worth having in the *cheap* operations, which is the opposite of
+// where I would have aimed the feature before measuring.
+
+const i32 N = 12;
+const u64 MINV = 0xfffcfffd;
+
+/** The modulus, written into a caller-owned buffer at `off`. */
+export void putModulus(u32[] buf, i32 off) {
+  buf[off + 0] = 0xffffaaab; buf[off + 1] = 0xb9feffff;
+  buf[off + 2] = 0xb153ffff; buf[off + 3] = 0x1eabfffe;
+  buf[off + 4] = 0xf6b0f624; buf[off + 5] = 0x6730d2a0;
+  buf[off + 6] = 0xf38512bf; buf[off + 7] = 0x64774b84;
+  buf[off + 8] = 0x434bacd7; buf[off + 9] = 0x4b1ba7b6;
+  buf[off + 10] = 0x397fe69a; buf[off + 11] = 0x1a0111ea;
+}
+
+u32[] modulusA() {
+  u32[] p = u32[N]();
+  putModulus(p, 0);
+  return p;
+}
+
+bool geModulus(u32[] a, i32 off, u32[] p, i32 poff) {
+  for (i32 i = N - 1; i >= 0; i--) {
+    if (a[off + i] > p[poff + i]) { return true; }
+    if (a[off + i] < p[poff + i]) { return false; }
+  }
+  return true;
+}
+
+/** `a -= p`, in place at `off`. */
+void subModulusAt(u32[] a, i32 off, u32[] p, i32 poff) {
+  u64 borrow = 0;
+  for (i32 i = 0; i < N; i++) {
+    u64 d = (a[off + i] as u64) - (p[poff + i] as u64) - borrow;
+    a[off + i] = (d & 0xFFFFFFFF) as@ u32;
+    borrow = (d >> 63) & 1;
+  }
+}
+
+/** A: allocates result, accumulator and modulus — the shape `src/fp.wac` uses. */
+export u32[] mulA(u32[] a, u32[] b) {
+  u32[] p = modulusA();
+  u64[] t = u64[N + 2]();
+  for (i32 i = 0; i < N; i++) {
+    u64 bi = b[i] as u64;
+    u64 carry = 0;
+    for (i32 j = 0; j < N; j++) {
+      u64 acc = t[j] + (a[j] as u64) * bi + carry;
+      t[j] = acc & 0xFFFFFFFF;
+      carry = acc >> 32;
+    }
+    u64 hi = t[N] + carry;
+    t[N] = hi & 0xFFFFFFFF;
+    t[N + 1] = t[N + 1] + (hi >> 32);
+    u64 m = ((t[0] * MINV) & 0xFFFFFFFF);
+    carry = 0;
+    for (i32 j = 0; j < N; j++) {
+      u64 acc = t[j] + (p[j] as u64) * m + carry;
+      t[j] = acc & 0xFFFFFFFF;
+      carry = acc >> 32;
+    }
+    hi = t[N] + carry;
+    t[N] = hi & 0xFFFFFFFF;
+    t[N + 1] = t[N + 1] + (hi >> 32);
+    for (i32 j = 0; j <= N; j++) { t[j] = t[j + 1]; }
+    t[N + 1] = 0;
+  }
+  u32[] out = u32[N]();
+  for (i32 i = 0; i < N; i++) { out[i] = (t[i] & 0xFFFFFFFF) as@ u32; }
+  if (t[N] != 0 || geModulus(out, 0, p, 0)) { subModulusAt(out, 0, p, 0); }
+  return out;
+}
+
+/** B: accumulator and modulus are the caller's; only the result is allocated. */
+export u32[] mulB(u32[] a, u32[] b, u64[] t, u32[] p) {
+  for (i32 j = 0; j < N + 2; j++) { t[j] = 0; }
+  for (i32 i = 0; i < N; i++) {
+    u64 bi = b[i] as u64;
+    u64 carry = 0;
+    for (i32 j = 0; j < N; j++) {
+      u64 acc = t[j] + (a[j] as u64) * bi + carry;
+      t[j] = acc & 0xFFFFFFFF;
+      carry = acc >> 32;
+    }
+    u64 hi = t[N] + carry;
+    t[N] = hi & 0xFFFFFFFF;
+    t[N + 1] = t[N + 1] + (hi >> 32);
+    u64 m = ((t[0] * MINV) & 0xFFFFFFFF);
+    carry = 0;
+    for (i32 j = 0; j < N; j++) {
+      u64 acc = t[j] + (p[j] as u64) * m + carry;
+      t[j] = acc & 0xFFFFFFFF;
+      carry = acc >> 32;
+    }
+    hi = t[N] + carry;
+    t[N] = hi & 0xFFFFFFFF;
+    t[N + 1] = t[N + 1] + (hi >> 32);
+    for (i32 j = 0; j <= N; j++) { t[j] = t[j + 1]; }
+    t[N + 1] = 0;
+  }
+  u32[] out = u32[N]();
+  for (i32 i = 0; i < N; i++) { out[i] = (t[i] & 0xFFFFFFFF) as@ u32; }
+  if (t[N] != 0 || geModulus(out, 0, p, 0)) { subModulusAt(out, 0, p, 0); }
+  return out;
+}
+
+/**
+ * C: everything lives in one caller-owned `u32[]`, addressed by limb offset. Nothing is allocated,
+ * which is the state a fixed-size array laid out inline would put the callers in.
+ *
+ * `buf` holds elements at multiples of 12; `po` is the modulus, `t` the accumulator.
+ */
+export void mulC(u32[] buf, i32 ao, i32 bo, i32 ro, i32 po, u64[] t) {
+  for (i32 j = 0; j < N + 2; j++) { t[j] = 0; }
+  for (i32 i = 0; i < N; i++) {
+    u64 bi = buf[bo + i] as u64;
+    u64 carry = 0;
+    for (i32 j = 0; j < N; j++) {
+      u64 acc = t[j] + (buf[ao + j] as u64) * bi + carry;
+      t[j] = acc & 0xFFFFFFFF;
+      carry = acc >> 32;
+    }
+    u64 hi = t[N] + carry;
+    t[N] = hi & 0xFFFFFFFF;
+    t[N + 1] = t[N + 1] + (hi >> 32);
+    u64 m = ((t[0] * MINV) & 0xFFFFFFFF);
+    carry = 0;
+    for (i32 j = 0; j < N; j++) {
+      u64 acc = t[j] + (buf[po + j] as u64) * m + carry;
+      t[j] = acc & 0xFFFFFFFF;
+      carry = acc >> 32;
+    }
+    hi = t[N] + carry;
+    t[N] = hi & 0xFFFFFFFF;
+    t[N + 1] = t[N + 1] + (hi >> 32);
+    for (i32 j = 0; j <= N; j++) { t[j] = t[j + 1]; }
+    t[N + 1] = 0;
+  }
+  for (i32 i = 0; i < N; i++) { buf[ro + i] = (t[i] & 0xFFFFFFFF) as@ u32; }
+  if (t[N] != 0 || geModulus(buf, ro, buf, po)) { subModulusAt(buf, ro, buf, po); }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Drivers. Each does `n` multiplications in a dependent chain, so the multiplications cannot be
+// reordered or hoisted out of the loop, and returns a word of the result so nothing is dead.
+
+export i32 runA(u32[] seed, i32 n) {
+  u32[] acc = seed;
+  for (i32 i = 0; i < n; i++) { acc = mulA(acc, seed); }
+  return acc[0] as@ i32;
+}
+
+export i32 runB(u32[] seed, i32 n) {
+  u64[] t = u64[N + 2]();
+  u32[] p = modulusA();
+  u32[] acc = seed;
+  for (i32 i = 0; i < n; i++) { acc = mulB(acc, seed, t, p); }
+  return acc[0] as@ i32;
+}
+
+export i32 runC(u32[] seed, i32 n) {
+  // Layout: 0 accumulator, 12 operand, 24 modulus.
+  u32[] buf = u32[36]();
+  for (i32 i = 0; i < N; i++) { buf[i] = seed[i]; buf[N + i] = seed[i]; }
+  putModulus(buf, 24);
+  u64[] t = u64[N + 2]();
+  for (i32 i = 0; i < n; i++) { mulC(buf, 0, N, 0, 24, t); }
+  return buf[0] as@ i32;
+}
+
+/** The three must agree, or the timings are comparing different arithmetic. */
+export u8[] chainA(u32[] seed, i32 n) {
+  u32[] acc = seed;
+  for (i32 i = 0; i < n; i++) { acc = mulA(acc, seed); }
+  u8[] out = u8[N * 4]();
+  for (i32 i = 0; i < N; i++) {
+    for (i32 k = 0; k < 4; k++) { out[i * 4 + k] = ((acc[i] >> ((k * 8) as@ u32)) & 0xFF) as! i32; }
+  }
+  return out;
+}
+
+export u8[] chainB(u32[] seed, i32 n) {
+  u64[] t = u64[N + 2]();
+  u32[] p = modulusA();
+  u32[] acc = seed;
+  for (i32 i = 0; i < n; i++) { acc = mulB(acc, seed, t, p); }
+  u8[] out = u8[N * 4]();
+  for (i32 i = 0; i < N; i++) {
+    for (i32 k = 0; k < 4; k++) { out[i * 4 + k] = ((acc[i] >> ((k * 8) as@ u32)) & 0xFF) as! i32; }
+  }
+  return out;
+}
+
+export u8[] chainC(u32[] seed, i32 n) {
+  u32[] buf = u32[36]();
+  for (i32 i = 0; i < N; i++) { buf[i] = seed[i]; buf[N + i] = seed[i]; }
+  putModulus(buf, 24);
+  u64[] t = u64[N + 2]();
+  for (i32 i = 0; i < n; i++) { mulC(buf, 0, N, 0, 24, t); }
+  u8[] out = u8[N * 4]();
+  for (i32 i = 0; i < N; i++) {
+    for (i32 k = 0; k < 4; k++) { out[i * 4 + k] = ((buf[i] >> ((k * 8) as@ u32)) & 0xFF) as! i32; }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The same three shapes for *addition*. This is the more informative half: a multiply does 144
+// limb products, so a fixed overhead disappears into it, while an add does 12 additions and a
+// conditional subtraction. If allocation matters anywhere it matters here — and Fp2/Fp6 arithmetic
+// is mostly additions, three of them per Karatsuba multiply.
+
+export u32[] addA(u32[] a, u32[] b) {
+  u32[] p = modulusA();
+  u32[] out = u32[N]();
+  u64 carry = 0;
+  for (i32 i = 0; i < N; i++) {
+    u64 s = (a[i] as u64) + (b[i] as u64) + carry;
+    out[i] = (s & 0xFFFFFFFF) as@ u32;
+    carry = s >> 32;
+  }
+  if (carry != 0 || geModulus(out, 0, p, 0)) { subModulusAt(out, 0, p, 0); }
+  return out;
+}
+
+export u32[] addB(u32[] a, u32[] b, u32[] p) {
+  u32[] out = u32[N]();
+  u64 carry = 0;
+  for (i32 i = 0; i < N; i++) {
+    u64 s = (a[i] as u64) + (b[i] as u64) + carry;
+    out[i] = (s & 0xFFFFFFFF) as@ u32;
+    carry = s >> 32;
+  }
+  if (carry != 0 || geModulus(out, 0, p, 0)) { subModulusAt(out, 0, p, 0); }
+  return out;
+}
+
+export void addC(u32[] buf, i32 ao, i32 bo, i32 ro, i32 po) {
+  u64 carry = 0;
+  for (i32 i = 0; i < N; i++) {
+    u64 s = (buf[ao + i] as u64) + (buf[bo + i] as u64) + carry;
+    buf[ro + i] = (s & 0xFFFFFFFF) as@ u32;
+    carry = s >> 32;
+  }
+  if (carry != 0 || geModulus(buf, ro, buf, po)) { subModulusAt(buf, ro, buf, po); }
+}
+
+export i32 runAddA(u32[] seed, i32 n) {
+  u32[] acc = seed;
+  for (i32 i = 0; i < n; i++) { acc = addA(acc, seed); }
+  return acc[0] as@ i32;
+}
+
+export i32 runAddB(u32[] seed, i32 n) {
+  u32[] p = modulusA();
+  u32[] acc = seed;
+  for (i32 i = 0; i < n; i++) { acc = addB(acc, seed, p); }
+  return acc[0] as@ i32;
+}
+
+export i32 runAddC(u32[] seed, i32 n) {
+  u32[] buf = u32[36]();
+  for (i32 i = 0; i < N; i++) { buf[i] = seed[i]; buf[N + i] = seed[i]; }
+  putModulus(buf, 24);
+  for (i32 i = 0; i < n; i++) { addC(buf, 0, N, 0, 24); }
+  return buf[0] as@ i32;
+}
+
+/** Agreement check for the addition chain, as above. */
+export u8[] chainAddA(u32[] seed, i32 n) {
+  u32[] acc = seed;
+  for (i32 i = 0; i < n; i++) { acc = addA(acc, seed); }
+  u8[] out = u8[N * 4]();
+  for (i32 i = 0; i < N; i++) {
+    for (i32 k = 0; k < 4; k++) { out[i * 4 + k] = ((acc[i] >> ((k * 8) as@ u32)) & 0xFF) as! i32; }
+  }
+  return out;
+}
+
+export u8[] chainAddC(u32[] seed, i32 n) {
+  u32[] buf = u32[36]();
+  for (i32 i = 0; i < N; i++) { buf[i] = seed[i]; buf[N + i] = seed[i]; }
+  putModulus(buf, 24);
+  for (i32 i = 0; i < n; i++) { addC(buf, 0, N, 0, 24); }
+  u8[] out = u8[N * 4]();
+  for (i32 i = 0; i < N; i++) {
+    for (i32 k = 0; k < 4; k++) { out[i * 4 + k] = ((buf[i] >> ((k * 8) as@ u32)) & 0xFF) as! i32; }
+  }
+  return out;
+}

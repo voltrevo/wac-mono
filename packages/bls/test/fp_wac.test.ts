@@ -13,6 +13,7 @@
 import { wacBind } from "../../../harness/wacBind.ts";
 
 const mod = await wacBind("packages/bls/test/wac/probe.wac") as unknown as {
+  blsModulusConstantsAgree(): boolean;
   blsFpStatus(a: Uint8Array, b: Uint8Array): number;
   blsFpAdd(a: Uint8Array, b: Uint8Array): Uint8Array;
   blsFpSub(a: Uint8Array, b: Uint8Array): Uint8Array;
@@ -229,5 +230,15 @@ Deno.test("Fp12 arithmetic and Frobenius agree with the Python tower", () => {
     if (!modT.blsFp12InverseIsInverse(flat(c.a))) {
       throw new Error("a · a⁻¹ != 1 in Fp12");
     }
+  }
+});
+
+// p is spelled twice in `src/fp.wac` — as an array for `fpMul`, and as `P0..P11` constants for the
+// reduction that every add and subtract goes through. Nothing else in the suite would notice them
+// drifting apart, because both spellings are used together in almost every operation and a
+// consistent pair of wrong values is still self-consistent. This ties them to each other.
+Deno.test("the modulus constants and the modulus array are the same p", () => {
+  if (!mod.blsModulusConstantsAgree()) {
+    throw new Error("P0..P11 disagree with modulus() — the reduction is against the wrong p");
   }
 });

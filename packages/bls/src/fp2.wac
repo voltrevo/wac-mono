@@ -18,7 +18,7 @@
 // values rather than against itself.
 
 import { fpAdd, fpSub, fpMul, fpNeg, fpSquare, fpZero, fpOne, fpIsZero, fpEquals, fpCopy,
-         fpFromBytes, fpToBytes, fpInvert, fpSqrt, fpSgn0 } from "./fp.wac";
+         fpFromBytes, fpToBytes, fpInvert, fpSqrt, fpSgn0, fpHalf } from "./fp.wac";
 
 /** `c0 + c1·u`. Both coefficients are in Montgomery form; see `fp.wac`. */
 export struct Fp2 {
@@ -132,14 +132,12 @@ export Fp2? fp2Sqrt(Fp2 a) {
   u32[] normSq = fpAdd(fpSquare(a.c0), fpSquare(a.c1));
   u32[]? n = fpSqrt(normSq);
   if (n is null) { return null; }
-  u32[]? half = fpInvert(fpAdd(fpOne(), fpOne()));
-  if (half is null) { return null; }
-
-  u32[] cand = fpMul(fpAdd(a.c0, n!), half!);
+  u32[] half = fpHalf();
+  u32[] cand = fpMul(fpAdd(a.c0, n!), half);
   u32[]? y0 = fpSqrt(cand);
   if (y0 is null) {
     // The other sign of the norm.
-    cand = fpMul(fpSub(a.c0, n!), half!);
+    cand = fpMul(fpSub(a.c0, n!), half);
     y0 = fpSqrt(cand);
     if (y0 is null) { return null; }
   }

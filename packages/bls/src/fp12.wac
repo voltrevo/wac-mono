@@ -271,7 +271,67 @@ export Fp12 fp12Mul(Fp12 a, Fp12 b) {
   return Fp12(c0, fp6Sub(fp6Sub(mid, t0), t1));
 }
 
-export Fp12 fp12Square(Fp12 a) { return fp12Mul(a, a); }
+/**
+ * Squaring in two Fp6 multiplications rather than the three `fp12Mul` would use.
+ *
+ * Complex squaring: with `w² = v`,
+ *
+ *   (a0 + a1·w)² = (a0² + v·a1²) + 2·a0·a1·w
+ *
+ * and `a0² + v·a1²` factors as `(a0 + a1)(a0 + v·a1) − a0a1 − v·a0a1`, so one product serves both
+ * coefficients. The final exponentiation does about 315 of these, so a third off each is worth
+ * having — and it was `fp12Mul(a, a)` until someone counted.
+ */
+export Fp12 fp12Square(Fp12 a) {
+  Fp6 t = fp6Mul(a.c0, a.c1);
+  Fp6 cross = fp6Mul(fp6Add(a.c0, a.c1), fp6Add(a.c0, fp6MulByV(a.c1)));
+  Fp6 c0 = fp6Sub(fp6Sub(cross, t), fp6MulByV(t));
+  return Fp12(c0, fp6Add(t, t));
+}
+
+/**
+ * Squaring for elements of the cyclotomic subgroup GΦ₆(p²) — Granger–Scott, eprint 2009/565.
+ *
+ * Every value the final exponentiation touches lives in this subgroup: the easy part maps into it
+ * and the subgroup is closed under multiplication, conjugation and Frobenius. There the six Fp2
+ * coefficients satisfy relations that a general Fp12 element does not, and squaring reduces to
+ * three Fp4 squarings — nine Fp2 multiplies against `fp12Square`'s eighteen.
+ *
+ * It is *wrong* outside the subgroup, which is why it is not called `fp12Square`. The Miller loop
+ * must keep the general one; its accumulator is not cyclotomic until the easy part has run.
+ *
+ * The three Fp4 squarings are inlined rather than factored into a helper returning a pair: this
+ * runs ~315 times per verification and three fewer heap objects each time is the point.
+ */
+export Fp12 fp12CyclotomicSquare(Fp12 a) {
+  // Fp4 squaring of (x, y) is (x² + ξy², (x+y)² − x² − y²), over three coefficient pairs.
+  Fp2 a2 = fp2Square(a.c0.c0);
+  Fp2 b2 = fp2Square(a.c1.c1);
+  Fp2 t3 = fp2Add(fp2MulByNonresidue(b2), a2);
+  Fp2 t4 = fp2Sub(fp2Sub(fp2Square(fp2Add(a.c0.c0, a.c1.c1)), a2), b2);
+
+  Fp2 c2 = fp2Square(a.c1.c0);
+  Fp2 d2 = fp2Square(a.c0.c2);
+  Fp2 t5 = fp2Add(fp2MulByNonresidue(d2), c2);
+  Fp2 t6 = fp2Sub(fp2Sub(fp2Square(fp2Add(a.c1.c0, a.c0.c2)), c2), d2);
+
+  Fp2 e2 = fp2Square(a.c0.c1);
+  Fp2 f2 = fp2Square(a.c1.c2);
+  Fp2 t7 = fp2Add(fp2MulByNonresidue(f2), e2);
+  Fp2 t8 = fp2Sub(fp2Sub(fp2Square(fp2Add(a.c0.c1, a.c1.c2)), e2), f2);
+  Fp2 t9 = fp2MulByNonresidue(t8);
+
+  // Each coefficient is 3·t ∓ 2·original: 2(t − orig) + t on c0, 2(t + orig) + t on c1.
+  Fp2 x0 = fp2Sub(t3, a.c0.c0);
+  Fp2 x1 = fp2Sub(t5, a.c0.c1);
+  Fp2 x2 = fp2Sub(t7, a.c0.c2);
+  Fp2 y0 = fp2Add(t9, a.c1.c0);
+  Fp2 y1 = fp2Add(t4, a.c1.c1);
+  Fp2 y2 = fp2Add(t6, a.c1.c2);
+  return Fp12(
+    Fp6(fp2Add(fp2Add(x0, x0), t3), fp2Add(fp2Add(x1, x1), t5), fp2Add(fp2Add(x2, x2), t7)),
+    Fp6(fp2Add(fp2Add(y0, y0), t9), fp2Add(fp2Add(y1, y1), t4), fp2Add(fp2Add(y2, y2), t6)));
+}
 
 export Fp12? fp12Invert(Fp12 a) {
   Fp6? t = fp6Invert(fp6Sub(fp6Square(a.c0), fp6MulByV(fp6Square(a.c1))));

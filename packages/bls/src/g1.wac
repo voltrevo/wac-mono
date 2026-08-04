@@ -166,17 +166,62 @@ export bool g1IsOnCurve(G1 p) {
   return fpEquals(lhs, rhs);
 }
 
+/** |x| = 0xd201000000010000, the BLS parameter's magnitude. `x` itself is negative. */
+u32[] absX() {
+  u32[] v = u32[2]();
+  v[0] = 0x00010000; v[1] = 0xd2010000;
+  return v;
+}
+
 /**
- * Whether the point has order dividing r.
+ * β, a primitive cube root of unity mod p, in Montgomery form.
  *
- * By multiplication, which is the slow way — 255 doublings — but the one that is obviously
- * correct. There are endomorphism-based checks perhaps ten times faster; they are also where
- * subtle acceptance bugs live, and this is a verifier, so the boring version wins until there
- * is a benchmark saying it must not.
+ * Generated, not typed — one wrong word gives an endomorphism that is not one, and the subgroup
+ * check below would then reject valid points rather than accept invalid ones, which at least fails
+ * loudly. `test/g1.py` re-derives it and asserts β³ = 1 with β ≠ 1.
+ */
+u32[] g1Beta() {
+  u32[] v = u32[12]();
+  v[0] = 0x798a64e8; v[1] = 0x30f1361b; v[2] = 0x7ece5a2a; v[3] = 0xf3b8ddab;
+  v[4] = 0xc61577f7; v[5] = 0x16a8ca3a; v[6] = 0x74fd029b; v[7] = 0xc26a2ff8;
+  v[8] = 0x60701c6e; v[9] = 0x3636b766; v[10] = 0x241b6160; v[11] = 0x051ba4ab;
+  return v;
+}
+
+/**
+ * φ, the cube-root endomorphism: (x, y) ↦ (βx, y).
+ *
+ * Because y³ = x³ + 4 depends on x only through x³, and β³ = 1, scaling x by β lands on the curve
+ * again. It costs a single Fp multiplication — no doublings, no additions — which is what makes the
+ * check below cheap.
+ */
+G1 g1Phi(G1 p) { return G1(fpMul(p.x, g1Beta()), fpCopy(p.y), fpCopy(p.z)); }
+
+/** Jacobian equality, cross-multiplied so that neither point has to be inverted to affine. */
+bool g1Same(G1 a, G1 b) {
+  if (g1IsInfinity(a) || g1IsInfinity(b)) { return g1IsInfinity(a) && g1IsInfinity(b); }
+  u32[] za2 = fpSquare(a.z);
+  u32[] zb2 = fpSquare(b.z);
+  if (!fpEquals(fpMul(a.x, zb2), fpMul(b.x, za2))) { return false; }
+  return fpEquals(fpMul(a.y, fpMul(zb2, b.z)), fpMul(b.y, fpMul(za2, a.z)));
+}
+
+/**
+ * Whether the point has order dividing r, via the endomorphism identity φ(P) = [−x²]P.
+ *
+ * On the prime-order subgroup φ acts as multiplication by a cube root of unity, and the identity
+ * above holds exactly there — see eprint 2021/1130. Two 64-bit scalar multiplications replace one
+ * by the 255-bit group order, so this is roughly four times less work than `g1Mul(p, groupOrder())`,
+ * which is what this used to do.
+ *
+ * `[−x²]P` is built as `[|x|]·(−[|x|]P)`: x is negative, so one negation between the two
+ * multiplications gives −x²·P rather than x²·P, and getting that sign wrong rejects every valid
+ * point — which the Ethereum deserialization fixtures would say immediately.
  */
 export bool g1InSubgroup(G1 p) {
   if (g1IsInfinity(p)) { return true; }
-  return g1IsInfinity(g1Mul(p, groupOrder()));
+  G1 xp = g1Negate(g1Mul(p, absX()));
+  return g1Same(g1Phi(p), g1Mul(xp, absX()));
 }
 
 /** Affine x and y, or null for infinity, which has neither. */

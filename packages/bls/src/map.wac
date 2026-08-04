@@ -19,7 +19,8 @@
 import { fpZero, fpOne } from "./fp.wac";
 import { Fp2, fp2Add, fp2Sub, fp2Mul, fp2Square, fp2Neg, fp2Zero, fp2One, fp2IsZero, fp2Equals,
          fp2Copy, fp2Invert, fp2Sqrt, fp2Sgn0, fp2Inv0, fp2IsSquare } from "./fp2.wac";
-import { G2, g2Add, g2Mul } from "./g2.wac";
+import { G2, g2Add, g2Mul, g2Double, g2Negate, g2Psi,
+         absX as absXScalar } from "./g2.wac";
 import { hashToFieldFp2 } from "./hash.wac";
 
 /** A' = 240·u, the isogenous curve's A. */
@@ -229,6 +230,32 @@ Fp2 isoK42() {
   b[8] = 0xca9e2dc3; b[9] = 0x393a9cba; b[10] = 0xfaee5748; b[11] = 0x14be74db;
   return Fp2(a, b);
 }
+
+/** -B'/A', a constant the map needs on every call. */
+Fp2 swuNegBOverA() {
+  u32[] a = u32[12]();
+  a[0] = 0x55474fb3; a[1] = 0x903c5555; a[2] = 0xce451105; a[3] = 0x5f98cc95;
+  a[4] = 0xefe0fade; a[5] = 0x9f8e582e; a[6] = 0xaebbd062; a[7] = 0xc68946b6;
+  a[8] = 0x0ee6de53; a[9] = 0x467a4ad1; a[10] = 0x83e23a05; a[11] = 0x0e7146f4;
+  u32[] b = u32[12]();
+  b[0] = 0xaab85af8; b[1] = 0x29c2aaaa; b[2] = 0xe30eeefa; b[3] = 0xbf133368;
+  b[4] = 0x06cffb45; b[5] = 0xc7a27a72; b[6] = 0x44c9425c; b[7] = 0x9dee04ce;
+  b[8] = 0x3464ce83; b[9] = 0x04a15ce5; b[10] = 0xb59dac95; b[11] = 0x0b8fcaf5;
+  return Fp2(a, b);
+}
+/** -1/Z, the value substituted when the SSWU denominator vanishes. */
+Fp2 swuNegInvZ() {
+  u32[] a = u32[12]();
+  a[0] = 0x00011110; a[1] = 0xacd00000; a[2] = 0xc88ccccd; a[3] = 0x9dd9999d;
+  a[4] = 0xb76352bf; a[5] = 0xb5ca2ac9; a[6] = 0xf4bc90ce; a[7] = 0xf1b574bc;
+  a[8] = 0x28a77081; a[9] = 0x42dab41f; a[10] = 0x14cd1e12; a[11] = 0x132fc6ac;
+  u32[] b = u32[12]();
+  b[0] = 0xffff2223; b[1] = 0xe396ffff; b[2] = 0xcd0d9998; b[3] = 0x4fbf332f;
+  b[4] = 0x1aff4cc4; b[5] = 0x0c4bbd3c; b[6] = 0x7926ca58; b[7] = 0x6b9c9126;
+  b[8] = 0xaef7f496; b[9] = 0x29ae4da6; b[10] = 0x2f195791; b[11] = 0x10692e94;
+  return Fp2(a, b);
+}
+
 /**
  * Simplified SWU onto E', returning affine (x, y).
  *
@@ -248,25 +275,29 @@ Fp2[] mapToCurveSswu(Fp2 u) {
   x1 = fp2Inv0(x1);
   bool degenerate = fp2IsZero(x1);
   x1 = fp2Add(x1, fp2One());
-  if (degenerate) {
-    // x1 = −1/Z, the value the RFC substitutes when the denominator vanishes.
-    Fp2? zi = fp2Invert(z);
-    x1 = (zi is null) ? fp2Zero() : fp2Neg(zi!);
-  }
-  // x1 = (−B/A)·(1 + 1/(Z²u⁴ + Zu²))
-  Fp2? ai = fp2Invert(a);
-  Fp2 c1 = (ai is null) ? fp2Zero() : fp2Neg(fp2Mul(b, ai!));
-  x1 = fp2Mul(x1, c1);
+  // −1/Z, the value the RFC substitutes when the denominator vanishes. A constant: the first
+  // version inverted Z here on every call, and Z is `swuZ()`.
+  if (degenerate) { x1 = swuNegInvZ(); }
+  // x1 = (−B/A)·(1 + 1/(Z²u⁴ + Zu²)). −B/A is likewise a constant, and was likewise being
+  // recomputed with a 570-multiplication inversion every time through.
+  x1 = fp2Mul(x1, swuNegBOverA());
 
   Fp2 gx1 = fp2Add(fp2Mul(fp2Add(fp2Square(x1), a), x1), b);   // x1³ + A·x1 + B
   Fp2 x2 = fp2Mul(tv1, x1);                                    // Z·u²·x1
   Fp2 gx2 = fp2Mul(gx1, fp2Mul(tv1, tv2));                     // (Z·u²)³·gx1
 
-  bool square = fp2IsSquare(gx1);
+  // One square root, not two. `fp2IsSquare` *is* an attempted root, so asking whether gx1 is a
+  // square and then taking its root computed the same expensive thing twice — and a root is a
+  // square-root exponentiation plus two inversions.
+  Fp2? root1 = fp2Sqrt(gx1);
+  bool square = root1 is not null;
   Fp2 x = square ? x1 : x2;
-  Fp2 y2 = square ? gx1 : gx2;
-  Fp2? root = fp2Sqrt(y2);
-  Fp2 y = (root is null) ? fp2Zero() : root!;
+  Fp2 y = fp2Zero();
+  if (square) { y = root1!; }
+  else {
+    Fp2? root2 = fp2Sqrt(gx2);
+    if (root2 is not null) { y = root2!; }
+  }
 
   // The sign of y follows the sign of u, by `sgn0` — parity, not the compression convention.
   if (fp2Sgn0(y) != fp2Sgn0(u)) { y = fp2Neg(y); }
@@ -328,31 +359,34 @@ export G2 mapToCurveG2(Fp2 u) {
 }
 
 /**
- * `h_eff` from RFC 9380 §8.8.2 — the scalar `clear_cofactor` multiplies by.
+ * `clear_cofactor` by Budroni–Pintore (eprint 2017/419), rather than by multiplying by `h_eff`.
  *
- * 636 bits in 20 words, taken from the draft by script. It is not the bare cofactor: the RFC
- * uses a multiple chosen so that one multiplication both clears the cofactor and lands in the
- * right subgroup, which is why the value looks nothing like |E'(Fp2)|/r.
+ * The RFC defines the operation as `h_eff · P` with `h_eff` 636 bits, which is 636 doublings. This
+ * computes the same subgroup element as
+ *
+ *     [x²−x−1]P + [x−1]Ψ(P) + Ψ²(2P)
+ *
+ * using the ψ endomorphism and two multiplications by the 64-bit |x| — measured, 12 ms of the
+ * original 109. Ψ² is ψ applied twice; a dedicated ψ² map would save one Frobenius pair and is not
+ * worth the second constant table.
+ *
+ * The signs are the whole difficulty. BLS12-381's x is **negative**, so `absXScalar()` is |x| and
+ * each multiplication by it is followed by a negation. I first wrote this chain from memory and got
+ * exactly that wrong — dropping both negations — which produces a point that is on the curve, in a
+ * subgroup, and not the right one. Bilinearity would not have noticed. The version here follows
+ * `@noble/curves` line for line, and what checks it is RFC 9380 §J.10's final `P` values together
+ * with Ethereum's `hash_to_G2` fixtures, neither of which this implementation had any hand in.
  */
-u32[] hEff() {
-  u32[] v = u32[20]();
-  v[0] = 0xaaa95551; v[1] = 0xe8020005; v[2] = 0xdebbf6b4; v[3] = 0x59894c0a;
-  v[4] = 0x6689f6a3; v[5] = 0xe954cbc0; v[6] = 0xd7477c1a; v[7] = 0x2ec0ec69;
-  v[8] = 0x5d1212b0; v[9] = 0x6d82bf01; v[10] = 0x8731db95; v[11] = 0x329c2f17;
-  v[12] = 0x1508ffe1; v[13] = 0x9986ff03; v[14] = 0x145ad768; v[15] = 0x88e2a8e9;
-  v[16] = 0xa91b3528; v[17] = 0x584c6a0e; v[18] = 0xf2ee75b3; v[19] = 0x0bc69f08;
-  return v;
+export G2 clearCofactorG2(G2 p) {
+  G2 t1 = g2Negate(g2Mul(p, absXScalar()));            // [−x]P
+  G2 t2 = g2Psi(p);                                    // Ψ(P)
+  G2 t3 = g2Psi(g2Psi(g2Double(p)));                   // Ψ²(2P)
+  t3 = g2Add(t3, g2Negate(t2));                        // Ψ²(2P) − Ψ(P)
+  t2 = g2Negate(g2Mul(g2Add(t1, t2), absXScalar()));   // [x²]P − [x]Ψ(P)
+  t3 = g2Add(t3, t2);
+  t3 = g2Add(t3, g2Negate(t1));
+  return g2Add(t3, g2Negate(p));
 }
-/**
- * `clear_cofactor(P) = h_eff · P`.
- *
- * The slow, obvious way: 636 doublings and a handful of additions. Budroni–Pintore does the same
- * job with the ψ endomorphism in a fraction of the time, and it is also where a subtle error puts
- * a point in the wrong subgroup while every arithmetic test still passes. This is a verifier with
- * no benchmark yet, so the version that is hard to get wrong wins for now — and the note is here
- * so the next person knows the faster route exists and why it was not taken.
- */
-export G2 clearCofactorG2(G2 p) { return g2Mul(p, hEff()); }
 
 /**
  * `hash_to_G2(msg, DST)` — RFC 9380's random-oracle encoding.

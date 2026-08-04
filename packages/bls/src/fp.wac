@@ -94,26 +94,201 @@ export bool fpEquals(u32[] a, u32[] b) {
   return true;
 }
 
+/**
+ * The modulus limb by limb, as constants rather than an array.
+ *
+ * `modulus()` above allocates a fresh twelve-word array on every call, and the two functions below
+ * are called by every addition and subtraction in the package — an `fpAdd` that has to reduce used
+ * to allocate four arrays to produce one result. Measured on an add chain, going through constants
+ * instead is worth about a quarter of the operation; `test/wac/flat.wac` is where that number comes
+ * from. `fpMul` keeps the array, because it indexes p in an inner loop and the same 8ns against its
+ * 350 is not worth unrolling for.
+ *
+ * Generated from the same digits as `modulus()`, which is the risk: two spellings of p that could
+ * drift. `fp_wac.test.ts` checks they agree rather than trusting that they do.
+ */
+const u32 P0  = 0xffffaaab;  const u32 P1  = 0xb9feffff;  const u32 P2  = 0xb153ffff;
+const u32 P3  = 0x1eabfffe;  const u32 P4  = 0xf6b0f624;  const u32 P5  = 0x6730d2a0;
+const u32 P6  = 0xf38512bf;  const u32 P7  = 0x64774b84;  const u32 P8  = 0x434bacd7;
+const u32 P9  = 0x4b1ba7b6;  const u32 P10 = 0x397fe69a;  const u32 P11 = 0x1a0111ea;
+
+/** The i-th limb of p, from the constants rather than a fresh array. */
+u32 modulusWord(i32 i) {
+  if (i == 0) { return P0; }   if (i == 1) { return P1; }
+  if (i == 2) { return P2; }   if (i == 3) { return P3; }
+  if (i == 4) { return P4; }   if (i == 5) { return P5; }
+  if (i == 6) { return P6; }   if (i == 7) { return P7; }
+  if (i == 8) { return P8; }   if (i == 9) { return P9; }
+  if (i == 10) { return P10; }
+  return P11;
+}
+
 /** Whether `a` is at least `p`, so the caller knows to subtract it. */
 bool atLeastModulus(u32[] a) {
-  u32[] p = modulus();
-  for (i32 i = LIMBS - 1; i >= 0; i--) {
-    if (a[i] != p[i]) { return (a[i] as u64) > (p[i] as u64); }
-  }
+  if (a[11] != P11) { return (a[11] as u64) > (P11 as u64); }
+  if (a[10] != P10) { return (a[10] as u64) > (P10 as u64); }
+  if (a[9] != P9) { return (a[9] as u64) > (P9 as u64); }
+  if (a[8] != P8) { return (a[8] as u64) > (P8 as u64); }
+  if (a[7] != P7) { return (a[7] as u64) > (P7 as u64); }
+  if (a[6] != P6) { return (a[6] as u64) > (P6 as u64); }
+  if (a[5] != P5) { return (a[5] as u64) > (P5 as u64); }
+  if (a[4] != P4) { return (a[4] as u64) > (P4 as u64); }
+  if (a[3] != P3) { return (a[3] as u64) > (P3 as u64); }
+  if (a[2] != P2) { return (a[2] as u64) > (P2 as u64); }
+  if (a[1] != P1) { return (a[1] as u64) > (P1 as u64); }
+  if (a[0] != P0) { return (a[0] as u64) > (P0 as u64); }
   return true;                    // exactly p
 }
 
 /** `a − p`, wrapping. Only called when `a >= p`. */
 u32[] subModulus(u32[] a) {
-  u32[] p = modulus();
   u32[] out = u32[LIMBS]();
   i64 borrow = 0;
-  for (i32 i = 0; i < LIMBS; i++) {
-    i64 d = (a[i] as i64) - (p[i] as i64) - borrow;
-    out[i] = (d & 0xFFFFFFFF) as@ u32;
-    borrow = (d < 0) ? 1 : 0;
-  }
+  i64 d = 0;
+  d = (a[0] as i64) - (P0 as i64) - borrow;
+  out[0] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[1] as i64) - (P1 as i64) - borrow;
+  out[1] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[2] as i64) - (P2 as i64) - borrow;
+  out[2] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[3] as i64) - (P3 as i64) - borrow;
+  out[3] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[4] as i64) - (P4 as i64) - borrow;
+  out[4] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[5] as i64) - (P5 as i64) - borrow;
+  out[5] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[6] as i64) - (P6 as i64) - borrow;
+  out[6] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[7] as i64) - (P7 as i64) - borrow;
+  out[7] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[8] as i64) - (P8 as i64) - borrow;
+  out[8] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[9] as i64) - (P9 as i64) - borrow;
+  out[9] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[10] as i64) - (P10 as i64) - borrow;
+  out[10] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[11] as i64) - (P11 as i64) - borrow;
+  out[11] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
   return out;
+}
+
+/**
+ * `a −= p` and `a += p`, in place.
+ *
+ * The allocating `subModulus` above is still used by `fpModulusConstantsAgree`, but the hot callers
+ * own their `out` array outright — it was allocated three lines earlier and nobody else has seen it
+ * — so there is no reason to allocate a second one to hold the corrected value. That halves the
+ * allocations on the reduce path, which `fpAdd` takes for roughly half of all inputs.
+ */
+void subModulusInPlace(u32[] a) {
+  i64 borrow = 0;
+  i64 d = 0;
+  d = (a[0] as i64) - (P0 as i64) - borrow;
+  a[0] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[1] as i64) - (P1 as i64) - borrow;
+  a[1] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[2] as i64) - (P2 as i64) - borrow;
+  a[2] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[3] as i64) - (P3 as i64) - borrow;
+  a[3] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[4] as i64) - (P4 as i64) - borrow;
+  a[4] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[5] as i64) - (P5 as i64) - borrow;
+  a[5] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[6] as i64) - (P6 as i64) - borrow;
+  a[6] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[7] as i64) - (P7 as i64) - borrow;
+  a[7] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[8] as i64) - (P8 as i64) - borrow;
+  a[8] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[9] as i64) - (P9 as i64) - borrow;
+  a[9] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[10] as i64) - (P10 as i64) - borrow;
+  a[10] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+  d = (a[11] as i64) - (P11 as i64) - borrow;
+  a[11] = (d & 0xFFFFFFFF) as@ u32;
+  borrow = (d < 0) ? 1 : 0;
+}
+
+void addModulusInPlace(u32[] a) {
+  u64 carry = 0;
+  u64 t = 0;
+  t = (a[0] as u64) + (P0 as u64) + carry;
+  a[0] = (t & 0xFFFFFFFF) as@ u32;
+  carry = t >> 32;
+  t = (a[1] as u64) + (P1 as u64) + carry;
+  a[1] = (t & 0xFFFFFFFF) as@ u32;
+  carry = t >> 32;
+  t = (a[2] as u64) + (P2 as u64) + carry;
+  a[2] = (t & 0xFFFFFFFF) as@ u32;
+  carry = t >> 32;
+  t = (a[3] as u64) + (P3 as u64) + carry;
+  a[3] = (t & 0xFFFFFFFF) as@ u32;
+  carry = t >> 32;
+  t = (a[4] as u64) + (P4 as u64) + carry;
+  a[4] = (t & 0xFFFFFFFF) as@ u32;
+  carry = t >> 32;
+  t = (a[5] as u64) + (P5 as u64) + carry;
+  a[5] = (t & 0xFFFFFFFF) as@ u32;
+  carry = t >> 32;
+  t = (a[6] as u64) + (P6 as u64) + carry;
+  a[6] = (t & 0xFFFFFFFF) as@ u32;
+  carry = t >> 32;
+  t = (a[7] as u64) + (P7 as u64) + carry;
+  a[7] = (t & 0xFFFFFFFF) as@ u32;
+  carry = t >> 32;
+  t = (a[8] as u64) + (P8 as u64) + carry;
+  a[8] = (t & 0xFFFFFFFF) as@ u32;
+  carry = t >> 32;
+  t = (a[9] as u64) + (P9 as u64) + carry;
+  a[9] = (t & 0xFFFFFFFF) as@ u32;
+  carry = t >> 32;
+  t = (a[10] as u64) + (P10 as u64) + carry;
+  a[10] = (t & 0xFFFFFFFF) as@ u32;
+  carry = t >> 32;
+  t = (a[11] as u64) + (P11 as u64) + carry;
+  a[11] = (t & 0xFFFFFFFF) as@ u32;
+  carry = t >> 32;
+}
+
+/**
+ * That `P0..P11` really are the same p as `modulus()`.
+ *
+ * Exported only so the probe can reach it: p appears twice in this file now, once as an array for
+ * `fpMul` and once as constants for the reduction, and nothing else would notice them drifting. A
+ * single wrong word in the constants gives arithmetic that is wrong for a narrow band of inputs —
+ * exactly the fault that random vectors miss and that only shows up months later.
+ */
+export bool fpModulusConstantsAgree() {
+  u32[] p = modulus();
+  if (!atLeastModulus(p)) { return false; }            // p >= p
+  if (!fpIsZero(subModulus(p))) { return false; }      // p − p == 0, limb by limb
+  u32[] below = fpCopy(p);
+  below[0] = p[0] - 1;                                 // p's low limb is 0xffffaaab, so no borrow
+  return !atLeastModulus(below);                       // p − 1 < p
 }
 
 export u32[] fpAdd(u32[] a, u32[] b) {
@@ -126,7 +301,7 @@ export u32[] fpAdd(u32[] a, u32[] b) {
   }
   // A 381-bit prime in 384 bits leaves three spare bits, so a sum of two reduced values
   // cannot overflow the array — but it can exceed p, and once only.
-  if (carry != 0 || atLeastModulus(out)) { return subModulus(out); }
+  if (carry != 0 || atLeastModulus(out)) { subModulusInPlace(out); }
   return out;
 }
 
@@ -140,15 +315,8 @@ export u32[] fpSub(u32[] a, u32[] b) {
   }
   if (borrow == 0) { return out; }
   // Underflowed: add p back, which is the same as working modulo 2^384 and correcting.
-  u32[] p = modulus();
-  u32[] fixed = u32[LIMBS]();
-  u64 carry = 0;
-  for (i32 i = 0; i < LIMBS; i++) {
-    u64 t = (out[i] as u64) + (p[i] as u64) + carry;
-    fixed[i] = (t & 0xFFFFFFFF) as@ u32;
-    carry = t >> 32;
-  }
-  return fixed;
+  addModulusInPlace(out);
+  return out;
 }
 
 export u32[] fpNeg(u32[] a) {
@@ -178,29 +346,30 @@ export u32[] fpMul(u32[] a, u32[] b) {
     }
     u64 hi = t[LIMBS] + carry;
     t[LIMBS] = hi & 0xFFFFFFFF;
-    t[LIMBS + 1] = t[LIMBS + 1] + (hi >> 32);
+    t[LIMBS + 1] = hi >> 32;
 
     // m clears the bottom limb: t + m·p ≡ t (mod p) and ends in zero.
+    //
+    // The division by 2³² that Montgomery form pays for is that discarded zero limb, and it does
+    // not need a shift pass: the reduction loop stores to `t[j-1]` as it goes, so the whole array
+    // slides down by one as a side effect of work it was doing anyway. Written as a separate
+    // 13-element copy it was a third of this function's array traffic for nothing.
     u64 m = ((t[0] * INV) & 0xFFFFFFFF);
-    carry = 0;
-    for (i32 j = 0; j < LIMBS; j++) {
+    carry = (t[0] + (p[0] as u64) * m) >> 32;    // the low word is zero by choice of m
+    for (i32 j = 1; j < LIMBS; j++) {
       u64 acc = t[j] + (p[j] as u64) * m + carry;
-      t[j] = acc & 0xFFFFFFFF;
+      t[j - 1] = acc & 0xFFFFFFFF;
       carry = acc >> 32;
     }
     hi = t[LIMBS] + carry;
-    t[LIMBS] = hi & 0xFFFFFFFF;
-    t[LIMBS + 1] = t[LIMBS + 1] + (hi >> 32);
-
-    // Shift down one limb, which is the division by 2³² that Montgomery form pays for.
-    for (i32 j = 0; j <= LIMBS; j++) { t[j] = t[j + 1]; }
-    t[LIMBS + 1] = 0;
+    t[LIMBS - 1] = hi & 0xFFFFFFFF;
+    t[LIMBS] = t[LIMBS + 1] + (hi >> 32);
   }
 
   u32[] out = u32[LIMBS]();
   for (i32 i = 0; i < LIMBS; i++) { out[i] = (t[i] & 0xFFFFFFFF) as@ u32; }
   // One conditional subtraction: the result is below 2p, never more.
-  if (t[LIMBS] != 0 || atLeastModulus(out)) { return subModulus(out); }
+  if (t[LIMBS] != 0 || atLeastModulus(out)) { subModulusInPlace(out); }
   return out;
 }
 
@@ -267,25 +436,129 @@ u32[] powRaw(u32[] a, u32[] e) {
   return acc;
 }
 
-/** p − 2, the Fermat inversion exponent. */
-u32[] pMinusTwo() {
-  u32[] e = modulus();
-  e[0] = 0xffffaaa9;            // p ends in ...aaab, so p−2 ends in ...aaa9
-  return e;
+// --- Inversion by binary extended GCD ------------------------------------------------------
+//
+// Fermat's little theorem gives inversion for free once you have exponentiation — a^(p−2) — and
+// that is what this used to do. It costs 381 squarings and about 190 multiplications, which
+// measured is 3.1 ms of a 19 ms signature verification: roughly a sixth of the total, spent in
+// about ten calls hidden inside affine conversion, `fp2Invert` and the SSWU map.
+//
+// Binary extended GCD replaces all of it with shifts, compares and additions. There are no
+// multiplications at all, and the loop runs at most about 2·381 halvings.
+//
+// This is *not* constant time — the iteration count depends on the value. That is deliberate and
+// safe here: every inversion in this package is applied to public data (a public key, a signature,
+// a hashed message, a point being decompressed). Nothing secret is ever inverted, because nothing
+// in signature verification is secret. A signing implementation could not reuse this as it stands,
+// which is why it says so here rather than in a commit message.
+
+bool isEvenRaw(u32[] a) { return (a[0] & 1) == 0; }
+
+bool isOneRaw(u32[] a) {
+  if (a[0] != 1) { return false; }
+  for (i32 i = 1; i < LIMBS; i++) {
+    if (a[i] != 0) { return false; }
+  }
+  return true;
+}
+
+/** `a >>= 1`. */
+void shr1Raw(u32[] a) {
+  for (i32 i = 0; i < LIMBS - 1; i++) {
+    a[i] = (a[i] >> 1) | ((a[i + 1] & 1) << 31);
+  }
+  a[LIMBS - 1] = a[LIMBS - 1] >> 1;
 }
 
 /**
- * `a⁻¹ mod p` by Fermat, or null for zero.
+ * `a = (a + p) >> 1`, used when `a` is odd and must be halved modulo p.
  *
- * Fermat rather than extended Euclid: it is ~570 multiplications against a few hundred
- * conditional subtractions, which is slower, but it is a dozen lines that reuse the multiply
- * already tested to death rather than a new algorithm with its own edge cases. Inversion is
- * off the hot path — point decompression and the final exponentiation's easy part — so the
- * trade is the right way round here.
+ * The sum needs no thirteenth limb. `a` is always below p here — it starts at 1, and every update
+ * is either a halving or a `subModRaw`, both of which stay below p — so `a + p < 2p < 2^382`, and
+ * a 381-bit prime in 384 bits leaves the three spare bits that makes that fit. I wrote a carry
+ * branch first and then checked whether it was reachable: it is not, across every inversion in the
+ * suite, which agrees with the arithmetic rather than merely failing to contradict it.
+ */
+void halveWithModulus(u32[] a) {
+  u64 carry = 0;
+  for (i32 i = 0; i < LIMBS; i++) {
+    u64 t = (a[i] as u64) + (modulusWord(i) as u64) + carry;
+    a[i] = (t & 0xFFFFFFFF) as@ u32;
+    carry = t >> 32;
+  }
+  shr1Raw(a);
+}
+
+/** Whether `a >= b`, as plain integers. */
+bool geRaw(u32[] a, u32[] b) {
+  for (i32 i = LIMBS - 1; i >= 0; i--) {
+    if (a[i] != b[i]) { return (a[i] as u64) > (b[i] as u64); }
+  }
+  return true;
+}
+
+/** `a -= b`, wrapping. Only called when `a >= b`. */
+void subRaw(u32[] a, u32[] b) {
+  i64 borrow = 0;
+  for (i32 i = 0; i < LIMBS; i++) {
+    i64 d = (a[i] as i64) - (b[i] as i64) - borrow;
+    a[i] = (d & 0xFFFFFFFF) as@ u32;
+    borrow = (d < 0) ? 1 : 0;
+  }
+}
+
+/** `a = (a − b) mod p`, for `a`, `b` already below p. */
+void subModRaw(u32[] a, u32[] b) {
+  if (geRaw(a, b)) { subRaw(a, b); return; }
+  // a < b, so a − b + p, computed as a + (p − b).
+  u32[] t = fpCopy(b);
+  u32[] p = modulus();
+  subRaw(p, t);            // p − b
+  u64 carry = 0;
+  for (i32 i = 0; i < LIMBS; i++) {
+    u64 s = (a[i] as u64) + (p[i] as u64) + carry;
+    a[i] = (s & 0xFFFFFFFF) as@ u32;
+    carry = s >> 32;
+  }
+  if (carry != 0 || atLeastModulus(a)) { subModulusInPlace(a); }
+}
+
+/**
+ * `a⁻¹` in Montgomery form, or null for zero.
+ *
+ * The GCD below works on plain integers, so it inverts the *stored* value: given A = aR it returns
+ * A⁻¹ = a⁻¹R⁻¹, and the answer wanted is a⁻¹R. Two factors of R are missing, which is exactly two
+ * applications of `toMont`. Getting that wrong gives an answer off by a factor of R — self-
+ * consistent, and wrong against every vector, which is how the fixtures would report it.
  */
 export u32[]? fpInvert(u32[] a) {
   if (fpIsZero(a)) { return null; }
-  return powRaw(a, pMinusTwo());
+  u32[] u = fpCopy(a);
+  u32[] v = modulus();
+  u32[] x1 = fpZero();
+  x1[0] = 1;
+  u32[] x2 = fpZero();
+
+  while (!isOneRaw(u) && !isOneRaw(v)) {
+    while (isEvenRaw(u)) {
+      shr1Raw(u);
+      if (isEvenRaw(x1)) { shr1Raw(x1); } else { halveWithModulus(x1); }
+    }
+    while (isEvenRaw(v)) {
+      shr1Raw(v);
+      if (isEvenRaw(x2)) { shr1Raw(x2); } else { halveWithModulus(x2); }
+    }
+    if (geRaw(u, v)) {
+      subRaw(u, v);
+      subModRaw(x1, x2);
+    } else {
+      subRaw(v, u);
+      subModRaw(x2, x1);
+    }
+  }
+
+  u32[] inv = isOneRaw(u) ? x1 : x2;
+  return toMont(toMont(inv));
 }
 
 /** (p + 1)/4, the square-root exponent. Valid because p ≡ 3 (mod 4). */
@@ -388,4 +661,19 @@ export u32[] fpInv0(u32[] a) {
 export bool fpIsSquare(u32[] a) {
   if (fpIsZero(a)) { return true; }
   return fpSqrt(a) is not null;
+}
+
+/**
+ * 1/2, in Montgomery form.
+ *
+ * A constant because three separate places were computing it with `fpInvert` — a 570-multiplication
+ * Fermat exponentiation — on every call. One of them was inside a Miller loop and cost 28 ms of a
+ * 36 ms loop. Halving is common enough in curve formulas that it belongs here once.
+ */
+export u32[] fpHalf() {
+  u32[] v = u32[12]();
+  v[0] = 0x00015554; v[1] = 0x18040000; v[2] = 0x3ab00001; v[3] = 0x85500005;
+  v[4] = 0x253c276f; v[5] = 0x633cb57c; v[6] = 0x31ebb502; v[7] = 0x6e22d1ec;
+  v[8] = 0xf2d14ca2; v[9] = 0xd3916126; v[10] = 0x1a006596; v[11] = 0x17fbb857;
+  return v;
 }

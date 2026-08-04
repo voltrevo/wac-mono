@@ -28,7 +28,7 @@ import { Fp12, fp12Mul, fp12IsOne } from "./fp12.wac";
 import { G1, g1FromBytes, g1Generator, g1Negate, g1IsInfinity, g1AffineX, g1AffineY } from "./g1.wac";
 import { G2, g2FromBytes, g2IsInfinity, g2AffineX, g2AffineY } from "./g2.wac";
 import { Fp2 } from "./fp2.wac";
-import { millerLoop, finalExponentiate } from "./pairing.wac";
+import { millerLoop, millerLoopTwo, finalExponentiate } from "./pairing.wac";
 import { hashToG2 } from "./map.wac";
 
 /** The domain separation tag Ethereum signatures use. */
@@ -71,11 +71,21 @@ export bool verify(u8[] pubkey, u8[] message, u8[] signature) {
   G2 h = hashToG2(message, ethDst());
   if (g2IsInfinity(h)) { return false; }
 
-  Fp12? a = loopFor(pk!, h);
-  Fp12? b = loopFor(g1Negate(g1Generator()), sig!);
-  if ((a is null) || (b is null)) { return false; }
+  // e(pk, H) · e(−G₁, sig), as one Miller loop over both pairs and one final exponentiation.
+  G1 ng = g1Negate(g1Generator());
+  u32[]? ax = g1AffineX(pk!);
+  u32[]? ay = g1AffineY(pk!);
+  Fp2? aqx = g2AffineX(h);
+  Fp2? aqy = g2AffineY(h);
+  u32[]? bx = g1AffineX(ng);
+  u32[]? by = g1AffineY(ng);
+  Fp2? bqx = g2AffineX(sig!);
+  Fp2? bqy = g2AffineY(sig!);
+  if ((ax is null) || (ay is null) || (aqx is null) || (aqy is null)) { return false; }
+  if ((bx is null) || (by is null) || (bqx is null) || (bqy is null)) { return false; }
 
-  Fp12? e = finalExponentiate(fp12Mul(a!, b!));
+  Fp12? e = finalExponentiate(
+    millerLoopTwo(ax!, ay!, aqx!, aqy!, bx!, by!, bqx!, bqy!));
   if (e is null) { return false; }
   return fp12IsOne(e!);
 }
