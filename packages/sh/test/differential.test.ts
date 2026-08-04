@@ -937,8 +937,23 @@ async function bash(script: string) {
  * process ids once already today for a related reason — see wac-mono 0017 — and the build is the
  * slow part regardless.
  */
+/**
+ * Remove the built shell however this file ends.
+ *
+ * `Deno.test` has no suite-level teardown, so a module-level temp had nowhere to be cleaned up: 98 of
+ * these were sitting in `/tmp` — one 400 KiB shell per run of the suite, since March by the timestamps —
+ * and the same leak in `spawn.test.ts` is what filled the disk once already today. `unload` fires
+ * whether the tests passed, failed or threw, which is the only hook that covers all three.
+ */
 const wacshBinary = await (async () => {
   const out = await Deno.makeTempFile({ prefix: "wacsh-" });
+  globalThis.addEventListener("unload", () => {
+    try {
+      Deno.removeSync(out);
+    } catch {
+      // Already gone, or never built. Nothing to report on the way out.
+    }
+  });
   const r = await new Deno.Command("deno", {
     args: [
       "run", "-A", "packages/platform/build.ts", "packages/sh/src/sh.wac",
