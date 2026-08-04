@@ -4,7 +4,7 @@ import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, flagValue } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
 import { Line, Lines, emitTo, nextLine } from "../lib/reader.wac";
-import { Sink } from "../lib/out.wac";
+import { Sink } from "../../../platform/src/stream.wac";
 import { slice } from "../lib/bytes.wac";
 import { atoi } from "../lib/num.wac";
 

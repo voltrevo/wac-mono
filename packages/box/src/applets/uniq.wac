@@ -7,7 +7,7 @@ import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
 import { Line, Lines, emitTo, nextLine } from "../lib/reader.wac";
-import { Sink } from "../lib/out.wac";
+import { Sink } from "../../../platform/src/stream.wac";
 import { cmpBytes } from "../lib/lines.wac";
 import { itoa } from "../lib/num.wac";
 

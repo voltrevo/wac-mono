@@ -360,11 +360,22 @@ Deno.test("wc reads standard input when given no file", async () => {
 });
 
 Deno.test("stat and readDir reach the application, and are gated", async () => {
-  const listed = await runFilter(HEXDUMP, ["packages/platform/src"], new Uint8Array(), {
-    read: true,
-  });
-  assertEquals(listed.code, 0, listed.err);
-  assertEquals(new TextDecoder().decode(listed.out).trim(), "platform.wac");
+  // A directory of this test's own making, listed against what was put in it. It used to list
+  // `packages/platform/src` and expect exactly "platform.wac", which meant adding a second file to this
+  // package — `stream.wac` — failed a test about `readDir`. A fixture that changes when the source tree
+  // changes is testing the source tree.
+  const dir = await Deno.makeTempDir({ prefix: "wac-readdir-" });
+  try {
+    await Deno.writeTextFile(`${dir}/one.txt`, "1");
+    await Deno.writeTextFile(`${dir}/two.txt`, "2");
+    await Deno.mkdir(`${dir}/sub`);
+    const listed = await runFilter(HEXDUMP, [dir], new Uint8Array(), { read: true });
+    assertEquals(listed.code, 0, listed.err);
+    assertEquals(new TextDecoder().decode(listed.out).trim().split("\n").sort().join(" "),
+      "one.txt sub two.txt");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
 
   // Without the grant, `stat` reports "does not exist" rather than throwing: an
   // application cannot tell a withheld capability from an absent file, which is the

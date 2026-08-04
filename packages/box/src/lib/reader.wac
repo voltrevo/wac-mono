@@ -15,7 +15,7 @@
 // `scanned` watermark for the search make both halves linear.
 
 import { Cli } from "../../../platform/src/platform.wac";
-import { Sink } from "./out.wac";
+import { Sink } from "../../../platform/src/stream.wac";
 import { slice } from "./bytes.wac";
 import { Buf } from "../../../bytes/src/buf.wac";
 
