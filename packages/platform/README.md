@@ -416,6 +416,19 @@ Running a *program* is therefore two steps, read it and spawn it, which is why t
 registry of launchable things: the capability is "run this", and where the code came from is
 the filesystem's business.
 
+**`spawn` answers only once the source has loaded**, so a file that is not a worker bundle is a
+failed child rather than a dead parent. That took two things. Deno re-raises an unhandled worker
+error as the *host's* own uncaught error, so a `SyntaxError` in the child killed the program that
+spawned it — a shell handed a text file exited 1 with Deno's message and never got to call it a
+failed command. And the handle used to be answered before the failure could happen, so `Child.error`
+was always empty. The worker now posts a notice as soon as its bundle evaluates, and `spawn` waits
+for either that or the load error: a handle means it is running, and -1 with a message means it never
+started. Issue 0021.
+
+The grace period on that wait resolves as *alive*, never as failed — a slow load on a busy machine
+must not be reported as a program that would not start. Which leaves the case where a file parses and
+then says nothing at all, and that still hangs: issue 0033, where the trade-off is written down.
+
 `closeFeed` is distinct from `closeSocket` because they differ in a way that matters:
 `closeFeed` ends the child's standard input, `closeSocket` stops the child. A program that
 reads to the end before answering — `wc` — needs the end while it is still alive.

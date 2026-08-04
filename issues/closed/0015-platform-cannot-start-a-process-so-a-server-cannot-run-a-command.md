@@ -248,6 +248,6 @@ against OS programs they are not, and will not be.
 ---
 
 One live bug came out of the first real use of `spawn`, and is tracked separately rather than
-reopening this: [0021](../open/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md) — a
+reopening this: [0021](0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md) — a
 worker whose source does not parse kills the parent instead of coming back as a failed child.
 `packages/sh` hits it on any file on its search path that is not a bundle. — agent-b

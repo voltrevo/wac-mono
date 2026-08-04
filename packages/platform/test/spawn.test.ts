@@ -51,6 +51,43 @@ Deno.test("a wac program runs another wac program as a worker", async () => {
   }
 });
 
+Deno.test("a source that is not a program is a failed child, not a dead parent — 0021", async () => {
+  // Not a shell test. `packages/sh` was where this was found, but the parent here is platform's
+  // own example: a worker whose source does not parse throws while loading, and that error is not
+  // contained by default — it reached the parent, which died with Deno's own message on stderr
+  // before it could call the child failed. wac-mono issue 0021.
+  const runner = await Deno.makeTempFile({ prefix: "wac-runner-" });
+  const notAProgram = await Deno.makeTempFile({ prefix: "wac-bad-", suffix: ".worker.js" });
+  try {
+    await buildApp("packages/platform/example/runner.wac", runner, { read: true });
+    await Deno.writeTextFile(notAProgram, "this is not javascript {{{\n");
+
+    const r = new Deno.Command(runner, {
+      args: [notAProgram, "anything"],
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    const err = new TextDecoder().decode(r.stderr);
+
+    // 1, because that is what `runner.wac` returns for a child it could not start. The point is
+    // that the *program* decided it: before this, the process died with 1 and nothing of its own.
+    assertEquals(r.code, 1, err);
+    assertEquals(err.includes("runner: "), true, `the program reported it, not the runtime: ${err}`);
+    assertEquals(err.includes("SyntaxError"), true, `with the host's reason: ${err}`);
+    // The line that used to be there, and is the parent dying rather than reporting.
+    assertEquals(err.includes("Unhandled error in child worker"), false, err);
+
+    // The worker's *own* isolate still prints its uncaught error, which no parent can prevent —
+    // `preventDefault` stops the propagation, not the child's own report. So stderr holds two
+    // accounts of one failure, and only one of them is ours. Asserted rather than lamented: if
+    // Deno ever stops printing it, this is where to notice.
+    assertEquals(err.includes("Uncaught (in worker"), true, err);
+  } finally {
+    await Deno.remove(runner);
+    await Deno.remove(notAProgram);
+  }
+});
+
 Deno.test("a child is granted nothing, even by a parent that has it", async () => {
   // The property that makes `spawn` worth having over process spawn: what the child may do
   // is the *parent's* choice, not the operating system's. `--allow-run=/bin/sh` cannot

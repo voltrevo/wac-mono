@@ -1,6 +1,6 @@
 # 0021 — a spawned worker whose source does not parse kills the parent
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-b
 - **Date:** 2026-08-03
@@ -74,3 +74,47 @@ people are meant to type into, and `$WACPATH` is one `export` away from being se
 not a worker bundle is the ordinary case — anything built without `--worker`, or a text file with
 the right name — so this is a trap a user can walk into rather than a wrong answer a program has to
 be written to hit.
+
+## Closed, 2026-08-04 (agent-a)
+
+`worker.onerror` existed and was an *observer*: without `preventDefault()` Deno re-raises a worker's
+error as the parent's own uncaught error, so the handler ran, resolved the exit code as -1, and the
+parent died anyway. One line is the difference between handling an event and watching it.
+
+That alone would have left `Child.error` empty, because the handle was answered before the failure
+happened. So `spawn` now waits for the source to *load* before it answers:
+
+- `entry.ts` posts `{ready: true}` from the worker as soon as the bundle evaluates — before the
+  bridge arrives and before the application runs. It is the one fact a parent cannot otherwise
+  learn.
+- `children.ts` exposes `loaded`, resolved by whichever comes first: the notice, the load error, the
+  child finishing, or a 500 ms grace. The grace resolves as **alive**, never as failed: a bundle
+  built before `ready` existed, or a slow load on a busy machine, must not be reported as a program
+  that would not start.
+- The Deno host's `SPAWN` awaits it and answers `-1` plus the reason instead of a handle, in the
+  same shape a handle already had, so the worker-side decoder reads one i32 and takes the rest as
+  the message.
+
+`packages/sh` needed nothing, as predicted: `handle < 0` was already 126, distinct from the 127 of
+not existing. The reproduction now reads
+
+```
+sh: notaprogram: SyntaxError: Expected ';', '}' or <eof>
+still-here
+```
+
+First line only in `Child.error` — a worker's `SyntaxError` arrives with a code frame, which is
+several lines and belongs on a terminal rather than after `sh: name: `. Nothing is lost: the child's
+own isolate has already printed the whole of it, which is also the one part of this that cannot be
+fixed from the parent. `preventDefault` stops the propagation, not the child's own report, so stderr
+carries two accounts of one failure and only the second is the shell's. `platform/test/spawn.test.ts`
+asserts both, so if Deno ever stops printing its own, there is a test to notice.
+
+Tests: `packages/platform/test/spawn.test.ts` for the platform (the issue was right that this is not
+about the shell — platform's own `runner.wac` died the same way), and two in
+`packages/sh/test/spawn.test.ts`, one of which is the old test flipped to expect what it should.
+
+What is *not* fixed, and was already named here: a file that parses but never speaks the protocol
+hangs instead of failing. Measured identical before and after this change, and now filed as
+[0033](0033-a-file-that-parses-but-is-not-a-worker-bundle-wedges-the-shell.md) with the reason the
+obvious fix — treating a missing `ready` as a failure — trades a hang for false failures under load.

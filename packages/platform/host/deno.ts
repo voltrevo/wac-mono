@@ -5,7 +5,7 @@
 // know the difference.
 
 import { type Handlers, serveHostCalls } from "./respond.ts";
-import { ByteQueue, type Child, spawnChild } from "./children.ts";
+import { ByteQueue, type Child, failedChild, spawnChild } from "./children.ts";
 import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
@@ -460,8 +460,13 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
      * Its world is granted nothing: no filesystem, no network. `log`, `warn` and `write` all
      * arrive at the parent through the handle, and its reads come from what the parent
      * sends. See the notes in `children.ts` and `platform.wac`.
+     *
+     * **Answers only once the source has loaded**, which is what makes a file that is not a worker
+     * bundle a failed child rather than a dead parent: the load error used to escape into this
+     * process. A handle and no message means it is running; -1 and a message means it never
+     * started, which is what `Child.error` is for. wac-mono issue 0021.
      */
-    [OP.SPAWN]: (p) => {
+    [OP.SPAWN]: async (p) => {
       const want = readI32le(p);
       const n = readI32le(p.subarray(4));
       const source = unstr(p.subarray(8, 8 + n));
@@ -483,7 +488,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       };
 
       const h = nextHandle++;
-      children.set(h, spawnChild(source, childArgs, (sab, cargs, out, input) => {
+      const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
         const enc = new TextEncoder();
         return serveHostCalls(bridgeOf(sab), denoWorld({
           args: cargs,
@@ -502,7 +507,15 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
           writeErr: (b: Uint8Array) => out.push(b),
           readStdin: () => input.next(),
         }));
-      }, newBridge));
+      }, newBridge);
+
+      const why = await child.loaded;
+      if (why !== "") {
+        // Never registered, so there is no handle to close and nothing for the parent to clean up.
+        child.kill();
+        return failedChild(why);
+      }
+      children.set(h, child);
       return i32le(h);
     },
 

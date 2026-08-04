@@ -70,6 +70,15 @@ export class ByteQueue {
   }
 }
 
+/**
+ * How long to wait for a bundle to say it loaded before assuming it did.
+ *
+ * Only ever paid by a bundle that sends no load notice — one built before `entry.ts` had one. A
+ * current bundle answers in a millisecond, and this is not a limit on how long a *program* may
+ * take: it is a limit on how long the parent waits to hear that the source is JavaScript.
+ */
+const LOAD_GRACE_MS = 500;
+
 /** One spawned worker, from the parent's side. */
 export type Child = {
   /** What the child wrote, in order. */
@@ -78,12 +87,25 @@ export type Child = {
   in: ByteQueue;
   /** Resolves with the exit code, or a negative number if it failed to run. */
   exit: Promise<number>;
+  /**
+   * Whether the source loaded: the empty string when it did, the host's message when it did not.
+   *
+   * Awaited by `spawn` before it answers, which is the whole of the fix for wac-mono issue 0021.
+   * A source that is not JavaScript throws while the worker is loading, and that error is *not*
+   * contained by default — it propagated into the parent, which died with Deno's own message on
+   * stderr and no chance to report it. `Child.error` existed for exactly this and stayed empty,
+   * because the handle came back before the failure happened.
+   *
+   * There is nothing to wait for in the happy case beyond one message: `entry.ts` posts `ready`
+   * as soon as the bundle evaluates, so a program that loads is answered immediately.
+   */
+  loaded: Promise<string>;
   /** Stop it. Safe to call more than once. */
   kill(): void;
 };
 
-/** Whatever the worker posts back when it finishes. Matches `entry.ts`'s `Result`. */
-type Result = { ok: true; code: number } | { ok: false; error: string };
+/** Whatever the worker posts back. `ready` is the load notice; the rest matches `entry.ts`. */
+type Result = { ok: true; code: number } | { ok: false; error: string } | { ready: true };
 
 /**
  * Start a worker on `source` and wire its standard streams to queues.
@@ -121,18 +143,70 @@ export function spawnChild(
     out.end();
   };
 
+  // Resolved by whichever comes first: the load notice, a load error, or the child finishing
+  // without ever saying either. The timer is the fallback for a bundle built before `ready`
+  // existed — it must assume the child is *alive*, since a slow machine must not be reported as a
+  // program that would not start. A failure after this window still arrives as a negative exit.
+  let settleLoaded: (why: string) => void;
+  const loaded = new Promise<string>((res) => { settleLoaded = res; });
+  const assumeAlive = setTimeout(() => settleLoaded(""), LOAD_GRACE_MS);
+  const done = (why: string) => {
+    clearTimeout(assumeAlive);
+    settleLoaded(why);
+  };
+
   const exit = new Promise<number>((resolve) => {
     worker.onmessage = (e: MessageEvent) => {
       const r = e.data as Result;
+      if ("ready" in r) {
+        done("");
+        return;
+      }
+      done("");
       shutdown();
       resolve(r.ok ? r.code : -1);
     };
-    worker.onerror = () => {
+    worker.onerror = (e: ErrorEvent) => {
+      // **This is the fix.** Without `preventDefault` the error is re-raised as the *parent's*
+      // uncaught error and the parent dies: a shell handed a file that is not a worker bundle
+      // exited 1 with Deno's message, rather than reporting a command that could not be executed.
+      // A handler that does not prevent the default is an observer, not a handler.
+      e.preventDefault();
+      done(e.message === "" ? "the worker failed to load" : e.message);
+      shutdown();
+      resolve(-1);
+    };
+    // A message that cannot be deserialised is the same kind of failure and would escape the same
+    // way. Nothing here posts anything but plain objects, so this is a guard rather than a case.
+    worker.onmessageerror = (e: Event) => {
+      e.preventDefault?.();
+      done("the worker sent a message that could not be read");
       shutdown();
       resolve(-1);
     };
   });
 
   worker.postMessage({ sab: bridge.sab });
-  return { out, in: input, exit, kill: shutdown };
+  return { out, in: input, exit, loaded, kill: shutdown };
+}
+
+/**
+ * The payload for a child that never started: -1, then the reason.
+ *
+ * The same shape a successful `spawn` answers with — a handle — so the worker side reads one i32
+ * and whatever follows is the message. A negative handle is how `Child.error` comes to hold
+ * something, and `packages/sh` already turns it into 126: "it exists and would not start",
+ * distinct from the 127 of not existing.
+ */
+export function failedChild(why: string): Uint8Array {
+  // The first line only. A `SyntaxError` from a worker arrives with a code frame attached, which is
+  // several lines and belongs on a terminal rather than inside `Child.error` — a shell puts this
+  // after `sh: name: ` and expects one line, as every other diagnostic here is. The frame is not
+  // lost: the worker's own isolate has already printed the whole of it to stderr, which is also why
+  // a `preventDefault` in the parent cannot make that output go away.
+  const text = new TextEncoder().encode(why.split("\n")[0]);
+  const out = new Uint8Array(4 + text.length);
+  new DataView(out.buffer).setInt32(0, -1, true);
+  out.set(text, 4);
+  return out;
 }

@@ -218,7 +218,12 @@ export function cliOf(
   };
   const child = (id: number) => {
     try {
-      return cls.Child.of(readI32le(collect(b, unpack(id))), "");
+      // A handle, then — when the handle is negative — why it never started. The host waits for the
+      // source to load before answering, so "it is not a worker bundle" arrives here as a `Child`
+      // with a reason rather than as an error that killed this program. wac-mono issue 0021.
+      const out = collect(b, unpack(id));
+      const handle = readI32le(out);
+      return cls.Child.of(handle, handle < 0 ? unstr(out.subarray(4)) : "");
     } catch (e) {
       return cls.Child.of(-1, e instanceof Error ? e.message : String(e));
     }

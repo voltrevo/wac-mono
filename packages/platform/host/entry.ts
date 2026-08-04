@@ -90,6 +90,12 @@ if (onWorker()) {
     if (deliver !== null) deliver(s);
     else buffered = s;
   };
+  // "This bundle parsed and evaluated." Sent before the application has done anything, and before
+  // the bridge has even arrived, because that is the one fact a parent cannot otherwise learn: a
+  // source that is not JavaScript fails at load, and until this existed the failure reached the
+  // parent as its own uncaught error and killed it. `children.ts` waits for either this or the
+  // load error before answering `spawn`. wac-mono issue 0021.
+  (self as unknown as { postMessage(m: unknown): void }).postMessage({ ready: true });
 }
 
 function firstMessage(): Promise<Start> {
@@ -159,11 +165,17 @@ async function runAsLauncher(workerSource: string, grants: Grants): Promise<void
   const worker = new Worker(url, { type: "module" });
   const finished = new Promise<number>((resolve, reject) => {
     worker.onmessage = (e: MessageEvent) => {
-      const m = e.data as Result;
+      const m = e.data as Result | { ready: true };
+      if ("ready" in m) return;    // the load notice; the launcher has nothing to do with it
       if (m.ok) resolve(m.code);
       else reject(new Error(m.error));
     };
-    worker.onerror = (e) => reject(new Error(e.message));
+    worker.onerror = (e) => {
+      // Contained, or Deno reports it a second time as *this* process's uncaught error — two
+      // messages for one failure, the second naming the launcher rather than the program.
+      e.preventDefault();
+      reject(new Error(e.message));
+    };
   });
   worker.postMessage({ sab: bridge.sab });
 

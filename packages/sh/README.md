@@ -155,10 +155,16 @@ redirection, status or `&&` handling, because all of it was already written agai
 stubs became what they were meant to be — a fallback for when the real program is absent.
 
 A child is granted nothing but its two streams, so a program that needs the filesystem cannot be
-run as one yet — that is `packages/platform`'s roadmap rather than an issue here. And see
-[0021](../../issues/open/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md) for the
-first thing a shell trips over: a bundle that does not parse takes the shell down with it instead
-of coming back as a failed command.
+run as one yet — that is `packages/platform`'s roadmap rather than an issue here.
+
+The first thing a shell trips over is a file on `$WACPATH` that is not a worker bundle, and there
+are two of those. One that does not parse is now a failed command with the host's reason and status
+126, distinct from the 127 of not existing —
+[0021](../../issues/closed/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md), where it
+used to take the shell down with it. One that *parses* and never speaks the bridge protocol — a
+built program rather than a `--worker` bundle, most likely — still hangs:
+[0033](../../issues/open/0033-a-file-that-parses-but-is-not-a-worker-bundle-wedges-the-shell.md) has
+why that is a harder question than it looks.
 
 **The signature is the design decision.** Bytes in, bytes out, a status, and a `found` flag —
 because a shell reports 127 for "no such command" and the program's own code for "ran and failed",
