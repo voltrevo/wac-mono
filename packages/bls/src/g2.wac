@@ -1,0 +1,284 @@
+// G2: the subgroup of order r on y² = x³ + 4(1 + u) over Fp2.
+//
+// The same Jacobian arithmetic as `g1.wac` with Fp2 in place of Fp, and it is a deliberate
+// duplication rather than a shared generic. Making it generic needs the field operations passed
+// in as funcrefs — an indirect call per multiply, on the hottest path in the package — or a
+// higher-kinded abstraction wac does not have. `crypto/src/fieldp.wac` shares P-256 and P-384
+// by reading the prime off an array length, which works because both are the same *kind* of
+// field; Fp and Fp2 are not.
+//
+// **The cost of duplicating is that a fix here must be made there too**, so both files keep the
+// same function names and the same order, and the tests cover the same cases on both. The cost
+// of not duplicating would be paid on every one of the thousands of Fp2 multiplies a pairing
+// does.
+//
+// Signatures are G2 points, so this is the file that reads attacker-supplied bytes.
+
+import { fpZero, fpOne, fpToBytes } from "./fp.wac";
+import { Fp2, fp2Add, fp2Sub, fp2Mul, fp2Square, fp2Neg, fp2Zero, fp2One, fp2IsZero, fp2Equals,
+         fp2Copy, fp2Invert, fp2FromBytes, fp2C0Bytes, fp2C1Bytes } from "./fp2.wac";
+import { fpIsZero, fpIsLexicographicallyLarger, fpSqrt, fpNeg, fpEquals, fpAdd, fpSub,
+         fpMul, fpSquare, fpInvert } from "./fp.wac";
+import { groupOrder } from "./g1.wac";
+
+/** A point in Jacobian coordinates over Fp2. `z` zero is the point at infinity. */
+export struct G2 {
+  Fp2 x;
+  Fp2 y;
+  Fp2 z;
+}
+
+/** The G2 generator's x. */
+Fp2 g2x() {
+  u32[] a = u32[12]();
+  a[0] = 0x02940a10; a[1] = 0xf5f28fa2; a[2] = 0x87b4961a; a[3] = 0xb3f5fb26;
+  a[4] = 0x3e2ae580; a[5] = 0xa1a893b5; a[6] = 0x1a3caee9; a[7] = 0x9894999d;
+  a[8] = 0x1863366b; a[9] = 0x6f67b763; a[10] = 0x4350bcd7; a[11] = 0x05819192;
+  u32[] b = u32[12]();
+  b[0] = 0x9e23f606; b[1] = 0xa5a9c075; b[2] = 0xbccd60c3; b[3] = 0xaaa0c59d;
+  b[4] = 0xe2867806; b[5] = 0x3bb17e18; b[6] = 0x8541b367; b[7] = 0x1b1ab6cc;
+  b[8] = 0xf2158547; b[9] = 0xc2b6ed0e; b[10] = 0x7360edf3; b[11] = 0x11922a09;
+  return Fp2(a, b);
+}
+/** And its y. */
+Fp2 g2y() {
+  u32[] a = u32[12]();
+  a[0] = 0x60494c4a; a[1] = 0x4c730af8; a[2] = 0x5e369c5a; a[3] = 0x597cfa1f;
+  a[4] = 0xaa0a635a; a[5] = 0xe7e6856c; a[6] = 0x6e0d495f; a[7] = 0xbbefb5e9;
+  a[8] = 0xf0ef25a2; a[9] = 0x07d3a975; a[10] = 0x7e80dae5; a[11] = 0x0083fd8e;
+  u32[] b = u32[12]();
+  b[0] = 0xdf64b05d; b[1] = 0xadc0fc92; b[2] = 0x2b1461dc; b[3] = 0x18aa270a;
+  b[4] = 0x3be4eba0; b[5] = 0x86adac6a; b[6] = 0xc93da33a; b[7] = 0x79495c4e;
+  b[8] = 0xa43ccaed; b[9] = 0xe7175850; b[10] = 0x63de1bf2; b[11] = 0x0b2bc2a1;
+  return Fp2(a, b);
+}
+/** b = 4(1 + u), the twisted curve's constant. */
+Fp2 curveB2() {
+  u32[] a = u32[12]();
+  a[0] = 0x000cfff3; a[1] = 0xaa270000; a[2] = 0xfc34000a; a[3] = 0x53cc0032;
+  a[4] = 0x6b0a807f; a[5] = 0x478fe97a; a[6] = 0xe6ba24d7; a[7] = 0xb1d37ebe;
+  a[8] = 0xbf78ab2f; a[9] = 0x8ec9733b; a[10] = 0x3d83de7e; a[11] = 0x09d64551;
+  u32[] b = u32[12]();
+  b[0] = 0x000cfff3; b[1] = 0xaa270000; b[2] = 0xfc34000a; b[3] = 0x53cc0032;
+  b[4] = 0x6b0a807f; b[5] = 0x478fe97a; b[6] = 0xe6ba24d7; b[7] = 0xb1d37ebe;
+  b[8] = 0xbf78ab2f; b[9] = 0x8ec9733b; b[10] = 0x3d83de7e; b[11] = 0x09d64551;
+  return Fp2(a, b);
+}
+export G2 g2Infinity() { return G2(fp2One(), fp2One(), fp2Zero()); }
+export bool g2IsInfinity(G2 p) { return fp2IsZero(p.z); }
+export G2 g2Generator() { return G2(g2x(), g2y(), fp2One()); }
+export G2 g2Negate(G2 p) { return G2(fp2Copy(p.x), fp2Neg(p.y), fp2Copy(p.z)); }
+
+export G2 g2Double(G2 p) {
+  if (g2IsInfinity(p)) { return g2Infinity(); }
+  Fp2 a = fp2Square(p.x);
+  Fp2 b = fp2Square(p.y);
+  Fp2 c = fp2Square(b);
+  Fp2 t = fp2Square(fp2Add(p.x, b));
+  Fp2 dHalf = fp2Sub(fp2Sub(t, a), c);
+  Fp2 d = fp2Add(dHalf, dHalf);
+  Fp2 e = fp2Add(fp2Add(a, a), a);
+  Fp2 f = fp2Square(e);
+
+  Fp2 x3 = fp2Sub(f, fp2Add(d, d));
+  Fp2 c2 = fp2Add(c, c);
+  Fp2 c4 = fp2Add(c2, c2);
+  Fp2 c8 = fp2Add(c4, c4);
+  Fp2 y3 = fp2Sub(fp2Mul(e, fp2Sub(d, x3)), c8);
+  Fp2 yz = fp2Mul(p.y, p.z);
+  return G2(x3, y3, fp2Add(yz, yz));
+}
+
+export G2 g2Add(G2 p, G2 q) {
+  if (g2IsInfinity(p)) { return G2(fp2Copy(q.x), fp2Copy(q.y), fp2Copy(q.z)); }
+  if (g2IsInfinity(q)) { return G2(fp2Copy(p.x), fp2Copy(p.y), fp2Copy(p.z)); }
+
+  Fp2 z1z1 = fp2Square(p.z);
+  Fp2 z2z2 = fp2Square(q.z);
+  Fp2 u1 = fp2Mul(p.x, z2z2);
+  Fp2 u2 = fp2Mul(q.x, z1z1);
+  Fp2 s1 = fp2Mul(fp2Mul(p.y, q.z), z2z2);
+  Fp2 s2 = fp2Mul(fp2Mul(q.y, p.z), z1z1);
+
+  Fp2 h = fp2Sub(u2, u1);
+  Fp2 rr = fp2Sub(s2, s1);
+  if (fp2IsZero(h)) {
+    if (fp2IsZero(rr)) { return g2Double(p); }
+    return g2Infinity();
+  }
+
+  Fp2 i = fp2Square(fp2Add(h, h));
+  Fp2 j = fp2Mul(h, i);
+  Fp2 r2 = fp2Add(rr, rr);
+  Fp2 vv = fp2Mul(u1, i);
+
+  Fp2 x3 = fp2Sub(fp2Sub(fp2Square(r2), j), fp2Add(vv, vv));
+  Fp2 s1j = fp2Mul(s1, j);
+  Fp2 y3 = fp2Sub(fp2Mul(r2, fp2Sub(vv, x3)), fp2Add(s1j, s1j));
+  Fp2 z3 = fp2Mul(fp2Sub(fp2Sub(fp2Square(fp2Add(p.z, q.z)), z1z1), z2z2), h);
+  return G2(x3, y3, z3);
+}
+
+export G2 g2Mul(G2 p, u32[] k) {
+  G2 acc = g2Infinity();
+  for (i32 i = k.len() - 1; i >= 0; i--) {
+    for (i32 b = 31; b >= 0; b--) {
+      acc = g2Double(acc);
+      if (((k[i] >> (b as@ u32)) & 1) != 0) { acc = g2Add(acc, p); }
+    }
+  }
+  return acc;
+}
+
+/** Y² = X³ + 4(1+u)·Z⁶. */
+export bool g2IsOnCurve(G2 p) {
+  if (g2IsInfinity(p)) { return true; }
+  Fp2 z2 = fp2Square(p.z);
+  Fp2 z6 = fp2Square(fp2Mul(z2, p.z));
+  Fp2 lhs = fp2Square(p.y);
+  Fp2 rhs = fp2Add(fp2Mul(fp2Square(p.x), p.x), fp2Mul(curveB2(), z6));
+  return fp2Equals(lhs, rhs);
+}
+
+/**
+ * Whether the point has order dividing r.
+ *
+ * G2's cofactor is far larger than G1's, so this matters more here, not less: a signature is a
+ * G2 point supplied by whoever is being verified.
+ */
+export bool g2InSubgroup(G2 p) {
+  if (g2IsInfinity(p)) { return true; }
+  return g2IsInfinity(g2Mul(p, groupOrder()));
+}
+
+export Fp2? g2AffineX(G2 p) {
+  if (g2IsInfinity(p)) { return null; }
+  Fp2? zi = fp2Invert(p.z);
+  if (zi is null) { return null; }
+  return fp2Mul(p.x, fp2Square(zi!));
+}
+
+export Fp2? g2AffineY(G2 p) {
+  if (g2IsInfinity(p)) { return null; }
+  Fp2? zi = fp2Invert(p.z);
+  if (zi is null) { return null; }
+  Fp2 z2 = fp2Square(zi!);
+  return fp2Mul(p.y, fp2Mul(z2, zi!));
+}
+
+// ── The compressed encoding: 96 bytes ─────────────────────────────────────────
+//
+// `c1` then `c0`, which is the opposite of the coefficient order used everywhere else in this
+// package and is what the Ethereum encodings specify. Flags sit in the top bits of byte 0 as in
+// G1, and the sign bit refers to the *lexicographic* order of the whole 96-byte y, which for
+// Fp2 means comparing c1 first and only then c0.
+
+/** Whether `a` is the larger of `±a`, comparing c1 before c0. */
+bool fp2IsLarger(Fp2 a) {
+  if (!fpIsZero(a.c1)) { return fpIsLexicographicallyLarger(a.c1); }
+  return fpIsLexicographicallyLarger(a.c0);
+}
+
+export u8[] g2Compress(G2 p) {
+  u8[] out = u8[96]();
+  if (g2IsInfinity(p)) {
+    out[0] = 0xc0;
+    return out;
+  }
+  Fp2? ax = g2AffineX(p);
+  Fp2? ay = g2AffineY(p);
+  if ((ax is null) || (ay is null)) { return out; }
+  u8[] hi = fp2C1Bytes(ax!);
+  u8[] lo = fp2C0Bytes(ax!);
+  for (i32 i = 0; i < 48; i++) { out[i] = hi[i]; out[48 + i] = lo[i]; }
+  i32 flags = 0x80;
+  if (fp2IsLarger(ay!)) { flags = flags | 0x20; }
+  out[0] = out[0] | flags;
+  return out;
+}
+
+export G2? g2Decompress(u8[] s) {
+  if (s.len() != 96) { return null; }
+  i32 b0 = s[0];
+  if ((b0 & 0x80) == 0) { return null; }
+  bool infinity = (b0 & 0x40) != 0;
+  bool wantLarger = (b0 & 0x20) != 0;
+
+  if (infinity) {
+    if (wantLarger) { return null; }
+    if ((b0 & 0x1F) != 0) { return null; }
+    for (i32 i = 1; i < 96; i++) {
+      if (s[i] != 0) { return null; }
+    }
+    return g2Infinity();
+  }
+
+  u8[] hi = u8[48]();
+  u8[] lo = u8[48]();
+  for (i32 i = 0; i < 48; i++) { hi[i] = s[i]; lo[i] = s[48 + i]; }
+  hi[0] = hi[0] & 0x1F;
+  Fp2? x = fp2FromBytes(hi, lo);
+  if (x is null) { return null; }
+
+  // y² = x³ + 4(1+u). A square root in Fp2 by way of the norm: if y = y0 + y1·u exists then
+  // its norm is a square in Fp, so this reduces to two Fp roots and a division.
+  Fp2 y2 = fp2Add(fp2Mul(fp2Square(x!), x!), curveB2());
+  Fp2? y = fp2Sqrt(y2);
+  if (y is null) { return null; }
+
+  Fp2 chosen = y!;
+  if (fp2IsLarger(chosen) != wantLarger) { chosen = fp2Neg(chosen); }
+  return G2(x!, chosen, fp2One());
+}
+
+/**
+ * A square root in Fp2, or null when there is none.
+ *
+ * Fp2 is `Fp[u]/(u²+1)` with p ≡ 3 (mod 4), so the standard algorithm applies: raise to
+ * (p−3)/4 and adjust. Written the direct way instead — solve for the two coefficients through
+ * the norm — because it needs only Fp roots, which are already tested, rather than a new
+ * exponentiation with its own edge cases.
+ *
+ * For `a = a0 + a1·u`, a root `y = y0 + y1·u` satisfies y0² − y1² = a0 and 2·y0·y1 = a1. With
+ * `n = √(a0² + a1²)` that gives y0² = (a0 + n)/2, and y1 = a1/(2·y0). The result is verified by
+ * squaring, so a wrong branch is caught rather than returned.
+ */
+Fp2? fp2Sqrt(Fp2 a) {
+  if (fp2IsZero(a)) { return fp2Zero(); }
+  if (fpIsZero(a.c1)) {
+    // Purely real: either a0 is a square, or −a0 is and the root is purely imaginary.
+    u32[]? r = fpSqrt(a.c0);
+    if (r is not null) { return Fp2(r!, fpZero()); }
+    u32[]? ri = fpSqrt(fpNeg(a.c0));
+    if (ri is null) { return null; }
+    return Fp2(fpZero(), ri!);
+  }
+  u32[] normSq = fpAdd(fpSquare(a.c0), fpSquare(a.c1));
+  u32[]? n = fpSqrt(normSq);
+  if (n is null) { return null; }
+  u32[]? half = fpInvert(fpAdd(fpOne(), fpOne()));
+  if (half is null) { return null; }
+
+  u32[] cand = fpMul(fpAdd(a.c0, n!), half!);
+  u32[]? y0 = fpSqrt(cand);
+  if (y0 is null) {
+    // The other sign of the norm.
+    cand = fpMul(fpSub(a.c0, n!), half!);
+    y0 = fpSqrt(cand);
+    if (y0 is null) { return null; }
+  }
+  u32[]? inv = fpInvert(fpAdd(y0!, y0!));
+  if (inv is null) { return null; }
+  Fp2 out = Fp2(y0!, fpMul(a.c1, inv!));
+  if (!fp2Equals(fp2Square(out), a)) { return null; }
+  return out;
+}
+
+/** Decompress and check the encoding, the curve and the subgroup. */
+export G2? g2FromBytes(u8[] s) {
+  G2? p = g2Decompress(s);
+  if (p is null) { return null; }
+  if (!g2IsOnCurve(p!)) { return null; }
+  if (!g2InSubgroup(p!)) { return null; }
+  return p!;
+}

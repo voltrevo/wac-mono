@@ -225,9 +225,10 @@ export bool blsFp12InverseIsInverse(u8[] a) {
 
 // ── G1 ────────────────────────────────────────────────────────────────────────
 
+import { groupOrder } from "../../src/g1.wac";
 import { G1, g1Generator, g1Infinity, g1IsInfinity, g1Add, g1Double, g1Mul, g1Negate,
          g1IsOnCurve, g1InSubgroup, g1Compress, g1Decompress, g1FromBytes, g1AffineX,
-         g1AffineY, groupOrder } from "../../src/g1.wac";
+         g1AffineY } from "../../src/g1.wac";
 
 /**
  * What a decompression attempt produced, as a single number a test can assert on.
@@ -286,3 +287,64 @@ export bool blsG1DegenerateAddition() {
 
 /** `r·G == O`, which is the subgroup check applied to the generator itself. */
 export bool blsG1OrderIsR() { return g1IsInfinity(g1Mul(g1Generator(), groupOrder())); }
+
+// ── G2 ────────────────────────────────────────────────────────────────────────
+
+import { G2, g2Generator, g2Infinity, g2IsInfinity, g2Add, g2Double, g2Mul, g2Negate,
+         g2IsOnCurve, g2InSubgroup, g2Compress, g2Decompress, g2FromBytes, g2AffineX,
+         g2AffineY } from "../../src/g2.wac";
+
+/** As `blsG1Status`: 0 accepted, 1 encoding refused, 2 off curve, 3 outside the subgroup. */
+export i32 blsG2Status(u8[] s) {
+  G2? p = g2Decompress(s);
+  if (p is null) { return 1; }
+  if (!g2IsOnCurve(p!)) { return 2; }
+  if (!g2InSubgroup(p!)) { return 3; }
+  return 0;
+}
+
+/** `x.c0 || x.c1` of a decompressed point, 96 bytes, or empty. */
+export u8[] blsG2X(u8[] s) {
+  G2? p = g2FromBytes(s);
+  if (p is null) { return u8[0](); }
+  Fp2? x = g2AffineX(p!);
+  if (x is null) { return u8[0](); }
+  u8[] out = u8[96]();
+  u8[] c0 = fp2C0Bytes(x!);
+  u8[] c1 = fp2C1Bytes(x!);
+  for (i32 i = 0; i < 48; i++) { out[i] = c0[i]; out[48 + i] = c1[i]; }
+  return out;
+}
+
+export u8[] blsG2Y(u8[] s) {
+  G2? p = g2FromBytes(s);
+  if (p is null) { return u8[0](); }
+  Fp2? y = g2AffineY(p!);
+  if (y is null) { return u8[0](); }
+  u8[] out = u8[96]();
+  u8[] c0 = fp2C0Bytes(y!);
+  u8[] c1 = fp2C1Bytes(y!);
+  for (i32 i = 0; i < 48; i++) { out[i] = c0[i]; out[48 + i] = c1[i]; }
+  return out;
+}
+
+export u8[] blsG2RoundTrip(u8[] s) {
+  G2? p = g2FromBytes(s);
+  return (p is null) ? u8[0]() : g2Compress(p!);
+}
+
+export u8[] blsG2MulGenerator(u32[] k) { return g2Compress(g2Mul(g2Generator(), k)); }
+export u8[] blsG2GeneratorBytes() { return g2Compress(g2Generator()); }
+
+export bool blsG2DegenerateAddition() {
+  G2 g = g2Generator();
+  if (!g2IsInfinity(g2Add(g, g2Negate(g)))) { return false; }
+  u8[] viaAdd = g2Compress(g2Add(g, g));
+  u8[] viaDouble = g2Compress(g2Double(g));
+  for (i32 i = 0; i < 96; i++) {
+    if (viaAdd[i] != viaDouble[i]) { return false; }
+  }
+  return true;
+}
+
+export bool blsG2OrderIsR() { return g2IsInfinity(g2Mul(g2Generator(), groupOrder())); }
