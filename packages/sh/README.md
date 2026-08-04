@@ -172,12 +172,26 @@ in GNU; here it is refused, because a write nobody asked for is worse than a mis
 diagnostic goes to standard error in one piece after the output rather than interleaved with it,
 which is the seam again — the fallback programs hand back two finished byte strings.
 
-**`tr` takes `-c`, `-d`, `-s` and `-t`**, interprets `\n`-style escapes and `[:alpha:]`-style
-classes, and *refuses* an option it does not have. It did none of that until bash was asked: `-d`
-was read as the two-character set `{-, d}`, so `tr -d 12` translated digits into a dash and a `d`
-and reported success; `tr : '\n'` produced a backslash and an `n`; `[:digit:]` was eight literal
-characters. `[c*n]` and `[=c=]` are refused rather than approximated, which is the one place this
-`tr` says no to something GNU does.
+**`tr` matches GNU.** `-c`, `-d`, `-s`, `-t`; `\n`-style escapes, and GNU's set of them rather than
+`printf`'s, so `\x41` is an `x`, a `4` and a `1`; all twelve `[:alpha:]` classes; `[c*n]` repeats and
+`[c*]` padding, octal counts included; `[=c=]` equivalence classes. It did none of that until bash was
+asked: `-d` was read as the two-character set `{-, d}`, so `tr -d 12` translated digits into a dash and
+a `d` and reported success; `tr : '\n'` produced a backslash and an `n`; `[:digit:]` was eight literal
+characters. The repeats and equivalence classes were *refused* for one afternoon, and the refusal is
+gone because a refusal is not the goal — see the next paragraph.
+
+**Three answers to a gap, and they are not equally good.** Doing something plausible anyway is the
+worst: it is a wrong answer with nothing to notice, which is what every bug in the paragraph above
+was. Refusing is better. Saying *which side is incomplete* is better still, and is the only one of the
+three that is true — a caller who writes `wc -m` has written a real flag, and "invalid option" tells
+them their command is wrong when this program is merely unfinished.
+
+So the two messages are two different facts. A letter GNU has not got either keeps GNU's own wording:
+`wc: invalid option -- 'Z'`. A letter GNU has and this does not says so: `wc: -m is not implemented`,
+`grep: -E is not implemented`, `test: -r is not implemented`, `sh: redirecting fd 2 is not
+implemented`. `gnuHas` in `program.wac` holds the letters, read out of the tools' own `--help`, and
+`test/gaps.test.ts` asserts the property against the installed coreutils: **no option GNU has is ever
+called invalid.** It fails if the table drifts, and it fails if a new refusal picks the wrong wording.
 
 The single seam was the point, and it paid off: wiring `spawn` in changed no part of the pipeline,
 redirection, status or `&&` handling, because all of it was already written against `Output`. The
@@ -322,8 +336,9 @@ A malformed expansion is **fatal**, as it is in bash: `${x:}` prints nothing, ex
 abandons the rest of the line rather than quietly expanding to the empty string. Quietly
 expanding to something plausible is the failure mode this package exists to avoid.
 
-**`2>` is refused rather than approximated.** Only standard output is captured, so there is
-nothing of the error stream to redirect, and saying so beats writing the wrong bytes to the file.
+**`2>` is not implemented, and says so in those words.** Only standard output is captured through the
+seam, so there is nothing of the error stream to redirect — and the message names the gap rather than
+the command: this shell is unfinished here, and the caller who wrote `2>err` was not wrong.
 
 **Standard error arrives when it happened**, interleaved with standard output as bash's is, which
 is what `2>&1` has to show. It used to be collected and flushed at the end through `Core.warn` —

@@ -11,8 +11,10 @@
 // is two arguments and `echo "$x"` is one. A shell that splits the source text, or that splits
 // everything, gets one of those wrong.
 //
-// Globbing is not implemented. A word containing `*` reaches the command unchanged, which is what
-// bash does when nothing matches — so the difference only shows when something would have.
+// Globbing *is* implemented — this comment said it was not, for as long as it took someone to read
+// both. `emitField` globs a field with an unquoted metacharacter and passes it through unchanged when
+// nothing matches, which is bash's default; the last path component is the only one patterned, and the
+// README says so under what this does not do.
 
 import { Vec } from "../../std/src/vec.wac";
 import { Map } from "../../std/src/map.wac";
@@ -341,7 +343,7 @@ void runList(Shell sh, Vec<AndOr> lists) {
 void runAndOr(Shell sh, AndOr list) {
   if (list.background) {
     // Refused rather than run in the foreground, which would look like it worked.
-    sh.err("sh: background commands are not supported\n".toBytes());
+    sh.err("sh: background commands are not implemented\n".toBytes());
     sh.status = 2;
     return;
   }
@@ -940,7 +942,10 @@ bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
     // Said, not silently skipped — but the command's own status is left alone. Overwriting it
     // made `cmd 2>/dev/null; echo $?` report the refusal instead of what the command did, which
     // is a second wrong answer on top of the first.
-    sh.err(("sh: redirecting fd " + itoa(r.fd) + " is not supported\n").toBytes());
+    // "Not implemented", not "not supported": the second reads as a decision, and this is a gap. Only
+    // standard output is captured through the seam, so there is nothing of the error stream to send
+    // anywhere — the fix is the seam's, and the message should not imply otherwise.
+    sh.err(("sh: redirecting fd " + itoa(r.fd) + " is not implemented\n").toBytes());
     return true;
   }
   u8[] payload = data;
@@ -1092,7 +1097,9 @@ Output setBuiltin(Shell sh, Vec<string> argv) {
   string flag = argv.get(1);
   if (flag == "--") { first = 2; }
   else if (flag.len() > 0 && flag.toBytes()[0] == 0x2d) {
-    return Output.fail(("sh: set: " + flag + ": not supported\n").toBytes(), 2);
+    // `set -e`, `set -u` and the rest are bash's and are not here: "not implemented" rather than "not
+    // supported", because the second reads as a decision and this is only unfinished.
+    return Output.fail(("sh: set: " + flag + ": not implemented\n").toBytes(), 2);
   }
 
   Vec<string> params = Vec.create();
@@ -1626,6 +1633,9 @@ Output test(Shell sh, Vec<string> argv) {
     else if (op == "-le") { result = atoiOr(l, 0) <= atoiOr(r, 0); }
     else if (op == "-gt") { result = atoiOr(l, 0) > atoiOr(r, 0); }
     else if (op == "-ge") { result = atoiOr(l, 0) >= atoiOr(r, 0); }
+    else if (gnuBinaryOperator(op)) {
+      return Output.fail(("test: " + op + " is not implemented\n").toBytes(), 2);
+    }
     else { return Output.fail(("test: unknown operator " + op + "\n").toBytes(), 2); }
   } else {
     return Output.fail("test: too many arguments\n".toBytes(), 2);
@@ -1663,7 +1673,32 @@ Output unaryTest(Shell sh, string op, string operand) {
     if (op == "-d") { return testResult(st.isDir); }
     return testResult(st.exists && st.size > 0);
   }
+  // Two facts, two messages. `-r`, `-w`, `-x` and the rest of GNU's file tests are *not implemented* —
+  // `Stat` carries no mode bits — and telling a caller that `-r` is an unknown operator says their
+  // command is wrong when this program is merely incomplete. Anything GNU has not got either keeps the
+  // original wording.
+  if (gnuTestOperator(op)) {
+    return Output.fail(("test: " + op + " is not implemented\n").toBytes(), 2);
+  }
   return Output.fail(("test: unknown operator " + op + "\n").toBytes(), 2);
+}
+
+/**
+ * Whether GNU's `test` has this unary operator.
+ *
+ * The list is `test --help`'s, minus the ones answered above: `-b` `-c` `-g` `-G` `-k` `-N` `-O` `-p`
+ * `-r` `-S` `-t` `-u` `-w` `-x` need a mode, an owner, a device or a descriptor, and the capability
+ * world answers none of those yet. `-a` and `-o` are the binary forms, which this shell does not parse.
+ */
+/** GNU's binary operators that this does not answer: the file-age and same-file comparisons. */
+bool gnuBinaryOperator(string op) {
+  return op == "-nt" || op == "-ot" || op == "-ef";
+}
+
+bool gnuTestOperator(string op) {
+  return op == "-b" || op == "-c" || op == "-g" || op == "-G" || op == "-k" || op == "-N"
+      || op == "-O" || op == "-p" || op == "-r" || op == "-S" || op == "-t" || op == "-u"
+      || op == "-w" || op == "-x" || op == "-a" || op == "-o";
 }
 
 /**
