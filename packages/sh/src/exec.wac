@@ -23,7 +23,7 @@ import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Read } from "../../bytes/src/read.wac";
 import { Change, Child, Cli, Core, FAULT_EXISTS, FAULT_NOT_EMPTY, FAULT_NOT_FOUND, FileResult,
-  GRANT_ENV, GRANT_NET, GRANT_NONE, GRANT_READ, GRANT_WRITE, Pending, Stat }
+  GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, Pending, Stat }
   from "../../platform/src/platform.wac";
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
@@ -1381,16 +1381,19 @@ Output trySpawn(Shell sh, Vec<string> argv, bool mayInherit) {
   string[] args = string[argv.len() - 1](fill: "");
   for (i32 i = 1; i < argv.len(); i++) { args[i - 1] = argv.get(i); }
 
-  // `GRANT_NONE` keeps exactly the behaviour this was written against: an external program is a
-  // filter, with standard input and output and no other authority. `spawn` grew a grants
-  // argument on 2026-08-03 and the host intersects it with the shell's own, so handing a child
-  // `GRANT_READ` — so that `$WACPATH` grep could open the file it is given — is now a one-word
-  // change here. Left to whoever owns this package to decide, since it widens what a script can
-  // reach and no test says which is wanted. (agent-a, forced by the signature change)
+  // **Everything this shell has**, which the host narrows to what it actually holds. `GRANT_NONE` was
+  // here instead, and it was never a decision — it was the value the argument had when `spawn` grew
+  // one, so `$WACPATH` grep could not open the file it was handed and `cat f` printed nothing while
+  // reporting success. Issue 0028 laid out the three defensible answers and this is the operator's:
+  // a shell's children are as trusted as the shell. The property that matters was never that a child
+  // gets *nothing* — it is that it cannot get *more*, and the host enforces that either way, so a
+  // shell started with no grants still hands its children none.
+  //
   // The shell's own directory, so `cd sub; prog f` opens `sub/f`. A spawned program used to inherit
   // the *host's* directory, which meant the shell's `cd` was invisible to everything it ran.
-  Child child = sh.cli
-    .spawn(string.fromBytes(prog.bytes), args, GRANT_NONE, sh.cwd, mayInherit).wait();
+  Child child = sh.cli.spawn(
+    string.fromBytes(prog.bytes), args,
+    GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV, sh.cwd, mayInherit).wait();
   // No `spawn` in this world at all: nothing was attempted, so this is not a failure of the program
   // and must not be reported as one. Falling through is what keeps `packages/box`'s sixty applets
   // working in the browser terminal, where a page cannot spawn — before this, setting `$WACPATH` to

@@ -120,6 +120,16 @@ was closed `wontfix`, so running host programs is a settled non-goal rather than
 What replaces it is a wac program run with grants the parent chooses — which is more than this
 package expected to settle for.
 
+**A spawned program is as trusted as the shell.** It gets `read`, `write`, `net` and `env`, and the
+host narrows that to what the shell itself holds, so a shell started with nothing hands its children
+nothing — the property that matters was never that a child gets *nothing*, it is that it cannot get
+*more*. `GRANT_NONE` was here instead and was never a decision: it was the value the argument had when
+`spawn` grew one, and it meant a `$WACPATH` `wc file` could not open the file it was handed while the
+shell refusing on its behalf could read it perfectly well.
+[0028](../../issues/closed/0028-sh-decides-nothing-about-what-wacpath-programs-may-do.md) set out the
+three defensible answers — nothing, the shell's own, or a `WACGRANTS=` variable — and this is the
+second, which is what every other shell does.
+
 Then **whatever was handed to the shell**, through `Shell.external`. `packages/box` has sixty
 applets and this package is one of its dependencies, so it cannot import them — the wiring goes the
 other way, and it is one line:

@@ -1,6 +1,6 @@
 # 0028 — `sh` passes `GRANT_NONE` to `$WACPATH` programs, which is a decision nobody has made
 
-- **Status:** open
+- **Status:** closed (2026-08-04, agent-a)
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-08-03
@@ -44,3 +44,20 @@ enforces either way.
 Filed rather than decided because `packages/sh` is not mine, and because "what may a spawned
 program do" is exactly the kind of thing that should be somebody's decision rather than a
 side-effect of my commit. `packages/platform/README.md` has the grant table if it helps.
+
+## Closed, 2026-08-04 (agent-a) — answer (2)
+
+The operator's answer was **inherit the shell's grants**, which is option (2) above and the one every
+other shell implements. `trySpawn` now passes `GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV`, the
+same set `trySelf` already handed an applet of the shell's own bundle — so the two routes to a real
+program agree about authority instead of differing by an accident of which was written first.
+
+The host intersects with what the shell itself holds, so this cannot widen anything: a shell built
+with no grants still hands its children none. Both halves are tested in `sh/test/spawn.test.ts` —
+`wc file` through `$WACPATH` now answers what the same program answers run alone, and the same script
+through a shell built without `read` still cannot see the file. The first fails on the old code with
+"filesystem read not granted to this application", which is the bug in one line.
+
+What made it a decision rather than a fix was that it widens what a script can reach; what made it an
+easy decision is the intersection. Filed as a task, closed as a task: nothing about the implementation
+was interesting once somebody had said which of the three it should be.
