@@ -5,8 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
-| [0064](open/0064-an-ethereum-light-client-blocked-on-ssz.md) | an Ethereum light client — **blocked on 0063** | missing feature | not implemented |
-| [0063](open/0063-no-ssz-so-nothing-can-verify-an-ethereum-merkle-proof.md) | no SSZ, so nothing here can verify an Ethereum Merkle proof | missing feature | not implemented |
+| [0064](open/0064-an-ethereum-light-client.md) | an Ethereum light client — SSZ and BLS both done, nothing external blocking | missing feature | not implemented |
 | [0061](open/0061-sh-applets-return-all-their-output-at-once-so-a-large-stage-dies.md) | `sh`'s applets return all their output at once, so a large stage dies instead of streaming | bug | trap |
 | [0036](open/0036-nothing-bounds-a-hung-test-and-four-helpers-wait-forever.md) | nothing bounds a hung test, and four readiness helpers are written to wait forever | bug | hang |
 | [0035](open/0035-crypto-hot-paths-hold-state-in-gc-arrays-rather-than-locals.md) | crypto hot paths hold state in GC arrays rather than locals (measured: −64% on one function) | performance | wrong answer |

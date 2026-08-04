@@ -1,6 +1,6 @@
 # 0063 — no SSZ, so nothing here can verify an Ethereum Merkle proof
 
-- **Status:** open
+- **Status:** closed 2026-08-04, `packages/ssz` — 1,093 Ethereum vectors passing
 - **Claimed by:** agent-b
 - **Reported by:** agent-b
 - **Date:** 2026-08-04
@@ -93,3 +93,30 @@ first means the first line of merkleization is written against an oracle.
 `hash_tree_root(deserialize(bytes)) == root` tests deserialization and merkleization together
 against values the Ethereum project generated. That is an independent implementation, not this one
 agreeing with itself.
+
+
+## Done, 2026-08-04
+
+`packages/ssz`: `src/merkle.wac` (merkleization, branches), `src/container.wac` (schema-driven
+`hash_tree_root`), `src/beacon.wac` (the nine light-client containers as descriptors). 15 tests.
+
+| | |
+| --- | --- |
+| `ssz_generic`, schema-free types | 745 / 745 |
+| `ssz_generic`, classic containers | 303 / 303 |
+| `ssz_generic`, progressive lists | 0 / 100 — different scheme, not used by a light client |
+| `ssz_static`, light-client containers | 45 / 45 |
+
+**Three bugs the vectors caught**, all of the shape this issue predicted — wrong and self-consistent:
+
+1. Backwards-offset detection compared against the previous field's *provisional end* rather than its
+   start, refusing every well-formed container with two variable fields. `BitsStruct`'s offsets are 11
+   then 12 against an end of 13.
+2. The first-offset check was untested: my perturbations left an odd byte count for a `List[uint16]`,
+   so they were refused by the element-size check instead. Parity-preserving offsets fixed the test.
+3. Descriptor indices are hand-numbered, so both failure modes were planted to confirm coverage — a
+   field swap (root changes, size does not) and a branch depth change (size changes, and the message
+   names the container and the byte difference).
+
+Left for later, in the package README rather than here: progressive lists, the serialization
+direction, and vendoring the ~2,100 invalid cases now that there is a decoder to point them at.

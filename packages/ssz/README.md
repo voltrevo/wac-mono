@@ -1,8 +1,8 @@
 # ssz — Ethereum's SimpleSerialize, and the Merkle proofs built on it
 
-**Merkleization and Merkle-branch verification work.** Serialization by type — the `containers` half —
-does not exist yet. Tracked as wac-mono issue **0063**; its consumer is **0064**, an Altair light
-client.
+**Everything an Altair light client needs is done and checked against Ethereum's vectors.** 1,093 of
+them: 1,048 `ssz_generic` and all 45 `ssz_static`. Issue **0063** is closed; **0064**, the light client
+itself, is unblocked.
 
 | | state |
 | --- | --- |
@@ -11,7 +11,7 @@ client.
 | `isValidMerkleBranch`, `isValidNormalizedMerkleBranch` | **done** |
 | `hash_tree_root` of containers, lists and vectors of composites | **done** — 303 Ethereum `containers` cases, schema-driven |
 | progressive lists | **out of scope** — a different merkleization scheme; 100 cases |
-| the nine light-client containers | **not started** — 45 vectors waiting, and now only descriptors away |
+| the nine light-client containers | **done** — all 45 Ethereum `ssz_static` cases |
 
 `src/merkle.wac` is merkleization; `src/container.wac` is a **schema-driven** `hash_tree_root` — a type
 is four `i32`s in a flat table (`kind, param, child, count`), so a container is described rather than
@@ -49,6 +49,12 @@ Four things this says loudest, because they are where implementations go wrong:
   the generator's own definitions in `consensus-specs/tests/formats/ssz_generic/README.md`.
   `ComplexTestStruct` is the one that earns its keep: seven fields, four variable, a nested container,
   a vector of fixed containers and a vector of *variable* ones.
+- **All 45 light-client `ssz_static` cases** produce Ethereum's root, from the descriptors in
+  `src/beacon.wac`. Their serialized sizes are asserted separately, because the two failures localise
+  differently: a wrong size means a wrong field list and is computable from the descriptor alone, while
+  a wrong root at the right size means wrong nesting or a wrong limit. Both were confirmed by planting
+  faults — swapping `SyncCommittee`'s two fields changes the root and not the size, and shortening the
+  finality branch from 6 to 5 changes the size and says which container by how many bytes.
 - **Both offset checks were confirmed load-bearing by removing them**, and one of those attempts found
   a vacuous test. Details below, because the second is the more useful finding.
 
@@ -126,7 +132,18 @@ valuable half — a decoder that accepts a malformed offset is the bug that matt
 expected root, only the requirement that decoding fails, so they need the decoder to exist first to be
 worth anything. Next after the encoder round-trips.
 
-## Scope of the rest
+## What is left
+
+- **Progressive lists** (`ProgressiveList`, `ProgressiveBitList`) — a different merkleization scheme,
+  100 vendored cases, and not used by a light client. The only reason to do them is completeness.
+- **Serialization** — this package computes roots from bytes and never produces bytes. A light client
+  only needs the reading direction, but a signer or a gossip publisher would need the other.
+- **Invalid-case vectors** — about 2,100 of them upstream, and the more valuable half, since a decoder
+  that accepts a malformed offset is the bug that matters. They need this decoder to exist, which it
+  now does, so vendoring them is the obvious next hardening step. The refusals are currently tested by
+  hand-built perturbations rather than by Ethereum's own malformed cases.
+
+## What it implements, from the spec
 
 Read off `consensus-specs/specs/altair/light-client/sync-protocol.md`:
 
