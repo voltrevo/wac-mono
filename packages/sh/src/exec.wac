@@ -816,7 +816,7 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
   if (argv.len() == 0) {
     for (i32 i = 0; i < cmd.assigns.len(); i++) {
       Assign a = cmd.assigns.get(i);
-      sh.setVar(a.name, joinWord(sh, a.value));
+      sh.setVar(a.name, joinAssign(sh, a.value));
     }
     // With no command name the status is the last command substitution's, or zero if there was
     // none: `x=$(false)` reports 1, `x=1` reports 0, and a bare `$(exit 3)` reports 3.
@@ -836,7 +836,7 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
     savedNames.push(a.name);
     savedValues.push(before.isSome() ? before.unwrap() : "");
     savedExisted.push(before.isSome() ? 1 : 0);
-    sh.setVar(a.name, joinWord(sh, a.value));
+    sh.setVar(a.name, joinAssign(sh, a.value));
   }
 
   // An input redirection replaces whatever the pipeline was carrying.
@@ -1696,6 +1696,16 @@ void expandInto(Shell sh, Word word, Vec<string> argv) {
     Part p = word.parts.get(i);
     string text = expandPart(sh, p);
 
+    // Tilde expansion, which is a rule about where the `~` *is*: only one that begins the word, and
+    // only in literal text, so `echo "a~"~` prints two tildes and `x=~; echo $x/y` does not expand a
+    // second time. `emitField` never sees a `~`, which is why this is here rather than there.
+    if (i == 0 && !p.quoted) {
+      match (p.kind) {
+        case Lit: { text = withHome(sh, text, true, false); }
+        else: {}
+      }
+    }
+
     if (p.quoted) {
       appendMasked(field, mask, text, 1);
       started = true;
@@ -2423,13 +2433,84 @@ string expandPart(Shell sh, Part p) {
   return "";
 }
 
-/** A word joined without splitting — for a redirection target or an assignment's value. */
-string joinWord(Shell sh, Word word) {
+/** A word joined without splitting — for a redirection target. */
+string joinWord(Shell sh, Word word) { return joinParts(sh, word, false); }
+
+/**
+ * The same, for an assignment's value, where a tilde may also follow a colon.
+ *
+ * That is bash's rule and it is not decoration: `PATH=/usr/bin:~/bin` has to expand the second entry
+ * or the shell keeps a directory called `~` on its search path and quietly finds nothing in it. In a
+ * plain word the leading one is the only one, which is why `echo ~:~` prints a tilde on the right.
+ */
+string joinAssign(Shell sh, Word word) { return joinParts(sh, word, true); }
+
+string joinParts(Shell sh, Word word, bool colons) {
   string s = "";
   for (i32 i = 0; i < word.parts.len(); i++) {
-    s = s + expandPart(sh, word.parts.get(i));
+    Part p = word.parts.get(i);
+    string text = expandPart(sh, p);
+    if (!p.quoted) {
+      match (p.kind) {
+        // A tilde begins the value, or follows a colon in it. `s` is what has been built so far, so a
+        // part starting after `PATH=/u:` is startable even though it is not the first part.
+        case Lit: { text = withHome(sh, text, i == 0 || (colons && endsWithColon(s)), colons); }
+        else: {}
+      }
+    }
+    s = s + text;
   }
   return s;
+}
+
+bool endsWithColon(string s) { return s.len() > 0 && s.slice(s.len() - 1, s.len()) == ":"; }
+
+/**
+ * `~` and `~/…` replaced with `$HOME`.
+ *
+ * `startable` says whether a tilde at the front of this text stands for a home directory — that is a
+ * position, not a character: only one at the start of the word counts, which is why `echo a~` prints
+ * `a~`. `colons` additionally allows one after every `:`, which is an assignment's rule.
+ *
+ * `~user` is left exactly as written, which is also what bash does for a user it cannot find: naming
+ * somebody else's home directory means reading the password file, and this shell has no capability
+ * that could. Same for `~+` and `~-`. With `HOME` unset bash consults the password file and this
+ * leaves the word alone, which is the one case where the two differ.
+ */
+string withHome(Shell sh, string text, bool startable, bool colons) {
+  u8[] b = text.toBytes();
+  bool any = false;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (homeTilde(b, i, startable, colons)) { any = true; }
+  }
+  if (!any) { return text; }
+
+  string home = sh.lookUp("HOME");
+  if (home == "") { return text; }
+  u8[] h = home.toBytes();
+
+  Buf out = Buf.create();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (homeTilde(b, i, startable, colons)) { out.pushAll(h); } else { out.push(b[i]); }
+  }
+  return string.fromBytes(out.bytes());
+}
+
+/**
+ * Whether byte `at` is a `~` in a position that means home, with nothing after it that would make it
+ * a user name instead.
+ *
+ * The tilde-prefix ends at the first `/` **or `:`**, or at the end of the word: `~:x` is the home
+ * directory and a colon, while `~=x` and `~,x` are words beginning with a tilde. A colon terminates
+ * one everywhere; it only *begins* one in an assignment, which is what `colons` distinguishes —
+ * `echo ~:~` expands the left tilde alone and `v=~:~` expands both, both as bash does.
+ */
+bool homeTilde(u8[] b, i32 at, bool startable, bool colons) {
+  if (b[at] != 0x7e) { return false; }                                   // '~'
+  bool placed = (at == 0 && startable) || (colons && at > 0 && b[at - 1] == 0x3a);   // ':'
+  if (!placed) { return false; }
+  if (at + 1 == b.len()) { return true; }
+  return b[at + 1] == 0x2f || b[at + 1] == 0x3a;                         // '/' ':'
 }
 
 i32 indexOfEq(string s) {

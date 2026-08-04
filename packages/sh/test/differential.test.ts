@@ -988,7 +988,7 @@ Deno.test({
 });
 
 /**
- * `cd` with an environment, which every case above runs without.
+ * `HOME` and `OLDPWD`, which every case above runs without.
  *
  * The harness clears the environment and sets `LC_ALL` and `PATH`, deliberately: a script whose answer
  * depends on the machine's `$USER` is not a comparison. But `cd` and `cd -` read `HOME` and `OLDPWD`,
@@ -998,10 +998,11 @@ Deno.test({
  * variables this shell had assigned.
  *
  * Two named variables, both set to a temporary directory, so the answer is still the shell's and not
- * the machine's.
+ * the machine's. `~` is here for the same reason and could not have been compared above either: with
+ * `HOME` unset bash reads the password file instead, so `echo ~` would be the container's own answer.
  */
 Deno.test({
-  name: "cd and `cd -` read HOME and OLDPWD from the environment, as bash does",
+  name: "HOME and OLDPWD reach `cd`, `cd -` and `~`, as they do in bash",
   ignore: !haveBash,
   fn: async () => {
     const home = await Deno.makeTempDir({ prefix: "sh-home-" });
@@ -1016,6 +1017,27 @@ Deno.test({
         "HOME=; cd; pwd",              // assigned empty in this shell, which is not the same as unset
         "cd nowhere; pwd",             // still where it was, and status 1
         "cd; echo st=$?",
+        // Tilde expansion, which is the same `HOME` and could not be compared with it cleared either:
+        // bash falls back to the password file, so `echo ~` there prints the real home directory and
+        // nothing in this container's environment makes the two shells agree.
+        "echo ~",
+        "echo ~/x",
+        'echo "~"',                    // quoted: a tilde is a tilde
+        "echo \\~",
+        "echo a~",                     // not at the front of the word
+        "echo ~a",                     // a user name, which neither shell can resolve here
+        "echo ~/x ~",
+        "echo ~:~",                    // in a *word* only the leading one expands
+        "echo ~:x",                    // …and a colon ends a tilde-prefix even so
+        "echo ~=x",                    // while other punctuation does not: a word, not a home
+        "echo ~/a:~/b",                // still one, in a word
+        'echo "a~"~',                  // …and the front of the word is not the front of a part
+        "x=~/a; echo $x",
+        "y=/u:~/b; echo $y",           // in an assignment, one after every colon
+        "v=~:~; echo $v",              // …so both of these expand, unlike in the word above
+        "z=~; echo $z/y",              // expanded once, at assignment time
+        "cd ~; pwd",
+        "echo hi > ~/f; cat ~/f",      // a redirection target, which is why `joinWord` does it too
       ];
       for (const script of cases) {
         const run = (cmd: string, args: string[]) =>

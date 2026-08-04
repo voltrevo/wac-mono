@@ -241,15 +241,33 @@ above the root, a failed `cd` leaving the shell where it was.
 `-a` is the only flag, and it synthesises `.` and `..` as a real `ls` does, since `readDir` does
 not report them.
 
+**`~` is `$HOME` and nothing else.** `~`, `~/x`, `cd ~`, `> ~/f`, and one after every colon in an
+assignment (`PATH=/usr/bin:~/bin`, which has to expand or the shell keeps a directory called `~` on
+its search path). Left exactly as written: `~user`, because naming somebody else's home means
+reading the password file and no capability offers it — bash also leaves a user it cannot find
+alone — and `~+`/`~-`, which are `$PWD` and `$OLDPWD` under a spelling almost nobody types. With
+`HOME` unset bash asks the password file and this leaves the word alone, which is the only case
+where the two disagree; the differential suite therefore compares `~` with `HOME` set, in the same
+test as `cd` and `cd -`, since all three read it.
+
 **No `$0`.** `cli.arg(0)` is the first *argument*, not the program name, so there is nothing
 truthful to put there.
 
 **No process substitution.** `<(…)` needs a pipe with a name, which the capability world does
 not offer.
 
-**Pipelines run one stage at a time**, in memory. A real pipeline runs its stages at once, so
-`yes | head -1` terminates in bash and would not here. Real processes will not fix that by
-themselves: it needs the shell to run stages concurrently, which needs more than one thread.
+**Pipeline stages run at once; a stage's own output does not stream.** This section used to say
+stages ran one at a time, and they no longer do — a pipeline whose every stage is a spawnable
+program named by a plain literal runs them concurrently, each in its own worker, and `canStream` in
+`exec.wac` is the exact list of what qualifies (a builtin, a compound, a redirection or an
+assignment falls back to one-at-a-time in memory, because those run in *this* shell).
+
+What did not change is the seam's signature: bytes in, bytes out. A program produces all of its
+output before any of it moves, so `head -1` cannot stop the stage feeding it — `seq 1 2000000000 |
+head -1` prints `1` in bash and here it dies with "requested new array is too large" after five
+seconds, exactly as `seq 1 2000000000 > out` does on its own. Stage concurrency does not fix that
+and neither would real processes; it needs the applets to write as they go, the way
+[`packages/box`](../box/README.md)'s do through `Sink`.
 
 **Globbing is last-component only.** A pattern in the final path component works; one in a leading
 component does not, because that needs walking every directory that matches.
