@@ -180,9 +180,12 @@ export function cliOf(
   };
   const fileResult = (id: number) => {
     try {
-      return cls.FileResult.of(true, collect(b, unpack(id)), "");
+      return cls.FileResult.of(true, collect(b, unpack(id)), "", 0);
     } catch (e) {
-      return cls.FileResult.of(false, EMPTY, e instanceof Error ? e.message : String(e));
+      // The category as well as the message, so a program can say what GNU says about a missing file
+      // instead of printing the host's sentence — `FAULT_OTHER` when nothing said better. wac-mono 0062.
+      const fault = e instanceof HostCallError ? e.fault : 5;
+      return cls.FileResult.of(false, EMPTY, e instanceof Error ? e.message : String(e), fault);
     }
   };
   const stat = (id: number) => {

@@ -5,7 +5,7 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Sink } from "../lib/out.wac";
+import { Sink } from "../../../platform/src/stream.wac";
 import { Chunk, Input, openStream, nextChunk } from "../lib/input.wac";
 import { Buf } from "../../../bytes/src/buf.wac";
 

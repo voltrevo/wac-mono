@@ -41,6 +41,7 @@ import {
   STATUS_OK,
   SUBMIT_SEQ,
 } from "./layout.ts";
+import { FAULT_OTHER, faultedBytes, faultOf } from "./faults.ts";
 
 /** What a capability does with a request payload. May be async; that is the point. */
 export type Handler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
@@ -170,7 +171,7 @@ export function serveHostCalls(
 
     const h = handlers[op];
     if (h === undefined) {
-      reply(slot, STATUS_ERR, enc.encode(`no handler for capability ${op}`));
+      reply(slot, STATUS_ERR, faultedBytes(FAULT_OTHER, `no handler for capability ${op}`));
       return;
     }
     // Dispatched, not awaited: the loop goes back to watching immediately, so a slow
@@ -197,7 +198,13 @@ export function serveHostCalls(
         if (!stillOurs()) return;
         // The worker turns this into a thrown HostCallError, so a capability failing is
         // an error in wac's caller rather than a silent wrong answer.
-        reply(slot, STATUS_ERR, enc.encode(e instanceof Error ? e.message : String(e)));
+        // Classified *here*, once, rather than at each of the forty handlers: `faultOf` reads the
+        // host's own exception, and every capability's failure gains a category for free. wac-mono 0062.
+        reply(
+          slot,
+          STATUS_ERR,
+          faultedBytes(faultOf(e), e instanceof Error ? e.message : String(e)),
+        );
       }
     })();
   };

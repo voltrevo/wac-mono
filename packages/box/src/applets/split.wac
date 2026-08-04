@@ -7,7 +7,7 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
-import { Line, Lines, emit, nextLine } from "../lib/reader.wac";
+import { Feed, Line, Lines, emit, nextLine } from "../../../platform/src/stream.wac";
 import { itoa } from "../lib/num.wac";
 
 export i32 split(Core core, Cli cli, Args a) {
@@ -22,11 +22,12 @@ export i32 split(Core core, Cli cli, Args a) {
   if (!in.ok) { return 1; }
 
   Lines s = Lines.create();
+  Feed fed = Feed.fromStdin(cli);
   i32 piece = 0;
   i32 written = 0;
   bool open = false;
   while (true) {
-    Line l = nextLine(s, cli);
+    Line l = nextLine(s, fed);
     if (!l.ok) { break; }
     if (!open) {
       string name = prefix + suffix(piece);

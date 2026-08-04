@@ -1,0 +1,359 @@
+// Output in blocks and input in chunks, so a program is not bounded by what it produces.
+//
+// Two shapes, and one reason for both: a capability call parks the caller on `Atomics.wait` until the
+// host answers, so a write per line is ruinous — `box seq 1 200000` spent 14.5 seconds making two
+// hundred thousand of them where GNU takes two milliseconds — and a program that holds its whole answer
+// before sending any of it cannot be stopped, cannot be piped into usefully, and dies on anything
+// large. `seq 1 2000000000 | head -1` prints one line in bash; through a seam that returns bytes it
+// runs for five seconds and traps with "requested new array is too large". wac-mono 0061.
+//
+// This lives in `platform` rather than in either caller because both callers are downstream of it and
+// neither is downstream of the other: `packages/box` had a `Sink` of its own (`lib/out.wac`, now a
+// re-export) and `packages/sh` could not use it, since box depends on sh. The cost being avoided is the
+// bridge's, which is this package's own, so the buffer belongs here.
+//
+// ## Using it
+//
+//     Sink out = Sink.toOutput(cli);
+//     while (…) { if (!out.line(text)) { break; } }
+//     out.flush();
+//
+// **Every path out has to flush.** There are no destructors here, so a forgotten flush is a program
+// that prints nothing — a worse bug than a slow one. What keeps that honest is a differential test
+// against the real tool: a missing flush is an empty answer where GNU has output.
+//
+// ## Why the answer matters
+//
+// `write` answers false when the other end has gone away, and `box yes` is `while (cli.write(b)) {}`
+// precisely so that it stops. A buffer must pass that on rather than swallowing it, so every method
+// answers "keep going", and a sink that has been refused once stays `broken` — a producer that ignored
+// the answer would fill memory with output nobody is going to read.
+
+import { Cli } from "./platform.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+import { Read } from "../../bytes/src/read.wac";
+
+/**
+ * How much to hold before writing it out.
+ *
+ * 64 KiB, which is `CHUNK` in the bridge — what a read answers with at most, and the size the ring is
+ * built to move. Larger buys nothing, because the host splits it again.
+ */
+i32 BLOCK() { return 65536; }
+
+/** Where a `Sink`'s bytes go. */
+i32 TO_OUTPUT() { return 0; }
+i32 TO_ERR() { return 1; }
+i32 TO_BUFFER() { return 2; }
+
+/**
+ * A buffered writer, to standard output, to standard error, or into memory.
+ *
+ * The third is what lets one program body serve both ways of being run. An applet spawned as a worker
+ * writes through the capability and streams; the same applet called *in process* by a shell that
+ * cannot spawn has its output collected, exactly as it did when the seam returned bytes. The applet
+ * cannot tell, which is the point — the alternative was two implementations of every program.
+ */
+export struct Sink {
+  Cli cli;
+  i32 to;
+  Buf held;
+  /** A write was refused: the reader has gone. Nothing more will be sent. */
+  bool broken;
+
+  /** Bytes to standard output, buffered. */
+  Sink toOutput(Cli cli) { return Sink(cli, TO_OUTPUT(), Buf.create(), false); }
+
+  /** The same, under the name `packages/box`'s sixty applets already call it. */
+  Sink create(Cli cli) { return Sink(cli, TO_OUTPUT(), Buf.create(), false); }
+
+  /**
+   * Bytes to standard error, buffered.
+   *
+   * Separate from the output sink rather than a flag on it, because a program has two streams and
+   * merging them is a bug a shell notices: `cat nosuch | wc -c` counted the error message.
+   */
+  Sink toErr(Cli cli) { return Sink(cli, TO_ERR(), Buf.create(), false); }
+
+  /**
+   * Into memory, for a caller that wants the bytes rather than a stream.
+   *
+   * `taken()` is how they come out. Nothing is ever written through the capability, so the `Cli` here
+   * is unused — it is a field rather than an option because wac has no nullable struct fields worth
+   * the branch, and an unused capability reference costs nothing.
+   */
+  Sink toBuffer(Cli cli) { return Sink(cli, TO_BUFFER(), Buf.create(), false); }
+
+  /** Bytes, exactly as given. False once the reader has gone away. */
+  bool bytes(this, u8[] b) {
+    if (this.broken) { return false; }
+    this.held.pushAll(b);
+    return this.maybeFlush();
+  }
+
+  /** A line and its newline — what `core.log` did, without the round trip. */
+  bool line(this, string text) {
+    if (this.broken) { return false; }
+    this.held.pushAll(text.toBytes());
+    this.held.push('\n');
+    return this.maybeFlush();
+  }
+
+  /**
+   * Bytes and a newline, for a line that is not text.
+   *
+   * Separate from `line` because a line of a file is bytes: decoding it to a string to add a newline
+   * would mangle anything that is not valid UTF-8.
+   */
+  bool lineBytes(this, u8[] b) {
+    if (this.broken) { return false; }
+    this.held.pushAll(b);
+    this.held.push('\n');
+    return this.maybeFlush();
+  }
+
+  /** One byte. */
+  bool byte(this, i32 b) {
+    if (this.broken) { return false; }
+    this.held.push(b);
+    return this.maybeFlush();
+  }
+
+  /** A buffer that has reached the block size sends; one that has not keeps collecting. */
+  bool maybeFlush(this) {
+    if (this.to == TO_BUFFER()) { return true; }
+    if (this.held.len >= BLOCK()) { return this.flush(); }
+    return true;
+  }
+
+  /**
+   * Send what is held. False if the write was refused, and then this sink is finished.
+   *
+   * Safe with nothing held and safe twice — a program with several ways out should flush on each
+   * rather than reasoning about which one already did. A buffering sink is a no-op: its bytes are
+   * meant to be taken, not sent.
+   */
+  bool flush(this) {
+    if (this.broken) { return false; }
+    if (this.to == TO_BUFFER()) { return true; }
+    if (this.held.len == 0) { return true; }
+    u8[] out = this.held.take();
+    bool sent = this.to == TO_ERR() ? this.cli.writeErr(out) : this.cli.write(out);
+    if (!sent) {
+      this.broken = true;
+      return false;
+    }
+    return true;
+  }
+
+  /** Everything a buffering sink has collected, and empty for the streaming ones. */
+  u8[] taken(this) { return this.held.take(); }
+
+  /** Whether a write has been refused: what a producer checks before making more. */
+  bool gone(const this) { return this.broken; }
+}
+
+/**
+ * Input, in chunks or all at once, from a capability or from bytes somebody already has.
+ *
+ * The mirror of `Sink`, and needed for the same reason: `seq 1 2000000000 | wc -l` cannot hand `wc` a
+ * fourteen-gigabyte argument, and `sort` genuinely needs every line before it can answer. So a program
+ * says which it wants — `next()` for a filter, `rest()` for a program that must see the whole input —
+ * and where the bytes come from is the caller's business.
+ */
+export struct Feed {
+  Cli cli;
+  bool streaming;
+  u8[] held;
+  i32 at;
+  bool ended;
+  /** Why a read failed, or empty. */
+  string why;
+
+  /** Standard input, pulled a chunk at a time through the capability. */
+  Feed fromStdin(Cli cli) { return Feed(cli, true, u8[0](), 0, false, ""); }
+
+  /** Bytes somebody already has — a here-document, a pipeline stage's collected output. */
+  Feed of(Cli cli, u8[] bytes) { return Feed(cli, false, bytes, 0, false, ""); }
+
+  /**
+   * The next chunk, empty at the end.
+   *
+   * A buffered feed answers with everything it has left, once: a caller that wanted it a piece at a
+   * time is asking for a stream, and turning bytes it already holds into pieces would only make the
+   * loop longer.
+   */
+  u8[] next(this) {
+    if (this.ended) { return u8[0](); }
+    if (!this.streaming) {
+      this.ended = true;
+      return this.remaining();
+    }
+    match (this.cli.readChunk()) {
+      case Data(bytes): { return bytes; }
+      case End: {
+        this.ended = true;
+        return u8[0]();
+      }
+      case Failed(why): {
+        // A read that failed *ends* the input as far as a filter is concerned, and the reason is kept:
+        // a program that reported success over a half-read file would be the worst of the three
+        // possible answers.
+        this.ended = true;
+        this.why = why;
+        return u8[0]();
+      }
+    }
+    return u8[0]();
+  }
+
+  /** Everything, for a program that cannot answer before it has seen all of it. */
+  u8[] rest(this) {
+    Buf all = Buf.create();
+    all.pushAll(this.remaining());
+    while (true) {
+      u8[] more = this.next();
+      if (more.len() == 0) { return all.take(); }
+      all.pushAll(more);
+    }
+    return all.take();
+  }
+
+  /** Why a read failed, or the empty string. Empty is the ordinary case, including at the end. */
+  string failure(const this) { return this.why; }
+
+  /** What a buffered feed has not handed over yet. */
+  u8[] remaining(this) {
+    if (this.at >= this.held.len()) { return u8[0](); }
+    u8[] out = u8[this.held.len() - this.at](fill: 0);
+    out.copyFrom(this.held, this.at, 0, out.len());
+    this.at = this.held.len();
+    return out;
+  }
+}
+
+// ── Lines ─────────────────────────────────────────────────────────────────────
+
+/**
+ * One line, or `ok: false` at the end of the input.
+ *
+ * `nl` says whether the line was newline-terminated, which only the last line of an input can fail to
+ * be. Carrying it is what lets a filter match the real tools on a file that does not end in a newline:
+ * `tail -1` of one prints `b`, not `b\n`.
+ */
+export struct Line { bool ok; u8[] bytes; bool nl; }
+
+/**
+ * Lines pulled from a `Feed`, one at a time.
+ *
+ * Splitting the whole input needs the whole input in memory, which is what streaming is for. This holds
+ * one chunk plus one partial line, so a line-oriented program costs whatever its own state costs and
+ * nothing for the input's size. A very long line still grows `pending` to hold it — the line is the
+ * unit, and no line-oriented tool can promise better.
+ *
+ * **It has to be linear as well as bounded**, which the first version of this was not: it appended with
+ * `concat` and rescanned from the start after every refill, so a 300 MB file with no newlines in it
+ * copied and scanned the whole buffer once per 64 KiB chunk. O(n²), and it had not finished after two
+ * minutes. A doubling `Buf` for the append and a `scanned` watermark for the search make both halves
+ * linear.
+ *
+ * It reads from a `Feed` rather than from `Cli` directly, which is what lets one line reader serve a
+ * program running as a worker and the same program called in process over bytes somebody already holds.
+ */
+export struct Lines {
+  /**
+   * Empty unless a read failed, in which case this is the host's message and the lines seen so far are
+   * all there are. A program that ignores it reports success over a truncated file.
+   */
+  string broken;
+  Buf pending;    // bytes read but not yet handed out; doubles, so appending is amortised
+  i32 at;         // where the line being built starts
+  i32 scanned;    // no newline anywhere in pending[at..scanned) — never re-examined
+  bool ended;     // the input said so; `pending` may still hold a last line
+
+  Lines create() { return Lines("", Buf.create(), 0, 0, false); }
+}
+
+/**
+ * The next line, without its newline.
+ *
+ * The final line is returned even without a trailing newline, and an input that ends with one does not
+ * produce a trailing empty line — so a program behaves the same whether it reads lines or splits bytes.
+ */
+export Line nextLine(Lines s, Feed in) {
+  while (true) {
+    // From the watermark, not from `at`: bytes already looked at cannot become newlines.
+    for (i32 i = s.scanned; i < s.pending.len; i++) {
+      if (s.pending.data[i] != '\n') { continue; }
+      u8[] line = sliceOf(s.pending.data, s.at, i);
+      s.at = i + 1;
+      s.scanned = s.at;
+      return Line(true, line, true);
+    }
+    s.scanned = s.pending.len;
+
+    // No newline in what is left, so it is either the start of a longer line or the last line.
+    if (s.ended) {
+      u8[] rest = sliceOf(s.pending.data, s.at, s.pending.len);
+      s.pending.len = 0;
+      s.at = 0;
+      s.scanned = 0;
+      return rest.len() > 0 ? Line(true, rest, false) : Line(false, u8[0](), false);
+    }
+
+    // Drop what has already been handed out before growing. `copyFrom` is a memmove, so a downward
+    // overlapping shift is exactly what it is for.
+    if (s.at > 0) {
+      i32 live = s.pending.len - s.at;
+      s.pending.data.copyFrom(s.pending.data, s.at, 0, live);
+      s.pending.len = live;
+      s.scanned = s.scanned - s.at;
+      s.at = 0;
+    }
+
+    u8[] more = in.next();
+    if (more.len() == 0) {
+      s.ended = true;
+      if (in.failure().len() > 0) { s.broken = in.failure(); }
+    } else {
+      s.pending.pushAll(more);
+    }
+  }
+  return Line(false, u8[0](), false);
+}
+
+/**
+ * A line into a `Sink`, terminated only if the one it came from was.
+ *
+ * The one to use in a loop: a `write` per line is a park and a wake per line, which cost `seq` fourteen
+ * seconds for two hundred thousand of them. Answers false once the reader has gone away, so a filter
+ * stops rather than producing into nothing.
+ */
+export bool emitTo(Sink out, u8[] line, bool nl) {
+  if (!nl) { return out.bytes(line); }
+  return out.lineBytes(line);
+}
+
+/**
+ * A line written *now*, terminated only if the one it came from was.
+ *
+ * Unbuffered, for the handful of places that write once and return — `emitTo` is the one to use in a
+ * loop, since a `write` per line is a park and a wake per line.
+ */
+export void emit(Cli cli, u8[] line, bool nl) {
+  if (!nl) {
+    cli.write(line);
+    return;
+  }
+  u8[] out = u8[line.len() + 1](fill: '\n');
+  out.copyFrom(line, 0, 0, line.len());
+  cli.write(out);
+}
+
+/** `b[at..to)`. */
+u8[] sliceOf(u8[] b, i32 at, i32 to) {
+  if (to <= at) { return u8[0](); }
+  u8[] out = u8[to - at](fill: 0);
+  out.copyFrom(b, at, 0, to - at);
+  return out;
+}

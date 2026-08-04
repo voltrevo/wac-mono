@@ -75,16 +75,19 @@ Pending<string?> fakeEnv(string name) {
 
 /** `in.txt`, `words.txt` and `out.txt` exist; nothing else does. */
 FileResult resolveFile(i32 id) {
-  if (id == 1) { return FileResult.of(true, "alpha\nbeta\n".toBytes(), ""); }
-  if (id == 2) { return FileResult.of(true, "b\na\nc\n".toBytes(), ""); }
-  if (id == 3) { return FileResult.of(true, "existing\n".toBytes(), ""); }
+  if (id == 1) { return FileResult.of(true, "alpha\nbeta\n".toBytes(), "", FAULT_NONE()); }
+  if (id == 2) { return FileResult.of(true, "b\na\nc\n".toBytes(), "", FAULT_NONE()); }
+  if (id == 3) { return FileResult.of(true, "existing\n".toBytes(), "", FAULT_NONE()); }
   // Two "worker bundles", distinguished only by their contents, so `fakeSpawn` can start one and
   // refuse the other without holding any state. See the spawn section below.
-  if (id == 4) { return FileResult.of(true, "runnable".toBytes(), ""); }
-  if (id == 5) { return FileResult.of(true, "unrunnable".toBytes(), ""); }
-  if (id == 6) { return FileResult.of(true, "vanishing".toBytes(), ""); }
-  if (id == 7) { return FileResult.of(true, "nospawnworld".toBytes(), ""); }
-  return FileResult.of(false, u8[0](), "no such file");
+  if (id == 4) { return FileResult.of(true, "runnable".toBytes(), "", FAULT_NONE()); }
+  if (id == 5) { return FileResult.of(true, "unrunnable".toBytes(), "", FAULT_NONE()); }
+  if (id == 6) { return FileResult.of(true, "vanishing".toBytes(), "", FAULT_NONE()); }
+  if (id == 7) { return FileResult.of(true, "nospawnworld".toBytes(), "", FAULT_NONE()); }
+  // The category as well as the message, as a host answers now: a program that phrases
+  // "No such file or directory" from the *fault* would otherwise see FAULT_NONE here and print the
+  // double's own words instead. wac-mono 0062.
+  return FileResult.of(false, u8[0](), "no such file", FAULT_NOT_FOUND());
 }
 Pending<FileResult> fakeReadFile(string path) {
   i32 which = 0;

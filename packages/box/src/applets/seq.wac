@@ -12,7 +12,7 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { atoi, itoa } from "../lib/num.wac";
-import { Sink } from "../lib/out.wac";
+import { Sink } from "../../../platform/src/stream.wac";
 
 export i32 seq(Core core, Cli cli, Args a) {
   // Read positionally, not from `a.rest`, and that is forced rather than preferred: to box's

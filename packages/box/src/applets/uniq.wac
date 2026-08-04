@@ -6,8 +6,7 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
-import { Line, Lines, emitTo, nextLine } from "../lib/reader.wac";
-import { Sink } from "../lib/out.wac";
+import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
 import { cmpBytes } from "../lib/lines.wac";
 import { itoa } from "../lib/num.wac";
 
@@ -17,12 +16,13 @@ export i32 uniq(Core core, Cli cli, Args a) {
   bool counting = has(a, 'c');
 
   Lines s = Lines.create();
+  Feed fed = Feed.fromStdin(cli);
   Sink out = Sink.create(cli);
   u8[] prev = u8[0]();
   bool lastNl = true;
   i32 run = 0;
   while (true) {
-    Line l = nextLine(s, cli);
+    Line l = nextLine(s, fed);
     if (!l.ok) { break; }
     if (run > 0 && cmpBytes(l.bytes, prev) == 0) { run++; lastNl = l.nl; continue; }
     if (run > 0) { show(out, prev, run, counting, lastNl); }
