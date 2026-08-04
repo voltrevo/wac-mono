@@ -175,3 +175,59 @@ Deno.test("Fp2 arithmetic agrees with Python", () => {
   }
   if (!mod2.blsFp2OneIsIdempotent()) throw new Error("1·1 != 1 in Fp2");
 });
+
+// ── The tower ─────────────────────────────────────────────────────────────────
+
+const modT = mod as unknown as {
+  blsFp6Op(a: Uint8Array, b: Uint8Array, op: number): Uint8Array;
+  blsFp12Op(a: Uint8Array, b: Uint8Array, op: number): Uint8Array;
+  blsFp12InverseIsInverse(a: Uint8Array): boolean;
+};
+type Tower = { fp6: Record<string, string[]>[]; fp12: Record<string, string[]>[] };
+const t = v as unknown as Vectors & Tower;
+
+const flat = (coeffs: string[]) => {
+  const out = new Uint8Array(coeffs.length * 48);
+  coeffs.forEach((c, i) => out.set(bytes(c), i * 48));
+  return out;
+};
+const unflat = (b: Uint8Array) => {
+  const out: string[] = [];
+  for (let i = 0; i < b.length; i += 48) out.push(hex(b.subarray(i, i + 48)));
+  return out;
+};
+
+const OPS: [string, number][] = [
+  ["mul", 0], ["sq", 1], ["mulByV", 2], ["inv", 3], ["frob1", 4], ["frob2", 5], ["frob3", 6],
+];
+
+Deno.test("Fp6 arithmetic and Frobenius agree with the Python tower", () => {
+  for (const c of t.fp6) {
+    for (const [name, op] of OPS) {
+      const got = unflat(modT.blsFp6Op(flat(c.a), flat(c.b), op));
+      if (got.join() !== c[name].join()) {
+        throw new Error(`fp6 ${name}\n  got  ${got[0]}…\n  want ${c[name][0]}…`);
+      }
+    }
+  }
+});
+
+Deno.test("Fp12 arithmetic and Frobenius agree with the Python tower", () => {
+  // Frobenius is the one worth naming: `tower.py` validates its constants by comparing
+  // Frobenius-by-constant against actually raising to the pⁿ-th power in the tower, so a wrong
+  // digit in any of the nine twelve-word tables fails there before reaching here.
+  const ops: [string, number][] = [
+    ["mul", 0], ["sq", 1], ["conj", 2], ["inv", 3], ["frob1", 4], ["frob2", 5], ["frob3", 6],
+  ];
+  for (const c of t.fp12) {
+    for (const [name, op] of ops) {
+      const got = unflat(modT.blsFp12Op(flat(c.a), flat(c.b), op));
+      if (got.join() !== c[name].join()) {
+        throw new Error(`fp12 ${name}\n  got  ${got[0]}…\n  want ${c[name][0]}…`);
+      }
+    }
+    if (!modT.blsFp12InverseIsInverse(flat(c.a))) {
+      throw new Error("a · a⁻¹ != 1 in Fp12");
+    }
+  }
+});

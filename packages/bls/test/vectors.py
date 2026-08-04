@@ -11,6 +11,12 @@ Deterministic: the seed is fixed, so regenerating without changing this file cha
 """
 import json
 import random
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tower import (P as TP, f2mul, f6mul, f6sqr, f6inv, f6mulByV, f12mul, f12sqr, f12inv,
+                   f12conj, f12frob, f6frob, F12_ONE)
 
 P = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab
 
@@ -73,8 +79,43 @@ def main() -> None:
             "norm": h((a[0] * a[0] + a[1] * a[1]) % P),
         })
 
+    # ── The tower ─────────────────────────────────────────────────────────────
+    # Fp6 and Fp12 elements are flattened to lists of coefficient hex, in the same order the
+    # probe reads and writes them: c0 then c1 within each Fp2, ascending degree above that.
+    def r2():
+        return (random.randrange(P), random.randrange(P))
+
+    def flat6(x):
+        return [h(c) for pair in x for c in pair]
+
+    def flat12(x):
+        return flat6(x[0]) + flat6(x[1])
+
+    def rnd6():
+        return tuple(r2() for _ in range(3))
+
+    def rnd12():
+        return (rnd6(), rnd6())
+
+    fp6 = []
+    for _ in range(8):
+        a, b = rnd6(), rnd6()
+        fp6.append({"a": flat6(a), "b": flat6(b), "mul": flat6(f6mul(a, b)),
+                    "sq": flat6(f6sqr(a)), "mulByV": flat6(f6mulByV(a)),
+                    "inv": flat6(f6inv(a)), "frob1": flat6(f6frob(a, 1)),
+                    "frob2": flat6(f6frob(a, 2)), "frob3": flat6(f6frob(a, 3))})
+
+    fp12 = []
+    for _ in range(8):
+        a, b = rnd12(), rnd12()
+        fp12.append({"a": flat12(a), "b": flat12(b), "mul": flat12(f12mul(a, b)),
+                     "sq": flat12(f12sqr(a)), "conj": flat12(f12conj(a)),
+                     "inv": flat12(f12inv(a)), "frob1": flat12(f12frob(a, 1)),
+                     "frob2": flat12(f12frob(a, 2)), "frob3": flat12(f12frob(a, 3))})
+
     print(json.dumps({"p": h(P), "one": h(1), "cases": cases, "unary": unary, "bad": bad,
-                      "inv": inv, "roots": roots, "fp2": fp2}, indent=0))
+                      "inv": inv, "roots": roots, "fp2": fp2, "fp6": fp6, "fp12": fp12},
+                     indent=0))
 
 
 if __name__ == "__main__":

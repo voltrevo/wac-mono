@@ -116,3 +116,109 @@ export u8[] blsFp2Norm(u8[] ac0, u8[] ac1) {
 
 /** `1·1 == 1` in Fp2 — a shape check on the identity, not a correctness claim. */
 export bool blsFp2OneIsIdempotent() { return fp2Equals(fp2Mul(fp2One(), fp2One()), fp2One()); }
+
+// ── The tower ─────────────────────────────────────────────────────────────────
+//
+// Fp6 and Fp12 elements cross as a flat run of 48-byte coefficients: within each Fp2, c0 then
+// c1; above that, ascending degree. Six coefficients for Fp6, twelve for Fp12.
+
+import { Fp6, Fp12, fp6Mul, fp6Square, fp6MulByV, fp6Invert, fp6Frobenius, fp6Zero,
+         fp12Mul, fp12Square, fp12Conjugate, fp12Invert, fp12Frobenius, fp12One, fp12Zero,
+         fp12Equals, fp12IsOne } from "../../src/fp12.wac";
+
+Fp2? at2(u8[] s, i32 i) {
+  u8[] c0 = u8[48]();
+  u8[] c1 = u8[48]();
+  for (i32 k = 0; k < 48; k++) {
+    c0[k] = s[96 * i + k];
+    c1[k] = s[96 * i + 48 + k];
+  }
+  return fp2FromBytes(c1, c0);
+}
+
+/** Six coefficients in, an Fp6 out, or null if any is non-canonical. */
+Fp6? read6(u8[] s) {
+  if (s.len() != 288) { return null; }
+  Fp2? a = at2(s, 0);
+  Fp2? b = at2(s, 1);
+  Fp2? c = at2(s, 2);
+  if ((a is null) || (b is null) || (c is null)) { return null; }
+  return Fp6(a!, b!, c!);
+}
+
+Fp12? read12(u8[] s) {
+  if (s.len() != 576) { return null; }
+  u8[] lo = u8[288]();
+  u8[] hi = u8[288]();
+  for (i32 k = 0; k < 288; k++) { lo[k] = s[k]; hi[k] = s[288 + k]; }
+  Fp6? a = read6(lo);
+  Fp6? b = read6(hi);
+  if ((a is null) || (b is null)) { return null; }
+  return Fp12(a!, b!);
+}
+
+void write2(u8[] out, i32 i, Fp2 a) {
+  u8[] c0 = fp2C0Bytes(a);
+  u8[] c1 = fp2C1Bytes(a);
+  for (i32 k = 0; k < 48; k++) {
+    out[96 * i + k] = c0[k];
+    out[96 * i + 48 + k] = c1[k];
+  }
+}
+
+u8[] bytes6(Fp6 a) {
+  u8[] out = u8[288]();
+  write2(out, 0, a.c0);
+  write2(out, 1, a.c1);
+  write2(out, 2, a.c2);
+  return out;
+}
+
+u8[] bytes12(Fp12 a) {
+  u8[] out = u8[576]();
+  u8[] lo = bytes6(a.c0);
+  u8[] hi = bytes6(a.c1);
+  for (i32 k = 0; k < 288; k++) { out[k] = lo[k]; out[288 + k] = hi[k]; }
+  return out;
+}
+
+/** Fp6 operations by index: 0 mul, 1 square, 2 mulByV, 3 invert, 4..6 Frobenius at 1..3. */
+export u8[] blsFp6Op(u8[] a, u8[] b, i32 op) {
+  Fp6? x = read6(a);
+  Fp6? y = read6(b);
+  if ((x is null) || (y is null)) { return u8[0](); }
+  if (op == 0) { return bytes6(fp6Mul(x!, y!)); }
+  if (op == 1) { return bytes6(fp6Square(x!)); }
+  if (op == 2) { return bytes6(fp6MulByV(x!)); }
+  if (op == 3) {
+    Fp6? r = fp6Invert(x!);
+    return (r is null) ? u8[0]() : bytes6(r!);
+  }
+  if (op >= 4 && op <= 6) { return bytes6(fp6Frobenius(x!, op - 3)); }
+  return u8[0]();
+}
+
+/** Fp12 operations: 0 mul, 1 square, 2 conjugate, 3 invert, 4..6 Frobenius at 1..3. */
+export u8[] blsFp12Op(u8[] a, u8[] b, i32 op) {
+  Fp12? x = read12(a);
+  Fp12? y = read12(b);
+  if ((x is null) || (y is null)) { return u8[0](); }
+  if (op == 0) { return bytes12(fp12Mul(x!, y!)); }
+  if (op == 1) { return bytes12(fp12Square(x!)); }
+  if (op == 2) { return bytes12(fp12Conjugate(x!)); }
+  if (op == 3) {
+    Fp12? r = fp12Invert(x!);
+    return (r is null) ? u8[0]() : bytes12(r!);
+  }
+  if (op >= 4 && op <= 6) { return bytes12(fp12Frobenius(x!, op - 3)); }
+  return u8[0]();
+}
+
+/** `a · a⁻¹ == 1` in Fp12 — a shape check, not the correctness oracle. */
+export bool blsFp12InverseIsInverse(u8[] a) {
+  Fp12? x = read12(a);
+  if (x is null) { return false; }
+  Fp12? r = fp12Invert(x!);
+  if (r is null) { return false; }
+  return fp12IsOne(fp12Mul(x!, r!));
+}

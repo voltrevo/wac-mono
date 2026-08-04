@@ -18,7 +18,7 @@
 // values rather than against itself.
 
 import { fpAdd, fpSub, fpMul, fpNeg, fpSquare, fpZero, fpOne, fpIsZero, fpEquals, fpCopy,
-         fpFromBytes, fpToBytes } from "./fp.wac";
+         fpFromBytes, fpToBytes, fpInvert } from "./fp.wac";
 
 /** `c0 + c1·u`. Both coefficients are in Montgomery form; see `fp.wac`. */
 export struct Fp2 {
@@ -93,6 +93,19 @@ export Fp2 fp2Double(Fp2 a) { return fp2Add(a, a); }
  * one Fp inversion rather than a linear solve.
  */
 export u32[] fp2Norm(Fp2 a) { return fpAdd(fpSquare(a.c0), fpSquare(a.c1)); }
+
+/**
+ * `a⁻¹`, or null when `a` is zero.
+ *
+ * One Fp inversion, not a linear solve: `a · conjugate(a)` is the norm `a0² + a1²`, whose u-part
+ * cancels, so `a⁻¹ = conjugate(a) / norm(a)`. Zero is the only non-invertible element because the
+ * norm is a sum of two squares in a field where −1 is not a square.
+ */
+export Fp2? fp2Invert(Fp2 a) {
+  u32[]? n = fpInvert(fp2Norm(a));
+  if (n is null) { return null; }
+  return Fp2(fpMul(a.c0, n!), fpMul(fpNeg(a.c1), n!));
+}
 
 /** Two 48-byte coefficients, `c1` first as the Ethereum encodings order them. */
 export Fp2? fp2FromBytes(u8[] c1, u8[] c0) {

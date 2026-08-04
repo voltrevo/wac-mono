@@ -17,7 +17,7 @@ Under construction, built in stages with an external oracle gating each one. Wha
 | `Fp` — the 381-bit base field, Montgomery form | **done**, against Python |
 | `Fp` inversion and square roots | **done**, against Python |
 | `Fp2` — the quadratic extension | **done**, against Python |
-| `Fp6` / `Fp12` — the rest of the tower | not started |
+| `Fp6` / `Fp12` — the rest of the tower, with Frobenius | **done**, against Python |
 | `G1` / `G2` — points, subgroup checks, compressed encoding | not started |
 | `hash_to_G2` — RFC 9380 | not started |
 | Miller loop and final exponentiation | not started |
@@ -40,8 +40,14 @@ oracle: it checks the implementation against itself and passes cheerfully with t
 wrong final-exponentiation exponent, or a consistently-wrong Frobenius. Pairing code is notorious
 for this. Every stage here is checked against something external instead:
 
-- `Fp` and the tower — `test/vectors.py`, which uses Python's own integers and shares no code,
-  representation or author's misreading with the implementation. Montgomery form in particular
+- `Fp` and the tower — `test/vectors.py` and `test/tower.py`, which use Python's own integers and
+  share no code, representation or author's misreading with the implementation.
+
+  The Frobenius constants get a second, sharper check. There are nine of them, each twelve 32-bit
+  words, and a single wrong digit gives a pairing that is entirely self-consistent and matches no
+  published value. `tower.py` therefore validates Frobenius-by-constants against **actually
+  raising to the pⁿ-th power** in the tower, so a bad table fails there before any wac runs. The
+  wac tables were emitted by script and pasted, never typed. Montgomery form in particular
   satisfies `a·1 == a` and `a + 0 == a` with a completely broken reduction, so a self-relation
   would prove almost nothing.
 - `hash_to_G2` — RFC 9380 §J.10's published vectors.
