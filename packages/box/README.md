@@ -82,14 +82,21 @@ sh.external = boxRun;
 ```
 
 `sort`, `sha256sum`, `gzip`, `cut`, `diff`, `shuf`, `strings`, `tar`: the same code that runs on a
-command line, in the page. It is not spawning them — `spawn` is Deno-only, so `platform` grew
-`pushChild`/`popChild`, which give a function its own argv, standard input and working directory
-and keep what it writes. An applet needs no change to run that way and cannot tell.
+command line, in the page. It **spawns** them: a worker can create a worker, and `spawnSelf` needs no
+filesystem, so `sort` is this bundle again with `sort` as its first argument — its own instance, its
+own `SharedArrayBuffer`, its own grants. This paragraph used to say the opposite, because `spawn` was
+Deno-only and `platform` grew `pushChild`/`popChild` instead: they give a function its own argv,
+standard input and working directory and keep what it writes, and an applet cannot tell which way it
+was run.
 
-What is missing is therefore isolation rather than the programs: an applet running in the shell has
-the page's own authority, and
-[issue 0030](../../issues/open/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md)
-is the honest fix. A real `$WACPATH` program still needs `spawn` and so still does not run here.
+That is still the fallback, and being indistinguishable is the reason
+[0030](../../issues/closed/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md)
+needed a test that could tell them apart: a *called* applet's output is captured and capped at 8 MiB,
+so `seq 1 1500000 | wc -c` truncates, while a *spawned* one's queue drains as the next stage reads it
+and answers what GNU answers. `platform/test/browser_live.test.ts` checks that in a real Chromium.
+
+A `$WACPATH` program still needs a filesystem of worker bundles and so still does not run in a page —
+which is why "run me again with different arguments" is the route that matters here.
 
 Typing into that terminal is also how `sort -n` was found missing: the flag parsed, nothing read
 it, and `seq 1 20 | sort -n` answered 1, 10, 11. The words fixture in the differential test could

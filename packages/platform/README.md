@@ -483,7 +483,8 @@ Child kid = cli.spawnSelf(string[]("sort", "-n"), GRANT_READ).wait();
 
 A child runs `main` even when the program also exports `page`, because it was spawned: it has a handle
 and nowhere to draw. One bundle can therefore be both a terminal and the programs the terminal runs —
-see `packages/platform/example/twin.wac`, which is the whole idea in forty lines, and issue 0030.
+see `packages/platform/example/twin.wac`, which is the whole idea in forty lines, and issue
+[0030](../../issues/closed/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md).
 
 **A child has two handles, because a program has two output streams.** `recv(handle)` is its output
 and `recv(errHandle)` is its error output. Merged — which they were until a shell tried it — a

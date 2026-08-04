@@ -316,6 +316,27 @@ Deno.test({
       // Redirection into OPFS and back out again: a shell with a real filesystem under it.
       assertEquals((await command("echo kept > note.txt; cat note.txt")).endsWith("kept"), true);
 
+      // **Which route answered.** Every assertion above passes either way: an applet called inside
+      // the shell's own instance and one spawned as a worker print the same bytes, which is what made
+      // the in-process fallback worth having and also what made this half of 0030 unfalsifiable.
+      //
+      // The cap tells them apart. A *called* applet's output is captured in memory and capped at
+      // 8 MiB (`host/child.ts`), so it truncates; a *spawned* one's queue drains as the next stage
+      // reads it, so it does not. Measured under Deno, where both routes can be built: the same
+      // command answers 8323568 with `externalSpawnable` off and 10888896 with it on — and the second
+      // is what GNU answers, which is why the expectation comes from `bash` here rather than from a
+      // literal in this file.
+      const big = "seq 1 1500000 | wc -c";
+      const gnu = new TextDecoder()
+        .decode((await new Deno.Command("bash", { args: ["-c", big], stdout: "piped" }).output()).stdout)
+        .trim();
+      assertEquals(
+        (await command(big)).endsWith(gnu),
+        true,
+        `the page truncated where a spawned child would not — applets are running in-process. ` +
+          `bash says ${gnu}`,
+      );
+
       // A page spawning a program of its own: issue 0030's whole claim, in a real browser.
       //
       // The child is a `--worker` bundle built for the browser, put into the Origin Private File

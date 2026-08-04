@@ -17,16 +17,24 @@
 // applet in `packages/box`, wired in with `sh.external = boxRun`. `sort`, `sha256sum`, `gzip`,
 // `cut`, `diff`, `shuf`, `strings`, `tar`: the same code the command-line `box` runs, in the page.
 //
-// It is not spawning them. `spawn` is Deno-only, so `platform` grew `pushChild`/`popChild` — the
-// host holds a child's stdin, its captured output and its working directory for the duration of a
-// call, which is what lets an applet that reads `cli.readChunk()` and writes `cli.write(...)` run
-// inside another program without being written differently. What is missing here is therefore
-// isolation rather than the programs: an applet runs with the page's own authority. The honest fix
-// is `spawn` in a browser — nested workers can do it — and that is issue 0030.
+// **It spawns them.** This paragraph used to say the opposite — "`spawn` is Deno-only", so `platform`
+// grew `pushChild`/`popChild` and an applet ran inside the shell's own instance with the page's whole
+// authority. A worker can create a worker, and `spawnSelf` needs no filesystem: this bundle is its own
+// program, so `sort` is this program again with `sort` as its first argument. Each stage is a separate
+// worker with its own `SharedArrayBuffer`, its own grants and its own instance, answered by the page
+// while its parent is parked. Issue 0030, closed.
 //
-// The other real limit is unchanged: pipeline stages run one at a time, so `yes | head -1` does
-// not terminate the way it does in bash. It does now *stop*, because a child's captured output is
-// capped and `yes` is written to notice a write that fails.
+// `pushChild`/`popChild` are still here and still the fallback — a world that cannot spawn degrades to
+// them rather than reporting a program broken — which is exactly what makes the difference invisible
+// from the outside. `browser_live.test.ts` tells the two apart in a real Chromium by the one place
+// they differ: a called applet's output is captured and capped at 8 MiB, so `seq 1 1500000 | wc -c`
+// truncates, and a spawned one's queue drains as the next stage reads it, so it answers what GNU
+// answers.
+//
+// Pipeline stages therefore run at once as well, and `yes | head -1` terminates the way it does in
+// bash rather than stopping at the cap. What has not changed is inside a stage: a `box` applet
+// streams through `Sink`, but `packages/sh`'s own twelve fallback programs return all their output at
+// once, which is issue 0061.
 //
 // ## Why the terminal is built the way it is
 //
@@ -119,9 +127,9 @@ export i32 page(Core core, Cli cli, Page page) {
   // the page's log rather than the screen being drawn.
   Shell sh = Shell.create(core, cli);
   sh.capture = true;
-  // Every `box` applet, as a command you can type. The shell tries a real spawned program first
-  // and a page cannot spawn, so in this tab this is what answers — `sort`, `sha256sum`, `gzip`,
-  // `cut`, `shuf` and fifty more, the same code `box` runs on a command line.
+  // Every `box` applet, as a command you can type — `sort`, `sha256sum`, `gzip`, `cut`, `shuf` and
+  // fifty more, the same code `box` runs on a command line. This is the *fallback* now: the shell
+  // spawns them (below), and calls them only in a world that cannot.
   sh.external = boxRun;
   sh.externalNames = boxNames;   // so `help` lists them
   // ...and they are applets of *this very program*, so the shell can run them as real children

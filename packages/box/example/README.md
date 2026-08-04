@@ -93,17 +93,21 @@ echo wac | sha256sum              gzip < f | base64 | head -2
 printf 'a,b,c\n' | cut -f2 -d,    diff old new
 ```
 
-That is one line of wiring — `sh.external = boxRun` — and no change to any applet. They are not
-spawned: `spawn` is Deno-only, so `platform` has `pushChild`/`popChild`, which give a function its
-own argv, standard input and working directory and keep what it writes. An applet asks for its
-arguments and its input the same way it always did, and the caller decides what those mean.
+That is two lines of wiring — `sh.external = boxRun` and `sh.externalSpawnable = true` — and no change
+to any applet. They are **spawned**: a worker can create a worker, and `spawnSelf` needs no file, so
+`sort` is this bundle again with `sort` as its first argument. Each one is its own instance with its own
+`SharedArrayBuffer`, its own grants and its own working directory, and pipeline stages therefore run at
+once — `yes | head -1` terminates the way it does in bash.
 
-Two real limits remain, and both are worth seeing plainly. There is **no isolation** between an
-applet and the shell — same wasm instance, same authority, which is
-[issue 0030](../../../issues/open/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md).
-And pipeline stages run one at a time, so `yes | head -1` does not terminate the way it does in
-bash; it does now *stop*, because a child's captured output is capped and `yes` is written to
-notice a write that fails.
+Both of those paragraphs said the opposite until
+[0030](../../../issues/closed/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md)
+was finished: `spawn` was Deno-only, so `platform` grew `pushChild`/`popChild`, which give a function
+its own argv, standard input and working directory and keep what it writes. That route is still here as
+the fallback for a world that cannot spawn, and an applet cannot tell which way it was run — which is
+why proving the difference took the one place they diverge. A called applet's output is captured in
+memory and capped at 8 MiB, so `seq 1 1500000 | wc -c` truncates; a spawned one's queue drains as the
+next stage reads it and answers what GNU answers. `platform/test/browser_live.test.ts` checks exactly
+that, in a real Chromium.
 
 ## The rest of `box`
 

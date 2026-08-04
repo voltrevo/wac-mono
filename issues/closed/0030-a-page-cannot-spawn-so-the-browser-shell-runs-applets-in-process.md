@@ -1,6 +1,6 @@
 # 0030 — a page cannot `spawn`, so the browser shell runs applets in-process instead
 
-- **Status:** open
+- **Status:** closed (2026-08-04, agent-a)
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-08-03
@@ -72,4 +72,36 @@ filesystem at all: every built program already carries its own worker bundle, an
 argv, so "run me again with these arguments" would give a page sixty real programs. That is what to do
 next, and it works identically under Deno.
 
-Also still true: a spawned program inherits the host's working directory rather than the shell's.
+## Closed, 2026-08-04 (agent-a)
+
+**The second half was already done and nothing proved it.** `packages/box/example/term.wac` sets
+`sh.externalSpawnable = true`, so the terminal's applets go through `spawnSelf` — "run me again with
+these arguments", the route named above as what to do next — and `spawn` no longer needs a filesystem
+of programs for a page to have any. The working-directory item is done too: `spawn` and `spawnSelf`
+both take a `cwd`, and `trySelf` passes `sh.cwd`, so `cd sub; sort f` looks where the shell is.
+
+What was missing was a way to *tell*. Every check on that page passed either way, because an applet
+called in-process and one spawned as a worker print the same bytes — which is what made the fallback
+worth having and this issue unfalsifiable. They diverge in one place: a called applet's output is
+captured in memory and capped at 8 MiB (`host/child.ts`), so it truncates, while a spawned one's queue
+drains as the next stage reads it. Measured under Deno, where both routes can be built from the same
+source:
+
+```
+seq 1 1500000 | wc -c     externalSpawnable = false ->  8323568
+                          externalSpawnable = true  -> 10888896
+                          GNU coreutils             -> 10888896
+```
+
+`platform/test/browser_live.test.ts` now runs that command in the terminal page in a real Chromium and
+compares against `bash`, so the page answering the truncated number would fail the suite. It answers
+GNU's. Verified failing when the expectation is perturbed, so it is not passing vacuously.
+
+The in-process route stays: a world that cannot spawn degrades to it rather than reporting a program
+broken, and the four READMEs that described it as the *only* route now say which is which.
+
+Still open next door: [0028](../open/0028-sh-decides-nothing-about-what-wacpath-programs-may-do.md) is
+the grants half for `$WACPATH` programs and remains nobody's decision — `trySelf` hands an applet the
+shell's own grants, which is a different question from what a program off a path may have. And a page
+still has no directory of worker bundles, so a real `$WACPATH` program does not run in a tab; that is a
+feature nobody has asked for rather than a gap this issue leaves behind.

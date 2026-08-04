@@ -130,11 +130,12 @@ sh.external = boxRun;              // from packages/box/src/shrun.wac
 ```
 
 With that, `sort`, `sha256sum`, `gzip`, `cut`, `diff`, `shuf`, `tar` and the rest are commands you
-can type, running the same code `box` runs on a command line. They are not spawned — `platform`'s
-`pushChild`/`popChild` let the shell give a function its own argv, standard input and working
-directory and keep what it wrote — so there is no isolation between them and the shell, which is
-[issue 0030](../../issues/open/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md).
-It is what makes the browser terminal useful, because a page cannot spawn at all.
+can type, running the same code `box` runs on a command line. They are *spawned* where the world can
+spawn, including in a browser tab — `Shell.externalSpawnable` below is what says they are applets of
+this very bundle — and called through `platform`'s `pushChild`/`popChild` where it cannot, which gives
+a function its own argv, standard input and working directory and keeps what it wrote. Only the second
+of those has no isolation from the shell, and it is now the fallback rather than the only route:
+[0030](../../issues/closed/0030-a-page-cannot-spawn-so-the-browser-shell-runs-applets-in-process.md).
 
 Then a **table of programs written in wac**, when nothing else answered:
 
