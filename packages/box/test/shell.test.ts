@@ -22,6 +22,23 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
 }
 
 const dir = await Deno.makeTempDir({ prefix: "box-shell-" });
+/**
+ * Remove what this file built, however it ends.
+ *
+ * `Deno.test` has no suite-level teardown, so a module-level temp used by several tests had nowhere to
+ * be cleaned up and was left behind — one built binary of about 700 KiB per run of the suite. Five
+ * hundred of them were sitting in `/tmp` when a parallel run finally died with "No space left on
+ * device", in the middle of a package that had nothing to do with it. `unload` fires on the way out
+ * whether the tests passed, failed or threw, which is the only hook that covers all three.
+ */
+globalThis.addEventListener("unload", () => {
+  try {
+    Deno.removeSync(dir, { recursive: true });
+  } catch {
+    // Already gone, or never made. Nothing to report on the way out.
+  }
+});
+
 const shell = `${dir}/wacsh`;
 await buildApp("packages/box/src/bin/sh.wac", shell, { read: true, write: true, env: true });
 

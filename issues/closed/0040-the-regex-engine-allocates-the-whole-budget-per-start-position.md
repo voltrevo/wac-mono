@@ -1,6 +1,6 @@
 # 0040 — the regex engine allocates its whole budget of arrays per start position
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** agent-a
 - **Reported by:** agent-a
 - **Date:** 2026-08-04
@@ -64,3 +64,33 @@ the budget being exhausted, so the behaviour is pinned while this is changed.
 
 Found while measuring 0039 (buffered output): `grep` was the one applet whose time did not move,
 because its time was never in the writes. The two are independent.
+
+## Closed, 2026-08-04 (agent-a)
+
+The five arrays start at 64 elements and double on demand, capped at the budget — which keeps the
+budget the hard limit it was written to be, since a push that finds no room still answers `BUDGET`
+exactly as it did when the arrays were that size from the start. `grown` is four lines. A literal
+pattern never pushes at all, so it never allocates past the first 64.
+
+Measured, same machine, same files:
+
+| | before | after |
+|---|---|---|
+| `box grep 9` over 2,000 lines | 14.5 s | **0.098 s** |
+| `box grep 9` over 20,000 lines | >120 s (killed) | **0.095 s** |
+| `packages/regex`'s own test file | 17 s | **0.17 s** |
+
+Both of the last two are process startup now. GNU grep does the 20,000-line file in 2 ms and still
+wins by a mile — a first-byte prefilter is what closes that, and it is an optimisation rather than a
+defect, so it is not done here.
+
+The `OP_CLEAR` case needed the same treatment for a different reason: it appends one undo entry per
+capture slot and checked room for all of them at once, which was right and was checked against the
+*old* fixed size. It now grows to fit before appending.
+
+The correctness net was already in place and is why this was a safe change to make: sixteen tests in
+`packages/regex/test/regex.test.ts`, two of them fuzzing against JavaScript's own `RegExp`, plus the
+case that pins a budget being exhausted rather than trapping. All pass, and the suite is 974 green.
+
+**A side effect worth naming**: `regex.test.ts` was the second-heaviest file in the whole suite at
+20 seconds, and is now a fifth of a second. The full run went from ~44 s to ~38 s on a quiet machine.

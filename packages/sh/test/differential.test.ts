@@ -649,6 +649,23 @@ esac`,
  * from. Relative ones are covered by the `cd` cases below, which move both shells first.
  */
 const globDir = await Deno.makeTempDir();
+/**
+ * Remove what this file built, however it ends.
+ *
+ * `Deno.test` has no suite-level teardown, so a module-level temp used by several tests had nowhere to
+ * be cleaned up and was left behind — one built binary of about 700 KiB per run of the suite. Five
+ * hundred of them were sitting in `/tmp` when a parallel run finally died with "No space left on
+ * device", in the middle of a package that had nothing to do with it. `unload` fires on the way out
+ * whether the tests passed, failed or threw, which is the only hook that covers all three.
+ */
+globalThis.addEventListener("unload", () => {
+  try {
+    Deno.removeSync(globDir, { recursive: true });
+  } catch {
+    // Already gone, or never made. Nothing to report on the way out.
+  }
+});
+
 for (const name of ["a.txt", "b.txt", "c.log", ".hidden"]) {
   await Deno.writeTextFile(`${globDir}/${name}`, "");
 }

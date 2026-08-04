@@ -28,6 +28,23 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
 }
 
 const dir = await Deno.makeTempDir({ prefix: "wacsh-spawn-" });
+/**
+ * Remove what this file built, however it ends.
+ *
+ * `Deno.test` has no suite-level teardown, so a module-level temp used by several tests had nowhere to
+ * be cleaned up and was left behind — one built binary of about 700 KiB per run of the suite. Five
+ * hundred of them were sitting in `/tmp` when a parallel run finally died with "No space left on
+ * device", in the middle of a package that had nothing to do with it. `unload` fires on the way out
+ * whether the tests passed, failed or threw, which is the only hook that covers all three.
+ */
+globalThis.addEventListener("unload", () => {
+  try {
+    Deno.removeSync(dir, { recursive: true });
+  } catch {
+    // Already gone, or never made. Nothing to report on the way out.
+  }
+});
+
 const shell = `${dir}/sh`;
 
 // Built once, both of them. The shell needs `read` to load the bundle at all — a program is a
@@ -121,5 +138,7 @@ Deno.test("a spawned program reads all of its input before answering", async () 
   assertEquals(r.out, "200 200 692\n", r.err);
 });
 
-// The temp directory outlives the tests deliberately: Deno.test has no suite-level teardown here,
-// and the leak is one directory per run in `/tmp`, which the OS clears.
+// The temp directory used to outlive the tests deliberately, on the grounds that the OS clears
+// `/tmp`. It does not, or not soon enough: one 700 KiB binary per run accumulated to five hundred of
+// them, and a parallel suite eventually failed with "No space left on device" in an unrelated package.
+// The `unload` handler at the top is the cleanup, and this comment is what it replaced.

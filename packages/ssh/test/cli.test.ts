@@ -11,6 +11,25 @@
 
 import { haveSshd, type Server, startServer, stopServer } from "./server.ts";
 
+/**
+ * Every binary this file builds, removed on the way out.
+ *
+ * Each build is a fresh ~700 KiB executable and there is no suite teardown to remove it, so `/tmp`
+ * accumulated five hundred of them and a parallel run eventually died with "No space left on device"
+ * in a package that had nothing to do with it. `unload` fires whether the tests passed, failed or
+ * threw, which is the only hook that covers all three.
+ */
+const built: string[] = [];
+globalThis.addEventListener("unload", () => {
+  for (const path of built) {
+    try {
+      Deno.removeSync(path, { recursive: true });
+    } catch {
+      // Already gone. Nothing to report on the way out.
+    }
+  }
+});
+
 const text = (b: Uint8Array) => new TextDecoder().decode(b);
 
 /** A HOME with an `.ssh` the program will find by its own defaults. */
@@ -41,6 +60,7 @@ async function makeHome(s: Server, knownHost: boolean): Promise<string> {
  */
 async function buildSsh(extra: string[]): Promise<string> {
   const out = await Deno.makeTempFile({ prefix: "wac-ssh-" });
+  built.push(out);
   const r = await new Deno.Command("deno", {
     args: [
       "run", "-A", "packages/platform/build.ts", "packages/ssh/src/ssh.wac",

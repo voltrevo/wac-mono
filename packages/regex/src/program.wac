@@ -81,17 +81,37 @@ bool inClass(Program p, i32 index, i32 c) {
  * everything a failed branch wrote. Copying the whole capture array per choice point would be
  * simpler and quadratic.
  */
+/** Where the backtracking stacks start. A literal pattern never pushes at all. */
+i32 START() { return 64; }
+
+/**
+ * A bigger copy, doubling, never past the budget.
+ *
+ * The budget stays the hard cap it was written to be: growth stops there, and the push that finds no
+ * room answers `BUDGET` exactly as it did when the arrays were that size from the start.
+ */
+i32[] grown(i32[] a, i32 budget) {
+  i32 want = a.len() * 2;
+  if (want > budget) { want = budget; }
+  i32[] next = i32[want]();
+  next.copyFrom(a, 0, 0, a.len());
+  return next;
+}
+
 export i32 runAt(Program p, u8[] input, i32 at, i32[] caps, i32 budget) {
-  // Sized generously and grown by nothing: a program with `len` instructions cannot push more
-  // than one frame per step, so the budget bounds the stack too.
-  i32 cap = budget < 64 ? 64 : budget;
-  i32[] stackPc = i32[cap]();
-  i32[] stackSp = i32[cap]();
-  i32[] stackUndo = i32[cap]();
+  // **Started small and grown on demand**, which the previous version deliberately did not do: it
+  // allocated `budget` elements of five arrays up front, on the grounds that the budget bounds how
+  // many frames can be pushed. It does — but a bound is not a size. `box grep` passes a budget of a
+  // million, `search` calls this once per *start position*, and a seven-byte line therefore allocated
+  // and zeroed 160 MB to match one literal character: 7.3 ms a line, where GNU grep does a
+  // two-thousand line file in two. Issue 0040.
+  i32[] stackPc = i32[START()]();
+  i32[] stackSp = i32[START()]();
+  i32[] stackUndo = i32[START()]();
   i32 sp32 = 0;
 
-  i32[] undoSlot = i32[cap]();
-  i32[] undoVal = i32[cap]();
+  i32[] undoSlot = i32[START()]();
+  i32[] undoVal = i32[START()]();
   i32 undoLen = 0;
 
   i32[] marks = i32[p.loops > 0 ? p.loops : 1]();
@@ -131,14 +151,23 @@ export i32 runAt(Program p, u8[] input, i32 at, i32[] caps, i32 budget) {
     } else if (op == OP_JMP()) {
       pc = a;
     } else if (op == OP_SPLIT()) {
-      if (sp32 >= cap) { return BUDGET(); }
+      if (sp32 >= stackPc.len()) {
+        if (stackPc.len() >= budget) { return BUDGET(); }
+        stackPc = grown(stackPc, budget);
+        stackSp = grown(stackSp, budget);
+        stackUndo = grown(stackUndo, budget);
+      }
       stackPc[sp32] = b;
       stackSp[sp32] = sp;
       stackUndo[sp32] = undoLen;
       sp32++;
       pc = a;
     } else if (op == OP_SAVE()) {
-      if (undoLen >= cap) { return BUDGET(); }
+      if (undoLen >= undoSlot.len()) {
+        if (undoSlot.len() >= budget) { return BUDGET(); }
+        undoSlot = grown(undoSlot, budget);
+        undoVal = grown(undoVal, budget);
+      }
       undoSlot[undoLen] = a;
       undoVal[undoLen] = caps[a];
       undoLen++;
@@ -154,7 +183,11 @@ export i32 runAt(Program p, u8[] input, i32 at, i32[] caps, i32 budget) {
       bool boundary = before != after;
       if (boundary == (a == 1)) { pc++; } else { ok = false; }
     } else if (op == OP_MARK()) {
-      if (undoLen >= cap) { return BUDGET(); }
+      if (undoLen >= undoSlot.len()) {
+        if (undoSlot.len() >= budget) { return BUDGET(); }
+        undoSlot = grown(undoSlot, budget);
+        undoVal = grown(undoVal, budget);
+      }
       // Marks are undone like captures, so a backtracked iteration does not leave its position
       // behind to be compared against.
       undoSlot[undoLen] = -1 - a;
@@ -168,7 +201,12 @@ export i32 runAt(Program p, u8[] input, i32 at, i32[] caps, i32 budget) {
       // catches a log that is already full, never one about to be overrun. A quantified group with
       // enough captures then wrote past the undo arrays and trapped, where the whole point of the
       // check is to return BUDGET instead.
-      if (undoLen + (b - a + 1) > cap) { return BUDGET(); }
+      i32 need = b - a + 1;
+      if (undoLen + need > budget) { return BUDGET(); }
+      while (undoSlot.len() < undoLen + need) {
+        undoSlot = grown(undoSlot, budget);
+        undoVal = grown(undoVal, budget);
+      }
       for (i32 slot = a; slot <= b; slot++) {
         undoSlot[undoLen] = slot;
         undoVal[undoLen] = caps[slot];
