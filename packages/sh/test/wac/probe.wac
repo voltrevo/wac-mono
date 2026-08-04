@@ -193,11 +193,11 @@ Pending<string> fakeOpenOutput(string path) {
   return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
 }
 
-Socket resolveSocket(i32 id) { return Socket(-1, "no network"); }
+Socket resolveSocket(i32 id) { return Socket(-1, "no network", ""); }
 Pending<Socket> fakeConnect(string host, i32 port) {
   return Pending.of(0, resolveSocket, alwaysSettled, ignoreDrop);
 }
-Pending<Socket> fakeListen(i32 port) {
+Pending<Socket> fakeListen(string address, i32 port) {
   return Pending.of(0, resolveSocket, alwaysSettled, ignoreDrop);
 }
 Pending<Socket> fakeAccept(i32 handle) {
@@ -366,7 +366,7 @@ export i32 shTouchStubs() {
   if (c.remove("d", true).wait().ok()) { n++; }
   if (c.rename("a", "b").wait().ok()) { n++; }
   n += c.openInput("x").wait().len() + c.openOutput("x").wait().len();
-  n += c.connect("h", 1).wait().handle + c.listen(1).wait().handle + c.accept(1).wait().handle;
+  n += c.connect("h", 1).wait().handle + c.listen("127.0.0.1", 1).wait().handle + c.accept(1).wait().handle;
   if (c.send(1, u8[0]()).wait()) { n++; }
   c.closeSocket(1);
 

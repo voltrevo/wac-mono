@@ -128,6 +128,26 @@ async function writeAllStdout(bytes: Uint8Array): Promise<void> {
   while (at < bytes.length) at += await Deno.stdout.write(bytes.subarray(at));
 }
 
+/**
+ * A handle and the peer's address, which is what `Socket` decodes.
+ *
+ * `connect` and `listen` answer with the handle alone; only `accept` has a peer to name. The shape is
+ * the same either way, so the worker side reads one i32 and takes whatever follows as the address.
+ */
+function withPeer(handle: number, peer: string): Uint8Array {
+  const text = new TextEncoder().encode(peer);
+  const out = new Uint8Array(4 + text.length);
+  new DataView(out.buffer).setInt32(0, handle, true);
+  out.set(text, 4);
+  return out;
+}
+
+/** The address at the other end, or empty where the runtime does not say. */
+function peerOf(conn: Deno.Conn): string {
+  const addr = conn.remoteAddr;
+  return addr.transport === "tcp" || addr.transport === "udp" ? addr.hostname : "";
+}
+
 async function writeAllStderr(bytes: Uint8Array): Promise<void> {
   let at = 0;
   while (at < bytes.length) at += await Deno.stderr.write(bytes.subarray(at));
@@ -500,9 +520,18 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       sockets.set(h, conn);
       return i32le(h);
     },
+    /**
+     * Bind an address and a port. See `listen` in platform.wac for why the address is a parameter.
+     *
+     * An empty address means every interface, which is what `Deno.listen` does with no hostname and
+     * what this did unconditionally before. `"127.0.0.1"` is the one a program can now ask for.
+     */
     [OP.LISTEN]: (p) => {
       if (!opts.net) deny("network access");
-      const l = Deno.listen({ port: readI32le(p) });
+      const address = unstr(p.subarray(4));
+      const l = Deno.listen(
+        address === "" ? { port: readI32le(p) } : { hostname: address, port: readI32le(p) },
+      );
       const h = nextHandle++;
       listeners.set(h, l);
       return i32le(h);
@@ -513,7 +542,9 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       const conn = await l.accept();
       const h = nextHandle++;
       sockets.set(h, conn);
-      return i32le(h);
+      // The peer's address travels with the handle, so a server can log it, rate-limit by it, or
+      // refuse a connection that did not come from this machine. It was dropped here before.
+      return withPeer(h, peerOf(conn));
     },
     [OP.RECV]: async (p) => {
       const h = readI32le(p);

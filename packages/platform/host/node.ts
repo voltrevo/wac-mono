@@ -47,7 +47,7 @@ export type NodeIo = {
    * promise-shaped, which is all the bridge needs.
    */
   connect(host: string, port: number): Promise<NodeSock>;
-  listen(port: number): Promise<NodeListener>;
+  listen(address: string, port: number): Promise<NodeListener>;
   writeStdout(bytes: Uint8Array): Promise<void>;
   /** The error stream as bytes. Optional: a host without one falls back to `warn`'s line. */
   writeStderr?(bytes: Uint8Array): Promise<void>;
@@ -67,6 +67,8 @@ export type NodeSock = {
   recv(): Promise<Uint8Array>;   // empty when the peer has closed
   send(b: Uint8Array): Promise<void>;
   close(): void;
+  /** The address at the other end, where the runtime says. Absent for one this program dialled. */
+  peer?: string;
 };
 
 export type NodeListener = {
@@ -114,6 +116,20 @@ function failed(why: string): Uint8Array {
   const out = new Uint8Array(message.length + 1);
   out[0] = 2;
   out.set(message, 1);
+  return out;
+}
+
+/**
+ * A handle and the peer's address, which is what `Socket` decodes.
+ *
+ * The same shape the Deno host answers with: one i32, then whatever follows is the address. Only
+ * `accept` has a peer to name.
+ */
+function withPeer(handle: number, peer: string): Uint8Array {
+  const text = new TextEncoder().encode(peer);
+  const out = new Uint8Array(4 + text.length);
+  new DataView(out.buffer).setInt32(0, handle, true);
+  out.set(text, 4);
   return out;
 }
 
@@ -463,9 +479,10 @@ export function nodeWorld(
       sockets.set(h, c);
       return i32le(h);
     },
+    /** Bind an address and a port; empty means every interface. See `listen` in platform.wac. */
     [OP.LISTEN]: async (p) => {
       if (!opts.net) deny("network access");
-      const l = await io.listen(readI32le(p));
+      const l = await io.listen(unstr(p.subarray(4)), readI32le(p));
       const h = nextHandle++;
       listeners.set(h, l);
       return i32le(h);
@@ -476,7 +493,8 @@ export function nodeWorld(
       const c = await l.accept();
       const h = nextHandle++;
       sockets.set(h, c);
-      return i32le(h);
+      // The peer travels with the handle, so a server can refuse one that is not from this machine.
+      return withPeer(h, c.peer ?? "");
     },
     [OP.RECV]: async (p) => {
       const h = readI32le(p);

@@ -233,6 +233,16 @@ one-at-a-time because the transforms take `fn[u8[]()]`, which has no parameter t
 a transform expects; an `i32` in a struct has no such problem, and a server needs a
 listener and a connection open at the same time, so a current-socket could not express it.
 
+**`listen` takes the address to bind, and it is not optional.** It took a port alone until issue
+0025, and the host bound `0.0.0.0` — so every server written here was reachable from every interface
+and no program could ask for loopback. For most servers that is a deployment surprise; for
+`packages/tor`'s SOCKS proxy it was the difference between serving the person at the keyboard and
+running an open proxy that sources strangers' traffic out of somebody else's exit node, which is why
+every other SOCKS implementation binds loopback. `"127.0.0.1"` is loopback, `""` is every interface —
+the old behaviour, spelled out rather than defaulted into, so the surprising one is something somebody
+typed. `accept` answers with the peer's address beside the handle, and `Socket.fromLoopback` is the
+check that makes a wide bind survivable.
+
 `connect` resolves and dials, `listen` binds, `accept` blocks until someone arrives, and
 `recv` answers empty when the peer closes — a short read means nothing, exactly as for a
 file. **There is no `poll`**, so a program waits on one socket at a time. That is enough

@@ -45,7 +45,9 @@ export i32 main(Core core, Cli cli) {
   string[] childArgs = string[extra < 0 ? 0 : extra](fill: "");
   for (i32 i = 0; i < extra; i++) { childArgs[i] = cli.arg(i + 2).wait(); }
 
-  Socket l = cli.listen(port).wait();
+  // Loopback: an example that runs a program for whoever connects should not be reachable from
+  // anywhere else while somebody is reading it. Issue 0025.
+  Socket l = cli.listen("127.0.0.1", port).wait();
   if (l.handle < 0) {
     core.warn("inetd: " + itoa(port) + ": " + l.error);
     return 1;

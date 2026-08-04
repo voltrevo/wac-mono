@@ -79,6 +79,10 @@ function wrapSock(sock) {
     recv: () => new Promise((res) => { waiting = res; pump(); }),
     send: (b) => new Promise((res, rej) => sock.write(b, (e) => (e ? rej(e) : res()))),
     close: () => sock.destroy(),
+    // Who is at the other end, for a server that wants to log it or refuse it. Node gives an
+    // IPv4-mapped form for a v6 socket ("::ffff:127.0.0.1"), which is the same address said longer,
+    // so it is unwrapped here rather than at every call site.
+    peer: (sock.remoteAddress ?? "").replace(/^::ffff:/, ""),
   };
 }
 
@@ -88,7 +92,7 @@ const nodeNet = {
       const s = nodeNetMod.createConnection({ host, port }, () => res(wrapSock(s)));
       s.once("error", rej);
     }),
-  listen: (port) =>
+  listen: (address, port) =>
     new Promise((res) => {
       const pending = [];
       let waiting = null;
@@ -96,7 +100,9 @@ const nodeNet = {
         const w = wrapSock(s);
         if (waiting !== null) { const k = waiting; waiting = null; k(w); } else { pending.push(w); }
       });
-      server.listen(port, () => res({
+      // No address means every interface, as in the Deno host and as this did before there was an
+      // address to pass. See the listen capability in platform.wac.
+      server.listen(address === "" ? { port } : { host: address, port }, () => res({
         accept: () => new Promise((k) => {
           if (pending.length > 0) { k(pending.shift()); return; }
           waiting = k;

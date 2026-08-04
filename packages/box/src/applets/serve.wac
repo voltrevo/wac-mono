@@ -17,7 +17,8 @@ import { Read } from "../../../bytes/src/read.wac";
 
 export i32 serve(Core core, Cli cli, Args a) {
   i32 port = a.num == 0 ? 8080 : a.num;
-  Socket l = cli.listen(port).wait();
+  // Every interface: `serve` exists to hand a file to another machine. Issue 0025.
+  Socket l = cli.listen("", port).wait();
   if (l.handle < 0) { core.warn(a.name + ": " + itoa(port) + ": " + l.error); return 1; }
   core.warn(a.name + ": listening on port " + itoa(port));
 

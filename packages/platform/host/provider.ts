@@ -282,9 +282,12 @@ export function cliOf(
   };
   const socket = (id: number) => {
     try {
-      return cls.Socket.of(readI32le(collect(b, unpack(id))), "");
+      // A handle, then the peer's address for a socket that came from `accept` — empty for one that
+      // came from `connect` or `listen`, where the peer is either the caller's own choice or nobody.
+      const out = collect(b, unpack(id));
+      return cls.Socket.of(readI32le(out), "", unstr(out.subarray(4)));
     } catch (e) {
-      return cls.Socket.of(-1, e instanceof Error ? e.message : String(e));
+      return cls.Socket.of(-1, e instanceof Error ? e.message : String(e), "");
     }
   };
 
@@ -410,7 +413,8 @@ export function cliOf(
     /*= connect */
     (host: string, port: number) => T.socket(submit(b, OP.CONNECT, headed(i32le(port), str(host)))),
     /*= listen */
-    (port: number) => T.socket(submit(b, OP.LISTEN, i32le(port))),
+    // The port, then the address — `headed` puts the fixed-width part first, as `spawn` does.
+    (address: string, port: number) => T.socket(submit(b, OP.LISTEN, headed(i32le(port), str(address)))),
     /*= accept */
     (handle: number) => T.socket(submit(b, OP.ACCEPT, i32le(handle))),
     /*= recv */
