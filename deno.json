@@ -29,6 +29,7 @@
     "coverage:unicode": "deno run -A packages/unicode/cov.ts",
     "coverage:url": "deno run -A packages/url/cov.ts",
     "gen:unicode": "deno run -A packages/unicode/tools/gentables.ts",
+    "gen:bls-fpkernel": "python3 packages/bls/tools/genfpkernel.py",
     "dead": "deno run -A tools/deadexports.ts",
     "mutate": "deno run -A tools/mutate.ts",
     "mutate:diff": "deno run -A tools/mutate.ts --diff --operators",

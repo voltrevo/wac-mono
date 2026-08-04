@@ -35,6 +35,8 @@
 // 32-bit limbs. There is no 64×64→128 on this machine, so 64-bit limbs would need four
 // products each and buy nothing.
 
+import { montMul, montAdd, montSub, atLeastP, subPInPlace, pWord } from "./fpkernel.wac";
+
 const i32 LIMBS = 12;
 
 /** p, least-significant limb first. */
@@ -94,230 +96,43 @@ export bool fpEquals(u32[] a, u32[] b) {
   return true;
 }
 
-/**
- * The modulus limb by limb, as constants rather than an array.
- *
- * `modulus()` above allocates a fresh twelve-word array on every call, and the two functions below
- * are called by every addition and subtraction in the package — an `fpAdd` that has to reduce used
- * to allocate four arrays to produce one result. Measured on an add chain, going through constants
- * instead is worth about a quarter of the operation; `test/wac/flat.wac` is where that number comes
- * from. `fpMul` keeps the array, because it indexes p in an inner loop and the same 8ns against its
- * 350 is not worth unrolling for.
- *
- * Generated from the same digits as `modulus()`, which is the risk: two spellings of p that could
- * drift. `fp_wac.test.ts` checks they agree rather than trusting that they do.
- */
-const u32 P0  = 0xffffaaab;  const u32 P1  = 0xb9feffff;  const u32 P2  = 0xb153ffff;
-const u32 P3  = 0x1eabfffe;  const u32 P4  = 0xf6b0f624;  const u32 P5  = 0x6730d2a0;
-const u32 P6  = 0xf38512bf;  const u32 P7  = 0x64774b84;  const u32 P8  = 0x434bacd7;
-const u32 P9  = 0x4b1ba7b6;  const u32 P10 = 0x397fe69a;  const u32 P11 = 0x1a0111ea;
-
-/** The i-th limb of p, from the constants rather than a fresh array. */
-u32 modulusWord(i32 i) {
-  if (i == 0) { return P0; }   if (i == 1) { return P1; }
-  if (i == 2) { return P2; }   if (i == 3) { return P3; }
-  if (i == 4) { return P4; }   if (i == 5) { return P5; }
-  if (i == 6) { return P6; }   if (i == 7) { return P7; }
-  if (i == 8) { return P8; }   if (i == 9) { return P9; }
-  if (i == 10) { return P10; }
-  return P11;
-}
-
-/** Whether `a` is at least `p`, so the caller knows to subtract it. */
-bool atLeastModulus(u32[] a) {
-  if (a[11] != P11) { return (a[11] as u64) > (P11 as u64); }
-  if (a[10] != P10) { return (a[10] as u64) > (P10 as u64); }
-  if (a[9] != P9) { return (a[9] as u64) > (P9 as u64); }
-  if (a[8] != P8) { return (a[8] as u64) > (P8 as u64); }
-  if (a[7] != P7) { return (a[7] as u64) > (P7 as u64); }
-  if (a[6] != P6) { return (a[6] as u64) > (P6 as u64); }
-  if (a[5] != P5) { return (a[5] as u64) > (P5 as u64); }
-  if (a[4] != P4) { return (a[4] as u64) > (P4 as u64); }
-  if (a[3] != P3) { return (a[3] as u64) > (P3 as u64); }
-  if (a[2] != P2) { return (a[2] as u64) > (P2 as u64); }
-  if (a[1] != P1) { return (a[1] as u64) > (P1 as u64); }
-  if (a[0] != P0) { return (a[0] as u64) > (P0 as u64); }
-  return true;                    // exactly p
-}
-
-/** `a − p`, wrapping. Only called when `a >= p`. */
-u32[] subModulus(u32[] a) {
-  u32[] out = u32[LIMBS]();
-  i64 borrow = 0;
-  i64 d = 0;
-  d = (a[0] as i64) - (P0 as i64) - borrow;
-  out[0] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[1] as i64) - (P1 as i64) - borrow;
-  out[1] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[2] as i64) - (P2 as i64) - borrow;
-  out[2] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[3] as i64) - (P3 as i64) - borrow;
-  out[3] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[4] as i64) - (P4 as i64) - borrow;
-  out[4] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[5] as i64) - (P5 as i64) - borrow;
-  out[5] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[6] as i64) - (P6 as i64) - borrow;
-  out[6] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[7] as i64) - (P7 as i64) - borrow;
-  out[7] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[8] as i64) - (P8 as i64) - borrow;
-  out[8] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[9] as i64) - (P9 as i64) - borrow;
-  out[9] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[10] as i64) - (P10 as i64) - borrow;
-  out[10] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[11] as i64) - (P11 as i64) - borrow;
-  out[11] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  return out;
-}
 
 /**
- * `a −= p` and `a += p`, in place.
+ * That `modulus()` and `fpkernel.wac`'s immediates are the same p.
  *
- * The allocating `subModulus` above is still used by `fpModulusConstantsAgree`, but the hot callers
- * own their `out` array outright — it was allocated three lines earlier and nobody else has seen it
- * — so there is no reason to allocate a second one to hold the corrected value. That halves the
- * allocations on the reduce path, which `fpAdd` takes for roughly half of all inputs.
- */
-void subModulusInPlace(u32[] a) {
-  i64 borrow = 0;
-  i64 d = 0;
-  d = (a[0] as i64) - (P0 as i64) - borrow;
-  a[0] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[1] as i64) - (P1 as i64) - borrow;
-  a[1] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[2] as i64) - (P2 as i64) - borrow;
-  a[2] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[3] as i64) - (P3 as i64) - borrow;
-  a[3] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[4] as i64) - (P4 as i64) - borrow;
-  a[4] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[5] as i64) - (P5 as i64) - borrow;
-  a[5] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[6] as i64) - (P6 as i64) - borrow;
-  a[6] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[7] as i64) - (P7 as i64) - borrow;
-  a[7] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[8] as i64) - (P8 as i64) - borrow;
-  a[8] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[9] as i64) - (P9 as i64) - borrow;
-  a[9] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[10] as i64) - (P10 as i64) - borrow;
-  a[10] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-  d = (a[11] as i64) - (P11 as i64) - borrow;
-  a[11] = (d & 0xFFFFFFFF) as@ u32;
-  borrow = (d < 0) ? 1 : 0;
-}
-
-void addModulusInPlace(u32[] a) {
-  u64 carry = 0;
-  u64 t = 0;
-  t = (a[0] as u64) + (P0 as u64) + carry;
-  a[0] = (t & 0xFFFFFFFF) as@ u32;
-  carry = t >> 32;
-  t = (a[1] as u64) + (P1 as u64) + carry;
-  a[1] = (t & 0xFFFFFFFF) as@ u32;
-  carry = t >> 32;
-  t = (a[2] as u64) + (P2 as u64) + carry;
-  a[2] = (t & 0xFFFFFFFF) as@ u32;
-  carry = t >> 32;
-  t = (a[3] as u64) + (P3 as u64) + carry;
-  a[3] = (t & 0xFFFFFFFF) as@ u32;
-  carry = t >> 32;
-  t = (a[4] as u64) + (P4 as u64) + carry;
-  a[4] = (t & 0xFFFFFFFF) as@ u32;
-  carry = t >> 32;
-  t = (a[5] as u64) + (P5 as u64) + carry;
-  a[5] = (t & 0xFFFFFFFF) as@ u32;
-  carry = t >> 32;
-  t = (a[6] as u64) + (P6 as u64) + carry;
-  a[6] = (t & 0xFFFFFFFF) as@ u32;
-  carry = t >> 32;
-  t = (a[7] as u64) + (P7 as u64) + carry;
-  a[7] = (t & 0xFFFFFFFF) as@ u32;
-  carry = t >> 32;
-  t = (a[8] as u64) + (P8 as u64) + carry;
-  a[8] = (t & 0xFFFFFFFF) as@ u32;
-  carry = t >> 32;
-  t = (a[9] as u64) + (P9 as u64) + carry;
-  a[9] = (t & 0xFFFFFFFF) as@ u32;
-  carry = t >> 32;
-  t = (a[10] as u64) + (P10 as u64) + carry;
-  a[10] = (t & 0xFFFFFFFF) as@ u32;
-  carry = t >> 32;
-  t = (a[11] as u64) + (P11 as u64) + carry;
-  a[11] = (t & 0xFFFFFFFF) as@ u32;
-  carry = t >> 32;
-}
-
-/**
- * That `P0..P11` really are the same p as `modulus()`.
+ * p is spelled twice in this package: as the array below, for the one caller that indexes it in a
+ * loop, and as immediates throughout the generated kernel. Nothing else would notice them drifting,
+ * because every operation uses them together and a consistently wrong pair is still self-consistent.
+ * A single wrong word gives arithmetic that is correct for almost every input and wrong for a narrow
+ * band of them — the fault random vectors miss and that surfaces months later.
  *
- * Exported only so the probe can reach it: p appears twice in this file now, once as an array for
- * `fpMul` and once as constants for the reduction, and nothing else would notice them drifting. A
- * single wrong word in the constants gives arithmetic that is wrong for a narrow band of inputs —
- * exactly the fault that random vectors miss and that only shows up months later.
+ * Exported so the probe can reach it; `fp_wac.test.ts` runs it.
  */
 export bool fpModulusConstantsAgree() {
   u32[] p = modulus();
-  if (!atLeastModulus(p)) { return false; }            // p >= p
-  if (!fpIsZero(subModulus(p))) { return false; }      // p − p == 0, limb by limb
+  if (!atLeastP(p)) { return false; }                  // p >= p
+  u32[] zero = fpCopy(p);
+  subPInPlace(zero);
+  if (!fpIsZero(zero)) { return false; }               // p − p == 0, limb by limb
   u32[] below = fpCopy(p);
   below[0] = p[0] - 1;                                 // p's low limb is 0xffffaaab, so no borrow
-  return !atLeastModulus(below);                       // p − 1 < p
+  if (atLeastP(below)) { return false; }               // p − 1 < p
+  for (i32 i = 0; i < LIMBS; i++) {
+    if (p[i] != pWord(i)) { return false; }            // limb for limb, array against immediates
+  }
+  return true;
 }
 
-export u32[] fpAdd(u32[] a, u32[] b) {
-  u32[] out = u32[LIMBS]();
-  u64 carry = 0;
-  for (i32 i = 0; i < LIMBS; i++) {
-    u64 t = (a[i] as u64) + (b[i] as u64) + carry;
-    out[i] = (t & 0xFFFFFFFF) as@ u32;
-    carry = t >> 32;
-  }
-  // A 381-bit prime in 384 bits leaves three spare bits, so a sum of two reduced values
-  // cannot overflow the array — but it can exceed p, and once only.
-  if (carry != 0 || atLeastModulus(out)) { subModulusInPlace(out); }
-  return out;
-}
+/**
+ * `(a + b) mod p` and `(a − b) mod p`.
+ *
+ * Bodies in `fpkernel.wac`, generated — unrolled with p as immediates, which measured 20% and 17%
+ * against the loops that used to be here. Small numbers each; between them these two account for as
+ * much of a verification as multiplication does, which is why they were worth unrolling at all.
+ */
+export u32[] fpAdd(u32[] a, u32[] b) { return montAdd(a, b); }
 
-export u32[] fpSub(u32[] a, u32[] b) {
-  u32[] out = u32[LIMBS]();
-  i64 borrow = 0;
-  for (i32 i = 0; i < LIMBS; i++) {
-    i64 d = (a[i] as i64) - (b[i] as i64) - borrow;
-    out[i] = (d & 0xFFFFFFFF) as@ u32;
-    borrow = (d < 0) ? 1 : 0;
-  }
-  if (borrow == 0) { return out; }
-  // Underflowed: add p back, which is the same as working modulo 2^384 and correcting.
-  addModulusInPlace(out);
-  return out;
-}
+export u32[] fpSub(u32[] a, u32[] b) { return montSub(a, b); }
 
 export u32[] fpNeg(u32[] a) {
   if (fpIsZero(a)) { return fpZero(); }
@@ -331,47 +146,16 @@ export u32[] fpNeg(u32[] a) {
  * a pass can exceed 384 bits, and dropping the top word is the classic way to get a routine
  * that is right for most inputs and wrong for the ones near p.
  */
-export u32[] fpMul(u32[] a, u32[] b) {
-  u32[] p = modulus();
-  u64[] t = u64[LIMBS + 2]();
-
-  for (i32 i = 0; i < LIMBS; i++) {
-    // t += a · b[i]
-    u64 bi = b[i] as u64;
-    u64 carry = 0;
-    for (i32 j = 0; j < LIMBS; j++) {
-      u64 acc = t[j] + (a[j] as u64) * bi + carry;
-      t[j] = acc & 0xFFFFFFFF;
-      carry = acc >> 32;
-    }
-    u64 hi = t[LIMBS] + carry;
-    t[LIMBS] = hi & 0xFFFFFFFF;
-    t[LIMBS + 1] = hi >> 32;
-
-    // m clears the bottom limb: t + m·p ≡ t (mod p) and ends in zero.
-    //
-    // The division by 2³² that Montgomery form pays for is that discarded zero limb, and it does
-    // not need a shift pass: the reduction loop stores to `t[j-1]` as it goes, so the whole array
-    // slides down by one as a side effect of work it was doing anyway. Written as a separate
-    // 13-element copy it was a third of this function's array traffic for nothing.
-    u64 m = ((t[0] * INV) & 0xFFFFFFFF);
-    carry = (t[0] + (p[0] as u64) * m) >> 32;    // the low word is zero by choice of m
-    for (i32 j = 1; j < LIMBS; j++) {
-      u64 acc = t[j] + (p[j] as u64) * m + carry;
-      t[j - 1] = acc & 0xFFFFFFFF;
-      carry = acc >> 32;
-    }
-    hi = t[LIMBS] + carry;
-    t[LIMBS - 1] = hi & 0xFFFFFFFF;
-    t[LIMBS] = t[LIMBS + 1] + (hi >> 32);
-  }
-
-  u32[] out = u32[LIMBS]();
-  for (i32 i = 0; i < LIMBS; i++) { out[i] = (t[i] & 0xFFFFFFFF) as@ u32; }
-  // One conditional subtraction: the result is below 2p, never more.
-  if (t[LIMBS] != 0 || atLeastModulus(out)) { subModulusInPlace(out); }
-  return out;
-}
+/**
+ * `a · b · R⁻¹ mod p`, the Montgomery product.
+ *
+ * The body lives in `fpmul.wac`, generated by `tools/genfpmul.py` — a thousand lines of unrolled
+ * CIOS with the modulus as immediates. It was two nested loops here, which read like the published
+ * algorithm and cost three times as much: measured, two thirds of a field multiplication was loop
+ * overhead, bounds checks and array traffic rather than arithmetic. The generator's docstring has
+ * the numbers, and the variant table that also shows why 384-bit Karatsuba would be a loss.
+ */
+export u32[] fpMul(u32[] a, u32[] b) { return montMul(a, b); }
 
 export u32[] fpSquare(u32[] a) { return fpMul(a, a); }
 
@@ -400,7 +184,7 @@ export u32[]? fpFromBytes(u8[] s) {
     v[i] = (((s[at] as@ u32) << 24) | ((s[at + 1] as@ u32) << 16)
           | ((s[at + 2] as@ u32) << 8) | (s[at + 3] as@ u32));
   }
-  if (atLeastModulus(v)) { return null; }
+  if (atLeastP(v)) { return null; }
   return toMont(v);
 }
 
@@ -482,7 +266,7 @@ void shr1Raw(u32[] a) {
 void halveWithModulus(u32[] a) {
   u64 carry = 0;
   for (i32 i = 0; i < LIMBS; i++) {
-    u64 t = (a[i] as u64) + (modulusWord(i) as u64) + carry;
+    u64 t = (a[i] as u64) + (pWord(i) as u64) + carry;
     a[i] = (t & 0xFFFFFFFF) as@ u32;
     carry = t >> 32;
   }
@@ -520,7 +304,7 @@ void subModRaw(u32[] a, u32[] b) {
     a[i] = (s & 0xFFFFFFFF) as@ u32;
     carry = s >> 32;
   }
-  if (carry != 0 || atLeastModulus(a)) { subModulusInPlace(a); }
+  if (carry != 0 || atLeastP(a)) { subPInPlace(a); }
 }
 
 /**

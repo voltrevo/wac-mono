@@ -11,7 +11,7 @@ different file with `ctTrace` over it, not bolted onto these functions.
 ## Status
 
 **Working.** `verify(pubkey, message, signature)` agrees with all 29 `ethereum/bls12-381-tests`
-verify fixtures and all 28 deserialization fixtures, at about **15 ms** per signature.
+verify fixtures and all 28 deserialization fixtures, at about **8 ms** per signature.
 
 Built in stages with an external oracle gating each one:
 
@@ -66,64 +66,80 @@ Vectors are vendored rather than fetched, so the tests need no network.
 
 ## Speed, stated up front
 
-**Measured: 15.2 ms per verification**, against 14.6 ms for `@noble/curves` on the same machine and
-about 1 ms for `blst`. It started at 109 ms. Wasm has no 64×64→128 multiply and no carry flag, so
-`Fp` uses twelve 32-bit limbs with a 64-bit accumulator, 144 partial products per multiply, because
-`i64` is the widest multiply the machine has. A verification is two Miller loops sharing one
+**Measured: 7.9 ms per verification**, against 14.6 ms for `@noble/curves` on the same machine and
+about 1 ms for `blst`. It started at 109 ms. A verification is two Miller loops sharing one
 accumulator and one final exponentiation, order 20,000 field multiplications.
 
-Run `deno run -A packages/bls/test/bench.ts` for the current split. As of 2026-08-04:
+Wasm has no 64×64→128 multiply and no carry flag, so `Fp` uses twelve 32-bit limbs with a 64-bit
+accumulator — 144 partial products per multiply, because `i64` is the widest multiply the machine
+has. The arithmetic kernel is therefore generated: see **`tools/genfpkernel.py`**, which holds the
+measurements that made it so and the two optimisations they ruled out.
+
+Run `deno run -A test/bench.ts` for the current split. As of 2026-08-04:
 
 | stage | | |
 | ----- | --- | --- |
-| Miller loop, both pairs | 7.8 ms | 51% |
-| final exponentiation | 4.3 ms | 28% |
-| `hash_to_G2` | 2.8 ms | 18% |
-| G2 decode + subgroup check | 1.2 ms | 8% |
-| G1 decode + subgroup check | 0.7 ms | 4% |
+| Miller loop, both pairs | 4.0 ms | 51% |
+| final exponentiation | 2.5 ms | 32% |
+| `hash_to_G2` | 1.3 ms | 17% |
+| G2 decode + subgroup check | 0.5 ms | 7% |
+| G1 decode + subgroup check | 0.3 ms | 4% |
 
-### What the 109 → 15 ms came from, and what it cost to find
+### What 109 → 7.9 ms came from
 
-Every one of these was chosen by the profile, and three of them contradicted what I expected before
-measuring. They are listed with their sizes because the sizes are the useful part:
+Every one of these was chosen by the profile, and four contradicted what I expected before
+measuring. The sizes are the useful part:
 
 | change | saved |
 | ------ | ----- |
 | `halve` recomputed 1/2 by Fermat inversion on every call | 58 ms |
+| unrolling the Fp kernel into locals with p as immediates | 7.4 ms |
 | Budroni–Pintore cofactor clearing instead of a 636-bit `h_eff` | 12 ms |
 | one square root in SSWU instead of two, and complex `fp12Square` | 10 ms |
-| `fpInvert` by binary extended GCD instead of Fermat | 2.6 ms |
 | Granger–Scott cyclotomic squaring in the final exponentiation | 3.9 ms |
+| `fpInvert` by binary extended GCD instead of Fermat | 2.6 ms |
 | `g1InSubgroup` by the φ endomorphism instead of multiplying by r | 1.3 ms |
 | one Miller loop over both pairs, sharing the 64 Fp12 squarings | 1.1 ms |
 | CIOS reduction storing to `t[j-1]`, so no separate shift pass | 1.1 ms |
-| reducing against `P0..P11` constants instead of a rebuilt array | 1.0 ms |
 
-Two hypotheses that did **not** survive measurement, recorded because they were expensive to hold:
+### Four hypotheses that did not survive measurement
 
-- **Allocation was going to dominate.** It does not. A `u32[12]` costs 5–7 ns to allocate, so the
-  tree of 21 objects behind an `Fp12` is about 1 ms of a 36 ms Miller loop. `test/wac/flat.wac`
-  re-tested this properly by rewriting the Montgomery multiply three ways, and a fully flat
-  zero-allocation version came out *slower* than the allocating one. The same experiment found the
-  opposite for addition — 44% — which is where the `P0..P11` change came from.
-- **Reordering the mutation suite was worth a multiple.** Measured, 9.5%. See wac-mono issue 0024.
+Recorded because each was expensive to hold, and because three of them were about to become work.
 
-### Still untaken, roughly in order of what the profile says they are worth
+- **Allocation was going to dominate.** It does not. A `u32[12]` costs 5–7 ns, so the tree of 21
+  objects behind an `Fp12` was about 1 ms of a 36 ms Miller loop.
+- **A fixed-size array type would fix that.** `test/wac/flat.wac` rewrote the Montgomery multiply
+  three ways and a zero-allocation version came out *slower* than the allocating one. The same
+  experiment found the opposite for addition — 44% — which is where the immediates came from.
+- **384-bit Karatsuba was the next big win.** It cuts 144 limb products to about 108, but a limb
+  addition costs about what a limb multiply-accumulate costs here, and Karatsuba pays ~70 extra
+  additions to save 36 multiplies. A loss at this size. The multiplication *count* was never the
+  lever: two thirds of a field multiply was loop overhead, bounds checks and array traffic.
+- **A dedicated squaring was worth writing.** `fpSquare` is `fpMul(a, a)` and computes every
+  off-diagonal product twice. All of `fpSquare` is 0.59 ms of 8.65, so the ceiling is ~0.14 ms —
+  1.6% — for several hundred lines of the carry handling that squaring implementations get wrong.
 
-- The Miller loop's per-pair work is half the total and has had no attention beyond using the
-  sparse `mul014` line function. 384-bit Karatsuba inside `fpMul` would cut 144 limb products to
-  about 108 and is the largest single item left.
-- Three scalar multiplications by 64-bit |x| remain per verification — one in `g2InSubgroup`, two
-  in `clearCofactorG2` — at roughly 0.5 ms each. The doublings are irreducible for a fixed scalar,
-  so only a cheaper `g2Double` helps.
-- Karabina compressed squaring would beat Granger–Scott in the final exponentiation, at the cost of
-  a decompression step.
+The trick that sized the last two, and the inversion before them: make the function do its work
+**twice** and time a whole verification. The delta is the time spent in it, which is otherwise hard
+to know with no profiler and no globals to hang a counter on.
+
+### Still untaken
+
+- The Miller loop's per-pair work is half the total and has had no attention beyond the sparse
+  `mul014` line function.
+- Three scalar multiplications by 64-bit |x| remain per verification — one in `g2InSubgroup`, two in
+  `clearCofactorG2`. The doublings are irreducible for a fixed scalar, so only a cheaper `g2Double`
+  helps.
+- Karabina compressed squaring would beat Granger–Scott, at the cost of a decompression step.
 - Batch and aggregate verification share one final exponentiation across many signatures. The
-  fixtures are already vendored (`eth_batch_verify.json`, `eth_aggregate_verify.json`) and unused.
+  fixtures are vendored (`eth_batch_verify.json`, `eth_aggregate_verify.json`) and unused.
 
-### A caveat that is not about speed
+### Two caveats that are not about speed
 
-`fpInvert` is no longer constant time — binary extended GCD branches on the value. That is safe
-here because nothing secret is ever inverted: a verifier handles public keys, signatures and
-messages only. A **signing** implementation must not reuse it as it stands. It says so at the
-function too.
+`fpInvert` is no longer constant time — binary extended GCD branches on the value. Safe here because
+nothing secret is ever inverted: a verifier handles public keys, signatures and messages only. A
+**signing** implementation must not reuse it as it stands. It says so at the function too.
+
+`src/fpkernel.wac` is generated and must not be edited. `test/fpkernel_generated.test.ts` fails if
+it is not what `tools/genfpkernel.py` produces; run `deno task gen:bls-fpkernel` after changing the
+generator. It also makes the package's mutation sweep large — see wac-mono issue 0027.
