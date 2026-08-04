@@ -83,6 +83,9 @@ function wrapSock(sock) {
     // IPv4-mapped form for a v6 socket ("::ffff:127.0.0.1"), which is the same address said longer,
     // so it is unwrapped here rather than at every call site.
     peer: (sock.remoteAddress ?? "").replace(/^::ffff:/, ""),
+    // This end's port. A socket that asked the kernel for a free one has to be able to say which it
+    // got, or asking is the same as not being able to.
+    port: sock.localPort ?? 0,
   };
 }
 
@@ -108,6 +111,8 @@ const nodeNet = {
           waiting = k;
         }),
         close: () => server.close(),
+        // The port it was actually given, which is what makes port 0 usable.
+        port: (server.address() ?? {}).port ?? 0,
       }));
     }),
 };

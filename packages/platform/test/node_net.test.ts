@@ -38,7 +38,6 @@ const haveNode = await (async () => {
 async function greeted(
   cmd: string,
   args: string[],
-  port: number,
 ): Promise<{ said: string; logged: string; code: number }> {
   const child = new Deno.Command(cmd, { args, stdout: "piped", stderr: "piped" }).spawn();
   const out: string[] = [];
@@ -48,10 +47,17 @@ async function greeted(
   })();
 
   try {
+    // The port comes out of the line, because the server was started on port 0: the kernel chose, and
+    // `Socket.port` is how a program can say what it chose. Two hardcoded ports here used to collide
+    // with anything else on this shared machine, and one of them did.
     const deadline = Date.now() + 30_000;
-    while (!out.join("").includes("listening") && Date.now() < deadline) {
-      await new Promise((res) => setTimeout(res, 50));
+    let port = 0;
+    while (port === 0 && Date.now() < deadline) {
+      const m = out.join("").match(/listening on (\d+)/);
+      if (m !== null) port = Number(m[1]);
+      else await new Promise((res) => setTimeout(res, 50));
     }
+    if (port === 0) throw new Error(`the server never said its port: ${out.join("")}`);
     const conn = await Deno.connect({ hostname: "127.0.0.1", port });
     const buf = new Uint8Array(256);
     const n = await conn.read(buf);
@@ -85,8 +91,8 @@ Deno.test({
 
       // Loopback, so the peer is knowable: whatever address the client comes from is the one the
       // server must report, and on loopback that is `127.0.0.1` on both runtimes.
-      const onDeno = await greeted(denoOut, ["127.0.0.1", "45881"], 45881);
-      const onNode = await greeted("node", [nodeOut, "127.0.0.1", "45882"], 45882);
+      const onDeno = await greeted(denoOut, ["127.0.0.1", "0"]);
+      const onNode = await greeted("node", [nodeOut, "127.0.0.1", "0"]);
 
       assertEquals(onDeno.said, "hello 127.0.0.1\n", `deno: ${onDeno.logged}`);
       assertEquals(onNode.said, onDeno.said, `node said something else: ${onNode.logged}`);
@@ -116,8 +122,14 @@ Deno.test({
     const nodeOut = await Deno.makeTempFile({ prefix: "wac-greet-bind-" });
     try {
       await buildApp("packages/platform/example/greet.wac", nodeOut, { net: true }, "node");
+      // A port from the kernel rather than a literal: bound, read, released, then handed over. The
+      // window between releasing and binding is a race, and it is a smaller one than sharing a fixed
+      // number with every other suite on this machine.
+      const probe = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+      const port = (probe.addr as Deno.NetAddr).port;
+      probe.close();
       const child = new Deno.Command("node", {
-        args: [nodeOut, "127.0.0.1", "45883"],
+        args: [nodeOut, "127.0.0.1", String(port)],
         stdout: "piped",
         stderr: "null",
       }).spawn();
@@ -135,8 +147,12 @@ Deno.test({
         const ss = new Deno.Command("ss", { args: ["-ltn"], stdout: "piped", stderr: "null" })
           .outputSync();
         const table = new TextDecoder().decode(ss.stdout);
-        const line = table.split("\n").find((l) => l.includes("45883")) ?? "";
-        assertEquals(line.includes("127.0.0.1:45883"), true, `bound elsewhere: ${line || table}`);
+        const line = table.split("\n").find((l) => l.includes(String(port))) ?? "";
+        assertEquals(
+          line.includes(`127.0.0.1:${port}`),
+          true,
+          `bound elsewhere: ${line || table}`,
+        );
 
         // Tidy: the server is waiting for a connection nobody is going to make.
         child.kill("SIGKILL");

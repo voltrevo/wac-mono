@@ -71,11 +71,15 @@ Deno.test("a listener bound to loopback is not reachable from another interface 
   const call = async (op: number, payload: Uint8Array<ArrayBufferLike>) =>
     await w[op](payload as Uint8Array) as Uint8Array;
 
-  // Port 0 is not usable here: the handler answers with a handle rather than with the port it got, so
-  // the test picks one and would rather fail loudly on a clash than silently test nothing.
-  const port = 45871;
-  const listener = readI32le(await call(OP.LISTEN, listenPayload("127.0.0.1", port)));
+  // Port 0, and the handler says which port it got. This used to be three hardcoded numbers with a
+  // comment explaining that the reply had no room for the answer — and one of them collided with
+  // another agent's suite run on this machine and failed a push over nothing. The capability answers
+  // it now, so the test asks for a free one like any other program would.
+  const bound = await call(OP.LISTEN, listenPayload("127.0.0.1", 0));
+  const listener = readI32le(bound);
+  const port = readI32le(bound.subarray(4));
   assertEquals(listener >= 1, true, "a handle");
+  assertEquals(port > 0, true, "the port it was given");
   try {
     assertEquals(await reachable("127.0.0.1", port), true, "loopback should reach it");
     if (outside !== null) {
@@ -97,8 +101,9 @@ Deno.test("...and an empty address still binds every interface, which is what it
   const call = async (op: number, payload: Uint8Array<ArrayBufferLike>) =>
     await w[op](payload as Uint8Array) as Uint8Array;
 
-  const port = 45872;
-  const listener = readI32le(await call(OP.LISTEN, listenPayload("", port)));
+  const bound = await call(OP.LISTEN, listenPayload("", 0));
+  const listener = readI32le(bound);
+  const port = readI32le(bound.subarray(4));
   try {
     assertEquals(await reachable("127.0.0.1", port), true, "loopback");
     assertEquals(await reachable(outside, port), true, `${outside}`);
@@ -115,15 +120,17 @@ Deno.test("accept says who connected", async () => {
   const call = async (op: number, payload: Uint8Array<ArrayBufferLike>) =>
     await w[op](payload as Uint8Array) as Uint8Array;
 
-  const port = 45873;
-  const listener = readI32le(await call(OP.LISTEN, listenPayload("127.0.0.1", port)));
+  const bound = await call(OP.LISTEN, listenPayload("127.0.0.1", 0));
+  const listener = readI32le(bound);
+  const port = readI32le(bound.subarray(4));
   try {
     const pending = call(OP.ACCEPT, i32le(listener));
     const client = await Deno.connect({ hostname: "127.0.0.1", port });
     const accepted = await pending;
     // A handle, then the peer's address — the shape `Socket` decodes.
     assertEquals(readI32le(accepted) >= 1, true, "a handle for the accepted socket");
-    assertEquals(unstr(accepted.subarray(4)), "127.0.0.1", "the peer, from the host");
+    assertEquals(unstr(accepted.subarray(8)), "127.0.0.1", "the peer, from the host");
+    assertEquals(readI32le(accepted.subarray(4)), port, "and the port it is served on");
     client.close();
   } finally {
     await call(OP.CLOSE_SOCKET, i32le(listener));
@@ -133,7 +140,9 @@ Deno.test("accept says who connected", async () => {
 Deno.test("...and a socket this program dialled has no peer to report", async () => {
   // `connect` and `listen` answer with the handle alone: the peer of an outgoing socket is the address
   // the caller passed, and repeating it back would be a second copy of the caller's own argument.
-  const server = Deno.listen({ hostname: "127.0.0.1", port: 45874 });
+  // The test's own listener asks the kernel for the port too, for the same reason.
+  const server = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+  const port = (server.addr as Deno.NetAddr).port;
   const accepting = server.accept().then((c) => c.close());
   const w = denoWorld({ net: true });
   const payload = (port: number, host: string) => {
@@ -144,9 +153,12 @@ Deno.test("...and a socket this program dialled has no peer to report", async ()
     return out;
   };
   try {
-    const out = await w[OP.CONNECT](payload(45874, "127.0.0.1")) as Uint8Array;
+    const out = await w[OP.CONNECT](payload(port, "127.0.0.1")) as Uint8Array;
     assertEquals(readI32le(out) >= 1, true, "a handle");
-    assertEquals(unstr(out.subarray(4)), "", "no peer for an outgoing socket");
+    assertEquals(unstr(out.subarray(8)), "", "no peer for an outgoing socket");
+    // …but it does report the port it dialled *from*, which is the kernel's choice and not the
+    // caller's, so it is a fact only the host has.
+    assertEquals(readI32le(out.subarray(4)) > 0, true, "the local port it was given");
     await w[OP.CLOSE_SOCKET](i32le(readI32le(out)));
   } finally {
     await accepting;

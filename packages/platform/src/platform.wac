@@ -466,13 +466,27 @@ export struct Socket {
   string peer;
 
   /**
+   * This socket's own port: what `listen` bound, what `connect` dialled *from*, what an accepted
+   * socket is served on. Zero when the host does not say.
+   *
+   * It exists because port 0 was useless without it. Asking the kernel for a free port is how a server
+   * avoids a clash it cannot predict — and `listen` answered with a handle alone, so a program that
+   * asked for 0 got one and could never learn which port it had, which is the same as not being able
+   * to ask. `platform/test/listen.test.ts` had a comment saying exactly that, above three hardcoded
+   * port numbers, and one of them collided with another agent's suite run and blocked a push.
+   */
+  i32 port;
+
+  /**
    * Declared here rather than left to bindgen, because the host builds these.
    *
    * bindgen emits a constructor for a struct that has none, and its name carries the `$` that marks
    * a generated identifier — so relying on it means the host reaches for a name no wac source
    * mentions. Two lines here and the capability world states its own construction API.
    */
-  Socket of(i32 handle, string error, string peer) { return Socket(handle, error, peer); }
+  Socket of(i32 handle, string error, string peer, i32 port) {
+    return Socket(handle, error, peer, port);
+  }
 
   /** Whether the peer is this machine — the check a server on every interface needs. */
   bool fromLoopback(const this) {

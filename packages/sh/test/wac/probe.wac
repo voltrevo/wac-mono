@@ -193,7 +193,7 @@ Pending<string> fakeOpenOutput(string path) {
   return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
 }
 
-Socket resolveSocket(i32 id) { return Socket(-1, "no network", ""); }
+Socket resolveSocket(i32 id) { return Socket(-1, "no network", "", 0); }
 Pending<Socket> fakeConnect(string host, i32 port) {
   return Pending.of(0, resolveSocket, alwaysSettled, ignoreDrop);
 }

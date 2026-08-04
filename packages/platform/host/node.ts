@@ -69,11 +69,15 @@ export type NodeSock = {
   close(): void;
   /** The address at the other end, where the runtime says. Absent for one this program dialled. */
   peer?: string;
+  /** This end's port, so a socket given an ephemeral one can say which it got. */
+  port?: number;
 };
 
 export type NodeListener = {
   accept(): Promise<NodeSock>;
   close(): void;
+  /** The port it was bound to, which is the answer `listen(…, 0)` needs. */
+  port?: number;
 };
 
 export type NodeWorldOptions = {
@@ -120,16 +124,18 @@ function failed(why: string): Uint8Array {
 }
 
 /**
- * A handle and the peer's address, which is what `Socket` decodes.
+ * A handle, this socket's own port, and the peer's address — which is what `Socket` decodes.
  *
- * The same shape the Deno host answers with: one i32, then whatever follows is the address. Only
- * `accept` has a peer to name.
+ * The same shape the Deno host answers with: two i32s, then whatever follows is the address. Only
+ * `accept` has a peer to name; the port is what a socket that asked for 0 was actually given.
  */
-function withPeer(handle: number, peer: string): Uint8Array {
+function withPeer(handle: number, peer: string, port = 0): Uint8Array {
   const text = new TextEncoder().encode(peer);
-  const out = new Uint8Array(4 + text.length);
-  new DataView(out.buffer).setInt32(0, handle, true);
-  out.set(text, 4);
+  const out = new Uint8Array(8 + text.length);
+  const view = new DataView(out.buffer);
+  view.setInt32(0, handle, true);
+  view.setInt32(4, port, true);
+  out.set(text, 8);
   return out;
 }
 
@@ -477,7 +483,7 @@ export function nodeWorld(
       const c = await io.connect(unstr(p.subarray(4)), readI32le(p));
       const h = nextHandle++;
       sockets.set(h, c);
-      return i32le(h);
+      return withPeer(h, "", c.port ?? 0);
     },
     /** Bind an address and a port; empty means every interface. See `listen` in platform.wac. */
     [OP.LISTEN]: async (p) => {
@@ -485,7 +491,7 @@ export function nodeWorld(
       const l = await io.listen(unstr(p.subarray(4)), readI32le(p));
       const h = nextHandle++;
       listeners.set(h, l);
-      return i32le(h);
+      return withPeer(h, "", l.port ?? 0);
     },
     [OP.ACCEPT]: async (p) => {
       const l = listeners.get(readI32le(p));
@@ -494,7 +500,7 @@ export function nodeWorld(
       const h = nextHandle++;
       sockets.set(h, c);
       // The peer travels with the handle, so a server can refuse one that is not from this machine.
-      return withPeer(h, c.peer ?? "");
+      return withPeer(h, c.peer ?? "", c.port ?? 0);
     },
     [OP.RECV]: async (p) => {
       const h = readI32le(p);

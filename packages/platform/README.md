@@ -248,6 +248,15 @@ the old behaviour, spelled out rather than defaulted into, so the surprising one
 typed. `accept` answers with the peer's address beside the handle, and `Socket.fromLoopback` is the
 check that makes a wide bind survivable.
 
+**`Socket.port` is what a socket was given**, which is what makes port 0 worth asking for. A program
+that wants a free port cannot pick one — the whole point is that it does not know which are taken —
+and `listen` used to answer with a handle alone, so asking for 0 got a listener on a port nobody could
+name. `platform/test/listen.test.ts` said so in a comment above three hardcoded port numbers, one of
+which collided with another agent's suite run on this machine and failed a push over nothing. Now the
+reply carries the handle, this socket's own port, and the peer: `listen(…, 0)` is answerable,
+`connect` reports the ephemeral port it dialled *from*, and every test in that file asks the kernel
+for a port like any other program would. `box nc -0 -l` prints the port it landed on.
+
 `connect` resolves and dials, `listen` binds, `accept` blocks until someone arrives, and
 `recv` answers empty when the peer closes — a short read means nothing, exactly as for a
 file. **There is no `poll`**, so a program waits on one socket at a time. That is enough

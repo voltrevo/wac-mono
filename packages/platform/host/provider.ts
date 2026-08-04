@@ -282,12 +282,14 @@ export function cliOf(
   };
   const socket = (id: number) => {
     try {
-      // A handle, then the peer's address for a socket that came from `accept` — empty for one that
-      // came from `connect` or `listen`, where the peer is either the caller's own choice or nobody.
+      // A handle, this socket's own port, then the peer's address for a socket that came from
+      // `accept` — empty for one that came from `connect` or `listen`, where the peer is either the
+      // caller's own choice or nobody. The port is what makes `listen(…, 0)` usable: the kernel picks
+      // a free one and the program is told which.
       const out = collect(b, unpack(id));
-      return cls.Socket.of(readI32le(out), "", unstr(out.subarray(4)));
+      return cls.Socket.of(readI32le(out), "", unstr(out.subarray(8)), readI32le(out.subarray(4)));
     } catch (e) {
-      return cls.Socket.of(-1, e instanceof Error ? e.message : String(e), "");
+      return cls.Socket.of(-1, e instanceof Error ? e.message : String(e), "", 0);
     }
   };
 

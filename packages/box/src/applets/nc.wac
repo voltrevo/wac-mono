@@ -73,7 +73,7 @@ export i32 nc(Core core, Cli cli, Args a) {
 Socket dialled(Core core, Cli cli, Args a) {
   if (a.rest.len() < 1) {
     core.warn("usage: " + a.name + " <host> <port>   |   " + a.name + " -<port> -l");
-    return Socket(-1, "", "");
+    return Socket(-1, "", "", 0);
   }
   i32 port = !a.hasNum && a.rest.len() > 1 ? atoi(a.rest[1]) : a.num;
   Socket s = cli.connect(a.rest[0], port).wait();
@@ -88,9 +88,11 @@ Socket accepted(Core core, Cli cli, Args a) {
   Socket l = cli.listen("", a.num).wait();
   if (l.handle < 0) {
     core.warn(a.name + ": " + itoa(a.num) + ": " + l.error);
-    return Socket(-1, "", "");
+    return Socket(-1, "", "", 0);
   }
-  core.warn(a.name + ": listening on port " + itoa(a.num));
+  // The port it *got*, not the port it asked for: `nc -0 -l` is a listener on whatever the kernel had
+  // free, and until `Socket.port` existed there was no way for it to say which.
+  core.warn(a.name + ": listening on port " + itoa(l.port));
   Socket c = cli.accept(l.handle).wait();
   cli.closeSocket(l.handle);
   if (c.handle < 0) { core.warn(a.name + ": accept: " + c.error); }

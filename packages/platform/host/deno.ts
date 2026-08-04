@@ -129,17 +129,26 @@ async function writeAllStdout(bytes: Uint8Array): Promise<void> {
 }
 
 /**
- * A handle and the peer's address, which is what `Socket` decodes.
+ * A handle, this socket's own port, and the peer's address — which is what `Socket` decodes.
  *
- * `connect` and `listen` answer with the handle alone; only `accept` has a peer to name. The shape is
- * the same either way, so the worker side reads one i32 and takes whatever follows as the address.
+ * Three fields because a handle alone made `listen(…, 0)` useless: the kernel picks a free port and the
+ * program could never learn which one, so every server had to guess a number and hope. Only `accept`
+ * has a peer to name; the port is whatever the socket is bound to locally, and 0 where the runtime
+ * does not say.
  */
-function withPeer(handle: number, peer: string): Uint8Array {
+function withPeer(handle: number, peer: string, port = 0): Uint8Array {
   const text = new TextEncoder().encode(peer);
-  const out = new Uint8Array(4 + text.length);
-  new DataView(out.buffer).setInt32(0, handle, true);
-  out.set(text, 4);
+  const out = new Uint8Array(8 + text.length);
+  const view = new DataView(out.buffer);
+  view.setInt32(0, handle, true);
+  view.setInt32(4, port, true);
+  out.set(text, 8);
   return out;
+}
+
+/** This end's port, or 0 for a transport that has none. */
+function localPort(addr: Deno.Addr): number {
+  return addr.transport === "tcp" || addr.transport === "udp" ? addr.port : 0;
 }
 
 /** The address at the other end, or empty where the runtime does not say. */
@@ -518,7 +527,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       const conn = await Deno.connect({ hostname: unstr(p.subarray(4)), port });
       const h = nextHandle++;
       sockets.set(h, conn);
-      return i32le(h);
+      return withPeer(h, "", localPort(conn.localAddr));
     },
     /**
      * Bind an address and a port. See `listen` in platform.wac for why the address is a parameter.
@@ -534,7 +543,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       );
       const h = nextHandle++;
       listeners.set(h, l);
-      return i32le(h);
+      // The port it *got*, which is the whole point of being allowed to ask for 0.
+      return withPeer(h, "", localPort(l.addr));
     },
     [OP.ACCEPT]: async (p) => {
       const l = listeners.get(readI32le(p));
@@ -544,7 +554,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       sockets.set(h, conn);
       // The peer's address travels with the handle, so a server can log it, rate-limit by it, or
       // refuse a connection that did not come from this machine. It was dropped here before.
-      return withPeer(h, peerOf(conn));
+      return withPeer(h, peerOf(conn), localPort(conn.localAddr));
     },
     [OP.RECV]: async (p) => {
       const h = readI32le(p);
