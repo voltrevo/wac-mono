@@ -112,4 +112,11 @@ Deno.test("an endless producer stops at the cap rather than filling memory", asy
   // this: the in-process route had one and the new route did not. Issue 0038 is the real fix.
   const r = await sh("yes | head -1; echo status=$?");
   assertEquals(r.out, "y\nstatus=0\n", r.err);
+
+  // And the input a parent *sends* is never dropped, however much of it there is. The first cap
+  // applied to every queue including a child's input, and on a loaded machine this came back as
+  // "status=0" with no `y` at all: 8 MiB went into `head`'s input before `head` began reading, and
+  // the overflow was discarded in silence. A cap belongs where a producer can be told to stop.
+  const big = await sh("seq 1 200000 | tail -1");
+  assertEquals(big.out.trim(), "200000", big.err);
 });

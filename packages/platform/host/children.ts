@@ -41,12 +41,26 @@
  */
 const QUEUE_CAP = 8 << 20;
 
-/** A queue of byte chunks with an end, read one chunk at a time. */
+/**
+ * A queue of byte chunks with an end, read one chunk at a time.
+ *
+ * `cap` bounds what may sit unread. **Only an output queue gets one.** A child's *input* is bytes its
+ * parent deliberately sent — `send` in `platform.wac` — and refusing those is data loss rather than
+ * backpressure: the first version of this capped every queue, and under a loaded machine
+ * `yes | head -1` came back empty, because 8 MiB was pushed into `head`'s input before `head` had
+ * started reading and the overflow was dropped on the floor. Silently. A cap belongs where a
+ * *producer* can be told to stop, which is the other direction.
+ */
 export class ByteQueue {
   #chunks: Uint8Array[] = [];
   #ended = false;
   #held = 0;
+  #cap: number;
   #waiting: ((v: Uint8Array) => void) | null = null;
+
+  constructor(cap = 0) {
+    this.#cap = cap;
+  }
 
   /**
    * Take these bytes, or answer false when the queue is full.
@@ -64,7 +78,7 @@ export class ByteQueue {
       w(b);
       return true;
     }
-    if (this.#held + b.length > QUEUE_CAP) return false;
+    if (this.#cap > 0 && this.#held + b.length > this.#cap) return false;
     this.#chunks.push(b);
     this.#held += b.length;
     return true;
@@ -212,8 +226,9 @@ export function spawnChild(
   makeBridge: () => { sab: SharedArrayBuffer },
   makeWorker: (source: string) => WorkerLike = blobWorker,
 ): Child {
-  const out = new ByteQueue();
-  const err = new ByteQueue();
+  // The two the child writes are capped; what the parent sends it is not — see `ByteQueue`.
+  const out = new ByteQueue(QUEUE_CAP);
+  const err = new ByteQueue(QUEUE_CAP);
   const input = new ByteQueue();
   const bridge = makeBridge();
   const responder = startWorld(bridge.sab, args, out, input, err);
