@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-25 packages, 46,855 lines of wac, 951 tests,
+25 packages, 47,132 lines of wac, 957 tests,
 23 command-line programs and 4 browser pages.
 
 ## Packages
@@ -32,7 +32,7 @@ In dependency order: nothing here imports anything below it.
 | [`json`](packages/json/) | JSON (RFC 8259) parsing and serialization, written in wac. | 967 | 51 | `bytes` `fmt` `std` |
 | [`sh`](packages/sh/) | A shell, in wac. | 4,387 | 14 | `bytes` `platform` `std` |
 | [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 237 | 16 | `fmt` |
-| [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 3,799 | 37 | `crypto` |
+| [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 4,076 | 43 | `crypto` |
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,565 | 45 | `bytes` `codec` `crypto` `platform` `sh` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,263 | 70 | `crypto` |

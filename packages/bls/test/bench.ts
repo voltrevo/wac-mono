@@ -31,6 +31,8 @@ const probe = await wacBind("packages/bls/test/wac/probe.wac") as unknown as {
   blsMillerLoopTwo(a1: Uint8Array, b1: Uint8Array, a2: Uint8Array, b2: Uint8Array): Uint8Array;
   blsPairing(g1c: Uint8Array, g2c: Uint8Array): Uint8Array;
   blsVerify(pk: Uint8Array, msg: Uint8Array, sig: Uint8Array): boolean;
+  blsBatchVerify(pks: Uint8Array[], msgs: Uint8Array[], sigs: Uint8Array[], e: Uint8Array): boolean;
+  blsFastAggregateVerify(pks: Uint8Array[], msg: Uint8Array, sig: Uint8Array): boolean;
 };
 
 const hexBytes = (h: string) =>
@@ -80,3 +82,38 @@ console.log(`Miller, two pairs      ${ms(two - decodeBoth)} ms   ${share(two - d
   `   raw ${ms(two)} against ${ms(2 * one)} for two separate loops`);
 console.log(`final exponentiation   ${ms(paired - one)} ms   ${share(paired - one)}`);
 console.log(`${"-".repeat(22)} ${ms(whole)} ms          full verification`);
+
+// ── Batching ──────────────────────────────────────────────────────────────────
+//
+// What the aggregate operations are for. A batch of n costs n+1 pairings through one Miller loop
+// and **one** final exponentiation, against n separate verifications at two pairings and one final
+// exponentiation each.
+//
+// The batch is built by repeating one valid triple, which is degenerate cryptographically — every
+// member is the same signature — and exactly representative for timing, because the weights differ
+// per index so the arithmetic is the same work as n distinct members.
+console.log();
+const sizes = [1, 2, 4, 8, 16];
+console.log(`${"n".padStart(3)}  ${"individually".padStart(13)}  ${"batched".padStart(9)}  speedup   per signature`);
+for (const n of sizes) {
+  const pks = Array.from({ length: n }, () => pk);
+  const msgs = Array.from({ length: n }, () => msg);
+  const sigs = Array.from({ length: n }, () => sig);
+  const entropy = new Uint8Array(0);
+  if (!probe.blsBatchVerify(pks, msgs, sigs, entropy)) {
+    throw new Error(`the synthetic batch of ${n} does not verify — the figures below would be noise`);
+  }
+  const one = best(Math.max(3, Math.floor(40 / n)), () => {
+    for (let i = 0; i < n; i++) probe.blsVerify(pk, msg, sig);
+  });
+  const batch = best(Math.max(3, Math.floor(40 / n)), () => probe.blsBatchVerify(pks, msgs, sigs, entropy));
+  console.log(
+    `${String(n).padStart(3)}  ${ms(one)} ms  ${ms(batch)} ms  ${(one / batch).toFixed(2)}x   ` +
+      `${ms(batch / n)} ms`,
+  );
+}
+
+// FastAggregateVerify is the cheap one: many signers on one message sum to a single verification.
+const fa = best(20, () => probe.blsFastAggregateVerify([pk, pk, pk, pk], msg, sig));
+console.log(`\nfastAggregateVerify, 4 keys, 1 message   ${ms(fa)} ms` +
+  `   (4 separate verifications: ${ms(best(10, () => { for (let i = 0; i < 4; i++) probe.blsVerify(pk, msg, sig); }))} ms)`);

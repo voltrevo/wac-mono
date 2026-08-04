@@ -211,48 +211,71 @@ export Fp12? finalExponentiate(Fp12 f) {
   return fp12Mul(t3, t4);
 }
 
+/** One pair for a shared Miller loop: P affine in G1, Q affine in G2. */
+export struct Pair {
+  u32[] px;
+  u32[] py;
+  Fp2 qx;
+  Fp2 qy;
+}
+
 /**
- * Two Miller loops sharing one accumulator: `f_{|x|}(Q₁,P₁) · f_{|x|}(Q₂,P₂)`.
+ * `∏ f_{|x|}(Qᵢ, Pᵢ)` — every pair through one accumulator.
  *
- * A verification is a product of two pairings, and a product of Miller loops does not need two
- * accumulators — at each step the one accumulator is squared once and both lines are multiplied in.
- * That pays the 64 Fp12 squarings once rather than twice, which is the single largest shared cost
- * between the two loops. The per-point work (`doubleStep`, `addStep`, the line multiplications) is
- * unavoidably doubled and is untouched here.
+ * A verification is a product of pairings, and a product of Miller loops does not need one
+ * accumulator each: at each step the single accumulator is squared once and every pair's line is
+ * multiplied in. The 64 Fp12 squarings are then paid once instead of n times, which is the largest
+ * shared cost. The per-pair work — `doubleStep`, `addStep`, the line multiplications — is
+ * unavoidably proportional to n and is untouched.
+ *
+ * This is what makes aggregate and batch verification worth having: n+1 pairings for the price of
+ * one loop's squarings and one final exponentiation.
  *
  * The final conjugation stays valid because conjugation is the p⁶ Frobenius, a homomorphism, so
- * conj(f₁)·conj(f₂) = conj(f₁·f₂). `pairing_wac.test.ts` checks the two spellings agree rather than
- * taking that on trust.
+ * ∏ conj(fᵢ) = conj(∏ fᵢ). `pairing_wac.test.ts` checks the two-pair case against the product of
+ * two single loops rather than taking that on trust.
  */
-export Fp12 millerLoopTwo(u32[] px1, u32[] py1, Fp2 qx1, Fp2 qy1,
-                          u32[] px2, u32[] py2, Fp2 qx2, Fp2 qy2) {
+export Fp12 millerLoopMulti(Pair[] pairs) {
   i32[] naf = ateNaf();
-  Fp2 negQy1 = fp2Neg(qy1);
-  Fp2 negQy2 = fp2Neg(qy2);
-  Rp r1 = Rp(fp2Copy(qx1), fp2Copy(qy1), fp2One());
-  Rp r2 = Rp(fp2Copy(qx2), fp2Copy(qy2), fp2One());
+  i32 n = pairs.len();
+  Fp2[] negQy = Fp2[n]();
+  Rp[] r = Rp[n]();
+  for (i32 j = 0; j < n; j++) {
+    negQy[j] = fp2Neg(pairs[j].qy);
+    r[j] = Rp(fp2Copy(pairs[j].qx), fp2Copy(pairs[j].qy), fp2One());
+  }
   Fp12 f = fp12One();
 
   for (i32 i = 0; i < naf.len(); i++) {
     if (i != 0) { f = fp12Square(f); }
-
-    Line l1 = Line(fp2Zero(), fp2Zero(), fp2Zero());
-    r1 = doubleStep(r1, l1);
-    f = applyLine(f, l1, px1, py1);
-    Line l2 = Line(fp2Zero(), fp2Zero(), fp2Zero());
-    r2 = doubleStep(r2, l2);
-    f = applyLine(f, l2, px2, py2);
-
+    for (i32 j = 0; j < n; j++) {
+      Line l = Line(fp2Zero(), fp2Zero(), fp2Zero());
+      r[j] = doubleStep(r[j], l);
+      f = applyLine(f, l, pairs[j].px, pairs[j].py);
+    }
     if (naf[i] != 0) {
-      Line m1 = Line(fp2Zero(), fp2Zero(), fp2Zero());
-      r1 = addStep(r1, qx1, (naf[i] == -1) ? negQy1 : qy1, m1);
-      f = applyLine(f, m1, px1, py1);
-      Line m2 = Line(fp2Zero(), fp2Zero(), fp2Zero());
-      r2 = addStep(r2, qx2, (naf[i] == -1) ? negQy2 : qy2, m2);
-      f = applyLine(f, m2, px2, py2);
+      for (i32 j = 0; j < n; j++) {
+        Line m = Line(fp2Zero(), fp2Zero(), fp2Zero());
+        r[j] = addStep(r[j], pairs[j].qx, (naf[i] == -1) ? negQy[j] : pairs[j].qy, m);
+        f = applyLine(f, m, pairs[j].px, pairs[j].py);
+      }
     }
   }
   return fp12Conjugate(f);
+}
+
+/**
+ * Two pairs, the shape a single signature verification wants.
+ *
+ * A wrapper over `millerLoopMulti` rather than a second copy of the loop: the two-pair case is the
+ * one with vector coverage, so routing it through the general code is what tests the general code.
+ */
+export Fp12 millerLoopTwo(u32[] px1, u32[] py1, Fp2 qx1, Fp2 qy1,
+                          u32[] px2, u32[] py2, Fp2 qx2, Fp2 qy2) {
+  Pair[] pairs = Pair[2]();
+  pairs[0] = Pair(px1, py1, qx1, qy1);
+  pairs[1] = Pair(px2, py2, qx2, qy2);
+  return millerLoopMulti(pairs);
 }
 
 /** `e(P, Q)` for affine inputs, or null if either is the identity. */

@@ -29,6 +29,8 @@ Built in stages with an external oracle gating each one:
 | Miller loop | **done**, against `@noble/curves` via Python |
 | Final exponentiation | **done**, via the verification identity |
 | `verify` | **done** — all 29 Ethereum fixtures, plus 28 deserialization |
+| `Aggregate`, `FastAggregateVerify`, `AggregateVerify` | **done** — all 17 Ethereum fixtures |
+| `BatchVerify` | **done** — all 4 Ethereum fixtures, including the forged set |
 
 ## Why none of `crypto/src/fieldp.wac` is reused
 
@@ -141,8 +143,66 @@ to know with no profiler and no globals to hang a counter on.
   `clearCofactorG2`. The doublings are irreducible for a fixed scalar, so only a cheaper `g2Double`
   helps.
 - Karabina compressed squaring would beat Granger–Scott, at the cost of a decompression step.
-- Batch and aggregate verification share one final exponentiation across many signatures. The
-  fixtures are vendored (`eth_batch_verify.json`, `eth_aggregate_verify.json`) and unused.
+- ~~Batch and aggregate verification.~~ Done — see below.
+
+## Aggregation, and what it is actually worth
+
+Four operations, and the useful distinction between them is *which* of the three things is shared.
+
+| | shared | cost |
+| --- | --- | --- |
+| `fastAggregateVerify(pks, msg, sig)` | one message, many signers | one verification + n−1 G1 additions |
+| `aggregateVerify(pks, msgs, sig)` | one signature, distinct messages | n+1 pairings, one final exponentiation |
+| `batchVerify(pks, msgs, sigs, entropy)` | nothing — n independent signatures | n+1 pairings, one final exponentiation, 2n 64-bit scalar multiplications |
+| `aggregate(sigs)` | — | n−1 G2 additions; **unauthenticated** |
+
+Measured with `deno run -A test/bench.ts`:
+
+```
+  n   individually    batched  speedup   per signature
+  1     7.96 ms      7.96 ms   1.00x      7.96 ms
+  2    15.84 ms     12.80 ms   1.24x      6.40 ms
+  4    31.76 ms     21.17 ms   1.50x      5.29 ms
+  8    63.61 ms     37.39 ms   1.70x      4.67 ms
+ 16   126.32 ms     70.46 ms   1.79x      4.40 ms
+
+fastAggregateVerify, 4 keys, 1 message   8.85 ms   (4 separate verifications: 31.52 ms)
+```
+
+**Read those two blocks against each other, because they say opposite things.** `batchVerify`
+plateaus near 1.8× and the per-signature floor is 4.4 ms, not 0: only the final exponentiation
+amortises, while `hash_to_G2` (1.36 ms), decoding, the per-pair Miller work and two scalar
+multiplications are all still paid per member. `fastAggregateVerify` is the one that scales — 3.6× at
+four keys and roughly n× beyond, because a signer costs one G1 addition. For Ethereum that is the
+common case: attestations aggregate over an identical message.
+
+`batchVerify` of one delegates to `verify`. Weighting a single term is overhead, and skipping it is
+sound rather than convenient — for one term the check is `(e(pk,H)·e(−G₁,sig))^r == 1`, and in a
+group of prime order a 64-bit `r` cannot be a multiple of a 255-bit prime, so `x^r == 1` forces
+`x == 1`.
+
+### The batch weights are the security, not an optimisation
+
+Multiplying n independent verification equations together is unsound and cheaply so: an adversary
+with two valid pairs moves a point X between the signatures — `sig₁+X`, `sig₂−X` — and the product
+still comes to one while neither signature verifies alone. Ethereum's
+`batch_verify_invalid_forged_signature_set` is that attack.
+
+Each term is therefore weighted by an unpredictable `rᵢ`. There is no entropy source in wac, so the
+weights are Fiat–Shamir: SHA-256 over a transcript of `entropy` and every key, message and signature
+in the batch, which fixes them only after the adversary has committed to all of it. Sound in the
+random-oracle model, and deterministic, which is what lets the fixtures pin it — pass fresh entropy
+if you want soundness without the ROM assumption.
+
+Verified load-bearing rather than assumed: forcing every weight to 1 makes the forged fixture pass,
+and both it and an independently constructed swap-two-signatures case fail.
+
+An infinity public key is refused **per key, not per aggregate** — a sum containing infinity is an
+ordinary point, so checking only the aggregate would admit `sk = 0` whenever somebody else also
+signed. That is `aggregate_verify_infinity_pubkey`: four keys, one of them infinity.
+
+A false batch result says the batch is bad, not which member. That is inherent to summing the terms;
+the pattern is batch-then-bisect.
 
 ### Two caveats that are not about speed
 

@@ -25,11 +25,14 @@
 
 import { fpOne } from "./fp.wac";
 import { Fp12, fp12Mul, fp12IsOne } from "./fp12.wac";
-import { G1, g1FromBytes, g1Generator, g1Negate, g1IsInfinity, g1AffineX, g1AffineY } from "./g1.wac";
-import { G2, g2FromBytes, g2IsInfinity, g2AffineX, g2AffineY } from "./g2.wac";
+import { G1, g1FromBytes, g1Generator, g1Negate, g1IsInfinity, g1AffineX, g1AffineY,
+         g1Add, g1Mul, g1Infinity } from "./g1.wac";
+import { G2, g2FromBytes, g2IsInfinity, g2AffineX, g2AffineY,
+         g2Add, g2Mul, g2Infinity, g2Compress } from "./g2.wac";
 import { Fp2 } from "./fp2.wac";
-import { millerLoop, millerLoopTwo, finalExponentiate } from "./pairing.wac";
+import { Pair, millerLoop, millerLoopTwo, millerLoopMulti, finalExponentiate } from "./pairing.wac";
 import { hashToG2 } from "./map.wac";
+import { sha256 } from "../../crypto/src/sha256.wac";
 
 /** The domain separation tag Ethereum signatures use. */
 export u8[] ethDst() {
@@ -58,6 +61,48 @@ Fp12? loopFor(G1 p, G2 q) {
  * False for anything malformed as well as anything merely wrong — a verifier has one bit to
  * return and "I could not read this" is not an acceptance.
  */
+/**
+ * Whether `∏ e(Pᵢ, Qᵢ) == 1`, for pairs already in G1 and G2.
+ *
+ * Every operation in this file reduces to this. One shared Miller loop and **one** final
+ * exponentiation, which is where the saving in aggregate and batch verification comes from: the
+ * final exponentiation is 31% of a single verification and it is paid once however many pairs there
+ * are.
+ *
+ * A pair whose point is infinity has no affine coordinates, so it cannot be put into a Miller loop
+ * at all. Callers decide what infinity *means* — usually a refusal — before getting here.
+ */
+bool productIsOne(Pair[] pairs) {
+  Fp12? e = finalExponentiate(millerLoopMulti(pairs));
+  if (e is null) { return false; }
+  return fp12IsOne(e!);
+}
+
+/** `(P, Q)` as a `Pair`, or null if either point is at infinity. */
+Pair? toPair(G1 p, G2 q) {
+  u32[]? px = g1AffineX(p);
+  u32[]? py = g1AffineY(p);
+  Fp2? qx = g2AffineX(q);
+  Fp2? qy = g2AffineY(q);
+  if ((px is null) || (py is null) || (qx is null) || (qy is null)) { return null; }
+  return Pair(px!, py!, qx!, qy!);
+}
+
+/**
+ * `e(pk, H(m)) · e(−G₁, sig) == 1`, the single-signature identity, for points already checked.
+ */
+bool verifyPair(G1 pk, u8[] message, G2 sig) {
+  G2 h = hashToG2(message, ethDst());
+  if (g2IsInfinity(h)) { return false; }
+  Pair? a = toPair(pk, h);
+  Pair? b = toPair(g1Negate(g1Generator()), sig);
+  if ((a is null) || (b is null)) { return false; }
+  Pair[] pairs = Pair[2]();
+  pairs[0] = a!;
+  pairs[1] = b!;
+  return productIsOne(pairs);
+}
+
 export bool verify(u8[] pubkey, u8[] message, u8[] signature) {
   G1? pk = g1FromBytes(pubkey);
   G2? sig = g2FromBytes(signature);
@@ -68,24 +113,233 @@ export bool verify(u8[] pubkey, u8[] message, u8[] signature) {
   if (g1IsInfinity(pk!)) { return false; }
   if (g2IsInfinity(sig!)) { return false; }
 
-  G2 h = hashToG2(message, ethDst());
-  if (g2IsInfinity(h)) { return false; }
+  return verifyPair(pk!, message, sig!);
+}
 
-  // e(pk, H) · e(−G₁, sig), as one Miller loop over both pairs and one final exponentiation.
-  G1 ng = g1Negate(g1Generator());
-  u32[]? ax = g1AffineX(pk!);
-  u32[]? ay = g1AffineY(pk!);
-  Fp2? aqx = g2AffineX(h);
-  Fp2? aqy = g2AffineY(h);
-  u32[]? bx = g1AffineX(ng);
-  u32[]? by = g1AffineY(ng);
-  Fp2? bqx = g2AffineX(sig!);
-  Fp2? bqy = g2AffineY(sig!);
-  if ((ax is null) || (ay is null) || (aqx is null) || (aqy is null)) { return false; }
-  if ((bx is null) || (by is null) || (bqx is null) || (bqy is null)) { return false; }
+// ── Aggregation ───────────────────────────────────────────────────────────────
+//
+// Three operations, and the distinction between them is which of the three things is shared:
+//
+//   `fastAggregateVerify`  one message, many signers    — sum the keys, then verify once
+//   `aggregateVerify`      many messages, one signature — a product of n+1 pairings
+//   `batchVerify`          many messages, many signatures, randomised
+//
+// **Every input is validated individually, and an infinity public key is refused per key rather
+// than per aggregate.** That is not a stylistic choice: the sum of an infinity key and a real one
+// is a perfectly ordinary point, so a check on the aggregate alone would let `sk = 0` in as long as
+// somebody else signed too. Ethereum's `aggregate_verify_infinity_pubkey` fixture is exactly that
+// case — four keys, one of them infinity — and it must fail.
 
-  Fp12? e = finalExponentiate(
-    millerLoopTwo(ax!, ay!, aqx!, aqy!, bx!, by!, bqx!, bqy!));
-  if (e is null) { return false; }
-  return fp12IsOne(e!);
+/**
+ * `Σ pubkeys` in G1, or null if the list is empty or any key is unusable.
+ *
+ * Empty is null rather than the identity. An empty aggregate is the infinity point, which then
+ * verifies nothing meaningfully, and every Ethereum `na_pubkeys` fixture requires a refusal.
+ */
+export G1? aggregatePubkeys(u8[][] pubkeys) {
+  if (pubkeys.len() == 0) { return null; }
+  G1 acc = g1Infinity();
+  for (i32 i = 0; i < pubkeys.len(); i++) {
+    G1? p = g1FromBytes(pubkeys[i]);
+    if (p is null) { return null; }
+    if (g1IsInfinity(p!)) { return null; }
+    acc = g1Add(acc, p!);
+  }
+  return acc;
+}
+
+/**
+ * `Σ signatures` in G2, or null if the list is empty or any signature is unusable.
+ *
+ * This is the `Aggregate` of the CFRG draft. Note what it does *not* do: aggregation is unauthenticated,
+ * so a caller must not treat a successful aggregation as evidence about the signatures — only a
+ * verification does that.
+ */
+export G2? aggregateSignatures(u8[][] signatures) {
+  if (signatures.len() == 0) { return null; }
+  G2 acc = g2Infinity();
+  for (i32 i = 0; i < signatures.len(); i++) {
+    G2? q = g2FromBytes(signatures[i]);
+    if (q is null) { return null; }
+    if (g2IsInfinity(q!)) { return null; }
+    acc = g2Add(acc, q!);
+  }
+  return acc;
+}
+
+/** `Aggregate`, as bytes in, bytes out; empty on refusal. */
+export u8[] aggregate(u8[][] signatures) {
+  G2? agg = aggregateSignatures(signatures);
+  if (agg is null) { return u8[0](); }
+  return g2Compress(agg!);
+}
+
+/**
+ * `FastAggregateVerify` — many signers, one message.
+ *
+ * Everyone signed the same message, so the keys sum to a key for the sum of the secrets and this is
+ * a single verification against the aggregate. Cost is one verification plus n−1 G1 additions,
+ * which is why it is the cheap one.
+ */
+export bool fastAggregateVerify(u8[][] pubkeys, u8[] message, u8[] signature) {
+  G1? agg = aggregatePubkeys(pubkeys);
+  if (agg is null) { return false; }
+  G2? sig = g2FromBytes(signature);
+  if (sig is null) { return false; }
+  if (g2IsInfinity(sig!)) { return false; }
+  return verifyPair(agg!, message, sig!);
+}
+
+/**
+ * `AggregateVerify` — many signers, *distinct* messages, one aggregate signature.
+ *
+ *     ∏ e(pkᵢ, H(mᵢ)) · e(−G₁, sig) == 1
+ *
+ * The keys cannot be summed here, because each signed something different; the pairings are what
+ * combine. n+1 pairs through one Miller loop and one final exponentiation.
+ *
+ * No randomisation is needed or wanted: there is a single signature, so there is nothing for an
+ * adversary to split across terms. That is what separates this from `batchVerify` below.
+ */
+export bool aggregateVerify(u8[][] pubkeys, u8[][] messages, u8[] signature) {
+  i32 n = pubkeys.len();
+  if (n == 0) { return false; }
+  if (messages.len() != n) { return false; }
+  G2? sig = g2FromBytes(signature);
+  if (sig is null) { return false; }
+  if (g2IsInfinity(sig!)) { return false; }
+
+  Pair[] pairs = Pair[n + 1]();
+  for (i32 i = 0; i < n; i++) {
+    G1? pk = g1FromBytes(pubkeys[i]);
+    if (pk is null) { return false; }
+    if (g1IsInfinity(pk!)) { return false; }
+    G2 h = hashToG2(messages[i], ethDst());
+    if (g2IsInfinity(h)) { return false; }
+    Pair? pr = toPair(pk!, h);
+    if (pr is null) { return false; }
+    pairs[i] = pr!;
+  }
+  Pair? last = toPair(g1Negate(g1Generator()), sig!);
+  if (last is null) { return false; }
+  pairs[n] = last!;
+  return productIsOne(pairs);
+}
+
+// ── Batch verification ────────────────────────────────────────────────────────
+
+/**
+ * A 64-bit scalar for term `i`, derived from the whole batch.
+ *
+ * **Why the scalars exist at all.** Verifying n independent signatures by multiplying their
+ * equations together is unsound, and cheaply so: an adversary holding two valid pairs can move an
+ * arbitrary point X from one signature to the other — `sig₁+X`, `sig₂−X` — and the product still
+ * comes to one while neither signature verifies alone. Ethereum's
+ * `batch_verify_invalid_forged_signature_set` fixture is that attack, and a naive product check
+ * accepts it. Weighting each term by an unpredictable rᵢ is what defeats it: the forgery survives
+ * only if the adversary guessed the weights.
+ *
+ * **Where the unpredictability comes from.** There is no entropy source in wac, so this is
+ * Fiat–Shamir: the scalars are SHA-256 of a transcript covering `entropy` and every public key,
+ * message and signature in the batch, so they are fixed only *after* the adversary has committed to
+ * all of it. That is sound in the random-oracle model and it makes a batch deterministic, which is
+ * what lets the fixtures pin it. A caller who wants soundness without the random-oracle assumption
+ * should pass fresh entropy; passing none is safe against the attack above but leans on the ROM.
+ *
+ * 64 bits, not 255. The forgery has to survive a guess of every rᵢ, so 64 bits each is ample, and a
+ * scalar multiplication costs its bit length — full-width scalars would make batching slower than
+ * verifying one at a time.
+ */
+u32[] batchScalar(u8[] transcript, i32 i) {
+  u8[] tagged = u8[transcript.len() + 4]();
+  for (i32 j = 0; j < transcript.len(); j++) { tagged[j] = transcript[j]; }
+  tagged[transcript.len() + 0] = (i >> 24) & 0xFF;
+  tagged[transcript.len() + 1] = (i >> 16) & 0xFF;
+  tagged[transcript.len() + 2] = (i >> 8) & 0xFF;
+  tagged[transcript.len() + 3] = i & 0xFF;
+  u8[] h = sha256(tagged);
+
+  // Two 32-bit words, least significant first, as `g1Mul` and `g2Mul` read a scalar.
+  u32[] k = u32[2]();
+  for (i32 w = 0; w < 2; w++) {
+    u32 v = 0;
+    for (i32 b = 0; b < 4; b++) { v = (v << 8) | (h[w * 4 + b] as@ u32); }
+    k[w] = v;
+  }
+  // A zero weight would drop its term from the check entirely, which is the one value that must not
+  // occur. Probability 2⁻⁶⁴, and cheaper to exclude than to reason about.
+  if (k[0] == 0 && k[1] == 0) { k[0] = 1; }
+  return k;
+}
+
+/** Everything the batch commits to, in order, so no term's weight can be chosen after the fact. */
+u8[] batchTranscript(u8[][] pubkeys, u8[][] messages, u8[][] signatures, u8[] entropy) {
+  i32 total = entropy.len();
+  for (i32 i = 0; i < pubkeys.len(); i++) {
+    total = total + pubkeys[i].len() + messages[i].len() + signatures[i].len();
+  }
+  u8[] t = u8[total]();
+  i32 at = 0;
+  for (i32 j = 0; j < entropy.len(); j++) { t[at] = entropy[j]; at = at + 1; }
+  for (i32 i = 0; i < pubkeys.len(); i++) {
+    for (i32 j = 0; j < pubkeys[i].len(); j++) { t[at] = pubkeys[i][j]; at = at + 1; }
+    for (i32 j = 0; j < messages[i].len(); j++) { t[at] = messages[i][j]; at = at + 1; }
+    for (i32 j = 0; j < signatures[i].len(); j++) { t[at] = signatures[i][j]; at = at + 1; }
+  }
+  return t;
+}
+
+/**
+ * `BatchVerify` — n independent signatures, each on its own message, in one pairing product.
+ *
+ *     ∏ e(rᵢ·pkᵢ, H(mᵢ)) · e(−G₁, Σ rᵢ·sigᵢ) == 1
+ *
+ * Bilinearity turns each scaled equation into its own term and lets every `−G₁` term collapse into
+ * one, so n signatures cost n+1 pairings rather than 2n, and **one** final exponentiation rather
+ * than n. See `batchScalar` for why the weights are there and where they come from.
+ *
+ * **All-or-nothing.** A false result says the batch is bad, not which member of it is. That is
+ * inherent — the terms have been summed — so a caller that needs to attribute a failure has to fall
+ * back to verifying individually, and the useful pattern is batch-then-bisect.
+ */
+export bool batchVerify(u8[][] pubkeys, u8[][] messages, u8[][] signatures, u8[] entropy) {
+  i32 n = pubkeys.len();
+  if (n == 0) { return false; }
+  if (messages.len() != n || signatures.len() != n) { return false; }
+
+  // A batch of one is just a verification, and weighting it is pure overhead — measured, 8.71 ms
+  // against 7.98 ms, so the batch API would be *worse* than the thing it replaces at the size a
+  // caller is most likely to reach it with accidentally.
+  //
+  // Sound to skip, not merely convenient: for one term the weighted check is `(e(pk,H)·e(−G₁,sig))^r
+  // == 1`, and the pairing output lies in a subgroup of prime order r_group, where x^r == 1 with
+  // r ≢ 0 (mod r_group) forces x == 1. A 64-bit r cannot be a multiple of a 255-bit prime, so the
+  // two checks accept exactly the same inputs. The weights only ever mattered for moving a point
+  // between *different* terms, and with one term there is nowhere to move it to.
+  if (n == 1) { return verify(pubkeys[0], messages[0], signatures[0]); }
+
+  u8[] transcript = batchTranscript(pubkeys, messages, signatures, entropy);
+
+  Pair[] pairs = Pair[n + 1]();
+  G2 sigSum = g2Infinity();
+  for (i32 i = 0; i < n; i++) {
+    G1? pk = g1FromBytes(pubkeys[i]);
+    G2? sig = g2FromBytes(signatures[i]);
+    if ((pk is null) || (sig is null)) { return false; }
+    if (g1IsInfinity(pk!)) { return false; }
+    if (g2IsInfinity(sig!)) { return false; }
+    G2 h = hashToG2(messages[i], ethDst());
+    if (g2IsInfinity(h)) { return false; }
+
+    u32[] r = batchScalar(transcript, i);
+    Pair? pr = toPair(g1Mul(pk!, r), h);
+    if (pr is null) { return false; }
+    pairs[i] = pr!;
+    sigSum = g2Add(sigSum, g2Mul(sig!, r));
+  }
+  if (g2IsInfinity(sigSum)) { return false; }
+  Pair? last = toPair(g1Negate(g1Generator()), sigSum);
+  if (last is null) { return false; }
+  pairs[n] = last!;
+  return productIsOne(pairs);
 }

@@ -467,7 +467,8 @@ export bool blsPairingInverse(u8[] g1c, u8[] g2c) {
 
 // ── verify ────────────────────────────────────────────────────────────────────
 
-import { verify } from "../../src/verify.wac";
+import { verify, aggregate, fastAggregateVerify,
+         aggregateVerify, batchVerify } from "../../src/verify.wac";
 
 export bool blsVerify(u8[] pubkey, u8[] message, u8[] signature) {
   return verify(pubkey, message, signature);
@@ -494,4 +495,22 @@ export u8[] blsMillerLoopTwo(u8[] a1, u8[] b1, u8[] a2, u8[] b2) {
   if ((x1 is null) || (y1 is null) || (u1 is null) || (v1 is null)) { return u8[0](); }
   if ((x2 is null) || (y2 is null) || (u2 is null) || (v2 is null)) { return u8[0](); }
   return bytes12(millerLoopTwo(x1!, y1!, u1!, v1!, x2!, y2!, u2!, v2!));
+}
+
+/** `Aggregate` over compressed G2 signatures; empty on refusal. */
+export u8[] blsAggregate(u8[][] sigs) { return aggregate(sigs); }
+
+/** `FastAggregateVerify` — many signers, one message. */
+export bool blsFastAggregateVerify(u8[][] pks, u8[] msg, u8[] sig) {
+  return fastAggregateVerify(pks, msg, sig);
+}
+
+/** `AggregateVerify` — many signers, distinct messages, one aggregate signature. */
+export bool blsAggregateVerify(u8[][] pks, u8[][] msgs, u8[] sig) {
+  return aggregateVerify(pks, msgs, sig);
+}
+
+/** `BatchVerify` — n signatures in one randomised pairing product. */
+export bool blsBatchVerify(u8[][] pks, u8[][] msgs, u8[][] sigs, u8[] entropy) {
+  return batchVerify(pks, msgs, sigs, entropy);
 }
