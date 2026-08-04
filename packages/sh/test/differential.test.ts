@@ -809,6 +809,72 @@ for (const [i, script] of [
   `test -s nothing; echo status=$?`,
   `echo x > f; test -h f; echo status=$?`,       // not a link, and `stat` would have said "file"
   `test -q f; echo status=$?`,                   // still refused, and it is a *usage* error: 2
+  // File *operands*. Every program here except `cat` used to ignore them and read standard input
+  // regardless, so `wc -l f` printed `0` and exited `0`, and `grep pattern f` exited 1 — which a
+  // script reads as "no match" rather than "the file was never opened".
+  `printf 'a\nb\n' > f; wc -l f`,
+  `printf 'a\nb\n' > f; wc f`,
+  `printf 'a\nb\n' > f; wc -l < f`,             // and no name, when it is standard input
+  `printf 'a\nb\n' > f; wc -l - < f`,           // …but `-` keeps its name, as GNU prints it
+  `printf 'a\nb\n' > f; head -1 f`,
+  `printf 'a\nb\n' > f; tail -1 f`,
+  `printf 'b\na\n' > f; sort f`,
+  `printf 'a\na\n' > f; uniq f`,
+  `printf 'ab\n' > f; rev f`,
+  `printf 'a\nb\n' > f; nl f`,
+  `printf 'a\nb\n' > f; cat f - < f`,
+  // Several of them, where the shape of the answer changes: `wc` names each file and totals them,
+  // `head` and `tail` write a header per block, `grep` labels its lines, and `sort`, `nl` and `rev`
+  // treat the operands as one concatenation — `nl`'s numbering runs on across the boundary.
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; wc -l f1 f2`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; wc f1 f2`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; wc -c f1 f1`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; head -1 f1 f2`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; tail -n 1 f1 f2`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; nl f1 f2`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; sort f1 f2`,
+  `printf 'ab\n' > f1; printf 'c\n' > f2; rev f1 f2`,
+  // `grep`'s flags, which were not read at all: an option it did not have became the *pattern*, so
+  // `grep -c a f` searched for `-c` and reported no match.
+  `printf 'a\nb\n' > f; grep a f`,
+  `printf 'a\nb\n' > f; grep -c a f`,
+  `printf 'a\nb\n' > f; grep -n a f`,
+  `printf 'a\nb\n' > f; grep -v a f`,
+  `printf 'a\nb\n' > f; grep -cv a f`,
+  `printf 'Apple\nbanana\napple\n' > f; grep -i apple f`,
+  `printf 'Apple\nbanana\napple\n' > f; grep -in a f`,
+  `printf 'Apple\napple\n' > f; grep -x apple f`,
+  `printf 'a\nb\n' > f; grep -q a f; echo status=$?`,
+  `printf 'a\nb\n' > f; grep -q z f; echo status=$?`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; grep a f1 f2`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; grep -c a f1 f2`,
+  // A file that cannot be read: each of these has GNU's own status for it, and three of the four
+  // concatenating programs carry on with what they could read where `sort` gives up.
+  `grep a missing; echo status=$?`,
+  `wc -l missing; echo status=$?`,
+  `head -1 missing; echo status=$?`,
+  `tail -1 missing; echo status=$?`,
+  `sort missing; echo status=$?`,
+  `uniq missing; echo status=$?`,
+  `rev missing; echo status=$?`,
+  `nl missing; echo status=$?`,
+  `wc -l missing1 missing2; echo status=$?`,
+  `printf 'c\n' > f2; nl missing f2; echo status=$?`,
+  `printf 'c\n' > f2; rev missing f2; echo status=$?`,
+  `printf 'c\n' > f2; sort missing f2; echo status=$?`,
+  `printf 'c\n' > f2; grep c missing f2; echo status=$?`,
+  `printf 'a\nb\n' > f; wc -l f missing; echo status=$?`,
+  `printf 'a\nb\n' > f; head -1 f missing; echo status=$?`,
+  // An option none of them has, refused rather than taken for something else. The statuses differ by
+  // program and are GNU's: 1 for `wc`, `head`, `tail`, `uniq`, `nl` and `rev`; 2 for `sort` and `grep`.
+  `echo x | wc -Z; echo status=$?`,
+  `echo x | sort -Z; echo status=$?`,
+  `echo x | grep -Y x; echo status=$?`,
+  `echo x | uniq -Z; echo status=$?`,
+  `echo x | head -Z; echo status=$?`,
+  `echo x | tail -Z; echo status=$?`,
+  `echo x | nl -Z; echo status=$?`,
+  `echo x | rev -Z; echo status=$?`,
 ].entries()) {
   // A directory per case, made by the harness rather than the script, so one failure cannot
   // leave a mess that changes what the next case sees.

@@ -16,7 +16,7 @@ All commands run from the repo root.
 
 ## The oracle is bash
 
-`test/differential.test.ts` runs 598 scripts through GNU bash and through this, and requires the
+`test/differential.test.ts` runs 652 scripts through GNU bash and through this, and requires the
 same standard output *and* the same exit status. For a shell that is the only test worth much:
 the behaviour is defined by what the real one does, and nearly every rule has a case where the
 obvious implementation is subtly wrong.
@@ -144,11 +144,32 @@ cat wc head tail rev sort uniq grep tr seq nl printf
 
 Those twelve exist because, when they were written, nothing could be started and nothing could be
 handed over. Both of those are now false, and they have become what the seam always said they
-were: a fallback. They are also visibly weaker than `box`'s — this `grep` matches substrings where
-`box`'s takes `-ivnc`, this `sort` is an insertion sort — so the sensible end state is to delete
-them once something checks that `box`'s pass the same differential scripts against bash. Kept for
-now because 598 of those scripts currently agree with bash *through these*, and swapping the
+were: a fallback. They are still weaker than `box`'s — this `grep` matches substrings rather than
+regular expressions, this `sort` is an insertion sort — so the sensible end state is to delete them
+once something checks that `box`'s pass the same differential scripts against bash. Kept for now
+because 652 of those scripts currently agree with bash *through these*, and swapping the
 implementation under a passing suite without measuring it first is how a green suite starts lying.
+
+**They read their operands**, which for nine of the twelve they did not: `wc`, `head`, `tail`,
+`sort`, `uniq`, `rev`, `nl` and `grep` ignored every file named on the command line and read standard
+input regardless. `wc -l f` printed `0` and exited `0`. `grep pattern f` printed nothing and exited
+1, which a script reads as "no match" rather than "the file was never opened". `cat` was the only one
+that had ever opened anything, and it is the reason `run` takes a `cwd` at all. Several operands
+change the shape of the answer and that shape is GNU's: `wc` names each file and totals them, `head`
+and `tail` write a `==> name <==` header per block, `grep` labels its lines, and `sort`, `nl` and
+`rev` treat the operands as one concatenation. A file that cannot be read carries each program's own
+status — 1 for most, 2 for `sort` and `grep` — and only `sort` gives up rather than answering over
+what it could read.
+
+**An option none of them has is refused.** It used to fall through to whatever the program did with a
+stray argument, which was never nothing: `grep -c a f` searched for `-c`, `sort -n` sorted as text,
+`wc -m` counted everything. `grep` now takes `-cinqvx`, `wc` `-lwc`, `sort` `-r`, `head`/`tail` the
+count in both spellings, and anything else is a usage error with GNU's status.
+
+Two deliberate differences remain, both refusals rather than approximations. `uniq f g` *writes* `g`
+in GNU; here it is refused, because a write nobody asked for is worse than a missing feature. And a
+diagnostic goes to standard error in one piece after the output rather than interleaved with it,
+which is the seam again — the fallback programs hand back two finished byte strings.
 
 **`tr` takes `-c`, `-d`, `-s` and `-t`**, interprets `\n`-style escapes and `[:alpha:]`-style
 classes, and *refuses* an option it does not have. It did none of that until bash was asked: `-d`
