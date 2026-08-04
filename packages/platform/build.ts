@@ -293,7 +293,12 @@ export async function buildApp(
  * sense.
  */
 async function place(text: string, out: string, executable: boolean): Promise<void> {
-  const partial = out + ".partial";
+  // Unique per call, not `out + ".partial"`. Two builds to the *same* destination happen under
+  // `--parallel` — the cache means they compute identical bytes, so the race is wasted work rather than
+  // a wrong answer — and with a shared temp name the loser was still holding the file the winner had
+  // just renamed into place. Exec'ing that is "Text file busy" (ETXTBSY), which failed a push gate on a
+  // test that had nothing to do with the change.
+  const partial = `${out}.${crypto.randomUUID()}.partial`;
   await Deno.writeTextFile(partial, text);
   if (executable) await Deno.chmod(partial, 0o755);
   await Deno.rename(partial, out);
