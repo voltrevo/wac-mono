@@ -453,6 +453,17 @@ export struct Stat {
 export struct Socket {
   i32 handle;      // negative when `error` is set
   string error;
+  /**
+   * Who is at the other end, for a socket that came from `accept`. Empty otherwise.
+   *
+   * The address only — `127.0.0.1`, or an IPv6 address without brackets — because the port a client
+   * dialled *from* is of no use to anyone and would invite string parsing at every call site.
+   *
+   * A server could not previously log who connected, rate-limit by source, or refuse a non-loopback
+   * peer. That last one is the check that makes a bind to every interface survivable, and it was not
+   * expressible: the address exists on the host side and was dropped at the boundary. wac-mono 0025.
+   */
+  string peer;
 
   /**
    * Declared here rather than left to bindgen, because the host builds these.
@@ -461,7 +472,12 @@ export struct Socket {
    * a generated identifier — so relying on it means the host reaches for a name no wac source
    * mentions. Two lines here and the capability world states its own construction API.
    */
-  Socket of(i32 handle, string error) { return Socket(handle, error); }
+  Socket of(i32 handle, string error, string peer) { return Socket(handle, error, peer); }
+
+  /** Whether the peer is this machine — the check a server on every interface needs. */
+  bool fromLoopback(const this) {
+    return this.peer == "127.0.0.1" || this.peer == "::1" || this.peer == "localhost";
+  }
 }
 
 /**
@@ -508,10 +524,23 @@ export struct Child {
    * right there and works. A missing capability is not a broken program.
    */
   i32 handle;
+  /**
+   * The child's *error* stream, as a handle of its own — `recv(errHandle)` reads it.
+   *
+   * A program has two output streams and a handle carries one, so a child needs two. Without this
+   * they were merged: a shell running `cat nosuch | wc -c` counted the error message, because the
+   * child's complaint arrived on the same handle as its output, and `cat nosuch` alone printed to
+   * *standard output*. Both are wrong in the same way, and a second handle rather than a second
+   * capability keeps everything that already works on handles working — `waitAny` most of all, which
+   * is what lets a parent watch a child's two streams and a socket together.
+   *
+   * Negative when `handle` is: there is nothing to read from a child that never started.
+   */
+  i32 errHandle;
   string error;
 
   /** As `Socket.of`: the host builds these, so the constructor is declared rather than generated. */
-  Child of(i32 handle, string error) { return Child(handle, error); }
+  Child of(i32 handle, i32 errHandle, string error) { return Child(handle, errHandle, error); }
 
   /** Whether this world can spawn at all. False says nothing about the program. */
   bool unavailable(const this) { return this.handle == -2; }
@@ -691,9 +720,21 @@ export struct Cli {
   /**
    * The network. `--allow-net`, and nothing without it.
    *
-   * `connect` resolves and dials; `listen` binds a port and `accept` blocks until someone
-   * arrives. `recv` answers with at most `CHUNK` bytes and with an empty array when the
+   * `connect` resolves and dials; `listen` binds an address and a port, and `accept` blocks until
+   * someone arrives. `recv` answers with at most `CHUNK` bytes and with an empty array when the
    * peer has closed — a short read means nothing, exactly as it does for a file.
+   *
+   * **`listen` takes the address to bind, and it is not optional.** It used to take a port alone and
+   * the host bound `0.0.0.0`, so every server written on this platform was reachable from every
+   * interface and no program could ask for loopback. For most servers that is a deployment surprise;
+   * for `packages/tor`'s SOCKS proxy it is the difference between serving the person at the keyboard
+   * and running an open proxy that sources strangers' traffic out of somebody else's exit node. Every
+   * other SOCKS implementation binds loopback for that reason, so the safe configuration was not only
+   * unavailable, it was the one people would assume they already had.
+   *
+   * `"127.0.0.1"` is loopback, `"0.0.0.0"` is every interface, and the empty string means *every
+   * interface* as well — the old behaviour, spelled out rather than defaulted into. A caller has to
+   * write one of them, which is the point: the surprising one is now a thing somebody typed.
    *
    * Watching two sockets at once is `waitAny` below, over the ids of two tickets in flight.
    * This comment used to say there was no way to do that and that "when something needs it,
@@ -701,7 +742,7 @@ export struct Cli {
    * further down, and contradicting it.
    */
   fn[Pending<Socket>(string, i32)] connect;
-  fn[Pending<Socket>(i32)] listen;
+  fn[Pending<Socket>(string, i32)] listen;
   fn[Pending<Socket>(i32)] accept;
   fn[Pending<Read>(i32)] recv;
   fn[Pending<bool>(i32, u8[])] send;
@@ -726,8 +767,8 @@ export struct Cli {
    * the child simply finds the capability denied. `GRANT_NONE` is the honest default and what
    * every example passes.
    *
-   *     cli.spawn(source, args, GRANT_NONE)                // stdin and stdout, nothing else
-   *     cli.spawn(source, args, GRANT_READ | GRANT_NET)     // ...if the parent has both
+   *     cli.spawn(source, args, GRANT_NONE, "", false)                 // fed; nothing else
+   *     cli.spawn(source, args, GRANT_READ | GRANT_NET, dir, true)     // ...if the parent has both
    *
    * This is the reason to prefer spawning a worker to spawning a process. What the child may
    * do is the *parent's* choice; `--allow-run=/bin/sh` cannot express it at any granularity,
@@ -743,8 +784,28 @@ export struct Cli {
    * worker can: it inherits the process's permissions, and dropping them needs an unstable
    * Deno flag that would appear in the shebang of every program that spawns. So this is a
    * composition and concurrency primitive rather than a sandbox. See wac-mono issue 0015.
+   *
+   * `cwd` is where the child's relative paths resolve from, and what its own `cwd()` reports. Empty
+   * means "wherever the host already was", which is what a program with no opinion wants. A shell
+   * has an opinion: without this, `cd sub; prog f` looked in the wrong place, because a spawned
+   * program inherited the *host's* directory rather than the shell's. `pushChild` took a directory
+   * from the start for exactly this reason and `spawn` did not.
+   *
+   * **`inheritIn` gives the child this program's own standard input** instead of the queue that
+   * `send` fills. Two things follow from it, and both are the difference between modelling a
+   * process and imitating one:
+   *
+   *   - it *streams*. A parent that feeds a child must first have the bytes, so `yes | sh -c
+   *     'head -1'` buffered without bound; an inherited input is read by the child as it goes, and
+   *     the child closing it ends the producer.
+   *   - it is *shared*. Two children that inherit read the same stream, so the second finds what
+   *     the first left — which is why `cat; cat` prints one line in every real shell and printed
+   *     two here. A shell cannot know how much a program read, and with this it does not have to.
+   *
+   * False is the ordinary case: a child fed from a pipeline, a redirection or a here-document gets
+   * exactly the bytes its parent chose, and `send` is how they arrive.
    */
-  fn[Pending<Child>(string, string[], i32)] spawn;
+  fn[Pending<Child>(string, string[], i32, string, bool)] spawn;
 
   /**
    * **This same program again, as a child**, with these arguments and at most these grants.
@@ -765,9 +826,12 @@ export struct Cli {
    * thing a person opened; a child is a program with a handle, and there is nowhere for it to draw.
    *
    * Grants are a ceiling of the parent's own, as with `spawn`: a shell that may read hands its
-   * children reading, and a program granted nothing cannot widen itself by spawning.
+   * children reading, and a program granted nothing cannot widen itself by spawning. `cwd` is where
+   * the child's relative paths resolve from, empty for the host's own directory, and `inheritIn`
+   * hands over this program's own standard input rather than a queue — see `spawn` above for what
+   * that buys.
    */
-  fn[Pending<Child>(string[], i32)] spawnSelf;
+  fn[Pending<Child>(string[], i32, string, bool)] spawnSelf;
 
   /**
    * End a spawned worker's standard input without stopping it.
@@ -856,13 +920,13 @@ export struct Cli {
     fn[Pending<string>()] outputError,
     fn[Pending<string>(string)] openOutput,
     fn[Pending<Socket>(string, i32)] connect,
-    fn[Pending<Socket>(i32)] listen,
+    fn[Pending<Socket>(string, i32)] listen,
     fn[Pending<Socket>(i32)] accept,
     fn[Pending<Read>(i32)] recv,
     fn[Pending<bool>(i32, u8[])] send,
     fn[void(i32)] closeSocket,
-    fn[Pending<Child>(string, string[], i32)] spawn,
-    fn[Pending<Child>(string[], i32)] spawnSelf,
+    fn[Pending<Child>(string, string[], i32, string, bool)] spawn,
+    fn[Pending<Child>(string[], i32, string, bool)] spawnSelf,
     fn[void(i32)] closeFeed,
     fn[Pending<i32>(i32)] exitCode,
     fn[Pending<string>()] cwd,

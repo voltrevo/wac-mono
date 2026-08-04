@@ -87,3 +87,59 @@ or `return` — with string literals stripped first, because the first attempt a
 One known false negative remains and is documented in the tool: a *local* of the same name used as
 a value counts, so `bitwriter.wac`'s `i32 masked` hides the exported `masked`. Distinguishing them
 needs the resolver rather than a regex. **The number is a floor, not a census.**
+
+## Progress, 2026-08-04 (agent-a)
+
+**55 → 38**, and most of the drop is the tool learning a shape rather than code being deleted.
+
+### The tool was wrong again, in the direction that gets a check switched off
+
+Two ways an export is called from TypeScript without any wac naming it, and both were reported dead:
+
+- **a by-name bridge entry.** `wacTransformStream({ …, entry: "upperCase" })` — so
+  `packages/stream`'s two transforms, which are the entire package, were "dead" while their tests ran
+  them.
+- **a method on a bound module.** `wacBind(...)` answers with a module and the caller writes
+  `mod.scanKeys(8, 10_000)`; the leading `.` was what the call regex deliberately excluded, so three
+  of `json/bench/lookup.wac`'s four entries looked dead while the bench measured them.
+
+Both now count. The search is narrow on purpose: `entry: "name"` anywhere, and `.name(` only in a file
+that mentions `wacBind` or `entry:`, so an unrelated TypeScript method of the same name is not mistaken
+for a caller. That is the third false-positive shape this check has had, and the note above was right
+that the answer is to fix the tool.
+
+### Fixed in the packages I am working in
+
+- `box/src/lib/lines.wac` — `mergeSort` deleted. `sort` is the only caller and always chooses a
+  comparison, because `sort -n` needs a different one; a wrapper that saves one argument for a caller
+  that does not want it documents nothing.
+- `box/src/lib/safe.wac` — `writeAtomic` deleted. `cp` and `sponge` both stream, which is the point of
+  the mutation tier: a copy that must fit in memory first is what `openOutput` exists to avoid.
+- `platform/src/platform.wac` — `FAULT_EXISTS` and `FAULT_NOT_EMPTY` **adopted**, which is the other
+  answer this issue offers. `box mkdir` over an existing directory now says "File exists" and
+  `box rmdir` of a non-empty one says "Directory not empty" — GNU's words, because the host's differ per
+  platform ("os error 17" under Deno, "already exists" in a browser) while the category does not. That
+  is what the fault numbers are for, and `box.test.ts` compares the reason against GNU's own stderr.
+
+### What is left, by file
+
+| `packages/tor/src/relay.wac` | 7 |
+| `packages/tor/src/cell.wac` | 5 |
+| `packages/bls/src/fp12.wac` | 3 |
+| `packages/gzip/bench/pushcost.wac` | 3 |
+| `packages/gzip/src/gzip.wac` | 3 |
+| `packages/wacc/src/lex.wac` | 3 |
+| `packages/bls/src/fp.wac` | 2 |
+| `packages/bls/src/fp2.wac` | 2 |
+| `packages/fmt/src/ftoa.wac` | 2 |
+| `packages/wacc/src/kinds.wac` | 2 |
+| `packages/zstd/src/castrepro.wac` | 2 |
+| `packages/gzip/src/inflate.wac` | 1 |
+| `packages/json/bench/lookup.wac` | 1 |
+| `packages/url/src/percent.wac` | 1 |
+| `packages/wacc/src/api.wac` | 1 |
+
+Not mine to touch: `bls` and `crypto` are agent-b's active work, `tor` is agent-c's, and `wacc`,
+`zstd`, `json`, `gzip` and `fmt` have owners who know which of the two answers applies. `gzip/bench/
+pushcost.wac` has no driver at all — no TypeScript names it — so its three are the "delete it" kind
+rather than a false positive.

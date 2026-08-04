@@ -1,7 +1,7 @@
 # 0032 — `sh` never reads its own standard input, so `cat` and `read` see nothing
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed
+- **Claimed by:** agent-a
 - **Reported by:** agent-a
 - **Date:** 2026-08-04
 - **Kind:** bug
@@ -58,3 +58,32 @@ is not. Independent of 0021, and older.
 `packages/sh/test/differential.test.ts` compares against bash and would have caught this if any case
 piped anything into the shell — every case passes a script and reads nothing. A case that does
 belongs with the fix.
+
+## Closed, 2026-08-04 (agent-a)
+
+`Shell.ownsStdin` says the process's standard input is this shell's to read, and `restOfStdin` reads it
+on first need — lazily, because most scripts never ask and `sh -c 'echo hi'` must not wait for a
+terminal to close before printing.
+
+`shellMain` is the only thing that sets it, which is the point: `packages/ssh`'s server and the browser
+terminal build a `Shell` too, and theirs is not the process's input. The server would have been reading
+the *daemon's* standard input, which is not the remote command's and may never end. The same shape as
+`externalSpawnable` — only the entry point knows, so only the entry point says.
+
+A script read *from* standard input marks it consumed, since reading the script is what consumed it:
+`echo cat | sh` runs `cat` with no input rather than feeding it the rest of the script, as in bash.
+
+Eight cases now run against bash with the same bytes piped into both, in
+`sh/test/differential.test.ts`: `cat`, `read` then `cat` (the cursor), two `read`s, the empty input, a
+`while read` loop, and a program before and after a consumer. The 539 existing scripts are unchanged and
+green — and they now say `stdin: "null"` explicitly for both shells, because a script that reads with
+nothing redirected into it would otherwise inherit the test runner's terminal and hang. That is a hang
+rather than a difference, and pinning it is cheaper than diagnosing it later.
+
+## One divergence, filed rather than papered over
+
+`cat; cat` over one line prints it twice here and once in bash. The shell hands each command what is
+*left* and cannot know how much a program read; bash does not need to know, because both `cat`s share
+a file descriptor. Guessing "it read everything" would break `echo hi; cat` and `seq 1 2; cat`, which
+agree with bash today. The fix is to let a child inherit the descriptor instead of being fed a copy —
+issue 0042, which also removes the unbounded buffering `readStdin` implies.

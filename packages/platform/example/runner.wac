@@ -33,7 +33,7 @@ export i32 main(Core core, Cli cli) {
   // commas, and nothing by default. The host will not exceed this program's own grants whatever
   // is asked for, which is the property `test/spawn.test.ts` measures rather than asserts.
   i32 grants = cli.argCount().wait() > 2 ? grantsOf(cli.arg(2).wait()) : GRANT_NONE;
-  Child kid = cli.spawn(string.fromBytes(prog.bytes), string[](), grants).wait();
+  Child kid = cli.spawn(string.fromBytes(prog.bytes), string[](), grants, "", false).wait();
   if (kid.handle < 0) {
     core.warn("runner: " + kid.error);
     return 1;

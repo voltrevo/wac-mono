@@ -193,11 +193,11 @@ Pending<string> fakeOpenOutput(string path) {
   return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
 }
 
-Socket resolveSocket(i32 id) { return Socket(-1, "no network"); }
+Socket resolveSocket(i32 id) { return Socket(-1, "no network", ""); }
 Pending<Socket> fakeConnect(string host, i32 port) {
   return Pending.of(0, resolveSocket, alwaysSettled, ignoreDrop);
 }
-Pending<Socket> fakeListen(i32 port) {
+Pending<Socket> fakeListen(string address, i32 port) {
   return Pending.of(0, resolveSocket, alwaysSettled, ignoreDrop);
 }
 Pending<Socket> fakeAccept(i32 handle) {
@@ -231,13 +231,15 @@ void fakeCloseSocket(i32 handle) {}
  * browser tab where a page cannot spawn.
  */
 Child resolveChild(i32 id) {
-  if (id > 0) { return Child(id, ""); }
-  if (id == -2) { return Child(-2, "no spawn in this world"); }
-  return Child(-1, "spawn not available");
+  // The error stream is a handle of its own; this fake answers end-of-input on every handle, so one
+  // more of them changes nothing here and keeps the shape honest.
+  if (id > 0) { return Child(id, id + 100, ""); }
+  if (id == -2) { return Child(-2, -2, "no spawn in this world"); }
+  return Child(-1, -1, "spawn not available");
 }
 i32 resolveId(i32 id) { return id; }
 
-Pending<Child> fakeSpawn(string source, string[] argv, i32 grants) {
+Pending<Child> fakeSpawn(string source, string[] argv, i32 grants, string cwd, bool inheritIn) {
   i32 handle = -1;
   if (source == "runnable") { handle = 7; }
   // Starts, then never reports a status — `exitCode` answers negative for it. The shell calls that
@@ -253,7 +255,7 @@ Pending<Child> fakeSpawn(string source, string[] argv, i32 grants) {
  * -2 is "there is no `spawn` here", the answer every world that cannot gives, and the one a caller is
  * expected to have another route for.
  */
-Pending<Child> fakeSpawnSelf(string[] argv, i32 grants) {
+Pending<Child> fakeSpawnSelf(string[] argv, i32 grants, string cwd, bool inheritIn) {
   return Pending.of(-2, resolveChild, alwaysSettled, ignoreDrop);
 }
 void fakeCloseFeed(i32 handle) {}
@@ -364,7 +366,7 @@ export i32 shTouchStubs() {
   if (c.remove("d", true).wait().ok()) { n++; }
   if (c.rename("a", "b").wait().ok()) { n++; }
   n += c.openInput("x").wait().len() + c.openOutput("x").wait().len();
-  n += c.connect("h", 1).wait().handle + c.listen(1).wait().handle + c.accept(1).wait().handle;
+  n += c.connect("h", 1).wait().handle + c.listen("127.0.0.1", 1).wait().handle + c.accept(1).wait().handle;
   if (c.send(1, u8[0]()).wait()) { n++; }
   c.closeSocket(1);
 

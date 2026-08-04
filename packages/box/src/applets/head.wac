@@ -7,7 +7,8 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
-import { Line, Lines, emit, nextLine } from "../lib/reader.wac";
+import { Line, Lines, emitTo, nextLine } from "../lib/reader.wac";
+import { Sink } from "../lib/out.wac";
 
 export i32 head(Core core, Cli cli, Args a) {
   Input in = openStream(core, cli, a, 0);
@@ -16,10 +17,12 @@ export i32 head(Core core, Cli cli, Args a) {
   i32 want = a.hasNum ? a.num : 10;
 
   Lines s = Lines.create();
+  Sink out = Sink.create(cli);
   for (i32 i = 0; i < want; i++) {
     Line l = nextLine(s, cli);
     if (!l.ok) { break; }
-    emit(cli, l.bytes, l.nl);
+    if (!emitTo(out, l.bytes, l.nl)) { return 0; }
   }
+  out.flush();
   return 0;
 }

@@ -24,7 +24,8 @@ export i32 httpd(Core core, Cli cli, Args a) {
   i32 port = a.num == 0 ? 8080 : a.num;
   string root = a.rest.len() > 0 ? a.rest[0] : ".";
 
-  Socket l = cli.listen(port).wait();
+  // Every interface, which is what a web server people point a browser at is for. Issue 0025.
+  Socket l = cli.listen("", port).wait();
   if (l.handle < 0) { core.warn(a.name + ": " + itoa(port) + ": " + l.error); return 1; }
   // The same phrase `serve` prints, deliberately: it is what a caller waits for to know
   // the port is up, and two spellings for it meant a test hung instead of failing.

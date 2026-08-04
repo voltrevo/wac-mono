@@ -454,17 +454,61 @@ Deno.test("the browser world refuses what a page cannot do", async () => {
   assertEquals((await call(OP.ENV, str("PATH")))[0], 0, "every variable is unset");
 });
 
-/** The payload `spawn` takes: grants, then the source length-prefixed, then NUL-joined arguments. */
-function spawnPayload(source: string, args: string[], grants = 0): Uint8Array {
+/**
+ * The payload `spawn` takes: grants, the source, the arguments, the child's directory.
+ *
+ * Length-prefixed the way `provider.ts` writes it and `children.ts` reads it. Written out here rather
+ * than imported because this test is checking the *host*, and a test that built its input with the
+ * same helper the host parses with would agree with itself about the format.
+ */
+function spawnPayload(
+  source: string,
+  args: string[],
+  grants = 0,
+  cwd = "",
+  inheritIn = false,
+): Uint8Array {
   const src = str(source);
   const rest = str(args.join("\u0000"));
-  const out = new Uint8Array(8 + src.length + rest.length);
+  const dir = str(cwd);
+  const out = new Uint8Array(17 + src.length + rest.length + dir.length);
   out.set(i32le(grants), 0);
   out.set(i32le(src.length), 4);
   out.set(src, 8);
-  out.set(rest, 8 + src.length);
+  out.set(i32le(rest.length), 8 + src.length);
+  out.set(rest, 12 + src.length);
+  out.set(i32le(dir.length), 12 + src.length + rest.length);
+  out.set(dir, 16 + src.length + rest.length);
+  // One byte: whether the child reads the page's own standard input rather than a queue. Issue 0042.
+  out[16 + src.length + rest.length + dir.length] = inheritIn ? 1 : 0;
   return out;
 }
+
+Deno.test("a failed read says what a failed change says", async () => {
+  // One tab should not speak with two voices. A change reports through `Change`, whose category the
+  // host turns into a short phrase; a read reports by *throwing*, and its message went out as the
+  // `DOMException`'s own prose — so `rm nosuchfile` said "no such file or directory" while
+  // `cat nosuchfile` said "A requested file or directory could not be found at the time an operation
+  // was processed." Found by driving the terminal, not by reading the code.
+  const w = browserWorld({ root: memDir() });
+  let said = "";
+  try {
+    await w[OP.READ_FILE](str("nothing-here")) as Uint8Array;
+  } catch (e) {
+    said = e instanceof Error ? e.message : String(e);
+  }
+  assertEquals(said, "no such file or directory", said);
+
+  // `openInput` reports the same failure as a message rather than a throw, one layer up, and has to
+  // agree with it.
+  let opened = "";
+  try {
+    await w[OP.OPEN_INPUT](str("nothing-here")) as Uint8Array;
+  } catch (e) {
+    opened = e instanceof Error ? e.message : String(e);
+  }
+  assertEquals(opened, "no such file or directory", opened);
+});
 
 Deno.test("a page spawns a worker of its own — 0030", async () => {
   // The unit of this is the *plumbing*: a worker is created, its load notice is waited for, its
@@ -478,7 +522,11 @@ Deno.test("a page spawns a worker of its own — 0030", async () => {
   `;
   const spawned = await w[OP.SPAWN](spawnPayload(child, ["one"])) as Uint8Array;
   const handle = readI32le(spawned);
-  assertEquals(handle >= 1, true, `a handle, not ${handle}: ${unstr(spawned.subarray(4))}`);
+  const errHandle = readI32le(spawned.subarray(4));
+  assertEquals(handle >= 1, true, `a handle, not ${handle}: ${unstr(spawned.subarray(8))}`);
+  // Two handles: a program has two output streams, and merging them made a shell count an error
+  // message in `cat nosuch | wc -c`. Both are readable with `recv`, because a handle is a handle.
+  assertEquals(errHandle >= 1 && errHandle !== handle, true, `a second handle, not ${errHandle}`);
   const code = readI32le(await w[OP.EXIT_CODE](i32le(handle)) as Uint8Array);
   assertEquals(code, 7, "the child's own exit code");
 
@@ -486,7 +534,8 @@ Deno.test("a page spawns a worker of its own — 0030", async () => {
   // page down with it — the same contract the Deno host has. Issue 0021.
   const bad = await w[OP.SPAWN](spawnPayload("this is not javascript {{{", [])) as Uint8Array;
   assertEquals(readI32le(bad), -1, "would not start");
-  assertEquals(unstr(bad.subarray(4)).length > 0, true, "and says why");
+  assertEquals(readI32le(bad.subarray(4)), -1, "and has no error stream to read either");
+  assertEquals(unstr(bad.subarray(8)).length > 0, true, "and says why");
 });
 
 Deno.test("the browser world denies the filesystem when the page grants none", async () => {

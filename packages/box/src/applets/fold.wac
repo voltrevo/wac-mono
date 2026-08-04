@@ -3,7 +3,8 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
-import { Line, Lines, emit, nextLine } from "../lib/reader.wac";
+import { Line, Lines, emitTo, nextLine } from "../lib/reader.wac";
+import { Sink } from "../lib/out.wac";
 import { slice } from "../lib/bytes.wac";
 
 export i32 fold(Core core, Cli cli, Args a) {
@@ -12,16 +13,17 @@ export i32 fold(Core core, Cli cli, Args a) {
   i32 width = a.hasNum ? a.num : 80;
 
   Lines s = Lines.create();
+  Sink out = Sink.create(cli);
   while (true) {
     Line l = nextLine(s, cli);
-    if (!l.ok) { return 0; }
+    if (!l.ok) { out.flush(); return 0; }
     u8[] line = l.bytes;
-    if (line.len() == 0) { emit(cli, line, l.nl); continue; }
+    if (line.len() == 0) { emitTo(out, line, l.nl); continue; }
     i32 start = 0;
     while (start < line.len()) {
       i32 end = start + width < line.len() ? start + width : line.len();
       // Only the piece that ends the line keeps the line's own terminator.
-      emit(cli, slice(line, start, end), end < line.len() ? true : l.nl);
+      emitTo(out, slice(line, start, end), end < line.len() ? true : l.nl);
       start = end;
     }
   }

@@ -12,6 +12,7 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { atoi, itoa } from "../lib/num.wac";
+import { Sink } from "../lib/out.wac";
 
 export i32 seq(Core core, Cli cli, Args a) {
   // Read positionally, not from `a.rest`, and that is forced rather than preferred: to box's
@@ -54,10 +55,16 @@ export i32 seq(Core core, Cli cli, Args a) {
   if ((by > 0 && span < 0) || (by < 0 && span > 0)) { return 0; }   // empty range
   i64 count = span / by + 1;
 
+  // Buffered, because a `write` per line is a park and a wake per line: this took 14.5 seconds for
+  // two hundred thousand numbers and takes a fraction of a second now. Issue 0039.
+  Sink out = Sink.create(cli);
   i32 value = first;
   for (i64 k = 0; k < count; k++) {
-    core.log(itoa(value));
+    // The answer is not decoration: `seq 1 100000000 | head -1` ends here rather than counting to a
+    // hundred million into a pipe nobody is reading.
+    if (!out.line(itoa(value))) { return 0; }
     value = value + step;
   }
+  out.flush();
   return 0;
 }

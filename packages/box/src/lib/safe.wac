@@ -9,21 +9,12 @@
 
 import { Change, Cli, Core, FAULT_OTHER } from "../../../platform/src/platform.wac";
 
-/**
- * `bytes` at `path`, atomically. The `Change` says which step failed, and why.
- *
- * The temporary name is random because two copies of this program running at once must
- * not pick the same one — the whole point is to be safe under concurrency, and a fixed
- * `.tmp` suffix would trade one race for another.
- */
-export Change writeAtomic(Core core, Cli cli, string path, u8[] bytes) {
-  string tmp = tempName(core, path);
-  Change wrote = cli.writeFile(tmp, bytes).wait();
-  // The temporary is the failure, but the *path* the caller asked about is the one worth naming, so
-  // the fault is passed on as it arrived rather than re-worded around a name nobody chose.
-  if (!wrote.ok()) { return wrote; }
-  return finish(cli, tmp, path);
-}
+// There was a `writeAtomic(core, cli, path, bytes)` here — the whole-buffer form of the same
+// dance — and nothing ever called it. `cp` and `sponge` both stream, which is the point of the
+// mutation tier: a copy that has to fit in memory first is the thing `openOutput` exists to avoid.
+// Deleted rather than kept for a caller that has not appeared in the life of the package (issue 0009).
+// The temporary name is random for the reason `streamAtomic` gives below: two copies of this program
+// running at once must not pick the same one.
 
 /**
  * Everything left of the current input, to `path`, atomically and a chunk at a time.

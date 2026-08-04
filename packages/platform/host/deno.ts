@@ -5,11 +5,21 @@
 // know the difference.
 
 import { type Handlers, serveHostCalls } from "./respond.ts";
-import { ByteQueue, type Child, failedChild, noSpawnHere, spawnChild } from "./children.ts";
+import {
+  ByteQueue,
+  type Child,
+  failedChild,
+  noSpawnHere,
+  spawnChild,
+  twoHandles,
+  unpackSpawn,
+  unpackSpawnSelf,
+  want,
+} from "./children.ts";
 import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
-import { ChildStack, packCaptured, unpackPush } from "./child.ts";
+import { ChildStack, joinPath, packCaptured, unpackPush } from "./child.ts";
 import { changeBytes, changed, FAULT_DENIED } from "./faults.ts";
 
 export type DenoWorldOptions = {
@@ -35,6 +45,14 @@ export type DenoWorldOptions = {
   /** Where exact bytes on the *error* stream go. A spawned world sends both to its parent. */
   writeErr?(bytes: Uint8Array): void;
   /**
+   * Where this world's relative paths resolve from, and what `cwd` reports.
+   *
+   * A *spawned child* is the caller of this: a shell that has done `cd sub` starts its children
+   * there, which is the difference between `cd sub; prog f` reading `sub/f` and reading `f`. Absent
+   * means the process's own directory.
+   */
+  cwd?: string;
+  /**
    * This program's own worker bundle, for `spawnSelf`.
    *
    * Passed by the launcher, which has it because it is what started the program. Absent means
@@ -43,6 +61,14 @@ export type DenoWorldOptions = {
    */
   selfSource?: string;
   readStdin?(): Promise<Uint8Array>;
+  /**
+   * One chunk of standard input, for `readChunk` and `recv(0)`.
+   *
+   * Separate from `readStdin` because they promise different things — everything, and something —
+   * and for a spawned child the difference is the difference between sorting its input and sorting
+   * the first line of it.
+   */
+  readStdinChunk?(): Promise<Uint8Array>;
 };
 
 const EMPTY = new Uint8Array(0);
@@ -102,6 +128,26 @@ async function writeAllStdout(bytes: Uint8Array): Promise<void> {
   while (at < bytes.length) at += await Deno.stdout.write(bytes.subarray(at));
 }
 
+/**
+ * A handle and the peer's address, which is what `Socket` decodes.
+ *
+ * `connect` and `listen` answer with the handle alone; only `accept` has a peer to name. The shape is
+ * the same either way, so the worker side reads one i32 and takes whatever follows as the address.
+ */
+function withPeer(handle: number, peer: string): Uint8Array {
+  const text = new TextEncoder().encode(peer);
+  const out = new Uint8Array(4 + text.length);
+  new DataView(out.buffer).setInt32(0, handle, true);
+  out.set(text, 4);
+  return out;
+}
+
+/** The address at the other end, or empty where the runtime does not say. */
+function peerOf(conn: Deno.Conn): string {
+  const addr = conn.remoteAddr;
+  return addr.transport === "tcp" || addr.transport === "udp" ? addr.hostname : "";
+}
+
 async function writeAllStderr(bytes: Uint8Array): Promise<void> {
   let at = 0;
   while (at < bytes.length) at += await Deno.stderr.write(bytes.subarray(at));
@@ -130,6 +176,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   const writeErrOut = opts.writeErr;
   const selfSource = opts.selfSource;
   const readIn = opts.readStdin;
+  const readChunkIn = opts.readStdinChunk ?? opts.readStdin;
 
   /**
    * Start a child on `source`, with `want` narrowed to this world's own authority.
@@ -142,16 +189,18 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   const startChild = async (
     source: string,
     childArgs: string[],
-    want: number,
+    wanted: number,
+    childCwd: string,
+    inheritIn: boolean,
   ): Promise<Uint8Array> => {
     const give = {
-      read: (want & GRANT_READ) !== 0 && opts.fs?.read === true,
-      write: (want & GRANT_WRITE) !== 0 && opts.fs?.write === true,
-      net: (want & GRANT_NET) !== 0 && opts.net === true,
-      env: (want & GRANT_ENV) !== 0 && opts.env !== undefined,
+      read: (wanted & GRANT_READ) !== 0 && opts.fs?.read === true,
+      write: (wanted & GRANT_WRITE) !== 0 && opts.fs?.write === true,
+      net: (wanted & GRANT_NET) !== 0 && opts.net === true,
+      env: (wanted & GRANT_ENV) !== 0 && opts.env !== undefined,
     };
     const h = nextHandle++;
-    const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
+    const child = spawnChild(source, childArgs, (sab, cargs, out, input, cerr) => {
       const enc = new TextEncoder();
       return serveHostCalls(bridgeOf(sab), denoWorld({
         args: cargs,
@@ -163,14 +212,32 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
         // A line of output is bytes on the handle, with the newline `log` implies. The parent
         // cannot tell `log` from `write` — nor can a pipe, which is the point.
         log: (l: string) => out.push(enc.encode(l + "\n")),
-        warn: (l: string) => out.push(enc.encode(l + "\n")),
-        write: (b: Uint8Array) => out.push(b),
-        // The child has one stream back to its parent, which is what `recv(handle)` reads. Its
-        // error output joins it in the order it was written rather than being dropped.
-        writeErr: (b: Uint8Array) => out.push(b),
-        readStdin: () => input.next(),
+        // ...and its error output goes to the *other* stream, which `recv(errHandle)` reads. A
+        // program has two, and merging them made a shell count an error message in `cat x | wc -c`.
+        warn: (l: string) => cerr.push(enc.encode(l + "\n")),
+        // A full queue has to *fail* the write, or a program written to stop when the other end
+        // goes away never learns: `box yes` is `while (cli.write(block)) {}`. Throwing is how the
+        // host says false — the same shape `pushChild`'s cap uses.
+        write: (b: Uint8Array) => {
+          if (!out.push(b)) throw new Error("the child's output is not being read");
+        },
+        writeErr: (b: Uint8Array) => { cerr.push(b); },
+        // `readStdin` means *all* of it, which for a child means waiting for its input to end: the
+        // bytes arrive over time. Serving it with one chunk made `seq 1 5 | sort -r` print `1`, since
+        // `sort` reads to the end before sorting. `readChunk` and `recv` still take one chunk.
+        // **An inheriting child reads the real thing.** Leaving these out is what hands it over: a
+        // world with no `readStdin` option falls back to the process's own input, so the child reads
+        // the same stream its parent would have — streaming rather than buffered, and *shared*, which
+        // is why `cat; cat` sees one line between them rather than one each. Issue 0042.
+        ...(inheritIn ? {} : {
+          readStdin: () => input.rest(),
+          readStdinChunk: () => input.next(),
+        }),
         // So that a child can run itself as well: the bundle is the same one.
         selfSource: opts.selfSource,
+        // Where its relative paths resolve from, and what its own `cwd()` reports. Empty means the
+        // host's own directory, which is what a caller with no opinion passes.
+        cwd: childCwd === "" ? opts.cwd : childCwd,
       }));
     }, newBridge);
 
@@ -180,8 +247,12 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       child.kill();
       return failedChild(why);
     }
+    // Two handles for one child: its output and its error stream. Numbered from the same counter, so
+    // `waitAny` can watch both beside a socket without knowing which is which.
+    const eh = nextHandle++;
     children.set(h, child);
-    return i32le(h);
+    errStreams.set(eh, child.err);
+    return twoHandles(h, eh, "");
   };
 
   // The current streaming input. One at a time rather than a handle per file, because the
@@ -213,6 +284,14 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   // Children share the handle space with sockets, so `recv`, `send` and `waitAny` need no
   // idea which they are holding — which is the whole reason a child is a handle.
   const children = new Map<number, Child>();
+  /**
+   * A child's error stream, by its own handle.
+   *
+   * Separate from `children` because it is a separate stream, and reading it is `recv` like anything
+   * else — a handle is a handle, which is what lets `waitAny` watch a child's two streams and a
+   * socket in one call.
+   */
+  const errStreams = new Map<number, ByteQueue>();
   let nextHandle = 1;
 
   // A program running inside this one: what it reads, what it writes, and where it stands.
@@ -221,7 +300,9 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   // `write` answers a bool and cannot carry a reason, so this is recorded for `outputError`. The
   // reads no longer need an equivalent: `Read` carries theirs.
   let outputFailure = "";
-  const P = (path: string) => kids.path(path);
+  // A path as this world means it: a pushed child's directory first, then this world's own. Both are
+  // the same join — `joinPath` leaves an absolute path alone and ignores an empty base.
+  const P = (path: string) => joinPath(opts.cwd ?? "", kids.path(path));
 
   return {
     [OP.NOW_MILLIS]: () => i64le(BigInt(Date.now())),
@@ -235,7 +316,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     // A read of where the host resolves relative paths. Not granted: it names a directory
     // rather than opening one, and a program that cannot read a file there learns nothing
     // useful from its name.
-    [OP.CWD]: () => str(Deno.cwd()),
+    [OP.CWD]: () => str(opts.cwd !== undefined && opts.cwd !== "" ? opts.cwd : Deno.cwd()),
     [OP.SLEEP_MILLIS]: (p) =>
       new Promise<Uint8Array>((ok) =>
         setTimeout(() => ok(i64le(BigInt(Math.round(performance.now() * 1e6)))), readI32le(p))
@@ -402,8 +483,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       // standard input, which would let a filter inside a shell swallow the terminal.
       const fed = source === null ? kids.readChunk() : null;
       if (fed !== null) return fed.length === 0 ? END : data(fed);
-      if (source === null && readIn !== undefined) {
-        const piped = await readIn();
+      if (source === null && readChunkIn !== undefined) {
+        const piped = await readChunkIn();
         return piped.length === 0 ? END : data(piped);
       }
       try {
@@ -439,9 +520,18 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       sockets.set(h, conn);
       return i32le(h);
     },
+    /**
+     * Bind an address and a port. See `listen` in platform.wac for why the address is a parameter.
+     *
+     * An empty address means every interface, which is what `Deno.listen` does with no hostname and
+     * what this did unconditionally before. `"127.0.0.1"` is the one a program can now ask for.
+     */
     [OP.LISTEN]: (p) => {
       if (!opts.net) deny("network access");
-      const l = Deno.listen({ port: readI32le(p) });
+      const address = unstr(p.subarray(4));
+      const l = Deno.listen(
+        address === "" ? { port: readI32le(p) } : { hostname: address, port: readI32le(p) },
+      );
       const h = nextHandle++;
       listeners.set(h, l);
       return i32le(h);
@@ -452,15 +542,17 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       const conn = await l.accept();
       const h = nextHandle++;
       sockets.set(h, conn);
-      return i32le(h);
+      // The peer's address travels with the handle, so a server can log it, rate-limit by it, or
+      // refuse a connection that did not come from this machine. It was dropped here before.
+      return withPeer(h, peerOf(conn));
     },
     [OP.RECV]: async (p) => {
       const h = readI32le(p);
       // Handle 0 is standard input. Handles count from 1, so it can never be a socket, and
       // giving stdin one means `waitAny` can watch it beside a socket — which is what a
       // relay like `nc` needs and could not express while stdin was only `readChunk`.
-      if (h === STDIN_HANDLE && readIn !== undefined) {
-        const piped = await readIn();
+      if (h === STDIN_HANDLE && readChunkIn !== undefined) {
+        const piped = await readChunkIn();
         return piped.length === 0 ? END : data(piped);
       }
       const into = fresh();
@@ -472,6 +564,11 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       if (kid !== undefined) {
         const fromChild = await kid.out.next();
         return fromChild.length === 0 ? END : data(fromChild);
+      }
+      const complaint = errStreams.get(h);
+      if (complaint !== undefined) {
+        const said = await complaint.next();
+        return said.length === 0 ? END : data(said);
       }
       const c = sockets.get(h);
       if (c === undefined) return failed("not an open socket");
@@ -508,6 +605,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       sockets.delete(h);
       listeners.delete(h);
       children.delete(h);
+      errStreams.delete(h);
       return EMPTY;
     },
 
@@ -529,11 +627,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
      * started, which is what `Child.error` is for. wac-mono issue 0021.
      */
     [OP.SPAWN]: (p) => {
-      const want = readI32le(p);
-      const n = readI32le(p.subarray(4));
-      const source = unstr(p.subarray(8, 8 + n));
-      const rest = unstr(p.subarray(8 + n));
-      return startChild(source, rest.length === 0 ? [] : rest.split("\u0000"), want);
+      const { source, args, cwd, inheritIn } = unpackSpawn(p);
+      return startChild(source, args, want(p), cwd, inheritIn);
     },
 
     /**
@@ -543,12 +638,11 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
      * child spawned this way is handed it too, so a program that runs itself can go on doing so.
      */
     [OP.SPAWN_SELF]: (p) => {
-      const want = readI32le(p);
-      const rest = unstr(p.subarray(4));
       if (selfSource === undefined) {
         return noSpawnHere("this launcher did not pass the program its own source");
       }
-      return startChild(selfSource, rest.length === 0 ? [] : rest.split("\u0000"), want);
+      const { args, cwd, inheritIn } = unpackSpawnSelf(p);
+      return startChild(selfSource, args, want(p), cwd, inheritIn);
     },
 
     [OP.CLOSE_FEED]: (p) => {

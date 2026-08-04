@@ -20,7 +20,8 @@ import { Option } from "../../std/src/option.wac";
 import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Read } from "../../bytes/src/read.wac";
-import { Change, Child, Cli, Core, FileResult, GRANT_NONE, Stat }
+import { Change, Child, Cli, Core, FAULT_EXISTS, FAULT_NOT_EMPTY, FAULT_NOT_FOUND, FileResult,
+  GRANT_ENV, GRANT_NET, GRANT_NONE, GRANT_READ, GRANT_WRITE, Pending, Stat }
   from "../../platform/src/platform.wac";
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
@@ -84,6 +85,22 @@ export struct Shell {
   fn[string[]()] externalNames;
 
   /**
+   * Whether `externalNames` are applets of *this very program*, so they can be spawned rather than
+   * called.
+   *
+   * Set by whoever wires `external`, because only they know: `packages/box`'s `main` dispatches on
+   * its first argument, so `spawnSelf(["sort", "-n"])` runs `sort` in a worker of its own — but a
+   * standalone `sh` whose `main` is the shell would spawn *another shell* and hand it a script named
+   * `sort`. The shell cannot tell those apart and does not guess.
+   *
+   * True is the better answer wherever it is true, because an applet spawned is a real program: its
+   * own instance, its own grants, and — once pipelines run their stages at once — actually concurrent.
+   * An applet *called* is the same wasm instance with the same authority, which is convenient and is
+   * not a boundary. False, or a world that cannot spawn, and the call is exactly what it was.
+   */
+  bool externalSpawnable;
+
+  /**
    * Every name ever set, so the table can be copied.
    *
    * `Map` offers no iteration, and a subshell has to start from a *copy* of its parent's
@@ -115,6 +132,22 @@ export struct Shell {
   u8[] stdinBytes;
   i32 stdinPos;
   /**
+   * Whether this shell's standard input is *the program's* standard input, to be read on first need.
+   *
+   * False by default, and that is the safe direction. A shell embedded in something else does not own
+   * the process's input: `packages/ssh`'s server would be reading the daemon's own standard input,
+   * which is not the remote command's and may never end; the browser terminal has none at all. Only
+   * an entry point invoked *as* a shell can say this, so `shellMain` sets it and nothing else does —
+   * the same shape as `externalSpawnable`.
+   *
+   * Without it, `printf x | sh -c 'cat'` printed nothing: `stdinBytes` was only ever filled by a
+   * redirection, a here-document or a pipeline, so a command asking for the shell's input got an empty
+   * array and every applet dutifully reported nothing. Issue 0032.
+   */
+  bool ownsStdin;
+  /** Whether the read below has already happened. `readStdin` answers once and is empty after. */
+  bool triedStdin;
+  /**
    * Where this shell believes it is.
    *
    * The shell's own, not the host's: `packages/platform` has a `cwd` to *read* and deliberately
@@ -131,9 +164,10 @@ export struct Shell {
     // guess. A browser answers "/" — the root of its Origin Private File System — which is the
     // true answer there rather than a stand-in.
     return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
-                 false, Buf.create(), noExternal, noExternalNames, Vec.create(),
+                 false, Buf.create(), noExternal, noExternalNames, false, Vec.create(),
                  Map.create(hashString, stringEq),
-                 Vec.create(), Vec.create(), false, u8[0](), 0, cli.cwd().wait());
+                 Vec.create(), Vec.create(), false, u8[0](), 0, false, false,
+                 cli.cwd().wait());
   }
 
   /**
@@ -161,9 +195,35 @@ export struct Shell {
     if (this.capture) { this.errOut.pushAll(bytes); } else { this.cli.writeErr(bytes); }
   }
 
-  /** What standard input still has to offer. */
-  u8[] restOfStdin(const this) {
+  /**
+   * What standard input still has to offer, reading the program's own on first need.
+   *
+   * Lazy rather than read at startup, because most scripts never ask: `sh -c 'echo hi'` should not
+   * wait for a terminal to be closed before it can print. It is read *once* — `readStdin` answers with
+   * everything and is empty afterwards — and only when this shell owns it.
+   *
+   * A shell attached to a terminal does block here, on a `cat` with nothing piped in, exactly as bash
+   * does: `cat` waits for end of input, and that is the program working rather than the shell hanging.
+   */
+  u8[] restOfStdin(this) {
+    this.ensureStdin();
     return sliceBytes(this.stdinBytes, this.stdinPos, this.stdinBytes.len());
+  }
+
+  /**
+   * Pull the program's standard input in, if this shell owns it and has not already.
+   *
+   * Separate from `restOfStdin` because `read` walks `stdinBytes` and `stdinPos` itself — it has to,
+   * since it consumes a line and leaves the rest — so it needs the input *loaded* without wanting a
+   * slice of it. Calling only `restOfStdin` left `read` looking at an empty array while a `cat` after
+   * it saw everything, which is neither the old behaviour nor bash's.
+   */
+  void ensureStdin(this) {
+    if (this.ownsStdin && !this.triedStdin && this.stdinPos >= this.stdinBytes.len()) {
+      this.triedStdin = true;
+      this.stdinBytes = this.cli.readStdin().wait();
+      this.stdinPos = 0;
+    }
   }
 
   /** Set a variable, remembering the name so the table can be copied later. */
@@ -298,19 +358,272 @@ void runAndOr(Shell sh, AndOr list) {
 }
 
 /**
- * Run a pipeline, feeding each stage's output to the next.
+ * Run a pipeline — every stage at once where that is possible, and one at a time otherwise.
  *
- * Sequentially and in memory, which is not what a shell does: a real pipeline runs its stages at
- * once, so `yes | head -1` finishes. Here every stage runs to completion first. The difference is
- * invisible for finite inputs and total for infinite ones.
+ * `seq 1 200000 | head -1` used to take twelve seconds, because each stage ran to completion and
+ * handed its whole output to the next. A real shell returns at once: `head` closing its input is what
+ * stops `seq`. The difference is invisible for small inputs and total for endless ones — `yes | head`
+ * only ended at all because a queue nobody reads is capped at 8 MiB. Issue 0038.
+ *
+ * Streaming needs every stage to be a real program, which is why this could not be done until a
+ * program could spawn *itself*: `packages/box`'s applets were function calls inside the shell's own
+ * instance, and a function call cannot run beside another one. `canStream` is the test, and anything
+ * it refuses — a builtin, a function, a compound, a redirection — takes the sequential path, which is
+ * unchanged and still correct.
  */
 void runPipeline(Shell sh, Pipeline pipeline) {
+  if (canStream(sh, pipeline)) {
+    streamPipeline(sh, pipeline);
+    return;
+  }
   u8[] carried = u8[0]();
   for (i32 i = 0; i < pipeline.stages.len(); i++) {
     bool last = i == pipeline.stages.len() - 1;
     carried = runCommand(sh, pipeline.stages.get(i), carried, last);
     if (sh.exiting) { return; }
   }
+}
+
+/**
+ * Whether every stage of this pipeline is a program that can be spawned.
+ *
+ * Decided from the *parse tree*, before anything is expanded, and that is deliberate: expansion runs
+ * command substitutions, so asking twice would run them twice. So the command word of each stage has
+ * to be a plain literal — `sort`, not `$cmd` — which every pipeline anybody types is.
+ *
+ * Everything refused here still works; it takes the sequential path. A builtin cannot be spawned
+ * because it is the shell itself (`cd` in a child would change nothing); a function cannot because it
+ * lives in this shell's own table; a redirection or a prefix assignment changes what a stage reads and
+ * writes, and getting that wrong is worse than not streaming.
+ */
+bool canStream(Shell sh, Pipeline pipeline) {
+  if (pipeline.stages.len() < 2) { return false; }
+  if (!sh.externalSpawnable) { return false; }
+  for (i32 i = 0; i < pipeline.stages.len(); i++) {
+    Command cmd = pipeline.stages.get(i);
+    bool plain = false;
+    match (cmd.kind) {
+      case Plain: { plain = true; }
+      else: {}
+    }
+    if (!plain) { return false; }
+    Simple simple = cmd.simple;
+    if (simple.redirs.len() > 0 || simple.assigns.len() > 0) { return false; }
+    if (simple.words.len() == 0) { return false; }
+    Word first = simple.words.get(0);
+    if (first.parts.len() != 1) { return false; }
+    Part only = first.parts.get(0);
+    bool literal = false;
+    match (only.kind) {
+      case Lit: { literal = true; }
+      else: {}
+    }
+    if (!literal) { return false; }
+    if (!spawnableName(sh, only.text)) { return false; }
+  }
+  return true;
+}
+
+/**
+ * Run every stage at once, moving bytes between them as they arrive.
+ *
+ * The shape is `packages/box/src/applets/nc.wac`'s relay, widened: one `recv` in flight per open
+ * stream, `waitAny` over all of them, and whichever answers is served and re-armed. Two streams per
+ * stage — its output and its error output are separate handles — so a complaint never lands in the
+ * pipe. Standard error goes where the shell's own does, in the order it arrives.
+ *
+ * **What makes it terminate.** When a stage's output ends, the stage before it has nowhere left to
+ * write, so it is stopped: that is `head -1` ending `seq`, and it is what a pipe does with `SIGPIPE`.
+ * Without it `yes | head -1` would fill the 8 MiB cap and stop there instead — right answer, wrong
+ * reason, and eleven seconds slower.
+ *
+ * The status of a pipeline is its last stage's, as in bash. A stage stopped early has no status worth
+ * reading, and its own exit code is discarded rather than reported as a failure of the script.
+ */
+void streamPipeline(Shell sh, Pipeline pipeline) {
+  i32 n = pipeline.stages.len();
+
+  // Spawn them all, first to last, expanding each stage's arguments as it goes. Expansion happens
+  // exactly once and in order, which is what a command substitution in an argument requires.
+  i32[] outH = i32[n](fill: -1);
+  i32[] errH = i32[n](fill: -1);
+  for (i32 i = 0; i < n; i++) {
+    Simple simple = pipeline.stages.get(i).simple;
+    Vec<string> argv = Vec.create();
+    for (i32 w = 0; w < simple.words.len(); w++) { expandInto(sh, simple.words.get(w), argv); }
+    if (argv.len() == 0) {
+      // An expansion that vanished — `$empty | wc` — is not a program. Nothing has been spawned
+      // that this stage would feed, so stopping here is safe.
+      stopAll(sh, outH, errH, n);
+      sh.err("sh: a pipeline stage expanded to nothing\n".toBytes());
+      sh.status = 1;
+      return;
+    }
+    string[] args = string[argv.len()](fill: "");
+    for (i32 a = 0; a < argv.len(); a++) { args[a] = argv.get(a); }
+    // The first stage could inherit the shell's input, and deliberately does not: this loop `send`s
+    // to every stage, including the first, and a stage reading the real descriptor *as well* would
+    // race the shell for the same bytes. Feeding it is what makes the pipeline one shape.
+    Child kid = sh.cli
+      .spawnSelf(args, GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV, sh.cwd, false).wait();
+    if (kid.handle < 0) {
+      // Whatever started before this must not be left running: they would write into nothing and
+      // their workers would outlive the script.
+      stopAll(sh, outH, errH, n);
+      sh.err(("sh: " + args[0] + ": " + kid.error + "\n").toBytes());
+      sh.status = 126;
+      return;
+    }
+    outH[i] = kid.handle;
+    errH[i] = kid.errHandle;
+  }
+
+  // The shell's own input goes to the first stage, and then its input ends. `closeFeed`, not
+  // `closeSocket`: a program that reads to the end before answering needs that end while alive.
+  u8[] first = sh.restOfStdin();
+  if (first.len() > 0) { sh.cli.send(outH[0], first).wait(); }
+  sh.cli.closeFeed(outH[0]);
+
+  // One read in flight per open stream. `alive` says which stages still have a handle worth reading;
+  // a stage that is stopped or finished is dropped from the wait list rather than polled.
+  Vec<Pending<Read>> outT = Vec.create();
+  Vec<Pending<Read>> errT = Vec.create();
+  bool[] outOpen = bool[n](fill: true);
+  bool[] errOpen = bool[n](fill: true);
+  // A stage stopped for want of a reader is *gone*: its handles are closed, so its exit code cannot
+  // be asked for afterwards. `head -1` ending `seq` is the ordinary case, not an error.
+  bool[] stopped = bool[n](fill: false);
+  for (i32 i = 0; i < n; i++) {
+    outT.push(sh.cli.recv(outH[i]));
+    errT.push(sh.cli.recv(errH[i]));
+  }
+
+  while (true) {
+    // The ids of every stream still open, and what each position in that list means. Rebuilt each
+    // time round because the set shrinks; `waitAny` takes ids and answers with a position.
+    i32 live = 0;
+    for (i32 i = 0; i < n; i++) {
+      if (outOpen[i]) { live++; }
+      if (errOpen[i]) { live++; }
+    }
+    if (live == 0) { break; }
+    i32[] ids = i32[live](fill: 0);
+    i32[] stage = i32[live](fill: 0);
+    bool[] isErr = bool[live](fill: false);
+    i32 at = 0;
+    for (i32 i = 0; i < n; i++) {
+      if (outOpen[i]) { ids[at] = outT.get(i).id; stage[at] = i; isErr[at] = false; at++; }
+      if (errOpen[i]) { ids[at] = errT.get(i).id; stage[at] = i; isErr[at] = true; at++; }
+    }
+
+    i32 which = sh.core.waitAny(ids, -1);
+    if (which < 0) { break; }
+    i32 i = stage[which];
+
+    if (isErr[which]) {
+      match (errT.get(i).wait()) {
+        case Data(bytes): { sh.err(bytes); errT.set(i, sh.cli.recv(errH[i])); }
+        case End: { errOpen[i] = false; }
+        case Failed(why): { errOpen[i] = false; }
+      }
+      continue;
+    }
+
+    match (outT.get(i).wait()) {
+      case Data(bytes): {
+        if (i + 1 < n) {
+          // Downstream may have finished while this arrived, and then there is nowhere for these
+          // bytes to go: stop this stage rather than buffering for a reader that will never come.
+          if (!sh.cli.send(outH[i + 1], bytes).wait()) {
+            stopStage(sh, outH, errH, outOpen, errOpen, stopped, i);
+          } else {
+            outT.set(i, sh.cli.recv(outH[i]));
+          }
+        } else if (sh.capture) {
+          sh.outBuf.pushAll(bytes);
+          outT.set(i, sh.cli.recv(outH[i]));
+        } else {
+          // Straight out as it arrives, which is the whole point: a long pipeline prints its first
+          // line before its last stage has seen the rest.
+          sh.cli.write(bytes);
+          outT.set(i, sh.cli.recv(outH[i]));
+        }
+      }
+      case End: {
+        outOpen[i] = false;
+        // Its own input is over, so tell the next stage that *its* input is over too.
+        if (i + 1 < n) { sh.cli.closeFeed(outH[i + 1]); }
+        // And the stage before it has nowhere to write: stop it. `head -1` ends `seq` here.
+        if (i > 0 && outOpen[i - 1]) { stopStage(sh, outH, errH, outOpen, errOpen, stopped, i - 1); }
+      }
+      case Failed(why): {
+        sh.err(("sh: " + why + "\n").toBytes());
+        outOpen[i] = false;
+      }
+    }
+  }
+
+  // The last stage's status is the pipeline's, as in bash. A stage that was *stopped* has no status
+  // worth asking for — its handle is gone, and asking is an error rather than an answer — so only the
+  // ones that ran to their own end are collected.
+  i32 status = 0;
+  for (i32 i = 0; i < n; i++) {
+    if (stopped[i]) { continue; }
+    i32 code = sh.cli.exitCode(outH[i]).wait();
+    if (i == n - 1) { status = code < 0 ? 126 : code; }
+    sh.cli.closeSocket(outH[i]);
+    if (errH[i] >= 0) { sh.cli.closeSocket(errH[i]); }
+  }
+  sh.status = status;
+}
+
+/** Stop one stage and stop reading it: it has nowhere to write, so it is finished whether or not it agrees. */
+void stopStage(Shell sh, i32[] outH, i32[] errH, bool[] outOpen, bool[] errOpen, bool[] stopped,
+               i32 i) {
+  sh.cli.closeSocket(outH[i]);
+  if (errH[i] >= 0) { sh.cli.closeSocket(errH[i]); }
+  outOpen[i] = false;
+  errOpen[i] = false;
+  stopped[i] = true;
+}
+
+/** Stop everything started so far, for a pipeline that could not be assembled. */
+void stopAll(Shell sh, i32[] outH, i32[] errH, i32 n) {
+  for (i32 i = 0; i < n; i++) {
+    if (outH[i] >= 0) { sh.cli.closeSocket(outH[i]); }
+    if (errH[i] >= 0) { sh.cli.closeSocket(errH[i]); }
+  }
+}
+
+/** Whether this name would reach `trySelf` — not a function, not a builtin, and one of ours. */
+bool spawnableName(Shell sh, string name) {
+  if (name == "" || containsSlash(name)) { return false; }
+  if (sh.funcs.has(name)) { return false; }
+  if (isBuiltin(name)) { return false; }
+  string[] mine = sh.externalNames();
+  for (i32 i = 0; i < mine.len(); i++) {
+    if (mine[i] == name) { return true; }
+  }
+  return false;
+}
+
+/**
+ * The names `dispatch` answers itself, before any program is looked for.
+ *
+ * A list rather than a lookup because `dispatch` is a chain of comparisons and this has to agree with
+ * it; keeping them adjacent in the file is the only thing keeping them honest. A name missing from
+ * here would be spawned as a program and then not found — which is why `echo`, which is both a
+ * builtin and a `box` applet, has to be listed.
+ */
+bool isBuiltin(string name) {
+  // Exactly the eighteen `dispatch` answers above, in the order it asks — nothing more, so that a
+  // name added there and forgotten here would be *spawned* and reported not found rather than
+  // silently changing meaning. `echo` is the one worth noticing: it is a builtin here and an applet
+  // in `box`, and the builtin wins.
+  return name == ":" || name == "true" || name == "false" || name == "echo" || name == "exit"
+      || name == "export" || name == "unset" || name == "cd" || name == "pwd" || name == "ls"
+      || name == "mkdir" || name == "rm" || name == "read" || name == "shift" || name == "set"
+      || name == "test" || name == "[" || name == "help";
 }
 
 /**
@@ -503,7 +816,7 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
   if (argv.len() == 0) {
     for (i32 i = 0; i < cmd.assigns.len(); i++) {
       Assign a = cmd.assigns.get(i);
-      sh.setVar(a.name, joinWord(sh, a.value));
+      sh.setVar(a.name, joinAssign(sh, a.value));
     }
     // With no command name the status is the last command substitution's, or zero if there was
     // none: `x=$(false)` reports 1, `x=1` reports 0, and a bare `$(exit 3)` reports 3.
@@ -523,7 +836,7 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
     savedNames.push(a.name);
     savedValues.push(before.isSome() ? before.unwrap() : "");
     savedExisted.push(before.isSome() ? 1 : 0);
-    sh.setVar(a.name, joinWord(sh, a.value));
+    sh.setVar(a.name, joinAssign(sh, a.value));
   }
 
   // An input redirection replaces whatever the pipeline was carrying.
@@ -563,10 +876,18 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
     sh.stdinBytes = input;
     sh.stdinPos = 0;
   }
-  // A program is handed what is left, not the whole thing, so `read a; cat` gives `cat` the
-  // remainder. It is not marked consumed afterwards: nothing here says which programs read their
-  // input, and guessing wrong in the other direction would silently drop bytes.
-  Output result = dispatch(sh, argv, sh.restOfStdin());
+  // **Whether a spawned command may take the shell's own standard input rather than a copy of it.**
+  //
+  // True only when there is nothing else to give it: no pipeline stage's output, no redirection, no
+  // here-document — and when this shell owns the process's input and has not already read it. Then a
+  // child reads the real stream, which streams instead of buffering and is *shared*, so `cat; cat`
+  // prints one line between them as it does in bash. Issue 0042.
+  //
+  // Anything the shell runs itself still takes what is left: `read a; cat` gives `cat` the remainder,
+  // and once `read` has pulled the input in, `mayInherit` is false for everything after it — the bytes
+  // are the shell's by then, and handing over a descriptor already drained would lose them.
+  bool mayInherit = !hasInput && sh.ownsStdin && !sh.triedStdin;
+  Output result = dispatch(sh, argv, mayInherit);
   if (hasInput) {
     sh.stdinBytes = savedIn;
     sh.stdinPos = savedPos;
@@ -670,6 +991,9 @@ bool patternMatches(Shell sh, Word pattern, string subject) {
  * more than being kinder than it.
  */
 Output readLine(Shell sh, Vec<string> argv) {
+  // The shell's own input, if that is where this is coming from: `read` is the one builtin that reads,
+  // and it walks the buffer directly rather than through `restOfStdin`.
+  sh.ensureStdin();
   bool raw = false;
   i32 first = 1;
   while (first < argv.len() && argv.get(first) == "-r") { raw = true; first++; }
@@ -784,13 +1108,25 @@ Output setBuiltin(Shell sh, Vec<string> argv) {
  * is the difference between a working directory and a variable. `cd` with no argument goes to
  * `$HOME` as bash does, and `cd -` to the previous directory, which is the one bit of `cd` people
  * use without thinking about it.
+ *
+ * Both of those come from `lookUp`, not from `vars`. Reading `vars` alone meant they had to have been
+ * *assigned in this shell*: `HOME=/etc; cd` worked and a plain `cd` said "HOME not set" while `echo
+ * $HOME` printed it, because expansion falls back to the environment and this did not. The corpus
+ * could not see it — it runs both shells with `HOME` cleared, so bash says "HOME not set" too.
  */
 Output cd(Shell sh, Vec<string> argv) {
-  string want = argv.len() > 1 ? argv.get(1) : sh.vars.get("HOME").orElse("");
-  if (want == "") { return Output.fail("cd: HOME not set\n".toBytes(), 1); }
+  // An argument that is present but empty is not the same as no argument: bash's `cd ""` stays where
+  // it is and succeeds, rather than going home.
+  bool given = argv.len() > 1;
+  string want = given ? argv.get(1) : sh.lookUp("HOME");
+  if (!given && want == "") { return Output.fail("cd: HOME not set\n".toBytes(), 1); }
+  if (given && want == "") { return Output.ok(u8[0]()); }
 
   string previous = sh.cwd;
-  string target = want == "-" ? sh.vars.get("OLDPWD").orElse(sh.cwd) : sh.resolve(want);
+  string back = want == "-" ? sh.lookUp("OLDPWD") : "";
+  // Nowhere to go back to, and bash refuses rather than staying quietly put.
+  if (want == "-" && back == "") { return Output.fail("cd: OLDPWD not set\n".toBytes(), 1); }
+  string target = want == "-" ? back : sh.resolve(want);
 
   Stat st = sh.cli.stat(target).wait();
   if (!st.exists) { return Output.fail(("cd: " + want + ": no such file or directory\n").toBytes(), 1); }
@@ -825,7 +1161,8 @@ Output mkdir(Shell sh, Vec<string> argv) {
     string given = paths.get(i);
     Change made = sh.cli.mkdir(sh.resolve(given), parents).wait();
     if (!made.ok()) {
-      err.pushAll(("mkdir: cannot create directory '" + given + "': " + made.message + "\n").toBytes());
+      err.pushAll(("mkdir: cannot create directory '" + given + "': " + reasonOf(made) + "\n")
+        .toBytes());
       status = 1;
     }
   }
@@ -871,7 +1208,7 @@ Output rm(Shell sh, Vec<string> argv) {
     // rather than by a `stat` first, so there is no window for the file to vanish in between.
     Change gone = sh.cli.remove(path, recursive).wait();
     if (!gone.ok() && !(force && gone.absent())) {
-      err.pushAll(("rm: cannot remove '" + given + "': " + gone.message + "\n").toBytes());
+      err.pushAll(("rm: cannot remove '" + given + "': " + reasonOf(gone) + "\n").toBytes());
       status = 1;
     }
   }
@@ -927,8 +1264,15 @@ Output ls(Shell sh, Vec<string> argv) {
   return status == 0 ? Output.ok(out.take()) : Output.fail(out.take(), status);
 }
 
-/** A function if one is defined, then a builtin, then an external program. */
-Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
+/**
+ * A function if one is defined, then a builtin, then an external program.
+ *
+ * `mayInherit` says the shell's own standard input is available *undrained*, so a spawned child can be
+ * handed the descriptor rather than a copy — see `runSimple`. Everything that runs inside this shell
+ * asks for bytes with `sh.restOfStdin()` instead, which reads the input at that moment if it has not
+ * been read; the two are exclusive, and which one happens depends on what the name turns out to be.
+ */
+Output dispatch(Shell sh, Vec<string> argv, bool mayInherit) {
   string name = argv.get(0);
 
   // Functions shadow builtins, as they do in bash for everything but the special builtins.
@@ -978,16 +1322,20 @@ Output dispatch(Shell sh, Vec<string> argv, u8[] stdin) {
   // A real program if `$WACPATH` has one, and the wac implementation if it does not. That order
   // is the whole point of the table in `program.wac`: those exist because nothing could be
   // started, and now that something can they are the fallback rather than the answer.
-  Output spawned = trySpawn(sh, argv, stdin);
+  Output spawned = trySpawn(sh, argv, mayInherit);
   if (spawned.found) { return spawned; }
-  // Then whatever was handed to us — `packages/box`'s applets, when something wired them in.
-  // After `spawn` because a separate worker with its own grants is a real boundary and this is
-  // not: an applet running here is the same wasm instance with the same authority. Before the
-  // table below because these are the programs someone finished, and those are the ones I wrote
-  // to stand in for them.
-  Output given = sh.external(sh.core, sh.cli, sh.cwd, argv, stdin);
+  // Then this program's own applets as *children*, where that is possible: `packages/box` decides
+  // which applet it is from its first argument, so running one is running this bundle again. That is
+  // a real boundary — its own instance, its own grants — where calling it is not.
+  Output asChild = trySelf(sh, argv, mayInherit);
+  if (asChild.found) { return asChild; }
+  // Then the same applets *called*, which is what happens in a world that cannot spawn — a page
+  // could not until issue 0030, and something has to answer there.
+  // The two in-process routes run *here*, so they need the bytes: reading the input now is what a
+  // program reading it would have done.
+  Output given = sh.external(sh.core, sh.cli, sh.cwd, argv, sh.restOfStdin());
   if (given.found) { return given; }
-  return run(sh.cli, sh.cwd, argv, stdin);
+  return run(sh.cli, sh.cwd, argv, sh.restOfStdin());
 }
 
 /** The default `Shell.externalNames`: nothing is wired in, so there is nothing to list. */
@@ -1013,7 +1361,7 @@ Output noExternal(Core core, Cli cli, string cwd, Vec<string> argv, u8[] stdin) 
  *
  * `found` false means "no such program", and the caller falls back to the wac implementations.
  */
-Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
+Output trySpawn(Shell sh, Vec<string> argv, bool mayInherit) {
   string name = argv.get(0);
   if (name == "") { return Output.missing(); }
   // A name with a slash is a path already, as in bash — `./prog` is not searched for.
@@ -1032,7 +1380,10 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
   // `GRANT_READ` — so that `$WACPATH` grep could open the file it is given — is now a one-word
   // change here. Left to whoever owns this package to decide, since it widens what a script can
   // reach and no test says which is wanted. (agent-a, forced by the signature change)
-  Child child = sh.cli.spawn(string.fromBytes(prog.bytes), args, GRANT_NONE).wait();
+  // The shell's own directory, so `cd sub; prog f` opens `sub/f`. A spawned program used to inherit
+  // the *host's* directory, which meant the shell's `cd` was invisible to everything it ran.
+  Child child = sh.cli
+    .spawn(string.fromBytes(prog.bytes), args, GRANT_NONE, sh.cwd, mayInherit).wait();
   // No `spawn` in this world at all: nothing was attempted, so this is not a failure of the program
   // and must not be reported as one. Falling through is what keeps `packages/box`'s sixty applets
   // working in the browser terminal, where a page cannot spawn — before this, setting `$WACPATH` to
@@ -1044,11 +1395,33 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
     return Output.fail(("sh: " + name + ": " + child.error + "\n").toBytes(), 126);
   }
 
-  // The input in one go, then the *end* — `closeFeed`, not `closeSocket`. A program that reads to
-  // the end before it answers, which is `wc` and `sort` and most of the interesting ones, needs
-  // the end to arrive while it is still running; stopping it instead means it never speaks.
-  if (stdin.len() > 0) { sh.cli.send(child.handle, stdin).wait(); }
-  sh.cli.closeFeed(child.handle);
+  return collectChild(sh, name, child, mayInherit);
+}
+
+/**
+ * Feed a child, read everything it wrote, and wait for its status.
+ *
+ * Shared by both routes to a real program — a bundle named by `$WACPATH`, and this program run again
+ * — because a child is a handle and neither route can tell which kind it has. That is the claim
+ * `packages/platform` makes about handles, and this function is what it buys.
+ *
+ * **This is where a pipeline stops streaming.** Everything the child writes is gathered before the
+ * next stage begins, so `seq 1 200000 | head -1` waits for all 200,000 lines: `Output` is bytes in
+ * and bytes out. Now that stages *can* be concurrent — separate workers, watchable together by
+ * `waitAny` — what would fix it is a pipeline that starts every stage first and shuttles between
+ * them. Issue 0038.
+ */
+Output collectChild(Shell sh, string name, Child child, bool inherited) {
+  // A child given the real descriptor feeds itself; sending it anything would be sending it bytes the
+  // shell does not have. Otherwise: the input in one go, then the *end* — `closeFeed`, not
+  // `closeSocket`. A program that reads to the end before it answers, which is `wc` and `sort` and
+  // most of the interesting ones, needs the end to arrive while it is still running; stopping it
+  // instead means it never speaks.
+  if (!inherited) {
+    u8[] stdin = sh.restOfStdin();
+    if (stdin.len() > 0) { sh.cli.send(child.handle, stdin).wait(); }
+    sh.cli.closeFeed(child.handle);
+  }
 
   Buf out = Buf.create();
   bool reading = true;
@@ -1063,14 +1436,89 @@ Output trySpawn(Shell sh, Vec<string> argv, u8[] stdin) {
     }
   }
 
+  // Its error stream, which is a *different handle*: a shell has to keep the two apart, or
+  // `cat nosuch | wc -c` counts the complaint. Read after the output rather than interleaved with it
+  // because both are queues that the host has already collected — nothing is lost by the order, and
+  // a pipeline that wants them interleaved wants `2>&1`, which is a redirection this shell refuses
+  // outright rather than approximating.
+  Buf err = Buf.create();
+  bool complaining = child.errHandle >= 0;
+  while (complaining) {
+    match (sh.cli.recv(child.errHandle).wait()) {
+      case Data(bytes): { err.pushAll(bytes); }
+      case End: { complaining = false; }
+      case Failed(why): { complaining = false; }
+    }
+  }
+
   i32 code = sh.cli.exitCode(child.handle).wait();
   sh.cli.closeSocket(child.handle);
+  if (child.errHandle >= 0) { sh.cli.closeSocket(child.errHandle); }
   // Negative means it never ran at all, which by then is a host problem rather than the
   // program's status, so it is reported as "could not execute" rather than as success.
   if (broke != "") {
-    return Output(out.bytes(), ("sh: " + name + ": " + broke + "\n").toBytes(), 126, true);
+    err.pushAll(("sh: " + name + ": " + broke + "\n").toBytes());
+    return Output(out.bytes(), err.bytes(), 126, true);
   }
-  return Output(out.bytes(), u8[0](), code < 0 ? 126 : code, true);
+  return Output(out.bytes(), err.bytes(), code < 0 ? 126 : code, true);
+}
+
+/**
+ * Run `argv` as a child of this same program, if this program has that applet.
+ *
+ * The difference from `trySpawn` is only where the code comes from: there, a file named by
+ * `$WACPATH`; here, the bundle this program was started with, which the host already holds. So there
+ * is no path to search, no file to read, and nothing that can be missing — which is why this is the
+ * route that works in a browser tab, where there is no directory of programs at all.
+ *
+ * `found` false means "not one of mine", and the caller falls through to calling the applet in
+ * process. A world that cannot spawn answers the same way, so the shell degrades to what it did
+ * before rather than reporting a program broken.
+ */
+Output trySelf(Shell sh, Vec<string> argv, bool mayInherit) {
+  if (!sh.externalSpawnable) { return Output.missing(); }
+  string name = argv.get(0);
+  if (name == "" || containsSlash(name)) { return Output.missing(); }
+  string[] mine = sh.externalNames();
+  bool ours = false;
+  for (i32 i = 0; i < mine.len(); i++) {
+    if (mine[i] == name) { ours = true; }
+  }
+  if (!ours) { return Output.missing(); }
+
+  string[] args = string[argv.len()](fill: "");
+  for (i32 i = 0; i < argv.len(); i++) { args[i] = argv.get(i); }
+
+  // Everything this shell has, which the host narrows to what it actually holds. An applet run in
+  // process had the shell's whole authority implicitly; asking for it explicitly is the same
+  // authority said out loud, and a shell granted nothing hands its children nothing.
+  Child child = sh.cli
+    .spawnSelf(args, GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV, sh.cwd, mayInherit).wait();
+  if (child.unavailable()) { return Output.missing(); }
+  if (child.handle < 0) {
+    return Output.fail(("sh: " + name + ": " + child.error + "\n").toBytes(), 126);
+  }
+  return collectChild(sh, name, child, mayInherit);
+}
+
+/**
+ * Why a change failed, in the words the tool this shell imitates uses.
+ *
+ * A fault the world has a *category* for gets the category's phrase; anything else keeps the host's
+ * own message, which is the only thing that knows. That distinction is the point of the fault numbers:
+ * the host's words differ per platform and per runtime — "File exists (os error 17): mkdir '/tmp/x'"
+ * under Deno, "EEXIST: file already exists, mkdir '/tmp/x'" under Node, "already exists" in a browser —
+ * while what happened does not.
+ *
+ * bash's `mkdir` and `rm` are `/bin/mkdir` and `/bin/rm`, so these lines are compared against GNU's own
+ * stderr in `test/differential.test.ts`. Before this they carried an errno and an absolute path that
+ * GNU does not print, in a shell whose whole suite is a comparison with bash.
+ */
+string reasonOf(Change c) {
+  if (c.fault == FAULT_NOT_FOUND()) { return "No such file or directory"; }
+  if (c.fault == FAULT_EXISTS()) { return "File exists"; }
+  if (c.fault == FAULT_NOT_EMPTY()) { return "Directory not empty"; }
+  return c.message;
 }
 
 /** The first `dir/name` on `$WACPATH` that exists, or "" when none does. */
@@ -1158,12 +1606,14 @@ Output test(Shell sh, Vec<string> argv) {
   bool result = false;
   if (a.len() == 0) { result = false; }
   else if (a.len() == 1) { result = a.get(0) != ""; }
-  else if (a.len() == 2) {
-    string op = a.get(0);
-    if (op == "-z") { result = a.get(1) == ""; }
-    else if (op == "-n") { result = a.get(1) != ""; }
-    else if (op == "!") { result = a.get(1) == ""; }
-    else { return Output.fail(("test: unknown operator " + op + "\n").toBytes(), 2); }
+  else if (a.len() == 2) { return unaryTest(sh, a.get(0), a.get(1)); }
+  else if (a.len() == 3 && a.get(0) == "!") {
+    // `! -f x` and `! -z "$x"`: the negation of a unary test, which is how a script asks whether a
+    // file is *missing*. Without this the `!` was read as the left operand of a binary operator and
+    // `-f` as the operator, so the most ordinary use of `test` reported "unknown operator".
+    Output inner = unaryTest(sh, a.get(1), a.get(2));
+    if (!inner.found || inner.status == 2) { return inner; }
+    return testResult(inner.status != 0);
   } else if (a.len() == 3) {
     string op = a.get(1);
     string l = a.get(0);
@@ -1180,7 +1630,40 @@ Output test(Shell sh, Vec<string> argv) {
   } else {
     return Output.fail("test: too many arguments\n".toBytes(), 2);
   }
-  return Output(u8[0](), u8[0](), result ? 0 : 1, true);
+  return testResult(result);
+}
+
+/** A `test` answer: nothing on either stream, and true is 0 because that is what a shell means by it. */
+Output testResult(bool v) { return Output(u8[0](), u8[0](), v ? 0 : 1, true); }
+
+/**
+ * The one-operand forms, including the ones that ask the filesystem.
+ *
+ * `test -f f` was "unknown operator" until now, which is the single most common thing a script asks:
+ * `if test -f config; then`. The shell has `stat` and has had it since `cd` arrived, so the answer was
+ * one capability call away — and asking `cat` instead, which is what a script has to do without this,
+ * tells you nothing about a directory.
+ *
+ * `-r`, `-w` and `-x` are *not* here and still refuse: `Stat` carries no mode bits, and a shell that
+ * answered "yes, readable" from the mere existence of a file would be wrong exactly when it matters.
+ */
+Output unaryTest(Shell sh, string op, string operand) {
+  if (op == "-z") { return testResult(operand == ""); }
+  if (op == "-n") { return testResult(operand != ""); }
+  if (op == "!") { return testResult(operand == ""); }
+
+  if (op == "-h" || op == "-L") {
+    // The link itself, not what it leads to — `stat` follows, which is why there are two.
+    return testResult(sh.cli.linkStat(sh.resolve(operand)).wait().isSymlink);
+  }
+  if (op == "-e" || op == "-f" || op == "-d" || op == "-s") {
+    Stat st = sh.cli.stat(sh.resolve(operand)).wait();
+    if (op == "-e") { return testResult(st.exists); }
+    if (op == "-f") { return testResult(st.isFile); }
+    if (op == "-d") { return testResult(st.isDir); }
+    return testResult(st.exists && st.size > 0);
+  }
+  return Output.fail(("test: unknown operator " + op + "\n").toBytes(), 2);
 }
 
 /**
@@ -1247,6 +1730,16 @@ void expandInto(Shell sh, Word word, Vec<string> argv) {
   for (i32 i = 0; i < word.parts.len(); i++) {
     Part p = word.parts.get(i);
     string text = expandPart(sh, p);
+
+    // Tilde expansion, which is a rule about where the `~` *is*: only one that begins the word, and
+    // only in literal text, so `echo "a~"~` prints two tildes and `x=~; echo $x/y` does not expand a
+    // second time. `emitField` never sees a `~`, which is why this is here rather than there.
+    if (i == 0 && !p.quoted) {
+      match (p.kind) {
+        case Lit: { text = withHome(sh, text, true, false); }
+        else: {}
+      }
+    }
 
     if (p.quoted) {
       appendMasked(field, mask, text, 1);
@@ -1975,13 +2468,84 @@ string expandPart(Shell sh, Part p) {
   return "";
 }
 
-/** A word joined without splitting — for a redirection target or an assignment's value. */
-string joinWord(Shell sh, Word word) {
+/** A word joined without splitting — for a redirection target. */
+string joinWord(Shell sh, Word word) { return joinParts(sh, word, false); }
+
+/**
+ * The same, for an assignment's value, where a tilde may also follow a colon.
+ *
+ * That is bash's rule and it is not decoration: `PATH=/usr/bin:~/bin` has to expand the second entry
+ * or the shell keeps a directory called `~` on its search path and quietly finds nothing in it. In a
+ * plain word the leading one is the only one, which is why `echo ~:~` prints a tilde on the right.
+ */
+string joinAssign(Shell sh, Word word) { return joinParts(sh, word, true); }
+
+string joinParts(Shell sh, Word word, bool colons) {
   string s = "";
   for (i32 i = 0; i < word.parts.len(); i++) {
-    s = s + expandPart(sh, word.parts.get(i));
+    Part p = word.parts.get(i);
+    string text = expandPart(sh, p);
+    if (!p.quoted) {
+      match (p.kind) {
+        // A tilde begins the value, or follows a colon in it. `s` is what has been built so far, so a
+        // part starting after `PATH=/u:` is startable even though it is not the first part.
+        case Lit: { text = withHome(sh, text, i == 0 || (colons && endsWithColon(s)), colons); }
+        else: {}
+      }
+    }
+    s = s + text;
   }
   return s;
+}
+
+bool endsWithColon(string s) { return s.len() > 0 && s.slice(s.len() - 1, s.len()) == ":"; }
+
+/**
+ * `~` and `~/…` replaced with `$HOME`.
+ *
+ * `startable` says whether a tilde at the front of this text stands for a home directory — that is a
+ * position, not a character: only one at the start of the word counts, which is why `echo a~` prints
+ * `a~`. `colons` additionally allows one after every `:`, which is an assignment's rule.
+ *
+ * `~user` is left exactly as written, which is also what bash does for a user it cannot find: naming
+ * somebody else's home directory means reading the password file, and this shell has no capability
+ * that could. Same for `~+` and `~-`. With `HOME` unset bash consults the password file and this
+ * leaves the word alone, which is the one case where the two differ.
+ */
+string withHome(Shell sh, string text, bool startable, bool colons) {
+  u8[] b = text.toBytes();
+  bool any = false;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (homeTilde(b, i, startable, colons)) { any = true; }
+  }
+  if (!any) { return text; }
+
+  string home = sh.lookUp("HOME");
+  if (home == "") { return text; }
+  u8[] h = home.toBytes();
+
+  Buf out = Buf.create();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (homeTilde(b, i, startable, colons)) { out.pushAll(h); } else { out.push(b[i]); }
+  }
+  return string.fromBytes(out.bytes());
+}
+
+/**
+ * Whether byte `at` is a `~` in a position that means home, with nothing after it that would make it
+ * a user name instead.
+ *
+ * The tilde-prefix ends at the first `/` **or `:`**, or at the end of the word: `~:x` is the home
+ * directory and a colon, while `~=x` and `~,x` are words beginning with a tilde. A colon terminates
+ * one everywhere; it only *begins* one in an assignment, which is what `colons` distinguishes —
+ * `echo ~:~` expands the left tilde alone and `v=~:~` expands both, both as bash does.
+ */
+bool homeTilde(u8[] b, i32 at, bool startable, bool colons) {
+  if (b[at] != 0x7e) { return false; }                                   // '~'
+  bool placed = (at == 0 && startable) || (colons && at > 0 && b[at - 1] == 0x3a);   // ':'
+  if (!placed) { return false; }
+  if (at + 1 == b.len()) { return true; }
+  return b[at + 1] == 0x2f || b[at + 1] == 0x3a;                         // '/' ':'
 }
 
 i32 indexOfEq(string s) {

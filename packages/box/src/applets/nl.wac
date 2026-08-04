@@ -5,7 +5,8 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
-import { Line, Lines, emit, nextLine } from "../lib/reader.wac";
+import { Line, Lines, emitTo, nextLine } from "../lib/reader.wac";
+import { Sink } from "../lib/out.wac";
 import { itoa } from "../lib/num.wac";
 
 export i32 nl(Core core, Cli cli, Args a) {
@@ -13,14 +14,15 @@ export i32 nl(Core core, Cli cli, Args a) {
   if (!in.ok) { return 1; }
 
   Lines s = Lines.create();
+  Sink out = Sink.create(cli);
   i32 n = 0;
   while (true) {
     Line l = nextLine(s, cli);
-    if (!l.ok) { return 0; }
+    if (!l.ok) { out.flush(); return 0; }
     if (l.bytes.len() == 0) {
       // Seven spaces where the number and its tab would be, which is what the real one
       // emits — measured, not derived from the six-wide number field.
-      emit(cli, "       ".toBytes(), true);
+      emitTo(out, "       ".toBytes(), true);
       continue;
     }
     n++;
@@ -29,7 +31,7 @@ export i32 nl(Core core, Cli cli, Args a) {
     for (i32 i = num.toBytes().len(); i < 6; i++) { pad = pad + " "; }
     // `nl` terminates its last line even when the input did not, unlike `head` and
     // `tail`. Checked against the real one rather than assumed to be uniform.
-    emit(cli, (pad + num + "\t" + string.fromBytes(l.bytes)).toBytes(), true);
+    emitTo(out, (pad + num + "\t" + string.fromBytes(l.bytes)).toBytes(), true);
   }
   return 0;
 }

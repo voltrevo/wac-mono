@@ -34,13 +34,24 @@ import { type Handlers } from "./respond.ts";
 import { CHUNK } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
-import { ChildStack, packCaptured, unpackPush } from "./child.ts";
-import { type Child, failedChild, noSpawnHere, spawnChild } from "./children.ts";
+import { ChildStack, joinPath, packCaptured, unpackPush } from "./child.ts";
+import {
+  ByteQueue,
+  type Child,
+  failedChild,
+  noSpawnHere,
+  spawnChild,
+  twoHandles,
+  unpackSpawn,
+  unpackSpawnSelf,
+  want,
+} from "./children.ts";
 import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
 import {
   changeBytes,
   changed,
+  faultOf,
   FAULT_DENIED,
   FAULT_EXISTS,
   Faulted,
@@ -117,12 +128,27 @@ export type BrowserWorldOptions = {
    */
   readStdin?(): Promise<Uint8Array>;
   /**
+   * One chunk of standard input, for `readChunk` and `recv(0)`.
+   *
+   * Separate from `readStdin` because they promise different things — everything, and something —
+   * and for a spawned child the difference is the difference between sorting its input and sorting
+   * the first line of it.
+   */
+  readStdinChunk?(): Promise<Uint8Array>;
+  /**
    * This program's own worker bundle, for `spawnSelf`.
    *
    * The launcher has it — it is what started the program — and `runInPage` passes it along. Absent
    * means `spawnSelf` says there is no spawn here rather than failing a program.
    */
   selfSource?: string;
+  /**
+   * Where relative paths resolve from, and what `cwd` reports.
+   *
+   * A page's own is `/`, the root of its Origin Private File System. A *child's* is whatever started
+   * it said, which is how `cd sub; prog f` means `sub/f` in a browser terminal too.
+   */
+  cwd?: string;
   /**
    * The Origin Private File System root, if the page is willing to grant one.
    *
@@ -178,6 +204,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   const warn = opts.warn ?? ((l: string) => console.warn(l));
   const write = opts.write ?? ((b: Uint8Array) => console.log(new TextDecoder().decode(b)));
   const readIn = opts.readStdin;
+  const readChunkIn = opts.readStdinChunk ?? opts.readStdin;
 
   /**
    * The children this page has started, by handle.
@@ -186,6 +213,14 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    * and `waitAny` watches them without knowing which is which.
    */
   const children = new Map<number, Child>();
+  /**
+   * A child's error stream, by its own handle.
+   *
+   * Separate from `children` because it is a separate stream, and reading it is `recv` like anything
+   * else — a handle is a handle, which is what lets `waitAny` watch a child's two streams and a
+   * socket in one call.
+   */
+  const errStreams = new Map<number, ByteQueue>();
   let nextHandle = 1;
 
   /**
@@ -198,27 +233,49 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   const startChild = async (
     source: string,
     childArgs: string[],
-    want: number,
+    wanted: number,
+    childCwd: string,
+    inheritIn: boolean,
   ): Promise<Uint8Array> => {
     const give = {
-      read: (want & GRANT_READ) !== 0 && opts.root !== undefined,
-      write: (want & GRANT_WRITE) !== 0 && opts.root !== undefined && opts.writable === true,
+      read: (wanted & GRANT_READ) !== 0 && opts.root !== undefined,
+      write: (wanted & GRANT_WRITE) !== 0 && opts.root !== undefined && opts.writable === true,
     };
     const h = nextHandle++;
-    const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
+    const child = spawnChild(source, childArgs, (sab, cargs, out, input, cerr) => {
       const enc = new TextEncoder();
       return serveHostCalls(bridgeOf(sab), browserWorld({
         args: cargs,
         // A line of output is bytes on the handle, with the newline `log` implies. The parent cannot
         // tell `log` from `write`, and neither can a pipe — which is the point.
         log: (l: string) => out.push(enc.encode(l + "\n")),
-        warn: (l: string) => out.push(enc.encode(l + "\n")),
-        write: (b: Uint8Array) => out.push(b),
-        writeErr: (b: Uint8Array) => out.push(b),
-        readStdin: () => input.next(),
+        // ...and its error output goes to the *other* stream, which `recv(errHandle)` reads. A
+        // program has two, and merging them made a shell count an error message in `cat x | wc -c`.
+        warn: (l: string) => cerr.push(enc.encode(l + "\n")),
+        // A full queue has to *fail* the write, or a program written to stop when the other end
+        // goes away never learns: `box yes` is `while (cli.write(block)) {}`. Throwing is how the
+        // host says false — the same shape `pushChild`'s cap uses.
+        write: (b: Uint8Array) => {
+          if (!out.push(b)) throw new Error("the child's output is not being read");
+        },
+        writeErr: (b: Uint8Array) => { cerr.push(b); },
+        // `readStdin` means *all* of it, which for a child means waiting for its input to end: the
+        // bytes arrive over time. Serving it with one chunk made `seq 1 5 | sort -r` print `1`, since
+        // `sort` reads to the end before sorting. `readChunk` and `recv` still take one chunk.
+        // **An inheriting child reads the real thing.** Leaving these out is what hands it over: a
+        // world with no `readStdin` option falls back to the process's own input, so the child reads
+        // the same stream its parent would have — streaming rather than buffered, and *shared*, which
+        // is why `cat; cat` sees one line between them rather than one each. Issue 0042.
+        ...(inheritIn ? {} : {
+          readStdin: () => input.rest(),
+          readStdinChunk: () => input.next(),
+        }),
         ...(give.read ? { root: opts.root, writable: give.write } : {}),
         // So that a child can run itself too: the bundle is the same one.
         selfSource: opts.selfSource,
+        // Where its relative paths resolve from. A shell in a tab that has done `cd sub` starts its
+        // children there, exactly as it would on a command line.
+        cwd: childCwd === "" ? opts.cwd : childCwd,
       }));
     }, newBridge);
 
@@ -227,13 +284,25 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       child.kill();
       return failedChild(why);
     }
+    // Two handles for one child: its output and its error stream. Numbered from the same counter, so
+    // `waitAny` can watch both beside a socket without knowing which is which.
+    const eh = nextHandle++;
     children.set(h, child);
-    return i32le(h);
+    errStreams.set(eh, child.err);
+    return twoHandles(h, eh, "");
   };
   const writeErr = opts.writeErr ??
     ((b: Uint8Array) => warn(new TextDecoder().decode(b)));
+  /**
+   * A capability this page was not given, said in the host's own words and *kept* in them.
+   *
+   * `Faulted` rather than a plain `Error` so that the phrase policy below can tell the two apart. This
+   * is a `Denied`, and rephrasing it to "permission denied" loses the only useful thing about it: that
+   * the *page* withheld the capability, not that a filesystem refused an operation. The existing
+   * denial test caught exactly that when the read path started rephrasing.
+   */
   const deny = (what: string): never => {
-    throw new Error(`${what} not granted to this application`);
+    throw new Faulted(FAULT_DENIED, `${what} not granted to this application`);
   };
 
   const root = (): DirHandle => opts.root ?? deny("filesystem read");
@@ -277,6 +346,28 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
   };
 
   /**
+   * Run a read, and say a failure the way a change says it.
+   *
+   * A read reports by *throwing*: the bridge turns that into an error reply and the worker decodes it
+   * into `FileResult.error` or `openInput`'s message. So the rephrasing has to happen here, and without
+   * it a page spoke with two voices — `rm nosuchfile` said "no such file or directory" while
+   * `cat nosuchfile` said "A requested file or directory could not be found at the time an operation was
+   * processed.", which is the same failure in the same tab. Found by driving the browser terminal after
+   * the change side was done. Issue 0025's phrase policy, one layer over.
+   */
+  const readOrPhrase = async <T>(work: () => Promise<T>): Promise<T> => {
+    try {
+      return await work();
+    } catch (e) {
+      // A fault this host named itself keeps its own words: those are chosen, and the phrase would be
+      // a worse version of them. Everything else is the browser's boilerplate.
+      if (e instanceof Faulted) throw e;
+      const message = e instanceof Error ? e.message : String(e);
+      throw new Error(describeAsPhrase(faultOf(e), message));
+    }
+  };
+
+  /**
    * The same question as `canWrite`, for the four operations that answer with a `Change` instead of
    * throwing: a refusal is a `Denied` fault said in the ordinary shape, not an exception.
    */
@@ -293,7 +384,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    * for them to be absolute about.
    */
   const resolve = async (path: string, create: boolean): Promise<Resolved> => {
-    const parts = kids.path(path).split("/").filter((p) => p !== "" && p !== ".");
+    const parts = joinPath(opts.cwd ?? "", kids.path(path)).split("/").filter((p) => p !== "" && p !== ".");
     if (parts.length === 0) throw new Error("empty path");
     let dir = root();
     for (let i = 0; i < parts.length - 1; i++) {
@@ -322,7 +413,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    * listing, so portable code asked the obvious question and silently got nothing.
    */
   const dirOf = async (path: string, create: boolean): Promise<DirHandle> => {
-    const parts = kids.path(path).split("/").filter((x) => x !== "" && x !== ".");
+    const parts = joinPath(opts.cwd ?? "", kids.path(path)).split("/").filter((x) => x !== "" && x !== ".");
     let dir = root();
     for (const part of parts) dir = await dir.getDirectoryHandle(part, { create });
     return dir;
@@ -412,7 +503,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
 
     // A page has no process directory. The root of the Origin Private File System is where its
     // relative paths land, so that is the true answer and not a placeholder.
-    [OP.CWD]: () => str("/"),
+    [OP.CWD]: () => str(opts.cwd !== undefined && opts.cwd !== "" ? opts.cwd : "/"),
     [OP.SLEEP_MILLIS]: (p) =>
       new Promise<Uint8Array>((ok) =>
         setTimeout(() => ok(i64le(BigInt(Math.round(performance.now() * 1e6)))), readI32le(p))
@@ -505,11 +596,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
      * a place to put a canvas.
      */
     [OP.SPAWN]: (p) => {
-      const want = readI32le(p);
-      const n = readI32le(p.subarray(4));
-      const source = unstr(p.subarray(8, 8 + n));
-      const rest = unstr(p.subarray(8 + n));
-      return startChild(source, rest.length === 0 ? [] : rest.split("\u0000"), want);
+      const { source, args, cwd, inheritIn } = unpackSpawn(p);
+      return startChild(source, args, want(p), cwd, inheritIn);
     },
 
     /**
@@ -521,12 +609,11 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
      * `packages/box` decides which applet it is from its first argument. Issue 0030.
      */
     [OP.SPAWN_SELF]: (p) => {
-      const want = readI32le(p);
-      const rest = unstr(p.subarray(4));
       if (opts.selfSource === undefined) {
         return noSpawnHere("this page did not pass the program its own source");
       }
-      return startChild(opts.selfSource, rest.length === 0 ? [] : rest.split("\u0000"), want);
+      const { args, cwd, inheritIn } = unpackSpawnSelf(p);
+      return startChild(opts.selfSource, args, want(p), cwd, inheritIn);
     },
 
     [OP.CLOSE_FEED]: (p) => {
@@ -541,7 +628,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       return i32le(await c.exit);
     },
 
-    [OP.READ_FILE]: async (p) => new Uint8Array(await (await fileOf(unstr(p))).arrayBuffer()),
+    [OP.READ_FILE]: (p) =>
+      readOrPhrase(async () => new Uint8Array(await (await fileOf(unstr(p))).arrayBuffer())),
     [OP.WRITE_FILE]: (p) => {
       const no = writeRefused();
       if (no !== null) return no;
@@ -619,21 +707,22 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       }, describeAsPhrase);
     },
 
-    [OP.OPEN_INPUT]: async (p) => {
-      const path = unstr(p);
-      source = null;
-      if (path === "") return EMPTY;             // "standard input", which is empty here
-      source = { blob: await fileOf(path), at: 0 };
-      return EMPTY;
-    },
+    [OP.OPEN_INPUT]: (p) =>
+      readOrPhrase(async () => {
+        const path = unstr(p);
+        source = null;
+        if (path === "") return EMPTY;             // "standard input", which is empty here
+        source = { blob: await fileOf(path), at: 0 };
+        return EMPTY;
+      }),
     [OP.READ_CHUNK]: async () => {
       const fed = source === null ? kids.readChunk() : null;
       if (fed !== null) return fed.length === 0 ? END : data(fed);
       // A spawned child's standard input is a queue its parent fills, which is the same shape a
       // fed child has and a different source: `pushChild` hands over a buffer, `send` arrives over
       // time. Both end, and the end is what `readChunk` has to be able to say.
-      if (source === null && readIn !== undefined) {
-        const piped = await readIn();
+      if (source === null && readChunkIn !== undefined) {
+        const piped = await readChunkIn();
         return piped.length === 0 ? END : data(piped);
       }
       if (source === null) return END;
@@ -672,14 +761,19 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       // Handle 0 is standard input, as everywhere: it exists so `waitAny` can watch it beside a
       // child. A page's own standard input is empty; a child's is what its parent sent.
       if (h === 0) {
-        if (readIn === undefined) return END;
-        const piped = await readIn();
+        if (readChunkIn === undefined) return END;
+        const piped = await readChunkIn();
         return piped.length === 0 ? END : data(piped);
       }
       const kid = children.get(h);
       if (kid !== undefined) {
         const fromChild = await kid.out.next();
         return fromChild.length === 0 ? END : data(fromChild);
+      }
+      const complaint = errStreams.get(h);
+      if (complaint !== undefined) {
+        const said = await complaint.next();
+        return said.length === 0 ? END : data(said);
       }
       return failed("network access is not granted");
     },

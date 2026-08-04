@@ -13,6 +13,16 @@
 // locale decides and the two disagree on case.
 
 const CASES: string[] = [
+  // `head`/`tail` with the traditional count, which nothing here asked for until `head -2` was found
+  // printing every line: a flag ignored rather than refused. GNU takes both spellings and so must this.
+  "seq 1 5 | head -2",
+  "seq 1 5 | head -n 2",
+  "seq 1 5 | tail -2",
+  "seq 1 5 | tail -n 2",
+  "seq 1 5 | head",
+  "seq 1 5 | head -0",
+  "printf 'a\\nb\\nc\\n' | head -1",
+  "printf 'a\\nb\\nc\\n' | tail -1",
   // ── Words and quoting ───────────────────────────────────────────────────────
   `echo hello`,
   `echo hello world`,
@@ -70,6 +80,48 @@ const CASES: string[] = [
   `seq 1 10 | grep 1`,
   `seq 1 3 | nl`,
   `echo one two three | tr ' ' ','`,
+  // `tr`'s flags, its escapes and its character classes — none of which it had. `tr -d 12` used to
+  // read `-d` as a *set* and translate, `tr : '\n'` produced a backslash and an `n`, and
+  // `[:digit:]` was eight literal characters. Every one of those reported success.
+  `printf 'a1b2\n' | tr -d 12`,
+  `printf 'a\nb\n' | tr -d '\n'; echo END`,
+  `printf 'a  b\n' | tr -s ' '`,
+  `printf 'ab\n' | tr -s 'ab' 'x'`,
+  `printf 'aabb\n' | tr -ds a b`,
+  `printf 'a1b2\n' | tr -c 'a-z' '.'`,
+  `printf 'a1b2\n' | tr -c 'a-z' 'xy'`,
+  `printf 'a1b2\n' | tr -cd 'a-z'; echo`,
+  `printf 'a1b\n' | tr -cs 'a-z' 'xy'`,
+  `printf 'abc\n' | tr -t 'abc' 'xy'`,
+  `printf 'abc\n' | tr -ts 'abc' 'x'`,
+  `printf 'a:b:c\n' | tr ':' '\n'`,
+  `printf 'a\tb\n' | tr '\t' ':'`,
+  `printf 'abc\n' | tr 'a\\142c' xyz`,
+  `printf 'q\n' | tr '\\q' X`,
+  `printf 'x\n' | tr '\\x41' X`,
+  `printf 'a1b\n' | tr '[:digit:]' 'x'`,
+  `printf 'ABC\n' | tr '[:upper:]' '[:lower:]'`,
+  `printf 'a1\n' | tr '[:alnum:]' 'x'`,
+  `printf 'a b\n' | tr '[:blank:]' '_'`,
+  `printf 'a.b\n' | tr '[:punct:]' '_'`,
+  `printf 'aFb\n' | tr '[:xdigit:]' '_'`,
+  `printf 'a  b\n' | tr -s '[:space:]' ' '`,
+  `printf 'a-d\n' | tr -- -d x`,
+  `printf 'ab\n' | tr '' ''; echo status=$?`,
+  `printf 'ab\n' | tr -d ''; echo status=$?`,
+  `printf 'aab\n' | tr -s '' 'x'; echo status=$?`,
+  `printf 'ab\n' | tr 'abc' 'xy'`,
+  `printf 'abc\n' | tr 'ab' 'xyz'`,
+  // The usage errors, which are GNU's own status 1 rather than a shell's 2. Only stdout and the
+  // status are compared here, which is what makes them comparable at all: GNU adds a second line of
+  // advice to stderr that this does not.
+  `printf 'abc\n' | tr -q a b; echo status=$?`,
+  `printf 'ab\n' | tr -d; echo status=$?`,
+  `printf 'ab\n' | tr -d a b; echo status=$?`,
+  `printf 'ab\n' | tr a; echo status=$?`,
+  `printf 'ab\n' | tr 'z-a' 'x'; echo status=$?`,
+  `printf 'ab\n' | tr a ''; echo status=$?`,
+  `printf 'ab\n' | tr '[:nope:]' 'x'; echo status=$?`,
   `echo abc | tr abc xyz`,
   `seq 1 5 | sort -r`,
   `seq 3 1 | sort`,
@@ -649,6 +701,23 @@ esac`,
  * from. Relative ones are covered by the `cd` cases below, which move both shells first.
  */
 const globDir = await Deno.makeTempDir();
+/**
+ * Remove what this file built, however it ends.
+ *
+ * `Deno.test` has no suite-level teardown, so a module-level temp used by several tests had nowhere to
+ * be cleaned up and was left behind — one built binary of about 700 KiB per run of the suite. Five
+ * hundred of them were sitting in `/tmp` when a parallel run finally died with "No space left on
+ * device", in the middle of a package that had nothing to do with it. `unload` fires on the way out
+ * whether the tests passed, failed or threw, which is the only hook that covers all three.
+ */
+globalThis.addEventListener("unload", () => {
+  try {
+    Deno.removeSync(globDir, { recursive: true });
+  } catch {
+    // Already gone, or never made. Nothing to report on the way out.
+  }
+});
+
 for (const name of ["a.txt", "b.txt", "c.log", ".hidden"]) {
   await Deno.writeTextFile(`${globDir}/${name}`, "");
 }
@@ -722,6 +791,90 @@ for (const [i, script] of [
   `rm nothing; echo status=$?`,
   `rm -f nothing; echo status=$?`,
   `mkdir one; rm one; echo status=$?`,
+  // `test`'s file operators, which need something to look at — the reason they are in this group and
+  // not among the string tests above. `test -f f` was "unknown operator" until it was compared with
+  // bash: the most ordinary line a script contains, answered with a usage error.
+  `echo x > f; test -f f && echo isfile`,
+  `echo x > f; test -d f || echo notdir`,
+  `mkdir one; test -d one && echo isdir`,
+  `mkdir one; test -f one || echo notfile`,
+  `echo x > f; test -e f && echo exists`,
+  `test -e nothing || echo absent`,
+  `test -f nothing; echo status=$?`,
+  `echo x > f; [ -f f ] && echo bracket`,
+  `echo x > f; test ! -f f; echo status=$?`,
+  `test ! -f nothing && echo missing`,
+  `echo x > f; test -s f && echo nonempty`,
+  `: > empty; test -s empty; echo status=$?`,
+  `test -s nothing; echo status=$?`,
+  `echo x > f; test -h f; echo status=$?`,       // not a link, and `stat` would have said "file"
+  `test -q f; echo status=$?`,                   // still refused, and it is a *usage* error: 2
+  // File *operands*. Every program here except `cat` used to ignore them and read standard input
+  // regardless, so `wc -l f` printed `0` and exited `0`, and `grep pattern f` exited 1 — which a
+  // script reads as "no match" rather than "the file was never opened".
+  `printf 'a\nb\n' > f; wc -l f`,
+  `printf 'a\nb\n' > f; wc f`,
+  `printf 'a\nb\n' > f; wc -l < f`,             // and no name, when it is standard input
+  `printf 'a\nb\n' > f; wc -l - < f`,           // …but `-` keeps its name, as GNU prints it
+  `printf 'a\nb\n' > f; head -1 f`,
+  `printf 'a\nb\n' > f; tail -1 f`,
+  `printf 'b\na\n' > f; sort f`,
+  `printf 'a\na\n' > f; uniq f`,
+  `printf 'ab\n' > f; rev f`,
+  `printf 'a\nb\n' > f; nl f`,
+  `printf 'a\nb\n' > f; cat f - < f`,
+  // Several of them, where the shape of the answer changes: `wc` names each file and totals them,
+  // `head` and `tail` write a header per block, `grep` labels its lines, and `sort`, `nl` and `rev`
+  // treat the operands as one concatenation — `nl`'s numbering runs on across the boundary.
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; wc -l f1 f2`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; wc f1 f2`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; wc -c f1 f1`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; head -1 f1 f2`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; tail -n 1 f1 f2`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; nl f1 f2`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; sort f1 f2`,
+  `printf 'ab\n' > f1; printf 'c\n' > f2; rev f1 f2`,
+  // `grep`'s flags, which were not read at all: an option it did not have became the *pattern*, so
+  // `grep -c a f` searched for `-c` and reported no match.
+  `printf 'a\nb\n' > f; grep a f`,
+  `printf 'a\nb\n' > f; grep -c a f`,
+  `printf 'a\nb\n' > f; grep -n a f`,
+  `printf 'a\nb\n' > f; grep -v a f`,
+  `printf 'a\nb\n' > f; grep -cv a f`,
+  `printf 'Apple\nbanana\napple\n' > f; grep -i apple f`,
+  `printf 'Apple\nbanana\napple\n' > f; grep -in a f`,
+  `printf 'Apple\napple\n' > f; grep -x apple f`,
+  `printf 'a\nb\n' > f; grep -q a f; echo status=$?`,
+  `printf 'a\nb\n' > f; grep -q z f; echo status=$?`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; grep a f1 f2`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; grep -c a f1 f2`,
+  // A file that cannot be read: each of these has GNU's own status for it, and three of the four
+  // concatenating programs carry on with what they could read where `sort` gives up.
+  `grep a missing; echo status=$?`,
+  `wc -l missing; echo status=$?`,
+  `head -1 missing; echo status=$?`,
+  `tail -1 missing; echo status=$?`,
+  `sort missing; echo status=$?`,
+  `uniq missing; echo status=$?`,
+  `rev missing; echo status=$?`,
+  `nl missing; echo status=$?`,
+  `wc -l missing1 missing2; echo status=$?`,
+  `printf 'c\n' > f2; nl missing f2; echo status=$?`,
+  `printf 'c\n' > f2; rev missing f2; echo status=$?`,
+  `printf 'c\n' > f2; sort missing f2; echo status=$?`,
+  `printf 'c\n' > f2; grep c missing f2; echo status=$?`,
+  `printf 'a\nb\n' > f; wc -l f missing; echo status=$?`,
+  `printf 'a\nb\n' > f; head -1 f missing; echo status=$?`,
+  // An option none of them has, refused rather than taken for something else. The statuses differ by
+  // program and are GNU's: 1 for `wc`, `head`, `tail`, `uniq`, `nl` and `rev`; 2 for `sort` and `grep`.
+  `echo x | wc -Z; echo status=$?`,
+  `echo x | sort -Z; echo status=$?`,
+  `echo x | grep -Y x; echo status=$?`,
+  `echo x | uniq -Z; echo status=$?`,
+  `echo x | head -Z; echo status=$?`,
+  `echo x | tail -Z; echo status=$?`,
+  `echo x | nl -Z; echo status=$?`,
+  `echo x | rev -Z; echo status=$?`,
 ].entries()) {
   // A directory per case, made by the harness rather than the script, so one failure cannot
   // leave a mess that changes what the next case sees.
@@ -743,6 +896,11 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
 async function bash(script: string) {
   const r = await new Deno.Command("bash", {
     args: ["-c", script],
+    // No standard input for either shell, and said rather than inherited. A script that reads — `cat`
+    // or `read` with nothing redirected into it — now reads the *shell's* input, since `sh` claims it
+    // (issue 0032). Inheriting the test runner's would mean both shells waiting on a terminal that
+    // never ends, which is a hang rather than a difference.
+    stdin: "null",
     env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
     clearEnv: true,
   }).output();
@@ -772,6 +930,7 @@ const wacshBinary = await (async () => {
 async function wacsh(script: string) {
   const r = await new Deno.Command(wacshBinary, {
     args: ["-c", script],
+    stdin: "null",   // as for bash above: the comparison is of scripts, not of terminals
     env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin", HOME: Deno.env.get("HOME") ?? "" },
     clearEnv: false,
   }).output();
@@ -868,5 +1027,217 @@ Deno.test({
     const raw = odd.stderr;
     assertEquals(raw.includes(0xff) && raw.includes(0xfe), true,
       `the bytes reached standard error unchanged: ${Array.from(raw).join(",")}`);
+  },
+});
+
+/**
+ * The shell's *own* standard input, which nothing else here exercises.
+ *
+ * Every case above is a script with no input piped in, which is why issue 0032 survived so long:
+ * `printf x | sh -c 'cat'` printed nothing, because `stdinBytes` was only ever filled by a
+ * redirection, a here-document or a pipeline. These pass the same bytes to both shells and compare
+ * what comes out, so the cursor (`read` then `cat`), the empty case, and a command that consumes
+ * everything are all pinned against bash rather than against my idea of bash.
+ *
+ * `cat; cat` is **not** here, and where it lives is the point. This binary is `packages/sh` alone, whose
+ * `cat` is one of the small wac implementations in `program.wac` — a function call inside the shell,
+ * handed a byte array. Nothing can tell how much of it that call read, so the shell cannot mark the
+ * input consumed and the second `cat` sees it again. Where the commands are *real programs* — the shell
+ * in `packages/box`, whose applets are spawned — the child is handed the shell's own descriptor and the
+ * second finds what the first left, exactly as in bash. That case is pinned in
+ * `packages/box/test/shell.test.ts`, and issue 0042 is where the reasoning is.
+ *
+ * `echo hi; cat` and `seq 1 2; cat` are the other side of it and belong here: a command that ignores its
+ * input must leave it for the next one, in-process or not.
+ */
+const STDIN_CASES: [string, string][] = [
+  ["cat", "a b c\nd\n"],
+  ["read x; echo \"[$x]\"; cat", "a b c\nd\n"],
+  ["echo hi; cat", "kept\n"],
+  ["seq 1 2; cat", "kept\n"],
+  ["read x; read y; echo \"[$x][$y]\"", "one\ntwo\nthree\n"],
+  ["cat", ""],
+  ["read x; echo \"[$x]\"", ""],
+  ["while read line; do echo \"got $line\"; done", "a\nb\nc\n"],
+  ["echo before; cat; echo after", "middle\n"],
+];
+
+Deno.test({
+  name: "the shell reads its own standard input, as bash does",
+  ignore: !haveBash,
+  fn: async () => {
+    for (const [script, input] of STDIN_CASES) {
+      const fed = async (cmd: string, args: string[]) => {
+        const p = new Deno.Command(cmd, {
+          args,
+          stdin: "piped",
+          stdout: "piped",
+          stderr: "null",
+          env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+          clearEnv: true,
+        }).spawn();
+        const w = p.stdin.getWriter();
+        await w.write(new TextEncoder().encode(input));
+        await w.close();
+        const out = await p.output();
+        return { out: new TextDecoder().decode(out.stdout), code: out.code };
+      };
+      const theirs = await fed("bash", ["-c", script]);
+      const ours = await fed(wacshBinary, ["-c", script]);
+      assertEquals(
+        ours.out,
+        theirs.out,
+        `${JSON.stringify(script)} over ${JSON.stringify(input)}`,
+      );
+      assertEquals(ours.code, theirs.code, `${JSON.stringify(script)}: exit status`);
+    }
+
+    // A script *read from* standard input consumes it, so a command inside it has nothing left —
+    // `echo cat | sh` runs `cat` with no input rather than feeding it the rest of the script.
+    const script = "cat\n";
+    const asScript = async (cmd: string, args: string[]) => {
+      const p = new Deno.Command(cmd, {
+        args,
+        stdin: "piped",
+        stdout: "piped",
+        stderr: "null",
+        env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+        clearEnv: true,
+      }).spawn();
+      const w = p.stdin.getWriter();
+      await w.write(new TextEncoder().encode(script));
+      await w.close();
+      return new TextDecoder().decode((await p.output()).stdout);
+    };
+    assertEquals(await asScript(wacshBinary, []), await asScript("bash", []), "script from stdin");
+  },
+});
+
+/**
+ * `HOME` and `OLDPWD`, which every case above runs without.
+ *
+ * The harness clears the environment and sets `LC_ALL` and `PATH`, deliberately: a script whose answer
+ * depends on the machine's `$USER` is not a comparison. But `cd` and `cd -` read `HOME` and `OLDPWD`,
+ * and with those cleared *bash* refuses too — so the corpus agreed with bash about the failure and
+ * never asked about the success. `cd` alone went nowhere and said "HOME not set" while `echo $HOME` in
+ * the same shell printed it, because expansion fell back to the environment and `cd` looked only at
+ * variables this shell had assigned.
+ *
+ * Two named variables, both set to a temporary directory, so the answer is still the shell's and not
+ * the machine's. `~` is here for the same reason and could not have been compared above either: with
+ * `HOME` unset bash reads the password file instead, so `echo ~` would be the container's own answer.
+ */
+Deno.test({
+  name: "HOME and OLDPWD reach `cd`, `cd -` and `~`, as they do in bash",
+  ignore: !haveBash,
+  fn: async () => {
+    const home = await Deno.makeTempDir({ prefix: "sh-home-" });
+    const old = await Deno.makeTempDir({ prefix: "sh-old-" });
+    const from = await Deno.makeTempDir({ prefix: "sh-from-" });
+    try {
+      const cases = [
+        "cd; pwd",                     // HOME from the environment
+        "cd -",                        // OLDPWD from the environment, and `cd -` prints where it went
+        'cd ""; pwd',                  // present but empty: a no-op, not "go home"
+        "cd; cd -; pwd",               // and OLDPWD as this shell set it, not as it inherited it
+        "HOME=; cd; pwd",              // assigned empty in this shell, which is not the same as unset
+        "cd nowhere; pwd",             // still where it was, and status 1
+        "cd; echo st=$?",
+        // Tilde expansion, which is the same `HOME` and could not be compared with it cleared either:
+        // bash falls back to the password file, so `echo ~` there prints the real home directory and
+        // nothing in this container's environment makes the two shells agree.
+        "echo ~",
+        "echo ~/x",
+        'echo "~"',                    // quoted: a tilde is a tilde
+        "echo \\~",
+        "echo a~",                     // not at the front of the word
+        "echo ~a",                     // a user name, which neither shell can resolve here
+        "echo ~/x ~",
+        "echo ~:~",                    // in a *word* only the leading one expands
+        "echo ~:x",                    // …and a colon ends a tilde-prefix even so
+        "echo ~=x",                    // while other punctuation does not: a word, not a home
+        "echo ~/a:~/b",                // still one, in a word
+        'echo "a~"~',                  // …and the front of the word is not the front of a part
+        "x=~/a; echo $x",
+        "y=/u:~/b; echo $y",           // in an assignment, one after every colon
+        "v=~:~; echo $v",              // …so both of these expand, unlike in the word above
+        "z=~; echo $z/y",              // expanded once, at assignment time
+        "cd ~; pwd",
+        "echo hi > ~/f; cat ~/f",      // a redirection target, which is why `joinWord` does it too
+      ];
+      for (const script of cases) {
+        const run = (cmd: string, args: string[]) =>
+          new Deno.Command(cmd, {
+            args,
+            cwd: from,
+            stdin: "null",
+            stdout: "piped",
+            stderr: "null",
+            env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin", HOME: home, OLDPWD: old },
+            clearEnv: true,
+          }).outputSync();
+        const theirs = run("bash", ["-c", script]);
+        const ours = run(wacshBinary, ["-c", script]);
+        const text = (r: Deno.CommandOutput) => new TextDecoder().decode(r.stdout);
+        assertEquals(text(ours), text(theirs), `${JSON.stringify(script)}: output`);
+        assertEquals(ours.code, theirs.code, `${JSON.stringify(script)}: exit status`);
+      }
+    } finally {
+      for (const d of [home, old, from]) await Deno.remove(d, { recursive: true });
+    }
+  },
+});
+
+/**
+ * The builtins' *diagnostics*, against GNU's own.
+ *
+ * Every case above compares standard output, which is the right default — a shell's job is what it
+ * prints — and it means the wording of a failure was never checked against anything. `mkdir` and `rm`
+ * are the two builtins here that GNU also ships as programs, so their lines are comparable, and they
+ * were not comparable at all: they carried the host's errno and an absolute path GNU does not print
+ * ("File exists (os error 17): mkdir '/tmp/…'"), which also differed by runtime — Node says
+ * "EEXIST: file already exists" for the same fault.
+ *
+ * `LC_ALL=C` matters here and is why the harness above sets it: GNU quotes the path with typographic
+ * marks in a UTF-8 locale and with apostrophes in C.
+ */
+Deno.test({
+  name: "mkdir and rm say what GNU says when they fail",
+  ignore: !haveBash,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "sh-diag-" });
+    try {
+      await Deno.mkdir(`${dir}/full/inner`, { recursive: true });
+      await Deno.mkdir(`${dir}/taken`);
+
+      // Builtins only. This binary is `packages/sh` alone, so `rmdir` here is "command not found" —
+      // it is `packages/box`'s applet, and its "Directory not empty" is compared against GNU in
+      // `box/test/shell.test.ts` where that applet exists.
+      const cases = [
+        "mkdir taken",      // exists
+        "rm nosuchthing",   // absent
+        "rm full",          // a directory, without -r
+      ];
+      for (const script of cases) {
+        const run = (cmd: string, args: string[]) =>
+          new Deno.Command(cmd, {
+            args,
+            cwd: dir,
+            stdin: "null",
+            stdout: "null",
+            stderr: "piped",
+            env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+            clearEnv: true,
+          }).outputSync();
+        const theirs = new TextDecoder().decode(run("bash", ["-c", script]).stderr).trim();
+        const ours = new TextDecoder().decode(run(wacshBinary, ["-c", script]).stderr).trim();
+        // The reason, which is the part a person reads and the part that was wrong. Compared rather than
+        // the whole line because a prefix can legitimately differ in shape; the reason cannot.
+        const reason = (line: string) => line.slice(line.lastIndexOf(": ") + 2);
+        assertEquals(reason(ours), reason(theirs), `${script}\n  ours:  ${ours}\n  theirs: ${theirs}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
   },
 });

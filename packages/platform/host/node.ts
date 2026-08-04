@@ -13,12 +13,17 @@
 import { type Handlers } from "./respond.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
-import { ChildStack, packCaptured, unpackPush } from "./child.ts";
+import { ChildStack, joinPath, packCaptured, unpackPush } from "./child.ts";
 import {
+  ByteQueue,
   type Child,
   failedChild,
   noSpawnHere,
   spawnChild,
+  twoHandles,
+  unpackSpawn,
+  unpackSpawnSelf,
+  want,
   type WorkerLike,
 } from "./children.ts";
 import { bridgeOf, newBridge } from "./layout.ts";
@@ -42,7 +47,7 @@ export type NodeIo = {
    * promise-shaped, which is all the bridge needs.
    */
   connect(host: string, port: number): Promise<NodeSock>;
-  listen(port: number): Promise<NodeListener>;
+  listen(address: string, port: number): Promise<NodeListener>;
   writeStdout(bytes: Uint8Array): Promise<void>;
   /** The error stream as bytes. Optional: a host without one falls back to `warn`'s line. */
   writeStderr?(bytes: Uint8Array): Promise<void>;
@@ -62,6 +67,8 @@ export type NodeSock = {
   recv(): Promise<Uint8Array>;   // empty when the peer has closed
   send(b: Uint8Array): Promise<void>;
   close(): void;
+  /** The address at the other end, where the runtime says. Absent for one this program dialled. */
+  peer?: string;
 };
 
 export type NodeListener = {
@@ -85,6 +92,8 @@ export type NodeWorldOptions = {
    * it is what started the program.
    */
   selfSource?: string;
+  /** Where relative paths resolve from, and what `cwd` reports. Absent means the process's own. */
+  cwd?: string;
   log?(line: string): void;
   warn?(line: string): void;
   fs?: { read?: boolean; write?: boolean };
@@ -107,6 +116,20 @@ function failed(why: string): Uint8Array {
   const out = new Uint8Array(message.length + 1);
   out[0] = 2;
   out.set(message, 1);
+  return out;
+}
+
+/**
+ * A handle and the peer's address, which is what `Socket` decodes.
+ *
+ * The same shape the Deno host answers with: one i32, then whatever follows is the address. Only
+ * `accept` has a peer to name.
+ */
+function withPeer(handle: number, peer: string): Uint8Array {
+  const text = new TextEncoder().encode(peer);
+  const out = new Uint8Array(4 + text.length);
+  new DataView(out.buffer).setInt32(0, handle, true);
+  out.set(text, 4);
   return out;
 }
 
@@ -146,6 +169,14 @@ export function nodeWorld(
   const listeners = new Map<number, NodeListener>();
   /** Children by handle, in the same namespace as sockets: `waitAny` does not care which is which. */
   const children = new Map<number, Child>();
+  /**
+   * A child's error stream, by its own handle.
+   *
+   * Separate from `children` because it is a separate stream, and reading it is `recv` like anything
+   * else — a handle is a handle, which is what lets `waitAny` watch a child's two streams and a
+   * socket in one call.
+   */
+  const errStreams = new Map<number, ByteQueue>();
   let nextHandle = 1;
 
   /**
@@ -157,29 +188,38 @@ export function nodeWorld(
   const startChild = async (
     source: string,
     childArgs: string[],
-    want: number,
+    wanted: number,
+    childCwd: string,
+    inheritIn: boolean,
   ): Promise<Uint8Array> => {
     const makeWorker = opts.makeWorker;
     if (makeWorker === undefined) {
       return noSpawnHere("this Node launcher was built without a way to start a worker");
     }
     const give = {
-      read: (want & GRANT_READ) !== 0 && opts.fs?.read === true,
-      write: (want & GRANT_WRITE) !== 0 && opts.fs?.write === true,
-      net: (want & GRANT_NET) !== 0 && opts.net === true,
-      env: (want & GRANT_ENV) !== 0 && opts.env !== undefined,
+      read: (wanted & GRANT_READ) !== 0 && opts.fs?.read === true,
+      write: (wanted & GRANT_WRITE) !== 0 && opts.fs?.write === true,
+      net: (wanted & GRANT_NET) !== 0 && opts.net === true,
+      env: (wanted & GRANT_ENV) !== 0 && opts.env !== undefined,
     };
     const h = nextHandle++;
-    const child = spawnChild(source, childArgs, (sab, cargs, out, input) => {
+    const child = spawnChild(source, childArgs, (sab, cargs, out, input, cerr) => {
       const enc = new TextEncoder();
       // The child's stdio is the parent's queues. Everything else about its world — files, sockets,
       // the clock — is this world's, narrowed by `give`.
+      // An inheriting child keeps `io`'s own readers, which are the process's standard input: it reads
+      // the same stream its parent would have, streaming and shared. Issue 0042.
       const childIo: NodeIo = {
         ...io,
-        readStdin: () => input.next(),
-        readStdinChunk: () => input.next(),
-        writeStdout: async (b: Uint8Array) => { out.push(b); },
-        writeStderr: async (b: Uint8Array) => { out.push(b); },
+        ...(inheritIn ? {} : {
+          readStdin: () => input.rest(),
+          readStdinChunk: () => input.next(),
+        }),
+        writeStdout: async (b: Uint8Array) => {
+          // See the note in `deno.ts`: a full queue must fail the write rather than growing.
+          if (!out.push(b)) throw new Error("the child's output is not being read");
+        },
+        writeStderr: async (b: Uint8Array) => { cerr.push(b); },
       };
       return serveHostCalls(bridgeOf(sab), nodeWorld(fs, proc, childIo, {
         args: cargs,
@@ -188,9 +228,10 @@ export function nodeWorld(
         ...(give.env ? { env: opts.env } : {}),
         // A line of output is bytes on the handle, with the newline `log` implies.
         log: (l: string) => out.push(enc.encode(l + "\n")),
-        warn: (l: string) => out.push(enc.encode(l + "\n")),
+        warn: (l: string) => cerr.push(enc.encode(l + "\n")),
         makeWorker,
         selfSource: opts.selfSource,
+        cwd: childCwd === "" ? opts.cwd : childCwd,
       }));
     }, newBridge, makeWorker);
 
@@ -199,8 +240,12 @@ export function nodeWorld(
       child.kill();
       return failedChild(why);
     }
+    // Two handles for one child: its output and its error stream. Numbered from the same counter, so
+    // `waitAny` can watch both beside a socket without knowing which is which.
+    const eh = nextHandle++;
     children.set(h, child);
-    return i32le(h);
+    errStreams.set(eh, child.err);
+    return twoHandles(h, eh, "");
   };
   const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
 
@@ -209,7 +254,7 @@ export function nodeWorld(
   // `write` answers a bool and cannot carry a reason, so this is recorded for `outputError`. The
   // reads no longer need an equivalent: `Read` carries theirs.
   let outputFailure = "";
-  const P = (path: string) => kids.path(path);
+  const P = (path: string) => joinPath(opts.cwd ?? "", kids.path(path));
 
   return {
     [OP.NOW_MILLIS]: () => i64le(BigInt(Date.now())),
@@ -220,7 +265,7 @@ export function nodeWorld(
     //
     // `unref()` is deliberately absent: an outstanding timer holding the event loop open
     // is what keeps a worker parked on it from waiting forever.
-    [OP.CWD]: () => str(process.cwd()),
+    [OP.CWD]: () => str(opts.cwd !== undefined && opts.cwd !== "" ? opts.cwd : process.cwd()),
     [OP.SLEEP_MILLIS]: (p) =>
       new Promise<Uint8Array>((ok) =>
         setTimeout(() => ok(i64le(BigInt(Math.round(performance.now() * 1e6)))), readI32le(p))
@@ -328,23 +373,19 @@ export function nodeWorld(
      * act on: -2, "there is no spawn here", which is not a fact about the program.
      */
     [OP.SPAWN]: (p) => {
-      const want = readI32le(p);
-      const n = readI32le(p.subarray(4));
-      const source = unstr(p.subarray(8, 8 + n));
-      const rest = unstr(p.subarray(8 + n));
-      return startChild(source, rest.length === 0 ? [] : rest.split("\u0000"), want);
+      const { source, args, cwd, inheritIn } = unpackSpawn(p);
+      return startChild(source, args, want(p), cwd, inheritIn);
     },
 
     /** This same program again, with different arguments. See `spawnSelf` in platform.wac. */
     [OP.SPAWN_SELF]: (p) => {
-      const want = readI32le(p);
-      const rest = unstr(p.subarray(4));
       if (opts.selfSource === undefined) {
         return Promise.resolve(
           noSpawnHere("this launcher did not pass the program its own source"),
         );
       }
-      return startChild(opts.selfSource, rest.length === 0 ? [] : rest.split("\u0000"), want);
+      const { args, cwd, inheritIn } = unpackSpawnSelf(p);
+      return startChild(opts.selfSource, args, want(p), cwd, inheritIn);
     },
     [OP.CLOSE_FEED]: (p) => {
       children.get(readI32le(p))?.in.end();
@@ -438,9 +479,10 @@ export function nodeWorld(
       sockets.set(h, c);
       return i32le(h);
     },
+    /** Bind an address and a port; empty means every interface. See `listen` in platform.wac. */
     [OP.LISTEN]: async (p) => {
       if (!opts.net) deny("network access");
-      const l = await io.listen(readI32le(p));
+      const l = await io.listen(unstr(p.subarray(4)), readI32le(p));
       const h = nextHandle++;
       listeners.set(h, l);
       return i32le(h);
@@ -451,7 +493,8 @@ export function nodeWorld(
       const c = await l.accept();
       const h = nextHandle++;
       sockets.set(h, c);
-      return i32le(h);
+      // The peer travels with the handle, so a server can refuse one that is not from this machine.
+      return withPeer(h, c.peer ?? "");
     },
     [OP.RECV]: async (p) => {
       const h = readI32le(p);
@@ -464,6 +507,11 @@ export function nodeWorld(
       if (kid !== undefined) {
         const fromChild = await kid.out.next();
         return fromChild.length === 0 ? END : data(fromChild);
+      }
+      const complaint = errStreams.get(h);
+      if (complaint !== undefined) {
+        const said = await complaint.next();
+        return said.length === 0 ? END : data(said);
       }
       const c = sockets.get(h);
       if (c === undefined) return failed("not an open socket");
@@ -492,6 +540,7 @@ export function nodeWorld(
       sockets.delete(h);
       listeners.delete(h);
       children.delete(h);
+      errStreams.delete(h);
       return EMPTY;
     },
 

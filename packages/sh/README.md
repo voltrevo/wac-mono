@@ -16,7 +16,7 @@ All commands run from the repo root.
 
 ## The oracle is bash
 
-`test/differential.test.ts` runs 499 scripts through GNU bash and through this, and requires the
+`test/differential.test.ts` runs 652 scripts through GNU bash and through this, and requires the
 same standard output *and* the same exit status. For a shell that is the only test worth much:
 the behaviour is defined by what the real one does, and nearly every rule has a case where the
 obvious implementation is subtly wrong.
@@ -144,18 +144,74 @@ cat wc head tail rev sort uniq grep tr seq nl printf
 
 Those twelve exist because, when they were written, nothing could be started and nothing could be
 handed over. Both of those are now false, and they have become what the seam always said they
-were: a fallback. They are also visibly weaker than `box`'s — this `grep` matches substrings where
-`box`'s takes `-ivnc`, this `sort` is an insertion sort — so the sensible end state is to delete
-them once something checks that `box`'s pass the same differential scripts against bash. Kept for
-now because 539 of those scripts currently agree with bash *through these*, and swapping the
+were: a fallback. They are still weaker than `box`'s — this `grep` matches substrings rather than
+regular expressions, this `sort` is an insertion sort — so the sensible end state is to delete them
+once something checks that `box`'s pass the same differential scripts against bash. Kept for now
+because 652 of those scripts currently agree with bash *through these*, and swapping the
 implementation under a passing suite without measuring it first is how a green suite starts lying.
+
+**They read their operands**, which for nine of the twelve they did not: `wc`, `head`, `tail`,
+`sort`, `uniq`, `rev`, `nl` and `grep` ignored every file named on the command line and read standard
+input regardless. `wc -l f` printed `0` and exited `0`. `grep pattern f` printed nothing and exited
+1, which a script reads as "no match" rather than "the file was never opened". `cat` was the only one
+that had ever opened anything, and it is the reason `run` takes a `cwd` at all. Several operands
+change the shape of the answer and that shape is GNU's: `wc` names each file and totals them, `head`
+and `tail` write a `==> name <==` header per block, `grep` labels its lines, and `sort`, `nl` and
+`rev` treat the operands as one concatenation. A file that cannot be read carries each program's own
+status — 1 for most, 2 for `sort` and `grep` — and only `sort` gives up rather than answering over
+what it could read.
+
+**An option none of them has is refused.** It used to fall through to whatever the program did with a
+stray argument, which was never nothing: `grep -c a f` searched for `-c`, `sort -n` sorted as text,
+`wc -m` counted everything. `grep` now takes `-cinqvx`, `wc` `-lwc`, `sort` `-r`, `head`/`tail` the
+count in both spellings, and anything else is a usage error with GNU's status.
+
+Two deliberate differences remain, both refusals rather than approximations. `uniq f g` *writes* `g`
+in GNU; here it is refused, because a write nobody asked for is worse than a missing feature. And a
+diagnostic goes to standard error in one piece after the output rather than interleaved with it,
+which is the seam again — the fallback programs hand back two finished byte strings.
+
+**`tr` takes `-c`, `-d`, `-s` and `-t`**, interprets `\n`-style escapes and `[:alpha:]`-style
+classes, and *refuses* an option it does not have. It did none of that until bash was asked: `-d`
+was read as the two-character set `{-, d}`, so `tr -d 12` translated digits into a dash and a `d`
+and reported success; `tr : '\n'` produced a backslash and an `n`; `[:digit:]` was eight literal
+characters. `[c*n]` and `[=c=]` are refused rather than approximated, which is the one place this
+`tr` says no to something GNU does.
 
 The single seam was the point, and it paid off: wiring `spawn` in changed no part of the pipeline,
 redirection, status or `&&` handling, because all of it was already written against `Output`. The
 stubs became what they were meant to be — a fallback for when the real program is absent.
 
-A child is granted nothing but its two streams, so a program that needs the filesystem cannot be
-run as one yet — that is `packages/platform`'s roadmap rather than an issue here.
+**A pipeline runs its stages at once**, where every stage is a program the shell can spawn.
+`seq 1 200000 | head -1` takes 0.15 seconds rather than 11.8, and 0.07 seconds in a browser tab, which
+is the same code. One `recv` in flight per open stream, `waitAny` over all of them, and a stage whose
+reader has finished is stopped.
+
+That is *not* `SIGPIPE`, and this paragraph used to say it was. Stopping a stage stops the worker; it
+does not shorten the work the worker has already been asked to do, because the seam is bytes in and
+bytes out — a program has produced nothing until it has produced all of it. Measured at twenty
+million lines: `seq | head -1` takes 2.02s, `seq | wc -l` 2.37s, and `seq` alone about the same. The
+difference is the *reader's* work, not the writer's, and `seq 1 2000000000 | head -1` still dies
+where bash prints one line. [Issue 0061](../../issues/open/0061-sh-applets-return-all-their-output-at-once-so-a-large-stage-dies.md).
+
+`canStream` decides before anything is expanded, because expansion runs command substitutions and
+asking twice would run them twice: every stage must be a plain command whose name is a bare literal
+naming one of this program's applets, with no redirection and no prefix assignment. Everything else
+takes the sequential path — a builtin *is* the shell, a function lives in its table — which is
+unchanged and still gathers. That boundary is visible rather than silent: `{ echo a; } | rev` gathering
+is fine, `seq | head` gathering was the bug. Issue 0038.
+
+**An applet of the shell's own program is spawned, not called.** `Shell.externalSpawnable` says the
+names in `externalNames` are applets of *this very bundle* — true for `packages/box`, whose `main`
+dispatches on its first argument — and then `trySelf` runs one with `spawnSelf`: its own wasm
+instance, its own grants, its own two streams, standing in the shell's own directory. That is a real
+boundary where calling was merely convenient, and it is the same route in a browser tab, where it is
+the *only* route to a real program. A world that cannot spawn falls through to calling the applet, so
+nothing regresses where the capability is missing.
+
+A child is granted what the shell has, which the host narrows to what it actually holds: an applet
+run in process had the shell's whole authority implicitly, and asking for it explicitly is the same
+authority said out loud.
 
 The first thing a shell trips over is a file on `$WACPATH` that is not a worker bundle, and there
 are two of those. One that does not parse is now a failed command with the host's reason and status
@@ -219,15 +275,33 @@ above the root, a failed `cd` leaving the shell where it was.
 `-a` is the only flag, and it synthesises `.` and `..` as a real `ls` does, since `readDir` does
 not report them.
 
+**`~` is `$HOME` and nothing else.** `~`, `~/x`, `cd ~`, `> ~/f`, and one after every colon in an
+assignment (`PATH=/usr/bin:~/bin`, which has to expand or the shell keeps a directory called `~` on
+its search path). Left exactly as written: `~user`, because naming somebody else's home means
+reading the password file and no capability offers it — bash also leaves a user it cannot find
+alone — and `~+`/`~-`, which are `$PWD` and `$OLDPWD` under a spelling almost nobody types. With
+`HOME` unset bash asks the password file and this leaves the word alone, which is the only case
+where the two disagree; the differential suite therefore compares `~` with `HOME` set, in the same
+test as `cd` and `cd -`, since all three read it.
+
 **No `$0`.** `cli.arg(0)` is the first *argument*, not the program name, so there is nothing
 truthful to put there.
 
 **No process substitution.** `<(…)` needs a pipe with a name, which the capability world does
 not offer.
 
-**Pipelines run one stage at a time**, in memory. A real pipeline runs its stages at once, so
-`yes | head -1` terminates in bash and would not here. Real processes will not fix that by
-themselves: it needs the shell to run stages concurrently, which needs more than one thread.
+**Pipeline stages run at once; a stage's own output does not stream.** This section used to say
+stages ran one at a time, and they no longer do — a pipeline whose every stage is a spawnable
+program named by a plain literal runs them concurrently, each in its own worker, and `canStream` in
+`exec.wac` is the exact list of what qualifies (a builtin, a compound, a redirection or an
+assignment falls back to one-at-a-time in memory, because those run in *this* shell).
+
+What did not change is the seam's signature: bytes in, bytes out. A program produces all of its
+output before any of it moves, so `head -1` cannot stop the stage feeding it — `seq 1 2000000000 |
+head -1` prints `1` in bash and here it dies with "requested new array is too large" after five
+seconds, exactly as `seq 1 2000000000 > out` does on its own. Stage concurrency does not fix that
+and neither would real processes; it needs the applets to write as they go, the way
+[`packages/box`](../box/README.md)'s do through `Sink`.
 
 **Globbing is last-component only.** A pattern in the final path component works; one in a leading
 component does not, because that needs walking every directory that matches.

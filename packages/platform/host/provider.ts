@@ -221,11 +221,14 @@ export function cliOf(
       // A handle, then — when the handle is negative — why it never started. The host waits for the
       // source to load before answering, so "it is not a worker bundle" arrives here as a `Child`
       // with a reason rather than as an error that killed this program. wac-mono issue 0021.
+      // Two handles, then — when they are negative — why there is nothing to read. The output stream
+      // and the error stream are separate because a program has two of them; see `Child`.
       const out = collect(b, unpack(id));
       const handle = readI32le(out);
-      return cls.Child.of(handle, handle < 0 ? unstr(out.subarray(4)) : "");
+      const errHandle = readI32le(out.subarray(4));
+      return cls.Child.of(handle, errHandle, handle < 0 ? unstr(out.subarray(8)) : "");
     } catch (e) {
-      return cls.Child.of(-1, e instanceof Error ? e.message : String(e));
+      return cls.Child.of(-1, -1, e instanceof Error ? e.message : String(e));
     }
   };
   const captured = (id: number) => {
@@ -279,9 +282,12 @@ export function cliOf(
   };
   const socket = (id: number) => {
     try {
-      return cls.Socket.of(readI32le(collect(b, unpack(id))), "");
+      // A handle, then the peer's address for a socket that came from `accept` — empty for one that
+      // came from `connect` or `listen`, where the peer is either the caller's own choice or nobody.
+      const out = collect(b, unpack(id));
+      return cls.Socket.of(readI32le(out), "", unstr(out.subarray(4)));
     } catch (e) {
-      return cls.Socket.of(-1, e instanceof Error ? e.message : String(e));
+      return cls.Socket.of(-1, e instanceof Error ? e.message : String(e), "");
     }
   };
 
@@ -327,6 +333,9 @@ export function cliOf(
     return out;
   };
   /** A length-prefixed head, so the host can tell where it ends — `writeFile` and `rename`. */
+  /** One byte, so a boolean can travel where a length prefix would be overkill. */
+  const flag = (on: boolean): Uint8Array => new Uint8Array([on ? 1 : 0]);
+
   const prefixed = (head: Uint8Array, body: Uint8Array): Uint8Array => {
     const out = new Uint8Array(4 + head.length + body.length);
     out.set(i32le(head.length), 0);
@@ -404,7 +413,8 @@ export function cliOf(
     /*= connect */
     (host: string, port: number) => T.socket(submit(b, OP.CONNECT, headed(i32le(port), str(host)))),
     /*= listen */
-    (port: number) => T.socket(submit(b, OP.LISTEN, i32le(port))),
+    // The port, then the address — `headed` puts the fixed-width part first, as `spawn` does.
+    (address: string, port: number) => T.socket(submit(b, OP.LISTEN, headed(i32le(port), str(address)))),
     /*= accept */
     (handle: number) => T.socket(submit(b, OP.ACCEPT, i32le(handle))),
     /*= recv */
@@ -415,22 +425,37 @@ export function cliOf(
     (handle: number) => { hostCall(b, OP.CLOSE_SOCKET, i32le(handle)); },
 
     /*= spawn */
-    (source: string, args: string[], grants: number) =>
-      // The grant flags, then the source length-prefixed, then the arguments NUL-separated —
-      // the same shape `readDir` answers with, for the same reason: a filename or an argument
-      // may contain anything but a NUL.
+    (source: string, args: string[], grants: number, cwd: string, inheritIn: boolean) =>
+      // The grant flags, then the source length-prefixed, then the arguments length-prefixed and
+      // NUL-separated — the same shape `readDir` answers with, for the same reason: a filename or an
+      // argument may contain anything but a NUL — and then the child's directory.
       T.child(
         submit(
           b,
           OP.SPAWN,
-          headed(i32le(grants), prefixed(str(source), str(args.join("\u0000")))),
+          headed(
+            i32le(grants),
+            prefixed(
+              str(source),
+              prefixed(str(args.join("\u0000")), prefixed(str(cwd), flag(inheritIn))),
+            ),
+          ),
         ),
       ),
     /*= spawnSelf */
     // No source: the host has this program's own bundle, because it is what started it. The payload
     // is the grants and the arguments, in the shape `spawn` uses minus the part that is already here.
-    (args: string[], grants: number) =>
-      T.child(submit(b, OP.SPAWN_SELF, headed(i32le(grants), str(args.join("\u0000"))))),
+    (args: string[], grants: number, cwd: string, inheritIn: boolean) =>
+      T.child(
+        submit(
+          b,
+          OP.SPAWN_SELF,
+          headed(
+            i32le(grants),
+            prefixed(str(args.join("\u0000")), prefixed(str(cwd), flag(inheritIn))),
+          ),
+        ),
+      ),
     /*= closeFeed */
     (handle: number) => { hostCall(b, OP.CLOSE_FEED, i32le(handle)); },
     /*= exitCode */

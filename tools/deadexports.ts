@@ -28,6 +28,13 @@
 //   - a package's public API, if the only consumers are outside this repo — which is not
 //     the case here, since every package is exercised by a probe
 //
+// **Named from TypeScript counts as called.** Two shapes do that without any wac naming the
+// function: a by-name bridge entry (`wacTransformStream({ …, entry: "upperCase" })`) and a method on
+// a module from `wacBind` (`mod.scanKeys(8, 10_000)`). Both were reported dead while their tests and
+// benches ran them — `packages/stream`'s two transforms are the whole package, and a check that calls
+// the package's point dead is a check nobody keeps. Only files that mention `wacBind` or `entry:` are
+// searched for the method shape, so an unrelated TypeScript method of the same name does not count.
+//
 // So a report from this is a question, not a verdict. The two answers are "use it at the
 // call sites, which usually reads better than the literal" and "delete it".
 
@@ -66,6 +73,31 @@ files.sort();
 const source = new Map<string, string>();
 for (const f of files) source.set(f, await Deno.readTextFile(f));
 
+/**
+ * The repo's TypeScript, for the two by-name bridges — see the header.
+ *
+ * Read once rather than per name: there are a hundred and forty test files and fifty-five candidates,
+ * and the naive shape is a hundred and forty reads each.
+ */
+const tsSource = new Map<string, string>();
+{
+  const walk = async (dir: string): Promise<void> => {
+    try {
+      for await (const e of Deno.readDir(dir)) {
+        const path = `${dir}/${e.name}`;
+        if (e.isDirectory) {
+          if (e.name !== "node_modules" && e.name !== ".cache") await walk(path);
+        } else if (e.name.endsWith(".ts")) {
+          tsSource.set(path, await Deno.readTextFile(path));
+        }
+      }
+    } catch {
+      // A root that does not exist in this checkout is not an error.
+    }
+  };
+  for (const r of [...roots, "tools"]) await walk(r);
+}
+
 /** A file whose exports exist to be called from TypeScript, not from wac. */
 const isProbe = (f: string) =>
   f.includes("/test/") || f.includes("/size/") || f.endsWith("client_entry.wac");
@@ -92,6 +124,27 @@ for (const f of files) {
  * gets a check like this switched off. So the name alone counts, as long as it is not immediately
  * followed by something that makes it a different thing (a `.` or a `(`-less declaration keyword).
  */
+/**
+ * TypeScript that names this export as a string, or calls it on a bound module.
+ *
+ * The two by-name bridges in this repo. Deliberately narrow: `entry: "name"` anywhere, and `.name(`
+ * only in a file that mentions `wacBind` or `entry:`, so that a same-named method elsewhere in the
+ * repo's TypeScript is not mistaken for a caller.
+ */
+function namedFromTypeScript(name: string): string[] {
+  const hits: string[] = [];
+  const asEntry = new RegExp(`entry:\\s*["']${name}["']`);
+  const asMethod = new RegExp(`\\.${name}\\s*\\(`);
+  for (const [f, text] of tsSource) {
+    if (asEntry.test(text)) {
+      hits.push(f);
+      continue;
+    }
+    if ((text.includes("wacBind") || text.includes("entry:")) && asMethod.test(text)) hits.push(f);
+  }
+  return hits;
+}
+
 function callers(name: string, declFile: string, declLine: number): string[] {
   const hits: string[] = [];
   // `import { x as y }` means the call site says `y(`, so the alias counts as a call of
@@ -138,7 +191,10 @@ function aliasesOf(name: string): string[] {
 }
 
 const dead = decls
-  .map((d) => ({ ...d, used: callers(d.name, d.file, d.line) }))
+  .map((d) => ({
+    ...d,
+    used: [...callers(d.name, d.file, d.line), ...namedFromTypeScript(d.name)],
+  }))
   .filter((d) => d.used.length === 0);
 
 const byFile = new Map<string, Decl[]>();

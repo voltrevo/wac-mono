@@ -133,7 +133,12 @@ The categories are deliberately few, and `FAULT_OTHER` is not an embarrassment: 
 a taxonomy nobody branches on. What a program branches on is "was it already gone"; what a person
 reads is the message.
 
-**In a browser the message is the category's own short phrase**, not the `DOMException`'s. Deno and
+**In a browser the message is the category's own short phrase**, not the `DOMException`'s — for a
+failed *read* as much as a failed change, since one tab speaking two ways about the same failure is
+worse than either way. A read reports by throwing, so the rephrasing happens where the throw does; a
+fault the host *named itself* keeps its own words, because "filesystem read not granted to this
+application" says the page withheld the capability and "permission denied" says a filesystem refused an
+operation, and only one of those is true. Deno and
 Node say "No such file or directory (os error 2), remove '/tmp/x'" — terse, and it names the path and
 the operation, so it is worth passing on verbatim. A browser says "A requested file or directory could
 not be found at the time an operation was processed.", which is prose for a developer console and
@@ -232,6 +237,16 @@ current; an enumeration here went stale twice.
 one-at-a-time because the transforms take `fn[u8[]()]`, which has no parameter to carry a
 a transform expects; an `i32` in a struct has no such problem, and a server needs a
 listener and a connection open at the same time, so a current-socket could not express it.
+
+**`listen` takes the address to bind, and it is not optional.** It took a port alone until issue
+0025, and the host bound `0.0.0.0` — so every server written here was reachable from every interface
+and no program could ask for loopback. For most servers that is a deployment surprise; for
+`packages/tor`'s SOCKS proxy it was the difference between serving the person at the keyboard and
+running an open proxy that sources strangers' traffic out of somebody else's exit node, which is why
+every other SOCKS implementation binds loopback. `"127.0.0.1"` is loopback, `""` is every interface —
+the old behaviour, spelled out rather than defaulted into, so the surprising one is something somebody
+typed. `accept` answers with the peer's address beside the handle, and `Socket.fromLoopback` is the
+check that makes a wide bind survivable.
 
 `connect` resolves and dials, `listen` binds, `accept` blocks until someone arrives, and
 `recv` answers empty when the peer closes — a short read means nothing, exactly as for a
@@ -469,6 +484,18 @@ Child kid = cli.spawnSelf(string[]("sort", "-n"), GRANT_READ).wait();
 A child runs `main` even when the program also exports `page`, because it was spawned: it has a handle
 and nowhere to draw. One bundle can therefore be both a terminal and the programs the terminal runs —
 see `packages/platform/example/twin.wac`, which is the whole idea in forty lines, and issue 0030.
+
+**A child has two handles, because a program has two output streams.** `recv(handle)` is its output
+and `recv(errHandle)` is its error output. Merged — which they were until a shell tried it — a
+complaint arrives in the pipe: `cat nosuch | wc -c` counted the error message, and `cat nosuch` alone
+printed it to standard *output*. A second handle rather than a second capability, so everything that
+already works on handles goes on working, `waitAny` above all: a parent can watch a child's two
+streams and a socket in one call without knowing which is which.
+
+**A child stands where its parent says.** Both spawn capabilities take a directory: it is where the
+child's relative paths resolve from and what its own `cwd()` reports. Empty means the host's own,
+which is what a program with no opinion passes. A shell has an opinion, and without this its `cd` was
+invisible to everything it ran — `cd sub; prog f` opened `f`.
 
 `closeFeed` is distinct from `closeSocket` because they differ in a way that matters:
 `closeFeed` ends the child's standard input, `closeSocket` stops the child. A program that

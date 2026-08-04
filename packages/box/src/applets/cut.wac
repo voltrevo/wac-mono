@@ -3,7 +3,8 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, flagValue } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
-import { Line, Lines, emit, nextLine } from "../lib/reader.wac";
+import { Line, Lines, emitTo, nextLine } from "../lib/reader.wac";
+import { Sink } from "../lib/out.wac";
 import { slice } from "../lib/bytes.wac";
 import { atoi } from "../lib/num.wac";
 
@@ -18,10 +19,11 @@ export i32 cut(Core core, Cli cli, Args a) {
   Input in = openStream(core, cli, a, 0);
   if (!in.ok) { return 1; }
   Lines s = Lines.create();
+  Sink out = Sink.create(cli);
   while (true) {
     Line l = nextLine(s, cli);
-    if (!l.ok) { return 0; }
-    emit(cli, fieldOf(l.bytes, delim, field), true);
+    if (!l.ok) { out.flush(); return 0; }
+    emitTo(out, fieldOf(l.bytes, delim, field), true);
   }
   return 0;
 }

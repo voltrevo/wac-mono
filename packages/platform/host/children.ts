@@ -27,22 +27,123 @@
 // confinement one, and the grants it takes are meaningful for wac children and advisory for
 // anything else. See wac-mono issue 0015.
 
-/** A queue of byte chunks with an end, read one chunk at a time. */
+import { CHUNK } from "./layout.ts";
+
+/** One array from several, for a reader that asked for more than one chunk's worth. */
+function join(parts: Uint8Array[]): Uint8Array {
+  if (parts.length === 1) return parts[0];
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+
+/**
+ * How much may sit in a queue nobody is reading before a writer is told to stop.
+ *
+ * The same 8 MiB `child.ts` caps a *called* child's output at, and for the same reason: the program
+ * deciding how much to produce is not the one holding it. `box yes` writes for ever by design.
+ *
+ * This became load-bearing when a shell started *spawning* its applets rather than calling them.
+ * `yes | head -1` used to stop at the cap, because the in-process route had one; a spawned `yes`
+ * wrote into an unbounded queue that nothing drained once `head` had finished, and a browser tab
+ * died of it. A pipeline that ran its stages at once would end `yes` properly — `head` closing its
+ * input is what stops it — and until then this is the backstop rather than the mechanism. Issue 0038.
+ */
+const QUEUE_CAP = 8 << 20;
+
+/**
+ * A queue of byte chunks with an end, read one chunk at a time.
+ *
+ * `cap` bounds what may sit unread. **Only an output queue gets one.** A child's *input* is bytes its
+ * parent deliberately sent — `send` in `platform.wac` — and refusing those is data loss rather than
+ * backpressure: the first version of this capped every queue, and under a loaded machine
+ * `yes | head -1` came back empty, because 8 MiB was pushed into `head`'s input before `head` had
+ * started reading and the overflow was dropped on the floor. Silently. A cap belongs where a
+ * *producer* can be told to stop, which is the other direction.
+ */
 export class ByteQueue {
   #chunks: Uint8Array[] = [];
   #ended = false;
+  #held = 0;
+  #cap: number;
   #waiting: ((v: Uint8Array) => void) | null = null;
 
-  push(b: Uint8Array): void {
-    if (this.#ended) return;
+  constructor(cap = 0) {
+    this.#cap = cap;
+  }
+
+  /**
+   * Take these bytes, or answer false when the queue is full.
+   *
+   * False is the answer `write` in `platform.wac` already has a meaning for — "the other end is not
+   * taking it" — and `box yes` is written as `while (cli.write(block)) {}` precisely so that it
+   * stops. The host's job is to turn this into a failed `write`, which is what the caller does.
+   */
+  push(b: Uint8Array): boolean {
+    if (this.#ended) return false;
     // Straight to a waiter if there is one, so nothing is buffered that is already wanted.
     if (this.#waiting !== null) {
       const w = this.#waiting;
       this.#waiting = null;
       w(b);
-      return;
+      return true;
     }
+    if (this.#cap > 0 && this.#held + b.length > this.#cap) return false;
     this.#chunks.push(b);
+    this.#held += b.length;
+    return true;
+  }
+
+  /**
+   * Everything, to the end — for `readStdin`, which promises exactly that.
+   *
+   * A child's standard input arrives over time, so "all of it" means waiting for the end rather than
+   * taking what is there. Serving `readStdin` with one chunk is the bug this exists to fix:
+   * `seq 1 5 | sort -r` printed `1`, because `sort` read to the end before sorting and the end came
+   * after one line. Nothing showed it earlier — a sequential pipeline sent the whole input in one
+   * `send`, so one chunk *was* everything.
+   */
+  async rest(): Promise<Uint8Array> {
+    const parts: Uint8Array[] = [];
+    for (;;) {
+      const c = await this.next();
+      if (c.length === 0) return join(parts);
+      parts.push(c);
+    }
+  }
+
+  /** Up to `limit` bytes of what is queued, or null when nothing is. */
+  private take(limit: number): Uint8Array | null {
+    if (this.#chunks.length === 0) return null;
+    if (this.#chunks.length === 1 && this.#chunks[0].length <= limit) {
+      const only = this.#chunks.shift()!;
+      this.#held -= only.length;
+      return only;
+    }
+    const parts: Uint8Array[] = [];
+    let taken = 0;
+    while (this.#chunks.length > 0 && taken < limit) {
+      const head = this.#chunks[0];
+      if (taken + head.length <= limit) {
+        this.#chunks.shift();
+        parts.push(head);
+        taken += head.length;
+      } else {
+        // Split it: the rest stays at the front, so nothing is reordered and nothing is lost.
+        const room = limit - taken;
+        parts.push(head.subarray(0, room));
+        this.#chunks[0] = head.subarray(room);
+        taken += room;
+      }
+    }
+    this.#held -= taken;
+    return join(parts);
   }
 
   /** No more will arrive. A reader waiting now gets the empty array that means "ended". */
@@ -55,10 +156,18 @@ export class ByteQueue {
     }
   }
 
-  /** The next chunk, or empty once ended and drained. */
+  /**
+   * The next chunk, or empty once ended and drained.
+   *
+   * **Everything queued, up to `CHUNK`** — not literally the next thing pushed. A writer that emits a
+   * line at a time and a reader on the other side of a bridge is one round trip per line otherwise:
+   * `seq 1 200000 | wc -l` took forty-five seconds that way, almost all of it in two hundred thousand
+   * parks and wakes. Coalescing is free here and legal by the protocol, which promises *at most*
+   * `CHUNK` bytes and says a short read means nothing.
+   */
   next(): Promise<Uint8Array> {
-    const c = this.#chunks.shift();
-    if (c !== undefined) return Promise.resolve(c);
+    const c = this.take(CHUNK);
+    if (c !== null) return Promise.resolve(c);
     if (this.#ended) return Promise.resolve(new Uint8Array(0));
     return new Promise((res) => {
       // One reader at a time. Two concurrent `recv`s on the same handle are a program bug
@@ -81,8 +190,16 @@ const LOAD_GRACE_MS = 500;
 
 /** One spawned worker, from the parent's side. */
 export type Child = {
-  /** What the child wrote, in order. */
+  /** What the child wrote to standard output, in order. */
   out: ByteQueue;
+  /**
+   * What it wrote to standard error, in order — a stream of its own.
+   *
+   * Kept apart because a shell must be able to keep them apart: merged, `cat nosuch | wc -c` counts
+   * the error message. `pushChild`/`popChild` have always answered with both, and a spawned child had
+   * one stream until this existed.
+   */
+  err: ByteQueue;
   /** What the parent sent, which the child reads as its standard input. */
   in: ByteQueue;
   /** Resolves with the exit code, or a negative number if it failed to run. */
@@ -173,14 +290,17 @@ export function spawnChild(
     args: string[],
     out: ByteQueue,
     input: ByteQueue,
+    err: ByteQueue,
   ) => { stop(): void },
   makeBridge: () => { sab: SharedArrayBuffer },
   makeWorker: (source: string) => WorkerLike = blobWorker,
 ): Child {
-  const out = new ByteQueue();
+  // The two the child writes are capped; what the parent sends it is not — see `ByteQueue`.
+  const out = new ByteQueue(QUEUE_CAP);
+  const err = new ByteQueue(QUEUE_CAP);
   const input = new ByteQueue();
   const bridge = makeBridge();
-  const responder = startWorld(bridge.sab, args, out, input);
+  const responder = startWorld(bridge.sab, args, out, input, err);
 
   const worker = makeWorker(source);
   let stopped = false;
@@ -191,6 +311,7 @@ export function spawnChild(
     worker.terminate();
     // Whatever the child had written is already queued; this only says no more is coming.
     out.end();
+    err.end();
   };
 
   // Resolved by whichever comes first: the load notice, a load error, or the child finishing
@@ -228,7 +349,7 @@ export function spawnChild(
   // person opened it and a program when something spawned it — a child has a handle, not a canvas,
   // and `packages/box`'s terminal exports both for exactly that reason.
   worker.post({ sab: bridge.sab, child: true });
-  return { out, in: input, exit, loaded, kill: shutdown };
+  return { out, err, in: input, exit, loaded, kill: shutdown };
 }
 
 /**
@@ -239,17 +360,23 @@ export function spawnChild(
  * something, and `packages/sh` already turns it into 126: "it exists and would not start",
  * distinct from the 127 of not existing.
  */
+export function twoHandles(handle: number, errHandle: number, why: string): Uint8Array {
+  const text = new TextEncoder().encode(why.split("\n")[0]);
+  const out = new Uint8Array(8 + text.length);
+  const dv = new DataView(out.buffer);
+  dv.setInt32(0, handle, true);
+  dv.setInt32(4, errHandle, true);
+  out.set(text, 8);
+  return out;
+}
+
 export function failedChild(why: string): Uint8Array {
   // The first line only. A `SyntaxError` from a worker arrives with a code frame attached, which is
   // several lines and belongs on a terminal rather than inside `Child.error` — a shell puts this
   // after `sh: name: ` and expects one line, as every other diagnostic here is. The frame is not
   // lost: the worker's own isolate has already printed the whole of it to stderr, which is also why
   // a `preventDefault` in the parent cannot make that output go away.
-  const text = new TextEncoder().encode(why.split("\n")[0]);
-  const out = new Uint8Array(4 + text.length);
-  new DataView(out.buffer).setInt32(0, -1, true);
-  out.set(text, 4);
-  return out;
+  return twoHandles(-1, -1, why);
 }
 
 /**
@@ -261,9 +388,53 @@ export function failedChild(why: string): Uint8Array {
  * page cannot spawn. Reporting 126 instead hid them behind a capability the world never had.
  */
 export function noSpawnHere(why: string): Uint8Array {
-  const text = new TextEncoder().encode(why);
-  const out = new Uint8Array(4 + text.length);
-  new DataView(out.buffer).setInt32(0, -2, true);
-  out.set(text, 4);
-  return out;
+  return twoHandles(-2, -2, why);
+}
+
+/** The grants a `spawn` or `spawnSelf` payload asks for: always the first four bytes. */
+export function want(p: Uint8Array): number {
+  return new DataView(p.buffer, p.byteOffset, p.byteLength).getInt32(0, true);
+}
+
+/**
+ * A `spawn` payload: grants, then the source, then the arguments, then the child's directory.
+ *
+ * Here rather than in each host because it is the wire format, and three copies of a length-prefixed
+ * walk is three chances to disagree about it. `provider.ts` writes it; this reads it.
+ */
+export function unpackSpawn(
+  p: Uint8Array,
+): { source: string; args: string[]; cwd: string; inheritIn: boolean } {
+  const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+  const dec = new TextDecoder();
+  const sourceLen = dv.getInt32(4, true);
+  const source = dec.decode(p.subarray(8, 8 + sourceLen));
+  const argsAt = 8 + sourceLen;
+  const argsLen = dv.getInt32(argsAt, true);
+  const joined = dec.decode(p.subarray(argsAt + 4, argsAt + 4 + argsLen));
+  const cwdAt = argsAt + 4 + argsLen;
+  const cwdLen = dv.getInt32(cwdAt, true);
+  return {
+    source,
+    args: joined.length === 0 ? [] : joined.split("\u0000"),
+    cwd: dec.decode(p.subarray(cwdAt + 4, cwdAt + 4 + cwdLen)),
+    inheritIn: p[cwdAt + 4 + cwdLen] === 1,
+  };
+}
+
+/** The same, for `spawnSelf`, which needs no source: grants, arguments, directory. */
+export function unpackSpawnSelf(
+  p: Uint8Array,
+): { args: string[]; cwd: string; inheritIn: boolean } {
+  const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+  const dec = new TextDecoder();
+  const argsLen = dv.getInt32(4, true);
+  const joined = dec.decode(p.subarray(8, 8 + argsLen));
+  const cwdAt = 8 + argsLen;
+  const cwdLen = dv.getInt32(cwdAt, true);
+  return {
+    args: joined.length === 0 ? [] : joined.split("\u0000"),
+    cwd: dec.decode(p.subarray(cwdAt + 4, cwdAt + 4 + cwdLen)),
+    inheritIn: p[cwdAt + 4 + cwdLen] === 1,
+  };
 }

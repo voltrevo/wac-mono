@@ -5,6 +5,7 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
+import { Sink } from "../lib/out.wac";
 import { Input, openStream } from "../lib/input.wac";
 import { Line, Lines, nextLine } from "../lib/reader.wac";
 import { itoa } from "../lib/num.wac";
@@ -29,6 +30,7 @@ export i32 grep(Core core, Cli cli, Args a) {
   i32 matches = 0;
   i32 n = 0;
   Lines s = Lines.create();
+  Sink out = Sink.create(cli);
   while (true) {
     Line l = nextLine(s, cli);
     if (!l.ok) { break; }
@@ -48,8 +50,11 @@ export i32 grep(Core core, Cli cli, Args a) {
     matches++;
     if (countOnly) { continue; }
     string text = string.fromBytes(l.bytes);
-    core.log(number ? itoa(n) + ":" + text : text);
+    // Buffered: a pattern that matches most of a large file is one host call per line otherwise, and
+    // each is a park and a wake. Issue 0039.
+    if (!out.line(number ? itoa(n) + ":" + text : text)) { break; }
   }
-  if (countOnly) { core.log(itoa(matches)); }
+  if (countOnly) { out.line(itoa(matches)); }
+  out.flush();
   return matches > 0 ? 0 : 1;
 }

@@ -91,7 +91,9 @@ export i32 main(Core core, Cli cli) {
     }
   }
 
-  Socket listener = cli.listen(o.port).wait();
+  // Every interface, as a real sshd does: a daemon nobody can reach is not a daemon. Said rather than
+  // assumed — `listen` took a port alone until issue 0025.
+  Socket listener = cli.listen("", o.port).wait();
   if (listener.handle < 0) {
     core.warn("sshd: listen: " + listener.error);
     return 1;

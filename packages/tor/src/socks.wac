@@ -171,19 +171,18 @@ export i32 main(Core core, Cli cli) {
   if (!guard.ok) { return 1; }
   core.log("guard: " + guard.nickname);
 
-  Socket listener = cli.listen(port).wait();
+  // **Loopback, and not by default — by name.** For a SOCKS proxy the address is not a detail: bound
+  // here it serves the person at this keyboard, and bound to every interface it is an open proxy that
+  // launders anyone's traffic into the Tor network under this client's exits. Every other SOCKS
+  // implementation binds loopback for the same reason. `listen` took a port alone until issue 0025,
+  // so this warned on every start about a configuration it could not choose.
+  Socket listener = cli.listen("127.0.0.1", port).wait();
   if (listener.handle < 0) {
-    core.warn("tor: cannot listen on port " + itoa(port) + ": " + listener.error);
+    core.warn("tor: cannot listen on 127.0.0.1:" + itoa(port) + ": " + listener.error);
     cli.closeSocket(guard.link.sock);
     return 1;
   }
-  // `listen` takes a port and no address, so this binds every interface — issue 0025. For a
-  // SOCKS proxy that is not a detail: bound to loopback it serves this machine, and bound to
-  // everything it is an open proxy that launders anyone's traffic into the Tor network under
-  // this client's exits. Said out loud on every start, because the difference is invisible.
-  core.warn("tor: listening on 0.0.0.0:" + itoa(port) + " — the platform's `listen` takes no");
-  core.warn("tor: address (issue 0025), so anyone who can reach this host can use the proxy.");
-  core.log("socks5 on port " + itoa(port) + ", circuits built on demand per port");
+  core.log("socks5 on 127.0.0.1:" + itoa(port) + ", circuits built on demand per port");
 
   Vec<Client> clients = Vec.create();
   Vec<Building> circuits = Vec.create();
@@ -416,7 +415,8 @@ export i32 main(Core core, Cli cli) {
         // nothing holds the index and it can be written over — which matters because the
         // slots are otherwise permanent: six requests for ports no exit carries would fill
         // the table with corpses and refuse everything after, for the life of the process.
-        // With `listen` binding every interface (issue 0025), six connections from anywhere.
+        // Six connections is not many, and they used to be reachable from any interface — the proxy
+        // binds loopback now (issue 0025), so they are at least six from this machine.
         i32 slot = -1;
         for (i32 i = 0; i < circuits.len(); i++) {
           if (circuits.get(i).state == circuitFailed()) { slot = i; }

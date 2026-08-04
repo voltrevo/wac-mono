@@ -160,9 +160,10 @@ export bool feedLink(Link l, u8[] chunk) {
   // and traps. `gets.wac` had the framing right and put the reason in a comment: this is how
   // a reader that mostly works fails on a fast connection rather than a slow one.
   //
-  // The loop that used to be here now lives in `record.wac` as `recordsReady`, next to the
-  // framing it belongs to and next to the server's `tlsRecordNeeded`, so there is one copy
-  // rather than one per caller.
+  // The loop that used to be here lives in `record.wac` as `recordsReady`, next to the framing it
+  // belongs to and next to the server's `tlsRecordNeeded`. `gets.wac` calls it too now (issue 0029),
+  // so there is one copy rather than one per caller — which is the whole point: as a convention this
+  // rule scored one correct and one silently broken.
   l.raw = concat(l.raw, chunk);
   i32 ready = recordsReady(l.raw);
   if (ready == 0) { return true; }
