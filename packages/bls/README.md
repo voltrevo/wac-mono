@@ -20,7 +20,9 @@ Under construction, built in stages with an external oracle gating each one. Wha
 | `Fp6` / `Fp12` — the rest of the tower, with Frobenius | **done**, against Python |
 | `G1` — points, subgroup check, compressed encoding | **done**, against Python |
 | `G2` — the same over Fp2, and Fp2 square roots | **done**, against Python |
-| `hash_to_G2` — RFC 9380 | not started |
+| `expand_message_xmd` + `hash_to_field` | **done**, against the CFRG vectors |
+| `map_to_curve` — SSWU and the 3-isogeny | not started |
+| `clear_cofactor` and `hash_to_G2` | not started |
 | Miller loop and final exponentiation | not started |
 | `verify` — against the Ethereum vectors | not started |
 

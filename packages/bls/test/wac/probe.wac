@@ -348,3 +348,26 @@ export bool blsG2DegenerateAddition() {
 }
 
 export bool blsG2OrderIsR() { return g2IsInfinity(g2Mul(g2Generator(), groupOrder())); }
+
+// ── hash_to_field ─────────────────────────────────────────────────────────────
+
+import { expandMessageXmd, hashToFieldFp2 } from "../../src/hash.wac";
+
+export u8[] blsExpandMessage(u8[] msg, u8[] dst, i32 len) {
+  return expandMessageXmd(msg, dst, len);
+}
+
+/** The two Fp2 elements, flattened as u0.c0 || u0.c1 || u1.c0 || u1.c1. */
+export u8[] blsHashToField(u8[] msg, u8[] dst) {
+  Fp2[] u = hashToFieldFp2(msg, dst);
+  u8[] out = u8[192]();
+  for (i32 i = 0; i < 2; i++) {
+    u8[] c0 = fp2C0Bytes(u[i]);
+    u8[] c1 = fp2C1Bytes(u[i]);
+    for (i32 k = 0; k < 48; k++) {
+      out[96 * i + k] = c0[k];
+      out[96 * i + 48 + k] = c1[k];
+    }
+  }
+  return out;
+}

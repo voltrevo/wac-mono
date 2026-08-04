@@ -1,0 +1,112 @@
+// RFC 9380 §5.3 `expand_message_xmd` over SHA-256, and §5.2 `hash_to_field` for Fp2.
+//
+// Everything a signature verifier needs before the curve arithmetic starts: a message and a
+// domain separation tag in, two Fp2 elements out.
+//
+// ## The DST is a parameter, not a constant
+//
+// The CFRG draft's own vectors use `QUUX-V01-CS02-with-BLS12381G2_XMD:SHA-256_SSWU_RO_`, and
+// Ethereum signatures use `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`. Hardcoding either one
+// passes that suite and fails the other, so it is passed in and both suites run.
+//
+// ## The two lengths that must not be confused
+//
+// `L = 64` bytes per base field element, not 48. The extra sixteen bytes are the whole point:
+// reducing 64 bytes mod p is statistically indistinguishable from uniform, while reducing 48
+// bytes is measurably biased toward small values. And `m = 2`, because an Fp2 element is two
+// base elements — so two Fp2 elements need `2 · 2 · 64 = 256` bytes of expansion.
+
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { fpFromWideBytes } from "./fp.wac";
+import { Fp2 } from "./fp2.wac";
+
+const i32 SHA256_OUT = 32;
+const i32 SHA256_BLOCK = 64;
+
+/** `L` from RFC 9380 §8.8.2: bytes of expansion per base field element. */
+const i32 L = 64;
+
+/**
+ * `expand_message_xmd(msg, DST, len)`.
+ *
+ * Two rules here are easy to get wrong and both are fatal rather than degrading:
+ *
+ *   **`DST_prime` carries the DST's length as a trailing byte.** Omitting it makes two different
+ *   DSTs of different lengths collide, which is precisely the domain separation the construction
+ *   exists to provide.
+ *
+ *   **`b_i` hashes `b_0 XOR b_(i−1)`, not `b_(i−1)` alone.** Without the XOR the chain is a
+ *   plain iterated hash and the output is still uniform-looking, so nothing but a test vector
+ *   ever notices.
+ *
+ * Returns empty when `len` exceeds what 255 blocks can supply, or when the DST is longer than
+ * 255 bytes — both of which the RFC declares out of range rather than something to truncate.
+ */
+export u8[] expandMessageXmd(u8[] msg, u8[] dst, i32 len) {
+  if (dst.len() > 255) { return u8[0](); }
+  i32 ell = (len + SHA256_OUT - 1) / SHA256_OUT;
+  if (ell > 255 || len <= 0) { return u8[0](); }
+
+  // DST_prime = DST || I2OSP(len(DST), 1)
+  u8[] dstPrime = u8[dst.len() + 1]();
+  for (i32 i = 0; i < dst.len(); i++) { dstPrime[i] = dst[i]; }
+  dstPrime[dst.len()] = dst.len();
+
+  // msg_prime = Z_pad || msg || I2OSP(len, 2) || I2OSP(0, 1) || DST_prime
+  i32 n = SHA256_BLOCK + msg.len() + 2 + 1 + dstPrime.len();
+  u8[] msgPrime = u8[n]();
+  i32 at = SHA256_BLOCK;                       // Z_pad is already zero
+  for (i32 i = 0; i < msg.len(); i++) { msgPrime[at + i] = msg[i]; }
+  at += msg.len();
+  msgPrime[at] = (len >> 8) & 0xFF;
+  msgPrime[at + 1] = len & 0xFF;
+  at += 2;
+  msgPrime[at] = 0;
+  at += 1;
+  for (i32 i = 0; i < dstPrime.len(); i++) { msgPrime[at + i] = dstPrime[i]; }
+
+  u8[] b0 = sha256(msgPrime);
+
+  // b_1 = H(b_0 || I2OSP(1, 1) || DST_prime)
+  u8[] first = u8[SHA256_OUT + 1 + dstPrime.len()]();
+  for (i32 i = 0; i < SHA256_OUT; i++) { first[i] = b0[i]; }
+  first[SHA256_OUT] = 1;
+  for (i32 i = 0; i < dstPrime.len(); i++) { first[SHA256_OUT + 1 + i] = dstPrime[i]; }
+  u8[] bi = sha256(first);
+
+  u8[] out = u8[len]();
+  i32 written = 0;
+  for (i32 i = 0; i < SHA256_OUT && written < len; i++) { out[written] = bi[i]; written++; }
+
+  for (i32 round = 2; round <= ell; round++) {
+    u8[] block = u8[SHA256_OUT + 1 + dstPrime.len()]();
+    for (i32 i = 0; i < SHA256_OUT; i++) { block[i] = b0[i] ^ bi[i]; }
+    block[SHA256_OUT] = round;
+    for (i32 i = 0; i < dstPrime.len(); i++) { block[SHA256_OUT + 1 + i] = dstPrime[i]; }
+    bi = sha256(block);
+    for (i32 i = 0; i < SHA256_OUT && written < len; i++) { out[written] = bi[i]; written++; }
+  }
+  return out;
+}
+
+/**
+ * `hash_to_field(msg, 2)` for Fp2 — the two elements the random-oracle map consumes.
+ *
+ * Coefficient order matters: within `u_i`, the *first* L bytes are c0 and the second are c1.
+ * Reversing them gives a point on the right curve for the wrong message.
+ */
+export Fp2[] hashToFieldFp2(u8[] msg, u8[] dst) {
+  u8[] uniform = expandMessageXmd(msg, dst, 2 * 2 * L);
+  Fp2[] out = Fp2[2]();
+  if (uniform.len() == 0) { return out; }
+  for (i32 i = 0; i < 2; i++) {
+    u8[] c0 = u8[L]();
+    u8[] c1 = u8[L]();
+    for (i32 k = 0; k < L; k++) {
+      c0[k] = uniform[L * (2 * i) + k];
+      c1[k] = uniform[L * (2 * i + 1) + k];
+    }
+    out[i] = Fp2(fpFromWideBytes(c0), fpFromWideBytes(c1));
+  }
+  return out;
+}
