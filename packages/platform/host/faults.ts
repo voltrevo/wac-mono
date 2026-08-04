@@ -91,15 +91,46 @@ export function changeBytes(fault: number, message: string): Uint8Array {
 /** The answer for something that worked. */
 export const CHANGED_OK = new Uint8Array([FAULT_NONE]);
 
-/** Run a change and answer with its outcome rather than throwing. */
+/**
+ * A short phrase for a category, for a host whose own words are boilerplate.
+ *
+ * The Origin Private File System reports through `DOMException`, whose messages are written for a
+ * developer console rather than for a terminal: "A requested file or directory could not be found at
+ * the time an operation was processed." — a sentence, with a full stop, naming neither the path nor
+ * the operation. In the browser shell demo that reads as a defect. Deno and Node say "No such file or
+ * directory (os error 2), remove '/tmp/x'", which is terse and names both, so they keep their own
+ * words and only the browser reaches for these.
+ *
+ * This is not inventing an explanation: the *category* was already established by `faultOf`, and
+ * `FAULT_OTHER` — the case where the message is the only information — has no phrase and must not get
+ * one. See `describeAsPhrase` in `browser.ts` for the policy that uses it.
+ */
+export function phraseOf(fault: number): string {
+  if (fault === FAULT_NOT_FOUND) return "no such file or directory";
+  if (fault === FAULT_DENIED) return "permission denied";
+  if (fault === FAULT_EXISTS) return "already exists";
+  if (fault === FAULT_NOT_EMPTY) return "directory not empty";
+  return "";
+}
+
+/**
+ * Run a change and answer with its outcome rather than throwing.
+ *
+ * `describe` lets a host say the failure in its own way once the category is known; the default is
+ * the error's own message, which is right wherever the host's message is worth reading.
+ */
 // `unknown` rather than `void` because some of these answer something — Node's recursive
 // `mkdir` returns the first directory it made — and none of it belongs in the reply.
-export async function changed(work: () => Promise<unknown>): Promise<Uint8Array> {
+export async function changed(
+  work: () => Promise<unknown>,
+  describe: (fault: number, message: string) => string = (_, m) => m,
+): Promise<Uint8Array> {
   try {
     await work();
     return CHANGED_OK;
   } catch (e) {
-    return changeBytes(faultOf(e), e instanceof Error ? e.message : String(e));
+    const fault = faultOf(e);
+    return changeBytes(fault, describe(fault, e instanceof Error ? e.message : String(e)));
   }
 }
 

@@ -66,13 +66,40 @@ async function rejects(fn: () => unknown | Promise<unknown>, contains: string): 
 // Only the four methods `browser.ts` uses. A fake rather than a mock: it really stores
 // bytes and really has a hierarchy, so a path bug shows up as a wrong answer here too.
 
-function memDir(): DirHandle {
+/**
+ * What a real Origin Private File System rejects with: a `DOMException`, named.
+ *
+ * The name is the whole point. `host/faults.ts` classifies a browser failure by
+ * `DOMException.name` — there are no errno codes here — so a double that rejected with a plain
+ * `Error` would put every failure in `FAULT_OTHER` and quietly agree with itself: `rm -f` would look
+ * tested and would not be. This is the shape of mistake `browser_live.test.ts`'s header warns about,
+ * where a double's assumptions came from the same place as the code's.
+ */
+function opfsError(name: string, message: string): Error {
+  // `DOMException` exists in Deno, so this is the real class rather than an impression of it.
+  return new DOMException(message, name);
+}
+
+/**
+ * A double with one extra question: is it empty?
+ *
+ * A real `FileSystemDirectoryHandle` answers that only asynchronously, through `keys()`, but the
+ * *parent* needs it synchronously inside `removeEntry` to decide between "not empty" and "removed".
+ * A browser has the answer in memory; this double gives itself the same shortcut rather than
+ * pretending `removeEntry` is more asynchronous than it is.
+ */
+type MemDir = DirHandle & { emptyNow(): boolean };
+
+function memDir(): MemDir {
   const files = new Map<string, Uint8Array>();
-  const dirs = new Map<string, DirHandle>();
-  const self: DirHandle = {
+  const dirs = new Map<string, MemDir>();
+  const self: MemDir = {
+    emptyNow: () => files.size === 0 && dirs.size === 0,
     getFileHandle(name, opts) {
       if (!files.has(name)) {
-        if (opts?.create !== true) return Promise.reject(new Error(`no file ${name}`));
+        if (opts?.create !== true) {
+          return Promise.reject(opfsError("NotFoundError", `no file ${name}`));
+        }
         files.set(name, new Uint8Array(0));
       }
       const h: FileHandle = {
@@ -105,14 +132,22 @@ function memDir(): DirHandle {
     },
     getDirectoryHandle(name, opts) {
       if (!dirs.has(name)) {
-        if (opts?.create !== true) return Promise.reject(new Error(`no directory ${name}`));
+        if (opts?.create !== true) {
+          return Promise.reject(opfsError("NotFoundError", `no directory ${name}`));
+        }
         dirs.set(name, memDir());
       }
       return Promise.resolve(dirs.get(name)!);
     },
-    removeEntry(name) {
+    removeEntry(name, opts) {
+      // A directory with anything in it is `InvalidModificationError` without `recursive`, which is
+      // how a browser says "not empty" — it has no errno to say it with.
+      const dir = dirs.get(name);
+      if (dir !== undefined && opts?.recursive !== true && !dir.emptyNow()) {
+        return Promise.reject(opfsError("InvalidModificationError", `${name} is not empty`));
+      }
       if (!files.delete(name) && !dirs.delete(name)) {
-        return Promise.reject(new Error(`no entry ${name}`));
+        return Promise.reject(opfsError("NotFoundError", `no entry ${name}`));
       }
       return Promise.resolve();
     },
@@ -186,10 +221,30 @@ Deno.test("the browser world honours the capabilities a page can honour", async 
   // rather than throwing, and the second is `FAULT_EXISTS` by category — which matters here more
   // than anywhere, because OPFS has no exclusive create and the *host* decided that fault.
   const missingParent = change(await call(OP.MKDIR, new Uint8Array([0, ...str("x/y")])));
-  assertEquals(missingParent.message.includes("no directory"), true, missingParent.message);
+  assertEquals(missingParent.fault, 1, "a missing parent is FAULT_NOT_FOUND");
+  assertEquals(missingParent.message, "no such file or directory", missingParent.message);
   const already = change(await call(OP.MKDIR, new Uint8Array([0, ...str("a")])));
   assertEquals(already.fault, 3, "already exists is FAULT_EXISTS");
-  assertEquals(already.message.includes("already exists"), true, already.message);
+  assertEquals(already.message, "already exists", already.message);
+
+  // This host says a known category in its own short words rather than passing on the
+  // `DOMException` message, which is written for a console: "A requested file or directory could
+  // not be found at the time an operation was processed." reads as a defect after
+  // `rm: cannot remove 'f': `. Checked against a real browser, not only this double — the demo page
+  // is where it shows.
+  const absent = change(await call(OP.REMOVE, new Uint8Array([0, ...str("nothing-here")])));
+  assertEquals(absent.fault, 1, "FAULT_NOT_FOUND");
+  assertEquals(absent.message, "no such file or directory", absent.message);
+  // A directory with something in it, without `recursive`: `InvalidModificationError` in a browser,
+  // which has no errno to say "not empty" with.
+  const notEmpty = change(await call(OP.REMOVE, new Uint8Array([0, ...str("a")])));
+  assertEquals(notEmpty.fault, 4, "FAULT_NOT_EMPTY");
+  assertEquals(notEmpty.message, "directory not empty", notEmpty.message);
+  // ...and a fault with no category keeps the message, because there it is the only information
+  // there is. "" names no component at all, which is this host's own complaint rather than OPFS's.
+  const empty = change(await call(OP.MKDIR, new Uint8Array([0])));
+  assertEquals(empty.fault, 5, "FAULT_OTHER");
+  assertEquals(empty.message, "empty path", empty.message);
 
   // Streaming input, in CHUNK-sized pieces out of a Blob.
   await put("big.txt", "x".repeat(200_000));

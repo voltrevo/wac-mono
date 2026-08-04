@@ -133,6 +133,16 @@ The categories are deliberately few, and `FAULT_OTHER` is not an embarrassment: 
 a taxonomy nobody branches on. What a program branches on is "was it already gone"; what a person
 reads is the message.
 
+**In a browser the message is the category's own short phrase**, not the `DOMException`'s. Deno and
+Node say "No such file or directory (os error 2), remove '/tmp/x'" — terse, and it names the path and
+the operation, so it is worth passing on verbatim. A browser says "A requested file or directory could
+not be found at the time an operation was processed.", which is prose for a developer console and
+names neither; after `rm: cannot remove 'f': ` it reads as a defect. Since the category is already
+established by then, the short form loses nothing — and `FAULT_OTHER` still keeps the message, because
+there the message is the only information there is. Checked against a real Chromium and not only
+against the in-memory double, since this is exactly the sort of thing a double agrees with itself
+about.
+
 **`readChunk` and `recv` answer a `Read`**, which is `Data(bytes)`, `End`, or `Failed(why)` — three
 states in the type, so a caller cannot mistake a broken read for the end of the input. `match` is
 exhaustive; ignoring `Failed` does not compile.

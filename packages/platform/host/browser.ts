@@ -35,7 +35,14 @@ import { CHUNK } from "./layout.ts";
 import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { OP } from "./ops.ts";
 import { ChildStack, packCaptured, unpackPush } from "./child.ts";
-import { changeBytes, changed, FAULT_DENIED, FAULT_EXISTS, Faulted } from "./faults.ts";
+import {
+  changeBytes,
+  changed,
+  FAULT_DENIED,
+  FAULT_EXISTS,
+  Faulted,
+  phraseOf,
+} from "./faults.ts";
 
 const EMPTY = new Uint8Array(0);
 
@@ -183,6 +190,21 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
 
   const canWrite = (): void => {
     if (opts.root === undefined || opts.writable !== true) deny("filesystem write");
+  };
+
+  /**
+   * How this host says a failure: the category's phrase where it has one, and the exception's own
+   * message where it does not.
+   *
+   * A `DOMException` message is written for a developer console — "A requested file or directory
+   * could not be found at the time an operation was processed." — and a shell prints it after
+   * `rm: cannot remove 'f': `, where it reads as a defect rather than as a diagnostic. The category
+   * is already known by then, so the short form loses nothing. `FAULT_OTHER` keeps the message,
+   * because there the message is the only information there is.
+   */
+  const describeAsPhrase = (fault: number, message: string): string => {
+    const phrase = phraseOf(fault);
+    return phrase === "" ? message : phrase;
   };
 
   /**
@@ -406,7 +428,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
         const w = await h.createWritable();
         await w.write(p.subarray(4 + n));
         await w.close();
-      });
+      }, describeAsPhrase);
     },
     [OP.STAT]: (p) => statBytes(unstr(p)),
     // The Origin Private File System has no symbolic links, so this *is* `stat`, and `isSymlink`
@@ -431,7 +453,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
         return changed(async () => {
           const { dir, name } = await resolve(path, true);   // -p: every component
           await dir.getDirectoryHandle(name, { create: true });
-        });
+        }, describeAsPhrase);
       }
       return changed(async () => {
         const { dir, name } = await resolve(path, false);
@@ -441,9 +463,9 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
         try { await dir.getDirectoryHandle(name); } catch { exists = false; }
         // `AlreadyExists` by name, because OPFS reports nothing here and the message is mine:
         // a caller asking "did it already exist" must not have to read my English.
-        if (exists) throw new Faulted(FAULT_EXISTS, path + ": already exists");
+        if (exists) throw new Faulted(FAULT_EXISTS, "already exists");
         await dir.getDirectoryHandle(name, { create: true });
-      });
+      }, describeAsPhrase);
     },
     [OP.REMOVE]: (p) => {
       const no = writeRefused();
@@ -451,7 +473,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       return changed(async () => {
         const { dir, name } = await resolve(unstr(p.subarray(1)), false);
         await dir.removeEntry(name, { recursive: p[0] === 1 });
-      });
+      }, describeAsPhrase);
     },
     [OP.RENAME]: (p) => {
       const no = writeRefused();
@@ -470,7 +492,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
         await w.close();
         const src = await resolve(from, false);
         await src.dir.removeEntry(src.name);
-      });
+      }, describeAsPhrase);
     },
 
     [OP.OPEN_INPUT]: async (p) => {
