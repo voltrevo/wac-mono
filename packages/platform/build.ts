@@ -24,6 +24,7 @@ import {
   filesParts,
   harnessKeyParts,
 } from "../../harness/buildCache.ts";
+import { WORKER_MARKER } from "./host/children.ts";
 
 /**
  * What the built file asks Deno for: exactly the capabilities granted, and nothing else.
@@ -344,7 +345,11 @@ async function produceApp(
     // existed — which showed up as a program that worked one run in three.
     const browserRuntime = import.meta.resolve("./host/entryBrowser.ts");
     const nodeRuntime = import.meta.resolve("./host/entryNode.ts");
-    const workerSource = target === "browser"
+    // Every worker bundle carries `WORKER_MARKER` on its first line, whichever target built it and
+    // however it is started: `--worker` writes this string to a file, and the launcher holds the same
+    // one for `spawnSelf`. Marking only the file would have left a program's own self-spawn as the one
+    // case `spawnChild` could not recognise, which is the opposite of the point — see `children.ts`.
+    const workerSource = WORKER_MARKER + "\n" + (target === "browser"
       ? await bundle(
         "worker",
         `import { runAsWorkerBrowser } from "${browserRuntime}";\n` +
@@ -369,7 +374,7 @@ async function produceApp(
         `import { runAsWorkerEntry } from "${runtime}";\n` +
           `import * as app from "${modPath}";\n` +
           `await runAsWorkerEntry(app as unknown as Parameters<typeof runAsWorkerEntry>[0]);\n`,
-      );
+      ));
 
     const launcher = target === "browser"
       ? await bundle(
@@ -445,7 +450,9 @@ async function produceApp(
     // so this is how a wac program becomes a *child* rather than a program of its own.
     //
     // No shebang — it is not runnable by itself, and pretending otherwise would invite
-    // someone to try.
+    // someone to try. Its first line is `WORKER_MARKER`, which is what lets `spawn` refuse a file that
+    // is not one of these *before* starting anything — see `host/children.ts` for why no deadline can
+    // answer that question.
     if (workerOnly) return workerSource;
     if (target === "browser") {
       // A page, not an executable.

@@ -119,9 +119,11 @@ Deno.test("a file that is not a worker bundle is a failed command, not a dead sh
   // command". The status of the *script* is `echo`'s, so 0 — the same as it is in bash.
   assertEquals(r.code, 0, `out=${r.out} err=${r.err}`);
   assertEquals(r.err.includes("notaprogram"), true, r.err);
-  // The reason, from the host, on one line. Without this the shell says only that something went
-  // wrong, and "it is not a worker bundle" is exactly the thing a person needs told.
-  assertEquals(r.err.includes("SyntaxError"), true, r.err);
+  // The reason, on one line, and it now says the thing a person needs told rather than leaving them to
+  // infer it from a `SyntaxError`: the file is not a worker bundle. It is answered from the source's
+  // first line, before a worker starts, which is also what stopped a bundle that *parses* and never
+  // speaks the protocol from wedging the shell — 0033.
+  assertEquals(r.err.includes("not a wac worker bundle"), true, r.err);
 });
 
 Deno.test("...and the status of that command alone is 126 — 0021", async () => {

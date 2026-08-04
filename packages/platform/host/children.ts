@@ -186,7 +186,32 @@ export class ByteQueue {
  * current bundle answers in a millisecond, and this is not a limit on how long a *program* may
  * take: it is a limit on how long the parent waits to hear that the source is JavaScript.
  */
-const LOAD_GRACE_MS = 500;
+/**
+ * The first line of every `--worker` bundle, and the reason a spawn can refuse one that is not.
+ *
+ * A file that *parses* but is not a worker bundle used to wedge the caller for ever: it evaluated, it
+ * never spoke the bridge protocol, and nothing distinguished it from a program still loading. That was
+ * wac-mono 0033, and its hard part was that no timer answers the question — a deadline long enough to
+ * be safe on a loaded machine is long enough to be a hang, and one short enough to be useful reports a
+ * slow load as a program that would not start.
+ *
+ * A marker answers it before anything runs. `build.ts` writes this line at the top of what `--worker`
+ * emits; `spawnChild` looks for it in the source it was handed and fails immediately when it is absent,
+ * with a message that says which of the two things went wrong. The version is in it so that a bundle
+ * built by an older compiler can be told from a file that was never one at all.
+ */
+export const WORKER_MARKER = "//wac-worker 1";
+
+/**
+ * How long a bundle that *is* one has to say `ready`.
+ *
+ * Generous, and now fatal rather than assumed-alive: the operator's call on 0033 was that `ready` is a
+ * required part of the protocol. The marker above means the only thing this can still catch is a
+ * genuine worker that takes seconds to evaluate, which a 700 KiB module on five loaded cores does not —
+ * evaluation is tens of milliseconds, so this is two orders of magnitude of headroom, and what it buys
+ * is that a wedge became a diagnostic.
+ */
+const LOAD_GRACE_MS = 5000;
 
 /** One spawned worker, from the parent's side. */
 export type Child = {
@@ -299,6 +324,31 @@ export function spawnChild(
   const out = new ByteQueue(QUEUE_CAP);
   const err = new ByteQueue(QUEUE_CAP);
   const input = new ByteQueue();
+
+  // **Before anything starts.** A file that parses and is not one of these used to be indistinguishable
+  // from a program still loading, and the caller waited for ever (0033). The marker is a fact about the
+  // source, so it is answered here rather than by a deadline — and the message says which of the two
+  // things it is, because "not a wac worker bundle" and "built by an older wac" are different problems
+  // with different fixes.
+  if (!source.startsWith(WORKER_MARKER)) {
+    const looksBuilt = source.includes("SharedArrayBuffer") || source.includes("wacBind");
+    out.end();
+    err.end();
+    input.end();
+    return {
+      out,
+      err,
+      in: input,
+      exit: Promise.resolve(-1),
+      loaded: Promise.resolve(
+        looksBuilt
+          ? "built by an older wac than this one: rebuild it with --worker"
+          : "not a wac worker bundle: build one with --worker",
+      ),
+      kill: () => {},
+    };
+  }
+
   const bridge = makeBridge();
   const responder = startWorld(bridge.sab, args, out, input, err);
 
@@ -314,13 +364,20 @@ export function spawnChild(
     err.end();
   };
 
-  // Resolved by whichever comes first: the load notice, a load error, or the child finishing
-  // without ever saying either. The timer is the fallback for a bundle built before `ready`
-  // existed — it must assume the child is *alive*, since a slow machine must not be reported as a
-  // program that would not start. A failure after this window still arrives as a negative exit.
+  // Resolved by whichever comes first: the load notice, a load error, or the child finishing without
+  // ever saying either. The timer used to assume the child was *alive*, which is what let a bundle that
+  // never speaks the protocol wedge the caller for ever (0033). `ready` is required now, so the timer
+  // is a failure — and the marker checked above is what makes that safe, since the case a timer cannot
+  // judge is caught before the worker starts.
   let settleLoaded: (why: string) => void;
   const loaded = new Promise<string>((res) => { settleLoaded = res; });
-  const assumeAlive = setTimeout(() => settleLoaded(""), LOAD_GRACE_MS);
+  const assumeAlive = setTimeout(
+    () => settleLoaded(
+      "did not report ready within " + LOAD_GRACE_MS + "ms: a worker bundle that does not speak the " +
+        "bridge protocol, or a machine too loaded to have evaluated it",
+    ),
+    LOAD_GRACE_MS,
+  );
   const done = (why: string) => {
     clearTimeout(assumeAlive);
     settleLoaded(why);

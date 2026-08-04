@@ -242,10 +242,14 @@ The first thing a shell trips over is a file on `$WACPATH` that is not a worker 
 are two of those. One that does not parse is now a failed command with the host's reason and status
 126, distinct from the 127 of not existing —
 [0021](../../issues/closed/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md), where it
-used to take the shell down with it. One that *parses* and never speaks the bridge protocol — a
-built program rather than a `--worker` bundle, most likely — still hangs:
-[0033](../../issues/open/0033-a-file-that-parses-but-is-not-a-worker-bundle-wedges-the-shell.md) has
-why that is a harder question than it looks.
+used to take the shell down with it. One that *parses* and never speaks the bridge protocol — a built
+program rather than a `--worker` bundle, most likely — used to hang for ever, and is now a failed
+command too: every bundle carries a marker on its first line, so a file that is not one is refused
+before a worker starts, and one that claims to be and then says nothing is failed by a five-second
+grace rather than waited on.
+[0033](../../issues/closed/0033-a-file-that-parses-but-is-not-a-worker-bundle-wedges-the-shell.md) is
+why the marker had to come first: the timer alone would have traded the hang for a false "cannot
+execute" on a loaded machine.
 
 **The signature is the design decision.** Bytes in, bytes out, a status, and a `found` flag —
 because a shell reports 127 for "no such command" and the program's own code for "ran and failed",

@@ -473,9 +473,19 @@ was always empty. The worker now posts a notice as soon as its bundle evaluates,
 for either that or the load error: a handle means it is running, and -1 with a message means it never
 started. Issue 0021.
 
-The grace period on that wait resolves as *alive*, never as failed — a slow load on a busy machine
-must not be reported as a program that would not start. Which leaves the case where a file parses and
-then says nothing at all, and that still hangs: issue 0033, where the trade-off is written down.
+**A bundle says on its first line that it is one.** `//wac-worker 1`, written by `build.ts` into the
+worker source — the same string whether `--worker` puts it in a file or the launcher holds it for
+`spawnSelf` — and `spawnChild` checks it before creating anything. So a file that is not a worker
+bundle is refused as a *fact about the source*: no worker starts, nothing is inferred from how it
+failed, and stderr carries one account of it rather than two. The version is there so a bundle built by
+an older wac can be told from a file that was never one.
+
+That is what made the wait safe to fail. The grace used to resolve as *alive*, never as failed, because
+a slow load on a busy machine must not be reported as a program that would not start — which left a
+file that parses and then says nothing hanging for ever. `ready` is required now, with five seconds
+rather than five hundred milliseconds, and its expiry is a failure that names the gap. Module
+evaluation is tens of milliseconds; the marker catches the case a timer cannot judge, and the timer
+catches what is left. Issue 0033.
 
 **`spawnSelf` is how a page has programs at all.** `spawn` takes a worker bundle, and a bundle comes
 from a filesystem — fine on a command line, impossible in a browser tab, where there is no directory
