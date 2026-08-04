@@ -30,6 +30,17 @@ export struct Args {
   bool hasNum;
   string[] rest;
   /**
+   * The value of each flag that took one, as `letter` then the value: `-d,` and `-d ,` both give
+   * `",,"` — the first byte is the flag.
+   *
+   * The detached spelling is the reason this exists. It used to be refused on the grounds that
+   * `parseList` would have left the value among the positional arguments where a filename lives, and
+   * that was true while the parser had no idea which letters take a value. `takesValue` is that idea,
+   * so the value is consumed where it is recognised and never reaches `rest` — which is what `cut -f 1`
+   * and `fold -w 3` need, being how the two of them are spelled everywhere but here.
+   */
+  string[] values;
+  /**
    * The arguments exactly as they were spelled, which `flagValue` needs and the fields above
    * cannot reconstruct: `-iv` and `-d,` are both "letters after a dash" once parsed.
    *
@@ -77,6 +88,8 @@ export Args parseList(string[] argv, i32 first, string name) {
   // largest it could be, then a copy of exactly what was written, cannot drift that way.
   string[] scratch = string[argv.len()](fill: "");
   i32 at = 0;
+  string[] pairs = string[argv.len()](fill: "");
+  i32 np = 0;
 
   string flags = "";
   i32 num = 0;
@@ -96,11 +109,32 @@ export Args parseList(string[] argv, i32 first, string name) {
       num = atoi(string.fromBytes(slice(b, 1, b.len())));          // -5
       hasNum = true;
     } else {
-      for (i32 k = 1; k < b.len(); k++) {
-        bool takesValue = b[k] == 'n' && nTakesValue(name) &&
-          i + 1 < argv.len() && allDigits(argv[i + 1]);
-        if (takesValue) { num = atoi(argv[i + 1]); hasNum = true; i++; }  // -n 5
-        else { flags = flags + string.fromBytes(slice(b, k, k + 1)); }
+      i32 k = 1;
+      while (k < b.len()) {
+        i32 letter = b[k];
+        flags = flags + string.fromBytes(slice(b, k, k + 1));
+        if (!takesValue(name, letter)) { k++; continue; }
+
+        // Attached — `-d,`, `-f2` — is the rest of this argument, and it ends the argument: a value
+        // cannot be followed by more flags, or `-d,v` would be a comma and a `v`.
+        if (k + 1 < b.len()) {
+          string attached = string.fromBytes(slice(b, k + 1, b.len()));
+          pairs[np] = valueOf(letter, attached);
+          np++;
+          if (allDigits(attached)) { num = atoi(attached); hasNum = true; }
+          k = b.len();
+          continue;
+        }
+        // Detached — `-d ,`, `-n 5` — is the next argument, whatever it looks like. Consuming it here
+        // is what keeps it out of `rest`, where it would be indistinguishable from a filename.
+        if (i + 1 < argv.len()) {
+          string detached = argv[i + 1];
+          pairs[np] = valueOf(letter, detached);
+          np++;
+          if (allDigits(detached)) { num = atoi(detached); hasNum = true; }
+          i++;
+        }
+        k++;
       }
     }
     i++;
@@ -108,37 +142,57 @@ export Args parseList(string[] argv, i32 first, string name) {
 
   string[] rest = string[at](fill: "");
   for (i32 k = 0; k < at; k++) { rest[k] = scratch[k]; }
-  return Args(name, flags, num, hasNum, rest, argv);
+  string[] values = string[np](fill: "");
+  for (i32 k = 0; k < np; k++) { values[k] = pairs[k]; }
+  return Args(name, flags, num, hasNum, rest, values, argv);
 }
 
 /**
- * Whether this applet's `-n` takes the next argument as a value.
+ * Which of an applet's flags take a value — the letters, in either spelling.
  *
- * It used to be every applet's, on the reasoning that only `tail` had one — so `grep -n 123 file`
- * put 123 in `num`, left `n` out of the flags, and searched for `file`. Two silent wrong answers
- * from one rule: `grep -n` stopped numbering, and its pattern became its filename.
+ * A table rather than a rule, because the same letter means both things in different programs: `-n` is
+ * a count in `head` and `tail` and a boolean in `grep` and `sort`. It used to be a rule ("only `-n`,
+ * and only when the next argument is all digits"), and the cost was two silent wrong answers from one
+ * line: `grep -n 123 file` put 123 in `num`, dropped `n` from the flags, and searched for `file`.
  *
- * A list rather than a schema because there are two. `head` and `tail` take `-n N`, as GNU's do;
- * `fold` takes `-N` attached and `-w` in GNU, and everything else — `grep -n`, `sort -n`, `uniq -c`
- * — is a boolean. If a third applet ever wants a detached value, this is where it says so, and the
- * cost of forgetting is a wrong answer rather than a compile error. Prefer attached `-5`.
+ * Anything absent here is a boolean, and its value — if somebody writes one — stays an operand. The
+ * cost of forgetting a letter is a usage error rather than a wrong answer, which is the right way
+ * round: `cut -f 1` was refused with a usage message for exactly this reason before the table existed.
+ *
+ * GNU's spellings are what these are: `cut -d, -f2` and `cut -d , -f 2` are the same command, and
+ * `fold -w 40` is how `fold` is documented — `-40` works here too, and works nowhere else.
  */
-bool nTakesValue(string name) { return name == "head" || name == "tail"; }
+bool takesValue(string name, i32 letter) {
+  if (name == "head" || name == "tail" || name == "shuf" || name == "strings") {
+    return letter == 'n';
+  }
+  if (name == "cut") { return letter == 'd' || letter == 'f'; }
+  if (name == "fold") { return letter == 'w'; }
+  if (name == "split") { return letter == 'l'; }
+  return false;
+}
+
+/** One entry of `Args.values`: the letter, then its value. */
+string valueOf(i32 letter, string value) {
+  return string.fromBytes(u8[1](fill: letter)) + value;
+}
 
 /**
- * The value of a flag that takes one, attached: the `,` of `-d,`.
+ * The value of a flag that takes one: the `,` of `-d,` or of `-d ,`.
  *
- * Read from argv rather than from the parsed flags, because a flag's *value* cannot be told
- * from another flag once they are all letters in one string — `-iv` is two booleans and
- * `-d,` is one flag with an argument, and only the original spelling knows which. An applet
- * asks for the ones it defines, so no general rule has to guess.
+ * Both spellings, now that `takesValue` says which letters have one. The detached form used to be
+ * refused — the parser could not tell a value from a filename, so `cut -f 2` reached `cut` as no value
+ * at all and got a usage message naming the attached spelling. That message was honest and the
+ * behaviour was still wrong: `-f 2` is how everybody writes it.
  *
- * The detached spelling `-d ,` is deliberately absent. `parseArgs` would already have put
- * the `,` among the positional arguments, where it is indistinguishable from a filename, so
- * an applet that accepted it here would read one argument twice. An applet should treat the
- * empty result as a usage error rather than guess, which is what `cut` does.
+ * The scan over `argv` remains as the fallback, for an applet whose letter is not in the table and
+ * which asks anyway — that answers the attached spelling, which is all it could ever have got.
  */
 export string flagValue(Args a, i32 letter) {
+  for (i32 i = 0; i < a.values.len(); i++) {
+    u8[] b = a.values[i].toBytes();
+    if (b.len() >= 1 && b[0] == letter) { return string.fromBytes(slice(b, 1, b.len())); }
+  }
   // From 0, which is safe under both layouts: an applet name never begins with a dash,
   // so `box`'s extra leading argument cannot be mistaken for a flag.
   for (i32 i = 0; i < a.argv.len(); i++) {

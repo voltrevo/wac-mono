@@ -631,18 +631,21 @@ Deno.test("box's text applets agree with the system tools they imitate", async (
       await sys("cut", ["-f2", fixture]),
       "cut with the default tab delimiter differs",
     );
-    // A flag's value must be attached. The separated spelling would be indistinguishable
-    // from a filename once parsed, so it is refused rather than silently misread.
-    const bare = new Deno.Command(built, {
-      args: ["cut", "-d", ",", "-f", "2", fixture],
-      stdout: "piped",
-      stderr: "piped",
-    }).outputSync();
-    assertEquals(bare.code, 2, "a detached flag value should be a usage error");
+    // A flag's value may be detached, which it may not be before: this asserted a usage error, on the
+    // reasoning that `-f 2` would leave the `2` among the operands where a filename lives. It would
+    // have, until `takesValue` in `args.wac` said which letters take a value — and `cut -d , -f 2` is
+    // how GNU documents it, so the refusal was a refusal of the ordinary spelling.
     assertEquals(
-      new TextDecoder().decode(bare.stderr).includes("-f<n>"),
-      true,
-      "and should say how to spell it",
+      await box(["cut", "-d", ",", "-f", "2", fixture]),
+      await sys("cut", ["-d", ",", "-f", "2", fixture]),
+      "cut with detached values differs",
+    );
+    // And the operand still arrives: the value is consumed where it is recognised, so the file is not
+    // mistaken for it — which is exactly what the old refusal was protecting against.
+    assertEquals(
+      await box(["cut", "-d", ",", "-f", "2", fixture]),
+      await box(["cut", "-d,", "-f2", fixture]),
+      "the two spellings are the same command",
     );
 
     const text = await Deno.readTextFile("README.md");
@@ -1853,6 +1856,98 @@ Deno.test("seq matches GNU seq, in all three spellings", async () => {
     const zero = box(["seq", "1", "0", "9"]);
     assertEquals(zero.code, 1);
     assertEquals(zero.err.includes("must not be zero"), true, zero.err);
+  } finally {
+    await Deno.remove(built);
+  }
+});
+
+Deno.test("flags take their values in either spelling, and coreutils says what the answer is", async () => {
+  // `cut -f 1` was a usage error. So were `cut -d ' ' -f 2` and `fold -w 40`, which are the spellings
+  // both are documented with everywhere: this parser only ever accepted a value *attached* to its
+  // flag, on the reasoning that it could not tell a detached value from a filename — true, until
+  // `takesValue` in `args.wac` said which letters have one.
+  //
+  // Every case runs through the real tool as well, so the expectations are coreutils' rather than
+  // this file's. The two spellings of each command are compared against the same oracle, which is what
+  // pins them as the same command rather than merely both working.
+  const have = async (tool: string) =>
+    await new Deno.Command(tool, { args: ["--version"], stdout: "null", stderr: "null" })
+      .output().then((r) => r.success).catch(() => false);
+  if (!(await have("cut")) || !(await have("fold")) || !(await have("sort"))) return;
+
+  const built = await Deno.makeTempFile({ prefix: "wac-flags-" });
+  try {
+    await buildApp(BOX, built, {});
+    const feed = "a,b,c\nd,e,f\n";
+    const run = (cmd: string, args: string[]) => {
+      const child = new Deno.Command(cmd, { args, stdin: "piped", stdout: "piped", stderr: "null" })
+        .spawn();
+      const w = child.stdin.getWriter();
+      w.write(new TextEncoder().encode(feed));
+      w.close();
+      return child.output().then((r) => ({
+        code: r.code,
+        out: new TextDecoder().decode(r.stdout),
+      }));
+    };
+
+    for (
+      const args of [
+        ["cut", "-f2", "-d,"],       // attached, which always worked
+        ["cut", "-f", "2", "-d", ","],   // …and detached, which did not
+        ["cut", "-f", "2", "-d,"],       // one of each
+        ["cut", "-d", ",", "-f", "1"],
+        ["cut", "-d", ",", "-f", "9"],   // a field that is not there
+        ["fold", "-w", "3"],
+        ["fold", "-w3"],
+        ["head", "-n", "1"],
+        ["head", "-1"],
+        ["tail", "-n", "1"],
+        ["sort", "-n"],              // `-n` is a *boolean* here, and must not swallow an operand
+        ["sort", "-r"],
+        ["grep", "-n", "a"],         // …nor here, where swallowing it would search for the pattern
+        ["grep", "-c", "a"],
+      ]
+    ) {
+      const [tool, ...rest] = args;
+      const theirs = await run(tool, rest);
+      const ours = await run(built, args);
+      assertEquals(ours.out, theirs.out, args.join(" "));
+      assertEquals(ours.code, theirs.code, `${args.join(" ")}: exit status`);
+    }
+
+    // `sort -n` over lines with equal keys is GNU's *last-resort comparison*, not the input's order:
+    // every line here has a numeric key of zero except the last, and the answer is byte order among
+    // them. This printed the input back and looked stable.
+    const mixed = "b\na\n1\nA\n";
+    const sorted = (cmd: string, args: string[]) => {
+      const child = new Deno.Command(cmd, { args, stdin: "piped", stdout: "piped", stderr: "null" })
+        .spawn();
+      const w = child.stdin.getWriter();
+      w.write(new TextEncoder().encode(mixed));
+      w.close();
+      return child.output().then((r) => new TextDecoder().decode(r.stdout));
+    };
+    assertEquals(await sorted(built, ["sort", "-n"]), await sorted("sort", ["-n"]), "sort -n");
+    assertEquals(await sorted(built, ["sort", "-nr"]), await sorted("sort", ["-nr"]), "sort -nr");
+    // …and `-u` is the exception: uniqueness is the *key's*, so the last resort must not apply or
+    // `1` and `01` would stop being one line.
+    const dup = (cmd: string, args: string[]) => {
+      const child = new Deno.Command(cmd, { args, stdin: "piped", stdout: "piped", stderr: "null" })
+        .spawn();
+      const w = child.stdin.getWriter();
+      w.write(new TextEncoder().encode("1\n01\n"));
+      w.close();
+      return child.output().then((r) => new TextDecoder().decode(r.stdout));
+    };
+    assertEquals(await dup(built, ["sort", "-nu"]), await dup("sort", ["-nu"]), "sort -nu");
+    assertEquals(await dup(built, ["sort", "-n"]), await dup("sort", ["-n"]), "sort -n over 1 and 01");
+
+    // `shuf -n 0` printed every line: "absent" and "none" were the same value, which is 0034's bug in
+    // the one applet where nothing could reach it until a detached `-n 0` parsed at all.
+    const none = await run(built, ["shuf", "-n", "0"]);
+    assertEquals(none.out, "", `shuf -n 0 printed something: ${JSON.stringify(none.out)}`);
+    assertEquals(none.code, 0);
   } finally {
     await Deno.remove(built);
   }
