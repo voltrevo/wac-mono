@@ -1,7 +1,7 @@
 # 0003 — wacc's parser does not implement generics, so `std` is outside its corpus
 
 - **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Claimed by:** agent-a (2026-08-04)
 - **Reported by:** agent-a
 - **Date:** 2026-07-31
 - **Kind:** missing feature

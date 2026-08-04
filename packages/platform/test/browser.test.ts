@@ -11,6 +11,7 @@
 // case below is the one it caught.
 
 import { browserWorld, type DirHandle, type FileHandle } from "../host/browser.ts";
+import { WORKER_MARKER } from "../host/children.ts";
 import { i32le, readI32le, str, unstr } from "../host/call.ts";
 import { OP } from "../host/ops.ts";
 
@@ -516,7 +517,10 @@ Deno.test("a page spawns a worker of its own — 0030", async () => {
   // is a whole wac program, and that is tested in a real browser by `browser_live.test.ts` — here a
   // handful of lines of JavaScript playing the same protocol is what keeps this test a unit.
   const w = browserWorld({});
-  const child = `
+  // The marker on the first line, because `spawnChild` refuses a source without one before starting
+  // anything — a file that parses and is not a worker bundle used to wedge the caller for ever (0033).
+  // A double that speaks the protocol has to say it is one, same as a built bundle does.
+  const child = `${WORKER_MARKER}
     self.postMessage({ ready: true });
     self.onmessage = () => self.postMessage({ ok: true, code: 7 });
   `;

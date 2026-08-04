@@ -120,6 +120,16 @@ was closed `wontfix`, so running host programs is a settled non-goal rather than
 What replaces it is a wac program run with grants the parent chooses — which is more than this
 package expected to settle for.
 
+**A spawned program is as trusted as the shell.** It gets `read`, `write`, `net` and `env`, and the
+host narrows that to what the shell itself holds, so a shell started with nothing hands its children
+nothing — the property that matters was never that a child gets *nothing*, it is that it cannot get
+*more*. `GRANT_NONE` was here instead and was never a decision: it was the value the argument had when
+`spawn` grew one, and it meant a `$WACPATH` `wc file` could not open the file it was handed while the
+shell refusing on its behalf could read it perfectly well.
+[0028](../../issues/closed/0028-sh-decides-nothing-about-what-wacpath-programs-may-do.md) set out the
+three defensible answers — nothing, the shell's own, or a `WACGRANTS=` variable — and this is the
+second, which is what every other shell does.
+
 Then **whatever was handed to the shell**, through `Shell.external`. `packages/box` has sixty
 applets and this package is one of its dependencies, so it cannot import them — the wiring goes the
 other way, and it is one line:
@@ -172,12 +182,26 @@ in GNU; here it is refused, because a write nobody asked for is worse than a mis
 diagnostic goes to standard error in one piece after the output rather than interleaved with it,
 which is the seam again — the fallback programs hand back two finished byte strings.
 
-**`tr` takes `-c`, `-d`, `-s` and `-t`**, interprets `\n`-style escapes and `[:alpha:]`-style
-classes, and *refuses* an option it does not have. It did none of that until bash was asked: `-d`
-was read as the two-character set `{-, d}`, so `tr -d 12` translated digits into a dash and a `d`
-and reported success; `tr : '\n'` produced a backslash and an `n`; `[:digit:]` was eight literal
-characters. `[c*n]` and `[=c=]` are refused rather than approximated, which is the one place this
-`tr` says no to something GNU does.
+**`tr` matches GNU.** `-c`, `-d`, `-s`, `-t`; `\n`-style escapes, and GNU's set of them rather than
+`printf`'s, so `\x41` is an `x`, a `4` and a `1`; all twelve `[:alpha:]` classes; `[c*n]` repeats and
+`[c*]` padding, octal counts included; `[=c=]` equivalence classes. It did none of that until bash was
+asked: `-d` was read as the two-character set `{-, d}`, so `tr -d 12` translated digits into a dash and
+a `d` and reported success; `tr : '\n'` produced a backslash and an `n`; `[:digit:]` was eight literal
+characters. The repeats and equivalence classes were *refused* for one afternoon, and the refusal is
+gone because a refusal is not the goal — see the next paragraph.
+
+**Three answers to a gap, and they are not equally good.** Doing something plausible anyway is the
+worst: it is a wrong answer with nothing to notice, which is what every bug in the paragraph above
+was. Refusing is better. Saying *which side is incomplete* is better still, and is the only one of the
+three that is true — a caller who writes `wc -m` has written a real flag, and "invalid option" tells
+them their command is wrong when this program is merely unfinished.
+
+So the two messages are two different facts. A letter GNU has not got either keeps GNU's own wording:
+`wc: invalid option -- 'Z'`. A letter GNU has and this does not says so: `wc: -m is not implemented`,
+`grep: -E is not implemented`, `test: -r is not implemented`, `sh: redirecting fd 2 is not
+implemented`. `gnuHas` in `program.wac` holds the letters, read out of the tools' own `--help`, and
+`test/gaps.test.ts` asserts the property against the installed coreutils: **no option GNU has is ever
+called invalid.** It fails if the table drifts, and it fails if a new refusal picks the wrong wording.
 
 The single seam was the point, and it paid off: wiring `spawn` in changed no part of the pipeline,
 redirection, status or `&&` handling, because all of it was already written against `Output`. The
@@ -218,10 +242,14 @@ The first thing a shell trips over is a file on `$WACPATH` that is not a worker 
 are two of those. One that does not parse is now a failed command with the host's reason and status
 126, distinct from the 127 of not existing —
 [0021](../../issues/closed/0021-a-spawned-worker-that-does-not-parse-kills-the-parent.md), where it
-used to take the shell down with it. One that *parses* and never speaks the bridge protocol — a
-built program rather than a `--worker` bundle, most likely — still hangs:
-[0033](../../issues/open/0033-a-file-that-parses-but-is-not-a-worker-bundle-wedges-the-shell.md) has
-why that is a harder question than it looks.
+used to take the shell down with it. One that *parses* and never speaks the bridge protocol — a built
+program rather than a `--worker` bundle, most likely — used to hang for ever, and is now a failed
+command too: every bundle carries a marker on its first line, so a file that is not one is refused
+before a worker starts, and one that claims to be and then says nothing is failed by a five-second
+grace rather than waited on.
+[0033](../../issues/closed/0033-a-file-that-parses-but-is-not-a-worker-bundle-wedges-the-shell.md) is
+why the marker had to come first: the timer alone would have traded the hang for a false "cannot
+execute" on a loaded machine.
 
 **The signature is the design decision.** Bytes in, bytes out, a status, and a `found` flag —
 because a shell reports 127 for "no such command" and the program's own code for "ran and failed",
@@ -322,8 +350,9 @@ A malformed expansion is **fatal**, as it is in bash: `${x:}` prints nothing, ex
 abandons the rest of the line rather than quietly expanding to the empty string. Quietly
 expanding to something plausible is the failure mode this package exists to avoid.
 
-**`2>` is refused rather than approximated.** Only standard output is captured, so there is
-nothing of the error stream to redirect, and saying so beats writing the wrong bytes to the file.
+**`2>` is not implemented, and says so in those words.** Only standard output is captured through the
+seam, so there is nothing of the error stream to redirect — and the message names the gap rather than
+the command: this shell is unfinished here, and the caller who wrote `2>err` was not wrong.
 
 **Standard error arrives when it happened**, interleaved with standard output as bash's is, which
 is what `2>&1` has to show. It used to be collected and flushed at the end through `Core.warn` —

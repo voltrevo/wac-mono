@@ -347,6 +347,45 @@ Gathered gather(Cli cli, string cwd, Vec<string> operands, u8[] stdin) {
   return Gathered(out.take(), failed, reasons);
 }
 
+/**
+ * Whether GNU's version of this program has this option — which decides what a refusal *says*.
+ *
+ * Two messages, because they are two different facts. A letter GNU does not have either is a mistake in
+ * the command and gets GNU's own wording. A letter GNU *has* and this does not is a gap in this program,
+ * and "invalid option" blames the wrong side: the caller wrote a real flag and was told it was not one.
+ * Saying plainly that it is not implemented is the difference between "you are wrong" and "I am
+ * incomplete", and only the second is true.
+ *
+ * The letters are the real tools', read out of `--help` rather than remembered. `test/gaps.test.ts`
+ * checks the list against the installed coreutils, so it cannot quietly drift out of date.
+ */
+bool gnuHas(string name, i32 letter) {
+  string letters = "";
+  if (name == "wc") { letters = "cmlLw"; }
+  else if (name == "head") { letters = "cnqvz"; }
+  else if (name == "tail") { letters = "cfFnqsvz"; }
+  else if (name == "sort") { letters = "bdfgiMhnRrVcCkmosStTuz"; }
+  else if (name == "uniq") { letters = "cdDfisuzw"; }
+  else if (name == "nl") { letters = "bdfhilnpsvw"; }
+  else if (name == "rev") { letters = "hV"; }
+  else if (name == "grep") { letters = "EFGPefiwxzsvVmbnHhoqaIdDrRLlcTZBACU"; }
+  else if (name == "tr") { letters = "cdst"; }
+  u8[] b = letters.toBytes();
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] == letter) { return true; }
+  }
+  return false;
+}
+
+/** What to say about an option this program does not take, and whose gap it is. */
+string optionRefusal(string name, string letter) {
+  u8[] b = letter.toBytes();
+  if (b.len() == 1 && gnuHas(name, b[0])) {
+    return name + ": -" + letter + " is not implemented\n";
+  }
+  return name + ": invalid option -- '" + letter + "'\n";
+}
+
 /** A program's arguments, split: the options it was given, its operands, and the first it refuses. */
 struct Options {
   /** The letters seen, in order — `sawOption` asks about one. */
@@ -460,7 +499,7 @@ Output cat(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
 Output wc(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
   Options o = options(argv, "lwc");
   if (o.bad != "") {
-    return Output.fail(("wc: invalid option -- '" + o.bad + "'\n").toBytes(), 1);
+    return Output.fail(optionRefusal("wc", o.bad).toBytes(), 1);
   }
   bool wantLines = sawOption(o, "l");
   bool wantWords = sawOption(o, "w");
@@ -538,7 +577,7 @@ Output headOrTail(Cli cli, string cwd, Vec<string> argv, u8[] stdin, bool front)
   string who = front ? "head" : "tail";
   Counted c = countOf(argv, 10);
   if (c.bad != "") {
-    return Output.fail((who + ": invalid option -- '" + c.bad + "'\n").toBytes(), 1);
+    return Output.fail(optionRefusal(who, c.bad).toBytes(), 1);
   }
 
   Vec<string> names = inputsOf(c.operands);
@@ -579,7 +618,7 @@ u8[] lastLines(u8[] data, i32 n) {
 Output rev(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
   Options o = options(argv, "");
   if (o.bad != "") {
-    return Output.fail(("rev: invalid option -- '" + o.bad + "'\n").toBytes(), 1);
+    return Output.fail(optionRefusal("rev", o.bad).toBytes(), 1);
   }
   Gathered in = gather(cli, cwd, o.operands, stdin);
   Buf err = Buf.create();
@@ -600,7 +639,7 @@ Output sort(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
   Options o = options(argv, "r");
   if (o.bad != "") {
     // 2, not 1: GNU sort's usage status is its own, and a script testing for it is testing for that.
-    return Output.fail(("sort: invalid option -- '" + o.bad + "'\n").toBytes(), 2);
+    return Output.fail(optionRefusal("sort", o.bad).toBytes(), 2);
   }
   bool reverse = sawOption(o, "r");
   Gathered in = gather(cli, cwd, o.operands, stdin);
@@ -637,10 +676,13 @@ Output sort(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
 Output uniq(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
   Options o = options(argv, "");
   if (o.bad != "") {
-    return Output.fail(("uniq: invalid option -- '" + o.bad + "'\n").toBytes(), 1);
+    return Output.fail(optionRefusal("uniq", o.bad).toBytes(), 1);
   }
   if (o.operands.len() > 1) {
-    return Output.fail("uniq: writing to a second operand is not supported\n".toBytes(), 1);
+    // GNU's second operand is an output *file*, which it writes. Not implemented rather than refused on
+    // principle: the distinction matters to whoever reads this next, and "not supported" reads as a
+    // decision somebody made.
+    return Output.fail("uniq: writing to a second operand is not implemented\n".toBytes(), 1);
   }
   Gathered in = gather(cli, cwd, o.operands, stdin);
   if (in.failed.len() > 0) {
@@ -668,7 +710,7 @@ Output uniq(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
 Output grep(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
   Options o = options(argv, "cinqvx");
   if (o.bad != "") {
-    return Output.fail(("grep: invalid option -- '" + o.bad + "'\n").toBytes(), 2);
+    return Output.fail(optionRefusal("grep", o.bad).toBytes(), 2);
   }
   if (o.operands.len() == 0) { return Output.fail("grep: no pattern\n".toBytes(), 2); }
 
@@ -754,7 +796,7 @@ Output tr(Vec<string> argv, u8[] stdin) {
       else if (b[i] == 't') { trunc = true; }
       else {
         u8[] one = u8[1](fill: b[i]);
-        return Output.fail(("tr: invalid option -- '" + string.fromBytes(one) + "'\n").toBytes(), 1);
+        return Output.fail(optionRefusal("tr", string.fromBytes(one)).toBytes(), 1);
       }
     }
     first++;
@@ -773,9 +815,10 @@ Output tr(Vec<string> argv, u8[] stdin) {
     return Output.fail(("tr: extra operand '" + argv.get(first + 1) + "'\n").toBytes(), 1);
   }
 
-  Set s1 = parseSet(argv.get(first));
+  Set s1 = parseSet(argv.get(first), -1);
   if (!s1.ok) { return Output.fail(s1.message.toBytes(), 1); }
-  Set s2 = sets == 2 ? parseSet(argv.get(first + 1)) : Set(true, u8[0](), "");
+  // Set2 is parsed knowing set1's length, which is what `[x*]` pads out to.
+  Set s2 = sets == 2 ? parseSet(argv.get(first + 1), s1.bytes.len()) : Set(true, u8[0](), "");
   if (!s2.ok) { return Output.fail(s2.message.toBytes(), 1); }
 
   u8[] from = comp ? complementOf(s1.bytes) : s1.bytes;
@@ -833,20 +876,34 @@ struct Set {
 }
 
 /**
- * One of `tr`'s sets: escapes, then ranges, then character classes.
+ * One of `tr`'s sets: escapes, classes, repeats, equivalence classes, then ranges.
  *
- * Each of the three was silently something else. `tr : '\n'` translated colons to a backslash and an
- * `n` — the *shell* does not interpret `\n` in `'…'` and neither did this, so the commonest way to
- * split a line on a delimiter produced two wrong characters where one was wanted. `[:digit:]` was
- * eight literal characters, so `tr '[:digit:]' x` turned brackets and colons into `x` and left the
- * digits alone.
+ * Each of the first two was silently something else. `tr : '\n'` translated colons to a backslash and
+ * an `n` — the *shell* does not interpret `\n` in `'…'` and neither did this, so the commonest way to
+ * split a line on a delimiter produced two wrong characters where one was wanted. `[:digit:]` was eight
+ * literal characters, so `tr '[:digit:]' x` turned brackets and colons into `x` and left the digits
+ * alone.
  *
- * `[c*n]` and `[=c=]` are *refused*. GNU has both, and this does not, and the difference between
- * refusing and pretending is the whole reason the two above were bugs.
+ * The other two were *refused*, which was better than pretending and worse than working: GNU has them,
+ * so a refusal named a gap in this program as though it were a mistake in the command. `[c*n]` is `n`
+ * copies of `c` — octal if `n` has a leading zero, as GNU reads it — and `[c*]` pads set2 out to set1's
+ * length, which is how `tr abc '[x*]'` means `xxx`. `[=c=]` is `c` itself, there being one character in
+ * an equivalence class in the C locale.
+ *
+ * `targetLen` is set1's length when this is set2, and -1 when this *is* set1 — which is also what makes
+ * `[c*]` an error there, as it is in GNU: there is nothing for it to pad to.
+ *
+ * **Ranges form from literal text only.** A `-` that arrived from an escape or a class is a character,
+ * not a range: `tr 'a\-b' xyz` translates three characters, and `[:punct:]` contains a dash that used
+ * to be able to swallow its neighbours. The mask is what tells them apart, and it is why ranges are
+ * expanded here rather than by a pass over the finished bytes.
  */
-Set parseSet(string set) {
+Set parseSet(string set, i32 targetLen) {
   u8[] raw = set.toBytes();
   Buf lit = Buf.create();
+  Buf plain = Buf.create();     // 1 where a byte was written literally, so a range may form from it
+  i32 padChar = -1;
+  i32 padAt = -1;
 
   for (i32 i = 0; i < raw.len(); i++) {
     if (raw[i] == '[' && i + 1 < raw.len() && raw[i + 1] == ':') {
@@ -857,30 +914,131 @@ Set parseSet(string set) {
       if (members.len() == 0) {
         return Set(false, u8[0](), "tr: invalid character class '" + name + "'\n");
       }
-      lit.pushAll(members);
+      pushExpanded(lit, plain, members);
       i = close;
       continue;
     }
     if (raw[i] == '[' && i + 1 < raw.len() && raw[i + 1] == '=') {
-      return Set(false, u8[0](), "tr: equivalence classes are not supported\n");
+      i32 close = equivEnd(raw, i);
+      if (close < 0) { return Set(false, u8[0](), "tr: unterminated equivalence class\n"); }
+      u8[] inside = sliceBytes(raw, i + 2, close - 1);
+      if (inside.len() != 1) {
+        return Set(false, u8[0](), "tr: " + string.fromBytes(inside) +
+          ": equivalence class operand must be a single character\n");
+      }
+      pushExpanded(lit, plain, inside);
+      i = close;
+      continue;
     }
-    if (raw[i] == '[' && repeatEnd(raw, i) > 0) {
-      return Set(false, u8[0](), "tr: repeated characters ([c*n]) are not supported\n");
+    i32 star = repeatEnd(raw, i);
+    if (star > 0) {
+      u8[] count = sliceBytes(raw, i + 3, star);
+      if (count.len() == 0 || allZero(count)) {
+        // `[c*]` and `[c*0]` both mean "as many as it takes", which only set2 can answer.
+        if (targetLen < 0) {
+          return Set(false, u8[0](), "tr: the [c*] repeat construct may not appear in string1\n");
+        }
+        padChar = raw[i + 1];
+        padAt = lit.bytes().len();
+        i = star;
+        continue;
+      }
+      i32 n = repeatCount(count);
+      if (n < 0) {
+        return Set(false, u8[0](), "tr: invalid repeat count '" + string.fromBytes(count) +
+          "' in [c*n] construct\n");
+      }
+      u8[] copies = u8[n](fill: raw[i + 1]);
+      pushExpanded(lit, plain, copies);
+      i = star;
+      continue;
     }
     if (raw[i] == 0x5c && i + 1 < raw.len()) {                     // '\'
-      i = trEscape(lit, raw, i) - 1;                               // the loop's own `i++` follows
+      i32 was = lit.bytes().len();
+      i32 next = trEscape(lit, raw, i);
+      // Whatever the escape produced is a character rather than range material.
+      for (i32 k = was; k < lit.bytes().len(); k++) { plain.push(0); }
+      i = next - 1;                                                // the loop's own `i++` follows
       continue;
     }
     lit.push(raw[i]);
+    plain.push(1);
   }
 
-  u8[] literal = lit.bytes();
-  if (descendingRange(literal)) {
-    return Set(false, u8[0](), "tr: range-endpoints are in reverse collating sequence order\n");
+  Set ranged = expandRanges(lit.bytes(), plain.bytes());
+  if (!ranged.ok) { return ranged; }
+  if (padChar < 0) { return ranged; }
+
+  // The pad is however many characters set2 still needs, which is why it is applied last: the count
+  // depends on everything else in the set, before it and after it.
+  i32 short = targetLen - ranged.bytes.len();
+  if (short < 0) { short = 0; }
+  Buf out = Buf.create();
+  for (i32 i = 0; i < padAt; i++) { out.push(ranged.bytes[i]); }
+  for (i32 i = 0; i < short; i++) { out.push(padChar); }
+  for (i32 i = padAt; i < ranged.bytes.len(); i++) { out.push(ranged.bytes[i]); }
+  return Set(true, out.bytes(), "");
+}
+
+/** Bytes that came from an expansion: characters, never a range's endpoints or its dash. */
+void pushExpanded(Buf lit, Buf plain, u8[] bytes) {
+  lit.pushAll(bytes);
+  for (i32 i = 0; i < bytes.len(); i++) { plain.push(0); }
+}
+
+/**
+ * `a-z` becomes the twenty-six bytes it names, where all three characters were written literally.
+ *
+ * Ranges last, or `a-z` is the three-character set `{a, -, z}` and the commonest use of `tr` in
+ * existence silently does almost nothing — issue 0019, which is exactly what happened.
+ */
+Set expandRanges(u8[] b, u8[] plain) {
+  Buf out = Buf.create();
+  for (i32 i = 0; i < b.len(); i++) {
+    bool range = i + 2 < b.len() && b[i + 1] == '-' &&
+      plain[i] != 0 && plain[i + 1] != 0 && plain[i + 2] != 0;
+    if (!range) { out.push(b[i]); continue; }
+    if (b[i + 2] < b[i]) {
+      // Named, as GNU names it: with two sets on one command line, "which range" is the question a
+      // person actually has.
+      u8[] pair = u8[3](fill: 0);
+      pair[0] = b[i];
+      pair[1] = '-';
+      pair[2] = b[i + 2];
+      return Set(false, u8[0](), "tr: range-endpoints of '" + string.fromBytes(pair) +
+        "' are in reverse collating sequence order\n");
+    }
+    for (i32 c = b[i]; c <= b[i + 2]; c++) { out.push(c); }
+    i += 2;
   }
-  // Ranges last, or `a-z` is the three-character set `{a, -, z}` and the commonest use of `tr` in
-  // existence silently does almost nothing — issue 0019, which is exactly what happened.
-  return Set(true, expandSet(literal), "");
+  return Set(true, out.bytes(), "");
+}
+
+/** Whether every byte is `0` — `[c*0]` is the pad form, not a repeat of zero. */
+bool allZero(u8[] b) {
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] != '0') { return false; }
+  }
+  return true;
+}
+
+/** A repeat count: octal with a leading zero, decimal otherwise, and -1 for anything else. */
+i32 repeatCount(u8[] b) {
+  i32 base = b[0] == '0' ? 8 : 10;
+  i32 v = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] >= '0' + base) { return -1; }
+    v = v * base + (b[i] - '0');
+  }
+  return v;
+}
+
+/** Where a `[=c=]` ends, or -1. */
+i32 equivEnd(u8[] b, i32 at) {
+  for (i32 i = at + 2; i + 1 < b.len(); i++) {
+    if (b[i] == '=' && b[i + 1] == ']') { return i + 1; }
+  }
+  return -1;
 }
 
 /**
@@ -923,12 +1081,18 @@ i32 classEnd(u8[] b, i32 at) {
   return -1;
 }
 
-/** Where a `[c*n]` ends, or -1 — `n` may be empty, which means "as many as it takes". */
+/**
+ * Where a `[c*n]` ends, or -1.
+ *
+ * The count is *not* validated here — anything up to the `]` counts as one — because `[x*a]` is a
+ * malformed repeat rather than five literal characters, and GNU says so. Requiring digits made it
+ * literal text and printed `[x*`, which is the shape of answer this file exists to stop producing.
+ * An unterminated `[x*` really is literal, in both.
+ */
 i32 repeatEnd(u8[] b, i32 at) {
-  if (at + 3 >= b.len() || b[at + 2] != '*') { return -1; }
+  if (b[at] != '[' || at + 3 >= b.len() || b[at + 2] != '*') { return -1; }
   for (i32 i = at + 3; i < b.len(); i++) {
     if (b[i] == ']') { return i; }
-    if (b[i] < '0' || b[i] > '9') { return -1; }
   }
   return -1;
 }
@@ -981,44 +1145,6 @@ u8[] sliceBytes(u8[] b, i32 from, i32 to) {
   return out;
 }
 
-/**
- * `a-z` becomes the twenty-six bytes it names; everything else is itself.
- *
- * A `-` that cannot begin a range — first, last, or with a descending pair around it — is an
- * ordinary character, which is what makes `tr -d` and `tr a-` mean anything at all.
- */
-u8[] expandSet(u8[] set) {
-  i32 n = 0;
-  for (i32 i = 0; i < set.len(); i++) {
-    if (isRangeAt(set, i)) { n = n + (set[i + 2] - set[i] + 1); i += 2; }
-    else { n++; }
-  }
-  u8[] out = u8[n](fill: 0);
-  i32 at = 0;
-  for (i32 i = 0; i < set.len(); i++) {
-    if (isRangeAt(set, i)) {
-      for (i32 c = set[i]; c <= set[i + 2]; c++) { out[at] = c; at++; }
-      i += 2;
-    } else {
-      out[at] = set[i];
-      at++;
-    }
-  }
-  return out;
-}
-
-bool isRangeAt(u8[] set, i32 i) {
-  return i + 2 < set.len() && set[i + 1] == '-' && set[i + 2] >= set[i];
-}
-
-/** Whether the set contains an `x-y` with y below x, which the real `tr` refuses outright. */
-bool descendingRange(u8[] set) {
-  for (i32 i = 0; i + 2 < set.len(); i++) {
-    if (set[i + 1] == '-' && set[i + 2] < set[i]) { return true; }
-  }
-  return false;
-}
-
 Output seq(Vec<string> argv) {
   i32 from = 1;
   i32 to = 0;
@@ -1037,7 +1163,7 @@ Output seq(Vec<string> argv) {
 Output nl(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
   Options nlo = options(argv, "");
   if (nlo.bad != "") {
-    return Output.fail(("nl: invalid option -- '" + nlo.bad + "'\n").toBytes(), 1);
+    return Output.fail(optionRefusal("nl", nlo.bad).toBytes(), 1);
   }
   Gathered nli = gather(cli, cwd, nlo.operands, stdin);
   Buf nlerr = Buf.create();

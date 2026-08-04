@@ -119,9 +119,11 @@ Deno.test("a file that is not a worker bundle is a failed command, not a dead sh
   // command". The status of the *script* is `echo`'s, so 0 — the same as it is in bash.
   assertEquals(r.code, 0, `out=${r.out} err=${r.err}`);
   assertEquals(r.err.includes("notaprogram"), true, r.err);
-  // The reason, from the host, on one line. Without this the shell says only that something went
-  // wrong, and "it is not a worker bundle" is exactly the thing a person needs told.
-  assertEquals(r.err.includes("SyntaxError"), true, r.err);
+  // The reason, on one line, and it now says the thing a person needs told rather than leaving them to
+  // infer it from a `SyntaxError`: the file is not a worker bundle. It is answered from the source's
+  // first line, before a worker starts, which is also what stopped a bundle that *parses* and never
+  // speaks the protocol from wedging the shell — 0033.
+  assertEquals(r.err.includes("not a wac worker bundle"), true, r.err);
 });
 
 Deno.test("...and the status of that command alone is 126 — 0021", async () => {
@@ -142,3 +144,40 @@ Deno.test("a spawned program reads all of its input before answering", async () 
 // `/tmp`. It does not, or not soon enough: one 700 KiB binary per run accumulated to five hundred of
 // them, and a parallel suite eventually failed with "No space left on device" in an unrelated package.
 // The `unload` handler at the top is the cleanup, and this comment is what it replaced.
+
+Deno.test("a spawned program may read a file, because a child is as trusted as the shell — 0028", async () => {
+  // `GRANT_NONE` was what `spawn` was called with, and it was never anybody's decision — it was the
+  // value the argument had when `spawn` grew one. So a `$WACPATH` program was a filter and nothing
+  // else: `wc file` could not open the file it was handed, and the shell that could read it was the
+  // one refusing on its behalf.
+  //
+  // The child gets the shell's own grants now, which the host intersects with what it actually holds —
+  // so this cannot widen anything: a shell started without `read` still hands its children nothing,
+  // which is the next case.
+  await Deno.writeTextFile(`${dir}/note.txt`, "one two three\n");
+  const r = await sh(`WACPATH=${dir}; wc ${dir}/note.txt`);
+  assertEquals(r.code, 0, `${r.out}${r.err}`);
+  // The same program run directly is the oracle: what `wc` prints for this file is `wc`'s business, and
+  // what this test is about is whether it was allowed to look at all.
+  const alone = `${dir}/wc-alone`;
+  await buildApp("packages/platform/example/wc.wac", alone, { read: true });
+  const direct = await new Deno.Command(alone, { args: [`${dir}/note.txt`] }).output();
+  assertEquals(r.out, new TextDecoder().decode(direct.stdout), "the same answer as running it alone");
+  assertEquals(r.out.trim().length > 0, true, `nothing printed: ${r.err}`);
+});
+
+Deno.test("...and a shell with no grants still hands its children none", async () => {
+  // The property that matters is not that a child gets nothing — it is that it cannot get *more*. The
+  // host intersects, so this asks for the same read through a shell built without one.
+  const bare = `${dir}/sh-bare`;
+  await buildApp("packages/sh/src/sh.wac", bare, { env: true });
+  await Deno.writeTextFile(`${dir}/note.txt`, "one two three\n");
+  const r = await new Deno.Command(bare, {
+    args: ["-c", `WACPATH=${dir}; wc ${dir}/note.txt`],
+  }).output();
+  const said = new TextDecoder().decode(r.stderr) + new TextDecoder().decode(r.stdout);
+  // It cannot even find the program: reading `$WACPATH/wc` is a filesystem read, so a shell with no
+  // `read` falls back to its own `wc`, which reads standard input and finds it empty. Either way the
+  // file is not opened, and nothing here can widen that.
+  assertEquals(said.includes("one two three"), false, `a child read a file the shell may not: ${said}`);
+});

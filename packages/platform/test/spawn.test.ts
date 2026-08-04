@@ -6,6 +6,7 @@
 // is. If any of that needed a child-shaped special case, the design would be wrong.
 
 import { buildApp } from "../build.ts";
+import { WORKER_MARKER } from "../host/children.ts";
 
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
@@ -73,15 +74,23 @@ Deno.test("a source that is not a program is a failed child, not a dead parent �
     // that the *program* decided it: before this, the process died with 1 and nothing of its own.
     assertEquals(r.code, 1, err);
     assertEquals(err.includes("runner: "), true, `the program reported it, not the runtime: ${err}`);
-    assertEquals(err.includes("SyntaxError"), true, `with the host's reason: ${err}`);
+    // The reason is now the *marker's* rather than a `SyntaxError`, and it arrives without starting a
+    // worker at all: a bundle says on its first line that it is one, so "this is not a program" is a
+    // fact about the file rather than something inferred from how it failed. 0033.
+    assertEquals(
+      err.includes("not a wac worker bundle"),
+      true,
+      `with a reason that names the gap: ${err}`,
+    );
     // The line that used to be there, and is the parent dying rather than reporting.
     assertEquals(err.includes("Unhandled error in child worker"), false, err);
 
-    // The worker's *own* isolate still prints its uncaught error, which no parent can prevent —
-    // `preventDefault` stops the propagation, not the child's own report. So stderr holds two
-    // accounts of one failure, and only one of them is ours. Asserted rather than lamented: if
-    // Deno ever stops printing it, this is where to notice.
-    assertEquals(err.includes("Uncaught (in worker"), true, err);
+    // And *one* account of one failure now, where there used to be two. The worker's own isolate
+    // printed its uncaught error as well — which no parent could prevent, since `preventDefault` stops
+    // the propagation and not the child's own report — but no worker is started for a source that does
+    // not carry the marker, so there is nothing to have printed it. If that line ever comes back, a
+    // file that is not a bundle is reaching the runtime again.
+    assertEquals(err.includes("Uncaught (in worker"), false, err);
   } finally {
     await Deno.remove(runner);
     await Deno.remove(notAProgram);
@@ -245,4 +254,44 @@ Deno.test("a parent hands a child a subset of its own grants, and cannot exceed 
   } finally {
     for (const f of [readOnly, readNet, child]) await Deno.remove(f);
   }
+});
+
+Deno.test({
+  name: "a bundle that parses and never speaks the protocol is a failed child, not a hang — 0033",
+  // Five seconds of waiting by design: the grace is what this is about. Nothing else in the suite
+  // waits, and the number is in `children.ts` beside the reasoning for it.
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // Two shapes of the same wedge, and only the second one needed a timer. A file that is not a
+    // bundle is refused from its first line — that is the marker, and the case above covers it. This
+    // one *claims* to be a bundle and then sits there, which is what 0021's notes predicted would
+    // still hang after 0021 was fixed, and it did: `recv` waited for a child that was never going to
+    // answer, for ever, with no way to interrupt it.
+    const runner = await Deno.makeTempFile({ prefix: "wac-mute-runner-" });
+    const mute = await Deno.makeTempFile({ prefix: "wac-mute-", suffix: ".worker.js" });
+    try {
+      await buildApp("packages/platform/example/runner.wac", runner, { read: true });
+      // The marker, and then nothing. Valid JavaScript, evaluates cleanly, says nothing.
+      await Deno.writeTextFile(mute, `${WORKER_MARKER}\n// and not another word\n`);
+
+      const started = Date.now();
+      const r = new Deno.Command(runner, {
+        args: [mute, "anything"],
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      const took = Date.now() - started;
+      const err = new TextDecoder().decode(r.stderr);
+
+      assertEquals(r.code, 1, `it should fail, and say so: ${err}`);
+      assertEquals(err.includes("did not report ready"), true, `naming the gap: ${err}`);
+      // Bounded, which is the whole difference: it used to be unbounded, and "hangs" and "is slow"
+      // look identical from outside. Generous on the upper side because this machine is shared.
+      assertEquals(took < 60_000, true, `${took} ms — the grace did not end it`);
+    } finally {
+      await Deno.remove(runner);
+      await Deno.remove(mute);
+    }
+  },
 });

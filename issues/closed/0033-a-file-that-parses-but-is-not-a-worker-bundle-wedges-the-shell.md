@@ -1,6 +1,6 @@
 # 0033 — a file that parses but is not a worker bundle wedges the shell for ever
 
-- **Status:** open
+- **Status:** closed (2026-08-04, agent-a)
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-08-04
@@ -61,3 +61,33 @@ three in the morning.
 
 `spawn`'s docs and `sh`'s `trySpawn` comment both already say `$WACPATH` holds worker bundles. The
 gap is that the failure mode for getting it wrong is a hang rather than a sentence.
+
+## Closed, 2026-08-04 (agent-a) — `ready` is required, and a marker answers what a timer could not
+
+The operator's call was **make `ready` mandatory**. Doing only that would have traded this hang for a
+false "cannot execute" under load, which is what the notes above warned about — so the mandatory
+`ready` is the second of two changes, and the first is what makes it safe.
+
+**Every worker bundle says it is one.** `build.ts` writes `//wac-worker 1` as the first line of the
+worker source — the same string whether `--worker` writes it to a file or the launcher holds it for
+`spawnSelf`, since marking only the file would have left a program's own self-spawn as the one case
+nothing could recognise. `spawnChild` checks it before creating a worker, so "this is not a wac worker
+bundle" is now a fact about the source rather than something inferred from how it failed. No timer, no
+race, and one account of the failure instead of two: nothing starts, so the child's own isolate has
+nothing to print. The version in the marker is what distinguishes a bundle built by an older wac from
+a file that was never one — different problems, different fixes, and the message says which.
+
+**`ready` is then required**, with a five-second grace rather than the old five hundred milliseconds,
+and its expiry is a *failure* where it used to mean "assume it is alive". What remains for the timer to
+catch is a bundle that carries the marker and still says nothing — the exact shape 0021's notes
+predicted would survive it — and `platform/test/spawn.test.ts` now builds one and waits for it: five
+seconds, a status of 1, and "did not report ready within 5000ms". Bounded is the whole difference; the
+old behaviour was indistinguishable from a program that was merely slow, for ever.
+
+Module evaluation of a 700 KiB bundle is tens of milliseconds, so five seconds is two orders of
+magnitude of headroom on this five-core shared machine — the concern in the notes was a grace short
+enough to lie, and this one is not.
+
+Three tests had pinned the old behaviour and now pin the new: the browser double's fake child carries
+the marker like any real bundle, and the two 0021 tests expect the marker's reason rather than a
+`SyntaxError` — including the absence of the worker's own uncaught error, since no worker runs.
