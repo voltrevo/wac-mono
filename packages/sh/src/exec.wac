@@ -34,10 +34,23 @@ import { Output, names, run } from "./program.wac";
 import { atoi, itoa } from "../../fmt/src/itoa.wac";
 import { resolvePath } from "./path.wac";
 import { Arith, evaluate } from "./arith.wac";
+import { Fs } from "../../fs/src/fs.wac";
 
 export struct Shell {
   Core core;
   Cli cli;
+  /**
+   * The filesystem this session sees.
+   *
+   * A *value* the shell holds rather than a capability it reaches for, which is what makes a session's
+   * filesystem a choice: `Fs.onHost(cli)` is the real disk and is what `create` builds, and
+   * `Fs.inMemory()` with `mountMemory("/")` is a session sealed off from it. The mount table decides per
+   * path, so `/host` can be real while everything else is not — design/0001 D1 and D3, wac-mono 0067.
+   *
+   * No closures in wac, so this cannot be a facade of funcrefs over a hidden filesystem; it has to be
+   * something the shell carries. That constraint produced the better shape, which is the mount table.
+   */
+  Fs fs;
   Map<string, string> vars;
   /** `$?` — the status of the last command run. */
   i32 status;
@@ -178,7 +191,7 @@ export struct Shell {
     // Asked once, at the start: the host knows where relative paths land and the shell cannot
     // guess. A browser answers "/" — the root of its Origin Private File System — which is the
     // true answer there rather than a stand-in.
-    return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
+    return Shell(core, cli, Fs.onHost(cli, 0), Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
                  false, Buf.create(), noExternal, noExternalNames, false, Vec.create(),
                  Map.create(hashString, stringEq),
                  Vec.create(), Vec.create(), false, u8[0](), 0, false, false, false,
@@ -687,7 +700,7 @@ Child spawnStage(Shell sh, Vec<string> argv, bool inheritIn) {
   string name = argv.get(0);
   string where = containsSlash(name) ? name : searchWacPath(sh, name);
   if (where != "") {
-    FileResult prog = sh.cli.readFile(sh.resolve(where)).wait();
+    FileResult prog = sh.fs.readFile(sh.resolve(where));
     if (prog.ok) {
       // Without argv[0]: a spawned bundle is one program, and its `arg(0)` is its first argument.
       // `spawnSelf` below keeps argv[0], because that is what tells this bundle which applet to be.
@@ -788,7 +801,7 @@ u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
     match (r.kind) {
       case In: {
         string path = sh.resolve(joinWord(sh, r.target));
-        FileResult f = sh.cli.readFile(path).wait();
+        FileResult f = sh.fs.readFile(path);
         if (!f.ok) {
           sh.err(("sh: " + path + ": " + f.error + "\n").toBytes());
           sh.status = 1;
@@ -982,7 +995,7 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
     match (r.kind) {
       case In: {
         string path = sh.resolve(joinWord(sh, r.target));
-        FileResult f = sh.cli.readFile(path).wait();
+        FileResult f = sh.fs.readFile(path);
         if (!f.ok) {
           sh.err(("sh: " + path + ": " + f.error + "\n").toBytes());
           sh.status = 1;
@@ -1086,7 +1099,7 @@ bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
   }
   u8[] payload = data;
   if (append) {
-    FileResult existing = sh.cli.readFile(path).wait();
+    FileResult existing = sh.fs.readFile(path);
     if (existing.ok) {
       Buf both = Buf.create();
       both.pushAll(existing.bytes);
@@ -1094,7 +1107,7 @@ bool writeTo(Shell sh, Redir r, u8[] data, bool append) {
       payload = both.take();
     }
   }
-  Change wrote = sh.cli.writeFile(path, payload).wait();
+  Change wrote = sh.fs.writeFile(path, payload);
   if (!wrote.ok()) {
     sh.err(("sh: " + path + ": " + wrote.message + "\n").toBytes());
     sh.status = 1;
@@ -1271,7 +1284,7 @@ Output cd(Shell sh, Vec<string> argv) {
   if (want == "-" && back == "") { return Output.fail("cd: OLDPWD not set\n".toBytes(), 1); }
   string target = want == "-" ? back : sh.resolve(want);
 
-  Stat st = sh.cli.stat(target).wait();
+  Stat st = sh.fs.stat(target);
   if (!st.exists) { return Output.fail(("cd: " + want + ": no such file or directory\n").toBytes(), 1); }
   if (!st.isDir) { return Output.fail(("cd: " + want + ": not a directory\n").toBytes(), 1); }
 
@@ -1302,7 +1315,7 @@ Output mkdir(Shell sh, Vec<string> argv) {
   i32 status = 0;
   for (i32 i = 0; i < paths.len(); i++) {
     string given = paths.get(i);
-    Change made = sh.cli.mkdir(sh.resolve(given), parents).wait();
+    Change made = sh.fs.mkdir(sh.resolve(given), parents);
     if (!made.ok()) {
       err.pushAll(("mkdir: cannot create directory '" + given + "': " + reasonOf(made) + "\n")
         .toBytes());
@@ -1339,7 +1352,7 @@ Output rm(Shell sh, Vec<string> argv) {
     // A real `rm` refuses a directory without `-r`, and the platform's `remove` does not: it takes
     // a recursive flag, and without it still removes an *empty* directory. So the check is here.
     // Differential testing found this: `mkdir one; rm one` succeeded where bash exits 1.
-    if (!recursive && sh.cli.stat(path).wait().isDir) {
+    if (!recursive && sh.fs.stat(path).isDir) {
       if (!force) {
         err.pushAll(("rm: cannot remove '" + given + "': Is a directory\n").toBytes());
         status = 1;
@@ -1349,7 +1362,7 @@ Output rm(Shell sh, Vec<string> argv) {
     // `-f` is about what is already gone, which is one fault category and not the others: a file
     // that exists and will not be removed is reported whatever the flags say. Asked in the answer
     // rather than by a `stat` first, so there is no window for the file to vanish in between.
-    Change gone = sh.cli.remove(path, recursive).wait();
+    Change gone = sh.fs.remove(path, recursive);
     if (!gone.ok() && !(force && gone.absent())) {
       err.pushAll(("rm: cannot remove '" + given + "': " + reasonOf(gone) + "\n").toBytes());
       status = 1;
@@ -1380,14 +1393,16 @@ Output ls(Shell sh, Vec<string> argv) {
   for (i32 i = 0; i < paths.len(); i++) {
     string given = paths.get(i);
     string path = sh.resolve(given);
-    string[]? names = sh.cli.readDir(path).wait();
+    string[]? names = sh.fs.readDir(path);
     if (names is null) {
       // Not a directory, or unreadable. A plain file is listed as itself, which is what `ls` does
       // and is why this is not simply an error.
-      if (sh.cli.stat(path).wait().exists) {
+      if (sh.fs.stat(path).exists) {
         out.pushAll((given + "\n").toBytes());
       } else {
-        out.pushAll(("ls: " + given + ": no such file or directory\n").toBytes());
+        // GNU's words, which this had invented its own version of: `ls: cannot access 'x': No such file
+        // or directory`. The quotes and the capital are GNU's, and the corpus compares this line now.
+        out.pushAll(("ls: cannot access '" + given + "': No such file or directory\n").toBytes());
         status = 2;
       }
       continue;
@@ -1511,7 +1526,7 @@ Output trySpawn(Shell sh, Vec<string> argv, bool mayInherit) {
   string where = containsSlash(name) ? name : searchWacPath(sh, name);
   if (where == "") { return Output.missing(); }
 
-  FileResult prog = sh.cli.readFile(sh.resolve(where)).wait();
+  FileResult prog = sh.fs.readFile(sh.resolve(where));
   if (!prog.ok) { return Output.missing(); }
 
   // Bytes, which is what an argument is: the child receives exactly what the shell parsed, with nothing
@@ -1685,7 +1700,7 @@ string searchWacPath(Shell sh, string name) {
       // rather than turned into a bare `/name`.
       if (i > start) {
         string candidate = string.fromBytes(sliceBytes(b, start, i)) + "/" + name;
-        if (sh.cli.stat(sh.resolve(candidate)).wait().exists) { return candidate; }
+        if (sh.fs.stat(sh.resolve(candidate)).exists) { return candidate; }
       }
       start = i + 1;
     }
@@ -1809,10 +1824,10 @@ Output unaryTest(Shell sh, string op, string operand) {
 
   if (op == "-h" || op == "-L") {
     // The link itself, not what it leads to — `stat` follows, which is why there are two.
-    return testResult(sh.cli.linkStat(sh.resolve(operand)).wait().isSymlink);
+    return testResult(sh.fs.linkStat(sh.resolve(operand)).isSymlink);
   }
   if (op == "-e" || op == "-f" || op == "-d" || op == "-s") {
-    Stat st = sh.cli.stat(sh.resolve(operand)).wait();
+    Stat st = sh.fs.stat(sh.resolve(operand));
     if (op == "-e") { return testResult(st.exists); }
     if (op == "-f") { return testResult(st.isFile); }
     if (op == "-d") { return testResult(st.isDir); }
@@ -2057,7 +2072,7 @@ void globInto(Shell sh, u8[] pattern, u8[] quoted, Vec<string> argv) {
   u8[] tail = sliceBytes(pattern, slash + 1, pattern.len());
   u8[] tailMask = sliceBytes(quoted, slash + 1, quoted.len());
 
-  string[]? names = sh.cli.readDir(sh.resolve(dir)).wait();
+  string[]? names = sh.fs.readDir(sh.resolve(dir));
   if (names is null) { return; }
 
   Vec<string> hits = Vec.create();

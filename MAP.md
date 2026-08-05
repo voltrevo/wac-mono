@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-28 packages, 59,466 lines of wac, 1140 tests,
+28 packages, 59,481 lines of wac, 1140 tests,
 32 command-line programs and 4 browser pages.
 
 ## Packages
@@ -31,15 +31,15 @@ In dependency order: nothing here imports anything below it.
 | [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, bcrypt_pbkdf, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519, NIST P-256 and P-384, RSA… | 5,522 | 144 | `bignum` |
 | [`fs`](packages/fs/) | A filesystem that belongs to the system rather than to the host. | 593 | 12 | `bytes` `platform` `std` |
 | [`json`](packages/json/) | JSON (RFC 8259) parsing and serialization, written in wac. | 967 | 51 | `bytes` `fmt` `std` |
-| [`sh`](packages/sh/) | A shell, in wac. | 6,517 | 24 | `bytes` `fmt` `platform` `std` |
 | [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 237 | 16 | `fmt` |
 | [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 4,049 | 45 | `crypto` |
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
-| [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,571 | 46 | `bytes` `codec` `crypto` `platform` `sh` |
+| [`sh`](packages/sh/) | A shell, in wac. | 6,532 | 24 | `bytes` `fmt` `fs` `platform` `std` |
 | [`ssz`](packages/ssz/) | **Everything an Altair light client needs is done and checked against Ethereum's vectors. | 808 | 26 | `crypto` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,685 | 75 | `crypto` |
 | [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,997 | 33 | `bytes` `codec` `crypto` `datetime` `fmt` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`lightclient`](packages/lightclient/) | **The Altair sync protocol works. | 642 | 12 | `bls` `ssz` |
+| [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,571 | 46 | `bytes` `codec` `crypto` `platform` `sh` |
 | [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 10,386 | 181 | `bytes` `codec` `crypto` `datetime` `fmt` `http` `platform` `std` `tls` `wactest` |
 
 ## Programs
@@ -71,8 +71,6 @@ reach — see `packages/platform/README.md`.
 | `packages/platform/example/whichever.wac` | Wait on two sockets and report whichever speaks first. |
 | `packages/fs/example/ops.wac` | The same filesystem operations against memory or against the host, so the two can be compared. |
 | `packages/sh/src/sh.wac` | `sh` — the shell as a program, entire, in wac. |
-| `packages/ssh/src/ssh.wac` | `ssh` — the client as a program, entire. There is no TypeScript in this package's `src/`. |
-| `packages/ssh/src/sshd.wac` | `sshd` — an SSH server, entire, in wac. |
 | `packages/box/example/term.wac` | A shell, in a browser tab. |
 | `packages/box/src/bin/cp.wac` | `cp` on its own: the same applet, built as its own program. |
 | `packages/box/src/bin/grep.wac` | `grep` on its own: the same applet, built as its own program. |
@@ -80,6 +78,8 @@ reach — see `packages/platform/README.md`.
 | `packages/box/src/bin/sha256sum.wac` | `sha256sum` on its own: the same applet, built as its own program. |
 | `packages/box/src/bin/wc.wac` | `wc` on its own: the same applet, built as its own program. |
 | `packages/box/src/box.wac` | A busybox-shaped application: one program, many applets, chosen by the first argument. |
+| `packages/ssh/src/ssh.wac` | `ssh` — the client as a program, entire. There is no TypeScript in this package's `src/`. |
+| `packages/ssh/src/sshd.wac` | `sshd` — an SSH server, entire, in wac. |
 | `packages/tor/src/app.wac` | A Tor client, entire. |
 | `packages/tor/src/dird.wac` | A directory authority's HTTP port: serve the consensus, the certificate and the descriptor. |
 | `packages/tor/src/gendesc.wac` | Generate a router descriptor and write it to a file, so tor's own parser can judge it. |

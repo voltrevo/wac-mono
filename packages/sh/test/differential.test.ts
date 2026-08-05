@@ -1421,6 +1421,11 @@ Deno.test({
         "rev missing",
         "nl missing",
         "grep x missing",
+        // `ls`'s own wording, which was invented rather than GNU's until 0067's work went past it: it said
+        // `ls: x: no such file or directory` where GNU says `ls: cannot access 'x': No such file or
+        // directory`. Nothing compared it, because every `ls` case in the corpus lists something that
+        // exists.
+        "ls nosuchthing",
       ];
       for (const script of cases) {
         const run = (cmd: string, args: string[]) =>
