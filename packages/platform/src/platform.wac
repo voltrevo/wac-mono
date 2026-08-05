@@ -417,6 +417,37 @@ export i32 FAULT_OTHER() { return 5; }
  */
 export i32 FAULT_NOT_REPRESENTABLE() { return 6; }
 
+/**
+ * A fault in the words the real tools use, or `""` where the category has none to give.
+ *
+ * One table, because there were four: `sh` had one for a `Change` and another for a `FileResult`, `box`
+ * had a third, and a fourth was about to be written for `Stat`. Four copies of a phrase list drift, and
+ * the drift is invisible — each one is only read when something has already gone wrong. The `sh` and `box`
+ * copies had already diverged: one of them had no phrase for `FAULT_NOT_REPRESENTABLE` and said the host's
+ * English instead, which is the exact failure the category was added to prevent.
+ *
+ * The words are GNU's, deliberately, because that is what our differential tests compare against and what
+ * a person reading a shell's output expects: `No such file or directory`, not `os error 2`. The
+ * capability layer is the right home for them — a fault number is meaningless without them, and every
+ * struct that carries one is declared here.
+ *
+ * `""` for `FAULT_OTHER` and `FAULT_NONE`: the first means the host had something to say that no category
+ * covers, so the caller should print *its* message rather than a category's, and the second is not a
+ * failure at all. Callers spell that as `words == "" ? f.error : words`, which is the shape all four
+ * copies already had.
+ */
+export string faultWords(i32 fault) {
+  if (fault == FAULT_NOT_FOUND()) { return "No such file or directory"; }
+  if (fault == FAULT_DENIED()) { return "Permission denied"; }
+  if (fault == FAULT_EXISTS()) { return "File exists"; }
+  if (fault == FAULT_NOT_EMPTY()) { return "Directory not empty"; }
+  // Not GNU's words, because GNU has none for this: a filesystem it can name every file in has no reason
+  // to. Saying the host cannot express the name is the true sentence, and it beats "No such file or
+  // directory" for a file the caller has just seen in `ls`. wac-mono 0065.
+  if (fault == FAULT_NOT_REPRESENTABLE()) { return "cannot be named on this host"; }
+  return "";
+}
+
 /** What a filesystem change answered. */
 export struct Change {
   /** `FAULT_NONE` when it worked. */
@@ -455,9 +486,32 @@ export struct Stat {
    */
   bool isSymlink;
 
-  Stat of(bool exists, bool isFile, bool isDir, i64 size, i64 modifiedMillis, bool isSymlink) {
-    return Stat(exists, isFile, isDir, size, modifiedMillis, isSymlink);
+  /**
+   * Why this is not an answer, or `FAULT_NONE` when it is.
+   *
+   * **Absence is an answer, not a fault.** A path that is simply not there gives `exists = false` with
+   * `FAULT_NONE`, because "there is nothing here" is what `stat` was asked. A fault means the question
+   * could not be *reached*: `FAULT_DENIED` when the world has no read capability, and
+   * `FAULT_NOT_REPRESENTABLE` for a name this host cannot express — a file `ls` has just listed, whose
+   * name came back from `readDir` with an invalid byte replaced, so every path built from it fails.
+   *
+   * Before this field, both of those arrived as `exists = false`: `test -e` said no about a file that is
+   * there, and a program with no read grant could not tell "absent" from "not allowed to look". wac-mono
+   * 0065 left this open on the grounds that giving `Stat` a fault changes every caller. It does, and the
+   * callers are better for it — a caller that only wants existence still reads `exists`, and one that
+   * reports to a person now has something true to say.
+   *
+   * So: **check `fault` before trusting `exists`.**
+   */
+  i32 fault;
+
+  Stat of(bool exists, bool isFile, bool isDir, i64 size, i64 modifiedMillis, bool isSymlink,
+          i32 fault) {
+    return Stat(exists, isFile, isDir, size, modifiedMillis, isSymlink, fault);
   }
+
+  /** Whether this is an answer at all. Reads better than `st.fault == FAULT_NONE()` at a call site. */
+  bool answered(this) { return this.fault == FAULT_NONE(); }
 }
 
 /**

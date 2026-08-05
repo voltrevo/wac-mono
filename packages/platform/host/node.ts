@@ -28,7 +28,15 @@ import {
 } from "./children.ts";
 import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
-import { changeBytes, changed, CHANGED_OK, FAULT_DENIED } from "./faults.ts";
+import {
+  changeBytes,
+  changed,
+  CHANGED_OK,
+  FAULT_DENIED,
+  STAT_BYTES,
+  STAT_FAULT,
+  statFault,
+} from "./faults.ts";
 
 /** Node's pieces, described rather than imported, so this file checks under Deno. */
 export type NodeIo = {
@@ -428,25 +436,35 @@ export function nodeWorld(
     },
 
     [OP.STAT]: async (p) => {
-      const out = new Uint8Array(20);
+      const out = new Uint8Array(STAT_BYTES);
       const dv = new DataView(out.buffer);
-      if (!opts.fs?.read) return out; // not granted reads as "does not exist"
+      // Not granted is not absence — see the Deno host, which says why at length.
+      if (!opts.fs?.read) {
+        out[STAT_FAULT] = FAULT_DENIED;
+        return out;
+      }
+      const path = P(unstr(p));
       try {
-        const st = await io.stat(P(unstr(p)));
+        const st = await io.stat(path);
         out[0] = 1;
         out[1] = st.isFile ? 1 : 0;
         out[2] = st.isDirectory ? 1 : 0;
         dv.setBigInt64(3, BigInt(st.size), true);
         dv.setBigInt64(11, BigInt(st.mtimeMillis ?? 0), true);
-      } catch { /* absent, and the zeroes say so */ }
+      } catch (e) {
+        out[STAT_FAULT] = statFault(e, path);
+      }
       return out;
     },
     [OP.LINK_STAT]: async (p) => {
-      const out = new Uint8Array(20);
+      const out = new Uint8Array(STAT_BYTES);
       const dv = new DataView(out.buffer);
-      if (!opts.fs?.read) return out;
+      if (!opts.fs?.read) {
+        out[STAT_FAULT] = FAULT_DENIED;
+        return out;
+      }
+      const path = P(unstr(p));
       try {
-        const path = P(unstr(p));
         const st = io.linkStat === undefined
           ? { ...(await io.stat(path)), isSymlink: false }
           : await io.linkStat(path);
@@ -456,7 +474,9 @@ export function nodeWorld(
         dv.setBigInt64(3, BigInt(st.size), true);
         dv.setBigInt64(11, BigInt(st.mtimeMillis ?? 0), true);
         out[19] = st.isSymlink ? 1 : 0;
-      } catch { /* absent, and the zeroes say so */ }
+      } catch (e) {
+        out[STAT_FAULT] = statFault(e, path);
+      }
       return out;
     },
 

@@ -21,7 +21,16 @@ import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
 import { EMPTY_ARG, argBytes, i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 import { ChildStack, joinPath, packCaptured, unpackPush } from "./child.ts";
-import { changeBytes, changed, CHANGED_OK, FAULT_DENIED, pathFailure } from "./faults.ts";
+import {
+  changeBytes,
+  changed,
+  CHANGED_OK,
+  FAULT_DENIED,
+  pathFailure,
+  STAT_BYTES,
+  STAT_FAULT,
+  statFault,
+} from "./faults.ts";
 
 export type DenoWorldOptions = {
   /** Arguments the application sees. Defaults to none, not to the launcher's own. */
@@ -487,11 +496,18 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     },
 
     [OP.STAT]: async (p) => {
-      const out = new Uint8Array(20);
+      const out = new Uint8Array(STAT_BYTES);
       const dv = new DataView(out.buffer);
-      if (!opts.fs?.read) return out; // not granted reads as "does not exist"
+      // Not granted is not absence. A program with no read capability used to be told "does not exist",
+      // which is the same lie this whole issue is about — it cannot tell that from a file it may not look
+      // at, and a diagnostic built on it blames the path.
+      if (!opts.fs?.read) {
+        out[STAT_FAULT] = FAULT_DENIED;
+        return out;
+      }
+      const path = P(unstr(p));
       try {
-        const st = await Deno.stat(P(unstr(p)));
+        const st = await Deno.stat(path);
         out[0] = 1;
         out[1] = st.isFile ? 1 : 0;
         out[2] = st.isDirectory ? 1 : 0;
@@ -499,22 +515,32 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
         dv.setBigInt64(11, BigInt(st.mtime?.getTime() ?? 0), true);
         // `stat` follows, so what it describes is never itself a link. `linkStat` is the one that
         // answers that, and it is the only difference between these two handlers.
-      } catch { /* absent, and the zeroes say so */ }
+      } catch (e) {
+        // Absence stays absence — zeroes and `FAULT_NONE`. Anything else says which way it failed, so a
+        // name this runtime cannot express is not reported as a file that is not there.
+        out[STAT_FAULT] = statFault(e, path);
+      }
       return out;
     },
     [OP.LINK_STAT]: async (p) => {
-      const out = new Uint8Array(20);
+      const out = new Uint8Array(STAT_BYTES);
       const dv = new DataView(out.buffer);
-      if (!opts.fs?.read) return out;
+      if (!opts.fs?.read) {
+        out[STAT_FAULT] = FAULT_DENIED;
+        return out;
+      }
+      const path = P(unstr(p));
       try {
-        const st = await Deno.lstat(P(unstr(p)));
+        const st = await Deno.lstat(path);
         out[0] = 1;
         out[1] = st.isFile ? 1 : 0;
         out[2] = st.isDirectory ? 1 : 0;
         dv.setBigInt64(3, BigInt(st.size), true);
         dv.setBigInt64(11, BigInt(st.mtime?.getTime() ?? 0), true);
         out[19] = st.isSymlink ? 1 : 0;
-      } catch { /* absent, and the zeroes say so */ }
+      } catch (e) {
+        out[STAT_FAULT] = statFault(e, path);
+      }
       return out;
     },
 

@@ -1,6 +1,6 @@
 # 0065 — a spawned program's arguments are not byte-exact
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** agent-a (2026-08-05)
 - **Reported by:** agent-a
 - **Date:** 2026-08-04
@@ -205,3 +205,56 @@ capability question rather than a signature question — which is the correction
 reads as "does not exist". Left alone deliberately — giving `Stat` a fault means changing its shape and
 every caller, and the callers that matter (`test -e`, `ls`) would then have to decide what to *do* about a
 name they cannot express. That is a real design question and not one to answer in passing.
+
+## Closed, 2026-08-05 (agent-a): `stat` answers now, and the phrase table is one copy
+
+The section above left `stat` as "the one operation still lying", on the grounds that giving `Stat` a fault
+means changing its shape and every caller, and that the callers would then have to decide what to *do*.
+Both are true. Neither is a reason — "it would change every caller" is a schedule.
+
+**`Stat` carries `i32 fault`, and the semantics are narrow on purpose.**
+
+- **Absence is an answer, not a fault.** A path with nothing at it gives `exists = false` with
+  `FAULT_NONE`, because "there is nothing here" is what `stat` was asked. `ENOTDIR` is the same: bash says
+  `test -e f/g` where `f` is a file is *false*, not an error, so a fault there would put every shell of
+  ours at odds with the oracle. `rm -f` and every "does it exist" check depend on this staying true.
+- **Only an unreachable question is a fault**: `FAULT_NOT_REPRESENTABLE` for a name this host cannot
+  express, and `FAULT_DENIED` for a world with no read capability. That second one was the same lie in
+  another costume — a program with no read grant was told "does not exist", and could not tell that from a
+  file it was not allowed to look at.
+- `Stat.answered()` reads better than `st.fault == FAULT_NONE()` at a call site, and the field's doc says
+  plainly: **check `fault` before trusting `exists`**.
+
+**The wire.** `STAT_BYTES`/`STAT_FAULT` live in `host/faults.ts` because three hosts answer this operation
+and `provider.ts` reads what they wrote; a field appended in two of three is a silent disagreement about a
+format, which is how `spawn`'s argv was wrong for a week. `statFault(e, path)` is the one mapper, so Deno,
+Node and the browser cannot drift on which failures are faults.
+
+**What the callers do with it**, which was the part this issue said should not be answered in passing:
+
+- **`test -e/-f/-s`** on a name that cannot be examined now exits **2 with a diagnostic** instead of
+  answering `false`. That is the shape `test` already used for an operator it has not implemented, and the
+  difference matters: a script acts on `false`.
+- **`ls`** says `cannot access 'x': cannot be named on this host` rather than GNU's "No such file or
+  directory" for a name `readDir` has just handed it. A genuinely missing operand keeps GNU's sentence
+  exactly, because the corpus compares that line.
+- **`box ls`** loses its comment claiming the application "cannot tell, by design" — it can now — and
+  **`box stat`** stops saying `not found` when what happened was something else.
+
+**And the phrase list is one copy instead of four.** `sh` had one for a `Change` and another for a
+`FileResult`, `box` had a third, and `statReason` was about to be a fourth. They had already drifted: the
+`box` one had no phrase for `FAULT_NOT_REPRESENTABLE`, so it printed the host's English for the one
+category that exists to prevent exactly that. `faultWords(i32)` is in `platform.wac` beside the fault
+numbers — a fault number is meaningless without them — and each caller is now the table plus its own
+fallback for the message a struct carries.
+
+Verified: the 614-script corpus, the 57-script two-backings comparison, all of `packages/platform`, and
+`packages/box` — 79 + 28 passing, with four new cases in `packages/sh/test/unnameable.test.ts` for what
+`stat` used to get wrong and two in `packages/platform/test/unnameable.test.ts` for the mapper's narrowness
+and the wire layout.
+
+**Not implemented, and said plainly rather than approximated:** a byte-exact Node host. Node's `fs` accepts
+a `Buffer` path, so a host built on it would never raise `FAULT_NOT_REPRESENTABLE` at all — but our Node
+host goes through the same `string` bridge as the others today, and making it byte-exact means giving the
+bridge a bytes-shaped path for one host and not the rest. Nobody needs that yet; when someone does, this
+issue's measurements are the starting point.

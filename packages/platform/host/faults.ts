@@ -192,3 +192,33 @@ export async function changed(
 function isInstance(e: unknown, ctor: unknown): boolean {
   return typeof ctor === "function" && e instanceof (ctor as new () => unknown);
 }
+
+/**
+ * The `stat` reply's width, and where its fault byte sits.
+ *
+ * Here rather than in each host because three of them answer this operation — Deno, Node and the browser —
+ * and `provider.ts` reads what they wrote. A field appended in two places out of four is a silent
+ * disagreement about a wire format, which is the shape that made `spawn`'s argv wrong for a week.
+ *
+ * Layout: exists, isFile, isDir, size (i64 LE at 3), mtime (i64 LE at 11), isSymlink at 19, fault at 20.
+ */
+export const STAT_BYTES = 21;
+export const STAT_FAULT = 20;
+
+/**
+ * The fault a failed `stat` should report — `FAULT_NONE` when the answer is simply "nothing here".
+ *
+ * Deliberately narrow: only the two cases where the answer is genuinely *unknowable* are faults.
+ *
+ *   - `FAULT_NOT_REPRESENTABLE` — a name this runtime cannot express, so the file may well be there.
+ *   - `FAULT_DENIED` — no read capability, so nothing can be said either way.
+ *
+ * Everything else means "nothing usable at this path", which is an answer and must stay one. `ENOTDIR` is
+ * the case that decides the shape: `test -e f/g` where `f` is a file is *false* in bash, not an error, and
+ * a fault there would make every shell of ours disagree with it. Absence with a fault attached would also
+ * make `rm -f` and every "does it exist" check start reporting failures they are written to ignore.
+ */
+export function statFault(e: unknown, path: string): number {
+  const fault = faultOfPath(e, path);
+  return fault === FAULT_NOT_REPRESENTABLE || fault === FAULT_DENIED ? fault : FAULT_NONE;
+}

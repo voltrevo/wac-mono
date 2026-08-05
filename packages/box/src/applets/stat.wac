@@ -4,7 +4,7 @@
 // and `find` use it internally and never show it. The mtime goes through `datetime`, the
 // same pairing `date` uses.
 
-import { Cli, Core, Stat } from "../../../platform/src/platform.wac";
+import { Cli, Core, faultWords, Stat } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { itoa64 } from "../../../fmt/src/itoa.wac";
 import { format } from "../../../datetime/src/rfc3339.wac";
@@ -15,7 +15,10 @@ export i32 stat(Core core, Cli cli, Args a) {
   for (i32 i = 0; i < a.rest.len(); i++) {
     Stat st = cli.stat(a.rest[i]).wait();
     if (!st.exists) {
-      core.warn(a.name + ": " + a.rest[i] + ": not found");
+      // `not found` was the only thing this could say, and it was a guess whenever the answer was not an
+      // answer: no read capability, or a name the host cannot express, both arrived as `exists = false`.
+      string words = faultWords(st.fault);
+      core.warn(a.name + ": " + a.rest[i] + ": " + (words == "" ? "not found" : words));
       code = 1;
       continue;
     }

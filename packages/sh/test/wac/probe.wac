@@ -132,7 +132,7 @@ Change resolveChange(i32 id) {
 }
 
 /** Only the two programs under `/bin` exist, which is what makes a `$WACPATH` search decide. */
-Stat resolveStat(i32 id) { return Stat.of(id == 1, id == 1, false, 0, 0, false); }
+Stat resolveStat(i32 id) { return Stat.of(id == 1, id == 1, false, 0, 0, false, 0); }
 
 /** Nothing here is a symbolic link, which a fake filesystem is entitled to say. */
 Pending<Stat> fakeLinkStat(string path) { return fakeStat(path); }

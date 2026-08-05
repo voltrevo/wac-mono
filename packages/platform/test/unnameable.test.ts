@@ -13,7 +13,18 @@
 // Here: that the refinement fires on the right paths and only those. The user-visible half — what a shell
 // prints — is `packages/sh/test/unnameable.test.ts`, because that is where a person meets it.
 
-import { faultOfPath, FAULT_DENIED, FAULT_NOT_FOUND, FAULT_NOT_REPRESENTABLE, pathFailure, phraseOf } from "../host/faults.ts";
+import {
+  faultOfPath,
+  FAULT_DENIED,
+  FAULT_NONE,
+  FAULT_NOT_FOUND,
+  FAULT_NOT_REPRESENTABLE,
+  pathFailure,
+  phraseOf,
+  STAT_BYTES,
+  STAT_FAULT,
+  statFault,
+} from "../host/faults.ts";
 
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
@@ -50,4 +61,27 @@ Deno.test("an ordinary NotFound stays absent, and other faults are untouched", (
 Deno.test("the category has a phrase, since a caller with no words of its own prints it", () => {
   assertEquals(phraseOf(FAULT_NOT_REPRESENTABLE), "the name is not representable on this host");
   assertEquals(phraseOf(FAULT_NOT_FOUND) === phraseOf(FAULT_NOT_REPRESENTABLE), false);
+});
+
+Deno.test("`stat` reports a fault only where the answer is unknowable", () => {
+  // The narrowness is the design. `Stat` gained a fault field so that "this name cannot be expressed" and
+  // "no read capability" stop arriving as `exists = false` — but absence itself must stay an answer, or
+  // every `test -e`, `rm -f` and "does it exist" check in the repo starts reporting failures it is
+  // written to ignore.
+  assertEquals(statFault(notFound(), lossy), FAULT_NOT_REPRESENTABLE);
+  assertEquals(statFault(notFound(), "/tmp/x/missing"), FAULT_NONE);
+  assertEquals(statFault(new Deno.errors.PermissionDenied("denied"), "/tmp/x/f"), FAULT_DENIED);
+
+  // `ENOTDIR` is the case that decides the shape: bash says `test -e f/g` is *false* where `f` is a file,
+  // not an error, so a fault there would make every shell of ours disagree with the oracle.
+  const notDir = Object.assign(new Error("Not a directory (os error 20)"), { code: "ENOTDIR" });
+  assertEquals(statFault(notDir, "/tmp/x/file/inside"), FAULT_NONE);
+});
+
+Deno.test("the stat wire layout is one definition, since three hosts write it", () => {
+  // Deno, Node and the browser all answer OP.STAT, and `provider.ts` reads what they wrote. A field
+  // appended in two hosts out of three is a silent disagreement about a wire format — which is exactly how
+  // `spawn`'s argv was wrong for a week.
+  assertEquals(STAT_FAULT, 20, "the fault byte moved without the hosts being told");
+  assertEquals(STAT_BYTES, STAT_FAULT + 1, "the reply is not wide enough to hold the fault");
 });

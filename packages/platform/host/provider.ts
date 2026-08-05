@@ -31,6 +31,7 @@ import {
   unstr,
 } from "./call.ts";
 import { OP } from "./ops.ts";
+import { FAULT_OTHER } from "./faults.ts";
 
 const EMPTY = new Uint8Array(0);
 const SLOT_BITS = Math.ceil(Math.log2(SLOTS));
@@ -185,23 +186,24 @@ export function cliOf(
     } catch (e) {
       // The category as well as the message, so a program can say what GNU says about a missing file
       // instead of printing the host's sentence — `FAULT_OTHER` when nothing said better. wac-mono 0062.
-      const fault = e instanceof HostCallError ? e.fault : 5;
+      const fault = e instanceof HostCallError ? e.fault : FAULT_OTHER;
       return cls.FileResult.of(false, EMPTY, e instanceof Error ? e.message : String(e), fault);
     }
   };
   const stat = (id: number) => {
     try {
       const out = collect(b, unpack(id));
-      // exists, isFile, isDir as bytes, then size and mtime as little-endian i64s, then isSymlink —
-      // appended rather than inserted, so the offsets above did not have to move.
+      // exists, isFile, isDir as bytes, then size and mtime as little-endian i64s, then isSymlink, then
+      // the fault — each appended rather than inserted, so the offsets above never had to move.
       const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
       return cls.Stat.of(
         out[0] === 1, out[1] === 1, out[2] === 1,
         dv.getBigInt64(3, true), dv.getBigInt64(11, true),
-        out[19] === 1,
+        out[19] === 1, out[20] ?? 0,
       );
     } catch {
-      return cls.Stat.of(false, false, false, 0n, 0n, false);
+      // The bridge itself failed, which is not absence — `FAULT_OTHER`, because nothing said better.
+      return cls.Stat.of(false, false, false, 0n, 0n, false, FAULT_OTHER);
     }
   };
   const dirNames = (id: number) => {

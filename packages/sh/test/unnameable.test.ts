@@ -11,6 +11,12 @@
 //
 // The fixture is made with bash, because neither Deno nor this shell can create such a file: both take a
 // path as a string, and the string that would name it does not exist.
+//
+// **`stat` was the last thing still lying**, and the third test below is what that was. `Stat` had no fault
+// field, so "the name cannot be expressed" and "there is nothing here" arrived identically as
+// `exists = false` — `test -e` answered *no* about a file that is there, silently and with status 1, which
+// is an answer a script then acts on. `Stat` carries a fault now: absence stays an answer with
+// `FAULT_NONE`, and only a question that could not be reached is a fault.
 
 import { buildApp } from "../../platform/build.ts";
 import "../../../harness/spawnRetry.ts";
@@ -123,6 +129,67 @@ Deno.test("removing one says the same thing, so a script cannot mistake it for g
       `rm -f swallowed a failure that is not absence: ${JSON.stringify(forced.err)}`,
     );
     assertEquals(forced.out.trim(), "status=1");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("`test -e` refuses to answer rather than saying no", async () => {
+  // The shape this fixes: `exists = false` for a file that is *there*. `test` has one way to say it could
+  // not tell — status 2 and a diagnostic, which is what it already does for an operator it has not
+  // implemented — and using it is the difference between a script skipping a file and a script being told.
+  const dir = await fixture();
+  try {
+    for (const op of ["-e", "-f", "-s"] as const) {
+      const r = sh(`test ${op} bad-*-name; echo status=$?`, dir);
+      assertEquals(
+        r.err.includes("cannot be named on this host"),
+        true,
+        `test ${op} said nothing about why: ${JSON.stringify(r.err)}`,
+      );
+      assertEquals(r.out.trim(), "status=2", `test ${op} answered instead of refusing: ${r.out}`);
+    }
+
+    // And a name that is genuinely absent still answers, silently, with 1 — the whole reason the fault is
+    // narrow. A `test` that complained about missing files would break every script that uses it to check.
+    const absent = sh("test -e no-such-file; echo status=$?", dir);
+    assertEquals(absent.out.trim(), "status=1");
+    assertEquals(absent.err, "", `it complained about an ordinary absent file: ${absent.err}`);
+
+    // As does an ordinary file, and a path *through* a file, which bash also calls simply false.
+    assertEquals(sh("test -e plain.txt; echo status=$?", dir).out.trim(), "status=0");
+    const through = sh("test -e plain.txt/inside; echo status=$?", dir);
+    assertEquals(through.out.trim(), "status=1", `a path through a file should be false, not an error`);
+    assertEquals(through.err, "", through.err);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("`ls` of the name it just listed does not call it missing", async () => {
+  const dir = await fixture();
+  try {
+    const r = sh("ls bad-*-name", dir);
+    assertEquals(
+      r.err.includes("cannot be named on this host") || r.out.includes("cannot be named on this host"),
+      true,
+      `ls blamed the path: ${JSON.stringify(r.out)} / ${JSON.stringify(r.err)}`,
+    );
+    assertEquals(r.out.includes("No such file or directory"), false, r.out);
+    // GNU's status for an inaccessible operand, which this already matched for a missing one.
+    assertEquals(r.code, 2, `ls exited ${r.code}`);
+
+    // A genuinely missing operand keeps GNU's sentence exactly, because that is the common case and the
+    // corpus compares it.
+    const missing = sh("ls no-such-file", dir);
+    // On standard error, where a diagnostic belongs — `ls` writes its listing to standard output and its
+    // complaints to standard error, and a test that conflated the two would pass for the wrong reason.
+    assertEquals(
+      missing.err.includes("cannot access 'no-such-file': No such file or directory"),
+      true,
+      `${JSON.stringify(missing.out)} / ${JSON.stringify(missing.err)}`,
+    );
+    assertEquals(missing.out, "", `a complaint went to standard output: ${missing.out}`);
   } finally {
     await Deno.remove(dir, { recursive: true });
   }

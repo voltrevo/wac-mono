@@ -21,9 +21,7 @@
 import { Vec } from "../../std/src/vec.wac";
 import { resolvePath } from "./path.wac";
 import { Buf } from "../../bytes/src/buf.wac";
-import { Cli, FAULT_DENIED, FAULT_NOT_EMPTY, FAULT_NOT_FOUND, FAULT_NOT_REPRESENTABLE,
-  FileResult }
-  from "../../platform/src/platform.wac";
+import { Cli, faultWords, FileResult } from "../../platform/src/platform.wac";
 import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../platform/src/stream.wac";
 // One implementation of each, in the package whose job it is. This file had its own `itoa` and
 // `atoi`: the `itoa` answered `"-"` for i32's minimum, because negating it wraps back to itself and
@@ -388,12 +386,10 @@ Reading readOne(Fs fs, string cwd, string name, u8[] stdin) {
  * text left that says anything.
  */
 string whyUnread(FileResult f) {
-  if (f.fault == FAULT_NOT_FOUND()) { return "No such file or directory"; }
-  // GNU has no phrase for this because a filesystem it can name every file in needs none. wac-mono 0065.
-  if (f.fault == FAULT_NOT_REPRESENTABLE()) { return "cannot be named on this host"; }
-  if (f.fault == FAULT_DENIED()) { return "Permission denied"; }
-  if (f.fault == FAULT_NOT_EMPTY()) { return "Directory not empty"; }
-  return f.error;
+  // `faultWords` is the one copy of this list, in `platform.wac` beside the fault numbers. The host's own
+  // message is the fallback, for a failure no category covers.
+  string words = faultWords(f.fault);
+  return words == "" ? f.error : words;
 }
 
 /**

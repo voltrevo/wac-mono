@@ -57,6 +57,8 @@ import {
   FAULT_EXISTS,
   Faulted,
   phraseOf,
+  STAT_BYTES,
+  STAT_FAULT,
 } from "./faults.ts";
 
 const EMPTY = new Uint8Array(0);
@@ -437,9 +439,14 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
 
   /** What `stat` and `linkStat` both answer with: the twenty bytes `provider.ts` decodes. */
   const statBytes = async (path: string): Promise<Uint8Array> => {
-    const out = new Uint8Array(20);
+    const out = new Uint8Array(STAT_BYTES);
     const dv = new DataView(out.buffer);
-    if (opts.root === undefined) return out;   // not granted reads as "does not exist"
+    // No root is no read capability, which is not the same as an empty filesystem — a page that was never
+    // given a directory cannot say whether a file is there, and saying "it is not" is a guess.
+    if (opts.root === undefined) {
+      out[STAT_FAULT] = FAULT_DENIED;
+      return out;
+    }
     try {
       const f = await fileOf(path);
       out[0] = 1;

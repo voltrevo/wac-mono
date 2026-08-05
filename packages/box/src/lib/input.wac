@@ -3,18 +3,21 @@
 // That an applet works in a pipe at all is this file: without `readStdin` every one of
 // them would be a file-to-file tool.
 
-import { Cli, Core, FAULT_DENIED, FAULT_NOT_EMPTY, FAULT_NOT_FOUND, FileResult }
-  from "../../../platform/src/platform.wac";
+import { Cli, Core, faultWords, FileResult } from "../../../platform/src/platform.wac";
 import { Args } from "./args.wac";
 
 export struct Input { bool ok; u8[] bytes; string label; }
 
-/** Why a file could not be read, in the words the real tools use. */
+/**
+ * Why a file could not be read, in the words the real tools use.
+ *
+ * The list lives in `platform.wac` as `faultWords`, because this was one of four copies of it and the
+ * copies had already drifted: this one had no phrase for a name the host cannot express, so it printed the
+ * host's English for the one category that exists to avoid exactly that.
+ */
 export string whyUnread(FileResult f) {
-  if (f.fault == FAULT_NOT_FOUND()) { return "No such file or directory"; }
-  if (f.fault == FAULT_DENIED()) { return "Permission denied"; }
-  if (f.fault == FAULT_NOT_EMPTY()) { return "Directory not empty"; }
-  return f.error;
+  string words = faultWords(f.fault);
+  return words == "" ? f.error : words;
 }
 
 /**

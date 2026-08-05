@@ -178,9 +178,10 @@ export struct Fs {
       else: {}
     }
     i32 node = this.find(m, path);
-    if (node < 0) { return Stat.of(false, false, false, 0, 0, false); }
+    // Absence, not a fault: a memory tree can always answer, and "nothing here" is the answer.
+      if (node < 0) { return Stat.of(false, false, false, 0, 0, false, FAULT_NONE()); }
     Inode n = this.nodes.get(node);
-    return Stat.of(true, !n.isDir, n.isDir, n.data.len as i64, n.mtime, false);
+    return Stat.of(true, !n.isDir, n.isDir, n.data.len as i64, n.mtime, false, FAULT_NONE());
   }
 
   /** Nothing here is a symbolic link yet, so this is `stat` — said rather than implied. */

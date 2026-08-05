@@ -22,8 +22,7 @@ import { Option } from "../../std/src/option.wac";
 import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Read } from "../../bytes/src/read.wac";
-import { Change, Child, Cli, Core, FAULT_EXISTS, FAULT_NOT_EMPTY, FAULT_NOT_FOUND,
-  FAULT_NOT_REPRESENTABLE, FileResult,
+import { Change, Child, Cli, Core, faultWords, FileResult,
   GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, Pending, Stat }
   from "../../platform/src/platform.wac";
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
@@ -1410,12 +1409,19 @@ Output ls(Shell sh, Vec<string> argv) {
     if (names is null) {
       // Not a directory, or unreadable. A plain file is listed as itself, which is what `ls` does
       // and is why this is not simply an error.
-      if (sh.fs.stat(path).exists) {
+      Stat st = sh.fs.stat(path);
+      if (st.exists) {
         out.pushAll((given + "\n").toBytes());
       } else {
         // GNU's words, which this had invented its own version of: `ls: cannot access 'x': No such file
         // or directory`. The quotes and the capital are GNU's, and the corpus compares this line now.
-        out.pushAll(("ls: cannot access '" + given + "': No such file or directory\n").toBytes());
+        //
+        // Unless `stat` could not answer at all, in which case saying "No such file" is the lie wac-mono
+        // 0065 is about: this is a name `readDir` has just handed us and no path built from it can be
+        // opened, so the file is there and we cannot reach it. `st.exists` is false either way, which is
+        // why the fault has to be consulted rather than inferred.
+        string why = st.answered() ? "No such file or directory" : statReason(st);
+        out.pushAll(("ls: cannot access '" + given + "': " + why + "\n").toBytes());
         status = 2;
       }
       continue;
@@ -1690,15 +1696,22 @@ Output trySelf(Shell sh, Vec<string> argv, bool mayInherit) {
  * stderr in `test/differential.test.ts`. Before this they carried an errno and an absolute path that
  * GNU does not print, in a shell whose whole suite is a comparison with bash.
  */
+/**
+ * Why a `Stat` is not an answer, in the words a person should see.
+ *
+ * The same translation `reasonOf` does for a `Change`, and separate only because they carry their fault in
+ * different structs. Both exist so that no program has to read a host's English to decide what happened.
+ */
+string statReason(Stat st) {
+  string words = faultWords(st.fault);
+  // A `Stat` carries no message of its own — it is a struct of facts, not a report — so where the category
+  // has no words there is nothing better to say than that the question could not be answered.
+  return words == "" ? "cannot be examined" : words;
+}
+
 string reasonOf(Change c) {
-  if (c.fault == FAULT_NOT_FOUND()) { return "No such file or directory"; }
-  if (c.fault == FAULT_EXISTS()) { return "File exists"; }
-  if (c.fault == FAULT_NOT_EMPTY()) { return "Directory not empty"; }
-  // Not GNU's words, because GNU has none for this: a filesystem it can name every file in has no reason
-  // to. Saying the host cannot express the name is the true sentence, and it beats "No such file or
-  // directory" for a file the caller has just seen in `ls`. wac-mono 0065.
-  if (c.fault == FAULT_NOT_REPRESENTABLE()) { return "cannot be named on this host"; }
-  return c.message;
+  string words = faultWords(c.fault);
+  return words == "" ? c.message : words;
 }
 
 /** The first `dir/name` on `$WACPATH` that exists, or "" when none does. */
@@ -1841,6 +1854,14 @@ Output unaryTest(Shell sh, string op, string operand) {
   }
   if (op == "-e" || op == "-f" || op == "-d" || op == "-s") {
     Stat st = sh.fs.stat(sh.resolve(operand));
+    // A `stat` that could not be taken is not the same as a "no", and `test` has exactly one way to say
+    // so: status 2 with a diagnostic, which is what it already does for an operator it has not
+    // implemented. Answering `false` for a file that is there — because its name cannot be expressed on
+    // this host, or because this program was given no read capability — is a wrong answer that a script
+    // then acts on, and it is the last thing wac-mono 0065 left lying.
+    if (!st.answered()) {
+      return Output.fail(("test: " + operand + ": " + statReason(st) + "\n").toBytes(), 2);
+    }
     if (op == "-e") { return testResult(st.exists); }
     if (op == "-f") { return testResult(st.isFile); }
     if (op == "-d") { return testResult(st.isDir); }
