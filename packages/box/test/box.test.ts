@@ -9,6 +9,9 @@
 // consumer of the world, not a part of it.
 
 import { buildApp, type Grants } from "../../platform/build.ts";
+// Imported for its side effect: retries a spawn that fails with "Text file busy" and names
+// whoever held the file, if anyone did. wac-mono 0074.
+import "../../../harness/spawnRetry.ts";
 import { readUntil } from "../../../harness/deadline.ts";
 
 const BOX = "packages/box/src/box.wac";
@@ -22,7 +25,6 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
     );
   }
 }
-
 
 /** Build once, then run with the given stdin and arguments. */
 async function runFilter(
@@ -64,7 +66,6 @@ function assertSameBytes(got: Uint8Array, want: Uint8Array, msg: string): void {
     }
   }
 }
-
 
 
 async function exists(path: string): Promise<boolean> {
@@ -1083,7 +1084,6 @@ Deno.test("line-oriented applets stream too, and stay faithful at the edges", as
     for (const f of [built, fixture, nonl, oneline]) await Deno.remove(f);
   }
 });
-
 
 /**
  * A port nobody is using, taken by binding one and letting go.

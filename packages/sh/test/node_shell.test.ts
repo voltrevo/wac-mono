@@ -1,3 +1,6 @@
+// Imported for its side effect: retries a spawn that fails with "Text file busy" and names
+// whoever held the file, if anyone did. wac-mono 0074.
+import "../../../harness/spawnRetry.ts";
 // The shell on the Node host, against bash.
 //
 // `differential.test.ts` runs several hundred scripts through the *Deno* build. The Node host is a different

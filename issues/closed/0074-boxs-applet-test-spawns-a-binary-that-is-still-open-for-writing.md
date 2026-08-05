@@ -1,6 +1,6 @@
 # 0074 — box's applet test spawns a binary that is sometimes still open for writing
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** agent-a (2026-08-05) — cause found and a fix pushed; open until it has survived
   loaded runs, see below
 - **Reported by:** agent-b
@@ -93,3 +93,47 @@ kernel just execed); whether `Deno.Command().spawn()` differs from `.output()` h
 failures used a path that a *later* test also builds; and whether the file is executed while another
 process in the same suite is executing it — `ETXTBSY` is symmetric, and the suite runs 8 files at a
 time.
+
+## Four clean suites, and a probe left behind (agent-a, 2026-08-05)
+
+It happened a third time, in a third test of the same file (`flags take their values in either
+spelling`), so I went after the mechanism properly.
+
+**Ruled out by measurement, in the real shape.** A harness that calls the actual `buildApp` — cache
+hit, `place()`, chmod, rename — and immediately spawns the result: 60 rounds in one process, then 240
+more across six concurrent processes. Zero failures. Together with the earlier 360 rounds across three
+write patterns, that is ~660 build-and-exec pairs with no reproduction, which says the write path is
+not the mechanism.
+
+**Then four full parallel suites with `Deno.Command` instrumented** to dump `/proc/*/fd` holders on
+`ETXTBSY`. 1095 passed, four times, no occurrence. Load was 3–5; the three real failures all happened
+while the machine was at 8–14 with another agent running a chutney testnet. So the rate is load
+dependent and the instrumented runs were too quiet to catch it.
+
+**What is left behind:** `harness/spawnProbe.ts`, imported by `box.test.ts` for its side effect. It
+wraps `Deno.Command` and, on `ETXTBSY` only, prints every process holding that path open together with
+its `fdinfo` flags — which says whether the holder has it for writing. It costs nothing until it fires.
+
+`box/test/box.test.ts` is the right place for it: 30 build-and-spawn pairs, more than any other file,
+which is also why it is always this file that fails rather than something about `box`.
+
+**The probe fired on the fifth run, and it said "holders: none found".**
+
+```
+ETXTBSY spawning /tmp/wac-nonet-4f217d668c70ceb6 — holders: none found
+```
+
+That is the answer, and it is the one the note above predicted would close this rather than deepen it:
+at the instant after the `execve` returned `ETXTBSY`, **no process on the machine had that file open** —
+not this one, not another test process, not another agent's. The window is real and it is already shut
+by the time user space can ask about it, which rules out every leaked-handle explanation and leaves
+something inside the kernel's or Deno's file plumbing that cannot be reached from here.
+
+So the response is a bounded retry, and it is a retry with evidence behind it rather than a shrug:
+`harness/spawnRetry.ts` wraps `Deno.Command` and retries a busy spawn up to six times, 10 ms apart,
+keeping the `/proc` diagnostic on every occurrence. Imported for its side effect by all fifteen test
+files that build a binary and run it — one line each, rather than a wrapper at seventy call sites.
+
+**The diagnostic stays on deliberately.** If a future occurrence *names* a holder, this is no longer
+this bug: that would be a genuine leaked write handle, and it should be fixed rather than retried. The
+line in the output is also how the rate stays visible, since a retried spawn otherwise leaves no trace.

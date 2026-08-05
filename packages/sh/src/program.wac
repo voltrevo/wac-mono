@@ -1019,56 +1019,135 @@ u8[] lastLines(u8[] data, i32 n) {
 }
 
 i32 rev(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
-  u8[] stdin = fed.rest();
   Options o = options(argv, "");
   if (o.bad != "") {
     { errs.bytes(optionRefusal("rev", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
   }
-  Gathered in = gather(cli, cwd, o.operands, stdin);
-  Buf err = Buf.create();
-  for (i32 i = 0; i < in.failed.len(); i++) {
-    err.pushAll(("rev: cannot open " + in.failed.get(i) + ": " + in.reasons.get(i) + "\n").toBytes());
+  // One implementation, over a `Feed`, whichever the input is — the shape `cat` took first. Reading
+  // everything and splitting it was two things at once: a stage that could not survive its input
+  // (0071), and a `rev` that *added* a newline to a last line that arrived without one, because
+  // `splitLines` cannot tell the two apart and the buffered loop pushed 10 after every line.
+  if (o.operands.len() == 0) { revFeed(fed, sink); return 0; }
+  i32 status = 0;
+  for (i32 i = 0; i < o.operands.len(); i++) {
+    // **No `-` here.** `cat`, `nl` and `uniq` all read standard input for it; GNU's `rev` does not,
+    // and answers "rev: cannot open -: No such file or directory". Measured rather than assumed —
+    // the three that do take it made it look like a convention.
+    string path = o.operands.get(i);
+    FileResult f = cli.readFile(resolvePath(cwd, path)).wait();
+    if (!f.ok) {
+      complain(sink, errs, "rev: cannot open " + path + ": " + whyUnread(f) + "\n");
+      status = 1;
+      continue;
+    }
+    if (!revFeed(Feed.of(cli, f.bytes), sink)) { break; }
   }
-  Buf out = Buf.create();
-  Vec<u8[]> lines = splitLines(in.bytes);
-  for (i32 i = 0; i < lines.len(); i++) {
-    u8[] line = lines.get(i);
-    for (i32 j = line.len() - 1; j >= 0; j--) { out.push(line[j]); }
-    out.push(10);
-  }
-  { sink.bytes(out.take()); errs.bytes(err.take()); sink.flush(); errs.flush(); return in.failed.len() > 0 ? 1 : 0; }
+  { sink.flush(); errs.flush(); return status; }
 }
 
+/** Each line backwards, one line at a time. False when the reader has gone. */
+bool revFeed(Feed fed, Sink sink) {
+  Lines lines = Lines.create();
+  while (true) {
+    Line l = nextLine(lines, fed);
+    if (!l.ok) { return true; }
+    u8[] back = u8[l.bytes.len()](fill: 0);
+    for (i32 i = 0; i < l.bytes.len(); i++) { back[i] = l.bytes[l.bytes.len() - 1 - i]; }
+    // Terminated only if the line it came from was: `printf ab | rev` is `ba` with no newline in GNU.
+    if (!emitTo(sink, back, l.nl)) { return false; }
+  }
+  return true;
+}
+
+/**
+ * `sort [-r] [file…]` — the one here that genuinely has to hold its input.
+ *
+ * It is the exception to 0071 and it is worth being precise about *what* it holds. Sorting needs every
+ * line before it can answer, so the lines are held — but they are held as lines, in a vector, rather
+ * than as one array of bytes. That distinction is the difference between "bounded by memory" and
+ * "bounded by one wasm array", which is 1.9 GB and was where `seq 1 200000000 | sort` trapped.
+ *
+ * The sort itself was an insertion sort, with a comment saying the inputs here are a shell pipeline's
+ * worth. A pipeline's worth turned out to be 100,000 lines in four seconds against GNU's none — n²
+ * where the input is the user's, which is not a trade-off anybody chose. It is a bottom-up merge sort
+ * now: stable, which `sort` has to be for equal lines, and n log n.
+ */
 i32 sort(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
-  u8[] stdin = fed.rest();
   Options o = options(argv, "r");
   if (o.bad != "") {
     // 2, not 1: GNU sort's usage status is its own, and a script testing for it is testing for that.
     { errs.bytes(optionRefusal("sort", o.bad).toBytes()); errs.flush(); sink.flush(); return 2; }
   }
   bool reverse = sawOption(o, "r");
-  Gathered in = gather(cli, cwd, o.operands, stdin);
-  // `sort` is the one that gives up rather than sorting what it managed to read.
-  if (in.failed.len() > 0) {
-    { errs.bytes(("sort: cannot read: " + in.failed.get(0) + ": " + in.reasons.get(0) + "\n").toBytes()); errs.flush(); sink.flush(); return 2; }
-  }
-  Vec<u8[]> lines = splitLines(in.bytes);
-  // Insertion sort: the inputs here are a shell pipeline's worth, and a reader can check it.
-  for (i32 i = 1; i < lines.len(); i++) {
-    u8[] v = lines.get(i);
-    i32 j = i - 1;
-    while (j >= 0 && after(lines.get(j), v, reverse)) {
-      lines.set(j + 1, lines.get(j));
-      j--;
+
+  Vec<u8[]> lines = Vec.create();
+  Vec<string> names = inputsOf(o.operands);
+  for (i32 i = 0; i < names.len(); i++) {
+    string name = names.get(i);
+    if (name == "" || name == "-") {
+      collectLines(fed, lines);
+      continue;
     }
-    lines.set(j + 1, v);
+    FileResult r = cli.readFile(resolvePath(cwd, name)).wait();
+    if (!r.ok) {
+      // `sort` is the one that gives up rather than sorting what it managed to read.
+      { errs.bytes(("sort: cannot read: " + name + ": " + whyUnread(r) + "\n").toBytes()); errs.flush(); sink.flush(); return 2; }
+    }
+    collectLines(Feed.of(cli, r.bytes), lines);
   }
-  Buf out = Buf.create();
-  for (i32 i = 0; i < lines.len(); i++) {
-    out.pushAll(lines.get(i));
-    out.push(10);
+
+  u8[][] all = u8[][lines.len()](fill: u8[0]());
+  for (i32 i = 0; i < lines.len(); i++) { all[i] = lines.get(i); }
+  mergeSort(all, reverse);
+  for (i32 i = 0; i < all.len(); i++) {
+    // Terminated whether or not the line was, as GNU's `sort` does.
+    if (!sink.lineBytes(all[i])) { return 0; }
   }
-  { sink.bytes(out.take()); sink.flush(); return 0; }
+  { sink.flush(); return 0; }
+}
+
+/** Every line of a feed, appended. Lines rather than one array: see `sort`. */
+void collectLines(Feed fed, Vec<u8[]> into) {
+  Lines lines = Lines.create();
+  while (true) {
+    Line l = nextLine(lines, fed);
+    if (!l.ok) { return; }
+    into.push(l.bytes);
+  }
+}
+
+/**
+ * Bottom-up merge sort, stable.
+ *
+ * Bottom-up rather than recursive because the passes are a loop and the scratch array is allocated
+ * once; stable because `sort` must not reorder lines that compare equal, and `after` answering false
+ * for equals is what keeps the left run first.
+ */
+void mergeSort(u8[][] a, bool reverse) {
+  i32 n = a.len();
+  if (n < 2) { return; }
+  u8[][] scratch = u8[][n](fill: u8[0]());
+  i32 width = 1;
+  while (width < n) {
+    i32 at = 0;
+    while (at < n) {
+      i32 mid = at + width < n ? at + width : n;
+      i32 end = at + width + width < n ? at + width + width : n;
+      i32 l = at;
+      i32 r = mid;
+      i32 w = at;
+      while (l < mid || r < end) {
+        if (l >= mid) { scratch[w] = a[r]; r++; }
+        else if (r >= end) { scratch[w] = a[l]; l++; }
+        else if (after(a[l], a[r], reverse)) { scratch[w] = a[r]; r++; }
+        else { scratch[w] = a[l]; l++; }
+        w++;
+      }
+      at = end;
+    }
+    for (i32 i = 0; i < n; i++) { a[i] = scratch[i]; }
+    width = width + width;
+  }
 }
 
 /**
@@ -1078,7 +1157,6 @@ i32 sort(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) 
  * argument this program never read before would be a write nobody asked for, so it is refused.
  */
 i32 uniq(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
-  u8[] stdin = fed.rest();
   Options o = options(argv, "");
   if (o.bad != "") {
     { errs.bytes(optionRefusal("uniq", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
@@ -1089,18 +1167,35 @@ i32 uniq(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) 
     // decision somebody made.
     { errs.bytes("uniq: writing to a second operand is not implemented\n".toBytes()); errs.flush(); sink.flush(); return 1; }
   }
-  Gathered in = gather(cli, cwd, o.operands, stdin);
-  if (in.failed.len() > 0) {
-    { errs.bytes(("uniq: " + in.failed.get(0) + ": " + in.reasons.get(0) + "\n").toBytes()); errs.flush(); sink.flush(); return 1; }
+  // Adjacent duplicates need one line of memory, not all of them: the comparison is with the line
+  // before, which is the whole of the state. 0071.
+  if (o.operands.len() == 0 || o.operands.get(0) == "-") { uniqFeed(fed, sink); return 0; }
+  string path = o.operands.get(0);
+  FileResult f = cli.readFile(resolvePath(cwd, path)).wait();
+  if (!f.ok) {
+    { errs.bytes(("uniq: " + path + ": " + whyUnread(f) + "\n").toBytes()); errs.flush(); sink.flush(); return 1; }
   }
-  Vec<u8[]> lines = splitLines(in.bytes);
-  Buf out = Buf.create();
-  for (i32 i = 0; i < lines.len(); i++) {
-    if (i > 0 && sameBytes(lines.get(i), lines.get(i - 1))) { continue; }
-    out.pushAll(lines.get(i));
-    out.push(10);
+  uniqFeed(Feed.of(cli, f.bytes), sink);
+  { sink.flush(); errs.flush(); return 0; }
+}
+
+/** Adjacent duplicates once each, holding one line. */
+bool uniqFeed(Feed fed, Sink sink) {
+  Lines lines = Lines.create();
+  u8[] previous = u8[0]();
+  bool first = true;
+  while (true) {
+    Line l = nextLine(lines, fed);
+    if (!l.ok) { break; }
+    if (!first && sameBytes(l.bytes, previous)) { continue; }
+    first = false;
+    previous = l.bytes;
+    // Terminated whether or not the line was: GNU's `uniq` adds the newline a last line arrived
+    // without, where its `rev` does not. Two tools, two answers, and the only way to know is to ask.
+    if (!sink.lineBytes(l.bytes)) { return false; }
   }
-  { sink.bytes(out.take()); sink.flush(); return 0; }
+  sink.flush();
+  return true;
 }
 
 /**
@@ -1113,63 +1208,95 @@ i32 uniq(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) 
  * each line is labelled with the file it came from, as GNU's is, and `-c` counts per file.
  */
 i32 grep(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
-  u8[] stdin = fed.rest();
   Options o = options(argv, "cinqvx");
   if (o.bad != "") {
     { errs.bytes(optionRefusal("grep", o.bad).toBytes()); errs.flush(); sink.flush(); return 2; }
   }
   if (o.operands.len() == 0) { { errs.bytes("grep: no pattern\n".toBytes()); errs.flush(); sink.flush(); return 2; } }
 
-  bool invert = sawOption(o, "v");
-  bool fold = sawOption(o, "i");
-  bool counting = sawOption(o, "c");
-  bool numbering = sawOption(o, "n");
-  bool quiet = sawOption(o, "q");
-  bool whole = sawOption(o, "x");
+  Match how = Match(
+    sawOption(o, "v"),
+    sawOption(o, "i"),
+    sawOption(o, "c"),
+    sawOption(o, "n"),
+    sawOption(o, "q"),
+    sawOption(o, "x"),
+    sawOption(o, "i") ? lowered(o.operands.get(0).toBytes()) : o.operands.get(0).toBytes());
 
-  u8[] needle = fold ? lowered(o.operands.get(0).toBytes()) : o.operands.get(0).toBytes();
   Vec<string> files = Vec.create();
   for (i32 i = 1; i < o.operands.len(); i++) { files.push(o.operands.get(i)); }
-
   Vec<string> names = inputsOf(files);
   // The label is a question of how many operands there are, not of how many matched: `grep a f` is
   // bare and `grep a f g` labels both, even when only one of them has a line.
   bool labelled = names.len() > 1;
 
-  Buf out = Buf.create();
-  Buf err = Buf.create();
   i32 hits = 0;
   i32 status = 0;
   for (i32 f = 0; f < names.len(); f++) {
-    Reading r = readOne(cli, cwd, names.get(f), stdin);
-    if (!r.ok) {
-      err.pushAll(("grep: " + r.name + ": " + r.error + "\n").toBytes());
-      status = 2;
-      continue;
-    }
-    string label = labelled ? r.name + ":" : "";
-    Vec<u8[]> lines = splitLines(r.bytes);
+    string name = names.get(f);
+    string label = labelled ? name + ":" : "";
     i32 here = 0;
-    for (i32 i = 0; i < lines.len(); i++) {
-      u8[] line = lines.get(i);
-      u8[] against = fold ? lowered(line) : line;
-      bool hit = whole ? sameBytes(against, needle) : contains(against, needle);
-      if (hit == invert) { continue; }
-      here++;
-      hits++;
-      if (quiet || counting) { continue; }
-      out.pushAll(label.toBytes());
-      if (numbering) { out.pushAll((itoa(i + 1) + ":").toBytes()); }
-      out.pushAll(line);
-      out.push(10);
+    if (name == "" || name == "-") {
+      here = grepFeed(fed, sink, how, label);
+    } else {
+      FileResult r = cli.readFile(resolvePath(cwd, name)).wait();
+      if (!r.ok) {
+        complain(sink, errs, "grep: " + name + ": " + whyUnread(r) + "\n");
+        status = 2;
+        continue;
+      }
+      here = grepFeed(Feed.of(cli, r.bytes), sink, how, label);
     }
-    if (counting && !quiet) { out.pushAll((label + itoa(here) + "\n").toBytes()); }
+    hits += here;
+    // **`-q` stops at the first match**, which is what makes `seq 1 2000000000 | grep -q 1` answer
+    // instead of counting to two billion: the sink is never written, so nothing else would ever stop
+    // the stage feeding it. GNU exits 0 the moment it has one.
+    if (how.quiet && hits > 0) { break; }
   }
 
   // grep's exit status is its answer, not an error: 1 means "no lines matched", which is what makes
   // `grep x f && echo found` work. A file it could not read is a real error and outranks both.
-  if (status != 0) { { sink.bytes(out.take()); errs.bytes(err.take()); sink.flush(); errs.flush(); return status; } }
-  { sink.bytes(out.take()); errs.bytes(err.take()); sink.flush(); errs.flush(); return hits > 0 ? 0 : 1; }
+  { sink.flush(); errs.flush(); }
+  if (status != 0) { return status; }
+  return hits > 0 ? 0 : 1;
+}
+
+/** What `grep` was asked for, so one input's worth of matching needs one argument rather than seven. */
+struct Match {
+  bool invert;
+  bool fold;
+  bool counting;
+  bool numbering;
+  bool quiet;
+  bool whole;
+  /** Already lower-cased when `-i` is on, so the input is the only thing folded per line. */
+  u8[] needle;
+}
+
+/** One input's matching lines, written as they are found. Answers how many matched. */
+i32 grepFeed(Feed fed, Sink sink, Match how, string label) {
+  Lines lines = Lines.create();
+  i32 here = 0;
+  i32 n = 0;
+  while (true) {
+    Line l = nextLine(lines, fed);
+    if (!l.ok) { break; }
+    n++;
+    u8[] against = how.fold ? lowered(l.bytes) : l.bytes;
+    bool hit = how.whole ? sameBytes(against, how.needle) : contains(against, how.needle);
+    if (hit == how.invert) { continue; }
+    here++;
+    if (how.quiet) { break; }
+    if (how.counting) { continue; }
+    Buf out = Buf.create();
+    out.pushAll(label.toBytes());
+    if (how.numbering) { out.pushAll((itoa(n) + ":").toBytes()); }
+    out.pushAll(l.bytes);
+    // GNU terminates a matching last line that arrived without a newline.
+    if (!sink.lineBytes(out.take())) { break; }
+  }
+  if (how.counting && !how.quiet) { sink.bytes((label + itoa(here) + "\n").toBytes()); }
+  return here;
 }
 
 /** ASCII lower case, for `-i`. The C locale is what the shell and its tests run in. */
@@ -1182,7 +1309,6 @@ u8[] lowered(u8[] b) {
 }
 
 i32 tr(Vec<string> argv, Feed fed, Sink sink, Sink errs) {
-  u8[] stdin = fed.rest();
   bool del = false;
   bool squeeze = false;
   bool comp = false;
@@ -1262,17 +1388,26 @@ i32 tr(Vec<string> argv, Feed fed, Sink sink, Sink errs) {
     for (i32 i = 0; i < runsOf.len(); i++) { runs[runsOf[i]] = 1; }
   }
 
-  Buf out = Buf.create();
+  // A chunk at a time, holding a chunk. The tables above are the whole of the state that depends on
+  // the *arguments*; the only thing that depends on the input is `previous`, the last byte written,
+  // which is what `-s` needs and which has to carry across a chunk boundary — a run of `aaa` split
+  // between two reads is still one run. 0071.
   i32 previous = -1;
-  for (i32 i = 0; i < stdin.len(); i++) {
-    i32 c = stdin[i];
-    if (drop[c] != 0) { continue; }
-    i32 v = map[c];
-    if (runs[v] != 0 && v == previous) { continue; }
-    out.push(v);
-    previous = v;
+  while (true) {
+    u8[] chunk = fed.next();
+    if (chunk.len() == 0) { break; }
+    Buf out = Buf.create();
+    for (i32 i = 0; i < chunk.len(); i++) {
+      i32 c = chunk[i];
+      if (drop[c] != 0) { continue; }
+      i32 v = map[c];
+      if (runs[v] != 0 && v == previous) { continue; }
+      out.push(v);
+      previous = v;
+    }
+    if (!sink.bytes(out.take())) { return 0; }
   }
-  { sink.bytes(out.take()); sink.flush(); return 0; }
+  { sink.flush(); return 0; }
 }
 
 /** A parsed set: the bytes it names, or why it could not be read. */
@@ -1704,30 +1839,59 @@ Numeral numeralOf(string text) {
 }
 
 i32 nl(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
-  u8[] stdin = fed.rest();
-  Options nlo = options(argv, "");
-  if (nlo.bad != "") {
-    { errs.bytes(optionRefusal("nl", nlo.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
+  Options o = options(argv, "");
+  if (o.bad != "") {
+    { errs.bytes(optionRefusal("nl", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
   }
-  Gathered nli = gather(cli, cwd, nlo.operands, stdin);
-  Buf nlerr = Buf.create();
-  for (i32 i = 0; i < nli.failed.len(); i++) {
-    nlerr.pushAll(("nl: " + nli.failed.get(i) + ": " + nli.reasons.get(i) + "\n").toBytes());
+  // The count runs on across the operands, as GNU's does, so it is state carried between them rather
+  // than a local. Nothing else is held: numbering costs one integer. 0071.
+  Counter state = Counter(0, false);
+  if (o.operands.len() == 0) { nlFeed(fed, sink, state); return 0; }
+  i32 status = 0;
+  for (i32 i = 0; i < o.operands.len(); i++) {
+    string path = o.operands.get(i);
+    if (path == "-") { nlFeed(fed, sink, state); continue; }
+    FileResult f = cli.readFile(resolvePath(cwd, path)).wait();
+    if (!f.ok) {
+      complain(sink, errs, "nl: " + path + ": " + whyUnread(f) + "\n");
+      status = 1;
+      continue;
+    }
+    if (!nlFeed(Feed.of(cli, f.bytes), sink, state)) { break; }
   }
-  Vec<u8[]> lines = splitLines(nli.bytes);
-  Buf out = Buf.create();
-  for (i32 i = 0; i < lines.len(); i++) {
-    // GNU `nl` right-aligns the number in six columns and then a tab. Matched exactly so this can
-    // be compared against the real one rather than only against itself.
-    string num = itoa(i + 1);
-    string pad = "";
-    for (i32 j = num.len(); j < 6; j++) { pad = pad + " "; }
-    out.pushAll((pad + num + "\t").toBytes());
-    out.pushAll(lines.get(i));
-    out.push(10);
-  }
-  { sink.bytes(out.take()); errs.bytes(nlerr.take()); sink.flush(); errs.flush(); return nli.failed.len() > 0 ? 1 : 0; }
+  { sink.flush(); errs.flush(); return status; }
 }
+
+/**
+ * Numbered lines, one at a time.
+ *
+ * **A blank line is not numbered**, which is GNU's default body type (`-b t`) and was wrong here: this
+ * numbered every line, so any input with a blank line in it came out with different numbers from GNU's
+ * from that point on. An unnumbered line is padded to the same width — six columns and the separator,
+ * which is seven spaces, because GNU pads by the number width *plus* the length of the separator
+ * rather than printing the separator itself.
+ */
+bool nlFeed(Feed fed, Sink sink, Counter state) {
+  Lines lines = Lines.create();
+  while (true) {
+    Line l = nextLine(lines, fed);
+    if (!l.ok) { break; }
+    Buf out = Buf.create();
+    if (l.bytes.len() == 0) {
+      out.pushAll("       ".toBytes());
+    } else {
+      state.lines++;
+      out.pushAll((rightAlign(itoa(state.lines), 6) + "\t").toBytes());
+    }
+    out.pushAll(l.bytes);
+    // As `uniq` does, and unlike `rev`: GNU's `nl` terminates the last line even when its input did
+    // not.
+    if (!sink.lineBytes(out.take())) { return false; }
+  }
+  sink.flush();
+  return true;
+}
+
 
 // ── Shared ────────────────────────────────────────────────────────────────────
 
