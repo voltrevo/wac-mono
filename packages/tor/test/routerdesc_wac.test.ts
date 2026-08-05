@@ -24,7 +24,9 @@
 // file carries tor's expanded secret and a signature tor made with it, and because ed25519 is
 // deterministic the signature pins all 64 bytes — derivation string and terminating NUL included.
 
-import { createPublicKey, verify as nodeEd25519Verify } from "node:crypto";
+import {
+  constants, createPublicKey, publicDecrypt, verify as nodeEd25519Verify,
+} from "node:crypto";
 import { wacTestRun } from "../../../harness/wacTestRun.ts";
 
 const V_COUNT = 0;
@@ -44,11 +46,35 @@ const P_SIGNBIT = 11; // a[0]=i
 const P_SIGNATURE = 12; // a[0]=i: tor's signature over P_MESSAGE with the derived key
 const P_MESSAGE = 13;
 
+// The descriptor documents themselves, for the signature-digest tests.
+const D_TEXT = 14; // a[0]=i: the whole descriptor, as tor wrote it
+const D_IDENTITY_CERT = 15; // a[0]=i: identity-ed25519, whose certified key is the signing key
+const D_ROUTER_SIG = 16; // a[0]=i: the 64 bytes of router-sig-ed25519
+const D_RSA_RECOVER = 17; // a[0]=i: the digest node recovers from tor's own router-signature
+const D_ONION_KEY_DER = 18; // a[0]=i: the onion-key PEM body, decoded
+const D_ONION_KEY_PEM = 19; // a[0]=i: the onion-key PEM block exactly as tor wrote it
+const D_FINGERPRINT_LINE = 20; // a[0]=i: the value on tor's own `fingerprint` line
+const D_PUBLISHED_LINE = 21; // a[0]=i: the value on tor's own `published` line
+const D_PUBLISHED_EPOCH = 22; // a[0]=i: that same time, as 8 big-endian bytes of epoch seconds
+const D_NTOR_LINE = 23; // a[0]=i: the value on tor's own `ntor-onion-key` line
+const D_SIGNING_N = 24; // a[0]=i: the modulus of the descriptor's own signing-key
+const D_SIGNING_E = 25; // a[0]=i: its public exponent
+const D_SIGNING_KEY_DER = 26; // a[0]=i: the signing-key DER exactly as tor published it
+
+// The descriptor this repo generated and tor accepted — see tools note in src/gendesc.wac.
+const G_KEY = 27; // a[0]=which of the nine key values
+const G_STR = 28; // a[0]=0 nickname, 1 address
+const G_NUM = 29; // a[0]=which number, 8 bytes big-endian
+const G_DESC = 30; // the descriptor itself
+
 const v = JSON.parse(
   await Deno.readTextFile(new URL("data/routerdesc_vectors.json", import.meta.url)),
 ) as {
   descriptors: {
     nickname: string;
+    descriptor: string;
+    identity_ed25519_cert: string;
+    router_sig_ed25519: string;
     ntor_onion_key: string;
     signbit: number;
     ntor_crosscert: string;
@@ -81,6 +107,37 @@ if (!v.descriptors.some((d) => d.signbit === 0) || !v.descriptors.some((d) => d.
 
 const hex = (h: string) => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
 
+/**
+ * A router descriptor this repo generated, and the key material that produced it.
+ *
+ * `router_parse_entry_from_string` accepted it, and rejects it if any signature, the certificate
+ * chain or a single body byte is disturbed — so the bytes committed here are a document a real tor
+ * verified. The suite compares against them rather than running tor: a test that needs a built tor
+ * tree present reddens the shared suite for whoever has not got one, which is the mistake
+ * `ntor_wac.test.ts` records having already made once.
+ *
+ * Regenerate with `packages/tor/src/gendesc.wac`, then re-check with `tools/parsedesc-probe.c`.
+ */
+const g = JSON.parse(
+  await Deno.readTextFile(new URL("data/routerdesc_generated.json", import.meta.url)),
+) as Record<string, string | number>;
+
+const G_KEYS = [
+  "rsaIdentityN", "rsaIdentityE", "rsaIdentityD",
+  "rsaOnionN", "rsaOnionE", "rsaOnionD",
+  "edIdentitySeed", "edSigningSeed", "ntorSecret",
+];
+const G_NUMS = [
+  "orPort", "dirPort", "published",
+  "bandwidthRate", "bandwidthBurst", "bandwidthObserved", "certExpiryHours",
+];
+
+const be64 = (v: number) => {
+  const out = new Uint8Array(8);
+  for (let i = 7; i >= 0; i--) out[i] = Math.floor(v / 2 ** (8 * (7 - i))) & 0xff;
+  return out;
+};
+
 // SubjectPublicKeyInfo for Ed25519: SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING }. node will
 // not take a raw 32-byte key, and wrapping it is cheaper than depending on a key-parsing library.
 const SPKI_PREFIX = hex("302a300506032b6570032100");
@@ -99,6 +156,82 @@ function hostVerify(pub: Uint8Array, cert: Uint8Array): boolean {
     return nodeEd25519Verify(null, body, key, sig);
   } catch {
     return false;
+  }
+}
+
+/**
+ * The modulus and exponent of the descriptor's `signing-key`, unwrapped from its DER.
+ *
+ * `SEQUENCE { INTEGER n, INTEGER e }`, and the leading zero a positive INTEGER carries when its top
+ * bit is set is stripped — the wac side is given magnitudes, and re-encoding is the thing under test.
+ */
+function rsaParts(desc: string): [Uint8Array, Uint8Array] {
+  const body = pemAfter(desc, "signing-key", "RSA PUBLIC KEY");
+  if (!body) return [new Uint8Array(0), new Uint8Array(0)];
+  const der = Uint8Array.from(atob(body.replace(/\s/g, "")), (c) => c.charCodeAt(0));
+  let i = 0;
+  const len = () => {
+    let n = der[i++];
+    if (n & 0x80) {
+      const k = n & 0x7f;
+      n = 0;
+      for (let j = 0; j < k; j++) n = n * 256 + der[i++];
+    }
+    return n;
+  };
+  if (der[i++] !== 0x30) return [new Uint8Array(0), new Uint8Array(0)];
+  len();
+  const readInt = () => {
+    if (der[i++] !== 0x02) return new Uint8Array(0);
+    const n = len();
+    let start = i;
+    let count = n;
+    if (der[start] === 0 && count > 1) {
+      start++;
+      count--;
+    }
+    i += n;
+    return der.subarray(start, start + count);
+  };
+  return [readInt(), readInt()];
+}
+
+/** The value on the line starting with `keyword`, or "". */
+function line(text: string, keyword: string): string {
+  return text.match(new RegExp(`^${keyword} (.+)$`, "m"))?.[1] ?? "";
+}
+
+/** The PEM body that follows `keyword` on its own line. */
+function pemAfter(text: string, keyword: string, label: string): string | null {
+  const re = new RegExp(
+    `^${keyword}[^\\n]*\\n-----BEGIN ${label}-----\\n([\\s\\S]*?)-----END ${label}-----`,
+    "m",
+  );
+  return text.match(re)?.[1] ?? null;
+}
+
+/**
+ * The digest tor's `router-signature` actually covers, recovered with a public-key operation.
+ *
+ * The descriptor publishes the RSA identity as `signing-key`, and `router-signature` is that key
+ * signing a bare SHA-1 digest with PKCS#1 padding and no DigestInfo — so recovering the payload is
+ * the only way to see what was signed, and it makes tor's own signature the oracle for our span.
+ * Returns empty if anything is missing, which the wac side asserts against.
+ */
+function recoverRouterSignature(desc: string): Uint8Array {
+  const keyBody = pemAfter(desc, "signing-key", "RSA PUBLIC KEY");
+  const sigBody = pemAfter(desc, "router-signature", "SIGNATURE");
+  if (!keyBody || !sigBody) return new Uint8Array(0);
+  try {
+    const key = createPublicKey({
+      key: `-----BEGIN RSA PUBLIC KEY-----\n${keyBody}-----END RSA PUBLIC KEY-----\n`,
+      format: "pem",
+      type: "pkcs1",
+    });
+    const sig = Uint8Array.from(atob(sigBody.replace(/\s/g, "")), (c) => c.charCodeAt(0));
+    return new Uint8Array(publicDecrypt({ key, padding: constants.RSA_PKCS1_PADDING }, sig));
+  } catch {
+    return new Uint8Array(0);
   }
 }
 
@@ -132,6 +265,60 @@ function ref(what: number, a: Uint8Array, b: Uint8Array): Uint8Array {
       return hex(p.cases[a[0]].signature);
     case P_MESSAGE:
       return new TextEncoder().encode(p.message);
+    case D_TEXT:
+      return new TextEncoder().encode(v.descriptors[a[0]].descriptor);
+    case D_IDENTITY_CERT:
+      return hex(v.descriptors[a[0]].identity_ed25519_cert);
+    case D_ROUTER_SIG: {
+      // tor writes these base64 without padding.
+      const t = v.descriptors[a[0]].router_sig_ed25519;
+      return Uint8Array.from(atob(t + "=".repeat((4 - t.length % 4) % 4)), (c) => c.charCodeAt(0));
+    }
+    case D_RSA_RECOVER:
+      return recoverRouterSignature(v.descriptors[a[0]].descriptor);
+    case D_ONION_KEY_DER: {
+      const body = pemAfter(v.descriptors[a[0]].descriptor, "onion-key", "RSA PUBLIC KEY");
+      if (!body) return new Uint8Array(0);
+      return Uint8Array.from(atob(body.replace(/\s/g, "")), (c) => c.charCodeAt(0));
+    }
+    case D_ONION_KEY_PEM: {
+      const body = pemAfter(v.descriptors[a[0]].descriptor, "onion-key", "RSA PUBLIC KEY");
+      if (!body) return new Uint8Array(0);
+      return new TextEncoder().encode(
+        `-----BEGIN RSA PUBLIC KEY-----\n${body}-----END RSA PUBLIC KEY-----\n`,
+      );
+    }
+    case D_FINGERPRINT_LINE:
+      return new TextEncoder().encode(line(v.descriptors[a[0]].descriptor, "fingerprint"));
+    case D_PUBLISHED_LINE:
+      return new TextEncoder().encode(line(v.descriptors[a[0]].descriptor, "published"));
+    case D_PUBLISHED_EPOCH: {
+      // The descriptor writes UTC with no zone marker, so it has to be read as UTC explicitly.
+      const t = line(v.descriptors[a[0]].descriptor, "published");
+      const secs = Math.floor(Date.parse(t.replace(" ", "T") + "Z") / 1000);
+      const out = new Uint8Array(8);
+      for (let i = 7; i >= 0; i--) out[i] = (secs / 2 ** (8 * (7 - i))) & 0xff;
+      return out;
+    }
+    case D_NTOR_LINE:
+      return new TextEncoder().encode(line(v.descriptors[a[0]].descriptor, "ntor-onion-key"));
+    case D_SIGNING_N:
+      return rsaParts(v.descriptors[a[0]].descriptor)[0];
+    case D_SIGNING_E:
+      return rsaParts(v.descriptors[a[0]].descriptor)[1];
+    case D_SIGNING_KEY_DER: {
+      const body = pemAfter(v.descriptors[a[0]].descriptor, "signing-key", "RSA PUBLIC KEY");
+      if (!body) return new Uint8Array(0);
+      return Uint8Array.from(atob(body.replace(/\s/g, "")), (c) => c.charCodeAt(0));
+    }
+    case G_KEY:
+      return hex(g[G_KEYS[a[0]]] as string);
+    case G_STR:
+      return new TextEncoder().encode(g[a[0] === 0 ? "nickname" : "address"] as string);
+    case G_NUM:
+      return be64(g[G_NUMS[a[0]]] as number);
+    case G_DESC:
+      return new TextEncoder().encode(g.descriptor as string);
     default:
       throw new Error(`unknown vector field ${what}`);
   }

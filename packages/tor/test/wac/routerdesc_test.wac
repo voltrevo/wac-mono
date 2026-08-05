@@ -36,6 +36,12 @@ import {
   CERT_TYPE_ONION_ID, KEY_TYPE_ED25519,
 } from "../../src/relaycert.wac";
 import { certCertifiedKey, certType } from "../../src/hsdesc.wac";
+import {
+  edDescriptorDigest, rsaDescriptorDigest, pastLineStarting, pemBlock, publishedTime,
+  spacedFingerprint, b64Unpadded, rsaFingerprint, rsaPublicKeyDer,
+  RelayInfo, RelayKeys, routerDescriptor,
+} from "../../src/routerdesc.wac";
+import { ed25519Verify } from "../../../crypto/src/ed25519.wac";
 
 const i32 V_COUNT = 0;
 const i32 V_NTOR = 1;
@@ -51,6 +57,23 @@ const i32 P_ED_PUBLIC = 10;
 const i32 P_SIGNBIT = 11;
 const i32 P_SIGNATURE = 12;
 const i32 P_MESSAGE = 13;
+const i32 D_TEXT = 14;
+const i32 D_IDENTITY_CERT = 15;
+const i32 D_ROUTER_SIG = 16;
+const i32 D_RSA_RECOVER = 17;
+const i32 D_ONION_KEY_DER = 18;
+const i32 D_ONION_KEY_PEM = 19;
+const i32 D_FINGERPRINT_LINE = 20;
+const i32 D_PUBLISHED_LINE = 21;
+const i32 D_PUBLISHED_EPOCH = 22;
+const i32 D_NTOR_LINE = 23;
+const i32 D_SIGNING_N = 24;
+const i32 D_SIGNING_E = 25;
+const i32 D_SIGNING_KEY_DER = 26;
+const i32 G_KEY = 27;
+const i32 G_STR = 28;
+const i32 G_NUM = 29;
+const i32 G_DESC = 30;
 
 u8[] arg1(i32 i) {
   u8[] a = u8[1]();
@@ -185,4 +208,191 @@ export string test_the_secret_derivation_is_tors(fn[u8[](i32, u8[], u8[])] ref) 
             which + ": node verifies the certificate we signed with the derived key");
   }
   return t.report();
+}
+
+export string test_the_document_digests_are_tors(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(V_COUNT, none(), none())[0];
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] text = ref(D_TEXT, arg1(i), none());
+    u8[] sig = ref(D_ROUTER_SIG, arg1(i), none());
+    string which = "descriptor " + itoa64(i as i64);
+
+    t.eqI32(sig.len(), 64, which + ": router-sig-ed25519 decodes to 64 bytes");
+
+    // `identity-ed25519` is a type-4 certificate whose *certified* key is the signing key. The master
+    // identity is in its extension, and does not sign the descriptor — using it here would be the
+    // natural mistake and would fail for every relay.
+    u8[] signingKey = certCertifiedKey(ref(D_IDENTITY_CERT, arg1(i), none()));
+    t.eqI32(signingKey.len(), 32, which + ": the identity certificate names a signing key");
+
+    // The assertion: tor's signature over tor's document, under our digest rule. If the span or the
+    // prefix or the hash is wrong, this fails — and nothing else here would notice.
+    u8[] digest = edDescriptorDigest(text);
+    t.eqI32(digest.len(), 32, which + ": the ed25519 digest is 32 bytes");
+    t.isTrue(ed25519Verify(signingKey, digest, sig),
+             which + ": tor's router-sig-ed25519 verifies over our digest");
+
+    // Not under the master identity, so the choice of key is pinned too.
+    t.isFalse(ed25519Verify(ref(V_MASTER, arg1(i), none()), digest, sig),
+              which + ": the master identity did not sign the descriptor");
+
+    // The RSA digest, against the payload node recovers from tor's own `router-signature` using the
+    // `signing-key` the descriptor publishes. Length alone would not do: stopping one byte short of
+    // the newline gives a perfectly good 20-byte digest, and that fault survived until this compared
+    // the bytes.
+    u8[] recovered = ref(D_RSA_RECOVER, arg1(i), none());
+    t.eqI32(recovered.len(), 20, which + ": node recovered a SHA-1 digest from router-signature");
+    t.eqBytes(rsaDescriptorDigest(text), recovered,
+              which + ": our RSA digest is the one tor signed");
+  }
+  return t.report();
+}
+
+export string test_a_digest_span_stops_where_tor_stops(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] text = ref(D_TEXT, arg1(0), none());
+
+  // The ed25519 span ends immediately after the keyword and its single space, with no newline. The
+  // easiest wrong answer is to include the signature that follows, and the second easiest is to stop
+  // before the keyword; both are excluded by checking the exact offset.
+  i32 end = pastLineStarting(text, "router-sig-ed25519 ".toBytes());
+  t.isTrue(end > 0, "the keyword is present");
+  t.eqI32(text[end - 1], 32, "the span ends on the space after the keyword");
+  t.neI32(text[end], 10, "the span does not reach the newline");
+
+  i32 rsaEnd = pastLineStarting(text, "router-signature\n".toBytes());
+  t.isTrue(rsaEnd > end, "router-signature comes after router-sig-ed25519");
+  t.eqI32(text[rsaEnd - 1], 10, "the RSA span includes the newline");
+
+  // A keyword that is not at a line start must not match, or a nickname or contact line could move
+  // the span. `pastLineStarting` is given a needle that occurs only mid-line here.
+  t.eqI32(pastLineStarting("aaa\nxrouter-signature\n".toBytes(), "router-signature\n".toBytes()), -1,
+          "a keyword mid-line is not the document's own");
+  t.eqI32(pastLineStarting("router-signature\n".toBytes(), "router-signature\n".toBytes()), 17,
+          "a keyword at the very start matches");
+  t.eqI32(pastLineStarting("nope\n".toBytes(), "router-signature\n".toBytes()), -1,
+          "an absent keyword is -1");
+
+  // An absent keyword must give an empty digest rather than a digest of the whole document.
+  t.eqI32(edDescriptorDigest("router nickname\n".toBytes()).len(), 0,
+          "no keyword, no digest");
+  t.eqI32(rsaDescriptorDigest("router nickname\n".toBytes()).len(), 0,
+          "no keyword, no RSA digest");
+  return t.report();
+}
+
+export string test_a_pem_block_is_wrapped_the_way_tor_wraps_one(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(V_COUNT, none(), none())[0];
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] der = ref(D_ONION_KEY_DER, arg1(i), none());
+    u8[] want = ref(D_ONION_KEY_PEM, arg1(i), none());
+    string which = "descriptor " + itoa64(i as i64);
+
+    t.isTrue(der.len() > 100, which + ": the onion key decoded");
+    // Byte for byte against tor's own block: header, 64-character lines, the trailing newline on the
+    // last one, and the footer. Wrapping at 76 — RFC 2045's width, and most tools' default — would
+    // still be valid base64 and would change every byte after the first line.
+    t.eqBytes(pemBlock("RSA PUBLIC KEY", der), want,
+              which + ": our PEM block is the block tor wrote");
+  }
+
+  // Every line is at most 64 characters, checked directly rather than inferred from the comparison
+  // above, so a change in wrapping says which rule it broke.
+  u8[] der = ref(D_ONION_KEY_DER, arg1(0), none());
+  u8[] block = pemBlock("RSA PUBLIC KEY", der);
+  i32 run = 0;
+  i32 longest = 0;
+  for (i32 i = 0; i < block.len(); i++) {
+    if (block[i] == 10) {
+      if (run > longest) { longest = run; }
+      run = 0;
+    } else {
+      run = run + 1;
+    }
+  }
+  t.eqI32(run, 0, "the block ends with a newline");
+  t.isTrue(longest <= 64, "no line exceeds 64 characters");
+  return t.report();
+}
+
+export string test_the_field_formats_are_tors(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(V_COUNT, none(), none())[0];
+
+  for (i32 i = 0; i < n; i++) {
+    string which = "descriptor " + itoa64(i as i64);
+
+    // `published` — the descriptor writes UTC with no zone marker at all, so a generator using local
+    // time produces a document that verifies and describes the wrong moment.
+    i64 epoch = 0;
+    u8[] secs = ref(D_PUBLISHED_EPOCH, arg1(i), none());
+    for (i32 j = 0; j < 8; j++) { epoch = epoch * 256 + (secs[j] as i64); }
+    t.eqBytes(publishedTime(epoch).toBytes(), ref(D_PUBLISHED_LINE, arg1(i), none()),
+              which + ": our published line is tor's");
+
+    // `fingerprint` — SHA-1 of the DER RSAPublicKey, uppercase, in groups of four. The key comes from
+    // the descriptor's own `signing-key`, so this checks the digest and the formatting together.
+    u8[] nn = ref(D_SIGNING_N, arg1(i), none());
+    u8[] ee = ref(D_SIGNING_E, arg1(i), none());
+    t.eqI32(nn.len(), 128, which + ": the signing key is RSA-1024");
+    t.eqBytes(spacedFingerprint(rsaFingerprint(nn, ee)).toBytes(),
+              ref(D_FINGERPRINT_LINE, arg1(i), none()),
+              which + ": our fingerprint line is tor's");
+
+    // And the DER we re-encode is the DER tor published, so the fingerprint above is not agreeing by
+    // way of two compensating mistakes.
+    t.eqBytes(rsaPublicKeyDer(nn, ee), ref(D_SIGNING_KEY_DER, arg1(i), none()),
+              which + ": our RSAPublicKey encoding is tor's");
+
+    // `ntor-onion-key` — base64 with the padding stripped.
+    t.eqBytes(b64Unpadded(ref(V_NTOR, arg1(i), none())).toBytes(),
+              ref(D_NTOR_LINE, arg1(i), none()),
+              which + ": our ntor-onion-key line is tor's");
+  }
+  return t.report();
+}
+
+export string test_the_descriptor_tor_accepted_is_reproduced(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+
+  RelayKeys k = RelayKeys(
+    ref(G_KEY, arg1(0), none()), ref(G_KEY, arg1(1), none()), ref(G_KEY, arg1(2), none()),
+    ref(G_KEY, arg1(3), none()), ref(G_KEY, arg1(4), none()), ref(G_KEY, arg1(5), none()),
+    ref(G_KEY, arg1(6), none()), ref(G_KEY, arg1(7), none()), ref(G_KEY, arg1(8), none()));
+
+  RelayInfo info = RelayInfo(
+    string.fromBytes(ref(G_STR, arg1(0), none())),
+    string.fromBytes(ref(G_STR, arg1(1), none())),
+    num(ref, 0) as~ i32, num(ref, 1) as~ i32, num(ref, 2),
+    num(ref, 3), num(ref, 4), num(ref, 5), num(ref, 6));
+
+  u8[] want = ref(G_DESC, none(), none());
+  t.isTrue(want.len() > 1500, "the committed descriptor is a whole document");
+
+  // The assertion: tor's own `router_parse_entry_from_string` accepted these exact bytes, and rejects
+  // them if a signature, the certificate chain or one body byte is disturbed. Reproducing them means
+  // reproducing a document a real tor verified — both signatures, all three certificates, and the
+  // proposal 228 crosscert included.
+  t.eqBytes(routerDescriptor(k, info), want, "the descriptor tor accepted is what we build");
+
+  // The document is self-consistent under our own reading of it too, which is worth asserting
+  // separately: it is the part that would still hold if the vector were ever regenerated wrongly.
+  u8[] built = routerDescriptor(k, info);
+  t.eqI32(edDescriptorDigest(built).len(), 32, "the built document has an ed25519 digest");
+  t.eqI32(rsaDescriptorDigest(built).len(), 20, "the built document has an RSA digest");
+  t.isTrue(pastLineStarting(built, "router-signature\n".toBytes()) > 0,
+           "the built document is signed with RSA last");
+  return t.report();
+}
+
+/** An 8-byte big-endian number from the vector. */
+i64 num(fn[u8[](i32, u8[], u8[])] ref, i32 which) {
+  u8[] b = ref(G_NUM, arg1(which), none());
+  i64 v = 0;
+  for (i32 i = 0; i < 8; i++) { v = v * 256 + (b[i] as i64); }
+  return v;
 }

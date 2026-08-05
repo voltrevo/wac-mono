@@ -1,0 +1,106 @@
+// A directory authority's key certificate — the root of trust for a consensus.
+//
+// An authority has two RSA keys and this document is what ties them together. The **identity** key is
+// long-lived, and its digest is the authority's fingerprint that every client ships hardcoded. The
+// **signing** key is rotated, and it is what actually signs votes and consensuses. A client that has
+// the fingerprint needs this certificate to learn which signing key to trust today.
+//
+// ## Two signatures, two signers, two different things signed
+//
+// The document ends with both, and they point in opposite directions:
+//
+//   - **`dir-key-crosscert`** is the *signing* key signing the **identity fingerprint** — 20 raw bytes,
+//     not a digest of the document. It proves the signing key's holder consents to being bound to that
+//     identity.
+//   - **`dir-key-certification`** is the *identity* key signing **SHA-1 of the document**, from
+//     `dir-key-certificate-version` through `dir-key-certification\n` inclusive. It is the assertion
+//     that makes the whole certificate worth anything.
+//
+// Getting the two the wrong way round produces a document with two well-formed signatures that no tor
+// accepts, and nothing local can tell the difference. `authority_cert_parse_from_string` checks both:
+// `check_signature_token(digest, ..., cert->identity_key, ...)` for the certification and
+// `check_signature_token(cert->cache_info.identity_digest, ..., cert->signing_key, ...)` for the
+// crosscert.
+//
+// ## The fingerprint is not written the way a router writes one
+//
+// Here it is unbroken uppercase hex. A router descriptor's `fingerprint` line is the same 20 bytes in
+// space-separated groups of four. Same value, two spellings, and this one has to match the digest tor
+// computes from the identity key it just read or the certificate is refused.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { encodeUpper } from "../../codec/src/hex.wac";
+import { rsaSignRawPkcs1 } from "../../crypto/src/rsa.wac";
+import { sha1 } from "../../crypto/src/sha1.wac";
+import {
+  pastLineStarting, pemBlock, publishedTime, rsaFingerprint, rsaPublicKeyDer,
+} from "./routerdesc.wac";
+
+/** An authority's two keypairs. All RSA values are big-endian magnitudes. */
+export struct AuthorityKeys {
+  u8[] identityN;
+  u8[] identityE;
+  u8[] identityD;
+  u8[] signingN;
+  u8[] signingE;
+  u8[] signingD;
+}
+
+/** The line the certification signature covers up to, newline included. */
+u8[] certificationKeyword() { return "dir-key-certification\n".toBytes(); }
+
+/**
+ * The 20-byte SHA-1 that `dir-key-certification` signs, or empty if the keyword is absent.
+ *
+ * The span runs from the first byte of the document — tor's `router_get_hash_impl` is given
+ * `"dir-key-certificate-version"` as the start token, and this document begins with it — through the
+ * `dir-key-certification` line and its newline.
+ */
+export u8[] certificationDigest(u8[] document) {
+  i32 end = pastLineStarting(document, certificationKeyword());
+  if (end < 0) { return u8[0](); }
+  u8[] signed = u8[end]();
+  for (i32 i = 0; i < end; i++) { signed[i] = document[i]; }
+  return sha1(signed);
+}
+
+/** The fingerprint as a certificate writes it: unbroken uppercase hex. */
+export string plainFingerprint(u8[] digest) { return string.fromBytes(encodeUpper(digest)); }
+
+/**
+ * A complete authority key certificate, signed by both keys.
+ *
+ * `published` and `expires` are seconds since the epoch. Empty if either signature cannot be made.
+ */
+export u8[] authorityCertificate(AuthorityKeys k, i64 published, i64 expires) {
+  u8[] fingerprint = rsaFingerprint(k.identityN, k.identityE);
+  if (fingerprint.len() != 20) { return u8[0](); }
+
+  // The signing key vouches for the identity fingerprint itself, not for any digest of this document.
+  u8[] crosscert = rsaSignRawPkcs1(k.signingN, k.signingD, fingerprint);
+  if (crosscert.len() == 0) { return u8[0](); }
+
+  Buf d = Buf.create();
+  d.pushAll("dir-key-certificate-version 3\n".toBytes());
+  d.pushAll(("fingerprint " + plainFingerprint(fingerprint) + "\n").toBytes());
+  d.pushAll(("dir-key-published " + publishedTime(published) + "\n").toBytes());
+  d.pushAll(("dir-key-expires " + publishedTime(expires) + "\n").toBytes());
+  d.pushAll("dir-identity-key\n".toBytes());
+  d.pushAll(pemBlock("RSA PUBLIC KEY", rsaPublicKeyDer(k.identityN, k.identityE)));
+  d.pushAll("dir-signing-key\n".toBytes());
+  d.pushAll(pemBlock("RSA PUBLIC KEY", rsaPublicKeyDer(k.signingN, k.signingE)));
+  d.pushAll("dir-key-crosscert\n".toBytes());
+  // tor parses this one with CST_NO_CHECK_OBJTYPE, so the label is not checked — but tor-gencert
+  // writes `ID SIGNATURE` and a reader of the document should see what tor's own output looks like.
+  d.pushAll(pemBlock("ID SIGNATURE", crosscert));
+
+  // The certification covers its own keyword line, so the keyword goes in before the digest is taken.
+  d.pushAll(certificationKeyword());
+  u8[] digest = certificationDigest(d.bytes());
+  if (digest.len() != 20) { return u8[0](); }
+  u8[] certification = rsaSignRawPkcs1(k.identityN, k.identityD, digest);
+  if (certification.len() == 0) { return u8[0](); }
+  d.pushAll(pemBlock("SIGNATURE", certification));
+
+  return d.bytes();
+}

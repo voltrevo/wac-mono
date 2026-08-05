@@ -1,0 +1,134 @@
+// A directory authority's key certificate, against one tor accepted.
+//
+// See `authcert_wac.test.ts` for where the vector comes from and why node, rather than us, decides
+// which key signed which payload.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  AuthorityKeys, authorityCertificate, certificationDigest, plainFingerprint,
+} from "../../src/authcert.wac";
+import { rsaFingerprint } from "../../src/routerdesc.wac";
+import { decode as b64decode } from "../../../codec/src/base64.wac";
+
+const i32 A_KEY = 0;
+const i32 A_NUM = 1;
+const i32 A_CERT = 2;
+const i32 A_RECOVER_CROSSCERT = 3;
+const i32 A_RECOVER_CERTIFICATION = 4;
+
+u8[] arg1(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+u8[] none() { return u8[0](); }
+
+i64 num(fn[u8[](i32, u8[], u8[])] ref, i32 which) {
+  u8[] b = ref(A_NUM, arg1(which), none());
+  i64 v = 0;
+  for (i32 i = 0; i < 8; i++) { v = v * 256 + (b[i] as i64); }
+  return v;
+}
+
+AuthorityKeys keysFrom(fn[u8[](i32, u8[], u8[])] ref) {
+  return AuthorityKeys(
+    ref(A_KEY, arg1(0), none()), ref(A_KEY, arg1(1), none()), ref(A_KEY, arg1(2), none()),
+    ref(A_KEY, arg1(3), none()), ref(A_KEY, arg1(4), none()), ref(A_KEY, arg1(5), none()));
+}
+
+/** The PEM body between `label`'s BEGIN and END lines, decoded — or empty. */
+u8[] blockAfter(u8[] doc, string keyword, string label) {
+  i32 at = indexOfLine(doc, keyword + "\n");
+  if (at < 0) { return u8[0](); }
+  i32 begin = indexOfFrom(doc, "-----BEGIN " + label + "-----\n", at);
+  if (begin < 0) { return u8[0](); }
+  i32 bodyAt = begin + ("-----BEGIN " + label + "-----\n").toBytes().len();
+  i32 end = indexOfFrom(doc, "-----END " + label + "-----\n", bodyAt);
+  if (end < 0) { return u8[0](); }
+  return base64Of(doc, bodyAt, end);
+}
+
+i32 indexOfLine(u8[] doc, string s) {
+  u8[] n = s.toBytes();
+  for (i32 i = 0; i + n.len() <= doc.len(); i++) {
+    if (i != 0 && doc[i - 1] != 10) { continue; }
+    bool hit = true;
+    for (i32 j = 0; j < n.len(); j++) { if (doc[i + j] != n[j]) { hit = false; break; } }
+    if (hit) { return i; }
+  }
+  return -1;
+}
+
+i32 indexOfFrom(u8[] doc, string s, i32 from) {
+  u8[] n = s.toBytes();
+  for (i32 i = from; i + n.len() <= doc.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < n.len(); j++) { if (doc[i + j] != n[j]) { hit = false; break; } }
+    if (hit) { return i; }
+  }
+  return -1;
+}
+
+/** The base64 between two offsets, newlines dropped, decoded. */
+u8[] base64Of(u8[] doc, i32 from, i32 to) {
+  u8[] packed = u8[to - from]();
+  i32 n = 0;
+  for (i32 i = from; i < to; i++) {
+    if (doc[i] != 10) { packed[n] = doc[i]; n = n + 1; }
+  }
+  u8[] text = u8[n]();
+  for (i32 i = 0; i < n; i++) { text[i] = packed[i]; }
+  u8[]? decoded = b64decode(text);
+  return decoded is null ? u8[0]() : decoded!;
+}
+
+export string test_the_certificate_tor_accepted_is_reproduced(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  AuthorityKeys k = keysFrom(ref);
+  u8[] want = ref(A_CERT, none(), none());
+
+  t.isTrue(want.len() > 800, "the committed certificate is a whole document");
+  t.eqBytes(authorityCertificate(k, num(ref, 0), num(ref, 1)), want,
+            "the certificate tor accepted is what we build");
+  return t.report();
+}
+
+export string test_each_signature_was_made_by_the_key_that_should_have_made_it(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  T t = T.create();
+  u8[] cert = ref(A_CERT, none(), none());
+  u8[] fingerprint = rsaFingerprint(ref(A_KEY, arg1(0), none()), ref(A_KEY, arg1(1), none()));
+  t.eqI32(fingerprint.len(), 20, "the identity fingerprint is 20 bytes");
+
+  // The `fingerprint` line has to be that digest, unbroken and uppercase — tor recomputes it from the
+  // identity key it just read and refuses the document if they differ.
+  t.isTrue(indexOfLine(cert, "fingerprint " + plainFingerprint(fingerprint) + "\n") >= 0,
+           "the fingerprint line is the identity digest in unbroken hex");
+
+  // The crosscert: recovered with the *signing* key, and the payload is the fingerprint. Nothing about
+  // this document's own bytes.
+  u8[] crosscert = blockAfter(cert, "dir-key-crosscert", "ID SIGNATURE");
+  t.isTrue(crosscert.len() > 0, "the crosscert block decodes");
+  t.eqBytes(ref(A_RECOVER_CROSSCERT, crosscert, none()), fingerprint,
+            "the signing key signed the identity fingerprint");
+
+  // The certification: recovered with the *identity* key, and the payload is the document digest.
+  u8[] certification = blockAfter(cert, "dir-key-certification", "SIGNATURE");
+  t.isTrue(certification.len() > 0, "the certification block decodes");
+  t.eqBytes(ref(A_RECOVER_CERTIFICATION, certification, none()), certificationDigest(cert),
+            "the identity key signed the document digest");
+
+  // And the two payloads differ, so the assertions above are not both true of the same 20 bytes — the
+  // failure the source file warns about is exchanging the signatures, and that is only detectable
+  // because these are different values signed by different keys.
+  t.isFalse(sameBytes(fingerprint, certificationDigest(cert)),
+            "the fingerprint and the document digest are not the same 20 bytes");
+  return t.report();
+}
+
+bool sameBytes(u8[] x, u8[] y) {
+  if (x.len() != y.len()) { return false; }
+  for (i32 i = 0; i < x.len(); i++) { if (x[i] != y[i]) { return false; } }
+  return true;
+}

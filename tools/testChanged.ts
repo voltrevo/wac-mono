@@ -80,9 +80,9 @@ const r = await new Deno.Command("deno", {
     ...targets,
   ],
   // The same cap `tools/runTests.ts` applies, so the two entry points do not differ in how much of
-  // the machine they take. See issue 0075 for why the number is 2. `SUITE_ENV` marks the children so
+  // the machine they take. See issue 0075 for the measurement behind 4. `SUITE_ENV` marks the children so
   // that a suite started from inside this one refuses instead of recursing — wac-mono 0077.
-  env: { DENO_JOBS: Deno.env.get("DENO_JOBS") ?? "2", ...SUITE_ENV },
+  env: { DENO_JOBS: Deno.env.get("DENO_JOBS") ?? "4", ...SUITE_ENV },
   stdout: "inherit",
   stderr: "inherit",
 }).output();
