@@ -14,6 +14,7 @@ import { browserWorld, type DirHandle, type FileHandle } from "../host/browser.t
 import { WORKER_MARKER } from "../host/children.ts";
 import { i32le, readI32le, str, unstr } from "../host/call.ts";
 import { OP } from "../host/ops.ts";
+import { FAULT_DENIED, STAT_BYTES, STAT_FAULT } from "../host/faults.ts";
 
 /**
  * The bytes out of a `Read` payload: tag 0 is data, 1 is the end, 2 is a failure.
@@ -214,7 +215,11 @@ Deno.test("the browser world honours the capabilities a page can honour", async 
   const dstat = await call(OP.STAT, str("a"));
   assertEquals(dstat[0], 1, "the directory exists");
   assertEquals(dstat[2], 1, "and is a directory");
-  assertEquals((await call(OP.STAT, str("absent")))[0], 0, "absent is all zeroes");
+  const absentStat = await call(OP.STAT, str("absent"));
+  assertEquals(absentStat[0], 0, "absent is all zeroes");
+  // And its fault byte is `FAULT_NONE`: absence is an *answer*, so `test -e` and `rm -f` keep working.
+  // If this ever reported a fault, every "does it exist" check in the repo would start failing loudly.
+  assertEquals(absentStat[STAT_FAULT], 0, "absence was reported as a fault");
 
   assertEquals(unstr(await call(OP.READ_DIR, str("a"))), "b");
 
@@ -559,8 +564,13 @@ Deno.test("the browser world denies the filesystem when the page grants none", a
 
   await rejects(() => call(OP.READ_FILE, str("anything")), "filesystem read not granted");
   await rejects(() => call(OP.READ_DIR, str("anything")), "filesystem read not granted");
-  // Not granted reads as "does not exist", the same as under Deno.
-  assertEquals((await call(OP.STAT, str("anything")))[0], 0);
+  // Not granted is *not* "does not exist" any more, here or under Deno: `stat` answers with
+  // `FAULT_DENIED` in its fault byte, because a page that was never given a directory cannot say
+  // whether a file is there and saying "it is not" is a guess. wac-mono 0065.
+  const ungranted = await call(OP.STAT, str("anything"));
+  assertEquals(ungranted[0], 0, "it claimed a file exists in a filesystem it cannot see");
+  assertEquals(ungranted.length, STAT_BYTES, "the reply is too narrow to carry a fault");
+  assertEquals(ungranted[STAT_FAULT], FAULT_DENIED, "an ungranted stat looked like absence");
 
   // A read-only grant still refuses every mutation.
   const ro = browserWorld({ root: memDir() });

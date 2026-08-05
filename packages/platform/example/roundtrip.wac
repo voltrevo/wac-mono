@@ -16,7 +16,7 @@
 // only kind of difference this program cannot show you, since a non-atomic rename looks exactly
 // like an atomic one until two of them race.
 
-import { Change, Cli, Core, FileResult, Stat } from "../src/platform.wac";
+import { Change, Cli, Core, faultWords, FileResult, Stat } from "../src/platform.wac";
 
 export i32 main(Core core, Cli cli) {
   string text = cli.argCount().wait() > 0 ? string.fromBytes(cli.arg(0).wait()) : "round trip";
@@ -38,7 +38,16 @@ export i32 main(Core core, Cli cli) {
   core.log("wrote " + a);
 
   Stat s = cli.stat(a).wait();
-  core.log("stat: exists=" + yn(s.exists) + " isFile=" + yn(s.isFile) + " size=" + itoa(s.size as~ i32));
+  // `stat` can fail to be an answer at all — no read capability, or a name this host cannot express —
+  // and that is a different thing from "there is nothing there". Printing it is the point of the
+  // example: run this built with no grants and the line says so instead of claiming the file vanished
+  // one statement after it was written. wac-mono 0065.
+  if (!s.answered()) {
+    core.log("stat: cannot tell — " + faultWords(s.fault));
+  } else {
+    core.log("stat: exists=" + yn(s.exists) + " isFile=" + yn(s.isFile) + " size="
+      + itoa(s.size as~ i32));
+  }
 
   FileResult back = cli.readFile(a).wait();
   if (!back.ok) {

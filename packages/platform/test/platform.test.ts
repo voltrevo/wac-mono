@@ -304,6 +304,99 @@ Deno.test("the same application builds for Node and agrees with the Deno build",
   }
 });
 
+Deno.test("the two runtimes agree about the whole filesystem, not just reading a file", async () => {
+  // The comparison above uses `wc`, which reads one file and prints three numbers — so `stat`,
+  // `readDir`, `writeFile`, `rename` and `remove` had **no Node coverage at all**, on a host whose
+  // handlers are separate code from Deno's. `stat`'s reply grew a fault byte today (wac-mono 0065) and
+  // nothing here would have noticed if only two of the three hosts had been told.
+  //
+  // `roundtrip` is the example that exercises all of them and prints what each answered, which makes it
+  // an oracle for itself: the two runtimes have to produce the same transcript.
+  const { buildApp } = await import("../build.ts");
+  const ROUNDTRIP = "packages/platform/example/roundtrip.wac";
+  const denoOut = await Deno.makeTempFile({ prefix: "wac-rt-deno-" });
+  const nodeOut = await Deno.makeTempFile({ prefix: "wac-rt-node-" });
+  const denoDir = await Deno.makeTempDir({ prefix: "wac-rt-d-" });
+  const nodeDir = await Deno.makeTempDir({ prefix: "wac-rt-n-" });
+  try {
+    await buildApp(ROUNDTRIP, denoOut, { read: true, write: true }, "deno");
+    await buildApp(ROUNDTRIP, nodeOut, { read: true, write: true }, "node");
+
+    // A directory each: `readDir(".")` prints how many entries it saw, so a shared one would make the
+    // two transcripts differ for a reason that has nothing to do with the hosts.
+    const run = (path: string, cwd: string, cmd?: string) => {
+      const r = new Deno.Command(cmd ?? path, {
+        args: cmd === undefined ? ["hello"] : [path, "hello"],
+        cwd,
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      const dec = new TextDecoder();
+      return { code: r.code, out: dec.decode(r.stdout), err: dec.decode(r.stderr) };
+    };
+
+    const d = run(denoOut, denoDir);
+    const n = run(nodeOut, nodeDir, "node");
+    assertEquals(d.code, 0, d.err);
+    assertEquals(n.code, 0, n.err);
+    assertEquals(n.out, d.out, "the two runtimes told different stories about the same operations");
+    // And the transcript is the one the program describes, rather than an empty run that agrees
+    // vacuously — the failure this comparison could most easily hide.
+    for (const line of ["wrote roundtrip.txt", "stat: exists=yes isFile=yes size=5", "read: hello",
+                        "same bytes back", "rename:", "removed,"]) {
+      assertEquals(d.out.includes(line), true, `missing ${JSON.stringify(line)} in:\n${d.out}`);
+    }
+  } finally {
+    for (const p of [denoOut, nodeOut]) await Deno.remove(p);
+    for (const p of [denoDir, nodeDir]) await Deno.remove(p, { recursive: true });
+  }
+});
+
+Deno.test("and they agree about a `stat` neither of them is allowed to take", async () => {
+  // The other half of the fault field: a world with no read capability answers `FAULT_DENIED`, not
+  // "does not exist". Both hosts have to say it, and this is a case where being wrong is invisible —
+  // an ungranted program that claims a file is absent looks exactly like one whose file is absent.
+  //
+  // **Write but not read**, which is a strange grant to hold and the only one that reaches the line
+  // this test is about. With nothing granted the program dies at its first `writeFile` and never
+  // stats at all — which is how the first version of this test passed while checking the *write*
+  // denial and claiming to check the stat.
+  const { buildApp } = await import("../build.ts");
+  const ROUNDTRIP = "packages/platform/example/roundtrip.wac";
+  const denoOut = await Deno.makeTempFile({ prefix: "wac-rtd-deno-" });
+  const nodeOut = await Deno.makeTempFile({ prefix: "wac-rtd-node-" });
+  const dir = await Deno.makeTempDir({ prefix: "wac-rtd-" });
+  try {
+    await buildApp(ROUNDTRIP, denoOut, { write: true }, "deno");
+    await buildApp(ROUNDTRIP, nodeOut, { write: true }, "node");
+    const run = (path: string, cmd?: string) => {
+      const r = new Deno.Command(cmd ?? path, {
+        args: cmd === undefined ? ["hello"] : [path, "hello"],
+        cwd: dir,
+        stdout: "piped",
+        stderr: "piped",
+      }).outputSync();
+      const dec = new TextDecoder();
+      return { code: r.code, out: dec.decode(r.stdout), err: dec.decode(r.stderr) };
+    };
+    const d = run(denoOut);
+    const n = run(nodeOut, "node");
+    assertEquals(n.out, d.out, `Deno said ${JSON.stringify(d.out)}, Node said ${JSON.stringify(n.out)}`);
+    assertEquals(n.code, d.code, `exit ${d.code} against ${n.code}`);
+    assertEquals(
+      d.out.includes("stat: cannot tell — Permission denied"),
+      true,
+      `the denied stat was not reported as denied:\n${d.out}\n${d.err}`,
+    );
+    // It got that far, which is what makes the line above a statement about `stat` rather than about
+    // whichever capability happened to fail first.
+    assertEquals(d.out.includes("wrote roundtrip.txt"), true, d.out);
+  } finally {
+    for (const p of [denoOut, nodeOut]) await Deno.remove(p);
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 // ── Filters: stdin, byte output, stat, readDir ────────────────────────────────
 
 const HEXDUMP = "packages/platform/example/hexdump.wac";

@@ -322,6 +322,13 @@ takes a `Buffer` and could do it, which is why the fault category exists rather 
 `FAULT_NOT_REPRESENTABLE` is a fact about the host, and a host that can express the name will not raise it.
 wac-mono 0065.
 
+**`test` refuses rather than answering, and this is a deliberate divergence from bash.** `test -e` on such
+a name exits **2 with a diagnostic** instead of the `1` bash would give, because bash's `1` is the truth
+there — bash looked and the file is absent — while ours would be a guess about a file we know is present
+and cannot examine. A script acts on `false`; it stops on a 2. The same reasoning gives `ls` the sentence
+`cannot access 'x': cannot be named on this host` where a genuinely missing operand still gets GNU's
+`No such file or directory`, exactly.
+
 **Only `read` consumes standard input.** It advances a cursor the whole command shares, which is
 what makes `while read line` terminate rather than see the first line for ever. The external
 programs are handed whatever is left but are *not* charged for it, because nothing here knows

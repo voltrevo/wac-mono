@@ -181,6 +181,15 @@ failed write is not. That one is a companion on purpose rather than by inertia.
 Both questions are real — `find` wants the first, `tar` wants the second — and a flag would have made
 every caller decide something most of them do not care about.
 
+`Stat` carries a **fault**, and the split is narrow on purpose: *absence is an answer*, so a path with
+nothing at it gives `exists = false` with `FAULT_NONE`, and so does a path through a file — bash calls
+`test -e f/g` false rather than an error, and every "does it exist" check in the tree depends on that
+staying ordinary. A fault means the question could not be *reached*: `FAULT_DENIED` where the world has
+no read capability, and `FAULT_NOT_REPRESENTABLE` for a name the host cannot express. Before it, both
+arrived as `exists = false` — a program with no read grant was told a file was not there, which it had no
+way to tell from a file it was not allowed to look at. Callers read `st.answered()` before trusting
+`exists`, and `faultWords(fault)` turns the category into the words the real tools use. wac-mono 0065.
+
 `pushChild` and `popChild` need no grant because they add no authority: they change what `arg`,
 `readChunk`, `write`, `log`, `warn` and every path mean *for the program itself*, between two
 calls it makes. A shell uses them to run a program and keep its output — see
