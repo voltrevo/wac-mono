@@ -55,3 +55,45 @@ The bug is entirely the decode.
 Same shape as the fault-category work in
 [0062](../closed/0062-a-read-failure-has-no-fault-category-so-nine-programs-print-the-hosts-wording.md):
 both ends were fine and the host's hop was where the information went missing.
+
+## It is not the wire format, 2026-08-05 (agent-a)
+
+The notes above blamed `children.ts`'s `TextDecoder`. That is one of three lossy hops, and fixing it
+alone would change nothing. Measured while closing
+[0066](../closed/0066-a-spawned-child-does-not-get-what-the-shell-has-left-of-its-input.md):
+
+1. **wac to JS**, in the compiler's own glue. `wacBindgen.ts` emits
+   `_stringFromWasm`, which is `new TextDecoder().decode(bytes)` — so a wac string containing
+   `\xff` is already two replacement characters *before* it reaches `provider.ts`.
+2. **The wire format**, as the notes said: `str`/`unstr` in `host/call.ts` are `TextEncoder`/
+   `TextDecoder`, and `children.ts` decodes the NUL-joined block the same way.
+3. **JS back to wac**: `_stringToWasm` is `new TextEncoder().encode(s)`, which cannot emit a lone
+   surrogate, so the child's `arg` reply is normalised again on the way in.
+
+So every `string` crossing the capability boundary is UTF-8-normalised in both directions, and this is
+not about `spawn` at all — it is about what a `string` *means* at that boundary. A path, an environment
+value and an argument are all bytes on the systems this targets.
+
+Two ways to fix it, and the second is the smaller diff at the call sites:
+
+**(A) Make the boundary byte-exact in the compiler.** Replace the `TextDecoder`/`TextEncoder` pair in
+`wacBindgen.ts` with a surrogate-escape codec: invalid bytes decode to lone surrogates `U+DC80..DCFF`
+and encode back to the same bytes, which is what Python's `surrogateescape` does and what a filesystem
+API in a garbage-collected language usually ends up doing. Valid text is untouched, so every host that
+treats one of these strings as text keeps working. wac's own `string.fromCodepoint` traps on a lone
+surrogate, so the escaped form never exists *inside* wac — only in the JS half, which is where the
+bytes need somewhere to live. Roughly forty lines of codec plus tests in `../wac`, and it fixes paths and
+environment values at the same time.
+
+**(B) Make the capabilities carry bytes.** `spawn(string source, u8[][] args, …)`, and `arg` answering
+`Pending<u8[]>` with a wac-side `argText` helper for the callers that want text. No compiler change, but
+`cli.arg(…)` has about fifty call sites across eight packages.
+
+(A) is the one to do: the loss is at the boundary, not in the signature, and (B) leaves paths and `env`
+lossy while making every applet spell out a conversion. It does mean a change in the compiler that every
+package depends on, so it wants its own tick and wac's own suite green first.
+
+Note also what is *not* broken: in-process argv is exact, because the bytes never leave wac —
+`printf '\xff' | cat` and `cat $(printf '\xff\xfe')` are right today with the shell's programs called
+rather than spawned. The Deno host cannot receive non-UTF-8 argv from the operating system at all
+(`Deno.args` is already normalised), so this is about arguments a wac *parent* constructs.
