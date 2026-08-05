@@ -9,11 +9,9 @@ record of what has been fixed and why.
 | [0079](open/0079-no-test-compiles-a-program-so-an-edit-to-a-shared-function-breaks-them-silently.md) | no test compiles a program, so an edit to a shared function breaks them silently | diagnostic | compile error |
 | [0076](open/0076-an-app-worker-runs-main-once-so-a-test-pays-a-fresh-one-per-case.md) | an app worker runs `main` once, so a test pays a fresh one per case | performance | not implemented |
 | [0073](open/0073-a-killed-test-run-leaves-its-sshd-behind-and-thirty-were-running.md) | a killed test run leaves its `sshd` behind, and thirty were running | bug | wrong answer |
-| [0070](open/0070-a-redirection-collects-a-childs-whole-output-before-writing-the-file.md) | a redirection collects a child's whole output before writing the file | bug | trap |
 | [0067](open/0067-no-filesystem-of-our-own-so-a-session-cannot-be-sealed-off-from-the-host.md) | no filesystem of our own, so a session cannot be sealed off from the host — [design/0001](../design/0001-a-self-contained-system.md) step 1 | missing feature | not implemented |
 | [0065](open/0065-a-spawned-programs-arguments-are-not-byte-exact.md) | a spawned program's arguments are not byte-exact | bug | wrong answer |
 | [0066](open/0066-the-light-client-is-minimal-config-only-and-has-never-seen-a-real-chain.md) | the light client is minimal-config only and has never seen a real chain | missing feature | not implemented |
-| [0069](open/0069-tests-hand-out-ports-by-binding-and-releasing-them.md) | tests hand out ports by binding one and releasing it, which is a race | bug | flake |
 | [0035](open/0035-crypto-hot-paths-hold-state-in-gc-arrays-rather-than-locals.md) | crypto hot paths hold state in GC arrays rather than locals (measured: −64% on one function) | performance | wrong answer |
 | [0034](open/0034-sha256s-one-shot-path-copies-the-whole-message-with-a-scalar-loop.md) | `sha256`'s one-shot path copies the whole message with a scalar loop | performance | wrong answer |
 | [0031](open/0031-a-mutation-sweep-starves-every-other-agent-on-this-machine.md) | a mutation sweep starves every other agent on this machine | performance | wrong answer |

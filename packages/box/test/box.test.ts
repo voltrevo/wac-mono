@@ -14,6 +14,7 @@ import { appRunner } from "../../../harness/appRun.ts";
 // whoever held the file, if anyone did. wac-mono 0074.
 import "../../../harness/spawnRetry.ts";
 import { readUntil } from "../../../harness/deadline.ts";
+import { freePort } from "../../../harness/port.ts";  // one allocator, pid-partitioned — wac-mono 0069
 
 const BOX = "packages/box/src/box.wac";
 
@@ -1101,12 +1102,7 @@ Deno.test("line-oriented applets stream too, and stay faithful at the edges", as
  * A fixed number would collide with whatever else is on the machine, and these tests run
  * in parallel with each other.
  */
-function freePort(): number {
-  const l = Deno.listen({ port: 0 });
-  const n = (l.addr as Deno.NetAddr).port;
-  l.close();
-  return n;
-}
+
 
 /**
  * Wait until the server says it is listening, by reading the line it prints.

@@ -9,6 +9,7 @@
 // A second implementation of my own misconceptions would agree with itself. OpenSSH does not.
 
 import { haveSshd } from "./server.ts";
+import { holdPort } from "../../../harness/port.ts";  // one allocator — wac-mono 0069
 
 /**
  * Every binary this file builds, removed on the way out.
@@ -31,12 +32,7 @@ globalThis.addEventListener("unload", () => {
 
 const text = (b: Uint8Array) => new TextDecoder().decode(b);
 
-function freePort(): number {
-  const l = Deno.listen({ hostname: "127.0.0.1", port: 0 });
-  const port = (l.addr as Deno.NetAddr).port;
-  l.close();
-  return port;
-}
+
 
 type Wacsshd = { dir: string; port: number; proc: Deno.ChildProcess; stderr: Promise<string> };
 
@@ -89,7 +85,9 @@ async function startWacsshd(): Promise<Wacsshd> {
   }
   await Deno.copyFile(`${dir}/clientkey.pub`, `${dir}/.ssh/authorized_keys`);
 
-  const port = freePort();
+  const held = holdPort();
+  const port = held.port;
+  held.release();   // the next statement binds it
   const proc = new Deno.Command(wacsshdBinary, {
     args: ["-p", String(port)],
     env: { HOME: dir },

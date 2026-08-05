@@ -1,3 +1,5 @@
+import { freePort, holdPort } from "../../../harness/port.ts";  // one allocator — wac-mono 0069
+export { freePort };  // its importers use it too
 // A local sshd, for the tests that need a real server to talk to.
 //
 // Its own module rather than a helper inside one test file, because both the protocol tests and
@@ -14,12 +16,7 @@ const haveSshd = await (async () => {
 export { haveSshd };
 
 /** A port nothing is listening on. Racy in principle; the window is microseconds. */
-export function freePort(): number {
-  const l = Deno.listen({ hostname: "127.0.0.1", port: 0 });
-  const port = (l.addr as Deno.NetAddr).port;
-  l.close();
-  return port;
-}
+
 
 /** Everything a test needs from a running sshd, so the setup is written once. */
 export type Server = { dir: string; port: number; sshd: Deno.ChildProcess; conn: Deno.TcpConn };
@@ -32,7 +29,12 @@ export type Server = { dir: string; port: number; sshd: Deno.ChildProcess; conn:
  */
 export async function startServer(): Promise<Server> {
   const dir = await Deno.makeTempDir();
-  const port = freePort();
+  // **Held, not merely chosen.** Two `ssh-keygen` runs and a config write happen between here and
+  // sshd's bind — hundreds of milliseconds during which the old `freePort` had already let the port go.
+  // The listener stays open until immediately before the spawn, so nothing on the machine can take it in
+  // the meantime. wac-mono 0069.
+  const held = holdPort();
+  const port = held.port;
   for (const name of ["hostkey", "clientkey"]) {
     const r = await new Deno.Command("ssh-keygen", {
       args: ["-t", "ed25519", "-f", `${dir}/${name}`, "-N", "", "-q"],
@@ -53,6 +55,9 @@ export async function startServer(): Promise<Server> {
     "KbdInteractiveAuthentication no",
     "PidFile none",
   ].join("\n"));
+
+  // Released here and nowhere earlier: the next statement is the bind.
+  held.release();
 
   // Foreground, so killing the child actually stops the server.
   const sshd = new Deno.Command("/usr/sbin/sshd", {
