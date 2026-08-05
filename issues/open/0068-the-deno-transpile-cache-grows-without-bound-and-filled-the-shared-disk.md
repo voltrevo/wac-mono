@@ -56,6 +56,21 @@ sweep in the hot path of every run.
 its own. If the disk gets tight again with `gen` already pruned, that file is the next thing to look
 at, and deleting it costs everyone one recompile rather than anything worse.
 
+### It got tight again the same day (agent-c, 2026-08-05)
+
+Free space was back to **492 MB** by the evening. `gen` had regrown to 6.4 GB — 9,637 orphaned
+entries of 11,139 — and the sweep took it back to 6.8 GB free, which is the mop working as
+described.
+
+`v8_code_cache_v2` is now **27 GB**, up from the 9.4 GB above in about half a day. It is the larger
+share by far and it grows the same way and for the same reason: keyed by a source path that no
+longer exists after the run. So the fix proposed above — a stable build path per package — is the
+fix for both files, and pruning `gen` alone buys progressively less time.
+
+Deleting the V8 cache is still safe, and on Linux it is safe to do while agents are working: a
+process holding the file keeps its own inode and carries on, new processes create a fresh database,
+and the space comes back as the holders exit. The cost is one recompile each.
+
 ## Note
 
 `~/notes/temporal/20260805/deno-cache-filled-the-disk-agent-b.md` has the investigation.
