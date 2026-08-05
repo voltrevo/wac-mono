@@ -23,18 +23,18 @@ export i32 shellMain(Core core, Cli cli, Shell sh, i32 first) {
   string src = "";
 
   i32 n = cli.argCount().wait() - first;
-  if (n >= 1 && cli.arg(first).wait() == "-c") {
+  if (n >= 1 && string.fromBytes(cli.arg(first).wait()) == "-c") {
     if (n < 2) {
       core.warn("sh: -c needs a script");
       return 2;
     }
     // Everything after `-c` joined with spaces, as `sh -c` does: the shell re-splits it anyway.
-    src = cli.arg(first + 1).wait();
-    for (i32 i = first + 2; i < first + n; i++) { src = src + " " + cli.arg(i).wait(); }
+    src = string.fromBytes(cli.arg(first + 1).wait());
+    for (i32 i = first + 2; i < first + n; i++) { src = src + " " + string.fromBytes(cli.arg(i).wait()); }
   } else if (n >= 1) {
-    FileResult f = cli.readFile(cli.arg(first).wait()).wait();
+    FileResult f = cli.readFile(string.fromBytes(cli.arg(first).wait())).wait();
     if (!f.ok) {
-      core.warn("sh: " + cli.arg(first).wait() + ": " + f.error);
+      core.warn("sh: " + string.fromBytes(cli.arg(first).wait()) + ": " + f.error);
       return 127;
     }
     src = string.fromBytes(f.bytes);

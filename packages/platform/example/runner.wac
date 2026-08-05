@@ -23,24 +23,24 @@ export i32 main(Core core, Cli cli) {
 
   // Two steps rather than one: read the program, then run it. There is no registry of
   // launchable things — where the code came from is the filesystem's business.
-  FileResult prog = cli.readFile(cli.arg(0).wait()).wait();
+  FileResult prog = cli.readFile(string.fromBytes(cli.arg(0).wait())).wait();
   if (!prog.ok) {
-    core.warn("runner: " + cli.arg(0).wait() + ": " + prog.error);
+    core.warn("runner: " + string.fromBytes(cli.arg(0).wait()) + ": " + prog.error);
     return 1;
   }
 
   // A third argument names what the child may do: `read`, `write`, `net`, `env`, joined by
   // commas, and nothing by default. The host will not exceed this program's own grants whatever
   // is asked for, which is the property `test/spawn.test.ts` measures rather than asserts.
-  i32 grants = cli.argCount().wait() > 2 ? grantsOf(cli.arg(2).wait()) : GRANT_NONE;
-  Child kid = cli.spawn(string.fromBytes(prog.bytes), string[](), grants, "", false).wait();
+  i32 grants = cli.argCount().wait() > 2 ? grantsOf(string.fromBytes(cli.arg(2).wait())) : GRANT_NONE;
+  Child kid = cli.spawn(string.fromBytes(prog.bytes), u8[][](), grants, "", false).wait();
   if (kid.handle < 0) {
     core.warn("runner: " + kid.error);
     return 1;
   }
 
   // Its standard input, then end it — a child reading to EOF gets one.
-  cli.send(kid.handle, (cli.arg(1).wait() + "\n").toBytes()).wait();
+  cli.send(kid.handle, (string.fromBytes(cli.arg(1).wait()) + "\n").toBytes()).wait();
   cli.closeFeed(kid.handle);
 
   // Everything it wrote, until it stops writing.

@@ -487,7 +487,8 @@ struct Options {
 }
 
 Options parseArgs(Core core, Cli cli) {
-  string? home = cli.env("HOME").wait();
+  u8[]? homeRaw = cli.env("HOME").wait();
+  string? home = homeRaw is null ? null : string.fromBytes(homeRaw!);
   string homeDir = (home is null) ? "" : home!;
 
   i32 port = defaultPort();
@@ -498,20 +499,20 @@ Options parseArgs(Core core, Cli cli) {
   i32 i = 0;
   i32 n = cli.argCount().wait();
   while (i < n) {
-    string a = cli.arg(i).wait();
+    string a = string.fromBytes(cli.arg(i).wait());
     if (a == "-p" && i + 1 < n) {
       i++;
-      port = atoi(cli.arg(i).wait());
+      port = atoi(string.fromBytes(cli.arg(i).wait()));
       if (port <= 0 || port > 65535) {
-        core.warn("sshd: bad port: " + cli.arg(i).wait());
+        core.warn("sshd: bad port: " + string.fromBytes(cli.arg(i).wait()));
         return Options(0, "", "", false, 2);
       }
     } else if (a == "-h" && i + 1 < n) {
       i++;
-      hostKey = cli.arg(i).wait();
+      hostKey = string.fromBytes(cli.arg(i).wait());
     } else if (a == "-a" && i + 1 < n) {
       i++;
-      authorizedKeys = cli.arg(i).wait();
+      authorizedKeys = string.fromBytes(cli.arg(i).wait());
     } else if (a == "-1") {
       once = true;
     } else {

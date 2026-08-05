@@ -22,14 +22,14 @@ export i32 seq(Core core, Cli cli, Args a) {
   // `seq` has no flags of its own to lose by skipping it.
   // `--` ends the options, as it does in GNU's. Without this it reached `atoi` as a number, which
   // is zero, and `seq -- -5 -1` printed a stray 0 before the range.
-  i32 skip = cli.argCount().wait() > 1 && cli.arg(1).wait() == "--" ? 2 : 1;
+  i32 skip = cli.argCount().wait() > 1 && string.fromBytes(cli.arg(1).wait()) == "--" ? 2 : 1;
   i32 n = cli.argCount().wait() - skip;
   if (n < 1 || n > 3) {
     core.warn("usage: " + a.name + " [first [step]] last");
     return 2;
   }
   string[] args = string[n](fill: "");
-  for (i32 i = 0; i < n; i++) { args[i] = cli.arg(i + skip).wait(); }
+  for (i32 i = 0; i < n; i++) { args[i] = string.fromBytes(cli.arg(i + skip).wait()); }
 
   i32 first = n == 1 ? 1 : atoi(args[0]);
   i32 step = n == 3 ? atoi(args[1]) : 1;

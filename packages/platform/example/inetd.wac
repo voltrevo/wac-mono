@@ -23,6 +23,7 @@
 // what it hands over is the `GRANT_NONE` below, which is where to change that.
 
 import { Child, Cli, Core, FileResult, GRANT_NONE, Pending, Socket } from "../src/platform.wac";
+import { argvOf } from "../src/stream.wac";
 import { Read } from "../../bytes/src/read.wac";
 
 export i32 main(Core core, Cli cli) {
@@ -30,8 +31,8 @@ export i32 main(Core core, Cli cli) {
     core.warn("usage: inetd <port> <worker.js> [args...]");
     return 2;
   }
-  i32 port = atoi(cli.arg(0).wait());
-  string workerPath = cli.arg(1).wait();
+  i32 port = atoi(string.fromBytes(cli.arg(0).wait()));
+  string workerPath = string.fromBytes(cli.arg(1).wait());
 
   FileResult prog = cli.readFile(workerPath).wait();
   if (!prog.ok) {
@@ -43,7 +44,7 @@ export i32 main(Core core, Cli cli) {
   // Everything after the worker path is the handler's own argv.
   i32 extra = cli.argCount().wait() - 2;
   string[] childArgs = string[extra < 0 ? 0 : extra](fill: "");
-  for (i32 i = 0; i < extra; i++) { childArgs[i] = cli.arg(i + 2).wait(); }
+  for (i32 i = 0; i < extra; i++) { childArgs[i] = string.fromBytes(cli.arg(i + 2).wait()); }
 
   // Loopback: an example that runs a program for whoever connects should not be reachable from
   // anywhere else while somebody is reading it. Issue 0025.
@@ -67,7 +68,7 @@ export i32 main(Core core, Cli cli) {
   // Nothing granted: the handler gets the socket's bytes and no other authority. Passing
   // GRANT_READ here is what would make this an `inetd` that can serve a shell with one
   // readable directory, and is the parent's decision to make rather than the handler's.
-  Child kid = cli.spawn(source, childArgs, GRANT_NONE, "", false).wait();
+  Child kid = cli.spawn(source, argvOf(childArgs), GRANT_NONE, "", false).wait();
   if (kid.handle < 0) {
     core.warn("inetd: " + kid.error);
     cli.closeSocket(c.handle);

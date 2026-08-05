@@ -470,18 +470,28 @@ function spawnPayload(
   inheritIn = false,
 ): Uint8Array {
   const src = str(source);
-  const rest = str(args.join("\u0000"));
   const dir = str(cwd);
-  const out = new Uint8Array(17 + src.length + rest.length + dir.length);
+  // The argument vector: a count, then each argument length-prefixed. It used to be one NUL-joined blob
+  // of text, which is why a non-UTF-8 argument could not survive a spawn — wac-mono 0065.
+  const argv = args.map((a) => str(a));
+  let argvLen = 4;
+  for (const a of argv) argvLen += 4 + a.length;
+  const out = new Uint8Array(13 + src.length + argvLen + dir.length);
   out.set(i32le(grants), 0);
   out.set(i32le(src.length), 4);
   out.set(src, 8);
-  out.set(i32le(rest.length), 8 + src.length);
-  out.set(rest, 12 + src.length);
-  out.set(i32le(dir.length), 12 + src.length + rest.length);
-  out.set(dir, 16 + src.length + rest.length);
+  let at = 8 + src.length;
+  out.set(i32le(argv.length), at);
+  at += 4;
+  for (const a of argv) {
+    out.set(i32le(a.length), at);
+    out.set(a, at + 4);
+    at += 4 + a.length;
+  }
+  out.set(i32le(dir.length), at);
+  out.set(dir, at + 4);
   // One byte: whether the child reads the page's own standard input rather than a queue. Issue 0042.
-  out[16 + src.length + rest.length + dir.length] = inheritIn ? 1 : 0;
+  out[at + 4 + dir.length] = inheritIn ? 1 : 0;
   return out;
 }
 

@@ -11,8 +11,8 @@ export i32 main(Core core, Cli cli) {
     return 2;
   }
 
-  Pending<FileResult> a = cli.readFile(cli.arg(0).wait());
-  Pending<FileResult> b = cli.readFile(cli.arg(1).wait());
+  Pending<FileResult> a = cli.readFile(string.fromBytes(cli.arg(0).wait()));
+  Pending<FileResult> b = cli.readFile(string.fromBytes(cli.arg(1).wait()));
 
   // Nothing has been waited for yet. Both reads are in the host's hands.
   core.log(a.isDone() || b.isDone() ? "one finished already" : "both still running");

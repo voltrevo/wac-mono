@@ -43,7 +43,8 @@ export i32 main(Core core, Cli cli) {
     core.warn("ssh: " + o.identity + ": " + keyFile.error);
     return 1;
   }
-  string? passphrase = cli.env("SSH_PASSPHRASE").wait();
+  u8[]? passphraseRaw = cli.env("SSH_PASSPHRASE").wait();
+  string? passphrase = passphraseRaw is null ? null : string.fromBytes(passphraseRaw!);
   u8[] pass = (passphrase is null) ? u8[0]() : passphrase!.toBytes();
   PrivateKey key = readEd25519(keyFile.bytes, pass);
   match (key.error) {
@@ -176,7 +177,8 @@ struct Options {
 Options bad(i32 code) { return Options("", "", 0, "", "", "", false, code); }
 
 Options parseArgs(Core core, Cli cli) {
-  string? home = cli.env("HOME").wait();
+  u8[]? homeRaw = cli.env("HOME").wait();
+  string? home = homeRaw is null ? null : string.fromBytes(homeRaw!);
   string homeDir = (home is null) ? "" : home!;
 
   i32 port = defaultPort();
@@ -188,17 +190,17 @@ Options parseArgs(Core core, Cli cli) {
   i32 i = 0;
   i32 n = cli.argCount().wait();
   while (i < n) {
-    string a = cli.arg(i).wait();
+    string a = string.fromBytes(cli.arg(i).wait());
     if (a == "-p" && i + 1 < n) {
       i++;
-      port = atoi(cli.arg(i).wait());
+      port = atoi(string.fromBytes(cli.arg(i).wait()));
       if (port <= 0 || port > 65535) {
-        core.warn("ssh: bad port: " + cli.arg(i).wait());
+        core.warn("ssh: bad port: " + string.fromBytes(cli.arg(i).wait()));
         return bad(2);
       }
     } else if (a == "-i" && i + 1 < n) {
       i++;
-      identity = cli.arg(i).wait();
+      identity = string.fromBytes(cli.arg(i).wait());
     } else if (a == "-k") {
       addHost = true;
     } else if (target == "") {
@@ -223,7 +225,8 @@ Options parseArgs(Core core, Cli cli) {
     user = target.slice(0, at);
     host = target.slice(at + 1, target.len());
   } else {
-    string? envUser = cli.env("USER").wait();
+    u8[]? envUserRaw = cli.env("USER").wait();
+  string? envUser = envUserRaw is null ? null : string.fromBytes(envUserRaw!);
     user = (envUser is null) ? "" : envUser!;
   }
   if (user == "") {

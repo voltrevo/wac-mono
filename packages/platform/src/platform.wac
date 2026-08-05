@@ -576,9 +576,27 @@ export struct Child {
 
 export struct Cli {
   fn[Pending<i32>()] argCount;
-  fn[Pending<string>(i32)] arg;
-  /** Null when the variable is unset, which is not the same as empty. */
-  fn[Pending<string?>(string)] env;
+  /**
+   * One argument, **as bytes**.
+   *
+   * Not a `string`, and that is the whole of wac-mono 0065. An argument is bytes on every system this
+   * targets, and a capability that called it text forced a conversion at the boundary — `TextDecoder`
+   * one way, `TextEncoder` the other — so a name that is not valid UTF-8 came back as replacement
+   * characters. It was silent: `cat $(printf '\xff\xfe')` named a file nobody had asked about, and a
+   * program using the argument as a path would have opened the wrong one.
+   *
+   * A caller that wants text says so: `string.fromBytes(cli.arg(0).wait())`. That is one call longer and
+   * it is honest about where the interpretation happens — the alternative was a clever codec smuggling
+   * bytes through a type that should not have been there.
+   */
+  fn[Pending<u8[]>(i32)] arg;
+  /**
+   * One environment value, as bytes. Null when the variable is unset, which is not the same as empty.
+   *
+   * Bytes for the same reason as `arg`: an environment value is not text on any system here, and this is
+   * how a path in `$HOME` or `$WACPATH` survives being one.
+   */
+  fn[Pending<u8[]?>(string)] env;
 
   /** All of standard input, to the end. Empty when there is none. */
   fn[Pending<u8[]>()] readStdin;
@@ -833,7 +851,7 @@ export struct Cli {
    * False is the ordinary case: a child fed from a pipeline, a redirection or a here-document gets
    * exactly the bytes its parent chose, and `send` is how they arrive.
    */
-  fn[Pending<Child>(string, string[], i32, string, bool)] spawn;
+  fn[Pending<Child>(string, u8[][], i32, string, bool)] spawn;
 
   /**
    * **This same program again, as a child**, with these arguments and at most these grants.
@@ -859,7 +877,7 @@ export struct Cli {
    * hands over this program's own standard input rather than a queue — see `spawn` above for what
    * that buys.
    */
-  fn[Pending<Child>(string[], i32, string, bool)] spawnSelf;
+  fn[Pending<Child>(u8[][], i32, string, bool)] spawnSelf;
 
   /**
    * End a spawned worker's standard input without stopping it.
@@ -930,8 +948,8 @@ export struct Cli {
 
   Cli of(
     fn[Pending<i32>()] argCount,
-    fn[Pending<string>(i32)] arg,
-    fn[Pending<string?>(string)] env,
+    fn[Pending<u8[]>(i32)] arg,
+    fn[Pending<u8[]?>(string)] env,
     fn[Pending<u8[]>()] readStdin,
     fn[bool(u8[])] write,
     fn[bool(u8[])] writeErr,
@@ -953,8 +971,8 @@ export struct Cli {
     fn[Pending<Read>(i32)] recv,
     fn[Pending<bool>(i32, u8[])] send,
     fn[void(i32)] closeSocket,
-    fn[Pending<Child>(string, string[], i32, string, bool)] spawn,
-    fn[Pending<Child>(string[], i32, string, bool)] spawnSelf,
+    fn[Pending<Child>(string, u8[][], i32, string, bool)] spawn,
+    fn[Pending<Child>(u8[][], i32, string, bool)] spawnSelf,
     fn[void(i32)] closeFeed,
     fn[Pending<i32>(i32)] exitCode,
     fn[Pending<string>()] cwd,

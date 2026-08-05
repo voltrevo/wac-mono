@@ -87,7 +87,7 @@ import { zstd } from "./applets/zstd.wac";
 
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 1) { return usage(core); }
-  string applet = cli.arg(0).wait();
+  string applet = string.fromBytes(cli.arg(0).wait());
   i32 code = dispatch(core, cli, parseArgs(cli), applet);
   if (code != UNKNOWN) { return code; }
 

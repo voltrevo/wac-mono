@@ -324,8 +324,11 @@ export struct Shell {
     if (v.isNone()) {
       // A variable the shell has not set falls back to the environment, which is what makes
       // `echo $HOME` work without an assignment.
-      string? env = this.cli.env(name).wait();
-      return (env is null) ? "" : env!;
+      // Bytes, because an environment value is not text — wac-mono 0065. The shell wants text here and
+      // says so; a value that is not valid UTF-8 keeps its bytes either way, since a wac string *is*
+      // bytes.
+      u8[]? env = this.cli.env(name).wait();
+      return (env is null) ? "" : string.fromBytes(env!);
     }
     return v.unwrap();
   }
@@ -471,8 +474,8 @@ void streamPipeline(Shell sh, Pipeline pipeline) {
       sh.status = 1;
       return;
     }
-    string[] args = string[argv.len()](fill: "");
-    for (i32 a = 0; a < argv.len(); a++) { args[a] = argv.get(a); }
+    u8[][] args = u8[][argv.len()](fill: u8[0]());
+    for (i32 a = 0; a < argv.len(); a++) { args[a] = argv.get(a).toBytes(); }
     // The first stage could inherit the shell's input, and deliberately does not: this loop `send`s
     // to every stage, including the first, and a stage reading the real descriptor *as well* would
     // race the shell for the same bytes. Feeding it is what makes the pipeline one shape.
@@ -482,7 +485,7 @@ void streamPipeline(Shell sh, Pipeline pipeline) {
       // Whatever started before this must not be left running: they would write into nothing and
       // their workers would outlive the script.
       stopAll(sh, outH, errH, n);
-      sh.err(("sh: " + args[0] + ": " + kid.error + "\n").toBytes());
+      sh.err(("sh: " + string.fromBytes(args[0]) + ": " + kid.error + "\n").toBytes());
       sh.status = 126;
       return;
     }
@@ -1400,8 +1403,10 @@ Output trySpawn(Shell sh, Vec<string> argv, bool mayInherit) {
   FileResult prog = sh.cli.readFile(sh.resolve(where)).wait();
   if (!prog.ok) { return Output.missing(); }
 
-  string[] args = string[argv.len() - 1](fill: "");
-  for (i32 i = 1; i < argv.len(); i++) { args[i - 1] = argv.get(i); }
+  // Bytes, which is what an argument is: the child receives exactly what the shell parsed, with nothing
+  // normalised on the way through. wac-mono 0065.
+  u8[][] args = u8[][argv.len() - 1](fill: u8[0]());
+  for (i32 i = 1; i < argv.len(); i++) { args[i - 1] = argv.get(i).toBytes(); }
 
   // **Everything this shell has**, which the host narrows to what it actually holds. `GRANT_NONE` was
   // here instead, and it was never a decision — it was the value the argument had when `spawn` grew
@@ -1518,8 +1523,8 @@ Output trySelf(Shell sh, Vec<string> argv, bool mayInherit) {
   }
   if (!ours) { return Output.missing(); }
 
-  string[] args = string[argv.len()](fill: "");
-  for (i32 i = 0; i < argv.len(); i++) { args[i] = argv.get(i); }
+  u8[][] args = u8[][argv.len()](fill: u8[0]());
+  for (i32 i = 0; i < argv.len(); i++) { args[i] = argv.get(i).toBytes(); }
 
   // Everything this shell has, which the host narrows to what it actually holds. An applet run in
   // process had the shell's whole authority implicitly; asking for it explicitly is the same

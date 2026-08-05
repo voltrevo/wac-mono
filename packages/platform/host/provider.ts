@@ -55,6 +55,7 @@ export type PendingClasses = {
   Pending$i64: PendingClass;
   Pending$string: PendingClass;
   Pending$stringOpt: PendingClass;
+  Pending$u8ArrOpt: PendingClass;
   Pending$u8Arr: PendingClass;
   Pending$bool: PendingClass;
   Pending$stringArrOpt: PendingClass;
@@ -219,6 +220,11 @@ export function cliOf(
     // different and a bare empty payload cannot say which this is.
     return out[0] === 1 ? unstr(out.subarray(1)) : null;
   };
+  /** The same, as bytes: an environment value is not text, any more than an argument is. */
+  const maybeBytes = (id: number) => {
+    const out = collect(b, unpack(id));
+    return out[0] === 1 ? out.slice(1) : null;
+  };
   const child = (id: number) => {
     try {
       // A handle, then — when the handle is negative — why it never started. The host waits for the
@@ -301,6 +307,7 @@ export function cliOf(
     text: (t: Ticket) => cls.Pending$string.of(pack(t), text, settled, drop),
     outcome: (t: Ticket) => cls.Pending$string.of(pack(t), outcome, settled, drop),
     maybeText: (t: Ticket) => cls.Pending$stringOpt.of(pack(t), maybeText, settled, drop),
+    maybeBytes: (t: Ticket) => cls.Pending$u8ArrOpt.of(pack(t), maybeBytes, settled, drop),
     bytes: (t: Ticket) => cls.Pending$u8Arr.of(pack(t), bytes, settled, drop),
     chunk: (t: Ticket) => cls.Pending$u8Arr.of(pack(t), chunk, settled, drop),
     ok: (t: Ticket) => cls.Pending$bool.of(pack(t), ok, settled, drop),
@@ -349,13 +356,34 @@ export function cliOf(
     return out;
   };
 
+  /**
+   * An argument vector: a count, then each argument length-prefixed.
+   *
+   * `children.ts`'s `unpackArgs` reads it. Bytes, and a length each, because an argument is bytes — the
+   * old format joined them as text with NUL separators and lost anything that was not valid UTF-8 on the
+   * way through. wac-mono 0065.
+   */
+  const argvBytes = (args: Uint8Array[]): Uint8Array => {
+    let total = 4;
+    for (const a of args) total += 4 + a.length;
+    const out = new Uint8Array(total);
+    out.set(i32le(args.length), 0);
+    let at = 4;
+    for (const a of args) {
+      out.set(i32le(a.length), at);
+      out.set(a, at + 4);
+      at += 4 + a.length;
+    }
+    return out;
+  };
+
   return cls.Cli.of(
     /*= argCount */
     () => T.i32(submit(b, OP.ARG_COUNT, EMPTY)),
     /*= arg */
-    (i: number) => T.text(submit(b, OP.ARG, i32le(i))),
+    (i: number) => T.bytes(submit(b, OP.ARG, i32le(i))),
     /*= env */
-    (name: string) => T.maybeText(submit(b, OP.ENV, str(name))),
+    (name: string) => T.maybeBytes(submit(b, OP.ENV, str(name))),
 
     /*= readStdin */
     // stdin and stdout, which need no grant — see the note in platform.wac.
@@ -430,7 +458,7 @@ export function cliOf(
     (handle: number) => { hostCall(b, OP.CLOSE_SOCKET, i32le(handle)); },
 
     /*= spawn */
-    (source: string, args: string[], grants: number, cwd: string, inheritIn: boolean) =>
+    (source: string, args: Uint8Array[], grants: number, cwd: string, inheritIn: boolean) =>
       // The grant flags, then the source length-prefixed, then the arguments length-prefixed and
       // NUL-separated — the same shape `readDir` answers with, for the same reason: a filename or an
       // argument may contain anything but a NUL — and then the child's directory.
@@ -442,7 +470,7 @@ export function cliOf(
             i32le(grants),
             prefixed(
               str(source),
-              prefixed(str(args.join("\u0000")), prefixed(str(cwd), flag(inheritIn))),
+              headed(argvBytes(args), prefixed(str(cwd), flag(inheritIn))),
             ),
           ),
         ),
@@ -450,14 +478,14 @@ export function cliOf(
     /*= spawnSelf */
     // No source: the host has this program's own bundle, because it is what started it. The payload
     // is the grants and the arguments, in the shape `spawn` uses minus the part that is already here.
-    (args: string[], grants: number, cwd: string, inheritIn: boolean) =>
+    (args: Uint8Array[], grants: number, cwd: string, inheritIn: boolean) =>
       T.child(
         submit(
           b,
           OP.SPAWN_SELF,
           headed(
             i32le(grants),
-            prefixed(str(args.join("\u0000")), prefixed(str(cwd), flag(inheritIn))),
+            headed(argvBytes(args), prefixed(str(cwd), flag(inheritIn))),
           ),
         ),
       ),

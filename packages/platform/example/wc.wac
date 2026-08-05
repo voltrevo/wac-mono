@@ -17,7 +17,7 @@ export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 1) {
     data = cli.readStdin().wait();
   } else {
-    label = cli.arg(0).wait();
+    label = string.fromBytes(cli.arg(0).wait());
     FileResult f = cli.readFile(label).wait();
     if (!f.ok) {
       core.warn("wc: " + label + ": " + f.error);
@@ -34,7 +34,8 @@ export i32 main(Core core, Cli cli) {
   core.log(label == "" ? line : line + " " + label);
 
   // Unset and empty are different things, which is why the capability returns `string?`.
-  string? verbose = cli.env("WC_VERBOSE").wait();
+  u8[]? verboseRaw = cli.env("WC_VERBOSE").wait();
+  string? verbose = verboseRaw is null ? null : string.fromBytes(verboseRaw!);
   if (verbose is null) { return 0; }
   core.log("counted in " + itoa((tookNanos / 1000) as~ i32) + "us");
   return 0;
