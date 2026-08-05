@@ -1,0 +1,280 @@
+// v3 onion service descriptors: two layers of encryption, and what is inside them.
+//
+// A descriptor is what a client fetches from an HSDir to learn where a service's introduction points
+// are. It is encrypted twice, and the two layers exist for different reasons:
+//
+//   **The first layer** keeps the descriptor unreadable by anyone who does not know the service's
+//   public identity key — which is to say, anyone who does not know the onion address. An HSDir holds
+//   descriptors it cannot read, so it cannot enumerate what it is storing.
+//
+//   **The second layer** keeps it unreadable by clients who are not authorised, when client
+//   authorisation is configured. With authorisation off it adds no secrecy at all and is still
+//   applied, so that the two cases are indistinguishable from outside.
+//
+// Both use one scheme with two customisations (rend-spec-v3 §2.5.3):
+//
+//     secret_input = SECRET_DATA | N_hs_subcred | INT_8(revision_counter)
+//     keys         = SHAKE-256(secret_input | SALT | STRING_CONSTANT, 32 + 16 + 32)
+//     ENCRYPTED    = AES-256-CTR(SECRET_KEY, SECRET_IV) XOR plaintext
+//     MAC          = SHA3-256(INT_8(len(MAC_KEY)) | MAC_KEY | INT_8(len(SALT)) | SALT | ENCRYPTED)
+//
+// and the blob on the wire is `SALT | ENCRYPTED | MAC`.
+//
+// ## The MAC is checked before the plaintext is used, and that is not a formality
+//
+// The ciphertext comes from an HSDir, which is an arbitrary relay that has never been authenticated
+// to us. AES-CTR is malleable: flipping a bit of ciphertext flips exactly that bit of plaintext, so
+// without the MAC an HSDir could edit the introduction points — change which relays a client contacts,
+// or which keys it uses to talk to them — and the client would parse the result perfectly happily.
+// `decryptLayer` returns empty on a MAC failure and there is no way to ask it not to.
+//
+// ## Why the revision counter is in the key derivation
+//
+// It means two descriptors from the same service in the same period, with different revisions,
+// derive different keys from the same salt. Without it a service that republished would reuse a
+// keystream if it also reused a salt, and AES-CTR keystream reuse is total loss of confidentiality.
+//
+// ## What is not here
+//
+// Client authorisation. `desc-auth-type x25519` and the `auth-client` lines in the first layer are
+// parsed past, not used — with authorisation off the descriptor cookie is empty and the second layer
+// derives from the blinded key alone. A service with authorised clients will not decrypt here, and
+// that is a missing feature rather than a silent wrong answer: the MAC fails and the descriptor is
+// refused.
+
+import { sha3_256, shake256 } from "../../crypto/src/keccak.wac";
+import { aesCtr } from "../../crypto/src/aesctr.wac";
+import { decode as b64decode } from "../../codec/src/base64.wac";
+
+export const i32 S_KEY_LEN = 32;      // AES-256
+export const i32 S_IV_LEN = 16;
+export const i32 MAC_KEY_LEN = 32;
+export const i32 SALT_LEN = 16;
+export const i32 MAC_LEN = 32;
+
+/** A big-endian u64 — `INT_8` throughout rend-spec-v3, and `htonll` in tor's C. */
+u8[] u64be(i64 v) {
+  u8[] b = u8[8]();
+  for (i32 i = 0; i < 8; i++) {
+    b[i] = ((v >> (((7 - i) * 8) as@ u32)) & 0xFF) as~ i32;
+  }
+  return b;
+}
+
+u8[] concat(u8[][] parts) {
+  i32 n = 0;
+  for (i32 i = 0; i < parts.len(); i++) { n = n + parts[i].len(); }
+  u8[] out = u8[n]();
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) {
+    for (i32 j = 0; j < parts[i].len(); j++) { out[at + j] = parts[i][j]; }
+    at = at + parts[i].len();
+  }
+  return out;
+}
+
+export u8[] slice(u8[] s, i32 from, i32 to) {
+  if (from < 0 || to > s.len() || from > to) { return u8[0](); }
+  u8[] o = u8[to - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = s[from + i]; }
+  return o;
+}
+
+/**
+ * The three keys for one layer: `SECRET_KEY | SECRET_IV | MAC_KEY`, 80 bytes.
+ *
+ * Exposed because it is worth testing directly against tor's values — a wrong key and a wrong MAC
+ * both present as "the descriptor did not decrypt", and only separate assertions tell them apart.
+ */
+export u8[] layerKeys(u8[] secretData, u8[] subcredential, i64 revision, u8[] salt, u8[] constant) {
+  if (subcredential.len() != 32 || salt.len() != SALT_LEN) { return u8[0](); }
+  u8[][] parts = u8[][5]();
+  parts[0] = secretData;
+  parts[1] = subcredential;
+  parts[2] = u64be(revision);
+  parts[3] = salt;
+  parts[4] = constant;
+  return shake256(concat(parts), S_KEY_LEN + S_IV_LEN + MAC_KEY_LEN);
+}
+
+/** `D_MAC = H(INT_8(len(MAC_KEY)) | MAC_KEY | INT_8(len(SALT)) | SALT | ENCRYPTED)`. */
+export u8[] layerMac(u8[] macKey, u8[] salt, u8[] ciphertext) {
+  u8[][] parts = u8[][5]();
+  parts[0] = u64be(macKey.len() as i64);
+  parts[1] = macKey;
+  parts[2] = u64be(salt.len() as i64);
+  parts[3] = salt;
+  parts[4] = ciphertext;
+  return sha3_256(concat(parts));
+}
+
+/**
+ * One encryption layer: `SALT | ENCRYPTED | MAC` in, plaintext out.
+ *
+ * **Empty on any failure, including a MAC mismatch**, and the MAC is checked before the plaintext is
+ * produced rather than alongside it. There is no variant that returns the plaintext anyway: the
+ * ciphertext came from a relay we have not authenticated, AES-CTR is bit-for-bit malleable, and a
+ * caller holding an unauthenticated plaintext would have no way to know.
+ *
+ * The trailing NUL padding is **not** stripped here. A caller parsing lines stops at the first NUL,
+ * and stripping would mean deciding what padding is on the strength of the plaintext's own contents.
+ */
+export u8[] decryptLayer(u8[] blob, u8[] secretData, u8[] subcredential, i64 revision, u8[] constant) {
+  if (blob.len() < SALT_LEN + MAC_LEN) { return u8[0](); }
+  u8[] salt = slice(blob, 0, SALT_LEN);
+  u8[] ciphertext = slice(blob, SALT_LEN, blob.len() - MAC_LEN);
+  u8[] mac = slice(blob, blob.len() - MAC_LEN, blob.len());
+
+  u8[] keys = layerKeys(secretData, subcredential, revision, salt, constant);
+  if (keys.len() != S_KEY_LEN + S_IV_LEN + MAC_KEY_LEN) { return u8[0](); }
+  u8[] macKey = slice(keys, S_KEY_LEN + S_IV_LEN, keys.len());
+
+  u8[] want = layerMac(macKey, salt, ciphertext);
+  i32 diff = 0;
+  for (i32 i = 0; i < MAC_LEN; i++) { diff = diff | (want[i] ^ mac[i]); }
+  if (diff != 0) { return u8[0](); }
+
+  return aesCtr(slice(keys, 0, S_KEY_LEN), slice(keys, S_KEY_LEN, S_KEY_LEN + S_IV_LEN), ciphertext);
+}
+
+/** `"hsdir-superencrypted-data"` — the first layer's customisation constant. */
+export u8[] superencryptedConstant() { return "hsdir-superencrypted-data".toBytes(); }
+/** `"hsdir-encrypted-data"` — the second layer's. */
+export u8[] encryptedConstant() { return "hsdir-encrypted-data".toBytes(); }
+
+// ── Reading the document ──────────────────────────────────────────────────────
+//
+// Descriptors use dir-spec's meta-format: keyword lines, and PEM-ish blocks between BEGIN and END
+// markers. Only what a client needs is parsed, by scanning for line starts — there is no general
+// parser here, because a general parser for a format this loose is more code and more places to be
+// wrong than the four fields actually required.
+
+/** Whether `doc[at..]` begins with `needle` and `at` is the start of a line. */
+bool atLineStart(u8[] doc, i32 at, u8[] needle) {
+  if (at != 0 && doc[at - 1] != 10) { return false; }
+  if (at + needle.len() > doc.len()) { return false; }
+  for (i32 i = 0; i < needle.len(); i++) {
+    if (doc[at + i] != needle[i]) { return false; }
+  }
+  return true;
+}
+
+/** The index just past the first line starting with `keyword`, or −1. */
+export i32 findKeywordLine(u8[] doc, u8[] keyword, i32 from) {
+  for (i32 at = from; at < doc.len(); at++) {
+    if (atLineStart(doc, at, keyword)) { return at; }
+  }
+  return -1;
+}
+
+/** The rest of the line at `at`, trimmed of the newline. Empty if there is none. */
+u8[] lineFrom(u8[] doc, i32 at) {
+  i32 end = at;
+  while (end < doc.len() && doc[end] != 10 && doc[end] != 13) { end++; }
+  return slice(doc, at, end);
+}
+
+/**
+ * The single-token value of `keyword SP value NL`, or empty.
+ *
+ * Only the first occurrence. rend-spec-v3 marks every field this is used for "exactly once", and a
+ * descriptor with two of them is malformed rather than an invitation to choose.
+ */
+export u8[] keywordValue(u8[] doc, u8[] keyword) {
+  i32 at = findKeywordLine(doc, keyword, 0);
+  if (at < 0) { return u8[0](); }
+  i32 start = at + keyword.len();
+  if (start < doc.len() && doc[start] == 32) { start++; }
+  return lineFrom(doc, start);
+}
+
+/**
+ * The decoded body of the first `-----BEGIN <label>-----` block after `keyword`.
+ *
+ * Empty if the block is missing, unterminated, or not valid base64 — all three are a malformed
+ * descriptor and none of them is worth distinguishing to a caller who can only refuse.
+ */
+export u8[] pemBlock(u8[] doc, u8[] keyword, u8[] label) {
+  i32 at = findKeywordLine(doc, keyword, 0);
+  if (at < 0) { return u8[0](); }
+  u8[][] parts = u8[][3]();
+  parts[0] = "-----BEGIN ".toBytes();
+  parts[1] = label;
+  parts[2] = "-----".toBytes();
+  u8[] begin = concat(parts);
+  i32 b = findKeywordLine(doc, begin, at);
+  if (b < 0) { return u8[0](); }
+  i32 bodyStart = b + begin.len();
+  while (bodyStart < doc.len() && (doc[bodyStart] == 10 || doc[bodyStart] == 13)) { bodyStart++; }
+
+  u8[][] endParts = u8[][3]();
+  endParts[0] = "-----END ".toBytes();
+  endParts[1] = label;
+  endParts[2] = "-----".toBytes();
+  i32 e = findKeywordLine(doc, concat(endParts), bodyStart);
+  if (e < 0) { return u8[0](); }
+
+  // Strip the newlines the base64 is wrapped at; the decoder wants a single run of digits.
+  u8[] wrapped = slice(doc, bodyStart, e);
+  u8[] flat = u8[wrapped.len()]();
+  i32 n = 0;
+  for (i32 i = 0; i < wrapped.len(); i++) {
+    if (wrapped[i] != 10 && wrapped[i] != 13) {
+      flat[n] = wrapped[i];
+      n = n + 1;
+    }
+  }
+  u8[]? decoded = b64decode(slice(flat, 0, n));
+  return (decoded is null) ? u8[0]() : decoded!;
+}
+
+/** A decimal integer value, or −1 if absent or not a number. */
+export i64 keywordInt(u8[] doc, u8[] keyword) {
+  u8[] v = keywordValue(doc, keyword);
+  if (v.len() == 0) { return -1; }
+  i64 out = 0;
+  for (i32 i = 0; i < v.len(); i++) {
+    if (v[i] < 48 || v[i] > 57) { return -1; }
+    out = out * 10 + ((v[i] - 48) as i64);
+  }
+  return out;
+}
+
+/**
+ * The blinded public key out of a `descriptor-signing-key-cert`.
+ *
+ * The certificate is proposal 220's format. Its *certified* key is the short-lived descriptor signing
+ * key; the blinded key is in extension type 4, `signed-with-ed25519-key`. Both are 32 bytes and they
+ * are easy to confuse, which is why `descriptorSigningKey` below is a separate function rather than
+ * an offset a caller passes.
+ *
+ *     VERSION[1] CERT_TYPE[1] EXPIRATION[4] KEY_TYPE[1] CERTIFIED_KEY[32] N_EXT[1]
+ *     N_EXT times: EXT_LENGTH[2] EXT_TYPE[1] EXT_FLAGS[1] EXT_DATA[len]
+ *     SIGNATURE[64]
+ */
+export u8[] certSignedWithKey(u8[] cert) {
+  if (cert.len() < 40) { return u8[0](); }
+  i32 n = cert[39];
+  i32 at = 40;
+  for (i32 i = 0; i < n; i++) {
+    if (at + 4 > cert.len()) { return u8[0](); }
+    i32 length = (cert[at] * 256) + cert[at + 1];
+    i32 type = cert[at + 2];
+    if (at + 4 + length > cert.len()) { return u8[0](); }
+    if (type == 4 && length == 32) { return slice(cert, at + 4, at + 36); }
+    at = at + 4 + length;
+  }
+  return u8[0]();
+}
+
+/** The key a proposal-220 certificate certifies — for a descriptor cert, the signing key. */
+export u8[] certCertifiedKey(u8[] cert) {
+  if (cert.len() < 39) { return u8[0](); }
+  return slice(cert, 7, 39);
+}
+
+/** A certificate's type byte: 8 for a descriptor signing cert, 9 for an intro auth key. */
+export i32 certType(u8[] cert) {
+  if (cert.len() < 2) { return -1; }
+  return cert[1];
+}
