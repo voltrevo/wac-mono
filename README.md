@@ -84,6 +84,7 @@ harness/           TypeScript for driving the compiler
   wacTestRun.ts      run wac-written tests as Deno tests
   wacCoverage.ts     instrument an entry point and report branch coverage
 tools/             check.ts, validate.ts, coverage.ts, mutate.ts, map.ts, push.sh
+design/            directions too big to be issues, one numbered document each; see design/README.md
 issues/            bug reports and cross-cutting tasks; see issues/README.md
 packages/<name>/
   src/               wac source

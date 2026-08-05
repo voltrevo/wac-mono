@@ -37,6 +37,7 @@ Three things already have homes, and duplicating them means two records that dri
 
 | where it goes | what |
 |---|---|
+| `design/` | a **direction**: too big to be actionable, spanning packages, with decisions that constrain code not yet written. An issue is one slice of one, and references it rather than restating it |
 | the package's `README.md` | that package's own known limitations and roadmap — its "Not here yet" section |
 | `~/notes/living/wac/language-friction-log.md` | language gaps, ranked across projects. "No generics" is not an issue, it is a measured cost |
 | `wac/issues/` | anything whose fix is in the compiler |

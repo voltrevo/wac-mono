@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0067](open/0067-no-filesystem-of-our-own-so-a-session-cannot-be-sealed-off-from-the-host.md) | no filesystem of our own, so a session cannot be sealed off from the host — [design/0001](../design/0001-a-self-contained-system.md) step 1 | missing feature | not implemented |
 | [0065](open/0065-a-spawned-programs-arguments-are-not-byte-exact.md) | a spawned program's arguments are not byte-exact | bug | wrong answer |
 | [0064](open/0064-an-ethereum-light-client.md) | an Ethereum light client — SSZ and BLS both done, nothing external blocking | missing feature | not implemented |
 | [0061](open/0061-sh-applets-return-all-their-output-at-once-so-a-large-stage-dies.md) | `sh`'s applets return all their output at once, so a large stage dies instead of streaming | bug | trap |
