@@ -16,7 +16,7 @@ export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 1) {
     data = cli.readStdin().wait();
   } else {
-    string path = cli.arg(0).wait();
+    string path = string.fromBytes(cli.arg(0).wait());
     Stat st = cli.stat(path).wait();
     if (!st.exists) {
       core.warn("hexdump: " + path + ": not found");

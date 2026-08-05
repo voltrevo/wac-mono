@@ -53,11 +53,11 @@ export i32 main(Core core, Cli cli) {
     core.warn("  authorities-file: one uppercase hex fingerprint per line");
     return 2;
   }
-  FileResult seedFile = cli.readFile(cli.arg(0).wait()).wait();
+  FileResult seedFile = cli.readFile(string.fromBytes(cli.arg(0).wait())).wait();
   if (!seedFile.ok) { core.warn("tor: " + seedFile.error); return 1; }
-  FileResult authFile = cli.readFile(cli.arg(1).wait()).wait();
+  FileResult authFile = cli.readFile(string.fromBytes(cli.arg(1).wait())).wait();
   if (!authFile.ok) { core.warn("tor: " + authFile.error); return 1; }
-  string path = cli.arg(2).wait();
+  string path = string.fromBytes(cli.arg(2).wait());
 
   Network net = bootstrap(core, cli, seedFile.bytes, authFile.bytes, true);
   if (!net.ok) { return 1; }

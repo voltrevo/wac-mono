@@ -37,9 +37,9 @@ import { isProgram, programNames, runStreaming } from "./program.wac";
  */
 export i32 main(Core core, Cli cli) {
   i32 n = cli.argCount().wait();
-  if (n >= 1 && isProgram(cli.arg(0).wait())) {
+  if (n >= 1 && isProgram(string.fromBytes(cli.arg(0).wait()))) {
     Vec<string> argv = Vec.create();
-    for (i32 i = 0; i < n; i++) { argv.push(cli.arg(i).wait()); }
+    for (i32 i = 0; i < n; i++) { argv.push(string.fromBytes(cli.arg(i).wait())); }
     return runStreaming(cli, cli.cwd().wait(), argv);
   }
 

@@ -347,10 +347,10 @@ export function blobWorker(source: string): WorkerLike {
  */
 export function spawnChild(
   source: string,
-  args: string[],
+  args: Uint8Array[],
   startWorld: (
     sab: SharedArrayBuffer,
-    args: string[],
+    args: Uint8Array[],
     out: ByteQueue,
     input: ByteQueue,
     err: ByteQueue,
@@ -499,37 +499,59 @@ export function want(p: Uint8Array): number {
  */
 export function unpackSpawn(
   p: Uint8Array,
-): { source: string; args: string[]; cwd: string; inheritIn: boolean } {
+): { source: string; args: Uint8Array[]; cwd: string; inheritIn: boolean } {
   const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
   const dec = new TextDecoder();
   const sourceLen = dv.getInt32(4, true);
   const source = dec.decode(p.subarray(8, 8 + sourceLen));
   const argsAt = 8 + sourceLen;
-  const argsLen = dv.getInt32(argsAt, true);
-  const joined = dec.decode(p.subarray(argsAt + 4, argsAt + 4 + argsLen));
-  const cwdAt = argsAt + 4 + argsLen;
-  const cwdLen = dv.getInt32(cwdAt, true);
+  const after = unpackArgs(p, argsAt);
+  const cwdLen = dv.getInt32(after.at, true);
   return {
     source,
-    args: joined.length === 0 ? [] : joined.split("\u0000"),
-    cwd: dec.decode(p.subarray(cwdAt + 4, cwdAt + 4 + cwdLen)),
-    inheritIn: p[cwdAt + 4 + cwdLen] === 1,
+    args: after.args,
+    cwd: dec.decode(p.subarray(after.at + 4, after.at + 4 + cwdLen)),
+    inheritIn: p[after.at + 4 + cwdLen] === 1,
   };
 }
 
 /** The same, for `spawnSelf`, which needs no source: grants, arguments, directory. */
 export function unpackSpawnSelf(
   p: Uint8Array,
-): { args: string[]; cwd: string; inheritIn: boolean } {
+): { args: Uint8Array[]; cwd: string; inheritIn: boolean } {
   const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
   const dec = new TextDecoder();
-  const argsLen = dv.getInt32(4, true);
-  const joined = dec.decode(p.subarray(8, 8 + argsLen));
-  const cwdAt = 8 + argsLen;
-  const cwdLen = dv.getInt32(cwdAt, true);
+  const after = unpackArgs(p, 4);
+  const cwdLen = dv.getInt32(after.at, true);
   return {
-    args: joined.length === 0 ? [] : joined.split("\u0000"),
-    cwd: dec.decode(p.subarray(cwdAt + 4, cwdAt + 4 + cwdLen)),
-    inheritIn: p[cwdAt + 4 + cwdLen] === 1,
+    args: after.args,
+    cwd: dec.decode(p.subarray(after.at + 4, after.at + 4 + cwdLen)),
+    inheritIn: p[after.at + 4 + cwdLen] === 1,
   };
+}
+
+/**
+ * The argument vector: a count, then each argument length-prefixed.
+ *
+ * **Bytes, and one length each.** This used to be one blob of text with NUL separators, decoded here with
+ * a `TextDecoder` — which replaced anything that was not valid UTF-8, so an argument arrived at the child
+ * as replacement characters and a program using it as a path opened the wrong file. An argument is bytes
+ * on every system this targets, so the wire format carries bytes and the capability's type says so.
+ * wac-mono 0065.
+ *
+ * Lengths rather than a separator because that is the honest encoding once the payload is bytes: a NUL
+ * cannot appear in an argument on the systems being imitated, but relying on that is a rule the *format*
+ * does not have to depend on.
+ */
+function unpackArgs(p: Uint8Array, at: number): { args: Uint8Array[]; at: number } {
+  const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+  const count = dv.getInt32(at, true);
+  let cursor = at + 4;
+  const args: Uint8Array[] = [];
+  for (let i = 0; i < count; i++) {
+    const len = dv.getInt32(cursor, true);
+    args.push(p.slice(cursor + 4, cursor + 4 + len));
+    cursor += 4 + len;
+  }
+  return { args, at: cursor };
 }

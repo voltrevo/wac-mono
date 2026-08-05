@@ -357,3 +357,18 @@ u8[] sliceOf(u8[] b, i32 at, i32 to) {
   out.copyFrom(b, at, 0, to - at);
   return out;
 }
+
+// ── Arguments ─────────────────────────────────────────────────────────────────
+
+/**
+ * Text arguments as the bytes `spawn` takes.
+ *
+ * `spawn` and `spawnSelf` take `u8[][]` because an argument is bytes — wac-mono 0065 — and a caller that
+ * *has* text says so here rather than each writing the same loop. A caller that has bytes already, like a
+ * shell handing on what it parsed, passes them straight through and never comes here.
+ */
+export u8[][] argvOf(string[] args) {
+  u8[][] out = u8[][args.len()](fill: u8[0]());
+  for (i32 i = 0; i < args.len(); i++) { out[i] = args[i].toBytes(); }
+  return out;
+}

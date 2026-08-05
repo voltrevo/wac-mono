@@ -32,7 +32,7 @@
 
 import { type Handlers } from "./respond.ts";
 import { CHUNK } from "./layout.ts";
-import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
+import { EMPTY_ARG, argBytes, i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 import { ChildStack, joinPath, packCaptured, unpackPush } from "./child.ts";
 import {
@@ -108,7 +108,15 @@ export type DirHandle = {
 /** What the page gives the application. Everything is optional, and absent means denied. */
 export type BrowserWorldOptions = {
   /** Arguments the application sees. The launcher reads these from the query string. */
-  args?: string[];
+  /**
+   * The program's arguments.
+   *
+   * Strings are accepted because that is what a launcher has — `Deno.args` is already text, and an
+   * operating system that handed us bytes gave them to the runtime first. Bytes are accepted because a
+   * *parent* has them exactly, and a spawned child must receive what its parent sent rather than a
+   * UTF-8 round trip of it. wac-mono 0065.
+   */
+  args?: (string | Uint8Array)[];
   /** Where `log` and `warn` go. Defaults to the console. */
   log?(line: string): void;
   warn?(line: string): void;
@@ -232,7 +240,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    */
   const startChild = async (
     source: string,
-    childArgs: string[],
+    childArgs: Uint8Array[],
     wanted: number,
     childCwd: string,
     inheritIn: boolean,
@@ -549,7 +557,8 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     [OP.ARG]: (p) => {
       const own = kids.args() ?? args;
       const i = readI32le(p);
-      return str(i >= 0 && i < own.length ? own[i] : "");
+      // The bytes, unchanged. A program that wants text says `string.fromBytes` on its own side.
+      return i >= 0 && i < own.length ? argBytes(own[i]) : EMPTY_ARG;
     },
     // Unset, always. One byte of presence says so, as it does everywhere else.
     [OP.ENV]: () => new Uint8Array([0]),

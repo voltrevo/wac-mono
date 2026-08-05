@@ -17,8 +17,8 @@ export i32 main(Core core, Cli cli) {
     core.warn("usage: whichever <port> <port>");
     return 2;
   }
-  Socket a = cli.connect("127.0.0.1", atoi(cli.arg(0).wait())).wait();
-  Socket b = cli.connect("127.0.0.1", atoi(cli.arg(1).wait())).wait();
+  Socket a = cli.connect("127.0.0.1", atoi(string.fromBytes(cli.arg(0).wait()))).wait();
+  Socket b = cli.connect("127.0.0.1", atoi(string.fromBytes(cli.arg(1).wait()))).wait();
   if (a.handle < 0 || b.handle < 0) {
     core.warn("whichever: " + (a.handle < 0 ? a.error : b.error));
     return 1;

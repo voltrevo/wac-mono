@@ -19,7 +19,7 @@
 import { Change, Cli, Core, FileResult, Stat } from "../src/platform.wac";
 
 export i32 main(Core core, Cli cli) {
-  string text = cli.argCount().wait() > 0 ? cli.arg(0).wait() : "round trip";
+  string text = cli.argCount().wait() > 0 ? string.fromBytes(cli.arg(0).wait()) : "round trip";
   string a = "roundtrip.txt";
   string b = "roundtrip.moved";
 

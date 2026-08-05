@@ -310,6 +310,19 @@ export function hostCall(b: Bridge, op: number, payload: Uint8Array): Uint8Array
 // spells it out rather than inheriting a serialisation format nobody chose.
 
 export const str = (s: string): Uint8Array => enc.encode(s);
+
+/**
+ * An argument as bytes, whichever shape the host was given.
+ *
+ * A launcher has strings — `Deno.args` is text by the time the runtime hands it over — and a *parent*
+ * spawning a child has the exact bytes. Both are accepted, and only the string is encoded, so nothing that
+ * arrived as bytes is round-tripped through UTF-8. wac-mono 0065.
+ */
+export const argBytes = (a: string | Uint8Array): Uint8Array =>
+  typeof a === "string" ? enc.encode(a) : a;
+
+/** An empty argument, for an index nobody passed. */
+export const EMPTY_ARG = new Uint8Array(0);
 export const unstr = (b: Uint8Array): string => dec.decode(b);
 
 export function i32le(n: number): Uint8Array {

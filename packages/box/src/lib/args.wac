@@ -66,7 +66,7 @@ export bool has(Args a, i32 flag) {
  * `bin/`.
  */
 export Args parseArgs(Cli cli) {
-  return parseFrom(cli, 1, cli.arg(0).wait());
+  return parseFrom(cli, 1, string.fromBytes(cli.arg(0).wait()));
 }
 
 export Args parseFrom(Cli cli, i32 first, string name) {
@@ -76,7 +76,7 @@ export Args parseFrom(Cli cli, i32 first, string name) {
   // flag cannot come to mean one thing under `box` and another under `sh`.
   i32 n = cli.argCount().wait();
   string[] argv = string[n](fill: "");
-  for (i32 i = 0; i < n; i++) { argv[i] = cli.arg(i).wait(); }
+  for (i32 i = 0; i < n; i++) { argv[i] = string.fromBytes(cli.arg(i).wait()); }
   return parseList(argv, first, name);
 }
 

@@ -17,14 +17,22 @@ import {
   want,
 } from "./children.ts";
 import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
-import { i32le, i64le, readI32le, str, unstr } from "./call.ts";
+import { EMPTY_ARG, argBytes, i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 import { ChildStack, joinPath, packCaptured, unpackPush } from "./child.ts";
 import { changeBytes, changed, FAULT_DENIED } from "./faults.ts";
 
 export type DenoWorldOptions = {
   /** Arguments the application sees. Defaults to none, not to the launcher's own. */
-  args?: string[];
+  /**
+   * The program's arguments.
+   *
+   * Strings are accepted because that is what a launcher has — `Deno.args` is already text, and an
+   * operating system that handed us bytes gave them to the runtime first. Bytes are accepted because a
+   * *parent* has them exactly, and a spawned child must receive what its parent sent rather than a
+   * UTF-8 round trip of it. wac-mono 0065.
+   */
+  args?: (string | Uint8Array)[];
   /** Where output goes. Defaults to the console. */
   log?(line: string): void;
   warn?(line: string): void;
@@ -197,7 +205,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
    */
   const startChild = async (
     source: string,
-    childArgs: string[],
+    childArgs: Uint8Array[],
     wanted: number,
     childCwd: string,
     inheritIn: boolean,
@@ -370,7 +378,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     [OP.ARG]: (p) => {
       const own = kids.args() ?? args;
       const i = readI32le(p);
-      return str(i >= 0 && i < own.length ? own[i] : "");
+      // The bytes, unchanged. A program that wants text says `string.fromBytes` on its own side.
+      return i >= 0 && i < own.length ? argBytes(own[i]) : EMPTY_ARG;
     },
     [OP.ENV]: (p) => {
       const v = opts.env?.(unstr(p));

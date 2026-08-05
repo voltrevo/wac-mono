@@ -22,7 +22,7 @@ export i32 main(Core core, Cli cli) {
     core.warn("usage: ops mem | ops host <root>");
     return 2;
   }
-  string kind = cli.arg(0).wait();
+  string kind = string.fromBytes(cli.arg(0).wait());
   string prefix = "";
   Fs fs = Fs.inMemory(0);
   if (kind == "host") {
@@ -30,7 +30,7 @@ export i32 main(Core core, Cli cli) {
       core.warn("ops host needs a root directory");
       return 2;
     }
-    prefix = cli.arg(1).wait();
+    prefix = string.fromBytes(cli.arg(1).wait());
     fs = Fs.onHost(cli, 0);
   } else if (kind != "mem") {
     core.warn("ops: unknown backing '" + kind + "'");

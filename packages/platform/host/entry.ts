@@ -36,6 +36,8 @@ export type AppModule = {
   Pending$string: { of(...a: unknown[]): unknown };
   Pending$stringOpt: { of(...a: unknown[]): unknown };
   Pending$u8Arr: { of(...a: unknown[]): unknown };
+  /** `env` answers bytes-or-nothing: a value is not text, and unset is not empty. wac-mono 0065. */
+  Pending$u8ArrOpt: { of(...a: unknown[]): unknown };
   Pending$bool: { of(...a: unknown[]): unknown };
   Pending$stringArrOpt: { of(...a: unknown[]): unknown };
   Pending$FileResult: { of(...a: unknown[]): unknown };

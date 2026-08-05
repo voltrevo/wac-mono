@@ -85,7 +85,7 @@ export i32 boxApplet(Core core, Cli cli) {
   i32 n = cli.argCount().wait();
   if (n < 1) { return UNKNOWN; }
   string[] args = string[n](fill: "");
-  for (i32 i = 0; i < n; i++) { args[i] = cli.arg(i).wait(); }
+  for (i32 i = 0; i < n; i++) { args[i] = string.fromBytes(cli.arg(i).wait()); }
   string name = args[0];
   return dispatch(core, cli, parseList(args, 1, name), name);
 }
