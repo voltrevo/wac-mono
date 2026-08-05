@@ -163,17 +163,31 @@ export async function cached(
  * Keep the cache from growing without bound.
  *
  * Cheap and approximate on purpose: it runs only when an entry was actually built, and a directory
- * under the limit costs one `readDir`. This container filled its disk once already today — for an
- * unrelated reason, a `finally` that never ran — and an unbounded cache of half-megabyte binaries is
- * the obvious way to do it again on purpose.
+ * under the limit costs one `readDir`. This container filled its disk once already — for an unrelated
+ * reason, a `finally` that never ran — and an unbounded cache of half-megabyte binaries is the obvious
+ * way to do it again on purpose.
+ *
+ * Stale *temp* files are dropped here too. A run killed between producing one and renaming it leaves it
+ * behind by definition, so nothing else can: an interrupted process has no `finally` that runs.
  */
 async function prune(dir: string): Promise<void> {
   const entries: { path: string; at: number }[] = [];
+  const now = Date.now();
   try {
     for await (const e of Deno.readDir(dir)) {
-      if (!e.isFile || e.name.endsWith(".tmp")) continue;
+      if (!e.isFile) continue;
       const st = await Deno.stat(`${dir}/${e.name}`).catch(() => null);
-      if (st !== null) entries.push({ path: `${dir}/${e.name}`, at: st.mtime?.getTime() ?? 0 });
+      if (st === null) continue;
+      const at = st.mtime?.getTime() ?? 0;
+      if (e.name.endsWith(".tmp")) {
+        // A build that was *interrupted* between producing its temp file and renaming it cannot clean
+        // up after itself — a killed test run, a cancelled suite — so 184 of these had accumulated
+        // here. Ten minutes is far longer than any build takes and far shorter than a session, so a
+        // live one is never touched.
+        if (now - at > 600_000) await Deno.remove(`${dir}/${e.name}`).catch(() => {});
+        continue;
+      }
+      entries.push({ path: `${dir}/${e.name}`, at });
     }
   } catch {
     return;
