@@ -269,32 +269,7 @@ async function appKey(
  * plus two `deno bundle` subprocesses, `packages/box`'s tests want twenty-seven of them from the
  * same source with different grants baked in, and five other test files ask for programs that were
  * already built. Cold, this is what it always was; warm, it is a file copy.
- *
- * ## And within one process, not even a key computation
- *
- * The on-disk cache is keyed by content, so a warm call still has to *read* all that content to
- * know which entry to fetch — measured at 82ms for `packages/box`, of which 75 is `wacFiles`
- * walking its import graph. `packages/box`'s tests make twenty-nine calls and the suite makes
- * eighty, so that is six seconds of hashing files to conclude what the previous call concluded.
- *
- * `memo` skips it: the same request in the same process resolves to the artifact it resolved to
- * before. **The assumption is that nothing edits a `.wac` file between two `buildApp` calls in one
- * process**, which is narrower than it sounds — every caller is a test or a tool that reads
- * sources, and `tools/mutate.ts`, the one thing here that does write them, copies the tree and runs
- * the suite in a subprocess, so its mutants are a different process and a different path.
- *
- * That assumption is why this is here and not inside `wacFiles`, whose callers include `mutate.ts`
- * itself. If a caller ever does need to rebuild after writing, `forgetBuilds()` is the escape
- * hatch — and an *unconditional* memo would have been the kind of staleness the file header warns
- * about, where the symptom is "my fix did nothing".
  */
-const memo = new Map<string, string>();
-
-/** Drop the in-process memo, for a caller that has edited a source since building. */
-export function forgetBuilds(): void {
-  memo.clear();
-}
-
 export async function buildApp(
   entry: string,
   out: string,
@@ -303,23 +278,15 @@ export async function buildApp(
   workerOnly = false,
 ): Promise<void> {
   checkWacVersion();
+  const files = await wacFiles(entry);
   // A page and a worker bundle are not runnable by themselves, so neither gets the execute bit.
   const executable = !workerOnly && target !== "browser";
 
-  const request = JSON.stringify([entry, grants, target, workerOnly]);
-  const seen = memo.get(request);
-  if (seen !== undefined) {
-    await place(await Deno.readTextFile(seen), out, executable);
-    return;
-  }
-
-  const files = await wacFiles(entry);
   const key = await appKey(entry, files, grants, target, workerOnly);
   if (key !== null) {
     const artifact = await cached("app", key, "", async (tmp) => {
       await Deno.writeTextFile(tmp, await produceApp(entry, files, grants, target, workerOnly));
     });
-    memo.set(request, artifact);
     await place(await Deno.readTextFile(artifact), out, executable);
     return;
   }
