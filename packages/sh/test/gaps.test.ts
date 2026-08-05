@@ -40,9 +40,12 @@ Deno.test({
     try {
       await buildApp("packages/sh/src/sh.wac", built, { read: true, write: true, env: true });
 
-      // The eight of this shell's twelve programs that a real tool exists for. `printf`, `seq`, `echo`
-      // and `cat` take no letter this cares about.
-      const tools = ["wc", "head", "tail", "sort", "uniq", "nl", "rev", "grep", "tr"];
+      // Eleven of this shell's twelve. `printf` is the only one left out, and `echo` is a builtin
+      // rather than one of these. `seq` and `cat` used to be excused here with the claim that they
+      // "take no letter this cares about" — which was wrong twice over: GNU's `seq` has -f, -s and -w,
+      // and its `cat` has nine letters, and this shell answered "No such file or directory" for every
+      // one of them, blaming the caller for a real flag.
+      const tools = ["wc", "head", "tail", "sort", "uniq", "nl", "rev", "grep", "tr", "seq", "cat"];
       let checked = 0;
       for (const tool of tools) {
         const letters = await gnuOptions(tool);
@@ -54,6 +57,9 @@ Deno.test({
             ? `echo x | grep -${letter} x`
             : tool === "tr"
             ? `echo x | tr -${letter} a b`
+            // `seq` needs an operand, or the answer is "missing operand" before it has read the flag.
+            : tool === "seq"
+            ? `seq -${letter} 3`
             : `echo x | ${tool} -${letter}`;
           const r = new Deno.Command(built, {
             args: ["-c", script],

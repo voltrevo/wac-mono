@@ -405,6 +405,11 @@ void runPipeline(Shell sh, Pipeline pipeline) {
 /**
  * Whether every stage of this pipeline is a program that can be spawned.
  *
+ * **One stage counts.** A lone command was collected — `Output` is bytes, so `wacsh -c 'seq 1 2000000000'`
+ * built the whole 20 GB in the shell and trapped at one wasm array, and `cat missing f` printed its
+ * complaint and `f`'s contents in whichever order the two buffers were flushed rather than in the order
+ * they happened. Relaying one stage is the same machinery as relaying six.
+ *
  * Decided from the *parse tree*, before anything is expanded, and that is deliberate: expansion runs
  * command substitutions, so asking twice would run them twice. So the command word of each stage has
  * to be a plain literal — `sort`, not `$cmd` — which every pipeline anybody types is.
@@ -415,7 +420,7 @@ void runPipeline(Shell sh, Pipeline pipeline) {
  * writes, and getting that wrong is worse than not streaming.
  */
 bool canStream(Shell sh, Pipeline pipeline) {
-  if (pipeline.stages.len() < 2) { return false; }
+  if (pipeline.stages.len() < 1) { return false; }
   if (!sh.externalSpawnable) { return false; }
   for (i32 i = 0; i < pipeline.stages.len(); i++) {
     Command cmd = pipeline.stages.get(i);
@@ -465,6 +470,7 @@ bool streamPipeline(Shell sh, Pipeline pipeline) {
   // exactly once and in order, which is what a command substitution in an argument requires.
   i32[] outH = i32[n](fill: -1);
   i32[] errH = i32[n](fill: -1);
+  bool inherited = false;
   for (i32 i = 0; i < n; i++) {
     Simple simple = pipeline.stages.get(i).simple;
     Vec<string> argv = Vec.create();
@@ -477,7 +483,14 @@ bool streamPipeline(Shell sh, Pipeline pipeline) {
       sh.status = 1;
       return true;
     }
-    Child kid = spawnStage(sh, argv);
+    // **A single stage may read the real descriptor.** With no pipe to feed it and nothing the shell is
+    // holding, a child gets the process's own standard input: streaming rather than buffered, and
+    // *shared*, which is what makes `cat; cat` print one line between them as bash does (issue 0042).
+    // A pipeline of two or more never inherits — the loop below `send`s to every stage, and a stage
+    // reading the descriptor as well would race the shell for the same bytes.
+    bool inheritIn = n == 1 && !sh.heldInput && sh.ownsStdin && !sh.triedStdin;
+    inherited = inheritIn;
+    Child kid = spawnStage(sh, argv, inheritIn);
     if (kid.unavailable()) {
       // No `spawn` in this world. Nothing has been started — this is the first stage, since every
       // stage asks the same world — so the caller can run the pipeline sequentially instead. Reporting
@@ -499,10 +512,14 @@ bool streamPipeline(Shell sh, Pipeline pipeline) {
   }
 
   // The shell's own input goes to the first stage, and then its input ends. `closeFeed`, not
-  // `closeSocket`: a program that reads to the end before answering needs that end while alive.
-  u8[] first = sh.restOfStdin();
-  if (first.len() > 0) { sh.cli.send(outH[0], first).wait(); }
-  sh.cli.closeFeed(outH[0]);
+  // `closeSocket`: a program that reads to the end before answering needs that end while alive. A
+  // stage that inherited the descriptor feeds itself, and sending it anything would be sending bytes
+  // the shell does not have.
+  if (!inherited) {
+    u8[] first = sh.restOfStdin();
+    if (first.len() > 0) { sh.cli.send(outH[0], first).wait(); }
+    sh.cli.closeFeed(outH[0]);
+  }
 
   // One read in flight per open stream. `alive` says which stages still have a handle worth reading;
   // a stage that is stopped or finished is dropped from the wait list rather than polled.
@@ -611,7 +628,7 @@ bool streamPipeline(Shell sh, Pipeline pipeline) {
  * A `$WACPATH` file that cannot be read falls through to the shell's own, as `trySpawn` does; one that
  * reads and will not start is returned as the failed child it is, and the caller reports 126.
  */
-Child spawnStage(Shell sh, Vec<string> argv) {
+Child spawnStage(Shell sh, Vec<string> argv, bool inheritIn) {
   i32 grants = GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV;
   string name = argv.get(0);
   string where = containsSlash(name) ? name : searchWacPath(sh, name);
@@ -623,16 +640,13 @@ Child spawnStage(Shell sh, Vec<string> argv) {
       u8[][] outer = u8[][argv.len() - 1](fill: u8[0]());
       for (i32 i = 1; i < argv.len(); i++) { outer[i - 1] = argv.get(i).toBytes(); }
       Child external = sh.cli
-        .spawn(string.fromBytes(prog.bytes), outer, grants, sh.cwd, false).wait();
+        .spawn(string.fromBytes(prog.bytes), outer, grants, sh.cwd, inheritIn).wait();
       if (!external.unavailable()) { return external; }
     }
   }
   u8[][] args = u8[][argv.len()](fill: u8[0]());
   for (i32 i = 0; i < argv.len(); i++) { args[i] = argv.get(i).toBytes(); }
-  // The first stage could inherit the shell's input, and deliberately does not: the caller `send`s to
-  // every stage, including the first, and a stage reading the real descriptor *as well* would race the
-  // shell for the same bytes. Feeding it is what makes the pipeline one shape.
-  return sh.cli.spawnSelf(args, grants, sh.cwd, false).wait();
+  return sh.cli.spawnSelf(args, grants, sh.cwd, inheritIn).wait();
 }
 
 /** Stop one stage and stop reading it: it has nowhere to write, so it is finished whether or not it agrees. */

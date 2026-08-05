@@ -75,6 +75,52 @@ const CASES: string[] = [
   `echo hello | rev`,
   `echo hello | wc -l`,
   `seq 1 5 | wc -l`,
+  // `seq`'s three-argument form, which was **read and thrown away**: `seq 1 2 9` printed `1 2`,
+  // taking the first two operands as first and last and ignoring the increment. It went unnoticed
+  // because `seq` is what the other cases here use to *make* input, so nobody asked it a question.
+  `seq 1 2 9`,
+  `seq 10 5 30`,
+  `seq 5 -1 1`,
+  `seq -1 1`,
+  `seq -3 -1 -6`,
+  `seq 1 -1 5`,
+  `seq 3 1`,
+  `seq 0`,
+  `seq 1 1 1`,
+  // …and what it says about what it will not do. Statuses are GNU's: 1 for every usage error.
+  `seq; echo status=$?`,
+  `seq abc; echo status=$?`,
+  `seq 1 2 3 4; echo status=$?`,
+  `seq 1 0 3; echo status=$?`,
+  `seq 1 2 x; echo status=$?`,
+  `seq -q 1; echo status=$?`,
+  `seq -- 3`,
+  // `cat` as a filter and as a refuser. `cat -Q` used to report "cat: -Q: No such file or directory",
+  // which blames whoever typed it for a mistake this program made.
+  `seq 1 3 | cat`,
+  `printf 'a\nb\n' | cat -`,
+  `echo x | cat -Q; echo status=$?`,
+  // …and `cat`'s nine flags, which were filenames until now. Each is a line transform and GNU's
+  // layout for each is exact, so every one of these is comparable rather than approximate.
+  `printf 'a\n\n\n\nb\tc\n' | cat -n`,
+  `printf 'a\n\n\n\nb\tc\n' | cat -b`,
+  `printf 'a\n\n\n\nb\tc\n' | cat -s`,
+  `printf 'a\n\n\n\nb\tc\n' | cat -ns`,
+  `printf 'a\n\n\n\nb\tc\n' | cat -bs`,
+  `printf 'a\n\n\n\nb\tc\n' | cat -E`,
+  `printf 'a\n\n\n\nb\tc\n' | cat -T`,
+  `printf 'a\n\n\n\nb\tc\n' | cat -A`,
+  `printf 'a\n\n\n\nb\tc\n' | cat -e`,
+  `printf 'a\n\n\n\nb\tc\n' | cat -t`,
+  `printf 'a\n\n\n\nb\tc\n' | cat -u`,
+  String.raw`printf 'a\001b\n' | cat -v`,
+  String.raw`printf 'a\001b\n' | cat -vE`,
+  String.raw`printf 'a\177b\n' | cat -v`,
+  // A last line with no newline: `-E`'s `$` marks the newline, so it does not get one, and `-b`
+  // still numbers it. Both were wrong in the first version of this.
+  `printf 'x' | cat -A`,
+  `printf 'x' | cat -n`,
+  `printf 'x' | cat -b`,
   // More than one count, which GNU right-aligns in columns seven wide when it cannot know the size
   // of its input in advance. Every `wc` case here asked for a single count until this one, and every
   // `wc` case with a file was small enough that GNU's width was 1 — so a `wc` that printed one space
@@ -859,6 +905,17 @@ for (const [i, script] of [
   `printf 'ab\n' > f; rev f`,
   `printf 'a\nb\n' > f; nl f`,
   `printf 'a\nb\n' > f; cat f - < f`,
+  // A file it cannot open is reported and the *rest are still printed*, as GNU does. This used to
+  // stop at the first failure, so `cat missing f` printed the complaint and none of `f` — with the
+  // right status, which is what made it invisible.
+  `printf 'a\nb\n' > f; cat missing f; echo status=$?`,
+  `printf 'a\nb\n' > f; cat f missing; echo status=$?`,
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; cat f1 missing f2; echo status=$?`,
+  `printf 'a\nb\n' > f; cat -n f; echo status=$?`,
+  // Numbering and squeezing run across the operands, as GNU's do.
+  `printf 'a\nb\n' > f1; printf 'c\n' > f2; cat -n f1 f2`,
+  `printf 'a\n\n' > f1; printf '\nc\n' > f2; cat -s f1 f2`,
+  `printf 'a\nb\n' > f; cat -n f - < f`,
   // Several of them, where the shape of the answer changes: `wc` names each file and totals them,
   // `head` and `tail` write a header per block, `grep` labels its lines, and `sort`, `nl` and `rev`
   // treat the operands as one concatenation — `nl`'s numbering runs on across the boundary.
@@ -1268,6 +1325,17 @@ Deno.test({
     const dir = await Deno.makeTempDir({ prefix: "sh-unread-" });
     try {
       const cases = [
+        // Usage errors, which GNU words to the byte and follows with a "Try 'x --help'" line. They are
+        // here rather than in a test of their own because the property is the same one: where the
+        // message is derivable it is compared, and where it is *ours* — a gap this shell has and GNU
+        // does not — it is not comparable and is not compared.
+        "seq",
+        "seq abc",
+        "seq 1 2 3 4",
+        "seq 1 0 3",
+        "seq -q 1",
+        "seq --nope 1",
+        "echo x | cat -Q",
         "cat missing",
         "wc -l missing",
         "head -1 missing",
