@@ -72,6 +72,13 @@ int main(int argc, char **argv) {
   printf("ACCEPTED\n");
   printf("nickname %s\n", ri->nickname ? ri->nickname : "(none)");
   printf("or_port %d\n", ri->ipv4_orport);
+  /* The digest a vote's `r` line carries, base64 of these 20 bytes with the padding stripped. Printed
+   * because the span it covers is not obvious from the document and tor is the only authority on it. */
+  {
+    char b16[HEX_DIGEST_LEN + 1];
+    base16_encode(b16, sizeof(b16), ri->cache_info.signed_descriptor_digest, DIGEST_LEN);
+    printf("descriptor_digest %s\n", b16);
+  }
   printf("bandwidth %u %u %u\n", (unsigned)ri->bandwidthrate,
          (unsigned)ri->bandwidthburst, (unsigned)ri->bandwidthcapacity);
   return 0;

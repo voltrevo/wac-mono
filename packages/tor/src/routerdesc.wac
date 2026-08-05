@@ -305,3 +305,126 @@ export u8[] routerDescriptor(RelayKeys k, RelayInfo info) {
 const string PROTO_LINE =
   "Cons=1-2 Desc=1-2 DirCache=1-2 FlowCtrl=1 HSDir=1-2 HSIntro=3-5 HSRend=1-2 Link=1-5 " +
   "LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-3";
+
+// ── The `r` line an authority writes about a relay ─────────────────────────────
+
+/**
+ * The digest that identifies a descriptor: SHA-1 over the span the RSA signature covers.
+ *
+ * **Not a hash of the whole document.** It stops after `router-signature\n`, before the signature
+ * block, so a descriptor and its digest do not include the signature that authenticates them. This is
+ * `rsaDescriptorDigest` under a second name because it is the same value used for two unrelated
+ * purposes — what the RSA signature signs, and how a vote refers to the descriptor — and a reader of
+ * either call site should not have to know about the other.
+ *
+ * The confusion is worth naming: hashing the whole descriptor yields a well-formed 20 bytes that no
+ * authority agrees with, and nothing local can tell the difference. Asking tor which span it meant is
+ * what settled it — `parsedesc-probe.c` prints `signed_descriptor_digest`, and with the whole-document
+ * span zero of five real vote entries paired with their descriptors.
+ */
+export u8[] descriptorIdentityDigest(u8[] descriptor) { return rsaDescriptorDigest(descriptor); }
+
+/**
+ * The `r` line an authority writes about a relay, derived from the relay's own descriptor.
+ *
+ * `r nickname identity digest publication address ORPort DirPort`, where `identity` is the 20-byte
+ * SHA-1 of the DER `RSAPublicKey` identity and `digest` is the descriptor digest above — both base64
+ * with the padding stripped, which is a third spelling of the fingerprint: a descriptor writes it as
+ * spaced uppercase hex, a key certificate as unbroken hex, and a vote as base64.
+ *
+ * Empty if the descriptor is missing anything the line needs, rather than a line with a gap in it.
+ */
+export u8[] routerStatusLine(u8[] descriptor) {
+  u8[] router = lineValue(descriptor, "router ");
+  u8[] published = lineValue(descriptor, "published ");
+  u8[] fingerprint = lineValue(descriptor, "fingerprint ");
+  if (router.len() == 0 || published.len() == 0 || fingerprint.len() == 0) { return u8[0](); }
+
+  // `router <nickname> <address> <ORPort> <SOCKSPort> <DirPort>` — the third field is dead weight in
+  // the descriptor and the r line skips it, so the fields cannot simply be copied across in order.
+  u8[][] parts = splitSpaces(router);
+  if (parts.len() < 5) { return u8[0](); }
+
+  u8[] identity = unhex(fingerprint);
+  if (identity.len() != 20) { return u8[0](); }
+  u8[] digest = descriptorIdentityDigest(descriptor);
+  if (digest.len() != 20) { return u8[0](); }
+
+  Buf out = Buf.create();
+  out.pushAll("r ".toBytes());
+  out.pushAll(parts[0]);
+  out.push(32);
+  out.pushAll(b64Unpadded(identity).toBytes());
+  out.push(32);
+  out.pushAll(b64Unpadded(digest).toBytes());
+  out.push(32);
+  out.pushAll(published);
+  out.push(32);
+  out.pushAll(parts[1]);
+  out.push(32);
+  out.pushAll(parts[2]);
+  out.push(32);
+  out.pushAll(parts[4]);
+  return out.bytes();
+}
+
+/** The rest of the line starting with `keyword`, without its newline. Empty if absent. */
+export u8[] lineValue(u8[] doc, string keyword) {
+  i32 at = pastLineStarting(doc, keyword.toBytes());
+  if (at < 0) { return u8[0](); }
+  i32 end = at;
+  while (end < doc.len() && doc[end] != 10) { end = end + 1; }
+  u8[] out = u8[end - at]();
+  for (i32 i = 0; i < end - at; i++) { out[i] = doc[at + i]; }
+  return out;
+}
+
+/** Split on single spaces. Empty fields are dropped, which is what a run of spaces would produce. */
+u8[][] splitSpaces(u8[] s) {
+  i32 count = 0;
+  i32 i = 0;
+  while (i < s.len()) {
+    while (i < s.len() && s[i] == 32) { i = i + 1; }
+    if (i >= s.len()) { break; }
+    count = count + 1;
+    while (i < s.len() && s[i] != 32) { i = i + 1; }
+  }
+  u8[][] out = u8[][count]();
+  i32 n = 0;
+  i = 0;
+  while (i < s.len()) {
+    while (i < s.len() && s[i] == 32) { i = i + 1; }
+    if (i >= s.len()) { break; }
+    i32 from = i;
+    while (i < s.len() && s[i] != 32) { i = i + 1; }
+    u8[] part = u8[i - from]();
+    for (i32 j = 0; j < i - from; j++) { part[j] = s[from + j]; }
+    out[n] = part;
+    n = n + 1;
+  }
+  return out;
+}
+
+/** Hex to bytes, spaces ignored — a descriptor's fingerprint line is written in groups. */
+u8[] unhex(u8[] text) {
+  i32 count = 0;
+  for (i32 i = 0; i < text.len(); i++) { if (text[i] != 32) { count = count + 1; } }
+  if (count % 2 != 0) { return u8[0](); }
+  u8[] out = u8[count / 2]();
+  i32 n = 0;
+  i32 hi = -1;
+  for (i32 i = 0; i < text.len(); i++) {
+    if (text[i] == 32) { continue; }
+    i32 v = hexValue(text[i]);
+    if (v < 0) { return u8[0](); }
+    if (hi < 0) { hi = v; } else { out[n] = hi * 16 + v; n = n + 1; hi = -1; }
+  }
+  return out;
+}
+
+i32 hexValue(i32 c) {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  return -1;
+}

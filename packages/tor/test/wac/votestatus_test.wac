@@ -1,0 +1,90 @@
+// The `r` line an authority writes, against the lines a chutney network's authorities wrote.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  routerStatusLine, descriptorIdentityDigest, lineValue, b64Unpadded,
+} from "../../src/routerdesc.wac";
+
+const i32 V_COUNT = 0;
+const i32 V_DESCRIPTOR = 1;
+const i32 V_R_LINE = 2;
+const i32 V_PUBLICATION = 3;
+const i32 V_DIGEST = 4;
+const i32 V_ADDRESS = 5;
+const i32 V_ORPORT = 6;
+const i32 V_DIRPORT = 7;
+
+u8[] arg1(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+u8[] none() { return u8[0](); }
+
+export string test_the_r_line_is_the_one_tors_authority_wrote(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(V_COUNT, none(), none())[0];
+  t.isTrue(n >= 3, "several relays, not one");
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] desc = ref(V_DESCRIPTOR, arg1(i), none());
+    string which = "relay " + itoa64(i as i64);
+
+    // The whole line, from the descriptor alone.
+    t.eqBytes(routerStatusLine(desc), ref(V_R_LINE, arg1(i), none()),
+              which + ": our r line is the one tor's authority wrote");
+
+    // And the digest field on its own, so a failure says which part moved rather than only that the
+    // line differs. This is the field the whole pairing rests on.
+    t.eqBytes(b64Unpadded(descriptorIdentityDigest(desc)).toBytes(),
+              ref(V_DIGEST, arg1(i), none()),
+              which + ": the descriptor digest is the one tor recorded");
+
+    // The publication time on the r line is the descriptor's own `published` line, copied rather than
+    // recomputed — an authority does not restate the time in its own words.
+    t.eqBytes(lineValue(desc, "published "), ref(V_PUBLICATION, arg1(i), none()),
+              which + ": the publication time is the descriptor's own");
+  }
+  return t.report();
+}
+
+export string test_the_r_line_skips_the_descriptors_dead_field(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] desc = ref(V_DESCRIPTOR, arg1(0), none());
+
+  // A descriptor's router line is `router <nickname> <address> <ORPort> <SOCKSPort> <DirPort>`, and the
+  // SOCKSPort is long dead and always 0. The r line has no such field, so the ports cannot be copied
+  // across in order — the last field of the r line is the descriptor's *fifth*, not its fourth.
+  u8[] router = lineValue(desc, "router ");
+  t.isTrue(router.len() > 0, "the descriptor has a router line");
+
+  // The r line's trailing fields are address, ORPort, DirPort — indices 6, 7 and 8, because the
+  // publication time occupies two of them.
+  u8[] line = routerStatusLine(desc);
+  t.eqBytes(fieldOf(line, 6), ref(V_ADDRESS, arg1(0), none()), "field 6 is the address");
+  t.eqBytes(fieldOf(line, 7), ref(V_ORPORT, arg1(0), none()),
+            "field 7 is the ORPort, the descriptor's third");
+  t.eqBytes(fieldOf(line, 8), ref(V_DIRPORT, arg1(0), none()),
+            "field 8 is the DirPort, the descriptor's fifth and not its fourth");
+
+  // A descriptor missing a line the r line needs gives nothing rather than a line with a hole in it.
+  t.eqI32(routerStatusLine("router x 127.0.0.1 1 0 2\n".toBytes()).len(), 0,
+          "a descriptor with no fingerprint or published line produces no r line");
+  return t.report();
+}
+
+/** The nth space-separated field of a line. */
+u8[] fieldOf(u8[] line, i32 which) {
+  i32 at = 0;
+  i32 seen = 0;
+  while (at < line.len() && seen < which) {
+    if (line[at] == 32) { seen = seen + 1; }
+    at = at + 1;
+  }
+  i32 end = at;
+  while (end < line.len() && line[end] != 32) { end = end + 1; }
+  u8[] out = u8[end - at]();
+  for (i32 i = 0; i < end - at; i++) { out[i] = line[at + i]; }
+  return out;
+}
