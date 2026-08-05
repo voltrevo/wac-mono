@@ -37,7 +37,7 @@ import {
 } from "../../src/relaycert.wac";
 import { certCertifiedKey, certType } from "../../src/hsdesc.wac";
 import {
-  edDescriptorDigest, rsaDescriptorDigest, pastLineStarting,
+  edDescriptorDigest, rsaDescriptorDigest, pastLineStarting, pemBlock,
 } from "../../src/routerdesc.wac";
 import { ed25519Verify } from "../../../crypto/src/ed25519.wac";
 
@@ -59,6 +59,8 @@ const i32 D_TEXT = 14;
 const i32 D_IDENTITY_CERT = 15;
 const i32 D_ROUTER_SIG = 16;
 const i32 D_RSA_RECOVER = 17;
+const i32 D_ONION_KEY_DER = 18;
+const i32 D_ONION_KEY_PEM = 19;
 
 u8[] arg1(i32 i) {
   u8[] a = u8[1]();
@@ -265,5 +267,41 @@ export string test_a_digest_span_stops_where_tor_stops(fn[u8[](i32, u8[], u8[])]
           "no keyword, no digest");
   t.eqI32(rsaDescriptorDigest("router nickname\n".toBytes()).len(), 0,
           "no keyword, no RSA digest");
+  return t.report();
+}
+
+export string test_a_pem_block_is_wrapped_the_way_tor_wraps_one(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(V_COUNT, none(), none())[0];
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] der = ref(D_ONION_KEY_DER, arg1(i), none());
+    u8[] want = ref(D_ONION_KEY_PEM, arg1(i), none());
+    string which = "descriptor " + itoa64(i as i64);
+
+    t.isTrue(der.len() > 100, which + ": the onion key decoded");
+    // Byte for byte against tor's own block: header, 64-character lines, the trailing newline on the
+    // last one, and the footer. Wrapping at 76 — RFC 2045's width, and most tools' default — would
+    // still be valid base64 and would change every byte after the first line.
+    t.eqBytes(pemBlock("RSA PUBLIC KEY", der), want,
+              which + ": our PEM block is the block tor wrote");
+  }
+
+  // Every line is at most 64 characters, checked directly rather than inferred from the comparison
+  // above, so a change in wrapping says which rule it broke.
+  u8[] der = ref(D_ONION_KEY_DER, arg1(0), none());
+  u8[] block = pemBlock("RSA PUBLIC KEY", der);
+  i32 run = 0;
+  i32 longest = 0;
+  for (i32 i = 0; i < block.len(); i++) {
+    if (block[i] == 10) {
+      if (run > longest) { longest = run; }
+      run = 0;
+    } else {
+      run = run + 1;
+    }
+  }
+  t.eqI32(run, 0, "the block ends with a newline");
+  t.isTrue(longest <= 64, "no line exceeds 64 characters");
   return t.report();
 }

@@ -51,6 +51,8 @@ const D_TEXT = 14; // a[0]=i: the whole descriptor, as tor wrote it
 const D_IDENTITY_CERT = 15; // a[0]=i: identity-ed25519, whose certified key is the signing key
 const D_ROUTER_SIG = 16; // a[0]=i: the 64 bytes of router-sig-ed25519
 const D_RSA_RECOVER = 17; // a[0]=i: the digest node recovers from tor's own router-signature
+const D_ONION_KEY_DER = 18; // a[0]=i: the onion-key PEM body, decoded
+const D_ONION_KEY_PEM = 19; // a[0]=i: the onion-key PEM block exactly as tor wrote it
 
 const v = JSON.parse(
   await Deno.readTextFile(new URL("data/routerdesc_vectors.json", import.meta.url)),
@@ -188,6 +190,18 @@ function ref(what: number, a: Uint8Array, b: Uint8Array): Uint8Array {
     }
     case D_RSA_RECOVER:
       return recoverRouterSignature(v.descriptors[a[0]].descriptor);
+    case D_ONION_KEY_DER: {
+      const body = pemAfter(v.descriptors[a[0]].descriptor, "onion-key", "RSA PUBLIC KEY");
+      if (!body) return new Uint8Array(0);
+      return Uint8Array.from(atob(body.replace(/\s/g, "")), (c) => c.charCodeAt(0));
+    }
+    case D_ONION_KEY_PEM: {
+      const body = pemAfter(v.descriptors[a[0]].descriptor, "onion-key", "RSA PUBLIC KEY");
+      if (!body) return new Uint8Array(0);
+      return new TextEncoder().encode(
+        `-----BEGIN RSA PUBLIC KEY-----\n${body}-----END RSA PUBLIC KEY-----\n`,
+      );
+    }
     default:
       throw new Error(`unknown vector field ${what}`);
   }

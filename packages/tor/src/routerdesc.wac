@@ -26,6 +26,9 @@
 //
 // Four independent choices, each of which produces a plausible 64 or 128 bytes when wrong.
 
+import { Buf } from "../../bytes/src/buf.wac";
+import { ALPHABET_STANDARD, encode } from "../../codec/src/base64.wac";
+import { derConcat, derInteger, derSequence } from "../../tls/src/derwrite.wac";
 import { sha1 } from "../../crypto/src/sha1.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
 
@@ -92,4 +95,44 @@ export u8[] rsaDescriptorDigest(u8[] descriptor) {
   i32 end = pastLineStarting(descriptor, rsaSignatureKeyword());
   if (end < 0) { return u8[0](); }
   return sha1(head(descriptor, end));
+}
+
+// ── The PEM blocks a descriptor carries ───────────────────────────────────────
+
+/**
+ * `SEQUENCE { INTEGER n, INTEGER e }` — a PKCS#1 `RSAPublicKey`.
+ *
+ * Not a `SubjectPublicKeyInfo`, which is the same key wrapped in an algorithm identifier and is what
+ * most tools mean by an RSA public key. A descriptor's `onion-key` and `signing-key` blocks are the
+ * bare sequence, and a relay's fingerprint is SHA-1 of it — three plausible encodings of one key, and
+ * only this one is what every other relay computes.
+ */
+export u8[] rsaPublicKeyDer(u8[] modulus, u8[] exponent) {
+  return derSequence(derConcat(u8[][](derInteger(modulus), derInteger(exponent))));
+}
+
+/** SHA-1 of the DER `RSAPublicKey`, which is what a relay's identity fingerprint is. */
+export u8[] rsaFingerprint(u8[] modulus, u8[] exponent) {
+  return sha1(rsaPublicKeyDer(modulus, exponent));
+}
+
+/**
+ * A PEM block, wrapped the way tor writes one.
+ *
+ * `BASE64_ENCODE_MULTILINE` breaks at **64** characters, and the last line gets a newline like any
+ * other. The width is not cosmetic here: these blocks sit inside a document that is hashed, so a
+ * relay that wrapped at 76 — the width most base64 tools default to, and the one RFC 2045 specifies —
+ * would produce a descriptor whose signature is over different bytes than a reader expects.
+ */
+export u8[] pemBlock(string label, u8[] der) {
+  u8[] body = encode(der, ALPHABET_STANDARD(), true);
+  Buf out = Buf.create();
+  out.pushAll(("-----BEGIN " + label + "-----\n").toBytes());
+  for (i32 i = 0; i < body.len(); i = i + 64) {
+    i32 n = body.len() - i < 64 ? body.len() - i : 64;
+    out.pushBytes(body, i, n);
+    out.push(10);
+  }
+  out.pushAll(("-----END " + label + "-----\n").toBytes());
+  return out.bytes();
 }

@@ -54,7 +54,6 @@ import { selfSignedEd25519, selfSignedRsa } from "../../tls/src/x509gen.wac";
 import { generateRsaKey, RsaKey } from "../../crypto/src/rsagen.wac";
 import { ed25519PublicKey } from "../../crypto/src/ed25519.wac";
 import { x25519Base } from "../../crypto/src/x25519.wac";
-import { sha1 } from "../../crypto/src/sha1.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
 import {
   ed25519Cert, rsaCrossCert, linkCertDigest, certsCell,
@@ -67,6 +66,7 @@ import {
   DESTROY_PROTOCOL,
 } from "./relaycircuit.wac";
 import { Hop } from "./relay.wac";
+import { rsaFingerprint } from "./routerdesc.wac";
 import {
   cellSize, cellCommand, cellCircId, cellPayload, cmdVersions, cmdNetinfo, cmdCreate2, cmdRelay,
   cmdRelayEarly, cmdPadding, cmdDestroy, cmdCreateFast,
@@ -134,68 +134,6 @@ export Identity deriveIdentity(u8[] seed, i64 now) {
                   edIdentity, edSigning, onion, cert, tlsSeed);
 }
 
-/**
- * The relay's fingerprint: SHA-1 of the DER `RSAPublicKey`.
- *
- * Not of the modulus, and not of a SubjectPublicKeyInfo — of the bare `SEQUENCE { n, e }`. Three
- * plausible things to hash and only one of them is what every other relay computes.
- */
-export u8[] rsaFingerprint(u8[] modulus, u8[] exponent) {
-  return sha1(rsaPublicKeyDer(modulus, exponent));
-}
-
-/** `SEQUENCE { INTEGER n, INTEGER e }`, which is what a fingerprint is taken over. */
-u8[] rsaPublicKeyDer(u8[] modulus, u8[] exponent) {
-  u8[] n = derInteger(modulus);
-  u8[] e = derInteger(exponent);
-  i32 bodyLen = n.len() + e.len();
-  u8[] length = derLen(bodyLen);
-  u8[] out = u8[1 + length.len() + bodyLen]();
-  out[0] = 0x30;
-  for (i32 i = 0; i < length.len(); i++) { out[1 + i] = length[i]; }
-  i32 at = 1 + length.len();
-  for (i32 i = 0; i < n.len(); i++) { out[at + i] = n[i]; }
-  at = at + n.len();
-  for (i32 i = 0; i < e.len(); i++) { out[at + i] = e[i]; }
-  return out;
-}
-
-u8[] derInteger(u8[] magnitude) {
-  i32 from = 0;
-  while (from + 1 < magnitude.len() && magnitude[from] == 0) { from++; }
-  bool pad = magnitude[from] >= 0x80;
-  i32 n = magnitude.len() - from;
-  u8[] length = derLen(n + (pad ? 1 : 0));
-  u8[] out = u8[1 + length.len() + n + (pad ? 1 : 0)]();
-  out[0] = 0x02;
-  for (i32 i = 0; i < length.len(); i++) { out[1 + i] = length[i]; }
-  i32 at = 1 + length.len() + (pad ? 1 : 0);
-  for (i32 i = 0; i < n; i++) { out[at + i] = magnitude[from + i]; }
-  return out;
-}
-
-u8[] derLen(i32 n) {
-  if (n < 128) {
-    u8[] o = u8[1]();
-    o[0] = n;
-    return o;
-  }
-  i32 bytes = 0;
-  i32 v = n;
-  while (v > 0) {
-    bytes = bytes + 1;
-    v = v / 256;
-  }
-  u8[] o = u8[1 + bytes]();
-  o[0] = 0x80 | bytes;
-  i32 shift = 1;
-  for (i32 i = 0; i < bytes; i++) { shift = shift * 256; }
-  for (i32 i = 0; i < bytes; i++) {
-    shift = shift / 256;
-    o[1 + i] = (n / shift) % 256;
-  }
-  return o;
-}
 
 /** The CERTS cell body this relay presents: types 4, 5 and 7. */
 export u8[] identityCerts(Identity id, i64 now) {
