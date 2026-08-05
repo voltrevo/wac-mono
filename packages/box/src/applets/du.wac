@@ -7,7 +7,7 @@
 
 import { Cli, Core, Stat } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { itoa, itoa64 } from "../lib/num.wac";
+import { itoa, itoa64 } from "../../../fmt/src/itoa.wac";
 
 /** As in `find`: a bound rather than a cycle check, because `stat` cannot see a symlink. */
 i32 MAX_DEPTH() { return 64; }

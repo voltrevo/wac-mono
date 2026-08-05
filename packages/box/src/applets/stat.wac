@@ -6,7 +6,7 @@
 
 import { Cli, Core, Stat } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { itoa64 } from "../lib/num.wac";
+import { itoa64 } from "../../../fmt/src/itoa.wac";
 import { format } from "../../../datetime/src/rfc3339.wac";
 
 export i32 stat(Core core, Cli cli, Args a) {

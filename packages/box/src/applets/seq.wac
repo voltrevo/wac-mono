@@ -11,7 +11,7 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { atoi, itoa } from "../lib/num.wac";
+import { atoi, itoa } from "../../../fmt/src/itoa.wac";
 import { Sink } from "../../../platform/src/stream.wac";
 
 export i32 seq(Core core, Cli cli, Args a) {

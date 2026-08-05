@@ -8,7 +8,7 @@ import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
 import { Feed, Line, Lines, emit, nextLine } from "../../../platform/src/stream.wac";
-import { itoa } from "../lib/num.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
 
 export i32 split(Core core, Cli cli, Args a) {
   if (a.rest.len() < 1) {

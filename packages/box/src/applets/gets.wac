@@ -15,7 +15,7 @@
 
 import { Cli, Core, FileResult, Socket } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
-import { itoa } from "../lib/num.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
 import { concat, slice } from "../lib/bytes.wac";
 import { recordsReady } from "../../../tls/src/record.wac";
 import { tlsClientInit, tlsClientFeed, tlsClientSend, tlsClientClose,

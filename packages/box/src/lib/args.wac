@@ -5,7 +5,7 @@
 
 import { Cli } from "../../../platform/src/platform.wac";
 import { slice } from "./bytes.wac";
-import { atoi } from "./num.wac";
+import { atoi } from "../../../fmt/src/itoa.wac";
 
 export struct Args {
   /**
