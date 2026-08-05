@@ -266,13 +266,31 @@ export const WORKER_MARKER = "//wac-worker 1";
 /**
  * How long a bundle that *is* one has to say `ready`.
  *
- * Generous, and now fatal rather than assumed-alive: the operator's call on 0033 was that `ready` is a
- * required part of the protocol. The marker above means the only thing this can still catch is a
- * genuine worker that takes seconds to evaluate, which a 700 KiB module on five loaded cores does not —
- * evaluation is tens of milliseconds, so this is two orders of magnitude of headroom, and what it buys
- * is that a wedge became a diagnostic.
+ * Fatal rather than assumed-alive: the operator's call on 0033 was that `ready` is a required part of
+ * the protocol. The marker above means the only thing this can still catch is a bundle that carries the
+ * marker and never speaks — which is malformed, not slow.
+ *
+ * **It was five seconds, and five seconds turned out to be a guess about the machine.** Evaluation is
+ * tens of milliseconds when a core is free, so five seconds looked like two orders of magnitude of
+ * headroom; then every command in the shell became a spawned worker, a suite running eight scripts at a
+ * time met a machine at load 14, and one `printf` in 722 differential scripts missed the deadline. The
+ * cost of waiting longer is paid only by a bundle that is already broken, and the cost of waiting less
+ * is a red suite that says "does not speak the bridge protocol" about a program that speaks it fine.
+ * So: generous by two more orders of magnitude, and overridable for the one test that has to wait it
+ * out.
  */
-const LOAD_GRACE_MS = 5000;
+const LOAD_GRACE_MS = 30_000;
+
+/**
+ * The grace, in milliseconds, or the default.
+ *
+ * A parameter rather than a constant read from the environment here, because this file also runs in a
+ * page: which knob a host offers is the host's business. `deno.ts` and `node.ts` read
+ * `WAC_LOAD_GRACE_MS`, which is how `spawn.test.ts` waits one second for the deadline instead of thirty.
+ */
+export function graceOf(ms: number | undefined): number {
+  return ms === undefined || !Number.isFinite(ms) || ms <= 0 ? LOAD_GRACE_MS : ms;
+}
 
 /** One spawned worker, from the parent's side. */
 export type Child = {
@@ -380,6 +398,7 @@ export function spawnChild(
   ) => { stop(): void },
   makeBridge: () => { sab: SharedArrayBuffer },
   makeWorker: (source: string) => WorkerLike = blobWorker,
+  graceMs?: number,
 ): Child {
   // The two the child writes are capped; what the parent sends it is not — see `ByteQueue`.
   const out = new ByteQueue(QUEUE_CAP);
@@ -432,12 +451,13 @@ export function spawnChild(
   // judge is caught before the worker starts.
   let settleLoaded: (why: string) => void;
   const loaded = new Promise<string>((res) => { settleLoaded = res; });
+  const grace = graceOf(graceMs);
   const assumeAlive = setTimeout(
     () => settleLoaded(
-      "did not report ready within " + LOAD_GRACE_MS + "ms: a worker bundle that does not speak the " +
+      "did not report ready within " + grace + "ms: a worker bundle that does not speak the " +
         "bridge protocol, or a machine too loaded to have evaluated it",
     ),
-    LOAD_GRACE_MS,
+    grace,
   );
   const done = (why: string) => {
     clearTimeout(assumeAlive);

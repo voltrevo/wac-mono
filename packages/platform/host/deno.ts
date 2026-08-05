@@ -6,6 +6,7 @@
 
 import { type Handlers, serveHostCalls } from "./respond.ts";
 import {
+  blobWorker,
   ByteQueue,
   type Child,
   failedChild,
@@ -184,6 +185,23 @@ async function denoDir(path: string): Promise<string[]> {
   return names.sort();
 }
 
+/**
+ * `WAC_LOAD_GRACE_MS`, when it is set and readable.
+ *
+ * Only `spawn.test.ts` sets it, so that the one test which has to *wait out* the ready deadline waits a
+ * second rather than the thirty a loaded machine may need. Read directly rather than through this
+ * world's `env` option, because the deadline is the host's own affair and a program with no `env` grant
+ * still has one; wrapped because a process without `--allow-env` throws on the attempt.
+ */
+function graceEnv(): number | undefined {
+  try {
+    const raw = Deno.env.get("WAC_LOAD_GRACE_MS");
+    return raw === undefined ? undefined : Number(raw);
+  } catch {
+    return undefined;
+  }
+}
+
 export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   const args = opts.args ?? [];
   const log = opts.log ?? ((l: string) => console.log(l));
@@ -259,7 +277,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
         // host's own directory, which is what a caller with no opinion passes.
         cwd: childCwd === "" ? opts.cwd : childCwd,
       }));
-    }, newBridge);
+    }, newBridge, blobWorker, graceEnv());
 
     const why = await child.loaded;
     if (why !== "") {

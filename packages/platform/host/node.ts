@@ -155,6 +155,18 @@ function lineOf(p: Uint8Array): Uint8Array {
   return out;
 }
 
+/**
+ * `WAC_LOAD_GRACE_MS`, when it is set.
+ *
+ * The same knob `deno.ts` reads, for the same reason: only `spawn.test.ts` sets it, so that the one
+ * test which has to wait out the ready deadline waits a second rather than thirty.
+ */
+function graceEnv(): number | undefined {
+  const raw = (globalThis as { process?: { env?: Record<string, string | undefined> } })
+    .process?.env?.WAC_LOAD_GRACE_MS;
+  return raw === undefined ? undefined : Number(raw);
+}
+
 /** Node's globals, described rather than imported, so this file type-checks under Deno. */
 type NodeProcess = { argv: string[]; env: Record<string, string | undefined> };
 type NodeFs = {
@@ -250,7 +262,7 @@ export function nodeWorld(
         selfSource: opts.selfSource,
         cwd: childCwd === "" ? opts.cwd : childCwd,
       }));
-    }, newBridge, makeWorker);
+    }, newBridge, makeWorker, graceEnv());
 
     const why = await child.loaded;
     if (why !== "") {

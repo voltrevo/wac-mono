@@ -271,7 +271,10 @@ Deno.test({
     const runner = await Deno.makeTempFile({ prefix: "wac-mute-runner-" });
     const mute = await Deno.makeTempFile({ prefix: "wac-mute-", suffix: ".worker.js" });
     try {
-      await buildApp("packages/platform/example/runner.wac", runner, { read: true });
+      // `env` as well as `read`, and only here: the deadline knob below is read with `Deno.env.get`,
+      // which a program built without the grant cannot call at all. The grant is the *process's*, not
+      // the wac program's — `runner.wac` never asks for an environment variable.
+      await buildApp("packages/platform/example/runner.wac", runner, { read: true, env: true });
       // The marker, and then nothing. Valid JavaScript, evaluates cleanly, says nothing.
       await Deno.writeTextFile(mute, `${WORKER_MARKER}\n// and not another word\n`);
 
@@ -280,12 +283,19 @@ Deno.test({
         args: [mute, "anything"],
         stdout: "piped",
         stderr: "piped",
+        // The deadline itself, shortened for the one test that has to *wait it out*. It is thirty
+        // seconds in a built program, because five turned out to be a guess about how loaded the
+        // machine is: a shell where every command is a spawned worker missed it once in 722
+        // differential scripts and reported a program that speaks the protocol as one that does not.
+        env: { WAC_LOAD_GRACE_MS: "1000", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+        clearEnv: true,
       }).outputSync();
       const took = Date.now() - started;
       const err = new TextDecoder().decode(r.stderr);
 
       assertEquals(r.code, 1, `it should fail, and say so: ${err}`);
       assertEquals(err.includes("did not report ready"), true, `naming the gap: ${err}`);
+      assertEquals(err.includes("1000ms"), true, `and the deadline it waited: ${err}`);
       // Bounded, which is the whole difference: it used to be unbounded, and "hangs" and "is slow"
       // look identical from outside. Generous on the upper side because this machine is shared.
       assertEquals(took < 60_000, true, `${took} ms — the grace did not end it`);
