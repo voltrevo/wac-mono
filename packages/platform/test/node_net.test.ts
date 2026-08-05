@@ -1,6 +1,7 @@
 // Imported for its side effect: retries a spawn that fails with "Text file busy" and names
 // whoever held the file, if anyone did. wac-mono 0074.
 import "../../../harness/spawnRetry.ts";
+import { freePort } from "../../../harness/port.ts";
 // The Node host's sockets, against the Deno host's, with a real client attached.
 //
 // **This path had no test.** `platform.test.ts` builds the same program for both runtimes and compares
@@ -128,9 +129,9 @@ Deno.test({
       // A port from the kernel rather than a literal: bound, read, released, then handed over. The
       // window between releasing and binding is a race, and it is a smaller one than sharing a fixed
       // number with every other suite on this machine.
-      const probe = Deno.listen({ hostname: "127.0.0.1", port: 0 });
-      const port = (probe.addr as Deno.NetAddr).port;
-      probe.close();
+      // `freePort` rather than probe-and-close here: the port is handed to a *child*, so the window
+      // between the close and its bind is the race in wac-mono 0069.
+      const port = freePort();
       const child = new Deno.Command("node", {
         args: [nodeOut, "127.0.0.1", String(port)],
         stdout: "piped",

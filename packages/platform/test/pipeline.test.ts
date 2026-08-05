@@ -12,6 +12,7 @@ import { buildApp } from "../build.ts";
 // Imported for its side effect: retries a spawn that fails with "Text file busy" and names
 // whoever held the file, if anyone did. wac-mono 0074.
 import "../../../harness/spawnRetry.ts";
+import { freePort } from "../../../harness/port.ts";
 
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
@@ -68,9 +69,8 @@ Deno.test("a child serves a socket it cannot see", async () => {
 
     // A port the OS just confirmed is free. Racy in principle; the alternative is a fixed
     // port that collides with the other agents sharing this container, which is worse.
-    const probe = Deno.listen({ port: 0 });
-    const port = (probe.addr as Deno.NetAddr).port;
-    probe.close();
+    // `freePort`: this port goes to a spawned `inetd`, so the close-then-bind window is 0069's race.
+    const port = freePort();
 
     const p = new Deno.Command(inetd, {
       args: [String(port), child],

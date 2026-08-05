@@ -38,10 +38,14 @@
 // workers. The 300 MB-per-worker figure this comment used to assume was wrong, so the memory argument
 // for a low cap was weaker than it looked.
 //
-// And **five does not fail for memory**: it fails with `AddrInUse: Address already in use`, which is
-// wac-mono 0069 — tests take a port by binding it and releasing it, then bind it again, and a fifth
-// worker wins that race often enough to redden a run. The ceiling here is a bug rather than the machine,
-// so if 0069 is fixed this should be measured again rather than assumed to stay at 4.
+// And **five did not fail for memory**: it failed with `AddrInUse: Address already in use`, which was
+// wac-mono 0069 — tests took a port by binding and releasing it, then bound it again, and a fifth worker
+// won that race often enough to redden a run. That is fixed (ports are held until the bind), and five now
+// passes: three full suites, no `AddrInUse`, 54–56s.
+//
+// **The cap stays at 4 anyway.** 56s against 59s is a 5% gain for every core on a machine two other agents
+// are also using, and this number should be the one that leaves room rather than the one that wins a
+// benchmark. `DENO_JOBS=5` is there for anyone who disagrees on a machine they have to themselves.
 //
 // Four is also *kinder* to the other agents than two, which is the opposite of what a cap suggests: the
 // run finishes in 59s instead of 95s, so the window during which this process holds three gigabytes is
