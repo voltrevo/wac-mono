@@ -22,7 +22,8 @@ import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import { ed25519PublicKey, ed25519Verify } from "../../../crypto/src/ed25519.wac";
 import { sha256 } from "../../../crypto/src/sha256.wac";
 import {
-  ed25519Cert, verifyEd25519Cert, rsaCrossCert, linkCertDigest, certsCell, certOfType,
+  ed25519Cert, verifyEd25519Cert, rsaCrossCert, onionKeyCrosscert, linkCertDigest, certsCell,
+  certOfType,
   CERT_TYPE_SIGNING, CERT_TYPE_LINK, CERT_TYPE_RSA_CROSSCERT,
   KEY_TYPE_ED25519, KEY_TYPE_SHA256_X509, EXT_SIGNED_WITH_KEY,
 } from "../../src/relaycert.wac";
@@ -34,6 +35,9 @@ const i32 V_MASTER = 2;      // a[0]=i: the master identity key
 const i32 V_RSA_N = 3;       // an RSA-1024 modulus from the host
 const i32 V_RSA_D = 4;       // its private exponent
 const i32 V_VERIFY_CROSSCERT = 5;   // a[..] = a type-7 cert; [1] if the host verifies it
+const i32 V_ONION_N = 6;     // a second RSA-1024 modulus, standing in for the TAP onion key
+const i32 V_ONION_D = 7;     // its private exponent
+const i32 V_RECOVER_ONION = 8;      // a[..] = a signature; the payload the host recovers
 
 bool same(u8[] a, u8[] b) {
   if (a.len() != b.len()) { return false; }
@@ -239,5 +243,44 @@ export string test_a_certs_cell_carries_one_of_each(fn[u8[](i32, u8[], u8[])] re
   short_[3] = 200;
   t.eqI32(certOfType(short_, CERT_TYPE_SIGNING).len(), 0,
           "a certificate longer than the cell is refused");
+  return t.report();
+}
+
+export string test_the_onion_key_crosscert_binds_both_identities(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+
+  u8[] fingerprint = u8[20]();
+  for (i32 i = 0; i < 20; i++) { fingerprint[i] = (i * 11 + 3) & 0xFF; }
+  u8[] edIdentity = u8[32]();
+  for (i32 i = 0; i < 32; i++) { edIdentity[i] = (250 - i * 5) & 0xFF; }
+
+  u8[] onionN = ref(V_ONION_N, none(), none());
+  u8[] onionD = ref(V_ONION_D, none(), none());
+
+  u8[] sig = onionKeyCrosscert(fingerprint, edIdentity, onionN, onionD);
+  t.eqI32(sig.len(), onionN.len(), "the signature is one modulus wide");
+
+  // The host recovers the payload with a public-key operation, which is how a relay's peer checks
+  // this. It is the only way to check it: tor signs the bare 52 bytes with no DigestInfo, so there is
+  // nothing for a normal verifier to match against.
+  u8[] want = u8[52]();
+  for (i32 i = 0; i < 20; i++) { want[i] = fingerprint[i]; }
+  for (i32 i = 0; i < 32; i++) { want[20 + i] = edIdentity[i]; }
+  t.eqBytes(ref(V_RECOVER_ONION, sig, none()), want,
+            "the recovered payload is the fingerprint then the ed25519 identity");
+
+  // The order is load-bearing and both halves are opaque bytes, so a transposition would otherwise
+  // go unnoticed. Assert the two spans separately against a payload built the other way round.
+  u8[] swapped = u8[52]();
+  for (i32 i = 0; i < 32; i++) { swapped[i] = edIdentity[i]; }
+  for (i32 i = 0; i < 20; i++) { swapped[32 + i] = fingerprint[i]; }
+  t.isFalse(same(ref(V_RECOVER_ONION, sig, none()), swapped),
+            "the identity does not come first");
+
+  // A digest of the wrong length is refused rather than padded or truncated into place.
+  t.eqI32(onionKeyCrosscert(u8[19](), edIdentity, onionN, onionD).len(), 0,
+          "a 19-byte digest is refused");
+  t.eqI32(onionKeyCrosscert(fingerprint, u8[31](), onionN, onionD).len(), 0,
+          "a 31-byte ed25519 identity is refused");
   return t.report();
 }

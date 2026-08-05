@@ -16,6 +16,10 @@ import { createHash } from "node:crypto";
 import { wacTestRun } from "../../../harness/wacTestRun.ts";
 
 const V_COUNT = 0, V_CERT = 1, V_MASTER = 2, V_RSA_N = 3, V_RSA_D = 4, V_VERIFY_CROSSCERT = 5;
+// A second RSA key, standing in for the TAP onion key, and the recovery of what it signed. The onion
+// key has to be a different key from the identity: `onion-key-crosscert` exists to bind two keys
+// together, and a test that used one key for both would pass with the roles swapped.
+const V_ONION_N = 6, V_ONION_D = 7, V_RECOVER_ONION = 8;
 
 const v = JSON.parse(
   await Deno.readTextFile(new URL("data/relaycert_vectors.json", import.meta.url)),
@@ -30,6 +34,21 @@ const jwk = rsa.privateKey.export({ format: "jwk" }) as Record<string, string>;
 const b64 = (s: string) =>
   new Uint8Array(Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64"));
 const N = b64(jwk.n), D = b64(jwk.d);
+
+const onion = generateKeyPairSync("rsa", { modulusLength: 1024 });
+const onionJwk = onion.privateKey.export({ format: "jwk" }) as Record<string, string>;
+const ONION_N = b64(onionJwk.n), ONION_D = b64(onionJwk.d);
+
+/** Recover what the onion key signed. Empty if the signature is not a PKCS#1 block under that key. */
+function recoverOnion(sig: Uint8Array): Uint8Array {
+  try {
+    return new Uint8Array(
+      publicDecrypt({ key: onion.publicKey, padding: constants.RSA_PKCS1_PADDING }, sig),
+    );
+  } catch {
+    return new Uint8Array(0);
+  }
+}
 
 const CROSSCERT_PREFIX = new TextEncoder().encode("Tor TLS RSA/Ed25519 cross-certificate");
 
@@ -69,6 +88,12 @@ function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
       return D;
     case V_VERIFY_CROSSCERT:
       return new Uint8Array([verifyCrossCert(a) ? 1 : 0]);
+    case V_ONION_N:
+      return ONION_N;
+    case V_ONION_D:
+      return ONION_D;
+    case V_RECOVER_ONION:
+      return recoverOnion(a);
     default:
       throw new Error(`unknown vector field ${what}`);
   }
