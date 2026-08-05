@@ -245,11 +245,31 @@ most, because it puts their implementation on the far side of every seam.
 > a relay logged `extending to 127.0.0.1:5559`, and relay C accepted a connection and negotiated link
 > protocol 5 — a relay-to-relay connection, which only an `EXTEND2` produces.
 >
-> **What is not established:** whether the extend *completed*. No `extended circuit` line was found, and
-> the per-relay logs disagreed with the counts on a second read, so the next run should settle it —
-> `extending to` and `extended circuit` in the same relay's log, and a CREATE2 (not CREATE_FAST) on the
-> relay being extended to. The SOCKS requests still time out, which is expected: nothing implements
-> `RELAY_BEGIN`, so there is no exit for a stream even once the path exists.
+> **Settled: the extend starts and does not complete, and the failure is ours-to-ours.** Per relay, on a
+> clean run at 95 % bootstrap:
+>
+>     relay A (5555)  1 extending to, 0 extended circuit, 1 CREATE2 circuit
+>     relay B (5557)  0 extending,    1 CREATE2 circuit
+>     relay C (5559)  1 CREATE_FAST circuit
+>
+> and relay A says why:
+>
+>     relayd:   extending to 127.0.0.1:5559
+>     relayd:   the link handshake with 127.0.0.1 failed
+>
+> So a C tor's `EXTEND2` is parsed, the hop is dialled, and `linkHandshake` — `src/link.wac`'s
+> *initiator* half, written for the client — fails against our own `relayd` responder.
+>
+> That asymmetry is the interesting part and narrows the bug sharply. **Each half works against C tor**:
+> our client builds circuits through real relays, and our relay is accepted by a real tor, which
+> negotiates link protocol 5 with it and builds circuits. It is only our initiator against our responder
+> that fails, which is exactly the seam D1 warns about — two halves that were each validated against C
+> tor, never against each other, and so free to disagree about something C tor is lenient over. Prime
+> suspects: what `linkHandshake` requires of the CERTS cell that `relayHandshakeReply` does not send
+> (an AUTH_CHALLENGE response, or a certificate type it insists on), and whether the responder's
+> NETINFO satisfies the initiator's check.
+>
+> The SOCKS requests still time out, which is expected and separate: nothing implements `RELAY_BEGIN`.
 >
 > One hypothesis tested and **disproved**: that tor asked our relay for the consensus because our vote
 > flagged it `V2Dir`, which advertises a directory cache we do not run. Dropping `V2Dir` and `HSDir`
