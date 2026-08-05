@@ -188,6 +188,21 @@ most, because it puts their implementation on the far side of every seam.
 > re-run was cut short by a shell timeout of the author's own making, not by a failure, so whether
 > bootstrap passes 50 % is still an open measurement. Re-run it before building anything on top.
 >
+> **Measured: it does. `Bootstrapped 75 % (enough_dirinfo)`**, with relay A answering **8** directory
+> requests over `BEGIN_DIR`. So the directory side is finished as far as a client needs it: consensus,
+> certificate and descriptors all reach a C tor, over a circuit, from our own relay.
+>
+> Two wrong guesses died on the way, both mine and both cheap to avoid next time. The runs that stalled
+> at 5 % were not a readiness race — a poll showed all three processes up in **2 seconds**, so the fixed
+> 35-second sleep had always been ample. They stalled because I had moved the relays to spare ports
+> while their **descriptors still advertised 5555 and 5557**: tor dialled the port the consensus named,
+> found nothing, and stopped. A relay's port lives in a signed document, so it cannot be changed by
+> changing a command line — regenerate the descriptor or keep the port.
+>
+> What is left for step 3 is `EXTEND2` firing: at 75 % tor has enough directory information but has not
+> extended, and a three-hop circuit needs three distinct relays where the consensus lists two. A third
+> relay is the next thing to try, and it is a `relayd --descriptor` and a third `-D` away.
+>
 > One hypothesis tested and **disproved**: that tor asked our relay for the consensus because our vote
 > flagged it `V2Dir`, which advertises a directory cache we do not run. Dropping `V2Dir` and `HSDir`
 > from the flags changed nothing — tor still sent `Downloading consensus from 127.0.0.1:5555` at the
