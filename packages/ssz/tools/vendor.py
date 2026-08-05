@@ -225,12 +225,57 @@ def do_generic(tarball: str) -> dict:
     }
 
 
-def write(name: str, payload: dict) -> None:
-    OUT.mkdir(parents=True, exist_ok=True)
-    path = OUT / name
-    path.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=False))
-    kb = path.stat().st_size / 1024
-    print(f"{path.relative_to(pathlib.Path.cwd())}: {len(payload['cases'])} cases, {kb:.0f} KB")
+def do_generic_invalid(tarball: str) -> dict:
+    """`ssz_generic`'s **invalid** cases — the ones with no answer, only a refusal.
+
+    Different in kind from every other set here. A valid case carries a `root:` and asks "do you agree";
+    an invalid case ships `serialized.ssz_snappy` alone and asks "do you refuse". There is nothing to
+    compare against, so the test cannot be wrong about the expected value — it can only be wrong about
+    whether refusing happened, which is a much smaller thing to get wrong.
+
+    The case *name* carries the type and the fault, e.g. `ComplexTestStruct_offset_zeroed_var_1`, so
+    the type is parsed off the front rather than read from a file. Unlike the valid set, the type name
+    is not always a bare prefix — `uint8_0_zeroed` and `bitlist_2_but_3` need the same split the
+    upstream README describes — so the parse is by longest matching known type name and any case whose
+    type is not recognised is *kept with an empty type*, so the test counts it as unhandled rather than
+    the generator silently dropping it.
+    """
+    want = ("uints", "bitlist", "bitvector", "boolean", "basic_vector", "containers")
+    found: dict[tuple[str, str], dict] = {}
+    skipped: list[str] = []
+    with tarfile.open(tarball) as tf:
+        for m in tf:
+            parts = m.name.split("/")
+            if len(parts) < 8 or parts[3] != "ssz_generic" or parts[4] not in want:
+                continue
+            typ, validity, case, fname = parts[4], parts[5], parts[6], parts[7]
+            if validity != "invalid" or fname != "serialized.ssz_snappy":
+                continue
+            # `Progressive*` excluded, matching the valid set: progressive lists merkleize under a
+            # different scheme that `packages/ssz` does not implement and an Altair light client does
+            # not use. Not a size decision, though it is also 32 of the 33 MB here — 29 cases at 1.76
+            # MB each. The count is reported so the exclusion is visible rather than assumed.
+            if case.startswith("Progressive"):
+                skipped.append(case)
+                continue
+            found[(typ, case)] = {
+                "group": typ,
+                "case": case,
+                "ssz": snappy_block(tf.extractfile(m).read()).hex(),
+            }
+    print(f"  skipped {len(skipped)} Progressive* cases (a merkleization scheme this package does "
+          f"not implement)", file=sys.stderr)
+    cases = sorted(found.values(), key=lambda c: (c["group"], c["case"]))
+    by_group: dict[str, int] = {}
+    for c in cases:
+        by_group[c["group"]] = by_group.get(c["group"], 0) + 1
+    for g in sorted(by_group):
+        print(f"  {g}: {by_group[g]} invalid cases", file=sys.stderr)
+    return {
+        "source": f"{REPO} @ {COMMIT[:12]}, general/phase0/ssz_generic (invalid only)",
+        "skippedProgressive": len(skipped),
+        "cases": cases,
+    }
 
 
 def write(name: str, payload: dict) -> None:
@@ -402,6 +447,7 @@ BUILDERS = {
     "light_client_proofs": lambda: do_proofs(),
     "ssz_static_altair_mainnet": lambda: do_static(),
     "ssz_generic_valid": lambda: do_generic(tarball_path()),
+    "ssz_generic_invalid": lambda: do_generic_invalid(tarball_path()),
 }
 
 

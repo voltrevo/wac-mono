@@ -1,8 +1,8 @@
 # ssz — Ethereum's SimpleSerialize, and the Merkle proofs built on it
 
-**Everything an Altair light client needs is done and checked against Ethereum's vectors.** 1,102 of
-them: 1,057 `ssz_generic` and all 45 `ssz_static`. Issue **0063** is closed; **0064**, the light client
-itself, is unblocked.
+**Everything an Altair light client needs is done and checked against Ethereum's vectors.** 2,233 of
+them: 1,057 valid `ssz_generic`, 1,131 **invalid** `ssz_generic`, and all 45 `ssz_static`. Issues
+**0063** and **0064** are both closed — `packages/lightclient` follows the chain on top of this.
 
 | | state |
 | --- | --- |
@@ -10,7 +10,8 @@ itself, is unblocked.
 | `hash_tree_root` of uints, booleans, bitvectors, bitlists, basic vectors and lists | **done** — 754 Ethereum `ssz_generic` cases |
 | `isValidMerkleBranch`, `isValidNormalizedMerkleBranch` | **done** — 9 real Ethereum light-client proofs |
 | `hash_tree_root` of containers, lists and vectors of composites | **done** — 303 Ethereum `containers` cases, schema-driven |
-| progressive lists | **out of scope** — a different merkleization scheme; 160 cases |
+| refusing malformed input | **done** — all 1,131 Ethereum `ssz_generic` *invalid* cases |
+| progressive lists | **out of scope** — a different merkleization scheme; 160 valid + 132 invalid cases |
 | the nine light-client containers | **done** — all 45 Ethereum `ssz_static` cases |
 
 `src/merkle.wac` is merkleization; `src/container.wac` is a **schema-driven** `hash_tree_root` — a type
@@ -182,10 +183,35 @@ rather than a sync-protocol one.
   100 vendored cases, and not used by a light client. The only reason to do them is completeness.
 - **Serialization** — this package computes roots from bytes and never produces bytes. A light client
   only needs the reading direction, but a signer or a gossip publisher would need the other.
-- **Invalid-case vectors** — about 2,100 of them upstream, and the more valuable half, since a decoder
-  that accepts a malformed offset is the bug that matters. They need this decoder to exist, which it
-  now does, so vendoring them is the obvious next hardening step. The refusals are currently tested by
-  hand-built perturbations rather than by Ethereum's own malformed cases.
+*(Invalid-case vectors were the third item here. They are done — see below.)*
+
+## The invalid vectors found three real bugs
+
+`test/invalid_wac.test.ts` runs Ethereum's 1,131 malformed `ssz_generic` encodings and requires every
+one to be **refused**. Unlike every other suite here it compares against no expected value, because an
+invalid case ships `serialized.ssz_snappy` with no `meta.yaml` — there is no correct root. It can
+therefore only be wrong about whether a refusal happened.
+
+That is worth more than it sounds. A malformed object that merkleizes anyway yields a root, and a root
+is what consensus *is*; two clients disagreeing about whether an encoding is legal disagree about a
+`hash_tree_root`. Three things were wrong, and all three produce a *different root* rather than merely
+an accepted byte string — so each was a way for this package to fork the chain:
+
+- **`boolean` was not a type.** It was `uint8`, so `0x02` was a perfectly good boolean. SSZ merkleizes
+  a boolean into a chunk padded with 31 zero bytes, so `0x02` and `0x01` have different roots — two
+  encodings of "true" that do not agree. 84 cases. Fixed by `KIND_BOOLEAN`.
+- **A `Bitvector[N]`'s bits above N were not required to be zero.** `Bitvector[1]` holding `0x03` is
+  the same *length* as one holding `0x01`, so the length check accepted it. 30 cases.
+- **`Vector[T, 0]` and `Bitvector[0]` were accepted.** Neither is a type — the spec requires N > 0.
+  8 cases.
+
+The remaining 1,009 were already refused, which is the part the hand-built perturbations had been
+standing in for.
+
+A case whose name this file cannot parse is a **failure, not a skip**. The type has to be recovered
+from the directory name (`vec_uint16_5_nil`, `bitlist_2_but_3`, `ComplexTestStruct_offset_zeroed`), and
+a parser that quietly dropped what it did not understand would report a smaller, cleaner, meaningless
+number.
 
 ## What it implements, from the spec
 

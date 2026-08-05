@@ -47,6 +47,19 @@ export const i32 KIND_BITLIST = 2;
 export const i32 KIND_VECTOR = 3;
 export const i32 KIND_LIST = 4;
 export const i32 KIND_CONTAINER = 5;
+/**
+ * `boolean` — one byte, and **the only two legal values are 0 and 1**.
+ *
+ * Distinct from `KIND_BASIC` with `param = 1` solely because of that value constraint; it serializes
+ * and merkleizes identically. Added after running Ethereum's 1,131 `ssz_generic` *invalid* vectors,
+ * 84 of which are a boolean byte holding 2, 0x10, 0x80 or 0xff — all of which this package accepted,
+ * because a `uint8` accepts them and nothing distinguished the two.
+ *
+ * Worth having rather than a curiosity: SSZ merkleizes a boolean into a chunk whose remaining 31
+ * bytes are zero, so `0x02` and `0x01` give *different* roots. Accepting both means two encodings of
+ * "true" with two different `hash_tree_root`s, which is a consensus split.
+ */
+export const i32 KIND_BOOLEAN = 6;
 
 const i32 STRIDE = 4;
 const i32 CHUNK = 32;
@@ -66,7 +79,7 @@ i32 countOf(i32[] t, i32 i) { return t[i * STRIDE + 3]; }
  */
 export bool isFixed(i32[] t, i32[] fields, i32 i) {
   i32 k = kindOf(t, i);
-  if (k == KIND_BASIC || k == KIND_BITVECTOR) { return true; }
+  if (k == KIND_BASIC || k == KIND_BOOLEAN || k == KIND_BITVECTOR) { return true; }
   if (k == KIND_BITLIST || k == KIND_LIST) { return false; }
   if (k == KIND_VECTOR) { return isFixed(t, fields, childOf(t, i)); }
   for (i32 f = 0; f < countOf(t, i); f++) {
@@ -79,6 +92,7 @@ export bool isFixed(i32[] t, i32[] fields, i32 i) {
 export i32 fixedSize(i32[] t, i32[] fields, i32 i) {
   i32 k = kindOf(t, i);
   if (k == KIND_BASIC) { return paramOf(t, i); }
+  if (k == KIND_BOOLEAN) { return 1; }
   if (k == KIND_BITVECTOR) { return (paramOf(t, i) + 7) / 8; }
   if (k == KIND_VECTOR) { return paramOf(t, i) * fixedSize(t, fields, childOf(t, i)); }
   if (k == KIND_CONTAINER) {
@@ -119,9 +133,28 @@ export u8[]? rootAt(i32[] t, i32[] fields, i32 i, u8[] data, i32 start, i32 end)
     if (span != paramOf(t, i)) { return null; }
     return rootBasic(slice(data, start, end));
   }
+  if (k == KIND_BOOLEAN) {
+    if (span != 1) { return null; }
+    if (data[start] > 1) { return null; }
+    return rootBasic(slice(data, start, end));
+  }
   if (k == KIND_BITVECTOR) {
-    if (span != (paramOf(t, i) + 7) / 8) { return null; }
-    return rootBitvector(slice(data, start, end), paramOf(t, i));
+    i32 n = paramOf(t, i);
+    // `Bitvector[0]` is not a type: the spec requires N > 0, and a zero-length one merkleizes to the
+    // zero hash, which is also `Bitvector[1]{false}`'s neighbourhood. Ethereum ships `bitvec_0` as an
+    // invalid vector for exactly this reason.
+    if (n <= 0) { return null; }
+    if (span != (n + 7) / 8) { return null; }
+    // **The bits above N must be zero.** A `Bitvector[1]` holding `0x03` is the same *length* as one
+    // holding `0x01`, so a length check alone accepts it — and it merkleizes to a different root, so
+    // accepting it is two encodings of one value. Thirty of Ethereum's invalid vectors are this
+    // exact shape and all thirty were accepted here before this check.
+    if (n % 8 != 0) {
+      i32 keep = 1;
+      for (i32 b = 0; b < n % 8; b++) { keep = keep * 2; }
+      if (data[end - 1] >= keep) { return null; }
+    }
+    return rootBitvector(slice(data, start, end), n);
   }
   if (k == KIND_BITLIST) {
     return rootBitlist(slice(data, start, end), paramOf(t, i));
@@ -131,12 +164,23 @@ export u8[]? rootAt(i32[] t, i32[] fields, i32 i, u8[] data, i32 start, i32 end)
     i32 elem = childOf(t, i);
     i32 limit = paramOf(t, i);
     bool isList = k == KIND_LIST;
+    // `Vector[T, 0]` is not a type either — same rule, same reason. A list may legitimately be empty;
+    // a vector of zero elements cannot exist, and without this it merkleizes happily from no bytes.
+    if (!isList && limit <= 0) { return null; }
 
-    if (isFixed(t, fields, elem) && kindOf(t, elem) == KIND_BASIC) {
-      // Basic elements are packed, so the bytes are already the chunks.
-      i32 size = paramOf(t, elem);
+    // Booleans pack exactly as `uint8` does, so they take the packed path — but every byte has to
+    // be 0 or 1 first, which a `uint8` vector does not require. Routing them down the composite path
+    // instead would be a *different merkleization*, not merely a slower one.
+    bool packs = kindOf(t, elem) == KIND_BASIC || kindOf(t, elem) == KIND_BOOLEAN;
+    if (isFixed(t, fields, elem) && packs) {
+      i32 size = (kindOf(t, elem) == KIND_BOOLEAN) ? 1 : paramOf(t, elem);
       if (span % size != 0) { return null; }
       i32 n = span / size;
+      if (kindOf(t, elem) == KIND_BOOLEAN) {
+        for (i32 e = 0; e < n; e++) {
+          if (data[start + e] > 1) { return null; }
+        }
+      }
       // Delegated rather than reimplemented. These two lines were the same expressions as
       // `rootBasicList` and `rootBasicVector`, written out again — which mutation testing found by
       // gutting `rootBasicList` and nothing noticing, because nothing called it.

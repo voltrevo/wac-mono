@@ -18,6 +18,10 @@
     "light_client_sync_altair_minimal": {
       "sha256": "29172c5681ed385f8cf7bf661c23aa0af087a250b64d1fde18a1c12fe857b2d3",
       "note": "4 sync-protocol cases, minimal config (SYNC_COMMITTEE_SIZE 32); the 3 cross-fork *_store_with_legacy_data cases are excluded, they need capella+ descriptors"
+    },
+    "ssz_generic_invalid": {
+      "sha256": "8ce77945952c00dfe9fb948749e3a01b18b482bf189c352bca8d2ed6b8bd79f9",
+      "note": "1131 cases that must be REFUSED; 132 Progressive* excluded (a merkleization scheme this package does not implement)"
     }
   }
 }
