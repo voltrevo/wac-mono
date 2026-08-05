@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-28 packages, 56,018 lines of wac, 1099 tests,
+28 packages, 56,311 lines of wac, 1104 tests,
 29 command-line programs and 4 browser pages.
 
 ## Packages
@@ -28,7 +28,7 @@ In dependency order: nothing here imports anything below it.
 | [`url`](packages/url/) | A WHATWG URL parser: parse, serialize, and resolve a reference against a base. | 1,229 | 27 | `bytes` `std` |
 | [`wacc`](packages/wacc/) | Porting the wac compiler to wac, so it can eventually compile itself. | 3,798 | 11 | `bytes` |
 | [`zstd`](packages/zstd/) | Zstandard (RFC 8878) in wac. | 2,690 | 42 | `bytes` |
-| [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, bcrypt_pbkdf, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519, NIST P-256 and P-384, RSA… | 5,125 | 139 | `bignum` |
+| [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, bcrypt_pbkdf, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519, NIST P-256 and P-384, RSA… | 5,418 | 144 | `bignum` |
 | [`fs`](packages/fs/) | A filesystem that belongs to the system rather than to the host. | 593 | 12 | `bytes` `platform` `std` |
 | [`json`](packages/json/) | JSON (RFC 8259) parsing and serialization, written in wac. | 967 | 51 | `bytes` `fmt` `std` |
 | [`sh`](packages/sh/) | A shell, in wac. | 6,470 | 22 | `bytes` `platform` `std` |

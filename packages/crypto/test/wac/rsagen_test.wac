@@ -1,0 +1,223 @@
+// Generating an RSA key, checked by OpenSSL.
+//
+// A generator checked only against our own verifier would establish that the two agree — and the
+// interesting failures here produce keys that *are* self-consistent: two primes that are not prime
+// give a modulus we can sign and verify with all day and that factors instantly. So the host takes
+// the modulus and exponents, builds a real RSA key from them, and asks OpenSSL whether it is valid:
+// that checks primality of p and q, that n = p*q, and that d is the right inverse, none of which
+// this side could establish about itself.
+//
+// The maths that has no external oracle — Miller-Rabin, gcd, modular inverse — is checked against
+// known answers instead.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { Big, add, sub, mul, cmp, isZero, bitLen } from "../../../bignum/src/big.wac";
+import { fromBytes, toBytes, modPow, rsaSignPkcs1, rsaVerifyPkcs1 } from "../../src/rsa.wac";
+import {
+  RsaKey, generateRsaKey, millerRabin, gcd, modInverse, randomPrime,
+  MILLER_RABIN_ROUNDS, PUBLIC_EXPONENT, small, suitablePrime,
+} from "../../src/rsagen.wac";
+
+const i32 V_CHECK_KEY = 0;      // a = n(len2) n e(len2) e d(len2) d p(len2) p q(len2) q; [1] if valid
+const i32 V_KEY_BITS = 1;       // a = modulus; openssl's idea of its bit length
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+u8[] none() { return u8[0](); }
+u8[] be16(i32 n) {
+  u8[] o = u8[2]();
+  o[0] = (n >> 8) & 0xFF;
+  o[1] = n & 0xFF;
+  return o;
+}
+u8[] cat(u8[][] parts) {
+  i32 n = 0;
+  for (i32 i = 0; i < parts.len(); i++) { n = n + parts[i].len(); }
+  u8[] out = u8[n]();
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) {
+    for (i32 j = 0; j < parts[i].len(); j++) { out[at + j] = parts[i][j]; }
+    at = at + parts[i].len();
+  }
+  return out;
+}
+
+export string test_openssl_agrees_the_generated_key_is_a_valid_rsa_key(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  T t = T.create();
+  u8[] seed = u8[32]();
+  for (i32 i = 0; i < 32; i++) { seed[i] = (i * 13 + 7) & 0xFF; }
+
+  RsaKey k = generateRsaKey(1024, seed);
+  t.isTrue(k.ok, "a key was generated");
+  t.eqI32(k.modulus.len(), 128, "an RSA-1024 modulus is 128 bytes");
+  t.eqI32(k.p.len(), 64, "and each prime is 64");
+
+  // The modulus really is 1024 bits, not 1023 — which is what setting the top *two* bits of each
+  // prime is for, and is silently wrong half the time without it.
+  t.eqI32(bitLen(fromBytes(k.modulus)), 1024, "the modulus is exactly 1024 bits");
+  t.eqI32(ref(V_KEY_BITS, k.modulus, none())[0], 4, "and openssl agrees: 1024, in 256-bit units");
+
+  // The relations that make it a key, checked here because they are cheap and name themselves.
+  t.isTrue(same(toBytes(mul(fromBytes(k.p), fromBytes(k.q)), 128), k.modulus), "n = p*q");
+  t.isFalse(same(k.p, k.q), "and p is not q — a square modulus factors instantly");
+
+  // The one that matters and that only the host can answer: are p and q actually prime, and is d
+  // actually the inverse? `openssl rsa -check` tests exactly that.
+  u8[][] packed = u8[][10]();
+  packed[0] = be16(k.modulus.len());
+  packed[1] = k.modulus;
+  packed[2] = be16(k.publicExponent.len());
+  packed[3] = k.publicExponent;
+  packed[4] = be16(k.privateExponent.len());
+  packed[5] = k.privateExponent;
+  packed[6] = be16(k.p.len());
+  packed[7] = k.p;
+  packed[8] = be16(k.q.len());
+  packed[9] = k.q;
+  t.eqI32(ref(V_CHECK_KEY, cat(packed), none())[0], 1,
+          "openssl accepts it: p and q are prime, n = p*q, and d is the inverse");
+
+  // And it signs. This is the whole point of the key existing, and it uses `rsaSignPkcs1` from
+  // design/0002 step 1 with a key this package made rather than one node handed it.
+  u8[] msg = "a relay identity, signed with a key we generated".toBytes();
+  u8[] sig = rsaSignPkcs1(k.modulus, k.privateExponent, msg, 32);
+  t.eqI32(sig.len(), 128, "the signature is a full modulus wide");
+  t.isTrue(rsaVerifyPkcs1(k.modulus, k.publicExponent, msg, sig, 32),
+           "and verifies under the public half");
+  t.isFalse(rsaVerifyPkcs1(k.modulus, k.publicExponent, "something else".toBytes(), sig, 32),
+            "but not over a different message");
+  return t.report();
+}
+
+export string test_the_same_seed_gives_the_same_key(fn[u8[](i32, u8[], u8[])] ref) {
+  // Deterministic from the seed, which is what makes this testable at all — and what makes the seed
+  // the whole of the key's secrecy. Both halves are worth an assertion.
+  T t = T.create();
+  u8[] seed = u8[32]();
+  for (i32 i = 0; i < 32; i++) { seed[i] = (i * 5 + 1) & 0xFF; }
+
+  RsaKey a = generateRsaKey(512, seed);
+  RsaKey b = generateRsaKey(512, seed);
+  t.isTrue(a.ok && b.ok, "both generated");
+  t.isTrue(same(a.modulus, b.modulus), "the same seed gives the same modulus");
+  t.isTrue(same(a.privateExponent, b.privateExponent), "and the same private exponent");
+
+  u8[] other = u8[32]();
+  for (i32 i = 0; i < 32; i++) { other[i] = seed[i]; }
+  other[31] = (other[31] ^ 1);
+  RsaKey c = generateRsaKey(512, other);
+  t.isTrue(c.ok, "a different seed also generates");
+  t.isFalse(same(c.modulus, a.modulus), "and gives a different key — one bit of seed is enough");
+
+  t.isFalse(generateRsaKey(512, u8[31]()).ok, "a 31-byte seed is refused");
+  t.isFalse(generateRsaKey(511, seed).ok, "an odd bit length is refused");
+  t.isFalse(generateRsaKey(256, seed).ok, "and anything below 512");
+  return t.report();
+}
+
+export string test_miller_rabin_knows_primes_from_composites(fn[u8[](i32, u8[], u8[])] ref) {
+  // Known answers, since there is no external oracle for a predicate. The composites are chosen to
+  // be the ones a weak test gets wrong.
+  T t = T.create();
+  u8[][] bases = u8[][8]();
+  for (i32 i = 0; i < 8; i++) {
+    u8[] b = u8[8]();
+    b[7] = (i * 7 + 2) & 0xFF;
+    b[6] = (i * 3 + 1) & 0xFF;
+    bases[i] = b;
+  }
+
+  i64[] primes = i64[](2, 3, 5, 7, 11, 13, 97, 101, 7919, 65537, 1000003, 2147483647);
+  for (i32 i = 0; i < primes.len(); i++) {
+    t.isTrue(millerRabin(small(primes[i]), bases),
+             itoa64(primes[i]) + " is prime");
+  }
+
+  // 561, 1105, 1729, 2465 are Carmichael numbers: composite, and Fermat's test calls them prime for
+  // every base coprime to them. Miller-Rabin is not fooled, and that is the reason to use it.
+  i64[] carmichael = i64[](561, 1105, 1729, 2465, 2821, 6601, 8911);
+  for (i32 i = 0; i < carmichael.len(); i++) {
+    t.isFalse(millerRabin(small(carmichael[i]), bases),
+              itoa64(carmichael[i]) + " is a Carmichael number, and composite");
+  }
+
+  i64[] composites = i64[](1, 4, 9, 15, 21, 25, 91, 100, 7917, 65535, 1000001);
+  for (i32 i = 0; i < composites.len(); i++) {
+    t.isFalse(millerRabin(small(composites[i]), bases),
+              itoa64(composites[i]) + " is composite");
+  }
+  t.eqI32(MILLER_RABIN_ROUNDS, 40, "forty rounds, which puts the error below 2^-80");
+  return t.report();
+}
+
+export string test_gcd_and_modular_inverse(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqI64(smallOf(gcd(small(12), small(18))), 6, "gcd(12,18) = 6");
+  t.eqI64(smallOf(gcd(small(17), small(5))), 1, "coprime gives 1");
+  t.eqI64(smallOf(gcd(small(0), small(7))), 7, "gcd(0,n) = n");
+  t.eqI64(smallOf(gcd(small(65537), small(65536))), 1, "65537 and 65536 are coprime");
+
+  // 3 * 7 = 21 = 1 mod 20.
+  t.eqI64(smallOf(modInverse(small(3), small(20))), 7, "3^-1 mod 20 = 7");
+  t.eqI64(smallOf(modInverse(small(65537), small(1000000007))), 743534192,
+          "a real-sized inverse");
+  // No inverse when they share a factor — and zero rather than a wrong answer, because a caller
+  // that used a wrong `d` would produce signatures nobody can verify and no error anywhere.
+  t.isTrue(isZero(modInverse(small(4), small(8))), "4 has no inverse mod 8");
+  t.isTrue(isZero(modInverse(small(6), small(9))), "nor 6 mod 9");
+
+  // The property, on a value big enough to exercise the loop: a * a^-1 = 1 mod m.
+  Big m = small(1000000007);
+  Big a = small(123456789);
+  Big inv = modInverse(a, m);
+  t.eqI64(smallOf(modPow(mul(a, inv), small(1), m)), 1, "a * a^-1 = 1 mod m");
+  return t.report();
+}
+
+/** A `Big` known to be small, as an i64. */
+i64 smallOf(Big v) {
+  u8[] b = toBytes(v, 8);
+  i64 out = 0;
+  for (i32 i = 0; i < 8; i++) { out = (out << 8) | (b[i] as i64); }
+  return out;
+}
+
+export string test_a_prime_is_rejected_when_e_has_no_inverse(fn[u8[](i32, u8[], u8[])] ref) {
+  // `gcd(e, p-1) == 1` or `e` has no inverse mod `p-1` and the key cannot be made. With e = 65537
+  // that needs 65537 to divide p-1 and essentially never happens, so the check looks like dead code
+  // and dropping it survives every other test here.
+  //
+  // With **e = 3** it fires about half the time. A prime above 3 is either 1 or 2 mod 3; if it is
+  // 1 then `p-1` is divisible by 3 and the candidate must be rejected. So every prime this returns
+  // has `p ≡ 2 (mod 3)`, which is to say `(p-1) mod 3 == 1` — and a search that skipped the check
+  // would return `(p-1) mod 3 == 0` about half the time.
+  T t = T.create();
+  Big three = small(3);
+  i32 checked = 0;
+  for (i32 i = 0; i < 6; i++) {
+    u8[] seed = u8[32]();
+    for (i32 j = 0; j < 32; j++) { seed[j] = (j * 17 + i * 31 + 3) & 0xFF; }
+    Big p = suitablePrime(96, seed, 100000, three);
+    if (isZero(p)) { continue; }
+    checked = checked + 1;
+    t.eqI64(smallOf(modPow(sub(p, small(1)), small(1), three)), 1,
+            "(p-1) mod 3 is 1, so 3 has an inverse mod p-1");
+  }
+  t.isTrue(checked >= 4, "several primes were drawn, so the property was actually exercised");
+
+  // And with the usual exponent the search still succeeds — the rejection is not so aggressive that
+  // it starves.
+  u8[] seed = u8[32]();
+  for (i32 j = 0; j < 32; j++) { seed[j] = (j * 11 + 5) & 0xFF; }
+  t.isFalse(isZero(suitablePrime(96, seed, 200000, small(PUBLIC_EXPONENT))),
+            "and 65537 finds a prime too");
+  return t.report();
+}

@@ -156,7 +156,7 @@ much as the thing steps 2–6 each contribute a row to, and it is where a regres
 | 6 — onion service host | not started |
 | 7 — the interop matrix | not started |
 | — X.509 generation | **done** — `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
-| — RSA key generation | not started — D4, so an identity can be made here rather than by `tor-gencert` |
+| — RSA key generation | **done** — `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
 
 The client itself is done and its own limitations live in `packages/tor/README.md` — guard algorithm,
 circuit padding, isolation by credential and the rest. Those are that package's roadmap and are

@@ -1,0 +1,292 @@
+// Generating an RSA key: prime search, and the arithmetic that turns two primes into a keypair.
+//
+// `design/0002` D4 puts this in scope. A Tor relay's identity is an RSA-1024 key and a directory
+// authority's is too, so an implementation that cannot make one is permanently using keys somebody
+// else made — which is the difference between running a relay and being lent one.
+//
+// ## Deterministic from a seed, on purpose
+//
+// `generateRsaKey(bits, seed)` expands a 32-byte seed with SHAKE-256 and takes every candidate and
+// every Miller-Rabin base from that stream. The same seed always produces the same key.
+//
+// That is a real design choice with a real cost, so both halves are worth stating. It makes key
+// generation *testable* — a test can assert a key is reproducible, and a captured key stays valid —
+// and it means a caller cannot accidentally generate a key from nothing, because there is nowhere
+// for entropy to come from except the seed it passed. The cost is that **the key is exactly as good
+// as the seed**: 32 bytes from a real random source gives a real key, and 32 bytes of anything else
+// gives a key an attacker can reproduce. There is no way for this function to tell the difference.
+//
+// ## What "probable prime" means here
+//
+// Miller-Rabin never proves primality; it proves compositeness, and failing to for enough
+// independent bases makes primality overwhelmingly likely. At 40 rounds the chance of accepting a
+// composite is below 2^-80 for random candidates — and "for random candidates" is the load-bearing
+// part. An adversary who *chooses* the number can construct a strong pseudoprime for any fixed set
+// of bases, which is why the bases here come from the seed stream rather than being 2, 3, 5, 7.
+// For a key we generate from our own seed that attack has no purchase; the bases are unpredictable
+// anyway because it costs nothing.
+//
+// ## Not constant time, and it does not need to be
+//
+// The timing note at the bottom of `rsa.wac` applies to signing, where a secret exponent is used
+// repeatedly and an attacker can measure. Key generation runs once, on a machine choosing its own
+// identity, and its timing reveals how many candidates were rejected — which is a property of the
+// seed, not of the key. What matters is that the *result* is only as secret as the seed.
+
+import { Big, DivMod, add, sub, mul, mulSmall, divmod, divSmall, DivSmall, cmp, cmpAbs, isZero,
+         bitLen, shr, copy } from "../../bignum/src/big.wac";
+import { modPow, fromBytes, toBytes } from "./rsa.wac";
+import { shake256 } from "./keccak.wac";
+
+/**
+ * Miller-Rabin rounds. 40 puts the error below 2^-80 for a randomly chosen candidate.
+ *
+ * **Not observable from the outcome.** One round would accept a composite with probability at most a
+ * quarter, so a single generated key almost certainly still comes out prime and OpenSSL still
+ * accepts it — reducing this to 1 survives every test in this package. The count can only be
+ * asserted as a constant, which is what `rsagen_test.wac` does, and the reason for the number lives
+ * here rather than in a test that could check it.
+ */
+export const i32 MILLER_RABIN_ROUNDS = 40;
+
+/** The public exponent everything uses. 65537: prime, and only two bits set, so verification is fast. */
+export const i64 PUBLIC_EXPONENT = 65537;
+
+/**
+ * A generated keypair. All values are big-endian magnitudes.
+ *
+ * `p` and `q` are kept because CRT signing needs them — `rsa.wac` does not use CRT today and the
+ * note there says why, but discarding the primes would make adding it impossible without
+ * regenerating every key.
+ */
+export struct RsaKey {
+  bool ok;
+  u8[] modulus;
+  u8[] publicExponent;
+  u8[] privateExponent;
+  u8[] p;
+  u8[] q;
+}
+
+/** The first primes, for trial division. Rejects about 80% of odd candidates before any modPow. */
+i32[] smallPrimes() {
+  return i32[](3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79,
+               83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167,
+               173, 179, 181, 191, 193, 197, 199, 211, 223, 227, 229, 233, 239, 241, 251);
+}
+
+/**
+ * A `Big` from a small value.
+ *
+ * `Big.fromU64` takes a `u64` and an integer literal in wac is an `i32`, which has no raw conversion
+ * to one — so every small constant would otherwise carry two casts. One named function instead.
+ */
+export Big small(i64 v) { return Big.fromU64(v as@ u64); }
+
+Big bigOne() { return small(1); }
+Big bigTwo() { return small(2); }
+
+/** `a mod m`, as a non-negative value. */
+Big mod(Big a, Big m) { return divmod(a, m).r; }
+
+/**
+ * The greatest common divisor, by Euclid.
+ *
+ * Used to check `gcd(e, p-1) == 1` — without which `e` has no inverse and the key does not exist —
+ * and to compute the Carmichael lambda below.
+ */
+export Big gcd(Big a, Big b) {
+  Big x = copy(a);
+  Big y = copy(b);
+  while (!isZero(y)) {
+    Big r = divmod(x, y).r;
+    x = y;
+    y = r;
+  }
+  return x;
+}
+
+/**
+ * `a^-1 mod m`, or zero when there is none.
+ *
+ * Extended Euclid, kept non-negative throughout by adding `m` rather than by tracking signs — `Big`
+ * has a sign but the intermediate values here are easier to reason about as residues.
+ */
+export Big modInverse(Big a, Big m) {
+  if (isZero(m)) { return small(0); }
+  Big oldR = mod(a, m);
+  Big r = copy(m);
+  Big oldS = bigOne();
+  Big s = small(0);
+  while (!isZero(r)) {
+    DivMod d = divmod(oldR, r);
+    Big nextR = d.r;
+    Big nextS = sub(oldS, mul(d.q, s));
+    oldR = r;
+    r = nextR;
+    oldS = s;
+    s = nextS;
+  }
+  // gcd is oldR; an inverse exists only when it is 1.
+  if (cmp(oldR, bigOne()) != 0) { return small(0); }
+  Big out = mod(oldS, m);
+  if (out.neg) { out = add(out, m); }
+  return out;
+}
+
+/** Whether `n` is divisible by any of the small primes, which is a cheap composite test. */
+bool hasSmallFactor(Big n) {
+  i32[] primes = smallPrimes();
+  for (i32 i = 0; i < primes.len(); i++) {
+    DivSmall d = divSmall(n, primes[i] as@ u32);
+    if (d.r == 0) {
+      // Equal to the prime itself is not a factor in the sense that matters.
+      if (cmp(n, small(primes[i] as i64)) != 0) { return true; }
+    }
+  }
+  return false;
+}
+
+/**
+ * Miller-Rabin: false means definitely composite, true means probably prime.
+ *
+ * `bases` supplies the witnesses, one per round, as big-endian values; each is reduced into
+ * `[2, n-2]`. A base outside that range proves nothing, so it is folded rather than rejected — the
+ * caller cannot know `n` in advance to choose bases in range.
+ */
+export bool millerRabin(Big n, u8[][] bases) {
+  if (cmp(n, bigTwo()) < 0) { return false; }
+  // 2 and 3 are prime and are the two the loop below cannot handle: for 2 the evenness test rejects
+  // it, and for 3 there is no base in `[2, n-2]` to test with. Both were wrong until a test asked.
+  if (cmp(n, bigTwo()) == 0 || cmp(n, small(3)) == 0) { return true; }
+  DivSmall even = divSmall(n, 2);
+  if (even.r == 0) { return false; }
+
+  // n - 1 = d * 2^s with d odd.
+  Big nMinusOne = sub(n, bigOne());
+  Big d = copy(nMinusOne);
+  i32 s = 0;
+  while (true) {
+    DivSmall half = divSmall(d, 2);
+    if (half.r != 0) { break; }
+    d = half.q;
+    s = s + 1;
+  }
+
+  Big nMinusTwo = sub(n, bigTwo());
+  for (i32 round = 0; round < bases.len(); round++) {
+    Big a = mod(fromBytes(bases[round]), nMinusTwo);
+    a = add(a, bigTwo());                       // now in [2, n-1]
+    Big x = modPow(a, d, n);
+    if (cmp(x, bigOne()) == 0 || cmp(x, nMinusOne) == 0) { continue; }
+    bool witnessed = true;
+    for (i32 i = 1; i < s && witnessed; i++) {
+      x = mod(mul(x, x), n);
+      if (cmp(x, nMinusOne) == 0) { witnessed = false; }
+    }
+    if (witnessed) { return false; }
+  }
+  return true;
+}
+
+/** `shake256(seed | counter)`, the stream every candidate and base comes from. */
+u8[] stream(u8[] seed, i64 counter, i32 outLen) {
+  u8[] input = u8[seed.len() + 8]();
+  for (i32 i = 0; i < seed.len(); i++) { input[i] = seed[i]; }
+  for (i32 i = 0; i < 8; i++) {
+    input[seed.len() + i] = ((counter >> (((7 - i) * 8) as@ u32)) & 0xFF) as~ i32;
+  }
+  return shake256(input, outLen);
+}
+
+/**
+ * A prime of exactly `bits` bits, or a zero `Big` if `attempts` candidates were all composite.
+ *
+ * **The top two bits are set.** The top one makes the candidate exactly `bits` long; the second
+ * makes the product of two such primes exactly `2*bits` long rather than one bit short half the
+ * time, which is why RSA key generation everywhere does this and why a 1024-bit modulus is always
+ * 1024 bits and never 1023.
+ */
+export Big randomPrime(i32 bits, u8[] seed, i64 counterBase, i32 attempts) {
+  i32 bytes = (bits + 7) / 8;
+  for (i32 attempt = 0; attempt < attempts; attempt++) {
+    u8[] raw = stream(seed, counterBase + (attempt as i64), bytes);
+    raw[0] = (raw[0] | 0xC0);                   // top two bits
+    // Forcing the candidate odd is an efficiency, not a correctness property: an even candidate is
+    // rejected by the evenness test in `millerRabin` and the next one is drawn. Removing it survives
+    // the tests and doubles the work, which is the honest description of it.
+    raw[bytes - 1] = (raw[bytes - 1] | 1);      // odd
+    Big candidate = fromBytes(raw);
+    if (bitLen(candidate) != bits) { continue; }
+    if (hasSmallFactor(candidate)) { continue; }
+
+    u8[][] bases = u8[][MILLER_RABIN_ROUNDS]();
+    for (i32 i = 0; i < MILLER_RABIN_ROUNDS; i++) {
+      bases[i] = stream(seed, counterBase + (attempt as i64) * 1000 + 500 + (i as i64), bytes);
+    }
+    if (millerRabin(candidate, bases)) { return candidate; }
+  }
+  return small(0);
+}
+
+/**
+ * An RSA keypair of `bits` bits from a 32-byte seed.
+ *
+ * `bits` must be even and at least 512 — below that the primes are small enough that the small-prime
+ * sieve and the bit-length check interact badly, and no protocol here wants a shorter key anyway.
+ *
+ * `p` and `q` are searched from disjoint parts of the seed stream, so they cannot come out equal —
+ * which would make `n` a perfect square and the key trivially breakable. They are also required to
+ * differ, which catches that even if the streams were ever to collide.
+ */
+export RsaKey generateRsaKey(i32 bits, u8[] seed) {
+  RsaKey bad = RsaKey(false, u8[0](), u8[0](), u8[0](), u8[0](), u8[0]());
+  if (seed.len() != 32) { return bad; }
+  if (bits < 512 || bits % 2 != 0) { return bad; }
+
+  i32 half = bits / 2;
+  Big e = small(PUBLIC_EXPONENT);
+
+  // Two searches from far-apart counters, so one prime's candidates can never be the other's.
+  Big p = suitablePrime(half, seed, 1000000, e);
+  if (isZero(p)) { return bad; }
+  Big q = suitablePrime(half, seed, 9000000, e);
+  if (isZero(q)) { return bad; }
+  if (cmp(p, q) == 0) { return bad; }
+
+  Big n = mul(p, q);
+  if (bitLen(n) != bits) { return bad; }
+
+  // λ(n) = lcm(p-1, q-1), which is what modern generators use: it gives the smallest working `d`.
+  //
+  // φ(n) = (p-1)(q-1) also works and no test can tell — every `d` valid mod λ is valid mod φ and the
+  // key verifies either way. λ is chosen because a smaller `d` is a faster private operation, not
+  // because φ would be wrong.
+  Big p1 = sub(p, bigOne());
+  Big q1 = sub(q, bigOne());
+  Big lambda = divmod(mul(p1, q1), gcd(p1, q1)).q;
+  Big d = modInverse(e, lambda);
+  if (isZero(d)) { return bad; }
+
+  i32 width = bits / 8;
+  return RsaKey(true, toBytes(n, width), toBytes(e, 3), toBytes(d, width),
+                toBytes(p, width / 2), toBytes(q, width / 2));
+}
+
+/**
+ * A prime `x` of `bits` bits with `gcd(e, x-1) == 1`, so that `e` has an inverse mod `x-1`.
+ *
+ * With `e = 65537` the rejection almost never fires — it needs 65537 to divide `p-1` — which makes
+ * it look like dead code. It is not: without it a generation that drew such a prime would fail
+ * outright instead of drawing another, and the failure would be a key that could not be made rather
+ * than one attempt wasted. Exported so a test can exercise it with a small `e`, where the rejection
+ * fires about half the time.
+ */
+export Big suitablePrime(i32 bits, u8[] seed, i64 counterBase, Big e) {
+  for (i32 round = 0; round < 40; round++) {
+    Big candidate = randomPrime(bits, seed, counterBase + (round as i64) * 100000, 200);
+    if (isZero(candidate)) { continue; }
+    if (cmp(gcd(e, sub(candidate, bigOne())), bigOne()) == 0) { return candidate; }
+  }
+  return small(0);
+}
