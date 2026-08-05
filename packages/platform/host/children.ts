@@ -96,6 +96,15 @@ export class ByteQueue {
    */
   push(b: Uint8Array): Promise<boolean> {
     if (this.#ended) return Promise.resolve(false);
+    // **A zero-length write is a no-op, not a stream.** Empty is this queue's *end* sentinel —
+    // `next` resolves empty when the queue has ended, and `rest` stops on an empty chunk — so
+    // handing an empty array to a waiting reader ends the stream from the reader's point of view
+    // and silently discards everything after it.
+    //
+    // `packages/sh`'s `true` builtin returns `Output.ok(u8[0]())`, so the shell writes zero bytes:
+    // `echo one; true; echo two` gave `one` alone through a spawned shell whose parent was reading
+    // as it went. Nothing is lost by dropping it, because there is nothing in it.
+    if (b.length === 0) return Promise.resolve(true);
     // Straight to a waiter if there is one, so nothing is buffered that is already wanted.
     if (this.#waiting !== null) {
       const w = this.#waiting;
