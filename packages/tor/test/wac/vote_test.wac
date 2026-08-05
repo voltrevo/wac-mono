@@ -1,0 +1,41 @@
+// The vote signature span, against a signature a chutney authority made over its own vote.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { signedLength, voteSignatureDigest, voteSignatureDigest256 } from "../../src/vote.wac";
+
+const i32 V_VOTE = 0;
+const i32 V_RECOVERED = 1;
+
+u8[] none() { return u8[0](); }
+
+export string test_the_signed_span_is_tors(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] vote = ref(V_VOTE, none(), none());
+  t.isTrue(vote.len() > 3000, "the vote is a whole document");
+
+  u8[] want = ref(V_RECOVERED, none(), none());
+  t.eqI32(want.len(), 20, "the signing key recovered a SHA-1 digest");
+
+  // The assertion: tor's signature over tor's vote, under our span.
+  t.eqBytes(voteSignatureDigest(vote), want, "our digest is the one the authority signed");
+
+  // The span ends on the space after the keyword, and includes it. Asserted directly so a failure says
+  // which rule broke rather than only that a digest differs.
+  i32 end = signedLength(vote);
+  t.isTrue(end > 0, "the keyword is present");
+  t.eqI32(vote[end - 1], 32, "the span ends on the space after directory-signature");
+  t.neI32(vote[end], 32, "and includes only that one space");
+
+  // The fingerprints that follow are outside the span — an authority's signature does not cover the
+  // claim about which authority made it.
+  t.neI32(vote[end], 10, "the fingerprints follow the space, and are not signed");
+
+  // The SHA-256 variant hashes the same span, which is what makes it a variant rather than a different
+  // rule. Only the length is asserted: no vector here carries a sha256 signature to compare against.
+  t.eqI32(voteSignatureDigest256(vote).len(), 32, "the sha256 form is over the same span");
+
+  // A document without the keyword yields nothing rather than a digest of everything.
+  t.eqI32(voteSignatureDigest("network-status-version 3\n".toBytes()).len(), 0,
+          "no keyword, no digest");
+  return t.report();
+}

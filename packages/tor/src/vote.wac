@@ -1,0 +1,57 @@
+// A directory authority's vote: the document it publishes saying what it believes the network is.
+//
+// This file starts with the signature, because that is the part with a rule nobody would guess and
+// everything else in a vote is worthless without it.
+//
+// ## The signed span ends on a space
+//
+// tor computes a network status's digests with
+//
+//     router_get_hashes_impl(s, len, digests, "network-status-version", "\ndirectory-signature", ' ')
+//
+// and that last argument is the whole point. The span runs from the first byte of the document,
+// through `directory-signature`, and then **to the following space** — so it includes the keyword and
+// exactly one space, and stops before the fingerprints that identify which authority signed.
+//
+// A router descriptor uses the same helper with `'\n'`, which is why `rsaDescriptorDigest` in
+// `routerdesc.wac` includes the newline after its keyword. Two documents, one helper, two different
+// endings. Checked against a vote a chutney authority produced: the span below matches its signature,
+// and stopping before the space or continuing to the newline after the fingerprints both fail.
+//
+// ## Which hash
+//
+// `directory-signature <identity> <signing-key>` with no algorithm token means SHA-1.
+// `directory-signature sha256 <identity> <signing-key>` means SHA-256 over the same span. A consensus
+// carries both forms from different authorities; a vote in practice carries the first.
+
+import { sha1 } from "../../crypto/src/sha1.wac";
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { pastLineStarting } from "./routerdesc.wac";
+
+/** The text the signature is announced by: keyword and the one space the digest includes. */
+u8[] signatureKeyword() { return "directory-signature ".toBytes(); }
+
+/** The signed span: from the start of the document through `directory-signature ` inclusive. */
+export i32 signedLength(u8[] document) { return pastLineStarting(document, signatureKeyword()); }
+
+/**
+ * The 20-byte SHA-1 an unqualified `directory-signature` signs, or empty if the keyword is absent.
+ */
+export u8[] voteSignatureDigest(u8[] document) {
+  i32 end = signedLength(document);
+  if (end < 0) { return u8[0](); }
+  return sha1(head(document, end));
+}
+
+/** The 32-byte SHA-256 a `directory-signature sha256` signs, over the same span. */
+export u8[] voteSignatureDigest256(u8[] document) {
+  i32 end = signedLength(document);
+  if (end < 0) { return u8[0](); }
+  return sha256(head(document, end));
+}
+
+u8[] head(u8[] document, i32 n) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = document[i]; }
+  return out;
+}
