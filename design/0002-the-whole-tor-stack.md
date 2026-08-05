@@ -269,6 +269,25 @@ most, because it puts their implementation on the far side of every seam.
 > (an AUTH_CHALLENGE response, or a certificate type it insists on), and whether the responder's
 > NETINFO satisfies the initiator's check.
 >
+> Narrowed further by reading, with two suspects eliminated:
+>
+>   - **Not TLS.** `extendCircuit` checks `next.dead` after `handshakeTls` and before `linkHandshake`,
+>     and it got past that, so our TLS client and our TLS server do complete a handshake.
+>   - **Not the version.** `relaylink.wac` offers `(4, 5)` and `link.wac` offers `(3, 4, 5)`, so they
+>     negotiate 5, comfortably past the initiator's `< 4` rejection.
+>
+> That leaves three branches of `linkHandshake`, and one is much likelier: it returns false on **any
+> cell command that is not CERTS, AUTH_CHALLENGE, VPADDING or NETINFO**. The suspicious thing is where
+> such a byte would come from — **link protocol 3 uses 2-byte circuit ids and 4 and 5 use 4-byte ones**,
+> and the VERSIONS cell is always framed the old way while everything after it is framed the new way. An
+> initiator that picks the wrong width at that boundary reads CERTS shifted by two bytes and sees a
+> nonsense command. That is exactly this symptom, and exactly what C tor could not have surfaced,
+> because against C tor only one side of the framing was ever ours.
+>
+> So: check what `nextCell` assumes about circuit-id width either side of VERSIONS, in `link.wac` and
+> `cell.wac`. The other two branches — `certsCount < 0`, and a short read — are cheap to rule out by
+> logging the command byte the loop rejects.
+>
 > The SOCKS requests still time out, which is expected and separate: nothing implements `RELAY_BEGIN`.
 >
 > One hypothesis tested and **disproved**: that tor asked our relay for the consensus because our vote
