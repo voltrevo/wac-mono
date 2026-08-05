@@ -138,12 +138,25 @@ most, because it puts their implementation on the far side of every seam.
 > `src/link.wac`'s job, written for the client), send `CREATE2` carrying the client's handshake
 > untouched, wait for `CREATED2`, answer `EXTENDED2`, and thereafter carry cells both ways.
 >
-> The multiplexing question is settled, which was the part that looked like it might need a platform
-> change. It does not: `Pending<T>` already has **`isDone()`**, a non-blocking readiness check, and
-> `Core.sleepMillis` gives a poll interval. Verified with a throwaway probe — a 400 ms sleep read as
-> not-ready, then ready, without blocking — so two sockets can be served from one loop by polling both.
-> Nothing else in the repo uses `isDone()` yet, so expect to be the first to find its rough edges; note
-> that `settled` is a raw capability field and `isDone` is the method wrapper over it.
+> The multiplexing is already solved, and by a purpose-built primitive rather than anything clever:
+>
+>     i32 which = core.waitAny(i32[](fromClient.id, fromNextHop.id), -1);
+>
+> **`Core.waitAny(ids, millis)`** parks until one of the tickets has an answer and returns *which* — its
+> index in the list, or -1 if the deadline passed. `-1` millis waits as long as it takes, `0` asks what
+> is ready right now. The ids may come from different `Pending<T>` types, so a `recv` and an `accept`
+> can be waited on together, and the deadline belongs to the wait rather than to each capability, which
+> is why there is no `recvWithin`.
+>
+> There is prior art for exactly this shape and it should be read first:
+> **`packages/box/src/applets/nc.wac`** is a two-source relay whose header says it "could not be written
+> until `waitAny` existed", plus `packages/platform/example/{whichever,inetd,pipe,patience}.wac`.
+>
+> An earlier version of this note recommended polling `Pending.isDone()` with `sleepMillis` instead.
+> That is wrong and `waitAny`'s own documentation says so — "polling `isDone` in a loop is a spin, which
+> burns a core to avoid parking" — as does `sleepMillis`, which points at `waitAny` for a deadline. The
+> correction is recorded rather than quietly removed because the wrong version was pushed, and because
+> the mistake was not reading far enough in a file that answered the question directly.
 >
 > Three relays are what step 5 needs, so `EXTEND2` is its prerequisite as much as this step's
 > completion. The current network reaches 50 % bootstrap with one relay and stops there.
