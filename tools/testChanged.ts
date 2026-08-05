@@ -17,6 +17,11 @@
 // Changed means "against `origin/master`, plus whatever is uncommitted", so it covers the file you
 // are editing right now as well as the branch you are on.
 
+import { refuseIfNested, SUITE_ENV } from "./suiteGuard.ts";
+
+// wac-mono 0076: this spawns whole test runs, so it must not be one.
+refuseIfNested("deno task test:changed");
+
 const SHARED = ["harness/", "tools/", "deno.json", "wac-version.json", "import_map.json"];
 
 async function git(args: string[]): Promise<string[]> {
@@ -74,9 +79,10 @@ const r = await new Deno.Command("deno", {
     "--allow-env",
     ...targets,
   ],
-  // The same cap `tools/test.ts` applies, so the two entry points do not differ in how much of
-  // the machine they take. See issue 0075 for why the number is 2.
-  env: { DENO_JOBS: Deno.env.get("DENO_JOBS") ?? "2" },
+  // The same cap `tools/runTests.ts` applies, so the two entry points do not differ in how much of
+  // the machine they take. See issue 0075 for why the number is 2. `SUITE_ENV` marks the children so
+  // that a suite started from inside this one refuses instead of recursing — wac-mono 0076.
+  env: { DENO_JOBS: Deno.env.get("DENO_JOBS") ?? "2", ...SUITE_ENV },
   stdout: "inherit",
   stderr: "inherit",
 }).output();

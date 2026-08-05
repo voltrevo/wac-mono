@@ -25,15 +25,21 @@ log="$(mktemp -t push-suite-XXXXXX.log)"
 
 # Space, before blaming the change. This gate has failed twice on `No space left on device` for reasons
 # outside this container: the shared overlay sits above 90% and only a few gigabytes of it are visible
-# from in here. The operator's standing answer (2026-08-05) is to clear *Deno's* cache and retry.
+# from in here. The operator's standing answer (2026-08-05) is to clear *Deno's* cache and retry, and to
+# leave the repo's own `.cache` alone — it is small and every test repopulates it with the same bytes.
 #
-# **It used to clear `gen`, which was the wrong directory.** Measured with the disk at 97%: `gen` held
-# 220 MB and `v8_code_cache_v2` held 28 GB, so the mitigation freed under one per cent of the problem —
-# three times — while reporting that it had done something. Both functions live in `cacheGuard.sh` now,
-# shared with `tools/test.sh`, because a mitigation that only runs when somebody pushes is a mitigation
-# nobody gets.
-# shellcheck source=tools/cacheGuard.sh
-. tools/cacheGuard.sh
+# The clearing itself lives in `tools/runTests.ts`, which the suite runs through anyway, so there is one
+# implementation of it rather than a shell copy beside a TypeScript one. It used to clear `gen` — 220 MB
+# — while 28 GB sat next to it in `v8_code_cache_v2`, three times, reporting success each time.
+guardDenoCache() {
+  deno run --allow-read --allow-write --allow-env tools/runTests.ts guard
+}
+freeDenoCache() {
+  echo "== the disk is full and it is not this change: clearing Deno's caches and retrying =="
+  du -sh "$HOME/.cache/deno"/* 2>/dev/null | sort -h | tail -3
+  deno run --allow-read --allow-write --allow-env tools/runTests.ts free
+  df -h / | tail -1
+}
 
 for attempt in 1 2 3; do
   guardDenoCache
