@@ -1,0 +1,452 @@
+// A filesystem that belongs to the system rather than to the host.
+//
+// [design/0001](../../../design/0001-a-self-contained-system.md) step 1, filed as wac-mono 0067. Every
+// filesystem capability a program has today is the *host's*, so `packages/ssh`'s demo hands each session
+// the real disk of whatever ran the daemon and the browser terminal hands it the tab's Origin Private
+// File System. There is nothing that belongs to the system: nothing to seal a session inside, nothing to
+// persist as an image, and nothing hermetic for a test to run against.
+//
+// ## Why one type with a mount table, rather than an interface
+//
+// The obvious design is an abstract filesystem with a memory implementation and a host implementation.
+// wac will not do it: `override` is a source-level check and **dispatch is static** — a `Circle` in a
+// `Shape` variable answers `Shape.name()` — so a base-typed `Fs` would always run the base's bodies.
+// The language's own idiom for varying behaviour is a funcref plus explicit state (`Shell.external` is
+// one), and a funcref cannot capture a filesystem because there are no closures.
+//
+// So: one concrete `Fs`, holding a mount table, and the branch is written by hand. That is what the tour
+// says to do, and it turns out to be the shape the design wanted anyway — a host mount is how "translate
+// to real operations on the host" survives as a deliberate feature rather than as the default.
+//
+// ## What a path is here
+//
+// Absolute, `/`-separated, with no `.` or `..` left in it: `packages/sh`'s `resolve` already normalises
+// every path before it crosses a capability boundary, and this relies on that rather than repeating it.
+// A name is bytes — anything but `/` and NUL — because that is what a name is on the systems being
+// imitated. The one wrinkle is that names arrive here as wac strings, which are byte arrays, so nothing
+// is lost on the way in; what a *host* does with them is
+// [0065](../../../issues/open/0065-a-spawned-programs-arguments-are-not-byte-exact.md).
+
+import { Map } from "../../std/src/map.wac";
+import { Vec } from "../../std/src/vec.wac";
+import { hashString, stringEq } from "../../std/src/hash.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+import { Change, Cli, FAULT_DENIED, FAULT_EXISTS, FAULT_NONE, FAULT_NOT_EMPTY, FAULT_NOT_FOUND,
+  FAULT_OTHER, FileResult, Stat } from "../../platform/src/platform.wac";
+
+/** Where a mount's bytes actually live. */
+export enum Backing {
+  /** In this program's own memory: the default, and what a test wants. */
+  Memory,
+  /**
+   * The host, through the capabilities of whoever built this filesystem.
+   *
+   * Present so that reaching the real disk is something a caller *asks* for. A shell built with one of
+   * these at `/` behaves exactly as it did before this package existed, which is what makes the change
+   * to `packages/sh` a change of shape rather than of behaviour.
+   */
+  Host(Cli cli),
+}
+
+/** One mounted filesystem, at a path. */
+export struct Mount {
+  /** Absolute, without a trailing slash. `/` is the empty string, so every path is a suffix of it. */
+  string at;
+  Backing backing;
+  /** Index into `Fs.nodes` of this mount's root. Meaningless for a host mount. */
+  i32 root;
+}
+
+/**
+ * A file or a directory.
+ *
+ * Metadata is stored beside the bytes because users are data in the image (design/0001 D5): a host's
+ * idea of who owns a file cannot survive an image that is one blob owned by whoever ran the process.
+ * `mode` and `owner` are recorded now and enforced later — step 4 is where a session gets a user.
+ */
+export struct Inode {
+  bool isDir;
+  /** Directory entries, name to node index. Empty for a file. */
+  Map<string, i32> entries;
+  /** File bytes. Empty for a directory. */
+  Buf data;
+  i32 mode;
+  string owner;
+  i64 mtime;
+
+  /** A copy of the bytes: a reader must not be able to write the file by holding its array. */
+  u8[] bytes(const this) { return this.data.bytes(); }
+
+  /** Replace the contents, as a truncating write does. */
+  void replace(this, u8[] data, i64 now) {
+    this.data = Buf.create();
+    this.data.pushAll(data);
+    this.mtime = now;
+  }
+}
+
+/**
+ * A filesystem: some mounts, and the nodes of every memory mount in one pool.
+ *
+ * One pool rather than one per mount so that a node index means the same thing everywhere, which is what
+ * an image format will want to write out and what a handle table will want to point at.
+ */
+export struct Fs {
+  Vec<Mount> mounts;
+  Vec<Inode> nodes;
+  /** What a newly created file is owned by until there are users. */
+  string owner;
+  /** Milliseconds, from whoever built this: wac has no clock of its own. */
+  i64 now;
+
+  /** An empty filesystem with one memory mount at the root. */
+  Fs inMemory(i64 now) {
+    Vec<Mount> mounts = Vec.create();
+    Vec<Inode> nodes = Vec.create();
+    nodes.push(dirNode("root", now));
+    mounts.push(Mount("", Backing.Memory, 0));
+    return Fs(mounts, nodes, "root", now);
+  }
+
+  /**
+   * The host's filesystem, mounted at the root.
+   *
+   * What `packages/sh` gets when nobody has said otherwise, so that today's behaviour is one mount
+   * rather than a special case: the shell asks its filesystem, and its filesystem asks the host.
+   */
+  Fs onHost(Cli cli, i64 now) {
+    Vec<Mount> mounts = Vec.create();
+    Vec<Inode> nodes = Vec.create();
+    mounts.push(Mount("", Backing.Host(cli), -1));
+    return Fs(mounts, nodes, "root", now);
+  }
+
+  /** Mount a fresh empty memory filesystem at `at`, which must be an absolute normalised path. */
+  void mountMemory(this, string at) {
+    this.nodes.push(dirNode(this.owner, this.now));
+    this.mounts.push(Mount(trimSlash(at), Backing.Memory, this.nodes.len() - 1));
+  }
+
+  /**
+   * Which mount owns this path: the longest `at` that prefixes it.
+   *
+   * Longest-prefix rather than first-match so that mounting `/home` under a host `/` does what a person
+   * expects, and so the order mounts were added in does not decide the answer.
+   */
+  i32 mountOf(const this, string path) {
+    i32 best = 0;
+    i32 bestLen = -1;
+    for (i32 i = 0; i < this.mounts.len(); i++) {
+      string at = this.mounts.get(i).at;
+      if (!underMount(at, path)) { continue; }
+      if (at.len() > bestLen) {
+        best = i;
+        bestLen = at.len();
+      }
+    }
+    return best;
+  }
+
+  // ── Reading ─────────────────────────────────────────────────────────────────
+
+  /** The whole file, or why not. */
+  FileResult readFile(this, string path) {
+    Mount m = this.mounts.get(this.mountOf(path));
+    match (m.backing) {
+      case Host(cli): { return cli.readFile(path).wait(); }
+      else: {}
+    }
+    i32 node = this.find(m, path);
+    if (node < 0) { return FileResult.of(false, u8[0](), "no such file or directory", FAULT_NOT_FOUND()); }
+    if (this.nodes.get(node).isDir) {
+      // `FAULT_OTHER`, not `FAULT_DENIED`, because that is what the hosts answer: the category set has no
+      // "is a directory", so `faults.ts` classifies Deno's `EISDIR` as other and the message carries it.
+      // Chosen by comparing against a real filesystem — the first run of `test/host.test.ts` said 2 where
+      // the host said 5, and the host is the oracle. Whether the taxonomy *should* grow a category is a
+      // separate question, noted in 0067: a program does branch on it, since `cat` on a directory and
+      // `cat` on a missing file are different mistakes.
+      return FileResult.of(false, u8[0](), "is a directory", FAULT_OTHER());
+    }
+    return FileResult.of(true, this.nodes.get(node).bytes(), "", FAULT_NONE());
+  }
+
+  /** What a path is, if it is anything. */
+  Stat stat(this, string path) {
+    Mount m = this.mounts.get(this.mountOf(path));
+    match (m.backing) {
+      case Host(cli): { return cli.stat(path).wait(); }
+      else: {}
+    }
+    i32 node = this.find(m, path);
+    if (node < 0) { return Stat.of(false, false, false, 0, 0, false); }
+    Inode n = this.nodes.get(node);
+    return Stat.of(true, !n.isDir, n.isDir, n.data.len as i64, n.mtime, false);
+  }
+
+  /** Nothing here is a symbolic link yet, so this is `stat` — said rather than implied. */
+  Stat linkStat(this, string path) { return this.stat(path); }
+
+  /**
+   * The names in a directory, sorted, without `.` or `..` — and null for a path that is not one.
+   *
+   * Sorted because a filesystem's own order is not something a program should depend on and every caller
+   * that cares sorts anyway. Null is the capability's answer for "not a directory", and keeping it means
+   * `ls` can tell that from an empty one.
+   */
+  string[]? readDir(this, string path) {
+    Mount m = this.mounts.get(this.mountOf(path));
+    match (m.backing) {
+      case Host(cli): { return cli.readDir(path).wait(); }
+      else: {}
+    }
+    i32 node = this.find(m, path);
+    // Null rather than empty for "not a directory" or "not there", which is what the capability answers
+    // and what lets `ls` tell an empty directory from a missing one.
+    if (node < 0 || !this.nodes.get(node).isDir) { return null; }
+    string[] names = this.nodes.get(node).entries.keys();
+    // Insertion sort: a directory listing is small, and a reader can check it. By *bytes*, because that
+    // is what `LC_ALL=C` means and what every tool this is compared against does with it.
+    for (i32 i = 1; i < names.len(); i++) {
+      string v = names[i];
+      i32 j = i - 1;
+      while (j >= 0 && afterName(names[j], v)) {
+        names[j + 1] = names[j];
+        j--;
+      }
+      names[j + 1] = v;
+    }
+    return names;
+  }
+
+  // ── Writing ─────────────────────────────────────────────────────────────────
+
+  /** Create or replace a file, making no parents: the same contract `writeFile` has. */
+  Change writeFile(this, string path, u8[] data) {
+    Mount m = this.mounts.get(this.mountOf(path));
+    match (m.backing) {
+      case Host(cli): { return cli.writeFile(path, data).wait(); }
+      else: {}
+    }
+    i32 parent = this.find(m, parentOf(path));
+    if (parent < 0) { return Change.of(FAULT_NOT_FOUND(), "no such file or directory"); }
+    if (!this.nodes.get(parent).isDir) { return Change.of(FAULT_OTHER(), "not a directory"); }
+    string name = baseOf(path);
+    if (name == "") { return Change.of(FAULT_OTHER(), "is a directory"); }
+    i32 existing = this.child(parent, name);
+    if (existing >= 0 && this.nodes.get(existing).isDir) {
+      // As above: the hosts say "other" for this, and matching them is what the differential asks for.
+      return Change.of(FAULT_OTHER(), "is a directory");
+    }
+    if (existing >= 0) {
+      this.nodes.get(existing).replace(data, this.now);
+      return Change.of(FAULT_NONE(), "");
+    }
+    this.nodes.push(fileNode(data, this.owner, this.now));
+    this.nodes.get(parent).entries.set(name, this.nodes.len() - 1);
+    return Change.of(FAULT_NONE(), "");
+  }
+
+  /**
+   * A directory. `parents` is `-p`: make what is missing above it, and say nothing if it is already there.
+   *
+   * The flag is the capability's, so a caller does not have to loop — and a `mkdir -p` written as a loop
+   * over `mkdir` cannot tell "already there" from "somebody else made it just now", which is the race the
+   * flag exists to avoid.
+   */
+  Change mkdir(this, string path, bool parents) {
+    Mount m = this.mounts.get(this.mountOf(path));
+    match (m.backing) {
+      case Host(cli): { return cli.mkdir(path, parents).wait(); }
+      else: {}
+    }
+    if (parents) { return this.mkdirAll(m, path); }
+    i32 parent = this.find(m, parentOf(path));
+    if (parent < 0) { return Change.of(FAULT_NOT_FOUND(), "no such file or directory"); }
+    if (!this.nodes.get(parent).isDir) { return Change.of(FAULT_DENIED(), "not a directory"); }
+    string name = baseOf(path);
+    if (name == "") { return Change.of(FAULT_EXISTS(), "file exists"); }
+    if (this.child(parent, name) >= 0) { return Change.of(FAULT_EXISTS(), "file exists"); }
+    this.nodes.push(dirNode(this.owner, this.now));
+    this.nodes.get(parent).entries.set(name, this.nodes.len() - 1);
+    return Change.of(FAULT_NONE(), "");
+  }
+
+  /** Every missing component of a path, and no complaint about the ones that are there. */
+  Change mkdirAll(this, Mount m, string path) {
+    string rest = path.slice(m.at.len(), path.len());
+    Vec<string> parts = splitPath(rest);
+    i32 at = m.root;
+    for (i32 i = 0; i < parts.len(); i++) {
+      i32 next = this.child(at, parts.get(i));
+      if (next < 0) {
+        this.nodes.push(dirNode(this.owner, this.now));
+        next = this.nodes.len() - 1;
+        this.nodes.get(at).entries.set(parts.get(i), next);
+      } else if (!this.nodes.get(next).isDir) {
+        return Change.of(FAULT_EXISTS(), "file exists");
+      }
+      at = next;
+    }
+    return Change.of(FAULT_NONE(), "");
+  }
+
+  /**
+   * Remove a file, or an *empty* directory.
+   *
+   * The three answers a caller needs are the three the hosts give: gone, not there, or a directory with
+   * something in it — which is what makes `rm -f` able to ignore only the second.
+   */
+  Change remove(this, string path, bool recursive) {
+    Mount m = this.mounts.get(this.mountOf(path));
+    match (m.backing) {
+      case Host(cli): { return cli.remove(path, recursive).wait(); }
+      else: {}
+    }
+    i32 parent = this.find(m, parentOf(path));
+    if (parent < 0) { return Change.of(FAULT_NOT_FOUND(), "no such file or directory"); }
+    string name = baseOf(path);
+    i32 node = this.child(parent, name);
+    if (node < 0) { return Change.of(FAULT_NOT_FOUND(), "no such file or directory"); }
+    if (this.nodes.get(node).isDir && this.nodes.get(node).entries.len() > 0 && !recursive) {
+      return Change.of(FAULT_NOT_EMPTY(), "directory not empty");
+    }
+    // Nothing is freed: a node nobody points at is unreachable, and an image writer walks from the roots.
+    // Reference counting would buy memory back in a program that deletes a great deal, and there is no
+    // such program yet — said here rather than discovered later.
+    this.nodes.get(parent).entries.remove(name);
+    return Change.of(FAULT_NONE(), "");
+  }
+
+  /** Move a name, replacing what is there — as the hosts do, and as `mv` expects. */
+  Change rename(this, string from, string to) {
+    Mount fromMount = this.mounts.get(this.mountOf(from));
+    Mount toMount = this.mounts.get(this.mountOf(to));
+    match (fromMount.backing) {
+      case Host(cli): {
+        // A rename across mounts is a copy and a delete, and no host does it for you. Not implemented
+        // rather than half-done: it would need reading the whole file, which a `Change` cannot report.
+        match (toMount.backing) {
+          case Host(cli2): { return cli.rename(from, to).wait(); }
+          else: { return Change.of(FAULT_DENIED(), "rename across mounts is not implemented"); }
+        }
+      }
+      else: {}
+    }
+    match (toMount.backing) {
+      case Host(cli): { return Change.of(FAULT_DENIED(), "rename across mounts is not implemented"); }
+      else: {}
+    }
+    if (fromMount.at != toMount.at) {
+      return Change.of(FAULT_DENIED(), "rename across mounts is not implemented");
+    }
+    i32 fromParent = this.find(fromMount, parentOf(from));
+    if (fromParent < 0) { return Change.of(FAULT_NOT_FOUND(), "no such file or directory"); }
+    i32 node = this.child(fromParent, baseOf(from));
+    if (node < 0) { return Change.of(FAULT_NOT_FOUND(), "no such file or directory"); }
+    i32 toParent = this.find(toMount, parentOf(to));
+    if (toParent < 0) { return Change.of(FAULT_NOT_FOUND(), "no such file or directory"); }
+    if (!this.nodes.get(toParent).isDir) { return Change.of(FAULT_DENIED(), "not a directory"); }
+    this.nodes.get(fromParent).entries.remove(baseOf(from));
+    this.nodes.get(toParent).entries.set(baseOf(to), node);
+    return Change.of(FAULT_NONE(), "");
+  }
+
+  // ── Walking ─────────────────────────────────────────────────────────────────
+
+  /** The node a path names inside a mount, or -1. */
+  i32 find(const this, Mount m, string path) {
+    if (path.len() < m.at.len()) { return -1; }
+    string rest = path.slice(m.at.len(), path.len());
+    i32 at = m.root;
+    Vec<string> parts = splitPath(rest);
+    for (i32 i = 0; i < parts.len(); i++) {
+      if (!this.nodes.get(at).isDir) { return -1; }
+      i32 next = this.child(at, parts.get(i));
+      if (next < 0) { return -1; }
+      at = next;
+    }
+    return at;
+  }
+
+  /** A named child of a directory node, or -1. */
+  i32 child(const this, i32 dir, string name) {
+    if (name == "") { return dir; }
+    return this.nodes.get(dir).entries.get(name).orElse(-1);
+  }
+}
+
+/** Whether `a` sorts after `b`, by bytes. wac compares strings for equality and not for order. */
+bool afterName(string a, string b) {
+  u8[] x = a.toBytes();
+  u8[] y = b.toBytes();
+  i32 n = x.len() < y.len() ? x.len() : y.len();
+  for (i32 i = 0; i < n; i++) {
+    if (x[i] != y[i]) { return x[i] > y[i]; }
+  }
+  return x.len() > y.len();
+}
+
+/** A fresh empty directory. */
+Inode dirNode(string owner, i64 now) {
+  return Inode(true, Map.create(hashString, stringEq), Buf.create(), 493, owner, now);   // 0755
+}
+
+/** A fresh file holding these bytes. */
+Inode fileNode(u8[] data, string owner, i64 now) {
+  Buf held = Buf.create();
+  held.pushAll(data);
+  return Inode(false, Map.create(hashString, stringEq), held, 420, owner, now);          // 0644
+}
+
+/** The path above this one: `/a/b` gives `/a`, and `/a` gives the root. */
+string parentOf(string path) {
+  i32 cut = lastSlash(path);
+  if (cut <= 0) { return ""; }
+  return path.slice(0, cut);
+}
+
+/** The last component: `/a/b` gives `b`. */
+string baseOf(string path) {
+  i32 cut = lastSlash(path);
+  if (cut < 0) { return path; }
+  return path.slice(cut + 1, path.len());
+}
+
+i32 lastSlash(string path) {
+  i32 at = -1;
+  for (i32 i = 0; i < path.len(); i++) {
+    if (path.slice(i, i + 1) == "/") { at = i; }
+  }
+  return at;
+}
+
+/** A path without its trailing slash, and the root as the empty string. */
+string trimSlash(string path) {
+  if (path.len() > 1 && path.slice(path.len() - 1, path.len()) == "/") {
+    return path.slice(0, path.len() - 1);
+  }
+  if (path == "/") { return ""; }
+  return path;
+}
+
+/** Whether `path` is at or under `at`, treating `at` as a whole component. */
+bool underMount(string at, string path) {
+  if (at == "") { return true; }
+  if (path.len() < at.len()) { return false; }
+  if (path.slice(0, at.len()) != at) { return false; }
+  if (path.len() == at.len()) { return true; }
+  return path.slice(at.len(), at.len() + 1) == "/";
+}
+
+/** The non-empty components of a path. */
+Vec<string> splitPath(string path) {
+  Vec<string> out = Vec.create();
+  i32 from = 0;
+  for (i32 i = 0; i <= path.len(); i++) {
+    bool end = i == path.len();
+    if (!end && path.slice(i, i + 1) != "/") { continue; }
+    if (i > from) { out.push(path.slice(from, i)); }
+    from = i + 1;
+  }
+  return out;
+}

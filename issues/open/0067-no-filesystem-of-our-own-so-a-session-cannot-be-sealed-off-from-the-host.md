@@ -61,3 +61,30 @@ Watch for two things the host does that a naive VFS will not:
   `string` crossing a capability is UTF-8-normalised. Inside the VFS a name is whatever bytes it was
   created with, so the VFS is where that bug becomes observable in a test rather than in a diagnostic —
   worth a case that fails today and passes when 0065 is fixed, marked as such.
+
+## Half done, 2026-08-05 (agent-a)
+
+`packages/fs` exists: `Fs` with a mount table, a memory backing, a host backing, and the operations the
+shell needs — `readFile`, `writeFile`, `stat`, `linkStat`, `readDir`, `mkdir` (with `-p`), `remove` (with
+`-r`), `rename`. Twelve tests: six in wac for what a differential cannot reach, and six comparing
+transcripts of the same operation script run in memory and against a real disk.
+
+**The "Cli-shaped facade" in the description above was the wrong idea, and the language said so.** A
+facade of funcrefs cannot reach a filesystem: wac has no closures, so a funcref cannot capture one, and
+`override` is a source-level check with static dispatch, so an abstract `Fs` with two implementations
+would always run the base's bodies. What works is the language's own idiom — one concrete type, state
+passed explicitly, and the branch written by hand. That is a mount table, which the design deferred to
+later and which turns out to be the natural shape from the start: a **host mount** is how reaching the
+real disk survives as something a caller asks for.
+
+**What is left of this issue:** nothing calls it. `packages/sh` still reaches `sh.cli` for file
+operations, and threading `Fs` through the shell — nine places, per its README — is what makes a session's
+filesystem a choice. The differential the "done when" asks for (the same scripts over both backings)
+needs that thread, and the `ops` differential is the honest proof available before it.
+
+**A question the differential raised, for whoever wants it:** the category set has no "is a directory", so
+`cat` on a directory answers `FAULT_OTHER` and carries the reason in its message — which is what the hosts
+do, so `packages/fs` matches them rather than inventing a divergence. But a program *does* branch on it:
+`cat` on a directory and `cat` on a missing file are different mistakes, and `rm` already gets
+`FAULT_NOT_EMPTY` for the same kind of reason. Adding `FAULT_IS_DIR` would touch `host/faults.ts`, three
+hosts and `platform.wac`. Worth doing when something needs it, not before.

@@ -1,0 +1,132 @@
+// The filesystem, in wac, because none of these values has a JS shape worth defining.
+//
+// The *oracle* for this package is the host filesystem — the same operations against a real disk have to
+// answer the same way, and that is `test/host.test.ts`, which runs both. What is here is the part a
+// differential cannot reach: the fault categories, the mount table's longest-prefix rule, and what
+// happens at the edges of a path.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Fs } from "../../src/fs.wac";
+import { FAULT_DENIED, FAULT_EXISTS, FAULT_NONE, FAULT_NOT_EMPTY, FAULT_NOT_FOUND, FAULT_OTHER }
+  from "../../../platform/src/platform.wac";
+
+export string test_a_file_written_reads_back() {
+  T t = T.create();
+  Fs fs = Fs.inMemory(1000);
+  t.isTrue(fs.stat("/").exists, "the root exists");
+  t.isTrue(fs.stat("/").isDir, "and is a directory");
+  t.isTrue(!fs.stat("/nope").exists, "nothing else does");
+
+  t.eqI32(fs.writeFile("/a.txt", "hello\n".toBytes()).fault, FAULT_NONE(), "a write into the root");
+  t.isTrue(fs.stat("/a.txt").isFile, "makes a file");
+  t.eqI32(fs.stat("/a.txt").size as~ i32, 6, "of the right size");
+  t.isTrue(fs.readFile("/a.txt").ok, "which reads");
+  t.eqStr(string.fromBytes(fs.readFile("/a.txt").bytes), "hello\n", "byte for byte");
+
+  // A second write replaces rather than appends, which is what a truncating write means.
+  fs.writeFile("/a.txt", "bye\n".toBytes());
+  t.eqStr(string.fromBytes(fs.readFile("/a.txt").bytes), "bye\n", "and replaces");
+  t.eqI32(fs.stat("/a.txt").size as~ i32, 4, "with the new size");
+  return t.report();
+}
+
+export string test_directories_and_their_faults() {
+  T t = T.create();
+  Fs fs = Fs.inMemory(1000);
+
+  t.eqI32(fs.mkdir("/d", false).fault, FAULT_NONE(), "a directory");
+  t.eqI32(fs.mkdir("/d", false).fault, FAULT_EXISTS(), "and again is 'file exists'");
+  t.eqI32(fs.mkdir("/x/y", false).fault, FAULT_NOT_FOUND(), "no parents are made: that is the caller's loop");
+  t.eqI32(fs.writeFile("/x/y.txt", "".toBytes()).fault, FAULT_NOT_FOUND(), "nor for a write");
+
+  fs.writeFile("/d/f.txt", "x\n".toBytes());
+  t.eqI32(fs.remove("/d", false).fault, FAULT_NOT_EMPTY(), "a directory with something in it is not empty");
+  t.eqI32(fs.remove("/d/f.txt", false).fault, FAULT_NONE(), "the file goes");
+  t.eqI32(fs.remove("/d", false).fault, FAULT_NONE(), "and then the directory does");
+  t.eqI32(fs.remove("/d", false).fault, FAULT_NOT_FOUND(), "removing it twice is 'not there'");
+
+  // The three answers `rm -f` needs to tell apart, which is why they are categories and not messages.
+  t.eqI32(fs.mkdir("/e", false).fault, FAULT_NONE(), "another directory");
+  t.eqI32(fs.readFile("/e").fault, FAULT_OTHER(), "reading a directory is refused, as the hosts say it");
+  t.eqI32(fs.writeFile("/e", "no\n".toBytes()).fault, FAULT_OTHER(), "and so is writing over one");
+  return t.report();
+}
+
+export string test_a_listing_is_sorted_and_shallow() {
+  T t = T.create();
+  Fs fs = Fs.inMemory(1000);
+  fs.writeFile("/b", "".toBytes());
+  fs.writeFile("/a", "".toBytes());
+  fs.mkdir("/c", false);
+  fs.writeFile("/c/inside", "".toBytes());
+
+  string[] names = fs.readDir("/")!;
+  t.eqI32(names.len(), 3, "three names at the root");
+  t.eqStr(names[0], "a", "sorted by bytes");
+  t.eqStr(names[1], "b", "…");
+  t.eqStr(names[2], "c", "…and nothing from inside `c`");
+  t.eqI32(fs.readDir("/c")!.len(), 1, "which has its own");
+  t.isTrue(fs.readDir("/a") is null, "a file is not a directory, and says so");
+  t.isTrue(fs.readDir("/nope") is null, "and neither is a path that is not there");
+  return t.report();
+}
+
+export string test_rename_moves_a_name() {
+  T t = T.create();
+  Fs fs = Fs.inMemory(1000);
+  fs.mkdir("/d", false);
+  fs.writeFile("/a", "one\n".toBytes());
+
+  t.eqI32(fs.rename("/a", "/d/b").fault, FAULT_NONE(), "a move into a directory");
+  t.isTrue(!fs.stat("/a").exists, "the old name is gone");
+  t.eqStr(string.fromBytes(fs.readFile("/d/b").bytes), "one\n", "and the bytes came with it");
+
+  fs.writeFile("/c", "two\n".toBytes());
+  t.eqI32(fs.rename("/d/b", "/c").fault, FAULT_NONE(), "a move over an existing name replaces it");
+  t.eqStr(string.fromBytes(fs.readFile("/c").bytes), "one\n", "with the mover's bytes");
+  t.eqI32(fs.rename("/gone", "/x").fault, FAULT_NOT_FOUND(), "moving what is not there");
+  t.eqI32(fs.rename("/c", "/nodir/x").fault, FAULT_NOT_FOUND(), "moving into what is not there");
+  return t.report();
+}
+
+export string test_a_mount_takes_the_longest_prefix() {
+  T t = T.create();
+  Fs fs = Fs.inMemory(1000);
+  fs.mkdir("/home", false);
+  fs.writeFile("/home/outside", "root fs\n".toBytes());
+  fs.mountMemory("/home");
+
+  // The mount shadows what was under it rather than merging: two filesystems, one path.
+  t.isTrue(!fs.stat("/home/outside").exists, "the mount shadows the directory it covers");
+  t.eqI32(fs.writeFile("/home/inside", "mounted\n".toBytes()).fault, FAULT_NONE(), "a write lands in it");
+  t.eqStr(string.fromBytes(fs.readFile("/home/inside").bytes), "mounted\n", "and reads back from it");
+  t.eqI32(fs.readDir("/home")!.len(), 1, "which is its own root");
+
+  // …and a name that merely *starts* with the mount point is not under it.
+  t.eqI32(fs.writeFile("/homework", "elsewhere\n".toBytes()).fault, FAULT_NONE(), "`/homework` is not `/home`");
+  t.eqStr(string.fromBytes(fs.readFile("/homework").bytes), "elsewhere\n", "and stays where it was written");
+
+  // A rename across mounts is not implemented, and says so rather than half-doing it.
+  t.eqI32(fs.rename("/homework", "/home/hw").fault, FAULT_DENIED(), "across mounts is refused: not implemented, and said so");
+  return t.report();
+}
+
+export string test_names_are_bytes() {
+  T t = T.create();
+  Fs fs = Fs.inMemory(1000);
+  // A name a UTF-8 decoder would replace. Inside the filesystem it is four bytes and stays four bytes:
+  // this is the property a host cannot offer today — wac-mono 0065 — and the reason it is tested here.
+  u8[] odd = u8[4](fill: 0);
+  odd[0] = 'x';
+  odd[1] = 0xff;
+  odd[2] = 0xfe;
+  odd[3] = 'y';
+  string name = "/" + string.fromBytes(odd);
+  t.eqI32(fs.writeFile(name, "held\n".toBytes()).fault, FAULT_NONE(), "a write under a name that is not text");
+  t.eqStr(string.fromBytes(fs.readFile(name).bytes), "held\n", "reads back");
+  string[] names = fs.readDir("/")!;
+  t.eqI32(names.len(), 1, "and lists as one name");
+  t.eqI32(names[0].toBytes().len(), 4, "of four bytes, unchanged");
+  t.eqI32(names[0].toBytes()[1], 0xff, "including the one a decoder would have replaced");
+  return t.report();
+}

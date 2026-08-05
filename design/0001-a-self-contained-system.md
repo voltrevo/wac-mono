@@ -38,6 +38,11 @@ Nothing here needs a new host feature. It needs work, but the shape is already l
 makes one system serve Deno, Node and the browser identically, and it is the only way a session can be
 sealed off from the host filesystem while still being a *filesystem*.
 
+> Landed as `packages/fs`, and the language narrowed the shape: no closures and static dispatch mean a
+> filesystem cannot be a facade of funcrefs or an abstract base with two implementations. It is one
+> concrete type with a **mount table**, which was going to be step-something-later and is in fact the
+> natural shape from the start — a host mount is how D3 is expressed.
+
 **D2 — two backings, both first-class: memory and a persisted image.** In-memory is the default for
 tests — hermetic, fast, and no `/tmp` — and persistence is what makes the demo a machine rather than a
 transcript. Neither is the "real" one: the same VFS with a different store.
@@ -97,7 +102,7 @@ Each step is an issue when it becomes actionable, and each references this docum
 
 | step | state |
 |---|---|
-| 1. VFS with two backings | not started |
+| 1. VFS with two backings | `packages/fs` exists, tested against the host filesystem; nothing calls it yet — 0067 |
 | 2. image format | not started |
 | 3. process table | not started |
 | 4. users and login | not started |
