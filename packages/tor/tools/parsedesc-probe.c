@@ -9,6 +9,12 @@
  * Reads the document on stdin. With no argument it is a router descriptor; `cert` makes it an
  * authority key certificate, judged by `authority_cert_parse_from_string`.
  *
+ * **Votes and consensuses are not here yet, and wac-mono issue 0080 says what it would take.**
+ * `networkstatus_parse_vote_from_string` needs much more of tor's startup than these two parsers do:
+ * it reaches for the global configuration, and supplying a default one via `options_new` /
+ * `options_init` / `set_options` — with and without `subsystems_init` — still segfaults further in.
+ * Whoever adds it should expect to need a real initialisation path rather than a few calls.
+ *
  * Reads the document on stdin. Exit 0 and `ACCEPTED` plus a few parsed fields, or exit 1 and
  * `REJECTED`. Build it the way capture-prop228.py builds its probe — against a configured and built
  * tor tree's libtor.a.
@@ -19,6 +25,7 @@
  * off-by-one-descriptor bug in capture-routerdesc.py was found.
  */
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include "orconfig.h"
@@ -32,6 +39,15 @@
 
 int main(int argc, char **argv) {
   init_logging(1);
+  /* Without a log destination tor's own diagnosis of a rejected document goes nowhere, and an
+   * assertion failure aborts silently — which is a slow way to find out that the parser wanted more
+   * initialisation than it was given. Warnings and worse to stderr, so stdout stays exactly the
+   * verdict a caller parses. */
+  {
+    log_severity_list_t sev;
+    set_log_severity_config(LOG_WARN, LOG_ERR, &sev);
+    add_stream_log(&sev, "stderr", STDERR_FILENO);
+  }
   if (crypto_early_init() < 0) { fprintf(stderr, "crypto_early_init failed\n"); return 2; }
 
   size_t cap = 1 << 20, len = 0;
