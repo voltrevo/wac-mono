@@ -1,0 +1,202 @@
+// Key blinding and time periods: which key a v3 onion service's descriptor is filed under today.
+//
+// A service never signs its directory information with its identity key. Each time period it derives
+// a *blinded* keypair from it, and clients derive the matching blinded public key from the address.
+// The HSDirs holding the descriptor therefore see a key that changes every period and can neither
+// link it to the onion address nor to the previous period's key — so a directory cannot build a list
+// of the services it has been storing.
+//
+//     h  = SHA3-256("Derive temporary signing key\0" | A | BASEPOINT | "key-blind" | tp | period_len)
+//     A' = hA                                                            (rend-spec-v3 Appendix A.2)
+//
+// with `h` clamped exactly as an ed25519 scalar is. Only the point multiply is needed on the client
+// side — deriving the blinded *private* key is the service's job (step 6).
+//
+// ## The two constants that are not what the spec's prose implies
+//
+// **The basepoint is hashed as its decimal string**, not as its 32 encoded bytes. rend-spec-v3 writes
+// `B = "(1511[...]2202, 4631[...]5960)"` and means it literally: 78 ASCII characters, parentheses,
+// comma and space included. Getting this wrong yields a perfectly well-formed blinded key that no
+// HSDir has ever heard of.
+//
+// **The blind string carries a trailing NUL.** The spec says `BLIND_STRING = "Derive temporary
+// signing key" | INT_1(0)`, and tor's C hashes `sizeof(blind_str)` rather than `strlen`, which is the
+// same thing said in a way that is easy to read past.
+//
+// ## Time periods on a test network are not one day
+//
+// The spec says the period is the consensus parameter `hsdir-interval`, default 1440 minutes. That is
+// true on the real network and **false on a testing one**: tor's `get_time_period_length()` returns
+// the SRV protocol run duration whenever `TestingTorNetwork` is set, so that a period actually
+// rotates during a test. With chutney's 20-second voting interval a period is 8 minutes, not a day.
+//
+// This is not a detail to skip. Computing 1440 against a chutney network produces a blinded key for a
+// period nobody is in, the HSDir answers 404, and nothing says why — the failure is indistinguishable
+// from a service that is not published. It cost a first attempt here, and was found by reading
+// `get_time_period_length()` rather than the specification.
+//
+// The parameter is also spelled differently in the two places: `hsdir-interval` in rend-spec-v3,
+// `hsdir_interval` in tor's `networkstatus_get_param` call. Tor's spelling is the one on the wire.
+
+import { sha3_256 } from "../../crypto/src/keccak.wac";
+import { Point, ptDecode, ptEncode, ptMul } from "../../crypto/src/ed25519.wac";
+
+/** `SHARED_RANDOM_N_ROUNDS`, the rounds in one phase of the shared-random protocol. */
+export const i32 SHARED_RANDOM_N_ROUNDS = 12;
+/** `SHARED_RANDOM_N_PHASES` — commit, then reveal. */
+export const i32 SHARED_RANDOM_N_PHASES = 2;
+/** `HS_TIME_PERIOD_LENGTH_DEFAULT`, in minutes. One day, and only on the real network. */
+export const i64 TIME_PERIOD_LENGTH_DEFAULT = 1440;
+
+/** The literal decimal-string form of the ed25519 basepoint that the blinding hash covers. */
+u8[] basepointString() {
+  return ("(15112221349535400772501151409588531511454012693041857206046113283949847762202, " +
+          "46316835694926478169428394003475163141307993866256225615783033603165251855960)").toBytes();
+}
+
+/** `"Derive temporary signing key" | INT_1(0)` — the trailing NUL is part of it. */
+u8[] blindString() {
+  u8[] s = "Derive temporary signing key".toBytes();
+  u8[] out = u8[s.len() + 1]();
+  for (i32 i = 0; i < s.len(); i++) { out[i] = s[i]; }
+  return out;                                    // out[s.len()] is already 0
+}
+
+/** A u64 in network byte order, which is how both nonce fields are written. */
+u8[] u64be(i64 v) {
+  u8[] b = u8[8]();
+  for (i32 i = 7; i >= 0; i--) {
+    b[i] = ((v >> (((7 - i) * 8) as@ u32)) & 0xFF) as~ i32;
+  }
+  return b;
+}
+
+/**
+ * The length of a time period in minutes.
+ *
+ * `votingIntervalSeconds` is `fresh-until - valid-after` from the consensus, which is what tor's
+ * `get_voting_interval()` uses. On a testing network the period is one full shared-random protocol
+ * run — 24 voting intervals — and on the real network it is `hsdir_interval`, defaulting to a day.
+ *
+ * Both cases are here rather than only the real one because the only network available to test
+ * against is a testing network, and a client that silently used 1440 there would fail to find any
+ * descriptor at all with no indication of why.
+ */
+export i64 timePeriodLength(bool testingNetwork, i64 votingIntervalSeconds, i64 hsdirInterval) {
+  if (testingNetwork) {
+    return ((SHARED_RANDOM_N_ROUNDS * SHARED_RANDOM_N_PHASES) as i64) * votingIntervalSeconds / 60;
+  }
+  return (hsdirInterval > 0) ? hsdirInterval : TIME_PERIOD_LENGTH_DEFAULT;
+}
+
+/**
+ * The rotation offset in minutes: one shared-random *phase*, so that periods line up with the SRV
+ * publication schedule rather than with midnight.
+ *
+ * rend-spec-v3 describes this as "12 voting periods" and gives 720 minutes as the example, which is
+ * only the answer when a voting period is an hour.
+ */
+export i64 rotationOffsetMinutes(i64 votingIntervalSeconds) {
+  return (SHARED_RANDOM_N_ROUNDS as i64) * votingIntervalSeconds / 60;
+}
+
+/**
+ * The current time period number.
+ *
+ * `nowSeconds` should be the consensus's `valid-after` rather than the wall clock where one is
+ * available — that is what tor uses, and it keeps a client whose clock is a little off in the same
+ * period as everybody else. Negative if the inputs are nonsense, so a caller cannot silently compute
+ * a period from a zero interval.
+ */
+export i64 timePeriodNum(i64 nowSeconds, i64 periodLength, i64 offsetMinutes) {
+  if (periodLength <= 0 || nowSeconds <= 0) { return -1; }
+  i64 minutes = nowSeconds / 60;
+  if (minutes <= offsetMinutes) { return -1; }
+  return (minutes - offsetMinutes) / periodLength;
+}
+
+/**
+ * The blinding factor `h` for an identity key and a time period, clamped as an ed25519 scalar.
+ *
+ * The clamping is not optional and not cosmetic: an unclamped scalar is not a valid ed25519 secret,
+ * and the service clamps before deriving its private key, so a client that skips it computes a
+ * different point.
+ */
+export u8[] blindingFactor(u8[] identityKey, i64 periodNum, i64 periodLength) {
+  if (identityKey.len() != 32) { return u8[0](); }
+  u8[] blind = blindString();
+  u8[] bp = basepointString();
+  u8[] prefix = "key-blind".toBytes();
+  u8[] tp = u64be(periodNum);
+  u8[] pl = u64be(periodLength);
+
+  i32 n = blind.len() + 32 + bp.len() + prefix.len() + 16;
+  u8[] buf = u8[n]();
+  i32 at = 0;
+  for (i32 i = 0; i < blind.len(); i++) { buf[at + i] = blind[i]; }
+  at = at + blind.len();
+  for (i32 i = 0; i < 32; i++) { buf[at + i] = identityKey[i]; }
+  at = at + 32;
+  for (i32 i = 0; i < bp.len(); i++) { buf[at + i] = bp[i]; }
+  at = at + bp.len();
+  for (i32 i = 0; i < prefix.len(); i++) { buf[at + i] = prefix[i]; }
+  at = at + prefix.len();
+  for (i32 i = 0; i < 8; i++) { buf[at + i] = tp[i]; }
+  at = at + 8;
+  for (i32 i = 0; i < 8; i++) { buf[at + i] = pl[i]; }
+
+  u8[] h = sha3_256(buf);
+  h[0] = (h[0] & 248);
+  h[31] = (h[31] & 63);
+  h[31] = (h[31] | 64);
+  return h;
+}
+
+/**
+ * The blinded public key `A' = hA` for a time period.
+ *
+ * Empty if the identity key is not a valid curve point, which is a real case rather than defensive
+ * noise: an onion address is 56 characters a user can mistype into something whose checksum happens
+ * to pass, and `ptDecode` is where that gets caught.
+ */
+export u8[] blindedPublicKey(u8[] identityKey, i64 periodNum, i64 periodLength) {
+  u8[] h = blindingFactor(identityKey, periodNum, periodLength);
+  if (h.len() != 32) { return u8[0](); }
+  Point? a = ptDecode(identityKey);
+  if (a is null) { return u8[0](); }
+  return ptEncode(ptMul(h, a!));
+}
+
+/**
+ * The credential: `SHA3-256("credential" | public-identity-key)`.
+ *
+ * Constant for the lifetime of the service, and never used directly — it exists only so that the
+ * per-period subcredential can be derived from it without the identity key being present.
+ */
+export u8[] credential(u8[] identityKey) {
+  if (identityKey.len() != 32) { return u8[0](); }
+  u8[] pre = "credential".toBytes();
+  u8[] buf = u8[pre.len() + 32]();
+  for (i32 i = 0; i < pre.len(); i++) { buf[i] = pre[i]; }
+  for (i32 i = 0; i < 32; i++) { buf[pre.len() + i] = identityKey[i]; }
+  return sha3_256(buf);
+}
+
+/**
+ * The subcredential: `SHA3-256("subcredential" | credential | blinded-public-key)`.
+ *
+ * What decrypts a descriptor and what authenticates the client during introduction. It changes every
+ * period, and the point of deriving it *from the credential* rather than from the identity key is
+ * that a service can hold subcredentials while its identity key stays offline — knowing one, even
+ * with the blinded private key, does not give you the credential back.
+ */
+export u8[] subcredential(u8[] identityKey, u8[] blindedKey) {
+  u8[] cred = credential(identityKey);
+  if (cred.len() != 32 || blindedKey.len() != 32) { return u8[0](); }
+  u8[] pre = "subcredential".toBytes();
+  u8[] buf = u8[pre.len() + 64]();
+  for (i32 i = 0; i < pre.len(); i++) { buf[i] = pre[i]; }
+  for (i32 i = 0; i < 32; i++) { buf[pre.len() + i] = cred[i]; }
+  for (i32 i = 0; i < 32; i++) { buf[pre.len() + 32 + i] = blindedKey[i]; }
+  return sha3_256(buf);
+}

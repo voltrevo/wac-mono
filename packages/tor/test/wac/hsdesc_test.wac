@@ -1,0 +1,240 @@
+// Descriptor parsing and both layers of decryption, against a descriptor tor published.
+//
+// `test/data/hsdesc_vectors.json` holds a real v3 descriptor — 14 KB, three introduction points —
+// fetched by a tor client over its own circuits, together with the keys and plaintext digests derived
+// independently by `tools/capture-descriptor.py` using `hashlib` and `openssl enc`. Nothing in the
+// vector came from this implementation, and the capture verifies both layer MACs before writing, so a
+// mis-captured descriptor cannot become an expected value.
+//
+// The strongest assertion here is the plaintext digest: SHAKE-256 key derivation, AES-256-CTR and the
+// whole 10 KB layer have to be right to the byte, and one wrong bit anywhere changes the hash.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { sha3_256 } from "../../../crypto/src/keccak.wac";
+import {
+  decryptLayer, layerKeys, layerMac, keywordValue, keywordInt, pemBlock, findKeywordLine,
+  certSignedWithKey, certCertifiedKey, certType, slice,
+  superencryptedConstant, encryptedConstant,
+  S_KEY_LEN, S_IV_LEN, MAC_KEY_LEN, SALT_LEN, MAC_LEN,
+} from "../../src/hsdesc.wac";
+
+const i32 V_DESCRIPTOR = 0;
+const i32 V_KEYS = 1;         // identity(32) blinded(32) signing(32) subcred(32) revision(8)
+const i32 V_LAYER = 2;        // a[0]=layer: salt(16) key(32) iv(16) mackey(32) sha3(32) len(8)
+const i32 V_INTRO_COUNT = 3;
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+i64 be64(u8[] b, i32 at) {
+  i64 v = 0;
+  for (i32 i = 0; i < 8; i++) { v = (v << 8) | (b[at + i] as i64); }
+  return v;
+}
+u8[] arg1(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+u8[] none() { return u8[0](); }
+
+export string test_the_outer_descriptor_parses(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] doc = ref(V_DESCRIPTOR, none(), none());
+  u8[] keys = ref(V_KEYS, none(), none());
+  t.isTrue(doc.len() > 10000, "the descriptor is a real one, not a stub");
+
+  t.isTrue(same(keywordValue(doc, "hs-descriptor".toBytes()), "3".toBytes()),
+           "hs-descriptor 3");
+  t.eqI64(keywordInt(doc, "revision-counter".toBytes()), be64(keys, 128),
+          "the revision counter is the one the vector records");
+  i64 lifetime = keywordInt(doc, "descriptor-lifetime".toBytes());
+  t.isTrue(lifetime >= 30 && lifetime <= 720,
+           "the lifetime is inside the 30..720 minutes rend-spec-v3 allows");
+
+  // The certificate, and the two 32-byte keys in it that are easy to mix up: the *certified* key is
+  // the short-lived descriptor signing key, and the blinded key is in extension 4.
+  u8[] cert = pemBlock(doc, "descriptor-signing-key-cert".toBytes(), "ED25519 CERT".toBytes());
+  t.isTrue(cert.len() > 100, "the signing key certificate decodes");
+  t.eqI32(certType(cert), 8, "it is a type-8 descriptor signing certificate");
+  t.isTrue(same(certSignedWithKey(cert), slice(keys, 32, 64)),
+           "extension 4 carries the blinded public key");
+  t.isTrue(same(certCertifiedKey(cert), slice(keys, 64, 96)),
+           "and the certified key is the descriptor signing key");
+  t.isFalse(same(certSignedWithKey(cert), certCertifiedKey(cert)),
+            "the two keys are different, so confusing them would be caught");
+
+  u8[] blob = pemBlock(doc, "superencrypted".toBytes(), "MESSAGE".toBytes());
+  t.isTrue(blob.len() > SALT_LEN + MAC_LEN, "the superencrypted blob decodes");
+  t.eqI32((blob.len() - SALT_LEN - MAC_LEN) % 16, 0,
+          "the ciphertext is a whole number of AES blocks");
+  return t.report();
+}
+
+export string test_both_layers_decrypt_to_what_tor_encrypted(fn[u8[](i32, u8[], u8[])] ref) {
+  // The central test. Two layers, and for each: the derived keys must be tor's, and the plaintext
+  // must hash to what an independent decryption produced.
+  T t = T.create();
+  u8[] doc = ref(V_DESCRIPTOR, none(), none());
+  u8[] keys = ref(V_KEYS, none(), none());
+  u8[] blinded = slice(keys, 32, 64);
+  u8[] subcred = slice(keys, 96, 128);
+  i64 revision = be64(keys, 128);
+
+  u8[] outer = pemBlock(doc, "superencrypted".toBytes(), "MESSAGE".toBytes());
+  u8[] first = checkLayer(t, ref, 0, outer, blinded, subcred, revision, superencryptedConstant(),
+                          "superencrypted");
+  if (first.len() == 0) { return t.report(); }
+
+  // The first layer's plaintext is a document in its own right, holding the second layer's blob.
+  u8[] inner = pemBlock(first, "encrypted".toBytes(), "MESSAGE".toBytes());
+  t.isTrue(inner.len() > SALT_LEN + MAC_LEN, "the first layer contains the second layer's blob");
+  u8[] second = checkLayer(t, ref, 1, inner, blinded, subcred, revision, encryptedConstant(),
+                           "encrypted");
+  if (second.len() == 0) { return t.report(); }
+
+  // And what is inside is a descriptor body with introduction points.
+  i32 wanted = ref(V_INTRO_COUNT, none(), none())[0];
+  i32 found = 0;
+  i32 at = 0;
+  while (at >= 0) {
+    at = findKeywordLine(second, "introduction-point ".toBytes(), at);
+    if (at >= 0) {
+      found = found + 1;
+      at = at + 1;
+    }
+  }
+  t.eqI32(found, wanted, "we found the introduction points tor published");
+  t.isTrue(found >= 1, "there is at least one, or the descriptor is useless");
+  t.isTrue(findKeywordLine(second, "onion-key ntor ".toBytes(), 0) >= 0,
+           "an introduction point carries an ntor onion key");
+  return t.report();
+}
+
+/** One layer: keys, MAC and plaintext, each against the vector. Returns the plaintext or empty. */
+u8[] checkLayer(
+  T t, fn[u8[](i32, u8[], u8[])] ref, i32 which, u8[] blob,
+  u8[] secretData, u8[] subcred, i64 revision, u8[] constant, string name
+) {
+  u8[] v = ref(V_LAYER, arg1(which), none());
+  u8[] wantSalt = slice(v, 0, 16);
+  u8[] wantKey = slice(v, 16, 48);
+  u8[] wantIv = slice(v, 48, 64);
+  u8[] wantMacKey = slice(v, 64, 96);
+  u8[] wantSha3 = slice(v, 96, 128);
+  i64 wantLen = be64(v, 128);
+
+  u8[] salt = slice(blob, 0, SALT_LEN);
+  t.isTrue(same(salt, wantSalt), name + ": the salt is the one in the blob tor produced");
+
+  // The three derived keys, separately. A wrong key and a failed MAC both present as "it did not
+  // decrypt", and only asserting them apart says which.
+  u8[] derived = layerKeys(secretData, subcred, revision, salt, constant);
+  t.eqI32(derived.len(), S_KEY_LEN + S_IV_LEN + MAC_KEY_LEN, name + ": 80 bytes of key material");
+  t.isTrue(same(slice(derived, 0, S_KEY_LEN), wantKey), name + ": SECRET_KEY agrees with tor's");
+  t.isTrue(same(slice(derived, S_KEY_LEN, S_KEY_LEN + S_IV_LEN), wantIv),
+           name + ": SECRET_IV agrees");
+  t.isTrue(same(slice(derived, S_KEY_LEN + S_IV_LEN, derived.len()), wantMacKey),
+           name + ": MAC_KEY agrees");
+
+  u8[] ciphertext = slice(blob, SALT_LEN, blob.len() - MAC_LEN);
+  t.isTrue(same(layerMac(wantMacKey, salt, ciphertext), slice(blob, blob.len() - MAC_LEN, blob.len())),
+           name + ": the MAC we compute is the MAC on the wire");
+
+  u8[] plain = decryptLayer(blob, secretData, subcred, revision, constant);
+  t.eqI64(plain.len() as i64, wantLen, name + ": the plaintext is the expected length");
+  t.isTrue(same(sha3_256(plain), wantSha3),
+           name + ": the plaintext hashes to what an independent decryption produced");
+  return plain;
+}
+
+export string test_a_tampered_layer_is_refused(fn[u8[](i32, u8[], u8[])] ref) {
+  // AES-CTR is bit-for-bit malleable and the ciphertext comes from an unauthenticated relay. Without
+  // the MAC an HSDir could rewrite the introduction points — which relays a client contacts and which
+  // keys it uses — and the client would parse the result happily. So every part of the blob is moved
+  // in turn and every one must be refused.
+  T t = T.create();
+  u8[] doc = ref(V_DESCRIPTOR, none(), none());
+  u8[] keys = ref(V_KEYS, none(), none());
+  u8[] blinded = slice(keys, 32, 64);
+  u8[] subcred = slice(keys, 96, 128);
+  i64 revision = be64(keys, 128);
+  u8[] blob = pemBlock(doc, "superencrypted".toBytes(), "MESSAGE".toBytes());
+  u8[] constant = superencryptedConstant();
+
+  t.isTrue(decryptLayer(blob, blinded, subcred, revision, constant).len() > 0,
+           "the unmodified blob decrypts, so the refusals below mean something");
+
+  i32[] spots = i32[](0, 8, SALT_LEN, SALT_LEN + 1, SALT_LEN + 500, 5000);
+  for (i32 i = 0; i < spots.len(); i++) {
+    u8[] bad = u8[blob.len()]();
+    for (i32 j = 0; j < blob.len(); j++) { bad[j] = blob[j]; }
+    bad[spots[i]] = (bad[spots[i]] ^ 1);
+    t.eqI32(decryptLayer(bad, blinded, subcred, revision, constant).len(), 0,
+            "a flipped bit at " + itoa64(spots[i] as i64) + " is refused");
+  }
+  // And the MAC itself, which is the field an attacker would have to forge rather than avoid.
+  u8[] badMac = u8[blob.len()]();
+  for (i32 j = 0; j < blob.len(); j++) { badMac[j] = blob[j]; }
+  badMac[blob.len() - 1] = (badMac[blob.len() - 1] ^ 1);
+  t.eqI32(decryptLayer(badMac, blinded, subcred, revision, constant).len(), 0,
+          "a flipped bit in the MAC is refused");
+
+  // Wrong secrets: each of the three inputs to the key schedule, changed alone.
+  u8[] otherKey = u8[32]();
+  for (i32 i = 0; i < 32; i++) { otherKey[i] = blinded[i]; }
+  otherKey[0] = (otherKey[0] ^ 1);
+  t.eqI32(decryptLayer(blob, otherKey, subcred, revision, constant).len(), 0,
+          "a wrong blinded key is refused");
+  u8[] otherSub = u8[32]();
+  for (i32 i = 0; i < 32; i++) { otherSub[i] = subcred[i]; }
+  otherSub[31] = (otherSub[31] ^ 1);
+  t.eqI32(decryptLayer(blob, blinded, otherSub, revision, constant).len(), 0,
+          "a wrong subcredential is refused");
+  t.eqI32(decryptLayer(blob, blinded, subcred, revision + 1, constant).len(), 0,
+          "a wrong revision counter is refused");
+  t.eqI32(decryptLayer(blob, blinded, subcred, revision, encryptedConstant()).len(), 0,
+          "the other layer's constant is refused — the two are not interchangeable");
+
+  // Truncation, which is the shape a malicious HSDir gets for free.
+  t.eqI32(decryptLayer(slice(blob, 0, SALT_LEN + MAC_LEN - 1), blinded, subcred, revision,
+                       constant).len(), 0, "a blob too short to hold a salt and a MAC is refused");
+  t.eqI32(decryptLayer(u8[0](), blinded, subcred, revision, constant).len(), 0,
+          "an empty blob is refused");
+  return t.report();
+}
+
+export string test_the_document_reader_does_not_match_mid_line(fn[u8[](i32, u8[], u8[])] ref) {
+  // dir-spec's format is keyword lines, and a reader that used a substring search would find
+  // `signature` inside a base64 body and take whatever followed. That is not hypothetical here: a
+  // 14 KB descriptor is mostly base64, so almost every short keyword appears inside it by chance.
+  T t = T.create();
+  u8[] doc = "hs-descriptor 3\nrevision-counter 42\nnot-a-keyword hs-descriptor 9\n".toBytes();
+  t.isTrue(same(keywordValue(doc, "hs-descriptor".toBytes()), "3".toBytes()),
+           "the keyword at the start of a line is found");
+  t.eqI64(keywordInt(doc, "revision-counter".toBytes()), 42, "and an integer value reads");
+
+  // The same text appearing mid-line must not be found as a keyword.
+  u8[] mid = "some-line contains hs-descriptor 9\nhs-descriptor 3\n".toBytes();
+  t.isTrue(same(keywordValue(mid, "hs-descriptor".toBytes()), "3".toBytes()),
+           "a mid-line occurrence is skipped in favour of the real line");
+
+  // Absent, and present but empty.
+  t.eqI32(keywordValue(doc, "no-such-keyword".toBytes()).len(), 0, "an absent keyword is empty");
+  t.eqI64(keywordInt(doc, "no-such-keyword".toBytes()), -1, "and an absent integer is -1");
+  t.eqI64(keywordInt(doc, "not-a-keyword".toBytes()), -1, "a non-numeric value is -1, not 0");
+
+  // A PEM block that never ends must not return the rest of the document.
+  u8[] unterminated = "thing\n-----BEGIN MESSAGE-----\nQUJD\n".toBytes();
+  t.eqI32(pemBlock(unterminated, "thing".toBytes(), "MESSAGE".toBytes()).len(), 0,
+          "an unterminated block is refused rather than run to the end");
+  u8[] good = "thing\n-----BEGIN MESSAGE-----\nQUJD\n-----END MESSAGE-----\n".toBytes();
+  t.isTrue(same(pemBlock(good, "thing".toBytes(), "MESSAGE".toBytes()), "ABC".toBytes()),
+           "a well-formed block decodes");
+  return t.report();
+}

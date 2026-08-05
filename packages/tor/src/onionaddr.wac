@@ -1,0 +1,126 @@
+// v3 onion addresses: the 56-character name, and the ed25519 key inside it.
+//
+// A v3 onion address *is* the service's public identity key. There is no lookup, no registry and no
+// authority — the name and the key are the same thing, which is why a client that reaches the right
+// address cannot be talking to the wrong service.
+//
+//     onion_address = base32(PUBKEY | CHECKSUM | VERSION) + ".onion"
+//     CHECKSUM      = SHA3-256(".onion checksum" | PUBKEY | VERSION)[:2]
+//
+// 32 + 2 + 1 = 35 bytes, which is 56 base32 characters with no padding. rend-spec-v3 §6.
+//
+// ## The checksum is not integrity protection
+//
+// Two bytes catch a typo and nothing else: an attacker who wants a valid-looking address simply
+// generates keys until the checksum works, which costs nothing. What makes an address trustworthy is
+// that the *key* is in it, so the checksum's only job is to stop a mistyped address being attempted
+// as a network request. It is checked because rejecting early is free, not because it proves anything.
+//
+// ## Why the version byte is at the end
+//
+// So that the version lands in the last base32 character, making v3 addresses distinguishable from v2
+// ones by length alone (56 against 16) without parsing. That was the migration story, and it is why
+// the field order looks backwards.
+
+import { sha3_256 } from "../../crypto/src/keccak.wac";
+import { encode as b32encode, decode as b32decode, ALPHABET_STANDARD } from "../../codec/src/base32.wac";
+
+export const i32 ONION_ADDRESS_LEN = 56;
+export const i32 ED25519_PUBKEY_LEN = 32;
+const i32 VERSION = 3;
+
+/** `".onion checksum"`, the constant the checksum is domain-separated by. */
+u8[] checksumPrefix() { return ".onion checksum".toBytes(); }
+
+/**
+ * The two checksum bytes for a 32-byte identity key.
+ *
+ * Empty if the key is not 32 bytes, rather than hashing whatever it was given — a caller that has a
+ * wrong-length key has a bug, and producing a plausible address from it would hide that.
+ */
+export u8[] addressChecksum(u8[] pubkey) {
+  if (pubkey.len() != ED25519_PUBKEY_LEN) { return u8[0](); }
+  u8[] pre = checksumPrefix();
+  u8[] buf = u8[pre.len() + ED25519_PUBKEY_LEN + 1]();
+  for (i32 i = 0; i < pre.len(); i++) { buf[i] = pre[i]; }
+  for (i32 i = 0; i < ED25519_PUBKEY_LEN; i++) { buf[pre.len() + i] = pubkey[i]; }
+  buf[pre.len() + ED25519_PUBKEY_LEN] = VERSION;
+  u8[] h = sha3_256(buf);
+  u8[] out = u8[2]();
+  out[0] = h[0];
+  out[1] = h[1];
+  return out;
+}
+
+/**
+ * The 56-character address for an identity key, without the `.onion` suffix.
+ *
+ * Lower case, because that is what the world writes and what a comparison against a user's input
+ * will be against. Base32 here is the standard alphabet with no padding.
+ */
+export u8[] onionAddress(u8[] pubkey) {
+  u8[] ck = addressChecksum(pubkey);
+  if (ck.len() != 2) { return u8[0](); }
+  u8[] raw = u8[ED25519_PUBKEY_LEN + 3]();
+  for (i32 i = 0; i < ED25519_PUBKEY_LEN; i++) { raw[i] = pubkey[i]; }
+  raw[ED25519_PUBKEY_LEN] = ck[0];
+  raw[ED25519_PUBKEY_LEN + 1] = ck[1];
+  raw[ED25519_PUBKEY_LEN + 2] = VERSION;
+  u8[] upper = b32encode(raw, ALPHABET_STANDARD(), false);
+  u8[] out = u8[upper.len()]();
+  for (i32 i = 0; i < upper.len(); i++) {
+    i32 c = upper[i];
+    out[i] = (c >= 65 && c <= 90) ? (c + 32) : c;
+  }
+  return out;
+}
+
+/**
+ * The identity key inside an address, or empty if the address is not a well-formed v3 one.
+ *
+ * Accepts an address with or without the `.onion` suffix and in either case, because a caller is
+ * usually passing something a user typed. Every other departure from the exact form is a refusal:
+ * wrong length, wrong version, bad base32, wrong checksum.
+ *
+ * **The checksum is verified here**, so a caller that gets 32 bytes back has an address that was at
+ * least self-consistent. That is not a security property — see the note at the top — but it does mean
+ * a mistyped address fails locally instead of becoming a directory request for a service that does
+ * not exist.
+ */
+export u8[] onionPubkey(u8[] address) {
+  u8[] a = stripSuffix(address);
+  if (a.len() != ONION_ADDRESS_LEN) { return u8[0](); }
+  u8[] upper = u8[a.len()]();
+  for (i32 i = 0; i < a.len(); i++) {
+    i32 c = a[i];
+    upper[i] = (c >= 97 && c <= 122) ? (c - 32) : c;
+  }
+  u8[]? raw = b32decode(upper, ALPHABET_STANDARD());
+  if (raw is null) { return u8[0](); }
+  if (raw!.len() != ED25519_PUBKEY_LEN + 3) { return u8[0](); }
+  if (raw![ED25519_PUBKEY_LEN + 2] != VERSION) { return u8[0](); }
+
+  u8[] pubkey = u8[ED25519_PUBKEY_LEN]();
+  for (i32 i = 0; i < ED25519_PUBKEY_LEN; i++) { pubkey[i] = raw![i]; }
+  u8[] want = addressChecksum(pubkey);
+  if (want.len() != 2) { return u8[0](); }
+  if (raw![ED25519_PUBKEY_LEN] != want[0] || raw![ED25519_PUBKEY_LEN + 1] != want[1]) {
+    return u8[0]();
+  }
+  return pubkey;
+}
+
+/** `<addr>.onion` reduced to `<addr>`; anything else returned unchanged. */
+u8[] stripSuffix(u8[] address) {
+  u8[] suffix = ".onion".toBytes();
+  if (address.len() < suffix.len()) { return address; }
+  i32 at = address.len() - suffix.len();
+  for (i32 i = 0; i < suffix.len(); i++) {
+    i32 c = address[at + i];
+    i32 lower = (c >= 65 && c <= 90) ? (c + 32) : c;
+    if (lower != suffix[i]) { return address; }
+  }
+  u8[] out = u8[at]();
+  for (i32 i = 0; i < at; i++) { out[i] = address[i]; }
+  return out;
+}

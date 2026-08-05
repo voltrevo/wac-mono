@@ -1,0 +1,260 @@
+// Onion addresses and key blinding, against values tor produced.
+//
+// Blinding is the one part of the client with no local oracle. An address decode can be checked
+// against its own checksum; a blinded key cannot be checked against anything, because the only thing
+// that knows whether it is right is the HSDir that either has a descriptor filed under it or does
+// not — and a 404 looks exactly like a service that never published. So this needs an external
+// vector, and `test/data/hs_blind_vectors.json` is one: the identity key from the service's own key
+// file, the blinded key read out of a descriptor tor fetched, neither having passed through our code.
+//
+// The address examples are rend-spec-v3's own, quoted in the spec text, which makes them a check
+// against the specification rather than against us.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { onionAddress, onionPubkey, addressChecksum } from "../../src/onionaddr.wac";
+import {
+  blindedPublicKey, blindingFactor, credential, subcredential,
+  timePeriodLength, timePeriodNum, rotationOffsetMinutes,
+} from "../../src/hsblind.wac";
+
+u8[] hexToBytes(u8[] hex) {
+  u8[] out = u8[hex.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) {
+    out[i] = ((nibble(hex[i * 2]) * 16) + nibble(hex[i * 2 + 1]));
+  }
+  return out;
+}
+i32 nibble(i32 c) {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  return 0;
+}
+u8[] bytesToHex(u8[] b) {
+  u8[] digits = "0123456789abcdef".toBytes();
+  u8[] out = u8[b.len() * 2]();
+  for (i32 i = 0; i < b.len(); i++) {
+    out[i * 2] = digits[(b[i] >> 4) & 0xF];
+    out[i * 2 + 1] = digits[b[i] & 0xF];
+  }
+  return out;
+}
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+
+// ── The vector, passed in as bytes so the wac side needs no JSON parser ───────
+//
+// `ref(what, a, b)` hands over one field of `test/data/hs_blind_vectors.json` at a time.
+const i32 V_IDENTITY = 0;
+const i32 V_BLINDED = 1;
+const i32 V_ONION = 2;
+const i32 V_PERIOD = 3;           // time period and period length, as two big-endian u64s
+const i32 V_EXAMPLE = 4;          // the i'th spec address example, i in a[0]
+const i32 V_EXAMPLE_COUNT = 5;
+const i32 V_INVALID = 6;          // the i'th spec address that does *not* validate
+const i32 V_INVALID_COUNT = 7;
+
+i64 be64(u8[] b, i32 at) {
+  i64 v = 0;
+  for (i32 i = 0; i < 8; i++) { v = (v << 8) | (b[at + i] as i64); }
+  return v;
+}
+
+export string test_a_real_onion_address_decodes_to_the_services_identity_key(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  T t = T.create();
+  u8[] identity = hexToBytes(ref(V_IDENTITY, u8[0](), u8[0]()));
+  u8[] onion = ref(V_ONION, u8[0](), u8[0]());
+  t.eqI32(identity.len(), 32, "the vector's identity key is 32 bytes");
+  t.eqI32(onion.len(), 56, "the vector's address is 56 characters");
+
+  // Both directions against the same pair, which is what makes this more than a round trip: the
+  // address came from tor's `hostname` file and the key from tor's key file, so neither side of the
+  // equality is ours.
+  t.isTrue(same(onionPubkey(onion), identity), "the address decodes to the identity key");
+  t.isTrue(same(onionAddress(identity), onion), "the identity key encodes to the address");
+
+  // With the suffix, which is how a user writes it and how a SOCKS request arrives.
+  u8[] withSuffix = u8[onion.len() + 6]();
+  for (i32 i = 0; i < onion.len(); i++) { withSuffix[i] = onion[i]; }
+  u8[] dot = ".onion".toBytes();
+  for (i32 i = 0; i < 6; i++) { withSuffix[onion.len() + i] = dot[i]; }
+  t.isTrue(same(onionPubkey(withSuffix), identity), "the .onion suffix is accepted");
+  return t.report();
+}
+
+export string test_every_address_in_the_specification_decodes(fn[u8[](i32, u8[], u8[])] ref) {
+  // rend-spec-v3's own examples. They check the encoding against the specification's output, which
+  // no round trip of ours can do — a consistently wrong base32 alphabet or field order would
+  // round-trip perfectly and fail here.
+  T t = T.create();
+  i32 n = ref(V_EXAMPLE_COUNT, u8[0](), u8[0]())[0];
+  t.eqI32(n, 3, "three real examples are quoted from the spec");
+  for (i32 i = 0; i < n; i++) {
+    u8[] idx = u8[1]();
+    idx[0] = i;
+    u8[] addr = ref(V_EXAMPLE, idx, u8[0]());
+    u8[] key = onionPubkey(addr);
+    t.eqI32(key.len(), 32, "spec example " + itoa64(i as i64) + " decodes");
+    // And re-encodes to itself, so the checksum we computed is the one the spec's author did.
+    t.isTrue(same(onionAddress(key), addr),
+             "spec example " + itoa64(i as i64) + " round-trips through our encoder");
+  }
+
+  // And the one address in the specification that is *not* valid. rend-spec-v3 section 1.2 offers
+  // `l5satjgud...` as what "a new name following this specification might look like", and its
+  // checksum does not validate — it is an illustration, not an address. Found by including it here
+  // and watching it fail, which is a better outcome than trusting a document's example text.
+  //
+  // Kept as a negative rather than deleted: it is a genuine 56-character v3-shaped string with a
+  // wrong checksum, which is precisely the shape of a mistyped address.
+  i32 bad = ref(V_INVALID_COUNT, u8[0](), u8[0]())[0];
+  t.eqI32(bad, 1, "one illustrative address is quoted");
+  for (i32 i = 0; i < bad; i++) {
+    u8[] idx = u8[1]();
+    idx[0] = i;
+    u8[] addr = ref(V_INVALID, idx, u8[0]());
+    t.eqI32(addr.len(), 56, "it is a 56-character address");
+    t.eqI32(onionPubkey(addr).len(), 0, "the spec's illustrative address is refused");
+  }
+  return t.report();
+}
+
+export string test_a_mistyped_address_is_refused(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] onion = ref(V_ONION, u8[0](), u8[0]());
+
+  // Every character in turn, changed to a different valid base32 digit. All 56 must fail: the
+  // checksum covers the key, the version covers the tail, and base32 covers the alphabet.
+  i32 accepted = 0;
+  for (i32 i = 0; i < onion.len(); i++) {
+    u8[] bad = u8[onion.len()]();
+    for (i32 j = 0; j < onion.len(); j++) { bad[j] = onion[j]; }
+    // 'a'..'z','2'..'7' — step within the alphabet so the failure is the checksum, not the decode.
+    bad[i] = (onion[i] == 97) ? 98 : ((onion[i] >= 98 && onion[i] <= 122) ? (onion[i] - 1) : 97);
+    if (onionPubkey(bad).len() != 0) { accepted = accepted + 1; }
+  }
+  t.eqI32(accepted, 0, "no single-character change to a valid address is accepted");
+
+  // Wrong length, wrong version, and a character outside the alphabet.
+  u8[] short_ = u8[55]();
+  for (i32 i = 0; i < 55; i++) { short_[i] = onion[i]; }
+  t.eqI32(onionPubkey(short_).len(), 0, "55 characters is refused");
+  t.eqI32(onionPubkey("".toBytes()).len(), 0, "an empty address is refused");
+  t.eqI32(addressChecksum(u8[31]()).len(), 0, "a 31-byte key has no checksum");
+  t.eqI32(onionAddress(u8[33]()).len(), 0, "a 33-byte key has no address");
+  return t.report();
+}
+
+export string test_the_blinded_key_matches_the_one_tor_used(fn[u8[](i32, u8[], u8[])] ref) {
+  // The whole reason this file has a vector. tor derived this blinded key from this identity key at
+  // this time period, and put it in a descriptor an HSDir accepted.
+  T t = T.create();
+  u8[] identity = hexToBytes(ref(V_IDENTITY, u8[0](), u8[0]()));
+  u8[] want = hexToBytes(ref(V_BLINDED, u8[0](), u8[0]()));
+  u8[] period = ref(V_PERIOD, u8[0](), u8[0]());
+  i64 tp = be64(period, 0);
+  i64 plen = be64(period, 8);
+  t.eqI32(want.len(), 32, "the vector's blinded key is 32 bytes");
+
+  u8[] got = blindedPublicKey(identity, tp, plen);
+  t.eqI32(got.len(), 32, "we produced a 32-byte blinded key");
+  t.isTrue(same(got, want), "A' = hA agrees with the blinded key tor put in its descriptor");
+  // On failure the equality above says only "no". Report where, since a wrong basepoint string and a
+  // wrong period give completely different keys while a wrong clamp differs in one byte.
+  if (!same(got, want)) {
+    i32 firstDiff = -1;
+    for (i32 i = got.len() - 1; i >= 0 && i < want.len(); i--) {
+      if (got[i] != want[i]) { firstDiff = i; }
+    }
+    t.eqI32(firstDiff, -2, "first differing byte of the blinded key");
+  }
+
+  // The blinding factor is clamped as an ed25519 scalar. Not decoration — the service clamps before
+  // deriving its private key, so an unclamped client computes a different point and the equality
+  // above would fail. Asserted directly as well, since it is one line to get wrong.
+  u8[] h = blindingFactor(identity, tp, plen);
+  t.eqI32(h.len(), 32, "the blinding factor is 32 bytes");
+  t.eqI32(h[0] & 7, 0, "the low three bits are cleared");
+  t.eqI32(h[31] & 128, 0, "the top bit is cleared");
+  t.eqI32(h[31] & 64, 64, "bit 254 is set");
+  return t.report();
+}
+
+export string test_the_blinded_key_depends_on_every_input(fn[u8[](i32, u8[], u8[])] ref) {
+  // No vector can show this: one (key, period) pair agreeing proves the pair, not the dependence.
+  // A blinding that ignored the period would match the vector and be wrong for every other period —
+  // and the symptom would be a client that works for eight minutes after it is written.
+  T t = T.create();
+  u8[] identity = hexToBytes(ref(V_IDENTITY, u8[0](), u8[0]()));
+  u8[] period = ref(V_PERIOD, u8[0](), u8[0]());
+  i64 tp = be64(period, 0);
+  i64 plen = be64(period, 8);
+  u8[] base = blindedPublicKey(identity, tp, plen);
+
+  t.isFalse(same(blindedPublicKey(identity, tp + 1, plen), base), "the period changes it");
+  t.isFalse(same(blindedPublicKey(identity, tp - 1, plen), base), "so does the previous period");
+  t.isFalse(same(blindedPublicKey(identity, tp, plen + 1), base), "the period length changes it");
+  u8[] other = u8[32]();
+  for (i32 i = 0; i < 32; i++) { other[i] = identity[i]; }
+  other[0] = (other[0] ^ 1);
+  // A flipped bit may or may not still be a curve point; either a different key or a refusal is
+  // correct, and silently returning the same key is not.
+  t.isFalse(same(blindedPublicKey(other, tp, plen), base), "a different identity key changes it");
+
+  // The subcredential must move with the blinded key, because it is what decrypts the descriptor:
+  // a subcredential that did not change per period would decrypt yesterday's and fail on today's.
+  u8[] sub = subcredential(identity, base);
+  t.eqI32(sub.len(), 32, "the subcredential is 32 bytes");
+  t.isFalse(same(sub, subcredential(identity, blindedPublicKey(identity, tp + 1, plen))),
+            "the subcredential changes with the period");
+  t.isFalse(same(sub, credential(identity)), "the subcredential is not the credential");
+  t.eqI32(subcredential(identity, u8[31]()).len(), 0, "a short blinded key has no subcredential");
+  return t.report();
+}
+
+export string test_time_periods_are_computed_as_tor_computes_them(fn[u8[](i32, u8[], u8[])] ref) {
+  // The trap that cost a first attempt: on a testing network the period is **not** `hsdir_interval`.
+  // tor's `get_time_period_length()` returns the shared-random protocol run duration whenever
+  // `TestingTorNetwork` is set and never looks at the consensus parameter at all.
+  T t = T.create();
+  u8[] period = ref(V_PERIOD, u8[0](), u8[0]());
+  i64 tp = be64(period, 0);
+  i64 plen = be64(period, 8);
+
+  // chutney's 20-second voting interval: 24 * 20 / 60 = 8 minutes, and an offset of 12 * 20 / 60 = 4.
+  t.eqI64(timePeriodLength(true, 20, 1440), 8, "a testing network's period is 8 minutes at 20s votes");
+  t.eqI64(timePeriodLength(true, 20, 0), 8, "and ignores hsdir_interval entirely");
+  t.eqI64(rotationOffsetMinutes(20), 4, "the rotation offset is one phase, 4 minutes");
+  t.eqI64(plen, 8, "which is the period length the vector was produced at");
+
+  // The real network: an hour's voting interval, a day's period, a 720-minute offset — the numbers
+  // rend-spec-v3 quotes, which are the special case rather than the rule.
+  t.eqI64(timePeriodLength(false, 3600, 1440), 1440, "the real network uses hsdir_interval");
+  t.eqI64(timePeriodLength(false, 3600, 0), 1440, "defaulting to 1440 when unset");
+  t.eqI64(timePeriodLength(false, 3600, 30), 30, "and honours a non-default value");
+  t.eqI64(rotationOffsetMinutes(3600), 720, "at hourly votes the offset is the spec's 720");
+
+  // The spec's own worked example, section 2.2.1: 2016-04-13 11:15:01 UTC is period 16903.
+  t.eqI64(timePeriodNum(1460546101, 1440, 720), 16903, "the spec's worked example gives 16903");
+
+  // And the vector's own period is reproduced from its own time. The period began at
+  // tp*plen + offset minutes past the epoch, so any second inside it must give tp back.
+  i64 startMinutes = tp * plen + 4;
+  t.eqI64(timePeriodNum(startMinutes * 60, plen, 4), tp, "the start of the period is in the period");
+  t.eqI64(timePeriodNum((startMinutes + plen - 1) * 60, plen, 4), tp, "and so is its last minute");
+  t.eqI64(timePeriodNum((startMinutes + plen) * 60, plen, 4), tp + 1, "the next minute is the next");
+
+  // Nonsense in, refusal out, rather than a period number computed from a zero interval.
+  t.eqI64(timePeriodNum(1460546101, 0, 720), -1, "a zero period length is refused");
+  t.eqI64(timePeriodNum(0, 1440, 720), -1, "a zero time is refused");
+  t.eqI64(timePeriodNum(60, 1440, 720), -1, "a time before the offset is refused");
+  return t.report();
+}

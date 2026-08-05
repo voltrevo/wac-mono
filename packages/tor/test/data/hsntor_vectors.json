@@ -1,0 +1,56 @@
+{
+  "source": "tor's own src/test/test-hs-ntor-cl, tor 0.4.7.13",
+  "produced_by": "packages/tor/tools/capture-hsntor.py",
+  "protoid": "tor-hs-ntor-curve25519-sha3-256-1",
+  "note": "Every expected value is tor's. Inputs are derived deterministically from a fixed string, so re-running reproduces this file byte for byte and a difference means tor changed. Public keys come from `openssl pkey`, not from a second curve25519 here.",
+  "cases": [
+    {
+      "introAuthKey": "d8230e9bbc22177b0b91852a5caa2f0202f50b22748cfa2aa543be7286c50738",
+      "introEncKey": "e78aa653dd961fb0104eee2d62d482ccfc229e7f9a14eab0fa7897c2dbd70479",
+      "clientEphemeralSecret": "781a08438c7c7155fc32419b707bd69520cd6dc4d30658dbe5cd56a98f148556",
+      "clientEphemeralPublic": "8abc830cc5ed567cf32377b25df2d38bca3776008afd26797cb262d79f6f4226",
+      "serviceEphemeralPublic": "2703653173f59dfbbbb30ad3c32e1f4222016963f1748d9ab09d1791958c5020",
+      "subcredential": "2c010c3a96228fe798c9b311df58b81830673163ad329397f91738550bf722a5",
+      "encKey": "00a4462c755ece6b8fa78b4c33da41d8a6b209fce0135f8f19a3c8f76914c5ef",
+      "macKey": "ffe5fe8c8a87351ea84ffd93e9327cdcae610e111acc73592a0255d1847a5708",
+      "authMac": "6d3c4fb9158f8d08fc7369966935cec9efca774f1ec0f4a9a2bb4578acfa6b8e",
+      "ntorKeySeed": "2ef6e72f78ed0b42e002afdce92194ed62b1c38e82d2fefe88d6f717c9b08e7b"
+    },
+    {
+      "introAuthKey": "37a19ad32be57d5451c51df56f2053504d2d64bb9ee3599663d8b414254663dd",
+      "introEncKey": "4e745eb893420473ec382c12834bf1215232e6a95795a49006fd7eb967f03707",
+      "clientEphemeralSecret": "80ed8db30629e35c593c8b5467260aeefe8a4f8d8a31b244572ede751883b272",
+      "clientEphemeralPublic": "7aa59db5c8cd0c12d22150deb441903d2261722946b4d1fd62054ccdfdd8766e",
+      "serviceEphemeralPublic": "2668540268e1dd6072d587205d5877c9e56e447b053a2885e73fa31b4e0f6a56",
+      "subcredential": "9e7369261afb40129aba067e0ecd97cad768d98ab2fd1ca3bb955821a5e964f9",
+      "encKey": "54a94446f5f551da60a054846d0cd84cee72c3b8316e22158dbfa2c0358df0f8",
+      "macKey": "86797642a2fc13821f9be7a8ae9da0a3829ce0e98c309dc4c9ec3471d5e0d38b",
+      "authMac": "01aebb76b98af00fb59024514084612d14a3fa892ab1b62ee055e8e95f4f0fd7",
+      "ntorKeySeed": "13aec282bfa9089c954df99bb3a305459ef38ad6af64412046ad7611a8c6c2ef"
+    },
+    {
+      "introAuthKey": "96472b73c2dc20cd03c3d6d488e302451b8610475fc24d1325babe188c75a0a5",
+      "introEncKey": "1c2b53ec5c1c555d0af3981e1329fc6c9de79bc60d63c5aff7eeb1a1a98dac17",
+      "clientEphemeralSecret": "4865dc8896d448004b116d33dfe04dcb805cac4e2bfe4c5ff9a4e8c86254cc58",
+      "clientEphemeralPublic": "bc8e9c208dcda77e2fdefe6cd758542e032bfbea212a22b4a7562f1cbce4644c",
+      "serviceEphemeralPublic": "25aaa887645db662e9c0e61fb5515e014329be28e5f6393084540ef64913ef08",
+      "subcredential": "803b10e4897a8d26cdcdaca37949a6008426e5eba441e3be767a97808a2e5ca6",
+      "encKey": "2390db4899bc7bd77daf6f9b6c5b7c7f623790438e1da10959db9196b4506b1b",
+      "macKey": "8cf151b1f7b5de8e2fb0836c354695367c477ea8f493b56f5a5838f05bf7639c",
+      "authMac": "ad38a60b552e56be95f5c0c101bdb8602e0be14026bf5a90bdda8f5c4824a728",
+      "ntorKeySeed": "17918323bcaebc69e9f21a8671263e10c21d55f90503f39daf22a4f1e42d75e4"
+    },
+    {
+      "introAuthKey": "89bf9432e5197e316414403e6e9c3b454bf8bd7edebabd4a5b2de74dd4365010",
+      "introEncKey": "d7b637caa902e020f2b3d66d6af5eecd224caf9b84a729654d90d3870eea5c1c",
+      "clientEphemeralSecret": "b828890c515c227c4da870b30910662ec94a08c8411f0463beb0cad734132f61",
+      "clientEphemeralPublic": "3c1e0815e99e6122a062906bd79cf6211911c46ae5cac994926167aebcf18869",
+      "serviceEphemeralPublic": "c1ec80d0cbabad60c9fed8611313dbfbe6e26751d4505da1cb1b59bcda4c286d",
+      "subcredential": "ae6d9f360f5af6eb3c1da4eff9db1cfe8c9f3c7b0f0b0136aadd570a2d5d886f",
+      "encKey": "d621d53b019e35a565902e0abc9b362ffbfbb9fbbe04b2b5f5c15ceabe7b2f02",
+      "macKey": "2eab3cdb4db46c852264844c79fcbff025783e30a1adaa0ce8bc865f57ed6a61",
+      "authMac": "9778d8a9e4ac7b3da0d08777053af5ed4ba7b11ea8450bbcc71e9cc03178f6e4",
+      "ntorKeySeed": "f46c94b9bb7d3f98b763e33b28ea416161dc733298a2abd630b57ea7607c9ca3"
+    }
+  ]
+}

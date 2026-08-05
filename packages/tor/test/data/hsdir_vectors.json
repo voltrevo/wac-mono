@@ -1,0 +1,146 @@
+{
+  "source": "tor 0.4.7.13 on a local chutney hs-v3 network",
+  "produced_by": "packages/tor/tools/capture-hsdir.py",
+  "note": "Indices and blinded keys are tor's own, logged by upload_descriptor_to_hsdir(). The time period is the one that makes them reproduce; a group that reproduces under no recorded SRV is dropped, which is expected for uploads older than the consensus's two shared random values.",
+  "serviceIndexNote": "serviceIndex is computed here from the spec's formula rather than observed \u2014 tor does not log it. It is checked indirectly: the HSDirs tor chose must be the ones that follow these indices around the ring.",
+  "consensus": {
+    "validAfter": "2026-08-05 03:36:00",
+    "freshUntil": "2026-08-05 03:36:20",
+    "votingIntervalSeconds": 20
+  },
+  "relays": [
+    {
+      "nickname": "test000a",
+      "ed25519": "b8495b55603f75f16ed00d23b0535e00c5f001e06d615e28ba1153ae6a4f6f58",
+      "hsdir": true
+    },
+    {
+      "nickname": "test001a",
+      "ed25519": "357d113328e714a871d0037aebb51fb4f715601d7e636e27bdb7899f6babb57e",
+      "hsdir": true
+    },
+    {
+      "nickname": "test002a",
+      "ed25519": "059cd54294683a80c3a60e563044fca191d616928cd9290795198f9ec171b192",
+      "hsdir": true
+    },
+    {
+      "nickname": "test003r",
+      "ed25519": "68c8623b3bebb4e39f3f003f35474cb3d5e23cbf4818e6b8cd2404bdca9b53f9",
+      "hsdir": true
+    },
+    {
+      "nickname": "test004r",
+      "ed25519": "57a03bad987e4e5b6815afacfb50c44179ff0224d2022f84a97faaca67406b40",
+      "hsdir": true
+    },
+    {
+      "nickname": "test005r",
+      "ed25519": "2040f1377c0d4eb39ec3bdcc5f26633cd78900c51bb1f3f8e6161b2831f9b6c9",
+      "hsdir": true
+    },
+    {
+      "nickname": "test006r",
+      "ed25519": "f33a8005fa3fcc66d4af3f2d16815ef24f0299ded6b0b9bfa90d239f06a8860f",
+      "hsdir": true
+    },
+    {
+      "nickname": "test007r",
+      "ed25519": "ac31a06c0b600334a7407e8f2f47da29db6ba20d252ef69678e1186a7c972e34",
+      "hsdir": true
+    },
+    {
+      "nickname": "test008r",
+      "ed25519": "7e090f79337a142e19f4f274977367a78b06ddd0549ef47353fe86739ac2b931",
+      "hsdir": true
+    },
+    {
+      "nickname": "test009r",
+      "ed25519": "f9ebebe8df9420b3c3aa0bc6d33fcf4788d03b9ed1597388cc1f8f727b3b6113",
+      "hsdir": true
+    },
+    {
+      "nickname": "test010r",
+      "ed25519": "36762a7c844de62e11f847fd652c291d84804c97a4ffb8c4909ae809d5aca412",
+      "hsdir": true
+    },
+    {
+      "nickname": "test011r",
+      "ed25519": "d2b9389d2917712ad20665b180dd5976fdf6cbbc566d295e2ebdc5f1959a4d12",
+      "hsdir": true
+    },
+    {
+      "nickname": "test012r",
+      "ed25519": "c4c17ed77654e63ba92357c20348f27c7f5a838e14578c5d3ef97e95a440e495",
+      "hsdir": true
+    }
+  ],
+  "cases": [
+    {
+      "blindedKey": "53c81ce1a9d2e808ca9222a276ccbff8ccb2ddade21ddfd611d260bd8c803d41",
+      "timePeriod": 3720627,
+      "periodLength": 8,
+      "srvName": "current",
+      "sharedRandomValue": "cf125aa3e8019853127b3bf3fd55e4116110243e5bff3fbb0173421a82c5556d",
+      "which": "next",
+      "serviceIndex": [
+        "9d3cfa4814db6bdb0e536ff0097e7fc31c068998f2c6cc8d2f8ef672afcba173",
+        "07eb42969fea82edc93a1512539ada7638a5d623a6a3c020ed10b2575a3e34c9"
+      ],
+      "hsdirs": [
+        {
+          "nickname": "test005r",
+          "ed25519": "2040f1377c0d4eb39ec3bdcc5f26633cd78900c51bb1f3f8e6161b2831f9b6c9",
+          "relayIndex": "246d73c51d2d4fe9fb3796555d0774120ec369db5d556a7ecd00247d43bf9fd1",
+          "rsaFingerprint": "F3664838E0E77EC3D1817438905496FF4732EB0D"
+        },
+        {
+          "nickname": "test002a",
+          "ed25519": "059cd54294683a80c3a60e563044fca191d616928cd9290795198f9ec171b192",
+          "relayIndex": "50502a3bca093cbb38c6a7747570a045cba9dea2555fee06df3630257b852464",
+          "rsaFingerprint": "11B96625157D68E71DAE0396A8E086782447F4E7"
+        },
+        {
+          "nickname": "test000a",
+          "ed25519": "b8495b55603f75f16ed00d23b0535e00c5f001e06d615e28ba1153ae6a4f6f58",
+          "relayIndex": "5cd8ba46401f3fcd9c29d1fc907c971d2d6d8bc7bd0849202be7b6b8d4571997",
+          "rsaFingerprint": "36442B75866D35CF32AA93608A10C17820B35747"
+        },
+        {
+          "nickname": "test006r",
+          "ed25519": "f33a8005fa3fcc66d4af3f2d16815ef24f0299ded6b0b9bfa90d239f06a8860f",
+          "relayIndex": "5d597dc47d32651f71b376b2e42ec6d0f9f0c0e445003467688b4db273e259f6",
+          "rsaFingerprint": "8C00523008C4779D8114FF3CF25679F169837430"
+        },
+        {
+          "nickname": "test009r",
+          "ed25519": "f9ebebe8df9420b3c3aa0bc6d33fcf4788d03b9ed1597388cc1f8f727b3b6113",
+          "relayIndex": "ae27eafe578f4561e92e4f3bcfefdcb5044759361568d2f495544dee6c79b20a",
+          "rsaFingerprint": "9D257D5A5C642FB4F614C130EF6EA4C616E74BC7"
+        },
+        {
+          "nickname": "test012r",
+          "ed25519": "c4c17ed77654e63ba92357c20348f27c7f5a838e14578c5d3ef97e95a440e495",
+          "relayIndex": "d3245877a5d35fc66d1ccd8c2c1c19003543f1a044c2fa74f451ccf24fa682d6",
+          "rsaFingerprint": "643E0432B73E59B7EE38B334D439F095C7AEC0B1"
+        },
+        {
+          "nickname": "test008r",
+          "ed25519": "7e090f79337a142e19f4f274977367a78b06ddd0549ef47353fe86739ac2b931",
+          "relayIndex": "d617703bb867b0326880ff33a92aabbcf20b4e21a70e4ace0e40ca12315dd371",
+          "rsaFingerprint": "71A9D28081F593BEB6B98CD332898E0ECABA140D"
+        },
+        {
+          "nickname": "test011r",
+          "ed25519": "d2b9389d2917712ad20665b180dd5976fdf6cbbc566d295e2ebdc5f1959a4d12",
+          "relayIndex": "f3cbbe806ccd0b95d5283be6908c4fc8f2f376db9a7e01a91abb8de642293e32",
+          "rsaFingerprint": "85A4EF5F8438670A3F4EF4AB20FB0F94937E90BC"
+        }
+      ]
+    }
+  ],
+  "droppedBlindedKeys": [
+    "b87b6067c90739a0f47d203e808c79e7c4c76f4568d30f704694caeb6649ee41",
+    "eccef8fd0fca402a6271b72401495115b004c0877277dca9ae04b98d03d40617"
+  ]
+}
