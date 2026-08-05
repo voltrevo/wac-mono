@@ -43,9 +43,11 @@
 // **No directory publication**, so nothing puts this relay in a consensus. A client reaches it by
 // being told, which is what a `Bridge` line is.
 
-import { Core, Cli, Socket, FileResult, Change } from "../../platform/src/platform.wac";
+import { Core, Cli, Socket, FileResult, Change, Pending } from "../../platform/src/platform.wac";
 import { Read } from "../../bytes/src/read.wac";
-import { itoa } from "./link.wac";
+import {
+  Link, connectRelay, feedLink, handshakeTls, itoa, linkHandshake, pump, sendCells, takeCell,
+} from "./link.wac";
 import { itoa64 } from "../../wactest/src/itoa64.wac";
 import {
   tlsServerInit, tlsServerFeed, tlsServerSend, tlsPhase, phaseEstablished, phaseFailed,
@@ -62,15 +64,20 @@ import {
 } from "./relaycert.wac";
 import { relayHandshakeReply, responderVersion, netinfoOtherAddress } from "./relaylink.wac";
 import {
-  Created, Inbound, answerCreate2, answerCreateFast, destroyCell, receiveFromClient,
-  DESTROY_PROTOCOL,
+  Created, Extend, Inbound, answerCreate2, answerCreateFast, destroyCell, extendTarget,
+  extended2Body, parseExtend2, receiveFromClient, sendToClient,
+  DESTROY_INTERNAL, DESTROY_NONE, DESTROY_PROTOCOL,
 } from "./relaycircuit.wac";
-import { Hop } from "./relay.wac";
+import { Hop, relayExtend2, relayExtended2, wrapForClient } from "./relay.wac";
 import { RelayInfo, RelayKeys, routerDescriptor, rsaFingerprint } from "./routerdesc.wac";
 import {
   cellSize, cellCommand, cellCircId, cellPayload, cmdVersions, cmdNetinfo, cmdCreate2, cmdRelay,
-  cmdRelayEarly, cmdPadding, cmdDestroy, cmdCreateFast,
+  cmdRelayEarly, cmdPadding, cmdDestroy, cmdCreateFast, cmdCreated2, decodeCreated2, encodeCreate2,
+  encodeFixed,
 } from "./cell.wac";
+
+/** How long a circuit may be silent before the connection is dropped. */
+const i32 IDLE_TIMEOUT_MS = 120000;
 
 /** An hour in seconds, for certificate lifetimes. */
 const i64 HOUR = 3600;
@@ -372,13 +379,72 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs)
   i32 circId = 0;
   Hop hop = Hop.create(u8[72]());
 
+  // The next hop, once an EXTEND2 has been acted on. `next` starts as a dead Link rather than an
+  // optional because it is only ever read while `hasNext` says it is real, and a dead one carries the
+  // same fields — a `Link?` would put a `!` on every use to say what `hasNext` already says.
+  bool hasNext = false;
+  Link next = Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]());
+  i32 nextCircId = 0;
+
+  // One outstanding read per side, re-armed after each answer. Created before the loop because a
+  // ticket has to exist to be waited on, and re-created rather than reused because `wait` spends it.
+  Pending<Read> fromClient = cli.recv(conn.handle);
+  Pending<Read> fromNext = fromClient;
+
   while (true) {
     // `Read` is an enum, not a struct with a length: a clean close and a failure are different
     // answers, and only the second is worth a line. Collapsing them to "no bytes" is how a program
     // reports a reset connection as a tidy goodbye.
+    // Both sides of a relayed circuit have to be watched at once: the client's connection and, once
+    // the circuit has been extended, the next hop's. `waitAny` parks on whichever speaks — polling
+    // both would spin a core to avoid parking, which is what its own documentation says. The shape is
+    // `packages/box/src/applets/nc.wac`'s, which is the same problem with stdin in place of a relay.
+    i32 which = hasNext
+      ? core.waitAny(i32[](fromClient.id, fromNext.id), IDLE_TIMEOUT_MS)
+      : core.waitAny(i32[](fromClient.id), IDLE_TIMEOUT_MS);
+    if (which < 0) {
+      core.warn("relayd:   idle for " + itoa(IDLE_TIMEOUT_MS) + "ms, dropping the connection");
+      if (hasNext) { cli.closeSocket(next.sock); }
+      return;
+    }
+
+    if (which == 1) {
+      // The next hop answered. Its cells belong to the client, one layer of encryption added.
+      bool alive = false;
+      match (fromNext.wait()) {
+        case Data(bytes): { alive = feedLink(next, bytes); }
+        case End: { }
+        case Failed(why): { core.warn("relayd:   the next hop failed: " + why); }
+      }
+      fromNext = cli.recv(next.sock);
+      if (!alive) {
+        core.warn("relayd:   the next hop closed the connection");
+        tls = sendCell(cli, conn, tls, destroyCell(circId, DESTROY_NONE));
+        cli.closeSocket(next.sock);
+        return;
+      }
+      while (true) {
+        u8[] back = takeCell(next);
+        if (back.len() == 0) { break; }
+        i32 backCommand = cellCommand(back, 0);
+        if (backCommand == cmdPadding()) { continue; }
+        if (backCommand == cmdDestroy()) {
+          core.log("relayd:   the next hop destroyed its leg of the circuit");
+          tls = sendCell(cli, conn, tls, destroyCell(circId, DESTROY_NONE));
+          cli.closeSocket(next.sock);
+          return;
+        }
+        if (backCommand != cmdRelay() && backCommand != cmdRelayEarly()) { continue; }
+        // One layer on, and out to the client. The payload is opaque here: it was encrypted for the
+        // client by the hop beyond us.
+        tls = sendCell(cli, conn, tls, encodeFixed(circId, cmdRelay(), wrapForClient(hop, cellPayload(back, 0))));
+      }
+      continue;
+    }
+
     u8[] incoming = u8[0]();
     bool live = false;
-    match (cli.recv(conn.handle).wait()) {
+    match (fromClient.wait()) {
       case Data(bytes): {
         incoming = bytes;
         live = true;
@@ -386,7 +452,11 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs)
       case End: { }
       case Failed(why): { core.warn("relayd:   the connection failed: " + why); }
     }
-    if (!live) { return; }
+    fromClient = cli.recv(conn.handle);
+    if (!live) {
+      if (hasNext) { cli.closeSocket(next.sock); }
+      return;
+    }
     Fed fed = unpackFeed(tlsServerFeed(tls, incoming));
     tls = fed.state;
     if (fed.toSend.len() > 0) { cli.send(conn.handle, fed.toSend).wait(); }
@@ -491,12 +561,41 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs)
         }
         Inbound inbound = receiveFromClient(hop, cellPayload(cell, 0));
         if (!inbound.recognized) {
-          // Addressed to a later hop, which means extending — and extending needs an outbound
-          // connection while this one is live. Refused rather than dropped, so a client sees why.
-          core.warn("relayd:   a cell for a later hop: extending is not supported");
-          tls = sendCell(cli, conn, tls, destroyCell(circId, DESTROY_PROTOCOL));
-          return;
+          // Not for us, so it belongs to a hop beyond us: forward the once-peeled payload verbatim.
+          // A relay never learns what is inside — that is between the client and the further hop.
+          if (!hasNext) {
+            core.warn("relayd:   a cell for a later hop, but nothing has been extended to");
+            tls = sendCell(cli, conn, tls, destroyCell(circId, DESTROY_PROTOCOL));
+            return;
+          }
+          sendCells(next, encodeFixed(nextCircId, cmdRelay(), inbound.payload));
+          continue;
         }
+
+        if (inbound.command == relayExtend2()) {
+          if (hasNext) {
+            core.warn("relayd:   a second EXTEND2 on one circuit is not supported");
+            tls = sendCell(cli, conn, tls, destroyCell(circId, DESTROY_PROTOCOL));
+            return;
+          }
+          Extended done = extendCircuit(core, cli, inbound.data, id);
+          if (!done.ok) {
+            // A refusal the client can act on: it will try another path rather than hang.
+            tls = sendCell(cli, conn, tls, destroyCell(circId, DESTROY_INTERNAL));
+            return;
+          }
+          next = done.link;
+          nextCircId = done.circId;
+          hasNext = true;
+          fromNext = cli.recv(next.sock);
+          tls = sendCell(cli, conn, tls,
+                         sendToClient(hop, circId, relayExtended2(), 0,
+                                      extended2Body(done.reply)));
+          core.log("relayd:   extended circuit " + itoa(circId) + " to the next hop as " +
+                   itoa(nextCircId));
+          continue;
+        }
+
         core.log("relayd:   relay command " + itoa(inbound.command) + " on stream " +
                  itoa(inbound.streamId));
         continue;
@@ -509,6 +608,95 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs)
       }
     }
   }
+}
+
+
+/** What extending produced: the connection to the next hop, its circuit id, and the CREATED2 reply. */
+struct Extended {
+  bool ok;
+  Link link;
+  i32 circId;
+  u8[] reply;
+}
+
+/**
+ * Open a connection to the hop an EXTEND2 names and hand its handshake on as a CREATE2.
+ *
+ * Blocking, on purpose. While a circuit is being extended there is nothing else to do on it — the
+ * client is waiting for the EXTENDED2 and will send nothing until it arrives — so the next hop's TLS
+ * and link handshake can own the thread. Forwarding afterwards is the part that must not block, and
+ * that is what the `waitAny` in `serve` is for.
+ *
+ * The handshake is forwarded **verbatim**. A relay that looked inside it could impersonate the hop it
+ * is extending to, which is why `parseExtend2` hands over opaque bytes and this does not inspect them.
+ */
+Extended extendCircuit(Core core, Cli cli, u8[] extendBody, Identity id) {
+  Extended bad = Extended(false, Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]()), 0, u8[0]());
+
+  Extend want = parseExtend2(extendBody);
+  if (!want.ok) {
+    core.warn("relayd:   an EXTEND2 we could not read");
+    return bad;
+  }
+  u8[] target = extendTarget(want.linkSpecifiers);
+  if (target.len() != 6) {
+    core.warn("relayd:   the EXTEND2 named no IPv4 address we can reach");
+    return bad;
+  }
+  string host = itoa(target[0]) + "." + itoa(target[1]) + "." + itoa(target[2]) + "." +
+                itoa(target[3]);
+  i32 port = target[4] * 256 + target[5];
+  core.log("relayd:   extending to " + host + ":" + itoa(port));
+
+  Link next = connectRelay(core, cli, host, port);
+  if (next.dead) {
+    core.warn("relayd:   could not reach " + host + ":" + itoa(port));
+    return bad;
+  }
+  handshakeTls(next);
+  if (next.dead || !linkHandshake(next, host)) {
+    core.warn("relayd:   the link handshake with " + host + " failed");
+    cli.closeSocket(next.sock);
+    return bad;
+  }
+
+  // A circuit id of our own choosing for the leg we originate. Ours is the connection, so ours is the
+  // namespace: the client's id and this one describe the same circuit and need not match, and tor-spec
+  // requires the high bit set for the side that opened the connection.
+  u8[] r = core.randomBytes(4).wait();
+  i32 nextCircId = (r[0] * 16777216 + r[1] * 65536 + r[2] * 256 + r[3]) | 0x80000000;
+  if (nextCircId == 0) { nextCircId = 0x80000001; }
+
+  sendCells(next, encodeCreate2(nextCircId, want.handshakeType, want.handshake));
+
+  // Wait for the CREATED2 that answers it. Anything else on this fresh connection is a protocol
+  // error rather than something to skip past.
+  while (true) {
+    u8[] cell = takeCell(next);
+    if (cell.len() == 0) {
+      if (!pump(next)) {
+        core.warn("relayd:   the next hop said nothing we could use");
+        cli.closeSocket(next.sock);
+        return bad;
+      }
+      continue;
+    }
+    i32 command = cellCommand(cell, 0);
+    if (command == cmdPadding()) { continue; }
+    if (command != cmdCreated2() || cellCircId(cell, 0) != nextCircId) {
+      core.warn("relayd:   the next hop answered with cell command " + itoa(command));
+      cli.closeSocket(next.sock);
+      return bad;
+    }
+    u8[] reply = decodeCreated2(cellPayload(cell, 0));
+    if (reply.len() == 0) {
+      core.warn("relayd:   the next hop's CREATED2 was unreadable");
+      cli.closeSocket(next.sock);
+      return bad;
+    }
+    return Extended(true, next, nextCircId, reply);
+  }
+  return bad;
 }
 
 /** Twenty random bytes: half the key material of a CREATE_FAST handshake. */

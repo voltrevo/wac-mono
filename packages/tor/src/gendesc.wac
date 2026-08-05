@@ -136,20 +136,26 @@ export i32 main(Core core, Cli cli) {
       // what makes the documents describe a relay that *exists*: `relayd --descriptor` writes the one
       // for the keys it actually serves with, and an authority voting about anything else describes a
       // relay a client would connect to and find the wrong identity at.
-      u8[] subject = desc;
-      if (cli.argCount().wait() >= 6) {
-        string subjectPath = string.fromBytes(cli.arg(5).wait());
-        FileResult sf = cli.readFile(subjectPath).wait();
-        if (!sf.ok) {
-          core.warn("gendesc: " + subjectPath + ": " + sf.error);
-          return 1;
+      // Every argument from the sixth on names a descriptor to vote about, so a network of several
+      // relays is described by listing them. With none, the one generated here stands in.
+      i32 extra = cli.argCount().wait() - 5;
+      i32 count = extra > 0 ? extra : 1;
+      RelayOpinion[] relays = RelayOpinion[count]();
+      for (i32 ri = 0; ri < count; ri++) {
+        u8[] subject = desc;
+        if (extra > 0) {
+          string subjectPath = string.fromBytes(cli.arg(5 + ri).wait());
+          FileResult sf = cli.readFile(subjectPath).wait();
+          if (!sf.ok) {
+            core.warn("gendesc: " + subjectPath + ": " + sf.error);
+            return 1;
+          }
+          subject = sf.bytes;
+          core.log("gendesc: voting about the relay described in " + subjectPath);
         }
-        subject = sf.bytes;
-        core.log("gendesc: voting about the relay described in " + subjectPath);
+        relays[ri] = RelayOpinion(subject, "Exit Fast Guard HSDir Running Stable V2Dir Valid",
+                                  640416, "reject 1-65535");
       }
-      RelayOpinion[] relays = RelayOpinion[1]();
-      relays[0] = RelayOpinion(subject, "Exit Fast Guard HSDir Running Stable V2Dir Valid",
-                               640416, "reject 1-65535");
       VoteInfo vi = VoteInfo("wacauth", "127.0.0.1", "127.0.0.1", 7000, 5000,
                              "agent-b@wac-mono", published, published + window,
                              published + window * 2, published + window * 3, 4, 4);

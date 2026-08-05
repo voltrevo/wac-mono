@@ -226,6 +226,22 @@ export u8[] decryptRelay(Hop hop, u8[] payload) {
 }
 
 /**
+ * Add this hop's layer to an opaque payload — no relay header, no digest.
+ *
+ * For a cell travelling back from a hop beyond this one. It was built and digested by whoever holds
+ * the further hop's keys, and this relay's only job is to wrap it: the running digest belongs to the
+ * cells this hop *originates*, and advancing it here would corrupt the hash for those. `encryptRelay`
+ * is the one that builds a body and digests it; this is the forwarding half.
+ *
+ * The cipher is `forwardCipher` because a responder's `Hop` has the two directions swapped relative
+ * to a client's — the same reversal `decryptRelay` relies on.
+ */
+export u8[] wrapForClient(Hop hop, u8[] payload) {
+  if (payload.len() != PAYLOAD_LEN) { trap; }
+  return hop.forwardCipher.apply(payload);
+}
+
+/**
  * Whether a decrypted body is a cell for us, advancing the digest if it is.
  *
  * The two Recognized bytes first, because they are free and reject almost everything. Then
