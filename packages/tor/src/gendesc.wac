@@ -62,9 +62,24 @@ export i32 main(Core core, Cli cli) {
     onion.modulus, onion.publicExponent, onion.privateExponent,
     seedFor(3), seedFor(4), ntorSecret());
 
-  // A fixed time rather than the clock, so the document is reproducible. 2026-08-05 12:00:00 UTC,
-  // and a certificate expiry a year past it — certificates count in hours, not seconds.
+  // A fixed time by default, so the vectors are reproducible: 2026-08-05 12:00:00 UTC, with a
+  // certificate expiry a year past it — certificates count in hours, not seconds.
+  //
+  // A fifth argument overrides it, which is what a *live* server needs: a document whose validity
+  // window is in the past is correctly refused by any client, so the committed fixture cannot also be
+  // the thing a real tor bootstraps from. The window widens with it for the same reason — the default
+  // 20/40/60 seconds mirrors chutney's voting interval and is far too short to bootstrap against.
   i64 published = 1785931200;
+  bool live = cli.argCount().wait() >= 5;
+  if (live) {
+    i64 given = atoi64(cli.arg(4).wait());
+    if (given <= 0) {
+      core.warn("gendesc: the fifth argument must be a unix time in seconds");
+      return 1;
+    }
+    published = given;
+  }
+  i64 window = live ? 3600 : 20;
   RelayInfo info = RelayInfo("wacrelay", "127.0.0.1", 9001, 0, published,
                              1073741824, 1073741824, 640416,
                              (published / 3600) + 8760);
@@ -121,8 +136,8 @@ export i32 main(Core core, Cli cli) {
       relays[0] = RelayOpinion(desc, "Exit Fast Guard HSDir Running Stable V2Dir Valid",
                                640416, "reject 1-65535");
       VoteInfo vi = VoteInfo("wacauth", "127.0.0.1", "127.0.0.1", 7000, 5000,
-                             "agent-b@wac-mono", published, published + 20, published + 40,
-                             published + 60, 4, 4);
+                             "agent-b@wac-mono", published, published + window,
+                             published + window * 2, published + window * 3, 4, 4);
       u8[] vote = voteDocument(vi, ak, cert, relays);
       if (vote.len() == 0) {
         core.warn("gendesc: could not build a vote");
@@ -144,8 +159,8 @@ export i32 main(Core core, Cli cli) {
         voters[0] = ConsensusVoter("wacauth", rsaFingerprint(ak.identityN, ak.identityE),
                                    "127.0.0.1", "127.0.0.1", 7000, 5000, "agent-b@wac-mono",
                                    sha1(vote));
-        ConsensusInfo ci = ConsensusInfo(32, published + 20, published + 40, published + 60, 4, 4,
-                                         WEIGHTS);
+        ConsensusInfo ci = ConsensusInfo(32, published + window, published + window * 2,
+                                         published + window * 3, 4, 4, WEIGHTS);
         u8[] cons = consensusDocument(ci, voters, relays, ak);
         if (cons.len() == 0) {
           core.warn("gendesc: could not build a consensus");
@@ -314,4 +329,15 @@ string consVectorJson(AuthorityKeys k, ConsensusInfo ci, ConsensusVoter v, Relay
     field2("descriptor", jsonText(r.descriptor)) +
     "  \"consensus\": \"" + jsonText(cons) + "\"\n" +
     "}\n";
+}
+
+/** A unix time from its digits, or -1 — a partial parse would silently date the network wrongly. */
+i64 atoi64(u8[] text) {
+  if (text.len() == 0) { return -1; }
+  i64 v = 0;
+  for (i32 i = 0; i < text.len(); i++) {
+    if (text[i] < 48 || text[i] > 57) { return -1; }
+    v = v * 10 + ((text[i] - 48) as i64);
+  }
+  return v;
 }

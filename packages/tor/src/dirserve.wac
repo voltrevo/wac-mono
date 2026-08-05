@@ -20,6 +20,15 @@
 // cache uses them to decide whether the consensus it holds is worth sending. With one authority the
 // answer is always the same, so they are parsed and ignored — deliberately, and said here rather than
 // left looking like an oversight, because a multi-authority network would have to honour them.
+//
+// And when that day comes: **they arrive abbreviated.** An observed request from tor 0.4.7.13 was
+//
+//     /tor/status-vote/current/consensus/F4748D.z
+//
+// for an authority whose v3 identity digest is F4748D52B8375DB5B1E705F3DBEC2814CDAEC884 — six hex
+// characters, not forty. Code that honours the list by comparing whole digests would match nothing.
+// `/tor/keys/fp/` is different: tor sends the full forty there, which is why `mentions` compares
+// full-length and works today.
 
 import { Response, write } from "../../http/src/response.wac";
 import { encodeUpper } from "../../codec/src/hex.wac";
