@@ -8,7 +8,7 @@
 
 import { Cli, Core, Stat } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { itoa } from "../lib/num.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
 
 /**
  * How deep the walk goes.

@@ -28,7 +28,9 @@ import { Change, Child, Cli, Core, FAULT_EXISTS, FAULT_NOT_EMPTY, FAULT_NOT_FOUN
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
 import { AndOr, AndOrOp, Assign, CaseArm, Clause, CmdKind, Command, Item, Pipeline, Redir,
          RedirKind, Script, Simple, Word, parse } from "./parse.wac";
-import { Output, itoa, names, run } from "./program.wac";
+import { Output, names, run } from "./program.wac";
+// Not through `program.wac`: wac has no re-export, and the one implementation lives in `fmt`.
+import { atoi, itoa } from "../../fmt/src/itoa.wac";
 import { resolvePath } from "./path.wac";
 import { Arith, evaluate } from "./arith.wac";
 

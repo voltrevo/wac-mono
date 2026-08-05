@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-28 packages, 56,311 lines of wac, 1104 tests,
+28 packages, 56,303 lines of wac, 1104 tests,
 29 command-line programs and 4 browser pages.
 
 ## Packages
@@ -20,7 +20,7 @@ In dependency order: nothing here imports anything below it.
 | [`bignum`](packages/bignum/) | Arbitrary-precision integers. | 629 | 42 | `bytes` |
 | [`codec`](packages/codec/) | Base16, base32 and base64, from RFC 4648. | 349 | 10 | `bytes` |
 | [`datetime`](packages/datetime/) | The proleptic Gregorian calendar, and RFC 3339 timestamps. | 272 | 14 | `bytes` |
-| [`fmt`](packages/fmt/) | Numbers to and from text. | 1,132 | 25 | `bytes` |
+| [`fmt`](packages/fmt/) | Numbers to and from text. | 1,194 | 25 | `bytes` |
 | [`gzip`](packages/gzip/) | gzip (RFC 1952) and DEFLATE (RFC 1951) written in wac. | 2,014 | 83 | `bytes` |
 | [`http`](packages/http/) | HTTP/1.1: parsing requests and responses, and writing both. | 914 | 27 | `bytes` |
 | [`platform`](packages/platform/) | A capability world for wac applications, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell… | 2,898 | 62 | `bytes` |
@@ -31,14 +31,14 @@ In dependency order: nothing here imports anything below it.
 | [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, bcrypt_pbkdf, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519, NIST P-256 and P-384, RSA… | 5,418 | 144 | `bignum` |
 | [`fs`](packages/fs/) | A filesystem that belongs to the system rather than to the host. | 593 | 12 | `bytes` `platform` `std` |
 | [`json`](packages/json/) | JSON (RFC 8259) parsing and serialization, written in wac. | 967 | 51 | `bytes` `fmt` `std` |
-| [`sh`](packages/sh/) | A shell, in wac. | 6,470 | 22 | `bytes` `platform` `std` |
+| [`sh`](packages/sh/) | A shell, in wac. | 6,458 | 22 | `bytes` `fmt` `platform` `std` |
 | [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 237 | 16 | `fmt` |
 | [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 4,049 | 45 | `crypto` |
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,571 | 45 | `bytes` `codec` `crypto` `platform` `sh` |
 | [`ssz`](packages/ssz/) | **Everything an Altair light client needs is done and checked against Ethereum's vectors. | 808 | 26 | `crypto` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,685 | 75 | `crypto` |
-| [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 4,053 | 33 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
+| [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,995 | 33 | `bytes` `codec` `crypto` `datetime` `fmt` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`lightclient`](packages/lightclient/) | **The Altair sync protocol works. | 642 | 12 | `bls` `ssz` |
 | [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 7,407 | 157 | `bytes` `codec` `crypto` `datetime` `platform` `std` `tls` `wactest` |
 

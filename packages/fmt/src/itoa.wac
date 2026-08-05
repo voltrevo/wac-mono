@@ -34,3 +34,65 @@ export string itoa(i32 n) {
   if (negative) { return "-" + out; }
   return out;
 }
+
+/**
+ * Decimal representation of a 64-bit `n`, with a leading `-` when negative.
+ *
+ * i64's minimum needs no special case, unlike `itoa`'s: negating it does overflow back to itself, but
+ * those same bits read as unsigned are exactly its magnitude, which is what `utoa64` wants. Two's
+ * complement does the work.
+ *
+ * Moved here from `packages/box/src/lib/num.wac`, which had a third copy of it — with the special case
+ * spelled out as a literal — because a program that counts bytes needs this and `box` sits above the
+ * things that count. `packages/wactest` still has its own pair; see the note at the end of this file.
+ */
+export string itoa64(i64 n) {
+  if (n >= 0) { return utoa64(n as! u64); }
+  return "-" + utoa64((0 - n) as@ u64);
+}
+
+/** Decimal representation of `n`. Never signed — a u64 has no negative values. */
+export string utoa64(u64 n) {
+  if (n == 0) { return "0"; }
+  string digits = "0123456789";
+  string out = "";
+  u64 m = n;
+  while (m > 0) {
+    // The remainder is 0..9, so the narrowing cannot trap; `as!` says so.
+    out = digits[(m % 10) as! i32] + out;
+    m /= 10;
+  }
+  return out;
+}
+
+/**
+ * Leading digits only, zero when there are none — a command line is not a parser.
+ *
+ * The sign is read, which one copy of this did not: a leading `-` failed the digit test on the first
+ * character and the answer was 0. It surfaced in `box`'s `seq` as `seq 10 -3 1` refusing a step of zero
+ * it had invented itself, and the same shape was still in `packages/sh` until this became one function.
+ * A caller for which `-5` is a *flag* has to strip the sign itself before asking.
+ */
+export i32 atoi(string s) {
+  u8[] b = s.toBytes();
+  if (b.len() == 0) { return 0; }
+  i32 at = 0;
+  bool negative = false;
+  if (b[0] == '-' || b[0] == '+') {
+    negative = b[0] == '-';
+    at = 1;
+  }
+  i32 v = 0;
+  for (i32 i = at; i < b.len(); i++) {
+    i32 c = b[i];
+    if (c < '0' || c > '9') { break; }
+    v = v * 10 + (c - '0');
+  }
+  return negative ? 0 - v : v;
+}
+
+// **One copy left, and it is deliberate for now.** `packages/wactest/src/itoa64.wac` and `utoa64.wac`
+// hold the same two functions. wac has no re-export — importing a symbol from a file that merely
+// imports it is a compile error — so unifying them means editing the import line of all forty-odd wac
+// test files that use them, several of which another agent is actively writing today. The bodies here
+// are the ones to keep; that move is a mechanical change waiting for a quiet moment. wac-mono 0072.
