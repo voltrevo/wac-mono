@@ -1,0 +1,190 @@
+// A directory authority's HTTP port: serve the consensus, the certificate and the descriptor.
+//
+//   deno task app packages/tor/src/dird.wac --allow-net --allow-read -- \
+//       <consensus-file> <certificate-file> <descriptor-file> [port]
+//
+// The documents are read from disk rather than generated here, because generating them means an
+// RSA-1024 prime search and a server should start in less than a minute. `src/gendesc.wac` writes them.
+//
+// The routing lives in `dirserve.wac` and is tested without a socket in sight. What is left here is the
+// part that can only be checked by connecting to it: accept, read a request, write a reply, close.
+//
+// ## Why it closes after each reply
+//
+// One request per connection, `Connection: close`, no keep-alive. A directory client makes a handful of
+// requests over a bootstrap and tor's own cache is happy to close; supporting keep-alive would mean
+// tracking a read buffer per connection and deciding when a pipelined request is complete, which is
+// work with no reader on the other side of it yet. `dirserve.wac`'s `write` is told `keepAlive = false`
+// so the header and the behaviour cannot drift apart.
+//
+// ## No TLS
+//
+// A DirPort is plain HTTP. That is not a shortcut: a directory document carries its own signatures, so
+// transport confidentiality buys nothing a client relies on, which is exactly why tor's own DirPort is
+// unencrypted. `consensus.wac` is the reason — a client checks the documents, not the connection.
+
+import { Core, Cli, Socket, FileResult } from "../../platform/src/platform.wac";
+import { Read } from "../../bytes/src/read.wac";
+import { itoa } from "../../fmt/src/itoa.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+import { Parsed, parseRequest } from "../../http/src/request.wac";
+import { DirDocuments, dirResponse } from "./dirserve.wac";
+import { rsaDescriptorDigest } from "./routerdesc.wac";
+
+const i32 DEFAULT_PORT = 7000;
+const i32 MAX_REQUEST = 8192;
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount().wait() < 3) {
+    core.warn("usage: dird <consensus-file> <certificate-file> <descriptor-file> [port]");
+    return 1;
+  }
+
+  u8[] consensus = readOr(core, cli, string.fromBytes(cli.arg(0).wait()));
+  u8[] certificate = readOr(core, cli, string.fromBytes(cli.arg(1).wait()));
+  u8[] descriptor = readOr(core, cli, string.fromBytes(cli.arg(2).wait()));
+  if (consensus.len() == 0 || certificate.len() == 0 || descriptor.len() == 0) { return 1; }
+
+  i32 port = DEFAULT_PORT;
+  if (cli.argCount().wait() >= 4) {
+    i32 given = atoiSafe(cli.arg(3).wait());
+    if (given <= 0 || given > 65535) {
+      core.warn("dird: " + string.fromBytes(cli.arg(3).wait()) + " is not a port");
+      return 1;
+    }
+    port = given;
+  }
+
+  // The fingerprint a client names in `/tor/keys/fp/<fp>` is the authority's identity digest, and the
+  // consensus states it on its own dir-source line — so it is read out of the document rather than
+  // passed in, where the two could disagree.
+  u8[] fingerprint = dirSourceFingerprint(consensus);
+  if (fingerprint.len() != 20) {
+    core.warn("dird: the consensus has no dir-source fingerprint to answer /tor/keys/fp for");
+    return 1;
+  }
+
+  DirDocuments docs = DirDocuments(consensus, u8[0](), certificate, descriptor,
+                                   rsaDescriptorDigest(descriptor), fingerprint);
+
+  Socket listener = cli.listen("127.0.0.1", port).wait();
+  if (listener.handle < 0) {
+    core.warn("dird: listen: " + listener.error);
+    return 1;
+  }
+  core.log("dird: serving the directory on 127.0.0.1:" + itoa(listener.port));
+
+  while (true) {
+    Socket conn = cli.accept(listener.handle).wait();
+    if (conn.handle < 0) {
+      core.warn("dird: accept: " + conn.error);
+      return 1;
+    }
+    answer(core, cli, conn, docs);
+    cli.closeSocket(conn.handle);
+  }
+  return 0;
+}
+
+/**
+ * Read one request and write one reply.
+ *
+ * A request can arrive in pieces, so bytes accumulate until the parser says it has a whole one. The
+ * cap matters: without it a client that never finishes a request line holds this loop forever, and a
+ * directory port is reachable by anyone who can route to it.
+ */
+void answer(Core core, Cli cli, Socket conn, DirDocuments docs) {
+  Buf pending = Buf.create();
+  while (true) {
+    match (parseRequest(pending.bytes(), 0)) {
+      case Ok(request): {
+        cli.send(conn.handle, dirResponse(request.target, docs)).wait();
+        return;
+      }
+      case Bad(code): {
+        core.warn("dird: a malformed request, code " + itoa(code));
+        cli.send(conn.handle, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".toBytes())
+          .wait();
+        return;
+      }
+      case Incomplete: { }
+    }
+    if (pending.bytes().len() > MAX_REQUEST) {
+      core.warn("dird: a request larger than " + itoa(MAX_REQUEST) + " bytes, dropped");
+      return;
+    }
+    bool more = false;
+    match (cli.recv(conn.handle).wait()) {
+      case Data(bytes): {
+        pending.pushAll(bytes);
+        more = true;
+      }
+      case End: { }
+      case Failed(why): { core.warn("dird: the connection failed: " + why); }
+    }
+    if (!more) { return; }
+  }
+}
+
+/** The 20-byte identity digest on the consensus's first `dir-source` line, or empty. */
+u8[] dirSourceFingerprint(u8[] consensus) {
+  u8[] keyword = "dir-source ".toBytes();
+  for (i32 i = 0; i + keyword.len() <= consensus.len(); i++) {
+    if (i != 0 && consensus[i - 1] != 10) { continue; }
+    bool hit = true;
+    for (i32 j = 0; j < keyword.len(); j++) {
+      if (consensus[i + j] != keyword[j]) { hit = false; break; }
+    }
+    if (!hit) { continue; }
+    // `dir-source <nickname> <fingerprint> ...` — the fingerprint is the second field.
+    i32 at = i + keyword.len();
+    while (at < consensus.len() && consensus[at] != 32 && consensus[at] != 10) { at = at + 1; }
+    at = at + 1;
+    i32 end = at;
+    while (end < consensus.len() && consensus[end] != 32 && consensus[end] != 10) {
+      end = end + 1;
+    }
+    return unhex(consensus, at, end);
+  }
+  return u8[0]();
+}
+
+u8[] unhex(u8[] s, i32 from, i32 to) {
+  if ((to - from) % 2 != 0) { return u8[0](); }
+  u8[] out = u8[(to - from) / 2]();
+  for (i32 i = 0; i < out.len(); i++) {
+    i32 hi = hexValue(s[from + i * 2]);
+    i32 lo = hexValue(s[from + i * 2 + 1]);
+    if (hi < 0 || lo < 0) { return u8[0](); }
+    out[i] = hi * 16 + lo;
+  }
+  return out;
+}
+
+i32 hexValue(i32 c) {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  return -1;
+}
+
+u8[] readOr(Core core, Cli cli, string path) {
+  FileResult f = cli.readFile(path).wait();
+  if (!f.ok) {
+    core.warn("dird: " + path + ": " + f.error);
+    return u8[0]();
+  }
+  return f.bytes;
+}
+
+/** A port, or -1 rather than a partial number — `atoi` would read "80x" as 80. */
+i32 atoiSafe(u8[] text) {
+  if (text.len() == 0) { return -1; }
+  i32 v = 0;
+  for (i32 i = 0; i < text.len(); i++) {
+    if (text[i] < 48 || text[i] > 57) { return -1; }
+    v = v * 10 + (text[i] - 48);
+    if (v > 65535) { return -1; }
+  }
+  return v;
+}
