@@ -68,16 +68,22 @@ and nothing captured an exit code. A dead suite and a passing one printed identi
 all, and prints no number for a run that did not pass. It also aborts if the warm-up fails, which
 is what should have stopped the run above at the first line.
 
-### A cold Deno cache makes the suite OOM, at any worker count
+### Why all five died, corrected (agent-c, 2026-08-05)
 
-The reason all five died: the reboot and the cache purge left `~/.cache/deno` at 2.9 GB, down from
-33 GB. With it cold, `deno test --parallel` type-checks and transpiles the whole tree across every
-worker at once, and the container went to **10 GB on an 11.9 GB host** — killed even at
-`DENO_JOBS=2`.
+I first wrote here that a cold Deno cache was the cause: `~/.cache/deno` had gone from 33 GB to
+2.9 GB over the reboot, and I reasoned that compiling the tree across every worker at once explained
+10 GB on an 11.9 GB host. **That was wrong.** The cause was 0077: `tools/test.ts` — mine, added
+earlier the same day — was collected as a test module by the suite it launched, so each generation
+started another. `jobsSweep.sh` calls `deno test` with no paths, so every one of its five runs was
+re-entering the suite without bound. The peak and rise columns measured that recursion, not
+parallelism, and the OOM killer was the only thing stopping it.
 
-So the cap has to survive a cold cache, not just a warm one, and the sweep has to warm sequentially
-before it measures anything. Whatever number this issue lands on, the first run after a reboot or a
-cache purge is the dangerous one.
+So there is **no evidence here about cold caches**, and none about worker counts either. The whole
+table is void, and the harness has not been run since the fix.
+
+What survives from the episode is narrower and still worth having: the sweep must take its status
+from exit codes, because the version that produced that table decided pass/fail by grepping deno's
+summary — which never matched, so five dead runs printed as though they were data.
 
 Worth doing at the same time, because it changes the answer: the per-case process spawning that
 makes a worker expensive is itself avoidable. `packages/sh`'s `gaps` test spends ~135 spawns of our
