@@ -287,8 +287,16 @@ export const WORKER_MARKER = "//wac-worker 1";
  * is a red suite that says "does not speak the bridge protocol" about a program that speaks it fine.
  * So: generous by two more orders of magnitude, and overridable for the one test that has to wait it
  * out.
+ *
+ * **Thirty seconds was still not enough**, which is the second time this number has been too small.
+ * `packages/sh`'s differential failed at load 6.3 with "did not report ready within 30000ms" against a
+ * commit that touched two markdown files (wac-mono 0082). Two hundred milliseconds of work, thirty
+ * seconds of budget, and a busy machine still lost — because the budget is not competing with the work,
+ * it is competing with every other process on the box. Two minutes now. The asymmetry that justifies it
+ * has not changed: waiting longer costs a broken bundle some seconds before it is told, and waiting less
+ * costs a working program a false accusation in somebody else's test run.
  */
-const LOAD_GRACE_MS = 30_000;
+const LOAD_GRACE_MS = 120_000;
 
 /**
  * The grace, in milliseconds, or the default.
