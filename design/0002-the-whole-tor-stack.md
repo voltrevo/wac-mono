@@ -130,6 +130,23 @@ most, because it puts their implementation on the far side of every seam.
 > configured with `Bridge <addr> <fingerprint>` will do TLS, the link handshake and a one-hop
 > `CREATE2` against our relay without any of it being in a consensus. That exercises every seam
 > except `EXTEND2` and needs no directory authority.
+>
+> **What is left is `EXTEND2`, and its obstacle is structural rather than cryptographic.** The cells are
+> written and tested; acting on one means holding two connections at once — the client's, and a new one
+> to the next hop — and `relayd`'s loop blocks on a single `recv` per connection. Concretely a relay
+> must, on `EXTEND2`: connect to the named hop, do the link handshake as *initiator* (which is
+> `src/link.wac`'s job, written for the client), send `CREATE2` carrying the client's handshake
+> untouched, wait for `CREATED2`, answer `EXTENDED2`, and thereafter carry cells both ways.
+>
+> The multiplexing question is settled, which was the part that looked like it might need a platform
+> change. It does not: `Pending<T>` already has **`isDone()`**, a non-blocking readiness check, and
+> `Core.sleepMillis` gives a poll interval. Verified with a throwaway probe — a 400 ms sleep read as
+> not-ready, then ready, without blocking — so two sockets can be served from one loop by polling both.
+> Nothing else in the repo uses `isDone()` yet, so expect to be the first to find its rough edges; note
+> that `settled` is a raw capability field and `isDone` is the method wrapper over it.
+>
+> Three relays are what step 5 needs, so `EXTEND2` is its prerequisite as much as this step's
+> completion. The current network reaches 50 % bootstrap with one relay and stops there.
 
 **4 — the directory authority.** Publish a descriptor, vote, compute a consensus, sign it. Done when a
 C tor client bootstraps from a consensus our authority signed.
