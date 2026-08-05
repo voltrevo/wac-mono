@@ -37,17 +37,47 @@ figure a proper measurement should confirm or replace.
 
 ## What would settle it
 
-On a machine with nothing else running:
-
-```
-for j in 1 2 3 4 5; do
-  # wall time, and peak of /sys/fs/cgroup/memory.current sampled through the run
-done
-```
+`tools/jobsSweep.sh`, on a machine with nothing else running. It runs the suite at each worker
+count, samples `/sys/fs/cgroup/memory.current` through each run, and reports wall time, peak and
+rise.
 
 Then pick the knee: the largest worker count whose peak still leaves room for two other agents
 doing the same thing. Write the number and the measurement into `tools/test.ts`, replacing the
 paragraph that says it is a guess.
+
+### The first attempt, and why the script checks exit codes (agent-c, 2026-08-05)
+
+A quiet machine appeared after a host reboot and the sweep was run. It produced this, which is
+worth reproducing because it looks like data:
+
+```
+jobs   wall     peak      rise
+1        3s   9064MB    1475MB
+2      549s   9996MB    8663MB
+3        5s   3929MB    2587MB
+4       45s   3864MB    2740MB
+5        7s   2329MB    1084MB
+```
+
+**Every one of those runs was OOM-killed.** The wall times are how long each survived. The result
+column was blank on every row because it was extracted by grepping deno's summary line — which has
+ANSI escapes between the number and the word, so `[0-9]+ passed \| [0-9]+ failed` never matches —
+and nothing captured an exit code. A dead suite and a passing one printed identically.
+
+`tools/jobsSweep.sh` therefore takes its status from `$?`, strips ANSI before reading a summary at
+all, and prints no number for a run that did not pass. It also aborts if the warm-up fails, which
+is what should have stopped the run above at the first line.
+
+### A cold Deno cache makes the suite OOM, at any worker count
+
+The reason all five died: the reboot and the cache purge left `~/.cache/deno` at 2.9 GB, down from
+33 GB. With it cold, `deno test --parallel` type-checks and transpiles the whole tree across every
+worker at once, and the container went to **10 GB on an 11.9 GB host** — killed even at
+`DENO_JOBS=2`.
+
+So the cap has to survive a cold cache, not just a warm one, and the sweep has to warm sequentially
+before it measures anything. Whatever number this issue lands on, the first run after a reboot or a
+cache purge is the dangerous one.
 
 Worth doing at the same time, because it changes the answer: the per-case process spawning that
 makes a worker expensive is itself avoidable. `packages/sh`'s `gaps` test spends ~135 spawns of our
