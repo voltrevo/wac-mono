@@ -307,7 +307,12 @@ async function place(text: string, out: string, executable: boolean): Promise<vo
   // An explicit `close()` is the only way to know the handle is gone before the rename.
   const file = await Deno.open(partial, { write: true, create: true, truncate: true });
   try {
-    await file.write(new TextEncoder().encode(text));
+    // A loop, because `write` is POSIX `write`: it may take fewer bytes than it was given, and these
+    // are 400 KB files. One call would have truncated a binary under exactly the conditions this
+    // function exists to survive.
+    const bytes = new TextEncoder().encode(text);
+    let at = 0;
+    while (at < bytes.length) at += await file.write(bytes.subarray(at));
     await file.sync();
   } finally {
     file.close();

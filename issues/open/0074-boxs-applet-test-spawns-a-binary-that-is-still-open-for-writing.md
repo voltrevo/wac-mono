@@ -69,9 +69,27 @@ the *name*, so the descriptor Deno might hold for the original is irrelevant by 
 The fix is to close it by hand — open, write, `sync()`, `close()` in a `finally`, then chmod and
 rename. Pushed on 2026-08-05.
 
-**Why this is still open.** One green run of `box`'s tests proves nothing about a load-dependent
-flake, and this issue is right that hardening blind is how it comes back. What would close it: a few
-full parallel suites under real load with no `ETXTBSY`. If it *does* come back, the next candidate is
-`harness/buildCache.ts`'s `produce(tmp)`, which writes through the same `place()` — now fixed — and
-after that the possibility that Deno's `rename` is not ordered against its own close either, which
-would need a retry at the exec rather than a fix at the write.
+**It came back on the next run**, in `nc -l takes one connection` — same file, different test. So the
+late close was not it, or not all of it. The two changes stay because both are right on their own
+merits (and the hand-rolled write turned up a second bug in itself: `write` is POSIX `write` and may
+take fewer bytes than it is given, so one call could truncate a 400 KB binary), but this issue is not
+explained.
+
+**What I measured, so the next person does not repeat it.** 360 build-and-exec rounds — three
+variants × 120, in three concurrent processes, at load 8, with a realistic 400 KB shebang script:
+
+| variant | ETXTBSY |
+|---|---|
+| open/write/sync/close, chmod, rename | 0 of 120 |
+| `writeTextFile`, chmod, rename | 0 of 120 |
+| `writeTextFile` straight to the destination, chmod, no rename | 0 of 120 |
+
+Even the variant with no rename at all never failed, which says the plain write-then-exec pattern is
+not the mechanism. Something else has that file open for writing, and it is not the obvious writer.
+
+**Where I would look next**, in order: whether `deno` itself reopens the script it was handed (the
+built artifacts are shebang scripts run through `deno run`, so the interpreter opens the same path the
+kernel just execed); whether `Deno.Command().spawn()` differs from `.output()` here, since both
+failures used a path that a *later* test also builds; and whether the file is executed while another
+process in the same suite is executing it — `ETXTBSY` is symmetric, and the suite runs 8 files at a
+time.
