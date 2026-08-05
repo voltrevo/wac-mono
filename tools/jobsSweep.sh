@@ -3,9 +3,18 @@
 #
 # The first version of this decided pass/fail by grepping deno's summary line, which has ANSI
 # codes between the number and the word, so it never matched — and every run had in fact been
-# OOM-killed while the table printed timings as though they were data. Status is the exit code
-# here, and a run that did not pass prints no number at all.
-cd ~/agent-c/workspaces/wac-mono
+# killed while the table printed timings as though they were data. Status is the exit code here,
+# and a run that did not pass prints no number at all.
+#
+# Those runs died because of 0077, not because of anything this measures: a `tools/test.ts` was
+# being collected as a test module by the suite it launched, so each run re-entered the suite
+# without bound. Hence the marker below.
+cd "$(git rev-parse --show-toplevel)"
+# The marker every tool that spawns a suite sets — see `tools/suiteGuard.ts`. This calls `deno test`
+# directly rather than through `runTests.ts`, because setting DENO_JOBS per run is the whole point,
+# so it has to set the marker itself: without it a test that invoked one of our tools would not be
+# refused, which is the second half of 0077.
+export WAC_SUITE_RUNNING=1
 ARGS=(--parallel --allow-read --allow-write --allow-run --allow-net --allow-env)
 
 run() {   # run <jobs> <logfile>; echoes "<exit> <wall_ms>"

@@ -24,7 +24,9 @@
 // line at all", which are different problems with different fixes and which today's
 // single "survivor" verdict conflates.
 
-import { SUITE_ENV } from "../suiteGuard.ts";
+import { refuseIfNested, SUITE_ENV } from "../suiteGuard.ts";
+
+refuseIfNested("the mutation profiler");
 
 
 export type Profile = {

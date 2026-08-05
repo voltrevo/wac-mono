@@ -74,7 +74,9 @@ import {
 } from "./mutate/profile.ts";
 import { ALL_OPERATORS, generate, type OperatorName } from "./mutate/operators.ts";
 import { applyEdits, packagesOf, type Curated, type Edit, type Mutant } from "./mutate/types.ts";
-import { SUITE_ENV } from "./suiteGuard.ts";
+import { refuseIfNested, SUITE_ENV } from "./suiteGuard.ts";
+
+refuseIfNested("deno task mutate");
 
 
 const args = Deno.args;
