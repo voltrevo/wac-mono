@@ -76,7 +76,9 @@ import {
   Hop, relayBeginDir, relayConnected, relayData, relayEnd, relayExtend2, relayExtended2,
   wrapForClient,
 } from "./relay.wac";
-import { RelayInfo, RelayKeys, routerDescriptor, rsaFingerprint } from "./routerdesc.wac";
+import {
+  RelayInfo, RelayKeys, routerDescriptor, rsaDescriptorDigest, rsaFingerprint,
+} from "./routerdesc.wac";
 import {
   cellSize, cellCommand, cellCircId, cellPayload, cmdVersions, cmdNetinfo, cmdCreate2, cmdRelay,
   cmdRelayEarly, cmdPadding, cmdDestroy, cmdCreateFast, cmdCreated2, decodeCreated2, encodeCreate2,
@@ -239,6 +241,7 @@ export i32 main(Core core, Cli cli) {
   string nickname = "wacrelay";
   string consensusPath = "";
   string certPath = "";
+  string[] descPaths = string[0]();
   i32 argc = cli.argCount().wait();
   for (i32 i = 0; i < argc; i++) {
     string a = string.fromBytes(cli.arg(i).wait());
@@ -260,13 +263,16 @@ export i32 main(Core core, Cli cli) {
     } else if (a == "-K" && i + 1 < argc) {
       certPath = string.fromBytes(cli.arg(i + 1).wait());
       i = i + 1;
+    } else if (a == "-D" && i + 1 < argc) {
+      descPaths = pushString(descPaths, string.fromBytes(cli.arg(i + 1).wait()));
+      i = i + 1;
     } else if (seedPath == "") {
       seedPath = a;
     }
   }
   if (seedPath == "") {
     core.warn("usage: relayd <seed-file> [-p port] [-a address] [-n nickname] " +
-              "[--descriptor path] [-C consensus -K certificate]");
+              "[--descriptor path] [-C consensus -K certificate] [-D descriptor]...");
     return 1;
   }
 
@@ -328,10 +334,25 @@ export i32 main(Core core, Cli cli) {
       core.warn("relayd: could not read the directory documents to serve");
       return 1;
     }
-    docs = DirDocuments(cf.bytes, u8[0](), kf.bytes, u8[0](), u8[][0](),
+    // The descriptors too, because tor asks for them over BEGIN_DIR as readily as for the consensus.
+    // Leaving them out did not make it ask elsewhere: it read our 404's ten-byte body as "server info"
+    // eight times over and stayed at 0/2 usable descriptors.
+    u8[] descriptors = u8[0]();
+    u8[][] digests = u8[][descPaths.len()]();
+    for (i32 di = 0; di < descPaths.len(); di++) {
+      FileResult df = cli.readFile(descPaths[di]).wait();
+      if (!df.ok) {
+        core.warn("relayd: " + descPaths[di] + ": " + df.error);
+        return 1;
+      }
+      descriptors = joinBytes(descriptors, df.bytes);
+      digests[di] = rsaDescriptorDigest(df.bytes);
+    }
+    docs = DirDocuments(cf.bytes, u8[0](), kf.bytes, descriptors, digests,
                         dirSourceFingerprint(cf.bytes));
     hasDir = true;
-    core.log("relayd: serving the consensus and certificate over BEGIN_DIR");
+    core.log("relayd: serving the consensus, certificate and " + itoa(descPaths.len()) +
+             " descriptor(s) over BEGIN_DIR");
   }
 
   u8[] certs = identityCerts(id, now);
@@ -865,4 +886,18 @@ u8[] endReason() {
   u8[] r = u8[1]();
   r[0] = 6;
   return r;
+}
+
+string[] pushString(string[] xs, string x) {
+  string[] out = string[xs.len() + 1]();
+  for (i32 i = 0; i < xs.len(); i++) { out[i] = xs[i]; }
+  out[xs.len()] = x;
+  return out;
+}
+
+u8[] joinBytes(u8[] a, u8[] b) {
+  u8[] out = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
+  return out;
 }

@@ -180,6 +180,14 @@ most, because it puts their implementation on the far side of every seam.
 > completes — or producing the microdesc flavour and the microdescriptors themselves, which is real
 > work. Try the config first: it is a measurement, not a fix.
 >
+> That measurement was taken. With `UseMicrodescriptors 0` bootstrap reaches **45 % (requesting
+> descriptors)** before 50 %, so the ns path does get further — and then it asked *relay A* for the
+> descriptors over `BEGIN_DIR`, got our 404, and read its ten-byte `Not found` body as server info eight
+> times while reporting `0/2` usable descriptors. Serving only the consensus and certificate was the
+> wrong scope: `relayd -D <descriptor>` now serves descriptors too. **Unconfirmed** — the four-process
+> re-run was cut short by a shell timeout of the author's own making, not by a failure, so whether
+> bootstrap passes 50 % is still an open measurement. Re-run it before building anything on top.
+>
 > One hypothesis tested and **disproved**: that tor asked our relay for the consensus because our vote
 > flagged it `V2Dir`, which advertises a directory cache we do not run. Dropping `V2Dir` and `HSDir`
 > from the flags changed nothing — tor still sent `Downloading consensus from 127.0.0.1:5555` at the
