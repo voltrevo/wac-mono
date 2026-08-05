@@ -143,3 +143,87 @@ Not mine to touch: `bls` and `crypto` are agent-b's active work, `tor` is agent-
 `zstd`, `json`, `gzip` and `fmt` have owners who know which of the two answers applies. `gzip/bench/
 pushcost.wac` has no driver at all — no TypeScript names it — so its three are the "delete it" kind
 rather than a false positive.
+
+## Progress, 2026-08-05 (agent-a): 37 → 21, and the check has a test now
+
+Seven of the 37 were **false positives** — live code called dead — and nine were real and are dealt with.
+
+### The check was wrong in a fourth and fifth way, and now cannot be wrong in them silently
+
+- **A bound module's function taken as a value.** `packages/gzip/cov.ts` writes
+  `const inflate = inf.mod.inflate as (d: Uint8Array) => Uint8Array` and then calls the local, so
+  `.inflate(` never appears in the file. `inflate` — the entry point of the whole decompressor, driven
+  through eighty calls in that file — was reported dead, along with `gzipStored`, `gzipFixed`,
+  `gzipDynamic`, `dumpErrors`, `lexTokens` and `lexErrors`. The fix is `.name` rather than `.name(`, for
+  exactly the reason the wac side already counts a bare name.
+- **Which TypeScript to search.** The old rule was "any file that mentions `wacBind` or `entry:`", which
+  `cov.ts` fails — it gets its module from `instrument()` in `harness/wacCoverage.ts`. The new rule is
+  **locality**: the package the export is declared in, plus `harness/` and `tools/`, which drive
+  everything. Propagating "mentions `wacBind`" through the import graph was the other candidate and is
+  worse — every test importing `buildApp` would qualify, because `packages/platform/build.ts` binds, and
+  then every `.write(` in the repo counts as a call. The old rule is kept *beside* the new one, so this
+  can only remove false positives.
+- **A one-line doc comment hid its own function.** The guard was "skip a line starting with `*`", which is
+  a comment's continuation lines and not its first, so `/** orphan() returns one. */` above
+  `export i32 orphan()` was read as code. Block comments are now blanked in place, line numbers preserved.
+- **And my first attempt at that broke it in the other direction**, which is worth recording because it is
+  the shape this issue is about: allowing `[^"\\]` to match a newline let one stray quote in a comment
+  pair with the next quote lines away, eat the newlines between them, and shift every line number after it
+  — so the scan stopped skipping each declaration's own line, and three genuinely dead exports (`ftoa32`,
+  `writeF32`, `needsEncoding`) silently disappeared from the report. Caught by diffing the report against
+  the previous run, which is the only reason I noticed.
+
+**`tools/deadexports.test.ts` now pins one fixture per shape** — all five false positives, the precision
+case (a `.write(` in an unrelated package is not a caller), comments, string literals, stale imports,
+probes, and the report's own wording. Five shapes had been fixed by editing a regex with nothing pinning
+any of them, and two of the five came back in a different spelling. `scan()` takes a root directory rather
+than assuming the repository, which is what makes the fixtures possible.
+
+### The nine real ones
+
+- **`packages/fmt`: adopted.** `ftoa32` and `ftoa32Bytes` both inlined `writeDecimal(out, decompose32(x))`
+  while `writeF32` sat unused beside them; both now call it, which is how the f64 pair already worked.
+  `ftoa32` itself is listed in `packages/fmt/README.md` as the package's f32 API and **had never been
+  executed by anything** — so `f32_probe.wac` exposes it and `f32.test.ts` requires the string and bytes
+  spellings to agree over 2,008 values. A documented function nothing had ever called is the most useful
+  thing this check has found.
+- **`packages/url`: deleted `needsEncoding`.** It said "used to skip work, not to validate", and there is
+  no work to skip: the parser calls `encodeInto` byte by byte as it walks, so a whole-array pre-pass has
+  no call site to have. Five lines of `inEncodeSet` in a loop, trivially rewritten if a caller appears.
+- **`packages/json`: deleted `getKeys`.** The bench driver measures `scanKeys`, `indexedKeys` and
+  `buildOnly`; `getKeys` was a fourth variant nothing timed.
+- **`packages/gzip`: deleted `bench/pushcost.wac`.** No driver at all, as this issue already noted — three
+  exports and no TypeScript naming any of them.
+- **`packages/wacc`: exempt, with the reason in the file.** `kBool` and `kindCount` are members of a table
+  that mirrors `TokenKind`'s declaration order in the reference lexer. `kBool` has no caller because a
+  boolean literal lexes as the keyword `true` or `false` and never as a `bool` token — and deleting it
+  would renumber every kind after it and silently misalign the differential test that derives those names
+  from `wac/atoms/wac/wacLex.ts` at run time. This is the third answer this issue anticipated: "say so, and
+  the check should learn to skip that shape".
+
+### The third answer is now a shape the check knows
+
+A file may exempt its own exports with a line that says why:
+
+    // dead-exports: exempt — the numbering mirrors the reference lexer's union
+
+The reason is printed in the report, above the verdict, so `no dead exports` can never be a scan that
+exempted everything. Deliberately *not* a per-name suppression list, which would accumulate one line per
+argument, and deliberately not inferred from shape — "every export returns an int literal, so it must be a
+table" would silently exempt the lone misplaced constant this check was written to find.
+
+### What is left: 21, all in packages being actively worked
+
+| file | count | owner |
+|---|---:|---|
+| `packages/tor/src/relay.wac` | 11 | agent-c |
+| `packages/tor/src/cell.wac` | 3 | agent-c |
+| `packages/bls/src/fp12.wac` | 2 | agent-b |
+| `packages/bls/src/fp2.wac` | 1 | agent-b |
+| `packages/tls/src/derwrite.wac` | 2 | agent-b (touched today) |
+
+Every one is a protocol command or field constant, which is the shape most likely to be the "exempt,
+because the set is the contract" answer — `relayExtend`/`relayTruncate`/`relayResolve` are Tor's relay
+command numbers, and a table with holes in it is worse than one with unused members. Whoever owns them
+should pick between adopting them at the call sites and the exemption line above; I have not guessed on
+their behalf.

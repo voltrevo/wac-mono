@@ -10,11 +10,14 @@ import { wacBind } from "../../../harness/wacBind.ts";
 
 const mod = await wacBind("packages/fmt/test/f32_probe.wac") as unknown as {
   fmt32(x: number): Uint8Array;
+  fmt32Str(x: number): Uint8Array;
   parse32(b: Uint8Array): number;
 };
 const dec = new TextDecoder();
 const enc = new TextEncoder();
 const fmt = (x: number): string => dec.decode(mod.fmt32(x));
+/** The same number through `ftoa32`, the string spelling `README.md` documents. */
+const fmtStr = (x: number): string => dec.decode(mod.fmt32Str(x));
 const parse = (s: string): number => mod.parse32(enc.encode(s));
 
 /** The f32 nearest x, as a JS number. */
@@ -73,6 +76,33 @@ function significantDigits(s: string): number {
   const trimmed = mantissa.replace(/^0+/, "").replace(/0+$/, "");
   return trimmed.length === 0 ? 1 : trimmed.length;
 }
+
+Deno.test("f32: the string spelling and the bytes spelling agree", () => {
+  // `ftoa32` and `ftoa32Bytes` differ only in `Buf.toStr()` against `Buf.bytes()`, and until now nothing
+  // had ever called the first — `deno task dead` found it, and `packages/fmt/README.md` lists it as the
+  // package's f32 API. Both now go through `writeF32`, so this is what would notice if one of them stopped.
+  const view = new DataView(new ArrayBuffer(4));
+  let seed = 0x2545f491;
+  const next = (): number => {
+    seed ^= seed << 13; seed >>>= 0;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5;  seed >>>= 0;
+    return seed;
+  };
+  let checked = 0;
+  for (const x of [0, -0, NaN, Infinity, -Infinity, f32(0.1), f32(1e-45), f32(3.4028235e38)]) {
+    if (fmt(x) !== fmtStr(x)) throw new Error(`${x}: bytes ${fmt(x)} vs string ${fmtStr(x)}`);
+    checked++;
+  }
+  for (let i = 0; i < 2000; i++) {
+    view.setUint32(0, next());
+    const x = view.getFloat32(0);
+    if (Number.isNaN(x)) continue;
+    if (fmt(x) !== fmtStr(x)) throw new Error(`${x}: bytes ${fmt(x)} vs string ${fmtStr(x)}`);
+    checked++;
+  }
+  console.log(`  ${checked} f32 values agree through both spellings`);
+});
 
 Deno.test("f32: the boundary values", () => {
   const view = new DataView(new ArrayBuffer(4));
