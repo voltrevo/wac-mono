@@ -171,6 +171,13 @@ most, because it puts their implementation on the far side of every seam.
 >
 > Until then `EXTEND2` can only be exercised by our own client, which extends explicitly — worth doing
 > as a smoke test, and not a substitute for the C tor path under D1.
+>
+> One hypothesis tested and **disproved**: that tor asked our relay for the consensus because our vote
+> flagged it `V2Dir`, which advertises a directory cache we do not run. Dropping `V2Dir` and `HSDir`
+> from the flags changed nothing — tor still sent `Downloading consensus from 127.0.0.1:5555` at the
+> relay's ORPort, repeatedly. It treats **any relay it knows** as a directory source, so there is no
+> flag to stop asking; the only answer is to answer. The flags are dropped anyway, because claiming a
+> capability we do not have is wrong on its own terms.
 
 **4 — the directory authority.** Publish a descriptor, vote, compute a consensus, sign it. Done when a
 C tor client bootstraps from a consensus our authority signed.
