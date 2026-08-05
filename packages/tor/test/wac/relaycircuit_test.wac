@@ -22,11 +22,11 @@ import {
   receiveFromClient, sendToClient, HOP_KEY_LEN, NTOR_REQUEST_LEN, NTOR_REPLY_LEN,
   DESTROY_PROTOCOL, Extend, parseExtend2, extendTarget, extendIdentity, extended2Body,
   kdfTor, answerCreateFast, CREATE_FAST_LEN,
-  LS_IPV4, LS_IPV6, LS_LEGACY_IDENTITY, LS_ED25519_IDENTITY,
+  LS_IPV4, LS_IPV6, LS_LEGACY_IDENTITY, LS_ED25519_IDENTITY, Begin, parseBegin,
 } from "../../src/relaycircuit.wac";
 import { ntorClientRequest, ntorClientFinish } from "../../src/ntor.wac";
 import { Hop, encryptRelay, decryptRelay, relayRecognized, relayCommand, relayStreamId,
-         relayPayload, relayData, relayBegin } from "../../src/relay.wac";
+         relayPayload, relayData, relayBegin, beginBody } from "../../src/relay.wac";
 import {
   encodeCreate2, decodeCreated2, cellPayload, cellCommand, cellCircId, cmdCreated2, cmdDestroy,
   handshakeNtor,
@@ -420,4 +420,38 @@ u8[] slice(u8[] s, i32 from, i32 to) {
   u8[] o = u8[to - from]();
   for (i32 i = 0; i < o.len(); i++) { o[i] = s[from + i]; }
   return o;
+}
+
+export string test_a_begin_says_where_to_connect() {
+  T t = T.create();
+
+  // What the client writes, read back by the exit. `beginBody` is validated by our client opening
+  // streams through real relays, so the format it produces is not a guess.
+  Begin ordinary = parseBegin(beginBody("127.0.0.1:8080"));
+  t.isTrue(ordinary.ok, "an ordinary host and port parse");
+  t.eqStr(ordinary.host, "127.0.0.1", "the host");
+  t.eqI32(ordinary.port, 8080, "the port");
+  t.isFalse(ordinary.ownAddress, "and it is not the relay's own address");
+
+  // A leading colon is how a rendezvous stream is opened — `hsconnect.wac` sends exactly this — and an
+  // exit that called it malformed would refuse the one case an onion service needs.
+  Begin rendezvous = parseBegin(beginBody(":80"));
+  t.isTrue(rendezvous.ok, "a bare port parses");
+  t.eqI32(rendezvous.port, 80, "its port");
+  t.isTrue(rendezvous.ownAddress, "and it names this relay");
+
+  // The last colon, not the first: an IPv6 literal has several and cutting at the first halves it.
+  Begin v6 = parseBegin(beginBody("[::1]:443"));
+  t.isTrue(v6.ok, "an IPv6 literal parses");
+  t.eqStr(v6.host, "[::1]", "kept whole");
+  t.eqI32(v6.port, 443, "with its port");
+
+  // Refusals. The NUL matters: without it the four flag bytes are read as part of the address.
+  t.isFalse(parseBegin("127.0.0.1:80".toBytes()).ok, "no NUL, no stream");
+  t.isFalse(parseBegin(beginBody("127.0.0.1")).ok, "no port at all");
+  t.isFalse(parseBegin(beginBody("127.0.0.1:0")).ok, "port zero");
+  t.isFalse(parseBegin(beginBody("127.0.0.1:65536")).ok, "port past the end of the range");
+  t.isFalse(parseBegin(beginBody("127.0.0.1:8o")).ok, "a port that is not digits");
+  t.isFalse(parseBegin(u8[0]()).ok, "an empty body");
+  return t.report();
 }

@@ -361,3 +361,55 @@ export Created answerCreateFast(i32 circId, u8[] createPayload, u8[] serverRando
   for (i32 i = 0; i < HOP_KEY_LEN; i++) { hopKeys[i] = material[CREATE_FAST_LEN + i]; }
   return Created(encodeFixed(circId, cmdCreatedFast(), payload), Hop.createReversed(hopKeys));
 }
+
+// ── Opening a stream: the exit's half of RELAY_BEGIN ──────────────────────────
+
+/** Where a `RELAY_BEGIN` asks to be connected. `ownAddress` means the client wrote no host. */
+export struct Begin {
+  bool ok;
+  string host;
+  i32 port;
+  bool ownAddress;
+}
+
+/**
+ * Read a `RELAY_BEGIN` body: `ADDRPORT \0 FLAGS[4]`, where ADDRPORT is `host:port` as text.
+ *
+ * `beginBody` in `relay.wac` is the writer, and this is deliberately not its inverse by construction:
+ * it parses the bytes on the wire, so a client that is not ours is read the same way.
+ *
+ * **A leading colon means the relay's own address**, which is not a malformed host — it is how a
+ * rendezvous stream is opened, and `hsconnect.wac` sends exactly `":" + port`. An exit that treated it
+ * as an empty hostname would refuse the one case an onion service depends on.
+ *
+ * The port is rejected outside 1..65535, and the NUL must be present: without it the flags would be
+ * read as part of the address, which is how a four-byte suffix becomes a plausible hostname.
+ */
+export Begin parseBegin(u8[] body) {
+  Begin bad = Begin(false, "", 0, false);
+  i32 nul = -1;
+  for (i32 i = 0; i < body.len(); i++) {
+    if (body[i] == 0) { nul = i; break; }
+  }
+  if (nul < 0) { return bad; }
+
+  // The colon that separates the port is the *last* one: an IPv6 literal has several, and taking the
+  // first would cut it in half.
+  i32 colon = -1;
+  for (i32 i = 0; i < nul; i++) {
+    if (body[i] == 58) { colon = i; }
+  }
+  if (colon < 0) { return bad; }
+
+  i32 port = 0;
+  for (i32 i = colon + 1; i < nul; i++) {
+    if (body[i] < 48 || body[i] > 57) { return bad; }
+    port = port * 10 + (body[i] - 48);
+    if (port > 65535) { return bad; }
+  }
+  if (port < 1) { return bad; }
+
+  u8[] host = u8[colon]();
+  for (i32 i = 0; i < colon; i++) { host[i] = body[i]; }
+  return Begin(true, string.fromBytes(host), port, colon == 0);
+}
