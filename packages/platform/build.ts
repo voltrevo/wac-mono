@@ -299,7 +299,24 @@ async function place(text: string, out: string, executable: boolean): Promise<vo
   // just renamed into place. Exec'ing that is "Text file busy" (ETXTBSY), which failed a push gate on a
   // test that had nothing to do with the change.
   const partial = `${out}.${crypto.randomUUID()}.partial`;
-  await Deno.writeTextFile(partial, text);
+  // Opened, written, flushed and **closed by hand**, rather than `writeTextFile`. The rename above is
+  // not enough on its own: `ETXTBSY` is about any process holding the file open *for writing* when the
+  // exec happens, and the write handle here belongs to this one. `writeTextFile` resolves before the
+  // handle is necessarily gone, so a test that builds and immediately spawns could still lose — which
+  // is how a `box` test with nothing to do with the change reddened a push gate for the second time.
+  // An explicit `close()` is the only way to know the handle is gone before the rename.
+  const file = await Deno.open(partial, { write: true, create: true, truncate: true });
+  try {
+    // A loop, because `write` is POSIX `write`: it may take fewer bytes than it was given, and these
+    // are 400 KB files. One call would have truncated a binary under exactly the conditions this
+    // function exists to survive.
+    const bytes = new TextEncoder().encode(text);
+    let at = 0;
+    while (at < bytes.length) at += await file.write(bytes.subarray(at));
+    await file.sync();
+  } finally {
+    file.close();
+  }
   if (executable) await Deno.chmod(partial, 0o755);
   await Deno.rename(partial, out);
 }

@@ -444,6 +444,8 @@ bool gnuHas(string name, i32 letter) {
   else if (name == "rev") { letters = "hV"; }
   else if (name == "grep") { letters = "EFGPefiwxzsvVmbnHhoqaIdDrRLlcTZBACU"; }
   else if (name == "tr") { letters = "cdst"; }
+  else if (name == "seq") { letters = "fsw"; }
+  else if (name == "cat") { letters = "AbeEnstTuv"; }
   u8[] b = letters.toBytes();
   for (i32 i = 0; i < b.len(); i++) {
     if (b[i] == letter) { return true; }
@@ -455,9 +457,20 @@ bool gnuHas(string name, i32 letter) {
 string optionRefusal(string name, string letter) {
   u8[] b = letter.toBytes();
   if (b.len() == 1 && gnuHas(name, b[0])) {
+    // Our gap, so our words: GNU's "Try --help" would be pointing at the wrong manual.
     return name + ": -" + letter + " is not implemented\n";
   }
-  return name + ": invalid option -- '" + letter + "'\n";
+  return name + ": invalid option -- '" + letter + "'\n" + tryHelp(name);
+}
+
+/**
+ * The second line GNU prints after a usage error, which it prints after *every* one.
+ *
+ * Only on the branches that are GNU's message rather than ours. It is derivable, so it is compared
+ * against the real tool's stderr rather than against an expectation written here.
+ */
+string tryHelp(string name) {
+  return "Try '" + name + " --help' for more information.\n";
 }
 
 /** A program's arguments, split: the options it was given, its operands, and the first it refuses. */
@@ -542,23 +555,182 @@ Counted countOf(Vec<string> argv, i32 fallback) {
   return Counted(n, operands, "");
 }
 
+/**
+ * `cat [-AbeEnstTuv] [file…]` — copy, and hold nothing.
+ *
+ * Four things it got wrong, all found by comparing with GNU rather than by reading it:
+ *
+ * - **It stopped at the first file it could not open.** `cat missing f` printed the complaint and
+ *   nothing else, where GNU prints `f` and exits 1. A `cat` that silently drops the rest of its
+ *   arguments after a bad one is a hard failure to debug: the status is right and the output is short.
+ * - **Options were filenames.** `cat -n f` reported "cat: -n: No such file or directory", which blames
+ *   the caller for writing a real GNU flag; `cat -Q f` said the same where GNU says "invalid option".
+ *   The flags are implemented now — all nine of them, since they are line transforms and the
+ *   comparison against GNU is exact — and an unknown letter gets GNU's own refusal.
+ * - **It held everything.** Standard input was read whole and every file appended to one buffer, so
+ *   `cat` — the one program in a pipeline that needs no state at all — was bounded by memory. It
+ *   copies a chunk at a time now, and numbering costs one line.
+ * - **A complaint overtook the output.** See `complain`.
+ *
+ * `-u` is accepted and does nothing, which is what GNU's own manual says of it: "(ignored)". That is
+ * not a gap.
+ */
 i32 cat(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
-  u8[] stdin = fed.rest();
-  if (argv.len() == 1) { { sink.bytes(stdin); sink.flush(); return 0; } }
-  Buf out = Buf.create();
-  for (i32 i = 1; i < argv.len(); i++) {
-    string path = argv.get(i);
-    if (path == "-") { out.pushAll(stdin); continue; }
-    // Through the shell's working directory, not the host's. `cat` is the only thing here that
-    // opens a file, and it is the reason `run` takes a `cwd` at all: without it, `cd sub; cat f`
-    // looked in whichever directory the process had started in.
+  Options o = options(argv, "AbeEnstTuv");
+  if (o.bad != "") {
+    { errs.bytes(optionRefusal("cat", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
+  }
+  // `-A` is `-vET`, `-e` is `-vE`, `-t` is `-vT`: GNU's own bundles, spelled out here.
+  bool all = sawOption(o, "A");
+  Style style = Style(
+    sawOption(o, "n"),
+    sawOption(o, "b"),
+    sawOption(o, "s"),
+    sawOption(o, "E") || all || sawOption(o, "e"),
+    sawOption(o, "T") || all || sawOption(o, "t"),
+    sawOption(o, "v") || all || sawOption(o, "e") || sawOption(o, "t"));
+
+  // Numbering and squeezing run *across* the operands, as GNU's do: `cat -n f g` keeps counting.
+  Counter state = Counter(0, false);
+  Vec<string> names = o.operands.len() == 0 ? inputsOf(o.operands) : o.operands;
+
+  i32 status = 0;
+  for (i32 i = 0; i < names.len(); i++) {
+    string path = names.get(i);
+    if (path == "" || path == "-") {
+      // Standard input, in its place among the operands: `cat f - g` is GNU's own shape.
+      catCopy(fed, sink, style, state);
+      continue;
+    }
+    // Through the shell's working directory, not the host's. Without it, `cd sub; cat f` looked in
+    // whichever directory the process had started in.
     FileResult f = cli.readFile(resolvePath(cwd, path)).wait();
     if (!f.ok) {
-      { errs.bytes(("cat: " + path + ": " + whyUnread(f) + "\n").toBytes()); errs.flush(); sink.flush(); return 1; }
+      // Reported and carried on, as GNU does, with the status remembered for the end.
+      complain(sink, errs, "cat: " + path + ": " + whyUnread(f) + "\n");
+      status = 1;
+      continue;
     }
-    out.pushAll(f.bytes);
+    // A file is bounded by the file, so it is read whole and then *fed* through the same path standard
+    // input takes. One implementation of `cat`, whichever the input is.
+    if (!catCopy(Feed.of(cli, f.bytes), sink, style, state)) { break; }
   }
-  { sink.bytes(out.take()); sink.flush(); return 0; }
+  { sink.flush(); errs.flush(); return status; }
+}
+
+/** Which of `cat`'s transformations are on. */
+struct Style {
+  bool number;        // -n
+  bool numberFilled;  // -b, which numbers only the lines with something on them and overrides -n
+  bool squeeze;       // -s
+  bool ends;          // -E, a `$` at the end of every line
+  bool tabs;          // -T, a tab as `^I`
+  bool nonPrinting;   // -v, everything else unprintable as `^X` or `M-X`
+
+  /** Whether anything at all is being done to the bytes, in which case they can go straight through. */
+  bool plain(const this) {
+    return !this.number && !this.numberFilled && !this.squeeze && !this.ends && !this.tabs &&
+           !this.nonPrinting;
+  }
+}
+
+/** What `cat` carries from one operand to the next: the line number, and whether the last was blank. */
+struct Counter {
+  i32 lines;
+  bool wasBlank;
+}
+
+/** One input into the sink, transformed if anything is on. False when the reader has gone. */
+bool catCopy(Feed fed, Sink sink, Style style, Counter state) {
+  if (style.plain()) {
+    while (true) {
+      u8[] chunk = fed.next();
+      if (chunk.len() == 0) { return true; }
+      // A refused write is the reader having gone — `cat big | head -1`. Stopping is the answer.
+      if (!sink.bytes(chunk)) { return false; }
+    }
+    return true;
+  }
+
+  Lines lines = Lines.create();
+  while (true) {
+    Line l = nextLine(lines, fed);
+    if (!l.ok) { return true; }
+    bool blank = l.bytes.len() == 0;
+    // `-s`: one blank line stands for a run of them. The *second* onwards is dropped, so the state is
+    // "was the previous line blank" and not a count.
+    if (style.squeeze && blank && state.wasBlank) { continue; }
+    state.wasBlank = blank;
+
+    Buf out = Buf.create();
+    if (style.numberFilled) {
+      // `-b` overrides `-n` and numbers only the lines with something on them. A blank line gets
+      // nothing at all — not even the width — which is GNU's layout and not the one I guessed.
+      if (!blank) {
+        state.lines++;
+        out.pushAll(numberField(state.lines).toBytes());
+      }
+    } else if (style.number) {
+      state.lines++;
+      out.pushAll(numberField(state.lines).toBytes());
+    }
+    for (i32 i = 0; i < l.bytes.len(); i++) {
+      i32 c = l.bytes[i];
+      if (c == 9) {
+        // A tab is only touched by -T; -v leaves it alone, which is why this is checked first.
+        if (style.tabs) { out.pushAll("^I".toBytes()); } else { out.push(9); }
+        continue;
+      }
+      if (!style.nonPrinting || c >= 32 && c < 127) { out.push(c); continue; }
+      // `M-` for the high half, then the same rule again for what is left of the byte.
+      i32 low = c;
+      if (c >= 128) {
+        out.pushAll("M-".toBytes());
+        low = c - 128;
+      }
+      if (low < 32) { out.push('^'); out.push(low + 64); }
+      else if (low == 127) { out.pushAll("^?".toBytes()); }
+      else { out.push(low); }
+    }
+    // The `$` marks the *newline*, so a last line without one does not get it. GNU's `cat -A` on a
+    // file with no final newline is the case that says which of the two this is.
+    if (style.ends && l.nl) { out.push('$'); }
+    if (!emitTo(sink, out.take(), l.nl)) { return false; }
+  }
+  return true;
+}
+
+/** `cat -n`'s number: right-aligned in six columns, then a tab. GNU's layout, matched exactly. */
+string numberField(i32 n) {
+  return rightAlign(itoa(n), 6) + "\t";
+}
+
+/**
+ * A complaint, in its place among the output.
+ *
+ * **The output sink is flushed first**, and that is the whole point of this existing. A `Sink` holds up
+ * to 64 KiB before it writes, so a program that reports a failure straight to standard error while its
+ * own output is still in the buffer puts the two in the wrong order: `cat f missing` printed the
+ * complaint *before* `f`'s contents, where GNU prints them as they happen. Nothing in the shell can fix
+ * that from outside — by the time the shell sees the two streams, the order is already wrong.
+ */
+void complain(Sink sink, Sink errs, string line) {
+  sink.flush();
+  errs.bytes(line.toBytes());
+  errs.flush();
+}
+
+/** Everything left of a feed, a chunk at a time, holding a chunk. */
+i32 catStream(Feed fed, Sink sink) {
+  while (true) {
+    u8[] chunk = fed.next();
+    if (chunk.len() == 0) { break; }
+    // A refused write is the reader having gone — `cat big | head -1`. Stopping is the answer, and
+    // the status is still 0: nothing failed.
+    if (!sink.bytes(chunk)) { return 0; }
+  }
+  sink.flush();
+  return 0;
 }
 
 /**
@@ -1390,18 +1562,145 @@ u8[] sliceBytes(u8[] b, i32 from, i32 to) {
  * two billion into nothing. That check is the whole of what `head` closing its input does to a producer
  * in a real shell.
  */
+/**
+ * `seq [FIRST [INCREMENT]] LAST` — whole numbers, counting up or down.
+ *
+ * **The third argument used to be read and thrown away.** `seq 1 2 9` printed `1 2`: it took the first
+ * two as FIRST and LAST and never looked at the increment, so a script asking for the odd numbers to
+ * nine got two lines and a status of 0. That is the shape this shell keeps finding and the reason the
+ * corpus exists — the case was simply never written, because `seq` was here to *produce* input for the
+ * cases about other programs.
+ *
+ * Everything GNU refuses is refused with GNU's own words, since they are derivable and comparable: a
+ * missing operand, a fourth one, an argument that is not a number, a zero increment. What is a gap is
+ * announced as a gap: GNU counts in fractions and reads hexadecimal, this counts in whole decimals, and
+ * `-f`, `-s` and `-w` are real flags that are not implemented rather than invalid.
+ */
 i32 seq(Vec<string> argv, Sink sink, Sink errs) {
-  i32 from = 1;
-  i32 to = 0;
-  if (argv.len() == 2) { to = atoi(argv.get(1)); }
-  else if (argv.len() >= 3) { from = atoi(argv.get(1)); to = atoi(argv.get(2)); }
-  else { errs.bytes("seq: needs a count\n".toBytes()); errs.flush(); sink.flush(); return 2; }
+  Vec<string> operands = Vec.create();
+  bool more = true;
+  for (i32 i = 1; i < argv.len(); i++) {
+    string a = argv.get(i);
+    if (more && a == "--") { more = false; continue; }
+    u8[] b = a.toBytes();
+    // **A negative number is an operand.** `seq -1 1` counts from minus one, and a shell that read
+    // `-1` as a bundle of options would refuse the most ordinary way of writing it. GNU decides the
+    // same way: a `-` followed by a digit or a decimal point is a number.
+    bool numeric = b.len() >= 2 && (b[1] >= '0' && b[1] <= '9' || b[1] == '.');
+    if (!more || b.len() < 2 || b[0] != '-' || numeric) { operands.push(a); continue; }
+    if (b[1] == '-') {
+      { errs.bytes(("seq: unrecognized option '" + a + "'\n" + tryHelp("seq")).toBytes()); errs.flush(); sink.flush(); return 1; }
+    }
+    u8[] one = u8[1](fill: b[1]);
+    { errs.bytes(optionRefusal("seq", string.fromBytes(one)).toBytes()); errs.flush(); sink.flush(); return 1; }
+  }
 
-  for (i32 i = from; i <= to; i++) {
-    if (!sink.line(itoa(i))) { return 0; }
+  if (operands.len() == 0) {
+    { errs.bytes(("seq: missing operand\n" + tryHelp("seq")).toBytes()); errs.flush(); sink.flush(); return 1; }
+  }
+  if (operands.len() > 3) {
+    { errs.bytes(("seq: extra operand '" + operands.get(3) + "'\n" + tryHelp("seq")).toBytes()); errs.flush(); sink.flush(); return 1; }
+  }
+
+  // LAST; or FIRST LAST; or FIRST INCREMENT LAST — GNU's order, with the increment in the middle.
+  i32 from = 1;
+  i32 step = 1;
+  string last = operands.get(operands.len() - 1);
+  string firstText = operands.len() > 1 ? operands.get(0) : "1";
+  string stepText = operands.len() > 2 ? operands.get(1) : "1";
+
+  Numeral f = numeralOf(firstText);
+  Numeral t = numeralOf(last);
+  Numeral st = numeralOf(stepText);
+  string bad = f.kind != 0 ? firstText : (st.kind != 0 ? stepText : (t.kind != 0 ? last : ""));
+  i32 badKind = f.kind != 0 ? f.kind : (st.kind != 0 ? st.kind : t.kind);
+  if (bad != "") {
+    if (badKind == 1) {
+      // A number GNU would count in and this cannot: a fraction, an exponent, hexadecimal, an
+      // infinity. Naming the gap rather than calling the argument invalid, because it is not.
+      { errs.bytes(("seq: only whole decimal numbers are implemented: '" + bad + "'\n").toBytes()); errs.flush(); sink.flush(); return 1; }
+    }
+    { errs.bytes(("seq: invalid floating point argument: '" + bad + "'\n" + tryHelp("seq")).toBytes()); errs.flush(); sink.flush(); return 1; }
+  }
+  from = f.value;
+  step = st.value;
+  i32 to = t.value;
+  if (step == 0) {
+    // GNU's capital Z, which is GNU's, and this is compared against it.
+    { errs.bytes(("seq: invalid Zero increment value: '" + stepText + "'\n" + tryHelp("seq")).toBytes()); errs.flush(); sink.flush(); return 1; }
+  }
+
+  // An increment that cannot reach LAST prints nothing and succeeds, which is what `seq 3 1` does.
+  if (step > 0) {
+    for (i32 i = from; i <= to; i += step) {
+      if (!sink.line(itoa(i))) { return 0; }
+    }
+  } else {
+    for (i32 i = from; i >= to; i += step) {
+      if (!sink.line(itoa(i))) { return 0; }
+    }
   }
   sink.flush();
   return 0;
+}
+
+/** What an argument to `seq` is: a whole number this can count in, a number it cannot, or not a number. */
+struct Numeral {
+  /** 0 a whole decimal number, 1 a number this does not implement, 2 not a number at all. */
+  i32 kind;
+  i32 value;
+}
+
+/**
+ * Classify one of `seq`'s arguments.
+ *
+ * The three answers are three different messages, which is the whole reason this is a classification
+ * and not a parse: `1.5` is a number GNU counts in and this does not, `abc` is not a number at all,
+ * and telling a caller their `1.5` is invalid would be blaming them for a gap here.
+ *
+ * "A number this does not implement" is judged loosely on purpose — anything with a decimal point, an
+ * exponent, a `0x` prefix, or the words `inf` and `nan`, which is what `strtold` accepts and GNU takes.
+ * Being too generous here costs a "not implemented" where GNU would have said "invalid"; being too
+ * strict costs the reverse, and that is the one that lies.
+ */
+Numeral numeralOf(string text) {
+  u8[] b = text.toBytes();
+  i32 at = 0;
+  if (b.len() > 0 && (b[0] == '-' || b[0] == '+')) { at = 1; }
+  if (at >= b.len()) { return Numeral(2, 0); }
+
+  bool digits = false;
+  bool whole = true;
+  for (i32 i = at; i < b.len(); i++) {
+    if (b[i] >= '0' && b[i] <= '9') { digits = true; continue; }
+    whole = false;
+  }
+  if (digits && whole) { return Numeral(0, atoi(text)); }
+
+  string lower = string.fromBytes(lowered(b));
+  bool hex = b.len() > at + 1 && b[at] == '0' && (b[at + 1] == 'x' || b[at + 1] == 'X');
+  bool word = lower == "inf" || lower == "-inf" || lower == "+inf" || lower == "infinity" ||
+              lower == "-infinity" || lower == "+infinity" || lower == "nan" || lower == "-nan" ||
+              lower == "+nan";
+  if (hex || word) { return Numeral(1, 0); }
+
+  // A decimal fraction or an exponent: digits, with at most one point and one `e`, and nothing else.
+  bool point = false;
+  bool exponent = false;
+  bool ok = digits;
+  for (i32 i = at; i < b.len(); i++) {
+    // i32, not u8: a packed type cannot be a local in wac.
+    i32 c = b[i];
+    if (c >= '0' && c <= '9') { continue; }
+    if (c == '.' && !point && !exponent) { point = true; continue; }
+    if ((c == 'e' || c == 'E') && !exponent && digits) {
+      exponent = true;
+      if (i + 1 < b.len() && (b[i + 1] == '-' || b[i + 1] == '+')) { i++; }
+      continue;
+    }
+    ok = false;
+  }
+  return Numeral(ok ? 1 : 2, 0);
 }
 
 i32 nl(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {

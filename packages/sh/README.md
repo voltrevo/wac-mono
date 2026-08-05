@@ -153,6 +153,13 @@ Then a **table of programs written in wac**, when nothing else answered:
 cat wc head tail rev sort uniq grep tr seq nl printf
 ```
 
+`cat` takes all nine of GNU's flags (`-A -b -e -E -n -s -t -T -u -v`), and `seq` takes all three of
+GNU's forms including the increment in the middle — both of which were *filenames and ignored
+arguments* until they were compared: `cat -n f` answered "cat: -n: No such file or directory" and
+`seq 1 2 9` printed `1 2`. What is still missing is announced as missing: `seq` counts in whole
+decimals, so `seq 1.5 3` says fractions are not implemented rather than truncating to something
+plausible, and `-f`, `-s` and `-w` say the same.
+
 Those twelve exist because, when they were written, nothing could be started and nothing could be
 handed over. Both of those are now false, and they have become what the seam always said they
 were: a fallback. They are still weaker than `box`'s — this `grep` matches substrings rather than
@@ -212,12 +219,20 @@ stubs became what they were meant to be — a fallback for when the real program
 is the same code. One `recv` in flight per open stream, `waitAny` over all of them, and a stage whose
 reader has finished is stopped.
 
-That is *not* `SIGPIPE`, and this paragraph used to say it was. Stopping a stage stops the worker; it
-does not shorten the work the worker has already been asked to do, because the seam is bytes in and
-bytes out — a program has produced nothing until it has produced all of it. Measured at twenty
-million lines: `seq | head -1` takes 2.02s, `seq | wc -l` 2.37s, and `seq` alone about the same. The
-difference is the *reader's* work, not the writer's, and `seq 1 2000000000 | head -1` still dies
-where bash prints one line. [Issue 0061](../../issues/open/0061-sh-applets-return-all-their-output-at-once-so-a-large-stage-dies.md).
+**And now it is `SIGPIPE` in every way that matters.** This paragraph twice said otherwise, and both
+times it was right at the time: the seam was bytes in and bytes out, so a program had produced nothing
+until it had produced all of it, and stopping a stage stopped a worker that had already been asked to
+do the whole job. The programs write through a `Sink` as they go now
+([0061](../../issues/closed/0061-sh-applets-return-all-their-output-at-once-so-a-large-stage-dies.md)),
+so `seq 1 2000000000 | head -1` prints `1` in 0.13 seconds where it used to trap after five, and
+`seq 1 200000000 | wc -c` prints GNU's own answer where it printed nothing and exited 126.
+
+**A lone command streams too.** One stage is the same machinery as six, and a single command used to be
+the collecting case: `wacsh -c 'seq 1 2000000000'` built twenty gigabytes in the shell and trapped at
+one wasm array, and `cat missing f` printed its complaint and `f`'s contents in whichever order the two
+buffers happened to be flushed rather than in the order they happened. `canStream` takes a pipeline of
+one, and a lone stage may *inherit* the real standard input — streaming and shared, which is what makes
+`cat; cat` print one line between them as bash does.
 
 `canStream` decides before anything is expanded, because expansion runs command substitutions and
 asking twice would run them twice: every stage must be a plain command whose name is a bare literal
@@ -288,6 +303,13 @@ standard input. Both of this shell's paths agree with each other meanwhile — t
 the redirected bytes and *could* answer 6 — and consistency was the thing worth keeping, because a
 `wc` whose output depended on whether the shell could spawn would be the harder bug to find.
 
+The same missing size costs one more thing, and it is worth naming because it looks like a bug: `wc`
+cannot print a file's counts *until it has read every input*, since the width depends on the total. So
+`wc -l f missing` prints its complaint after the counts where GNU prints it between them. GNU gets both
+because `fstat` tells it the widths before it reads anything. `cat` has no such constraint and does
+interleave correctly — see `complain` in `program.wac`, which flushes the output sink before writing to
+the error one, because a 64 KiB buffer is enough to reverse the two.
+
 **Only `read` consumes standard input.** It advances a cursor the whole command shares, which is
 what makes `while read line` terminate rather than see the first line for ever. The external
 programs are handed whatever is left but are *not* charged for it, because nothing here knows
@@ -331,18 +353,18 @@ truthful to put there.
 **No process substitution.** `<(…)` needs a pipe with a name, which the capability world does
 not offer.
 
-**Pipeline stages run at once; a stage's own output does not stream.** This section used to say
-stages ran one at a time, and they no longer do — a pipeline whose every stage is a spawnable
-program named by a plain literal runs them concurrently, each in its own worker, and `canStream` in
-`exec.wac` is the exact list of what qualifies (a builtin, a compound, a redirection or an
-assignment falls back to one-at-a-time in memory, because those run in *this* shell).
+**A redirection still collects.** Everything else streams — the stages of a pipeline, a lone command,
+and the programs themselves through `Sink` — but `> file` gathers the command's output in the shell and
+writes it afterwards, so a redirected command is bounded by memory however well it streams:
+`seq 1 2000000000 > out` traps where bash writes twenty gigabytes.
+[Issue 0070](../../issues/open/0070-a-redirection-collects-a-childs-whole-output-before-writing-the-file.md)
+is that, with `openOutput` named as the capability it wants. `2>` and `2>&1` are not implemented at
+all, and say so.
 
-What did not change is the seam's signature: bytes in, bytes out. A program produces all of its
-output before any of it moves, so `head -1` cannot stop the stage feeding it — `seq 1 2000000000 |
-head -1` prints `1` in bash and here it dies with "requested new array is too large" after five
-seconds, exactly as `seq 1 2000000000 > out` does on its own. Stage concurrency does not fix that
-and neither would real processes; it needs the applets to write as they go, the way
-[`packages/box`](../box/README.md)'s do through `Sink`.
+**Some of the programs still hold their whole input.** `cat`, `wc`, `head` and `tail` stream; `sort`,
+`uniq`, `grep`, `tr`, `nl` and `rev` read all of it before answering, so a large input traps in the
+stage that holds it. `sort` is the one that genuinely cannot stream and should say so rather than trap.
+[Issue 0071](../../issues/open/0071-nine-of-shs-programs-read-all-of-their-input-before-answering.md).
 
 **Globbing is last-component only.** A pattern in the final path component works; one in a leading
 component does not, because that needs walking every directory that matches.
