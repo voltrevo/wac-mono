@@ -1,0 +1,120 @@
+// Signature domains for the beacon chain — what a sync-committee signature is actually over.
+//
+// A light client checks one BLS signature per update, and the message is **not** the block header.
+// It is `hash_tree_root(SigningData(header_root, domain))`, where the domain mixes in the fork and
+// the genesis validators root. That indirection is the replay protection: the same header signed on
+// two chains, or across a fork boundary, produces different signing roots, so a signature cannot be
+// lifted from one context into another.
+//
+//     fork_data_root = hash_tree_root(ForkData(fork_version, genesis_validators_root))
+//     domain         = DOMAIN_SYNC_COMMITTEE ‖ fork_data_root[:28]
+//     signing_root   = hash_tree_root(SigningData(header_root, domain))
+//
+// Both containers are two 32-byte chunks, so each root is a single `sha256(a ‖ b)` — written that way
+// here rather than driven through `packages/ssz`'s descriptor machinery, because at this size the
+// direct form is the clearer statement of the same thing.
+//
+// `Version` is `Bytes4` and a `Bytes32` chunk is what it merkleizes to, so the four bytes are
+// left-aligned and the rest zero. Getting that padding wrong is the kind of error that yields a
+// perfectly stable wrong answer.
+//
+// Checked against Ethereum's own fixtures rather than derived here: a test case's `meta.yaml` states
+// its `store_fork_digest`, and a fork digest is the first four bytes of exactly this fork data root.
+// The minimal-config Altair version `0x01000001` reproduces the vectors' `0x15cfa0a7`.
+
+import { hashPair } from "../../ssz/src/merkle.wac";
+
+/** `DomainType('0x07000000')` — the sync committee's domain, from the Altair spec. */
+export u8[] domainSyncCommittee() {
+  u8[] d = u8[4]();
+  d[0] = 0x07;
+  return d;
+}
+
+/** Altair's fork version under the `minimal` config, which the sync-protocol vectors are built with. */
+export u8[] altairForkVersionMinimal() {
+  u8[] v = u8[4]();
+  v[0] = 0x01;
+  v[3] = 0x01;
+  return v;
+}
+
+/** Altair's fork version on mainnet. */
+export u8[] altairForkVersionMainnet() {
+  u8[] v = u8[4]();
+  v[0] = 0x01;
+  return v;
+}
+
+/** A 4-byte value in the first chunk, zero-padded — how `Bytes4` merkleizes. */
+u8[] chunkOf4(u8[] v) {
+  u8[] c = u8[32]();
+  for (i32 i = 0; i < 4 && i < v.len(); i++) { c[i] = v[i]; }
+  return c;
+}
+
+/**
+ * `hash_tree_root(ForkData(current_version, genesis_validators_root))`.
+ *
+ * Null unless the inputs are the widths the container declares — 4 and 32 bytes. A caller passing a
+ * 32-byte "version" would otherwise get a stable, wrong root.
+ */
+export u8[]? computeForkDataRoot(u8[] forkVersion, u8[] genesisValidatorsRoot) {
+  if (forkVersion.len() != 4 || genesisValidatorsRoot.len() != 32) { return null; }
+  return hashPair(chunkOf4(forkVersion), genesisValidatorsRoot);
+}
+
+/**
+ * `compute_fork_digest` — the first four bytes of the fork data root.
+ *
+ * Not used to verify anything; it is how the wire format labels which fork an object belongs to, and
+ * it is what lets a test confirm the fork version it is assuming.
+ */
+export u8[]? computeForkDigest(u8[] forkVersion, u8[] genesisValidatorsRoot) {
+  u8[]? root = computeForkDataRoot(forkVersion, genesisValidatorsRoot);
+  if (root is null) { return null; }
+  u8[] out = u8[4]();
+  for (i32 i = 0; i < 4; i++) { out[i] = root![i]; }
+  return out;
+}
+
+/**
+ * `compute_domain(domain_type, fork_version, genesis_validators_root)`.
+ *
+ * Four bytes of domain type then **twenty-eight** of the fork data root — not thirty-two. The root is
+ * truncated, which is why a domain is not itself a hash and cannot be treated as one.
+ */
+export u8[]? computeDomain(u8[] domainType, u8[] forkVersion, u8[] genesisValidatorsRoot) {
+  if (domainType.len() != 4) { return null; }
+  u8[]? root = computeForkDataRoot(forkVersion, genesisValidatorsRoot);
+  if (root is null) { return null; }
+  u8[] d = u8[32]();
+  for (i32 i = 0; i < 4; i++) { d[i] = domainType[i]; }
+  for (i32 i = 0; i < 28; i++) { d[4 + i] = root![i]; }
+  return d;
+}
+
+/**
+ * `compute_signing_root(object, domain)` — the message a beacon-chain signature is over.
+ *
+ * Takes the object's root rather than the object, because the caller has already merkleized it and
+ * `packages/ssz` is where that belongs.
+ */
+export u8[]? computeSigningRoot(u8[] objectRoot, u8[] domain) {
+  if (objectRoot.len() != 32 || domain.len() != 32) { return null; }
+  return hashPair(objectRoot, domain);
+}
+
+/**
+ * The signing root for a sync-committee signature over a beacon block header.
+ *
+ * The composition a light client actually performs, in one place so a caller cannot assemble it in
+ * the wrong order — which would still produce 32 plausible bytes.
+ */
+export u8[]? syncCommitteeSigningRoot(
+  u8[] headerRoot, u8[] forkVersion, u8[] genesisValidatorsRoot
+) {
+  u8[]? domain = computeDomain(domainSyncCommittee(), forkVersion, genesisValidatorsRoot);
+  if (domain is null) { return null; }
+  return computeSigningRoot(headerRoot, domain!);
+}
