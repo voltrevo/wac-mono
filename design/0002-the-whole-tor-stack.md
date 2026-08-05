@@ -395,3 +395,29 @@ deliberately not restated here.
   rather than assumed.
 - **Where the launcher's network description lives.** Chutney uses Python network files; ours could be
   JSON read by a Deno harness, or a wac program. Decide at step 5, when there is something to launch.
+
+## The fetch that proved nothing, and how to test one that does
+
+A C tor with our three relays fetched 49,678 bytes through its SOCKS port, four times, exit 0 — and no
+relay logged a stream. The two facts did not join up, so the result was not claimed. The control settles
+why: a tor with a fresh `DataDirectory`, no relays and no authority reachable, sitting at
+`Bootstrapped 0%`, and `curl --socks5-hostname 127.0.0.1:9260 http://127.0.0.1:8098/` **still returned
+49,873 bytes**. curl bypasses a proxy for loopback addresses. That fetch measured curl.
+
+The method that tests something: a **non-loopback** target (`hostname -I`) with the proxy forced —
+`curl --noproxy '' --proxy socks5h://127.0.0.1:PORT http://IP:PORT/`. Under the same control that
+combination times out, which is what a proxy genuinely in the path looks like.
+
+Re-run properly with all four processes: **the fetch times out and no relay opens a stream.** tor gets
+further than it ever has — `90% (ap_handshake_done)` then `95% (circuit_create)` — and then no stream
+completes. `no exit nodes` still appears in its log, though those lines may predate the consensus
+arriving.
+
+**Next, unverified rather than disproved:** whether that run's consensus actually carried
+`p accept 1-65535`. The vector inspected was a stale one from an earlier hour, so this is the first
+thing to check — if the policy is present and tor still refuses, the `Exit` flag and the policy
+disagree somewhere; if it is absent, the run used a stale `gendesc` build.
+
+The general lesson is worth more than the bug: **a test that cannot fail proves nothing, and a fetch
+through a proxy to loopback is one of those.** Run the control first — with the network deliberately
+broken — and only trust a success once the failure has been seen.
