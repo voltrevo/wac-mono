@@ -605,14 +605,10 @@ Deno.test("box's text applets agree with the system tools they imitate", async (
     await buildApp(BOX, built, { read: true });
     await Deno.writeTextFile(fixture, "a,b,c\nd,e,f\nnodelim\n,leading,\n");
 
-    const box = (args: string[], input = "") => {
-      const child = new Deno.Command(built, {
-        args, stdin: "piped", stdout: "piped", stderr: "piped",
-      }).spawn();
-      const w = child.stdin.getWriter();
-      w.write(new TextEncoder().encode(input)).then(() => w.close());
-      return child.output().then((o) => new TextDecoder().decode(o.stdout));
-    };
+    // In this process. The helper already returned a promise — it had to, to write standard input
+    // before reading the output — so its thirty-three call sites needed no change at all.
+    const runner = await appRunner(BOX, { read: true });
+    const box = (args: string[], input = "") => runner.run(args, { stdin: input }).then((r) => r.out);
     const sys = (cmd: string, args: string[], input = "") => {
       const child = new Deno.Command(cmd, {
         args, stdin: "piped", stdout: "piped", stderr: "null",

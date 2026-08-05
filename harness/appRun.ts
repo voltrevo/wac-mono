@@ -139,6 +139,17 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
       const why = await child.loaded;
       if (why !== "") throw new Error(`${entry} did not load: ${why}`);
 
+      // **Drain before waiting, not after.** The output queues are capped at 8 MB, so reading only
+      // after `exit` breaks any program that writes more than that. Measured, with the drain moved
+      // back after the exit: `box seq 1 2000000` (~13 MB) fails with `the program's output is not
+      // being read`, thrown from the `write` handler below — and thrown *out of the test*, so Deno
+      // reports "this error was not caught from a test and caused the test runner to fail on the
+      // referenced module" and takes the whole file with it rather than one case.
+      //
+      // `rest()` releases room as it takes chunks, so starting it first drains continuously and the
+      // size stops mattering. `shutdown()` ends both queues, which is what lets these resolve.
+      const draining = Promise.all([child.out.rest(), child.err.rest()]);
+
       // Standard input is whatever the caller gave, then end — a program that reads to the end has
       // to see one. Pushed before awaiting the exit, since a filter blocks until it has input.
       if (opts.stdin !== undefined) {
@@ -147,8 +158,8 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
       child.in.end();
 
       const code = await child.exit;
-      const bytes = await child.out.rest();
-      return { code, out: dec.decode(bytes), err: dec.decode(await child.err.rest()), bytes };
+      const [bytes, errBytes] = await draining;
+      return { code, out: dec.decode(bytes), err: dec.decode(errBytes), bytes };
     },
   };
 }
