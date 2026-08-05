@@ -306,6 +306,22 @@ most, because it puts their implementation on the far side of every seam.
 > They are distinguishable in one run by logging the rejected command byte and whether `l.dead` was set,
 > which is the cheapest next step and needs no theory at all.
 >
+> **`EXTEND2` works. A relay extended a C tor's circuit to the next hop:**
+>
+>     relayd:   extending to 127.0.0.1:5559
+>     relayd:   extended circuit -80345653 to the next hop as -408921639
+>
+> So the whole path is exercised: a C tor bootstraps from our authority, builds a circuit through one of
+> our relays, asks it to extend, and that relay opens a connection to the next, forwards the handshake
+> untouched, and answers EXTENDED2. Step 3's last unexercised piece is no longer unexercised.
+>
+> Two things remain, and the instrumentation named the first by staying silent. One relay still fails,
+> and **none** of the three new messages fired for it — so `linkHandshake` returns false in the VERSIONS
+> exchange at the top, which was not instrumented. That relay had also been asked to extend to
+> `127.0.0.1:5555`, **its own port**: a relay extending to itself is the case to look at, and tor is
+> entitled to ask for it. The second is `RELAY_BEGIN`, without which a built path still carries no
+> stream.
+>
 > The SOCKS requests still time out, which is expected and separate: nothing implements `RELAY_BEGIN`.
 >
 > One hypothesis tested and **disproved**: that tor asked our relay for the consensus because our vote

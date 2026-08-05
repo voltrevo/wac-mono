@@ -234,12 +234,24 @@ export bool linkHandshake(Link l, string host) {
 
   while (true) {
     u8[] cell = nextCell(l);
-    if (cell.len() == 0) { return false; }
+    if (cell.len() == 0) {
+      // Which of the two ways this fails matters: a dead link is a timeout or a closed socket, and an
+      // unexpected command is a disagreement about the cells themselves. Saying which cost a whole
+      // cycle of guessing when a relay could not extend to another of ours.
+      l.core.warn("tor: the link went quiet during the handshake (dead=" +
+                  (l.dead ? "yes" : "no") + ")");
+      return false;
+    }
     i32 cmd = cellCommand(cell, 0);
     if (cmd == cmdNetinfo()) { break; }
     if (cmd == cmdCerts()) {
-      if (certsCount(cellPayload(cell, 0)) < 0) { return false; }
+      if (certsCount(cellPayload(cell, 0)) < 0) {
+        l.core.warn("tor: the CERTS cell did not parse, payload " +
+                    itoa(cellPayload(cell, 0).len()) + " bytes");
+        return false;
+      }
     } else if (cmd != cmdAuthChallenge() && cmd != cmdVpadding()) {
+      l.core.warn("tor: an unexpected cell command " + itoa(cmd) + " during the handshake");
       return false;
     }
   }
