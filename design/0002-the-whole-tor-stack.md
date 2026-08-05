@@ -447,3 +447,26 @@ and abandons rather than extending. Worth looking at next, cheapest first:
   - tor's own log around `circuit_create` for the reason it drops each attempt, which is the direct
     route and needs no theory at all — the pattern all day has been that the log says it and the
     theories do not.
+
+### `EnforceDistinctSubnets` was the path-selection blocker
+
+`circuitbuild.c:495` closed 235 circuits, with one `Failed to find node for hop` beside it. Every relay
+here listens on **127.0.0.1**, and tor will not put two relays from one /16 in a circuit — so no
+three-hop path could be *chosen*, whatever the relays could do. Chutney sets `EnforceDistinctSubnets 0`
+for the same reason, and the probe's torrc now does too.
+
+With it set, path selection works and the shape of the failure changes again:
+
+    relay A   2 circuits, 1 extending to, 1 extended circuit
+    relay B   2 circuits, 1 extending to, 0 extended circuit
+    relay C   1 circuit,  0 extends
+
+**The first extend completes and the second does not.** A extends to B and finishes; B extends to C and
+does not, which is the ours-to-ours `linkHandshake` failure already recorded above — the one that
+returns false somewhere in the VERSIONS exchange that was never instrumented. It is now the single
+thing standing between this network and a stream: path selection works, the exit policy is right, the
+first hop extends, and the second hop's link handshake is where it stops.
+
+So the next step is not a new experiment but the old bug, now clearly load-bearing: instrument the two
+returns at the top of `linkHandshake` — the VERSIONS reply check and `negotiateVersion(...) < 4` — and
+run once. Everything else in the chain has been eliminated by measurement.
