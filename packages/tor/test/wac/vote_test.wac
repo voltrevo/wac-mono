@@ -2,8 +2,10 @@
 
 import { T } from "../../../wactest/src/assert.wac";
 import {
-  compareBytes, signedLength, sortedStatusEntries, voteSignatureDigest, voteSignatureDigest256,
+  compareBytes, RelayOpinion, signedLength, sortedStatusEntries, VoteInfo, voteDocument,
+  voteSignatureDigest, voteSignatureDigest256,
 } from "../../src/vote.wac";
+import { AuthorityKeys } from "../../src/authcert.wac";
 import { b64Unpadded, descriptorIdentity } from "../../src/routerdesc.wac";
 
 const i32 V_VOTE = 0;
@@ -11,6 +13,12 @@ const i32 V_RECOVERED = 1;
 const i32 V_DESC_COUNT = 2;
 const i32 V_DESCRIPTOR = 3;
 const i32 V_R_LINES = 4;
+const i32 G_KEY = 5;
+const i32 G_STR = 6;
+const i32 G_NUM = 7;
+const i32 G_CERT = 8;
+const i32 G_DESC = 9;
+const i32 G_VOTE = 10;
 
 u8[] none() { return u8[0](); }
 
@@ -153,4 +161,49 @@ u8[] nicknameOf(u8[] line) {
   u8[] out = u8[end - at]();
   for (i32 i = 0; i < end - at; i++) { out[i] = line[at + i]; }
   return out;
+}
+
+i64 gnum(fn[u8[](i32, u8[], u8[])] ref, i32 which) {
+  u8[] b = ref(G_NUM, arg1(which), none());
+  i64 v = 0;
+  for (i32 i = 0; i < 8; i++) { v = v * 256 + (b[i] as i64); }
+  return v;
+}
+
+string gstr(fn[u8[](i32, u8[], u8[])] ref, i32 which) {
+  return string.fromBytes(ref(G_STR, arg1(which), none()));
+}
+
+export string test_the_vote_tor_accepted_is_reproduced(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+
+  AuthorityKeys k = AuthorityKeys(
+    ref(G_KEY, arg1(0), none()), ref(G_KEY, arg1(1), none()), ref(G_KEY, arg1(2), none()),
+    ref(G_KEY, arg1(3), none()), ref(G_KEY, arg1(4), none()), ref(G_KEY, arg1(5), none()));
+
+  VoteInfo info = VoteInfo(
+    gstr(ref, 0), gstr(ref, 1), gstr(ref, 2),
+    gnum(ref, 0) as~ i32, gnum(ref, 1) as~ i32, gstr(ref, 3),
+    gnum(ref, 2), gnum(ref, 3), gnum(ref, 4), gnum(ref, 5),
+    gnum(ref, 6) as~ i32, gnum(ref, 7) as~ i32);
+
+  RelayOpinion[] relays = RelayOpinion[1]();
+  relays[0] = RelayOpinion(ref(G_DESC, none(), none()), gstr(ref, 4), gnum(ref, 8), gstr(ref, 5));
+
+  u8[] want = ref(G_VOTE, none(), none());
+  t.isTrue(want.len() > 2000, "the committed vote is a whole document");
+
+  // The assertion: tor's own parser accepted these exact bytes, and for a vote that means it verified
+  // the signature — corrupting the signature, the embedded certificate, or one body byte are each
+  // rejected. Reproducing them is reproducing a document a real tor checked.
+  t.eqBytes(voteDocument(info, k, ref(G_CERT, none(), none()), relays), want,
+            "the vote tor accepted is what we build");
+
+  // Our own reading of it agrees about where the signature starts, which is the one rule the byte
+  // comparison could not distinguish from a coincidence.
+  u8[] built = voteDocument(info, k, ref(G_CERT, none(), none()), relays);
+  i32 end = signedLength(built);
+  t.isTrue(end > 0, "the built document announces its signature");
+  t.eqI32(built[end - 1], 32, "and the signed span ends on the space");
+  return t.report();
 }

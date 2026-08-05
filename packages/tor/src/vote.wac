@@ -26,7 +26,14 @@
 
 import { sha1 } from "../../crypto/src/sha1.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
-import { descriptorIdentity, pastLineStarting, routerStatusLine } from "./routerdesc.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+import { itoa, itoa64 } from "../../fmt/src/itoa.wac";
+import { rsaSignRawPkcs1 } from "../../crypto/src/rsa.wac";
+import { AuthorityKeys, plainFingerprint } from "./authcert.wac";
+import {
+  descriptorIdentity, lineValue, pastLineStarting, pemBlock, publishedTime, rsaFingerprint,
+  routerStatusLine,
+} from "./routerdesc.wac";
 
 /** The text the signature is announced by: keyword and the one space the digest includes. */
 u8[] signatureKeyword() { return "directory-signature ".toBytes(); }
@@ -103,3 +110,136 @@ export i32 compareBytes(u8[] a, u8[] b) {
   if (a.len() == b.len()) { return 0; }
   return a.len() < b.len() ? -1 : 1;
 }
+
+// ── The document ──────────────────────────────────────────────────────────────
+
+/** What an authority says about itself and the period it is voting for. */
+export struct VoteInfo {
+  string nickname;
+  string address;              // the authority's hostname or IP as it advertises it
+  string ip;
+  i32 dirPort;
+  i32 orPort;
+  string contact;
+  i64 published;
+  i64 validAfter;
+  i64 freshUntil;
+  i64 validUntil;
+  i32 voteSeconds;             // the two halves of `voting-delay`
+  i32 distSeconds;
+}
+
+/** One relay as this authority sees it — the parts no descriptor can tell us. */
+export struct RelayOpinion {
+  u8[] descriptor;
+  string flags;                // the `s` line, space separated, in the order known-flags gives
+  i64 bandwidth;              // the `w` line's Bandwidth=
+  string exitPolicy;          // the `p` line, e.g. "reject 1-65535"
+}
+
+/**
+ * A complete vote, signed.
+ *
+ * The certificate is passed in rather than built here: it is signed by the authority's *identity* key
+ * and lives for months, while a vote is signed by the signing key and lives for minutes. An authority
+ * that rebuilt its certificate every voting period would be re-certifying its identity hourly.
+ *
+ * Empty if the signature cannot be made or a relay's descriptor is unusable.
+ */
+export u8[] voteDocument(
+  VoteInfo info, AuthorityKeys keys, u8[] certificate, RelayOpinion[] relays
+) {
+  u8[] identityFp = rsaFingerprint(keys.identityN, keys.identityE);
+  u8[] signingFp = rsaFingerprint(keys.signingN, keys.signingE);
+  if (identityFp.len() != 20 || signingFp.len() != 20) { return u8[0](); }
+
+  Buf d = Buf.create();
+  d.pushAll("network-status-version 3\n".toBytes());
+  d.pushAll("vote-status vote\n".toBytes());
+  d.pushAll(("consensus-methods " + CONSENSUS_METHODS + "\n").toBytes());
+  d.pushAll(("published " + publishedTime(info.published) + "\n").toBytes());
+  d.pushAll(("valid-after " + publishedTime(info.validAfter) + "\n").toBytes());
+  d.pushAll(("fresh-until " + publishedTime(info.freshUntil) + "\n").toBytes());
+  d.pushAll(("valid-until " + publishedTime(info.validUntil) + "\n").toBytes());
+  d.pushAll(("voting-delay " + itoa(info.voteSeconds) + " " + itoa(info.distSeconds) +
+             "\n").toBytes());
+  d.pushAll(("recommended-relay-protocols " + RELAY_PROTOCOLS + "\n").toBytes());
+  d.pushAll(("recommended-client-protocols " + CLIENT_PROTOCOLS + "\n").toBytes());
+  d.pushAll(("required-relay-protocols " + RELAY_PROTOCOLS + "\n").toBytes());
+  d.pushAll(("required-client-protocols " + CLIENT_PROTOCOLS + "\n").toBytes());
+  d.pushAll(("known-flags " + KNOWN_FLAGS + "\n").toBytes());
+  d.pushAll(("params " + PARAMS + "\n").toBytes());
+
+  // `dir-source` writes the fingerprint as unbroken uppercase hex, like a certificate and unlike a
+  // descriptor. Address and IP are separate fields and are the same thing for a testnet.
+  d.pushAll(("dir-source " + info.nickname + " " + plainFingerprint(identityFp) + " " +
+             info.address + " " + info.ip + " " + itoa(info.dirPort) + " " +
+             itoa(info.orPort) + "\n").toBytes());
+  d.pushAll(("contact " + info.contact + "\n").toBytes());
+
+  // The certificate goes in verbatim, so that a reader who has only the authority's fingerprint can
+  // learn the signing key from the vote itself. It is what makes a vote self-verifying.
+  d.pushAll(certificate);
+
+  // Entries in ascending identity-digest order, which `sortedStatusEntries` establishes.
+  u8[][] descriptors = u8[][relays.len()]();
+  for (i32 i = 0; i < relays.len(); i++) { descriptors[i] = relays[i].descriptor; }
+  u8[][] lines = sortedStatusEntries(descriptors);
+  for (i32 i = 0; i < lines.len(); i++) {
+    if (lines[i].len() == 0) { return u8[0](); }
+    RelayOpinion r = opinionFor(relays, lines[i]);
+    d.pushAll(lines[i]);
+    d.push(10);
+    d.pushAll(("s " + r.flags + "\n").toBytes());
+    d.pushAll(("v Tor " + TOR_VERSION + "\n").toBytes());
+    d.pushAll(("pr " + RELAY_SUBPROTOCOLS + "\n").toBytes());
+    d.pushAll(("w Bandwidth=" + itoa64(r.bandwidth) + "\n").toBytes());
+    d.pushAll(("p " + r.exitPolicy + "\n").toBytes());
+    u8[] ed = lineValue(r.descriptor, "master-key-ed25519 ");
+    if (ed.len() > 0) {
+      d.pushAll("id ed25519 ".toBytes());
+      d.pushAll(ed);
+      d.push(10);
+    }
+  }
+
+  d.pushAll("directory-footer\n".toBytes());
+
+  // The signature covers the keyword and one space, so the fingerprints that follow are outside it.
+  d.pushAll(signatureKeyword());
+  u8[] digest = voteSignatureDigest(d.bytes());
+  if (digest.len() != 20) { return u8[0](); }
+  d.pushAll((plainFingerprint(identityFp) + " " + plainFingerprint(signingFp) + "\n").toBytes());
+  u8[] sig = rsaSignRawPkcs1(keys.signingN, keys.signingD, digest);
+  if (sig.len() == 0) { return u8[0](); }
+  d.pushAll(pemBlock("SIGNATURE", sig));
+
+  return d.bytes();
+}
+
+/** The opinion whose descriptor produced `line`, matched by the line's identity field. */
+RelayOpinion opinionFor(RelayOpinion[] relays, u8[] line) {
+  for (i32 i = 0; i < relays.len(); i++) {
+    u8[] want = routerStatusLine(relays[i].descriptor);
+    if (want.len() == line.len() && sameLine(want, line)) { return relays[i]; }
+  }
+  return relays[0];
+}
+
+bool sameLine(u8[] a, u8[] b) {
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+const string CONSENSUS_METHODS = "28 29 30 31 32";
+const string TOR_VERSION = "0.4.7.13";
+const string KNOWN_FLAGS =
+  "Authority Exit Fast Guard HSDir Running Stable StaleDesc Sybil V2Dir Valid";
+const string PARAMS = "";
+const string RELAY_PROTOCOLS =
+  "Cons=2 Desc=2 DirCache=2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 LinkAuth=3 Microdesc=2 Relay=2";
+const string CLIENT_PROTOCOLS =
+  "Cons=2 Desc=2 DirCache=2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 Microdesc=2 Relay=2";
+const string RELAY_SUBPROTOCOLS =
+  "Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 " +
+  "LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4";
