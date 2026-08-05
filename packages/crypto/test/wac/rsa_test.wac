@@ -1,9 +1,15 @@
-// RSA signature verification, against node:crypto.
+// RSA against node:crypto, in both directions.
 //
-// Verification only, which shapes the whole file: there is no signing here, so every test
-// is "somebody else signed this and we must agree". The host generates the key and the
-// signature and we check it — the one direction that matters for a TLS client reading a
-// certificate.
+// It began as verification only — the host signs, we agree — which is the direction a TLS client
+// reading a certificate needs. `design/0002` needs the other one too: a Tor relay signs its identity
+// crosscert and an authority signs a consensus, so we must *produce* signatures somebody else
+// accepts.
+//
+// Both directions are here and they are not the same test. "Node verifies what we signed" and "we
+// verify what node signed" can both pass while our signer and our verifier share a fault — the
+// symmetric-oracle trap. What closes it is that PKCS#1 v1.5 is **deterministic**: for a given key,
+// message and hash there is exactly one correct signature, so we can require ours to equal node's
+// byte for byte. That assertion cannot be satisfied by two wrong halves agreeing.
 //
 // `ref(mode, a, b)` returns a fresh key as `modulus || exponent` on request, then signs
 // with it. Both PKCS#1 v1.5 and PSS, because they fail differently:
@@ -17,12 +23,18 @@
 //                 wrong-length handling is where implementations diverge.
 
 import { T } from "../../../wactest/src/assert.wac";
+import { sha256 } from "../../src/sha256.wac";
+import { Big } from "../../../bignum/src/big.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
-import { rsaVerifyPkcs1, rsaVerifyPss } from "../../src/rsa.wac";
+import { rsaVerifyPkcs1, rsaVerifyPss, rsaSignPkcs1, rsaSignRawPkcs1, rsaRecoverPkcs1,
+         modPowSecret, fromBytes, toBytes } from "../../src/rsa.wac";
 
 const i32 KEYGEN = 0;
 const i32 SIGN_PKCS1 = 1;
 const i32 SIGN_PSS = 2;
+const i32 PRIVATE = 3;
+const i32 VERIFY_PKCS1 = 4;
+const i32 RECOVER_RAW = 5;
 
 u8[] slice(u8[] src, i32 from, i32 to) {
   u8[] o = u8[to - from]();
@@ -72,16 +84,15 @@ export string test_pkcs1_signatures_from_the_host(fn[u8[](i32, u8[], u8[])] ref)
 export string test_pkcs1_refuses_a_block_that_is_not_exact(fn[u8[](i32, u8[], u8[])] ref) {
   // Every byte of the block is specified, so every byte is worth moving.
   //
-  // What this does *not* reach, and it is worth saying rather than implying otherwise:
-  // the individual strictness checks guard each other. Flipping a bit in the signature
-  // makes the whole block garbage after exponentiation, so removing any one check — the
-  // leading zero, the 0x01 block type, the padding run — still leaves the others
-  // refusing. Verified by deleting them one at a time; all four tests stayed green.
+  // What this does *not* reach: the individual strictness checks guard each other here. Flipping a
+  // bit in the signature makes the whole block garbage after exponentiation, so removing any one
+  // check still leaves the others refusing.
   //
-  // Reaching a single check needs a signature crafted to have the right shape everywhere
-  // else, which is Bleichenbacher's 2006 forgery and needs the private key to construct.
-  // That is a fixture worth adding one day; until then the checks are covered
-  // collectively and not individually.
+  // That gap is now closed by `test_a_forged_block_that_is_wrong_in_one_place_is_refused` below,
+  // which is this file's older note — "reaching a single check needs a signature crafted to have the
+  // right shape everywhere else, which needs the private key to construct" — acted on once signing
+  // arrived. Each of the six checks was confirmed reachable by deleting it and watching exactly the
+  // matching forgery be accepted.
   T t = T.create();
   u8[] sizeArg = u8[2]();
   sizeArg[0] = 8;
@@ -167,4 +178,190 @@ export string test_pss_refuses_tampering(fn[u8[](i32, u8[], u8[])] ref) {
   // verifier told the wrong length reconstructs a different DB and must refuse.
   t.isFalse(rsaVerifyPss(k.n, k.e, msg, sig, 32, 20), "the wrong salt length is refused");
   return t.report();
+}
+
+
+// ── Signing ───────────────────────────────────────────────────────────────────
+
+/** The current key's private exponent, from the host. Throwaway keys, generated in-process. */
+u8[] privateExponent(fn[u8[](i32, u8[], u8[])] ref) { return ref(PRIVATE, u8[0](), u8[0]()); }
+
+u8[] sizeArgOf(i32 bits) {
+  u8[] a = u8[2]();
+  a[0] = (bits >> 8) & 0xFF;
+  a[1] = bits & 0xFF;
+  return a;
+}
+
+export string test_our_pkcs1_signature_is_byte_identical_to_the_hosts(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  // The strongest form available, and the reason it is available: PKCS#1 v1.5 has no salt and no
+  // randomness, so one key, one message and one hash admit exactly one signature. Equality with
+  // node's therefore checks the padding construction, the digest, the DigestInfo prefix and the
+  // modular exponentiation all at once — and unlike "each side accepts the other", it cannot be
+  // satisfied by our signer and our verifier being wrong together.
+  T t = T.create();
+  i32[] bits = i32[](2048, 3072);
+  i32[] hashes = i32[](32, 48, 64);
+  for (i32 b = 0; b < bits.len(); b++) {
+    Key k = Key.of(ref(KEYGEN, sizeArgOf(bits[b]), u8[0]()));
+    u8[] d = privateExponent(ref);
+    for (i32 h = 0; h < hashes.len(); h++) {
+      u8[] msg = fill(64 + h, b * 5 + h);
+      u8[] hashArg = u8[1]();
+      hashArg[0] = hashes[h];
+      u8[] theirs = ref(SIGN_PKCS1, hashArg, msg);
+      u8[] ours = rsaSignPkcs1(k.n, d, msg, hashes[h]);
+      t.eqI32(ours.len(), theirs.len(), "signature width at " + itoa64(bits[b] as i64) + " bits");
+      i32 diff = 0;
+      for (i32 i = 0; i < theirs.len() && i < ours.len(); i++) { diff = diff | (ours[i] ^ theirs[i]); }
+      t.eqI32(diff, 0, "sha-" + itoa64((hashes[h] * 8) as i64) + " at " +
+              itoa64(bits[b] as i64) + " bits is byte-identical to node's");
+    }
+  }
+  return t.report();
+}
+
+export string test_the_host_accepts_what_we_signed(fn[u8[](i32, u8[], u8[])] ref) {
+  // Byte-identity above already implies this, but only while node's signer stays deterministic —
+  // and it is node that decides that, not us. This asks the question the caller actually cares
+  // about, which is whether an independent verifier accepts our output.
+  T t = T.create();
+  Key k = Key.of(ref(KEYGEN, sizeArgOf(2048), u8[0]()));
+  u8[] d = privateExponent(ref);
+  u8[] msg = "a relay identity crosscert, more or less".toBytes();
+  u8[] sig = rsaSignPkcs1(k.n, d, msg, 32);
+  t.eqI32(sig.len(), 256, "a 2048-bit signature is 256 bytes");
+
+  u8[] arg = u8[1 + sig.len()]();
+  arg[0] = 32;
+  for (i32 i = 0; i < sig.len(); i++) { arg[1 + i] = sig[i]; }
+  t.eqI32(ref(VERIFY_PKCS1, arg, msg)[0], 1, "node verifies our signature");
+
+  // And it is a signature over *this* message, not merely a well-formed block. Without this the
+  // test would pass for a signer that ignored its input.
+  t.eqI32(ref(VERIFY_PKCS1, arg, "a different message entirely".toBytes())[0], 0,
+          "node refuses it for a different message");
+
+  // Our own verifier agrees, which is the weak direction and is labelled as such.
+  t.isTrue(rsaVerifyPkcs1(k.n, k.e, msg, sig, 32), "and we verify it ourselves");
+  return t.report();
+}
+
+export string test_a_raw_signature_carries_exactly_the_payload(fn[u8[](i32, u8[], u8[])] ref) {
+  // `rsaSignRawPkcs1` is the one Tor needs: a bare digest in PKCS#1 padding with no DigestInfo.
+  // node cannot verify that with `createVerify`, because there is nothing naming an algorithm — so
+  // the check is `RSA_public_decrypt`, which is the verify primitive and returns the payload.
+  T t = T.create();
+  Key k = Key.of(ref(KEYGEN, sizeArgOf(2048), u8[0]()));
+  u8[] d = privateExponent(ref);
+
+  // Twenty bytes, because that is a SHA-1 digest and SHA-1 is what Tor's older signatures carry.
+  u8[] payload = fill(20, 9);
+  u8[] sig = rsaSignRawPkcs1(k.n, d, payload);
+  t.eqI32(sig.len(), 256, "raw signature is a full modulus wide");
+
+  u8[] got = ref(RECOVER_RAW, sig, u8[0]());
+  t.eqI32(got.len(), payload.len(), "node recovered a payload of the right length");
+  i32 diff = 0;
+  for (i32 i = 0; i < got.len() && i < payload.len(); i++) { diff = diff | (got[i] ^ payload[i]); }
+  t.eqI32(diff, 0, "node recovers exactly the payload we signed");
+
+  // Round trip through our own recover, which is what `packages/tor` will actually call.
+  u8[] mine = rsaRecoverPkcs1(k.n, k.e, sig);
+  t.eqI32(mine.len(), payload.len(), "our recover returns the payload");
+
+  // A 32-byte payload too, since Tor signs SHA-256 digests in newer places.
+  u8[] p32 = fill(32, 4);
+  u8[] got32 = ref(RECOVER_RAW, rsaSignRawPkcs1(k.n, d, p32), u8[0]());
+  t.eqI32(got32.len(), 32, "a 32-byte payload recovers at its own length");
+  return t.report();
+}
+
+export string test_a_forged_block_that_is_wrong_in_one_place_is_refused(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  // The gap `test_pkcs1_refuses_a_block_that_is_not_exact` names above and could not close: its
+  // perturbations turn the whole block to garbage after exponentiation, so every strictness check
+  // refuses and none of them is reached individually. Closing it needs a block that is correct
+  // everywhere *except* one place, which needs the private key to construct — and now there is one.
+  //
+  // This is Bleichenbacher's 2006 forgery in the form that matters here: each block below is what a
+  // lax verifier would accept and a strict one must not.
+  T t = T.create();
+  Key k = Key.of(ref(KEYGEN, sizeArgOf(2048), u8[0]()));
+  u8[] d = privateExponent(ref);
+  i32 emLen = k.n.len();
+  u8[] msg = "the message under all of these".toBytes();
+
+  // The correct block, assembled here rather than taken from `rsaSignPkcs1`, so a bug shared with
+  // the signer cannot make every case below vacuous.
+  u8[] prefix = u8[](0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
+                     0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20);
+  u8[] h = sha256(msg);
+  i32 tLen = prefix.len() + 32;
+
+  u8[] good = u8[emLen]();
+  good[1] = 0x01;
+  i32 padEnd = emLen - tLen - 1;
+  for (i32 i = 2; i < padEnd; i++) { good[i] = 0xFF; }
+  for (i32 i = 0; i < prefix.len(); i++) { good[padEnd + 1 + i] = prefix[i]; }
+  for (i32 i = 0; i < 32; i++) { good[padEnd + 1 + prefix.len() + i] = h[i]; }
+  t.isTrue(rsaVerifyPkcs1(k.n, k.e, msg, signBlock(k.n, d, good), 32),
+           "the hand-built correct block verifies, so the forgeries below mean something");
+  // 1. The digest right, the padding short — the classic. A verifier that scans forward for 0x00
+  //    instead of requiring 0xFF everywhere accepts this.
+  u8[] shortPad = copyOf(good);
+  shortPad[10] = 0x00;
+  t.isFalse(rsaVerifyPkcs1(k.n, k.e, msg, signBlock(k.n, d, shortPad), 32),
+            "a padding run broken early is refused");
+
+  // 2. The block type wrong. 0x02 is the *encryption* block type; accepting it confuses two
+  //    operations that must never be interchangeable.
+  u8[] wrongType = copyOf(good);
+  wrongType[1] = 0x02;
+  t.isFalse(rsaVerifyPkcs1(k.n, k.e, msg, signBlock(k.n, d, wrongType), 32),
+            "block type 0x02 is refused");
+
+  // 3. The leading byte non-zero.
+  u8[] leading = copyOf(good);
+  leading[0] = 0x01;
+  t.isFalse(rsaVerifyPkcs1(k.n, k.e, msg, signBlock(k.n, d, leading), 32),
+            "a non-zero leading byte is refused");
+
+  // 4. The DigestInfo naming a different algorithm, over the same SHA-256 digest. This is the
+  //    substitution the prefix exists to prevent.
+  u8[] wrongAlgo = copyOf(good);
+  wrongAlgo[padEnd + 1 + 14] = 0x02;             // the OID's last byte: sha256 -> sha384
+  t.isFalse(rsaVerifyPkcs1(k.n, k.e, msg, signBlock(k.n, d, wrongAlgo), 32),
+            "a DigestInfo naming the wrong algorithm is refused");
+
+  // 5. The separator missing — 0xFF where the single 0x00 that ends the padding belongs. The run and
+  //    the DigestInfo are both still exactly right, at exactly their offsets, so this is the one
+  //    forgery that no other check can catch: it exists because planting each check away in turn
+  //    showed the separator's was the only one nothing reached.
+  u8[] noSeparator = copyOf(good);
+  noSeparator[padEnd] = 0xFF;
+  t.isFalse(rsaVerifyPkcs1(k.n, k.e, msg, signBlock(k.n, d, noSeparator), 32),
+            "a padding run with no terminator is refused");
+
+  // 6. The digest itself wrong by one bit, everything else exact.
+  u8[] wrongHash = copyOf(good);
+  wrongHash[emLen - 1] = wrongHash[emLen - 1] ^ 1;
+  t.isFalse(rsaVerifyPkcs1(k.n, k.e, msg, signBlock(k.n, d, wrongHash), 32),
+            "a digest wrong in its last bit is refused");
+  return t.report();
+}
+
+/** `em^d mod n`, with no padding of our own — the test builds the block. */
+u8[] signBlock(u8[] n, u8[] d, u8[] em) {
+  Big modulus = fromBytes(n);
+  return toBytes(modPowSecret(fromBytes(em), fromBytes(d), modulus, 2048), n.len());
+}
+
+u8[] copyOf(u8[] src) {
+  u8[] o = u8[src.len()]();
+  for (i32 i = 0; i < src.len(); i++) { o[i] = src[i]; }
+  return o;
 }

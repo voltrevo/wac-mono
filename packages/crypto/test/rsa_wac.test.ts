@@ -4,11 +4,17 @@
 // generated once and reused across the tests that ask for it. The last key generated is
 // also the one the signing modes use, which is why every test asks for its key before it
 // asks for a signature.
-import { createSign, generateKeyPairSync, type KeyPairKeyObjectResult } from "node:crypto";
+import {
+  constants, createSign, createVerify, generateKeyPairSync, publicDecrypt,
+  type KeyPairKeyObjectResult,
+} from "node:crypto";
 import { Buffer } from "node:buffer";
 import { wacTestRun } from "../../../harness/wacTestRun.ts";
 
 const KEYGEN = 0, SIGN_PKCS1 = 1, SIGN_PSS = 2;
+// Added for signing (design/0002 step 1). The wac side can now produce a signature, so the host has
+// to be able to hand over a private exponent and to check what came back.
+const PRIVATE = 3, VERIFY_PKCS1 = 4, RECOVER_RAW = 5;
 // Named outright rather than as `ReturnType<typeof generateKeyPairSync<"rsa">>`: that spelling
 // asks an overloaded function to be instantiated with a type argument, and none of the overloads
 // accepts one, so it fails to type-check. `deno test` type-checks by default, so it fails the
@@ -24,6 +30,14 @@ function parts(bits: number): { n: Uint8Array; e: Uint8Array } {
   return { n: b64(jwk.n), e: b64(jwk.e) };
 }
 
+/** A named JWK field of the current key, as raw big-endian bytes. */
+function jwkPart(field: "n" | "e" | "d"): Uint8Array {
+  const jwk = keys.get(current)!.privateKey.export({ format: "jwk" }) as Record<string, string>;
+  return new Uint8Array(
+    Buffer.from(jwk[field].replace(/-/g, "+").replace(/_/g, "/"), "base64"),
+  );
+}
+
 function ref(mode: number, a: Uint8Array, b: Uint8Array): Uint8Array {
   if (mode === KEYGEN) {
     const bits = (a[0] << 8) | a[1];
@@ -35,6 +49,31 @@ function ref(mode: number, a: Uint8Array, b: Uint8Array): Uint8Array {
     // Length-prefixed, because a callback returns one array and the two halves have
     // different sizes.
     return new Uint8Array([n.length >> 8, n.length & 0xFF, ...n, ...e]);
+  }
+  if (mode === PRIVATE) {
+    // The private exponent of the key most recently generated. Only ever a throwaway key made in this
+    // process — see the timing note at the bottom of `src/rsa.wac`.
+    return jwkPart("d");
+  }
+  if (mode === VERIFY_PKCS1) {
+    // `a` is the hash length then the signature; `b` is the message.
+    const hLen = a[0];
+    const v = createVerify(hLen === 32 ? "sha256" : hLen === 48 ? "sha384" : "sha512");
+    v.update(b);
+    const ok = v.verify(keys.get(current)!.publicKey, a.subarray(1));
+    return new Uint8Array([ok ? 1 : 0]);
+  }
+  if (mode === RECOVER_RAW) {
+    // `RSA_public_decrypt` with PKCS#1 padding is the *verify* primitive: it requires block type 1
+    // and returns the payload. That is exactly the shape `rsaSignRawPkcs1` produces, and node offers
+    // no other way to check a signature with no DigestInfo in it.
+    try {
+      return new Uint8Array(
+        publicDecrypt({ key: keys.get(current)!.publicKey, padding: constants.RSA_PKCS1_PADDING }, a),
+      );
+    } catch {
+      return new Uint8Array(0);          // malformed padding; the wac side asserts on the length
+    }
   }
   const hashLen = a[0];
   const algo = hashLen === 32 ? "sha256" : hashLen === 48 ? "sha384" : "sha512";
