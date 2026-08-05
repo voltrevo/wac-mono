@@ -17,7 +17,35 @@
 import http from "node:http";
 import net from "node:net";
 
-const CASE_TIMEOUT_MS = 60;
+// **A clock may hurry, but it may not decide.** This used to conclude "the parser wants more bytes" by
+// waiting 60 ms and seeing whether llhttp had said anything, which makes the oracle's answer a function
+// of how busy the machine is: under load a *complete* request misses the window, is reported as
+// incomplete, and the differential fails with "llhttp wanted more bytes, wac accepted" against a change
+// that touched neither. Four of the five flakes in wac-mono 0082 are that.
+//
+// The window stays, because it is what keeps this fast — but it no longer produces a verdict. When it
+// fires, the connection is **half-closed** and llhttp is asked directly: a complete message reaches the
+// request handler, a malformed one reaches `clientError`, and one that genuinely needed more bytes
+// reaches `clientError` with an EOF-state code or aborts a request whose headers had already parsed. The
+// answer comes from the parser and the end of the input, so a slow machine costs milliseconds rather
+// than a wrong outcome.
+//
+// Asking *only* at EOF, with no window at all, was the first attempt: correct and forty seconds for
+// `http.test.ts` against three, because some shapes leave node's server holding a half-closed socket
+// until one of its own timeouts. The window is what avoids that.
+// Overridable so a test can set it to zero and prove the point: with no window at all, every case takes
+// the EOF path and the outcomes must be identical. `oracle_clock.test.ts` asserts exactly that, which is
+// the regression test for 0082 — a machine so slow that the window never helps is the same machine as one
+// where the window has been switched off.
+const NUDGE_MS = Number(process.env.WAC_HTTP_ORACLE_NUDGE_MS ?? "60");
+
+// A backstop against a hang, not a decision procedure, and deliberately loud: it records `timeout`,
+// which the TypeScript side throws on. A safety net that silently answers "incomplete" is how the
+// original became a decision.
+const HANG_BACKSTOP_MS = 10_000;
+
+/** llhttp's code for "the input ended in the middle of a message" — the deterministic "incomplete". */
+const EOF_CODES = new Set(["HPE_INVALID_EOF_STATE", "HPE_CB_MESSAGE_COMPLETE", "ECONNRESET"]);
 
 const raw = await new Promise((resolve) => {
   let acc = "";
@@ -55,12 +83,16 @@ const server = http.createServer((req, res) => {
     });
     res.end();
   });
-  req.on("aborted", () => {});
+  // Headers parsed, body cut short by the half-close: incomplete, not an error and not ok.
+  req.on("aborted", () => record(req.socket.remotePort, { outcome: "incomplete" }));
 });
 
 // A malformed message never reaches the request handler; it arrives here instead.
 server.on("clientError", (err, socket) => {
-  record(socket.remotePort, { outcome: "error", code: err.code ?? String(err.message) });
+  const code = err.code ?? String(err.message);
+  // An EOF-state error is not a refusal: it is llhttp saying the message was still open when the input
+  // ended, which is precisely the third outcome. Distinguishing them here is what removes the clock.
+  record(socket.remotePort, EOF_CODES.has(code) ? { outcome: "incomplete" } : { outcome: "error", code });
   socket.destroy();
 });
 
@@ -79,35 +111,45 @@ const port = server.address().port;
 function runCase(i) {
   const bytes = Buffer.from(cases[i], "base64");
   return new Promise((resolve) => {
+    // **Started after the write, not before it.** With the window at zero — which is how a test emulates
+    // a machine too slow for any window to help — a timer created here would race the connect callback
+    // and could half-close before the bytes went out. That is not slowness, it is an empty request, and
+    // the first version of `oracle_clock.test.ts` caught it by reporting a complete `GET` as incomplete.
+    let nudge;
     const socket = net.connect(port, "127.0.0.1", () => {
       byPort.set(socket.localPort, i);
       socket.write(bytes);
+      nudge = setTimeout(() => {
+        if (results[i] !== null) return finish();
+        socket.end();
+      }, NUDGE_MS);
     });
-    const done = () => {
+    const finish = () => {
+      clearTimeout(nudge);
+      clearTimeout(backstop);
       socket.destroy();
       resolve();
     };
-    // The parser has neither accepted nor rejected within the window, so it is waiting for
-    // more input. That is a third answer, not a refusal.
-    const timer = setTimeout(() => {
-      if (results[i] === null) results[i] = { outcome: "incomplete" };
-      done();
-    }, CASE_TIMEOUT_MS);
-    const finish = () => {
-      if (results[i] !== null) {
-        clearTimeout(timer);
-        done();
-      }
-    };
-    socket.on("data", finish);
+    const backstop = setTimeout(() => {
+      if (results[i] === null) results[i] = { outcome: "timeout" };
+      finish();
+    }, HANG_BACKSTOP_MS);
+    // A verdict can arrive as a response written back, as the server closing after `clientError`, or as
+    // the socket ending once the half-close is reciprocated. Whichever comes first, the recorded value
+    // is llhttp's.
+    socket.on("data", () => { if (results[i] !== null) finish(); });
     socket.on("close", () => {
-      clearTimeout(timer);
+      clearTimeout(nudge);
+      clearTimeout(backstop);
+      // Nothing recorded and the connection is over: llhttp said nothing about a message it never
+      // completed, which is the third outcome.
       if (results[i] === null) results[i] = { outcome: "incomplete" };
       resolve();
     });
     socket.on("error", () => {
-      clearTimeout(timer);
-      if (results[i] === null) results[i] = { outcome: "error", code: "SOCKET" };
+      clearTimeout(nudge);
+      clearTimeout(backstop);
+      if (results[i] === null) results[i] = { outcome: "incomplete" };
       resolve();
     });
   });
@@ -123,8 +165,9 @@ function runCase(i) {
  * batch. Reintroducing the index breaks that test immediately.
  *
  * Bounded rather than unlimited: a few hundred simultaneous connects risks the listen backlog and the
- * descriptor limit, and neither failure would look like a parser disagreement. With the timeout
- * dominating, thirty-two turns 110 sequential windows into four.
+ * descriptor limit, and neither failure would look like a parser disagreement. It mattered more when a
+ * 60 ms window per case dominated the run — thirty-two turned 110 sequential windows into four — and it
+ * is kept because the backlog argument stands on its own.
  */
 const CONCURRENCY = 32;
 

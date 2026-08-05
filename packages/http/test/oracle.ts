@@ -19,7 +19,7 @@ export type Outcome =
   | { outcome: "incomplete" };
 
 /** Parse every case with Node. One subprocess for the whole batch. */
-export async function oracle(cases: Uint8Array[]): Promise<Outcome[]> {
+export async function oracle(cases: Uint8Array[], nudgeMs?: number): Promise<Outcome[]> {
   if (cases.length === 0) return [];
   const payload = JSON.stringify(cases.map(toBase64));
   const command = new Deno.Command("node", {
@@ -27,6 +27,10 @@ export async function oracle(cases: Uint8Array[]): Promise<Outcome[]> {
     stdin: "piped",
     stdout: "piped",
     stderr: "piped",
+    // Passed through so a test can shrink the oracle's hurry-up window to nothing — see
+    // `oracle_clock.test.ts`, which is 0082's regression test.
+    env: nudgeMs === undefined ? {} : { WAC_HTTP_ORACLE_NUDGE_MS: String(nudgeMs) },
+    clearEnv: false,
   });
   const child = command.spawn();
   const writer = child.stdin.getWriter();
@@ -36,7 +40,18 @@ export async function oracle(cases: Uint8Array[]): Promise<Outcome[]> {
   if (code !== 0) {
     throw new Error(`the oracle failed: ${new TextDecoder().decode(stderr)}`);
   }
-  return JSON.parse(new TextDecoder().decode(stdout)) as Outcome[];
+  const outcomes = JSON.parse(new TextDecoder().decode(stdout)) as Outcome[];
+  // `timeout` is the oracle's backstop firing, which means a case hung rather than that llhttp had an
+  // opinion. Throwing here is deliberate: the alternative is a mismatch that reads like a parser
+  // disagreement, which is what 0082 was — a clock's answer wearing a verdict's clothes.
+  const hung = outcomes.filter((o) => (o as { outcome: string }).outcome === "timeout").length;
+  if (hung > 0) {
+    throw new Error(
+      `the oracle's backstop fired on ${hung} of ${cases.length} cases: llhttp never decided and the ` +
+        `connection never closed. That is a hang in the oracle, not a parser disagreement.`,
+    );
+  }
+  return outcomes;
 }
 
 function toBase64(bytes: Uint8Array): string {
