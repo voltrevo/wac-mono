@@ -36,6 +36,10 @@ import {
   CERT_TYPE_ONION_ID, KEY_TYPE_ED25519,
 } from "../../src/relaycert.wac";
 import { certCertifiedKey, certType } from "../../src/hsdesc.wac";
+import {
+  edDescriptorDigest, rsaDescriptorDigest, pastLineStarting,
+} from "../../src/routerdesc.wac";
+import { ed25519Verify } from "../../../crypto/src/ed25519.wac";
 
 const i32 V_COUNT = 0;
 const i32 V_NTOR = 1;
@@ -51,6 +55,10 @@ const i32 P_ED_PUBLIC = 10;
 const i32 P_SIGNBIT = 11;
 const i32 P_SIGNATURE = 12;
 const i32 P_MESSAGE = 13;
+const i32 D_TEXT = 14;
+const i32 D_IDENTITY_CERT = 15;
+const i32 D_ROUTER_SIG = 16;
+const i32 D_RSA_RECOVER = 17;
 
 u8[] arg1(i32 i) {
   u8[] a = u8[1]();
@@ -184,5 +192,78 @@ export string test_the_secret_derivation_is_tors(fn[u8[](i32, u8[], u8[])] ref) 
     t.eqI32(ref(V_HOST_VERIFY, edPublic, cert)[0], 1,
             which + ": node verifies the certificate we signed with the derived key");
   }
+  return t.report();
+}
+
+export string test_the_document_digests_are_tors(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(V_COUNT, none(), none())[0];
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] text = ref(D_TEXT, arg1(i), none());
+    u8[] sig = ref(D_ROUTER_SIG, arg1(i), none());
+    string which = "descriptor " + itoa64(i as i64);
+
+    t.eqI32(sig.len(), 64, which + ": router-sig-ed25519 decodes to 64 bytes");
+
+    // `identity-ed25519` is a type-4 certificate whose *certified* key is the signing key. The master
+    // identity is in its extension, and does not sign the descriptor — using it here would be the
+    // natural mistake and would fail for every relay.
+    u8[] signingKey = certCertifiedKey(ref(D_IDENTITY_CERT, arg1(i), none()));
+    t.eqI32(signingKey.len(), 32, which + ": the identity certificate names a signing key");
+
+    // The assertion: tor's signature over tor's document, under our digest rule. If the span or the
+    // prefix or the hash is wrong, this fails — and nothing else here would notice.
+    u8[] digest = edDescriptorDigest(text);
+    t.eqI32(digest.len(), 32, which + ": the ed25519 digest is 32 bytes");
+    t.isTrue(ed25519Verify(signingKey, digest, sig),
+             which + ": tor's router-sig-ed25519 verifies over our digest");
+
+    // Not under the master identity, so the choice of key is pinned too.
+    t.isFalse(ed25519Verify(ref(V_MASTER, arg1(i), none()), digest, sig),
+              which + ": the master identity did not sign the descriptor");
+
+    // The RSA digest, against the payload node recovers from tor's own `router-signature` using the
+    // `signing-key` the descriptor publishes. Length alone would not do: stopping one byte short of
+    // the newline gives a perfectly good 20-byte digest, and that fault survived until this compared
+    // the bytes.
+    u8[] recovered = ref(D_RSA_RECOVER, arg1(i), none());
+    t.eqI32(recovered.len(), 20, which + ": node recovered a SHA-1 digest from router-signature");
+    t.eqBytes(rsaDescriptorDigest(text), recovered,
+              which + ": our RSA digest is the one tor signed");
+  }
+  return t.report();
+}
+
+export string test_a_digest_span_stops_where_tor_stops(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] text = ref(D_TEXT, arg1(0), none());
+
+  // The ed25519 span ends immediately after the keyword and its single space, with no newline. The
+  // easiest wrong answer is to include the signature that follows, and the second easiest is to stop
+  // before the keyword; both are excluded by checking the exact offset.
+  i32 end = pastLineStarting(text, "router-sig-ed25519 ".toBytes());
+  t.isTrue(end > 0, "the keyword is present");
+  t.eqI32(text[end - 1], 32, "the span ends on the space after the keyword");
+  t.neI32(text[end], 10, "the span does not reach the newline");
+
+  i32 rsaEnd = pastLineStarting(text, "router-signature\n".toBytes());
+  t.isTrue(rsaEnd > end, "router-signature comes after router-sig-ed25519");
+  t.eqI32(text[rsaEnd - 1], 10, "the RSA span includes the newline");
+
+  // A keyword that is not at a line start must not match, or a nickname or contact line could move
+  // the span. `pastLineStarting` is given a needle that occurs only mid-line here.
+  t.eqI32(pastLineStarting("aaa\nxrouter-signature\n".toBytes(), "router-signature\n".toBytes()), -1,
+          "a keyword mid-line is not the document's own");
+  t.eqI32(pastLineStarting("router-signature\n".toBytes(), "router-signature\n".toBytes()), 17,
+          "a keyword at the very start matches");
+  t.eqI32(pastLineStarting("nope\n".toBytes(), "router-signature\n".toBytes()), -1,
+          "an absent keyword is -1");
+
+  // An absent keyword must give an empty digest rather than a digest of the whole document.
+  t.eqI32(edDescriptorDigest("router nickname\n".toBytes()).len(), 0,
+          "no keyword, no digest");
+  t.eqI32(rsaDescriptorDigest("router nickname\n".toBytes()).len(), 0,
+          "no keyword, no RSA digest");
   return t.report();
 }
