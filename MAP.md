@@ -4,8 +4,8 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-27 packages, 51,017 lines of wac, 1023 tests,
-26 command-line programs and 4 browser pages.
+28 packages, 51,610 lines of wac, 1035 tests,
+27 command-line programs and 4 browser pages.
 
 ## Packages
 
@@ -29,6 +29,7 @@ In dependency order: nothing here imports anything below it.
 | [`wacc`](packages/wacc/) | Porting the wac compiler to wac, so it can eventually compile itself. | 3,798 | 11 | `bytes` |
 | [`zstd`](packages/zstd/) | Zstandard (RFC 8878) in wac. | 2,690 | 42 | `bytes` |
 | [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, bcrypt_pbkdf, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519, NIST P-256 and P-384, RSA… | 4,942 | 133 | `bignum` |
+| [`fs`](packages/fs/) | A filesystem that belongs to the system rather than to the host. | 593 | 12 | `bytes` `platform` `std` |
 | [`json`](packages/json/) | JSON (RFC 8259) parsing and serialization, written in wac. | 967 | 51 | `bytes` `fmt` `std` |
 | [`sh`](packages/sh/) | A shell, in wac. | 5,858 | 22 | `bytes` `platform` `std` |
 | [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 237 | 16 | `fmt` |
@@ -68,6 +69,7 @@ reach — see `packages/platform/README.md`.
 | `packages/platform/example/waiter.wac` | A program that does not end by itself. |
 | `packages/platform/example/wc.wac` | A word-count application, entire. There is no TypeScript in this directory. |
 | `packages/platform/example/whichever.wac` | Wait on two sockets and report whichever speaks first. |
+| `packages/fs/example/ops.wac` | The same filesystem operations against memory or against the host, so the two can be compared. |
 | `packages/sh/src/sh.wac` | `sh` — the shell as a program, entire, in wac. |
 | `packages/ssh/src/ssh.wac` | `ssh` — the client as a program, entire. There is no TypeScript in this package's `src/`. |
 | `packages/ssh/src/sshd.wac` | `sshd` — an SSH server, entire, in wac. |
