@@ -33,6 +33,8 @@
 // fingerprint.
 
 import { decode as b64decode } from "../../codec/src/base64.wac";
+import { aesCtr } from "../../crypto/src/aesctr.wac";
+import { hsMac } from "./hsntor.wac";
 import { findKeywordLine, keywordValue, pemBlock, certCertifiedKey, certType, slice }
   from "./hsdesc.wac";
 
@@ -228,15 +230,22 @@ export u8[] introduce1Cell(u8[] authKey, u8[] encrypted) {
 }
 
 /**
- * The span an INTRODUCE1's MAC covers: from `AUTH_KEY_TYPE` to the end of `ENCRYPTED_DATA`.
+ * The span an INTRODUCE1's MAC covers: **the whole cell** up to but not including the MAC.
  *
- * "All of the cell from the AUTH_KEY through the end of ENCRYPTED_DATA" — which begins at the
- * AUTH_KEY_TYPE byte, not at the key, and excludes the MAC that is about to be appended. Both ends
- * are easy to get wrong by a few bytes and the result verifies nowhere.
+ * rend-spec-v3 §3.3.2 says "a MAC of all of the cell from the AUTH_KEY through the end of
+ * ENCRYPTED_DATA", which reads as starting at the auth key and skipping the twenty leading zero
+ * bytes of `LEGACY_KEY_ID`. **It does not.** tor's `compute_introduce_mac()` concatenates the
+ * encoded cell — from byte 0, `LEGACY_KEY_ID` included — with `CLIENT_PK | ENCRYPTED_DATA`, and
+ * that is what is on the wire.
+ *
+ * Starting at byte 20 produces a perfectly good MAC that a service rejects with
+ * "Could not get valid INTRO2 keys", which is the only sign you get. Found exactly that way, against
+ * a live service, after every unit test passed — the twenty bytes are zeros, so nothing local
+ * distinguishes the two spans.
  */
 export u8[] introduce1MacInput(u8[] cellSoFar) {
   if (cellSoFar.len() <= 20) { return u8[0](); }
-  return slice(cellSoFar, 20, cellSoFar.len());
+  return cellSoFar;
 }
 
 /**
@@ -262,4 +271,46 @@ export u8[] establishRendezvousCell(u8[] cookie) {
 export u8[] rendezvous2HandshakeInfo(u8[] body) {
   if (body.len() < 64) { return u8[0](); }
   return slice(body, 0, 64);
+}
+
+/**
+ * A complete INTRODUCE1 cell: header, ephemeral key, ciphertext and MAC.
+ *
+ *     ENCRYPTED = CLIENT_PK | ENCRYPTED_DATA | MAC
+ *
+ * with `ENCRYPTED_DATA = AES-256-CTR(ENC_KEY, iv=0) XOR plaintext` and the MAC taken under `MAC_KEY`
+ * over the cell from `AUTH_KEY_TYPE` to the end of the ciphertext. Both keys come from
+ * `clientIntroduceKeys`.
+ *
+ * ## Why this is one function and not three
+ *
+ * The MAC covers a span of the cell that includes the ciphertext but not the MAC itself, so the cell
+ * has to be built twice: once to have something to MAC, once to carry the result. Exposing that as
+ * separate steps would invite a caller to MAC the wrong span — and the wrong span still produces
+ * thirty-two plausible bytes, which an introduction point drops without saying why.
+ *
+ * The IV is sixteen zero bytes. rend-spec-v3 does not say so; tor's `crypto_cipher_new_with_bits`
+ * is AES-CTR with an all-zero IV and that is what is on the wire. It is safe here only because
+ * `ENC_KEY` is derived per handshake from a fresh ephemeral key — reusing this construction with a
+ * fixed key would be keystream reuse.
+ */
+export u8[] buildIntroduce1(
+  u8[] authKey, u8[] encKey, u8[] macKey, u8[] clientPublic, u8[] plaintext
+) {
+  if (authKey.len() != 32 || encKey.len() != 32 || macKey.len() != 32) { return u8[0](); }
+  if (clientPublic.len() != 32 || plaintext.len() == 0) { return u8[0](); }
+
+  u8[] ciphertext = aesCtr(encKey, u8[16](), plaintext);
+  u8[] withoutMac = u8[32 + ciphertext.len()]();
+  for (i32 i = 0; i < 32; i++) { withoutMac[i] = clientPublic[i]; }
+  for (i32 i = 0; i < ciphertext.len(); i++) { withoutMac[32 + i] = ciphertext[i]; }
+
+  u8[] draft = introduce1Cell(authKey, withoutMac);
+  if (draft.len() == 0) { return u8[0](); }
+  u8[] mac = hsMac(macKey, introduce1MacInput(draft));
+
+  u8[] encrypted = u8[withoutMac.len() + 32]();
+  for (i32 i = 0; i < withoutMac.len(); i++) { encrypted[i] = withoutMac[i]; }
+  for (i32 i = 0; i < 32; i++) { encrypted[withoutMac.len() + i] = mac[i]; }
+  return introduce1Cell(authKey, encrypted);
 }

@@ -1,0 +1,438 @@
+// Connect to a v3 onion service and fetch a page from it.
+//
+//   deno task app packages/tor/src/hsconnect.wac --allow-net --allow-read -- \
+//     <seed-file> <authorities-file> <onion-address> <port> [--testnet]
+//
+// The whole onion client. `hsfetch.wac` gets as far as the descriptor; this goes the rest of the
+// way — rendezvous, introduction, and a stream to the service.
+//
+// ## The shape of it, and why there are two circuits
+//
+//   1. **A rendezvous circuit** to a relay we choose, told a 20-byte cookie with
+//      ESTABLISH_RENDEZVOUS. It waits.
+//   2. **An introduction circuit** to one of the service's introduction points, carrying an
+//      INTRODUCE1 cell whose encrypted half names the rendezvous point and that same cookie.
+//   3. The introduction point passes the cell to the service, which builds its *own* circuit to the
+//      rendezvous point and presents the cookie. The rendezvous relay joins the two.
+//   4. RENDEZVOUS2 comes back on the first circuit with the service's half of the handshake, and the
+//      service becomes a fourth hop on it.
+//
+// Two circuits because neither end is willing to be told where the other is. The introduction point
+// learns which service it serves but not where any client meets it; the rendezvous point learns two
+// circuits joined but not whose; the service learns a rendezvous address but not a client. Doing it
+// on one circuit would collapse that.
+//
+// ## What is not here
+//
+// **Client authorisation**, so a service configured with authorised clients will not decrypt.
+//
+// **Retrying a second introduction point.** The descriptor names three; this uses the first that
+// answers and gives up if the handshake then fails. A real client would move on.
+//
+// **Any padding or timing defence.** The two circuits are built back to back on demand, which is a
+// recognisable shape.
+
+import { Core, Cli, FileResult } from "../../platform/src/platform.wac";
+import { Network, Session, bootstrap, buildCircuit, buildCircuitTo } from "./bootstrap.wac";
+import {
+  Link, connectRelay, handshakeTls, linkHandshake, createCircuit, extendTo, sendCells, nextCell,
+  itoa,
+} from "./link.wac";
+import { itoa64 } from "../../wactest/src/itoa64.wac";
+import {
+  Circuit, Received, gotNothing, gotData, gotEnd, gotConnected, gotDestroyed, gotBroken,
+} from "./circuit.wac";
+import {
+  relayRendezvousEstablished, relayIntroduceAck, relayRendezvous2, relayEstablishRendezvous,
+  relayIntroduce1,
+} from "./relay.wac";
+import { Relay } from "./directory.wac";
+import { Vec } from "../../std/src/vec.wac";
+import { onionPubkey } from "./onionaddr.wac";
+import { blindedPublicKey, subcredential } from "./hsblind.wac";
+import {
+  hsdirsForDescriptor, descriptorPath, consensusSharedRandom, consensusTimePeriod, disasterSrv,
+  HSDIR_N_REPLICAS_DEFAULT, HSDIR_SPREAD_FETCH_DEFAULT,
+} from "./hsdir.wac";
+import {
+  decryptLayer, pemBlock, keywordInt, certSignedWithKey, certType, slice,
+  superencryptedConstant, encryptedConstant,
+} from "./hsdesc.wac";
+import {
+  IntroPoint, parseIntroPoints, linkSpecifier, buildIntroduce1, introduce1Plaintext,
+  establishRendezvousCell, rendezvous2HandshakeInfo, LS_IPV4, LS_ED25519_ID,
+} from "./hsintro.wac";
+import {
+  clientIntroduceKeys, clientRendezvousKeys, clientPublicKey, rendezvousCircuitKeys,
+} from "./hsntor.wac";
+import { fetchDescriptor } from "./hsfetch.wac";
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount().wait() < 4) {
+    core.warn("usage: hsconnect <seed-file> <authorities-file> <onion-address> <port> [--testnet]");
+    return 1;
+  }
+  FileResult seedFile = cli.readFile(string.fromBytes(cli.arg(0).wait())).wait();
+  if (!seedFile.ok) { core.warn("tor: " + seedFile.error); return 1; }
+  FileResult authFile = cli.readFile(string.fromBytes(cli.arg(1).wait())).wait();
+  if (!authFile.ok) { core.warn("tor: " + authFile.error); return 1; }
+  u8[] address = cli.arg(2).wait();
+  i32 port = parsePort(string.fromBytes(cli.arg(3).wait()));
+  if (port <= 0) { core.warn("tor: the port must be a positive number"); return 1; }
+
+  bool testnet = false;
+  i32 argc = cli.argCount().wait();
+  for (i32 i = 4; i < argc; i++) {
+    if (string.fromBytes(cli.arg(i).wait()) == "--testnet") { testnet = true; }
+  }
+
+  u8[] identity = onionPubkey(address);
+  if (identity.len() != 32) {
+    core.warn("tor: that is not a v3 onion address");
+    return 1;
+  }
+
+  Network net = bootstrap(core, cli, seedFile.bytes, authFile.bytes, testnet);
+  if (!net.ok) { return 1; }
+
+  u8[] second = fetchDescriptor(core, cli, net, identity, testnet);
+  if (second.len() == 0) { return 1; }
+  IntroPoint[] points = parseIntroPoints(second);
+  if (points.len() == 0) {
+    core.warn("tor: the descriptor names no usable introduction point");
+    return 1;
+  }
+  core.log(itoa(points.len()) + " introduction points");
+
+  // The subcredential again — `fetchDescriptor` needed it to decrypt and the handshake needs it to
+  // authenticate. Recomputed rather than threaded back out, because the period could have rolled
+  // between the two and a stale one should fail the handshake rather than be reused silently.
+  i64[] period = consensusTimePeriod(net.consensus, testnet, 0);
+  u8[] blinded = blindedPublicKey(identity, period[0], period[1]);
+  u8[] subcred = subcredential(identity, blinded);
+
+  return connect(core, cli, net, points, subcred, port, testnet);
+}
+
+/**
+ * Rendezvous, introduce, join, and fetch.
+ *
+ * The rendezvous circuit stays open across the whole exchange — it is the one the service joins — so
+ * it is built first and closed last.
+ */
+i32 connect(Core core, Cli cli, Network net, IntroPoint[] points, u8[] subcred, i32 port,
+            bool testnet) {
+  // ── 1. A rendezvous point, and a cookie only it and the service will see ────
+  u8[] cookie = core.randomBytes(20).wait();
+  Session rend = buildCircuit(core, cli, net, 0, 0x80000020);
+  if (!rend.ok) { core.warn("tor: could not build a rendezvous circuit"); return 1; }
+  core.log("rendezvous circuit: " + rend.description);
+
+  i32 rendRelay = lastHopOf(net, rend.description);
+  if (rendRelay < 0) {
+    core.warn("tor: could not identify the rendezvous relay");
+    cli.closeSocket(rend.link.sock);
+    return 1;
+  }
+
+  sendCells(rend.link, rend.circ.onionCell(relayEstablishRendezvous(), establishRendezvousCell(cookie)));
+  if (!awaitCommand(core, rend.link, rend.circ, relayRendezvousEstablished()).ok) {
+    core.warn("tor: the rendezvous point did not acknowledge the cookie");
+    cli.closeSocket(rend.link.sock);
+    return 1;
+  }
+  core.log("rendezvous established at " + net.relays[rendRelay].nickname);
+
+  // ── 2. An introduction circuit, and the one cell that goes over it ──────────
+  //
+  // Each introduction point in turn. A service publishes three so that any one of them being stale,
+  // unreachable or rotated is survivable, and stopping at the first refusal throws that away — the
+  // refusals are routine: an INTRODUCE_ACK of status 1 means that relay no longer has a circuit for
+  // this service, which happens whenever the service has rotated since the descriptor was written.
+  for (i32 pi = 0; pi < points.len(); pi++) {
+    i32 outcome = introduceVia(core, cli, net, points[pi], subcred, cookie, rendRelay, rend, pi);
+    if (outcome == 0) { break; }
+    if (pi + 1 == points.len()) {
+      core.warn("tor: no introduction point accepted the cell");
+      cli.closeSocket(rend.link.sock);
+      return 1;
+    }
+  }
+  return afterJoin(core, cli, rend, port);
+}
+
+/**
+ * One attempt through one introduction point: build the circuit, send INTRODUCE1, wait for the ACK
+ * and then for the service at the rendezvous point. 0 on success.
+ */
+i32 introduceVia(Core core, Cli cli, Network net, IntroPoint p, u8[] subcred, u8[] cookie,
+                 i32 rendRelay, Session rend, i32 which) {
+  i32 introRelay = relayByEd25519(net, linkSpecifier(p.linkSpecifiers, LS_ED25519_ID));
+  if (introRelay < 0) {
+    core.warn("tor: introduction point " + itoa(which) + " is not a relay in this consensus");
+    return 1;
+  }
+
+  u8[] clientSecret = core.randomBytes(32).wait();
+  u8[] clientPublic = clientPublicKey(clientSecret);
+  u8[] keys = clientIntroduceKeys(p.authKey, p.encKey, clientSecret, subcred);
+  if (keys.len() != 64) {
+    core.warn("tor: the introduction handshake would not start — a degenerate key");
+    return 1;
+  }
+
+  // What the service is told: the cookie, and where to meet.
+  u8[] plaintext = introduce1Plaintext(cookie, net.relays[rendRelay].ntorOnionKey,
+                                       linkSpecifiersFor(net.relays[rendRelay]));
+  if (plaintext.len() == 0) {
+    core.warn("tor: could not describe the rendezvous point");
+    return 1;
+  }
+  u8[] cell = buildIntroduce1(p.authKey, slice(keys, 0, 32), slice(keys, 32, 64),
+                              clientPublic, plaintext);
+  if (cell.len() == 0) {
+    core.warn("tor: could not build the INTRODUCE1 cell");
+    return 1;
+  }
+
+  Session intro = buildCircuitTo(core, cli, net, introRelay, 0x80000021);
+  if (!intro.ok) {
+    core.warn("tor: could not reach the introduction point");
+    return 1;
+  }
+  core.log("introduction circuit: " + intro.description);
+  sendCells(intro.link, intro.circ.onionCell(relayIntroduce1(), cell));
+  Awaited ack = awaitCommand(core, intro.link, intro.circ, relayIntroduceAck());
+  cli.closeSocket(intro.link.sock);
+  if (!ack.ok) {
+    core.warn("tor: the introduction point did not acknowledge the cell");
+    return 1;
+  }
+  // INTRODUCE_ACK's status is two bytes; anything but zero is a refusal with a reason.
+  if (ack.data.len() >= 2 && (ack.data[0] != 0 || ack.data[1] != 0)) {
+    core.warn("tor: the introduction point refused the cell, status " +
+              itoa((ack.data[0] * 256) + ack.data[1]));
+    return 1;
+  }
+  core.log("introduction acknowledged");
+
+  // ── 3. The service arrives at the rendezvous point ──────────────────────────
+  Awaited joined = awaitCommand(core, rend.link, rend.circ, relayRendezvous2());
+  if (!joined.ok) {
+    core.warn("tor: the service never arrived at the rendezvous point");
+    return 1;
+  }
+  u8[] handshake = rendezvous2HandshakeInfo(joined.data);
+  if (handshake.len() != 64) {
+    core.warn("tor: the RENDEZVOUS2 cell is malformed");
+    return 1;
+  }
+
+  u8[] out = clientRendezvousKeys(p.authKey, clientSecret, p.encKey, slice(handshake, 0, 32));
+  if (out.len() != 64) {
+    core.warn("tor: the rendezvous handshake failed");
+    return 1;
+  }
+  // **The service is authenticated here and nowhere else.** Without this comparison the circuit
+  // completes with whoever answered the rendezvous point, which is anybody who guessed the cookie.
+  i32 diff = 0;
+  for (i32 i = 0; i < 32; i++) { diff = diff | (out[i] ^ handshake[32 + i]); }
+  if (diff != 0) {
+    core.warn("tor: the service did not authenticate — AUTH does not match");
+    return 1;
+  }
+  rend.circ.addRendezvousHop(rendezvousCircuitKeys(slice(out, 32, 64)));
+  core.log("joined: the service is hop " + itoa(rend.circ.length()));
+
+  return 0;
+}
+
+/** Once the service is a hop: open a stream to it and read the answer. */
+i32 afterJoin(Core core, Cli cli, Session rend, i32 port) {
+  // ── 4. An ordinary stream, to an extraordinary last hop ─────────────────────
+  // **The address is empty.** A BEGIN cell on a rendezvous circuit carries `":port"` and nothing
+  // else: the service is the far end, so there is no host to name, and tor's
+  // `connection_ap_handshake_send_begin` writes the empty string for any circuit that is not a
+  // general one. Sending `127.0.0.1:port` instead is accepted by nothing and refused silently — the
+  // service simply never answers, which reads as a broken circuit.
+  i32 sid = rend.circ.beginStream();
+  sendCells(rend.link, rend.circ.beginCell(sid, ":" + itoa(port)));
+  u8[] body = readStream(core, rend.link, rend.circ, sid, port);
+  cli.closeSocket(rend.link.sock);
+  if (body.len() == 0) { return 1; }
+  cli.write(body);
+  return 0;
+}
+
+struct Awaited {
+  bool ok;
+  u8[] data;
+}
+
+/**
+ * Read cells until one carries `command`, or the circuit ends.
+ *
+ * Anything else on the way is fed back through `receive` and its SENDMEs sent, so a circuit that
+ * carries data while we are waiting does not stall. A DESTROY or an unrecognised cell ends the wait
+ * rather than looping: both mean this circuit is finished.
+ */
+Awaited awaitCommand(Core core, Link l, Circuit c, i32 command) {
+  while (!l.dead) {
+    u8[] cell = nextCell(l);
+    if (cell.len() == 0) { return Awaited(false, u8[0]()); }
+    Received got = c.receive(cell);
+    if (got.toSend.len() > 0) { sendCells(l, got.toSend); }
+    if (got.kind == gotDestroyed() || got.kind == gotBroken()) { return Awaited(false, u8[0]()); }
+    if (got.command == command) { return Awaited(true, got.data); }
+  }
+  return Awaited(false, u8[0]());
+}
+
+/** A plain HTTP GET over the finished circuit, and whatever comes back. */
+u8[] readStream(Core core, Link l, Circuit c, i32 sid, i32 port) {
+  u8[] raw = u8[0]();
+  bool connected = false;
+  while (!l.dead) {
+    u8[] cell = nextCell(l);
+    if (cell.len() == 0) { break; }
+    Received got = c.receive(cell);
+    if (got.toSend.len() > 0) { sendCells(l, got.toSend); }
+    if (got.kind == gotDestroyed() || got.kind == gotBroken()) { break; }
+    if (got.kind == gotEnd() && !connected) {
+      // A RELAY_END before a RELAY_CONNECTED is the service refusing the stream, and its one byte
+      // says why — tor-spec §6.3. Worth reporting rather than swallowing: 3 is the commonest and
+      // means the service's own target port is not listening, which is a problem at the far end and
+      // not with the circuit that just took four hops to build.
+      core.warn("tor: the service refused the stream, reason " +
+                (got.data.len() > 0 ? itoa(got.data[0]) : "unstated"));
+      break;
+    }
+    if (got.kind == gotConnected() && !connected) {
+      connected = true;
+      sendCells(l, c.dataCell(sid, "GET / HTTP/1.0\r\nConnection: close\r\n\r\n".toBytes()));
+    } else if (got.kind == gotData()) {
+      raw = join(raw, got.data);
+    } else if (got.kind == gotEnd()) {
+      break;
+    }
+  }
+  if (!connected) { core.warn("tor: the service did not open the stream"); }
+  return raw;
+}
+
+u8[] join(u8[] a, u8[] b) {
+  u8[] out = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
+  return out;
+}
+
+/** The relay whose ed25519 identity matches, or −1. */
+i32 relayByEd25519(Network net, u8[] want) {
+  if (want.len() != 32) { return -1; }
+  for (i32 i = 0; i < net.relays.len(); i++) {
+    u8[] have = net.relays[i].ed25519Identity;
+    if (have.len() == 32) {
+      i32 diff = 0;
+      for (i32 j = 0; j < 32; j++) { diff = diff | (have[j] ^ want[j]); }
+      if (diff == 0) { return i; }
+    }
+  }
+  return -1;
+}
+
+/**
+ * The link specifiers describing a relay, for telling the service where to meet.
+ *
+ * IPv4, legacy identity and ed25519 identity — the three rend-spec-v3 says must be present. Built
+ * here rather than copied from a descriptor, because this is *our* choice of rendezvous point and
+ * nobody has described it to us.
+ */
+u8[] linkSpecifiersFor(Relay r) {
+  u8[] ip = parseIpv4(r.address);
+  if (ip.len() != 4 || r.identity.len() != 20 || r.ed25519Identity.len() != 32) { return u8[0](); }
+  u8[] out = u8[1 + 2 + 6 + 2 + 20 + 2 + 32]();
+  i32 at = 0;
+  out[at] = 3;                     // three specifiers
+  at = 1;
+  out[at] = 0;                     // TLS-over-TCP, IPv4
+  out[at + 1] = 6;
+  for (i32 i = 0; i < 4; i++) { out[at + 2 + i] = ip[i]; }
+  out[at + 6] = (r.orPort >> 8) & 0xFF;
+  out[at + 7] = r.orPort & 0xFF;
+  at = at + 8;
+  out[at] = 2;                     // legacy identity
+  out[at + 1] = 20;
+  for (i32 i = 0; i < 20; i++) { out[at + 2 + i] = r.identity[i]; }
+  at = at + 22;
+  out[at] = 3;                     // ed25519 identity
+  out[at + 1] = 32;
+  for (i32 i = 0; i < 32; i++) { out[at + 2 + i] = r.ed25519Identity[i]; }
+  return out;
+}
+
+/** A dotted quad, or empty. Relays in a consensus are addressed by literal, never by name. */
+u8[] parseIpv4(string address) {
+  u8[] text = address.toBytes();
+  u8[] out = u8[4]();
+  i32 part = 0;
+  i32 value = -1;
+  for (i32 i = 0; i <= text.len(); i++) {
+    if (i == text.len() || text[i] == '.') {
+      if (value < 0 || value > 255 || part > 3) { return u8[0](); }
+      out[part] = value;
+      part = part + 1;
+      value = -1;
+    } else if (text[i] >= '0' && text[i] <= '9') {
+      value = (value < 0 ? 0 : value) * 10 + (text[i] - '0');
+      if (value > 255) { return u8[0](); }
+    } else {
+      return u8[0]();
+    }
+  }
+  return (part == 4) ? out : u8[0]();
+}
+
+/** The index of the relay named last in a path description, or −1. */
+i32 lastHopOf(Network net, string description) {
+  string[] parts = splitArrow(description);
+  if (parts.len() == 0) { return -1; }
+  string want = parts[parts.len() - 1];
+  for (i32 i = 0; i < net.relays.len(); i++) {
+    if (net.relays[i].nickname == want) { return i; }
+  }
+  return -1;
+}
+
+string[] splitArrow(string s) {
+  u8[] b = s.toBytes();
+  Vec<string> out = Vec.create();
+  i32 start = 0;
+  for (i32 i = 0; i + 3 < b.len(); i++) {
+    if (b[i] == ' ' && b[i + 1] == '-' && b[i + 2] == '>' && b[i + 3] == ' ') {
+      out.push(sub(b, start, i));
+      start = i + 4;
+      i = i + 3;
+    }
+  }
+  out.push(sub(b, start, b.len()));
+  return out.toArray();
+}
+
+string sub(u8[] b, i32 from, i32 to) {
+  u8[] o = u8[to - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = b[from + i]; }
+  return string.fromBytes(o);
+}
+
+i32 parsePort(string s) {
+  u8[] b = s.toBytes();
+  if (b.len() == 0) { return -1; }
+  i32 v = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return -1; }
+    v = v * 10 + (b[i] - '0');
+    if (v > 65535) { return -1; }
+  }
+  return v;
+}

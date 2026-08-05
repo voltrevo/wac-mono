@@ -21,8 +21,10 @@ import {
 import {
   IntroPoint, parseIntroPoints, linkSpecifiersValid, linkSpecifier,
   introduce1Plaintext, introduce1Cell, introduce1MacInput, establishRendezvousCell,
-  rendezvous2HandshakeInfo, LS_IPV4, LS_LEGACY_ID, LS_ED25519_ID,
+  rendezvous2HandshakeInfo, LS_IPV4, LS_LEGACY_ID, LS_ED25519_ID, buildIntroduce1,
 } from "../../src/hsintro.wac";
+import { hsMac } from "../../src/hsntor.wac";
+import { aesCtr } from "../../../crypto/src/aesctr.wac";
 
 const i32 V_DESCRIPTOR = 0;
 const i32 V_KEYS = 1;         // identity(32) blinded(32) signing(32) subcred(32) revision(8)
@@ -370,11 +372,12 @@ export string test_the_cells_have_the_layout_the_spec_fixes(fn[u8[](i32, u8[], u
   t.eqI32(cell[55], 0, "then no extensions");
   t.isTrue(same(slice(cell, 56, cell.len()), encrypted), "then the encrypted portion");
 
-  // The MAC covers AUTH_KEY_TYPE through the end of the ciphertext — starting at byte 20, not at the
-  // key, and excluding the MAC about to be appended. Both ends are a few bytes from wrong.
+  // The MAC covers the whole cell — see `test_an_introduce1_cell_macs_the_right_span`, where the
+  // twenty leading zero bytes turned out to be included despite what the specification's wording
+  // suggests.
   u8[] macInput = introduce1MacInput(cell);
-  t.eqI32(macInput.len(), cell.len() - 20, "the MAC input skips only LEGACY_KEY_ID");
-  t.eqI32(macInput[0], 2, "it begins at AUTH_KEY_TYPE");
+  t.eqI32(macInput.len(), cell.len(), "the MAC input is the whole cell so far");
+  t.eqI32(macInput[0], 0, "beginning at LEGACY_KEY_ID's first zero byte");
 
   // ESTABLISH_RENDEZVOUS is the cookie and nothing else.
   t.isTrue(same(establishRendezvousCell(cookie), cookie), "ESTABLISH_RENDEZVOUS is just the cookie");
@@ -388,5 +391,63 @@ export string test_the_cells_have_the_layout_the_spec_fixes(fn[u8[](i32, u8[], u
   for (i32 i = 0; i < 64; i++) { rend[i] = (i * 5 + 2) & 0xFF; }
   t.eqI32(rendezvous2HandshakeInfo(rend).len(), 64, "a 64-byte RENDEZVOUS2 body reads");
   t.eqI32(rendezvous2HandshakeInfo(slice(rend, 0, 63)).len(), 0, "a 63-byte one is refused");
+  return t.report();
+}
+
+export string test_an_introduce1_cell_macs_the_right_span(fn[u8[](i32, u8[], u8[])] ref) {
+  // The MAC covers the cell from AUTH_KEY_TYPE to the end of the ciphertext, and not the MAC itself.
+  // Building the cell twice is what makes that possible, and doing it inside one function is what
+  // stops a caller MACing the wrong span — a wrong span still gives thirty-two plausible bytes and
+  // an introduction point that drops the cell without saying why.
+  T t = T.create();
+  u8[] expect = ref(V_INTRO, arg1(0), none());
+  i32 lsLen = (expect[0] * 256) + expect[1];
+  u8[] auth = slice(expect, 2 + lsLen + 64, 2 + lsLen + 96);
+
+  u8[] encKey = u8[32]();
+  u8[] macKey = u8[32]();
+  u8[] clientPub = u8[32]();
+  for (i32 i = 0; i < 32; i++) {
+    encKey[i] = (i * 3 + 1) & 0xFF;
+    macKey[i] = (i * 5 + 2) & 0xFF;
+    clientPub[i] = (i * 7 + 3) & 0xFF;
+  }
+  u8[] plaintext = u8[84]();
+  for (i32 i = 0; i < plaintext.len(); i++) { plaintext[i] = (i * 11) & 0xFF; }
+
+  u8[] cell = buildIntroduce1(auth, encKey, macKey, clientPub, plaintext);
+  t.eqI32(cell.len(), 56 + 32 + plaintext.len() + 32, "the cell is header, key, ciphertext and MAC");
+  t.isTrue(same(slice(cell, 56, 88), clientPub), "the ephemeral public key follows the header");
+
+  // The ciphertext is the plaintext under AES-256-CTR with a zero IV, and is not the plaintext.
+  u8[] ct = slice(cell, 88, 88 + plaintext.len());
+  t.isFalse(same(ct, plaintext), "the payload is encrypted");
+  t.isTrue(same(aesCtr(encKey, u8[16](), ct), plaintext), "and decrypts back under the same key");
+
+  // **The MAC covers the whole cell up to the MAC — LEGACY_KEY_ID included.** rend-spec-v3 says
+  // "from the AUTH_KEY through the end of ENCRYPTED_DATA", which reads as starting twenty bytes in;
+  // tor's `compute_introduce_mac()` starts at byte 0. The twenty bytes are zeros, so nothing local
+  // tells the two apart — this was found against a live service, which answered "Could not get valid
+  // INTRO2 keys" and nothing else. The earlier version of this test asserted the *wrong* span and
+  // passed.
+  u8[] wantMac = slice(cell, cell.len() - 32, cell.len());
+  t.isTrue(same(hsMac(macKey, slice(cell, 0, cell.len() - 32)), wantMac),
+           "the MAC covers the whole cell up to the MAC");
+  t.isFalse(same(hsMac(macKey, slice(cell, 20, cell.len() - 32)), wantMac),
+            "not the span the specification's wording suggests");
+  t.isFalse(same(hsMac(macKey, slice(cell, 23, cell.len() - 32)), wantMac),
+            "and not the span starting at the auth key itself");
+  t.isFalse(same(hsMac(macKey, cell), wantMac), "and not the whole cell including the MAC");
+
+  // Every key changes the cell.
+  u8[] other = u8[32]();
+  for (i32 i = 0; i < 32; i++) { other[i] = macKey[i]; }
+  other[0] = (other[0] ^ 1);
+  t.isFalse(same(buildIntroduce1(auth, encKey, other, clientPub, plaintext), cell),
+            "a different MAC key gives a different cell");
+  t.eqI32(buildIntroduce1(auth, encKey, macKey, clientPub, u8[0]()).len(), 0,
+          "an empty plaintext is refused");
+  t.eqI32(buildIntroduce1(auth, slice(encKey, 0, 31), macKey, clientPub, plaintext).len(), 0,
+          "a short encryption key is refused");
   return t.report();
 }

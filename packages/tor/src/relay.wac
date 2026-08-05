@@ -62,6 +62,19 @@ export i32 relayBeginDir() { return 13; }
 export i32 relayExtend2() { return 14; }
 export i32 relayExtended2() { return 15; }
 
+// The onion-service commands, tor-spec §6.1 and rend-spec-v3. A client sends ESTABLISH_RENDEZVOUS
+// and INTRODUCE1 and receives the three replies; the other two are the service's side of the same
+// conversation and are here so that a cell carrying one is recognisable rather than merely unknown.
+export i32 relayEstablishIntro() { return 32; }
+export i32 relayEstablishRendezvous() { return 33; }
+export i32 relayIntroduce1() { return 34; }
+export i32 relayIntroduce2() { return 35; }
+export i32 relayRendezvous1() { return 36; }
+export i32 relayRendezvous2() { return 37; }
+export i32 relayIntroEstablished() { return 38; }
+export i32 relayRendezvousEstablished() { return 39; }
+export i32 relayIntroduceAck() { return 40; }
+
 /**
  * One hop's cryptographic state: two keystreams and two running digests.
  *

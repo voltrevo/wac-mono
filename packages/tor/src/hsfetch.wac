@@ -74,11 +74,27 @@ export i32 main(Core core, Cli cli) {
   Network net = bootstrap(core, cli, seedFile.bytes, authFile.bytes, testnet);
   if (!net.ok) { return 1; }
 
+  u8[] second = fetchDescriptor(core, cli, net, identity, testnet);
+  if (second.len() == 0) { return 1; }
+  return report(core, cli, second);
+}
+
+/**
+ * Fetch a service's descriptor over circuits and return its **decrypted second layer**.
+ *
+ * Shared with `hsconnect.wac`, which needs the same bytes for a different reason. Everything the
+ * ring depends on comes from `net.consensus` — the consensus that was just verified — rather than
+ * from a fresh fetch, so the relay list and the shared random values cannot come from two different
+ * documents.
+ *
+ * Empty on any failure, having said which one.
+ */
+export u8[] fetchDescriptor(Core core, Cli cli, Network net, u8[] identity, bool testnet) {
   // The ring's inputs, all from the consensus that was just verified rather than from a second one.
   i64[] period = consensusTimePeriod(net.consensus, testnet, 0);
   if (period[0] < 0) {
     core.warn("tor: the consensus has no usable valid-after and fresh-until");
-    return 1;
+    return u8[0]();
   }
   i64 periodNum = period[0];
   i64 periodLength = period[1];
@@ -100,7 +116,7 @@ export i32 main(Core core, Cli cli) {
   u8[] blinded = blindedPublicKey(identity, periodNum, periodLength);
   if (blinded.len() != 32) {
     core.warn("tor: the address does not decode to a curve point");
-    return 1;
+    return u8[0]();
   }
   u8[] subcred = subcredential(identity, blinded);
 
@@ -108,7 +124,7 @@ export i32 main(Core core, Cli cli) {
                                    HSDIR_N_REPLICAS_DEFAULT, HSDIR_SPREAD_FETCH_DEFAULT);
   if (dirs.len() == 0) {
     core.warn("tor: no directory could be placed on the ring — are microdescriptors attached?");
-    return 1;
+    return u8[0]();
   }
   core.log(itoa(dirs.len()) + " responsible directories");
 
@@ -129,58 +145,62 @@ export i32 main(Core core, Cli cli) {
   }
   if (body.len() == 0) {
     core.warn("tor: no responsible directory had a descriptor for this address");
-    return 1;
+    return u8[0]();
   }
   core.log("descriptor: " + itoa(body.len()) + " bytes");
 
-  return report(core, cli, body, blinded, subcred);
+
+  return decryptDescriptor(core, body, blinded, subcred);
 }
 
-/** Decrypt both layers and print what the descriptor names. */
-i32 report(Core core, Cli cli, u8[] body, u8[] blinded, u8[] subcred) {
+/** Check the descriptor is the one we asked for, and decrypt both layers. */
+u8[] decryptDescriptor(Core core, u8[] body, u8[] blinded, u8[] subcred) {
   // The descriptor names its own blinded key in the signing certificate. Checking it against the one
   // we derived is not redundant with the fetch succeeding: an HSDir serves whatever is filed under a
   // key, and this is what says the file it served is the one we asked for.
   u8[] cert = pemBlock(body, "descriptor-signing-key-cert".toBytes(), "ED25519 CERT".toBytes());
   if (certType(cert) != 8) {
     core.warn("tor: the descriptor has no type-8 signing certificate");
-    return 1;
+    return u8[0]();
   }
   u8[] claimed = certSignedWithKey(cert);
   if (claimed.len() != 32) {
     core.warn("tor: the certificate names no blinded key");
-    return 1;
+    return u8[0]();
   }
   for (i32 i = 0; i < 32; i++) {
     if (claimed[i] != blinded[i]) {
       core.warn("tor: the descriptor is signed under a different blinded key than we asked for");
-      return 1;
+      return u8[0]();
     }
   }
 
   i64 revision = keywordInt(body, "revision-counter".toBytes());
   if (revision < 0) {
     core.warn("tor: the descriptor has no revision counter");
-    return 1;
+    return u8[0]();
   }
-
   u8[] outer = pemBlock(body, "superencrypted".toBytes(), "MESSAGE".toBytes());
   u8[] first = decryptLayer(outer, blinded, subcred, revision, superencryptedConstant());
   if (first.len() == 0) {
     core.warn("tor: the first layer did not decrypt — wrong subcredential, or the descriptor is "
               + "for a service with client authorisation, which is not implemented");
-    return 1;
+    return u8[0]();
   }
   u8[] inner = pemBlock(first, "encrypted".toBytes(), "MESSAGE".toBytes());
   u8[] second = decryptLayer(inner, blinded, subcred, revision, encryptedConstant());
   if (second.len() == 0) {
     core.warn("tor: the second layer did not decrypt");
-    return 1;
+    return u8[0]();
   }
+  return second;
+}
 
+
+/** Print what the decrypted descriptor names. */
+i32 report(Core core, Cli cli, u8[] second) {
   IntroPoint[] points = parseIntroPoints(second);
-  core.log("revision " + itoa64(revision) + ", " + itoa(points.len()) +
-           " introduction points");
+  core.log(itoa(points.len()) + " introduction points");
   for (i32 i = 0; i < points.len(); i++) {
     u8[] v4 = linkSpecifier(points[i].linkSpecifiers, LS_IPV4);
     string where = "?";
