@@ -1,0 +1,140 @@
+// Generate a router descriptor and write it to a file, so tor's own parser can judge it.
+//
+// This is the regeneration half of the differential in `test/routerdesc_wac.test.ts`. The suite does
+// not run this: it compares against the descriptor bytes committed as a vector, because a test that
+// needs a built tor tree present turns the shared suite red for whoever does not have one — the
+// mistake `test/ntor_wac.test.ts` documents having made once already.
+//
+//     deno task app:build packages/tor/src/gendesc.wac -o /tmp/gendesc.ts --allow-write
+//     deno run --allow-write /tmp/gendesc.ts /tmp/desc.txt
+//     <parsedesc-probe built against libtor.a> < /tmp/desc.txt
+//
+// Everything is derived from fixed seeds, so the output is reproducible and a change in it is a
+// change in the generator rather than in the weather. RSA-1024 key generation is a prime search and
+// takes a moment; that is the reason this is a tool and the keys are committed with the vector rather
+// than generated inside a test.
+
+import { Core, Cli, Change } from "../../platform/src/platform.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+import { itoa, itoa64 } from "../../fmt/src/itoa.wac";
+import { encode as hexEncode } from "../../codec/src/hex.wac";
+import { generateRsaKey, RsaKey } from "../../crypto/src/rsagen.wac";
+import { RelayInfo, RelayKeys, routerDescriptor } from "./routerdesc.wac";
+
+/** A deterministic 32-byte seed. Distinct per role, so no two keys are the same key. */
+u8[] seedFor(i32 role) {
+  u8[] s = u8[32]();
+  for (i32 i = 0; i < 32; i++) { s[i] = (role * 61 + i * 7 + 3) & 0xFF; }
+  return s;
+}
+
+/** A curve25519 secret has to be clamped; `curve25519ToEd25519Secret` uses it as a scalar unchanged. */
+u8[] ntorSecret() {
+  u8[] s = seedFor(9);
+  s[0] = s[0] & 248;
+  s[31] = s[31] & 127;
+  s[31] = s[31] | 64;
+  return s;
+}
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount().wait() < 1) {
+    core.warn("usage: gendesc <out-path>");
+    return 1;
+  }
+  string out = string.fromBytes(cli.arg(0).wait());
+
+  core.log("gendesc: generating two RSA-1024 keys (a prime search, so this takes a moment)");
+  RsaKey identity = generateRsaKey(1024, seedFor(1));
+  RsaKey onion = generateRsaKey(1024, seedFor(2));
+  if (!identity.ok || !onion.ok) {
+    core.warn("gendesc: RSA key generation failed");
+    return 1;
+  }
+
+  RelayKeys keys = RelayKeys(
+    identity.modulus, identity.publicExponent, identity.privateExponent,
+    onion.modulus, onion.publicExponent, onion.privateExponent,
+    seedFor(3), seedFor(4), ntorSecret());
+
+  // A fixed time rather than the clock, so the document is reproducible. 2026-08-05 12:00:00 UTC,
+  // and a certificate expiry a year past it — certificates count in hours, not seconds.
+  i64 published = 1785931200;
+  RelayInfo info = RelayInfo("wacrelay", "127.0.0.1", 9001, 0, published,
+                             1073741824, 1073741824, 640416,
+                             (published / 3600) + 8760);
+
+  u8[] desc = routerDescriptor(keys, info);
+  if (desc.len() == 0) {
+    core.warn("gendesc: could not build a descriptor");
+    return 1;
+  }
+
+  // Written as the test's vector, not as a bare document: reproducing these bytes needs the private
+  // exponents, and an RSA-1024 prime search is far too slow to run inside the suite. With the keys
+  // committed the test is a byte-for-byte comparison that costs nothing.
+  Change c = cli.writeFile(out, vectorJson(keys, info, desc).toBytes()).wait();
+  if (!c.ok()) {
+    core.warn("gendesc: " + out + ": " + c.message);
+    return 1;
+  }
+  core.log("gendesc: wrote a " + itoa(desc.len()) + "-byte descriptor, with its keys, to " + out);
+  return 0;
+}
+
+/** Lowercase hex, for the key material in the vector. */
+string hex(u8[] b) { return string.fromBytes(hexEncode(b)); }
+
+/**
+ * A JSON string body. The descriptor is ASCII with newlines; quote and backslash are handled anyway
+ * so that a future field cannot silently produce invalid JSON.
+ *
+ * Built through a Buf rather than by concatenating a string per character — 2 KB of `out = out + c`
+ * is 2000 allocations of a growing string, and the byte-oriented version is the shape the rest of
+ * this package uses for documents.
+ */
+string jsonText(u8[] text) {
+  Buf out = Buf.create();
+  for (i32 i = 0; i < text.len(); i++) {
+    i32 c = text[i];
+    if (c == 10) { out.push(92); out.push(110); }
+    else if (c == 34) { out.push(92); out.push(34); }
+    else if (c == 92) { out.push(92); out.push(92); }
+    else { out.push(c); }
+  }
+  return string.fromBytes(out.bytes());
+}
+
+string field(string name, string value) { return "  \"" + name + "\": \"" + value + "\",\n"; }
+
+/**
+ * The vector: every input, and the document they produce.
+ *
+ * Written by this tool rather than by a Python capture script because the private exponents only
+ * exist here — `generateRsaKey` derives them from the seed and nothing else can recover them.
+ */
+string vectorJson(RelayKeys k, RelayInfo info, u8[] desc) {
+  return "{\n" +
+    field("note", "generated by packages/tor/src/gendesc.wac; accepted by tor's " +
+                  "router_parse_entry_from_string") +
+    field("rsaIdentityN", hex(k.rsaIdentityN)) +
+    field("rsaIdentityE", hex(k.rsaIdentityE)) +
+    field("rsaIdentityD", hex(k.rsaIdentityD)) +
+    field("rsaOnionN", hex(k.rsaOnionN)) +
+    field("rsaOnionE", hex(k.rsaOnionE)) +
+    field("rsaOnionD", hex(k.rsaOnionD)) +
+    field("edIdentitySeed", hex(k.edIdentitySeed)) +
+    field("edSigningSeed", hex(k.edSigningSeed)) +
+    field("ntorSecret", hex(k.ntorSecret)) +
+    field("nickname", info.nickname) +
+    field("address", info.address) +
+    "  \"orPort\": " + itoa(info.orPort) + ",\n" +
+    "  \"dirPort\": " + itoa(info.dirPort) + ",\n" +
+    "  \"published\": " + itoa64(info.published) + ",\n" +
+    "  \"bandwidthRate\": " + itoa64(info.bandwidthRate) + ",\n" +
+    "  \"bandwidthBurst\": " + itoa64(info.bandwidthBurst) + ",\n" +
+    "  \"bandwidthObserved\": " + itoa64(info.bandwidthObserved) + ",\n" +
+    "  \"certExpiryHours\": " + itoa64(info.certExpiryHours) + ",\n" +
+    "  \"descriptor\": \"" + jsonText(desc) + "\"\n" +
+    "}\n";
+}

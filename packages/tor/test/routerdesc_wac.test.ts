@@ -61,6 +61,12 @@ const D_SIGNING_N = 24; // a[0]=i: the modulus of the descriptor's own signing-k
 const D_SIGNING_E = 25; // a[0]=i: its public exponent
 const D_SIGNING_KEY_DER = 26; // a[0]=i: the signing-key DER exactly as tor published it
 
+// The descriptor this repo generated and tor accepted — see tools note in src/gendesc.wac.
+const G_KEY = 27; // a[0]=which of the nine key values
+const G_STR = 28; // a[0]=0 nickname, 1 address
+const G_NUM = 29; // a[0]=which number, 8 bytes big-endian
+const G_DESC = 30; // the descriptor itself
+
 const v = JSON.parse(
   await Deno.readTextFile(new URL("data/routerdesc_vectors.json", import.meta.url)),
 ) as {
@@ -100,6 +106,37 @@ if (!v.descriptors.some((d) => d.signbit === 0) || !v.descriptors.some((d) => d.
 }
 
 const hex = (h: string) => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
+
+/**
+ * A router descriptor this repo generated, and the key material that produced it.
+ *
+ * `router_parse_entry_from_string` accepted it, and rejects it if any signature, the certificate
+ * chain or a single body byte is disturbed — so the bytes committed here are a document a real tor
+ * verified. The suite compares against them rather than running tor: a test that needs a built tor
+ * tree present reddens the shared suite for whoever has not got one, which is the mistake
+ * `ntor_wac.test.ts` records having already made once.
+ *
+ * Regenerate with `packages/tor/src/gendesc.wac`, then re-check with `tools/parsedesc-probe.c`.
+ */
+const g = JSON.parse(
+  await Deno.readTextFile(new URL("data/routerdesc_generated.json", import.meta.url)),
+) as Record<string, string | number>;
+
+const G_KEYS = [
+  "rsaIdentityN", "rsaIdentityE", "rsaIdentityD",
+  "rsaOnionN", "rsaOnionE", "rsaOnionD",
+  "edIdentitySeed", "edSigningSeed", "ntorSecret",
+];
+const G_NUMS = [
+  "orPort", "dirPort", "published",
+  "bandwidthRate", "bandwidthBurst", "bandwidthObserved", "certExpiryHours",
+];
+
+const be64 = (v: number) => {
+  const out = new Uint8Array(8);
+  for (let i = 7; i >= 0; i--) out[i] = Math.floor(v / 2 ** (8 * (7 - i))) & 0xff;
+  return out;
+};
 
 // SubjectPublicKeyInfo for Ed25519: SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING }. node will
 // not take a raw 32-byte key, and wrapping it is cheaper than depending on a key-parsing library.
@@ -274,6 +311,14 @@ function ref(what: number, a: Uint8Array, b: Uint8Array): Uint8Array {
       if (!body) return new Uint8Array(0);
       return Uint8Array.from(atob(body.replace(/\s/g, "")), (c) => c.charCodeAt(0));
     }
+    case G_KEY:
+      return hex(g[G_KEYS[a[0]]] as string);
+    case G_STR:
+      return new TextEncoder().encode(g[a[0] === 0 ? "nickname" : "address"] as string);
+    case G_NUM:
+      return be64(g[G_NUMS[a[0]]] as number);
+    case G_DESC:
+      return new TextEncoder().encode(g.descriptor as string);
     default:
       throw new Error(`unknown vector field ${what}`);
   }

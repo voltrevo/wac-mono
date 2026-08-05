@@ -30,7 +30,17 @@ import { Buf } from "../../bytes/src/buf.wac";
 import { ALPHABET_STANDARD, encode } from "../../codec/src/base64.wac";
 import { civilFrom, derConcat, derInteger, derSequence } from "../../tls/src/derwrite.wac";
 import { encodeUpper } from "../../codec/src/hex.wac";
-import { itoa64 } from "../../fmt/src/itoa.wac";
+import { itoa, itoa64 } from "../../fmt/src/itoa.wac";
+import {
+  curve25519ToEd25519Secret, ed25519PublicKey, ed25519PublicKeyExpanded, ed25519Sign,
+  ed25519SignBit,
+} from "../../crypto/src/ed25519.wac";
+import { rsaSignRawPkcs1 } from "../../crypto/src/rsa.wac";
+import { x25519Base } from "../../crypto/src/x25519.wac";
+import {
+  ed25519Cert, ed25519CertExpanded, onionKeyCrosscert,
+  CERT_TYPE_ONION_ID, CERT_TYPE_SIGNING, KEY_TYPE_ED25519,
+} from "./relaycert.wac";
 import { sha1 } from "../../crypto/src/sha1.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
 
@@ -212,3 +222,86 @@ export string spacedFingerprint(u8[] digest) {
   }
   return string.fromBytes(out.bytes());
 }
+
+/**
+ * A complete router descriptor, signed with both keys.
+ *
+ * The order of work is the order the signatures force. Everything up to `router-sig-ed25519 ` is
+ * built first, because that text is inside the ed25519 digest; the signature is appended, then
+ * `router-signature\n`, which is inside the RSA digest, and finally the RSA signature block. Trying
+ * to lay the document out and sign afterwards does not work — there is no gap to write a signature
+ * into that the digest has not already covered.
+ *
+ * Empty if any key is the wrong size or a certificate cannot be built, rather than a document with a
+ * hole in it.
+ */
+export u8[] routerDescriptor(RelayKeys k, RelayInfo info) {
+  u8[] masterPub = ed25519PublicKey(k.edIdentitySeed);
+  u8[] signingPub = ed25519PublicKey(k.edSigningSeed);
+  if (masterPub.len() != 32 || signingPub.len() != 32) { return u8[0](); }
+
+  // The signing certificate: the master identity certifying the key that signs the descriptor, with
+  // itself in extension 4 so a reader who has only the master key can check it.
+  u8[] signingCert = ed25519Cert(CERT_TYPE_SIGNING, info.certExpiryHours, KEY_TYPE_ED25519,
+                                 signingPub, masterPub, k.edIdentitySeed);
+  if (signingCert.len() == 0) { return u8[0](); }
+
+  // The ntor key, and the proposal 228 key derived from it that cross-certifies the identity.
+  u8[] ntorPub = x25519Base(k.ntorSecret);
+  u8[] ntorExpanded = curve25519ToEd25519Secret(k.ntorSecret);
+  u8[] ntorEd = ed25519PublicKeyExpanded(ntorExpanded);
+  u8[] ntorCross = ed25519CertExpanded(CERT_TYPE_ONION_ID, info.certExpiryHours, KEY_TYPE_ED25519,
+                                      masterPub, ntorExpanded);
+  if (ntorCross.len() == 0) { return u8[0](); }
+
+  // The TAP onion key vouching for both identities.
+  u8[] fingerprint = rsaFingerprint(k.rsaIdentityN, k.rsaIdentityE);
+  u8[] onionCross = onionKeyCrosscert(fingerprint, masterPub, k.rsaOnionN, k.rsaOnionD);
+  if (onionCross.len() == 0) { return u8[0](); }
+
+  Buf d = Buf.create();
+  d.pushAll(("router " + info.nickname + " " + info.address + " " + itoa(info.orPort) +
+             " 0 " + itoa(info.dirPort) + "\n").toBytes());
+  d.pushAll("identity-ed25519\n".toBytes());
+  d.pushAll(pemBlock("ED25519 CERT", signingCert));
+  d.pushAll(("master-key-ed25519 " + b64Unpadded(masterPub) + "\n").toBytes());
+  d.pushAll(("platform Tor 0.4.7.13 on Linux\n").toBytes());
+  d.pushAll(("proto " + PROTO_LINE + "\n").toBytes());
+  d.pushAll(("published " + publishedTime(info.published) + "\n").toBytes());
+  d.pushAll(("fingerprint " + spacedFingerprint(fingerprint) + "\n").toBytes());
+  d.pushAll(("bandwidth " + itoa64(info.bandwidthRate) + " " + itoa64(info.bandwidthBurst) +
+             " " + itoa64(info.bandwidthObserved) + "\n").toBytes());
+  d.pushAll("onion-key\n".toBytes());
+  d.pushAll(pemBlock("RSA PUBLIC KEY", rsaPublicKeyDer(k.rsaOnionN, k.rsaOnionE)));
+  d.pushAll("signing-key\n".toBytes());
+  d.pushAll(pemBlock("RSA PUBLIC KEY", rsaPublicKeyDer(k.rsaIdentityN, k.rsaIdentityE)));
+  d.pushAll("onion-key-crosscert\n".toBytes());
+  d.pushAll(pemBlock("CROSSCERT", onionCross));
+  d.pushAll(("ntor-onion-key-crosscert " + itoa(ed25519SignBit(ntorEd)) + "\n").toBytes());
+  d.pushAll(pemBlock("ED25519 CERT", ntorCross));
+  d.pushAll("hidden-service-dir\n".toBytes());
+  d.pushAll(("ntor-onion-key " + b64Unpadded(ntorPub) + "\n").toBytes());
+  d.pushAll("reject *:*\n".toBytes());
+  d.pushAll("tunnelled-dir-server\n".toBytes());
+
+  // The ed25519 signature covers the keyword announcing it, so the keyword goes in first.
+  d.pushAll(edSignatureKeyword());
+  u8[] edDigest = edDescriptorDigest(d.bytes());
+  if (edDigest.len() != 32) { return u8[0](); }
+  d.pushAll((b64Unpadded(ed25519Sign(k.edSigningSeed, edDigest)) + "\n").toBytes());
+
+  // And the RSA signature covers its own keyword line, newline included.
+  d.pushAll(rsaSignatureKeyword());
+  u8[] rsaDigest = rsaDescriptorDigest(d.bytes());
+  if (rsaDigest.len() != 20) { return u8[0](); }
+  u8[] rsaSig = rsaSignRawPkcs1(k.rsaIdentityN, k.rsaIdentityD, rsaDigest);
+  if (rsaSig.len() == 0) { return u8[0](); }
+  d.pushAll(pemBlock("SIGNATURE", rsaSig));
+
+  return d.bytes();
+}
+
+/** The subprotocol versions this implementation claims. */
+const string PROTO_LINE =
+  "Cons=1-2 Desc=1-2 DirCache=1-2 FlowCtrl=1 HSDir=1-2 HSIntro=3-5 HSRend=1-2 Link=1-5 " +
+  "LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-3";

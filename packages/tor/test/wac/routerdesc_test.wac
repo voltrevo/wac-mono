@@ -39,6 +39,7 @@ import { certCertifiedKey, certType } from "../../src/hsdesc.wac";
 import {
   edDescriptorDigest, rsaDescriptorDigest, pastLineStarting, pemBlock, publishedTime,
   spacedFingerprint, b64Unpadded, rsaFingerprint, rsaPublicKeyDer,
+  RelayInfo, RelayKeys, routerDescriptor,
 } from "../../src/routerdesc.wac";
 import { ed25519Verify } from "../../../crypto/src/ed25519.wac";
 
@@ -69,6 +70,10 @@ const i32 D_NTOR_LINE = 23;
 const i32 D_SIGNING_N = 24;
 const i32 D_SIGNING_E = 25;
 const i32 D_SIGNING_KEY_DER = 26;
+const i32 G_KEY = 27;
+const i32 G_STR = 28;
+const i32 G_NUM = 29;
+const i32 G_DESC = 30;
 
 u8[] arg1(i32 i) {
   u8[] a = u8[1]();
@@ -349,4 +354,45 @@ export string test_the_field_formats_are_tors(fn[u8[](i32, u8[], u8[])] ref) {
               which + ": our ntor-onion-key line is tor's");
   }
   return t.report();
+}
+
+export string test_the_descriptor_tor_accepted_is_reproduced(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+
+  RelayKeys k = RelayKeys(
+    ref(G_KEY, arg1(0), none()), ref(G_KEY, arg1(1), none()), ref(G_KEY, arg1(2), none()),
+    ref(G_KEY, arg1(3), none()), ref(G_KEY, arg1(4), none()), ref(G_KEY, arg1(5), none()),
+    ref(G_KEY, arg1(6), none()), ref(G_KEY, arg1(7), none()), ref(G_KEY, arg1(8), none()));
+
+  RelayInfo info = RelayInfo(
+    string.fromBytes(ref(G_STR, arg1(0), none())),
+    string.fromBytes(ref(G_STR, arg1(1), none())),
+    num(ref, 0) as~ i32, num(ref, 1) as~ i32, num(ref, 2),
+    num(ref, 3), num(ref, 4), num(ref, 5), num(ref, 6));
+
+  u8[] want = ref(G_DESC, none(), none());
+  t.isTrue(want.len() > 1500, "the committed descriptor is a whole document");
+
+  // The assertion: tor's own `router_parse_entry_from_string` accepted these exact bytes, and rejects
+  // them if a signature, the certificate chain or one body byte is disturbed. Reproducing them means
+  // reproducing a document a real tor verified — both signatures, all three certificates, and the
+  // proposal 228 crosscert included.
+  t.eqBytes(routerDescriptor(k, info), want, "the descriptor tor accepted is what we build");
+
+  // The document is self-consistent under our own reading of it too, which is worth asserting
+  // separately: it is the part that would still hold if the vector were ever regenerated wrongly.
+  u8[] built = routerDescriptor(k, info);
+  t.eqI32(edDescriptorDigest(built).len(), 32, "the built document has an ed25519 digest");
+  t.eqI32(rsaDescriptorDigest(built).len(), 20, "the built document has an RSA digest");
+  t.isTrue(pastLineStarting(built, "router-signature\n".toBytes()) > 0,
+           "the built document is signed with RSA last");
+  return t.report();
+}
+
+/** An 8-byte big-endian number from the vector. */
+i64 num(fn[u8[](i32, u8[], u8[])] ref, i32 which) {
+  u8[] b = ref(G_NUM, arg1(which), none());
+  i64 v = 0;
+  for (i32 i = 0; i < 8; i++) { v = v * 256 + (b[i] as i64); }
+  return v;
 }
