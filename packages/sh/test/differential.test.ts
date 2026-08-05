@@ -1,3 +1,6 @@
+// Imported for its side effect: retries a spawn that fails with "Text file busy" and names
+// whoever held the file, if anyone did. wac-mono 0074.
+import "../../../harness/spawnRetry.ts";
 // The shell, against bash.
 //
 // Every script here runs through GNU bash and through ours, and the two must agree on standard
@@ -95,6 +98,29 @@ const CASES: string[] = [
   `seq 1 2 x; echo status=$?`,
   `seq -q 1; echo status=$?`,
   `seq -- 3`,
+  // **`nl` numbered blank lines**, which GNU does not (its default body type is `t`), so every input
+  // with a blank line in it came out with different numbers from that point on. An unnumbered line is
+  // padded to the same width — seven spaces, because GNU pads by the number width plus the length of
+  // the separator rather than printing the separator.
+  String.raw`printf 'x\n\ny\n' | nl`,
+  String.raw`printf '\n\n\n' | nl`,
+  String.raw`printf 'a\n\nb\n\n\nc\n' | nl`,
+  // Each of these tools has its own answer about a last line that arrived without a newline, and the
+  // only way to know is to ask: `rev` leaves it off, `nl`, `uniq`, `sort` and `grep` put one on.
+  String.raw`printf 'ab' | rev`,
+  String.raw`printf 'x' | nl`,
+  String.raw`printf 'x' | uniq`,
+  String.raw`printf 'b\na' | sort`,
+  String.raw`printf 'x' | grep x`,
+  // …and its own answer about `-`. `cat`, `nl`, `uniq` and `sort` read standard input for it; GNU's
+  // `rev` treats it as a filename and cannot open it.
+  `printf 'ab\n' | rev -; echo status=$?`,
+  `printf 'a\na\n' | uniq -`,
+  `printf 'b\na\n' | sort -`,
+  // `grep -q` answers on the first match rather than reading the rest, which is the only thing that
+  // can stop the stage feeding it: nothing is written, so a refused write never happens.
+  `seq 1 100000 | grep -q 5; echo status=$?`,
+  `seq 1 100000 | grep -q zzz; echo status=$?`,
   // `cat` as a filter and as a refuser. `cat -Q` used to report "cat: -Q: No such file or directory",
   // which blames whoever typed it for a mistake this program made.
   `seq 1 3 | cat`,
@@ -905,6 +931,16 @@ for (const [i, script] of [
   `printf 'ab\n' > f; rev f`,
   `printf 'a\nb\n' > f; nl f`,
   `printf 'a\nb\n' > f; cat f - < f`,
+  // The operand paths of the five that now stream, including the two orderings of a file that cannot
+  // be opened — `rev` and `nl` report and carry on, `sort` gives up, and the complaint lands *between*
+  // the outputs rather than before them, which needs the output sink flushed first.
+  `printf 'ab\n' > f1; printf 'cd\n' > f2; rev f1 f2`,
+  `printf 'ab\n' > f; rev f missing; echo status=$?`,
+  `printf 'a\nb\n' > f; nl f missing; echo status=$?`,
+  `printf 'a\n\nb\n' > f1; printf '\nc\n' > f2; nl f1 f2`,
+  `printf 'a\na\n' > f; uniq f`,
+  `printf 'b\na\n' > f1; printf 'z\n' > f2; sort f1 f2`,
+  `printf 'b\na\n' > f; sort - f < f`,
   // A file it cannot open is reported and the *rest are still printed*, as GNU does. This used to
   // stop at the first failure, so `cat missing f` printed the complaint and none of `f` — with the
   // right status, which is what made it invisible.

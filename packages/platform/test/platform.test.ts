@@ -10,6 +10,9 @@ import { denoWorld } from "../host/deno.ts";
 import { newBridge } from "../host/layout.ts";
 import { serveHostCalls } from "../host/respond.ts";
 import { hostCall, HostCallError, str, unstr } from "../host/call.ts";
+// Imported for its side effect: retries a spawn that fails with "Text file busy" and names
+// whoever held the file, if anyone did. wac-mono 0074.
+import "../../../harness/spawnRetry.ts";
 
 const WC = "packages/platform/example/wc.wac";
 

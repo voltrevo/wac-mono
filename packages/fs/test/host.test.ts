@@ -10,6 +10,9 @@
 // two parsers, and it is why a divergence here means something.
 
 import { buildApp } from "../../platform/build.ts";
+// Imported for its side effect: retries a spawn that fails with "Text file busy" and names
+// whoever held the file, if anyone did. wac-mono 0074.
+import "../../../harness/spawnRetry.ts";
 
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {

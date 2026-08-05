@@ -361,10 +361,17 @@ writes it afterwards, so a redirected command is bounded by memory however well 
 is that, with `openOutput` named as the capability it wants. `2>` and `2>&1` are not implemented at
 all, and say so.
 
-**Some of the programs still hold their whole input.** `cat`, `wc`, `head` and `tail` stream; `sort`,
-`uniq`, `grep`, `tr`, `nl` and `rev` read all of it before answering, so a large input traps in the
-stage that holds it. `sort` is the one that genuinely cannot stream and should say so rather than trap.
-[Issue 0071](../../issues/open/0071-nine-of-shs-programs-read-all-of-their-input-before-answering.md).
+**The programs stream, and `sort` holds lines rather than bytes.** Each reads a chunk or a line at a
+time: `cat` and `tr` a chunk, `head`, `tail`, `wc`, `rev`, `nl`, `uniq` and `grep` a line — and `grep -q`
+stops at the first match, which is the only thing that can stop the stage feeding it, since nothing is
+written and a refused write never happens. `sort` is the exception and it is a narrow one: it holds every
+line, because that is what sorting is, but as lines in a vector rather than one array of bytes, which is
+the difference between bounded by memory and bounded by one 1.9 GB wasm array. Its insertion sort became
+a bottom-up merge sort at the same time — 100,000 lines took four seconds and now takes one.
+[0071](../../issues/closed/0071-nine-of-shs-programs-read-all-of-their-input-before-answering.md) has the
+table of what each program turned out to be doing wrong, which was three things nobody was looking for:
+`rev` added a newline that was not there, `nl` numbered blank lines, and `rev` took `-` as standard input
+where GNU takes it as a filename.
 
 **Globbing is last-component only.** A pattern in the final path component works; one in a leading
 component does not, because that needs walking every directory that matches.

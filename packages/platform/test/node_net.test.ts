@@ -1,3 +1,6 @@
+// Imported for its side effect: retries a spawn that fails with "Text file busy" and names
+// whoever held the file, if anyone did. wac-mono 0074.
+import "../../../harness/spawnRetry.ts";
 // The Node host's sockets, against the Deno host's, with a real client attached.
 //
 // **This path had no test.** `platform.test.ts` builds the same program for both runtimes and compares
