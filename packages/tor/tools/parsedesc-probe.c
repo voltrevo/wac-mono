@@ -6,7 +6,10 @@
  * reader agree. `router_parse_entry_from_string` is the function a real relay's descriptor has to
  * satisfy, signatures and certificates included, and it needs no network to ask.
  *
- * Reads the descriptor on stdin. Exit 0 and `ACCEPTED` plus a few parsed fields, or exit 1 and
+ * Reads the document on stdin. With no argument it is a router descriptor; `cert` makes it an
+ * authority key certificate, judged by `authority_cert_parse_from_string`.
+ *
+ * Reads the document on stdin. Exit 0 and `ACCEPTED` plus a few parsed fields, or exit 1 and
  * `REJECTED`. Build it the way capture-prop228.py builds its probe — against a configured and built
  * tor tree's libtor.a.
  *
@@ -22,10 +25,12 @@
 #include "core/or/or.h"
 #include "feature/dirparse/routerparse.h"
 #include "feature/nodelist/routerinfo_st.h"
+#include "feature/dirparse/authcert_parse.h"
+#include "feature/nodelist/authority_cert_st.h"
 #include "lib/crypt_ops/crypto_init.h"
 #include "lib/log/log.h"
 
-int main(void) {
+int main(int argc, char **argv) {
   init_logging(1);
   if (crypto_early_init() < 0) { fprintf(stderr, "crypto_early_init failed\n"); return 2; }
 
@@ -33,6 +38,18 @@ int main(void) {
   char *buf = malloc(cap);
   len = fread(buf, 1, cap - 1, stdin);
   buf[len] = 0;
+
+  if (argc > 1 && !strcmp(argv[1], "cert")) {
+    authority_cert_t *cert = authority_cert_parse_from_string(buf, len, NULL);
+    if (!cert) { printf("REJECTED\n"); return 1; }
+    printf("ACCEPTED\n");
+    char fp[HEX_DIGEST_LEN + 1];
+    base16_encode(fp, sizeof(fp), cert->cache_info.identity_digest, DIGEST_LEN);
+    printf("fingerprint %s\n", fp);
+    printf("dir_key_published %ld\n", (long)cert->cache_info.published_on);
+    printf("expires %ld\n", (long)cert->expires);
+    return 0;
+  }
 
   routerinfo_t *ri = router_parse_entry_from_string(buf, NULL, 1, 0, NULL, NULL);
   if (!ri) { printf("REJECTED\n"); return 1; }
