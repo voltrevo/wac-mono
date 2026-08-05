@@ -43,7 +43,7 @@
 // **No directory publication**, so nothing puts this relay in a consensus. A client reaches it by
 // being told, which is what a `Bridge` line is.
 
-import { Core, Cli, Socket, FileResult } from "../../platform/src/platform.wac";
+import { Core, Cli, Socket, FileResult, Change } from "../../platform/src/platform.wac";
 import { Read } from "../../bytes/src/read.wac";
 import { itoa } from "./link.wac";
 import { itoa64 } from "../../wactest/src/itoa64.wac";
@@ -66,7 +66,7 @@ import {
   DESTROY_PROTOCOL,
 } from "./relaycircuit.wac";
 import { Hop } from "./relay.wac";
-import { rsaFingerprint } from "./routerdesc.wac";
+import { RelayInfo, RelayKeys, routerDescriptor, rsaFingerprint } from "./routerdesc.wac";
 import {
   cellSize, cellCommand, cellCircId, cellPayload, cmdVersions, cmdNetinfo, cmdCreate2, cmdRelay,
   cmdRelayEarly, cmdPadding, cmdDestroy, cmdCreateFast,
@@ -182,10 +182,47 @@ u8[] clampScalar(u8[] s) {
   return out;
 }
 
+/**
+ * The TAP onion key, from the same seed, derived only when a descriptor is wanted.
+ *
+ * Not part of `deriveIdentity` on purpose: serving costs nothing without it — CREATE2 uses the
+ * curve25519 ntor key and CREATE_FAST uses no key at all — while generating it is a second RSA-1024
+ * prime search, and a relay that never publishes would pay for it at every start. A relay that *does*
+ * publish needs it, because `onion-key` and `onion-key-crosscert` are not optional in a descriptor.
+ */
+export RsaKey deriveTapOnionKey(u8[] seed) {
+  if (seed.len() != 32) { return RsaKey(false, u8[0](), u8[0](), u8[0](), u8[0](), u8[0]()); }
+  return generateRsaKey(1024, tweak(seed, 6));
+}
+
+/**
+ * The relay's own descriptor: the document an authority publishes about it.
+ *
+ * The keys are the ones this relay actually serves with, which is the whole point — a descriptor
+ * generated from separate key material describes a relay that does not exist, and a client that
+ * believed it would connect somewhere and find the wrong identity.
+ */
+export u8[] ownDescriptor(
+  Identity id, RsaKey tap, string nickname, string address, i32 orPort, i64 now
+) {
+  if (!id.ok || !tap.ok) { return u8[0](); }
+  RelayKeys keys = RelayKeys(
+    id.rsaModulus, id.rsaExponent, id.rsaPrivate,
+    tap.modulus, tap.publicExponent, tap.privateExponent,
+    id.edIdentitySeed, id.edSigningSeed, id.onionPrivate);
+  // A descriptor's certificates expire in hours; this window is the same 48 the TLS certificate uses,
+  // so a relay's papers all go stale together rather than one at a time.
+  RelayInfo info = RelayInfo(nickname, address, orPort, 0, now,
+                             1073741824, 1073741824, 640416, (now / 3600) + 48);
+  return routerDescriptor(keys, info);
+}
+
 export i32 main(Core core, Cli cli) {
   i32 port = 9001;
   string bind = "127.0.0.1";
   string seedPath = "";
+  string descriptorOut = "";
+  string nickname = "wacrelay";
   i32 argc = cli.argCount().wait();
   for (i32 i = 0; i < argc; i++) {
     string a = string.fromBytes(cli.arg(i).wait());
@@ -195,12 +232,19 @@ export i32 main(Core core, Cli cli) {
     } else if (a == "-a" && i + 1 < argc) {
       bind = string.fromBytes(cli.arg(i + 1).wait());
       i = i + 1;
+    } else if (a == "--descriptor" && i + 1 < argc) {
+      descriptorOut = string.fromBytes(cli.arg(i + 1).wait());
+      i = i + 1;
+    } else if (a == "-n" && i + 1 < argc) {
+      nickname = string.fromBytes(cli.arg(i + 1).wait());
+      i = i + 1;
     } else if (seedPath == "") {
       seedPath = a;
     }
   }
   if (seedPath == "") {
-    core.warn("usage: relayd <seed-file> [-p port] [-a address]");
+    core.warn("usage: relayd <seed-file> [-p port] [-a address] [-n nickname] " +
+              "[--descriptor path]");
     return 1;
   }
 
@@ -228,6 +272,26 @@ export i32 main(Core core, Cli cli) {
   }
   core.log("relayd: fingerprint " + hex(id.fingerprint));
   core.log("relayd: ntor onion key " + hex(x25519Base(id.onionPrivate)));
+
+  // `--descriptor` writes what an authority should publish about this relay and exits. Separate from
+  // serving because the authority needs the document before the relay is useful, and because the
+  // second prime search should not be paid by a relay that is only serving.
+  if (descriptorOut != "") {
+    core.log("relayd: deriving the TAP onion key a descriptor needs (another moment)");
+    RsaKey tap = deriveTapOnionKey(seed);
+    u8[] desc = ownDescriptor(id, tap, nickname, bind, port, now);
+    if (desc.len() == 0) {
+      core.warn("relayd: could not build a descriptor");
+      return 1;
+    }
+    Change wrote = cli.writeFile(descriptorOut, desc).wait();
+    if (!wrote.ok()) {
+      core.warn("relayd: " + descriptorOut + ": " + wrote.message);
+      return 1;
+    }
+    core.log("relayd: wrote a " + itoa(desc.len()) + "-byte descriptor to " + descriptorOut);
+    return 0;
+  }
 
   u8[] certs = identityCerts(id, now);
   if (certs.len() == 0) {

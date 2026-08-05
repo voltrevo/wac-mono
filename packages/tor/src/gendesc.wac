@@ -14,7 +14,7 @@
 // takes a moment; that is the reason this is a tool and the keys are committed with the vector rather
 // than generated inside a test.
 
-import { Core, Cli, Change } from "../../platform/src/platform.wac";
+import { Core, Cli, Change, FileResult } from "../../platform/src/platform.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { itoa, itoa64 } from "../../fmt/src/itoa.wac";
 import { encode as hexEncode } from "../../codec/src/hex.wac";
@@ -132,8 +132,23 @@ export i32 main(Core core, Cli cli) {
     // this run produced, so the whole set is consistent and reproducible from the same seeds.
     if (cli.argCount().wait() >= 3) {
       string voteOut = string.fromBytes(cli.arg(2).wait());
+      // A sixth argument names a descriptor to vote about instead of the one generated here. That is
+      // what makes the documents describe a relay that *exists*: `relayd --descriptor` writes the one
+      // for the keys it actually serves with, and an authority voting about anything else describes a
+      // relay a client would connect to and find the wrong identity at.
+      u8[] subject = desc;
+      if (cli.argCount().wait() >= 6) {
+        string subjectPath = string.fromBytes(cli.arg(5).wait());
+        FileResult sf = cli.readFile(subjectPath).wait();
+        if (!sf.ok) {
+          core.warn("gendesc: " + subjectPath + ": " + sf.error);
+          return 1;
+        }
+        subject = sf.bytes;
+        core.log("gendesc: voting about the relay described in " + subjectPath);
+      }
       RelayOpinion[] relays = RelayOpinion[1]();
-      relays[0] = RelayOpinion(desc, "Exit Fast Guard HSDir Running Stable V2Dir Valid",
+      relays[0] = RelayOpinion(subject, "Exit Fast Guard HSDir Running Stable V2Dir Valid",
                                640416, "reject 1-65535");
       VoteInfo vi = VoteInfo("wacauth", "127.0.0.1", "127.0.0.1", 7000, 5000,
                              "agent-b@wac-mono", published, published + window,
