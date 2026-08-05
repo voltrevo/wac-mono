@@ -150,6 +150,16 @@ export struct Shell {
   /** Whether the read below has already happened. `readStdin` answers once and is empty after. */
   bool triedStdin;
   /**
+   * Whether `stdinBytes` is the shell's *own* — a here-document, a redirection, a pipeline stage's
+   * output — rather than the process's standard input.
+   *
+   * It decides whether a spawned command may inherit the real stream or must be *sent* what is left.
+   * Without it `{ read a; cat; } <<EOF` printed nothing where bash prints the rest: the here-document
+   * filled `stdinBytes` without touching `triedStdin`, so the child was handed a descriptor that had
+   * never held those bytes, read the process's empty input, and reported success. wac-mono 0066.
+   */
+  bool heldInput;
+  /**
    * Where this shell believes it is.
    *
    * The shell's own, not the host's: `packages/platform` has a `cwd` to *read* and deliberately
@@ -168,7 +178,7 @@ export struct Shell {
     return Shell(core, cli, Map.create(hashString, stringEq), 0, false, 0, Buf.create(),
                  false, Buf.create(), noExternal, noExternalNames, false, Vec.create(),
                  Map.create(hashString, stringEq),
-                 Vec.create(), Vec.create(), false, u8[0](), 0, false, false,
+                 Vec.create(), Vec.create(), false, u8[0](), 0, false, false, false,
                  cli.cwd().wait());
   }
 
@@ -652,10 +662,12 @@ u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
   // makes `while read x; do …; done < file` advance through the file instead of restarting it.
   u8[] savedIn = sh.stdinBytes;
   i32 savedPos = sh.stdinPos;
+  bool savedHeld = sh.heldInput;
   bool ownInput = stdin.len() > 0;
   if (ownInput) {
     sh.stdinBytes = stdin;
     sh.stdinPos = 0;
+    sh.heldInput = true;
   }
   for (i32 i = 0; i < cmd.redirs.len(); i++) {
     Redir r = cmd.redirs.get(i);
@@ -672,11 +684,13 @@ u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
         }
         sh.stdinBytes = f.bytes;
         sh.stdinPos = 0;
+        sh.heldInput = true;
         ownInput = true;
       }
       case Here: {
         sh.stdinBytes = hereBody(sh, r);
         sh.stdinPos = 0;
+        sh.heldInput = true;
         ownInput = true;
       }
       else: {}
@@ -754,6 +768,7 @@ u8[] runCommand(Shell sh, Command cmd, u8[] stdin, bool last) {
   if (ownInput) {
     sh.stdinBytes = savedIn;
     sh.stdinPos = savedPos;
+    sh.heldInput = savedHeld;
   }
 
   if (!collect) { return u8[0](); }
@@ -874,9 +889,11 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
   // `read`'s own advance through it, and `while read` would never reach the end.
   u8[] savedIn = sh.stdinBytes;
   i32 savedPos = sh.stdinPos;
+  bool savedHeld = sh.heldInput;
   if (hasInput) {
     sh.stdinBytes = input;
     sh.stdinPos = 0;
+    sh.heldInput = true;
   }
   // **Whether a spawned command may take the shell's own standard input rather than a copy of it.**
   //
@@ -888,11 +905,16 @@ u8[] runSimple(Shell sh, Simple cmd, u8[] stdin, bool last) {
   // Anything the shell runs itself still takes what is left: `read a; cat` gives `cat` the remainder,
   // and once `read` has pulled the input in, `mayInherit` is false for everything after it — the bytes
   // are the shell's by then, and handing over a descriptor already drained would lose them.
-  bool mayInherit = !hasInput && sh.ownsStdin && !sh.triedStdin;
+  // …and not when the shell is holding bytes of its own. A here-document on an *enclosing* compound is
+  // the case that was missed: `{ read a; cat; } <<EOF` filled `stdinBytes` without touching
+  // `triedStdin`, so this said "inherit" and the child read the process's empty input instead of the
+  // two lines the shell had left. wac-mono 0066.
+  bool mayInherit = !hasInput && !sh.heldInput && sh.ownsStdin && !sh.triedStdin;
   Output result = dispatch(sh, argv, mayInherit);
   if (hasInput) {
     sh.stdinBytes = savedIn;
     sh.stdinPos = savedPos;
+    sh.heldInput = savedHeld;
   }
 
   // Put the prefix assignments back before anything else looks at them. Done even when the

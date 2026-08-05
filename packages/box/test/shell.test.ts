@@ -240,3 +240,45 @@ Deno.test("...and an inherited input streams rather than being read into memory 
   assertEquals(out, "y\n", new TextDecoder().decode(r.stderr));
   assertEquals(took < 15_000, true, `${took} ms — reading all of an endless input would never finish`);
 });
+
+Deno.test("a spawned command gets what the shell has left of its input, not the process's — 0066", async () => {
+  // The bug: a here-document on an *enclosing compound* filled the shell's input without touching the
+  // flag that says "the process's stream has been drained", so `mayInherit` said yes and the child was
+  // handed a descriptor that had never held those bytes. It read the process's empty input and reported
+  // success. Called in process the same script is right, which is why only a *spawning* shell shows it —
+  // and `packages/sh`'s own twelve are called, so this is the shell that can.
+  //
+  // bash is the oracle for every case, including the two that must keep inheriting.
+  const cases: [string, string][] = [
+    ["a here-document into a compound, after a read",
+      "{ read a; cat; } <<EOF\none\ntwo\nthree\nEOF"],
+    ["a here-document into a compound", "{ cat; } <<EOF\nheld\nEOF"],
+    ["a here-document into the command itself", "cat <<EOF\nonly\nEOF"],
+    ["a pipeline into a compound, after a read", `printf 'a\nb\nc\n' | { read x; cat; }`],
+    ["a redirection into a compound, after a read",
+      `printf 'p\nq\n' > in.txt; { read a; cat; } < in.txt`],
+    ["an empty here-document gives the child nothing, rather than the terminal",
+      "{ cat; } <<EOF\nEOF"],
+  ];
+  for (const [what, script] of cases) {
+    const ours = await sh(script);
+    const theirs = new Deno.Command("bash", {
+      args: ["-c", script],
+      cwd: dir,
+      stdin: "null",
+      stdout: "piped",
+      stderr: "null",
+      env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+      clearEnv: true,
+    }).outputSync();
+    assertEquals(ours.out, new TextDecoder().decode(theirs.stdout), `${what}: ${script}`);
+  }
+
+  // And the inheriting cases still inherit, which is the property the flag must not break: a child
+  // reading the *real* stream sees what a previous child left, because it is one descriptor and not a
+  // copy. Issue 0042.
+  const shared = await sh("cat; cat", "one\ntwo\n");
+  assertEquals(shared.out, "one\ntwo\n", shared.err);
+  const piped = await sh("cat", "through\n");
+  assertEquals(piped.out, "through\n", piped.err);
+});
