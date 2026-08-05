@@ -161,6 +161,29 @@ export u8[] ed25519CertExpanded(
 }
 
 /**
+ * `onion-key-crosscert`: the TAP onion key signing the two identities it is published under.
+ *
+ * 52 bytes are signed — SHA-1 of the DER `RSAPublicKey` identity (what `rsaFingerprint` returns),
+ * then the 32-byte ed25519 identity — with PKCS#1 padding and **no DigestInfo**. That is what tor's
+ * `crypto_pk_private_sign` does, and it matters because a verifier recovers the payload with a public
+ * key operation and compares it: a DigestInfo wrapper would make the recovered bytes 15 longer and
+ * the comparison would fail without indicating why.
+ *
+ * Signed by the *onion* key rather than the identity key. The direction is the point — a relay
+ * proves that whoever holds the onion key agrees to the identity it is advertised under, which is
+ * the opposite direction from the type-7 cross-certificate above.
+ */
+export u8[] onionKeyCrosscert(
+  u8[] rsaIdentityDigest, u8[] ed25519Identity, u8[] onionModulus, u8[] onionPrivate
+) {
+  if (rsaIdentityDigest.len() != 20 || ed25519Identity.len() != 32) { return u8[0](); }
+  u8[] payload = u8[52]();
+  for (i32 i = 0; i < 20; i++) { payload[i] = rsaIdentityDigest[i]; }
+  for (i32 i = 0; i < 32; i++) { payload[20 + i] = ed25519Identity[i]; }
+  return rsaSignRawPkcs1(onionModulus, onionPrivate, payload);
+}
+
+/**
  * Append a signature to a certificate body.
  *
  * "The signature is formed by signing the first N-64 bytes of the certificate" — the whole thing
