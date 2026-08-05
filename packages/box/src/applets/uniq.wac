@@ -8,7 +8,7 @@ import { Args, has } from "../lib/args.wac";
 import { Input, openStream } from "../lib/input.wac";
 import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
 import { cmpBytes } from "../lib/lines.wac";
-import { itoa } from "../lib/num.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
 
 export i32 uniq(Core core, Cli cli, Args a) {
   Input in = openStream(core, cli, a, 0);

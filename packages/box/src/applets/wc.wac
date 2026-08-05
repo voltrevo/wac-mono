@@ -7,7 +7,7 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
 import { Chunk, Input, openStream, nextChunk } from "../lib/input.wac";
-import { itoa } from "../lib/num.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
 
 export i32 wc(Core core, Cli cli, Args a) {
   Input in = openStream(core, cli, a, 0);

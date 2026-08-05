@@ -24,6 +24,11 @@ import { Buf } from "../../bytes/src/buf.wac";
 import { Cli, FAULT_DENIED, FAULT_NOT_EMPTY, FAULT_NOT_FOUND, FileResult }
   from "../../platform/src/platform.wac";
 import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../platform/src/stream.wac";
+// One implementation of each, in the package whose job it is. This file had its own `itoa` and
+// `atoi`: the `itoa` answered `"-"` for i32's minimum, because negating it wraps back to itself and
+// the digit loop never ran — so `echo $((-2147483648))` printed a bare minus sign where bash prints
+// the number. Three other copies existed, and the correct one was already in `fmt`. wac-mono 0072.
+import { atoi, itoa, itoa64 } from "../../fmt/src/itoa.wac";
 
 export struct Output {
   u8[] out;
@@ -768,17 +773,17 @@ i32 wc(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
   Vec<string> names = inputsOf(o.operands);
   Buf err = Buf.create();
   i32 status = 0;
-  i32 allLines = 0;
-  i32 allWords = 0;
-  i32 allBytes = 0;
+  i64 allLines = 0;
+  i64 allWords = 0;
+  i64 allBytes = 0;
   bool anyStdin = false;
 
   // Counted first, printed second, because the width of the columns depends on the total — see
   // `countWidth`. GNU knows the total in advance from the sizes on disk; the only way to know it here
   // is to have read them, and every input is read whole on this path anyway.
-  Vec<i32> eachLines = Vec.create();
-  Vec<i32> eachWords = Vec.create();
-  Vec<i32> eachBytes = Vec.create();
+  Vec<i64> eachLines = Vec.create();
+  Vec<i64> eachWords = Vec.create();
+  Vec<i64> eachBytes = Vec.create();
   Vec<string> eachName = Vec.create();
 
   for (i32 f = 0; f < names.len(); f++) {
@@ -789,8 +794,8 @@ i32 wc(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
       status = 1;
       continue;
     }
-    i32 lines = 0;
-    i32 words = 0;
+    i64 lines = 0;
+    i64 words = 0;
     bool inWord = false;
     for (i32 i = 0; i < r.bytes.len(); i++) {
       i32 c = r.bytes[i];
@@ -801,10 +806,10 @@ i32 wc(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
     }
     allLines += lines;
     allWords += words;
-    allBytes += r.bytes.len();
+    allBytes += r.bytes.len() as i64;
     eachLines.push(lines);
     eachWords.push(words);
-    eachBytes.push(r.bytes.len());
+    eachBytes.push(r.bytes.len() as i64);
     eachName.push(r.name);
   }
 
@@ -830,14 +835,18 @@ i32 wc(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
  * the bug would be silent — `wc -w` over a pipe would count *more* words the smaller the chunks got.
  */
 i32 wcStream(Feed fed, Sink sink, bool wantLines, bool wantWords, bool wantBytes) {
-  i32 lines = 0;
-  i32 words = 0;
-  i32 bytes = 0;
+  // **i64, because a stream has no size limit.** These were i32 and nothing said so: 2.6 GB through a
+  // pipe answered `-1306078398`, a negative byte count, quietly. That became reachable the moment `wc`
+  // started streaming — before, an input that large trapped long before it could be miscounted, and a
+  // trap is a better wrong answer than a negative one. wac-mono 0072.
+  i64 lines = 0;
+  i64 words = 0;
+  i64 bytes = 0;
   bool inWord = false;
   while (true) {
     u8[] chunk = fed.next();
     if (chunk.len() == 0) { break; }
-    bytes += chunk.len();
+    bytes += chunk.len() as i64;
     for (i32 i = 0; i < chunk.len(); i++) {
       i32 c = chunk[i];
       if (c == 10) { lines++; }
@@ -871,10 +880,10 @@ i32 wcStream(Feed fed, Sink sink, bool wantLines, bool wantWords, bool wantBytes
  * `wc` that answered differently depending on whether the shell could spawn would be worse than one
  * that is consistently narrower than GNU. `packages/sh/README.md` records it.
  */
-i32 countWidth(i32 columns, bool sizeKnown, i32 totalBytes) {
+i32 countWidth(i32 columns, bool sizeKnown, i64 totalBytes) {
   if (columns < 2) { return 1; }
   if (!sizeKnown) { return 7; }
-  i32 width = itoa(totalBytes).len();
+  i32 width = itoa64(totalBytes).len();
   return width < 1 ? 1 : width;
 }
 
@@ -883,11 +892,11 @@ i32 countWidth(i32 columns, bool sizeKnown, i32 totalBytes) {
  *
  * `countWidth` decides the width and says why it is what it is.
  */
-string countLine(bool l, bool w, bool c, i32 lines, i32 words, i32 bytes, string name, i32 width) {
+string countLine(bool l, bool w, bool c, i64 lines, i64 words, i64 bytes, string name, i32 width) {
   string s = "";
-  if (l) { s = rightAlign(itoa(lines), width); }
-  if (w) { s = (s == "" ? "" : s + " ") + rightAlign(itoa(words), width); }
-  if (c) { s = (s == "" ? "" : s + " ") + rightAlign(itoa(bytes), width); }
+  if (l) { s = rightAlign(itoa64(lines), width); }
+  if (w) { s = (s == "" ? "" : s + " ") + rightAlign(itoa64(words), width); }
+  if (c) { s = (s == "" ? "" : s + " ") + rightAlign(itoa64(bytes), width); }
   if (name != "") { s = s + " " + name; }
   return s + "\n";
 }
@@ -1974,27 +1983,4 @@ u8[] sliceOf(u8[] s, i32 from, i32 to) {
   return out;
 }
 
-export string itoa(i32 v) {
-  if (v == 0) { return "0"; }
-  bool negative = v < 0;
-  i32 x = negative ? -v : v;
-  string out = "";
-  while (x > 0) {
-    out = string.fromCodepoint(0x30 + (x % 10)) + out;
-    x = x / 10;
-  }
-  return negative ? "-" + out : out;
-}
 
-export i32 atoi(string s) {
-  i32 v = 0;
-  bool negative = false;
-  i32 start = 0;
-  if (s.len() > 0 && s.slice(0, 1) == "-") { negative = true; start = 1; }
-  for (i32 i = start; i < s.len(); i++) {
-    u8[] b = s.slice(i, i + 1).toBytes();
-    if (b.len() != 1 || b[0] < 0x30 || b[0] > 0x39) { return 0; }
-    v = v * 10 + (b[0] - 0x30);
-  }
-  return negative ? -v : v;
-}

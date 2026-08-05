@@ -14,7 +14,7 @@
 
 import { Cli, Core, FileResult, Stat, Socket } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
-import { itoa, itoa64 } from "../lib/num.wac";
+import { itoa, itoa64 } from "../../../fmt/src/itoa.wac";
 import { concat, slice } from "../lib/bytes.wac";
 import { Parsed, Request, parseRequest } from "../../../http/src/request.wac";
 import { Response, write as writeResponse } from "../../../http/src/response.wac";

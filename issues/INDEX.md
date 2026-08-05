@@ -5,10 +5,10 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0075](open/0075-the-test-worker-cap-is-a-guess-and-needs-a-quiet-machine-to-set.md) | the test worker cap is a guess, and needs a quiet machine to set | performance | not implemented |
 | [0073](open/0073-a-killed-test-run-leaves-its-sshd-behind-and-thirty-were-running.md) | a killed test run leaves its `sshd` behind, and thirty were running | bug | wrong answer |
 | [0072](open/0072-wcs-counts-are-i32-so-above-2-gb-they-go-negative.md) | `wc`'s counts are i32, so above 2 GB they go negative | bug | wrong answer |
 | [0070](open/0070-a-redirection-collects-a-childs-whole-output-before-writing-the-file.md) | a redirection collects a child's whole output before writing the file | bug | trap |
-| [0068](open/0068-the-deno-transpile-cache-grows-without-bound-and-filled-the-shared-disk.md) | the Deno transpile cache grows without bound, and filled the shared disk | bug | disk full |
 | [0067](open/0067-no-filesystem-of-our-own-so-a-session-cannot-be-sealed-off-from-the-host.md) | no filesystem of our own, so a session cannot be sealed off from the host — [design/0001](../design/0001-a-self-contained-system.md) step 1 | missing feature | not implemented |
 | [0065](open/0065-a-spawned-programs-arguments-are-not-byte-exact.md) | a spawned program's arguments are not byte-exact | bug | wrong answer |
 | [0066](open/0066-the-light-client-is-minimal-config-only-and-has-never-seen-a-real-chain.md) | the light client is minimal-config only and has never seen a real chain | missing feature | not implemented |

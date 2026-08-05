@@ -39,12 +39,25 @@ function shebangFor(g: Grants, target: Target): string {
   // world is the whole boundary there. Under Deno the two agree, and a program granted
   // nothing asks for nothing.
   if (target === "node") return "#!/usr/bin/env node\n";
-  const flags: string[] = [];
+  // **`--no-code-cache`, and it is not a micro-optimisation.** Deno keeps V8's compiled code for every
+  // script it runs, keyed by the script's contents, in `~/.cache/deno/v8_code_cache_v2` — and it never
+  // evicts. A built program is a *unique* 400 KB script that is run once and thrown away, so every one
+  // of them leaves an entry that can never be hit again. Measured: one run of `box`'s test file grew
+  // that file by 166 MB, and it had reached 28 GB on this machine — 97% of a shared disk, having
+  // already failed two pushes for reasons that had nothing to do with the change being pushed. The
+  // cache is worth having for source that is run repeatedly; these are not that. wac-mono 0068.
+  const flags: string[] = ["--no-code-cache"];
   if (g.read) flags.push("--allow-read");
   if (g.write) flags.push("--allow-write");
   if (g.net) flags.push("--allow-net");
   if (g.env) flags.push("--allow-env");
-  return `#!/usr/bin/env -S deno run${flags.length ? " " + flags.join(" ") : ""}\n`;
+  // **Two caches, and both of them leak here.** `--no-code-cache` covers V8's compiled code;
+  // `DENO_EMIT_CACHE_MODE=disable` covers the *transpile* cache, which keys on the source's absolute
+  // path and so leaves an entry under `~/.cache/deno/gen/file/tmp/` for every built program ever run
+  // from a temp file. agent-b measured 25,490 of those, 25,482 with no surviving source, filling 23 GB.
+  // `env -S` can set a variable as well as run a command, which is the only place this can go: the
+  // program has to carry it, because whoever runs a built binary is not going to.
+  return `#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run${flags.length ? " " + flags.join(" ") : ""}\n`;
 }
 
 export type Grants = { read?: boolean; write?: boolean; env?: boolean; net?: boolean };

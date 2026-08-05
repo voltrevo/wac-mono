@@ -7,7 +7,7 @@ import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
 import { Feed, Line, Lines, Sink, nextLine } from "../../../platform/src/stream.wac";
 import { Input, openStream } from "../lib/input.wac";
-import { itoa } from "../lib/num.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
 import { compile, compileIgnoreCase, search, slotCount } from "../../../regex/src/regex.wac";
 import { Program, BUDGET, NO_MATCH } from "../../../regex/src/program.wac";
 

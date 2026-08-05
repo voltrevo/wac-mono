@@ -1,7 +1,7 @@
 # 0068 — the Deno transpile cache grows without bound, and filled the shared disk
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed
+- **Claimed by:** agent-a (2026-08-05)
 - **Reported by:** agent-b
 - **Date:** 2026-08-05
 - **Kind:** bug
@@ -74,3 +74,44 @@ and the space comes back as the holders exit. The cost is one recompile each.
 ## Note
 
 `~/notes/temporal/20260805/deno-cache-filled-the-disk-agent-b.md` has the investigation.
+
+## Closed, 2026-08-05 (agent-a): two caches, both switched off at the source
+
+This issue named the transpile cache. There are **two**, and the other one was five times bigger.
+Measured with the disk at 97% and 5.9 GB free:
+
+```
+28G  ~/.cache/deno/v8_code_cache_v2   <- V8's compiled code, one file, never evicted
+220M ~/.cache/deno/gen                <- the transpile cache this issue is about
+```
+
+The 23 GB of `gen` this issue reported had already been mopped by `tools/prune-deno-cache.sh`; what had
+grown in its place was the code cache, for the same reason in a different currency. Deno keeps V8's
+compiled code for every script it runs, keyed by content, and every built program is a unique 400 KB
+bundle run once. **One run of `box/test/box.test.ts` added 166 MB.**
+
+**Both are off at the source now**, in the shebang every built program carries:
+
+```
+#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache --allow-read
+```
+
+`--no-code-cache` for V8's, and `DENO_EMIT_CACHE_MODE=disable` for the transpile cache — `env -S` can
+set a variable as well as run a command, which is the only place it can go, since whoever runs a built
+binary is not going to set it. This is a better answer than the stable-path fix proposed above: an entry
+that is never written needs no path to be reused, and builds keep going to temp files, which is what
+lets tests run in parallel without fighting over a destination.
+
+Measured after, a full suite from an empty cache: **97 MB of `gen` and 566 MB of code cache**, down from
+118 MB and 1216 MB — and none of either from built programs. What is left is `deno test` itself
+compiling in-process bundles, and `deno test` has no flag for it.
+
+**So the residue is bounded rather than prevented**, by `tools/cacheGuard.sh`: one `stat` before a run,
+and the code cache is deleted if it is over 4 GB. It is sourced by `tools/test.sh` — which
+`deno task test` now runs, because a mitigation that only fires when somebody pushes is a mitigation
+nobody gets — and by `tools/push.sh`, whose own version of this had been **clearing the wrong
+directory**: `gen`, 220 MB, while 28 GB sat next to it. Three times, reporting success each time.
+
+`tools/prune-deno-cache.sh` stays: it prunes `gen` entries whose source is gone, which is a different
+question from size, and it is still the right tool after something *other* than a built program leaves
+garbage there.

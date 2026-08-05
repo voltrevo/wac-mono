@@ -14,7 +14,7 @@ import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { Input, readInput } from "../lib/input.wac";
 import { cmpBytes, splitLines } from "../lib/lines.wac";
-import { itoa } from "../lib/num.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
 
 /** Above this the table is more memory than the job is worth. */
 i32 MAX_LINES() { return 4000; }

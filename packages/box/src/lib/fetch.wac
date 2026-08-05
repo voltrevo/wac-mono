@@ -5,7 +5,7 @@
 // does not know the difference.
 
 import { Cli, Core, Socket } from "../../../platform/src/platform.wac";
-import { itoa } from "./num.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
 import { concat } from "./bytes.wac";
 import { Incoming, ParsedResponse, parseResponse } from "../../../http/src/incoming.wac";
 import { Read } from "../../../bytes/src/read.wac";
