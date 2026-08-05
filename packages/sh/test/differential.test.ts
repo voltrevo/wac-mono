@@ -1,5 +1,7 @@
 // Imported for its side effect: retries a spawn that fails with "Text file busy" and names
 // whoever held the file, if anyone did. wac-mono 0074.
+import { appRunner } from "../../../harness/appRun.ts";
+import { buildApp } from "../../platform/build.ts";
 import "../../../harness/spawnRetry.ts";
 // The shell, against bash.
 //
@@ -1052,6 +1054,13 @@ async function bash(script: string) {
  * and the same leak in `spawn.test.ts` is what filled the disk once already today. `unload` fires
  * whether the tests passed, failed or threw, which is the only hook that covers all three.
  */
+const GRANTS = { read: true, write: true, env: true };
+
+/**
+ * The shell as an executable, for the tests that need a real process: one redirects both streams
+ * into a file through bash, one feeds a script on standard input, and one compares what two
+ * *processes* see of `HOME` and `OLDPWD`.
+ */
 const wacshBinary = await (async () => {
   const out = await Deno.makeTempFile({ prefix: "wacsh-" });
   globalThis.addEventListener("unload", () => {
@@ -1061,28 +1070,42 @@ const wacshBinary = await (async () => {
       // Already gone, or never built. Nothing to report on the way out.
     }
   });
-  const r = await new Deno.Command("deno", {
-    args: [
-      "run", "-A", "packages/platform/build.ts", "packages/sh/src/sh.wac",
-      "--allow-read", "--allow-write", "--allow-env", "-o", out,
-    ],
-  }).output();
-  if (!r.success) throw new Error(`building sh failed: ${new TextDecoder().decode(r.stderr)}`);
+  // `buildApp` directly rather than `deno run build.ts` — a whole extra Deno start for a function
+  // this file can import.
+  await buildApp("packages/sh/src/sh.wac", out, GRANTS);
   return out;
 })();
 
+/**
+ * The shell in *this* process, which is how the 604 cases run.
+ *
+ * Each case was two subprocesses and one of them was ours at ~167ms, which was most of what this
+ * file cost. `appRunner` is the launcher half of a built program, so a case is a worker here — same
+ * wasm, same world, no second Deno. bash stays a process: it is the oracle at 2.5ms, and running it
+ * any other way would be testing something else.
+ */
+const sh = await appRunner("packages/sh/src/sh.wac", GRANTS);
+
+/**
+ * The environment the shell is given.
+ *
+ * The spawning version passed three variables with `clearEnv: false`, so it *inherited* the suite's
+ * environment and overrode those. `appRunner`'s `env` is exhaustive, so the inheritance is spelled
+ * out rather than quietly dropped — a variable the suite had and this did not would be a difference
+ * between the two shells that nothing here would attribute correctly.
+ */
+const SH_ENV: Record<string, string> = {
+  ...Deno.env.toObject(),
+  LC_ALL: "C",
+  PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin",
+  HOME: Deno.env.get("HOME") ?? "",
+};
+
 async function wacsh(script: string) {
-  const r = await new Deno.Command(wacshBinary, {
-    args: ["-c", script],
-    stdin: "null",   // as for bash above: the comparison is of scripts, not of terminals
-    env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin", HOME: Deno.env.get("HOME") ?? "" },
-    clearEnv: false,
-  }).output();
-  return {
-    stdout: new TextDecoder().decode(r.stdout),
-    code: r.code,
-    stderr: new TextDecoder().decode(r.stderr),
-  };
+  // No standard input, as for bash above: the comparison is of scripts, not of terminals. The
+  // runner ends the input stream at once when none is given, which is what `stdin: "null"` did.
+  const r = await sh.run(["-c", script], { env: SH_ENV });
+  return { stdout: r.out, code: r.code, stderr: r.err };
 }
 
 const haveBash = await (async () => {

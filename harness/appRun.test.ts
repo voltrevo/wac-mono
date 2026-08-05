@@ -50,7 +50,7 @@ Deno.test("appRun: the worker and the executable agree, argument for argument", 
 
 Deno.test("appRun: a filter reads the standard input it is given", async () => {
   const box = await appRunner(BOX, { read: true });
-  const r = await box.run(["rev"], "abc\ndef\n");
+  const r = await box.run(["rev"], { stdin: "abc\ndef\n" });
   eq(r.out, "cba\nfed\n", "rev over stdin");
   eq(r.code, 0, "exit code");
 });
@@ -59,7 +59,7 @@ Deno.test("appRun: a program that reads to the end sees the end", async () => {
   // `sort` cannot answer until its input is closed, so this is the case that hangs if `in.end()`
   // is forgotten — and hangs rather than fails, which is the worst way for it to be wrong.
   const box = await appRunner(BOX, { read: true });
-  const r = await box.run(["sort"], "gamma\nalpha\nbeta\n");
+  const r = await box.run(["sort"], { stdin: "gamma\nalpha\nbeta\n" });
   eq(r.out, "alpha\nbeta\ngamma\n", "sorted");
 });
 

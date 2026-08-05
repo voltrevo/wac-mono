@@ -14,7 +14,8 @@
 // with byte-identical output and the same exit code.
 //
 //   const box = await appRunner("packages/box/src/box.wac", { read: true });
-//   const r = await box.run(["cat", path]);        // r.code, r.out, r.err
+//   const r = await box.run(["cat", path]);                    // r.code, r.out, r.err
+//   const s = await sh.run(["-c", script], { env: { LC_ALL: "C" }, stdin: "..." });
 //
 // ## What this is not
 //
@@ -45,8 +46,24 @@ export type RunResult = {
   bytes: Uint8Array;
 };
 
+export type RunOptions = {
+  /** What the program reads as its standard input. Absent means it reads nothing. */
+  stdin?: string | Uint8Array;
+  /**
+   * The environment the program sees.
+   *
+   * Given, it sees exactly these and nothing else — `Deno.Command`'s `clearEnv`, which is what a
+   * differential test needs: `LC_ALL=C` and a known `PATH` and no inheritance, so the comparison
+   * is against a fixed world rather than against whatever the suite was started with. Omitted, the
+   * `env` grant decides: granted, the process's own; not granted, every variable unset.
+   */
+  env?: Record<string, string>;
+  /** Where the program's relative paths resolve from, and what `cwd` reports. */
+  cwd?: string;
+};
+
 export type AppRunner = {
-  run(args: string[], stdin?: string | Uint8Array): Promise<RunResult>;
+  run(args: string[], opts?: RunOptions): Promise<RunResult>;
 };
 
 const enc = new TextEncoder();
@@ -84,7 +101,7 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
   const source = await workerSource(entry, grants);
 
   return {
-    async run(args, stdin) {
+    async run(args, opts = {}) {
       const child = spawnChild(
         source,
         args.map((a) => enc.encode(a)),
@@ -98,7 +115,14 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
               ? { fs: { read: grants.read === true, write: grants.write === true } }
               : {}),
             ...(grants.net === true ? { net: true } : {}),
-            ...(grants.env === true ? { env: (n: string) => Deno.env.get(n) } : {}),
+            // A supplied environment wins over the grant, and is exhaustive: a name not in it is
+            // unset, not inherited.
+            ...(opts.env !== undefined
+              ? { env: (n: string) => opts.env![n] }
+              : grants.env === true
+              ? { env: (n: string) => Deno.env.get(n) }
+              : {}),
+            ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
             log: async (l: string) => { await out.push(enc.encode(l + "\n")); },
             warn: async (l: string) => { await cerr.push(enc.encode(l + "\n")); },
             write: async (b: Uint8Array) => {
@@ -117,8 +141,8 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
 
       // Standard input is whatever the caller gave, then end — a program that reads to the end has
       // to see one. Pushed before awaiting the exit, since a filter blocks until it has input.
-      if (stdin !== undefined) {
-        await child.in.push(typeof stdin === "string" ? enc.encode(stdin) : stdin);
+      if (opts.stdin !== undefined) {
+        await child.in.push(typeof opts.stdin === "string" ? enc.encode(opts.stdin) : opts.stdin);
       }
       child.in.end();
 
