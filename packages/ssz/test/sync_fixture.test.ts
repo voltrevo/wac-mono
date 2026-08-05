@@ -13,6 +13,18 @@
 // descriptor table — which the bootstrap size proves is a real difference, not a nominal one.
 
 import { fixtureJson, type FixtureManifest } from "../../../harness/fixtures.ts";
+import { wacBind } from "../../../harness/wacBind.ts";
+
+const mod = await wacBind("packages/ssz/test/wac/probe.wac") as unknown as {
+  sszBeaconRootMinimal(ty: number, data: Uint8Array): Uint8Array;
+  sszBeaconFixedSizeMinimal(ty: number): number;
+  sszBeaconFixedSize(ty: number): number;
+  sszTyFor(which: number): number;
+  sszFieldMinimal(ty: number, data: Uint8Array, f: number): Uint8Array;
+  sszFieldRootMinimal(ty: number, data: Uint8Array, f: number): Uint8Array;
+};
+const TY_BOOTSTRAP = mod.sszTyFor(5);
+const TY_UPDATE = mod.sszTyFor(6);
 
 const manifest = JSON.parse(
   await Deno.readTextFile(new URL("fixtures.json", import.meta.url)),
@@ -130,3 +142,131 @@ Deno.test("the metadata carries what initialising a store needs", () => {
     }
   }
 });
+
+Deno.test("the minimal descriptor table reproduces the vendored objects' sizes", () => {
+  // The reason `beaconTypes` takes a config at all. `SYNC_COMMITTEE_SIZE` is 32 here and 512 on
+  // mainnet, and that changes the serialized size of everything holding a `SyncCommittee` — so the
+  // same descriptor under the wrong config produces a wrong root *and* a wrong length, silently.
+  //
+  // Checked against the bytes Ethereum actually generated rather than against my arithmetic.
+  const bootstrap = fixture.cases[0].bootstrap.length / 2;
+  const update = Object.values(fixture.cases[0].updates)[0].length / 2;
+  if (mod.sszBeaconFixedSizeMinimal(TY_BOOTSTRAP) !== bootstrap) {
+    throw new Error(
+      `minimal LightClientBootstrap: descriptor says ` +
+        `${mod.sszBeaconFixedSizeMinimal(TY_BOOTSTRAP)}, the vectors are ${bootstrap}`,
+    );
+  }
+  if (mod.sszBeaconFixedSizeMinimal(TY_UPDATE) !== update) {
+    throw new Error(
+      `minimal LightClientUpdate: descriptor says ` +
+        `${mod.sszBeaconFixedSizeMinimal(TY_UPDATE)}, the vectors are ${update}`,
+    );
+  }
+  // And the two configs must genuinely differ, or the parameter is doing nothing and both tables
+  // would agree with whichever set of vectors happened to be checked first.
+  if (mod.sszBeaconFixedSize(TY_BOOTSTRAP) === bootstrap) {
+    throw new Error("the mainnet table also matches the minimal vectors — the config is ignored");
+  }
+});
+
+Deno.test("every vendored bootstrap and update merkleizes under the minimal table", () => {
+  // Not against a published root — the sync vectors give none — but every object must at least be
+  // *readable* as the container it claims to be. A refusal here means a descriptor or a length is
+  // wrong, and it would otherwise surface much later as a client that cannot start.
+  let n = 0;
+  for (const c of fixture.cases) {
+    if (mod.sszBeaconRootMinimal(TY_BOOTSTRAP, hex(c.bootstrap)).length !== 32) {
+      throw new Error(`${c.case}: the bootstrap was refused under the minimal table`);
+    }
+    n++;
+    for (const [name, data] of Object.entries(c.updates)) {
+      if (mod.sszBeaconRootMinimal(TY_UPDATE, hex(data)).length !== 32) {
+        throw new Error(`${c.case}/${name}: the update was refused`);
+      }
+      n++;
+    }
+  }
+  if (n !== 4 + 16) throw new Error(`merkleized ${n} objects, expected 20`);
+});
+
+function hex(h: string): Uint8Array {
+  return Uint8Array.from(h.match(/../g) ?? [], (x) => parseInt(x, 16));
+}
+
+// Field indices, in the order `src/beacon.wac` lists them.
+const UPDATE_ATTESTED_HEADER = 0;
+const UPDATE_SIGNATURE_SLOT = 6;
+const HEADER_BEACON = 0;
+const BEACON_SLOT = 0;
+
+Deno.test("reading fields out of a real update agrees with the vectors' own checks", () => {
+  // The oracle nobody had to write. A step's `checks.optimistic_header` states a slot and the
+  // `hash_tree_root` of a beacon header — a value this package has to be able to extract — so field
+  // access is checkable against Ethereum's own numbers rather than against a round trip through my
+  // code.
+  //
+  // **The relationship is conditional, which I got wrong first.** After `process_update` the store's
+  // optimistic header is the update's attested header only when the update actually advances it;
+  // `supply_sync_committee_from_past_update` applies a *past* update, so the store keeps the later
+  // header the bootstrap gave it and the check states slot 49 against the update's 32. That is the
+  // protocol working, not the extraction failing.
+  //
+  // So the assertion is made where the slots agree — which is where the check is describing this
+  // update's header — and the count below makes sure that is most of them rather than none.
+  let matched = 0, seen = 0;
+  for (const c of fixture.cases) {
+    for (const step of c.steps) {
+      if (step.kind !== "process_update") continue;
+      const update = hex(c.updates[step.update!]);
+      const want = step.checks!.optimistic_header!;
+
+      const header = mod.sszFieldMinimal(TY_UPDATE, update, UPDATE_ATTESTED_HEADER);
+      if (header.length === 0) throw new Error(`${c.case}: could not read attested_header`);
+      const beacon = mod.sszFieldMinimal(mod.sszTyFor(4), header, HEADER_BEACON);
+      const slotBytes = mod.sszFieldMinimal(mod.sszTyFor(0), beacon, BEACON_SLOT);
+      if (slotBytes.length !== 8) throw new Error(`${c.case}: slot is ${slotBytes.length} bytes`);
+      let slot = 0;
+      for (let i = 7; i >= 0; i--) slot = slot * 256 + slotBytes[i];
+      seen++;
+
+      if (String(slot) !== want.slot) continue;      // a past update; the store did not adopt it
+      const root = mod.sszFieldRootMinimal(mod.sszTyFor(4), header, HEADER_BEACON);
+      if ("0x" + hexOf(root) !== want.beacon_root) {
+        throw new Error(
+          `${c.case} @ slot ${slot}: attested beacon root\n  got  0x${hexOf(root)}` +
+            `\n  want ${want.beacon_root}`,
+        );
+      }
+      matched++;
+    }
+  }
+  if (seen < 15) throw new Error(`only ${seen} process_update steps found`);
+  if (matched < 12) {
+    throw new Error(
+      `only ${matched} of ${seen} steps had the store adopt the update's header — too few for this ` +
+        `to be testing extraction rather than skipping`,
+    );
+  }
+});
+
+Deno.test("signature_slot reads as a slot, and out-of-range fields are refused", () => {
+  const c = fixture.cases[0];
+  const update = hex(Object.values(c.updates)[0]);
+  const slotBytes = mod.sszFieldMinimal(TY_UPDATE, update, UPDATE_SIGNATURE_SLOT);
+  if (slotBytes.length !== 8) throw new Error(`signature_slot is ${slotBytes.length} bytes, expected 8`);
+  let slot = 0;
+  for (let i = 7; i >= 0; i--) slot = slot * 256 + slotBytes[i];
+  // The spec requires signature_slot > attested_slot, so it is a real slot rather than zero padding.
+  if (slot === 0 || slot > 1e9) throw new Error(`signature_slot is implausible: ${slot}`);
+
+  for (const bad of [-1, 7, 99]) {
+    if (mod.sszFieldMinimal(TY_UPDATE, update, bad).length !== 0) {
+      throw new Error(`field index ${bad} returned bytes for a 7-field container`);
+    }
+  }
+});
+
+function hexOf(b: Uint8Array): string {
+  return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
+}
