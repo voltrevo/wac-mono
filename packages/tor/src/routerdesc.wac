@@ -28,7 +28,9 @@
 
 import { Buf } from "../../bytes/src/buf.wac";
 import { ALPHABET_STANDARD, encode } from "../../codec/src/base64.wac";
-import { derConcat, derInteger, derSequence } from "../../tls/src/derwrite.wac";
+import { civilFrom, derConcat, derInteger, derSequence } from "../../tls/src/derwrite.wac";
+import { encodeUpper } from "../../codec/src/hex.wac";
+import { itoa64 } from "../../fmt/src/itoa.wac";
 import { sha1 } from "../../crypto/src/sha1.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
 
@@ -135,4 +137,78 @@ export u8[] pemBlock(string label, u8[] der) {
   }
   out.pushAll(("-----END " + label + "-----\n").toBytes());
   return out.bytes();
+}
+
+// ── The document's own text ───────────────────────────────────────────────────
+//
+// Built as bytes rather than assembled as a string and converted at the end. `directory.wac` gives
+// the reason for reading a descriptor and it applies to writing one: the signatures are over these
+// bytes, so the bytes are what the code should be handling. A string round trip is a place for an
+// encoding assumption to hide.
+
+/** The keys a relay signs its descriptor with. RSA values are big-endian magnitudes. */
+export struct RelayKeys {
+  u8[] rsaIdentityN;
+  u8[] rsaIdentityE;
+  u8[] rsaIdentityD;
+  u8[] rsaOnionN;
+  u8[] rsaOnionE;
+  u8[] rsaOnionD;
+  u8[] edIdentitySeed;     // the master identity: signs the signing certificate and nothing else
+  u8[] edSigningSeed;      // signs the descriptor
+  u8[] ntorSecret;         // curve25519, and the source of the proposal 228 key
+}
+
+/** What a descriptor says about the relay, apart from its keys. */
+export struct RelayInfo {
+  string nickname;
+  string address;
+  i32 orPort;
+  i32 dirPort;
+  i64 published;           // seconds since the epoch
+  i64 bandwidthRate;
+  i64 bandwidthBurst;
+  i64 bandwidthObserved;
+  i64 certExpiryHours;     // hours since the epoch, which is how a certificate counts them
+}
+
+string pad2(i64 v) { return v < 10 ? "0" + itoa64(v) : itoa64(v); }
+
+string pad4(i64 v) {
+  string s = itoa64(v);
+  while (s.len() < 4) { s = "0" + s; }
+  return s;
+}
+
+/** `YYYY-MM-DD HH:MM:SS`, which is how a descriptor writes a time. Always UTC. */
+export string publishedTime(i64 seconds) {
+  i64[] p = civilFrom(seconds);
+  return pad4(p[0]) + "-" + pad2(p[1]) + "-" + pad2(p[2]) + " " +
+         pad2(p[3]) + ":" + pad2(p[4]) + ":" + pad2(p[5]);
+}
+
+/**
+ * Base64 with the padding stripped, which is how a descriptor writes a bare key or signature.
+ *
+ * The `=` is dropped rather than never produced — tor's `base64_encode` writes padding and its
+ * callers for these fields strip it, and a reader accepts either. The PEM blocks keep theirs.
+ */
+export string b64Unpadded(u8[] data) {
+  return string.fromBytes(encode(data, ALPHABET_STANDARD(), false));
+}
+
+/**
+ * The fingerprint as a descriptor writes it: uppercase hex in groups of four, space separated.
+ *
+ * The grouping looks cosmetic and is not: it is inside the bytes both signatures cover, so a
+ * fingerprint written without the spaces changes every signature in the document.
+ */
+export string spacedFingerprint(u8[] digest) {
+  u8[] h = encodeUpper(digest);
+  Buf out = Buf.create();
+  for (i32 i = 0; i < h.len(); i++) {
+    if (i != 0 && i % 4 == 0) { out.push(32); }
+    out.push(h[i]);
+  }
+  return string.fromBytes(out.bytes());
 }

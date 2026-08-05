@@ -53,6 +53,13 @@ const D_ROUTER_SIG = 16; // a[0]=i: the 64 bytes of router-sig-ed25519
 const D_RSA_RECOVER = 17; // a[0]=i: the digest node recovers from tor's own router-signature
 const D_ONION_KEY_DER = 18; // a[0]=i: the onion-key PEM body, decoded
 const D_ONION_KEY_PEM = 19; // a[0]=i: the onion-key PEM block exactly as tor wrote it
+const D_FINGERPRINT_LINE = 20; // a[0]=i: the value on tor's own `fingerprint` line
+const D_PUBLISHED_LINE = 21; // a[0]=i: the value on tor's own `published` line
+const D_PUBLISHED_EPOCH = 22; // a[0]=i: that same time, as 8 big-endian bytes of epoch seconds
+const D_NTOR_LINE = 23; // a[0]=i: the value on tor's own `ntor-onion-key` line
+const D_SIGNING_N = 24; // a[0]=i: the modulus of the descriptor's own signing-key
+const D_SIGNING_E = 25; // a[0]=i: its public exponent
+const D_SIGNING_KEY_DER = 26; // a[0]=i: the signing-key DER exactly as tor published it
 
 const v = JSON.parse(
   await Deno.readTextFile(new URL("data/routerdesc_vectors.json", import.meta.url)),
@@ -113,6 +120,48 @@ function hostVerify(pub: Uint8Array, cert: Uint8Array): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The modulus and exponent of the descriptor's `signing-key`, unwrapped from its DER.
+ *
+ * `SEQUENCE { INTEGER n, INTEGER e }`, and the leading zero a positive INTEGER carries when its top
+ * bit is set is stripped — the wac side is given magnitudes, and re-encoding is the thing under test.
+ */
+function rsaParts(desc: string): [Uint8Array, Uint8Array] {
+  const body = pemAfter(desc, "signing-key", "RSA PUBLIC KEY");
+  if (!body) return [new Uint8Array(0), new Uint8Array(0)];
+  const der = Uint8Array.from(atob(body.replace(/\s/g, "")), (c) => c.charCodeAt(0));
+  let i = 0;
+  const len = () => {
+    let n = der[i++];
+    if (n & 0x80) {
+      const k = n & 0x7f;
+      n = 0;
+      for (let j = 0; j < k; j++) n = n * 256 + der[i++];
+    }
+    return n;
+  };
+  if (der[i++] !== 0x30) return [new Uint8Array(0), new Uint8Array(0)];
+  len();
+  const readInt = () => {
+    if (der[i++] !== 0x02) return new Uint8Array(0);
+    const n = len();
+    let start = i;
+    let count = n;
+    if (der[start] === 0 && count > 1) {
+      start++;
+      count--;
+    }
+    i += n;
+    return der.subarray(start, start + count);
+  };
+  return [readInt(), readInt()];
+}
+
+/** The value on the line starting with `keyword`, or "". */
+function line(text: string, keyword: string): string {
+  return text.match(new RegExp(`^${keyword} (.+)$`, "m"))?.[1] ?? "";
 }
 
 /** The PEM body that follows `keyword` on its own line. */
@@ -201,6 +250,29 @@ function ref(what: number, a: Uint8Array, b: Uint8Array): Uint8Array {
       return new TextEncoder().encode(
         `-----BEGIN RSA PUBLIC KEY-----\n${body}-----END RSA PUBLIC KEY-----\n`,
       );
+    }
+    case D_FINGERPRINT_LINE:
+      return new TextEncoder().encode(line(v.descriptors[a[0]].descriptor, "fingerprint"));
+    case D_PUBLISHED_LINE:
+      return new TextEncoder().encode(line(v.descriptors[a[0]].descriptor, "published"));
+    case D_PUBLISHED_EPOCH: {
+      // The descriptor writes UTC with no zone marker, so it has to be read as UTC explicitly.
+      const t = line(v.descriptors[a[0]].descriptor, "published");
+      const secs = Math.floor(Date.parse(t.replace(" ", "T") + "Z") / 1000);
+      const out = new Uint8Array(8);
+      for (let i = 7; i >= 0; i--) out[i] = (secs / 2 ** (8 * (7 - i))) & 0xff;
+      return out;
+    }
+    case D_NTOR_LINE:
+      return new TextEncoder().encode(line(v.descriptors[a[0]].descriptor, "ntor-onion-key"));
+    case D_SIGNING_N:
+      return rsaParts(v.descriptors[a[0]].descriptor)[0];
+    case D_SIGNING_E:
+      return rsaParts(v.descriptors[a[0]].descriptor)[1];
+    case D_SIGNING_KEY_DER: {
+      const body = pemAfter(v.descriptors[a[0]].descriptor, "signing-key", "RSA PUBLIC KEY");
+      if (!body) return new Uint8Array(0);
+      return Uint8Array.from(atob(body.replace(/\s/g, "")), (c) => c.charCodeAt(0));
     }
     default:
       throw new Error(`unknown vector field ${what}`);
