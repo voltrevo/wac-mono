@@ -20,6 +20,13 @@
 // range rather than listing them, to decide whether a token is a keyword. Keep it so:
 // inserting a non-keyword into the middle of that block would silently make `atKeyword`
 // wrong, and nothing else here depends on the ordering.
+//
+// dead-exports: exempt — the numbering mirrors `TokenKind`'s declaration order in the reference lexer,
+// so the completeness of this table is the contract rather than a convenience. Two of these have no
+// caller and both should stay: `kBool` because a boolean literal lexes as the keyword `true` or `false`
+// and never as a `bool` token, and `kindCount` because it states how many variants the reference has.
+// Deleting either would renumber every kind after it and silently misalign the differential test that
+// derives these names from `wac/atoms/wac/wacLex.ts` at run time.
 
 
 /** `int` */

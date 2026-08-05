@@ -46,18 +46,6 @@ export i32 scanKeys(i32 n, i32 reps) {
   return hits;
 }
 
-/** The same, through `get` — so above the threshold it builds an index once and uses it. */
-export i32 getKeys(i32 n, i32 reps) {
-  JsonObject o = build(n);
-  u8[][] keys = u8[][n]();
-  for (i32 i = 0; i < n; i++) { keys[i] = ("k" + itoaLocal(i)).toBytes(); }
-  i32 hits = 0;
-  for (i32 r = 0; r < reps; r++) {
-    JsonValue? v = o.get(keys[r % n]);
-    if (v is not null) { hits++; }
-  }
-  return hits;
-}
 
 /** Forces the indexed path regardless of size, so the crossover can be seen from below. */
 export i32 indexedKeys(i32 n, i32 reps) {

@@ -1,7 +1,13 @@
 // Test fixture: f32 formatting across the bindgen boundary.
-import { ftoa32Bytes } from "../src/ftoa.wac";
+import { ftoa32, ftoa32Bytes } from "../src/ftoa.wac";
 
 export u8[] fmt32(f32 x) { return ftoa32Bytes(x); }
+
+// The same number through the string spelling. `ftoa32` is what `packages/fmt/README.md` lists as the
+// f32 half of the API, and nothing had ever called it — the dead-export check found it, and the two
+// spellings differ only in `Buf.toStr()` against `Buf.bytes()`, so a test that they agree is what keeps
+// the documented one honest.
+export u8[] fmt32Str(f32 x) { return ftoa32(x).toBytes(); }
 
 import { atof32Span } from "../src/atof.wac";
 

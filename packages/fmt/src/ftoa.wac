@@ -256,13 +256,13 @@ export string ftoa(f64 x) {
 /** The same for an f32: shortest digits that read back as the same f32. */
 export string ftoa32(f32 x) {
   Buf out = Buf.create();
-  writeDecimal(out, decompose32(x));
+  writeF32(out, x);
   return out.toStr();
 }
 
 export u8[] ftoa32Bytes(f32 x) {
   Buf out = Buf.create();
-  writeDecimal(out, decompose32(x));
+  writeF32(out, x);
   return out.bytes();
 }
 
