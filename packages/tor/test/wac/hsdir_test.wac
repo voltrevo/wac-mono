@@ -1,0 +1,290 @@
+// The HSDir hash ring, against the directories tor actually chose.
+//
+// `test/data/hsdir_vectors.json` is captured from a running chutney network by
+// `tools/capture-hsdir.py`. Every relay index in it is a value **tor logged**, from
+// `upload_descriptor_to_hsdir()`, alongside the blinded key and the directory's ed25519 identity. So
+// the central assertion here is not "our formula is self-consistent" but "our formula produces the
+// number tor produced, for thirteen relays across two time periods".
+//
+// That matters because the ring has no local oracle. A client whose index is wrong asks a directory
+// that does not have the descriptor, gets a 404, and cannot tell that apart from a service that never
+// published. Nothing short of an external value catches it.
+//
+// The network was widened for this. chutney's stock `hs-v3` has eight nodes, and 2 replicas x a
+// spread of 4 is eight directories — so every node is chosen and "did we pick the right ones" has no
+// wrong answer. `networks/hs-v3-wide` has thirteen candidates for those eight slots.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  hsServiceIndex, hsRelayIndex, disasterSrv, compareIndex, responsibleHsdirs,
+  HSDIR_N_REPLICAS_DEFAULT, HSDIR_SPREAD_STORE_DEFAULT, HSDIR_SPREAD_FETCH_DEFAULT,
+} from "../../src/hsdir.wac";
+
+const i32 V_CASE_COUNT = 0;
+const i32 V_CASE_META = 1;      // blindedKey(32) srv(32) tp(8) plen(8)
+const i32 V_CASE_HSDIRS = 2;    // n(1) then n x (ed25519(32) relayIndex(32))
+const i32 V_RELAYS = 3;         // n(1) then n x ed25519(32)  — the HSDir-flagged candidates
+const i32 V_SERVICE_INDEX = 4;  // replicas x 32
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+u8[] slice(u8[] s, i32 from, i32 to) {
+  u8[] o = u8[to - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = s[from + i]; }
+  return o;
+}
+i64 be64(u8[] b, i32 at) {
+  i64 v = 0;
+  for (i32 i = 0; i < 8; i++) { v = (v << 8) | (b[at + i] as i64); }
+  return v;
+}
+/** `1 << k` as an i32 — `1 << (k as@ u32)` is a u32 and will not meet an i32 accumulator. */
+i32 bit(i32 k) {
+  i32 m = 1;
+  for (i32 i = 0; i < k; i++) { m = m * 2; }
+  return m;
+}
+u8[] caseArg(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+
+export string test_every_relay_index_is_the_one_tor_computed(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 cases = ref(V_CASE_COUNT, u8[0](), u8[0]())[0];
+  t.isTrue(cases >= 1, "the vector has at least one case");
+  i32 checked = 0;
+  for (i32 c = 0; c < cases; c++) {
+    u8[] meta = ref(V_CASE_META, caseArg(c), u8[0]());
+    u8[] srv = slice(meta, 32, 64);
+    i64 tp = be64(meta, 64);
+    i64 plen = be64(meta, 72);
+
+    u8[] dirs = ref(V_CASE_HSDIRS, caseArg(c), u8[0]());
+    i32 n = dirs[0];
+    t.isTrue(n > 0, "case " + itoa64(c as i64) + " names some directories");
+    for (i32 i = 0; i < n; i++) {
+      u8[] ed = slice(dirs, 1 + i * 64, 1 + i * 64 + 32);
+      u8[] want = slice(dirs, 1 + i * 64 + 32, 1 + i * 64 + 64);
+      t.isTrue(same(hsRelayIndex(ed, srv, tp, plen), want),
+               "case " + itoa64(c as i64) + " relay " + itoa64(i as i64) +
+               ": hs_relay_index agrees with tor's");
+      checked = checked + 1;
+    }
+  }
+  t.isTrue(checked >= 8, "at least eight indices were checked, not one");
+  return t.report();
+}
+
+export string test_we_choose_the_directories_tor_chose(fn[u8[](i32, u8[], u8[])] ref) {
+  // The whole ring, end to end: from a blinded key and the consensus's HSDir set, pick the
+  // responsible directories and require exactly tor's set. This is what `hsServiceIndex` is tested
+  // by — tor does not log a service index, so the only evidence it is right is that the relays it
+  // selects are the relays tor uploaded to.
+  T t = T.create();
+  i32 cases = ref(V_CASE_COUNT, u8[0](), u8[0]())[0];
+  u8[] relays = ref(V_RELAYS, u8[0](), u8[0]());
+  i32 nr = relays[0];
+  t.isTrue(nr > HSDIR_N_REPLICAS_DEFAULT * HSDIR_SPREAD_STORE_DEFAULT,
+           "there are more candidates than slots, so the choice discriminates");
+
+  for (i32 c = 0; c < cases; c++) {
+    u8[] meta = ref(V_CASE_META, caseArg(c), u8[0]());
+    u8[] blinded = slice(meta, 0, 32);
+    u8[] srv = slice(meta, 32, 64);
+    i64 tp = be64(meta, 64);
+    i64 plen = be64(meta, 72);
+
+    u8[][] indices = u8[][nr]();
+    for (i32 i = 0; i < nr; i++) {
+      indices[i] = hsRelayIndex(slice(relays, 1 + i * 32, 1 + i * 32 + 32), srv, tp, plen);
+    }
+    i32[] chosen = responsibleHsdirs(blinded, indices, HSDIR_N_REPLICAS_DEFAULT,
+                                     HSDIR_SPREAD_STORE_DEFAULT, plen, tp);
+
+    u8[] dirs = ref(V_CASE_HSDIRS, caseArg(c), u8[0]());
+    i32 want = dirs[0];
+    t.eqI32(chosen.len(), want,
+            "case " + itoa64(c as i64) + ": we chose as many directories as tor did");
+
+    // Membership both ways. Ours must all be tor's, and tor's must all be ours — one direction alone
+    // would pass for a subset.
+    i32 missing = 0;
+    for (i32 i = 0; i < want; i++) {
+      u8[] theirs = slice(dirs, 1 + i * 64, 1 + i * 64 + 32);
+      bool found = false;
+      for (i32 j = 0; j < chosen.len(); j++) {
+        if (same(slice(relays, 1 + chosen[j] * 32, 1 + chosen[j] * 32 + 32), theirs)) { found = true; }
+      }
+      if (!found) { missing = missing + 1; }
+    }
+    t.eqI32(missing, 0, "case " + itoa64(c as i64) + ": every directory tor used is one we chose");
+
+    // No relay chosen twice. With few candidates the two replicas' spreads overlap, and the spec
+    // says a relay already taken by a lower-numbered replica is skipped — without that a service
+    // uploads twice to one directory and reaches fewer than it believes.
+    i32 dupes = 0;
+    for (i32 i = 0; i < chosen.len(); i++) {
+      for (i32 j = i + 1; j < chosen.len(); j++) {
+        if (chosen[i] == chosen[j]) { dupes = dupes + 1; }
+      }
+    }
+    t.eqI32(dupes, 0, "case " + itoa64(c as i64) + ": no directory is chosen twice");
+  }
+  return t.report();
+}
+
+export string test_the_trailing_field_order_differs_between_the_two_indices(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  // `store-at-idx` ends with period **length then number**; `node-idx` ends with **number then
+  // length**. It reads like a transcription slip in the specification and it is not. Anyone tidying
+  // this code would normalise them, so the asymmetry is asserted rather than left as a comment: swap
+  // the arguments and the index must change.
+  T t = T.create();
+  u8[] meta = ref(V_CASE_META, caseArg(0), u8[0]());
+  u8[] blinded = slice(meta, 0, 32);
+  u8[] srv = slice(meta, 32, 64);
+  i64 tp = be64(meta, 64);
+  i64 plen = be64(meta, 72);
+  t.isFalse(tp == plen, "the two values differ, or this test proves nothing");
+
+  u8[] service = hsServiceIndex(blinded, 1, plen, tp);
+  t.isFalse(same(service, hsServiceIndex(blinded, 1, tp, plen)),
+            "swapping length and number changes the service index");
+  u8[] ed = slice(ref(V_RELAYS, u8[0](), u8[0]()), 1, 33);
+  u8[] relay = hsRelayIndex(ed, srv, tp, plen);
+  t.isFalse(same(relay, hsRelayIndex(ed, srv, plen, tp)),
+            "swapping number and length changes the relay index");
+
+  // Every other input must move the index too.
+  t.isFalse(same(service, hsServiceIndex(blinded, 2, plen, tp)), "the replica number matters");
+  t.isFalse(same(relay, hsRelayIndex(ed, disasterSrv(plen, tp), tp, plen)), "the SRV matters");
+  t.eqI32(hsServiceIndex(u8[31](), 1, plen, tp).len(), 0, "a short blinded key is refused");
+  t.eqI32(hsRelayIndex(u8[31](), srv, tp, plen).len(), 0, "a short identity is refused");
+  return t.report();
+}
+
+export string test_the_ring_wraps(fn[u8[](i32, u8[], u8[])] ref) {
+  // A service index above every relay's index must come back round to the lowest, not fall off the
+  // end. Constructed rather than found: with a handful of relays the natural case may not occur, and
+  // an off-by-one at the wrap is exactly the bug that leaves a client asking nobody.
+  T t = T.create();
+  u8[][] indices = u8[][4]();
+  for (i32 i = 0; i < 4; i++) {
+    u8[] idx = u8[32]();
+    idx[0] = (0x10 + i * 0x10);
+    indices[i] = idx;
+  }
+  // A blinded key is only a hash input here, so any 32 bytes do; what is being tested is the walk.
+  u8[] blinded = u8[32]();
+  for (i32 i = 0; i < 32; i++) { blinded[i] = (i * 7 + 3) & 0xFF; }
+
+  i32[] one = responsibleHsdirs(blinded, indices, 1, 4, 8, 100);
+  t.eqI32(one.len(), 4, "one replica with a spread of four takes every relay");
+  i32 seen = 0;
+  for (i32 i = 0; i < one.len(); i++) { seen = seen | bit(one[i]); }
+  t.eqI32(seen, 15, "all four relays appear exactly once");
+
+  // **Which relay comes first** is the part that discriminates. Taking all four is a permutation
+  // whatever the starting point, so the assertion above passes for a walk that ignores the target
+  // entirely — planting `start = 0` in place of the wrap sentinel survived it. So: compute the
+  // target the walk should use, work out which relay ought to be first, and require exactly that.
+  u8[] target = hsServiceIndex(blinded, 1, 8, 100);
+  t.eqI32(target.len(), 32, "the service index is 32 bytes");
+  i32 wantFirst = -1;
+  for (i32 i = 3; i >= 0; i--) {
+    if (compareIndex(indices[i], target) >= 0) { wantFirst = i; }
+  }
+  // Nothing at or after the target means the walk wraps to the lowest, which here is relay 0.
+  bool wrapped = wantFirst < 0;
+  if (wrapped) { wantFirst = 0; }
+  t.eqI32(one[0], wantFirst,
+          wrapped ? "the target is above every relay, so the walk wraps to the lowest"
+                  : "the walk starts at the first relay at or after the target");
+
+  // And both situations are reachable, so this test is not silently only ever checking one of them.
+  // Relay indices at 0x10..0x40 leave three quarters of the ring above them, so a handful of
+  // different keys covers both sides; assert that rather than assume it.
+  i32 sawWrap = 0;
+  i32 sawInside = 0;
+  for (i32 k = 0; k < 24; k++) {
+    u8[] key = u8[32]();
+    for (i32 i = 0; i < 32; i++) { key[i] = (i * 11 + k * 37 + 1) & 0xFF; }
+    u8[] tgt = hsServiceIndex(key, 1, 8, 100);
+    bool above = compareIndex(tgt, indices[3]) > 0;
+    if (above) { sawWrap = sawWrap + 1; } else { sawInside = sawInside + 1; }
+    i32[] pick = responsibleHsdirs(key, indices, 1, 1, 8, 100);
+    t.eqI32(pick.len(), 1, "one replica, spread one, gives one relay");
+    i32 expect = -1;
+    for (i32 i = 3; i >= 0; i--) {
+      if (compareIndex(indices[i], tgt) >= 0) { expect = i; }
+    }
+    if (expect < 0) { expect = 0; }
+    t.eqI32(pick[0], expect, "the single choice is the relay the ring says");
+  }
+  t.isTrue(sawWrap > 0, "some keys land above every relay, exercising the wrap");
+  t.isTrue(sawInside > 0, "and some land inside, exercising the ordinary case");
+
+  // A spread larger than the candidate set returns the set, not a padded list with repeats.
+  i32[] over = responsibleHsdirs(blinded, indices, 1, 9, 8, 100);
+  t.eqI32(over.len(), 4, "a spread beyond the candidates returns only the candidates");
+
+  // Two replicas of two, over four relays: four distinct choices.
+  i32[] two = responsibleHsdirs(blinded, indices, 2, 2, 8, 100);
+  t.eqI32(two.len(), 4, "two replicas of two give four");
+  i32 seen2 = 0;
+  for (i32 i = 0; i < two.len(); i++) { seen2 = seen2 | bit(two[i]); }
+  t.eqI32(seen2, 15, "and they are four different relays");
+
+  t.eqI32(responsibleHsdirs(blinded, u8[][0](), 2, 4, 8, 100).len(), 0, "no candidates, no choice");
+  t.eqI32(responsibleHsdirs(blinded, indices, 0, 4, 8, 100).len(), 0, "zero replicas is refused");
+  t.eqI32(responsibleHsdirs(blinded, indices, 2, 0, 8, 100).len(), 0, "zero spread is refused");
+  return t.report();
+}
+
+export string test_index_comparison_is_unsigned(fn[u8[](i32, u8[], u8[])] ref) {
+  // The indices are 256-bit unsigned numbers held in `u8[]`. If a byte were ever compared as signed,
+  // every index with the high bit set would sort below every index without one — half the ring
+  // inverted, which still produces a plausible-looking set of directories.
+  T t = T.create();
+  u8[] low = u8[32]();
+  u8[] high = u8[32]();
+  high[0] = 0x80;
+  t.eqI32(compareIndex(low, high), -1, "0x00... is below 0x80...");
+  t.eqI32(compareIndex(high, low), 1, "and 0x80... is above it");
+  t.eqI32(compareIndex(high, high), 0, "equal indices compare equal");
+
+  u8[] ff = u8[32]();
+  for (i32 i = 0; i < 32; i++) { ff[i] = 0xFF; }
+  t.eqI32(compareIndex(ff, high), 1, "0xFF... is the top of the ring");
+  t.eqI32(compareIndex(low, ff), -1, "and 0x00... the bottom");
+
+  // The difference must be found at the first differing byte, not the last.
+  u8[] a = u8[32]();
+  u8[] b = u8[32]();
+  a[0] = 1;
+  b[31] = 1;
+  t.eqI32(compareIndex(a, b), 1, "the most significant byte decides");
+  return t.report();
+}
+
+export string test_the_disaster_srv_is_deterministic(fn[u8[](i32, u8[], u8[])] ref) {
+  // When the consensus carries no shared random value, everyone falls back to a value derived from
+  // the period alone. Entirely predictable, and that is the point: an unpredictable fallback would
+  // put clients and services on different rings, which is worse than a predictable one.
+  T t = T.create();
+  u8[] a = disasterSrv(1440, 16903);
+  t.eqI32(a.len(), 32, "the disaster SRV is 32 bytes");
+  t.isTrue(same(a, disasterSrv(1440, 16903)), "and is the same every time");
+  t.isFalse(same(a, disasterSrv(1440, 16904)), "the period number changes it");
+  t.isFalse(same(a, disasterSrv(8, 16903)), "the period length changes it");
+  return t.report();
+}
