@@ -1,0 +1,219 @@
+// Writing DER: the encoder that `asn1.wac` is the decoder for.
+//
+// DER is BER with the ambiguity removed — every value has exactly one legal encoding — which is what
+// makes it usable for signing. A certificate's signature covers its `tbsCertificate` *as bytes*, so a
+// re-encoding that is merely equivalent is a different document.
+//
+// That cuts both ways and is the reason this file exists at all rather than being a convenience: an
+// encoder that is nearly right produces certificates that parse, look correct, and fail verification
+// somewhere else. The three places DER differs from "just write the bytes":
+//
+//   **Length.** Under 128, one byte. Otherwise a leading byte with the high bit set and the count of
+//   following length bytes, then those bytes big-endian with no leading zeros. Writing 0x81 0x05 for
+//   a five-byte value is legal BER and illegal DER.
+//
+//   **INTEGER is signed.** A value whose top bit is set needs a leading zero byte or it is negative,
+//   and a value with a redundant leading zero is malformed. RSA moduli always need the extra byte and
+//   exponents usually do not, which is exactly the case that goes unnoticed until a modulus happens
+//   to start below 0x80.
+//
+//   **BIT STRING has a leading unused-bits byte**, zero for everything here. Omitting it shifts the
+//   whole key by one byte and every parser reads a different key.
+
+import {
+  tagBoolean, tagInteger, tagBitString, tagOctetString, tagOid, tagSequence, tagUtcTime,
+  tagGeneralizedTime, tagContext,
+} from "./asn1.wac";
+
+/** A tag, a DER length, and a body. */
+export u8[] derTlv(i32 tag, u8[] body) {
+  u8[] length = derLength(body.len());
+  u8[] out = u8[1 + length.len() + body.len()]();
+  out[0] = tag;
+  for (i32 i = 0; i < length.len(); i++) { out[1 + i] = length[i]; }
+  for (i32 i = 0; i < body.len(); i++) { out[1 + length.len() + i] = body[i]; }
+  return out;
+}
+
+/**
+ * A DER length: short form under 128, else long form with no leading zeros.
+ *
+ * The shortest encoding is the only legal one. `0x81 0x05` and `0x05` describe the same length and
+ * only the second is DER — a parser that accepts both, as many do, will read a certificate that no
+ * verifier agrees with the signature of.
+ */
+export u8[] derLength(i32 n) {
+  if (n < 128) {
+    u8[] out = u8[1]();
+    out[0] = n;
+    return out;
+  }
+  // How many bytes the value needs, most significant first with no leading zero.
+  i32 bytes = 0;
+  i32 v = n;
+  while (v > 0) {
+    bytes = bytes + 1;
+    v = v / 256;
+  }
+  u8[] out = u8[1 + bytes]();
+  out[0] = 0x80 | bytes;
+  for (i32 i = 0; i < bytes; i++) {
+    out[1 + i] = (n / powOf256(bytes - 1 - i)) % 256;
+  }
+  return out;
+}
+
+i32 powOf256(i32 k) {
+  i32 v = 1;
+  for (i32 i = 0; i < k; i++) { v = v * 256; }
+  return v;
+}
+
+/**
+ * An INTEGER from a big-endian magnitude, as a non-negative number.
+ *
+ * A leading zero is added when the top bit is set — without it the value is negative — and redundant
+ * leading zeros are stripped, since DER admits only the shortest form. Both directions matter: an
+ * RSA modulus always needs the byte added and a public exponent of `01 00 01` must not have one.
+ */
+export u8[] derInteger(u8[] magnitude) {
+  i32 from = 0;
+  while (from + 1 < magnitude.len() && magnitude[from] == 0) { from++; }
+  bool needsPad = magnitude.len() > 0 && magnitude[from] >= 0x80;
+  i32 n = magnitude.len() - from;
+  if (n == 0) {
+    // Zero is a single zero byte, not an empty one.
+    u8[] zero = u8[1]();
+    return derTlv(tagInteger(), zero);
+  }
+  u8[] body = u8[n + (needsPad ? 1 : 0)]();
+  i32 at = needsPad ? 1 : 0;
+  for (i32 i = 0; i < n; i++) { body[at + i] = magnitude[from + i]; }
+  return derTlv(tagInteger(), body);
+}
+
+/** A small non-negative INTEGER, for versions and serial numbers that fit in a word. */
+export u8[] derIntegerSmall(i64 value) {
+  if (value < 0) { return u8[0](); }
+  u8[] big = u8[8]();
+  for (i32 i = 0; i < 8; i++) {
+    big[i] = ((value >> (((7 - i) * 8) as@ u32)) & 0xFF) as~ i32;
+  }
+  return derInteger(big);
+}
+
+/** A BIT STRING with no unused bits — the only kind anything here needs. */
+export u8[] derBitString(u8[] bits) {
+  u8[] body = u8[1 + bits.len()]();
+  body[0] = 0;                        // unused bits
+  for (i32 i = 0; i < bits.len(); i++) { body[1 + i] = bits[i]; }
+  return derTlv(tagBitString(), body);
+}
+
+export u8[] derOctetString(u8[] bytes) { return derTlv(tagOctetString(), bytes); }
+export u8[] derOid(u8[] encodedOid) { return derTlv(tagOid(), encodedOid); }
+export u8[] derBoolean(bool value) {
+  u8[] body = u8[1]();
+  body[0] = value ? 0xFF : 0x00;      // DER's TRUE is 0xFF, not any non-zero byte
+  return derTlv(tagBoolean(), body);
+}
+export u8[] derSequence(u8[] body) { return derTlv(tagSequence(), body); }
+export u8[] derSet(u8[] body) { return derTlv(0x31, body); }
+export u8[] derExplicit(i32 n, u8[] body) { return derTlv(tagContext(n), body); }
+
+/** A PrintableString, tag 0x13. */
+export u8[] derPrintableString(string s) { return derTlv(0x13, s.toBytes()); }
+
+/**
+ * A UTCTime, `YYMMDDHHMMSSZ`.
+ *
+ * X.509 says UTCTime for years through 2049 and GeneralizedTime after — and the two are not
+ * interchangeable, because a two-digit year is read as 19xx above 49. `derTime` below picks; this is
+ * here so a caller that knows can be explicit.
+ */
+export u8[] derUtcTime(i64 secondsSinceEpoch) {
+  i64[] p = civilFrom(secondsSinceEpoch);
+  if (p[0] < 1950 || p[0] > 2049) { return u8[0](); }
+  i64 yy = p[0] % 100;
+  u8[] text = u8[13]();
+  put2(text, 0, yy);
+  put2(text, 2, p[1]);
+  put2(text, 4, p[2]);
+  put2(text, 6, p[3]);
+  put2(text, 8, p[4]);
+  put2(text, 10, p[5]);
+  text[12] = 'Z';
+  return derTlv(tagUtcTime(), text);
+}
+
+/** A GeneralizedTime, `YYYYMMDDHHMMSSZ`, for 2050 and later. */
+export u8[] derGeneralizedTime(i64 secondsSinceEpoch) {
+  i64[] p = civilFrom(secondsSinceEpoch);
+  if (p[0] < 0 || p[0] > 9999) { return u8[0](); }
+  u8[] text = u8[15]();
+  put2(text, 0, p[0] / 100);
+  put2(text, 2, p[0] % 100);
+  put2(text, 4, p[1]);
+  put2(text, 6, p[2]);
+  put2(text, 8, p[3]);
+  put2(text, 10, p[4]);
+  put2(text, 12, p[5]);
+  text[14] = 'Z';
+  return derTlv(tagGeneralizedTime(), text);
+}
+
+/**
+ * UTCTime through 2049, GeneralizedTime after, which is what RFC 5280 requires.
+ *
+ * Not a stylistic choice: a UTCTime year of `50` means 1950, so a certificate valid until 2050
+ * encoded as UTCTime expires a century in the past.
+ */
+export u8[] derTime(i64 secondsSinceEpoch) {
+  i64[] p = civilFrom(secondsSinceEpoch);
+  return (p[0] <= 2049) ? derUtcTime(secondsSinceEpoch) : derGeneralizedTime(secondsSinceEpoch);
+}
+
+void put2(u8[] out, i32 at, i64 v) {
+  out[at] = ('0' + ((v / 10) % 10)) as~ i32;
+  out[at + 1] = ('0' + (v % 10)) as~ i32;
+}
+
+/**
+ * Seconds since the epoch as `[year, month, day, hour, minute, second]`.
+ *
+ * Howard Hinnant's civil-from-days, which is the standard way to do this without a table: shift the
+ * epoch to March so that a leap day lands at the end of a year, then the month arithmetic has no
+ * special cases.
+ */
+export i64[] civilFrom(i64 seconds) {
+  i64 days = seconds / 86400;
+  i64 rem = seconds % 86400;
+  if (rem < 0) {
+    rem = rem + 86400;
+    days = days - 1;
+  }
+  i64 z = days + 719468;
+  i64 era = (z >= 0 ? z : z - 146096) / 146097;
+  i64 doe = z - era * 146097;
+  i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  i64 y = yoe + era * 400;
+  i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  i64 mp = (5 * doy + 2) / 153;
+  i64 d = doy - (153 * mp + 2) / 5 + 1;
+  i64 m = mp + (mp < 10 ? 3 : -9);
+  if (m <= 2) { y = y + 1; }
+  return i64[](y, m, d, rem / 3600, (rem / 60) % 60, rem % 60);
+}
+
+/** Several encoded values, one after another — a SEQUENCE's body before it is wrapped. */
+export u8[] derConcat(u8[][] parts) {
+  i32 n = 0;
+  for (i32 i = 0; i < parts.len(); i++) { n = n + parts[i].len(); }
+  u8[] out = u8[n]();
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) {
+    for (i32 j = 0; j < parts[i].len(); j++) { out[at + j] = parts[i][j]; }
+    at = at + parts[i].len();
+  }
+  return out;
+}

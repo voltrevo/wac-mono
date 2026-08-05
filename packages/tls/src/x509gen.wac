@@ -1,0 +1,201 @@
+// Generating X.509 certificates: the writer that `x509.wac` is the reader for.
+//
+// Two kinds, because Tor needs both:
+//
+//   - **ed25519, self-signed.** A relay's TLS link certificate. `packages/tls`'s server signs
+//     CertificateVerify with ed25519, so the certificate it presents must carry an ed25519 key.
+//     Rotated every few hours by a real relay, which is why generating it has to be ours.
+//   - **RSA, self-signed.** A relay's identity certificate — CertType 2 in a CERTS cell. RSA-1024,
+//     because that is what a Tor identity key is and the other end checks it.
+//
+// ## What a self-signed certificate is and is not
+//
+// Nothing here is a certificate authority and nothing signs anything but itself. A Tor relay's TLS
+// certificate is not validated as a chain by anybody: tor checks that the *ed25519* certificate
+// chain in the CERTS cell certifies this certificate's SHA-256 digest, and the X.509 is a carrier
+// for a public key. So `notBefore`/`notAfter` and the subject name are filled in because the format
+// requires them, not because anything depends on them.
+//
+// That is worth stating rather than assuming, because it is the reason this file can be short. A
+// generator for the web PKI would need extensions, name constraints and a policy story; this one
+// needs a well-formed carrier.
+//
+// ## The bytes are signed, so re-encoding is not equivalence
+//
+// The signature covers `tbsCertificate` exactly as encoded. `derwrite.wac` says more about why DER's
+// single-encoding rule matters; the consequence here is that `tbsCertificate` is built once and both
+// signed and embedded, never built twice.
+
+import { ed25519Sign, ed25519PublicKey } from "../../crypto/src/ed25519.wac";
+import { rsaSignPkcs1 } from "../../crypto/src/rsa.wac";
+import {
+  oidEd25519, oidRsaEncryption, oidRsaSha256,
+} from "./asn1.wac";
+import {
+  derSequence, derSet, derInteger, derIntegerSmall, derBitString, derOid, derExplicit,
+  derPrintableString, derTime, derConcat, derTlv,
+} from "./derwrite.wac";
+
+/** `id-at-commonName`, 2.5.4.3. */
+u8[] oidCommonName() { return u8[](0x55, 0x04, 0x03); }
+/** `id-ce-basicConstraints`, 2.5.29.19. */
+u8[] oidBasicConstraintsHere() { return u8[](0x55, 0x1D, 0x13); }
+
+/** `SEQUENCE { SET { SEQUENCE { OID commonName, PrintableString name } } }`. */
+u8[] nameOf(string commonName) {
+  u8[][] atv = u8[][2]();
+  atv[0] = derOid(oidCommonName());
+  atv[1] = derPrintableString(commonName);
+  u8[][] rdn = u8[][1]();
+  rdn[0] = derSequence(derConcat(atv));
+  u8[][] seq = u8[][1]();
+  seq[0] = derSet(derConcat(rdn));
+  return derSequence(derConcat(seq));
+}
+
+/** `SEQUENCE { OID }` — an AlgorithmIdentifier with absent parameters, which is ed25519's form. */
+u8[] algEd25519() {
+  u8[][] p = u8[][1]();
+  p[0] = derOid(oidEd25519());
+  return derSequence(derConcat(p));
+}
+
+/**
+ * `SEQUENCE { OID, NULL }` — RSA's form, and the NULL is required.
+ *
+ * RFC 4055: for `rsaEncryption` and `sha256WithRSAEncryption` the parameters field must be present
+ * and NULL, not absent. Omitting it is the commonest way a hand-built RSA certificate fails to
+ * verify while parsing perfectly.
+ */
+u8[] algRsa(u8[] oid) {
+  u8[][] p = u8[][2]();
+  p[0] = derOid(oid);
+  p[1] = derTlv(0x05, u8[0]());       // NULL
+  return derSequence(derConcat(p));
+}
+
+/** `SEQUENCE { AlgorithmIdentifier, BIT STRING }`. */
+u8[] spki(u8[] algorithm, u8[] keyBits) {
+  u8[][] p = u8[][2]();
+  p[0] = algorithm;
+  p[1] = derBitString(keyBits);
+  return derSequence(derConcat(p));
+}
+
+/** `SEQUENCE { RSAPublicKey }` as a BIT STRING body: `SEQUENCE { INTEGER n, INTEGER e }`. */
+u8[] rsaPublicKeyBits(u8[] modulus, u8[] exponent) {
+  u8[][] p = u8[][2]();
+  p[0] = derInteger(modulus);
+  p[1] = derInteger(exponent);
+  return derSequence(derConcat(p));
+}
+
+/** `SEQUENCE { notBefore, notAfter }`. */
+u8[] validity(i64 notBefore, i64 notAfter) {
+  u8[][] p = u8[][2]();
+  p[0] = derTime(notBefore);
+  p[1] = derTime(notAfter);
+  return derSequence(derConcat(p));
+}
+
+/**
+ * `[3] EXPLICIT SEQUENCE { basicConstraints }` — the one extension worth stating.
+ *
+ * Marked critical, so a verifier that does not understand it must reject rather than ignore. For a
+ * leaf that is the point: `cA` absent means FALSE means this certificate may not sign others, and a
+ * verifier quietly skipping the extension is how a leaf becomes an intermediate.
+ */
+u8[] extensions(bool isCa) {
+  u8[][] ext = u8[][3]();
+  ext[0] = derOid(oidBasicConstraintsHere());
+  ext[1] = derTlv(0x01, caTrue());                       // critical: TRUE
+  ext[2] = derTlv(0x04, derSequence(isCa ? derTlv(0x01, caTrue()) : u8[0]()));
+  u8[][] one = u8[][1]();
+  one[0] = derSequence(derConcat(ext));
+  return derExplicit(3, derSequence(derConcat(one)));
+}
+
+u8[] caTrue() {
+  u8[] b = u8[1]();
+  b[0] = 0xFF;
+  return b;
+}
+
+/**
+ * The `tbsCertificate`, which is the part that is signed.
+ *
+ * Version 3 — `[0] EXPLICIT INTEGER 2` — because anything with extensions must be. A v1 certificate
+ * carrying extensions is malformed, and the version field being an *explicit* tag rather than a
+ * plain integer is the piece most easily got wrong.
+ */
+u8[] tbsCertificate(
+  i64 serial, u8[] signatureAlgorithm, string subject, i64 notBefore, i64 notAfter,
+  u8[] subjectPublicKeyInfo, bool isCa
+) {
+  u8[] name = nameOf(subject);
+  u8[][] p = u8[][7]();
+  p[0] = derExplicit(0, derIntegerSmall(2));   // version v3
+  p[1] = derIntegerSmall(serial);
+  p[2] = signatureAlgorithm;
+  p[3] = name;                                  // issuer — self-signed, so the same
+  p[4] = validity(notBefore, notAfter);
+  p[5] = name;                                  // subject
+  p[6] = subjectPublicKeyInfo;
+  u8[] body = derConcat(p);
+  u8[][] both = u8[][2]();
+  both[0] = body;
+  both[1] = extensions(isCa);
+  return derSequence(derConcat(both));
+}
+
+/** `SEQUENCE { tbsCertificate, AlgorithmIdentifier, BIT STRING signature }`. */
+u8[] wrap(u8[] tbs, u8[] algorithm, u8[] signature) {
+  u8[][] p = u8[][3]();
+  p[0] = tbs;
+  p[1] = algorithm;
+  p[2] = derBitString(signature);
+  return derSequence(derConcat(p));
+}
+
+/**
+ * A self-signed ed25519 certificate, DER.
+ *
+ * `seed` is the 32-byte ed25519 seed; the public key is derived from it rather than passed in, so
+ * the certificate cannot name a key it was not signed by.
+ *
+ * Empty if the seed is the wrong width or the validity window is inverted — a certificate whose
+ * `notAfter` precedes its `notBefore` parses and is never valid, which is worse than not existing.
+ */
+export u8[] selfSignedEd25519(string subject, i64 serial, i64 notBefore, i64 notAfter, u8[] seed) {
+  if (seed.len() != 32) { return u8[0](); }
+  if (notAfter <= notBefore) { return u8[0](); }
+  u8[] alg = algEd25519();
+  u8[] tbs = tbsCertificate(serial, alg, subject, notBefore, notAfter,
+                            spki(alg, ed25519PublicKey(seed)), false);
+  if (tbs.len() == 0) { return u8[0](); }
+  u8[] sig = ed25519Sign(seed, tbs);
+  if (sig.len() != 64) { return u8[0](); }
+  return wrap(tbs, alg, sig);
+}
+
+/**
+ * A self-signed RSA certificate, DER, signed `sha256WithRSAEncryption`.
+ *
+ * `modulus` and `exponent` are the public key as big-endian magnitudes; `privateExponent` is `d`.
+ * See the timing note at the bottom of `packages/crypto/src/rsa.wac` about what these keys are for.
+ */
+export u8[] selfSignedRsa(
+  string subject, i64 serial, i64 notBefore, i64 notAfter,
+  u8[] modulus, u8[] exponent, u8[] privateExponent
+) {
+  if (modulus.len() == 0 || exponent.len() == 0 || privateExponent.len() == 0) { return u8[0](); }
+  if (notAfter <= notBefore) { return u8[0](); }
+  u8[] alg = algRsa(oidRsaSha256());
+  u8[] tbs = tbsCertificate(serial, alg, subject, notBefore, notAfter,
+                            spki(algRsa(oidRsaEncryption()),
+                                 rsaPublicKeyBits(modulus, exponent)), false);
+  if (tbs.len() == 0) { return u8[0](); }
+  u8[] sig = rsaSignPkcs1(modulus, privateExponent, tbs, 32);
+  if (sig.len() == 0) { return u8[0](); }
+  return wrap(tbs, alg, sig);
+}

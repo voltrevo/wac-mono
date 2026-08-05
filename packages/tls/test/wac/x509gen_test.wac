@@ -1,0 +1,233 @@
+// Generating X.509 certificates, checked by OpenSSL.
+//
+// Our own parser reading our own certificates would establish only that the two agree, and a DER
+// encoder and decoder written together agree about their shared mistakes — a length in long form
+// where short form is required round-trips perfectly and is not DER. So the oracle here is
+// `openssl x509` and `openssl verify`, on the host, which have never seen this code.
+//
+// Our parser is checked too, second: the certificates have to be ones `x509.wac` reads, since that
+// is what a peer's TLS stack does with them.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import { ed25519PublicKey } from "../../../crypto/src/ed25519.wac";
+import { selfSignedEd25519, selfSignedRsa } from "../../src/x509gen.wac";
+import {
+  derLength, derInteger, derIntegerSmall, derBitString, derTime, derUtcTime, derGeneralizedTime,
+  civilFrom,
+} from "../../src/derwrite.wac";
+import { parseCert, certSignedBy, Cert, keyEd25519, keyRsa, sigEd25519Alg, sigRsaSha256 }
+  from "../../src/x509.wac";
+
+const i32 V_RSA_KEY = 0;        // n(len2) n e(len2) e d(len2) d
+const i32 V_CHECK_CERT = 1;     // a = DER; [1] if openssl parses and the self-signature verifies
+const i32 V_CERT_SUBJECT = 2;   // a = DER; openssl's idea of the subject CN
+const i32 V_CERT_KEYTYPE = 3;   // a = DER; openssl's idea of the key algorithm
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+u8[] none() { return u8[0](); }
+
+// 2026-08-05 and a year later, well inside UTCTime's range.
+const i64 NOT_BEFORE = 1785888000;
+const i64 NOT_AFTER = 1817424000;
+
+export string test_openssl_reads_and_verifies_an_ed25519_certificate(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  T t = T.create();
+  u8[] seed = u8[32]();
+  for (i32 i = 0; i < 32; i++) { seed[i] = (i * 7 + 3) & 0xFF; }
+
+  u8[] der = selfSignedEd25519("wac relay", 1, NOT_BEFORE, NOT_AFTER, seed);
+  t.isTrue(der.len() > 100, "a certificate was produced");
+  t.eqI32(der[0], 0x30, "and it is a SEQUENCE");
+
+  t.eqI32(ref(V_CHECK_CERT, der, none())[0], 1,
+          "openssl parses it and the self-signature verifies");
+  t.isTrue(same(ref(V_CERT_SUBJECT, der, none()), "wac relay".toBytes()),
+           "openssl reads the subject we asked for");
+  t.isTrue(same(ref(V_CERT_KEYTYPE, der, none()), "ED25519".toBytes()),
+           "and sees an ed25519 key");
+
+  // And our own parser, which is what a peer's TLS stack would do with it.
+  Cert c = parseCert(der);
+  t.isTrue(c.wellFormed, "our parser reads it");
+  t.eqI32(c.keyType, keyEd25519(), "as an ed25519 key");
+  t.eqI32(c.sigAlg, sigEd25519Alg(), "signed with ed25519");
+  t.isTrue(same(c.publicKey, ed25519PublicKey(seed)),
+           "carrying the key derived from the seed, not one passed in beside it");
+  t.eqI64(c.notBefore, NOT_BEFORE, "notBefore round-trips through UTCTime");
+  t.eqI64(c.notAfter, NOT_AFTER, "and so does notAfter");
+  t.isFalse(c.isCa, "a leaf, not a CA");
+  // Self-signed, so our own signature check must accept it against itself. That is the same
+  // assertion openssl just made, from the other implementation.
+  t.isTrue(certSignedBy(c, c), "and our verifier accepts the self-signature");
+  return t.report();
+}
+
+export string test_openssl_reads_and_verifies_an_rsa_certificate(fn[u8[](i32, u8[], u8[])] ref) {
+  // RSA-1024, because that is what a Tor identity key is. This is also the first end-to-end use of
+  // `rsaSignPkcs1` from design/0002 step 1 in something another implementation has to accept.
+  T t = T.create();
+  u8[] key = ref(V_RSA_KEY, none(), none());
+  i32 nLen = (key[0] * 256) + key[1];
+  u8[] n = slice(key, 2, 2 + nLen);
+  i32 at = 2 + nLen;
+  i32 eLen = (key[at] * 256) + key[at + 1];
+  u8[] e = slice(key, at + 2, at + 2 + eLen);
+  at = at + 2 + eLen;
+  i32 dLen = (key[at] * 256) + key[at + 1];
+  u8[] d = slice(key, at + 2, at + 2 + dLen);
+  t.eqI32(n.len(), 128, "an RSA-1024 modulus");
+
+  u8[] der = selfSignedRsa("wac relay identity", 2, NOT_BEFORE, NOT_AFTER, n, e, d);
+  t.isTrue(der.len() > 300, "a certificate was produced");
+  t.eqI32(ref(V_CHECK_CERT, der, none())[0], 1,
+          "openssl parses it and the RSA self-signature verifies");
+  t.isTrue(same(ref(V_CERT_SUBJECT, der, none()), "wac relay identity".toBytes()),
+           "with the subject we asked for");
+  t.isTrue(same(ref(V_CERT_KEYTYPE, der, none()), "rsaEncryption".toBytes()),
+           "and an RSA key");
+
+  // **The NULL parameters, asserted against the RFC rather than against a verifier.** RFC 4055 §2.1
+  // requires the parameters field of `rsaEncryption` and `sha256WithRSAEncryption` to be present and
+  // NULL, not absent. OpenSSL accepts a certificate without it — removing the NULL survived every
+  // check above — so tolerance is not evidence, and the bytes are checked directly.
+  //
+  // **Three** algorithm identifiers, not two: RFC 5280 puts the signature algorithm inside
+  // `tbsCertificate` *and* again in the outer Certificate — and requires the two to match, so that a
+  // signature cannot be relabelled without breaking it — plus the one in the SPKI. Each OID must be
+  // followed by `05 00`.
+  i32 found = 0;
+  i32 withNull = 0;
+  for (i32 i = 0; i + 11 <= der.len(); i++) {
+    // 06 09 <rsaEncryption> or 06 09 <sha256WithRSAEncryption>: both are nine-byte OIDs starting
+    // 2a 86 48 86 f7 0d 01 01, differing only in the last byte.
+    if (der[i] == 0x06 && der[i + 1] == 9 && der[i + 2] == 0x2A && der[i + 3] == 0x86 &&
+        der[i + 4] == 0x48 && der[i + 5] == 0x86 && der[i + 6] == 0xF7 && der[i + 7] == 0x0D &&
+        der[i + 8] == 0x01 && der[i + 9] == 0x01) {
+      found = found + 1;
+      if (i + 12 < der.len() && der[i + 11] == 0x05 && der[i + 12] == 0x00) {
+        withNull = withNull + 1;
+      }
+    }
+  }
+  t.eqI32(found, 3, "all three RSA algorithm identifiers are present");
+  t.eqI32(withNull, 3, "and each carries the NULL parameters RFC 4055 requires");
+
+  Cert c = parseCert(der);
+  t.isTrue(c.wellFormed, "our parser reads it");
+  t.eqI32(c.keyType, keyRsa(), "as an RSA key");
+  t.eqI32(c.sigAlg, sigRsaSha256(), "signed sha256WithRSAEncryption");
+  t.isTrue(same(c.publicKey, n), "carrying the modulus, with the DER sign byte stripped");
+  t.isTrue(same(c.rsaExponent, e), "and the exponent");
+  t.isTrue(certSignedBy(c, c), "and our verifier accepts the self-signature");
+  return t.report();
+}
+
+export string test_a_certificate_that_cannot_be_valid_is_not_produced(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  // A window that ends before it begins parses fine and is never valid, which is worse than nothing:
+  // it fails at use, far from here, with a message about expiry rather than about generation.
+  T t = T.create();
+  u8[] seed = u8[32]();
+  t.eqI32(selfSignedEd25519("x", 1, NOT_AFTER, NOT_BEFORE, seed).len(), 0,
+          "an inverted validity window is refused");
+  t.eqI32(selfSignedEd25519("x", 1, NOT_BEFORE, NOT_BEFORE, seed).len(), 0,
+          "and a zero-length one");
+  t.eqI32(selfSignedEd25519("x", 1, NOT_BEFORE, NOT_AFTER, u8[31]()).len(), 0,
+          "a 31-byte seed is refused");
+  t.eqI32(selfSignedRsa("x", 1, NOT_BEFORE, NOT_AFTER, u8[0](), u8[](1), u8[](1)).len(), 0,
+          "an empty modulus is refused");
+  return t.report();
+}
+
+export string test_der_lengths_and_integers_are_the_shortest_form(fn[u8[](i32, u8[], u8[])] ref) {
+  // DER admits exactly one encoding, which is what makes a signature over it meaningful. Both of
+  // these have a legal-BER alternative that is not DER, and a decoder written alongside this encoder
+  // would accept either — so they are asserted against the rule, not against a round trip.
+  T t = T.create();
+  t.eqI32(derLength(0).len(), 1, "zero is one byte");
+  t.eqI32(derLength(127)[0], 127, "127 is short form");
+  t.eqI32(derLength(128).len(), 2, "128 needs long form");
+  t.eqI32(derLength(128)[0], 0x81, "one following length byte");
+  t.eqI32(derLength(128)[1], 128, "which is the length");
+  t.eqI32(derLength(255)[1], 255, "255 still fits one byte");
+  t.eqI32(derLength(256).len(), 3, "256 needs two");
+  t.eqI32(derLength(256)[0], 0x82, "so the header says two");
+  t.eqI32(derLength(256)[1], 1, "big-endian, high byte first");
+  t.eqI32(derLength(256)[2], 0, "and no leading zero beyond what is needed");
+
+  // INTEGER is signed: a top bit set needs a leading zero, and a redundant one is malformed.
+  u8[] high = u8[](0xFF, 0x01);
+  u8[] enc = derInteger(high);
+  t.eqI32(enc[0], 0x02, "an INTEGER");
+  t.eqI32(enc[1], 3, "three content bytes");
+  t.eqI32(enc[2], 0, "a leading zero, because the top bit was set");
+  u8[] low = u8[](0x01, 0x00, 0x01);
+  u8[] enc2 = derInteger(low);
+  t.eqI32(enc2[1], 3, "65537 needs no padding");
+  t.eqI32(enc2[2], 1, "and begins with its own first byte");
+  u8[] padded = u8[](0x00, 0x00, 0x7F);
+  t.eqI32(derInteger(padded)[1], 1, "redundant leading zeros are stripped");
+  t.eqI32(derIntegerSmall(0)[1], 1, "zero is one zero byte, not none");
+  t.eqI32(derIntegerSmall(0)[2], 0, "and that byte is zero");
+
+  // A BIT STRING's first content byte is the unused-bit count. Omitting it shifts the key.
+  u8[] bits = derBitString(u8[](0xAB, 0xCD));
+  t.eqI32(bits[0], 0x03, "a BIT STRING");
+  t.eqI32(bits[1], 3, "three content bytes for two of data");
+  t.eqI32(bits[2], 0, "the first being the unused-bit count");
+  t.eqI32(bits[3], 0xAB, "then the data");
+  return t.report();
+}
+
+export string test_time_crosses_the_utc_boundary_correctly(fn[u8[](i32, u8[], u8[])] ref) {
+  // X.509 uses UTCTime through 2049 and GeneralizedTime after. They are not interchangeable: a
+  // two-digit year of 50 reads as 1950, so a certificate valid to 2050 written as UTCTime expires a
+  // century in the past.
+  T t = T.create();
+  i64[] c = civilFrom(1785888000);
+  t.eqI64(c[0], 2026, "2026");
+  t.eqI64(c[1], 8, "August");
+  t.eqI64(c[2], 5, "the fifth");
+
+  // A known instant, checked digit by digit: 2026-08-05T00:00:00Z.
+  u8[] utc = derUtcTime(1785888000);
+  t.eqI32(utc[0], 0x17, "tag UTCTime");
+  t.eqI32(utc[1], 13, "thirteen characters");
+  t.isTrue(same(slice(utc, 2, 15), "260805000000Z".toBytes()), "YYMMDDHHMMSSZ");
+
+  // The epoch, and a leap day, since the month arithmetic is where a date routine goes wrong.
+  t.isTrue(same(slice(derUtcTime(0), 2, 15), "700101000000Z".toBytes()), "the epoch is 1970-01-01");
+  t.isTrue(same(slice(derUtcTime(951782400), 2, 15), "000229000000Z".toBytes()),
+           "2000-02-29 exists — 2000 is a leap year despite being a century");
+  t.isTrue(same(slice(derUtcTime(1709164800), 2, 15), "240229000000Z".toBytes()),
+           "and so does 2024-02-29");
+
+  // The boundary itself.
+  // The boundary is 2049/2050 and it is worth pinning from both sides, one day apart — the rule is
+  // "through 2049", not "before 2050 minus a margin", and an off-by-one here writes a year that
+  // reads as 1950.
+  t.eqI32(derTime(2524521600)[0], 0x17, "2049-12-31 is UTCTime");
+  t.eqI32(derTime(2524608000)[0], 0x18, "2050-01-01, one day later, is GeneralizedTime");
+  t.eqI32(derTime(2556144000)[0], 0x18, "and so is 2051");
+  u8[] gen = derGeneralizedTime(2556144000);
+  t.eqI32(gen[1], 15, "fifteen characters, with a four-digit year");
+  t.isTrue(same(slice(gen, 2, 17), "20510101000000Z".toBytes()), "YYYYMMDDHHMMSSZ");
+  t.eqI32(derUtcTime(2556144000).len(), 0, "and UTCTime refuses 2051 rather than writing 51");
+  return t.report();
+}
+
+u8[] slice(u8[] s, i32 from, i32 to) {
+  u8[] o = u8[to - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = s[from + i]; }
+  return o;
+}

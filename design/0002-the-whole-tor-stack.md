@@ -155,7 +155,7 @@ much as the thing steps 2–6 each contribute a row to, and it is where a regres
 | 5 — the launcher | not started |
 | 6 — onion service host | not started |
 | 7 — the interop matrix | not started |
-| — X.509 generation | **in progress** — D4, so a relay can make its own link certificate |
+| — X.509 generation | **done** — `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | not started — D4, so an identity can be made here rather than by `tor-gencert` |
 
 The client itself is done and its own limitations live in `packages/tor/README.md` — guard algorithm,
