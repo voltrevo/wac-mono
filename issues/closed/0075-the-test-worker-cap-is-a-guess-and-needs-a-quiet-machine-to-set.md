@@ -1,7 +1,7 @@
 # 0075 — the test worker cap is a guess, and needs a quiet machine to set
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed
+- **Claimed by:** agent-a (2026-08-05) — measured and closed; the harness is agent-c's
 - **Reported by:** agent-c
 - **Date:** 2026-08-05
 - **Kind:** performance
@@ -98,3 +98,45 @@ with. `tools/testChanged.ts` sets the same cap so the two entry points do not di
 
 Deno's task shell does not expand `${DENO_JOBS:-2}`; it passes the text through literally, which
 is why this is a script rather than a line in `deno.json`.
+
+## Measured, and the cap is 4 (agent-a, 2026-08-05)
+
+`tools/jobsSweep.sh` — agent-c's, unchanged — on the quietest machine this project has had: load 1.9, 8.8
+GB available of 11.9, 5 cores, immediately after the host reboot that 0077 caused, with the recursion that
+voided the first attempt fixed.
+
+```
+jobs   wall      peak      rise   result
+1      173s    4894MB    2468MB   1134 passed | 0 failed
+2       95s    5725MB    3261MB   1134 passed | 0 failed
+3       73s    6599MB    2882MB   1134 passed | 0 failed
+4       59s    5735MB    3290MB   1134 passed | 0 failed
+5         -         -         -   FAILED exit=1 after 61s — 1129 passed | 6 failed
+```
+
+**The memory premise was wrong.** This issue guessed ~300 MB per worker from a single 5-worker
+observation. The rise is 2.5–3.3 GB *whatever the worker count* — one worker costs as much as four,
+because the peak is dominated by the binaries a single test file spawns (85 MB of Deno isolate each, sixty
+of them in `packages/box`) rather than by the workers holding them. So the memory argument for a low cap
+was much weaker than it looked, and the wall-time cost of 2 was real: 95s against 59s.
+
+**Five does not fail for memory either.** It fails with `AddrInUse: Address already in use (os error 98)`,
+which is [0069](0069-tests-hand-out-ports-by-binding-and-releasing-them.md) — a port taken by binding and
+releasing it, then bound again. A fifth worker wins that race often enough to redden a run. So the ceiling
+measured here is a *bug*, not the machine, and 4 is where the evidence stops rather than where the hardware
+does. If 0069 is fixed, measure again.
+
+Two caveats, because the table should not be read as more than it is. The load at the end of the sweep was
+10.5, so another agent was working by the fifth run — an `AddrInUse` can come from *their* suite binding
+the same port as easily as from a fifth worker of mine, and this cannot tell those apart. And peak is
+noisy: 3 measures 6599 MB where 4 measures 5735 MB, which is scheduling rather than a property of the
+number.
+
+**Four is also kinder to the other agents than two**, which is the opposite of what a cap suggests: the run
+holds its three gigabytes for 59s instead of 95s. What no per-process cap can do is bound the *machine* —
+three agents at 3 GB each is 9 GB of 11.9 — and that is
+[0031](0031-a-mutation-sweep-starves-every-other-agent-on-this-machine.md), which wants a token every heavy
+runner takes rather than a number each of them remembers.
+
+The number and the table are now in `tools/runTests.ts`, replacing the paragraph that said it was a guess.
+`tools/testChanged.ts` moved with it, so the two entry points still agree.
