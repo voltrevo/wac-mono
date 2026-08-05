@@ -51,6 +51,7 @@ import { serveHostCalls } from "./respond.ts";
 import {
   changeBytes,
   changed,
+  CHANGED_OK,
   faultOf,
   FAULT_DENIED,
   FAULT_EXISTS,
@@ -757,11 +758,12 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     [OP.OPEN_OUTPUT]: async (p) => {
       const path = unstr(p);
       if (sink !== null) { await sink.close(); sink = null; }
-      if (path === "") return EMPTY;
+      if (path === "") return CHANGED_OK;
       canWrite();
-      const { dir, name } = await resolve(path, true);
-      sink = await (await dir.getFileHandle(name, { create: true })).createWritable();
-      return EMPTY;
+      return await changed(async () => {
+        const { dir, name } = await resolve(path, true);
+        sink = await (await dir.getFileHandle(name, { create: true })).createWritable();
+      });
     },
 
     // No TCP in a page, and no honest approximation of one.

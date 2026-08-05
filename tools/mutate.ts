@@ -74,6 +74,8 @@ import {
 } from "./mutate/profile.ts";
 import { ALL_OPERATORS, generate, type OperatorName } from "./mutate/operators.ts";
 import { applyEdits, packagesOf, type Curated, type Edit, type Mutant } from "./mutate/types.ts";
+import { SUITE_ENV } from "./suiteGuard.ts";
+
 
 const args = Deno.args;
 /**
@@ -499,14 +501,23 @@ function testCommand(work: string, dirs: string[], filter?: string): Deno.Comman
                     ...(filter ? ["--filter", filter] : []), ...dirs];
   // `nice` wraps the whole `deno test`, and the niceness is inherited by every subprocess it
   // spawns — which is the point, since those subprocesses are most of the load.
+  // `SUITE_ENV` so a suite launched from inside one of these runs refuses rather than recursing, which
+  // is what filled a machine to load 122 — wac-mono 0077.
   return NICE
     ? new Deno.Command("nice", {
       args: ["-n", "19", "deno", ...denoArgs],
       cwd: work,
+      env: { ...SUITE_ENV },
       stdout: "piped",
       stderr: "piped",
     })
-    : new Deno.Command("deno", { args: denoArgs, cwd: work, stdout: "piped", stderr: "piped" });
+    : new Deno.Command("deno", {
+      args: denoArgs,
+      cwd: work,
+      env: { ...SUITE_ENV },
+      stdout: "piped",
+      stderr: "piped",
+    });
 }
 
 const runTests = (work: string, dirs: string[]) => testCommand(work, dirs).output();

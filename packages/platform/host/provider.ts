@@ -441,7 +441,9 @@ export function cliOf(
     /*= outputError */
     () => T.text(submit(b, OP.OUTPUT_ERROR, EMPTY)),
     /*= openOutput */
-    (path: string) => T.outcome(submit(b, OP.OPEN_OUTPUT, str(path))),
+    // `change`, not `outcome`: the answer is a fault category and the host's message, so a shell can
+    // say what GNU says rather than passing an errno through.
+    (path: string) => T.change(submit(b, OP.OPEN_OUTPUT, str(path))),
 
     /*= connect */
     (host: string, port: number) => T.socket(submit(b, OP.CONNECT, headed(i32le(port), str(host)))),

@@ -194,8 +194,9 @@ Pending<string> fakeOpenInput(string path) {
  * not a state the type admits.
  */
 Read fakeReadChunk() { return Read.End; }
-Pending<string> fakeOpenOutput(string path) {
-  return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
+/** A `Change` now, like the other four that change something — wac-mono 0070. */
+Pending<Change> fakeOpenOutput(string path) {
+  return Pending.of(0, resolveChange, alwaysSettled, ignoreDrop);
 }
 
 Socket resolveSocket(i32 id) { return Socket(-1, "no network", "", 0); }
@@ -370,7 +371,8 @@ export i32 shTouchStubs() {
   if (c.mkdir("d", true).wait().ok()) { n++; }
   if (c.remove("d", true).wait().ok()) { n++; }
   if (c.rename("a", "b").wait().ok()) { n++; }
-  n += c.openInput("x").wait().len() + c.openOutput("x").wait().len();
+  n += c.openInput("x").wait().len();
+  if (c.openOutput("x").wait().ok()) { n++; }
   n += c.connect("h", 1).wait().handle + c.listen("127.0.0.1", 1).wait().handle + c.accept(1).wait().handle;
   if (c.send(1, u8[0]()).wait()) { n++; }
   c.closeSocket(1);

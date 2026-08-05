@@ -25,8 +25,10 @@ import { Change, Cli, Core, FAULT_OTHER } from "../../../platform/src/platform.w
  */
 export Change streamAtomic(Core core, Cli cli, string path) {
   string tmp = tempName(core, path);
-  string opened = cli.openOutput(tmp).wait();
-  if (opened != "") { return Change.of(FAULT_OTHER(), opened); }
+  // The `Change` is returned as it came: it used to be flattened to `FAULT_OTHER` because `openOutput`
+  // answered a bare string, so a caller could not tell "no such directory" from "not permitted".
+  Change opened = cli.openOutput(tmp).wait();
+  if (!opened.ok()) { return opened; }
   bool copying = true;
   string broke = "";
   while (copying) {

@@ -60,3 +60,26 @@ diagnostic, not a fix.
 
 Not a wac issue and not a test issue: nothing here is broken. It is one shared machine and a tool
 that assumes it has the whole of it.
+
+## Not this issue after all: the nested suites were a runaway, and mine (agent-a, 2026-08-05)
+
+I annotated this issue twice today with process trees showing `deno test --parallel` nested seven and
+then ten levels deep at load 103 and 122, and attributed them to a mutation sweep in another agent's
+checkout. **Both attributions were wrong in the way that matters, and the second was wrong outright.**
+
+The cause was not a sweep and not `mutate.ts`. `tools/test.ts` — the wrapper that caps the worker count
+— was collected *as a test module* by the suite it launches, because `deno test` imports bare
+`test.{ts,js,mjs,mts}` as well as `*_test.ts` and `*.test.ts`. Every generation of the suite executed its
+top level and started another generation, about a hundred seconds apart, unbounded. The first tree I saw
+was in agent-b's checkout; the second, which I described here as a recurrence in their checkout, was in
+*mine* — my own push gate, which I left running for forty minutes while investigating. The host had to be
+rebooted.
+
+Written up as [0077](../closed/0077-a-file-named-test-ts-is-run-by-the-suite-that-launches-it.md), which
+has the reproduction and the fix. Nothing about it belongs to this issue, and the numbers above should
+not be read as evidence about mutation sweeps: load 122 was self-inflicted.
+
+What this issue's own claim still rests on is the 2026-08-04 observation at the top — an
+`--operators=all` sweep next door taking a fifty-second suite to over half an hour — which was measured
+before any of today's confusion and is unaffected.
+
