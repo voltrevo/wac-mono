@@ -84,3 +84,17 @@ Deno.test("appRun: a program granted nothing cannot read", async () => {
     await Deno.remove(fixture).catch(() => {});
   }
 });
+
+Deno.test("appRun: an output larger than the queue cap does not deadlock", async () => {
+  // The queues are capped at 8 MB, and before the runner drained concurrently this failed with
+  // `the program's output is not being read` — thrown from the host's `write` handler and escaping
+  // as an unhandled rejection, so Deno failed the whole *module* rather than this case. Verified by
+  // putting the drain back after the exit and watching it happen.
+  const box = await appRunner(BOX, { read: true });
+  const r = await box.run(["seq", "1", "2000000"]);
+  eq(r.code, 0, "exit code");
+  // ~13 MB, comfortably past the 8 MB cap.
+  if (r.bytes.length < 9 << 20) throw new Error(`only ${r.bytes.length} bytes — is seq still counting?`);
+  if (!r.out.startsWith("1\n2\n")) throw new Error(r.out.slice(0, 20));
+  if (!r.out.endsWith("2000000\n")) throw new Error(`ends with ${JSON.stringify(r.out.slice(-20))}`);
+});
