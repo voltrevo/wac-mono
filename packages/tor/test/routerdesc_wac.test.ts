@@ -24,7 +24,9 @@
 // file carries tor's expanded secret and a signature tor made with it, and because ed25519 is
 // deterministic the signature pins all 64 bytes — derivation string and terminating NUL included.
 
-import { createPublicKey, verify as nodeEd25519Verify } from "node:crypto";
+import {
+  constants, createPublicKey, publicDecrypt, verify as nodeEd25519Verify,
+} from "node:crypto";
 import { wacTestRun } from "../../../harness/wacTestRun.ts";
 
 const V_COUNT = 0;
@@ -44,11 +46,20 @@ const P_SIGNBIT = 11; // a[0]=i
 const P_SIGNATURE = 12; // a[0]=i: tor's signature over P_MESSAGE with the derived key
 const P_MESSAGE = 13;
 
+// The descriptor documents themselves, for the signature-digest tests.
+const D_TEXT = 14; // a[0]=i: the whole descriptor, as tor wrote it
+const D_IDENTITY_CERT = 15; // a[0]=i: identity-ed25519, whose certified key is the signing key
+const D_ROUTER_SIG = 16; // a[0]=i: the 64 bytes of router-sig-ed25519
+const D_RSA_RECOVER = 17; // a[0]=i: the digest node recovers from tor's own router-signature
+
 const v = JSON.parse(
   await Deno.readTextFile(new URL("data/routerdesc_vectors.json", import.meta.url)),
 ) as {
   descriptors: {
     nickname: string;
+    descriptor: string;
+    identity_ed25519_cert: string;
+    router_sig_ed25519: string;
     ntor_onion_key: string;
     signbit: number;
     ntor_crosscert: string;
@@ -102,6 +113,40 @@ function hostVerify(pub: Uint8Array, cert: Uint8Array): boolean {
   }
 }
 
+/** The PEM body that follows `keyword` on its own line. */
+function pemAfter(text: string, keyword: string, label: string): string | null {
+  const re = new RegExp(
+    `^${keyword}[^\\n]*\\n-----BEGIN ${label}-----\\n([\\s\\S]*?)-----END ${label}-----`,
+    "m",
+  );
+  return text.match(re)?.[1] ?? null;
+}
+
+/**
+ * The digest tor's `router-signature` actually covers, recovered with a public-key operation.
+ *
+ * The descriptor publishes the RSA identity as `signing-key`, and `router-signature` is that key
+ * signing a bare SHA-1 digest with PKCS#1 padding and no DigestInfo — so recovering the payload is
+ * the only way to see what was signed, and it makes tor's own signature the oracle for our span.
+ * Returns empty if anything is missing, which the wac side asserts against.
+ */
+function recoverRouterSignature(desc: string): Uint8Array {
+  const keyBody = pemAfter(desc, "signing-key", "RSA PUBLIC KEY");
+  const sigBody = pemAfter(desc, "router-signature", "SIGNATURE");
+  if (!keyBody || !sigBody) return new Uint8Array(0);
+  try {
+    const key = createPublicKey({
+      key: `-----BEGIN RSA PUBLIC KEY-----\n${keyBody}-----END RSA PUBLIC KEY-----\n`,
+      format: "pem",
+      type: "pkcs1",
+    });
+    const sig = Uint8Array.from(atob(sigBody.replace(/\s/g, "")), (c) => c.charCodeAt(0));
+    return new Uint8Array(publicDecrypt({ key, padding: constants.RSA_PKCS1_PADDING }, sig));
+  } catch {
+    return new Uint8Array(0);
+  }
+}
+
 function ref(what: number, a: Uint8Array, b: Uint8Array): Uint8Array {
   switch (what) {
     case V_COUNT:
@@ -132,6 +177,17 @@ function ref(what: number, a: Uint8Array, b: Uint8Array): Uint8Array {
       return hex(p.cases[a[0]].signature);
     case P_MESSAGE:
       return new TextEncoder().encode(p.message);
+    case D_TEXT:
+      return new TextEncoder().encode(v.descriptors[a[0]].descriptor);
+    case D_IDENTITY_CERT:
+      return hex(v.descriptors[a[0]].identity_ed25519_cert);
+    case D_ROUTER_SIG: {
+      // tor writes these base64 without padding.
+      const t = v.descriptors[a[0]].router_sig_ed25519;
+      return Uint8Array.from(atob(t + "=".repeat((4 - t.length % 4) % 4)), (c) => c.charCodeAt(0));
+    }
+    case D_RSA_RECOVER:
+      return recoverRouterSignature(v.descriptors[a[0]].descriptor);
     default:
       throw new Error(`unknown vector field ${what}`);
   }

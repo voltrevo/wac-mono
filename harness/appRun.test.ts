@@ -98,3 +98,14 @@ Deno.test("appRun: an output larger than the queue cap does not deadlock", async
   if (!r.out.startsWith("1\n2\n")) throw new Error(r.out.slice(0, 20));
   if (!r.out.endsWith("2000000\n")) throw new Error(`ends with ${JSON.stringify(r.out.slice(-20))}`);
 });
+
+Deno.test("appRun: a program that writes zero bytes mid-stream is not truncated", async () => {
+  // End to end for the `ByteQueue` collision in `packages/platform/test/bytequeue.test.ts`: `true`
+  // returns an empty output, the shell writes it, and empty was the queue's end sentinel. This gave
+  // `one` alone — and 215 of the differential suite's 751 scripts failed the same way, all of them
+  // silently, because an empty write looks exactly like a program that finished.
+  const sh = await appRunner("packages/sh/src/sh.wac", { read: true, write: true, env: true });
+  const r = await sh.run(["-c", "echo one; true; echo two"], { env: { LC_ALL: "C" } });
+  eq(r.out, "one\ntwo\n", "output after a zero-byte write");
+  eq(r.code, 0, "exit code");
+});

@@ -1,0 +1,95 @@
+// Router descriptors: the document a relay publishes about itself.
+//
+// This file is the document's *signatures* first, because they are what a descriptor is checked by
+// and where its layout is least forgiving. Generation is built on top of them.
+//
+// ## The digests cover the line that introduces them
+//
+// Both signatures are computed over a prefix of the document that **includes the keyword announcing
+// the signature**, and neither includes what follows it. Tor builds a descriptor as a list of chunks
+// and digests the list as it stands:
+//
+//     smartlist_add_strdup(chunks, "router-sig-ed25519 ");        <- appended first
+//     crypto_digest_smartlist_prefix(digest, ..., ED_DESC_SIGNATURE_PREFIX, chunks, "", SHA256);
+//
+// So the ed25519 digest covers everything up to and including `router-sig-ed25519 ` — keyword, single
+// trailing space, no newline — and the RSA digest covers everything up to and including
+// `router-signature\n`, newline included. Stopping one line early, or including the newline after
+// `router-sig-ed25519 `, both give a well-formed digest that verifies against nothing.
+//
+// ## Two different hashes and two different keys
+//
+// `router-sig-ed25519` is SHA-256, prefixed with `Tor router descriptor signature v1`, and signed by
+// the relay's **signing key** — the one in `identity-ed25519`'s certified position — not by the master
+// identity, which never signs a descriptor. `router-signature` is SHA-1 with no prefix at all, signed
+// by the RSA identity with raw PKCS#1 and no DigestInfo.
+//
+// Four independent choices, each of which produces a plausible 64 or 128 bytes when wrong.
+
+import { sha1 } from "../../crypto/src/sha1.wac";
+import { sha256 } from "../../crypto/src/sha256.wac";
+
+/** `ED_DESC_SIGNATURE_PREFIX`, from `routerparse.h`. No separator follows it. */
+u8[] edDescriptorPrefix() { return "Tor router descriptor signature v1".toBytes(); }
+
+/** The text a descriptor's ed25519 signature is announced by, trailing space included. */
+u8[] edSignatureKeyword() { return "router-sig-ed25519 ".toBytes(); }
+
+/** The line a descriptor's RSA signature is announced by, newline included. */
+u8[] rsaSignatureKeyword() { return "router-signature\n".toBytes(); }
+
+/**
+ * The offset just past `needle`, which must start a line, or -1.
+ *
+ * Matching only at a line start matters: `router-signature` is a prefix of nothing else in a
+ * descriptor, but `router-sig-ed25519` would match inside an `opt router-sig-ed25519` and a keyword
+ * appearing in a nickname or a contact line is not the document's own structure. hsdesc.wac's
+ * `keywordValue` restricts itself the same way and for the same reason.
+ */
+export i32 pastLineStarting(u8[] text, u8[] needle) {
+  if (needle.len() == 0 || text.len() < needle.len()) { return -1; }
+  for (i32 i = 0; i + needle.len() <= text.len(); i++) {
+    if (i != 0 && text[i - 1] != 10) { continue; }
+    bool hit = true;
+    for (i32 j = 0; j < needle.len(); j++) {
+      if (text[i + j] != needle[j]) { hit = false; break; }
+    }
+    if (hit) { return i + needle.len(); }
+  }
+  return -1;
+}
+
+/** The first `n` bytes of `text`. */
+u8[] head(u8[] text, i32 n) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = text[i]; }
+  return out;
+}
+
+/**
+ * The 32-byte SHA-256 a `router-sig-ed25519` signs, or empty if the keyword is absent.
+ *
+ * The prefix is concatenated with the document with no separator — tor passes it to
+ * `crypto_digest_smartlist_prefix`, which hashes it and then the chunks.
+ */
+export u8[] edDescriptorDigest(u8[] descriptor) {
+  i32 end = pastLineStarting(descriptor, edSignatureKeyword());
+  if (end < 0) { return u8[0](); }
+  u8[] prefix = edDescriptorPrefix();
+  u8[] signed = u8[prefix.len() + end]();
+  for (i32 i = 0; i < prefix.len(); i++) { signed[i] = prefix[i]; }
+  for (i32 i = 0; i < end; i++) { signed[prefix.len() + i] = descriptor[i]; }
+  return sha256(signed);
+}
+
+/**
+ * The 20-byte SHA-1 a `router-signature` signs, or empty if the keyword is absent.
+ *
+ * No prefix here. The asymmetry with the ed25519 digest is tor's, not a simplification: the RSA
+ * signature predates the personalisation convention.
+ */
+export u8[] rsaDescriptorDigest(u8[] descriptor) {
+  i32 end = pastLineStarting(descriptor, rsaSignatureKeyword());
+  if (end < 0) { return u8[0](); }
+  return sha1(head(descriptor, end));
+}
