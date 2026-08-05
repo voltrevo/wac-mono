@@ -39,6 +39,7 @@
     "app:build": "deno run --allow-read --allow-write --allow-run --allow-env packages/platform/build.ts",
     "app": "deno run --allow-read --allow-write --allow-env --allow-run packages/platform/app.ts",
     "wac:pin": "deno run --allow-read --allow-write --allow-run tools/wacPin.ts",
+    "check": "deno run -A tools/checkTypes.ts",
     "test": "deno run --allow-read --allow-write --allow-env --allow-run tools/runTests.ts",
     "test:changed": "deno run -A tools/testChanged.ts",
     "validate": "deno run -A tools/validate.ts",

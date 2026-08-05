@@ -116,6 +116,7 @@ Everything runs from the repo root, so one command covers every package.
 ```sh
 deno task test            # all tests, host-side and wac-written (~50s on five cores)
 deno task test:changed    # ...only the packages you have touched, for the loop before that
+deno task check           # type-check every .ts, including the drivers no test imports (~1s)
 deno task wac:pin         # record the sibling wac checkout as the minimum this repo needs
 deno task app <entry.wac> --allow-read -- args   # run a wac application
 deno task app:build <entry.wac> --allow-read -o wc   # ...or build one executable; then: ./wc FILE

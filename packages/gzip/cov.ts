@@ -41,7 +41,11 @@ function ignoringTraps(call: () => unknown): void {
 // ── The compressor ────────────────────────────────────────────────────────────
 
 const gz = await instrument("packages/gzip/src/gzip.wac");
-const gzRead = gz.mod.Read as { Data(b: Uint8Array): unknown; End(): unknown };
+// `Read` is a wac enum, and what bindgen hands back is its marshalled representation — which the
+// capability takes straight back. Declared as the bytes it is, rather than `unknown`, because the two
+// readers below promise a `Uint8Array` and nothing was checking that promise: `deno test` never imports
+// this file, so its type errors were invisible until `deno task check` looked at every file. wac-mono 0011.
+const gzRead = gz.mod.Read as { Data(b: Uint8Array): Uint8Array; End(): Uint8Array };
 const gzipStored = gz.mod.gzipStored as (d: Uint8Array) => Uint8Array;
 const gzipFixed = gz.mod.gzipFixed as (d: Uint8Array) => Uint8Array;
 const gzipDynamic = gz.mod.gzipDynamic as (d: Uint8Array) => Uint8Array;
@@ -68,7 +72,7 @@ for (const n of [0, 1, 2, 3, 258, 65535, 65536, 131071]) {
 
 const inf = await instrument("packages/gzip/src/inflate.wac");
 /** `Read`'s variant constructors, from each instrumented module — a wac enum crosses as a class. */
-const infRead = inf.mod.Read as { Data(b: Uint8Array): unknown; End(): unknown };
+const infRead = inf.mod.Read as { Data(b: Uint8Array): Uint8Array; End(): Uint8Array };
 const gunzipBytes = inf.mod.gunzipBytes as (gz: Uint8Array) => Uint8Array;
 const inflate = inf.mod.inflate as (d: Uint8Array) => Uint8Array;
 

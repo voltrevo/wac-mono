@@ -24,12 +24,11 @@ const ENTRIES = [
 
 for (const entry of ENTRIES) {
   Deno.test(`entry compiles: ${entry}`, async () => {
-    const result = wacCompile(await wacFiles(entry) as never, entry) as {
-      ok: boolean;
-      diagnostics?: { file: string; line: number; col: number; phase: string; message: string }[];
-    };
+    // The compiler's own result type. A local re-declaration here would be a second copy of a shape
+    // that already exists, and `tools/size.ts` had one that quietly dropped `diagnostics`.
+    const result = wacCompile(await wacFiles(entry), entry);
     if (!result.ok) {
-      const lines = (result.diagnostics ?? [])
+      const lines = result.diagnostics
         .map((d) => `  ${d.file}:${d.line}:${d.col} [${d.phase}] ${d.message}`);
       throw new Error(`${entry} did not compile:\n${lines.join("\n")}`);
     }

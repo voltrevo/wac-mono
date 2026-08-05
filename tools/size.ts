@@ -11,7 +11,7 @@
 // than V8 deciding to optimise it. A genuinely cold run is roughly twice as slow: the first
 // compile in a fresh process pays for the JIT as well as the work.
 
-import { wacCompile } from "wac/wacCompile.ts";
+import { type CompileResult, wacCompile } from "wac/wacCompile.ts";
 import { wacFiles } from "../harness/wacFiles.ts";
 
 const gzip = async (b: Uint8Array) =>
@@ -26,15 +26,17 @@ const TARGETS: [string, string][] = [
   ["packages/tor/src/client_entry.wac", "the whole client"],
 ];
 
-type Compiled = { ok: boolean; compiled?: { wasm: Uint8Array } };
-
 console.log(
   "layer".padEnd(36) + "     wasm     gzipped     lines    compile",
 );
 console.log("-".repeat(76));
 const broken: string[] = [];
 for (const [entry, label] of TARGETS) {
-  const warm = await wacCompile(await wacFiles(entry) as never, entry) as Compiled;
+  // The compiler's own result type, not a local re-declaration of it. The one that was here said
+  // `{ ok: boolean; compiled?: { wasm } }` and nothing else, so `warm.diagnostics` below — the whole
+  // point of the "did not compile" branch — was a property the cast had thrown away. It printed
+  // nothing, silently, in exactly the case this tool exists to report loudly.
+  const warm: CompileResult = await wacCompile(await wacFiles(entry), entry);
   if (!warm.ok || warm.compiled === undefined) {
     // Loudly, and non-zero at the end. A size report that prints "did not compile" and
     // exits 0 is green to everything that checks exit codes while measuring nothing —
@@ -55,7 +57,7 @@ for (const [entry, label] of TARGETS) {
       lines = [...files.values()].reduce((n, src) => n + src.split("\n").length, 0);
     }
     const t0 = performance.now();
-    await wacCompile(files as never, entry);
+    await wacCompile(files, entry);
     times.push(performance.now() - t0);
   }
   times.sort((a, b) => a - b);

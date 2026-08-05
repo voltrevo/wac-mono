@@ -30,7 +30,10 @@ if (!result.ok) {
 }
 
 try {
-  new WebAssembly.Module(result.compiled.wasm);
+  // `.slice()` because `WebAssembly.Module` takes a `BufferSource` and TypeScript's `Uint8Array` is
+  // generic over its buffer now: one backed by a `SharedArrayBuffer` is not accepted, and the compiler
+  // cannot prove this one is not. The copy is a few hundred kilobytes, once, in a diagnostic tool.
+  new WebAssembly.Module(result.compiled.wasm.slice());
   console.log("OK — compiles, and the wasm validates");
 } catch (e) {
   console.log(`INVALID WASM: ${(e as Error).message}`);
