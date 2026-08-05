@@ -167,8 +167,37 @@ export u8[]? rootAt(i32[] t, i32[] fields, i32 i, u8[] data, i32 start, i32 end)
   if (k != KIND_CONTAINER) { return null; }
 
   // ── A container ─────────────────────────────────────────────────────────────
+  i32[]? spans = containerSpans(t, fields, i, data, start, end);
+  if (spans is null) { return null; }
+  i32 nf = countOf(t, i);
+  u8[] leaves = u8[nf * CHUNK]();
+  for (i32 f = 0; f < nf; f++) {
+    i32 ft = fields[childOf(t, i) + f];
+    u8[]? r = rootAt(t, fields, ft, data, spans![f * 2], spans![f * 2 + 1]);
+    if (r is null) { return null; }
+    for (i32 b = 0; b < CHUNK; b++) { leaves[f * CHUNK + b] = r![b]; }
+  }
+  return merkleize(leaves, nf);
+}
+
+/**
+ * Where every field of a container lives: `[begin0, end0, begin1, end1, …]`, or null if malformed.
+ *
+ * Factored out of `rootAt` rather than written twice, because reading a field and merkleizing one
+ * need exactly the same walk — and a mutation sweep had just caught this package keeping two copies
+ * of the list-merkleization rule, where both were correct and neither was covered.
+ *
+ * The walk is the whole of SSZ's container encoding. Fixed fields sit inline; variable ones leave a
+ * 4-byte offset in the fixed part and their bytes in the variable part, and **a variable field's end
+ * comes from the next offset**, with the last running to the container's end.
+ */
+export i32[]? containerSpans(i32[] t, i32[] fields, i32 i, u8[] data, i32 start, i32 end) {
+  if (kindOf(t, i) != KIND_CONTAINER) { return null; }
+  if (start < 0 || end > data.len() || start > end) { return null; }
   i32 nf = countOf(t, i);
   if (nf == 0) { return null; }               // SSZ has no empty containers
+  i32 span = end - start;
+
   i32 fixedPart = 0;
   for (i32 f = 0; f < nf; f++) {
     i32 ft = fields[childOf(t, i) + f];
@@ -176,10 +205,7 @@ export u8[]? rootAt(i32[] t, i32[] fields, i32 i, u8[] data, i32 start, i32 end)
   }
   if (span < fixedPart) { return null; }
 
-  // Pass one: walk the fixed part, recording where each field's bytes are. A variable field's
-  // extent is not known until the *next* offset is seen, so ends are filled in afterwards.
-  i32[] begin = i32[nf]();
-  i32[] finish = i32[nf]();
+  i32[] out = i32[nf * 2]();
   i32 pos = start;
   i32 prevVar = -1;
   bool sawVar = false;
@@ -187,8 +213,8 @@ export u8[]? rootAt(i32[] t, i32[] fields, i32 i, u8[] data, i32 start, i32 end)
     i32 ft = fields[childOf(t, i) + f];
     if (isFixed(t, fields, ft)) {
       i32 sz = fixedSize(t, fields, ft);
-      begin[f] = pos;
-      finish[f] = pos + sz;
+      out[f * 2] = pos;
+      out[f * 2 + 1] = pos + sz;
       pos = pos + sz;
     } else {
       u32 off = readOffset(data, pos);
@@ -200,29 +226,41 @@ export u8[]? rootAt(i32[] t, i32[] fields, i32 i, u8[] data, i32 start, i32 end)
         sawVar = true;
       } else {
         // Against the previous variable field's *start*, not its provisional end — that end is still
-        // the container's end and is exactly what this offset is about to narrow. Comparing with it
-        // rejects every well-formed container that has two variable fields, which is how this was
-        // found: `BitsStruct` offsets are 11 then 12, and 12 < 13 looked backwards.
-        if (abs < begin[prevVar]) { return null; }
-        finish[prevVar] = abs;
+        // the container's end and is exactly what this offset is about to narrow.
+        if (abs < out[prevVar * 2]) { return null; }
+        out[prevVar * 2 + 1] = abs;
       }
-      begin[f] = abs;
-      finish[f] = end;                                      // provisional; the next offset narrows it
+      out[f * 2] = abs;
+      out[f * 2 + 1] = end;                                 // provisional; the next offset narrows it
       prevVar = f;
       pos = pos + OFFSET_BYTES;
     }
   }
   // A container with no variable fields must be exactly its fixed size.
   if (!sawVar && span != fixedPart) { return null; }
+  return out;
+}
 
-  u8[] leaves = u8[nf * CHUNK]();
-  for (i32 f = 0; f < nf; f++) {
-    i32 ft = fields[childOf(t, i) + f];
-    u8[]? r = rootAt(t, fields, ft, data, begin[f], finish[f]);
-    if (r is null) { return null; }
-    for (i32 b = 0; b < CHUNK; b++) { leaves[f * CHUNK + b] = r![b]; }
-  }
-  return merkleize(leaves, nf);
+/**
+ * The bytes of field `f`, copied out.
+ *
+ * What a light client reads a `LightClientUpdate` with: the attested header, the sync aggregate, the
+ * branches. Empty when the container is malformed or `f` is out of range — the caller cannot tell
+ * those apart, and does not need to, because both mean the same refusal.
+ */
+export u8[] fieldBytes(i32[] t, i32[] fields, i32 ty, u8[] data, i32 f) {
+  i32[]? spans = containerSpans(t, fields, ty, data, 0, data.len());
+  if (spans is null) { return u8[0](); }
+  if (f < 0 || f >= countOf(t, ty)) { return u8[0](); }
+  return slice(data, spans![f * 2], spans![f * 2 + 1]);
+}
+
+/** `hash_tree_root` of field `f` — the leaf a Merkle branch into this container proves. */
+export u8[]? fieldRoot(i32[] t, i32[] fields, i32 ty, u8[] data, i32 f) {
+  i32[]? spans = containerSpans(t, fields, ty, data, 0, data.len());
+  if (spans is null) { return null; }
+  if (f < 0 || f >= countOf(t, ty)) { return null; }
+  return rootAt(t, fields, fields[childOf(t, ty) + f], data, spans![f * 2], spans![f * 2 + 1]);
 }
 
 /**

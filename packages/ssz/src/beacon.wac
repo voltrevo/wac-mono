@@ -27,8 +27,17 @@
 // `mainnet`: SYNC_COMMITTEE_SIZE is 512. Under `minimal` it is 32 and every SyncCommittee-bearing
 // root differs, so a descriptor table is per-config and this one says which.
 
-/** Sync committee size, mainnet. The one number here that is a config choice rather than a type. */
-export const i32 SYNC_COMMITTEE_SIZE = 512;
+/**
+ * Sync committee size — the one number here that is a config choice rather than a type, and the only
+ * reason the table is a function of anything.
+ *
+ * `mainnet` is 512 and `minimal` is 32, and the difference is not cosmetic: it changes the root of
+ * every container holding a `SyncCommittee`, and the serialized size of a `LightClientBootstrap` from
+ * 24,896 bytes to 1,856. Ethereum's *sync-protocol* vectors exist only for `minimal`, while its
+ * `ssz_static` vectors here are `mainnet`, so both are needed and neither is the default.
+ */
+export const i32 SYNC_COMMITTEE_SIZE_MAINNET = 512;
+export const i32 SYNC_COMMITTEE_SIZE_MINIMAL = 32;
 
 // Branch lengths are `floorlog2` of the generalized index the branch proves, so they are derived from
 // the BeaconState layout rather than chosen: FINALIZED_ROOT_GINDEX 105 -> 6,
@@ -66,7 +75,7 @@ export i32 TY_LIGHT_CLIENT_OPTIMISTIC_UPDATE() { return 17; }
  *
  * Kinds match `container.wac`: 0 basic, 1 bitvector, 2 bitlist, 3 vector, 4 list, 5 container.
  */
-export i32[] beaconTypes() {
+export i32[] beaconTypes(i32 syncCommitteeSize) {
   i32[] t = i32[18 * 4]();
 
   //                    kind  param                     child                 count
@@ -81,11 +90,11 @@ export i32[] beaconTypes() {
   // SigningData: object_root, domain
   put(t, 6,             5,    0,                        5,                    2);
   // Vector[BLSPubkey, SYNC_COMMITTEE_SIZE]
-  put(t, 7,             3,    SYNC_COMMITTEE_SIZE,      3,                    0);
+  put(t, 7,             3,    syncCommitteeSize,        3,                    0);
   // SyncCommittee: pubkeys, aggregate_pubkey
   put(t, 8,             5,    0,                        7,                    2);
   // BitVector[SYNC_COMMITTEE_SIZE]
-  put(t, 9,             1,    SYNC_COMMITTEE_SIZE,      0,                    0);
+  put(t, 9,             1,    syncCommitteeSize,        0,                    0);
   // SyncAggregate: sync_committee_bits, sync_committee_signature
   put(t, 10,            5,    0,                        9,                    2);
   // LightClientHeader: beacon
@@ -117,6 +126,12 @@ void put(i32[] t, i32 i, i32 kind, i32 param, i32 child, i32 count) {
  * Every container's field types, concatenated. A container's `child` is where its run starts and
  * `count` is how long it is.
  */
+/** The mainnet table, for `ssz_static` and for a client following the real chain. */
+export i32[] beaconTypesMainnet() { return beaconTypes(SYNC_COMMITTEE_SIZE_MAINNET); }
+
+/** The minimal table, which is what Ethereum's sync-protocol vectors are generated under. */
+export i32[] beaconTypesMinimal() { return beaconTypes(SYNC_COMMITTEE_SIZE_MINIMAL); }
+
 export i32[] beaconFields() {
   i32[] f = i32[30]();
   // 0..4  BeaconBlockHeader

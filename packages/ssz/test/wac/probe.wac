@@ -4,8 +4,8 @@ import { hashPair, zeroHash, merkleize, mixInLength, padToChunks, chunkCount, ne
          depthFor, rootBasic, rootBasicVector, rootBitvector, rootBitlist, rootBasicList,
          bitlistLength, floorLog2, subtreeIndex, isValidMerkleBranch,
          isValidNormalizedMerkleBranch } from "../../src/merkle.wac";
-import { hashTreeRoot, isFixed, fixedSize } from "../../src/container.wac";
-import { beaconTypes, beaconFields, TY_UINT8, TY_UINT64, TY_BYTES32, TY_BYTES48, TY_BYTES96,
+import { hashTreeRoot, isFixed, fixedSize, fieldBytes, fieldRoot } from "../../src/container.wac";
+import { beaconTypes, beaconTypesMainnet, beaconTypesMinimal, beaconFields, TY_UINT8, TY_UINT64, TY_BYTES32, TY_BYTES48, TY_BYTES96,
          TY_PUBKEY_VECTOR, TY_SYNC_COMMITTEE_BITS, TY_SYNC_BRANCH, TY_FINALITY_BRANCH,
          TY_BEACON_BLOCK_HEADER, TY_SIGNING_DATA, TY_SYNC_COMMITTEE,
          TY_SYNC_AGGREGATE, TY_LIGHT_CLIENT_HEADER, TY_LIGHT_CLIENT_BOOTSTRAP,
@@ -51,14 +51,14 @@ export i32 sszFixedSize(i32[] types, i32[] fields, i32 i) { return fixedSize(typ
 
 /** `hash_tree_root` of a beacon type, named by index; empty when refused. */
 export u8[] sszBeaconRoot(i32 ty, u8[] data) {
-  u8[]? r = hashTreeRoot(beaconTypes(), beaconFields(), ty, data);
+  u8[]? r = hashTreeRoot(beaconTypesMainnet(), beaconFields(), ty, data);
   return (r is null) ? u8[0]() : r!;
 }
 
 export i32 sszBeaconFixedSize(i32 ty) {
-  return fixedSize(beaconTypes(), beaconFields(), ty);
+  return fixedSize(beaconTypesMainnet(), beaconFields(), ty);
 }
-export bool sszBeaconIsFixed(i32 ty) { return isFixed(beaconTypes(), beaconFields(), ty); }
+export bool sszBeaconIsFixed(i32 ty) { return isFixed(beaconTypesMainnet(), beaconFields(), ty); }
 
 /** The type index for each container name the fixtures use. */
 export i32 sszTyFor(i32 which) {
@@ -95,8 +95,29 @@ export i32 sszTyAt(i32 which) {
 
 /** `kind, param, child, count` for a type, so a test can assert its shape rather than its index. */
 export i32[] sszTypeRow(i32 ty) {
-  i32[] t = beaconTypes();
+  i32[] t = beaconTypesMainnet();
   i32[] row = i32[4]();
   for (i32 i = 0; i < 4; i++) { row[i] = t[ty * 4 + i]; }
   return row;
+}
+
+/** `hash_tree_root` under the minimal config, which is what the sync vectors are generated with. */
+export u8[] sszBeaconRootMinimal(i32 ty, u8[] data) {
+  u8[]? r = hashTreeRoot(beaconTypesMinimal(), beaconFields(), ty, data);
+  return (r is null) ? u8[0]() : r!;
+}
+
+export i32 sszBeaconFixedSizeMinimal(i32 ty) {
+  return fixedSize(beaconTypesMinimal(), beaconFields(), ty);
+}
+
+/** Field `f` of a beacon container, minimal config. */
+export u8[] sszFieldMinimal(i32 ty, u8[] data, i32 f) {
+  return fieldBytes(beaconTypesMinimal(), beaconFields(), ty, data, f);
+}
+
+/** `hash_tree_root` of field `f`, minimal config; empty when refused. */
+export u8[] sszFieldRootMinimal(i32 ty, u8[] data, i32 f) {
+  u8[]? r = fieldRoot(beaconTypesMinimal(), beaconFields(), ty, data, f);
+  return (r is null) ? u8[0]() : r!;
 }

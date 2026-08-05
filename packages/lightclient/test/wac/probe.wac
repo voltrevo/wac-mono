@@ -1,0 +1,55 @@
+// The light client's surface, plus enough of `ssz` and `bls` to drive a whole update through.
+
+import { domainSyncCommittee, altairForkVersionMinimal, altairForkVersionMainnet,
+         computeForkDataRoot, computeForkDigest, computeDomain, computeSigningRoot,
+         syncCommitteeSigningRoot } from "../../src/domain.wac";
+import { beaconTypesMinimal, beaconFields, TY_LIGHT_CLIENT_UPDATE, TY_LIGHT_CLIENT_BOOTSTRAP,
+         TY_LIGHT_CLIENT_HEADER, TY_SYNC_COMMITTEE, TY_SYNC_AGGREGATE,
+         TY_BEACON_BLOCK_HEADER } from "../../../ssz/src/beacon.wac";
+import { fieldBytes, fieldRoot } from "../../../ssz/src/container.wac";
+import { fastAggregateVerify } from "../../../bls/src/verify.wac";
+
+export u8[] lcForkDigest(u8[] version, u8[] gvr) {
+  u8[]? d = computeForkDigest(version, gvr);
+  return (d is null) ? u8[0]() : d!;
+}
+export u8[] lcAltairVersionMinimal() { return altairForkVersionMinimal(); }
+export u8[] lcAltairVersionMainnet() { return altairForkVersionMainnet(); }
+export u8[] lcDomain(u8[] version, u8[] gvr) {
+  u8[]? d = computeDomain(domainSyncCommittee(), version, gvr);
+  return (d is null) ? u8[0]() : d!;
+}
+export u8[] lcSigningRoot(u8[] headerRoot, u8[] version, u8[] gvr) {
+  u8[]? r = syncCommitteeSigningRoot(headerRoot, version, gvr);
+  return (r is null) ? u8[0]() : r!;
+}
+export u8[] lcSigningRootRaw(u8[] objectRoot, u8[] domain) {
+  u8[]? r = computeSigningRoot(objectRoot, domain);
+  return (r is null) ? u8[0]() : r!;
+}
+export u8[] lcForkDataRoot(u8[] version, u8[] gvr) {
+  u8[]? r = computeForkDataRoot(version, gvr);
+  return (r is null) ? u8[0]() : r!;
+}
+
+/** Field access over the minimal-config beacon types, by container name. */
+i32 tyOf(i32 which) {
+  if (which == 0) { return TY_LIGHT_CLIENT_UPDATE(); }
+  if (which == 1) { return TY_LIGHT_CLIENT_BOOTSTRAP(); }
+  if (which == 2) { return TY_LIGHT_CLIENT_HEADER(); }
+  if (which == 3) { return TY_SYNC_COMMITTEE(); }
+  if (which == 4) { return TY_SYNC_AGGREGATE(); }
+  return TY_BEACON_BLOCK_HEADER();
+}
+export u8[] lcField(i32 which, u8[] data, i32 f) {
+  return fieldBytes(beaconTypesMinimal(), beaconFields(), tyOf(which), data, f);
+}
+export u8[] lcFieldRoot(i32 which, u8[] data, i32 f) {
+  u8[]? r = fieldRoot(beaconTypesMinimal(), beaconFields(), tyOf(which), data, f);
+  return (r is null) ? u8[0]() : r!;
+}
+
+/** `FastAggregateVerify` over the participating keys — what an update's signature is checked with. */
+export bool lcFastAggregateVerify(u8[][] pubkeys, u8[] signingRoot, u8[] signature) {
+  return fastAggregateVerify(pubkeys, signingRoot, signature);
+}
