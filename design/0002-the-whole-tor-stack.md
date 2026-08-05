@@ -322,6 +322,31 @@ most, because it puts their implementation on the far side of every seam.
 > entitled to ask for it. The second is `RELAY_BEGIN`, without which a built path still carries no
 > stream.
 >
+> ### `RELAY_BEGIN` — what it needs, so the next hour is execution
+>
+> Decided rather than asked: per **D4**, the exit policy becomes true by implementing the stream, not by
+> advertising `accept 80,443` on a relay that would refuse every connection. Claiming a capability is
+> what the `V2Dir` and `HSDir` episodes were about, in both directions.
+>
+> The writer already exists — `beginBody(host)` in `relay.wac`, which the client uses. What is missing:
+>
+>   1. **A parser.** `BEGIN`'s body is `ADDRPORT \0 FLAGS[4]`, where `ADDRPORT` is `host:port` as text,
+>      and a leading `:` means "this relay's own address", which is how a rendezvous stream is opened
+>      (`hsconnect.wac` sends exactly that). Returns host and port, or refuses.
+>   2. **A third source in the `waitAny`.** `relayd`'s loop already parks on the client and the next hop;
+>      a stream adds the target socket. That is the same `i32[]` grown by one, and `nc.wac` remains the
+>      model.
+>   3. **The stream itself.** `connect`, then `RELAY_CONNECTED` carrying the address, then `RELAY_DATA`
+>      both ways in 498-byte pieces, then `RELAY_END` with a reason. `chunkRequest` already splits at the
+>      right size — it is what `BEGIN_DIR` uses.
+>   4. **Flow control.** A directory answer was five cells and never needed a `SENDME`; a real transfer
+>      does. `relay.wac` has the SENDME machinery the client uses, so this is wiring rather than new
+>      cryptography — but it is the first place a window can actually run out.
+>
+> Two known holes to close alongside: the relay that fails to extend **to its own port**, where
+> `linkHandshake` returns false in the uninstrumented VERSIONS exchange; and `certsCount` versus
+> `certsCell`, still never having been shown each other's output.
+>
 > The SOCKS requests still time out, which is expected and separate: nothing implements `RELAY_BEGIN`.
 >
 > One hypothesis tested and **disproved**: that tor asked our relay for the consensus because our vote
