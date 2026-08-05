@@ -16,6 +16,7 @@
 // this file did not notice. What catches that lives in the crypto package, where the oracle
 // is the host's own AES rather than the other end of the same code.
 
+import { chunkRequest } from "../../src/link.wac";
 import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import {
@@ -271,3 +272,42 @@ export string test_an_extended2_reply_is_cut_at_its_length() {
   return t.report();
 }
 
+
+export string test_a_request_longer_than_a_cell_is_split() {
+  // `buildBody` traps above `relayDataLen()`, and `fetchOverCircuit` used to hand it a whole GET
+  // line. That was fine for a consensus URL and not for a microdescriptor one: `microdescBatches`
+  // puts up to 92 digests in a URL, which is about 4 KB, and tor uses that same 92 precisely because
+  // it expects a multi-cell request.
+  //
+  // It did not fire against chutney's six-relay default — six digests is under 300 bytes — and fired
+  // on the first fetch against a thirteen-relay one. With thousands of relays it would never have
+  // worked at all.
+  T t = T.create();
+  i32 max = relayDataLen();
+
+  // Exactly one cell, one byte under, one byte over: the boundaries the trap sat on.
+  t.eqI32(chunkRequest(u8[max]()).len(), 1, "exactly one cell's worth is one chunk");
+  t.eqI32(chunkRequest(u8[max - 1]()).len(), 1, "one byte under is still one");
+  t.eqI32(chunkRequest(u8[max + 1]()).len(), 2, "one byte over is two");
+  t.eqI32(chunkRequest(u8[max * 3]()).len(), 3, "three cells' worth is three");
+  t.eqI32(chunkRequest(u8[0]()).len(), 0, "nothing is no chunks");
+
+  // Every chunk fits, and the pieces reassemble to the original in order — a split that lost or
+  // reordered a byte would produce a request the directory answers 400 to, which reads as a
+  // different bug entirely.
+  u8[] req = u8[1000]();
+  for (i32 i = 0; i < req.len(); i++) { req[i] = (i * 7 + 3) & 0xFF; }
+  u8[][] chunks = chunkRequest(req);
+  i32 total = 0;
+  i32 wrong = 0;
+  for (i32 i = 0; i < chunks.len(); i++) {
+    if (chunks[i].len() > max) { wrong = wrong + 1; }
+    for (i32 j = 0; j < chunks[i].len(); j++) {
+      if (chunks[i][j] != req[total + j]) { wrong = wrong + 1; }
+    }
+    total = total + chunks[i].len();
+  }
+  t.eqI32(wrong, 0, "every chunk fits a cell and holds the right bytes");
+  t.eqI32(total, req.len(), "and together they are the whole request");
+  return t.report();
+}

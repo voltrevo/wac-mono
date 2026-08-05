@@ -34,6 +34,15 @@ export struct Network {
    * every possible path. A field rather than a default so that reaching it takes saying so.
    */
   bool sameSubnetOk;
+  /**
+   * The verified consensus, kept whole.
+   *
+   * A client that only builds circuits does not need it after `parseConsensus`, but an onion client
+   * does: the HSDir hash ring is computed from the consensus's shared random values and its
+   * `valid-after`, and re-fetching to get them would be a second consensus that might not be the one
+   * the relay list came from.
+   */
+  u8[] consensus;
 }
 
 /** A built circuit and the link it runs over. The two travel together or not at all. */
@@ -51,7 +60,8 @@ export struct Session {
  * against the fingerprints the caller chose, which is what makes asking a stranger fine.
  */
 export Network bootstrap(Core core, Cli cli, u8[] seedBytes, u8[] authBytes, bool sameSubnetOk) {
-  Network bad = Network(false, Relay[0](), i64[0](), Families(i32[0](), i32[0]()), sameSubnetOk);
+  Network bad = Network(false, Relay[0](), i64[0](), Families(i32[0](), i32[0]()), sameSubnetOk,
+                        u8[0]());
 
   string[] seedLines = lines(seedBytes);
   if (seedLines.len() == 0) { core.warn("tor: the seed file is empty"); return bad; }
@@ -118,7 +128,8 @@ export Network bootstrap(Core core, Cli cli, u8[] seedBytes, u8[] authBytes, boo
   // chosen by weight, not through whoever happened to be in the seed file.
   cli.closeSocket(l.sock);
 
-  return Network(true, relays, parseWeights(consensus), resolveFamilies(relays), sameSubnetOk);
+  return Network(true, relays, parseWeights(consensus), resolveFamilies(relays), sameSubnetOk,
+                 consensus);
 }
 
 /**
@@ -167,6 +178,63 @@ export Session buildCircuit(Core core, Cli cli, Network n, i32 port, i32 circId)
     return bad;
   }
   if (!extendTo(l, c, n.relays[exit], core.randomBytes(32).wait())) {
+    cli.closeSocket(l.sock);
+    return bad;
+  }
+  return Session(true, l, c, desc);
+}
+
+/**
+ * A three-hop circuit whose **last hop is `target`**, for reaching one particular relay.
+ *
+ * `buildCircuit` above picks its last hop by exit weight, which is right for carrying traffic and
+ * wrong here: an HSDir fetch has to arrive at the directory that holds the descriptor, and any other
+ * relay would answer 404 whatever else was correct.
+ *
+ * The guard and middle are still chosen by weight, and still exclude the target — so the circuit is
+ * three distinct relays and the directory does not also see where the request entered the network.
+ * That is the whole reason this is not simply a direct connection to the HSDir: tor refuses a
+ * single-hop descriptor request outright (`connection_dir_is_anonymous`, 503), and would be right to.
+ */
+export Session buildCircuitTo(Core core, Cli cli, Network n, i32 target, i32 circId) {
+  Session bad = Session(false, Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]()),
+                        Circuit.create(circId, u8[72]()), "");
+  if (target < 0 || target >= n.relays.len()) {
+    core.warn("tor: no such relay to build to");
+    return bad;
+  }
+  i32 guard = pick(n.relays, n.weights, n.families, positionGuard(), i32[](target), 0,
+                   n.sameSubnetOk, randomI64(core));
+  if (guard < 0) { core.warn("tor: no usable guard"); return bad; }
+  i32 middle = pick(n.relays, n.weights, n.families, positionMiddle(), i32[](target, guard), 0,
+                    n.sameSubnetOk, randomI64(core));
+  if (middle < 0) { core.warn("tor: no usable middle relay"); return bad; }
+
+  string desc = n.relays[guard].nickname + " -> " + n.relays[middle].nickname +
+                " -> " + n.relays[target].nickname;
+
+  Link l = connectRelay(core, cli, n.relays[guard].address, n.relays[guard].orPort);
+  if (l.dead) { return bad; }
+  handshakeTls(l);
+  if (l.dead || !linkHandshake(l, n.relays[guard].address)) {
+    core.warn("tor: the link handshake with the guard failed");
+    cli.closeSocket(l.sock);
+    return bad;
+  }
+  u8[] gk = createCircuit(l, Circuit.create(circId, u8[72]()),
+                          n.relays[guard].identity, n.relays[guard].ntorOnionKey,
+                          core.randomBytes(32).wait());
+  if (gk.len() == 0) {
+    core.warn("tor: the guard did not authenticate");
+    cli.closeSocket(l.sock);
+    return bad;
+  }
+  Circuit c = Circuit.create(circId, gk);
+  if (!extendTo(l, c, n.relays[middle], core.randomBytes(32).wait())) {
+    cli.closeSocket(l.sock);
+    return bad;
+  }
+  if (!extendTo(l, c, n.relays[target], core.randomBytes(32).wait())) {
     cli.closeSocket(l.sock);
     return bad;
   }

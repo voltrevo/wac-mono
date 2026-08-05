@@ -9,6 +9,7 @@
 // is a stranger from a public directory and one that answers the TCP handshake and then says
 // nothing is not hypothetical.
 
+import { relayDataLen } from "./relay.wac";
 import { Core, Cli, Socket, Pending } from "../../platform/src/platform.wac";
 import { Vec } from "../../std/src/vec.wac";
 import { Relay } from "./directory.wac";
@@ -307,6 +308,47 @@ export bool extendTo(Link l, Circuit c, Relay r, u8[] ephemeral) {
   }
 }
 
+/**
+ * Send `request` as as many RELAY_DATA cells as it takes.
+ *
+ * A relay cell carries 498 bytes and `buildBody` **traps** above that, so a request had to fit in one
+ * cell. It usually did: a consensus or certificate URL is short. A microdescriptor request is not —
+ * `microdescBatches` puts up to 92 digests in one URL, which is about 4 KB, and tor's own limit is
+ * that same 92 precisely because it expects a multi-cell request.
+ *
+ * So this was a trap waiting for a network with enough relays. It did not fire against chutney's
+ * six-relay default (six digests is under 300 bytes) and fired immediately on a thirteen-relay one.
+ * On the real network, with thousands of relays, it would have fired on the first fetch.
+ *
+ * Nothing splits the *response*, because the response already arrives as a stream of cells and is
+ * concatenated by the caller.
+ */
+void sendRequest(Link l, Circuit c, i32 sid, u8[] request) {
+  u8[][] chunks = chunkRequest(request);
+  for (i32 i = 0; i < chunks.len(); i++) { sendCells(l, c.dataCell(sid, chunks[i])); }
+}
+
+/**
+ * `request` split into pieces that each fit one RELAY_DATA cell.
+ *
+ * Separated from the sending so it can be tested without a socket — the bug this exists for was a
+ * trap on a length, and a length is exactly what a pure function can be asked about.
+ */
+export u8[][] chunkRequest(u8[] request) {
+  i32 max = relayDataLen();
+  i32 n = (request.len() + max - 1) / max;
+  u8[][] out = u8[][n]();
+  for (i32 i = 0; i < n; i++) {
+    i32 at = i * max;
+    i32 take = request.len() - at;
+    if (take > max) { take = max; }
+    u8[] chunk = u8[take]();
+    for (i32 j = 0; j < take; j++) { chunk[j] = request[at + j]; }
+    out[i] = chunk;
+  }
+  return out;
+}
+
 /** GET a directory document over the circuit, and return the body. */
 export u8[] fetchOverCircuit(Link l, Circuit c, string path) {
   i32 sid = c.beginStream();
@@ -321,8 +363,8 @@ export u8[] fetchOverCircuit(Link l, Circuit c, string path) {
     if (got.kind == gotBroken() || got.kind == gotDestroyed()) { return u8[0](); }
     if (got.kind == gotConnected() && !connected) {
       connected = true;
-      sendCells(l, c.dataCell(sid, ("GET " + path + " HTTP/1.0\r\n" +
-                                    "Accept-Encoding: identity\r\n\r\n").toBytes()));
+      sendRequest(l, c, sid, ("GET " + path + " HTTP/1.0\r\n" +
+                              "Accept-Encoding: identity\r\n\r\n").toBytes());
     } else if (got.kind == gotData()) {
       raw = concat(raw, got.data);
     } else if (got.kind == gotEnd()) {

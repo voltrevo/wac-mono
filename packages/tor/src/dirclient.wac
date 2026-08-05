@@ -142,7 +142,7 @@ export i64 refreshAt(u8[] doc, i32 r01) {
 /** Unix second at which a consensus stops being acceptable at all, or -1. */
 export i64 validUntil(u8[] doc) { return timeOf(doc, "valid-until"); }
 
-i64 timeOf(u8[] doc, string field) {
+export i64 timeOf(u8[] doc, string field) {
   i32 at = findFrom(doc, "\n" + field + " ", 0);
   i32 from = -1;
   if (at >= 0) { from = at + field.len() + 2; }

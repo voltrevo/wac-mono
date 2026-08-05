@@ -33,6 +33,10 @@
 
 import { sha3_256 } from "../../crypto/src/keccak.wac";
 import { Relay, base64NoPad } from "./directory.wac";
+import { findFrom } from "./consensus.wac";
+import { timeOf } from "./dirclient.wac";
+import { decode as b64decode } from "../../codec/src/base64.wac";
+import { timePeriodLength, timePeriodNum, rotationOffsetMinutes } from "./hsblind.wac";
 
 /** `hsdir_n_replicas`, consensus parameter, default 2. */
 export const i32 HSDIR_N_REPLICAS_DEFAULT = 2;
@@ -270,4 +274,54 @@ bool isHsdir(Relay r) {
 export string descriptorPath(u8[] blindedKey) {
   if (blindedKey.len() != 32) { return ""; }
   return "/tor/hs/3/" + base64NoPad(blindedKey);
+}
+
+// ── Reading the ring's inputs out of a consensus ──────────────────────────────
+
+/**
+ * A `shared-rand-current-value` or `shared-rand-previous-value`, decoded, or empty.
+ *
+ * **Which one to use is not "the current one".** A client synchronises its time period with the
+ * shared random value that was published *for* that period, so in the stretch between a new SRV and
+ * a new time period it uses the previous value with the current period (rend-spec-v3 §2.2.4.1). This
+ * was confirmed on a live network rather than taken on trust: the current period's uploads reproduce
+ * under `shared-rand-previous-value` and the next period's under `shared-rand-current-value`.
+ *
+ * A consensus that carries neither is not an error — `disasterSrv` is the documented fallback — so
+ * this returns empty rather than refusing, and the caller decides.
+ */
+export u8[] consensusSharedRandom(u8[] consensus, bool current) {
+  string field = current ? "shared-rand-current-value" : "shared-rand-previous-value";
+  i32 at = findFrom(consensus, "\n" + field + " ", 0);
+  if (at < 0) { return u8[0](); }
+  i32 from = at + field.len() + 2;
+  // The line is `<field> SP NUM_REVEALS SP VALUE`, so skip the reveal count.
+  while (from < consensus.len() && consensus[from] != ' ' && consensus[from] != '\n') { from++; }
+  if (from >= consensus.len() || consensus[from] != ' ') { return u8[0](); }
+  from++;
+  i32 end = from;
+  while (end < consensus.len() && consensus[end] != '\n' && consensus[end] != '\r') { end++; }
+  u8[] value = u8[end - from]();
+  for (i32 i = 0; i < value.len(); i++) { value[i] = consensus[from + i]; }
+  u8[]? decoded = b64decode(value);
+  if (decoded is null) { return u8[0](); }
+  return (decoded!.len() == 32) ? decoded! : u8[0]();
+}
+
+/**
+ * The time period a client should fetch for, and the shared random value that goes with it.
+ *
+ * Returns `[periodNum, periodLength]`, or `[-1, -1]` if the consensus does not carry the timings.
+ * `testingNetwork` is the caller's, because nothing in a consensus says so — the give-away is a
+ * voting interval of seconds rather than an hour, and guessing from that would be a heuristic in the
+ * one place a wrong answer is silent.
+ */
+export i64[] consensusTimePeriod(u8[] consensus, bool testingNetwork, i64 hsdirInterval) {
+  i64 validAfter = timeOf(consensus, "valid-after");
+  i64 freshUntil = timeOf(consensus, "fresh-until");
+  if (validAfter < 0 || freshUntil <= validAfter) { return i64[](-1, -1); }
+  i64 voting = freshUntil - validAfter;
+  i64 length = timePeriodLength(testingNetwork, voting, hsdirInterval);
+  i64 num = timePeriodNum(validAfter, length, rotationOffsetMinutes(voting));
+  return i64[](num, length);
 }

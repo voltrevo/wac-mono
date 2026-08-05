@@ -123,7 +123,7 @@ much as the thing steps 2–6 each contribute a row to, and it is where a regres
 | step | state |
 |---|---|
 | 1 — RSA signing | **done** — `rsaSignPkcs1`, `rsaSignRawPkcs1`, byte-identical to node's |
-| 2 — onion service client | **in progress** — addresses, blinding, the hash ring, descriptors and hs-ntor all check against tor; the fetch over a circuit is what remains |
+| 2 — onion service client | **in progress** — `src/hsfetch.wac` fetches and decrypts a real descriptor over our own three-hop circuits. Introduction and rendezvous are what remain |
 | 3 — relay | not started |
 | 4 — directory authority | not started |
 | 5 — the launcher | not started |

@@ -1,0 +1,207 @@
+// Fetch a v3 onion service's descriptor from the network, and say what is in it.
+//
+//   deno task app packages/tor/src/hsfetch.wac --allow-net --allow-read -- \
+//     <seed-file> <authorities-file> <onion-address> [--testnet]
+//
+// The whole client half of the onion protocol, end to end and over real circuits: bootstrap, work
+// out which directories hold today's descriptor, build a three-hop circuit to one of them, fetch,
+// decrypt both layers, and print the introduction points.
+//
+// Not part of the test suite, for the reason `app.wac` is not: it needs a network. The suite checks
+// each piece against captured values from `tools/capture-*.py`, and this is what proves those pieces
+// compose — run it against a chutney `hs-v3` network and it either prints introduction points or
+// says which step failed.
+//
+// ## Why the fetch goes over three hops rather than straight to the directory
+//
+// It would be far simpler to open a socket to the HSDir's DirPort and ask. tor refuses:
+// `connection_dir_is_anonymous()` rejects a single-hop descriptor request with a 503, and it is
+// right to. A directory that could see who asks for a descriptor learns which clients are interested
+// in which services, which is most of what the design is protecting.
+//
+// So the circuit's **last hop must be the chosen directory**, which is what `buildCircuitTo` is for.
+// `buildCircuit`'s weighted exit is wrong here: any other relay answers 404 however correct
+// everything else is, and a 404 is indistinguishable from a service that never published.
+//
+// ## `--testnet`
+//
+// Two things at once, and both are needed together or not at all: paths may reuse a /16 (chutney
+// puts every relay on 127.0.0.1), and the time period is a shared-random protocol run rather than a
+// day. The second is the one that matters — `get_time_period_length()` in tor ignores
+// `hsdir_interval` entirely when `TestingTorNetwork` is set, so a client computing 1440 minutes
+// against chutney asks for a period nobody is in and gets a 404 with nothing to say why.
+
+import { Core, Cli, FileResult } from "../../platform/src/platform.wac";
+import { Network, Session, bootstrap, buildCircuitTo } from "./bootstrap.wac";
+import { fetchOverCircuit, itoa } from "./link.wac";
+import { itoa64 } from "../../wactest/src/itoa64.wac";
+import { Relay, attachMicrodescriptors } from "./directory.wac";
+import { onionPubkey } from "./onionaddr.wac";
+import { blindedPublicKey, subcredential } from "./hsblind.wac";
+import {
+  hsdirsForDescriptor, descriptorPath, consensusSharedRandom, consensusTimePeriod, disasterSrv,
+  HSDIR_N_REPLICAS_DEFAULT, HSDIR_SPREAD_FETCH_DEFAULT,
+} from "./hsdir.wac";
+import {
+  decryptLayer, pemBlock, keywordInt, certSignedWithKey, certType,
+  superencryptedConstant, encryptedConstant,
+} from "./hsdesc.wac";
+import { IntroPoint, parseIntroPoints, linkSpecifier, LS_IPV4, LS_ED25519_ID } from "./hsintro.wac";
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount().wait() < 3) {
+    core.warn("usage: hsfetch <seed-file> <authorities-file> <onion-address> [--testnet]");
+    return 1;
+  }
+  FileResult seedFile = cli.readFile(string.fromBytes(cli.arg(0).wait())).wait();
+  if (!seedFile.ok) { core.warn("tor: " + seedFile.error); return 1; }
+  FileResult authFile = cli.readFile(string.fromBytes(cli.arg(1).wait())).wait();
+  if (!authFile.ok) { core.warn("tor: " + authFile.error); return 1; }
+  u8[] address = cli.arg(2).wait();
+
+  bool testnet = false;
+  i32 n = cli.argCount().wait();
+  for (i32 i = 3; i < n; i++) {
+    if (string.fromBytes(cli.arg(i).wait()) == "--testnet") { testnet = true; }
+  }
+
+  u8[] identity = onionPubkey(address);
+  if (identity.len() != 32) {
+    core.warn("tor: that is not a v3 onion address — 56 characters, and the checksum has to hold");
+    return 1;
+  }
+
+  Network net = bootstrap(core, cli, seedFile.bytes, authFile.bytes, testnet);
+  if (!net.ok) { return 1; }
+
+  // The ring's inputs, all from the consensus that was just verified rather than from a second one.
+  i64[] period = consensusTimePeriod(net.consensus, testnet, 0);
+  if (period[0] < 0) {
+    core.warn("tor: the consensus has no usable valid-after and fresh-until");
+    return 1;
+  }
+  i64 periodNum = period[0];
+  i64 periodLength = period[1];
+  core.log("time period " + itoa64(periodNum) + ", " + itoa64(periodLength) +
+           " minutes long");
+
+  // The current period pairs with the *previous* shared random value — see `consensusSharedRandom`.
+  u8[] srv = consensusSharedRandom(net.consensus, false);
+  if (srv.len() != 32) {
+    srv = consensusSharedRandom(net.consensus, true);
+    if (srv.len() == 32) {
+      core.log("no previous shared random value; using the current one");
+    } else {
+      srv = disasterSrv(periodLength, periodNum);
+      core.log("the consensus carries no shared random value; using the disaster SRV");
+    }
+  }
+
+  u8[] blinded = blindedPublicKey(identity, periodNum, periodLength);
+  if (blinded.len() != 32) {
+    core.warn("tor: the address does not decode to a curve point");
+    return 1;
+  }
+  u8[] subcred = subcredential(identity, blinded);
+
+  i32[] dirs = hsdirsForDescriptor(net.relays, blinded, srv, periodNum, periodLength,
+                                   HSDIR_N_REPLICAS_DEFAULT, HSDIR_SPREAD_FETCH_DEFAULT);
+  if (dirs.len() == 0) {
+    core.warn("tor: no directory could be placed on the ring — are microdescriptors attached?");
+    return 1;
+  }
+  core.log(itoa(dirs.len()) + " responsible directories");
+
+  // Try them in turn. A descriptor is stored on more directories than a client looks at, precisely so
+  // that one being down is not the end of it, and treating the first 404 as final would throw that
+  // away.
+  string path = descriptorPath(blinded);
+  u8[] body = u8[0]();
+  for (i32 i = 0; i < dirs.len() && body.len() == 0; i++) {
+    Relay d = net.relays[dirs[i]];
+    core.log("asking " + d.nickname + " at " + d.address + ":" + itoa(d.orPort));
+    Session s = buildCircuitTo(core, cli, net, dirs[i], 0x80000010 + i);
+    if (!s.ok) { continue; }
+    core.log("  path: " + s.description);
+    body = fetchOverCircuit(s.link, s.circ, path);
+    cli.closeSocket(s.link.sock);
+    if (body.len() == 0) { core.log("  no descriptor there"); }
+  }
+  if (body.len() == 0) {
+    core.warn("tor: no responsible directory had a descriptor for this address");
+    return 1;
+  }
+  core.log("descriptor: " + itoa(body.len()) + " bytes");
+
+  return report(core, cli, body, blinded, subcred);
+}
+
+/** Decrypt both layers and print what the descriptor names. */
+i32 report(Core core, Cli cli, u8[] body, u8[] blinded, u8[] subcred) {
+  // The descriptor names its own blinded key in the signing certificate. Checking it against the one
+  // we derived is not redundant with the fetch succeeding: an HSDir serves whatever is filed under a
+  // key, and this is what says the file it served is the one we asked for.
+  u8[] cert = pemBlock(body, "descriptor-signing-key-cert".toBytes(), "ED25519 CERT".toBytes());
+  if (certType(cert) != 8) {
+    core.warn("tor: the descriptor has no type-8 signing certificate");
+    return 1;
+  }
+  u8[] claimed = certSignedWithKey(cert);
+  if (claimed.len() != 32) {
+    core.warn("tor: the certificate names no blinded key");
+    return 1;
+  }
+  for (i32 i = 0; i < 32; i++) {
+    if (claimed[i] != blinded[i]) {
+      core.warn("tor: the descriptor is signed under a different blinded key than we asked for");
+      return 1;
+    }
+  }
+
+  i64 revision = keywordInt(body, "revision-counter".toBytes());
+  if (revision < 0) {
+    core.warn("tor: the descriptor has no revision counter");
+    return 1;
+  }
+
+  u8[] outer = pemBlock(body, "superencrypted".toBytes(), "MESSAGE".toBytes());
+  u8[] first = decryptLayer(outer, blinded, subcred, revision, superencryptedConstant());
+  if (first.len() == 0) {
+    core.warn("tor: the first layer did not decrypt — wrong subcredential, or the descriptor is "
+              + "for a service with client authorisation, which is not implemented");
+    return 1;
+  }
+  u8[] inner = pemBlock(first, "encrypted".toBytes(), "MESSAGE".toBytes());
+  u8[] second = decryptLayer(inner, blinded, subcred, revision, encryptedConstant());
+  if (second.len() == 0) {
+    core.warn("tor: the second layer did not decrypt");
+    return 1;
+  }
+
+  IntroPoint[] points = parseIntroPoints(second);
+  core.log("revision " + itoa64(revision) + ", " + itoa(points.len()) +
+           " introduction points");
+  for (i32 i = 0; i < points.len(); i++) {
+    u8[] v4 = linkSpecifier(points[i].linkSpecifiers, LS_IPV4);
+    string where = "?";
+    if (v4.len() == 6) {
+      where = itoa(v4[0]) + "." + itoa(v4[1]) + "." + itoa(v4[2]) + "." + itoa(v4[3]) +
+              ":" + itoa((v4[4] * 256) + v4[5]);
+    }
+    cli.write(("introduction-point " + itoa(i) + " at " + where +
+               "\n  auth-key   " + hex(points[i].authKey) +
+               "\n  enc-key    " + hex(points[i].encKey) +
+               "\n  onion-key  " + hex(points[i].onionKey) + "\n").toBytes());
+  }
+  return points.len() > 0 ? 0 : 1;
+}
+
+string hex(u8[] b) {
+  u8[] digits = "0123456789abcdef".toBytes();
+  u8[] out = u8[b.len() * 2]();
+  for (i32 i = 0; i < b.len(); i++) {
+    out[i * 2] = digits[(b[i] >> 4) & 0xF];
+    out[i * 2 + 1] = digits[b[i] & 0xF];
+  }
+  return string.fromBytes(out);
+}
