@@ -44,19 +44,14 @@ export i32 main(Core core, Cli cli) {
   }
 
   Shell sh = Shell.create(core, cli);
-  // The twelve are programs of this very bundle, so the shell *could* spawn them rather than call them
-  // — `sh.externalSpawnable = true` is the one line — and that is what makes a pipeline's stages run at
-  // once and lets `head` stop `seq`. It is off, because turning it on made two differential scripts
-  // disagree with bash and both are platform bugs rather than shell bugs:
-  //
-  //   * a non-UTF-8 argument does not survive a spawn. `cat $(printf '\xff\xfe')` names the file with
-  //     two replacement characters, because the wire format decodes arguments as text — wac-mono 0065.
-  //   * a spawned child does not receive what the shell has left of its standard input, so
-  //     `{ read a; cat; } <<EOF` prints nothing where bash prints the rest — wac-mono 0066.
-  //
-  // Both are reachable today by anything that wires `Shell.external` — `packages/box`'s terminal spawns
-  // sixty applets — so they are worth fixing rather than routing around, and this line is what turns the
-  // fix on. Until then the twelve are called in process, which is where they were.
+  // The twelve are programs of this very bundle, so the shell spawns them rather than calling them, which
+  // is what makes a pipeline's stages run at once and lets `head` stop `seq`. Two platform bugs kept this
+  // off until now — a non-UTF-8 argument did not survive a spawn (wac-mono 0065: the argv wire format
+  // decoded arguments as text, and now carries bytes), and a spawned child did not receive what the shell
+  // had left of its standard input (wac-mono 0066: `Shell.heldInput`). Both were reachable by anything
+  // wiring `Shell.external`, including `packages/box`'s terminal, so they were worth fixing rather than
+  // routing around.
   sh.externalNames = programNames;
+  sh.externalSpawnable = true;
   return shellMain(core, cli, sh, 0);
 }
