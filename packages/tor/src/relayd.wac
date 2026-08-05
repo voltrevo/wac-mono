@@ -68,13 +68,13 @@ import {
 } from "./relaycert.wac";
 import { relayHandshakeReply, responderVersion, netinfoOtherAddress } from "./relaylink.wac";
 import {
-  Created, Extend, Inbound, answerCreate2, answerCreateFast, destroyCell, extendTarget,
+  Begin, Created, Extend, Inbound, answerCreate2, parseBegin, answerCreateFast, destroyCell, extendTarget,
   extended2Body, parseExtend2, receiveFromClient, sendToClient,
   DESTROY_INTERNAL, DESTROY_NONE, DESTROY_PROTOCOL,
 } from "./relaycircuit.wac";
 import {
-  Hop, relayBeginDir, relayConnected, relayData, relayEnd, relayExtend2, relayExtended2,
-  wrapForClient,
+  Hop, relayBegin, relayBeginDir, relayConnected, relayData, relayEnd, relayExtend2,
+  relayExtended2, wrapForClient,
 } from "./relay.wac";
 import {
   RelayInfo, RelayKeys, routerDescriptor, rsaDescriptorDigest, rsaFingerprint,
@@ -443,6 +443,13 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs,
   i32 dirStream = -1;
   Buf dirRequest = Buf.create();
 
+  // And the one ordinary stream: a socket to wherever a RELAY_BEGIN asked to go. One at a time, which
+  // is a real limit rather than a simplification — a second BEGIN is refused with an END so the client
+  // knows, instead of being left to time out.
+  bool hasStream = false;
+  i32 streamSock = -1;
+  i32 streamId = -1;
+
   bool hasNext = false;
   Link next = Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]());
   i32 nextCircId = 0;
@@ -451,6 +458,7 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs,
   // ticket has to exist to be waited on, and re-created rather than reused because `wait` spends it.
   Pending<Read> fromClient = cli.recv(conn.handle);
   Pending<Read> fromNext = fromClient;
+  Pending<Read> fromStream = fromClient;
 
   while (true) {
     // `Read` is an enum, not a struct with a length: a clean close and a failure are different
@@ -460,13 +468,50 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs,
     // the circuit has been extended, the next hop's. `waitAny` parks on whichever speaks — polling
     // both would spin a core to avoid parking, which is what its own documentation says. The shape is
     // `packages/box/src/applets/nc.wac`'s, which is the same problem with stdin in place of a relay.
-    i32 which = hasNext
-      ? core.waitAny(i32[](fromClient.id, fromNext.id), IDLE_TIMEOUT_MS)
-      : core.waitAny(i32[](fromClient.id), IDLE_TIMEOUT_MS);
+    i32 which = -2;
+    if (hasNext && hasStream) {
+      which = core.waitAny(i32[](fromClient.id, fromNext.id, fromStream.id), IDLE_TIMEOUT_MS);
+    } else if (hasNext) {
+      which = core.waitAny(i32[](fromClient.id, fromNext.id), IDLE_TIMEOUT_MS);
+    } else if (hasStream) {
+      // The stream keeps index 2 whether or not a next hop exists, so the branches below never have to
+      // ask which arrangement produced the number.
+      i32 w = core.waitAny(i32[](fromClient.id, fromStream.id), IDLE_TIMEOUT_MS);
+      which = w == 1 ? 2 : w;
+    } else {
+      which = core.waitAny(i32[](fromClient.id), IDLE_TIMEOUT_MS);
+    }
     if (which < 0) {
       core.warn("relayd:   idle for " + itoa(IDLE_TIMEOUT_MS) + "ms, dropping the connection");
       if (hasNext) { cli.closeSocket(next.sock); }
       return;
+    }
+
+    if (which == 2) {
+      bool open = false;
+      u8[] payload = u8[0]();
+      match (fromStream.wait()) {
+        case Data(bytes): { payload = bytes; open = true; }
+        case End: { }
+        case Failed(why): { core.warn("relayd:   the stream failed: " + why); }
+      }
+      fromStream = cli.recv(streamSock);
+      if (!open) {
+        // The far end closed, which is an END rather than silence: a client that is told nothing waits
+        // for its own timeout and blames the circuit.
+        tls = sendCell(cli, conn, tls,
+                       sendToClient(hop, circId, relayEnd(), streamId, endReason()));
+        cli.closeSocket(streamSock);
+        hasStream = false;
+        core.log("relayd:   stream " + itoa(streamId) + " closed by the far end");
+        continue;
+      }
+      u8[][] parts = chunkRequest(payload);
+      for (i32 pi = 0; pi < parts.len(); pi++) {
+        tls = sendCell(cli, conn, tls,
+                       sendToClient(hop, circId, relayData(), streamId, parts[pi]));
+      }
+      continue;
     }
 
     if (which == 1) {
@@ -654,6 +699,58 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs,
                                       extended2Body(done.reply)));
           core.log("relayd:   extended circuit " + itoa(circId) + " to the next hop as " +
                    itoa(nextCircId));
+          continue;
+        }
+
+        if (inbound.command == relayBegin()) {
+          if (hasStream) {
+            core.warn("relayd:   a second stream on one circuit is not supported");
+            tls = sendCell(cli, conn, tls,
+                           sendToClient(hop, circId, relayEnd(), inbound.streamId, endReason()));
+            continue;
+          }
+          Begin want = parseBegin(inbound.data);
+          if (!want.ok) {
+            core.warn("relayd:   a BEGIN we could not read");
+            tls = sendCell(cli, conn, tls,
+                           sendToClient(hop, circId, relayEnd(), inbound.streamId, endReason()));
+            continue;
+          }
+          // A leading colon means this relay's own address, which is how a rendezvous stream is opened.
+          string host = want.ownAddress ? "127.0.0.1" : want.host;
+          Socket target = cli.connect(host, want.port).wait();
+          if (target.handle < 0) {
+            core.log("relayd:   " + host + ":" + itoa(want.port) + " refused: " + target.error);
+            tls = sendCell(cli, conn, tls,
+                           sendToClient(hop, circId, relayEnd(), inbound.streamId, endReason()));
+            continue;
+          }
+          streamSock = target.handle;
+          streamId = inbound.streamId;
+          hasStream = true;
+          fromStream = cli.recv(streamSock);
+          tls = sendCell(cli, conn, tls,
+                         sendToClient(hop, circId, relayConnected(), streamId, connectedBody()));
+          core.log("relayd:   stream " + itoa(streamId) + " open to " + host + ":" +
+                   itoa(want.port));
+          continue;
+        }
+
+        if (inbound.command == relayData() && hasStream && inbound.streamId == streamId) {
+          if (!cli.send(streamSock, inbound.data).wait()) {
+            core.warn("relayd:   the stream would not take the data");
+            tls = sendCell(cli, conn, tls,
+                           sendToClient(hop, circId, relayEnd(), streamId, endReason()));
+            cli.closeSocket(streamSock);
+            hasStream = false;
+          }
+          continue;
+        }
+
+        if (inbound.command == relayEnd() && hasStream && inbound.streamId == streamId) {
+          core.log("relayd:   the client ended stream " + itoa(streamId));
+          cli.closeSocket(streamSock);
+          hasStream = false;
           continue;
         }
 
@@ -900,4 +997,17 @@ u8[] joinBytes(u8[] a, u8[] b) {
   for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
   for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
   return out;
+}
+
+/**
+ * A RELAY_CONNECTED body: the address the stream reached, and how long it may be cached.
+ *
+ * `127.0.0.1` and a zero TTL. The address is what a client uses for its own bookkeeping, and zero says
+ * not to cache it — honest for a testnet exit that connects to one loopback address.
+ */
+u8[] connectedBody() {
+  u8[] b = u8[8]();
+  b[0] = 127;
+  b[3] = 1;
+  return b;
 }

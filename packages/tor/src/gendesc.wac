@@ -162,8 +162,12 @@ export i32 main(Core core, Cli cli) {
         //
         // Still no `HSDir`: nothing here serves a hidden-service directory, and a client that believed
         // that flag would publish onion descriptors into a hole.
+        // `accept` became true when `relayd` learned to carry a stream: it parses RELAY_BEGIN, opens
+        // the socket, answers CONNECTED and forwards data both ways. D4 is why this is the order —
+        // the policy follows the capability rather than advertising ahead of it, which is what the
+        // V2Dir and HSDir decisions were both about.
         relays[ri] = RelayOpinion(subject, "Exit Fast Guard Running Stable V2Dir Valid",
-                                  640416, "reject 1-65535");
+                                  640416, "accept 1-65535");
       }
       VoteInfo vi = VoteInfo("wacauth", "127.0.0.1", "127.0.0.1", 7000, 5000,
                              "agent-b@wac-mono", published, published + window,
