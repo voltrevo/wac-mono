@@ -433,7 +433,29 @@ bool canStream(Shell sh, Pipeline pipeline) {
     }
     if (!plain) { return false; }
     Simple simple = cmd.simple;
-    if (simple.redirs.len() > 0 || simple.assigns.len() > 0) { return false; }
+    if (simple.assigns.len() > 0) { return false; }
+    // **One redirection is allowed, and only one shape of it**: `> file` on the *last* stage. That is
+    // the case 0070 was reported for — `seq 1 2000000000 > out` built twenty gigabytes in the shell and
+    // trapped, because the output was gathered before the file was written. `openOutput` sends the
+    // shell's own `write` to a file, and the relay loop already writes there, so streaming it is a
+    // question of opening the file first rather than of new machinery.
+    //
+    // Everything else still takes the sequential path, and each exclusion is a fact about the
+    // capability rather than caution: `>>` needs the file's existing bytes, and `openOutput` truncates;
+    // `2>` and `2>&1` are not implemented at all; `< file` and a here-document belong to the shell's own
+    // cursor; and two output redirections cannot both be the current output.
+    if (simple.redirs.len() > 0) {
+      if (i != pipeline.stages.len() - 1) { return false; }
+      if (simple.redirs.len() != 1) { return false; }
+      Redir only = simple.redirs.get(0);
+      if (only.fd != 1) { return false; }
+      bool truncating = false;
+      match (only.kind) {
+        case Out: { truncating = true; }
+        else: {}
+      }
+      if (!truncating) { return false; }
+    }
     if (simple.words.len() == 0) { return false; }
     Word first = simple.words.get(0);
     if (first.parts.len() != 1) { return false; }
@@ -513,6 +535,30 @@ bool streamPipeline(Shell sh, Pipeline pipeline) {
     errH[i] = kid.errHandle;
   }
 
+  // **The redirection, opened once every stage is running.** `openOutput` makes a file the destination
+  // of the shell's own `write`, which is where the relay loop below already sends the last stage's
+  // output — so a redirected command streams into the file instead of being gathered and written after.
+  // 0070: `seq 1 2000000000 > out` used to build twenty gigabytes in the shell and trap at one wasm
+  // array; bash writes about twenty gigabytes.
+  //
+  // After the spawns, not before, so that every early return above happens with the file untouched.
+  bool redirected = false;
+  for (i32 i = 0; i < pipeline.stages.get(n - 1).simple.redirs.len(); i++) {
+    Redir r = pipeline.stages.get(n - 1).simple.redirs.get(i);
+    string path = sh.resolve(joinWord(sh, r.target));
+    Change opened = sh.cli.openOutput(path).wait();
+    if (!opened.ok()) {
+      // `reasonOf`, so the words are the ones GNU uses for the category rather than the host's
+      // sentence: "No such file or directory", not "No such file or directory (os error 2): open
+      // '/tmp/…/sub/out'". Same translation `mkdir` and `rm` go through.
+      sh.err(("sh: " + joinWord(sh, r.target) + ": " + reasonOf(opened) + "\n").toBytes());
+      sh.status = 1;
+      stopAll(sh, outH, errH, n);
+      return true;
+    }
+    redirected = true;
+  }
+
   // The shell's own input goes to the first stage, and then its input ends. `closeFeed`, not
   // `closeSocket`: a program that reads to the end before answering needs that end while alive. A
   // stage that inherited the descriptor feeds itself, and sending it anything would be sending bytes
@@ -578,7 +624,7 @@ bool streamPipeline(Shell sh, Pipeline pipeline) {
           } else {
             outT.set(i, sh.cli.recv(outH[i]));
           }
-        } else if (sh.capture) {
+        } else if (sh.capture && !redirected) {
           sh.outBuf.pushAll(bytes);
           outT.set(i, sh.cli.recv(outH[i]));
         } else {
@@ -601,6 +647,11 @@ bool streamPipeline(Shell sh, Pipeline pipeline) {
       }
     }
   }
+
+  // Closed before anything else, so the file is complete by the time the next command runs: a script
+  // that writes `f` and then reads it must not see a half-written one. Opening `""` is how a program
+  // says it has finished writing — see `openOutput` in `platform.wac`.
+  if (redirected) { sh.cli.openOutput("").wait(); }
 
   // The last stage's status is the pipeline's, as in bash. A stage that was *stopped* has no status
   // worth asking for — its handle is gone, and asking is an error rather than an answer — so only the

@@ -28,7 +28,7 @@ import {
 } from "./children.ts";
 import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
-import { changeBytes, changed, FAULT_DENIED } from "./faults.ts";
+import { changeBytes, changed, CHANGED_OK, FAULT_DENIED } from "./faults.ts";
 
 /** Node's pieces, described rather than imported, so this file checks under Deno. */
 export type NodeIo = {
@@ -496,10 +496,9 @@ export function nodeWorld(
       const path = unstr(p);
       await sink?.close();
       sink = null;
-      if (path === "") return EMPTY;
-      if (!opts.fs?.write) deny("filesystem write");
-      sink = await io.createFile(P(path));
-      return EMPTY;
+      if (path === "") return CHANGED_OK;
+      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      return await changed(async () => { sink = await io.createFile(P(path)); });
     },
 
     [OP.CONNECT]: async (p) => {

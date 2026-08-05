@@ -4,7 +4,7 @@
 // where `cli.write` goes, so the fetch itself is unchanged and does not know. Switching
 // back to standard output at the end is what closes the file.
 
-import { Cli, Core } from "../../../platform/src/platform.wac";
+import { Change, Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
 import { fetch } from "../lib/fetch.wac";
 
@@ -14,8 +14,8 @@ export i32 wget(Core core, Cli cli, Args a) {
     return 2;
   }
   string out = a.rest[2];
-  string error = cli.openOutput(out).wait();
-  if (error != "") { core.warn(a.name + ": " + out + ": " + error); return 1; }
+  Change opened = cli.openOutput(out).wait();
+  if (!opened.ok()) { core.warn(a.name + ": " + out + ": " + opened.message); return 1; }
 
   i32 code = fetch(core, cli, a.name, a.rest[0], a.rest[1], a.num == 0 ? 80 : a.num, false);
 

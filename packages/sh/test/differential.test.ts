@@ -931,6 +931,23 @@ for (const [i, script] of [
   `printf 'ab\n' > f; rev f`,
   `printf 'a\nb\n' > f; nl f`,
   `printf 'a\nb\n' > f; cat f - < f`,
+  // Redirections, which used to gather the command's whole output in the shell and write the file
+  // afterwards — so `seq 1 2000000000 > out` trapped at one wasm array where bash writes twenty
+  // gigabytes (0070). The streaming path opens the file first and relays into it, which is why the
+  // truncation, the ordering and the capture interaction all need saying.
+  `seq 1 3 > f; cat f`,
+  `seq 1 3 > f; seq 4 5 > f; cat f`,
+  `seq 1 5 | head -2 > f; cat f`,
+  `x=$(seq 1 3 > f); echo "[$x]"; cat f`,
+  // **Truncated first, on purpose.** The harness gives each case a directory and runs *both* shells in
+  // it, so a case whose answer depends on what is already there sees the other shell's leftovers: this
+  // one without the `: > f` reported `1..5` from bash and `1..5` twice from us, which is the harness
+  // rather than the shell. Every other case here happens to truncate, which is why nothing had hit it.
+  `: > f; seq 1 3 >> f; seq 4 5 >> f; cat f`,
+  `printf '' > f; wc -c < f`,
+  `cat missing > f; echo status=$?; wc -c < f`,
+  `seq 1 3 > sub/f; echo status=$?`,
+  `echo one > f; echo two > f; wc -l < f`,
   // The operand paths of the five that now stream, including the two orderings of a file that cannot
   // be opened — `rev` and `nl` report and carry on, `sort` gives up, and the complaint lands *between*
   // the outputs rather than before them, which needs the output sink flushed first.
