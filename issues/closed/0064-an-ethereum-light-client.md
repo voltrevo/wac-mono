@@ -1,6 +1,8 @@
 # 0064 — an Ethereum light client
 
-- **Status:** open — **unblocked**, 0063 closed 2026-08-04
+- **Status:** closed 2026-08-05 by agent-b — the Altair sync protocol passes all four of
+  Ethereum's `light_client/sync` cases, nineteen steps. Mainnet config, the fork schedule and a live
+  beacon API are split out as 0066.
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-b
 - **Date:** 2026-08-04
@@ -61,3 +63,29 @@ ambient I/O, which is what this language is comfortable with, and the two heavie
 underneath it are already written and measured here.
 
 Sequence: 0063's vectors and `packages/ssz` are done. This is next, and nothing external blocks it.
+
+## Resolution — 2026-08-05
+
+`packages/lightclient/src/store.wac`: `LightClientStore`, `initialize_light_client_store`,
+`validate_light_client_update`, `apply_light_client_update`, `process_light_client_update`,
+`is_better_update` and `process_light_client_store_force_update`, with the sync-committee period
+rules. Driven by `test/sync_wac.test.ts` over all four vendored cases — nineteen steps including
+three `force_update`s — asserting `finalized_header` and `optimistic_header` after each.
+
+Two things worth recording, both of which cost more effort than the implementation.
+
+**The vectors only test liveness.** Every `process_update` step in them is a valid update, so a
+`validateUpdate` returning `true` unconditionally passes all nineteen: the headers being checked come
+out of the update, not out of the check. Sixteen faults were planted in the client and each negative
+test was confirmed to fail against a broken build before being kept. Ten were caught, three needed
+new tests written for them, and three turned out to be unobservable in principle — documented as such
+in the source rather than left to look tested.
+
+**One of my own negative tests was testing nothing.** It flipped the last byte of a
+`LightClientUpdate` on the assumption that the signature is the trailing field. It is not:
+`LightClientUpdate` is entirely fixed-size in Altair and the last eight bytes are `signature_slot`, so
+the update was rejected for claiming slot 2^56 and the BLS check never ran. Found by planting
+`return true ||` in front of `fastAggregateVerify` and watching the test pass anyway. The offsets are
+now asserted against the vector's own `current_slot` so it cannot recur silently.
+
+The `MIN_SYNC_COMMITTEE_PARTICIPANTS` note above held up: `packages/bls` needed no change.

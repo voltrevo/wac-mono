@@ -1,0 +1,520 @@
+// The Altair light client sync protocol: a store, and the rules for advancing it.
+//
+// A light client follows the beacon chain without downloading it. It holds a sync committee it
+// trusts, and each update carries a header, a signature from that committee, and Merkle branches
+// proving the header's state contains the *next* committee and a finalized checkpoint. Believing an
+// update means checking the signature and the branches; believing a *chain* of them means the period
+// rules below, which are what stop a client being walked onto a fork.
+//
+// Structured as the spec is, function for function, because the spec is the specification of a
+// consensus protocol and a paraphrase of it is a different protocol. Where this departs — storing
+// serialized objects rather than parsed ones — it is noted.
+//
+// ## Objects are kept serialized
+//
+// `Store` holds SSZ bytes and reads fields out of them with `packages/ssz` when needed. wac has no
+// generic containers, so the alternative is a struct per beacon type and a parser per struct, which
+// is the thing `packages/ssz`'s descriptor table exists to avoid. The cost is re-parsing on access;
+// the benefit is that there is exactly one definition of every layout, and it is checked against
+// Ethereum's vectors.
+//
+// ## Configuration
+//
+// Minimal, because Ethereum's sync-protocol vectors exist only for it. `SLOTS_PER_EPOCH` 8 and
+// `EPOCHS_PER_SYNC_COMMITTEE_PERIOD` 8 give a 64-slot period, and `UPDATE_TIMEOUT` is the same 64.
+// Mainnet is 32 and 256, so a period is 8192 slots — the arithmetic is identical and only these
+// three numbers move.
+
+import { beaconTypesMinimal, beaconFields, TY_LIGHT_CLIENT_UPDATE, TY_LIGHT_CLIENT_BOOTSTRAP,
+         TY_LIGHT_CLIENT_HEADER, TY_SYNC_COMMITTEE, TY_SYNC_AGGREGATE, TY_BEACON_BLOCK_HEADER,
+         SYNC_COMMITTEE_SIZE_MINIMAL } from "../../ssz/src/beacon.wac";
+import { fieldBytes, fieldRoot } from "../../ssz/src/container.wac";
+import { isValidNormalizedMerkleBranch } from "../../ssz/src/merkle.wac";
+import { fastAggregateVerify } from "../../bls/src/verify.wac";
+import { syncCommitteeSigningRoot } from "./domain.wac";
+
+/** Slots per sync committee period, minimal config: SLOTS_PER_EPOCH 8 x EPOCHS_PER_PERIOD 8. */
+export const i64 SLOTS_PER_SYNC_COMMITTEE_PERIOD = 64;
+/** `Slot(SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMITTEE_PERIOD)`. */
+export const i64 UPDATE_TIMEOUT = 64;
+export const i32 MIN_SYNC_COMMITTEE_PARTICIPANTS = 1;
+
+// Generalized indices, Altair. Electra moves these — see `packages/ssz`'s proof tests.
+const i64 FINALIZED_ROOT_GINDEX = 105;
+const i64 CURRENT_SYNC_COMMITTEE_GINDEX = 54;
+const i64 NEXT_SYNC_COMMITTEE_GINDEX = 55;
+
+// Field indices, from `packages/ssz`'s `beaconFields`.
+const i32 UPDATE_ATTESTED_HEADER = 0;
+const i32 UPDATE_NEXT_SYNC_COMMITTEE = 1;
+const i32 UPDATE_NEXT_SYNC_COMMITTEE_BRANCH = 2;
+const i32 UPDATE_FINALIZED_HEADER = 3;
+const i32 UPDATE_FINALITY_BRANCH = 4;
+const i32 UPDATE_SYNC_AGGREGATE = 5;
+const i32 UPDATE_SIGNATURE_SLOT = 6;
+const i32 BOOTSTRAP_HEADER = 0;
+const i32 BOOTSTRAP_CURRENT_SYNC_COMMITTEE = 1;
+const i32 BOOTSTRAP_CURRENT_SYNC_COMMITTEE_BRANCH = 2;
+const i32 HEADER_BEACON = 0;
+const i32 BEACON_SLOT = 0;
+const i32 BEACON_STATE_ROOT = 3;
+const i32 AGGREGATE_BITS = 0;
+const i32 AGGREGATE_SIGNATURE = 1;
+const i32 COMMITTEE_PUBKEYS = 0;
+
+/**
+ * The client's whole state.
+ *
+ * `nextSyncCommittee` and `bestValidUpdate` are empty when absent — the spec's `SyncCommittee()` and
+ * `None`. An empty array and an all-zero one are different things here and the distinction matters:
+ * an update legitimately carries an all-zero `next_sync_committee` to mean "none supplied", which is
+ * why `isZero` exists rather than a length check.
+ */
+export struct Store {
+  u8[] finalizedHeader;
+  u8[] currentSyncCommittee;
+  u8[] nextSyncCommittee;
+  u8[] bestValidUpdate;
+  u8[] optimisticHeader;
+  i32 previousMaxActiveParticipants;
+  i32 currentMaxActiveParticipants;
+}
+
+i32[] types() { return beaconTypesMinimal(); }
+
+u8[] field(i32 ty, u8[] data, i32 f) { return fieldBytes(types(), beaconFields(), ty, data, f); }
+
+u8[] rootOf(i32 ty, u8[] data, i32 f) {
+  u8[]? r = fieldRoot(types(), beaconFields(), ty, data, f);
+  return (r is null) ? u8[0]() : r!;
+}
+
+/** Whether every byte is zero — how the spec's `== SyncCommittee()` and `== FinalityBranch()` read. */
+export bool isZero(u8[] b) {
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] != 0) { return false; }
+  }
+  return true;
+}
+
+/** A little-endian uint64 field as a slot. −1 when the field is not eight bytes. */
+i64 readSlot(u8[] b) {
+  if (b.len() != 8) { return -1; }
+  i64 v = 0;
+  for (i32 i = 7; i >= 0; i--) { v = (v << 8) | (b[i] as i64); }
+  return v;
+}
+
+/** `compute_sync_committee_period_at_slot`. */
+export i64 syncCommitteePeriodAtSlot(i64 slot) { return slot / SLOTS_PER_SYNC_COMMITTEE_PERIOD; }
+
+// ── Reading the pieces of an update ───────────────────────────────────────────
+
+export u8[] updateAttestedHeader(u8[] u) { return field(TY_LIGHT_CLIENT_UPDATE(), u, UPDATE_ATTESTED_HEADER); }
+export u8[] updateFinalizedHeader(u8[] u) { return field(TY_LIGHT_CLIENT_UPDATE(), u, UPDATE_FINALIZED_HEADER); }
+export u8[] updateNextSyncCommittee(u8[] u) { return field(TY_LIGHT_CLIENT_UPDATE(), u, UPDATE_NEXT_SYNC_COMMITTEE); }
+export u8[] updateNextSyncCommitteeBranch(u8[] u) { return field(TY_LIGHT_CLIENT_UPDATE(), u, UPDATE_NEXT_SYNC_COMMITTEE_BRANCH); }
+export u8[] updateFinalityBranch(u8[] u) { return field(TY_LIGHT_CLIENT_UPDATE(), u, UPDATE_FINALITY_BRANCH); }
+export u8[] updateSyncAggregate(u8[] u) { return field(TY_LIGHT_CLIENT_UPDATE(), u, UPDATE_SYNC_AGGREGATE); }
+export i64 updateSignatureSlot(u8[] u) { return readSlot(field(TY_LIGHT_CLIENT_UPDATE(), u, UPDATE_SIGNATURE_SLOT)); }
+
+/** The beacon slot inside a `LightClientHeader`. */
+export i64 headerSlot(u8[] header) {
+  u8[] beacon = field(TY_LIGHT_CLIENT_HEADER(), header, HEADER_BEACON);
+  return readSlot(field(TY_BEACON_BLOCK_HEADER(), beacon, BEACON_SLOT));
+}
+
+/** `hash_tree_root(header.beacon)` — what a finality branch proves and what a signature covers. */
+export u8[] headerBeaconRoot(u8[] header) { return rootOf(TY_LIGHT_CLIENT_HEADER(), header, HEADER_BEACON); }
+
+/** `header.beacon.state_root` — the root the update's branches are verified against. */
+export u8[] headerStateRoot(u8[] header) {
+  u8[] beacon = field(TY_LIGHT_CLIENT_HEADER(), header, HEADER_BEACON);
+  return field(TY_BEACON_BLOCK_HEADER(), beacon, BEACON_STATE_ROOT);
+}
+
+/** `1 << k` as an i32. `1 << (k as@ u32)` is a u32 and will not meet a `u8[]` element. */
+i32 maskFor(i32 k) {
+  i32 m = 1;
+  for (i32 i = 0; i < k; i++) { m = m * 2; }
+  return m;
+}
+
+/** How many committee members signed. */
+export i32 countBits(u8[] bits) {
+  i32 n = 0;
+  for (i32 i = 0; i < bits.len() * 8; i++) {
+    if ((bits[i >> 3] & maskFor(i & 7)) != 0) { n = n + 1; }
+  }
+  return n;
+}
+
+/** `is_sync_committee_update` / `is_finality_update`: the branch is present rather than all zeros. */
+export bool isSyncCommitteeUpdate(u8[] u) { return !isZero(updateNextSyncCommitteeBranch(u)); }
+export bool isFinalityUpdate(u8[] u) { return !isZero(updateFinalityBranch(u)); }
+export bool isNextSyncCommitteeKnown(Store s) {
+  return s.nextSyncCommittee.len() > 0 && !isZero(s.nextSyncCommittee);
+}
+
+/**
+ * Two thirds of the committee — what finality requires, as opposed to what the optimistic header
+ * requires.
+ *
+ * Named rather than written inline at its two use sites because the two thresholds in this file are
+ * the security boundary of the whole protocol, and weakening either one is invisible against
+ * Ethereum's sync vectors: every update in them is signed by nearly the whole committee, so `>= 2/3`
+ * and `>= 1/3` accept exactly the same set. `test/sync_wac.test.ts` pins them directly for that
+ * reason.
+ */
+export bool hasSupermajority(u8[] bits, i32 active) { return active * 3 >= bits.len() * 8 * 2; }
+
+/** `get_safety_threshold` — half the best participation seen in this period or the last. */
+export i32 safetyThreshold(Store s) {
+  i32 m = (s.previousMaxActiveParticipants > s.currentMaxActiveParticipants)
+    ? s.previousMaxActiveParticipants : s.currentMaxActiveParticipants;
+  return m / 2;
+}
+
+// ── Initialisation ────────────────────────────────────────────────────────────
+
+/**
+ * `initialize_light_client_store` — trust one block root, and derive a committee from it.
+ *
+ * Everything the client later believes rests on this: the caller supplies a block root it trusts out
+ * of band, and the bootstrap must both hash to it and prove that its committee is the one in that
+ * block's state. Null if either fails, because a store built from an unproven committee would verify
+ * signatures from whoever supplied it.
+ */
+export Store? initializeStore(u8[] trustedBlockRoot, u8[] bootstrap) {
+  u8[] header = field(TY_LIGHT_CLIENT_BOOTSTRAP(), bootstrap, BOOTSTRAP_HEADER);
+  if (header.len() == 0) { return null; }
+  u8[] beaconRoot = headerBeaconRoot(header);
+  if (beaconRoot.len() != 32 || trustedBlockRoot.len() != 32) { return null; }
+  for (i32 i = 0; i < 32; i++) {
+    if (beaconRoot[i] != trustedBlockRoot[i]) { return null; }
+  }
+  u8[] committee = field(TY_LIGHT_CLIENT_BOOTSTRAP(), bootstrap, BOOTSTRAP_CURRENT_SYNC_COMMITTEE);
+  u8[] branch = field(TY_LIGHT_CLIENT_BOOTSTRAP(), bootstrap, BOOTSTRAP_CURRENT_SYNC_COMMITTEE_BRANCH);
+  u8[] leaf = rootOf(TY_LIGHT_CLIENT_BOOTSTRAP(), bootstrap, BOOTSTRAP_CURRENT_SYNC_COMMITTEE);
+  if (leaf.len() != 32) { return null; }
+  if (!isValidNormalizedMerkleBranch(leaf, branch, CURRENT_SYNC_COMMITTEE_GINDEX as@ u64,
+                                     headerStateRoot(header))) {
+    return null;
+  }
+  return Store(header, committee, u8[0](), u8[0](), header, 0, 0);
+}
+
+// ── Validation ────────────────────────────────────────────────────────────────
+
+/**
+ * `validate_light_client_update`. True if the update may be applied to this store.
+ *
+ * The order is the spec's, and the ordering is load-bearing in one place worth naming: participation
+ * and the slot relations are checked *before* any signature, so a malformed update is rejected
+ * without paying for a pairing. Everything here is supplied by an untrusted peer.
+ *
+ * ## Three of these checks cannot be observed from outside
+ *
+ * Deleting any one of them changes no verdict on any input, and `test/sync_wac.test.ts` says so
+ * rather than pretending otherwise — each is subsumed by a later cryptographic check:
+ *
+ *   - `attested_slot >= finalized_slot` — a finalized header later than the attested one cannot be
+ *     proven, because its branch is verified against the attested header's state root.
+ *   - the signature-period window — a signature period outside it selects the wrong committee below,
+ *     or an absent one, and the signature then fails.
+ *   - `MIN_SYNC_COMMITTEE_PARTICIPANTS` — at 1 this rejects only an empty participant set, and
+ *     `fastAggregateVerify` refuses an empty key list rather than verifying vacuously.
+ *
+ * They stay because each rejects for a few hundred nanoseconds what would otherwise cost a pairing,
+ * and because the checks they lean on are in other packages: making this function's correctness
+ * depend on `packages/bls` refusing an empty list is a coupling worth not having. But an unobservable
+ * check is exactly the kind that rots unnoticed, so it is named here as one.
+ */
+export bool validateUpdate(Store store, u8[] update, i64 currentSlot, u8[] genesisValidatorsRoot) {
+  u8[] aggregate = updateSyncAggregate(update);
+  u8[] bits = field(TY_SYNC_AGGREGATE(), aggregate, AGGREGATE_BITS);
+  if (bits.len() == 0) { return false; }
+  if (countBits(bits) < MIN_SYNC_COMMITTEE_PARTICIPANTS) { return false; }
+
+  u8[] attested = updateAttestedHeader(update);
+  u8[] finalized = updateFinalizedHeader(update);
+  if (attested.len() == 0 || finalized.len() == 0) { return false; }
+  i64 attestedSlot = headerSlot(attested);
+  i64 finalizedSlot = headerSlot(finalized);
+  i64 signatureSlot = updateSignatureSlot(update);
+  if (attestedSlot < 0 || finalizedSlot < 0 || signatureSlot < 0) { return false; }
+
+  // current_slot >= signature_slot > attested_slot >= finalized_slot, all four at once.
+  if (!(currentSlot >= signatureSlot)) { return false; }
+  if (!(signatureSlot > attestedSlot)) { return false; }
+  if (!(attestedSlot >= finalizedSlot)) { return false; }
+
+  i64 storeSlot = headerSlot(store.finalizedHeader);
+  if (storeSlot < 0) { return false; }
+  i64 storePeriod = syncCommitteePeriodAtSlot(storeSlot);
+  i64 signaturePeriod = syncCommitteePeriodAtSlot(signatureSlot);
+  bool nextKnown = isNextSyncCommitteeKnown(store);
+  if (nextKnown) {
+    if (signaturePeriod != storePeriod && signaturePeriod != storePeriod + 1) { return false; }
+  } else {
+    if (signaturePeriod != storePeriod) { return false; }
+  }
+
+  // Relevance: it must advance the finalized header, or supply the committee the store lacks.
+  i64 attestedPeriod = syncCommitteePeriodAtSlot(attestedSlot);
+  bool hasNextCommittee = !nextKnown && isSyncCommitteeUpdate(update) && attestedPeriod == storePeriod;
+  if (!(attestedSlot > storeSlot || hasNextCommittee)) { return false; }
+
+  // The finality branch, when present, proves the finalized header against the attested state.
+  if (!isFinalityUpdate(update)) {
+    if (!isZero(finalized)) { return false; }
+  } else {
+    u8[] finalizedRoot = u8[32]();          // the genesis checkpoint root is the zero hash
+    if (finalizedSlot != 0) {
+      finalizedRoot = headerBeaconRoot(finalized);
+      if (finalizedRoot.len() != 32) { return false; }
+    } else {
+      if (!isZero(finalized)) { return false; }
+    }
+    if (!isValidNormalizedMerkleBranch(finalizedRoot, updateFinalityBranch(update),
+                                       FINALIZED_ROOT_GINDEX as@ u64, headerStateRoot(attested))) {
+      return false;
+    }
+  }
+
+  // The next sync committee, when present, must match what the store already knows and be proven.
+  u8[] nextCommittee = updateNextSyncCommittee(update);
+  if (!isSyncCommitteeUpdate(update)) {
+    if (!isZero(nextCommittee)) { return false; }
+  } else {
+    if (attestedPeriod == storePeriod && nextKnown) {
+      if (nextCommittee.len() != store.nextSyncCommittee.len()) { return false; }
+      for (i32 i = 0; i < nextCommittee.len(); i++) {
+        if (nextCommittee[i] != store.nextSyncCommittee[i]) { return false; }
+      }
+    }
+    u8[] leaf = rootOf(TY_LIGHT_CLIENT_UPDATE(), update, UPDATE_NEXT_SYNC_COMMITTEE);
+    if (leaf.len() != 32) { return false; }
+    if (!isValidNormalizedMerkleBranch(leaf, updateNextSyncCommitteeBranch(update),
+                                       NEXT_SYNC_COMMITTEE_GINDEX as@ u64,
+                                       headerStateRoot(attested))) {
+      return false;
+    }
+  }
+
+  // Only now the signature, by whichever committee owns the signature period.
+  u8[] committee = (signaturePeriod == storePeriod) ? store.currentSyncCommittee
+                                                    : store.nextSyncCommittee;
+  if (committee.len() == 0) { return false; }
+  u8[] flat = field(TY_SYNC_COMMITTEE(), committee, COMMITTEE_PUBKEYS);
+  if (flat.len() != SYNC_COMMITTEE_SIZE_MINIMAL * 48) { return false; }
+
+  i32 n = countBits(bits);
+  u8[][] participants = u8[][n]();
+  i32 at = 0;
+  for (i32 i = 0; i < SYNC_COMMITTEE_SIZE_MINIMAL; i++) {
+    if ((bits[i >> 3] & maskFor(i & 7)) != 0) {
+      u8[] pk = u8[48]();
+      for (i32 b = 0; b < 48; b++) { pk[b] = flat[i * 48 + b]; }
+      participants[at] = pk;
+      at = at + 1;
+    }
+  }
+  u8[]? signingRoot = syncCommitteeSigningRoot(headerBeaconRoot(attested),
+                                               altairForkVersion(), genesisValidatorsRoot);
+  if (signingRoot is null) { return false; }
+  return fastAggregateVerify(participants, signingRoot!,
+                             field(TY_SYNC_AGGREGATE(), aggregate, AGGREGATE_SIGNATURE));
+}
+
+/** Altair's fork version under the minimal config. See `domain.wac` for why this is config-specific. */
+u8[] altairForkVersion() {
+  u8[] v = u8[4]();
+  v[0] = 0x01;
+  v[3] = 0x01;
+  return v;
+}
+
+// ── Choosing between updates ──────────────────────────────────────────────────
+
+/**
+ * `is_better_update` — the ordering the client uses to keep the best update it has seen.
+ *
+ * Six criteria in a fixed order, and the order is the whole content: supermajority participation
+ * first, then a relevant sync committee, then any finality, then sync-committee finality, then raw
+ * participation, then *older* data. Reordering them is a different protocol, so this reads as a
+ * sequence of early returns matching the spec line for line rather than as a score.
+ *
+ * The last two tiebreakers prefer the *earlier* update, which is not an accident: it minimises how
+ * often the best changes, and therefore how often a forced update moves the client.
+ */
+export bool isBetterUpdate(u8[] newUpdate, u8[] oldUpdate) {
+  u8[] newBits = field(TY_SYNC_AGGREGATE(), updateSyncAggregate(newUpdate), AGGREGATE_BITS);
+  u8[] oldBits = field(TY_SYNC_AGGREGATE(), updateSyncAggregate(oldUpdate), AGGREGATE_BITS);
+  i32 maxActive = newBits.len() * 8;
+  i32 newActive = countBits(newBits);
+  i32 oldActive = countBits(oldBits);
+  bool newSuper = hasSupermajority(newBits, newActive);
+  bool oldSuper = hasSupermajority(oldBits, oldActive);
+  if (newSuper != oldSuper) { return newSuper; }
+  if (!newSuper && newActive != oldActive) { return newActive > oldActive; }
+
+  bool newRelevant = isSyncCommitteeUpdate(newUpdate) &&
+    syncCommitteePeriodAtSlot(headerSlot(updateAttestedHeader(newUpdate))) ==
+    syncCommitteePeriodAtSlot(updateSignatureSlot(newUpdate));
+  bool oldRelevant = isSyncCommitteeUpdate(oldUpdate) &&
+    syncCommitteePeriodAtSlot(headerSlot(updateAttestedHeader(oldUpdate))) ==
+    syncCommitteePeriodAtSlot(updateSignatureSlot(oldUpdate));
+  if (newRelevant != oldRelevant) { return newRelevant; }
+
+  bool newFinality = isFinalityUpdate(newUpdate);
+  bool oldFinality = isFinalityUpdate(oldUpdate);
+  if (newFinality != oldFinality) { return newFinality; }
+
+  if (newFinality) {
+    bool newCommitteeFinality =
+      syncCommitteePeriodAtSlot(headerSlot(updateFinalizedHeader(newUpdate))) ==
+      syncCommitteePeriodAtSlot(headerSlot(updateAttestedHeader(newUpdate)));
+    bool oldCommitteeFinality =
+      syncCommitteePeriodAtSlot(headerSlot(updateFinalizedHeader(oldUpdate))) ==
+      syncCommitteePeriodAtSlot(headerSlot(updateAttestedHeader(oldUpdate)));
+    if (newCommitteeFinality != oldCommitteeFinality) { return newCommitteeFinality; }
+  }
+
+  if (newActive != oldActive) { return newActive > oldActive; }
+  i64 newAttested = headerSlot(updateAttestedHeader(newUpdate));
+  i64 oldAttested = headerSlot(updateAttestedHeader(oldUpdate));
+  if (newAttested != oldAttested) { return newAttested < oldAttested; }
+  return updateSignatureSlot(newUpdate) < updateSignatureSlot(oldUpdate);
+}
+
+// ── Advancing the store ───────────────────────────────────────────────────────
+
+/**
+ * `apply_light_client_update` — adopt an update that has already been validated.
+ *
+ * The committee rotation is the delicate part. A store learns `next` once, and thereafter only
+ * *rotates* when finality crosses into the following period: `current` becomes what `next` was, and
+ * `next` becomes the update's. Rotating on any other trigger would let a client be moved to a
+ * committee a period ahead of its own finality, which is the position from which it can be fed
+ * anything.
+ */
+export void applyUpdate(Store store, u8[] update) {
+  i64 storePeriod = syncCommitteePeriodAtSlot(headerSlot(store.finalizedHeader));
+  u8[] finalized = updateFinalizedHeader(update);
+  i64 finalizedPeriod = syncCommitteePeriodAtSlot(headerSlot(finalized));
+
+  if (!isNextSyncCommitteeKnown(store)) {
+    if (finalizedPeriod != storePeriod) { return; }     // the spec asserts; a client refuses
+    store.nextSyncCommittee = updateNextSyncCommittee(update);
+  } else {
+    if (finalizedPeriod == storePeriod + 1) {
+      store.currentSyncCommittee = store.nextSyncCommittee;
+      store.nextSyncCommittee = updateNextSyncCommittee(update);
+      store.previousMaxActiveParticipants = store.currentMaxActiveParticipants;
+      store.currentMaxActiveParticipants = 0;
+    }
+  }
+  if (headerSlot(finalized) > headerSlot(store.finalizedHeader)) {
+    store.finalizedHeader = finalized;
+    if (headerSlot(store.finalizedHeader) > headerSlot(store.optimisticHeader)) {
+      store.optimisticHeader = store.finalizedHeader;
+    }
+  }
+}
+
+/**
+ * `process_light_client_update` — validate, then advance as far as the update justifies.
+ *
+ * Three separate advances, and they need different amounts of evidence, which is the point of the
+ * function:
+ *
+ *   - the **best valid update** is kept unconditionally, as the fallback a timeout can force;
+ *   - the **optimistic header** moves on more than the safety threshold — a majority of the best
+ *     participation lately, so it tracks the chain quickly and is explicitly not final;
+ *   - the **finalized header** moves only on a supermajority, two thirds of the committee.
+ *
+ * Returns false when the update is invalid; a valid update that advances nothing still returns true,
+ * because "believed and not useful" is not an error.
+ */
+export bool processUpdate(Store store, u8[] update, i64 currentSlot, u8[] genesisValidatorsRoot) {
+  if (!validateUpdate(store, update, currentSlot, genesisValidatorsRoot)) { return false; }
+
+  u8[] bits = field(TY_SYNC_AGGREGATE(), updateSyncAggregate(update), AGGREGATE_BITS);
+  i32 active = countBits(bits);
+
+  if (store.bestValidUpdate.len() == 0 || isBetterUpdate(update, store.bestValidUpdate)) {
+    store.bestValidUpdate = update;
+  }
+  if (active > store.currentMaxActiveParticipants) { store.currentMaxActiveParticipants = active; }
+
+  u8[] attested = updateAttestedHeader(update);
+  if (active > safetyThreshold(store) && headerSlot(attested) > headerSlot(store.optimisticHeader)) {
+    store.optimisticHeader = attested;
+  }
+
+  bool hasFinalizedNextCommittee = !isNextSyncCommitteeKnown(store)
+    && isSyncCommitteeUpdate(update) && isFinalityUpdate(update)
+    && syncCommitteePeriodAtSlot(headerSlot(updateFinalizedHeader(update)))
+       == syncCommitteePeriodAtSlot(headerSlot(attested));
+
+  if (hasSupermajority(bits, active)
+      && (headerSlot(updateFinalizedHeader(update)) > headerSlot(store.finalizedHeader)
+          || hasFinalizedNextCommittee)) {
+    applyUpdate(store, update);
+    store.bestValidUpdate = u8[0]();
+  }
+  return true;
+}
+
+/**
+ * `process_light_client_store_force_update` — accept the best update once the timeout has elapsed.
+ *
+ * The escape from extended non-finality. If nothing has finalized for a whole period, the client
+ * promotes its best update anyway, treating that update's *attested* header as finalized so it can
+ * still progress into later committee periods.
+ *
+ * That is a deliberate weakening and it is bounded by `is_better_update` having chosen the candidate:
+ * a client that never forced would stall for ever, and one that forced eagerly would follow whoever
+ * spoke last.
+ */
+export void forceUpdate(Store store, i64 currentSlot) {
+  if (store.bestValidUpdate.len() == 0) { return; }
+  if (!(currentSlot > headerSlot(store.finalizedHeader) + UPDATE_TIMEOUT)) { return; }
+
+  u8[] best = store.bestValidUpdate;
+  if (headerSlot(updateFinalizedHeader(best)) <= headerSlot(store.finalizedHeader)) {
+    // Treat the attested header as finalized, which is what the spec does by rewriting the update.
+    // Done by applying the pieces rather than by editing the serialized update, because these bytes
+    // came from a peer and rewriting them would make the store's provenance harder to reason about.
+    applyAsFinalized(store, best);
+  } else {
+    applyUpdate(store, best);
+  }
+  store.bestValidUpdate = u8[0]();
+}
+
+/** `applyUpdate`, with the update's attested header standing in for its finalized one. */
+void applyAsFinalized(Store store, u8[] update) {
+  u8[] attested = updateAttestedHeader(update);
+  i64 storePeriod = syncCommitteePeriodAtSlot(headerSlot(store.finalizedHeader));
+  i64 finalizedPeriod = syncCommitteePeriodAtSlot(headerSlot(attested));
+
+  if (!isNextSyncCommitteeKnown(store)) {
+    if (finalizedPeriod != storePeriod) { return; }
+    store.nextSyncCommittee = updateNextSyncCommittee(update);
+  } else {
+    if (finalizedPeriod == storePeriod + 1) {
+      store.currentSyncCommittee = store.nextSyncCommittee;
+      store.nextSyncCommittee = updateNextSyncCommittee(update);
+      store.previousMaxActiveParticipants = store.currentMaxActiveParticipants;
+      store.currentMaxActiveParticipants = 0;
+    }
+  }
+  if (headerSlot(attested) > headerSlot(store.finalizedHeader)) {
+    store.finalizedHeader = attested;
+    if (headerSlot(store.finalizedHeader) > headerSlot(store.optimisticHeader)) {
+      store.optimisticHeader = store.finalizedHeader;
+    }
+  }
+}

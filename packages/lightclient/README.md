@@ -1,16 +1,51 @@
 # lightclient — the Ethereum Altair light client sync protocol
 
-**Partly built.** Signature domains and the signing root work, and a real sync-committee signature
-from Ethereum's own vectors verifies end to end. The store and `validate_light_client_update` are
-next. Tracked as wac-mono **0064**.
+**The Altair sync protocol works.** All four of Ethereum's `light_client/sync` cases run
+step by step — nineteen steps, sixteen real sync-committee signatures, every Merkle branch — and the
+store's `finalized_header` and `optimistic_header` match the vectors' checks after each one. Filed as
+wac-mono **0064**, now closed.
 
 | | state |
 | --- | --- |
 | `compute_fork_data_root`, `compute_fork_digest` | **done** — checked against the vectors' `meta.store_fork_digest` |
 | `compute_domain`, `compute_signing_root` | **done** |
 | verifying a sync aggregate | **done** — all 16 updates in Ethereum's `light_client/sync` cases |
-| `LightClientStore`, `validate_light_client_update` | **not started** |
-| the sync-committee period rules | **not started** |
+| `LightClientStore`, `initialize_light_client_store` | **done** |
+| `validate_light_client_update` | **done** |
+| `apply_light_client_update`, `process_light_client_update` | **done** |
+| `is_better_update`, `process_light_client_store_force_update` | **done** |
+| the sync-committee period rules | **done** |
+| mainnet config, the fork schedule, a live beacon API | **not started** — 0066 |
+
+## What the vectors cannot check, and what stands in for it
+
+Every `process_update` step in Ethereum's sync vectors is a *valid* update: the suite is a liveness
+test, and it says nothing about what a client refuses. A `validateUpdate` that returned `true`
+unconditionally passes all nineteen steps, because the headers being checked come out of the update
+rather than out of the check.
+
+So the negatives are built here by corrupting real data, one field at a time, and each one was
+confirmed to fail against a deliberately broken client before being kept:
+
+| plant | what it would otherwise hide |
+| --- | --- |
+| a bit in the 96-byte signature | the BLS check |
+| the finalized header's `body_root` or `state_root`, or a finality branch node | the finality branch — **the signature does not cover these bytes** |
+| a `next_sync_committee` key or a branch node | the committee branch |
+| a bootstrap committee key or branch node | the whole root of trust |
+| `signature_slot == attested_slot` | the one strict slot relation |
+| all 32 participation bits cleared | an empty aggregate verifying vacuously |
+
+Two checks resisted this and are pinned directly instead, because every vector update is signed by
+almost the whole committee: `>= 2/3` and `>= 1/3` accept exactly the same set, and a safety threshold
+of `max/2` and of zero behave identically. Weakening either is invisible to the vectors. They are the
+security boundary of the protocol, so `hasSupermajority` is a named function with its own boundary
+test at 21 and 22 of 32.
+
+A third group — the signature-period window, `MIN_SYNC_COMMITTEE_PARTICIPANTS`, and
+`attested_slot >= finalized_slot` — cannot be observed from outside at all: each is subsumed by a
+cryptographic check further down. `src/store.wac` names them as such rather than leaving a reader to
+assume they are tested.
 
 ## What one verified signature actually proves
 

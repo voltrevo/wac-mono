@@ -53,3 +53,23 @@ export u8[] lcFieldRoot(i32 which, u8[] data, i32 f) {
 export bool lcFastAggregateVerify(u8[][] pubkeys, u8[] signingRoot, u8[] signature) {
   return fastAggregateVerify(pubkeys, signingRoot, signature);
 }
+
+import { Store, initializeStore, processUpdate, forceUpdate, headerSlot, headerBeaconRoot,
+         syncCommitteePeriodAtSlot, safetyThreshold, hasSupermajority, isBetterUpdate,
+         countBits } from "../../src/store.wac";
+
+/** A store as an opaque handle for the test driver. */
+export Store? lcInit(u8[] trustedRoot, u8[] bootstrap) { return initializeStore(trustedRoot, bootstrap); }
+export bool lcProcess(Store s, u8[] update, i64 currentSlot, u8[] gvr) {
+  return processUpdate(s, update, currentSlot, gvr);
+}
+export void lcForce(Store s, i64 currentSlot) { forceUpdate(s, currentSlot); }
+export i64 lcFinalizedSlot(Store s) { return headerSlot(s.finalizedHeader); }
+export u8[] lcFinalizedRoot(Store s) { return headerBeaconRoot(s.finalizedHeader); }
+export i64 lcOptimisticSlot(Store s) { return headerSlot(s.optimisticHeader); }
+export u8[] lcOptimisticRoot(Store s) { return headerBeaconRoot(s.optimisticHeader); }
+
+export i32 lcSafetyThreshold(Store s) { return safetyThreshold(s); }
+export bool lcHasSupermajority(u8[] bits, i32 active) { return hasSupermajority(bits, active); }
+export bool lcIsBetterUpdate(u8[] a, u8[] b) { return isBetterUpdate(a, b); }
+export i32 lcCountBits(u8[] bits) { return countBits(bits); }
