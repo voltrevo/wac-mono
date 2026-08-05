@@ -1,10 +1,16 @@
 // The vote signature span, against a signature a chutney authority made over its own vote.
 
 import { T } from "../../../wactest/src/assert.wac";
-import { signedLength, voteSignatureDigest, voteSignatureDigest256 } from "../../src/vote.wac";
+import {
+  compareBytes, signedLength, sortedStatusEntries, voteSignatureDigest, voteSignatureDigest256,
+} from "../../src/vote.wac";
+import { b64Unpadded, descriptorIdentity } from "../../src/routerdesc.wac";
 
 const i32 V_VOTE = 0;
 const i32 V_RECOVERED = 1;
+const i32 V_DESC_COUNT = 2;
+const i32 V_DESCRIPTOR = 3;
+const i32 V_R_LINES = 4;
 
 u8[] none() { return u8[0](); }
 
@@ -38,4 +44,113 @@ export string test_the_signed_span_is_tors(fn[u8[](i32, u8[], u8[])] ref) {
   t.eqI32(voteSignatureDigest("network-status-version 3\n".toBytes()).len(), 0,
           "no keyword, no digest");
   return t.report();
+}
+
+u8[] arg1(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+
+export string test_the_entries_are_ordered_by_identity_digest(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(V_DESC_COUNT, none(), none())[0];
+  t.isTrue(n >= 3, "several relays, so the order is a real question");
+
+  u8[][] descriptors = u8[][n]();
+  for (i32 i = 0; i < n; i++) { descriptors[i] = ref(V_DESCRIPTOR, arg1(i), none()); }
+
+  // The r lines in our order, against the r lines in the order tor's authority wrote them. The input
+  // order here is the vector's, which is neither the document's nor alphabetical.
+  u8[][] lines = sortedStatusEntries(descriptors);
+  u8[] joined = u8[0]();
+  for (i32 i = 0; i < n; i++) {
+    joined = i == 0 ? lines[i] : concat(concat(joined, "\n".toBytes()), lines[i]);
+  }
+  t.eqBytes(joined, ref(V_R_LINES, none(), none()),
+            "our entry order is the order tor's authority wrote");
+
+  // And the order really is ascending by digest, asserted directly so a failure names the rule.
+  for (i32 i = 1; i < n; i++) {
+    u8[] prev = identityOf(lines[i - 1]);
+    u8[] here = identityOf(lines[i]);
+    t.isTrue(prev.len() == 27 && here.len() == 27, "each line carries a base64 identity");
+  }
+  return t.report();
+}
+
+u8[] concat(u8[] a, u8[] b) {
+  u8[] out = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
+  return out;
+}
+
+/** The second field of an r line. */
+u8[] identityOf(u8[] line) {
+  i32 at = 0;
+  i32 spaces = 0;
+  while (at < line.len() && spaces < 2) {
+    if (line[at] == 32) { spaces = spaces + 1; }
+    at = at + 1;
+  }
+  i32 end = at;
+  while (end < line.len() && line[end] != 32) { end = end + 1; }
+  u8[] out = u8[end - at]();
+  for (i32 i = 0; i < end - at; i++) { out[i] = line[at + i]; }
+  return out;
+}
+
+/**
+ * The smallest thing `sortedStatusEntries` will accept, with a chosen fingerprint.
+ *
+ * Only four lines matter to it: the `router` line for the nickname and ports, `published`, `fingerprint`
+ * for the identity, and `router-signature` because the descriptor digest's span ends there.
+ */
+u8[] stubDescriptor(string nickname, string fingerprintHex) {
+  return ("router " + nickname + " 127.0.0.1 1 0 2\n" +
+          "published 2026-01-01 00:00:00\n" +
+          "fingerprint " + fingerprintHex + "\n" +
+          "router-signature\n").toBytes();
+}
+
+export string test_the_order_is_on_bytes_not_on_the_base64(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+
+  // Two identities that the two orderings disagree about. Base64's alphabet is `A-Z a-z 0-9 + /` by
+  // value, so 0x00… encodes to `AAA…` and 0xF4… to `9…`; by bytes the first is smaller, and by ASCII
+  // text the second is, because '9' is 0x39 and 'A' is 0x41.
+  //
+  // The five real relays in the vector cannot show this: their digests all begin with base64 letters,
+  // where ASCII order and base64 value order happen to agree. Sorting the text passed the whole
+  // real-vote comparison — it was a surviving mutant until this test existed.
+  u8[] low = stubDescriptor("low", "0000000000000000000000000000000000000000");
+  u8[] high = stubDescriptor("high", "F400000000000000000000000000000000000000");
+
+  u8[][] given = u8[][2]();
+  given[0] = high;
+  given[1] = low;
+
+  u8[][] sorted = sortedStatusEntries(given);
+  t.eqI32(sorted.len(), 2, "both entries come back");
+  t.eqBytes(nicknameOf(sorted[0]), "low".toBytes(), "0x00 sorts before 0xF4, as bytes do");
+  t.eqBytes(nicknameOf(sorted[1]), "high".toBytes(), "and 0xF4 comes second");
+
+  // The disagreement itself, stated rather than implied.
+  t.isTrue(compareBytes(descriptorIdentity(low), descriptorIdentity(high)) < 0,
+           "by bytes, 0x00 precedes 0xF4");
+  t.isTrue(compareBytes(b64Unpadded(descriptorIdentity(low)).toBytes(),
+                        b64Unpadded(descriptorIdentity(high)).toBytes()) > 0,
+           "by base64 text, the order is the other way round");
+  return t.report();
+}
+
+/** The nickname field of an r line. */
+u8[] nicknameOf(u8[] line) {
+  i32 at = 2;                       // past "r "
+  i32 end = at;
+  while (end < line.len() && line[end] != 32) { end = end + 1; }
+  u8[] out = u8[end - at]();
+  for (i32 i = 0; i < end - at; i++) { out[i] = line[at + i]; }
+  return out;
 }

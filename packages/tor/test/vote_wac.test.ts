@@ -15,6 +15,9 @@ import { wacTestRun } from "../../../harness/wacTestRun.ts";
 
 const V_VOTE = 0;
 const V_RECOVERED = 1; // the payload the embedded signing key recovers from the vote's signature
+const V_DESC_COUNT = 2;
+const V_DESCRIPTOR = 3; // a[0]=i: a relay's descriptor, in the vector's own arbitrary order
+const V_R_LINES = 4; // every r line of the real vote, in document order, newline separated
 
 const v = JSON.parse(
   await Deno.readTextFile(new URL("data/vote_vectors.json", import.meta.url)),
@@ -24,6 +27,16 @@ if (v.votes.length < 1) throw new Error("no vote in the vector");
 const vote = v.votes[0];
 
 const hex = (h: string) => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
+
+// The same relays' descriptors, from the router-status vector. Kept separate because that vector is
+// paired by digest and this one is a whole document; the two together are what let the ordering rule be
+// checked against the order tor's authority actually wrote.
+const rs = JSON.parse(
+  await Deno.readTextFile(new URL("data/votestatus_vectors.json", import.meta.url)),
+) as { cases: { descriptor: string; rLine: string }[] };
+
+/** Every `r` line of the real vote, in the order the document has them. */
+const realOrder = (vote.vote.match(/^r .+$/gm) ?? []).join("\n");
 
 /** What the authority's signing key says its `directory-signature` covers. */
 function recovered(): Uint8Array {
@@ -47,6 +60,12 @@ function ref(what: number, _a: Uint8Array, _b: Uint8Array): Uint8Array {
       return new TextEncoder().encode(vote.vote);
     case V_RECOVERED:
       return recovered();
+    case V_DESC_COUNT:
+      return new Uint8Array([rs.cases.length]);
+    case V_DESCRIPTOR:
+      return new TextEncoder().encode(rs.cases[_a[0]].descriptor);
+    case V_R_LINES:
+      return new TextEncoder().encode(realOrder);
     default:
       throw new Error(`unknown vector field ${what}`);
   }

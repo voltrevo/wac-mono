@@ -324,6 +324,11 @@ const string PROTO_LINE =
  */
 export u8[] descriptorIdentityDigest(u8[] descriptor) { return rsaDescriptorDigest(descriptor); }
 
+/** The relay's 20-byte identity digest, read from its descriptor's `fingerprint` line. */
+export u8[] descriptorIdentity(u8[] descriptor) {
+  return unhex(lineValue(descriptor, "fingerprint "));
+}
+
 /**
  * The `r` line an authority writes about a relay, derived from the relay's own descriptor.
  *

@@ -26,7 +26,7 @@
 
 import { sha1 } from "../../crypto/src/sha1.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
-import { pastLineStarting } from "./routerdesc.wac";
+import { descriptorIdentity, pastLineStarting, routerStatusLine } from "./routerdesc.wac";
 
 /** The text the signature is announced by: keyword and the one space the digest includes. */
 u8[] signatureKeyword() { return "directory-signature ".toBytes(); }
@@ -54,4 +54,52 @@ u8[] head(u8[] document, i32 n) {
   u8[] out = u8[n]();
   for (i32 i = 0; i < n; i++) { out[i] = document[i]; }
   return out;
+}
+
+// ── The order the entries go in ────────────────────────────────────────────────
+
+/**
+ * A relay's status entries, in the order a vote writes them: ascending by identity digest.
+ *
+ * Not by nickname, which is the order a reader assumes because the nickname is the first thing on the
+ * line. A chutney network's own vote lists test002a, test000a, test004r, test001a, test003a — plainly
+ * not alphabetical, and exactly ascending by the 20-byte digest.
+ *
+ * The comparison is on the **decoded** digest, not on the base64 the line carries. Those give
+ * different orders: base64's alphabet runs `A-Z a-z 0-9 + /` by value, while ASCII puts the digits and
+ * `+` and `/` *below* the letters, so sorting the text would disagree with sorting the bytes for any
+ * pair whose leading characters straddle that boundary. Sorting the text is the kind of shortcut that
+ * works on a five-relay testnet and fails on a real network.
+ *
+ * Insertion sort: a vote holds thousands of entries at most, and this runs once per vote.
+ */
+export u8[][] sortedStatusEntries(u8[][] descriptors) {
+  i32 n = descriptors.len();
+  u8[][] order = u8[][n]();
+  for (i32 i = 0; i < n; i++) { order[i] = descriptors[i]; }
+
+  for (i32 i = 1; i < n; i++) {
+    u8[] held = order[i];
+    u8[] heldId = descriptorIdentity(held);
+    i32 j = i - 1;
+    while (j >= 0 && compareBytes(descriptorIdentity(order[j]), heldId) > 0) {
+      order[j + 1] = order[j];
+      j = j - 1;
+    }
+    order[j + 1] = held;
+  }
+
+  u8[][] lines = u8[][n]();
+  for (i32 i = 0; i < n; i++) { lines[i] = routerStatusLine(order[i]); }
+  return lines;
+}
+
+/** Lexicographic byte comparison: negative, zero or positive. Shorter sorts first when it is a prefix. */
+export i32 compareBytes(u8[] a, u8[] b) {
+  i32 n = a.len() < b.len() ? a.len() : b.len();
+  for (i32 i = 0; i < n; i++) {
+    if (a[i] != b[i]) { return a[i] < b[i] ? -1 : 1; }
+  }
+  if (a.len() == b.len()) { return 0; }
+  return a.len() < b.len() ? -1 : 1;
 }
