@@ -38,8 +38,8 @@ export struct DirDocuments {
   u8[] consensus;              // the ns-flavoured consensus
   u8[] consensusMicrodesc;     // the microdesc flavour, if one is produced
   u8[] certificate;            // this authority's key certificate
-  u8[] descriptor;             // its own router descriptor
-  u8[] descriptorDigest;       // 20 bytes: the digest an `r` line carries, for /tor/server/d/
+  u8[] descriptors;            // every descriptor this authority holds, concatenated
+  u8[][] descriptorDigests;    // the digest an `r` line carries, one per descriptor
   u8[] fingerprint;            // 20 bytes: this authority's identity digest
 }
 
@@ -84,12 +84,19 @@ export Response dirRoute(u8[] target, DirDocuments docs) {
   }
 
   if (equals(path, "/tor/server/authority") || equals(path, "/tor/server/all")) {
-    return docs.descriptor.len() == 0 ? notFound() : document(docs.descriptor);
+    return docs.descriptors.len() == 0 ? notFound() : document(docs.descriptors);
   }
   if (startsWith(path, "/tor/server/d/")) {
-    if (docs.descriptor.len() == 0) { return notFound(); }
-    return mentions(rest(path, "/tor/server/d/"), docs.descriptorDigest)
-      ? document(docs.descriptor) : notFound();
+    // A client asks for several digests at once — `/tor/server/d/<d1>+<d2>` — and every descriptor we
+    // hold goes back if any of them is named. Sending the whole set where a subset was asked for is
+    // what tor's own cache does: a descriptor is public, and splitting the response by digest would
+    // mean parsing our own documents to reassemble them.
+    if (docs.descriptors.len() == 0) { return notFound(); }
+    u8[] asked = rest(path, "/tor/server/d/");
+    for (i32 i = 0; i < docs.descriptorDigests.len(); i++) {
+      if (mentions(asked, docs.descriptorDigests[i])) { return document(docs.descriptors); }
+    }
+    return notFound();
   }
 
   return notFound();

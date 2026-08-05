@@ -36,20 +36,36 @@ const i32 MAX_REQUEST = 8192;
 
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 3) {
-    core.warn("usage: dird <consensus-file> <certificate-file> <descriptor-file> [port]");
+    core.warn("usage: dird <consensus-file> <certificate-file> <descriptor-file>... [port]");
     return 1;
   }
 
   u8[] consensus = readOr(core, cli, string.fromBytes(cli.arg(0).wait()));
   u8[] certificate = readOr(core, cli, string.fromBytes(cli.arg(1).wait()));
-  u8[] descriptor = readOr(core, cli, string.fromBytes(cli.arg(2).wait()));
-  if (consensus.len() == 0 || certificate.len() == 0 || descriptor.len() == 0) { return 1; }
+  // Every argument from the third on is a descriptor, so a network of several relays is served by
+  // listing them. They go out concatenated, which is how a directory response carries more than one.
+  // A trailing port and a descriptor path are both just arguments, so the port is recognised by being
+  // all digits and last. Counting descriptors as "everything that is not a flag" would have swallowed
+  // the port and then failed trying to open `17999` as a file.
+  i32 argc = cli.argCount().wait();
+  i32 descCount = argc - 2;
+  if (descCount > 1 && atoiSafe(cli.arg(argc - 1).wait()) > 0) { descCount = descCount - 1; }
+  u8[] descriptors = u8[0]();
+  u8[][] digests = u8[][descCount]();
+  for (i32 i = 0; i < descCount; i++) {
+    u8[] one = readOr(core, cli, string.fromBytes(cli.arg(2 + i).wait()));
+    if (one.len() == 0) { return 1; }
+    descriptors = joinBytes(descriptors, one);
+    digests[i] = rsaDescriptorDigest(one);
+  }
+  if (consensus.len() == 0 || certificate.len() == 0 || descriptors.len() == 0) { return 1; }
 
+  // The port follows the descriptors, so it is found by position rather than by guessing at index 3.
   i32 port = DEFAULT_PORT;
-  if (cli.argCount().wait() >= 4) {
-    i32 given = atoiSafe(cli.arg(3).wait());
+  if (argc > 2 + descCount) {
+    i32 given = atoiSafe(cli.arg(2 + descCount).wait());
     if (given <= 0 || given > 65535) {
-      core.warn("dird: " + string.fromBytes(cli.arg(3).wait()) + " is not a port");
+      core.warn("dird: " + string.fromBytes(cli.arg(2 + descCount).wait()) + " is not a port");
       return 1;
     }
     port = given;
@@ -64,8 +80,8 @@ export i32 main(Core core, Cli cli) {
     return 1;
   }
 
-  DirDocuments docs = DirDocuments(consensus, u8[0](), certificate, descriptor,
-                                   rsaDescriptorDigest(descriptor), fingerprint);
+  DirDocuments docs = DirDocuments(consensus, u8[0](), certificate, descriptors, digests,
+                                   fingerprint);
 
   Socket listener = cli.listen("127.0.0.1", port).wait();
   if (listener.handle < 0) {
@@ -187,4 +203,11 @@ i32 atoiSafe(u8[] text) {
     if (v > 65535) { return -1; }
   }
   return v;
+}
+
+u8[] joinBytes(u8[] a, u8[] b) {
+  u8[] out = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
+  return out;
 }

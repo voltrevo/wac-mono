@@ -159,7 +159,18 @@ most, because it puts their implementation on the far side of every seam.
 > the mistake was not reading far enough in a file that answered the question directly.
 >
 > Three relays are what step 5 needs, so `EXTEND2` is its prerequisite as much as this step's
-> completion. The current network reaches 50 % bootstrap with one relay and stops there.
+> completion.
+>
+> **`EXTEND2` is implemented, and provoking one needs `RELAY_BEGIN_DIR` first.** With two of our relays
+> in a consensus our authority served, a C tor built a one-hop circuit to the first and sent **relay
+> command 13, `BEGIN_DIR`** — it tunnels its directory fetches through a circuit rather than extending,
+> and only builds multi-hop circuits once it has bootstrapped. Our relay answers `BEGIN_DIR` with an
+> END, so bootstrap stalls at 50 % and the second relay is never contacted. So the order is:
+> `BEGIN_DIR` (a directory stream over a circuit, answered from the same documents `dirserve.wac`
+> already routes), then multi-hop circuits follow on their own.
+>
+> Until then `EXTEND2` can only be exercised by our own client, which extends explicitly — worth doing
+> as a smoke test, and not a substitute for the C tor path under D1.
 
 **4 — the directory authority.** Publish a descriptor, vote, compute a consensus, sign it. Done when a
 C tor client bootstraps from a consensus our authority signed.

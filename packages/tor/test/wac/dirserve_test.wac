@@ -15,11 +15,17 @@ u8[] none() { return u8[0](); }
 DirDocuments docsFrom(fn[u8[](i32, u8[], u8[])] ref) {
   return DirDocuments(
     ref(D_CONSENSUS, none(), none()), u8[0](), ref(D_CERT, none(), none()),
-    ref(D_DESCRIPTOR, none(), none()), ref(D_DESC_DIGEST, none(), none()),
+    ref(D_DESCRIPTOR, none(), none()), oneDigest(ref(D_DESC_DIGEST, none(), none())),
     ref(D_FINGERPRINT, none(), none()));
 }
 
 string hexOf(u8[] b) { return string.fromBytes(encodeUpper(b)); }
+
+u8[][] oneDigest(u8[] d) {
+  u8[][] out = u8[][1]();
+  out[0] = d;
+  return out;
+}
 
 export string test_the_targets_a_bootstrapping_tor_builds(fn[u8[](i32, u8[], u8[])] ref) {
   T t = T.create();
