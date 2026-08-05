@@ -10,6 +10,10 @@
     "ssz_generic_valid": {
       "sha256": "07c01bec7a10cbc0a26f19f52359fa2be62a78a881ebcf345cb8837b203b0904",
       "note": "1217 cases across uints, boolean, bitlist, bitvector, basic_vector, containers"
+    },
+    "light_client_proofs": {
+      "sha256": "677af9636b31f7976b1d88658601b195e1f2c58e6beca0978a47612e7ef22aa9",
+      "note": "9 cases: 3 Merkle proofs into one BeaconState, for altair, deneb and electra"
     }
   }
 }

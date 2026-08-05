@@ -262,7 +262,43 @@ def tarball_path() -> str:
     return str(tar)
 
 
+# The light client's own Merkle-proof vectors: three proofs into one `BeaconState`, per fork.
+#
+# `object.ssz_snappy` is deliberately **not** vendored. Using it would need a full `BeaconState`
+# descriptor, which a light client never merkleizes — it verifies branches *into* a state root it is
+# handed. The three proofs are checkable without it: they share one object, so three different
+# gindexes at three different depths must fold to one root, which is an oracle with no circularity in
+# it. The object is upstream if `hash_tree_root(BeaconState)` ever exists.
+PROOF_FORKS = ["altair", "deneb", "electra"]
+PROOF_CASES = [
+    "current_sync_committee_merkle_proof",
+    "next_sync_committee_merkle_proof",
+    "finality_root_merkle_proof",
+]
+
+
+def do_proofs() -> dict:
+    import re
+    cases = []
+    for fork in PROOF_FORKS:
+        for case in PROOF_CASES:
+            d = f"tests/{CONFIG}/{fork}/light_client/single_merkle_proof/BeaconState/{case}"
+            text = fetch(f"{RAW}/{d}/proof.yaml").decode()
+            leaf = re.search(r"leaf: '0x([0-9a-f]+)'", text).group(1)
+            gindex = int(re.search(r"leaf_index: (\d+)", text).group(1))
+            branch = re.findall(r"^- '0x([0-9a-f]+)'", text, re.M)
+            assert len(leaf) == 64 and all(len(b) == 64 for b in branch), f"{d}: bad hex"
+            cases.append({"fork": fork, "case": case, "leaf": leaf,
+                          "gindex": gindex, "branch": branch})
+            print(f"  {fork}/{case}: gindex {gindex}, depth {len(branch)}", file=sys.stderr)
+    return {
+        "source": f"{REPO} @ {COMMIT[:12]}, {CONFIG}/*/light_client/single_merkle_proof",
+        "cases": cases,
+    }
+
+
 BUILDERS = {
+    "light_client_proofs": lambda: do_proofs(),
     "ssz_static_altair_mainnet": lambda: do_static(),
     "ssz_generic_valid": lambda: do_generic(tarball_path()),
 }

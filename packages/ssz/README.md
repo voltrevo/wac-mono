@@ -8,7 +8,7 @@ itself, is unblocked.
 | --- | --- |
 | `merkleize`, `mixInLength`, `zeroHash`, chunking | **done** |
 | `hash_tree_root` of uints, booleans, bitvectors, bitlists, basic vectors and lists | **done** — 754 Ethereum `ssz_generic` cases |
-| `isValidMerkleBranch`, `isValidNormalizedMerkleBranch` | **done** |
+| `isValidMerkleBranch`, `isValidNormalizedMerkleBranch` | **done** — 9 real Ethereum light-client proofs |
 | `hash_tree_root` of containers, lists and vectors of composites | **done** — 303 Ethereum `containers` cases, schema-driven |
 | progressive lists | **out of scope** — a different merkleization scheme; 160 cases |
 | the nine light-client containers | **done** — all 45 Ethereum `ssz_static` cases |
@@ -38,7 +38,19 @@ Four things this says loudest, because they are where implementations go wrong:
   that produces a merkleizer which is right for every full-length value and wrong for every short one.
 - **`zeroHash(d)` equals the zero subtree it stands in for**, at every depth up to 6, so the
   optimisation and the thing it replaces cannot drift.
-- **Branch verification is tested against a tree built with the *host's* SHA-256**, via Web Crypto —
+- **Nine real light-client proofs verify** — the current sync committee, the next, and the finalized
+  root, for altair, deneb and electra. The vectors give no state root, so they look unusable without a
+  `BeaconState` descriptor; the way through is that all three proofs in a fork come from the *same*
+  object, so three gindexes at three depths must fold to one root. That has no circularity in it: a
+  wrong side-bit rule gives three different answers.
+- **The generalized indices are fork-dependent, and the vectors show it.** Altair and Deneb put the
+  sync committees at 54/55 and the finalized root at 105; **Electra moved them to 86/87 and 169**, a
+  level deeper. That is the concrete reason `is_valid_normalized_merkle_branch` exists: the same
+  logical proof is 5 nodes under one fork and 6 under another, so a shallower proof appears in the
+  deeper layout with leading nodes that **must be zero**. `src/beacon.wac` declares the Altair depths,
+  which is right for the fork it names — a client extended past Deneb has to make them fork-dependent,
+  and `test/proof_wac.test.ts` is where that will fail first.
+- **Branch verification is also tested against a tree built with the *host's* SHA-256**, via Web Crypto —
   not against this package's merkleizer. Building the tree with wac and then checking it with wac
   would be a symmetric oracle: both halves wrong together would still agree. Every leaf position is
   verified, and a wrong index, a flipped byte and a short branch are each refused.
@@ -93,6 +105,7 @@ forks, other configs) are far larger than the 1.7 MB that used to sit in the rep
 
 | set | cases | what |
 | --- | --- | --- |
+| `light_client_proofs` | 9 | 3 Merkle proofs into one `BeaconState`, for altair, deneb and electra |
 | `ssz_static_altair_mainnet` | 45 | the nine containers an Altair light client touches, `mainnet` config |
 | `ssz_generic_valid` | 1,217 | `uints`, `boolean`, `bitlist`, `bitvector`, `basic_vector`, `containers` |
 
