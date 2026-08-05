@@ -22,18 +22,37 @@
 //   deno task test packages/json        # a subset, same cap
 //   DENO_JOBS=5 deno task test          # override, honoured as given
 //
-// **The cap is 2 and that number is not measured.** Comparing 2 against 5 needs a quiet machine
-// and this one has not been quiet — three agents, load 11-13 on five cores — so any figure taken
-// now would describe the contention rather than the choice. Issue 0075 is to measure it properly
-// and set it from evidence. Until then 2 is a deliberate guess on the safe side, and the override
-// is there because a guess should be easy to disagree with.
+// **The cap is 4, and it is measured.** `tools/jobsSweep.sh` on a quiet machine (load 1.9, 8.8 GB
+// available, 5 cores), sampling `/sys/fs/cgroup/memory.current` through each run — issue 0075:
 //
+//   jobs   wall      peak      rise   result
+//   1      173s    4894MB    2468MB   1134 passed
+//   2       95s    5725MB    3261MB   1134 passed
+//   3       73s    6599MB    2882MB   1134 passed
+//   4       59s    5735MB    3290MB   1134 passed
+//   5        -         -         -    FAILED: AddrInUse
+//
+// Two things in that table are worth more than the number. **Memory barely moves**: the rise is
+// 2.5–3.3 GB whether one worker runs or four, because the peak is dominated by the built binaries a
+// single test file spawns — 85 MB of Deno isolate each, sixty of them in `packages/box` — and not by the
+// workers. The 300 MB-per-worker figure this comment used to assume was wrong, so the memory argument
+// for a low cap was weaker than it looked.
+//
+// And **five does not fail for memory**: it fails with `AddrInUse: Address already in use`, which is
+// wac-mono 0069 — tests take a port by binding it and releasing it, then bind it again, and a fifth
+// worker wins that race often enough to redden a run. The ceiling here is a bug rather than the machine,
+// so if 0069 is fixed this should be measured again rather than assumed to stay at 4.
+//
+// Four is also *kinder* to the other agents than two, which is the opposite of what a cap suggests: the
+// run finishes in 59s instead of 95s, so the window during which this process holds three gigabytes is
+// forty per cent shorter. What no per-process cap can do is bound the *machine* — three agents at 3 GB
+// each is 9 GB of 11.9 — and that is 0031, which wants a token every heavy runner takes.
 // `${DENO_JOBS:-2}` in the task itself would have been simpler and does not work: deno's task
 // shell does not expand parameter defaults, and passes the text through literally.
 
 import { refuseIfNested, SUITE_ENV } from "./suiteGuard.ts";
 
-const DEFAULT_JOBS = 2;
+const DEFAULT_JOBS = 4;
 
 /**
  * Deno's code cache, cleared when it is over the limit.
@@ -98,7 +117,7 @@ const jobs = override ?? DEFAULT_JOBS;
 
 console.log(
   override === null
-    ? `${jobs} workers (the default cap — see issue 0075; DENO_JOBS=n overrides)`
+    ? `${jobs} workers (measured — see issue 0075; DENO_JOBS=n overrides)`
     : `${jobs} workers (DENO_JOBS)`,
 );
 
