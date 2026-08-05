@@ -1,0 +1,265 @@
+// Introduction points, and the cells a client sends to reach a hidden service through them.
+//
+// The second layer of a descriptor is a list of introduction points. Each one names a relay — by
+// address and identity — and carries three keys:
+//
+//     introduction-point <link specifiers>     where the introduction point is
+//     onion-key ntor <key>                     for extending a circuit *to* it
+//     auth-key <ed25519 cert>                  identifies this introduction circuit to the relay
+//     enc-key ntor <key>                       the service's key, for the hs-ntor handshake
+//
+// The two ntor keys are different things and both are 32 bytes: `onion-key` belongs to the
+// *introduction point relay* and is used to build a circuit to it, while `enc-key` belongs to the
+// *service* and is what the client encrypts to. Confusing them produces a circuit that builds and a
+// handshake the service silently drops.
+//
+// ## The rendezvous is chosen by the client, and the introduction point never learns it
+//
+// A client picks its own rendezvous relay, tells it a 20-byte cookie, and then sends the service —
+// through the introduction point, encrypted — the rendezvous point's address and that cookie. The
+// introduction point relays an INTRODUCE1 cell it cannot read. That is why the ENCRYPTED portion
+// exists at all: without it the introduction point would know where every client meets every service.
+//
+// ## Link specifiers
+//
+// tor-spec's EXTEND2 format, reused (rend-spec-v3 §0.4):
+//
+//     NSPEC [1 byte], then NSPEC times: LSTYPE [1] LSLEN [1] LSPEC [LSLEN]
+//
+// with type 0 an IPv4 address and port, 1 IPv6, 2 a legacy 20-byte RSA identity digest, and 3 a
+// 32-byte ed25519 identity. **They are passed on verbatim and in order.** rend-spec-v3 says a service
+// should send them to the rendezvous point exactly as received, and that unrecognised types must not
+// be dropped — filtering them is an information leak, because which types a party understands is a
+// fingerprint.
+
+import { decode as b64decode } from "../../codec/src/base64.wac";
+import { findKeywordLine, keywordValue, pemBlock, certCertifiedKey, certType, slice }
+  from "./hsdesc.wac";
+
+export const i32 LS_IPV4 = 0;
+export const i32 LS_IPV6 = 1;
+export const i32 LS_LEGACY_ID = 2;
+export const i32 LS_ED25519_ID = 3;
+
+/** The certificate type of an introduction point's `auth-key`. */
+export const i32 CERT_TYPE_INTRO_AUTH = 9;
+
+/**
+ * One introduction point, as the descriptor gives it.
+ *
+ * `linkSpecifiers` is the raw `NSPEC | …` blob, kept whole rather than parsed into fields, because
+ * that is the form it has to be forwarded in and re-encoding a parsed version is a chance to change
+ * it. `linkSpecifier` below reads individual entries out of it for the cases a client does need.
+ */
+export struct IntroPoint {
+  u8[] linkSpecifiers;
+  u8[] onionKey;         // ntor key of the introduction point relay, for extending to it
+  u8[] authKey;          // ed25519, the introduction circuit's identity at that relay
+  u8[] encKey;           // ntor key of the *service*, for the hs-ntor handshake
+}
+
+bool wellFormed(IntroPoint p) {
+  return p.linkSpecifiers.len() > 0 && p.onionKey.len() == 32
+      && p.authKey.len() == 32 && p.encKey.len() == 32;
+}
+
+/** Whether a link-specifier blob is internally consistent: every entry inside the buffer. */
+export bool linkSpecifiersValid(u8[] ls) {
+  if (ls.len() < 1) { return false; }
+  i32 n = ls[0];
+  if (n == 0) { return false; }
+  i32 at = 1;
+  for (i32 i = 0; i < n; i++) {
+    if (at + 2 > ls.len()) { return false; }
+    i32 length = ls[at + 1];
+    at = at + 2 + length;
+    // The per-entry overrun check is redundant with the equality below — `at` only increases, so an
+    // entry that runs past the end leaves `at > ls.len()` at the finish. Kept because it says what
+    // the loop is maintaining, and because the guard at the top of the iteration is what stops the
+    // reads themselves going out of bounds. Removing it survives the tests, as it should.
+    if (at > ls.len()) { return false; }
+  }
+  // Exactly consumed. `<=` would accept trailing bytes after the last entry, which is a truncated or
+  // padded blob rather than a list.
+  return at == ls.len();
+}
+
+/**
+ * The body of the first link specifier of type `type`, or empty.
+ *
+ * Only for the cases a client genuinely needs — the address to connect to and the identity to check.
+ * Everything else is forwarded whole and never inspected.
+ */
+export u8[] linkSpecifier(u8[] ls, i32 type) {
+  if (!linkSpecifiersValid(ls)) { return u8[0](); }
+  i32 n = ls[0];
+  i32 at = 1;
+  for (i32 i = 0; i < n; i++) {
+    i32 t = ls[at];
+    i32 length = ls[at + 1];
+    if (t == type) { return slice(ls, at + 2, at + 2 + length); }
+    at = at + 2 + length;
+  }
+  return u8[0]();
+}
+
+/** Base64 with the trailing newline trimmed, decoded, or empty. */
+u8[] decodeValue(u8[] value) {
+  u8[]? d = b64decode(value);
+  return (d is null) ? u8[0]() : d!;
+}
+
+/**
+ * Every introduction point in a decrypted second-layer descriptor.
+ *
+ * A malformed entry is **dropped, not fatal**: a service publishes several introduction points so
+ * that some can be unreachable, and refusing the whole descriptor because one is odd would hand any
+ * one relay a veto over the service. An empty result is still an error for the caller — there is
+ * nothing to introduce through.
+ */
+export IntroPoint[] parseIntroPoints(u8[] plaintext) {
+  // Count first, so the array can be exact; wac has no growable array here and the alternative is
+  // an over-allocated one with a length the caller has to be told about separately.
+  i32 count = 0;
+  i32 scan = 0;
+  while (true) {
+    scan = findKeywordLine(plaintext, "introduction-point ".toBytes(), scan);
+    if (scan < 0) { break; }
+    count = count + 1;
+    scan = scan + 1;
+  }
+  if (count == 0) { return IntroPoint[0](); }
+
+  IntroPoint[] found = IntroPoint[count]();
+  i32 kept = 0;
+  i32 at = 0;
+  for (i32 i = 0; i < count; i++) {
+    i32 start = findKeywordLine(plaintext, "introduction-point ".toBytes(), at);
+    if (start < 0) { break; }
+    // Each introduction point runs to the next one, or to the end.
+    //
+    // Bounding at the next one is not strictly necessary — every reader below takes the *first*
+    // match in the section, and an introduction point's fields all precede the next
+    // `introduction-point` line, so running to the end of the document finds the same values. It is
+    // written this way because the equivalence depends on the field order in a document we do not
+    // control, and a service that ever emitted them differently would silently mix two points
+    // together. Mutating it to `plaintext.len()` survives the tests, and that is expected.
+    i32 next = findKeywordLine(plaintext, "introduction-point ".toBytes(), start + 1);
+    i32 end = (next < 0) ? plaintext.len() : next;
+    u8[] section = slice(plaintext, start, end);
+
+    u8[] ls = decodeValue(keywordValue(section, "introduction-point".toBytes()));
+    u8[] onion = decodeValue(keywordValue(section, "onion-key ntor".toBytes()));
+    u8[] enc = decodeValue(keywordValue(section, "enc-key ntor".toBytes()));
+    u8[] authCert = pemBlock(section, "auth-key".toBytes(), "ED25519 CERT".toBytes());
+    u8[] auth = (certType(authCert) == CERT_TYPE_INTRO_AUTH) ? certCertifiedKey(authCert) : u8[0]();
+
+    IntroPoint p = IntroPoint(ls, onion, auth, enc);
+    if (wellFormed(p) && linkSpecifiersValid(ls)) {
+      found[kept] = p;
+      kept = kept + 1;
+    }
+    at = start + 1;
+  }
+  if (kept == count) { return found; }
+  IntroPoint[] out = IntroPoint[kept]();
+  for (i32 i = 0; i < kept; i++) { out[i] = found[i]; }
+  return out;
+}
+
+// ── The cells ─────────────────────────────────────────────────────────────────
+
+/**
+ * The plaintext a client encrypts into an INTRODUCE1 cell (rend-spec-v3 §3.3):
+ *
+ *     RENDEZVOUS_COOKIE [20]  N_EXTENSIONS [1]  ONION_KEY_TYPE [1]  ONION_KEY_LEN [2]
+ *     ONION_KEY [32]  NSPEC [1]  link specifiers…  PAD
+ *
+ * `rendOnionKey` is the **rendezvous point's** ntor key, so the service can extend a circuit to it —
+ * a third distinct 32-byte ntor key in this file, and the one most easily confused with the others.
+ * No extensions and no padding: padding is only required when talking to a legacy introduction point.
+ */
+export u8[] introduce1Plaintext(u8[] rendCookie, u8[] rendOnionKey, u8[] rendLinkSpecifiers) {
+  if (rendCookie.len() != 20 || rendOnionKey.len() != 32) { return u8[0](); }
+  if (!linkSpecifiersValid(rendLinkSpecifiers)) { return u8[0](); }
+  i32 n = 20 + 1 + 1 + 2 + 32 + rendLinkSpecifiers.len();
+  u8[] out = u8[n]();
+  i32 at = 0;
+  for (i32 i = 0; i < 20; i++) { out[at + i] = rendCookie[i]; }
+  at = 20;
+  out[at] = 0;              // N_EXTENSIONS
+  at = at + 1;
+  out[at] = 1;              // ONION_KEY_TYPE: ntor
+  at = at + 1;
+  out[at] = 0;              // ONION_KEY_LEN, big-endian
+  out[at + 1] = 32;
+  at = at + 2;
+  for (i32 i = 0; i < 32; i++) { out[at + i] = rendOnionKey[i]; }
+  at = at + 32;
+  for (i32 i = 0; i < rendLinkSpecifiers.len(); i++) { out[at + i] = rendLinkSpecifiers[i]; }
+  return out;
+}
+
+/**
+ * An INTRODUCE1 cell body (rend-spec-v3 §3.2.1), with the ENCRYPTED portion supplied by the caller.
+ *
+ *     LEGACY_KEY_ID [20]  AUTH_KEY_TYPE [1]  AUTH_KEY_LEN [2]  AUTH_KEY [32]
+ *     N_EXTENSIONS [1]  ENCRYPTED [rest]
+ *
+ * **`LEGACY_KEY_ID` must be twenty zero bytes.** That is how an introduction point tells a v3 cell
+ * from a v2 one: anything non-zero there is handled as a legacy cell and this one is not.
+ *
+ * The encryption is not done here because it needs the ephemeral keypair and the MAC covers a span of
+ * this very cell — from AUTH_KEY to the end of the ciphertext — so a caller has to assemble the
+ * pieces in one place. `introduce1MacInput` gives that span.
+ */
+export u8[] introduce1Cell(u8[] authKey, u8[] encrypted) {
+  if (authKey.len() != 32) { return u8[0](); }
+  i32 n = 20 + 1 + 2 + 32 + 1 + encrypted.len();
+  u8[] out = u8[n]();
+  // out[0..20] stays zero: LEGACY_KEY_ID.
+  out[20] = 2;              // AUTH_KEY_TYPE: ed25519
+  out[21] = 0;              // AUTH_KEY_LEN, big-endian
+  out[22] = 32;
+  for (i32 i = 0; i < 32; i++) { out[23 + i] = authKey[i]; }
+  out[55] = 0;              // N_EXTENSIONS
+  for (i32 i = 0; i < encrypted.len(); i++) { out[56 + i] = encrypted[i]; }
+  return out;
+}
+
+/**
+ * The span an INTRODUCE1's MAC covers: from `AUTH_KEY_TYPE` to the end of `ENCRYPTED_DATA`.
+ *
+ * "All of the cell from the AUTH_KEY through the end of ENCRYPTED_DATA" — which begins at the
+ * AUTH_KEY_TYPE byte, not at the key, and excludes the MAC that is about to be appended. Both ends
+ * are easy to get wrong by a few bytes and the result verifies nowhere.
+ */
+export u8[] introduce1MacInput(u8[] cellSoFar) {
+  if (cellSoFar.len() <= 20) { return u8[0](); }
+  return slice(cellSoFar, 20, cellSoFar.len());
+}
+
+/**
+ * `ESTABLISH_RENDEZVOUS` — the client tells its chosen rendezvous point a 20-byte cookie.
+ *
+ * The body is the cookie and nothing else. The relay remembers it and joins the first circuit that
+ * later presents the same cookie in a RENDEZVOUS1 cell, without ever learning which service that is.
+ */
+export u8[] establishRendezvousCell(u8[] cookie) {
+  if (cookie.len() != 20) { return u8[0](); }
+  u8[] out = u8[20]();
+  for (i32 i = 0; i < 20; i++) { out[i] = cookie[i]; }
+  return out;
+}
+
+/**
+ * The `HANDSHAKE_INFO` from a RENDEZVOUS2 cell: `SERVER_PK [32] | AUTH [32]`.
+ *
+ * Returns the two concatenated, or empty if the cell is not 64 bytes. The caller must check `AUTH`
+ * against `clientRendezvousKeys`' first 32 bytes **before** using the key seed — that comparison is
+ * the entire authentication of the service, and nothing else in the exchange performs it.
+ */
+export u8[] rendezvous2HandshakeInfo(u8[] body) {
+  if (body.len() < 64) { return u8[0](); }
+  return slice(body, 0, 64);
+}
