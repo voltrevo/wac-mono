@@ -1,6 +1,6 @@
 # 0067 — no filesystem of our own, so a session cannot be sealed off from the host
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** agent-a (2026-08-05)
 - **Reported by:** agent-a
 - **Date:** 2026-08-05
@@ -125,3 +125,37 @@ shebang asks for neither `--allow-read` nor `--allow-write`.
 So this issue's "done when" — the same differential scripts over both backings — is now *possible* and not
 yet done: the corpus drives `wacsh`, and pointing it at `sealed` needs the two holes above closed, since a
 script that redirects or spawns would diverge for reasons that are not VFS bugs. That is the next slice.
+
+## Closed, 2026-08-05 (agent-a): both backings answer the same thing
+
+The "done when" above asked for a shell on an in-memory VFS passing the same scripts it passes on the host.
+`packages/sh/test/backings.test.ts` is that, and it goes one step further than the criterion:
+
+- **57 filesystem scripts, run through `wacsh` (host mount) and `sealed` (memory), byte-identical output and
+  identical statuses.** Creating, reading, truncating, appending, nested directories, listings, removal
+  including `rm -r`, `test`'s file operators, globs, several operands, a pipeline, and sixteen edge cases —
+  a trailing slash, a doubled separator, `..` at the root, redirecting over a directory, a file used as a
+  directory, `mkdir` over a file, `ls` of a plain file, a space in a name, a leading dot.
+- **And the host side of that comparison agrees with bash**, case for case, in the same file. That is the
+  part worth having: the memory filesystem is verified *transitively against GNU* rather than against
+  expectations I wrote down. Two of our own shells wrong in the same way would pass the first test and fail
+  the second.
+
+Verified the comparison can fail before trusting it: adding `pwd` reports
+`host "/tmp/wac-backing-…" vs memory "/"` — different worlds, correctly detected.
+
+**What the comparison cannot see, said in the test's own header.** The shell normalises a path before either
+backing does, so `d//f` and `a/b/../b/f` pin `sh.resolve` rather than the VFS. What it does see is every
+decision the backing makes, which is the part that could differ.
+
+**What is left belongs to design/0001's later steps, not here:**
+
+- A **spawned** applet gets a fresh `Fs`, so `sealed` does not spawn. Handing a child the parent's
+  filesystem is the same question two sessions on one image raise, and step 4 forces it.
+- A **streaming redirection** goes through `openOutput`, a capability rather than a filesystem operation, so
+  `Fs` needs an output sink before `>` on a pipeline's last stage can reach a memory mount. In `sealed` the
+  collecting path covers it because nothing is spawned.
+- An **image** is step 2. Two sealed sessions share nothing today, which the test asserts rather than
+  laments.
+
+design/0001's state-of-play table says step 1 is done.

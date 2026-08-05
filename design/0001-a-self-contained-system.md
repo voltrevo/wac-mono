@@ -108,7 +108,7 @@ Each step is an issue when it becomes actionable, and each references this docum
 
 | step | state |
 |---|---|
-| 1. VFS with two backings | `packages/fs` exists, tested against the host filesystem; nothing calls it yet — 0067 |
+| 1. VFS with two backings | **done.** `packages/fs`, threaded through `packages/sh` as a value the shell holds; `sealed.wac` is a session on `Fs.inMemory()` built with no filesystem grants at all. 57 scripts answer identically on both backings and identically to bash — 0067 |
 | 2. image format | not started |
 | 3. process table | not started |
 | 4. users and login | not started |
