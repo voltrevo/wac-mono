@@ -4,8 +4,8 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-28 packages, 59,367 lines of wac, 1140 tests,
-32 command-line programs and 4 browser pages.
+28 packages, 59,429 lines of wac, 1143 tests,
+33 command-line programs and 4 browser pages.
 
 ## Packages
 
@@ -34,7 +34,7 @@ In dependency order: nothing here imports anything below it.
 | [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 237 | 16 | `fmt` |
 | [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 4,049 | 45 | `crypto` |
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
-| [`sh`](packages/sh/) | A shell, in wac. | 6,532 | 24 | `bytes` `fmt` `fs` `platform` `std` |
+| [`sh`](packages/sh/) | A shell, in wac. | 6,594 | 27 | `bytes` `fmt` `fs` `platform` `std` |
 | [`ssz`](packages/ssz/) | **Everything an Altair light client needs is done and checked against Ethereum's vectors. | 808 | 26 | `crypto` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,685 | 75 | `crypto` |
 | [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,997 | 33 | `bytes` `codec` `crypto` `datetime` `fmt` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
@@ -70,6 +70,7 @@ reach — see `packages/platform/README.md`.
 | `packages/platform/example/wc.wac` | A word-count application, entire. There is no TypeScript in this directory. |
 | `packages/platform/example/whichever.wac` | Wait on two sockets and report whichever speaks first. |
 | `packages/fs/example/ops.wac` | The same filesystem operations against memory or against the host, so the two can be compared. |
+| `packages/sh/src/sealed.wac` | A shell whose filesystem is its own: nothing it writes touches the host. |
 | `packages/sh/src/sh.wac` | `sh` — the shell as a program, entire, in wac. |
 | `packages/box/example/term.wac` | A shell, in a browser tab. |
 | `packages/box/src/bin/cp.wac` | `cp` on its own: the same applet, built as its own program. |

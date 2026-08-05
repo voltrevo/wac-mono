@@ -1,0 +1,43 @@
+// A shell whose filesystem is its own: nothing it writes touches the host.
+//
+// The other half of design/0001 D3a. `wacsh` is a shell on the real disk; this is the same shell handed
+// `Fs.inMemory()`, so every file it creates lives in the process and disappears with it. That is one line
+// of difference, and the line is the point: wac-mono 0067 threaded the filesystem through the shell as a
+// *value*, so which filesystem a session gets is a decision a caller makes rather than something the
+// shell reaches for per operation.
+//
+// What it is for, in order of how soon it matters:
+//
+//   * A session that cannot damage anything, which is what `packages/ssh`'s demo wants to offer a stranger.
+//   * Tests that need a filesystem and should not need a temporary directory — hermetic by construction.
+//   * The thing an image will be loaded into, once there is an image (design/0001 step 2).
+//
+//   sealed -c 'mkdir d; echo hi > d/f; cat d/f; ls d'      ->  hi, then f
+//   sealed -c 'ls /'                                       ->  nothing: an empty world
+//
+// **What is not sealed yet, said plainly.** A redirection streams through `openOutput`, which is a
+// capability rather than a filesystem operation, so `echo hi > f` writes into memory only because the
+// shell's *collecting* path handles it — a redirection on a pipeline's last stage still reaches the host.
+// `packages/fs` needs an output sink before that is a choice too, and until it has one this program is a
+// sealed shell with one hole in it, named here rather than discovered later.
+
+import { Core, Cli } from "../../platform/src/platform.wac";
+import { Fs } from "../../fs/src/fs.wac";
+import { Shell } from "./exec.wac";
+import { shellMain } from "./entry.wac";
+import { programNames } from "./program.wac";
+
+export i32 main(Core core, Cli cli) {
+  // A memory filesystem with one directory at the root, and a working directory inside it. The host's
+  // notion of "where am I" is deliberately not consulted: a sealed session's cwd is its own.
+  Fs fs = Fs.inMemory(0);
+  Shell sh = Shell.onFs(core, cli, fs);
+  sh.cwd = "/";
+
+  // The twelve are called in process rather than spawned. A spawned child gets its own `Fs` — a fresh
+  // empty one — so a sealed session that spawned its applets would find its own files missing. That is a
+  // real limit of doing this with a value the shell holds, and the honest answer for now is not to spawn:
+  // wac-mono 0067's next slice is whether a child can be handed the parent's filesystem at all.
+  sh.externalNames = programNames;
+  return shellMain(core, cli, sh, 0);
+}

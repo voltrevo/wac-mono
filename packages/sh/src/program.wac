@@ -30,6 +30,7 @@ import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../platform/src/st
 // the digit loop never ran — so `echo $((-2147483648))` printed a bare minus sign where bash prints
 // the number. Three other copies existed, and the correct one was already in `fmt`. wac-mono 0072.
 import { atoi, itoa, itoa64 } from "../../fmt/src/itoa.wac";
+import { Fs } from "../../fs/src/fs.wac";
 
 export struct Output {
   u8[] out;
@@ -56,13 +57,13 @@ export struct Output {
  * passes collect rather than write. What changed is underneath — a program now *writes as it goes*, so
  * the same body streams when it is spawned as a worker. wac-mono 0061.
  */
-export Output run(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
+export Output run(Fs fs, Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
   if (argv.len() == 0) { return Output.missing(); }
   if (!isProgram(argv.get(0))) { return Output.missing(); }
   Sink sink = Sink.toBuffer(cli);
   Sink errs = Sink.toBuffer(cli);
   Feed fed = Feed.of(cli, stdin);
-  i32 status = dispatchProgram(cli, cwd, argv, fed, sink, errs);
+  i32 status = dispatchProgram(fs, cli, cwd, argv, fed, sink, errs);
   return Output(sink.taken(), errs.taken(), status, true);
 }
 
@@ -74,13 +75,13 @@ export Output run(Cli cli, string cwd, Vec<string> argv, u8[] stdin) {
  * what lets the shell run its own twelve as real children. Two entry points over one dispatcher rather
  * than two implementations, which is the whole reason `Sink` can also collect.
  */
-export i32 runStreaming(Cli cli, string cwd, Vec<string> argv) {
+export i32 runStreaming(Fs fs, Cli cli, string cwd, Vec<string> argv) {
   if (argv.len() == 0) { return 127; }
   if (!isProgram(argv.get(0))) { return 127; }
   Sink sink = Sink.toOutput(cli);
   Sink errs = Sink.toErr(cli);
   Feed fed = Feed.fromStdin(cli);
-  i32 status = dispatchProgram(cli, cwd, argv, fed, sink, errs);
+  i32 status = dispatchProgram(fs, cli, cwd, argv, fed, sink, errs);
   sink.flush();
   errs.flush();
   return status;
@@ -95,19 +96,19 @@ export bool isProgram(string name) {
   return false;
 }
 
-i32 dispatchProgram(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+i32 dispatchProgram(Fs fs, Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
   string name = argv.get(0);
-  if (name == "cat") { return cat(cli, cwd, argv, fed, sink, errs); }
-  if (name == "wc") { return wc(cli, cwd, argv, fed, sink, errs); }
-  if (name == "head") { return head(cli, cwd, argv, fed, sink, errs); }
-  if (name == "tail") { return tail(cli, cwd, argv, fed, sink, errs); }
-  if (name == "rev") { return rev(cli, cwd, argv, fed, sink, errs); }
-  if (name == "sort") { return sort(cli, cwd, argv, fed, sink, errs); }
-  if (name == "uniq") { return uniq(cli, cwd, argv, fed, sink, errs); }
-  if (name == "grep") { return grep(cli, cwd, argv, fed, sink, errs); }
+  if (name == "cat") { return cat(fs, cli, cwd, argv, fed, sink, errs); }
+  if (name == "wc") { return wc(fs, cli, cwd, argv, fed, sink, errs); }
+  if (name == "head") { return head(fs, cli, cwd, argv, fed, sink, errs); }
+  if (name == "tail") { return tail(fs, cli, cwd, argv, fed, sink, errs); }
+  if (name == "rev") { return rev(fs, cli, cwd, argv, fed, sink, errs); }
+  if (name == "sort") { return sort(fs, cli, cwd, argv, fed, sink, errs); }
+  if (name == "uniq") { return uniq(fs, cli, cwd, argv, fed, sink, errs); }
+  if (name == "grep") { return grep(fs, cli, cwd, argv, fed, sink, errs); }
   if (name == "tr") { return tr(argv, fed, sink, errs); }
   if (name == "seq") { return seq(argv, sink, errs); }
-  if (name == "nl") { return nl(cli, cwd, argv, fed, sink, errs); }
+  if (name == "nl") { return nl(fs, cli, cwd, argv, fed, sink, errs); }
   if (name == "printf") { return printf(argv, sink, errs); }
   return 127;
 }
@@ -370,9 +371,9 @@ Vec<string> inputsOf(Vec<string> operands) {
 }
 
 /** One input, through the shell's working directory rather than the host's. */
-Reading readOne(Cli cli, string cwd, string name, u8[] stdin) {
+Reading readOne(Fs fs, string cwd, string name, u8[] stdin) {
   if (name == "" || name == "-") { return Reading(true, name, stdin, ""); }
-  FileResult f = cli.readFile(resolvePath(cwd, name)).wait();
+  FileResult f = fs.readFile(resolvePath(cwd, name));
   if (!f.ok) { return Reading(false, name, u8[0](), whyUnread(f)); }
   return Reading(true, name, f.bytes, "");
 }
@@ -412,13 +413,13 @@ struct Gathered {
   Vec<string> reasons;
 }
 
-Gathered gather(Cli cli, string cwd, Vec<string> operands, u8[] stdin) {
+Gathered gather(Fs fs, string cwd, Vec<string> operands, u8[] stdin) {
   Vec<string> names = inputsOf(operands);
   Buf out = Buf.create();
   Vec<string> failed = Vec.create();
   Vec<string> reasons = Vec.create();
   for (i32 i = 0; i < names.len(); i++) {
-    Reading r = readOne(cli, cwd, names.get(i), stdin);
+    Reading r = readOne(fs, cwd, names.get(i), stdin);
     if (!r.ok) {
       failed.push(r.name);
       reasons.push(r.error);
@@ -583,7 +584,7 @@ Counted countOf(Vec<string> argv, i32 fallback) {
  * `-u` is accepted and does nothing, which is what GNU's own manual says of it: "(ignored)". That is
  * not a gap.
  */
-i32 cat(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+i32 cat(Fs fs, Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
   Options o = options(argv, "AbeEnstTuv");
   if (o.bad != "") {
     { errs.bytes(optionRefusal("cat", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
@@ -612,7 +613,7 @@ i32 cat(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
     }
     // Through the shell's working directory, not the host's. Without it, `cd sub; cat f` looked in
     // whichever directory the process had started in.
-    FileResult f = cli.readFile(resolvePath(cwd, path)).wait();
+    FileResult f = fs.readFile(resolvePath(cwd, path));
     if (!f.ok) {
       // Reported and carried on, as GNU does, with the status remembered for the end.
       complain(sink, errs, "cat: " + path + ": " + whyUnread(f) + "\n");
@@ -751,7 +752,7 @@ i32 catStream(Feed fed, Sink sink) {
  * A file that cannot be read is reported and the rest are still counted, with a status of 1 at the
  * end: GNU prints the `total` line even then, over the files it managed.
  */
-i32 wc(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+i32 wc(Fs fs, Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
   Options o = options(argv, "lwc");
   if (o.bad != "") {
     { errs.bytes(optionRefusal("wc", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
@@ -791,7 +792,7 @@ i32 wc(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
 
   for (i32 f = 0; f < names.len(); f++) {
     if (names.get(f) == "" || names.get(f) == "-") { anyStdin = true; }
-    Reading r = readOne(cli, cwd, names.get(f), stdin);
+    Reading r = readOne(fs, cwd, names.get(f), stdin);
     if (!r.ok) {
       err.pushAll(("wc: " + r.name + ": " + r.error + "\n").toBytes());
       status = 1;
@@ -917,15 +918,15 @@ string rightAlign(string n, i32 width) {
  * With more than one operand each block carries a `==> name <==` header and a blank line between them,
  * as GNU's do. A file that cannot be opened is reported and the others are still printed.
  */
-i32 head(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
-  return headOrTail(cli, cwd, argv, fed, sink, errs, true);
+i32 head(Fs fs, Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+  return headOrTail(fs, cli, cwd, argv, fed, sink, errs, true);
 }
 
-i32 tail(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
-  return headOrTail(cli, cwd, argv, fed, sink, errs, false);
+i32 tail(Fs fs, Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+  return headOrTail(fs, cli, cwd, argv, fed, sink, errs, false);
 }
 
-i32 headOrTail(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs, bool front) {
+i32 headOrTail(Fs fs, Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs, bool front) {
   string who = front ? "head" : "tail";
   Counted c = countOf(argv, 10);
   if (c.bad != "") {
@@ -950,7 +951,7 @@ i32 headOrTail(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink 
   i32 status = 0;
   bool printed = false;
   for (i32 f = 0; f < names.len(); f++) {
-    Reading r = readOne(cli, cwd, names.get(f), stdin);
+    Reading r = readOne(fs, cwd, names.get(f), stdin);
     if (!r.ok) {
       err.pushAll((who + ": cannot open '" + r.name + "' for reading: " + r.error + "\n").toBytes());
       status = 1;
@@ -1030,7 +1031,7 @@ u8[] lastLines(u8[] data, i32 n) {
   return out.take();
 }
 
-i32 rev(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+i32 rev(Fs fs, Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
   Options o = options(argv, "");
   if (o.bad != "") {
     { errs.bytes(optionRefusal("rev", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
@@ -1046,7 +1047,7 @@ i32 rev(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
     // and answers "rev: cannot open -: No such file or directory". Measured rather than assumed —
     // the three that do take it made it look like a convention.
     string path = o.operands.get(i);
-    FileResult f = cli.readFile(resolvePath(cwd, path)).wait();
+    FileResult f = fs.readFile(resolvePath(cwd, path));
     if (!f.ok) {
       complain(sink, errs, "rev: cannot open " + path + ": " + whyUnread(f) + "\n");
       status = 1;
@@ -1084,7 +1085,7 @@ bool revFeed(Feed fed, Sink sink) {
  * where the input is the user's, which is not a trade-off anybody chose. It is a bottom-up merge sort
  * now: stable, which `sort` has to be for equal lines, and n log n.
  */
-i32 sort(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+i32 sort(Fs fs, Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
   Options o = options(argv, "r");
   if (o.bad != "") {
     // 2, not 1: GNU sort's usage status is its own, and a script testing for it is testing for that.
@@ -1100,7 +1101,7 @@ i32 sort(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) 
       collectLines(fed, lines);
       continue;
     }
-    FileResult r = cli.readFile(resolvePath(cwd, name)).wait();
+    FileResult r = fs.readFile(resolvePath(cwd, name));
     if (!r.ok) {
       // `sort` is the one that gives up rather than sorting what it managed to read.
       { errs.bytes(("sort: cannot read: " + name + ": " + whyUnread(r) + "\n").toBytes()); errs.flush(); sink.flush(); return 2; }
@@ -1168,7 +1169,7 @@ void mergeSort(u8[][] a, bool reverse) {
  * One operand only. GNU's *second* one is an output file, which it writes: guessing that from an
  * argument this program never read before would be a write nobody asked for, so it is refused.
  */
-i32 uniq(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+i32 uniq(Fs fs, Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
   Options o = options(argv, "");
   if (o.bad != "") {
     { errs.bytes(optionRefusal("uniq", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
@@ -1183,7 +1184,7 @@ i32 uniq(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) 
   // before, which is the whole of the state. 0071.
   if (o.operands.len() == 0 || o.operands.get(0) == "-") { uniqFeed(fed, sink); return 0; }
   string path = o.operands.get(0);
-  FileResult f = cli.readFile(resolvePath(cwd, path)).wait();
+  FileResult f = fs.readFile(resolvePath(cwd, path));
   if (!f.ok) {
     { errs.bytes(("uniq: " + path + ": " + whyUnread(f) + "\n").toBytes()); errs.flush(); sink.flush(); return 1; }
   }
@@ -1219,7 +1220,7 @@ bool uniqFeed(Feed fed, Sink sink) {
  * script reads as "no match" rather than "you asked for something I do not do". With several operands
  * each line is labelled with the file it came from, as GNU's is, and `-c` counts per file.
  */
-i32 grep(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+i32 grep(Fs fs, Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
   Options o = options(argv, "cinqvx");
   if (o.bad != "") {
     { errs.bytes(optionRefusal("grep", o.bad).toBytes()); errs.flush(); sink.flush(); return 2; }
@@ -1251,7 +1252,7 @@ i32 grep(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) 
     if (name == "" || name == "-") {
       here = grepFeed(fed, sink, how, label);
     } else {
-      FileResult r = cli.readFile(resolvePath(cwd, name)).wait();
+      FileResult r = fs.readFile(resolvePath(cwd, name));
       if (!r.ok) {
         complain(sink, errs, "grep: " + name + ": " + whyUnread(r) + "\n");
         status = 2;
@@ -1850,7 +1851,7 @@ Numeral numeralOf(string text) {
   return Numeral(ok ? 1 : 2, 0);
 }
 
-i32 nl(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
+i32 nl(Fs fs, Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
   Options o = options(argv, "");
   if (o.bad != "") {
     { errs.bytes(optionRefusal("nl", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
@@ -1863,7 +1864,7 @@ i32 nl(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
   for (i32 i = 0; i < o.operands.len(); i++) {
     string path = o.operands.get(i);
     if (path == "-") { nlFeed(fed, sink, state); continue; }
-    FileResult f = cli.readFile(resolvePath(cwd, path)).wait();
+    FileResult f = fs.readFile(resolvePath(cwd, path));
     if (!f.ok) {
       complain(sink, errs, "nl: " + path + ": " + whyUnread(f) + "\n");
       status = 1;

@@ -21,6 +21,7 @@ import { Vec } from "../../std/src/vec.wac";
 import { Shell } from "./exec.wac";
 import { shellMain } from "./entry.wac";
 import { isProgram, programNames, runStreaming } from "./program.wac";
+import { Fs } from "../../fs/src/fs.wac";
 
 /**
  * A shell, or one of its own twelve programs — decided by the first argument.
@@ -40,7 +41,10 @@ export i32 main(Core core, Cli cli) {
   if (n >= 1 && isProgram(string.fromBytes(cli.arg(0).wait()))) {
     Vec<string> argv = Vec.create();
     for (i32 i = 0; i < n; i++) { argv.push(string.fromBytes(cli.arg(i).wait())); }
-    return runStreaming(cli, cli.cwd().wait(), argv);
+    // The real filesystem, which is what `wacsh` is: a shell on the host. A session sealed off from it
+    // is a different program — design/0001 D3a — and building one is now a matter of handing the shell a
+    // different `Fs`, which is the whole point of wac-mono 0067's thread.
+    return runStreaming(Fs.onHost(cli, 0), cli, cli.cwd().wait(), argv);
   }
 
   Shell sh = Shell.create(core, cli);

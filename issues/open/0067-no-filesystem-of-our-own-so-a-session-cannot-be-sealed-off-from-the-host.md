@@ -88,3 +88,40 @@ do, so `packages/fs` matches them rather than inventing a divergence. But a prog
 `cat` on a directory and `cat` on a missing file are different mistakes, and `rm` already gets
 `FAULT_NOT_EMPTY` for the same kind of reason. Adding `FAULT_IS_DIR` would touch `host/faults.ts`, three
 hosts and `platform.wac`. Worth doing when something needs it, not before.
+
+## Threaded, and there is a sealed shell to show it (agent-a, 2026-08-05)
+
+The filesystem is a value the shell holds. `Shell` has an `Fs`; the sixteen places in `exec.wac` and the
+twelve programs in `program.wac` go through it; `run`, `runStreaming`, `dispatchProgram`, `readOne` and
+`gather` carry it. `Shell.create` builds `Fs.onHost(cli)`, so `wacsh` is exactly what it was — the corpus's
+751 scripts still agree with bash, which is the assertion for a change of this shape.
+
+**`packages/sh/src/sealed.wac`** is the payoff and the demonstration: the same shell handed
+`Fs.inMemory()`. One line of difference.
+
+```
+$ sealed -c 'mkdir d; echo hi > d/f; cat d/f'     hi
+$ sealed -c 'ls /'                                (nothing: an empty world)
+$ sealed -c 'cat /etc/passwd'                     cat: /etc/passwd: No such file or directory
+```
+
+The part worth more than the tests: it is **built with no filesystem grants at all**. `buildApp(…, {})`
+means the world has no `fs`, so the program could not reach the host if it tried — the seal is the
+capability world's, and the mount table is what makes the session *usable* rather than merely harmless.
+`packages/sh/test/sealed.test.ts` asserts the host directory is byte-identical afterwards, and that the
+shebang asks for neither `--allow-read` nor `--allow-write`.
+
+**What is still not sealed, and it is named in the program's own header rather than left to be found.**
+
+- **A redirection on a pipeline's last stage** streams through `openOutput`, which is a capability rather
+  than a filesystem operation. In `sealed` the collecting path handles `>` because nothing is spawned, but
+  `Fs` needs an output sink before a streaming redirection can go to a memory mount.
+- **A spawned applet gets its own filesystem.** `spawnSelf` starts a fresh instance, so a sealed session
+  that spawned its twelve would find its own files missing — which is why `sealed` does not set
+  `externalSpawnable`. Whether a child can be handed the parent's `Fs` at all is the open question, and it
+  is the same question an image raises: two sessions on one filesystem need a rule (design/0001's open
+  question about concurrency).
+
+So this issue's "done when" — the same differential scripts over both backings — is now *possible* and not
+yet done: the corpus drives `wacsh`, and pointing it at `sealed` needs the two holes above closed, since a
+script that redirects or spawns would diverge for reasons that are not VFS bugs. That is the next slice.
