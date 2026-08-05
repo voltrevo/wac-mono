@@ -140,3 +140,21 @@ the reason above. Recorded so the next reader does not re-propose it.
 
 **Where to start:** `spawn`/`spawnSelf`'s argv and `arg`/`env`, which is what 0061 needs and touches the
 fewest callers. Paths are the larger half and can follow in their own commit.
+
+## Half done, 2026-08-05 (agent-a)
+
+**Arguments and the environment are bytes.** The operator's answer settled the shape — bindgen should
+not be involved, the signature was the flaw — so `arg`, `env` and the argv of `spawn`/`spawnSelf` now
+carry `u8[]` end to end, and the spawn wire format carries a count and length-prefixed arguments
+instead of one NUL-joined blob of text. Names and arguments are bytes; messages and source are text.
+
+That unblocked [0061](../closed/0061-sh-applets-return-all-their-output-at-once-so-a-large-stage-dies.md):
+`cat $(printf '\xff\xfe')` names the file it was given, and the shell spawns its own programs now.
+
+**What is left is paths**, which is the larger half. `readFile`, `writeFile`, `stat`, `readDir`,
+`mkdir`, `remove`, `rename` and `openOutput` all take a `string`, and a name that is not valid UTF-8
+cannot survive one — while `readDir` hands such names back happily, so a shell can list a file it
+cannot then open. The rule to hold to: the host decodes a path only where the API it calls demands
+text, and where a name cannot be represented it reports a fault rather than approximating it.
+`packages/fs` already pins the property on a memory mount, where no host API is involved, which makes
+it the place to test the rule before the hosts implement it.

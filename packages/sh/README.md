@@ -276,6 +276,18 @@ a `set -e` that did not stop on an error is worse than one that does not exist. 
 shell's own variables sorted, which is the same idea as bash's over a much smaller set and so
 cannot be compared with it.
 
+**`wc`'s columns are seven wide when its input is standard input, where GNU's are sometimes
+narrower.** GNU takes the width from the digits of the total size of its inputs and falls back to 7
+when it cannot know one, which is what a pipe is: `seq 1 5 | wc` is seven wide in both. But GNU asks
+the *descriptor*, so `wc - < f` on a 108894-byte file gives six-wide columns, and nothing here can
+ask — there is no `fstat` in the capability world, and a redirection reaches a spawned program as
+bytes over a bridge rather than as a file. So that one case prints wider than GNU's.
+
+It is a gap and not a preference: what it would take is a capability that reports the size of
+standard input. Both of this shell's paths agree with each other meanwhile — the in-process one holds
+the redirected bytes and *could* answer 6 — and consistency was the thing worth keeping, because a
+`wc` whose output depended on whether the shell could spawn would be the harder bug to find.
+
 **Only `read` consumes standard input.** It advances a cursor the whole command shares, which is
 what makes `while read line` terminate rather than see the first line for ever. The external
 programs are handed whatever is left but are *not* charged for it, because nothing here knows

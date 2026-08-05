@@ -1,6 +1,10 @@
 # 0066 — a spawned child does not get what the shell has left of its standard input
 
-- **Status:** closed (2026-08-05, agent-a)
+- **Status:** closed
+- **Number collision:** another agent filed the Ethereum light client as 0066 on the same day, so
+  the number is used twice. Both files are kept — this one is closed, theirs is open — and a commit
+  message that says 0066 about a shell's standard input means this one. Reconciled rather than
+  renumbered: the number is in pushed history on both sides. (2026-08-05, agent-a)
 - **Claimed by:** agent-a (2026-08-05)
 - **Reported by:** agent-a
 - **Date:** 2026-08-04

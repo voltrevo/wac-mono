@@ -572,7 +572,6 @@ i32 cat(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
  * end: GNU prints the `total` line even then, over the files it managed.
  */
 i32 wc(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
-  u8[] stdin = fed.rest();
   Options o = options(argv, "lwc");
   if (o.bad != "") {
     { errs.bytes(optionRefusal("wc", o.bad).toBytes()); errs.flush(); sink.flush(); return 1; }
@@ -584,15 +583,34 @@ i32 wc(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
     wantLines = true; wantWords = true; wantBytes = true;
   }
 
+  // Standard input and nothing else takes the streaming path, as `head` and `tail` do. Counting is
+  // the case where holding the input is *purely* waste — the answer is three integers whatever the
+  // size — and holding it is what made `seq 1 200000000 | wc -c` fail where bash prints
+  // 1888888898: 1.9 GB does not fit in one wasm array, so the child trapped and the pipeline
+  // reported 126. Now it counts a chunk at a time and holds a chunk.
+  if (o.operands.len() == 0) {
+    return wcStream(fed, sink, wantLines, wantWords, wantBytes);
+  }
+
+  u8[] stdin = fed.rest();
   Vec<string> names = inputsOf(o.operands);
-  Buf out = Buf.create();
   Buf err = Buf.create();
   i32 status = 0;
   i32 allLines = 0;
   i32 allWords = 0;
   i32 allBytes = 0;
+  bool anyStdin = false;
+
+  // Counted first, printed second, because the width of the columns depends on the total — see
+  // `countWidth`. GNU knows the total in advance from the sizes on disk; the only way to know it here
+  // is to have read them, and every input is read whole on this path anyway.
+  Vec<i32> eachLines = Vec.create();
+  Vec<i32> eachWords = Vec.create();
+  Vec<i32> eachBytes = Vec.create();
+  Vec<string> eachName = Vec.create();
 
   for (i32 f = 0; f < names.len(); f++) {
+    if (names.get(f) == "" || names.get(f) == "-") { anyStdin = true; }
     Reading r = readOne(cli, cwd, names.get(f), stdin);
     if (!r.ok) {
       err.pushAll(("wc: " + r.name + ": " + r.error + "\n").toBytes());
@@ -612,27 +630,101 @@ i32 wc(Cli cli, string cwd, Vec<string> argv, Feed fed, Sink sink, Sink errs) {
     allLines += lines;
     allWords += words;
     allBytes += r.bytes.len();
-    out.pushAll(countLine(wantLines, wantWords, wantBytes, lines, words, r.bytes.len(), r.name).toBytes());
+    eachLines.push(lines);
+    eachWords.push(words);
+    eachBytes.push(r.bytes.len());
+    eachName.push(r.name);
+  }
+
+  i32 columns = (wantLines ? 1 : 0) + (wantWords ? 1 : 0) + (wantBytes ? 1 : 0);
+  i32 width = countWidth(columns, !anyStdin, allBytes);
+  Buf out = Buf.create();
+  for (i32 f = 0; f < eachName.len(); f++) {
+    out.pushAll(countLine(wantLines, wantWords, wantBytes, eachLines.get(f), eachWords.get(f),
+                          eachBytes.get(f), eachName.get(f), width).toBytes());
   }
   if (names.len() > 1) {
-    out.pushAll(countLine(wantLines, wantWords, wantBytes, allLines, allWords, allBytes, "total").toBytes());
+    out.pushAll(countLine(wantLines, wantWords, wantBytes, allLines, allWords, allBytes, "total",
+                          width).toBytes());
   }
   { sink.bytes(out.take()); errs.bytes(err.take()); sink.flush(); errs.flush(); return status; }
 }
 
 /**
- * One line of counts, in `wc`'s order whichever subset was asked for.
+ * Counting a chunk at a time, holding a chunk.
  *
- * GNU pads the columns when it knows the widest count in advance, which it does not for a stream, so
- * a single space is what this prints and the differential scripts ask for one count at a time.
+ * The one piece of state a chunk boundary threatens is `inWord`: a word split across two chunks is
+ * one word, so the flag carries over rather than being reset per chunk. A test for that is cheap and
+ * the bug would be silent — `wc -w` over a pipe would count *more* words the smaller the chunks got.
  */
-string countLine(bool l, bool w, bool c, i32 lines, i32 words, i32 bytes, string name) {
+i32 wcStream(Feed fed, Sink sink, bool wantLines, bool wantWords, bool wantBytes) {
+  i32 lines = 0;
+  i32 words = 0;
+  i32 bytes = 0;
+  bool inWord = false;
+  while (true) {
+    u8[] chunk = fed.next();
+    if (chunk.len() == 0) { break; }
+    bytes += chunk.len();
+    for (i32 i = 0; i < chunk.len(); i++) {
+      i32 c = chunk[i];
+      if (c == 10) { lines++; }
+      bool blank = c == 32 || c == 9 || c == 10;
+      if (blank) { inWord = false; }
+      else if (!inWord) { inWord = true; words++; }
+    }
+  }
+  i32 columns = (wantLines ? 1 : 0) + (wantWords ? 1 : 0) + (wantBytes ? 1 : 0);
+  // A stream has no size to ask for, so the columns are GNU's fallback width whatever arrives. It
+  // is the *count* that is unknown in advance here, not merely unmeasured: this path exists because
+  // the input may be larger than memory.
+  sink.bytes(countLine(wantLines, wantWords, wantBytes, lines, words, bytes, "",
+                       countWidth(columns, false, 0)).toBytes());
+  sink.flush();
+  return 0;
+}
+
+/**
+ * How wide GNU makes each of `wc`'s columns: one count is bare, and more than one is right-aligned.
+ *
+ * GNU takes the width from the digits of the *total size* of its inputs when it knows them, and 7
+ * when it does not — so `wc f` on a 108894-byte file prints counts six wide, and `seq 1 5 | wc`
+ * prints them seven wide. Matched because it is derivable, and because the corpus could not see it:
+ * every `wc` case with a file was small enough that one digit and one space happened to agree, and
+ * every case with a pipe asked for a single count.
+ *
+ * **One divergence, and it is a gap rather than a choice.** `wc - < f` prints six-wide columns in
+ * GNU, because it asks the descriptor how big it is; nothing here can, so it prints seven. Both of
+ * this shell's paths agree with each other about that, which is the property worth keeping — a
+ * `wc` that answered differently depending on whether the shell could spawn would be worse than one
+ * that is consistently narrower than GNU. `packages/sh/README.md` records it.
+ */
+i32 countWidth(i32 columns, bool sizeKnown, i32 totalBytes) {
+  if (columns < 2) { return 1; }
+  if (!sizeKnown) { return 7; }
+  i32 width = itoa(totalBytes).len();
+  return width < 1 ? 1 : width;
+}
+
+/**
+ * One line of counts, in `wc`'s order whichever subset was asked for, right-aligned in `width`.
+ *
+ * `countWidth` decides the width and says why it is what it is.
+ */
+string countLine(bool l, bool w, bool c, i32 lines, i32 words, i32 bytes, string name, i32 width) {
   string s = "";
-  if (l) { s = itoa(lines); }
-  if (w) { s = (s == "" ? "" : s + " ") + itoa(words); }
-  if (c) { s = (s == "" ? "" : s + " ") + itoa(bytes); }
+  if (l) { s = rightAlign(itoa(lines), width); }
+  if (w) { s = (s == "" ? "" : s + " ") + rightAlign(itoa(words), width); }
+  if (c) { s = (s == "" ? "" : s + " ") + rightAlign(itoa(bytes), width); }
   if (name != "") { s = s + " " + name; }
   return s + "\n";
+}
+
+/** `n` in a field of `width`, spaces first. A number wider than the field is printed whole. */
+string rightAlign(string n, i32 width) {
+  string pad = "";
+  for (i32 i = n.len(); i < width; i++) { pad = pad + " "; }
+  return pad + n;
 }
 
 /**

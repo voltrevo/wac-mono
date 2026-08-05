@@ -195,6 +195,29 @@ export class ByteQueue {
   }
 
   /**
+   * One last thing, then the end — for a diagnostic about the stream itself.
+   *
+   * Two reasons this is not `push` followed by `end`. A full queue *parks* a writer, and `end`
+   * refuses the parked ones, so a last line pushed onto a full queue would be dropped by the very
+   * call meant to follow it. And a diagnostic is bounded — one line, written by the host — so the
+   * cap it bypasses is not protecting anything from it. The cap exists to keep an unread producer
+   * from holding megabytes; this is the note explaining why nothing more is coming.
+   */
+  endWith(b: Uint8Array): void {
+    if (!this.#ended) {
+      if (this.#waiting !== null) {
+        const w = this.#waiting;
+        this.#waiting = null;
+        w(b);
+      } else {
+        this.#chunks.push(b);
+        this.#held += b.length;
+      }
+    }
+    this.end();
+  }
+
+  /**
    * The next chunk, or empty once ended and drained.
    *
    * **Everything queued, up to `CHUNK`** — not literally the next thing pushed. A writer that emits a
@@ -421,20 +444,50 @@ export function spawnChild(
     settleLoaded(why);
   };
 
+  // Whether the child ever got as far as running. Which of two places the reason for a failure
+  // belongs depends on it: before `ready` the caller is still holding `loaded` and reports the
+  // message itself, and after `ready` nobody is listening for one.
+  let started = false;
+
   const exit = new Promise<number>((resolve) => {
     worker.onMessage((data) => {
       const r = data as Result;
       // The load notice, which says only that the bundle evaluated.
       if ("ready" in r) {
         done("");
+        started = true;
         return;
       }
       done("");
+      started = true;
+      // **A trap the child caught about itself.** `entry.ts` wraps `main` and posts
+      // `{ok: false, error}` for anything thrown out of it, and that error used to be dropped right
+      // here — the parent got -1 and no reason, which is how `seq 1 200000000 | wc -c` came to print
+      // nothing and exit 126 where bash prints 1888888898. Same channel as the runtime failure
+      // below, for the same reason: standard error is where a program's diagnostics go, and the
+      // label says the runtime is speaking rather than the program.
+      if (!r.ok) {
+        err.endWith(new TextEncoder().encode("wac: " + r.error.split("\n")[0] + "\n"));
+      }
       shutdown();
       resolve(r.ok ? r.code : -1);
     });
     worker.onError((message) => {
       done(message);
+      // **A child that dies after it started used to die in silence.** `loaded` has already been
+      // settled and read by then, so the reason went nowhere: the parent saw exit -1, which
+      // `packages/sh` reports as 126 — "it exists and would not start" — with no message anywhere,
+      // and 126 is not even true of a program that started and then stopped. `seq 1 200000000 | wc -c`
+      // is the case that showed it: bash prints 1888888898, and this printed nothing at all and
+      // exited 126, because `wc` reads all of its input and 1.9 GB of it does not fit in one array.
+      //
+      // So the reason goes onto the child's standard error, which is the stream a program's
+      // diagnostics travel on and the one a shell already relays. It is *not* the program's own
+      // output, so it is labelled with what is speaking — the runtime the child was running in,
+      // which is the only thing that saw the failure.
+      if (started) {
+        err.endWith(new TextEncoder().encode("wac: " + message.split("\n")[0] + "\n"));
+      }
       shutdown();
       resolve(-1);
     });
