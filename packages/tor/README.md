@@ -514,10 +514,10 @@ Three things a responder has to get right that a client never meets:
 - **The signature span in an ed25519 certificate is not what cert-spec §1.1 implies.** §2.1 overrides
   it, and four of tor's own certificates verifying is what says so.
 
-What remains is the program that holds the sockets. Its open question is the **TLS certificate**:
-`packages/tls`'s server takes a DER certificate and this package cannot yet generate one. A testnet
-relay can use an openssl-generated fixture, which is enough; a relay rotating its own link
-certificate would need an X.509 generator.
+What remains is the program that holds the sockets, and an X.509 generator so the relay can make its
+own TLS link certificate. A relay rotates that certificate every few hours, so one that cannot make
+its own is permanently somebody else's guest — see `design/0002` D4, which was revised to put
+generation in scope rather than leaning on an openssl fixture.
 
 ## What is not here
 

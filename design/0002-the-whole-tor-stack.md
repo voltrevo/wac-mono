@@ -69,14 +69,25 @@ chutney launch them without knowing they are not tor.
 A relay needs it for its RSA identity crosscert, and an authority needs it to sign a consensus: Tor
 still uses RSA-1024 identity keys, and that is not negotiable by us because the other end checks them.
 
-**D4 — long-term keys come from `openssl`/`tor` as fixtures, not from key generation we wrote.**
-RSA keygen is prime search — Miller-Rabin, a sieve, and a lot of care about the bits — and it is a
-large independent piece that has nothing to do with speaking Tor's protocols. A testnet's identities
-can be generated once by tools that already do it well.
+**D4 — everything is in scope; fixtures are staging, not the end state** (operator, 2026-08-05).
 
-The cost is stated: we will not be able to `tor-gencert` an authority identity ourselves, so an
-authority we stand up uses keys somebody else made. That is fine for a testnet and would not be fine
-for anything else, and it is a separate direction if it ever matters.
+This decision was originally the other way round: long-term keys would come from `openssl`/`tor` as
+fixtures, on the reasoning that RSA key generation is prime search and X.509 generation is DER, and
+neither has anything to do with speaking Tor's protocols. The operator revised it: *"we definitely
+aspire to implement everything fully and correctly. Nothing should be excluded because 'it's only a
+testnet.'"*
+
+So the reasoning was right about the *cost* and wrong about the *conclusion*. Those pieces are
+genuinely separate from the protocol work and they are still ours to write:
+
+  - **X.509 generation.** A relay's TLS link certificate is rotated every few hours; one that cannot
+    make its own is permanently somebody else's guest. In scope, and next.
+  - **RSA key generation.** Prime search with Miller-Rabin. In scope, so that an identity can be made
+    here rather than by `tor-gencert`.
+
+A fixture is still the right way to *start* a piece — it separates "can we speak the protocol" from
+"can we make the key" — but it is a scaffold with a removal date, and each one should be named where
+it stands so it does not quietly become the design.
 
 **D5 — the order is set by where an independent oracle already exists**, not by the layer diagram.
 That puts the onion-service *client* first — it needs no new server code and chutney's `hs-v3` network
@@ -144,6 +155,8 @@ much as the thing steps 2–6 each contribute a row to, and it is where a regres
 | 5 — the launcher | not started |
 | 6 — onion service host | not started |
 | 7 — the interop matrix | not started |
+| — X.509 generation | **in progress** — D4, so a relay can make its own link certificate |
+| — RSA key generation | not started — D4, so an identity can be made here rather than by `tor-gencert` |
 
 The client itself is done and its own limitations live in `packages/tor/README.md` — guard algorithm,
 circuit padding, isolation by credential and the rest. Those are that package's roadmap and are
