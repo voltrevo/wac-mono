@@ -124,6 +124,31 @@ export struct Hop {
   }
 
   /**
+   * The same 72 bytes, from the **responder's** point of view.
+   *
+   * tor's `relay_crypto_init(..., reverse)` swaps the forward and backward halves for a relay,
+   * because "forward" means towards the exit and the two ends of a hop disagree about which way that
+   * is. Our forward digest and key are the client's backward ones and the other way round.
+   *
+   * Getting this wrong is not a subtle failure and not an obvious one either: every cell is
+   * unrecognised in both directions at once, which looks like a broken circuit rather than a key
+   * that is the wrong way round.
+   */
+  Hop createReversed(u8[] material) {
+    if (material.len() != 72) { trap; }
+    u8[] swapped = u8[72]();
+    for (i32 i = 0; i < 20; i++) {
+      swapped[i] = material[20 + i];          // their Db is our Df
+      swapped[20 + i] = material[i];
+    }
+    for (i32 i = 0; i < 16; i++) {
+      swapped[40 + i] = material[56 + i];     // their Kb is our Kf
+      swapped[56 + i] = material[40 + i];
+    }
+    return Hop.create(swapped);
+  }
+
+  /**
    * The rendezvous hop: SHA3-256 and AES-256, from 128 bytes of `Df | Db | Kf | Kb`.
    *
    * Same layout as `create`, four times as wide in the digest keys and twice in the cipher keys.
