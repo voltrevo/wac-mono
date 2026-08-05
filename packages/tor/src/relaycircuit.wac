@@ -20,8 +20,9 @@
 import { Hop, encryptRelay, decryptRelay, relayRecognized, relayCommand, relayStreamId,
          relayPayload, relayLengthValid } from "./relay.wac";
 import { encodeFixed, cellPayload, cellCommand, cellCircId, cmdCreate2, cmdCreated2, cmdDestroy,
-         cmdRelay, handshakeNtor } from "./cell.wac";
+         cmdRelay, cmdCreateFast, cmdCreatedFast, handshakeNtor } from "./cell.wac";
 import { ntorServerRespond } from "./ntor.wac";
+import { sha1 } from "../../crypto/src/sha1.wac";
 
 /** The key material one hop needs: `Df | Db | Kf | Kb` for SHA-1 and AES-128. */
 export const i32 HOP_KEY_LEN = 72;
@@ -287,4 +288,76 @@ export u8[] extended2Body(u8[] reply) {
   out[1] = reply.len() & 0xFF;
   for (i32 i = 0; i < reply.len(); i++) { out[2 + i] = reply[i]; }
   return out;
+}
+
+// ── CREATE_FAST ───────────────────────────────────────────────────────────────
+//
+// The handshake for a client that does not know the relay's onion key. There is no public-key
+// operation in it at all: both sides contribute 20 random bytes and the key material is a SHA-1
+// chain over the pair.
+//
+// **That means it authenticates nothing**, and tor-spec is explicit that it is only safe as the
+// *first* hop of a circuit, where TLS has already authenticated the relay — the certificate chain in
+// the CERTS cell is what says who this is, and CREATE_FAST simply agrees a key with whoever that
+// turned out to be. Using it anywhere else would let any relay on the path be the endpoint.
+//
+// A bridge is exactly the case it exists for: a client told an address and a fingerprint has no
+// descriptor, so it has no onion key, so it cannot send a CREATE2. A C tor client pointed at this
+// relay sends CREATE_FAST, which is how this came to be implemented.
+
+/** `X` in a CREATE_FAST cell, and `Y` in the reply: 20 bytes each. */
+export const i32 CREATE_FAST_LEN = 20;
+
+/**
+ * KDF-TOR: `K = H(K0 | [00]) | H(K0 | [01]) | …`, tor-spec §5.2.1.
+ *
+ * SHA-1 in a counter chain, which is why the spec says it "shouldn't be used for new
+ * functionality" — it is here because CREATE_FAST is, and CREATE_FAST is what a bridge client sends.
+ *
+ * The first 20 bytes are `KH`, which the reply carries to prove the relay derived the same key;
+ * the rest is `Df | Db | Kf | Kb` for an ordinary hop.
+ */
+export u8[] kdfTor(u8[] k0, i32 outLen) {
+  u8[] out = u8[outLen]();
+  i32 produced = 0;
+  i32 counter = 0;
+  while (produced < outLen) {
+    u8[] input = u8[k0.len() + 1]();
+    for (i32 i = 0; i < k0.len(); i++) { input[i] = k0[i]; }
+    input[k0.len()] = counter;
+    u8[] block = sha1(input);
+    for (i32 i = 0; i < block.len() && produced < outLen; i++) {
+      out[produced] = block[i];
+      produced = produced + 1;
+    }
+    counter = counter + 1;
+  }
+  return out;
+}
+
+/**
+ * Answer a CREATE_FAST cell: the CREATED_FAST to send, and the hop to keep.
+ *
+ * `serverRandom` must be 20 bytes from a real random source — it is half the key material, and a
+ * predictable `Y` means a predictable circuit key. There is no public-key operation to fall back on
+ * here, so this is the only secret the relay contributes.
+ */
+export Created answerCreateFast(i32 circId, u8[] createPayload, u8[] serverRandom) {
+  Created bad = Created(u8[0](), Hop.create(u8[HOP_KEY_LEN]()));
+  if (serverRandom.len() != CREATE_FAST_LEN) { return bad; }
+  if (createPayload.len() < CREATE_FAST_LEN) { return bad; }
+
+  u8[] k0 = u8[CREATE_FAST_LEN * 2]();
+  for (i32 i = 0; i < CREATE_FAST_LEN; i++) { k0[i] = createPayload[i]; }
+  for (i32 i = 0; i < CREATE_FAST_LEN; i++) { k0[CREATE_FAST_LEN + i] = serverRandom[i]; }
+
+  // KH, then the hop's 72 bytes.
+  u8[] material = kdfTor(k0, CREATE_FAST_LEN + HOP_KEY_LEN);
+  u8[] payload = u8[CREATE_FAST_LEN * 2]();
+  for (i32 i = 0; i < CREATE_FAST_LEN; i++) { payload[i] = serverRandom[i]; }
+  for (i32 i = 0; i < CREATE_FAST_LEN; i++) { payload[CREATE_FAST_LEN + i] = material[i]; }
+
+  u8[] hopKeys = u8[HOP_KEY_LEN]();
+  for (i32 i = 0; i < HOP_KEY_LEN; i++) { hopKeys[i] = material[CREATE_FAST_LEN + i]; }
+  return Created(encodeFixed(circId, cmdCreatedFast(), payload), Hop.createReversed(hopKeys));
 }

@@ -33,6 +33,16 @@ import { ed25519Sign, ed25519Verify } from "../../crypto/src/ed25519.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { rsaSignRawPkcs1 } from "../../crypto/src/rsa.wac";
 
+/**
+ * `RSA1024 Identity certificate, self-signed` — an X.509 certificate, not an ed25519 one.
+ *
+ * **Required, and easy to leave out.** The ed25519 chain (types 4, 5 and 7) looks complete on its
+ * own and is not: tor-spec §4.2 lists type 2 first among the certificates an initiator must find,
+ * and tor refuses a CERTS cell without it with "Missing legacy RSA ID certificate". Found exactly
+ * that way, from a C tor client, after TLS and version negotiation had both succeeded.
+ */
+export const i32 CERT_TYPE_RSA_ID = 2;
+
 /** `ed25519 signing key, signed with identity key`. */
 export const i32 CERT_TYPE_SIGNING = 4;
 /** `TLS link certificate, signed with ed25519 signing key`. */
