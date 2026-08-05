@@ -20,7 +20,8 @@ import { x25519Base } from "../../../crypto/src/x25519.wac";
 import {
   Created, Inbound, answerCreate2, create2Handshake, created2Cell, destroyCell,
   receiveFromClient, sendToClient, HOP_KEY_LEN, NTOR_REQUEST_LEN, NTOR_REPLY_LEN,
-  DESTROY_PROTOCOL,
+  DESTROY_PROTOCOL, Extend, parseExtend2, extendTarget, extendIdentity, extended2Body,
+  LS_IPV4, LS_IPV6, LS_LEGACY_IDENTITY, LS_ED25519_IDENTITY,
 } from "../../src/relaycircuit.wac";
 import { ntorClientRequest, ntorClientFinish } from "../../src/ntor.wac";
 import { Hop, encryptRelay, decryptRelay, relayRecognized, relayCommand, relayStreamId,
@@ -208,5 +209,127 @@ export string test_a_destroy_cell_says_why() {
   t.eqI32(cellCircId(cell, 0), 42, "on the right circuit");
   t.eqI32(cellPayload(cell, 0)[0], DESTROY_PROTOCOL, "carrying the reason");
   t.eqI32(cell.len(), 514, "and padded to a full cell like any other");
+  return t.report();
+}
+
+export string test_an_extend2_names_a_next_hop_and_carries_a_handshake_untouched() {
+  // The client builds this cell for the *last* hop, which reads the specifiers, connects, and passes
+  // the handshake on as a CREATE2 without looking inside it. A relay that could read the handshake
+  // could impersonate the hop it is extending to, so "untouched" is the property, not an efficiency.
+  T t = T.create();
+  u8[] identity = fill(20, 30);
+  u8[] handshake = ntorClientRequest(identity, x25519Base(scalar(31)), scalar(32));
+
+  // Specifiers in the order tor-spec asks for: IPv4, legacy identity, ed25519 identity.
+  u8[] ed = fill(32, 33);
+  u8[] specs = u8[1 + 8 + 22 + 34]();
+  specs[0] = 3;
+  specs[1] = LS_IPV4;
+  specs[2] = 6;
+  specs[3] = 127; specs[4] = 0; specs[5] = 0; specs[6] = 1;
+  specs[7] = 0x14; specs[8] = 0x0A;                       // port 5130
+  specs[9] = LS_LEGACY_IDENTITY;
+  specs[10] = 20;
+  for (i32 i = 0; i < 20; i++) { specs[11 + i] = identity[i]; }
+  specs[31] = LS_ED25519_IDENTITY;
+  specs[32] = 32;
+  for (i32 i = 0; i < 32; i++) { specs[33 + i] = ed[i]; }
+
+  u8[] payload = u8[specs.len() + 4 + handshake.len()]();
+  for (i32 i = 0; i < specs.len(); i++) { payload[i] = specs[i]; }
+  payload[specs.len() + 1] = handshakeNtor();
+  payload[specs.len() + 2] = (handshake.len() >> 8) & 0xFF;
+  payload[specs.len() + 3] = handshake.len() & 0xFF;
+  for (i32 i = 0; i < handshake.len(); i++) { payload[specs.len() + 4 + i] = handshake[i]; }
+
+  Extend e = parseExtend2(payload);
+  t.isTrue(e.ok, "the cell parses");
+  t.eqI32(e.handshakeType, handshakeNtor(), "an ntor handshake");
+  t.isTrue(same(e.handshake, handshake), "carried through byte for byte");
+  t.isTrue(same(e.linkSpecifiers, specs), "and the specifiers whole and in order");
+
+  u8[] target = extendTarget(e.linkSpecifiers);
+  t.eqI32(target.len(), 6, "an IPv4 target");
+  t.eqI32(target[0], 127, "127.");
+  t.eqI32(target[3], 1, "…0.0.1");
+  t.eqI32((target[4] * 256) + target[5], 5130, "port 5130, big-endian");
+  t.isTrue(same(extendIdentity(e.linkSpecifiers), identity), "and the identity to expect there");
+
+  // The reply goes back with the same shape a CREATED2 has, because that is what it is.
+  u8[] body = extended2Body(fill(64, 34));
+  t.eqI32(body.len(), 66, "EXTENDED2 is a two-byte length and the reply");
+  t.eqI32((body[0] * 256) + body[1], 64, "with the length big-endian");
+  return t.report();
+}
+
+export string test_an_extend2_that_is_malformed_is_refused() {
+  // A relay is asked to extend by strangers, so every length in this cell is somebody else's claim.
+  T t = T.create();
+  t.isFalse(parseExtend2(u8[0]()).ok, "an empty payload");
+  t.isFalse(parseExtend2(u8[1]()).ok, "zero specifiers");
+
+  // A specifier running past the end.
+  u8[] over = u8[4]();
+  over[0] = 1;
+  over[1] = LS_IPV4;
+  over[2] = 200;
+  t.isFalse(parseExtend2(over).ok, "a specifier longer than the payload");
+
+  // Two legacy identities: a request to extend to two relays at once, which tor-spec says to reject.
+  u8[] two = u8[1 + 22 + 22 + 4]();
+  two[0] = 2;
+  two[1] = LS_LEGACY_IDENTITY;
+  two[2] = 20;
+  two[23] = LS_LEGACY_IDENTITY;
+  two[24] = 20;
+  t.isFalse(parseExtend2(two).ok, "two legacy identities are rejected");
+
+  // An identity of the wrong width is not an identity.
+  u8[] shortId = u8[1 + 21 + 4]();
+  shortId[0] = 1;
+  shortId[1] = LS_LEGACY_IDENTITY;
+  shortId[2] = 19;
+  t.isFalse(parseExtend2(shortId).ok, "a 19-byte legacy identity is rejected");
+
+  // A handshake length past the end.
+  u8[] lying = u8[1 + 8 + 4]();
+  lying[0] = 1;
+  lying[1] = LS_IPV4;
+  lying[2] = 6;
+  lying[10] = 255;
+  lying[11] = 255;
+  t.isFalse(parseExtend2(lying).ok, "a handshake length past the payload");
+
+  // No IPv4 specifier at all: nothing to connect to, and an IPv6 one is not a substitute here.
+  u8[] v6only = u8[1 + 20 + 4]();
+  v6only[0] = 1;
+  v6only[1] = LS_IPV6;
+  v6only[2] = 18;
+  t.isTrue(parseExtend2(v6only).ok, "an IPv6-only list still parses");
+  t.eqI32(extendTarget(parseExtend2(v6only).linkSpecifiers).len(), 0,
+          "but offers no address this relay can dial");
+
+  // An unrecognised specifier that happens to be six bytes must not be read as an address. Found by
+  // planting: dropping the type check from `extendTarget` survived every case above, because the
+  // first six-byte specifier in each was in fact the IPv4 one.
+  //
+  // This is not hypothetical — tor-spec says nodes MUST ignore unrecognised specifiers and MUST
+  // accept multiple instances of them, so a six-byte one from a future extension is expected traffic.
+  u8[] decoy = u8[1 + 8 + 8]();
+  decoy[0] = 2;
+  decoy[1] = 9;                   // an unknown type, six bytes long
+  decoy[2] = 6;
+  decoy[3] = 10; decoy[4] = 9; decoy[5] = 8; decoy[6] = 7;
+  decoy[7] = 0xFF; decoy[8] = 0xFF;
+  decoy[9] = LS_IPV4;
+  decoy[10] = 6;
+  decoy[11] = 192; decoy[12] = 168; decoy[13] = 0; decoy[14] = 5;
+  decoy[15] = 0x1F; decoy[16] = 0x90;                     // port 8080
+  u8[] found = extendTarget(decoy);
+  t.eqI32(found.len(), 6, "the IPv4 specifier is found past an unknown one");
+  t.eqI32(found[0], 192, "and it is the IPv4 one, not the six-byte decoy");
+  t.eqI32((found[4] * 256) + found[5], 8080, "with its own port");
+  t.eqI32(extendIdentity(decoy).len(), 0, "and no identity is invented from the decoy");
+  t.eqI32(extended2Body(u8[0]()).len(), 0, "and an empty reply makes no EXTENDED2");
   return t.report();
 }

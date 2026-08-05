@@ -151,3 +151,140 @@ export u8[] sendToClient(Hop hop, i32 circId, i32 command, i32 streamId, u8[] da
 }
 
 
+
+// ── Extending a circuit ───────────────────────────────────────────────────────
+
+/**
+ * An EXTEND2 cell's payload, as the relay being asked to extend reads it.
+ *
+ *     NSPEC [1]  (LSTYPE [1] LSLEN [1] LSPEC [LSLEN]) x NSPEC  HTYPE [2] HLEN [2] HDATA [HLEN]
+ *
+ * The relay's job is to open a connection to the node the specifiers describe, send the handshake on
+ * as a CREATE2, and send the CREATED2 back as an EXTENDED2. It never looks inside the handshake:
+ * that is between the client and the next hop, and a relay that could read it would be able to
+ * impersonate the hop it is extending to.
+ */
+export struct Extend {
+  bool ok;
+  /** The link specifiers, whole and in order, for the connection to make. */
+  u8[] linkSpecifiers;
+  i32 handshakeType;
+  /** The client's handshake, to be forwarded verbatim in a CREATE2. */
+  u8[] handshake;
+}
+
+export Extend parseExtend2(u8[] payload) {
+  Extend bad = Extend(false, u8[0](), -1, u8[0]());
+  if (payload.len() < 1) { return bad; }
+  i32 n = payload[0];
+  if (n == 0) { return bad; }
+
+  // Walk the specifiers to find where they end, then keep the whole run. They are forwarded as
+  // received: rend-spec and tor-spec both say unrecognised types must be passed on rather than
+  // dropped, because which types a party understands is a fingerprint.
+  i32 at = 1;
+  i32 legacyCount = 0;
+  i32 edCount = 0;
+  for (i32 i = 0; i < n; i++) {
+    if (at + 2 > payload.len()) { return bad; }
+    i32 type = payload[at];
+    i32 length = payload[at + 1];
+    // Redundant with the header check below — if a specifier overran, `at` ends past the payload and
+    // `at + 4 > payload.len()` catches it, so `specs` can never be allocated longer than the input.
+    // Kept because it says what the loop maintains, and removing it survives the tests, as it should.
+    if (at + 2 + length > payload.len()) { return bad; }
+    if (type == LS_LEGACY_IDENTITY) {
+      if (length != 20) { return bad; }
+      legacyCount = legacyCount + 1;
+    }
+    if (type == LS_ED25519_IDENTITY) {
+      if (length != 32) { return bad; }
+      edCount = edCount + 1;
+    }
+    if (type == LS_IPV4 && length != 6) { return bad; }
+    at = at + 2 + length;
+  }
+  // "Nodes SHOULD reject link specifier lists that include multiple instances of either one of
+  // those specifiers." Two identities is a request to extend to two different relays at once.
+  if (legacyCount > 1 || edCount > 1) { return bad; }
+
+  i32 specEnd = at;
+  if (at + 4 > payload.len()) { return bad; }
+  i32 hType = (payload[at] * 256) + payload[at + 1];
+  i32 hLen = (payload[at + 2] * 256) + payload[at + 3];
+  at = at + 4;
+  if (at + hLen > payload.len()) { return bad; }
+
+  u8[] specs = u8[specEnd]();
+  specs[0] = n;
+  for (i32 i = 1; i < specEnd; i++) { specs[i] = payload[i]; }
+  u8[] handshake = u8[hLen]();
+  for (i32 i = 0; i < hLen; i++) { handshake[i] = payload[at + i]; }
+  return Extend(true, specs, hType, handshake);
+}
+
+export const i32 LS_IPV4 = 0;
+export const i32 LS_IPV6 = 1;
+export const i32 LS_LEGACY_IDENTITY = 2;
+export const i32 LS_ED25519_IDENTITY = 3;
+
+/**
+ * The address and port from an IPv4 link specifier, as `a.b.c.d` and a port, or empty.
+ *
+ * A relay asked to extend needs somewhere to connect. IPv6 is not handled: this relay does not have
+ * an IPv6 socket to offer, and returning an address it cannot use would turn a clean refusal into a
+ * connection attempt that fails later and less clearly.
+ */
+export u8[] extendTarget(u8[] linkSpecifiers) {
+  if (linkSpecifiers.len() < 1) { return u8[0](); }
+  i32 n = linkSpecifiers[0];
+  i32 at = 1;
+  for (i32 i = 0; i < n; i++) {
+    if (at + 2 > linkSpecifiers.len()) { return u8[0](); }
+    i32 type = linkSpecifiers[at];
+    i32 length = linkSpecifiers[at + 1];
+    if (at + 2 + length > linkSpecifiers.len()) { return u8[0](); }
+    if (type == LS_IPV4 && length == 6) {
+      u8[] out = u8[6]();
+      for (i32 j = 0; j < 6; j++) { out[j] = linkSpecifiers[at + 2 + j]; }
+      return out;
+    }
+    at = at + 2 + length;
+  }
+  return u8[0]();
+}
+
+/** The 20-byte legacy identity a link specifier list names, or empty. */
+export u8[] extendIdentity(u8[] linkSpecifiers) {
+  if (linkSpecifiers.len() < 1) { return u8[0](); }
+  i32 n = linkSpecifiers[0];
+  i32 at = 1;
+  for (i32 i = 0; i < n; i++) {
+    if (at + 2 > linkSpecifiers.len()) { return u8[0](); }
+    i32 type = linkSpecifiers[at];
+    i32 length = linkSpecifiers[at + 1];
+    if (at + 2 + length > linkSpecifiers.len()) { return u8[0](); }
+    if (type == LS_LEGACY_IDENTITY && length == 20) {
+      u8[] out = u8[20]();
+      for (i32 j = 0; j < 20; j++) { out[j] = linkSpecifiers[at + 2 + j]; }
+      return out;
+    }
+    at = at + 2 + length;
+  }
+  return u8[0]();
+}
+
+/**
+ * An EXTENDED2 relay body: `HLEN [2] | HDATA`.
+ *
+ * The same shape as a CREATED2 payload, which is not a coincidence — it is the CREATED2 the next hop
+ * sent, repackaged. A relay copies the handshake through without inspecting it.
+ */
+export u8[] extended2Body(u8[] reply) {
+  if (reply.len() == 0 || reply.len() > 65535) { return u8[0](); }
+  u8[] out = u8[2 + reply.len()]();
+  out[0] = (reply.len() >> 8) & 0xFF;
+  out[1] = reply.len() & 0xFF;
+  for (i32 i = 0; i < reply.len(); i++) { out[2 + i] = reply[i]; }
+  return out;
+}
