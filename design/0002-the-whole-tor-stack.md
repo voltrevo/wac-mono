@@ -288,6 +288,24 @@ most, because it puts their implementation on the far side of every seam.
 > `cell.wac`. The other two branches — `certsCount < 0`, and a short read — are cheap to rule out by
 > logging the command byte the loop rejects.
 >
+> **The framing hypothesis is wrong, and reading `cell.wac` says so.** `cellSize` already handles that
+> boundary on purpose: it peeks `buf[at + 2]` for `cmdVersions` before assuming a four-byte id, with a
+> comment explaining that 7 cannot be confused with a four-byte-id command in that position. And here
+> it is safe for a stronger reason — CERTS, AUTH_CHALLENGE and NETINFO are all **link-level cells with
+> circuit id 0**, so `buf[at + 2]` is 0 and never 7. The initiator cannot mis-frame them.
+>
+> `nextCell` narrows the rest: it loops on `takeCell` and `pump` and returns empty **only when the link
+> is dead**, which means a 30-second read timeout or a failed socket. So the two live suspects are:
+>
+>   - **`certsCount(payload) < 0`** — our client's CERTS parser rejecting the CERTS cell our own relay
+>     builds with `certsCell`. Both are ours and neither has ever been shown the other's output, which
+>     is the shape of every bug found on this seam so far.
+>   - **the link simply going quiet** — relayd waiting for something the initiator will not send, or
+>     the reverse, until `READ_TIMEOUT_MS` expires.
+>
+> They are distinguishable in one run by logging the rejected command byte and whether `l.dead` was set,
+> which is the cheapest next step and needs no theory at all.
+>
 > The SOCKS requests still time out, which is expected and separate: nothing implements `RELAY_BEGIN`.
 >
 > One hypothesis tested and **disproved**: that tor asked our relay for the consensus because our vote
