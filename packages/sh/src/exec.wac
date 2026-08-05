@@ -22,7 +22,8 @@ import { Option } from "../../std/src/option.wac";
 import { hashString, stringEq } from "../../std/src/hash.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Read } from "../../bytes/src/read.wac";
-import { Change, Child, Cli, Core, FAULT_EXISTS, FAULT_NOT_EMPTY, FAULT_NOT_FOUND, FileResult,
+import { Change, Child, Cli, Core, FAULT_EXISTS, FAULT_NOT_EMPTY, FAULT_NOT_FOUND,
+  FAULT_NOT_REPRESENTABLE, FileResult,
   GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, Pending, Stat }
   from "../../platform/src/platform.wac";
 import { Part, PartKind, Token, lexQuotedText, tokenize } from "./lex.wac";
@@ -1665,6 +1666,10 @@ string reasonOf(Change c) {
   if (c.fault == FAULT_NOT_FOUND()) { return "No such file or directory"; }
   if (c.fault == FAULT_EXISTS()) { return "File exists"; }
   if (c.fault == FAULT_NOT_EMPTY()) { return "Directory not empty"; }
+  // Not GNU's words, because GNU has none for this: a filesystem it can name every file in has no reason
+  // to. Saying the host cannot express the name is the true sentence, and it beats "No such file or
+  // directory" for a file the caller has just seen in `ls`. wac-mono 0065.
+  if (c.fault == FAULT_NOT_REPRESENTABLE()) { return "cannot be named on this host"; }
   return c.message;
 }
 

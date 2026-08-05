@@ -310,6 +310,18 @@ because `fstat` tells it the widths before it reads anything. `cat` has no such 
 interleave correctly — see `complain` in `program.wac`, which flushes the output sink before writing to
 the error one, because a 64 KiB buffer is enough to reverse the two.
 
+**A file whose name is not valid UTF-8 can be listed and not opened, and it says so.** `ls` shows
+`bad-\ufffd-name` where bash shows the real bytes, and every program that tries to open that name reports
+`cannot be named on this host` rather than `No such file or directory`. bash handles these files perfectly,
+so this is a genuine divergence rather than a gap in the shell.
+
+The loss is not ours and cannot be fixed here: `Deno.readDir` replaces invalid bytes with U+FFFD, and
+`Deno.stat` of the name it just returned fails — there is no byte-oriented path anywhere in that API. wac
+strings *are* byte arrays, so a name would survive the bridge; it does not survive the runtime. Node's `fs`
+takes a `Buffer` and could do it, which is why the fault category exists rather than a blanket refusal:
+`FAULT_NOT_REPRESENTABLE` is a fact about the host, and a host that can express the name will not raise it.
+wac-mono 0065.
+
 **Only `read` consumes standard input.** It advances a cursor the whole command shares, which is
 what makes `while read line` terminate rather than see the first line for ever. The external
 programs are handed whatever is left but are *not* charged for it, because nothing here knows

@@ -15,6 +15,13 @@ export const FAULT_DENIED = 2;
 export const FAULT_EXISTS = 3;
 export const FAULT_NOT_EMPTY = 4;
 export const FAULT_OTHER = 5;
+/**
+ * The host cannot express this name — see `FAULT_NOT_REPRESENTABLE` in `platform.wac`.
+ *
+ * A path containing U+FFFD that does not resolve is the detectable case, and it is the common one: it is
+ * what a lossy `readDir` hands back for a filename that is not valid UTF-8.
+ */
+export const FAULT_NOT_REPRESENTABLE = 6;
 
 /**
  * A fault a host had to name itself, because its filesystem does not report one.
@@ -40,6 +47,42 @@ export class Faulted extends Error {
  * *message* for a category is what an applet had to do before this existed, and it is a guess about
  * three operating systems: "No such file or directory" is not what any of them promises to say.
  */
+/** The replacement character, which is what a lossy decode leaves where bytes it could not read were. */
+const REPLACEMENT = "\ufffd";
+
+/**
+ * The fault for an operation on `path`, given what the host threw.
+ *
+ * The one refinement over `faultOf`: a `NotFound` for a path containing U+FFFD is almost certainly a name
+ * the host could not express rather than a file that is not there — because U+FFFD is what a lossy
+ * `readDir` produces, and a name containing it round-trips only if the file really does have a replacement
+ * character in it. Checked rather than assumed: if the path resolves, it is a real name and the fault
+ * stands as it was.
+ */
+export function faultOfPath(e: unknown, path: string): number {
+  const fault = faultOf(e);
+  if (fault !== FAULT_NOT_FOUND || !path.includes(REPLACEMENT)) return fault;
+  return FAULT_NOT_REPRESENTABLE;
+}
+
+/**
+ * The error to throw for a failed operation on `path`.
+ *
+ * Returns the original unless the path is one the host cannot express, in which case it returns a
+ * `Faulted` carrying the category — which every reply path already respects, since `faultOf` reads it.
+ * That is why this is a thrown value rather than a change to `changed()` or `faultedBytes()`: the fault
+ * travels with the error and needs no new parameter anywhere.
+ */
+export function pathFailure(e: unknown, path: string): unknown {
+  if (faultOfPath(e, path) !== FAULT_NOT_REPRESENTABLE) return e;
+  return new Faulted(
+    FAULT_NOT_REPRESENTABLE,
+    `${path}: the name is not representable on this host — it contains U+FFFD, which is what a lossy ` +
+      `directory read leaves in place of bytes that are not valid UTF-8, and no path in this runtime's ` +
+      `filesystem API can name the original`,
+  );
+}
+
 export function faultOf(e: unknown): number {
   if (e instanceof Faulted) return e.fault;
 
@@ -121,6 +164,7 @@ export function phraseOf(fault: number): string {
   if (fault === FAULT_DENIED) return "permission denied";
   if (fault === FAULT_EXISTS) return "already exists";
   if (fault === FAULT_NOT_EMPTY) return "directory not empty";
+  if (fault === FAULT_NOT_REPRESENTABLE) return "the name is not representable on this host";
   return "";
 }
 

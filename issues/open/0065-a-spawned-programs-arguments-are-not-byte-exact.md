@@ -158,3 +158,50 @@ cannot then open. The rule to hold to: the host decodes a path only where the AP
 text, and where a name cannot be represented it reports a fault rather than approximating it.
 `packages/fs` already pins the property on a memory mount, where no host API is involved, which makes
 it the place to test the rule before the hosts implement it.
+
+## The second half, and it is not what this issue assumed (agent-a, 2026-08-05)
+
+The paths half is **closed as not-fixable-here**, with the gap named instead. That is a different answer
+from the one above, and the measurement is why.
+
+I had written that the rule to hold to is "the host decodes a path only where the API it calls demands
+text, and where a name cannot be represented it reports a fault". The second clause is right. The first
+does not apply, because on Deno *every* path API demands text and there is no alternative:
+
+```
+$ ls -b .                       # created with python: b"bad-\xff-name"
+bad-\377-name
+$ deno … readDir(".")           # what the world receives
+"bad-\ufffd-name"  [62 61 64 2d ef bf bd 2d 6e 61 6d 65]  stat FAILS: NotFound
+```
+
+`Deno.readDir` replaces the invalid byte with U+FFFD before anything of ours sees it, and `Deno.stat` of
+the name it just handed back fails. So the file is unnameable from this runtime, and **changing our
+signatures from `string` to `u8[]` would not have helped** — wac strings are byte arrays already, so a name
+survives the bridge; it does not survive the runtime's own API. The churn this issue implied for eight
+capabilities and every caller would have bought nothing on the host we actually run.
+
+What was wrong was the *sentence*. A file the caller has just seen in `ls` reported as "No such file or
+directory" reads as their mistake. So:
+
+- **`FAULT_NOT_REPRESENTABLE`** joins the five categories, in `platform.wac` and `host/faults.ts`, with the
+  reasoning for why it is distinct from absence written where the constant is.
+- **`pathFailure(e, path)`** refines a `NotFound` for a path containing U+FFFD into that category, and the
+  Deno host wraps every path-taking operation in it — `readFile`, `writeFile`, `readDir`, `mkdir`, `remove`,
+  `rename`, `openInput`, `openOutput`. It travels as a thrown `Faulted`, which every reply path already
+  respects, so no plumbing changed.
+- **`sh` says it**: `cat`, `wc`, `rm` and the rest print `cannot be named on this host`, and `rm -f` does
+  *not* swallow it, because a file that is still there afterwards is not absent.
+- Tested twice: the refinement in `packages/platform/test/unnameable.test.ts`, and what a person sees in
+  `packages/sh/test/unnameable.test.ts`. Neither is a differential case, and that is the point — bash
+  handles these names perfectly, so comparing against it would only restate the gap. `packages/sh/README.md`
+  records the divergence.
+
+**What a future host can do.** Node's `fs` accepts a `Buffer` path, so the Node host could be byte-exact and
+would simply never raise this category. That is the shape of the remaining work and it is a *host*
+capability question rather than a signature question — which is the correction this issue needed.
+
+`stat` is the one operation still lying: it answers a struct with no fault field, so an unnameable name
+reads as "does not exist". Left alone deliberately — giving `Stat` a fault means changing its shape and
+every caller, and the callers that matter (`test -e`, `ls`) would then have to decide what to *do* about a
+name they cannot express. That is a real design question and not one to answer in passing.

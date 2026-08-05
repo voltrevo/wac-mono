@@ -21,7 +21,7 @@ import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
 import { EMPTY_ARG, argBytes, i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 import { ChildStack, joinPath, packCaptured, unpackPush } from "./child.ts";
-import { changeBytes, changed, CHANGED_OK, FAULT_DENIED } from "./faults.ts";
+import { changeBytes, changed, CHANGED_OK, FAULT_DENIED, pathFailure } from "./faults.ts";
 
 export type DenoWorldOptions = {
   /** Arguments the application sees. Defaults to none, not to the launcher's own. */
@@ -199,6 +199,21 @@ function graceEnv(): number | undefined {
     return raw === undefined ? undefined : Number(raw);
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Run a filesystem operation and, if it fails, say whether the *name* was the problem.
+ *
+ * A `NotFound` for a path containing U+FFFD is a name this runtime cannot express rather than a file that
+ * is absent — see `pathFailure`. Wrapping every path-taking handler in this is what turns "no such file or
+ * directory" for a file the user can see in `ls` into a sentence that is true. wac-mono 0065.
+ */
+async function onPath<T>(path: string, work: () => Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (e) {
+    throw pathFailure(e, path);
   }
 }
 
@@ -412,7 +427,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     // Genuinely asynchronous, and the wac side calls it like a function.
     [OP.READ_FILE]: async (p) => {
       if (!opts.fs?.read) deny("filesystem read");
-      return await Deno.readFile(P(unstr(p)));
+      const path = P(unstr(p));
+      return await onPath(path, () => Deno.readFile(path));
     },
 
     // stdin and stdout need no grant: what the user pipes in and what the program prints
@@ -504,7 +520,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
 
     [OP.READ_DIR]: async (p) => {
       if (!opts.fs?.read) deny("filesystem read");
-      const names = await denoDir(P(unstr(p)));
+      const path = P(unstr(p));
+      const names = await onPath(path, () => denoDir(path));
       return str(names.join("\u0000"));
     },
     // The four changes answer a `Change` rather than throwing: a fault category and the host's own
@@ -513,7 +530,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
       const n = readI32le(p);
       const path = P(unstr(p.subarray(4, 4 + n)));
-      return changed(() => Deno.writeFile(path, p.subarray(4 + n)));
+      return changed(() => onPath(path, () => Deno.writeFile(path, p.subarray(4 + n))));
     },
 
     // The mutation tier. Each throws on failure and the wac side reads that as `false`,
@@ -525,7 +542,8 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       source = null;
       if (path === "") return EMPTY;      // standard input, and the default
       if (!opts.fs?.read) deny("filesystem read");
-      source = await Deno.open(P(path), { read: true });
+      const full = P(path);
+      source = await onPath(full, () => Deno.open(full, { read: true }));
       return EMPTY;
     },
     [OP.READ_CHUNK]: async () => {
@@ -560,9 +578,12 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
       // `changed`, so a directory that does not exist is `FAULT_NOT_FOUND` rather than an errno and an
       // absolute path in somebody's shell diagnostic.
-      return await changed(async () => {
-        sink = await Deno.open(P(path), { write: true, create: true, truncate: true });
-      });
+      const full = P(path);
+      return await changed(() =>
+        onPath(full, async () => {
+          sink = await Deno.open(full, { write: true, create: true, truncate: true });
+        })
+      );
     },
 
     [OP.CONNECT]: async (p) => {
@@ -714,18 +735,22 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
 
     [OP.MKDIR]: (p) => {
       if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
-      return changed(() => Deno.mkdir(P(unstr(p.subarray(1))), { recursive: p[0] === 1 }));
+      const dir = P(unstr(p.subarray(1)));
+      return changed(() => onPath(dir, () => Deno.mkdir(dir, { recursive: p[0] === 1 })));
     },
     [OP.REMOVE]: (p) => {
       if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
-      return changed(() => Deno.remove(P(unstr(p.subarray(1))), { recursive: p[0] === 1 }));
+      const victim = P(unstr(p.subarray(1)));
+      return changed(() => onPath(victim, () => Deno.remove(victim, { recursive: p[0] === 1 })));
     },
     [OP.RENAME]: (p) => {
       if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
       const n = readI32le(p);
-      return changed(() =>
-        Deno.rename(P(unstr(p.subarray(4, 4 + n))), P(unstr(p.subarray(4 + n))))
-      );
+      const from = P(unstr(p.subarray(4, 4 + n)));
+      const to = P(unstr(p.subarray(4 + n)));
+      // The source first: a rename fails on whichever name the host cannot express, and reporting the
+      // destination for a source it could not read would send the reader to the wrong half.
+      return changed(() => onPath(from, () => onPath(to, () => Deno.rename(from, to))));
     },
   };
 }

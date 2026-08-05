@@ -402,6 +402,20 @@ export i32 FAULT_EXISTS() { return 3; }
 export i32 FAULT_NOT_EMPTY() { return 4; }
 /** The host said something this world has no category for; the message is all there is. */
 export i32 FAULT_OTHER() { return 5; }
+/**
+ * The host cannot express this name, so the operation was never attempted.
+ *
+ * Not the same as absent, and the difference is visible from a shell: `ls` in a directory holding a file
+ * whose name is not valid UTF-8 lists `bad-\ufffd-name`, and every attempt to open *that* answers "no such
+ * file or directory" — a file you can see and cannot touch, with the blame on whoever typed it.
+ *
+ * Measured on Deno, which is where this world mostly runs: `Deno.readDir` replaces the invalid bytes with
+ * U+FFFD, and `Deno.stat` of the name it just handed you fails `NotFound`. There is no byte-oriented path
+ * in that API, so the file is genuinely unnameable from here — this is not a conversion wac-mono can fix by
+ * changing a signature, which is what wac-mono 0065 assumed at first. Node's `fs` takes a `Buffer` and
+ * could do it; the Deno host cannot, and says so.
+ */
+export i32 FAULT_NOT_REPRESENTABLE() { return 6; }
 
 /** What a filesystem change answered. */
 export struct Change {
