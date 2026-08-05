@@ -188,14 +188,27 @@ used to happen, four times, to three different agents (`issues/closed/0001`, `00
 
 **Being ahead of the pin is normal and is never an error.** The pin is a floor.
 
-**Bump it when you adopt a compiler feature that did not exist before.** That is the only
-time it is required, and the sequence is:
+**Update it proactively — whenever the suite has just passed and wac has moved.** This
+used to say the opposite ("bump it only when you adopt a compiler feature that did not
+exist before"), and that rule failed in the way rules like it do: the pin sat at a
+2026-08-03 commit while wac went 52 commits ahead, and nothing about the drift told
+anyone whether the claim was still true. It was — every package still built against that
+commit when somebody eventually tested it — but nobody had, for two days, and the note the
+harness prints had become something three agents scrolled past.
+
+A pin that names a compiler the suite passed against *this week* is a useful claim. A pin
+that names the oldest commit that happens to still work is an archaeological fact nobody
+maintains. The sequence either way:
 
 ```sh
 git -C ../wac pull                              # get the compiler you want
 deno task test                                  # prove this repo works with it
 deno task wac:pin -- "generic enums, for std"   # then record it, with a real reason
 ```
+
+The reason field is read by whoever hits *"wac-mono needs a newer compiler"* weeks later.
+Name the feature when a feature is why; say `routine` when it is a routine bump, because
+"routine" is honest and a copied commit subject is not.
 
 The order matters: the pin is a claim that the suite passes against that compiler, and
 `wac:pin` cannot check that for you. It refuses a dirty wac working tree and refuses to

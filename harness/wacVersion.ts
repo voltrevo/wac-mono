@@ -86,10 +86,16 @@ export function checkWacVersion(): void {
   }
 
   const ahead = Number(git(root, ["rev-list", "--count", `${pin.commit}..HEAD`]).out || "0");
+  // Days as well as commits, because the policy is about *staleness* and commits are a poor proxy
+  // for it: fifty-two of them landed in two days here, and a quiet week can pass with none. The
+  // rule is to bump the pin whenever the suite has passed and wac has moved (README, "Keeping the
+  // compiler pin current"), so the note names both numbers and the exact command.
+  const days = Math.floor((Date.now() - Date.parse(pin.updated)) / 86_400_000);
   if (ahead >= NUDGE_AFTER) {
     console.warn(
-      `note: wac is ${ahead} commits ahead of the pin (${pin.shortCommit}, ${pin.updated}). ` +
-      `If the suite passes, \`deno task wac:pin\` records today's compiler as the minimum.`,
+      `note: wac is ${ahead} commits ahead of the pin (${pin.shortCommit}, ${pin.updated}` +
+      `${Number.isFinite(days) ? `, ${days} day${days === 1 ? "" : "s"} ago` : ""}). ` +
+      `If this run passes, \`deno task wac:pin -- "routine"\` records today's compiler.`,
     );
   }
 }
