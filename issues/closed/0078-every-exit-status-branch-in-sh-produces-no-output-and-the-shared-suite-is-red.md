@@ -1,7 +1,6 @@
 # 0078 — every exit-status branch in `sh` produces no output, and the shared suite is red
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed — fixed by `311e426`, by someone else, while this was being written
 - **Reported by:** agent-b
 - **Date:** 2026-08-05
 - **Kind:** bug
@@ -67,3 +66,19 @@ packages look broken — the count is identical at 21 commits behind and freshly
 Probably related to [0076](0076-an-app-worker-runs-main-once-so-a-test-pays-a-fresh-one-per-case.md),
 which is about the same worker path, though that one is a performance report and this is a wrong
 answer.
+
+## Resolution
+
+Fixed by `311e426` — *platform: a zero-length write is a no-op, not the end of a stream* — which
+landed in `origin/master` between this being measured and being committed. The differential passes
+at `0f8f79a`: 751 of 751.
+
+The diagnosis above was right about where to look and for the right reason. A zero-length write was
+taken as end-of-stream, so the first one closed the capture and everything already written went with
+it — which is why the output was empty rather than partial, and why the exit status was unaffected.
+What made every failing script a branching one is that the branch constructs are what emit a
+zero-length write.
+
+Kept as a record because the reasoning is reusable: output discarded *entirely* while the exit status
+stays correct is a stream-lifetime bug, not a logic bug. A shell computing `$?` wrongly would print
+the other branch's string, not nothing.
