@@ -24,10 +24,8 @@
 // line at all", which are different problems with different fixes and which today's
 // single "survivor" verdict conflates.
 
-import { refuseIfNested, SUITE_ENV } from "../suiteGuard.ts";
+import { SUITE_ENV } from "../suiteGuard.ts";
 
-// wac-mono 0077: this spawns whole test runs, so it must not be one.
-refuseIfNested("the mutation profiler");
 
 export type Profile = {
   /** "file:line" to the tests that execute it. */

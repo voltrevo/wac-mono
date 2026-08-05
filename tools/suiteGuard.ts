@@ -25,6 +25,11 @@ export const SUITE_ENV: Record<string, string> = { [MARKER]: "1" };
  * `what` names the tool, because the message has to tell whoever hits it which of them refused — and
  * because the fix is always the same shape: call the thing you need directly rather than the whole suite.
  */
+// **Called by `runTests.ts` only, for now.** Wiring it into `mutate.ts`, `testChanged.ts` and
+// `mutate/profile.ts` as a top-level call broke the suite: those are modules, something imports them,
+// and a module that calls `Deno.exit` while being imported takes the importing process with it — the
+// gate died after type-checking with no output at all. The fix is `import.meta.main`, and it belongs in
+// a change that is verified rather than bolted onto this one.
 export function refuseIfNested(what: string): void {
   if (Deno.env.get(MARKER) === undefined) return;
   console.error(
