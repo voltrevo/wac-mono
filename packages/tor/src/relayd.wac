@@ -45,8 +45,12 @@
 
 import { Core, Cli, Socket, FileResult, Change, Pending } from "../../platform/src/platform.wac";
 import { Read } from "../../bytes/src/read.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+import { Parsed, parseRequest } from "../../http/src/request.wac";
+import { DirDocuments, dirResponse, dirSourceFingerprint } from "./dirserve.wac";
 import {
-  Link, connectRelay, feedLink, handshakeTls, itoa, linkHandshake, pump, sendCells, takeCell,
+  Link, chunkRequest, connectRelay, feedLink, handshakeTls, itoa, linkHandshake, pump, sendCells,
+  takeCell,
 } from "./link.wac";
 import { itoa64 } from "../../wactest/src/itoa64.wac";
 import {
@@ -68,7 +72,10 @@ import {
   extended2Body, parseExtend2, receiveFromClient, sendToClient,
   DESTROY_INTERNAL, DESTROY_NONE, DESTROY_PROTOCOL,
 } from "./relaycircuit.wac";
-import { Hop, relayExtend2, relayExtended2, wrapForClient } from "./relay.wac";
+import {
+  Hop, relayBeginDir, relayConnected, relayData, relayEnd, relayExtend2, relayExtended2,
+  wrapForClient,
+} from "./relay.wac";
 import { RelayInfo, RelayKeys, routerDescriptor, rsaFingerprint } from "./routerdesc.wac";
 import {
   cellSize, cellCommand, cellCircId, cellPayload, cmdVersions, cmdNetinfo, cmdCreate2, cmdRelay,
@@ -230,6 +237,8 @@ export i32 main(Core core, Cli cli) {
   string seedPath = "";
   string descriptorOut = "";
   string nickname = "wacrelay";
+  string consensusPath = "";
+  string certPath = "";
   i32 argc = cli.argCount().wait();
   for (i32 i = 0; i < argc; i++) {
     string a = string.fromBytes(cli.arg(i).wait());
@@ -245,13 +254,19 @@ export i32 main(Core core, Cli cli) {
     } else if (a == "-n" && i + 1 < argc) {
       nickname = string.fromBytes(cli.arg(i + 1).wait());
       i = i + 1;
+    } else if (a == "-C" && i + 1 < argc) {
+      consensusPath = string.fromBytes(cli.arg(i + 1).wait());
+      i = i + 1;
+    } else if (a == "-K" && i + 1 < argc) {
+      certPath = string.fromBytes(cli.arg(i + 1).wait());
+      i = i + 1;
     } else if (seedPath == "") {
       seedPath = a;
     }
   }
   if (seedPath == "") {
     core.warn("usage: relayd <seed-file> [-p port] [-a address] [-n nickname] " +
-              "[--descriptor path]");
+              "[--descriptor path] [-C consensus -K certificate]");
     return 1;
   }
 
@@ -300,6 +315,25 @@ export i32 main(Core core, Cli cli) {
     return 0;
   }
 
+  // A relay serves directory documents over RELAY_BEGIN_DIR, and a bootstrapping tor asks *any* relay
+  // it knows for them — there is no flag that stops it asking, so a relay that cannot answer leaves the
+  // client stuck with a consensus it cannot check. Only the consensus and the certificate are served:
+  // those are what it asks for at this stage, and `dirserve.wac` answers 404 for what we do not hold.
+  DirDocuments docs = DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0]());
+  bool hasDir = false;
+  if (consensusPath != "" && certPath != "") {
+    FileResult cf = cli.readFile(consensusPath).wait();
+    FileResult kf = cli.readFile(certPath).wait();
+    if (!cf.ok || !kf.ok) {
+      core.warn("relayd: could not read the directory documents to serve");
+      return 1;
+    }
+    docs = DirDocuments(cf.bytes, u8[0](), kf.bytes, u8[0](), u8[][0](),
+                        dirSourceFingerprint(cf.bytes));
+    hasDir = true;
+    core.log("relayd: serving the consensus and certificate over BEGIN_DIR");
+  }
+
   u8[] certs = identityCerts(id, now);
   if (certs.len() == 0) {
     core.warn("relayd: could not build the certificate chain");
@@ -320,7 +354,7 @@ export i32 main(Core core, Cli cli) {
       return 1;
     }
     core.log("relayd: connection from " + conn.peer);
-    serve(core, cli, conn, id, certs, now);
+    serve(core, cli, conn, id, certs, now, docs, hasDir);
     cli.closeSocket(conn.handle);
   }
   return 0;
@@ -358,10 +392,11 @@ u8[] takeVec(u8[] b, i32 at) {
 }
 
 /** One connection, from TLS through to circuits, until it closes. */
-void serve(Core core, Cli cli, Socket conn, Identity id, u8[] certs, i64 now) {
+void serve(Core core, Cli cli, Socket conn, Identity id, u8[] certs, i64 now,
+           DirDocuments docs, bool hasDir) {
   u8[] tls = tlsServerInit(id.tlsCertDer, id.tlsSeed, clampScalar(tweak(id.tlsSeed, 6)),
                            core.randomBytes(32).wait());
-  runLink(core, cli, conn, tls, id, certs);
+  runLink(core, cli, conn, tls, id, certs, docs, hasDir);
 }
 
 /**
@@ -371,7 +406,8 @@ void serve(Core core, Cli cli, Socket conn, Identity id, u8[] certs, i64 now) {
  * whole one is present — the same reasoning as the client's `nextCell`, and the reason cell framing
  * is a function of the buffer rather than of a read.
  */
-void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs) {
+void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs,
+             DirDocuments docs, bool hasDir) {
   u8[] buf = u8[0]();
   bool established = false;
   bool versionsSeen = false;
@@ -382,6 +418,10 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs)
   // The next hop, once an EXTEND2 has been acted on. `next` starts as a dead Link rather than an
   // optional because it is only ever read while `hasNext` says it is real, and a dead one carries the
   // same fields — a `Link?` would put a `!` on every use to say what `hasNext` already says.
+  // The one directory stream a client may open over this circuit, and the request arriving on it.
+  i32 dirStream = -1;
+  Buf dirRequest = Buf.create();
+
   bool hasNext = false;
   Link next = Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]());
   i32 nextCircId = 0;
@@ -596,6 +636,54 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs)
           continue;
         }
 
+        if (inbound.command == relayBeginDir()) {
+          if (!hasDir) {
+            // Refused rather than ignored: a client that gets no answer waits out its timeout, and a
+            // client that gets an END tries somewhere else immediately.
+            tls = sendCell(cli, conn, tls,
+                           sendToClient(hop, circId, relayEnd(), inbound.streamId, endReason()));
+            core.log("relayd:   a BEGIN_DIR, refused: no documents to serve");
+            continue;
+          }
+          dirStream = inbound.streamId;
+          dirRequest = Buf.create();
+          // CONNECTED with an empty payload: a directory stream has no address to report, unlike the
+          // BEGIN it otherwise resembles.
+          tls = sendCell(cli, conn, tls,
+                         sendToClient(hop, circId, relayConnected(), dirStream, u8[0]()));
+          core.log("relayd:   a directory stream opened as " + itoa(dirStream));
+          continue;
+        }
+
+        if (inbound.command == relayData() && inbound.streamId == dirStream) {
+          dirRequest.pushAll(inbound.data);
+          match (parseRequest(dirRequest.bytes(), 0)) {
+            case Ok(request): {
+              u8[] response = dirResponse(request.target, docs);
+              // 498 bytes to a cell, which is what `chunkRequest` splits at — named for the client's
+              // side of the same operation, and the same arithmetic in this direction.
+              u8[][] parts = chunkRequest(response);
+              for (i32 pi = 0; pi < parts.len(); pi++) {
+                tls = sendCell(cli, conn, tls,
+                               sendToClient(hop, circId, relayData(), dirStream, parts[pi]));
+              }
+              tls = sendCell(cli, conn, tls,
+                             sendToClient(hop, circId, relayEnd(), dirStream, endReason()));
+              core.log("relayd:   answered a directory request with " + itoa(response.len()) +
+                       " bytes in " + itoa(parts.len()) + " cells");
+              dirStream = -1;
+            }
+            case Bad(code): {
+              core.warn("relayd:   a malformed directory request, code " + itoa(code));
+              tls = sendCell(cli, conn, tls,
+                             sendToClient(hop, circId, relayEnd(), dirStream, endReason()));
+              dirStream = -1;
+            }
+            case Incomplete: { }
+          }
+          continue;
+        }
+
         core.log("relayd:   relay command " + itoa(inbound.command) + " on stream " +
                  itoa(inbound.streamId));
         continue;
@@ -770,4 +858,11 @@ i32 parseInt(string s) {
     v = v * 10 + (b[i] - '0');
   }
   return v;
+}
+
+/** A one-byte RELAY_END reason: `REASON_DONE`, the ordinary close. */
+u8[] endReason() {
+  u8[] r = u8[1]();
+  r[0] = 6;
+  return r;
 }

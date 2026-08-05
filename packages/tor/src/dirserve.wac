@@ -169,3 +169,46 @@ u8[] rest(u8[] s, string prefix) {
   for (i32 i = 0; i < out.len(); i++) { out[i] = s[from + i]; }
   return out;
 }
+
+/** The 20-byte identity digest on the consensus's first `dir-source` line, or empty. */
+export u8[] dirSourceFingerprint(u8[] consensus) {
+  u8[] keyword = "dir-source ".toBytes();
+  for (i32 i = 0; i + keyword.len() <= consensus.len(); i++) {
+    if (i != 0 && consensus[i - 1] != 10) { continue; }
+    bool hit = true;
+    for (i32 j = 0; j < keyword.len(); j++) {
+      if (consensus[i + j] != keyword[j]) { hit = false; break; }
+    }
+    if (!hit) { continue; }
+    // `dir-source <nickname> <fingerprint> ...` — the fingerprint is the second field.
+    i32 at = i + keyword.len();
+    while (at < consensus.len() && consensus[at] != 32 && consensus[at] != 10) { at = at + 1; }
+    at = at + 1;
+    i32 end = at;
+    while (end < consensus.len() && consensus[end] != 32 && consensus[end] != 10) {
+      end = end + 1;
+    }
+    return unhex(consensus, at, end);
+  }
+  return u8[0]();
+}
+
+u8[] unhex(u8[] s, i32 from, i32 to) {
+  if ((to - from) % 2 != 0) { return u8[0](); }
+  u8[] out = u8[(to - from) / 2]();
+  for (i32 i = 0; i < out.len(); i++) {
+    i32 hi = hexValue(s[from + i * 2]);
+    i32 lo = hexValue(s[from + i * 2 + 1]);
+    if (hi < 0 || lo < 0) { return u8[0](); }
+    out[i] = hi * 16 + lo;
+  }
+  return out;
+}
+
+i32 hexValue(i32 c) {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  return -1;
+}
+

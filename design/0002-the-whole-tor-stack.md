@@ -172,6 +172,14 @@ most, because it puts their implementation on the far side of every seam.
 > Until then `EXTEND2` can only be exercised by our own client, which extends explicitly — worth doing
 > as a smoke test, and not a substitute for the C tor path under D1.
 >
+> **`BEGIN_DIR` is answered now** and it works: relay A served a 2193-byte consensus in 5 relay cells
+> over a circuit, from the same `dirserve.wac` routing the DirPort uses. Bootstrap still stops at 50 %,
+> and the reason has moved on: tor asked for `/tor/status-vote/current/consensus-microdesc` **eleven
+> times** against five for the unflavoured one, and we produce only the ns flavour, so it 404s. Next
+> is either `UseMicrodescriptors 0` on the client — one line, and it establishes whether the ns path
+> completes — or producing the microdesc flavour and the microdescriptors themselves, which is real
+> work. Try the config first: it is a measurement, not a fix.
+>
 > One hypothesis tested and **disproved**: that tor asked our relay for the consensus because our vote
 > flagged it `V2Dir`, which advertises a directory cache we do not run. Dropping `V2Dir` and `HSDir`
 > from the flags changed nothing — tor still sent `Downloading consensus from 127.0.0.1:5555` at the
