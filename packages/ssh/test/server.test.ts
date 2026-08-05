@@ -10,6 +10,8 @@
 
 import { haveSshd } from "./server.ts";
 import { holdPort } from "../../../harness/port.ts";  // one allocator — wac-mono 0069
+import { ABANDONED_SSHD } from "./server.ts";
+import { reapOrphans } from "../../../harness/reap.ts";
 
 /**
  * Every binary this file builds, removed on the way out.
@@ -58,6 +60,11 @@ const sshBinary = await (async () => {
   if (!r.success) throw new Error(`building ssh failed: ${new TextDecoder().decode(r.stderr)}`);
   return out;
 })();
+
+// Our own server leaks the same way the system one does: a killed run leaves it listening with init as
+// its parent. `wacsshd-…` is the temp-file prefix below, so the pattern is this file's own shape — and a
+// running instance always has this process as its parent, so nothing live can match. wac-mono 0073.
+reapOrphans(/\/tmp\/wacsshd-[A-Za-z0-9]+/, "wacsshd");
 
 const wacsshdBinary = await (async () => {
   const out = await Deno.makeTempFile({ prefix: "wacsshd-" });
@@ -446,4 +453,23 @@ Deno.test({
       throw new Error(`expected ${JSON.stringify(want)}, server said ${JSON.stringify(said.trim())}`);
     }
   },
+});
+
+Deno.test("the abandoned-sshd pattern matches what ps actually prints", () => {
+  // The trap this exists for: sshd rewrites its own argv, so what `ps` shows is not what was executed. A
+  // pattern anchored at the binary matches nothing, the reaper finds nothing, and a machine with thirty
+  // leaked daemons looks exactly like a clean one. wac-mono 0073.
+  const listener =
+    "sshd: /usr/sbin/sshd -D -f /tmp/tmp.VPs8c9aLpd/sshd_config [listener] 0 of 10-100 startups";
+  if (!ABANDONED_SSHD.test(listener)) {
+    throw new Error(`the pattern does not match a real listener:\n  ${listener}`);
+  }
+  // And what it must not match: the machine's own sshd, and a client.
+  for (const other of [
+    "/usr/sbin/sshd -D",
+    "sshd: /usr/sbin/sshd -D -f /etc/ssh/sshd_config [listener]",
+    "ssh -p 2222 -o StrictHostKeyChecking=no user@127.0.0.1 true",
+  ]) {
+    if (ABANDONED_SSHD.test(other)) throw new Error(`the pattern matches something it must not:\n  ${other}`);
+  }
 });
