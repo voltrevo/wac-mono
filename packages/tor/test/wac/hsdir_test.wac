@@ -19,13 +19,17 @@ import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import {
   hsServiceIndex, hsRelayIndex, disasterSrv, compareIndex, responsibleHsdirs,
   HSDIR_N_REPLICAS_DEFAULT, HSDIR_SPREAD_STORE_DEFAULT, HSDIR_SPREAD_FETCH_DEFAULT,
+  hsdirsForDescriptor, hsdirCandidates, descriptorPath,
 } from "../../src/hsdir.wac";
+import { Relay, parseConsensus, attachMicrodescriptors, base64NoPad } from "../../src/directory.wac";
 
 const i32 V_CASE_COUNT = 0;
 const i32 V_CASE_META = 1;      // blindedKey(32) srv(32) tp(8) plen(8)
 const i32 V_CASE_HSDIRS = 2;    // n(1) then n x (ed25519(32) relayIndex(32))
 const i32 V_RELAYS = 3;         // n(1) then n x ed25519(32)  — the HSDir-flagged candidates
 const i32 V_SERVICE_INDEX = 4;  // replicas x 32
+const i32 V_CONSENSUS = 5;
+const i32 V_MICRODESCS = 6;
 
 bool same(u8[] a, u8[] b) {
   if (a.len() != b.len()) { return false; }
@@ -286,5 +290,120 @@ export string test_the_disaster_srv_is_deterministic(fn[u8[](i32, u8[], u8[])] r
   t.isTrue(same(a, disasterSrv(1440, 16903)), "and is the same every time");
   t.isFalse(same(a, disasterSrv(1440, 16904)), "the period number changes it");
   t.isFalse(same(a, disasterSrv(8, 16903)), "the period length changes it");
+  return t.report();
+}
+
+// ── From a consensus, which is what a client actually has ─────────────────────
+
+export string test_the_directories_are_chosen_from_a_parsed_consensus(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  // Everything above works from ed25519 keys handed over directly. A client has a consensus and a
+  // pile of microdescriptors, and has to get from those to the same answer — which means parsing the
+  // `HSDir` flag out of the consensus and the `id ed25519` line out of a microdescriptor, neither of
+  // which is in the other document.
+  //
+  // This is the same assertion as `we_choose_the_directories_tor_chose`, one layer lower down: the
+  // relays tor uploaded to, reached from the bytes a client downloads.
+  T t = T.create();
+  u8[] consensus = ref(V_CONSENSUS, u8[0](), u8[0]());
+  u8[] microdescs = ref(V_MICRODESCS, u8[0](), u8[0]());
+  t.isTrue(consensus.len() > 1000, "the vector carries a real consensus");
+  t.isTrue(microdescs.len() > 1000, "and the microdescriptors that go with it");
+
+  Relay[] relays = parseConsensus(consensus);
+  t.isTrue(relays.len() >= 8, "the consensus parses into relays");
+  // Before microdescriptors are attached nothing can be placed on the ring — a client in that state
+  // must fetch them rather than compute a ring from the relays it happens to have.
+  t.eqI32(hsdirCandidates(relays).len(), 0,
+          "with no microdescriptors attached there are no ring candidates");
+
+  attachMicrodescriptors(relays, microdescs);
+  i32[] candidates = hsdirCandidates(relays);
+  t.isTrue(candidates.len() > HSDIR_N_REPLICAS_DEFAULT * HSDIR_SPREAD_STORE_DEFAULT,
+           "after attaching them there are more candidates than slots");
+
+  i32 cases = ref(V_CASE_COUNT, u8[0](), u8[0]())[0];
+  for (i32 c = 0; c < cases; c++) {
+    u8[] meta = ref(V_CASE_META, caseArg(c), u8[0]());
+    u8[] blinded = slice(meta, 0, 32);
+    u8[] srv = slice(meta, 32, 64);
+    i64 tp = be64(meta, 64);
+    i64 plen = be64(meta, 72);
+
+    i32[] chosen = hsdirsForDescriptor(relays, blinded, srv, tp, plen,
+                                       HSDIR_N_REPLICAS_DEFAULT, HSDIR_SPREAD_STORE_DEFAULT);
+    u8[] dirs = ref(V_CASE_HSDIRS, caseArg(c), u8[0]());
+    i32 want = dirs[0];
+    t.eqI32(chosen.len(), want, "case " + itoa64(c as i64) + ": as many directories as tor used");
+
+    i32 missing = 0;
+    for (i32 i = 0; i < want; i++) {
+      u8[] theirs = slice(dirs, 1 + i * 64, 1 + i * 64 + 32);
+      bool found = false;
+      for (i32 j = 0; j < chosen.len(); j++) {
+        if (same(relays[chosen[j]].ed25519Identity, theirs)) { found = true; }
+      }
+      if (!found) { missing = missing + 1; }
+    }
+    t.eqI32(missing, 0,
+            "case " + itoa64(c as i64) + ": every directory tor used was chosen from the consensus");
+  }
+  return t.report();
+}
+
+export string test_the_descriptor_path_is_the_one_an_hsdir_answers(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  T t = T.create();
+  u8[] meta = ref(V_CASE_META, caseArg(0), u8[0]());
+  u8[] blinded = slice(meta, 0, 32);
+  string path = descriptorPath(blinded);
+  // `/tor/hs/3/<z>`, z being the blinded key in unpadded base64: 32 bytes is 43 characters.
+  t.eqI32(path.len(), 10 + 43, "the path is the prefix plus an unpadded base64 key");
+  t.isTrue(same(path.toBytes(), ("/tor/hs/3/" + base64NoPad(blinded)).toBytes()),
+           "and it is exactly /tor/hs/3/<z>");
+  i32 pad = 0;
+  u8[] pb = path.toBytes();
+  for (i32 i = 0; i < pb.len(); i++) {
+    if (pb[i] == 61) { pad = pad + 1; }
+  }
+  t.eqI32(pad, 0, "the base64 is unpadded — tor's cache is keyed on the unpadded form");
+  t.eqI32(descriptorPath(u8[31]()).len(), 0, "a short key has no path");
+  return t.report();
+}
+
+export string test_only_flagged_relays_with_an_identity_are_candidates(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  // The vector cannot show this: chutney gives every relay the HSDir flag, so on that data the
+  // filter is a no-op and removing it changes nothing. Planting `if (true)` in place of the flag
+  // check survived every test above, which is how the gap was found.
+  //
+  // On the real network most relays are not HSDirs, and including one shifts every ring position
+  // after it — so the client would ask a set of directories that overlaps tor's by chance and
+  // usually fails.
+  T t = T.create();
+  u8[] ed = u8[32]();
+  for (i32 i = 0; i < 32; i++) { ed[i] = (i * 3 + 1) & 0xFF; }
+
+  string[] withFlag = string[]("Fast", "HSDir", "Running");
+  string[] without = string[]("Fast", "Running");
+  Relay[] relays = Relay[4]();
+  relays[0] = Relay("a", u8[20](), "127.0.0.1", 9001, withFlag, "", 0, u8[0](), ed, null, string[0]());
+  relays[1] = Relay("b", u8[20](), "127.0.0.1", 9002, without, "", 0, u8[0](), ed, null, string[0]());
+  // Flagged, but no microdescriptor attached yet, so it has no ed25519 identity and cannot be placed.
+  relays[2] = Relay("c", u8[20](), "127.0.0.1", 9003, withFlag, "", 0, u8[0](), u8[0](), null,
+                    string[0]());
+  relays[3] = Relay("d", u8[20](), "127.0.0.1", 9004, withFlag, "", 0, u8[0](), ed, null, string[0]());
+
+  i32[] candidates = hsdirCandidates(relays);
+  t.eqI32(candidates.len(), 2, "only the flagged relays that can be placed are candidates");
+  t.eqI32(candidates[0], 0, "the first is relay a");
+  t.eqI32(candidates[1], 3, "and the second is relay d, skipping b and c");
+
+  // A relay with a short identity — a truncated `id ed25519` line — is not a candidate either.
+  relays[2].ed25519Identity = u8[31]();
+  t.eqI32(hsdirCandidates(relays).len(), 2, "a 31-byte identity is still not placeable");
   return t.report();
 }

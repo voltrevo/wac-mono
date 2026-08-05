@@ -8,10 +8,13 @@
 
 import { wacTestRun } from "../../../harness/wacTestRun.ts";
 
-const V_CASE_COUNT = 0, V_CASE_META = 1, V_CASE_HSDIRS = 2, V_RELAYS = 3, V_SERVICE_INDEX = 4;
+const V_CASE_COUNT = 0, V_CASE_META = 1, V_CASE_HSDIRS = 2, V_RELAYS = 3,
+  V_SERVICE_INDEX = 4, V_CONSENSUS = 5, V_MICRODESCS = 6;
 
 type Vectors = {
   relays: { nickname: string; ed25519: string; hsdir: boolean }[];
+  consensusDocument: string;
+  microdescriptors: string;
   cases: {
     blindedKey: string;
     timePeriod: number;
@@ -73,6 +76,10 @@ function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
       const c = v.cases[a[0]];
       return new Uint8Array(c.serviceIndex.flatMap((s) => [...hex(s)]));
     }
+    case V_CONSENSUS:
+      return new TextEncoder().encode(v.consensusDocument);
+    case V_MICRODESCS:
+      return new TextEncoder().encode(v.microdescriptors);
     default:
       throw new Error(`unknown vector field ${what}`);
   }

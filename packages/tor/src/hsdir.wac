@@ -32,6 +32,7 @@
 // under `shared-rand-current-value`.
 
 import { sha3_256 } from "../../crypto/src/keccak.wac";
+import { Relay, base64NoPad } from "./directory.wac";
 
 /** `hsdir_n_replicas`, consensus parameter, default 2. */
 export const i32 HSDIR_N_REPLICAS_DEFAULT = 2;
@@ -202,4 +203,71 @@ export i32[] responsibleHsdirs(
   i32[] out = i32[count]();
   for (i32 i = 0; i < count; i++) { out[i] = chosen[i]; }
   return out;
+}
+
+// ── Choosing directories from a consensus ─────────────────────────────────────
+
+/**
+ * The relays a client should ask for a descriptor, as indices into `relays`.
+ *
+ * This is the form a client actually has: a parsed consensus with microdescriptors attached, rather
+ * than a list of ed25519 keys. The two differences from `responsibleHsdirs` are both real:
+ *
+ *   - **only relays with the `HSDir` flag are candidates.** A relay without it is not in the ring at
+ *     all, and including it shifts every position after it.
+ *   - **a relay whose microdescriptor has not been attached has no ed25519 identity**, so it cannot
+ *     be placed. Those are skipped, and skipping them is not free — it silently changes the ring, so
+ *     `hsdirCandidates` returns the count and a caller with too few should fetch the missing
+ *     microdescriptors rather than proceed.
+ *
+ * Uses `spread` directly so a caller can pass `HSDIR_SPREAD_FETCH_DEFAULT` when fetching and
+ * `HSDIR_SPREAD_STORE_DEFAULT` when checking what a service would have done.
+ */
+export i32[] hsdirsForDescriptor(
+  Relay[] relays, u8[] blindedKey, u8[] sharedRandom, i64 periodNum, i64 periodLength,
+  i32 replicas, i32 spread
+) {
+  i32[] candidates = hsdirCandidates(relays);
+  if (candidates.len() == 0) { return i32[0](); }
+
+  u8[][] indices = u8[][candidates.len()]();
+  for (i32 i = 0; i < candidates.len(); i++) {
+    indices[i] = hsRelayIndex(relays[candidates[i]].ed25519Identity, sharedRandom,
+                              periodNum, periodLength);
+  }
+  i32[] picked = responsibleHsdirs(blindedKey, indices, replicas, spread, periodLength, periodNum);
+  i32[] out = i32[picked.len()]();
+  for (i32 i = 0; i < picked.len(); i++) { out[i] = candidates[picked[i]]; }
+  return out;
+}
+
+/** The indices of relays that can be placed on the ring: `HSDir` flagged, with an ed25519 identity. */
+export i32[] hsdirCandidates(Relay[] relays) {
+  i32 n = 0;
+  for (i32 i = 0; i < relays.len(); i++) {
+    if (isHsdir(relays[i])) { n = n + 1; }
+  }
+  i32[] out = i32[n]();
+  i32 at = 0;
+  for (i32 i = 0; i < relays.len(); i++) {
+    if (isHsdir(relays[i])) {
+      out[at] = i;
+      at = at + 1;
+    }
+  }
+  return out;
+}
+
+bool isHsdir(Relay r) {
+  if (r.ed25519Identity.len() != 32) { return false; }
+  for (i32 i = 0; i < r.flags.len(); i++) {
+    if (r.flags[i] == "HSDir") { return true; }
+  }
+  return false;
+}
+
+/** `/tor/hs/3/<z>`, where `z` is the blinded key in unpadded base64. rend-spec-v3 §2.2.6. */
+export string descriptorPath(u8[] blindedKey) {
+  if (blindedKey.len() != 32) { return ""; }
+  return "/tor/hs/3/" + base64NoPad(blindedKey);
 }

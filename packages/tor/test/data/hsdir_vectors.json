@@ -1,11 +1,14 @@
 {
   "source": "tor 0.4.7.13 on a local chutney hs-v3 network",
+  "consensusDocument": "network-status-version 3 microdesc\nvote-status consensus\nconsensus-method 32\nvalid-after 2026-08-05 04:07:00\nfresh-until 2026-08-05 04:07:20\nvalid-until 2026-08-05 04:07:40\nvoting-delay 4 4\nclient-versions \nserver-versions \nknown-flags Authority Exit Fast Guard HSDir NoEdConsensus Running Stable StaleDesc Sybil V2Dir Valid\nrecommended-client-protocols Cons=2 Desc=2 DirCache=2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 Microdesc=2 Relay=2\nrecommended-relay-protocols Cons=2 Desc=2 DirCache=2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 LinkAuth=3 Microdesc=2 Relay=2\nrequired-client-protocols Cons=2 Desc=2 Link=4 Microdesc=2 Relay=2\nrequired-relay-protocols Cons=2 Desc=2 DirCache=2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 LinkAuth=3 Microdesc=2 Relay=2\nshared-rand-previous-value 3 GJLOQOMzpEBo2vGMLhYoTu1cGYgO230KshKpLOAuk6s=\nshared-rand-current-value 3 yfPOB1n6bjGO0uaQllfcXlo+01v9/o7xI1tKfXv8/kw=\ndir-source test002a 6861710F2E25D9DC01037628CD9D3B1F8CDC5237 127.0.0.1 127.0.0.1 7102 5102\ncontact auth2@test.test\nvote-digest F3FF11032E5AC922934E0E60418911F06142980D\ndir-source test000a E351A6000E3C187D97DB501B5A73097FDD598647 127.0.0.1 127.0.0.1 7100 5100\ncontact auth0@test.test\nvote-digest CC8A6CC95BE1E325E38BDA4DC3F76BC5146551CB\ndir-source test001a FAD3755DCC2FD03FEA9F81BEF61E372D86A566DD 127.0.0.1 127.0.0.1 7101 5101\ncontact auth1@test.test\nvote-digest A2197F0DCBD61F70C2E73F09CE4408F57F24FB0B\nr test010r BQQTP0TVxWvEz1l7jaFgIbGnTxE 2026-08-05 03:34:19 127.0.0.1 5110 0\nm pcVX0g91Mw4UQNDtMkLlNO9sVeROR/xxNJGElqZieQY\ns Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=57 Unmeasured=1\nr test002a EblmJRV9aOcdrgOWqOCGeCRH9Oc 2026-08-05 03:33:50 127.0.0.1 5102 7102\nm xNaAQxK0JS84SiCD94szJVlQQd/1eI6h275jQPROlHU\ns Authority Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=438 Unmeasured=1\nr test000a NkQrdYZtNc8yqpNgihDBeCCzV0c 2026-08-05 03:33:50 127.0.0.1 5100 7100\nm mNbuQqXyo1DC2GYjEeNZ2WBxs18wCVNZLQ+G5uUy+P4\ns Authority Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=234 Unmeasured=1\nr test012r ZD4EMrc+WbfuOLM01DnwlceuwLE 2026-08-05 03:32:58 127.0.0.1 5112 0\nm WtkIp46q/PpX88uj6QboU/Cdt1wkpOWGSTXuYOlqz2w\ns Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=54 Unmeasured=1\nr test008r canSgIH1k762uYzTMomODsq6FA0 2026-08-05 03:33:22 127.0.0.1 5108 0\nm 7fS0fhIF63V4Ru0ym+pqSbcaZ7VYBq7Q/F7TLTJKJq0\ns Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=54 Unmeasured=1\nr test011r haTvX4Q4Zwo/TvSrIPsPlJN+kLw 2026-08-05 03:33:21 127.0.0.1 5111 0\nm +1PFtQ9HILm144bidYotVDgUX56kuYS8Y0YmzO/Xmr8\ns Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=54 Unmeasured=1\nr test006r jABSMAjEd52BFP888lZ58WmDdDA 2026-08-05 03:33:02 127.0.0.1 5106 0\nm 1KSzy3TLx5jnSelqDCft5RtRZYEIWMGNFFICVe2Y3Tw\ns Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=54 Unmeasured=1\nr test009r nSV9WlxkL7T2FMEw726kxhbnS8c 2026-08-05 03:37:58 127.0.0.1 5109 0\nm VeFv+LLJDNwbC2NxQxIWHwQeJR/taijl4t18yb6EMYk\ns Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=124 Unmeasured=1\nr test003r sUNpZDtSctUp8HbqIlRtU8PwS6Q 2026-08-05 03:33:40 127.0.0.1 5103 0\nm +L5TLIWj/u+wCuh2VMWukoJQd1wx8FvkXecyTlVgZWs\ns Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=55 Unmeasured=1\nr test007r t+A0hbz2RKMq9IudOAu3OK2pOA0 2026-08-05 03:33:18 127.0.0.1 5107 0\nm 7TuSQC+QiI5N29MtPwufgf/o+ay6/jfxjiYrS6DbKFE\ns Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=55 Unmeasured=1\nr test001a 4mVJSSA2ffUmNKZV60iurHET8t8 2026-08-05 03:33:49 127.0.0.1 5101 7101\nm i0xsVBt6XJRvo7zlyeC21q895Nqsegd7ib2olsceYNE\ns Authority Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=260 Unmeasured=1\nr test004r 7y7ND34bFzXUl8ogSHMpqeyomHA 2026-08-05 03:33:50 127.0.0.1 5104 0\nm sm/QcIJtPZzmllsFhPRn8y9c8w8tkqiBwiN5c84+miA\ns Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=111 Unmeasured=1\nr test005r 82ZIOODnfsPRgXQ4kFSW/0cy6w0 2026-08-05 03:33:20 127.0.0.1 5105 0\nm W0XKOxZ/82oGPFukAu3TopAjGNH7pIZEAPMrv728w2A\ns Exit Fast Guard HSDir Running Stable V2Dir Valid\nv Tor 0.4.7.13\npr Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\nw Bandwidth=55 Unmeasured=1\ndirectory-footer\nbandwidth-weights Wbd=3333 Wbe=0 Wbg=0 Wbm=10000 Wdb=10000 Web=10000 Wed=3333 Wee=10000 Weg=3333 Wem=10000 Wgb=10000 Wgd=3333 Wgg=10000 Wgm=10000 Wmb=10000 Wmd=3333 Wme=0 Wmg=0 Wmm=10000\ndirectory-signature sha256 6861710F2E25D9DC01037628CD9D3B1F8CDC5237 D301FEB59B4D98BC5009CEFFD72A311731F0266C\n-----BEGIN SIGNATURE-----\n3ZOs5sNcEzjKjCVwICFVbyGZjaJsKpURcyT41MEShLnuzAtIa2U5GMYUh5SuMc16\nioyCKa8eqwSlVRV696uPpuzUQXdPi7k9tIRqn2IgbEuvO8Noe1Pe6hniWtrao4PP\nePPeaG4zX6nl63mnq6dtlZvjGBRq06vQ6JoU7Z916fsq3ZmHm/CE7BYmdOZZyfpF\ncRWHpiYzV6Z/CWv2MBIkSeDhiAZfdNOnijnD0vtn8oTpAYMtDEgLoAQaVrbEVIF/\n+7Efq7vHjh7zD81Qg3P6Hv2V6f9yKQHPsrt8dMtfj6OzJ206itv2ulIiThICmzki\nPzIHdZEhNaguswSmlTGRag==\n-----END SIGNATURE-----\ndirectory-signature sha256 E351A6000E3C187D97DB501B5A73097FDD598647 CB129FCA60BDF96F70B92CA433C9288E8C3F456E\n-----BEGIN SIGNATURE-----\nI0yYFtPrFSrnDtT4Wk0D3zbSLplEzV5yE84/Epwnl/JLt0j7d6LBYwpKxV8LRR48\ngpqTdRXfA8/FotuuEahf7mazCsWIwWP4a4mdS3vD9Xk+a551Q+rtWA53LVNvp8kf\nz0iVeA+7JhlcNV9SttJ75UarDTIe5Uf0NDacYb1PvtcpfMHLbF88u+vypKZYAs7o\nLCQlLIXu+E/tKZhywojIgIrAjkAEKTIoek/IH6lowh6oK8R9Y0cLzor91/nGQEbG\n8RF7jcq37rWph6puPQoYTKBFHiNBOasAQxaMtDEQzSRptiof4CGEuXCXOIfHwkyH\nfoQpNzVeDY8uOhuWCLBMVg==\n-----END SIGNATURE-----\ndirectory-signature sha256 FAD3755DCC2FD03FEA9F81BEF61E372D86A566DD 169E48EB98C94CE0418C4D095E17DE263CBFEF5D\n-----BEGIN SIGNATURE-----\nLm1n3ShruPB3bWorkXoseqiDFTeZwKTvO6r9B9F7AWIdixdO6GyjIHAGkmTGXpo4\nlKsdcb+Z1Wnmac3tYW2tkr5E5k2sXSRKzZ6pkofotRrvEkrH7SVmSiQD8tcoXZxQ\n3A2Xgk+80fXtCcP2eDwF6ZxCYbrBp6DkLd9cjdPuZGBfgowNy8UMU68cfaw2YJom\n8hj9Q4/NIqz2s5OGkVKicbwrYKCMjmZbvP/DHoZa0KHXVgP5ZE/MhLlA/TcwQED3\nwa3VMnFf6lTWP5Cd3S1zdRSADXOHblk563mIAPYsjh3l8Xfn4r1t/nFPjFBBEONR\nDpHXHQiis17KaSxn+rCUBg==\n-----END SIGNATURE-----\n",
+  "microdescriptors": "@last-listed 2026-08-05 03:33:27\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBAMHL3ov9qKe6gpJF9KPP8tiV9dZ3fmUJ+ZMhCK+54o3YQVeB7lDipaM5\nxw2VyN1rOuo6KxCwC1flsAmRBpeHfqpV0HwcJ1J9JRQOhJoyaGRKR2fCr/Zag3O/\nC3qrKLyZKdTrqvGX4XG3tvBCcE2rY5x1RK3NjvJ/BAASiXMulum3AgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key fXTZzQqZIKtrBkynXOelQND6a35P+1bBM0qhxuOraUw\np accept 1-65535\nid ed25519 8zqABfo/zGbUrz8tFoFe8k8Cmd7WsLm/qQ0jnwaohg8\n@last-listed 2026-08-05 03:33:27\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBAOfAaB9Ud9nUTAAn5bfyFNOgR5+gk6ziLx0W3tlkumjGTnV0jXPdowQr\nkilN2M5MkxZiYtbd2Ga6H+WE94JyNvEnEJB8HrM+4Vl77aJM47mGhuO587gjjCJ1\nfoqh8zOd1zg3XtctAOTrVUMIgP3lHPZm36OLhOyOcQ3hRh9QexnXAgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key NrjUJPJOpzP0Ql4dDno26tlYThHvPDAbHlHH+6E8KiA\nid ed25519 BZzVQpRoOoDDpg5WMET8oZHWFpKM2SkHlRmPnsFxsZI\n@last-listed 2026-08-05 03:33:27\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBANntzpaWY5YblYZCFdM7JjYF+ebUhijJis4W5LqCbz+LIsh1tMw3u1OQ\nQ9i5/08ANhHF9Ts4DG+JwZtbETeLm+VeGrfhWLap+YtCUsBpB9pkrsDf2ttftGBh\n3e1CJnbdu5fZTcDjlkiwhb9zvlHfhMYXcMirp74ELbTf/cAFIeHRAgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key w6u+2Q1GMtuMnrSsnnCAM9XVwEqzDeDFwTKFbq71ikI\np accept 1-65535\nid ed25519 V6A7rZh+TltoFa+s+1DEQXn/AiTSAi+EqX+qymdAa0A\n@last-listed 2026-08-05 03:33:27\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBALmBvOQvApdYCN+w5WjbxarL/qSqHWMXmVa+4nybQCYKrc8tv6QdVRna\nXKqrjYihAVfMS+CtgFxFXUvzRXAaqpcyXYKA1RZpKoEQL0r9PxkfDYkXvHWyQvZi\nbno5lbw9YXmYjQJMb3xobbQHyquIl9pX1d758kO1hOAMazOA1iELAgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key oL9bBVjF+0kf8CAgg86jKkRTl5otzvR9fiQs6tR3/00\nid ed25519 uElbVWA/dfFu0A0jsFNeAMXwAeBtYV4ouhFTrmpPb1g\n@last-listed 2026-08-05 03:33:27\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBAMEfdHnGMpF29Xw1FjsVYNDtYsYZT818qk1MwPQmCmOstI3KQ2jnEisy\njU/dPCy5k+rmklVtouFZFMYdQq9kqzdAom1o1BOQuzvxjc3L9lmgKCUEwNH47sQ8\nYsSECwSyO8NqIdisFuWwvVzK0ugDqhOtd8PwKSWYvHXK//PidkMjAgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key MsGfyAAD+iijk85YfLzuMrKaq5F0vyu/sQKBzS0Y5Aw\nid ed25519 NX0RMyjnFKhx0AN667UftPcVYB1+Y24nvbeJn2urtX4\n@last-listed 2026-08-05 03:33:27\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBAKl2QMe9mC2s7DJqo0afLdHqqd2hSFebu3GAVJMigbJlC3BSrtzO0QE4\nAlezWFm56bskLFv0jzfSGeZMRwe7hdXUWU9j9Dr9fI1QrqTxt4cuc/KyxQ5qGbdA\nLlR+paWTbv897XmOugb1MsPzZFHZtaguXj14op3O092Lxlv07zB7AgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key jYr6TKO0WcLs5ZAESRDRnBUZby7trew71zLN14tU4xo\np accept 1-65535\nid ed25519 xMF+13ZU5jupI1fCA0jyfH9ag44UV4xdPvl+laRA5JU\n@last-listed 2026-08-05 03:33:27\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBAKAT7VxZNf3DYvAKZjhDf7gjbqh/Nvmd1uSr5iaZTfqGmA83xvR0yYpt\n+LIQQL8dh22ddk/Qcgr358b5cadIjxN0kHOIyXQRrsLAJ7C87ZyGb6CIOws6YNNu\n7I4O9PM53mbUTx6syRA4pNYaKer8qYb/h8Ta/Kbscmsp1MlyTbjJAgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key Z13wziU1+K88BmUQXLljAnLd4cVBRPmmqDSL3KzfZwo\np accept 1-65535\nid ed25519 +evr6N+UILPDqgvG0z/PR4jQO57RWXOIzB+Pcns7YRM\n@last-listed 2026-08-05 03:33:57\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBANktaiaCmsblBkpQDvxuehPuAGprMKMsHPnJ4u3bXwbuaDpBiD7Y1pId\nzR3+37d0qcd0rVIeUXnaj2gkeZHuCuXsY9kq4TRWtZxcBtljsSv0capuaU4Mzvjc\nGZ0qiVI3lbxXQIiK2YatIZeP4bN+6wiuxXUGi+IU8IvpKhh5LrzpAgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key H1y8+GSriNZPNVPLm+cbS5wKHX6hDo2yuvMnmtUeZm8\np accept 1-65535\nid ed25519 0rk4nSkXcSrSBmWxgN1Zdv32y7xWbSleLr3F8ZWaTRI\n@last-listed 2026-08-05 03:33:57\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBAO5KkirtZ89Wooy72GT6OWY1V9WhxTYtyczCv2OpMpDs744tRiH1uwBV\n55/mGZTHlIFiA0OSKlLuaX97vK3JTVuZQcUO1KZYc8xCSls2a3aDXcun2RDT8zkg\nyaA53E8UINyrJeR7hn/KFj8HBytKw7o1oDjuxA2qxDgQfSCXY3N7AgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key 8HH7rkz6I2+ReOBlFogjQf1xCPkj2ffJ859EQKZj6Hs\np accept 1-65535\nid ed25519 fgkPeTN6FC4Z9PJ0l3Nnp4sG3dBUnvRzU/6Gc5rCuTE\n@last-listed 2026-08-05 03:33:57\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBAO/NuicLaCChsybUprBgCBdP2BrQbWwGDov92K07+rgUW+Oo+1FG0BWM\nmA4Mp+XJG60PjdX4klfal9IgXTq3qnROM7LZ/OeY7CzYjBfULWgEa/RYIFPfcjhW\nq7M7CfBQew3dJHsXftymeyW/ghWnRd8k94Jc+fevvS2r8kwbTLPHAgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key 3FYtwRiY3cnk4IHS8lOy/D1uy/+86Wv0WiswcUtjh3k\np accept 1-65535\nid ed25519 rDGgbAtgAzSnQH6PL0faKdtrog0lLvaWeOEYanyXLjQ\n@last-listed 2026-08-05 03:33:57\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBANS4SWAUIMrVTBxCbT9vT4bIows48mORHLZJJAONXr+S0lH6Jr+WoogX\nMMi1XgTRU+BHNtC7JRrwQHC7V3NvksiDgwYHV8rMVSkAnlVrGFi5Pv6UeDfy/fGu\nbAoJL/odCQI0RY0dxkd5VA5w4wZuzPlS6y6HiZV0DKvXJF7WZhIvAgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key ai5IX46Sox6fwgvdpk7s8wOgl9IiKlLa2oBz/YcXnSE\np accept 1-65535\nid ed25519 NnYqfIRN5i4R+Ef9ZSwpHYSATJek/7jEkJroCdWspBI\n@last-listed 2026-08-05 03:33:57\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBALmCQTqd1q1QuaGv02srHRBsztJdv4m1g5IYGqAyjcJKk2t1z2852iRW\njiRqTnbjZlCH6k/gzJJCjnXOuH8Y1OTfRAF7Cwuk4Lw/0csHQlsOUPTBGGnXlmnY\nZR/4F6dHlA5obzzv27ZcCDUfhyW93M2ygzX+5B76AnXSP+zyruZ9AgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key wSZ3N67RBVW+b6f+Pi4Ene90pGbVu1k+ntTu2QQv5kU\np accept 1-65535\nid ed25519 IEDxN3wNTrOew73MXyZjPNeJAMUbsfP45hYbKDH5tsk\n@last-listed 2026-08-05 03:34:36\nonion-key\n-----BEGIN RSA PUBLIC KEY-----\nMIGJAoGBAL9C97xm5v3lyqwH9ftno/baIlFwjaH3a8Xg28ZyNr7A4STgH/NaVa6/\nob3QhziOrV76uBaMzThdyUQp+thNGqJgjRm/3jntJOzi50AU/UAFUR9xpqIYkHWO\n+ttKWs+mg+HbEm5rJHkwzbDLQt99ijhTP9AO8k9ejDK1MYHBD9LpAgMBAAE=\n-----END RSA PUBLIC KEY-----\nntor-onion-key Ikp7Fy59qT2Yic+YRTCIFvRawDlUZfnwp+A1OVGY0UM\np accept 1-65535\nid ed25519 aMhiOzvrtOOfPwA/NUdMs9XiPL9IGOa4zSQEvcqbU/k\n",
+  "directoryNote": "The consensus and microdescriptors exactly as the client cached them. A test can then compute the ring from parsed directory data, which is what a client has, rather than from node key files, which it does not. The ed25519 identity the ring needs is in the microdescriptor's `id ed25519` line and is not in a microdesc consensus at all.",
   "produced_by": "packages/tor/tools/capture-hsdir.py",
   "note": "Indices and blinded keys are tor's own, logged by upload_descriptor_to_hsdir(). The time period is the one that makes them reproduce; a group that reproduces under no recorded SRV is dropped, which is expected for uploads older than the consensus's two shared random values.",
   "serviceIndexNote": "serviceIndex is computed here from the spec's formula rather than observed \u2014 tor does not log it. It is checked indirectly: the HSDirs tor chose must be the ones that follow these indices around the ring.",
   "consensus": {
-    "validAfter": "2026-08-05 03:36:00",
-    "freshUntil": "2026-08-05 03:36:20",
+    "validAfter": "2026-08-05 04:07:00",
+    "freshUntil": "2026-08-05 04:07:20",
     "votingIntervalSeconds": 20
   },
   "relays": [
@@ -77,69 +80,133 @@
   ],
   "cases": [
     {
-      "blindedKey": "53c81ce1a9d2e808ca9222a276ccbff8ccb2ddade21ddfd611d260bd8c803d41",
-      "timePeriod": 3720627,
+      "blindedKey": "98fd0dcff5f8a8a4a8b58d75555033c19dfd3bf690832fbf30764ce572d20930",
+      "timePeriod": 3720629,
       "periodLength": 8,
-      "srvName": "current",
-      "sharedRandomValue": "cf125aa3e8019853127b3bf3fd55e4116110243e5bff3fbb0173421a82c5556d",
-      "which": "next",
+      "srvName": "previous",
+      "sharedRandomValue": "1892ce40e333a44068daf18c2e16284eed5c19880edb7d0ab212a92ce02e93ab",
+      "which": "current",
       "serviceIndex": [
-        "9d3cfa4814db6bdb0e536ff0097e7fc31c068998f2c6cc8d2f8ef672afcba173",
-        "07eb42969fea82edc93a1512539ada7638a5d623a6a3c020ed10b2575a3e34c9"
+        "df408b1ae20379c067c6864307be4f48d2b85e95d01489ed4541bf1b2798d58f",
+        "f1e236d23d8a796f719d3116d7f3c395c466e08c52b024a13ded0ae8d25dd631"
       ],
       "hsdirs": [
         {
-          "nickname": "test005r",
-          "ed25519": "2040f1377c0d4eb39ec3bdcc5f26633cd78900c51bb1f3f8e6161b2831f9b6c9",
-          "relayIndex": "246d73c51d2d4fe9fb3796555d0774120ec369db5d556a7ecd00247d43bf9fd1",
-          "rsaFingerprint": "F3664838E0E77EC3D1817438905496FF4732EB0D"
-        },
-        {
-          "nickname": "test002a",
-          "ed25519": "059cd54294683a80c3a60e563044fca191d616928cd9290795198f9ec171b192",
-          "relayIndex": "50502a3bca093cbb38c6a7747570a045cba9dea2555fee06df3630257b852464",
-          "rsaFingerprint": "11B96625157D68E71DAE0396A8E086782447F4E7"
-        },
-        {
-          "nickname": "test000a",
-          "ed25519": "b8495b55603f75f16ed00d23b0535e00c5f001e06d615e28ba1153ae6a4f6f58",
-          "relayIndex": "5cd8ba46401f3fcd9c29d1fc907c971d2d6d8bc7bd0849202be7b6b8d4571997",
-          "rsaFingerprint": "36442B75866D35CF32AA93608A10C17820B35747"
-        },
-        {
-          "nickname": "test006r",
-          "ed25519": "f33a8005fa3fcc66d4af3f2d16815ef24f0299ded6b0b9bfa90d239f06a8860f",
-          "relayIndex": "5d597dc47d32651f71b376b2e42ec6d0f9f0c0e445003467688b4db273e259f6",
-          "rsaFingerprint": "8C00523008C4779D8114FF3CF25679F169837430"
-        },
-        {
-          "nickname": "test009r",
-          "ed25519": "f9ebebe8df9420b3c3aa0bc6d33fcf4788d03b9ed1597388cc1f8f727b3b6113",
-          "relayIndex": "ae27eafe578f4561e92e4f3bcfefdcb5044759361568d2f495544dee6c79b20a",
-          "rsaFingerprint": "9D257D5A5C642FB4F614C130EF6EA4C616E74BC7"
-        },
-        {
           "nickname": "test012r",
           "ed25519": "c4c17ed77654e63ba92357c20348f27c7f5a838e14578c5d3ef97e95a440e495",
-          "relayIndex": "d3245877a5d35fc66d1ccd8c2c1c19003543f1a044c2fa74f451ccf24fa682d6",
+          "relayIndex": "177c22aaad4fba2ba49e4da90689b970ce4fe0eef4eec78ab32c9e7666e5d0d5",
           "rsaFingerprint": "643E0432B73E59B7EE38B334D439F095C7AEC0B1"
         },
         {
-          "nickname": "test008r",
-          "ed25519": "7e090f79337a142e19f4f274977367a78b06ddd0549ef47353fe86739ac2b931",
-          "relayIndex": "d617703bb867b0326880ff33a92aabbcf20b4e21a70e4ace0e40ca12315dd371",
-          "rsaFingerprint": "71A9D28081F593BEB6B98CD332898E0ECABA140D"
+          "nickname": "test007r",
+          "ed25519": "ac31a06c0b600334a7407e8f2f47da29db6ba20d252ef69678e1186a7c972e34",
+          "relayIndex": "19db1b93ed256cdd2d0f6a010977fa559f6c3591ed6eec541663794865c480c1",
+          "rsaFingerprint": "B7E03485BCF644A32AF48B9D380BB738ADA9380D"
+        },
+        {
+          "nickname": "test003r",
+          "ed25519": "68c8623b3bebb4e39f3f003f35474cb3d5e23cbf4818e6b8cd2404bdca9b53f9",
+          "relayIndex": "1f150edf1090430fda5b5bb1d3e3698f98a7d62024c465b2e7ae92b319e53cbe",
+          "rsaFingerprint": "B14369643B5272D529F076EA22546D53C3F04BA4"
         },
         {
           "nickname": "test011r",
           "ed25519": "d2b9389d2917712ad20665b180dd5976fdf6cbbc566d295e2ebdc5f1959a4d12",
-          "relayIndex": "f3cbbe806ccd0b95d5283be6908c4fc8f2f376db9a7e01a91abb8de642293e32",
+          "relayIndex": "23c994cdfc29b5a65fd598c47dfea86824370dd02c69f87700d5b3b7eba24979",
           "rsaFingerprint": "85A4EF5F8438670A3F4EF4AB20FB0F94937E90BC"
+        },
+        {
+          "nickname": "test005r",
+          "ed25519": "2040f1377c0d4eb39ec3bdcc5f26633cd78900c51bb1f3f8e6161b2831f9b6c9",
+          "relayIndex": "4fbe25f7afb44d52acef914fdce452532a7ca7fd5736ae3b61692fc42b5c5ef9",
+          "rsaFingerprint": "F3664838E0E77EC3D1817438905496FF4732EB0D"
+        },
+        {
+          "nickname": "test010r",
+          "ed25519": "36762a7c844de62e11f847fd652c291d84804c97a4ffb8c4909ae809d5aca412",
+          "relayIndex": "507c66f04de440f7d54ae93564c79e20dad72057fe9c62a00a378db25697f476",
+          "rsaFingerprint": "0504133F44D5C56BC4CF597B8DA16021B1A74F11"
+        },
+        {
+          "nickname": "test009r",
+          "ed25519": "f9ebebe8df9420b3c3aa0bc6d33fcf4788d03b9ed1597388cc1f8f727b3b6113",
+          "relayIndex": "57d99f5f760f847b5e544af4a242bf4cedfc28711f0f403f4f247c5b77f6c416",
+          "rsaFingerprint": "9D257D5A5C642FB4F614C130EF6EA4C616E74BC7"
+        },
+        {
+          "nickname": "test006r",
+          "ed25519": "f33a8005fa3fcc66d4af3f2d16815ef24f0299ded6b0b9bfa90d239f06a8860f",
+          "relayIndex": "e01cb21cdaec04808ccf68bc44e19cf1e50ff5ed81e132870a82c216e5241a62",
+          "rsaFingerprint": "8C00523008C4779D8114FF3CF25679F169837430"
+        }
+      ]
+    },
+    {
+      "blindedKey": "b6e9c90709e465d3e9ebe2ac4eeb9de3507fd01e5c62b4808e8c02875580d3bc",
+      "timePeriod": 3720630,
+      "periodLength": 8,
+      "srvName": "current",
+      "sharedRandomValue": "c9f3ce0759fa6e318ed2e6909657dc5e5a3ed35bfdfe8ef1235b4a7d7bfcfe4c",
+      "which": "next",
+      "serviceIndex": [
+        "b2e14a9b46d0168d3055c3b835257173bbfd6880080b0f0985917fb6c1b6bf23",
+        "fa7bf5730229f0633663e103dc1c5c47302763539f1a4963a183c57d9094bbc3"
+      ],
+      "hsdirs": [
+        {
+          "nickname": "test003r",
+          "ed25519": "68c8623b3bebb4e39f3f003f35474cb3d5e23cbf4818e6b8cd2404bdca9b53f9",
+          "relayIndex": "1408c2c50a60048e9b7e095377162dc53b4c475f60bd513dc000cae7a605c446",
+          "rsaFingerprint": "B14369643B5272D529F076EA22546D53C3F04BA4"
+        },
+        {
+          "nickname": "test005r",
+          "ed25519": "2040f1377c0d4eb39ec3bdcc5f26633cd78900c51bb1f3f8e6161b2831f9b6c9",
+          "relayIndex": "1cd1e2ca96a0b84a49d629ecec2384a74706935c06e901eb556adfd1f5a3dc01",
+          "rsaFingerprint": "F3664838E0E77EC3D1817438905496FF4732EB0D"
+        },
+        {
+          "nickname": "test008r",
+          "ed25519": "7e090f79337a142e19f4f274977367a78b06ddd0549ef47353fe86739ac2b931",
+          "relayIndex": "2982bc9786a4ca2bc3aabb47301601f4310bc2c70e51a2cd58483ba657461db3",
+          "rsaFingerprint": "71A9D28081F593BEB6B98CD332898E0ECABA140D"
+        },
+        {
+          "nickname": "test002a",
+          "ed25519": "059cd54294683a80c3a60e563044fca191d616928cd9290795198f9ec171b192",
+          "relayIndex": "c3b8b77b0f180cead3f2aa2120852eb97c5ceee583017ce20c17729a9be2db09",
+          "rsaFingerprint": "11B96625157D68E71DAE0396A8E086782447F4E7"
+        },
+        {
+          "nickname": "test007r",
+          "ed25519": "ac31a06c0b600334a7407e8f2f47da29db6ba20d252ef69678e1186a7c972e34",
+          "relayIndex": "cd57b5be2063ae9ffce044d6217932450b2a84c767f568f78c720102ca4b6a58",
+          "rsaFingerprint": "B7E03485BCF644A32AF48B9D380BB738ADA9380D"
+        },
+        {
+          "nickname": "test011r",
+          "ed25519": "d2b9389d2917712ad20665b180dd5976fdf6cbbc566d295e2ebdc5f1959a4d12",
+          "relayIndex": "ced0eac4c91c8ffcf41d6333092d780b6ed933657ab6cfb5da8f35fd604e8ed9",
+          "rsaFingerprint": "85A4EF5F8438670A3F4EF4AB20FB0F94937E90BC"
+        },
+        {
+          "nickname": "test006r",
+          "ed25519": "f33a8005fa3fcc66d4af3f2d16815ef24f0299ded6b0b9bfa90d239f06a8860f",
+          "relayIndex": "fad4acdcb41c147f72ce054cd0a31c524e52256e4ae575b6df5e79b0a1894725",
+          "rsaFingerprint": "8C00523008C4779D8114FF3CF25679F169837430"
+        },
+        {
+          "nickname": "test000a",
+          "ed25519": "b8495b55603f75f16ed00d23b0535e00c5f001e06d615e28ba1153ae6a4f6f58",
+          "relayIndex": "ff8a70497c843b21f80b5248f78a5d4f9a5a8d49eba7377813acc62b0a8a16bf",
+          "rsaFingerprint": "36442B75866D35CF32AA93608A10C17820B35747"
         }
       ]
     }
   ],
   "droppedBlindedKeys": [
+    "36282934e0515aa758a028c60b81c31273398584c2dfbeb20df5cb78d104545b",
+    "53c81ce1a9d2e808ca9222a276ccbff8ccb2ddade21ddfd611d260bd8c803d41",
     "b87b6067c90739a0f47d203e808c79e7c4c76f4568d30f704694caeb6649ee41",
     "eccef8fd0fca402a6271b72401495115b004c0877277dca9ae04b98d03d40617"
   ]

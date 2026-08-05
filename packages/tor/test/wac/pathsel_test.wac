@@ -25,7 +25,9 @@ import { Relay, ExitPolicy } from "../../src/directory.wac";
  * cross that boundary. Nothing needed them to be separate; they are one record now.
  */
 Relay mk(string name, string addr, i32 bw, string[] flags) {
-  return Relay(name, u8[20](), addr, 9001, flags, "", bw, u8[32](), null, string[0]());
+  // The ed25519 identity is empty: path selection never uses it, and only the HSDir hash ring
+  // does. A relay here is deliberately not placeable on that ring.
+  return Relay(name, u8[20](), addr, 9001, flags, "", bw, u8[32](), u8[0](), null, string[0]());
 }
 
 string[] noFlags() { return string[]("Running", "Valid"); }
@@ -485,7 +487,7 @@ export string test_wge_is_zero_because_nobody_publishes_it() {
  * check ran, logged nothing, and protected nothing.
  */
 Relay withPolicy(string name, string[] flags, bool isAccept, i32[] ranges) {
-  return Relay(name, u8[20](), "10.0.0.1", 9001, flags, "", 1000, u8[32](),
+  return Relay(name, u8[20](), "10.0.0.1", 9001, flags, "", 1000, u8[32](), u8[0](),
                ExitPolicy(isAccept, ranges), string[0]());
 }
 
@@ -519,7 +521,7 @@ export string test_exits_anything_is_not_eligible_with_port_zero() {
   t.isFalse(exitsAnything(rejectSplit), "two ranges that abut still cover everything");
 
   Relay noSummary = Relay("none", u8[20](), "10.0.0.1", 9001, exitFlags(), "", 1000,
-                          u8[32](), null, string[0]());
+                          u8[32](), u8[0](), null, string[0]());
   t.isFalse(exitsAnything(noSummary), "a missing summary is a reject-all, not 'no policy'");
 
   Relay notAnExit = withPolicy("plain", noFlags(), true, i32[](1, 65535));

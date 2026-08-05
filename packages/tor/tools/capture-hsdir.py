@@ -163,8 +163,23 @@ def main(nodes_dir):
         sys.exit("no group of uploads could be reproduced from a recorded SRV; capture again "
                  "sooner after the service publishes")
 
+    # The consensus and microdescriptors as the client cached them, so a test can drive selection
+    # from *parsed* directory data rather than from key files — which is what a client actually has.
+    microdescs = ''
+    for name in ('cached-microdescs', 'cached-microdescs.new'):
+        f = client / name
+        if f.is_file():
+            microdescs += f.read_text(errors='replace')
+
     json.dump(dict(
         source="tor 0.4.7.13 on a local chutney hs-v3 network",
+        consensusDocument=consensus,
+        microdescriptors=microdescs,
+        directoryNote=("The consensus and microdescriptors exactly as the client cached them. A test "
+                       "can then compute the ring from parsed directory data, which is what a client "
+                       "has, rather than from node key files, which it does not. The ed25519 identity "
+                       "the ring needs is in the microdescriptor's `id ed25519` line and is not in a "
+                       "microdesc consensus at all."),
         produced_by="packages/tor/tools/capture-hsdir.py",
         note=("Indices and blinded keys are tor's own, logged by upload_descriptor_to_hsdir(). The "
               "time period is the one that makes them reproduce; a group that reproduces under no "

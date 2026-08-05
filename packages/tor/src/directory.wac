@@ -52,6 +52,16 @@ export struct Relay {
   /** Empty until a microdescriptor is matched up. */
   u8[] ntorOnionKey;
   /**
+   * The relay's ed25519 master identity, from its microdescriptor's `id ed25519` line. Empty until
+   * one is matched up, and empty for a relay that publishes none.
+   *
+   * **Not interchangeable with `identity` above.** That one is a SHA-1 digest of an RSA key and is
+   * what a consensus `r` line carries; this is a different key of a different length. The HSDir hash
+   * ring is computed over *this* one, and computing it over the RSA digest gives a complete,
+   * consistent ring that no service has ever published to.
+   */
+  u8[] ed25519Identity;
+  /**
    * Absent means the relay carries nothing, which is not the same as "no policy".
    *
    * A microdescriptor omits the `p` line when the relay exits nowhere, so a missing summary
@@ -154,7 +164,7 @@ export Relay[] parseConsensus(u8[] doc) {
       if (f.len() >= 8) {
         i32 port = parseInt(f[6]);
         relays.push(Relay(f[1], unpaddedBase64(f[2]), f[5], port < 0 ? 0 : port,
-                          string[0](), "", 0, u8[0](), null, string[0]()));
+                          string[0](), "", 0, u8[0](), u8[0](), null, string[0]()));
       }
     } else if (relays.len() > 0) {
       Relay r = relays.get(relays.len() - 1);
@@ -293,6 +303,12 @@ void fillFrom(Relay r, u8[] body) {
     if (lineStartsWith(body, at, end, "ntor-onion-key ")) {
       string[] f = fields(body, at, end);
       if (f.len() >= 2) { r.ntorOnionKey = unpaddedBase64(f[1]); }
+    } else if (lineStartsWith(body, at, end, "id ed25519 ")) {
+      // A relay's ed25519 master identity. Needed for the HSDir hash ring and for nothing else a
+      // client does, which is why it lives here rather than in the consensus parser: a microdesc
+      // consensus does not carry it at all.
+      string[] f = fields(body, at, end);
+      if (f.len() >= 3) { r.ed25519Identity = unpaddedBase64(f[2]); }
     } else if (lineStartsWith(body, at, end, "p ")) {
       u8[] line = u8[end - at]();
       for (i32 i = 0; i < line.len(); i++) { line[i] = body[at + i]; }
