@@ -37,7 +37,8 @@ import {
 } from "../../src/relaycert.wac";
 import { certCertifiedKey, certType } from "../../src/hsdesc.wac";
 import {
-  edDescriptorDigest, rsaDescriptorDigest, pastLineStarting,
+  edDescriptorDigest, rsaDescriptorDigest, pastLineStarting, pemBlock, publishedTime,
+  spacedFingerprint, b64Unpadded, rsaFingerprint, rsaPublicKeyDer,
 } from "../../src/routerdesc.wac";
 import { ed25519Verify } from "../../../crypto/src/ed25519.wac";
 
@@ -59,6 +60,15 @@ const i32 D_TEXT = 14;
 const i32 D_IDENTITY_CERT = 15;
 const i32 D_ROUTER_SIG = 16;
 const i32 D_RSA_RECOVER = 17;
+const i32 D_ONION_KEY_DER = 18;
+const i32 D_ONION_KEY_PEM = 19;
+const i32 D_FINGERPRINT_LINE = 20;
+const i32 D_PUBLISHED_LINE = 21;
+const i32 D_PUBLISHED_EPOCH = 22;
+const i32 D_NTOR_LINE = 23;
+const i32 D_SIGNING_N = 24;
+const i32 D_SIGNING_E = 25;
+const i32 D_SIGNING_KEY_DER = 26;
 
 u8[] arg1(i32 i) {
   u8[] a = u8[1]();
@@ -265,5 +275,78 @@ export string test_a_digest_span_stops_where_tor_stops(fn[u8[](i32, u8[], u8[])]
           "no keyword, no digest");
   t.eqI32(rsaDescriptorDigest("router nickname\n".toBytes()).len(), 0,
           "no keyword, no RSA digest");
+  return t.report();
+}
+
+export string test_a_pem_block_is_wrapped_the_way_tor_wraps_one(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(V_COUNT, none(), none())[0];
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] der = ref(D_ONION_KEY_DER, arg1(i), none());
+    u8[] want = ref(D_ONION_KEY_PEM, arg1(i), none());
+    string which = "descriptor " + itoa64(i as i64);
+
+    t.isTrue(der.len() > 100, which + ": the onion key decoded");
+    // Byte for byte against tor's own block: header, 64-character lines, the trailing newline on the
+    // last one, and the footer. Wrapping at 76 — RFC 2045's width, and most tools' default — would
+    // still be valid base64 and would change every byte after the first line.
+    t.eqBytes(pemBlock("RSA PUBLIC KEY", der), want,
+              which + ": our PEM block is the block tor wrote");
+  }
+
+  // Every line is at most 64 characters, checked directly rather than inferred from the comparison
+  // above, so a change in wrapping says which rule it broke.
+  u8[] der = ref(D_ONION_KEY_DER, arg1(0), none());
+  u8[] block = pemBlock("RSA PUBLIC KEY", der);
+  i32 run = 0;
+  i32 longest = 0;
+  for (i32 i = 0; i < block.len(); i++) {
+    if (block[i] == 10) {
+      if (run > longest) { longest = run; }
+      run = 0;
+    } else {
+      run = run + 1;
+    }
+  }
+  t.eqI32(run, 0, "the block ends with a newline");
+  t.isTrue(longest <= 64, "no line exceeds 64 characters");
+  return t.report();
+}
+
+export string test_the_field_formats_are_tors(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(V_COUNT, none(), none())[0];
+
+  for (i32 i = 0; i < n; i++) {
+    string which = "descriptor " + itoa64(i as i64);
+
+    // `published` — the descriptor writes UTC with no zone marker at all, so a generator using local
+    // time produces a document that verifies and describes the wrong moment.
+    i64 epoch = 0;
+    u8[] secs = ref(D_PUBLISHED_EPOCH, arg1(i), none());
+    for (i32 j = 0; j < 8; j++) { epoch = epoch * 256 + (secs[j] as i64); }
+    t.eqBytes(publishedTime(epoch).toBytes(), ref(D_PUBLISHED_LINE, arg1(i), none()),
+              which + ": our published line is tor's");
+
+    // `fingerprint` — SHA-1 of the DER RSAPublicKey, uppercase, in groups of four. The key comes from
+    // the descriptor's own `signing-key`, so this checks the digest and the formatting together.
+    u8[] nn = ref(D_SIGNING_N, arg1(i), none());
+    u8[] ee = ref(D_SIGNING_E, arg1(i), none());
+    t.eqI32(nn.len(), 128, which + ": the signing key is RSA-1024");
+    t.eqBytes(spacedFingerprint(rsaFingerprint(nn, ee)).toBytes(),
+              ref(D_FINGERPRINT_LINE, arg1(i), none()),
+              which + ": our fingerprint line is tor's");
+
+    // And the DER we re-encode is the DER tor published, so the fingerprint above is not agreeing by
+    // way of two compensating mistakes.
+    t.eqBytes(rsaPublicKeyDer(nn, ee), ref(D_SIGNING_KEY_DER, arg1(i), none()),
+              which + ": our RSAPublicKey encoding is tor's");
+
+    // `ntor-onion-key` — base64 with the padding stripped.
+    t.eqBytes(b64Unpadded(ref(V_NTOR, arg1(i), none())).toBytes(),
+              ref(D_NTOR_LINE, arg1(i), none()),
+              which + ": our ntor-onion-key line is tor's");
+  }
   return t.report();
 }

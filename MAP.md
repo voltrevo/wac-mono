@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-28 packages, 57,307 lines of wac, 1111 tests,
+28 packages, 57,364 lines of wac, 1117 tests,
 30 command-line programs and 4 browser pages.
 
 ## Packages
@@ -23,7 +23,7 @@ In dependency order: nothing here imports anything below it.
 | [`fmt`](packages/fmt/) | Numbers to and from text. | 1,194 | 25 | `bytes` |
 | [`gzip`](packages/gzip/) | gzip (RFC 1952) and DEFLATE (RFC 1951) written in wac. | 2,014 | 83 | `bytes` |
 | [`http`](packages/http/) | HTTP/1.1: parsing requests and responses, and writing both. | 914 | 27 | `bytes` |
-| [`platform`](packages/platform/) | A capability world for wac applications, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell… | 2,903 | 62 | `bytes` |
+| [`platform`](packages/platform/) | A capability world for wac applications, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell… | 2,903 | 66 | `bytes` |
 | [`stream`](packages/stream/) | Run a wac transform as a `ReadableStream`/`WritableStream` pair, so it consumes input as it arrives instead of taking the whole thing at once. | 97 | 14 | `bytes` `unicode` |
 | [`url`](packages/url/) | A WHATWG URL parser: parse, serialize, and resolve a reference against a base. | 1,229 | 27 | `bytes` `std` |
 | [`wacc`](packages/wacc/) | Porting the wac compiler to wac, so it can eventually compile itself. | 3,798 | 11 | `bytes` |
@@ -40,7 +40,7 @@ In dependency order: nothing here imports anything below it.
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,685 | 75 | `crypto` |
 | [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,997 | 33 | `bytes` `codec` `crypto` `datetime` `fmt` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`lightclient`](packages/lightclient/) | **The Altair sync protocol works. | 642 | 12 | `bls` `ssz` |
-| [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 8,249 | 164 | `bytes` `codec` `crypto` `datetime` `platform` `std` `tls` `wactest` |
+| [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 8,306 | 166 | `bytes` `codec` `crypto` `datetime` `fmt` `platform` `std` `tls` `wactest` |
 
 ## Programs
 

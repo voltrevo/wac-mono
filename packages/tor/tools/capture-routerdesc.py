@@ -49,11 +49,23 @@ def pem_hex(block):
     return base64.b64decode("".join(block)).hex()
 
 
+SIGNATURE_END = "-----END SIGNATURE-----\n"
+
+
 def descriptors(text):
-    starts = [m.start() for m in re.finditer(r"(?m)^router ", text)]
-    for i, start in enumerate(starts):
-        end = starts[i + 1] if i + 1 < len(starts) else len(text)
-        yield text[start:end]
+    """Each descriptor, from its `router` line to the end of its signature block.
+
+    Not "up to the next `router` line": tor's cache format puts *annotations* (`@uploaded-at`,
+    `@source`) before each descriptor, so slicing that way appends the next descriptor's annotations
+    to this one. `router_parse_entry_from_string` refuses the result unless annotations are explicitly
+    allowed — which is how this was found, by feeding a descriptor tor wrote back to tor's own parser
+    and having it rejected.
+    """
+    for m in re.finditer(r"(?m)^router ", text):
+        end = text.find(SIGNATURE_END, m.start())
+        if end < 0:
+            continue
+        yield text[m.start():end + len(SIGNATURE_END)]
 
 
 def field(desc, keyword):
