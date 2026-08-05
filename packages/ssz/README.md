@@ -106,6 +106,7 @@ forks, other configs) are far larger than the 1.7 MB that used to sit in the rep
 | set | cases | what |
 | --- | --- | --- |
 | `light_client_proofs` | 9 | 3 Merkle proofs into one `BeaconState`, for altair, deneb and electra |
+| `light_client_sync_altair_minimal` | 4 | sync-protocol cases: a bootstrap and a sequence of steps with per-step store assertions |
 | `ssz_static_altair_mainnet` | 45 | the nine containers an Altair light client touches, `mainnet` config |
 | `ssz_generic_valid` | 1,217 | `uints`, `boolean`, `bitlist`, `bitvector`, `basic_vector`, `containers` |
 
@@ -153,6 +154,27 @@ a knob in `tools/vendor.py`, set high.
 valuable half — a decoder that accepts a malformed offset is the bug that matters. They carry no
 expected root, only the requirement that decoding fails, so they need the decoder to exist first to be
 worth anything. Next after the encoder round-trips.
+
+## The sync-protocol vectors are vendored ahead of the client
+
+`light_client_sync_altair_minimal` holds the oracle for wac-mono **0064**, committed before the client
+exists because vendoring it was the hard half. The steps come from a restricted YAML with no parser
+available here, so `tools/vendor.py` grew one — and a hand-written parser that silently drops a step
+leaves a client passing a shorter test than it believes. Every `- ` step and every `key:` was
+cross-checked against the raw YAML: 10/10, 3/3, 5/5 and 1/1 steps, 96/96, 28/28, 50/50 and 10/10 keys.
+
+Two things that came free, each an independent check on layouts asserted elsewhere:
+
+- the bootstrap is **exactly 1,856 bytes**, which is minimal-config `112 + (32×48 + 48) + 5×32`. The
+  same container is 24,896 under mainnet, so this confirms both the snappy decode and that these
+  really are minimal-config objects.
+- an update is **exactly 2,268 bytes**, `112 + 1584 + 160 + 112 + 192 + 100 + 8`.
+
+**These are `minimal` config and that is not cosmetic.** `SYNC_COMMITTEE_SIZE` is 32 rather than 512,
+so `src/beacon.wac`'s mainnet table cannot drive them; a client checked against these needs a second
+descriptor table. The three `*_store_with_legacy_data` cases are excluded — they exercise
+`upgrade_store` across forks and need capella-and-later descriptors, which is a fork-support question
+rather than a sync-protocol one.
 
 ## What is left
 

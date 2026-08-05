@@ -14,6 +14,10 @@
     "light_client_proofs": {
       "sha256": "677af9636b31f7976b1d88658601b195e1f2c58e6beca0978a47612e7ef22aa9",
       "note": "9 cases: 3 Merkle proofs into one BeaconState, for altair, deneb and electra"
+    },
+    "light_client_sync_altair_minimal": {
+      "sha256": "29172c5681ed385f8cf7bf661c23aa0af087a250b64d1fde18a1c12fe857b2d3",
+      "note": "4 sync-protocol cases, minimal config (SYNC_COMMITTEE_SIZE 32); the 3 cross-fork *_store_with_legacy_data cases are excluded, they need capella+ descriptors"
     }
   }
 }

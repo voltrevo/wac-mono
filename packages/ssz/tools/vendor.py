@@ -297,7 +297,108 @@ def do_proofs() -> dict:
     }
 
 
+# The sync-protocol tests, which exist only in the `minimal` config — SYNC_COMMITTEE_SIZE 32 rather
+# than 512, so a client checked against them needs minimal-config descriptors as well as mainnet ones.
+#
+# **No directory listing.** Each case's `steps.yaml` names every update file it uses, so the file set
+# is derivable from two fetches rather than from the GitHub API — which is 60 requests an hour and was
+# exhausted once already by listing.
+SYNC_FORK = "altair"
+SYNC_CASES = [
+    "light_client_sync",
+    "light_client_sync_no_force_update",
+    "advance_finality_without_sync_committee",
+    "supply_sync_committee_from_past_update",
+    # The `*_store_with_legacy_data` cases are deliberately absent: they exercise `upgrade_store`
+    # across forks, which needs the capella/deneb/electra container descriptors this package does not
+    # have. Adding them is a fork-support question, not a sync-protocol one.
+]
+
+
+def parse_steps(text: str) -> list:
+    """The restricted YAML in `steps.yaml`: a list of one-key maps of nested scalar maps.
+
+    Hand-written because there is no pyyaml here, and targeted rather than general — every shape it
+    does not expect raises instead of guessing.
+
+    The one wrinkle is that a key may carry its value on the **following** line, indented under it
+    (`update:` then the filename), which is textually indistinguishable from the start of a nested map
+    until you look for a colon. Two attempts at resolving that during the walk both put the scalar in
+    the wrong map, so it is now removed by a **pre-pass** that folds such a line back onto its key.
+    Deciding it before parsing is what makes the parser itself trivial.
+    """
+    raw = [(len(r) - len(r.lstrip(" ")), r.strip()) for r in text.splitlines() if r.strip()]
+
+    # Pre-pass: `key:` followed by a deeper line with no colon is one `key: value`.
+    lines: list = []
+    i = 0
+    while i < len(raw):
+        indent, line = raw[i]
+        if (line.endswith(":") and not line.startswith("- ") and i + 1 < len(raw)
+                and raw[i + 1][0] > indent and ":" not in raw[i + 1][1]):
+            lines.append((indent, f"{line} {raw[i + 1][1]}"))
+            i += 2
+            continue
+        assert ":" in line, f"a value with no key: {line!r}"
+        lines.append((indent, line))
+        i += 1
+
+    steps: list = []
+    owner: dict = {}                     # indent -> the map that keys at that indent belong to
+    for indent, line in lines:
+        if line.startswith("- "):
+            key = line[2:]
+            assert key.endswith(":") and ":" not in key[:-1], f"unexpected step header {line!r}"
+            step = {"kind": key[:-1]}
+            steps.append(step)
+            owner = {indent: step}
+            continue
+        assert steps, f"content before any step: {line!r}"
+        parent_indent = max((d for d in owner if d < indent), default=None)
+        assert parent_indent is not None, f"orphan line at indent {indent}: {line!r}"
+        parent = owner[parent_indent]
+        key, _, val = line.partition(":")
+        key, val = key.strip(), val.strip()
+        if val == "":
+            child: dict = {}
+            parent[key] = child
+            owner[indent] = child
+        else:
+            parent[key] = val.strip("'\"")
+    return steps
+
+
+def do_sync() -> dict:
+    cases = []
+    for name in SYNC_CASES:
+        base = f"tests/minimal/{SYNC_FORK}/light_client/sync/pyspec_tests/{name}"
+        meta_text = fetch(f"{RAW}/{base}/meta.yaml").decode()
+        meta = {}
+        for line in meta_text.splitlines():
+            if ":" in line:
+                k, _, v = line.partition(":")
+                meta[k.strip()] = v.strip().strip("'\"")
+        steps = parse_steps(fetch(f"{RAW}/{base}/steps.yaml").decode())
+        assert steps, f"{name}: no steps parsed"
+
+        wanted = sorted({st["update"] for st in steps if "update" in st})
+        updates = {}
+        for u in wanted:
+            updates[u] = snappy_block(fetch(f"{RAW}/{base}/{u}.ssz_snappy")).hex()
+        bootstrap = snappy_block(fetch(f"{RAW}/{base}/bootstrap.ssz_snappy")).hex()
+        kinds = sorted({st["kind"] for st in steps})
+        print(f"  {name}: {len(steps)} steps {kinds}, {len(updates)} update(s), "
+              f"bootstrap {len(bootstrap)//2} bytes", file=sys.stderr)
+        cases.append({"case": name, "meta": meta, "steps": steps,
+                      "bootstrap": bootstrap, "updates": updates})
+    return {
+        "source": f"{REPO} @ {COMMIT[:12]}, minimal/{SYNC_FORK}/light_client/sync",
+        "cases": cases,
+    }
+
+
 BUILDERS = {
+    "light_client_sync_altair_minimal": lambda: do_sync(),
     "light_client_proofs": lambda: do_proofs(),
     "ssz_static_altair_mainnet": lambda: do_static(),
     "ssz_generic_valid": lambda: do_generic(tarball_path()),

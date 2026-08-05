@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-26 packages, 50,300 lines of wac, 1002 tests,
+26 packages, 50,300 lines of wac, 1006 tests,
 26 command-line programs and 4 browser pages.
 
 ## Packages
@@ -35,7 +35,7 @@ In dependency order: nothing here imports anything below it.
 | [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 4,049 | 45 | `crypto` |
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,567 | 45 | `bytes` `codec` `crypto` `platform` `sh` |
-| [`ssz`](packages/ssz/) | **Everything an Altair light client needs is done and checked against Ethereum's vectors. | 711 | 16 | `crypto` |
+| [`ssz`](packages/ssz/) | **Everything an Altair light client needs is done and checked against Ethereum's vectors. | 711 | 20 | `crypto` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,263 | 70 | `crypto` |
 | [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 4,053 | 32 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 4,301 | 109 | `bytes` `codec` `crypto` `datetime` `platform` `std` `tls` |
