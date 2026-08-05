@@ -214,6 +214,28 @@ most, because it puts their implementation on the far side of every seam.
 > circuit, which forces `EXTEND2` at the first hop, which is the thing that has never been exercised.
 > Cheap to try and it needs nothing new written.
 >
+> **Tried, and a request is not enough either.** Three SOCKS requests timed out and no relay was asked
+> to extend. tor says why, in its own words:
+>
+>     no exit nodes. Tor can only build internal paths, such as paths to onion services.
+>     Application request when we haven't received a consensus with exits.
+>     We need more descriptors: we have 0/3 ... (no exits in consensus, using mid) = 0% of path bw.
+>
+> Every relay we vote about carries `p reject 1-65535`, so the consensus contains no exit and tor will
+> not build a general path at all — it does not build one and fail at the end, it declines to start.
+> So `EXTEND2` needs one of:
+>
+>   - **an exit policy on one relay** (`accept 80,443` on its `p` line). tor would then build a
+>     three-hop path and send `EXTEND2`; the stream would fail at our exit, because `relayd` does not
+>     implement `RELAY_BEGIN` — but the extend would have happened, which is what is untested. Cheapest,
+>     and dishonest in the consensus only in the sense that the exit refuses every stream it is given.
+>   - **an onion service**, since "internal paths" are exactly what tor will still build. That is step 6,
+>     and it would exercise `EXTEND2` on the way.
+>
+> The second is the honest one and the first is the measurement. Note also `0/3 descriptors` in that
+> run where earlier two-relay runs fetched them — worth checking whether three descriptors in one
+> response exceeds something, before reading too much into the exit message.
+>
 > One hypothesis tested and **disproved**: that tor asked our relay for the consensus because our vote
 > flagged it `V2Dir`, which advertises a directory cache we do not run. Dropping `V2Dir` and `HSDir`
 > from the flags changed nothing — tor still sent `Downloading consensus from 127.0.0.1:5555` at the
