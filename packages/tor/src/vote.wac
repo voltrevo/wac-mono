@@ -36,6 +36,8 @@ import {
 } from "./routerdesc.wac";
 
 /** The text the signature is announced by: keyword and the one space the digest includes. */
+export u8[] signatureKeywordText() { return signatureKeyword(); }
+
 u8[] signatureKeyword() { return "directory-signature ".toBytes(); }
 
 /** The signed span: from the start of the document through `directory-signature ` inclusive. */

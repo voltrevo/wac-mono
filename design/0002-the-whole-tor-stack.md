@@ -151,7 +151,7 @@ much as the thing steps 2–6 each contribute a row to, and it is where a regres
 | 1 — RSA signing | **done** — `rsaSignPkcs1`, `rsaSignRawPkcs1`, byte-identical to node's |
 | 2 — onion service client | **done** — `src/hsconnect.wac` fetches a page from a real onion service over our own circuits |
 | 3 — relay | **a C tor client builds a circuit through it** — `src/relayd.wac`. EXTEND2 is parsed and refused, so it is a one-hop relay |
-| 4 — directory authority | **descriptor and key certificate done** — `src/routerdesc.wac` and `src/authcert.wac` generate both, and C tor's own parsers accept them, rejecting either if a signature, the certificate chain or a single body byte is disturbed. **the vote is done** — `src/vote.wac` builds one and C tor's `networkstatus_parse_vote_from_string` accepts it, which for a vote *includes verifying the signature*. Remaining: the consensus, and serving both |
+| 4 — directory authority | **descriptor and key certificate done** — `src/routerdesc.wac` and `src/authcert.wac` generate both, and C tor's own parsers accept them, rejecting either if a signature, the certificate chain or a single body byte is disturbed. **vote and consensus both build** — `src/vote.wac` and `src/consensus.wac`. C tor accepts the vote *including its signature* (a vote embeds its certificate); for the consensus tor checks structure only, so the signature is verified by node instead — see issue 0081. Remaining: serving them over a dir port, and a C tor client bootstrapping from ours |
 | 5 — the launcher | not started |
 | 6 — onion service host | not started |
 | 7 — the interop matrix | not started |

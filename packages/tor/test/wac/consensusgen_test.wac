@@ -1,0 +1,115 @@
+// The consensus document, against one tor found well-formed and node found correctly signed.
+//
+// See `consensus_wac.test.ts` for why the oracle is split in two, and why it has to be.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { AuthorityKeys } from "../../src/authcert.wac";
+import { ConsensusInfo, ConsensusVoter, consensusDocument } from "../../src/consensusgen.wac";
+import { RelayOpinion, signedLength, voteSignatureDigest } from "../../src/vote.wac";
+import { decode as b64decode } from "../../../codec/src/base64.wac";
+
+const i32 C_KEY = 0;
+const i32 C_STR = 1;
+const i32 C_NUM = 2;
+const i32 C_BYTES = 3;
+const i32 C_DESC = 4;
+const i32 C_CONSENSUS = 5;
+const i32 C_RECOVERED = 6;
+
+u8[] arg1(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+u8[] none() { return u8[0](); }
+
+i64 num(fn[u8[](i32, u8[], u8[])] ref, i32 which) {
+  u8[] b = ref(C_NUM, arg1(which), none());
+  i64 v = 0;
+  for (i32 i = 0; i < 8; i++) { v = v * 256 + (b[i] as i64); }
+  return v;
+}
+
+string str(fn[u8[](i32, u8[], u8[])] ref, i32 which) {
+  return string.fromBytes(ref(C_STR, arg1(which), none()));
+}
+
+u8[] build(fn[u8[](i32, u8[], u8[])] ref) {
+  AuthorityKeys k = AuthorityKeys(
+    ref(C_KEY, arg1(0), none()), ref(C_KEY, arg1(1), none()), ref(C_KEY, arg1(2), none()),
+    ref(C_KEY, arg1(3), none()), ref(C_KEY, arg1(4), none()), ref(C_KEY, arg1(5), none()));
+
+  ConsensusVoter[] voters = ConsensusVoter[1]();
+  voters[0] = ConsensusVoter(str(ref, 0), ref(C_BYTES, arg1(0), none()), str(ref, 1), str(ref, 2),
+                             num(ref, 0) as~ i32, num(ref, 1) as~ i32, str(ref, 3),
+                             ref(C_BYTES, arg1(1), none()));
+
+  ConsensusInfo info = ConsensusInfo(num(ref, 2) as~ i32, num(ref, 3), num(ref, 4), num(ref, 5),
+                                     num(ref, 6) as~ i32, num(ref, 7) as~ i32, str(ref, 6));
+
+  RelayOpinion[] relays = RelayOpinion[1]();
+  relays[0] = RelayOpinion(ref(C_DESC, none(), none()), str(ref, 4), num(ref, 8), str(ref, 5));
+
+  return consensusDocument(info, voters, relays, k);
+}
+
+export string test_the_consensus_tor_found_wellformed_is_reproduced(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  T t = T.create();
+  u8[] want = ref(C_CONSENSUS, none(), none());
+  t.isTrue(want.len() > 1200, "the committed consensus is a whole document");
+  t.eqBytes(build(ref), want, "the consensus tor parsed is what we build");
+  return t.report();
+}
+
+export string test_the_signature_is_over_the_span_and_by_the_signing_key(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  T t = T.create();
+  u8[] cons = build(ref);
+
+  // tor's parser cannot do this part — a consensus carries no certificate, so nothing in the document
+  // can check its signatures. node does it with the key that should have made it.
+  u8[] sig = signatureOf(cons);
+  t.isTrue(sig.len() >= 128, "the consensus carries a signature");
+  t.eqBytes(ref(C_RECOVERED, sig, none()), voteSignatureDigest(cons),
+            "the signing key signed our digest over the signed span");
+
+  // The span is the vote's span — same helper in tor, and `vote_wac.test.ts` pins it against a real
+  // chutney authority's own document, so this is not a rule invented here.
+  i32 end = signedLength(cons);
+  t.isTrue(end > 0, "the document announces its signature");
+  t.eqI32(cons[end - 1], 32, "the span ends on the space after directory-signature");
+
+  // The fingerprints naming the signer sit outside the span, as in a vote.
+  t.neI32(cons[end], 10, "the fingerprints follow the space");
+  return t.report();
+}
+
+/** The bytes of the last PEM SIGNATURE block, decoded from base64. */
+u8[] signatureOf(u8[] doc) {
+  u8[] begin = "-----BEGIN SIGNATURE-----\n".toBytes();
+  i32 at = -1;
+  for (i32 i = 0; i + begin.len() <= doc.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < begin.len(); j++) { if (doc[i + j] != begin[j]) { hit = false; break; } }
+    if (hit) { at = i + begin.len(); }
+  }
+  if (at < 0) { return u8[0](); }
+  u8[] end = "-----END SIGNATURE-----".toBytes();
+  i32 stop = at;
+  while (stop + end.len() <= doc.len()) {
+    bool hit = true;
+    for (i32 j = 0; j < end.len(); j++) { if (doc[stop + j] != end[j]) { hit = false; break; } }
+    if (hit) { break; }
+    stop = stop + 1;
+  }
+  u8[] packed = u8[stop - at]();
+  i32 n = 0;
+  for (i32 i = at; i < stop; i++) { if (doc[i] != 10) { packed[n] = doc[i]; n = n + 1; } }
+  u8[] text = u8[n]();
+  for (i32 i = 0; i < n; i++) { text[i] = packed[i]; }
+  u8[]? decoded = b64decode(text);
+  return decoded is null ? u8[0]() : decoded!;
+}

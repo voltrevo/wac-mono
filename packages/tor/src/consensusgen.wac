@@ -1,0 +1,166 @@
+// Building a consensus: what the authorities agree the network is, and the document a client
+// bootstraps from.
+//
+// The *reading* half is `consensus.wac`, which decides whether to believe one. This is the writing
+// half, and the two are deliberately separate files: a client needs the reader and never the writer,
+// and an authority's own output must not be validated by the code that produced it.
+//
+// Built on `vote.wac`, because the two documents share the machinery that matters — the same signed
+// span, the same router status entries in the same order. What differs is structure, and the
+// differences are not the ones a reader guesses from having seen a vote:
+//
+//   - `consensus-method` is singular where a vote lists `consensus-methods` it would accept.
+//   - There is no `published` line. A vote says when it was made; a consensus only says when it applies.
+//   - `known-flags` comes **before** the `recommended-*` and `required-*` lines. In a vote it comes
+//     after them. Same keywords, opposite order, and tor's parser accepts either order in neither
+//     document — the order is part of the format.
+//   - Each authority contributes a `dir-source` / `contact` / **`vote-digest`** triple, the last being
+//     the digest of the vote it cast. A vote has one dir-source and no vote-digest.
+//   - No certificate is embedded. A vote carries its own so it can be verified alone; a consensus
+//     cannot, because its signatures come from authorities whose certificates a client fetches
+//     separately. This is exactly why `networkstatus_parse_vote_from_string` verifies a vote's
+//     signature and not a consensus's — see wac-mono issue 0081.
+//   - `w` lines carry `Unmeasured=1` where no bandwidth authority has measured the relay, and status
+//     entries carry no `id` line in a consensus this method produces.
+//   - The footer holds `bandwidth-weights` and then one `directory-signature` per signing authority,
+//     all over the same digest — the span ends at the *first* one.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { itoa, itoa64 } from "../../fmt/src/itoa.wac";
+import { rsaSignRawPkcs1 } from "../../crypto/src/rsa.wac";
+import { AuthorityKeys, plainFingerprint } from "./authcert.wac";
+import { pemBlock, publishedTime, rsaFingerprint } from "./routerdesc.wac";
+import {
+  RelayOpinion, signatureKeywordText, signedLength, sortedStatusEntries, voteSignatureDigest,
+} from "./vote.wac";
+
+/** One authority's contribution to the consensus, as the document records it. */
+export struct ConsensusVoter {
+  string nickname;
+  u8[] identityDigest;      // 20 bytes
+  string address;
+  string ip;
+  i32 dirPort;
+  i32 orPort;
+  string contact;
+  u8[] voteDigest;          // 20 bytes: the digest of the vote this authority cast
+}
+
+/** The period and the method. */
+export struct ConsensusInfo {
+  i32 consensusMethod;
+  i64 validAfter;
+  i64 freshUntil;
+  i64 validUntil;
+  i32 voteSeconds;
+  i32 distSeconds;
+  string bandwidthWeights;
+}
+
+/**
+ * A consensus, signed by one authority.
+ *
+ * One signature because a testnet of one authority is what this is for; the format takes any number,
+ * all over the same digest, and adding more is appending more blocks after this one's.
+ *
+ * Empty if the signature cannot be made or a relay's descriptor is unusable.
+ */
+export u8[] consensusDocument(
+  ConsensusInfo info, ConsensusVoter[] voters, RelayOpinion[] relays, AuthorityKeys signer
+) {
+  u8[] identityFp = rsaFingerprint(signer.identityN, signer.identityE);
+  u8[] signingFp = rsaFingerprint(signer.signingN, signer.signingE);
+  if (identityFp.len() != 20 || signingFp.len() != 20) { return u8[0](); }
+
+  Buf d = Buf.create();
+  d.pushAll("network-status-version 3\n".toBytes());
+  d.pushAll("vote-status consensus\n".toBytes());
+  d.pushAll(("consensus-method " + itoa(info.consensusMethod) + "\n").toBytes());
+  d.pushAll(("valid-after " + publishedTime(info.validAfter) + "\n").toBytes());
+  d.pushAll(("fresh-until " + publishedTime(info.freshUntil) + "\n").toBytes());
+  d.pushAll(("valid-until " + publishedTime(info.validUntil) + "\n").toBytes());
+  d.pushAll(("voting-delay " + itoa(info.voteSeconds) + " " + itoa(info.distSeconds) +
+             "\n").toBytes());
+  // Empty and still present, with the trailing space a real consensus has: the keyword asserts that
+  // the authorities agreed on no recommendation, which is not the same as saying nothing.
+  d.pushAll("client-versions \n".toBytes());
+  d.pushAll("server-versions \n".toBytes());
+  d.pushAll(("known-flags " + CONSENSUS_FLAGS + "\n").toBytes());
+  d.pushAll(("recommended-client-protocols " + CLIENT_PROTOCOLS + "\n").toBytes());
+  d.pushAll(("recommended-relay-protocols " + RELAY_PROTOCOLS + "\n").toBytes());
+  d.pushAll(("required-client-protocols " + REQUIRED_CLIENT + "\n").toBytes());
+  d.pushAll(("required-relay-protocols " + RELAY_PROTOCOLS + "\n").toBytes());
+
+  for (i32 i = 0; i < voters.len(); i++) {
+    ConsensusVoter v = voters[i];
+    if (v.identityDigest.len() != 20 || v.voteDigest.len() != 20) { return u8[0](); }
+    d.pushAll(("dir-source " + v.nickname + " " + plainFingerprint(v.identityDigest) + " " +
+               v.address + " " + v.ip + " " + itoa(v.dirPort) + " " + itoa(v.orPort) +
+               "\n").toBytes());
+    d.pushAll(("contact " + v.contact + "\n").toBytes());
+    d.pushAll(("vote-digest " + plainFingerprint(v.voteDigest) + "\n").toBytes());
+  }
+
+  u8[][] descriptors = u8[][relays.len()]();
+  for (i32 i = 0; i < relays.len(); i++) { descriptors[i] = relays[i].descriptor; }
+  u8[][] lines = sortedStatusEntries(descriptors);
+  for (i32 i = 0; i < lines.len(); i++) {
+    if (lines[i].len() == 0) { return u8[0](); }
+    RelayOpinion r = opinionFor(relays, lines[i]);
+    d.pushAll(lines[i]);
+    d.push(10);
+    d.pushAll(("s " + r.flags + "\n").toBytes());
+    d.pushAll(("v Tor " + TOR_VERSION + "\n").toBytes());
+    d.pushAll(("pr " + RELAY_SUBPROTOCOLS + "\n").toBytes());
+    // Unmeasured, because nothing here runs a bandwidth authority. Saying so is the honest form; a
+    // consensus that omitted it would claim the number came from a measurement.
+    d.pushAll(("w Bandwidth=" + itoa64(r.bandwidth) + " Unmeasured=1\n").toBytes());
+    d.pushAll(("p " + r.exitPolicy + "\n").toBytes());
+  }
+
+  d.pushAll("directory-footer\n".toBytes());
+  d.pushAll(("bandwidth-weights " + info.bandwidthWeights + "\n").toBytes());
+
+  d.pushAll(signatureKeywordText());
+  u8[] digest = voteSignatureDigest(d.bytes());
+  if (digest.len() != 20) { return u8[0](); }
+  d.pushAll((plainFingerprint(identityFp) + " " + plainFingerprint(signingFp) + "\n").toBytes());
+  u8[] sig = rsaSignRawPkcs1(signer.signingN, signer.signingD, digest);
+  if (sig.len() == 0) { return u8[0](); }
+  d.pushAll(pemBlock("SIGNATURE", sig));
+
+  return d.bytes();
+}
+
+/** The opinion whose descriptor produced `line`. */
+RelayOpinion opinionFor(RelayOpinion[] relays, u8[] line) {
+  for (i32 i = 0; i < relays.len(); i++) {
+    u8[] want = sortedStatusEntries(oneDescriptor(relays[i].descriptor))[0];
+    if (want.len() == line.len() && same(want, line)) { return relays[i]; }
+  }
+  return relays[0];
+}
+
+u8[][] oneDescriptor(u8[] d) {
+  u8[][] out = u8[][1]();
+  out[0] = d;
+  return out;
+}
+
+bool same(u8[] a, u8[] b) {
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+/** `NoEdConsensus` appears here and not in a vote: it is a thing authorities can fail to agree on. */
+const string CONSENSUS_FLAGS =
+  "Authority Exit Fast Guard HSDir NoEdConsensus Running Stable StaleDesc Sybil V2Dir Valid";
+const string TOR_VERSION = "0.4.7.13";
+const string CLIENT_PROTOCOLS =
+  "Cons=2 Desc=2 DirCache=2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 Microdesc=2 Relay=2";
+const string RELAY_PROTOCOLS =
+  "Cons=2 Desc=2 DirCache=2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 LinkAuth=3 Microdesc=2 Relay=2";
+const string REQUIRED_CLIENT = "Cons=2 Desc=2 Link=4 Microdesc=2 Relay=2";
+const string RELAY_SUBPROTOCOLS =
+  "Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 " +
+  "LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4";
