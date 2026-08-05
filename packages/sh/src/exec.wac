@@ -387,9 +387,12 @@ void runAndOr(Shell sh, AndOr list) {
  * unchanged and still correct.
  */
 void runPipeline(Shell sh, Pipeline pipeline) {
+  // `streamPipeline` answers false for a world that cannot spawn at all, which is not a failure of
+  // the pipeline: the sequential path below runs the same stages in process, which is what a browser
+  // tab did before a page could spawn. Nothing has started when it answers that, so falling through
+  // runs each stage exactly once.
   if (canStream(sh, pipeline)) {
-    streamPipeline(sh, pipeline);
-    return;
+    if (streamPipeline(sh, pipeline)) { return; }
   }
   u8[] carried = u8[0]();
   for (i32 i = 0; i < pipeline.stages.len(); i++) {
@@ -455,7 +458,7 @@ bool canStream(Shell sh, Pipeline pipeline) {
  * The status of a pipeline is its last stage's, as in bash. A stage stopped early has no status worth
  * reading, and its own exit code is discarded rather than reported as a failure of the script.
  */
-void streamPipeline(Shell sh, Pipeline pipeline) {
+bool streamPipeline(Shell sh, Pipeline pipeline) {
   i32 n = pipeline.stages.len();
 
   // Spawn them all, first to last, expanding each stage's arguments as it goes. Expansion happens
@@ -472,22 +475,24 @@ void streamPipeline(Shell sh, Pipeline pipeline) {
       stopAll(sh, outH, errH, n);
       sh.err("sh: a pipeline stage expanded to nothing\n".toBytes());
       sh.status = 1;
-      return;
+      return true;
     }
-    u8[][] args = u8[][argv.len()](fill: u8[0]());
-    for (i32 a = 0; a < argv.len(); a++) { args[a] = argv.get(a).toBytes(); }
-    // The first stage could inherit the shell's input, and deliberately does not: this loop `send`s
-    // to every stage, including the first, and a stage reading the real descriptor *as well* would
-    // race the shell for the same bytes. Feeding it is what makes the pipeline one shape.
-    Child kid = sh.cli
-      .spawnSelf(args, GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV, sh.cwd, false).wait();
+    Child kid = spawnStage(sh, argv);
+    if (kid.unavailable()) {
+      // No `spawn` in this world. Nothing has been started — this is the first stage, since every
+      // stage asks the same world — so the caller can run the pipeline sequentially instead. Reporting
+      // 126 here would hide sixty working applets behind a capability the world never had, which is
+      // the mistake `trySpawn`'s own `unavailable` check exists to avoid.
+      stopAll(sh, outH, errH, n);
+      return false;
+    }
     if (kid.handle < 0) {
       // Whatever started before this must not be left running: they would write into nothing and
       // their workers would outlive the script.
       stopAll(sh, outH, errH, n);
-      sh.err(("sh: " + string.fromBytes(args[0]) + ": " + kid.error + "\n").toBytes());
+      sh.err(("sh: " + argv.get(0) + ": " + kid.error + "\n").toBytes());
       sh.status = 126;
-      return;
+      return true;
     }
     outH[i] = kid.handle;
     errH[i] = kid.errHandle;
@@ -590,6 +595,44 @@ void streamPipeline(Shell sh, Pipeline pipeline) {
     if (errH[i] >= 0) { sh.cli.closeSocket(errH[i]); }
   }
   sh.status = status;
+  return true;
+}
+
+/**
+ * One stage of a streaming pipeline: the program `$WACPATH` names if there is one, otherwise this
+ * bundle's own applet of that name.
+ *
+ * **The order matters and it is the sequential path's.** `trySpawn` looks along `$WACPATH` before
+ * `trySelf` offers the shell's own, so `WACPATH=dir; wc f` runs the `wc` in `dir`. A streaming
+ * pipeline that always ran its own would answer differently only when a pipe was involved:
+ * `WACPATH=dir; seq 1 5 | wc | rev` printed this shell's column format where the same programs
+ * outside a pipeline printed the external's. Two tests in `test/spawn.test.ts` caught exactly that.
+ *
+ * A `$WACPATH` file that cannot be read falls through to the shell's own, as `trySpawn` does; one that
+ * reads and will not start is returned as the failed child it is, and the caller reports 126.
+ */
+Child spawnStage(Shell sh, Vec<string> argv) {
+  i32 grants = GRANT_READ | GRANT_WRITE | GRANT_NET | GRANT_ENV;
+  string name = argv.get(0);
+  string where = containsSlash(name) ? name : searchWacPath(sh, name);
+  if (where != "") {
+    FileResult prog = sh.cli.readFile(sh.resolve(where)).wait();
+    if (prog.ok) {
+      // Without argv[0]: a spawned bundle is one program, and its `arg(0)` is its first argument.
+      // `spawnSelf` below keeps argv[0], because that is what tells this bundle which applet to be.
+      u8[][] outer = u8[][argv.len() - 1](fill: u8[0]());
+      for (i32 i = 1; i < argv.len(); i++) { outer[i - 1] = argv.get(i).toBytes(); }
+      Child external = sh.cli
+        .spawn(string.fromBytes(prog.bytes), outer, grants, sh.cwd, false).wait();
+      if (!external.unavailable()) { return external; }
+    }
+  }
+  u8[][] args = u8[][argv.len()](fill: u8[0]());
+  for (i32 i = 0; i < argv.len(); i++) { args[i] = argv.get(i).toBytes(); }
+  // The first stage could inherit the shell's input, and deliberately does not: the caller `send`s to
+  // every stage, including the first, and a stage reading the real descriptor *as well* would race the
+  // shell for the same bytes. Feeding it is what makes the pipeline one shape.
+  return sh.cli.spawnSelf(args, grants, sh.cwd, false).wait();
 }
 
 /** Stop one stage and stop reading it: it has nowhere to write, so it is finished whether or not it agrees. */

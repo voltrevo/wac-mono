@@ -1,9 +1,10 @@
-# 0070 — box's applet test spawns a binary that is sometimes still open for writing
+# 0074 — box's applet test spawns a binary that is sometimes still open for writing
 
 - **Status:** open
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-b
-- **Date:** 2026-08-05
+- **Date:** 2026-08-05 (filed as 0070; renumbered same day — that number was already taken
+  by a redirection issue that was pushed first)
 - **Kind:** bug
 - **Symptom:** flake — reddens the shared suite for whoever is pushing
 

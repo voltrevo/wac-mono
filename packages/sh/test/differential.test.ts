@@ -75,6 +75,14 @@ const CASES: string[] = [
   `echo hello | rev`,
   `echo hello | wc -l`,
   `seq 1 5 | wc -l`,
+  // More than one count, which GNU right-aligns in columns seven wide when it cannot know the size
+  // of its input in advance. Every `wc` case here asked for a single count until this one, and every
+  // `wc` case with a file was small enough that GNU's width was 1 — so a `wc` that printed one space
+  // between counts agreed with bash on all of them and with none of these.
+  `printf 'a b\nc\n' | wc`,
+  `echo hi | wc -lwc`,
+  `printf 'a\n' | wc -lc`,
+  `seq 1 5 | wc -lw`,
   `seq 1 5 | head -n 2`,
   `seq 1 5 | tail -n 2`,
   `seq 1 10 | grep 1`,
@@ -836,6 +844,12 @@ for (const [i, script] of [
   // script reads as "no match" rather than "the file was never opened".
   `printf 'a\nb\n' > f; wc -l f`,
   `printf 'a\nb\n' > f; wc f`,
+  // A file big enough for the column width to be visible: GNU takes it from the digits of the total
+  // size, so these are six wide where the two-line files above are one.
+  `seq 1 20000 > f; wc f`,
+  `seq 1 20000 > f; wc -l f`,
+  `seq 1 20000 > f1; echo x > f2; wc f1 f2`,
+  `seq 1 20000 > f1; echo x > f2; wc -lw f1 f2`,
   `printf 'a\nb\n' > f; wc -l < f`,             // and no name, when it is standard input
   `printf 'a\nb\n' > f; wc -l - < f`,           // …but `-` keeps its name, as GNU prints it
   `printf 'a\nb\n' > f; head -1 f`,

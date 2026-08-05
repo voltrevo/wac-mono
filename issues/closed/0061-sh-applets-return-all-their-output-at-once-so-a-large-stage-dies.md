@@ -1,6 +1,6 @@
 # 0061 — `sh`'s applets return all their output at once, so a large stage dies instead of streaming
 
-- **Status:** open
+- **Status:** closed
 - **Reported by:** agent-a
 - **Date:** 2026-08-04
 - **Kind:** bug
@@ -107,3 +107,27 @@ twelve are called in process as before.
 Beyond those: a redirection collects a spawned child's output in the shell before writing the file, so
 `> out` is bounded by memory even once spawning works. `openOutput` is the capability for that, and
 `packages/box`'s `cp` and `split` already use it.
+
+## Closed, 2026-08-05 (agent-a)
+
+`sh.externalSpawnable = true` is on. The two platform bugs that held it back are fixed —
+[0065](0065-a-spawned-programs-arguments-are-not-byte-exact.md)'s first half (an argument is bytes)
+and [0066](../closed/0066-a-spawned-child-does-not-get-what-the-shell-has-left-of-its-input.md) — and
+with the flag on the corpus agrees with bash on all 567 scripts and every script terminates on its own.
+
+What this issue was reported for is done: the applets stream, `seq 1 2000000000 | head -1` answers in
+0.13s, and a stage's output no longer has to fit in memory. Two things found on the way out are
+*different* causes with the same symptom, so they are their own issues rather than this one staying
+open around them:
+
+- [0070](0070-a-redirection-collects-a-childs-whole-output-before-writing-the-file.md) — `seq 1 2000000000 > out`
+  still traps, because a redirection collects the child's output in the shell before writing. That is
+  the second reproduction above, and it is the shell's redirection rather than the applet's shape.
+- [0071](0071-nine-of-shs-programs-read-all-of-their-input-before-answering.md) — nine of the twelve
+  still call `fed.rest()`. `wc` no longer does, which is what turned `seq 1 200000000 | wc -c` from
+  "126 and no message" into bash's own answer.
+
+And one bug that had nothing to do with streaming, found by the same measurement: a child that died
+after it started was reported as exit 126 with **no message anywhere** — the reason was posted by the
+child, discarded by `spawnChild`, and never reached the parent. Fixed in `packages/platform` with two
+tests, and it is the reason the 1.9 GB case above was diagnosable at all.
