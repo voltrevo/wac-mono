@@ -150,8 +150,8 @@ much as the thing steps 2–6 each contribute a row to, and it is where a regres
 |---|---|
 | 1 — RSA signing | **done** — `rsaSignPkcs1`, `rsaSignRawPkcs1`, byte-identical to node's |
 | 2 — onion service client | **done** — `src/hsconnect.wac` fetches a page from a real onion service over our own circuits |
-| 3 — relay | **in progress** — certificates, the responder handshake, CREATE2 and EXTEND2 all done and tested. What remains is the program with the sockets in it |
-| 4 — directory authority | not started |
+| 3 — relay | **a C tor client builds a circuit through it** — `src/relayd.wac`. EXTEND2 is parsed and refused, so it is a one-hop relay |
+| 4 — directory authority | **started on its prerequisite** — a router descriptor needs `ntor-onion-key-crosscert`, so proposal 228's curve25519↔ed25519 conversion is done and pinned against tor (`ed25519.wac`, `routerdesc_test.wac`). The descriptor generator itself is not written |
 | 5 — the launcher | not started |
 | 6 — onion service host | not started |
 | 7 — the interop matrix | not started |

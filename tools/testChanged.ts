@@ -17,7 +17,9 @@
 // Changed means "against `origin/master`, plus whatever is uncommitted", so it covers the file you
 // are editing right now as well as the branch you are on.
 
-import { SUITE_ENV } from "./suiteGuard.ts";
+import { refuseIfNested, SUITE_ENV } from "./suiteGuard.ts";
+
+refuseIfNested("deno task test:changed");
 
 
 const SHARED = ["harness/", "tools/", "deno.json", "wac-version.json", "import_map.json"];

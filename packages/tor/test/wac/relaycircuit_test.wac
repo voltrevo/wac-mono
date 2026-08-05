@@ -21,6 +21,7 @@ import {
   Created, Inbound, answerCreate2, create2Handshake, created2Cell, destroyCell,
   receiveFromClient, sendToClient, HOP_KEY_LEN, NTOR_REQUEST_LEN, NTOR_REPLY_LEN,
   DESTROY_PROTOCOL, Extend, parseExtend2, extendTarget, extendIdentity, extended2Body,
+  kdfTor, answerCreateFast, CREATE_FAST_LEN,
   LS_IPV4, LS_IPV6, LS_LEGACY_IDENTITY, LS_ED25519_IDENTITY,
 } from "../../src/relaycircuit.wac";
 import { ntorClientRequest, ntorClientFinish } from "../../src/ntor.wac";
@@ -332,4 +333,91 @@ export string test_an_extend2_that_is_malformed_is_refused() {
   t.eqI32(extendIdentity(decoy).len(), 0, "and no identity is invented from the decoy");
   t.eqI32(extended2Body(u8[0]()).len(), 0, "and an empty reply makes no EXTENDED2");
   return t.report();
+}
+
+export string test_create_fast_agrees_with_kdf_tor() {
+  // KDF-TOR is a SHA-1 counter chain over `X | Y`. The expected values below were computed with
+  // Python's hashlib, so they are an independent answer rather than a round trip — and they have to
+  // be, because a wrong KDF here produces a circuit both ends agree on and no real client can use.
+  //
+  // The layout is KH, Df, Db, Kf, Kb: 20, 20, 20, 16, 16. `KH` goes back in the reply to prove the
+  // relay derived the same key, and the remaining 72 bytes are an ordinary hop.
+  T t = T.create();
+  u8[] x = u8[20]();
+  u8[] y = u8[20]();
+  for (i32 i = 0; i < 20; i++) {
+    x[i] = (i * 7 + 1) & 0xFF;
+    y[i] = (i * 11 + 3) & 0xFF;
+  }
+  u8[] k0 = u8[40]();
+  for (i32 i = 0; i < 20; i++) { k0[i] = x[i]; }
+  for (i32 i = 0; i < 20; i++) { k0[20 + i] = y[i]; }
+
+  u8[] k = kdfTor(k0, 92);
+  t.eqI32(k.len(), 92, "KH, Df, Db, Kf, Kb");
+  t.isTrue(same(slice(k, 0, 20), hexBytes("75b3852b0170087ed080a8a96147791f47e46423")),
+           "KH agrees with an independently computed KDF-TOR");
+  t.isTrue(same(slice(k, 20, 40), hexBytes("9296d9bd66de03163a7191c588020feeee3f04eb")),
+           "and so does Df");
+  t.isTrue(same(slice(k, 60, 76), hexBytes("a2429f1a2281bff1ad72ecd550bb24f1")),
+           "and Kf");
+
+  // The reply is `Y | KH`, and the hop's keys are what follows KH.
+  Created answer = answerCreateFast(9, x, y);
+  t.isTrue(answer.cell.len() > 0, "a CREATED_FAST was produced");
+  t.eqI32(cellCircId(answer.cell, 0), 9, "on the right circuit");
+  u8[] payload = cellPayload(answer.cell, 0);
+  t.isTrue(same(slice(payload, 0, 20), y), "Y comes first");
+  t.isTrue(same(slice(payload, 20, 40), slice(k, 0, 20)),
+           "then KH, which is what proves we derived the same key");
+
+  // Every input matters, and a wrong width is refused rather than padded.
+  t.isFalse(same(cellPayload(answerCreateFast(9, x, x).cell, 0), payload), "Y is part of the key");
+  t.eqI32(answerCreateFast(9, x, u8[19]()).cell.len(), 0, "a 19-byte Y is refused");
+  t.eqI32(answerCreateFast(9, u8[19](), y).cell.len(), 0, "and a 19-byte X");
+
+  // The counter really counts: a KDF that reused block zero would give identical 20-byte runs.
+  t.isFalse(same(slice(k, 0, 20), slice(k, 20, 40)), "the blocks differ, so the counter advances");
+  t.isFalse(same(slice(k, 20, 40), slice(k, 40, 60)), "and keeps advancing");
+
+  // **And the hop it produced carries cells.** Checking only the cell left the hop untested, and
+  // two plants proved it: taking the hop's keys from KH rather than from what follows it, and
+  // building the hop unreversed, both survived. A client's side of the same handshake is the other
+  // end of the exchange.
+  u8[] clientKeys = slice(k, 20, 92);
+  Hop clientHop = Hop.create(clientKeys);
+  i32 bad = 0;
+  for (i32 n = 0; n < 3; n++) {
+    u8[] out = fill(60 + n, 40 + n);
+    Inbound got = receiveFromClient(answer.hop, encryptRelay(clientHop, relayData(), 5 + n, out));
+    if (!got.recognized) { bad = bad + 1; }
+    if (!same(got.data, out)) { bad = bad + 1; }
+    u8[] back = fill(30 + n, 50 + n);
+    u8[] cell = sendToClient(answer.hop, 9, relayData(), 5 + n, back);
+    u8[] body = decryptRelay(clientHop, cellPayload(cell, 0));
+    if (!relayRecognized(clientHop, body)) { bad = bad + 1; }
+    if (!same(relayPayload(body), back)) { bad = bad + 1; }
+  }
+  t.eqI32(bad, 0, "three cells each way over a CREATE_FAST circuit");
+  return t.report();
+}
+
+u8[] hexBytes(string hex) {
+  u8[] h = hex.toBytes();
+  u8[] out = u8[h.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) {
+    out[i] = (nib(h[i * 2]) * 16) + nib(h[i * 2 + 1]);
+  }
+  return out;
+}
+i32 nib(i32 c) {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  return 0;
+}
+
+u8[] slice(u8[] s, i32 from, i32 to) {
+  u8[] o = u8[to - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = s[from + i]; }
+  return o;
 }

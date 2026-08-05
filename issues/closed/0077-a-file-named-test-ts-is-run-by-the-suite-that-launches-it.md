@@ -89,3 +89,34 @@ that is deepening is not evidence to be gathered carefully; it is a fire.
 
 And **`/proc/<pid>/cwd` before naming anyone.** Two agents' checkouts had chains, the shared file was the
 cause, and I wrote an issue note blaming a colleague for a tree that turned out to be mine.
+
+## A wrong diagnosis inside the fix (agent-a, 2026-08-05)
+
+The guard above went into all four suite-spawning tools, and the next gate run failed after nine seconds.
+I concluded that a top-level `Deno.exit` in `mutate.ts`, `testChanged.ts` and `mutate/profile.ts` was
+killing whatever imported them, removed those three calls, and wrote that reasoning into the code and the
+commit message.
+
+**It was wrong.** Nothing imports those three — checked afterwards with `rg` over every `*.test.ts` — and
+a full suite with the calls restored passes 1134 tests. The guard was innocent. What I had actually done
+was pattern-match on the bug I had just spent an hour on: a top-level side effect run by something that
+only meant to read the file. Having a fresh, vivid failure mode makes the next unexplained failure look
+like it.
+
+**What that nine-second failure was is still unknown**, and the evidence is thin because the run said
+almost nothing. `deno test` type-checked all 140 files, printed the last `Check` line, and exited non-zero
+with no diagnostic and no test output. The machine had rebooted fifteen minutes earlier and other agents
+were rebuilding their caches, so a child killed for memory is the likeliest explanation — two workers plus
+a type-check of the whole repo is the heaviest moment of a run.
+
+`tools/push.sh`'s own branches rule out two of the candidates: 124 and 137 have their own message, and
+this took the generic one, so the code was something else — probably 1. Deno exiting 1 immediately after
+type-checking with nothing printed is what a `--parallel` worker dying looks like from outside, and
+[0075](../open/0075-the-test-worker-cap-is-a-guess-and-needs-a-quiet-machine-to-set.md) has already seen
+exactly that: a worker killed for memory, reported as though the test were wrong. That is why the cap
+exists.
+
+`push.sh` now prints the exit code, and says so explicitly when a failing run contains no failures —
+because a gate that reports *that* the suite failed and nothing about how leaves a guess as the only
+available diagnosis. That is the actual lesson: the gate reported *that* the suite failed and nothing about how,
+so the only diagnosis available was a guess, and I made a confident one.
