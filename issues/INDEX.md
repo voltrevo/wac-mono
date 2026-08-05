@@ -5,7 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
-| [0080](open/0080-the-probe-cannot-judge-a-vote-or-a-consensus-yet.md) | the probe cannot judge a vote or a consensus yet | missing feature | not implemented |
+| [0081](open/0081-a-consensus-accepted-by-the-probe-is-not-a-consensus-tor-would-trust.md) | a consensus ACCEPTED by the probe is not one tor would trust | missing feature | not implemented |
 | [0079](open/0079-no-test-compiles-a-program-so-an-edit-to-a-shared-function-breaks-them-silently.md) | no test compiles a program, so an edit to a shared function breaks them silently | diagnostic | compile error |
 | [0076](open/0076-an-app-worker-runs-main-once-so-a-test-pays-a-fresh-one-per-case.md) | an app worker runs `main` once, so a test pays a fresh one per case | performance | not implemented |
 | [0073](open/0073-a-killed-test-run-leaves-its-sshd-behind-and-thirty-were-running.md) | a killed test run leaves its `sshd` behind, and thirty were running | bug | wrong answer |

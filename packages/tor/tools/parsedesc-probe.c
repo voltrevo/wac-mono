@@ -7,13 +7,26 @@
  * satisfy, signatures and certificates included, and it needs no network to ask.
  *
  * Reads the document on stdin. With no argument it is a router descriptor; `cert` makes it an
- * authority key certificate, judged by `authority_cert_parse_from_string`.
+ * authority key certificate; `vote` and `consensus` a network status.
  *
- * **Votes and consensuses are not here yet, and wac-mono issue 0080 says what it would take.**
- * `networkstatus_parse_vote_from_string` needs much more of tor's startup than these two parsers do:
- * it reaches for the global configuration, and supplying a default one via `options_new` /
- * `options_init` / `set_options` — with and without `subsystems_init` — still segfaults further in.
- * Whoever adds it should expect to need a real initialisation path rather than a few calls.
+ * ## What a verdict is worth, per document
+ *
+ * ACCEPTED does not mean the same thing for all four, and the difference decides what a test built on
+ * this may claim. Measured by corrupting each document and asking:
+ *
+ *   | document        | signature corrupted | body corrupted |
+ *   |-----------------|---------------------|----------------|
+ *   | descriptor      | REJECTED            | REJECTED       |
+ *   | key certificate | REJECTED            | REJECTED       |
+ *   | vote            | REJECTED            | REJECTED       |
+ *   | **consensus**   | **ACCEPTED**        | **ACCEPTED**   |
+ *
+ * The first three verify signatures inside the parse. A vote does because it embeds the authority's
+ * key certificate, so it can be checked standing alone. A **consensus cannot** — its signatures are
+ * made by other authorities whose certificates arrive separately, so
+ * `networkstatus_parse_vote_from_string` checks structure and digests and nothing else, and
+ * `networkstatus_check_consensus_signature` is the missing second step. Treat a consensus ACCEPTED as
+ * "well-formed", never as "correctly signed".
  *
  * Reads the document on stdin. Exit 0 and `ACCEPTED` plus a few parsed fields, or exit 1 and
  * `REJECTED`. Build it the way capture-prop228.py builds its probe — against a configured and built
@@ -36,8 +49,20 @@
 #include "feature/nodelist/authority_cert_st.h"
 #include "lib/crypt_ops/crypto_init.h"
 #include "lib/log/log.h"
+#include "app/config/config.h"
+#include "app/main/subsysmgr.h"
+#include "lib/evloop/compat_libevent.h"
+#include "feature/control/control_events.h"
+#include "core/or/protover.h"
+#include "feature/stats/rephist.h"
+#include "feature/stats/bwhist.h"
+#include "core/mainloop/mainloop.h"
+#include "feature/dirparse/ns_parse.h"
+#include "feature/nodelist/networkstatus_st.h"
+#include <sys/stat.h>
 
 int main(int argc, char **argv) {
+  subsystems_init();
   init_logging(1);
   /* Without a log destination tor's own diagnosis of a rejected document goes nowhere, and an
    * assertion failure aborts silently — which is a slow way to find out that the parser wanted more
@@ -48,7 +73,39 @@ int main(int argc, char **argv) {
     set_log_severity_config(LOG_WARN, LOG_ERR, &sev);
     add_stream_log(&sev, "stderr", STDERR_FILENO);
   }
-  if (crypto_early_init() < 0) { fprintf(stderr, "crypto_early_init failed\n"); return 2; }
+  /* The recipe is tor's own test harness, src/test/testing_common.c. The network-status parser needs
+   * most of it; the descriptor and certificate parsers need almost none. */
+  {
+    or_options_t *options = options_new();
+    struct tor_libevent_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    tor_libevent_initialize(&cfg);
+    control_initialize_event_queue();
+    init_protocol_warning_severity_level();
+    options->command = CMD_RUN_UNITTESTS;
+    if (crypto_global_init(0, NULL, NULL)) { fprintf(stderr, "crypto_global_init failed\n"); return 2; }
+    if (crypto_seed_rng() < 0) { fprintf(stderr, "crypto_seed_rng failed\n"); return 2; }
+    rep_hist_init();
+    bwhist_init();
+    initialize_mainloop_events();
+    options_init(options);
+    const char *dir = "/tmp/parsedesc-probe";
+    mkdir(dir, 0700);
+    options->DataDirectory = tor_strdup(dir);
+    options->DataDirectory_option = tor_strdup(dir);
+    tor_asprintf(&options->KeyDirectory, "%s/keys", dir);
+    options->CacheDirectory = tor_strdup(dir);
+    /* Chutney's voting interval is seconds, and tor enforces a minimum freshness interval unless it is
+     * told the network is a test one — which is what chutney's own torrc says. Without this, a vote a
+     * chutney authority produced is rejected as "freshness interval is too short", which is tor
+     * disagreeing with its own configuration rather than with the document. */
+    options->TestingTorNetwork = 1;
+    char *errmsg = NULL;
+    if (set_options(options, &errmsg) < 0) {
+      fprintf(stderr, "set_options failed: %s\n", errmsg ? errmsg : "(none)");
+      return 2;
+    }
+  }
 
   size_t cap = 1 << 20, len = 0;
   char *buf = malloc(cap);
@@ -64,6 +121,19 @@ int main(int argc, char **argv) {
     printf("fingerprint %s\n", fp);
     printf("dir_key_published %ld\n", (long)cert->cache_info.published_on);
     printf("expires %ld\n", (long)cert->expires);
+    return 0;
+  }
+
+  if (argc > 1 && (!strcmp(argv[1], "vote") || !strcmp(argv[1], "consensus"))) {
+    int is_vote = !strcmp(argv[1], "vote");
+    networkstatus_t *ns = networkstatus_parse_vote_from_string(
+        buf, len, NULL, is_vote ? NS_TYPE_VOTE : NS_TYPE_CONSENSUS);
+    if (!ns) { printf("REJECTED\n"); return 1; }
+    printf("ACCEPTED\n");
+    printf("type %s\n", is_vote ? "vote" : "consensus");
+    printf("valid_after %ld\n", (long)ns->valid_after);
+    printf("routerstatuses %d\n",
+           ns->routerstatus_list ? smartlist_len(ns->routerstatus_list) : 0);
     return 0;
   }
 
