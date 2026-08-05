@@ -29,7 +29,7 @@
 // signature is over `SHA-256("Tor TLS RSA/Ed25519 cross-certificate" | ED25519_KEY | EXPIRATION)`
 // with no DigestInfo. That is why `rsaSignRawPkcs1` exists.
 
-import { ed25519Sign, ed25519Verify } from "../../crypto/src/ed25519.wac";
+import { ed25519Sign, ed25519SignExpanded, ed25519Verify } from "../../crypto/src/ed25519.wac";
 import { sha256 } from "../../crypto/src/sha256.wac";
 import { rsaSignRawPkcs1 } from "../../crypto/src/rsa.wac";
 
@@ -51,6 +51,12 @@ export const i32 CERT_TYPE_LINK = 5;
 export const i32 CERT_TYPE_AUTH = 6;
 /** `Ed25519 identity, signed with RSA identity` — a different format from 4, 5 and 6. */
 export const i32 CERT_TYPE_RSA_CROSSCERT = 7;
+/**
+ * `ntor onion key, cross-certifying ed25519 identity`, the `ntor-onion-key-crosscert` in a router
+ * descriptor. Signed by a key that does not exist as a seed: proposal 228 derives it from the
+ * curve25519 onion key, so this type is built by `ed25519CertExpanded` rather than `ed25519Cert`.
+ */
+export const i32 CERT_TYPE_ONION_ID = 10;
 
 /** `CERT_KEY_TYPE`: the certified key is an ed25519 public key. */
 export const i32 KEY_TYPE_ED25519 = 1;
@@ -88,33 +94,83 @@ export u8[] ed25519Cert(
   i32 certType, i64 expirationHours, i32 certKeyType, u8[] certifiedKey,
   u8[] signingKey, u8[] signingSecret
 ) {
-  if (certifiedKey.len() != 32 || signingKey.len() != 32 || signingSecret.len() != 32) {
-    return u8[0]();
-  }
+  if (signingKey.len() != 32 || signingSecret.len() != 32) { return u8[0](); }
+  u8[] body =
+    ed25519CertBody(certType, expirationHours, certKeyType, certifiedKey, signingKey, true);
+  if (body.len() == 0) { return u8[0](); }
+  return withSignature(body, ed25519Sign(signingSecret, body));
+}
+
+/**
+ * The signed part of a certificate: everything except the trailing 64-byte signature.
+ *
+ * Split out because the two kinds of signer differ in both the key and the extension. The link,
+ * signing and auth certificates are signed by a seed-derived key and carry extension 4, so that a
+ * client meeting the relay for the first time can find the key that signed them. The **ntor
+ * cross-certificate** is signed by a key that exists only as an expanded scalar — proposal 228
+ * derives it from the curve25519 onion key and there is no seed — and it deliberately carries *no*
+ * extension: a verifier reconstructs the signing key from the relay's published `ntor-onion-key`,
+ * so including it would assert nothing it does not already have.
+ *
+ * Empty for anything it cannot encode, which the callers propagate.
+ */
+export u8[] ed25519CertBody(
+  i32 certType, i64 expirationHours, i32 certKeyType, u8[] certifiedKey,
+  u8[] signingKey, bool includeSigningKey
+) {
+  if (certifiedKey.len() != 32) { return u8[0](); }
+  if (includeSigningKey && signingKey.len() != 32) { return u8[0](); }
   if (expirationHours < 0 || expirationHours > 4294967295) { return u8[0](); }
 
-  i32 bodyLen = 1 + 1 + 4 + 1 + 32 + 1 + 4 + 32;
-  u8[] cert = u8[bodyLen + 64]();
-  cert[0] = 1;
-  cert[1] = certType;
-  u8[] exp = be32(expirationHours);
-  for (i32 i = 0; i < 4; i++) { cert[2 + i] = exp[i]; }
-  cert[6] = certKeyType;
-  for (i32 i = 0; i < 32; i++) { cert[7 + i] = certifiedKey[i]; }
-  cert[39] = 1;                       // one extension
-  cert[40] = 0;                       // ExtLength, big-endian 32
-  cert[41] = 32;
-  cert[42] = EXT_SIGNED_WITH_KEY;
-  cert[43] = 0;                       // ExtFlags
-  for (i32 i = 0; i < 32; i++) { cert[44 + i] = signingKey[i]; }
-
-  // "The signature is formed by signing the first N-64 bytes of the certificate" — the whole thing
-  // except the signature, and with no personalisation prefix, despite §1.1's general rule.
+  i32 fixed = 1 + 1 + 4 + 1 + 32 + 1;
+  i32 bodyLen = includeSigningKey ? fixed + 4 + 32 : fixed;
   u8[] body = u8[bodyLen]();
-  for (i32 i = 0; i < bodyLen; i++) { body[i] = cert[i]; }
-  u8[] sig = ed25519Sign(signingSecret, body);
+  body[0] = 1;
+  body[1] = certType;
+  u8[] exp = be32(expirationHours);
+  for (i32 i = 0; i < 4; i++) { body[2 + i] = exp[i]; }
+  body[6] = certKeyType;
+  for (i32 i = 0; i < 32; i++) { body[7 + i] = certifiedKey[i]; }
+  if (!includeSigningKey) {
+    body[39] = 0;                     // N_EXTENSIONS = 0
+    return body;
+  }
+  body[39] = 1;                       // one extension
+  body[40] = 0;                       // ExtLength, big-endian 32
+  body[41] = 32;
+  body[42] = EXT_SIGNED_WITH_KEY;
+  body[43] = 0;                       // ExtFlags
+  for (i32 i = 0; i < 32; i++) { body[44 + i] = signingKey[i]; }
+  return body;
+}
+
+/**
+ * A certificate signed with a 64-byte expanded secret, for proposal 228 keys.
+ *
+ * The signing key is not passed at all: it is not carried in an extension, and the expanded secret
+ * determines it. `ed25519SignExpanded` recomputes the public key it needs internally.
+ */
+export u8[] ed25519CertExpanded(
+  i32 certType, i64 expirationHours, i32 certKeyType, u8[] certifiedKey, u8[] signingExpanded
+) {
+  if (signingExpanded.len() != 64) { return u8[0](); }
+  u8[] body =
+    ed25519CertBody(certType, expirationHours, certKeyType, certifiedKey, u8[0](), false);
+  if (body.len() == 0) { return u8[0](); }
+  return withSignature(body, ed25519SignExpanded(signingExpanded, body));
+}
+
+/**
+ * Append a signature to a certificate body.
+ *
+ * "The signature is formed by signing the first N-64 bytes of the certificate" — the whole thing
+ * except the signature, and with no personalisation prefix, despite §1.1's general rule.
+ */
+u8[] withSignature(u8[] body, u8[] sig) {
   if (sig.len() != 64) { return u8[0](); }
-  for (i32 i = 0; i < 64; i++) { cert[bodyLen + i] = sig[i]; }
+  u8[] cert = u8[body.len() + 64]();
+  for (i32 i = 0; i < body.len(); i++) { cert[i] = body[i]; }
+  for (i32 i = 0; i < 64; i++) { cert[body.len() + i] = sig[i]; }
   return cert;
 }
 

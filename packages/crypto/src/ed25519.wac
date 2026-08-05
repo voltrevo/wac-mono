@@ -352,16 +352,18 @@ export u8[] ed25519PublicKey(u8[] seed) {
   return ptEncode(ptMul(a, ptBase()));
 }
 
-/** The 64-byte signature over `msg` for a 32-byte seed. */
-export u8[] ed25519Sign(u8[] seed, u8[] msg) {
-  if (seed.len() != 32) { trap; }
-  u8[] h = expandSeed(seed);
-  u8[] a = clampScalar(h);
-  u8[] pub = ptEncode(ptMul(a, ptBase()));
-
-  // r = H(prefix || msg) mod L, where prefix is the second half of the expansion.
+/**
+ * The scheme proper, from an already-expanded key: `a` is the secret scalar, `prefix` the
+ * 32-byte nonce prefix, and `pub` the public key those two produce.
+ *
+ * RFC 8032 arrives here by hashing a seed; proposal 228 arrives by another route entirely
+ * (see `curve25519ToEd25519Secret`). Neither the nonce nor the challenge depends on how the
+ * key was derived, so the signature is written once here and both entry points feed it.
+ */
+u8[] signExpanded(u8[] a, u8[] prefix, u8[] pub, u8[] msg) {
+  // r = H(prefix || msg) mod L
   u8[] prefixMsg = u8[32 + msg.len()]();
-  for (i32 i = 0; i < 32; i++) { prefixMsg[i] = h[32 + i]; }
+  for (i32 i = 0; i < 32; i++) { prefixMsg[i] = prefix[i]; }
   for (i32 i = 0; i < msg.len(); i++) { prefixMsg[32 + i] = msg[i]; }
   u8[] r = scReduce(sha512(prefixMsg));
 
@@ -379,6 +381,16 @@ export u8[] ed25519Sign(u8[] seed, u8[] msg) {
   u8[] sig = u8[64]();
   for (i32 i = 0; i < 32; i++) { sig[i] = rPoint[i]; sig[32 + i] = s[i]; }
   return sig;
+}
+
+/** The 64-byte signature over `msg` for a 32-byte seed. */
+export u8[] ed25519Sign(u8[] seed, u8[] msg) {
+  if (seed.len() != 32) { trap; }
+  u8[] h = expandSeed(seed);
+  u8[] a = clampScalar(h);
+  u8[] prefix = u8[32]();
+  for (i32 i = 0; i < 32; i++) { prefix[i] = h[32 + i]; }
+  return signExpanded(a, prefix, ptEncode(ptMul(a, ptBase())), msg);
 }
 
 /**
@@ -413,4 +425,96 @@ export bool ed25519Verify(u8[] pub, u8[] msg, u8[] sig) {
   Point left = ptMul(s, ptBase());
   Point right = ptAdd(rPoint, ptMul(k, a));
   return ptEquals(left, right) == 1;
+}
+
+// ── Proposal 228: the ed25519 key that matches a curve25519 key ────────────────
+//
+// A relay has one ntor onion key, a curve25519 keypair, and has to cross-certify its
+// ed25519 identity with it. Curve25519 and the Edwards curve here are the same curve in
+// two coordinate systems, so the key can be moved between them — which is what lets a
+// Diffie-Hellman key sign something. Proposal 228 defines the move; tor implements it in
+// `ed25519_donna_pubkey_from_curve25519_pubkey` and
+// `ed25519_keypair_from_curve25519_keypair`.
+//
+// The proposal's own warning is worth repeating: a key derived this way should sign only
+// the fixed, self-generated structure it exists for. It is not a general signing key, and
+// signing attacker-chosen bytes with it has not been analysed.
+
+/**
+ * The 64-byte expanded ed25519 secret for a curve25519 secret, per proposal 228.
+ *
+ * Deliberately *not* `expandSeed`. RFC 8032 hashes a seed and clamps the first half to get
+ * the scalar; here the curve25519 scalar **is** the ed25519 scalar and only the nonce
+ * prefix is hashed out of it. That is the whole point — the two curves must end up holding
+ * the same secret, and a key that went through the RFC's derivation would not.
+ *
+ * The hashed string carries its terminating NUL. Tor hashes `sizeof(string)` over a
+ * 51-character literal, so 52 bytes go in, and the 51 a reader counts gives a key that
+ * matches nothing. The same trap as the blind string in `packages/tor/src/hsblind.wac`.
+ *
+ * No clamp is applied. A curve25519 secret is already clamped to exactly the bits
+ * `clampScalar` sets, so clamping would be a no-op — but writing one would imply the input
+ * may be arbitrary bytes, and it may not: an unclamped scalar yields a public key that the
+ * conversion below cannot reproduce, which is a silent mismatch rather than an error.
+ */
+export u8[] curve25519ToEd25519Secret(u8[] curveSecret) {
+  if (curveSecret.len() != 32) { trap; }
+  u8[] s = "Derive high part of ed25519 key from curve25519 key".toBytes();
+  u8[] input = u8[32 + s.len() + 1]();
+  for (i32 i = 0; i < 32; i++) { input[i] = curveSecret[i]; }
+  for (i32 i = 0; i < s.len(); i++) { input[32 + i] = s[i]; }
+  u8[] high = sha512(input);                     // input[32 + s.len()] is the NUL
+
+  u8[] out = u8[64]();
+  for (i32 i = 0; i < 32; i++) { out[i] = curveSecret[i]; out[32 + i] = high[i]; }
+  return out;
+}
+
+/** The public key for a 64-byte expanded secret — scalar first, nonce prefix second. */
+export u8[] ed25519PublicKeyExpanded(u8[] expanded) {
+  if (expanded.len() != 64) { trap; }
+  u8[] a = u8[32]();
+  for (i32 i = 0; i < 32; i++) { a[i] = expanded[i]; }
+  return ptEncode(ptMul(a, ptBase()));
+}
+
+/** The 64-byte signature over `msg` for a 64-byte expanded secret. */
+export u8[] ed25519SignExpanded(u8[] expanded, u8[] msg) {
+  if (expanded.len() != 64) { trap; }
+  u8[] a = u8[32]();
+  u8[] prefix = u8[32]();
+  for (i32 i = 0; i < 32; i++) { a[i] = expanded[i]; prefix[i] = expanded[32 + i]; }
+  return signExpanded(a, prefix, ptEncode(ptMul(a, ptBase())), msg);
+}
+
+/**
+ * The sign bit of a proposal-228 key: the bit a verifier needs and cannot derive.
+ *
+ * A Montgomery u coordinate fixes y and leaves x ambiguous, so the two ed25519 keys with
+ * x and -x share one curve25519 key. Which was meant is not recoverable from u, which is
+ * why a relay states it on its `ntor-onion-key-crosscert` line and why the conversion
+ * below takes it as an argument. It is the top bit of the encoded public key, i.e. the
+ * same bit `ptEncode` writes there.
+ */
+export i32 ed25519SignBit(u8[] pub) {
+  if (pub.len() != 32) { trap; }
+  return (pub[31] >> 7) & 1;
+}
+
+/**
+ * The ed25519 public key birationally equivalent to a curve25519 public key: y = (u-1)/(u+1).
+ *
+ * Null when u + 1 has no inverse. `feInvert` returns zero for a zero input rather than
+ * trapping, so taking it at face value would produce a well-formed key that is simply
+ * wrong; the case is rejected instead. It requires u == p-1, which no keypair produces —
+ * this guards against a hostile or corrupt descriptor, not against ordinary use.
+ */
+export u8[]? ed25519FromCurve25519Public(u8[] u, i32 signbit) {
+  if (u.len() != 32) { trap; }
+  i64[] uu = feFromBytes(u);
+  i64[] uPlus1 = feAdd(uu, feOne());
+  if (feIsZero(uPlus1) != 0) { return null; }
+  u8[] y = feToBytes(feMul(feSub(uu, feOne()), feInvert(uPlus1)));
+  y[31] = y[31] | ((signbit & 1) << 7);
+  return y;
 }

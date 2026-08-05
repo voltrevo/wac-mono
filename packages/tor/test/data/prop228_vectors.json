@@ -1,0 +1,30 @@
+{
+  "source": "/home/claude/tor-build/torproject-tor-c8d2b17/libtor.a via packages/tor/tools/prop228-probe.c",
+  "message": "prop228 nonce prefix, pinned",
+  "cases": [
+    {
+      "curve_secret": "00080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd35a",
+      "curve_public": "c8feca81be196cdf2cadeabf13c4903d7632dce4955aa68b6e5d9adef54e2616",
+      "expanded": "00080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd35ac309e692d686a2e402607027b8c0425601de05605988fc0b6b39120b34e14edc",
+      "ed_public": "22a51202e4e28893e58c12a34f1c42655b53395bd38fb98ddc462abdb78e80a8",
+      "signbit": 1,
+      "signature": "d7f43b86056194aaffde9464972abe2142d88fabf2b5fde7294b50d79294f191e35ffb914edccd0fea70dc41da9a3852da100ad0b7921479b4a3111c7ab3810e"
+    },
+    {
+      "curve_secret": "20272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf279",
+      "curve_public": "c1c318eeeead11778e566a24a8cb04b9b431eb84cfa623c6a682c7ee56c8e206",
+      "expanded": "20272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf279ec7edf372b2ebbfdf7690ed4268300629aff572b9047b6ddca623b0c4f8570f1",
+      "ed_public": "dcd8b2a080d04f86f33fdab5605f30af840aba44c71a136db5a8bec6028afa3b",
+      "signbit": 0,
+      "signature": "4e374f94e89711da3d2ffb4ffa53890b91d40daad3c7e909806351d6e6cfc9713e655c93c52ade232f8034e3a5af715b628de70c7ed3c2d2e6832df995c78308"
+    },
+    {
+      "curve_secret": "38464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a1158",
+      "curve_public": "cbc2e6302e9a1bc8a47304805f3b49a5130d3eb39c527a05a4d258541290f92f",
+      "expanded": "38464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a1158359f73a6e79101ebc2c265e3093ab7ae5a35e699b41aad321356a993c27f3f4f",
+      "ed_public": "d12d1e66e1caad94c419ae31438ac894736ed5cdc51d3a4878f441c349e03e6e",
+      "signbit": 0,
+      "signature": "2e055d5f075472a905ff5de52459953fae93c7bd5bdbda784f42c5d5889d76a7ef58d6edea42f2acefb627a6bdcb93bfb96be4ab312c0fd30488138a12029803"
+    }
+  ]
+}

@@ -1,0 +1,188 @@
+// Proposal 228: moving a key between Curve25519 and the Edwards curve, which is what lets a relay's
+// ntor onion key sign its `ntor-onion-key-crosscert`.
+//
+// The vectors are eight router descriptors tor produced (`src/test/test_descriptors.inc`), so the
+// curve25519 key, the sign bit, the certificate and the identity it certifies are all C tor's. The
+// host verifies signatures with node's Ed25519 rather than ours — see the note in
+// `routerdesc_wac.test.ts` for why our own verifier cannot be the judge of our own conversion.
+//
+// ## Two oracles, because the descriptors cannot reach the secret side
+//
+// The derivation string `"Derive high part of ed25519 key from curve25519 key"` and its trailing NUL
+// are invisible to every descriptor-based check here, and the reason is worth stating because the
+// opposite is the natural assumption: the string contributes only the nonce prefix — the second half
+// of the expanded secret — and a *public* key does not depend on the prefix. Get the string wrong,
+// including dropping the NUL, and every public-key comparison still passes. A planted fault confirms
+// it: removing the NUL survives the whole descriptor suite.
+//
+// Tor's own committed vectors do not cover it either. `test_crypto_ed25519_testvectors` overwrites the
+// derived secret with an ordinary ed25519 key before it signs, so nothing in tor exercises a signature
+// made with a proposal-228 prefix.
+//
+// So the second vector file comes from calling tor: `tools/capture-prop228.py` links against tor's
+// static library and records the expanded secret it derives together with a signature tor makes with
+// it. ed25519 is deterministic, so reproducing that signature byte for byte pins all 64 bytes of the
+// secret — which is what the last test does.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  curve25519ToEd25519Secret, ed25519FromCurve25519Public, ed25519PublicKeyExpanded,
+  ed25519SignBit, ed25519SignExpanded,
+} from "../../../crypto/src/ed25519.wac";
+import { x25519Base } from "../../../crypto/src/x25519.wac";
+import {
+  ed25519CertBody, ed25519CertExpanded, verifyEd25519Cert,
+  CERT_TYPE_ONION_ID, KEY_TYPE_ED25519,
+} from "../../src/relaycert.wac";
+import { certCertifiedKey, certType } from "../../src/hsdesc.wac";
+
+const i32 V_COUNT = 0;
+const i32 V_NTOR = 1;
+const i32 V_SIGNBIT = 2;
+const i32 V_CROSSCERT = 3;
+const i32 V_MASTER = 4;
+const i32 V_HOST_VERIFY = 5;
+const i32 P_COUNT = 6;
+const i32 P_CURVE_SECRET = 7;
+const i32 P_CURVE_PUBLIC = 8;
+const i32 P_EXPANDED = 9;
+const i32 P_ED_PUBLIC = 10;
+const i32 P_SIGNBIT = 11;
+const i32 P_SIGNATURE = 12;
+const i32 P_MESSAGE = 13;
+
+u8[] arg1(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+u8[] none() { return u8[0](); }
+
+/** The 4-byte big-endian field at `off`, which is how a certificate writes its expiry. */
+i64 be32At(u8[] c, i32 off) {
+  i64 v = 0;
+  for (i32 i = 0; i < 4; i++) { v = v * 256 + (c[off + i] as i64); }
+  return v;
+}
+
+/** The conversion, or an empty array — the tests assert on the length rather than trapping. */
+u8[] convert(u8[] u, i32 signbit) {
+  u8[]? k = ed25519FromCurve25519Public(u, signbit);
+  return k is null ? u8[0]() : k!;
+}
+
+export string test_the_conversion_matches_the_certificates_tor_signed(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  T t = T.create();
+  i32 n = ref(V_COUNT, none(), none())[0];
+  t.isTrue(n >= 4, "several descriptors, not one");
+
+  i32 zeros = 0;
+  i32 ones = 0;
+  for (i32 i = 0; i < n; i++) {
+    u8[] ntor = ref(V_NTOR, arg1(i), none());
+    i32 bit = ref(V_SIGNBIT, arg1(i), none())[0];
+    u8[] cert = ref(V_CROSSCERT, arg1(i), none());
+    u8[] master = ref(V_MASTER, arg1(i), none());
+    string which = "descriptor " + itoa64(i as i64);
+
+    if (bit == 0) { zeros = zeros + 1; } else { ones = ones + 1; }
+
+    t.eqI32(certType(cert), CERT_TYPE_ONION_ID, which + ": is a type-10 certificate");
+    t.eqI32(cert.len(), 104, which + ": 40 bytes of body and a 64-byte signature");
+    t.eqBytes(certCertifiedKey(cert), master, which + ": certifies the master identity");
+
+    // The assertion the file exists for: the converted key is the one that signed tor's certificate,
+    // as judged by node rather than by us.
+    u8[] key = convert(ntor, bit);
+    t.eqI32(key.len(), 32, which + ": the onion key converts");
+    t.eqI32(ref(V_HOST_VERIFY, key, cert)[0], 1,
+            which + ": node verifies tor's crosscert under the converted key");
+
+    // And our own verifier agrees, now that the host has settled what the answer is.
+    t.isTrue(verifyEd25519Cert(cert, key), which + ": our verifier agrees");
+
+    // The sign bit is not decoration. Flipping it must produce a key that fails, or the conversion
+    // could be ignoring it and passing on the half of the vectors where it happens to be zero.
+    u8[] flipped = convert(ntor, 1 - bit);
+    t.eqI32(ref(V_HOST_VERIFY, flipped, cert)[0], 0,
+            which + ": the other sign bit does not verify");
+    t.isFalse(verifyEd25519Cert(cert, flipped), which + ": our verifier rejects it too");
+  }
+
+  t.isTrue(zeros > 0 && ones > 0, "both sign bits occur, so the bit is genuinely exercised");
+  return t.report();
+}
+
+export string test_the_crosscert_body_is_reproduced_byte_for_byte(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(V_COUNT, none(), none())[0];
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] cert = ref(V_CROSSCERT, arg1(i), none());
+    u8[] master = ref(V_MASTER, arg1(i), none());
+    string which = "descriptor " + itoa64(i as i64);
+
+    u8[] want = u8[40]();
+    for (i32 j = 0; j < 40; j++) { want[j] = cert[j]; }
+
+    u8[] got = ed25519CertBody(CERT_TYPE_ONION_ID, be32At(cert, 2), KEY_TYPE_ED25519,
+                               master, u8[0](), false);
+    t.eqBytes(got, want, which + ": the body we build is the body tor wrote");
+
+    // The zero-extension byte is the difference between this certificate and every other one the
+    // relay publishes, and it is one byte at the end of the body — so it is worth naming rather than
+    // leaving to the comparison above.
+    t.eqI32(cert[39], 0, which + ": tor's crosscert carries no extension");
+    u8[] withExt = ed25519CertBody(CERT_TYPE_ONION_ID, be32At(cert, 2), KEY_TYPE_ED25519,
+                                   master, master, true);
+    t.eqI32(withExt.len(), 76, which + ": including the signing key makes it 76 bytes");
+  }
+  return t.report();
+}
+
+export string test_the_secret_derivation_is_tors(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(P_COUNT, none(), none())[0];
+  t.isTrue(n >= 1, "tor's derivation was captured");
+  u8[] message = ref(P_MESSAGE, none(), none());
+
+  for (i32 k = 0; k < n; k++) {
+    u8[] secret = ref(P_CURVE_SECRET, arg1(k), none());
+    string which = "case " + itoa64(k as i64);
+
+    // The whole expanded secret, against the bytes tor produced. This is what pins the derivation
+    // string and its trailing NUL: the second half is a hash of both.
+    u8[] expanded = curve25519ToEd25519Secret(secret);
+    t.eqBytes(expanded, ref(P_EXPANDED, arg1(k), none()),
+              which + ": the expanded secret is the one tor derived");
+
+    u8[] edPublic = ref(P_ED_PUBLIC, arg1(k), none());
+    t.eqBytes(ed25519PublicKeyExpanded(expanded), edPublic,
+              which + ": the public key matches tor's");
+    t.eqI32(ed25519SignBit(edPublic), ref(P_SIGNBIT, arg1(k), none())[0],
+            which + ": the sign bit is the one tor reported");
+    t.eqBytes(x25519Base(secret), ref(P_CURVE_PUBLIC, arg1(k), none()),
+              which + ": the curve25519 public key matches tor's");
+    t.eqBytes(convert(ref(P_CURVE_PUBLIC, arg1(k), none()), ed25519SignBit(edPublic)), edPublic,
+              which + ": converting tor's public key gives tor's ed25519 key");
+
+    // And the signature, byte for byte. A public key cannot see the nonce prefix; a signature is a
+    // fingerprint of the whole secret, so this is the assertion the second vector file exists for.
+    t.eqBytes(ed25519SignExpanded(expanded, message), ref(P_SIGNATURE, arg1(k), none()),
+              which + ": the signature is identical to tor's");
+
+    // Finally the builder path a relay actually uses, judged from outside: a certificate signed with
+    // the derived key must verify under the converted public key, according to node.
+    u8[] identity = u8[32]();
+    for (i32 j = 0; j < 32; j++) { identity[j] = (200 - j * 3) & 0xFF; }
+    u8[] cert = ed25519CertExpanded(CERT_TYPE_ONION_ID, 123456, KEY_TYPE_ED25519,
+                                   identity, expanded);
+    t.eqI32(cert.len(), 104, which + ": the certificate we build is 104 bytes");
+    t.eqI32(ref(V_HOST_VERIFY, edPublic, cert)[0], 1,
+            which + ": node verifies the certificate we signed with the derived key");
+  }
+  return t.report();
+}
