@@ -27,6 +27,18 @@ and 400KB back the other way.
 Built, it is **386.7 KiB** as a self-contained executable — 234.2 KiB of wasm, 71.8 KiB
 gzipped — of which the proxy costs 14.4 KiB over the fetch-and-exit program.
 
+It reaches **onion services**. `src/hsconnect.wac` takes a `.onion` address and fetches a page from
+the service behind it — over our own circuits, end to end, against a real one:
+
+    rendezvous established at test000a
+    introduction acknowledged
+    joined: the service is hop 4
+    HTTP/1.0 200 OK
+    hello from behind an onion
+
+See *Onion services* below for what that involved and the two things only a live service could have
+caught.
+
 It should still not be pointed at the real network — see *What is not here*.
 
 ## Why this is possible at all
@@ -429,6 +441,56 @@ opposite of where you look.
 next to it. Two of this repo's TLS callers, one correct and one not, and nothing compared
 them. The fix is `wholeRecordBytes` in `link.wac`, and the test feeds it every prefix of a
 record and the exact eighty-records-plus-a-split-one shape that failed.
+
+## Onion services
+
+`design/0002` step 2. A v3 onion address *is* an ed25519 public key, so there is no lookup and no
+registry: a client that reaches the right address cannot be talking to the wrong service. Getting
+from the address to a stream takes six pieces, and each is checked against tor rather than against
+itself.
+
+| | where | checked against |
+| --- | --- | --- |
+| the address and its checksum | `src/onionaddr.wac` | rend-spec-v3's own examples |
+| key blinding, time periods, subcredentials | `src/hsblind.wac` | a blinded key from a descriptor tor fetched |
+| the HSDir hash ring | `src/hsdir.wac` | indices tor logged, and the directories it chose |
+| descriptors, both encryption layers | `src/hsdesc.wac` | a real descriptor, decrypted independently |
+| introduction points and cells | `src/hsintro.wac` | keys cross-checked against that decryption |
+| the hs-ntor handshake | `src/hsntor.wac` | tor's own `test-hs-ntor-cl` |
+
+The vectors are captured by `tools/capture-*.py` from a running chutney network and committed, so the
+suite needs no network. `src/hsfetch.wac` and `src/hsconnect.wac` are the live programs; they are not
+in the suite, for the same reason `src/app.wac` is not.
+
+### Four things the specification does not say plainly
+
+Each produces a well-formed, useless value, and none of them has a local symptom.
+
+- **A time period is not a day on a testing network.** `get_time_period_length()` ignores the
+  `hsdir_interval` consensus parameter entirely when `TestingTorNetwork` is set and returns the
+  shared-random protocol run duration — 8 minutes at chutney's 20-second voting interval, not 1440.
+  Computing 1440 asks for a period nobody is in and gets a 404.
+- **The MAC's arguments are the other way round.** §3.3.2 writes `MAC(rend_secret_hs_input, t_hsenc)`,
+  which reads as "MAC of the secret under the tweak"; §0.3 defines `MAC(key=k, message=m)`, so the
+  long secret is the *key*. Backwards gives 32 perfectly good bytes no service agrees with.
+- **The INTRODUCE1 MAC covers the whole cell**, including the twenty zero bytes of `LEGACY_KEY_ID`,
+  not "from the AUTH_KEY" as the text says. The bytes are zeros, so nothing local tells the spans
+  apart — the first version of the test asserted the wrong one and passed.
+- **A BEGIN cell on a rendezvous circuit has an empty address**: `":port"`, not `"host:port"`.
+
+The first two were caught by differentials against tor's own values. The last two needed a live
+service, and are the argument for `design/0002`'s D1 in one sentence.
+
+### What the onion client does not do
+
+**Client authorisation.** A service with authorised clients fails its descriptor MAC and is refused —
+a missing feature rather than a wrong answer.
+
+**Anything the service side needs.** `ESTABLISH_INTRO`, descriptor publication and answering a
+rendezvous are step 6.
+
+**Padding or timing defence.** The rendezvous and introduction circuits are built back to back on
+demand, which is a recognisable shape.
 
 ## What is not here
 

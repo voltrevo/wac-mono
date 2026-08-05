@@ -214,3 +214,25 @@ export u8[] clientRendezvousKeys(
   out[1] = keySeed;
   return concat(out);
 }
+
+/**
+ * The rendezvous hop's key material: `Df | Db | Kf | Kb`, 128 bytes.
+ *
+ *     keys = SHAKE-256(NTOR_KEY_SEED | m_hsexpand, 32*2 + 32*2)
+ *
+ * The same split as an ordinary hop and four times as wide: two 32-byte digest keys, then two
+ * 32-byte cipher keys, because this hop uses SHA3-256 and AES-256 rather than SHA-1 and AES-128
+ * (rend-spec-v3 §3.3.2, and `relay_crypto_init`'s `is_hs_v3` branch in tor).
+ *
+ * Note what is *not* here: no `verify` step and no auth check. Those happened in
+ * `clientRendezvousKeys`, and the caller must have compared its `AUTH_INPUT_MAC` against the
+ * RENDEZVOUS2 cell's `AUTH` field before calling this. Expanding an unauthenticated key seed gives
+ * a working circuit to whoever answered.
+ */
+export u8[] rendezvousCircuitKeys(u8[] ntorKeySeed) {
+  if (ntorKeySeed.len() != 32) { return u8[0](); }
+  u8[][] parts = u8[][2]();
+  parts[0] = ntorKeySeed;
+  parts[1] = mHsExpand();
+  return shake256(concat(parts), 128);
+}

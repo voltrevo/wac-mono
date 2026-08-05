@@ -37,6 +37,7 @@
 //     hash, so ignoring it desynchronises every cell after it. The circuit is dead.
 //   - `peek`, not `finish` — the stream continues. That is why sha1.wac has one.
 
+import { Sha3_256 } from "../../crypto/src/keccak.wac";
 import { Sha1 } from "../../crypto/src/sha1.wac";
 import { CtrStream } from "../../crypto/src/aesctr.wac";
 
@@ -61,6 +62,19 @@ export i32 relayBeginDir() { return 13; }
 export i32 relayExtend2() { return 14; }
 export i32 relayExtended2() { return 15; }
 
+// The onion-service commands, tor-spec §6.1 and rend-spec-v3. A client sends ESTABLISH_RENDEZVOUS
+// and INTRODUCE1 and receives the three replies; the other two are the service's side of the same
+// conversation and are here so that a cell carrying one is recognisable rather than merely unknown.
+export i32 relayEstablishIntro() { return 32; }
+export i32 relayEstablishRendezvous() { return 33; }
+export i32 relayIntroduce1() { return 34; }
+export i32 relayIntroduce2() { return 35; }
+export i32 relayRendezvous1() { return 36; }
+export i32 relayRendezvous2() { return 37; }
+export i32 relayIntroEstablished() { return 38; }
+export i32 relayRendezvousEstablished() { return 39; }
+export i32 relayIntroduceAck() { return 40; }
+
 /**
  * One hop's cryptographic state: two keystreams and two running digests.
  *
@@ -69,9 +83,24 @@ export i32 relayExtended2() { return 15; }
  * were the first thing hashed, and both ciphers start from an all-zero counter — safe only
  * because the keys themselves are fresh per circuit.
  */
+/**
+ * One hop's crypto: a running digest each way, and a keystream each way.
+ *
+ * **Two flavours, and `wide` says which.** An ordinary relay hop uses SHA-1 and AES-128, as
+ * tor-spec §5.1.4 has always specified. The hop between a client and a *hidden service* — the one
+ * that exists only after a rendezvous — uses SHA3-256 and AES-256 instead (rend-spec-v3 §3.3.2).
+ *
+ * Both digest pairs are held and one is unused, which is not elegant. wac has no sum types and no
+ * closures, so the alternatives are two `Hop` types that `Circuit` would have to hold a mixture of,
+ * or a facade of function pointers. A boolean and two spare hash states is the smallest of the three,
+ * and the branch is in the two places that take a digest rather than spread through the file.
+ */
 export struct Hop {
+  bool wide;
   Sha1 forwardDigest;
   Sha1 backwardDigest;
+  Sha3_256 forwardDigest3;
+  Sha3_256 backwardDigest3;
   CtrStream forwardCipher;
   CtrStream backwardCipher;
 
@@ -90,7 +119,34 @@ export struct Hop {
     fd.update(df);
     Sha1 bd = Sha1.create();
     bd.update(db);
-    return Hop(fd, bd, CtrStream.create(kf, u8[16]()), CtrStream.create(kb, u8[16]()));
+    return Hop(false, fd, bd, Sha3_256.create(), Sha3_256.create(),
+               CtrStream.create(kf, u8[16]()), CtrStream.create(kb, u8[16]()));
+  }
+
+  /**
+   * The rendezvous hop: SHA3-256 and AES-256, from 128 bytes of `Df | Db | Kf | Kb`.
+   *
+   * Same layout as `create`, four times as wide in the digest keys and twice in the cipher keys.
+   * The IV is still sixteen zero bytes — that is the block size, not the key size, and AES-256-CTR
+   * counts from zero exactly as AES-128-CTR does.
+   */
+  Hop createWide(u8[] material) {
+    if (material.len() != 128) { trap; }
+    u8[] df = u8[32]();
+    u8[] db = u8[32]();
+    u8[] kf = u8[32]();
+    u8[] kb = u8[32]();
+    for (i32 i = 0; i < 32; i++) { df[i] = material[i]; }
+    for (i32 i = 0; i < 32; i++) { db[i] = material[32 + i]; }
+    for (i32 i = 0; i < 32; i++) { kf[i] = material[64 + i]; }
+    for (i32 i = 0; i < 32; i++) { kb[i] = material[96 + i]; }
+
+    Sha3_256 fd = Sha3_256.create();
+    fd.update(df);
+    Sha3_256 bd = Sha3_256.create();
+    bd.update(db);
+    return Hop(true, Sha1.create(), Sha1.create(), fd, bd,
+               CtrStream.create(kf, u8[16]()), CtrStream.create(kb, u8[16]()));
   }
 }
 
@@ -117,8 +173,14 @@ u8[] buildBody(i32 command, i32 streamId, u8[] data) {
  */
 export u8[] encryptRelay(Hop hop, i32 command, i32 streamId, u8[] data) {
   u8[] body = buildBody(command, streamId, data);
-  hop.forwardDigest.update(body);
-  u8[] digest = hop.forwardDigest.peek();
+  u8[] digest = u8[0]();
+  if (hop.wide) {
+    hop.forwardDigest3.update(body);
+    digest = hop.forwardDigest3.peek();
+  } else {
+    hop.forwardDigest.update(body);
+    digest = hop.forwardDigest.peek();
+  }
   for (i32 i = 0; i < 4; i++) { body[5 + i] = digest[i]; }
   return hop.forwardCipher.apply(body);
 }
@@ -155,14 +217,24 @@ export bool relayRecognized(Hop hop, u8[] body) {
 
   // Against a copy of the digest state: if this is not our cell, the hash must be left
   // exactly as it was, and there is no way to un-update a SHA-1.
-  Sha1 trial = hop.backwardDigest.clone();
-  trial.update(zeroed);
-  u8[] expect = trial.peek();
+  u8[] expect = u8[0]();
+  if (hop.wide) {
+    Sha3_256 trial3 = hop.backwardDigest3.clone();
+    trial3.update(zeroed);
+    expect = trial3.peek();
+  } else {
+    Sha1 trial = hop.backwardDigest.clone();
+    trial.update(zeroed);
+    expect = trial.peek();
+  }
   bool ok = true;
   for (i32 i = 0; i < 4; i++) {
     if (expect[i] != body[5 + i]) { ok = false; }
   }
-  if (ok) { hop.backwardDigest.update(zeroed); }
+  if (ok) {
+    if (hop.wide) { hop.backwardDigest3.update(zeroed); }
+    else { hop.backwardDigest.update(zeroed); }
+  }
   return ok;
 }
 

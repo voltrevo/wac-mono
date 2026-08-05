@@ -311,3 +311,56 @@ export string test_a_request_longer_than_a_cell_is_split() {
   t.eqI32(total, req.len(), "and together they are the whole request");
   return t.report();
 }
+
+export string test_a_rendezvous_hop_carries_cells_both_ways() {
+  // The hop a client shares with a hidden service uses SHA3-256 and AES-256 rather than SHA-1 and
+  // AES-128. Everything above this in `relay.wac` is shared between the two, so the risk is not that
+  // the wide flavour is wrong on its own but that the branch is taken in one place and not another —
+  // a cell encrypted with SHA3 and recognised with SHA-1 is simply never recognised.
+  //
+  // Two hops from the same 128 bytes, the peer's with the directions swapped, exactly as tor's
+  // `relay_crypto_init(..., reverse)` does.
+  T t = T.create();
+  u8[] material = u8[128]();
+  for (i32 i = 0; i < 128; i++) { material[i] = (i * 37 + 11) & 0xFF; }
+  u8[] swapped = u8[128]();
+  for (i32 i = 0; i < 32; i++) {
+    swapped[i] = material[32 + i];          // their Df is our Db
+    swapped[32 + i] = material[i];
+    swapped[64 + i] = material[96 + i];     // their Kf is our Kb
+    swapped[96 + i] = material[64 + i];
+  }
+  Hop ours = Hop.createWide(material);
+  Hop theirs = Hop.createWide(swapped);
+  t.isTrue(ours.wide, "the wide constructor makes a wide hop");
+  t.isFalse(Hop.create(u8[72]()).wide, "and the ordinary one does not");
+
+  // Several cells in a row: the digest is a *running* hash, so cell two only verifies if cell one
+  // advanced both sides identically. One cell proves nothing about that.
+  i32 bad = 0;
+  for (i32 n = 0; n < 4; n++) {
+    u8[] payload = u8[100 + n]();
+    for (i32 i = 0; i < payload.len(); i++) { payload[i] = (i * 5 + n) & 0xFF; }
+    u8[] wire = encryptRelay(ours, relayData(), 7 + n, payload);
+    u8[] body = decryptRelay(theirs, wire);
+    if (!relayRecognized(theirs, body)) { bad = bad + 1; }
+    if (relayCommand(body) != relayData()) { bad = bad + 1; }
+    if (relayStreamId(body) != 7 + n) { bad = bad + 1; }
+    u8[] got = relayPayload(body);
+    if (got.len() != payload.len()) { bad = bad + 1; }
+    for (i32 i = 0; i < got.len() && i < payload.len(); i++) {
+      if (got[i] != payload[i]) { bad = bad + 1; }
+    }
+  }
+  t.eqI32(bad, 0, "four cells in a row encrypt, decrypt and verify on a wide hop");
+
+  // A cell from an ordinary hop must not be recognised by a wide one. Both digests are 32 or 20
+  // bytes truncated to four, so a wrong one agrees by accident about one time in four billion —
+  // this asserts the branch, not the arithmetic.
+  Hop narrow = Hop.create(u8[72]());
+  u8[] fromNarrow = encryptRelay(narrow, relayData(), 1, "hello".toBytes());
+  Hop wideAgain = Hop.createWide(swapped);
+  t.isFalse(relayRecognized(wideAgain, decryptRelay(wideAgain, fromNarrow)),
+            "a SHA-1 hop's cell is not recognised by a SHA3 one");
+  return t.report();
+}

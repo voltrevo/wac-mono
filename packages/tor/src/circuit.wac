@@ -71,6 +71,16 @@ export struct Received {
   i32 streamId;
   u8[] data;
   u8[] toSend;
+  /**
+   * The relay command the cell carried, or −1 for anything that was not a relay cell.
+   *
+   * `kind` collapses the commands a data-carrying client cares about into a handful of outcomes,
+   * which is right for fetching a page and not enough for the onion protocol: ESTABLISH_RENDEZVOUS,
+   * INTRODUCE1 and their replies are all `gotNothing()` by that reckoning, and a client waiting for
+   * a RENDEZVOUS2 needs to tell it from an INTRODUCE_ACK. So the raw command comes out too, and a
+   * caller that does not care can keep ignoring it.
+   */
+  i32 command;
 }
 
 export struct Stream {
@@ -142,9 +152,9 @@ export struct Circuit {
   Received receive(this, u8[] cell) {
     i32 cmd = cellCommand(cell, 0);
     if (cmd == cmdDestroy()) {
-      return Received(gotDestroyed(), 0, cellPayload(cell, 0), u8[0]());
+      return Received(gotDestroyed(), 0, cellPayload(cell, 0), u8[0](), -1);
     }
-    if (cmd != cmdRelay()) { return Received(gotNothing(), 0, u8[0](), u8[0]()); }
+    if (cmd != cmdRelay()) { return Received(gotNothing(), 0, u8[0](), u8[0](), -1); }
 
     u8[] payload = cellPayload(cell, 0);
     i32 from = -1;
@@ -152,13 +162,13 @@ export struct Circuit {
       payload = decryptRelay(this.hops.get(i), payload);
       if (relayRecognized(this.hops.get(i), payload)) { from = i; }
     }
-    if (from < 0) { return Received(gotBroken(), 0, u8[0](), u8[0]()); }
+    if (from < 0) { return Received(gotBroken(), 0, u8[0](), u8[0](), -1); }
 
     // A length field past the end of the body is a protocol violation by a hop we have
     // already authenticated — which it is entitled to be, being a stranger from a directory.
     // The circuit is finished either way; what matters is that saying so is not a crash.
     if (!relayLengthValid(payload)) {
-      return Received(gotBroken(), 0, u8[0](), u8[0]());
+      return Received(gotBroken(), 0, u8[0](), u8[0](), -1);
     }
     i32 command = relayCommand(payload);
     i32 streamId = relayStreamId(payload);
@@ -171,14 +181,14 @@ export struct Circuit {
         Stream s = this.stream(streamId);
         s.packageWindow += STREAM_INCREMENT;
       }
-      return Received(gotNothing(), streamId, u8[0](), u8[0]());
+      return Received(gotNothing(), streamId, u8[0](), u8[0](), command);
     }
 
     u8[] owed = u8[0]();
     if (command == relayData()) {
       this.deliverWindow -= 1;
       if (this.deliverWindow < 0) {
-        return Received(gotBroken(), streamId, u8[0](), u8[0]());
+        return Received(gotBroken(), streamId, u8[0](), u8[0](), command);
       }
       // Record the digest exactly when the window reaches a multiple of the increment. This
       // cell is the one the next SENDME will name, and the hash has to be read now: one more
@@ -198,7 +208,7 @@ export struct Circuit {
     else if (command == relayExtended2()) { kind = gotExtended(); }
     else if (command != relayData()) { kind = gotNothing(); }
 
-    return Received(kind, streamId, data, owed);
+    return Received(kind, streamId, data, owed, command);
   }
 
   /** SENDMEs we now owe, circuit first then stream, as cells ready for the wire. */
@@ -278,6 +288,28 @@ export struct Circuit {
   u8[] dataCell(this, i32 streamId, u8[] chunk) {
     return this.sendToEnd(relayData(), streamId, chunk);
   }
+
+  /**
+   * Any relay command to the last hop, on stream 0.
+   *
+   * The onion-service cells — ESTABLISH_RENDEZVOUS, INTRODUCE1 — are circuit-level rather than
+   * stream-level, so they carry stream id 0 and there is no `Stream` behind them. Exposed as one
+   * method rather than one per command because the bodies are built in `hsintro.wac`, which is where
+   * their layouts are documented, and a second copy of each name here would be a second place to
+   * keep in step.
+   */
+  u8[] onionCell(this, i32 command, u8[] body) {
+    return this.sendToEnd(command, 0, body);
+  }
+
+  /**
+   * Add the hop shared with a hidden service, from a rendezvous key seed.
+   *
+   * Distinct from `addHop` because this hop is SHA3-256 and AES-256 — see `Hop.createWide`. Nothing
+   * else about the circuit changes: the service simply becomes hop four, and a stream opened after
+   * this is carried to it through the rendezvous point exactly as any other last hop.
+   */
+  void addRendezvousHop(this, u8[] material) { this.hops.push(Hop.createWide(material)); }
 
   u8[] endCell(this, i32 streamId, i32 reason) {
     return this.sendToEnd(relayEnd(), streamId, u8[](reason));

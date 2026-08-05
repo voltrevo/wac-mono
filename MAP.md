@@ -4,8 +4,8 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-28 packages, 53,699 lines of wac, 1072 tests,
-28 command-line programs and 4 browser pages.
+28 packages, 54,718 lines of wac, 1077 tests,
+29 command-line programs and 4 browser pages.
 
 ## Packages
 
@@ -28,10 +28,10 @@ In dependency order: nothing here imports anything below it.
 | [`url`](packages/url/) | A WHATWG URL parser: parse, serialize, and resolve a reference against a base. | 1,229 | 27 | `bytes` `std` |
 | [`wacc`](packages/wacc/) | Porting the wac compiler to wac, so it can eventually compile itself. | 3,798 | 11 | `bytes` |
 | [`zstd`](packages/zstd/) | Zstandard (RFC 8878) in wac. | 2,690 | 42 | `bytes` |
-| [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, bcrypt_pbkdf, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519, NIST P-256 and P-384, RSA… | 5,055 | 137 | `bignum` |
+| [`crypto`](packages/crypto/) | SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, bcrypt_pbkdf, ChaCha20-Poly1305, AES-CTR, AES-GCM, X25519, Ed25519, NIST P-256 and P-384, RSA… | 5,125 | 139 | `bignum` |
 | [`fs`](packages/fs/) | A filesystem that belongs to the system rather than to the host. | 593 | 12 | `bytes` `platform` `std` |
 | [`json`](packages/json/) | JSON (RFC 8259) parsing and serialization, written in wac. | 967 | 51 | `bytes` `fmt` `std` |
-| [`sh`](packages/sh/) | A shell, in wac. | 5,993 | 22 | `bytes` `platform` `std` |
+| [`sh`](packages/sh/) | A shell, in wac. | 6,306 | 22 | `bytes` `platform` `std` |
 | [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 237 | 16 | `fmt` |
 | [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 4,049 | 45 | `crypto` |
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
@@ -40,7 +40,7 @@ In dependency order: nothing here imports anything below it.
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,263 | 70 | `crypto` |
 | [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 4,053 | 33 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`lightclient`](packages/lightclient/) | **The Altair sync protocol works. | 642 | 12 | `bls` `ssz` |
-| [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 6,057 | 137 | `bytes` `codec` `crypto` `datetime` `platform` `std` `tls` `wactest` |
+| [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 6,693 | 140 | `bytes` `codec` `crypto` `datetime` `platform` `std` `tls` `wactest` |
 
 ## Programs
 
@@ -81,6 +81,7 @@ reach — see `packages/platform/README.md`.
 | `packages/box/src/bin/wc.wac` | `wc` on its own: the same applet, built as its own program. |
 | `packages/box/src/box.wac` | A busybox-shaped application: one program, many applets, chosen by the first argument. |
 | `packages/tor/src/app.wac` | A Tor client, entire. |
+| `packages/tor/src/hsconnect.wac` | Connect to a v3 onion service and fetch a page from it. |
 | `packages/tor/src/hsfetch.wac` | Fetch a v3 onion service's descriptor from the network, and say what is in it. |
 | `packages/tor/src/socks.wac` | A SOCKS5 proxy that carries streams over Tor. |
 
