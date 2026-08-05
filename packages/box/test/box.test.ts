@@ -9,6 +9,7 @@
 // consumer of the world, not a part of it.
 
 import { buildApp, type Grants } from "../../platform/build.ts";
+import { appRunner } from "../../../harness/appRun.ts";
 // Imported for its side effect: retries a spawn that fails with "Text file busy" and names
 // whoever held the file, if anyone did. wac-mono 0074.
 import "../../../harness/spawnRetry.ts";
@@ -89,10 +90,12 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     await buildApp(BOX, built, { read: true });
     await Deno.writeTextFile(fixture, input);
 
-    const box = (args: string[]) => {
-      const r = new Deno.Command(built, { args, stdout: "piped", stderr: "piped" }).outputSync();
-      return { code: r.code, out: new TextDecoder().decode(r.stdout) };
-    };
+    // In this process, not a subprocess. `appRunner` is the launcher half of a built program, so
+    // "running box" is a worker rather than a whole second Deno — 64ms against 112ms, measured, for
+    // byte-identical output. The executable is still built above: `sysCode` compares against it,
+    // and the tests that are *about* process boundaries need a real one.
+    const runner = await appRunner(BOX, { read: true });
+    const box = (args: string[]) => runner.run(args);
     const sysCode = (cmd: string, args: string[]) =>
       new Deno.Command(cmd, { args, stdout: "null", stderr: "null" }).outputSync().code;
     const sys = (cmd: string, args: string[]) => {
@@ -102,17 +105,17 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
 
     // Byte-for-byte against the real thing, where the real thing exists here.
     for (const [applet, cmd] of [["cat", "cat"], ["rev", "rev"], ["nl", "nl"], ["base64", "base64"]]) {
-      assertEquals(box([applet, fixture]).out, sys(cmd, [fixture]), `${applet} differs`);
+      assertEquals((await box([applet, fixture])).out, sys(cmd, [fixture]), `${applet} differs`);
     }
     assertEquals(
-      box(["sha256sum", fixture]).out.split(" ")[0],
+      (await box(["sha256sum", fixture])).out.split(" ")[0],
       sys("sha256sum", [fixture]).split(" ")[0],
       "sha256sum differs",
     );
 
     // `wc` prints its columns without padding, so compare the numbers rather than the text.
     assertEquals(
-      box(["wc", fixture]).out.trim().split(/\s+/).slice(0, 3).join(" "),
+      (await box(["wc", fixture])).out.trim().split(/\s+/).slice(0, 3).join(" "),
       sys("wc", [fixture]).trim().split(/\s+/).slice(0, 3).join(" "),
       "wc counts differ",
     );
@@ -123,7 +126,7 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
       [["tac"], ["tac"]],
     ] as [string[], string[]][]) {
       assertEquals(
-        box([...args, fixture]).out,
+        (await box([...args, fixture])).out,
         sys(cmd[0], [...cmd.slice(1), fixture]),
         `${args.join(" ")} differs`,
       );
@@ -135,7 +138,7 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     await Deno.writeTextFile(numbers, ["10", "9", "100", "-5", "9", "0", "1000", "07"].join("\n") + "\n");
     for (const flags of [["-n"], ["-n", "-r"], ["-n", "-u"]]) {
       assertEquals(
-        box(["sort", ...flags, numbers]).out,
+        (await box(["sort", ...flags, numbers])).out,
         sys("sort", [...flags, numbers]),
         `sort ${flags.join(" ")} differs`,
       );
@@ -148,7 +151,7 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     for (const path of ["a/b/", "a/b", "/", "//", "a//", "a", "/a", "a//b//", "/usr/lib/"]) {
       for (const applet of ["basename", "dirname"]) {
         assertEquals(
-          box([applet, path]).out,
+          (await box([applet, path])).out,
           sys(applet, [path]),
           `${applet} ${JSON.stringify(path)}`,
         );
@@ -158,7 +161,7 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     // A numeric option that was asked for, versus one that was never given. `Args.num` used to say
     // zero for both, so `head -0` printed the default ten. GitHub wac-mono#8.
     for (const args of [["head", "-0"], ["head", "-n", "0"], ["tail", "-0"], ["tail", "-n", "0"]]) {
-      assertEquals(box([...args, fixture]).out, "", `${args.join(" ")} prints nothing`);
+      assertEquals((await box([...args, fixture])).out, "", `${args.join(" ")} prints nothing`);
       assertEquals(sys(args[0], [...args.slice(1), fixture]), "", `and so does the real one`);
     }
 
@@ -167,16 +170,16 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     // and stopped numbering. GitHub wac-mono#5.
     const numeric = await Deno.makeTempFile({ prefix: "wac-box-num2-" });
     await Deno.writeTextFile(numeric, "123\nabc\n");
-    assertEquals(box(["grep", "-n", "123", numeric]).out, sys("grep", ["-n", "123", numeric]), "grep -n <number>");
-    assertEquals(box(["sort", "-n", numeric]).out, sys("sort", ["-n", numeric]), "sort -n <file>");
+    assertEquals((await box(["grep", "-n", "123", numeric])).out, sys("grep", ["-n", "123", numeric]), "grep -n <number>");
+    assertEquals((await box(["sort", "-n", numeric])).out, sys("sort", ["-n", numeric]), "sort -n <file>");
     await Deno.remove(numeric);
 
     // The ends of the range, where the counter used to wrap and print for ever, and where the
     // formatter used to answer with a bare "-". GitHub wac-mono#7 and #6.
-    assertEquals(box(["seq", "2147483647", "2147483647"]).out, "2147483647\n", "seq at i32 max");
-    assertEquals(box(["seq", "--", "-2147483648", "-2147483648"]).out, "-2147483648\n", "seq at i32 min");
-    assertEquals(box(["seq", "1", "5"]).out, sys("seq", ["1", "5"]), "seq still counts");
-    assertEquals(box(["seq", "10", "-3", "1"]).out, sys("seq", ["10", "-3", "1"]), "seq counts down");
+    assertEquals((await box(["seq", "2147483647", "2147483647"])).out, "2147483647\n", "seq at i32 max");
+    assertEquals((await box(["seq", "--", "-2147483648", "-2147483648"])).out, "-2147483648\n", "seq at i32 min");
+    assertEquals((await box(["seq", "1", "5"])).out, sys("seq", ["1", "5"]), "seq still counts");
+    assertEquals((await box(["seq", "10", "-3", "1"])).out, sys("seq", ["10", "-3", "1"]), "seq counts down");
 
     // A component, not a path: `/` has to become `%2F` or the output cannot be pasted into a URL.
     // Checked against fixed answers rather than a system tool, since there is not a portable one.
@@ -189,7 +192,7 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
       ["plain-text_1.2~", "plain-text_1.2~"],
     ]) {
       await Deno.writeTextFile(datum, given);
-      assertEquals(box(["urlencode", datum]).out.trim(), want, `urlencode ${JSON.stringify(given)}`);
+      assertEquals((await box(["urlencode", datum])).out.trim(), want, `urlencode ${JSON.stringify(given)}`);
     }
     await Deno.remove(datum);
 
@@ -200,14 +203,14 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     const noNl = await Deno.makeTempFile({ prefix: "wac-box-nl2-" });
     await Deno.writeTextFile(withNl, "x\ny\n");
     await Deno.writeTextFile(noNl, "x\ny");
-    const near = box(["diff", withNl, noNl]);
+    const near = (await box(["diff", withNl, noNl]));
     assertEquals(near.code, 1, "files differing only in a final newline are different");
     assertEquals(near.out.includes("No newline at end of file"), true, near.out);
     // The real one agrees about the status, which is the part a script reads.
     const sysDiff = new Deno.Command("diff", { args: [withNl, noNl], stdout: "null", stderr: "null" })
       .outputSync();
     assertEquals(sysDiff.code, 1, "and so does GNU diff");
-    assertEquals(box(["diff", withNl, withNl]).code, 0, "identical files are still identical");
+    assertEquals((await box(["diff", withNl, withNl])).code, 0, "identical files are still identical");
     await Deno.remove(withNl);
     await Deno.remove(noNl);
 
@@ -243,7 +246,7 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     assertEquals(loud.err.includes("No such file"), true, loud.err);
     // A program that may not write at all is refused rather than forgiven, which is a different
     // answer from "there was nothing to do" and should not be flattened into it.
-    assertEquals(box(["rm", "-f", `${guarded}/nothing-here`]).code, 1, "no write grant is denial");
+    assertEquals((await box(["rm", "-f", `${guarded}/nothing-here`])).code, 1, "no write grant is denial");
     await Deno.remove(guarded, { recursive: true });
     await Deno.remove(rmBin);
 
@@ -254,9 +257,9 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     // platform — "os error 17" under Deno, "already exists" in a browser. Issue 0009.
     const faults = await Deno.makeTempDir({ prefix: "wac-box-faults-" });
     await Deno.mkdir(`${faults}/full/inner`, { recursive: true });
-    const mkdirTwice = box(["mkdir", `${faults}/full`]);
+    const mkdirTwice = (await box(["mkdir", `${faults}/full`]));
     assertEquals(mkdirTwice.code, 1, "mkdir over an existing directory fails");
-    const rmdirFull = box(["rmdir", `${faults}/full`]);
+    const rmdirFull = (await box(["rmdir", `${faults}/full`]));
     assertEquals(rmdirFull.code, 1, "rmdir of a non-empty directory fails");
     // GNU's wording for each, which is where these two strings come from.
     const gnuMkdir = new Deno.Command("mkdir", { args: [`${faults}/full`], stderr: "piped", stdout: "null" })
@@ -325,16 +328,16 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     // both as flags, found no operand, read empty standard input and exited 0. GitHub wac-mono#11.
     const dashDir = await Deno.makeTempDir({ prefix: "wac-box-dash-" });
     await Deno.writeTextFile(`${dashDir}/-x`, "contents\n");
-    assertEquals(box(["cat", "--", `${dashDir}/-x`]).out, "contents\n", "cat -- -x");
+    assertEquals((await box(["cat", "--", `${dashDir}/-x`])).out, "contents\n", "cat -- -x");
     await Deno.remove(dashDir, { recursive: true });
 
     // A numeric sort key outside i32. It used to wrap: `4294967296` and `0` compared equal, so
     // `-nu` dropped one of them. GitHub wac-mono#12.
     const wide = await Deno.makeTempFile({ prefix: "wac-box-wide-" });
     await Deno.writeTextFile(wide, "4294967296\n1\n2147483648\n-1\n");
-    assertEquals(box(["sort", "-n", wide]).out, sys("sort", ["-n", wide]), "sort -n past i32");
+    assertEquals((await box(["sort", "-n", wide])).out, sys("sort", ["-n", wide]), "sort -n past i32");
     await Deno.writeTextFile(wide, "4294967296\n0\n");
-    assertEquals(box(["sort", "-nu", wide]).out, sys("sort", ["-nu", wide]), "sort -nu past i32");
+    assertEquals((await box(["sort", "-nu", wide])).out, sys("sort", ["-nu", wide]), "sort -nu past i32");
     await Deno.remove(wide);
 
     // `split`'s suffixes past `zz`. GNU reserves a leading `z` as the marker that the suffix has
@@ -362,7 +365,7 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     // because only NO_MATCH was checked. GitHub wac-mono#26.
     const patho = await Deno.makeTempFile({ prefix: "wac-box-patho-" });
     await Deno.writeTextFile(patho, "a".repeat(30) + "\n");
-    const gave = box(["grep", "(a|a)*b", patho]);
+    const gave = (await box(["grep", "(a|a)*b", patho]));
     assertEquals(gave.code, 2, `budget exhaustion should exit 2, got ${gave.code}`);
     assertEquals(gave.out, "", "and should print no matches");
     await Deno.remove(patho);
@@ -395,8 +398,8 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     await Deno.mkdir(`${unreadable}/shut`);
     await Deno.writeTextFile(`${unreadable}/shut/inside`, "x");
     await Deno.chmod(`${unreadable}/shut`, 0o000);
-    const found = box(["find", unreadable]);
-    const counted = box(["du", unreadable]);
+    const found = (await box(["find", unreadable]));
+    const counted = (await box(["du", unreadable]));
     await Deno.chmod(`${unreadable}/shut`, 0o755);
     await Deno.remove(unreadable, { recursive: true });
     assertEquals(found.code, 1, "find over an unreadable subtree fails");
@@ -408,7 +411,7 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     // chunks stop. A directory is the portable way to get an open that succeeds and a read that does
     // not. GitHub wac-mono#18.
     for (const applet of ["cat", "wc", "hex", "crc32", "sha256sum", "strings"]) {
-      const r = box([applet, "/tmp"]);
+      const r = (await box([applet, "/tmp"]));
       assertEquals(r.code, 1, `${applet} of a directory should fail, got ${r.code}`);
     }
     // And the real ones agree that it is a failure.
@@ -418,44 +421,44 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
       "GNU cat agrees",
     );
 
-    assertEquals(box(["head", "-3", fixture]).out, sys("head", ["-3", fixture]), "head -N");
-    assertEquals(box(["tail", "-n", "2", fixture]).out, sys("tail", ["-n", "2", fixture]), "tail -n N");
-    assertEquals(box(["wc", "-l", fixture]).out.trim(), sys("wc", ["-l", fixture]).trim().split(/\s+/)[0]);
+    assertEquals((await box(["head", "-3", fixture])).out, sys("head", ["-3", fixture]), "head -N");
+    assertEquals((await box(["tail", "-n", "2", fixture])).out, sys("tail", ["-n", "2", fixture]), "tail -n N");
+    assertEquals((await box(["wc", "-l", fixture])).out.trim(), sys("wc", ["-l", fixture]).trim().split(/\s+/)[0]);
     assertEquals(
-      box(["sha512sum", fixture]).out.split(" ")[0],
+      (await box(["sha512sum", fixture])).out.split(" ")[0],
       sys("sha512sum", [fixture]).split(" ")[0],
       "sha512sum differs",
     );
-    assertEquals(box(["base32", fixture]).out, sys("base32", [fixture]), "base32 differs");
+    assertEquals((await box(["base32", fixture])).out, sys("base32", [fixture]), "base32 differs");
 
     // grep, which brings the regex package in. Every flag against the real thing.
     for (const args of [["grep", "an"], ["grep", "-i", "AN"], ["grep", "-v", "an"],
                         ["grep", "-n", "an"], ["grep", "-c", "an"]]) {
       assertEquals(
-        box([...args, fixture]).out,
+        (await box([...args, fixture])).out,
         sys("grep", [...args.slice(1), fixture]),
         `${args.join(" ")} differs`,
       );
     }
-    assertEquals(box(["grep", "zzznope", fixture]).code, 1, "no match exits 1, as grep does");
-    assertEquals(box(["grep", "[", fixture]).code, 2, "a bad pattern is a usage error");
+    assertEquals((await box(["grep", "zzznope", fixture])).code, 1, "no match exits 1, as grep does");
+    assertEquals((await box(["grep", "[", fixture])).code, 2, "a bad pattern is a usage error");
 
-    assertEquals(box(["basename", "a/b/c.txt"]).out.trim(), "c.txt");
-    assertEquals(box(["dirname", "a/b/c.txt"]).out.trim(), "a/b");
-    assertEquals(box(["echo", "hello", "wac"]).out.trim(), "hello wac");
-    assertEquals(box(["seq", "3"]).out.trim().split("\n").join(","), "1,2,3");
-    assertEquals(box(["true"]).code, 0);
-    assertEquals(box(["false"]).code, 1);
-    assertEquals(box(["nope"]).code, 2, "an unknown applet is a usage error");
+    assertEquals((await box(["basename", "a/b/c.txt"])).out.trim(), "c.txt");
+    assertEquals((await box(["dirname", "a/b/c.txt"])).out.trim(), "a/b");
+    assertEquals((await box(["echo", "hello", "wac"])).out.trim(), "hello wac");
+    assertEquals((await box(["seq", "3"])).out.trim().split("\n").join(","), "1,2,3");
+    assertEquals((await box(["true"])).code, 0);
+    assertEquals((await box(["false"])).code, 1);
+    assertEquals((await box(["nope"])).code, 2, "an unknown applet is a usage error");
 
     // The first applets that recurse, against the real tools over a nested tree.
     assertEquals(
-      box(["find", "packages/platform/src"]).out.trim().split("\n").sort().join("\n"),
+      (await box(["find", "packages/platform/src"])).out.trim().split("\n").sort().join("\n"),
       sys("find", ["packages/platform/src"]).trim().split("\n").sort().join("\n"),
       "find differs",
     );
     assertEquals(
-      box(["du", "packages/platform/src"]).out.split("\t")[0],
+      (await box(["du", "packages/platform/src"])).out.split("\t")[0],
       sys("du", ["-sb", "packages/platform/src"]).split("\t")[0],
       "du differs from du -sb",
     );
@@ -464,8 +467,8 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     const many = await Deno.makeTempFile();
     try {
       await Deno.writeTextFile(many, Array.from({ length: 15 }, (_, i) => i + 1).join("\n") + "\n");
-      assertEquals(box(["head", many]).out, sys("head", ["-10", many]), "head differs");
-      assertEquals(box(["tail", many]).out, sys("tail", ["-10", many]), "tail differs");
+      assertEquals((await box(["head", many])).out, sys("head", ["-10", many]), "head differs");
+      assertEquals((await box(["tail", many])).out, sys("tail", ["-10", many]), "tail differs");
     } finally {
       await Deno.remove(many);
     }

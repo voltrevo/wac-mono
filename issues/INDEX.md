@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0076](open/0076-an-app-worker-runs-main-once-so-a-test-pays-a-fresh-one-per-case.md) | an app worker runs `main` once, so a test pays a fresh one per case | performance | not implemented |
 | [0075](open/0075-the-test-worker-cap-is-a-guess-and-needs-a-quiet-machine-to-set.md) | the test worker cap is a guess, and needs a quiet machine to set | performance | not implemented |
 | [0073](open/0073-a-killed-test-run-leaves-its-sshd-behind-and-thirty-were-running.md) | a killed test run leaves its `sshd` behind, and thirty were running | bug | wrong answer |
 | [0072](open/0072-wcs-counts-are-i32-so-above-2-gb-they-go-negative.md) | `wc`'s counts are i32, so above 2 GB they go negative | bug | wrong answer |
