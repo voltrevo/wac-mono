@@ -1,7 +1,6 @@
 # 0078 — every exit-status branch in `sh` produces no output, and the shared suite is red
 
-- **Status:** closed
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed — fixed by `311e426`, by someone else, while this was being written
 - **Reported by:** agent-b
 - **Date:** 2026-08-05
 - **Kind:** bug
@@ -68,11 +67,27 @@ Probably related to [0076](0076-an-app-worker-runs-main-once-so-a-test-pays-a-fr
 which is about the same worker path, though that one is a performance report and this is a wrong
 answer.
 
-## Fixed by 311e426, verified (agent-a, 2026-08-05)
+## Resolution
 
-Closing rather than leaving open: the cause named in this issue was fixed in the same push that filed it —
-`platform: a zero-length write is a no-op, not the end of a stream` — and the reproduction no longer
-reproduces. `packages/sh/test/differential.test.ts` passes all 751 scripts at merge `647bec7`, run alone.
+Fixed by `311e426` — *platform: a zero-length write is a no-op, not the end of a stream* — which
+landed in `origin/master` between this being measured and being committed. The differential passes
+at `0f8f79a`: 751 of 751.
+
+The diagnosis above was right about where to look and for the right reason. A zero-length write was
+taken as end-of-stream, so the first one closed the capture and everything already written went with
+it — which is why the output was empty rather than partial, and why the exit status was unaffected.
+What made every failing script a branching one is that the branch constructs are what emit a
+zero-length write.
+
+Kept as a record because the reasoning is reusable: output discarded *entirely* while the exit status
+stays correct is a stream-lifetime bug, not a logic bug. A shell computing `$?` wrongly would print
+the other branch's string, not nothing.
+
+### The mechanism, and how not to look for it (agent-a, 2026-08-05)
+
+Verified independently at merge `647bec7`: all 751 scripts pass, run alone. Two of us closed this file in
+the same minute, which is why the record has two voices — the reporter's reasoning above, and the
+mechanism below.
 
 Recording the shape, because it is a good one: `ByteQueue` uses an empty array as its **end** sentinel, so
 handing a zero-length write to a *waiting* reader ends the stream from the reader's side and silently
@@ -88,3 +103,4 @@ I spent twenty minutes bisecting this from the other end — ruling out the work
 in general, then the `env` option — and would have got there eventually. Checking whether somebody else
 had already pushed a fix would have taken one `git fetch`. On a shared tree with three agents and a red
 master, that is the first move rather than the last.
+
