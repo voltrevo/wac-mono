@@ -1,7 +1,7 @@
 # 0079 — no test compiles a program, so an edit to a shared function breaks them silently
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed
+- **Claimed by:** agent-a (2026-08-05)
 - **Reported by:** agent-b
 - **Date:** 2026-08-05
 - **Kind:** diagnostic
@@ -53,3 +53,38 @@ only rather than emit, run it as a separate task the push gate calls rather than
 Not the same as [0076](0076-an-app-worker-runs-main-once-so-a-test-pays-a-fresh-one-per-case.md),
 which is about the cost of running a program a test already builds. This is about programs no test
 builds at all.
+
+## Closed, 2026-08-05 (agent-a)
+
+`tools/programs.test.ts` compiles every program and asserts nothing else, as this issue proposed. Thirty-six
+of them, in **4.3 seconds** — which is what makes it affordable inside `deno task test` rather than a
+separate task somebody has to remember to run.
+
+The cost question this issue flagged had a simple answer: don't build, compile. `wacCompile` on the file set
+`wacFiles` collects skips the two `deno bundle` subprocesses that dominate `buildApp`, so a program costs
+about 120 ms rather than about a second. None of the three fallbacks suggested here — typecheck-only, a
+separate task, or building only what changed — turned out to be necessary.
+
+**One definition of "a program".** `harness/programs.ts` finds them, and `tools/map.ts` now uses it instead
+of its own pair of regexes, so a program cannot be in `MAP.md` and outside this test. `MAP.md` regenerates
+byte-identically, which is the evidence that the shared finder agrees with what the map has been printing.
+The dead copy of `blurbOf` went with it.
+
+**Verified by breaking one**, the way this issue was found: removing `relayd.wac`'s `platform.wac` import
+makes the test fail naming the file, the kind, the package and the first six diagnostics —
+
+```
+1 of 36 programs do not compile:
+  packages/tor/src/relayd.wac (cli, tor):
+    packages/tor/src/relayd.wac:431:3 'Pending' is not generic, so it takes no type arguments
+    packages/tor/src/relayd.wac:234:17 undefined type 'Core'
+```
+
+Six diagnostics rather than one, because a program that broke when a shared function moved usually says so
+several times and the *second* line is often the one that names the cause.
+
+**A second test guards the discovery**, and it earned its place immediately: it asserts that the two
+launchers still dispatch the exports `harness/programs.ts` looks for, and its first version failed because
+it looked for `page` in `entry.ts`. `page` is only ever run by `entryBrowser.ts` — a page needs a canvas, so
+the Deno launcher has nothing to offer it. A guard that had quietly looked in one file would have gone on
+passing while the finder drifted.

@@ -7,7 +7,6 @@ record of what has been fixed and why.
 |---|---|---|---|
 | [0082](open/0082-five-tests-fail-rather-than-slow-down-when-the-machine-is-busy.md) | five tests fail, rather than slow down, when the machine is busy | bug | wrong answer |
 | [0081](open/0081-a-consensus-accepted-by-the-probe-is-not-a-consensus-tor-would-trust.md) | a consensus ACCEPTED by the probe is not one tor would trust | missing feature | not implemented |
-| [0079](open/0079-no-test-compiles-a-program-so-an-edit-to-a-shared-function-breaks-them-silently.md) | no test compiles a program, so an edit to a shared function breaks them silently | diagnostic | compile error |
 | [0076](open/0076-an-app-worker-runs-main-once-so-a-test-pays-a-fresh-one-per-case.md) | an app worker runs `main` once, so a test pays a fresh one per case | performance | not implemented |
 | [0073](open/0073-a-killed-test-run-leaves-its-sshd-behind-and-thirty-were-running.md) | a killed test run leaves its `sshd` behind, and thirty were running | bug | wrong answer |
 | [0067](open/0067-no-filesystem-of-our-own-so-a-session-cannot-be-sealed-off-from-the-host.md) | no filesystem of our own, so a session cannot be sealed off from the host — [design/0001](../design/0001-a-self-contained-system.md) step 1 | missing feature | not implemented |

@@ -1,3 +1,4 @@
+import { findPrograms } from "../harness/programs.ts";
 // Generate MAP.md: every package, what it is, how big it is, what depends on what, and every
 // program you can actually build and run.
 //
@@ -68,22 +69,6 @@ function summarize(readme: string): string {
   return first.replace(/\|/g, "\\|");
 }
 
-/**
- * A program's own first line of comment, which is what it does.
- *
- * Every entry point in this repo opens with one, so the list of programs can be a menu rather
- * than a list of paths. A file that does not is left blank rather than guessed at.
- */
-function blurbOf(src: string): string {
-  for (const line of src.split("\n")) {
-    const t = line.trim();
-    if (t === "") continue;
-    if (!t.startsWith("//")) return "";
-    const text = t.replace(/^\/\/+\s?/, "").trim();
-    if (text !== "") return text.replace(/\|/g, "\\|");
-  }
-  return "";
-}
 
 async function survey(name: string): Promise<Package> {
   const dir = `${ROOT}/packages/${name}`;
@@ -115,16 +100,18 @@ async function survey(name: string): Promise<Package> {
         pkg.wacTests += [...src.matchAll(/^export string test[A-Za-z0-9_]*\(/gm)].length;
       } else {
         pkg.wacLines += src.split("\n").length;
-        const blurb = blurbOf(src);
-        if (/^export i32 main\(/m.test(src)) pkg.programs.push({ path: rel, kind: "cli", blurb });
-        if (/^export i32 page\(/m.test(src)) pkg.programs.push({ path: rel, kind: "page", blurb });
+        // The programs come from `harness/programs.ts` below, which is the one definition of what a
+        // program is — shared with `tools/programs.test.ts`, which compiles them. Two regexes would
+        // drift, and a program the test does not know about is a program nothing compiles (0079).
       }
     } else if (path.endsWith(".test.ts")) {
       pkg.hostTests += [...src.matchAll(/Deno\.test\(/g)].length;
     }
   }
   pkg.uses = [...uses].sort();
-  pkg.programs.sort((a, b) => a.path.localeCompare(b.path));
+  pkg.programs = (await findPrograms())
+    .filter((p) => p.pkg === name)
+    .map(({ path, kind, blurb }) => ({ path, kind, blurb }));
   return pkg;
 }
 
