@@ -9,7 +9,7 @@
 //
 // The recursion was invisible from inside. Every level's output was inherited by the same terminal, so
 // the log looked like one very slow suite — 14,000 "ok" lines and no summary — and the process tree was
-// the only place the truth showed. wac-mono 0076.
+// the only place the truth showed. wac-mono 0077.
 //
 // So this test asserts the property that would have caught it before it ran: a file the runner will
 // import is either a test file or a mistake.

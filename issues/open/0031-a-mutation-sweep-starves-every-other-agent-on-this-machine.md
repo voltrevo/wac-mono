@@ -75,7 +75,7 @@ was in agent-b's checkout; the second, which I described here as a recurrence in
 *mine* — my own push gate, which I left running for forty minutes while investigating. The host had to be
 rebooted.
 
-Written up as [0076](../closed/0076-a-file-named-test-ts-is-run-by-the-suite-that-launches-it.md), which
+Written up as [0077](../closed/0077-a-file-named-test-ts-is-run-by-the-suite-that-launches-it.md), which
 has the reproduction and the fix. Nothing about it belongs to this issue, and the numbers above should
 not be read as evidence about mutation sweeps: load 122 was self-inflicted.
 

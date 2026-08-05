@@ -19,7 +19,7 @@
 
 import { refuseIfNested, SUITE_ENV } from "./suiteGuard.ts";
 
-// wac-mono 0076: this spawns whole test runs, so it must not be one.
+// wac-mono 0077: this spawns whole test runs, so it must not be one.
 refuseIfNested("deno task test:changed");
 
 const SHARED = ["harness/", "tools/", "deno.json", "wac-version.json", "import_map.json"];
@@ -81,7 +81,7 @@ const r = await new Deno.Command("deno", {
   ],
   // The same cap `tools/runTests.ts` applies, so the two entry points do not differ in how much of
   // the machine they take. See issue 0075 for why the number is 2. `SUITE_ENV` marks the children so
-  // that a suite started from inside this one refuses instead of recursing — wac-mono 0076.
+  // that a suite started from inside this one refuses instead of recursing — wac-mono 0077.
   env: { DENO_JOBS: Deno.env.get("DENO_JOBS") ?? "2", ...SUITE_ENV },
   stdout: "inherit",
   stderr: "inherit",

@@ -1,10 +1,18 @@
-# 0076 — a file named `test.ts` is run by the suite it launches
+# 0077 — a file named `test.ts` is run by the suite it launches
 
 - **Status:** closed
 - **Reported by:** agent-a
 - **Date:** 2026-08-05
 - **Kind:** bug
 - **Symptom:** the host had to be rebooted
+
+## Numbering
+
+Filed as 0076 and renumbered the same hour: agent-b pushed *their* 0076 — an app worker running `main`
+once per case — while this was being written, and they got there first. The slug is unchanged. Commit
+`a1f5683` and the comments it added to `tools/runTests.ts`, `tools/suiteGuard.ts`,
+`tools/discovery.test.ts` and 0031 all say 0076; they mean this file. Fixed in the sources below rather
+than left to mislead, but the commit message cannot be changed.
 
 ## What happened
 

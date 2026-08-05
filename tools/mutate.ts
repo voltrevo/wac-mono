@@ -76,7 +76,7 @@ import { ALL_OPERATORS, generate, type OperatorName } from "./mutate/operators.t
 import { applyEdits, packagesOf, type Curated, type Edit, type Mutant } from "./mutate/types.ts";
 import { refuseIfNested, SUITE_ENV } from "./suiteGuard.ts";
 
-// wac-mono 0076: this spawns whole test runs, so it must not be one.
+// wac-mono 0077: this spawns whole test runs, so it must not be one.
 refuseIfNested("deno task mutate");
 
 const args = Deno.args;
@@ -504,7 +504,7 @@ function testCommand(work: string, dirs: string[], filter?: string): Deno.Comman
   // `nice` wraps the whole `deno test`, and the niceness is inherited by every subprocess it
   // spawns — which is the point, since those subprocesses are most of the load.
   // `SUITE_ENV` so a suite launched from inside one of these runs refuses rather than recursing, which
-  // is what filled a machine to load 122 — wac-mono 0076.
+  // is what filled a machine to load 122 — wac-mono 0077.
   return NICE
     ? new Deno.Command("nice", {
       args: ["-n", "19", "deno", ...denoArgs],

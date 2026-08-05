@@ -7,7 +7,7 @@
 // One child per generation, about 100 seconds apart, unbounded. It reached seventeen levels and load
 // 122 on a five-core machine shared with two other agents, and the host had to be rebooted.
 // `tools/discovery.test.ts` now fails if any file in the repo can be collected that way without
-// declaring a test. wac-mono 0076.
+// declaring a test. wac-mono 0077.
 //
 // `deno test --parallel` defaults to one worker per core. That is right for a suite of pure
 // computation and wrong for this one, because a test here is frequently a *process*:

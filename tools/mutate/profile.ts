@@ -26,7 +26,7 @@
 
 import { refuseIfNested, SUITE_ENV } from "../suiteGuard.ts";
 
-// wac-mono 0076: this spawns whole test runs, so it must not be one.
+// wac-mono 0077: this spawns whole test runs, so it must not be one.
 refuseIfNested("the mutation profiler");
 
 export type Profile = {

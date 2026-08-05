@@ -1,6 +1,6 @@
 // One suite at a time: the marker every tool that spawns `deno test` sets and checks.
 //
-// wac-mono 0076: a wrapper named `test.ts` was collected as a test module by the suite it launched, and
+// wac-mono 0077: a wrapper named `test.ts` was collected as a test module by the suite it launched, and
 // each generation started another — seventeen deep, load 122 on a shared five-core machine, and the host
 // had to be rebooted. `tools/discovery.test.ts` makes *that* cause impossible: nothing importable by the
 // runner is a script. This file covers the other direction, which no filename rule can catch — a test
@@ -29,7 +29,7 @@ export function refuseIfNested(what: string): void {
   if (Deno.env.get(MARKER) === undefined) return;
   console.error(
     `${what}: refusing to run the suite from inside the suite (${MARKER} is set).\n` +
-      "This is wac-mono 0076's shape: something running under `deno test` has invoked a whole suite,\n" +
+      "This is wac-mono 0077's shape: something running under `deno test` has invoked a whole suite,\n" +
       "which recurses without bound. Call the thing you need directly instead.",
   );
   Deno.exit(2);
