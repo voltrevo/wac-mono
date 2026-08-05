@@ -67,9 +67,18 @@ server.on("clientError", (err, socket) => {
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const port = server.address().port;
 
-for (let i = 0; i < cases.length; i++) {
+/**
+ * One case: connect, write it, and wait for llhttp to decide or for the window to close.
+ *
+ * Unchanged in what it does. It used to be the body of a sequential loop, and the loop was the whole
+ * cost: **an incomplete message is only ever resolved by the timeout**, because llhttp neither
+ * accepts nor rejects it — so a test made entirely of incomplete cases paid `CASE_TIMEOUT_MS` once
+ * per case, in series. `http.test.ts`'s two prefix tests are exactly that shape and were 3s and 4s
+ * between them; the package was 13s and is 3s.
+ */
+function runCase(i) {
   const bytes = Buffer.from(cases[i], "base64");
-  await new Promise((resolve) => {
+  return new Promise((resolve) => {
     const socket = net.connect(port, "127.0.0.1", () => {
       byPort.set(socket.localPort, i);
       socket.write(bytes);
@@ -102,6 +111,27 @@ for (let i = 0; i < cases.length; i++) {
       resolve();
     });
   });
+}
+
+/**
+ * Cases in flight at once.
+ *
+ * Safe because a result is correlated by the *client's port* rather than by a running index — see
+ * `byPort` above, which exists because llhttp's `clientError` for one case can arrive after the next
+ * connection has opened. That already had to hold when the cases were sequential; it is what makes
+ * them independent now, and `oracle_batch.test.ts` asserts it by mixing all three outcomes in one
+ * batch. Reintroducing the index breaks that test immediately.
+ *
+ * Bounded rather than unlimited: a few hundred simultaneous connects risks the listen backlog and the
+ * descriptor limit, and neither failure would look like a parser disagreement. With the timeout
+ * dominating, thirty-two turns 110 sequential windows into four.
+ */
+const CONCURRENCY = 32;
+
+for (let start = 0; start < cases.length; start += CONCURRENCY) {
+  const batch = [];
+  for (let i = start; i < Math.min(start + CONCURRENCY, cases.length); i++) batch.push(runCase(i));
+  await Promise.all(batch);
 }
 
 server.close();
