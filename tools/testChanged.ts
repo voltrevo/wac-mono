@@ -74,6 +74,9 @@ const r = await new Deno.Command("deno", {
     "--allow-env",
     ...targets,
   ],
+  // The same cap `tools/test.ts` applies, so the two entry points do not differ in how much of
+  // the machine they take. See issue 0075 for why the number is 2.
+  env: { DENO_JOBS: Deno.env.get("DENO_JOBS") ?? "2" },
   stdout: "inherit",
   stderr: "inherit",
 }).output();
