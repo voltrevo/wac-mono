@@ -10,6 +10,7 @@
 // order on purpose: index order and speed order disagree, so a `waitAny` that quietly
 // returned "the first one you passed" would pass a test where they agreed.
 
+import { withDeadline } from "../../../harness/deadline.ts";
 import { buildApp } from "../build.ts";
 
 /** Local, because this repo has no third-party dependencies. */
@@ -28,7 +29,9 @@ function serveOnce(delay: number, msg: string): { port: number; done: Promise<vo
   const port = (l.addr as Deno.NetAddr).port;
   const done = (async () => {
     try {
-      const c = await l.accept();
+      // Bounded: without it, a test that never dials leaves this `accept()` outstanding for ever and
+      // Deno has no per-test timeout to notice. 0036.
+      const c = await withDeadline(l.accept(), `a client on port ${port}`);
       if (delay > 0) await new Promise((r) => setTimeout(r, delay));
       await c.write(new TextEncoder().encode(msg + "\n"));
       // Held open so the *other* recv is still outstanding when the first is collected.

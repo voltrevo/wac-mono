@@ -11,6 +11,7 @@
 // server for the round trip, which exercises both halves of the implementation at once
 // and would hide a shared misreading of the spec — hence the OpenSSL case.
 
+import { withDeadline } from "../../../harness/deadline.ts";
 import {
   close, failure, feed, init, p256Scalar, pemBundle, phase, pemToDer, request,
   send, singleRoot, unpack,
@@ -34,7 +35,8 @@ function serveOnce(): { port: number; done: Promise<void>; } {
   const port = (listener.addr as Deno.NetAddr).port;
   const done = (async () => {
     try {
-      const conn = await listener.accept();
+      // Bounded — see 0036; an un-dialled accept never settles and Deno has no test timeout.
+      const conn = await withDeadline(listener.accept(), `a TLS client on port ${port}`);
       let state = newConnection();
       let buf = new Uint8Array(0);
       const chunk = new Uint8Array(16640);

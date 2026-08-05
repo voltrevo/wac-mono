@@ -19,6 +19,7 @@
 // rejects a CA certificate presented as an end-entity — correctly, and the first version
 // of this test hit exactly that.
 
+import { withDeadline } from "../../../harness/deadline.ts";
 import { feed, newConnection, recordNeeded, send, tlsClose, unpack } from "../host/serve.ts";
 
 const enc = new TextEncoder();
@@ -42,7 +43,8 @@ function serveOnce(reply: string): { port: number; done: Promise<string | null>;
   const done = (async (): Promise<string | null> => {
     let received: string | null = null;
     try {
-      const conn = await listener.accept();
+      // Bounded — see 0036; an un-dialled accept never settles and Deno has no test timeout.
+      const conn = await withDeadline(listener.accept(), `a TLS client on port ${port}`);
       let state = newConnection();
       let buf = new Uint8Array(0);
       const chunk = new Uint8Array(16640);

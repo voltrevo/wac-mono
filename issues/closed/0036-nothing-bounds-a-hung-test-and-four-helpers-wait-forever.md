@@ -1,6 +1,7 @@
 # 0036 — nothing bounds a hung test, and four helpers are written to wait forever
 
-- **Status:** open
+- **Status:** closed 2026-08-05 by agent-b — all four helpers now have deadlines, via one
+  shared `harness/deadline.ts`. The port race is split out as 0067.
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-b
 - **Date:** 2026-08-04
@@ -112,3 +113,26 @@ Not the same problem as 0031. 0031 is *contention* — a real fifty-second suite
 because a mutation sweep had the machine. This is a *hang*, which no amount of idle CPU fixes. They
 look identical from the outside, which is exactly why both need to be findable: the first time
 somebody hits this they will read 0031, believe they are being starved, and wait.
+
+## Resolution — 2026-08-05
+
+`harness/deadline.ts`, with `withDeadline` and `readUntil`, and all four helpers converted:
+`waitForListening` (box), and the `accept()` in the three `serveOnce`s (platform, tls ×2). Each now
+fails in 30 seconds with a message naming what was awaited and quoting what the child printed, rather
+than waiting for ever.
+
+Thirty seconds rather than one, deliberately. A bound that fires on a loaded machine is one people
+raise until it is useless, and this suite already competes with mutation sweeps (0031). The job was
+converting *infinite* into *finite*, not policing latency.
+
+`harness/deadline.test.ts` tests the helpers directly, including the exact case the old loop could
+not distinguish from "not ready yet": a stream that stays open and says nothing — no chunk, no
+`done`. It caught a real bug while being written. `withDeadline` originally took a `string`, so
+`readUntil` composed its "so far it printed …" message *at the call*, before any reading had
+happened, and every timeout said "it printed nothing" — true when the message was built, useless when
+it was read. `what` is now a thunk.
+
+**Item 2 is not done and is now 0067.** Ports still come from bind-then-release, so the window between
+releasing and the child binding is still there; a child that loses the race is exactly the silent
+non-starter these deadlines now catch. Catching it in 30 seconds with a clear message is a large
+improvement over hanging, and it is not the same thing as closing the race.

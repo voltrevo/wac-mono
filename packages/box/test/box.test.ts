@@ -9,6 +9,7 @@
 // consumer of the world, not a part of it.
 
 import { buildApp, type Grants } from "../../platform/build.ts";
+import { readUntil } from "../../../harness/deadline.ts";
 
 const BOX = "packages/box/src/box.wac";
 
@@ -1106,17 +1107,11 @@ function freePort(): number {
  *
  * Returns the stderr it consumed, so a caller can still assert on it afterwards.
  */
-async function waitForListening(server: Deno.ChildProcess, port: number): Promise<string> {
-  const reader = server.stderr.getReader();
-  const dec = new TextDecoder();
-  let seen = "";
-  while (!seen.includes(`listening on port ${port}`)) {
-    const { value, done } = await reader.read();
-    if (done) throw new Error(`the server exited before listening: ${seen}`);
-    seen += dec.decode(value, { stream: true });
-  }
-  reader.releaseLock();
-  return seen;
+function waitForListening(server: Deno.ChildProcess, port: number): Promise<string> {
+  // Bounded, via `harness/deadline.ts`. The loop this replaces handled the server *exiting* and not
+  // the server *living without printing* — a child that fails to bind and sits there yields neither a
+  // chunk nor a `done`, so the read never settled and took the whole suite with it. 0036.
+  return readUntil(server.stderr, `listening on port ${port}`, `box serve on port ${port}`);
 }
 
 Deno.test("box's network applets: a wac server and a wac client, over real TCP", async () => {
