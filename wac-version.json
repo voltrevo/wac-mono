@@ -1,18 +1,26 @@
 {
   "$comment": [
-    "The oldest wac compiler this repo is known to work with. A minimum, not an exact",
-    "version: a newer checkout is fine and is the normal state.",
+    "The wac compiler this repo is verified against. A minimum \u2014 a newer checkout is fine",
+    "and is the normal state \u2014 but one that is *kept current* rather than left at the oldest",
+    "commit that happens to still work.",
     "",
-    "Only ever move it to a commit the suite has actually passed against — the pin is a",
-    "claim, and an unverified claim is worse than none. `deno task wac:pin` records the",
-    "sibling checkout's HEAD, which is the right move when you adopt a new compiler",
-    "feature; write a reason saying which feature, not the commit's subject line.",
+    "Update it proactively, whenever the suite has just passed and wac has moved (operator,",
+    "2026-08-05). The old rule here was 'bump it only when you adopt a compiler feature that",
+    "did not exist before', and the failure of that rule is measurable: this pin sat at a",
+    "2026-08-03 commit while wac went 52 commits ahead, and nobody knew whether the claim was",
+    "still true. It was \u2014 every package still built against it when somebody finally checked \u2014",
+    "but an untested claim is not evidence, and the note the harness prints had become noise",
+    "that three agents scrolled past.",
+    "",
+    "Only ever move it to a commit the suite has actually passed against; `deno task wac:pin`",
+    "records the sibling checkout's HEAD. The reason field is for whoever reads a failure six",
+    "weeks from now: name the feature when a feature is why, and say 'routine' when it is not.",
     "",
     "See 'Keeping the compiler pin current' in README.md. Checked by",
     "harness/wacVersion.ts on the first wacBind of a run."
   ],
-  "commit": "29a5d90d449c1361104da5dace2f123504a13116",
-  "shortCommit": "29a5d90",
-  "reason": "0063: a null test against a non-nullable type now warns (§wac-nonnull-isnull-warn-2mkq7np)",
-  "updated": "2026-08-03"
+  "commit": "9f299ff9c0e770eb8da1ee996ba8b8865d083b0e",
+  "shortCommit": "9f299ff",
+  "reason": "routine: the suite passed against this compiler in the gate run that pushed it \u2014 the pin tracks a recently verified compiler, not the oldest conceivable one",
+  "updated": "2026-08-05"
 }
