@@ -23,6 +23,17 @@ fi
 
 log="$(mktemp -t push-suite-XXXXXX.log)"
 
+# Space, before blaming the change. This gate has failed twice on `No space left on device` for reasons
+# outside this container: the shared overlay sits above 90%, only a couple of gigabytes of it are visible
+# from in here, and `~/.cache/deno/gen` alone has held 22G of generated code. The operator's standing
+# answer (2026-08-05) is to clear *Deno's* cache and retry, and to leave the repo's own `.cache` alone —
+# it is small and every test would repopulate it with the same bytes anyway.
+freeDenoCache() {
+  echo "== clearing ~/.cache/deno/gen and retrying: the disk is full and it is not this change =="
+  rm -rf "$HOME/.cache/deno/gen" 2>/dev/null || true
+  df -h / | tail -1
+}
+
 for attempt in 1 2 3; do
   # Inside the loop, not before it. A merge on a later attempt can bring in a commit that
   # bumps the compiler pin, and then the next run fails on a stale compiler for a reason
@@ -75,6 +86,13 @@ for attempt in 1 2 3; do
       echo "   the run would have continued indefinitely. Still running when it was cut:"
       grep -oE "'[^']+' has been running for over[^)]*.\)" "$log" | sort -u | head -10
     else
+      # A failure that is really the shared disk: clear Deno's cache once and give the suite another go,
+      # rather than reporting a change as broken when nothing about it was.
+      if grep -q "No space left on device" "$log" && [ "$attempt" -lt 3 ]; then
+        freeDenoCache
+        continue
+      fi
+
       echo "== tests failed after $((SECONDS - started))s: not pushing =="
       echo "-- failures --"
       grep -E 'FAILED|error:' "$log" | head -20

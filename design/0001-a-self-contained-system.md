@@ -49,8 +49,12 @@ transcript. Neither is the "real" one: the same VFS with a different store.
 
 **D3 — host access is an explicit mount, not the default.** Today a shell's capabilities are the host's
 filesystem, and that stays available *by asking* — a mount, named in one place — rather than by being
-what you get when you say nothing. `wacsh` on a terminal remains an ordinary shell over the real
-filesystem; it is the *system* that boots an image.
+what you get when you say nothing.
+
+**D3a — two binaries** (operator, 2026-08-05). `wacsh` stays an ordinary shell over the real filesystem,
+and a separate entry point boots an image and serves a system from it. Clearer than a flag for the demo —
+what each one is for is in its name — at the cost of two entries to keep in step, which is what the
+differential corpus is for: both run the same scripts.
 
 **D4 — the kernel is a wac program that synthesises capability worlds.** A session gets a `Cli` whose
 `readFile`, `writeFile`, `readDir`, `stat`, `remove` and `rename` are the VFS's, whose `arg`/`env` are
@@ -77,10 +81,12 @@ Each step is an issue when it becomes actionable, and each references this docum
 1. **The VFS, with both backings.** A package with directories, files, metadata (owner, mode, mtime),
    and a `Cli`-shaped facade a session can be handed. Done when a shell mounted on an in-memory image
    passes the same differential scripts it passes on the host filesystem.
-2. **The image format.** Persist and reload. `packages/box` already has `tar` and `zstd`, so a
-   tar(+zstd) image is the obvious candidate: inspectable with real tools, and it dogfoods two packages
-   that want the exercise. Done when a session's writes survive a restart, and `tar tf` on the host
-   lists the same tree.
+2. **The image format.** Persist and reload. **A format of our own** (operator, 2026-08-05) rather than
+   tar: cheaper incremental saves and exact metadata, at the price of nothing outside this repo being able
+   to read it. Two things follow from that price, and both are part of the step rather than extras — a
+   `dump` that prints an image's tree so a person can inspect one, and a round-trip property test, since
+   there is no GNU tool to be the oracle. Done when a session's writes survive a restart and an image
+   written by one build loads in the next.
 3. **A process table.** Pids, parents, states, exit statuses; `ps`, `kill`, `jobs`. The processes are
    already there — spawned workers, or `pushChild` frames in a browser. Done when `ps` in the ssh demo
    shows the pipeline you are running and `kill` ends one.
@@ -117,9 +123,8 @@ Each step is an issue when it becomes actionable, and each references this docum
   interrupt and EOF. Where the line is drawn should be decided when step 5 starts, not now.
 - **Concurrency on one image.** Two sessions writing the same image at once needs a rule — one writer,
   or copy-on-write per session, or a lock. Step 4 forces the question.
-- **What `wacsh` does by default.** D3 says the host filesystem, but a `--image` flag that boots one is
-  the obvious convenience, and it decides how the tests are written.
-- **Byte-exact paths.** [0065](../issues/open/0065-a-spawned-programs-arguments-are-not-byte-exact.md)
-  is that a `string` crossing the capability boundary is UTF-8-normalised. A VFS storing arbitrary
-  filenames wants it fixed, and the VFS is where it would finally be observable in a test rather than
-  in a diagnostic.
+- ~~What `wacsh` does by default.~~ Answered: two binaries, D3a.
+- ~~Byte-exact paths.~~ Answered:
+  [0065](../issues/open/0065-a-spawned-programs-arguments-are-not-byte-exact.md) is a *signature* problem
+  — names and arguments are bytes, messages and source are text — and not something to solve with a codec
+  in the compiler. `packages/fs` already pins the property on a mount, where no host API is involved.

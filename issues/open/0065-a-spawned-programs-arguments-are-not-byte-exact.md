@@ -97,3 +97,46 @@ Note also what is *not* broken: in-process argv is exact, because the bytes neve
 `printf '\xff' | cat` and `cat $(printf '\xff\xfe')` are right today with the shell's programs called
 rather than spawned. The Deno host cannot receive non-UTF-8 argv from the operating system at all
 (`Deno.args` is already normalised), so this is about arguments a wac *parent* constructs.
+
+## Decided, 2026-08-05 — the signature is the flaw, not the codec
+
+Put to the operator as a choice between a surrogate-escape codec in `wacBindgen.ts` and turning the
+capabilities into bytes. Their answer, and it is the right one: *bindgen should not be involved; this is a
+design flaw rather than a conversion to solve.*
+
+`readFile(string path)`, `arg(i) -> string` and `spawn(source, string[] args)` say **text** where the thing
+is **bytes** — a path, an argument, a directory entry, an environment value. Because the type says text, a
+conversion has to exist, and every conversion between bytes and text loses in one direction. A clever
+codec would only make the lie survive longer.
+
+**The split to build:**
+
+| bytes | text |
+|---|---|
+| `arg`, `env` | `log`, `warn` — a person reads them |
+| every path parameter, and `readDir`'s answers | `spawn`'s source, which really is JavaScript |
+| `spawn`/`spawnSelf` argv | `Change.message`, `FileResult.error` — the host's own words |
+| | socket addresses |
+
+Then nothing needs a codec, because nothing converts.
+
+Two consequences worth stating up front:
+
+- **It fixes [0061](0061-sh-applets-return-all-their-output-at-once-so-a-large-stage-dies.md)'s second
+  half.** Spawn's arguments go parent-wac → host-as-courier → child-wac and never become text, so there is
+  no loss to escape. That is the case that blocks `Shell.externalSpawnable`.
+- **The one unavoidable loss becomes a refusal.** `Deno.readFile` takes a JS string, so a path whose bytes
+  are not valid UTF-8 cannot reach that host — but with bytes in the signature the *host* is what must
+  decode, and it can answer "not representable on this host" as a fault rather than silently opening the
+  wrong file. One named place per host instead of a mangling in the middle. On a `packages/fs` mount, where
+  no host API is involved, byte-exactness is real, which `fs/test/wac/fs_test.wac` already pins.
+
+**Rejected: a surrogate-escape codec in the compiler** (invalid bytes as lone surrogates `U+DC80..DCFF`,
+encoded back exactly). It would have cost ~40 lines and no call-site churn, and it was the wrong shape for
+the reason above. Recorded so the next reader does not re-propose it.
+
+**Cost:** about fifty call sites across eight packages; `cli.arg(0).wait()` becomes
+`string.fromBytes(cli.arg(0).wait())` wherever a program wants text. A schedule, not a veto.
+
+**Where to start:** `spawn`/`spawnSelf`'s argv and `arg`/`env`, which is what 0061 needs and touches the
+fewest callers. Paths are the larger half and can follow in their own commit.
