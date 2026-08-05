@@ -5,7 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
-| [0072](open/0072-wcs-counts-are-i32-so-above-2-gb-they-go-negative.md) | `wc`'s counts are i32, so above 2 GB they go negative | bug | wrong answer |
+| [0073](open/0073-a-killed-test-run-leaves-its-sshd-behind-and-thirty-were-running.md) | a killed test run leaves its `sshd` behind, and thirty were running | bug | wrong answer |\n| [0072](open/0072-wcs-counts-are-i32-so-above-2-gb-they-go-negative.md) | `wc`'s counts are i32, so above 2 GB they go negative | bug | wrong answer |
 | [0071](open/0071-nine-of-shs-programs-read-all-of-their-input-before-answering.md) | nine of `sh`'s programs read all of their input before answering | bug | trap |
 | [0070](open/0070-a-redirection-collects-a-childs-whole-output-before-writing-the-file.md) | a redirection collects a child's whole output before writing the file | bug | trap |
 | [0068](open/0068-the-deno-transpile-cache-grows-without-bound-and-filled-the-shared-disk.md) | the Deno transpile cache grows without bound, and filled the shared disk | bug | disk full |
