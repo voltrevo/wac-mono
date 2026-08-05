@@ -1,0 +1,34 @@
+{
+  "source": "tor 0.4.7.13 on a local chutney hs-v3 network, 2026-08-05",
+  "how": "The service's identity key is net/nodes/009h/hidden_service/hs_ed25519_public_key (bytes 32..64, after the 32-byte 'ed25519v1-public: type0' tag). The blinded key is extension type 4 ('signed-with-ed25519-key') of the descriptor-signing-key-cert in the descriptor tor itself fetched, read back with 'GETINFO hs/client/desc/id/<addr>' on the client's control port. So both values are tor's, produced by tor, and neither passed through any code of ours.",
+  "why": "A blinded key is the one input a client cannot check locally: get it wrong and the HSDir simply answers 404, which is indistinguishable from a service that is not published. It needs an external vector or it has no oracle at all.",
+  "network": {
+    "votingIntervalSeconds": 20,
+    "note": "fresh-until minus valid-after from the live consensus. chutney votes every 20s; the real network every hour.",
+    "testingNetwork": true,
+    "periodLengthMinutes": 8,
+    "periodLengthNote": "SHARED_RANDOM_N_ROUNDS * SHARED_RANDOM_N_PHASES * votingInterval / 60 = 24*20/60. NOT hsdir_interval's 1440 default: tor's get_time_period_length() ignores the consensus parameter entirely when TestingTorNetwork is set.",
+    "rotationOffsetMinutes": 4,
+    "rotationOffsetNote": "SHARED_RANDOM_N_ROUNDS * votingInterval / 60 = 12*20/60. rend-spec-v3's '720 minutes' is only right when a voting period is an hour."
+  },
+  "cases": [
+    {
+      "onion": "s2v6zlybtpugfqy7drwoyy6qibprg6goy7qgtzq2ytezqqdo4alhpbid",
+      "identityKey": "96abecaf019be862c31f1c6cec63d0405f1378cec7e069e61ac4c998406ee016",
+      "timePeriod": 3720624,
+      "periodLength": 8,
+      "blindedKey": "2466c15f97df73b823a044946714477a3a22bc333ffbcf96ea864f8d3ba17fff",
+      "descriptorSigningKey": "a90d620f088bc6943cab45b13c5e680a4c066f7c18ed0389c914b1469621a436"
+    }
+  ],
+  "addressExamples": [
+    "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd",
+    "sp3k262uwy4r2k3ycr5awluarykdpag6a7y33jxop4cs2lu5uz5sseqd",
+    "xa4r2iadxm55fbnqgwwi5mymqdcofiu3w6rpbtqn7b2dyn7mgwj64jyd"
+  ],
+  "addressExamplesNote": "Verbatim from rend-spec-v3 section 6, 'Here are a few example addresses'. Each must decode and its checksum must be the one we compute, so they test the encoding against the specification's own output rather than against ours.",
+  "invalidExamples": [
+    "l5satjgud6gucryazcyvyvhuxhr74u6ygigiuyixe3a6ysis67ororad"
+  ],
+  "invalidExamplesNote": "From rend-spec-v3 section 1.2, where the prose is 'a new name following this specification might look like' \u2014 it is illustrative and its checksum does NOT validate. Found by including it among the valid examples and having it fail. Kept as a negative case, which is worth more than dropping it: it is a real 56-character v3-shaped address with a wrong checksum, which is exactly what a mistyped one is."
+}

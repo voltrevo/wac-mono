@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0070](open/0070-boxs-applet-test-spawns-a-binary-that-is-still-open-for-writing.md) | box's applet test spawns a binary that is sometimes still open for writing | bug | flake |
 | [0068](open/0068-the-deno-transpile-cache-grows-without-bound-and-filled-the-shared-disk.md) | the Deno transpile cache grows without bound, and filled the shared disk | bug | disk full |
 | [0067](open/0067-no-filesystem-of-our-own-so-a-session-cannot-be-sealed-off-from-the-host.md) | no filesystem of our own, so a session cannot be sealed off from the host — [design/0001](../design/0001-a-self-contained-system.md) step 1 | missing feature | not implemented |
 | [0065](open/0065-a-spawned-programs-arguments-are-not-byte-exact.md) | a spawned program's arguments are not byte-exact | bug | wrong answer |
