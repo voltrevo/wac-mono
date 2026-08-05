@@ -12,7 +12,7 @@
 import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import {
-  clientIntroduceKeys, clientRendezvousKeys, hsMac, clientPublicKey,
+  clientIntroduceKeys, clientRendezvousKeys, hsMac, clientPublicKey, rendezvousCircuitKeys,
   tHsEnc, tHsVerify, tHsMac, mHsExpand, S_KEY_LEN, MAC_LEN,
 } from "../../src/hsntor.wac";
 
@@ -188,3 +188,39 @@ u8[] flipScalar(u8[] b) {
   o[1] = (o[1] ^ 1);
   return o;
 }
+
+export string test_the_rendezvous_hop_keys_are_a_full_hop(fn[u8[](i32, u8[], u8[])] ref) {
+  // 128 bytes: Df, Db, Kf, Kb, each 32. The same layout as an ordinary hop and four times as wide,
+  // because this hop is SHA3-256 and AES-256 rather than SHA-1 and AES-128.
+  T t = T.create();
+  u8[] c = ref(V_CASE, arg1(0), none());
+  u8[] seed = slice(c, 288, 320);        // NTOR_KEY_SEED, tor's own
+  u8[] keys = rendezvousCircuitKeys(seed);
+  t.eqI32(keys.len(), 128, "a rendezvous hop takes 128 bytes of key material");
+
+  // The four parts must all differ. A KDF wired up wrong — reading the same 32 bytes four times, or
+  // an offset that repeats — gives a hop where the forward and backward directions share a
+  // keystream, which is a catastrophic and entirely silent failure.
+  i32 same01 = 0;
+  i32 same23 = 0;
+  i32 same02 = 0;
+  for (i32 i = 0; i < 32; i++) {
+    if (keys[i] == keys[32 + i]) { same01 = same01 + 1; }
+    if (keys[64 + i] == keys[96 + i]) { same23 = same23 + 1; }
+    if (keys[i] == keys[64 + i]) { same02 = same02 + 1; }
+  }
+  t.isTrue(same01 < 32, "Df and Db differ");
+  t.isTrue(same23 < 32, "Kf and Kb differ");
+  t.isTrue(same02 < 32, "Df and Kf differ");
+
+  // Deterministic, and every bit of the seed reaches every part.
+  t.isTrue(sameBytes(keys, rendezvousCircuitKeys(seed)), "the expansion is a function");
+  u8[] other = u8[32]();
+  for (i32 i = 0; i < 32; i++) { other[i] = seed[i]; }
+  other[31] = (other[31] ^ 1);
+  t.isFalse(sameBytes(rendezvousCircuitKeys(other), keys), "a flipped seed bit changes the keys");
+  t.eqI32(rendezvousCircuitKeys(u8[31]()).len(), 0, "a short seed gives no keys");
+  return t.report();
+}
+
+bool sameBytes(u8[] a, u8[] b) { return same(a, b); }

@@ -22,7 +22,7 @@
 
 import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
-import { sha3_256, sha3_512, shake128, shake256, keccakF } from "../../src/keccak.wac";
+import { sha3_256, sha3_512, shake128, shake256, keccakF, Sha3_256 } from "../../src/keccak.wac";
 
 const i32 SHA3_256 = 0;
 const i32 SHA3_512 = 1;
@@ -154,4 +154,69 @@ export string test_the_domain_separation_actually_separates() {
               "sha3-256 and shake256 differ at " + itoa64(lens[i] as i64) + " bytes");
   }
   return t.report();
+}
+
+export string test_the_running_sha3_agrees_with_the_one_shot() {
+  // A running hash and a one-shot over the same bytes must be the same value, at every buffer
+  // boundary — the rate is 136 bytes and an off-by-one in the buffering shows up only at a multiple
+  // of it.
+  T t = T.create();
+  i32[] lengths = i32[](0, 1, 135, 136, 137, 271, 272, 273, 500, 1000);
+  for (i32 k = 0; k < lengths.len(); k++) {
+    i32 n = lengths[k];
+    u8[] msg = u8[n]();
+    for (i32 i = 0; i < n; i++) { msg[i] = (i * 31 + 7) & 0xFF; }
+    Sha3_256 h = Sha3_256.create();
+    h.update(msg);
+    t.isTrue(sameBytes(h.peek(), sha3_256(msg)),
+             "running == one-shot at " + itoa64(n as i64) + " bytes");
+  }
+
+  // Fed in pieces, at every split of a message that crosses two blocks.
+  u8[] msg = u8[300]();
+  for (i32 i = 0; i < 300; i++) { msg[i] = (i * 13 + 5) & 0xFF; }
+  u8[] want = sha3_256(msg);
+  i32 wrong = 0;
+  for (i32 split = 0; split <= 300; split += 7) {
+    Sha3_256 h = Sha3_256.create();
+    u8[] a = u8[split]();
+    for (i32 i = 0; i < split; i++) { a[i] = msg[i]; }
+    u8[] b = u8[300 - split]();
+    for (i32 i = 0; i < 300 - split; i++) { b[i] = msg[split + i]; }
+    h.update(a);
+    h.update(b);
+    if (!sameBytes(h.peek(), want)) { wrong = wrong + 1; }
+  }
+  t.eqI32(wrong, 0, "every two-part split gives the same digest");
+  return t.report();
+}
+
+export string test_peeking_does_not_end_the_hash() {
+  // The property the relay digest depends on: peek, absorb more, peek again — and the second peek
+  // must be the hash of everything, not of the tail, and not of a sponge that was already padded.
+  T t = T.create();
+  u8[] first = "the first part".toBytes();
+  u8[] second = "and the second".toBytes();
+  u8[] both = u8[first.len() + second.len()]();
+  for (i32 i = 0; i < first.len(); i++) { both[i] = first[i]; }
+  for (i32 i = 0; i < second.len(); i++) { both[first.len() + i] = second[i]; }
+
+  Sha3_256 h = Sha3_256.create();
+  h.update(first);
+  u8[] afterFirst = h.peek();
+  t.isTrue(sameBytes(afterFirst, sha3_256(first)), "the first peek is the hash of the first part");
+  u8[] again = h.peek();
+  t.isTrue(sameBytes(again, afterFirst), "peeking twice gives the same answer");
+  h.update(second);
+  t.isTrue(sameBytes(h.peek(), sha3_256(both)),
+           "after absorbing more, the digest is of everything — peek did not finalise the sponge");
+  return t.report();
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
 }
