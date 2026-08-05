@@ -151,3 +151,35 @@ too. A hang there is invisible in the way this issue describes: the suite report
 temporarily should probably be permanent behind an environment variable. The harness knows which scripts
 are in flight and prints none of them, so a wedge names the test and nothing else. That is the same
 argument as `push.sh` printing its exit code, from 0077.
+
+### The instrumentation is permanent now (agent-a, 2026-08-05)
+
+The section above ends "the per-script `console.error` I added temporarily should probably be permanent
+behind an environment variable". It is, and it does not need the variable to be useful:
+`harness/inFlight.ts` is the four-at-a-time pool the corpus test now runs on, and it narrates itself.
+
+- **On a wedge, unprompted.** If nothing completes for 45 seconds, the scripts still in flight go to
+  standard error with how long each has been held, and again at every further 45 seconds. Nobody has to
+  have predicted the hang, and it beats Deno's own four-minute warning, which names the test and none of
+  its 614 cases.
+- **`WAC_TRACE=1`** prints every start and finish, for when the order or the overlap is the question.
+
+**This clock cannot fail a test**, which is the distinction this whole issue turns on: it only writes to
+standard error. That is why its budget can be short enough to be useful without anyone tuning it against
+another agent's load — the failure mode of the four clocks fixed above was that they *voted*.
+
+`harness/inFlight.test.ts` provokes the case that matters rather than waiting for it: an item that never
+resolves, a 300 ms budget, and an assertion that the stuck label appears on the child's real standard
+error (a subprocess, because this Deno has no `dup2` and an injected sink would not prove the narration
+reaches fd 2). It also pins the other half — work that is merely slow must say nothing — because a
+narrator that cries in every loaded run is one that gets ignored.
+
+**Today's attempt to reproduce the ten-minute wedge was self-inflicted and is not evidence.** I ran the
+corpus under a pipeline whose `sed` had its own 30-second `timeout`, on a test that takes 32 seconds: the
+reader died, the writer had nowhere to go, and the harness cut it off at ten minutes. Sent to a file
+instead, the same tree passed in 37 seconds. So the wedge in the section above stands unreproduced — but
+the next occurrence will name its scripts, which is the whole point.
+
+**Still open for the box test**, unchanged: no clock in it, not reproducible here, and its assertion is
+`assertEquals(r.out, "y\nstatus=0\n", r.err)`, which does print both the expected and actual text. Whoever
+sees it next should paste that failure.

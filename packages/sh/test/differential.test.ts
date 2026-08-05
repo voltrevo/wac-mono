@@ -1,6 +1,7 @@
 // Imported for its side effect: retries a spawn that fails with "Text file busy" and names
 // whoever held the file, if anyone did. wac-mono 0074.
 import { appRunner } from "../../../harness/appRun.ts";
+import { pool } from "../../../harness/inFlight.ts";
 import { buildApp } from "../../platform/build.ts";
 import "../../../harness/spawnRetry.ts";
 // The shell, against bash.
@@ -1137,25 +1138,31 @@ Deno.test({
   name: "every script agrees with bash on output and exit status",
   ignore: !haveBash,
   fn: async () => {
-    // Eight at a time. Each script is two subprocesses and one of them compiles the shell, so
-    // serially this is twenty-odd seconds of a suite that runs in thirty.
+    // Four at a time. Each script is a bash subprocess and an in-process run of our shell, so serially this
+    // is twenty-odd seconds of a suite that runs in a minute.
+    //
+    // Through `pool` rather than a hand-rolled queue for one reason: when this test wedges — and it has,
+    // for over ten minutes at load 0.55, which is 0082's last open question — the pool writes the scripts
+    // it is still holding to standard error. Without that, a hang here reports the name of this test and
+    // nothing about which of 614 scripts caused it, and the only way to find out is to instrument the
+    // harness by hand, which is what I did the first time and then deleted.
     const differences: string[] = [];
-    const queue = [...CASES];
-    async function worker() {
-      while (queue.length > 0) {
-        const script = queue.shift()!;
-        const [want, got] = await Promise.all([bash(script), wacsh(script)]);
-        if (want.stdout !== got.stdout || want.code !== got.code) {
-          differences.push(
-            `script: ${JSON.stringify(script)}\n` +
-            `  bash: ${JSON.stringify(want.stdout)} exit ${want.code}\n` +
-            `  ours: ${JSON.stringify(got.stdout)} exit ${got.code}` +
-            (got.stderr.trim() === "" ? "" : `\n  stderr: ${got.stderr.trim().split("\n")[0]}`),
-          );
-        }
+    await pool(CASES, 4, async (script) => {
+      const [want, got] = await Promise.all([bash(script), wacsh(script)]);
+      if (want.stdout !== got.stdout || want.code !== got.code) {
+        differences.push(
+          `script: ${JSON.stringify(script)}\n` +
+          `  bash: ${JSON.stringify(want.stdout)} exit ${want.code}\n` +
+          `  ours: ${JSON.stringify(got.stdout)} exit ${got.code}` +
+          (got.stderr.trim() === "" ? "" : `\n  stderr: ${got.stderr.trim().split("\n")[0]}`),
+        );
       }
-    }
-    await Promise.all(Array.from({ length: 4 }, () => worker()));
+    }, {
+      what: "script",
+      // The script itself is the label, shortened: a case is identified by what it runs, and the longest
+      // here would wrap several times in a terminal.
+      label: (script) => (script.length > 110 ? `${script.slice(0, 110)}…` : script),
+    });
     if (differences.length > 0) {
       throw new Error(`${differences.length} of ${CASES.length} scripts differ from bash:\n\n` +
                       differences.join("\n\n"));
