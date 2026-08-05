@@ -199,9 +199,20 @@ most, because it puts their implementation on the far side of every seam.
 > found nothing, and stopped. A relay's port lives in a signed document, so it cannot be changed by
 > changing a command line — regenerate the descriptor or keep the port.
 >
-> What is left for step 3 is `EXTEND2` firing: at 75 % tor has enough directory information but has not
-> extended, and a three-hop circuit needs three distinct relays where the consensus lists two. A third
-> relay is the next thing to try, and it is a `relayd --descriptor` and a third `-D` away.
+> What is left for step 3 is `EXTEND2` firing, and **a third relay was not it.** With three relays in the
+> consensus, all three listening on the ports their descriptors advertise, a C tor still stopped at
+> `75 % (enough_dirinfo)`: relay A took one connection, answered 6 directory requests and was never
+> asked to extend; relays B and C were never contacted at all.
+>
+> The reason is simpler than a missing feature. **Nothing asked tor for a circuit.** 75 % is the point
+> where it has enough directory information and is waiting for a reason to build one, and the probe is
+> configured as a relay with no client traffic — `SocksPort` is open but nobody connects to it. tor
+> builds a three-hop circuit when a stream needs one.
+>
+> So the next step is to give it a reason: a request through its SOCKS port
+> (`curl --socks5-hostname 127.0.0.1:9250 ...`) to something reachable inside the testnet. That forces a
+> circuit, which forces `EXTEND2` at the first hop, which is the thing that has never been exercised.
+> Cheap to try and it needs nothing new written.
 >
 > One hypothesis tested and **disproved**: that tor asked our relay for the consensus because our vote
 > flagged it `V2Dir`, which advertises a directory cache we do not run. Dropping `V2Dir` and `HSDir`
