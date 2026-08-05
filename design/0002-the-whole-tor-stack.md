@@ -105,6 +105,21 @@ process `EXTEND2` by opening the next hop, and forward relay cells both ways. Do
 client** builds a circuit through our relay inside a chutney network — the D1 direction that matters
 most, because it puts their implementation on the far side of every seam.
 
+> The pure parts are done: `src/relaycert.wac` (the four certificates and the CERTS cell),
+> `src/relaylink.wac` (the responder's four handshake cells), `src/relaycircuit.wac` (CREATE2,
+> CREATED2, EXTEND2, EXTENDED2, and being a hop). `ntorServerRespond` already existed.
+>
+> What remains is the program that holds the sockets, and the one open question in it is the **TLS
+> certificate**. `packages/tls`'s server takes a DER certificate and this package cannot yet make
+> one — X.509 generation is a separate piece of work. Per D4 a testnet relay can use an
+> openssl-generated certificate as a fixture, which is enough to reach the *done* condition; a relay
+> that rotated its own link certificate would need the generator.
+>
+> The first interop milestone is smaller than the full one and worth naming: a C tor client
+> configured with `Bridge <addr> <fingerprint>` will do TLS, the link handshake and a one-hop
+> `CREATE2` against our relay without any of it being in a consensus. That exercises every seam
+> except `EXTEND2` and needs no directory authority.
+
 **4 — the directory authority.** Publish a descriptor, vote, compute a consensus, sign it. Done when a
 C tor client bootstraps from a consensus our authority signed.
 
@@ -124,7 +139,7 @@ much as the thing steps 2–6 each contribute a row to, and it is where a regres
 |---|---|
 | 1 — RSA signing | **done** — `rsaSignPkcs1`, `rsaSignRawPkcs1`, byte-identical to node's |
 | 2 — onion service client | **done** — `src/hsconnect.wac` fetches a page from a real onion service over our own circuits |
-| 3 — relay | not started |
+| 3 — relay | **in progress** — certificates, the responder handshake, CREATE2 and EXTEND2 all done and tested. What remains is the program with the sockets in it |
 | 4 — directory authority | not started |
 | 5 — the launcher | not started |
 | 6 — onion service host | not started |

@@ -492,6 +492,33 @@ rendezvous are step 6.
 **Padding or timing defence.** The rendezvous and introduction circuits are built back to back on
 demand, which is a recognisable shape.
 
+## Being a relay
+
+`design/0002` step 3, in progress. Everything that is a pure function of bytes is done and tested:
+
+| | where |
+| --- | --- |
+| the four certificates a relay presents, and the CERTS cell | `src/relaycert.wac` |
+| the responder's VERSIONS, CERTS, AUTH_CHALLENGE, NETINFO | `src/relaylink.wac` |
+| answering CREATE2, being a hop, reading EXTEND2 | `src/relaycircuit.wac` |
+| the ntor responder | `src/ntor.wac`, which always had both halves |
+
+Three things a responder has to get right that a client never meets:
+
+- **The key material goes the other way round.** A relay's forward is the client's backward, because
+  "forward" means towards the exit and the two ends disagree about which way that is.
+  `Hop.createReversed`. Wrong, and every cell is unrecognised in both directions — a broken circuit,
+  not a key error.
+- **A relay talks to strangers, so a trap is a denial of service.** Every length in a CREATE2 or an
+  EXTEND2 is somebody else's claim, and `ntorServerRespond` asserts its own input length.
+- **The signature span in an ed25519 certificate is not what cert-spec §1.1 implies.** §2.1 overrides
+  it, and four of tor's own certificates verifying is what says so.
+
+What remains is the program that holds the sockets. Its open question is the **TLS certificate**:
+`packages/tls`'s server takes a DER certificate and this package cannot yet generate one. A testnet
+relay can use an openssl-generated fixture, which is enough; a relay rotating its own link
+certificate would need an X.509 generator.
+
 ## What is not here
 
 **The real network.** Directory authorities are reached by IP and this sandbox's proxy
