@@ -236,6 +236,21 @@ most, because it puts their implementation on the far side of every seam.
 > run where earlier two-relay runs fetched them — worth checking whether three descriptors in one
 > response exceeds something, before reading too much into the exit message.
 >
+> **That thread was the real blocker, and the answer was a flag.** The descriptors were never the
+> problem: tor logged `router_load_routers_from_string(): 3 elements to add`, accepting all three, and
+> then `We know of 0 in the USABLE_FILTERED set` and `0 eligible guards`. **A guard must be a directory
+> cache**, so dropping `V2Dir` — correct when we served nothing over `BEGIN_DIR` — left tor unable to
+> sample an entry guard and therefore unable to build any path, however many relays it knew. Restoring
+> it (truthfully now, since `relayd -C -K -D` answers `BEGIN_DIR`) took bootstrap from 75 % to **95 %**,
+> a relay logged `extending to 127.0.0.1:5559`, and relay C accepted a connection and negotiated link
+> protocol 5 — a relay-to-relay connection, which only an `EXTEND2` produces.
+>
+> **What is not established:** whether the extend *completed*. No `extended circuit` line was found, and
+> the per-relay logs disagreed with the counts on a second read, so the next run should settle it —
+> `extending to` and `extended circuit` in the same relay's log, and a CREATE2 (not CREATE_FAST) on the
+> relay being extended to. The SOCKS requests still time out, which is expected: nothing implements
+> `RELAY_BEGIN`, so there is no exit for a stream even once the path exists.
+>
 > One hypothesis tested and **disproved**: that tor asked our relay for the consensus because our vote
 > flagged it `V2Dir`, which advertises a directory cache we do not run. Dropping `V2Dir` and `HSDir`
 > from the flags changed nothing — tor still sent `Downloading consensus from 127.0.0.1:5555` at the

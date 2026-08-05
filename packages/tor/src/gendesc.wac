@@ -153,13 +153,16 @@ export i32 main(Core core, Cli cli) {
           subject = sf.bytes;
           core.log("gendesc: voting about the relay described in " + subjectPath);
         }
-        // No `V2Dir` and no `HSDir`: both advertise services this relay does not provide. A relay
-        // flagged V2Dir is a directory cache, and a bootstrapping tor believes the flag — it opens a
-        // circuit and asks *the relay* for the consensus and certificates over RELAY_BEGIN_DIR, gets
-        // an END because nothing answers that yet, and concludes it has "not enough certificates to
-        // check networkstatus consensus" while the authority's own DirPort was serving them all along.
-        // Claiming a capability is how you get asked to honour it.
-        relays[ri] = RelayOpinion(subject, "Exit Fast Guard Running Stable Valid",
+        // `V2Dir` is back, because it became true: `relayd -C -K -D` answers RELAY_BEGIN_DIR now, and
+        // a relay that serves directory documents *is* a cache. It was dropped when it was a false
+        // claim, and dropping it had a cost that took two runs to see — **a guard must be a directory
+        // cache**, so without the flag tor found "0 eligible guards", could sample no entry guard, and
+        // would not build a path however many relays the consensus listed. The descriptors were fine:
+        // it logged "3 elements to add" and then ran out of guards.
+        //
+        // Still no `HSDir`: nothing here serves a hidden-service directory, and a client that believed
+        // that flag would publish onion descriptors into a hole.
+        relays[ri] = RelayOpinion(subject, "Exit Fast Guard Running Stable V2Dir Valid",
                                   640416, "reject 1-65535");
       }
       VoteInfo vi = VoteInfo("wacauth", "127.0.0.1", "127.0.0.1", 7000, 5000,
