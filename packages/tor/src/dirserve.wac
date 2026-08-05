@@ -1,0 +1,155 @@
+// Serving the directory: the HTTP side of being an authority.
+//
+// Routing only — no sockets. A request target goes in, a `Response` comes out, which is what makes the
+// awkward parts of the protocol testable without a client attached.
+//
+// ## The `.z` a client appends is a request, not a filename
+//
+// A bootstrapping tor builds
+//
+//     /tor/status-vote/current/consensus[-<flavour>]/<fp>+<fp>+....z
+//
+// and the `.z` asks for a zlib-compressed body. The suffix has to be stripped before the path is
+// matched or every request 404s. We answer **uncompressed**: tor's client guesses the encoding from the
+// body (`detect_compression_method`) and accepts an identity-encoded directory document, complaining in
+// its log and carrying on. `packages/gzip` is here if that complaint ever needs to stop.
+//
+// ## The fingerprint list is a filter, and we are one authority
+//
+// Those `<fp>+<fp>` digests name the authorities whose signatures the client already trusts. A real
+// cache uses them to decide whether the consensus it holds is worth sending. With one authority the
+// answer is always the same, so they are parsed and ignored — deliberately, and said here rather than
+// left looking like an oversight, because a multi-authority network would have to honour them.
+
+import { Response, write } from "../../http/src/response.wac";
+import { encodeUpper } from "../../codec/src/hex.wac";
+
+/** The documents an authority can hand out. Empty means "not produced", which answers 404. */
+export struct DirDocuments {
+  u8[] consensus;              // the ns-flavoured consensus
+  u8[] consensusMicrodesc;     // the microdesc flavour, if one is produced
+  u8[] certificate;            // this authority's key certificate
+  u8[] descriptor;             // its own router descriptor
+  u8[] descriptorDigest;       // 20 bytes: the digest an `r` line carries, for /tor/server/d/
+  u8[] fingerprint;            // 20 bytes: this authority's identity digest
+}
+
+/** A document response, `text/plain` as tor's own cache sends these. */
+Response document(u8[] body) {
+  Response res = Response.create(200);
+  res.set("Content-Type", "text/plain");
+  return Response(200, res.headers, body);
+}
+
+Response notFound() {
+  Response res = Response.create(404);
+  res.set("Content-Type", "text/plain");
+  return Response(404, res.headers, "Not found\n".toBytes());
+}
+
+/**
+ * The response for a request target.
+ *
+ * 404 rather than 500 for a document we do not hold: to a client the two are the same event — this
+ * cache cannot serve it — and 500 would suggest retrying here rather than asking elsewhere.
+ */
+export Response dirRoute(u8[] target, DirDocuments docs) {
+  u8[] path = stripDotZ(target);
+
+  if (startsWith(path, "/tor/status-vote/current/consensus-microdesc")) {
+    return docs.consensusMicrodesc.len() == 0 ? notFound() : document(docs.consensusMicrodesc);
+  }
+  if (startsWith(path, "/tor/status-vote/current/consensus")) {
+    return docs.consensus.len() == 0 ? notFound() : document(docs.consensus);
+  }
+
+  // `/tor/keys/all` and `/tor/keys/authority` both mean "the certificates you have", and with one
+  // authority that is one certificate.
+  if (equals(path, "/tor/keys/all") || equals(path, "/tor/keys/authority")) {
+    return docs.certificate.len() == 0 ? notFound() : document(docs.certificate);
+  }
+  if (startsWith(path, "/tor/keys/fp/")) {
+    if (docs.certificate.len() == 0) { return notFound(); }
+    return mentions(rest(path, "/tor/keys/fp/"), docs.fingerprint)
+      ? document(docs.certificate) : notFound();
+  }
+
+  if (equals(path, "/tor/server/authority") || equals(path, "/tor/server/all")) {
+    return docs.descriptor.len() == 0 ? notFound() : document(docs.descriptor);
+  }
+  if (startsWith(path, "/tor/server/d/")) {
+    if (docs.descriptor.len() == 0) { return notFound(); }
+    return mentions(rest(path, "/tor/server/d/"), docs.descriptorDigest)
+      ? document(docs.descriptor) : notFound();
+  }
+
+  return notFound();
+}
+
+/** The response bytes for a GET, framing headers included. */
+export u8[] dirResponse(u8[] target, DirDocuments docs) {
+  return write(dirRoute(target, docs), "GET".toBytes(), false);
+}
+
+/**
+ * The target without a trailing `.z`.
+ *
+ * Only the suffix, not every `.z` in the path: a fingerprint list cannot contain one, but stripping by
+ * search rather than by position is the kind of shortcut that breaks the first time a path does.
+ */
+export u8[] stripDotZ(u8[] target) {
+  i32 n = target.len();
+  if (n >= 2 && target[n - 2] == 46 && target[n - 1] == 122) {
+    u8[] out = u8[n - 2]();
+    for (i32 i = 0; i < n - 2; i++) { out[i] = target[i]; }
+    return out;
+  }
+  return target;
+}
+
+/** Whether a `+`-separated list of hex digests names `digest`, case-insensitively. */
+bool mentions(u8[] list, u8[] digest) {
+  if (digest.len() == 0) { return false; }
+  u8[] want = encodeUpper(digest);
+  i32 at = 0;
+  while (at <= list.len()) {
+    i32 end = at;
+    while (end < list.len() && list[end] != 43) { end = end + 1; }   // '+'
+    if (end - at == want.len() && sameFold(list, at, want)) { return true; }
+    if (end >= list.len()) { return false; }
+    at = end + 1;
+  }
+  return false;
+}
+
+/** Compare `want` against `list[at..]`, upper-casing the list's letters as it goes. */
+bool sameFold(u8[] list, i32 at, u8[] want) {
+  for (i32 i = 0; i < want.len(); i++) {
+    i32 c = list[at + i];
+    if (c >= 97 && c <= 122) { c = c - 32; }
+    if (c != want[i]) { return false; }
+  }
+  return true;
+}
+
+bool startsWith(u8[] s, string prefix) {
+  u8[] p = prefix.toBytes();
+  if (s.len() < p.len()) { return false; }
+  for (i32 i = 0; i < p.len(); i++) { if (s[i] != p[i]) { return false; } }
+  return true;
+}
+
+bool equals(u8[] s, string text) {
+  u8[] t = text.toBytes();
+  if (s.len() != t.len()) { return false; }
+  for (i32 i = 0; i < t.len(); i++) { if (s[i] != t[i]) { return false; } }
+  return true;
+}
+
+/** What follows `prefix` in `s`. */
+u8[] rest(u8[] s, string prefix) {
+  i32 from = prefix.toBytes().len();
+  u8[] out = u8[s.len() - from]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = s[from + i]; }
+  return out;
+}

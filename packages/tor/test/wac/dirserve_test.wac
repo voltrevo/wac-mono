@@ -1,0 +1,130 @@
+// Directory routing, against the request targets a bootstrapping tor builds.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { DirDocuments, dirRoute, dirResponse, stripDotZ } from "../../src/dirserve.wac";
+import { encodeUpper } from "../../../codec/src/hex.wac";
+
+const i32 D_CONSENSUS = 0;
+const i32 D_CERT = 1;
+const i32 D_DESCRIPTOR = 2;
+const i32 D_DESC_DIGEST = 3;
+const i32 D_FINGERPRINT = 4;
+
+u8[] none() { return u8[0](); }
+
+DirDocuments docsFrom(fn[u8[](i32, u8[], u8[])] ref) {
+  return DirDocuments(
+    ref(D_CONSENSUS, none(), none()), u8[0](), ref(D_CERT, none(), none()),
+    ref(D_DESCRIPTOR, none(), none()), ref(D_DESC_DIGEST, none(), none()),
+    ref(D_FINGERPRINT, none(), none()));
+}
+
+string hexOf(u8[] b) { return string.fromBytes(encodeUpper(b)); }
+
+export string test_the_targets_a_bootstrapping_tor_builds(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  DirDocuments docs = docsFrom(ref);
+  string fp = hexOf(ref(D_FINGERPRINT, none(), none()));
+
+  // The real shape: flavourless consensus, the trusted authorities' fingerprints, and `.z`.
+  t.eqI32(dirRoute(("/tor/status-vote/current/consensus/" + fp + ".z").toBytes(), docs).status, 200,
+          "the consensus target with a fingerprint list and .z is served");
+  t.eqBytes(dirRoute(("/tor/status-vote/current/consensus/" + fp + ".z").toBytes(), docs).body,
+            ref(D_CONSENSUS, none(), none()), "and the body is the consensus");
+
+  // Without either decoration, which is what a hand-written request looks like.
+  t.eqI32(dirRoute("/tor/status-vote/current/consensus".toBytes(), docs).status, 200,
+          "the bare consensus target is served too");
+
+  // Mixed case, and a list of several authorities with ours among them.
+  t.eqI32(dirRoute(("/tor/keys/fp/" + lower(fp)).toBytes(), docs).status, 200,
+          "a lowercase fingerprint still names us");
+  t.eqI32(dirRoute(("/tor/keys/fp/0000000000000000000000000000000000000000").toBytes(), docs).status,
+          404, "another authority's fingerprint is not ours to answer");
+  t.eqI32(dirRoute(("/tor/keys/fp/0000000000000000000000000000000000000000+" + fp).toBytes(),
+                   docs).status, 200, "and a list containing ours is answered");
+
+  t.eqI32(dirRoute("/tor/keys/all".toBytes(), docs).status, 200, "keys/all is the certificate");
+  t.eqBytes(dirRoute("/tor/keys/authority".toBytes(), docs).body, ref(D_CERT, none(), none()),
+            "keys/authority is the same certificate");
+
+  // The descriptor, by the digest an r line carries.
+  string dd = hexOf(ref(D_DESC_DIGEST, none(), none()));
+  t.eqI32(dirRoute(("/tor/server/d/" + dd + ".z").toBytes(), docs).status, 200,
+          "the descriptor is served by its r-line digest");
+  t.eqI32(dirRoute("/tor/server/d/0000000000000000000000000000000000000000".toBytes(), docs).status,
+          404, "an unknown descriptor digest is a 404");
+  t.eqI32(dirRoute("/tor/server/authority".toBytes(), docs).status, 200,
+          "server/authority is our own descriptor");
+
+  // A microdesc consensus we do not produce is a 404 and not the ns one under a wrong name, which
+  // would be worse than useless: a client would verify it and then fail to find microdescriptors.
+  t.eqI32(dirRoute("/tor/status-vote/current/consensus-microdesc".toBytes(), docs).status, 404,
+          "a flavour we do not have is refused, not substituted");
+
+  t.eqI32(dirRoute("/tor/robots.txt".toBytes(), docs).status, 404, "anything else is a 404");
+  t.eqI32(dirRoute("/".toBytes(), docs).status, 404, "including the root");
+  return t.report();
+}
+
+export string test_the_compression_suffix_is_a_request_not_a_name(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  DirDocuments docs = docsFrom(ref);
+
+  // `.z` asks for zlib. Strip it before matching or every real request 404s — which is the whole
+  // failure mode: a server that works when tested by hand and never when tested by tor.
+  t.eqBytes(stripDotZ("/tor/keys/all.z".toBytes()), "/tor/keys/all".toBytes(),
+            "the suffix comes off");
+  t.eqBytes(stripDotZ("/tor/keys/all".toBytes()), "/tor/keys/all".toBytes(),
+            "and an absent one changes nothing");
+  t.eqBytes(stripDotZ("z".toBytes()), "z".toBytes(), "a bare z is not a suffix");
+  t.eqBytes(stripDotZ(".z".toBytes()), u8[0](), "the suffix alone leaves nothing");
+
+  // Only the trailing one: a path with `.z` inside it keeps it.
+  t.eqBytes(stripDotZ("/tor/keys/fp/A.zB".toBytes()), "/tor/keys/fp/A.zB".toBytes(),
+            "a .z that is not the suffix stays");
+  return t.report();
+}
+
+export string test_the_response_is_framed_for_a_client(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  DirDocuments docs = docsFrom(ref);
+  u8[] res = dirResponse("/tor/keys/all.z".toBytes(), docs);
+
+  t.isTrue(startsWith(res, "HTTP/1.1 200"), "a status line a client can read");
+  t.isTrue(contains(res, "Content-Type: text/plain"), "the content type tor's own cache sends");
+  t.isTrue(contains(res, "Content-Length: "), "a length, so the body's end is not the socket's");
+  t.isTrue(contains(res, "dir-key-certificate-version 3"), "the certificate is in the body");
+
+  // A 404 is framed too, rather than a bare close that a client reads as a network fault.
+  u8[] missing = dirResponse("/nope".toBytes(), docs);
+  t.isTrue(startsWith(missing, "HTTP/1.1 404"), "a 404 is a reply, not a hangup");
+  return t.report();
+}
+
+string lower(string s) {
+  u8[] b = s.toBytes();
+  u8[] out = u8[b.len()]();
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 c = b[i];
+    out[i] = (c >= 65 && c <= 90) ? c + 32 : c;
+  }
+  return string.fromBytes(out);
+}
+
+bool startsWith(u8[] s, string prefix) {
+  u8[] p = prefix.toBytes();
+  if (s.len() < p.len()) { return false; }
+  for (i32 i = 0; i < p.len(); i++) { if (s[i] != p[i]) { return false; } }
+  return true;
+}
+
+bool contains(u8[] s, string text) {
+  u8[] t = text.toBytes();
+  for (i32 i = 0; i + t.len() <= s.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < t.len(); j++) { if (s[i + j] != t[j]) { hit = false; break; } }
+    if (hit) { return true; }
+  }
+  return false;
+}
