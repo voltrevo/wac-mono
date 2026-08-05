@@ -1,0 +1,174 @@
+// The responder's half of the link handshake.
+//
+// The framing is fixed by tor-spec and checked against the byte offsets it states, as `cell_test.wac`
+// does for cells generally. What this file can additionally do is check the two halves *fit*: the
+// client in `link.wac` reads a responder's four cells, so a reply this file builds must be one that
+// reader accepts, cell for cell.
+//
+// That is not a differential — both halves are ours — and it is worth saying so. It catches a
+// disagreement between our reader and our writer and nothing else. The real check is a C tor client
+// completing a handshake with our relay, which is `design/0002` step 3's *done* condition and needs
+// the relay to exist first.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { itoa64 } from "../../../wactest/src/itoa64.wac";
+import {
+  relayHandshakeReply, authChallengeBody, relayNetinfo, relayNetinfoAt, responderVersion,
+  netinfoOtherAddress, supportedVersions, AUTH_METHOD_ED25519_SHA256_RFC5705,
+} from "../../src/relaylink.wac";
+import {
+  encodeVersions, encodeNetinfo, cellCommand, cellPayload, cellSize, cmdVersions, cmdCerts,
+  cmdAuthChallenge, cmdNetinfo,
+} from "../../src/cell.wac";
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] != b[i]) { return false; }
+  }
+  return true;
+}
+u8[] fill(i32 n, i32 seed) {
+  u8[] o = u8[n]();
+  for (i32 i = 0; i < n; i++) { o[i] = (i * 31 + seed * 7 + 5) & 0xFF; }
+  return o;
+}
+
+export string test_the_reply_is_four_cells_in_the_order_the_spec_fixes() {
+  // "The responder sends a VERSIONS cell, a CERTS cell, an AUTH_CHALLENGE cell, and a NETINFO cell."
+  // The order is not decorative: an initiator reads them in sequence and a CERTS cell arriving
+  // before the version is negotiated cannot be framed, because VERSIONS uses a two-byte circuit id
+  // and everything after it uses four.
+  T t = T.create();
+  u8[] certs = fill(300, 1);
+  u8[] challenge = fill(32, 2);
+  u8[] theirIp = u8[](10, 0, 0, 7);
+
+  u8[] reply = relayHandshakeReply(certs, challenge, theirIp);
+  t.isTrue(reply.len() > 300, "the reply carries the certificates");
+
+  // Walk it as an initiator would.
+  i32 at = 0;
+  t.eqI32(cellCommand(reply, at), cmdVersions(), "first a VERSIONS cell");
+  at = at + cellSize(reply, at);
+  t.eqI32(cellCommand(reply, at), cmdCerts(), "then CERTS");
+  t.isTrue(same(cellPayload(reply, at), certs), "carrying exactly the body it was given");
+  at = at + cellSize(reply, at);
+  t.eqI32(cellCommand(reply, at), cmdAuthChallenge(), "then AUTH_CHALLENGE");
+  u8[] auth = cellPayload(reply, at);
+  at = at + cellSize(reply, at);
+  t.eqI32(cellCommand(reply, at), cmdNetinfo(), "then NETINFO");
+  at = at + cellSize(reply, at);
+  t.eqI32(at, reply.len(), "and nothing after it");
+
+  // The challenge must be the one supplied, not a copy of anything else in the reply.
+  t.isTrue(same(slice(auth, 0, 32), challenge), "the challenge is passed through verbatim");
+  t.eqI32((auth[32] * 256) + auth[33], 1, "one authentication method is offered");
+  t.eqI32((auth[34] * 256) + auth[35], AUTH_METHOD_ED25519_SHA256_RFC5705, "and it is ed25519");
+  return t.report();
+}
+
+export string test_a_constant_challenge_is_refused() {
+  // "Responders MUST generate every challenge independently using a strong RNG or PRNG." Nothing
+  // here can check randomness, and pretending otherwise would be worse than admitting it — but an
+  // all-zero challenge is the shape a forgotten `randomBytes` takes, and that much is catchable.
+  T t = T.create();
+  u8[] certs = fill(100, 3);
+  u8[] ip = u8[](127, 0, 0, 1);
+  t.eqI32(relayHandshakeReply(certs, u8[32](), ip).len(), 0, "an all-zero challenge is refused");
+  t.isTrue(relayHandshakeReply(certs, fill(32, 4), ip).len() > 0, "a real one is not");
+  t.eqI32(relayHandshakeReply(certs, fill(31, 4), ip).len(), 0, "a 31-byte challenge is refused");
+  t.eqI32(relayHandshakeReply(u8[0](), fill(32, 4), ip).len(), 0, "an empty CERTS body is refused");
+  t.eqI32(relayHandshakeReply(certs, fill(32, 4), u8[](1, 2, 3)).len(), 0, "a 3-byte address too");
+  t.eqI32(authChallengeBody(u8[31]()).len(), 0, "and directly, too");
+  return t.report();
+}
+
+export string test_a_relays_netinfo_states_what_a_clients_does_not() {
+  // A client sends no timestamp and no address of its own — tor-spec says clients SHOULD send 0 to
+  // avoid fingerprinting, and a client has no address worth announcing. A relay is a public, named
+  // thing and sends both, so an initiator can notice its own clock skew.
+  T t = T.create();
+  u8[] theirs = u8[](192, 168, 1, 9);
+  u8[] mine = u8[](10, 1, 2, 3);
+
+  u8[] withMine = relayNetinfoAt(theirs, mine, 1785900000);
+  u8[] payload = cellPayload(withMine, 0);
+  t.eqI32(cellCommand(withMine, 0), cmdNetinfo(), "a NETINFO cell");
+  i64 stamp = ((payload[0] as i64) << 24) | ((payload[1] as i64) << 16) |
+              ((payload[2] as i64) << 8) | (payload[3] as i64);
+  t.eqI64(stamp, 1785900000, "the timestamp is big-endian seconds");
+  t.eqI32(payload[4], 4, "OTHERADDR is IPv4");
+  t.eqI32(payload[5], 4, "four bytes long");
+  t.isTrue(same(slice(payload, 6, 10), theirs), "and is the initiator's address");
+  t.eqI32(payload[10], 1, "one address of our own");
+  t.eqI32(payload[11], 4, "IPv4");
+  t.eqI32(payload[12], 4, "four bytes");
+  t.isTrue(same(slice(payload, 13, 17), mine), "and it is ours");
+
+  // Without one — a relay that does not yet know its own address.
+  u8[] without = relayNetinfo(theirs, u8[0]());
+  u8[] p2 = cellPayload(without, 0);
+  t.eqI32(p2[10], 0, "no addresses of our own");
+  i64 zero = ((p2[0] as i64) << 24) | ((p2[1] as i64) << 16) | ((p2[2] as i64) << 8) | (p2[3] as i64);
+  t.eqI64(zero, 0, "and no timestamp when none is given");
+
+  t.eqI32(relayNetinfoAt(theirs, u8[](1, 2, 3), 0).len(), 0, "a 3-byte own address is refused");
+  t.eqI32(relayNetinfoAt(u8[0](), mine, 0).len(), 0, "and an absent initiator address");
+  return t.report();
+}
+
+export string test_the_version_we_pick_is_the_highest_in_common() {
+  T t = T.create();
+  // An initiator offering 3, 4 and 5 — we speak 4 and 5, so 5.
+  t.eqI32(responderVersion(encodeVersions(i32[](3, 4, 5))), 5, "the highest in common");
+  t.eqI32(responderVersion(encodeVersions(i32[](3, 4))), 4, "the highest in common, again");
+  t.eqI32(responderVersion(encodeVersions(i32[](5))), 5, "one version in common");
+  t.eqI32(responderVersion(encodeVersions(i32[](1, 2, 3))), -1, "nothing in common is -1");
+  t.eqI32(responderVersion(encodeVersions(i32[](99))), -1, "a version from the future too");
+
+  // Not a VERSIONS cell at all.
+  t.eqI32(responderVersion(encodeNetinfo(u8[](1, 2, 3, 4))), -1, "a NETINFO cell is refused");
+  t.eqI32(responderVersion(u8[0]()), -1, "and nothing at all");
+
+  // We must offer what we accept — a relay that negotiated a version it does not speak would frame
+  // every later cell wrongly.
+  i32[] mine = supportedVersions();
+  t.isTrue(mine.len() >= 1, "we speak at least one version");
+  for (i32 i = 0; i < mine.len(); i++) {
+    t.eqI32(responderVersion(encodeVersions(i32[](mine[i]))), mine[i],
+            "we accept version " + itoa64(mine[i] as i64) + ", which we offer");
+  }
+  return t.report();
+}
+
+export string test_the_initiators_netinfo_tells_us_our_own_address() {
+  // OTHERADDR in the *initiator's* NETINFO is the address it thinks *we* have. A relay behind a NAT
+  // cannot discover that any other way — and must not simply believe it, since the initiator is a
+  // stranger. Reading it is this function's job; deciding whether to trust it is not.
+  T t = T.create();
+  u8[] cell = encodeNetinfo(u8[](203, 0, 113, 5));
+  t.isTrue(same(netinfoOtherAddress(cell), u8[](203, 0, 113, 5)),
+           "the address the initiator says we have");
+
+  // Malformed cells give nothing rather than a wrong four bytes.
+  t.eqI32(netinfoOtherAddress(encodeVersions(i32[](4, 5))).len(), 0, "a VERSIONS cell is refused");
+  t.eqI32(netinfoOtherAddress(u8[0]()).len(), 0, "and nothing at all");
+
+  // An IPv6 OTHERADDR is not an IPv4 address and must not be read as one — the length and type both
+  // say so, and taking four bytes anyway would produce a plausible and wrong address.
+  // Mutating the cell itself, not a copy: `cellPayload` returns a fresh array, so editing that
+  // changes nothing — which is how the first version of this test passed while asserting nothing.
+  // A fixed-length cell is a four-byte circuit id and a command, so the payload starts at byte 5.
+  u8[] v6 = relayNetinfoAt(u8[](1, 2, 3, 4), u8[0](), 0);
+  v6[5 + 4] = 6;
+  v6[5 + 5] = 16;
+  t.eqI32(netinfoOtherAddress(v6).len(), 0, "an IPv6 OTHERADDR is not read as IPv4");
+  return t.report();
+}
+
+u8[] slice(u8[] s, i32 from, i32 to) {
+  u8[] o = u8[to - from]();
+  for (i32 i = 0; i < o.len(); i++) { o[i] = s[from + i]; }
+  return o;
+}

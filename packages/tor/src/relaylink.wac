@@ -1,0 +1,173 @@
+// The responder's half of the link handshake: what a relay says when somebody connects to it.
+//
+// tor-spec §4. The initiator opens TLS and sends a VERSIONS cell; the responder answers with four
+// cells in one breath — VERSIONS, CERTS, AUTH_CHALLENGE, NETINFO — and then waits for the
+// initiator's NETINFO (and, if it wants to authenticate, a CERTS and an AUTHENTICATE first).
+//
+//     initiator                       responder
+//     ---------                       ---------
+//     VERSIONS         ------>
+//                      <------        VERSIONS, CERTS, AUTH_CHALLENGE, NETINFO
+//     [CERTS, AUTHENTICATE,]
+//     NETINFO          ------>
+//
+// `packages/tor/src/link.wac` is the other side of this exchange, and reading the two together is
+// the fastest way to see what each field is for.
+//
+// ## What a relay does and does not have to prove
+//
+// The responder must authenticate: a client picks relays out of a signed consensus by fingerprint,
+// and a relay that could not prove its identity would let anyone who can intercept a TCP connection
+// be any relay. That proof is the CERTS cell, and it is what `relaycert.wac` builds.
+//
+// The **initiator** need not. A client is nobody in particular and has nothing to prove, so it sends
+// a NETINFO and the exchange is over. AUTH_CHALLENGE is sent regardless, because the responder does
+// not know yet which kind of peer it has — a relay extending a circuit *does* authenticate, and it
+// needs the challenge to do so.
+//
+// ## The link protocol version is the initiator's choice, bounded by ours
+//
+// Both sides send the versions they speak and both compute the highest in common. Getting that
+// wrong in the same way on both sides would agree on a version neither implements, which is why
+// `negotiateVersion` is shared with the client rather than written twice.
+
+import {
+  encodeFixed, encodeVar, encodeVersions, negotiateVersion, cmdVersions, cmdNetinfo, cmdCerts,
+  cmdAuthChallenge, cellCommand, cellPayload, cellLen,
+} from "./cell.wac";
+
+/** Authentication method 3: `Ed25519-SHA256-RFC5705`, the only one a modern relay offers. */
+export const i32 AUTH_METHOD_ED25519_SHA256_RFC5705 = 3;
+
+/** Link protocol versions this relay speaks. 5 is the current one; 4 is still widely used. */
+export i32[] supportedVersions() { return i32[](4, 5); }
+
+/**
+ * The four cells a responder sends after receiving a VERSIONS cell.
+ *
+ * Returned as one buffer because they go out together and there is nothing to decide in between —
+ * splitting them into four calls would invite a caller to send three.
+ *
+ * `challenge` must be 32 bytes from a strong random source. tor-spec: "Responders MUST generate
+ * every challenge independently using a strong RNG or PRNG." It is passed in rather than generated
+ * here because this file has no access to one, and a caller that supplies a constant has made a
+ * mistake that no test here can see — so `relayHandshakeReply` refuses a challenge that is all
+ * zeros, which catches the commonest form of it.
+ */
+export u8[] relayHandshakeReply(u8[] certsCellBody, u8[] challenge, u8[] initiatorIpv4) {
+  if (certsCellBody.len() == 0 || challenge.len() != 32 || initiatorIpv4.len() != 4) {
+    return u8[0]();
+  }
+  if (isZero(challenge)) { return u8[0](); }
+
+  u8[] versions = encodeVersions(supportedVersions());
+  u8[] certs = encodeVar(0, cmdCerts(), certsCellBody);
+  u8[] auth = encodeVar(0, cmdAuthChallenge(), authChallengeBody(challenge));
+  u8[] netinfo = relayNetinfo(initiatorIpv4, u8[0]());
+  return concat4(versions, certs, auth, netinfo);
+}
+
+/**
+ * `Challenge [32] | N_Methods [2] | Methods [2*N]`.
+ *
+ * One method: ed25519. Offering the older RSA-SHA256-TLSSecret method would mean implementing it,
+ * and a modern initiator that wants to authenticate offers ed25519 anyway.
+ */
+export u8[] authChallengeBody(u8[] challenge) {
+  if (challenge.len() != 32) { return u8[0](); }
+  u8[] body = u8[32 + 2 + 2]();
+  for (i32 i = 0; i < 32; i++) { body[i] = challenge[i]; }
+  body[33] = 1;                                        // N_Methods, big-endian 1
+  body[35] = AUTH_METHOD_ED25519_SHA256_RFC5705;       // big-endian, high byte zero
+  return body;
+}
+
+/**
+ * A responder's NETINFO: the initiator's address, and ours.
+ *
+ * Unlike a client's, this one **states its own address and a real timestamp**. `encodeNetinfo` in
+ * `cell.wac` sends neither, and deliberately: tor-spec says clients SHOULD send 0 as their timestamp
+ * to avoid fingerprinting, and a client has no address worth announcing. A relay is the opposite —
+ * it is a public, named thing, and an initiator uses the timestamp to notice its own clock skew.
+ *
+ * `now` is seconds since the epoch, or zero to omit it. `myIpv4` may be empty for a relay that does
+ * not know its own address yet.
+ */
+export u8[] relayNetinfoAt(u8[] initiatorIpv4, u8[] myIpv4, i64 now) {
+  if (initiatorIpv4.len() != 4) { return u8[0](); }
+  if (myIpv4.len() != 0 && myIpv4.len() != 4) { return u8[0](); }
+  i32 mine = (myIpv4.len() == 4) ? 1 : 0;
+  u8[] payload = u8[4 + 6 + 1 + (mine * 6)]();
+  for (i32 i = 0; i < 4; i++) {
+    payload[i] = ((now >> (((3 - i) * 8) as@ u32)) & 0xFF) as~ i32;
+  }
+  payload[4] = 4;                    // OTHERADDR type: IPv4
+  payload[5] = 4;
+  for (i32 i = 0; i < 4; i++) { payload[6 + i] = initiatorIpv4[i]; }
+  payload[10] = mine;
+  if (mine == 1) {
+    payload[11] = 4;
+    payload[12] = 4;
+    for (i32 i = 0; i < 4; i++) { payload[13 + i] = myIpv4[i]; }
+  }
+  return encodeFixed(0, cmdNetinfo(), payload);
+}
+
+/** `relayNetinfoAt` with no timestamp, for a relay that has no clock to offer. */
+export u8[] relayNetinfo(u8[] initiatorIpv4, u8[] myIpv4) {
+  return relayNetinfoAt(initiatorIpv4, myIpv4, 0);
+}
+
+/**
+ * The link version to use, from the initiator's VERSIONS cell.
+ *
+ * −1 if the cell is not a VERSIONS cell or if there is nothing in common. Sharing
+ * `negotiateVersion` with the client is deliberate: two implementations of "highest in common"
+ * can agree on a version neither speaks, and one of them is always the one that is wrong.
+ */
+export i32 responderVersion(u8[] cell) {
+  if (cell.len() == 0) { return -1; }
+  if (cellCommand(cell, 0) != cmdVersions()) { return -1; }
+  // `negotiateVersion` takes the *payload*, and answers 0 rather than −1 when nothing matches.
+  // Both are easy to get wrong from the name alone; the client calls it the same way.
+  i32 best = negotiateVersion(cellPayload(cell, 0), supportedVersions());
+  return (best == 0) ? -1 : best;
+}
+
+/**
+ * The initiator's address as seen from here, out of its NETINFO's OTHERADDR field.
+ *
+ * That is the address the *initiator* thinks we have, not the address we think it has. A relay uses
+ * it to learn its own public address, which it cannot otherwise discover from behind a NAT — and it
+ * must not be believed on its own, because the initiator is a stranger. Empty unless it is an IPv4
+ * address of the right length.
+ */
+export u8[] netinfoOtherAddress(u8[] cell) {
+  if (cell.len() == 0 || cellCommand(cell, 0) != cmdNetinfo()) { return u8[0](); }
+  u8[] payload = cellPayload(cell, 0);
+  if (payload.len() < 6) { return u8[0](); }
+  if (payload[4] != 4 || payload[5] != 4) { return u8[0](); }
+  if (payload.len() < 10) { return u8[0](); }
+  u8[] out = u8[4]();
+  for (i32 i = 0; i < 4; i++) { out[i] = payload[6 + i]; }
+  return out;
+}
+
+bool isZero(u8[] b) {
+  i32 acc = 0;
+  for (i32 i = 0; i < b.len(); i++) { acc = acc | b[i]; }
+  return acc == 0;
+}
+
+u8[] concat4(u8[] a, u8[] b, u8[] c, u8[] d) {
+  u8[] out = u8[a.len() + b.len() + c.len() + d.len()]();
+  i32 at = 0;
+  for (i32 i = 0; i < a.len(); i++) { out[at + i] = a[i]; }
+  at = at + a.len();
+  for (i32 i = 0; i < b.len(); i++) { out[at + i] = b[i]; }
+  at = at + b.len();
+  for (i32 i = 0; i < c.len(); i++) { out[at + i] = c[i]; }
+  at = at + c.len();
+  for (i32 i = 0; i < d.len(); i++) { out[at + i] = d[i]; }
+  return out;
+}

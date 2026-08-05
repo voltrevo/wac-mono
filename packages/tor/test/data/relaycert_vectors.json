@@ -1,0 +1,32 @@
+{
+  "source": "tor 0.4.7.13 on a local chutney network",
+  "produced_by": "packages/tor/tools/capture-relaycert.py",
+  "note": "Certificates tor generated. The signing cert is type 4: the relay's signing key, certified by its ed25519 master identity, with the identity in extension 4. Our verifier must accept every one of them, which checks that the signature covers the first N-64 bytes with no personalisation prefix \u2014 cert-spec \u00a71.1's general rule says there is a prefix and \u00a72.1 overrides it, and reading only the first gives a certificate no relay accepts.",
+  "secretKeyNote": "ed25519_signing_secret_key holds an *expanded* key \u2014 32 bytes of clamped scalar and 32 of nonce \u2014 not a seed. `ed25519Sign` takes a seed, so these cannot be used to re-sign tor's own certificates. The byte-for-byte rebuild test therefore uses a keypair of our own and checks the encoding against a cert we can re-derive, while the verification tests use tor's.",
+  "cases": [
+    {
+      "nickname": "test000a",
+      "masterIdentity": "b8495b55603f75f16ed00d23b0535e00c5f001e06d615e28ba1153ae6a4f6f58",
+      "signingCert": "0104000794a4012b707295b13d9ead06a8a97c5fe1ec7e837c0fac74d0bb1d1076eaac781384800100200400b8495b55603f75f16ed00d23b0535e00c5f001e06d615e28ba1153ae6a4f6f58ffc176fdef25f81f6a043d7f92e8d68b6382fa1b08d25a236184bb4c19d4bb4c91dfe6eef3878b1ec08d15c14b6c28dbd5377d6940d01da2608a9f47368ba401",
+      "signingSecretExpanded": "88e46d535ebcb7dbb485bbde83a5af9dd989ec83473e85418d379b384e28eb62633c34b4821b66267595deb39cf05938b2c7174b172b35332b3414c1117130ac"
+    },
+    {
+      "nickname": "test001a",
+      "masterIdentity": "357d113328e714a871d0037aebb51fb4f715601d7e636e27bdb7899f6babb57e",
+      "signingCert": "0104000794a4017a04419f169c88a6df1d2283d006b55bc76b367670770b97653aadbd3d3d408d0100200400357d113328e714a871d0037aebb51fb4f715601d7e636e27bdb7899f6babb57ee34ca2e74362ff73c299135eb3499fbe6bc31bf77d651bc13e9e1df94e5c1c66c6d5d3a92a5da6b90628c7c062277373b935f392e79df4dbf294f63c55a6620d",
+      "signingSecretExpanded": "78b1c7f69163534594dbc83473b110b4695e16335a82f73323ca7fdbd60e1c4dcf820a944459e89d0b1449cf8318c6dd3794508bd487c9214bce8f3d70373280"
+    },
+    {
+      "nickname": "test002a",
+      "masterIdentity": "059cd54294683a80c3a60e563044fca191d616928cd9290795198f9ec171b192",
+      "signingCert": "0104000794a401ac3853cc553911ea1dfbf60def6373ed314e3e24c7aa7cc2363f3441f864722e0100200400059cd54294683a80c3a60e563044fca191d616928cd9290795198f9ec171b19259483df0927dbecd0763754bf9ba17345fdee04116781455bca6f54dc19fb41ae89e4a002e4be0eae8dbf3a31acc7a7ed1e0e9d2d195edce82dbe44a71250b0e",
+      "signingSecretExpanded": "3050e7608d322026d563ec5c81bc21714501ed96035f9c34de7630e4d23947427ce20ab951af999110030436cb00c29e4aa169bd9120d01ecc66752af325968e"
+    },
+    {
+      "nickname": "test003r",
+      "masterIdentity": "68c8623b3bebb4e39f3f003f35474cb3d5e23cbf4818e6b8cd2404bdca9b53f9",
+      "signingCert": "0104000794a4016e9538053cad61a0dd84d4e34ab74bdc443d6ca716d101d7cb9ec9cf7ef4da5b010020040068c8623b3bebb4e39f3f003f35474cb3d5e23cbf4818e6b8cd2404bdca9b53f9a536b01e57bfdbc1387cf5fb980fb861146e73a8e59e5be19e52da0d688581c8a0353a899a4fbcafc62ac7405b36235be693859725ab899ebc6579b6168b4e0e",
+      "signingSecretExpanded": "e8a0ccab8df8048ddd639a03bf8bc940001ed894c59807759dafa7399ee4fb73dadfba960e0b120a9310dcce7a5308079276bd071597c8d4eecfbc95bfdfa712"
+    }
+  ]
+}
