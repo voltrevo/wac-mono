@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-28 packages, 52,977 lines of wac, 1065 tests,
+28 packages, 53,243 lines of wac, 1068 tests,
 27 command-line programs and 4 browser pages.
 
 ## Packages
@@ -40,7 +40,7 @@ In dependency order: nothing here imports anything below it.
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,263 | 70 | `crypto` |
 | [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 4,053 | 33 | `bytes` `codec` `crypto` `datetime` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`lightclient`](packages/lightclient/) | **The Altair sync protocol works. | 642 | 12 | `bls` `ssz` |
-| [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 5,335 | 130 | `bytes` `codec` `crypto` `datetime` `platform` `std` `tls` |
+| [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 5,601 | 133 | `bytes` `codec` `crypto` `datetime` `platform` `std` `tls` |
 
 ## Programs
 

@@ -7,7 +7,7 @@
 
 import { wacTestRun } from "../../../harness/wacTestRun.ts";
 
-const V_DESCRIPTOR = 0, V_KEYS = 1, V_LAYER = 2, V_INTRO_COUNT = 3;
+const V_DESCRIPTOR = 0, V_KEYS = 1, V_LAYER = 2, V_INTRO_COUNT = 3, V_INTRO = 4;
 
 type Vectors = {
   identityKey: string;
@@ -25,7 +25,7 @@ type Vectors = {
     plaintextSha3: string;
     plaintextLength: number;
   }[];
-  introductionPoints: unknown[];
+  introductionPoints: { linkSpecifiers: string; onionKeyNtor: string; encKeyNtor: string; authKey: string }[];
 };
 
 const v = JSON.parse(
@@ -71,6 +71,15 @@ function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
     }
     case V_INTRO_COUNT:
       return new Uint8Array([v.introductionPoints.length]);
+    case V_INTRO: {
+      const p = v.introductionPoints[a[0]];
+      const b64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+      const ls = b64(p.linkSpecifiers);
+      return new Uint8Array([
+        ls.length >> 8, ls.length & 0xff, ...ls,
+        ...b64(p.onionKeyNtor), ...b64(p.encKeyNtor), ...hex(p.authKey),
+      ]);
+    }
     default:
       throw new Error(`unknown vector field ${what}`);
   }

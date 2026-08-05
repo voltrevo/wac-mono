@@ -18,11 +18,17 @@ import {
   superencryptedConstant, encryptedConstant,
   S_KEY_LEN, S_IV_LEN, MAC_KEY_LEN, SALT_LEN, MAC_LEN,
 } from "../../src/hsdesc.wac";
+import {
+  IntroPoint, parseIntroPoints, linkSpecifiersValid, linkSpecifier,
+  introduce1Plaintext, introduce1Cell, introduce1MacInput, establishRendezvousCell,
+  rendezvous2HandshakeInfo, LS_IPV4, LS_LEGACY_ID, LS_ED25519_ID,
+} from "../../src/hsintro.wac";
 
 const i32 V_DESCRIPTOR = 0;
 const i32 V_KEYS = 1;         // identity(32) blinded(32) signing(32) subcred(32) revision(8)
 const i32 V_LAYER = 2;        // a[0]=layer: salt(16) key(32) iv(16) mackey(32) sha3(32) len(8)
 const i32 V_INTRO_COUNT = 3;
+const i32 V_INTRO = 4;      // a[0]=i: lsLen(2) linkSpecifiers onion(32) enc(32) auth(32)
 
 bool same(u8[] a, u8[] b) {
   if (a.len() != b.len()) { return false; }
@@ -236,5 +242,151 @@ export string test_the_document_reader_does_not_match_mid_line(fn[u8[](i32, u8[]
   u8[] good = "thing\n-----BEGIN MESSAGE-----\nQUJD\n-----END MESSAGE-----\n".toBytes();
   t.isTrue(same(pemBlock(good, "thing".toBytes(), "MESSAGE".toBytes()), "ABC".toBytes()),
            "a well-formed block decodes");
+  return t.report();
+}
+
+// ── Introduction points ───────────────────────────────────────────────────────
+
+export string test_the_introduction_points_are_the_ones_tor_published(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  // Decrypt both layers, then parse. Every key is compared against what an independent decryption
+  // read out of the same descriptor, so a parser that took the wrong 32 bytes — and there are three
+  // different 32-byte ntor-shaped keys per introduction point — fails here rather than at connect
+  // time against a service that simply never answers.
+  T t = T.create();
+  u8[] doc = ref(V_DESCRIPTOR, none(), none());
+  u8[] keys = ref(V_KEYS, none(), none());
+  u8[] blinded = slice(keys, 32, 64);
+  u8[] subcred = slice(keys, 96, 128);
+  i64 revision = be64(keys, 128);
+
+  u8[] first = decryptLayer(pemBlock(doc, "superencrypted".toBytes(), "MESSAGE".toBytes()),
+                            blinded, subcred, revision, superencryptedConstant());
+  u8[] second = decryptLayer(pemBlock(first, "encrypted".toBytes(), "MESSAGE".toBytes()),
+                             blinded, subcred, revision, encryptedConstant());
+  t.isTrue(second.len() > 0, "the second layer decrypted");
+
+  IntroPoint[] points = parseIntroPoints(second);
+  i32 want = ref(V_INTRO_COUNT, none(), none())[0];
+  t.eqI32(points.len(), want, "every introduction point parsed");
+
+  for (i32 i = 0; i < points.len(); i++) {
+    u8[] expect = ref(V_INTRO, arg1(i), none());   // ls_len(2) ls onion(32) enc(32) auth(32)
+    i32 lsLen = (expect[0] * 256) + expect[1];
+    string which = "intro " + itoa64(i as i64);
+    t.isTrue(same(points[i].linkSpecifiers, slice(expect, 2, 2 + lsLen)),
+             which + ": the link specifiers are forwarded verbatim");
+    t.isTrue(same(points[i].onionKey, slice(expect, 2 + lsLen, 2 + lsLen + 32)),
+             which + ": onion-key ntor — the introduction relay's, for extending to it");
+    t.isTrue(same(points[i].encKey, slice(expect, 2 + lsLen + 32, 2 + lsLen + 64)),
+             which + ": enc-key ntor — the service's, for the hs-ntor handshake");
+    t.isTrue(same(points[i].authKey, slice(expect, 2 + lsLen + 64, 2 + lsLen + 96)),
+             which + ": auth-key, from inside its type-9 certificate");
+    // The three keys are all 32 bytes and all distinct, so a transposition would be caught above —
+    // assert the distinctness too, since a descriptor where two happened to match would make those
+    // comparisons vacuous.
+    t.isFalse(same(points[i].onionKey, points[i].encKey), which + ": onion-key is not enc-key");
+    t.isFalse(same(points[i].onionKey, points[i].authKey), which + ": onion-key is not auth-key");
+    t.isFalse(same(points[i].encKey, points[i].authKey), which + ": enc-key is not auth-key");
+  }
+  return t.report();
+}
+
+export string test_link_specifiers_are_read_without_being_rebuilt(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] expect = ref(V_INTRO, arg1(0), none());
+  i32 lsLen = (expect[0] * 256) + expect[1];
+  u8[] ls = slice(expect, 2, 2 + lsLen);
+  t.isTrue(linkSpecifiersValid(ls), "a real link specifier list is well formed");
+
+  // An IPv4 specifier is four address bytes and a big-endian port. chutney runs on loopback, so the
+  // address is known and this checks the offsets rather than merely the length.
+  u8[] v4 = linkSpecifier(ls, LS_IPV4);
+  t.eqI32(v4.len(), 6, "the IPv4 specifier is six bytes");
+  t.eqI32(v4[0], 127, "on loopback, as chutney runs everything");
+  t.eqI32(v4[3], 1, "127.0.0.1");
+  i32 port = (v4[4] * 256) + v4[5];
+  t.isTrue(port > 1024, "the port is a real one, read big-endian");
+
+  t.eqI32(linkSpecifier(ls, LS_LEGACY_ID).len(), 20, "the legacy identity is a 20-byte digest");
+  t.eqI32(linkSpecifier(ls, LS_ED25519_ID).len(), 32, "the ed25519 identity is 32 bytes");
+  t.eqI32(linkSpecifier(ls, 99).len(), 0, "an absent type is empty rather than the first entry");
+
+  // Malformed lists are refused rather than half-read. A length running past the end is what a
+  // truncated descriptor looks like, and reading it would walk off the buffer.
+  t.isFalse(linkSpecifiersValid(u8[0]()), "an empty list is not valid");
+  u8[] zero = u8[1]();
+  t.isFalse(linkSpecifiersValid(zero), "a list claiming zero entries is not valid");
+  u8[] overrun = u8[4]();
+  overrun[0] = 1;
+  overrun[1] = LS_IPV4;
+  overrun[2] = 200;
+  t.isFalse(linkSpecifiersValid(overrun), "an entry longer than the buffer is refused");
+  u8[] trailing = u8[5]();
+  trailing[0] = 1;
+  trailing[1] = LS_IPV4;
+  trailing[2] = 1;
+  t.isFalse(linkSpecifiersValid(trailing), "trailing bytes after the last entry are refused");
+  return t.report();
+}
+
+export string test_the_cells_have_the_layout_the_spec_fixes(fn[u8[](i32, u8[], u8[])] ref) {
+  // Framing, where a mistake desynchronises rather than fails: an introduction point that reads
+  // AUTH_KEY from the wrong offset finds no matching circuit and drops the cell silently.
+  T t = T.create();
+  u8[] expect = ref(V_INTRO, arg1(0), none());
+  i32 lsLen = (expect[0] * 256) + expect[1];
+  u8[] ls = slice(expect, 2, 2 + lsLen);
+  u8[] onion = slice(expect, 2 + lsLen, 2 + lsLen + 32);
+  u8[] auth = slice(expect, 2 + lsLen + 64, 2 + lsLen + 96);
+
+  u8[] cookie = u8[20]();
+  for (i32 i = 0; i < 20; i++) { cookie[i] = (i * 9 + 1) & 0xFF; }
+
+  u8[] plain = introduce1Plaintext(cookie, onion, ls);
+  t.eqI32(plain.len(), 20 + 1 + 1 + 2 + 32 + lsLen, "the plaintext is exactly its fields");
+  t.isTrue(same(slice(plain, 0, 20), cookie), "the rendezvous cookie comes first");
+  t.eqI32(plain[20], 0, "no extensions");
+  t.eqI32(plain[21], 1, "ONION_KEY_TYPE is 1, ntor");
+  t.eqI32(plain[22], 0, "ONION_KEY_LEN is big-endian 32");
+  t.eqI32(plain[23], 32, "…and its low byte is 32");
+  t.isTrue(same(slice(plain, 24, 56), onion), "then the rendezvous point's onion key");
+  t.isTrue(same(slice(plain, 56, 56 + lsLen), ls), "then its link specifiers, verbatim");
+
+  u8[] encrypted = u8[100]();
+  for (i32 i = 0; i < 100; i++) { encrypted[i] = (i * 3) & 0xFF; }
+  u8[] cell = introduce1Cell(auth, encrypted);
+  t.eqI32(cell.len(), 20 + 1 + 2 + 32 + 1 + 100, "the cell is exactly its fields");
+  // LEGACY_KEY_ID must be twenty zero bytes: that is how an introduction point tells a v3 cell from
+  // a v2 one, and anything non-zero there is handled as legacy and dropped.
+  i32 legacy = 0;
+  for (i32 i = 0; i < 20; i++) { legacy = legacy | cell[i]; }
+  t.eqI32(legacy, 0, "LEGACY_KEY_ID is twenty zero bytes");
+  t.eqI32(cell[20], 2, "AUTH_KEY_TYPE is 2, ed25519");
+  t.eqI32(cell[21], 0, "AUTH_KEY_LEN is big-endian 32");
+  t.eqI32(cell[22], 32, "…and its low byte is 32");
+  t.isTrue(same(slice(cell, 23, 55), auth), "then the auth key");
+  t.eqI32(cell[55], 0, "then no extensions");
+  t.isTrue(same(slice(cell, 56, cell.len()), encrypted), "then the encrypted portion");
+
+  // The MAC covers AUTH_KEY_TYPE through the end of the ciphertext — starting at byte 20, not at the
+  // key, and excluding the MAC about to be appended. Both ends are a few bytes from wrong.
+  u8[] macInput = introduce1MacInput(cell);
+  t.eqI32(macInput.len(), cell.len() - 20, "the MAC input skips only LEGACY_KEY_ID");
+  t.eqI32(macInput[0], 2, "it begins at AUTH_KEY_TYPE");
+
+  // ESTABLISH_RENDEZVOUS is the cookie and nothing else.
+  t.isTrue(same(establishRendezvousCell(cookie), cookie), "ESTABLISH_RENDEZVOUS is just the cookie");
+  t.eqI32(establishRendezvousCell(u8[19]()).len(), 0, "a 19-byte cookie is refused");
+  t.eqI32(introduce1Plaintext(u8[19](), onion, ls).len(), 0, "and in the plaintext too");
+  t.eqI32(introduce1Plaintext(cookie, slice(onion, 0, 31), ls).len(), 0, "a short onion key too");
+  t.eqI32(introduce1Cell(slice(auth, 0, 31), encrypted).len(), 0, "a short auth key too");
+
+  // RENDEZVOUS2 carries SERVER_PK | AUTH, and a short cell must not be read as a valid one.
+  u8[] rend = u8[64]();
+  for (i32 i = 0; i < 64; i++) { rend[i] = (i * 5 + 2) & 0xFF; }
+  t.eqI32(rendezvous2HandshakeInfo(rend).len(), 64, "a 64-byte RENDEZVOUS2 body reads");
+  t.eqI32(rendezvous2HandshakeInfo(slice(rend, 0, 63)).len(), 0, "a 63-byte one is refused");
   return t.report();
 }

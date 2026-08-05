@@ -142,8 +142,22 @@ def main(nodes_dir):
     intro = re.findall(r'^introduction-point (\S+)$', second_text, re.M)
     onion_keys = re.findall(r'^onion-key ntor (\S+)$', second_text, re.M)
     enc_keys = re.findall(r'^enc-key ntor (\S+)$', second_text, re.M)
+    # The auth key is inside a certificate rather than on its own line: a type-9 cert whose
+    # *certified* key is the introduction circuit's identity at that relay.
+    auth_certs = re.findall(
+        r'^auth-key\n-----BEGIN ED25519 CERT-----\n(.*?)-----END ED25519 CERT-----',
+        second_text, re.M | re.S)
+    auth_keys = []
+    for c in auth_certs:
+        cert = base64.b64decode(c)
+        if cert[1] != 9:
+            sys.exit(f"an auth-key certificate has type {cert[1]}, expected 9")
+        auth_keys.append(cert[7:39].hex())
     if not intro:
         sys.exit("no introduction points in the decrypted descriptor; something is wrong")
+    if not (len(intro) == len(onion_keys) == len(enc_keys) == len(auth_keys)):
+        sys.exit(f"introduction points do not line up: {len(intro)} points, {len(onion_keys)} onion "
+                 f"keys, {len(enc_keys)} enc keys, {len(auth_keys)} auth keys")
 
     json.dump(dict(
         source="tor 0.4.7.13 on a local chutney hs-v3 network",
@@ -171,8 +185,8 @@ def main(nodes_dir):
                  plaintextPrefix=second_text[:200]),
         ],
         introductionPoints=[
-            dict(linkSpecifiers=ls, onionKeyNtor=ok, encKeyNtor=ek)
-            for ls, ok, ek in zip(intro, onion_keys, enc_keys)
+            dict(linkSpecifiers=ls, onionKeyNtor=ok, encKeyNtor=ek, authKey=ak)
+            for ls, ok, ek, ak in zip(intro, onion_keys, enc_keys, auth_keys)
         ],
     ), sys.stdout, indent=2)
     print(file=sys.stdout)
