@@ -117,7 +117,13 @@ Deno.test("a program runs itself, with no file to read and nothing to find", asy
       err,
     );
     // No grant of any kind: the program was built with none, and running itself needs none.
-    assertEquals((await Deno.readTextFile(twin)).split("\n")[0], "#!/usr/bin/env -S deno run", "no flags");
+    // `--no-code-cache` is not a grant: it stops Deno keeping V8's compiled code for a script that is
+    // built once, run once and deleted. 28 GB of those entries filled the shared disk — wac-mono 0068.
+    assertEquals(
+      (await Deno.readTextFile(twin)).split("\n")[0],
+      "#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache",
+      "no grants, and the cache flag which is not one",
+    );
 
     // And the same source, the same behaviour, on Node — where the worker is made a different way.
     await buildApp("packages/platform/example/twin.wac", nodeTwin, {}, "node");

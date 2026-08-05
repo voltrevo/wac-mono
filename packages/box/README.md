@@ -115,11 +115,11 @@ also built alone — the entry point is four lines and imports the applet file u
 
 | built alone | shebang | size |
 | --- | --- | --- |
-| `wc` | `#!/usr/bin/env -S deno run` | 47K |
-| `sha256sum` | `#!/usr/bin/env -S deno run` | 51K |
-| `grep` | `#!/usr/bin/env -S deno run --allow-read` | 59K |
-| `cp` | `#!/usr/bin/env -S deno run --allow-read --allow-write` | 47K |
-| `box` | `#!/usr/bin/env -S deno run --allow-read --allow-write` | 111K |
+| `wc` | `#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache` | 47K |
+| `sha256sum` | `#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache` | 51K |
+| `grep` | `#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache --allow-read` | 59K |
+| `cp` | `#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache --allow-read --allow-write` | 47K |
+| `box` | `#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache --allow-read --allow-write` | 111K |
 
 `wc` and `sha256sum` come out with **no permissions at all** — they read standard input
 and write a line, and a program that only does that needs nothing from anyone. Handed a

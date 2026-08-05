@@ -205,8 +205,8 @@ Deno.test("an application builds to one executable file and runs repeatedly", as
     assertEquals(stat.mode !== null && (stat.mode & 0o111) !== 0, true, "executable");
     assertEquals(
       (await Deno.readTextFile(out)).split("\n")[0],
-      "#!/usr/bin/env -S deno run --allow-read",
-      "the shebang states the grants and nothing more",
+      "#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache --allow-read",
+      "the shebang states the grants, and the cache flag which is not one",
     );
 
     for (let i = 0; i < 3; i++) {
@@ -238,7 +238,7 @@ Deno.test("an application builds to one executable file and runs repeatedly", as
       // filesystem grant to anyone auditing it.
       assertEquals(
         (await Deno.readTextFile(bare)).split("\n")[0],
-        "#!/usr/bin/env -S deno run",
+        "#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache",
         "no capabilities, no permissions",
       );
     } finally {

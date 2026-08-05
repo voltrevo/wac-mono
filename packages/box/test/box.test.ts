@@ -843,18 +843,29 @@ Deno.test("box's mutation tier: mkdir, rm, rmdir, mv, touch", async () => {
 });
 
 Deno.test("bin/: one applet alone states only the grants it needs", async () => {
+  // Neither `DENO_EMIT_CACHE_MODE=disable` nor `--no-code-cache` is a permission. They turn off Deno's
+  // two caches, both of which key on something unique to a built program and so grow without bound: the
+  // V8 code cache added 166 MB per run of *this file*, and the transpile cache leaves an entry under
+  // `gen/file/tmp/` for every temp-file program ever run. 28 GB and 23 GB respectively, on a shared
+  // disk (wac-mono 0068). Asserted in full rather than filtered out, because the next thing somebody
+  // adds to a built program's shebang should have to be thought about here.
+  //
   // The README has been claiming that a multicall binary costs you the permission story
   // and that built separately each applet would state its own. This measures it rather
   // than asserting it: `wc` and `sha256sum` come out with an empty shebang, and a `wc`
   // built that way cannot open a file even when told to.
   const cases: Array<{ name: string; grants: Grants; shebang: string }> = [
-    { name: "wc", grants: {}, shebang: "#!/usr/bin/env -S deno run" },
-    { name: "sha256sum", grants: {}, shebang: "#!/usr/bin/env -S deno run" },
-    { name: "grep", grants: { read: true }, shebang: "#!/usr/bin/env -S deno run --allow-read" },
+    { name: "wc", grants: {}, shebang: "#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache" },
+    { name: "sha256sum", grants: {}, shebang: "#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache" },
+    {
+      name: "grep",
+      grants: { read: true },
+      shebang: "#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache --allow-read",
+    },
     {
       name: "cp",
       grants: { read: true, write: true },
-      shebang: "#!/usr/bin/env -S deno run --allow-read --allow-write",
+      shebang: "#!/usr/bin/env -S DENO_EMIT_CACHE_MODE=disable deno run --no-code-cache --allow-read --allow-write",
     },
   ];
   const built: string[] = [];

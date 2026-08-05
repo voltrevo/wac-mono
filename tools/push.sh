@@ -24,17 +24,20 @@ fi
 log="$(mktemp -t push-suite-XXXXXX.log)"
 
 # Space, before blaming the change. This gate has failed twice on `No space left on device` for reasons
-# outside this container: the shared overlay sits above 90%, only a couple of gigabytes of it are visible
-# from in here, and `~/.cache/deno/gen` alone has held 22G of generated code. The operator's standing
-# answer (2026-08-05) is to clear *Deno's* cache and retry, and to leave the repo's own `.cache` alone —
-# it is small and every test would repopulate it with the same bytes anyway.
-freeDenoCache() {
-  echo "== clearing ~/.cache/deno/gen and retrying: the disk is full and it is not this change =="
-  rm -rf "$HOME/.cache/deno/gen" 2>/dev/null || true
-  df -h / | tail -1
-}
+# outside this container: the shared overlay sits above 90% and only a few gigabytes of it are visible
+# from in here. The operator's standing answer (2026-08-05) is to clear *Deno's* cache and retry.
+#
+# **It used to clear `gen`, which was the wrong directory.** Measured with the disk at 97%: `gen` held
+# 220 MB and `v8_code_cache_v2` held 28 GB, so the mitigation freed under one per cent of the problem —
+# three times — while reporting that it had done something. Both functions live in `cacheGuard.sh` now,
+# shared with `tools/test.sh`, because a mitigation that only runs when somebody pushes is a mitigation
+# nobody gets.
+# shellcheck source=tools/cacheGuard.sh
+. tools/cacheGuard.sh
 
 for attempt in 1 2 3; do
+  guardDenoCache
+
   # Inside the loop, not before it. A merge on a later attempt can bring in a commit that
   # bumps the compiler pin, and then the next run fails on a stale compiler for a reason
   # that has nothing to do with the change being pushed. Pulling once at the top misses
