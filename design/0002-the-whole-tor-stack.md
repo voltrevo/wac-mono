@@ -421,3 +421,29 @@ disagree somewhere; if it is absent, the run used a stale `gendesc` build.
 The general lesson is worth more than the bug: **a test that cannot fail proves nothing, and a fetch
 through a proxy to loopback is one of those.** Run the control first — with the network deliberately
 broken — and only trust a success once the failure has been seen.
+
+### The exit policy is right, and the failure moved earlier
+
+Checked first, since the last note left it unverified: the consensus does carry `p accept 1-65535` with
+the `Exit` flag, from a freshly built `gendesc`. So the policy was never the problem.
+
+With it in place, and the proxy genuinely in the path, a C tor reaches `95% (circuit_create)` and then:
+
+    each of the three relays   1 circuit created, 0 extends, 0 relay commands, 0 streams
+
+**No relay is asked to extend at all** — where earlier runs, before the exit policy, did produce
+`extending to` and one completed `extended circuit`. That is the useful part: the failure moved
+*earlier* when the exit appeared. With an exit in the consensus tor stops building the internal paths it
+was building before and starts building general three-hop ones, and those die at the first hop instead.
+
+So the question is no longer "does the stream work" but **why a general circuit stops after CREATE**.
+One circuit at each relay and no second cell suggests tor creates, dislikes something about the answer,
+and abandons rather than extending. Worth looking at next, cheapest first:
+
+  - the `pr` line our vote advertises versus what a general circuit requires (`Relay=`, `FlowCtrl=`),
+    since an internal path and a general path need not demand the same subprotocols;
+  - whether tor expects a `RELAY_SENDME` or a padding negotiation early on a general circuit that a
+    one-hop directory circuit never asked for;
+  - tor's own log around `circuit_create` for the reason it drops each attempt, which is the direct
+    route and needs no theory at all — the pattern all day has been that the log says it and the
+    theories do not.
