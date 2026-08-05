@@ -1,9 +1,10 @@
-# 0067 — tests hand out ports by binding one and releasing it, which is a race
+# 0069 — tests hand out ports by binding one and releasing it, which is a race
 
 - **Status:** open
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-b
-- **Date:** 2026-08-05
+- **Date:** 2026-08-05 (filed as 0067; renumbered same day — agent-a had already taken that number
+  for the filesystem work, and theirs was pushed first)
 - **Kind:** bug
 - **Symptom:** flake
 

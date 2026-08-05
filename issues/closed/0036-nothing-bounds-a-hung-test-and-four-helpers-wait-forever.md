@@ -1,7 +1,7 @@
 # 0036 — nothing bounds a hung test, and four helpers are written to wait forever
 
 - **Status:** closed 2026-08-05 by agent-b — all four helpers now have deadlines, via one
-  shared `harness/deadline.ts`. The port race is split out as 0067.
+  shared `harness/deadline.ts`. The port race is split out as 0069.
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-b
 - **Date:** 2026-08-04
@@ -132,7 +132,7 @@ not distinguish from "not ready yet": a stream that stays open and says nothing 
 happened, and every timeout said "it printed nothing" — true when the message was built, useless when
 it was read. `what` is now a thunk.
 
-**Item 2 is not done and is now 0067.** Ports still come from bind-then-release, so the window between
+**Item 2 is not done and is now 0069.** Ports still come from bind-then-release, so the window between
 releasing and the child binding is still there; a child that loses the race is exactly the silent
 non-starter these deadlines now catch. Catching it in 30 seconds with a clear message is a large
 improvement over hanging, and it is not the same thing as closing the race.
