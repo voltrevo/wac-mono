@@ -424,11 +424,22 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
         if (!kids.write(p)) throw new Error("the child's output buffer is full");
         return EMPTY;
       }
-      if (writeOut !== undefined) { writeOut(p.slice()); return EMPTY; }
+      // **`openOutput`'s file first, and the caller's `write` second.** These were the other way round,
+      // so a caller that supplies `write` — every spawned child, and `harness/appRun.ts` — silently lost
+      // the redirection: `openOutput` truncated the file and every byte still went to the caller's sink.
+      // Nothing noticed because nothing had asked a *child* to redirect its own output until `sh` began
+      // streaming into `> file` (wac-mono 0070); `box wget url out` run as a child wrote an empty file.
+      //
+      // The order is not arbitrary. `write` in the options says where *standard output* goes;
+      // `openOutput` is the program saying its output is a file now, which is not standard output.
       try {
-        if (sink === null) { await writeAllStdout(p); return EMPTY; }
-        let at = 0;
-        while (at < p.length) at += await sink.write(p.subarray(at));
+        if (sink !== null) {
+          let at = 0;
+          while (at < p.length) at += await sink.write(p.subarray(at));
+          return EMPTY;
+        }
+        if (writeOut !== undefined) { writeOut(p.slice()); return EMPTY; }
+        await writeAllStdout(p);
         return EMPTY;
       } catch (e) {
         // Recorded and then rethrown: the throw is what makes `write` answer false, and the record
