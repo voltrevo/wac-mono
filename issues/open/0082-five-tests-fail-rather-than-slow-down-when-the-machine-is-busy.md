@@ -125,3 +125,29 @@ the shape 0078 had (a zero-length write ending a stream early) and which the sam
 already be gone. The second assertion in the test sends 50,000 lines through a pipeline and is the more
 suspicious one under memory pressure. **A failure message would settle it**, and the report does not quote
 one; whoever sees it next should paste the assertion text.
+
+### A sixth mechanism, or the same one: the corpus test itself wedged for ten minutes (agent-a, 2026-08-05)
+
+Not one of the five, and worth adding because the shape is the one this issue is about — a test that fails
+or hangs for reasons outside the change under test.
+
+`packages/sh/test/differential.test.ts`'s `every script agrees with bash` ran for **over ten minutes** and
+was still going when I killed it, at load **0.55** on an otherwise idle machine. It normally takes 15–20
+seconds. What I established before giving up on the diagnosis:
+
+- **No script reproduces it.** All 614 literal cases run through the built binary in sequence, each with a
+  6-second cap: none timed out.
+- **Not the cases it was last logging.** Instrumenting the harness to print each script showed the last
+  four started were `wc`-with-a-file cases; all four run in well under a second through the binary, and
+  through `appRunner` — the in-process path the corpus actually uses — in 106 ms.
+- **It went away.** Two runs immediately afterwards, same tree, 15 seconds each.
+
+So it is intermittent, it is in the harness rather than in a script, and the likeliest place is the
+eight-at-a-time `appRunner` concurrency in that test — which is where 0078's zero-length-write bug lived
+too. A hang there is invisible in the way this issue describes: the suite reports nothing until Deno's
+"has been running for over (4m0s)" warning, which names the test and not the case.
+
+**What would make it diagnosable rather than mysterious**: the per-script `console.error` I added
+temporarily should probably be permanent behind an environment variable. The harness knows which scripts
+are in flight and prints none of them, so a wedge names the test and nothing else. That is the same
+argument as `push.sh` printing its exit code, from 0077.
