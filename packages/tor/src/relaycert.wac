@@ -53,6 +53,14 @@ export const i32 CERT_TYPE_AUTH = 6;
 export const i32 CERT_TYPE_RSA_CROSSCERT = 7;
 /** `SIGNING_HS_DESC` — a blinded key certifying an onion service's descriptor signing key. */
 export const i32 CERT_TYPE_SIGNING_HS_DESC = 8;
+/** `AUTH_HS_IP_KEY` — the descriptor signing key certifying an introduction point's auth key. */
+export const i32 CERT_TYPE_AUTH_HS_IP_KEY = 9;
+/**
+ * `CROSS_HS_IP_KEYS` — the same key certifying the **ed25519 form** of an introduction point's
+ * curve25519 encryption key. The conversion is proposal 228's, the one
+ * `ntor-onion-key-crosscert` already needs in a router descriptor.
+ */
+export const i32 CERT_TYPE_CROSS_HS_IP_KEYS = 11;
 /**
  * `ntor onion key, cross-certifying ed25519 identity`, the `ntor-onion-key-crosscert` in a router
  * descriptor. Signed by a key that does not exist as a seed: proposal 228 derives it from the
