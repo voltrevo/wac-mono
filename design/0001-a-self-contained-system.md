@@ -1,8 +1,21 @@
-# 0001 — a self-contained system
+# 0001 — Wacland: a self-contained system
 
 - **Status:** active
 - **Opened:** 2026-08-05
 - **Written by:** agent-a, from a decision with the operator
+- **Extended:** 2026-08-06 by agent-c, folding in the frame from
+  [voltrevo/wac-mono#38](https://github.com/voltrevo/wac-mono/issues/38)
+
+## The name, and the external issue
+
+The system is called **Wacland**. GitHub #38 states the same direction as this document in a wider
+frame, and it was written four days later; the two are one plan and this is the authoritative copy.
+GitHub is an independent external guide, read inward and not written back to — so what #38 adds is
+folded in below rather than linked to, and where the two disagree this wins.
+
+What #38 supplied and this did not: the name, the four hosts stated as a portability requirement, the
+layering rule (D8), the boundaries, and the arrival test. What this has and #38 does not is the part
+that makes it a plan — the decisions with their reasons, the eight steps, and the state of play.
 
 ## What we are aiming at
 
@@ -16,6 +29,29 @@ What it is **not**: a Linux emulator. No ELF loading, no syscall emulation, no q
 `packages/box`'s applets and `packages/sh`, which are wac programs compared against GNU's behaviour;
 the system underneath them is wac too. "Convincing" means the parts that exist are real, not that
 everything a Linux has is present.
+
+### The same system wherever it runs
+
+One image, and the same users, files, programs, shell behaviour and services in each of:
+
+- a browser;
+- Deno, Node or Bun;
+- the userland of a bootable system — a minimal Linux kernel and Wasmtime, no JavaScript at all.
+
+The host supplies execution and the capabilities it is explicitly granted. Wacland supplies everything
+the user experiences as the system. An image moves between hosts carrying its state; it does **not**
+carry live processes or connections.
+
+**The arrival test** (#38's "first convincing proof", and better than anything this document had): load
+the same image in two substantially different hosts and demonstrate the same users, files, installed
+programs, shell behaviour and system services in both, with no implicit access to either host.
+
+### What it is not
+
+Not a Linux emulator, and the boundary is worth stating in full because "self-contained system" invites
+the assumption: no Linux syscall ABI, no ELF or arbitrary native binaries, no obligation to reproduce
+Linux internals, and no dependence on a particular JavaScript or WebAssembly runtime. A graphical
+desktop is step 8 rather than part of the definition, though the mechanisms under it should support one.
 
 ## Why this is a small architectural step
 
@@ -74,6 +110,19 @@ and the shell against bash. The VFS is an opportunity here rather than a threat:
 against a host mount *and* against an image, and any divergence between those two is a VFS bug with a
 reference answer.
 
+**D8 — POSIX is a personality over a native core, and the dependency runs one way** (#38). Wacland
+should not treat POSIX or Unix abstractions as fundamental merely because they are familiar. The native
+foundations are the ones this repo already reaches for — explicit capabilities, structured process
+lifetimes, typed communication, supervised services, portable system objects — and POSIX and GNU
+behaviour are a *compatibility personality* built over them.
+
+> The POSIX personality may depend on the Wacland core, but the Wacland core must not depend on the
+> POSIX personality.
+
+The reason to write it down now, before there is a core to violate it: `packages/sh` and `packages/box`
+are the userland and they are POSIX-shaped, so the natural drift is for the core to grow whatever they
+happen to need. These abstractions are deliberately unstable while Wacland and wac are young.
+
 ## Order of work
 
 Each step is an issue when it becomes actionable, and each references this document.
@@ -119,12 +168,27 @@ Each step is an issue when it becomes actionable, and each references this docum
 
 ## Open questions
 
+- **The native core has no oracle.** D7 makes differential testing the oracle, and the oracles are bash
+  and GNU coreutils — which judge the *personality* only. Under D8 the native core is the first large
+  subsystem here with nothing independent to check it against, in a repo whose rigour is mostly
+  differential. What plays that role — a reference implementation of the same semantics, property tests
+  over the capability algebra, something else — should be decided with the core rather than after it.
+  This is the largest open risk in the direction.
+- **The fourth host has no JavaScript, and the process model is JavaScript.** `spawnChild` makes blob
+  URLs and `Worker`s; the bridge is a `SharedArrayBuffer` with `Atomics.wait`; `packages/platform/host/`
+  is `browser.ts`, `node.ts`, `deno.ts`. None of that exists under Wasmtime. The other three hosts are
+  all JavaScript, so portability across them proves less than it appears. Proving a trivial image under
+  Wasmtime — the VFS and one program, no processes — is cheap at step 2 and expensive to discover at
+  step 7.
+- **Supervised services are named in D8 and in none of the eight steps.** Step 7 is `init`, which owns
+  the image, starts daemons and reaps; supervision — restart policy, dependency order, health — is a
+  different shape. Either it belongs in step 7's definition of done or it is a ninth step.
 - **How much of a pty.** Full termios is a project of its own; the useful subset is echo, line editing,
   interrupt and EOF. Where the line is drawn should be decided when step 5 starts, not now.
 - **Concurrency on one image.** Two sessions writing the same image at once needs a rule — one writer,
   or copy-on-write per session, or a lock. Step 4 forces the question.
 - ~~What `wacsh` does by default.~~ Answered: two binaries, D3a.
 - ~~Byte-exact paths.~~ Answered:
-  [0065](../issues/open/0065-a-spawned-programs-arguments-are-not-byte-exact.md) is a *signature* problem
+  [0065](../issues/closed/0065-a-spawned-programs-arguments-are-not-byte-exact.md) is a *signature* problem
   — names and arguments are bytes, messages and source are text — and not something to solve with a codec
   in the compiler. `packages/fs` already pins the property on a mount, where no host API is involved.

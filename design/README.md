@@ -18,6 +18,19 @@ more than a sitting, and the decisions in it constrain code that has not been wr
   document honest: a design that says "next: a process table" six weeks after the process table landed
   is worse than no document.
 
+## A destination, which is a second kind
+
+Most of these are directions: a target, decisions, an order of work. A **destination** has no order of
+work — it is the shape several independent lines of work converge on, written down so each can be judged
+against where it is going. `Status: destination` says so, and its state of play tracks contributing
+pieces rather than steps, ordered by dependency rather than intent.
+
+The distinction earns its place because the two fail differently. A direction with no order of work is
+incomplete; a destination with one invites somebody to follow it top to bottom, which is exactly the
+mistake [0003](0003-an-ethereum-distribution.md) exists to prevent — its verification core is finished
+and its plumbing is not, so reading it as a sequence would start at the wrong end. If a destination
+acquires a sequence, it becomes an ordinary direction and says so.
+
 ## What does not belong here
 
 - Anything actionable now — that is an issue, and the issue **references this document rather than
