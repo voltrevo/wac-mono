@@ -9,6 +9,8 @@
 // It is worth having separately because every one of those is outside the protocol and none of
 // them is exercised by the transport tests.
 
+// test-lane: exclusive — drives a real `ssh` binary against a real server.
+
 import { haveSshd, type Server, startServer, stopServer } from "./server.ts";
 
 /**

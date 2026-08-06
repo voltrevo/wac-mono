@@ -6,6 +6,10 @@
 // anything about our framing closes the connection instead of answering, so reaching a parsed
 // server KEXINIT means the packet layer is right in both directions.
 
+// test-lane: exclusive — a real OpenSSH server per case, on a real port. Under the parallel runner these reset during the
+// handshake — see wac-mono 0082, where `MaxStartups` and a reused port are the two candidates and
+// neither needed to be settled once the tests stopped competing with four other workers.
+
 import { wacBind } from "../../../harness/wacBind.ts";
 import { freePort, haveSshd, type Server, startServer, stopServer } from "./server.ts";
 

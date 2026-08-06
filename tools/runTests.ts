@@ -55,6 +55,7 @@
 // shell does not expand parameter defaults, and passes the text through literally.
 
 import { refuseIfNested, SUITE_ENV } from "./suiteGuard.ts";
+import { exclusiveTests, laneSplit } from "../harness/testLane.ts";
 
 const DEFAULT_JOBS = 4;
 
@@ -125,20 +126,37 @@ console.log(
     : `${jobs} workers (DENO_JOBS)`,
 );
 
-const r = await new Deno.Command(Deno.execPath(), {
-  args: [
-    "test",
-    "--parallel",
-    "--allow-read",
-    "--allow-write",
-    "--allow-run",
-    "--allow-net",
-    "--allow-env",
-    ...Deno.args,
-  ],
-  env: { DENO_JOBS: String(jobs), ...SUITE_ENV },
-  stdout: "inherit",
-  stderr: "inherit",
-}).output();
+const PERMS = ["--allow-read", "--allow-write", "--allow-run", "--allow-net", "--allow-env"];
 
-Deno.exit(r.code);
+const run = async (args: string[], workers: number): Promise<number> => {
+  const r = await new Deno.Command(Deno.execPath(), {
+    args: ["test", ...args, ...PERMS, ...Deno.args],
+    env: { DENO_JOBS: String(workers), ...SUITE_ENV },
+    stdout: "inherit",
+    stderr: "inherit",
+  }).output();
+  return r.code;
+};
+
+// No targets here: the gate runs whatever `deno test` discovers, so every declared file is in the lane.
+const exclusive = laneSplit([], (await exclusiveTests()).map((e) => e.file)).alone;
+
+// The parallel pass covers everything else. `--ignore` rather than an explicit file list, so a new test
+// file is picked up by discovery exactly as it always was and nobody has to remember this exists.
+const parallel = await run(
+  ["--parallel", ...(exclusive.length > 0 ? [`--ignore=${exclusive.join(",")}`] : [])],
+  jobs,
+);
+
+// Then the ones that asked for the machine, sequentially and alone. Second rather than first because a
+// failure in the broad pass is the more likely one and the more useful to see early.
+let lane = 0;
+if (exclusive.length > 0) {
+  console.log(`\n${exclusive.length} file(s) run alone, by their own declaration (see tools/runTests.ts):`);
+  for (const f of exclusive) console.log(`  ${f}`);
+  lane = await run(exclusive, 1);
+}
+
+// Either failing fails the suite: a green parallel pass with a red lane is still a red suite, and
+// exiting on the first code would hide whichever ran second.
+Deno.exit(parallel !== 0 ? parallel : lane);

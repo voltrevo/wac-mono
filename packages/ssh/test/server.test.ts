@@ -8,6 +8,8 @@
 //
 // A second implementation of my own misconceptions would agree with itself. OpenSSH does not.
 
+// test-lane: exclusive — a real OpenSSH client against our server, on a real port.
+
 import { haveSshd } from "./server.ts";
 import { holdPort } from "../../../harness/port.ts";  // one allocator — wac-mono 0069
 import { ABANDONED_SSHD } from "./server.ts";
