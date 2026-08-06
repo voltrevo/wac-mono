@@ -10,7 +10,7 @@
 // again for the other one, so the second answer is not lost.
 
 import { Cli, Core, Pending, Socket } from "../src/platform.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 2) {

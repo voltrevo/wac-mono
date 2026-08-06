@@ -44,7 +44,7 @@
 // being told, which is what a `Bridge` line is.
 
 import { Core, Cli, Socket, FileResult, Change, Pending } from "../../platform/src/platform.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 import { Buf } from "../../bytes/src/buf.wac";
 import { Parsed, parseRequest } from "../../http/src/request.wac";
 import { DirDocuments, dirResponse, dirSourceFingerprint } from "./dirserve.wac";
@@ -76,6 +76,7 @@ import {
 } from "./relaycircuit.wac";
 import {
   Hop, relayBegin, relayBeginDir, relayConnected, relayData, relayEnd, relayExtend2,
+  relaySendme,
   relayExtended2, wrapForClient,
 } from "./relay.wac";
 import {
@@ -101,6 +102,22 @@ const i32 MAX_CONNS = 64;
  * rebuilt from every connection's circuits each round, a size worth walking.
  */
 const i32 MAX_CIRCS = 8;
+
+/**
+ * A window, and how many cells of it a `SENDME` restores.
+ *
+ * tor's `STREAMWINDOW_INCREMENT` and `CIRCWINDOW_INCREMENT`. A client may send 500 cells on a stream
+ * and 1000 on a circuit before it must stop, and each `SENDME` returned buys it 50 or 100 more. Send
+ * none and an upload stops dead at the initial window — measured at exactly that boundary, before
+ * this existed: 200 KB (411 cells) went through and 300 KB (617 cells) did not.
+ *
+ * **Version 0 SENDMEs, with an empty body.** Version 1 carries the digest of the cell that triggered
+ * it; tor's `sendme_accept_min_version` defaults to **0**, so the simple form is accepted and no
+ * digest has to be threaded out of the relay crypto. `sendmeBodyV1` in `relay.wac` is there for the
+ * day a consensus raises that minimum.
+ */
+const i32 STREAM_SENDME_EVERY = 50;
+const i32 CIRCUIT_SENDME_EVERY = 100;
 
 /** An hour in seconds, for certificate lifetimes. */
 const i64 HOUR = 3600;
@@ -626,6 +643,9 @@ struct Circ {
   i32 streamSock;
   i32 streamId;
   Pending<Read> fromStream;
+  /** Data cells received from the client, for flow control. Circuit-wide, and per stream. */
+  i32 cellsInCirc;
+  i32 cellsInStream;
   /** Bytes forwarded each way on this stream, so a stream that ends early can say how early. */
   i32 streamIn;
   i32 streamOut;
@@ -646,7 +666,7 @@ struct Circ {
  */
 Circ newCirc(Core core, Cli cli, i32 circId, Hop hop, Pending<Read> idle) {
   return Circ(circId, hop, false, Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]()), 0, idle,
-              -1, Buf.create(), false, -1, -1, idle, 0, 0, false, 0, 0);
+              -1, Buf.create(), false, -1, -1, idle, 0, 0, 0, 0, false, 0, 0);
 }
 
 /** A connection as it arrives: TLS begun, nothing else known yet. */
@@ -993,6 +1013,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
           // request when it was three.
           k.streamIn = 0;
           k.streamOut = 0;
+          k.cellsInStream = 0;
           k.fromStream = cli.recv(k.streamSock);
           c.tls = sendCell(cli, c.sockObj, c.tls,
                          sendToClient(k.hop, k.circId, relayConnected(), k.streamId, connectedBody()));
@@ -1001,16 +1022,27 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
           continue;
         }
 
+        // Flow control, before the cell is dispatched: a client's window is spent by *any* data
+        // cell on the circuit, including the directory stream's, so the circuit-level count is kept
+        // here rather than inside the branch that happens to handle this stream.
+        if (inbound.command == relayData()) {
+          k.cellsInCirc = k.cellsInCirc + 1;
+          if (k.cellsInCirc % CIRCUIT_SENDME_EVERY == 0) {
+            // Stream id 0 is what makes it circuit-level rather than about one stream.
+            c.tls = sendCell(cli, c.sockObj, c.tls,
+                           sendToClient(k.hop, k.circId, relaySendme(), 0, u8[0]()));
+            core.log("relayd: [" + itoa(c.id) + "]  circuit " + itoa(k.circId) + " SENDME after " +
+                     itoa(k.cellsInCirc) + " cells");
+          }
+        }
+
         if (inbound.command == relayData() && k.hasStream && inbound.streamId == k.streamId) {
-          // The first cell each way is logged and the rest are not. Without this a stream that
-          // stalls looks exactly like a stream that was never written to, which is the difference
-          // that mattered when uploads were being chased (issue 0089).
+          k.cellsInStream = k.cellsInStream + 1;
+          if (k.cellsInStream % STREAM_SENDME_EVERY == 0) {
+            c.tls = sendCell(cli, c.sockObj, c.tls,
+                           sendToClient(k.hop, k.circId, relaySendme(), k.streamId, u8[0]()));
+          }
           k.streamIn = k.streamIn + inbound.data.len();
-          // Every forward, with its size and handle. One line per cell is noisy and this is the one
-          // question left in 0089: exactly one cell reaches the target and then the read on it ends.
-          core.log("relayd: [" + itoa(c.id) + "]  forwarding " + itoa(inbound.data.len()) +
-                   " bytes to handle " + itoa(k.streamSock) + " (stream " + itoa(k.streamId) +
-                   ", " + itoa(k.streamIn) + " total)");
           if (!cli.send(k.streamSock, inbound.data).wait()) {
             core.warn("relayd: [" + itoa(c.id) + "]  the stream would not take the data");
             c.tls = sendCell(cli, c.sockObj, c.tls,

@@ -52,7 +52,7 @@ import { cellCircId, encodeDestroy, destroyRequested } from "./cell.wac";
 import { Link, feedLink, takeCell, sendCells, sliceOf, concat, itoa } from "./link.wac";
 import { socksReply, replyForEndReason, endReasonName, targetOf, requestLength,
          repOk, repFailure, repNotAllowed, repBadCommand, repBadAddress } from "./socks5.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 
 /**
  * One `accept`, one relay `recv`, and one `recv` per client, kept well under `CALL_SLOTS`.

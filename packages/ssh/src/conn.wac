@@ -14,7 +14,7 @@ import { Buf } from "../../bytes/src/buf.wac";
 import { Cli, Core } from "../../platform/src/platform.wac";
 import { Framed, Status, frame, maxPacket, minBlock, paddingFor, unframe } from "./packet.wac";
 import { Opened, Plain, aeadPaddingFor, open, seal } from "./cipher.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 
 /** Transport messages a peer may send at any point and neither end should mistake for a reply. */
 export i32 msgDisconnect() { return 1; }

@@ -8,7 +8,7 @@ import { Cli, Core, Socket } from "../../../platform/src/platform.wac";
 import { itoa } from "../../../fmt/src/itoa.wac";
 import { concat } from "./bytes.wac";
 import { Incoming, ParsedResponse, parseResponse } from "../../../http/src/incoming.wac";
-import { Read } from "../../../bytes/src/read.wac";
+import { Read } from core;
 
 /** The exit code the applet should return. */
 export i32 fetch(Core core, Cli cli, string name, string host, string path, i32 port, bool headers) {

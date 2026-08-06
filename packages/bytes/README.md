@@ -70,15 +70,22 @@ from the test suite it is meant to measure. Twice now it has reported a branch a
 uncovered that the tests do cover, and once the reverse. When it disagrees with the
 suite, the suite is right and `cov.ts` needs the input adding.
 
-## `Read`, and why it lives here
+## `Read` moved to `core`
 
-`src/read.wac` holds one enum: `Data(bytes)`, `End`, `Failed(why)` — what a read answered.
+It used to be `src/read.wac`, here rather than in `packages/platform`, because of who has to name
+it: the streaming transforms in `gzip` and `stream` take their source as a funcref and `platform`
+hands `cli.readChunk` to them directly, so a capability world and two pure algorithm packages all
+had to name one type — and `bytes` was the only package below all of them.
 
-It is here rather than in `packages/platform` because of who has to name it. The streaming transforms
-in `gzip` and `stream` take their source as a funcref, and `platform` hands `cli.readChunk` to them
-directly; wac has no closures, so nothing can sit in between converting one shape to another.
-Whatever a read answers is therefore a type that both a capability world and two pure algorithm
-packages must name — and `bytes` is the only package below all of them.
+That reasoning still holds and now points somewhere else. wac has no closures, so two declarations
+of `Read` can never be converted into each other; being below everything in *this* repo is not
+enough once `platform` is a repo of its own. So `Read` is in `core`, the module the compiler ships,
+which is the only place with one identity everywhere:
 
-The shape exists because `u8[]` had a hole in it: an empty array meant both "finished" and "failed",
-so every filter in the repo treated a dying disk as a completed file and exited 0.
+```wac
+import { Read } from core;
+```
+
+Nothing here re-exports it — a re-export would leave two spellings, and someone would write new code
+against the old one. See wac's `design/0001` for the admission rule, which is narrow: a type belongs
+in `core` only if it must cross a repository boundary through a funcref signature.

@@ -7,7 +7,7 @@
 // starts.
 
 import { Buf } from "../../bytes/src/buf.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 import { crc32, crc32Start, crc32Finish, crc32Update, crcTable8 } from "./crc32.wac";
 import { deflateFixed, deflateDynamic, lz77Range, writeDynamicBlock, Tokens } from "./deflate.wac";
 import { BitWriter } from "./bitwriter.wac";

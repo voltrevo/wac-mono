@@ -36,6 +36,10 @@ function resolveFrom(fromPath: string, spec: string): string {
  * Comments and string literals cannot contribute, because the lexer has already
  * classified them. A malformed import contributes nothing and is left for the
  * compiler to report properly.
+ *
+ * `import { Read } from core;` contributes nothing either, and deliberately: `core` ships inside
+ * the compiler, so there is no file to read and `wacCompile` supplies it. The `string` test below
+ * is what excludes it — a bare word after `from` is not a path.
  */
 export function importPaths(src: string): string[] {
   const { tokens } = wacLex(src);

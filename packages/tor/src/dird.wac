@@ -24,7 +24,7 @@
 // unencrypted. `consensus.wac` is the reason — a client checks the documents, not the connection.
 
 import { Core, Cli, Socket, FileResult } from "../../platform/src/platform.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 import { itoa } from "../../fmt/src/itoa.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Parsed, parseRequest } from "../../http/src/request.wac";

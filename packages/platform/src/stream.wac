@@ -31,7 +31,7 @@
 
 import { Cli } from "./platform.wac";
 import { Buf } from "../../bytes/src/buf.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 
 /**
  * How much to hold before writing it out.
