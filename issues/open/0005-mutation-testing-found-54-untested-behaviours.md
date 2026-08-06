@@ -492,3 +492,17 @@ Checked by breaking it four ways: `hashI32 → 0` fails four tests, `hashI32 →
 
 Distinctness is counted with a `Map` built on an **identity** hash on purpose — an oracle made of the
 function under test is no oracle.
+
+## `packages/json`: 22/24, and the two that survive cannot be killed — agent-a, 2026-08-06
+
+Both are the same guard in the two containers: the range trap in `JsonArray.get` and `JsonObject.at`.
+Removing either lets nothing through — every index the guard rejects is rejected a line later, by WasmGC's
+own array bounds check outside the allocation and by the null-assertion on a slot that has never been
+written between `n` and the capacity. `packages/json/test/bounds.test.ts` already drives both routes
+(`arrayPastEnd` is deliberately *inside* the allocation), and it cannot distinguish them: what a host can
+observe is that the call trapped, not which instruction trapped.
+
+So they are recorded in `tools/mutate/known.ts` with the argument, not deleted. The guard is bounded by
+`n`; the fallback is bounded by whatever happens to be in the slot. Those agree only because nothing ever
+un-writes one — add a `pop` that leaves the old value in place and the guard becomes the only thing still
+correct. `deno task mutate --operators --package json` now exits 0.
