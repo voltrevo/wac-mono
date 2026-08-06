@@ -333,9 +333,84 @@ u8[] bytesAt(R r, i32 at, i32 n) {
 
 // ── Encoding ──────────────────────────────────────────────────────────────────
 
-/** The tuple `schema` describes, encoded. The inverse of `decode`, and the same offsets. */
-export u8[] encode(Value[] items, i32[] schema) {
-  return encodeTuple(items, schema, 0, items.len());
+/** What `encode` answered. A mismatch between the values and the schema is an error, never zeroes. */
+export struct Encoded {
+  bool ok;
+  u8[] bytes;
+  string error;
+
+  Encoded of(bool ok, u8[] bytes, string error) { return Encoded(ok, bytes, error); }
+}
+
+/**
+ * The tuple `schema` describes, encoded — the inverse of `decode`, with the same offsets.
+ *
+ * **A value that does not fit its type is refused.** The first version of this returned 32 zero bytes for a
+ * `List` where the schema said `uint256`, which is the worst possible answer for an encoder of calldata: a
+ * caller that built its tree wrong would have got well-formed bytes meaning a transfer of nothing to
+ * nobody, and no indication that anything had gone wrong. There is no sensible encoding of a mismatch, so
+ * there is no encoding of one.
+ */
+export Encoded encode(Value[] items, i32[] schema) {
+  string bad = checkTuple(items, schema, 0, items.len());
+  if (bad != "") { return Encoded.of(false, u8[0](), bad); }
+  return Encoded.of(true, encodeTuple(items, schema, 0, items.len()), "");
+}
+
+/** Whether these values fit this tuple's types, and what does not. Empty means they do. */
+string checkTuple(Value[] items, i32[] schema, i32 schemaAt, i32 count) {
+  i32 declared = 0;
+  i32 s = schemaAt;
+  while (s < schema.len() && declared < count) { s = s + typeLen(schema, s); declared++; }
+  if (items.len() != count) {
+    return "the schema describes " + itoa(count) + " members and " + itoa(items.len()) + " were given";
+  }
+  s = schemaAt;
+  for (i32 i = 0; i < count; i++) {
+    string bad = check(items[i], schema, s);
+    if (bad != "") { return "member " + itoa(i) + ": " + bad; }
+    s = s + typeLen(schema, s);
+  }
+  return "";
+}
+
+/** Whether one value fits one type. */
+string check(Value v, i32[] schema, i32 s) {
+  i32 t = schema[s];
+  if (t == T_BYTES() || t == T_STRING()) {
+    match (v) {
+      case Bytes(_): return "";
+      case Word(_): return "a bytes or string needs Bytes, and a Word was given";
+      case List(_): return "a bytes or string needs Bytes, and a List was given";
+    }
+  }
+  if (t == T_ARRAY() || t == T_FIXED() || t == T_TUPLE()) {
+    match (v) {
+      case List(xs): {
+        i32 elem = t == T_TUPLE() ? s + 2 : (t == T_FIXED() ? s + 2 : s + 1);
+        if (t == T_TUPLE()) { return checkTuple(xs, schema, s + 2, schema[s + 1]); }
+        if (t == T_FIXED() && xs.len() != schema[s + 1]) {
+          return "a fixed array of " + itoa(schema[s + 1]) + " was given " + itoa(xs.len()) + " elements";
+        }
+        for (i32 i = 0; i < xs.len(); i++) {
+          string bad = check(xs[i], schema, elem);
+          if (bad != "") { return "element " + itoa(i) + ": " + bad; }
+        }
+        return "";
+      }
+      case Word(_): return "an array or tuple needs List, and a Word was given";
+      case Bytes(_): return "an array or tuple needs List, and Bytes were given";
+    }
+  }
+  // A static type: one word, and exactly one — a short `Word` padded silently would be a different value.
+  match (v) {
+    case Word(b): {
+      if (b.len() != 32) { return "a static type is one 32-byte word, and this one is " + itoa(b.len()); }
+      return "";
+    }
+    case Bytes(_): return "a static type needs a Word, and Bytes were given";
+    case List(_): return "a static type needs a Word, and a List was given";
+  }
 }
 
 u8[] encodeTuple(Value[] items, i32[] schema, i32 schemaAt, i32 count) {
