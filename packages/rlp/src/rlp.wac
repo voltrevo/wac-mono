@@ -45,18 +45,32 @@ export enum Item {
   List(Item[] items),
 }
 
-/** The bytes of a byte-string item, or empty for a list. For a caller that knows which it has. */
+/**
+ * The bytes of a byte-string item. **Traps for a list** — check `isList` first.
+ *
+ * It used to answer the empty string for a list, "for a caller that knows which it has", and that was a
+ * trap of a different kind: `packages/mpt` had seven call sites that did not know, and each of them turned
+ * a list where the format requires a byte string into a *plausible* value. A list-valued leaf read as a
+ * present empty value, a list-valued branch terminal read as absence, a list-valued account balance read
+ * as zero — all from data committed to a trie, where the whole point of the exercise is that malformed
+ * input cannot change what a proof means (wac-mono upstream #43).
+ *
+ * An empty answer for a shape error is unrecoverable at the call site: the caller cannot tell it apart
+ * from the empty string, which RLP uses constantly and legitimately. So the mismatch stops here, and a
+ * caller that wants to report rather than stop asks `isList` first — which is what a decoder of somebody
+ * else's bytes should be doing anyway.
+ */
 export u8[] bytesOf(Item it) {
   match (it) {
     case Bytes(v): return v;
-    case List(_): return u8[0]();
+    case List(_): trap;
   }
 }
 
-/** The members of a list item, or empty for a byte string. */
+/** The members of a list item. **Traps for a byte string** — `isList` first, and see `bytesOf` for why. */
 export Item[] itemsOf(Item it) {
   match (it) {
-    case Bytes(_): return Item[0](fill: Item.Bytes(u8[0]()));
+    case Bytes(_): trap;
     case List(xs): return xs;
   }
 }

@@ -10,8 +10,19 @@
 import { keccak256 } from "../../../crypto/src/keccak.wac";
 import { verify, Proved } from "../../src/proof.wac";
 import { accountAt, storageAt, Account, AccountProof, StorageProof } from "../../src/account.wac";
+import { emptyStorageRoot, emptyCodeHash } from "../../src/account.wac";
 
 export u8[] hash(u8[] input) { return keccak256(input); }
+
+/** The two constants, so the test can check them rather than only use their values by coincidence. */
+export u8[] emptyRoots() {
+  u8[] a = emptyStorageRoot();
+  u8[] b = emptyCodeHash();
+  u8[] out = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
+  return out;
+}
 
 export u8[] verifyProof(u8[] root, u8[] key, u8[] packed) {
   u8[][] nodes = unpack(packed);

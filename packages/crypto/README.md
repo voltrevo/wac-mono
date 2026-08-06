@@ -124,8 +124,8 @@ FIPS 202 appends `0x06`. They agree on no input at all. Every address, ABI selec
 Merkle-Patricia key is this function (wac-mono 0083, design/0003).
 
 **Nothing on a normal machine implements it.** OpenSSL and node have SHA-3 and the SHAKEs; the original
-padding predates the standard and no library ships it. So the test is three constants Ethereum quotes
-constantly, at three message lengths — `c5d24601…` for the empty string, `56e81f17…` for the single byte
+padding predates the standard and no library ships it. So the test is three constants the Ethereum
+ecosystem quotes constantly, at three message lengths — `c5d24601…` for the empty string, `56e81f17…` for the single byte
 `0x80` (the empty trie root), and `a9059cbb` for the first four bytes of
 `transfer(address,uint256)` — plus the argument that the machinery under them is already verified: the
 sponge agrees with `node:crypto` for two *other* domain bytes, which pins the permutation, the rate

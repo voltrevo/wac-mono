@@ -9,9 +9,9 @@
 // are each individually valid, against roots that have nothing to do with each other. So the storage root is
 // never supplied by the test — it comes out of the account proof, exactly as a caller must take it.
 
-import { wacBind } from "../../../harness/wacBind.ts";
 import { trie } from "./trie.ts";
 import { rlpEncode } from "./rlp.ts";
+import { accountAt, emptyRoots, hex, keccak, storageAt } from "./probe.ts";
 
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
@@ -21,65 +21,6 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
         `  got:  ${JSON.stringify(got)}\n  want: ${JSON.stringify(want)}`,
     );
   }
-}
-
-const probe = await wacBind("packages/mpt/test/wac/probe.wac") as Record<string, unknown>;
-const keccak = probe.hash as (b: Uint8Array) => Uint8Array;
-const accountRaw = probe.verifyAccount as (r: Uint8Array, a: Uint8Array, n: Uint8Array) => Uint8Array;
-const storageRaw = probe.verifyStorage as (r: Uint8Array, s: Uint8Array, n: Uint8Array) => Uint8Array;
-
-const hex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
-const dec = new TextDecoder();
-
-function packNodes(nodes: Uint8Array[]): Uint8Array {
-  const out = new Uint8Array(nodes.reduce((n, x) => n + 4 + x.length, 0));
-  let at = 0;
-  for (const n of nodes) {
-    out[at] = n.length & 0xff;
-    out[at + 1] = (n.length >> 8) & 0xff;
-    out[at + 2] = (n.length >> 16) & 0xff;
-    out[at + 3] = (n.length >> 24) & 0xff;
-    out.set(n, at + 4);
-    at += 4 + n.length;
-  }
-  return out;
-}
-
-type AccountAnswer = {
-  ok: boolean;
-  present: boolean;
-  nonce: string;
-  balance: string;
-  storageRoot: Uint8Array;
-  codeHash: string;
-  error: string;
-};
-
-function accountAt(stateRoot: Uint8Array, address: Uint8Array, nodes: Uint8Array[]): AccountAnswer {
-  const out = accountRaw(stateRoot, address, packNodes(nodes));
-  const nl = out[2], bl = out[3];
-  const present = out[1] === 1;
-  const at = 4 + nl + bl;
-  return {
-    ok: out[0] === 1,
-    present,
-    nonce: hex(out.subarray(4, 4 + nl)),
-    balance: hex(out.subarray(4 + nl, at)),
-    storageRoot: present ? out.slice(at, at + 32) : new Uint8Array(0),
-    codeHash: present ? hex(out.subarray(at + 32, at + 64)) : "",
-    error: dec.decode(out.subarray(present ? at + 64 : at)),
-  };
-}
-
-function storageAt(root: Uint8Array, slot: Uint8Array, nodes: Uint8Array[]) {
-  const out = storageRaw(root, slot, packNodes(nodes));
-  const len = out[2] | (out[3] << 8) | (out[4] << 16) | (out[5] << 24);
-  return {
-    ok: out[0] === 1,
-    present: out[1] === 1,
-    value: hex(out.subarray(6, 6 + len)),
-    error: dec.decode(out.subarray(6 + len)),
-  };
 }
 
 /** A 32-byte slot key, and the minimal big-endian bytes a slot value is stored as. */
@@ -121,6 +62,22 @@ const accounts: [Uint8Array, Uint8Array][] = [
   [keccak(address(3)), accountRlp(1, 0, EMPTY_STORAGE_ROOT, EMPTY_CODE_HASH)],
 ];
 const state = trie(accounts, keccak);
+
+Deno.test("the two empty constants are what they claim to be", () => {
+  // `emptyStorageRoot()` and `emptyCodeHash()` are literals in wac's sense — functions returning a fixed
+  // hash — and nothing called them, so mutation testing replaced each body with a constant and every test
+  // still passed. The file *derives* both values here, for the accounts it builds, and then never compared
+  // its derivation against the package's answer.
+  //
+  // What this anchors is the composition: the storage root of an account with no storage is the root of an
+  // empty trie, `keccak256(rlp(""))`, and its code hash is `keccak256("")` — not `keccak256(rlp(""))` again,
+  // which is the confusion the two being adjacent invites. keccak256 itself is anchored against `node:crypto`
+  // in `packages/crypto`, so it is not being trusted here on its own say-so.
+  const got = emptyRoots();
+  assertEquals(hex(got.subarray(0, 32)), hex(EMPTY_STORAGE_ROOT), "emptyStorageRoot");
+  assertEquals(hex(got.subarray(32, 64)), hex(EMPTY_CODE_HASH), "emptyCodeHash");
+  assertEquals(hex(EMPTY_STORAGE_ROOT) === hex(EMPTY_CODE_HASH), false, "they are not the same hash");
+});
 
 Deno.test("an account is read out of the state trie, fields and all", () => {
   const got = accountAt(state.root, address(2), state.proof(keccak(address(2))));

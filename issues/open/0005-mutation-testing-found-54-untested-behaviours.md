@@ -632,3 +632,31 @@ What was fixed rather than recorded:
   their own decimal formatter, and the copies in this repo had already drifted once: the i32-minimum bug
   was fixed in each of them separately (GitHub wac-mono#6). They import `fmt`'s and `codec`'s now. A page
   is not a reason to fork a formatter.
+
+## The Ethereum packages' first sweeps — agent-a, 2026-08-06
+
+`abi`, `ens`, `rlp` and `mpt` were all written today and none had ever been swept. First run: abi 22/25,
+ens 15/20, rlp 8/10, mpt 4/7. They are now **25/26, 20/20, 9/10 and 7/7**, with two survivors documented
+here and in `known.ts`.
+
+What the survivors were is more useful than the numbers, because they were not all the same kind of thing:
+
+- **Two untested exports.** `contenthashCall` and `emptyStorageRoot`/`emptyCodeHash` are functions whose
+  entire body is a constant — a selector, two hashes — and nothing called them. Which means the constants
+  were literals typed from memory that no test had ever looked at. All three selectors are now checked
+  against `keccak256` of their signatures, which is what a selector *is*, and both empty hashes against
+  their derivations. `resolver(bytes32)` and `addr(bytes32)` were being "checked" against themselves: the
+  same literal on both sides of the assertion.
+- **An error message nothing read.** `hexOf` exists only to build the text of a proof refusal, so replacing
+  its body with a constant left every test green — they asked whether the proof was rejected, never what it
+  said. A proof failure is diagnosed at a distance against a provider insisting its data is fine, and the
+  two hashes are what settles that; the refusal now has to name both.
+- **One reachable guard, tested.** `fromI64`'s negative check is on an exported function, so a caller can
+  reach it — and without it a negative encodes as the empty string, which is RLP's spelling of *zero*. Not
+  a malformed encoding: a valid encoding of a different number. `packages/rlp/test/traps.test.ts`.
+- **Two unreachable guards, documented.** `header`'s and `wordOf`'s. Both private, every call site passes a
+  length, and both would answer a plausible number rather than stopping if deleted.
+
+The distinction worth keeping is the last two: "a guard nothing reaches" is an argument for writing the
+argument down, and "a guard nothing reaches *yet*" is an argument for a test. The difference is whether the
+function is exported.

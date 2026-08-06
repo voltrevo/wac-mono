@@ -1,9 +1,11 @@
-# 0003 — an Ethereum distribution: what arriving looks like
+# 0003 — an Ethereum-centric reference distribution: what arriving looks like
 
 - **Status:** destination
 - **Opened:** 2026-08-06
 - **Written by:** agent-c, from a decision with the operator
 - **Source:** [voltrevo/wac-mono#39](https://github.com/voltrevo/wac-mono/issues/39), read inward
+- **Terminology aligned:** agent-a, 2026-08-06, per
+  [#46](https://github.com/voltrevo/wac-mono/issues/46) — see "What the words are doing" below
 
 ## Read this differently from 0001 and 0002
 
@@ -16,10 +18,29 @@ answers a different question, so the state of play below tracks *contributing pi
 and the pieces are ordered by dependency rather than by intent. If this ever acquires a sequence it
 should become an ordinary direction and say so.
 
+## What the words are doing
+
+**"An Ethereum-centric reference distribution", never "the Ethereum distribution"** — #46, and the
+distinction is load-bearing rather than stylistic. *Reference* because it is one worked example of a
+shape, not the sanctioned one; *-centric* because Ethereum is what it is built around rather than what
+it belongs to. Nobody has blessed this and nobody needs to.
+
+The other half of #46 is grammatical: **Ethereum is not the actor in a sentence here.** A network does
+not publish, govern, approve or authorise anything — people and contracts do, and naming them is what
+lets a reader ask who they are. So it is the *Ethereum network* or *chain* for shared state, finality
+and proofs; the *Ethereum ecosystem* for applications, standards and communities; and named actors —
+`ethereum/tests`' maintainers, a sync committee, a publisher, a contract — wherever a decision is being
+made. The Ethereum Foundation is not a trusted party in any of it.
+
+That reads as fussiness until it changes an answer. "Ethereum's own test vectors" quietly says a body
+approved them; `ethereum/tests` says a repository some maintainers keep, which a reader can go and
+check. The second is both more accurate and more useful, and the difference between them is exactly the
+authority this distribution declines to claim for itself.
+
 ## What we are aiming at
 
-One coherent system for interacting with Ethereum — not a generic installation with Ethereum tools
-added afterwards. A person can:
+One coherent system for interacting with the Ethereum network and its ecosystem — not a generic
+installation with Ethereum tools added afterwards. A person can:
 
 - see which network backend is in use, and replace it;
 - connect or create an account without any application seeing a private key;
@@ -38,10 +59,10 @@ the most finished thing in the repo, and Wacland is at step 1 of 8. The referenc
 against the platform that exists today, and moves onto Wacland when Wacland exists. What that buys is
 the interfaces — chain access, signing mediation, notifications — pinned by something that runs.
 
-**E2 — the core exposes nothing Ethereum-shaped.** Wacland stays independent of Ethereum: generic
-facilities only, every authority and dependency explicit and replaceable. No Foundation-operated
-service, no canonical provider, no permission from a maintainer, and no contract holding automatic
-system authority. A person can pin a version, choose their own recognised publishers, and move to a
+**E2 — the core exposes nothing Ethereum-shaped.** Wacland stays independent of the Ethereum network
+and everything specific to it: generic facilities only, every authority and dependency explicit and
+replaceable. No Ethereum Foundation service in the trusted path, no canonical provider, no permission
+from a maintainer, and no contract holding automatic system authority. A person can pin a version, choose their own recognised publishers, and move to a
 forked channel. This is a constraint on the distribution, not a feature of it.
 
 ## State of play
@@ -50,13 +71,13 @@ Ordered by dependency, not by intent.
 
 | piece | state |
 | --- | --- |
-| consensus verification — `packages/lightclient` | **done** — Altair sync, all four of Ethereum's `light_client/sync` cases, 19 steps, 16 real sync-committee signatures |
-| SSZ and Merkle proofs — `packages/ssz` | **done** — 2,233 Ethereum vectors, including all 1,131 *invalid* `ssz_generic` |
-| BLS12-381 verification — `packages/bls` | **done** — all 29 Ethereum verify fixtures, ~8ms a signature |
+| consensus verification — `packages/lightclient` | **done** — Altair sync, all four `light_client/sync` cases from `consensus-spec-tests`, 19 steps, 16 real sync-committee signatures |
+| SSZ and Merkle proofs — `packages/ssz` | **done** — 2,233 vectors from `consensus-spec-tests`, including all 1,131 *invalid* `ssz_generic` |
+| BLS12-381 verification — `packages/bls` | **done** — all 29 `bls` verify fixtures from `consensus-spec-tests`, ~8ms a signature |
 | keccak256 | **done** — `crypto.keccak256`, the sponge's fourth domain byte; three published vectors at three lengths, and asserted to disagree with SHA3-256 and truncated SHAKE256 |
-| RLP — `packages/rlp` | **done** — Ethereum's own `RLPTests`, 28 valid driven in both directions against the published bytes and 26 invalid all refused; the one rule the corpus does not cover is named in `test/vendor/README.md` |
+| RLP — `packages/rlp` | **done** — `RLPTests` from `ethereum/tests`, 28 valid driven in both directions against the published bytes and 26 invalid all refused; the one rule the corpus does not cover is named in `test/vendor/README.md` |
 | ABI encoding and decoding — `packages/abi` | **done** — schema-driven, thirty cases from `npm:ethers` including every nested shape, decoded *and* re-encoded byte for byte, with the malformed-offset refusals |
-| Merkle-Patricia state proofs — `packages/mpt` | **done bar one vector** — the verifier and the account-and-storage composition, anchored to all seven of `trieanyorder.json`'s published roots; inclusion, absence and every perturbation. 0086 stays open only for a live `eth_getProof` recorded as a vector |
+| Merkle-Patricia state proofs — `packages/mpt` | **done** — the verifier and the account-and-storage composition, anchored to all seven of `trieanyorder.json`'s published roots and to `eth_getProof` from a real client (anvil, `alloy-trie` in Rust); inclusion, absence and every perturbation. 0086 closed |
 | ENS resolution — `packages/ens` | **the name half is done** — namehash, DNS wire encoding, selectors and the two calls' calldata, all against `npm:ethers`. ENSIP-15 normalisation is not implemented and says so; making the calls needs an endpoint, which is the same gap 0086 has |
 | secp256k1 signing | not started — see the section below, which is the reason it is last |
 | content-addressed retrieval (IPFS or otherwise) | not started — needs a decision about what is being promised |
@@ -98,8 +119,8 @@ for why that sharing does not happen.
 
 ## Explicitly not this
 
-From #39, and worth keeping because each one is a thing a reader will otherwise assume: Ethereum is not
-mandatory for Wacland; no contract gets automatic system authority; binaries do not go onchain; private
+From #39, and worth keeping because each one is a thing a reader will otherwise assume: the Ethereum
+network is not mandatory for Wacland, and this distribution is neither official nor canonical; no contract gets automatic system authority; binaries do not go onchain; private
 keys are never exposed to an application; and no particular network, committee or governance model is
 required.
 
@@ -107,10 +128,11 @@ required.
 
 Issues reference this document rather than restating it. Unblocked today, in dependency order:
 
-- [0083](../issues/open/0083-keccak256-for-ethereum-not-just-sha3.md) — keccak256
-- [0084](../issues/open/0084-rlp-encoding-and-decoding.md) — RLP
-- [0085](../issues/open/0085-abi-encoding-and-decoding.md) — ABI
-- [0086](../issues/open/0086-merkle-patricia-proofs-so-a-contract-read-is-verified.md) — state proofs
+- [0083](../issues/closed/0083-keccak256-for-ethereum-not-just-sha3.md) — keccak256 — **closed**
+- [0084](../issues/closed/0084-rlp-encoding-and-decoding.md) — RLP — **closed**
+- [0085](../issues/closed/0085-abi-encoding-and-decoding.md) — ABI — **closed**
+- [0086](../issues/closed/0086-merkle-patricia-proofs-so-a-contract-read-is-verified.md) — state proofs
+  — **closed**
 
 Not yet issues, and why: **ENS** needs the three above; **signing** needs its gate designed first;
 **content-addressed retrieval** needs a decision about what is being promised; the **reference

@@ -1,0 +1,58 @@
+// Fixture for the guards that trap. A trap aborts the module, so each case needs its own call from the host
+// rather than a wac test — the shape `packages/std/test/traps.wac` and `packages/json/test/bounds.wac` use.
+//
+// These are the inputs a caller can get wrong and the type system cannot catch: a node that is not 32 bytes,
+// a DNS label longer than the wire format can express. Each was a surviving mutant until this file existed,
+// which is the honest reason it does: a guard nothing exercises is a guard nobody has checked.
+import { hashInto, namehash, dnsEncode, resolverCall, addrCall } from "../../src/ens.wac";
+import { ownerSlot, resolverSlot } from "../../src/registry.wac";
+
+u8[] short() { return u8[31](); }
+/**
+ * A node that is too *long*, which is the case the guards are actually for.
+ *
+ * A short node traps anyway — the copy loop reads past its end — so a fixture of short nodes alone leaves
+ * every length check deletable with the tests still green, which is what the first version of this file
+ * did. An over-long node is copied happily and silently truncated to its first 32 bytes: a plausible hash
+ * of the wrong thing, which for a registry read means proving something true about a different name.
+ */
+u8[] long() { return u8[40](); }
+u8[] node() { return namehash("foo.eth".toBytes()); }
+
+export i32 hashIntoShortNode()  { hashInto(short(), node()); return 0; }
+export i32 hashIntoShortLabel() { hashInto(node(), short()); return 0; }
+export i32 hashIntoLongNode()   { hashInto(long(), node()); return 0; }
+export i32 hashIntoLongLabel()  { hashInto(node(), long()); return 0; }
+export i32 resolverCallShort()  { resolverCall(short()); return 0; }
+export i32 resolverCallLong()   { resolverCall(long()); return 0; }
+export i32 addrCallShort()      { addrCall(short()); return 0; }
+export i32 addrCallLong()       { addrCall(long()); return 0; }
+export i32 ownerSlotShort()     { ownerSlot(short()); return 0; }
+export i32 ownerSlotLong()      { ownerSlot(long()); return 0; }
+export i32 resolverSlotShort()  { resolverSlot(short()); return 0; }
+export i32 resolverSlotLong()   { resolverSlot(long()); return 0; }
+
+/** A label of 256 bytes has no wire form: the length prefix is one byte. */
+export i32 dnsLabelTooLong() {
+  u8[] name = u8[256]();
+  for (i32 i = 0; i < name.len(); i++) { name[i] = 'a'; }
+  dnsEncode(name);
+  return 0;
+}
+
+/** And the boundary below it, which must work: 255 is the longest label there is. */
+export i32 dnsLabelAtTheLimit() {
+  u8[] name = u8[255]();
+  for (i32 i = 0; i < name.len(); i++) { name[i] = 'a'; }
+  return dnsEncode(name).len();
+}
+
+/** The ordinary calls, so a fixture that trapped everywhere would be caught. */
+export i32 ordinary() {
+  hashInto(node(), node());
+  resolverCall(node());
+  addrCall(node());
+  ownerSlot(node());
+  resolverSlot(node());
+  return dnsEncode("foo.eth".toBytes()).len();
+}

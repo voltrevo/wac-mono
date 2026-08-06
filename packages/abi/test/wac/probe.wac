@@ -3,7 +3,8 @@
 // The rendering is done here rather than in TypeScript for the reason `packages/rlp`'s tests give: what is
 // under test is what the *decoder* thinks the bytes mean, and a rendering computed on this side is a
 // rendering of exactly that. The host computes the same string from ethers' decode of the same bytes.
-import { decode, encode, Decoded, Value, T_TUPLE, listOf, wordOfValue, bytesOfValue,
+import { decode, encode, Decoded, Encoded, Value, T_UINT, T_BOOL, T_ADDRESS, T_BYTES32, T_BYTES,
+         T_STRING, T_ARRAY, T_FIXED, T_TUPLE, listOf, wordOfValue, bytesOfValue,
          typeLen, isDynamic } from "../../src/abi.wac";
 
 /** `[ok, render… ]` when it worked, `[0, error…]` when it did not. */
@@ -21,7 +22,34 @@ export u8[] decodeRender(u8[] data, i32[] schema) {
 export u8[] roundTrip(u8[] data, i32[] schema) {
   Decoded d = decode(data, schema);
   if (!d.ok) { return u8[0](); }
-  return encode(d.items, schema);
+  Encoded e = encode(d.items, schema);
+  if (!e.ok) { return u8[0](); }
+  return e.bytes;
+}
+
+/**
+ * Encode a deliberately mismatched tree: `kind` picks which shape to hand over where the schema wants
+ * something else. `[ok, error…]` — and `ok` had better be 0 for every one of them.
+ */
+export u8[] encodeMismatch(i32 kind, i32[] schema) {
+  Value[] one = Value[1](fill: Value.Word(u8[32]()));
+  if (kind == 0) { one[0] = Value.List(Value[0](fill: Value.Word(u8[32]()))); }   // a List for a uint
+  if (kind == 1) { one[0] = Value.Bytes(u8[3]()); }                              // Bytes for a uint
+  if (kind == 2) { one[0] = Value.Word(u8[31]()); }                              // a short word
+  if (kind == 3) { one[0] = Value.Word(u8[32]()); }                              // a Word for bytes
+  if (kind == 4) { one[0] = Value.Bytes(u8[3]()); }                              // Bytes for an array
+  Encoded e = encode(one, schema);
+  u8[] err = e.error.toBytes();
+  u8[] out = u8[1 + err.len()]();
+  out[0] = e.ok ? 1 : 0;
+  for (i32 i = 0; i < err.len(); i++) { out[1 + i] = err[i]; }
+  return out;
+}
+
+/** The descriptor tags, so the host can check its own copy of them has not drifted. */
+export i32[] tags() {
+  return i32[](T_UINT(), T_BOOL(), T_ADDRESS(), T_BYTES32(), T_BYTES(), T_STRING(),
+               T_ARRAY(), T_FIXED(), T_TUPLE());
 }
 
 string renderTuple(Value[] items, i32[] schema, i32 schemaAt) {

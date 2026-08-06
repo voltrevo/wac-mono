@@ -36,7 +36,10 @@ import { Relay, base64NoPad } from "./directory.wac";
 import { findFrom } from "./consensus.wac";
 import { timeOf } from "./dirclient.wac";
 import { decode as b64decode } from "../../codec/src/base64.wac";
-import { timePeriodLength, timePeriodNum, rotationOffsetMinutes } from "./hsblind.wac";
+import {
+  SHARED_RANDOM_N_PHASES, SHARED_RANDOM_N_ROUNDS, timePeriodLength, timePeriodNum,
+  rotationOffsetMinutes,
+} from "./hsblind.wac";
 
 /** `hsdir_n_replicas`, consensus parameter, default 2. */
 export const i32 HSDIR_N_REPLICAS_DEFAULT = 2;
@@ -336,4 +339,93 @@ export i64[] consensusTimePeriod(u8[] consensus, bool testingNetwork, i64 hsdirI
   i64 length = timePeriodLength(testingNetwork, voting, hsdirInterval);
   i64 num = timePeriodNum(validAfter, length, rotationOffsetMinutes(voting));
   return i64[](num, length);
+}
+
+// ── What a *service* publishes for, which is not what a client fetches for ────
+//
+// A client fetches one descriptor. A service publishes **two**, under two different time periods with
+// two different shared random values, and to two different sets of directories. That is not
+// redundancy: it is what keeps a service reachable across the moment the ring rotates, when some
+// clients have moved to the new period and some have not.
+//
+// tor computes this in `node_set_hsdir_index` (`nodelist.c`) and the rule has two halves:
+//
+//   - **which two periods**, which depends on where the consensus sits between a new time period and
+//     a new shared random value — `hs_in_period_between_tp_and_srv`;
+//   - **which SRV goes with each**, which does not depend on anything: the first descriptor always
+//     uses the *previous* shared random value and the second always uses the *current* one.
+//
+// Getting either wrong produces a descriptor filed under a name no client computes — the same silent
+// failure as a wrong blinded key, and equally invisible to every party involved.
+
+/** One of the two descriptors a service publishes: which period, and which shared random value. */
+export struct StorePeriod {
+  i64 periodNum;
+  i64 periodLength;
+  /** True for `shared-rand-current-value`, false for `shared-rand-previous-value`. */
+  bool useCurrentSrv;
+}
+
+/**
+ * Whether the consensus sits between a new time period and a new shared random value.
+ *
+ * tor's diagram, which is clearer than any restatement:
+ *
+ *      00:00      12:00       00:00       12:00
+ *      SRV#1      TP#1        SRV#2       TP#2
+ *       $==========|-----------$===========|
+ *                  ^^^^^^^^^^^^
+ *
+ * True in the marked stretch. The computation is entirely from the consensus: the current shared
+ * random protocol run started at the beginning of the round the consensus falls in, rounded back by
+ * however many rounds have elapsed, and the next time period starts one phase after the period
+ * boundary that follows it.
+ */
+export bool betweenTimePeriodAndSrv(u8[] consensus, bool testingNetwork, i64 hsdirInterval) {
+  i64 validAfter = timeOf(consensus, "valid-after");
+  i64 freshUntil = timeOf(consensus, "fresh-until");
+  if (validAfter <= 0 || freshUntil <= validAfter) { return false; }
+  i64 voting = freshUntil - validAfter;
+  i64 length = timePeriodLength(testingNetwork, voting, hsdirInterval);
+  i64 offset = rotationOffsetMinutes(voting);
+
+  // The protocol run's start: step back by however many rounds of this run have already happened.
+  i64 totalRounds = (SHARED_RANDOM_N_ROUNDS * SHARED_RANDOM_N_PHASES) as i64;
+  i64 slot = (validAfter / voting) % totalRounds;
+  i64 srvStart = validAfter - slot * voting;
+
+  // And the start of the next time period after that, offset by one phase — the same offset that
+  // makes periods line up with SRV publication rather than with midnight.
+  i64 nextPeriod = timePeriodNum(srvStart, length, offset) + 1;
+  if (nextPeriod <= 0) { return false; }
+  i64 tpStart = nextPeriod * length * 60 + (SHARED_RANDOM_N_ROUNDS as i64) * voting;
+
+  return !(validAfter >= srvStart && validAfter < tpStart);
+}
+
+/**
+ * The two descriptors a service should publish, in tor's order.
+ *
+ * Empty if the consensus carries no timings, so a caller cannot publish against a period it invented.
+ * The two entries are `store_first` and `store_second`, and they are always consecutive periods —
+ * what moves is *which* consecutive pair, and that is the half the predicate above decides.
+ */
+export StorePeriod[] serviceStorePeriods(u8[] consensus, bool testingNetwork, i64 hsdirInterval) {
+  i64[] now = consensusTimePeriod(consensus, testingNetwork, hsdirInterval);
+  if (now[0] < 0) { return StorePeriod[0](fill: StorePeriod(0, 0, false)); }
+  i64 current = now[0];
+  i64 length = now[1];
+
+  // Between a new period and a new SRV, a service is still publishing for the period that is ending
+  // as well as the one that has begun; outside that stretch it publishes for the current period and
+  // the one about to begin.
+  i64 first = betweenTimePeriodAndSrv(consensus, testingNetwork, hsdirInterval)
+    ? current - 1 : current;
+
+  // The SRV assignment is fixed and does not follow the predicate: the older descriptor always uses
+  // the previous shared random value and the newer one the current value. tor says so in one line
+  // and it is the kind of line that reads like a comment rather than a rule.
+  StorePeriod[] out = StorePeriod[2](fill: StorePeriod(first, length, false));
+  out[1] = StorePeriod(first + 1, length, true);
+  return out;
 }

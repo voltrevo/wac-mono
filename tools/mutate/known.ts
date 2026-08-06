@@ -324,6 +324,27 @@ export const KNOWN_SURVIVORS: KnownSurvivor[] = [
       "whose answer differs, and no test could find one. It stays because a path built by hand is read by " +
       "people in log lines, and `//` in one is a question somebody has to answer twice. wac-mono 0005.",
   },
+  {
+    name: "guard/rlp/rlp:120:18",
+    why:
+      "`header`'s negative check, the private one. Its exported neighbour `fromI64` has the same guard and " +
+      "is now covered by `test/traps.test.ts`, because a caller can reach it with a negative; `header` " +
+      "cannot be reached at all — it is private, and its three call sites pass `b.len()`, a sum of `.len()`s " +
+      "and an encoded payload's length. Kept for the same reason as abi's `wordOf`: without it `while (x > 0)` " +
+      "does not run, so the header would be `short + len` with a negative added to it — a byte that means " +
+      "some other RLP type entirely. wac-mono 0005.",
+  },
+  {
+    name: "guard/abi/abi:526:16",
+    why:
+      "`wordOf`'s negative check. Every caller passes a length or a running offset — `b.len()`, " +
+      "`xs.len()`, `tailAt` — so a negative cannot arise from anything this package can encode: it would " +
+      "take a payload past 2^31 bytes, which is larger than the array that would have to hold it. Kept " +
+      "rather than deleted because of what happens without it: `while (x > 0)` does not run for a " +
+      "negative, so the answer would be a word of zeroes — a silent wrong offset in calldata, which is " +
+      "the failure `encode` was changed this evening to stop producing. A guard that turns an impossible " +
+      "case into a stop rather than a plausible number. wac-mono 0005.",
+  },
   // ── the browser examples ────────────────────────────────────────────────────
   //
   // These are page bodies, and the only thing that drives a page is

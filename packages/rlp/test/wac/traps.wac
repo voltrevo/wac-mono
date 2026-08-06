@@ -1,0 +1,35 @@
+// Fixture for `fromI64`'s refusal to encode a negative, driven one call at a time because a trap aborts the
+// module — the shape `packages/ens/test/wac/traps.wac` and `packages/std/test/traps.wac` use.
+//
+// **RLP has no negative numbers.** It encodes byte strings, and a number is the minimal big-endian byte
+// string that spells it; there is no sign bit anywhere in the format and nowhere to put one. So a caller
+// handing `fromI64` a negative has a bug in the layer above, and the only question is what it hears back.
+//
+// Without the guard the answer is the empty string, because `while (x > 0)` does not run for a negative —
+// and the empty string is RLP's encoding of *zero*. A balance of -1 would go on the wire as a balance of 0,
+// which is a perfectly valid encoding of the wrong number, and every downstream check would pass. That is
+// the failure this file exists to keep: a mutant that deletes the guard is otherwise killed by nothing.
+import { fromI64, encode, Item } from "../../src/rlp.wac";
+
+/** The obvious one. */
+export i32 negativeOne() { fromI64(-1); return 0; }
+
+/** The i64 minimum, whose negation overflows and which a `v < 0` written as `-v > 0` would let through. */
+export i32 mostNegative() { fromI64(-9223372036854775808); return 0; }
+
+/** A negative arriving through the encoder rather than directly, which is how a caller would really meet it. */
+export i32 negativeInAList() {
+  Item[] xs = Item[2](fill: Item.Bytes(u8[0]()));
+  xs[0] = Item.Bytes(fromI64(1));
+  xs[1] = Item.Bytes(fromI64(-7));
+  encode(Item.List(xs));
+  return 0;
+}
+
+/**
+ * A non-negative, so the fixture cannot pass by being broken.
+ *
+ * If the module trapped on load, or `fromI64` trapped for everything, every case above would "pass" and the
+ * file would be measuring nothing. This one must return.
+ */
+export i32 ordinary() { return fromI64(258).len(); }

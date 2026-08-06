@@ -6,7 +6,7 @@
 
 import { T } from "../../../wactest/src/assert.wac";
 import { namehash, dnsEncode, rootNode, hashInto, selector, resolverCall, addrCall,
-         addressFromWord, isZeroAddress } from "../../src/ens.wac";
+         contenthashCall, addressFromWord, isZeroAddress } from "../../src/ens.wac";
 import { ownerSlot, resolverSlot, ttlSlot } from "../../src/registry.wac";
 import { keccak256 } from "../../../crypto/src/keccak.wac";
 
@@ -71,6 +71,20 @@ export string test_calldata_is_a_selector_and_a_word() {
   t.eqStr(hex(slice(call, 0, 4)), "0178b8bf", "resolver(bytes32)");
   t.eqStr(hex(slice(call, 4, 36)), hex(node), "the node, unpadded because it is already a word");
   t.eqStr(hex(slice(addrCall(node), 0, 4)), "3b3b57de", "addr(bytes32)");
+
+  // **The three selectors against keccak256 of their signatures**, which is what a selector *is*. They were
+  // written into the source as literals from memory, and a literal nothing checks is a constant that can be
+  // wrong without any test noticing — `contenthashCall` survived mutation testing precisely because nothing
+  // called it. The signatures themselves are in the corpus, hashed by ethers.
+  t.eqStr(hex(slice(resolverCall(node), 0, 4)), hex(selector("resolver(bytes32)".toBytes())),
+          "resolver(bytes32)'s literal matches its hash");
+  t.eqStr(hex(slice(addrCall(node), 0, 4)), hex(selector("addr(bytes32)".toBytes())),
+          "addr(bytes32)'s literal matches its hash");
+  u8[] ch = contenthashCall(node);
+  t.eqI32(ch.len(), 36, "contenthash takes one word too");
+  t.eqStr(hex(slice(ch, 0, 4)), hex(selector("contenthash(bytes32)".toBytes())),
+          "contenthash(bytes32)'s literal matches its hash");
+  t.eqStr(hex(slice(ch, 4, 36)), hex(node), "and carries the node");
   return t.report();
 }
 

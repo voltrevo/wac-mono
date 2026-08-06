@@ -7,7 +7,7 @@
 - **Kind:** missing feature
 - **Symptom:** not implemented
 
-First slice of [design/0003](../../design/0003-an-ethereum-distribution.md), where the reasoning lives.
+First slice of [design/0003](../../design/0003-an-ethereum-centric-reference-distribution.md), where the reasoning lives.
 
 Ethereum hashes with **keccak256**, which is Keccak with the original padding rather than the one NIST
 chose for SHA-3. Same permutation, same rate and capacity, one byte different: keccak256 appends `0x01`
