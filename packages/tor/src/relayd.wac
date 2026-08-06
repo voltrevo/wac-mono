@@ -88,6 +88,9 @@ import {
 /** How long a circuit may be silent before the connection is dropped. */
 const i32 IDLE_TIMEOUT_MS = 120000;
 
+/** How many connections a relay will hold at once. Beyond this it refuses rather than collapses. */
+const i32 MAX_CONNS = 64;
+
 /** An hour in seconds, for certificate lifetimes. */
 const i64 HOUR = 3600;
 
@@ -368,15 +371,85 @@ export i32 main(Core core, Cli cli) {
   }
   core.log("relayd: listening on " + bind + ":" + itoa(listener.port));
 
+  // Accept and serve at once. The listener's ticket sits in the same `waitAny` as every live
+  // connection's, so a relay busy carrying one circuit still answers the relay extending to it — which
+  // is the whole reason this is not a loop that serves one connection to completion.
+  // `Conn?` because a struct array needs a default and a half-built connection is not a thing
+  // this program should be able to name. `live` is the count that is real.
+  Conn?[] conns = Conn?[MAX_CONNS]();
+  i32 live = 0;
+  Pending<Socket> incoming = cli.accept(listener.handle);
+
   while (true) {
-    Socket conn = cli.accept(listener.handle).wait();
-    if (conn.handle < 0) {
-      core.warn("relayd: accept: " + conn.error);
-      return 1;
+    // The wait list is rebuilt each round because it changes shape each round: a connection may gain a
+    // next hop or a stream, or go away. Index 0 is always the listener; after that each live
+    // connection contributes one to three ids, and `owner`/`source` record which is which so the
+    // answer can be translated back. Guessing that mapping instead of recording it is the bug this
+    // shape exists to avoid.
+    i32 n = 1;
+    for (i32 i = 0; i < live; i++) {
+      n = n + 1;
+      if (conns[i]!.hasNext) { n = n + 1; }
+      if (conns[i]!.hasStream) { n = n + 1; }
     }
-    core.log("relayd: connection from " + conn.peer);
-    serve(core, cli, conn, id, certs, now, docs, hasDir);
-    cli.closeSocket(conn.handle);
+    i32[] ids = i32[n]();
+    i32[] owner = i32[n]();
+    i32[] source = i32[n]();
+    ids[0] = incoming.id;
+    owner[0] = -1;
+    source[0] = -1;
+    i32 at = 1;
+    for (i32 i = 0; i < live; i++) {
+      ids[at] = conns[i]!.fromClient.id; owner[at] = i; source[at] = 0; at = at + 1;
+      if (conns[i]!.hasNext) {
+        ids[at] = conns[i]!.fromNext.id; owner[at] = i; source[at] = 1; at = at + 1;
+      }
+      if (conns[i]!.hasStream) {
+        ids[at] = conns[i]!.fromStream.id; owner[at] = i; source[at] = 2; at = at + 1;
+      }
+    }
+
+    i32 which = core.waitAny(ids, IDLE_TIMEOUT_MS);
+    if (which < 0) {
+      // Nothing spoke for two minutes. Dropping everything is heavy-handed and it is what a relay with
+      // no traffic should do rather than hold sockets for a network that has gone.
+      for (i32 i = 0; i < live; i++) { dropConn(cli, conns[i]!); }
+      live = 0;
+      incoming.cancel();
+      incoming = cli.accept(listener.handle);
+      continue;
+    }
+
+    if (which == 0) {
+      Socket fresh = incoming.wait();
+      incoming = cli.accept(listener.handle);
+      if (fresh.handle < 0) {
+        core.warn("relayd: accept: " + fresh.error);
+        continue;
+      }
+      if (live >= MAX_CONNS) {
+        // Refusing is the honest answer. A relay that accepts every connection offered holds them all
+        // and dies on the first burst, which is worse for the network than one refusal.
+        core.warn("relayd: at " + itoa(MAX_CONNS) + " connections, refusing " + fresh.peer);
+        cli.closeSocket(fresh.handle);
+        continue;
+      }
+      core.log("relayd: connection from " + fresh.peer);
+      conns[live] = newConn(core, cli, fresh, id);
+      live = live + 1;
+      continue;
+    }
+
+    i32 who = owner[which];
+    Conn hot = conns[who]!;
+    feedConn(core, cli, hot, source[which], id, certs, docs, hasDir);
+    if (!hot.live) {
+      dropConn(cli, hot);
+      // Close the gap rather than leave a hole: the wait list is built by walking 0..live, and a dead
+      // entry in the middle would be waited on forever.
+      for (i32 i = who; i + 1 < live; i++) { conns[i] = conns[i + 1]; }
+      live = live - 1;
+    }
   }
   return 0;
 }
@@ -413,144 +486,138 @@ u8[] takeVec(u8[] b, i32 at) {
 }
 
 /** One connection, from TLS through to circuits, until it closes. */
-void serve(Core core, Cli cli, Socket conn, Identity id, u8[] certs, i64 now,
-           DirDocuments docs, bool hasDir) {
+/**
+ * One connection this relay is serving, and everything its life depends on.
+ *
+ * These were `runLink`'s locals when a relay served one connection at a time. They had to become a
+ * struct for the same reason the loop had to change: **a relay in the middle of a circuit must serve
+ * the client it has and accept the extend that is coming**, and a program sitting inside one
+ * connection's function cannot do the second. Whether a three-hop circuit could be built used to
+ * depend on the order connections happened to arrive.
+ */
+struct Conn {
+  bool live;
+  i32 sock;
+  Socket sockObj;
+  u8[] tls;
+  u8[] buf;
+  bool established;
+  bool versionsSeen;
+  bool circuitOpen;
+  i32 circId;
+  Hop hop;
+  bool hasNext;
+  Link next;
+  i32 nextCircId;
+  i32 dirStream;
+  Buf dirRequest;
+  bool hasStream;
+  i32 streamSock;
+  i32 streamId;
+  /** One outstanding read per source. A ticket has to exist to be waited on, and `wait` spends it. */
+  Pending<Read> fromClient;
+  Pending<Read> fromNext;
+  Pending<Read> fromStream;
+}
+
+/** A connection as it arrives: TLS begun, nothing else known yet. */
+Conn newConn(Core core, Cli cli, Socket sock, Identity id) {
   u8[] tls = tlsServerInit(id.tlsCertDer, id.tlsSeed, clampScalar(tweak(id.tlsSeed, 6)),
                            core.randomBytes(32).wait());
-  runLink(core, cli, conn, tls, id, certs, docs, hasDir);
+  Pending<Read> first = cli.recv(sock.handle);
+  return Conn(true, sock.handle, sock, tls, u8[0](), false, false, false, 0, Hop.create(u8[72]()),
+              false, Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]()), 0,
+              -1, Buf.create(), false, -1, -1, first, first, first);
+}
+
+/** Everything a closing connection holds: its own socket, the next hop's, and any stream's. */
+void dropConn(Cli cli, Conn c) {
+  if (c.hasStream) { cli.closeSocket(c.streamSock); c.hasStream = false; }
+  if (c.hasNext) { cli.closeSocket(c.next.sock); c.hasNext = false; }
+  cli.closeSocket(c.sock);
+  c.live = false;
 }
 
 /**
- * The Tor link protocol over an established TLS connection.
+ * One source of one connection has spoken: read it and act.
  *
- * Cells arrive in whatever chunks TLS delivers, so a buffer accumulates until `cellSize` says a
- * whole one is present — the same reasoning as the client's `nextCell`, and the reason cell framing
- * is a function of the buffer rather than of a read.
+ * `source` is 0 for the client, 1 for the next hop, 2 for a stream — the same numbering the wait
+ * builds, so the caller never has to translate. The function returns when the event is handled;
+ * `c.live` says whether the connection survived it.
  */
-void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs,
-             DirDocuments docs, bool hasDir) {
-  u8[] buf = u8[0]();
-  bool established = false;
-  bool versionsSeen = false;
-  bool circuitOpen = false;
-  i32 circId = 0;
-  Hop hop = Hop.create(u8[72]());
-
-  // The next hop, once an EXTEND2 has been acted on. `next` starts as a dead Link rather than an
-  // optional because it is only ever read while `hasNext` says it is real, and a dead one carries the
-  // same fields — a `Link?` would put a `!` on every use to say what `hasNext` already says.
-  // The one directory stream a client may open over this circuit, and the request arriving on it.
-  i32 dirStream = -1;
-  Buf dirRequest = Buf.create();
-
-  // And the one ordinary stream: a socket to wherever a RELAY_BEGIN asked to go. One at a time, which
-  // is a real limit rather than a simplification — a second BEGIN is refused with an END so the client
-  // knows, instead of being left to time out.
-  bool hasStream = false;
-  i32 streamSock = -1;
-  i32 streamId = -1;
-
-  bool hasNext = false;
-  Link next = Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]());
-  i32 nextCircId = 0;
-
-  // One outstanding read per side, re-armed after each answer. Created before the loop because a
-  // ticket has to exist to be waited on, and re-created rather than reused because `wait` spends it.
-  Pending<Read> fromClient = cli.recv(conn.handle);
-  Pending<Read> fromNext = fromClient;
-  Pending<Read> fromStream = fromClient;
-
-  while (true) {
-    // `Read` is an enum, not a struct with a length: a clean close and a failure are different
-    // answers, and only the second is worth a line. Collapsing them to "no bytes" is how a program
-    // reports a reset connection as a tidy goodbye.
-    // Both sides of a relayed circuit have to be watched at once: the client's connection and, once
-    // the circuit has been extended, the next hop's. `waitAny` parks on whichever speaks — polling
-    // both would spin a core to avoid parking, which is what its own documentation says. The shape is
-    // `packages/box/src/applets/nc.wac`'s, which is the same problem with stdin in place of a relay.
-    i32 which = -2;
-    if (hasNext && hasStream) {
-      which = core.waitAny(i32[](fromClient.id, fromNext.id, fromStream.id), IDLE_TIMEOUT_MS);
-    } else if (hasNext) {
-      which = core.waitAny(i32[](fromClient.id, fromNext.id), IDLE_TIMEOUT_MS);
-    } else if (hasStream) {
-      // The stream keeps index 2 whether or not a next hop exists, so the branches below never have to
-      // ask which arrangement produced the number.
-      i32 w = core.waitAny(i32[](fromClient.id, fromStream.id), IDLE_TIMEOUT_MS);
-      which = w == 1 ? 2 : w;
-    } else {
-      which = core.waitAny(i32[](fromClient.id), IDLE_TIMEOUT_MS);
-    }
-    if (which < 0) {
-      core.warn("relayd:   idle for " + itoa(IDLE_TIMEOUT_MS) + "ms, dropping the connection");
-      if (hasNext) { cli.closeSocket(next.sock); }
-      return;
-    }
-
-    if (which == 2) {
+void feedConn(Core core, Cli cli, Conn c, i32 source, Identity id, u8[] certs,
+              DirDocuments docs, bool hasDir) {
+    if (source == 2) {
       bool open = false;
       u8[] payload = u8[0]();
-      match (fromStream.wait()) {
+      match (c.fromStream.wait()) {
         case Data(bytes): { payload = bytes; open = true; }
         case End: { }
         case Failed(why): { core.warn("relayd:   the stream failed: " + why); }
       }
-      fromStream = cli.recv(streamSock);
+      c.fromStream = cli.recv(c.streamSock);
       if (!open) {
         // The far end closed, which is an END rather than silence: a client that is told nothing waits
         // for its own timeout and blames the circuit.
-        tls = sendCell(cli, conn, tls,
-                       sendToClient(hop, circId, relayEnd(), streamId, endReason()));
-        cli.closeSocket(streamSock);
-        hasStream = false;
-        core.log("relayd:   stream " + itoa(streamId) + " closed by the far end");
-        continue;
+        c.tls = sendCell(cli, c.sockObj, c.tls,
+                       sendToClient(c.hop, c.circId, relayEnd(), c.streamId, endReason()));
+        cli.closeSocket(c.streamSock);
+        c.hasStream = false;
+        core.log("relayd:   stream " + itoa(c.streamId) + " closed by the far end");
+        c.live = false;
+        return;
       }
       u8[][] parts = chunkRequest(payload);
       for (i32 pi = 0; pi < parts.len(); pi++) {
-        tls = sendCell(cli, conn, tls,
-                       sendToClient(hop, circId, relayData(), streamId, parts[pi]));
+        c.tls = sendCell(cli, c.sockObj, c.tls,
+                       sendToClient(c.hop, c.circId, relayData(), c.streamId, parts[pi]));
       }
-      continue;
+      c.live = false;
+      return;
     }
 
-    if (which == 1) {
-      // The next hop answered. Its cells belong to the client, one layer of encryption added.
+
+    if (source == 1) {
+      // The c.next c.hop answered. Its cells belong to the client, one layer of encryption added.
       bool alive = false;
-      match (fromNext.wait()) {
-        case Data(bytes): { alive = feedLink(next, bytes); }
+      match (c.fromNext.wait()) {
+        case Data(bytes): { alive = feedLink(c.next, bytes); }
         case End: { }
         case Failed(why): { core.warn("relayd:   the next hop failed: " + why); }
       }
-      fromNext = cli.recv(next.sock);
+      c.fromNext = cli.recv(c.next.sock);
       if (!alive) {
         core.warn("relayd:   the next hop closed the connection");
-        tls = sendCell(cli, conn, tls, destroyCell(circId, DESTROY_NONE));
-        cli.closeSocket(next.sock);
+        c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(c.circId, DESTROY_NONE));
+        cli.closeSocket(c.next.sock);
+        c.live = false;
         return;
       }
       while (true) {
-        u8[] back = takeCell(next);
+        u8[] back = takeCell(c.next);
         if (back.len() == 0) { break; }
         i32 backCommand = cellCommand(back, 0);
         if (backCommand == cmdPadding()) { continue; }
         if (backCommand == cmdDestroy()) {
           core.log("relayd:   the next hop destroyed its leg of the circuit");
-          tls = sendCell(cli, conn, tls, destroyCell(circId, DESTROY_NONE));
-          cli.closeSocket(next.sock);
+          c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(c.circId, DESTROY_NONE));
+          cli.closeSocket(c.next.sock);
+          c.live = false;
           return;
         }
         if (backCommand != cmdRelay() && backCommand != cmdRelayEarly()) { continue; }
         // One layer on, and out to the client. The payload is opaque here: it was encrypted for the
-        // client by the hop beyond us.
-        tls = sendCell(cli, conn, tls, encodeFixed(circId, cmdRelay(), wrapForClient(hop, cellPayload(back, 0))));
+        // client by the c.hop beyond us.
+        c.tls = sendCell(cli, c.sockObj, c.tls, encodeFixed(c.circId, cmdRelay(), wrapForClient(c.hop, cellPayload(back, 0))));
       }
-      continue;
+      c.live = false;
+      return;
     }
+
 
     u8[] incoming = u8[0]();
     bool live = false;
-    match (fromClient.wait()) {
+    match (c.fromClient.wait()) {
       case Data(bytes): {
         incoming = bytes;
         live = true;
@@ -558,51 +625,56 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs,
       case End: { }
       case Failed(why): { core.warn("relayd:   the connection failed: " + why); }
     }
-    fromClient = cli.recv(conn.handle);
+    c.fromClient = cli.recv(c.sock);
     if (!live) {
-      if (hasNext) { cli.closeSocket(next.sock); }
+      if (c.hasNext) { cli.closeSocket(c.next.sock); }
+      c.live = false;
       return;
     }
-    Fed fed = unpackFeed(tlsServerFeed(tls, incoming));
-    tls = fed.state;
-    if (fed.toSend.len() > 0) { cli.send(conn.handle, fed.toSend).wait(); }
-    if (tlsPhase(tls) == phaseFailed()) {
+    Fed fed = unpackFeed(tlsServerFeed(c.tls, incoming));
+    c.tls = fed.state;
+    if (fed.toSend.len() > 0) { cli.send(c.sock, fed.toSend).wait(); }
+    if (tlsPhase(c.tls) == phaseFailed()) {
       core.warn("relayd:   the TLS handshake failed");
+      c.live = false;
       return;
     }
-    if (!established && tlsPhase(tls) == phaseEstablished()) {
-      established = true;
+    if (!c.established && tlsPhase(c.tls) == phaseEstablished()) {
+      c.established = true;
       core.log("relayd:   TLS established");
     }
-    buf = concat(buf, fed.appData);
+    c.buf = concat(c.buf, fed.appData);
 
     while (true) {
-      i32 size = cellSize(buf, 0);
-      if (size < 0 || size > buf.len()) { break; }
-      u8[] cell = slice(buf, 0, size);
-      buf = slice(buf, size, buf.len());
+      i32 size = cellSize(c.buf, 0);
+      if (size < 0 || size > c.buf.len()) { break; }
+      u8[] cell = slice(c.buf, 0, size);
+      c.buf = slice(c.buf, size, c.buf.len());
 
       i32 command = cellCommand(cell, 0);
       if (command == cmdPadding()) { continue; }
 
-      if (!versionsSeen) {
+      if (!c.versionsSeen) {
         if (command != cmdVersions()) {
           core.warn("relayd:   first cell was not VERSIONS");
+          c.live = false;
           return;
         }
         i32 version = responderVersion(cell);
         if (version < 0) {
           core.warn("relayd:   no link protocol version in common");
+          c.live = false;
           return;
         }
         core.log("relayd:   link protocol " + itoa(version));
-        versionsSeen = true;
-        u8[] reply = relayHandshakeReply(certs, core.randomBytes(32).wait(), peerIpv4(conn.peer));
+        c.versionsSeen = true;
+        u8[] reply = relayHandshakeReply(certs, core.randomBytes(32).wait(), peerIpv4(c.sockObj.peer));
         if (reply.len() == 0) {
           core.warn("relayd:   could not build the handshake reply");
+          c.live = false;
           return;
         }
-        tls = sendCell(cli, conn, tls, reply);
+        c.tls = sendCell(cli, c.sockObj, c.tls, reply);
         continue;
       }
 
@@ -620,28 +692,28 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs,
         // A client with no descriptor for us — which is every client told about us by a `Bridge`
         // line — has no onion key and so cannot send a CREATE2. TLS has already authenticated us by
         // then, which is what makes CREATE_FAST safe here and nowhere else.
-        if (circuitOpen) {
-          tls = sendCell(cli, conn, tls, destroyCell(cellCircId(cell, 0), DESTROY_PROTOCOL));
+        if (c.circuitOpen) {
+          c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(cellCircId(cell, 0), DESTROY_PROTOCOL));
           continue;
         }
         Created fast = answerCreateFast(cellCircId(cell, 0), cellPayload(cell, 0),
                                         randomBytes20(core));
         if (fast.cell.len() == 0) {
-          tls = sendCell(cli, conn, tls, destroyCell(cellCircId(cell, 0), DESTROY_PROTOCOL));
+          c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(cellCircId(cell, 0), DESTROY_PROTOCOL));
           continue;
         }
-        circId = cellCircId(cell, 0);
-        hop = fast.hop;
-        circuitOpen = true;
-        tls = sendCell(cli, conn, tls, fast.cell);
-        core.log("relayd:   circuit " + itoa(circId) + " created (CREATE_FAST)");
+        c.circId = cellCircId(cell, 0);
+        c.hop = fast.hop;
+        c.circuitOpen = true;
+        c.tls = sendCell(cli, c.sockObj, c.tls, fast.cell);
+        core.log("relayd:   circuit " + itoa(c.circId) + " created (CREATE_FAST)");
         continue;
       }
 
       if (command == cmdCreate2()) {
-        if (circuitOpen) {
+        if (c.circuitOpen) {
           core.warn("relayd:   a second circuit on one connection is not supported");
-          tls = sendCell(cli, conn, tls, destroyCell(cellCircId(cell, 0), DESTROY_PROTOCOL));
+          c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(cellCircId(cell, 0), DESTROY_PROTOCOL));
           continue;
         }
         Created answer = answerCreate2(cellCircId(cell, 0), cellPayload(cell, 0),
@@ -649,71 +721,74 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs,
                                        clampScalar(core.randomBytes(32).wait()));
         if (answer.cell.len() == 0) {
           core.warn("relayd:   the CREATE2 was not one we could answer");
-          tls = sendCell(cli, conn, tls, destroyCell(cellCircId(cell, 0), DESTROY_PROTOCOL));
+          c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(cellCircId(cell, 0), DESTROY_PROTOCOL));
           continue;
         }
-        circId = cellCircId(cell, 0);
-        hop = answer.hop;
-        circuitOpen = true;
-        tls = sendCell(cli, conn, tls, answer.cell);
-        core.log("relayd:   circuit " + itoa(circId) + " created");
+        c.circId = cellCircId(cell, 0);
+        c.hop = answer.hop;
+        c.circuitOpen = true;
+        c.tls = sendCell(cli, c.sockObj, c.tls, answer.cell);
+        core.log("relayd:   circuit " + itoa(c.circId) + " created");
         continue;
       }
 
       if (command == cmdRelay() || command == cmdRelayEarly()) {
-        if (!circuitOpen || cellCircId(cell, 0) != circId) {
-          tls = sendCell(cli, conn, tls, destroyCell(cellCircId(cell, 0), DESTROY_PROTOCOL));
+        if (!c.circuitOpen || cellCircId(cell, 0) != c.circId) {
+          c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(cellCircId(cell, 0), DESTROY_PROTOCOL));
           continue;
         }
-        Inbound inbound = receiveFromClient(hop, cellPayload(cell, 0));
+        Inbound inbound = receiveFromClient(c.hop, cellPayload(cell, 0));
         if (!inbound.recognized) {
-          // Not for us, so it belongs to a hop beyond us: forward the once-peeled payload verbatim.
-          // A relay never learns what is inside — that is between the client and the further hop.
-          if (!hasNext) {
+          // Not for us, so it belongs to a c.hop beyond us: forward the once-peeled payload verbatim.
+          // A relay never learns what is inside — that is between the client and the further c.hop.
+          if (!c.hasNext) {
             core.warn("relayd:   a cell for a later hop, but nothing has been extended to");
-            tls = sendCell(cli, conn, tls, destroyCell(circId, DESTROY_PROTOCOL));
+            c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(c.circId, DESTROY_PROTOCOL));
+            c.live = false;
             return;
           }
-          sendCells(next, encodeFixed(nextCircId, cmdRelay(), inbound.payload));
+          sendCells(c.next, encodeFixed(c.nextCircId, cmdRelay(), inbound.payload));
           continue;
         }
 
         if (inbound.command == relayExtend2()) {
-          if (hasNext) {
+          if (c.hasNext) {
             core.warn("relayd:   a second EXTEND2 on one circuit is not supported");
-            tls = sendCell(cli, conn, tls, destroyCell(circId, DESTROY_PROTOCOL));
+            c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(c.circId, DESTROY_PROTOCOL));
+            c.live = false;
             return;
           }
           Extended done = extendCircuit(core, cli, inbound.data, id);
           if (!done.ok) {
             // A refusal the client can act on: it will try another path rather than hang.
-            tls = sendCell(cli, conn, tls, destroyCell(circId, DESTROY_INTERNAL));
+            c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(c.circId, DESTROY_INTERNAL));
+            c.live = false;
             return;
           }
-          next = done.link;
-          nextCircId = done.circId;
-          hasNext = true;
-          fromNext = cli.recv(next.sock);
-          tls = sendCell(cli, conn, tls,
-                         sendToClient(hop, circId, relayExtended2(), 0,
+          c.next = done.link;
+          c.nextCircId = done.circId;
+          c.hasNext = true;
+          c.fromNext = cli.recv(c.next.sock);
+          c.tls = sendCell(cli, c.sockObj, c.tls,
+                         sendToClient(c.hop, c.circId, relayExtended2(), 0,
                                       extended2Body(done.reply)));
-          core.log("relayd:   extended circuit " + itoa(circId) + " to the next hop as " +
-                   itoa(nextCircId));
+          core.log("relayd:   extended circuit " + itoa(c.circId) + " to the next hop as " +
+                   itoa(c.nextCircId));
           continue;
         }
 
         if (inbound.command == relayBegin()) {
-          if (hasStream) {
+          if (c.hasStream) {
             core.warn("relayd:   a second stream on one circuit is not supported");
-            tls = sendCell(cli, conn, tls,
-                           sendToClient(hop, circId, relayEnd(), inbound.streamId, endReason()));
+            c.tls = sendCell(cli, c.sockObj, c.tls,
+                           sendToClient(c.hop, c.circId, relayEnd(), inbound.streamId, endReason()));
             continue;
           }
           Begin want = parseBegin(inbound.data);
           if (!want.ok) {
             core.warn("relayd:   a BEGIN we could not read");
-            tls = sendCell(cli, conn, tls,
-                           sendToClient(hop, circId, relayEnd(), inbound.streamId, endReason()));
+            c.tls = sendCell(cli, c.sockObj, c.tls,
+                           sendToClient(c.hop, c.circId, relayEnd(), inbound.streamId, endReason()));
             continue;
           }
           // A leading colon means this relay's own address, which is how a rendezvous stream is opened.
@@ -721,36 +796,36 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs,
           Socket target = cli.connect(host, want.port).wait();
           if (target.handle < 0) {
             core.log("relayd:   " + host + ":" + itoa(want.port) + " refused: " + target.error);
-            tls = sendCell(cli, conn, tls,
-                           sendToClient(hop, circId, relayEnd(), inbound.streamId, endReason()));
+            c.tls = sendCell(cli, c.sockObj, c.tls,
+                           sendToClient(c.hop, c.circId, relayEnd(), inbound.streamId, endReason()));
             continue;
           }
-          streamSock = target.handle;
-          streamId = inbound.streamId;
-          hasStream = true;
-          fromStream = cli.recv(streamSock);
-          tls = sendCell(cli, conn, tls,
-                         sendToClient(hop, circId, relayConnected(), streamId, connectedBody()));
-          core.log("relayd:   stream " + itoa(streamId) + " open to " + host + ":" +
+          c.streamSock = target.handle;
+          c.streamId = inbound.streamId;
+          c.hasStream = true;
+          c.fromStream = cli.recv(c.streamSock);
+          c.tls = sendCell(cli, c.sockObj, c.tls,
+                         sendToClient(c.hop, c.circId, relayConnected(), c.streamId, connectedBody()));
+          core.log("relayd:   stream " + itoa(c.streamId) + " open to " + host + ":" +
                    itoa(want.port));
           continue;
         }
 
-        if (inbound.command == relayData() && hasStream && inbound.streamId == streamId) {
-          if (!cli.send(streamSock, inbound.data).wait()) {
+        if (inbound.command == relayData() && c.hasStream && inbound.streamId == c.streamId) {
+          if (!cli.send(c.streamSock, inbound.data).wait()) {
             core.warn("relayd:   the stream would not take the data");
-            tls = sendCell(cli, conn, tls,
-                           sendToClient(hop, circId, relayEnd(), streamId, endReason()));
-            cli.closeSocket(streamSock);
-            hasStream = false;
+            c.tls = sendCell(cli, c.sockObj, c.tls,
+                           sendToClient(c.hop, c.circId, relayEnd(), c.streamId, endReason()));
+            cli.closeSocket(c.streamSock);
+            c.hasStream = false;
           }
           continue;
         }
 
-        if (inbound.command == relayEnd() && hasStream && inbound.streamId == streamId) {
-          core.log("relayd:   the client ended stream " + itoa(streamId));
-          cli.closeSocket(streamSock);
-          hasStream = false;
+        if (inbound.command == relayEnd() && c.hasStream && inbound.streamId == c.streamId) {
+          core.log("relayd:   the client ended stream " + itoa(c.streamId));
+          cli.closeSocket(c.streamSock);
+          c.hasStream = false;
           continue;
         }
 
@@ -758,44 +833,44 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs,
           if (!hasDir) {
             // Refused rather than ignored: a client that gets no answer waits out its timeout, and a
             // client that gets an END tries somewhere else immediately.
-            tls = sendCell(cli, conn, tls,
-                           sendToClient(hop, circId, relayEnd(), inbound.streamId, endReason()));
+            c.tls = sendCell(cli, c.sockObj, c.tls,
+                           sendToClient(c.hop, c.circId, relayEnd(), inbound.streamId, endReason()));
             core.log("relayd:   a BEGIN_DIR, refused: no documents to serve");
             continue;
           }
-          dirStream = inbound.streamId;
-          dirRequest = Buf.create();
+          c.dirStream = inbound.streamId;
+          c.dirRequest = Buf.create();
           // CONNECTED with an empty payload: a directory stream has no address to report, unlike the
           // BEGIN it otherwise resembles.
-          tls = sendCell(cli, conn, tls,
-                         sendToClient(hop, circId, relayConnected(), dirStream, u8[0]()));
-          core.log("relayd:   a directory stream opened as " + itoa(dirStream));
+          c.tls = sendCell(cli, c.sockObj, c.tls,
+                         sendToClient(c.hop, c.circId, relayConnected(), c.dirStream, u8[0]()));
+          core.log("relayd:   a directory stream opened as " + itoa(c.dirStream));
           continue;
         }
 
-        if (inbound.command == relayData() && inbound.streamId == dirStream) {
-          dirRequest.pushAll(inbound.data);
-          match (parseRequest(dirRequest.bytes(), 0)) {
+        if (inbound.command == relayData() && inbound.streamId == c.dirStream) {
+          c.dirRequest.pushAll(inbound.data);
+          match (parseRequest(c.dirRequest.bytes(), 0)) {
             case Ok(request): {
               u8[] response = dirResponse(request.target, docs);
               // 498 bytes to a cell, which is what `chunkRequest` splits at — named for the client's
               // side of the same operation, and the same arithmetic in this direction.
               u8[][] parts = chunkRequest(response);
               for (i32 pi = 0; pi < parts.len(); pi++) {
-                tls = sendCell(cli, conn, tls,
-                               sendToClient(hop, circId, relayData(), dirStream, parts[pi]));
+                c.tls = sendCell(cli, c.sockObj, c.tls,
+                               sendToClient(c.hop, c.circId, relayData(), c.dirStream, parts[pi]));
               }
-              tls = sendCell(cli, conn, tls,
-                             sendToClient(hop, circId, relayEnd(), dirStream, endReason()));
+              c.tls = sendCell(cli, c.sockObj, c.tls,
+                             sendToClient(c.hop, c.circId, relayEnd(), c.dirStream, endReason()));
               core.log("relayd:   answered a directory request with " + itoa(response.len()) +
                        " bytes in " + itoa(parts.len()) + " cells");
-              dirStream = -1;
+              c.dirStream = -1;
             }
             case Bad(code): {
               core.warn("relayd:   a malformed directory request, code " + itoa(code));
-              tls = sendCell(cli, conn, tls,
-                             sendToClient(hop, circId, relayEnd(), dirStream, endReason()));
-              dirStream = -1;
+              c.tls = sendCell(cli, c.sockObj, c.tls,
+                             sendToClient(c.hop, c.circId, relayEnd(), c.dirStream, endReason()));
+              c.dirStream = -1;
             }
             case Incomplete: { }
           }
@@ -809,11 +884,10 @@ void runLink(Core core, Cli cli, Socket conn, u8[] tls, Identity id, u8[] certs,
 
       if (command == cmdDestroy()) {
         core.log("relayd:   the initiator destroyed circuit " + itoa(cellCircId(cell, 0)));
-        circuitOpen = false;
+        c.circuitOpen = false;
         continue;
       }
     }
-  }
 }
 
 
