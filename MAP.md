@@ -4,8 +4,8 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-28 packages, 61,372 lines of wac, 1205 tests,
-36 command-line programs and 4 browser pages.
+28 packages, 61,581 lines of wac, 1209 tests,
+37 command-line programs and 4 browser pages.
 
 ## Packages
 
@@ -23,7 +23,7 @@ In dependency order: nothing here imports anything below it.
 | [`fmt`](packages/fmt/) | Numbers to and from text. | 1,199 | 27 | `bytes` |
 | [`gzip`](packages/gzip/) | gzip (RFC 1952) and DEFLATE (RFC 1951) written in wac. | 1,985 | 83 | `bytes` |
 | [`http`](packages/http/) | HTTP/1.1: parsing requests and responses, and writing both. | 914 | 29 | `bytes` |
-| [`platform`](packages/platform/) | A capability world for wac applications, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell… | 3,134 | 96 | `bytes` |
+| [`platform`](packages/platform/) | A capability world for wac applications, so a program can be written **entirely in wac** — no TypeScript of its own — and still read files, tell… | 3,290 | 100 | `bytes` |
 | [`stream`](packages/stream/) | Run a wac transform as a `ReadableStream`/`WritableStream` pair, so it consumes input as it arrives instead of taking the whole thing at once. | 97 | 14 | `bytes` `unicode` |
 | [`url`](packages/url/) | A WHATWG URL parser: parse, serialize, and resolve a reference against a base. | 1,219 | 27 | `bytes` `std` |
 | [`wacc`](packages/wacc/) | Porting the wac compiler to wac, so it can eventually compile itself. | 3,805 | 14 | `bytes` |
@@ -40,7 +40,7 @@ In dependency order: nothing here imports anything below it.
 | [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 4,006 | 33 | `bytes` `codec` `crypto` `datetime` `fmt` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`lightclient`](packages/lightclient/) | **The Altair sync protocol works. | 642 | 12 | `bls` `ssz` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,571 | 46 | `bytes` `codec` `crypto` `platform` `sh` |
-| [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 12,010 | 207 | `bytes` `codec` `crypto` `datetime` `fmt` `http` `platform` `std` `tls` `wactest` |
+| [`tor`](packages/tor/) | A Tor client, in wac, on top of this repo's TLS 1.3 stack. | 12,063 | 207 | `bytes` `codec` `crypto` `datetime` `fmt` `http` `platform` `std` `tls` `wactest` |
 
 ## Programs
 
@@ -55,6 +55,7 @@ reach — see `packages/platform/README.md`.
 
 | program | what it does |
 |---|---|
+| `packages/platform/example/crowd.wac` | How many host calls a program may have in flight, measured rather than quoted. |
 | `packages/platform/example/greet.wac` | Listen, take one connection, and say who it came from. |
 | `packages/platform/example/hexdump.wac` | A filter: bytes in, bytes out. `hexdump < file` or `hexdump file`. |
 | `packages/platform/example/inetd.wac` | A network service whose handler is another wac program. |

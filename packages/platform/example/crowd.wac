@@ -1,0 +1,120 @@
+// How many host calls a program may have in flight, measured rather than quoted.
+//
+//   crowd [n] [millis]
+//
+// Every unsettled `Pending<T>` holds one of the platform's `CALL_SLOTS` until it is collected or
+// cancelled. That number has been four, then sixteen, then 128, and programs have been sizing themselves
+// against a comment: `socks.wac` capped its clients at twelve for a ring of sixteen, and `relayd.wac`
+// can hold `1 + connections + 2 × circuits` at once with nothing connecting that to the ring at all
+// (wac-mono issue 0091, which asks for exactly this program).
+//
+// So: arm `n` calls without collecting any, then wait for them all, and print what it cost. The calls are
+// sleeps of `millis`, chosen because they settle on their own — a `recv` on a peer that never speaks
+// would hold its slot for ever and the program would park instead of reporting, which is the failure this
+// is meant to make legible rather than reproduce.
+//
+// What it shows, and the third case it cannot show:
+//
+//   * **`n` at or below `CALL_SLOTS`.** Every call is armed before any is collected, and the whole thing
+//     takes about one `millis`. That is the ring doing its job.
+//
+//         crowd 128 200
+//         crowd: the ring has 128 slots; arming 128 calls of 200ms
+//         crowd: armed 128, collected 128, elapsed 211ms
+//
+//   * **`n` above it, with calls that settle.** Not backpressure — a refusal, by name:
+//
+//         crowd 256 200
+//         crowd: armed 128 so far...
+//         error: all 128 call slots hold answers that were never taken, from: SLEEP_MILLIS × 128.
+//                A ticket you stopped waiting on has to be wait()ed or cancel()led...
+//
+//     A settled call holds its slot until somebody collects it, and only the worker can — so a worker
+//     that keeps arming instead of collecting is waiting for something only it can do. `claim` detects
+//     exactly that (every slot `READY`) and raises rather than parking for ever.
+//
+//   * **`n` above it, with calls that do not settle** — a `recv` on a peer that never speaks, which is
+//     what a relay watching many sockets actually holds. The slots are `RUNNING`, not `READY`, so the
+//     check above cannot fire: the program parks with no error and no output. That is wac-mono issue
+//     0091, and it is why this example arms sleeps: a program that demonstrated the deadlock would have
+//     nothing to report from inside it. The measurement to take from here is the *ceiling*, and the rule
+//     it gives every program that watches handles — derive the limit from `CALL_SLOTS`, do not transcribe
+//     it, and count every outstanding call, not just the ones you think of as reads.
+
+import { Cli, Core, Pending, CALL_SLOTS } from "../src/platform.wac";
+
+export i32 main(Core core, Cli cli) {
+  i32 argc = cli.argCount().wait();
+  i32 n = argc > 0 ? atoi(cli.arg(0).wait()) : CALL_SLOTS;
+  i32 ms = argc > 1 ? atoi(cli.arg(1).wait()) : 200;
+  if (n < 1) {
+    core.warn("usage: crowd [n] [millis]");
+    return 2;
+  }
+
+  core.warn("crowd: the ring has " + itoa(CALL_SLOTS) + " slots; arming " + itoa(n) +
+            " calls of " + itoa(ms) + "ms");
+
+  i64 started = core.nowMillis().wait();
+
+  // Armed first, collected second, on purpose. Interleaving them would never hold more than one slot and
+  // would measure nothing — the question is what happens when the arming outruns the collecting, which is
+  // the shape every program that watches many handles at once has.
+  Pending<i64>?[] live = Pending<i64>?[n]();
+  i32 armed = 0;
+  while (armed < n) {
+    // Said as it goes, because past the ring's size this is where the program stops: the refusal comes
+    // from `claim` inside the *next* submission, and a count printed afterwards would never be reached.
+    //
+    // Every quarter ring rather than at the boundary, and that is not cosmetic: `warn` is a host call
+    // too, so a report printed with the ring already full is refused along with everything else. The
+    // last line you see is a quarter of a ring behind the truth, which is the most any program can say
+    // about the moment it ran out.
+    if (armed % (CALL_SLOTS / 4) == 0 && armed > 0) {
+      core.warn("crowd: armed " + itoa(armed) + " so far...");
+    }
+    live[armed] = core.sleepMillis(ms);
+    armed = armed + 1;
+  }
+
+  i32 collected = 0;
+  while (collected < n) {
+    Pending<i64>? p = live[collected];
+    if (!(p is null)) { p!.wait(); }
+    collected = collected + 1;
+  }
+
+  i64 elapsed = core.nowMillis().wait() - started;
+  core.warn("crowd: armed " + itoa(armed) + ", collected " + itoa(collected) +
+            ", elapsed " + itoa(elapsed as~ i32) + "ms");
+  return 0;
+}
+
+/** Digits only; anything else is zero, which the caller sees as a usage error. */
+i32 atoi(u8[] b) {
+  i32 v = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 d = b[i] - '0';
+    if (d < 0 || d > 9) { return 0; }
+    v = v * 10 + d;
+  }
+  return v;
+}
+
+/** Decimal, because `warn` takes a string and this file has numbers to say. */
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  bool neg = v < 0;
+  i32 x = neg ? -v : v;
+  u8[] buf = u8[12]();
+  i32 n = 0;
+  while (x > 0) {
+    buf[n] = '0' + (x % 10);
+    n++;
+    x = x / 10;
+  }
+  u8[] out = u8[n + (neg ? 1 : 0)]();
+  if (neg) { out[0] = '-'; }
+  for (i32 i = 0; i < n; i++) { out[(neg ? 1 : 0) + i] = buf[n - 1 - i]; }
+  return string.fromBytes(out);
+}

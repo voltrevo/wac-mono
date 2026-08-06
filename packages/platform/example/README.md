@@ -99,6 +99,7 @@ Each is here because it is the smallest program that exercises one thing.
 | `pipe.wac` | two programs piped together with no shell involved |
 | `inetd.wac` | a network service whose per-connection handler is another wac program |
 | `probe.wac` | reports what it is allowed to do — for checking what a spawned child was granted |
+| `crowd.wac` | how many calls may be in flight at once, and what exceeding that looks like |
 
 The ones that spawn (`runner`, `pipe`, `inetd`) are Deno-only: a page cannot spawn. A child gets
 the grants its parent chose intersected with what the parent itself holds, so a program can hand
