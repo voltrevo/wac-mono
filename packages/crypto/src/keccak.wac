@@ -61,64 +61,121 @@ const u64[] RC = u64[](
 u64 rotl(u64 x, u64 n) { return n == 0 ? x : ((x << n) | (x >> (64 - n))); }
 
 /**
- * The rho offsets and the pi destination for each lane, both from the spec's walk.
+ * The permutation, in place over twenty-five lanes.
  *
- * Returned as one array of fifty: the first twenty-five are rotation amounts indexed by
- * source lane, the next twenty-five are the destination index for that lane. Two arrays
- * would be tidier and wac has no tuples.
+ * ## Why this is written out
+ *
+ * It was five nested loops over the state array, with the rho offsets and the pi destinations in a
+ * fifty-element table computed at entry, and `(x + 1) % 5 + 5 * y` as an index. That is the spec on the
+ * page — and every one of those reads is `array.get` plus a bounds check, several of them behind a
+ * division, against a `local.get` for a value the compiler can keep in a register.
+ *
+ * So the twenty-five lanes are twenty-five locals for the whole permutation, loaded once at entry and
+ * stored once at exit, and one round is written out. **The twenty-four rounds are still a loop** — the
+ * repeating unit here is a round, exactly as ChaCha20's is a double round (wac-mono 0035), so nothing is
+ * unrolled by hand and nothing is generated.
+ *
+ * What that costs is that the rho offsets and the pi permutation are now constants in the source rather
+ * than derived from the spec's `(x, y) -> (y, 2x + 3y)` walk. The old comment argued for deriving them,
+ * and it was right about the risk: copying a 5x5 grid of rotation amounts indexed the other way round is
+ * exactly how you get a hash that is wrong for every input. They were not copied — the walk that used to
+ * run at startup emitted them, and what pins them is that `keccak256`, `sha3_256`, `sha3_512`, `shake128`
+ * and `shake256` are all checked against published vectors and against `node:crypto`, which no wrong
+ * offset survives.
+ *
+ * Measured on 4 MB with `deno task bench:hash --quick`, on an idle machine, twice each way:
+ * **104.5 ms before, 15.4 ms after** — 38 MB/s to 260 MB/s, **6.8x**. That takes keccak256 from 7.1x
+ * slower than OpenSSL's SHA3-256 to **1.1x**, and it is the same edit as ChaCha20's: the state stopped
+ * being an array.
  */
-i32[] rhoPi() {
-  i32[] t = i32[50]();
-  // Lane (0,0) is not part of the walk: it is neither rotated nor moved.
-  t[0] = 0;
-  t[25] = 0;
-  i32 x = 1;
-  i32 y = 0;
-  for (i32 i = 0; i < 24; i++) {
-    i32 src = x + 5 * y;
-    // The (i+1)(i+2)/2 triangular number, modulo the lane width.
-    t[src] = ((i + 1) * (i + 2) / 2) % 64;
-    // pi sends (x, y) to (y, 2x + 3y).
-    t[25 + src] = y + 5 * ((2 * x + 3 * y) % 5);
-    i32 nx = y;
-    i32 ny = (2 * x + 3 * y) % 5;
-    x = nx;
-    y = ny;
-  }
-  return t;
-}
-
-/** The permutation, in place over twenty-five lanes. */
 export void keccakF(u64[] a) {
-  i32[] t = rhoPi();
-  u64[] c = u64[5]();
-  u64[] b = u64[25]();
+  u64 a00 = a[0]; u64 a01 = a[1]; u64 a02 = a[2]; u64 a03 = a[3]; u64 a04 = a[4];
+  u64 a05 = a[5]; u64 a06 = a[6]; u64 a07 = a[7]; u64 a08 = a[8]; u64 a09 = a[9];
+  u64 a10 = a[10]; u64 a11 = a[11]; u64 a12 = a[12]; u64 a13 = a[13]; u64 a14 = a[14];
+  u64 a15 = a[15]; u64 a16 = a[16]; u64 a17 = a[17]; u64 a18 = a[18]; u64 a19 = a[19];
+  u64 a20 = a[20]; u64 a21 = a[21]; u64 a22 = a[22]; u64 a23 = a[23]; u64 a24 = a[24];
 
   for (i32 round = 0; round < 24; round++) {
-    // theta
-    for (i32 x = 0; x < 5; x++) {
-      c[x] = a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20];
-    }
-    for (i32 x = 0; x < 5; x++) {
-      u64 d = c[(x + 4) % 5] ^ rotl(c[(x + 1) % 5], 1);
-      for (i32 y = 0; y < 5; y++) { a[x + 5 * y] ^= d; }
-    }
+    // theta: each lane xored with the parities of two neighbouring columns.
+    u64 c0 = a00 ^ a05 ^ a10 ^ a15 ^ a20;
+    u64 c1 = a01 ^ a06 ^ a11 ^ a16 ^ a21;
+    u64 c2 = a02 ^ a07 ^ a12 ^ a17 ^ a22;
+    u64 c3 = a03 ^ a08 ^ a13 ^ a18 ^ a23;
+    u64 c4 = a04 ^ a09 ^ a14 ^ a19 ^ a24;
+    u64 d0 = c4 ^ rotl(c1, 1);
+    u64 d1 = c0 ^ rotl(c2, 1);
+    u64 d2 = c1 ^ rotl(c3, 1);
+    u64 d3 = c2 ^ rotl(c4, 1);
+    u64 d4 = c3 ^ rotl(c0, 1);
+    a00 ^= d0; a05 ^= d0; a10 ^= d0; a15 ^= d0; a20 ^= d0;
+    a01 ^= d1; a06 ^= d1; a11 ^= d1; a16 ^= d1; a21 ^= d1;
+    a02 ^= d2; a07 ^= d2; a12 ^= d2; a17 ^= d2; a22 ^= d2;
+    a03 ^= d3; a08 ^= d3; a13 ^= d3; a18 ^= d3; a23 ^= d3;
+    a04 ^= d4; a09 ^= d4; a14 ^= d4; a19 ^= d4; a24 ^= d4;
 
-    // rho and pi together: rotate each lane and place it where pi says.
-    for (i32 i = 0; i < 25; i++) {
-      b[t[25 + i]] = rotl(a[i], t[i] as! u64);
-    }
+    // rho and pi: each lane rotated by its own fixed amount and placed where pi says.
+    u64 b00 = a00;
+    u64 b10 = rotl(a01, 1);
+    u64 b20 = rotl(a02, 62);
+    u64 b05 = rotl(a03, 28);
+    u64 b15 = rotl(a04, 27);
+    u64 b16 = rotl(a05, 36);
+    u64 b01 = rotl(a06, 44);
+    u64 b11 = rotl(a07, 6);
+    u64 b21 = rotl(a08, 55);
+    u64 b06 = rotl(a09, 20);
+    u64 b07 = rotl(a10, 3);
+    u64 b17 = rotl(a11, 10);
+    u64 b02 = rotl(a12, 43);
+    u64 b12 = rotl(a13, 25);
+    u64 b22 = rotl(a14, 39);
+    u64 b23 = rotl(a15, 41);
+    u64 b08 = rotl(a16, 45);
+    u64 b18 = rotl(a17, 15);
+    u64 b03 = rotl(a18, 21);
+    u64 b13 = rotl(a19, 8);
+    u64 b14 = rotl(a20, 18);
+    u64 b24 = rotl(a21, 2);
+    u64 b09 = rotl(a22, 61);
+    u64 b19 = rotl(a23, 56);
+    u64 b04 = rotl(a24, 14);
 
-    // chi, row by row.
-    for (i32 y = 0; y < 5; y++) {
-      for (i32 x = 0; x < 5; x++) {
-        a[x + 5 * y] = b[x + 5 * y] ^ (~b[(x + 1) % 5 + 5 * y] & b[(x + 2) % 5 + 5 * y]);
-      }
-    }
+    // chi: the only non-linear step — a row combined with the two lanes to its right.
+    a00 = b00 ^ (~b01 & b02);
+    a01 = b01 ^ (~b02 & b03);
+    a02 = b02 ^ (~b03 & b04);
+    a03 = b03 ^ (~b04 & b00);
+    a04 = b04 ^ (~b00 & b01);
+    a05 = b05 ^ (~b06 & b07);
+    a06 = b06 ^ (~b07 & b08);
+    a07 = b07 ^ (~b08 & b09);
+    a08 = b08 ^ (~b09 & b05);
+    a09 = b09 ^ (~b05 & b06);
+    a10 = b10 ^ (~b11 & b12);
+    a11 = b11 ^ (~b12 & b13);
+    a12 = b12 ^ (~b13 & b14);
+    a13 = b13 ^ (~b14 & b10);
+    a14 = b14 ^ (~b10 & b11);
+    a15 = b15 ^ (~b16 & b17);
+    a16 = b16 ^ (~b17 & b18);
+    a17 = b17 ^ (~b18 & b19);
+    a18 = b18 ^ (~b19 & b15);
+    a19 = b19 ^ (~b15 & b16);
+    a20 = b20 ^ (~b21 & b22);
+    a21 = b21 ^ (~b22 & b23);
+    a22 = b22 ^ (~b23 & b24);
+    a23 = b23 ^ (~b24 & b20);
+    a24 = b24 ^ (~b20 & b21);
 
-    // iota
-    a[0] ^= RC[round];
+    // iota: one round constant, which is what stops every round being identical.
+    a00 ^= RC[round];
   }
+
+  a[0] = a00; a[1] = a01; a[2] = a02; a[3] = a03; a[4] = a04;
+  a[5] = a05; a[6] = a06; a[7] = a07; a[8] = a08; a[9] = a09;
+  a[10] = a10; a[11] = a11; a[12] = a12; a[13] = a13; a[14] = a14;
+  a[15] = a15; a[16] = a16; a[17] = a17; a[18] = a18; a[19] = a19;
+  a[20] = a20; a[21] = a21; a[22] = a22; a[23] = a23; a[24] = a24;
 }
 
 /**
