@@ -382,7 +382,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
-| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**: `dird` accepts a `POST /tor/hs/3/publish`, checks the descriptor the way `desc_decode_plaintext_v3` does, files it under the blinded key from its certificate, and serves it back at `/tor/hs/3/<z>` — with the upload arriving in four pieces. **Not done:** the service program that holds it together |
+| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>`. **Not done:** the service program — the client side of the upload, and the loop that establishes introduction points and answers INTRODUCE2 |
 | 7 — the interop matrix | **not started as a document.** Steps 2–6 each contribute rows and most are green; nothing collects them, so a regression in one would not be visible as a regression in *the matrix* |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
@@ -1382,3 +1382,35 @@ in the tests: a second version check masking the first's mutation, and a status 
 mutation landed on the dead copy. Worth naming as a pattern — **a surviving mutant sometimes points at
 duplicated logic rather than a missing assertion**, and the fix is to delete the duplicate, not to add
 a test for it.
+
+### DirPort 0, and a transport question answered by evidence
+
+Publication from a service was going to need one of two transports: a direct connection to a
+directory's DirPort, or a BEGIN_DIR stream over a circuit. The usual argument is anonymity — a
+service that connects directly to a directory has told that directory where it is — and the usual
+argument is enough, but it is the kind of reasoning that leaves a shortcut looking merely
+inadvisable.
+
+The consensus captured from a real network in `test/data/hsdir_vectors.json` settles it as a fact.
+Of thirteen relays, ten have `DirPort 0`, and **all eight of the HSDirs tor actually uploaded to are
+among them** — only the three authorities publish a DirPort at all. A service uploading to DirPorts
+would have nowhere to upload to. BEGIN_DIR is not the private route to an HSDir; for an HSDir it is
+the only route.
+
+    r test012r ...  127.0.0.1 5112 0      ← an HSDir tor published to
+    r test002a ...  127.0.0.1 5102 7102   ← an authority
+
+So `relayd` answers a publish on its directory stream, and the accumulate-parse-answer loop it shared
+with `dird` — written out twice, and already diverged, since only `dird` had learned to accept an
+upload — is now one function of the bytes so far.
+
+The property both copies needed and neither stated: **nothing is answered until the whole request is
+present.** A directory that replies to the first read of a fourteen-kilobyte upload passes a verdict
+on a document it has not seen, and the reply is plausible rather than obviously wrong — a truncated
+descriptor is refused, so the service would be told its descriptor was malformed when it was only
+still in flight. That is issue 0089's shape from the other side of the wire.
+
+One planted fault survived and was worth the exercise: the method was not checked, so a `GET
+/tor/hs/3/publish` would have been handled as an upload and answered 400 — a directory telling a
+client its descriptor was invalid when the client never sent one. tor reaches
+`handle_post_hs_descriptor` only from its POST handler.
