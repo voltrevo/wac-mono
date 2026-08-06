@@ -14,8 +14,18 @@ import { wacParse, type WacType } from "wac/wacParse.ts";
 
 export type Entry = [name: string, source: string];
 
-/** Where wac's own checkout is expected, relative to this file. */
-const TOUR = new URL("../../../../wac/spec/tour.wac", import.meta.url);
+/**
+ * Where wac's own checkout is, resolved through the import map rather than by counting `..`.
+ *
+ * The relative form was `../../../../wac/spec/tour.wac` from this file, which is right in a real
+ * side-by-side checkout and wrong everywhere else — and "everywhere else" turned out to include every
+ * mutation run. `tools/mutate.ts` stages `packages` and `harness` into a temp directory and rewrites the
+ * `wac/` alias to an absolute path, so the compiler resolves and the sibling checkout does not. The corpus
+ * therefore lost its richest file in exactly the runs that decide whether a test is worth anything, and
+ * said so only in the output of a *passing* test, which nobody reads: `startsLower` was reported as
+ * surviving for weeks while the real suite killed it. Through the alias, both trees find the same file.
+ */
+const TOUR = new URL("../../spec/tour.wac", import.meta.resolve("wac/"));
 
 export type Corpus = {
   files: Entry[];
@@ -99,8 +109,16 @@ export async function loadCorpus(caller: string): Promise<Entry[]> {
       `These tests run from the repo root; check the cwd.`);
   }
   console.log(`  ${caller}: ${files.length} files`);
-  for (const s of skipped) {
-    console.log(`  ${caller}: SKIPPED ${s.name} — ${s.reason}`);
+  // Loud, not printed. `tour.wac` is written to exercise every feature in the language, so a corpus
+  // without it is a different and much weaker corpus — and the one entry that used to be allowed to go
+  // missing is now the one that cannot: the `wac/` alias this resolves through is the same alias every
+  // package compiles with, so if the checkout were absent nothing here would run at all.
+  if (skipped.length > 0) {
+    throw new Error(
+      `${caller}: the corpus could not read ${skipped.map((s) => `${s.name} (${s.reason})`).join(", ")}. ` +
+      `This is the entry that exercises every feature in the language; a run without it measures less ` +
+      `than it says it does.`,
+    );
   }
   return files;
 }

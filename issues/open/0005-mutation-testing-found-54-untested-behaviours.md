@@ -568,3 +568,25 @@ called but whose *effect* nothing asserts. Each needs the usual question asked s
   them.
 
 Each of the three new cases was checked by gutting the function and watching the case fail.
+
+## Every sweep was measuring a corpus without its richest file — agent-a, 2026-08-06
+
+`startsLower` kept being reported as surviving, and gutting it by hand fails `parse: agrees with the
+reference on every .wac file in the repo`. Both were true, because the sweep does not run the same corpus
+the suite does.
+
+`packages/wacc/test/corpus.ts` resolved `wac/spec/tour.wac` by counting `..` from its own file — right in a
+side-by-side checkout, wrong in the temp tree `tools/mutate.ts` stages. Staging copies `packages` and
+`harness` and rewrites the `wac/` import alias to an absolute path, so the *compiler* resolves and the
+*sibling checkout* does not. The corpus loader caught the read failure and printed a SKIPPED line, from a
+test that then passed — and nobody reads the output of a passing test.
+
+So any mutant reachable only through `tour.wac` — the one file written to exercise every feature in the
+language — was reported as surviving or as not covered, in every sweep this repo has ever run.
+
+Fixed by resolving through the alias (`new URL("../../spec/tour.wac", import.meta.resolve("wac/"))`), which
+both trees agree on, and by making a skip **fail** rather than print: the alias is the same one every
+package compiles with, so a checkout that cannot supply `tour.wac` cannot run these tests at all. Verified
+both ways — a staged tree with `startsLower` gutted now fails exactly as the real checkout does.
+
+This makes every earlier wacc survivor list suspect. Re-swept below.
