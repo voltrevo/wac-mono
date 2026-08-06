@@ -180,6 +180,16 @@ export struct RelayInfo {
   i64 bandwidthBurst;
   i64 bandwidthObserved;
   i64 certExpiryHours;     // hours since the epoch, which is how a certificate counts them
+  /**
+   * The `reject`/`accept` line this relay publishes.
+   *
+   * A field rather than a constant because it was a constant, and the constant disagreed with the
+   * vote: descriptors said `reject *:*` while the consensus said `accept 1-65535`, and a client
+   * believes the **descriptor** — so relays that advertised themselves as exits were never chosen as
+   * one, and no stream ever reached them. Two documents describing one relay must not be able to
+   * disagree, which is what putting the policy in one place buys.
+   */
+  string exitPolicy;
 }
 
 string pad2(i64 v) { return v < 10 ? "0" + itoa64(v) : itoa64(v); }
@@ -281,7 +291,7 @@ export u8[] routerDescriptor(RelayKeys k, RelayInfo info) {
   d.pushAll(pemBlock("ED25519 CERT", ntorCross));
   d.pushAll("hidden-service-dir\n".toBytes());
   d.pushAll(("ntor-onion-key " + b64Unpadded(ntorPub) + "\n").toBytes());
-  d.pushAll("reject *:*\n".toBytes());
+  d.pushAll((info.exitPolicy + "\n").toBytes());
   d.pushAll("tunnelled-dir-server\n".toBytes());
 
   // The ed25519 signature covers the keyword announcing it, so the keyword goes in first.

@@ -569,3 +569,19 @@ first time the whole directory-and-relay stack has satisfied a real tor end to e
 
 The fetch still times out with no relay opening a stream, so `RELAY_BEGIN` is the remaining gap between
 a usable network and a byte delivered. That is now the only thing left in step 3.
+
+### The descriptor and the vote disagreed about the exit policy
+
+No stream ever reached an exit, and the reason was not the stream code. **The descriptor said
+`reject *:*` while the consensus said `accept 1-65535`** — and a client believes the descriptor, so
+relays advertised as exits were never chosen as one. The policy was hardcoded in `routerDescriptor`
+while the vote's came from `RelayOpinion`; two documents describing one relay, free to disagree.
+
+It is a field now, so they cannot. And fixing it exposed a second distinction worth keeping: **the two
+are written in different grammars.** A descriptor's policy takes address patterns (`accept *:*`); a
+consensus `p` line takes a port summary (`accept 1-65535`). Putting the summary form in a descriptor is
+not merely unidiomatic — `router_parse_entry_from_string` **rejects the whole document**, which is how
+the mistake was caught within a minute of making it.
+
+The committed descriptor vector still reproduces byte for byte, because the fixture keeps the policy
+that was hardcoded when those bytes were signed.

@@ -231,8 +231,16 @@ export u8[] ownDescriptor(
     id.edIdentitySeed, id.edSigningSeed, id.onionPrivate);
   // A descriptor's certificates expire in hours; this window is the same 48 the TLS certificate uses,
   // so a relay's papers all go stale together rather than one at a time.
+  // `accept` because `relayd` parses RELAY_BEGIN and carries a stream. The descriptor and the vote have
+  // to agree — a client reads this one, and it used to say reject while the consensus said accept.
+  //
+  // **The two are written in different grammars.** A descriptor's policy takes address patterns
+  // (`accept *:*`); a consensus `p` line takes a port summary (`accept 1-65535`). Putting the summary
+  // form here is not merely unidiomatic: tor's own parser refuses the whole descriptor, which is how
+  // this was caught.
   RelayInfo info = RelayInfo(nickname, address, orPort, 0, now,
-                             1073741824, 1073741824, 640416, (now / 3600) + 48);
+                             1073741824, 1073741824, 640416, (now / 3600) + 48,
+                             "accept *:*");
   return routerDescriptor(keys, info);
 }
 
