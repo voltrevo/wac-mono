@@ -1,0 +1,135 @@
+// Working out where a rendezvous point is, from bytes a client chose.
+//
+// An INTRODUCE2 carries the rendezvous point's link specifiers verbatim: the introduction point does
+// not read them and neither does anything before this. They are the one part of the onion protocol
+// where a **stranger tells the service what to connect to**, and the service then connects. Every
+// rule below exists because of that sentence.
+//
+// The shape is tor's `hs_get_extend_info_from_lspecs`, and the parts worth naming are the ones that
+// are not obvious from the wire format:
+//
+//   - **an unknown specifier type is ignored, not fatal.** The list is extensible and a service that
+//     refused a list containing something it did not recognise would stop working the day a new type
+//     was added — while gaining nothing, since it can already tell whether the fields it needs are
+//     present.
+//   - **the first IPv4 wins.** Later ones are skipped rather than overwriting, so a list with two
+//     addresses names the first, and cannot be used to make different implementations disagree about
+//     where they are going.
+//   - **a short legacy ID is ignored rather than padded**, which then fails the "legacy ID is
+//     mandatory" check below. tor `break`s out of the case without setting the flag; the effect is a
+//     rejection, but by the missing-field rule rather than by a length check, and a reader looking for
+//     an explicit refusal will not find one.
+//   - **the ed25519 identity is optional.** It is the identity actually worth checking, and it is not
+//     required — the legacy RSA digest is. That is the protocol as it stands rather than as it should
+//     be, and inverting it here would refuse rendezvous points tor accepts.
+//
+// ## The private address rule
+//
+// `extend_info_addr_is_allowed` refuses an internal or multicast address unless
+// `ExtendAllowPrivateAddresses` is set. This is the whole defence against a client using a service as
+// a probe: without it, `INTRODUCE1` with a rendezvous point at 127.0.0.1:22 makes the service connect
+// to its own SSH port and report success or failure by whether a rendezvous completes. The same trick
+// against 10.0.0.0/8 maps the network the service is hosted on.
+//
+// It is a *configuration* rather than a constant because a test network is entirely private
+// addresses — which is why `allowPrivate` is a parameter here and why chutney works at all.
+
+import { LS_ED25519_ID, LS_IPV4, LS_LEGACY_ID, linkSpecifiersValid } from "./hsintro.wac";
+
+export const i32 REND_OK = 0;
+export const i32 REND_MALFORMED = 1;       // the list does not parse as a list
+export const i32 REND_EMPTY = 2;           // no specifiers at all
+export const i32 REND_NO_ADDRESS = 3;      // no usable IPv4 address and port
+export const i32 REND_NO_LEGACY_ID = 4;    // the mandatory RSA identity digest is absent or short
+export const i32 REND_PRIVATE_ADDRESS = 5; // internal or multicast, and we are not allowed there
+
+/** Where to extend to, once a client's link specifiers have been believed as far as they may be. */
+export struct RendPoint {
+  i32 error;
+  u8[] address;      // 4 bytes, network order
+  i32 port;
+  u8[] legacyId;     // 20 bytes: the RSA identity digest, mandatory
+  u8[] ed25519Id;    // 32 bytes, or empty — optional, and the one worth checking
+}
+
+RendPoint rejected(i32 error) { return RendPoint(error, u8[0](), 0, u8[0](), u8[0]()); }
+
+/**
+ * Resolve the rendezvous point a client named.
+ *
+ * `allowPrivate` corresponds to `ExtendAllowPrivateAddresses`: false on a real network, true on a
+ * test one. It is not a default because getting it wrong in either direction is silent — false on a
+ * test network means nothing ever connects, and true on a real one hands the service to anyone who
+ * can send an INTRODUCE1.
+ */
+export RendPoint rendezvousPoint(u8[] linkSpecifiers, bool allowPrivate) {
+  // Emptiness first, because `linkSpecifiersValid` folds it into malformedness and the two are
+  // different events: a count of zero is a well-formed list saying nothing, and tor logs it
+  // separately for that reason. A service operator reading "malformed" would go looking for a broken
+  // client rather than an empty field.
+  if (linkSpecifiers.len() == 1 && linkSpecifiers[0] == 0) { return rejected(REND_EMPTY); }
+  if (!linkSpecifiersValid(linkSpecifiers)) { return rejected(REND_MALFORMED); }
+  i32 n = linkSpecifiers[0];
+
+  u8[] address = u8[0]();
+  i32 port = 0;
+  u8[] legacyId = u8[0]();
+  u8[] ed25519Id = u8[0]();
+
+  i32 at = 1;
+  for (i32 i = 0; i < n; i++) {
+    i32 type = linkSpecifiers[at];
+    i32 length = linkSpecifiers[at + 1];
+    i32 from = at + 2;
+
+    if (type == LS_IPV4 && address.len() == 0 && length == 6) {
+      address = sub(linkSpecifiers, from, from + 4);
+      port = (linkSpecifiers[from + 4] << 8) | linkSpecifiers[from + 5];
+    } else if (type == LS_LEGACY_ID && length >= 20 && legacyId.len() == 0) {
+      // Exactly twenty bytes are taken even if more were sent, matching tor's fixed-size copy: a
+      // longer field is not a longer digest.
+      legacyId = sub(linkSpecifiers, from, from + 20);
+    } else if (type == LS_ED25519_ID && length == 32 && ed25519Id.len() == 0) {
+      ed25519Id = sub(linkSpecifiers, from, from + 32);
+    }
+    // Anything else — an unknown type, a malformed entry of a known one — is skipped. See the header.
+    at = from + length;
+  }
+
+  // Port zero is not a port. tor's `tor_addr_port_is_valid_ap` refuses it along with an unset address,
+  // and it is worth refusing explicitly here because a caller that connected to port 0 would get an
+  // error from the operating system rather than from the protocol.
+  if (address.len() != 4 || port == 0) { return rejected(REND_NO_ADDRESS); }
+  if (legacyId.len() != 20) { return rejected(REND_NO_LEGACY_ID); }
+  if (!allowPrivate && !addressIsAllowed(address)) { return rejected(REND_PRIVATE_ADDRESS); }
+  return RendPoint(REND_OK, address, port, legacyId, ed25519Id);
+}
+
+/**
+ * Whether an IPv4 address may be extended to — `tor_addr_is_internal` plus multicast.
+ *
+ * The ranges are RFC 1918 and friends, and the list is the interesting part rather than the
+ * arithmetic: 0.0.0.0/8 and 127.0.0.0/8 reach this host, 10/8, 172.16/12 and 192.168/16 reach the
+ * network it sits on, 169.254/16 is link-local, and 224/4 is multicast. Every one of them is a
+ * different thing a stranger could ask a service to probe on their behalf.
+ */
+export bool addressIsAllowed(u8[] a) {
+  if (a.len() != 4) { return false; }
+  i32 b0 = a[0];
+  i32 b1 = a[1];
+  if (b0 == 0) { return false; }                          // 0.0.0.0/8 — "this network"
+  if (b0 == 127) { return false; }                        // loopback
+  if (b0 == 10) { return false; }                         // RFC 1918
+  if (b0 == 172 && b1 >= 16 && b1 <= 31) { return false; }
+  if (b0 == 192 && b1 == 168) { return false; }
+  if (b0 == 169 && b1 == 254) { return false; }           // link-local
+  if (b0 >= 224) { return false; }                        // multicast, and everything above it
+  return true;
+}
+
+u8[] sub(u8[] b, i32 from, i32 to) {
+  if (from < 0 || to > b.len() || to < from) { return u8[0](); }
+  u8[] out = u8[to - from]();
+  for (i32 i = from; i < to; i++) { out[i - from] = b[i]; }
+  return out;
+}

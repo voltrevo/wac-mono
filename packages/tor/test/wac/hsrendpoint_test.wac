@@ -1,0 +1,206 @@
+// Where a rendezvous point is, according to bytes a stranger sent.
+//
+// The link specifiers in an INTRODUCE2 are the one place in the onion protocol where somebody the
+// service has never met says "connect to this". The introduction point does not read them and nothing
+// before this does either, so every rule here is load-bearing and several of them look like
+// permissiveness until you ask what the alternative lets through.
+//
+// The rules are `hs_get_extend_info_from_lspecs` and `extend_info_addr_is_allowed` in C tor.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  REND_EMPTY, REND_MALFORMED, REND_NO_ADDRESS, REND_NO_LEGACY_ID, REND_OK, REND_PRIVATE_ADDRESS,
+  RendPoint, addressIsAllowed, rendezvousPoint,
+} from "../../src/hsrendpoint.wac";
+
+/** A well-formed pair — a public address and a legacy identity — resolves. */
+export string test_a_usable_rendezvous_point(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  RendPoint r = rendezvousPoint(list2(ipv4(93, 184, 216, 34, 9001), legacy(7)), false);
+  t.eqI32(r.error, REND_OK, "an address and a legacy identity is enough");
+  t.eqI32(r.port, 9001, "the port is read big-endian");
+  t.eqI32(r.address[0], 93, "and the address in order");
+  t.eqI32(r.address[3], 34, "all four bytes of it");
+  t.eqI32(r.legacyId.len(), 20, "the legacy identity is twenty bytes");
+  t.eqI32(r.ed25519Id.len(), 0, "and the ed25519 identity is optional, so absent here");
+
+  RendPoint full = rendezvousPoint(list3(ipv4(93, 184, 216, 34, 9001), legacy(7), ed(8)), false);
+  t.eqI32(full.error, REND_OK, "with an ed25519 identity too");
+  t.eqI32(full.ed25519Id.len(), 32, "which is carried through");
+  t.eqI32(full.ed25519Id[0], (8 * 131) & 0xFF, "unchanged");
+  return t.report();
+}
+
+/**
+ * A stranger cannot send the service to an address of their choosing.
+ *
+ * This is the defence the whole file exists for. Without it, an INTRODUCE1 naming 127.0.0.1:22 makes
+ * the service connect to its own SSH port and report the result by whether a rendezvous completes;
+ * the same against 10.0.0.0/8 maps the network it is hosted on. Every refused range below is a
+ * different thing a stranger would otherwise get to probe.
+ */
+export string test_a_stranger_cannot_choose_a_private_address(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqI32(rendezvousPoint(list2(ipv4(127, 0, 0, 1, 22), legacy(7)), false).error,
+          REND_PRIVATE_ADDRESS, "loopback");
+  t.eqI32(rendezvousPoint(list2(ipv4(10, 1, 2, 3, 9001), legacy(7)), false).error,
+          REND_PRIVATE_ADDRESS, "RFC 1918 ten");
+  t.eqI32(rendezvousPoint(list2(ipv4(192, 168, 1, 1, 9001), legacy(7)), false).error,
+          REND_PRIVATE_ADDRESS, "and one-ninety-two dot one-sixty-eight");
+  t.eqI32(rendezvousPoint(list2(ipv4(169, 254, 1, 1, 9001), legacy(7)), false).error,
+          REND_PRIVATE_ADDRESS, "link-local");
+  t.eqI32(rendezvousPoint(list2(ipv4(0, 0, 0, 0, 9001), legacy(7)), false).error,
+          REND_PRIVATE_ADDRESS, "this network");
+  t.eqI32(rendezvousPoint(list2(ipv4(239, 1, 1, 1, 9001), legacy(7)), false).error,
+          REND_PRIVATE_ADDRESS, "and multicast");
+
+  // 172.16/12 and both sides of it, because a range check written as `>= 16 && <= 31` and one written
+  // as `>= 16 && < 31` agree on every address except the last one in the block.
+  t.eqI32(rendezvousPoint(list2(ipv4(172, 15, 0, 1, 9001), legacy(7)), false).error, REND_OK,
+          "172.15 is public");
+  t.eqI32(rendezvousPoint(list2(ipv4(172, 16, 0, 1, 9001), legacy(7)), false).error,
+          REND_PRIVATE_ADDRESS, "172.16 is not");
+  t.eqI32(rendezvousPoint(list2(ipv4(172, 31, 255, 254, 9001), legacy(7)), false).error,
+          REND_PRIVATE_ADDRESS, "and neither is the last address of the block");
+  t.eqI32(rendezvousPoint(list2(ipv4(172, 32, 0, 1, 9001), legacy(7)), false).error, REND_OK,
+          "while the one after it is");
+
+  // A test network is entirely private addresses, which is why this is configuration rather than a
+  // constant — and why getting it wrong in either direction is silent.
+  t.eqI32(rendezvousPoint(list2(ipv4(127, 0, 0, 1, 9001), legacy(7)), true).error, REND_OK,
+          "with ExtendAllowPrivateAddresses a test network works");
+  return t.report();
+}
+
+/**
+ * What is mandatory, what is optional, and what is merely ignored.
+ *
+ * An unknown specifier type is skipped rather than refused: the list is extensible, and a service
+ * that rejected anything it did not recognise would break the day a type was added while gaining
+ * nothing — it can already tell whether the fields it needs are present.
+ */
+export string test_what_is_required(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqI32(rendezvousPoint(list1(legacy(7)), false).error, REND_NO_ADDRESS,
+          "an identity with nowhere to connect is not a rendezvous point");
+  t.eqI32(rendezvousPoint(list1(ipv4(93, 184, 216, 34, 9001)), false).error, REND_NO_LEGACY_ID,
+          "and an address with no legacy identity is refused — it is mandatory, the ed25519 is not");
+
+  // Port zero refused explicitly, so a caller gets a protocol error rather than an errno.
+  t.eqI32(rendezvousPoint(list2(ipv4(93, 184, 216, 34, 0), legacy(7)), false).error, REND_NO_ADDRESS,
+          "port zero is not a port");
+
+  // A short legacy ID is ignored rather than padded, which then fails the mandatory check. tor
+  // reaches the same answer by the same route, which is why the error is the missing-field one.
+  t.eqI32(rendezvousPoint(list2(ipv4(93, 184, 216, 34, 9001), shortLegacy()), false).error,
+          REND_NO_LEGACY_ID, "a nineteen-byte legacy identity is no legacy identity");
+  // And the same short field with something after it, which is the case that distinguishes a length
+  // check from a bounds check. Last in the list, reading twenty bytes runs off the end and fails for
+  // that reason; in the middle it would quietly succeed, and the identity would be nineteen bytes of
+  // what was sent plus one byte of the next specifier's header. A forged digest assembled from the
+  // wire, accepted as an identity.
+  t.eqI32(rendezvousPoint(list3(ipv4(93, 184, 216, 34, 9001), shortLegacy(), ed(8)), false).error,
+          REND_NO_LEGACY_ID, "nor when there are bytes after it to borrow");
+
+  // An unknown type between two good ones changes nothing.
+  t.eqI32(rendezvousPoint(list3(unknown(), ipv4(93, 184, 216, 34, 9001), legacy(7)), false).error,
+          REND_OK, "an unrecognised specifier is skipped, not fatal");
+
+  // The first IPv4 wins, so two implementations reading the same list go to the same place.
+  RendPoint two = rendezvousPoint(list3(ipv4(93, 184, 216, 34, 9001), ipv4(1, 2, 3, 4, 9002),
+                                       legacy(7)), false);
+  t.eqI32(two.error, REND_OK, "two addresses is a valid list");
+  t.eqI32(two.address[0], 93, "and the first one is the one used");
+  t.eqI32(two.port, 9001, "port included");
+
+  t.eqI32(rendezvousPoint(u8[1](), false).error, REND_EMPTY, "no specifiers at all");
+  t.eqI32(rendezvousPoint(u8[0](), false).error, REND_MALFORMED, "and nothing is not a list");
+  // A length that runs past the end is malformed rather than a short read.
+  u8[] truncated = u8[4]();
+  truncated[0] = 1;
+  truncated[1] = 0;
+  truncated[2] = 6;
+  truncated[3] = 93;
+  t.eqI32(rendezvousPoint(truncated, false).error, REND_MALFORMED,
+          "a specifier claiming more bytes than are there");
+  return t.report();
+}
+
+/** The address rule on its own, including what it lets through. */
+export string test_which_addresses_are_allowed(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.isTrue(addressIsAllowed(v4(93, 184, 216, 34)), "a public address");
+  t.isTrue(addressIsAllowed(v4(8, 8, 8, 8)), "another");
+  t.isTrue(addressIsAllowed(v4(223, 255, 255, 255)), "the last address before multicast");
+  t.isTrue(!addressIsAllowed(v4(224, 0, 0, 1)), "and the first multicast address");
+  t.isTrue(!addressIsAllowed(v4(255, 255, 255, 255)), "broadcast is above it and also refused");
+  t.isTrue(!addressIsAllowed(u8[3]()), "three bytes is not an address");
+  return t.report();
+}
+
+// ── building link specifier lists ─────────────────────────────────────────────
+
+/** `n` entries, prefixed with the count, as the wire format has them. */
+u8[] list1(u8[] a) { return joined(1, a, u8[0](), u8[0]()); }
+u8[] list2(u8[] a, u8[] b) { return joined(2, a, b, u8[0]()); }
+u8[] list3(u8[] a, u8[] b, u8[] c) { return joined(3, a, b, c); }
+
+u8[] joined(i32 n, u8[] a, u8[] b, u8[] c) {
+  u8[] out = u8[1 + a.len() + b.len() + c.len()]();
+  out[0] = n;
+  i32 at = 1;
+  for (i32 i = 0; i < a.len(); i++) { out[at + i] = a[i]; }
+  at = at + a.len();
+  for (i32 i = 0; i < b.len(); i++) { out[at + i] = b[i]; }
+  at = at + b.len();
+  for (i32 i = 0; i < c.len(); i++) { out[at + i] = c[i]; }
+  return out;
+}
+
+u8[] ipv4(i32 a, i32 b, i32 c, i32 d, i32 port) {
+  u8[] out = u8[8]();
+  out[0] = 0;          // LS_IPV4
+  out[1] = 6;
+  out[2] = a; out[3] = b; out[4] = c; out[5] = d;
+  out[6] = (port >> 8) & 0xFF;
+  out[7] = port & 0xFF;
+  return out;
+}
+
+u8[] legacy(i32 role) {
+  u8[] out = u8[22]();
+  out[0] = 2;          // LS_LEGACY_ID
+  out[1] = 20;
+  for (i32 i = 0; i < 20; i++) { out[2 + i] = (role * 131 + i) & 0xFF; }
+  return out;
+}
+
+u8[] shortLegacy() {
+  u8[] out = u8[21]();
+  out[0] = 2;
+  out[1] = 19;
+  for (i32 i = 0; i < 19; i++) { out[2 + i] = i; }
+  return out;
+}
+
+u8[] ed(i32 role) {
+  u8[] out = u8[34]();
+  out[0] = 3;          // LS_ED25519_ID
+  out[1] = 32;
+  for (i32 i = 0; i < 32; i++) { out[2 + i] = (role * 131 + i) & 0xFF; }
+  return out;
+}
+
+/** A specifier of a type nothing understands, which must be skipped rather than refused. */
+u8[] unknown() {
+  u8[] out = u8[6]();
+  out[0] = 42;
+  out[1] = 4;
+  return out;
+}
+
+u8[] v4(i32 a, i32 b, i32 c, i32 d) {
+  u8[] out = u8[4]();
+  out[0] = a; out[1] = b; out[2] = c; out[3] = d;
+  return out;
+}
