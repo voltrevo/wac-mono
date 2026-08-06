@@ -470,3 +470,22 @@ first hop extends, and the second hop's link handshake is where it stops.
 So the next step is not a new experiment but the old bug, now clearly load-bearing: instrument the two
 returns at the top of `linkHandshake` — the VERSIONS reply check and `negotiateVersion(...) < 4` — and
 run once. Everything else in the chain has been eliminated by measurement.
+
+### The extend failure is at the last line of `linkHandshake`
+
+Instrumented all five early exits — no VERSIONS answer, a first cell that is not VERSIONS, no version in
+common, an unexpected cell command, a CERTS cell that will not parse — and ran. **None of them fired**,
+while the relay still reported `the link handshake with 127.0.0.1 failed`.
+
+That leaves exactly one exit: `return !l.dead` after `sendCells(l, encodeNetinfo(...))`. So every cell of
+the handshake was exchanged successfully and **the link died on the way out**, which is a much smaller
+question than "the handshake fails": the responder accepted VERSIONS, sent CERTS, AUTH_CHALLENGE and
+NETINFO, the initiator read them all, and then the socket went.
+
+It now says so. Look next at why the responder drops a connection at that moment — `relayd` closing
+after its own handshake reply, an idle timeout on the wrong side, or a `send` refused on a socket the
+other end has already closed.
+
+Worth noting the shape of this: five instrumented branches staying quiet was more informative than any
+of them firing would have been. The uninstrumented path is the one that was taken, and it was the only
+one nobody had thought worth a message.

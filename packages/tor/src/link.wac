@@ -229,8 +229,20 @@ export u8[] takeCell(Link l) {
 export bool linkHandshake(Link l, string host) {
   sendCells(l, encodeVersions(i32[](3, 4, 5)));
   u8[] versions = nextCell(l);
-  if (versions.len() == 0 || cellCommand(versions, 0) != cmdVersions()) { return false; }
-  if (negotiateVersion(cellPayload(versions, 0), i32[](3, 4, 5)) < 4) { return false; }
+  if (versions.len() == 0) {
+    l.core.warn("tor: no VERSIONS answer (dead=" + (l.dead ? "yes" : "no") + ")");
+    return false;
+  }
+  if (cellCommand(versions, 0) != cmdVersions()) {
+    l.core.warn("tor: the first cell was command " + itoa(cellCommand(versions, 0)) +
+                ", not VERSIONS");
+    return false;
+  }
+  i32 agreed = negotiateVersion(cellPayload(versions, 0), i32[](3, 4, 5));
+  if (agreed < 4) {
+    l.core.warn("tor: no link version in common, best was " + itoa(agreed));
+    return false;
+  }
 
   while (true) {
     u8[] cell = nextCell(l);
@@ -256,7 +268,14 @@ export bool linkHandshake(Link l, string host) {
     }
   }
   sendCells(l, encodeNetinfo(ipv4Of(host)));
-  return !l.dead;
+  if (l.dead) {
+    // Every cell was exchanged and the link died on the way out. This was the one exit with no
+    // message, which is why a relay reported only "the link handshake failed" after the other five
+    // had been instrumented and stayed silent.
+    l.core.warn("tor: the link died while sending NETINFO");
+    return false;
+  }
+  return true;
 }
 
 export u8[] ipv4Of(string host) {
