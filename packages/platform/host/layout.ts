@@ -127,8 +127,24 @@ export const CHUNK = 1 << 16;
 export const SUBMIT_SEQ = 0;
 /** Bumped by the host whenever a slot changes in the worker's favour. */
 export const DONE_SEQ = 1;
+
+/**
+ * Non-zero once the host has stopped answering, so a parked worker learns instead of waiting.
+ *
+ * A worker in `Atomics.wait` is waiting for the responder loop and nothing else. Answering its
+ * outstanding calls is not enough on its own: a worker can be parked with *nothing* outstanding — waiting
+ * for a free slot, or for a request buffer, or holding a slot it has claimed but not yet published — and
+ * in every one of those states the only thing that can wake it is the loop that has just gone away. What
+ * that looks like from outside is a program that stops with no error anywhere, which is the shape
+ * wac-mono 0082 spent three days being.
+ *
+ * So the host sets this and bumps `DONE_SEQ`; every park in `call.ts` rechecks it on waking and raises.
+ * A flag rather than a per-slot status because the states that need it have no slot to write into.
+ */
+export const HOST_GONE = 2;
+
 /** Ints before the per-slot blocks begin. */
-export const CTRL_HEAD = 2;
+export const CTRL_HEAD = 3;
 /** Ints per slot. */
 export const SLOT_INTS = 8;
 

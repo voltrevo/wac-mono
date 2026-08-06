@@ -19,6 +19,7 @@
 import {
   type Bridge,
   DONE_SEQ,
+  HOST_GONE,
   OP_CONTINUE,
   OP_PUSH,
   S_GEN,
@@ -304,16 +305,42 @@ export function serveHostCalls(
    * three days as that shape. A failure the worker can see is worth more than a tidy stack trace here.
    */
   const failPending = (why: string): void => {
+    // The flag first, and it is the part that actually covers everything. A worker can be parked with no
+    // slot to answer at all — waiting for a free one, waiting for a request buffer, or holding one it
+    // claimed and never published — and those parks are woken by nothing but this. See `HOST_GONE`.
+    Atomics.store(b.ctrl, HOST_GONE, 1);
+
     for (let s = 0; s < SLOTS; s++) {
-      const st = Atomics.load(b.ctrl, slotAt(s) + S_STATUS);
-      if (st === ST_PENDING || st === ST_CLAIMED) {
-        try {
-          reply(s, STATUS_ERR, faultedBytes(FAULT_OTHER, why));
-        } catch {
-          // Nothing better to do: the bridge is already in a state we are explaining.
-        }
+      const at = slotAt(s);
+      const st = Atomics.load(b.ctrl, at + S_STATUS);
+      // `ST_RUNNING` as well as `ST_PENDING`, and that was the gap: a call the host had *taken* is the
+      // likeliest state when a responder stops, and it was the one state this skipped — so the worker
+      // waited for an answer from a handler that would never be reached.
+      //
+      // A pending slot is moved to running first, because publishing an answer is a compare-and-exchange
+      // from `ST_RUNNING` and would otherwise silently do nothing. That is not hypothetical: it made this
+      // whole function a no-op for every state it claimed to cover.
+      if (st === ST_PENDING) {
+        if (Atomics.compareExchange(b.ctrl, at + S_STATUS, ST_PENDING, ST_RUNNING) !== ST_PENDING) continue;
+        // Taken without being read, so the request buffer has to go back here — `take` is what normally
+        // frees one, and this path skips it. A buffer lost this way is not a lost byte, it is one of
+        // eight that a later worker parks on, in a call with nothing to do with this shutdown.
+        releaseBuf(b, "req", detach(b, at, S_REQ_BUF));
+      } else if (st !== ST_RUNNING) {
+        // Claimed but not published: the worker is mid-fill and writing into the slot would race with it.
+        // `HOST_GONE` is what reaches that one.
+        continue;
+      }
+      try {
+        reply(s, STATUS_ERR, faultedBytes(FAULT_OTHER, why));
+      } catch {
+        // Nothing better to do: the bridge is already in a state we are explaining.
       }
     }
+
+    // And wake whatever is parked, since some of those waits have no answer to arrive.
+    Atomics.add(b.ctrl, DONE_SEQ, 1);
+    Atomics.notify(b.ctrl, DONE_SEQ);
   };
 
   const loop = async (): Promise<void> => {
@@ -359,6 +386,11 @@ export function serveHostCalls(
     },
     stop() {
       running = false;
+      // Every outstanding call fails, and the flag goes up. A clean stop used to answer nothing: the loop
+      // returned, and a worker still parked on a call — or on a slot, or on a buffer — waited for a host
+      // that had gone. Stopping a responder while a worker is alive is what tearing down a child *is*, so
+      // this is the ordinary path, not the exceptional one.
+      failPending("the host responder was stopped");
       sched.quiet(bridgeId);
       sched.forget(bridgeId);
       // Wake the loop so it can notice. Bumping the counter it waits on is the only way

@@ -18,6 +18,7 @@
 import {
   type Bridge,
   DONE_SEQ,
+  HOST_GONE,
   OP_CONTINUE,
   OP_PUSH,
   S_GEN,
@@ -47,6 +48,7 @@ import {
   STATUS_MORE,
   SUBMIT_SEQ,
 } from "./layout.ts";
+import { FAULT_OTHER } from "./faults.ts";
 import { OP } from "./ops.ts";
 
 const enc = new TextEncoder();
@@ -183,9 +185,33 @@ function ping(b: Bridge): void {
   Atomics.notify(b.ctrl, SUBMIT_SEQ);
 }
 
-/** Park until the host changes something, then look again. */
+/**
+ * Park until the host changes something, then look again.
+ *
+ * **And check the host is still there.** Every wait in this file is a wait on the responder loop, so a
+ * loop that has stopped means every one of them is permanent. Answering the outstanding calls does not
+ * cover it: a worker parked for a free slot, for a request buffer, or holding a slot it claimed but never
+ * published has nothing outstanding to answer, and those parks are exactly the ones that end as a program
+ * stopping with no error anywhere. The host sets `HOST_GONE` and bumps `DONE_SEQ`; this is where it lands.
+ */
 function parkForHost(b: Bridge, seen: number, millis = Infinity): void {
+  // Checked on both sides of the wait, and both are needed. After, because the flag can go up while this
+  // is parked. *Before*, because it can go up before we park — and then there is nothing left to wake us:
+  // the wait would block for ever on a counter nobody will bump again. The window between the two is
+  // closed by `seen`, which was read before this call: the host bumps `DONE_SEQ` after raising the flag,
+  // so a wait armed with a stale value returns at once rather than sleeping.
+  gone(b);
   Atomics.wait(b.ctrl, DONE_SEQ, seen, millis);
+  gone(b);
+}
+
+/** Raise if the host has stopped answering. */
+function gone(b: Bridge): void {
+  if (Atomics.load(b.ctrl, HOST_GONE) === 0) return;
+  throw new HostCallError(
+    "the host stopped answering: this program's capabilities are gone, so the call cannot complete",
+    FAULT_OTHER,
+  );
 }
 
 /**
