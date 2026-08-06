@@ -529,3 +529,20 @@ calls. Deleted.
 
 That last one is worth generalising. **A surviving mutant on a private function is a dead-code report**,
 and it is the only one this repo currently produces — `deadexports` cannot see inside a file.
+
+## `packages/wacc`: 156/166, and four of the ten are now dealt with — agent-a, 2026-08-06
+
+- **Three parse error codes had no input that produced them.** `perrBadLvalue`, `perrCtorBrace` and
+  `perrFnArray` — replace any of them with `return 0` and the suite stayed green, because nothing in the
+  corpus reaches those branches. `parse_errors.test.ts` now includes `++1`, `++g()`, `fn[i32(i32)]`,
+  `fn[i32(i32)][]` and `S<i32>`; the reference parser agrees with wacc on all five, and gutting the three
+  codes now fails two or three tests each. This is the pattern the issue's own header describes —
+  "error codes are never checked by value" — reaching the last of the parser's codes.
+- **`tokenText` was dead.** Exported, called by nothing, and already in `deno task dead`'s report; the
+  host reads tokens through the flat accessors. Deleted (0009 shrinks by one too).
+- **`kBool` and `kindCount` are recorded in `known.ts`** with the argument `kinds.wac` and 0009 already
+  make: the table mirrors the reference lexer's declaration order, `kinds.test.ts` checks the numbering
+  member by member, and what is under test is the completeness of the set rather than any one value.
+
+Left in wacc: `spanIs6`, `atTypeArgEnd`, `startsLower`, `looksLikeEnumMethod` — four functions that are
+called but whose *effect* nothing asserts. Each needs the usual question asked separately.

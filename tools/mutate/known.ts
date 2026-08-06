@@ -313,6 +313,23 @@ export const KNOWN_SURVIVORS: KnownSurvivor[] = [
       "A `pop` that left the old value in place would make the guard the only thing still correct, " +
       "and that is exactly the change somebody adds without reading this accessor. wac-mono 0005.",
   },
+  // ── wacc's token-kind table ─────────────────────────────────────────────────
+  {
+    name: "extreme/wacc/kinds/kBool",
+    why:
+      "A member of the 84-constant table in `kinds.wac` that mirrors `TokenKind`'s declaration order in " +
+      "the reference lexer, and the file says so in its own `dead-exports: exempt` note. `kBool` has no " +
+      "caller because a boolean literal lexes as the keyword `true` or `false` and never as a `bool` " +
+      "token — but deleting it would renumber every kind after it and silently misalign " +
+      "`packages/wacc/test/kinds.test.ts`, which derives the names from `wac/atoms/wac/wacLex.ts` at run " +
+      "time. What is under test is the *completeness* of the set, which no single member's value can " +
+      "carry. wac-mono 0005 and 0009.",
+  },
+  {
+    name: "extreme/wacc/kinds/kindCount",
+    why: "The same table's length. Same argument: it is the numbering that is checked, member by " +
+      "member, against the reference lexer's union.",
+  },
   {
     name: "guard/bignum/big:354:19",
     why:

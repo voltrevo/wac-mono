@@ -554,17 +554,6 @@ export Lexed lex(u8[] src) {
   return out;
 }
 
-// ── Reading a token's value ───────────────────────────────────────────────────
-
-/** The source text of a token's span. */
-export string tokenText(u8[] src, i32 start, i32 len) {
-  u8[] slice = u8[len]();
-  for (i32 i = 0; i < len; i++) {
-    slice[i] = src[start + i];
-  }
-  return string.fromBytes(slice);
-}
-
 // ── Flat accessors for the host ───────────────────────────────────────────────
 //
 // bindgen cannot marshal a struct, so the host gets the arrays directly. Trimmed to
