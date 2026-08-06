@@ -1,0 +1,196 @@
+// Publishing a descriptor: the upload a service sends, and what a directory does with it.
+//
+// The oracle is `test/data/hspublish.json`, from tor's own HSDir cache — see `tools/capture-hspub.py`.
+// The value that matters there is `query`: the name **tor** filed our descriptor under. An HSDir
+// takes it from the blinded key inside the descriptor's signing-key certificate, never from the
+// uploader, because the publish URL carries no key at all. So the join being tested is between a
+// name we compute and a name tor chose.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { descriptorPath, publishPath } from "../../src/hsdir.wac";
+import { hsPublishRequest } from "../../src/dirclient.wac";
+import {
+  DirDocuments, dirRoute, hsPublishResponse, hsPublishVersion,
+} from "../../src/dirserve.wac";
+
+const i32 P_BLINDED = 0;
+const i32 P_QUERY = 1;
+const i32 P_DESCRIPTOR = 2;
+
+u8[] none() { return u8[0](); }
+
+/**
+ * The fetch URL names the descriptor the way the directory that stored it does.
+ *
+ * This is the one claim publication cannot make on its own. tor told us it stored the descriptor and
+ * would have served it back byte for byte — but under a name it derived from the certificate. Had we
+ * computed the fetch path from anything else, every step would still have reported success and no
+ * client would ever have found the service.
+ */
+export string test_the_fetch_name_is_the_one_the_directory_chose(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  string query = string.fromBytes(ref(P_QUERY, none(), none()));
+  t.eqStr(descriptorPath(ref(P_BLINDED, none(), none())), "/tor/hs/3/" + query,
+          "our fetch path ends at the name tor filed the descriptor under");
+
+  // And it is derived, not copied: another key gives another name.
+  u8[] other = u8[32](fill: 7);
+  t.isTrue(descriptorPath(other) != descriptorPath(ref(P_BLINDED, none(), none())),
+           "a different blinded key is a different name");
+  t.eqStr(descriptorPath(u8[31]()), "", "a key that is not 32 bytes names nothing");
+  t.eqStr(publishPath(), "/tor/hs/3/publish", "and publication has no key in it at all");
+  return t.report();
+}
+
+/** The upload's bytes, in tor's order: request line, Host, Content-Length, blank line, descriptor. */
+export string test_the_upload_is_shaped_like_tors(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] desc = ref(P_DESCRIPTOR, none(), none());
+  u8[] req = hsPublishRequest(desc, "127.0.0.1:9001");
+  string head = string.fromBytes(req);
+
+  t.isTrue(startsWith(head, "POST /tor/hs/3/publish HTTP/1.0\r\n"), "a POST to the publish path");
+  i32 blank = find(req, "\r\n\r\n");
+  t.isTrue(blank > 0, "the headers end");
+  string headers = sliceStr(req, 0, blank);
+  t.isTrue(indexOf(headers, "\r\nHost: 127.0.0.1:9001\r\n") > 0, "the directory is named");
+  t.isTrue(indexOf(headers, "\r\nContent-Length: ") > 0, "and the body is counted");
+  // Order, not just presence: tor prints Host before the header list Content-Length is appended to.
+  t.isTrue(indexOf(headers, "\r\nHost: ") < indexOf(headers, "\r\nContent-Length: "),
+           "Host comes before Content-Length, as tor writes them");
+  t.isTrue(indexOf(headers, "Content-Length: " + itoa(desc.len())) > 0,
+           "the count is the descriptor's length");
+
+  // The body is the descriptor unchanged — an HSDir stores what it was given, and a client verifies a
+  // signature over those bytes, so anything that rewrote them here would break the signature.
+  t.eqI32(req.len() - blank - 4, desc.len(), "nothing follows the descriptor");
+  t.eqBytes(slice(req, blank + 4, req.len()), desc, "and the body is the descriptor verbatim");
+
+  t.eqI32(find(hsPublishRequest(u8[0](), "x:1"), "Content-Length: 0\r\n") > 0 ? 1 : 0, 1,
+          "an empty body still counts itself");
+  return t.report();
+}
+
+/**
+ * Which targets are a publish, parsed the way tor parses them.
+ *
+ * `/tor/hs/3/publish` and `/tor/hs/3/<z>` share a prefix and differ in method, so the version has to
+ * come out of the middle of the path rather than the path being matched whole. tor reads a number
+ * after `/tor/hs/` and then requires `/publish`; matching the literal string would agree on every
+ * request tor sends today and disagree on the first one it does not.
+ */
+export string test_a_publish_target_is_recognised(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqI32(hsPublishVersion("/tor/hs/3/publish".toBytes()), 3, "the version tor uploads");
+  t.eqI32(hsPublishVersion("/tor/hs/003/publish".toBytes()), 3, "leading zeros are still three");
+  t.eqI32(hsPublishVersion("/tor/hs/4/publish".toBytes()), 4, "a version we do not serve is read, "
+          + "not refused — the caller decides what it supports");
+
+  t.eqI32(hsPublishVersion("/tor/hs/3publish".toBytes()), -1, "the separator is required");
+  t.eqI32(hsPublishVersion("/tor/hs/3/".toBytes()), -1, "a fetch prefix is not a publish");
+  t.eqI32(hsPublishVersion("/tor/hs/3/8cD2lg".toBytes()), -1, "nor is a fetch for a descriptor");
+  t.eqI32(hsPublishVersion("/tor/hs/publish".toBytes()), -1, "a version is required");
+  t.eqI32(hsPublishVersion("/tor/hs/".toBytes()), -1, "and the empty version is no version");
+  // The separator alone. `/tor/hs/publish` is refused by the `/publish` check whatever the number
+  // parse does, so it cannot show that an absent version is refused — this one can, and a version
+  // that silently reads as zero was invisible until it was here.
+  t.eqI32(hsPublishVersion("/tor/hs//publish".toBytes()), -1, "no digits is not version zero");
+  t.eqI32(hsPublishVersion("/tor/micro/d/x".toBytes()), -1, "another route entirely");
+  t.eqI32(hsPublishVersion("/tor/hs/99999999/publish".toBytes()), -1,
+          "and an absurd version is a malformed request rather than a version");
+  return t.report();
+}
+
+/**
+ * A stored descriptor is served back unchanged, and only under its own name.
+ *
+ * tor's cache hands back the encoded descriptor verbatim — `identical: yes` in the vector — because a
+ * client verifies the signature over exactly those bytes. Serving a re-encoded document would be a
+ * subtle way of breaking every service published here.
+ */
+export string test_what_was_stored_is_what_is_served(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] desc = ref(P_DESCRIPTOR, none(), none());
+  u8[][] descs = u8[][1]();
+  descs[0] = desc;
+  u8[][] keys = u8[][1]();
+  keys[0] = ref(P_BLINDED, none(), none());
+  DirDocuments docs = DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](), u8[0](),
+                                   u8[][0](), descs, keys);
+
+  string path = descriptorPath(ref(P_BLINDED, none(), none()));
+  t.eqI32(dirRoute(path.toBytes(), docs).status, 200, "the descriptor is there under its own name");
+  t.eqBytes(dirRoute(path.toBytes(), docs).body, desc, "and it comes back byte for byte");
+
+  t.eqI32(dirRoute("/tor/hs/3/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".toBytes(), docs).status,
+          404, "another key is not this descriptor");
+  t.eqI32(dirRoute("/tor/hs/3/".toBytes(), docs).status, 404, "and no key is nothing");
+
+  DirDocuments empty = DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](), u8[0](),
+                                    u8[][0](), u8[][0](), u8[][0]());
+  t.eqI32(dirRoute(path.toBytes(), empty).status, 404,
+          "a directory holding nothing says so rather than serving an empty body");
+  return t.report();
+}
+
+/** tor's two answers, and the codes a service reads. */
+export string test_the_publish_answers_are_tors(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqI32(hsPublishResponse(true).status, 200, "stored");
+  // 400 rather than 404: the request reached the right directory and said something wrong, and a
+  // service told 404 would go looking for another HSDir when the fault is in its own document.
+  t.eqI32(hsPublishResponse(false).status, 400, "rejected");
+  t.isTrue(hsPublishResponse(true).body.len() > 0, "and each says which it was");
+  t.isTrue(!sameBytes(hsPublishResponse(true).body, hsPublishResponse(false).body),
+           "in words that differ");
+  return t.report();
+}
+
+// ── small helpers ─────────────────────────────────────────────────────────────
+
+bool startsWith(string s, string prefix) {
+  u8[] a = s.toBytes();
+  u8[] b = prefix.toBytes();
+  if (a.len() < b.len()) { return false; }
+  for (i32 i = 0; i < b.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+i32 find(u8[] hay, string needle) {
+  u8[] n = needle.toBytes();
+  for (i32 i = 0; i + n.len() <= hay.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < n.len(); j++) { if (hay[i + j] != n[j]) { hit = false; j = n.len(); } }
+    if (hit) { return i; }
+  }
+  return -1;
+}
+
+i32 indexOf(string hay, string needle) { return find(hay.toBytes(), needle); }
+
+string sliceStr(u8[] b, i32 from, i32 to) { return string.fromBytes(slice(b, from, to)); }
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[to - from]();
+  for (i32 i = from; i < to; i++) { out[i - from] = b[i]; }
+  return out;
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  string out = "";
+  i32 x = v;
+  while (x > 0) {
+    u8[] d = u8[1]();
+    d[0] = 48 + (x % 10);
+    out = string.fromBytes(d) + out;
+    x = x / 10;
+  }
+  return out;
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}

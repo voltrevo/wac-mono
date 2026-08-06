@@ -374,7 +374,7 @@ export i32 main(Core core, Cli cli) {
   // client stuck with a consensus it cannot check. Only the consensus and the certificate are served:
   // those are what it asks for at this stage, and `dirserve.wac` answers 404 for what we do not hold.
   DirDocuments docs = DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](),
-                                   u8[0](), u8[][0]());
+                                   u8[0](), u8[][0](), u8[][0](), u8[][0]());
   bool hasDir = false;
   if (consensusPath != "" && certPath != "") {
     FileResult cf = cli.readFile(consensusPath).wait();
@@ -419,7 +419,8 @@ export i32 main(Core core, Cli cli) {
     }
 
     docs = DirDocuments(cf.bytes, microCons, kf.bytes, descriptors, digests,
-                        dirSourceFingerprint(cf.bytes), micros, microDigests);
+                        dirSourceFingerprint(cf.bytes), micros, microDigests, u8[][0](),
+                        u8[][0]());
     hasDir = true;
     core.log("relayd: serving the consensus, certificate and " + itoa(descPaths.len()) +
              " descriptor(s) over BEGIN_DIR" +

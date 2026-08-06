@@ -16,7 +16,49 @@
 
 import { Vec } from "../../std/src/vec.wac";
 import { parseInt } from "./directory.wac";
+import { publishPath } from "./hsdir.wac";
 import { parseUtc, findFrom } from "./consensus.wac";
+
+/**
+ * The upload a service sends to an HSDir: `POST /tor/hs/3/publish`, with the descriptor as the body.
+ *
+ * The bytes are tor's, from `directory_send_command` in `dirclient.c`: request line, then `Host`,
+ * then `Content-Length`, then a blank line, then the descriptor. That order is not decoration —
+ * `Content-Length` is appended to a header list that `Host` is printed before, so a server written
+ * against observed traffic would see it in exactly this place.
+ *
+ * `host` is the `address:port` of the directory, which for an upload over a BEGIN_DIR stream is the
+ * relay's own OR address. It is a header rather than a routing decision: the stream already goes
+ * where it goes. tor omits the port when it is 80, which never happens for an ORPort, so this always
+ * writes what it is given.
+ *
+ * HTTP/1.0, matching tor, and deliberately not 1.1: a 1.1 request without `Connection: close` invites
+ * the server to keep the stream open, and an upload is one document to one directory and then done.
+ */
+export u8[] hsPublishRequest(u8[] descriptor, string host) {
+  string head = "POST " + publishPath() + " HTTP/1.0\r\n" +
+                "Host: " + host + "\r\n" +
+                "Content-Length: " + decimal(descriptor.len()) + "\r\n\r\n";
+  u8[] h = head.toBytes();
+  u8[] out = u8[h.len() + descriptor.len()]();
+  for (i32 i = 0; i < h.len(); i++) { out[i] = h[i]; }
+  for (i32 i = 0; i < descriptor.len(); i++) { out[h.len() + i] = descriptor[i]; }
+  return out;
+}
+
+/** Unsigned decimal, because `Content-Length` is counted rather than formatted from a template. */
+string decimal(i32 v) {
+  if (v == 0) { return "0"; }
+  string out = "";
+  i32 x = v;
+  while (x > 0) {
+    u8[] d = u8[1]();
+    d[0] = 48 + (x % 10);
+    out = string.fromBytes(d) + out;
+    x = x / 10;
+  }
+  return out;
+}
 
 /** The URL for a batch of microdescriptors, by their base64 digests. */
 export string microdescPath(string[] digests) {

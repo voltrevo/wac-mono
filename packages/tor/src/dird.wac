@@ -101,7 +101,7 @@ export i32 main(Core core, Cli cli) {
   }
 
   DirDocuments docs = DirDocuments(consensus, microCons, certificate, descriptors, digests,
-                                   fingerprint, micros, microDigests);
+                                   fingerprint, micros, microDigests, u8[][0](), u8[][0]());
 
   Socket listener = cli.listen("127.0.0.1", port).wait();
   if (listener.handle < 0) {

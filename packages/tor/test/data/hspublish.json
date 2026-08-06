@@ -1,0 +1,49 @@
+{
+ "source": "tor's own hs_cache_store_as_dir and hs_cache_lookup_as_dir, tor 0.4.7.13",
+ "produced_by": "packages/tor/tools/capture-hspub.py",
+ "note": "An HSDir keys a descriptor by the blinded key inside its signing-key certificate, not by anything the uploader says \u2014 the publish URL carries no key at all. So `query` is the name tor chose, and our fetch path has to produce the same one or a service publishes into a slot nobody looks in.",
+ "descriptorFrom": "packages/tor/test/data/hsdesc_generated.json",
+ "blindedKey": "f1c0f6960f2b3fb2804b16c59c3071d6c142c4ec42f854e96b1c4b9f2f2da49a",
+ "query": "8cD2lg8rP7KASxbFnDBx1sFCxOxC+FTpaxxLny8tpJo",
+ "descriptorLength": 14103,
+ "stored": true,
+ "servedIdentical": true,
+ "controls": [
+  {
+   "name": "one byte of the encrypted body flipped",
+   "result": {
+    "stored": false,
+    "lookup": "none",
+    "identical": false,
+    "accepted": false
+   }
+  },
+  {
+   "name": "the document signature corrupted",
+   "result": {
+    "stored": false,
+    "lookup": "none",
+    "identical": false,
+    "accepted": false
+   }
+  },
+  {
+   "name": "truncated after the first line",
+   "result": {
+    "stored": false,
+    "lookup": "none",
+    "identical": false,
+    "accepted": false
+   }
+  },
+  {
+   "name": "the right descriptor, looked up under an all-zero key",
+   "result": {
+    "stored": true,
+    "lookup": "miss",
+    "identical": false,
+    "accepted": false
+   }
+  }
+ ]
+}

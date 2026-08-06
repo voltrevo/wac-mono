@@ -17,7 +17,7 @@ DirDocuments docsFrom(fn[u8[](i32, u8[], u8[])] ref) {
   return DirDocuments(
     ref(D_CONSENSUS, none(), none()), u8[0](), ref(D_CERT, none(), none()),
     ref(D_DESCRIPTOR, none(), none()), oneDigest(ref(D_DESC_DIGEST, none(), none())),
-    ref(D_FINGERPRINT, none(), none()), u8[0](), u8[][0]());
+    ref(D_FINGERPRINT, none(), none()), u8[0](), u8[][0](), u8[][0](), u8[][0]());
 }
 
 string hexOf(u8[] b) { return string.fromBytes(encodeUpper(b)); }
@@ -98,7 +98,8 @@ export string test_microdescriptors_are_batched_with_a_hyphen(fn[u8[](i32, u8[],
   u8[][] two = u8[][2]();
   two[0] = withPlus;
   two[1] = other;
-  DirDocuments docs = DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](), body, two);
+  DirDocuments docs = DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](), body, two,
+                                   u8[][0](), u8[][0]());
 
   t.eqI32(dirRoute(("/tor/micro/d/" + a).toBytes(), docs).status, 200,
           "a single digest containing a + is served");
@@ -126,7 +127,7 @@ export string test_microdescriptors_are_batched_with_a_hyphen(fn[u8[](i32, u8[],
   // And with nothing to serve, the route is a 404 rather than an empty 200 — a client reading an
   // empty body as a valid response would discard the relays it just verified.
   DirDocuments bare = DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](),
-                                   u8[0](), u8[][0]());
+                                   u8[0](), u8[][0](), u8[][0](), u8[][0]());
   t.eqI32(dirRoute(("/tor/micro/d/" + a).toBytes(), bare).status, 404,
           "a cache holding no microdescriptors says so");
   return t.report();

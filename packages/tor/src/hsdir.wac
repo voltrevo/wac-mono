@@ -276,6 +276,18 @@ export string descriptorPath(u8[] blindedKey) {
   return "/tor/hs/3/" + base64NoPad(blindedKey);
 }
 
+/**
+ * Where a service uploads: `/tor/hs/3/publish`, for every descriptor and every directory.
+ *
+ * There is no key in it, unlike the fetch path — and that asymmetry is the whole of how publication
+ * works. The uploader does not get to say what the descriptor is called. An HSDir reads the blinded
+ * key out of the descriptor's own signing-key certificate and files it under that
+ * (`cache_store_v3_as_dir` in tor), so the name a client later asks for is decided by what was
+ * signed, not by what was claimed. A service whose upload path and blinded key disagreed would still
+ * publish successfully — into a slot nobody looks in.
+ */
+export string publishPath() { return "/tor/hs/3/publish"; }
+
 // ── Reading the ring's inputs out of a consensus ──────────────────────────────
 
 /**

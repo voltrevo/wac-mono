@@ -44,6 +44,8 @@ export struct DirDocuments {
   u8[] fingerprint;            // 20 bytes: this authority's identity digest
   u8[] microdescriptors;       // every microdescriptor, concatenated, if any
   u8[][] microdescDigests;     // the 32-byte digest an `m` line carries, one per microdescriptor
+  u8[][] hsDescriptors;        // onion service descriptors uploaded here, one per entry
+  u8[][] hsBlindedKeys;        // the 32-byte blinded key each was filed under
 }
 
 /** A document response, `text/plain` as tor's own cache sends these. */
@@ -99,6 +101,19 @@ export Response dirRoute(u8[] target, DirDocuments docs) {
     return notFound();
   }
 
+  // `/tor/hs/3/<z>` — one descriptor, by the blinded key it was filed under. Unlike the directory
+  // documents above, a batch would be meaningless: two descriptors concatenated is not a descriptor,
+  // and a client asks for exactly the one service it is trying to reach.
+  if (startsWith(path, "/tor/hs/3/")) {
+    u8[] asked = rest(path, "/tor/hs/3/");
+    for (i32 i = 0; i < docs.hsBlindedKeys.len(); i++) {
+      if (equalBytes(asked, b64Unpadded(docs.hsBlindedKeys[i]).toBytes())) {
+        return document(docs.hsDescriptors[i]);
+      }
+    }
+    return notFound();
+  }
+
   if (equals(path, "/tor/server/authority") || equals(path, "/tor/server/all")) {
     return docs.descriptors.len() == 0 ? notFound() : document(docs.descriptors);
   }
@@ -121,6 +136,79 @@ export Response dirRoute(u8[] target, DirDocuments docs) {
 /** The response bytes for a GET, framing headers included. */
 export u8[] dirResponse(u8[] target, DirDocuments docs) {
   return write(dirRoute(target, docs), "GET".toBytes(), false);
+}
+
+// ── Publication ───────────────────────────────────────────────────────────────
+//
+// A service POSTs its descriptor rather than an authority collecting it, and the request is a
+// different shape from everything above: a body, and a target with no key in it.
+//
+// The version is parsed out of the *middle* of the path rather than matched whole, which is worth
+// following exactly, because `/tor/hs/3/publish` and `/tor/hs/3/<z>` differ only after that point and
+// one is a POST target while the other is a GET target. tor's `parse_hs_version_from_post` takes the
+// prefix `/tor/hs/`, reads a number, and then requires the remainder to start with `/publish` — so
+// `/tor/hs/003/publish` is a v3 publish and `/tor/hs/3publish` is not a publish at all. Matching the
+// literal string instead would agree on every request tor sends today and disagree on the first one
+// it does not.
+
+/**
+ * The onion service version this target publishes, or -1 if it is not a publish target at all.
+ *
+ * Mirrors `parse_hs_version_from_post` in tor's `dircache.c`, including its tolerance of leading
+ * zeros, and its refusal of a version that is not followed by `/publish`.
+ */
+export i32 hsPublishVersion(u8[] target) {
+  if (!startsWith(target, "/tor/hs/")) { return -1; }
+  i32 i = "/tor/hs/".toBytes().len();
+  i32 start = i;
+  i32 version = 0;
+  while (i < target.len() && target[i] >= '0' && target[i] <= '9') {
+    version = version * 10 + (target[i] - '0');
+    if (version > 65535) { return -1; }   // a version this large is a malformed request, not a v65536
+    i++;
+  }
+  if (i == start) { return -1; }          // `tor_parse_long` fails when there is no number at all
+  if (!startsWith(rest(target, sliceString(target, 0, i)), "/publish")) { return -1; }
+  return version;
+}
+
+/**
+ * tor's two answers to a publish, and its status codes.
+ *
+ * 400 rather than 404 for a descriptor an HSDir will not have: the request reached the right place
+ * and said something wrong, and a service that got 404 would go looking for another directory when
+ * the problem is its own document. The reason phrases are tor's, though nothing reads them — its
+ * uploader matches on the status alone.
+ *
+ * We answer HTTP/1.1 where tor's cache answers 1.0. tor's response parser reads `HTTP/1.%d` and does
+ * not care which, and every other route here answers 1.1 already; one route disagreeing would be the
+ * surprising thing.
+ */
+export Response hsPublishResponse(bool accepted) {
+  i32 status = accepted ? 200 : 400;
+  Response res = Response.create(status);
+  res.set("Content-Type", "text/plain");
+  return Response(status, res.headers,
+                  (accepted ? "HS descriptor stored successfully.\n"
+                            : "Invalid HS descriptor. Rejected.\n").toBytes());
+}
+
+/** The response bytes for a publish, framing headers included. */
+export u8[] hsPublishResponseBytes(bool accepted) {
+  return write(hsPublishResponse(accepted), "POST".toBytes(), false);
+}
+
+/** The first `n` bytes of `s`, as a string, for prefix arithmetic on a target. */
+string sliceString(u8[] s, i32 from, i32 to) {
+  u8[] out = u8[to - from]();
+  for (i32 i = from; i < to; i++) { out[i - from] = s[i]; }
+  return string.fromBytes(out);
+}
+
+bool equalBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
 }
 
 /**
