@@ -9,7 +9,7 @@
 // `echo one; true; echo two` printed `one` alone through a spawned shell. `push` drops empty writes
 // now; nothing is lost, because there is nothing in them.
 
-import { ByteQueue } from "../host/children.ts";
+import { ByteQueue } from "../host/queue.ts";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();

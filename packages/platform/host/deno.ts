@@ -7,7 +7,6 @@
 import { type Handlers, serveHostCalls } from "./respond.ts";
 import {
   blobWorker,
-  ByteQueue,
   type Child,
   failedChild,
   noSpawnHere,
@@ -21,6 +20,7 @@ import { bridgeOf, CHUNK, newBridge } from "./layout.ts";
 import { EMPTY_ARG, argBytes, i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 import { ChildStack, joinPath, packCaptured, unpackPush } from "./child.ts";
+import { ByteQueue } from "./queue.ts";
 import {
   changeBytes,
   changed,

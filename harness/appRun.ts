@@ -210,7 +210,11 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
           const slots = describeSlots(bridge);
           const stats = responder?.stats();
           const host = stats === undefined ? "" : ` host: running=${stats.running} sweeps=${stats.sweeps}`;
-          console.error(`wac: ${entry} still running: ${slots}${host}`);
+          // The child's own streams, because "the parent is blocked reading" and "the stream was never
+          // ended" are the same picture from the slot table alone — which is where 0082's hunt ran out
+          // of evidence.
+          const streams = ` out: ${child.out.describe()} | err: ${child.err.describe()} | in: ${child.in.describe()}`;
+          console.error(`wac: ${entry} still running: ${slots}${host}${streams}`);
           const state = `${slots}${host}`;
           // "Nothing in use" is not a deadlock — a child can legitimately be busy computing with no
           // call outstanding, and this must not fail `seq 1 200000000`.

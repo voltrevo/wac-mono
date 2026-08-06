@@ -14,8 +14,8 @@ import { type Handlers } from "./respond.ts";
 import { EMPTY_ARG, argBytes, i32le, i64le, readI32le, str, unstr } from "./call.ts";
 import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 import { ChildStack, joinPath, packCaptured, unpackPush } from "./child.ts";
+import { ByteQueue } from "./queue.ts";
 import {
-  ByteQueue,
   type Child,
   failedChild,
   noSpawnHere,
