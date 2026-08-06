@@ -178,3 +178,22 @@ Deno.test("asking for the whole population, or more, returns it unchanged", () =
     throw new Error("--sample=0 should be treated as no sampling, not an empty run");
   }
 });
+
+Deno.test("a body that already is the default yields no extreme mutant", () => {
+  // `packages/box/src/applets/nc.wac` has `i32 STDIN() { return 0; }`, and the `extreme` operator's
+  // replacement for an `i32` is `{ return 0; }` — the same program. It was reported as a surviving
+  // mutant for as long as the operator existed, because no test can tell a program from itself, and the
+  // byte-comparison against a rebuilt wasm did not catch it either. Whitespace does not count: the two
+  // spellings of the same body are the same body.
+  const names = (src: string) =>
+    generate("packages/demo/src/x.wac", src, ["extreme"], stats()).map((m) => m.name).sort();
+
+  const spaced = names("i32 zero() { return 0; }");
+  if (spaced.length !== 0) throw new Error(`\`{ return 0; }\` is the operator's own text: ${spaced}`);
+  const tight = names("i32 zero() {return 0;}");
+  if (tight.length !== 0) throw new Error(`the same body without spaces is the same body: ${tight}`);
+  const one = names("i32 one() { return 1; }");
+  if (one.join(",") !== "extreme/demo/x/one") {
+    throw new Error(`a body that differs from the default is still mutated, got: ${one}`);
+  }
+});

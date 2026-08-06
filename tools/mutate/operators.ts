@@ -258,6 +258,12 @@ export function generate(
   }
   if (stats !== undefined) stats.shapes += shapeMembers.size;
 
+  /**
+   * Whitespace removed, not collapsed: `{ return 0; }` and `{return 0;}` are the same program, and
+   * collapsing runs only equates the spellings that already agree about *where* the spaces are.
+   */
+  const normalise = (text: string) => text.replace(/\s+/g, "");
+
   if (want.has("extreme")) {
     for (const f of bodySpans) {
       const value = defaultValueFor(f.retType);
@@ -265,16 +271,17 @@ export function generate(
       const open = tokens[f.open], close = tokens[f.close];
       const start = at(open.line, open.col);
       const end = at(close.line, close.col) + 1;
+      const replacement = value === "" ? "{ }" : `{ return ${value}; }`;
+      // A body that *is* the default is not a mutation. `nc`'s `i32 STDIN() { return 0; }` produced
+      // `{ return 0; }` — the same program, reported as a surviving mutant because no test can tell one
+      // program from itself. The equivalence check compiles both and compares bytes, and did not catch
+      // this one; not generating it is cheaper than explaining it, and cannot be wrong: whitespace aside,
+      // the two texts are the same. wac-mono 0005.
+      if (normalise(source.slice(start, end)) === normalise(replacement)) continue;
       out.push({
         name: `extreme/${short(file)}/${f.name}`,
         origin: "operator",
-        edits: [{
-          file,
-          start,
-          end,
-          replacement: value === "" ? "{ }" : `{ return ${value}; }`,
-          was: source.slice(start, end),
-        }],
+        edits: [{ file, start, end, replacement, was: source.slice(start, end) }],
       });
     }
   }
