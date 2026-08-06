@@ -183,3 +183,47 @@ the next occurrence will name its scripts, which is the whole point.
 **Still open for the box test**, unchanged: no clock in it, not reproducible here, and its assertion is
 `assertEquals(r.out, "y\nstatus=0\n", r.err)`, which does print both the expected and actual text. Whoever
 sees it next should paste that failure.
+
+## Caught in the act: the narrator named it (agent-a, 2026-08-06)
+
+The section above ends "the next occurrence will name its scripts". It did, twice in twenty minutes, and
+the two are identical:
+
+```
+wac: scripts in flight for 55.0s with none finishing (677 of 681 done):
+wac:   script held 55.0s: cd /tmp/8ff9133dce02f5d8/w25; printf 'a
+wac:   script held 55.0s: cd /tmp/8ff9133dce02f5d8/w26; printf 'a
+wac:   script held 55.0s: cd /tmp/8ff9133dce02f5d8/w27; seq 1 20000 > f; wc f
+wac:   script held 55.0s: cd /tmp/8ff9133dce02f5d8/w28; seq 1 20000 > f; wc -l f
+…
+wac:   script held 550.1s: …the same four…
+```
+
+**What that establishes, which reasoning had not:**
+
+- **It is the last four scripts, not four particular scripts.** 677 of 681 finished; the four that did not
+  are the tail of the queue, one per worker. The pool is four wide, so *every* worker is stuck. Nothing
+  else was running.
+- **The shape matches the earlier hand-instrumented observation exactly** — `wc`-with-a-file cases — which
+  I had recorded above and could not act on. Same four, same position, twice.
+- **They are not slow, they are stopped.** 550 seconds against a 20-second whole-file run, with no
+  progress in any of the twelve narration blocks.
+
+**What it is not:**
+
+- Not the scripts themselves. All four run in **188 ms** through the same `appRunner`, four at a time, in
+  a fresh process. It needs the accumulated state of ~680 prior runs.
+- Not load: the machine was otherwise idle, and the same file passed in 20 seconds between the two wedges.
+- Not the six multi-line cases added at the same time. They pass in isolation, and this shape predates
+  them — the note above records it from 2026-08-05.
+- Not an obviously leaked worker: `spawnChild`'s `shutdown()` terminates the worker and stops the
+  responder, and both are called on the child's result.
+
+**Reproduction rate right now: two of three runs of `packages/sh/test/differential.test.ts`.** That is far
+higher than it has been, which makes this the moment to chase it. The next step I would take is to
+distinguish *which half* is blocked — each case awaits `bash(script)` and `wacsh(script)` together, so a
+hung `Deno.Command` and a hung in-process worker are indistinguishable in the narration as it stands. A
+label that changes as a case progresses would settle it in one run.
+
+**The narrator is doing its job**: this went from "an intermittent hang I could not name" to "the tail of
+the queue, every worker, reproducible" without anybody instrumenting anything by hand.
