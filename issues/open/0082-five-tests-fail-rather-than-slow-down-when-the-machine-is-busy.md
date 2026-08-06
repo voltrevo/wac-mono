@@ -392,3 +392,69 @@ candidate that fits is the shell's `RECV` on a spawned applet's output racing th
 The next occurrence will print `RECV(h=N)`, the responder's sweep count and whether it is still running,
 which distinguishes those without another round of guessing. The hunt is a loop of the corpus with a ten
 second settle between runs; on a quiet machine it has hit on the first run three times out of four.
+
+### The symptom is fixed even though the cause is not (agent-a, 2026-08-06)
+
+Reproduction stayed out of reach this tick — the machine had another agent on it, and ten runs at load
+3–9 were clean — so the work went to the part that does not need a reproduction: **a wedge no longer
+hangs.**
+
+`harness/appRun.ts` now concludes *deadlock* from the bridge's own state rather than from elapsed time.
+Every 45 seconds it compares the slot table and the counters with what they were last time; if they are
+identical twice running **and** a call is outstanding, it fails the run with the state in the message:
+
+```
+packages/sh/src/sh.wac is deadlocked: the bridge has not moved in 90s with work outstanding —
+0:running:READ_STDIN (submit=7 done=12) host: running=true sweeps=8. This is wac-mono 0082 …
+```
+
+**Why this is allowed to decide when the rest of this issue argues that clocks must not.** It is not
+deciding on duration: a slow machine still moves — `sweeps` climbs, `done` climbs, slots change hands — so
+a frozen table with work outstanding is a *state*, and the duration only says how long to look before
+believing it. `no slot in use` is explicitly not a deadlock, so a program that computes for a long time
+with nothing outstanding is never failed.
+
+`harness/deadlock.test.ts` is both halves of that claim, and builds the wedge rather than waiting for one:
+`endStdin: false` leaves a `read` waiting for bytes and an end that will never come, which is the same
+frozen shape, and it is detected in two seconds at a 700 ms budget. The second test runs
+`seq 1 300000 | wc -l` at a 500 ms budget and must *not* be failed — if that one ever fails, the detector
+has started looking at time instead of progress and every long-running program is about to be reported as
+broken.
+
+What this buys, until the cause is found: a wedge costs one failing test with the wait named, instead of
+the push gate's 45-minute timeout spent on no information at all.
+
+### The three that still flake say so in their names (operator's call, 2026-08-06)
+
+> "I think we should tag these tests as flaky in the test name and link the issue. That way when they fail
+> the flake is a clear alternative explanation. Obviously we should just not be flaky in the first place,
+> but until that's solved it should at least be clear to avoid chasing the wrong geese."
+
+Done, for the three that are still open members of this class:
+
+| test | file |
+| --- | --- |
+| `[flaky 0082] every script agrees with bash on output and exit status` | `packages/sh/test/differential.test.ts` |
+| `[flaky 0082] run a command on a real OpenSSH server and read its output` | `packages/ssh/test/transport.test.ts` |
+| `[flaky 0082] an endless producer stops at the cap rather than filling memory` | `packages/box/test/shell.test.ts` |
+
+In the *name*, so the explanation arrives in the line the runner prints, at the moment somebody is deciding
+whether they broke something. A tracker entry only helps a reader who already suspects the suite, which is
+the state this issue's reporter reached after an hour.
+
+**Deliberately not tagged: the four that were fixed.** Tagging a test that is no longer flaky is how a real
+regression gets waved through, and it is the failure mode of this whole practice.
+
+`tools/flaky.test.ts` is what keeps it from becoming one:
+
+- every `[flaky NNNN]` must name an issue in `issues/open/`. **When this issue is closed and the tags are
+  not, the suite fails and names the lines to edit** — so the tag and the issue come off together.
+- the issue it names has to read as one about intermittent failure, or the tag is a dead end for whoever
+  follows it mid-diagnosis;
+- the convention is required to be written down in `issues/README.md`, so the next person does not invent
+  a different spelling;
+- and every green run prints the list, because three flaky tests became normal here by nobody counting
+  them out loud.
+
+Verified it fails: pointing one tag at a closed issue reports
+`packages/box/test/shell.test.ts:130 is tagged [flaky 0011], which is closed`.

@@ -49,6 +49,17 @@ export type RunResult = {
 
 export type RunOptions = {
   /**
+   * Whether to end standard input after `stdin` has been pushed. Ending it is the default, because a
+   * program that reads to the end has to see one.
+   *
+   * `false` leaves it open: the program blocks on `read` and nothing will ever release it. That is a
+   * deadlock by construction, which is what `harness/deadlock.test.ts` uses it for — and it is also
+   * what a caller driving a program over time would want, if one existed. There is no way to push more
+   * input afterwards yet; when something needs that, this option is where it goes.
+   */
+  endStdin?: boolean;
+
+  /**
    * Called with the phase this run is in, for a caller that narrates a wedge.
    *
    * wac-mono 0082: four corpus cases hung for ten minutes, and the narration could say which *half* of
@@ -172,23 +183,54 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
       // `rest()` releases room as it takes chunks, so starting it first drains continuously and the
       // size stops mattering. `shutdown()` ends both queues, which is what lets these resolve.
       note("running");
-      // A child that never finishes says what it is waiting on, every 45 seconds, to standard error.
-      // It cannot fail anything — it prints — so the budget can be short enough to be useful without
-      // being tuned against a loaded machine. Cleared in the `finally` below.
-      // `WAC_STALL_MS` so this can be provoked in a second rather than only by a real wedge — a
-      // narrator that is never seen to fire is one nobody knows is broken.
+      // A child that never finishes says what it is waiting on, every 45 seconds, to standard error —
+      // and if nothing at all has moved for three of those in a row, it says so as a *failure*.
+      //
+      // **Why this one is allowed to decide, when wac-mono 0082 argues that clocks should not.** It is
+      // not deciding on elapsed time: it compares the bridge's own counters and slot states between
+      // checks, and only concludes when they are *identical* and there is work outstanding. A slow
+      // machine still moves; a deadlocked one does not. The alternative is what this harness did
+      // before — hang for as long as the caller waits, which for the push gate is a 45-minute timeout
+      // spent on no information at all, and for a person is Deno's "has been running for over (4m0s)"
+      // naming the test and nothing else.
+      //
+      // `WAC_STALL_MS` provokes it in a second rather than only at a real wedge — a narrator nobody
+      // has seen fire is one nobody knows is broken.
       const stallMs = Number(Deno.env.get("WAC_STALL_MS") ?? "45000");
+      const every = Number.isFinite(stallMs) && stallMs > 0 ? stallMs : 45_000;
+      let lastState = "";
+      let frozen = 0;
+      let deadlocked: ((e: Error) => void) | undefined;
+      const wedged = new Promise<never>((_, reject) => {
+        deadlocked = reject;
+      });
       const stall = setInterval(() => {
         if (bridge === undefined) return;
         try {
-          const host = responder === undefined
-            ? ""
-            : ` host: running=${responder.stats().running} sweeps=${responder.stats().sweeps}`;
-          console.error(`wac: ${entry} still running: ${describeSlots(bridge)}${host}`);
+          const slots = describeSlots(bridge);
+          const stats = responder?.stats();
+          const host = stats === undefined ? "" : ` host: running=${stats.running} sweeps=${stats.sweeps}`;
+          console.error(`wac: ${entry} still running: ${slots}${host}`);
+          const state = `${slots}${host}`;
+          // "Nothing in use" is not a deadlock — a child can legitimately be busy computing with no
+          // call outstanding, and this must not fail `seq 1 200000000`.
+          frozen = state === lastState && !slots.startsWith("no slot in use") ? frozen + 1 : 0;
+          lastState = state;
+          if (frozen >= 2 && deadlocked !== undefined) {
+            deadlocked(
+              new Error(
+                `${entry} is deadlocked: the bridge has not moved in ${
+                  Math.round((every * 2) / 1000)
+                }s with work outstanding — ${state}. ` +
+                  `This is wac-mono 0082: the child is waiting for an answer that is not coming. ` +
+                  `Set WAC_STALL_MS higher if a capability here really can take that long.`,
+              ),
+            );
+          }
         } catch {
           // A bridge whose buffer has gone is not worth an exception here.
         }
-      }, Number.isFinite(stallMs) && stallMs > 0 ? stallMs : 45_000);
+      }, every);
       Deno.unrefTimer(stall);
       const draining = Promise.all([child.out.rest(), child.err.rest()]);
 
@@ -197,14 +239,23 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
       if (opts.stdin !== undefined) {
         await child.in.push(typeof opts.stdin === "string" ? enc.encode(opts.stdin) : opts.stdin);
       }
-      child.in.end();
+      if (opts.endStdin !== false) child.in.end();
 
       try {
-        const code = await child.exit;
+        // Whichever settles first: the child, or the conclusion that it never will. The child is
+        // killed on the way out so a deadlocked worker does not outlive the test that gave up on it.
+        const code = await Promise.race([child.exit, wedged]);
         note("draining");
         const [bytes, errBytes] = await draining;
         note("done");
         return { code, out: dec.decode(bytes), err: dec.decode(errBytes), bytes };
+      } catch (e) {
+        try {
+          child.kill();
+        } catch {
+          // Already gone.
+        }
+        throw e;
       } finally {
         clearInterval(stall);
       }

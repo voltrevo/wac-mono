@@ -62,6 +62,31 @@ what happened — `fixed`, `wontfix`, or `obsolete` with a reason. Keeping close
 issues rather than deleting them is what makes "was this ever a problem?" answerable
 without archaeology.
 
+## A test that fails for reasons of its own: `[flaky NNNN]`
+
+A test that sometimes fails without the code being wrong costs whoever is pushing an hour of diagnosing
+their own change — that is what [0082](open/0082-five-tests-fail-rather-than-slow-down-when-the-machine-is-busy.md)
+is about, and it happened to the person who filed it. Until the cause is found, such a test carries the
+issue number **in its name**:
+
+```ts
+Deno.test("[flaky 0082] an endless producer stops at the cap rather than filling memory", …)
+```
+
+So the failure arrives with its own alternative explanation, in the line the runner prints, at the moment
+somebody is deciding whether they broke something. That is the whole of it: a tracker entry helps only
+those who already suspect the suite.
+
+**The tag is the dangerous half**, and this is not a licence to leave it. "Known flaky" is how a real
+regression gets waved through, so:
+
+- it names an **open** issue, and `tools/flaky.test.ts` fails the suite when the issue is closed and the
+  tag is not — the tag and the issue come off together;
+- that test also prints the tagged tests on every green run, because a list nobody sees is how three
+  flaky tests became normal;
+- it is a description of a *known* fault with evidence in the issue, never a shrug at a test somebody
+  has not looked at.
+
 ## What makes a report worth having
 
 A reproduction. For a package, the smallest input that misbehaves and what you

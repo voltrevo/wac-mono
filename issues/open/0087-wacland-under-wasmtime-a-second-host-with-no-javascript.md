@@ -69,14 +69,37 @@ ambient anything, but arbitrary JavaScript in a spawned worker can, since Deno w
 process's permissions. Under this runtime a child instance gets **exactly the imports the host gives
 it**. `spawn` becomes a confinement primitive rather than only a composition one, on this host first.
 
-## Preconditions, which are an operator ask
+## The toolchain is in place (2026-08-06)
 
-- No `cargo` or `rustc` here. Needs `sudo`, plus proxy allowlist entries for rustup and crates.io.
-- **This repo has no compiled language today** — 371 `.wac`, 305 `.ts`, with Python and shell only as
-  tooling. This is the first, and where it lives is undecided: its own bare repo, or
-  `packages/platform/host/native/`. See 0001's open questions; it wants deciding before code lands, not
-  after.
-- Only whoever *builds* the runtime needs the toolchain. Everyone else needs a binary.
+Settled, so nobody repeats it:
+
+- **`rustc` and `cargo` 1.97.1, via rustup**, on the PATH in every shell. `~/.zshenv` and `~/.profile`
+  source `~/.cargo/env`; the rustup shims are also symlinked into `/usr/local/bin`, because Claude
+  Code's tool shells source a snapshot that pins `PATH` *after* `.zshenv` is read and would otherwise
+  never see them.
+- **Ubuntu's `rustc` 1.75 is not enough and has been removed.** It installs from `ports.ubuntu.com`
+  with no allowlist change, and then cannot build wasmtime: current wasmtime (47.x) requires
+  `edition2024`, which needs Rust 1.85+. `cargo fetch` fails with "the package requires the Cargo
+  feature called `edition2024`". Two toolchains on the PATH is a trap, so there is one.
+- **Proxy allowlist**, all five added by the operator and all five used: `index.crates.io` and
+  `static.crates.io` for the registry and the downloads, `crates.io` for `cargo add`, and
+  `sh.rustup.rs` with `static.rust-lang.org` for the toolchain itself.
+- **Measured**, on a trivial wasmtime host: release build 1m28s at 401% CPU, a 17.2 MB unstripped
+  binary with default features, and ~850 MB of toolchain on the shared home (`~/.rustup` 520 MB,
+  `~/.cargo` 333 MB). A real runtime should trim wasmtime's features hard; the default pulls in the
+  pooling allocator, profiling, `wat` and `wit-parser`, none of which this needs.
+- **The two mechanisms D10 rests on are proven** by a probe: `Func::wrap` supplying a host function to
+  the guest, and a second `Instance` created from the host with its own `Store` and only the imports
+  that call handed it. That second one is `spawn`, and it is why `spawn` is a confinement primitive on
+  this host and not on the others.
+
+## Still an operator decision
+
+**This repo has no compiled language today** — 371 `.wac`, 305 `.ts`, with Python and shell only as
+tooling. Where the runtime lives is undecided: its own bare repo, or `packages/platform/host/native/`.
+See 0001's open questions. Worth settling before code lands rather than after.
+
+Only whoever *builds* the runtime needs the toolchain; everyone else needs a binary.
 
 ## Not in scope
 
