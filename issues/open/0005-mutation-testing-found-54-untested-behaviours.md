@@ -364,3 +364,46 @@ after    baseline 2/2 scopes     0 of 251 mutants excluded   160/251 narrowed
 
 Those 34 `unicode` survivors are new information — most were previously in the excluded 150 — and
 are not yet in this issue's tables.
+
+## wacc's error codes are compared now, and the two sides do not categorise alike (agent-a, 2026-08-06)
+
+The pattern at the top of this issue — "error codes are never checked by value", sixteen of wacc's twenty
+survivors — is closed for the lexer and the parser. Both tests said so in their own headers; both now
+compare the field they were dropping.
+
+**The lexer lines up one-to-one.** `packages/wacc/test/errorCodes.ts` maps each of the seven `err*` codes
+to the reference message it means, anchored on the part that is not interpolated so a reworded message
+does not break it. Every error in the corpus is checked, and a code with no entry fails — which is
+precisely what `return 0` produces. The table is hand-written because the reference has no error *kinds*
+to derive from: it interpolates English at each site, so there is nothing to enumerate. It gets its own
+soundness test in exchange — no code twice, and every `err*` in `lex.wac` present.
+
+**The parser does not line up, and that is a finding.** wacc reports `perrExpected` at sites where the
+reference says `expected function name`, `expected struct name`, `expected constant name`. All nine
+`perr*` codes are emitted somewhere, so this is not dead code — the two sides simply categorise the same
+errors at different granularities, and nothing had ever compared them to notice. Measured over the
+existing cases: **269 errors, 24 distinct reference shapes, 6 distinct wacc codes.**
+
+Rather than guess which message each code is *supposed* to mean and then assert my guess, the parser gets
+claims that need no guess:
+
+- one reference message shape never comes back as two different codes;
+- every code observed is one the *recorded* numbering declares;
+- the corpus produces at least six distinct codes.
+
+**Whether wacc should match the reference's granularity is left open, deliberately.** It is a question for
+whoever owns wacc's diagnostics, and rung 3 is where it will start to matter — that is the reason this
+issue gave for caring about the codes at all.
+
+### Two versions of this check were too weak, and the mutants said so
+
+Worth recording because both looked right:
+
+- **counting distinct codes** does not catch a constant gutted to `return 0`: replacing one value with
+  zero leaves the count exactly where it was.
+- **scraping the source for the declared codes** does not either — the mutant *is* the source, so the
+  goalposts move with it. The numbering is recorded in the test now, and a separate check keeps the record
+  and the source in step, so a code cannot change without one of the two failing.
+
+Verified by gutting `errUnterminatedString` and `perrBadType` in turn: each is now reported, in two
+independent ways for the parser.

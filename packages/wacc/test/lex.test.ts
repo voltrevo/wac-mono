@@ -11,6 +11,7 @@
 // silently comparing the wrong names.
 
 import { wacLex } from "wac/wacLex.ts";
+import { disagreement, LEX_CODES, tableFaults } from "./errorCodes.ts";
 import { wacBind } from "../../../harness/wacBind.ts";
 import { loadCorpus } from "./corpus.ts";
 
@@ -200,6 +201,33 @@ Deno.test("lex: error codes and positions line up with the reference", () => {
           `${JSON.stringify(source)}: error ${i} at ${flat[i * 3 + 1]}:${flat[i * 3 + 2]}, ` +
           `reference says ${ref[i].line}:${ref[i].col}`);
       }
+      // **And the code, which nothing checked until now.** Position and count were compared and the
+      // first field of each triple — the one that says *what went wrong* — was dropped. A mutation
+      // sweep put `return 0` in place of every error constant and this test stayed green. wac-mono 0005.
+      const wrong = disagreement(LEX_CODES, flat[i * 3], ref[i].message);
+      if (wrong !== null) throw new Error(`${JSON.stringify(source)}: error ${i}: ${wrong}`);
     }
+  }
+});
+
+Deno.test("lex errors: the code table itself is sound", async () => {
+  // The table is hand-written, because the reference has no error kinds to derive from — it interpolates
+  // English at each site. So the table gets its own check: no code twice, and every code the source can
+  // emit is in it. Without this, a code added to `lex.wac` would be compared against nothing.
+  const faults = tableFaults(LEX_CODES);
+  if (faults.length > 0) throw new Error(faults.join("; "));
+  const declared = new Set(LEX_CODES.map((c) => c.code));
+  const inSource = [...(await Deno.readTextFile("packages/wacc/src/lex.wac")).matchAll(
+    // `err[A-Z]` rather than `err\w+`: the latter also matches `errorStride()`, which is a layout
+    // constant and not a code, and the count check duly reported eight where the table has seven.
+    /^export i32 (err[A-Z]\w*)\(\)\s*\{\s*return (\d+);/gm,
+  )];
+  for (const [, name, code] of inSource) {
+    if (!declared.has(Number(code))) {
+      throw new Error(`${name} = ${code} is in lex.wac and not in the table, so nothing compares it`);
+    }
+  }
+  if (inSource.length !== LEX_CODES.length) {
+    throw new Error(`${inSource.length} codes in lex.wac, ${LEX_CODES.length} in the table`);
   }
 });
