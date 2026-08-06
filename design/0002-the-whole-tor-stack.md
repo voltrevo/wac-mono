@@ -518,3 +518,54 @@ model — its whole subject is accepting while serving.
 The `link died while sending NETINFO` message stays, and is still the thing to read when an extend does
 happen. But it is no longer the leading suspect: a socket closed by a relay that went back to `accept`
 and never came, and a handshake that genuinely disagrees, look identical from the initiator's side.
+
+### Correction: `inetd.wac` is not the model, and nothing in the repo is
+
+The note above named `packages/platform/example/inetd.wac` as the model for accepting while serving. It
+is not, and it says so itself:
+
+> One connection, then exit. A loop would need `accept` and the live child watched together, which
+> `waitAny` can do — but serving one is what makes this testable, and **concurrency across connections
+> is a different design decision from this one.**
+
+Every `waitAny` user in the repo watches a *fixed* set of handles — `nc.wac` two, `inetd.wac` one
+connection's worth. **A relay would be the first program here to multiplex an unbounded set**, which
+makes this a design step rather than a copy.
+
+The shape it needs, written down so the next attempt starts from a decision rather than a blank page:
+
+  - **A `Conn` struct** holding what `runLink`'s locals hold today — the TLS state, the cell buffer,
+    `versionsSeen`, the circuit id and `Hop`, the next-hop `Link`, the stream socket, and the one
+    outstanding `recv` ticket per source.
+  - **An array of them**, plus the listener's `accept` ticket, all in one `waitAny`. The index that
+    comes back selects a connection *and* which of its sources spoke, so the mapping from index to
+    (connection, source) has to be built each time round rather than assumed — that is the part that
+    will be fiddly, and the part worth a test of its own.
+  - **A cap.** Unbounded means a relay holds every connection anyone opens; tor's own relays have one,
+    and a testnet relay with no limit is a program that dies under its first mistake rather than
+    refusing politely.
+
+The prize is worth the size: it is the difference between a relay that can be *in* a circuit and one
+that can only be at the end of it, and it is the last structural thing between this network and a
+stream.
+
+### A relay multiplexes now, and a C tor reaches 100 %
+
+`relayd`'s loop no longer serves one connection to completion. `runLink`'s locals became a `Conn`
+struct; the listener's `accept` ticket sits in the same `waitAny` as every live connection's sources;
+and the wait list is rebuilt each round with parallel `owner`/`source` arrays, because the index that
+comes back has to be translated into *which connection* and *which of its sources* — recording that
+mapping rather than inferring it is the whole trick. `MAX_CONNS` bounds it: a relay that accepts
+everything offered dies on the first burst, and one refusal is better for the network than that.
+
+The measurement, against the same run an hour earlier:
+
+    before   each relay 1 connection, 0-1 extends, at most 1 completed, Bootstrapped 95%
+    after    each relay 2 connections, 2 extends, **2 completed**, **Bootstrapped 100% (done)**
+
+**100 % is new.** A C tor now builds a complete circuit through our relays and calls the network
+usable. That is step 3's `EXTEND2` no longer merely working once but working reliably, and it is the
+first time the whole directory-and-relay stack has satisfied a real tor end to end.
+
+The fetch still times out with no relay opening a stream, so `RELAY_BEGIN` is the remaining gap between
+a usable network and a byte delivered. That is now the only thing left in step 3.
