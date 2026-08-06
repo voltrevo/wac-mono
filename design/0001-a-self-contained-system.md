@@ -196,6 +196,42 @@ ticket. That is D8 one level down — WASI is to the runtime what POSIX is to th
 compatibility personality over native foundations and never the foundation. Written down now so that
 whoever wants it builds it that way round.
 
+**D12 — a fully deterministic execution mode is a goal of the native runtime, and only partly reachable
+before it** (operator, 2026-08-06). Everything hard about testing this system comes from interleaving: a
+zero-length write ended a stream *only when a reader happened to be parked* (0078); a corpus hangs about
+once in fifty runs *and only on an idle machine* (0082). The response so far has been to make the
+semantics enumerable — the queue, the child lifecycle and the bridge protocol are pure transition
+functions with every interleaving walked in `packages/platform/test/*_model.test.ts` — and that catches
+design bugs, but it cannot reproduce a *run*.
+
+Reproducing a run needs the schedule to be ours. **In the JavaScript hosts it can only be partly ours**,
+and the boundary is worth stating precisely rather than discovering:
+
+- **what we can own today.** A worker makes progress only when the host answers it, so a test-mode
+  scheduler can let exactly one worker run at a time and choose the order answers are delivered in. When a
+  program parks on `waitAny` with several tickets ready, which one it sees is *our* choice — the protocol
+  permits either, and today it is decided by timing.
+- **what we cannot.** Whether a real `readFile`, `accept` or child exit has completed is the kernel's
+  business. So the *choice set* — which workers are unblockable right now — is not reproducible from a
+  seed, even though the choice among them is. A worker parked on two OS-backed tickets, one of which will
+  never complete until something else is unblocked, cannot be distinguished from one that is merely slow.
+- **so the honest claim is "deterministic over a world the scheduler owns"**: an in-memory filesystem, a
+  scripted network. `packages/fs`'s memory backing and `sealed.wac` already provide the first of those.
+  Anything touching the real filesystem or a real socket gets improved reproducibility, not a guarantee,
+  and the mode should say so rather than implying more.
+
+**In Wacland the boundary moves.** The runtime owns the ticket table, the threads, the clock and the
+syscalls, so nothing can complete except by its own doing: the choice set becomes ours, "nobody can
+proceed" becomes a *proven* deadlock rather than an inference from frozen counters, and a seed really is
+the whole schedule. That is a reason to build the ticket table and `waitAny` with a scheduler seam in them
+from the start, rather than adding one later — the runtime should be able to answer "who is runnable?"
+without asking the operating system.
+
+**Until then, record rather than only generate.** A seed cannot carry what the kernel decided, but a log
+of the choices actually made can: a run that wedges leaves its schedule behind, and replaying the log
+reproduces it where replaying the seed might not. That is what would settle 0082, which has been observed
+half a dozen times and never once with its interleaving in hand.
+
 ## Order of work
 
 Each step is an issue when it becomes actionable, and each references this document.

@@ -105,3 +105,26 @@ Only whoever *builds* the runtime needs the toolchain; everyone else needs a bin
 
 No shell, no services, no image format, no process table. A `.wasm` and a manifest of grants is the
 whole artifact; `buildApp` gains a target that emits it.
+
+## D12: build the ticket table with a scheduler seam in it (operator, 2026-08-06)
+
+design/0001 gained **D12 — a fully deterministic execution mode is a goal of the native runtime, and only
+partly reachable before it.** It bears directly on items 3 and 4 above.
+
+In the JavaScript hosts a test scheduler can own *which answer is delivered next* but not *which real call
+has completed*, because that is the kernel's. A worker parked on two OS-backed tickets — one of which
+cannot complete until something else is unblocked — is indistinguishable from one that is merely slow. So
+the JavaScript mode can improve reproducibility and cannot guarantee it.
+
+Wacland is where that boundary moves, because the runtime owns the ticket table, the threads and the
+clock. Two consequences for the design of items 3 and 4:
+
+- **the ticket table should be able to answer "who is runnable?" without asking the operating system.**
+  Completion is recorded by the runtime's own threads, so it already knows; the seam is making that
+  queryable and making delivery order a policy rather than an accident.
+- **`waitAny` should take its choice from that policy** when more than one ticket is ready. The protocol
+  permits returning either, and in a deterministic mode the choice has to be the scheduler's rather than
+  whichever thread happened to finish first.
+
+Neither is extra machinery — it is where the machinery is put. Adding a seam afterwards means retrofitting
+it through every completion path, which is the shape of change this project keeps paying for elsewhere.
