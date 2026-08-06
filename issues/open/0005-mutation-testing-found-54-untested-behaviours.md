@@ -506,3 +506,26 @@ So they are recorded in `tools/mutate/known.ts` with the argument, not deleted. 
 `n`; the fallback is bounded by whatever happens to be in the slot. Those agree only because nothing ever
 un-writes one — add a `pop` that leaves the old value in place and the guard becomes the only thing still
 correct. `deno task mutate --operators --package json` now exits 0.
+
+## `bignum` and `wactest`, and one of the three was dead code — agent-a, 2026-08-06
+
+**`bignum`: 13/14, one documented.** Two guards, and they are not the same case, which is the point:
+
+- `divSmall`'s zero check was a **real gap**. Delete it and `0 /small 0` returns the answer `0` instead
+  of trapping, because the early return for a zero dividend sits *below* the guard. Nothing asked: the
+  random comparison against BigInt explicitly skips a zero divisor, and the division-by-zero test only
+  drove the general path. `arith.test.ts` now drives `/`, `/small` and `%small` over 0, 1, -1 and 2^200,
+  and checks BigInt throws for the same inputs — the contract being matched. Without the guard it fails
+  with `0 /small 0 did not trap`.
+- `divmod`'s is **redundant**, and measured rather than argued: with it deleted, all 42 of the package's
+  tests pass, because an empty divisor sends Knuth's algorithm to read `b.limbs[-1]` and that traps too.
+  Recorded in `known.ts`. It stays in the source because it fails at the top of the function with the
+  divisor in hand rather than several allocations deep.
+
+**`wactest`: 2/2, by deleting the mutant's subject.** `extreme/wactest/assert/utoa` survived because
+`utoa` has no callers — `eqU32` prints through `utoa64(got as u64)`. It is not exported, so
+`tools/deadexports.ts` never saw it: that check reads exports, and this is a private function nothing
+calls. Deleted.
+
+That last one is worth generalising. **A surviving mutant on a private function is a dead-code report**,
+and it is the only one this repo currently produces — `deadexports` cannot see inside a file.

@@ -273,15 +273,38 @@ Deno.test("arith: truncated division matches BigInt on every sign", () => {
   }
 });
 
-Deno.test("arith: division by zero traps", () => {
+Deno.test("arith: division by zero traps, on both the general and the single-limb path", () => {
+  // BigInt throws RangeError; a wac program has no exceptions, so trapping is the equivalent — what
+  // matters is that neither returns an answer. Both paths, because they are separate code: `divSmall`
+  // has its own zero check and was reached by nothing here. The random comparison above deliberately
+  // skips `mu === 0n`, so this is the only place the single-limb zero is asked about at all, and until
+  // it was added, deleting `divSmall`'s guard changed `0 /small 0` from a trap into the answer `0`
+  // and no test noticed. wac-mono 0005.
+  const calls: [string, (x: bigint) => unknown][] = [
+    ["/", (x) => mod.opDiv(b(x), b(0n))],
+    ["/small", (x) => mod.opDivSmall(b(x), 0)],
+    ["%small", (x) => mod.opRemSmall(b(x), 0)],
+  ];
   for (const x of [0n, 1n, -1n, 1n << 200n]) {
-    let trapped = false;
-    try {
-      mod.opDiv(b(x), b(0n));
-    } catch {
-      trapped = true;
+    // The zero dividend is the case that separates the guard from the trap underneath it: with the
+    // guard gone, `0 / 0` takes an early return rather than reaching whatever would fault.
+    for (const [what, call] of calls) {
+      let trapped = false;
+      try {
+        call(x);
+      } catch {
+        trapped = true;
+      }
+      if (!trapped) throw new Error(`${x} ${what} 0 did not trap`);
+      // And BigInt agrees that this has no answer, which is the contract being matched.
+      let threw = false;
+      try {
+        void (x / 0n);
+      } catch {
+        threw = true;
+      }
+      if (!threw) throw new Error(`BigInt did not throw for ${x} / 0 — the oracle has changed`);
     }
-    if (!trapped) throw new Error(`${x} / 0 did not trap`);
   }
 });
 

@@ -314,6 +314,20 @@ export const KNOWN_SURVIVORS: KnownSurvivor[] = [
       "and that is exactly the change somebody adds without reading this accessor. wac-mono 0005.",
   },
   {
+    name: "guard/bignum/big:354:19",
+    why:
+      "`divmod`'s division-by-zero trap. Removing it does not produce an answer: an empty divisor sends " +
+      "Knuth's algorithm D to normalise `b.limbs[b.n - 1]`, which is `limbs[-1]` and a WasmGC bounds " +
+      "trap. Measured rather than argued — with the guard deleted, all 42 of `packages/bignum`'s tests " +
+      "pass, including `arith: division by zero traps` over 0, 1, -1 and 2^200. What no host can " +
+      "distinguish is *which* instruction trapped, and pinning the trap's message would be a test of " +
+      "the compiler rather than of this code. The guard stays because it fails at the top of the " +
+      "function with the divisor in hand rather than several allocations deep. " +
+      "Its sibling in `divSmall` is *not* here: that one was a real gap, since without it `0 /small 0` " +
+      "returns zero instead of trapping, and `arith.test.ts` now covers the single-limb path. " +
+      "wac-mono 0005.",
+  },
+  {
     name: "guard/json/value:153:37",
     why: "`JsonObject.at`'s copy of the guard above. Same two routes, same fixture pair " +
       "(`objectPastEnd`, `objectNegative`), same argument.",
