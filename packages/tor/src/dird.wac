@@ -30,6 +30,7 @@ import { Buf } from "../../bytes/src/buf.wac";
 import { Parsed, parseRequest } from "../../http/src/request.wac";
 import { DirDocuments, dirResponse, dirSourceFingerprint } from "./dirserve.wac";
 import { rsaDescriptorDigest } from "./routerdesc.wac";
+import { microdescDigests } from "./microdesc.wac";
 
 const i32 DEFAULT_PORT = 7000;
 const i32 MAX_REQUEST = 8192;
@@ -80,8 +81,27 @@ export i32 main(Core core, Cli cli) {
     return 1;
   }
 
-  DirDocuments docs = DirDocuments(consensus, u8[0](), certificate, descriptors, digests,
-                                   fingerprint);
+  // The microdesc flavour, when it is sitting next to the consensus file. Named by convention rather
+  // than by a flag so the caller has one fewer thing to keep in step: `<consensus>.micro` and
+  // `<consensus>.mds` are what `gendesc` writes, and an authority that has them serves them.
+  u8[] microCons = u8[0]();
+  u8[] micros = u8[0]();
+  u8[][] microDigests = u8[][0]();
+  {
+    string base = string.fromBytes(cli.arg(0).wait());
+    FileResult mc = cli.readFile(base + ".micro").wait();
+    FileResult md = cli.readFile(base + ".mds").wait();
+    if (mc.ok && md.ok) {
+      microCons = mc.bytes;
+      micros = md.bytes;
+      microDigests = microdescDigests(micros);
+      core.log("dird: serving the microdesc flavour and " + itoa(microDigests.len()) +
+               " microdescriptor(s)");
+    }
+  }
+
+  DirDocuments docs = DirDocuments(consensus, microCons, certificate, descriptors, digests,
+                                   fingerprint, micros, microDigests);
 
   Socket listener = cli.listen("127.0.0.1", port).wait();
   if (listener.handle < 0) {

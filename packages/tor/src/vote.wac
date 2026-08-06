@@ -83,6 +83,22 @@ u8[] head(u8[] document, i32 n) {
  * Insertion sort: a vote holds thousands of entries at most, and this runs once per vote.
  */
 export u8[][] sortedStatusEntries(u8[][] descriptors) {
+  u8[][] order = sortedDescriptors(descriptors);
+  u8[][] lines = u8[][order.len()]();
+  for (i32 i = 0; i < order.len(); i++) { lines[i] = routerStatusLine(order[i]); }
+  return lines;
+}
+
+/**
+ * The descriptors in the order their status entries appear, without formatting them.
+ *
+ * Split out because a consensus comes in flavours whose `r` lines differ — the microdesc flavour omits
+ * the descriptor digest — while the *order* is the same for all of them. A caller that needs a
+ * different line still needs this ordering, and re-deriving which opinion produced a formatted line by
+ * comparing the formatted lines back (which is what the consensus generator used to do) stops working
+ * the moment there is more than one way to format them.
+ */
+export u8[][] sortedDescriptors(u8[][] descriptors) {
   i32 n = descriptors.len();
   u8[][] order = u8[][n]();
   for (i32 i = 0; i < n; i++) { order[i] = descriptors[i]; }
@@ -97,10 +113,7 @@ export u8[][] sortedStatusEntries(u8[][] descriptors) {
     }
     order[j + 1] = held;
   }
-
-  u8[][] lines = u8[][n]();
-  for (i32 i = 0; i < n; i++) { lines[i] = routerStatusLine(order[i]); }
-  return lines;
+  return order;
 }
 
 /** Lexicographic byte comparison: negative, zero or positive. Shorter sorts first when it is a prefix. */

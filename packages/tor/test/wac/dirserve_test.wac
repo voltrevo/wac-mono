@@ -3,6 +3,7 @@
 import { T } from "../../../wactest/src/assert.wac";
 import { DirDocuments, dirRoute, dirResponse, stripDotZ } from "../../src/dirserve.wac";
 import { encodeUpper } from "../../../codec/src/hex.wac";
+import { b64Unpadded } from "../../src/routerdesc.wac";
 
 const i32 D_CONSENSUS = 0;
 const i32 D_CERT = 1;
@@ -16,7 +17,7 @@ DirDocuments docsFrom(fn[u8[](i32, u8[], u8[])] ref) {
   return DirDocuments(
     ref(D_CONSENSUS, none(), none()), u8[0](), ref(D_CERT, none(), none()),
     ref(D_DESCRIPTOR, none(), none()), oneDigest(ref(D_DESC_DIGEST, none(), none())),
-    ref(D_FINGERPRINT, none(), none()));
+    ref(D_FINGERPRINT, none(), none()), u8[0](), u8[][0]());
 }
 
 string hexOf(u8[] b) { return string.fromBytes(encodeUpper(b)); }
@@ -71,6 +72,81 @@ export string test_the_targets_a_bootstrapping_tor_builds(fn[u8[](i32, u8[], u8[
   t.eqI32(dirRoute("/tor/robots.txt".toBytes(), docs).status, 404, "anything else is a 404");
   t.eqI32(dirRoute("/".toBytes(), docs).status, 404, "including the root");
   return t.report();
+}
+
+/**
+ * Microdescriptors, whose path is batched with a hyphen rather than a `+`.
+ *
+ * The separator is the point. A microdescriptor digest is base64, in which `+` is a data character —
+ * so splitting the list on `+` cuts digests in half, and a cache that did so would answer 404 for
+ * every batch containing one. That is a failure a client reports only as having no usable relays.
+ */
+export string test_microdescriptors_are_batched_with_a_hyphen(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+
+  // Two digests, one of them deliberately containing a `+` — which real ones do, roughly half the
+  // time, and which a fixture chosen from a small sample can easily fail to include.
+  u8[] withPlus = u8[32]();
+  for (i32 i = 0; i < 32; i++) { withPlus[i] = (i * 7 + 251) & 0xFF; }
+  u8[] other = u8[32]();
+  for (i32 i = 0; i < 32; i++) { other[i] = (i * 13 + 5) & 0xFF; }
+  string a = b64Unpadded(withPlus);
+  string b = b64Unpadded(other);
+  t.isTrue(hasPlus(a), "the fixture digest really does contain a + character");
+
+  u8[] body = "onion-key\nfake\n".toBytes();
+  u8[][] two = u8[][2]();
+  two[0] = withPlus;
+  two[1] = other;
+  DirDocuments docs = DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](), body, two);
+
+  t.eqI32(dirRoute(("/tor/micro/d/" + a).toBytes(), docs).status, 200,
+          "a single digest containing a + is served");
+  t.eqI32(dirRoute(("/tor/micro/d/" + a + "-" + b).toBytes(), docs).status, 200,
+          "and a hyphen-separated batch of two");
+  t.eqI32(dirRoute(("/tor/micro/d/" + b + "-" + a + ".z").toBytes(), docs).status, 200,
+          "with the compression suffix, in either order");
+  t.eqBytes(dirRoute(("/tor/micro/d/" + a).toBytes(), docs).body, body,
+            "the body is the microdescriptors");
+
+  // The failure this route is shaped to avoid: were the list split on `+`, the digest containing one
+  // would be cut into two fragments and match nothing.
+  t.eqI32(dirRoute(("/tor/micro/d/" + a + "+" + b).toBytes(), docs).status, 404,
+          "a + is not a separator here, so the whole string names no digest we hold");
+
+  t.eqI32(dirRoute("/tor/micro/d/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".toBytes(),
+                   docs).status, 404, "an unknown digest is a 404");
+
+  // Case matters here and does not on the hex path, which is the kind of difference that gets copied
+  // away by accident. `a` and `A` are different base64 digits, so folding case would make a request
+  // for one digest match a different one — served confidently, and wrong.
+  t.eqI32(dirRoute(("/tor/micro/d/" + swapCase(a)).toBytes(), docs).status, 404,
+          "the same digest with its case swapped is a different digest");
+
+  // And with nothing to serve, the route is a 404 rather than an empty 200 — a client reading an
+  // empty body as a valid response would discard the relays it just verified.
+  DirDocuments bare = DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](),
+                                   u8[0](), u8[][0]());
+  t.eqI32(dirRoute(("/tor/micro/d/" + a).toBytes(), bare).status, 404,
+          "a cache holding no microdescriptors says so");
+  return t.report();
+}
+
+string swapCase(string s) {
+  u8[] b = s.toBytes();
+  u8[] out = u8[b.len()]();
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 c = b[i];
+    if (c >= 65 && c <= 90) { c = c + 32; } else if (c >= 97 && c <= 122) { c = c - 32; }
+    out[i] = c;
+  }
+  return string.fromBytes(out);
+}
+
+bool hasPlus(string s) {
+  u8[] b = s.toBytes();
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == 43) { return true; } }
+  return false;
 }
 
 export string test_the_compression_suffix_is_a_request_not_a_name(fn[u8[](i32, u8[], u8[])] ref) {

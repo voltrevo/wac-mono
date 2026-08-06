@@ -48,6 +48,7 @@ import { Read } from "../../bytes/src/read.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Parsed, parseRequest } from "../../http/src/request.wac";
 import { DirDocuments, dirResponse, dirSourceFingerprint } from "./dirserve.wac";
+import { microdescDigests } from "./microdesc.wac";
 import {
   Link, chunkRequest, connectRelay, feedLink, handshakeTls, itoa, linkHandshake, pump, sendCells,
   takeCell,
@@ -260,6 +261,8 @@ export i32 main(Core core, Cli cli) {
   string descriptorOut = "";
   string nickname = "wacrelay";
   string consensusPath = "";
+  string microConsensusPath = "";
+  string microdescPath = "";
   string certPath = "";
   string[] descPaths = string[0]();
   i32 argc = cli.argCount().wait();
@@ -283,6 +286,12 @@ export i32 main(Core core, Cli cli) {
     } else if (a == "-K" && i + 1 < argc) {
       certPath = string.fromBytes(cli.arg(i + 1).wait());
       i = i + 1;
+    } else if (a == "-M" && i + 1 < argc) {
+      microConsensusPath = string.fromBytes(cli.arg(i + 1).wait());
+      i = i + 1;
+    } else if (a == "-m" && i + 1 < argc) {
+      microdescPath = string.fromBytes(cli.arg(i + 1).wait());
+      i = i + 1;
     } else if (a == "-D" && i + 1 < argc) {
       descPaths = pushString(descPaths, string.fromBytes(cli.arg(i + 1).wait()));
       i = i + 1;
@@ -292,7 +301,8 @@ export i32 main(Core core, Cli cli) {
   }
   if (seedPath == "") {
     core.warn("usage: relayd <seed-file> [-p port] [-a address] [-n nickname] " +
-              "[--descriptor path] [-C consensus -K certificate] [-D descriptor]...");
+              "[--descriptor path] [-C consensus -K certificate] [-D descriptor]... " +
+              "[-M microdesc-consensus -m microdescriptors]");
     return 1;
   }
 
@@ -345,7 +355,8 @@ export i32 main(Core core, Cli cli) {
   // it knows for them — there is no flag that stops it asking, so a relay that cannot answer leaves the
   // client stuck with a consensus it cannot check. Only the consensus and the certificate are served:
   // those are what it asks for at this stage, and `dirserve.wac` answers 404 for what we do not hold.
-  DirDocuments docs = DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0]());
+  DirDocuments docs = DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](),
+                                   u8[0](), u8[][0]());
   bool hasDir = false;
   if (consensusPath != "" && certPath != "") {
     FileResult cf = cli.readFile(consensusPath).wait();
@@ -368,11 +379,34 @@ export i32 main(Core core, Cli cli) {
       descriptors = joinBytes(descriptors, df.bytes);
       digests[di] = rsaDescriptorDigest(df.bytes);
     }
-    docs = DirDocuments(cf.bytes, u8[0](), kf.bytes, descriptors, digests,
-                        dirSourceFingerprint(cf.bytes));
+    // The microdesc flavour and the microdescriptors, when given. A client of this package asks for
+    // those and nothing else, so a relay serving only the ns flavour is one our own client cannot
+    // bootstrap from — which is how this gap survived four rounds of C tor interop.
+    //
+    // The `m` digests are computed here rather than passed in, exactly as a real cache does: it stores
+    // microdescriptors keyed by their own digest, so the key and the document cannot disagree.
+    u8[] microCons = u8[0]();
+    u8[] micros = u8[0]();
+    u8[][] microDigests = u8[][0]();
+    if (microConsensusPath != "" && microdescPath != "") {
+      FileResult mcf = cli.readFile(microConsensusPath).wait();
+      FileResult mdf = cli.readFile(microdescPath).wait();
+      if (!mcf.ok || !mdf.ok) {
+        core.warn("relayd: could not read the microdesc documents to serve");
+        return 1;
+      }
+      microCons = mcf.bytes;
+      micros = mdf.bytes;
+      microDigests = microdescDigests(micros);
+    }
+
+    docs = DirDocuments(cf.bytes, microCons, kf.bytes, descriptors, digests,
+                        dirSourceFingerprint(cf.bytes), micros, microDigests);
     hasDir = true;
     core.log("relayd: serving the consensus, certificate and " + itoa(descPaths.len()) +
-             " descriptor(s) over BEGIN_DIR");
+             " descriptor(s) over BEGIN_DIR" +
+             (micros.len() == 0 ? ""
+                                : ", plus " + itoa(microDigests.len()) + " microdescriptor(s)"));
   }
 
   u8[] certs = identityCerts(id, now);

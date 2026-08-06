@@ -671,3 +671,165 @@ check in `run25.sh` is now fatal and named — a control fetch that must succeed
 a preflight that refuses to run while the last run's ports are held, an explicit "NEVER BOOTSTRAPPED"
 line, and a readiness loop that reports what it saw instead of expiring in silence. The `bc` one had
 been silently failing since the script was written; making the check fatal is what surfaced it.
+
+### Microdescriptors, and the flavour our own client had always asked for
+
+Step 5 wants a network with no C in it: our client, through three of our relays. It was blocked by
+something neither half could see on its own. `dirclient.wac` fetches
+`/tor/status-vote/current/consensus-microdesc` and then microdescriptors by each entry's `m` digest;
+the authority produced only the **ns** flavour and answered that path with a 404. So **no client in
+this package could bootstrap from an authority in this package** — two halves each validated against C
+tor and never against each other, which is exactly what D1 is about, arrived at from the opposite
+direction to the `linkHandshake` case.
+
+Every live run until now hid it behind `UseMicrodescriptors 0` in the probe's torrc. That line began
+as a measurement — "does the ns path complete?" — and quietly became a crutch holding up a network
+that could only ever serve a C tor.
+
+What was added: `src/microdesc.wac` (the document, its digest, and splitting a concatenated response
+back apart), the microdesc consensus flavour in `consensusgen.wac`, the `/tor/micro/d/` route in
+`dirserve.wac`, and `-M`/`-m` on `relayd` with `<consensus>.micro`/`.mds` beside the consensus for
+`dird`.
+
+Measured, with the crutch removed — the torrc has no `UseMicrodescriptors` line at all:
+
+    Received answer to microdescriptor request (status 200, body size 1176) from server 127.0.0.1:5557
+    A consensus needs 1 good signatures … This microdesc one has 1 (wacauth).
+    Bootstrapped 100% (done)
+
+**Read the order, not the last line.** tor logs `We need more microdescriptors: we have 0/3` until they
+arrive, and both of those lines sit *above* the answer in the log. Grepping for the last one said 0/3
+and I read it as a failure; what settles it is that the last shortfall is at line 265, the answer at
+271, and `enough_dirinfo` at 274 — a state tor does not reach without accepting them. The run script
+now prints those line numbers rather than a count, because the count was the misleading part.
+
+### A microdescriptor's verdict is its digest
+
+`tools/microdesc-probe.c` puts a document through tor's own `microdescs_parse_from_string`. Corrupting
+it, the way the other probes were exercised:
+
+| mutation | verdict | digest |
+|---|---|---|
+| unmodified | ACCEPTED | `Xkm7p1…` |
+| the `onion-key` keyword damaged | REJECTED | — |
+| the `id` line removed | ACCEPTED | `gNEkkd…` |
+| one character of the ntor key | ACCEPTED | `TWTjPz…` |
+| one byte of the RSA key | ACCEPTED | `9PsLZ9…` |
+| the lines reordered | ACCEPTED | `wePWVc…` |
+| the trailing newline dropped | ACCEPTED | `p+VzFA…` |
+
+So ACCEPTED means *structurally parseable* and nothing else — weaker even than a consensus's, which at
+least checks digests. Everything that distinguishes a right microdescriptor from a wrong one lives in
+the digest, and the consensus's `m` line is what commits to it. A client that computes a different one
+discards the document and reports only that it has no usable relays. The tests pin the digest; the
+verdict is the weaker second thing.
+
+Two details worth keeping, both of which parse either way and hash differently:
+
+  - **The `m` line comes before the `s` line**, not after it.
+  - **`p` is omitted entirely when the summary is `reject 1-65535`**, rather than written out.
+
+And one that is not about digests at all: **`/tor/micro/d/` batches with a hyphen, not a `+`.** Every
+other batched path in the protocol uses `+`, and `+` is a *data* character in base64 — so a route that
+split on it would cut roughly half of all digests in two and answer 404 for the batch. Case matters
+there too, where the hex paths fold it.
+
+Faults planted after the tests went green, and the result of each: writing `p` unconditionally,
+reversing tor's line order, dropping the trailing newline, misspelling the `ntor-onion-key` keyword,
+and digesting the wrong bytes — all caught. Splitting the microdesc path on `+`, and serving
+microdescriptors for a request naming none of them — caught. **Case-folding the base64 comparison
+survived**, because no test asked for a digest with its case changed; an assertion for it was added
+and the same fault is caught now.
+
+### A network with no C in it
+
+Step 5's *done* condition: "the suite stands up a network with no C in it and a client fetches through
+three of our relays." The condition is met. The deliverable it belongs to is not yet — see below.
+
+Nothing in this run is C tor. Our `gendesc` produced the documents, our `dird` served them, three of
+our `relayd` carried the traffic, and our `socks.wac` was the client:
+
+    control: direct fetch gave 4004 bytes
+    consensus verified: 1 of 1 authorities signed
+    guard: wacrelay3
+    building circuit 0 for port 8088
+    circuit 0 for port 8088: wacrelay3 -> wacrelay -> wacrelay2
+    stream 1 -> 192.168.80.2:8088 on circuit 0
+    stream 1 ended: done
+    fetch attempt 1 exit 0 bytes 4004
+    BODY: identical to the file the server holds
+
+and on the exit relay's side, `stream … open to 192.168.80.2:8088`.
+
+Every seam in that path has our code on **both** sides — our TLS client against our TLS server, our
+link initiator against our link responder, our consensus reader against our consensus writer, our
+microdescriptor reader against our writer, our `RELAY_BEGIN` against our exit. That is exactly the
+arrangement D1 says proves the least, and it is why this is reported next to the C tor run rather than
+instead of it: the same code reached `Bootstrapped 100% (done)` with tor 0.4.7.13 on the other side of
+the directory, and carried a stream for it. Two mutually-blind witnesses to the same path.
+
+Worth keeping from the way this arrived: `app.wac` was tried first and answered
+`the directory answered 404`. That was not a bug — `app.wac` fetches *directory* paths over
+`BEGIN_DIR`, which is what its header says, and 404 is the correct answer for `/probe.txt`. It had
+already proved the interesting half by then (`consensus verified`, `circuit built, 3 hops`), and the
+program that opens an ordinary stream is `socks.wac`. Reading the failure as the client being broken
+would have cost an hour looking at working code.
+
+**What is still owed for step 5.** The step asks for a *launcher* — "bring up a mixed network from a
+description, wait for bootstrap, run something across it, tear it down" — and what stood this network
+up is a shell script in a scratch directory, not a program in this repo, and not something the suite
+runs. The condition is evidence that the launcher has something to launch; it is not the launcher.
+
+### The launcher
+
+`src/network.wac`. A description names each server, **the line it prints when it is genuinely
+listening**, and the work to run once they are all up; the launcher spawns them all at once, waits on
+every one of their output streams through a single `waitAny`, runs the work, and stops everything.
+
+The specification came from the scripts it replaces. Every one of their failures was a stage assumed
+rather than observed, so: a node is waited for by marker and never slept on; a node that does not
+announce itself fails the run **by name**, and the work does not run; the work's exit code is the
+run's, so a network that came up and a fetch that failed cannot read as success; and a description
+that asks for nothing to be run is a failure rather than a quiet zero.
+
+Controls, because a launcher that always says ok is worse than none. Four networks broken on purpose:
+
+| what was broken | what it said |
+|---|---|
+| a relay's ready marker names a port it will never listen on | `relay2 never said "listening on 127.0.0.1:9999"` |
+| the client trusts an authority that signed nothing | `network: failed with 1` |
+| a node's bundle is not on disk | `authority: nosuch.worker.js: No such file or directory` |
+| no nodes at all | `the description has no nodes, so there is no network to run across` |
+
+Six faults planted in the launcher after its tests went green — treating "started" as "up", ignoring
+the work's exit code, running the work anyway when a node never came up, calling a description with no
+work a success, swallowing a missing bundle, and matching the ready marker against only the latest
+read — all caught. A seventh, merging the child's two streams onto stdout, was caught after the
+assertion for it was added; see below.
+
+**Two stream bugs, one at each level, found by looking at the output rather than the exit code.** The
+launcher's own progress went to stdout, so `network net.txt > doc` produced a document with
+`network: ok` in the middle of it; and `runOnce` forwarded both of a child's streams to stdout, so the
+client's `consensus verified` and `path:` lines landed in the fetched document too. Both are the same
+mistake — a program mixing what it says about itself with what it was asked to produce — and neither
+shows up in an exit code. Fixed at both levels, and `app.wac`/`bootstrap.wac` had it too.
+
+The payoff is a much stronger end-to-end assertion than "the fetch succeeded": **stdout is now
+byte-identical to the microdesc consensus the authority holds**, having come back through a three-hop
+circuit. `cmp` is the whole check.
+
+    network: all 4 nodes are up
+    consensus verified: 1 of 1 authorities signed
+    path: wacrelay2 -> wacrelay -> wacrelay3
+    circuit built, 3 hops
+    network: ok
+
+about a second, on a quiet machine.
+
+**Two things it does not do, both stated rather than discovered.** It cannot start a C tor: `Cli.spawn`
+takes a worker bundle and this world deliberately has no capability for running an arbitrary binary,
+so "a mixed network" in this document's sense needs a platform change and the C tor half of the
+interop matrix stays a shell script. And **the suite does not stand up a Tor network with it** — the
+ports a relay listens on are baked into its signed descriptor, so two agents running the suite at once
+would collide on 5555. `test/network.test.ts` tests the launcher against `example/waiter.wac`, which
+is the right subject anyway: it knows about processes and ready markers, not about Tor.

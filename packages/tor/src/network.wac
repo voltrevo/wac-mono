@@ -1,0 +1,454 @@
+// Stand up a Tor network from a description, run something across it, and take it down.
+//
+//   network <description-file>
+//
+// Design 0002 step 5 — "our own chutney". What it replaces is a series of shell scripts, and the way
+// those failed is the whole specification for this program. Four consecutive runs produced confident
+// numbers about the relays while actually measuring: a port the previous run still held, a log the
+// previous run had appended to, the previous run's processes still listening, and a proxy error page.
+// None of them said so. So every check here is fatal and named, and the only success this can report
+// is one where each stage was seen to happen.
+//
+// ## The description
+//
+// One directive per line, fields separated by `|` because paths and arguments contain spaces and
+// never that. Blank lines and `#` comments are skipped.
+//
+//     # name    | the line that means it is up | the program and its arguments
+//     node relay1 | listening on 127.0.0.1:5555 | relayd.worker.js relay.seed -p 5555 -n wacrelay
+//     node relay2 | listening on 127.0.0.1:5557 | relayd.worker.js r2.seed -p 5557 -n wacrelay2
+//     run  fetch  |                             | torapp.worker.js seed.txt auth.txt /tor/…
+//
+//   - **`node`** is a server: started, waited for, kept running, and stopped at the end. Its ready
+//     marker is a substring of a line it prints when it is actually listening — not a sleep. Every
+//     bug in the scripts this replaces came from guessing that a process was up.
+//   - **`run`** is the thing done across the network, started once every node is ready. Its exit code
+//     is this program's exit code, so a launcher that stood the network up and then quietly failed the
+//     fetch cannot report success.
+//
+// ## Progress goes to the error channel
+//
+// Everything this program says about itself is a `warn`, and stdout carries only what the work wrote.
+// That is what makes `network fetch.txt > consensus.txt` give the document rather than the document
+// with "network: ok" in the middle of it — which is what the first run of this produced, and what a
+// launcher whose chatter shares a stream with its payload always produces.
+//
+// ## Why the nodes start together
+//
+// Every node is spawned first and then all of them are waited on through one `waitAny`, rather than
+// each being started and awaited in turn. Three relays derive RSA identities in parallel that way
+// instead of one after another — but the real reason is that relays *need* each other: a relay that
+// answers a directory request during another's startup would deadlock a sequential launcher, and the
+// deadlock would look like a slow relay.
+//
+// ## What this cannot do, and why it is not an oversight
+//
+// **It cannot start a C tor.** `Cli.spawn` takes a worker bundle — JavaScript that speaks the bridge
+// protocol — and there is deliberately no capability in this world for running an arbitrary binary;
+// `spawn`'s own documentation is explicit that it is a composition primitive and not a way to inherit
+// the operating system's authority. So "a mixed network" in design 0002's sense is out of reach from
+// here, and the C tor half of the interop matrix stays a shell script until the platform grows a way
+// to start a process. That is a real limitation of this program and worth stating rather than
+// discovering: what it does cover is a network with no C in it, which is exactly step 5's condition.
+
+import {
+  Child, Cli, Core, FileResult, GRANT_NET, GRANT_READ, GRANT_WRITE, Pending,
+} from "../../platform/src/platform.wac";
+import { Read } from "../../bytes/src/read.wac";
+import { Buf } from "../../bytes/src/buf.wac";
+import { itoa } from "../../fmt/src/itoa.wac";
+
+/**
+ * How long a node has to announce itself before the run is abandoned.
+ *
+ * Two minutes because a relay derives an RSA identity at startup and a busy machine makes that slow;
+ * a default that assumed a quiet one would turn load into a failure. A description that expects to
+ * fail — the control runs, which stand a network up deliberately broken — says `timeout 5000` and
+ * gets its answer in seconds instead.
+ */
+const i32 READY_TIMEOUT_MS = 120000;
+
+/** How long the thing run across the network has to finish. */
+const i32 RUN_TIMEOUT_MS = 180000;
+
+/** A line from the description: a server to bring up, or the work to do once they are all up. */
+struct Directive {
+  bool isNode;
+  string name;
+  string ready;
+  string bundle;
+  u8[][] args;
+}
+
+/** A started node, and what it has said so far. */
+struct Node {
+  string name;
+  string ready;
+  i32 handle;
+  i32 errHandle;
+  bool up;
+  /** Everything it has written, kept because the marker may be split across two reads. */
+  Buf said;
+  Pending<Read> fromOut;
+  Pending<Read> fromErr;
+}
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount().wait() < 1) {
+    core.warn("usage: network <description-file>");
+    return 2;
+  }
+  string path = string.fromBytes(cli.arg(0).wait());
+  FileResult f = cli.readFile(path).wait();
+  if (!f.ok) {
+    core.warn("network: " + path + ": " + f.error);
+    return 1;
+  }
+
+  i32 readyTimeout = timeoutIn(f.bytes);
+  Directive?[] plan = parsePlan(f.bytes);
+  if (plan.len() == 0) {
+    core.warn("network: " + path + " describes nothing to run");
+    return 1;
+  }
+
+  i32 nodeCount = 0;
+  for (i32 i = 0; i < plan.len(); i++) { if (plan[i]!.isNode) { nodeCount = nodeCount + 1; } }
+  if (nodeCount == 0) {
+    core.warn("network: the description has no nodes, so there is no network to run across");
+    return 1;
+  }
+
+  // Start them all before waiting on any, so their startups overlap and none can be blocked waiting
+  // for a peer that has not been launched yet.
+  Node?[] nodes = Node?[nodeCount]();
+  i32 live = 0;
+  for (i32 i = 0; i < plan.len(); i++) {
+    if (!plan[i]!.isNode) { continue; }
+    Node? started = startNode(core, cli, plan[i]!);
+    if (started is null) {
+      stopAll(cli, nodes, live);
+      return 1;
+    }
+    nodes[live] = started!;
+    live = live + 1;
+    core.warn("network: started " + plan[i]!.name);
+  }
+
+  if (!awaitReady(core, cli, nodes, live, readyTimeout)) {
+    stopAll(cli, nodes, live);
+    return 1;
+  }
+  core.warn("network: all " + itoa(live) + " nodes are up");
+
+  // Now the work. Its exit code is the verdict, so a network that came up and a fetch that failed is
+  // reported as a failure rather than as "the network came up".
+  i32 code = 0;
+  bool ranSomething = false;
+  for (i32 i = 0; i < plan.len(); i++) {
+    if (plan[i]!.isNode) { continue; }
+    ranSomething = true;
+    i32 one = runOnce(core, cli, plan[i]!);
+    if (one != 0) { code = one; }
+  }
+  if (!ranSomething) {
+    core.warn("network: every node came up and the description asks for nothing to be run");
+    code = 1;
+  }
+
+  stopAll(cli, nodes, live);
+  core.warn("network: " + (code == 0 ? "ok" : "failed with " + itoa(code)));
+  return code;
+}
+
+/**
+ * Spawn one node.
+ *
+ * The grants are read, write and net: a relay reads its seed and the documents, writes a descriptor
+ * when asked to, and listens. They are a ceiling of this program's own — the host intersects them —
+ * so a launcher built without `--allow-net` hands out no network however this reads.
+ */
+Node? startNode(Core core, Cli cli, Directive d) {
+  FileResult prog = cli.readFile(d.bundle).wait();
+  if (!prog.ok) {
+    core.warn("network: " + d.name + ": " + d.bundle + ": " + prog.error);
+    return null;
+  }
+  Child kid = cli.spawn(string.fromBytes(prog.bytes), d.args,
+                        GRANT_READ | GRANT_WRITE | GRANT_NET, "", false).wait();
+  if (kid.handle < 0) {
+    core.warn("network: " + d.name + ": " + kid.error);
+    return null;
+  }
+  return Node(d.name, d.ready, kid.handle, kid.errHandle, false, Buf.create(),
+              cli.recv(kid.handle), cli.recv(kid.errHandle));
+}
+
+/**
+ * Wait until every node has printed its marker, or say which one did not.
+ *
+ * Both streams are watched. A program's own idea of which channel a startup line belongs on is not
+ * something a launcher should have to know — `relayd` logs to one and warns to the other, and a
+ * marker that only ever appeared on the unwatched one would look exactly like a node that never
+ * started.
+ */
+bool awaitReady(Core core, Cli cli, Node?[] nodes, i32 live, i32 readyTimeout) {
+  i32 ready = 0;
+  for (i32 i = 0; i < live; i++) {
+    if (nodes[i]!.ready == "") { nodes[i]!.up = true; ready = ready + 1; }
+  }
+
+  while (ready < live) {
+    // Two ids per node that is still starting: nothing is gained by watching one that is already up,
+    // and its output would only accumulate.
+    i32 n = 0;
+    for (i32 i = 0; i < live; i++) { if (!nodes[i]!.up) { n = n + 2; } }
+    i32[] ids = i32[n]();
+    i32[] owner = i32[n]();
+    i32 at = 0;
+    for (i32 i = 0; i < live; i++) {
+      if (nodes[i]!.up) { continue; }
+      ids[at] = nodes[i]!.fromOut.id; owner[at] = i; at = at + 1;
+      ids[at] = nodes[i]!.fromErr.id; owner[at] = i; at = at + 1;
+    }
+
+    i32 which = core.waitAny(ids, readyTimeout);
+    if (which < 0) {
+      for (i32 i = 0; i < live; i++) {
+        if (!nodes[i]!.up) {
+          core.warn("network: " + nodes[i]!.name + " never said \"" + nodes[i]!.ready + "\" — " +
+                    "this network did not come up, so nothing run across it would mean anything");
+          core.warn("network: what " + nodes[i]!.name + " did say: " +
+                    string.fromBytes(nodes[i]!.said.bytes()));
+        }
+      }
+      return false;
+    }
+
+    i32 who = owner[which];
+    Node hot = nodes[who]!;
+    bool isErr = which % 2 == 1;
+    bool alive = false;
+    match ((isErr ? hot.fromErr : hot.fromOut).wait()) {
+      case Data(bytes): { hot.said.pushAll(bytes); alive = true; }
+      case End: { }
+      case Failed(why): { core.warn("network: " + hot.name + ": " + why); }
+    }
+    if (isErr) { hot.fromErr = cli.recv(hot.errHandle); } else { hot.fromOut = cli.recv(hot.handle); }
+
+    if (!alive) {
+      // A stream ending is not the node ending — a program may close one and keep the other. It stops
+      // being watched, and the deadline is what catches a node that has gone quiet on both.
+      continue;
+    }
+    if (contains(hot.said.bytes(), hot.ready)) {
+      hot.up = true;
+      ready = ready + 1;
+      core.warn("network: " + hot.name + " is up");
+    }
+  }
+  return true;
+}
+
+/** Run one program to completion, echoing what it writes, and return its exit code. */
+i32 runOnce(Core core, Cli cli, Directive d) {
+  FileResult prog = cli.readFile(d.bundle).wait();
+  if (!prog.ok) {
+    core.warn("network: " + d.name + ": " + d.bundle + ": " + prog.error);
+    return 1;
+  }
+  Child kid = cli.spawn(string.fromBytes(prog.bytes), d.args,
+                        GRANT_READ | GRANT_WRITE | GRANT_NET, "", false).wait();
+  if (kid.handle < 0) {
+    core.warn("network: " + d.name + ": " + kid.error);
+    return 1;
+  }
+  core.warn("network: running " + d.name);
+
+  // Both streams again, and until both are done: a program that writes its answer to one and its
+  // diagnosis to the other should have both reach the log, in the order they arrived.
+  Pending<Read> fromOut = cli.recv(kid.handle);
+  Pending<Read> fromErr = cli.recv(kid.errHandle);
+  bool outOpen = true;
+  bool errOpen = true;
+  while (outOpen || errOpen) {
+    i32 n = (outOpen ? 1 : 0) + (errOpen ? 1 : 0);
+    i32[] ids = i32[n]();
+    i32 at = 0;
+    if (outOpen) { ids[at] = fromOut.id; at = at + 1; }
+    if (errOpen) { ids[at] = fromErr.id; at = at + 1; }
+
+    i32 which = core.waitAny(ids, RUN_TIMEOUT_MS);
+    if (which < 0) {
+      core.warn("network: " + d.name + " did not finish within " + itoa(RUN_TIMEOUT_MS) + "ms");
+      cli.closeSocket(kid.handle);
+      return 1;
+    }
+    bool isErr = outOpen ? which == 1 : true;
+    bool more = false;
+    match ((isErr ? fromErr : fromOut).wait()) {
+      // Each of the child's streams goes to the matching one of ours. Merging them — which this did
+      // at first — puts the child's progress in the middle of its own output, and a caller
+      // redirecting stdout gets a document with commentary in it. A launcher that forwards two
+      // streams has to forward them as two.
+      case Data(bytes): {
+        if (isErr) { cli.writeErr(bytes); } else { cli.write(bytes); }
+        more = true;
+      }
+      case End: { }
+      case Failed(why): { core.warn("network: " + d.name + ": " + why); }
+    }
+    if (isErr) {
+      errOpen = more;
+      if (more) { fromErr = cli.recv(kid.errHandle); }
+    } else {
+      outOpen = more;
+      if (more) { fromOut = cli.recv(kid.handle); }
+    }
+  }
+
+  i32 code = cli.exitCode(kid.handle).wait();
+  cli.closeSocket(kid.handle);
+  if (code != 0) { core.warn("network: " + d.name + " exited " + itoa(code)); }
+  return code < 0 ? 1 : code;
+}
+
+/**
+ * Stop every node that was started.
+ *
+ * Unconditional, and on every exit path including the failed ones. A launcher that leaves its nodes
+ * running holds their ports, and the next run's nodes fail to bind while its fetch quietly succeeds
+ * through the *old* ones — which happened, produced a green result with no evidence behind it, and is
+ * the reason this function is called from four places rather than one.
+ */
+void stopAll(Cli cli, Node?[] nodes, i32 live) {
+  for (i32 i = 0; i < live; i++) { cli.closeSocket(nodes[i]!.handle); }
+}
+
+/** The description, as directives. Malformed lines are skipped and the rest still runs. */
+Directive?[] parsePlan(u8[] text) {
+  u8[][] lines = splitLines(text);
+  i32 count = 0;
+  for (i32 i = 0; i < lines.len(); i++) { if (isDirective(lines[i])) { count = count + 1; } }
+
+  Directive?[] out = Directive?[count]();
+  i32 at = 0;
+  for (i32 i = 0; i < lines.len(); i++) {
+    if (!isDirective(lines[i])) { continue; }
+    u8[][] fields = splitOn(lines[i], 124);            // '|'
+    // `node <name> | <ready> | <bundle> <args...>`, so the first field still carries the keyword.
+    u8[][] head = splitSpaces(trim(fields[0]));
+    string kind = string.fromBytes(head[0]);
+    string name = head.len() > 1 ? string.fromBytes(head[1]) : kind;
+    string ready = fields.len() > 1 ? string.fromBytes(trim(fields[1])) : "";
+    u8[][] words = fields.len() > 2 ? splitSpaces(trim(fields[2])) : u8[][0]();
+    string bundle = words.len() > 0 ? string.fromBytes(words[0]) : "";
+    u8[][] args = u8[][words.len() > 0 ? words.len() - 1 : 0]();
+    for (i32 j = 1; j < words.len(); j++) { args[j - 1] = words[j]; }
+    out[at] = Directive(kind == "node", name, ready, bundle, args);
+    at = at + 1;
+  }
+  return out;
+}
+
+/** A line that is neither blank nor a comment, and names a kind this understands. */
+bool isDirective(u8[] line) {
+  u8[] t = trim(line);
+  if (t.len() == 0 || t[0] == 35) { return false; }    // '#'
+  u8[][] head = splitSpaces(t);
+  if (head.len() == 0) { return false; }
+  string kind = string.fromBytes(head[0]);
+  return kind == "node" || kind == "run";
+}
+
+/**
+ * The `timeout <millis>` a description asks for, or the default.
+ *
+ * Read separately from the directives because it applies to all of them and belongs to no one of
+ * them. A value that does not parse is ignored rather than refused: this decides how long to wait,
+ * and waiting the default is never the wrong answer badly enough to refuse to run.
+ */
+i32 timeoutIn(u8[] text) {
+  u8[][] lines = splitLines(text);
+  for (i32 i = 0; i < lines.len(); i++) {
+    u8[][] words = splitSpaces(trim(lines[i]));
+    if (words.len() < 2) { continue; }
+    if (string.fromBytes(words[0]) != "timeout") { continue; }
+    i32 v = 0;
+    bool ok = true;
+    for (i32 j = 0; j < words[1].len(); j++) {
+      if (words[1][j] < 48 || words[1][j] > 57) { ok = false; break; }
+      v = v * 10 + (words[1][j] - 48);
+    }
+    if (ok && v > 0) { return v; }
+  }
+  return READY_TIMEOUT_MS;
+}
+
+bool contains(u8[] s, string text) {
+  u8[] t = text.toBytes();
+  if (t.len() == 0) { return true; }
+  for (i32 i = 0; i + t.len() <= s.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < t.len(); j++) { if (s[i + j] != t[j]) { hit = false; break; } }
+    if (hit) { return true; }
+  }
+  return false;
+}
+
+u8[][] splitLines(u8[] text) { return splitOn(text, 10); }
+
+/** Split on one byte. Empty pieces are kept, because a missing field is a field. */
+u8[][] splitOn(u8[] s, i32 sep) {
+  i32 count = 1;
+  for (i32 i = 0; i < s.len(); i++) { if (s[i] == sep) { count = count + 1; } }
+  u8[][] out = u8[][count]();
+  i32 n = 0;
+  i32 from = 0;
+  for (i32 i = 0; i <= s.len(); i++) {
+    if (i == s.len() || s[i] == sep) {
+      out[n] = sub(s, from, i);
+      n = n + 1;
+      from = i + 1;
+    }
+  }
+  return out;
+}
+
+/** Split on runs of spaces and tabs, dropping empties — arguments, not fields. */
+u8[][] splitSpaces(u8[] s) {
+  i32 count = 0;
+  i32 i = 0;
+  while (i < s.len()) {
+    while (i < s.len() && (s[i] == 32 || s[i] == 9)) { i = i + 1; }
+    if (i >= s.len()) { break; }
+    count = count + 1;
+    while (i < s.len() && s[i] != 32 && s[i] != 9) { i = i + 1; }
+  }
+  u8[][] out = u8[][count]();
+  i32 n = 0;
+  i = 0;
+  while (i < s.len()) {
+    while (i < s.len() && (s[i] == 32 || s[i] == 9)) { i = i + 1; }
+    if (i >= s.len()) { break; }
+    i32 start = i;
+    while (i < s.len() && s[i] != 32 && s[i] != 9) { i = i + 1; }
+    out[n] = sub(s, start, i);
+    n = n + 1;
+  }
+  return out;
+}
+
+u8[] trim(u8[] s) {
+  i32 from = 0;
+  i32 to = s.len();
+  while (from < to && (s[from] == 32 || s[from] == 9 || s[from] == 13)) { from = from + 1; }
+  while (to > from && (s[to - 1] == 32 || s[to - 1] == 9 || s[to - 1] == 13)) { to = to - 1; }
+  return sub(s, from, to);
+}
+
+u8[] sub(u8[] s, i32 from, i32 to) {
+  u8[] out = u8[to - from]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = s[from + i]; }
+  return out;
+}

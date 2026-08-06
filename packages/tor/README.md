@@ -519,6 +519,44 @@ own TLS link certificate. A relay rotates that certificate every few hours, so o
 its own is permanently somebody else's guest — see `design/0002` D4, which was revised to put
 generation in scope rather than leaning on an openssl fixture.
 
+## Standing a network up — `src/network.wac`
+
+Design 0002 step 5. A description names the servers, the line each prints when it is genuinely
+listening, and the work to run once they are all up:
+
+    # <kind> <name> | <the line that means it is up> | <bundle> <args...>
+    node authority | serving the directory       | dird.worker.js cons.txt cert.txt r1.desc 17981
+    node relay1    | listening on 127.0.0.1:5555 | relayd.worker.js relay.seed -p 5555 …
+    run  fetch     |                             | torapp.worker.js seed.txt auth.txt /tor/…
+
+    deno task app:build packages/tor/src/network.wac --allow-read --allow-write --allow-net -o network
+    deno task app:build packages/tor/src/relayd.wac --worker -o relayd.worker.js   # and dird, app
+    ./network net.txt > document.txt
+
+A node is **waited for**, not slept on, and a node that never announces itself fails the run by name
+rather than being assumed up. The work's exit code is the run's, so a network that came up and a
+fetch that failed cannot report success. Progress goes to the error channel and stdout carries only
+what the work produced — so the redirection above yields the fetched document and nothing else. On a
+quiet machine the whole thing takes about a second.
+
+**It cannot start a C tor.** `Cli.spawn` takes a worker bundle and this world has deliberately no
+capability for running an arbitrary binary, so the C tor half of the interop matrix stays a shell
+script. What this covers is a network with no C in it, which is step 5's condition:
+
+    network: all 4 nodes are up
+    consensus verified: 1 of 1 authorities signed
+    path: wacrelay2 -> wacrelay -> wacrelay3
+    circuit built, 3 hops
+    network: ok
+
+with stdout byte-identical to the microdesc consensus the authority was holding.
+
+`test/network.test.ts` tests the launcher against `example/waiter.wac` rather than against relays —
+it knows about processes and ready markers, not about Tor, and a launcher test that stood up three
+relays would fail whenever anything in the stack did. **The Tor network is not stood up by the
+suite**, because the ports a relay listens on are baked into its signed descriptor and two agents
+running the suite at once would collide on them. Run the recipe above by hand.
+
 ## What is not here
 
 **The real network.** Directory authorities are reached by IP and this sandbox's proxy

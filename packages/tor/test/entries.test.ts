@@ -24,6 +24,7 @@ const ENTRIES = [
   "packages/tor/src/relayd.wac",
   "packages/tor/src/dird.wac",
   "packages/tor/src/gendesc.wac",
+  "packages/tor/src/network.wac",
   "packages/tor/size/proto_only.wac",
   "packages/tor/size/tor_only.wac",
   "packages/tor/size/tls_only.wac",
