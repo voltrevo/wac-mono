@@ -392,3 +392,34 @@ candidate that fits is the shell's `RECV` on a spawned applet's output racing th
 The next occurrence will print `RECV(h=N)`, the responder's sweep count and whether it is still running,
 which distinguishes those without another round of guessing. The hunt is a loop of the corpus with a ten
 second settle between runs; on a quiet machine it has hit on the first run three times out of four.
+
+### The symptom is fixed even though the cause is not (agent-a, 2026-08-06)
+
+Reproduction stayed out of reach this tick — the machine had another agent on it, and ten runs at load
+3–9 were clean — so the work went to the part that does not need a reproduction: **a wedge no longer
+hangs.**
+
+`harness/appRun.ts` now concludes *deadlock* from the bridge's own state rather than from elapsed time.
+Every 45 seconds it compares the slot table and the counters with what they were last time; if they are
+identical twice running **and** a call is outstanding, it fails the run with the state in the message:
+
+```
+packages/sh/src/sh.wac is deadlocked: the bridge has not moved in 90s with work outstanding —
+0:running:READ_STDIN (submit=7 done=12) host: running=true sweeps=8. This is wac-mono 0082 …
+```
+
+**Why this is allowed to decide when the rest of this issue argues that clocks must not.** It is not
+deciding on duration: a slow machine still moves — `sweeps` climbs, `done` climbs, slots change hands — so
+a frozen table with work outstanding is a *state*, and the duration only says how long to look before
+believing it. `no slot in use` is explicitly not a deadlock, so a program that computes for a long time
+with nothing outstanding is never failed.
+
+`harness/deadlock.test.ts` is both halves of that claim, and builds the wedge rather than waiting for one:
+`endStdin: false` leaves a `read` waiting for bytes and an end that will never come, which is the same
+frozen shape, and it is detected in two seconds at a 700 ms budget. The second test runs
+`seq 1 300000 | wc -l` at a 500 ms budget and must *not* be failed — if that one ever fails, the detector
+has started looking at time instead of progress and every long-running program is about to be reported as
+broken.
+
+What this buys, until the cause is found: a wedge costs one failing test with the wait named, instead of
+the push gate's 45-minute timeout spent on no information at all.
