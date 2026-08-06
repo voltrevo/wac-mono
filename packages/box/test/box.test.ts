@@ -508,9 +508,19 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     const denied = `${fixtureDir}/unreadable`;
     await Deno.writeTextFile(denied, "secret\n");
     await Deno.chmod(denied, 0o000);
-    for (const path of [`${fixtureDir}/definitely-not-here`, denied]) {
-      const ours = await box(["cat", path]);
-      const theirs = new Deno.Command("cat", {
+    // Both halves of the read path, because they are separate code and drifted apart once: `cat` streams
+    // through `openInput`, `base64` takes the whole file through `readFile`, and each translates its own
+    // failure — `lib/input.wac` has a function per half. `base64` is the oracle for the second because GNU
+    // words it the same way; `sort` says "cannot read:", `tac` says "failed to open ... for reading", and
+    // comparing against either would be comparing a different sentence rather than the same reason.
+    for (const [applet, path] of [
+      ["cat", `${fixtureDir}/definitely-not-here`],
+      ["cat", denied],
+      ["base64", `${fixtureDir}/definitely-not-here`],
+      ["base64", denied],
+    ] as const) {
+      const ours = await box([applet, path]);
+      const theirs = new Deno.Command(applet, {
         args: [path],
         env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
         clearEnv: true,
@@ -523,9 +533,9 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
       assertEquals(
         reason(ours.err),
         reason(new TextDecoder().decode(theirs.stderr)),
-        `the reason a read failed differs from cat's: ${ours.err.trim()}`,
+        `the reason ${applet} gave differs from the real one's: ${ours.err.trim()}`,
       );
-      assertEquals(ours.code, 1, "a failed read exits 1, as cat does");
+      assertEquals(ours.code, 1, `a failed read exits 1, as ${applet} does`);
     }
 
     // The usage message lists every applet, wrapped. Nothing looked at it, so `wrapped` could return the
