@@ -17,7 +17,30 @@
 export const MARKER = "WAC_SUITE_RUNNING";
 
 /** What to add to a child suite's environment. Spread it into `Deno.Command`'s `env`. */
-export const SUITE_ENV: Record<string, string> = { [MARKER]: "1" };
+/**
+ * What every suite run carries, whichever entry point started it.
+ *
+ * `WAC_SCHED=seed` makes the host's answers land in an order the *scheduler* chose rather than whichever
+ * handler's promise resolved first, with a fixed seed so two runs make the same choices. That is the
+ * default for tests because a run whose interleaving is nobody's decision is a run that cannot be
+ * repeated: the corpus hang in wac-mono 0082 took three days to locate and was reproduced four times out
+ * of four the moment a scheduler was put in front of it. Production stays unscheduled, and so does
+ * anything driven through `packages/platform/test/worker.ts`, which is where the concurrent mode is
+ * tested on purpose. design/0001 D12.
+ *
+ * Overridable: an explicit `WAC_SCHED` in the environment wins, so `WAC_SCHED=off deno task test` is how
+ * to check a failure is not the scheduler's doing, and `WAC_SCHED=seed=1234` explores another ordering.
+ */
+export const SUITE_ENV: Record<string, string> = {
+  [MARKER]: "1",
+  WAC_SCHED: (() => {
+    try {
+      return Deno.env.get("WAC_SCHED") ?? "seed";
+    } catch {
+      return "seed";
+    }
+  })(),
+};
 
 /**
  * Stop, loudly, if a suite is already running above us.

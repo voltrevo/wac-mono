@@ -43,6 +43,8 @@ import {
   SUBMIT_SEQ,
 } from "./layout.ts";
 import { FAULT_OTHER, faultedBytes, faultOf } from "./faults.ts";
+import { type Scheduler, scheduler } from "./schedule.ts";
+import { describeSlots } from "./call.ts";
 
 /** What a capability does with a request payload. May be async; that is the point. */
 export type Handler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
@@ -52,6 +54,9 @@ export type Handlers = Record<number, Handler>;
 
 const enc = new TextEncoder();
 const EMPTY = new Uint8Array(0);
+
+/** Labels bridges in the scheduler's log, so a recorded run can be read. */
+let nextBridgeId = 0;
 
 function joined(parts: Uint8Array[], last: Uint8Array): Uint8Array {
   const total = parts.reduce((n, p) => n + p.length, 0) + last.length;
@@ -72,15 +77,34 @@ function joined(parts: Uint8Array[], last: Uint8Array): Uint8Array {
 export function serveHostCalls(
   b: Bridge,
   handlers: Handlers,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; scheduler?: Scheduler } = {},
 ): { stats(): { running: boolean; sweeps: number }; stop(): void; done: Promise<void> } {
   let running = true;
+
+  // The scheduler is shared by every bridge in this process, because the orderings worth exploring are
+  // *between* a shell and the applets it spawned, not within one of them. The id only labels the log.
+  // The process-wide one unless the caller brings its own. A test *about* the concurrent ring has to
+  // bring `newScheduler("off")`: scheduling exists to remove the interleavings, and removing them is
+  // exactly what such a test must not have done to it. See design/0001 D12's note on the testing gap.
+  const sched = opts.scheduler ?? scheduler();
+  const bridgeId = nextBridgeId++;
+  // Registered so a stall anywhere can ask every bridge what it is doing — a shell parked reading a child
+  // explains nothing without the child's side of it.
+  sched.register(bridgeId, () => describeSlots(b));
 
   // Per-slot state kept between the pieces of one call.
   const pending: (Uint8Array | null)[] = new Array(SLOTS).fill(null);      // response tail
   const partial: Uint8Array[][] = Array.from({ length: SLOTS }, () => []); // request head
 
   const reply = (slot: number, status: number, body: Uint8Array): void => {
+    // **Through the scheduler**, which with scheduling off calls this straight back — the path the host
+    // has always taken. With it on, the answer joins a ready set and the scheduler decides which one
+    // lands next, so the order the whole system runs in is chosen rather than raced for. See
+    // `schedule.ts`, and design/0001 D12 for what that can and cannot promise.
+    sched.ready(bridgeId, slot, () => write(slot, status, body));
+  };
+
+  const write = (slot: number, status: number, body: Uint8Array): void => {
     const at = slotAt(slot);
     b.res(slot).set(body, 0);
     Atomics.store(b.ctrl, at + S_RES_LEN, body.length);
@@ -247,6 +271,9 @@ export function serveHostCalls(
         else if (st === ST_CANCELLED) abandon(s);
       }
       sweeps++;
+      // The worker has come back: whatever it was answered with, it is parked again. That is the signal
+      // the scheduler waits on before letting another worker run — see `schedule.ts`.
+      sched.quiet(bridgeId);
       const w = Atomics.waitAsync(b.ctrl, SUBMIT_SEQ, seen);
       if (w.async) await w.value;
       if (!running || opts.signal?.aborted) return;
@@ -274,6 +301,8 @@ export function serveHostCalls(
     },
     stop() {
       running = false;
+      sched.quiet(bridgeId);
+      sched.forget(bridgeId);
       // Wake the loop so it can notice. Bumping the counter it waits on is the only way
       // in: it is parked on a value, not on a flag.
       Atomics.add(b.ctrl, SUBMIT_SEQ, 1);

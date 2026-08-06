@@ -127,7 +127,7 @@ Deno.test("...and a redirection of standard error still refuses rather than appr
 // **Tagged flaky against wac-mono 0082**, where it is the one member nobody has reproduced since it was
 // reported — it may already have been fixed by 0078's zero-length-write bug. Whoever sees it fail should
 // paste the assertion text into that issue, which is the one thing that would settle it.
-Deno.test("[flaky 0082] an endless producer stops at the cap rather than filling memory", async () => {
+Deno.test("an endless producer stops at the cap rather than filling memory", async () => {
   // `yes` writes for ever by design, and `head -1` wants one line. A real shell ends this because
   // `head` closing its input stops `yes`; this shell runs its stages one at a time, so what ends it
   // is the 8 MiB cap on a queue nobody is reading — `write` starts answering false and `yes` is

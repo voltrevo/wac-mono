@@ -1,6 +1,6 @@
 # 0082 — five tests fail, rather than slow down, when the machine is busy
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** agent-a (2026-08-05) — four of the five fixed; the box one is still open
 - **Reported by:** agent-b
 - **Date:** 2026-08-05
@@ -570,3 +570,98 @@ load ~1.8", and that is now clean four times where it used to wedge three times 
 
 It is not proof. A once-in-fifty failure needs a week of green gates, not forty runs. The tag stays on the
 test, and `tools/flaky.test.ts` will make somebody take it off when this issue closes.
+
+### Reproducible on demand, under the scheduler (agent-a, 2026-08-06)
+
+`WAC_SCHED=seed deno test packages/sh/test/differential.test.ts` fails **every time**, in about two and a
+half minutes, with the signature this issue has been chasing for three days:
+
+```
+packages/sh/src/sh.wac is deadlocked: the bridge has not moved in 90s with work outstanding —
+0:running:RECV(h=3) 1:running:RECV(h=4) (submit=23 done=42) host: running=true sweeps=22
+  last choices: … 1046:0@11598 1047:0@11600 1047:0@11602 1047:0@11605
+```
+
+Two runs, two identical failures, where the unscheduled corpus wedges about once in fifty runs and only on
+an idle machine. **That is the thing this issue has never had**: a way to make it happen.
+
+What the log adds beyond the state: eleven thousand choices were made while this shell sat still, and the
+recent ones are all *other* bridges — freshly spawned children, each answered on slot 0 and progressing.
+So the stuck shell is not being starved by the policy; its two `RECV`s never become **ready**, meaning the
+host handlers behind them are waiting on children whose output never ends.
+
+**What is not yet established**, and I am not claiming it: whether this is the same bug as the intermittent
+wedge or a second one that the scheduler's ordering exposes. The signature is identical — same operation,
+same handles, same frozen counters — and the deterministic reproduction is worth having either way,
+because a bug that happens on demand is a bug that can be bisected.
+
+**Consequence for the scheduler's rollout**: it is *not* the default for tests yet, and cannot be until
+this is fixed. A mode that reproduces a real hang is doing its job; a default that reddens everyone's gate
+with a two-and-a-half-minute failure is not something to switch on and walk away from. `WAC_SCHED=seed`
+and `WAC_SCHED=fifo` are opt-in, off is the default, and the next tick starts here.
+
+## Closed, 2026-08-06 (agent-a): an inheriting child was reading the test runner's standard input
+
+The scheduler reproduced it four times out of four, and the survey it printed named every bridge at once:
+
+```
+every bridge:
+  bridge 1036: 0:running:RECV(h=3) 1:running:RECV(h=4) (submit=23 done=42)
+  bridge 1037: 0:running:RECV(h=3) 1:running:RECV(h=4) (submit=23 done=42)
+  bridge 1038: 0:running:RECV(h=3) 1:running:RECV(h=4) (submit=25 done=46)
+  bridge 1039: 0:running:RECV(h=3) 1:running:RECV(h=4) (submit=25 done=46)
+  bridge 1044: 0:running:READ_CHUNK (submit=6 done=10)
+  bridge 1045: 0:running:READ_CHUNK (submit=7 done=12)
+  bridge 1046: 0:running:READ_CHUNK (submit=6 done=10)
+  bridge 1047: 0:running:READ_CHUNK (submit=7 done=12)
+```
+
+Four shells parked reading a child's two streams; four children parked reading **their own standard
+input**. A cycle neither side can break.
+
+**The cause.** A spawned stage that inherits standard input inherited it *by omission*: `startChild` left
+`readStdin` and `readStdinChunk` out of the child's world, and a world without them falls through to
+`Deno.stdin`. That is right for a program run from a terminal and wrong everywhere else. In a test the
+parent's world has a queue — `harness/appRun.ts` gives the shell one and ends it immediately — so the
+child was handed **the test runner's standard input**, which never ends. The child waited for bytes that
+could not come; its parent waited for output the child would never write.
+
+**The fix**: an inheriting child takes the parent's source when the parent has one, and falls back to the
+real thing only when the parent was reading the real thing too. That keeps what the omission was for —
+`cat; cat` sharing one stream, issue 0042 — while making "inherit" mean the parent's input rather than the
+process's.
+
+**Measured.** `WAC_SCHED=seed` on the corpus before the fix: four runs, four deadlocks, ~155s each. After:
+**24 seconds, passing.** The whole suite under the scheduler: 1235 passing. And the 8× slowdown I had
+blamed on the scheduler was this deadlock all along — a scheduled suite costs about 20%.
+
+**Why it was one run in fifty unscheduled**, and only on an idle machine: the child had to reach its
+standard-input read before the parent's output read was satisfied, which needs the two to be interleaved a
+particular way. A busy machine spread them out; an idle one packed them together. That is why three days
+of instrumentation found the *state* and never the cause — the state was reachable, but only by luck, and
+luck cannot be bisected.
+
+**The tags come off**: `[flaky 0082]` is removed from the three tests, and `tools/flaky.test.ts` would have
+failed the suite otherwise, which is what it exists for.
+
+### The other members, and their honest status
+
+This issue collected a class, so closing it should say what happened to each rather than implying one fix
+covered them all:
+
+- **the four HTTP ones** — fixed at the root. A 60 ms window in a shared oracle was deciding "the parser
+  wants more bytes"; it keeps the window as a hurry-up and asks llhttp for the answer.
+- **the sh corpus hang** — fixed here, cause above.
+- **the OpenSSH handshake reset** — addressed by the exclusive lane, which removes the cause whichever of
+  the two candidates was right, since both are consequences of running resource-hungry tests concurrently.
+  Not independently confirmed: it happened once in eight gate runs, so a week of green gates is the
+  evidence, not one.
+- **the worker-readiness deadline** — raised to two minutes rather than removed, on the asymmetry that
+  waiting longer costs a broken bundle seconds and waiting less costs a working program a false accusation.
+- **`packages/box`'s cap test** — **never reproduced since it was reported**, by anyone. It may have been
+  fixed by 0078's zero-length-write bug, which has the same shape. That is a guess, and it is written down
+  as one: if it recurs, it needs its own issue with the failure text pasted in, which is the one thing the
+  original report lacked.
+
+Closing rather than leaving open for the last item, because an issue that stays open on a
+never-reproduced symptom is an issue nobody reads.

@@ -6,13 +6,13 @@ record of what has been fixed and why.
 | # | summary | kind | symptom |
 |---|---|---|---|
 | [0089](open/0089-a-relay-carries-downloads-but-truncates-uploads-at-about-six-cells.md) | a relay carries downloads but truncates uploads at about six cells | bug | wrong answer |
+| [0089](open/0089-a-line-the-tests-demonstrably-execute-is-reported-not-covered.md) | a line the tests demonstrably execute is reported "not covered" | bug | wrong answer |
 | [0088](open/0088-zstd-is-whole-buffer-in-both-directions.md) | zstd is whole-buffer in both directions, and gzip is not | missing feature | not implemented |
 | [0087](open/0087-wacland-under-wasmtime-a-second-host-with-no-javascript.md) | the native runtime: a second host, with no JavaScript and no WASI in it | missing feature | not implemented |
 | [0086](open/0086-merkle-patricia-proofs-so-a-contract-read-is-verified.md) | Merkle-Patricia proofs, so reading a contract does not mean trusting the answer | missing feature | not implemented |
 | [0085](open/0085-abi-encoding-and-decoding.md) | ABI encoding and decoding, so a contract call can be made and its answer read | missing feature | not implemented |
 | [0084](open/0084-rlp-encoding-and-decoding.md) | RLP, the encoding everything below the consensus layer uses | missing feature | not implemented |
 | [0083](open/0083-keccak256-for-ethereum-not-just-sha3.md) | keccak256, which is not SHA3-256 | missing feature | not implemented |
-| [0082](open/0082-five-tests-fail-rather-than-slow-down-when-the-machine-is-busy.md) | five tests fail, rather than slow down, when the machine is busy | bug | wrong answer |
 | [0076](open/0076-an-app-worker-runs-main-once-so-a-test-pays-a-fresh-one-per-case.md) | an app worker runs `main` once, so a test pays a fresh one per case | performance | not implemented |
 | [0066](open/0066-the-light-client-is-minimal-config-only-and-has-never-seen-a-real-chain.md) | the light client is minimal-config only and has never seen a real chain | missing feature | not implemented |
 | [0035](open/0035-crypto-hot-paths-hold-state-in-gc-arrays-rather-than-locals.md) | crypto hot paths hold state in GC arrays rather than locals (measured: −64% on one function) | performance | wrong answer |
