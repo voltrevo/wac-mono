@@ -6,9 +6,9 @@
 // times and exited 0, and `tools/mutate.ts` turned the same error into "117 invalid
 // mutants". Three separate things could see it and none of them said so (issue 0022).
 //
-// The programs are here too. They are the only files with a `main`, so a change to the
-// platform's capability world lands on them first, and they are also the two files that no
-// unit test imports.
+// The programs are here too. They are the files with a `main`, so a change to the platform's
+// capability world lands on them first, and they are also the files that no unit test imports —
+// which for the server programs is every line they have.
 
 import { wacCompile } from "wac/wacCompile.ts";
 import { wacFiles } from "../../../harness/wacFiles.ts";
@@ -17,6 +17,13 @@ const ENTRIES = [
   "packages/tor/src/app.wac",
   "packages/tor/src/socks.wac",
   "packages/tor/src/client_entry.wac",
+  // The server side: a relay, a directory authority's HTTP port, and the generator that produces the
+  // documents both of them serve. Added after a refactor of `relayd.wac` compiled only because it was
+  // built by hand — the list above was written when `app` and `socks` were the only programs, and
+  // three more had arrived under a comment claiming there were two.
+  "packages/tor/src/relayd.wac",
+  "packages/tor/src/dird.wac",
+  "packages/tor/src/gendesc.wac",
   "packages/tor/size/proto_only.wac",
   "packages/tor/size/tor_only.wac",
   "packages/tor/size/tls_only.wac",

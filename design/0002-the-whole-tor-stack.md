@@ -609,3 +609,65 @@ Two lessons, and the second is the uncomfortable one:
     about the machine, not about who caused it, and I read it as though it were both.
 
 Verified: 167,212 spins before, **0** after, with the relays otherwise behaving as before.
+
+### A stream carried bytes end to end
+
+The last thing in this design that had never been shown: a byte arriving through a stream one of our
+relays opened. It does now.
+
+    control: direct fetch of 192.168.80.2:8087 gave 5004 bytes
+    bootstrapped after 5s
+    socks attempt 1 exit 0 bytes 5004
+    STREAM_OPEN: A=1
+    relayd:   stream 5129 open to 192.168.80.2:8087
+
+and from the C tor on the other side of it:
+
+    'connected' received for circid 4095531604 streamid 5129 after 0 seconds.
+    14: end cell (closed normally) for stream 5129. Removing stream.
+
+`curl --proxy socks5h://` through tor 0.4.7.13, over a three-hop circuit built entirely from our
+relays, to a non-loopback address — and the 5004 bytes it received are byte-identical to the file the
+server holds. Every layer between now has a live witness: link handshake, CREATE2, EXTEND2, BEGIN,
+CONNECTED, DATA in both directions, END.
+
+Two bugs stood between here and there, and neither was in the protocol.
+
+**A connection carried one circuit.** `Conn` held `circId`, `hop`, `hasNext`, `hasStream` inline, so a
+second CREATE2 on the same connection was answered with DESTROY and a warning saying so. That is not
+an exotic case: a bootstrapping tor opens a directory circuit and an exit circuit **to the same guard,
+over the same TLS connection, within the same second**. The exit circuit was the one being refused,
+which is why the BEGIN never arrived — a client-visible failure that looked, from the relay's own log,
+like nothing happening at all. Per-circuit state is a `Circ` now, and a `Conn` holds up to eight; a
+circuit id is unique per connection, so the lookup is per `Conn` rather than global.
+
+**`continue` became `c.live = false; return`.** Moving the single-connection loop into `feedConn` for
+the multiplexer turned "keep going" into "close the connection" at two sites: after forwarding a
+stream's data to the client, and after forwarding the next hop's cells. So the connection died on the
+first cell of any response it carried. The refactor compiled, the tests passed, and the circuit still
+built — the damage only showed once traffic flowed through it, which is the one thing no test in this
+repo does.
+
+### Four runs that proved nothing, and what they were measuring instead
+
+Getting to that result took six runs. Four of them produced a confident-looking answer about the
+relays while measuring something else entirely, and the pattern is worth keeping:
+
+| what the run appeared to show | what was actually true |
+|---|---|
+| the exit refused the connection | port 8086 was still held by the previous run's web server |
+| bootstrapped in 1s, then the fetch failed | tor **appends** to its log; the check matched the *previous* run's `Bootstrapped 100%` |
+| a 5004-byte fetch with every relay counter at 0 | the previous run's relays were still up under `timeout 420`; the new ones failed to bind and the old ones were logging to deleted inodes |
+| the control fetch returned 3083 bytes | **`--noproxy ''` does not bypass a proxy** — that was a Squid error page. `--noproxy '*'` is the form that does |
+| four processes never became ready | `bc` is not installed; `... | paste -sd+ | bc` yielded an empty string and the comparison never matched |
+
+The `--noproxy` one generalises furthest: the earlier note in this document said a fetch must use a
+non-loopback target and `--noproxy ''`, and that only ever worked because `--proxy socks5h://`
+overrides it explicitly. As a *control* — no `--proxy` — the same flag sends the request straight
+through Squid.
+
+The others share one shape: **a run that cannot work should say so, not produce a number.** Every
+check in `run25.sh` is now fatal and named — a control fetch that must succeed before tor is started,
+a preflight that refuses to run while the last run's ports are held, an explicit "NEVER BOOTSTRAPPED"
+line, and a readiness loop that reports what it saw instead of expiring in silence. The `bc` one had
+been silently failing since the script was written; making the check fatal is what surfaced it.

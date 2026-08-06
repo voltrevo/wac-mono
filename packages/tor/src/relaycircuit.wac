@@ -111,8 +111,10 @@ export u8[] destroyCell(i32 circId, i32 reason) {
 export const i32 DESTROY_NONE = 0;
 /** `PROTOCOL` — the peer sent something that violates the protocol. */
 export const i32 DESTROY_PROTOCOL = 1;
-/** `TORPROTOCOL` — as above, from tor-spec's own list. */
+/** `INTERNAL` — an error at this relay, not the peer's doing. (2 is INTERNAL; TORPROTOCOL is 1.) */
 export const i32 DESTROY_INTERNAL = 2;
+/** `RESOURCELIMIT` — this relay could have carried it and has run out of room. */
+export const i32 DESTROY_RESOURCELIMIT = 5;
 
 // ── Being a hop ───────────────────────────────────────────────────────────────
 
