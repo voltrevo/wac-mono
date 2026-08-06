@@ -476,7 +476,7 @@ export i32 main(Core core, Cli cli) {
     if (which < 0) {
       // Nothing spoke for two minutes. Dropping everything is heavy-handed and it is what a relay with
       // no traffic should do rather than hold sockets for a network that has gone.
-      for (i32 i = 0; i < live; i++) { dropConn(cli, conns[i]!); }
+      for (i32 i = 0; i < live; i++) { dropConn(core, cli, conns[i]!); }
       live = 0;
       // The accept ticket is **not** re-armed here. `cancel` detaches this program from the answer but
       // does not stop the host accepting, so a fresh `accept` collides with the one still running and
@@ -514,7 +514,7 @@ export i32 main(Core core, Cli cli) {
     Conn hot = conns[who]!;
     feedConn(core, cli, hot, source[which], slot[which], id, certs, docs, hasDir);
     if (!hot.live) {
-      dropConn(cli, hot);
+      dropConn(core, cli, hot);
       // Close the gap rather than leave a hole: the wait list is built by walking 0..live, and a dead
       // entry in the middle would be waited on forever.
       for (i32 i = who; i + 1 < live; i++) { conns[i] = conns[i + 1]; }
@@ -576,6 +576,8 @@ struct Conn {
   /** The circuits this connection carries. `circCount` is how many of them are real. */
   Circ?[] circs;
   i32 circCount;
+  /** How many circuits this connection has torn down, so a silent teardown is countable. */
+  i32 droppedCircs;
   /** The one outstanding read of the connection itself. A ticket must exist to be waited on. */
   Pending<Read> fromClient;
 }
@@ -627,7 +629,7 @@ Conn newConn(Core core, Cli cli, Socket sock, Identity id) {
                            core.randomBytes(32).wait());
   Pending<Read> first = cli.recv(sock.handle);
   return Conn(true, sock.handle, sock, tls, u8[0](), false, false,
-              Circ?[MAX_CIRCS](), 0, first);
+              Circ?[MAX_CIRCS](), 0, 0, first);
 }
 
 /** The circuit with this id on this connection, or -1. */
@@ -646,6 +648,9 @@ i32 findCirc(Conn c, i32 circId) {
  */
 void dropCirc(Cli cli, Conn c, i32 slot) {
   Circ k = c.circs[slot]!;
+  // Callers each explain *why* they are dropping; this says that one happened at all, so a circuit
+  // that vanishes is never a silent event.
+  c.droppedCircs = c.droppedCircs + 1;
   if (k.hasStream) { cli.closeSocket(k.streamSock); k.hasStream = false; }
   if (k.hasNext) { cli.closeSocket(k.next.sock); k.hasNext = false; }
   for (i32 i = slot; i + 1 < c.circCount; i++) { c.circs[i] = c.circs[i + 1]; }
@@ -653,7 +658,9 @@ void dropCirc(Cli cli, Conn c, i32 slot) {
 }
 
 /** Everything a closing connection holds: its own socket, and every circuit's. */
-void dropConn(Cli cli, Conn c) {
+void dropConn(Core core, Cli cli, Conn c) {
+  core.log("relayd:   dropping a connection carrying " + itoa(c.circCount) + " circuit(s), " +
+           itoa(c.droppedCircs) + " already torn down");
   while (c.circCount > 0) { dropCirc(cli, c, c.circCount - 1); }
   cli.closeSocket(c.sock);
   c.live = false;
@@ -750,7 +757,10 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
         incoming = bytes;
         live = true;
       }
-      case End: { }
+      // A connection ending was silent, which made "the peer went away" indistinguishable from
+      // "nothing happened" in a log — and a circuit dying at the client with no line here is exactly
+      // what issue 0089 looked like from the outside.
+      case End: { core.log("relayd:   the initiator closed the connection"); }
       case Failed(why): { core.warn("relayd:   the connection failed: " + why); }
     }
     c.fromClient = cli.recv(c.sock);

@@ -1042,3 +1042,31 @@ way per stream and logs the first cell in each direction, so a stalled stream no
 identical to one that was never written to — the same argument that found the accept spin. And the
 issue records both dead hypotheses, because the reasoning that produced them was sound and someone
 will have it again.
+
+### Pinning the exit, and what is actually left of 0089
+
+`ExitNodes` plus `StrictNodes 1` removes tor's random choice of exit, and the upload failure becomes
+the same sequence every run. Worth having written down as a technique: three relays and a random exit
+means each run instruments a third of the network, and three runs that each answer a third of the
+question answer none of it.
+
+With that, the remaining lead is **optimistic data**. tor logs `does allow optimistic data` and sends
+the request immediately after BEGIN, without waiting for CONNECTED — so the DATA cells arrive while
+`relayd` is parked in the blocking `cli.connect(…).wait()` that a BEGIN performs. A GET's request
+arrives the same way and works, because it is small enough to share a record with the BEGIN; a POST's
+does not. Nothing in this stack has ever exercised that.
+
+Two things found on the way, neither of them 0089:
+
+  - **Issue 0091.** The platform ring has sixteen slots and an outstanding call holds one.
+    `socks.wac` caps itself at twelve and says exceeding the ring deadlocks rather than degrades.
+    `relayd` allows 64 connections of 8 circuits, and a *single* connection at that limit needs 17
+    outstanding calls before the accept ticket is counted. Filed rather than fixed, because what a
+    relay refuses under pressure is a decision.
+  - **`could not reach 127.0.0.1:5557`** — one relay failing to connect to another with the port open
+    and the peer running, recurring across runs. Recorded in 0089 as explicitly *not* part of it.
+
+And the instrument for next time is somebody else's: agent-a's `host/schedule.ts` makes the host
+answer one worker at a time in a chosen order (`WAC_SCHED=fifo`, or `seeded:N`). `network.wac` already
+runs the relays as workers of one host, so a launcher-run network can be replayed exactly and a
+working run diffed against a failing one.

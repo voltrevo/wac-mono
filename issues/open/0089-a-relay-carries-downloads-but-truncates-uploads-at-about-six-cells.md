@@ -88,6 +88,41 @@ authenticate — at an exit that means the running backward/forward digest has g
 the most likely place for that is the exchange of two `RELAY_END`s around a stream closing. Second:
 whatever `dropCirc` is reached by. Both are `relayd.wac`'s, not the platform's.
 
+## Pinned, reproducible, and one lead left
+
+`ExitNodes <fp>` plus `StrictNodes 1` in the probe's torrc removes tor's random exit choice, and with
+it the failing sequence is the same every run:
+
+    stream 55423 open                        (the GET control)
+    stream 55423 is carrying data from the client
+    stream 55423 closed by the far end after 89 bytes in, 69 bytes out
+    relay command 3 on stream 55423 (this circuit has no stream)
+    stream 55424 open                        (the upload)
+    …nothing…
+
+**The lead is optimistic data.** tor's log for the failing stream says:
+
+    link_apconn_to_circ(): Looks like completed circuit … does allow optimistic data
+    connection_ap_handshake_send_begin(): Sending relay cell 0 … to begin stream 55424.
+    connection_ap_handshake_send_begin(): Address/port sent, ap socket 16, n_circ_id …
+    'connected' received for … streamid 55424 after 0 seconds.
+    circuit_mark_for_close_(): … (orig reason: 520)
+
+tor sends the request **immediately after BEGIN, without waiting for CONNECTED**. `relayd` handles a
+BEGIN with a blocking `cli.connect(…).wait()`, so those DATA cells arrive while it is parked mid-cell
+— which is a case nothing has ever exercised, because a GET's request also arrives that way but is
+small enough to sit in one record with the BEGIN. That is where to look next.
+
+**A second, independent defect keeps appearing in the same runs:** `could not reach 127.0.0.1:5557`,
+one relay failing to connect to another on a machine with the port open and the peer running. It is
+not this bug and it should not be diagnosed as part of it.
+
+**agent-a's scheduler is the tool for the next attempt.** `host/schedule.ts` (commit dc89e43) makes
+the host answer one worker at a time in a chosen order — `WAC_SCHED=fifo` for a canonical, diffable
+order, `WAC_SCHED=seeded:N` for a reproducible random one. `src/network.wac` already runs the relays
+as workers of a single host, so a network stood up through the launcher can be replayed exactly, and a
+working run diffed against a failing one. That is a far better instrument than another log line.
+
 **Removing the randomness is still the next step**: tor picks an exit from the three at will, so each
 run instruments a different relay, and the runs above each answered a third of the question. A
 single-relay path or a pinned exit would let one run answer it. Note also that the machine was at load

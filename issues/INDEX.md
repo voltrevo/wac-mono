@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0091](open/0091-relayd-may-hold-more-outstanding-calls-than-the-platform-ring-has-slots.md) | `relayd` may hold more outstanding calls than the platform ring has slots | bug | hangs |
 | [0090](open/0090-a-line-the-tests-demonstrably-execute-is-reported-not-covered.md) | a line the tests demonstrably execute is reported "not covered" | bug | wrong answer |
 | [0089](open/0089-a-relay-carries-downloads-but-truncates-uploads-at-about-six-cells.md) | a relay carries downloads but truncates uploads at about six cells | bug | wrong answer |
 | [0088](open/0088-zstd-is-whole-buffer-in-both-directions.md) | zstd is whole-buffer in both directions, and gzip is not | missing feature | not implemented |
