@@ -585,3 +585,27 @@ the mistake was caught within a minute of making it.
 
 The committed descriptor vector still reproduces byte for byte, because the fixture keeps the policy
 that was hardcoded when those bytes were signed.
+
+### The multiplexer span its accept ticket 167,000 times, and I blamed the machine
+
+Instrumenting the forwarding path — silent until now, which made "no stream opened" impossible to tell
+from "no cell arrived" — showed cells *are* forwarded to later hops. It also showed something worse in
+the relay's own log:
+
+    accept: Another accept task is ongoing        × 167,212
+
+On a `waitAny` timeout the loop was cancelling the accept ticket and issuing a new one. **`cancel`
+detaches this program from the answer; it does not stop the host accepting.** So the replacement
+collided with the accept still running, failed instantly, settled instantly, woke the wait instantly,
+and re-armed — a hot loop burning a core per relay.
+
+Two lessons, and the second is the uncomfortable one:
+
+  - A timeout means *nothing arrived*, not *the ticket is spent*. The accept ticket is now kept across
+    timeouts, and an accept that genuinely fails stops the listener once with a message rather than
+    retrying thousands of times a second.
+  - **I attributed that load to another agent.** Runs at load 4.5 and 6.1 were called invalid "because
+    the box is busy" for two hours — and the busy thing was this program. A load average is evidence
+    about the machine, not about who caused it, and I read it as though it were both.
+
+Verified: 167,212 spins before, **0** after, with the relays otherwise behaving as before.

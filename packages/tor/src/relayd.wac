@@ -387,6 +387,7 @@ export i32 main(Core core, Cli cli) {
   Conn?[] conns = Conn?[MAX_CONNS]();
   i32 live = 0;
   Pending<Socket> incoming = cli.accept(listener.handle);
+  bool accepting = true;
 
   while (true) {
     // The wait list is rebuilt each round because it changes shape each round: a connection may gain a
@@ -394,7 +395,7 @@ export i32 main(Core core, Cli cli) {
     // connection contributes one to three ids, and `owner`/`source` record which is which so the
     // answer can be translated back. Guessing that mapping instead of recording it is the bug this
     // shape exists to avoid.
-    i32 n = 1;
+    i32 n = accepting ? 1 : 0;
     for (i32 i = 0; i < live; i++) {
       n = n + 1;
       if (conns[i]!.hasNext) { n = n + 1; }
@@ -403,10 +404,13 @@ export i32 main(Core core, Cli cli) {
     i32[] ids = i32[n]();
     i32[] owner = i32[n]();
     i32[] source = i32[n]();
-    ids[0] = incoming.id;
-    owner[0] = -1;
-    source[0] = -1;
-    i32 at = 1;
+    i32 at = 0;
+    if (accepting) {
+      ids[0] = incoming.id;
+      owner[0] = -1;
+      source[0] = -1;
+      at = 1;
+    }
     for (i32 i = 0; i < live; i++) {
       ids[at] = conns[i]!.fromClient.id; owner[at] = i; source[at] = 0; at = at + 1;
       if (conns[i]!.hasNext) {
@@ -423,18 +427,25 @@ export i32 main(Core core, Cli cli) {
       // no traffic should do rather than hold sockets for a network that has gone.
       for (i32 i = 0; i < live; i++) { dropConn(cli, conns[i]!); }
       live = 0;
-      incoming.cancel();
-      incoming = cli.accept(listener.handle);
+      // The accept ticket is **not** re-armed here. `cancel` detaches this program from the answer but
+      // does not stop the host accepting, so a fresh `accept` collides with the one still running and
+      // fails with "another accept task is ongoing" — instantly, which makes `waitAny` return at once,
+      // which re-arms again. That spin ran 167,000 times in one run of this program, burned a core, and
+      // was misread as another agent's load. A timeout means nothing arrived; the ticket is still good.
       continue;
     }
 
-    if (which == 0) {
+    if (accepting && which == 0) {
       Socket fresh = incoming.wait();
-      incoming = cli.accept(listener.handle);
       if (fresh.handle < 0) {
-        core.warn("relayd: accept: " + fresh.error);
+        // Re-arming after a failure is what turns one refusal into a spin. Say it once and stop
+        // accepting: the connections already held keep working, and a listener that cannot accept is
+        // not something to retry thousands of times a second.
+        core.warn("relayd: accept: " + fresh.error + " — no longer accepting");
+        accepting = false;
         continue;
       }
+      incoming = cli.accept(listener.handle);
       if (live >= MAX_CONNS) {
         // Refusing is the honest answer. A relay that accepts every connection offered holds them all
         // and dies on the first burst, which is worse for the network than one refusal.
@@ -522,6 +533,8 @@ struct Conn {
   bool hasStream;
   i32 streamSock;
   i32 streamId;
+  /** Whether anything has been forwarded, so the first one can be logged and the rest not. */
+  bool forwardedAny;
   /** One outstanding read per source. A ticket has to exist to be waited on, and `wait` spends it. */
   Pending<Read> fromClient;
   Pending<Read> fromNext;
@@ -535,7 +548,7 @@ Conn newConn(Core core, Cli cli, Socket sock, Identity id) {
   Pending<Read> first = cli.recv(sock.handle);
   return Conn(true, sock.handle, sock, tls, u8[0](), false, false, false, 0, Hop.create(u8[72]()),
               false, Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]()), 0,
-              -1, Buf.create(), false, -1, -1, first, first, first);
+              -1, Buf.create(), false, -1, -1, false, first, first, first);
 }
 
 /** Everything a closing connection holds: its own socket, the next hop's, and any stream's. */
@@ -754,6 +767,13 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, Identity id, u8[] certs,
             c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(c.circId, DESTROY_PROTOCOL));
             c.live = false;
             return;
+          }
+          // Forwarding was silent, which made "no stream opened" impossible to tell apart from "no cell
+          // ever arrived". The first one per connection is enough to say the path is carrying traffic
+          // without a line per cell.
+          if (!c.forwardedAny) {
+            c.forwardedAny = true;
+            core.log("relayd:   forwarding cells for a later hop on circuit " + itoa(c.circId));
           }
           sendCells(c.next, encodeFixed(c.nextCircId, cmdRelay(), inbound.payload));
           continue;
