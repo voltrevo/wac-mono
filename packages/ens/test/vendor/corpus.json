@@ -6,62 +6,114 @@
     {
       "name": "eth",
       "namehash": "93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae",
-      "dns": "0365746800"
+      "dns": "0365746800",
+      "ownerSlot": "859ecef2e168dc10231b000bd53493b42bc9d944cac29d94582c1e1d43592131",
+      "resolverSlot": "859ecef2e168dc10231b000bd53493b42bc9d944cac29d94582c1e1d43592132",
+      "ttlSlot": "859ecef2e168dc10231b000bd53493b42bc9d944cac29d94582c1e1d43592133"
     },
     {
       "name": "foo.eth",
       "namehash": "de9b09fd7c5f901e23a3f19fecc54828e9c848539801e86591bd9801b019f84f",
-      "dns": "03666f6f0365746800"
+      "dns": "03666f6f0365746800",
+      "ownerSlot": "652b6728c41ee332c975ca4dcf2987a866b80933253be0f11f22f684f248fc2d",
+      "resolverSlot": "652b6728c41ee332c975ca4dcf2987a866b80933253be0f11f22f684f248fc2e",
+      "ttlSlot": "652b6728c41ee332c975ca4dcf2987a866b80933253be0f11f22f684f248fc2f"
     },
     {
       "name": "a.b.c.eth",
       "namehash": "922dd0da59088eccc6d9681b9c2fa97dd872ab83e7899f998090d652a0bcf83a",
-      "dns": "0161016201630365746800"
+      "dns": "0161016201630365746800",
+      "ownerSlot": "18060140a28ae81e96b8e3498cadd0abb2e3b79453c3cdcd1f95bd1df839a4a4",
+      "resolverSlot": "18060140a28ae81e96b8e3498cadd0abb2e3b79453c3cdcd1f95bd1df839a4a5",
+      "ttlSlot": "18060140a28ae81e96b8e3498cadd0abb2e3b79453c3cdcd1f95bd1df839a4a6"
     },
     {
       "name": "vitalik.eth",
       "namehash": "ee6c4522aab0003e8d14cd40a6af439055fd2577951148c14b6cea9a53475835",
-      "dns": "07766974616c696b0365746800"
+      "dns": "07766974616c696b0365746800",
+      "ownerSlot": "9f63b6aa7c9ae6a87aed6d2a486460bc7fabde733278ff83dea2b3db500c17c9",
+      "resolverSlot": "9f63b6aa7c9ae6a87aed6d2a486460bc7fabde733278ff83dea2b3db500c17ca",
+      "ttlSlot": "9f63b6aa7c9ae6a87aed6d2a486460bc7fabde733278ff83dea2b3db500c17cb"
     },
     {
       "name": "resolver.eth",
       "namehash": "fdd5d5de6dd63db72bbc2d487944ba13bf775b50a80805fe6fcaba9b0fba88f5",
-      "dns": "087265736f6c7665720365746800"
+      "dns": "087265736f6c7665720365746800",
+      "ownerSlot": "861a01fbb16ae61ec657daa619a7bfbe489763ae2ff637ec4f8753aec7343e4f",
+      "resolverSlot": "861a01fbb16ae61ec657daa619a7bfbe489763ae2ff637ec4f8753aec7343e50",
+      "ttlSlot": "861a01fbb16ae61ec657daa619a7bfbe489763ae2ff637ec4f8753aec7343e51"
     },
     {
       "name": "long-label-with-hyphens.eth",
       "namehash": "bb8b71e3c2c527a90e23d377315c24a372c55e10b836febb91c9e4440155adc5",
-      "dns": "176c6f6e672d6c6162656c2d776974682d68797068656e730365746800"
+      "dns": "176c6f6e672d6c6162656c2d776974682d68797068656e730365746800",
+      "ownerSlot": "99c0140d47887c25c1561140b5f04e2370cd68480d2e12c80390ceef9c7afebf",
+      "resolverSlot": "99c0140d47887c25c1561140b5f04e2370cd68480d2e12c80390ceef9c7afec0",
+      "ttlSlot": "99c0140d47887c25c1561140b5f04e2370cd68480d2e12c80390ceef9c7afec1"
     },
     {
       "name": "0123456789.eth",
       "namehash": "07bb61e23d6426b81f89509a9f23b55a138c6f9c4e1367da5678618324eb2b7f",
-      "dns": "0a303132333435363738390365746800"
+      "dns": "0a303132333435363738390365746800",
+      "ownerSlot": "fb29b81dfbe76de9224fb60fa0884bd91f6884a3fe1432c899b330723c017542",
+      "resolverSlot": "fb29b81dfbe76de9224fb60fa0884bd91f6884a3fe1432c899b330723c017543",
+      "ttlSlot": "fb29b81dfbe76de9224fb60fa0884bd91f6884a3fe1432c899b330723c017544"
     },
     {
       "name": "x.y.z.a.b.c.d.e.f.eth",
       "namehash": "c7e78dd001ddf37700b3dc4f949ea50b1614cdb35547176a806ef40b8cb9ea68",
-      "dns": "01780179017a0161016201630164016501660365746800"
+      "dns": "01780179017a0161016201630164016501660365746800",
+      "ownerSlot": "56388b41f64af737f6a2e128411085e016b99421705d768eeecd32ee4967740a",
+      "resolverSlot": "56388b41f64af737f6a2e128411085e016b99421705d768eeecd32ee4967740b",
+      "ttlSlot": "56388b41f64af737f6a2e128411085e016b99421705d768eeecd32ee4967740c"
     },
     {
       "name": "café.eth",
       "namehash": "a7369e1df22e06ec6d91162508e400d7af475860638f927e6d1085bb0134a74a",
-      "dns": "05636166c3a90365746800"
+      "dns": "05636166c3a90365746800",
+      "ownerSlot": "6d19d563242c3d8d8a031af32e622e5dd258a61edd16b89c59f40fa388ae4ede",
+      "resolverSlot": "6d19d563242c3d8d8a031af32e622e5dd258a61edd16b89c59f40fa388ae4edf",
+      "ttlSlot": "6d19d563242c3d8d8a031af32e622e5dd258a61edd16b89c59f40fa388ae4ee0"
     },
     {
       "name": "test",
       "namehash": "04f740db81dc36c853ab4205bddd785f46e79ccedca351fc6dfcbd8cc9a33dd6",
-      "dns": "047465737400"
+      "dns": "047465737400",
+      "ownerSlot": "19976631b1d57d68e1f7d7833f93a9f14c1a1b47d01663acb575e19030475ed6",
+      "resolverSlot": "19976631b1d57d68e1f7d7833f93a9f14c1a1b47d01663acb575e19030475ed7",
+      "ttlSlot": "19976631b1d57d68e1f7d7833f93a9f14c1a1b47d01663acb575e19030475ed8"
     },
     {
       "name": "a",
       "namehash": "83853f8c4ca91ae85231d68dec421e7d9210f65860b863a574dfc0dc0c7e815e",
-      "dns": "016100"
+      "dns": "016100",
+      "ownerSlot": "70d4f336882a10e7c7d1b1b40c1bd3446312ac6b07f2c9cc9245fd97faf391ef",
+      "resolverSlot": "70d4f336882a10e7c7d1b1b40c1bd3446312ac6b07f2c9cc9245fd97faf391f0",
+      "ttlSlot": "70d4f336882a10e7c7d1b1b40c1bd3446312ac6b07f2c9cc9245fd97faf391f1"
     },
     {
       "name": "sub.domain.test",
       "namehash": "c6fc45d5fb0e5439c27c760d34a6dca9c20224dd1c3a40c85ec0dc00f322db0b",
-      "dns": "0373756206646f6d61696e047465737400"
+      "dns": "0373756206646f6d61696e047465737400",
+      "ownerSlot": "bcef3dfd4acdf28926d977b1f95458ff783ef7d09c7ef7824a6f1f213176b30a",
+      "resolverSlot": "bcef3dfd4acdf28926d977b1f95458ff783ef7d09c7ef7824a6f1f213176b30b",
+      "ttlSlot": "bcef3dfd4acdf28926d977b1f95458ff783ef7d09c7ef7824a6f1f213176b30c"
+    },
+    {
+      "name": "carry-78.eth",
+      "namehash": "d09e4e12ba60b4aec792d9b2a17a49c483430bb996623955a1a150973f9bb096",
+      "dns": "0863617272792d37380365746800",
+      "ownerSlot": "cbed1b147b79ed69bcf77e20f8220338581ffdcffc8ff7e3bcffda703bf91bff",
+      "resolverSlot": "cbed1b147b79ed69bcf77e20f8220338581ffdcffc8ff7e3bcffda703bf91c00",
+      "ttlSlot": "cbed1b147b79ed69bcf77e20f8220338581ffdcffc8ff7e3bcffda703bf91c01"
+    },
+    {
+      "name": "carry-1915.eth",
+      "namehash": "6ca5161391a5bcce27b8a1584808f4e332be2b8002407e5b20d2bf761135a74b",
+      "dns": "0a63617272792d313931350365746800",
+      "ownerSlot": "f65c0d661345ec682ce6eb40becfec36f5900f5206c6c9941ab40e63ab6affff",
+      "resolverSlot": "f65c0d661345ec682ce6eb40becfec36f5900f5206c6c9941ab40e63ab6b0000",
+      "ttlSlot": "f65c0d661345ec682ce6eb40becfec36f5900f5206c6c9941ab40e63ab6b0001"
     }
   ],
   "selectors": [

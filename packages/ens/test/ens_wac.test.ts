@@ -7,7 +7,14 @@
 import { wacTestRun } from "../../../harness/wacTestRun.ts";
 
 type Corpus = {
-  names: { name: string; namehash: string; dns: string }[];
+  names: {
+    name: string;
+    namehash: string;
+    dns: string;
+    ownerSlot: string;
+    resolverSlot: string;
+    ttlSlot: string;
+  }[];
   selectors: { signature: string; selector: string }[];
 };
 
@@ -15,13 +22,20 @@ const corpus = JSON.parse(
   await Deno.readTextFile(new URL("./vendor/corpus.json", import.meta.url)),
 ) as Corpus;
 
+// The two ground-out names are what exercise the slot increment's carry; a corpus that lost them would
+// leave the slot test passing and covering one case fewer than it says.
+const carries = corpus.names.filter((n) => n.ownerSlot.endsWith("ff")).length;
+if (carries < 2) throw new Error(`the corpus has ${carries} carry cases — regenerate it`);
+
 if (corpus.names.length < 10 || corpus.selectors.length < 5) {
   throw new Error(
     `corpus has ${corpus.names.length} names and ${corpus.selectors.length} selectors — is it intact?`,
   );
 }
 
-const names = corpus.names.map((n) => `${n.name}|${n.namehash}|${n.dns}`);
+const names = corpus.names.map((n) =>
+  `${n.name}|${n.namehash}|${n.dns}|${n.ownerSlot}|${n.resolverSlot}|${n.ttlSlot}`
+);
 const sigs = corpus.selectors.map((s) => `${s.signature}|${s.selector}`);
 
 await wacTestRun("packages/ens/test/wac/ens_test.wac", "ens", [

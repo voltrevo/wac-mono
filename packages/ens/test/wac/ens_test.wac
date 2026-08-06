@@ -7,6 +7,7 @@
 import { T } from "../../../wactest/src/assert.wac";
 import { namehash, dnsEncode, rootNode, hashInto, selector, resolverCall, addrCall,
          addressFromWord, isZeroAddress } from "../../src/ens.wac";
+import { ownerSlot, resolverSlot, ttlSlot } from "../../src/registry.wac";
 import { keccak256 } from "../../../crypto/src/keccak.wac";
 
 export string test_namehash_and_dns_encoding_match_ethers(fn[string(i32)] cases, fn[i32()] count,
@@ -17,8 +18,16 @@ export string test_namehash_and_dns_encoding_match_ethers(fn[string(i32)] cases,
   for (i32 i = 0; i < n; i++) {
     string[] parts = split(cases(i));
     u8[] name = parts[0].toBytes();
-    t.eqStr(hex(namehash(name)), parts[1], parts[0] + ": namehash");
+    u8[] node = namehash(name);
+    t.eqStr(hex(node), parts[1], parts[0] + ": namehash");
     t.eqStr(hex(dnsEncode(name)), parts[2], parts[0] + ": dns encoding");
+    // Solidity's mapping layout, which is what lets the registry be *read from a proof* rather than asked.
+    // Two of these names were ground out so their owner slot ends in `ff` and `ffff`: the step to the
+    // resolver slot is an increment across a 256-bit number, and an implementation that only touches the
+    // last byte is right 255 times in 256.
+    t.eqStr(hex(ownerSlot(node)), parts[3], parts[0] + ": records[node].owner slot");
+    t.eqStr(hex(resolverSlot(node)), parts[4], parts[0] + ": records[node].resolver slot");
+    t.eqStr(hex(ttlSlot(node)), parts[5], parts[0] + ": records[node].ttl slot");
   }
   return t.report();
 }

@@ -44,6 +44,35 @@ the tests cannot quietly cover for this.
   twelve bytes are not zero. Taking the low twenty anyway is how a resolver's wrong answer becomes a payment
   to the wrong place.
 
+## Reading the registry instead of asking it
+
+`src/registry.wac` says *where* a name's record lives, so it can be read from a state proof rather than from
+somebody's `eth_call`:
+
+```wac
+u8[] slot = resolverSlot(namehash(name));        // records[node].resolver
+StorageProof s = storageAt(registry.storageRoot, slot, proofNodes);   // packages/mpt
+```
+
+That is the difference between a resolution you can check and one you are told. The registry is
+
+    mapping(bytes32 => Record) records;   // slot 0
+    struct Record { address owner; address resolver; uint64 ttl; }
+
+so a node's owner is at `keccak256(node ++ 0)` and its resolver one slot above — an increment across a
+256-bit number, not a `+1` on something register-sized. Two of the corpus names were **ground out so their
+owner slot ends in `ff` and `ffff`**, because an implementation that only touches the last byte is right 255
+times in 256; with the carry removed, four assertions fail.
+
+This is a *layout*, not an interface: it is what the deployed bytecode does, and reading storage couples a
+caller to it in a way an `eth_call` does not. That coupling is the price of not trusting the answer, and it
+is stated in the source rather than discovered.
+
+**A resolver's own storage is not here.** A resolver is a contract of somebody's choosing — the public one, a
+wildcard resolver, one answering offchain through CCIP-read — and it has no layout this package can assume.
+Reading `addr(node)` from its storage needs that resolver's layout; reading it by `eth_call` means trusting
+the answer. Neither is pretended.
+
 ## How it is tested
 
 `npm:ethers@6` computed every expectation: twelve names' namehashes and DNS encodings, seven selectors. The

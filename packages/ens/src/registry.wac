@@ -1,0 +1,79 @@
+// Where the ENS registry keeps a name's record, so it can be read from a proof instead of from an answer.
+//
+// The usual way to resolve a name is `eth_call`, which is a provider computing something and telling you the
+// result. There is nothing to check in that. The other way is to read the registry's **storage** directly —
+// one slot, proved against a state root the light client already verified — and that is what this file is
+// for: it says which slot, and `packages/mpt` says whether the bytes are really in it.
+//
+// ## Solidity's mapping layout
+//
+// A `mapping(K => V)` declared at slot `p` stores the value for key `k` at `keccak256(k ++ p)`, both padded
+// to 32 bytes. A struct value occupies consecutive slots from there. The registry is
+//
+//     mapping(bytes32 => Record) records;      // slot 0
+//     struct Record { address owner; address resolver; uint64 ttl; }
+//
+// so a node's owner is at `keccak256(node ++ 0)`, its resolver one slot later, and its ttl one after that.
+// This is a layout rather than an interface: it is what the deployed bytecode does, and a caller reading
+// storage is coupled to it in a way an `eth_call` is not. Said plainly because that coupling is the price
+// of not trusting the answer, and the registry has not changed since 2017.
+//
+// ## Not implemented
+//
+// **Anything about a resolver's own storage.** A resolver is a contract of somebody's choosing — the public
+// one, a wildcard resolver, an offchain one answering through CCIP-read — and it has no layout this package
+// can assume. Reading `addr(node)` from a resolver's storage means knowing that resolver's layout; reading
+// it by `eth_call` means trusting the answer. Neither is here, and pretending otherwise would be the
+// approximation this repo keeps refusing to make.
+
+import { keccak256 } from "../../crypto/src/keccak.wac";
+
+/** The registry's `records` mapping is the contract's first declared variable, so its slot is zero. */
+export i32 RECORDS_SLOT() { return 0; }
+
+/**
+ * The slot holding `records[node].owner` — the base of the struct.
+ *
+ * `keccak256(node ++ slot)`, both 32 bytes, which is Solidity's rule for a mapping's value.
+ */
+export u8[] ownerSlot(u8[] node) {
+  if (node.len() != 32) { trap; }
+  u8[] joined = u8[64]();
+  for (i32 i = 0; i < 32; i++) { joined[i] = node[i]; }
+  // The slot number, big-endian in the low bytes — zero here, and written out rather than left implicit so
+  // that a second mapping in this file would only have to change the number.
+  i32 slot = RECORDS_SLOT();
+  joined[63] = slot & 0xFF;
+  joined[62] = (slot >> 8) & 0xFF;
+  return keccak256(joined);
+}
+
+/** `records[node].resolver` — the struct's second field, so one slot above the base. */
+export u8[] resolverSlot(u8[] node) { return plusOne(ownerSlot(node)); }
+
+/** `records[node].ttl` — the third. */
+export u8[] ttlSlot(u8[] node) { return plusOne(resolverSlot(node)); }
+
+/**
+ * A 32-byte big-endian value plus one.
+ *
+ * Struct fields are consecutive *slots*, and a slot number is a 256-bit integer — so "the next one" is an
+ * increment with carry across 32 bytes, not `+ 1` on something that fits a register. A base ending in
+ * `0xff` is the case that catches an implementation which only touches the last byte, and it happens once
+ * every 256 names.
+ */
+u8[] plusOne(u8[] v) {
+  u8[] out = u8[32]();
+  for (i32 i = 0; i < 32; i++) { out[i] = v[i]; }
+  for (i32 i = 31; i >= 0; i--) {
+    if (out[i] == 255) {
+      out[i] = 0;
+    } else {
+      out[i] = out[i] + 1;
+      return out;
+    }
+  }
+  // Every byte was 0xff: the increment wrapped to zero, which is the correct answer for a 256-bit value and
+  // an address space nothing can reach. Returning it rather than trapping keeps this total.
+  return out;
+}
