@@ -118,6 +118,7 @@ def main():
             clientEphemeralSecret=bytes(client_sec).hex(),
             clientEphemeralPublic=client_pub,
             serviceEphemeralPublic=service_pub,
+            serviceEphemeralSecret=bytes(service_sec).hex(),
             subcredential=subcred,
             encKey=enc_key,
             macKey=mac_key,

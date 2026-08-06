@@ -268,6 +268,62 @@ export u8[] clientRendezvousKeys(
  * RENDEZVOUS2 cell's `AUTH` field before calling this. Expanding an unauthenticated key seed gives
  * a working circuit to whoever answered.
  */
+/**
+ * The **service's** side of the rendezvous keys: `AUTH_INPUT_MAC | NTOR_KEY_SEED`, 64 bytes, or empty.
+ *
+ * The mirror of `clientRendezvousKeys`. As with the introduce half, only the two Diffie-Hellman
+ * computations differ and everything hashed after them is identical, in the same order:
+ *
+ *     client   EXP(Y, x)  EXP(B, x)      service   EXP(X, y)  EXP(X, b)
+ *
+ * — the same two shared values reached from the other side. `AUTH_INPUT_MAC` is what the service puts
+ * in RENDEZVOUS1 and the client compares against its own; `NTOR_KEY_SEED` expands to the circuit keys
+ * through `rendezvousCircuitKeys`, which both ends already share.
+ *
+ * **No subcredential**, as on the client side and for the same reason: tor's
+ * `hs_ntor_service_get_rendezvous1_keys()` does not take one.
+ */
+export u8[] serviceRendezvousKeys(
+  u8[] introAuthKey, u8[] introEncSecret, u8[] serviceEphemeralSecret, u8[] clientPublic
+) {
+  if (introAuthKey.len() != 32 || introEncSecret.len() != 32) { return u8[0](); }
+  if (serviceEphemeralSecret.len() != 32 || clientPublic.len() != 32) { return u8[0](); }
+
+  u8[] introEncKey = x25519Base(introEncSecret);
+  u8[] serviceEphemeral = x25519Base(serviceEphemeralSecret);
+  u8[] xy = x25519(serviceEphemeralSecret, clientPublic);
+  u8[] xb = x25519(introEncSecret, clientPublic);
+  if (isZero(xy) || isZero(xb)) { return u8[0](); }
+
+  u8[][] parts = u8[][7]();
+  parts[0] = xy;
+  parts[1] = xb;
+  parts[2] = introAuthKey;
+  parts[3] = introEncKey;
+  parts[4] = clientPublic;
+  parts[5] = serviceEphemeral;
+  parts[6] = protoid();
+  u8[] rendSecret = concat(parts);
+
+  u8[] keySeed = hsMac(rendSecret, tHsEnc());
+  u8[] verify = hsMac(rendSecret, tHsVerify());
+
+  u8[][] auth = u8[][7]();
+  auth[0] = verify;
+  auth[1] = introAuthKey;
+  auth[2] = introEncKey;
+  auth[3] = serviceEphemeral;
+  auth[4] = clientPublic;
+  auth[5] = protoid();
+  auth[6] = "Server".toBytes();
+  u8[] authMac = hsMac(concat(auth), tHsMac());
+
+  u8[][] out = u8[][2]();
+  out[0] = authMac;
+  out[1] = keySeed;
+  return concat(out);
+}
+
 export u8[] rendezvousCircuitKeys(u8[] ntorKeySeed) {
   if (ntorKeySeed.len() != 32) { return u8[0](); }
   u8[][] parts = u8[][2]();
