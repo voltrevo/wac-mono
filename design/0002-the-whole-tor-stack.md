@@ -382,7 +382,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
-| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. The **descriptor build is a function** now — `buildDescriptor` takes a service's own introduction points, time period and revision — and is checked by both oracles on three variants, not just the committed fixture. The **publication plan is complete**: from a consensus alone, `servicePlan` chooses the two time periods, the shared random value for each, and the directories — reaching exactly the ones a real service uploaded to. The **upload has a transport** (`publishOverCircuit`) and its answers three meanings, and an **INTRODUCE2 seen twice is dropped**. **Not done:** the service loop that ties them together — establishing introduction points, and driving a rendezvous circuit from an INTRODUCE2 |
+| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. The **descriptor build is a function** now — `buildDescriptor` takes a service's own introduction points, time period and revision — and is checked by both oracles on three variants, not just the committed fixture. The **publication plan is complete**: from a consensus alone, `servicePlan` chooses the two time periods, the shared random value for each, and the directories — reaching exactly the ones a real service uploaded to. The **upload has a transport** (`publishOverCircuit`) and its answers three meanings, and an **INTRODUCE2 seen twice is dropped**. **Introduction point rotation** follows tor's two drawn limits. **Not done:** the service loop that ties it together — establishing the circuits, and driving a rendezvous from an INTRODUCE2 |
 | 7 — the interop matrix | **not started as a document.** Steps 2–6 each contribute rows and most are green; nothing collects them, so a regression in one would not be visible as a regression in *the matrix* |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
@@ -1617,3 +1617,35 @@ Seven faults planted there, seven caught, the truncation among them.
 A smaller thing worth keeping: the replay cache's own test found a trap. A zero-capacity cache fell
 through to the eviction path and indexed an empty array. It remembers nothing now — a bad
 configuration but a coherent one, and not worth crashing a service over.
+
+### Rotation is a security property, and a comment in tor that is wrong
+
+An introduction point can count the cells it forwards. A service that kept one forever would let it
+accumulate an unbounded record of that service's traffic; a service that rotated on a fixed schedule
+would be identifiable by the schedule. So tor draws *both* limits and rotates on whichever arrives
+first — a busy service on the count, a quiet one on the clock:
+
+    introduce2_max = rand[16384, 32768)
+    time_to_expire = now + rand[18h, 24h)
+
+**Both upper bounds are exclusive, and tor's own comment says otherwise.** `crypto_rand_int_range` is
+documented as returning a value "between 0 and (max - min) inclusive", which reads as `[min, max]`. It
+calls `crypto_rand_uint(max - min)`, which returns `0 .. limit-1`. An introduction point therefore
+never lasts a full twenty-four hours and never forwards 32768 cells. Believing the comment puts both
+bounds one out, and nothing except a test sitting on the boundary would ever show it — so both
+boundaries are tested. That is the same shape as the padding round-down, the one-entry store and the
+one-sided consensus: **the documentation of a range is not the range.**
+
+The other rule worth having is an ordering. `should_remove_intro_point` checks for an existing circuit
+*before* acting on the retry count, because a circuit may have opened at the previous scheduled
+attempt. A service that counted retries alone would tear down an introduction point that had just come
+up — a race the counter cannot see from the inside. Expiry and falling out of the consensus outrank
+the circuit; the retry count does not. Reordering those two checks is a planted fault, and it is
+caught.
+
+The randomness is a parameter, for the reason the descriptor's salts are, and for one more: the
+rejection sampling belongs at the source. `crypto_rand_uint` loops to avoid the modulo bias, and a
+caller pushing a raw byte through a `%` at this end would reintroduce exactly that bias with nothing
+here able to notice.
+
+Nine faults planted, nine caught.
