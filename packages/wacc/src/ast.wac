@@ -255,7 +255,12 @@ export struct Decl {
 }
 
 export enum DeclKind {
-  Import(i32 pathTok, ImportItem[] items),
+  /**
+   * `prefixTok` is the bare word in `import { Read } from core;` and -1 for an ordinary quoted
+   * import, where `pathTok` is the string instead. Exactly one of the two is set: `core` is not a
+   * path, so there is nothing to quote and nothing to resolve it against.
+   */
+  Import(i32 pathTok, i32 prefixTok, ImportItem[] items),
   /**
    * `typeParams` are the name tokens of `<T, U>` after the declaration's name, empty when there are
    * none. A generic function, struct or enum is the same declaration with those recorded.

@@ -554,9 +554,18 @@ void printParams(Pr w, Param[] params) {
 
 void printDecl(Pr w, Decl d) {
   match (d.kind) {
-    case Import(pathTok, items): {
+    case Import(pathTok, prefixTok, items): {
       w.open("import", d.line, d.col);
-      w.sp(); w.strTok(pathTok);
+      // A prefixed import has no path token, and the module *inside* the provider is the empty
+      // string — `from core` names its only one. That is a value, not an absence, so it prints as
+      // `""` rather than as the `?` a missing token would give.
+      w.sp();
+      if (pathTok < 0 && prefixTok >= 0) { w.s("\"\""); } else { w.strTok(pathTok); }
+      // The provider prefix, or `-` for an ordinary path import. Printed rather than left out
+      // because the differential compares these strings: without it `from core` and `from ""`
+      // would render alike, and the corpus would agree about something it had not checked.
+      w.sp();
+      if (prefixTok < 0) { w.s("-"); } else { w.tok(prefixTok); }
       w.s(" (");
       for (i32 i = 0; i < items.len(); i++) {
         if (i > 0) { w.sp(); }

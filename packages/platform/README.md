@@ -168,10 +168,16 @@ anybody who forgot to ask got the old bug back — a filter over a disk that gav
 written half the answer. Removing a failure mode is worth more than the twenty call sites it cost,
 and in a young codebase those call sites are a schedule rather than an objection.
 
-`Read` lives in `packages/bytes`, not here, because `gzipStream(cli.readChunk, cli.write)` hands the
-capability straight to a transform — wac has no closures, so no adapter can sit between them, and
-`gzip` has no business depending on a capability world. The lowest package in the tree is where both
-sides can reach it.
+`Read` is not declared here. `gzipStream(cli.readChunk, cli.write)` hands the capability straight to
+a transform — wac has no closures, so no adapter can sit between them, and `gzip` has no business
+depending on a capability world. It used to live in `packages/bytes`, the lowest package in the
+tree; it is now in `core`, the module the compiler ships, which is the same argument carried one
+step further. Being below everything in *this* repo stops being enough the moment `platform` is a
+repo of its own, and two declarations of `Read` can never be converted into each other. So:
+
+```wac
+import { Read } from core;
+```
 
 `write` keeps its `bool` and has `outputError()` beside it, because its two outcomes are *not* the
 same shape of question: a reader that went away is a normal ending a filter should exit 0 on, and a

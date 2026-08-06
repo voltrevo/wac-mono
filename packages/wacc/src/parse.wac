@@ -1714,10 +1714,19 @@ Decl parseImport(P p) {
   // `slice(a, from, to)` could name its argument — and only an import clause can put
   // one here, which is what makes matching it by text safe.
   if (p.at1(kIdent())) { p.advance(); } else { p.fail(perrExpected()); }
+  // A quoted specifier is a path. A bare word is `core`, the module the compiler ships — it is not
+  // a file, so it is not quoted, and there is nothing here to resolve it against.
+  //
+  // The word is recorded rather than checked, the same way `from` above is recorded rather than
+  // checked. The reference rejects anything but `core`; matching that means a new error code, and
+  // this parser does not yet distinguish the contextual keywords it already accepts loosely.
   i32 pathTok = -1;
-  if (p.at1(kString())) { pathTok = p.advance(); } else { p.fail(perrExpected()); }
+  i32 prefixTok = -1;
+  if (p.at1(kString())) { pathTok = p.advance(); }
+  else if (p.at1(kIdent())) { prefixTok = p.advance(); }
+  else { p.fail(perrExpected()); }
   p.expect(kSemi());
-  return Decl(DeclKind.Import(pathTok, items.take()), line, col);
+  return Decl(DeclKind.Import(pathTok, prefixTok, items.take()), line, col);
 }
 
 Decl parseStructDecl(P p, bool exported) {

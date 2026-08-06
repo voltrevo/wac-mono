@@ -48,7 +48,8 @@ new from it.
 
 `Read` rather than `u8[]` for the same reason gzip uses it: an empty array means both "finished" and
 "failed", every filter in this repo treated the second as the first, and `gzipStream` produced a
-*valid* archive of half its input with a CRC to match. See `packages/bytes/src/read.wac`.
+*valid* archive of half its input with a CRC to match. `Read` is in `core`, the module the compiler
+ships — `import { Read } from core;` — so both ends of a stream name one type.
 
 ## What is actually hard here
 

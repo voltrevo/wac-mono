@@ -195,7 +195,9 @@ function decl(d: any): string {
   switch (d.tag) {
     case "import": {
       const items = d.items.map((i: any) => `(${i.name} ${i.alias})`).join(" ");
-      return `(import${pos(d)} ${escapeStr(d.path)} (${items}))`;
+      // `-` for an ordinary path import, the provider's name for `from core`. Both sides render it,
+      // so the corpus compares it rather than agreeing about a field neither one shows.
+      return `(import${pos(d)} ${escapeStr(d.path)} ${d.prefix ?? "-"} (${items}))`;
     }
     case "func":
       return `(func${pos(d)} ${d.exported ? "export" : "local"} ${d.name}` +

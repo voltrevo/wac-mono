@@ -18,7 +18,7 @@ import { itoa, itoa64 } from "../../../fmt/src/itoa.wac";
 import { concat, slice } from "../lib/bytes.wac";
 import { Parsed, Request, parseRequest } from "../../../http/src/request.wac";
 import { Response, write as writeResponse } from "../../../http/src/response.wac";
-import { Read } from "../../../bytes/src/read.wac";
+import { Read } from core;
 
 export i32 httpd(Core core, Cli cli, Args a) {
   i32 port = a.num == 0 ? 8080 : a.num;

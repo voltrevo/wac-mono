@@ -30,7 +30,7 @@
 // file: it is the smallest program that distinguishes them.
 
 import { Core, Cli, Socket, Pending } from "../src/platform.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 
 export i32 main(Core core, Cli cli) {
   i32 port = cli.argCount().wait() > 0 ? parsePort(cli.arg(0).wait()) : 18099;

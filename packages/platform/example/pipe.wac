@@ -25,7 +25,7 @@
 
 import { Child, Cli, Core, FileResult, GRANT_NONE, Pending } from "../src/platform.wac";
 import { argvOf } from "../src/stream.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 
 /** Standard input, in the same handle space as sockets and children. */
 const i32 STDIN = 0;

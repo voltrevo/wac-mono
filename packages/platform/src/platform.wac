@@ -55,10 +55,11 @@
  * A ticket is good once. Waiting on a spent one is an error rather than a plausible wrong
  * answer, because the slot underneath is reused and its generation has moved on.
  */
-// The one type this world does not define itself. `Read` lives in `packages/bytes` because the
-// streaming transforms in `gzip` and `stream` must name it too, and they have no business depending
-// on a capability world — see the note at the top of `bytes/src/read.wac`.
-import { Read } from "../../bytes/src/read.wac";
+// The one type this world does not define itself. `Read` is in `core` — the compiler's own module —
+// because the streaming transforms in `gzip` and `stream` must name it too and have no business
+// depending on a capability world, and because with no closures in the language a second copy of it
+// could never be converted into this one. See wac's `design/0001`.
+import { Read } from core;
 
 export struct Pending<T> {
   i32 id;

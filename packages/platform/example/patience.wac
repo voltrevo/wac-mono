@@ -35,7 +35,7 @@
 //   giving up after 600ms
 
 import { Cli, Core, Pending, Socket } from "../src/platform.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 
 const i32 ROUNDS = 6;   // more than SLOTS, so a leaked ticket would show up as a stall
 
