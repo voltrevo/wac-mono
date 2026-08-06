@@ -1,0 +1,146 @@
+// ESTABLISH_INTRO, against the cell tor's own parser accepted and both of tor's verifications.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  ESTABLISH_INTRO_SIG_PREFIX, establishIntroCell, macSpanOf, prefixed, sigSpanOf,
+} from "../../src/hsservice.wac";
+import { hsMac } from "../../src/hsntor.wac";
+import { ed25519PublicKey, ed25519Verify } from "../../../crypto/src/ed25519.wac";
+
+const i32 E_AUTH_SEED = 0;
+const i32 E_AUTH_PUBLIC = 1;
+const i32 E_KH = 2;
+const i32 E_CELL = 3;
+const i32 E_MAC_SPAN_LEN = 4;
+const i32 E_SIG_SPAN_LEN = 5;
+const i32 E_NODE_SIG = 6;
+
+u8[] none() { return u8[0](); }
+
+i32 be32(u8[] b) { return b[0] * 16777216 + b[1] * 65536 + b[2] * 256 + b[3]; }
+
+/** The cell built from the vector's own inputs. */
+u8[] built(fn[u8[](i32, u8[], u8[])] ref) {
+  return establishIntroCell(ref(E_AUTH_PUBLIC, none(), none()), ref(E_AUTH_SEED, none(), none()),
+                            ref(E_KH, none(), none()));
+}
+
+export string test_the_cell_tor_accepted_is_reproduced(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqBytes(built(ref), ref(E_CELL, none(), none()),
+            "the ESTABLISH_INTRO cell is the one tor parsed and verified");
+
+  // The public half is derivable from the seed, so a vector whose two halves disagreed would be
+  // caught here rather than showing up as a signature that verifies against the wrong key.
+  t.eqBytes(ed25519PublicKey(ref(E_AUTH_SEED, none(), none())), ref(E_AUTH_PUBLIC, none(), none()),
+            "the auth key is the seed's own public half");
+  return t.report();
+}
+
+/**
+ * The two spans, as tor reports them.
+ *
+ * Taken from tor's parsed cell rather than recomputed, which is what makes this a check on the
+ * boundary rather than a restatement of it. The signature span is the one that matters: it ends
+ * *after* the MAC and *before* `sig_len`, so it is the MAC span plus exactly 32.
+ */
+export string test_the_spans_are_where_tor_says(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] cell = built(ref);
+  i32 macLen = be32(ref(E_MAC_SPAN_LEN, none(), none()));
+  i32 sigLen = be32(ref(E_SIG_SPAN_LEN, none(), none()));
+
+  t.eqI32(macSpanOf(cell).len(), macLen, "the MAC span ends where tor's end_mac_fields does");
+  t.eqI32(sigSpanOf(cell).len(), sigLen, "the signature span ends where tor's end_sig_fields does");
+
+  // And the relationship, stated separately: the two length bytes of `sig_len` are outside the
+  // signed span, which is the whole trap.
+  t.eqI32(sigLen - macLen, 32, "the signature covers the MAC and stops before sig_len");
+  t.eqI32(cell.len() - sigLen, 66, "and what follows the span is sig_len plus the 64-byte signature");
+  return t.report();
+}
+
+/** The MAC is `crypto_mac_sha3_256` over the MAC span, keyed with the circuit's KH. */
+export string test_the_mac_is_keyed_with_the_circuit(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] cell = built(ref);
+  i32 macLen = be32(ref(E_MAC_SPAN_LEN, none(), none()));
+
+  u8[] want = hsMac(ref(E_KH, none(), none()), macSpanOf(cell));
+  u8[] have = u8[32]();
+  for (i32 i = 0; i < 32; i++) { have[i] = cell[macLen + i]; }
+  t.eqBytes(have, want, "the handshake MAC in the cell is the one the KH produces");
+
+  // A different circuit gives a different MAC, which is the property that stops a recorded cell being
+  // replayed onto another circuit. Without this the test would pass for a MAC that ignored the key.
+  u8[] otherKh = u8[20]();
+  for (i32 i = 0; i < 20; i++) { otherKh[i] = 1; }
+  t.isTrue(!sameBytes(hsMac(otherKh, macSpanOf(cell)), want),
+           "another circuit's KH gives another MAC");
+  return t.report();
+}
+
+/**
+ * The signature, checked by a signer that has never seen ours.
+ *
+ * The host signs the same message with the same seed using node's Ed25519. Our own `ed25519Verify` is
+ * asked too, which is worth something once the host has established what the answer is — but on its
+ * own it would only say that our signer and our verifier agree.
+ */
+export string test_the_signature_is_over_the_prefixed_span(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] cell = built(ref);
+  i32 sigLen = be32(ref(E_SIG_SPAN_LEN, none(), none()));
+
+  u8[] sig = u8[64]();
+  for (i32 i = 0; i < 64; i++) { sig[i] = cell[sigLen + 2 + i]; }
+
+  u8[] message = prefixed(sigSpanOf(cell));
+  t.eqBytes(sig, ref(E_NODE_SIG, message, none()),
+            "node's Ed25519 over the same span produces the same signature");
+  t.isTrue(ed25519Verify(ref(E_AUTH_PUBLIC, none(), none()), message, sig),
+           "and our own verifier accepts it");
+
+  // The prefix is part of the message. Without it the signature would still be well-formed and tor
+  // would refuse it, so a test that signed the bare span would pass against itself and fail live.
+  t.isTrue(!ed25519Verify(ref(E_AUTH_PUBLIC, none(), none()), sigSpanOf(cell), sig),
+           "the bare span is not what was signed — the prefix is part of the message");
+  t.eqStr(ESTABLISH_INTRO_SIG_PREFIX, "Tor establish-intro cell v1", "and it is tor's own string");
+
+  // The obvious span — two bytes more, taking in `sig_len` — is a different message. The fixture
+  // records tor refusing a cell signed that way; this is the same fact on our side of the seam.
+  u8[] tooMuch = u8[sigLen + 2]();
+  for (i32 i = 0; i < tooMuch.len(); i++) { tooMuch[i] = cell[i]; }
+  t.isTrue(!ed25519Verify(ref(E_AUTH_PUBLIC, none(), none()), prefixed(tooMuch), sig),
+           "signing everything before the signature would be a different signature");
+  return t.report();
+}
+
+/** Inputs that are not keys produce nothing, rather than a cell an intro point will hang up on. */
+export string test_bad_inputs_make_no_cell(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] seed = ref(E_AUTH_SEED, none(), none());
+  u8[] pub = ref(E_AUTH_PUBLIC, none(), none());
+  u8[] kh = ref(E_KH, none(), none());
+
+  t.eqI32(establishIntroCell(u8[0](), seed, kh).len(), 0, "no auth key, no cell");
+  t.eqI32(establishIntroCell(pub, u8[0](), kh).len(), 0, "no secret, no cell");
+  t.eqI32(establishIntroCell(pub, seed, u8[0]()).len(), 0, "no circuit material, no cell");
+  t.eqI32(establishIntroCell(u8[31](), seed, kh).len(), 0, "a 31-byte auth key is not one");
+
+  // Truncated cells are walked rather than indexed, so the span helpers refuse them instead of
+  // reading past the end.
+  u8[] cell = built(ref);
+  u8[] cut = u8[10]();
+  for (i32 i = 0; i < 10; i++) { cut[i] = cell[i]; }
+  t.eqI32(macSpanOf(cut).len(), 0, "a truncated cell has no MAC span");
+  t.eqI32(sigSpanOf(cut).len(), 0, "and no signature span");
+  t.eqI32(macSpanOf(u8[0]()).len(), 0, "nor does an empty one");
+  return t.report();
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}

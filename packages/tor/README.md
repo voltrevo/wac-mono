@@ -462,6 +462,22 @@ The vectors are captured by `tools/capture-*.py` from a running chutney network 
 suite needs no network. `src/hsfetch.wac` and `src/hsconnect.wac` are the live programs; they are not
 in the suite, for the same reason `src/app.wac` is not.
 
+### Hosting one — `src/hsservice.wac`
+
+`design/0002` step 6, begun. Every table row above is the *client* half; a service does the mirror of
+each, and the mirrors are not symmetric — the client proves nothing about itself and the service
+proves everything, so every cell it sends carries a signature or a MAC the client's equivalent does
+not. **ESTABLISH_INTRO** is done and pinned by `tools/estintro-probe.c` against tor's own parser and
+both of tor's verifications; INTRODUCE2, the hs-ntor responder, RENDEZVOUS1 and descriptor publication
+are not.
+
+The one thing to know before writing another cell of it: **the signature span ends before `sig_len`,
+not before the signature.** `end_sig_fields` sits between the handshake MAC and the two length bytes,
+so a cell signed over "everything before the signature" parses, verifies its MAC, and is refused with
+`signature not as expected`. Nothing in the cell's shape says so — only a `@ptr` in
+`src/trunnel/hs/cell_establish_intro.trunnel` — so both spans are read out of tor's *parsed* cell in
+the test rather than recomputed on our side.
+
 ### Four things the specification does not say plainly
 
 Each produces a well-formed, useless value, and none of them has a local symptom.

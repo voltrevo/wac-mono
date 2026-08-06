@@ -833,3 +833,70 @@ interop matrix stays a shell script. And **the suite does not stand up a Tor net
 ports a relay listens on are baked into its signed descriptor, so two agents running the suite at once
 would collide on 5555. `test/network.test.ts` tests the launcher against `example/waiter.wac`, which
 is the right subject anyway: it knows about processes and ready markers, not about Tor.
+
+### Step 6 begins: ESTABLISH_INTRO, and a span nothing in the cell hints at
+
+The first cell an onion service sends. `src/hsservice.wac`, pinned by `tools/estintro-probe.c`, which
+puts the cell through tor's own `trn_cell_establish_intro_parse` and then tor's own
+`crypto_mac_sha3_256` and `ed25519_checksig_prefixed`.
+
+The layout is `src/trunnel/hs/cell_establish_intro.trunnel`, and the two `@ptr` markers in it are the
+entire difficulty:
+
+    auth_key_type   1        <- start_cell
+    auth_key_len    2
+    auth_key       32
+    extensions      1 + …
+                             <- end_mac_fields
+    handshake_mac  32
+                             <- end_sig_fields
+    sig_len         2
+    sig            64
+
+The MAC covers everything before the MAC, which is the obvious thing. **The signature covers
+everything before `sig_len`** — so it includes the MAC and excludes the two length bytes that follow
+it. "Everything before the signature", the reading anyone would take from the cell's shape, is two
+bytes too long.
+
+That is not an argument, it is a measurement. A cell signed the obvious way, with the same key over
+the same fields:
+
+    parsed_bytes: 134
+    mac: ok
+    REJECTED
+    reason: signature not as expected
+
+It parses, its MAC verifies, and tor refuses it. Nothing but the position of a marker in a trunnel
+file distinguishes the two, so the test reads both span lengths **out of tor's parsed cell** rather
+than recomputing them — a comment can drift from the code, and this cannot.
+
+**Unlike a microdescriptor, this cell's verdict is worth something.** It carries a MAC and a
+signature and tor checks both, so ACCEPTED means the bytes are right rather than merely well-shaped.
+Measured rather than assumed — every mutation refused, and the table is in the fixture so a test built
+on the verdict can say what the verdict is worth:
+
+| mutation | tor |
+|---|---|
+| unmodified | ACCEPTED |
+| one bit of the auth key | `handshake_auth not as expected` |
+| one bit of the handshake MAC | `handshake_auth not as expected` |
+| one bit of the signature | `signature not as expected` |
+| the wrong circuit KH | `handshake_auth not as expected` |
+| `auth_key_type` 1 instead of 2 | `handshake_auth not as expected` |
+| truncated | `parse returned -2` |
+| **signed over the obvious span** | `signature not as expected` |
+
+Two other things worth keeping. `crypto_mac_sha3_256` — SHA3-256 over the key length as eight
+big-endian bytes, then the key, then the message — is exactly `hsMac`, which the client half already
+had; the service reuses it rather than growing a second one. And **node's Ed25519 reproduces our
+signature byte for byte**, which is the check that matters: our signer feeding our verifier can agree
+on a wrong answer, and node shares no code with us.
+
+Faults planted after green — signing the obvious span, signing only the MAC span, dropping the
+prefix, swapping the MAC's key and message, omitting the extension count, the wrong auth key type,
+and a `sigSpanOf` that forgets the MAC — all seven caught.
+
+What step 6 still needs: INTRODUCE2 parsing (the inverse of `introduce1Cell`), the hs-ntor
+*responder* keys mirroring `clientIntroduceKeys`/`clientRendezvousKeys`, RENDEZVOUS1, and descriptor
+building and publication — the inverse of `hsdesc.wac`'s decryption. The cell above is the one they
+all hang from, because a service with no established introduction point has nothing to publish.
