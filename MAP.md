@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-30 packages, 63,366 lines of wac, 1268 tests,
+31 packages, 63,859 lines of wac, 1272 tests,
 38 command-line programs and 4 browser pages.
 
 ## Packages
@@ -13,6 +13,7 @@ In dependency order: nothing here imports anything below it.
 
 | package | what it is | wac lines | tests | builds on |
 |---|---|---|---|---|
+| [`abi`](packages/abi/) | The contract ABI, in wac: how a call's arguments become calldata and how returned bytes become values. | 493 | 4 | — |
 | [`bytes`](packages/bytes/) | `Buf` — a growable byte buffer. | 256 | 25 | — |
 | [`regex`](packages/regex/) | A backtracking regular expression engine, with JavaScript's semantics. | 971 | 16 | — |
 | [`std`](packages/std/) | Containers and the two sum types every program ends up wanting. | 586 | 42 | — |

@@ -1,0 +1,102 @@
+// `decode` and `encode` reachable from the test's TypeScript, flattened.
+//
+// The rendering is done here rather than in TypeScript for the reason `packages/rlp`'s tests give: what is
+// under test is what the *decoder* thinks the bytes mean, and a rendering computed on this side is a
+// rendering of exactly that. The host computes the same string from ethers' decode of the same bytes.
+import { decode, encode, Decoded, Value, T_TUPLE, listOf, wordOfValue, bytesOfValue,
+         typeLen, isDynamic } from "../../src/abi.wac";
+
+/** `[ok, render… ]` when it worked, `[0, error…]` when it did not. */
+export u8[] decodeRender(u8[] data, i32[] schema) {
+  Decoded d = decode(data, schema);
+  string text = d.ok ? renderTuple(d.items, schema, 0) : d.error;
+  u8[] body = text.toBytes();
+  u8[] out = u8[1 + body.len()]();
+  out[0] = d.ok ? 1 : 0;
+  for (i32 i = 0; i < body.len(); i++) { out[1 + i] = body[i]; }
+  return out;
+}
+
+/** Decode, then re-encode: the bytes must come back. Answers the re-encoding, or empty on failure. */
+export u8[] roundTrip(u8[] data, i32[] schema) {
+  Decoded d = decode(data, schema);
+  if (!d.ok) { return u8[0](); }
+  return encode(d.items, schema);
+}
+
+string renderTuple(Value[] items, i32[] schema, i32 schemaAt) {
+  string out = "";
+  i32 s = schemaAt;
+  for (i32 i = 0; i < items.len(); i++) {
+    if (i > 0) { out = out + "|"; }
+    out = out + render(items[i], schema, s);
+    s = s + typeLen(schema, s);
+  }
+  return out;
+}
+
+string render(Value v, i32[] schema, i32 s) {
+  i32 t = schema[s];
+  if (t == 1 || t == 4) { return (t == 1 ? "u" : "x") + trimHex(wordOfValue(v), t == 1); }
+  if (t == 2) { u8[] w = wordOfValue(v); return w[31] == 1 ? "b1" : "b0"; }
+  if (t == 3) {
+    u8[] w = wordOfValue(v);
+    u8[] a = u8[20]();
+    for (i32 i = 0; i < 20; i++) { a[i] = w[12 + i]; }
+    return "a" + hex(a);
+  }
+  if (t == 5) { return "x" + hex(bytesOfValue(v)); }
+  if (t == 6) { return "s" + hex(bytesOfValue(v)); }
+  if (t == 7 || t == 8) {
+    Value[] xs = listOf(v);
+    i32 elem = t == 7 ? s + 1 : s + 2;
+    string out = "[";
+    for (i32 i = 0; i < xs.len(); i++) {
+      if (i > 0) { out = out + ","; }
+      out = out + render(xs[i], schema, elem);
+    }
+    return out + "]";
+  }
+  if (t == 9) {
+    Value[] xs = listOf(v);
+    string out = "(";
+    i32 m = s + 2;
+    for (i32 i = 0; i < xs.len(); i++) {
+      if (i > 0) { out = out + ","; }
+      out = out + render(xs[i], schema, m);
+      m = m + typeLen(schema, m);
+    }
+    return out + ")";
+  }
+  return "?";
+}
+
+/** A number's hex without leading zeros — `u0` for zero — or a `bytes32`'s full 64 characters. */
+string trimHex(u8[] b, bool trim) {
+  if (!trim) { return hex(b); }
+  i32 at = 0;
+  while (at < b.len() && b[at] == 0) { at++; }
+  if (at == b.len()) { return "0"; }
+  u8[] rest = u8[b.len() - at]();
+  for (i32 i = 0; i < rest.len(); i++) { rest[i] = b[at + i]; }
+  string h = hex(rest);
+  // A leading nibble of zero is not written either: ethers prints `0x2a`, not `0x02a`.
+  u8[] hb = h.toBytes();
+  if (hb.len() > 1 && hb[0] == '0') {
+    u8[] cut = u8[hb.len() - 1]();
+    for (i32 i = 0; i < cut.len(); i++) { cut[i] = hb[i + 1]; }
+    return string.fromBytes(cut);
+  }
+  return h;
+}
+
+string hex(u8[] b) {
+  u8[] out = u8[b.len() * 2]();
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 hi = b[i] >> 4;
+    i32 lo = b[i] & 15;
+    out[i * 2] = hi < 10 ? '0' + hi : 'a' + (hi - 10);
+    out[i * 2 + 1] = lo < 10 ? '0' + lo : 'a' + (lo - 10);
+  }
+  return string.fromBytes(out);
+}

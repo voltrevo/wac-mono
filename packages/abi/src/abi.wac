@@ -1,0 +1,492 @@
+// The contract ABI: how a call's arguments become calldata, and how returned bytes become values.
+//
+// Every static type is a 32-byte word. Every dynamic one — `bytes`, `string`, `T[]`, and any tuple or fixed
+// array containing one — puts an **offset** in the head and its contents in the tail, and the offsets are
+// relative to the start of the *enclosing tuple's head* rather than to the message. That relativity is the
+// whole difficulty: an implementation that measures from the start of the calldata passes every flat case
+// and fails the moment a dynamic type is nested. `packages/ssz/src/container.wac` documents the same class
+// of mistake for SSZ's variable fields and is worth reading beside this.
+//
+// ## Schema-driven, because a type is data
+//
+// A descriptor is an `i32[]` in prefix order — `T_ARRAY, T_STRING` is `string[]`, and
+// `T_TUPLE, 2, T_UINT, T_BYTES` is `(uint256, bytes)`. One decoder walks the descriptor rather than one
+// function per signature, which is the shape `packages/ssz` arrived at for containers and for the same
+// reason: a call site describes its types instead of hand-writing an accessor per field.
+//
+// ## What a decoder must refuse
+//
+// A malformed offset is not an unusual input, it is an attack: reading past a field's own bounds is how
+// this class of bug becomes a security one. So an offset outside the payload, an offset pointing back into
+// the head, a length longer than the bytes that follow it, and a payload that is not a whole number of
+// words are each refused with a sentence naming the rule.
+//
+// ## Not implemented
+//
+// **Signed integers, and widths other than 256.** `uint256`/`int256` are one word and land in `Word`
+// unchanged, which is what every caller in this repo needs; `uint8`…`uint248` are the same word with a
+// range check nobody has asked for yet, and sign extension is a decision about a type this package does not
+// have. A caller that wants a number has `packages/bignum` and the 32 bytes.
+//
+// **Function selectors are not prepended.** `encode` produces the argument tuple; a call is
+// `keccak256(signature)[0..4] ++ encode(...)`, and which signature a call has is the caller's business.
+
+/** A decoded value. `Word` is every static type; the ABI does not distinguish them once they are bytes. */
+export enum Value {
+  /** Exactly 32 bytes, as they appear in the calldata. */
+  Word(u8[] bytes),
+  /** The contents of a `bytes` or `string`, without the length word or the padding. */
+  Bytes(u8[] value),
+  /** An array's elements or a tuple's members, in order. */
+  List(Value[] items),
+}
+
+// ── The descriptor ────────────────────────────────────────────────────────────
+
+/** `uint256`, `int256` — one word, untouched. */
+export i32 T_UINT() { return 1; }
+/** `bool` — a word that is 0 or 1, checked. */
+export i32 T_BOOL() { return 2; }
+/** `address` — a word whose first twelve bytes are zero, checked. */
+export i32 T_ADDRESS() { return 3; }
+/** `bytes32` — one word, untouched. */
+export i32 T_BYTES32() { return 4; }
+/** `bytes` — dynamic. */
+export i32 T_BYTES() { return 5; }
+/** `string` — dynamic, and the same encoding as `bytes`; the difference is what a caller does with it. */
+export i32 T_STRING() { return 6; }
+/** `T[]` — dynamic. Followed by the element's descriptor. */
+export i32 T_ARRAY() { return 7; }
+/** `T[k]` — followed by `k`, then the element's descriptor. Dynamic only if `T` is. */
+export i32 T_FIXED() { return 8; }
+/** `(a, b, …)` — followed by the member count, then each member's descriptor. */
+export i32 T_TUPLE() { return 9; }
+
+/** What `decode` answered. */
+export struct Decoded {
+  bool ok;
+  /** The top-level tuple's members, in order. Empty when `ok` is false. */
+  Value[] items;
+  string error;
+
+  Decoded of(bool ok, Value[] items, string error) { return Decoded(ok, items, error); }
+}
+
+/** How many `i32`s the descriptor at `at` occupies, so a walk can step over a member. */
+export i32 typeLen(i32[] schema, i32 at) {
+  i32 t = schema[at];
+  if (t == T_ARRAY()) { return 1 + typeLen(schema, at + 1); }
+  if (t == T_FIXED()) { return 2 + typeLen(schema, at + 2); }
+  if (t == T_TUPLE()) {
+    i32 n = schema[at + 1];
+    i32 len = 2;
+    for (i32 i = 0; i < n; i++) { len = len + typeLen(schema, at + len); }
+    return len;
+  }
+  return 1;
+}
+
+/** Whether this type is encoded as an offset and a tail rather than in place. */
+export bool isDynamic(i32[] schema, i32 at) {
+  i32 t = schema[at];
+  if (t == T_BYTES() || t == T_STRING() || t == T_ARRAY()) { return true; }
+  if (t == T_FIXED()) { return isDynamic(schema, at + 2); }
+  if (t == T_TUPLE()) {
+    i32 n = schema[at + 1];
+    i32 off = 2;
+    for (i32 i = 0; i < n; i++) {
+      if (isDynamic(schema, at + off)) { return true; }
+      off = off + typeLen(schema, at + off);
+    }
+    return false;
+  }
+  return false;
+}
+
+/** How many words this type occupies in a head. One, unless it is a fixed array or tuple of static types. */
+i32 headWords(i32[] schema, i32 at) {
+  if (isDynamic(schema, at)) { return 1; }
+  i32 t = schema[at];
+  if (t == T_FIXED()) { return schema[at + 1] * headWords(schema, at + 2); }
+  if (t == T_TUPLE()) {
+    i32 n = schema[at + 1];
+    i32 off = 2;
+    i32 words = 0;
+    for (i32 i = 0; i < n; i++) {
+      words = words + headWords(schema, at + off);
+      off = off + typeLen(schema, at + off);
+    }
+    return words;
+  }
+  return 1;
+}
+
+// ── Decoding ──────────────────────────────────────────────────────────────────
+
+/** The reader: where it is, and what broke. A struct, because wac has no exceptions. */
+struct R {
+  u8[] data;
+  string error;
+}
+
+/**
+ * `data` as the tuple `schema` describes, where `schema` is the *members* of the top-level tuple.
+ *
+ * The descriptor is a tuple's contents rather than a tuple itself, because that is what a call's arguments
+ * and a call's return are: `decode(returnData, i32[](T_UINT(), T_BYTES()))` reads `(uint256, bytes)`.
+ */
+export Decoded decode(u8[] data, i32[] schema) {
+  if (data.len() % 32 != 0) {
+    return Decoded.of(false, none(), "calldata is a whole number of 32-byte words, and this is " +
+      itoa(data.len()) + " bytes");
+  }
+  R r = R(data, "");
+  // The top level is a tuple of everything in the descriptor, and its head starts at zero.
+  i32 count = 0;
+  i32 off = 0;
+  while (off < schema.len()) { off = off + typeLen(schema, off); count++; }
+  Value[] items = tupleAt(r, schema, 0, count, 0, data.len());
+  if (r.error != "") { return Decoded.of(false, none(), r.error); }
+  return Decoded.of(true, items, "");
+}
+
+Value[] none() { return Value[0](fill: Value.Word(u8[32]())); }
+
+/**
+ * The members of a tuple whose head begins at `base` and whose region ends at `end`.
+ *
+ * `base` is what every offset inside this tuple is measured from — the rule that makes nesting work, and
+ * the one an implementation gets wrong by measuring from the message instead.
+ */
+Value[] tupleAt(R r, i32[] schema, i32 schemaAt, i32 count, i32 base, i32 end) {
+  Value[] out = Value[count](fill: Value.Word(u8[32]()));
+  if (r.error != "") { return out; }
+  // The head's width, needed before the walk: an offset must point *past* it. Without that, an offset of
+  // zero aims a dynamic field at the head itself, which is how one field is made to alias another — and it
+  // is the one malformation that reads as a perfectly ordinary empty value.
+  i32 headBytes = 0;
+  i32 hs = schemaAt;
+  for (i32 i = 0; i < count; i++) {
+    headBytes = headBytes + headWords(schema, hs) * 32;
+    hs = hs + typeLen(schema, hs);
+  }
+  i32 at = base;
+  i32 s = schemaAt;
+  for (i32 i = 0; i < count; i++) {
+    if (isDynamic(schema, s)) {
+      i32 off = word(r, at);
+      if (r.error != "") { return out; }
+      // Measured from this tuple's own base, and it must land inside this tuple's region and after its head.
+      if (off < headBytes) {
+        r.error = "an offset of " + itoa(off) + " points back into a head of " + itoa(headBytes) + " bytes";
+        return out;
+      }
+      if (base + off >= end) {
+        r.error = "an offset of " + itoa(off) + " points outside its tuple";
+        return out;
+      }
+      out[i] = valueAt(r, schema, s, base + off, end, base);
+    } else {
+      out[i] = staticAt(r, schema, s, at, end);
+    }
+    if (r.error != "") { return out; }
+    at = at + headWords(schema, s) * 32;
+    if (at > end) {
+      r.error = "a tuple's head runs past the end of its region";
+      return out;
+    }
+    s = s + typeLen(schema, s);
+  }
+  return out;
+}
+
+/** A static value in place at `at`. */
+Value staticAt(R r, i32[] schema, i32 s, i32 at, i32 end) {
+  i32 t = schema[s];
+  if (t == T_FIXED()) {
+    i32 n = schema[s + 1];
+    Value[] items = Value[n](fill: Value.Word(u8[32]()));
+    i32 step = headWords(schema, s + 2) * 32;
+    for (i32 i = 0; i < n; i++) {
+      items[i] = staticAt(r, schema, s + 2, at + i * step, end);
+      if (r.error != "") { return Value.Word(u8[32]()); }
+    }
+    return Value.List(items);
+  }
+  if (t == T_TUPLE()) {
+    return Value.List(tupleAt(r, schema, s + 2, schema[s + 1], at, end));
+  }
+  u8[] w = bytesAt(r, at, 32);
+  if (r.error != "") { return Value.Word(u8[32]()); }
+  if (t == T_BOOL()) {
+    for (i32 i = 0; i < 31; i++) {
+      if (w[i] != 0) { r.error = "a bool's first 31 bytes must be zero"; return Value.Word(w); }
+    }
+    if (w[31] > 1) { r.error = "a bool is 0 or 1, and this word ends in " + itoa(w[31]); }
+  }
+  if (t == T_ADDRESS()) {
+    for (i32 i = 0; i < 12; i++) {
+      if (w[i] != 0) { r.error = "an address's first twelve bytes must be zero"; return Value.Word(w); }
+    }
+  }
+  return Value.Word(w);
+}
+
+/** A dynamic value whose tail begins at `at`. `base` is the enclosing tuple's, for nested offsets. */
+Value valueAt(R r, i32[] schema, i32 s, i32 at, i32 end, i32 base) {
+  i32 t = schema[s];
+  if (t == T_BYTES() || t == T_STRING()) {
+    i32 n = word(r, at);
+    if (r.error != "") { return Value.Bytes(u8[0]()); }
+    if (at + 32 + n > end) {
+      r.error = "a " + itoa(n) + "-byte string runs past the end of the payload";
+      return Value.Bytes(u8[0]());
+    }
+    return Value.Bytes(bytesAt(r, at + 32, n));
+  }
+  if (t == T_ARRAY()) {
+    i32 n = word(r, at);
+    if (r.error != "") { return Value.List(none()); }
+    // A length checked against the space that could hold it, before anything is allocated.
+    //
+    // **This is a better message rather than a further refusal**, and saying so is the point: deleting it
+    // leaves every test passing, because an element read past the payload fails anyway on the next line's
+    // bounds check. What it buys is that a claimed four-billion-element array fails saying *that*, instead
+    // of saying a read at some offset was out of range. Measured, not assumed — the check was deleted and
+    // the suite stayed green.
+    if (at + 32 + n * 32 > end) {
+      r.error = "an array of " + itoa(n) + " runs past the end of the payload";
+      return Value.List(none());
+    }
+    // The elements are a tuple of `n` copies of one type, based just after the length word.
+    return Value.List(repeatAt(r, schema, s + 1, n, at + 32, end));
+  }
+  if (t == T_FIXED()) {
+    return Value.List(repeatAt(r, schema, s + 2, schema[s + 1], at, end));
+  }
+  if (t == T_TUPLE()) {
+    return Value.List(tupleAt(r, schema, s + 2, schema[s + 1], at, end));
+  }
+  return staticAt(r, schema, s, at, end);
+}
+
+/** `n` elements of one type, laid out as a tuple would lay them: heads then tails, offsets from `base`. */
+Value[] repeatAt(R r, i32[] schema, i32 s, i32 n, i32 base, i32 end) {
+  Value[] out = Value[n](fill: Value.Word(u8[32]()));
+  if (r.error != "") { return out; }
+  bool dyn = isDynamic(schema, s);
+  i32 step = dyn ? 32 : headWords(schema, s) * 32;
+  i32 headBytes = n * step;
+  for (i32 i = 0; i < n; i++) {
+    i32 at = base + i * step;
+    if (dyn) {
+      i32 off = word(r, at);
+      if (r.error != "") { return out; }
+      if (off < headBytes) {
+        r.error = "an element offset of " + itoa(off) + " points back into the array's head";
+        return out;
+      }
+      if (base + off >= end) {
+        r.error = "an element offset of " + itoa(off) + " points outside its array";
+        return out;
+      }
+      out[i] = valueAt(r, schema, s, base + off, end, base);
+    } else {
+      out[i] = staticAt(r, schema, s, at, end);
+    }
+    if (r.error != "") { return out; }
+  }
+  return out;
+}
+
+/** A 32-byte word as an i32, refusing anything that would not fit — a length is not a 256-bit number. */
+i32 word(R r, i32 at) {
+  u8[] w = bytesAt(r, at, 32);
+  if (r.error != "") { return 0; }
+  for (i32 i = 0; i < 28; i++) {
+    if (w[i] != 0) {
+      r.error = "a length or offset larger than 32 bits";
+      return 0;
+    }
+  }
+  i64 v = ((w[28] as i64) << 24) | ((w[29] as i64) << 16) | ((w[30] as i64) << 8) | (w[31] as i64);
+  if (v > 2147483647) {
+    r.error = "a length or offset larger than 32 bits";
+    return 0;
+  }
+  return v as~ i32;
+}
+
+u8[] bytesAt(R r, i32 at, i32 n) {
+  if (at < 0 || at + n > r.data.len()) {
+    r.error = "a read of " + itoa(n) + " bytes at " + itoa(at) + " is outside the payload";
+    return u8[0]();
+  }
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = r.data[at + i]; }
+  return out;
+}
+
+// ── Encoding ──────────────────────────────────────────────────────────────────
+
+/** The tuple `schema` describes, encoded. The inverse of `decode`, and the same offsets. */
+export u8[] encode(Value[] items, i32[] schema) {
+  return encodeTuple(items, schema, 0, items.len());
+}
+
+u8[] encodeTuple(Value[] items, i32[] schema, i32 schemaAt, i32 count) {
+  // Heads first, then tails: a head slot is either the value in place or an offset, and an offset is only
+  // knowable once every earlier head's width is.
+  i32 headBytes = 0;
+  i32 s = schemaAt;
+  for (i32 i = 0; i < count; i++) {
+    headBytes = headBytes + headWords(schema, s) * 32;
+    s = s + typeLen(schema, s);
+  }
+  u8[][] heads = u8[][count](fill: u8[0]());
+  u8[][] tails = u8[][count](fill: u8[0]());
+  i32 tailAt = headBytes;
+  s = schemaAt;
+  for (i32 i = 0; i < count; i++) {
+    if (isDynamic(schema, s)) {
+      tails[i] = encodeValue(items[i], schema, s);
+      heads[i] = wordOf(tailAt);
+      tailAt = tailAt + tails[i].len();
+    } else {
+      heads[i] = encodeStatic(items[i], schema, s);
+    }
+    s = s + typeLen(schema, s);
+  }
+  return join(heads, tails);
+}
+
+u8[] encodeStatic(Value v, i32[] schema, i32 s) {
+  i32 t = schema[s];
+  if (t == T_FIXED() || t == T_TUPLE()) {
+    Value[] xs = listOf(v);
+    if (t == T_TUPLE()) { return encodeTuple(xs, schema, s + 2, schema[s + 1]); }
+    u8[][] parts = u8[][xs.len()](fill: u8[0]());
+    for (i32 i = 0; i < xs.len(); i++) { parts[i] = encodeStatic(xs[i], schema, s + 2); }
+    return concat(parts);
+  }
+  return wordOfValue(v);
+}
+
+u8[] encodeValue(Value v, i32[] schema, i32 s) {
+  i32 t = schema[s];
+  if (t == T_BYTES() || t == T_STRING()) {
+    u8[] b = bytesOfValue(v);
+    i32 padded = ((b.len() + 31) / 32) * 32;
+    u8[] out = u8[32 + padded]();
+    u8[] len = wordOf(b.len());
+    for (i32 i = 0; i < 32; i++) { out[i] = len[i]; }
+    for (i32 i = 0; i < b.len(); i++) { out[32 + i] = b[i]; }
+    return out;
+  }
+  if (t == T_ARRAY()) {
+    Value[] xs = listOf(v);
+    u8[] body = encodeRepeat(xs, schema, s + 1);
+    u8[] out = u8[32 + body.len()]();
+    u8[] len = wordOf(xs.len());
+    for (i32 i = 0; i < 32; i++) { out[i] = len[i]; }
+    for (i32 i = 0; i < body.len(); i++) { out[32 + i] = body[i]; }
+    return out;
+  }
+  if (t == T_FIXED()) { return encodeRepeat(listOf(v), schema, s + 2); }
+  if (t == T_TUPLE()) { return encodeTuple(listOf(v), schema, s + 2, schema[s + 1]); }
+  return encodeStatic(v, schema, s);
+}
+
+/** `n` elements of one type, heads then tails — the same layout a tuple of identical members has. */
+u8[] encodeRepeat(Value[] xs, i32[] schema, i32 s) {
+  bool dyn = isDynamic(schema, s);
+  u8[][] heads = u8[][xs.len()](fill: u8[0]());
+  u8[][] tails = u8[][xs.len()](fill: u8[0]());
+  i32 headBytes = xs.len() * (dyn ? 32 : headWords(schema, s) * 32);
+  i32 tailAt = headBytes;
+  for (i32 i = 0; i < xs.len(); i++) {
+    if (dyn) {
+      tails[i] = encodeValue(xs[i], schema, s);
+      heads[i] = wordOf(tailAt);
+      tailAt = tailAt + tails[i].len();
+    } else {
+      heads[i] = encodeStatic(xs[i], schema, s);
+    }
+  }
+  return join(heads, tails);
+}
+
+u8[] join(u8[][] heads, u8[][] tails) {
+  i32 total = 0;
+  for (i32 i = 0; i < heads.len(); i++) { total = total + heads[i].len(); }
+  for (i32 i = 0; i < tails.len(); i++) { total = total + tails[i].len(); }
+  u8[] out = u8[total]();
+  i32 at = 0;
+  for (i32 i = 0; i < heads.len(); i++) {
+    for (i32 j = 0; j < heads[i].len(); j++) { out[at] = heads[i][j]; at++; }
+  }
+  for (i32 i = 0; i < tails.len(); i++) {
+    for (i32 j = 0; j < tails[i].len(); j++) { out[at] = tails[i][j]; at++; }
+  }
+  return out;
+}
+
+u8[] concat(u8[][] parts) {
+  i32 total = 0;
+  for (i32 i = 0; i < parts.len(); i++) { total = total + parts[i].len(); }
+  u8[] out = u8[total]();
+  i32 at = 0;
+  for (i32 i = 0; i < parts.len(); i++) {
+    for (i32 j = 0; j < parts[i].len(); j++) { out[at] = parts[i][j]; at++; }
+  }
+  return out;
+}
+
+/** A non-negative i32 as a 32-byte word. */
+u8[] wordOf(i32 v) {
+  if (v < 0) { trap; }
+  u8[] out = u8[32]();
+  i32 x = v;
+  i32 at = 31;
+  while (x > 0) { out[at] = x & 0xFF; at--; x = x / 256; }
+  return out;
+}
+
+/** The 32 bytes of a `Word`, which is what every static type decodes to. */
+export u8[] wordOfValue(Value v) {
+  match (v) {
+    case Word(b): return b;
+    case Bytes(_): return u8[32]();
+    case List(_): return u8[32]();
+  }
+}
+
+/** The contents of a `Bytes`. */
+export u8[] bytesOfValue(Value v) {
+  match (v) {
+    case Word(b): return b;
+    case Bytes(b): return b;
+    case List(_): return u8[0]();
+  }
+}
+
+/** The members of a `List`. */
+export Value[] listOf(Value v) {
+  match (v) {
+    case Word(_): return none();
+    case Bytes(_): return none();
+    case List(xs): return xs;
+  }
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  u8[] buf = u8[12]();
+  i32 n = 0;
+  i32 x = v < 0 ? 0 - v : v;
+  while (x > 0) { buf[n] = '0' + (x % 10); n++; x = x / 10; }
+  u8[] out = u8[n + (v < 0 ? 1 : 0)]();
+  if (v < 0) { out[0] = '-'; }
+  for (i32 i = 0; i < n; i++) { out[(v < 0 ? 1 : 0) + i] = buf[n - 1 - i]; }
+  return string.fromBytes(out);
+}
