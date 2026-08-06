@@ -39,8 +39,6 @@
 
 import { refuseIfNested, SUITE_ENV } from "../suiteGuard.ts";
 
-refuseIfNested("the mutation profiler");
-
 
 export type Profile = {
   /** "file:line" to the tests that execute it. */
@@ -115,6 +113,12 @@ export async function buildProfile(
   testFiles: string[],
   log: (s: string) => void,
 ): Promise<Profile> {
+  // **Here, not at import.** This module also exports the pure part — `selectTests`, `planFor`,
+  // `filterFor` — and a guard at module scope means a *test* of those cannot import the file: it called
+  // `Deno.exit(2)` from outside any test and took the isolate with it. The guard belongs where the suite
+  // is actually spawned, which is this function. `mutate.ts` guards its own entry as well, so the sweep
+  // path is covered twice and the library path not at all, which is the right way round. wac-mono 0077.
+  refuseIfNested("the mutation profiler");
   const dir = await Deno.makeTempDir({ prefix: "wac-profile-" });
   const cost = new Map<string, number>();
   try {
@@ -198,6 +202,33 @@ export function selectTests(p: Profile, locations: string[]): string[] | null {
   // Otherwise fall back, which costs time and cannot be wrong.
   if (picked.size === 0 && !locations.every((l) => p.known.has(l))) return null;
   return [...picked].sort();
+}
+
+/**
+ * What to run for a mutant at these lines, as one decision rather than three flags.
+ *
+ *   - `narrow` — the profile names the tests that reach it. Run those.
+ *   - `widen`  — the profile cannot say. Run the whole scope; slow, never wrong.
+ *   - `unhit`  — the profile accounts for every line of the span and no test hits any of them.
+ *
+ * **`unhit` is not "skip".** It used to be: the runner recorded such a mutant as unmeasurable and left it
+ * out of the score. That is wrong for anything the compiler can fold — `perrCtorBrace() { return 27; }` is
+ * inlined into its call sites, so its own line's counter stays at zero while the constant it returns
+ * reaches every caller, and gutting it fails two tests. So `unhit` means "run everything, and if it
+ * survives, say that nothing executes the line" — the useful half of the old message, without the verdict
+ * the counter cannot support. This is the shape the whole file argues for: under-selection is a wrong
+ * answer, over-selection is only slow. wac-mono 0005.
+ */
+export type Plan =
+  | { readonly kind: "narrow"; readonly tests: string[] }
+  | { readonly kind: "widen" }
+  | { readonly kind: "unhit" };
+
+export function planFor(p: Profile, locations: string[]): Plan {
+  const picked = selectTests(p, locations);
+  if (picked === null) return { kind: "widen" };
+  if (picked.length === 0) return { kind: "unhit" };
+  return { kind: "narrow", tests: picked };
 }
 
 /** A `--filter` that matches exactly these test names and nothing else. */

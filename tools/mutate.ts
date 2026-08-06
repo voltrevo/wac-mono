@@ -70,7 +70,7 @@ import { CURATED } from "./mutate/curated.ts";
 import { KNOWN_SURVIVORS } from "./mutate/known.ts";
 import { fileCount, sampleMutants } from "./mutate/sample.ts";
 import {
-  buildProfile, byCost, filterFor, selectTests, testFilesIn, type Profile,
+  buildProfile, byCost, filterFor, planFor, testFilesIn, type Profile,
 } from "./mutate/profile.ts";
 import { ALL_OPERATORS, generate, type OperatorName } from "./mutate/operators.ts";
 import { applyEdits, packagesOf, type Curated, type Edit, type Mutant } from "./mutate/types.ts";
@@ -817,28 +817,17 @@ try {
       let filter: string | undefined;
       let notCovered = false;
       if (profile) {
-        const locs = mutant.edits.flatMap((e) => linesOf(e.file, e.start, e.end));
-        const picked = selectTests(profile, locs);
-        if (picked === null) widened++;
-        if (picked !== null) {
-          if (picked.length === 0) {
-            // **Unhit is not unobservable.** A one-line accessor like `perrCtorBrace() { return 27; }` is
-            // folded into its call sites, so its own line's counter stays at zero while the constant it
-            // returns reaches every caller — and gutting it does fail two tests. Concluding "no test
-            // executes this" from the counter alone recorded such a mutant as unmeasurable and dropped it
-            // from the score, which is the under-selection this tool says elsewhere it will not do.
-            //
-            // So the full scope runs instead, and the *result* decides: killed is killed, and a survivor
-            // is still reported as an unhit line, which is the useful half of the old message. It costs a
-            // handful of full-scope runs per sweep. wac-mono 0005.
-            notCovered = true;
-            widened++;
-          } else {
-            const f = filterFor(picked);
-            const files = [...new Set(picked.map((t) => profile!.home.get(t)!))].sort();
-            if (f && files.every(Boolean)) { filter = f; runDirs = byCost(files, profile); narrowed++; }
-            else widened++;
-          }
+        // One decision, made in `profile.ts` where the argument for it lives — including why an unhit
+        // line still runs the whole scope rather than being written off.
+        const plan = planFor(profile, mutant.edits.flatMap((e) => linesOf(e.file, e.start, e.end)));
+        if (plan.kind === "narrow") {
+          const f = filterFor(plan.tests);
+          const files = [...new Set(plan.tests.map((t) => profile!.home.get(t)!))].sort();
+          if (f && files.every(Boolean)) { filter = f; runDirs = byCost(files, profile); narrowed++; }
+          else widened++;
+        } else {
+          if (plan.kind === "unhit") notCovered = true;
+          widened++;
         }
       }
       const cmd = testCommand(work, runDirs, filter);
