@@ -12,8 +12,8 @@ compiler, this one is things built with it.
 it builds on, and every program and page you can build, each with a line on what it does. It
 is generated from the tree by `deno task map` and checked by the suite, so it cannot drift.
 
-Today, give or take whatever landed this morning: **24 packages, ~41,000 lines of wac, ~900
-tests, 20 command-line programs and 4 browser pages.** MAP.md has the exact figures, and the
+Today, give or take whatever landed this morning: **32 packages, ~64,000 lines of wac, ~1,300
+tests, 38 command-line programs and 4 browser pages.** MAP.md has the exact figures, and the
 suite checks its *structure* — packages, dependencies, programs — rather than its counts, since
 three agents share this repo and a guard that fails on somebody else's new test is a guard
 everyone learns to ignore.
@@ -27,7 +27,7 @@ in both directions, `url` against WHATWG's test suite, `bignum` against `BigInt`
 
 What they add up to is more interesting:
 
-**`box` — a busybox.** Fifty-nine applets in one program, chosen by the first argument, each
+**`box` — a busybox.** Sixty applets in one program, chosen by the first argument, each
 differential-tested against the real tool where one exists. `cat`, `grep`, `sort`, `gzip`,
 `sha256sum`, `tar`, `diff`, `httpd`, `nc`. It streams: 300MB through `wc` peaks at 94MB of RSS.
 
@@ -45,12 +45,24 @@ own client, hosting the shell above. Curve25519, Ed25519, chacha20-poly1305, `kn
 encrypted private keys.
 
 **`tls` — TLS 1.3**, interoperating with OpenSSL and rustls. **`tor`** is a Tor client on top
-of it, with a SOCKS5 proxy. **`crypto`** is what they stand on: SHA-2, SHA-3, HMAC, HKDF,
-AES-GCM, ChaCha20-Poly1305, X25519, Ed25519, P-256, P-384, RSA verification, ML-KEM-768 — all
-in wac, all against published vectors.
+of it, with a SOCKS5 proxy, and by now the other side too: a relay, a directory authority, and
+a launcher that stands a whole network up with no C tor in it. It reaches onion services.
+**`crypto`** is what they stand on: SHA-2, SHA-3, keccak256, HMAC, HKDF, AES-GCM,
+ChaCha20-Poly1305, X25519, Ed25519, P-256, P-384, RSA verification, ML-KEM-768 — all in wac,
+all against published vectors.
 
 **`gzip` and `zstd`** compress at or under the reference tools. **`wacc`** is the wac compiler
 being ported to wac, so it can eventually compile itself.
+
+**Ethereum, checked rather than trusted.** `bls` verifies BLS12-381 signatures against
+Ethereum's own fixtures, `ssz` is its serialization and Merkle proofs, and `lightclient` runs
+the Altair sync protocol through all four of Ethereum's `light_client/sync` cases. On top of
+those, the execution side: `rlp`, `abi`, `ens`, and `mpt` — Merkle-Patricia proofs, which is
+what turns "a provider told me" into "the state root I already verified commits to this". See
+[design/0003](design/0003-an-ethereum-distribution.md) for where that is going.
+
+**`fs` — a filesystem that belongs to the program**, in memory or mounted on the host's, so a
+session can be sealed off from the machine that started it.
 
 **`platform` — a capability world**, and the reason a wac program can be an *application*
 rather than a library. Two structs say everything a program may do, because wac has no ambient
@@ -100,14 +112,18 @@ packages/<name>/
 
 ## Cross-package imports
 
-wac imports are relative file paths, so a package reaches a sibling by path:
+A package reaches a sibling by relative path:
 
 ```wac
 import { T } from "../../../wactest/src/assert.wac";
 ```
 
-There is no module-alias mechanism in the language, so this is what it looks
-like. Keeping the tree at `packages/<name>/src` bounds the depth.
+There is no module-alias mechanism in the language yet, so this is what it looks
+like. Keeping the tree at `packages/<name>/src` bounds the depth. One import is
+*not* a path — `import { Read } from core;` names the module the compiler ships —
+and a prefix that maps to a directory is the next step of wac's
+`design/0001`, which is what [issue 0092](issues/open/0092-the-capability-layer-should-be-its-own-repo.md)
+is waiting on.
 
 ## Commands
 
@@ -158,7 +174,9 @@ in three commands, and skips in milliseconds without them.
 
 ### What the suite costs, and where
 
-Measured on five cores: **~50 seconds** for all 910 tests in parallel, about 160 seconds of CPU. One
+Measured on five cores, when the suite was 910 tests: **~50 seconds** in parallel, about 160
+seconds of CPU. It is over 1,280 now and has not been re-measured on a quiet machine — the shape
+below is what matters, not the stopwatch. One
 file at a time in its own process is 6.5 minutes, and most of that is a hundred and forty deno
 startups; the heaviest single files are `packages/box` (25s, three hundred subprocesses comparing
 applets against the GNU tools) and `packages/regex` (17s, differential fuzzing against `RegExp`).

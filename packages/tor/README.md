@@ -489,12 +489,24 @@ in the suite, for the same reason `src/app.wac` is not.
 
 ### Hosting one — `src/hsservice.wac`
 
-`design/0002` step 6, begun. Every table row above is the *client* half; a service does the mirror of
-each, and the mirrors are not symmetric — the client proves nothing about itself and the service
-proves everything, so every cell it sends carries a signature or a MAC the client's equivalent does
-not. **ESTABLISH_INTRO** is done and pinned by `tools/estintro-probe.c` against tor's own parser and
-both of tor's verifications; INTRODUCE2, the hs-ntor responder, RENDEZVOUS1 and descriptor publication
-are not.
+`design/0002` step 6, most of the way. Every table row above is the *client* half; a service does the
+mirror of each, and the mirrors are not symmetric — the client proves nothing about itself and the
+service proves everything, so every cell it sends carries a signature or a MAC the client's equivalent
+does not.
+
+Done and pinned against C tor: **ESTABLISH_INTRO** (`tools/estintro-probe.c`, tor's own parser and
+both of its verifications), **INTRODUCE2** parsing, the **hs-ntor responder** — introduce *and*
+rendezvous keys — and **RENDEZVOUS1**. The **descriptor decodes whole** under tor's
+`hs_desc_decode_descriptor`, introduction point and both certificates included, and **key blinding
+matches in both directions**, so the blinded secret a service signs with is byte-identical to tor's.
+**Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both
+accept a `POST /tor/hs/3/publish`, check it the way `desc_decode_plaintext_v3` does, file it under the
+blinded key from its certificate, and serve it back — replacing what they hold only for a strictly
+newer revision counter, as `cache_store_v3_as_dir` does.
+
+**Not done: the service program itself** — the client side of the upload, and the loop that
+establishes introduction points and answers an INTRODUCE2. `design/0002`'s step 6 row is the
+authority on this list; keep the two together.
 
 **INTRODUCE2** is done too — the inverse of the client's `introduce1Cell`, checked against cells
 tor's own `hs_cell_build_introduce1` wrote rather than against our own builder. That distinction
@@ -537,8 +549,9 @@ service, and are the argument for `design/0002`'s D1 in one sentence.
 **Client authorisation.** A service with authorised clients fails its descriptor MAC and is refused —
 a missing feature rather than a wrong answer.
 
-**Anything the service side needs.** `ESTABLISH_INTRO`, descriptor publication and answering a
-rendezvous are step 6.
+**Being a service.** The cells and the descriptor are done — see *Hosting one* above — but the
+program that establishes introduction points, uploads its own descriptor and answers an introduction
+is not written. That is the rest of step 6.
 
 **Padding or timing defence.** The rendezvous and introduction circuits are built back to back on
 demand, which is a recognisable shape.
@@ -620,7 +633,8 @@ script. What this covers is a network with no C in it, which is step 5's conditi
 
 with stdout byte-identical to the microdesc consensus the authority was holding.
 
-`test/network.test.ts` tests the launcher against `example/waiter.wac` rather than against relays —
+`test/network.test.ts` tests the launcher against `packages/platform/example/waiter.wac` rather than
+against relays —
 it knows about processes and ready markers, not about Tor, and a launcher test that stood up three
 relays would fail whenever anything in the stack did. **The Tor network is not stood up by the
 suite**, because the ports a relay listens on are baked into its signed descriptor and two agents
