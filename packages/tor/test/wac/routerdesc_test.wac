@@ -368,7 +368,10 @@ export string test_the_descriptor_tor_accepted_is_reproduced(fn[u8[](i32, u8[], 
     string.fromBytes(ref(G_STR, arg1(0), none())),
     string.fromBytes(ref(G_STR, arg1(1), none())),
     num(ref, 0) as~ i32, num(ref, 1) as~ i32, num(ref, 2),
-    num(ref, 3), num(ref, 4), num(ref, 5), num(ref, 6));
+    num(ref, 3), num(ref, 4), num(ref, 5), num(ref, 6),
+    // The committed vector predates the policy being a field, so it keeps the value that was
+    // hardcoded when those bytes were signed. Reproducing them is the point of the test.
+    "reject *:*");
 
   u8[] want = ref(G_DESC, none(), none());
   t.isTrue(want.len() > 1500, "the committed descriptor is a whole document");

@@ -82,7 +82,7 @@ export i32 main(Core core, Cli cli) {
   i64 window = live ? 3600 : 20;
   RelayInfo info = RelayInfo("wacrelay", "127.0.0.1", 9001, 0, published,
                              1073741824, 1073741824, 640416,
-                             (published / 3600) + 8760);
+                             (published / 3600) + 8760, "reject *:*");
 
   u8[] desc = routerDescriptor(keys, info);
   if (desc.len() == 0) {
