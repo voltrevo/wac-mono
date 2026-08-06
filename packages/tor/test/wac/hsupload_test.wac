@@ -1,0 +1,89 @@
+// What a directory's answer to an upload means.
+//
+// The three outcomes are tor's `handle_response_upload_hsdesc`, which separates a *rejection* from a
+// *surprise*. That separation is the only interesting thing in this file and it is not obvious from
+// the status codes alone: 400 and 503 are both failures, and a service should respond to them
+// completely differently.
+//
+// The statuses are not invented here either. `hsPublishResponse` is what our own directory answers,
+// and it was pinned against tor's HSDir cache — so the two ends of the upload are joined rather than
+// each being checked against a number someone wrote down.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  Publication, UPLOAD_NO_ANSWER, UPLOAD_OK, UPLOAD_REJECTED, UPLOAD_UNEXPECTED, publicationState,
+  uploadOutcome, worthRetryingElsewhere,
+} from "../../src/hsupload.wac";
+import { hsPublishResponse } from "../../src/dirserve.wac";
+
+/** The answers our own directory gives are the answers this reads. */
+export string test_the_two_ends_agree(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqI32(uploadOutcome(hsPublishResponse(true).status), UPLOAD_OK,
+          "what a directory answers when it stored the descriptor reads as stored");
+  t.eqI32(uploadOutcome(hsPublishResponse(false).status), UPLOAD_REJECTED,
+          "and what it answers when it refused reads as refused");
+  return t.report();
+}
+
+/**
+ * A rejection and a surprise are different events.
+ *
+ * 400 means the directory read the descriptor and refused it, so every other directory will refuse
+ * the same bytes. Anything else says nothing about the descriptor. Collapsing the two into "failed"
+ * is what turns a signing bug into an intermittent outage: a service retries its way around the ring,
+ * each directory refusing for the same reason, and the log shows eight failures against eight
+ * directories rather than one bad document.
+ */
+export string test_a_rejection_is_not_a_surprise(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqI32(uploadOutcome(200), UPLOAD_OK, "200 is tor's only success");
+  t.eqI32(uploadOutcome(400), UPLOAD_REJECTED, "400 is the descriptor's fault");
+  t.eqI32(uploadOutcome(503), UPLOAD_UNEXPECTED, "503 is the directory's");
+  t.eqI32(uploadOutcome(404), UPLOAD_UNEXPECTED, "and so is anything else tor does not name");
+  t.eqI32(uploadOutcome(201), UPLOAD_UNEXPECTED, "including a success code that is not 200");
+  // -1 is `splitResponse`'s "nothing arrived", which tor never sees as a status because it handles a
+  // dead connection elsewhere. Kept apart from UNEXPECTED because a broken circuit says nothing about
+  // the directory, and a service that counted it against one would blame a directory it never reached.
+  t.eqI32(uploadOutcome(-1), UPLOAD_NO_ANSWER, "no answer is not a bad answer");
+
+  t.isTrue(!worthRetryingElsewhere(UPLOAD_REJECTED),
+           "a refused descriptor is not worth carrying to another directory");
+  t.isTrue(worthRetryingElsewhere(UPLOAD_UNEXPECTED), "an odd answer is");
+  t.isTrue(worthRetryingElsewhere(UPLOAD_NO_ANSWER), "and so is silence");
+  t.isTrue(!worthRetryingElsewhere(UPLOAD_OK), "and a success needs no retry at all");
+  return t.report();
+}
+
+/** A round of uploads, tallied — and one rejection is enough to indict the descriptor. */
+export string test_one_rejection_indicts_the_descriptor(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+
+  Publication all = publicationState(i32[](UPLOAD_OK, UPLOAD_OK, UPLOAD_OK, UPLOAD_OK));
+  t.eqI32(all.uploaded, 4, "four directories took it");
+  t.eqI32(all.rejected, 0, "none refused");
+  t.isTrue(!all.descriptorRefused, "so the descriptor is not in question");
+
+  // Seven directories accepted and one refused. The seven do not outvote the one: a rejection is a
+  // fact about the bytes, and the bytes were the same for all eight.
+  Publication mixed = publicationState(i32[](UPLOAD_OK, UPLOAD_OK, UPLOAD_OK, UPLOAD_OK, UPLOAD_OK,
+                                             UPLOAD_OK, UPLOAD_OK, UPLOAD_REJECTED));
+  t.eqI32(mixed.uploaded, 7, "seven took it");
+  t.eqI32(mixed.rejected, 1, "one refused");
+  t.isTrue(mixed.descriptorRefused,
+           "and one refusal is enough — the other seven read the same bytes");
+
+  // Unreachable directories are an ordinary event on a network of volunteers and say nothing about
+  // the descriptor, however many of them there are.
+  Publication down = publicationState(i32[](UPLOAD_OK, UPLOAD_NO_ANSWER, UPLOAD_UNEXPECTED,
+                                            UPLOAD_NO_ANSWER));
+  t.eqI32(down.uploaded, 1, "one took it");
+  t.eqI32(down.unreachable, 3, "three could not be reached or answered oddly");
+  t.eqI32(down.rejected, 0, "none refused");
+  t.isTrue(!down.descriptorRefused, "so the descriptor is still not in question");
+
+  Publication none = publicationState(i32[0]());
+  t.eqI32(none.uploaded, 0, "no uploads is no successes");
+  t.isTrue(!none.descriptorRefused, "and nothing to indict the descriptor with");
+  return t.report();
+}
