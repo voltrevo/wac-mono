@@ -1,0 +1,119 @@
+// One directory request, however many reads it arrives in.
+//
+// Both things that serve the directory — `dird` on a DirPort, `relayd` on a BEGIN_DIR stream — had
+// the same loop written out twice: accumulate bytes, try to parse, answer or wait. They have now
+// diverged once (only `dird` learned to accept a published descriptor), which is the usual way a
+// duplicated loop announces itself.
+//
+// So the decision is here, as a function of the bytes so far, and both callers keep only the part
+// that differs: where the bytes come from and where the reply goes.
+//
+// ## Why publication has to be reachable over a BEGIN_DIR stream
+//
+// It would be simpler for a service to connect to a directory's DirPort and POST. It cannot, and not
+// only for the anonymity reason that is usually given. In the consensus captured from a real network
+// in `test/data/hsdir_vectors.json`, **every one of the eight HSDirs tor uploaded to has DirPort 0**
+// — only the three authorities publish one at all. A service that uploaded to DirPorts would have
+// nowhere to upload to. BEGIN_DIR is not the private route to a directory; for an HSDir it is the
+// only route.
+//
+// ## The body is the part that arrives in pieces
+//
+// A request line and its headers fit one read in practice. A descriptor is fourteen kilobytes and
+// does not. `parseRequest` already returns `Incomplete` until a `Content-Length` body is entirely
+// present, so the accumulation is its job rather than a counter kept here — this only has to not
+// answer early, which is exactly the mistake issue 0089 was.
+
+import { Parsed, parseRequest } from "../../http/src/request.wac";
+import {
+  DirDocuments, dirResponse, hsPublishResponseBytes, hsPublishVersion,
+} from "./dirserve.wac";
+import { PUB_OK, Checked, checkForPublication } from "./hsstore.wac";
+
+/** `HS_DESC_MAX_LEN`, since a descriptor is the only body a directory accepts. */
+export const i32 MAX_BODY = 50000;
+
+/**
+ * What to do about the bytes received so far.
+ *
+ * `ready` false means nothing at all should be sent: the request is not finished. Every other field
+ * is meaningless until it is true, and `descriptor` is empty unless this was a publish that passed
+ * every check — a caller cannot store something this did not accept.
+ */
+export struct DirAction {
+  bool ready;
+  u8[] response;      // the reply bytes, framing included
+  u8[] descriptor;    // a descriptor to file, or empty
+  u8[] blindedKey;    // the name to file it under, taken from the descriptor's own certificate
+  i32 refusedFor;     // why a publish was refused, or PUB_OK — for a log, not for the reply
+}
+
+DirAction waiting() { return DirAction(false, u8[0](), u8[0](), u8[0](), PUB_OK); }
+DirAction answer(u8[] response) { return DirAction(true, response, u8[0](), u8[0](), PUB_OK); }
+
+/**
+ * The reply to `pending`, or "not yet".
+ *
+ * `docs` answers the GETs. A publish does not consult it: what a directory already holds has no
+ * bearing on whether a new descriptor is well-formed, and mixing the two would make the verdict
+ * depend on the order uploads arrived.
+ */
+export DirAction dirStep(u8[] pending, DirDocuments docs) {
+  match (parseRequest(pending, MAX_BODY)) {
+    case Ok(request): {
+      // A publish is the only request with a body, and the only one that changes anything. The
+      // version comes out of the middle of the target rather than the path being matched whole,
+      // because `/tor/hs/3/publish` and `/tor/hs/3/<z>` differ only after it and one is a POST.
+      if (sameBytes(request.method, "POST".toBytes()) && hsPublishVersion(request.target) == 3) {
+        Checked checked = checkForPublication(request.body, 0);
+        if (checked.reason != PUB_OK) {
+          return DirAction(true, hsPublishResponseBytes(false), u8[0](), u8[0](), checked.reason);
+        }
+        return DirAction(true, hsPublishResponseBytes(true), request.body, checked.blindedKey,
+                         PUB_OK);
+      }
+      return answer(dirResponse(request.target, docs));
+    }
+    case Bad(code): {
+      return answer("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".toBytes());
+    }
+    case Incomplete: { return waiting(); }
+  }
+  return waiting();
+}
+
+/**
+ * `docs` with `descriptor` filed under `blindedKey`, replacing any descriptor already under it.
+ *
+ * Replacing rather than appending is what makes republication an update. A store that appended would
+ * serve whichever copy the search reached first, which over a service's lifetime is the stale one —
+ * and the served bytes cannot tell the two apart, so nothing downstream would notice.
+ */
+export DirDocuments filed(DirDocuments docs, u8[] descriptor, u8[] blindedKey, i32 max) {
+  if (blindedKey.len() != 32 || descriptor.len() == 0) { return docs; }
+  for (i32 i = 0; i < docs.hsBlindedKeys.len(); i++) {
+    if (sameBytes(docs.hsBlindedKeys[i], blindedKey)) {
+      docs.hsDescriptors[i] = descriptor;
+      return docs;
+    }
+  }
+  i32 n = docs.hsDescriptors.len();
+  if (n >= max) { return docs; }
+  u8[][] descs = u8[][n + 1]();
+  u8[][] keys = u8[][n + 1]();
+  for (i32 i = 0; i < n; i++) {
+    descs[i] = docs.hsDescriptors[i];
+    keys[i] = docs.hsBlindedKeys[i];
+  }
+  descs[n] = descriptor;
+  keys[n] = blindedKey;
+  return DirDocuments(docs.consensus, docs.consensusMicrodesc, docs.certificate, docs.descriptors,
+                      docs.descriptorDigests, docs.fingerprint, docs.microdescriptors,
+                      docs.microdescDigests, descs, keys);
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len() || a.len() == 0) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}

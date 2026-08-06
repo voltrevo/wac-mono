@@ -47,7 +47,12 @@ import { Core, Cli, Socket, FileResult, Change, Pending } from "../../platform/s
 import { Read } from core;
 import { Buf } from "../../bytes/src/buf.wac";
 import { Parsed, parseRequest } from "../../http/src/request.wac";
-import { DirDocuments, dirResponse, dirSourceFingerprint } from "./dirserve.wac";
+import { DirDocuments, dirSourceFingerprint } from "./dirserve.wac";
+import { DirAction, dirStep, filed } from "./dirstep.wac";
+import { PUB_OK } from "./hsstore.wac";
+
+/** How many onion service descriptors this relay will hold as an HSDir. */
+const i32 MAX_STORED_DESCRIPTORS = 32;
 import { microdescDigests } from "./microdesc.wac";
 import {
   Link, chunkRequest, connectRelay, feedLink, handshakeTls, itoa, linkHandshake, pump, sendCells,
@@ -1083,29 +1088,32 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
 
         if (inbound.command == relayData() && inbound.streamId == k.dirStream) {
           k.dirRequest.pushAll(inbound.data);
-          match (parseRequest(k.dirRequest.bytes(), 0)) {
-            case Ok(request): {
-              u8[] response = dirResponse(request.target, docs);
-              // 498 bytes to a cell, which is what `chunkRequest` splits at — named for the client's
-              // side of the same operation, and the same arithmetic in this direction.
-              u8[][] parts = chunkRequest(response);
-              for (i32 pi = 0; pi < parts.len(); pi++) {
-                c.tls = sendCell(cli, c.sockObj, c.tls,
-                               sendToClient(k.hop, k.circId, relayData(), k.dirStream, parts[pi]));
-              }
-              c.tls = sendCell(cli, c.sockObj, c.tls,
-                             sendToClient(k.hop, k.circId, relayEnd(), k.dirStream, endReason()));
-              core.log("relayd: [" + itoa(c.id) + "]  answered a directory request with " + itoa(response.len()) +
-                       " bytes in " + itoa(parts.len()) + " cells");
-              k.dirStream = -1;
+          // A publish is the reason this waits rather than answering the first read: a descriptor is
+          // fourteen kilobytes and arrives in thirty cells. `dirStep` holds off until the whole
+          // request is present, which is the same contract `dird` serves on its DirPort — and the
+          // only route to an HSDir, since the HSDirs in a real consensus have no DirPort at all.
+          DirAction act = dirStep(k.dirRequest.bytes(), docs);
+          if (act.ready) {
+            if (act.descriptor.len() > 0) {
+              docs = filed(docs, act.descriptor, act.blindedKey, MAX_STORED_DESCRIPTORS);
+              core.log("relayd: [" + itoa(c.id) + "]  filed an onion service descriptor, " +
+                       itoa(docs.hsDescriptors.len()) + " held");
+            } else if (act.refusedFor != PUB_OK) {
+              core.warn("relayd: [" + itoa(c.id) + "]  refused a descriptor, reason " +
+                        itoa(act.refusedFor));
             }
-            case Bad(code): {
-              core.warn("relayd: [" + itoa(c.id) + "]  a malformed directory request, code " + itoa(code));
+            // 498 bytes to a cell, which is what `chunkRequest` splits at — named for the client's
+            // side of the same operation, and the same arithmetic in this direction.
+            u8[][] parts = chunkRequest(act.response);
+            for (i32 pi = 0; pi < parts.len(); pi++) {
               c.tls = sendCell(cli, c.sockObj, c.tls,
-                             sendToClient(k.hop, k.circId, relayEnd(), k.dirStream, endReason()));
-              k.dirStream = -1;
+                             sendToClient(k.hop, k.circId, relayData(), k.dirStream, parts[pi]));
             }
-            case Incomplete: { }
+            c.tls = sendCell(cli, c.sockObj, c.tls,
+                           sendToClient(k.hop, k.circId, relayEnd(), k.dirStream, endReason()));
+            core.log("relayd: [" + itoa(c.id) + "]  answered a directory request with " +
+                     itoa(act.response.len()) + " bytes in " + itoa(parts.len()) + " cells");
+            k.dirStream = -1;
           }
           continue;
         }

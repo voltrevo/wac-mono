@@ -1,0 +1,187 @@
+// One request, arriving a byte at a time.
+//
+// The loop this replaces existed twice and had already diverged once. What is checked here is the
+// property both copies needed and neither stated: **nothing is answered until the whole request is
+// present.** A directory that replies to the first read of a fourteen-kilobyte upload sends a verdict
+// on a document it has not seen, and the service is told its descriptor was stored.
+//
+// Driving it one byte at a time is not thoroughness for its own sake. A body that arrives in pieces
+// is the shape of issue 0089, and the boundary that matters — the last byte of the body — is the one
+// a two-chunk test is least likely to land on.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { DirAction, dirStep, filed } from "../../src/dirstep.wac";
+import { DirDocuments } from "../../src/dirserve.wac";
+import { PUB_OK } from "../../src/hsstore.wac";
+
+const i32 D_DESCRIPTOR = 0;
+const i32 D_BLINDED = 1;
+const i32 D_CONTROL_COUNT = 2;
+const i32 D_CONTROL = 3;      // a[0] = index: bytes tor's own HSDir cache refused
+
+u8[] none() { return u8[0](); }
+
+u8[] at(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+
+DirDocuments empty() {
+  return DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](), u8[0](), u8[][0](),
+                      u8[][0](), u8[][0]());
+}
+
+/**
+ * A publish is answered on its last byte and not one byte sooner.
+ *
+ * The prefix loop is the test. `ready` on any short prefix would mean a reply sent before the
+ * document was read — and since a truncated descriptor is refused, that reply would even look
+ * plausible: a 400 for a descriptor that was merely still in flight.
+ */
+export string test_nothing_is_answered_before_the_last_byte(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] request = publishRequest(ref(D_DESCRIPTOR, none(), none()));
+
+  // Every prefix, stepped over the interesting region rather than sampled at two points: the header
+  // boundary, the first body bytes, and the last few, which is where an off-by-one lives.
+  i32 answeredEarly = 0;
+  for (i32 i = 0; i < request.len(); i++) {
+    bool near = i < 300 || i > request.len() - 8 || i % 997 == 0;
+    if (near && dirStep(slice(request, 0, i), empty()).ready) { answeredEarly = answeredEarly + 1; }
+  }
+  t.eqI32(answeredEarly, 0, "no prefix of the request is answered");
+
+  DirAction done = dirStep(request, empty());
+  t.isTrue(done.ready, "and the whole request is");
+  t.eqBytes(done.descriptor, ref(D_DESCRIPTOR, none(), none()), "with the descriptor to file");
+  t.eqBytes(done.blindedKey, ref(D_BLINDED, none(), none()),
+            "under the name its own certificate gave it");
+  t.eqI32(done.refusedFor, PUB_OK, "and nothing refused");
+  t.isTrue(contains(done.response, "200"), "the reply says stored");
+  return t.report();
+}
+
+/** A descriptor C tor's HSDir cache refused is refused, and nothing is handed back to file. */
+export string test_a_refused_upload_files_nothing(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(D_CONTROL_COUNT, none(), none())[0];
+  i32 refused = 0;
+  for (i32 i = 0; i < n; i++) {
+    u8[] body = ref(D_CONTROL, at(i), none());
+    if (sameBytes(body, ref(D_DESCRIPTOR, none(), none()))) { continue; }  // that control is a name
+    DirAction a = dirStep(publishRequest(body), empty());
+    t.isTrue(a.ready, "a refusal is still an answer, not a hang");
+    t.eqI32(a.descriptor.len(), 0, "and a refused descriptor is not filed");
+    t.eqI32(a.blindedKey.len(), 0, "nor named");
+    t.isTrue(a.refusedFor != PUB_OK, "with a reason recorded for the log");
+    t.isTrue(contains(a.response, "400"), "and the service is told");
+    refused = refused + 1;
+  }
+  t.isTrue(refused >= 3, "several controls ran, not none");
+  return t.report();
+}
+
+/** A GET is still a GET: publication did not take the port over. */
+export string test_the_other_routes_still_answer(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  DirDocuments docs = empty();
+  docs.consensus = "network-status-version 3\n".toBytes();
+
+  DirAction a = dirStep("GET /tor/status-vote/current/consensus HTTP/1.0\r\n\r\n".toBytes(), docs);
+  t.isTrue(a.ready, "a GET needs no body and is answered at once");
+  t.isTrue(contains(a.response, "200"), "and served");
+  t.eqI32(a.descriptor.len(), 0, "a GET files nothing");
+
+  // A POST to somewhere that is not a publish target falls through to routing, which 404s it rather
+  // than treating a body as a descriptor.
+  DirAction other = dirStep("POST /tor/hs/3/AAAA HTTP/1.0\r\nContent-Length: 0\r\n\r\n".toBytes(),
+                            docs);
+  t.isTrue(other.ready, "answered");
+  t.eqI32(other.descriptor.len(), 0, "and files nothing");
+
+  // A GET of the publish path is not a publish. tor only reaches `handle_post_hs_descriptor` from
+  // its POST handler, so this falls through to routing, where `publish` is not a blinded key and the
+  // answer is 404. Treating it as an upload would answer 400 instead — a directory telling a client
+  // its *descriptor* was invalid when the client never sent one.
+  DirAction wrongMethod = dirStep("GET /tor/hs/3/publish HTTP/1.0\r\n\r\n".toBytes(), docs);
+  t.isTrue(wrongMethod.ready, "answered");
+  t.isTrue(contains(wrongMethod.response, "404"), "and routed, not published");
+  t.eqI32(wrongMethod.descriptor.len(), 0, "filing nothing");
+
+  DirAction bad = dirStep("nonsense\r\n\r\n".toBytes(), empty());
+  t.isTrue(bad.ready, "a malformed request is answered rather than waited on");
+  t.isTrue(contains(bad.response, "400"), "with a refusal");
+  return t.report();
+}
+
+/** Filing replaces by name, so a service republishing does not accumulate copies. */
+export string test_republishing_replaces(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] desc = ref(D_DESCRIPTOR, none(), none());
+  u8[] key = ref(D_BLINDED, none(), none());
+
+  DirDocuments one = filed(empty(), desc, key, 4);
+  t.eqI32(one.hsDescriptors.len(), 1, "the first upload is held");
+  DirDocuments twice = filed(one, desc, key, 4);
+  t.eqI32(twice.hsDescriptors.len(), 1, "and the second replaces it rather than joining it");
+
+  u8[] otherKey = u8[32](fill: 9);
+  t.eqI32(filed(twice, desc, otherKey, 4).hsDescriptors.len(), 2, "another service is another entry");
+
+  // The cap is a cap: a directory with no bound would hold whatever it was sent.
+  DirDocuments full = filed(filed(twice, desc, u8[32](fill: 1), 2), desc, u8[32](fill: 2), 2);
+  t.eqI32(full.hsDescriptors.len(), 2, "and the store stops at its limit");
+
+  t.eqI32(filed(empty(), desc, u8[31](), 4).hsDescriptors.len(), 0, "a name that is not a key files nothing");
+  t.eqI32(filed(empty(), u8[0](), key, 4).hsDescriptors.len(), 0, "and nothing files nothing");
+  return t.report();
+}
+
+// ── small helpers ─────────────────────────────────────────────────────────────
+
+/** A publish request for `body`, framed as tor frames it. */
+u8[] publishRequest(u8[] body) {
+  string head = "POST /tor/hs/3/publish HTTP/1.0\r\nHost: 127.0.0.1:9001\r\n" +
+                "Content-Length: " + itoa(body.len()) + "\r\n\r\n";
+  u8[] h = head.toBytes();
+  u8[] out = u8[h.len() + body.len()]();
+  for (i32 i = 0; i < h.len(); i++) { out[i] = h[i]; }
+  for (i32 i = 0; i < body.len(); i++) { out[h.len() + i] = body[i]; }
+  return out;
+}
+
+bool contains(u8[] hay, string needle) {
+  u8[] n = needle.toBytes();
+  for (i32 i = 0; i + n.len() <= hay.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < n.len(); j++) { if (hay[i + j] != n[j]) { hit = false; j = n.len(); } }
+    if (hit) { return true; }
+  }
+  return false;
+}
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[to - from]();
+  for (i32 i = from; i < to; i++) { out[i - from] = b[i]; }
+  return out;
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  string out = "";
+  i32 x = v;
+  while (x > 0) {
+    u8[] d = u8[1]();
+    d[0] = 48 + (x % 10);
+    out = string.fromBytes(d) + out;
+    x = x / 10;
+  }
+  return out;
+}

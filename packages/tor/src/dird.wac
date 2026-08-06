@@ -28,10 +28,9 @@ import { Read } from core;
 import { itoa } from "../../fmt/src/itoa.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Parsed, parseRequest } from "../../http/src/request.wac";
-import {
-  DirDocuments, dirResponse, dirSourceFingerprint, hsPublishResponseBytes, hsPublishVersion,
-} from "./dirserve.wac";
-import { PUB_OK, checkForPublication } from "./hsstore.wac";
+import { DirDocuments, dirSourceFingerprint } from "./dirserve.wac";
+import { DirAction, MAX_BODY, dirStep, filed } from "./dirstep.wac";
+import { PUB_OK } from "./hsstore.wac";
 import { rsaDescriptorDigest } from "./routerdesc.wac";
 import { microdescDigests } from "./microdesc.wac";
 
@@ -46,9 +45,6 @@ const i32 DEFAULT_PORT = 7000;
  * anyone hold this loop open with fourteen kilobytes of header they never finish.
  */
 const i32 MAX_REQUEST = 8192;
-
-/** `HS_DESC_MAX_LEN`, since the only body this port accepts is a descriptor. */
-const i32 MAX_BODY = 50000;
 
 /** How many descriptors this directory will hold. */
 const i32 MAX_STORED = 32;
@@ -143,43 +139,6 @@ export i32 main(Core core, Cli cli) {
 }
 
 /**
- * File an uploaded descriptor, and return the documents this directory now holds.
- *
- * The name is taken from `checkForPublication`, never from the request: the publish URL has no key in
- * it, and a directory that let the uploader choose would file a valid descriptor where no client
- * looks. Replacing by name rather than appending is what makes a service's republication an update —
- * a store that appended would serve whichever copy the search reached first, which over a service's
- * lifetime is the older one.
- */
-DirDocuments stored(DirDocuments docs, u8[] descriptor, u8[] blindedKey) {
-  for (i32 i = 0; i < docs.hsBlindedKeys.len(); i++) {
-    if (sameBytes(docs.hsBlindedKeys[i], blindedKey)) {
-      docs.hsDescriptors[i] = descriptor;
-      return docs;
-    }
-  }
-  i32 n = docs.hsDescriptors.len();
-  if (n >= MAX_STORED) { return docs; }
-  u8[][] descs = u8[][n + 1]();
-  u8[][] keys = u8[][n + 1]();
-  for (i32 i = 0; i < n; i++) {
-    descs[i] = docs.hsDescriptors[i];
-    keys[i] = docs.hsBlindedKeys[i];
-  }
-  descs[n] = descriptor;
-  keys[n] = blindedKey;
-  return DirDocuments(docs.consensus, docs.consensusMicrodesc, docs.certificate, docs.descriptors,
-                      docs.descriptorDigests, docs.fingerprint, docs.microdescriptors,
-                      docs.microdescDigests, descs, keys);
-}
-
-bool sameBytes(u8[] a, u8[] b) {
-  if (a.len() != b.len() || a.len() == 0) { return false; }
-  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
-  return true;
-}
-
-/**
  * Read one request and write one reply.
  *
  * A request can arrive in pieces, so bytes accumulate until the parser says it has a whole one. The
@@ -189,34 +148,16 @@ bool sameBytes(u8[] a, u8[] b) {
 DirDocuments answer(Core core, Cli cli, Socket conn, DirDocuments docs) {
   Buf pending = Buf.create();
   while (true) {
-    match (parseRequest(pending.bytes(), MAX_BODY)) {
-      case Ok(request): {
-        // A publish is the one request with a body, and the only one that changes what is held here.
-        // `hsPublishVersion` reads the version out of the middle of the target rather than matching
-        // the path whole, because `/tor/hs/3/publish` and `/tor/hs/3/<z>` differ only after it.
-        if (sameBytes(request.method, "POST".toBytes()) &&
-            hsPublishVersion(request.target) == 3) {
-          i32 reason = checkForPublication(request.body, 0).reason;
-          if (reason == PUB_OK) {
-            u8[] key = checkForPublication(request.body, 0).blindedKey;
-            docs = stored(docs, request.body, key);
-            core.log("dird: stored a descriptor, " + itoa(docs.hsDescriptors.len()) + " held");
-          } else {
-            core.warn("dird: refused a descriptor, reason " + itoa(reason));
-          }
-          cli.send(conn.handle, hsPublishResponseBytes(reason == PUB_OK)).wait();
-          return docs;
-        }
-        cli.send(conn.handle, dirResponse(request.target, docs)).wait();
-        return docs;
+    DirAction act = dirStep(pending.bytes(), docs);
+    if (act.ready) {
+      if (act.descriptor.len() > 0) {
+        docs = filed(docs, act.descriptor, act.blindedKey, MAX_STORED);
+        core.log("dird: stored a descriptor, " + itoa(docs.hsDescriptors.len()) + " held");
+      } else if (act.refusedFor != PUB_OK) {
+        core.warn("dird: refused a descriptor, reason " + itoa(act.refusedFor));
       }
-      case Bad(code): {
-        core.warn("dird: a malformed request, code " + itoa(code));
-        cli.send(conn.handle, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".toBytes())
-          .wait();
-        return docs;
-      }
-      case Incomplete: { }
+      cli.send(conn.handle, act.response).wait();
+      return docs;
     }
     if (pending.bytes().len() > MAX_REQUEST + MAX_BODY) {
       core.warn("dird: a request larger than " + itoa(MAX_REQUEST + MAX_BODY) + " bytes, dropped");
