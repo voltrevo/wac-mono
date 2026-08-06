@@ -577,10 +577,12 @@ Deno.test("box works as a filter, and its applets need only what they use", asyn
   const hashed = await runFilter(BOX, ["sha256sum"], input);
   assertEquals(new TextDecoder().decode(hashed.out).trim().endsWith("  -"), true, "stdin is '-'");
 
-  // But a file still needs the grant, and says so.
+  // But a file still needs the grant, and says so — in `faultWords`' phrase for `FAULT_NOT_GRANTED`,
+  // which is what an applet prints when the category has words. "Permission denied" would be wrong here:
+  // nothing denied anything, the program was never handed a filesystem.
   const denied = await runFilter(BOX, ["cat", "README.md"], new Uint8Array());
   assertEquals(denied.code, 1);
-  assertEquals(denied.err.includes("not granted"), true, denied.err);
+  assertEquals(denied.err.includes("Not granted to this application"), true, denied.err);
 });
 
 Deno.test("cp streams, and leaves nothing behind either way", async () => {
@@ -995,7 +997,7 @@ Deno.test("bin/: one applet alone states only the grants it needs", async () => 
     // And a program with no grants cannot be talked into a read, whatever it is passed.
     const denied = await pipe(wc, ["README.md"], "");
     assertEquals(denied.code, 1);
-    assertEquals(dec.decode(denied.stderr).includes("not granted"), true);
+    assertEquals(dec.decode(denied.stderr).includes("Not granted to this application"), true);
     // It names itself, not `box` — the entry point in `bin/` passes the name, because a
     // program in this model is never handed its own argv[0].
     assertEquals(dec.decode(denied.stderr).startsWith("wc: "), true, dec.decode(denied.stderr));
@@ -1101,7 +1103,7 @@ Deno.test("streaming applets hold a chunk, not the input", async () => {
       }).outputSync();
       assertEquals(r.code, 1);
       assertEquals(
-        new TextDecoder().decode(r.stderr).includes("not granted"),
+        new TextDecoder().decode(r.stderr).includes("Not granted to this application"),
         true,
         new TextDecoder().decode(r.stderr),
       );
@@ -1294,8 +1296,12 @@ Deno.test("box's network applets: a wac server and a wac client, over real TCP",
         stderr: "piped",
       }).outputSync();
       assertEquals(denied.code, 1);
+      // The host's own sentence, not `faultWords`' phrase: a connection failure is not a `Change` and
+      // carries no category, so what reaches the applet is the message. "network access not granted to
+      // this application" says more than any phrase would, which is the argument the fault categories
+      // make in reverse — see `packages/platform/test/faults_agree.test.ts`.
       assertEquals(
-        new TextDecoder().decode(denied.stderr).includes("not granted"),
+        new TextDecoder().decode(denied.stderr).includes("network access not granted"),
         true,
         new TextDecoder().decode(denied.stderr),
       );

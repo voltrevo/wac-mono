@@ -30,7 +30,6 @@ import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
 import {
   CHANGED_OK,
-  FAULT_DENIED,
   FAULT_NOT_GRANTED,
   Faulted,
   STAT_BYTES,
@@ -446,7 +445,7 @@ export function nodeWorld(
       const dv = new DataView(out.buffer);
       // Not granted is not absence — see the Deno host, which says why at length.
       if (!opts.fs?.read) {
-        out[STAT_FAULT] = FAULT_DENIED;
+        out[STAT_FAULT] = FAULT_NOT_GRANTED;
         return out;
       }
       const path = P(unstr(p));
@@ -466,7 +465,7 @@ export function nodeWorld(
       const out = new Uint8Array(STAT_BYTES);
       const dv = new DataView(out.buffer);
       if (!opts.fs?.read) {
-        out[STAT_FAULT] = FAULT_DENIED;
+        out[STAT_FAULT] = FAULT_NOT_GRANTED;
         return out;
       }
       const path = P(unstr(p));
@@ -492,7 +491,7 @@ export function nodeWorld(
       return str(names.join("\u0000"));
     },
     [OP.WRITE_FILE]: (p) => {
-      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      if (!opts.fs?.write) return changeBytes(FAULT_NOT_GRANTED, "filesystem write not granted to this application");
       const n = readI32le(p);
       return changed(() => fs.writeFile(P(unstr(p.subarray(4, 4 + n))), p.subarray(4 + n)));
     },
@@ -525,7 +524,7 @@ export function nodeWorld(
       await sink?.close();
       sink = null;
       if (path === "") return CHANGED_OK;
-      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      if (!opts.fs?.write) return changeBytes(FAULT_NOT_GRANTED, "filesystem write not granted to this application");
       return await changed(async () => { sink = await io.createFile(P(path)); });
     },
 
@@ -602,17 +601,17 @@ export function nodeWorld(
     },
 
     [OP.MKDIR]: (p) => {
-      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      if (!opts.fs?.write) return changeBytes(FAULT_NOT_GRANTED, "filesystem write not granted to this application");
       return changed(() => fs.mkdir(P(unstr(p.subarray(1))), { recursive: p[0] === 1 }));
     },
     [OP.REMOVE]: (p) => {
-      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      if (!opts.fs?.write) return changeBytes(FAULT_NOT_GRANTED, "filesystem write not granted to this application");
       // `force: false` so that removing something absent fails, as `Deno.remove` does — and now that
       // the failure carries a category, `rm -f` can ignore exactly that one rather than all of them.
       return changed(() => fs.rm(P(unstr(p.subarray(1))), { recursive: p[0] === 1, force: false }));
     },
     [OP.RENAME]: (p) => {
-      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      if (!opts.fs?.write) return changeBytes(FAULT_NOT_GRANTED, "filesystem write not granted to this application");
       const n = readI32le(p);
       return changed(() =>
         fs.rename(P(unstr(p.subarray(4, 4 + n))), P(unstr(p.subarray(4 + n))))

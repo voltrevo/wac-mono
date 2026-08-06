@@ -299,3 +299,21 @@ file" from "happens to use the word". Three more real ones appeared immediately:
 are actively working in; the tor and bls ones are protocol and field-arithmetic tables, where the
 completeness argument may well hold and belongs in the file as a `dead-exports: exempt` note written by
 whoever owns the design.
+
+
+## 20 → 19: `FAULT_NOT_GRANTED` had no caller because the category had no test — agent-a, 2026-08-06
+
+`packages/platform`'s `FAULT_NOT_GRANTED` was on the list, and deleting it would have been wrong: the
+hosts raise it, and the reason no *wac* code named it was that nothing checked the numbering at all. The
+categories are a shared constant with a copy on each side of the bridge — `host/faults.ts` and
+`src/platform.wac` — and neither can import the other, so a category inserted in one file shifts every
+code above it and turns "no such file" into "permission denied" with nothing to notice.
+
+`packages/platform/test/faults_agree.test.ts` holds the two lists up side by side, and a third: `phraseOf`
+in the host, which renders the same categories for a browser page. What that pinned immediately was that
+only one of seven ungranted paths used the category (see the commit), so the export was dead in the same
+way the behaviour was.
+
+The remaining 19 are `bls` (3), `tls` (2), `tor` (14) — protocol and field-arithmetic tables, where the
+completeness argument may well hold and belongs in the file as a `dead-exports: exempt` note written by
+whoever owns the design.

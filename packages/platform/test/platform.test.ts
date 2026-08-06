@@ -355,9 +355,10 @@ Deno.test("the two runtimes agree about the whole filesystem, not just reading a
 });
 
 Deno.test("and they agree about a `stat` neither of them is allowed to take", async () => {
-  // The other half of the fault field: a world with no read capability answers `FAULT_DENIED`, not
-  // "does not exist". Both hosts have to say it, and this is a case where being wrong is invisible —
-  // an ungranted program that claims a file is absent looks exactly like one whose file is absent.
+  // The other half of the fault field: a world with no read capability answers `FAULT_NOT_GRANTED`, not
+  // "does not exist" and not "permission denied". Both hosts have to say it, and this is a case where
+  // being wrong is invisible — an ungranted program that claims a file is absent looks exactly like one
+  // whose file is absent, and one that claims permission was denied sends a reader to check a mode.
   //
   // **Write but not read**, which is a strange grant to hold and the only one that reaches the line
   // this test is about. With nothing granted the program dies at its first `writeFile` and never
@@ -386,10 +387,13 @@ Deno.test("and they agree about a `stat` neither of them is allowed to take", as
     assertEquals(n.out, d.out, `Deno said ${JSON.stringify(d.out)}, Node said ${JSON.stringify(n.out)}`);
     assertEquals(n.code, d.code, `exit ${d.code} against ${n.code}`);
     assertEquals(
-      d.out.includes("stat: cannot tell — Permission denied"),
+      d.out.includes("stat: cannot tell — Not granted to this application"),
       true,
-      `the denied stat was not reported as denied:\n${d.out}\n${d.err}`,
+      `the ungranted stat was not reported as ungranted:\n${d.out}\n${d.err}`,
     );
+    // And not with an empty reason, which is what this printed while the category had no phrase: `Stat`
+    // carries no host message to fall back to, so "no words for this category" meant no words at all.
+    assertEquals(d.out.includes("stat: cannot tell — \n"), false, `an empty reason:\n${d.out}`);
     // It got that far, which is what makes the line above a statement about `stat` rather than about
     // whichever capability happened to fail first.
     assertEquals(d.out.includes("wrote roundtrip.txt"), true, d.out);

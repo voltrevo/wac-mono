@@ -23,7 +23,6 @@ import { ChildStack, joinPath, packCaptured, unpackPush } from "./child.ts";
 import { ByteQueue } from "./queue.ts";
 import {
   CHANGED_OK,
-  FAULT_DENIED,
   FAULT_NOT_GRANTED,
   Faulted,
   STAT_BYTES,
@@ -519,11 +518,11 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     [OP.STAT]: async (p) => {
       const out = new Uint8Array(STAT_BYTES);
       const dv = new DataView(out.buffer);
-      // Not granted is not absence. A program with no read capability used to be told "does not exist",
-      // which is the same lie this whole issue is about — it cannot tell that from a file it may not look
-      // at, and a diagnostic built on it blames the path.
+      // Not granted is not absence, and it is not denial either. A program with no read capability was
+      // told "does not exist", then "permission denied" — the first blames the path and the second blames
+      // the file's mode, and both send a reader looking at a filesystem that was never handed over.
       if (!opts.fs?.read) {
-        out[STAT_FAULT] = FAULT_DENIED;
+        out[STAT_FAULT] = FAULT_NOT_GRANTED;
         return out;
       }
       const path = P(unstr(p));
@@ -547,7 +546,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       const out = new Uint8Array(STAT_BYTES);
       const dv = new DataView(out.buffer);
       if (!opts.fs?.read) {
-        out[STAT_FAULT] = FAULT_DENIED;
+        out[STAT_FAULT] = FAULT_NOT_GRANTED;
         return out;
       }
       const path = P(unstr(p));
@@ -574,7 +573,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     // The four changes answer a `Change` rather than throwing: a fault category and the host's own
     // words. A refusal for want of a grant is a `Denied` like any other, said in the same shape.
     [OP.WRITE_FILE]: (p) => {
-      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      if (!opts.fs?.write) return changeBytes(FAULT_NOT_GRANTED, "filesystem write not granted to this application");
       const n = readI32le(p);
       const path = P(unstr(p.subarray(4, 4 + n)));
       return changed(() => onPath(path, () => Deno.writeFile(path, p.subarray(4 + n))));
@@ -626,7 +625,7 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       sink?.close();
       sink = null;
       if (path === "") return CHANGED_OK;
-      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      if (!opts.fs?.write) return changeBytes(FAULT_NOT_GRANTED, "filesystem write not granted to this application");
       // `changed`, so a directory that does not exist is `FAULT_NOT_FOUND` rather than an errno and an
       // absolute path in somebody's shell diagnostic.
       const full = P(path);
@@ -785,17 +784,17 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
     },
 
     [OP.MKDIR]: (p) => {
-      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      if (!opts.fs?.write) return changeBytes(FAULT_NOT_GRANTED, "filesystem write not granted to this application");
       const dir = P(unstr(p.subarray(1)));
       return changed(() => onPath(dir, () => Deno.mkdir(dir, { recursive: p[0] === 1 })));
     },
     [OP.REMOVE]: (p) => {
-      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      if (!opts.fs?.write) return changeBytes(FAULT_NOT_GRANTED, "filesystem write not granted to this application");
       const victim = P(unstr(p.subarray(1)));
       return changed(() => onPath(victim, () => Deno.remove(victim, { recursive: p[0] === 1 })));
     },
     [OP.RENAME]: (p) => {
-      if (!opts.fs?.write) return changeBytes(FAULT_DENIED, "filesystem write not granted");
+      if (!opts.fs?.write) return changeBytes(FAULT_NOT_GRANTED, "filesystem write not granted to this application");
       const n = readI32le(p);
       const from = P(unstr(p.subarray(4, 4 + n)));
       const to = P(unstr(p.subarray(4 + n)));

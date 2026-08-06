@@ -50,7 +50,6 @@ import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
 import {
   CHANGED_OK,
-  FAULT_DENIED,
   FAULT_EXISTS,
   FAULT_NOT_GRANTED,
   Faulted,
@@ -392,7 +391,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    */
   const writeRefused = (): Uint8Array | null =>
     opts.root === undefined || opts.writable !== true
-      ? changeBytes(FAULT_DENIED, "filesystem write not granted")
+      ? changeBytes(FAULT_NOT_GRANTED, "filesystem write not granted to this application")
       : null;
 
   /**
@@ -445,7 +444,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
     // No root is no read capability, which is not the same as an empty filesystem — a page that was never
     // given a directory cannot say whether a file is there, and saying "it is not" is a guess.
     if (opts.root === undefined) {
-      out[STAT_FAULT] = FAULT_DENIED;
+      out[STAT_FAULT] = FAULT_NOT_GRANTED;
       return out;
     }
     try {

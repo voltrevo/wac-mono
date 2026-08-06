@@ -1,0 +1,22 @@
+// The fault numbers and phrases, as the wac side sees them, for `test/faults_agree.test.ts`.
+//
+// A probe rather than a test in wac, because the comparison is against `host/faults.ts` — TypeScript, on
+// the other side of the bridge — and that is the whole point: the two copies of this numbering cannot see
+// each other, so something has to hold them up side by side.
+import { FAULT_NONE, FAULT_NOT_FOUND, FAULT_DENIED, FAULT_EXISTS, FAULT_NOT_EMPTY, FAULT_OTHER,
+         FAULT_NOT_REPRESENTABLE, FAULT_NOT_GRANTED, faultWords } from "../../src/platform.wac";
+
+export i32[] codes() {
+  i32[] out = i32[8]();
+  out[0] = FAULT_NONE();
+  out[1] = FAULT_NOT_FOUND();
+  out[2] = FAULT_DENIED();
+  out[3] = FAULT_EXISTS();
+  out[4] = FAULT_NOT_EMPTY();
+  out[5] = FAULT_OTHER();
+  out[6] = FAULT_NOT_REPRESENTABLE();
+  out[7] = FAULT_NOT_GRANTED();
+  return out;
+}
+
+export u8[] words(i32 fault) { return faultWords(fault).toBytes(); }
