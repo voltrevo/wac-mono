@@ -489,3 +489,32 @@ other end has already closed.
 Worth noting the shape of this: five instrumented branches staying quiet was more informative than any
 of them firing would have been. The uninstrumented path is the one that was taken, and it was the only
 one nobody had thought worth a message.
+
+### A relay serves one connection at a time, and that is the structural blocker
+
+The instrumented message never fired, because this run never reached an extend: with the same
+configuration that produced two extends an hour earlier — `EnforceDistinctSubnets 0` confirmed present
+in both the script and the generated torrc — **each relay took exactly one connection and no relay was
+asked to extend.** The runs are not deterministic, and the difference correlates with load (0.39 then,
+1.91 now).
+
+`relayd`'s accept loop explains it:
+
+    Socket conn = cli.accept(listener.handle).wait();
+    serve(core, cli, conn, id, certs, now, docs, hasDir);
+    cli.closeSocket(conn.handle);
+
+**One connection at a time, start to finish.** A relay in a three-hop circuit has to serve the client
+*and* accept an incoming extend from another relay at the same time, and a relay busy inside `serve`
+never returns to `accept`. Whether a circuit can be built therefore depends on the order connections
+happen to arrive — which is exactly the nondeterminism observed, and it explains the earlier "second
+extend fails" just as well as a handshake bug does: the far relay was not in `accept` to answer.
+
+This is a bigger change than the instrumentation it displaces: `serve` would have to become one of
+several connections the loop multiplexes, with `accept` as another id in the same `waitAny` that
+already watches the client, the next hop and the stream. `packages/platform/example/inetd.wac` is the
+model — its whole subject is accepting while serving.
+
+The `link died while sending NETINFO` message stays, and is still the thing to read when an extend does
+happen. But it is no longer the leading suspect: a socket closed by a relay that went back to `accept`
+and never came, and a handshake that genuinely disagrees, look identical from the initiator's side.
