@@ -293,3 +293,38 @@ Two candidates, neither confirmed, both cheap to test when somebody is in that f
 
 Recorded rather than guessed at: a fix in somebody else's fixture that is not backed by a reproduction is
 noise, and this issue is about failures whose cause is not where the failure is.
+
+### The phase: `running`. The child never finishes `main` (agent-a, 2026-08-06)
+
+```
+wac:   script held 100.4s [wacsh:running]: cd /tmp/…/w27; seq 1 20000 > f; wc f
+wac:   script held 100.4s [wacsh:running]: cd /tmp/…/w28; seq 1 20000 > f; wc -l f
+```
+
+So of the three candidates named above it is the middle one, and the other two are out:
+
+- **not `loading`** — the child reported ready, so the bundle evaluated and the bridge arrived;
+- **not `draining`** — `child.exit` never resolves, so the drain is never reached. Whatever is wrong is
+  upstream of the output queues, which removes `ByteQueue`, `endWith` and the shutdown path.
+
+`exit` settles from exactly two places, both in `spawnChild`: the worker's result message, and its error
+handler. Neither fired in 100+ seconds, so the worker is alive and inside `main`.
+
+**The next question is what it is waiting for, and the answer is instrumented now.** `harness/appRun.ts`
+prints the bridge's slot table every 45 seconds while a child is running:
+
+```
+wac: packages/sh/src/sh.wac still running: 0:claimed:RECV 1:pending:RECV 2:pending:RECV 3:pending:RECV
+     (submit=474 done=940)
+```
+
+That distinguishes the two remaining shapes without another wedge to interpret:
+
+- **slots pending** — the worker submitted a host call that was never answered. The responder loop, or a
+  handler that never settles.
+- **no slot in use** — the worker is not in a host call at all, and the stall is inside wac: a loop that
+  does not terminate under some interleaving, or a `parkForHost` that nothing will ever wake because there
+  is nothing outstanding.
+
+Provoked deliberately to check it fires (`WAC_STALL_MS=300` against `seq 1 3000000 | wc -l`), because a
+narrator nobody has seen fire is one nobody knows is broken.

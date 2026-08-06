@@ -34,7 +34,8 @@
 import { spawnChild } from "../packages/platform/host/children.ts";
 import { serveHostCalls } from "../packages/platform/host/respond.ts";
 import { denoWorld } from "../packages/platform/host/deno.ts";
-import { bridgeOf, newBridge } from "../packages/platform/host/layout.ts";
+import { type Bridge, bridgeOf, newBridge } from "../packages/platform/host/layout.ts";
+import { describeSlots } from "../packages/platform/host/call.ts";
 import { buildApp, type Grants } from "../packages/platform/build.ts";
 
 export type RunResult = {
@@ -111,6 +112,10 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
 
   return {
     async run(args, opts = {}) {
+      // Kept so a stall can be described: the slot table says whether the child is blocked in a host
+      // call and which one. Without it a wedged run reports "still running" and nothing else, which is
+      // where wac-mono 0082 stood for two days.
+      let bridge: Bridge | undefined;
       const child = spawnChild(
         source,
         args.map((a) => enc.encode(a)),
@@ -142,7 +147,10 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
             readStdinChunk: () => input.next(),
             selfSource: source,
           })),
-        () => newBridge(),
+        () => {
+          bridge = newBridge();
+          return bridge;
+        },
       );
 
       const note = opts.note ?? (() => {});
@@ -160,6 +168,21 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
       // `rest()` releases room as it takes chunks, so starting it first drains continuously and the
       // size stops mattering. `shutdown()` ends both queues, which is what lets these resolve.
       note("running");
+      // A child that never finishes says what it is waiting on, every 45 seconds, to standard error.
+      // It cannot fail anything — it prints — so the budget can be short enough to be useful without
+      // being tuned against a loaded machine. Cleared in the `finally` below.
+      // `WAC_STALL_MS` so this can be provoked in a second rather than only by a real wedge — a
+      // narrator that is never seen to fire is one nobody knows is broken.
+      const stallMs = Number(Deno.env.get("WAC_STALL_MS") ?? "45000");
+      const stall = setInterval(() => {
+        if (bridge === undefined) return;
+        try {
+          console.error(`wac: ${entry} still running: ${describeSlots(bridge)}`);
+        } catch {
+          // A bridge whose buffer has gone is not worth an exception here.
+        }
+      }, Number.isFinite(stallMs) && stallMs > 0 ? stallMs : 45_000);
+      Deno.unrefTimer(stall);
       const draining = Promise.all([child.out.rest(), child.err.rest()]);
 
       // Standard input is whatever the caller gave, then end — a program that reads to the end has
@@ -169,11 +192,15 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
       }
       child.in.end();
 
-      const code = await child.exit;
-      note("draining");
-      const [bytes, errBytes] = await draining;
-      note("done");
-      return { code, out: dec.decode(bytes), err: dec.decode(errBytes), bytes };
+      try {
+        const code = await child.exit;
+        note("draining");
+        const [bytes, errBytes] = await draining;
+        note("done");
+        return { code, out: dec.decode(bytes), err: dec.decode(errBytes), bytes };
+      } finally {
+        clearInterval(stall);
+      }
     },
   };
 }

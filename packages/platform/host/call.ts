@@ -79,7 +79,7 @@ export function faultedMessage(bytes: Uint8Array): { fault: number; message: str
 const OP_NAMES: Record<number, string> = Object.fromEntries(
   Object.entries(OP).map(([name, op]) => [op, name]),
 );
-const opName = (op: number): string =>
+export const opName = (op: number): string =>
   op === OP_CONTINUE ? "a continued response" : (OP_NAMES[op] ?? `op ${op}`);
 
 /**
@@ -90,6 +90,32 @@ const opName = (op: number): string =>
  * bug, because the answer looks plausible.
  */
 export type Ticket = { slot: number; gen: number };
+
+/**
+ * What every slot in a bridge is doing, for a caller narrating a stall.
+ *
+ * wac-mono 0082: a child that never finishes leaves the parent with nothing to say beyond "it is still
+ * running". The slot table is the answer — a worker blocked in a host call has a slot sitting at
+ * `pending` with its opcode in it, and a worker blocked on something else has none.
+ *
+ * Reads only, and atomically, so it is safe to call at any moment from either side. Never used to decide
+ * anything: it prints.
+ */
+export function describeSlots(b: Bridge): string {
+  const names = ["free", "claimed", "pending", "ready", "cancelled"];
+  const busy: string[] = [];
+  for (let i = 0; i < SLOTS; i++) {
+    const at = slotAt(i);
+    const st = Atomics.load(b.ctrl, at + S_STATUS);
+    if (st === ST_FREE) continue;
+    busy.push(`${i}:${names[st] ?? st}:${opName(Atomics.load(b.ctrl, at + S_OP))}`);
+  }
+  return busy.length === 0
+    ? `no slot in use (submit=${Atomics.load(b.ctrl, SUBMIT_SEQ)} done=${Atomics.load(b.ctrl, DONE_SEQ)})`
+    : `${busy.join(" ")} (submit=${Atomics.load(b.ctrl, SUBMIT_SEQ)} done=${
+      Atomics.load(b.ctrl, DONE_SEQ)
+    })`;
+}
 
 /** Publish a slot's state change and wake the host. */
 function ping(b: Bridge): void {
