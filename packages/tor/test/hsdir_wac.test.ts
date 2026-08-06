@@ -9,7 +9,7 @@
 import { wacTestRun } from "../../../harness/wacTestRun.ts";
 
 const V_CASE_COUNT = 0, V_CASE_META = 1, V_CASE_HSDIRS = 2, V_RELAYS = 3,
-  V_SERVICE_INDEX = 4, V_CONSENSUS = 5, V_MICRODESCS = 6;
+  V_SERVICE_INDEX = 4, V_CONSENSUS = 5, V_MICRODESCS = 6, V_CASE_SRV_NAME = 7;
 
 type Vectors = {
   relays: { nickname: string; ed25519: string; hsdir: boolean }[];
@@ -20,6 +20,7 @@ type Vectors = {
     timePeriod: number;
     periodLength: number;
     sharedRandomValue: string;
+    srvName: string;
     serviceIndex: string[];
     hsdirs: { nickname: string; ed25519: string; relayIndex: string }[];
   }[];
@@ -28,6 +29,13 @@ type Vectors = {
 const v = JSON.parse(
   await Deno.readTextFile(new URL("data/hsdir_vectors.json", import.meta.url)),
 ) as Vectors;
+
+// A service publishes two descriptors, and the vector must contain both or the store rule cannot be
+// checked at all: one case would be consistent with almost any pair of periods.
+if (v.cases.length < 2) throw new Error("the vector records fewer than two service uploads");
+if (new Set(v.cases.map((c) => c.srvName)).size < 2) {
+  throw new Error("both uploads used the same shared random value, so the assignment is untested");
+}
 
 // The candidate set is the HSDir-flagged relays, not every node with an identity key: a client has
 // none and a relay can be in the consensus without the flag. Getting this wrong would change the ring
@@ -76,6 +84,11 @@ function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
       const c = v.cases[a[0]];
       return new Uint8Array(c.serviceIndex.flatMap((s) => [...hex(s)]));
     }
+    // Which of the consensus's two shared random values tor used for this upload. Recorded by the
+    // capture from the service's own log, not inferred here — the whole point is that it is tor's
+    // choice rather than ours.
+    case V_CASE_SRV_NAME:
+      return new Uint8Array([v.cases[a[0]].srvName === "current" ? 1 : 0]);
     case V_CONSENSUS:
       return new TextEncoder().encode(v.consensusDocument);
     case V_MICRODESCS:

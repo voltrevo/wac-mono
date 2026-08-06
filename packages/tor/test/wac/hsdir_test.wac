@@ -19,7 +19,8 @@ import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import {
   hsServiceIndex, hsRelayIndex, disasterSrv, compareIndex, responsibleHsdirs,
   HSDIR_N_REPLICAS_DEFAULT, HSDIR_SPREAD_STORE_DEFAULT, HSDIR_SPREAD_FETCH_DEFAULT,
-  hsdirsForDescriptor, hsdirCandidates, descriptorPath,
+  hsdirsForDescriptor, hsdirCandidates, descriptorPath, StorePeriod, betweenTimePeriodAndSrv,
+  serviceStorePeriods, consensusTimePeriod,
 } from "../../src/hsdir.wac";
 import { Relay, parseConsensus, attachMicrodescriptors, base64NoPad } from "../../src/directory.wac";
 
@@ -30,6 +31,7 @@ const i32 V_RELAYS = 3;         // n(1) then n x ed25519(32)  — the HSDir-flag
 const i32 V_SERVICE_INDEX = 4;  // replicas x 32
 const i32 V_CONSENSUS = 5;
 const i32 V_MICRODESCS = 6;
+const i32 V_CASE_SRV_NAME = 7;  // 1 if tor used shared-rand-current-value for this upload
 
 bool same(u8[] a, u8[] b) {
   if (a.len() != b.len()) { return false; }
@@ -406,4 +408,110 @@ export string test_only_flagged_relays_with_an_identity_are_candidates(
   relays[2].ed25519Identity = u8[31]();
   t.eqI32(hsdirCandidates(relays).len(), 2, "a 31-byte identity is still not placeable");
   return t.report();
+}
+
+/**
+ * The two descriptors a service publishes, against the two a service actually published.
+ *
+ * The vector is not a set of parameters: it is two uploads a real tor service made against this
+ * consensus, each recorded with the time period and the shared random value tor chose for it. So this
+ * asks the only question that matters — given the same consensus, do we choose the same two?
+ *
+ * A client fetches one descriptor and a service publishes two, under consecutive periods with
+ * *different* shared random values. Publishing both under one SRV, or under the wrong pair of
+ * periods, produces documents filed under names no client computes: the same silent failure as a
+ * wrong blinded key, and invisible to everyone involved.
+ */
+export string test_a_service_publishes_for_the_two_periods_tor_did(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  T t = T.create();
+  u8[] consensus = ref(V_CONSENSUS, u8[0](), u8[0]());
+  i32 n = ref(V_CASE_COUNT, u8[0](), u8[0]())[0];
+  t.isTrue(n >= 2, "the vector records both of a service's uploads");
+
+  StorePeriod[] store = serviceStorePeriods(consensus, true, 0);
+  t.eqI32(store.len(), 2, "a service publishes two descriptors, not one");
+
+  for (i32 i = 0; i < 2; i++) {
+    u8[] meta = ref(V_CASE_META, idx(i), u8[0]());
+    t.eqI64(store[i].periodNum, readI64(meta, 64), "the period tor published under");
+    t.eqI64(store[i].periodLength, readI64(meta, 72), "and its length");
+    bool wantedCurrent = ref(V_CASE_SRV_NAME, idx(i), u8[0]())[0] == 1;
+    t.isTrue(store[i].useCurrentSrv == wantedCurrent,
+             "and the shared random value tor used for it");
+  }
+
+  // The two are consecutive, and they differ in their SRV — the older descriptor always takes the
+  // previous value and the newer one the current value, whichever pair of periods is in play.
+  t.eqI64(store[1].periodNum, store[0].periodNum + 1, "the two periods are consecutive");
+  t.isTrue(!store[0].useCurrentSrv, "the first takes the previous shared random value");
+  t.isTrue(store[1].useCurrentSrv, "and the second the current one");
+
+  // A consensus with no timings is refused rather than answered from an invented period.
+  t.eqI32(serviceStorePeriods("network-status-version 3\n".toBytes(), true, 0).len(), 0,
+          "a consensus with no timings yields no periods to publish for");
+  return t.report();
+}
+
+/**
+ * The predicate that decides which pair, on the consensus it was captured from.
+ *
+ * This consensus falls in the marked stretch, which is why the first period is the one *before* the
+ * current one — and why a service that ignored the predicate would have published the current and
+ * next periods, missing the period half its clients are still asking under.
+ */
+export string test_the_stretch_between_a_period_and_an_srv(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] consensus = ref(V_CONSENSUS, u8[0](), u8[0]());
+  t.isTrue(betweenTimePeriodAndSrv(consensus, true, 0),
+           "this consensus is between a new time period and a new shared random value");
+
+  i64[] now = consensusTimePeriod(consensus, true, 0);
+  StorePeriod[] store = serviceStorePeriods(consensus, true, 0);
+  t.eqI64(store[0].periodNum, now[0] - 1, "so the first descriptor is for the period that is ending");
+  t.eqI64(store[1].periodNum, now[0], "and the second for the one that has begun");
+
+  t.isTrue(!betweenTimePeriodAndSrv("network-status-version 3\n".toBytes(), true, 0),
+           "a consensus with no timings is not in the stretch — it is not anywhere");
+
+  // The other side of the boundary, which the captured consensus never reaches. Two faults planted
+  // in the start-of-next-period arithmetic — dropping the phase offset, and taking the current period
+  // instead of the next — survived every assertion above, because lowering that boundary keeps the
+  // answer `true` for a consensus already past it. Only a consensus *before* it tells them apart.
+  //
+  // 04:00:00 with a twenty-second voting interval is the start of a shared-random protocol run, so it
+  // is in the `$====|` stretch rather than the `----` one.
+  t.isTrue(!betweenTimePeriodAndSrv(timings("04:00:00", "04:00:20"), true, 0),
+           "a consensus at the start of a protocol run is not between a period and an SRV");
+  t.isTrue(betweenTimePeriodAndSrv(timings("04:07:00", "04:07:20"), true, 0),
+           "and one seven minutes in is");
+
+  // Which pair a service publishes for follows from that, and differs across the boundary in *which*
+  // period is first even where the numbers happen to coincide — so the periods are asserted against
+  // the current period rather than against constants.
+  StorePeriod[] early = serviceStorePeriods(timings("04:00:00", "04:00:20"), true, 0);
+  i64 earlyNow = consensusTimePeriod(timings("04:00:00", "04:00:20"), true, 0)[0];
+  t.eqI64(early[0].periodNum, earlyNow, "before the boundary a service starts at the current period");
+  t.eqI64(early[1].periodNum, earlyNow + 1, "and publishes for the next one too");
+  return t.report();
+}
+
+/** A consensus with nothing in it but the two timings the ring arithmetic reads. */
+u8[] timings(string validAfter, string freshUntil) {
+  return ("valid-after 2026-08-05 " + validAfter + "\nfresh-until 2026-08-05 " + freshUntil +
+          "\n").toBytes();
+}
+
+/** A one-byte argument, which is how the harness is told which case to answer for. */
+u8[] idx(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+
+i64 readI64(u8[] b, i32 at) {
+  i64 v = 0;
+  for (i32 i = 0; i < 8; i++) { v = (v << 8) | (b[at + i] as i64); }
+  return v;
 }
