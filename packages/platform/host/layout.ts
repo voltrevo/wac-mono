@@ -94,12 +94,11 @@ export const BUFS = 8;
 export const INLINE_BYTES = 4096;
 
 /**
- * Payload bytes per slot, each way.
+ * What one pooled buffer holds, each way.
  *
- * `SLOTS * 2 * SLOT_BUF` is 4MB. Sixteen slots at the old 256KB would have been 8MB, and
- * halving the buffer to pay for four times the slots is the right side of that trade: the
- * buffer only decides how many round trips a *large* payload takes, while the slot count
- * decides which programs can be written at all.
+ * `BUFS * 2 * BUF_BYTES` is 2MB, and it is the whole of what this bridge reserves for payloads — it used
+ * to be per *slot*, which is why raising the slot count used to cost memory at all. What the size decides
+ * now is only how many round trips a large payload takes, and how much is pinned while one is in flight.
  *
  * It must stay comfortably above `CHUNK`, not merely equal to it. A `send` of a full 64KB
  * chunk carries a four-byte handle in front, so a 64KB buffer would chunk every streaming
@@ -111,15 +110,12 @@ export const INLINE_BYTES = 4096;
  * 1.99s. The first run of either is three to five times that and is disk, which is why the
  * comparison has to be interleaved and warm to say anything at all.
  */
-export const SLOT_BUF = 1 << 17;
-
-/** What one pooled buffer holds. Named for what it is now; `SLOT_BUF` is the old name kept for callers. */
-export const BUF_BYTES = SLOT_BUF;
+export const BUF_BYTES = 1 << 17;
 
 /**
  * What one `readChunk` hands back at most.
  *
- * Half of `SLOT_BUF`, so a chunk plus any header a capability puts in front of it never
+ * Half of `BUF_BYTES`, so a chunk plus any header a capability puts in front of it never
  * itself needs chunking, and large enough that the per-call round trip is noise next to the
  * work done on it.
  */

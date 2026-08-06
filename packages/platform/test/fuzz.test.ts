@@ -21,7 +21,7 @@
 // and how big it should be, so nothing depends on the host's own clock or randomness. A failure
 // prints its seed and can be replayed exactly.
 
-import { CTRL_INTS, newBridge, S_GEN, S_STATUS, SLOT_BUF, SLOTS, slotAt, ST_FREE } from "../host/layout.ts";
+import { BUF_BYTES, CTRL_INTS, newBridge, S_GEN, S_STATUS, SLOTS, slotAt, ST_FREE } from "../host/layout.ts";
 import { serveHostCalls } from "../host/respond.ts";
 import { newScheduler } from "../host/schedule.ts";
 
@@ -145,8 +145,8 @@ const BODY = `
       // A new call. One in eight is big enough to chunk in one direction or both, which is
       // where a slot's payload space and its control block have to agree.
       const big = pick(8) === 0;
-      const size = big ? ${SLOT_BUF} + pick(${SLOT_BUF}) : pick(2000);
-      const extra = big ? ${SLOT_BUF} + pick(1000) : pick(64);
+      const size = big ? ${BUF_BYTES} + pick(${BUF_BYTES}) : pick(2000);
+      const extra = big ? ${BUF_BYTES} + pick(1000) : pick(64);
       if (big) chunked++;
       const n = nonce++;
       live.push({ t: submit(b, ${ECHO}, req(n, pick(3), size, extra)), nonce: n, size });
