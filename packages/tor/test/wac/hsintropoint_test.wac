@@ -1,0 +1,119 @@
+// When a service gives up an introduction point.
+//
+// The constants are tor's (`or.h`, `hs_common.h`) and the decisions are `intro_point_should_expire`
+// and `should_remove_intro_point` in `hs_service.c`. Two things here are worth more than the
+// constants: that both limits are drawn from a **range** rather than fixed, and that a check for an
+// existing circuit comes **before** the retry count.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  INTRO_POINT_MAX_INTRODUCE2, INTRO_POINT_MAX_LIFETIME, INTRO_POINT_MIN_INTRODUCE2,
+  INTRO_POINT_MIN_LIFETIME, MAX_INTRO_POINT_CIRCUIT_RETRIES, NUM_INTRO_POINTS_DEFAULT, ServiceIntro,
+  introPointShouldExpire, introPointsWanted, newIntroPoint, shouldRemoveIntroPoint,
+} from "../../src/hsintropoint.wac";
+
+const i64 NOW = 1785931200;
+
+/** The constants are tor's, and the ranges are half-open as tor's random range actually is. */
+export string test_the_limits_are_tors(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqI32(NUM_INTRO_POINTS_DEFAULT, 3, "three introduction points");
+  t.eqI32(INTRO_POINT_MIN_INTRODUCE2, 16384, "INTRO_POINT_MIN_LIFETIME_INTRODUCTIONS");
+  t.eqI32(INTRO_POINT_MAX_INTRODUCE2, 32768, "and double it");
+  t.eqI64(INTRO_POINT_MIN_LIFETIME, 64800 as i64, "eighteen hours");
+  t.eqI64(INTRO_POINT_MAX_LIFETIME, 86400 as i64, "and twenty-four");
+  t.eqI32(MAX_INTRO_POINT_CIRCUIT_RETRIES, 3, "three circuit retries");
+
+  // The lowest draw gives exactly the minimum; the highest gives one *under* the maximum, because
+  // `crypto_rand_int_range` is half-open however its comment reads. Taking the comment at its word
+  // would put both bounds one out, which nothing but a boundary test would show.
+  ServiceIntro low = newIntroPoint(NOW, 0, 0);
+  t.eqI64(low.expiresAt, NOW + INTRO_POINT_MIN_LIFETIME, "the shortest life is the minimum");
+  t.eqI32(low.introduce2Max, INTRO_POINT_MIN_INTRODUCE2, "and the fewest cells is the minimum");
+
+  ServiceIntro high = newIntroPoint(NOW, INTRO_POINT_MAX_LIFETIME - INTRO_POINT_MIN_LIFETIME - 1,
+                                    INTRO_POINT_MAX_INTRODUCE2 - INTRO_POINT_MIN_INTRODUCE2 - 1);
+  t.eqI64(high.expiresAt, NOW + INTRO_POINT_MAX_LIFETIME - 1,
+          "the longest life is one second under twenty-four hours");
+  t.eqI32(high.introduce2Max, INTRO_POINT_MAX_INTRODUCE2 - 1,
+          "and the most cells is one under the maximum");
+
+  // A draw past the end is clamped rather than refused: a broken random source should make a service
+  // slightly predictable, not offline.
+  ServiceIntro over = newIntroPoint(NOW, 999999999, 999999);
+  t.isTrue(over.expiresAt < NOW + INTRO_POINT_MAX_LIFETIME, "an absurd draw is still inside the range");
+  t.isTrue(over.introduce2Max < INTRO_POINT_MAX_INTRODUCE2, "in both dimensions");
+  ServiceIntro under = newIntroPoint(NOW, -5, -5);
+  t.eqI64(under.expiresAt, NOW + INTRO_POINT_MIN_LIFETIME, "and a negative draw is the minimum");
+  return t.report();
+}
+
+/**
+ * A new introduction point is not expired, and either limit alone expires it.
+ *
+ * Whichever comes first: a busy service rotates on the cell count and a quiet one on the clock. A
+ * check that required both would leave a quiet service's introduction point in place indefinitely,
+ * which is the case the clock exists for.
+ */
+export string test_either_limit_expires_it(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  ServiceIntro ip = newIntroPoint(NOW, 3600, 100);
+  t.isTrue(!introPointShouldExpire(ip, NOW), "a new introduction point is not expired");
+  t.isTrue(!introPointShouldExpire(ip, ip.expiresAt - 1), "nor a second before its time");
+  t.isTrue(introPointShouldExpire(ip, ip.expiresAt), "and it expires at its time, not after it");
+  t.isTrue(introPointShouldExpire(ip, ip.expiresAt + 86400), "and stays expired");
+
+  // The count alone, well before the clock.
+  ServiceIntro busy = newIntroPoint(NOW, 3600, 100);
+  busy.introduce2Count = busy.introduce2Max - 1;
+  t.isTrue(!introPointShouldExpire(busy, NOW), "one cell short is not expired");
+  busy.introduce2Count = busy.introduce2Max;
+  t.isTrue(introPointShouldExpire(busy, NOW),
+           "and the cell that reaches the limit expires it, hours before the clock would");
+  return t.report();
+}
+
+/**
+ * A circuit that exists outranks the retry count.
+ *
+ * tor checks for a circuit before acting on retries because one may have opened at the previous
+ * scheduled attempt. A service that counted retries alone would tear down an introduction point that
+ * had just come up — a race the counter cannot see, and one that turns into dropping points the
+ * service is successfully using.
+ */
+export string test_a_circuit_outranks_the_retry_count(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  ServiceIntro ip = newIntroPoint(NOW, 3600, 100);
+  t.isTrue(!shouldRemoveIntroPoint(ip, NOW), "a healthy introduction point stays");
+
+  ip.circuitRetries = MAX_INTRO_POINT_CIRCUIT_RETRIES;
+  t.isTrue(!shouldRemoveIntroPoint(ip, NOW), "at the retry limit it is still kept — tor uses `>`");
+  ip.circuitRetries = MAX_INTRO_POINT_CIRCUIT_RETRIES + 1;
+  t.isTrue(shouldRemoveIntroPoint(ip, NOW), "past it, with no circuit, it goes");
+
+  // The same point, over the retry limit, but a circuit exists. It stays.
+  ip.hasCircuit = true;
+  t.isTrue(!shouldRemoveIntroPoint(ip, NOW),
+           "unless a circuit exists, which may have opened at the last attempt");
+
+  // Expiry and falling out of the consensus are immediate and outrank the circuit.
+  ServiceIntro gone = newIntroPoint(NOW, 3600, 100);
+  gone.hasCircuit = true;
+  gone.inConsensus = false;
+  t.isTrue(shouldRemoveIntroPoint(gone, NOW), "a relay that left the consensus goes, circuit or not");
+
+  ServiceIntro old = newIntroPoint(NOW, 3600, 100);
+  old.hasCircuit = true;
+  t.isTrue(shouldRemoveIntroPoint(old, old.expiresAt), "and an expired one goes, circuit or not");
+  return t.report();
+}
+
+/** How many to establish, and no negative answers when a service somehow holds extra. */
+export string test_how_many_to_establish(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqI32(introPointsWanted(0), NUM_INTRO_POINTS_DEFAULT, "a new service wants three");
+  t.eqI32(introPointsWanted(2), 1, "one short wants one");
+  t.eqI32(introPointsWanted(NUM_INTRO_POINTS_DEFAULT), 0, "a full set wants none");
+  t.eqI32(introPointsWanted(9), 0, "and more than a full set wants none rather than minus six");
+  return t.report();
+}

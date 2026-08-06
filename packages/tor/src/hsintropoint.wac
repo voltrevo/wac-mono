@@ -1,0 +1,109 @@
+// How long a service keeps an introduction point, and when it gives one up.
+//
+// An introduction point is a relay that has agreed to forward INTRODUCE1 cells to a service. The
+// service holds three of them and rotates them, and *when* it rotates is a security property rather
+// than a housekeeping detail: an introduction point can count the cells it forwards, so a service
+// that kept one forever would let it accumulate an unbounded record of that service's traffic, and a
+// service that rotated on a fixed schedule would be identifiable by the schedule.
+//
+// So both limits are drawn from a range rather than fixed — tor's `service_intro_point_new`:
+//
+//     introduce2_max = rand[16384, 32768)          cells forwarded
+//     time_to_expire = now + rand[18h, 24h)        wall-clock age
+//
+// whichever comes first. A busy service rotates on the count; a quiet one rotates on the clock; and
+// an observer watching either cannot tell which service it is watching from the interval alone.
+//
+// ## The randomness is a parameter
+//
+// `pick` is supplied rather than drawn here, for the reason the descriptor's salts are: a function
+// that reached for randomness could not be tested against a stated range at all. It also puts the
+// rejection sampling at the source, where it belongs — tor's `crypto_rand_uint` loops to avoid the
+// modulo bias, and a caller passing a raw byte through a `%` here would reintroduce exactly that bias
+// with nothing in this file able to notice.
+//
+// ## `[min, max)`, and a comment in tor that says otherwise
+//
+// `crypto_rand_int_range(min, max)` is documented as returning a value "between 0 and (max - min)
+// inclusive", which reads as `[min, max]`. It is not: it calls `crypto_rand_uint(max - min)`, which
+// returns `0 .. limit-1`. The upper bound is **exclusive**, so an introduction point never lasts a
+// full 24 hours and never forwards 32768 cells. Taking the comment at its word would put both bounds
+// one out — invisible in any test that does not sit on the boundary, which is where this package has
+// been caught three times already.
+
+/** `NUM_INTRO_POINTS_DEFAULT` — how many a service maintains at once. */
+export const i32 NUM_INTRO_POINTS_DEFAULT = 3;
+
+/** `INTRO_POINT_MIN_LIFETIME_INTRODUCTIONS`, and its double. Exclusive upper bound. */
+export const i32 INTRO_POINT_MIN_INTRODUCE2 = 16384;
+export const i32 INTRO_POINT_MAX_INTRODUCE2 = 32768;
+
+/** `INTRO_POINT_LIFETIME_MIN_SECONDS` and `..._MAX_SECONDS`. Exclusive upper bound. */
+export const i64 INTRO_POINT_MIN_LIFETIME = 64800;   // 18 hours
+export const i64 INTRO_POINT_MAX_LIFETIME = 86400;   // 24 hours
+
+/** `MAX_INTRO_POINT_CIRCUIT_RETRIES` — how many times a circuit to it may fail before giving up. */
+export const i32 MAX_INTRO_POINT_CIRCUIT_RETRIES = 3;
+
+/** An introduction point as the service holds it, with the two limits it was born with. */
+export struct ServiceIntro {
+  i64 expiresAt;         // unix seconds; drawn once, when the point was established
+  i32 introduce2Max;     // drawn once too — the cell count at which it expires
+  i32 introduce2Count;   // how many valid INTRODUCE2 cells have arrived through it
+  i32 circuitRetries;    // failed attempts to build a circuit to it
+  bool hasCircuit;       // whether a circuit to it exists, established or pending
+  bool inConsensus;      // whether the relay is still in the consensus at all
+}
+
+/**
+ * A newly established introduction point, with both limits drawn from `pickLifetime` and `pickCells`.
+ *
+ * Each `pick` must be uniform in `[0, span)` for its range — see the note above about where the
+ * rejection sampling belongs. Values outside are clamped rather than refused: a caller that supplied
+ * a bad draw has a broken random source, and a service that refused to establish an introduction
+ * point over it would be offline rather than slightly predictable.
+ */
+export ServiceIntro newIntroPoint(i64 now, i64 pickLifetime, i32 pickCells) {
+  i64 lifeSpan = INTRO_POINT_MAX_LIFETIME - INTRO_POINT_MIN_LIFETIME;
+  i64 life = pickLifetime < 0 ? 0 : (pickLifetime >= lifeSpan ? lifeSpan - 1 : pickLifetime);
+  i32 cellSpan = INTRO_POINT_MAX_INTRODUCE2 - INTRO_POINT_MIN_INTRODUCE2;
+  i32 cells = pickCells < 0 ? 0 : (pickCells >= cellSpan ? cellSpan - 1 : pickCells);
+  return ServiceIntro(now + INTRO_POINT_MIN_LIFETIME + life,
+                      INTRO_POINT_MIN_INTRODUCE2 + cells, 0, 0, false, true);
+}
+
+/**
+ * Whether this introduction point has reached either of its limits.
+ *
+ * `>=` on the count and `<=` on the time, both tor's: an introduction point that has forwarded
+ * exactly its maximum is done, and one whose expiry has arrived is done. The asymmetry is only in how
+ * the two quantities are counted, not in the intent.
+ */
+export bool introPointShouldExpire(ServiceIntro ip, i64 now) {
+  if (ip.introduce2Count >= ip.introduce2Max) { return true; }
+  return ip.expiresAt <= now;
+}
+
+/**
+ * Whether to drop this introduction point now.
+ *
+ * Expiry and falling out of the consensus are immediate: there is no point holding a relay nobody
+ * lists, and an expired point is expired.
+ *
+ * Retries are not immediate, and the order matters. tor checks for an existing circuit **before**
+ * acting on the retry count, because a circuit may have opened at the previous scheduled attempt —
+ * so a service that counted retries alone would tear down an introduction point that had just come
+ * up. That is a race a retry counter cannot see on its own, and reordering these two checks turns it
+ * into a service that drops points it is successfully using.
+ */
+export bool shouldRemoveIntroPoint(ServiceIntro ip, i64 now) {
+  if (!ip.inConsensus || introPointShouldExpire(ip, now)) { return true; }
+  if (ip.hasCircuit) { return false; }
+  return ip.circuitRetries > MAX_INTRO_POINT_CIRCUIT_RETRIES;
+}
+
+/** How many more introduction points a service should establish. */
+export i32 introPointsWanted(i32 held) {
+  i32 want = NUM_INTRO_POINTS_DEFAULT - held;
+  return want < 0 ? 0 : want;
+}
