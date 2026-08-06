@@ -1,9 +1,23 @@
 // The names in a directory, or the path itself when it is a file.
+//
+// **Sorted, and without the names beginning with a dot** — which is what `ls` does, and what this did not.
+// `readDir`'s order is the filesystem's, so the output differed from the tool this imitates on any
+// directory with more than one entry, and nothing compared them: replacing this whole function's body with
+// a default left `packages/box`'s suite green (wac-mono 0005). It is compared against `ls -1` now.
+//
+// `-a`, `-l` and the rest are **not implemented**, and a flag is refused rather than ignored. Ignoring is
+// what every applet in this package does with a letter it does not know, and for `ls` that is the
+// difference between "hidden files are not shown" and "you asked for them and were not told no".
 
 import { Cli, Core, faultWords, Stat } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
+import { cmpBytes, mergeSortWith } from "../lib/lines.wac";
 
 export i32 ls(Core core, Cli cli, Args a) {
+  if (a.flags != "") {
+    core.warn(a.name + ": -" + a.flags + ": not implemented — this ls takes no options");
+    return 2;
+  }
   string path = a.rest.len() < 1 ? "." : a.rest[0];
   string[]? names = cli.readDir(path).wait();
   if (names is null) {
@@ -17,6 +31,17 @@ export i32 ls(Core core, Cli cli, Args a) {
     return 1;
   }
   string[] found = names!;
-  for (i32 i = 0; i < found.len(); i++) { core.log(found[i]); }
+  // Byte order, which is `ls` under `LC_ALL=C` — the environment every comparison in this repo uses. A
+  // locale-aware collation is a different thing and is not implemented.
+  u8[][] shown = u8[][found.len()](fill: u8[0]());
+  i32 n = 0;
+  for (i32 i = 0; i < found.len(); i++) {
+    u8[] name = found[i].toBytes();
+    if (name.len() > 0 && name[0] == '.') { continue; }
+    shown[n] = name;
+    n++;
+  }
+  u8[][] sorted = mergeSortWith(shown, n, cmpBytes);
+  for (i32 i = 0; i < n; i++) { core.log(string.fromBytes(sorted[i])); }
   return 0;
 }

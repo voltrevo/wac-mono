@@ -453,16 +453,51 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     assertEquals((await box(["nope"])).code, 2, "an unknown applet is a usage error");
 
     // The first applets that recurse, against the real tools over a nested tree.
+    //
+    // `packages/platform` rather than `packages/platform/src`, which is **flat**: every file in it is a
+    // `.wac`, so neither applet ever descended and the comparison said nothing about recursion. Gutting
+    // either applet's `MAX_DEPTH` to zero — which stops all descent — left both of these passing, and
+    // that is how the two mutants survived (wac-mono 0005). The subdirectory check below is here so the
+    // same thing cannot happen again by somebody choosing a tidier-looking path.
+    const tree = "packages/platform";
+    const theirFind = sys("find", [tree]).trim().split("\n");
     assertEquals(
-      (await box(["find", "packages/platform/src"])).out.trim().split("\n").sort().join("\n"),
-      sys("find", ["packages/platform/src"]).trim().split("\n").sort().join("\n"),
+      theirFind.some((p) => p.slice(tree.length + 1).includes("/")),
+      true,
+      `${tree} has no subdirectory: this comparison would not exercise recursion at all`,
+    );
+    assertEquals(
+      (await box(["find", tree])).out.trim().split("\n").sort().join("\n"),
+      theirFind.sort().join("\n"),
       "find differs",
     );
     assertEquals(
-      (await box(["du", "packages/platform/src"])).out.split("\t")[0],
-      sys("du", ["-sb", "packages/platform/src"]).split("\t")[0],
+      (await box(["du", tree])).out.split("\t")[0],
+      sys("du", ["-sb", tree]).split("\t")[0],
       "du differs from du -sb",
     );
+
+    // `ls`, which nothing compared: replacing its whole body with a default left this suite green, and
+    // the reason is that `readDir`'s order is the filesystem's while `ls` sorts. `LC_ALL=C` is set
+    // explicitly here because that is the collation the applet implements — a locale-aware one is a
+    // different thing and is not implemented.
+    const sysLs = (dir: string) =>
+      new TextDecoder().decode(
+        new Deno.Command("ls", {
+          args: ["-1", dir],
+          env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+          clearEnv: true,
+          stdout: "piped",
+          stderr: "null",
+        }).outputSync().stdout,
+      );
+    assertEquals((await box(["ls", tree])).out, sysLs(tree), "ls differs from ls -1");
+    // A directory with dotfiles in it, since hiding them is half of what `ls` means by default.
+    assertEquals((await box(["ls", "."])).out, sysLs("."), "ls of the repo root differs");
+    // And a flag it does not implement is refused rather than ignored, which is the other half.
+    const dashA = await box(["ls", "-a", tree]);
+    assertEquals(dashA.code, 2, `ls -a should be a usage error: ${JSON.stringify(dashA.err)}`);
+    assertEquals(dashA.err.includes("not implemented"), true, dashA.err);
 
     // head and tail against a file with more lines than they take.
     const many = await Deno.makeTempFile();
