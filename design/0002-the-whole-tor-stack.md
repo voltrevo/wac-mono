@@ -382,7 +382,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
-| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. The **descriptor build is a function** now — `buildDescriptor` takes a service's own introduction points, time period and revision — and is checked by both oracles on three variants, not just the committed fixture. The **two time periods a service publishes for** are chosen the way `node_set_hsdir_index` chooses them, against two uploads a real service made. **Not done:** the service program — the client side of the upload, and the loop that establishes introduction points and answers INTRODUCE2 |
+| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. The **descriptor build is a function** now — `buildDescriptor` takes a service's own introduction points, time period and revision — and is checked by both oracles on three variants, not just the committed fixture. The **publication plan is complete**: from a consensus alone, `servicePlan` chooses the two time periods, the shared random value for each, and the directories — reaching exactly the ones a real service uploaded to. **Not done:** the service program — the client side of the upload, and the loop that establishes introduction points and answers INTRODUCE2 |
 | 7 — the interop matrix | **not started as a document.** Steps 2–6 each contribute rows and most are green; nothing collects them, so a regression in one would not be visible as a regression in *the matrix* |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
@@ -1536,3 +1536,34 @@ a boundary.** The padding round-down needed an input one byte over a block; the 
 lookup needed a store with two entries; this needed a consensus on the other side of a period start.
 A fixture captured from a live network is the strongest kind of oracle for what it covers, and it
 covers exactly one point.
+
+### The ingredients were all pinned; the recipe was not
+
+Every ring test in this package was handed the shared random value and the time period as *inputs*.
+A service has neither. It has a consensus, and everything else is a derivation — which two periods,
+which SRV goes with each, which directories follow. Each of those was pinned against tor separately
+and none of them against the others, which is the seam this project keeps rediscovering: pick the
+wrong SRV for a period and every ingredient is still individually correct, and only the plan is wrong.
+
+`servicePlan` is the composition, and the check is that from the consensus in `hsdir_vectors.json` it
+reaches exactly the directories a real tor service uploaded to — both descriptors, both directory
+sets, membership in both directions.
+
+Two things it makes explicit that a smaller return type would have hidden:
+
+- **The SRV is a field of the result.** Nothing downstream reveals which value was used: two plans
+  that chose differently produce different directories, and a directory list does not say which value
+  produced it. A service that fell back to the disaster SRV while the consensus carried a real one
+  would be indistinguishable from one that did not — until no client could find it.
+- **The disaster SRV is a documented fallback, not an error.** A network whose authorities have not
+  agreed on a value still has to work, and every party computes the same substitute from the period
+  alone, so they still agree about the ring. Refusing there would take a service offline for a
+  condition the protocol expects. Tested both ways: the substitute when the consensus carries nothing,
+  and the real value when it does.
+
+The blinded keys stay a parameter rather than being derived inside. Deriving them needs the identity
+key, and a function that takes an identity key to answer a question about *directories* is one that
+will eventually be handed a secret it did not need.
+
+Eight faults planted, eight caught — the first clean sweep in this area, which is what a composition
+test buys once its ingredients are already trustworthy.
