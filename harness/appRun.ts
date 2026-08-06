@@ -227,13 +227,15 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
             // every previous occurrence of wac-mono 0082 lacked.
             const sched = scheduler();
             const recent = sched.on ? `\n  last choices: ${sched.log.slice(-24).join(" ")}` : "";
+            // Every bridge, not just this one: the cycle closes somewhere else by definition.
+            const all = sched.on ? `\n  every bridge:\n${sched.survey()}` : "";
             deadlocked(
               new Error(
                 `${entry} is deadlocked: the bridge has not moved in ${
                   Math.round((every * 2) / 1000)
                 }s with work outstanding — ${state}. ` +
                   `This is wac-mono 0082: the child is waiting for an answer that is not coming. ` +
-                  `Set WAC_STALL_MS higher if a capability here really can take that long.${recent}`,
+                  `Set WAC_STALL_MS higher if a capability here really can take that long.${recent}${all}`,
               ),
             );
           }

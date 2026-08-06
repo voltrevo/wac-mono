@@ -6,6 +6,7 @@
 
 import { newBridge } from "../host/layout.ts";
 import { serveHostCalls } from "../host/respond.ts";
+import { newScheduler } from "../host/schedule.ts";
 
 const CALL = import.meta.resolve("../host/call.ts");
 
@@ -17,7 +18,11 @@ const CALL = import.meta.resolve("../host/call.ts");
  */
 export async function onWorker(body: string, handlers: Record<number, (p: Uint8Array) => Uint8Array | Promise<Uint8Array>>): Promise<unknown> {
   const bridge = newBridge();
-  const responder = serveHostCalls(bridge, handlers);
+  // **Not scheduled.** Everything driven through this harness is a test *of* the bridge: how many calls
+  // can be in flight, what `waitAny` does when several are ready, what happens under random load. A
+  // deterministic scheduler removes exactly those interleavings, so running these under one would leave
+  // the concurrent mode — the production one — checked by nothing. design/0001 D12.
+  const responder = serveHostCalls(bridge, handlers, { scheduler: newScheduler("off") });
   const src = `
     import { submit, collect, isDone, waitAny, cancel, hostCall, i32le, readI32le } from ${JSON.stringify(CALL)};
     import { bridgeOf } from ${JSON.stringify(import.meta.resolve("../host/layout.ts"))};

@@ -1028,7 +1028,7 @@ Deno.test({
   // **Tagged flaky against wac-mono 0082.** Seen once in eight gate runs: `ConnectionReset` 25ms into
   // the handshake, under the parallel suite only, passing alone in a second immediately afterwards. Two
   // candidates are recorded there. The tag comes off when the issue does.
-  name: "[flaky 0082] run a command on a real OpenSSH server and read its output",
+  name: "run a command on a real OpenSSH server and read its output",
   ignore: !haveSshd,
   sanitizeResources: false,
   fn: async () => {

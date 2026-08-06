@@ -23,6 +23,7 @@
 
 import { CTRL_INTS, newBridge, S_GEN, S_STATUS, SLOT_BUF, SLOTS, slotAt, ST_FREE } from "../host/layout.ts";
 import { serveHostCalls } from "../host/respond.ts";
+import { newScheduler } from "../host/schedule.ts";
 
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
@@ -206,7 +207,11 @@ const BODY = `
 
 async function fuzz(seed: number, steps: number): Promise<{ report: string; ctrl: Int32Array }> {
   const bridge = newBridge();
-  const responder = serveHostCalls(bridge, handlers);
+  // **Not scheduled.** This test is about what the ring does when many calls are in flight at once and
+  // the host answers them in whatever order it likes — the very thing a deterministic scheduler takes
+  // away. Running it under one would test the scheduler instead, and leave the concurrent mode, which is
+  // the production one, checked by nothing. design/0001 D12.
+  const responder = serveHostCalls(bridge, handlers, { scheduler: newScheduler("off") });
   const src = `
     import { submit, collect, isDone, waitAny, cancel, hostCall, i32le, readI32le } from ${JSON.stringify(CALL)};
     import { bridgeOf, CTRL_HEAD, SLOT_INTS, SLOTS } from ${JSON.stringify(LAYOUT)};

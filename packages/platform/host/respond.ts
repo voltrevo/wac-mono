@@ -43,7 +43,8 @@ import {
   SUBMIT_SEQ,
 } from "./layout.ts";
 import { FAULT_OTHER, faultedBytes, faultOf } from "./faults.ts";
-import { scheduler } from "./schedule.ts";
+import { type Scheduler, scheduler } from "./schedule.ts";
+import { describeSlots } from "./call.ts";
 
 /** What a capability does with a request payload. May be async; that is the point. */
 export type Handler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
@@ -76,14 +77,20 @@ function joined(parts: Uint8Array[], last: Uint8Array): Uint8Array {
 export function serveHostCalls(
   b: Bridge,
   handlers: Handlers,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; scheduler?: Scheduler } = {},
 ): { stats(): { running: boolean; sweeps: number }; stop(): void; done: Promise<void> } {
   let running = true;
 
   // The scheduler is shared by every bridge in this process, because the orderings worth exploring are
   // *between* a shell and the applets it spawned, not within one of them. The id only labels the log.
-  const sched = scheduler();
+  // The process-wide one unless the caller brings its own. A test *about* the concurrent ring has to
+  // bring `newScheduler("off")`: scheduling exists to remove the interleavings, and removing them is
+  // exactly what such a test must not have done to it. See design/0001 D12's note on the testing gap.
+  const sched = opts.scheduler ?? scheduler();
   const bridgeId = nextBridgeId++;
+  // Registered so a stall anywhere can ask every bridge what it is doing — a shell parked reading a child
+  // explains nothing without the child's side of it.
+  sched.register(bridgeId, () => describeSlots(b));
 
   // Per-slot state kept between the pieces of one call.
   const pending: (Uint8Array | null)[] = new Array(SLOTS).fill(null);      // response tail
@@ -295,6 +302,7 @@ export function serveHostCalls(
     stop() {
       running = false;
       sched.quiet(bridgeId);
+      sched.forget(bridgeId);
       // Wake the loop so it can notice. Bumping the counter it waits on is the only way
       // in: it is parked on a value, not on a flag.
       Atomics.add(b.ctrl, SUBMIT_SEQ, 1);

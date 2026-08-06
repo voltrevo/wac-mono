@@ -30,8 +30,10 @@
 // - **`seeded`** — chosen with a seeded generator from the ones ready *now*. Explores orderings a real
 //   machine reaches rarely, and the same seed makes the same choices given the same choice set.
 //
-// The default for tests is `seeded` with a **fixed** seed, so runs are comparable with each other while
-// still being an ordering the event loop would not have produced. `WAC_SCHED` overrides it.
+// **The default for suite runs is `seeded` with a fixed seed** — set in `tools/suiteGuard.ts`, so both
+// `deno task test` and `deno task test:changed` carry it, and mutation runs inherit it too. Production is
+// unscheduled, and so is anything driven through `packages/platform/test/worker.ts`, which is where the
+// concurrent mode is tested on purpose. `WAC_SCHED=off|fifo|seed=N` overrides.
 //
 // ## Recording
 //
@@ -215,6 +217,37 @@ export class Scheduler {
     }
     return this.#next() % this.#ready.length;
   }
+
+  /**
+   * Every bridge in this process, and how to describe it.
+   *
+   * A stall is almost never explainable from one bridge: a shell parked reading a child says nothing
+   * about what the *child* is doing, and that is where a cycle closes. The scheduler already has to know
+   * about every bridge, so it is the natural place to ask them all at once.
+   */
+  #bridges = new Map<number, () => string>();
+
+  register(bridge: number, describe: () => string): void {
+    this.#bridges.set(bridge, describe);
+  }
+
+  forget(bridge: number): void {
+    this.#bridges.delete(bridge);
+  }
+
+  /** Every live bridge's state, for a caller explaining a stall. Reads only, and never throws. */
+  survey(): string {
+    const lines: string[] = [];
+    for (const [id, describe] of this.#bridges) {
+      try {
+        lines.push(`    bridge ${id}: ${describe()}`);
+      } catch {
+        lines.push(`    bridge ${id}: <gone>`);
+      }
+    }
+    return lines.join("\n");
+  }
+
 }
 
 /** The one every host in this process shares. Built from the environment on first use. */

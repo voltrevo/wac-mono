@@ -287,14 +287,29 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
         // `readStdin` means *all* of it, which for a child means waiting for its input to end: the
         // bytes arrive over time. Serving it with one chunk made `seq 1 5 | sort -r` print `1`, since
         // `sort` reads to the end before sorting. `readChunk` and `recv` still take one chunk.
-        // **An inheriting child reads the real thing.** Leaving these out is what hands it over: a
-        // world with no `readStdin` option falls back to the process's own input, so the child reads
-        // the same stream its parent would have — streaming rather than buffered, and *shared*, which
-        // is why `cat; cat` sees one line between them rather than one each. Issue 0042.
-        ...(inheritIn ? {} : {
-          readStdin: () => input.rest(),
-          readStdinChunk: () => input.next(),
-        }),
+        // **An inheriting child reads what its parent's world reads** — the same stream, streaming
+        // rather than buffered and *shared*, which is why `cat; cat` sees one line between them rather
+        // than one each (issue 0042).
+        //
+        // It used to inherit by *omission*: leave the options out and the child falls through to
+        // `Deno.stdin`. That is right for a program run from a terminal and wrong everywhere else. In a
+        // test the parent's world has a queue — `harness/appRun.ts` gives the shell one and ends it — so
+        // omitting handed the child the *test runner's* standard input instead, which never ends. The
+        // child parked in `READ_CHUNK` for ever and its parent parked reading the child's output: a
+        // cycle neither side can break. wac-mono 0082, found by running the corpus under a deterministic
+        // scheduler, which reproduced it four times out of four where it had been one run in fifty.
+        //
+        // So an inheriting child takes the parent's source when the parent has one, and falls back to
+        // the real thing only when the parent was reading the real thing too.
+        ...(inheritIn
+          ? {
+            ...(opts.readStdin === undefined ? {} : { readStdin: opts.readStdin }),
+            ...(opts.readStdinChunk === undefined ? {} : { readStdinChunk: opts.readStdinChunk }),
+          }
+          : {
+            readStdin: () => input.rest(),
+            readStdinChunk: () => input.next(),
+          }),
         // So that a child can run itself as well: the bundle is the same one.
         selfSource: opts.selfSource,
         // Where its relative paths resolve from, and what its own `cwd()` reports. Empty means the
