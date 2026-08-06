@@ -50,37 +50,19 @@ const u32[] K = u32[](
 /**
  * The digest of `msg`, 32 bytes.
  *
- * Padding follows the spec: a 0x80 byte, then zeros, then the message length in
- * bits as a big-endian u64, landing the total on a multiple of 64.
+ * **The streaming form, which is the whole implementation.** This used to allocate a padded copy of the
+ * message and hash that: a 36 MB digest allocated 36 MB and copied it, element-wise, before compressing a
+ * byte. `Sha256.update` compresses whole blocks straight out of the caller's array and holds nothing but
+ * the 64-byte remainder, so the one-shot form is the incremental one with the pieces arriving all at once
+ * — which is what it always was underneath (wac-mono 0034).
+ *
+ * `deno task bench:hash --quick`, 4 MB: **27.1 ms before, 23.1 ms after** — 153 MB/s to 174 MB/s, best of
+ * three, twice. The padded duplicate existed only to be read once, in order, and thrown away.
  */
 export u8[] sha256(u8[] msg) {
-  i32 len = msg.len();
-
-  // Total padded length: the message, the 0x80, at least 8 bytes of length
-  // field, rounded up to a whole number of 64-byte blocks.
-  i32 blocks = (len + 9 + 63) / 64;
-  i32 total = blocks * 64;
-
-  u8[] m = u8[total]();
-  for (i32 i = 0; i < len; i++) { m[i] = msg[i]; }
-  m[len] = 0x80;
-
-  // Length in bits, big-endian, in the last 8 bytes. 64 bits because a message of
-  // 2^29 bytes already overflows a 32-bit bit count.
-  storeBE64((len as! u64) * 8, m, total - 8);
-
-  u32 h0 = 0x6a09e667; u32 h1 = 0xbb67ae85;
-  u32 h2 = 0x3c6ef372; u32 h3 = 0xa54ff53a;
-  u32 h4 = 0x510e527f; u32 h5 = 0x9b05688c;
-  u32 h6 = 0x1f83d9ab; u32 h7 = 0x5be0cd19;
-
-  u32[] hs = u32[](h0, h1, h2, h3, h4, h5, h6, h7);
-  u32[] w = u32[64]();
-  for (i32 b = 0; b < blocks; b++) { compressBlock(hs, m, b * 64, w); }
-
-  u8[] out = u8[32]();
-  for (i32 i = 0; i < 8; i++) { storeBE32(hs[i], out, i * 4); }
-  return out;
+  Sha256 s = Sha256.create();
+  s.update(msg);
+  return s.finish();
 }
 
 /**

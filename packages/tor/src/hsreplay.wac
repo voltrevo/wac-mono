@@ -1,0 +1,123 @@
+// Noticing an INTRODUCE2 we have already handled.
+//
+// A service answers an INTRODUCE2 by building a rendezvous circuit, which is real work at a real
+// cost. Without a memory of what it has already seen, anyone who can capture one INTRODUCE2 can make
+// the service build that circuit again by sending the same bytes back — indefinitely, without
+// holding any key, because the cell is opaque to the introduction point and its validity does not
+// expire.
+//
+// tor keeps two caches and they catch different things. Both are `replaycache_add_test_and_elapsed`
+// in `replaycache.c`, so both are implemented here, and where each is *checked* is as much a part of
+// the rule as what it stores.
+//
+// ## The encrypted section, before the MAC
+//
+// `hs_cell_parse_introduce2` checks the ENCRYPTED section against a cache **belonging to the
+// introduction point**, and does it before deriving the ntor keys or verifying the MAC. That order is
+// the point: a replayed cell is rejected for the cost of one SHA-256 rather than a curve25519
+// handshake, so replaying is not cheaper for the attacker than it is for the service.
+//
+// Per introduction point rather than per service, because the same client reaching the same service
+// through two introduction points is not a replay — it is a client whose first attempt did not work.
+//
+// ## The rendezvous cookie, after the parse
+//
+// `hs_circ_handle_introduce2` then checks the REND_COOKIE against a cache **belonging to the
+// service**, after the cell has parsed and its MAC has verified. tor's comment is the interesting
+// part, because it says this is usually *not* an attack: a client whose introduction circuit times
+// out sends a new INTRODUCE1 with the same cookie, and the service may already be building — or have
+// built — that very rendezvous circuit. Dropping the cell is right because the work is already in
+// hand, not because the client did anything wrong.
+//
+// The two horizons differ accordingly. The encrypted-section cache never expires; the cookie cache
+// forgets after `REND_REPLAY_TIME_INTERVAL`, five minutes, because a cookie reused long afterwards is
+// a new attempt rather than a retry of one in flight.
+
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { ctEqual } from "../../crypto/src/ct.wac";
+
+/** `REND_REPLAY_TIME_INTERVAL` — how long a rendezvous cookie is remembered. */
+export const i64 REND_REPLAY_SECONDS = 300;
+
+/** A horizon of zero means never forget, which is what tor's `replaycache_new(0, 0)` asks for. */
+export const i64 HORIZON_FOREVER = 0;
+
+/**
+ * What has been seen, and when.
+ *
+ * Digests rather than the cells themselves: an INTRODUCE2's encrypted section is hundreds of bytes
+ * and a service may see many, and tor stores a SHA-256 for the same reason. Keeping the cells would
+ * also mean keeping ciphertext addressed to us for as long as the cache lives, which is a thing worth
+ * not doing when the alternative costs nothing.
+ */
+export struct ReplayCache {
+  u8[][] digests;
+  i64[] seenAt;
+  i32 count;
+  /** Seconds after which an entry stops counting as a hit; 0 never forgets. */
+  i64 horizon;
+  /** How many entries this will hold before evicting the oldest. */
+  i32 capacity;
+
+  ReplayCache create(i64 horizon, i32 capacity) {
+    return ReplayCache(u8[][capacity](), i64[capacity](), 0, horizon, capacity);
+  }
+}
+
+/** The cache an introduction point keeps of the ENCRYPTED sections it has relayed. */
+export ReplayCache introReplayCache(i32 capacity) {
+  return ReplayCache.create(HORIZON_FOREVER, capacity);
+}
+
+/** The cache a service keeps of the rendezvous cookies it has been asked for. */
+export ReplayCache cookieReplayCache(i32 capacity) {
+  return ReplayCache.create(REND_REPLAY_SECONDS, capacity);
+}
+
+/**
+ * Whether `data` has been seen, recording it either way.
+ *
+ * Test-and-add in one call, deliberately: two calls invite a caller to test, do some work, and forget
+ * to add — and the entire value of this is that it cannot be bypassed by a cell taking an unusual
+ * path through the handler.
+ *
+ * `now` is the caller's, in unix seconds. An entry counts as a hit while it is within the horizon,
+ * and a hit **refreshes** it, exactly as tor's does: a cell replayed steadily every four minutes
+ * should not fall out of a five-minute cache.
+ */
+export bool seenBefore(ReplayCache c, u8[] data, i64 now) {
+  if (data.len() == 0 || now <= 0) { return false; }
+  u8[] digest = sha256(data);
+
+  for (i32 i = 0; i < c.count; i++) {
+    if (c.digests[i].len() > 0 && ctEqual(c.digests[i], digest)) {
+      bool within = c.horizon == 0 || c.seenAt[i] >= now - c.horizon;
+      // Refreshed whether or not it counted as a hit — an entry seen again is a recent entry, and
+      // leaving the old timestamp would make the next check measure from the wrong moment.
+      if (c.seenAt[i] < now) { c.seenAt[i] = now; }
+      return within;
+    }
+  }
+
+  // Not seen. Remember it, evicting the oldest if there is no room — a bounded cache is not optional
+  // for something an attacker can fill at will, and forgetting the oldest is the least bad way to be
+  // full, since the newest entries are the ones a retry is most likely to match.
+  if (c.count < c.capacity) {
+    c.digests[c.count] = digest;
+    c.seenAt[c.count] = now;
+    c.count = c.count + 1;
+    return false;
+  }
+  // A cache with no room remembers nothing rather than trapping. It is a degenerate configuration
+  // and not one to fail loudly on: the caller has asked for no replay protection, which is a bad
+  // choice but a coherent one, and crashing a service over it would be worse than honouring it.
+  if (c.count == 0) { return false; }
+  i32 oldest = 0;
+  for (i32 i = 1; i < c.count; i++) {
+    if (c.seenAt[i] < c.seenAt[oldest]) { oldest = i; }
+  }
+  c.digests[oldest] = digest;
+  c.seenAt[oldest] = now;
+  return false;
+}
+

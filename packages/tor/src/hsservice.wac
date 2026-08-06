@@ -46,6 +46,7 @@ import { Buf } from "../../bytes/src/buf.wac";
 import { aesCtr } from "../../crypto/src/aesctr.wac";
 import { hsMac, serviceIntroduceKeys } from "./hsntor.wac";
 import { ed25519Sign } from "../../crypto/src/ed25519.wac";
+import { ctEqual } from "../../crypto/src/ct.wac";
 
 /** ed25519, and the only type this builds. Tor's own check rejects anything else before verifying. */
 export const i32 AUTH_KEY_TYPE_ED25519 = 2;
@@ -227,7 +228,7 @@ export Introduce2 parseIntroduce2(u8[] cell, u8[] introEncSecret, u8[] subcreden
   u8[] macKey = sub(keys, 32, 64);
 
   u8[] want = hsMac(macKey, sub(cell, 0, macFrom));
-  if (!sameConstantTime(want, sub(cell, macFrom, cell.len()))) { return noIntroduce2(); }
+  if (!ctEqual(want, sub(cell, macFrom, cell.len()))) { return noIntroduce2(); }
 
   u8[] plain = aesCtr(encKey, u8[16](), sub(cell, dataFrom, macFrom));
   return parseIntroducePlaintext(plain, authKey, clientPublic);
@@ -301,12 +302,6 @@ export u8[] rendezvous1Cell(u8[] rendCookie, u8[] handshakeInfo) {
  * whoever sent the cell how much of their guess was right. That turns forging a MAC from 2^256 work
  * into 32 × 256, which is the whole reason this is not `==`.
  */
-bool sameConstantTime(u8[] a, u8[] b) {
-  if (a.len() != b.len()) { return false; }
-  i32 diff = 0;
-  for (i32 i = 0; i < a.len(); i++) { diff = diff | (a[i] ^ b[i]); }
-  return diff == 0;
-}
 
 u8[] sub(u8[] s, i32 from, i32 to) {
   u8[] out = u8[to - from]();

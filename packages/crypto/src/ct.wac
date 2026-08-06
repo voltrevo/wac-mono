@@ -1,0 +1,51 @@
+// Comparing secrets without telling the caller where they differ.
+//
+// An equality check that returns as soon as it finds a mismatch leaks the position of that mismatch
+// in how long it took. For a MAC tag that is the whole attack: forge a tag, learn the first byte was
+// right from the reply being a fraction slower, keep the byte and move on — sixteen bytes fall in a
+// few thousand attempts instead of 2^128.
+//
+// **This is not a constant-time guarantee, and saying so is the point.** wac compiles to WasmGC and
+// offers no control over what a JIT does with a loop; a compiler is free to introduce a branch we did
+// not write. What this removes is the *obvious* leak — the early return — which is the one an attacker
+// can actually measure over a network. The stronger property needs a language that promises it, and
+// nothing here promises it.
+//
+// There were four copies of this loop before this file: two in `crypto` (`aead`, `aesgcm`), one in
+// `tor` (`hsservice`), and a fifth was about to be written in `hsreplay` that was **not**
+// constant-time, because a replay cache does not look like a place where timing matters. It is: the
+// digests it compares are of ciphertext an attacker chose.
+//
+// The related trap that made this worth a file rather than another copy — a truncated comparison,
+// checking four bytes of a thirty-two-byte digest — cannot be caught by any test that feeds real
+// inputs, because constructing two values whose digests share a prefix is the work the digest exists
+// to prevent. It can only be caught by a test that knows how many bytes were compared, which is what
+// this module's own test does, and which every caller then inherits.
+
+/**
+ * Whether `a` and `b` are the same bytes, without an early exit.
+ *
+ * Different lengths return false immediately, which is deliberate rather than an oversight: a length
+ * is not a secret — it is visible in the message — and looping to a length that does not exist would
+ * mean deciding what to compare against, which is worse than admitting the sizes differ.
+ */
+export bool ctEqual(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  i32 diff = 0;
+  for (i32 i = 0; i < a.len(); i++) { diff = diff | (a[i] ^ b[i]); }
+  return diff == 0;
+}
+
+/**
+ * The same, for a fixed expected length — for callers that know the size and want it enforced.
+ *
+ * `gcmDecrypt` and `aeadOpen` both compare exactly sixteen bytes and both trap on a tag of any other
+ * length. Passing the length here says that intent at the call site rather than leaving a bare 16 in
+ * a loop bound, where shortening it is an edit nobody would question.
+ */
+export bool ctEqualN(u8[] a, u8[] b, i32 n) {
+  if (a.len() < n || b.len() < n || n <= 0) { return false; }
+  i32 diff = 0;
+  for (i32 i = 0; i < n; i++) { diff = diff | (a[i] ^ b[i]); }
+  return diff == 0;
+}

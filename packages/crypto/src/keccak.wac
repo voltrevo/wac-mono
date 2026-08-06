@@ -137,21 +137,28 @@ export u8[] sponge(u8[] input, i32 rate, i32 domain, i32 outLen) {
   if (rate <= 0 || rate > 200) { trap; }
   u64[] state = u64[25]();
 
+  // **Whole blocks are absorbed where they lie.** `absorb` takes an offset for the same reason
+  // `compressBlock` in `sha256.wac` does: copying each rate-sized block into scratch first is a second
+  // pass over every byte of the message, and the absorb reads each byte exactly once anyway. Only the
+  // final partial block needs an array of its own, because only that one is padded (wac-mono 0034).
+  //
+  // Worth **2%** here and 15% in `sha256`, which is the interesting part: this permutation costs 24 rounds
+  // over 25 lanes for every 136 bytes, so the copy was never where the time went. Same edit, same argument,
+  // an order of magnitude apart in what it bought — a copy loop is worth removing where it is a meaningful
+  // share of the work, and measuring is the only way to know which one you are looking at.
   i32 at = 0;
-  u8[] block = u8[rate]();
   while (at + rate <= input.len()) {
-    for (i32 i = 0; i < rate; i++) { block[i] = input[at + i]; }
-    absorb(state, block, rate);
+    absorb(state, input, at, rate);
     at += rate;
   }
 
   // The final, partial block, with the padding.
-  for (i32 i = 0; i < rate; i++) { block[i] = 0; }
+  u8[] block = u8[rate]();
   i32 tail = input.len() - at;
-  for (i32 i = 0; i < tail; i++) { block[i] = input[at + i]; }
+  block.copyFrom(input, at, 0, tail);
   block[tail] = block[tail] | domain;
   block[rate - 1] = block[rate - 1] | 0x80;
-  absorb(state, block, rate);
+  absorb(state, block, 0, rate);
 
   // Squeeze: read a block, then permute if more is wanted. Reading first is what makes
   // this correct — the absorb of the padded block already permuted, so the state is
@@ -171,9 +178,9 @@ export u8[] sponge(u8[] input, i32 rate, i32 domain, i32 outLen) {
 }
 
 /** Xor one rate-sized block into the state, little-endian by lane, then permute. */
-void absorb(u64[] state, u8[] block, i32 rate) {
+void absorb(u64[] state, u8[] block, i32 off, i32 rate) {
   for (i32 i = 0; i < rate; i++) {
-    state[i / 8] ^= (block[i] as! u64) << (((i % 8) * 8) as! u64);
+    state[i / 8] ^= (block[off + i] as! u64) << (((i % 8) * 8) as! u64);
   }
   keccakF(state);
 }
@@ -235,7 +242,7 @@ export struct Sha3_256 {
       this.pendingLen = this.pendingLen + take;
       at = at + take;
       if (this.pendingLen == 136) {
-        absorb(this.state, this.pending, 136);
+        absorb(this.state, this.pending, 0, 136);
         this.pendingLen = 0;
       }
     }
@@ -264,7 +271,7 @@ export struct Sha3_256 {
     for (i32 i = 0; i < this.pendingLen; i++) { block[i] = this.pending[i]; }
     block[this.pendingLen] = block[this.pendingLen] | 0x06;
     block[135] = block[135] | 0x80;
-    absorb(copy, block, 136);
+    absorb(copy, block, 0, 136);
     u8[] out = u8[32]();
     for (i32 i = 0; i < 32; i++) {
       out[i] = ((copy[i / 8] >> (((i % 8) * 8) as! u64)) & 255) as! i32;
