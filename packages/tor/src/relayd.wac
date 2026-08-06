@@ -615,6 +615,10 @@ struct Circ {
   i32 streamOut;
   /** Whether anything has been forwarded, so the first one can be logged and the rest not. */
   bool forwardedAny;
+  /** How many cells have gone each way for a later hop. A relay that forwards silently cannot say
+   *  whether cells stopped arriving or stopped being sent, which is the question issue 0089 is on. */
+  i32 forwardedOut;
+  i32 forwardedBack;
 }
 
 /**
@@ -626,7 +630,7 @@ struct Circ {
  */
 Circ newCirc(Core core, Cli cli, i32 circId, Hop hop, Pending<Read> idle) {
   return Circ(circId, hop, false, Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]()), 0, idle,
-              -1, Buf.create(), false, -1, -1, idle, 0, 0, false);
+              -1, Buf.create(), false, -1, -1, idle, 0, 0, false, 0, 0);
 }
 
 /** A connection as it arrives: TLS begun, nothing else known yet. */
@@ -652,8 +656,12 @@ i32 findCirc(Conn c, i32 circId) {
  * The slot is closed by compaction rather than by a flag, for the same reason connections are: the
  * wait list is built by walking 0..circCount, so a hole in the middle would be waited on forever.
  */
-void dropCirc(Cli cli, Conn c, i32 slot) {
+void dropCirc(Core core, Cli cli, Conn c, i32 slot) {
   Circ k = c.circs[slot]!;
+  if (k.forwardedOut > 0 || k.forwardedBack > 0) {
+    core.log("relayd: [" + itoa(c.id) + "]  circuit " + itoa(k.circId) + " carried " +
+             itoa(k.forwardedOut) + " cells out, " + itoa(k.forwardedBack) + " back");
+  }
   // Callers each explain *why* they are dropping; this says that one happened at all, so a circuit
   // that vanishes is never a silent event.
   c.droppedCircs = c.droppedCircs + 1;
@@ -667,7 +675,7 @@ void dropCirc(Cli cli, Conn c, i32 slot) {
 void dropConn(Core core, Cli cli, Conn c) {
   core.log("relayd: [" + itoa(c.id) + "]  dropping a connection carrying " + itoa(c.circCount) + " circuit(s), " +
            itoa(c.droppedCircs) + " already torn down");
-  while (c.circCount > 0) { dropCirc(cli, c, c.circCount - 1); }
+  while (c.circCount > 0) { dropCirc(core, cli, c, c.circCount - 1); }
   cli.closeSocket(c.sock);
   c.live = false;
 }
@@ -735,7 +743,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
       if (!alive) {
         core.warn("relayd: [" + itoa(c.id) + "]  the next hop closed the connection");
         c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_NONE));
-        dropCirc(cli, c, slot);
+        dropCirc(core, cli, c, slot);
         return;
       }
       // As above: only a hop that is staying gets a fresh read.
@@ -748,12 +756,13 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
         if (backCommand == cmdDestroy()) {
           core.log("relayd: [" + itoa(c.id) + "]  the next hop destroyed its leg of the circuit");
           c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_NONE));
-          dropCirc(cli, c, slot);
+          dropCirc(core, cli, c, slot);
           return;
         }
         if (backCommand != cmdRelay() && backCommand != cmdRelayEarly()) { continue; }
         // One layer on, and out to the client. The payload is opaque here: it was encrypted for the
         // client by the hop beyond us.
+        k.forwardedBack = k.forwardedBack + 1;
         c.tls = sendCell(cli, c.sockObj, c.tls,
                        encodeFixed(k.circId, cmdRelay(), wrapForClient(k.hop, cellPayload(back, 0))));
       }
@@ -889,7 +898,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
           if (!k.hasNext) {
             core.warn("relayd: [" + itoa(c.id) + "]  a cell for a later hop, but nothing has been extended to");
             c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_PROTOCOL));
-            dropCirc(cli, c, slotOf);
+            dropCirc(core, cli, c, slotOf);
             continue;
           }
           // Forwarding was silent, which made "no stream opened" impossible to tell apart from "no cell
@@ -899,6 +908,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
             k.forwardedAny = true;
             core.log("relayd: [" + itoa(c.id) + "]  forwarding cells for a later hop on circuit " + itoa(k.circId));
           }
+          k.forwardedOut = k.forwardedOut + 1;
           sendCells(k.next, encodeFixed(k.nextCircId, cmdRelay(), inbound.payload));
           continue;
         }
@@ -907,14 +917,14 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
           if (k.hasNext) {
             core.warn("relayd: [" + itoa(c.id) + "]  a second EXTEND2 on one circuit is not supported");
             c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_PROTOCOL));
-            dropCirc(cli, c, slotOf);
+            dropCirc(core, cli, c, slotOf);
             continue;
           }
           Extended done = extendCircuit(core, cli, inbound.data, id);
           if (!done.ok) {
             // A refusal the client can act on: it will try another path rather than hang.
             c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_INTERNAL));
-            dropCirc(cli, c, slotOf);
+            dropCirc(core, cli, c, slotOf);
             continue;
           }
           k.next = done.link;
@@ -1053,7 +1063,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
       if (command == cmdDestroy()) {
         core.log("relayd: [" + itoa(c.id) + "]  the initiator destroyed circuit " + itoa(cellCircId(cell, 0)));
         i32 gone = findCirc(c, cellCircId(cell, 0));
-        if (gone >= 0) { dropCirc(cli, c, gone); }
+        if (gone >= 0) { dropCirc(core, cli, c, gone); }
         continue;
       }
     }

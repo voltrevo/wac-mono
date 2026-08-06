@@ -88,6 +88,39 @@ authenticate — at an exit that means the running backward/forward digest has g
 the most likely place for that is the exchange of two `RELAY_END`s around a stream closing. Second:
 whatever `dropCirc` is reached by. Both are `relayd.wac`'s, not the platform's.
 
+## The transfer stops with no error, and congestion control was not the reason
+
+Per-circuit cell counters and per-forward logging give the clearest picture yet. On a run where the
+exit got furthest:
+
+    forwarding 498 bytes to handle 6 (stream 24131,  996 total)
+    …
+    forwarding 498 bytes to handle 6 (stream 24131, 3486 total)
+    (nothing further, until the run is torn down)
+
+and the target's own log: `read 3329 of 65536`. Eight cells are forwarded, the target receives them,
+and then **the client simply stops sending**. No error at either end, no `END`, no `DESTROY` — the
+circuit and the stream stay open and idle until the harness kills them.
+
+Stopping after a few kilobytes and never resuming is the signature of a window that is never
+replenished, and `relayd` sends no `SENDME` of any kind. So the obvious candidate was **proposal 324
+congestion control**, whose window starts small and grows only on returned SENDMEs — where version 1's
+window is 500 cells, which a 64 KB upload (132 cells) would fit inside entirely.
+
+**Tested and disproved.** The consensus advertised `FlowCtrl=1-2`; changing it to `FlowCtrl=1` so the
+classic window is negotiated changed nothing — the 64 KB upload fails identically.
+
+Worth keeping anyway, and fixed: the consensus and the vote said `FlowCtrl=1-2` while the *descriptor*
+said `FlowCtrl=1`, so two documents describing one relay disagreed, and tor negotiates from the
+consensus. We implement neither version. Claiming a capability we do not have is what the `V2Dir` and
+`HSDir` episodes were about; this is the same mistake somewhere the symptom is a stall rather than a
+refusal.
+
+That makes five hypotheses eliminated by experiment. What is left is the bare observation above: the
+sender stops, silently, after a few kilobytes, and nothing in either implementation says why. The next
+instrument is tor's own `[info]` log filtered to that stream at the moment it goes quiet — which is
+the one place not yet read line by line.
+
 ## The line is one cell, and `Expect: 100-continue` is not it
 
 Per-forward logging with socket handles gives the whole ladder in one run:

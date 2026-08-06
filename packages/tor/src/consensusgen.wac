@@ -216,6 +216,20 @@ const string CLIENT_PROTOCOLS =
 const string RELAY_PROTOCOLS =
   "Cons=2 Desc=2 DirCache=2 HSDir=2 HSIntro=4 HSRend=2 Link=4-5 LinkAuth=3 Microdesc=2 Relay=2";
 const string REQUIRED_CLIENT = "Cons=2 Desc=2 Link=4 Microdesc=2 Relay=2";
+/**
+ * What a relay in this consensus claims to speak.
+ *
+ * **`FlowCtrl=1`, not `1-2`.** Version 2 is proposal 324 congestion control, whose window starts
+ * small and only grows as the receiver returns SENDMEs — and `relayd.wac` sends none. Advertising it
+ * meant a client opened a circuit with a congestion window of a few kilobytes, filled it, and waited
+ * forever for credit that was never coming: an upload stopped after about eight cells with no error
+ * anywhere. Version 1's window is 500 cells per stream, which nothing has yet exhausted.
+ *
+ * The descriptor already said `FlowCtrl=1` (`routerdesc.wac`) while this said `1-2`, so the two
+ * documents describing one relay disagreed — and tor negotiates from the consensus. Claiming a
+ * capability we do not have is what the `V2Dir` and `HSDir` episodes were about; this is the same
+ * mistake in a place where the symptom was a stall rather than a refusal.
+ */
 const string RELAY_SUBPROTOCOLS =
-  "Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 " +
+  "Cons=1-2 Desc=1-2 DirCache=2 FlowCtrl=1 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 " +
   "LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4";

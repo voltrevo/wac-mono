@@ -1090,3 +1090,22 @@ transferable part: per-stream byte counters that were never reset (so every coun
 cumulative), log lines with no connection number (so three connections interleaved indistinguishably),
 and no record of a forward at all (so a stalled stream looked exactly like one nothing was written to).
 Each was found by the log failing to answer a question I already knew how to ask.
+
+### FlowCtrl was advertised in two documents that disagreed
+
+Not a fix for 0089 — it was tested as one and changed nothing — but a real defect found by looking.
+
+`consensusgen.wac` and `vote.wac` advertised `FlowCtrl=1-2` on every relay's `pr` line while
+`routerdesc.wac` advertised `FlowCtrl=1` on the same relay's descriptor. Two documents describing one
+relay, disagreeing about what it can do, and tor negotiates from the consensus. **We implement
+neither version**: `relayd.wac` sends no `SENDME` at all.
+
+Version 2 is proposal 324 congestion control, whose window starts small and grows only as the receiver
+returns credit. Advertising it invites a client to open a circuit with a few kilobytes of window and
+then wait forever — which is exactly what an upload does here, though changing the advertisement did
+not fix it, so the mechanism is something else.
+
+Both now say `FlowCtrl=1`, matching the descriptor. The generated vote and consensus fixtures were
+regenerated and re-checked: C tor's parsers accept the descriptor, the certificate, the vote (whose
+acceptance includes verifying its signature) and both consensus flavours. A fixture that satisfies
+only our own tests would have proved nothing.
