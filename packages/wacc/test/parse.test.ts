@@ -291,6 +291,17 @@ Deno.test("parse: agrees on constructs a working corpus does not contain", () =>
       `i32 f(i32 a, i32 b) { return a || b && a | b ^ a & b == a < b << a + b * a as i32; }`],
     ["ternary chained right", `i32 f(bool a) { return a ? 1 : a ? 2 : 3; }`],
     ["is with a nullable type", `bool f(anyref x) { return x is i32[]?; }`],
+    ["an anyref array, constructed", `anyref[] f() { return anyref[3](); }`],
+    ["an array of nullable primitives", `i32?[] f() { return i32?[3](); }`],
+    ["a trailing comma in a type-argument list",
+      `struct Vec<T> { T[] items; } i32 f(Vec<i32,> v) { return 0; }`],
+    // The comma is the whole case. Without it the variant loop stops because there is no comma to eat,
+    // and the method parses by accident; with it, the only thing that ends the variant list is
+    // recognising that what comes next declares a method. `Option<T>` in `packages/std` is written the
+    // second way, and nothing here reached that path.
+    ["an enum whose variants end in a comma, then a method",
+      `enum E { A(i32 v), B,\n  i32 val(const this) { return match (this) { case A(v): v, case B: 0 }; }\n}\n` +
+      `i32 f(E e) { return e.val(); }`],
     ["is against a type then ternary", `i32 f(anyref x) { return x is i32 ? 1 : 0; }`],
     ["is not null", `bool f(i32[]? x) { return x is not null; }`],
     ["unary chains", `i32 f(i32 a) { return - - !~a; }`],

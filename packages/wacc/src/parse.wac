@@ -531,14 +531,6 @@ bool spanIsPrimName(u8[] s, i32 start, i32 len) {
   return false;
 }
 
-/** Does the span equal this exact 6-byte name? Used for `anyref`/`i31ref`. */
-bool spanIs6(u8[] s, i32 start, i32 len, i64 want) {
-  if (len != 6) { return false; }
-  i64 v = 0 as i64;
-  for (i32 i = 0; i < len; i++) { v = (v << 8) | (s[start + i] as i64); }
-  return v == want;
-}
-
 i64 q2(i32 a, i32 b) { return ((a as i64) << 8) | (b as i64); }
 i64 q3(i32 a, i32 b, i32 c) { return (q2(a, b) << 8) | (c as i64); }
 i64 q4(i32 a, i32 b, i32 c, i32 d) { return (q3(a, b, c) << 8) | (d as i64); }
@@ -1080,15 +1072,13 @@ bool looksLikeConstructionOrCall(P p) {
   i32 next = p.kindAt(1);
 
   if (identIsPrim(p, 0)) {
-    // A primitive name is only ever construction with `(` or `[`.
-    return next == kLparen() || next == kLbrack();
-  }
-  // `anyref` and `i31ref` are cast targets, never constructed.
-  if (spanIs6(p.src, p.startAt(0), p.lenAt(0), q6('a', 'n', 'y', 'r', 'e', 'f'))) {
-    return false;
-  }
-  if (spanIs6(p.src, p.startAt(0), p.lenAt(0), q6('i', '3', '1', 'r', 'e', 'f'))) {
-    return false;
+    // A primitive name is only ever construction with `(` or `[` — and with `?[`, which is an array of
+    // *nullable* primitives: `i32?[3]()` is the same shape as `Node?[3]()`, and only the named case was
+    // accepted here. The reference grew that third arm and this port did not, so the two disagreed about
+    // a program neither the corpus nor the synthetic cases contained. wac-mono 0005 found it by asking
+    // why the `anyref` guard below could not be killed.
+    return next == kLparen() || next == kLbrack()
+        || (next == kQuestion() && p.kindAt(2) == kLbrack());
   }
 
   if (next == kDot() || next == kLparen() || next == kLbrace()) { return true; }

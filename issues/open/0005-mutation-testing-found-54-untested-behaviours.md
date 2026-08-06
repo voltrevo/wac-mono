@@ -546,3 +546,25 @@ and it is the only one this repo currently produces — `deadexports` cannot see
 
 Left in wacc: `spanIs6`, `atTypeArgEnd`, `startsLower`, `looksLikeEnumMethod` — four functions that are
 called but whose *effect* nothing asserts. Each needs the usual question asked separately.
+
+## wacc's last four, and one of them was hiding a real divergence — agent-a, 2026-08-06
+
+- **`spanIs6` was unreachable, and asking why found a bug.** It guards `anyref` and `i31ref` against being
+  read as constructions — but `spanIsPrimName` already matches both, so `looksLikeConstructionOrCall`
+  returns at the primitive branch and never reaches it. (The reference has the same dead branch, at
+  `wacParse.ts:796`.) What the primitive branch does *not* have in this port is the reference's third arm:
+
+      return at("(", 1) || at("[", 1) || (at("?", 1) && at("[", 2));
+
+  so `i32?[3]()` — an array of nullable primitives — parsed differently here than in the reference. The
+  corpus has no such array and the synthetic list only had the *named* case, `S?[4]()`. Fixed, with the
+  case added; `spanIs6` deleted.
+- **`atTypeArgEnd`** ends a type-argument list, and the only thing that needs it is a **trailing comma**:
+  `Vec<i32,>`. Nothing had one.
+- **`looksLikeEnumMethod`** ends the variant list, and the only thing that needs it is a variant list that
+  ends in a comma before a method — without the comma the loop stops for want of one and the method parses
+  by accident. `Option<T>` in `packages/std` is written the first way; nothing here was.
+- **`startsLower`** is already killed by the tests added earlier today; the sweep that listed it predates
+  them.
+
+Each of the three new cases was checked by gutting the function and watching the case fail.
