@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0088](open/0088-zstd-is-whole-buffer-in-both-directions.md) | zstd is whole-buffer in both directions, and gzip is not | missing feature | not implemented |
 | [0087](open/0087-wacland-under-wasmtime-a-second-host-with-no-javascript.md) | the native runtime: a second host, with no JavaScript and no WASI in it | missing feature | not implemented |
 | [0086](open/0086-merkle-patricia-proofs-so-a-contract-read-is-verified.md) | Merkle-Patricia proofs, so reading a contract does not mean trusting the answer | missing feature | not implemented |
 | [0085](open/0085-abi-encoding-and-decoding.md) | ABI encoding and decoding, so a contract call can be made and its answer read | missing feature | not implemented |
