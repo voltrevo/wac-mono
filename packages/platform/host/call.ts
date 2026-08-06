@@ -110,6 +110,9 @@ export type Ticket = { slot: number; gen: number };
  * Reads only, and atomically, so it is safe to call at any moment from either side. Never used to decide
  * anything: it prints.
  */
+/** How many slots are described individually before the rest are counted. */
+const DETAILED = 12;
+
 export function describeSlots(b: Bridge): string {
   // Indexed by the constant's *value*, not by the order they happen to be declared in: `ST_CLAIMED` is
   // 5, not 1, and a table written from the declaration order labelled `ST_RUNNING` as "pending". That is
@@ -124,7 +127,14 @@ export function describeSlots(b: Bridge): string {
     [ST_CANCELLED]: "cancelled",
     [ST_CLAIMED]: "claimed",
   };
+  // Detail for the first few, then a tally.
+  //
+  // The ring is 128 slots now, and four bridges each printing 128 lines is a page of scrollback for a
+  // reader looking for one cycle. What a stall report has to answer is *which kinds of call are stuck and
+  // where*, and past a handful of identical entries the repetition answers nothing — but the first few
+  // carry slot numbers, which is what lets one bridge's report be lined up against another's.
   const busy: string[] = [];
+  const rest = new Map<string, number>();
   for (let i = 0; i < SLOTS; i++) {
     const at = slotAt(i);
     const st = Atomics.load(b.ctrl, at + S_STATUS);
@@ -141,13 +151,14 @@ export function describeSlots(b: Bridge): string {
         Atomics.load(b.ctrl, at + S_REQ_LEN) >= 4
       ? `(h=${new DataView(b.reqBuf(rb).buffer, b.reqBuf(rb).byteOffset, 4).getInt32(0, true)})`
       : "";
-    busy.push(`${i}:${names[st] ?? st}:${opName(op)}${handle}`);
+    const what = `${names[st] ?? st}:${opName(op)}${handle}`;
+    if (busy.length < DETAILED) busy.push(`${i}:${what}`);
+    else rest.set(what, (rest.get(what) ?? 0) + 1);
   }
-  return busy.length === 0
-    ? `no slot in use (submit=${Atomics.load(b.ctrl, SUBMIT_SEQ)} done=${Atomics.load(b.ctrl, DONE_SEQ)})`
-    : `${busy.join(" ")} (submit=${Atomics.load(b.ctrl, SUBMIT_SEQ)} done=${
-      Atomics.load(b.ctrl, DONE_SEQ)
-    })`;
+  const counters = `(submit=${Atomics.load(b.ctrl, SUBMIT_SEQ)} done=${Atomics.load(b.ctrl, DONE_SEQ)})`;
+  if (busy.length === 0) return `no slot in use ${counters}`;
+  const more = [...rest].sort((x, y) => y[1] - x[1]).map(([w, n]) => `${w} × ${n}`);
+  return `${busy.join(" ")}${more.length === 0 ? "" : ` and ${more.join(" ")}`} ${counters}`;
 }
 
 /**
