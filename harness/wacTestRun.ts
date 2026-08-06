@@ -36,6 +36,7 @@ import { wacCompile } from "wac/wacCompile.ts";
 import { wacBindgen } from "wac/wacBindgen.ts";
 import { wacFiles } from "./wacFiles.ts";
 import { checkWacVersion } from "./wacVersion.ts";
+import { profileDir, registerProfiled } from "./wacProfile.ts";
 
 const CACHE_DIR = ".cache";
 const tempName = (base: string) => `${base}.${crypto.randomUUID()}.tmp`;
@@ -58,7 +59,14 @@ export async function wacTestRun(
   // immediately: a pin bump left every `.test.ts` failing with a clear message and every
   // wac test passing, which is the wrong way round for a check that exists to explain.
   checkWacVersion();
-  const result = wacCompile(await wacFiles(entry), entry);
+  // Instrumented when profiling, exactly as `wacBind` does it — and it was not, which made every
+  // wac-written test invisible to the mutation runner's selection. The line was *known*, because some
+  // other file's instrumented build contributed it, and belonged to no test, because this path wrote no
+  // profile at all: `install()` is called by `registerProfiled`, so a file that never registers never
+  // wraps `Deno.test` and never writes its attribution. The runner read that as "nothing executes this"
+  // and excluded the mutant from the score rather than reporting it — wac-mono 0090, where `std`'s
+  // `i32Eq` was called untested by four cases that build a `Map` with it.
+  const result = wacCompile(await wacFiles(entry), entry, profileDir ? { coverage: true } : {});
   if (!result.ok) {
     const lines = result.diagnostics.map(d =>
       `  ${d.file}:${d.line}:${d.col} [${d.phase}] ${d.message}`);
@@ -89,11 +97,29 @@ export async function wacTestRun(
   // without hand-rolling the accessors.
   const ts = wacBindgen(result.compiled);
   await Deno.mkdir(CACHE_DIR, { recursive: true });
-  const outPath = `${CACHE_DIR}/${entry.replaceAll("/", "_")}.gen.ts`;
+  // A separate name under profiling, because the two builds are different binaries and a module is
+  // cached by its path for the life of the process.
+  const outPath = `${CACHE_DIR}/${profileDir ? "prof_" : ""}${entry.replaceAll("/", "_")}.gen.ts`;
   const tmpPath = tempName(outPath);
   await Deno.writeTextFile(tmpPath, ts);
   await Deno.rename(tmpPath, outPath);
   const mod = await import(`${Deno.cwd()}/${outPath}`) as Record<string, unknown>;
+
+  if (profileDir) {
+    // The counter array is allocated by `__cov_init`, not at instantiation; without it the first
+    // instrumented branch traps on a null pointer. Registered *before* the tests are declared, so the
+    // `Deno.test` wrapper is in place when they are — the whole point is per-test attribution.
+    (mod.__cov_init as () => void)();
+    const points = result.compiled.coverage!;
+    registerProfiled({
+      points,
+      counts: () => {
+        const len = (mod.__cov_len as () => number)();
+        const get = mod.__cov_get as (i: number) => number;
+        return Array.from({ length: len }, (_, i) => get(i));
+      },
+    });
+  }
 
   const label = prefix ?? entry.split("/").pop()!.replace(/\.wac$/, "");
   for (const t of tests) {

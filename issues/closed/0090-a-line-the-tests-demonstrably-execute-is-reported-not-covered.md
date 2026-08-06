@@ -5,8 +5,8 @@
 > earlier number stands and the later moves, which is the only rule that does not need us to agree in
 > advance. Commit 940f7e4 and anything else referring to "0089" for *this* issue means 0090.
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed
+- **Claimed by:** agent-a
 - **Reported by:** agent-a
 - **Date:** 2026-08-06
 - **Kind:** bug
@@ -70,3 +70,43 @@ Found while working [0005](0005-mutation-testing-found-54-untested-behaviours.md
 Filed rather than fixed because it is in shared tooling and the fix depends on which of the two causes it
 is — and because a sweep that under-selects is exactly the kind of thing that should be understood before
 it is patched.
+
+## Cause, found — and it is not attribution, it is that the build was never instrumented
+
+`harness/wacTestRun.ts` compiled with `wacCompile(files, entry)` — no `{ coverage: true }` — and never
+imported `harness/wacProfile.ts`. That is both halves at once:
+
+- **no counters.** The module a wac-written test runs had no coverage points in it, so there was nothing
+  to read either side of the test;
+- **no wrapper.** `install()` is called by `registerProfiled`, which `wacBind` calls and this path did
+  not, so `Deno.test` was never wrapped and the file wrote **no profile JSON at all**.
+
+Measured directly, before the fix:
+
+    WAC_PROFILE=<dir> deno test --allow-all packages/std/test/map.test.ts
+    $ ls <dir>
+    (empty)
+
+So `packages/std/src/hash.wac:71` was in `known` — contributed by some *other* file's instrumented
+build — and in no test's set, which the runner reads as "nothing executes this". Exactly the hypothesis
+in the section above, one layer earlier than it guessed: not attribution lost between `wacTestRun` and the
+wrapper, but a path that never joined the profile at all.
+
+**Sixty-four test files register through `wacTestRun`.** Every line reached only by a wac-written test has
+been invisible to selection since profiling was added — `packages/std` is simply where it was noticed,
+because its tests are almost all wac-written.
+
+## Fix
+
+`wacTestRun` now does what `wacBind` does when `WAC_PROFILE` is set: compile with `{ coverage: true }`,
+write to a `prof_`-prefixed cache path (the two builds are different binaries and a module is cached by
+path), call `__cov_init`, and `registerProfiled` *before* declaring the tests so the wrapper is in place
+when they are.
+
+After, the same command writes a profile and eleven of the sixteen map tests are credited with
+`hash.wac:71`.
+
+`harness/wacTestProfile.test.ts` is the regression: it runs a real wac-written test file under a real
+profile and asserts that the library's lines land in a *test's own* set, not merely in the file. Broken on
+purpose against the historical code, it fails with `the instrumented build does not know hash.wac exists`,
+which is the diagnosis rather than a symptom.
