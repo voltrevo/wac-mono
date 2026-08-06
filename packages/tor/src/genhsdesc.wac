@@ -28,16 +28,9 @@ import {
 import {
   TIME_PERIOD_LENGTH_DEFAULT, blindedSecretKey, blindingFactor, subcredential, timePeriodNum,
 } from "./hsblind.wac";
-import {
-  CERT_TYPE_SIGNING_HS_DESC, ed25519Cert, ed25519CertExpandedWithKey,
-} from "./relaycert.wac";
-import {
-  descriptorDocument, encryptLayer, encryptedPlaintext, introPointSection, padToBlock, signedSpanOf,
-  superencryptedPlaintext,
-} from "./hsdescgen.wac";
-import { encryptedConstant, superencryptedConstant } from "./hsdesc.wac";
-import { CERT_TYPE_AUTH_HS_IP_KEY, CERT_TYPE_CROSS_HS_IP_KEYS } from "./relaycert.wac";
-import { ed25519FromCurve25519Public, ed25519SignBit } from "../../crypto/src/ed25519.wac";
+import { signedSpanOf } from "./hsdescgen.wac";
+import { BUILD_OK, Built, IntroPoint, buildDescriptor } from "./hsdescbuild.wac";
+import { ed25519FromCurve25519Public } from "../../crypto/src/ed25519.wac";
 import { x25519Base } from "../../crypto/src/x25519.wac";
 
 /** Two hours, which is what a real service asks for. */
@@ -66,7 +59,6 @@ export i32 main(Core core, Cli cli) {
 
   // The service's identity: the key an onion address *is*. Everything else is derived from it.
   u8[] identitySeed = seedFor(21);
-  u8[] identityExpanded = ed25519ExpandedSecret(identitySeed);
   u8[] identityPublic = ed25519PublicKey(identitySeed);
 
   // The time period, fixed so the vector is reproducible. A live service uses the current one and
@@ -74,17 +66,9 @@ export i32 main(Core core, Cli cli) {
   // ring is keyed on the blinded key it produces.
   i64 periodLength = TIME_PERIOD_LENGTH_DEFAULT;
   i64 periodNum = timePeriodNum(1785931200, periodLength, 0);
-
   u8[] factor = blindingFactor(identityPublic, periodNum, periodLength);
-  u8[] blindExpanded = blindedSecretKey(identityExpanded, factor);
-  if (blindExpanded.len() != 64) {
-    core.warn("genhsdesc: could not blind the identity key");
-    return 1;
-  }
-  u8[] blindPublic = ed25519PublicKeyExpanded(blindExpanded);
+  u8[] blindExpanded = blindedSecretKey(ed25519ExpandedSecret(identitySeed), factor);
 
-  // The descriptor signing key is an ordinary keypair — it is not blinded, and it is the key the
-  // certificate below vouches for and the document's own signature is made with.
   u8[] signSeed = seedFor(22);
   u8[] signPublic = ed25519PublicKey(signSeed);
 
@@ -97,20 +81,9 @@ export i32 main(Core core, Cli cli) {
   // window is a year, and `tools/hsdesc-probe.c` re-checks whenever the fixture is regenerated.
   i64 published = 1785931200;                       // 2026-08-05 12:00:00 UTC, as gendesc uses
   i64 expiryHours = (published / 3600) + 8760;      // a year on
-  // Signed with the **blinded secret**, and carrying the blinded public key in an extension —
-  // `hs_desc_decode_plaintext` reads `blinded_pubkey` from exactly there and has nowhere else to get
-  // it.
-  u8[] cert = ed25519CertExpandedWithKey(CERT_TYPE_SIGNING_HS_DESC, expiryHours, 1, signPublic,
-                                         blindPublic, blindExpanded);
-  if (cert.len() == 0) {
-    core.warn("genhsdesc: could not build the signing-key certificate");
-    return 1;
-  }
 
-  // The inner layer, for real: one introduction point with both of its certificates.
-  //
-  // The link specifiers are the same shape `hsintro.wac` validates — a count byte then one IPv4
-  // entry for 127.0.0.1:9001.
+  // The introduction point. The link specifiers are the shape `hsintro.wac` validates — a count byte
+  // then one IPv4 entry for 127.0.0.1:9001.
   u8[] ls = u8[9]();
   ls[0] = 1;                                        // NSPEC
   ls[1] = 0;                                        // LS_IPV4
@@ -118,47 +91,20 @@ export i32 main(Core core, Cli cli) {
   ls[3] = 127; ls[4] = 0; ls[5] = 0; ls[6] = 1;     // 127.0.0.1
   ls[7] = 0x23; ls[8] = 0x29;                       // 9001
 
-  u8[] ipNtorSecret = clamped(seedFor(25));
-  u8[] ipNtor = x25519Base(ipNtorSecret);
+  u8[] ipNtor = x25519Base(clamped(seedFor(25)));
   u8[] ipAuthSeed = seedFor(26);
-  u8[] ipAuthPublic = ed25519PublicKey(ipAuthSeed);
   u8[] ipEncSecret = clamped(seedFor(27));
   u8[] ipEnc = x25519Base(ipEncSecret);
-
-  // The cross-certificate certifies the **ed25519 form** of the curve25519 encryption key —
-  // proposal 228, the same conversion `ntor-onion-key-crosscert` uses in a router descriptor.
   u8[]? ipEncEd = ed25519FromCurve25519Public(ipEnc, 0);
   if (ipEncEd is null) {
     core.warn("genhsdesc: the encryption key does not convert to ed25519");
     return 1;
   }
 
-  // Both certificates are signed by the *descriptor signing key*, which is the key the outer
-  // document's certificate vouches for.
-  u8[] authCert = ed25519Cert(CERT_TYPE_AUTH_HS_IP_KEY, expiryHours, 1, ipAuthPublic, signPublic,
-                              signSeed);
-  u8[] encCert = ed25519Cert(CERT_TYPE_CROSS_HS_IP_KEYS, expiryHours, 1, ipEncEd!, signPublic,
-                             signSeed);
-  if (authCert.len() == 0 || encCert.len() == 0) {
-    core.warn("genhsdesc: could not build the introduction point certificates");
-    return 1;
-  }
+  IntroPoint[] intros = IntroPoint[1](fill: IntroPoint(ls, ipNtor, ipAuthSeed, ipEncSecret));
 
-  u8[][] intros = u8[][1]();
-  intros[0] = introPointSection(ls, ipNtor, authCert, ipEnc, encCert);
-  u8[] innerPlain = encryptedPlaintext(intros);
-  if (innerPlain.len() == 0) {
-    core.warn("genhsdesc: could not build the inner layer");
-    return 1;
-  }
-
-  // The inner layer is encrypted with the same secret data and subcredential as the middle one, under
-  // its own customisation constant. It is **not** padded — only the middle layer is.
-  u8[] innerSalt = u8[16]();
-  for (i32 i = 0; i < 16; i++) { innerSalt[i] = (i * 29 + 5) & 0xFF; }
-
-  // Sixteen decoy clients, as tor writes when no client is authorised, so the descriptor's shape says
-  // nothing about whether the service restricts access.
+  // Sixteen decoy client-auth entries, which a descriptor carries whether or not client
+  // authorisation is in use — so that using it is not visible from the outside.
   u8[][] clients = u8[][16]();
   for (i32 ci = 0; ci < 16; ci++) {
     u8[] one = u8[40]();
@@ -166,50 +112,32 @@ export i32 main(Core core, Cli cli) {
     clients[ci] = one;
   }
   u8[] ephemeral = seedFor(23);
-
-  // Derived, not invented: `H("subcredential" | H("credential" | identity) | blinded)`. A client
-  // computes the same thing from the onion address alone, which is what makes the descriptor
-  // decryptable by someone who has never spoken to the service.
-  u8[] subcredEarly = subcredential(identityPublic, blindPublic);
-  u8[] inner = encryptLayer(innerPlain, blindPublic, subcredEarly, REVISION, innerSalt,
-                            encryptedConstant());
-  u8[] innerNext = encryptLayer(innerPlain, blindPublic, subcredEarly, REVISION_NEXT, innerSalt,
-                                encryptedConstant());
-  if (inner.len() == 0 || innerNext.len() == 0) {
-    core.warn("genhsdesc: could not encrypt the inner layer");
-    return 1;
-  }
-
-  u8[] middle = padToBlock(superencryptedPlaintext(ephemeral, clients, inner));
-  u8[] middleNext = padToBlock(superencryptedPlaintext(ephemeral, clients, innerNext));
-  if (middle.len() == 0 || middleNext.len() == 0) {
-    core.warn("genhsdesc: could not build the superencrypted layer");
-    return 1;
-  }
-  // The salt is fixed for the same reason the keys are: a committed vector has to be reproducible.
+  u8[] innerSalt = u8[16]();
+  for (i32 i = 0; i < 16; i++) { innerSalt[i] = (i * 29 + 5) & 0xFF; }
   u8[] salt = u8[16]();
   for (i32 i = 0; i < 16; i++) { salt[i] = (i * 23 + 11) & 0xFF; }
-  // SECRET_DATA for this layer is the blinded public key; the subcredential is the service's.
-  u8[] subcred = subcredEarly;
-  u8[] superencrypted = encryptLayer(middle, blindPublic, subcred, REVISION, salt,
-                                     superencryptedConstant());
-  u8[] superencryptedNext = encryptLayer(middleNext, blindPublic, subcred, REVISION_NEXT, salt,
-                                         superencryptedConstant());
-  if (superencrypted.len() == 0 || superencryptedNext.len() == 0) {
-    core.warn("genhsdesc: could not encrypt the superencrypted layer");
-    return 1;
-  }
 
-  u8[] doc = descriptorDocument(LIFETIME_MINUTES, cert, REVISION, superencrypted, signSeed);
+  Built b = buildDescriptor(identitySeed, signSeed, intros, periodNum, periodLength, REVISION,
+                            LIFETIME_MINUTES, expiryHours, ephemeral, innerSalt, salt, clients);
   // The same service, the same keys, the same introduction point — one revision later. Everything
   // that differs between these two documents follows from the counter, including both ciphertexts,
   // because the revision is part of the key derivation for each layer as well as a line in the text.
-  u8[] docNext = descriptorDocument(LIFETIME_MINUTES, cert, REVISION_NEXT, superencryptedNext,
-                                    signSeed);
-  if (doc.len() == 0 || docNext.len() == 0) {
-    core.warn("genhsdesc: could not build the descriptor");
+  Built bn = buildDescriptor(identitySeed, signSeed, intros, periodNum, periodLength, REVISION_NEXT,
+                             LIFETIME_MINUTES, expiryHours, ephemeral, innerSalt, salt, clients);
+  if (b.error != BUILD_OK || bn.error != BUILD_OK) {
+    core.warn("genhsdesc: could not build the descriptor, error " + itoa(b.error) + "/" +
+              itoa(bn.error));
     return 1;
   }
+  u8[] doc = b.document;
+  u8[] docNext = bn.document;
+  u8[] blindPublic = b.blindedKey;
+  u8[] subcred = b.subcredential;
+  u8[] cert = b.certificate;
+  u8[] inner = b.inner;
+  u8[] superencrypted = b.superencrypted;
+  u8[] authCert = b.introAuthCerts[0];
+  u8[] encCert = b.introEncCerts[0];
 
   Change c = cli.writeFile(descOut, doc).wait();
   if (!c.ok()) {
@@ -243,14 +171,14 @@ export i32 main(Core core, Cli cli) {
     "  \"linkSpecifiers\": \"" + hex(ls) + "\",\n" +
     "  \"ipNtor\": \"" + hex(ipNtor) + "\",\n" +
     "  \"ipAuthSeed\": \"" + hex(ipAuthSeed) + "\",\n" +
-    "  \"ipAuthPublic\": \"" + hex(ipAuthPublic) + "\",\n" +
+    "  \"ipAuthPublic\": \"" + hex(ed25519PublicKey(ipAuthSeed)) + "\",\n" +
     "  \"ipEnc\": \"" + hex(ipEnc) + "\",\n" +
     "  \"ipEncEd\": \"" + hex(ipEncEd!) + "\",\n" +
     "  \"authCert\": \"" + hex(authCert) + "\",\n" +
     "  \"encCert\": \"" + hex(encCert) + "\",\n" +
-    "  \"innerPlainLen\": " + itoa(innerPlain.len()) + ",\n" +
+    "  \"innerPlainLen\": " + itoa(b.innerPlainLen) + ",\n" +
     "  \"inner\": \"" + hex(inner) + "\",\n" +
-    "  \"middleLen\": " + itoa(middle.len()) + ",\n" +
+    "  \"middleLen\": " + itoa(b.middleLen) + ",\n" +
     "  \"superencrypted\": \"" + hex(superencrypted) + "\",\n" +
     "  \"lifetimeMinutes\": " + itoa(LIFETIME_MINUTES) + ",\n" +
     "  \"revision\": 42,\n" +

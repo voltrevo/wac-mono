@@ -1,0 +1,182 @@
+// Building the descriptor a service publishes, from the keys a service holds.
+//
+// `hsdescgen.wac` has the layers — encrypt one, pad it, wrap it, sign the document. What was missing
+// is the step above: everything a service must decide *before* those functions can be called, which
+// is where all the joins are. The blinded keypair for this time period, the certificate signed with
+// its secret and carrying its public half, the subcredential the layers are encrypted under, and the
+// two certificates each introduction point needs. Those were written out once, inline in
+// `genhsdesc.wac`, so the descriptor could only ever be built one way with one set of keys.
+//
+// A service cannot use that. It has its own introduction points, chosen when it started; it
+// republishes when the time period rolls over, with a different blinded key and therefore a different
+// name; and it increments a revision counter each time. All of that is a parameter here.
+//
+// ## Why the salts and the ephemeral key are arguments
+//
+// The same reason `encryptLayer` takes its salt: a function that reached for randomness could not be
+// pinned against committed bytes at all, and the descriptor is pinned against bytes tor accepted. A
+// live service passes fresh randomness; the generator passes fixed values and gets the vector back.
+//
+// ## What is *not* here
+//
+// Choosing the time period from a consensus (`consensusTimePeriod` in `hsdir.wac`), choosing which
+// relays to publish to (`hsdirsForDescriptor`), and the upload itself. This builds a document; it does
+// not decide when to build one.
+
+import {
+  ed25519ExpandedSecret, ed25519FromCurve25519Public, ed25519PublicKey, ed25519PublicKeyExpanded,
+} from "../../crypto/src/ed25519.wac";
+import { blindedSecretKey, blindingFactor, subcredential } from "./hsblind.wac";
+import {
+  CERT_TYPE_AUTH_HS_IP_KEY, CERT_TYPE_CROSS_HS_IP_KEYS, CERT_TYPE_SIGNING_HS_DESC, ed25519Cert,
+  ed25519CertExpandedWithKey,
+} from "./relaycert.wac";
+import {
+  descriptorDocument, encryptLayer, encryptedPlaintext, introPointSection, padToBlock,
+  superencryptedPlaintext,
+} from "./hsdescgen.wac";
+import { encryptedConstant, superencryptedConstant } from "./hsdesc.wac";
+import { x25519Base } from "../../crypto/src/x25519.wac";
+
+export const i32 BUILD_OK = 0;
+export const i32 BUILD_BAD_IDENTITY = 1;   // the identity seed is not 32 bytes, or will not blind
+export const i32 BUILD_BAD_SIGNING = 2;    // the signing seed is not 32 bytes
+export const i32 BUILD_NO_INTROS = 3;      // a descriptor with no introduction points reaches nobody
+export const i32 BUILD_BAD_INTRO = 4;      // an introduction point's keys are the wrong size
+export const i32 BUILD_BAD_ENC_KEY = 5;    // an encryption key that does not convert to ed25519
+export const i32 BUILD_FAILED = 6;         // a layer, a certificate or the document would not build
+
+/**
+ * One introduction point, as the service holds it.
+ *
+ * `ntorOnionKey` is the **relay's** — what a client extends to it with. `encSecret` is the
+ * **service's**, and its public half is what a client runs hs-ntor against. Both are 32 bytes of
+ * curve25519 and confusing them produces a descriptor that decodes perfectly and cannot be used, so
+ * they are separate fields rather than two entries in an array.
+ */
+export struct IntroPoint {
+  u8[] linkSpecifiers;   // where the introduction point is, as `hsintro.wac` validates them
+  u8[] ntorOnionKey;     // the intro relay's ntor key, 32 bytes
+  u8[] authSeed;         // ours: the seed for this circuit's auth key, 32 bytes
+  u8[] encSecret;        // ours: a clamped curve25519 secret, 32 bytes
+}
+
+/**
+ * The document, the values a service needs afterwards, and the layers it was built from.
+ *
+ * The layers are here because a test vector wants them and there is nowhere honest to get them
+ * otherwise: recomputing them beside this function is the duplication that has already cost a
+ * divergence in this package. A service ignores every field below `signingPublic`.
+ */
+export struct Built {
+  i32 error;
+  u8[] document;
+  /** The name an HSDir will file it under, and the name a client will ask for. */
+  u8[] blindedKey;
+  /** What the layers were encrypted under — a client derives the same from the onion address. */
+  u8[] subcredential;
+  u8[] signingPublic;
+
+  u8[] certificate;        // the descriptor-signing-key certificate, signed by the blinded secret
+  u8[] inner;              // the encrypted introduction-point layer
+  u8[] superencrypted;     // the outer encrypted layer, padded before encryption
+  i32 innerPlainLen;       // the inner layer's plaintext length, which tracks the intro point count
+  i32 middleLen;           // the padded plaintext length, which does not
+  u8[][] introAuthCerts;   // one per introduction point, in order
+  u8[][] introEncCerts;
+}
+
+Built failed(i32 error) {
+  return Built(error, u8[0](), u8[0](), u8[0](), u8[0](), u8[0](), u8[0](), u8[0](), 0, 0,
+               u8[][0](), u8[][0]());
+}
+
+/**
+ * The descriptor for this service, this time period, this revision.
+ *
+ * `certExpiryHours` is **hours since the epoch, not a duration** — the mistake that costs an
+ * afternoon, because tor's decoder refuses an expired certificate without saying which of a dozen
+ * checks failed.
+ *
+ * `decoyClients` are the 16 client-auth entries a descriptor carries whether or not client
+ * authorisation is in use; passing fewer is allowed here and is what a caller wanting a smaller
+ * document does, but a real service sends the full set so that using client auth is not visible from
+ * the outside.
+ */
+export Built buildDescriptor(
+  u8[] identitySeed, u8[] signingSeed, IntroPoint[] intros, i64 periodNum, i64 periodLength,
+  i64 revision, i32 lifetimeMinutes, i64 certExpiryHours, u8[] ephemeral, u8[] innerSalt,
+  u8[] outerSalt, u8[][] decoyClients
+) {
+  if (identitySeed.len() != 32) { return failed(BUILD_BAD_IDENTITY); }
+  if (signingSeed.len() != 32) { return failed(BUILD_BAD_SIGNING); }
+  if (intros.len() == 0) { return failed(BUILD_NO_INTROS); }
+
+  u8[] identityPublic = ed25519PublicKey(identitySeed);
+  u8[] factor = blindingFactor(identityPublic, periodNum, periodLength);
+  u8[] blindExpanded = blindedSecretKey(ed25519ExpandedSecret(identitySeed), factor);
+  if (blindExpanded.len() != 64) { return failed(BUILD_BAD_IDENTITY); }
+  u8[] blindPublic = ed25519PublicKeyExpanded(blindExpanded);
+
+  // The signing key is an ordinary keypair. It is *not* blinded: it is the key the certificate below
+  // vouches for and the key the document's own signature is made with, and a service rotates it
+  // without changing its address.
+  u8[] signingPublic = ed25519PublicKey(signingSeed);
+
+  // Signed with the blinded secret and carrying the blinded public key in extension 4, which is the
+  // only place `hs_desc_decode_plaintext` looks for it.
+  u8[] cert = ed25519CertExpandedWithKey(CERT_TYPE_SIGNING_HS_DESC, certExpiryHours, 1, signingPublic,
+                                         blindPublic, blindExpanded);
+  if (cert.len() == 0) { return failed(BUILD_FAILED); }
+
+  u8[][] sections = u8[][intros.len()]();
+  u8[][] authCerts = u8[][intros.len()]();
+  u8[][] encCerts = u8[][intros.len()]();
+  for (i32 i = 0; i < intros.len(); i++) {
+    IntroPoint ip = intros[i];
+    if (ip.linkSpecifiers.len() == 0 || ip.ntorOnionKey.len() != 32 || ip.authSeed.len() != 32 ||
+        ip.encSecret.len() != 32) {
+      return failed(BUILD_BAD_INTRO);
+    }
+    u8[] encPublic = x25519Base(ip.encSecret);
+    // The cross-certificate certifies the **ed25519 form** of the curve25519 encryption key —
+    // proposal 228, the same conversion a router descriptor's `ntor-onion-key-crosscert` uses.
+    u8[]? encEd = ed25519FromCurve25519Public(encPublic, 0);
+    if (encEd is null) { return failed(BUILD_BAD_ENC_KEY); }
+
+    // Both certificates are signed by the *descriptor signing key* — not by the blinded key, and not
+    // by each other. tor drops an introduction point whose certificates fail and still calls the
+    // descriptor accepted, so getting this wrong shows up as a service nobody can reach rather than
+    // as a document anybody rejects.
+    u8[] authCert = ed25519Cert(CERT_TYPE_AUTH_HS_IP_KEY, certExpiryHours, 1,
+                                ed25519PublicKey(ip.authSeed), signingPublic, signingSeed);
+    u8[] encCert = ed25519Cert(CERT_TYPE_CROSS_HS_IP_KEYS, certExpiryHours, 1, encEd!, signingPublic,
+                               signingSeed);
+    if (authCert.len() == 0 || encCert.len() == 0) { return failed(BUILD_FAILED); }
+    authCerts[i] = authCert;
+    encCerts[i] = encCert;
+    sections[i] = introPointSection(ip.linkSpecifiers, ip.ntorOnionKey, authCert, encPublic, encCert);
+  }
+
+  // Derived, not invented: `H("subcredential" | H("credential" | identity) | blinded)`. A client
+  // computes the same thing from the onion address alone, which is what makes a descriptor
+  // decryptable by someone who has never spoken to the service.
+  u8[] subcred = subcredential(identityPublic, blindPublic);
+
+  u8[] innerPlain = encryptedPlaintext(sections);
+  if (innerPlain.len() == 0) { return failed(BUILD_FAILED); }
+  u8[] inner = encryptLayer(innerPlain, blindPublic, subcred, revision, innerSalt,
+                            encryptedConstant());
+  if (inner.len() == 0) { return failed(BUILD_FAILED); }
+
+  u8[] middle = padToBlock(superencryptedPlaintext(ephemeral, decoyClients, inner));
+  if (middle.len() == 0) { return failed(BUILD_FAILED); }
+  u8[] superencrypted = encryptLayer(middle, blindPublic, subcred, revision, outerSalt,
+                                     superencryptedConstant());
+  if (superencrypted.len() == 0) { return failed(BUILD_FAILED); }
+
+  u8[] doc = descriptorDocument(lifetimeMinutes, cert, revision, superencrypted, signingSeed);
+  if (doc.len() == 0) { return failed(BUILD_FAILED); }
+  return Built(BUILD_OK, doc, blindPublic, subcred, signingPublic, cert, inner, superencrypted,
+               innerPlain.len(), middle.len(), authCerts, encCerts);
+}
