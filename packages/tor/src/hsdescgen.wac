@@ -1,0 +1,166 @@
+// Building an onion service descriptor: the document a service publishes about itself.
+//
+// The *reading* half is `hsdesc.wac`, which a client uses to decrypt and believe one. This is the
+// writing half, and the two are separate files for the reason `consensus.wac` and `consensusgen.wac`
+// are: a client needs the reader and never the writer, and a service's own output must not be
+// validated by the code that produced it.
+//
+// ## The shape, outside in
+//
+//     hs-descriptor 3
+//     descriptor-lifetime <minutes>
+//     descriptor-signing-key-cert
+//     -----BEGIN ED25519 CERT-----      <- type 8, signed by the *blinded* key
+//     ...
+//     -----END ED25519 CERT-----
+//     revision-counter <n>
+//     superencrypted
+//     -----BEGIN MESSAGE-----           <- SALT | AES-256-CTR ciphertext | MAC
+//     ...
+//     -----END MESSAGE-----
+//     signature <unpadded base64>       <- by the descriptor signing key
+//
+// ## What the signature covers, and where it stops
+//
+// From tor's `desc_sig_is_valid`: it finds `"\nsignature "`, steps **past the newline**, and signs
+// everything before that point — so the span includes the newline that ends the `superencrypted`
+// object and excludes the word `signature`. The message is prefixed with
+// `Tor onion service descriptor sig v3`, the same `ed25519_checksig_prefixed` shape ESTABLISH_INTRO
+// uses with a different string.
+//
+// That is one more span in a package whose bugs have mostly been spans, so it is pinned against tor's
+// own `hs_desc_decode_plaintext` rather than described and hoped for.
+//
+// ## Why the outer shell is worth building alone
+//
+// `hs_desc_decode_plaintext` verifies the version, the lifetime, the certificate chain and the
+// signature, and treats `superencrypted` as an opaque object. So the outer document can be built and
+// checked against C tor *before* either encrypted layer exists — which is the only way to get an
+// oracle at each stage rather than one at the end of a week's work.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { itoa, itoa64 } from "../../fmt/src/itoa.wac";
+import { aesCtr } from "../../crypto/src/aesctr.wac";
+import { ed25519Sign } from "../../crypto/src/ed25519.wac";
+import { encode as b64encode } from "../../codec/src/base64.wac";
+import {
+  MAC_KEY_LEN, MAC_LEN, S_IV_LEN, S_KEY_LEN, SALT_LEN, layerKeys, layerMac, slice,
+} from "./hsdesc.wac";
+
+/** What tor prepends before checking a descriptor's signature — `strlen`, so no terminating NUL. */
+export const string DESC_SIG_PREFIX = "Tor onion service descriptor sig v3";
+
+/**
+ * One encryption layer: plaintext in, `SALT | ENCRYPTED | MAC` out.
+ *
+ * The exact inverse of `decryptLayer`, and deliberately taking the salt as a parameter rather than
+ * generating one: a caller with a source of randomness passes it, and a test passes a fixed one and
+ * gets a reproducible document. A function that reached for randomness itself could not be pinned
+ * against a committed vector at all.
+ *
+ * Empty if the salt or subcredential is the wrong size, rather than a blob that decrypts to nothing.
+ */
+export u8[] encryptLayer(
+  u8[] plaintext, u8[] secretData, u8[] subcredential, i64 revision, u8[] salt, u8[] constant
+) {
+  if (salt.len() != SALT_LEN || subcredential.len() != 32) { return u8[0](); }
+  u8[] keys = layerKeys(secretData, subcredential, revision, salt, constant);
+  if (keys.len() != S_KEY_LEN + S_IV_LEN + MAC_KEY_LEN) { return u8[0](); }
+
+  u8[] ciphertext = aesCtr(slice(keys, 0, S_KEY_LEN),
+                           slice(keys, S_KEY_LEN, S_KEY_LEN + S_IV_LEN), plaintext);
+  u8[] mac = layerMac(slice(keys, S_KEY_LEN + S_IV_LEN, keys.len()), salt, ciphertext);
+
+  Buf out = Buf.create();
+  out.pushAll(salt);
+  out.pushAll(ciphertext);
+  out.pushAll(mac);
+  return out.bytes();
+}
+
+/**
+ * The outer descriptor, signed.
+ *
+ * `signingSeed` is the descriptor signing key's seed and `signingCert` the type-8 certificate that
+ * the *blinded* key issued for its public half — the caller builds that with `relaycert.wac`, because
+ * blinding lives in `hsblind.wac` and putting either here would give this file two jobs.
+ *
+ * `superencrypted` is the already-encrypted first layer. Empty means the caller has none yet, which
+ * is legitimate while the layers are being built: tor's `hs_desc_decode_plaintext` checks everything
+ * outside that object and treats the object itself as opaque.
+ */
+export u8[] descriptorDocument(
+  i32 lifetimeMinutes, u8[] signingCert, i64 revision, u8[] superencrypted, u8[] signingSeed
+) {
+  if (signingCert.len() == 0 || signingSeed.len() != 32) { return u8[0](); }
+  if (lifetimeMinutes <= 0) { return u8[0](); }
+
+  Buf d = Buf.create();
+  d.pushAll("hs-descriptor 3\n".toBytes());
+  d.pushAll(("descriptor-lifetime " + itoa(lifetimeMinutes) + "\n").toBytes());
+  d.pushAll("descriptor-signing-key-cert\n".toBytes());
+  d.pushAll(pemBlock("ED25519 CERT", signingCert));
+  d.pushAll(("revision-counter " + itoa64(revision) + "\n").toBytes());
+  d.pushAll("superencrypted\n".toBytes());
+  d.pushAll(pemBlock("MESSAGE", superencrypted));
+
+  // The span ends here: everything written so far, the newline that closed the object included.
+  u8[] signed = d.bytes();
+  u8[] sig = ed25519Sign(signingSeed, prefixed(signed));
+  if (sig.len() != 64) { return u8[0](); }
+
+  d.pushAll(("signature " + b64Unpadded(sig) + "\n").toBytes());
+  return d.bytes();
+}
+
+/** The bytes tor signs: the prefix, then the document up to the signature line. */
+export u8[] prefixed(u8[] span) {
+  Buf b = Buf.create();
+  b.pushAll(DESC_SIG_PREFIX.toBytes());
+  b.pushAll(span);
+  return b.bytes();
+}
+
+/**
+ * The span a descriptor's signature covers, taken from a finished document.
+ *
+ * Exported so a test can compare it against where tor stops rather than against where this file
+ * thinks it stops — the same reason `hsservice.wac` exports its two spans.
+ */
+export u8[] signedSpanOf(u8[] document) {
+  u8[] needle = "\nsignature ".toBytes();
+  for (i32 i = 0; i + needle.len() <= document.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < needle.len(); j++) {
+      if (document[i + j] != needle[j]) { hit = false; break; }
+    }
+    // tor steps *past* the newline, so the span includes it.
+    if (hit) { return slice(document, 0, i + 1); }
+  }
+  return u8[0]();
+}
+
+/**
+ * A PEM block, 64 characters to a line.
+ *
+ * `routerdesc.wac` has one of these for RSA keys and this is not it: that one is part of a document
+ * whose bytes are pinned against tor's own descriptors, and sharing would couple two formats that
+ * happen to agree today. The wrapping rule is the same and the labels are not.
+ */
+u8[] pemBlock(string label, u8[] body) {
+  Buf out = Buf.create();
+  out.pushAll(("-----BEGIN " + label + "-----\n").toBytes());
+  u8[] b64 = b64encode(body, 0, true);
+  for (i32 i = 0; i < b64.len(); i = i + 64) {
+    i32 end = i + 64 < b64.len() ? i + 64 : b64.len();
+    for (i32 j = i; j < end; j++) { out.push(b64[j]); }
+    out.push(10);
+  }
+  out.pushAll(("-----END " + label + "-----\n").toBytes());
+  return out.bytes();
+}
+
+/** Unpadded base64, which is what every key and signature in these documents uses. */
+u8[] b64UnpaddedBytes(u8[] data) { return b64encode(data, 0, false); }
+
+string b64Unpadded(u8[] data) { return string.fromBytes(b64UnpaddedBytes(data)); }
