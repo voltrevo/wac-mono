@@ -1382,6 +1382,19 @@ Deno.test("box's newest batch: sponge, zstd, json, stat, uuid, shuf, paste, yes"
     assertEquals(shuffled.slice().sort().join(","), lines.slice().sort().join(","), "same lines");
     assertEquals(shuffled.join(",") !== lines.join(","), true, "and in some other order");
     assertEquals(run(["shuf", "-5", `${dir}/lines`]).out.trim().split("\n").length, 5);
+    // **A different order each time**, which is the part the checks above cannot see. `below` — the
+    // rejection-sampled index the shuffle draws — could return a constant and every assertion above still
+    // held: swapping each element with position zero is a permutation, and it differs from the input. It
+    // is also *the same* permutation on every run, so two shuffles of the same 200 lines are identical.
+    // Probabilistic in the direction that cannot fail by accident: 200! orders, and this asks only that
+    // two of three runs differ. wac-mono 0005.
+    const again = run(["shuf", `${dir}/lines`]).out.trim();
+    const third = run(["shuf", `${dir}/lines`]).out.trim();
+    assertEquals(
+      new Set([shuffled.join("\n"), again, third]).size > 1,
+      true,
+      "three shuffles of the same input gave one order: the draw is not random",
+    );
 
     // ── paste, against the real one ──
     await Deno.writeTextFile(`${dir}/p1`, "a\nb\n");

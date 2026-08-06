@@ -14,8 +14,11 @@
 //     sudo ./node_modules/.bin/playwright install-deps chromium
 //
 // The browser lands in `~/.cache/ms-playwright`, which is what the guard looks for. Deno pulls
-// the JavaScript half itself on first run. Then run it with `deno test -A` — `deno task test`
-// withholds `--allow-sys`, which Playwright needs, and the guard skips rather than fails. Chromium 151 on arm64 works — issue 0016 warned the
+// the JavaScript half itself on first run. Then run it with **`deno test -A`** — nothing narrower
+// works: `deno task test` withholds `--allow-sys`, and granting only that is not enough either,
+// because `playwright-core` reads `/proc/sys/fs/binfmt_misc/WSLInterop` through `node:fs` and Deno
+// gates that on blanket access. The guard skips rather than fails, and **says why on standard error**,
+// because a silent skip reads as coverage. Chromium 151 on arm64 works — issue 0016 warned the
 // arm64 builds had been unavailable, and they are not any more.
 //
 // What this proves that nothing else does: `SharedArrayBuffer` under genuine cross-origin
@@ -49,18 +52,39 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
  * `deno task test`, which is the right way round: the shared suite should not be the thing
  * that needs a browser.
  */
-function canDriveBrowser(): boolean {
+function canDriveBrowser(): string {
   if (Deno.permissions.querySync({ name: "sys", kind: "homedir" }).state !== "granted") {
-    return false;
+    return "no `sys` permission: run this file with `deno test -A`";
   }
   const home = Deno.env.get("HOME");
-  if (home === undefined) return false;
+  if (home === undefined) return "no HOME to look for a browser under";
   try {
-    return [...Deno.readDirSync(`${home}/.cache/ms-playwright`)]
+    const found = [...Deno.readDirSync(`${home}/.cache/ms-playwright`)]
       .some((e) => e.isDirectory && e.name.startsWith("chromium"));
+    if (!found) return `no chromium in ${home}/.cache/ms-playwright`;
   } catch {
-    return false;   // no such directory: no browser
+    return `no ${home}/.cache/ms-playwright: no browser installed`;
   }
+  return "";
+}
+
+/**
+ * Why this run cannot drive a browser, or `""` when it can — **and it is printed, not swallowed.**
+ *
+ * A skip that says nothing reads as coverage that was never there, which is how this repo has already
+ * lost a corpus entry for weeks (wac-mono 0005's note on `tour.wac`). Deno prints `ignored` and no reason,
+ * so the reason goes to standard error at module scope, once.
+ *
+ * The check is a *string* rather than a bool for the same reason. It also has to answer more than
+ * "is Chromium there": granting `--allow-sys` alone is not enough, because `playwright-core` reads
+ * `/proc/sys/fs/binfmt_misc/WSLInterop` through `node:fs`, which Deno gates on blanket access — so
+ * adding `--allow-sys` to `deno task test` turns this from a clean skip into a red suite, which is
+ * exactly what happened when I tried it. `deno test -A` is the way to run it, and saying so here is
+ * worth more than a comment in the header nobody reads at the moment they need it.
+ */
+const cannotBecause = canDriveBrowser();
+if (cannotBecause !== "") {
+  console.error(`browser_live: skipped — ${cannotBecause}`);
 }
 
 /**
@@ -90,7 +114,7 @@ function serve(dir: string): { port: number; stop(): Promise<void> } {
 
 Deno.test({
   name: "a wac program runs in a real browser, over real cross-origin isolation",
-  ignore: !canDriveBrowser(),
+  ignore: cannotBecause !== "",
   // An external browser process and its pipes are not resources this test can account for to
   // Deno's satisfaction, and pretending otherwise would mean leaking them instead.
   sanitizeResources: false,
@@ -293,6 +317,17 @@ Deno.test({
         new Blob([gz as BlobPart]).stream().pipeThrough(new DecompressionStream("gzip")),
       );
       assertEquals(await plain.text(), body, "what the page compressed, ungzipped");
+
+      // The ratio the page prints, which nothing looked at: `tenths` could return anything and every
+      // assertion above still held, because the page's numbers were checked and its arithmetic was not.
+      // Computed here from the two lengths this test already knows — the input's, and the container the
+      // runtime just decompressed — so it is the *formatting* under test rather than the compressor.
+      const permille = Math.floor(gz.length * 1000 / body.length);
+      assertEquals(
+        await page.textContent("#ratio"),
+        `(${Math.floor(permille / 10)}.${permille % 10}% of the input)`,
+        "the page's compression ratio",
+      );
 
       // And the shell, which is `packages/sh` unchanged with a keyboard in front of it.
       await buildApp(

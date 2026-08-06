@@ -604,3 +604,31 @@ handful of full-scope runs per sweep.
 
 **`packages/wacc` is now 162/164**, two documented (`kBool`, `kindCount` — the token-kind table), zero
 undocumented survivors, and `deno task mutate --operators --package wacc` exits 0.
+
+## `packages/box`, and the eight survivors a sweep cannot reach — agent-a, 2026-08-06
+
+A sampled repo-wide sweep put every one of its survivors in `box`; a `--package box` sweep says why. Of
+its survivors, **eight are browser pages** — `example/hash.wac` and `example/term.wac` — and the only thing
+that drives a page is `packages/platform/test/browser_live.test.ts`, which needs `deno test -A`:
+`playwright-core` reads `/proc/sys/fs/binfmt_misc/WSLInterop` through `node:fs`, and Deno gates that on
+blanket access. A sweep runs with the suite's narrower grants, so it cannot reach them, and has been
+reporting them as untested by a run that could not have tested them.
+
+Granting `--allow-sys` to the suite does *not* fix it — I tried, and it turns a clean skip into a red
+suite for the reason above. What would fix it is a way to run one file with blanket permissions from
+inside a sweep; `harness/testLane.ts` is the obvious place and it is not built. Until then the five
+page-body mutants are in `known.ts` with that argument, and the skip now **says why** on standard error
+rather than being silent, because a silent skip reads as coverage that was never there.
+
+What was fixed rather than recorded:
+
+- **`shuf` never checked that its draw was random.** `below` could return a constant and every assertion
+  held — swapping each element with position zero is a permutation, and it differs from the input. It is
+  also the *same* permutation every time, so three shuffles of the same 200 lines now have to produce more
+  than one order.
+- **`tenths`** — the hash page's ratio formatter — is asserted by the live test against the two lengths it
+  already knows, so gutting it fails.
+- **Two more `itoa` copies and a `hex` copy deleted.** `example/term.wac` and `example/hash.wac` each had
+  their own decimal formatter, and the copies in this repo had already drifted once: the i32-minimum bug
+  was fixed in each of them separately (GitHub wac-mono#6). They import `fmt`'s and `codec`'s now. A page
+  is not a reason to fork a formatter.

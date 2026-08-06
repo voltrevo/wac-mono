@@ -313,6 +313,45 @@ export const KNOWN_SURVIVORS: KnownSurvivor[] = [
       "A `pop` that left the old value in place would make the guard the only thing still correct, " +
       "and that is exactly the change somebody adds without reading this accessor. wac-mono 0005.",
   },
+  // ── the browser examples ────────────────────────────────────────────────────
+  //
+  // These are page bodies, and the only thing that drives a page is
+  // `packages/platform/test/browser_live.test.ts` — which needs `deno test -A`, because
+  // `playwright-core` reads `/proc/sys/fs/binfmt_misc/WSLInterop` through `node:fs` and Deno gates that
+  // on blanket access. A sweep runs with the suite's narrower grants, so it *cannot* reach them, and every
+  // sweep has duly reported them as untested by a run that could not have tested them.
+  //
+  // Listed here with that argument rather than left to be rediscovered. Checked, not assumed: gutting
+  // `tenths` fails the live test, which is where the ratio it formats is now asserted against the two
+  // lengths that test already knows. What would remove these entries is a way to run one test file with
+  // blanket permissions from inside a sweep — the lane machinery in `harness/testLane.ts` is the obvious
+  // place for it, and it is not built.
+  {
+    name: "extreme/box/example/hash/page",
+    why:
+      "The hash page's body. Driven only by `browser_live.test.ts`, which a sweep cannot run — see the " +
+      "note above. That test asserts the SHA-256 against the runtime's own crypto, the gzip against the " +
+      "runtime's own decompressor, and the ratio line, so the page is covered where it can be run.",
+  },
+  {
+    name: "extreme/box/example/hash/update",
+    why: "The same page's redraw. Same argument as `page` above.",
+  },
+  {
+    name: "extreme/box/example/hash/tenths",
+    why:
+      "The ratio formatter on the same page. Asserted by `browser_live.test.ts` against the input's " +
+      "length and the gzip container's — gutting it fails that test — and unreachable from a sweep.",
+  },
+  {
+    name: "extreme/box/example/term/main",
+    why: "The browser terminal's entry point. Driven only by `browser_live.test.ts`, which types into it " +
+      "and reads the screen back; unreachable from a sweep.",
+  },
+  {
+    name: "extreme/box/example/term/page",
+    why: "The same terminal's page half. Same argument as `main` above.",
+  },
   // ── wacc's token-kind table ─────────────────────────────────────────────────
   {
     name: "extreme/wacc/kinds/kBool",
