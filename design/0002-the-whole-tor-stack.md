@@ -1649,3 +1649,39 @@ caller pushing a raw byte through a `%` at this end would reintroduce exactly th
 here able to notice.
 
 Nine faults planted, nine caught.
+
+### Everything here is a steady state, and the interesting bugs are in the transitions
+
+Worth writing down as a gap rather than leaving as an impression: **every property this stack has
+pinned is a steady state.** Given this consensus, choose these directories. Given these bytes, accept
+or refuse. Given this period, this name. Each is a pure function tested against a value C tor produced,
+and that has found real defects all week.
+
+What none of them touches is *change over time*, because each transition costs hours of wall clock:
+
+| transition | how long it takes to observe |
+|---|---|
+| publish, the time period rolls, republish, a client still finds the service | 24h (8 minutes on chutney) |
+| an introduction point expiring while an INTRODUCE2 is in flight | 18–24h, drawn |
+| a consensus expiring mid-circuit; `refreshAt` firing at all | ~1h |
+| a revision counter across a service restart | a restart, plus a publish interval |
+
+`serviceStorePeriods` is the sharpest example. It exists *entirely* to decide what to do either side of
+a period boundary, and it has only ever been tested at two frozen instants — the captured consensus and
+a synthesised one. The boundary itself, which is the thing it is for, has never been crossed in a test.
+
+There is also a quieter cost. `hsdir_vectors.json` records `periodLength: 8` **minutes** because chutney
+shrinks the voting interval to twenty seconds to make rotation observable; production is 1440. So
+`timePeriodLength(testingNetwork: true, …)` is the branch under test and the production branch has never
+met a live network. That is not a coverage gap that patience would close — it is a *different
+configuration*, tested in place of the real one.
+
+**design/0001's D13 is what would close both.** Virtual time — a clock the scheduler advances when
+nothing is runnable, rather than a clock it merely owns — turns "24 hours" into "200ms" and removes the
+reason to shrink the voting interval at all. The first demonstration worth building is stated there:
+publish a descriptor, cross a period boundary in simulated time, fetch it as a client.
+
+With the caveat D13 also states, which belongs here more than there: **a closed-world simulation is a
+symmetric oracle**, and this document is a record of that trap being fallen into repeatedly. Every
+defect found this week came from C tor and none would have survived contact with a simulator that only
+ran our own code faster. Virtual time is for the transitions; C tor stays the oracle for the steps.
