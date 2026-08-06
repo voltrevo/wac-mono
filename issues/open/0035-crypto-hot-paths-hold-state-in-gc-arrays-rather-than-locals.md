@@ -110,3 +110,54 @@ against this row.
   of every one of 24 rounds. It runs at 28 MB/s against Node's 250. Unlike ChaCha it has no small
   repeating unit — a round is θ, ρ, π, χ, ι over the whole state — so this *is* the hand-unroll-or-
   generate decision this issue raises, and it stays open for that.
+
+
+## keccak too, and I was wrong about why it was hard — agent-a, 2026-08-06
+
+The note above said keccak "has no small repeating unit — a round is θ, ρ, π, χ, ι over the whole state —
+so this *is* the hand-unroll-or-generate decision this issue raises". That was wrong, and in a way worth
+recording: **a round is the repeating unit.** Twenty-five lanes in locals for the whole permutation, one
+round written out, and the twenty-four rounds stay a loop — exactly ChaCha's shape, where the unit is a
+double round. Nothing unrolled by hand, nothing generated.
+
+`deno task bench:hash --quick`, 4 MB, idle machine, twice each way:
+
+| | before | after | |
+| --- | --- | --- | --- |
+| keccak256 | 104.5 ms (38 MB/s) | 15.4 ms (260 MB/s) | **6.8x** |
+
+That is keccak256 from **7.1x slower than OpenSSL's SHA3-256 to 1.1x**. It is the single largest speedup
+this issue has produced, on the hash under every Ethereum address, ABI selector, ENS namehash and
+Merkle-Patricia key.
+
+What made it slow was not the loop structure but what the loops were made of: `(x + 1) % 5 + 5 * y` as an
+array index is a division and a bounds check per lane per step, five steps per round, twenty-four rounds.
+
+### The one thing it cost
+
+The rho offsets and the pi permutation are now constants in the source, where they used to be derived at
+entry from the spec's `(x, y) -> (y, 2x + 3y)` walk. The old comment argued for deriving them and was
+right about the risk — a 5x5 grid of rotation amounts transcribed the other way round is a hash that is
+wrong for every input. They were not transcribed: the walk that used to run at startup emitted them. What
+pins them now is that all five functions are checked against published vectors and `node:crypto`, which no
+wrong offset survives.
+
+### Where this leaves the issue
+
+Every case named in it is done: ChaCha20 (4.7x), keccak (6.8x), and `sha256`/`sha512`, which turned out to
+need almost nothing — `a`..`h` are already locals and the message schedule genuinely wants an array, since
+it is indexed `t-2`, `t-7`, `t-15`, `t-16`. The current standing, all at 4 MB against `node:crypto`:
+
+| | wac | node | |
+| --- | --- | --- | --- |
+| sha256 | 165 MB/s | 2182 MB/s | 13x |
+| sha512 | 238 MB/s | 1336 MB/s | 5.6x |
+| keccak256 / sha3-256 | 250 MB/s | 273 MB/s | 1.1x |
+| chacha20 | 339 MB/s | 821 MB/s | 2.4x, and node's includes Poly1305 |
+
+**SHA-256 is now the outlier**, and for a reason no amount of locals will fix: OpenSSL uses the SHA
+extensions, which are one instruction per round. That is a hardware gap, not a shape gap — worth saying
+plainly before somebody spends a week on it.
+
+The issue can close once somebody agrees the remaining generate-or-unroll question no longer has a
+subject. wac 0074 is where the language-level version of it went.
