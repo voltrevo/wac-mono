@@ -26,7 +26,7 @@ Complete, both directions.
 `gunzipStream` does neither:
 
 ```wac
-export i32 gunzipStream(fn[u8[]()] read, fn[bool(u8[])] write)
+export i32 gunzipStream(fn[Read()] read, fn[bool(u8[])] write)
 ```
 
 It pulls input through `read` and hands output to `write` as it is produced, holding only a
@@ -217,14 +217,16 @@ level 9.
   vectorise match comparison at all. Native CRC also uses carry-less multiply,
   which wasm has no equivalent of — that gap is structural rather than fixable.
 
-## Known limitations## Known limitations## Known limitations
+## Known limitations
 
 - **Single-member only.** Concatenated gzip members are legal; this reads the
   first and then fails the trailer check. It traps rather than silently
   returning a prefix of the data.
 - **One block per stream.** Fine up to a point, but a long input with shifting
   statistics would compress better split into blocks with their own codes.
-- **Whole-buffer, not streaming.** Input and output are both fully in memory.
+- **The one-shot entry points are whole-buffer.** `gunzipBytes`, `inflate` and the `gzipStored` /
+  `gzipFixed` / `gzipDynamic` / `gzipBest` family hold input and output in memory; `gunzipStream`
+  and `gzipStream` do not — see *Streaming* above.
 
 `u8[]` crosses the wasm boundary as a `Uint8Array` via wac's bindgen, so the
 exports are plain `(data: Uint8Array) => Uint8Array` on the JS side.

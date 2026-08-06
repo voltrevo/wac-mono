@@ -4,6 +4,7 @@
   },
   "tasks": {
     "bench": "deno run -A tools/bench.ts",
+    "bench:hash": "deno run -A packages/crypto/bench/hash.ts",
     "bench:zstd": "deno run -A packages/zstd/bench/ratio.ts",
     "bench:zstd-speed": "deno run -A packages/zstd/bench/speed.ts",
     "bench:json": "deno run -A packages/json/bench/throughput.ts",

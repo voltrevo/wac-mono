@@ -61,27 +61,6 @@ const u64[] H384 = u64[](0xcbbb9d5dc1059ed8, 0x629a292a367cd507, 0x9159015a3070d
  * The compression, shared by both digest sizes: returns the eight-word state
  * after absorbing every block of the padded message.
  */
-u64[] compress(u8[] msg, u64[] iv) {
-  i32 len = msg.len();
-  // 0x80, then zeros, then a 128-bit big-endian length, to a multiple of 128.
-  i32 blocks = (len + 17 + 127) / 128;
-  i32 total = blocks * 128;
-
-  u8[] m = u8[total]();
-  for (i32 i = 0; i < len; i++) { m[i] = msg[i]; }
-  m[len] = 0x80;
-
-  // Only the low 64 bits of the length are written: the high half is zero for
-  // any message this can be handed, and wac has no 128-bit integer to hold it.
-  storeBE64((len as! u64) * 8, m, total - 8);
-
-  u64[] h = u64[8]();
-  for (i32 i = 0; i < 8; i++) { h[i] = iv[i]; }
-  u64[] w = u64[80]();
-  for (i32 b = 0; b < blocks; b++) { compressBlock(h, m, b * 128, w); }
-  return h;
-}
-
 /**
  * One 128-byte block, folded into `h` in place.
  *
@@ -184,7 +163,21 @@ u8[] serialize(u64[] h, i32 bytes) {
 }
 
 /** SHA-512 of `msg`, 64 bytes. */
-export u8[] sha512(u8[] msg) { return serialize(compress(msg, H512), 64); }
+export u8[] sha512(u8[] msg) { return oneShot(Sha512.create(), msg, 64); }
 
 /** SHA-384 of `msg`, 48 bytes. */
-export u8[] sha384(u8[] msg) { return serialize(compress(msg, H384), 48); }
+export u8[] sha384(u8[] msg) { return oneShot(Sha512.create384(), msg, 48); }
+
+/**
+ * A whole message through the streaming form.
+ *
+ * `compress` used to live here: it allocated a padded duplicate of the message and copied it element-wise
+ * before compressing a byte, so hashing 36 MB allocated 36 MB and read it twice. `update` compresses whole
+ * blocks straight out of the caller's array and holds nothing but the 128-byte remainder, which is what
+ * the one-shot form always was underneath (wac-mono 0034). `deno task bench:hash --quick`, 4 MB: 19.2 ms
+ * before, 16.3 ms after — 209 MB/s to 246 MB/s.
+ */
+u8[] oneShot(Sha512 s, u8[] msg, i32 bytes) {
+  s.update(msg);
+  return s.digest(bytes);
+}

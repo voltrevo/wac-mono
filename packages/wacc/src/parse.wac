@@ -1701,8 +1701,9 @@ Decl parseImport(P p) {
   }
   p.expect(kRbrace());
   // `from` lexes as an ordinary identifier — it stopped being a keyword so that
-  // `slice(a, from, to)` could name its argument — and only an import clause can put
-  // one here, which is what makes matching it by text safe.
+  // `slice(a, from, to)` could name its argument. Any identifier is taken here rather than that
+  // one: only an import clause can put a word in this position, so the reference's message is the
+  // one that names it, and this parser has no error code for "the wrong contextual keyword".
   if (p.at1(kIdent())) { p.advance(); } else { p.fail(perrExpected()); }
   // A quoted specifier is a path. A bare word is `core`, the module the compiler ships — it is not
   // a file, so it is not quoted, and there is nothing here to resolve it against.
