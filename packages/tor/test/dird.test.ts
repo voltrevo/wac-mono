@@ -16,7 +16,7 @@ import "../../../harness/spawnRetry.ts";
 
 const generated = JSON.parse(
   await Deno.readTextFile(new URL("data/hsdesc_generated.json", import.meta.url)),
-) as { descriptor: string; blindPublic: string };
+) as { descriptor: string; descriptorNext: string; blindPublic: string };
 const consensusVector = JSON.parse(
   await Deno.readTextFile(new URL("data/consensus_generated.json", import.meta.url)),
 ) as { consensus: string; descriptor: string };
@@ -25,6 +25,8 @@ const certVector = JSON.parse(
 ) as { certificate: string };
 
 const DESCRIPTOR = generated.descriptor;
+/** The same service, one revision later — what a republishing service actually sends. */
+const NEWER = generated.descriptorNext;
 const QUERY = btoa(
   String.fromCharCode(...generated.blindPublic.match(/../g)!.map((h) => parseInt(h, 16))),
 ).replace(/=+$/, "");
@@ -160,11 +162,38 @@ Deno.test("dird publishes and serves an onion service descriptor", async () => {
     const still = await get(port, `/tor/hs/3/${QUERY}`);
     assertEquals(still.body, DESCRIPTOR, "and a refused upload does not disturb what is held");
 
-    // ── Republishing replaces rather than appends ──
-    assertEquals((await post(port, DESCRIPTOR)).status, 200, "the same service may publish again");
-    // Two uploads, and the directory still holds one descriptor. A store that appended would serve
-    // whichever copy the search reached first, which over a service's lifetime is the stale one — and
-    // the served bytes cannot tell the two apart, so the count is the only honest signal.
+    // ── Republishing: strictly newer, or refused ──
+    // tor's `cache_store_v3_as_dir` replaces only when the revision counter is greater, so an
+    // unchanged descriptor uploaded twice is a 400 rather than a no-op 200. This case asserted 200
+    // until the sequence was put to a real HSDir, which refused it.
+    assertEquals(
+      (await post(port, DESCRIPTOR)).status,
+      400,
+      "an unchanged descriptor is refused the second time, as tor refuses it",
+    );
+    assertEquals(
+      (await get(port, `/tor/hs/3/${QUERY}`)).body,
+      DESCRIPTOR,
+      "and what is held is untouched by the refusal",
+    );
+
+    assertEquals((await post(port, NEWER)).status, 200, "a newer revision is accepted");
+    assertEquals(
+      (await get(port, `/tor/hs/3/${QUERY}`)).body,
+      NEWER,
+      "and replaces what was held rather than joining it",
+    );
+    // An older descriptor arriving late must not undo the newest publication — the failure that
+    // makes a service unreachable while every log line says it published.
+    assertEquals((await post(port, DESCRIPTOR)).status, 400, "the older one is refused");
+    assertEquals(
+      (await get(port, `/tor/hs/3/${QUERY}`)).body,
+      NEWER,
+      "and the newer descriptor still stands",
+    );
+    // Two accepted uploads, and the directory still holds one descriptor. A store that appended
+    // would serve whichever copy the search reached first, which over a service's lifetime is the
+    // stale one — and the count is the only signal that tells the two apart.
     await waitFor(/stored a descriptor, 1 held[\s\S]*stored a descriptor, 1 held/,
                   "stored one descriptor twice");
 

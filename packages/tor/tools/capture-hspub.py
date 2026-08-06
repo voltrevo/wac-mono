@@ -45,16 +45,24 @@ def build(root, out):
         sys.exit(f"compiling the probe failed:\n{r.stderr}")
 
 
-def ask(probe, tmp, desc, query):
-    """Run the probe over one descriptor and one query, and report what tor did with each."""
-    p = pathlib.Path(tmp) / "desc.txt"
-    p.write_text(desc)
-    r = subprocess.run([str(probe), str(p), query], capture_output=True, text=True)
+def ask(probe, tmp, descs, query):
+    """Upload `descs` in order to one fresh HSDir cache, and report what tor did with each."""
+    if isinstance(descs, str):
+        descs = [descs]
+    paths = []
+    for i, d in enumerate(descs):
+        p = pathlib.Path(tmp) / f"desc{i}.txt"
+        p.write_text(d)
+        paths.append(str(p))
+    r = subprocess.run([str(probe), query] + paths, capture_output=True, text=True)
     got = dict(line.split(": ", 1) for line in r.stdout.splitlines() if ": " in line)
+    stored = [got.get(f"stored[{i}]") == "yes" for i in range(len(descs))]
     return dict(
-        stored=got.get("stored") == "yes",
+        stored=stored[0],
+        storedEach=stored,
+        served=int(got.get("served", -1)),
         lookup=got.get("lookup", "none"),
-        identical=got.get("identical") == "yes",
+        identical=got.get("served", "-1") == "0",
         accepted=r.returncode == 0,
     )
 
@@ -73,6 +81,30 @@ def main(argv):
         real = ask(probe, tmp, desc, query)
         if not (real["stored"] and real["lookup"] == "hit" and real["identical"]):
             sys.exit(f"an HSDir would not publish our descriptor: {real}")
+
+        # The sequence rules. An HSDir replaces what it holds only when the revision counter is
+        # strictly greater, so which descriptor a client is served depends on the order uploads
+        # arrived — and a service that republished an unchanged document would be refused. None of
+        # this is visible from one upload, which is why `genhsdesc` emits a second document that
+        # differs from the first only in that counter.
+        newer = gen["descriptorNext"]
+        sequences = [
+            dict(name="the newer revision replaces the older",
+                 order=["current", "next"], result=ask(probe, tmp, [desc, newer], query)),
+            dict(name="an older revision does not overwrite a newer",
+                 order=["next", "current"], result=ask(probe, tmp, [newer, desc], query)),
+            dict(name="an unchanged descriptor is refused the second time",
+                 order=["current", "current"], result=ask(probe, tmp, [desc, desc], query)),
+        ]
+        for s_ in sequences:
+            if s_["result"]["storedEach"][0] is not True:
+                sys.exit(f"the first upload of {s_['name']!r} was refused")
+        if sequences[0]["result"]["storedEach"] != [True, True]:
+            sys.exit("tor did not accept a strictly newer revision")
+        if sequences[1]["result"]["storedEach"] != [True, False]:
+            sys.exit("tor accepted an older revision over a newer one")
+        if sequences[2]["result"]["storedEach"] != [True, False]:
+            sys.exit("tor accepted an unchanged descriptor twice")
 
         # Each control is a descriptor tor must refuse, or a name it must not find. Without them a
         # probe that returned "stored" unconditionally would look identical to this one.
@@ -122,6 +154,9 @@ def main(argv):
         descriptorLength=len(desc),
         stored=real["stored"],
         servedIdentical=real["identical"],
+        revision=gen["revision"],
+        revisionNext=gen["revisionNext"],
+        sequences=sequences,
         controls=controls,
     ), sys.stdout, indent=1)
     sys.stdout.write("\n")

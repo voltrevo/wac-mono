@@ -8,6 +8,64 @@
  "descriptorLength": 14103,
  "stored": true,
  "servedIdentical": true,
+ "revision": 42,
+ "revisionNext": 43,
+ "sequences": [
+  {
+   "name": "the newer revision replaces the older",
+   "order": [
+    "current",
+    "next"
+   ],
+   "result": {
+    "stored": true,
+    "storedEach": [
+     true,
+     true
+    ],
+    "served": 1,
+    "lookup": "hit",
+    "identical": false,
+    "accepted": true
+   }
+  },
+  {
+   "name": "an older revision does not overwrite a newer",
+   "order": [
+    "next",
+    "current"
+   ],
+   "result": {
+    "stored": true,
+    "storedEach": [
+     true,
+     false
+    ],
+    "served": 0,
+    "lookup": "hit",
+    "identical": true,
+    "accepted": true
+   }
+  },
+  {
+   "name": "an unchanged descriptor is refused the second time",
+   "order": [
+    "current",
+    "current"
+   ],
+   "result": {
+    "stored": true,
+    "storedEach": [
+     true,
+     false
+    ],
+    "served": 1,
+    "lookup": "hit",
+    "identical": false,
+    "accepted": true
+   }
+  }
+ ],
  "controls": [
   {
    "name": "one byte of the encrypted body flipped",
@@ -18,6 +76,10 @@
    },
    "result": {
     "stored": false,
+    "storedEach": [
+     false
+    ],
+    "served": -1,
     "lookup": "none",
     "identical": false,
     "accepted": false
@@ -32,6 +94,10 @@
    },
    "result": {
     "stored": false,
+    "storedEach": [
+     false
+    ],
+    "served": -1,
     "lookup": "none",
     "identical": false,
     "accepted": false
@@ -46,6 +112,10 @@
    },
    "result": {
     "stored": false,
+    "storedEach": [
+     false
+    ],
+    "served": -1,
     "lookup": "none",
     "identical": false,
     "accepted": false
@@ -59,6 +129,10 @@
    },
    "result": {
     "stored": false,
+    "storedEach": [
+     false
+    ],
+    "served": -1,
     "lookup": "none",
     "identical": false,
     "accepted": false
@@ -71,6 +145,10 @@
    },
    "result": {
     "stored": true,
+    "storedEach": [
+     true
+    ],
+    "served": -1,
     "lookup": "miss",
     "identical": false,
     "accepted": false

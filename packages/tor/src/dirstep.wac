@@ -28,7 +28,7 @@ import { Parsed, parseRequest } from "../../http/src/request.wac";
 import {
   DirDocuments, dirResponse, hsPublishResponseBytes, hsPublishVersion,
 } from "./dirserve.wac";
-import { PUB_OK, Checked, checkForPublication } from "./hsstore.wac";
+import { PUB_NOT_NEWER, PUB_OK, Checked, checkForPublication, revisionOf } from "./hsstore.wac";
 
 /** `HS_DESC_MAX_LEN`, since a descriptor is the only body a directory accepts. */
 export const i32 MAX_BODY = 50000;
@@ -54,9 +54,12 @@ DirAction answer(u8[] response) { return DirAction(true, response, u8[0](), u8[0
 /**
  * The reply to `pending`, or "not yet".
  *
- * `docs` answers the GETs. A publish does not consult it: what a directory already holds has no
- * bearing on whether a new descriptor is well-formed, and mixing the two would make the verdict
- * depend on the order uploads arrived.
+ * `docs` answers the GETs, and a publish consults it too. That is not an aesthetic choice: tor's
+ * `cache_store_v3_as_dir` replaces a held descriptor only when the new one's revision counter is
+ * **strictly greater**, so the verdict on an upload genuinely does depend on what arrived before it.
+ * An earlier version of this comment claimed the opposite, on the reasoning that well-formedness is a
+ * property of the document alone. It is — but acceptance is not, and a directory that replaced
+ * unconditionally would let a replayed older descriptor undo a service's most recent publication.
  */
 export DirAction dirStep(u8[] pending, DirDocuments docs) {
   match (parseRequest(pending, MAX_BODY)) {
@@ -68,6 +71,13 @@ export DirAction dirStep(u8[] pending, DirDocuments docs) {
         Checked checked = checkForPublication(request.body, 0);
         if (checked.reason != PUB_OK) {
           return DirAction(true, hsPublishResponseBytes(false), u8[0](), u8[0](), checked.reason);
+        }
+        // Strictly greater, matching tor: re-uploading an unchanged descriptor is refused, and so
+        // is an older one arriving late. A service increments the counter on every publication, so
+        // the only way to hit this is a replay or a service that has lost track of its own state.
+        i64 held = heldRevision(docs, checked.blindedKey);
+        if (held >= 0 && held >= checked.revision) {
+          return DirAction(true, hsPublishResponseBytes(false), u8[0](), u8[0](), PUB_NOT_NEWER);
         }
         return DirAction(true, hsPublishResponseBytes(true), request.body, checked.blindedKey,
                          PUB_OK);
@@ -110,6 +120,14 @@ export DirDocuments filed(DirDocuments docs, u8[] descriptor, u8[] blindedKey, i
   return DirDocuments(docs.consensus, docs.consensusMicrodesc, docs.certificate, docs.descriptors,
                       docs.descriptorDigests, docs.fingerprint, docs.microdescriptors,
                       docs.microdescDigests, descs, keys);
+}
+
+/** The revision counter of the descriptor already filed under `blindedKey`, or -1 if none is. */
+i64 heldRevision(DirDocuments docs, u8[] blindedKey) {
+  for (i32 i = 0; i < docs.hsBlindedKeys.len(); i++) {
+    if (sameBytes(docs.hsBlindedKeys[i], blindedKey)) { return revisionOf(docs.hsDescriptors[i]); }
+  }
+  return -1 as i64;
 }
 
 bool sameBytes(u8[] a, u8[] b) {

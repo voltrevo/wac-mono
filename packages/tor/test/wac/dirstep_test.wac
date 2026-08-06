@@ -12,12 +12,16 @@
 import { T } from "../../../wactest/src/assert.wac";
 import { DirAction, dirStep, filed } from "../../src/dirstep.wac";
 import { DirDocuments } from "../../src/dirserve.wac";
-import { PUB_OK } from "../../src/hsstore.wac";
+import { PUB_NOT_NEWER, PUB_OK, revisionOf } from "../../src/hsstore.wac";
 
 const i32 D_DESCRIPTOR = 0;
 const i32 D_BLINDED = 1;
 const i32 D_CONTROL_COUNT = 2;
 const i32 D_CONTROL = 3;      // a[0] = index: bytes tor's own HSDir cache refused
+const i32 D_NEXT = 4;         // the same service's descriptor, one revision later
+const i32 D_SEQUENCE = 5;     // a[0] = index, a[1] = position: the document tor was given
+const i32 D_SEQ_COUNT = 6;
+const i32 D_SEQ_STORED = 7;   // a[0] = index: one byte per position, 1 if tor kept it
 
 u8[] none() { return u8[0](); }
 
@@ -135,6 +139,84 @@ export string test_republishing_replaces(fn[u8[](i32, u8[], u8[])] ref) {
 
   t.eqI32(filed(empty(), desc, u8[31](), 4).hsDescriptors.len(), 0, "a name that is not a key files nothing");
   t.eqI32(filed(empty(), u8[0](), key, 4).hsDescriptors.len(), 0, "and nothing files nothing");
+  return t.report();
+}
+
+/**
+ * Two uploads in a row, and the same decision tor made about each.
+ *
+ * This is the rule a republishing service depends on and the one a single upload cannot show: an
+ * HSDir replaces what it holds only when the revision counter is **strictly greater**. The
+ * consequence that matters is the third case — a service re-uploading an unchanged descriptor is
+ * *refused*, not quietly accepted — and the one that matters for correctness is the second, where an
+ * older descriptor arriving late must not undo the newest publication.
+ *
+ * The sequences and their outcomes are tor's, recorded by `capture-hspub.py` against a real cache.
+ */
+export string test_a_second_upload_follows_tors_rule(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(D_SEQ_COUNT, none(), none())[0];
+  t.isTrue(n >= 3, "there are several sequences");
+
+  for (i32 si = 0; si < n; si++) {
+    u8[] wanted = ref(D_SEQ_STORED, at(si), none());
+    DirDocuments docs = empty();
+    for (i32 pos = 0; pos < wanted.len(); pos++) {
+      u8[] body = ref(D_SEQUENCE, at(si), at(pos));
+      DirAction a = dirStep(publishRequest(body), docs);
+      t.isTrue(a.ready, "each upload is answered");
+      bool kept = a.descriptor.len() > 0;
+      t.eqI32(kept ? 1 : 0, wanted[pos], "kept exactly when tor kept it");
+      if (kept) {
+        docs = filed(docs, a.descriptor, a.blindedKey, 4);
+        t.isTrue(contains(a.response, "200"), "and the service is told so");
+      } else {
+        t.isTrue(contains(a.response, "400"), "or told it was refused");
+        t.eqI32(a.refusedFor, PUB_NOT_NEWER, "for not being newer than what is held");
+      }
+    }
+    // Whatever the order, the directory ends up holding the highest revision it was offered — which
+    // for the sequence that uploads one document twice is that document, not a newer one.
+    i64 highest = -1 as i64;
+    for (i32 pos = 0; pos < wanted.len(); pos++) {
+      i64 r = revisionOf(ref(D_SEQUENCE, at(si), at(pos)));
+      if (r > highest) { highest = r; }
+    }
+    t.eqI32(docs.hsDescriptors.len(), 1, "one service is one entry however many times it uploaded");
+    t.eqI64(revisionOf(docs.hsDescriptors[0]), highest,
+            "and the descriptor held is the highest revision uploaded, whatever the order");
+  }
+  return t.report();
+}
+
+/**
+ * The comparison is against *this* service's descriptor, not whatever the directory holds.
+ *
+ * A directory holds many services at once, and their revision counters have nothing to do with one
+ * another — they are per-service sequence numbers, not a clock. A lookup that ignored the name would
+ * refuse a new service's first upload whenever some other service happened to be further along, and
+ * with one service stored nothing would ever notice.
+ */
+export string test_another_services_revision_does_not_block_this_one(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  // Another service, further along: revision 43 under a name that is not ours.
+  DirDocuments docs = filed(empty(), ref(D_NEXT, none(), none()), u8[32](fill: 5), 4);
+  t.eqI32(docs.hsDescriptors.len(), 1, "the other service is held");
+
+  DirAction a = dirStep(publishRequest(ref(D_DESCRIPTOR, none(), none())), docs);
+  t.isTrue(a.ready, "answered");
+  t.eqI32(a.refusedFor, PUB_OK, "our first upload is not refused for someone else's counter");
+  t.isTrue(a.descriptor.len() > 0, "and is filed");
+  t.eqBytes(a.blindedKey, ref(D_BLINDED, none(), none()), "under our own name");
+  return t.report();
+}
+
+/** The counter is read from the document, so it cannot disagree with what was stored. */
+export string test_the_revision_comes_from_the_document(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqI64(revisionOf(ref(D_DESCRIPTOR, none(), none())), 42 as i64, "the first revision");
+  t.eqI64(revisionOf(ref(D_NEXT, none(), none())), 43 as i64, "and the next");
+  t.eqI64(revisionOf("hs-descriptor 3\n".toBytes()), -1 as i64, "a document with none says so");
   return t.report();
 }
 

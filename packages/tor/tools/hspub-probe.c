@@ -14,10 +14,16 @@
  * lookup here is by the base64 blinded key our `hsdirFetchPath` puts in the URL, and a match means
  * the two agree about the name.
  *
- *   hspub-probe <descriptor-file> <blinded-key-base64>
+ *   hspub-probe <blinded-key-base64> <descriptor-file>...
  *
- * Prints `stored: yes|no`, `lookup: hit|miss`, and `identical: yes|no` — whether the bytes an
- * HSDir would serve are the bytes we uploaded, since tor stores the encoded descriptor verbatim.
+ * Prints `stored[i]: yes|no` per file in the order given, then `lookup: hit|miss` and `served: <i>`
+ * — which of the uploaded files an HSDir would now hand out, since tor stores the encoded descriptor
+ * verbatim and a lookup returns exactly what it kept.
+ *
+ * More than one file is how the *sequence* rules are observed. An HSDir replaces what it holds only
+ * when the new descriptor's revision counter is strictly greater (`cache_store_v3_as_dir`), so
+ * re-uploading an unchanged descriptor is refused and an older one must not overwrite a newer. None
+ * of that is visible from a single upload, and all of it is what a republishing service depends on.
  *
  * Build it the way capture-blind.py builds its probe — against a configured and built tor tree's
  * libtor.a.
@@ -59,7 +65,7 @@ int
 main(int argc, char **argv)
 {
   if (argc < 3) {
-    fprintf(stderr, "usage: hspub-probe <descriptor-file> <blinded-key-base64>\n");
+    fprintf(stderr, "usage: hspub-probe <blinded-key-base64> <descriptor-file>...\n");
     return 2;
   }
   /* Unbuffered, because tor aborts the process on a failed assertion and buffered output is lost
@@ -96,22 +102,30 @@ main(int argc, char **argv)
   }
   hs_init();
 
-  size_t desc_len = 0;
-  char *desc = slurp(argv[1], &desc_len);
-  if (!desc) {
-    fprintf(stderr, "cannot read %s\n", argv[1]);
-    return 2;
-  }
+  const char *query = argv[1];
+  int files = argc - 2;
+  char *descs[64];
+  size_t lens[64];
+  if (files > 64) { fprintf(stderr, "too many files\n"); return 2; }
 
-  int stored = hs_cache_store_as_dir(desc);
-  printf("stored: %s\n", stored == 0 ? "yes" : "no");
-  if (stored != 0) {
-    printf("FAILED\nreason: an HSDir would not accept this descriptor\n");
+  int any_stored = 0;
+  for (int i = 0; i < files; i++) {
+    descs[i] = slurp(argv[2 + i], &lens[i]);
+    if (!descs[i]) {
+      fprintf(stderr, "cannot read %s\n", argv[2 + i]);
+      return 2;
+    }
+    int stored = hs_cache_store_as_dir(descs[i]);
+    printf("stored[%d]: %s\n", i, stored == 0 ? "yes" : "no");
+    if (stored == 0) any_stored = 1;
+  }
+  if (!any_stored) {
+    printf("FAILED\nreason: an HSDir would not accept any of these descriptors\n");
     return 1;
   }
 
   const char *got = NULL;
-  int found = hs_cache_lookup_as_dir(3, argv[2], &got);
+  int found = hs_cache_lookup_as_dir(3, query, &got);
   printf("lookup: %s\n", found == 1 ? "hit" : (found == 0 ? "miss" : "bad-query"));
   if (found != 1) {
     printf("FAILED\nreason: nothing is filed under that blinded key\n");
@@ -119,13 +133,17 @@ main(int argc, char **argv)
   }
 
   /* An HSDir serves back exactly what it was given; anything else and a client's signature check
-   * over the document would fail. */
-  int same = (strlen(got) == desc_len) && memcmp(got, desc, desc_len) == 0;
-  printf("identical: %s\n", same ? "yes" : "no");
+   * over the document would fail. Naming *which* file came back is what distinguishes "it kept the
+   * new one" from "it kept the old one" — two outcomes a byte count cannot tell apart, since every
+   * revision of one service's descriptor is the same length. */
+  int served = -1;
+  for (int i = 0; i < files; i++) {
+    if (strlen(got) == lens[i] && memcmp(got, descs[i], lens[i]) == 0) { served = i; }
+  }
+  printf("served: %d\n", served);
   printf("served_len: %zu\n", strlen(got));
-  printf("uploaded_len: %zu\n", desc_len);
-  if (!same) {
-    printf("FAILED\nreason: the bytes an HSDir would serve are not the ones uploaded\n");
+  if (served < 0) {
+    printf("FAILED\nreason: the bytes an HSDir would serve are none of the ones uploaded\n");
     return 1;
   }
 

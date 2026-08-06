@@ -10,6 +10,10 @@ const D_DESCRIPTOR = 0;
 const D_BLINDED = 1;
 const D_CONTROL_COUNT = 2;
 const D_CONTROL = 3;
+const D_NEXT = 4;
+const D_SEQUENCE = 5;
+const D_SEQ_COUNT = 6;
+const D_SEQ_STORED = 7;
 
 type Edit =
   | { kind: "replace"; offset: number; byte: string }
@@ -23,11 +27,29 @@ const v = JSON.parse(
   blindedKey: string;
   descriptorLength: number;
   controls: { name: string; edit: Edit; result: { accepted: boolean } }[];
+  sequences: { name: string; order: string[]; result: { storedEach: boolean[] } }[];
 };
 
 const generated = JSON.parse(
   await Deno.readTextFile(new URL("data/hsdesc_generated.json", import.meta.url)),
-) as { descriptor: string; blindPublic: string };
+) as { descriptor: string; descriptorNext: string; blindPublic: string };
+
+/** The document named by a sequence position — `current` or `next`. */
+const document = (which: string) =>
+  which === "next" ? generated.descriptorNext : generated.descriptor;
+
+if (generated.descriptor === generated.descriptorNext) {
+  throw new Error("the two revisions are the same document, so no sequence proves anything");
+}
+if (v.sequences.length < 3) throw new Error("too few sequences to show the rule");
+// Every sequence must have kept its first upload, or it is testing a rejection that happened for
+// some other reason entirely.
+for (const s of v.sequences) {
+  if (!s.result.storedEach[0]) throw new Error(`sequence ${s.name} was refused from the start`);
+}
+if (!v.sequences.some((s) => s.result.storedEach.includes(false))) {
+  throw new Error("no sequence records a refusal, so the rule is not being observed");
+}
 
 const hex = (h: string) => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
 const utf8 = (s: string) => new TextEncoder().encode(s);
@@ -50,7 +72,7 @@ function control(i: number): string {
   return d;
 }
 
-function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
+function ref(what: number, a: Uint8Array, b: Uint8Array): Uint8Array {
   switch (what) {
     case D_DESCRIPTOR:
       return utf8(generated.descriptor);
@@ -60,6 +82,14 @@ function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
       return new Uint8Array([v.controls.length]);
     case D_CONTROL:
       return utf8(control(a[0]));
+    case D_NEXT:
+      return utf8(generated.descriptorNext);
+    case D_SEQ_COUNT:
+      return new Uint8Array([v.sequences.length]);
+    case D_SEQUENCE:
+      return utf8(document(v.sequences[a[0]].order[b[0]]));
+    case D_SEQ_STORED:
+      return Uint8Array.from(v.sequences[a[0]].result.storedEach.map((k) => (k ? 1 : 0)));
     default:
       throw new Error(`unknown vector field ${what}`);
   }

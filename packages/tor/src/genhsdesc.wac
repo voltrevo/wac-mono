@@ -43,6 +43,19 @@ import { x25519Base } from "../../crypto/src/x25519.wac";
 /** Two hours, which is what a real service asks for. */
 const i32 LIFETIME_MINUTES = 180;
 
+/**
+ * The revision counter, and the one after it.
+ *
+ * Two documents are emitted for the same service, differing only in this number. That is what makes
+ * the *sequence* rules testable: an HSDir replaces a descriptor only when the new one's revision
+ * counter is strictly greater, so re-uploading an unchanged descriptor is refused, and a document
+ * that arrives out of order must not overwrite a newer one. A single document cannot show any of
+ * that, and a second one edited by hand would not verify — the revision line is inside the span the
+ * signature covers.
+ */
+const i64 REVISION = 42;
+const i64 REVISION_NEXT = 43;
+
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 2) {
     core.warn("usage: genhsdesc <descriptor-out> <vector-out>");
@@ -158,15 +171,18 @@ export i32 main(Core core, Cli cli) {
   // computes the same thing from the onion address alone, which is what makes the descriptor
   // decryptable by someone who has never spoken to the service.
   u8[] subcredEarly = subcredential(identityPublic, blindPublic);
-  u8[] inner = encryptLayer(innerPlain, blindPublic, subcredEarly, 42, innerSalt,
+  u8[] inner = encryptLayer(innerPlain, blindPublic, subcredEarly, REVISION, innerSalt,
                             encryptedConstant());
-  if (inner.len() == 0) {
+  u8[] innerNext = encryptLayer(innerPlain, blindPublic, subcredEarly, REVISION_NEXT, innerSalt,
+                                encryptedConstant());
+  if (inner.len() == 0 || innerNext.len() == 0) {
     core.warn("genhsdesc: could not encrypt the inner layer");
     return 1;
   }
 
   u8[] middle = padToBlock(superencryptedPlaintext(ephemeral, clients, inner));
-  if (middle.len() == 0) {
+  u8[] middleNext = padToBlock(superencryptedPlaintext(ephemeral, clients, innerNext));
+  if (middle.len() == 0 || middleNext.len() == 0) {
     core.warn("genhsdesc: could not build the superencrypted layer");
     return 1;
   }
@@ -175,15 +191,22 @@ export i32 main(Core core, Cli cli) {
   for (i32 i = 0; i < 16; i++) { salt[i] = (i * 23 + 11) & 0xFF; }
   // SECRET_DATA for this layer is the blinded public key; the subcredential is the service's.
   u8[] subcred = subcredEarly;
-  u8[] superencrypted = encryptLayer(middle, blindPublic, subcred, 42, salt,
+  u8[] superencrypted = encryptLayer(middle, blindPublic, subcred, REVISION, salt,
                                      superencryptedConstant());
-  if (superencrypted.len() == 0) {
+  u8[] superencryptedNext = encryptLayer(middleNext, blindPublic, subcred, REVISION_NEXT, salt,
+                                         superencryptedConstant());
+  if (superencrypted.len() == 0 || superencryptedNext.len() == 0) {
     core.warn("genhsdesc: could not encrypt the superencrypted layer");
     return 1;
   }
 
-  u8[] doc = descriptorDocument(LIFETIME_MINUTES, cert, 42, superencrypted, signSeed);
-  if (doc.len() == 0) {
+  u8[] doc = descriptorDocument(LIFETIME_MINUTES, cert, REVISION, superencrypted, signSeed);
+  // The same service, the same keys, the same introduction point — one revision later. Everything
+  // that differs between these two documents follows from the counter, including both ciphertexts,
+  // because the revision is part of the key derivation for each layer as well as a line in the text.
+  u8[] docNext = descriptorDocument(LIFETIME_MINUTES, cert, REVISION_NEXT, superencryptedNext,
+                                    signSeed);
+  if (doc.len() == 0 || docNext.len() == 0) {
     core.warn("genhsdesc: could not build the descriptor");
     return 1;
   }
@@ -191,6 +214,12 @@ export i32 main(Core core, Cli cli) {
   Change c = cli.writeFile(descOut, doc).wait();
   if (!c.ok()) {
     core.warn("genhsdesc: " + descOut + ": " + c.message);
+    return 1;
+  }
+
+  Change cn = cli.writeFile(descOut + ".next", docNext).wait();
+  if (!cn.ok()) {
+    core.warn("genhsdesc: " + descOut + ".next: " + cn.message);
     return 1;
   }
 
@@ -225,6 +254,8 @@ export i32 main(Core core, Cli cli) {
     "  \"superencrypted\": \"" + hex(superencrypted) + "\",\n" +
     "  \"lifetimeMinutes\": " + itoa(LIFETIME_MINUTES) + ",\n" +
     "  \"revision\": 42,\n" +
+    "  \"revisionNext\": 43,\n" +
+    "  \"descriptorNext\": \"" + jsonText(docNext) + "\",\n" +
     "  \"signedSpanLen\": " + itoa(signedSpanOf(doc).len()) + ",\n" +
     "  \"descriptor\": \"" + jsonText(doc) + "\"\n" +
     "}\n";

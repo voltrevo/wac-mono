@@ -36,8 +36,9 @@
 //
 // **Not checked here:** certificate expiry against a clock, unless the caller passes one — a
 // directory with no clock should refuse nothing on those grounds rather than guess — and the
-// revision-counter replacement rule, which needs the descriptor already held to compare against and
-// belongs where the store lives.
+// revision-counter replacement rule, which needs the descriptor already held to compare against.
+// `revisionOf` below is what a caller compares with; the decision is `dirStep`'s, because the reply
+// depends on it.
 
 import {
   certCertifiedKey, certSignedWithKey, certType, keywordInt, keywordValue, pemBlock, slice,
@@ -65,6 +66,7 @@ export const i32 PUB_NO_REVISION = 8;    // no `revision-counter`
 export const i32 PUB_NO_BODY = 9;        // no `superencrypted` block
 export const i32 PUB_SIGNATURE = 10;     // the document's own signature does not verify
 export const i32 PUB_EXPIRED = 11;       // the certificate expired, when a clock was supplied
+export const i32 PUB_NOT_NEWER = 12;     // a revision counter no greater than the one held
 
 /** The verdict, and the name — which is only meaningful when `reason` is `PUB_OK`. */
 export struct Checked {
@@ -138,3 +140,14 @@ u8[] b64Or(u8[] text) {
   return (decoded is null) ? u8[0]() : decoded!;
 }
 
+
+/**
+ * The revision counter of a descriptor already held, or -1.
+ *
+ * Read back out of the stored document rather than kept beside it. A parallel array of counters is a
+ * second copy of a number that is already in the bytes, and the two can drift — which would show up
+ * as a directory refusing an upload for being older than a descriptor it is not actually holding.
+ */
+export i64 revisionOf(u8[] descriptor) {
+  return keywordInt(descriptor, "revision-counter".toBytes());
+}
