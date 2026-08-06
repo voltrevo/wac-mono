@@ -31,6 +31,10 @@
 // **Function selectors are not prepended.** `encode` produces the argument tuple; a call is
 // `keccak256(signature)[0..4] ++ encode(...)`, and which signature a call has is the caller's business.
 
+// Decimal for the messages, from `packages/fmt`. Four private copies of `itoa` were deleted from this repo
+// today; a fifth here would have been a sixth by Friday.
+import { itoa } from "../../fmt/src/itoa.wac";
+
 /** A decoded value. `Word` is every static type; the ABI does not distinguish them once they are bytes. */
 export enum Value {
   /** Exactly 32 bytes, as they appear in the calldata. */
@@ -477,16 +481,4 @@ export Value[] listOf(Value v) {
     case Bytes(_): return none();
     case List(xs): return xs;
   }
-}
-
-string itoa(i32 v) {
-  if (v == 0) { return "0"; }
-  u8[] buf = u8[12]();
-  i32 n = 0;
-  i32 x = v < 0 ? 0 - v : v;
-  while (x > 0) { buf[n] = '0' + (x % 10); n++; x = x / 10; }
-  u8[] out = u8[n + (v < 0 ? 1 : 0)]();
-  if (v < 0) { out[0] = '-'; }
-  for (i32 i = 0; i < n; i++) { out[(v < 0 ? 1 : 0) + i] = buf[n - 1 - i]; }
-  return string.fromBytes(out);
 }

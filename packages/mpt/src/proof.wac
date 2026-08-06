@@ -43,6 +43,13 @@
 
 import { decode, Decoded, Item, itemsOf, bytesOf, isList } from "../../rlp/src/rlp.wac";
 import { keccak256 } from "../../crypto/src/keccak.wac";
+// The three helpers this needs already have homes: decimal in `fmt`, hex in `codec`, byte equality in
+// `std`. A verifier is not a reason to fork any of them — the copies this file started with were three of
+// the five `itoa`s in `packages/*/src`, and the drift they cause is measured elsewhere in this repo (the
+// i32-minimum bug was fixed in four copies separately).
+import { itoa } from "../../fmt/src/itoa.wac";
+import { encode as hexBytes } from "../../codec/src/hex.wac";
+import { bytesEq } from "../../std/src/hash.wac";
 
 /** What a proof established. */
 export struct Proved {
@@ -110,14 +117,14 @@ struct Walk {
  */
 Item? nodeAt(Walk w, u8[] want) {
   if (w.used >= w.nodes.len()) {
-    w.error = "the proof ends where a node hashing to " + hex(want) + " was expected";
+    w.error = "the proof ends where a node hashing to " + hexOf(want) + " was expected";
     return null;
   }
   u8[] raw = w.nodes[w.used];
   w.used = w.used + 1;
   u8[] got = keccak256(raw);
-  if (!sameBytes(got, want)) {
-    w.error = "node " + itoa(w.used - 1) + " hashes to " + hex(got) + ", but its parent named " + hex(want);
+  if (!bytesEq(got, want)) {
+    w.error = "node " + itoa(w.used - 1) + " hashes to " + hexOf(got) + ", but its parent named " + hexOf(want);
     return null;
   }
   Decoded d = decode(raw);
@@ -247,32 +254,5 @@ u8[] nibblesOf(u8[] b) {
   return out;
 }
 
-bool sameBytes(u8[] a, u8[] b) {
-  if (a.len() != b.len()) { return false; }
-  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
-  return true;
-}
-
-/** Lowercase hex, for the messages: a failure that names two hashes is a failure somebody can act on. */
-string hex(u8[] b) {
-  u8[] out = u8[b.len() * 2]();
-  for (i32 i = 0; i < b.len(); i++) {
-    i32 hi = b[i] >> 4;
-    i32 lo = b[i] & 15;
-    out[i * 2] = hi < 10 ? '0' + hi : 'a' + (hi - 10);
-    out[i * 2 + 1] = lo < 10 ? '0' + lo : 'a' + (lo - 10);
-  }
-  return string.fromBytes(out);
-}
-
-string itoa(i32 v) {
-  if (v == 0) { return "0"; }
-  u8[] buf = u8[12]();
-  i32 n = 0;
-  i32 x = v < 0 ? 0 - v : v;
-  while (x > 0) { buf[n] = '0' + (x % 10); n++; x = x / 10; }
-  u8[] out = u8[n + (v < 0 ? 1 : 0)]();
-  if (v < 0) { out[0] = '-'; }
-  for (i32 i = 0; i < n; i++) { out[(v < 0 ? 1 : 0) + i] = buf[n - 1 - i]; }
-  return string.fromBytes(out);
-}
+/** Lowercase hex for a message: a failure that names two hashes is one somebody can act on. */
+string hexOf(u8[] b) { return string.fromBytes(hexBytes(b)); }

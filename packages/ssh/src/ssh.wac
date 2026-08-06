@@ -26,6 +26,7 @@
 // channel — so byte-exact interleaving is not expressible. Filed as wac-mono 0014.
 
 import { Change, Cli, Core, FileResult, Socket } from "../../platform/src/platform.wac";
+import { itoa } from "../../fmt/src/itoa.wac";
 import { Client } from "./client.wac";
 import { KeyError, PrivateKey, readEd25519 } from "./privatekey.wac";
 import { Verdict, lookUp } from "./knownhosts.wac";
@@ -264,15 +265,4 @@ i32 atoi(string s) {
     if (v > 65535) { return -1; }
   }
   return s.len() == 0 ? -1 : v;
-}
-
-string itoa(i32 v) {
-  if (v == 0) { return "0"; }
-  string out = "";
-  i32 x = v;
-  while (x > 0) {
-    out = string.fromCodepoint(0x30 + (x % 10)) + out;
-    x = x / 10;
-  }
-  return out;
 }

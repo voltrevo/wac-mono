@@ -29,6 +29,7 @@
 // asking for any of them gets a refusal rather than silence.
 
 import { Buf } from "../../bytes/src/buf.wac";
+import { itoa } from "../../fmt/src/itoa.wac";
 import { Cli, Core, FileResult, Socket } from "../../platform/src/platform.wac";
 import { Conn, msgNewKeys } from "./conn.wac";
 import { clientVersion, clientVersionLine, Found, scanVersion, speaksV2, Version } from "./version.wac";
@@ -548,17 +549,6 @@ i32 atoi(string s) {
     if (v > 65535) { return -1; }
   }
   return s.len() == 0 ? -1 : v;
-}
-
-string itoa(i32 v) {
-  if (v == 0) { return "0"; }
-  string out = "";
-  i32 x = v;
-  while (x > 0) {
-    out = string.fromCodepoint(0x30 + (x % 10)) + out;
-    x = x / 10;
-  }
-  return out;
 }
 
 bool sameBytes(u8[] a, u8[] b) {
