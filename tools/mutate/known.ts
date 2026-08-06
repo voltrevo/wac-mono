@@ -313,6 +313,17 @@ export const KNOWN_SURVIVORS: KnownSurvivor[] = [
       "A `pop` that left the old value in place would make the guard the only thing still correct, " +
       "and that is exactly the change somebody adds without reading this accessor. wac-mono 0005.",
   },
+  {
+    name: "extreme/box/applets/httpd/endsWithSlash",
+    why:
+      "`httpd` appends `index.html` to a directory target, and this decides whether a separator is " +
+      "needed first. Forcing it false gives `root/dir//index.html` — and a doubled separator resolves " +
+      "identically on every host this can run on: POSIX ignores it, and the browser host's own resolver " +
+      "drops empty segments explicitly (`split(\"/\").filter((p) => p !== \"\")` in `browser.ts`), which " +
+      "is the one place where the resolution is our code rather than the kernel's. So there is no request " +
+      "whose answer differs, and no test could find one. It stays because a path built by hand is read by " +
+      "people in log lines, and `//` in one is a question somebody has to answer twice. wac-mono 0005.",
+  },
   // ── the browser examples ────────────────────────────────────────────────────
   //
   // These are page bodies, and the only thing that drives a page is
