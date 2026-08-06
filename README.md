@@ -59,7 +59,7 @@ Ethereum's own fixtures, `ssz` is its serialization and Merkle proofs, and `ligh
 the Altair sync protocol through all four of Ethereum's `light_client/sync` cases. On top of
 those, the execution side: `rlp`, `abi`, `ens`, and `mpt` — Merkle-Patricia proofs, which is
 what turns "a provider told me" into "the state root I already verified commits to this". See
-[design/0003](design/0003-an-ethereum-distribution.md) for where that is going.
+[design/0003](design/0003-an-ethereum-centric-reference-distribution.md) for where that is going.
 
 **`fs` — a filesystem that belongs to the program**, in memory or mounted on the host's, so a
 session can be sealed off from the machine that started it.

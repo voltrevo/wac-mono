@@ -385,7 +385,7 @@ not offer.
 and the programs themselves through `Sink` — but `> file` gathers the command's output in the shell and
 writes it afterwards, so a redirected command is bounded by memory however well it streams:
 `seq 1 2000000000 > out` traps where bash writes twenty gigabytes.
-[Issue 0070](../../issues/open/0070-a-redirection-collects-a-childs-whole-output-before-writing-the-file.md)
+[Issue 0070](../../issues/closed/0070-a-redirection-collects-a-childs-whole-output-before-writing-the-file.md)
 is that, with `openOutput` named as the capability it wants. `2>` and `2>&1` are not implemented at
 all, and say so.
 
@@ -468,7 +468,7 @@ relational and literal mutants and is **3052 mutants**, which has never been run
 per-test selection in `tools/mutate.ts` does nothing at all for this package — every test file
 builds a binary and runs it as a child, so the coverage counters are in the wrong process and the
 tool reports `0/117 ran only the tests that reach them`. See
-[issue 0024](../../issues/open/0024-mutation-selection-is-inert-for-subprocess-tests-and-the-fallback-runs-them-worst-first.md).
+[issue 0024](../../issues/closed/0024-mutation-selection-is-inert-for-subprocess-tests-and-the-fallback-runs-them-worst-first.md).
 
 The three measurements answer different questions and none replaces the others. bash says what is
 *right*; coverage says what has *run*; mutation says what is *noticed*.

@@ -15,7 +15,8 @@ import { Vec } from "../../std/src/vec.wac";
 import { Relay } from "./directory.wac";
 import { Circuit, Received, gotData, gotEnd, gotConnected, gotExtended, gotBroken,
          gotDestroyed, extendedReply } from "./circuit.wac";
-import { splitResponse, isIdentity, Response } from "./dirclient.wac";
+import { hsPublishRequest, splitResponse, isIdentity, Response } from "./dirclient.wac";
+import { uploadOutcome } from "./hsupload.wac";
 import { encodeVersions, negotiateVersion, encodeNetinfo, encodeCreate2, decodeCreated2,
          cellSize, cellCommand, cellPayload, certsCount, handshakeNtor,
          cmdVersions, cmdNetinfo, cmdCerts, cmdAuthChallenge, cmdVpadding, cmdCreated2,
@@ -380,8 +381,19 @@ export u8[][] chunkRequest(u8[] request) {
   return out;
 }
 
-/** GET a directory document over the circuit, and return the body. */
-export u8[] fetchOverCircuit(Link l, Circuit c, string path) {
+/**
+ * One HTTP exchange with a directory over a BEGIN_DIR stream: send `request`, return the response.
+ *
+ * A GET and an upload differ only in the bytes sent and what the caller does with the answer, so they
+ * share this rather than each carrying a cell loop. That is not tidiness — the loop is where the
+ * SENDME accounting, the DESTROY handling and the stream teardown live, and a second copy of it would
+ * be a second place for those to be got subtly differently.
+ *
+ * A status of -1 means no response arrived at all: the circuit broke, or the directory closed the
+ * stream without answering. That is a different event from a directory that said no, and the two are
+ * separated here because a caller retries one and not the other.
+ */
+export Response requestOverCircuit(Link l, Circuit c, u8[] request) {
   i32 sid = c.beginStream();
   sendCells(l, c.beginDirCell(sid));
   u8[] raw = u8[0]();
@@ -391,18 +403,31 @@ export u8[] fetchOverCircuit(Link l, Circuit c, string path) {
     if (cell.len() == 0) { break; }
     Received got = c.receive(cell);
     if (got.toSend.len() > 0) { sendCells(l, got.toSend); }
-    if (got.kind == gotBroken() || got.kind == gotDestroyed()) { return u8[0](); }
+    if (got.kind == gotBroken() || got.kind == gotDestroyed()) {
+      return Response(-1, "", u8[0]());
+    }
     if (got.kind == gotConnected() && !connected) {
       connected = true;
-      sendRequest(l, c, sid, ("GET " + path + " HTTP/1.0\r\n" +
-                              "Accept-Encoding: identity\r\n\r\n").toBytes());
+      sendRequest(l, c, sid, request);
     } else if (got.kind == gotData()) {
       raw = concat(raw, got.data);
     } else if (got.kind == gotEnd()) {
       break;
     }
   }
-  Response r = splitResponse(raw);
+  return splitResponse(raw);
+}
+
+/** GET a directory document over the circuit, and return the body. */
+export u8[] fetchOverCircuit(Link l, Circuit c, string path) {
+  Response r = requestOverCircuit(l, c, ("GET " + path + " HTTP/1.0\r\n" +
+                                         "Accept-Encoding: identity\r\n\r\n").toBytes());
+  // A status of -1 is not an answer, and saying "the directory answered -1" would send whoever reads
+  // the log looking for a directory bug rather than a broken circuit.
+  if (r.status < 0) {
+    l.core.warn("tor: no answer for " + path + " — the circuit broke or the stream closed unanswered");
+    return u8[0]();
+  }
   if (r.status != 200) {
     l.core.warn("tor: the directory answered " + itoa(r.status) + " for " + path);
     return u8[0]();
@@ -412,6 +437,16 @@ export u8[] fetchOverCircuit(Link l, Circuit c, string path) {
     return u8[0]();
   }
   return r.body;
+}
+
+/**
+ * Upload a descriptor to one HSDir over the circuit, and say what happened.
+ *
+ * Returns one of the `UPLOAD_*` outcomes in `hsupload.wac`, which are tor's own three: uploaded,
+ * rejected, or something unexpected. The distinction is the point — see the note there.
+ */
+export i32 publishOverCircuit(Link l, Circuit c, u8[] descriptor, string host) {
+  return uploadOutcome(requestOverCircuit(l, c, hsPublishRequest(descriptor, host)).status);
 }
 
 export string itoa(i32 v) {
