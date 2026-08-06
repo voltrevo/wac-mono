@@ -369,3 +369,26 @@ callers — the worker then waits in `Atomics.wait` for an answer that can no lo
 hang exactly like this one. The loop now catches, says `the host responder stopped: …` on standard error,
 and fails every outstanding slot so the worker unparks with an error it can report. That is worth having
 even though it is not yet known to be this bug.
+
+### The load correlation is now the strongest signal (agent-a, 2026-08-06)
+
+Counting every run made while chasing this:
+
+| machine | runs | wedges |
+| --- | ---: | ---: |
+| load below 1 (idle) | 4 | **4** |
+| load 2–6 (another agent working) | 22 | 0 |
+
+Every wedge has been on an idle machine, and twenty-two consecutive runs under ordinary load were clean —
+twenty of them *after* the instrumentation landed, which is why the corrected slot dump has not yet been
+read at a wedge. That is the opposite of what the issue's title says about this class, and it is the most
+useful thing known about this particular one: **to reproduce it, wait for the machine to be quiet.**
+
+It also says something about the shape. A race that needs two events close together is likelier when
+everything is fast and nothing is descheduled; spreading the interleavings out with load hides it. The
+candidate that fits is the shell's `RECV` on a spawned applet's output racing that applet's `end()` — a
+`next()` registered at the moment the queue ends, or an `end()` that lands between a `take` and a park.
+
+The next occurrence will print `RECV(h=N)`, the responder's sweep count and whether it is still running,
+which distinguishes those without another round of guessing. The hunt is a loop of the corpus with a ten
+second settle between runs; on a quiet machine it has hit on the first run three times out of four.
