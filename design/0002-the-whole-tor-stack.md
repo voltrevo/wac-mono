@@ -382,7 +382,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
-| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. **Not done:** the service program — the client side of the upload, and the loop that establishes introduction points and answers INTRODUCE2 |
+| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. The **descriptor build is a function** now — `buildDescriptor` takes a service's own introduction points, time period and revision — and is checked by both oracles on three variants, not just the committed fixture. **Not done:** the service program — the client side of the upload, and the loop that establishes introduction points and answers INTRODUCE2 |
 | 7 — the interop matrix | **not started as a document.** Steps 2–6 each contribute rows and most are green; nothing collects them, so a regression in one would not be visible as a regression in *the matrix* |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
@@ -1451,3 +1451,42 @@ Of five planted faults one survived: a lookup that ignored the name. Harmless wi
 and wrong the moment a directory holds two — revision counters are per-service sequence numbers, not a
 clock, so a new service's first upload would be refused whenever some other service happened to be
 further along. **A store with one entry cannot test a lookup**, and every test here had one entry.
+
+### A fixture of one, and the two things it could not say
+
+The descriptor build lived inline in `genhsdesc.wac`'s `main`, so a descriptor could only ever be
+built one way with one set of keys. A service cannot use that: its introduction points are its own,
+its blinded key changes when the time period rolls over, and its revision counter increments. So the
+build is a function now, and the generator is a caller.
+
+**The extraction was checked by regenerating the committed vector and diffing all 33 fields.** That
+check earned its keep on the first run. Reconstructing the inner layer's salt from context gave
+`(i * 7 + 5)` where the original was `(i * 29 + 5)`, and the only symptom was five changed fields.
+Nothing else would have caught it: every test reads the committed vector rather than regenerating it,
+so a refactor judged by "it compiles and the suite is green" would have shipped a different
+descriptor and only the next regeneration would have shown it.
+
+Then the point of having a function: **inputs the fixture cannot reach.** One service, one
+introduction point, one time period says nothing about a builder that quietly ignores everything past
+the first introduction point — that builder reproduces the fixture byte for byte. Three variants now
+go to both oracles:
+
+| variant | HSDir | client decoder |
+|---|---|---|
+| two introduction points | filed, identical | `intro_points: 2` |
+| three introduction points | filed, identical | `intro_points: 3` |
+| the next time period | filed **under a different name** | `intro_points: 1` |
+
+The wac tests take what tor cannot see from outside. The inner plaintext grows by the *same amount*
+per introduction point — 682, 1346, 2010 — so a dropped one is a step of the wrong size rather than no
+step at all; and the outer layer stays padded to one ten-thousand-byte block regardless, which is the
+entire reason that padding exists. How many introduction points a service runs is visible in the inner
+length and must not be visible in the outer one.
+
+Of seven planted faults, six were caught and the survivor was the one this package keeps being caught
+by: **a certificate signed by the descriptor signing key rather than the blinded secret.** It decodes
+perfectly for anyone who does not know the identity key, and every structural assertion passes on it.
+The fix is not another assertion about shape — it is to run the built document through
+`hsstore.wac`'s `checkForPublication`, which verifies the certificate against the blinded key the
+certificate carries. Builder and directory were each pinned against tor and never against each other,
+which is the seam this project keeps rediscovering; they are joined now.
