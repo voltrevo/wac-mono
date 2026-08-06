@@ -150,9 +150,51 @@ So the second binding implements `Pending<T>` **properly**. A host that resolved
 immediately would satisfy the types and quietly make every program that overlaps requests sequential —
 D6's shape exactly, and worse than not having the host, because it would pass.
 
-Some evidence the interface is not JavaScript's: `waitAny(ids, timeoutMs)` maps almost exactly onto
-WASI's `poll_oneoff` — a list of subscriptions, the timeout as a clock subscription in the same list,
-returning which fired. It was not designed for WASI and lands on WASI's own concurrency primitive.
+**D10 — the host is a native runtime, written in Rust on wasmtime** (operator, 2026-08-06). Not
+`wasmtime run`, which cannot host this: a wasm module cannot instantiate another wasm module, so
+`spawn` is impossible without an embedding, and the thirty-six capability funcrefs have to come from
+somewhere. **Spawn is not optional** — it is what makes a pipeline concurrent (`pushChild` runs stages
+one at a time, which is why `yes | head -1` does not terminate as bash's does) and it is step 3's
+whole subject.
+
+So this is a runtime binary whose job is to run wac programs: the peer of `deno.ts`, `node.ts` and
+`browser.ts`, in the role Deno plays but Wasm-native and with no JavaScript in it. Rust rather than the
+C API that `cc` could build today, because the runtime's job is *confinement* and the parts it needs —
+a ticket table, a thread per child, message queues between them — are exactly what C makes
+error-prone.
+
+It is also the **simpler** host, which is the strongest evidence for D9's split. The
+`SharedArrayBuffer`, `Atomics.wait`, the sequence counters, the ring of slots and the responder all
+exist to park a worker while an asynchronous host runs. Native code blocks the calling wasm thread
+directly and completes tickets from its own threads, so the whole transport collapses to a ticket
+table and a condvar. The artifact simplifies too: no launcher, no bundle, no base64 — a `.wasm` and a
+manifest of grants.
+
+**D11 — no WASI, in either direction** (operator, 2026-08-06). A wac module built today imports
+**forty-three functions, all of them `wac.cbN` callback dispatchers, and nothing else.** No ambient
+namespace exists, and none is added:
+
+- **the guest imports no WASI.** WASI is a namespace of syscalls a module declares and then has,
+  narrowed afterwards by preopens and configuration. A capability struct is the inverse — exactly what
+  was granted, and reading it tells you what the program can reach. With both present the second stops
+  being true: `sealed.wac` is a session built with no filesystem grants at all, and a preopen is a
+  mount nobody named, which is D3 undone. `Pending<T>` would not survive it either, since WASI preview
+  1 blocks by default and half of a program's I/O would stop composing with `waitAny`.
+- **the runtime does not use WASI internally.** It is native code; it has `std::fs`, `std::net` and
+  threads. WASI is a way for *wasm* to reach the operating system and the runtime is not wasm.
+
+That second point retires a constraint recorded here earlier: `poll_oneoff` subscribes only to
+descriptor readiness and clocks, so a ticket for `render`, `nextEvent` or a child's exit would have had
+no subscription. That was premised on WASI being the readiness mechanism. In a native host `waitAny` is
+a condvar over a ticket table and readiness is whatever completes it — a socket, a timer, a child
+exiting, an event queued by the embedder — uniformly.
+
+**Where WASI would earn a place is later, and above rather than below.** If Wacland is ever to run wasm
+it did not compile, those modules speak WASI, and the runtime should then implement WASI *over* the
+capability world: `path_open` resolved through the VFS, preopens being mounts, `fd_read` becoming a
+ticket. That is D8 one level down — WASI is to the runtime what POSIX is to the userland, a
+compatibility personality over native foundations and never the foundation. Written down now so that
+whoever wants it builds it that way round.
 
 ## Order of work
 
@@ -167,12 +209,20 @@ Each step is an issue when it becomes actionable, and each references this docum
    `dump` that prints an image's tree so a person can inspect one, and a round-trip property test, since
    there is no GNU tool to be the oracle. Done when a session's writes survive a restart and an image
    written by one build loads in the next.
-2a. **A second host, with no JavaScript in it.** Wacland under `wasmtime`, per D9. Done when, with no
-   JavaScript in the artifact, a program issues **two** capability requests that complete out of order,
-   `waitAny`s over both, and observes them settle independently — and a `waitAny` with neither ready
-   returns on its timeout. Deliberately *not* "runs a program against the VFS": that would pass without
-   touching the thing in question. No processes, no shell, no services; those come later and on the
-   host that already has them.
+2a. **A second host, with no JavaScript in it.** The native runtime, per D9, D10 and D11. Done when,
+   with no JavaScript in the artifact and no WASI import in the module:
+   - a program issues **two** capability requests that complete out of order, `waitAny`s over both, and
+     observes them settle independently;
+   - a `waitAny` with neither ready returns on its **timeout**;
+   - and it **spawns a child** and `waitAny`s over one of its own tickets *and* the child's exit at the
+     same time.
+
+   That last clause is the one that exercises all three of D10's requirements at once, and the reason
+   spawn is in the criteria rather than deferred to step 3: a runtime that cannot make a second
+   instance is not a host for this system, and finding that out at step 3 would be finding it out
+   after the design had been built on it. Deliberately *not* "runs a program against the VFS", which
+   would pass without touching any of it. No shell and no services yet — those come later, and the
+   process **table** is still step 3; this is the primitive underneath it.
 
 3. **A process table.** Pids, parents, states, exit statuses; `ps`, `kill`, `jobs`. The processes are
    already there — spawned workers, or `pushChild` frames in a browser. Done when `ps` in the ssh demo
@@ -213,13 +263,18 @@ Each step is an issue when it becomes actionable, and each references this docum
   differential. What plays that role — a reference implementation of the same semantics, property tests
   over the capability algebra, something else — should be decided with the core rather than after it.
   This is the largest open risk in the direction.
-- ~~The fourth host has no JavaScript.~~ Answered by D9 and scheduled as step 2a. What is still open is
-  narrower and is what the spike has to settle: **whether plain WASI can express the interface, or
-  whether it needs a custom embedding.** `poll_oneoff` subscribes to file-descriptor readiness and
-  clocks, so a ticket for a read or a timeout has a subscription and a ticket for `render`,
-  `nextEvent` or a child's exit does not. Either the host maps those onto descriptors, or `wasmtime
-  run` is not enough and the host is an embedding with its own readiness table — which is a new
-  language in this repo and therefore a decision rather than a detail.
+- ~~The fourth host has no JavaScript.~~ Answered by D9, D10 and D11, and scheduled as step 2a.
+  ~~Whether plain WASI can express the interface.~~ Answered: it cannot, and it is not used — D10 and
+  D11. What remains is not a design question:
+- **Where the native runtime lives.** The other three hosts are `packages/platform/host/*.ts` and the
+  interface they implement is defined beside them, which argues for keeping the fourth there. Against:
+  cargo is a second build system, `deno task test` cannot cover it, and "no TypeScript in any package's
+  `src/`" is a stated property of this repo that "…and some Rust" muddies. Its own bare repo, or
+  `packages/platform/host/native/`. An operator decision, and not urgent until 0087 starts.
+- **The toolchain is a precondition, not a detail.** No `cargo` or `rustc` here, and this repo has no
+  compiled language at all today — 371 `.wac`, 305 `.ts`, with Python and shell only as tooling. Needs
+  `sudo` plus proxy allowlist entries for rustup and crates.io. Only whoever *builds* the runtime needs
+  it; everyone else gets a binary.
 - **Supervised services are named in D8 and in none of the eight steps.** Step 7 is `init`, which owns
   the image, starts daemons and reaps; supervision — restart policy, dependency order, health — is a
   different shape. Either it belongs in step 7's definition of done or it is a ninth step.
