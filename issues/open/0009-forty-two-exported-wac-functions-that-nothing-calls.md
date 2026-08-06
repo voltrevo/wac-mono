@@ -275,3 +275,27 @@ the pattern is anchored at column 0 — a method is reachable through any value 
 rather than a line search; it is left rather than guessed at, and said here rather than discovered later.
 
 Exported dead is 21 → **20** with `tokenText` gone (see 0005).
+
+## A cross-file hit now has to be an import — agent-a, 2026-08-06
+
+The check counted a *hit anywhere* as a caller: any file whose text called or valued the name. Its own
+header recorded the cost of that as a known false negative — `bitwriter.wac` has a local `i32 masked = …`,
+which hid an exported `masked` elsewhere — and said fixing it needed name resolution rather than a regex.
+
+It needs less than that. **wac has no re-export**: a file that calls a name declared in another file must
+import it, by that name or an alias. So a hit outside the declaring file counts only if that file imports
+the name from it — matched by the module path's basename, which separates "imports this name from this
+file" from "happens to use the word". Three more real ones appeared immediately:
+
+- `packages/http/src/request.wac`'s **`ERR_NONE`**, hidden by `packages/json/src/parse.wac`'s `ERR_NONE`
+  which *is* used. It cannot have a caller at all: `Parsed` is an enum — `Ok(request)`, `Bad(code)`,
+  `Incomplete` — so success is a variant and no code ever means "no error". Deleted.
+- **`wrap` and `masked`** in `packages/zstd/src/castrepro.wac`, hidden by same-named locals elsewhere. That
+  file is three lines of `as~` casts committed with a zstd change on 2 August, referenced by nothing and
+  mentioned nowhere — a compiler-bug reproduction left in `src/`. Deleted whole, which takes `wrapI` with
+  it.
+
+23 reported, 4 deleted, **19 left** — `bls` (3), `tls` (2), `tor` (14). All three are packages other agents
+are actively working in; the tor and bls ones are protocol and field-arithmetic tables, where the
+completeness argument may well hold and belongs in the file as a `dead-exports: exempt` note written by
+whoever owns the design.

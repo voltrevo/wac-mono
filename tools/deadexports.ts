@@ -219,6 +219,50 @@ export async function scan(base = "."): Promise<Scan> {
     return m === null ? m : m[1];
   };
 
+  /**
+   * The names a file imports, under whatever local name it uses, and where each came from.
+   *
+   * This is what makes a cross-file hit mean something. wac has no re-export: a file that calls a name
+   * declared elsewhere must import it, by that name or an alias. Without the check, any file mentioning
+   * the word counted — and the header already records what that cost: `bitwriter.wac` has a local
+   * `i32 masked = …`, which hid an exported `masked` in another file, and `packages/zstd/src/castrepro.wac`
+   * kept two of its three exports alive the same way. Those are false *negatives*, the direction that
+   * matters for a check whose job is to find things nothing uses.
+   *
+   * Only the module path is recorded, not resolved: an import in `packages/a/src/x.wac` of
+   * `"../../b/src/y.wac"` is matched by suffix against the declaring file, which is enough to separate
+   * "imports this name from this file" from "happens to use the word".
+   */
+  const importsIn = (f: string): { name: string; local: string; from: string }[] => {
+    const out: { name: string; local: string; from: string }[] = [];
+    const re = /import\s*\{([^}]*)\}\s*from\s*"([^"]+)"/g;
+    for (const m of source.get(f)!.matchAll(re)) {
+      for (const part of m[1].split(",")) {
+        const t = part.trim();
+        if (t === "") continue;
+        const as = /^([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)$/.exec(t);
+        if (as) out.push({ name: as[1], local: as[2], from: m[2] });
+        else if (/^[A-Za-z_]\w*$/.test(t)) out.push({ name: t, local: t, from: m[2] });
+      }
+    }
+    return out;
+  };
+
+  /** Cached, because `callers` asks per name and there are a hundred and forty files. */
+  const importCache = new Map<string, { name: string; local: string; from: string }[]>();
+  const importsOf = (f: string) => {
+    if (!importCache.has(f)) importCache.set(f, importsIn(f));
+    return importCache.get(f)!;
+  };
+
+  /** Whether `f` imports `name` as declared in `declFile` — and under which local names. */
+  const importedInto = (f: string, name: string, declFile: string): string[] => {
+    const base = declFile.split("/").pop()!;
+    return importsOf(f)
+      .filter((i) => i.name === name && (i.from.endsWith(`/${base}`) || i.from === base))
+      .map((i) => i.local);
+  };
+
   /** Every local name an export is imported under. */
   const aliasesOf = (name: string): string[] => {
     const out: string[] = [];
@@ -300,12 +344,22 @@ export async function scan(base = "."): Promise<Scan> {
     // list is complete.
     const value = new RegExp(`(?:[=,(\\[?:]|\\breturn)\\s*(?:${any})(?![\\w(])`);
     for (const f of files) {
+      // A hit in another file counts only if that file imports the name from this one. wac has no
+      // re-export, so a caller must — and a same-named local somewhere else is a different thing.
+      let local: RegExp | null = null;
+      if (f !== declFile) {
+        const locals = importedInto(f, name, declFile);
+        if (locals.length === 0) continue;
+        const alt = locals.join("|");
+        local = new RegExp(`(?<![\\w.])(?:${alt})\\s*\\(|(?:[=,(\\[?:]|\\breturn)\\s*(?:${alt})(?![\\w(])`);
+      }
       code.get(f)!.forEach((bare, i) => {
         if (f === declFile && i + 1 === declLine) return;
         if (!bare.trim()) return;
         // An import naming it is not a call — a stale import is exactly as dead.
         if (/^\s*(import|export)\s*\{/.test(bare) || /^\s*[\w,\s]+\}\s*from/.test(bare)) return;
-        if (call.test(bare) || value.test(bare)) hits.push(`${f}:${i + 1}`);
+        const hit = local === null ? (call.test(bare) || value.test(bare)) : local.test(bare);
+        if (hit) hits.push(`${f}:${i + 1}`);
       });
     }
     return hits;

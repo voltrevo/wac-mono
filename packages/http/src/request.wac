@@ -21,7 +21,6 @@
 
 import { Headers, eqFold, isToken, isOws, isFieldValueByte } from "./headers.wac";
 
-export i32 ERR_NONE() { return 0; }
 export i32 ERR_METHOD() { return 1; }         // the method is not a token
 export i32 ERR_TARGET() { return 2; }         // an empty or malformed request target
 export i32 ERR_VERSION() { return 3; }        // not `HTTP/1.x`
