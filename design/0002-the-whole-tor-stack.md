@@ -379,7 +379,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 |---|---|
 | 1 — RSA signing | **pinned.** `rsaSignPkcs1`, `rsaSignRawPkcs1`, byte-identical to node's |
 | 2 — onion service client | **live.** `src/hsconnect.wac` fetches a page from a real onion service over our own circuits |
-| 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works up to a stream's 500-cell window (200 KB measured); past it an upload stops, because `relayd` sends no `SENDME` — the remaining half of issue 0089. A connection multiplexes several circuits |
+| 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
 | 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. **Not done:** the rendezvous half of the responder (`serviceRendezvousKeys`), building and encrypting a descriptor (the inverse of `hsdesc.wac`), publishing it to the HSDirs, and the program that holds it all together |
@@ -1146,3 +1146,38 @@ work rather than a mystery.
 The method worth keeping: six hypotheses, each killed by an experiment rather than an argument, and
 three rounds of fixing my own instrumentation before the log could answer the question. The cause was
 found by reading a contract — `tlsServerFeed`'s comment — not by reasoning about Tor.
+
+### `RELAY_SENDME`, and the last of 0089
+
+The half of 0089 left after the TLS record fix: a client's window is 500 cells per stream and 1000 per
+circuit, each `SENDME` returns 50 or 100, and `relayd` returned none — so an upload stopped dead at
+the initial window and never resumed.
+
+Implemented as **version 0** SENDMEs, an empty body, circuit-level every 100 data cells and
+stream-level every 50. Version 1 carries the digest of the cell that triggered it; tor's
+`sendme_accept_min_version` defaults to **0**, so the simple form is accepted and no digest has to be
+threaded out of the relay crypto. Our *client* already emits v1, so if a consensus ever raises that
+minimum the upgrade is reuse rather than new work.
+
+The circuit-level count deliberately covers **every** `RELAY_DATA` on the circuit, including the
+directory stream's, because that is what spends a client's circuit window — keeping it inside the
+branch that handles one stream would undercount by exactly the cells that are hardest to notice.
+
+Measured on the same script and network, before and after:
+
+| upload | before | after |
+| --- | --- | --- |
+| 200 KB (411 cells) | works | works |
+| 300 KB (617 cells) | **fails** | **works** |
+| 1 MB (2105 cells) | **fails** | **works** |
+| 4 MB (8400 cells) | — | **works** |
+
+with 34 circuit-level SENDMEs emitted on the run. The 4 MB case is there because a fix that merely
+moved a threshold would look identical at 1 MB. The failing column is not a recollection: it is the
+immediately preceding run of the same script against the previous binary, which is the control this
+kind of claim needs.
+
+So step 3's row is now true in both directions, and the two halves of 0089 together are a decent
+illustration of why a symptom is not a diagnosis: the same observation — "an upload stops" — had two
+independent causes stacked, one at the TLS layer and one at the Tor layer, and the lower one hid the
+upper one by two orders of magnitude.
