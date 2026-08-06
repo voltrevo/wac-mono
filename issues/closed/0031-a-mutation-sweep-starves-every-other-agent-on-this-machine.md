@@ -1,6 +1,6 @@
 # 0031 — a mutation sweep starves every other agent on this machine
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-a
 - **Date:** 2026-08-04
@@ -83,3 +83,54 @@ What this issue's own claim still rests on is the 2026-08-04 observation at the 
 `--operators=all` sweep next door taking a fifty-second suite to over half an hour — which was measured
 before any of today's confusion and is unaffected.
 
+## Closed, 2026-08-06 (agent-a): all three candidates, and the third is a wait rather than a warning
+
+The list above was "three candidates, in the order I would try them". All three are in.
+
+**1. Count cores, not jobs.** `--jobs` meant "this many `deno test` runs", and the issue's own measurement
+is why that was wrong: `box.test.ts` alone spawns about three hundred built binaries, so four such jobs is
+hundreds of processes rather than four. A scope whose tests build and run programs of their own now runs
+**one mutant at a time**.
+
+Decided by what the test files *import* rather than by a list of package names — `buildApp`, `appRunner`,
+`spawnChild`, `workerSource` are the doors to a built program. A hand-kept list would be wrong the first
+time somebody writes a spawning test in a package that is not on it, and wrong *silently*, which is the
+direction that matters here. An explicit `--jobs=N` still wins.
+
+Staging moved to match: one directory up front, the rest only once the scope's test files are known, since
+how many workers to start now depends on what those tests do.
+
+**2. Yield to interactive work.** Already done and safe, for the reason the issue names: the deadline is
+`10x each scope's own baseline`, measured in the same conditions, so a loaded machine stretches the
+deadline instead of manufacturing kills. The sweep prints it: `deadline: 10x each scope's own baseline
+(slowest 94.5s -> 600s) … running under nice -n 19`.
+
+**3. Wait for the machine, rather than printing a note about it.** `nice` does not help a suite competing
+for memory and process slots rather than CPU time. Before picking up each mutant — never during one, or a
+mutant's duration stops meaning anything and the deadline that scores it becomes a measurement of when the
+machine was busy — the sweep waits while the one-minute load is above `cores × 1.5`, in five-second steps,
+up to two minutes per mutant. It says so the first time, and reports the total at the end, because a run
+that looks stalled and says nothing is exactly how this issue cost somebody an hour. `--no-wait` disables
+it.
+
+### Measured, on a real sweep of `packages/sh` (20 of 183 mutants, `--operators`)
+
+```
+load before starting: 0.78 0.42 0.38 on 5 core(s)
+baseline: 3/3 test scope(s) pass unmutated
+deadline: 10x each scope's own baseline (slowest 94.5s -> 600s) … running under nice -n 19
+profile: 99 test(s) across 13 file(s), 7417 covered line(s)
+running 1 at a time: these tests build and run programs of their own, so a job is not one process
+selection: 20/20 mutant(s) ran only the tests that reach them, 0 fell back to the full scope
+19/20 mutants killed
+```
+
+`20/20` is the number 0024 was named for reading `0/117`; subprocess attribution landed the day before and
+this is the first sweep to use it. Peak load stayed at about one core's worth of oversubscription rather
+than the ten this issue opened with.
+
+The sweep also found a real gap, which is what they are for: `isNewline` in `parse.wac` could be replaced
+with `return false` and all 614 corpus cases still passed, because every one of them was a single line. The
+newline continuations after `&&`, `||` and `|` are in the corpus now, and a divergence found while adding
+them is recorded in `packages/sh/README.md` — bash parses and runs a line at a time, so `echo a` followed
+by a line starting `&&` prints `a` and then fails, where ours refuses the whole script.

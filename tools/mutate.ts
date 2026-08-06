@@ -569,6 +569,76 @@ const jobs = (() => {
 })();
 
 /**
+ * Whether a test file spawns processes of its own, decided by what it imports.
+ *
+ * wac-mono 0031: `--jobs` was read as "this many `deno test` runs", and several of this repo's test
+ * files are themselves swarms — `packages/box/test/box.test.ts` spawns about three hundred built
+ * binaries, each a `deno` process plus a worker. Four such jobs is not four processes, it is hundreds,
+ * and the machine is shared: a fifty-second suite next door took over half an hour.
+ *
+ * Read from the imports rather than from a list of package names, because a hand-kept list is wrong the
+ * first time somebody writes a spawning test in a package that is not on it — and wrong silently, which
+ * is the direction that matters here. `buildApp` and `appRunner` are the two doors to a built program;
+ * `spawnChild` is the third, for tests that drive the worker protocol themselves.
+ */
+const SPAWNS = /\b(buildApp|appRunner|spawnChild|workerSource)\b/;
+
+/** How many mutants to run at once for this scope, given what its tests do. */
+async function jobsFor(files: string[], root: string): Promise<number> {
+  if (args.some((a) => a.startsWith("--jobs"))) return jobs;   // an explicit number wins
+  for (const f of files) {
+    try {
+      if (SPAWNS.test(await Deno.readTextFile(`${root}/${f}`))) return 1;
+    } catch {
+      // Unreadable is not evidence of anything; the other files still decide.
+    }
+  }
+  return jobs;
+}
+
+/**
+ * Wait while the machine belongs to somebody else.
+ *
+ * The third of 0031's candidates — "refuse to start on a loaded machine, or wait for the load to fall"
+ * — and the honest one, because `nice` alone does not help a suite that is competing for *memory* and
+ * process slots rather than for CPU time. Checked between mutants, never during one: a mutant's own run
+ * must not be paused, or its duration stops meaning anything and the deadline that scores it becomes a
+ * measurement of when the machine was busy.
+ *
+ * Bounded, and it says so out loud when it waits. An unbounded wait would turn a shared machine into a
+ * sweep that never finishes and never explains itself.
+ */
+const LOAD_CEILING = (navigator.hardwareConcurrency || 2) * 1.5;
+const WAIT_STEP_MS = 5_000;
+const WAIT_MAX_MS = 120_000;
+let waitedMs = 0;
+let saidWaiting = false;
+
+async function yieldToOthers(): Promise<void> {
+  if (args.includes("--no-wait")) return;
+  let waited = 0;
+  while (waited < WAIT_MAX_MS) {
+    let load: number;
+    try {
+      load = Number((await Deno.readTextFile("/proc/loadavg")).split(" ")[0]);
+    } catch {
+      return;   // no /proc; not a reason to stop working
+    }
+    if (!Number.isFinite(load) || load <= LOAD_CEILING) return;
+    if (!saidWaiting) {
+      saidWaiting = true;
+      console.log(
+        `  load ${load.toFixed(1)} is above ${LOAD_CEILING.toFixed(1)} — waiting for the machine ` +
+          `(at most ${WAIT_MAX_MS / 1000}s per mutant; --no-wait to disable). See issue 0031.`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, WAIT_STEP_MS));
+    waited += WAIT_STEP_MS;
+    waitedMs += WAIT_STEP_MS;
+  }
+}
+
+/**
  * One staging directory per worker.
  *
  * The single shared directory is what forced this loop to be sequential: a mutant is
@@ -584,12 +654,15 @@ const noSelect = args.includes("--no-select");
 let measurable: typeof toRun = [];
 const results: (Result & { index: number })[] = [];
 try {
-  for (let i = 0; i < jobs; i++) {
+  // One staging directory now; the rest after the scope's test files are known, because how many
+  // mutants may run at once depends on what those tests *do* — see `jobsFor`. Staging is a `cp -r`,
+  // so making four of them for a scope that turns out to want one is a second and some disk wasted,
+  // and the baseline and the profile below only ever use the first.
+  {
     const dir = await Deno.makeTempDir({ prefix: "wac-mutate-" });
     workDirs.push(dir);
     await stageProject(dir);
   }
-  if (jobs > 1) console.log(`  running ${jobs} at a time`);
   // Print the load, because this is the number that explains a slow sweep *and* a slow suite next
   // door, and because the alternative is somebody spending an hour proving the suite has not hung.
   // A job is a whole `deno test`, and several test files are themselves swarms of subprocesses, so
@@ -700,9 +773,29 @@ try {
     }
   }
 
+  // ── How much of the machine this scope is allowed ─────────────────────────
+  const everyFile = [...new Set([...scopeFiles.values()].flat())];
+  const effectiveJobs = Math.min(jobs, await jobsFor(everyFile, workDirs[0]));
+  if (effectiveJobs < jobs) {
+    console.log(
+      `  running 1 at a time: these tests build and run programs of their own, so a job is not one ` +
+        `process (issue 0031). --jobs=N overrides.`,
+    );
+  } else if (jobs > 1) {
+    console.log(`  running ${jobs} at a time`);
+  }
+  for (let i = workDirs.length; i < effectiveJobs; i++) {
+    const dir = await Deno.makeTempDir({ prefix: "wac-mutate-" });
+    workDirs.push(dir);
+    await stageProject(dir);
+  }
+
   let next = 0;
   const worker = async (work: string) => {
     while (true) {
+      // Between mutants, never during one: pausing a running mutant would make its duration a
+      // measurement of when the machine was busy, and its duration is what the deadline scores.
+      await yieldToOthers();
       const index = next++;
       if (index >= measurable.length) return;
       const mutant = measurable[index].mutant;
@@ -799,6 +892,13 @@ if (unmeasurable.length > 0) {
 }
 
 if (profile) {
+  if (waitedMs > 0) {
+    console.log(
+      `\nwaited ${Math.round(waitedMs / 1000)}s in total for the machine to be free — a sweep that ` +
+        `takes longer for being polite is the point, but a run that looks stalled and says nothing is ` +
+        `how issue 0031 cost somebody an hour.`,
+    );
+  }
   const total = narrowed + widened + results.filter((r) => r.notCovered).length;
   console.log(
     `\nselection: ${narrowed}/${total} mutant(s) ran only the tests that reach them, ` +

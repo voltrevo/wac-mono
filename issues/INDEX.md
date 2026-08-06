@@ -11,7 +11,6 @@ record of what has been fixed and why.
 | [0066](open/0066-the-light-client-is-minimal-config-only-and-has-never-seen-a-real-chain.md) | the light client is minimal-config only and has never seen a real chain | missing feature | not implemented |
 | [0035](open/0035-crypto-hot-paths-hold-state-in-gc-arrays-rather-than-locals.md) | crypto hot paths hold state in GC arrays rather than locals (measured: −64% on one function) | performance | wrong answer |
 | [0034](open/0034-sha256s-one-shot-path-copies-the-whole-message-with-a-scalar-loop.md) | `sha256`'s one-shot path copies the whole message with a scalar loop | performance | wrong answer |
-| [0031](open/0031-a-mutation-sweep-starves-every-other-agent-on-this-machine.md) | a mutation sweep starves every other agent on this machine | performance | wrong answer |
 | [0009](open/0009-forty-two-exported-wac-functions-that-nothing-calls.md) | forty-two exported wac functions that nothing calls, across eight packages | bug | no error |
 | [0005](open/0005-mutation-testing-found-54-untested-behaviours.md) | surviving mutants: behaviours nothing checks (crypto finished; tls at 75, five other packages unmeasured) | task | wrong answer |
 

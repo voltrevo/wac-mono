@@ -290,7 +290,13 @@ export async function appKeyParts(
     String(workerOnly),
     // An instrumented build is a different artefact from the same source, and handing one to a test
     // that expected the other would be a wrong answer rather than a slow one.
-    coverage ? "cov" : "plain",
+    //
+    // The dump directory goes in too, because it is *baked into the binary* and derived from the
+    // working directory: a mutation sweep stages the project into a temp directory per worker, so a
+    // cached artefact from one staging directory would otherwise be handed to another and would write
+    // its counters into a path that has already been deleted. The attribution would then be silently
+    // incomplete, which is the failure mode that looks like "these tests reach nothing".
+    coverage ? `cov:${COV_DUMP_DIR}` : "plain",
     ...compiler,
     ...harness,
     ...host,

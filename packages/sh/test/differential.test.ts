@@ -77,6 +77,22 @@ const CASES: string[] = [
   `echo a; echo b; echo c`,
   `false; true; echo $?`,
 
+  // A newline after `&&`, `||` or `|` continues the list — how a multi-line condition is written, and
+  // what `isNewline` in `parse.wac` exists for. Nothing here exercised it: a mutation sweep replaced
+  // that function with `return false` and every one of the 614 cases still passed, because every one
+  // of them is a single line. wac-mono 0005.
+  `true &&\necho yes`,
+  `false ||\necho yes`,
+  `printf 'a\\nb\\n' |\nsort -r`,
+  `true &&\n\n\necho blank lines too`,
+  `false &&\necho no; echo $?`,
+  `echo a |\ncat |\ncat`,
+  // `echo a\n&& echo b` is *not* here, and the reason is a real divergence rather than an oversight:
+  // bash prints `a` and *then* fails with a syntax error, because it parses and runs a line at a time.
+  // Ours parses the whole script before running any of it, so it refuses the lot and prints nothing.
+  // Both exit 2. See `packages/sh/README.md` — the corpus asserts agreement, so a case that documents a
+  // disagreement belongs in prose, not here.
+
   // ── Pipelines ───────────────────────────────────────────────────────────────
   `echo hello | rev`,
   `echo hello | wc -l`,
@@ -1147,8 +1163,26 @@ Deno.test({
     // nothing about which of 614 scripts caused it, and the only way to find out is to instrument the
     // harness by hand, which is what I did the first time and then deleted.
     const differences: string[] = [];
-    await pool(CASES, 4, async (script) => {
-      const [want, got] = await Promise.all([bash(script), wacsh(script)]);
+    await pool(CASES, 4, async (script, _index, note) => {
+      // Both halves run at once, and the note says which are still outstanding. Without it a wedge names
+      // the script and leaves it open whether the stuck half is the real `bash` subprocess or our own
+      // shell in this process — wac-mono 0082, where four cases hung for 550s and that was the question.
+      let waiting = new Set(["bash", "wacsh"]);
+      const finish = (half: string) => {
+        waiting.delete(half);
+        note([...waiting].join("+"));
+      };
+      note("bash+wacsh");
+      const [want, got] = await Promise.all([
+        bash(script).then((r) => {
+          finish("bash");
+          return r;
+        }),
+        wacsh(script).then((r) => {
+          finish("wacsh");
+          return r;
+        }),
+      ]);
       if (want.stdout !== got.stdout || want.code !== got.code) {
         differences.push(
           `script: ${JSON.stringify(script)}\n` +

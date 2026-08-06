@@ -19,12 +19,26 @@
 // costs a slow machine one extra line of stderr, so the budget can be short enough to be useful without
 // anybody having to tune it against contention.
 
-/** A label still being worked on, and how long since it started. */
-export type Held = { label: string; heldMs: number };
+/** A label still being worked on, how long since it started, and what it is waiting on. */
+export type Held = { label: string; heldMs: number; note: string };
+
+/** A unit of work in flight: end it, or say what it is doing now. */
+export type Entry = {
+  /** Call when the work ends. Idempotent. */
+  done(): void;
+  /**
+   * What this unit is waiting on, replacing whatever it said before.
+   *
+   * The difference between "this script is stuck" and "this script is stuck *on the subprocess*". A
+   * corpus case runs two things at once — a real `bash` and our own shell — and a wedge that names only
+   * the script leaves both halves suspects. wac-mono 0082.
+   */
+  note(what: string): void;
+};
 
 export type Flight = {
-  /** Call as work starts; call the returned function when it ends. */
-  start(label: string): () => void;
+  /** Call as work starts; the entry it returns is how the work is ended and annotated. */
+  start(label: string): Entry;
   /** What is in flight now, longest-held first. Exported so a test can assert on it. */
   held(): Held[];
   /** Stop narrating. Must be called — a live timer outlives the test otherwise. */
@@ -51,7 +65,7 @@ function say(line: string): void {
 export function watch(what: string, options: { quietMs?: number } = {}): Flight {
   const quietMs = options.quietMs ?? 45_000;
   const trace = Deno.env.get("WAC_TRACE") === "1";
-  const flight = new Map<number, { label: string; at: number }>();
+  const flight = new Map<number, { label: string; at: number; note: string }>();
   let next = 0;
   let lastFinish = performance.now();
   let started = 0;
@@ -60,7 +74,7 @@ export function watch(what: string, options: { quietMs?: number } = {}): Flight 
   const held = (): Held[] => {
     const now = performance.now();
     return [...flight.values()]
-      .map((e) => ({ label: e.label, heldMs: Math.round(now - e.at) }))
+      .map((e) => ({ label: e.label, heldMs: Math.round(now - e.at), note: e.note }))
       .sort((a, b) => b.heldMs - a.heldMs);
   };
 
@@ -79,31 +93,40 @@ export function watch(what: string, options: { quietMs?: number } = {}): Flight 
       `wac: ${what}s in flight for ${(quiet / 1000).toFixed(1)}s with none finishing ` +
         `(${finished} of ${started} done):`,
     );
-    for (const e of held()) say(`wac:   ${what} held ${(e.heldMs / 1000).toFixed(1)}s: ${e.label}`);
+    for (const e of held()) {
+      const on = e.note === "" ? "" : ` [${e.note}]`;
+      say(`wac:   ${what} held ${(e.heldMs / 1000).toFixed(1)}s${on}: ${e.label}`);
+    }
   }, Math.max(50, Math.floor(quietMs / 4)));
   // So the interval is not itself a reason for the process to stay alive. `stop()` clears it; this covers
   // the path where a throw skips the `finally` somebody forgot to write.
   Deno.unrefTimer(tick);
 
   return {
-    start(label: string): () => void {
+    start(label: string): Entry {
       const id = next++;
-      flight.set(id, { label, at: performance.now() });
+      flight.set(id, { label, at: performance.now(), note: "" });
       started++;
       if (trace) say(`wac: ${what} start: ${label}`);
       let ended = false;
-      return () => {
-        // Idempotent: a caller that ends in both a `finally` and the happy path is not a miscount.
-        if (ended) return;
-        ended = true;
-        const entry = flight.get(id);
-        flight.delete(id);
-        finished++;
-        lastFinish = performance.now();
-        spoken = 0;
-        if (trace && entry !== undefined) {
-          say(`wac: ${what} done in ${Math.round(performance.now() - entry.at)}ms: ${label}`);
-        }
+      return {
+        done(): void {
+          // Idempotent: a caller that ends in both a `finally` and the happy path is not a miscount.
+          if (ended) return;
+          ended = true;
+          const entry = flight.get(id);
+          flight.delete(id);
+          finished++;
+          lastFinish = performance.now();
+          spoken = 0;
+          if (trace && entry !== undefined) {
+            say(`wac: ${what} done in ${Math.round(performance.now() - entry.at)}ms: ${label}`);
+          }
+        },
+        note(what2: string): void {
+          const entry = flight.get(id);
+          if (entry !== undefined) entry.note = what2;
+        },
       };
     },
     held,
@@ -123,7 +146,7 @@ export function watch(what: string, options: { quietMs?: number } = {}): Flight 
 export async function pool<T, R>(
   items: readonly T[],
   jobs: number,
-  work: (item: T, index: number) => Promise<R>,
+  work: (item: T, index: number, note: (what: string) => void) => Promise<R>,
   options: { what?: string; label?: (item: T, index: number) => string; quietMs?: number } = {},
 ): Promise<R[]> {
   const what = options.what ?? "item";
@@ -136,11 +159,11 @@ export async function pool<T, R>(
       while (true) {
         const index = next++;
         if (index >= items.length) return;
-        const done = flight.start(label(items[index], index));
+        const entry = flight.start(label(items[index], index));
         try {
-          results[index] = await work(items[index], index);
+          results[index] = await work(items[index], index, entry.note);
         } finally {
-          done();
+          entry.done();
         }
       }
     };

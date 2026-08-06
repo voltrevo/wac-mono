@@ -329,6 +329,15 @@ and cannot examine. A script acts on `false`; it stops on a 2. The same reasonin
 `cannot access 'x': cannot be named on this host` where a genuinely missing operand still gets GNU's
 `No such file or directory`, exactly.
 
+**The whole script is parsed before any of it runs, and bash does not do that.** `echo a` followed by a
+line beginning `&& echo b` prints `a` in bash and then fails with a syntax error, because bash reads,
+parses and executes one line at a time; ours prints nothing and exits 2, having refused the script as a
+whole. Both exit 2, and every valid script agrees — this shows up only where a script is *partly* valid.
+Found by a mutation sweep: `isNewline` in `parse.wac` could be replaced with `return false` and all 614
+corpus cases still passed, because every one of them was a single line. The continuations that function
+exists for — a newline after `&&`, `||` or `|` — are in the corpus now, and the partly-valid case is here
+rather than there because the corpus asserts agreement.
+
 **Only `read` consumes standard input.** It advances a cursor the whole command shares, which is
 what makes `while read line` terminate rather than see the first line for ever. The external
 programs are handed whatever is left but are *not* charged for it, because nothing here knows
