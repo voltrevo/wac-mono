@@ -57,6 +57,7 @@ import { itoa64 } from "../../wactest/src/itoa64.wac";
 import {
   tlsServerInit, tlsServerFeed, tlsServerSend, tlsPhase, phaseEstablished, phaseFailed,
 } from "../../tls/src/server.wac";
+import { recordsReady } from "../../tls/src/record.wac";
 import { selfSignedEd25519, selfSignedRsa } from "../../tls/src/x509gen.wac";
 import { generateRsaKey, RsaKey } from "../../crypto/src/rsagen.wac";
 import { ed25519PublicKey } from "../../crypto/src/ed25519.wac";
@@ -576,6 +577,21 @@ struct Conn {
   i32 sock;
   Socket sockObj;
   u8[] tls;
+  /**
+   * Raw bytes that do not yet form whole TLS records.
+   *
+   * `tlsServerFeed` takes **whole records only** and traps on a partial one — its own comment says
+   * so, and `tlsRecordNeeded`/`recordsReady` exist to enforce it. This fed it whatever `recv`
+   * returned. That works for as long as every record happens to arrive intact, which is every small
+   * exchange: a request that fits in one record, a reply that fits in one record. It stops working
+   * the moment enough data arrives at once for a record to be split across two reads — a 64 KB
+   * upload, say — and then the trap kills the connection, tor sees `CONNRESET` or a TLS error, and
+   * every circuit on that connection dies at once with nothing logged here at all. Issue 0089.
+   *
+   * `link.wac` had this right on the client side. Its comment is the warning this file did not
+   * heed: "a reader that mostly works fails on a fast connection rather than a slow one".
+   */
+  u8[] raw;
   u8[] buf;
   bool established;
   bool versionsSeen;
@@ -638,7 +654,7 @@ Conn newConn(Core core, Cli cli, Socket sock, Identity id, i32 connId) {
   u8[] tls = tlsServerInit(id.tlsCertDer, id.tlsSeed, clampScalar(tweak(id.tlsSeed, 6)),
                            core.randomBytes(32).wait());
   Pending<Read> first = cli.recv(sock.handle);
-  return Conn(true, connId, sock.handle, sock, tls, u8[0](), false, false,
+  return Conn(true, connId, sock.handle, sock, tls, u8[0](), u8[0](), false, false,
               Circ?[MAX_CIRCS](), 0, 0, first);
 }
 
@@ -792,7 +808,14 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
     }
     // And here: a connection that is going does not need another read outstanding on it.
     c.fromClient = cli.recv(c.sock);
-    Fed fed = unpackFeed(tlsServerFeed(c.tls, incoming));
+    // Whole records only, or `tlsServerFeed` traps. Anything left over waits for the next read.
+    c.raw = concat(c.raw, incoming);
+    i32 ready = recordsReady(c.raw);
+    if (ready == 0) { return; }
+    u8[] whole = slice(c.raw, 0, ready);
+    c.raw = slice(c.raw, ready, c.raw.len());
+
+    Fed fed = unpackFeed(tlsServerFeed(c.tls, whole));
     c.tls = fed.state;
     if (fed.toSend.len() > 0) { cli.send(c.sock, fed.toSend).wait(); }
     if (tlsPhase(c.tls) == phaseFailed()) {

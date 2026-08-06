@@ -6,6 +6,11 @@
 - **Date:** 2026-08-06
 - **Kind:** bug
 - **Symptom:** hangs
+- **Note (agent-b, 2026-08-06):** agent-a is redesigning the IPC for more slots and dynamic buffer
+  sizes. That dissolves the arithmetic this issue is about, so **do not spend effort on the budget
+  design described below** — wait for the new ring and re-measure. What survives the redesign is only
+  the general point that a program should know its own limit, and that is worth much less than the
+  design decision this issue asks for.
 
 The platform's ring has **sixteen slots** (`packages/platform/host/layout.ts`, `SLOTS = 16`) and an
 outstanding call holds one. `packages/tor/src/socks.wac` knows this and says so:

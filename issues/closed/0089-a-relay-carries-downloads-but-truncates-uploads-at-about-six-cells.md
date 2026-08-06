@@ -1,7 +1,53 @@
 # 0089 — a relay carries downloads but truncates uploads at about six cells
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+## Resolved: `relayd` fed partial TLS records to a parser that traps on them
+
+`tlsServerFeed`'s own comment says it takes **whole records only**, and it traps otherwise:
+
+    if (pos + 5 + recLen > input.len()) { trap; }
+
+`packages/tls/src/record.wac` exports `recordsReady`/`tlsRecordNeeded` so a caller can honour that.
+`link.wac` — our *client* side — calls it. `relayd.wac` did not: it passed whatever `recv` returned
+straight in.
+
+That works for as long as every TLS record happens to arrive intact, which is every small exchange: a
+request in one record, a reply in one record. It stops the moment enough arrives at once for a record
+to split across two reads. Then the trap kills the connection, tor sees `CONNRESET` (`ORCONN DELETE
+… reason=4`) or a TLS error (`reason=10`), and **every circuit on that connection dies at once** —
+which is why all three were marked for close in the same millisecond, and why nothing was logged on
+our side at all.
+
+`link.wac`'s comment is the warning this file did not heed: *"a reader that mostly works fails on a
+fast connection rather than a slow one"*. Issue 0029 is the same rule, scored once correct and once
+silently broken; this was the second silently broken one.
+
+Fixed by buffering raw bytes on the connection and feeding only whole records. Measured, same script,
+same network, previous binary versus fixed:
+
+| upload | before | after |
+| --- | --- | --- |
+| 100 bytes | works | works |
+| 64 KB | **fails after ~3 KB** | **works, 65536 received** |
+| 200 KB | fails | **works, 204800 received** |
+| 300 KB | fails | fails |
+| 1 MB | fails | fails |
+
+## And beneath it, the flow control after all
+
+With the trap gone the limit moves to where the protocol says it should be: **200 KB (411 cells)
+works and 300 KB (617 cells) does not**, and a stream's window is 500 cells of 498 bytes — 249,000
+bytes. `relayd` sends no `SENDME`, so a client's package window is never replenished and an upload
+past it stops for good.
+
+So the original prediction — that missing flow control breaks large transfers — was right about
+uploads all along. It could not be seen because a worse bug fired two orders of magnitude earlier,
+and it looked disproved because downloads are kept inside their window by tor's own back-pressure.
+Implementing `RELAY_SENDME` is the remaining work and is now a plain feature rather than a mystery.
+
+
+
+- **Status:** closed 2026-08-06 — two causes, one fixed and one now visible beneath it
+- **Claimed by:** agent-b
 - **Reported by:** agent-b
 - **Date:** 2026-08-06
 - **Kind:** bug
