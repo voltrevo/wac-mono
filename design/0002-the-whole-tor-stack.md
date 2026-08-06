@@ -379,7 +379,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 |---|---|
 | 1 — RSA signing | **pinned.** `rsaSignPkcs1`, `rsaSignRawPkcs1`, byte-identical to node's |
 | 2 — onion service client | **live.** `src/hsconnect.wac` fetches a page from a real onion service over our own circuits |
-| 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. **DATA the other way does not**: a 64 KB upload delivers about 3 KB and the stream closes — issue 0089. A connection multiplexes several circuits |
+| 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works up to a stream's 500-cell window (200 KB measured); past it an upload stops, because `relayd` sends no `SENDME` — the remaining half of issue 0089. A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
 | 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. **Not done:** the rendezvous half of the responder (`serviceRendezvousKeys`), building and encrypting a descriptor (the inverse of `hsdesc.wac`), publishing it to the HSDirs, and the program that holds it all together |
@@ -1109,3 +1109,40 @@ Both now say `FlowCtrl=1`, matching the descriptor. The generated vote and conse
 regenerated and re-checked: C tor's parsers accept the descriptor, the certificate, the vote (whose
 acceptance includes verifying its signature) and both consensus flavours. A fixture that satisfies
 only our own tests would have proved nothing.
+
+### 0089 solved: a partial TLS record, and the flow control hiding underneath it
+
+`tlsServerFeed` takes **whole records only** and traps otherwise — its own comment says so, and
+`recordsReady`/`tlsRecordNeeded` exist so a caller can honour it. `link.wac`, our client, calls it.
+`relayd.wac` did not: it passed whatever `recv` returned straight in.
+
+That is invisible while every record happens to arrive intact, which is every small exchange. It fires
+the moment enough data arrives at once for a record to straddle two reads — and then the trap kills
+the connection, tor reports `CONNRESET` or a TLS error, and **every circuit on that connection dies at
+once**. Which is exactly what the log showed all along: three circuits marked for close in the same
+millisecond, an `ORCONN DELETE … reason=4`, and nothing at all on our side.
+
+`link.wac`'s own comment was the warning: *"a reader that mostly works fails on a fast connection
+rather than a slow one."* Issue 0029 recorded this rule scoring one correct and one silently broken.
+This was the second silently broken one, and it took six hypotheses to find because the symptom
+appears three layers above the cause.
+
+**And underneath it, the thing I had already predicted and wrongly abandoned.** With the trap gone the
+limit moves to exactly where the protocol puts it:
+
+| upload | before the fix | after |
+| --- | --- | --- |
+| 64 KB | fails after ~3 KB | works |
+| 200 KB (411 cells) | fails | **works** |
+| 300 KB (617 cells) | fails | fails |
+
+A stream's window is 500 cells of 498 bytes — 249,000 bytes, between those two. `relayd` sends no
+`SENDME`, so the client's package window is never replenished. The original prediction that missing
+flow control breaks large transfers was **right about uploads all along**; it could not be seen
+because a worse bug fired two orders of magnitude earlier, and it looked disproved because downloads
+are held inside their window by tor's own back-pressure. Implementing `RELAY_SENDME` is now ordinary
+work rather than a mystery.
+
+The method worth keeping: six hypotheses, each killed by an experiment rather than an argument, and
+three rounds of fixing my own instrumentation before the log could answer the question. The cause was
+found by reading a contract — `tlsServerFeed`'s comment — not by reasoning about Tor.
