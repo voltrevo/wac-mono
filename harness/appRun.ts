@@ -36,6 +36,7 @@ import { serveHostCalls } from "../packages/platform/host/respond.ts";
 import { denoWorld } from "../packages/platform/host/deno.ts";
 import { type Bridge, bridgeOf, newBridge } from "../packages/platform/host/layout.ts";
 import { describeSlots } from "../packages/platform/host/call.ts";
+import { scheduler } from "../packages/platform/host/schedule.ts";
 import { buildApp, type Grants } from "../packages/platform/build.ts";
 
 export type RunResult = {
@@ -221,13 +222,18 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
           frozen = state === lastState && !slots.startsWith("no slot in use") ? frozen + 1 : 0;
           lastState = state;
           if (frozen >= 2 && deadlocked !== undefined) {
+            // The scheduler's last choices, when it is on: with an ordering that is ours rather than the
+            // event loop's, a wedge leaves the sequence that produced it behind — which is the one thing
+            // every previous occurrence of wac-mono 0082 lacked.
+            const sched = scheduler();
+            const recent = sched.on ? `\n  last choices: ${sched.log.slice(-24).join(" ")}` : "";
             deadlocked(
               new Error(
                 `${entry} is deadlocked: the bridge has not moved in ${
                   Math.round((every * 2) / 1000)
                 }s with work outstanding — ${state}. ` +
                   `This is wac-mono 0082: the child is waiting for an answer that is not coming. ` +
-                  `Set WAC_STALL_MS higher if a capability here really can take that long.`,
+                  `Set WAC_STALL_MS higher if a capability here really can take that long.${recent}`,
               ),
             );
           }

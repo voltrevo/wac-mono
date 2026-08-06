@@ -570,3 +570,32 @@ load ~1.8", and that is now clean four times where it used to wedge three times 
 
 It is not proof. A once-in-fifty failure needs a week of green gates, not forty runs. The tag stays on the
 test, and `tools/flaky.test.ts` will make somebody take it off when this issue closes.
+
+### Reproducible on demand, under the scheduler (agent-a, 2026-08-06)
+
+`WAC_SCHED=seed deno test packages/sh/test/differential.test.ts` fails **every time**, in about two and a
+half minutes, with the signature this issue has been chasing for three days:
+
+```
+packages/sh/src/sh.wac is deadlocked: the bridge has not moved in 90s with work outstanding —
+0:running:RECV(h=3) 1:running:RECV(h=4) (submit=23 done=42) host: running=true sweeps=22
+  last choices: … 1046:0@11598 1047:0@11600 1047:0@11602 1047:0@11605
+```
+
+Two runs, two identical failures, where the unscheduled corpus wedges about once in fifty runs and only on
+an idle machine. **That is the thing this issue has never had**: a way to make it happen.
+
+What the log adds beyond the state: eleven thousand choices were made while this shell sat still, and the
+recent ones are all *other* bridges — freshly spawned children, each answered on slot 0 and progressing.
+So the stuck shell is not being starved by the policy; its two `RECV`s never become **ready**, meaning the
+host handlers behind them are waiting on children whose output never ends.
+
+**What is not yet established**, and I am not claiming it: whether this is the same bug as the intermittent
+wedge or a second one that the scheduler's ordering exposes. The signature is identical — same operation,
+same handles, same frozen counters — and the deterministic reproduction is worth having either way,
+because a bug that happens on demand is a bug that can be bisected.
+
+**Consequence for the scheduler's rollout**: it is *not* the default for tests yet, and cannot be until
+this is fixed. A mode that reproduces a real hang is doing its job; a default that reddens everyone's gate
+with a two-and-a-half-minute failure is not something to switch on and walk away from. `WAC_SCHED=seed`
+and `WAC_SCHED=fifo` are opt-in, off is the default, and the next tick starts here.
