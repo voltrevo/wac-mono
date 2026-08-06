@@ -471,6 +471,16 @@ not. **ESTABLISH_INTRO** is done and pinned by `tools/estintro-probe.c` against 
 both of tor's verifications; INTRODUCE2, the hs-ntor responder, RENDEZVOUS1 and descriptor publication
 are not.
 
+**INTRODUCE2** is done too — the inverse of the client's `introduce1Cell`, checked against cells
+tor's own `hs_cell_build_introduce1` wrote rather than against our own builder. That distinction
+earned its keep immediately: **tor pads an INTRODUCE1 to a fixed size and our client does not**, so a
+parser returning "the rest of the plaintext" as the link specifier list agrees with our builder and
+hands back two hundred bytes of padding for tor's, which `linkSpecifiersValid` then refuses.
+
+The reverse direction — tor reading one of our cells — needs a running service, not a probe:
+`hs_cell_parse_introduce2` asserts on a real `origin_circuit_t` for replay caching, so a stateless
+probe aborts rather than getting an answer.
+
 The one thing to know before writing another cell of it: **the signature span ends before `sig_len`,
 not before the signature.** `end_sig_fields` sits between the handshake MAC and the two length bytes,
 so a cell signed over "everything before the signature" parses, verifies its MAC, and is refused with

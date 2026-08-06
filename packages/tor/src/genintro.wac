@@ -10,11 +10,12 @@
 //
 // Keys are derived from fixed seeds, so a change in the output is a change in the generator.
 
-import { Core, Cli, Change } from "../../platform/src/platform.wac";
+import { Core, Cli, Change, FileResult } from "../../platform/src/platform.wac";
 import { itoa } from "../../fmt/src/itoa.wac";
 import { encode as hexEncode } from "../../codec/src/hex.wac";
 import { ed25519PublicKey } from "../../crypto/src/ed25519.wac";
-import { establishIntroCell, macSpanOf, sigSpanOf } from "./hsservice.wac";
+import { decode as hexDecode } from "../../codec/src/hex.wac";
+import { Introduce2, establishIntroCell, macSpanOf, parseIntroduce2, sigSpanOf } from "./hsservice.wac";
 
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 2) {
@@ -60,7 +61,42 @@ export i32 main(Core core, Cli cli) {
     return 1;
   }
   core.warn("genintro: wrote a " + itoa(cell.len()) + "-byte cell to " + cellOut);
+
+  // Three more arguments turn this into the other half: read an INTRODUCE2 cell — one tor built — and
+  // report what our service recovers from it. The comparison is against the values tor was *given*,
+  // which is what makes it a check across the seam rather than a round trip through our own code.
+  if (cli.argCount().wait() >= 5) {
+    string cellPath = string.fromBytes(cli.arg(2).wait());
+    u8[] encSecret = fromHex(cli.arg(3).wait());
+    u8[] subcred = fromHex(cli.arg(4).wait());
+    if (encSecret.len() != 32 || subcred.len() != 32) {
+      core.warn("genintro: the secret and subcredential must each be 32 bytes of hex");
+      return 1;
+    }
+    FileResult f = cli.readFile(cellPath).wait();
+    if (!f.ok) {
+      core.warn("genintro: " + cellPath + ": " + f.error);
+      return 1;
+    }
+    Introduce2 got = parseIntroduce2(f.bytes, encSecret, subcred);
+    if (!got.ok) {
+      cli.write("PARSE_FAILED\n".toBytes());
+      return 1;
+    }
+    cli.write(("authKey " + hex(got.authKey) + "\n").toBytes());
+    cli.write(("clientPublic " + hex(got.clientPublic) + "\n").toBytes());
+    cli.write(("rendCookie " + hex(got.rendCookie) + "\n").toBytes());
+    cli.write(("rendOnionKey " + hex(got.rendOnionKey) + "\n").toBytes());
+    cli.write(("linkSpecifiers " + hex(got.linkSpecifiers) + "\n").toBytes());
+    cli.write("PARSED\n".toBytes());
+  }
   return 0;
+}
+
+/** Hex from a command line, or empty — a partial decode would be a key that is not the key. */
+u8[] fromHex(u8[] text) {
+  u8[]? decoded = hexDecode(text);
+  return decoded is null ? u8[0]() : decoded!;
 }
 
 string hex(u8[] b) { return string.fromBytes(hexEncode(b)); }
