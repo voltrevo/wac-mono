@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0089](open/0089-a-relay-carries-downloads-but-truncates-uploads-at-about-six-cells.md) | a relay carries downloads but truncates uploads at about six cells | bug | wrong answer |
 | [0088](open/0088-zstd-is-whole-buffer-in-both-directions.md) | zstd is whole-buffer in both directions, and gzip is not | missing feature | not implemented |
 | [0087](open/0087-wacland-under-wasmtime-a-second-host-with-no-javascript.md) | the native runtime: a second host, with no JavaScript and no WASI in it | missing feature | not implemented |
 | [0086](open/0086-merkle-patricia-proofs-so-a-contract-read-is-verified.md) | Merkle-Patricia proofs, so reading a contract does not mean trusting the answer | missing feature | not implemented |

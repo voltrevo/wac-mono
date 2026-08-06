@@ -379,7 +379,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 |---|---|
 | 1 — RSA signing | **pinned.** `rsaSignPkcs1`, `rsaSignRawPkcs1`, byte-identical to node's |
 | 2 — onion service client | **live.** `src/hsconnect.wac` fetches a page from a real onion service over our own circuits |
-| 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, DATA both ways, END all have live witnesses. A connection multiplexes several circuits |
+| 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. **DATA the other way does not**: a 64 KB upload delivers about 3 KB and the stream closes — issue 0089. A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
 | 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. **Not done:** the rendezvous half of the responder (`serviceRendezvousKeys`), building and encrypting a descriptor (the inverse of `hsdesc.wac`), publishing it to the HSDirs, and the program that holds it all together |
@@ -975,3 +975,43 @@ refusal — but `LEGACY_KEY_ID` is inside the MAC span, so the MAC check refuses
 structural check exists. The check only bites on a cell whose MAC is *valid over the modified bytes*,
 which is what a v2 introduction point would actually relay. A case that re-MACs the cell was added,
 and the same fault is caught now.
+
+### Flow control does not break large transfers, and the reason is not us
+
+The biggest untested risk in step 3 was flow control: `relayd.wac` contains no `SENDME` handling and no
+window accounting at all. The prediction was that a transfer larger than the initial stream window —
+500 cells of 498 bytes, about 249 KB — would stall or be killed.
+
+**Wrong, three times.** A ladder of 64 KB, 200 KB, 400 KB and 1 MB all arrived byte-identical. A
+deliberately slow reader (1 MB at 20 KB/s) arrived. Eight megabytes at 100 KB/s — eighty seconds of a
+reader far slower than the sender — arrived, byte-identical, with tor logging nothing about windows at
+all.
+
+Reading tor rather than guessing a fourth time explains it, and the explanation is worth keeping
+because it says when the missing code *would* matter:
+
+  - **Circuit-level SENDMEs are sent unconditionally.** `sendme_circuit_consider_sending` runs after
+    every DATA cell and has no output-buffer gate, so the circuit window is always replenished. Only
+    *stream*-level SENDMEs are held back when `connection_outbuf_too_full`.
+  - **tor applies back-pressure below the protocol.** When its buffers fill it stops reading the OR
+    connection, so our cells wait in the kernel instead of overrunning a window. An exit that sends as
+    fast as it can is throttled by TCP long before it can exceed what tor has advertised.
+
+So the missing window accounting is invisible in the direction everything has been tested in. That is
+not "it works" — it is "the thing that would have caught it cannot happen here", which is a different
+statement and the useful one.
+
+### The direction nobody had tested
+
+Every live test in this document is a **download**. Turning the same harness around — a 64 KB POST
+through the same three relays to a sink that counts what it reads — fails: about 3 KB arrives and the
+relay reports `stream N closed by the far end` when nothing has closed. Twice, with different byte
+counts, and with a direct POST of the same body to the same sink succeeding in the same run.
+
+Filed as **issue 0089** rather than fixed here, because the fix depends on which of two suspects it is
+and one of them is in the platform rather than in Tor. The asymmetry that makes it interesting: a
+download reads one socket and writes another, while an upload writes a socket that already has a
+`recv` outstanding on it.
+
+Step 3's line in the state table said "a stream carries bytes". It does — in one direction. The table
+now says which.

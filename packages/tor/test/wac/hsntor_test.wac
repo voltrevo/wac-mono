@@ -13,14 +13,16 @@ import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import {
   clientIntroduceKeys, clientRendezvousKeys, hsMac, clientPublicKey, rendezvousCircuitKeys,
-  serviceIntroduceKeys, tHsEnc, tHsVerify, tHsMac, mHsExpand, S_KEY_LEN, MAC_LEN,
+  serviceIntroduceKeys, serviceRendezvousKeys, tHsEnc, tHsVerify, tHsMac, mHsExpand, S_KEY_LEN,
+  MAC_LEN,
 } from "../../src/hsntor.wac";
 import { x25519Base } from "../../../crypto/src/x25519.wac";
 
 const i32 V_COUNT = 0;
 const i32 V_CASE = 1;   // authKey(32) encKey(32) clientSec(32) clientPub(32) svcPub(32)
                         // subcred(32) encOut(32) macOut(32) authMac(32) keySeed(32)
-                        // introEncSecret(32) — appended, so the offsets above are unchanged
+                        // introEncSecret(32) serviceEphemeralSecret(32) — appended, so the
+                        // offsets above are unchanged
 
 bool same(u8[] a, u8[] b) {
   if (a.len() != b.len()) { return false; }
@@ -158,6 +160,73 @@ export string test_the_rendezvous_keys_are_tors(fn[u8[](i32, u8[], u8[])] ref) {
     t.isTrue(same(slice(out, 32, 64), slice(c, 288, 320)),
              "case " + itoa64(i as i64) + ": NTOR_KEY_SEED agrees with tor's");
   }
+  return t.report();
+}
+
+/**
+ * The service derives the same rendezvous keys the client does.
+ *
+ * Both against **tor's** values: `capture-hsntor.py` takes `authMac` and `ntorKeySeed` from
+ * `test-hs-ntor-cl client2`, so the expected numbers were computed by tor's client and are being
+ * reproduced by our service. The two sides reach the same pair of shared values from opposite
+ * directions — EXP(Y, x) and EXP(B, x) for the client, EXP(X, y) and EXP(X, b) for the service — and
+ * that is the only difference between the two derivations.
+ */
+export string test_the_service_derives_the_same_rendezvous_keys(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(V_COUNT, none(), none())[0];
+  t.isTrue(n >= 3, "there are several cases, not one");
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] c = ref(V_CASE, arg1(i), none());
+    u8[] authKey = slice(c, 0, 32);
+    u8[] clientPub = slice(c, 96, 128);
+    u8[] svcPub = slice(c, 128, 160);
+    u8[] wantAuthMac = slice(c, 256, 288);
+    u8[] wantKeySeed = slice(c, 288, 320);
+    u8[] encSecret = slice(c, 320, 352);
+    u8[] svcSecret = slice(c, 352, 384);
+
+    // The vector's halves must belong together, or nothing below it means anything.
+    t.eqBytes(x25519Base(svcSecret), svcPub, "the service ephemeral secret matches its public half");
+
+    u8[] keys = serviceRendezvousKeys(authKey, encSecret, svcSecret, clientPub);
+    t.eqI32(keys.len(), 64, "the service gets 64 bytes");
+    t.eqBytes(slice(keys, 0, 32), wantAuthMac, "AUTH_INPUT_MAC is the one tor's client expects");
+    t.eqBytes(slice(keys, 32, 64), wantKeySeed, "NTOR_KEY_SEED is tor's");
+
+    // And the same as our client's, which is what lets a circuit be joined at all.
+    u8[] clientSec = slice(c, 64, 96);
+    u8[] encKey = slice(c, 32, 64);
+    t.eqBytes(keys, clientRendezvousKeys(authKey, clientSec, encKey, svcPub),
+              "the two sides agree");
+  }
+  return t.report();
+}
+
+/** Every input matters to the service's rendezvous half too, and degenerate keys are refused. */
+export string test_the_service_rendezvous_refuses_what_it_should(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] c = ref(V_CASE, arg1(0), none());
+  u8[] authKey = slice(c, 0, 32);
+  u8[] clientPub = slice(c, 96, 128);
+  u8[] encSecret = slice(c, 320, 352);
+  u8[] svcSecret = slice(c, 352, 384);
+  u8[] good = serviceRendezvousKeys(authKey, encSecret, svcSecret, clientPub);
+
+  t.isTrue(!same(good, serviceRendezvousKeys(flip(authKey), encSecret, svcSecret, clientPub)),
+           "the auth key changes the keys");
+  t.isTrue(!same(good, serviceRendezvousKeys(authKey, flipScalar(encSecret), svcSecret, clientPub)),
+           "the introduction secret changes the keys");
+  t.isTrue(!same(good, serviceRendezvousKeys(authKey, encSecret, flipScalar(svcSecret), clientPub)),
+           "the ephemeral secret changes the keys");
+  t.isTrue(!same(good, serviceRendezvousKeys(authKey, encSecret, svcSecret, flip(clientPub))),
+           "the client key changes the keys");
+
+  t.eqI32(serviceRendezvousKeys(authKey, encSecret, svcSecret, u8[32]()).len(), 0,
+          "an all-zero client key is refused");
+  t.eqI32(serviceRendezvousKeys(authKey, encSecret, u8[0](), clientPub).len(), 0,
+          "and a missing ephemeral secret is not a secret");
   return t.report();
 }
 
