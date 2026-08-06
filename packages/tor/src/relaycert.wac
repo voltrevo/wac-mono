@@ -171,6 +171,31 @@ export u8[] ed25519CertExpanded(
 }
 
 /**
+ * A certificate signed with an expanded secret that **does** carry its signing key.
+ *
+ * `ed25519CertExpanded` omits the extension because a proposal 228 crosscert's verifier already
+ * holds the key. An onion service's descriptor-signing-key certificate is the opposite case: the
+ * blinded key is *only* available from inside the certificate, and tor reads it from there —
+ * `hs_desc_decode_plaintext` reports `blinded_pubkey` taken out of this extension. Omit it and the
+ * descriptor has no blinded key at all, which is not a subtle failure but is a confusing one,
+ * because everything else about the document is well-formed.
+ *
+ * The signing key is passed as well as the secret rather than derived from it, so a caller that has
+ * them inconsistent gets a certificate that fails verification rather than one that silently
+ * certifies under a key nobody expected.
+ */
+export u8[] ed25519CertExpandedWithKey(
+  i32 certType, i64 expirationHours, i32 certKeyType, u8[] certifiedKey, u8[] signingKey,
+  u8[] signingExpanded
+) {
+  if (signingExpanded.len() != 64 || signingKey.len() != 32) { return u8[0](); }
+  u8[] body =
+    ed25519CertBody(certType, expirationHours, certKeyType, certifiedKey, signingKey, true);
+  if (body.len() == 0) { return u8[0](); }
+  return withSignature(body, ed25519SignExpanded(signingExpanded, body));
+}
+
+/**
  * `onion-key-crosscert`: the TAP onion key signing the two identities it is published under.
  *
  * 52 bytes are signed — SHA-1 of the DER `RSAPublicKey` identity (what `rsaFingerprint` returns),

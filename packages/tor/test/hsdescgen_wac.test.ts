@@ -50,6 +50,13 @@
 // So this verdict is a strong one — unlike a microdescriptor's, where only the digest discriminates.
 // Everything in the document is covered by either the signature or the certificate.
 //
+// **The keys are blinded now, as a real service's are**, and the subcredential tor is handed is the
+// derived one rather than a constant. Until this was wired up, blinding and the descriptor were each
+// pinned against tor and never against each other — a descriptor signed with any key at all decoded
+// perfectly, because nothing in the format says which key ought to have signed it. Controls on the
+// joined chain: all-zero subcredential REJECTED, and a subcredential built from the right identity
+// with the wrong blinded key REJECTED.
+//
 // One of those rows was nearly recorded wrongly. An early run reported "one character of the
 // certificate — ACCEPTED", which looked like a real gap; the string being replaced was from the
 // *previous* generated document and appeared nowhere in the current one, so the mutation changed
@@ -63,7 +70,6 @@ const H_CERT = 1;
 const H_SUPERENCRYPTED = 2;
 const H_SIGN_SEED = 3;
 const H_SIGN_PUBLIC = 4;
-const H_BLIND_SEED = 5;
 const H_BLIND_PUBLIC = 6;
 const H_NUM = 7; // a[0]: 0 lifetime, 1 revision, 2 signedSpanLen, 3 middleLen — 4 bytes big-endian
 const H_SUBCRED = 8;
@@ -79,6 +85,10 @@ const H_IP_ENC = 17;
 const H_IP_ENC_ED = 18;
 const H_AUTH_CERT = 19;
 const H_ENC_CERT = 20;
+const H_IDENTITY_SEED = 21;
+const H_IDENTITY_PUBLIC = 22;
+const H_FACTOR = 23;
+const H_BLIND_EXPANDED = 24;
 
 const v = JSON.parse(
   await Deno.readTextFile(new URL("data/hsdesc_generated.json", import.meta.url)),
@@ -88,8 +98,13 @@ const v = JSON.parse(
   superencrypted: string;
   signSeed: string;
   signPublic: string;
-  blindSeed: string;
   blindPublic: string;
+  identitySeed: string;
+  identityPublic: string;
+  periodNum: number;
+  periodLength: number;
+  factor: string;
+  blindExpanded: string;
   lifetimeMinutes: number;
   revision: number;
   signedSpanLen: number;
@@ -142,13 +157,19 @@ function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
       return hex(v.signSeed);
     case H_SIGN_PUBLIC:
       return hex(v.signPublic);
-    case H_BLIND_SEED:
-      return hex(v.blindSeed);
+    case H_IDENTITY_SEED:
+      return hex(v.identitySeed);
+    case H_IDENTITY_PUBLIC:
+      return hex(v.identityPublic);
+    case H_FACTOR:
+      return hex(v.factor);
+    case H_BLIND_EXPANDED:
+      return hex(v.blindExpanded);
     case H_BLIND_PUBLIC:
       return hex(v.blindPublic);
     case H_NUM:
       return be32([v.lifetimeMinutes, v.revision, v.signedSpanLen, v.middleLen,
-                   v.innerPlainLen][a[0]]);
+                   v.innerPlainLen, v.periodNum, v.periodLength][a[0]]);
     case H_SUBCRED:
       return hex(v.subcredential);
     case H_EPHEMERAL:

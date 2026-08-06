@@ -9,6 +9,10 @@ import {
   decryptLayer, encryptedConstant, superencryptedConstant, SALT_LEN, MAC_LEN,
 } from "../../src/hsdesc.wac";
 import { linkSpecifiersValid } from "../../src/hsintro.wac";
+import { blindedSecretKey, blindingFactor, subcredential } from "../../src/hsblind.wac";
+import { CERT_TYPE_SIGNING_HS_DESC, ed25519CertExpandedWithKey } from "../../src/relaycert.wac";
+import { ed25519ExpandedSecret, ed25519PublicKey, ed25519PublicKeyExpanded }
+  from "../../../crypto/src/ed25519.wac";
 import { ed25519Verify } from "../../../crypto/src/ed25519.wac";
 
 const i32 H_DESCRIPTOR = 0;
@@ -16,7 +20,10 @@ const i32 H_CERT = 1;
 const i32 H_SUPERENCRYPTED = 2;
 const i32 H_SIGN_SEED = 3;
 const i32 H_SIGN_PUBLIC = 4;
-const i32 H_BLIND_SEED = 5;
+const i32 H_IDENTITY_SEED = 21;
+const i32 H_IDENTITY_PUBLIC = 22;
+const i32 H_FACTOR = 23;
+const i32 H_BLIND_EXPANDED = 24;
 const i32 H_BLIND_PUBLIC = 6;
 const i32 H_NUM = 7;
 const i32 H_SUBCRED = 8;
@@ -283,6 +290,79 @@ export string test_a_bad_introduction_point_is_refused(fn[u8[](i32, u8[], u8[])]
   t.eqI32(introPointSection(ls, ntor, a, u8[31](), e).len(), 0, "a 31-byte encryption key is not one");
   t.eqI32(introPointSection(ls, ntor, a, enc, u8[0]()).len(), 0, "no cross certificate, no section");
   return t.report();
+}
+
+/**
+ * The whole chain, from one identity seed to the subcredential tor decrypted with.
+ *
+ * Every link here was already pinned against tor on its own. What was missing is that they were never
+ * joined: the descriptor was built with ordinary keypairs and a subcredential chosen at random, and
+ * every oracle accepted it, because **nothing in a descriptor says which key ought to have signed
+ * it**. A service that blinded wrongly would publish a document that decodes perfectly for anyone who
+ * does not know the identity key and fails only for the clients who do.
+ *
+ * So this walks the chain a service actually walks — identity, factor, blinded keypair,
+ * subcredential — and ends at the value tor was handed when it decrypted both layers.
+ */
+export string test_the_chain_from_identity_to_subcredential(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] seed = ref(H_IDENTITY_SEED, none(), none());
+
+  t.eqBytes(ed25519PublicKey(seed), ref(H_IDENTITY_PUBLIC, none(), none()),
+            "the identity public key is the seed's own");
+
+  i64 periodNum = num(ref, 5) as i64;
+  i64 periodLength = num(ref, 6) as i64;
+  u8[] factor = blindingFactor(ref(H_IDENTITY_PUBLIC, none(), none()), periodNum, periodLength);
+  t.eqBytes(factor, ref(H_FACTOR, none(), none()),
+            "the blinding factor is the one this period gives");
+
+  u8[] blindExpanded = blindedSecretKey(ed25519ExpandedSecret(seed), factor);
+  t.eqBytes(blindExpanded, ref(H_BLIND_EXPANDED, none(), none()),
+            "the blinded secret follows from the identity and the factor");
+  t.eqBytes(ed25519PublicKeyExpanded(blindExpanded), ref(H_BLIND_PUBLIC, none(), none()),
+            "and its public half is the blinded key tor read out of the certificate");
+
+  t.eqBytes(subcredential(ref(H_IDENTITY_PUBLIC, none(), none()), ref(H_BLIND_PUBLIC, none(), none())),
+            ref(H_SUBCRED, none(), none()),
+            "the subcredential tor decrypted with is the derived one, not a constant");
+
+  // And the certificate itself, rebuilt from the blinded secret. Every other test here takes the
+  // certificate from the vector as an *input*, so a fault in how it is built was invisible to all of
+  // them — one planted fault ("omit the signing key extension") survived until this line existed.
+  // Without that extension tor has nowhere to read `blinded_pubkey` from at all.
+  t.eqBytes(ed25519CertExpandedWithKey(CERT_TYPE_SIGNING_HS_DESC, expiryHoursOf(ref), 1,
+                                       ref(H_SIGN_PUBLIC, none(), none()),
+                                       ref(H_BLIND_PUBLIC, none(), none()), blindExpanded),
+            ref(H_CERT, none(), none()),
+            "the signing-key certificate is signed by the blinded key and carries it");
+
+  // A neighbouring period gives a different everything, which is what makes a descriptor expire from
+  // the hash ring rather than linger under a stale name.
+  u8[] otherFactor = blindingFactor(ref(H_IDENTITY_PUBLIC, none(), none()), periodNum + 1,
+                                    periodLength);
+  t.isTrue(!sameBytes(otherFactor, factor), "the next period has its own factor");
+  u8[] otherBlind = ed25519PublicKeyExpanded(
+    blindedSecretKey(ed25519ExpandedSecret(seed), otherFactor));
+  t.isTrue(!sameBytes(otherBlind, ref(H_BLIND_PUBLIC, none(), none())),
+           "and its own blinded key");
+  t.isTrue(!sameBytes(subcredential(ref(H_IDENTITY_PUBLIC, none(), none()), otherBlind),
+                      ref(H_SUBCRED, none(), none())),
+           "and its own subcredential, so last period's descriptor will not decrypt");
+  return t.report();
+}
+
+/**
+ * The certificate's expiry, read back out of the committed certificate.
+ *
+ * Taken from the bytes rather than recomputed, because the generator's choice of expiry is not
+ * something this test is about — and hard-coding it here would be a second place to update.
+ */
+i64 expiryHoursOf(fn[u8[](i32, u8[], u8[])] ref) {
+  u8[] cert = ref(H_CERT, none(), none());
+  // VERSION[1] CERT_TYPE[1] EXPIRATION[4] — big-endian hours since the epoch.
+  return ((cert[2] as i64) << 24) | ((cert[3] as i64) << 16) | ((cert[4] as i64) << 8) |
+         (cert[5] as i64);
 }
 
 /** How many times `needle` appears. */
