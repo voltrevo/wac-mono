@@ -532,3 +532,28 @@ order. Promises make each idempotent, so a child killed after it finished keeps 
 watched it not happen; a once-in-fifty hang needs more than one clean run. What can be said is that this
 mechanism produces exactly the state that was observed, it is now impossible, and the deadlock detector
 would turn any survivor into a named failure in ninety seconds rather than a hang.
+
+### The third layer: the bridge protocol is sound, which eliminates it (agent-a, 2026-08-06)
+
+`test/bridge_model.test.ts` walks every interleaving of the two agents' moves over one slot — claim,
+publish, take, answer, collect, cancel, reclaim — to depth nine, against: an answer collected that belongs
+to a different call; a slot freed while the host is inside its handler; a slot published with no opcode; and
+a slot **owned by nobody**, meaning nothing will ever move it again.
+
+**No violation.** Seven distinct slot states are reachable and every one of them can return to free. So the
+protocol is not where the wedge is, which agrees with the observed evidence — the slot was `running` with
+the host alive, meaning it *had* been taken and the handler never came back — and leaves the lifecycle hole
+fixed above as the mechanism that matches.
+
+Both historical bugs are caught by the same invariants, which is what makes the "no violation" worth
+anything:
+
+- the plain store where a compare-and-exchange belongs, by
+  `claim → publish → take → cancel → take → answer` — the exact race the code's own comment describes;
+- one state for "claimed" and "pending" together, by a slot published with no opcode in it, which is the
+  `no handler for capability 0` this repo saw.
+
+Ownership had to be stated precisely for the first of those to be caught at all: a slot is owned if it is
+free, claimed, cancelled, held by a live ticket, or being worked on. Writing it as "ready counts as owned"
+let the mutant through, because that bug's whole signature is an answer written into a slot whose ticket
+had already died.
