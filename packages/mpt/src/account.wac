@@ -28,7 +28,7 @@
 // A caller that treats a failed proof as an empty slot has undone the point of the exercise, so `ok` is
 // separate from `present` here exactly as it is one layer down.
 
-import { verify, Proved } from "./proof.wac";
+import { verify, Proved, emptyTrieRoot } from "./proof.wac";
 import { decode, Decoded, Item, itemsOf, bytesOf, isList } from "../../rlp/src/rlp.wac";
 import { keccak256 } from "../../crypto/src/keccak.wac";
 import { itoa } from "../../fmt/src/itoa.wac";
@@ -103,6 +103,15 @@ export AccountProof accountAt(u8[] stateRoot, u8[] address, u8[][] nodes) {
     return AccountProof.of(false, false, emptyAccount(),
       "an account has four items, and this one has " + itoa(parts.len()));
   }
+  // Every field of an account is a byte string. A list in any of them used to read as empty — which for
+  // the nonce and the balance means *zero*, an account that has never sent a transaction and holds
+  // nothing, from bytes committed to the state trie (wac-mono upstream #43).
+  for (i32 i = 0; i < 4; i++) {
+    if (isList(parts[i])) {
+      return AccountProof.of(false, false, emptyAccount(),
+        "an account's " + fieldName(i) + " is a byte string, and this one is a list");
+    }
+  }
   u8[] root = bytesOf(parts[2]);
   u8[] code = bytesOf(parts[3]);
   // Checked here rather than left to the storage walk: a 31-byte "root" would fail there with a message
@@ -156,8 +165,22 @@ export StorageProof storageAt(u8[] storageRoot, u8[] slot, u8[][] nodes) {
   return StorageProof.of(true, true, v, "");
 }
 
-/** The storage root of an account with nothing in it: `keccak256(rlp(""))`. */
-export u8[] emptyStorageRoot() { return keccak256(u8[](0x80)); }
+/** An account field's name, for the message a shape error produces. */
+string fieldName(i32 i) {
+  if (i == 0) { return "nonce"; }
+  if (i == 1) { return "balance"; }
+  if (i == 2) { return "storage root"; }
+  return "code hash";
+}
+
+/**
+ * The storage root of an account with nothing in it.
+ *
+ * The same value as `proof.emptyTrieRoot`, and delegating rather than repeating the hash: an account with
+ * no storage has a storage trie with nothing in it, so this is that one root under the name a caller of
+ * `storageAt` will be looking for. Two spellings of one constant is how they drift apart.
+ */
+export u8[] emptyStorageRoot() { return emptyTrieRoot(); }
 
 /** `keccak256` of the empty string — the code hash of an account that is not a contract. */
 export u8[] emptyCodeHash() { return keccak256(u8[0]()); }

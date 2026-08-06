@@ -9,9 +9,9 @@
 // are each individually valid, against roots that have nothing to do with each other. So the storage root is
 // never supplied by the test — it comes out of the account proof, exactly as a caller must take it.
 
-import { wacBind } from "../../../harness/wacBind.ts";
 import { trie } from "./trie.ts";
 import { rlpEncode } from "./rlp.ts";
+import { accountAt, emptyRoots, hex, keccak, storageAt } from "./probe.ts";
 
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
@@ -21,65 +21,6 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
         `  got:  ${JSON.stringify(got)}\n  want: ${JSON.stringify(want)}`,
     );
   }
-}
-
-const probe = await wacBind("packages/mpt/test/wac/probe.wac") as Record<string, unknown>;
-const keccak = probe.hash as (b: Uint8Array) => Uint8Array;
-const accountRaw = probe.verifyAccount as (r: Uint8Array, a: Uint8Array, n: Uint8Array) => Uint8Array;
-const storageRaw = probe.verifyStorage as (r: Uint8Array, s: Uint8Array, n: Uint8Array) => Uint8Array;
-
-const hex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
-const dec = new TextDecoder();
-
-function packNodes(nodes: Uint8Array[]): Uint8Array {
-  const out = new Uint8Array(nodes.reduce((n, x) => n + 4 + x.length, 0));
-  let at = 0;
-  for (const n of nodes) {
-    out[at] = n.length & 0xff;
-    out[at + 1] = (n.length >> 8) & 0xff;
-    out[at + 2] = (n.length >> 16) & 0xff;
-    out[at + 3] = (n.length >> 24) & 0xff;
-    out.set(n, at + 4);
-    at += 4 + n.length;
-  }
-  return out;
-}
-
-type AccountAnswer = {
-  ok: boolean;
-  present: boolean;
-  nonce: string;
-  balance: string;
-  storageRoot: Uint8Array;
-  codeHash: string;
-  error: string;
-};
-
-function accountAt(stateRoot: Uint8Array, address: Uint8Array, nodes: Uint8Array[]): AccountAnswer {
-  const out = accountRaw(stateRoot, address, packNodes(nodes));
-  const nl = out[2], bl = out[3];
-  const present = out[1] === 1;
-  const at = 4 + nl + bl;
-  return {
-    ok: out[0] === 1,
-    present,
-    nonce: hex(out.subarray(4, 4 + nl)),
-    balance: hex(out.subarray(4 + nl, at)),
-    storageRoot: present ? out.slice(at, at + 32) : new Uint8Array(0),
-    codeHash: present ? hex(out.subarray(at + 32, at + 64)) : "",
-    error: dec.decode(out.subarray(present ? at + 64 : at)),
-  };
-}
-
-function storageAt(root: Uint8Array, slot: Uint8Array, nodes: Uint8Array[]) {
-  const out = storageRaw(root, slot, packNodes(nodes));
-  const len = out[2] | (out[3] << 8) | (out[4] << 16) | (out[5] << 24);
-  return {
-    ok: out[0] === 1,
-    present: out[1] === 1,
-    value: hex(out.subarray(6, 6 + len)),
-    error: dec.decode(out.subarray(6 + len)),
-  };
 }
 
 /** A 32-byte slot key, and the minimal big-endian bytes a slot value is stored as. */
@@ -93,8 +34,6 @@ const minimal = (n: number) => {
   for (let x = n; x > 0; x = Math.floor(x / 256)) out.unshift(x & 0xff);
   return new Uint8Array(out);
 };
-
-const emptyRoots = probe.emptyRoots as () => Uint8Array;
 
 const EMPTY_STORAGE_ROOT = keccak(rlpEncode(new Uint8Array(0)));
 const EMPTY_CODE_HASH = keccak(new Uint8Array(0));

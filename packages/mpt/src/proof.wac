@@ -68,6 +68,14 @@ export struct Proved {
 }
 
 /**
+ * The root of a trie with nothing in it: `keccak256(rlp(""))`, which is `keccak256(0x80)`.
+ *
+ * Every empty trie has this root — it is a hash of the encoding of nothing, so there is only one — and
+ * `verify` treats it as a complete proof that any key is absent.
+ */
+export u8[] emptyTrieRoot() { return keccak256(u8[](0x80)); }
+
+/**
  * What `root` commits to at `key`, according to `nodes`.
  *
  * `key` is the trie key as *bytes* — for Ethereum's state and storage tries that is already a keccak256
@@ -76,7 +84,17 @@ export struct Proved {
  */
 export Proved verify(u8[] root, u8[] key, u8[][] nodes) {
   if (root.len() != 32) { return Proved.of(false, false, u8[0](), "a root must be 32 bytes"); }
-  if (nodes.len() == 0) { return Proved.of(false, false, u8[0](), "a proof with no nodes proves nothing"); }
+  if (nodes.len() == 0) {
+    // **An empty trie is the one root a proof of absence needs no nodes for.** There is nothing to walk:
+    // the root itself says the trie is empty, and every key is absent from an empty trie. Refusing this was
+    // not a safety property, it was an off-by-one in what "proves nothing" means — and the case is
+    // ordinary rather than exotic, because it is what an untouched account's storage looks like. A provider
+    // asked for a slot of an account that has never written one has exactly zero nodes to send
+    // (wac-mono upstream #44).
+    if (bytesEq(root, emptyTrieRoot())) { return Proved.of(true, false, u8[0](), ""); }
+    return Proved.of(false, false, u8[0](),
+      "a proof with no nodes proves nothing, unless the root is the empty trie's");
+  }
 
   u8[] path = nibblesOf(key);
   Walk w = Walk(nodes, 0, path, 0, "", false, u8[0]());
@@ -148,6 +166,12 @@ void step(Walk w, Item node) {
     if (w.at == w.path.len()) {
       // The path ends exactly at this branch, so its own value slot is the answer — empty means the key is
       // absent, which is as sound a result as a value.
+      if (isList(parts[16])) {
+        // A branch's own value slot, holding a list. Without this check `bytesOf` answered empty and the
+        // walk read that as *absence* — a malformed node proving a key is not there.
+        w.error = "a branch's value is a byte string, and this one is a list";
+        return;
+      }
       u8[] v = bytesOf(parts[16]);
       w.found = v.len() > 0;
       w.value = v;
@@ -165,6 +189,10 @@ void step(Walk w, Item node) {
   }
 
   // Leaf or extension: the first item's top nibble says which, and carries the odd-length flag.
+  if (isList(parts[0])) {
+    w.error = "a hex-prefix header is a byte string, and this one is a list";
+    return;
+  }
   u8[] head = bytesOf(parts[0]);
   if (head.len() == 0) {
     w.error = "a leaf or extension needs a hex-prefix header, and this one is empty";
@@ -210,6 +238,12 @@ void step(Walk w, Item node) {
     if (w.at != w.path.len()) {
       w.found = false;
       w.value = u8[0]();
+      return;
+    }
+    if (isList(parts[1])) {
+      // The worst of the three: `bytesOf` answered empty, so the walk reported the key **present with an
+      // empty value** — a well-formed-looking answer to a question the trie never answered.
+      w.error = "a leaf's value is a byte string, and this one is a list";
       return;
     }
     w.found = true;
