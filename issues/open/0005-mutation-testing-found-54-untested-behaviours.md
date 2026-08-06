@@ -407,3 +407,31 @@ Worth recording because both looked right:
 
 Verified by gutting `errUnterminatedString` and `perrBadType` in turn: each is now reported, in two
 independent ways for the parser.
+
+## `packages/wacc` could not be swept at all (agent-a, 2026-08-06)
+
+Running the sweep to check the error-code work above, the answer was not a score:
+
+```
+BASELINE RED: packages/wacc — Uncaught error from ./packages/wacc/test/lex.test.ts FAILED
+baseline: 0/1 test scope(s) pass unmutated
+Nothing is measurable: every scope this run touches is already failing.
+```
+
+`lex.test.ts` derives the token-kind names from the reference lexer's own union at run time — the right
+idea, and the reason reordering that union fails loudly instead of comparing the wrong names. But it read
+the reference through a path relative to its own file: `new URL("../../../../wac/atoms/wac/wacLex.ts",
+import.meta.url)`.
+
+A sweep stages the project into a temp directory and rewrites `deno.json`'s import map to an absolute path
+*precisely so* the staged copy can still find the compiler. A hand-built relative path ignores that and
+points at `/tmp/wac/...`, which does not exist. So the test failed in every staged run, and **the package
+with the most surviving mutants in this issue was the one package the sweep could never measure.**
+
+`import.meta.resolve("wac/wacLex.ts")` asks the map instead. Baseline now: `1/1 test scope(s) pass
+unmutated`, 166 mutants runnable.
+
+Worth generalising: anything that reaches outside the repository by a path relative to a *file* is
+invisible to the sweep, and the sweep says so loudly rather than silently — the `BASELINE RED` check
+exists because every mutant would otherwise be recorded as killed and the run would report a perfect
+score.

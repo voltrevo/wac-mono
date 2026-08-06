@@ -28,8 +28,14 @@ const STRIDE = 5;
 
 /** Kind names in declaration order — the numbering the wac side uses. */
 async function kindNames(): Promise<string[]> {
-  const url = new URL("../../../../wac/atoms/wac/wacLex.ts", import.meta.url);
-  const src = await Deno.readTextFile(url);
+  // **Through the import map, not a path relative to this file.** `deno.json` maps `wac/` to the sibling
+  // checkout, and a mutation sweep stages the project into a temp directory *and rewrites that mapping to
+  // an absolute path* precisely so the staged copy can still find the compiler. A hand-built
+  // `../../../../wac/...` ignores all of that and points at `/tmp/wac/...`, which does not exist — so
+  // this test failed in every staged run, the sweep reported `BASELINE RED: packages/wacc`, and
+  // `packages/wacc` could not be swept at all. It is the package with the most surviving mutants in
+  // wac-mono 0005. `import.meta.resolve` asks the map.
+  const src = await Deno.readTextFile(new URL(import.meta.resolve("wac/wacLex.ts")));
   const m = src.match(/export type TokenKind =([\s\S]*?)\| "eof";/);
   if (!m) throw new Error("could not find the TokenKind union in wacLex.ts");
   const found = [...m[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((x) => x[1]);
