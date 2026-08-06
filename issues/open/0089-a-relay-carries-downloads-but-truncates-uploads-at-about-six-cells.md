@@ -88,6 +88,48 @@ authenticate — at an exit that means the running backward/forward digest has g
 the most likely place for that is the exchange of two `RELAY_END`s around a stream closing. Second:
 whatever `dropCirc` is reached by. Both are `relayd.wac`'s, not the platform's.
 
+## Three variables separated, and the answer is none of the ones I had
+
+One run with four requests through a pinned exit settles what every earlier run conflated:
+
+| request | result |
+| --- | --- |
+| GET #1 — first stream on the circuit | works |
+| GET #2 — **second** stream on the same circuit | **works** |
+| POST of 100 bytes — an upload, under one cell | **works** |
+| POST of 64 KB | fails |
+
+So it is **not** "the second stream on a reused circuit", **not** "uploads", and **not** optimistic
+data — the 100-byte POST is optimistic too and goes through. What is left is size.
+
+And with the counters reset per stream and every log line carrying its connection number, the failure
+is exact and repeats byte for byte across runs:
+
+    [1] stream 14949 is carrying data from the client
+    [1] stream 14949 closed by the far end after 498 bytes in, 0 bytes out
+    [1] relay command 2 on stream 14949 (this circuit has no stream)   x6
+
+**Exactly 498 bytes — one relay cell's payload — reach the target, then the read on the target socket
+returns `End`.** The remaining six DATA cells arrive for a stream that no longer exists. The sink is
+demonstrably still alive at that point: its own log says `POST header seen, want 65536` and it never
+prints the line it would print if its connection had closed.
+
+So the question is now narrow and mechanical: **why does a read on the target socket end after exactly
+one cell has been written to it, when the peer is alive and blocked reading?** That is one send of 498
+bytes followed by a spurious `End`, and `writeread.wac` says a send does not do that — but
+`writeread`'s peer never reads, and this one does.
+
+## What was tried and did not change it
+
+Reads are no longer re-armed before the code decides whether the socket is about to be closed. That
+was a real defect — a ticket left outstanding on a dead handle holds one of the platform ring's
+sixteen slots forever, and issue 0091 is about that budget — but fixing it changed nothing here. Kept
+because it is right, not because it helped.
+
+**And one run in the middle failed completely**, with every request timing out. Re-running the same
+binary reproduced the normal results, so that run was flaky and not the change. Worth writing down
+because the temptation to attribute it was strong and it would have sent the next hour the wrong way.
+
 ## Pinned, reproducible, and one lead left
 
 `ExitNodes <fp>` plus `StrictNodes 1` in the probe's torrc removes tor's random exit choice, and with
