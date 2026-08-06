@@ -18,6 +18,7 @@
 // are editing right now as well as the branch you are on.
 
 import { refuseIfNested, SUITE_ENV } from "./suiteGuard.ts";
+import { exclusiveTests, laneSplit } from "../harness/testLane.ts";
 
 refuseIfNested("deno task test:changed");
 
@@ -68,16 +69,31 @@ if (shared.length === 0) {
 }
 
 const started = Date.now();
+// The same lane the gate uses: a file that declared itself exclusive is not run beside four others,
+// whichever entry point started it. Two entry points with different rules would mean a flake that only
+// appears in the gate, which is the worst place to meet one. See `harness/testLane.ts`.
+//
+// **Matched by prefix, not by equality.** `targets` here are *directories* — `packages/ssh/` — and
+// `deno test` discovers the files inside them. The first version of this compared a directory against a
+// file path, so nothing ever matched, the lane was empty and everything ran in parallel exactly as
+// before. It looked like it worked: the suite passed, and the output said nothing either way.
+// `targets` is empty in whole-suite mode, and empty means *everything* — which is the second way this
+// was wrong when it was written inline. `laneSplit` is the one place that decides.
+const { alone } = laneSplit(targets, (await exclusiveTests()).map((e) => e.file));
+const together = targets;
 const r = await new Deno.Command("deno", {
   args: [
     "test",
     "--parallel",
+    // Excluded from the parallel pass rather than removed from `targets`, since a target is a whole
+    // directory and only some of its files are exclusive.
+    ...(alone.length > 0 ? [`--ignore=${alone.join(",")}`] : []),
     "--allow-read",
     "--allow-write",
     "--allow-run",
     "--allow-net",
     "--allow-env",
-    ...targets,
+    ...together,
   ],
   // The same cap `tools/runTests.ts` applies, so the two entry points do not differ in how much of
   // the machine they take. See issue 0075 for the measurement behind 4. `SUITE_ENV` marks the children so
@@ -87,5 +103,18 @@ const r = await new Deno.Command("deno", {
   stderr: "inherit",
 }).output();
 
+let lane = 0;
+if (alone.length > 0) {
+  console.log(`\n${alone.length} file(s) run alone, by their own declaration:`);
+  for (const f of alone) console.log(`  ${f}`);
+  const second = await new Deno.Command("deno", {
+    args: ["test", "--allow-read", "--allow-write", "--allow-run", "--allow-net", "--allow-env", ...alone],
+    env: { DENO_JOBS: "1", ...SUITE_ENV },
+    stdout: "inherit",
+    stderr: "inherit",
+  }).output();
+  lane = second.code;
+}
+
 console.log(`\n${((Date.now() - started) / 1000).toFixed(1)}s`);
-Deno.exit(r.code);
+Deno.exit(r.code !== 0 ? r.code : lane);

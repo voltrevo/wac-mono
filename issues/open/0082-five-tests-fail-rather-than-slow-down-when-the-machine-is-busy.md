@@ -458,3 +458,36 @@ regression gets waved through, and it is the failure mode of this whole practice
 
 Verified it fails: pointing one tag at a closed issue reports
 `packages/box/test/shell.test.ts:130 is tagged [flaky 0011], which is closed`.
+
+### The ssh member is fixed at its root: a lane rather than a fifth workaround (agent-a, 2026-08-06)
+
+`ConnectionReset` during an OpenSSH handshake, under five parallel workers, once in eight suite runs. The
+next thing I was about to try was setting `MaxStartups` in the fixture — which would have been the *fifth*
+workaround for one decision. The others: `harness/port.ts` holding a listener until the bind,
+`harness/reap.ts` killing sshds orphaned by a killed run, that reaper's pattern being deliberately
+unanchored because sshd rewrites its argv, and a two-minute worker-readiness grace.
+
+The decision was running tests that need exclusive machine resources concurrently with everything else. So
+a file can now declare that it needs the machine:
+
+    // test-lane: exclusive — a real OpenSSH server per case, on a real port
+
+and both `deno task test` and `deno task test:changed` run those files in a pass of their own, one at a
+time, after the parallel pass. Three files declare it, all in `packages/ssh`.
+
+**Measured cost: about 10 seconds** on a 70-second suite — 1183 tests in parallel, then 46 alone. That buys
+the removal of a flake whose cause was never established, and it would have removed it whichever of the two
+candidates was right, because both are consequences of concurrency rather than of ssh.
+
+Kept honest by `tools/lane.test.ts`: every declaration must give a reason, the lane's membership is printed
+on every green run, and more than six files in it fails the suite — because "run it alone" is an easier
+answer than fixing a test, and a lane with twenty files in it is a sequential suite wearing a lane.
+
+`harness/testLane.ts` holds the one decision, `laneSplit`, and it is unit-tested because both callers got
+it wrong when it was written inline: `test:changed` compared a *directory* target against a *file* path so
+nothing ever matched, and its whole-suite mode passes no targets at all, where "no targets" means
+everything rather than nothing. Neither mistake failed anything — the suite passed, in parallel, exactly as
+before, and said nothing either way.
+
+**The tag stays on the ssh test for now.** One clean gate run is not evidence that a once-in-eight flake is
+gone; a week of them is. `tools/flaky.test.ts` will make somebody take it off when 0082 closes.
