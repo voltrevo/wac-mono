@@ -200,7 +200,9 @@ Deno.test("an application builds to one executable file and runs repeatedly", as
   const { buildApp } = await import("../build.ts");
   const out = await Deno.makeTempFile({ prefix: "wac-app-" });
   try {
-    await buildApp(WC, out, { read: true });
+    // `coverage: false`: this compares the shebang exactly, and an instrumented build (which is what
+    // `WAC_PROFILE` asks for) carries a scoped `--allow-write` for its coverage dump. wac-mono 0024.
+    await buildApp(WC, out, { read: true }, "deno", false, { coverage: false });
     const stat = await Deno.stat(out);
     assertEquals(stat.mode !== null && (stat.mode & 0o111) !== 0, true, "executable");
     assertEquals(

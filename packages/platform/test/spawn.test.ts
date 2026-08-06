@@ -107,7 +107,11 @@ Deno.test("a program runs itself, with no file to read and nothing to find", asy
   const twin = await Deno.makeTempFile({ prefix: "wac-twin-" });
   const nodeTwin = await Deno.makeTempFile({ prefix: "wac-twin-node-" });
   try {
-    await buildApp("packages/platform/example/twin.wac", twin, {});
+    // `coverage: false`: the shebang is compared exactly below, and an instrumented build — what
+    // `WAC_PROFILE` asks for — carries a scoped `--allow-write` for its coverage dump. wac-mono 0024.
+    await buildApp("packages/platform/example/twin.wac", twin, {}, "deno", false, {
+      coverage: false,
+    });
     const r = new Deno.Command(twin, { stdout: "piped", stderr: "piped" }).outputSync();
     const err = new TextDecoder().decode(r.stderr);
     assertEquals(r.code, 0, err);

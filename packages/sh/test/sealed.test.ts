@@ -31,7 +31,11 @@ globalThis.addEventListener("unload", () => {
   }
 });
 // No grants. Not `{ read: false }` — absent, which is how this world spells "no such capability".
-await buildApp("packages/sh/src/sealed.wac", sealed, {});
+// `coverage: false` because the assertion below is about an ordinary build: under `WAC_PROFILE`
+// this repo builds instrumented programs, and one of those carries a scoped `--allow-write` for
+// its coverage dump. That is a genuine difference in what the shebang says, and not the thing
+// this file is checking. wac-mono 0024.
+await buildApp("packages/sh/src/sealed.wac", sealed, {}, "deno", false, { coverage: false });
 
 function run(script: string, cwd: string) {
   const r = new Deno.Command(sealed, {

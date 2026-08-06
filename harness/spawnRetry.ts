@@ -21,6 +21,14 @@
 //
 // The diagnostic stays on. If a future failure names a holder, that is a *different* bug — a real leaked
 // write handle — and it should be fixed rather than retried.
+// Imported for a second side effect: under `WAC_PROFILE` this installs the wrapper that attributes
+// coverage to tests. Every subprocess-based test file imports *this* module — that is what makes it the
+// right place — and several of them reach `build.ts` only through a dynamic `import()` inside a test
+// body, which is too late: `Deno.test` has already registered the case by then, so the wrapper wraps
+// nothing and the file writes no profile at all. That is the shape wac-mono 0024 is about, and it would
+// have looked exactly like the problem it was meant to fix.
+import "./wacProfile.ts";
+
 const RealCommand = Deno.Command;
 
 /** How many times, and how long between: the window measured closed in under a millisecond. */

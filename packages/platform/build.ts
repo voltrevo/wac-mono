@@ -17,6 +17,11 @@ import { wacCompile } from "wac/wacCompile.ts";
 import { wacBindgen } from "wac/wacBindgen.ts";
 import { wacFiles } from "../../harness/wacFiles.ts";
 import { checkWacVersion } from "../../harness/wacVersion.ts";
+// Imported for its side effect as much as for `COV_DUMP_DIR`'s twin: under `WAC_PROFILE` it wraps
+// `Deno.test` so that what a *built* program executes is attributed to whichever test ran it. Every
+// subprocess-based test file reaches this module — that is how it builds the binary it runs — and none
+// of them import `wacBind`, which is what used to install the wrapper. wac-mono 0024.
+import "../../harness/wacProfile.ts";
 import {
   cached,
   compilerKeyParts,
@@ -34,7 +39,37 @@ import { WORKER_MARKER } from "./host/children.ts";
  * `--allow-read`, which used to sit in every shebang whatever the program could do, and
  * read as a filesystem grant to anyone auditing it.
  */
-function shebangFor(g: Grants, target: Target): string {
+/**
+ * Where a coverage build writes what it executed, and whether to make one.
+ *
+ * wac-mono 0024. Mutation testing narrows "run the package's whole suite" to "run the tests that
+ * reach this line" by reading wac's coverage counters either side of each test — in the test's *own*
+ * process. A test that builds a binary and runs it as a child has its counters in the child, so it
+ * contributes nothing, and the profile cannot tell "this test reaches no lines" from "this test was
+ * never measured". For `packages/sh`, where every test is subprocess-based, that made the whole
+ * optimisation inert: `0/117 mutant(s) ran only the tests that reach them`.
+ *
+ * So a built program dumps its own counters when it was built for it. The directory is baked in at
+ * build time rather than read from the environment, for two reasons: a program that reads `WAC_COV_DIR`
+ * would need `--allow-env` it does not otherwise want, and a path in the build's cache key would miss
+ * the cache on every sweep. It is absolute because a built binary runs wherever its caller stands.
+ *
+ * **A coverage build is a test artefact.** It carries a scoped `--allow-write` for that directory and
+ * nothing else, and `coverage: false` forces an ordinary build for the tests that assert on what a
+ * shebang says.
+ */
+export const COV_DUMP_DIR = `${Deno.cwd()}/.cache/cov-dump`;
+
+/** Whether this process is profiling, and so wants instrumented builds. Off is the normal case. */
+function profiling(): boolean {
+  try {
+    return (Deno.env.get("WAC_PROFILE") ?? "") !== "";
+  } catch {
+    return false;   // no --allow-env; profiling is off
+  }
+}
+
+function shebangFor(g: Grants, target: Target, coverage = false): string {
   // Node has no permission system, so its shebang has nothing to state — the capability
   // world is the whole boundary there. Under Deno the two agree, and a program granted
   // nothing asks for nothing.
@@ -47,6 +82,15 @@ function shebangFor(g: Grants, target: Target): string {
   // already failed two pushes for reasons that had nothing to do with the change being pushed. The
   // cache is worth having for source that is run repeatedly; these are not that. wac-mono 0068.
   const flags: string[] = ["--no-code-cache"];
+  // Scoped to the dump directory: a coverage build may write its counters there and nowhere else. It
+  // is still a capability the program did not ask for, which is why this only ever happens under
+  // `WAC_PROFILE` and why `sealed.test.ts` builds with coverage off to assert on the real shebang.
+  //
+  // **Only when the program has no write grant of its own.** Deno *narrows* to the scoped list rather
+  // than adding to it, so `--allow-write=<dump> --allow-write` left a shell able to write its dump and
+  // nothing else — `rm` then failed with "Requires write access", inside a test asserting on what `rm`
+  // says about a file it cannot name. A program that may already write anywhere can write the dump too.
+  if (coverage && !g.write) flags.push(`--allow-write=${COV_DUMP_DIR}`);
   if (g.read) flags.push("--allow-read");
   if (g.write) flags.push("--allow-write");
   if (g.net) flags.push("--allow-net");
@@ -219,6 +263,7 @@ export async function appKeyParts(
   grants: Grants,
   target: Target,
   workerOnly: boolean,
+  coverage = false,
 ): Promise<string[] | null> {
   const compiler = await compilerKeyParts();
   const harness = await harnessKeyParts();
@@ -243,6 +288,9 @@ export async function appKeyParts(
     JSON.stringify(grants),
     target,
     String(workerOnly),
+    // An instrumented build is a different artefact from the same source, and handing one to a test
+    // that expected the other would be a wrong answer rather than a slow one.
+    coverage ? "cov" : "plain",
     ...compiler,
     ...harness,
     ...host,
@@ -256,8 +304,9 @@ async function appKey(
   grants: Grants,
   target: Target,
   workerOnly: boolean,
+  coverage = false,
 ): Promise<string | null> {
-  const parts = await appKeyParts(entry, files, grants, target, workerOnly);
+  const parts = await appKeyParts(entry, files, grants, target, workerOnly, coverage);
   return parts === null ? null : await contentKey(parts);
 }
 
@@ -276,21 +325,29 @@ export async function buildApp(
   grants: Grants = {},
   target: Target = "deno",
   workerOnly = false,
+  opts: { coverage?: boolean } = {},
 ): Promise<void> {
   checkWacVersion();
+  // Instrumented when this process is profiling, which is how every existing subprocess test becomes
+  // attributable without being edited — `differential.test.ts` builds its shell through here. Callers
+  // that assert on what an ordinary build looks like pass `coverage: false`.
+  // Never for the browser: a page has no filesystem to dump into, so instrumenting one would cost
+  // bundle size and buy nothing — and an instrumented module whose `__cov_init` is never called traps
+  // on its first branch, which is a page that does not start rather than a page with no profile.
+  const coverage = (opts.coverage ?? profiling()) && target !== "browser";
   const files = await wacFiles(entry);
   // A page and a worker bundle are not runnable by themselves, so neither gets the execute bit.
   const executable = !workerOnly && target !== "browser";
 
-  const key = await appKey(entry, files, grants, target, workerOnly);
+  const key = await appKey(entry, files, grants, target, workerOnly, coverage);
   if (key !== null) {
     const artifact = await cached("app", key, "", async (tmp) => {
-      await Deno.writeTextFile(tmp, await produceApp(entry, files, grants, target, workerOnly));
+      await Deno.writeTextFile(tmp, await produceApp(entry, files, grants, target, workerOnly, coverage));
     });
     await place(await Deno.readTextFile(artifact), out, executable);
     return;
   }
-  await place(await produceApp(entry, files, grants, target, workerOnly), out, executable);
+  await place(await produceApp(entry, files, grants, target, workerOnly, coverage), out, executable);
 }
 
 /**
@@ -341,14 +398,19 @@ async function produceApp(
   grants: Grants,
   target: Target,
   workerOnly: boolean,
+  coverage: boolean,
 ): Promise<string> {
-  const r = wacCompile(files, entry);
+  const r = wacCompile(files, entry, coverage ? { coverage: true } : {});
   if (!r.ok) {
     throw new Error(
       `${entry} did not compile:\n` +
         r.diagnostics.map((d) => `  ${d.file}:${d.line}:${d.col} ${d.message}`).join("\n"),
     );
   }
+
+  // `file:line` per counter index, resolved here: the dump then carries lines rather than indices, so
+  // the reader needs no copy of this table and the two cannot disagree about what index 400 means.
+  const covLines = coverage ? (r.compiled.coverage ?? []).map((p) => `${p.file}:${p.line}`) : [];
 
   const work = await Deno.makeTempDir({ prefix: "wac-app-" });
   try {
@@ -399,16 +461,23 @@ async function produceApp(
         `import { runAsWorkerEntryNode } from "${nodeRuntime}";\n` +
           `import * as wt from "node:worker_threads";\n` +
           `import * as app from "${modPath}";\n` +
+          // `node:fs` only in an instrumented build: a program's bundle carries what it uses.
+          (coverage ? `import * as covfs from "node:fs";\n` : "") +
           `runAsWorkerEntryNode(\n` +
           `  wt as unknown as Parameters<typeof runAsWorkerEntryNode>[0],\n` +
           `  app as unknown as Parameters<typeof runAsWorkerEntryNode>[1],\n` +
+          (coverage
+            ? `  ${JSON.stringify({ dir: COV_DUMP_DIR, lines: covLines })},\n` +
+              `  covfs as unknown as Parameters<typeof runAsWorkerEntryNode>[3],\n`
+            : "") +
           `);\n`,
       )
       : await bundle(
         "worker",
         `import { runAsWorkerEntry } from "${runtime}";\n` +
           `import * as app from "${modPath}";\n` +
-          `await runAsWorkerEntry(app as unknown as Parameters<typeof runAsWorkerEntry>[0]);\n`,
+          `await runAsWorkerEntry(app as unknown as Parameters<typeof runAsWorkerEntry>[0],\n` +
+          `  ${coverage ? JSON.stringify({ dir: COV_DUMP_DIR, lines: covLines }) : "undefined"});\n`,
       ));
 
     const launcher = target === "browser"
@@ -498,7 +567,7 @@ async function produceApp(
       const template = interactive ? PAGE_APP : PAGE_CLI;
       return template.replaceAll("%TITLE%", title).replace("%LAUNCHER%", launcher);
     }
-    return shebangFor(grants, target) + launcher;
+    return shebangFor(grants, target, coverage) + launcher;
   } finally {
     await Deno.remove(work, { recursive: true });
   }

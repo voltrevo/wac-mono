@@ -64,6 +64,50 @@ function workerFrom(wt: WorkerThreads): (source: string) => WorkerLike {
 
 /** `child` is set by `spawnChild`: a spawned program runs `main`, never `page`. */
 type Start = { sab: SharedArrayBuffer; child?: boolean };
+
+/** Where to dump counters and what each one means — see `Coverage` in `entry.ts`. */
+type Coverage = { dir: string; lines: string[] };
+
+/** The two `node:fs` calls a dump needs, injected like every other Node built-in in this file. */
+type CovFs = {
+  mkdirSync(p: string, o: { recursive: boolean }): unknown;
+  writeFileSync(p: string, data: string): void;
+};
+
+/**
+ * Write what this program executed, through Node's own `fs`.
+ *
+ * The Deno half of this is `dumpCoverage` in `entry.ts`; they are two implementations of one idea
+ * because the two runtimes reach the filesystem differently and neither module imports the other.
+ * `fs` arrives as an argument rather than an import for the reason the whole file does that: this
+ * module is type-checked under Deno, and only an instrumented build should carry `node:fs` at all.
+ * wac-mono 0024.
+ */
+function dumpCoverageNode(app: AppModule, cov: Coverage, fs: CovFs): void {
+  try {
+    const len = (app as unknown as { __cov_len?: () => number }).__cov_len;
+    const get = (app as unknown as { __cov_get?: (i: number) => number }).__cov_get;
+    if (len === undefined || get === undefined) return;
+    const hit: string[] = [];
+    const seen = new Set<string>();
+    const n = len();
+    for (let i = 0; i < n; i++) {
+      if (get(i) > 0 && !seen.has(cov.lines[i])) {
+        seen.add(cov.lines[i]);
+        hit.push(cov.lines[i]);
+      }
+    }
+    fs.mkdirSync(cov.dir, { recursive: true });
+    // Named by time and a random suffix rather than `crypto.randomUUID`, which the Deno half uses:
+    // one file per run, and two children writing at once must not collide.
+    fs.writeFileSync(
+      `${cov.dir}/${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
+      JSON.stringify({ all: [...new Set(cov.lines)].sort(), hit: hit.sort() }),
+    );
+  } catch {
+    // A dump that cannot be written must not change what the program does. See the Deno half.
+  }
+}
 type Result = { ok: true; code: number } | { ok: false; error: string };
 
 /**
@@ -73,7 +117,12 @@ type Result = { ok: true; code: number } | { ok: false; error: string };
  * documents: the application module suspends at its top-level `WebAssembly.instantiate`,
  * and a message arriving in that window would be lost.
  */
-export function runAsWorkerEntryNode(wt: WorkerThreads, app: AppModule): void {
+export function runAsWorkerEntryNode(
+  wt: WorkerThreads,
+  app: AppModule,
+  cov?: Coverage,
+  fs?: CovFs,
+): void {
   const port = wt.parentPort;
   if (port === null) throw new Error("runAsWorkerEntryNode called off a worker");
   // "This bundle loaded", before the bridge arrives and before the application runs — the one fact a
@@ -86,8 +135,15 @@ export function runAsWorkerEntryNode(wt: WorkerThreads, app: AppModule): void {
       if (typeof app.main !== "function") {
         throw new Error("an application must export `main(Core, Cli) -> i32`");
       }
-      port.postMessage({ ok: true, code: app.main(coreOf(b, app), cliOf(b, app)) } as Result);
+      // Allocates the counter array. Without it every instrumented function traps on its first branch
+      // with "dereferencing a null pointer" — which is what a Node coverage build did until this line
+      // existed, while the Deno one worked, because only half the contract had been implemented.
+      if (cov !== undefined) (app as unknown as { __cov_init?: () => void }).__cov_init?.();
+      const code = app.main(coreOf(b, app), cliOf(b, app));
+      if (cov !== undefined && fs !== undefined) dumpCoverageNode(app, cov, fs);
+      port.postMessage({ ok: true, code } as Result);
     } catch (err) {
+      if (cov !== undefined && fs !== undefined) dumpCoverageNode(app, cov, fs);
       port.postMessage({ ok: false, error: err instanceof Error ? err.message : String(err) } as Result);
     }
   });

@@ -122,8 +122,54 @@ export type Grants = { read?: boolean; write?: boolean; env?: boolean; net?: boo
  * Called by the generated worker entry, which imports this module *before* the
  * application so the handler above is installed first.
  */
-export async function runAsWorkerEntry(app: AppModule): Promise<void> {
-  await runAsWorker(app);
+export async function runAsWorkerEntry(app: AppModule, cov?: Coverage): Promise<void> {
+  await runAsWorker(app, cov);
+}
+
+/**
+ * Where to dump counters, and what each one means — baked into a coverage build by `build.ts`.
+ *
+ * `lines` is `file:line` per counter index, resolved at build time, so a dump carries lines rather
+ * than indices and whoever reads it needs no copy of the table.
+ */
+export type Coverage = { dir: string; lines: string[] };
+
+/**
+ * Write what this program executed, for a parent that is profiling.
+ *
+ * wac-mono 0024. A test that builds a binary and runs it as a child cannot read the child's coverage
+ * counters, so mutation testing could not tell which tests reach which lines for any subprocess-based
+ * suite — `packages/sh` narrowed 0 of 117 mutants. This is the far end of that: the child says what it
+ * touched, and `harness/wacProfile.ts` attributes it to whichever test was running.
+ *
+ * Failures here are swallowed on purpose. A program is not doing this for its own sake — a dump that
+ * cannot be written must not change what the program does or what it exits with, or the profile run
+ * stops being a measurement of the same thing.
+ */
+function dumpCoverage(app: AppModule, cov: Coverage): void {
+  try {
+    const len = (app as unknown as { __cov_len?: () => number }).__cov_len;
+    const get = (app as unknown as { __cov_get?: (i: number) => number }).__cov_get;
+    if (len === undefined || get === undefined) return;
+    const hit: string[] = [];
+    const seen = new Set<string>();
+    const n = len();
+    for (let i = 0; i < n; i++) {
+      if (get(i) > 0 && !seen.has(cov.lines[i])) {
+        seen.add(cov.lines[i]);
+        hit.push(cov.lines[i]);
+      }
+    }
+    Deno.mkdirSync(cov.dir, { recursive: true });
+    // One file per run, named so that two children writing at once cannot collide: a shell under test
+    // spawns its applets, and every one of them is a program dumping into the same directory.
+    Deno.writeTextFileSync(
+      `${cov.dir}/${crypto.randomUUID()}.json`,
+      JSON.stringify({ all: [...new Set(cov.lines)].sort(), hit: hit.sort() }),
+    );
+  } catch {
+    // See above: a program that cannot write its dump still runs.
+  }
 }
 
 /**
@@ -137,7 +183,7 @@ export async function runLauncher(workerSource: string, grants: Grants = {}): Pr
   await runAsLauncher(workerSource, grants);
 }
 
-async function runAsWorker(app: AppModule): Promise<void> {
+async function runAsWorker(app: AppModule, cov?: Coverage): Promise<void> {
   const worker = self as unknown as { postMessage(m: Result): void };
   const start = await firstMessage();
   {
@@ -147,8 +193,17 @@ async function runAsWorker(app: AppModule): Promise<void> {
         if (typeof app.main !== "function") {
           throw new Error("an application must export `main(Core, Cli) -> i32`");
         }
-        worker.postMessage({ ok: true, code: app.main(coreOf(b, app), cliOf(b, app)) });
+        // The counter array is allocated by this call, not at instantiation: without it every
+        // instrumented function traps on its first branch, and the message names the program under
+        // test rather than the missing call. `harness/wacCoverage.ts` learnt the same thing.
+        if (cov !== undefined) (app as unknown as { __cov_init?: () => void }).__cov_init?.();
+        const code = app.main(coreOf(b, app), cliOf(b, app));
+        if (cov !== undefined) dumpCoverage(app, cov);
+        worker.postMessage({ ok: true, code });
       } catch (err) {
+        // Dumped for a failed run too: a mutant that makes a program *crash* is killed by whichever
+        // test ran it, and that test is exactly the one the attribution needs to know about.
+        if (cov !== undefined) dumpCoverage(app, cov);
         worker.postMessage({ ok: false, error: err instanceof Error ? err.message : String(err) });
       }
     }

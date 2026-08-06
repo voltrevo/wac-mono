@@ -873,7 +873,12 @@ Deno.test("bin/: one applet alone states only the grants it needs", async () => 
     for (const c of cases) {
       const out = await Deno.makeTempFile({ prefix: `wac-bin-${c.name}-` });
       built.push(out);
-      await buildApp(`packages/box/src/bin/${c.name}.wac`, out, c.grants);
+      // `coverage: false`: the shebangs below are compared exactly, and an instrumented build carries
+      // a scoped `--allow-write` for its coverage dump. That difference is real and is asserted in
+      // `packages/platform/test/subprocess_profile.test.ts`; here it would be noise. wac-mono 0024.
+      await buildApp(`packages/box/src/bin/${c.name}.wac`, out, c.grants, "deno", false, {
+        coverage: false,
+      });
       const first = (await Deno.readTextFile(out)).split("\n")[0];
       assertEquals(first, c.shebang, `${c.name}'s shebang`);
     }

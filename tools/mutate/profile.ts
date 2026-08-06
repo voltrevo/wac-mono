@@ -23,6 +23,19 @@
 // worth seeing: it separates "tests ran and noticed nothing" from "no test executes this
 // line at all", which are different problems with different fixes and which today's
 // single "survivor" verdict conflates.
+//
+// ## Tests that run the code in another process
+//
+// Attribution used to be blind to them, and that was not a small gap: a test which builds a binary and
+// runs it as a child keeps its counters in the child, so it looked like a test that reaches nothing.
+// For `packages/sh`, where every test works that way, the headline optimisation contributed exactly
+// nothing — `selection: 0/117 mutant(s) ran only the tests that reach them`.
+//
+// A built program dumps its own counters now (`packages/platform/build.ts` instruments whenever
+// `WAC_PROFILE` is set, so no test had to be edited) and `harness/wacProfile.ts` credits whatever
+// appeared while a test was running to that test. So `0/117` is no longer a property of the tests, and
+// a number like it in a future run means something is broken rather than something is subprocess-based.
+// wac-mono 0024.
 
 import { refuseIfNested, SUITE_ENV } from "../suiteGuard.ts";
 

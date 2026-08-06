@@ -14,7 +14,6 @@ record of what has been fixed and why.
 | [0031](open/0031-a-mutation-sweep-starves-every-other-agent-on-this-machine.md) | a mutation sweep starves every other agent on this machine | performance | wrong answer |
 | [0009](open/0009-forty-two-exported-wac-functions-that-nothing-calls.md) | forty-two exported wac functions that nothing calls, across eight packages | bug | no error |
 | [0005](open/0005-mutation-testing-found-54-untested-behaviours.md) | surviving mutants: behaviours nothing checks (crypto finished; tls at 75, five other packages unmeasured) | task | wrong answer |
-| [0024](open/0024-mutation-selection-is-inert-for-subprocess-tests-and-the-fallback-runs-them-worst-first.md) | mutation test-selection is inert for subprocess tests, and the fallback runs them worst-first | performance | wrong answer |
 
 An empty list is the expected state most of the time — see `README.md`: something you
 can fix in a package you are already working in should just be fixed, and a package's

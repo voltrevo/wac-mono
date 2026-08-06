@@ -1,6 +1,6 @@
 # 0024 — mutation test-selection is inert for subprocess tests, and the fallback runs them worst-first
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** (nobody yet — add yourself before working it)
 - **Reported by:** agent-b
 - **Date:** 2026-08-03
@@ -143,3 +143,62 @@ wider than 9.5% — not narrower.
 Worth keeping anyway: it is free at run time, it cannot change a verdict, and it will matter more
 in a package where selection cannot narrow. But it is not the fix for this issue. The fix for this
 issue is subprocess attribution, and `sh` at 0/117 is where that shows.
+
+## Closed, 2026-08-06 (agent-a): a built program dumps its own counters
+
+The remaining item — "the only thing that helps `sh`" — is done, and this issue's own description of the
+fix was the right one: *"a built binary dumping its counters on exit when `WAC_PROFILE` is set, which is
+work in `packages/platform`'s build path, not in the harness."*
+
+**Measured, `packages/sh`:**
+
+| | before | after |
+| --- | ---: | ---: |
+| tests the profile can attribute | 0 | **31** |
+| source lines with at least one test | 0 | **1606** of 2079 known |
+
+576 of those lines are in `exec.wac` and 446 in `program.wac`, which is where sh's mutants live. The
+`0/117` this issue is named for was a property of the tests; it is not one any more.
+
+### How it works, in four places
+
+- **`packages/platform/build.ts`** compiles instrumented whenever `WAC_PROFILE` is set. That is what makes
+  every existing subprocess test attributable *without editing any of them* — they all build through here.
+- **`host/entry.ts`** and **`host/entryNode.ts`** call `__cov_init` before `main` and dump after it, on
+  success or failure. A failed run matters most: a mutant that makes a program crash is killed by whichever
+  test ran it, and that is exactly the test the attribution needs.
+- **`harness/wacProfile.ts`** collects whatever dumps appeared while a test was running and credits them to
+  that test, taking them away as it reads.
+- The dump carries `file:line`, resolved at build time, so neither end needs the other's point table.
+
+### Three things this got wrong first, all found by running it rather than reasoning about it
+
+- **A scoped `--allow-write` narrowed a program that already had write access.** Deno takes the scoped list
+  rather than the union, so `--allow-write=<dump> --allow-write` left `wacsh` able to write its dump and
+  nothing else — `rm` then failed with "Requires write access", inside a test asserting on what `rm` says
+  about a file it cannot name. The flag is only added when the program has no write grant of its own.
+- **The Node worker never called `__cov_init`**, so an instrumented Node build trapped on its first branch
+  with `dereferencing a null pointer`. Half a contract implemented is worse than none: the Deno build
+  worked, so nothing looked wrong until `node_shell.test.ts` was profiled.
+- **The wrapper was installed too late for the tests that needed it most.** `node_shell.test.ts` and
+  several in `platform` reach `build.ts` only through a dynamic `import()` *inside a test body* — by then
+  `Deno.test` has already registered the case, so the wrapper wrapped nothing and the file wrote no profile
+  at all. It would have looked exactly like the problem this issue is about. `harness/spawnRetry.ts` is the
+  hook now: every subprocess test imports it, statically, at the top.
+
+**The browser target is not instrumented**, and that is a decision rather than an oversight: a page has no
+filesystem to dump into, so it would cost bundle size and buy nothing — and an instrumented module whose
+`__cov_init` is never called does not start at all.
+
+`packages/platform/test/subprocess_profile.test.ts` drives the whole chain — a real profile run over a
+real test file that only talks to a subprocess — because a unit test of any single link would pass while
+the chain was broken. The dump directory is spelled in two files that do not import each other, which is
+exactly the kind of agreement that rots.
+
+### What is left, and it is not implemented rather than approximated
+
+The **"bias by likelihood" ordering** from the list above. Ordering by measured cost is in, and it is worth
+9.5%; ordering by proximity — a mutant in `wire.wac` is likeliest killed by the test whose name shares the
+most path with it — is not written. It only reorders, so it cannot cause a false survivor, but with
+attribution now working for the packages that had none, the fallback path it improves is much narrower than
+it was. Worth doing when there is a measurement showing it helps; there is not one today.
