@@ -27,7 +27,14 @@ import {
   S_RES_LEN,
   S_RES_STATUS,
   S_STATUS,
-  SLOT_BUF,
+  acquireBuf,
+  INLINE_BYTES,
+  BUF_BYTES,
+  releaseBuf,
+  attach,
+  detach,
+  S_REQ_BUF,
+  S_RES_BUF,
   SLOTS,
   slotAt,
   ST_CANCELLED,
@@ -54,6 +61,7 @@ export type Handlers = Record<number, Handler>;
 
 const enc = new TextEncoder();
 const EMPTY = new Uint8Array(0);
+
 
 /** Labels bridges in the scheduler's log, so a recorded run can be read. */
 let nextBridgeId = 0;
@@ -94,6 +102,7 @@ export function serveHostCalls(
 
   // Per-slot state kept between the pieces of one call.
   const pending: (Uint8Array | null)[] = new Array(SLOTS).fill(null);      // response tail
+  const finalStatus: number[] = new Array(SLOTS).fill(STATUS_OK);           // what the tail's last piece is
   const partial: Uint8Array[][] = Array.from({ length: SLOTS }, () => []); // request head
 
   const reply = (slot: number, status: number, body: Uint8Array): void => {
@@ -101,14 +110,42 @@ export function serveHostCalls(
     // has always taken. With it on, the answer joins a ready set and the scheduler decides which one
     // lands next, so the order the whole system runs in is chosen rather than raced for. See
     // `schedule.ts`, and design/0001 D12 for what that can and cannot promise.
-    sched.ready(bridgeId, slot, () => write(slot, status, body));
+    // The generation is read *now*, while the slot is still this call's, and travels with the answer
+    // through both delays: the scheduler's, and the wait for a free buffer.
+    const gen = Atomics.load(b.ctrl, slotAt(slot) + S_GEN);
+    sched.ready(bridgeId, slot, () => write(slot, status, body, gen));
   };
 
-  const write = (slot: number, status: number, body: Uint8Array): void => {
+  /**
+   * Write an answer, in a pooled buffer when one is free and inline when not.
+   *
+   * `gen` is the generation the answer belongs to, and checking it is not optional. The answer may have
+   * been held by the scheduler meanwhile, and the worker may have *cancelled* the call — the sweep then
+   * frees the slot and a new call takes it at a new generation. Writing the old answer there delivers one
+   * call's bytes to another, which the fuzzer caught on its first seed: `asked as 15, answered as 22`.
+   *
+   * **Never fails for want of a buffer.** An earlier version deferred instead, and deadlocked: the
+   * buffers are held by answers the worker has not collected, and a worker parked on one specific call
+   * collects nothing, so the call it waits for never lands. Inline is the guarantee; the pool is speed.
+   */  const write = (slot: number, status: number, body: Uint8Array, gen: number): void => {
     const at = slotAt(slot);
-    b.res(slot).set(body, 0);
-    Atomics.store(b.ctrl, at + S_RES_LEN, body.length);
-    Atomics.store(b.ctrl, at + S_RES_STATUS, status);
+    if (Atomics.load(b.ctrl, at + S_GEN) !== gen) return;   // recycled; this answer is for nobody
+    // A pooled buffer if one is free, the slot's own inline area otherwise. The tail, if the chosen room
+    // cannot hold it all, goes through the same `STATUS_MORE` path an oversized answer always used.
+    const bi = body.length > INLINE_BYTES ? acquireBuf(b, "res") : -1;
+    const room = bi >= 0 ? b.resBuf(bi) : b.inline(slot);
+    const fits = Math.min(body.length, room.length);
+    const tail = body.subarray(fits);
+    room.set(body.subarray(0, fits), 0);
+    attach(b, at, S_RES_BUF, bi);
+    Atomics.store(b.ctrl, at + S_RES_LEN, fits);
+    Atomics.store(b.ctrl, at + S_RES_STATUS, tail.length > 0 ? STATUS_MORE : status);
+    if (tail.length > 0) {
+      // Remembered here, and asked for with `OP_CONTINUE`. `finalStatus` so the last piece carries the
+      // real answer status rather than `STATUS_MORE`.
+      pending[slot] = tail;
+      finalStatus[slot] = status;
+    }
 
     // Published with a compare-and-exchange, for the same reason `take` takes with one, and it
     // is the last store rather than the first because it is what makes the rest visible.
@@ -124,27 +161,34 @@ export function serveHostCalls(
     // writes a response, and the worker reads one only after seeing `ST_READY`. So a losing
     // exchange leaves bytes in a buffer that the slot's next owner overwrites before publishing.
     if (Atomics.compareExchange(b.ctrl, at + S_STATUS, ST_RUNNING, ST_READY) !== ST_RUNNING) {
-      return;   // no longer ours; the sweep hands the slot back
+      // No longer ours; the sweep hands the slot back — and the buffer with it, or the pool leaks one
+      // per losing race, which is a pool that empties over an hour and a hang nobody can explain.
+      releaseBuf(b, "res", detach(b, at, S_RES_BUF));
+      pending[slot] = null;
+      return;
     }
     Atomics.add(b.ctrl, DONE_SEQ, 1);
     Atomics.notify(b.ctrl, DONE_SEQ);
   };
 
-  /** Answer, splitting the body if it does not fit. */
+  /**
+   * Answer. The splitting lives in `write`, which is the only place that knows how much room it got — a
+   * pooled buffer or the slot's inline area — so deciding here as well would be two rules for one thing.
+   */
   const send = (slot: number, body: Uint8Array): void => {
-    if (body.length <= SLOT_BUF) {
-      pending[slot] = null;
-      reply(slot, STATUS_OK, body);
-      return;
-    }
-    pending[slot] = body.subarray(SLOT_BUF);
-    reply(slot, STATUS_MORE, body.subarray(0, SLOT_BUF));
+    reply(slot, STATUS_OK, body);
   };
 
   /** A slot the worker gave up on: drop what we know and hand it back. */
   const abandon = (slot: number): void => {
     pending[slot] = null;
     partial[slot] = [];
+    // Both buffers, because a cancel can land at any point: the request may still be attached if the
+    // sweep never took it, and the answer if it was written and never collected.
+    const cancelled = slotAt(slot);
+    for (const dir of ["req", "res"] as const) {
+      releaseBuf(b, dir, detach(b, cancelled, dir === "req" ? S_REQ_BUF : S_RES_BUF));
+    }
     Atomics.store(b.ctrl, slotAt(slot) + S_STATUS, ST_FREE);
     Atomics.add(b.ctrl, DONE_SEQ, 1);
     Atomics.notify(b.ctrl, DONE_SEQ);
@@ -159,7 +203,13 @@ export function serveHostCalls(
     const gen = Atomics.load(b.ctrl, at + S_GEN);
     const op = Atomics.load(b.ctrl, at + S_OP);
     const len = Atomics.load(b.ctrl, at + S_REQ_LEN);
-    const payload = b.req(slot).slice(0, len);
+    // Copied out and the buffer released immediately: a request buffer is held for exactly one read, so
+    // a worker parked for one waits on this line and nothing else.
+    const rb = detach(b, at, S_REQ_BUF);
+    const payload = rb < 0 ? EMPTY : b.reqBuf(rb).slice(0, len);
+    releaseBuf(b, "req", rb);
+    Atomics.add(b.ctrl, DONE_SEQ, 1);
+    Atomics.notify(b.ctrl, DONE_SEQ);
 
     // Taken with a compare-and-exchange, not a store.
     //
@@ -177,7 +227,11 @@ export function serveHostCalls(
     }
 
     if (op === OP_CONTINUE) {
-      send(slot, pending[slot] ?? EMPTY);
+      // The status the *whole* answer had, kept from the first piece: a failure delivered in two pieces is
+      // still a failure, and sending the tail as `STATUS_OK` would turn it into a successful empty answer.
+      const tail = pending[slot] ?? EMPTY;
+      pending[slot] = null;
+      reply(slot, finalStatus[slot], tail);
       return;
     }
     // A piece of an oversized request, held here rather than in the worker for the same

@@ -109,7 +109,7 @@ const BODY = `
       throw new Error("the answer to cancelled call " + got + " was delivered as the answer to " + entry.nonce);
     }
     if (got !== entry.nonce) {
-      throw new Error("asked as " + entry.nonce + ", answered as " + got);
+      throw new Error("asked as " + entry.nonce + ", answered as " + got + " in slot " + entry.t.slot + " gen " + entry.t.gen);
     }
     // Every byte, not just the nonce: a response reassembled out of order would keep its head.
     for (let i = 4; i < bytes.length; i++) {
@@ -214,17 +214,17 @@ async function fuzz(seed: number, steps: number): Promise<{ report: string; ctrl
   const responder = serveHostCalls(bridge, handlers, { scheduler: newScheduler("off") });
   const src = `
     import { submit, collect, isDone, waitAny, cancel, hostCall, i32le, readI32le } from ${JSON.stringify(CALL)};
-    import { bridgeOf, CTRL_HEAD, SLOT_INTS, SLOTS } from ${JSON.stringify(LAYOUT)};
-    globalThis.__layout = { CTRL_HEAD, SLOT_INTS, SLOTS };
+    import { bridgeOf, slotAt, S_STATUS, SLOTS } from ${JSON.stringify(LAYOUT)};
+    globalThis.__layout = { slotAt, S_STATUS, SLOTS };
     self.onmessage = (e) => {
       const b = bridgeOf(e.data);
       try { self.postMessage({ ok: true, value: (() => { ${BODY.replace("SEED", String(seed)).replace('const STEPS = 0;', `const STEPS = ${steps};`)} })() }); }
       catch (err) {
         let held = "";
         try {
-          const { CTRL_HEAD, SLOT_INTS, SLOTS } = globalThis.__layout;
+          const { slotAt, S_STATUS, SLOTS } = globalThis.__layout;
           const st = [];
-          for (let i = 0; i < SLOTS; i++) st.push(Atomics.load(b.ctrl, CTRL_HEAD + i * SLOT_INTS));
+          for (let i = 0; i < SLOTS; i++) st.push(Atomics.load(b.ctrl, slotAt(i) + S_STATUS));
           held = " statuses=[" + st.join(",") + "]";
         } catch { /* diagnostics only */ }
         self.postMessage({ ok: false, error: String((err && err.message) || err) + held + " " + (globalThis.__model || "") });

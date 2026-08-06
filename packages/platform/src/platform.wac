@@ -604,6 +604,20 @@ export const i32 GRANT_NET = 4;
 /** `env`, which reports every variable unset without it. */
 export const i32 GRANT_ENV = 8;
 
+/**
+ * How many host calls one worker may have outstanding at once.
+ *
+ * Every unsettled `Pending<T>` holds one call slot until it is collected or cancelled, so this is the
+ * ceiling on how many handles a program can watch: watching N sockets means N outstanding `recv`s, plus
+ * one for an `accept` and one for whatever it writes with. Exceeding it does not degrade into slowness —
+ * the extra submission parks, and the calls holding the slots cannot complete, so it deadlocks.
+ *
+ * Stated here rather than transcribed into each program, because it has already changed twice (four,
+ * sixteen, 128) and every copy of the old number becomes a limit nobody can explain.
+ * `test/slots.test.ts` fails if this and `host/layout.ts` disagree.
+ */
+export const i32 CALL_SLOTS = 128;
+
 export struct Child {
   /**
    * The child's handle, or a negative number and an `error`.
