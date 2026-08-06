@@ -295,4 +295,58 @@ export const KNOWN_SURVIVORS: KnownSurvivor[] = [
       "directly by inflate.test.ts, which checks that a member claiming 100 MiB, 1 GiB " +
       "or 4 GiB is rejected in under a second rather than attempting the allocation.",
   },
+  // ── json's container bounds guards ──────────────────────────────────────────
+  //
+  // Both are the same argument, and it is the one every "redundant guard" claim has to make: name the
+  // other check. Here there are two of them, and between them they cover the whole index range.
+  {
+    name: "guard/json/value:74:33",
+    why:
+      "`JsonArray.get`'s range trap. Removing it does not let a bad index through, because every " +
+      "index it rejects is rejected again a line later: outside the backing array, `items[i]` is a " +
+      "WasmGC bounds trap; between `n` and the allocation's length, the slot has never been written " +
+      "and `items[i]!` traps on the null. `packages/json/test/bounds.test.ts` drives both routes — " +
+      "`arrayPastEnd` is deliberately inside the allocation — and cannot distinguish them, because " +
+      "what it can observe is that the call trapped, not which instruction did it. " +
+      "The guard is kept rather than deleted because it is bounded by `n` and the fallback is bounded " +
+      "by what happens to be in the slot: today those agree only because nothing ever un-writes one. " +
+      "A `pop` that left the old value in place would make the guard the only thing still correct, " +
+      "and that is exactly the change somebody adds without reading this accessor. wac-mono 0005.",
+  },
+  // ── wacc's token-kind table ─────────────────────────────────────────────────
+  {
+    name: "extreme/wacc/kinds/kBool",
+    why:
+      "A member of the 84-constant table in `kinds.wac` that mirrors `TokenKind`'s declaration order in " +
+      "the reference lexer, and the file says so in its own `dead-exports: exempt` note. `kBool` has no " +
+      "caller because a boolean literal lexes as the keyword `true` or `false` and never as a `bool` " +
+      "token — but deleting it would renumber every kind after it and silently misalign " +
+      "`packages/wacc/test/kinds.test.ts`, which derives the names from `wac/atoms/wac/wacLex.ts` at run " +
+      "time. What is under test is the *completeness* of the set, which no single member's value can " +
+      "carry. wac-mono 0005 and 0009.",
+  },
+  {
+    name: "extreme/wacc/kinds/kindCount",
+    why: "The same table's length. Same argument: it is the numbering that is checked, member by " +
+      "member, against the reference lexer's union.",
+  },
+  {
+    name: "guard/bignum/big:354:19",
+    why:
+      "`divmod`'s division-by-zero trap. Removing it does not produce an answer: an empty divisor sends " +
+      "Knuth's algorithm D to normalise `b.limbs[b.n - 1]`, which is `limbs[-1]` and a WasmGC bounds " +
+      "trap. Measured rather than argued — with the guard deleted, all 42 of `packages/bignum`'s tests " +
+      "pass, including `arith: division by zero traps` over 0, 1, -1 and 2^200. What no host can " +
+      "distinguish is *which* instruction trapped, and pinning the trap's message would be a test of " +
+      "the compiler rather than of this code. The guard stays because it fails at the top of the " +
+      "function with the divisor in hand rather than several allocations deep. " +
+      "Its sibling in `divSmall` is *not* here: that one was a real gap, since without it `0 /small 0` " +
+      "returns zero instead of trapping, and `arith.test.ts` now covers the single-limb path. " +
+      "wac-mono 0005.",
+  },
+  {
+    name: "guard/json/value:153:37",
+    why: "`JsonObject.at`'s copy of the guard above. Same two routes, same fixture pair " +
+      "(`objectPastEnd`, `objectNegative`), same argument.",
+  },
 ];

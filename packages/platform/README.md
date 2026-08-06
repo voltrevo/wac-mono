@@ -473,6 +473,16 @@ while a live answer was still in it. The fuzzer read one call's answer out of an
 means "none" by construction, and `test/pool_model.test.ts` walks every reachable state of two
 slots over one buffer with that bug and its mirror image as mutants.
 
+**When the host stops, every wait raises rather than parking.** A worker in `Atomics.wait` is
+waiting for the responder loop and nothing else, so a loop that has gone makes every one of those
+waits permanent — and what that looks like from outside is a program that stops with no error
+anywhere. Answering the outstanding calls is not enough on its own, because a worker can be parked
+with nothing outstanding: waiting for a free slot, waiting for a request buffer, or holding a slot
+it claimed and never published. So the host raises a `HOST_GONE` flag in the control block and bumps
+the completion counter; every park checks the flag on both sides of its wait, and the call fails
+with `the host stopped answering`. The flag is deliberately sticky — a bridge whose host has gone is
+finished, and a half-restarted world is worse than a clear failure.
+
 A ticket abandoned rather than cancelled still fills a slot, so the ring keeps its backstop:
 `all 128 call slots hold answers that were never taken, from: RECV × 127, ACCEPT`.
 A ready slot can only be freed by the thread that submitted it, so a submitter finding all

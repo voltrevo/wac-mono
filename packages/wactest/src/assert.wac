@@ -27,21 +27,6 @@ import { itoa64 } from "./itoa64.wac";
 import { utoa64 } from "./utoa64.wac";
 import { ftoa } from "../../fmt/src/ftoa.wac";
 
-// Decimal for a u32. itoa cannot serve: it takes an i32, and every value above
-// 2147483647 would arrive as a negative. Unsigned `/` and `%` make this the
-// obvious loop it looks like — with i32 the same code would go wrong at exactly
-// the values that need it.
-string utoa(u32 v) {
-  if (v == 0) { return "0"; }
-  string out = "";
-  u32 n = v;
-  while (n > 0) {
-    out = itoa((n % 10) as@ i32) + out;
-    n = n / 10;
-  }
-  return out;
-}
-
 export struct T {
   i32 failed;
   string messages;

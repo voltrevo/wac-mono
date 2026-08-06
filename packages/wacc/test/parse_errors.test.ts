@@ -192,6 +192,15 @@ Deno.test("parse errors: malformation inside an otherwise well-formed declaratio
     "i32 f() { return (1; }",
     "i32 f() { i32[] a = i32[; }",
     "i32 f() { return 1 as; }",
+    // Three codes that nothing here produced, so nothing checked them: `++` on something that cannot be
+    // assigned to, a `fn[...]` that is not an array construction, and a type name in expression position
+    // with neither `{` nor `(` after it. A code no input reaches is a number nobody has ever compared —
+    // mutation testing replaced each of these with `return 0` and the suite stayed green (wac-mono 0005).
+    "i32 f() { ++1; }",
+    "i32 f() { ++g(); }",
+    "i32 f() { return fn[i32(i32)]; }",
+    "i32 f() { return fn[i32(i32)][]; }",
+    "i32 f() { return S<i32>; }",
   ]);
 });
 
