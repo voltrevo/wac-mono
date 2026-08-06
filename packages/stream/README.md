@@ -24,14 +24,20 @@ The observation here is that **the transform does not have to be the thing that 
 host blocks instead, wac can stay an ordinary nested loop:
 
 ```wac
-export i32 upperCase(fn[u8[]()] read, fn[bool(u8[])] write) {
+export i32 upperCase(fn[Read()] read, fn[bool(u8[])] write) {
   while (true) {
-    u8[] chunk = read();          // <- blocks in the host until bytes exist
-    if (chunk.len() == 0) { break; }
-    ...
+    match (read()) {              // <- blocks in the host until an answer exists
+      case Data(bytes): { ... }
+      case End: { break; }
+      case Failed(why): { return 1; }
+    }
   }
 }
 ```
+
+`read` answers a [`Read`](../bytes/README.md) rather than a `u8[]`, because an empty array means
+both *finished* and *failed* — and every filter that conflated them exited 0 having written half
+its output. `match` is exhaustive, so this loop cannot forget the third case.
 
 `src/transform.wac` is exactly that — a `while` loop with a few bytes of held state for a scalar cut
 in half by a chunk boundary, and no idea that anything ever waited.
