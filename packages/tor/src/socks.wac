@@ -35,12 +35,14 @@
 // plus one `accept`, hands the whole list to `waitAny`, and re-issues whichever answered.
 // `box nc` is the two-handle version of the same shape.
 //
-// The platform's ring has sixteen slots and an outstanding call holds one, so the number of
-// handles that can be watched is bounded by it. `MAX_CLIENTS` is set below that with room to
-// spare rather than at it, because exceeding the ring does not degrade — it deadlocks, with
-// the held slots unable to complete.
+// An outstanding call holds one of the platform's `CALL_SLOTS`, so the number of handles that
+// can be watched is bounded by it. `MAX_CLIENTS` is derived from that constant rather than
+// written out, because the ring has been four slots, then sixteen, then 128, and a transcribed
+// number becomes a limit nobody can explain. It is set below the ceiling with room to spare
+// rather than at it, because exceeding the ring does not degrade — it deadlocks, with the held
+// slots unable to complete.
 
-import { Core, Cli, Socket, Pending, FileResult } from "../../platform/src/platform.wac";
+import { Core, Cli, Socket, Pending, FileResult, CALL_SLOTS } from "../../platform/src/platform.wac";
 import { Vec } from "../../std/src/vec.wac";
 import { Network, Guard, Building, bootstrap, connectGuard, startCircuit, advanceCircuit,
          circuitReady, circuitFailed } from "./bootstrap.wac";
@@ -52,8 +54,15 @@ import { socksReply, replyForEndReason, endReasonName, targetOf, requestLength,
          repOk, repFailure, repNotAllowed, repBadCommand, repBadAddress } from "./socks5.wac";
 import { Read } from "../../bytes/src/read.wac";
 
-/** Below the ring's sixteen slots: one `accept`, one relay `recv`, and one per client. */
-const i32 MAX_CLIENTS = 12;
+/**
+ * One `accept`, one relay `recv`, and one `recv` per client, kept well under `CALL_SLOTS`.
+ *
+ * The ring stopped being the binding constraint when it went to 128 slots; what bounds this now is that
+ * each client can ask for a circuit, and a circuit is three handshakes through three relays. So it is a
+ * quarter of the ring rather than all of it — raising it further is a question about how much work one
+ * client may demand, not about the transport.
+ */
+const i32 MAX_CLIENTS = CALL_SLOTS / 4;
 
 /**
  * How many circuits to keep. One per port in practice, built on demand.

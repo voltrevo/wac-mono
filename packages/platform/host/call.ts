@@ -26,7 +26,15 @@ import {
   S_RES_LEN,
   S_RES_STATUS,
   S_STATUS,
-  SLOT_BUF,
+  acquireBuf,
+  SLOT_INTS,
+  BUF_BYTES,
+  releaseBuf,
+  attach,
+  attached,
+  detach,
+  S_REQ_BUF,
+  S_RES_BUF,
   SLOTS,
   slotAt,
   ST_CANCELLED,
@@ -125,9 +133,13 @@ export function describeSlots(b: Bridge): string {
     // The handle for the stream operations, because `RECV` on standard input and `RECV` on a spawned
     // child's output are different waits with different causes, and the opcode alone cannot tell them
     // apart. Handle 0 is standard input; anything else counts from 1.
-    const handle = (op === OP.RECV || op === OP.SEND) &&
+    // The handle, when the request payload is still attached: the host detaches the buffer as it takes
+    // the call, so a slot in `running` no longer has one to read. That is the common case in a stall
+    // report, and it is why this is a `?` rather than a lookup.
+    const rb = attached(b, at, S_REQ_BUF);
+    const handle = (op === OP.RECV || op === OP.SEND) && rb >= 0 &&
         Atomics.load(b.ctrl, at + S_REQ_LEN) >= 4
-      ? `(h=${new DataView(b.req(i).buffer, b.req(i).byteOffset, 4).getInt32(0, true)})`
+      ? `(h=${new DataView(b.reqBuf(rb).buffer, b.reqBuf(rb).byteOffset, 4).getInt32(0, true)})`
       : "";
     busy.push(`${i}:${names[st] ?? st}:${opName(op)}${handle}`);
   }
@@ -136,6 +148,22 @@ export function describeSlots(b: Bridge): string {
     : `${busy.join(" ")} (submit=${Atomics.load(b.ctrl, SUBMIT_SEQ)} done=${
       Atomics.load(b.ctrl, DONE_SEQ)
     })`;
+}
+
+/**
+ * Take a request buffer, waiting for one if the pool is empty.
+ *
+ * Waiting is safe here and only here: a request buffer is released by the **host** as it takes the call,
+ * so a worker parked for one is waiting on the other side, which makes progress on its own. That is the
+ * whole reason there are two pools — with one, this wait could be on a buffer only this thread can free.
+ */
+function takeReqBuf(b: Bridge): number {
+  for (;;) {
+    const seen = Atomics.load(b.ctrl, DONE_SEQ);
+    const i = acquireBuf(b, "req");
+    if (i >= 0) return i;
+    parkForHost(b, seen);
+  }
 }
 
 /** Publish a slot's state change and wake the host. */
@@ -182,8 +210,14 @@ function claim(b: Bridge): number {
     // 0018 was filed about. `waitAny` says which ticket settled and collects nothing, so a
     // ticket that lost and was then forgotten keeps its slot for good.
     if (ready === SLOTS) {
-      const held: string[] = [];
-      for (let i = 0; i < SLOTS; i++) held.push(opName(Atomics.load(b.ctrl, slotAt(i) + S_OP)));
+      // Tallied rather than listed: 128 opcodes in a row is a wall of text, and what the reader needs is
+      // which *kind* of call was abandoned — `RECV × 126` says the mistake at a glance.
+      const tally = new Map<string, number>();
+      for (let i = 0; i < SLOTS; i++) {
+        const name = opName(Atomics.load(b.ctrl, slotAt(i) + S_OP));
+        tally.set(name, (tally.get(name) ?? 0) + 1);
+      }
+      const held = [...tally].sort((x, y) => y[1] - x[1]).map(([n, c]) => c === 1 ? n : `${n} × ${c}`);
       throw new HostCallError(
         `all ${SLOTS} call slots hold answers that were never taken, from: ${held.join(", ")}. ` +
           `A ticket you stopped waiting on has to be wait()ed or cancel()led — waitAny reports ` +
@@ -206,9 +240,39 @@ function awaitReady(b: Bridge, slot: number): void {
   }
 }
 
+/**
+ * The answer bytes, copied out, with the buffer handed straight back.
+ *
+ * The copy is not new — the slot was always reused under the reader — but the release is: a response
+ * buffer is the scarce thing now, and holding one a moment longer than the copy is memory somebody else
+ * is parked on.
+ */
+/** Which slot a control offset belongs to — the inline area is indexed by slot, not by buffer. */
+function slotOf(at: number): number {
+  return (at - slotAt(0)) / SLOT_INTS;
+}
+
+function readRes(b: Bridge, at: number): Uint8Array {
+  const len = Atomics.load(b.ctrl, at + S_RES_LEN);
+  const bi = attached(b, at, S_RES_BUF);
+  // `-1` means the answer is inline rather than absent: small answers never take a pooled buffer, and an
+  // answer that could not get one is written inline in pieces.
+  const out = (bi < 0 ? b.inline(slotOf(at)) : b.resBuf(bi)).slice(0, len);
+  detach(b, at, S_RES_BUF);
+  releaseBuf(b, "res", bi);
+  // The host may be holding an answer it could not write for want of a buffer; this is what tells it.
+  ping(b);
+  return out;
+}
+
 /** Give the slot back and move its generation on, so stale tickets read as expired. */
 function release(b: Bridge, slot: number): void {
   const at = slotAt(slot);
+  // The answer's buffer goes back here too, whatever route got us here. Doing it only in `readRes` left
+  // two paths leaking one buffer each — an acknowledged push chunk, and a cancel of a call that had
+  // already answered — and a pool that loses one buffer per occurrence is a hang later with nothing to
+  // point at. `releaseBuf` ignores -1, so a slot whose answer was already read is unaffected.
+  releaseBuf(b, "res", detach(b, at, S_RES_BUF));
   Atomics.add(b.ctrl, at + S_GEN, 1);
   Atomics.store(b.ctrl, at + S_STATUS, ST_FREE);
   // Someone may be parked because every slot was busy.
@@ -229,26 +293,35 @@ export function submit(b: Bridge, op: number, payload: Uint8Array): Ticket {
   const slot = claim(b);
   const at = slotAt(slot);
   const gen = Atomics.load(b.ctrl, at + S_GEN);
-  const buf = b.req(slot);
 
   let sent = 0;
-  while (payload.length - sent > SLOT_BUF) {
-    buf.set(payload.subarray(sent, sent + SLOT_BUF), 0);
+  while (payload.length - sent > BUF_BYTES) {
+    // A buffer per piece, released by the host as it reads each one. Holding one across the whole push
+    // loop would pin it for the length of a multi-megabyte write, which is the memory this pool exists to
+    // stop being reserved.
+    const bi = takeReqBuf(b);
+    b.reqBuf(bi).set(payload.subarray(sent, sent + BUF_BYTES), 0);
+    attach(b, at, S_REQ_BUF, bi);
     Atomics.store(b.ctrl, at + S_OP, OP_PUSH);
-    Atomics.store(b.ctrl, at + S_REQ_LEN, SLOT_BUF);
+    Atomics.store(b.ctrl, at + S_REQ_LEN, BUF_BYTES);
     Atomics.store(b.ctrl, at + S_STATUS, ST_PENDING);
     ping(b);
     awaitReady(b, slot);
+    // Read *before* the check, because reading is what hands the buffer back: an acknowledgement carries
+    // no bytes but it does carry a buffer, and skipping it leaked one per chunk of every large write.
+    const acked = readRes(b, at);
     if (Atomics.load(b.ctrl, at + S_RES_STATUS) === STATUS_ERR) {
-      const said = faultedMessage(b.res(slot).slice(0, Atomics.load(b.ctrl, at + S_RES_LEN)));
+      const said = faultedMessage(acked);
       release(b, slot);
       throw new HostCallError(said.message, said.fault);
     }
-    sent += SLOT_BUF;   // acknowledged; the host is waiting for the next piece
+    sent += BUF_BYTES;   // acknowledged; the host is waiting for the next piece
   }
 
   const tail = payload.subarray(sent);
-  buf.set(tail, 0);
+  const bi = takeReqBuf(b);
+  b.reqBuf(bi).set(tail, 0);
+  attach(b, at, S_REQ_BUF, bi);
   Atomics.store(b.ctrl, at + S_OP, op);
   Atomics.store(b.ctrl, at + S_REQ_LEN, tail.length);
   Atomics.store(b.ctrl, at + S_STATUS, ST_PENDING);
@@ -303,8 +376,7 @@ export function collect(b: Bridge, t: Ticket): Uint8Array {
   for (;;) {
     awaitReady(b, t.slot);
     const status = Atomics.load(b.ctrl, at + S_RES_STATUS);
-    const len = Atomics.load(b.ctrl, at + S_RES_LEN);
-    const chunk = b.res(t.slot).slice(0, len);   // a copy: the slot gets reused
+    const chunk = readRes(b, at);   // copied out, and the pooled buffer handed back at once
     if (status === STATUS_ERR) {
       release(b, t.slot);
       const said = faultedMessage(chunk);

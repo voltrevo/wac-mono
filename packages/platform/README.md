@@ -353,7 +353,7 @@ own memory — the wait is on the completion counter the host bumps, so it consu
 and cannot deadlock the ring. `nc`, an SSH relay and a shell all needed this and none of
 them could be written before it; polling `isDone` in a loop burns a core to avoid parking.
 
-Underneath, the bridge is a ring of sixteen slots rather than one mailbox — see `layout.ts`.
+Underneath, the bridge is a ring of 128 slots rather than one mailbox — see `layout.ts`.
 `Atomics.wait` takes a single address, so "wait until any of these finishes" is a wait on
 one completion counter followed by a rescan, which is also exactly what `poll` over sockets
 is. `hostCall` is still submit-then-collect and does the same atomics the single mailbox
@@ -376,7 +376,7 @@ holds — and all four were live in a bridge whose tests passed:
 
 The last two are invisible until the ring runs out, and then the failure is a park in whatever
 call happens to be next. The first was unhittable at four slots and appeared within three suite
-runs at sixteen. Only the second was ever reported from the field, and only because a tor client
+runs at sixteen slots. Only the second was ever reported from the field, and only because a tor client
 was dropping healthy relays.
 
 So `test/fuzz.test.ts` exists: a seeded random sequence of submit, cancel, collect and waitAny
@@ -428,15 +428,47 @@ What stays the caller's problem, because it is about the call rather than the cl
   outstanding means two reads on one socket and no defined byte order.
 
 **The slot count is also a ceiling on how many handles a program can watch**, since watching N
-means N outstanding `recv`s holding N slots, and writing needs one more. It is sixteen rather
-than four for that reason: four meant three handles, and `pipe.wac` already watches three, so a
-three-stage pipeline could not be written. Exceeding it is worse than a limit — the held slots
-are RUNNING, not READY, so it is indistinguishable from backpressure and parks silently. The
-buffer per slot halved to pay for it, which costs round trips only on payloads above 128KB;
-interleaved warm runs of a 200MB `sha256sum` are 1.9s either way.
+means N outstanding `recv`s holding N slots, and writing needs one more. It went four → sixteen
+→ 128 for that reason: four meant three handles, and `pipe.wac` already watches three, so a
+three-stage pipeline could not be written; sixteen meant a relay could not fan in more than a
+dozen sockets. Exceeding it is worse than a limit — the held slots are RUNNING, not READY, so it
+is indistinguishable from backpressure and parks silently.
+
+**What paid for 128 slots is that a slot no longer owns a buffer.** Sixteen slots × 128KiB was
+2MiB of shared memory per bridge whether a program made one call or none, and the natural way to
+raise the slot count multiplies it: 128 would have been 16MiB, four times over for a shell with
+four applets running. So the payload buffers are **pooled** — eight per direction, taken for the
+length of one copy and handed straight back — and a slot is a 32-byte control record with a
+4KiB inline area of its own. 2.5MiB against the old 2MiB, for eight times the fan-in.
+
+The inline area is not an optimisation, it is the progress guarantee: **an answer can always be
+written.** The first version of the pool deferred an answer that could not get a buffer, and
+deadlocked — the buffers are held by answers the worker has not collected, and a worker parked on
+one particular call collects nothing, so the answer it waits for never comes. With an inline
+area, a pool that is empty costs round trips and nothing else.
+
+How many round trips is the whole question, and 256 bytes — the size it was first written at —
+made the fallback a cliff: `bench/ring.ts` measures 300 × 1MiB answers with 32 in flight, and at
+256 bytes that cost seven times what 8 in flight did, because every answer past the eighth
+crawled 256 bytes at a time. 4KiB is the knee of that curve (1694 → 384ms for +0.46MiB), and it
+is why the inline area is sized against the pool's *absence* rather than against a typical
+answer:
+
+| inline | 256B | 1KiB | 2KiB | 4KiB | 8KiB |
+| --- | --- | --- | --- | --- | --- |
+| 300 × 1MiB, 32 live | 1694ms | 712ms | 512ms | 384ms | 300ms |
+| bridge | 2.04MiB | 2.13MiB | 2.25MiB | 2.50MiB | 3.00MiB |
+
+Pooling makes ownership shared, which is a new class of bug, and it produced one immediately:
+handles were stored as an index with -1 for "none", in memory that starts at **zero**, so every
+untouched slot claimed to hold buffer 0 and the first `release` of one handed that buffer back
+while a live answer was still in it. The fuzzer read one call's answer out of another's —
+`asked as 15, answered as 24` — on its first seed. Handles are one-based now, so zeroed memory
+means "none" by construction, and `test/pool_model.test.ts` walks every reachable state of two
+slots over one buffer with that bug and its mirror image as mutants.
 
 A ticket abandoned rather than cancelled still fills a slot, so the ring keeps its backstop:
-`all 16 call slots hold answers that were never taken, from: RECV, RECV, …`.
+`all 128 call slots hold answers that were never taken, from: RECV × 127, ACCEPT`.
 A ready slot can only be freed by the thread that submitted it, so a submitter finding all
 every slot ready is provably stuck rather than merely waiting — an error, not a park. It names
 the opcodes because the call that discovers the full ring is rarely the one that leaked.

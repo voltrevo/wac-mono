@@ -42,7 +42,56 @@
  * Submitting with no free slot still waits, which is backpressure rather than an error, and
  * is correct whenever the outstanding calls will finish on their own.
  */
-export const SLOTS = 16;
+export const SLOTS = 128;
+
+/**
+ * How many payload buffers there are, per direction, and how big each is.
+ *
+ * **A slot no longer owns a buffer.** It used to: sixteen slots each reserved 128 KiB in each direction,
+ * so a program's *fan-in* — how many calls it can have outstanding — was priced in megabytes of mostly
+ * empty memory. A server holding sixteen idle `recv`s reserved 4 MB to hold nothing, and `packages/tor`'s
+ * relay needs 1 + 2 per circuit outstanding, which exceeds sixteen with a single connection at full
+ * circuits. Exceeding the ring does not degrade; it parks for ever.
+ *
+ * So this is the descriptor-ring-and-buffer-pool shape a network card uses. A slot is a 32-byte control
+ * record, and a payload buffer is acquired only while bytes are actually moving. 128 slots cost 4 KiB of
+ * control; sixteen buffers cost 2 MB. That is **half the memory for eight times the fan-in**, and the
+ * scarce resource is now bandwidth rather than concurrency, which is the one you can back-pressure
+ * without deadlocking.
+ *
+ * **Two pools, not one, and that is what makes it safe.** A request buffer is released by the *host* when
+ * it takes the call; a response buffer by the *worker* when it collects. With one pool a worker could park
+ * waiting for a buffer that only it can free. With two, each side only ever waits on the other, and the
+ * other always makes progress.
+ */
+export const BUFS = 8;
+
+/**
+ * Bytes of answer that fit in the slot itself, without a pooled buffer.
+ *
+ * **This is what makes the pool an optimisation rather than a requirement**, and it is not decoration: a
+ * shared pool alone deadlocks. An answer that cannot get a buffer has to wait for one, the buffers are
+ * held by answers the worker has not collected, and a worker parked on one specific call will not collect
+ * anything — so the call it is waiting for can never land. The fuzzer found that immediately, as a hang.
+ *
+ * With an inline area every answer can *always* be written, in chunks if need be: the response path
+ * already carries a tail through `STATUS_MORE` and `OP_CONTINUE`, so a pooled buffer only decides whether
+ * a large answer takes one round trip or many.
+ *
+ * **Which makes this the fallback path's bandwidth**, and the first version got it wrong. At 256 bytes a
+ * 1 MiB answer that misses the pool takes four thousand round trips, and `bench/ring.ts` duly showed a
+ * cliff — 32 concurrent large answers cost seven times what 8 did, because everything past the eighth
+ * crawled. The sweep, 300 × 1 MiB with 32 in flight:
+ *
+ *   inline    256B   1KiB   2KiB   4KiB   8KiB
+ *   time     1694ms  712ms  512ms  384ms  300ms
+ *   bridge   2.04MiB 2.13   2.25   2.50   3.00
+ *
+ * 4 KiB is the knee: four times better than 256 bytes for less than half a megabyte, and past it the
+ * memory grows faster than the saving. A pool that is merely *busy* now costs round trips in proportion,
+ * rather than falling off a cliff nobody would connect to the pool being full.
+ */
+export const INLINE_BYTES = 4096;
 
 /**
  * Payload bytes per slot, each way.
@@ -63,6 +112,9 @@ export const SLOTS = 16;
  * comparison has to be interleaved and warm to say anything at all.
  */
 export const SLOT_BUF = 1 << 17;
+
+/** What one pooled buffer holds. Named for what it is now; `SLOT_BUF` is the old name kept for callers. */
+export const BUF_BYTES = SLOT_BUF;
 
 /**
  * What one `readChunk` hands back at most.
@@ -98,6 +150,17 @@ export const S_RES_STATUS = 4;
  * the answer looks plausible.
  */
 export const S_GEN = 5;
+
+/**
+ * Which pooled buffer currently carries this slot's request. **One-based**; read it with `attached`.
+ *
+ * Attached when the worker publishes and detached by the host as it takes the call — a request buffer is
+ * held for exactly one host-side read.
+ */
+export const S_REQ_BUF = 6;
+
+/** Which pooled buffer carries this slot's answer, one-based. Held until the worker collects. */
+export const S_RES_BUF = 7;
 
 /** Nobody is using this slot. The worker allocates; only the worker sets this. */
 export const ST_FREE = 0;
@@ -142,24 +205,92 @@ export const OP_CONTINUE = -1;
 /** Set as the op while the worker is still feeding an oversized request. */
 export const OP_PUSH = -2;
 
-export const CTRL_INTS = CTRL_HEAD + SLOTS * SLOT_INTS;
+/**
+ * One flag per buffer, per direction: 0 free, 1 held.
+ *
+ * A flag array with a compare-and-exchange per entry rather than a linked free list, because a Treiber
+ * stack in shared memory has an ABA problem and this repo has already paid twice for subtle lock-free
+ * mistakes in this file's neighbours. Eight entries make the scan free, and the failure mode of a scan is
+ * "did not find one", which is a state the callers already have to handle.
+ */
+export const REQ_FREE_AT = CTRL_HEAD;
+export const RES_FREE_AT = REQ_FREE_AT + BUFS;
+const SLOTS_AT = RES_FREE_AT + BUFS;
+
+export const CTRL_INTS = SLOTS_AT + SLOTS * SLOT_INTS;
 export const CTRL_BYTES = CTRL_INTS * 4;
 export const REQ_OFFSET = CTRL_BYTES;
-export const RES_OFFSET = REQ_OFFSET + SLOTS * SLOT_BUF;
-export const TOTAL_BYTES = RES_OFFSET + SLOTS * SLOT_BUF;
+export const RES_OFFSET = REQ_OFFSET + BUFS * BUF_BYTES;
+export const INLINE_OFFSET = RES_OFFSET + BUFS * BUF_BYTES;
+export const TOTAL_BYTES = INLINE_OFFSET + SLOTS * INLINE_BYTES;
 
 export type Bridge = {
   sab: SharedArrayBuffer;
   ctrl: Int32Array;
-  /** Request payload for slot `i`. */
-  req(i: number): Uint8Array;
-  /** Response payload for slot `i`. */
-  res(i: number): Uint8Array;
+  /** Pooled request buffer `i`. */
+  reqBuf(i: number): Uint8Array;
+  /** Pooled response buffer `i`. */
+  resBuf(i: number): Uint8Array;
+  /** Slot `i`'s inline answer area — always available, and small. */
+  inline(i: number): Uint8Array;
 };
+
+/** Which pool: requests are freed by the host, responses by the worker. */
+export type Dir = "req" | "res";
+
+/**
+ * Take a buffer, or -1 when they are all busy.
+ *
+ * Never blocks: a caller that cannot get one has to decide what to do — the worker parks and retries, the
+ * host holds the answer until one frees. Blocking here would put the decision in the wrong place.
+ */
+export function acquireBuf(b: Bridge, dir: Dir): number {
+  const base = dir === "req" ? REQ_FREE_AT : RES_FREE_AT;
+  for (let i = 0; i < BUFS; i++) {
+    if (Atomics.compareExchange(b.ctrl, base + i, 0, 1) === 0) return i;
+  }
+  return -1;
+}
+
+/** Give one back. Idempotent for -1, which is what an unattached slot carries. */
+export function releaseBuf(b: Bridge, dir: Dir, i: number): void {
+  if (i < 0) return;
+  Atomics.store(b.ctrl, (dir === "req" ? REQ_FREE_AT : RES_FREE_AT) + i, 0);
+}
+
+/**
+ * Buffer handles live in shared memory **one-based**, so zero — what memory starts as — means "none".
+ *
+ * This is not a style choice. With -1 for "none", every slot of a fresh bridge claimed to hold pooled
+ * buffer 0, and the first `release` of an untouched slot handed that buffer back while a live answer was
+ * still writing in it. Two slots then pointed at one buffer and the worker read one call's answer out of
+ * another's: `asked as 15, answered as 24`. Zero-means-none cannot be forgotten by a slot nobody has
+ * initialised, which is the only version of this that stays correct as slots and paths are added.
+ */
+export function attach(b: Bridge, at: number, field: number, i: number): void {
+  Atomics.store(b.ctrl, at + field, i + 1);
+}
+
+/** What is attached, or -1. Leaves the field alone. */
+export function attached(b: Bridge, at: number, field: number): number {
+  return Atomics.load(b.ctrl, at + field) - 1;
+}
+
+/**
+ * Detach, and say what was there — or -1 if nothing was.
+ *
+ * An exchange rather than a load and a store, because both sides can reach a handle at once: the host
+ * takes a request while the worker cancels the call, and a cancel sweep frees the same slot. Read-then-
+ * clear lets both see the same index and both release it, which is the double free this encoding exists
+ * to make impossible.
+ */
+export function detach(b: Bridge, at: number, field: number): number {
+  return Atomics.exchange(b.ctrl, at + field, 0) - 1;
+}
 
 /** Where slot `i`'s control block starts. */
 export function slotAt(i: number): number {
-  return CTRL_HEAD + i * SLOT_INTS;
+  return SLOTS_AT + i * SLOT_INTS;
 }
 
 export function bridgeOf(sab: SharedArrayBuffer): Bridge {
@@ -169,11 +300,21 @@ export function bridgeOf(sab: SharedArrayBuffer): Bridge {
   // worth two and a half times the whole test suite's runtime in a streaming loop.
   const reqs: Uint8Array[] = [];
   const ress: Uint8Array[] = [];
-  for (let i = 0; i < SLOTS; i++) {
-    reqs.push(new Uint8Array(sab, REQ_OFFSET + i * SLOT_BUF, SLOT_BUF));
-    ress.push(new Uint8Array(sab, RES_OFFSET + i * SLOT_BUF, SLOT_BUF));
+  for (let i = 0; i < BUFS; i++) {
+    reqs.push(new Uint8Array(sab, REQ_OFFSET + i * BUF_BYTES, BUF_BYTES));
+    ress.push(new Uint8Array(sab, RES_OFFSET + i * BUF_BYTES, BUF_BYTES));
   }
-  return { sab, ctrl, req: (i: number) => reqs[i], res: (i: number) => ress[i] };
+  const inlines: Uint8Array[] = [];
+  for (let i = 0; i < SLOTS; i++) {
+    inlines.push(new Uint8Array(sab, INLINE_OFFSET + i * INLINE_BYTES, INLINE_BYTES));
+  }
+  return {
+    sab,
+    ctrl,
+    reqBuf: (i: number) => reqs[i],
+    resBuf: (i: number) => ress[i],
+    inline: (i: number) => inlines[i],
+  };
 }
 
 export function newBridge(): Bridge {
