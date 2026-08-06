@@ -900,3 +900,29 @@ What step 6 still needs: INTRODUCE2 parsing (the inverse of `introduce1Cell`), t
 *responder* keys mirroring `clientIntroduceKeys`/`clientRendezvousKeys`, RENDEZVOUS1, and descriptor
 building and publication — the inverse of `hsdesc.wac`'s decryption. The cell above is the one they
 all hang from, because a service with no established introduction point has nothing to publish.
+
+### The hs-ntor responder, checked against tor on both sides
+
+`serviceIntroduceKeys` in `hsntor.wac`, beside its client twin rather than folded into it with a flag.
+Only the *inputs* differ — the service holds the secret half of `enc-key ntor` and receives the
+client's ephemeral public key in the cell, where the client holds the public half and its own secret —
+and everything hashed after that is identical and in the same order. That sameness is the whole reason
+a client and a service agree, so the two lists are worth seeing side by side.
+
+The oracle is tor's own `test-hs-ntor-cl`, which `capture-hsntor.py` already used for the client half;
+it now runs **`server1` as well as `client1`** over the same inputs and **refuses to write a vector if
+the two disagree**. So the expected value in the fixture is tor's twice over, and our service is
+compared against tor rather than against our client. Checking our service against our client would
+pass for a pair sharing a mistake — which is the seam that produced the `linkHandshake` bug and the
+microdesc-flavour gap, both found only when something of tor's was put on the other side.
+
+Re-capturing changed **four lines** of the committed vector — one `introEncSecret` per case, with
+every derived value byte-identical. That is the check that the capture is deterministic and that
+adding the service side disturbed nothing.
+
+Faults planted: swapping the arguments to `x25519`, hashing the service's secret where its public key
+belongs, dropping the degenerate-key refusal, and omitting the subcredential — all four caught.
+
+One thing the test file's own history caught for me: it already had a `flipScalar` beside `flip`,
+because flipping byte 0 of a curve25519 secret breaks the clamping and turns a test about key
+derivation into a test about clamping. Mine had used `flip`.

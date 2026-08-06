@@ -163,6 +163,45 @@ export u8[] clientIntroduceKeys(
 }
 
 /**
+ * The **service's** side of the same INTRODUCE1 keys: `ENC_KEY | MAC_KEY`, 64 bytes, or empty.
+ *
+ * The mirror of `clientIntroduceKeys`, and deliberately written out rather than folded into it with a
+ * flag. Only two things differ, and both are the *inputs* rather than the construction: the service
+ * holds the secret half of `enc-key ntor` where the client holds the public half, and the client's
+ * ephemeral public key arrives in the cell instead of being derived. Everything hashed after that is
+ * identical and in the same order — which is the property that makes a client and a service agree at
+ * all, so seeing the two lists side by side is worth more than sharing one.
+ *
+ * `introEncSecret` is the service's own curve25519 secret; `clientPublic` is the `CLIENT_PK` field of
+ * the INTRODUCE2 cell. Empty on a degenerate shared value, for the reason the client half gives: a
+ * small-order client key would let anyone holding no private key derive what we derive.
+ */
+export u8[] serviceIntroduceKeys(
+  u8[] introAuthKey, u8[] introEncSecret, u8[] clientPublic, u8[] subcredential
+) {
+  if (introAuthKey.len() != 32 || introEncSecret.len() != 32) { return u8[0](); }
+  if (clientPublic.len() != 32 || subcredential.len() != 32) { return u8[0](); }
+
+  u8[] introEncKey = x25519Base(introEncSecret);
+  u8[] shared = x25519(introEncSecret, clientPublic);
+  if (isZero(shared)) { return u8[0](); }
+
+  u8[][] secret = u8[][5]();
+  secret[0] = shared;
+  secret[1] = introAuthKey;
+  secret[2] = clientPublic;
+  secret[3] = introEncKey;
+  secret[4] = protoid();
+
+  u8[][] input = u8[][4]();
+  input[0] = concat(secret);
+  input[1] = tHsEnc();
+  input[2] = mHsExpand();
+  input[3] = subcredential;
+  return shake256(concat(input), S_KEY_LEN + MAC_LEN);
+}
+
+/**
  * From the service's reply `Y`: `AUTH_INPUT_MAC | NTOR_KEY_SEED`, 64 bytes, or empty.
  *
  * The caller must compare `AUTH_INPUT_MAC` against the `AUTH` field of the RENDEZVOUS2 cell before
