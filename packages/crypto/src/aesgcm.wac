@@ -17,6 +17,7 @@
 import { aesExpandKey, aesEncryptBlock, aesRounds } from "./aes.wac";
 import { ghash } from "./ghash.wac";
 import { storeBE64, padTo16 } from "./layout.wac";
+import { ctEqualN } from "./ct.wac";
 
 /**
  * Increment the low 32 bits of a 16-byte counter block, wrapping at 2^32.
@@ -142,8 +143,6 @@ export u8[] gcmTag(u8[] key, u8[] iv, u8[] aad, u8[] ct) {
 export u8[] gcmDecrypt(u8[] key, u8[] iv, u8[] aad, u8[] ct, u8[] tag) {
   if (tag.len() != 16) { trap; }
   u8[] want = gcmTag(key, iv, aad, ct);
-  i32 diff = 0;
-  for (i32 i = 0; i < 16; i++) { diff |= want[i] ^ tag[i]; }
-  if (diff != 0) { trap; }
+  if (!ctEqualN(want, tag, 16)) { trap; }
   return gcmEncrypt(key, iv, ct);
 }

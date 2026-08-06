@@ -1,0 +1,129 @@
+// Remembering an INTRODUCE2 we have already handled.
+//
+// The rules are tor's `replaycache_add_and_test_internal`: a SHA-256 of the data is the key, a
+// horizon of zero never expires, an entry within the horizon is a hit, and a hit refreshes the
+// entry's timestamp. Each of those is a line of C and each has a consequence a test can state.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  HORIZON_FOREVER, REND_REPLAY_SECONDS, ReplayCache, cookieReplayCache, introReplayCache, seenBefore,
+} from "../../src/hsreplay.wac";
+
+const i64 NOW = 1785931200;
+
+/** The first sight of a cell is not a replay; the second is. */
+export string test_the_second_time_is_a_replay(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  ReplayCache c = introReplayCache(8);
+  u8[] cell = bytes(1, 200);
+
+  t.isTrue(!seenBefore(c, cell, NOW), "the first INTRODUCE2 is new");
+  t.isTrue(seenBefore(c, cell, NOW), "the same bytes again are a replay");
+  t.isTrue(seenBefore(c, cell, NOW + 1), "and still are a moment later");
+
+  // A different cell is a different client, not a replay — the whole cache is worthless if it
+  // rejects legitimate introductions.
+  t.isTrue(!seenBefore(c, bytes(2, 200), NOW), "another client's cell is not a replay");
+  // One byte different is a different cell: the key is a digest of the whole thing.
+  u8[] almost = bytes(1, 200);
+  almost[199] = almost[199] ^ 1;
+  t.isTrue(!seenBefore(c, almost, NOW), "one byte apart is not the same cell");
+
+  t.isTrue(!seenBefore(c, u8[0](), NOW), "nothing is not a cell and is not remembered");
+  return t.report();
+}
+
+/**
+ * The two caches forget on different schedules, and that is deliberate.
+ *
+ * An introduction point's cache of ENCRYPTED sections never expires: the cell carries no timestamp,
+ * so one captured today is exactly as replayable next month, and forgetting it would reopen the hole.
+ *
+ * The service's cache of rendezvous cookies forgets after five minutes, because a repeated cookie
+ * inside that window is usually a client retrying after its introduction circuit timed out — the
+ * service is already building that rendezvous circuit — while the same cookie an hour later is a new
+ * attempt that deserves a new circuit.
+ */
+export string test_the_two_caches_forget_differently(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqI64(REND_REPLAY_SECONDS, 300 as i64, "REND_REPLAY_TIME_INTERVAL is five minutes");
+  t.eqI64(HORIZON_FOREVER, 0 as i64, "and zero is tor's 'never expire'");
+
+  ReplayCache intro = introReplayCache(8);
+  u8[] cell = bytes(3, 200);
+  t.isTrue(!seenBefore(intro, cell, NOW), "first sight");
+  t.isTrue(seenBefore(intro, cell, NOW + 86400 * 30), "a month on it is still a replay");
+
+  ReplayCache cookies = cookieReplayCache(8);
+  u8[] cookie = bytes(4, 20);
+  t.isTrue(!seenBefore(cookies, cookie, NOW), "first sight of a cookie");
+  t.isTrue(seenBefore(cookies, cookie, NOW + 299), "inside five minutes it is a repeat");
+
+  // Just past the horizon it is a new attempt. Both sides of the boundary, because a `>` and a `>=`
+  // agree everywhere except the one second that separates them.
+  ReplayCache fresh = cookieReplayCache(8);
+  t.isTrue(!seenBefore(fresh, cookie, NOW), "first sight");
+  t.isTrue(seenBefore(fresh, cookie, NOW + REND_REPLAY_SECONDS),
+           "exactly at the horizon it is still a repeat, as tor's `>=` has it");
+  ReplayCache fresh2 = cookieReplayCache(8);
+  t.isTrue(!seenBefore(fresh2, cookie, NOW), "first sight");
+  t.isTrue(!seenBefore(fresh2, cookie, NOW + REND_REPLAY_SECONDS + 1),
+           "and one second past it is a new attempt");
+  return t.report();
+}
+
+/**
+ * A hit refreshes the entry, so steady replaying does not outlast the cache.
+ *
+ * Without the refresh, a cell replayed every four minutes would fall out of a five-minute cache on
+ * the schedule of its *first* arrival and become new again — the cache would be a rate limit rather
+ * than a memory.
+ */
+export string test_a_replay_refreshes_what_it_hit(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  ReplayCache c = cookieReplayCache(8);
+  u8[] cookie = bytes(5, 20);
+  t.isTrue(!seenBefore(c, cookie, NOW), "first sight");
+
+  // Four minutes apart, over and over. Each is a hit, and each pushes the entry forward.
+  i64 at = NOW;
+  for (i32 i = 0; i < 10; i++) {
+    at = at + 240;
+    t.isTrue(seenBefore(c, cookie, at), "still a repeat forty minutes after the first sight");
+  }
+  return t.report();
+}
+
+/**
+ * The cache is bounded, and being full does not mean rejecting everything.
+ *
+ * An attacker can send as many distinct INTRODUCE2 cells as they like, so an unbounded cache is a way
+ * to run a service out of memory using the mechanism meant to protect it. Full means the oldest entry
+ * goes, which keeps the newest — and a retry, which is what this is mostly catching, is recent.
+ */
+export string test_the_cache_is_bounded(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  ReplayCache c = introReplayCache(4);
+
+  for (i32 i = 0; i < 4; i++) {
+    t.isTrue(!seenBefore(c, bytes(10 + i, 40), NOW + (i as i64)), "four distinct cells are new");
+  }
+  t.isTrue(seenBefore(c, bytes(10, 40), NOW + 4), "and all four are remembered");
+
+  // A fifth evicts the oldest. That entry was refreshed by the check above, so the *second* is now
+  // the oldest — which is the behaviour that makes eviction follow use rather than arrival.
+  t.isTrue(!seenBefore(c, bytes(99, 40), NOW + 5), "a fifth cell is new");
+  t.isTrue(!seenBefore(c, bytes(11, 40), NOW + 6), "and the least recently seen was forgotten");
+  t.isTrue(seenBefore(c, bytes(99, 40), NOW + 7), "while the newest is still held");
+
+  t.isTrue(!seenBefore(introReplayCache(0), bytes(1, 40), NOW),
+           "a cache with no room holds nothing and says so rather than trapping");
+  return t.report();
+}
+
+/** `n` bytes derived from `role`, so two cells differ in every byte rather than in a prefix. */
+u8[] bytes(i32 role, i32 n) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (role * 131 + i * 17 + 7) & 0xFF; }
+  return out;
+}
