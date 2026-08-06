@@ -660,3 +660,15 @@ What the survivors were is more useful than the numbers, because they were not a
 The distinction worth keeping is the last two: "a guard nothing reaches" is an argument for writing the
 argument down, and "a guard nothing reaches *yet*" is an argument for a test. The difference is whether the
 function is exported.
+
+## `packages/ssz`, 55/55 on a first sweep — agent-a, 2026-08-06
+
+Nothing survived. That is the first package to come back clean without a single fix, and the reason is
+worth writing down rather than celebrating: **2,233 vectors from `consensus-spec-tests`, including all
+1,131 *invalid* `ssz_generic` cases.** A corpus with a thousand malformed inputs in it kills guard mutants
+the way no hand-written test does — every length check, every offset check and every bounds check has
+something in the corpus whose only purpose is to trip it.
+
+The comparison that makes the point is `packages/abi`, swept the same evening: also a codec, also driven
+by an oracle, 25/26 — and its one survivor was a guard on a *path the corpus cannot reach*, because every
+case in it came from encoding a valid value. Malformed-input corpora are what separate the two.

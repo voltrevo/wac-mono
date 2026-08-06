@@ -426,9 +426,11 @@ export i32 FAULT_NOT_REPRESENTABLE() { return 6; }
  * about them, and until this existed it could not tell them apart — a withheld filesystem and a
  * `chmod 000` were the same category with different sentences.
  *
- * **`faultWords` deliberately has no phrase for it.** The host's own message — "filesystem read not
- * granted to this application" — says what no four-word errno phrase can, so a caller that falls back to
- * the message when the category has no words prints exactly the right thing.
+ * **`faultWords` has a phrase for it, and used not to.** The argument for having none was that the host's
+ * own sentence — "filesystem read not granted to this application" — says what no errno phrase can, and a
+ * caller falling back to the message would print exactly the right thing. That holds only where there *is*
+ * a message: `Change` and `FileResult` carry one, and **`Stat` does not**. So `stat: cannot tell — ` was
+ * what a program printed for the answer this category exists to give, with nothing after the dash.
  */
 export i32 FAULT_NOT_GRANTED() { return 7; }
 
@@ -460,6 +462,10 @@ export string faultWords(i32 fault) {
   // to. Saying the host cannot express the name is the true sentence, and it beats "No such file or
   // directory" for a file the caller has just seen in `ls`. wac-mono 0065.
   if (fault == FAULT_NOT_REPRESENTABLE()) { return "cannot be named on this host"; }
+  // Also not GNU's, for the same reason: a program the operating system runs was granted everything the
+  // operating system has, so GNU never had to say this. It is the sentence a caller most needs, because it
+  // is the one failure that is nothing to do with the file.
+  if (fault == FAULT_NOT_GRANTED()) { return "Not granted to this application"; }
   return "";
 }
 
@@ -506,7 +512,8 @@ export struct Stat {
    *
    * **Absence is an answer, not a fault.** A path that is simply not there gives `exists = false` with
    * `FAULT_NONE`, because "there is nothing here" is what `stat` was asked. A fault means the question
-   * could not be *reached*: `FAULT_DENIED` when the world has no read capability, and
+   * could not be *reached*: `FAULT_NOT_GRANTED` when the world has no read capability, `FAULT_DENIED`
+   * when it has one and the operating system refused anyway, and
    * `FAULT_NOT_REPRESENTABLE` for a name this host cannot express — a file `ls` has just listed, whose
    * name came back from `readDir` with an invalid byte replaced, so every path built from it fails.
    *

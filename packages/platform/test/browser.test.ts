@@ -14,7 +14,7 @@ import { browserWorld, type DirHandle, type FileHandle } from "../host/browser.t
 import { WORKER_MARKER } from "../host/children.ts";
 import { i32le, readI32le, str, unstr } from "../host/call.ts";
 import { OP } from "../host/ops.ts";
-import { FAULT_DENIED, FAULT_NOT_FOUND, STAT_BYTES, STAT_FAULT } from "../host/faults.ts";
+import { FAULT_NOT_FOUND, FAULT_NOT_GRANTED, STAT_BYTES, STAT_FAULT } from "../host/faults.ts";
 
 /**
  * The bytes out of a `Read` payload: tag 0 is data, 1 is the end, 2 is a failure.
@@ -560,20 +560,22 @@ Deno.test("the browser world denies the filesystem when the page grants none", a
 
   await rejects(() => call(OP.READ_FILE, str("anything")), "filesystem read not granted");
   await rejects(() => call(OP.READ_DIR, str("anything")), "filesystem read not granted");
-  // Not granted is *not* "does not exist" any more, here or under Deno: `stat` answers with
-  // `FAULT_DENIED` in its fault byte, because a page that was never given a directory cannot say
-  // whether a file is there and saying "it is not" is a guess. wac-mono 0065.
+  // Not granted is *not* "does not exist" — a page that was never given a directory cannot say whether a
+  // file is there, and saying "it is not" is a guess (wac-mono 0065). It is not `FAULT_DENIED` either,
+  // which it was until the grant got its own category: "the page never handed this over" and "the
+  // filesystem said no" are different sentences to whoever reads the diagnostic.
   const ungranted = await call(OP.STAT, str("anything"));
   assertEquals(ungranted[0], 0, "it claimed a file exists in a filesystem it cannot see");
   assertEquals(ungranted.length, STAT_BYTES, "the reply is too narrow to carry a fault");
-  assertEquals(ungranted[STAT_FAULT], FAULT_DENIED, "an ungranted stat looked like absence");
+  assertEquals(ungranted[STAT_FAULT], FAULT_NOT_GRANTED, "an ungranted stat looked like absence or denial");
 
   // A read-only grant still refuses every mutation.
   const ro = browserWorld({ root: memDir() });
   const roCall = async (op: number, payload: Uint8Array<ArrayBufferLike> = new Uint8Array(0)) =>
     await ro[op](payload as Uint8Array) as Uint8Array;
-  // A refusal for want of a grant is `FAULT_DENIED` said in the ordinary shape, not an exception:
-  // one code path in the applet for "the page said no" and "the filesystem said no".
+  // A refusal for want of a grant is a fault said in the ordinary shape, not an exception: one code path
+  // in the applet for "the page said no" and "the filesystem said no", and different categories so the
+  // applet can tell which happened.
   for (const [op, payload] of [
     [OP.MKDIR, new Uint8Array([1, ...str("d")])],
     [OP.REMOVE, new Uint8Array([0, ...str("d")])],
@@ -581,7 +583,7 @@ Deno.test("the browser world denies the filesystem when the page grants none", a
     [OP.RENAME, new Uint8Array([1, 0, 0, 0, ...str("f"), ...str("g")])],
   ] as [number, Uint8Array][]) {
     const c = change(await roCall(op, payload));
-    assertEquals(c.fault, 2, `op ${op} is FAULT_DENIED`);
+    assertEquals(c.fault, FAULT_NOT_GRANTED, `op ${op} should be FAULT_NOT_GRANTED, was ${c.fault}`);
     assertEquals(c.message.includes("write not granted"), true, c.message);
   }
   await rejects(() => roCall(OP.OPEN_OUTPUT, str("f")), "write not granted");

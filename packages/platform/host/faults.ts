@@ -133,7 +133,9 @@ export function faultOf(e: unknown): number {
   // directory under Deno arrives as a plain `Error`, and its os error number is the only marker.
   const message = e instanceof Error ? e.message : String(e);
   if (/not empty|os error 39|os error 66/i.test(message)) return FAULT_NOT_EMPTY;
-  if (/not granted/i.test(message)) return FAULT_DENIED;
+  // A grant this program was never given. This line said `FAULT_DENIED` for a year after the category
+  // below it existed, which made the distinction it was added for unobservable from a message.
+  if (/not granted/i.test(message)) return FAULT_NOT_GRANTED;
   return FAULT_OTHER;
 }
 
@@ -180,6 +182,7 @@ export function phraseOf(fault: number): string {
   if (fault === FAULT_EXISTS) return "already exists";
   if (fault === FAULT_NOT_EMPTY) return "directory not empty";
   if (fault === FAULT_NOT_REPRESENTABLE) return "the name is not representable on this host";
+  if (fault === FAULT_NOT_GRANTED) return "not granted to this application";
   return "";
 }
 
@@ -226,7 +229,10 @@ export const STAT_FAULT = 20;
  * Deliberately narrow: only the two cases where the answer is genuinely *unknowable* are faults.
  *
  *   - `FAULT_NOT_REPRESENTABLE` — a name this runtime cannot express, so the file may well be there.
- *   - `FAULT_DENIED` — no read capability, so nothing can be said either way.
+ *   - `FAULT_DENIED` — the operating system refused, so nothing can be said either way.
+ *
+ * A world with no read capability never reaches here at all: the hosts answer `FAULT_NOT_GRANTED`
+ * before they try, because that is a fact about the grant rather than about the path.
  *
  * Everything else means "nothing usable at this path", which is an answer and must stay one. `ENOTDIR` is
  * the case that decides the shape: `test -e f/g` where `f` is a file is *false* in bash, not an error, and
