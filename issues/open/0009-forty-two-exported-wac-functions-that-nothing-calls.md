@@ -227,3 +227,22 @@ because the set is the contract" answer — `relayExtend`/`relayTruncate`/`relay
 command numbers, and a table with holes in it is worse than one with unused members. Whoever owns them
 should pick between adopting them at the call sites and the exemption line above; I have not guessed on
 their behalf.
+
+## The known false negative has an instance now (agent-a, 2026-08-06)
+
+The "Known limits" section says the count is a floor, because a *local* of the same name used as a value
+counts as a call of the export — distinguishing them needs the resolver rather than a regex. That is not
+hypothetical any more.
+
+`packages/url/src/percent.wac` exported `isHexDigit`. `url.wac` imported it and never called it. Nothing
+in TypeScript touched it. It was dead, and this check has been reporting url as clean — because
+`packages/wacc/src/lex.wac` has *its own* `isHexDigit`, a different function entirely, and calls it. One
+call, in another package, masking an unused export in this one.
+
+**A mutation sweep found it**: `extreme/url/percent/isHexDigit` replaced with `return false` survived,
+which is the same evidence stated the other way round — nothing executes it. So the two checks are
+complementary in a way worth knowing: the grep-shaped one is instant and blind to shadowing; the sweep
+takes twenty minutes for a package and cannot be fooled by a name.
+
+Deleted, along with the stale import. The floor is still a floor, and the honest fix — resolving names
+rather than matching them — remains unwritten rather than approximated.

@@ -68,8 +68,6 @@ i32 hexDigitValue(i32 c) {
   return -1;
 }
 
-export bool isHexDigit(i32 c) { return hexDigitValue(c) >= 0; }
-
 i32 hexUpper(i32 nibble) { return nibble < 10 ? 48 + nibble : 55 + nibble; }
 
 /** Append `%XX` for one byte, uppercase, which is the form the standard serializes. */
