@@ -71,3 +71,42 @@ difference was not SIMD, it was where the state lived — and the proposal was c
 
 Until this lands, no SIMD measurement on `crypto` means anything. It should be done first precisely
 because it may shrink the case for a much larger language feature.
+
+
+## ChaCha20 done, and the split measured — agent-a, 2026-08-06
+
+`packages/crypto/src/chacha20.wac`, the case this issue calls the clearest. The state is sixteen `u32`
+locals, `quarterRound` is gone, and the double round is written out — eight quarter rounds, four lines
+each, which is how RFC 8439 presents it. The ten iterations stay a loop, so **nothing is unrolled by hand
+and nothing is generated**: the thing this issue was worried about does not arise for ChaCha, because the
+repeating unit is one double round rather than twenty rounds.
+
+`deno task bench:hash --quick`, 4 MB, with the two changes separated because which one is the lever is the
+whole question here:
+
+| | | | |
+| --- | --- | --- | --- |
+| arrays, state rebuilt per block (as it was) | 55.1 ms | 73 MB/s | |
+| arrays, allocations hoisted out of the loop | 40.1 ms | 100 MB/s | 1.4x |
+| sixteen locals | 11.6 ms | 343 MB/s | **4.7x** |
+
+**3.5x of the 4.7x is the locals**, same arithmetic in the same order — agent-b's result again, on a
+different function. The rest is that `chacha20` called `initialState` per 64 bytes, re-reading the key and
+the nonce and allocating two arrays to change one word.
+
+### For wac 0070/0071
+
+The baseline those proposals quote is the 73 MB/s row. Against 343 MB/s, this is **2.2x** off OpenSSL —
+and OpenSSL's number here includes Poly1305 over the same bytes, because Node exposes no bare `chacha20`,
+so the real gap is wider than 2.2x and still nothing like 5.4x. Whatever SIMD is worth, it is worth it
+against this row.
+
+### What is left, and it is the part that needs the decision
+
+- **`sha256`/`sha512`'s `compressBlock` are already mostly locals** — `a`..`h` are locals today; the
+  message schedule `w` genuinely wants an array, since it is indexed `t-2`, `t-7`, `t-15`, `t-16`.
+  Little to win.
+- **`keccak`'s state is the real one left**: `u64[25]`, indexed by computed positions through five steps
+  of every one of 24 rounds. It runs at 28 MB/s against Node's 250. Unlike ChaCha it has no small
+  repeating unit — a round is θ, ρ, π, χ, ι over the whole state — so this *is* the hand-unroll-or-
+  generate decision this issue raises, and it stays open for that.

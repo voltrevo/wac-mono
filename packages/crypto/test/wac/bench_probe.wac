@@ -5,6 +5,7 @@
 import { sha256 } from "../../src/sha256.wac";
 import { sha512 } from "../../src/sha512.wac";
 import { keccak256, sha3_256 } from "../../src/keccak.wac";
+import { chacha20 } from "../../src/chacha20.wac";
 
 u8[] message(i32 n) {
   // Not zeroes: a compressing hash does not care, but a reader comparing these numbers against another
@@ -33,3 +34,14 @@ export u8[] benchSha256(i32 n) { return sha256(message(n)); }
 export u8[] benchSha512(i32 n) { return sha512(message(n)); }
 export u8[] benchKeccak(i32 n) { return keccak256(message(n)); }
 export u8[] benchSha3(i32 n) { return sha3_256(message(n)); }
+
+/** ChaCha20 over `n` bytes. The 32 bytes returned are the tail, so nothing can be elided. */
+export u8[] benchChacha(i32 n) {
+  u8[] key = u8[32]();
+  for (i32 i = 0; i < 32; i++) { key[i] = i; }
+  u8[] nonce = u8[12]();
+  u8[] ct = chacha20(key, 1, nonce, message(n));
+  u8[] out = u8[32]();
+  out.copyFrom(ct, ct.len() - 32, 0, 32);
+  return out;
+}

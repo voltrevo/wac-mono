@@ -7,23 +7,33 @@
 //
 // This is the 32-bit-counter, 96-bit-nonce variant from RFC 8439, not the
 // original 64/64 split.
+//
+// ## The state is sixteen locals, not an array
+//
+// It was an array, with a `quarterRound(s, a, b, c, d)` taking indices — "the array *is* the tuple",
+// since wac has no way to return four words at once. That reads beautifully and costs about half the
+// cipher: every one of those accesses is `local.get`, `i32.const`, `array.get` **and a bounds check**,
+// against one instruction for a local, and the indices are runtime parameters so nothing can be hoisted.
+// wac-mono 0035 measured the same shape in `packages/bls` at −64% with the instruction count unchanged.
+//
+// So the double round is written out — eight quarter rounds, four lines each — over `x0`..`x15`. That is
+// the one thing 0035 worried about, and it is not the unreadable case it feared: the RFC presents the
+// double round exactly this way, and the ten iterations stay a loop. Nothing here is generated.
+//
+// Measured with `deno task bench:hash --quick`, 4 MB, and the two changes separated because 0035 is
+// specifically about which one is the lever:
+//
+//     arrays, state rebuilt per block (as it was)   55.1 ms    73 MB/s
+//     arrays, allocations hoisted out of the loop   40.1 ms   100 MB/s   1.4x
+//     sixteen locals                                11.6 ms   343 MB/s   4.7x
+//
+// **3.5x of the 4.7x is the locals**, with the same arithmetic in the same order. That is the number the
+// SIMD proposals in wac 0070/0071 need: they quoted their speedup against the 73 MB/s baseline, and most
+// of what they were promising was this. Against 343 MB/s, OpenSSL with Poly1305 on top is 2.2x away.
 
 import { leWord32, storeLE32 } from "./layout.wac";
 
 u32 rotl(u32 x, u32 n) { return (x << n) | (x >> (32 - n)); }
-
-/**
- * The quarter round, in place over the state array.
- *
- * Written against indices rather than values because wac has no way to return
- * four words at once, and no out-parameters — the array *is* the tuple.
- */
-void quarterRound(u32[] s, i32 a, i32 b, i32 c, i32 d) {
-  s[a] += s[b]; s[d] ^= s[a]; s[d] = rotl(s[d], 16);
-  s[c] += s[d]; s[b] ^= s[c]; s[b] = rotl(s[b], 12);
-  s[a] += s[b]; s[d] ^= s[a]; s[d] = rotl(s[d], 8);
-  s[c] += s[d]; s[b] ^= s[c]; s[b] = rotl(s[b], 7);
-}
 
 /** The 16-word initial state for a key, counter and nonce. */
 u32[] initialState(u8[] key, u32 counter, u8[] nonce) {
@@ -36,29 +46,88 @@ u32[] initialState(u8[] key, u32 counter, u8[] nonce) {
   return s;
 }
 
-/** One 64-byte keystream block. */
-export u8[] chachaBlock(u8[] key, u32 counter, u8[] nonce) {
-  u32[] start = initialState(key, counter, nonce);
-  u32[] s = u32[16]();
-  for (i32 i = 0; i < 16; i++) { s[i] = start[i]; }
+/**
+ * One keystream block from a prepared state, written into `out` at `off`.
+ *
+ * `start` is the initial state with **its own counter word ignored** — `counter` is passed separately so a
+ * message of many blocks builds the state once. That was the other cost here: `chacha20` called
+ * `initialState` per 64 bytes, re-reading the key and the nonce and allocating two arrays, to change one
+ * word.
+ */
+void core(u32[] start, u32 counter, u8[] out, i32 off) {
+  u32 x0 = start[0];   u32 x1 = start[1];   u32 x2 = start[2];   u32 x3 = start[3];
+  u32 x4 = start[4];   u32 x5 = start[5];   u32 x6 = start[6];   u32 x7 = start[7];
+  u32 x8 = start[8];   u32 x9 = start[9];   u32 x10 = start[10]; u32 x11 = start[11];
+  u32 x12 = counter;   u32 x13 = start[13]; u32 x14 = start[14]; u32 x15 = start[15];
 
   // 20 rounds = 10 iterations of a column round followed by a diagonal round.
   for (i32 r = 0; r < 10; r++) {
-    quarterRound(s, 0, 4, 8, 12);
-    quarterRound(s, 1, 5, 9, 13);
-    quarterRound(s, 2, 6, 10, 14);
-    quarterRound(s, 3, 7, 11, 15);
-    quarterRound(s, 0, 5, 10, 15);
-    quarterRound(s, 1, 6, 11, 12);
-    quarterRound(s, 2, 7, 8, 13);
-    quarterRound(s, 3, 4, 9, 14);
+    // Columns.
+    x0 += x4;   x12 ^= x0;  x12 = rotl(x12, 16);
+    x8 += x12;  x4 ^= x8;   x4 = rotl(x4, 12);
+    x0 += x4;   x12 ^= x0;  x12 = rotl(x12, 8);
+    x8 += x12;  x4 ^= x8;   x4 = rotl(x4, 7);
+
+    x1 += x5;   x13 ^= x1;  x13 = rotl(x13, 16);
+    x9 += x13;  x5 ^= x9;   x5 = rotl(x5, 12);
+    x1 += x5;   x13 ^= x1;  x13 = rotl(x13, 8);
+    x9 += x13;  x5 ^= x9;   x5 = rotl(x5, 7);
+
+    x2 += x6;   x14 ^= x2;  x14 = rotl(x14, 16);
+    x10 += x14; x6 ^= x10;  x6 = rotl(x6, 12);
+    x2 += x6;   x14 ^= x2;  x14 = rotl(x14, 8);
+    x10 += x14; x6 ^= x10;  x6 = rotl(x6, 7);
+
+    x3 += x7;   x15 ^= x3;  x15 = rotl(x15, 16);
+    x11 += x15; x7 ^= x11;  x7 = rotl(x7, 12);
+    x3 += x7;   x15 ^= x3;  x15 = rotl(x15, 8);
+    x11 += x15; x7 ^= x11;  x7 = rotl(x7, 7);
+
+    // Diagonals.
+    x0 += x5;   x15 ^= x0;  x15 = rotl(x15, 16);
+    x10 += x15; x5 ^= x10;  x5 = rotl(x5, 12);
+    x0 += x5;   x15 ^= x0;  x15 = rotl(x15, 8);
+    x10 += x15; x5 ^= x10;  x5 = rotl(x5, 7);
+
+    x1 += x6;   x12 ^= x1;  x12 = rotl(x12, 16);
+    x11 += x12; x6 ^= x11;  x6 = rotl(x6, 12);
+    x1 += x6;   x12 ^= x1;  x12 = rotl(x12, 8);
+    x11 += x12; x6 ^= x11;  x6 = rotl(x6, 7);
+
+    x2 += x7;   x13 ^= x2;  x13 = rotl(x13, 16);
+    x8 += x13;  x7 ^= x8;   x7 = rotl(x7, 12);
+    x2 += x7;   x13 ^= x2;  x13 = rotl(x13, 8);
+    x8 += x13;  x7 ^= x8;   x7 = rotl(x7, 7);
+
+    x3 += x4;   x14 ^= x3;  x14 = rotl(x14, 16);
+    x9 += x14;  x4 ^= x9;   x4 = rotl(x4, 12);
+    x3 += x4;   x14 ^= x3;  x14 = rotl(x14, 8);
+    x9 += x14;  x4 ^= x9;   x4 = rotl(x4, 7);
   }
 
+  // The feed-forward add is what makes the core non-invertible.
+  storeLE32(x0 + start[0], out, off);
+  storeLE32(x1 + start[1], out, off + 4);
+  storeLE32(x2 + start[2], out, off + 8);
+  storeLE32(x3 + start[3], out, off + 12);
+  storeLE32(x4 + start[4], out, off + 16);
+  storeLE32(x5 + start[5], out, off + 20);
+  storeLE32(x6 + start[6], out, off + 24);
+  storeLE32(x7 + start[7], out, off + 28);
+  storeLE32(x8 + start[8], out, off + 32);
+  storeLE32(x9 + start[9], out, off + 36);
+  storeLE32(x10 + start[10], out, off + 40);
+  storeLE32(x11 + start[11], out, off + 44);
+  storeLE32(x12 + counter, out, off + 48);
+  storeLE32(x13 + start[13], out, off + 52);
+  storeLE32(x14 + start[14], out, off + 56);
+  storeLE32(x15 + start[15], out, off + 60);
+}
+
+/** One 64-byte keystream block. */
+export u8[] chachaBlock(u8[] key, u32 counter, u8[] nonce) {
   u8[] out = u8[64]();
-  for (i32 i = 0; i < 16; i++) {
-    // The feed-forward add is what makes the core non-invertible.
-    storeLE32(s[i] + start[i], out, i * 4);
-  }
+  core(initialState(key, counter, nonce), counter, out, 0);
   return out;
 }
 
@@ -69,10 +138,12 @@ export u8[] chachaBlock(u8[] key, u32 counter, u8[] nonce) {
 export u8[] chacha20(u8[] key, u32 counter, u8[] nonce, u8[] msg) {
   i32 n = msg.len();
   u8[] out = u8[n]();
+  u32[] start = initialState(key, counter, nonce);
+  u8[] ks = u8[64]();
   i32 i = 0;
   u32 block = counter;
   while (i < n) {
-    u8[] ks = chachaBlock(key, block, nonce);
+    core(start, block, ks, 0);
     i32 take = n - i < 64 ? n - i : 64;
     for (i32 j = 0; j < take; j++) { out[i + j] = msg[i + j] ^ ks[j]; }
     i += 64;
