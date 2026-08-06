@@ -20,7 +20,7 @@ import {
   hsServiceIndex, hsRelayIndex, disasterSrv, compareIndex, responsibleHsdirs,
   HSDIR_N_REPLICAS_DEFAULT, HSDIR_SPREAD_STORE_DEFAULT, HSDIR_SPREAD_FETCH_DEFAULT,
   hsdirsForDescriptor, hsdirCandidates, descriptorPath, StorePeriod, betweenTimePeriodAndSrv,
-  serviceStorePeriods, consensusTimePeriod,
+  serviceStorePeriods, consensusTimePeriod, Publication, servicePlan,
 } from "../../src/hsdir.wac";
 import { Relay, parseConsensus, attachMicrodescriptors, base64NoPad } from "../../src/directory.wac";
 
@@ -494,6 +494,104 @@ export string test_the_stretch_between_a_period_and_an_srv(fn[u8[](i32, u8[], u8
   i64 earlyNow = consensusTimePeriod(timings("04:00:00", "04:00:20"), true, 0)[0];
   t.eqI64(early[0].periodNum, earlyNow, "before the boundary a service starts at the current period");
   t.eqI64(early[1].periodNum, earlyNow + 1, "and publishes for the next one too");
+  return t.report();
+}
+
+/**
+ * The whole publication plan, from a consensus and nothing else.
+ *
+ * Every other test here is handed the shared random value and the time period as inputs. A service
+ * has neither: it has a consensus. So this composes the pieces the way a service must — the two store
+ * periods, the shared random value that goes with each, and the directories that follow — and
+ * requires the result to be the directories tor actually uploaded to, for both descriptors.
+ *
+ * The pieces were each pinned against tor already and never against each other, which is the seam
+ * this package keeps being caught by. Pick the wrong SRV for a period and every ingredient is still
+ * correct; the plan is not.
+ */
+export string test_the_plan_reaches_the_directories_tor_used(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] consensus = ref(V_CONSENSUS, u8[0](), u8[0]());
+  Relay[] relays = parseConsensus(consensus);
+  attachMicrodescriptors(relays, ref(V_MICRODESCS, u8[0](), u8[0]()));
+
+  // The blinded keys are the service's, one per store period, and they are index-matched to the
+  // vector's two cases — case 0 is the earlier period, case 1 the later.
+  u8[][] blinded = u8[][2]();
+  for (i32 i = 0; i < 2; i++) { blinded[i] = slice(ref(V_CASE_META, caseArg(i), u8[0]()), 0, 32); }
+
+  Publication[] plan = servicePlan(consensus, relays, blinded, true, 0);
+  t.eqI32(plan.len(), 2, "a service plans two uploads");
+
+  for (i32 i = 0; i < 2; i++) {
+    u8[] meta = ref(V_CASE_META, caseArg(i), u8[0]());
+    t.eqI64(plan[i].periodNum, be64(meta, 64), "the period tor used");
+    // The shared random value, taken from the consensus rather than handed in. Asserting it directly
+    // matters because nothing downstream reveals it: two plans that used different values produce
+    // different directories, and a directory list does not say which value produced it.
+    t.eqBytes(plan[i].srv, slice(meta, 32, 64), "and the shared random value tor used with it");
+
+    u8[] dirs = ref(V_CASE_HSDIRS, caseArg(i), u8[0]());
+    i32 want = dirs[0];
+    t.eqI32(plan[i].hsdirs.len(), want, "as many directories as tor uploaded to");
+    i32 missing = 0;
+    for (i32 k = 0; k < want; k++) {
+      u8[] theirs = slice(dirs, 1 + k * 64, 1 + k * 64 + 32);
+      bool found = false;
+      for (i32 j = 0; j < plan[i].hsdirs.len(); j++) {
+        if (same(relays[plan[i].hsdirs[j]].ed25519Identity, theirs)) { found = true; }
+      }
+      if (!found) { missing = missing + 1; }
+    }
+    t.eqI32(missing, 0, "and every one of them is one tor used");
+  }
+
+  // The two uploads go to different places. If they did not, publishing twice would be publishing
+  // once, and the rotation the second descriptor exists for would protect nothing.
+  i32 shared = 0;
+  for (i32 a = 0; a < plan[0].hsdirs.len(); a++) {
+    for (i32 b = 0; b < plan[1].hsdirs.len(); b++) {
+      if (plan[0].hsdirs[a] == plan[1].hsdirs[b]) { shared = shared + 1; }
+    }
+  }
+  t.isTrue(shared < plan[0].hsdirs.len(), "the two descriptors do not go to the same set");
+  return t.report();
+}
+
+/**
+ * With no shared random value in the consensus, the documented fallback — not an empty ring.
+ *
+ * rend-spec-v3 makes the disaster SRV a fallback rather than an error: a network whose authorities
+ * have not agreed still has to be usable, and every party computes the same substitute from the
+ * period alone, so they still agree about the ring. A plan that refused here would take a service
+ * offline for a condition the protocol expects.
+ */
+export string test_a_consensus_with_no_srv_falls_back(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] consensus = ref(V_CONSENSUS, u8[0](), u8[0]());
+  Relay[] relays = parseConsensus(consensus);
+  attachMicrodescriptors(relays, ref(V_MICRODESCS, u8[0](), u8[0]()));
+  u8[][] blinded = u8[][2]();
+  for (i32 i = 0; i < 2; i++) { blinded[i] = slice(ref(V_CASE_META, caseArg(i), u8[0]()), 0, 32); }
+
+  // The same timings, with both shared-rand lines gone.
+  u8[] bare = timings("04:07:00", "04:07:20");
+  Publication[] plan = servicePlan(bare, relays, blinded, true, 0);
+  t.eqI32(plan.len(), 2, "a plan is still made");
+  for (i32 i = 0; i < 2; i++) {
+    t.eqBytes(plan[i].srv, disasterSrv(plan[i].periodLength, plan[i].periodNum),
+              "the disaster value for that period is used");
+    t.isTrue(plan[i].hsdirs.len() > 0, "and it still names directories");
+  }
+  t.isTrue(!same(plan[0].srv, plan[1].srv),
+           "the fallback differs per period, so the two uploads still diverge");
+
+  // And it is a fallback, not the default: with a real consensus the real value wins.
+  Publication[] real = servicePlan(consensus, relays, blinded, true, 0);
+  t.isTrue(!same(real[0].srv, plan[0].srv), "a consensus that carries a value is not overridden");
+
+  t.eqI32(servicePlan("network-status-version 3\n".toBytes(), relays, blinded, true, 0).len(), 0,
+          "but a consensus with no timings yields no plan at all");
   return t.report();
 }
 

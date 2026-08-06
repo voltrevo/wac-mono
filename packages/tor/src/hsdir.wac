@@ -429,3 +429,57 @@ export StorePeriod[] serviceStorePeriods(u8[] consensus, bool testingNetwork, i6
   out[1] = StorePeriod(first + 1, length, true);
   return out;
 }
+
+/**
+ * One of the two uploads a service makes: where it goes, and what it was computed from.
+ *
+ * `srv` is here rather than left implicit because which shared random value was used is not
+ * recoverable from the result. Two plans that picked different values produce different directories
+ * and nothing about the directory list says which value produced it — so a service that fell back to
+ * the disaster SRV when the consensus had one, or the reverse, would look exactly like a service that
+ * did not.
+ */
+export struct Publication {
+  i64 periodNum;
+  i64 periodLength;
+  bool useCurrentSrv;
+  u8[] srv;            // the value actually used — the consensus's, or the disaster fallback
+  i32[] hsdirs;        // indices into `relays`, in the order tor would upload
+}
+
+/**
+ * The two uploads a service should make, from a consensus and its blinded keys.
+ *
+ * `blindedKeys` is index-matched to `serviceStorePeriods`: the caller derives each from its identity
+ * key and the period, which is `blindingFactor` and is pinned separately. It is a parameter rather
+ * than derived here because deriving it needs the identity key, and a function that takes an identity
+ * key to answer a question about directories is a function that will one day be handed a secret it
+ * did not need.
+ *
+ * Empty if the consensus carries no timings — the caller cannot be given a plan built on a period
+ * nobody agreed on.
+ */
+export Publication[] servicePlan(
+  u8[] consensus, Relay[] relays, u8[][] blindedKeys, bool testingNetwork, i64 hsdirInterval
+) {
+  StorePeriod[] periods = serviceStorePeriods(consensus, testingNetwork, hsdirInterval);
+  if (periods.len() != 2 || blindedKeys.len() != 2) {
+    return Publication[0](fill: Publication(0, 0, false, u8[0](), i32[0]()));
+  }
+
+  Publication[] out = Publication[2](fill: Publication(0, 0, false, u8[0](), i32[0]()));
+  for (i32 i = 0; i < 2; i++) {
+    StorePeriod sp = periods[i];
+    // The consensus's value if it carries one, and the disaster SRV if it does not. rend-spec-v3
+    // makes this a documented fallback rather than an error: a network whose authorities have not
+    // agreed on a value still has to be usable, and every party computes the same substitute from the
+    // period alone, so they still agree on the ring.
+    u8[] srv = consensusSharedRandom(consensus, sp.useCurrentSrv);
+    if (srv.len() != 32) { srv = disasterSrv(sp.periodLength, sp.periodNum); }
+    out[i] = Publication(sp.periodNum, sp.periodLength, sp.useCurrentSrv, srv,
+                         hsdirsForDescriptor(relays, blindedKeys[i], srv, sp.periodNum,
+                                             sp.periodLength, HSDIR_N_REPLICAS_DEFAULT,
+                                             HSDIR_SPREAD_STORE_DEFAULT));
+  }
+  return out;
+}
