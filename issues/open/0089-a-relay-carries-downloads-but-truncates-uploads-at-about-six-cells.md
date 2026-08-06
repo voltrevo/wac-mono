@@ -88,6 +88,103 @@ authenticate — at an exit that means the running backward/forward digest has g
 the most likely place for that is the exchange of two `RELAY_END`s around a stream closing. Second:
 whatever `dropCirc` is reached by. Both are `relayd.wac`'s, not the platform's.
 
+## The transfer stops with no error, and congestion control was not the reason
+
+Per-circuit cell counters and per-forward logging give the clearest picture yet. On a run where the
+exit got furthest:
+
+    forwarding 498 bytes to handle 6 (stream 24131,  996 total)
+    …
+    forwarding 498 bytes to handle 6 (stream 24131, 3486 total)
+    (nothing further, until the run is torn down)
+
+and the target's own log: `read 3329 of 65536`. Eight cells are forwarded, the target receives them,
+and then **the client simply stops sending**. No error at either end, no `END`, no `DESTROY` — the
+circuit and the stream stay open and idle until the harness kills them.
+
+Stopping after a few kilobytes and never resuming is the signature of a window that is never
+replenished, and `relayd` sends no `SENDME` of any kind. So the obvious candidate was **proposal 324
+congestion control**, whose window starts small and grows only on returned SENDMEs — where version 1's
+window is 500 cells, which a 64 KB upload (132 cells) would fit inside entirely.
+
+**Tested and disproved.** The consensus advertised `FlowCtrl=1-2`; changing it to `FlowCtrl=1` so the
+classic window is negotiated changed nothing — the 64 KB upload fails identically.
+
+Worth keeping anyway, and fixed: the consensus and the vote said `FlowCtrl=1-2` while the *descriptor*
+said `FlowCtrl=1`, so two documents describing one relay disagreed, and tor negotiates from the
+consensus. We implement neither version. Claiming a capability we do not have is what the `V2Dir` and
+`HSDir` episodes were about; this is the same mistake somewhere the symptom is a stall rather than a
+refusal.
+
+That makes five hypotheses eliminated by experiment. What is left is the bare observation above: the
+sender stops, silently, after a few kilobytes, and nothing in either implementation says why. The next
+instrument is tor's own `[info]` log filtered to that stream at the moment it goes quiet — which is
+the one place not yet read line by line.
+
+## The line is one cell, and `Expect: 100-continue` is not it
+
+Per-forward logging with socket handles gives the whole ladder in one run:
+
+    stream 22092 handle 4: forwarding  89 bytes -> closed,  89 in /  69 out   GET #1     works
+    stream 22093 handle 5: forwarding  89 bytes -> closed,  89 in /  69 out   GET #2     works
+    stream 22094 handle 6: forwarding 255 bytes -> closed, 255 in /  71 out   POST 100   works
+    stream 22095 handle 7: opened — no forwarding line at all                 POST 64 KB fails
+
+**Every request that works has its entire body in one relay cell. The one that does not, fails — and
+receives nothing at all**, not a first cell and then a stall. Three forwards in the whole run.
+
+`Expect: 100-continue` was the obvious suspect, because curl adds it for bodies over 1 KB and the
+100-byte POST that works does not carry it, and the sink never sends the `100 Continue`. **Ruled
+out:** the same 64 KB body fails identically with `-H "Expect:"` suppressing the header and without
+it. Size — or rather, needing more than one cell — is the variable.
+
+The other observation, from runs where the stream *was* torn down: six `RELAY_DATA` cells arrive for a
+stream that has already gone. So cells are not lost upstream; they arrive **late**, after this relay
+has decided the stream is over. Between runs it varies whether the teardown or the data comes first,
+which is the signature of a race rather than of a missing feature.
+
+## Three variables separated, and the answer is none of the ones I had
+
+One run with four requests through a pinned exit settles what every earlier run conflated:
+
+| request | result |
+| --- | --- |
+| GET #1 — first stream on the circuit | works |
+| GET #2 — **second** stream on the same circuit | **works** |
+| POST of 100 bytes — an upload, under one cell | **works** |
+| POST of 64 KB | fails |
+
+So it is **not** "the second stream on a reused circuit", **not** "uploads", and **not** optimistic
+data — the 100-byte POST is optimistic too and goes through. What is left is size.
+
+And with the counters reset per stream and every log line carrying its connection number, the failure
+is exact and repeats byte for byte across runs:
+
+    [1] stream 14949 is carrying data from the client
+    [1] stream 14949 closed by the far end after 498 bytes in, 0 bytes out
+    [1] relay command 2 on stream 14949 (this circuit has no stream)   x6
+
+**Exactly 498 bytes — one relay cell's payload — reach the target, then the read on the target socket
+returns `End`.** The remaining six DATA cells arrive for a stream that no longer exists. The sink is
+demonstrably still alive at that point: its own log says `POST header seen, want 65536` and it never
+prints the line it would print if its connection had closed.
+
+So the question is now narrow and mechanical: **why does a read on the target socket end after exactly
+one cell has been written to it, when the peer is alive and blocked reading?** That is one send of 498
+bytes followed by a spurious `End`, and `writeread.wac` says a send does not do that — but
+`writeread`'s peer never reads, and this one does.
+
+## What was tried and did not change it
+
+Reads are no longer re-armed before the code decides whether the socket is about to be closed. That
+was a real defect — a ticket left outstanding on a dead handle holds one of the platform ring's
+sixteen slots forever, and issue 0091 is about that budget — but fixing it changed nothing here. Kept
+because it is right, not because it helped.
+
+**And one run in the middle failed completely**, with every request timing out. Re-running the same
+binary reproduced the normal results, so that run was flaky and not the change. Worth writing down
+because the temptation to attribute it was strong and it would have sent the next hour the wrong way.
+
 ## Pinned, reproducible, and one lead left
 
 `ExitNodes <fp>` plus `StrictNodes 1` in the probe's torrc removes tor's random exit choice, and with

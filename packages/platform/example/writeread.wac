@@ -15,6 +15,12 @@
 //   3. `send` on the same handle, repeatedly
 //   4. ask `waitAny` whether that `recv` has settled, and if so with what
 //
+// A second argument, `drain`, makes the peer **read** what is sent to it. That is the one way the
+// first version of this differed from a relay's stream socket: there the target is a real server that
+// consumes, here it was a socket nobody ever read from, so the bytes sat in a buffer. If a read only
+// ends once the peer has consumed, the difference matters and the first version could not have seen
+// it.
+//
 // A `recv` that settles as `End` here, with the peer still connected and holding the connection open,
 // would mean a handle may not have a read and a write in flight together — which nothing in
 // `platform.wac` says, and which would make the relay's behaviour a platform matter rather than a Tor
@@ -70,6 +76,12 @@ export i32 main(Core core, Cli cli) {
   u8[] payload = u8[498]();
   for (i32 i = 0; i < 498; i++) { payload[i] = (i * 7 + 13) & 0xFF; }
 
+  // Whether the peer consumes. Both ends are in this process, so the read can be driven by hand
+  // rather than hoped for.
+  bool drain = cli.argCount().wait() > 1 &&
+               string.fromBytes(cli.arg(1).wait()) == "drain";
+  if (drain) { core.log("writeread: the peer will read what it is sent"); }
+
   i32 sent = 0;
   for (i32 i = 0; i < 20; i++) {
     if (!cli.send(client.handle, payload).wait()) {
@@ -77,6 +89,15 @@ export i32 main(Core core, Cli cli) {
       break;
     }
     sent = sent + 1;
+    if (drain) {
+      // Consume it, exactly as a server on the far side of a relay's stream would. The read is
+      // waited on rather than polled: the bytes are already there.
+      match (cli.recv(server.handle).wait()) {
+        case Data(got): { }
+        case End: { core.warn("writeread: the peer's own read ended"); }
+        case Failed(why): { core.warn("writeread: the peer's read failed: " + why); }
+      }
+    }
     // After each send, ask whether the outstanding read has settled. Polling with a zero deadline is
     // what `waitAny` is for — this is a question about *now*, not a wait.
     i32 which = core.waitAny(one, 0);
