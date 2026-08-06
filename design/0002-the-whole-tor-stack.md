@@ -926,3 +926,45 @@ belongs, dropping the degenerate-key refusal, and omitting the subcredential —
 One thing the test file's own history caught for me: it already had a `flipScalar` beside `flip`,
 because flipping byte 0 of a curve25519 secret breaks the clamping and turns a test about key
 derivation into a test about clamping. Mine had used `flip`.
+
+### INTRODUCE2, and the symmetric oracle caught in the act
+
+A service's `parseIntroduce2`, the inverse of the client's `introduce1Cell` and `introduce1Plaintext`.
+An INTRODUCE2 is byte-for-byte an INTRODUCE1 — the introduction point relays the body unchanged and
+only the relay command differs — so this repo now holds both ends of one format, which is exactly the
+arrangement that has caught it out before.
+
+It caught it again, and this time in the act. **tor pads an INTRODUCE1 to a fixed size; our client's
+builder does not.** The first version of the parser returned "the rest of the plaintext" as the link
+specifier list, which is right for every cell our own client builds and returns *two hundred bytes of
+padding* for one of tor's. `linkSpecifiersValid` requires the list to be exactly consumed, so a
+service would have refused a perfectly good cell and failed to build the rendezvous circuit — and no
+round trip through our own code could have shown it. The parser now walks `NSPEC` entries and stops.
+
+The oracle is `tools/introduce-probe.c`, which calls tor's own `hs_cell_build_introduce1`. Our service
+recovers, from a cell tor wrote, every value tor was given:
+
+    authKey      5befac73…   clientPublic 9f53d870…
+    rendCookie   be5aa96b…   rendOnionKey d7aae69c…
+    linkSpecifiers 0100067f0000012329
+
+**The reverse direction is not available and the reason is worth recording.**
+`hs_cell_parse_introduce2` asserts on its `circ` argument — it wants a real `origin_circuit_t` for
+replay caching, so passing NULL aborts rather than returning an error. Feeding one of *our* cells to
+tor's parser therefore needs a running service, which is a chutney network rather than a probe. The
+probe had a `parse` mode for about ten minutes; it is gone, because a mode that aborts is worse than
+an absent one, and the comment claiming "the parse reads neither argument" was simply wrong.
+
+Also here: `rendezvous1Cell`, and a constant-time MAC comparison — a service answers strangers, and a
+check that returns at the first differing byte turns forging a MAC from 2^256 work into 32 × 256.
+
+Nine faults planted. Eight caught immediately: returning the padding, skipping the MAC, using the
+span the specification describes rather than the one tor uses, including the MAC in its own input,
+decrypting `CLIENT_PK` along with the data, a non-zero IV, swapping `ENC_KEY` and `MAC_KEY`, and
+putting the handshake before the cookie in RENDEZVOUS1.
+
+**One survived: accepting a non-zero `LEGACY_KEY_ID`.** The test flipped that byte and expected a
+refusal — but `LEGACY_KEY_ID` is inside the MAC span, so the MAC check refuses it whether or not the
+structural check exists. The check only bites on a cell whose MAC is *valid over the modified bytes*,
+which is what a v2 introduction point would actually relay. A case that re-MACs the cell was added,
+and the same fault is caught now.
