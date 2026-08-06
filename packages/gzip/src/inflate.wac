@@ -5,7 +5,7 @@
 // input must trap rather than read out of bounds or loop forever.
 
 import { Buf } from "../../bytes/src/buf.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 import { Tables } from "./tables.wac";
 import { crc32, crc32Start, crc32Finish, crc32Update, crcTable8 } from "./crc32.wac";
 

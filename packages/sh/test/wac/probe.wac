@@ -25,7 +25,7 @@
 
 import { Captured, Change, Child, Cli, Core, FAULT_DENIED, FAULT_NONE, FAULT_NOT_FOUND, FileResult,
   Pending, Socket, Stat } from "../../../platform/src/platform.wac";
-import { Read } from "../../../bytes/src/read.wac";
+import { Read } from core;
 import { Shell, runScript } from "../../src/exec.wac";
 
 /** A ticket is always ready here, and dropping one does nothing. */

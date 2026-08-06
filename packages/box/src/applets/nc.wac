@@ -16,7 +16,7 @@
 import { Cli, Core, Pending, Socket } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
 import { atoi, itoa } from "../../../fmt/src/itoa.wac";
-import { Read } from "../../../bytes/src/read.wac";
+import { Read } from core;
 
 /** Standard input, as a handle `recv` accepts. See `deno.ts`. */
 i32 STDIN() { return 0; }

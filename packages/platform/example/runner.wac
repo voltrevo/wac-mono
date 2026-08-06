@@ -13,7 +13,7 @@
 //   runner probe.worker.js "" read          ->  the child may read, if this program may
 
 import { Child, Cli, Core, FileResult, GRANT_ENV, GRANT_NET, GRANT_NONE, GRANT_READ, GRANT_WRITE, Pending } from "../src/platform.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 2) {

@@ -54,7 +54,7 @@
 import {
   Child, Cli, Core, FileResult, GRANT_NET, GRANT_READ, GRANT_WRITE, Pending,
 } from "../../platform/src/platform.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 import { Buf } from "../../bytes/src/buf.wac";
 import { itoa } from "../../fmt/src/itoa.wac";
 

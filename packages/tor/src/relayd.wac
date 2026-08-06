@@ -44,7 +44,7 @@
 // being told, which is what a `Bridge` line is.
 
 import { Core, Cli, Socket, FileResult, Change, Pending } from "../../platform/src/platform.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 import { Buf } from "../../bytes/src/buf.wac";
 import { Parsed, parseRequest } from "../../http/src/request.wac";
 import { DirDocuments, dirResponse, dirSourceFingerprint } from "./dirserve.wac";

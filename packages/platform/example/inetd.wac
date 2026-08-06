@@ -24,7 +24,7 @@
 
 import { Child, Cli, Core, FileResult, GRANT_NONE, Pending, Socket } from "../src/platform.wac";
 import { argvOf } from "../src/stream.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 2) {

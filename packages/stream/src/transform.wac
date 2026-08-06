@@ -13,7 +13,7 @@
 import { Scalar, decode, encode, encodedLength } from "../../unicode/src/utf8.wac";
 import { toUpper } from "../../unicode/src/case.wac";
 import { Buf } from "../../bytes/src/buf.wac";
-import { Read } from "../../bytes/src/read.wac";
+import { Read } from core;
 
 /**
  * Bytes in, same bytes out. The control: any failure here is the bridge, not a transform.
