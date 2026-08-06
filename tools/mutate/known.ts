@@ -325,6 +325,16 @@ export const KNOWN_SURVIVORS: KnownSurvivor[] = [
       "people in log lines, and `//` in one is a question somebody has to answer twice. wac-mono 0005.",
   },
   {
+    name: "guard/rlp/rlp:120:18",
+    why:
+      "`header`'s negative check, the private one. Its exported neighbour `fromI64` has the same guard and " +
+      "is now covered by `test/traps.test.ts`, because a caller can reach it with a negative; `header` " +
+      "cannot be reached at all — it is private, and its three call sites pass `b.len()`, a sum of `.len()`s " +
+      "and an encoded payload's length. Kept for the same reason as abi's `wordOf`: without it `while (x > 0)` " +
+      "does not run, so the header would be `short + len` with a negative added to it — a byte that means " +
+      "some other RLP type entirely. wac-mono 0005.",
+  },
+  {
     name: "guard/abi/abi:526:16",
     why:
       "`wordOf`'s negative check. Every caller passes a length or a running offset — `b.len()`, " +

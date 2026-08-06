@@ -94,6 +94,8 @@ const minimal = (n: number) => {
   return new Uint8Array(out);
 };
 
+const emptyRoots = probe.emptyRoots as () => Uint8Array;
+
 const EMPTY_STORAGE_ROOT = keccak(rlpEncode(new Uint8Array(0)));
 const EMPTY_CODE_HASH = keccak(new Uint8Array(0));
 
@@ -121,6 +123,22 @@ const accounts: [Uint8Array, Uint8Array][] = [
   [keccak(address(3)), accountRlp(1, 0, EMPTY_STORAGE_ROOT, EMPTY_CODE_HASH)],
 ];
 const state = trie(accounts, keccak);
+
+Deno.test("the two empty constants are what they claim to be", () => {
+  // `emptyStorageRoot()` and `emptyCodeHash()` are literals in wac's sense — functions returning a fixed
+  // hash — and nothing called them, so mutation testing replaced each body with a constant and every test
+  // still passed. The file *derives* both values here, for the accounts it builds, and then never compared
+  // its derivation against the package's answer.
+  //
+  // What this anchors is the composition: the storage root of an account with no storage is the root of an
+  // empty trie, `keccak256(rlp(""))`, and its code hash is `keccak256("")` — not `keccak256(rlp(""))` again,
+  // which is the confusion the two being adjacent invites. keccak256 itself is anchored against `node:crypto`
+  // in `packages/crypto`, so it is not being trusted here on its own say-so.
+  const got = emptyRoots();
+  assertEquals(hex(got.subarray(0, 32)), hex(EMPTY_STORAGE_ROOT), "emptyStorageRoot");
+  assertEquals(hex(got.subarray(32, 64)), hex(EMPTY_CODE_HASH), "emptyCodeHash");
+  assertEquals(hex(EMPTY_STORAGE_ROOT) === hex(EMPTY_CODE_HASH), false, "they are not the same hash");
+});
 
 Deno.test("an account is read out of the state trie, fields and all", () => {
   const got = accountAt(state.root, address(2), state.proof(keccak(address(2))));
