@@ -46,6 +46,10 @@ carry live processes or connections.
 the same image in two substantially different hosts and demonstrate the same users, files, installed
 programs, shell behaviour and system services in both, with no implicit access to either host.
 
+Read "substantially different" as **one JavaScript host and one that is not** — D9. Two JavaScript
+hosts satisfy the words and prove nothing, since they share the transport, the worker model and the
+event loop.
+
 ### What it is not
 
 Not a Linux emulator, and the boundary is worth stating in full because "self-contained system" invites
@@ -123,6 +127,33 @@ The reason to write it down now, before there is a core to violate it: `packages
 are the userland and they are POSIX-shaped, so the natural drift is for the core to grow whatever they
 happen to need. These abstractions are deliberately unstable while Wacland and wac are young.
 
+**D9 — Wasmtime directly is the portability proof; bootable is packaging on top** (operator,
+2026-08-06). The three hosts today are a browser, Deno and Node, and all three are JavaScript. Bun
+would be a fourth JavaScript host and prove nothing new. **Wasmtime is the first host that is not**, so
+it is the only one that tests D8's claim at all.
+
+Running under `wasmtime` as an ordinary program comes *before* a bootable image, because bootable is
+Wasmtime **and** no operating system **and** a kernel **and** `init` **and** a block device, and only
+the first of those says anything about whether Wacland is portable. One variable at a time.
+
+What that separates, and the distinction is the useful part:
+
+- **the transport is JavaScript's** — the `SharedArrayBuffer`, `Atomics.wait`, the sequence counters,
+  the responder. It exists to park a worker while an asynchronous host runs, and under a synchronous
+  host it should not exist at all.
+- **the interface is not** — a request returns a *ticket*, and `waitAny` takes a set of them and a
+  deadline. That is the right shape whatever the host: asking for something external must not imply
+  serialising on it, which is why the bridge went from one mailbox to a ring of slots in the first
+  place. Two files at once, a relay between two sockets, several children.
+
+So the second binding implements `Pending<T>` **properly**. A host that resolved every ticket
+immediately would satisfy the types and quietly make every program that overlaps requests sequential —
+D6's shape exactly, and worse than not having the host, because it would pass.
+
+Some evidence the interface is not JavaScript's: `waitAny(ids, timeoutMs)` maps almost exactly onto
+WASI's `poll_oneoff` — a list of subscriptions, the timeout as a clock subscription in the same list,
+returning which fired. It was not designed for WASI and lands on WASI's own concurrency primitive.
+
 ## Order of work
 
 Each step is an issue when it becomes actionable, and each references this document.
@@ -136,6 +167,13 @@ Each step is an issue when it becomes actionable, and each references this docum
    `dump` that prints an image's tree so a person can inspect one, and a round-trip property test, since
    there is no GNU tool to be the oracle. Done when a session's writes survive a restart and an image
    written by one build loads in the next.
+2a. **A second host, with no JavaScript in it.** Wacland under `wasmtime`, per D9. Done when, with no
+   JavaScript in the artifact, a program issues **two** capability requests that complete out of order,
+   `waitAny`s over both, and observes them settle independently — and a `waitAny` with neither ready
+   returns on its timeout. Deliberately *not* "runs a program against the VFS": that would pass without
+   touching the thing in question. No processes, no shell, no services; those come later and on the
+   host that already has them.
+
 3. **A process table.** Pids, parents, states, exit statuses; `ps`, `kill`, `jobs`. The processes are
    already there — spawned workers, or `pushChild` frames in a browser. Done when `ps` in the ssh demo
    shows the pipeline you are running and `kill` ends one.
@@ -159,6 +197,7 @@ Each step is an issue when it becomes actionable, and each references this docum
 |---|---|
 | 1. VFS with two backings | **done.** `packages/fs`, threaded through `packages/sh` as a value the shell holds; `sealed.wac` is a session on `Fs.inMemory()` built with no filesystem grants at all. 57 scripts answer identically on both backings and identically to bash — 0067 |
 | 2. image format | not started |
+| 2a. a second host, no JavaScript | not started — [0087](../issues/open/0087-wacland-under-wasmtime-a-second-host-with-no-javascript.md) |
 | 3. process table | not started |
 | 4. users and login | not started |
 | 5. line discipline | not started |
@@ -174,12 +213,13 @@ Each step is an issue when it becomes actionable, and each references this docum
   differential. What plays that role — a reference implementation of the same semantics, property tests
   over the capability algebra, something else — should be decided with the core rather than after it.
   This is the largest open risk in the direction.
-- **The fourth host has no JavaScript, and the process model is JavaScript.** `spawnChild` makes blob
-  URLs and `Worker`s; the bridge is a `SharedArrayBuffer` with `Atomics.wait`; `packages/platform/host/`
-  is `browser.ts`, `node.ts`, `deno.ts`. None of that exists under Wasmtime. The other three hosts are
-  all JavaScript, so portability across them proves less than it appears. Proving a trivial image under
-  Wasmtime — the VFS and one program, no processes — is cheap at step 2 and expensive to discover at
-  step 7.
+- ~~The fourth host has no JavaScript.~~ Answered by D9 and scheduled as step 2a. What is still open is
+  narrower and is what the spike has to settle: **whether plain WASI can express the interface, or
+  whether it needs a custom embedding.** `poll_oneoff` subscribes to file-descriptor readiness and
+  clocks, so a ticket for a read or a timeout has a subscription and a ticket for `render`,
+  `nextEvent` or a child's exit does not. Either the host maps those onto descriptors, or `wasmtime
+  run` is not enough and the host is an embedding with its own readiness table — which is a new
+  language in this repo and therefore a decision rather than a detail.
 - **Supervised services are named in D8 and in none of the eight steps.** Step 7 is `init`, which owns
   the image, starts daemons and reaps; supervision — restart policy, dependency order, health — is a
   different shape. Either it belongs in step 7's definition of done or it is a ninth step.
