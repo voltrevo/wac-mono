@@ -88,6 +88,28 @@ authenticate — at an exit that means the running backward/forward digest has g
 the most likely place for that is the exchange of two `RELAY_END`s around a stream closing. Second:
 whatever `dropCirc` is reached by. Both are `relayd.wac`'s, not the platform's.
 
+## The line is one cell, and `Expect: 100-continue` is not it
+
+Per-forward logging with socket handles gives the whole ladder in one run:
+
+    stream 22092 handle 4: forwarding  89 bytes -> closed,  89 in /  69 out   GET #1     works
+    stream 22093 handle 5: forwarding  89 bytes -> closed,  89 in /  69 out   GET #2     works
+    stream 22094 handle 6: forwarding 255 bytes -> closed, 255 in /  71 out   POST 100   works
+    stream 22095 handle 7: opened — no forwarding line at all                 POST 64 KB fails
+
+**Every request that works has its entire body in one relay cell. The one that does not, fails — and
+receives nothing at all**, not a first cell and then a stall. Three forwards in the whole run.
+
+`Expect: 100-continue` was the obvious suspect, because curl adds it for bodies over 1 KB and the
+100-byte POST that works does not carry it, and the sink never sends the `100 Continue`. **Ruled
+out:** the same 64 KB body fails identically with `-H "Expect:"` suppressing the header and without
+it. Size — or rather, needing more than one cell — is the variable.
+
+The other observation, from runs where the stream *was* torn down: six `RELAY_DATA` cells arrive for a
+stream that has already gone. So cells are not lost upstream; they arrive **late**, after this relay
+has decided the stream is over. Between runs it varies whether the teardown or the data comes first,
+which is the signature of a race rather than of a missing feature.
+
 ## Three variables separated, and the answer is none of the ones I had
 
 One run with four requests through a pinned exit settles what every earlier run conflated:

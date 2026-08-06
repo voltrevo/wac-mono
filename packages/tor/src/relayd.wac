@@ -698,7 +698,8 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
                        sendToClient(k.hop, k.circId, relayEnd(), k.streamId, endReason()));
         cli.closeSocket(k.streamSock);
         k.hasStream = false;
-        core.log("relayd: [" + itoa(c.id) + "]  stream " + itoa(k.streamId) + " closed by the far end after " +
+        core.log("relayd: [" + itoa(c.id) + "]  stream " + itoa(k.streamId) + " on handle " +
+                 itoa(k.streamSock) + " closed by the far end after " +
                  itoa(k.streamIn) + " bytes in, " + itoa(k.streamOut) + " bytes out");
         // The stream is gone; the circuit is not. A client reuses a circuit for the next stream, so
         // tearing down the connection here would cost it a fresh three-hop build per request.
@@ -963,7 +964,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
           c.tls = sendCell(cli, c.sockObj, c.tls,
                          sendToClient(k.hop, k.circId, relayConnected(), k.streamId, connectedBody()));
           core.log("relayd: [" + itoa(c.id) + "]  stream " + itoa(k.streamId) + " open to " + host + ":" +
-                   itoa(want.port));
+                   itoa(want.port) + " on handle " + itoa(k.streamSock));
           continue;
         }
 
@@ -971,10 +972,12 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
           // The first cell each way is logged and the rest are not. Without this a stream that
           // stalls looks exactly like a stream that was never written to, which is the difference
           // that mattered when uploads were being chased (issue 0089).
-          if (k.streamIn == 0) {
-            core.log("relayd: [" + itoa(c.id) + "]  stream " + itoa(k.streamId) + " is carrying data from the client");
-          }
           k.streamIn = k.streamIn + inbound.data.len();
+          // Every forward, with its size and handle. One line per cell is noisy and this is the one
+          // question left in 0089: exactly one cell reaches the target and then the read on it ends.
+          core.log("relayd: [" + itoa(c.id) + "]  forwarding " + itoa(inbound.data.len()) +
+                   " bytes to handle " + itoa(k.streamSock) + " (stream " + itoa(k.streamId) +
+                   ", " + itoa(k.streamIn) + " total)");
           if (!cli.send(k.streamSock, inbound.data).wait()) {
             core.warn("relayd: [" + itoa(c.id) + "]  the stream would not take the data");
             c.tls = sendCell(cli, c.sockObj, c.tls,

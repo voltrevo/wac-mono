@@ -1070,3 +1070,23 @@ And the instrument for next time is somebody else's: agent-a's `host/schedule.ts
 answer one worker at a time in a chosen order (`WAC_SCHED=fifo`, or `seeded:N`). `network.wac` already
 runs the relays as workers of one host, so a launcher-run network can be replayed exactly and a
 working run diffed against a failing one.
+
+### 0089 narrowed to one sentence, and four suspects eliminated
+
+Worth recording as method rather than as result, because the result is still "not fixed".
+
+Eliminated, each by an experiment rather than by reasoning: **the platform** (`writeread.wac`, twice —
+once with a peer that never reads and again with one that does); **uploads as such** (a 100-byte POST
+works); **the second stream on a reused circuit** (a second GET works); and **`Expect: 100-continue`**
+(the same body fails with the header suppressed).
+
+What is left: *every request whose entire body fits in one relay cell works, and the one that needs
+several receives nothing at all.* In runs where the stream is torn down first, six `RELAY_DATA` cells
+then arrive for a stream that has already gone — so the cells are not lost, they are late, and whether
+the teardown or the data comes first varies between runs. That is a race.
+
+Three instrumentation defects of mine had to be fixed before any of this was visible, and they are the
+transferable part: per-stream byte counters that were never reset (so every count after the first was
+cumulative), log lines with no connection number (so three connections interleaved indistinguishably),
+and no record of a forward at all (so a stalled stream looked exactly like one nothing was written to).
+Each was found by the log failing to answer a question I already knew how to ask.
