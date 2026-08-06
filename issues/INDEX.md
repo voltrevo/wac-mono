@@ -5,6 +5,10 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0086](open/0086-merkle-patricia-proofs-so-a-contract-read-is-verified.md) | Merkle-Patricia proofs, so reading a contract does not mean trusting the answer | missing feature | not implemented |
+| [0085](open/0085-abi-encoding-and-decoding.md) | ABI encoding and decoding, so a contract call can be made and its answer read | missing feature | not implemented |
+| [0084](open/0084-rlp-encoding-and-decoding.md) | RLP, the encoding everything below the consensus layer uses | missing feature | not implemented |
+| [0083](open/0083-keccak256-for-ethereum-not-just-sha3.md) | keccak256, which is not SHA3-256 | missing feature | not implemented |
 | [0082](open/0082-five-tests-fail-rather-than-slow-down-when-the-machine-is-busy.md) | five tests fail, rather than slow down, when the machine is busy | bug | wrong answer |
 | [0081](open/0081-a-consensus-accepted-by-the-probe-is-not-a-consensus-tor-would-trust.md) | a consensus ACCEPTED by the probe is not one tor would trust | missing feature | not implemented |
 | [0076](open/0076-an-app-worker-runs-main-once-so-a-test-pays-a-fresh-one-per-case.md) | an app worker runs `main` once, so a test pays a fresh one per case | performance | not implemented |
