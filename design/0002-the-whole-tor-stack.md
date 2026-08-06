@@ -382,7 +382,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
-| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **Not done:** the two encrypted layers' contents, publishing to the HSDirs, and the program that holds it together |
+| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. The **middle layer** decrypts under tor's `hs_desc_decode_superencrypted`. **Not done:** the inner layer's contents, publishing to the HSDirs, and the program that holds it together |
 | 7 — the interop matrix | **not started as a document.** Steps 2–6 each contribute rows and most are green; nothing collects them, so a regression in one would not be visible as a regression in *the matrix* |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
@@ -1211,3 +1211,32 @@ from the *previous* generated document and appeared nowhere in the current one, 
 changed nothing: a no-op that is indistinguishable from a surviving fault. A careful re-run, decoding
 the certificate and flipping actual bytes, showed the signature, the expiry and the certified key are
 all checked. Every fault planted since asserts the source actually changed before running the tests.
+
+### The middle layer, and an oracle for it too
+
+tor's own decoder chains `plaintext -> superencrypted -> encrypted`, so stopping after two stages is a
+supported position rather than a trick — `tools/hsdesc-probe.c` grew a `super` mode that does exactly
+that. The middle layer now decrypts:
+
+    auth_clients: 16       encrypted_blob_len: 64       ACCEPTED
+
+Two things about that layer are worth knowing because neither is arithmetic:
+
+  - **The sixteen `auth-client` lines are decoys.** With no client authorised, tor still writes a
+    fixed number, so a descriptor's shape does not say whether a service restricts access. A generator
+    that omitted them produces a document that *parses* — the token rule wants one or more — and leaks
+    by its size.
+  - **Only this layer is padded**, to a multiple of ten thousand bytes (`build_plaintext_padding`,
+    called only when `is_superencrypted_layer`). That is why the descriptor jumped from 668 bytes to
+    14103 the moment the layer became real, and why every real descriptor is at least ten kilobytes
+    whatever the service is.
+
+Controls on the new stage: another service's subcredential, one character of the blob, and the
+revision counter that keys it — all three rejected by tor.
+
+**A planted fault survived and the reason generalises.** "Round the padding down instead of up" passed
+every test, because a plaintext under one block rounds down to zero and a guard turns zero back into
+one block — so up and down agree for every input the tests had. It is caught now by a case one byte
+*over* a block. The lesson is that a boundary guard can hide the very arithmetic it guards, and a
+single-size test cannot see it: the fault needed an input on the other side of the boundary, which is
+exactly the input a fixture built from one real document never has.

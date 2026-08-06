@@ -21,6 +21,16 @@
 //   | `hs-descriptor 4` | REJECTED |
 //   | truncated before the signature | REJECTED |
 //
+// And for the middle layer, through `hs_desc_decode_superencrypted` — tor's own decoder chains the
+// three stages in that order, so stopping after two is a supported position rather than a trick:
+//
+//   | mutation | tor |
+//   |---|---|
+//   | unmodified | ACCEPTED, 16 auth clients, 64-byte inner blob |
+//   | another service's subcredential | REJECTED |
+//   | one character of the superencrypted blob | REJECTED |
+//   | the revision counter, which keys the layer | REJECTED |
+//
 // So this verdict is a strong one — unlike a microdescriptor's, where only the digest discriminates.
 // Everything in the document is covered by either the signature or the certificate.
 //
@@ -39,7 +49,13 @@ const H_SIGN_SEED = 3;
 const H_SIGN_PUBLIC = 4;
 const H_BLIND_SEED = 5;
 const H_BLIND_PUBLIC = 6;
-const H_NUM = 7; // a[0]: 0 lifetime, 1 revision, 2 signedSpanLen — 4 bytes big-endian
+const H_NUM = 7; // a[0]: 0 lifetime, 1 revision, 2 signedSpanLen, 3 middleLen — 4 bytes big-endian
+const H_SUBCRED = 8;
+const H_EPHEMERAL = 9;
+const H_SALT = 10;
+const H_INNER = 11;
+const H_CLIENT = 12; // a[0]=i: the i-th decoy client, 40 bytes
+const H_CLIENT_COUNT = 13;
 
 const v = JSON.parse(
   await Deno.readTextFile(new URL("data/hsdesc_generated.json", import.meta.url)),
@@ -54,7 +70,16 @@ const v = JSON.parse(
   lifetimeMinutes: number;
   revision: number;
   signedSpanLen: number;
+  subcredential: string;
+  ephemeral: string;
+  salt: string;
+  inner: string;
+  middleLen: number;
 };
+
+/** The decoys the generator writes, reproduced here so the wac side can rebuild the same layer. */
+const CLIENTS = Array.from({ length: 16 }, (_, ci) =>
+  Uint8Array.from({ length: 40 }, (_, i) => (ci * 97 + i * 11 + 3) & 0xff));
 
 const hex = (h: string) => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
 const utf8 = (s: string) => new TextEncoder().encode(s);
@@ -91,7 +116,19 @@ function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
     case H_BLIND_PUBLIC:
       return hex(v.blindPublic);
     case H_NUM:
-      return be32([v.lifetimeMinutes, v.revision, v.signedSpanLen][a[0]]);
+      return be32([v.lifetimeMinutes, v.revision, v.signedSpanLen, v.middleLen][a[0]]);
+    case H_SUBCRED:
+      return hex(v.subcredential);
+    case H_EPHEMERAL:
+      return hex(v.ephemeral);
+    case H_SALT:
+      return hex(v.salt);
+    case H_INNER:
+      return hex(v.inner);
+    case H_CLIENT:
+      return CLIENTS[a[0]];
+    case H_CLIENT_COUNT:
+      return be32(CLIENTS.length);
     default:
       throw new Error(`unknown vector field ${what}`);
   }

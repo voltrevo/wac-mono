@@ -6,6 +6,10 @@
  *   plaintext   `hs_desc_decode_plaintext` — the version, the lifetime, the signing-key certificate
  *               and the signature over the document. The `superencrypted` object is opaque to it, so
  *               the outer shell can be checked before either encrypted layer exists.
+ *   super       `hs_desc_decode_plaintext` then `hs_desc_decode_superencrypted` — the middle layer
+ *               decrypted and parsed, with the inner `encrypted` object left opaque. tor's own
+ *               decoder chains the three stages in exactly this order, so stopping after two is a
+ *               supported position rather than a trick.
  *   full        `hs_desc_decode_descriptor` with a subcredential — everything, both layers decrypted.
  *
  * Reads the descriptor on stdin. `full` takes the subcredential as hex in argv[2].
@@ -116,6 +120,30 @@ main(int argc, char **argv)
     return 0;
   }
 
+  if (!strcmp(mode, "super")) {
+    if (argc < 3) { fprintf(stderr, "super needs the subcredential as hex\n"); return 2; }
+    hs_descriptor_t *desc = tor_malloc_zero(sizeof(hs_descriptor_t));
+    if (unhex(argv[2], desc->subcredential.subcred, DIGEST256_LEN)) {
+      fprintf(stderr, "the subcredential is not 32 bytes of hex\n");
+      return 2;
+    }
+    if (hs_desc_decode_plaintext(buf, &desc->plaintext_data) != HS_DESC_DECODE_OK) {
+      printf("REJECTED\nreason: hs_desc_decode_plaintext\n");
+      return 1;
+    }
+    if (hs_desc_decode_superencrypted(desc, &desc->superencrypted_data)
+        != HS_DESC_DECODE_OK) {
+      printf("REJECTED\nreason: hs_desc_decode_superencrypted\n");
+      return 1;
+    }
+    printf("auth_clients: %d\n",
+           desc->superencrypted_data.clients
+             ? smartlist_len(desc->superencrypted_data.clients) : 0);
+    printf("encrypted_blob_len: %d\n", (int)desc->superencrypted_data.encrypted_blob_size);
+    printf("ACCEPTED\n");
+    return 0;
+  }
+
   if (!strcmp(mode, "full")) {
     if (argc < 3) { fprintf(stderr, "full needs the subcredential as hex\n"); return 2; }
     hs_subcredential_t subcred;
@@ -135,6 +163,6 @@ main(int argc, char **argv)
     return 0;
   }
 
-  fprintf(stderr, "usage: hsdesc-probe plaintext|full [subcredential-hex] < descriptor\n");
+  fprintf(stderr, "usage: hsdesc-probe plaintext|super|full [subcredential-hex] < descriptor\n");
   return 2;
 }

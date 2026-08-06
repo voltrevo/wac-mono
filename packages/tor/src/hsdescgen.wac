@@ -47,6 +47,9 @@ import {
   MAC_KEY_LEN, MAC_LEN, S_IV_LEN, S_KEY_LEN, SALT_LEN, layerKeys, layerMac, slice,
 } from "./hsdesc.wac";
 
+/** tor's `HS_DESC_SUPERENC_PLAINTEXT_PAD_MULTIPLE`. */
+export const i32 SUPERENC_PAD_MULTIPLE = 10000;
+
 /** What tor prepends before checking a descriptor's signature — `strlen`, so no terminating NUL. */
 export const string DESC_SIG_PREFIX = "Tor onion service descriptor sig v3";
 
@@ -158,6 +161,65 @@ u8[] pemBlock(string label, u8[] body) {
   }
   out.pushAll(("-----END " + label + "-----\n").toBytes());
   return out.bytes();
+}
+
+/**
+ * The middle layer's plaintext: who may fetch this descriptor, and the inner layer.
+ *
+ *     desc-auth-type x25519
+ *     desc-auth-ephemeral-key <base64 of 32 bytes>
+ *     auth-client <8 bytes> <16 bytes> <16 bytes>      (one line per client, base64, unpadded)
+ *     encrypted
+ *     -----BEGIN MESSAGE-----
+ *     ...the inner layer...
+ *     -----END MESSAGE-----
+ *
+ * **With no client authorisation the `auth-client` lines are still there and are noise.** tor writes
+ * a fixed number of decoy clients so that a descriptor with no authorised clients is the same size
+ * and shape as one with a few — publishing the difference would tell every directory whether a
+ * service restricts access. `tor`'s own encoder does this; a generator that omitted the lines would
+ * produce a document that parses (the token rule allows one or more) and leaks by its shape.
+ *
+ * The caller supplies the decoys and the ephemeral key rather than this reaching for randomness, for
+ * the reason `encryptLayer` takes its salt: a function that generated them could not be pinned
+ * against a committed vector.
+ */
+export u8[] superencryptedPlaintext(u8[] ephemeralKey, u8[][] authClients, u8[] innerBlob) {
+  if (ephemeralKey.len() != 32 || authClients.len() == 0) { return u8[0](); }
+
+  Buf d = Buf.create();
+  d.pushAll("desc-auth-type x25519\n".toBytes());
+  d.pushAll(("desc-auth-ephemeral-key " + b64Unpadded(ephemeralKey) + "\n").toBytes());
+  for (i32 i = 0; i < authClients.len(); i++) {
+    // Each decoy is 8 + 16 + 16 bytes laid out as three base64 fields.
+    u8[] c = authClients[i];
+    if (c.len() != 40) { return u8[0](); }
+    d.pushAll(("auth-client " + b64Unpadded(slice(c, 0, 8)) + " " +
+               b64Unpadded(slice(c, 8, 24)) + " " + b64Unpadded(slice(c, 24, 40)) + "\n").toBytes());
+  }
+  d.pushAll("encrypted\n".toBytes());
+  d.pushAll(pemBlock("MESSAGE", innerBlob));
+  return d.bytes();
+}
+
+/**
+ * The middle layer's plaintext, NUL-padded to a multiple of 10000 bytes.
+ *
+ * tor pads **this layer and not the inner one** (`build_plaintext_padding`, called only when
+ * `is_superencrypted_layer`), which is why a real descriptor is at least ten kilobytes whatever the
+ * service is. The point is the same as the decoy clients: a fetched descriptor's size should not say
+ * how many introduction points a service has.
+ *
+ * `decryptLayer` deliberately does not strip this padding, so a reader stops at the first NUL — which
+ * is why the padding is NULs rather than anything else.
+ */
+export u8[] padToBlock(u8[] plaintext) {
+  i32 block = SUPERENC_PAD_MULTIPLE;
+  i32 want = ((plaintext.len() + block - 1) / block) * block;
+  if (want == 0) { want = block; }
+  u8[] out = u8[want]();
+  for (i32 i = 0; i < plaintext.len(); i++) { out[i] = plaintext[i]; }
+  return out;
 }
 
 /** Unpadded base64, which is what every key and signature in these documents uses. */

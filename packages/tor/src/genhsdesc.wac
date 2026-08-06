@@ -22,7 +22,10 @@ import { itoa } from "../../fmt/src/itoa.wac";
 import { encode as hexEncode } from "../../codec/src/hex.wac";
 import { ed25519PublicKey } from "../../crypto/src/ed25519.wac";
 import { CERT_TYPE_SIGNING_HS_DESC, ed25519Cert } from "./relaycert.wac";
-import { descriptorDocument, signedSpanOf } from "./hsdescgen.wac";
+import {
+  descriptorDocument, encryptLayer, padToBlock, signedSpanOf, superencryptedPlaintext,
+} from "./hsdescgen.wac";
+import { superencryptedConstant } from "./hsdesc.wac";
 
 /** Two hours, which is what a real service asks for. */
 const i32 LIFETIME_MINUTES = 180;
@@ -57,11 +60,38 @@ export i32 main(Core core, Cli cli) {
     return 1;
   }
 
-  // A stand-in for the first encrypted layer. `hs_desc_decode_plaintext` treats the object as opaque,
-  // so this is enough to check everything outside it — and saying so here stops the next reader
-  // assuming the layers exist.
-  u8[] superencrypted = u8[128]();
-  for (i32 i = 0; i < 128; i++) { superencrypted[i] = (i * 31 + 7) & 0xFF; }
+  // The middle layer, for real. The inner `encrypted` object is still a stand-in: tor's decoder
+  // chains plaintext -> superencrypted -> encrypted and the middle stage leaves the inner object
+  // opaque, so this is checkable before the inner layer exists.
+  u8[] inner = u8[64]();
+  for (i32 i = 0; i < 64; i++) { inner[i] = (i * 17 + 5) & 0xFF; }
+
+  // Sixteen decoy clients, as tor writes when no client is authorised, so the descriptor's shape says
+  // nothing about whether the service restricts access.
+  u8[][] clients = u8[][16]();
+  for (i32 ci = 0; ci < 16; ci++) {
+    u8[] one = u8[40]();
+    for (i32 i = 0; i < 40; i++) { one[i] = (ci * 97 + i * 11 + 3) & 0xFF; }
+    clients[ci] = one;
+  }
+  u8[] ephemeral = seedFor(23);
+
+  u8[] middle = padToBlock(superencryptedPlaintext(ephemeral, clients, inner));
+  if (middle.len() == 0) {
+    core.warn("genhsdesc: could not build the superencrypted layer");
+    return 1;
+  }
+  // The salt is fixed for the same reason the keys are: a committed vector has to be reproducible.
+  u8[] salt = u8[16]();
+  for (i32 i = 0; i < 16; i++) { salt[i] = (i * 23 + 11) & 0xFF; }
+  // SECRET_DATA for this layer is the blinded public key; the subcredential is the service's.
+  u8[] subcred = seedFor(24);
+  u8[] superencrypted = encryptLayer(middle, blindPublic, subcred, 42, salt,
+                                     superencryptedConstant());
+  if (superencrypted.len() == 0) {
+    core.warn("genhsdesc: could not encrypt the superencrypted layer");
+    return 1;
+  }
 
   u8[] doc = descriptorDocument(LIFETIME_MINUTES, cert, 42, superencrypted, signSeed);
   if (doc.len() == 0) {
@@ -83,6 +113,11 @@ export i32 main(Core core, Cli cli) {
     "  \"signSeed\": \"" + hex(signSeed) + "\",\n" +
     "  \"signPublic\": \"" + hex(signPublic) + "\",\n" +
     "  \"cert\": \"" + hex(cert) + "\",\n" +
+    "  \"subcredential\": \"" + hex(subcred) + "\",\n" +
+    "  \"ephemeral\": \"" + hex(ephemeral) + "\",\n" +
+    "  \"salt\": \"" + hex(salt) + "\",\n" +
+    "  \"inner\": \"" + hex(inner) + "\",\n" +
+    "  \"middleLen\": " + itoa(middle.len()) + ",\n" +
     "  \"superencrypted\": \"" + hex(superencrypted) + "\",\n" +
     "  \"lifetimeMinutes\": " + itoa(LIFETIME_MINUTES) + ",\n" +
     "  \"revision\": 42,\n" +

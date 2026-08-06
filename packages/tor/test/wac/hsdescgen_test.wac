@@ -2,7 +2,8 @@
 
 import { T } from "../../../wactest/src/assert.wac";
 import {
-  DESC_SIG_PREFIX, descriptorDocument, encryptLayer, prefixed, signedSpanOf,
+  DESC_SIG_PREFIX, SUPERENC_PAD_MULTIPLE, descriptorDocument, encryptLayer, padToBlock, prefixed,
+  signedSpanOf, superencryptedPlaintext,
 } from "../../src/hsdescgen.wac";
 import { decryptLayer, superencryptedConstant, SALT_LEN, MAC_LEN } from "../../src/hsdesc.wac";
 import { ed25519Verify } from "../../../crypto/src/ed25519.wac";
@@ -15,6 +16,12 @@ const i32 H_SIGN_PUBLIC = 4;
 const i32 H_BLIND_SEED = 5;
 const i32 H_BLIND_PUBLIC = 6;
 const i32 H_NUM = 7;
+const i32 H_SUBCRED = 8;
+const i32 H_EPHEMERAL = 9;
+const i32 H_SALT = 10;
+const i32 H_INNER = 11;
+const i32 H_CLIENT = 12;
+const i32 H_CLIENT_COUNT = 13;
 
 u8[] none() { return u8[0](); }
 
@@ -129,6 +136,91 @@ export string test_bad_inputs_make_no_descriptor(fn[u8[](i32, u8[], u8[])] ref) 
   t.eqI32(signedSpanOf("no signature line here\n".toBytes()).len(), 0,
           "a document with no signature line has no span");
   return t.report();
+}
+
+/**
+ * The middle layer, rebuilt and compared against the one tor decrypted.
+ *
+ * This is the whole descriptor's middle stage: the plaintext, the padding to ten kilobytes, and the
+ * encryption under the blinded key and the subcredential. tor decrypted the committed blob and found
+ * sixteen auth clients and the inner object, so reproducing the blob byte for byte reproduces
+ * something an independent implementation understood.
+ */
+export string test_the_middle_layer_tor_decrypted_is_reproduced(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = be32(ref(H_CLIENT_COUNT, none(), none()));
+  u8[][] clients = u8[][n]();
+  for (i32 i = 0; i < n; i++) { clients[i] = ref(H_CLIENT, at(i), none()); }
+
+  u8[] plain = superencryptedPlaintext(ref(H_EPHEMERAL, none(), none()), clients,
+                                       ref(H_INNER, none(), none()));
+  t.isTrue(plain.len() > 0, "the middle plaintext builds");
+  t.isTrue(startsWith(plain, "desc-auth-type x25519\n"),
+           "it opens with the auth type, which tor's token rule requires first");
+
+  u8[] padded = padToBlock(plain);
+  t.eqI32(padded.len(), num(ref, 3), "padded to the length tor decrypted");
+  t.eqI32(padded.len() % SUPERENC_PAD_MULTIPLE, 0, "and to a multiple of ten thousand");
+  t.isTrue(padded.len() >= plain.len(), "padding never shortens");
+  t.eqI32(padded[padded.len() - 1], 0, "the padding is NULs, which is where a reader stops");
+
+  // A plaintext *over* one block, because everything above passes for a padding that rounds the
+  // wrong way: under 10000 bytes, rounding down gives zero and a guard turns zero back into one
+  // block, so up and down agree. A planted "round down" fault survived until this case existed.
+  u8[] big = u8[SUPERENC_PAD_MULTIPLE + 1]();
+  for (i32 i = 0; i < big.len(); i++) { big[i] = 65; }
+  t.eqI32(padToBlock(big).len(), SUPERENC_PAD_MULTIPLE * 2,
+          "one byte over a block pads to two blocks, not down to one");
+  u8[] exact = u8[SUPERENC_PAD_MULTIPLE]();
+  for (i32 i = 0; i < exact.len(); i++) { exact[i] = 66; }
+  t.eqI32(padToBlock(exact).len(), SUPERENC_PAD_MULTIPLE,
+          "an exact block is left alone rather than grown");
+
+  u8[] blob = encryptLayer(padded, ref(H_BLIND_PUBLIC, none(), none()),
+                           ref(H_SUBCRED, none(), none()), num(ref, 1) as i64,
+                           ref(H_SALT, none(), none()), superencryptedConstant());
+  t.eqBytes(blob, ref(H_SUPERENCRYPTED, none(), none()),
+            "and the encrypted layer is the blob tor decrypted");
+  return t.report();
+}
+
+/** The decoy clients are present and uniform, because their absence would leak. */
+export string test_the_decoy_clients_are_written(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = be32(ref(H_CLIENT_COUNT, none(), none()));
+  u8[][] clients = u8[][n]();
+  for (i32 i = 0; i < n; i++) { clients[i] = ref(H_CLIENT, at(i), none()); }
+  u8[] plain = superencryptedPlaintext(ref(H_EPHEMERAL, none(), none()), clients,
+                                       ref(H_INNER, none(), none()));
+
+  t.eqI32(countOf(plain, "auth-client "), n, "one line per client, and tor counted the same number");
+
+  // A layer with no clients is refused rather than written: the token rule wants at least one, and a
+  // descriptor whose shape says "nobody is authorised" is the leak the decoys exist to prevent.
+  t.eqI32(superencryptedPlaintext(ref(H_EPHEMERAL, none(), none()), u8[][0](),
+                                  ref(H_INNER, none(), none())).len(), 0,
+          "no clients at all is refused");
+  // A client of the wrong size would produce fields tor cannot parse.
+  u8[][] wrong = u8[][1]();
+  wrong[0] = u8[39]();
+  t.eqI32(superencryptedPlaintext(ref(H_EPHEMERAL, none(), none()), wrong,
+                                  ref(H_INNER, none(), none())).len(), 0,
+          "a thirty-nine byte client is not one");
+  t.eqI32(superencryptedPlaintext(u8[31](), clients, ref(H_INNER, none(), none())).len(), 0,
+          "and a thirty-one byte ephemeral key is not a key");
+  return t.report();
+}
+
+/** How many times `needle` appears. */
+i32 countOf(u8[] s, string needle) {
+  u8[] t = needle.toBytes();
+  i32 n = 0;
+  for (i32 i = 0; i + t.len() <= s.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < t.len(); j++) { if (s[i + j] != t[j]) { hit = false; break; } }
+    if (hit) { n = n + 1; }
+  }
+  return n;
 }
 
 /** The 64 bytes on the `signature ` line, decoded. */
