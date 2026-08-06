@@ -1,0 +1,57 @@
+// The two things the test's TypeScript needs from wac.
+//
+// `hash` because the trie oracle has to build Ethereum's trie and `node:crypto` has no keccak256 — see
+// `packages/crypto`'s README. `verifyProof` because bindgen marshals arrays and not structs, so the answer
+// is flattened: `[ok, present, len(4), value…, error…]`, and a proof arrives as one blob with a four-byte
+// length in front of each node.
+//
+// Flattening rather than a second entry point per field: one call is one answer, and three calls that each
+// re-verify would be three chances for them to disagree about which proof they were talking about.
+import { keccak256 } from "../../../crypto/src/keccak.wac";
+import { verify, Proved } from "../../src/proof.wac";
+
+export u8[] hash(u8[] input) { return keccak256(input); }
+
+export u8[] verifyProof(u8[] root, u8[] key, u8[] packed) {
+  u8[][] nodes = unpack(packed);
+  Proved p = verify(root, key, nodes);
+  u8[] err = p.error.toBytes();
+  u8[] out = u8[6 + p.value.len() + err.len()]();
+  out[0] = p.ok ? 1 : 0;
+  out[1] = p.present ? 1 : 0;
+  i32 n = p.value.len();
+  out[2] = n & 0xFF;
+  out[3] = (n >> 8) & 0xFF;
+  out[4] = (n >> 16) & 0xFF;
+  out[5] = (n >> 24) & 0xFF;
+  for (i32 i = 0; i < n; i++) { out[6 + i] = p.value[i]; }
+  for (i32 i = 0; i < err.len(); i++) { out[6 + n + i] = err[i]; }
+  return out;
+}
+
+/** `[len(4) bytes…]*` back into the nodes. */
+u8[][] unpack(u8[] packed) {
+  i32 count = 0;
+  i32 at = 0;
+  while (at + 4 <= packed.len()) {
+    i32 n = lenAt(packed, at);
+    at = at + 4 + n;
+    count++;
+  }
+  u8[][] out = u8[][count](fill: u8[0]());
+  at = 0;
+  i32 k = 0;
+  while (at + 4 <= packed.len()) {
+    i32 n = lenAt(packed, at);
+    u8[] node = u8[n]();
+    for (i32 i = 0; i < n; i++) { node[i] = packed[at + 4 + i]; }
+    out[k] = node;
+    k++;
+    at = at + 4 + n;
+  }
+  return out;
+}
+
+i32 lenAt(u8[] b, i32 at) {
+  return b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24);
+}

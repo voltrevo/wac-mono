@@ -1,7 +1,7 @@
 # 0086 — Merkle-Patricia proofs, so reading a contract does not mean trusting the answer
 
 - **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Claimed by:** agent-a
 - **Reported by:** agent-c
 - **Date:** 2026-08-06
 - **Kind:** missing feature
@@ -42,3 +42,39 @@ here.
 A verifier is worth building before a fetcher. The proof is just bytes; where it came from is a separate
 concern, and building them in that order keeps the trust boundary visible rather than tangled with an
 RPC client.
+
+## The verifier is done; the composition and the endpoint vector are not — agent-a, 2026-08-06
+
+`packages/mpt`. `verify(root, key, nodes) -> Proved { ok, present, value, error }` walks one trie and checks
+every step against what its parent committed to. Left open deliberately, because two things this issue asks
+for are not done — both named below.
+
+**What is done, and how it is anchored.** A verifier needs proofs, and a generator written beside it agrees
+with it for free, so there are three layers:
+
+1. `test/trie.ts` builds a Merkle-Patricia trie in TypeScript, and its roots are checked against **all seven
+   cases** in `ethereum/tests`' `trieanyorder.json` (vendored, 1.2 KB, pinned commit). Matching a published
+   root is not possible with the hex-prefix encoding, the node shapes, the 32-byte inline rule or the RLP
+   beneath them wrong.
+2. Proofs from that builder are handed to the wac verifier: every key of every fixture for inclusion, and
+   keys chosen to end in each of the three **absence** shapes — an empty branch slot, a diverging extension,
+   a leaf whose path is a prefix. `ok` and `present` are separate fields so a broken proof can never read as
+   an empty slot.
+3. Every perturbation this issue lists, and a few more: a flipped byte at three positions in every node,
+   every node dropped in turn, two swapped, a valid node from another position substituted, an unnecessary
+   node appended, the proof presented against a different root, and against a root where the value was
+   changed. Each must be refused, and each is. Checked from the other side too — deleting the hash check, the
+   leftover-node check or the leaf-prefix check each turns tests red.
+
+A fifth test builds the shape a real state trie has: 200 keys that are keccak256 digests, so every path is
+64 nibbles and every child is hashed rather than inline, which the small readable fixtures never exercise.
+
+**Not implemented — the composition.** An `eth_getProof` response is *two* walks: the state trie to an
+account, then that account's RLP decoded into `[nonce, balance, storageRoot, codeHash]`, then the storage
+trie under `storageRoot`. This package verifies one trie against one root. The account structure and the
+two-step walk belong above it, with the type that names those fields.
+
+**Not implemented — a real endpoint's proof as a vector.** The anchor here is Ethereum's published *roots*
+plus an independently built trie, not a live `eth_getProof`. What that would catch is a misunderstanding of
+how a real response is *shaped* — the order nodes arrive in, an account proof and a storage proof together —
+rather than of the trie itself, which the seven roots already pin.

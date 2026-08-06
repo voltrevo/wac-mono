@@ -1,0 +1,278 @@
+// Merkle-Patricia proofs: what a state root says about one key, checked rather than believed.
+//
+// `packages/lightclient` follows the chain and gives a verified header, so the state root is known. It says
+// nothing about what is *in* that state. This is the piece that turns "a provider told me" into "the root I
+// verified commits to this": a proof is the nodes along one key's path, and each is checked to hash to what
+// its parent said it would.
+//
+// ## What a proof is
+//
+// A list of RLP-encoded nodes, root first. Three node shapes:
+//
+//   leaf      [ hp(path, leaf: true), value ]
+//   extension [ hp(path, leaf: false), child ]
+//   branch    [ c0 … c15, value ]                — seventeen items
+//
+// A child reference is `keccak256(rlp(node))` when that encoding is 32 bytes or more, and **the node
+// itself, inline** when it is shorter. So the proof carries only the nodes a hash points at; an inline child
+// arrives inside its parent's bytes and has no hash of its own to check. A verifier that assumed one node
+// per level would reject every proof containing a small node, which for storage tries is most of them.
+//
+// ## Absence is an answer
+//
+// `eth_getProof` answers for a slot that was never written, and the proof of that is a path that *ends*
+// before the key does — an empty branch slot, or a leaf or extension whose own path diverges. That is a
+// different shape from an inclusion proof and it is the half people skip, so `Proved` reports `present`
+// separately from `ok`: a valid proof of absence is `ok = true, present = false`, and the two must never be
+// confused with the third case, which is a proof that does not hold together at all.
+//
+// ## What is refused
+//
+// Every step is checked against what the parent committed to, so all of these fail:
+//
+//   * a node whose hash is not what its parent said — one flipped byte anywhere;
+//   * a node missing from the middle, which makes the next hash mismatch;
+//   * two nodes swapped, for the same reason;
+//   * a valid node from a different position, which hashes to something the parent did not name;
+//   * nodes left over after the walk ends, which is a proof carrying something it does not need;
+//   * a node that is not RLP, or is RLP of the wrong shape.
+//
+// **Not implemented:** building or updating a trie. A verifier needs no writer, and the account-and-storage
+// composition — walk the state trie to an account, decode its RLP, then walk the storage trie under
+// `storageRoot` — belongs above this file with the account structure it decodes.
+
+import { decode, Decoded, Item, itemsOf, bytesOf, isList } from "../../rlp/src/rlp.wac";
+import { keccak256 } from "../../crypto/src/keccak.wac";
+
+/** What a proof established. */
+export struct Proved {
+  /** Whether the proof holds together against the root. Nothing below matters if this is false. */
+  bool ok;
+  /** Whether the key has a value. A sound proof of absence is `ok` and not `present`. */
+  bool present;
+  /** The value, when present. */
+  u8[] value;
+  /** Why the proof was refused, in words a caller can print. Empty when `ok`. */
+  string error;
+
+  Proved of(bool ok, bool present, u8[] value, string error) {
+    return Proved(ok, present, value, error);
+  }
+}
+
+/**
+ * What `root` commits to at `key`, according to `nodes`.
+ *
+ * `key` is the trie key as *bytes* — for Ethereum's state and storage tries that is already a keccak256
+ * digest, hashed by the caller, because whether a trie is "secure" is the caller's business and not this
+ * walk's. `nodes` is the proof, root first, each item an RLP encoding.
+ */
+export Proved verify(u8[] root, u8[] key, u8[][] nodes) {
+  if (root.len() != 32) { return Proved.of(false, false, u8[0](), "a root must be 32 bytes"); }
+  if (nodes.len() == 0) { return Proved.of(false, false, u8[0](), "a proof with no nodes proves nothing"); }
+
+  u8[] path = nibblesOf(key);
+  Walk w = Walk(nodes, 0, path, 0, "", false, u8[0]());
+
+  // The first node is named by the root, which is a hash by definition.
+  Item? node = nodeAt(w, root);
+  if (w.error != "") { return Proved.of(false, false, u8[0](), w.error); }
+  step(w, node!);
+  if (w.error != "") { return Proved.of(false, false, u8[0](), w.error); }
+
+  // Everything in the proof has to have been needed. A proof with a node left over is either a different
+  // key's proof or one padded with something the caller might be invited to trust.
+  if (w.used != nodes.len()) {
+    return Proved.of(false, false, u8[0](),
+      "the proof has " + itoa(nodes.len() - w.used) + " node(s) the walk never reached");
+  }
+  return Proved.of(true, w.found, w.value, "");
+}
+
+/** The walk's state. A struct because wac has no exceptions and a failure has to stop the descent. */
+struct Walk {
+  u8[][] nodes;
+  /** How many of them the walk has consumed — every one must be, by the end. */
+  i32 used;
+  u8[] path;
+  i32 at;
+  string error;
+  bool found;
+  u8[] value;
+}
+
+/**
+ * The node the parent's reference points at.
+ *
+ * A 32-byte reference is a hash: take the next node from the proof and check it. Anything else would be an
+ * inline child, which `step` handles without coming here — so a short reference reaching this point is a
+ * malformed proof rather than a shape to interpret.
+ */
+Item? nodeAt(Walk w, u8[] want) {
+  if (w.used >= w.nodes.len()) {
+    w.error = "the proof ends where a node hashing to " + hex(want) + " was expected";
+    return null;
+  }
+  u8[] raw = w.nodes[w.used];
+  w.used = w.used + 1;
+  u8[] got = keccak256(raw);
+  if (!sameBytes(got, want)) {
+    w.error = "node " + itoa(w.used - 1) + " hashes to " + hex(got) + ", but its parent named " + hex(want);
+    return null;
+  }
+  Decoded d = decode(raw);
+  if (!d.ok) {
+    w.error = "node " + itoa(w.used - 1) + " is not RLP: " + d.error;
+    return null;
+  }
+  return d.item;
+}
+
+/** One node: descend, or settle the answer. */
+void step(Walk w, Item node) {
+  if (w.error != "") { return; }
+  if (!isList(node)) {
+    w.error = "a node must be a list, and this one is a byte string";
+    return;
+  }
+  Item[] parts = itemsOf(node);
+
+  if (parts.len() == 17) {
+    if (w.at == w.path.len()) {
+      // The path ends exactly at this branch, so its own value slot is the answer — empty means the key is
+      // absent, which is as sound a result as a value.
+      u8[] v = bytesOf(parts[16]);
+      w.found = v.len() > 0;
+      w.value = v;
+      return;
+    }
+    i32 nib = w.path[w.at];
+    w.at = w.at + 1;
+    descend(w, parts[nib]);
+    return;
+  }
+
+  if (parts.len() != 2) {
+    w.error = "a node has two items or seventeen, and this one has " + itoa(parts.len());
+    return;
+  }
+
+  // Leaf or extension: the first item's top nibble says which, and carries the odd-length flag.
+  u8[] head = bytesOf(parts[0]);
+  if (head.len() == 0) {
+    w.error = "a leaf or extension needs a hex-prefix header, and this one is empty";
+    return;
+  }
+  i32 flag = head[0] >> 4;
+  if (flag > 3) {
+    w.error = "a hex-prefix flag is 0..3, and this one is " + itoa(flag);
+    return;
+  }
+  bool leaf = flag >= 2;
+  bool odd = (flag & 1) == 1;
+  u8[] own = nibblesOf(head);
+  // The flag nibble, and the padding nibble an even-length path carries.
+  i32 skip = odd ? 1 : 2;
+  if (!odd && own.len() >= 2 && own[1] != 0) {
+    w.error = "an even-length hex-prefix path must pad with a zero nibble";
+    return;
+  }
+
+  // Does the key follow this node's own path?
+  i32 shared = own.len() - skip;
+  if (w.at + shared > w.path.len()) {
+    // The node's path is longer than what is left of the key: the key is not under this node, and this node
+    // is the proof of that.
+    w.found = false;
+    w.value = u8[0]();
+    return;
+  }
+  for (i32 i = 0; i < shared; i++) {
+    if (w.path[w.at + i] != own[skip + i]) {
+      // Diverged. The trie has something else at this prefix, which is exactly what proves the key absent.
+      w.found = false;
+      w.value = u8[0]();
+      return;
+    }
+  }
+  w.at = w.at + shared;
+
+  if (leaf) {
+    // A leaf matches only if the key ends here. A leaf whose path is a prefix of the key means the key is
+    // absent — the trie stores a shorter key along this path and nothing longer.
+    if (w.at != w.path.len()) {
+      w.found = false;
+      w.value = u8[0]();
+      return;
+    }
+    w.found = true;
+    w.value = bytesOf(parts[1]);
+    return;
+  }
+  descend(w, parts[1]);
+}
+
+/** Follow a child reference: an empty slot ends the walk, a hash fetches, a list is inline. */
+void descend(Walk w, Item child) {
+  if (isList(child)) {
+    // Inline: the node is here, in its parent's bytes, because its RLP was under 32 bytes. Nothing to hash
+    // and nothing to consume from the proof.
+    step(w, child);
+    return;
+  }
+  u8[] ref = bytesOf(child);
+  if (ref.len() == 0) {
+    // An empty slot. The key is absent and this node proves it.
+    w.found = false;
+    w.value = u8[0]();
+    return;
+  }
+  if (ref.len() != 32) {
+    w.error = "a child reference is a 32-byte hash or an inline node, and this one is " +
+      itoa(ref.len()) + " bytes";
+    return;
+  }
+  Item? next = nodeAt(w, ref);
+  if (w.error != "") { return; }
+  step(w, next!);
+}
+
+/** A byte string as nibbles, high first. */
+u8[] nibblesOf(u8[] b) {
+  u8[] out = u8[b.len() * 2]();
+  for (i32 i = 0; i < b.len(); i++) {
+    out[i * 2] = b[i] >> 4;
+    out[i * 2 + 1] = b[i] & 15;
+  }
+  return out;
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+/** Lowercase hex, for the messages: a failure that names two hashes is a failure somebody can act on. */
+string hex(u8[] b) {
+  u8[] out = u8[b.len() * 2]();
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 hi = b[i] >> 4;
+    i32 lo = b[i] & 15;
+    out[i * 2] = hi < 10 ? '0' + hi : 'a' + (hi - 10);
+    out[i * 2 + 1] = lo < 10 ? '0' + lo : 'a' + (lo - 10);
+  }
+  return string.fromBytes(out);
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  u8[] buf = u8[12]();
+  i32 n = 0;
+  i32 x = v < 0 ? 0 - v : v;
+  while (x > 0) { buf[n] = '0' + (x % 10); n++; x = x / 10; }
+  u8[] out = u8[n + (v < 0 ? 1 : 0)]();
+  if (v < 0) { out[0] = '-'; }
+  for (i32 i = 0; i < n; i++) { out[(v < 0 ? 1 : 0) + i] = buf[n - 1 - i]; }
+  return string.fromBytes(out);
+}
