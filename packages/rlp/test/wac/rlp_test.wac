@@ -1,0 +1,235 @@
+// RLP against Ethereum's own `RLPTests`, both halves of them.
+//
+// The oracle is the fixture *bytes*, not a round trip. An encoder and a decoder wrong in opposite ways
+// agree with each other perfectly — `packages/datetime`'s README says so and issue 0084 asks for better —
+// so every case here starts from a byte string Ethereum published and works in both directions:
+//
+//   1. **decode it** and render the tree, which the host compares against a rendering it derives from the
+//      fixture's `in` field. That checks the decoder against a value nothing here produced.
+//   2. **re-encode the tree** and require the original bytes back. Since step 1 established that the tree
+//      is the right tree, this checks the encoder against real bytes rather than against my decoder.
+//
+// The rendering is deliberately unambiguous and cheap: a byte string is its lowercase hex in brackets, a
+// list is its members in parentheses. `(<0f>(<>))` is a list of a one-byte string and an empty list, and
+// nothing else renders that way — an encoding of the *structure*, so a decoder that flattened a nested list
+// or dropped an empty one cannot match.
+//
+// The invalid half is the interesting half. Twenty-six inputs that a lenient decoder accepts, each of which
+// would be a consensus fault: leading zeros in a length, a single byte spelled the long way, a declared
+// length that overruns, a size that does not fit an i32. `decode` must refuse all of them, and the test
+// says which one it accepted rather than only that a count differed.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { decode, encode, fromI64, Decoded, Item } from "../../src/rlp.wac";
+
+/** `(` … `)` for a list, `<hex>` for a byte string. One rendering per tree, and no two trees alike. */
+string render(Item it) {
+  match (it) {
+    case Bytes(v): return "<" + hex(v) + ">";
+    case List(xs): {
+      string out = "(";
+      for (i32 i = 0; i < xs.len(); i++) { out = out + render(xs[i]); }
+      return out + ")";
+    }
+  }
+}
+
+string hex(u8[] b) {
+  u8[] out = u8[b.len() * 2]();
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 hi = b[i] >> 4;
+    i32 lo = b[i] & 15;
+    out[i * 2] = hi < 10 ? '0' + hi : 'a' + (hi - 10);
+    out[i * 2 + 1] = lo < 10 ? '0' + lo : 'a' + (lo - 10);
+  }
+  return string.fromBytes(out);
+}
+
+u8[] unhex(string h) {
+  u8[] src = h.toBytes();
+  u8[] out = u8[src.len() / 2]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = nib(src[2 * i]) * 16 + nib(src[2 * i + 1]); }
+  return out;
+}
+i32 nib(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+  trap;
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+/**
+ * Every valid fixture: `cases(i)` gives `<hex bytes>|<expected rendering>|<name>`, and `count()` how many.
+ *
+ * One string rather than three funcrefs because a wac test's host arguments are positional and a case is
+ * one fact; splitting it into parallel arrays is how they get out of step.
+ */
+export string test_the_published_vectors_decode_and_re_encode(
+  fn[string(i32)] cases, fn[i32()] count, fn[string(i32)] bad, fn[i32()] badCount
+) {
+  T t = T.create();
+  i32 n = count();
+  t.isTrue(n >= 25, "the fixture set should have twenty-odd cases, got " + itoa(n));
+  for (i32 i = 0; i < n; i++) {
+    string[] parts = split(cases(i));
+    u8[] bytes = unhex(parts[0]);
+    Decoded got = decode(bytes);
+    t.isTrue(got.ok, parts[2] + ": decode refused a valid encoding — " + got.error);
+    if (!got.ok) { continue; }
+    t.eqStr(render(got.item), parts[1], parts[2] + ": decoded to the wrong tree");
+    t.isTrue(same(encode(got.item), bytes), parts[2] + ": re-encoding did not reproduce the bytes");
+  }
+  return t.report();
+}
+
+/** Every invalid fixture: `cases(i)` gives `<hex bytes>|<name>`. All must be refused. */
+export string test_the_invalid_vectors_are_all_refused(
+  fn[string(i32)] cases, fn[i32()] count, fn[string(i32)] bad, fn[i32()] badCount
+) {
+  // The *third and fourth* arguments. `wacTestRun` hands every test the same positional list, trimmed to
+  // the number it declares, so a test that wanted only the invalid pair would be handed the valid one —
+  // which is exactly what happened first, and the failure read as "the decoder accepts everything".
+  T t = T.create();
+  i32 n = badCount();
+  t.isTrue(n >= 20, "the invalid set should have twenty-odd cases, got " + itoa(n));
+  for (i32 i = 0; i < n; i++) {
+    string[] parts = split(bad(i));
+    Decoded got = decode(unhex(parts[0]));
+    // Named, because "one of twenty-six was accepted" is a bisect and "wrongSizeList was accepted" is a
+    // fix. Each of these is a consensus fault if it decodes.
+    t.isFalse(got.ok, parts[1] + ": accepted an invalid encoding, rendered " + render(got.item));
+  }
+  return t.report();
+}
+
+export string test_trailing_bytes_are_refused() {
+  // **The one rule Ethereum's invalid corpus does not exercise.** Measured, not assumed: deleting the
+  // trailing-bytes check leaves all twenty-six of those fixtures passing, because every one of them is
+  // malformed *inside* an item rather than followed by extra. So the cases below are mine.
+  //
+  // It matters as much as the others: a decoder that reads one item and ignores the rest lets two
+  // different byte strings carry the same transaction, and `decode` is defined over the whole input for
+  // that reason.
+  T t = T.create();
+  string[] cases = string[](
+    "0000",              // two zero-byte strings where one item was asked for
+    "83646f6700",        // "dog", and then a stray byte
+    "c0c0",              // two empty lists
+    "80c0",              // an empty string and an empty list
+    "0f10"               // two small bytes, each valid alone
+  );
+  for (i32 i = 0; i < cases.len(); i++) {
+    Decoded got = decode(unhex(cases[i]));
+    t.isFalse(got.ok, "0x" + cases[i] + " is two items, not one — rendered " + render(got.item));
+  }
+  // And the same bytes *are* accepted when they are what a single item says they are.
+  t.isTrue(decode(unhex("c2800f")).ok, "a list of two items is one item");
+  return t.report();
+}
+
+export string test_the_edges_of_the_length_forms() {
+  // The boundaries the fixture set touches but does not surround: 55 and 56 bytes for a string, the same
+  // for a list, and the two-byte length above 255. Built here rather than fetched because they are
+  // arithmetic on the encoder's own rules and the *point* is that both directions agree at the step.
+  T t = T.create();
+  i32[] lens = i32[](0, 1, 2, 54, 55, 56, 57, 255, 256, 257, 1000);
+  for (i32 k = 0; k < lens.len(); k++) {
+    u8[] payload = u8[lens[k]]();
+    for (i32 i = 0; i < payload.len(); i++) { payload[i] = (i * 7 + 1) & 0xFF; }
+    u8[] enc = encode(Item.Bytes(payload));
+    Decoded back = decode(enc);
+    t.isTrue(back.ok, "a " + itoa(lens[k]) + "-byte string did not decode: " + back.error);
+    if (back.ok) {
+      t.eqStr(render(back.item), "<" + hex(payload) + ">", "a " + itoa(lens[k]) + "-byte string");
+    }
+    // The prefix itself, because the boundary is where the form changes and a test of the round trip
+    // alone would pass with both sides using the wrong form.
+    if (lens[k] == 1 && payload[0] < 0x80) {
+      t.eqI32(enc.len(), 1, "a single small byte is itself, with no prefix");
+    } else if (lens[k] <= 55) {
+      t.eqI32(enc[0], 0x80 + lens[k], "a " + itoa(lens[k]) + "-byte string uses the short form");
+    } else if (lens[k] <= 255) {
+      t.eqI32(enc[0], 0xB8, "a " + itoa(lens[k]) + "-byte string uses a one-byte length");
+    } else {
+      t.eqI32(enc[0], 0xB9, "a " + itoa(lens[k]) + "-byte string uses a two-byte length");
+    }
+  }
+  return t.report();
+}
+
+export string test_a_number_is_the_shortest_big_endian_string() {
+  // RLP has no integers: `0` is the empty string and not a zero byte, and every value above that is its
+  // minimal big-endian bytes. Getting `0` wrong is the classic RLP bug, because `0x00` is a perfectly
+  // valid *byte string* and means something else.
+  T t = T.create();
+  t.eqI32(fromI64(0 as i64).len(), 0, "zero is the empty string");
+  t.eqStr(hex(fromI64(1 as i64)), "01", "one");
+  t.eqStr(hex(fromI64(127 as i64)), "7f", "127");
+  t.eqStr(hex(fromI64(128 as i64)), "80", "128 — the byte value, not the prefix");
+  t.eqStr(hex(fromI64(1024 as i64)), "0400", "1024");
+  t.eqStr(hex(fromI64(4294967295)), "ffffffff", "2^32 - 1");
+  // And through the encoder, where 0 becomes 0x80 and 15 stays 0x0f — the two the spec names.
+  t.eqStr(hex(encode(Item.Bytes(fromI64(0 as i64)))), "80", "encode(0)");
+  t.eqStr(hex(encode(Item.Bytes(fromI64(15 as i64)))), "0f", "encode(15)");
+  t.eqStr(hex(encode(Item.Bytes(fromI64(1024 as i64)))), "820400", "encode(1024)");
+  return t.report();
+}
+
+export string test_nesting_survives_a_round_trip() {
+  // The spec's "set theoretic representation of three": [ [], [[]], [ [], [[]] ] ] is 0xc7c0c1c0c3c0c1c0,
+  // which is the one case that goes wrong if empty lists are dropped or nesting is flattened.
+  T t = T.create();
+  Item empty = Item.List(Item[0](fill: Item.Bytes(u8[0]())));
+  Item[] one = Item[1](fill: empty);
+  Item singleton = Item.List(one);
+  Item[] two = Item[2](fill: empty);
+  two[0] = empty;
+  two[1] = singleton;
+  Item[] three = Item[3](fill: empty);
+  three[0] = empty;
+  three[1] = singleton;
+  three[2] = Item.List(two);
+  u8[] enc = encode(Item.List(three));
+  t.eqStr(hex(enc), "c7c0c1c0c3c0c1c0", "the set theoretic representation of three");
+  Decoded back = decode(enc);
+  t.isTrue(back.ok, "it decodes: " + back.error);
+  if (back.ok) { t.eqStr(render(back.item), "(()(())(()(())))", "and to the same shape"); }
+  return t.report();
+}
+
+/** `a|b|c` into its parts. The fixtures carry no `|`, being hex and a rendering of hex. */
+string[] split(string s) {
+  u8[] b = s.toBytes();
+  i32 fields = 1;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == '|') { fields++; } }
+  string[] out = string[fields](fill: "");
+  i32 at = 0;
+  i32 start = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == '|') {
+      u8[] piece = u8[i - start]();
+      for (i32 j = start; j < i; j++) { piece[j - start] = b[j]; }
+      out[at] = string.fromBytes(piece);
+      at++;
+      start = i + 1;
+    }
+  }
+  return out;
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  u8[] buf = u8[12]();
+  i32 n = 0;
+  i32 x = v;
+  while (x > 0) { buf[n] = '0' + (x % 10); n++; x = x / 10; }
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = buf[n - 1 - i]; }
+  return string.fromBytes(out);
+}

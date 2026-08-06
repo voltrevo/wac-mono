@@ -1,0 +1,302 @@
+// RLP — Recursive Length Prefix, the execution layer's serialisation.
+//
+// Two kinds of thing exist: a **byte string** and a **list of items**. There are no integers, no maps and
+// no types; a number is the shortest big-endian byte string that spells it, and the meaning of a list's
+// members is the caller's business. That is the whole data model, and everything below is length prefixes.
+//
+// The difficulty is entirely in the edges. Ethereum's own `RLPTests` fixtures are vendored beside the
+// tests, and the twenty-six *invalid* cases are the interesting half: an implementation that encodes
+// correctly and decodes leniently round-trips perfectly and accepts consensus-breaking input.
+//
+// ## Canonical, not merely parseable
+//
+// RLP as deployed is a canonical encoding: **every value has exactly one valid encoding**, and a decoder
+// that accepts a second one is a consensus fault rather than a nicety. Four rules carry that, and each is
+// a fixture in `invalidRLPTest.json`:
+//
+//   * a single byte below 0x80 is itself, never `0x81 <byte>`;
+//   * a length prefix carries no leading zero — `0xb8 0x00` is invalid however plausible it looks;
+//   * the long form is for lengths above 55 only, so `0xb8 0x02` where `0x82` would do is invalid;
+//   * the declared length must be exactly the bytes that follow, with nothing over and nothing left.
+//
+// The last one is why `decode` is defined over the *whole* input and returns a failure for trailing bytes:
+// a decoder that reads one item and ignores the rest lets two different byte strings mean the same
+// transaction, which is the shape of several real Ethereum vulnerabilities.
+//
+// ## Sizes
+//
+// A length that does not fit an `i32` is refused rather than wrapped. `packages/ssz` has the same case and
+// gives the same answer: a four-byte length prefix can spell 4 GB, an `i32` cannot hold it, and a wrapped
+// negative would be read as a short item. There is no input this repo can hold for which the refusal is
+// wrong, and it is a refusal rather than a trap so the caller can say what happened.
+
+// The messages carry numbers, and `packages/fmt` is where decimal formatting lives. Three copies of
+// `itoa` were deleted from this repo today alone; a fourth here would be a fifth by Friday.
+import { itoa, itoa64 } from "../../fmt/src/itoa.wac";
+
+/**
+ * An RLP item: bytes, or a list of them.
+ *
+ * A recursive enum through an array, which works because an array is a reference — `List(Item[])` holds a
+ * pointer to a block of items rather than embedding them, so the type is finite.
+ */
+export enum Item {
+  Bytes(u8[] value),
+  List(Item[] items),
+}
+
+/** The bytes of a byte-string item, or empty for a list. For a caller that knows which it has. */
+export u8[] bytesOf(Item it) {
+  match (it) {
+    case Bytes(v): return v;
+    case List(_): return u8[0]();
+  }
+}
+
+/** The members of a list item, or empty for a byte string. */
+export Item[] itemsOf(Item it) {
+  match (it) {
+    case Bytes(_): return Item[0](fill: Item.Bytes(u8[0]()));
+    case List(xs): return xs;
+  }
+}
+
+/** Whether this item is a list. `Item` is an enum, so a caller may also match it directly. */
+export bool isList(Item it) {
+  match (it) {
+    case Bytes(_): return false;
+    case List(_): return true;
+  }
+}
+
+// ── Encoding ──────────────────────────────────────────────────────────────────
+
+/** `item`, encoded. The only encoding of it, since RLP is canonical. */
+export u8[] encode(Item item) {
+  match (item) {
+    case Bytes(v): return encodeBytes(v);
+    case List(xs): {
+      // The payload first, because a list's prefix depends on the encoded length of everything in it.
+      // Concatenating once at the end rather than growing a buffer per member keeps this O(n) in the
+      // number of *bytes* rather than in the number of members squared.
+      u8[][] parts = u8[][xs.len()](fill: u8[0]());
+      i32 total = 0;
+      for (i32 i = 0; i < xs.len(); i++) {
+        parts[i] = encode(xs[i]);
+        total = total + parts[i].len();
+      }
+      u8[] head = header(total, 0xC0, 0xF7);
+      u8[] out = u8[head.len() + total]();
+      for (i32 i = 0; i < head.len(); i++) { out[i] = head[i]; }
+      i32 at = head.len();
+      for (i32 i = 0; i < parts.len(); i++) {
+        for (i32 j = 0; j < parts[i].len(); j++) { out[at] = parts[i][j]; at++; }
+      }
+      return out;
+    }
+  }
+}
+
+/** A byte string, encoded: itself when it is one small byte, otherwise a prefix and the bytes. */
+u8[] encodeBytes(u8[] v) {
+  // The single-byte case is not an optimisation; it is the canonical form, and `0x81 0x05` is invalid
+  // input rather than a second spelling of `5`.
+  if (v.len() == 1 && v[0] < 0x80) { return v; }
+  u8[] head = header(v.len(), 0x80, 0xB7);
+  u8[] out = u8[head.len() + v.len()]();
+  for (i32 i = 0; i < head.len(); i++) { out[i] = head[i]; }
+  for (i32 i = 0; i < v.len(); i++) { out[head.len() + i] = v[i]; }
+  return out;
+}
+
+/**
+ * The length prefix for a payload of `len` bytes.
+ *
+ * `short` is the base for a length that fits in the prefix itself (0x80 for a string, 0xC0 for a list);
+ * `long` is the base for the form that carries the length as bytes. Both offsets are the same shape, which
+ * is why one function serves strings and lists — the only difference between them in RLP is 0x40.
+ */
+u8[] header(i32 len, i32 short, i32 long) {
+  if (len < 0) { trap; }
+  if (len <= 55) { return u8[](short + len); }
+  // Minimal big-endian length: no leading zero, because a decoder must reject one.
+  u8[] be = u8[4]();
+  i32 n = 0;
+  i32 x = len;
+  while (x > 0) { be[n] = x & 0xFF; n++; x = x / 256; }
+  u8[] out = u8[1 + n]();
+  out[0] = long + n;
+  for (i32 i = 0; i < n; i++) { out[1 + i] = be[n - 1 - i]; }
+  return out;
+}
+
+/** The minimal big-endian encoding of a non-negative integer — RLP's only way to spell a number. */
+export u8[] fromI64(i64 v) {
+  if (v < 0) { trap; }
+  if (v == 0) { return u8[0](); }         // zero is the empty string, not a zero byte
+  u8[] be = u8[8]();
+  i32 n = 0;
+  i64 x = v;
+  while (x > 0) { be[n] = (x & 255) as~ i32; n++; x = x / 256; }
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = be[n - 1 - i]; }
+  return out;
+}
+
+// ── Decoding ──────────────────────────────────────────────────────────────────
+
+/** What `decode` answered: the item, or why not. */
+export struct Decoded {
+  bool ok;
+  Item item;
+  /** Empty when `ok`; otherwise which rule the input broke, in words a caller can print. */
+  string error;
+
+  Decoded of(bool ok, Item item, string error) { return Decoded(ok, item, error); }
+}
+
+/**
+ * The one item this input encodes, or a failure.
+ *
+ * Trailing bytes are a failure: RLP is canonical, and an input that encodes an item *and then some* has
+ * two readings. Everything else it refuses is listed at the top of this file.
+ */
+export Decoded decode(u8[] input) {
+  Cursor c = Cursor(input, 0, "");
+  Item it = item(c);
+  if (c.error != "") { return Decoded.of(false, Item.Bytes(u8[0]()), c.error); }
+  if (c.at != input.len()) {
+    return Decoded.of(false, Item.Bytes(u8[0]()),
+      "trailing bytes: " + itoa(input.len() - c.at) + " after a complete item");
+  }
+  return Decoded.of(true, it, "");
+}
+
+/**
+ * Where the reader is, and what went wrong.
+ *
+ * A struct rather than a return value threaded through every helper, because a failure has to stop the
+ * walk without unwinding — wac has no exceptions, and a recursive descent that returns an error tuple at
+ * every level is where the checks get dropped.
+ */
+struct Cursor {
+  u8[] src;
+  i32 at;
+  string error;
+}
+
+/** One item at the cursor. Leaves `c.error` set and the cursor wherever it stopped on failure. */
+Item item(Cursor c) {
+  Item empty = Item.Bytes(u8[0]());
+  if (c.error != "") { return empty; }
+  if (c.at >= c.src.len()) {
+    c.error = "input ended where an item was expected";
+    return empty;
+  }
+  i32 tag = c.src[c.at];
+  c.at++;
+
+  if (tag < 0x80) {
+    // The byte is itself. Written before the length forms because it is the case a decoder gets wrong by
+    // treating 0x00..0x7f as a zero-length prefix.
+    u8[] one = u8[1]();
+    one[0] = tag;
+    return Item.Bytes(one);
+  }
+  if (tag <= 0xB7) { return Item.Bytes(take(c, tag - 0x80, true)); }
+  if (tag <= 0xBF) {
+    i32 len = longLength(c, tag - 0xB7);
+    if (c.error != "") { return empty; }
+    return Item.Bytes(take(c, len, false));
+  }
+  if (tag <= 0xF7) { return list(c, tag - 0xC0); }
+  i32 len = longLength(c, tag - 0xF7);
+  if (c.error != "") { return empty; }
+  return list(c, len);
+}
+
+/** `n` bytes from the cursor. `short` marks the ≤55 form, where a one-byte payload has a canonical rule. */
+u8[] take(Cursor c, i32 n, bool short) {
+  if (c.at + n > c.src.len()) {
+    c.error = "a string of " + itoa(n) + " bytes runs past the end of the input";
+    return u8[0]();
+  }
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = c.src[c.at + i]; }
+  c.at = c.at + n;
+  // `0x81 0x05` spells a byte that spells itself. Canonical RLP has one encoding per value and this is
+  // the second one, so it is invalid input rather than a tolerated variant.
+  if (short && n == 1 && out[0] < 0x80) {
+    c.error = "a single byte below 0x80 must be itself, not a one-byte string";
+  }
+  return out;
+}
+
+/** A list of `payload` bytes' worth of items, read until exactly that many are consumed. */
+Item list(Cursor c, i32 payload) {
+  Item empty = Item.Bytes(u8[0]());
+  if (c.at + payload > c.src.len()) {
+    c.error = "a list of " + itoa(payload) + " bytes runs past the end of the input";
+    return empty;
+  }
+  i32 end = c.at + payload;
+  // Grown by doubling rather than counted first: counting means decoding twice, and the members'
+  // lengths are only known by decoding them.
+  Item[] items = Item[4](fill: empty);
+  i32 n = 0;
+  while (c.at < end) {
+    Item next = item(c);
+    if (c.error != "") { return empty; }
+    if (n == items.len()) {
+      Item[] bigger = Item[items.len() * 2](fill: empty);
+      for (i32 i = 0; i < n; i++) { bigger[i] = items[i]; }
+      items = bigger;
+    }
+    items[n] = next;
+    n++;
+  }
+  if (c.at != end) {
+    // A member that ran past the list's own declared end: the list says one thing and its contents
+    // another, and which to believe is exactly the ambiguity RLP's canonicity forbids.
+    c.error = "a list's members overrun its declared length";
+    return empty;
+  }
+  Item[] exact = Item[n](fill: empty);
+  for (i32 i = 0; i < n; i++) { exact[i] = items[i]; }
+  return Item.List(exact);
+}
+
+/**
+ * The length carried by a long-form prefix: `n` big-endian bytes, checked three ways.
+ *
+ * No leading zero (canonical), above 55 (or the short form was available), and small enough to be an
+ * `i32` — a four-byte prefix can spell 4 GB and an `i32` cannot hold it, so the alternative to refusing
+ * is a negative length read as a short item.
+ */
+i32 longLength(Cursor c, i32 n) {
+  if (c.at + n > c.src.len()) {
+    c.error = "a length prefix of " + itoa(n) + " bytes runs past the end of the input";
+    return 0;
+  }
+  if (c.src[c.at] == 0) {
+    c.error = "a length prefix with a leading zero is not canonical";
+    return 0;
+  }
+  if (n > 4) {
+    c.error = "a length of " + itoa(n) + " bytes cannot fit a 32-bit size";
+    return 0;
+  }
+  i64 v = 0 as i64;
+  for (i32 i = 0; i < n; i++) { v = (v * 256) + (c.src[c.at + i] as i64); }
+  c.at = c.at + n;
+  if (v > 2147483647 as i64) {
+    c.error = "a length of " + itoa64(v) + " bytes cannot fit a 32-bit size";
+    return 0;
+  }
+  i32 len = v as~ i32;
+  if (len <= 55) {
+    c.error = "a length of " + itoa(len) + " must use the short form";
+    return 0;
+  }
+  return len;
+}

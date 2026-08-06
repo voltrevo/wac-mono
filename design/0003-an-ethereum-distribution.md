@@ -54,7 +54,7 @@ Ordered by dependency, not by intent.
 | SSZ and Merkle proofs — `packages/ssz` | **done** — 2,233 Ethereum vectors, including all 1,131 *invalid* `ssz_generic` |
 | BLS12-381 verification — `packages/bls` | **done** — all 29 Ethereum verify fixtures, ~8ms a signature |
 | keccak256 | **done** — `crypto.keccak256`, the sponge's fourth domain byte; three published vectors at three lengths, and asserted to disagree with SHA3-256 and truncated SHAKE256 |
-| RLP | not started |
+| RLP — `packages/rlp` | **done** — Ethereum's own `RLPTests`, 28 valid driven in both directions against the published bytes and 26 invalid all refused; the one rule the corpus does not cover is named in `test/vendor/README.md` |
 | ABI encoding and decoding | not started |
 | Merkle-Patricia state proofs | not started — **the gap between a verified header and reading a contract**, and the piece E2's "without trusting a provider" actually rests on |
 | ENS resolution | not started — downstream of keccak256, ABI and state proofs |
