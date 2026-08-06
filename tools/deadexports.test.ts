@@ -51,6 +51,16 @@ async function deadNames(files: Record<string, string>): Promise<string> {
   }
 }
 
+/** The unexported names the scan calls dead, sorted, so an assertion reads as a set. */
+async function deadPrivateNames(files: Record<string, string>): Promise<string> {
+  const base = await fixture(files);
+  try {
+    return (await scan(base)).privateDead.map((d) => d.name).sort().join(",");
+  } finally {
+    await Deno.remove(base, { recursive: true });
+  }
+}
+
 Deno.test("an export with a wac caller is not dead, and one without is", async () => {
   assertEquals(
     await deadNames({
@@ -252,4 +262,76 @@ Deno.test("the report names the file and line, since that is what a reader acts 
   } finally {
     await Deno.remove(base, { recursive: true });
   }
+});
+
+// ── The private half ─────────────────────────────────────────────────────────
+//
+// Added because a mutation sweep found what this could not: `packages/wactest/src/assert.wac` carried a
+// `utoa` that nothing had called since `eqU32` started printing through `utoa64`. A private function is
+// reachable only from its own file, so it is the easier question of the two, and nothing was asking it.
+
+Deno.test("an unexported function its own file never calls is dead", async () => {
+  assertEquals(
+    await deadPrivateNames({
+      "packages/demo/src/lib.wac": [
+        "i32 helper() { return 1; }",
+        "i32 orphan() { return 2; }",
+        "export i32 api() { return helper(); }",
+      ].join("\n"),
+    }),
+    "orphan",
+    "`helper` has a caller in the file; `orphan` has none anywhere it could have one",
+  );
+});
+
+Deno.test("a caller in another file does not save a private function", async () => {
+  // The case that makes this worth a separate list: wac has no way to reach another file's private
+  // function, so a same-named call elsewhere is a different symbol. Counting it would hide exactly the
+  // shape worth finding — a helper whose last caller moved out of the file and left a familiar name.
+  assertEquals(
+    await deadPrivateNames({
+      "packages/demo/src/lib.wac": "i32 helper() { return 1; }",
+      "packages/demo/src/other.wac": "export i32 api() { return helper(); }",
+    }),
+    "helper",
+  );
+});
+
+Deno.test("a struct's methods are not private functions", async () => {
+  // A method is reachable through any value of the struct, and the declaration looks identical apart
+  // from the indentation — which is why the pattern is anchored at column 0.
+  assertEquals(
+    await deadPrivateNames({
+      "packages/demo/src/lib.wac": [
+        "export struct S {",
+        "  i32 value;",
+        "  i32 twice(this) { return this.value * 2; }",
+        "}",
+      ].join("\n"),
+    }),
+    "",
+    "`twice` is a method, not a top-level function",
+  );
+});
+
+Deno.test("a private function passed as a value counts as called", async () => {
+  assertEquals(
+    await deadPrivateNames({
+      "packages/demo/src/lib.wac": [
+        "i32 double(i32 x) { return x * 2; }",
+        "export i32 run(i32 x) { fn[i32(i32)] f = double; return f(x); }",
+      ].join("\n"),
+    }),
+    "",
+  );
+});
+
+Deno.test("a probe file is exempt from the private check as well as the exported one", async () => {
+  // Test fixtures exist to be driven from TypeScript, and their helpers are theirs.
+  assertEquals(
+    await deadPrivateNames({
+      "packages/demo/test/wac/probe.wac": "i32 unusedHelper() { return 1; }",
+    }),
+    "",
+  );
 });

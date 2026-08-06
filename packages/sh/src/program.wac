@@ -393,40 +393,6 @@ string whyUnread(FileResult f) {
 }
 
 /**
- * Every operand that could be read, in order, and the ones that could not.
- *
- * For the programs whose answer does not depend on which file a line came from: GNU's `sort`, `uniq`,
- * `rev` and `nl` treat several operands as exactly a concatenation, including `nl`'s numbering, which
- * runs on across the boundary rather than restarting.
- *
- * A failure does not end it, because for three of those four it does not end GNU either: `nl missing f`
- * numbers `f` and exits 1, and only `sort` gives up on the first unreadable operand. Both are possible
- * from here — the caller decides by looking at `failed`.
- */
-struct Gathered {
-  u8[] bytes;
-  Vec<string> failed;
-  Vec<string> reasons;
-}
-
-Gathered gather(Fs fs, string cwd, Vec<string> operands, u8[] stdin) {
-  Vec<string> names = inputsOf(operands);
-  Buf out = Buf.create();
-  Vec<string> failed = Vec.create();
-  Vec<string> reasons = Vec.create();
-  for (i32 i = 0; i < names.len(); i++) {
-    Reading r = readOne(fs, cwd, names.get(i), stdin);
-    if (!r.ok) {
-      failed.push(r.name);
-      reasons.push(r.error);
-      continue;
-    }
-    out.pushAll(r.bytes);
-  }
-  return Gathered(out.take(), failed, reasons);
-}
-
-/**
  * Whether GNU's version of this program has this option — which decides what a refusal *says*.
  *
  * Two messages, because they are two different facts. A letter GNU does not have either is a mistake in
@@ -723,19 +689,6 @@ void complain(Sink sink, Sink errs, string line) {
   sink.flush();
   errs.bytes(line.toBytes());
   errs.flush();
-}
-
-/** Everything left of a feed, a chunk at a time, holding a chunk. */
-i32 catStream(Feed fed, Sink sink) {
-  while (true) {
-    u8[] chunk = fed.next();
-    if (chunk.len() == 0) { break; }
-    // A refused write is the reader having gone — `cat big | head -1`. Stopping is the answer, and
-    // the status is still 0: nothing failed.
-    if (!sink.bytes(chunk)) { return 0; }
-  }
-  sink.flush();
-  return 0;
 }
 
 /**

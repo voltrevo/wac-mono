@@ -246,3 +246,32 @@ takes twenty minutes for a package and cannot be fooled by a name.
 
 Deleted, along with the stale import. The floor is still a floor, and the honest fix — resolving names
 rather than matching them — remains unwritten rather than approximated.
+
+## The check now sees inside a file — agent-a, 2026-08-06
+
+`deno task dead` read exports only, so a *private* function nothing called was invisible to it. That is
+the easier question of the two — a private function is reachable from its own file and nowhere else — and
+nothing was asking it. What found the first one was a mutation sweep: `packages/wactest/src/assert.wac`
+carried a `utoa` that had had no caller since `eqU32` started printing through `utoa64`, and the surviving
+mutant was the only report this repo produced for it. A sweep costs minutes and a list to read; this costs
+a second.
+
+The scan now returns `privateDead` beside `dead`, and the report prints it as its own section:
+
+    3 unexported function(s) that their own file never calls:
+      packages/sh/src/program.wac
+        :412  gather
+        :729  catStream
+      packages/tor/src/hsntor.wac
+        :95   slice
+
+All three are deleted, along with `Gathered`, the struct only `gather` produced. `--strict` counts them
+too, because unlike an export they have only one answer: nothing outside the file could ever have been
+the caller.
+
+Two shapes are deliberately not reported. A **struct method** looks identical apart from indentation, so
+the pattern is anchored at column 0 — a method is reachable through any value of the struct. A
+**self-recursive** dead function looks used, and separating that from a real call needs the body's extent
+rather than a line search; it is left rather than guessed at, and said here rather than discovered later.
+
+Exported dead is 21 → **20** with `tokenText` gone (see 0005).

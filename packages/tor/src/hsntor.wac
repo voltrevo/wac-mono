@@ -92,12 +92,6 @@ u8[] concat(u8[][] parts) {
   return out;
 }
 
-u8[] slice(u8[] s, i32 from, i32 to) {
-  u8[] o = u8[to - from]();
-  for (i32 i = 0; i < o.len(); i++) { o[i] = s[from + i]; }
-  return o;
-}
-
 bool isZero(u8[] b) {
   i32 acc = 0;
   for (i32 i = 0; i < b.len(); i++) { acc = acc | b[i]; }

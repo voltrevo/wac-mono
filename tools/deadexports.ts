@@ -83,11 +83,33 @@ export const TS_ROOTS = [...WAC_ROOTS, "tools"];
 /** `export <type> name(` — the shapes wac declares a function in. */
 const EXPORT = /^\s*export\s+(?:[A-Za-z_][\w]*(?:\[\])*|void|bool|i32|i64|u8|u32|u64|f32|f64)(?:\[\])*\s+([a-zA-Z_]\w*)\s*\(/;
 
+/**
+ * The same shape without `export`, and anchored at column 0.
+ *
+ * A private function can only be called from its own file, so it is *easier* to be sure about than an
+ * exported one — and nothing was looking. `packages/wactest/src/assert.wac` carried a `utoa` that nothing
+ * had called since `eqU32` started printing through `utoa64`, and it took a mutation sweep to notice: the
+ * surviving mutant was the only report this repo produced for it. A sweep costs minutes and a list that
+ * has to be read; this costs a second.
+ *
+ * Column 0 is what keeps struct methods out — a wac struct's body is indented, and a method is reachable
+ * through any value of the struct rather than by name alone.
+ */
+const PRIVATE = /^(?:[A-Za-z_][\w]*(?:\[\])*|void|bool|i32|i64|u8|u32|u64|f32|f64)(?:\[\])*\s+([a-zA-Z_]\w*)\s*\(/;
+
 export type Decl = { name: string; file: string; line: number };
 
 /** What one scan found: every export, and the ones with no caller. */
 export type Exemption = { file: string; reason: string };
-export type Scan = { decls: Decl[]; dead: Decl[]; files: string[]; exempt: Exemption[] };
+export type Scan = {
+  decls: Decl[];
+  dead: Decl[];
+  files: string[];
+  exempt: Exemption[];
+  /** Unexported functions, and the ones their own file never mentions again. */
+  privates: Decl[];
+  privateDead: Decl[];
+};
 
 /**
  * A file's lines with strings and comments taken out, line numbering preserved.
@@ -175,6 +197,7 @@ export async function scan(base = "."): Promise<Scan> {
   const exempt: Exemption[] = [];
 
   const decls: Decl[] = [];
+  const privates: Decl[] = [];
   for (const f of files) {
     if (isProbe(f)) continue;
     const claim = EXEMPT.exec(source.get(f)!);
@@ -185,6 +208,8 @@ export async function scan(base = "."): Promise<Scan> {
     source.get(f)!.split("\n").forEach((line, i) => {
       const m = EXPORT.exec(line);
       if (m) decls.push({ name: m[1], file: f, line: i + 1 });
+      const q = PRIVATE.exec(line);
+      if (q) privates.push({ name: q[1], file: f, line: i + 1 });
     });
   }
 
@@ -289,7 +314,17 @@ export async function scan(base = "."): Promise<Scan> {
   const dead = decls.filter((d) =>
     callers(d.name, d.file, d.line).length === 0 && namedFromTypeScript(d.name, d.file).length === 0
   );
-  return { decls, dead, files, exempt };
+  // Its own file and nowhere else. A private name that appears in another file is a different symbol —
+  // wac has no way to reach this one — so counting those hits would hide exactly the case worth finding,
+  // which is a helper whose last caller moved away and left a name that still reads as familiar.
+  //
+  // Recursion is the one shape this cannot see: a function that only calls itself looks used. It is still
+  // dead, and finding it needs the body's extent rather than a line search, so it is left rather than
+  // guessed at.
+  const privateDead = privates.filter((d) =>
+    callers(d.name, d.file, d.line).every((hit) => !hit.startsWith(`${d.file}:`))
+  );
+  return { decls, dead, files, exempt, privates, privateDead };
 }
 
 /** The report, as the command line prints it. Returned rather than printed so a test can read it. */
@@ -299,15 +334,22 @@ export function report(scan: Scan): string {
   const notes = scan.exempt.length === 0 ? "" : `${scan.exempt.length} file(s) exempt by their own note:\n` +
     scan.exempt.map((e) => `  ${e.file} — ${e.reason === "" ? "no reason given" : e.reason}`).join("\n") +
     "\n\n";
+  // The private section, printed whichever way the export verdict goes: a file can be clean of dead
+  // exports and still carry a helper nothing calls, and that is the case this was blind to.
+  const privateNote = scan.privateDead.length === 0 ? "" : `\n\n${scan.privateDead.length} ` +
+    `unexported function(s) that their own file never calls:\n` +
+    [...groupByFile(scan.privateDead)].sort().map(([f, ds]) =>
+      `  ${f}\n` + ds.map((d) => `    :${String(d.line).padEnd(4)} ${d.name}`).join("\n")
+    ).join("\n") +
+    "\n\nA private function is only reachable from its own file, so there is no second answer here:\n" +
+    "either a call site is missing or the function is.";
+
   if (scan.dead.length === 0) {
     return notes +
-      `no dead exports across ${scan.decls.length} exported functions in ${scan.files.length} files`;
+      `no dead exports across ${scan.decls.length} exported functions in ${scan.files.length} files` +
+      privateNote;
   }
-  const byFile = new Map<string, Decl[]>();
-  for (const d of scan.dead) {
-    if (!byFile.has(d.file)) byFile.set(d.file, []);
-    byFile.get(d.file)!.push(d);
-  }
+  const byFile = groupByFile(scan.dead);
   const lines = [notes + `${scan.dead.length} exported function(s) that no wac code calls:\n`];
   for (const [f, ds] of [...byFile].sort()) {
     lines.push(`  ${f}`);
@@ -318,7 +360,17 @@ export function report(scan: Scan): string {
     "literal it was written instead of — or one worth deleting. A constant no code\n" +
     "consults documents nothing and cannot be wrong in a way a test would notice.",
   );
-  return lines.join("\n");
+  return lines.join("\n") + privateNote;
+}
+
+/** Declarations by the file they are in. */
+function groupByFile(ds: Decl[]): Map<string, Decl[]> {
+  const byFile = new Map<string, Decl[]>();
+  for (const d of ds) {
+    if (!byFile.has(d.file)) byFile.set(d.file, []);
+    byFile.get(d.file)!.push(d);
+  }
+  return byFile;
 }
 
 if (import.meta.main) {
@@ -328,5 +380,8 @@ if (import.meta.main) {
   // packages other people are working in, and a check that turns somebody else's tree red
   // the day it lands is a check that gets deleted rather than acted on. `--strict` is there
   // for whoever wants it in a pipeline once their own package is clear.
-  Deno.exit(found.dead.length === 0 || !Deno.args.includes("--strict") ? 0 : 1);
+  // Private dead code counts towards `--strict` as well: it has one answer rather than two, since
+  // nothing outside its file could ever have been the caller.
+  const total = found.dead.length + found.privateDead.length;
+  Deno.exit(total === 0 || !Deno.args.includes("--strict") ? 0 : 1);
 }
