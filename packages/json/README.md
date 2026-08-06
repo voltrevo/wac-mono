@@ -109,12 +109,12 @@ that used to look like and is kept only to say what changed.
 | 2 ulp | 0.4% |
 
 The serializer writes a parsed number from the source span retained on
-`JsonNumber`, so a round-trip is byte-exact: `1e2` comes back as `1e2`, `1.50`
-keeps its trailing zero, and `-0` keeps its sign — none of which survives a trip
-through the shortest decimal.
+`JsonValue.Number(value, raw)`, so a round-trip is byte-exact: `1e2` comes back as
+`1e2`, `1.50` keeps its trailing zero, and `-0` keeps its sign — none of which
+survives a trip through the shortest decimal.
 
-A number with no span — `JsonNumber.ofValue(x)`, a tree built by hand — is
-formatted by `packages/fmt` to its shortest round-tripping form instead.
+A number with no span — `numberOf(x)`, a tree built by hand — is formatted by
+`packages/fmt` to its shortest round-tripping form instead.
 
 ## Deliberate divergences from `JSON.parse`
 
