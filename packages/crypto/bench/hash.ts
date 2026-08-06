@@ -16,7 +16,7 @@
 // subtraction every hash here looked 2-3x slower than it is, which is the trap in benchmarking through a
 // boundary you cannot allocate across.
 
-import { createHash } from "node:crypto";
+import { createCipheriv, createHash } from "node:crypto";
 import { wacBind } from "../../../harness/wacBind.ts";
 
 const probe = await wacBind("packages/crypto/test/wac/bench_probe.wac") as Record<string, unknown>;
@@ -26,6 +26,7 @@ const fns: [string, (n: number) => Uint8Array][] = [
   ["sha512", probe.benchSha512 as (n: number) => Uint8Array],
   ["keccak256", probe.benchKeccak as (n: number) => Uint8Array],
   ["sha3-256", probe.benchSha3 as (n: number) => Uint8Array],
+  ["chacha20", probe.benchChacha as (n: number) => Uint8Array],
 ];
 
 const MB = 1024 * 1024;
@@ -60,7 +61,18 @@ for (const [name, fn] of fns) {
     const ms = Math.max(0.001, best(() => fn(n)) - buildMs);
     const host = name === "keccak256" ? null : name === "sha3-256" ? "sha3-256" : name;
     let baseline = "";
-    if (host !== null) {
+    if (name === "chacha20") {
+      // Node has no bare `chacha20`, only the AEAD — so the baseline includes Poly1305 over the same
+      // bytes, which makes it *slower* than the cipher alone. It is a floor on OpenSSL, not its speed.
+      const bytes = message(n);
+      const key = new Uint8Array(32).map((_, i) => i);
+      const hostMs = best(() => {
+        const c = createCipheriv("chacha20-poly1305", key, new Uint8Array(12), { authTagLength: 16 });
+        c.update(bytes);
+        c.final();
+      });
+      baseline = `   node ${(mb / (hostMs / 1000)).toFixed(0)} MB/s  (${(ms / hostMs).toFixed(1)}x slower, +poly1305)`;
+    } else if (host !== null) {
       const bytes = message(n);
       const hostMs = best(() => { createHash(host).update(bytes).digest(); });
       baseline = `   node ${(mb / (hostMs / 1000)).toFixed(0)} MB/s  (${(ms / hostMs).toFixed(1)}x slower)`;
