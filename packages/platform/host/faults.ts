@@ -24,6 +24,21 @@ export const FAULT_OTHER = 5;
 export const FAULT_NOT_REPRESENTABLE = 6;
 
 /**
+ * The program was not given this capability.
+ *
+ * Not an operating-system failure at all, which is why it is its own category rather than `FAULT_DENIED`
+ * beside a real `EACCES`. The distinction is the one this whole world is about — "the file said no" and
+ * "you were never handed the filesystem" call for different responses from whoever reads the message —
+ * and it is the one case where the *host's own words* are worth more than a translation: `faultWords`
+ * has no phrase for it, so a caller falls through to "filesystem read not granted to this application",
+ * which no four-word errno phrase can say.
+ *
+ * The categories here are otherwise deliberately few (see the header). This one is not errno granularity;
+ * it is the boundary between the OS and the grant.
+ */
+export const FAULT_NOT_GRANTED = 7;
+
+/**
  * A fault a host had to name itself, because its filesystem does not report one.
  *
  * OPFS is the case that needs it: it has no exclusive create, so "already exists" is a question the

@@ -419,6 +419,20 @@ export i32 FAULT_OTHER() { return 5; }
 export i32 FAULT_NOT_REPRESENTABLE() { return 6; }
 
 /**
+ * The program was not given this capability.
+ *
+ * Not an operating-system failure, which is why it is not `FAULT_DENIED`: that one is the file saying no,
+ * and this one is the program never having been handed the file. A caller wants to say different things
+ * about them, and until this existed it could not tell them apart — a withheld filesystem and a
+ * `chmod 000` were the same category with different sentences.
+ *
+ * **`faultWords` deliberately has no phrase for it.** The host's own message — "filesystem read not
+ * granted to this application" — says what no four-word errno phrase can, so a caller that falls back to
+ * the message when the category has no words prints exactly the right thing.
+ */
+export i32 FAULT_NOT_GRANTED() { return 7; }
+
+/**
  * A fault in the words the real tools use, or `""` where the category has none to give.
  *
  * One table, because there were four: `sh` had one for a `Change` and another for a `FileResult`, `box`
@@ -784,14 +798,18 @@ export struct Cli {
    * `readChunk` answers with an empty array at end of input, and with at most
    * `CHUNK` bytes otherwise. A short chunk does not mean the end.
    *
-   * `openInput` answers with the empty string on success and the host's message
-   * otherwise, exactly as `FileResult.error` does. A bool would have been enough for the
-   * applet to exit 1, and would have cost the reason — `cat: README.md: cannot read`
-   * instead of `cat: README.md: filesystem read not granted to this application`. The
-   * distinction between "no such file" and "you were not given the filesystem" is the one
-   * thing a person needs from this message.
+   * `openInput` answers with a `Change`: `FAULT_NONE` when the source was selected, and a
+   * category with the host's words when it was not.
+   *
+   * **A `Change` and not a bare message**, which is what this used to be, for the reason
+   * `openOutput` was changed first: a message alone cannot be translated. `readFile` carries a
+   * fault and its callers print what GNU prints; this carried the host's sentence, so
+   * `cat missing` said `No such file or directory (os error 2): open '/tmp/x'` where the whole-file
+   * path said `No such file or directory` — the same failure, worded two ways in one program,
+   * depending on whether the applet happened to stream. That is the drift `faultWords` exists to
+   * end, and it survived in the streaming half until a differential test against `cat` caught it.
    */
-  fn[Pending<string>(string)] openInput;
+  fn[Pending<Change>(string)] openInput;
   /**
    * **Blocking, unlike its neighbours**, and so is `write`.
    *
@@ -1049,7 +1067,7 @@ export struct Cli {
     fn[Pending<Change>(string, bool)] mkdir,
     fn[Pending<Change>(string, bool)] remove,
     fn[Pending<Change>(string, string)] rename,
-    fn[Pending<string>(string)] openInput,
+    fn[Pending<Change>(string)] openInput,
     fn[Read()] readChunk,
     fn[Pending<string>()] outputError,
     fn[Pending<Change>(string)] openOutput,

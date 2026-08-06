@@ -14,7 +14,7 @@ import { browserWorld, type DirHandle, type FileHandle } from "../host/browser.t
 import { WORKER_MARKER } from "../host/children.ts";
 import { i32le, readI32le, str, unstr } from "../host/call.ts";
 import { OP } from "../host/ops.ts";
-import { FAULT_DENIED, STAT_BYTES, STAT_FAULT } from "../host/faults.ts";
+import { FAULT_DENIED, FAULT_NOT_FOUND, STAT_BYTES, STAT_FAULT } from "../host/faults.ts";
 
 /**
  * The bytes out of a `Read` payload: tag 0 is data, 1 is the end, 2 is a failure.
@@ -515,15 +515,11 @@ Deno.test("a failed read says what a failed change says", async () => {
   }
   assertEquals(said, "no such file or directory", said);
 
-  // `openInput` reports the same failure as a message rather than a throw, one layer up, and has to
-  // agree with it.
-  let opened = "";
-  try {
-    await w[OP.OPEN_INPUT](str("nothing-here")) as Uint8Array;
-  } catch (e) {
-    opened = e instanceof Error ? e.message : String(e);
-  }
-  assertEquals(opened, "no such file or directory", opened);
+  // `openInput` answers a `Change` now rather than throwing, so the agreement is between the phrase in
+  // that answer and the phrase in the throw above — the same words either way, which is the whole claim.
+  const change = await w[OP.OPEN_INPUT](str("nothing-here")) as Uint8Array;
+  assertEquals(change[0], FAULT_NOT_FOUND, `fault ${change[0]}`);
+  assertEquals(new TextDecoder().decode(change.subarray(1)), "no such file or directory");
 });
 
 Deno.test("a page spawns a worker of its own — 0030", async () => {

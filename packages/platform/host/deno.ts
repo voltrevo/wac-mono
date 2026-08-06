@@ -22,13 +22,15 @@ import { GRANT_ENV, GRANT_NET, GRANT_READ, GRANT_WRITE, OP } from "./ops.ts";
 import { ChildStack, joinPath, packCaptured, unpackPush } from "./child.ts";
 import { ByteQueue } from "./queue.ts";
 import {
-  changeBytes,
-  changed,
   CHANGED_OK,
   FAULT_DENIED,
-  pathFailure,
+  FAULT_NOT_GRANTED,
+  Faulted,
   STAT_BYTES,
   STAT_FAULT,
+  changeBytes,
+  changed,
+  pathFailure,
   statFault,
 } from "./faults.ts";
 
@@ -230,7 +232,11 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
   const args = opts.args ?? [];
   const log = opts.log ?? ((l: string) => console.log(l));
   const warn = opts.warn ?? ((l: string) => console.error(l));
-  const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
+  // `Faulted`, so a withheld capability arrives as its own category rather than as an `EACCES` lookalike:
+  // `FAULT_DENIED` is the file saying no, and this is the program never having been given the file.
+  const deny = (what: string) => {
+    throw new Faulted(FAULT_NOT_GRANTED, `${what} not granted to this application`);
+  };
   const writeOut = opts.write;
   const writeErrOut = opts.writeErr;
   const selfSource = opts.selfSource;
@@ -581,11 +587,15 @@ export function denoWorld(opts: DenoWorldOptions = {}): Handlers {
       const path = unstr(p);
       source?.close();
       source = null;
-      if (path === "") return EMPTY;      // standard input, and the default
-      if (!opts.fs?.read) deny("filesystem read");
+      if (path === "") return CHANGED_OK;      // standard input, and the default
+      // `changed`, so "not there" is `FAULT_NOT_FOUND` and the caller can say what `cat` says —
+      // the streaming half used to answer with the host's sentence while `readFile` answered a
+      // category, which is one program wording one failure two ways.
+      if (!opts.fs?.read) return changeBytes(FAULT_NOT_GRANTED, "filesystem read not granted to this application");
       const full = P(path);
-      source = await onPath(full, () => Deno.open(full, { read: true }));
-      return EMPTY;
+      return await changed(async () => {
+        source = await onPath(full, () => Deno.open(full, { read: true }));
+      });
     },
     [OP.READ_CHUNK]: async () => {
       // A pushed child reads what it was fed and then end of input — never the parent's own

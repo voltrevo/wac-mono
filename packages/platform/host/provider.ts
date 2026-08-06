@@ -435,7 +435,9 @@ export function cliOf(
     (from: string, to: string) => T.change(submit(b, OP.RENAME, twoPaths(from, to))),
 
     /*= openInput */
-    (path: string) => T.outcome(submit(b, OP.OPEN_INPUT, str(path))),
+    // `change`, not `outcome`, for the same reason `openOutput` uses it: a category the caller can put
+    // into its own words, rather than an errno in somebody's shell diagnostic.
+    (path: string) => T.change(submit(b, OP.OPEN_INPUT, str(path))),
     /*= readChunk */
     // Blocking, and it answers the three states directly — no ticket, and no way to mistake a broken
     // read for the end of the input.

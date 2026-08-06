@@ -3,7 +3,7 @@
 // That an applet works in a pipe at all is this file: without `readStdin` every one of
 // them would be a file-to-file tool.
 
-import { Cli, Core, faultWords, FileResult } from "../../../platform/src/platform.wac";
+import { Change, Cli, Core, faultWords, FileResult } from "../../../platform/src/platform.wac";
 import { Args } from "./args.wac";
 
 export struct Input { bool ok; u8[] bytes; string label; }
@@ -32,9 +32,12 @@ export string whyUnread(FileResult f) {
  */
 export Input openStream(Core core, Cli cli, Args a, i32 n) {
   string path = a.rest.len() <= n ? "" : a.rest[n];
-  string error = cli.openInput(path).wait();
-  if (error == "") { return Input(true, u8[0](), path); }
-  core.warn(a.name + ": " + path + ": " + error);
+  Change opened = cli.openInput(path).wait();
+  if (opened.ok()) { return Input(true, u8[0](), path); }
+  // The same translation the whole-file path does, which is the point of the `Change`: `cat missing`
+  // now says what `cat` says instead of the host's sentence about `open '/tmp/x'`.
+  string words = faultWords(opened.fault);
+  core.warn(a.name + ": " + path + ": " + (words == "" ? opened.message : words));
   return Input(false, u8[0](), path);
 }
 

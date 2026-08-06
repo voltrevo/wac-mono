@@ -29,12 +29,14 @@ import {
 import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
 import {
-  changeBytes,
-  changed,
   CHANGED_OK,
   FAULT_DENIED,
+  FAULT_NOT_GRANTED,
+  Faulted,
   STAT_BYTES,
   STAT_FAULT,
+  changeBytes,
+  changed,
   statFault,
 } from "./faults.ts";
 
@@ -284,7 +286,11 @@ export function nodeWorld(
     errStreams.set(eh, child.err);
     return twoHandles(h, eh, "");
   };
-  const deny = (what: string) => { throw new Error(`${what} not granted to this application`); };
+  // `Faulted`, so a withheld capability arrives as its own category rather than as an `EACCES` lookalike:
+  // `FAULT_DENIED` is the file saying no, and this is the program never having been given the file.
+  const deny = (what: string) => {
+    throw new Faulted(FAULT_NOT_GRANTED, `${what} not granted to this application`);
+  };
 
   // A program running inside this one. `P` is the identity when nothing is pushed.
   const kids = new ChildStack();
@@ -495,10 +501,12 @@ export function nodeWorld(
       const path = unstr(p);
       await source?.close();
       source = null;
-      if (path === "") return EMPTY;
-      if (!opts.fs?.read) deny("filesystem read");
-      source = await io.openFile(P(path));
-      return EMPTY;
+      if (path === "") return CHANGED_OK;
+      // A category rather than the host's sentence, as `openOutput` above — see `platform.wac`.
+      if (!opts.fs?.read) return changeBytes(FAULT_NOT_GRANTED, "filesystem read not granted to this application");
+      return await changed(async () => {
+        source = await io.openFile(P(path));
+      });
     },
     [OP.READ_CHUNK]: async () => {
       const fed = source === null ? kids.readChunk() : null;

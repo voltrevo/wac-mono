@@ -499,6 +499,48 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     assertEquals(dashA.code, 2, `ls -a should be a usage error: ${JSON.stringify(dashA.err)}`);
     assertEquals(dashA.err.includes("not implemented"), true, dashA.err);
 
+    // A directory of its own for the two unreadable paths, so nothing else in this test can see them.
+    const fixtureDir = await Deno.makeTempDir({ prefix: "wac-box-fail-" });
+    // **A failed read says what the real tool says.** The words come from `faultWords` in
+    // `platform.wac`, which exists because four copies of this list had already drifted — and nothing
+    // compared any of them to the tool they imitate. Replacing `lib/input`'s `whyUnread` with the empty
+    // string left every one of these messages ending in a bare colon, and the suite green.
+    const denied = `${fixtureDir}/unreadable`;
+    await Deno.writeTextFile(denied, "secret\n");
+    await Deno.chmod(denied, 0o000);
+    for (const path of [`${fixtureDir}/definitely-not-here`, denied]) {
+      const ours = await box(["cat", path]);
+      const theirs = new Deno.Command("cat", {
+        args: [path],
+        env: { LC_ALL: "C", PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin" },
+        clearEnv: true,
+        stdout: "null",
+        stderr: "piped",
+      }).outputSync();
+      // After the program name: `Deno.Command` resolves `cat` through PATH and hands it that path as
+      // argv[0], so the real one says `/usr/bin/cat:` where ours says `cat:`. The reason is the claim.
+      const reason = (line: string) => line.trim().split(": ").slice(1).join(": ");
+      assertEquals(
+        reason(ours.err),
+        reason(new TextDecoder().decode(theirs.stderr)),
+        `the reason a read failed differs from cat's: ${ours.err.trim()}`,
+      );
+      assertEquals(ours.code, 1, "a failed read exits 1, as cat does");
+    }
+
+    // The usage message lists every applet, wrapped. Nothing looked at it, so `wrapped` could return the
+    // empty string — and the list of what this program can do would simply be missing.
+    const help = await box([]);
+    assertEquals(help.code, 2, "no applet is a usage error");
+    for (const name of ["cat", "grep", "sha256sum", "zstd"]) {
+      assertEquals(help.err.includes(name), true, `usage does not list ${name}:\n${help.err}`);
+    }
+    const appletLines = help.err.split("\n").filter((l) => l.startsWith("  ") && !l.includes(":"));
+    assertEquals(appletLines.length > 1, true, `the applet list is not wrapped at all:\n${help.err}`);
+    for (const line of appletLines) {
+      assertEquals(line.length <= 74, true, `a usage line is ${line.length} wide: ${line}`);
+    }
+
     // head and tail against a file with more lines than they take.
     const many = await Deno.makeTempFile();
     try {

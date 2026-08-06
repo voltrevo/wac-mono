@@ -49,16 +49,17 @@ import {
 import { bridgeOf, newBridge } from "./layout.ts";
 import { serveHostCalls } from "./respond.ts";
 import {
-  changeBytes,
-  changed,
   CHANGED_OK,
-  faultOf,
   FAULT_DENIED,
   FAULT_EXISTS,
+  FAULT_NOT_GRANTED,
   Faulted,
-  phraseOf,
   STAT_BYTES,
   STAT_FAULT,
+  changeBytes,
+  changed,
+  faultOf,
+  phraseOf,
 } from "./faults.ts";
 
 const EMPTY = new Uint8Array(0);
@@ -316,7 +317,7 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
    * denial test caught exactly that when the read path started rephrasing.
    */
   const deny = (what: string): never => {
-    throw new Faulted(FAULT_DENIED, `${what} not granted to this application`);
+    throw new Faulted(FAULT_NOT_GRANTED, `${what} not granted to this application`);
   };
 
   const root = (): DirHandle => opts.root ?? deny("filesystem read");
@@ -731,14 +732,17 @@ export function browserWorld(opts: BrowserWorldOptions = {}): Handlers {
       }, describeAsPhrase);
     },
 
-    [OP.OPEN_INPUT]: (p) =>
-      readOrPhrase(async () => {
-        const path = unstr(p);
-        source = null;
-        if (path === "") return EMPTY;             // "standard input", which is empty here
+    [OP.OPEN_INPUT]: async (p) => {
+      const path = unstr(p);
+      source = null;
+      if (path === "") return CHANGED_OK;          // "standard input", which is empty here
+      // `changed` rather than `readOrPhrase`: this answers a `Change` now, so a failure is a category
+      // in the reply instead of an exception in the envelope — the same shape `OPEN_OUTPUT` uses, with
+      // the same phrase policy for a browser's boilerplate messages (issue 0025).
+      return await changed(async () => {
         source = { blob: await fileOf(path), at: 0 };
-        return EMPTY;
-      }),
+      }, describeAsPhrase);
+    },
     [OP.READ_CHUNK]: async () => {
       const fed = source === null ? kids.readChunk() : null;
       if (fed !== null) return fed.length === 0 ? END : data(fed);

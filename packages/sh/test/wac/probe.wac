@@ -183,8 +183,8 @@ Pending<Change> fakeRemove(string path, bool recursive) {
 Pending<Change> fakeRename(string from, string to) {
   return Pending.of(FAULT_NONE(), resolveChange, alwaysSettled, ignoreDrop);
 }
-Pending<string> fakeOpenInput(string path) {
-  return Pending.of(0, resolveEmpty, alwaysSettled, ignoreDrop);
+Pending<Change> fakeOpenInput(string path) {
+  return Pending.of(FAULT_NONE(), resolveChange, alwaysSettled, ignoreDrop);
 }
 /**
  * A `Read`, always `End` — this fake filesystem has nothing to stream.
@@ -371,7 +371,7 @@ export i32 shTouchStubs() {
   if (c.mkdir("d", true).wait().ok()) { n++; }
   if (c.remove("d", true).wait().ok()) { n++; }
   if (c.rename("a", "b").wait().ok()) { n++; }
-  n += c.openInput("x").wait().len();
+  n += c.openInput("x").wait().fault;
   if (c.openOutput("x").wait().ok()) { n++; }
   n += c.connect("h", 1).wait().handle + c.listen("127.0.0.1", 1).wait().handle + c.accept(1).wait().handle;
   if (c.send(1, u8[0]()).wait()) { n++; }
