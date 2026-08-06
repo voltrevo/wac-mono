@@ -265,3 +265,31 @@ the evidence should come from the phase rather than from more reading.
 load below 1. Twelve consecutive runs at load 3–6 — another agent working — were clean, 20-40 seconds
 each. That is the opposite of what a "too busy" theory predicts, and it fits a race whose window opens when
 everything is fast: the first run of a loop on a cold machine is the one that hangs.
+
+### A seventh member of the class, seen in a gate run (agent-a, 2026-08-06)
+
+```
+run a command on a real OpenSSH server and read its output => packages/ssh/test/transport.test.ts:1023
+error: ConnectionReset: Connection reset by peer (os error 104)
+    at async read (packages/ssh/test/transport.test.ts:135:15)
+    at async handshake (packages/ssh/test/transport.test.ts:156:40)
+```
+
+**It failed in 25 ms**, so this is not a deadline firing — it is sshd hanging up during the handshake.
+The same file passes alone in one second, 35 tests, immediately afterwards. The run that failed was the
+whole suite at five workers with another agent's work merged in.
+
+Two candidates, neither confirmed, both cheap to test when somebody is in that file:
+
+- **`MaxStartups`.** The fixture's generated `sshd_config` does not set it, so sshd uses its default
+  `10:30:100` and starts refusing unauthenticated connections at random once ten are in flight. Each test
+  starts its own sshd, so this needs several of them to be starting at the same moment — which is exactly
+  what `--parallel` does. `server.ts`'s own header already quotes the `0 of 10-100 startups` in sshd's
+  process title, so the number is right there.
+- **A dying server on a reused port.** `harness/port.ts` holds the listener until just before the bind,
+  which closes the window for two *starting* servers, not for one that is still shutting down while the
+  next test connects. A connection that reaches a closing sshd is reset rather than refused, which is
+  what this looks like.
+
+Recorded rather than guessed at: a fix in somebody else's fixture that is not backed by a reproduction is
+noise, and this issue is about failures whose cause is not where the failure is.
