@@ -740,3 +740,42 @@ and digesting the wrong bytes — all caught. Splitting the microdesc path on `+
 microdescriptors for a request naming none of them — caught. **Case-folding the base64 comparison
 survived**, because no test asked for a digest with its case changed; an assertion for it was added
 and the same fault is caught now.
+
+### A network with no C in it
+
+Step 5's *done* condition: "the suite stands up a network with no C in it and a client fetches through
+three of our relays." The condition is met. The deliverable it belongs to is not yet — see below.
+
+Nothing in this run is C tor. Our `gendesc` produced the documents, our `dird` served them, three of
+our `relayd` carried the traffic, and our `socks.wac` was the client:
+
+    control: direct fetch gave 4004 bytes
+    consensus verified: 1 of 1 authorities signed
+    guard: wacrelay3
+    building circuit 0 for port 8088
+    circuit 0 for port 8088: wacrelay3 -> wacrelay -> wacrelay2
+    stream 1 -> 192.168.80.2:8088 on circuit 0
+    stream 1 ended: done
+    fetch attempt 1 exit 0 bytes 4004
+    BODY: identical to the file the server holds
+
+and on the exit relay's side, `stream … open to 192.168.80.2:8088`.
+
+Every seam in that path has our code on **both** sides — our TLS client against our TLS server, our
+link initiator against our link responder, our consensus reader against our consensus writer, our
+microdescriptor reader against our writer, our `RELAY_BEGIN` against our exit. That is exactly the
+arrangement D1 says proves the least, and it is why this is reported next to the C tor run rather than
+instead of it: the same code reached `Bootstrapped 100% (done)` with tor 0.4.7.13 on the other side of
+the directory, and carried a stream for it. Two mutually-blind witnesses to the same path.
+
+Worth keeping from the way this arrived: `app.wac` was tried first and answered
+`the directory answered 404`. That was not a bug — `app.wac` fetches *directory* paths over
+`BEGIN_DIR`, which is what its header says, and 404 is the correct answer for `/probe.txt`. It had
+already proved the interesting half by then (`consensus verified`, `circuit built, 3 hops`), and the
+program that opens an ordinary stream is `socks.wac`. Reading the failure as the client being broken
+would have cost an hour looking at working code.
+
+**What is still owed for step 5.** The step asks for a *launcher* — "bring up a mixed network from a
+description, wait for bootstrap, run something across it, tear it down" — and what stood this network
+up is a shell script in a scratch directory, not a program in this repo, and not something the suite
+runs. The condition is evidence that the launcher has something to launch; it is not the launcher.
