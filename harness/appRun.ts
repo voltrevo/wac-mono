@@ -47,6 +47,15 @@ export type RunResult = {
 };
 
 export type RunOptions = {
+  /**
+   * Called with the phase this run is in, for a caller that narrates a wedge.
+   *
+   * wac-mono 0082: four corpus cases hung for ten minutes, and the narration could say which *half* of
+   * each case was stuck — `[wacsh]`, ours rather than bash — but not which await inside it. There are
+   * three candidates and they are different bugs: the child never reports ready, the child never exits,
+   * or its output queues are never ended so the drain does not finish.
+   */
+  note?: (what: string) => void;
   /** What the program reads as its standard input. Absent means it reads nothing. */
   stdin?: string | Uint8Array;
   /**
@@ -136,6 +145,8 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
         () => newBridge(),
       );
 
+      const note = opts.note ?? (() => {});
+      note("loading");
       const why = await child.loaded;
       if (why !== "") throw new Error(`${entry} did not load: ${why}`);
 
@@ -148,6 +159,7 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
       //
       // `rest()` releases room as it takes chunks, so starting it first drains continuously and the
       // size stops mattering. `shutdown()` ends both queues, which is what lets these resolve.
+      note("running");
       const draining = Promise.all([child.out.rest(), child.err.rest()]);
 
       // Standard input is whatever the caller gave, then end — a program that reads to the end has
@@ -158,7 +170,9 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
       child.in.end();
 
       const code = await child.exit;
+      note("draining");
       const [bytes, errBytes] = await draining;
+      note("done");
       return { code, out: dec.decode(bytes), err: dec.decode(errBytes), bytes };
     },
   };

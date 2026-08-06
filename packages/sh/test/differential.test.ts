@@ -1135,10 +1135,10 @@ const SH_ENV: Record<string, string> = {
   HOME: Deno.env.get("HOME") ?? "",
 };
 
-async function wacsh(script: string) {
+async function wacsh(script: string, note?: (what: string) => void) {
   // No standard input, as for bash above: the comparison is of scripts, not of terminals. The
   // runner ends the input stream at once when none is given, which is what `stdin: "null"` did.
-  const r = await sh.run(["-c", script], { env: SH_ENV });
+  const r = await sh.run(["-c", script], { env: SH_ENV, note });
   return { stdout: r.out, code: r.code, stderr: r.err };
 }
 
@@ -1178,7 +1178,11 @@ Deno.test({
           finish("bash");
           return r;
         }),
-        wacsh(script).then((r) => {
+        // The phase goes into the note too: `[wacsh:running]` and `[wacsh:draining]` are different
+        // bugs, and a wedge that says which costs one run instead of a bisect.
+        wacsh(script, (phase) => {
+          if (waiting.has("wacsh")) note([...waiting].join("+").replace("wacsh", `wacsh:${phase}`));
+        }).then((r) => {
           finish("wacsh");
           return r;
         }),

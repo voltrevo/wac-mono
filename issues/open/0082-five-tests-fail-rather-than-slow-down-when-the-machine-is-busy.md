@@ -227,3 +227,41 @@ label that changes as a case progresses would settle it in one run.
 
 **The narrator is doing its job**: this went from "an intermittent hang I could not name" to "the tail of
 the queue, every worker, reproducible" without anybody instrumenting anything by hand.
+
+## It is ours, not bash — and the next wedge will say which await (agent-a, 2026-08-06)
+
+The previous section asked for a label that distinguishes the two halves of a case. It exists, and it
+answered on the first wedge after it landed:
+
+```
+wac: scripts in flight for 184.9s with none finishing (676 of 680 done):
+wac:   script held 185.0s [wacsh]: … printf 'a
+wac:   script held 185.0s [wacsh]: … printf 'a
+wac:   script held 185.0s [wacsh]: … seq 1 20000 > f; wc f
+wac:   script held 184.9s [wacsh]: … seq 1 20000 > f; wc -l f
+```
+
+**Every stuck case is waiting on `wacsh`.** The real `bash` returned in all four; our own shell, run
+in-process through `harness/appRun.ts`, never did. That removes `Deno.Command`, the subprocess pipes and
+bash itself from the search, which is most of the surface.
+
+**And the phase is instrumented now.** `RunOptions.note` reports `loading`, `running` and `draining`, so
+the next wedge says `[wacsh:running]` or `[wacsh:draining]` — three different bugs:
+
+- *loading* — the child never reports ready. Unlikely: that path has a 120-second grace and then reports
+  `did not load`, which is an error rather than a hang, and these hang past 180 seconds in silence.
+- *running* — the child never finishes `main`. That points at the bridge or at a host handler that never
+  settles.
+- *draining* — the child finished and its output queues were never ended, so `out.rest()` waits for a
+  sentinel that is not coming. `shutdown()` is what ends them.
+
+**The bridge protocol itself reads correct**, for what that is worth: both sides use the seen-value
+pattern — the worker loads `DONE_SEQ`, checks the slot, then `Atomics.wait`s on the value it read, and the
+host loads `SUBMIT_SEQ` before its sweep and `waitAsync`es on that. A wakeup arriving in between makes the
+wait return immediately rather than sleeping through it. So a plain lost notify is not the explanation, and
+the evidence should come from the phase rather than from more reading.
+
+**A correlation worth knowing before the next hunt: it wedges on an idle machine.** Three wedges, all at
+load below 1. Twelve consecutive runs at load 3–6 — another agent working — were clean, 20-40 seconds
+each. That is the opposite of what a "too busy" theory predicts, and it fits a race whose window opens when
+everything is fast: the first run of a loop on a cold machine is the one that hangs.
