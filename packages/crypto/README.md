@@ -1,6 +1,6 @@
 # crypto
 
-SHA-256, SHA-512/384, SHA-3, SHAKE, HMAC, HKDF, bcrypt_pbkdf, ChaCha20-Poly1305,
+SHA-256, SHA-512/384, SHA-3, SHAKE, keccak256, HMAC, HKDF, bcrypt_pbkdf, ChaCha20-Poly1305,
 AES-CTR, AES-GCM, X25519, Ed25519, NIST P-256 and P-384, RSA signature verification and
 ML-KEM-768, written in wac.
 
@@ -111,11 +111,33 @@ transcribed. FIPS 202 prints them as a 5×5 grid, and copying a grid of rotation
 into a flat array indexed the other way round is the classic way to produce a hash that
 is wrong for every input. Deriving them is four lines and is the definition.
 
-Two oracles, split by what exists: WebCrypto has SHA3-256 and SHA3-512 but no SHAKE,
-OpenSSL 3.5.7 has all four. Between a browser engine and a C library that is a wider net
-than either. `tools/openssl35.sh` builds the latter — the system OpenSSL is 3.0.13, which
-predates ML-KEM — and the SHAKE test skips itself when it is absent rather than failing
-over a tool the repo does not ship.
+`node:crypto` is the oracle for all four, and it replaced a pair that was worse: WebCrypto has SHA3-256
+and SHA3-512 but no SHAKE, so the extendable-output tests used to shell out to an OpenSSL 3.5 built from
+source and mark themselves `ignore` when it was missing — green, and checking nothing. node has `shake128`
+and `shake256` built in and synchronously, so every one of the four is checked on every run.
+
+## keccak256
+
+`keccak256` is Ethereum's hash and **not** SHA3-256: same permutation, same rate, same capacity, same
+output length, and one byte of padding different — the original Keccak submission appends `0x01` where
+FIPS 202 appends `0x06`. They agree on no input at all. Every address, ABI selector, ENS namehash and
+Merkle-Patricia key is this function (wac-mono 0083, design/0003).
+
+**Nothing on a normal machine implements it.** OpenSSL and node have SHA-3 and the SHAKEs; the original
+padding predates the standard and no library ships it. So the test is three constants Ethereum quotes
+constantly, at three message lengths — `c5d24601…` for the empty string, `56e81f17…` for the single byte
+`0x80` (the empty trie root), and `a9059cbb` for the first four bytes of
+`transfer(address,uint256)` — plus the argument that the machinery under them is already verified: the
+sponge agrees with `node:crypto` for two *other* domain bytes, which pins the permutation, the rate
+handling and the squeeze. What that cannot pin is the domain byte, and the empty message is the case where
+it is the only thing the permutation sees.
+
+The same test asserts keccak256 **disagrees** with both SHA3-256 and a SHAKE256 truncated to 32 bytes at
+six lengths. One wrong padding byte gives a hash that is the right length, avalanches, and is silently the
+other algorithm.
+
+There is no streaming keccak256. `Sha3_256` hashes incrementally and hardcodes SHA-3's domain byte;
+nothing here hashes a keccak256 input it cannot hold, so a second struct beside it would have no caller.
 
 ## RSA
 

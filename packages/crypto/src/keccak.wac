@@ -178,6 +178,26 @@ void absorb(u64[] state, u8[] block, i32 rate) {
   keccakF(state);
 }
 
+/**
+ * keccak256 — Ethereum's hash, and **not** SHA3-256.
+ *
+ * Same permutation, same rate, same capacity, same output length. One byte of padding differs: the
+ * original Keccak submission appends `0x01` where NIST's SHA-3 appends `0x06`, and the two therefore agree
+ * on no input at all. Every address, every ABI selector, every ENS namehash and every Merkle-Patricia key
+ * is this function and not the one beside it (wac-mono 0083, design/0003).
+ *
+ * The empty message is where the difference is *entirely* visible: with no input, the padding is the whole
+ * of what the permutation sees, so `keccak256("")` being `c5d24601…` and `sha3_256("")` being something
+ * else is a check on this line specifically. That vector is in `test/wac/keccak_test.wac` along with two
+ * others whose lengths differ, and the sponge underneath is already checked against `node:crypto` for two
+ * other domain bytes.
+ *
+ * **There is no streaming form.** `Sha3_256` below hashes incrementally and hardcodes SHA-3's domain byte;
+ * nothing in this repo hashes a keccak256 input it cannot hold, so a `Keccak256` beside it would be a
+ * shape with no caller. Said here rather than left for somebody to assume `Sha3_256` can be repointed.
+ */
+export u8[] keccak256(u8[] msg) { return sponge(msg, 136, 0x01, 32); }
+
 export u8[] sha3_256(u8[] msg) { return sponge(msg, 136, 0x06, 32); }
 export u8[] sha3_512(u8[] msg) { return sponge(msg, 72, 0x06, 64); }
 export u8[] shake128(u8[] msg, i32 outLen) { return sponge(msg, 168, 0x1F, outLen); }

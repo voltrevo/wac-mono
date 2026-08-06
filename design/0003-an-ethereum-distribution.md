@@ -53,7 +53,7 @@ Ordered by dependency, not by intent.
 | consensus verification — `packages/lightclient` | **done** — Altair sync, all four of Ethereum's `light_client/sync` cases, 19 steps, 16 real sync-committee signatures |
 | SSZ and Merkle proofs — `packages/ssz` | **done** — 2,233 Ethereum vectors, including all 1,131 *invalid* `ssz_generic` |
 | BLS12-381 verification — `packages/bls` | **done** — all 29 Ethereum verify fixtures, ~8ms a signature |
-| keccak256 | **near** — `packages/crypto` has SHA-3 and SHAKE, so the Keccak-f permutation is there; Ethereum's padding differs |
+| keccak256 | **done** — `crypto.keccak256`, the sponge's fourth domain byte; three published vectors at three lengths, and asserted to disagree with SHA3-256 and truncated SHAKE256 |
 | RLP | not started |
 | ABI encoding and decoding | not started |
 | Merkle-Patricia state proofs | not started — **the gap between a verified header and reading a contract**, and the piece E2's "without trusting a provider" actually rests on |

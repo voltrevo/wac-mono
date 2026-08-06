@@ -22,7 +22,7 @@
 
 import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
-import { sha3_256, sha3_512, shake128, shake256, keccakF, Sha3_256 } from "../../src/keccak.wac";
+import { keccak256, sha3_256, sha3_512, shake128, shake256, keccakF, Sha3_256 } from "../../src/keccak.wac";
 
 const i32 SHA3_256 = 0;
 const i32 SHA3_512 = 1;
@@ -152,6 +152,55 @@ export string test_the_domain_separation_actually_separates() {
     u8[] m = fill(lens[i], 9);
     t.isFalse(same(sha3_256(m), shake256(m, 32)),
               "sha3-256 and shake256 differ at " + itoa64(lens[i] as i64) + " bytes");
+  }
+  return t.report();
+}
+
+export string test_keccak256_matches_the_published_vectors() {
+  // **No oracle for this one.** This machine's OpenSSL and node have SHA-3 and the SHAKEs and no
+  // keccak256 — the original padding predates the standard and nothing ships it. So the check is three
+  // constants that Ethereum quotes constantly, at three different message lengths, and the argument that
+  // the machinery under them is already verified: `sha3_256` and both SHAKEs agree with `node:crypto`
+  // above, which pins the permutation, the rate handling and the squeeze. What those cannot pin is the
+  // domain byte, and the empty message is where it is the *only* thing the permutation sees.
+  T t = T.create();
+
+  // KECCAK_EMPTY — the code hash of an account with no code.
+  t.eqBytes(keccak256(u8[0]()),
+            unhex("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+            "keccak256 of the empty string");
+
+  // The root of an empty Merkle-Patricia trie, which is keccak256 of RLP's empty string: one byte, 0x80.
+  t.eqBytes(keccak256(u8[](0x80)),
+            unhex("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
+            "keccak256 of the single byte 0x80 — the empty trie root");
+
+  // ERC-20's `transfer` selector: the first four bytes of the keccak256 of the signature, over 25 bytes
+  // of input, which is a partial block with the padding well inside it.
+  u8[] sig = keccak256("transfer(address,uint256)".toBytes());
+  u8[] selector = u8[4]();
+  for (i32 i = 0; i < 4; i++) { selector[i] = sig[i]; }
+  t.eqBytes(selector, unhex("a9059cbb"), "the ERC-20 transfer selector");
+
+  return t.report();
+}
+
+export string test_keccak256_is_not_sha3_256() {
+  // The failure this exists for: one wrong padding byte gives a hash function that looks entirely
+  // healthy — right length, avalanching, self-consistent — and is the other algorithm. Both directions
+  // are asserted, because "they differ" is also satisfied by a keccak256 that is broken in some third
+  // way, and the vectors above are what say which of the two this is.
+  T t = T.create();
+  i32[] lens = i32[](0, 1, 135, 136, 137, 272);
+  for (i32 i = 0; i < lens.len(); i++) {
+    u8[] m = fill(lens[i], 5);
+    u8[] k = keccak256(m);
+    t.eqI32(k.len(), 32, "keccak256 is 32 bytes at " + itoa64(lens[i] as i64));
+    t.isFalse(same(k, sha3_256(m)),
+              "keccak256 and sha3-256 differ at " + itoa64(lens[i] as i64) + " bytes");
+    // And not a truncated SHAKE either, which shares the rate and differs only in the same byte.
+    t.isFalse(same(k, shake256(m, 32)),
+              "keccak256 and shake256 differ at " + itoa64(lens[i] as i64) + " bytes");
   }
   return t.report();
 }
