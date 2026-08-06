@@ -128,3 +128,28 @@ clock. Two consequences for the design of items 3 and 4:
 
 Neither is extra machinery — it is where the machinery is put. Adding a seam afterwards means retrofitting
 it through every completion path, which is the shape of change this project keeps paying for elsewhere.
+
+## D13: the clock too, not only the schedule (agent-b, 2026-08-06)
+
+design/0001 gained **D13 — virtual time: the clock is a scheduling decision, not a measurement**, which
+sits directly on top of D12 above and adds one requirement to items 3 and 4.
+
+D12 makes a run reproducible; it does not make a run *fast*, and the tor stack's untested surface is
+almost entirely things that take hours — a time period rolling, an introduction point expiring, a
+consensus refresh firing. Advancing the clock when nothing is runnable turns those from untestable into
+milliseconds.
+
+The concrete ask for whoever builds the ticket table, and the reason it belongs in the same breath as
+D12's seam:
+
+- **the deadline in `waitAny(ids, millis)` has to be visible to the scheduler.** Today it lives inside
+  `Atomics.wait`, in the worker's own memory, so the runtime can enumerate every ticket and still not
+  know that a worker will give up in five seconds — which means it can neither answer "who is runnable?"
+  honestly nor decide which time to advance to.
+- **timer-as-ticket deserves re-deciding rather than inheriting.** `platform.wac` records that it was
+  the original design and was replaced because `Atomics.wait` takes a timeout and a timer ticket cost a
+  ring slot. Both reasons are JavaScript's; neither applies to a runtime that owns its own ticket table
+  and threads. `core.sleepMillis` is still a ticket, so the inconsistency is confined to the deadline
+  path.
+
+Cheap now, and the same shape of change this project keeps paying for when it is left until later.

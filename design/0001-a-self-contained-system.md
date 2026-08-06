@@ -232,6 +232,105 @@ of the choices actually made can: a run that wedges leaves its schedule behind, 
 reproduces it where replaying the seed might not. That is what would settle 0082, which has been observed
 half a dozen times and never once with its interleaving in hand.
 
+**D13 — virtual time: the clock is a scheduling decision, not a measurement** (agent-b, 2026-08-06,
+prompted by the operator). D12 makes a run *reproducible*. It does not make a run *fast*, and those are
+separate properties: a runtime can own the clock completely and still make every test wait eighteen
+hours. Owning the clock buys replay; **advancing** it buys coverage, and nothing in D12 implies the
+second.
+
+The rule that makes it work is the one Shadow uses — tor's own discrete-event simulator, which exists
+for exactly the problem below:
+
+> Simulated time advances only when nothing is runnable. When every worker is blocked, the scheduler
+> jumps the clock to the earliest deadline among them and settles precisely those waits.
+
+That is not "mock `now()`". A mocked clock lets a test *state* a time; a scheduler-owned clock lets a
+test *pass through* one. The difference is the whole feature.
+
+**What it is worth, concretely.** Everything the tor stack has pinned is a steady state: given this
+consensus, choose these directories; given these bytes, accept or refuse. Every **transition** is
+untested, because each needs hours of wall clock:
+
+- a descriptor published, the time period rolls, the service republishes — can a client still find it?
+  `serviceStorePeriods` exists for precisely that boundary and has only ever been tested at two frozen
+  instants.
+- an introduction point expiring (18–24h, drawn) while an INTRODUCE2 is in flight.
+- a consensus expiring mid-circuit; `refreshAt` picks a re-download time in a window and nothing has
+  ever watched it fire.
+- a revision counter's monotonicity across a service restart.
+
+And one that is already costing accuracy rather than only coverage: `test/data/hsdir_vectors.json` has
+`periodLength: 8` **minutes**, because chutney shrinks the voting interval to twenty seconds to make
+rotation observable at all. Production is 1440. So `timePeriodLength(testingNetwork: true, …)` is the
+branch under test and the production branch has never met a live network. Virtual time removes the
+reason to shrink the interval, which is a correctness win and not a speed one.
+
+**The obstacle is already in the interface, and it is small today.** `core.waitAny(ids, millis)` puts
+the deadline inside `Atomics.wait`, in the worker's own memory. The scheduler can enumerate every
+ticket and still cannot see *"this worker gives up in five seconds"* — so it cannot answer "who is
+runnable?" honestly (a worker with a live deadline is runnable at a future time), and it cannot know
+which time to advance to. `platform.wac` records that a timer **ticket** was the original design and was
+replaced because "`Atomics.wait` already takes a timeout, so the deadline needs no ticket, no slot and
+no cleanup at all". Both reasons are JavaScript's. `core.sleepMillis` is still a ticket, which is the
+shape virtual time wants — so the inconsistency is confined to the deadline path, and D12's own argument
+applies: this is where the seam goes, and retrofitting it later means touching every wait.
+
+**Two modes, and they are not substitutes.** Naming them now matters more than building either, because
+the temptation is to build the first and believe it covers the second:
+
+- **closed world** — an in-memory filesystem, a scripted network, virtual time. Genuinely deterministic;
+  a seed is the whole run. Answers *what happens when things interleave and time passes*.
+- **open world** — a real C tor on the other end of a real socket. Our side reproducible, the peer's
+  not. Answers *are we right*.
+
+**The tension is fundamental: virtual time XOR a real peer.** A tor process has a real clock, so
+anything it participates in runs at wall speed. Shadow escapes this only by simulating every node,
+which for us would mean intercepting a real tor binary's syscalls — a larger project than the runtime
+itself and probably never worth it.
+
+**And the trap, which is worth stating in the same breath as the goal.** A closed world is the ultimate
+symmetric oracle: our stack agreeing with itself, forever, at high speed. Determinism makes a wrong
+answer *reliably* wrong. Every real defect found in the tor work this week came from C tor and none
+would have been caught by a simulator — `HS_DESC_MAX_LEN` compared with `>=` rather than `>`, the
+strictly-greater revision-counter rule, `crypto_rand_int_range` being half-open where its own comment
+says inclusive, and every HSDir in a real consensus having `DirPort 0`. A deterministic mode should be
+sold as a coverage and debugging multiplier, which is large, and not as an oracle, which it is not.
+
+**Two hazards it introduces**, both known from Shadow and neither obvious:
+
+- **a program that polls instead of blocking hangs the simulation.** It stays runnable, so the clock
+  never advances, so its poll never becomes true. `waitAny(ids, 0)` — "which is ready right now" — is
+  exactly that shape, and a loop around it would spin forever in virtual time while working fine in
+  real time. The runtime should be able to say so: *no progress, and no blocking wait* is a diagnosable
+  state, not a hang.
+- **timeout constants become load-bearing.** Today `waitAny(…, 5000)` is a safety net that rarely
+  fires. Under virtual time it fires at exactly five simulated seconds, so which side of it a test lands
+  on becomes deterministic — which is the point, and also means changing a timeout changes outcomes.
+
+**The path, smallest first.** Each step is useful alone, which is the test of whether the staging is
+honest:
+
+1. **Make the deadline visible** — no semantic change. A worker records its deadline in shared memory
+   before parking; `Atomics.wait` still implements it. Costs one store, and gives the scheduler
+   "earliest deadline among blocked workers" for nothing. Everything else needs this and it is a few
+   lines.
+2. **A clock policy in the test scheduler.** `WAC_SCHED` already selects delivery order; add the clock
+   beside it. Under a virtual clock, `nowMillis` and `monotonicNanos` read the scheduler's counter, and
+   when nothing is runnable the scheduler advances to the earliest recorded deadline and settles exactly
+   those waits.
+3. **Ship it with the closed world.** D12's honest claim is "deterministic over a world the scheduler
+   owns"; virtual time is only *useful* over the same world. `packages/fs`'s memory backing is half of
+   it and a scripted network is the other half.
+4. **Wacland re-decides timer-as-ticket** rather than inheriting the JavaScript answer. The runtime owns
+   the ticket table and the threads, so a deadline can be a ticket without costing a ring slot or a
+   cancellation path.
+5. **First target is not a tor network.** `relayd` + `dird` + a client is the smallest system here with
+   a real race — a circuit extend against an accept — and it is where run-to-run nondeterminism already
+   bites. The demonstration that would settle the argument: publish a descriptor, cross a time-period
+   boundary in simulated time, and fetch it as a client. Two hundred milliseconds, and today untestable
+   at any speed.
+
+
 ## Order of work
 
 Each step is an issue when it becomes actionable, and each references this document.
