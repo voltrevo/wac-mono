@@ -545,6 +545,24 @@ own TLS link certificate. A relay rotates that certificate every few hours, so o
 its own is permanently somebody else's guest — see `design/0002` D4, which was revised to put
 generation in scope rather than leaning on an openssl fixture.
 
+### Flow control, on the relay side
+
+The client's is described above and emits **version 1** SENDMEs, which carry the digest of the cell
+that triggered them. `src/relayd.wac` emits **version 0** — an empty body — because tor's
+`sendme_accept_min_version` defaults to 0, so the simple form is accepted and no digest has to be
+threaded out of the relay crypto. `sendmeBodyV1` exists for the day a consensus raises that minimum,
+and the client already computes the digest, so the upgrade is reuse rather than new work.
+
+Measured, with three of our relays carrying a C tor's upload:
+
+| upload | no SENDMEs | with them |
+| --- | --- | --- |
+| 200 KB (411 cells) | works | works |
+| 300 KB (617 cells) | **fails** | works |
+| 1 MB (2105 cells) | **fails** | works |
+
+500 cells of 498 bytes is 249,000, which is exactly where the untreated version stopped.
+
 ## Standing a network up — `src/network.wac`
 
 Design 0002 step 5. A description names the servers, the line each prints when it is genuinely
