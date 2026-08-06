@@ -349,7 +349,20 @@ export u8[] descriptorIdentity(u8[] descriptor) {
  *
  * Empty if the descriptor is missing anything the line needs, rather than a line with a gap in it.
  */
-export u8[] routerStatusLine(u8[] descriptor) {
+export u8[] routerStatusLine(u8[] descriptor) { return statusLine(descriptor, true); }
+
+/**
+ * The `r` line for a **microdesc** consensus, which omits the descriptor digest.
+ *
+ * From tor's `routerstatus_format_entry`: the format string is one, and the flavour decides whether
+ * the digest and the space after it are written at all. So the microdesc line is not "the ns line with
+ * a field blanked" — it is one field shorter, and a client counting fields positionally reads every
+ * subsequent one wrong if it is written the other way. There is nothing else to omit: the digest lives
+ * in the `m` line instead, over a different document.
+ */
+export u8[] routerStatusLineMicrodesc(u8[] descriptor) { return statusLine(descriptor, false); }
+
+u8[] statusLine(u8[] descriptor, bool withDigest) {
   u8[] router = lineValue(descriptor, "router ");
   u8[] published = lineValue(descriptor, "published ");
   u8[] fingerprint = lineValue(descriptor, "fingerprint ");
@@ -371,8 +384,10 @@ export u8[] routerStatusLine(u8[] descriptor) {
   out.push(32);
   out.pushAll(b64Unpadded(identity).toBytes());
   out.push(32);
-  out.pushAll(b64Unpadded(digest).toBytes());
-  out.push(32);
+  if (withDigest) {
+    out.pushAll(b64Unpadded(digest).toBytes());
+    out.push(32);
+  }
   out.pushAll(published);
   out.push(32);
   out.pushAll(parts[1]);

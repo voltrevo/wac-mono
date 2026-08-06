@@ -1,0 +1,174 @@
+// Microdescriptors: the part of a descriptor a client actually needs.
+//
+// A router descriptor is signed, self-describing and large; almost none of it matters to a client
+// building a circuit. A microdescriptor is the useful remainder — the onion keys, the identity and the
+// exit policy summary — with no signature of its own, because it does not need one: the consensus
+// names it by digest, and the consensus *is* signed. That is the whole design, and it is why the
+// digest is the only thing here that can be got wrong in a way nothing catches.
+//
+// ## Its verdict is the digest, not "does it parse"
+//
+// Measured with `tools/microdesc-probe.c`, which puts a document through tor's own
+// `microdescs_parse_from_string`:
+//
+//   | mutation                       | verdict  | digest   |
+//   |--------------------------------|----------|----------|
+//   | unmodified                     | ACCEPTED | Xkm7p1…  |
+//   | the `onion-key` keyword damaged | REJECTED | —        |
+//   | the `id` line removed          | ACCEPTED | gNEkkd…  |
+//   | one character of the ntor key  | ACCEPTED | TWTjPz…  |
+//   | one byte of the RSA key        | ACCEPTED | 9PsLZ9…  |
+//   | the lines reordered            | ACCEPTED | wePWVc…  |
+//   | the trailing newline dropped   | ACCEPTED | p+VzFA…  |
+//
+// So ACCEPTED means *structurally parseable* and nothing more. Every corruption above changed the
+// digest, and a client that computes a digest other than the one the consensus's `m` line names
+// discards the microdescriptor — reporting only that it has no usable relays, which points at
+// everything except the document. The test for this file pins the digest against tor's, and the
+// verdict is the weaker second thing.
+//
+// ## The order of the lines is the format
+//
+// From `dirvote_create_microdescriptor` in tor's `dirvote.c`, in the order it appends them:
+// `onion-key`, `ntor-onion-key`, `family`, `p`, `p6`, `id`. Reordering parses and changes the digest,
+// which is the worst of both — so this writes them in tor's order and says why here rather than
+// leaving the order looking incidental.
+//
+// Two omissions are deliberate and both are tor's:
+//
+//   - **`p` is omitted when the summary is `reject 1-65535`.** tor writes the line only when the
+//     policy differs from that default, so a non-exit relay's microdescriptor has no `p` line at all.
+//     Writing one would be a different document with a different digest.
+//   - **`family` is not written**, because nothing here declares one. When it is, note that tor
+//     canonicalises the list before writing it (`nodefamily_canonicalize`) for consensus methods that
+//     support it, so copying the descriptor's line across would not be enough.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { sha256 } from "../../crypto/src/sha256.wac";
+import { b64Unpadded, lineValue, pastLineStarting } from "./routerdesc.wac";
+
+/** The summary a non-exit relay gets, and the one whose `p` line tor omits. */
+export const string POLICY_REJECT_ALL = "reject 1-65535";
+
+/**
+ * The microdescriptor for a router descriptor.
+ *
+ * `policySummary` is the port-summary form — `accept 1-65535`, `reject 1-65535`, `accept 80,443` —
+ * which is the same string a consensus `p` line carries, and deliberately *not* the address-pattern
+ * form a descriptor uses (`accept *:*`). The two grammars are easy to confuse and each is rejected
+ * where the other belongs; `routerdesc.wac` carries the same distinction for the same reason.
+ *
+ * Empty if the descriptor lacks anything a microdescriptor is made of.
+ */
+export u8[] microdescriptor(u8[] descriptor, string policySummary) {
+  u8[] onionKey = onionKeyBlock(descriptor);
+  u8[] ntor = lineValue(descriptor, "ntor-onion-key ");
+  u8[] master = lineValue(descriptor, "master-key-ed25519 ");
+  if (onionKey.len() == 0 || ntor.len() == 0 || master.len() == 0) { return u8[0](); }
+
+  Buf d = Buf.create();
+  d.pushAll("onion-key\n".toBytes());
+  d.pushAll(onionKey);
+  d.pushAll("ntor-onion-key ".toBytes());
+  d.pushAll(ntor);
+  d.push(10);
+  if (policySummary != POLICY_REJECT_ALL && policySummary != "") {
+    d.pushAll(("p " + policySummary + "\n").toBytes());
+  }
+  // `id ed25519 <master identity key>`. tor falls back to `id rsa1024 <identity digest>` for a relay
+  // whose descriptor carries no ed25519 certificate; every descriptor this package writes carries one,
+  // so the fallback would be unreachable code standing in for a case that cannot arrive.
+  d.pushAll("id ed25519 ".toBytes());
+  d.pushAll(master);
+  d.push(10);
+  return d.bytes();
+}
+
+/** The 32 bytes a consensus `m` line names, as a digest. */
+export u8[] microdescDigest(u8[] microdesc) {
+  return sha256(microdesc);
+}
+
+/** The consensus line that names this microdescriptor: `m <unpadded base64 of SHA-256>`. */
+export string microdescLine(u8[] microdesc) {
+  return "m " + b64Unpadded(microdescDigest(microdesc));
+}
+
+/**
+ * Split a concatenated run of microdescriptors into the individual documents.
+ *
+ * A directory answer carries them end to end with nothing between, so the only boundary is that each
+ * one begins with `onion-key` at the start of a line — which is why `onion-key` is first in tor's
+ * ordering and not an arbitrary choice. A cache has to do this to key them by digest, and so does
+ * anything that wants to check that a consensus's `m` lines and a microdescriptor response describe
+ * the same set.
+ *
+ * Bytes before the first `onion-key` are dropped rather than attached to the first document: they
+ * cannot be part of it, and attaching them would change its digest — turning a malformed response
+ * into a set of documents nothing can match instead of an obviously empty one.
+ */
+export u8[][] splitMicrodescriptors(u8[] all) {
+  u8[] keyword = "onion-key\n".toBytes();
+  i32 count = 0;
+  for (i32 i = 0; i + keyword.len() <= all.len(); i++) {
+    if (startsAt(all, i, keyword)) { count = count + 1; }
+  }
+  u8[][] out = u8[][count]();
+  i32 n = 0;
+  i32 from = -1;
+  for (i32 i = 0; i + keyword.len() <= all.len(); i++) {
+    if (!startsAt(all, i, keyword)) { continue; }
+    if (from >= 0) { out[n] = slice(all, from, i); n = n + 1; }
+    from = i;
+  }
+  if (from >= 0) { out[n] = slice(all, from, all.len()); }
+  return out;
+}
+
+/** The `m`-line digests for a concatenated run, in the order they appear. */
+export u8[][] microdescDigests(u8[] all) {
+  u8[][] parts = splitMicrodescriptors(all);
+  u8[][] out = u8[][parts.len()]();
+  for (i32 i = 0; i < parts.len(); i++) { out[i] = microdescDigest(parts[i]); }
+  return out;
+}
+
+bool startsAt(u8[] text, i32 at, u8[] needle) {
+  if (at != 0 && text[at - 1] != 10) { return false; }
+  for (i32 j = 0; j < needle.len(); j++) {
+    if (text[at + j] != needle[j]) { return false; }
+  }
+  return true;
+}
+
+u8[] slice(u8[] s, i32 from, i32 to) {
+  u8[] out = u8[to - from]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = s[from + i]; }
+  return out;
+}
+
+/**
+ * The PEM block following the descriptor's `onion-key` keyword, newline included.
+ *
+ * Copied verbatim rather than re-encoded from the modulus and exponent. The digest covers these bytes,
+ * so a re-encoding that differed in line width or in how it wrapped would produce a document naming
+ * the same key and hashing differently — and it would still parse, which is the failure this file's
+ * header is about.
+ */
+u8[] onionKeyBlock(u8[] descriptor) {
+  i32 at = pastLineStarting(descriptor, "onion-key\n".toBytes());
+  if (at < 0) { return u8[0](); }
+  u8[] end = "-----END RSA PUBLIC KEY-----\n".toBytes();
+  for (i32 i = at; i + end.len() <= descriptor.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < end.len(); j++) {
+      if (descriptor[i + j] != end[j]) { hit = false; break; }
+    }
+    if (!hit) { continue; }
+    i32 stop = i + end.len();
+    u8[] out = u8[stop - at]();
+    for (i32 k = 0; k < out.len(); k++) { out[k] = descriptor[at + k]; }
+    return out;
+  }
+  return u8[0]();
+}

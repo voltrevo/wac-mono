@@ -29,9 +29,13 @@ import { Buf } from "../../bytes/src/buf.wac";
 import { itoa, itoa64 } from "../../fmt/src/itoa.wac";
 import { rsaSignRawPkcs1 } from "../../crypto/src/rsa.wac";
 import { AuthorityKeys, plainFingerprint } from "./authcert.wac";
-import { pemBlock, publishedTime, rsaFingerprint } from "./routerdesc.wac";
+import { microdescLine, microdescriptor } from "./microdesc.wac";
 import {
-  RelayOpinion, signatureKeywordText, signedLength, sortedStatusEntries, voteSignatureDigest,
+  descriptorIdentity, pemBlock, publishedTime, routerStatusLine, routerStatusLineMicrodesc,
+  rsaFingerprint,
+} from "./routerdesc.wac";
+import {
+  RelayOpinion, signatureKeywordText, signedLength, sortedDescriptors, voteSignatureDigest,
 } from "./vote.wac";
 
 /** One authority's contribution to the consensus, as the document records it. */
@@ -68,12 +72,47 @@ export struct ConsensusInfo {
 export u8[] consensusDocument(
   ConsensusInfo info, ConsensusVoter[] voters, RelayOpinion[] relays, AuthorityKeys signer
 ) {
+  return consensusFlavoured(info, voters, relays, signer, false);
+}
+
+/**
+ * The **microdesc** flavour of the same consensus.
+ *
+ * This is the one a client bootstraps from by default, and until it existed no client in this package
+ * could bootstrap from an authority in this package: `dirclient.wac` asks for
+ * `/tor/status-vote/current/consensus-microdesc` and then fetches microdescriptors by the digest on
+ * each entry's `m` line. An authority producing only the ns flavour answered that with a 404 — two
+ * halves of this repo that had each been validated against C tor and never against each other, which
+ * is the seam design 0002's D1 is about.
+ *
+ * Four differences from the ns flavour, all from tor's `dirvote.c`:
+ *
+ *   - the version line carries the flavour: `network-status-version 3 microdesc`
+ *   - the `r` line omits the descriptor digest, being one field shorter rather than one field blank
+ *   - an `m` line names the microdescriptor, and it comes **before** the `s` line, not after it
+ *   - there is no `p` line: the policy summary moves into the microdescriptor
+ *
+ * A relay whose microdescriptor cannot be built is omitted from the document entirely — which is
+ * tor's rule (`with no microdescriptor digest, we omit the entry entirely`) and not an error, because
+ * a consensus listing a relay a client can never fetch keys for is worse than one that does not.
+ */
+export u8[] microdescConsensusDocument(
+  ConsensusInfo info, ConsensusVoter[] voters, RelayOpinion[] relays, AuthorityKeys signer
+) {
+  return consensusFlavoured(info, voters, relays, signer, true);
+}
+
+u8[] consensusFlavoured(
+  ConsensusInfo info, ConsensusVoter[] voters, RelayOpinion[] relays, AuthorityKeys signer,
+  bool microdesc
+) {
   u8[] identityFp = rsaFingerprint(signer.identityN, signer.identityE);
   u8[] signingFp = rsaFingerprint(signer.signingN, signer.signingE);
   if (identityFp.len() != 20 || signingFp.len() != 20) { return u8[0](); }
 
   Buf d = Buf.create();
-  d.pushAll("network-status-version 3\n".toBytes());
+  d.pushAll(microdesc ? "network-status-version 3 microdesc\n".toBytes()
+                      : "network-status-version 3\n".toBytes());
   d.pushAll("vote-status consensus\n".toBytes());
   d.pushAll(("consensus-method " + itoa(info.consensusMethod) + "\n").toBytes());
   d.pushAll(("valid-after " + publishedTime(info.validAfter) + "\n").toBytes());
@@ -103,19 +142,34 @@ export u8[] consensusDocument(
 
   u8[][] descriptors = u8[][relays.len()]();
   for (i32 i = 0; i < relays.len(); i++) { descriptors[i] = relays[i].descriptor; }
-  u8[][] lines = sortedStatusEntries(descriptors);
-  for (i32 i = 0; i < lines.len(); i++) {
-    if (lines[i].len() == 0) { return u8[0](); }
-    RelayOpinion r = opinionFor(relays, lines[i]);
-    d.pushAll(lines[i]);
-    d.push(10);
+  u8[][] order = sortedDescriptors(descriptors);
+  for (i32 i = 0; i < order.len(); i++) {
+    RelayOpinion r = opinionFor(relays, order[i]);
+    u8[] line = microdesc ? routerStatusLineMicrodesc(order[i]) : routerStatusLine(order[i]);
+    if (line.len() == 0) { return u8[0](); }
+
+    if (microdesc) {
+      u8[] md = microdescriptor(order[i], r.exitPolicy);
+      // Omitted rather than refused: tor drops an entry it has no microdescriptor digest for, and a
+      // document that listed a relay whose keys no client can fetch is the worse of the two.
+      if (md.len() == 0) { continue; }
+      d.pushAll(line);
+      d.push(10);
+      d.pushAll((microdescLine(md) + "\n").toBytes());
+    } else {
+      d.pushAll(line);
+      d.push(10);
+    }
+
     d.pushAll(("s " + r.flags + "\n").toBytes());
     d.pushAll(("v Tor " + TOR_VERSION + "\n").toBytes());
     d.pushAll(("pr " + RELAY_SUBPROTOCOLS + "\n").toBytes());
     // Unmeasured, because nothing here runs a bandwidth authority. Saying so is the honest form; a
     // consensus that omitted it would claim the number came from a measurement.
     d.pushAll(("w Bandwidth=" + itoa64(r.bandwidth) + " Unmeasured=1\n").toBytes());
-    d.pushAll(("p " + r.exitPolicy + "\n").toBytes());
+    // The policy summary lives in the microdescriptor for that flavour, so writing it here too would
+    // state it twice, in a document whose reader does not expect it.
+    if (!microdesc) { d.pushAll(("p " + r.exitPolicy + "\n").toBytes()); }
   }
 
   d.pushAll("directory-footer\n".toBytes());
@@ -132,19 +186,20 @@ export u8[] consensusDocument(
   return d.bytes();
 }
 
-/** The opinion whose descriptor produced `line`. */
-RelayOpinion opinionFor(RelayOpinion[] relays, u8[] line) {
+/**
+ * The opinion holding `descriptor`.
+ *
+ * By identity rather than by comparing formatted status lines back, which is what this did before the
+ * microdesc flavour arrived: two flavours format the same relay differently, so a match on the
+ * formatted line silently returned the wrong opinion — the first relay's — for every entry.
+ */
+RelayOpinion opinionFor(RelayOpinion[] relays, u8[] descriptor) {
+  u8[] want = descriptorIdentity(descriptor);
   for (i32 i = 0; i < relays.len(); i++) {
-    u8[] want = sortedStatusEntries(oneDescriptor(relays[i].descriptor))[0];
-    if (want.len() == line.len() && same(want, line)) { return relays[i]; }
+    u8[] have = descriptorIdentity(relays[i].descriptor);
+    if (have.len() == want.len() && want.len() > 0 && same(have, want)) { return relays[i]; }
   }
   return relays[0];
-}
-
-u8[][] oneDescriptor(u8[] d) {
-  u8[][] out = u8[][1]();
-  out[0] = d;
-  return out;
 }
 
 bool same(u8[] a, u8[] b) {

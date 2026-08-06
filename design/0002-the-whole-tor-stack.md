@@ -671,3 +671,72 @@ check in `run25.sh` is now fatal and named — a control fetch that must succeed
 a preflight that refuses to run while the last run's ports are held, an explicit "NEVER BOOTSTRAPPED"
 line, and a readiness loop that reports what it saw instead of expiring in silence. The `bc` one had
 been silently failing since the script was written; making the check fatal is what surfaced it.
+
+### Microdescriptors, and the flavour our own client had always asked for
+
+Step 5 wants a network with no C in it: our client, through three of our relays. It was blocked by
+something neither half could see on its own. `dirclient.wac` fetches
+`/tor/status-vote/current/consensus-microdesc` and then microdescriptors by each entry's `m` digest;
+the authority produced only the **ns** flavour and answered that path with a 404. So **no client in
+this package could bootstrap from an authority in this package** — two halves each validated against C
+tor and never against each other, which is exactly what D1 is about, arrived at from the opposite
+direction to the `linkHandshake` case.
+
+Every live run until now hid it behind `UseMicrodescriptors 0` in the probe's torrc. That line began
+as a measurement — "does the ns path complete?" — and quietly became a crutch holding up a network
+that could only ever serve a C tor.
+
+What was added: `src/microdesc.wac` (the document, its digest, and splitting a concatenated response
+back apart), the microdesc consensus flavour in `consensusgen.wac`, the `/tor/micro/d/` route in
+`dirserve.wac`, and `-M`/`-m` on `relayd` with `<consensus>.micro`/`.mds` beside the consensus for
+`dird`.
+
+Measured, with the crutch removed — the torrc has no `UseMicrodescriptors` line at all:
+
+    Received answer to microdescriptor request (status 200, body size 1176) from server 127.0.0.1:5557
+    A consensus needs 1 good signatures … This microdesc one has 1 (wacauth).
+    Bootstrapped 100% (done)
+
+**Read the order, not the last line.** tor logs `We need more microdescriptors: we have 0/3` until they
+arrive, and both of those lines sit *above* the answer in the log. Grepping for the last one said 0/3
+and I read it as a failure; what settles it is that the last shortfall is at line 265, the answer at
+271, and `enough_dirinfo` at 274 — a state tor does not reach without accepting them. The run script
+now prints those line numbers rather than a count, because the count was the misleading part.
+
+### A microdescriptor's verdict is its digest
+
+`tools/microdesc-probe.c` puts a document through tor's own `microdescs_parse_from_string`. Corrupting
+it, the way the other probes were exercised:
+
+| mutation | verdict | digest |
+|---|---|---|
+| unmodified | ACCEPTED | `Xkm7p1…` |
+| the `onion-key` keyword damaged | REJECTED | — |
+| the `id` line removed | ACCEPTED | `gNEkkd…` |
+| one character of the ntor key | ACCEPTED | `TWTjPz…` |
+| one byte of the RSA key | ACCEPTED | `9PsLZ9…` |
+| the lines reordered | ACCEPTED | `wePWVc…` |
+| the trailing newline dropped | ACCEPTED | `p+VzFA…` |
+
+So ACCEPTED means *structurally parseable* and nothing else — weaker even than a consensus's, which at
+least checks digests. Everything that distinguishes a right microdescriptor from a wrong one lives in
+the digest, and the consensus's `m` line is what commits to it. A client that computes a different one
+discards the document and reports only that it has no usable relays. The tests pin the digest; the
+verdict is the weaker second thing.
+
+Two details worth keeping, both of which parse either way and hash differently:
+
+  - **The `m` line comes before the `s` line**, not after it.
+  - **`p` is omitted entirely when the summary is `reject 1-65535`**, rather than written out.
+
+And one that is not about digests at all: **`/tor/micro/d/` batches with a hyphen, not a `+`.** Every
+other batched path in the protocol uses `+`, and `+` is a *data* character in base64 — so a route that
+split on it would cut roughly half of all digests in two and answer 404 for the batch. Case matters
+there too, where the hex paths fold it.
+
+Faults planted after the tests went green, and the result of each: writing `p` unconditionally,
+reversing tor's line order, dropping the trailing newline, misspelling the `ntor-onion-key` keyword,
+and digesting the wrong bytes — all caught. Splitting the microdesc path on `+`, and serving
+microdescriptors for a request naming none of them — caught. **Case-folding the base64 comparison
+survived**, because no test asked for a digest with its case changed; an assertion for it was added
+and the same fault is caught now.

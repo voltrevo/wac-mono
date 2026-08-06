@@ -32,6 +32,7 @@
 
 import { Response, write } from "../../http/src/response.wac";
 import { encodeUpper } from "../../codec/src/hex.wac";
+import { b64Unpadded } from "./routerdesc.wac";
 
 /** The documents an authority can hand out. Empty means "not produced", which answers 404. */
 export struct DirDocuments {
@@ -41,6 +42,8 @@ export struct DirDocuments {
   u8[] descriptors;            // every descriptor this authority holds, concatenated
   u8[][] descriptorDigests;    // the digest an `r` line carries, one per descriptor
   u8[] fingerprint;            // 20 bytes: this authority's identity digest
+  u8[] microdescriptors;       // every microdescriptor, concatenated, if any
+  u8[][] microdescDigests;     // the 32-byte digest an `m` line carries, one per microdescriptor
 }
 
 /** A document response, `text/plain` as tor's own cache sends these. */
@@ -83,6 +86,19 @@ export Response dirRoute(u8[] target, DirDocuments docs) {
       ? document(docs.certificate) : notFound();
   }
 
+  // `/tor/micro/d/<d1>-<d2>-...`, and the separator is a **hyphen** where every other batched path in
+  // the protocol uses `+`. The digests are base64 of SHA-256, in which `+` is a data character — so a
+  // route that split on `+` here would cut digests in half. Same batching, different delimiter, for a
+  // reason rather than by accident.
+  if (startsWith(path, "/tor/micro/d/")) {
+    if (docs.microdescriptors.len() == 0) { return notFound(); }
+    u8[] asked = rest(path, "/tor/micro/d/");
+    for (i32 i = 0; i < docs.microdescDigests.len(); i++) {
+      if (mentionsBase64(asked, docs.microdescDigests[i])) { return document(docs.microdescriptors); }
+    }
+    return notFound();
+  }
+
   if (equals(path, "/tor/server/authority") || equals(path, "/tor/server/all")) {
     return docs.descriptors.len() == 0 ? notFound() : document(docs.descriptors);
   }
@@ -121,6 +137,32 @@ export u8[] stripDotZ(u8[] target) {
     return out;
   }
   return target;
+}
+
+/**
+ * Whether a `-`-separated list of **base64** digests names `digest`.
+ *
+ * Case-sensitive, unlike the hex form: base64 distinguishes `a` from `A`, so folding case here would
+ * make two different digests compare equal. The comparison is exact for the same reason the separator
+ * is a hyphen — everything about this path is base64's constraints rather than the hex path's habits.
+ */
+bool mentionsBase64(u8[] list, u8[] digest) {
+  if (digest.len() == 0) { return false; }
+  u8[] want = b64Unpadded(digest).toBytes();
+  i32 at = 0;
+  while (at <= list.len()) {
+    i32 end = at;
+    while (end < list.len() && list[end] != 45) { end = end + 1; }   // '-'
+    if (end - at == want.len() && exactly(list, at, want)) { return true; }
+    if (end >= list.len()) { return false; }
+    at = end + 1;
+  }
+  return false;
+}
+
+bool exactly(u8[] list, i32 at, u8[] want) {
+  for (i32 i = 0; i < want.len(); i++) { if (list[at + i] != want[i]) { return false; } }
+  return true;
 }
 
 /** Whether a `+`-separated list of hex digests names `digest`, case-insensitively. */

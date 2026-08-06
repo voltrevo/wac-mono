@@ -1,0 +1,209 @@
+// Microdescriptors, against the documents tor's own parser accepted and digested.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  microdescriptor, microdescDigest, microdescDigests, microdescLine, splitMicrodescriptors,
+} from "../../src/microdesc.wac";
+import { b64Unpadded } from "../../src/routerdesc.wac";
+
+const i32 M_COUNT = 0;
+const i32 M_DESCRIPTOR = 1;
+const i32 M_POLICY = 2;
+const i32 M_EXPECTED = 3;
+const i32 M_DIGEST = 4;
+const i32 M_DIGEST_B64 = 5;
+const i32 M_MUT_COUNT = 6;
+const i32 M_MUT_DIGEST_B64 = 7;
+
+u8[] none() { return u8[0](); }
+
+u8[] at(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+
+i32 be32(u8[] b) { return b[0] * 16777216 + b[1] * 65536 + b[2] * 256 + b[3]; }
+
+export string test_the_bytes_tor_accepted(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = be32(ref(M_COUNT, none(), none()));
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] descriptor = ref(M_DESCRIPTOR, at(i), none());
+    string policy = string.fromBytes(ref(M_POLICY, at(i), none()));
+    u8[] made = microdescriptor(descriptor, policy);
+    t.eqBytes(made, ref(M_EXPECTED, at(i), none()),
+              "case " + itoaLocal(i) + ": the microdescriptor is the document tor accepted");
+  }
+  return t.report();
+}
+
+/**
+ * The digest, which is the assertion that matters.
+ *
+ * tor accepts a microdescriptor with its ntor key altered or its `id` line missing; what it does not
+ * do is give it the same digest. A consensus `m` line names a microdescriptor by this number, so a
+ * generator that produces almost-right bytes produces a document no client will ever match up.
+ */
+export string test_the_digest_is_the_one_the_m_line_names(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = be32(ref(M_COUNT, none(), none()));
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] made = microdescriptor(ref(M_DESCRIPTOR, at(i), none()),
+                               string.fromBytes(ref(M_POLICY, at(i), none())));
+    t.eqBytes(microdescDigest(made), ref(M_DIGEST, at(i), none()),
+              "case " + itoaLocal(i) + ": SHA-256 over the same span tor hashed");
+    t.eqStr(b64Unpadded(microdescDigest(made)),
+            string.fromBytes(ref(M_DIGEST_B64, at(i), none())),
+            "case " + itoaLocal(i) + ": and it renders as tor's unpadded base64");
+    t.eqStr(microdescLine(made),
+            "m " + string.fromBytes(ref(M_DIGEST_B64, at(i), none())),
+            "case " + itoaLocal(i) + ": the consensus line names it");
+  }
+  return t.report();
+}
+
+/**
+ * The digest discriminates.
+ *
+ * Without this the two tests above would pass for an implementation that hashed a constant. Each
+ * mutation is a document tor **accepted** and gave a different digest — so these are not assertions
+ * about validity, they are the evidence that the digest is doing the work.
+ */
+export string test_a_corrupted_microdescriptor_gets_a_different_digest(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  T t = T.create();
+  u8[] good = microdescriptor(ref(M_DESCRIPTOR, at(0), none()),
+                             string.fromBytes(ref(M_POLICY, at(0), none())));
+  string ours = b64Unpadded(microdescDigest(good));
+  i32 m = be32(ref(M_MUT_COUNT, none(), none()));
+  t.isTrue(m > 0, "there are mutations to compare against");
+
+  for (i32 i = 0; i < m; i++) {
+    string other = string.fromBytes(ref(M_MUT_DIGEST_B64, at(i), none()));
+    t.isTrue(ours != other,
+             "mutation " + itoaLocal(i) + " has a digest of its own, so the digest is a check");
+  }
+  return t.report();
+}
+
+/**
+ * The `p` line is absent for the default policy and present otherwise.
+ *
+ * tor writes `p` only when the summary differs from `reject 1-65535`. A generator that always wrote
+ * the line would produce a document that still parses — and hashes differently, which is the whole
+ * failure mode this file exists to stop.
+ */
+export string test_the_default_policy_writes_no_p_line(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = be32(ref(M_COUNT, none(), none()));
+  bool sawAccept = false;
+  bool sawReject = false;
+
+  for (i32 i = 0; i < n; i++) {
+    string policy = string.fromBytes(ref(M_POLICY, at(i), none()));
+    u8[] made = microdescriptor(ref(M_DESCRIPTOR, at(i), none()), policy);
+    if (policy == "reject 1-65535") {
+      sawReject = true;
+      t.isTrue(!contains(made, "\np "), "the default policy writes no p line");
+    } else {
+      sawAccept = true;
+      t.isTrue(contains(made, "\np " + policy + "\n"), "a real policy is written as a p line");
+    }
+  }
+  t.isTrue(sawAccept && sawReject, "both policy cases were exercised");
+  return t.report();
+}
+
+/** A descriptor missing what a microdescriptor is made of yields nothing, rather than a stub. */
+export string test_an_unusable_descriptor_makes_no_microdescriptor(
+  fn[u8[](i32, u8[], u8[])] ref
+) {
+  T t = T.create();
+  t.eqI32(microdescriptor(u8[0](), "accept 1-65535").len(), 0,
+          "an empty descriptor makes nothing");
+  t.eqI32(microdescriptor("router x 127.0.0.1 1 0 0\n".toBytes(), "accept 1-65535").len(), 0,
+          "a descriptor with no keys makes nothing");
+
+  // Truncated inside the onion-key block: the keyword is there and the PEM end is not, which is the
+  // case a search that assumed the block was complete would run off the end of.
+  u8[] full = ref(M_DESCRIPTOR, at(0), none());
+  u8[] cut = u8[full.len() / 2]();
+  for (i32 i = 0; i < cut.len(); i++) { cut[i] = full[i]; }
+  t.eqI32(microdescriptor(cut, "accept 1-65535").len(), 0,
+          "a descriptor cut in half makes nothing");
+  return t.report();
+}
+
+/**
+ * A concatenated response splits back into the documents that made it.
+ *
+ * This is the join a cache depends on: it receives one blob and has to key each document by its own
+ * digest. A split that got the boundary wrong would produce documents that parse and hash to nothing
+ * the consensus names — the same silent failure the digest tests above are about, one level up.
+ */
+export string test_a_run_of_microdescriptors_splits_back_apart(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = be32(ref(M_COUNT, none(), none()));
+
+  // Build a response the way a directory answer carries them: end to end, nothing between.
+  u8[] joined = u8[0]();
+  for (i32 i = 0; i < n; i++) {
+    u8[] one = microdescriptor(ref(M_DESCRIPTOR, at(i), none()),
+                              string.fromBytes(ref(M_POLICY, at(i), none())));
+    joined = join(joined, one);
+  }
+
+  u8[][] parts = splitMicrodescriptors(joined);
+  t.eqI32(parts.len(), n, "every document is found");
+  for (i32 i = 0; i < n; i++) {
+    u8[] want = microdescriptor(ref(M_DESCRIPTOR, at(i), none()),
+                               string.fromBytes(ref(M_POLICY, at(i), none())));
+    t.eqBytes(parts[i], want, "document " + itoaLocal(i) + " comes back whole and in order");
+  }
+
+  u8[][] digests = microdescDigests(joined);
+  t.eqI32(digests.len(), n, "one digest per document");
+  for (i32 i = 0; i < n; i++) {
+    t.eqBytes(digests[i], ref(M_DIGEST, at(i), none()),
+              "digest " + itoaLocal(i) + " is still tor's after a round trip through the blob");
+  }
+
+  t.eqI32(splitMicrodescriptors(u8[0]()).len(), 0, "an empty response holds nothing");
+  t.eqI32(splitMicrodescriptors("garbage with no keyword\n".toBytes()).len(), 0,
+          "a response with no microdescriptor in it holds nothing");
+  return t.report();
+}
+
+u8[] join(u8[] a, u8[] b) {
+  u8[] out = u8[a.len() + b.len()]();
+  for (i32 i = 0; i < a.len(); i++) { out[i] = a[i]; }
+  for (i32 i = 0; i < b.len(); i++) { out[a.len() + i] = b[i]; }
+  return out;
+}
+
+bool contains(u8[] s, string text) {
+  u8[] t = text.toBytes();
+  for (i32 i = 0; i + t.len() <= s.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < t.len(); j++) { if (s[i + j] != t[j]) { hit = false; break; } }
+    if (hit) { return true; }
+  }
+  return false;
+}
+
+string itoaLocal(i32 n) {
+  if (n == 0) { return "0"; }
+  string out = "";
+  i32 v = n;
+  while (v > 0) {
+    u8[] d = u8[1]();
+    d[0] = 48 + v % 10;
+    out = string.fromBytes(d) + out;
+    v = v / 10;
+  }
+  return out;
+}
