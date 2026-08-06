@@ -1,6 +1,7 @@
 {
   "version": "5",
   "specifiers": {
+    "npm:binaryen@123.0.0": "123.0.0",
     "npm:ethers@6": "6.17.0",
     "npm:playwright@1": "1.62.1"
   },
@@ -25,6 +26,10 @@
     },
     "aes-js@4.0.0-beta.5": {
       "integrity": "sha512-G965FqalsNyrPqgEGON7nIx1e/OVENSgiEIzyC63haUMuvNnwIgIjMs52hlTCKhkBny7A2ORNlfY9Zu+jmGk1Q=="
+    },
+    "binaryen@123.0.0": {
+      "integrity": "sha512-/hls/a309aZCc0itqP6uhoR+5DsKSlJVfB8Opd2BY9Ndghs84IScTunlyidyF4r2Xe3lQttnfBNIDjaNpj6mTw==",
+      "bin": true
     },
     "ethers@6.17.0": {
       "integrity": "sha512-BpyrpIPJ3ydEVow8zGaz1DuPS7YU8DcWxuBnY9a0UA/lvAPwrMr+EPXsfrul628SRaekPNeIM4UFh/91GWZang==",

@@ -1,0 +1,31 @@
+// The three hashes behind exports that are `i32 -> i32`, so a **raw** wasm instance can be called.
+//
+// Everything else in this repo reaches wac through bindgen, which is the only way a JS caller can build a
+// WasmGC array. That is fine until the thing being measured is the module itself — `tools/wasmopt.ts`
+// instantiates the same bytes twice, once as emitted and once through binaryen, and it cannot use bindgen
+// for the second because bindgen's glue is generated against the module it compiled.
+//
+// So each export takes a length, builds its own input, and returns a checksum of the digest: nothing
+// crosses the boundary but two i32s, and nothing can be optimised away, because the answer depends on
+// every byte.
+import { chacha20 } from "../../src/chacha20.wac";
+import { sha256 } from "../../src/sha256.wac";
+import { keccak256 } from "../../src/keccak.wac";
+
+u8[] message(i32 n) {
+  u8[] m = u8[n]();
+  i32 x = 1;
+  for (i32 i = 0; i < n; i++) { x = (x * 1103515245 + 12345) & 0x7FFFFFFF; m[i] = x >> 16; }
+  return m;
+}
+
+i32 sum32(u8[] b) {
+  i32 s = 0;
+  for (i32 i = 0; i < 32; i++) { s = s * 31 + b[i]; }
+  return s;
+}
+
+export i32 optBuild(i32 n) { return sum32(message(n)); }
+export i32 optChacha(i32 n) { return sum32(chacha20(u8[32](), 1, u8[12](), message(n))); }
+export i32 optSha256(i32 n) { return sum32(sha256(message(n))); }
+export i32 optKeccak(i32 n) { return sum32(keccak256(message(n))); }

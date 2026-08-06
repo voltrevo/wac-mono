@@ -1,1 +1,4 @@
 .cache/
+# `--node-modules-dir=auto` materialises npm packages here — `tools/wasmopt.ts` needs binaryen, and
+# `packages/platform`'s browser test needs playwright-core. Neither is a dependency of the repo itself.
+node_modules/
