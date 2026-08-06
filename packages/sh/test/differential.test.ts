@@ -1163,8 +1163,26 @@ Deno.test({
     // nothing about which of 614 scripts caused it, and the only way to find out is to instrument the
     // harness by hand, which is what I did the first time and then deleted.
     const differences: string[] = [];
-    await pool(CASES, 4, async (script) => {
-      const [want, got] = await Promise.all([bash(script), wacsh(script)]);
+    await pool(CASES, 4, async (script, _index, note) => {
+      // Both halves run at once, and the note says which are still outstanding. Without it a wedge names
+      // the script and leaves it open whether the stuck half is the real `bash` subprocess or our own
+      // shell in this process — wac-mono 0082, where four cases hung for 550s and that was the question.
+      let waiting = new Set(["bash", "wacsh"]);
+      const finish = (half: string) => {
+        waiting.delete(half);
+        note([...waiting].join("+"));
+      };
+      note("bash+wacsh");
+      const [want, got] = await Promise.all([
+        bash(script).then((r) => {
+          finish("bash");
+          return r;
+        }),
+        wacsh(script).then((r) => {
+          finish("wacsh");
+          return r;
+        }),
+      ]);
       if (want.stdout !== got.stdout || want.code !== got.code) {
         differences.push(
           `script: ${JSON.stringify(script)}\n` +

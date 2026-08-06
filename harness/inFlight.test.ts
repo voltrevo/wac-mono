@@ -127,6 +127,27 @@ Deno.test("work that finishes, however slowly, says nothing", async () => {
   assertEquals(text.trim(), "", `it narrated work that was progressing:\n${text}`);
 });
 
+Deno.test("a note says what a stuck unit is waiting on", async () => {
+  // The distinction wac-mono 0082 needed: a corpus case runs a real `bash` and our own shell at once, so
+  // "this script is stuck" leaves both halves suspects and "stuck on wacsh" does not.
+  const flight = watch("case");
+  try {
+    const e = flight.start("some-script");
+    assertEquals(flight.held()[0].note, "");
+    e.note("bash+wacsh");
+    assertEquals(flight.held()[0].note, "bash+wacsh");
+    e.note("wacsh");
+    assertEquals(flight.held()[0].note, "wacsh");
+    // A note on something that has ended is not an error — the work may finish while a `.then` is still
+    // in flight, and a narrator that threw there would fail the test it is watching.
+    e.done();
+    e.note("too late");
+    assertEquals(flight.held().length, 0);
+  } finally {
+    flight.stop();
+  }
+});
+
 Deno.test("`held` reports longest-first, so the wedge is the first line", async () => {
   const flight = watch("thing");
   try {
@@ -136,10 +157,10 @@ Deno.test("`held` reports longest-first, so the wedge is the first line", async 
     const order = flight.held().map((h) => h.label);
     assertEquals(order.join(","), "started-first,started-second");
     assertEquals(flight.held()[0].heldMs >= 30, true, `held time was ${flight.held()[0].heldMs}ms`);
-    first();
+    first.done();
     assertEquals(flight.held().map((h) => h.label).join(","), "started-second");
     // Ending twice is not a miscount — a caller with both a `finally` and a happy-path call is fine.
-    first();
+    first.done();
     assertEquals(flight.held().length, 1);
   } finally {
     flight.stop();
