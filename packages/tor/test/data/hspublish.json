@@ -66,6 +66,35 @@
    }
   }
  ],
+ "variants": [
+  {
+   "name": "two introduction points",
+   "introPoints": 2,
+   "blindedKey": "f1c0f6960f2b3fb2804b16c59c3071d6c142c4ec42f854e96b1c4b9f2f2da49a",
+   "storedByHsdir": true,
+   "servedIdentical": true,
+   "decodedIntroPoints": 2,
+   "accepted": true
+  },
+  {
+   "name": "three introduction points",
+   "introPoints": 3,
+   "blindedKey": "f1c0f6960f2b3fb2804b16c59c3071d6c142c4ec42f854e96b1c4b9f2f2da49a",
+   "storedByHsdir": true,
+   "servedIdentical": true,
+   "decodedIntroPoints": 3,
+   "accepted": true
+  },
+  {
+   "name": "the next time period",
+   "introPoints": 1,
+   "blindedKey": "6985b9521656344e7d3927aa0a9e46f2410a62892131fdd5085e740fc05f332f",
+   "storedByHsdir": true,
+   "servedIdentical": true,
+   "decodedIntroPoints": 1,
+   "accepted": true
+  }
+ ],
  "controls": [
   {
    "name": "one byte of the encrypted body flipped",

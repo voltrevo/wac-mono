@@ -1,0 +1,233 @@
+// Building a descriptor from inputs other than the committed one.
+//
+// The fixture in `hsdesc_generated.json` is one service, one introduction point, one time period. A
+// builder that ignored everything past the first introduction point, or that derived the name from
+// something other than the period, would reproduce that fixture exactly — so nothing about it can
+// show that the build generalises.
+//
+// tor has already answered the version of this question that matters, in `hspublish.json`: it filed
+// each variant, decrypted it, and found exactly the introduction points it was built with. What is
+// here is the part tor cannot see from outside — that the two lengths move independently, that the
+// name follows the period, and that bad inputs are refused rather than built around.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  BUILD_BAD_ENC_KEY, BUILD_BAD_IDENTITY, BUILD_BAD_INTRO, BUILD_BAD_SIGNING, BUILD_FAILED,
+  BUILD_NO_INTROS, BUILD_OK, Built, IntroPoint, buildDescriptor,
+} from "../../src/hsdescbuild.wac";
+import { blindingFactor, subcredential } from "../../src/hsblind.wac";
+import { ed25519ExpandedSecret, ed25519PublicKey, ed25519PublicKeyExpanded }
+  from "../../../crypto/src/ed25519.wac";
+import { blindedSecretKey } from "../../src/hsblind.wac";
+import { x25519Base } from "../../../crypto/src/x25519.wac";
+import { PUB_OK, checkForPublication } from "../../src/hsstore.wac";
+
+const i32 B_VARIANT_COUNT = 0;
+const i32 B_VARIANT_INTROS = 1;      // a[0] = index: how many were built
+const i32 B_VARIANT_FOUND = 2;       // a[0] = index: how many tor found
+const i32 B_VARIANT_LENS = 3;        // a[0] = index: innerPlainLen and middleLen, 4 bytes each
+
+u8[] none() { return u8[0](); }
+
+u8[] at(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+
+const i64 PERIOD_LENGTH = 1440;
+const i64 PERIOD = 3720629;
+
+/**
+ * More introduction points is a longer inner layer and the *same* outer one.
+ *
+ * That is the whole reason the middle layer is padded: the number of introduction points a service
+ * runs is visible in the inner plaintext's length, and would be visible to anyone watching a
+ * directory if the outer layer tracked it. The two lengths moving independently is the property, and
+ * it needs at least two descriptors of different shapes to state at all.
+ */
+export string test_the_intro_count_shows_inside_and_not_outside(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  Built one = build(1, PERIOD);
+  Built two = build(2, PERIOD);
+  Built three = build(3, PERIOD);
+  t.eqI32(one.error, BUILD_OK, "one introduction point builds");
+  t.eqI32(three.error, BUILD_OK, "and so do three");
+
+  t.isTrue(two.innerPlainLen > one.innerPlainLen, "a second introduction point lengthens the inner layer");
+  t.isTrue(three.innerPlainLen > two.innerPlainLen, "and a third lengthens it again");
+  // Evenly: each section is the same shape, so a builder that dropped one would show up as a step of
+  // the wrong size rather than as no step at all.
+  t.eqI32(three.innerPlainLen - two.innerPlainLen, two.innerPlainLen - one.innerPlainLen,
+          "each introduction point costs the same, so none was silently dropped");
+
+  t.eqI32(one.middleLen, two.middleLen, "the outer layer does not grow with them");
+  t.eqI32(two.middleLen, three.middleLen, "however many there are");
+  t.eqI32(one.middleLen % 10000, 0, "because it is padded to a multiple of ten thousand");
+
+  t.eqI32(one.introAuthCerts.len(), 1, "one certificate pair per introduction point");
+  t.eqI32(three.introEncCerts.len(), 3, "one each");
+  return t.report();
+}
+
+/**
+ * The name follows the time period, and nothing else does.
+ *
+ * A descriptor is filed under its blinded key, and the blinded key is the identity key blinded *for
+ * this period*. So the same service is a different name tomorrow — which is what stops a directory
+ * from being asked for a service by a name that never expires, and what a service must republish for.
+ */
+export string test_the_name_follows_the_period(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  Built now = build(1, PERIOD);
+  Built next = build(1, PERIOD + 1);
+  t.eqI32(next.error, BUILD_OK, "the next period builds too");
+
+  t.isTrue(!same(now.blindedKey, next.blindedKey), "the next period is a different name");
+  t.isTrue(!same(now.subcredential, next.subcredential), "and a different subcredential");
+  t.eqBytes(now.signingPublic, next.signingPublic, "but the signing key is unchanged by a period");
+
+  // Derived rather than asserted: the name is exactly what a client computes from the identity key
+  // it decoded out of the onion address, which is the only reason a client can find anything.
+  u8[] identityPublic = ed25519PublicKey(seed(1));
+  u8[] expected = ed25519PublicKeyExpanded(blindedSecretKey(
+    ed25519ExpandedSecret(seed(1)), blindingFactor(identityPublic, PERIOD, PERIOD_LENGTH)));
+  t.eqBytes(now.blindedKey, expected, "the name is the blinded key a client derives independently");
+  t.eqBytes(now.subcredential, subcredential(identityPublic, now.blindedKey),
+            "and the subcredential follows from both keys");
+  return t.report();
+}
+
+/** Every variant tor was given is one it decoded, with the introduction points it was built with. */
+export string test_tor_found_what_was_built(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(B_VARIANT_COUNT, none(), none())[0];
+  t.isTrue(n >= 3, "there are several variants");
+  bool sawMany = false;
+  for (i32 i = 0; i < n; i++) {
+    i32 built = ref(B_VARIANT_INTROS, at(i), none())[0];
+    t.eqI32(ref(B_VARIANT_FOUND, at(i), none())[0], built,
+            "tor found the introduction points the variant was built with");
+    if (built > 1) { sawMany = true; }
+    // And the lengths tor's acceptance says nothing about: the inner layer grew, the outer did not.
+    u8[] lens = ref(B_VARIANT_LENS, at(i), none());
+    t.eqI32(readI32(lens, 4), 10000, "every variant's outer layer is one padded block");
+    t.isTrue(readI32(lens, 0) < 10000, "and its inner layer is smaller than the padding hides it in");
+  }
+  t.isTrue(sawMany, "at least one variant has more than one introduction point");
+  return t.report();
+}
+
+/**
+ * What is built is what a directory accepts, and it names itself.
+ *
+ * The join. `hsstore.wac` performs the checks tor's `desc_decode_plaintext_v3` performs, and the one
+ * that matters here is the certificate's signature — verified against the blinded key the certificate
+ * itself carries. A descriptor whose certificate was signed by the *signing* key instead decodes
+ * perfectly for anyone who does not know the identity key, and every structural assertion above
+ * passes on it. That fault survived until this test existed.
+ *
+ * And the name a directory would file it under has to be the name the builder reports, or a service
+ * would publish somewhere it does not expect and never notice.
+ */
+export string test_a_directory_would_accept_what_was_built(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  for (i32 n = 1; n <= 3; n++) {
+    Built b = build(n, PERIOD);
+    t.eqI32(checkForPublication(b.document, 0).reason, PUB_OK,
+            "a directory accepts the document, certificate signature included");
+    t.eqBytes(checkForPublication(b.document, 0).blindedKey, b.blindedKey,
+              "and files it under the name the builder reports");
+  }
+  Built next = build(1, PERIOD + 1);
+  t.eqBytes(checkForPublication(next.document, 0).blindedKey, next.blindedKey,
+            "a later period is filed under its own name");
+  return t.report();
+}
+
+/** Bad inputs are refused, each for its own reason, rather than built around. */
+export string test_what_cannot_be_built(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  IntroPoint[] ok = intros(1);
+  u8[][] clients = u8[][0]();
+
+  t.eqI32(buildDescriptor(u8[31](), seed(2), ok, PERIOD, PERIOD_LENGTH, 1, 180, 500000,
+                          seed(3), u8[16](), u8[16](), clients).error,
+          BUILD_BAD_IDENTITY, "an identity seed that is not 32 bytes");
+  t.eqI32(buildDescriptor(seed(1), u8[0](), ok, PERIOD, PERIOD_LENGTH, 1, 180, 500000,
+                          seed(3), u8[16](), u8[16](), clients).error,
+          BUILD_BAD_SIGNING, "a signing seed that is not a seed");
+  t.eqI32(buildDescriptor(seed(1), seed(2), IntroPoint[0](fill: ok[0]), PERIOD, PERIOD_LENGTH, 1,
+                          180, 500000, seed(3), u8[16](), u8[16](), clients).error,
+          BUILD_NO_INTROS, "a descriptor with no introduction points reaches nobody");
+
+  // An introduction point whose keys are the wrong size. Refused rather than padded: a 31-byte ntor
+  // key is a caller that lost a byte, and building a document around it produces a service nobody
+  // can reach, which is the failure that looks like a working publication.
+  IntroPoint[] bad = IntroPoint[1](fill: IntroPoint(ok[0].linkSpecifiers, u8[31](), seed(5),
+                                                    clampedSeed(6)));
+  t.eqI32(buildDescriptor(seed(1), seed(2), bad, PERIOD, PERIOD_LENGTH, 1, 180, 500000,
+                          seed(3), u8[16](), u8[16](), clients).error,
+          BUILD_BAD_INTRO, "an ntor key of the wrong length");
+  IntroPoint[] noLs = IntroPoint[1](fill: IntroPoint(u8[0](), x25519Base(clampedSeed(4)), seed(5),
+                                                     clampedSeed(6)));
+  t.eqI32(buildDescriptor(seed(1), seed(2), noLs, PERIOD, PERIOD_LENGTH, 1, 180, 500000,
+                          seed(3), u8[16](), u8[16](), clients).error,
+          BUILD_BAD_INTRO, "and an introduction point that says nowhere");
+
+  // A refusal returns nothing at all, so a caller cannot publish a partial build by ignoring `error`.
+  Built refused = buildDescriptor(u8[31](), seed(2), ok, PERIOD, PERIOD_LENGTH, 1, 180, 500000,
+                                  seed(3), u8[16](), u8[16](), clients);
+  t.eqI32(refused.document.len(), 0, "a refused build is not a short document");
+  t.eqI32(refused.blindedKey.len(), 0, "and names nothing");
+  return t.report();
+}
+
+// ── building the inputs ───────────────────────────────────────────────────────
+
+/** A deterministic seed, so a failure is reproducible. */
+u8[] seed(i32 role) {
+  u8[] s = u8[32]();
+  for (i32 i = 0; i < 32; i++) { s[i] = (role * 61 + i * 17 + 13) & 0xFF; }
+  return s;
+}
+
+u8[] clampedSeed(i32 role) {
+  u8[] s = seed(role);
+  s[0] = s[0] & 248;
+  s[31] = (s[31] & 127) | 64;
+  return s;
+}
+
+IntroPoint[] intros(i32 n) {
+  IntroPoint[] out = IntroPoint[n](fill: one(0));
+  for (i32 i = 0; i < n; i++) { out[i] = one(i); }
+  return out;
+}
+
+/** One introduction point with keys of its own — two sharing a key would be one, written twice. */
+IntroPoint one(i32 i) {
+  u8[] ls = u8[9]();
+  ls[0] = 1; ls[1] = 0; ls[2] = 6;
+  ls[3] = 127; ls[4] = 0; ls[5] = 0; ls[6] = 1;
+  ls[7] = 0x23; ls[8] = (0x29 + i) & 0xFF;
+  return IntroPoint(ls, x25519Base(clampedSeed(70 + i)), seed(80 + i), clampedSeed(90 + i));
+}
+
+Built build(i32 introCount, i64 period) {
+  u8[][] clients = u8[][2]();
+  clients[0] = u8[40](fill: 1);
+  clients[1] = u8[40](fill: 2);
+  return buildDescriptor(seed(1), seed(2), intros(introCount), period, PERIOD_LENGTH, 7, 180,
+                         500000, seed(3), u8[16](fill: 9), u8[16](fill: 11), clients);
+}
+
+i32 readI32(u8[] b, i32 at) {
+  return (b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3];
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}

@@ -30,12 +30,13 @@ import tempfile
 
 DEFAULT_TOR = pathlib.Path.home() / "tor-build" / "torproject-tor-c8d2b17"
 PROBE = pathlib.Path(__file__).with_name("hspub-probe.c")
+CLIENT_PROBE = pathlib.Path(__file__).with_name("hsdesc-probe.c")
 GENERATED = pathlib.Path(__file__).parents[1] / "test" / "data" / "hsdesc_generated.json"
 
 
-def build(root, out):
+def build(root, out, source=PROBE):
     cmd = [
-        "gcc", "-O1", "-o", str(out), str(PROBE),
+        "gcc", "-O1", "-o", str(out), str(source),
         f"-I{root}", f"-I{root}/src", f"-I{root}/src/ext", f"-I{root}/src/ext/trunnel",
         str(root / "libtor.a"),
         "-lssl", "-lcrypto", "-lz", "-lm", "-levent", "-lpthread",
@@ -141,6 +142,46 @@ def main(argv):
             if c["result"]["accepted"]:
                 sys.exit(f"the control {c['name']!r} was accepted, so the probe proves nothing")
 
+        # The variants. The committed fixture is one descriptor with one introduction point in one
+        # time period, so nothing in it can show that the builder generalises — and a builder that
+        # silently ignored everything past the first introduction point would reproduce that fixture
+        # exactly. Each variant is put to both oracles: a directory must file it (under its *own*
+        # name, which for a different time period is a different name), and a client must decrypt it
+        # and find the introduction points it was built with.
+        client = pathlib.Path(tmp) / "hsdesc"
+        build(root, client, CLIENT_PROBE)
+        variants = []
+        for var in gen.get("variants", []):
+            key = base64.b64encode(binascii.unhexlify(var["blindedKey"])).decode().rstrip("=")
+            stored = ask(probe, tmp, var["descriptor"], key)
+            body = var["descriptor"].encode()
+            r = subprocess.run([str(client), "full", var["subcredential"]],
+                               input=body, capture_output=True)
+            out = r.stdout.decode()
+            found = -1
+            for line in out.splitlines():
+                if line.startswith("intro_points: "):
+                    found = int(line.split(": ")[1])
+            variants.append(dict(
+                name=var["name"],
+                introPoints=var["introPoints"],
+                blindedKey=var["blindedKey"],
+                storedByHsdir=stored["stored"] and stored["lookup"] == "hit",
+                servedIdentical=stored["identical"],
+                decodedIntroPoints=found,
+                accepted="ACCEPTED" in out,
+            ))
+        for var in variants:
+            if not var["storedByHsdir"]:
+                sys.exit(f"an HSDir would not file the variant {var['name']!r}")
+            if not var["accepted"]:
+                sys.exit(f"a client would not decode the variant {var['name']!r}")
+            if var["decodedIntroPoints"] != var["introPoints"]:
+                sys.exit(f"variant {var['name']!r}: built {var['introPoints']} introduction points, "
+                         f"tor found {var['decodedIntroPoints']}")
+        if len({v["blindedKey"] for v in variants}) < 2:
+            sys.exit("every variant has the same name, so the period is not reaching the key")
+
     json.dump(dict(
         source="tor's own hs_cache_store_as_dir and hs_cache_lookup_as_dir, tor 0.4.7.13",
         produced_by="packages/tor/tools/capture-hspub.py",
@@ -157,6 +198,7 @@ def main(argv):
         revision=gen["revision"],
         revisionNext=gen["revisionNext"],
         sequences=sequences,
+        variants=variants,
         controls=controls,
     ), sys.stdout, indent=1)
     sys.stdout.write("\n")
