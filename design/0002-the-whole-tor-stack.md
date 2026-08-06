@@ -779,3 +779,57 @@ would have cost an hour looking at working code.
 description, wait for bootstrap, run something across it, tear it down" — and what stood this network
 up is a shell script in a scratch directory, not a program in this repo, and not something the suite
 runs. The condition is evidence that the launcher has something to launch; it is not the launcher.
+
+### The launcher
+
+`src/network.wac`. A description names each server, **the line it prints when it is genuinely
+listening**, and the work to run once they are all up; the launcher spawns them all at once, waits on
+every one of their output streams through a single `waitAny`, runs the work, and stops everything.
+
+The specification came from the scripts it replaces. Every one of their failures was a stage assumed
+rather than observed, so: a node is waited for by marker and never slept on; a node that does not
+announce itself fails the run **by name**, and the work does not run; the work's exit code is the
+run's, so a network that came up and a fetch that failed cannot read as success; and a description
+that asks for nothing to be run is a failure rather than a quiet zero.
+
+Controls, because a launcher that always says ok is worse than none. Four networks broken on purpose:
+
+| what was broken | what it said |
+|---|---|
+| a relay's ready marker names a port it will never listen on | `relay2 never said "listening on 127.0.0.1:9999"` |
+| the client trusts an authority that signed nothing | `network: failed with 1` |
+| a node's bundle is not on disk | `authority: nosuch.worker.js: No such file or directory` |
+| no nodes at all | `the description has no nodes, so there is no network to run across` |
+
+Six faults planted in the launcher after its tests went green — treating "started" as "up", ignoring
+the work's exit code, running the work anyway when a node never came up, calling a description with no
+work a success, swallowing a missing bundle, and matching the ready marker against only the latest
+read — all caught. A seventh, merging the child's two streams onto stdout, was caught after the
+assertion for it was added; see below.
+
+**Two stream bugs, one at each level, found by looking at the output rather than the exit code.** The
+launcher's own progress went to stdout, so `network net.txt > doc` produced a document with
+`network: ok` in the middle of it; and `runOnce` forwarded both of a child's streams to stdout, so the
+client's `consensus verified` and `path:` lines landed in the fetched document too. Both are the same
+mistake — a program mixing what it says about itself with what it was asked to produce — and neither
+shows up in an exit code. Fixed at both levels, and `app.wac`/`bootstrap.wac` had it too.
+
+The payoff is a much stronger end-to-end assertion than "the fetch succeeded": **stdout is now
+byte-identical to the microdesc consensus the authority holds**, having come back through a three-hop
+circuit. `cmp` is the whole check.
+
+    network: all 4 nodes are up
+    consensus verified: 1 of 1 authorities signed
+    path: wacrelay2 -> wacrelay -> wacrelay3
+    circuit built, 3 hops
+    network: ok
+
+about a second, on a quiet machine.
+
+**Two things it does not do, both stated rather than discovered.** It cannot start a C tor: `Cli.spawn`
+takes a worker bundle and this world deliberately has no capability for running an arbitrary binary,
+so "a mixed network" in this document's sense needs a platform change and the C tor half of the
+interop matrix stays a shell script. And **the suite does not stand up a Tor network with it** — the
+ports a relay listens on are baked into its signed descriptor, so two agents running the suite at once
+would collide on 5555. `test/network.test.ts` tests the launcher against `example/waiter.wac`, which
+is the right subject anyway: it knows about processes and ready markers, not about Tor.

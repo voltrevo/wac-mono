@@ -109,7 +109,7 @@ export Network bootstrap(Core core, Cli cli, u8[] seedBytes, u8[] authBytes, boo
     cli.closeSocket(l.sock);
     return bad;
   }
-  core.log("consensus verified: " + itoa(v.goodSignatures) + " of " + itoa(trusted.len()) +
+  core.warn("consensus verified: " + itoa(v.goodSignatures) + " of " + itoa(trusted.len()) +
            " authorities signed");
 
   Relay[] relays = parseConsensus(consensus);

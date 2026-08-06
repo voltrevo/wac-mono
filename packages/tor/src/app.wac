@@ -66,8 +66,11 @@ export i32 main(Core core, Cli cli) {
   // a stream to a particular port has to say so, or it may build a circuit that cannot.
   Session s = buildCircuit(core, cli, net, 0, 0x80000002);
   if (!s.ok) { return 1; }
-  core.log("path: " + s.description);
-  core.log("circuit built, " + itoa(s.circ.length()) + " hops");
+  // Progress on the error channel, so stdout carries the fetched document and nothing else. Without
+  // this `tor … /tor/status-vote/current/consensus > cons.txt` writes a file with three lines of
+  // commentary above the document, which every consumer then has to strip.
+  core.warn("path: " + s.description);
+  core.warn("circuit built, " + itoa(s.circ.length()) + " hops");
 
   u8[] body = fetchOverCircuit(s.link, s.circ, path);
   cli.closeSocket(s.link.sock);
