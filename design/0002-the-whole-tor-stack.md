@@ -382,7 +382,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
-| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. The **middle layer** decrypts under tor's `hs_desc_decode_superencrypted`. **Not done:** the inner layer's contents, publishing to the HSDirs, and the program that holds it together |
+| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Not done:** publishing to the HSDirs, real key blinding, and the program that holds it together |
 | 7 — the interop matrix | **not started as a document.** Steps 2–6 each contribute rows and most are green; nothing collects them, so a regression in one would not be visible as a regression in *the matrix* |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
@@ -1240,3 +1240,38 @@ one block — so up and down agree for every input the tests had. It is caught n
 *over* a block. The lesson is that a boundary guard can hide the very arithmetic it guards, and a
 single-size test cannot see it: the fault needed an input on the other side of the boundary, which is
 exactly the input a fixture built from one real document never has.
+
+### The whole descriptor decodes — and `ACCEPTED` was nearly believed again
+
+    intro_points: 1     ACCEPTED
+
+tor decrypts both layers, parses the introduction point and validates both of its certificates.
+That completes the descriptor; what step 6 still owes is publication, real key blinding, and the
+program.
+
+**Read the count, not the verdict.** Three deliberately-wrong descriptors were built to check the
+oracle, and all three came back `ACCEPTED` — which was recorded, briefly, as "tor does not check
+this". It does: tor **drops** an introduction point whose certificates fail and returns success for
+the descriptor, so the real signal was a field the control was not printing.
+
+| how it was built | tor |
+|---|---|
+| correctly | ACCEPTED, `intro_points: 1` |
+| auth-key cert signed by the blinded key | ACCEPTED, **`intro_points: 0`** |
+| auth-key cert with the wrong cert type | ACCEPTED, **`intro_points: 0`** |
+| enc-key-cert certifying the curve25519 key itself | ACCEPTED, `intro_points: 1` |
+
+That is the third time this week a verdict has been weaker than it looked — after a microdescriptor's
+ACCEPTED, and a consensus's. The pattern is worth stating as a rule: **when a checker's answer is
+"fine", find the field that counts what it kept.**
+
+The last row is a fact about tor rather than about us. It validates the cross-certificate's signature
+and type but never checks that the key inside is the ed25519 form of the encryption key — so *this*
+oracle cannot confirm the proposal 228 conversion at all. The conversion is used here on the authority
+of `routerdesc_wac.test.ts`, which pins it against tor's own vectors, and the descriptor tests say so
+rather than implying a check they do not perform.
+
+Two smaller things the format fixes and nothing hints at: both intro-point certificates are signed by
+the **descriptor signing key** — not the blinded key, and not each other — and the inner layer is
+**not** padded, so its length tracks the number of introduction points. The middle layer's padding is
+what hides that from anyone who has not decrypted that far.

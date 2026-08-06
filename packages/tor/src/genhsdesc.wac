@@ -23,9 +23,13 @@ import { encode as hexEncode } from "../../codec/src/hex.wac";
 import { ed25519PublicKey } from "../../crypto/src/ed25519.wac";
 import { CERT_TYPE_SIGNING_HS_DESC, ed25519Cert } from "./relaycert.wac";
 import {
-  descriptorDocument, encryptLayer, padToBlock, signedSpanOf, superencryptedPlaintext,
+  descriptorDocument, encryptLayer, encryptedPlaintext, introPointSection, padToBlock, signedSpanOf,
+  superencryptedPlaintext,
 } from "./hsdescgen.wac";
-import { superencryptedConstant } from "./hsdesc.wac";
+import { encryptedConstant, superencryptedConstant } from "./hsdesc.wac";
+import { CERT_TYPE_AUTH_HS_IP_KEY, CERT_TYPE_CROSS_HS_IP_KEYS } from "./relaycert.wac";
+import { ed25519FromCurve25519Public, ed25519SignBit } from "../../crypto/src/ed25519.wac";
+import { x25519Base } from "../../crypto/src/x25519.wac";
 
 /** Two hours, which is what a real service asks for. */
 const i32 LIFETIME_MINUTES = 180;
@@ -60,11 +64,55 @@ export i32 main(Core core, Cli cli) {
     return 1;
   }
 
-  // The middle layer, for real. The inner `encrypted` object is still a stand-in: tor's decoder
-  // chains plaintext -> superencrypted -> encrypted and the middle stage leaves the inner object
-  // opaque, so this is checkable before the inner layer exists.
-  u8[] inner = u8[64]();
-  for (i32 i = 0; i < 64; i++) { inner[i] = (i * 17 + 5) & 0xFF; }
+  // The inner layer, for real: one introduction point with both of its certificates.
+  //
+  // The link specifiers are the same shape `hsintro.wac` validates — a count byte then one IPv4
+  // entry for 127.0.0.1:9001.
+  u8[] ls = u8[9]();
+  ls[0] = 1;                                        // NSPEC
+  ls[1] = 0;                                        // LS_IPV4
+  ls[2] = 6;                                        // length
+  ls[3] = 127; ls[4] = 0; ls[5] = 0; ls[6] = 1;     // 127.0.0.1
+  ls[7] = 0x23; ls[8] = 0x29;                       // 9001
+
+  u8[] ipNtorSecret = clamped(seedFor(25));
+  u8[] ipNtor = x25519Base(ipNtorSecret);
+  u8[] ipAuthSeed = seedFor(26);
+  u8[] ipAuthPublic = ed25519PublicKey(ipAuthSeed);
+  u8[] ipEncSecret = clamped(seedFor(27));
+  u8[] ipEnc = x25519Base(ipEncSecret);
+
+  // The cross-certificate certifies the **ed25519 form** of the curve25519 encryption key —
+  // proposal 228, the same conversion `ntor-onion-key-crosscert` uses in a router descriptor.
+  u8[]? ipEncEd = ed25519FromCurve25519Public(ipEnc, 0);
+  if (ipEncEd is null) {
+    core.warn("genhsdesc: the encryption key does not convert to ed25519");
+    return 1;
+  }
+
+  // Both certificates are signed by the *descriptor signing key*, which is the key the outer
+  // document's certificate vouches for.
+  u8[] authCert = ed25519Cert(CERT_TYPE_AUTH_HS_IP_KEY, expiryHours, 1, ipAuthPublic, signPublic,
+                              signSeed);
+  u8[] encCert = ed25519Cert(CERT_TYPE_CROSS_HS_IP_KEYS, expiryHours, 1, ipEncEd!, signPublic,
+                             signSeed);
+  if (authCert.len() == 0 || encCert.len() == 0) {
+    core.warn("genhsdesc: could not build the introduction point certificates");
+    return 1;
+  }
+
+  u8[][] intros = u8[][1]();
+  intros[0] = introPointSection(ls, ipNtor, authCert, ipEnc, encCert);
+  u8[] innerPlain = encryptedPlaintext(intros);
+  if (innerPlain.len() == 0) {
+    core.warn("genhsdesc: could not build the inner layer");
+    return 1;
+  }
+
+  // The inner layer is encrypted with the same secret data and subcredential as the middle one, under
+  // its own customisation constant. It is **not** padded — only the middle layer is.
+  u8[] innerSalt = u8[16]();
+  for (i32 i = 0; i < 16; i++) { innerSalt[i] = (i * 29 + 5) & 0xFF; }
 
   // Sixteen decoy clients, as tor writes when no client is authorised, so the descriptor's shape says
   // nothing about whether the service restricts access.
@@ -76,6 +124,14 @@ export i32 main(Core core, Cli cli) {
   }
   u8[] ephemeral = seedFor(23);
 
+  u8[] subcredEarly = seedFor(24);
+  u8[] inner = encryptLayer(innerPlain, blindPublic, subcredEarly, 42, innerSalt,
+                            encryptedConstant());
+  if (inner.len() == 0) {
+    core.warn("genhsdesc: could not encrypt the inner layer");
+    return 1;
+  }
+
   u8[] middle = padToBlock(superencryptedPlaintext(ephemeral, clients, inner));
   if (middle.len() == 0) {
     core.warn("genhsdesc: could not build the superencrypted layer");
@@ -85,7 +141,7 @@ export i32 main(Core core, Cli cli) {
   u8[] salt = u8[16]();
   for (i32 i = 0; i < 16; i++) { salt[i] = (i * 23 + 11) & 0xFF; }
   // SECRET_DATA for this layer is the blinded public key; the subcredential is the service's.
-  u8[] subcred = seedFor(24);
+  u8[] subcred = subcredEarly;
   u8[] superencrypted = encryptLayer(middle, blindPublic, subcred, 42, salt,
                                      superencryptedConstant());
   if (superencrypted.len() == 0) {
@@ -116,6 +172,16 @@ export i32 main(Core core, Cli cli) {
     "  \"subcredential\": \"" + hex(subcred) + "\",\n" +
     "  \"ephemeral\": \"" + hex(ephemeral) + "\",\n" +
     "  \"salt\": \"" + hex(salt) + "\",\n" +
+    "  \"innerSalt\": \"" + hex(innerSalt) + "\",\n" +
+    "  \"linkSpecifiers\": \"" + hex(ls) + "\",\n" +
+    "  \"ipNtor\": \"" + hex(ipNtor) + "\",\n" +
+    "  \"ipAuthSeed\": \"" + hex(ipAuthSeed) + "\",\n" +
+    "  \"ipAuthPublic\": \"" + hex(ipAuthPublic) + "\",\n" +
+    "  \"ipEnc\": \"" + hex(ipEnc) + "\",\n" +
+    "  \"ipEncEd\": \"" + hex(ipEncEd!) + "\",\n" +
+    "  \"authCert\": \"" + hex(authCert) + "\",\n" +
+    "  \"encCert\": \"" + hex(encCert) + "\",\n" +
+    "  \"innerPlainLen\": " + itoa(innerPlain.len()) + ",\n" +
     "  \"inner\": \"" + hex(inner) + "\",\n" +
     "  \"middleLen\": " + itoa(middle.len()) + ",\n" +
     "  \"superencrypted\": \"" + hex(superencrypted) + "\",\n" +
@@ -149,6 +215,16 @@ string jsonText(u8[] body) {
       out = out + string.fromBytes(one);
     }
   }
+  return out;
+}
+
+/** A curve25519 secret has to be clamped before it is used as a scalar. */
+u8[] clamped(u8[] s) {
+  u8[] out = u8[32]();
+  for (i32 i = 0; i < 32; i++) { out[i] = s[i]; }
+  out[0] = out[0] & 248;
+  out[31] = out[31] & 127;
+  out[31] = out[31] | 64;
   return out;
 }
 

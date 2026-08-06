@@ -31,6 +31,22 @@
 //   | one character of the superencrypted blob | REJECTED |
 //   | the revision counter, which keys the layer | REJECTED |
 //
+// And the whole thing, through `hs_desc_decode_descriptor`. **Read the count, not the verdict.** tor
+// *drops* an introduction point it cannot validate and returns success for the descriptor, so
+// ACCEPTED with `intro_points: 0` is a failure wearing a success:
+//
+//   | how the descriptor was built | tor |
+//   |---|---|
+//   | correctly | ACCEPTED, `intro_points: 1` |
+//   | auth-key cert signed by the blinded key | ACCEPTED, **`intro_points: 0`** |
+//   | auth-key cert with the wrong cert type | ACCEPTED, **`intro_points: 0`** |
+//   | enc-key-cert certifying the curve25519 key itself | ACCEPTED, `intro_points: 1` |
+//
+// That last row is a statement about **tor**, not about us: it validates the cross-certificate's
+// signature and type but never checks that the key inside it is the ed25519 form of the encryption
+// key. So this oracle cannot confirm the proposal 228 conversion — `routerdesc_wac.test.ts` pins that
+// against tor's own vectors, and the conversion is used here on that authority rather than this one.
+//
 // So this verdict is a strong one — unlike a microdescriptor's, where only the digest discriminates.
 // Everything in the document is covered by either the signature or the certificate.
 //
@@ -56,6 +72,13 @@ const H_SALT = 10;
 const H_INNER = 11;
 const H_CLIENT = 12; // a[0]=i: the i-th decoy client, 40 bytes
 const H_CLIENT_COUNT = 13;
+const H_INNER_SALT = 14;
+const H_LINK_SPECS = 15;
+const H_IP_NTOR = 16;
+const H_IP_ENC = 17;
+const H_IP_ENC_ED = 18;
+const H_AUTH_CERT = 19;
+const H_ENC_CERT = 20;
 
 const v = JSON.parse(
   await Deno.readTextFile(new URL("data/hsdesc_generated.json", import.meta.url)),
@@ -75,6 +98,14 @@ const v = JSON.parse(
   salt: string;
   inner: string;
   middleLen: number;
+  innerSalt: string;
+  linkSpecifiers: string;
+  ipNtor: string;
+  ipEnc: string;
+  ipEncEd: string;
+  authCert: string;
+  encCert: string;
+  innerPlainLen: number;
 };
 
 /** The decoys the generator writes, reproduced here so the wac side can rebuild the same layer. */
@@ -116,7 +147,8 @@ function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
     case H_BLIND_PUBLIC:
       return hex(v.blindPublic);
     case H_NUM:
-      return be32([v.lifetimeMinutes, v.revision, v.signedSpanLen, v.middleLen][a[0]]);
+      return be32([v.lifetimeMinutes, v.revision, v.signedSpanLen, v.middleLen,
+                   v.innerPlainLen][a[0]]);
     case H_SUBCRED:
       return hex(v.subcredential);
     case H_EPHEMERAL:
@@ -129,6 +161,20 @@ function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
       return CLIENTS[a[0]];
     case H_CLIENT_COUNT:
       return be32(CLIENTS.length);
+    case H_INNER_SALT:
+      return hex(v.innerSalt);
+    case H_LINK_SPECS:
+      return hex(v.linkSpecifiers);
+    case H_IP_NTOR:
+      return hex(v.ipNtor);
+    case H_IP_ENC:
+      return hex(v.ipEnc);
+    case H_IP_ENC_ED:
+      return hex(v.ipEncEd);
+    case H_AUTH_CERT:
+      return hex(v.authCert);
+    case H_ENC_CERT:
+      return hex(v.encCert);
     default:
       throw new Error(`unknown vector field ${what}`);
   }

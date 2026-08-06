@@ -164,6 +164,70 @@ u8[] pemBlock(string label, u8[] body) {
 }
 
 /**
+ * One introduction point, as the inner layer lists it.
+ *
+ *     introduction-point <base64 of the link specifiers>
+ *     onion-key ntor <base64>
+ *     auth-key
+ *     -----BEGIN ED25519 CERT-----     <- type 9, signed by the descriptor signing key
+ *     -----END ED25519 CERT-----
+ *     enc-key ntor <base64>
+ *     enc-key-cert
+ *     -----BEGIN ED25519 CERT-----     <- type 11, also signed by the descriptor signing key
+ *     -----END ED25519 CERT-----
+ *
+ * **Both certificates are signed by the descriptor signing key**, not by the blinded key and not by
+ * each other — `tor_cert_checksig(…, &desc->plaintext_data.signing_pubkey, 0)` for each. That is the
+ * key certified two layers up in the outer document, so a service that rotated it between building
+ * the shell and building this section would produce a descriptor whose halves disagree.
+ *
+ * The `enc-key-cert` certifies the **ed25519 form** of the curve25519 encryption key — the proposal
+ * 228 conversion this package already has for `ntor-onion-key-crosscert`. Nothing about the field
+ * names says so; the cross-certification is the whole reason the conversion exists in two places.
+ *
+ * `linkSpecifiers` is the raw list, `NSPEC` byte included, exactly as `hsintro.wac` validates it.
+ */
+export u8[] introPointSection(
+  u8[] linkSpecifiers, u8[] ntorOnionKey, u8[] authKeyCert, u8[] encKey, u8[] encKeyCert
+) {
+  if (ntorOnionKey.len() != 32 || encKey.len() != 32) { return u8[0](); }
+  if (authKeyCert.len() == 0 || encKeyCert.len() == 0 || linkSpecifiers.len() == 0) {
+    return u8[0]();
+  }
+
+  Buf d = Buf.create();
+  d.pushAll(("introduction-point " + b64Unpadded(linkSpecifiers) + "\n").toBytes());
+  d.pushAll(("onion-key ntor " + b64Unpadded(ntorOnionKey) + "\n").toBytes());
+  d.pushAll("auth-key\n".toBytes());
+  d.pushAll(pemBlock("ED25519 CERT", authKeyCert));
+  d.pushAll(("enc-key ntor " + b64Unpadded(encKey) + "\n").toBytes());
+  d.pushAll("enc-key-cert\n".toBytes());
+  d.pushAll(pemBlock("ED25519 CERT", encKeyCert));
+  return d.bytes();
+}
+
+/**
+ * The inner layer's plaintext: what a client needs to reach the service.
+ *
+ * `create2-formats 2` first, which tor's token rule requires as the opening keyword — 2 is the ntor
+ * handshake and the only one this package speaks.
+ *
+ * **Not padded.** tor pads the middle layer and not this one, so the inner blob's length tracks the
+ * number of introduction points. That is deliberate on tor's part rather than an omission: the middle
+ * layer's padding is what hides it from anyone who has not decrypted that far.
+ */
+export u8[] encryptedPlaintext(u8[][] introPoints) {
+  if (introPoints.len() == 0) { return u8[0](); }
+  Buf d = Buf.create();
+  d.pushAll("create2-formats 2\n".toBytes());
+  for (i32 i = 0; i < introPoints.len(); i++) {
+    if (introPoints[i].len() == 0) { return u8[0](); }
+    d.pushAll(introPoints[i]);
+  }
+  return d.bytes();
+}
+
+/**
  * The middle layer's plaintext: who may fetch this descriptor, and the inner layer.
  *
  *     desc-auth-type x25519

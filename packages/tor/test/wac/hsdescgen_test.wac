@@ -2,10 +2,13 @@
 
 import { T } from "../../../wactest/src/assert.wac";
 import {
-  DESC_SIG_PREFIX, SUPERENC_PAD_MULTIPLE, descriptorDocument, encryptLayer, padToBlock, prefixed,
-  signedSpanOf, superencryptedPlaintext,
+  DESC_SIG_PREFIX, SUPERENC_PAD_MULTIPLE, descriptorDocument, encryptLayer, encryptedPlaintext,
+  introPointSection, padToBlock, prefixed, signedSpanOf, superencryptedPlaintext,
 } from "../../src/hsdescgen.wac";
-import { decryptLayer, superencryptedConstant, SALT_LEN, MAC_LEN } from "../../src/hsdesc.wac";
+import {
+  decryptLayer, encryptedConstant, superencryptedConstant, SALT_LEN, MAC_LEN,
+} from "../../src/hsdesc.wac";
+import { linkSpecifiersValid } from "../../src/hsintro.wac";
 import { ed25519Verify } from "../../../crypto/src/ed25519.wac";
 
 const i32 H_DESCRIPTOR = 0;
@@ -22,6 +25,13 @@ const i32 H_SALT = 10;
 const i32 H_INNER = 11;
 const i32 H_CLIENT = 12;
 const i32 H_CLIENT_COUNT = 13;
+const i32 H_INNER_SALT = 14;
+const i32 H_LINK_SPECS = 15;
+const i32 H_IP_NTOR = 16;
+const i32 H_IP_ENC = 17;
+const i32 H_IP_ENC_ED = 18;
+const i32 H_AUTH_CERT = 19;
+const i32 H_ENC_CERT = 20;
 
 u8[] none() { return u8[0](); }
 
@@ -208,6 +218,70 @@ export string test_the_decoy_clients_are_written(fn[u8[](i32, u8[], u8[])] ref) 
           "a thirty-nine byte client is not one");
   t.eqI32(superencryptedPlaintext(u8[31](), clients, ref(H_INNER, none(), none())).len(), 0,
           "and a thirty-one byte ephemeral key is not a key");
+  return t.report();
+}
+
+/**
+ * The inner layer, rebuilt and compared against the one tor decrypted into an introduction point.
+ *
+ * tor reported `intro_points: 1` for the committed descriptor, which is the assertion that matters:
+ * it **drops** an introduction point whose certificates do not check out and still returns success,
+ * so a descriptor that decodes with zero introduction points is a failure wearing a success. Two
+ * deliberately-wrong builds produced exactly that, and are recorded in the registrar's header.
+ */
+export string test_the_inner_layer_tor_read_is_reproduced(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] ls = ref(H_LINK_SPECS, none(), none());
+  t.isTrue(linkSpecifiersValid(ls), "the link specifiers are a list our own validator accepts");
+
+  u8[] section = introPointSection(ls, ref(H_IP_NTOR, none(), none()),
+                                   ref(H_AUTH_CERT, none(), none()), ref(H_IP_ENC, none(), none()),
+                                   ref(H_ENC_CERT, none(), none()));
+  t.isTrue(section.len() > 0, "the introduction point section builds");
+  t.isTrue(startsWith(section, "introduction-point "),
+           "it opens with the keyword tor's token rule requires first");
+  t.eqI32(countOf(section, "\nauth-key\n"), 1, "exactly one auth-key");
+  t.eqI32(countOf(section, "\nenc-key-cert\n"), 1, "exactly one enc-key-cert");
+  t.eqI32(countOf(section, "ED25519 CERT"), 4, "two certificates, each with a begin and an end");
+
+  u8[][] intros = u8[][1]();
+  intros[0] = section;
+  u8[] plain = encryptedPlaintext(intros);
+  t.isTrue(startsWith(plain, "create2-formats 2\n"),
+           "the inner layer opens with create2-formats, which tor requires first");
+  t.eqI32(plain.len(), num(ref, 4), "and is the length tor decrypted");
+
+  u8[] blob = encryptLayer(plain, ref(H_BLIND_PUBLIC, none(), none()),
+                           ref(H_SUBCRED, none(), none()), num(ref, 1) as i64,
+                           ref(H_INNER_SALT, none(), none()), encryptedConstant());
+  t.eqBytes(blob, ref(H_INNER, none(), none()),
+            "the encrypted inner layer is the blob tor decrypted");
+
+  // The inner layer is **not** padded, unlike the middle one. Its length tracks the number of
+  // introduction points, which is why the middle layer's padding is what hides that.
+  t.isTrue(plain.len() % SUPERENC_PAD_MULTIPLE != 0,
+           "the inner layer is not padded to a block, and only the middle one is");
+
+  // No introduction points is refused rather than written: a descriptor with none is useless, and
+  // tor would report exactly the `intro_points: 0` that a broken one does.
+  t.eqI32(encryptedPlaintext(u8[][0]()).len(), 0, "a descriptor with no introduction points is not one");
+  return t.report();
+}
+
+/** Inputs that cannot make an introduction point produce nothing. */
+export string test_a_bad_introduction_point_is_refused(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] ls = ref(H_LINK_SPECS, none(), none());
+  u8[] ntor = ref(H_IP_NTOR, none(), none());
+  u8[] enc = ref(H_IP_ENC, none(), none());
+  u8[] a = ref(H_AUTH_CERT, none(), none());
+  u8[] e = ref(H_ENC_CERT, none(), none());
+
+  t.eqI32(introPointSection(u8[0](), ntor, a, enc, e).len(), 0, "no link specifiers, no section");
+  t.eqI32(introPointSection(ls, u8[31](), a, enc, e).len(), 0, "a 31-byte onion key is not one");
+  t.eqI32(introPointSection(ls, ntor, u8[0](), enc, e).len(), 0, "no auth certificate, no section");
+  t.eqI32(introPointSection(ls, ntor, a, u8[31](), e).len(), 0, "a 31-byte encryption key is not one");
+  t.eqI32(introPointSection(ls, ntor, a, enc, u8[0]()).len(), 0, "no cross certificate, no section");
   return t.report();
 }
 
