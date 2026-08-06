@@ -1,0 +1,97 @@
+{
+  "source": "npm:ethers@6 — namehash, dnsEncode, id",
+  "rebuild": "deno run -A packages/ens/tools/vendor.ts > packages/ens/test/vendor/corpus.json",
+  "note": "every name is already ENSIP-15 normalised; the generator refuses one that is not",
+  "names": [
+    {
+      "name": "eth",
+      "namehash": "93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae",
+      "dns": "0365746800"
+    },
+    {
+      "name": "foo.eth",
+      "namehash": "de9b09fd7c5f901e23a3f19fecc54828e9c848539801e86591bd9801b019f84f",
+      "dns": "03666f6f0365746800"
+    },
+    {
+      "name": "a.b.c.eth",
+      "namehash": "922dd0da59088eccc6d9681b9c2fa97dd872ab83e7899f998090d652a0bcf83a",
+      "dns": "0161016201630365746800"
+    },
+    {
+      "name": "vitalik.eth",
+      "namehash": "ee6c4522aab0003e8d14cd40a6af439055fd2577951148c14b6cea9a53475835",
+      "dns": "07766974616c696b0365746800"
+    },
+    {
+      "name": "resolver.eth",
+      "namehash": "fdd5d5de6dd63db72bbc2d487944ba13bf775b50a80805fe6fcaba9b0fba88f5",
+      "dns": "087265736f6c7665720365746800"
+    },
+    {
+      "name": "long-label-with-hyphens.eth",
+      "namehash": "bb8b71e3c2c527a90e23d377315c24a372c55e10b836febb91c9e4440155adc5",
+      "dns": "176c6f6e672d6c6162656c2d776974682d68797068656e730365746800"
+    },
+    {
+      "name": "0123456789.eth",
+      "namehash": "07bb61e23d6426b81f89509a9f23b55a138c6f9c4e1367da5678618324eb2b7f",
+      "dns": "0a303132333435363738390365746800"
+    },
+    {
+      "name": "x.y.z.a.b.c.d.e.f.eth",
+      "namehash": "c7e78dd001ddf37700b3dc4f949ea50b1614cdb35547176a806ef40b8cb9ea68",
+      "dns": "01780179017a0161016201630164016501660365746800"
+    },
+    {
+      "name": "café.eth",
+      "namehash": "a7369e1df22e06ec6d91162508e400d7af475860638f927e6d1085bb0134a74a",
+      "dns": "05636166c3a90365746800"
+    },
+    {
+      "name": "test",
+      "namehash": "04f740db81dc36c853ab4205bddd785f46e79ccedca351fc6dfcbd8cc9a33dd6",
+      "dns": "047465737400"
+    },
+    {
+      "name": "a",
+      "namehash": "83853f8c4ca91ae85231d68dec421e7d9210f65860b863a574dfc0dc0c7e815e",
+      "dns": "016100"
+    },
+    {
+      "name": "sub.domain.test",
+      "namehash": "c6fc45d5fb0e5439c27c760d34a6dca9c20224dd1c3a40c85ec0dc00f322db0b",
+      "dns": "0373756206646f6d61696e047465737400"
+    }
+  ],
+  "selectors": [
+    {
+      "signature": "resolver(bytes32)",
+      "selector": "0178b8bf"
+    },
+    {
+      "signature": "addr(bytes32)",
+      "selector": "3b3b57de"
+    },
+    {
+      "signature": "addr(bytes32,uint256)",
+      "selector": "f1cb7e06"
+    },
+    {
+      "signature": "text(bytes32,string)",
+      "selector": "59d1d43c"
+    },
+    {
+      "signature": "contenthash(bytes32)",
+      "selector": "bc1c58d1"
+    },
+    {
+      "signature": "supportsInterface(bytes4)",
+      "selector": "01ffc9a7"
+    },
+    {
+      "signature": "resolve(bytes,bytes)",
+      "selector": "9061b923"
+    }
+  ]
+}

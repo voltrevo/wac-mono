@@ -1,0 +1,170 @@
+// ENS: the name a person types, turned into the node a contract is asked about.
+//
+// A name is `sub.domain.eth`; the registry keys on a 32-byte **node**, and `namehash` is how one becomes the
+// other (EIP-137):
+//
+//     namehash("")        = 32 zero bytes
+//     namehash("a.b.c")   = keccak256(namehash("b.c") ++ keccak256("a"))
+//
+// Right to left, which is what makes a subdomain's node derivable from its parent's without asking anybody.
+//
+// ## Normalisation is not implemented, and that matters
+//
+// A real client normalises the name first — ENSIP-15: case folding, Unicode mapping, emoji sequences,
+// confusable checks — and `namehash("UPPER.eth")` in a wallet means `namehash("upper.eth")`. That is a
+// Unicode specification with a large data table, and none of it is here. **This hashes the labels it is
+// given.** For a lowercase ASCII name that is the same answer; for anything else it is the caller's job, and
+// a caller that skips it will compute a node nobody else agrees with.
+//
+// Said here rather than approximated with a `toLowerCase`, which would be right for `UPPER.eth` and wrong
+// for half of Unicode — and wrong in a way that produces a *plausible* node rather than an error.
+// `packages/ens/test/vendor/corpus.json` is generated with a check that every name in it is already
+// normalised, so the tests cannot quietly cover for this.
+//
+// ## What is here
+//
+// The node, the DNS wire encoding ENSIP-10 wildcard resolution needs, and the calldata for the two calls a
+// resolution makes: `resolver(bytes32)` on the registry, then `addr(bytes32)` on whatever that returns.
+// Making the calls is not this package's business — it has no network and no opinion about where an RPC
+// endpoint lives.
+
+import { keccak256 } from "../../crypto/src/keccak.wac";
+
+/** The 32 zero bytes every name's walk starts from — the root node. */
+export u8[] rootNode() { return u8[32](); }
+
+/**
+ * The ENS node for `name`, which must already be normalised — see the header.
+ *
+ * An empty name is the root. A trailing dot is not stripped, because `"eth."` and `"eth"` are different
+ * inputs and guessing which was meant is how a resolver silently answers about a different node.
+ */
+export u8[] namehash(u8[] name) {
+  u8[] node = rootNode();
+  if (name.len() == 0) { return node; }
+  // Right to left: the last label is hashed into the root first, so `sub.example.eth` reaches the same node
+  // whichever way a caller arrived at `example.eth`.
+  i32 end = name.len();
+  for (i32 i = name.len() - 1; i >= -1; i--) {
+    if (i == -1 || name[i] == '.') {
+      u8[] label = slice(name, i + 1, end);
+      node = hashInto(node, keccak256(label));
+      end = i;
+    }
+  }
+  return node;
+}
+
+/** `keccak256(node ++ labelHash)` — one step up the tree. Exported because a subdomain is one step. */
+export u8[] hashInto(u8[] node, u8[] labelHash) {
+  if (node.len() != 32 || labelHash.len() != 32) { trap; }
+  u8[] joined = u8[64]();
+  for (i32 i = 0; i < 32; i++) { joined[i] = node[i]; }
+  for (i32 i = 0; i < 32; i++) { joined[32 + i] = labelHash[i]; }
+  return keccak256(joined);
+}
+
+/**
+ * A name in DNS wire format: each label prefixed by its length, terminated by a zero byte.
+ *
+ * ENSIP-10 wildcard resolution passes the name this way, so a resolver can see the labels rather than only
+ * the node. `foo.eth` is `03 666f6f 03 657468 00`.
+ *
+ * A label longer than 255 bytes has no wire form and traps rather than being truncated: a truncated name is
+ * a different name, and answering about it would be worse than refusing.
+ */
+export u8[] dnsEncode(u8[] name) {
+  if (name.len() == 0) { return u8[](0); }
+  i32 total = 1;
+  i32 start = 0;
+  for (i32 i = 0; i <= name.len(); i++) {
+    if (i == name.len() || name[i] == '.') {
+      i32 len = i - start;
+      if (len > 255) { trap; }
+      total = total + 1 + len;
+      start = i + 1;
+    }
+  }
+  u8[] out = u8[total]();
+  i32 at = 0;
+  start = 0;
+  for (i32 i = 0; i <= name.len(); i++) {
+    if (i == name.len() || name[i] == '.') {
+      out[at] = i - start;
+      at++;
+      for (i32 j = start; j < i; j++) { out[at] = name[j]; at++; }
+      start = i + 1;
+    }
+  }
+  // The terminator. A `u8[]` is zero-filled and `total` counts this byte, so deleting the line changes
+  // nothing — measured, and said here because the alternative is a reader assuming it is load-bearing. It
+  // stays because a wire format's terminator should be written where the format is built, not left to be
+  // inferred from an allocator's behaviour.
+  out[at] = 0;
+  return out;
+}
+
+// ── Calldata ──────────────────────────────────────────────────────────────────
+//
+// A selector is the first four bytes of `keccak256` of the signature, and the arguments follow it in ABI
+// encoding. Both of these take one `bytes32`, which is a static type, so the calldata is the selector and
+// one word — no `packages/abi` needed for the encoding, though the *answer* needs it.
+
+/** `resolver(bytes32)` on the registry: which contract answers for this node. */
+export u8[] resolverCall(u8[] node) { return callWithNode(u8[](0x01, 0x78, 0xb8, 0xbf), node); }
+
+/** `addr(bytes32)` on a resolver: the address a name points at. */
+export u8[] addrCall(u8[] node) { return callWithNode(u8[](0x3b, 0x3b, 0x57, 0xde), node); }
+
+/** `contenthash(bytes32)` on a resolver — the content a name points at, for a page rather than a payment. */
+export u8[] contenthashCall(u8[] node) { return callWithNode(u8[](0xbc, 0x1c, 0x58, 0xd1), node); }
+
+u8[] callWithNode(u8[] selector, u8[] node) {
+  if (node.len() != 32) { trap; }
+  u8[] out = u8[36]();
+  for (i32 i = 0; i < 4; i++) { out[i] = selector[i]; }
+  for (i32 i = 0; i < 32; i++) { out[4 + i] = node[i]; }
+  return out;
+}
+
+/**
+ * The selector for any signature, for a call this package does not name.
+ *
+ * The signature is the canonical one — `transfer(address,uint256)`, no spaces, no parameter names — because
+ * that is what the selector is defined over. A signature with a space in it hashes to something no contract
+ * has.
+ */
+export u8[] selector(u8[] signature) {
+  u8[] h = keccak256(signature);
+  u8[] out = u8[4]();
+  for (i32 i = 0; i < 4; i++) { out[i] = h[i]; }
+  return out;
+}
+
+/**
+ * The 20-byte address in a 32-byte return word, or empty when the word is not one.
+ *
+ * `addr(bytes32)` answers one ABI word, and an address occupies its last twenty bytes. The first twelve must
+ * be zero — a resolver whose word has anything in them is not answering with an address, and the caller
+ * would otherwise take the low twenty bytes of something else and treat it as one.
+ */
+export u8[] addressFromWord(u8[] word) {
+  if (word.len() != 32) { return u8[0](); }
+  for (i32 i = 0; i < 12; i++) { if (word[i] != 0) { return u8[0](); } }
+  u8[] out = u8[20]();
+  for (i32 i = 0; i < 20; i++) { out[i] = word[12 + i]; }
+  return out;
+}
+
+/** The zero address, which is how ENS says "no resolver" and "not set" — an answer, not a failure. */
+export bool isZeroAddress(u8[] address) {
+  if (address.len() != 20) { return false; }
+  for (i32 i = 0; i < 20; i++) { if (address[i] != 0) { return false; } }
+  return true;
+}
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[to - from]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = b[from + i]; }
+  return out;
+}

@@ -57,7 +57,7 @@ Ordered by dependency, not by intent.
 | RLP — `packages/rlp` | **done** — Ethereum's own `RLPTests`, 28 valid driven in both directions against the published bytes and 26 invalid all refused; the one rule the corpus does not cover is named in `test/vendor/README.md` |
 | ABI encoding and decoding — `packages/abi` | **done** — schema-driven, thirty cases from `npm:ethers` including every nested shape, decoded *and* re-encoded byte for byte, with the malformed-offset refusals |
 | Merkle-Patricia state proofs — `packages/mpt` | **done bar one vector** — the verifier and the account-and-storage composition, anchored to all seven of `trieanyorder.json`'s published roots; inclusion, absence and every perturbation. 0086 stays open only for a live `eth_getProof` recorded as a vector |
-| ENS resolution | not started — downstream of keccak256, ABI and state proofs |
+| ENS resolution — `packages/ens` | **the name half is done** — namehash, DNS wire encoding, selectors and the two calls' calldata, all against `npm:ethers`. ENSIP-15 normalisation is not implemented and says so; making the calls needs an endpoint, which is the same gap 0086 has |
 | secp256k1 signing | not started — see the section below, which is the reason it is last |
 | content-addressed retrieval (IPFS or otherwise) | not started — needs a decision about what is being promised |
 | notifications, update channels, atomic activation with rollback | not started — these are Wacland's, see [0001](0001-a-self-contained-system.md) |

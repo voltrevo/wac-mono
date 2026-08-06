@@ -1,0 +1,128 @@
+// ENS against `ethers`, which computed every expectation in `../vendor/corpus.json`.
+//
+// The host hands each case over as `name|namehash|dnsEncoding`; nothing here was written by hand, and the
+// generator refuses a name that is not already ENSIP-15 normalised — because this package hashes the labels
+// it is given and a corpus entry needing normalisation would be testing the wrong thing.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { namehash, dnsEncode, rootNode, hashInto, selector, resolverCall, addrCall,
+         addressFromWord, isZeroAddress } from "../../src/ens.wac";
+import { keccak256 } from "../../../crypto/src/keccak.wac";
+
+export string test_namehash_and_dns_encoding_match_ethers(fn[string(i32)] cases, fn[i32()] count,
+                                                          fn[string(i32)] sigs, fn[i32()] sigCount) {
+  T t = T.create();
+  i32 n = count();
+  t.isTrue(n >= 10, "the corpus should have a dozen names, has " + itoa(n));
+  for (i32 i = 0; i < n; i++) {
+    string[] parts = split(cases(i));
+    u8[] name = parts[0].toBytes();
+    t.eqStr(hex(namehash(name)), parts[1], parts[0] + ": namehash");
+    t.eqStr(hex(dnsEncode(name)), parts[2], parts[0] + ": dns encoding");
+  }
+  return t.report();
+}
+
+export string test_selectors_match_ethers(fn[string(i32)] cases, fn[i32()] count,
+                                          fn[string(i32)] sigs, fn[i32()] sigCount) {
+  // The *third and fourth* arguments: `wacTestRun` hands every test the same positional list.
+  T t = T.create();
+  i32 n = sigCount();
+  t.isTrue(n >= 5, "the corpus should have several signatures, has " + itoa(n));
+  for (i32 i = 0; i < n; i++) {
+    string[] parts = split(sigs(i));
+    t.eqStr(hex(selector(parts[0].toBytes())), parts[1], parts[0]);
+  }
+  return t.report();
+}
+
+export string test_the_root_and_the_walk_up() {
+  // `namehash("")` is the root, and every name is one `hashInto` per label above it — the property that
+  // lets a subdomain's node be derived from its parent's without asking anybody.
+  T t = T.create();
+  t.eqStr(hex(rootNode()), "0000000000000000000000000000000000000000000000000000000000000000", "the root");
+  t.eqStr(hex(namehash("".toBytes())), hex(rootNode()), "the empty name is the root");
+
+  u8[] eth = hashInto(rootNode(), keccak256("eth".toBytes()));
+  t.eqStr(hex(eth), hex(namehash("eth".toBytes())), "one step up from the root");
+  u8[] foo = hashInto(eth, keccak256("foo".toBytes()));
+  t.eqStr(hex(foo), hex(namehash("foo.eth".toBytes())), "and one more");
+
+  // A trailing dot is a different name, not a tidier spelling of the same one.
+  t.isFalse(hex(namehash("eth.".toBytes())) == hex(namehash("eth".toBytes())),
+            "`eth.` and `eth` are different names");
+  return t.report();
+}
+
+export string test_calldata_is_a_selector_and_a_word() {
+  T t = T.create();
+  u8[] node = namehash("foo.eth".toBytes());
+  u8[] call = resolverCall(node);
+  t.eqI32(call.len(), 36, "four bytes of selector and one word");
+  t.eqStr(hex(slice(call, 0, 4)), "0178b8bf", "resolver(bytes32)");
+  t.eqStr(hex(slice(call, 4, 36)), hex(node), "the node, unpadded because it is already a word");
+  t.eqStr(hex(slice(addrCall(node), 0, 4)), "3b3b57de", "addr(bytes32)");
+  return t.report();
+}
+
+export string test_an_address_is_the_low_twenty_bytes_and_only_those() {
+  T t = T.create();
+  u8[] word = u8[32]();
+  for (i32 i = 12; i < 32; i++) { word[i] = i; }
+  t.eqStr(hex(addressFromWord(word)), "0c0d0e0f101112131415161718191a1b1c1d1e1f", "the low twenty bytes");
+  // A word with anything above them is not an address: taking the low twenty anyway is how a resolver's
+  // wrong answer becomes a payment to the wrong place.
+  word[3] = 1;
+  t.eqI32(addressFromWord(word).len(), 0, "a dirty high word is refused");
+  t.eqI32(addressFromWord(u8[20]()).len(), 0, "a short word is refused");
+  t.isTrue(isZeroAddress(u8[20]()), "the zero address is how ENS says `not set`");
+  t.isFalse(isZeroAddress(u8[](1)), "and a 1-byte value is not an address at all");
+  return t.report();
+}
+
+string[] split(string s) {
+  u8[] b = s.toBytes();
+  i32 fields = 1;
+  for (i32 i = 0; i < b.len(); i++) { if (b[i] == '|') { fields++; } }
+  string[] out = string[fields](fill: "");
+  i32 at = 0;
+  i32 start = 0;
+  for (i32 i = 0; i <= b.len(); i++) {
+    if (i == b.len() || b[i] == '|') {
+      u8[] piece = u8[i - start]();
+      for (i32 j = start; j < i; j++) { piece[j - start] = b[j]; }
+      out[at] = string.fromBytes(piece);
+      at++;
+      start = i + 1;
+    }
+  }
+  return out;
+}
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[to - from]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = b[from + i]; }
+  return out;
+}
+
+string hex(u8[] b) {
+  u8[] out = u8[b.len() * 2]();
+  for (i32 i = 0; i < b.len(); i++) {
+    i32 hi = b[i] >> 4;
+    i32 lo = b[i] & 15;
+    out[i * 2] = hi < 10 ? '0' + hi : 'a' + (hi - 10);
+    out[i * 2 + 1] = lo < 10 ? '0' + lo : 'a' + (lo - 10);
+  }
+  return string.fromBytes(out);
+}
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  u8[] buf = u8[12]();
+  i32 n = 0;
+  i32 x = v;
+  while (x > 0) { buf[n] = '0' + (x % 10); n++; x = x / 10; }
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = buf[n - 1 - i]; }
+  return string.fromBytes(out);
+}
