@@ -382,7 +382,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
-| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. The **descriptor build is a function** now — `buildDescriptor` takes a service's own introduction points, time period and revision — and is checked by both oracles on three variants, not just the committed fixture. The **publication plan is complete**: from a consensus alone, `servicePlan` chooses the two time periods, the shared random value for each, and the directories — reaching exactly the ones a real service uploaded to. **Not done:** the service program — the client side of the upload, and the loop that establishes introduction points and answers INTRODUCE2 |
+| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. The **descriptor build is a function** now — `buildDescriptor` takes a service's own introduction points, time period and revision — and is checked by both oracles on three variants, not just the committed fixture. The **publication plan is complete**: from a consensus alone, `servicePlan` chooses the two time periods, the shared random value for each, and the directories — reaching exactly the ones a real service uploaded to. The **upload has a transport** (`publishOverCircuit`) and its answers three meanings, and an **INTRODUCE2 seen twice is dropped**. **Not done:** the service loop that ties them together — establishing introduction points, and driving a rendezvous circuit from an INTRODUCE2 |
 | 7 — the interop matrix | **not started as a document.** Steps 2–6 each contribute rows and most are green; nothing collects them, so a regression in one would not be visible as a regression in *the matrix* |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
@@ -1567,3 +1567,53 @@ will eventually be handed a secret it did not need.
 
 Eight faults planted, eight caught — the first clean sweep in this area, which is what a composition
 test buys once its ingredients are already trustworthy.
+
+### A rejection is not a surprise, and a replay is not a client
+
+Two rules from the same afternoon, both about reading an answer correctly rather than computing one.
+
+**The upload.** `fetchOverCircuit` already had the cell loop an upload needs, so it became
+`requestOverCircuit` — send bytes, get a `Response` — with the GET as a thin wrapper. The loop is
+where SENDME accounting, DESTROY handling and stream teardown live; a second copy would be a second
+place for those to be got subtly differently.
+
+Reading the reply, tor's `handle_response_upload_hsdesc` separates three outcomes where two would seem
+enough. **400** means this directory read the descriptor and refused it — every other directory will
+refuse the same bytes, so retrying is the same failure repeated rather than a recovery. **Anything
+else** says nothing about the descriptor. Collapsing them is what turns a signing bug into an
+intermittent outage: the service retries around the ring, each directory refusing for the same reason,
+and the log shows eight failures against eight directories instead of one bad document. So one
+rejection indicts the descriptor even when seven directories accepted it — they all read the same
+bytes.
+
+**The replay.** A service answers an INTRODUCE2 by building a rendezvous circuit. tor keeps two caches
+and *where each is checked* is as much the rule as what it holds: the ENCRYPTED section against the
+introduction point's cache **before** the ntor keys and the MAC, so a replay costs one SHA-256 rather
+than a handshake; the REND_COOKIE against the service's cache **after** the parse. tor's comment on
+the second is the interesting one — it is usually not an attack. A client whose introduction circuit
+timed out resends the same cookie, and the service is already building that circuit.
+
+Their horizons differ for the same reason: a captured cell is as replayable next month, so that cache
+never forgets; a cookie an hour later is a new attempt, so that one forgets after five minutes.
+
+### The check that could not live at any call site
+
+Eight faults planted on the replay cache, seven caught. The survivor was a comparison **truncated to
+four bytes of a thirty-two-byte digest** — and no test that feeds real inputs can catch it, because
+constructing two values whose digests share a prefix is exactly the work the digest exists to prevent.
+
+That is a different kind of gap from the ones this document keeps recording. It is not a missing case;
+it is a property that is unreachable from where the calls are made.
+
+So the comparison stopped being private. There were already **four** copies of that loop —
+`crypto/aead`, `crypto/aesgcm`, `tor/hsservice` — and the fifth about to be written in `hsreplay` was
+not even constant-time, because a replay cache does not look like somewhere timing matters. It is: the
+digests are of ciphertext an attacker chose. `crypto/src/ct.wac` now holds `ctEqual` and `ctEqualN`,
+all four callers use them, and its own test places the difference at each of the thirty-two positions
+in turn. The check that could not live at any call site lives once, and every caller inherits it.
+
+Seven faults planted there, seven caught, the truncation among them.
+
+A smaller thing worth keeping: the replay cache's own test found a trap. A zero-capacity cache fell
+through to the eviction path and indexed an empty array. It remembers nothing now — a bad
+configuration but a coherent one, and not worth crashing a service over.
