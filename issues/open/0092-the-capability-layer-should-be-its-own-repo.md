@@ -12,10 +12,11 @@ Move `packages/platform` out of wac-mono into a repo of its own. Decided with th
 
 ## Why it does not belong here
 
-wac-mono is a repo of **wac libraries**: 28 packages, 61k lines of wac, and the rule that the
+wac-mono is a repo of **wac libraries**: 32 packages, 64k lines of wac, and the rule that the
 interesting code is in `src/*.wac` with TypeScript only as harness. `platform` inverts that ratio —
-**3,271 lines of wac and 12,826 of TypeScript**, most of it in `host/`, which is 17 files of worker
-lifecycle, a `SharedArrayBuffer` ring, sequence counters, a responder and three runtime adaptors.
+**3,289 lines of wac and 13,270 of TypeScript** as of 2026-08-06, most of it in `host/`, which is 17
+files of worker lifecycle, a `SharedArrayBuffer` ring, sequence counters, a responder and three
+runtime adaptors. The ratio is the point rather than the figures, and it has not moved.
 
 That is not a library that happens to have a host. It is a platform: it juggles workers and
 messaging and binds external capabilities, and everything else here is built *on* it — `box`, `fs`,

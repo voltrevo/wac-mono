@@ -838,7 +838,7 @@ takes a worker bundle and this world deliberately has no capability for running 
 so "a mixed network" in this document's sense needs a platform change and the C tor half of the
 interop matrix stays a shell script. And **the suite does not stand up a Tor network with it** — the
 ports a relay listens on are baked into its signed descriptor, so two agents running the suite at once
-would collide on 5555. `test/network.test.ts` tests the launcher against `example/waiter.wac`, which
+would collide on 5555. `test/network.test.ts` tests the launcher against `packages/platform/example/waiter.wac`, which
 is the right subject anyway: it knows about processes and ready markers, not about Tor.
 
 ### Step 6 begins: ESTABLISH_INTRO, and a span nothing in the cell hints at

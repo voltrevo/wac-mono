@@ -3,7 +3,7 @@
 // Deliberately **not** a Tor network. `src/network.wac` knows about processes and ready markers, not
 // about relays, and testing it against three relays would mean this test fails whenever anything in
 // the tor stack does — plus it would bind the fixed ports a signed descriptor advertises, so two
-// agents running the suite at once would collide. `example/waiter.wac` exists to be started and
+// agents running the suite at once would collide. `packages/platform/example/waiter.wac` exists to be started and
 // killed and `example/wc.wac` exits 0 or 1 on demand, which is the whole vocabulary the launcher has.
 //
 // What is checked is the part that made every shell script this replaces untrustworthy:
