@@ -1,6 +1,28 @@
 # tor
 
-A Tor client, in wac, on top of this repo's TLS 1.3 stack.
+Tor in wac — a client, a relay, a directory authority and an onion-service client, on top of this repo's TLS 1.3 stack.
+
+Both ends of the protocol, in other words. The package started as a client and the name stuck, but
+what is here now is most of a small Tor network and the tools to stand one up:
+
+| | where | state |
+| --- | --- | --- |
+| **client** — circuits, streams, a verified consensus, path selection | `src/bootstrap.wac`, `src/circuit.wac`, `src/app.wac` | live against C tor |
+| **SOCKS5** — the protocol as pure functions, and a proxy program | `src/socks5.wac`, `src/socks.wac` | live; `curl --socks5-hostname` works |
+| **relay** — certificates, the responder link handshake, CREATE2/EXTEND2, being a hop | `src/relaycert.wac`, `src/relaylink.wac`, `src/relaycircuit.wac`, `src/relayd.wac` | live: a C tor bootstraps through it and carries bytes |
+| **directory authority** — votes, consensus generation, the HTTP port | `src/vote.wac`, `src/consensusgen.wac`, `src/dird.wac` | live: a C tor bootstraps from it |
+| **onion-service client** — addresses, blinding, the HSDir ring, descriptors, hs-ntor | `src/onionaddr.wac` … `src/hsntor.wac`, `src/hsconnect.wac` | live against a real service |
+| **onion-service hosting** | `src/hsservice.wac` | **partial** — see *Hosting one* |
+| **a whole test network** | `src/network.wac` | wac all the way down: authorities, relays and the run, from a description |
+
+Every row is checked against C tor rather than against another part of this package — parsers, cell
+formats and key material pinned by tor's own code, and the live ones witnessed by a C tor doing the
+other half. *How it is tested* says what that means in each case, and **what is deliberately missing
+is at the bottom**, under *What is not here*: the guard algorithm is partial, there is no circuit
+padding, isolation is by port rather than by credential, and none of this should be pointed at the
+real network.
+
+## The client
 
 It builds circuits. Against a local chutney testnet it does the link handshake, negotiates
 link protocol 5, runs ntor, extends to three hops, opens a stream and fetches a consensus
@@ -113,9 +135,12 @@ building with `tools/tor.sh`. The binary is looked for under `$HOME/tor-build`, 
 | `src/app.wac` | a program: fetch one path over a fresh circuit and exit |
 | `src/socks.wac` | a program: the SOCKS5 proxy |
 
-The two programs are thin — `app.wac` is 77 lines — because everything they share was moved
+The programs are thin — `app.wac` is 77 lines — because everything they share was moved
 below them. It did not start that way: `app.wac` was 510 lines with the whole client inside
-`main`, which was fine until there was a second program and none of it could be reused.
+`main`, which was fine until there was a second program and none of it could be reused. There are
+ten of them now, in `MAP.md`: the client and the proxy, the relay and the directory authority, the
+network launcher, the two onion-service clients, and three generators that exist to hand a document
+to tor's own parser.
 
 There is no `host/` directory. There was, and it was 1368 lines against 722 of wac — in a
 repo where `tls` is 0.17x TypeScript and `ssh`, a client and a server, is zero. The excuse

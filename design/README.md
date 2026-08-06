@@ -27,8 +27,8 @@ pieces rather than steps, ordered by dependency rather than intent.
 
 The distinction earns its place because the two fail differently. A direction with no order of work is
 incomplete; a destination with one invites somebody to follow it top to bottom, which is exactly the
-mistake [0003](0003-an-ethereum-distribution.md) exists to prevent — its verification core is finished
-and its plumbing is not, so reading it as a sequence would start at the wrong end. If a destination
+mistake [0003](0003-an-ethereum-centric-reference-distribution.md) exists to prevent — its verification
+core is finished and its plumbing is not, so reading it as a sequence would start at the wrong end. If a destination
 acquires a sequence, it becomes an ordinary direction and says so.
 
 ## What does not belong here

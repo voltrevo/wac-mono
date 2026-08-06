@@ -7,7 +7,7 @@
 - **Kind:** missing feature
 - **Symptom:** not implemented
 
-Third slice of [design/0003](../../design/0003-an-ethereum-distribution.md). Needs
+Third slice of [design/0003](../../design/0003-an-ethereum-centric-reference-distribution.md). Needs
 [0083](0083-keccak256-for-ethereum-not-just-sha3.md) for selectors.
 
 The contract ABI: how a call's arguments become calldata and how the returned bytes become values. Every

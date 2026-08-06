@@ -7,7 +7,7 @@
 - **Kind:** missing feature
 - **Symptom:** not implemented
 
-Fourth slice of [design/0003](../../design/0003-an-ethereum-distribution.md). Needs
+Fourth slice of [design/0003](../../design/0003-an-ethereum-centric-reference-distribution.md). Needs
 [0083](0083-keccak256-for-ethereum-not-just-sha3.md) and
 [0084](0084-rlp-encoding-and-decoding.md).
 

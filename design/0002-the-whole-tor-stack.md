@@ -387,9 +387,16 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
 
-Known holes that are not steps: flow control (`SENDME`) has never run under a transfer big enough to
-exhaust a window; a relay extending to *its own* port still fails in the uninstrumented VERSIONS
-exchange; `certsCount` and `certsCell` have still never been shown each other's output.
+Known holes that are not steps: a relay extending to *its own* port still fails in the uninstrumented
+VERSIONS exchange; `certsCount` and `certsCell` have still never been shown each other's output.
+
+**Flow control was on this list and is not any more** (agent-a, 2026-08-06, from
+[#45](https://github.com/voltrevo/wac-mono/issues/45)). It said `SENDME` had never run under a
+transfer big enough to exhaust a window, which step 3 above already contradicts — 8 MB to a slow
+reader, 1 MB the other way past the 500-cell window, and the client side has carried 1.2 MB over 209
+streams at 2.5x the circuit window. A hole that has been filled and left on the list is worse than one
+that was never written down: somebody reads it and re-does the work, or trusts the rest of the list
+less.
 
 The client's own limitations — guard algorithm, circuit padding, isolation by credential — live in
 `packages/tor/README.md` and are deliberately not restated here.

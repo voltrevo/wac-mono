@@ -7,7 +7,7 @@
 - **Kind:** missing feature
 - **Symptom:** not implemented
 
-Second slice of [design/0003](../../design/0003-an-ethereum-distribution.md).
+Second slice of [design/0003](../../design/0003-an-ethereum-centric-reference-distribution.md).
 
 Recursive Length Prefix: the execution layer's serialisation, for transactions, receipts, block headers
 and — the reason 0003 needs it — the nodes of a Merkle-Patricia trie. Nothing in the repo has it.
