@@ -296,6 +296,36 @@ strictly-greater revision-counter rule, `crypto_rand_int_range` being half-open 
 says inclusive, and every HSDir in a real consensus having `DirPort 0`. A deterministic mode should be
 sold as a coverage and debugging multiplier, which is large, and not as an oracle, which it is not.
 
+**It also turns hangs from an inference into an observation** (operator, 2026-08-06). D12 already notes
+that under Wacland "nobody can proceed" becomes a *proven* deadlock; virtual time is what makes that
+cheap and what separates it from the two states it is currently confused with. Under a real clock a
+hang is only ever inferred — nothing happened for thirty seconds, so we call it stuck — which is why
+0082 has been seen half a dozen times and diagnosed none. Under a scheduler-owned clock there are three
+distinguishable states where there was one:
+
+| the scheduler sees | what it means |
+|---|---|
+| nothing runnable, no deadlines pending | **deadlock** — there is nothing to advance the clock to, so nothing can ever happen. A proof, not a wait, reported in milliseconds with the blocked-on-what state attached |
+| nothing runnable, a deadline pending | **quiescent** — advance to it. This is progress, and today it is indistinguishable from a hang whenever the deadline is far away |
+| always runnable, clock never advances | **livelock** — busy and going nowhere. The polling hazard below is exactly this, which makes the hazard its own detector |
+
+The strongest form of it: **in a closed world nothing is merely slow**, so a deadline that fires is
+evidence of a stall. Today a five-second `waitAny` timeout *masks* a deadlock — the program takes its
+fallback path, the test passes slowly, and nobody learns the primary path never completed. Under a
+virtual clock the timeout still fires and still costs nothing, but the runtime can report that the run
+advanced five seconds purely to satisfy a deadline, which where nothing is slow means something did not
+happen that should have.
+
+Two open issues are this shape. **0082** hangs about once in fifty runs and only on an idle machine.
+**0091** — `relayd` holding more outstanding calls than the ring has slots — is annotated "not worth
+doing this week" largely because reproducing it is expensive; under this it is a seed and a proof, with
+the ring's state in the report.
+
+The limit, so the claim is not oversold: this decides hangs *inside* the world the scheduler owns. A
+peer that never answers on a real socket is open-world, and there a timeout genuinely is the mechanism
+rather than a mask. And "nothing runnable, no deadlines" is decidable where "this will never progress"
+is not — the livelock row stays a heuristic on a counter, not a proof.
+
 **Two hazards it introduces**, both known from Shadow and neither obvious:
 
 - **a program that polls instead of blocking hangs the simulation.** It stays runnable, so the clock
