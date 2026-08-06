@@ -9,6 +9,7 @@
 // re-verify would be three chances for them to disagree about which proof they were talking about.
 import { keccak256 } from "../../../crypto/src/keccak.wac";
 import { verify, Proved } from "../../src/proof.wac";
+import { accountAt, storageAt, Account, AccountProof, StorageProof } from "../../src/account.wac";
 
 export u8[] hash(u8[] input) { return keccak256(input); }
 
@@ -54,4 +55,53 @@ u8[][] unpack(u8[] packed) {
 
 i32 lenAt(u8[] b, i32 at) {
   return b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24);
+}
+
+/**
+ * `accountAt`, flattened: `[ok, present, nonceLen, balanceLen, nonce…, balance…, storageRoot(32),
+ * codeHash(32), error…]` when present, and `[ok, present, 0, 0, error…]` when not.
+ *
+ * The two lengths are single bytes because both fields are minimal big-endian and neither can exceed 32.
+ */
+export u8[] verifyAccount(u8[] stateRoot, u8[] address, u8[] packed) {
+  AccountProof a = accountAt(stateRoot, address, unpack(packed));
+  u8[] err = a.error.toBytes();
+  i32 nl = a.present ? a.account.nonce.len() : 0;
+  i32 bl = a.present ? a.account.balance.len() : 0;
+  i32 tail = a.present ? 64 : 0;
+  u8[] out = u8[4 + nl + bl + tail + err.len()]();
+  out[0] = a.ok ? 1 : 0;
+  out[1] = a.present ? 1 : 0;
+  out[2] = nl;
+  out[3] = bl;
+  i32 at = 4;
+  if (a.present) {
+    for (i32 i = 0; i < nl; i++) { out[at + i] = a.account.nonce[i]; }
+    at = at + nl;
+    for (i32 i = 0; i < bl; i++) { out[at + i] = a.account.balance[i]; }
+    at = at + bl;
+    for (i32 i = 0; i < 32; i++) { out[at + i] = a.account.storageRoot[i]; }
+    at = at + 32;
+    for (i32 i = 0; i < 32; i++) { out[at + i] = a.account.codeHash[i]; }
+    at = at + 32;
+  }
+  for (i32 i = 0; i < err.len(); i++) { out[at + i] = err[i]; }
+  return out;
+}
+
+/** `storageAt`, flattened as `verifyProof` is: `[ok, present, len(4), value…, error…]`. */
+export u8[] verifyStorage(u8[] storageRoot, u8[] slot, u8[] packed) {
+  StorageProof s = storageAt(storageRoot, slot, unpack(packed));
+  u8[] err = s.error.toBytes();
+  i32 n = s.value.len();
+  u8[] out = u8[6 + n + err.len()]();
+  out[0] = s.ok ? 1 : 0;
+  out[1] = s.present ? 1 : 0;
+  out[2] = n & 0xFF;
+  out[3] = (n >> 8) & 0xFF;
+  out[4] = (n >> 16) & 0xFF;
+  out[5] = (n >> 24) & 0xFF;
+  for (i32 i = 0; i < n; i++) { out[6 + i] = s.value[i]; }
+  for (i32 i = 0; i < err.len(); i++) { out[6 + n + i] = err[i]; }
+  return out;
 }

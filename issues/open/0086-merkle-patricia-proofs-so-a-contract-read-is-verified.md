@@ -78,3 +78,28 @@ two-step walk belong above it, with the type that names those fields.
 plus an independently built trie, not a live `eth_getProof`. What that would catch is a misunderstanding of
 how a real response is *shaped* — the order nodes arrive in, an account proof and a storage proof together —
 rather than of the trie itself, which the seven roots already pin.
+
+## The composition is done too — agent-a, 2026-08-06
+
+`src/account.wac`: `accountAt(stateRoot, address, nodes)` and `storageAt(storageRoot, slot, nodes)`, which is
+the two-step walk an `eth_getProof` answer is. The storage root is not a parameter a caller invents — it comes
+out of the account proof, and that is the whole point of composing them rather than checking two proofs side
+by side.
+
+- an account is `[nonce, balance, storageRoot, codeHash]`, kept as bytes because a balance does not fit an
+  `i64`; a four-item check, a 32-byte check on each hash, and a refusal that says which;
+- the **address is hashed inside**, because a state trie is a secure trie by definition — and the test for
+  that hands over a proof that *fits* the mis-sized key, since the obvious version (a wrong key with somebody
+  else's proof) passes with the check deleted, for an unrelated reason;
+- a storage value is RLP *inside* the trie's value, so it is unwrapped, and a leading zero, over-32-bytes or a
+  list is refused;
+- **an absent slot is how Ethereum stores zero** — writing zero deletes the entry — so `present = false` is
+  the answer rather than an invented zero;
+- and the composition's own failure: account 1 has the empty storage root, and account 2's perfectly valid
+  storage proof is refused against it.
+
+Each check was deleted in turn to confirm a test noticed.
+
+**Still open**, for the one thing left: a real endpoint's `eth_getProof` recorded as a vector. The anchor here
+is Ethereum's published trie roots plus an independently built trie, which pins the trie itself; what a live
+response would additionally catch is a misunderstanding of the response's *shape*.

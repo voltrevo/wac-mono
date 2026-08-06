@@ -1,0 +1,174 @@
+// The two-step walk an `eth_getProof` answer actually is.
+//
+// `proof.wac` verifies one trie against one root. Reading a contract's storage takes two: the **state**
+// trie, keyed by `keccak256(address)`, whose value is an account's RLP; and then that account's **storage**
+// trie, keyed by `keccak256(slot)`, under the `storageRoot` the account itself carries. The second root is
+// therefore not something a caller supplies — it comes out of the first proof, which is what makes the
+// composition a verification rather than two unrelated checks.
+//
+// ## What an account is
+//
+//     [ nonce, balance, storageRoot, codeHash ]
+//
+// Four items, RLP. `nonce` and `balance` are big-endian byte strings of minimal length, which is RLP's only
+// way to spell a number; `storageRoot` and `codeHash` are 32 bytes each. They are kept as bytes here rather
+// than parsed into integers: a balance does not fit an `i64`, and a caller that wants one has
+// `packages/bignum` and knows what it is asking for.
+//
+// ## Absence, twice
+//
+// Both levels can legitimately answer "nothing there", and they mean different things:
+//
+//   * **no account** — the address has never been touched. Ethereum's own answer for this is an account of
+//     all zeros with the empty-trie storage root, and the *proof* is an exclusion proof in the state trie.
+//   * **no slot** — the account exists and the slot was never written, or was written back to zero.
+//     Ethereum stores no zero slots, so "absent" and "zero" are the same state, and `storageAt` reports
+//     `present = false` with an empty value rather than inventing a zero.
+//
+// A caller that treats a failed proof as an empty slot has undone the point of the exercise, so `ok` is
+// separate from `present` here exactly as it is one layer down.
+
+import { verify, Proved } from "./proof.wac";
+import { decode, Decoded, Item, itemsOf, bytesOf, isList } from "../../rlp/src/rlp.wac";
+import { keccak256 } from "../../crypto/src/keccak.wac";
+
+/** An account as the state trie stores it. Numbers stay as bytes — see the header. */
+export struct Account {
+  /** Big-endian, minimal length. Empty means zero. */
+  u8[] nonce;
+  /** Big-endian, minimal length. Empty means zero, and a real balance does not fit an i64. */
+  u8[] balance;
+  /** The root of this account's storage trie: the second walk starts here. */
+  u8[] storageRoot;
+  /** `keccak256` of the account's code, or of the empty string when it has none. */
+  u8[] codeHash;
+
+  Account of(u8[] nonce, u8[] balance, u8[] storageRoot, u8[] codeHash) {
+    return Account(nonce, balance, storageRoot, codeHash);
+  }
+}
+
+/** What an account proof established. `present` is false for an address the state has never seen. */
+export struct AccountProof {
+  bool ok;
+  bool present;
+  Account account;
+  string error;
+
+  AccountProof of(bool ok, bool present, Account account, string error) {
+    return AccountProof(ok, present, account, error);
+  }
+}
+
+/** What a storage proof established. An absent slot is zero, which is why `present` is separate. */
+export struct StorageProof {
+  bool ok;
+  bool present;
+  /** The slot's value, big-endian and minimal — the RLP *inside* the trie's value. Empty when absent. */
+  u8[] value;
+  string error;
+
+  StorageProof of(bool ok, bool present, u8[] value, string error) {
+    return StorageProof(ok, present, value, error);
+  }
+}
+
+/** The empty account, for an address the state trie does not have. */
+Account emptyAccount() { return Account.of(u8[0](), u8[0](), u8[0](), u8[0]()); }
+
+/**
+ * The account at `address`, according to `stateRoot`.
+ *
+ * `address` is the twenty raw bytes; the hashing is done here because the state trie is a *secure* trie by
+ * definition and a caller passing an unhashed key would be a silent wrong answer rather than an error.
+ */
+export AccountProof accountAt(u8[] stateRoot, u8[] address, u8[][] nodes) {
+  if (address.len() != 20) {
+    return AccountProof.of(false, false, emptyAccount(), "an address is 20 bytes");
+  }
+  Proved p = verify(stateRoot, keccak256(address), nodes);
+  if (!p.ok) { return AccountProof.of(false, false, emptyAccount(), p.error); }
+  if (!p.present) { return AccountProof.of(true, false, emptyAccount(), ""); }
+
+  Decoded d = decode(p.value);
+  if (!d.ok) {
+    return AccountProof.of(false, false, emptyAccount(), "the account is not RLP: " + d.error);
+  }
+  if (!isList(d.item)) {
+    return AccountProof.of(false, false, emptyAccount(), "an account is a list of four items");
+  }
+  Item[] parts = itemsOf(d.item);
+  if (parts.len() != 4) {
+    return AccountProof.of(false, false, emptyAccount(),
+      "an account has four items, and this one has " + itoa(parts.len()));
+  }
+  u8[] root = bytesOf(parts[2]);
+  u8[] code = bytesOf(parts[3]);
+  // Checked here rather than left to the storage walk: a 31-byte "root" would fail there with a message
+  // about a proof, which sends the reader to the wrong file.
+  if (root.len() != 32) {
+    return AccountProof.of(false, false, emptyAccount(),
+      "an account's storage root is 32 bytes, and this one is " + itoa(root.len()));
+  }
+  if (code.len() != 32) {
+    return AccountProof.of(false, false, emptyAccount(),
+      "an account's code hash is 32 bytes, and this one is " + itoa(code.len()));
+  }
+  return AccountProof.of(true, true,
+    Account.of(bytesOf(parts[0]), bytesOf(parts[1]), root, code), "");
+}
+
+/**
+ * The value of `slot` in a storage trie rooted at `storageRoot`.
+ *
+ * The root comes from an `Account` this caller has already verified — that is the whole composition, and
+ * passing one from anywhere else is how a proof of the wrong account's storage gets believed.
+ *
+ * A storage value is stored **RLP-encoded**: the trie's value is `rlp(bytes)` rather than the bytes, so a
+ * slot holding 1 is `0x01` and a slot holding 2^256-1 is a 33-byte encoding. That layer is undone here,
+ * because a caller wanting the slot wants the number, not its envelope.
+ */
+export StorageProof storageAt(u8[] storageRoot, u8[] slot, u8[][] nodes) {
+  if (slot.len() != 32) {
+    return StorageProof.of(false, false, u8[0](), "a storage slot key is 32 bytes");
+  }
+  Proved p = verify(storageRoot, keccak256(slot), nodes);
+  if (!p.ok) { return StorageProof.of(false, false, u8[0](), p.error); }
+  if (!p.present) { return StorageProof.of(true, false, u8[0](), ""); }
+
+  Decoded d = decode(p.value);
+  if (!d.ok) {
+    return StorageProof.of(false, false, u8[0](), "the slot's value is not RLP: " + d.error);
+  }
+  if (isList(d.item)) {
+    return StorageProof.of(false, false, u8[0](), "a slot holds a byte string, not a list");
+  }
+  u8[] v = bytesOf(d.item);
+  if (v.len() > 32) {
+    return StorageProof.of(false, false, u8[0](),
+      "a slot holds at most 32 bytes, and this one claims " + itoa(v.len()));
+  }
+  // A stored value is minimal — `0x00…01` would be a second encoding of 1, and the trie is canonical.
+  if (v.len() > 0 && v[0] == 0) {
+    return StorageProof.of(false, false, u8[0](), "a slot's value has a leading zero byte");
+  }
+  return StorageProof.of(true, true, v, "");
+}
+
+/** The storage root of an account with nothing in it: `keccak256(rlp(""))`. */
+export u8[] emptyStorageRoot() { return keccak256(u8[](0x80)); }
+
+/** `keccak256` of the empty string — the code hash of an account that is not a contract. */
+export u8[] emptyCodeHash() { return keccak256(u8[0]()); }
+
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  u8[] buf = u8[12]();
+  i32 n = 0;
+  i32 x = v < 0 ? 0 - v : v;
+  while (x > 0) { buf[n] = '0' + (x % 10); n++; x = x / 10; }
+  u8[] out = u8[n + (v < 0 ? 1 : 0)]();
+  if (v < 0) { out[0] = '-'; }
+  for (i32 i = 0; i < n; i++) { out[(v < 0 ? 1 : 0) + i] = buf[n - 1 - i]; }
+  return string.fromBytes(out);
+}

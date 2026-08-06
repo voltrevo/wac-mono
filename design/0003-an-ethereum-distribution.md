@@ -56,7 +56,7 @@ Ordered by dependency, not by intent.
 | keccak256 | **done** — `crypto.keccak256`, the sponge's fourth domain byte; three published vectors at three lengths, and asserted to disagree with SHA3-256 and truncated SHAKE256 |
 | RLP — `packages/rlp` | **done** — Ethereum's own `RLPTests`, 28 valid driven in both directions against the published bytes and 26 invalid all refused; the one rule the corpus does not cover is named in `test/vendor/README.md` |
 | ABI encoding and decoding | not started |
-| Merkle-Patricia state proofs — `packages/mpt` | **the verifier is done** — one trie against one root, inclusion and absence, every perturbation refused, anchored to all seven of `trieanyorder.json`'s published roots. The account-and-storage *composition* and a live `eth_getProof` vector are not: 0086 stays open for those |
+| Merkle-Patricia state proofs — `packages/mpt` | **done bar one vector** — the verifier and the account-and-storage composition, anchored to all seven of `trieanyorder.json`'s published roots; inclusion, absence and every perturbation. 0086 stays open only for a live `eth_getProof` recorded as a vector |
 | ENS resolution | not started — downstream of keccak256, ABI and state proofs |
 | secp256k1 signing | not started — see the section below, which is the reason it is last |
 | content-addressed retrieval (IPFS or otherwise) | not started — needs a decision about what is being promised |

@@ -63,12 +63,30 @@ A fifth test builds the shape Ethereum's tries actually have — two hundred key
 so every path is 64 nibbles and every child is hashed rather than inline — because the readable fixtures are
 small tries with short keys and the inline case dominates them.
 
-## Not implemented
+## The two-step walk
 
-**The composition.** Verifying an `eth_getProof` response end to end means walking the state trie to an
-account, decoding its RLP into `[nonce, balance, storageRoot, codeHash]`, then walking the storage trie under
-that `storageRoot`. This file verifies one trie against one root; the account structure and the two-step walk
-belong above it, with the type that names those four fields.
+`src/account.wac` is the composition an `eth_getProof` answer actually is:
+
+```wac
+AccountProof a = accountAt(stateRoot, address, accountNodes);
+if (a.ok && a.present) {
+  // The storage root comes *out of the account proof*. A caller that supplies it from anywhere else can be
+  // handed a perfectly valid proof of a different account's storage.
+  StorageProof s = storageAt(a.account.storageRoot, slot, storageNodes);
+}
+```
+
+An account is `[nonce, balance, storageRoot, codeHash]`, and its numbers stay as bytes: a balance does not
+fit an `i64`, and a caller that wants one has `packages/bignum` and knows what it is asking for. The address
+is hashed here rather than by the caller, because a state trie is a secure trie by definition — a mis-sized
+or unhashed key is refused rather than turned into a confident wrong answer.
+
+**A slot's value is RLP inside the trie's value**, so `storageAt` unwraps it: a slot holding 1 is stored as
+`0x01`, and a value with a leading zero, over 32 bytes, or shaped as a list is refused. **An absent slot is
+how Ethereum stores zero** — writing zero deletes the entry — so `present = false` is the answer rather than
+an invented zero, and the caller decides what that means in its own terms.
+
+## Not implemented
 
 **A real endpoint's proof, recorded as a vector.** Issue 0086 asks for one and this does not have it: the
 anchor here is Ethereum's published *roots* plus an independently built trie, not a live `eth_getProof`. The
