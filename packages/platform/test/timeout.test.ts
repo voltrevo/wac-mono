@@ -200,10 +200,10 @@ Deno.test("the exhaustion error names what is holding the slots", async () => {
     slowHandlers,
   );
   const msg = String(out);
-  // One name per slot, from `SLOTS` rather than a literal: the count is a tuning decision
-  // and a test that pins it would fail for the wrong reason when it changes.
-  const names = new Array(SLOTS).fill("NOW_MILLIS").join(", ");
-  assertEquals(msg.includes(`from: ${names}`), true, msg);
+  // A tally rather than one name per slot: at 128 slots a list is a wall of text, and what the
+  // reader needs is which *kind* of call was abandoned. Written from `SLOTS` rather than a literal
+  // because the count is a tuning decision and a test that pins it fails for the wrong reason.
+  assertEquals(msg.includes(`from: NOW_MILLIS × ${SLOTS}`), true, msg);
   // And it says the blame is probably elsewhere, because it is.
   assertEquals(msg.includes("abandoned ticket is usually earlier"), true, msg);
 });
