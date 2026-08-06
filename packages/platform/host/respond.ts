@@ -98,7 +98,11 @@ export function serveHostCalls(
   const bridgeId = nextBridgeId++;
   // Registered so a stall anywhere can ask every bridge what it is doing — a shell parked reading a child
   // explains nothing without the child's side of it.
-  sched.register(bridgeId, () => describeSlots(b));
+  //
+  // The description says whether this bridge is still being served, because the interesting stall is a
+  // worker parked against a host that stopped: `stop()` takes the bridge out of the survey, but a loop
+  // that *died* leaves it in, and a slot table with no note would read as an ordinary busy bridge.
+  sched.register(bridgeId, () => `${running ? "" : "responder stopped — "}${describeSlots(b)}`);
 
   // Per-slot state kept between the pieces of one call.
   const pending: (Uint8Array | null)[] = new Array(SLOTS).fill(null);      // response tail

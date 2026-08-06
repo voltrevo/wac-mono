@@ -459,3 +459,36 @@ branch catches a literal that is not too long. **Ours is the better answer**, so
 `CODE_DIVERGENCES` with the argument rather than matched — and policed in the other direction:
 `staleDivergence` fails if the two ever start agreeing, because an entry that is no longer true is a
 comparison quietly not being made.
+
+## `packages/std`: 2/8 → 6/8, and the two survivors were worth having — agent-a, 2026-08-06
+
+The score moved without a single new assertion in `map_test.wac`, because four of the six were never run:
+`wacTestRun` did not instrument, so every line reached only by a wac-written test was reported "not
+covered" and excluded (0090, fixed). With selection working, `i32Eq`, `i64Eq`, `bytesEq` and `stringEq`
+are killed by the tests that were already there.
+
+The two that survive are a real gap and the interesting kind:
+
+    extreme/std/hash/hashI32   { … } -> { return 0; }
+    extreme/std/hash/hashI64   { … } -> { return 0; }
+
+**A hash that returns zero for every key passes every test in the repo.** That is not a bug in the tests
+so much as a property of `Map`: it answers correctly under any hash, and `map_test.wac` proves that on
+purpose with a `badHash` that does exactly this. What a constant hash costs is time, not answers, and
+nothing measured time.
+
+`packages/std/test/wac/hash_test.wac` now asks the question the functions exist for — distribution:
+
+- **injective over a sample** — 1024 consecutive keys, 1024 distinct hashes (the finaliser is a bijection,
+  so this is exact rather than a bound);
+- **aligned keys spread in the low bits** — `i * 64` masked to ten bits must reach more than 400 of 1024
+  buckets. The identity hash passes the injectivity test and fills sixteen, which is why both are here;
+- **avalanche** — a flipped input bit moves 13–19 of the 32 output bits, and no bit is ignored;
+- the same for `hashI64`, with keys above 2^32 so a hash that dropped the high word dies;
+- `hashBytes` separating near neighbours, and `hashString` agreeing with it byte for byte (0004).
+
+Checked by breaking it four ways: `hashI32 → 0` fails four tests, `hashI32 → x` (identity) three,
+`hashI64 → 0` two, and `hashI64 → low word only` two.
+
+Distinctness is counted with a `Map` built on an **identity** hash on purpose — an oracle made of the
+function under test is no oracle.

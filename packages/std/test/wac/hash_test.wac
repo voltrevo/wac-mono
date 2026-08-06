@@ -1,0 +1,160 @@
+// What `hash.wac` has to be good at, which no test asked before.
+//
+// `Map` answers every query correctly whatever the hash returns — `map_test.wac` proves that on purpose,
+// with a `badHash` that sends every key to one slot. So the map's own tests cannot notice a hash going
+// wrong: mutation testing replaced the whole body of `hashI32` and `hashI64` with `return 0` and the
+// suite stayed green (wac-mono 0005). What such a hash costs is not correctness but time — every lookup
+// becomes a scan — and a property nothing checks is a property that will drift.
+//
+// So these tests are about **distribution**, which is the thing the functions exist for:
+//
+//   * **injective over a sample.** The 32-bit finaliser is a bijection on `u32`, so a thousand distinct
+//     keys must give a thousand distinct hashes. `return 0` dies here, and so does anything that folds.
+//   * **aligned keys spread in the low bits.** This is the one the module's own comment promises: `Map`
+//     masks the hash, so consecutive or aligned integers — indices, pointers, ids — must not land in a
+//     run of the same buckets. The identity hash passes the first test and fails this one, which is why
+//     both are here.
+//   * **avalanche.** One input bit flipped changes about half the output bits. This is what makes the
+//     first two hold for keys nobody thought of, and it is what a dropped multiply or shift breaks
+//     while leaving the others passing.
+//
+// Distinctness is counted with a `Map` built on an **identity** hash, deliberately: using `hashI32` to
+// check `hashI32` would be an oracle made of the thing under test, and a `Map` is correct under any hash.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { Map } from "../../src/map.wac";
+import { hashI32, hashI64, hashBytes, hashString } from "../../src/hash.wac";
+
+/** The key itself, so the set used for counting cannot share a fault with what it is measuring. */
+i32 identity(i32 k) { return k; }
+bool sameI32(i32 a, i32 b) { return a == b; }
+
+/** How many of these hashes are distinct. */
+i32 distinctCount(i32[] hs) {
+  Map<i32, i32> seen = Map.create(identity, sameI32);
+  for (i32 i = 0; i < hs.len(); i++) { seen.set(hs[i], 1); }
+  return seen.len();
+}
+
+/** Bits set, for the avalanche measure. */
+i32 popcount(u32 v) {
+  i32 n = 0;
+  u32 x = v;
+  while (x != 0) {
+    n = n + ((x & 1) as@ i32);
+    x = x >> 1;
+  }
+  return n;
+}
+
+export string test_i32_hash_is_injective_over_a_sample() {
+  T t = T.create();
+  i32 N = 1024;
+  i32[] hs = i32[N]();
+  for (i32 i = 0; i < N; i++) { hs[i] = hashI32(i); }
+  // The finaliser is a bijection on 32 bits, so this is exact rather than a bound: any collision at all
+  // among a thousand consecutive keys means the mixing has stopped being one-to-one.
+  t.eqI32(distinctCount(hs), N, "1024 consecutive keys hash to 1024 distinct values");
+  return t.report();
+}
+
+export string test_aligned_keys_spread_across_buckets() {
+  T t = T.create();
+  // Pointers, ids and array offsets are aligned, and this is the case the module's comment is about: the
+  // identity hash keeps every one of these in the same 16 buckets of a 1024-slot table.
+  i32 N = 1024;
+  i32 MASK = 1023;
+  i32[] low = i32[N]();
+  for (i32 i = 0; i < N; i++) { low[i] = hashI32(i * 64) & MASK; }
+  i32 spread = distinctCount(low);
+  // A perfectly random map of 1024 keys into 1024 buckets fills about 647 of them; the identity hash
+  // fills 16. The bound is what tells those apart, not a measurement of this hash — 400 is far below
+  // what a good mixer gives and far above what a bad one can reach.
+  t.isTrue(spread > 400, "aligned keys reach more than 400 of 1024 buckets, got " + itoa(spread));
+  return t.report();
+}
+
+export string test_i32_hash_avalanches() {
+  T t = T.create();
+  // Every input bit, over a spread of keys: flip it, and count how many output bits move. A hash that
+  // ignores an input bit is one whose keys can be chosen to collide, and it is invisible to every other
+  // test here.
+  i32 total = 0;
+  i32 samples = 0;
+  i32 worst = 32;
+  for (i32 k = 0; k < 64; k++) {
+    i32 key = k * 1103515245 + 12345;       // spread out, so this is not a test of small integers
+    u32 base = hashI32(key) as@ u32;
+    for (i32 b = 0; b < 32; b++) {
+      u32 flipped = hashI32(key ^ (1 << b)) as@ u32;
+      i32 moved = popcount(base ^ flipped);
+      total = total + moved;
+      samples = samples + 1;
+      if (moved < worst) { worst = moved; }
+    }
+  }
+  i32 mean = total / samples;
+  t.isTrue(mean >= 13 && mean <= 19, "a flipped input bit moves about half the output, mean " + itoa(mean));
+  // And no single bit is ignored: a bit that changes nothing is a whole class of chosen collisions.
+  t.isTrue(worst >= 2, "every input bit moves at least two output bits, worst " + itoa(worst));
+  return t.report();
+}
+
+export string test_i64_hash_is_injective_and_spreads() {
+  T t = T.create();
+  i32 N = 1024;
+  i32[] hs = i32[N]();
+  i32[] low = i32[N]();
+  for (i32 i = 0; i < N; i++) {
+    // Values above 2^32, so this exercises the fold rather than the low half alone: a 64-bit hash that
+    // dropped its high word would pass every test built from small numbers.
+    i64 key = (i as i64) * 68719476736;     // i * 2^36
+    i32 h = hashI64(key);
+    hs[i] = h;
+    low[i] = h & 1023;
+  }
+  t.eqI32(distinctCount(hs), N, "1024 spaced 64-bit keys hash to 1024 distinct values");
+  i32 spread = distinctCount(low);
+  t.isTrue(spread > 400, "and their low bits reach more than 400 buckets, got " + itoa(spread));
+  return t.report();
+}
+
+export string test_byte_hash_separates_near_neighbours() {
+  T t = T.create();
+  // FNV-1a is not a mixer, so avalanche is the wrong question — what a table needs from it is that keys
+  // differing in one byte, or in length, do not land together.
+  i32 N = 512;
+  i32[] hs = i32[N]();
+  for (i32 i = 0; i < N; i++) {
+    u8[] k = u8[4]();
+    k[0] = 'k';
+    k[1] = '0' + (i / 100);
+    k[2] = '0' + ((i / 10) % 10);
+    k[3] = '0' + (i % 10);
+    hs[i] = hashBytes(k);
+  }
+  t.eqI32(distinctCount(hs), N, "512 four-byte keys hash apart");
+
+  // And the string path is the byte path: two implementations of FNV-1a that disagreed about the same
+  // bytes would be invisible to a Map, since one map only ever uses one of them (wac-mono 0004).
+  t.eqI32(hashString("hello"), hashBytes("hello".toBytes()), "hashString is hashBytes over the UTF-8");
+  return t.report();
+}
+
+/** Decimal, for the failure messages — a bound that fails should say what it got. */
+string itoa(i32 v) {
+  if (v == 0) { return "0"; }
+  bool neg = v < 0;
+  i32 x = neg ? -v : v;
+  u8[] buf = u8[12]();
+  i32 n = 0;
+  while (x > 0) {
+    buf[n] = '0' + (x % 10);
+    n++;
+    x = x / 10;
+  }
+  u8[] out = u8[n + (neg ? 1 : 0)]();
+  if (neg) { out[0] = '-'; }
+  for (i32 i = 0; i < n; i++) { out[(neg ? 1 : 0) + i] = buf[n - 1 - i]; }
+  return string.fromBytes(out);
+}
