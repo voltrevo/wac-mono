@@ -1,0 +1,201 @@
+// A directory's verdict on an uploaded descriptor, against the verdicts C tor reached on the same
+// bytes.
+//
+// The controls are not invented here. `tools/capture-hspub.py` fed each of them to tor's own
+// `hs_cache_store_as_dir` and recorded both the edit and the outcome, so this asks a narrow question:
+// **given exactly what tor was given, do we decide the same thing?** A control the two ends built
+// separately would be a control they could disagree about silently.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  Checked, MAX_DESCRIPTOR_LEN, MAX_LIFETIME_MINUTES, PUB_CERT_SIG, PUB_LIFETIME, PUB_NOT_V3,
+  PUB_NO_BODY, PUB_NO_CERT, PUB_OK, PUB_SIGNATURE, PUB_TOO_LARGE, certExpiryHours,
+  checkForPublication,
+} from "../../src/hsstore.wac";
+
+const i32 S_DESCRIPTOR = 0;
+const i32 S_BLINDED = 1;
+const i32 S_CONTROL_COUNT = 2;
+const i32 S_CONTROL = 3;      // a[0] = index — the descriptor tor was given, already edited
+
+u8[] none() { return u8[0](); }
+
+u8[] at(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+
+/**
+ * The descriptor tor stored is one we would store, and under the name tor chose.
+ *
+ * The name is the point. It comes back *out* of the check, because there is nowhere for a caller to
+ * pass one in: a directory that took the uploader's word for the name would file a perfectly valid
+ * descriptor where no client will look, and the upload, the store and the reply would all report
+ * success.
+ */
+export string test_the_descriptor_tor_stored_is_stored(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  Checked c = checkForPublication(ref(S_DESCRIPTOR, none(), none()), 0);
+  t.eqI32(c.reason, PUB_OK, "the descriptor an HSDir accepted is one we accept");
+  t.eqBytes(c.blindedKey, ref(S_BLINDED, none(), none()),
+            "and the name is the blinded key tor filed it under");
+  t.isTrue(c.revision >= 0, "with a revision counter a store can compare against");
+  return t.report();
+}
+
+/**
+ * Every descriptor tor refused, refused — on the same bytes tor saw.
+ *
+ * Recorded reasons, not just "not OK": a checker that returned `PUB_NOT_V3` for everything would
+ * agree with tor on all five of these and be useless. Each control is here because it fails at a
+ * different check, and the reasons are asserted individually below.
+ */
+export string test_every_descriptor_tor_refused_is_refused(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(S_CONTROL_COUNT, none(), none())[0];
+  t.isTrue(n >= 4, "there are several controls, not one");
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] body = ref(S_CONTROL, at(i), none());
+    // The last control is the real descriptor under a wrong lookup name; it is about the name rather
+    // than the document, so the document itself must still be accepted. That is what separates "a bad
+    // descriptor" from "a bad name", and it is the only control that can.
+    if (body.len() == ref(S_DESCRIPTOR, none(), none()).len() &&
+        sameBytes(body, ref(S_DESCRIPTOR, none(), none()))) {
+      t.eqI32(checkForPublication(body, 0).reason, PUB_OK,
+              "the unedited descriptor is still accepted — that control is about the name");
+    } else {
+      t.isTrue(checkForPublication(body, 0).reason != PUB_OK,
+               "a descriptor tor would not store is not stored");
+      t.eqI32(checkForPublication(body, 0).blindedKey.len(), 0,
+              "and a refused descriptor names nothing");
+    }
+  }
+  return t.report();
+}
+
+/** And each is refused for its own reason, at the check that should have caught it. */
+export string test_the_reasons_are_the_right_ones(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] desc = ref(S_DESCRIPTOR, none(), none());
+
+  // Truncated after the first line: version present, everything else gone.
+  t.eqI32(checkForPublication(slice(desc, 0, 16), 0).reason, PUB_LIFETIME,
+          "a document that stops after its version has no lifetime");
+
+  // A flipped byte inside the encrypted body changes nothing the parser reads, so it survives every
+  // structural check and dies at the signature — which is the only thing covering that region. That
+  // is worth pinning: it is the difference between checking a document and checking its shape.
+  t.eqI32(checkForPublication(edit(desc, findFrom(desc, "superencrypted", 0) + 60, 'X'), 0).reason,
+          PUB_SIGNATURE, "a byte of ciphertext is caught by the signature and nothing else");
+
+  t.eqI32(checkForPublication(replaceFirst(desc, "hs-descriptor 3", "hs-descriptor 2"), 0).reason,
+          PUB_NOT_V3, "another version is another format");
+  // And a version that merely *starts* with three is not three. A check on the first digit alone
+  // agrees with a correct one on every version anyone has published, and on none of the ones a
+  // future format would use.
+  t.eqI32(checkForPublication(replaceFirst(desc, "hs-descriptor 3", "hs-descriptor 30"), 0).reason,
+          PUB_NOT_V3, "and thirty is not three");
+  t.eqI32(checkForPublication(replaceFirst(desc, "descriptor-signing-key-cert",
+                                           "descriptor-signing-key-xxxx"), 0).reason,
+          PUB_NO_CERT, "without a certificate there is no key to file it under");
+  t.eqI32(checkForPublication(replaceFirst(desc, "superencrypted", "superencryptes"), 0).reason,
+          PUB_NO_BODY, "and a descriptor with no body is not a descriptor");
+  return t.report();
+}
+
+/** The limits are tor's own, and the ones that bound work before it is done. */
+export string test_the_limits_are_tors(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqI32(MAX_DESCRIPTOR_LEN, 50000, "HS_DESC_MAX_LEN");
+  t.eqI32(MAX_LIFETIME_MINUTES, 720, "HS_DESC_MAX_LIFETIME, in the minutes a descriptor states");
+
+  u8[] desc = ref(S_DESCRIPTOR, none(), none());
+  t.isTrue(desc.len() < MAX_DESCRIPTOR_LEN, "a real descriptor is well inside the cap");
+  // Refused by size *before* anything is parsed, so an absurd upload costs an allocation and not a
+  // signature verification. Both sides of the boundary, because tor's comparison is `>=` and a `>`
+  // agrees with it on every input except the one length that distinguishes them — the same shape as
+  // the padding boundary that hid a round-down for a whole session.
+  t.eqI32(checkForPublication(u8[MAX_DESCRIPTOR_LEN + 1](fill: 'a'), 0).reason, PUB_TOO_LARGE,
+          "a larger one is refused before it is read");
+  t.eqI32(checkForPublication(u8[MAX_DESCRIPTOR_LEN](fill: 'a'), 0).reason, PUB_TOO_LARGE,
+          "and exactly HS_DESC_MAX_LEN is too large, which is where tor's `>=` bites");
+  t.isTrue(checkForPublication(u8[MAX_DESCRIPTOR_LEN - 1](fill: 'a'), 0).reason != PUB_TOO_LARGE,
+           "one byte under it is not refused for its size — it fails for being nonsense");
+
+  t.eqI32(checkForPublication(replaceFirst(desc, "descriptor-lifetime 180",
+                                           "descriptor-lifetime 721"), 0).reason,
+          PUB_LIFETIME, "a lifetime past twelve hours is refused");
+  t.eqI32(checkForPublication(replaceFirst(desc, "descriptor-lifetime 180",
+                                           "descriptor-lifetime 720"), 0).reason,
+          PUB_SIGNATURE, "and twelve hours exactly is not — it gets as far as the signature");
+  return t.report();
+}
+
+/**
+ * The certificate's own signature, and the clock that is optional.
+ *
+ * Verifying the certificate against the key it carries is not circular: it proves the signing key was
+ * certified by whoever holds the blinded secret, and the blinded key is then the name. A client that
+ * knows the onion address derives that key independently and accepts nothing filed elsewhere.
+ */
+export string test_the_certificate_stands_on_its_own_key(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] desc = ref(S_DESCRIPTOR, none(), none());
+  i32 certAt = findFrom(desc, "-----BEGIN ED25519 CERT-----", 0);
+  t.isTrue(certAt > 0, "the certificate is where a descriptor keeps it");
+  t.eqI32(checkForPublication(edit(desc, certAt + 40, 'A'), 0).reason, PUB_CERT_SIG,
+          "an edited certificate does not verify under the key it carries");
+
+  // The expiry check is the caller's to ask for. A directory with no clock refusing on expiry grounds
+  // would be guessing, and every other check here is about the document alone.
+  Checked withClock = checkForPublication(desc, 1);
+  t.eqI32(withClock.reason, PUB_OK, "a clock before the expiry changes nothing");
+  t.isTrue(certExpiryHours(u8[6](fill: 255)) > 0, "an expiry is read big-endian from offset 2");
+  t.eqI64(certExpiryHours(u8[5]()), -1 as i64, "and a certificate too short to hold one says so");
+  return t.report();
+}
+
+// ── small helpers ─────────────────────────────────────────────────────────────
+
+u8[] edit(u8[] b, i32 at, i32 to) {
+  u8[] out = u8[b.len()]();
+  for (i32 i = 0; i < b.len(); i++) { out[i] = b[i]; }
+  out[at] = out[at] == to ? to + 1 : to;
+  return out;
+}
+
+u8[] replaceFirst(u8[] b, string find, string with) {
+  i32 at = findFrom(b, find, 0);
+  if (at < 0) { return b; }
+  u8[] w = with.toBytes();
+  u8[] out = u8[b.len() - find.toBytes().len() + w.len()]();
+  for (i32 i = 0; i < at; i++) { out[i] = b[i]; }
+  for (i32 i = 0; i < w.len(); i++) { out[at + i] = w[i]; }
+  i32 rest = at + find.toBytes().len();
+  for (i32 i = rest; i < b.len(); i++) { out[at + w.len() + i - rest] = b[i]; }
+  return out;
+}
+
+i32 findFrom(u8[] hay, string needle, i32 from) {
+  u8[] n = needle.toBytes();
+  for (i32 i = from; i + n.len() <= hay.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < n.len(); j++) { if (hay[i + j] != n[j]) { hit = false; j = n.len(); } }
+    if (hit) { return i; }
+  }
+  return -1;
+}
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[to - from]();
+  for (i32 i = from; i < to; i++) { out[i - from] = b[i]; }
+  return out;
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}

@@ -1,0 +1,140 @@
+// What a directory does with an uploaded descriptor: decide whether to keep it, and under what name.
+//
+// This is the HSDir's half of publication, and it is a different job from `hsdesc.wac`'s. A client
+// decrypts; a directory never can — it has no subcredential and no business knowing which service
+// this is. It sees the plaintext layer only: a version, a lifetime, a certificate, a revision
+// counter, an opaque `superencrypted` blob, and a signature over all of it.
+//
+// ## The name is taken, not given
+//
+// The upload arrives at `/tor/hs/3/publish`, which carries no key. tor reads the blinded key out of
+// the descriptor's own signing-key certificate — `desc->blinded_pubkey` is copied from
+// `signing_key_cert->signing_key`, extension 4 — and files the descriptor under that. So a directory
+// that trusted the uploader for the name would accept a descriptor and file it somewhere no client
+// would look, and every party involved would report success.
+//
+// That is why `blindedKey` comes back out of the check rather than in: there is nowhere for a caller
+// to supply it, by construction.
+//
+// ## What is checked, and what is not
+//
+// The checks mirror `desc_decode_plaintext_v3` in tor's `hs_descriptor.c`, in its order:
+//
+//   - `hs-descriptor 3` — the version we serve;
+//   - `descriptor-lifetime`, in minutes, no greater than `HS_DESC_MAX_LIFETIME` (12 hours);
+//   - `descriptor-signing-key-cert`, a proposal 220 certificate of type 8 carrying extension 4;
+//   - the certificate's signature, under the blinded key the certificate itself carries;
+//   - `revision-counter` and a non-empty `superencrypted` block;
+//   - `signature`, over `"Tor onion service descriptor sig v3" | <document up to the signature line>`,
+//     under the key the certificate certifies.
+//
+// The certificate being verified against the key inside it looks circular and is not: it proves the
+// descriptor signing key was certified by *whoever holds the blinded secret*, and the blinded key is
+// then the name. A client that knows the onion address derives the same blinded key independently and
+// will not accept a descriptor filed under any other. The directory's job is only to refuse documents
+// that are internally inconsistent, and to name the rest the way every client will look for them.
+//
+// **Not checked here:** certificate expiry against a clock, unless the caller passes one — a
+// directory with no clock should refuse nothing on those grounds rather than guess — and the
+// revision-counter replacement rule, which needs the descriptor already held to compare against and
+// belongs where the store lives.
+
+import {
+  certCertifiedKey, certSignedWithKey, certType, keywordInt, keywordValue, pemBlock, slice,
+} from "./hsdesc.wac";
+import { CERT_TYPE_SIGNING_HS_DESC, verifyEd25519Cert } from "./relaycert.wac";
+import { prefixed, signedSpanOf } from "./hsdescgen.wac";
+import { ed25519Verify } from "../../crypto/src/ed25519.wac";
+import { decode as b64decode } from "../../codec/src/base64.wac";
+
+/** `HS_DESC_MAX_LEN`. A descriptor of exactly this length is refused, as tor's `>=` refuses it. */
+export const i32 MAX_DESCRIPTOR_LEN = 50000;
+
+/** `HS_DESC_MAX_LIFETIME`, in minutes, which is the unit the descriptor states it in. */
+export const i32 MAX_LIFETIME_MINUTES = 12 * 60;
+
+export const i32 PUB_OK = 0;
+export const i32 PUB_TOO_LARGE = 1;      // past HS_DESC_MAX_LEN
+export const i32 PUB_NOT_V3 = 2;         // not `hs-descriptor 3`
+export const i32 PUB_LIFETIME = 3;       // absent, zero, or longer than twelve hours
+export const i32 PUB_NO_CERT = 4;        // no `descriptor-signing-key-cert` block, or it will not decode
+export const i32 PUB_CERT_TYPE = 5;      // a certificate that is not type 8
+export const i32 PUB_NO_BLINDED_KEY = 6; // type 8 without extension 4 — nothing to file it under
+export const i32 PUB_CERT_SIG = 7;       // the certificate is not signed by the key it carries
+export const i32 PUB_NO_REVISION = 8;    // no `revision-counter`
+export const i32 PUB_NO_BODY = 9;        // no `superencrypted` block
+export const i32 PUB_SIGNATURE = 10;     // the document's own signature does not verify
+export const i32 PUB_EXPIRED = 11;       // the certificate expired, when a clock was supplied
+
+/** The verdict, and the name — which is only meaningful when `reason` is `PUB_OK`. */
+export struct Checked {
+  i32 reason;
+  u8[] blindedKey;      // 32 bytes out of the certificate, empty unless the descriptor was accepted
+  i64 revision;         // the revision counter, for a store deciding whether this replaces what it has
+}
+
+Checked refused(i32 reason) { return Checked(reason, u8[0](), -1); }
+
+/**
+ * Whether a directory should keep this descriptor, and the name to keep it under.
+ *
+ * `nowHours` is hours since the epoch, the unit a proposal 220 certificate states its expiry in.
+ * Pass 0 to skip the expiry check — a directory that cannot tell the time should not be inventing
+ * verdicts about it, and every other check here is about the document alone.
+ */
+export Checked checkForPublication(u8[] descriptor, i64 nowHours) {
+  // `>=`, not `>`: tor compares `encoded_len >= hs_cache_get_max_descriptor_size()`, so a descriptor
+  // of exactly HS_DESC_MAX_LEN is refused. Off by one here and we would store a document every real
+  // directory rejects, and serve it to clients that then cannot fetch it from anywhere else.
+  if (descriptor.len() >= MAX_DESCRIPTOR_LEN) { return refused(PUB_TOO_LARGE); }
+
+  // Found by keyword rather than by position, which is what tor's `find_by_keyword` does. Requiring
+  // it on the first line would be *stricter* than tor — and a directory stricter than the network
+  // refuses documents every client would have accepted, which is worse than being wrong in the
+  // obvious direction. The single argument is tor's too: its token table gives this keyword exactly
+  // one, so `hs-descriptor 3 extra` fails to tokenize rather than reading as three.
+  u8[] version = keywordValue(descriptor, "hs-descriptor".toBytes());
+  if (version.len() != 1 || version[0] != '3') { return refused(PUB_NOT_V3); }
+
+  i64 lifetime = keywordInt(descriptor, "descriptor-lifetime".toBytes());
+  if (lifetime <= 0 || lifetime > (MAX_LIFETIME_MINUTES as i64)) { return refused(PUB_LIFETIME); }
+
+  u8[] cert = pemBlock(descriptor, "descriptor-signing-key-cert".toBytes(), "ED25519 CERT".toBytes());
+  if (cert.len() < 104) { return refused(PUB_NO_CERT); }
+  if (certType(cert) != CERT_TYPE_SIGNING_HS_DESC) { return refused(PUB_CERT_TYPE); }
+
+  u8[] blinded = certSignedWithKey(cert);
+  if (blinded.len() != 32) { return refused(PUB_NO_BLINDED_KEY); }
+  if (!verifyEd25519Cert(cert, blinded)) { return refused(PUB_CERT_SIG); }
+  if (nowHours > 0 && certExpiryHours(cert) <= nowHours) { return refused(PUB_EXPIRED); }
+
+  i64 revision = keywordInt(descriptor, "revision-counter".toBytes());
+  if (revision < 0) { return refused(PUB_NO_REVISION); }
+  if (pemBlock(descriptor, "superencrypted".toBytes(), "MESSAGE".toBytes()).len() == 0) {
+    return refused(PUB_NO_BODY);
+  }
+
+  u8[] signature = b64Or(keywordValue(descriptor, "signature".toBytes()));
+  u8[] span = signedSpanOf(descriptor);
+  if (signature.len() != 64 || span.len() == 0) { return refused(PUB_SIGNATURE); }
+  if (!ed25519Verify(certCertifiedKey(cert), prefixed(span), signature)) {
+    return refused(PUB_SIGNATURE);
+  }
+
+  return Checked(PUB_OK, blinded, revision);
+}
+
+/** A proposal 220 certificate's expiry: hours since the epoch, big-endian, at offset 2. */
+export i64 certExpiryHours(u8[] cert) {
+  if (cert.len() < 6) { return -1; }
+  return ((cert[2] as i64) << 24) | ((cert[3] as i64) << 16) | ((cert[4] as i64) << 8) |
+         (cert[5] as i64);
+}
+
+/** Base64, or empty rather than a partial decode — a truncated signature is not a short one. */
+u8[] b64Or(u8[] text) {
+  if (text.len() == 0) { return u8[0](); }
+  u8[]? decoded = b64decode(text);
+  return (decoded is null) ? u8[0]() : decoded!;
+}
+

@@ -76,21 +76,35 @@ def main(argv):
 
         # Each control is a descriptor tor must refuse, or a name it must not find. Without them a
         # probe that returned "stored" unconditionally would look identical to this one.
+        # Each edit is recorded rather than described, so the wac side can reproduce the exact bytes
+        # tor was given. A control the two ends build separately is a control they can disagree about
+        # silently, which is the one thing this file exists to prevent.
         mid = desc.index("superencrypted") + 60
         sig = desc.rindex("\nsignature ") + 12
-        controls = [
-            dict(name="one byte of the encrypted body flipped",
-                 result=ask(probe, tmp,
-                            desc[:mid] + ("X" if desc[mid] != "X" else "Y") + desc[mid + 1:],
-                            query)),
-            dict(name="the document signature corrupted",
-                 result=ask(probe, tmp, desc[:sig] + "A" + desc[sig + 1:], query)),
-            dict(name="truncated after the first line",
-                 result=ask(probe, tmp, desc.split("\n")[0] + "\n", query)),
-            dict(name="the right descriptor, looked up under an all-zero key",
-                 result=ask(probe, tmp, desc,
-                            base64.b64encode(bytes(32)).decode().rstrip("="))),
+        cert = desc.index("-----BEGIN ED25519 CERT-----") + 40
+        edits = [
+            ("one byte of the encrypted body flipped",
+             dict(kind="replace", offset=mid, byte="X" if desc[mid] != "X" else "Y")),
+            ("the document signature corrupted",
+             dict(kind="replace", offset=sig, byte="A" if desc[sig] != "A" else "B")),
+            ("one byte of the signing certificate flipped",
+             dict(kind="replace", offset=cert, byte="A" if desc[cert] != "A" else "B")),
+            ("truncated after the first line",
+             dict(kind="truncate", length=len(desc.split("\n")[0]) + 1)),
         ]
+        controls = []
+        for name, edit in edits:
+            if edit["kind"] == "replace":
+                at = edit["offset"]
+                body = desc[:at] + edit["byte"] + desc[at + 1:]
+                assert body != desc, name
+            else:
+                body = desc[:edit["length"]]
+            controls.append(dict(name=name, edit=edit, result=ask(probe, tmp, body, query)))
+        controls.append(dict(
+            name="the right descriptor, looked up under an all-zero key",
+            edit=dict(kind="none"),
+            result=ask(probe, tmp, desc, base64.b64encode(bytes(32)).decode().rstrip("="))))
         for c in controls:
             if c["result"]["accepted"]:
                 sys.exit(f"the control {c['name']!r} was accepted, so the probe proves nothing")

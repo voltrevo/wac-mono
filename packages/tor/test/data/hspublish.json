@@ -11,6 +11,11 @@
  "controls": [
   {
    "name": "one byte of the encrypted body flipped",
+   "edit": {
+    "kind": "replace",
+    "offset": 395,
+    "byte": "X"
+   },
    "result": {
     "stored": false,
     "lookup": "none",
@@ -20,6 +25,25 @@
   },
   {
    "name": "the document signature corrupted",
+   "edit": {
+    "kind": "replace",
+    "offset": 14017,
+    "byte": "A"
+   },
+   "result": {
+    "stored": false,
+    "lookup": "none",
+    "identical": false,
+    "accepted": false
+   }
+  },
+  {
+   "name": "one byte of the signing certificate flipped",
+   "edit": {
+    "kind": "replace",
+    "offset": 108,
+    "byte": "A"
+   },
    "result": {
     "stored": false,
     "lookup": "none",
@@ -29,6 +53,10 @@
   },
   {
    "name": "truncated after the first line",
+   "edit": {
+    "kind": "truncate",
+    "length": 16
+   },
    "result": {
     "stored": false,
     "lookup": "none",
@@ -38,6 +66,9 @@
   },
   {
    "name": "the right descriptor, looked up under an all-zero key",
+   "edit": {
+    "kind": "none"
+   },
    "result": {
     "stored": true,
     "lookup": "miss",

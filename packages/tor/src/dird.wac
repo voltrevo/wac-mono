@@ -28,12 +28,30 @@ import { Read } from core;
 import { itoa } from "../../fmt/src/itoa.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { Parsed, parseRequest } from "../../http/src/request.wac";
-import { DirDocuments, dirResponse, dirSourceFingerprint } from "./dirserve.wac";
+import {
+  DirDocuments, dirResponse, dirSourceFingerprint, hsPublishResponseBytes, hsPublishVersion,
+} from "./dirserve.wac";
+import { PUB_OK, checkForPublication } from "./hsstore.wac";
 import { rsaDescriptorDigest } from "./routerdesc.wac";
 import { microdescDigests } from "./microdesc.wac";
 
 const i32 DEFAULT_PORT = 7000;
+
+/**
+ * The cap on a request's *headers*, which is the part a client can make arbitrarily long for free.
+ *
+ * A body is capped separately, by `Content-Length` against `MAX_BODY`, and the parser refuses a
+ * declared length past that without buffering it. Keeping the two caps apart is the point: a
+ * descriptor is fourteen kilobytes, so one shared cap large enough to accept an upload would also let
+ * anyone hold this loop open with fourteen kilobytes of header they never finish.
+ */
 const i32 MAX_REQUEST = 8192;
+
+/** `HS_DESC_MAX_LEN`, since the only body this port accepts is a descriptor. */
+const i32 MAX_BODY = 50000;
+
+/** How many descriptors this directory will hold. */
+const i32 MAX_STORED = 32;
 
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 3) {
@@ -50,7 +68,7 @@ export i32 main(Core core, Cli cli) {
   // the port and then failed trying to open `17999` as a file.
   i32 argc = cli.argCount().wait();
   i32 descCount = argc - 2;
-  if (descCount > 1 && atoiSafe(cli.arg(argc - 1).wait()) > 0) { descCount = descCount - 1; }
+  if (descCount > 1 && atoiSafe(cli.arg(argc - 1).wait()) >= 0) { descCount = descCount - 1; }
   u8[] descriptors = u8[0]();
   u8[][] digests = u8[][descCount]();
   for (i32 i = 0; i < descCount; i++) {
@@ -64,8 +82,10 @@ export i32 main(Core core, Cli cli) {
   // The port follows the descriptors, so it is found by position rather than by guessing at index 3.
   i32 port = DEFAULT_PORT;
   if (argc > 2 + descCount) {
+    // Port 0 is "ask the operating system", not a mistake: the chosen port is logged, and it is what
+    // lets two agents run the suite at once without agreeing in advance about who gets which number.
     i32 given = atoiSafe(cli.arg(2 + descCount).wait());
-    if (given <= 0 || given > 65535) {
+    if (given < 0 || given > 65535) {
       core.warn("dird: " + string.fromBytes(cli.arg(2 + descCount).wait()) + " is not a port");
       return 1;
     }
@@ -116,10 +136,47 @@ export i32 main(Core core, Cli cli) {
       core.warn("dird: accept: " + conn.error);
       return 1;
     }
-    answer(core, cli, conn, docs);
+    docs = answer(core, cli, conn, docs);
     cli.closeSocket(conn.handle);
   }
   return 0;
+}
+
+/**
+ * File an uploaded descriptor, and return the documents this directory now holds.
+ *
+ * The name is taken from `checkForPublication`, never from the request: the publish URL has no key in
+ * it, and a directory that let the uploader choose would file a valid descriptor where no client
+ * looks. Replacing by name rather than appending is what makes a service's republication an update —
+ * a store that appended would serve whichever copy the search reached first, which over a service's
+ * lifetime is the older one.
+ */
+DirDocuments stored(DirDocuments docs, u8[] descriptor, u8[] blindedKey) {
+  for (i32 i = 0; i < docs.hsBlindedKeys.len(); i++) {
+    if (sameBytes(docs.hsBlindedKeys[i], blindedKey)) {
+      docs.hsDescriptors[i] = descriptor;
+      return docs;
+    }
+  }
+  i32 n = docs.hsDescriptors.len();
+  if (n >= MAX_STORED) { return docs; }
+  u8[][] descs = u8[][n + 1]();
+  u8[][] keys = u8[][n + 1]();
+  for (i32 i = 0; i < n; i++) {
+    descs[i] = docs.hsDescriptors[i];
+    keys[i] = docs.hsBlindedKeys[i];
+  }
+  descs[n] = descriptor;
+  keys[n] = blindedKey;
+  return DirDocuments(docs.consensus, docs.consensusMicrodesc, docs.certificate, docs.descriptors,
+                      docs.descriptorDigests, docs.fingerprint, docs.microdescriptors,
+                      docs.microdescDigests, descs, keys);
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len() || a.len() == 0) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
 }
 
 /**
@@ -129,25 +186,41 @@ export i32 main(Core core, Cli cli) {
  * cap matters: without it a client that never finishes a request line holds this loop forever, and a
  * directory port is reachable by anyone who can route to it.
  */
-void answer(Core core, Cli cli, Socket conn, DirDocuments docs) {
+DirDocuments answer(Core core, Cli cli, Socket conn, DirDocuments docs) {
   Buf pending = Buf.create();
   while (true) {
-    match (parseRequest(pending.bytes(), 0)) {
+    match (parseRequest(pending.bytes(), MAX_BODY)) {
       case Ok(request): {
+        // A publish is the one request with a body, and the only one that changes what is held here.
+        // `hsPublishVersion` reads the version out of the middle of the target rather than matching
+        // the path whole, because `/tor/hs/3/publish` and `/tor/hs/3/<z>` differ only after it.
+        if (sameBytes(request.method, "POST".toBytes()) &&
+            hsPublishVersion(request.target) == 3) {
+          i32 reason = checkForPublication(request.body, 0).reason;
+          if (reason == PUB_OK) {
+            u8[] key = checkForPublication(request.body, 0).blindedKey;
+            docs = stored(docs, request.body, key);
+            core.log("dird: stored a descriptor, " + itoa(docs.hsDescriptors.len()) + " held");
+          } else {
+            core.warn("dird: refused a descriptor, reason " + itoa(reason));
+          }
+          cli.send(conn.handle, hsPublishResponseBytes(reason == PUB_OK)).wait();
+          return docs;
+        }
         cli.send(conn.handle, dirResponse(request.target, docs)).wait();
-        return;
+        return docs;
       }
       case Bad(code): {
         core.warn("dird: a malformed request, code " + itoa(code));
         cli.send(conn.handle, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".toBytes())
           .wait();
-        return;
+        return docs;
       }
       case Incomplete: { }
     }
-    if (pending.bytes().len() > MAX_REQUEST) {
-      core.warn("dird: a request larger than " + itoa(MAX_REQUEST) + " bytes, dropped");
-      return;
+    if (pending.bytes().len() > MAX_REQUEST + MAX_BODY) {
+      core.warn("dird: a request larger than " + itoa(MAX_REQUEST + MAX_BODY) + " bytes, dropped");
+      return docs;
     }
     bool more = false;
     match (cli.recv(conn.handle).wait()) {
@@ -158,7 +231,7 @@ void answer(Core core, Cli cli, Socket conn, DirDocuments docs) {
       case End: { }
       case Failed(why): { core.warn("dird: the connection failed: " + why); }
     }
-    if (!more) { return; }
+    if (!more) { return docs; }
   }
 }
 
@@ -171,7 +244,7 @@ u8[] readOr(Core core, Cli cli, string path) {
   return f.bytes;
 }
 
-/** A port, or -1 rather than a partial number — `atoi` would read "80x" as 80. */
+/** A port, or -1 rather than a partial number — `atoi` would read "80x" as 80. Zero is a port here. */
 i32 atoiSafe(u8[] text) {
   if (text.len() == 0) { return -1; }
   i32 v = 0;
