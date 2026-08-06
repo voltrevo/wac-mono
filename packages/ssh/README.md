@@ -377,7 +377,7 @@ The 13 "not covered" are mostly length preconditions on internal helpers — `if
 keyLength()) { trap; }` and the like. Note that "not covered" here means **not covered by the
 attributable tests**: the profiler only sees in-process `wacBind` tests, so anything exercised
 solely by the two integration suites reads as uncovered when it is not. See
-[issue 0024](../../issues/open/0024-mutation-selection-is-inert-for-subprocess-tests-and-the-fallback-runs-them-worst-first.md).
+[issue 0024](../../issues/closed/0024-mutation-selection-is-inert-for-subprocess-tests-and-the-fallback-runs-them-worst-first.md).
 
 There is a design rule underneath those guards worth stating, because it is easy to break by
 accident: **a `trap` guards our own invariants; anything a peer supplies is handled with a

@@ -48,7 +48,7 @@ in `core`, the module the compiler ships, so both repos name one type.
 
 ## What actually blocks it
 
-**Step 3 of [wac's `design/0001`](../../wac/design/0001-import-resolution-core-and-what-packages-inherit.md)
+**Step 3 of [wac's `design/0001`](../../../wac/design/0001-import-resolution-core-and-what-packages-inherit.md)
 — a directory provider.** Today every import here is a relative path, so the five dependent packages
 would have to reach platform as `../../../wac-platform/src/platform.wac`: a path out of one checkout
 and into a sibling, which is right only for whoever cloned things the way the author did.

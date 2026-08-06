@@ -65,7 +65,7 @@ without archaeology.
 ## A test that fails for reasons of its own: `[flaky NNNN]`
 
 A test that sometimes fails without the code being wrong costs whoever is pushing an hour of diagnosing
-their own change — that is what [0082](open/0082-five-tests-fail-rather-than-slow-down-when-the-machine-is-busy.md)
+their own change — that is what [0082](closed/0082-five-tests-fail-rather-than-slow-down-when-the-machine-is-busy.md)
 is about, and it happened to the person who filed it. Until the cause is found, such a test carries the
 issue number **in its name**:
 

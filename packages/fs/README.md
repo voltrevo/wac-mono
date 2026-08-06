@@ -16,7 +16,7 @@ commands run from the repo root.
 ## Why
 
 [design/0001](../../design/0001-a-self-contained-system.md) step 1, filed as
-[0067](../../issues/open/0067-no-filesystem-of-our-own-so-a-session-cannot-be-sealed-off-from-the-host.md).
+[0067](../../issues/closed/0067-no-filesystem-of-our-own-so-a-session-cannot-be-sealed-off-from-the-host.md).
 Every filesystem capability a program has is the *host's*, so `packages/ssh`'s demo hands each session the
 real disk of whatever ran the daemon, and the browser terminal hands it the tab's Origin Private File
 System. There is nothing that belongs to the system: nothing to seal a session inside, nothing to persist
@@ -70,7 +70,7 @@ It earned that on the first run, three times:
 `test/wac/fs_test.wac` covers what a differential cannot reach: the fault categories directly, the mount
 table's longest-prefix rule, and that a name is **bytes** — a file called `x\xff\xfey` keeps all four,
 which is a property no host can offer today
-([0065](../../issues/open/0065-a-spawned-programs-arguments-are-not-byte-exact.md)).
+([0065](../../issues/closed/0065-a-spawned-programs-arguments-are-not-byte-exact.md)).
 
 ## Not here yet
 
