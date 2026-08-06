@@ -491,3 +491,44 @@ before, and said nothing either way.
 
 **The tag stays on the ssh test for now.** One clean gate run is not evidence that a once-in-eight flake is
 gone; a week of them is. `tools/flaky.test.ts` will make somebody take it off when 0082 closes.
+
+### A mechanism, found by enumeration rather than by waiting (agent-a, 2026-08-06)
+
+The operator's question was whether buffers and backpressure can be made deterministic. They can — not by
+removing the nondeterminism, which `waitAny` genuinely needs, but by separating the *semantics* from the
+*scheduling* so every interleaving can be walked instead of sampled. Two state machines came out of that,
+and the second one found a live hole in about a minute.
+
+**The queue** (`host/queue.ts`) is now `apply(state, event) → (state, effects)`, pure, with `ByteQueue` as
+a driver that holds no rules. `test/queue_model.test.ts` walks every sequence of pushes, reads, ends and
+cap-driven parks to depth six — 117,649 paths — against the invariants that matter: a reader told the
+stream ended when it had not; a reader parked with bytes queued; the first parked writer having room;
+bytes lost, duplicated or reordered after their writer was told `ok`. Two of its four tests are mutants,
+because an invariant set that passes a known bug is decoration: re-introducing **0078** makes it fail and
+print the counter-example, `push(1b) → push(1b) → next(≤64) → next(≤1) → push(0b)`.
+
+The queue passing everything is what made the next step obvious: **a stream that never ends is not a queue
+bug, it is `end()` never being called.** So the child's lifecycle got the same treatment
+(`host/childLife.ts`), over the four things the runtime can deliver in any order — ready, result, error,
+grace — plus the caller's kill.
+
+**It reported a violation at depth one.** `kill` on a child that has not yet reported ready left both
+`loaded` and `exit` unsettled. In the real `spawnChild`, `kill` *was* `shutdown`: it ended the streams and
+stopped the responder, and settled neither promise. So:
+
+- `OP.EXIT_CODE` is `await child.exit`;
+- a handle closed anywhere else — `CLOSE` on a child calls `kid.kill()` — leaves that promise unsettled;
+- the worker is then parked in `Atomics.wait` on a call that can never be answered.
+
+**That is the observed wedge state exactly**: a slot stuck in `running`, the host alive with its sweep
+count frozen, and everything else finished. `packages/sh` happens to guard its own path — it skips
+`exitCode` for a stage it stopped, and says so in a comment — which is consistent with the wedge being
+rare and appearing at the tail of a run rather than every time.
+
+**Fixed**: `kill` now settles `loaded` with why, ends the streams, and settles `exit` with -1, in that
+order. Promises make each idempotent, so a child killed after it finished keeps the code it returned.
+
+**Not yet claimed as *the* cause**, because I have not reproduced the corpus wedge with the fix in and
+watched it not happen; a once-in-fifty hang needs more than one clean run. What can be said is that this
+mechanism produces exactly the state that was observed, it is now impossible, and the deadlock detector
+would turn any survivor into a named failure in ninety seconds rather than a hang.

@@ -299,7 +299,15 @@ export function spawnChild(
   // message itself, and after `ready` nobody is listening for one.
   let started = false;
 
+  // Hoisted so `kill` can settle it too. **A killed child must still settle its exit**, or whoever is
+  // waiting on it waits for ever: `OP.EXIT_CODE` is `await child.exit`, and a worker parked on that call
+  // shows up as a slot stuck in `running` with the host alive and the counters frozen — which is
+  // precisely the state wac-mono 0082's wedge is observed in. Found by enumerating this lifecycle
+  // (`test/childlife_model.test.ts`), which reported it at depth one: `kill` on a newborn child left
+  // both `loaded` and `exit` unsettled.
+  let settleExit: (code: number) => void;
   const exit = new Promise<number>((resolve) => {
+    settleExit = resolve;
     worker.onMessage((data) => {
       const r = data as Result;
       // The load notice, which says only that the bundle evaluated.
@@ -346,8 +354,21 @@ export function spawnChild(
   // `child: true` so the worker runs `main` rather than `page`. A program with both is a page when a
   // person opened it and a program when something spawned it — a child has a handle, not a canvas,
   // and `packages/box`'s terminal exports both for exactly that reason.
+  /**
+   * Stop the child and release everyone waiting on it.
+   *
+   * Not `shutdown` alone, which only ends the streams and stops the responder. A caller awaiting
+   * `loaded` or `exit` has to be told as well, and promises make both settles idempotent — so a child
+   * killed after it finished keeps the code it actually returned.
+   */
+  const kill = (): void => {
+    done(started ? "" : "the child was killed before it reported ready");
+    shutdown();
+    settleExit(-1);
+  };
+
   worker.post({ sab: bridge.sab, child: true });
-  return { out, err, in: input, exit, loaded, kill: shutdown };
+  return { out, err, in: input, exit, loaded, kill };
 }
 
 /**
