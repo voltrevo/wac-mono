@@ -382,7 +382,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
-| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's. **Not done:** publishing to the HSDirs, and the program that holds it together |
+| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication is pinned against tor's own HSDir cache**: it stores our descriptor and files it under the blinded key our fetch path names. **Not done:** the upload and the publish route over a socket, and the program that holds it together |
 | 7 — the interop matrix | **not started as a document.** Steps 2–6 each contribute rows and most are green; nothing collects them, so a regression in one would not be visible as a regression in *the matrix* |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
@@ -1306,3 +1306,45 @@ cofactor is still a scalar and still produces sixty-four plausible bytes. Both d
 
 Six faults planted, all caught, including "clamp the blinded scalar again" — which is the plausible
 mistake, since every *other* scalar in ed25519 is clamped and this one must not be.
+
+### Publication, and the name the uploader does not choose
+
+Publishing looked like the least interesting thing step 6 owed — a POST with a document in it. The
+part that is not obvious is that **the uploader does not name the descriptor**. `/tor/hs/3/publish`
+carries no key at all; an HSDir reads the blinded key out of the descriptor's own signing-key
+certificate and files it under that. Only the *fetch* path has a name in it.
+
+So the failure this had to be tested against is a service that blinds correctly, signs correctly,
+uploads successfully, is told `HS descriptor stored successfully.`, and is unreachable — because the
+name it computes for the fetch URL is not the name the directory used. Every check short of asking a
+real directory what it called the thing would pass.
+
+`tools/hspub-probe.c` asks one. It stores our generated descriptor with tor's `hs_cache_store_as_dir`
+and looks it back up with `hs_cache_lookup_as_dir`, under the base64 blinded key `descriptorPath`
+puts in the URL. It hits, and the bytes tor would serve back are the bytes uploaded — which matters
+on its own, since a client verifies a signature over exactly those bytes.
+
+The four controls are recorded in the vector, and one of them is doing different work from the other
+three:
+
+| control | tor |
+|---|---|
+| one byte of the encrypted body flipped | refused |
+| the document signature corrupted | refused |
+| truncated after the first line | refused |
+| **the right descriptor, under an all-zero key** | **stored, and not found** |
+
+The first three only show that tor reads the document. The last is the one that separates a bad
+descriptor from a bad *name*, which is the failure the whole file exists for.
+
+The version parse is worth following exactly rather than matching `/tor/hs/3/publish` whole, because
+that path and `/tor/hs/3/<z>` differ only after the version and one is a POST target while the other
+is a GET target. tor reads a number after `/tor/hs/` and then requires `/publish`, so
+`/tor/hs/003/publish` is a v3 publish and `/tor/hs/3publish` is not a publish at all.
+
+Two planted faults survived the first pass. One was equivalent — a short-circuit that returned the
+same answer. The other was real: with the "there must be digits" guard removed, an absent version
+read as zero, and the obvious probe for it (`/tor/hs/publish`) could not see it, because the
+`/publish` check refuses that input whichever way the number parse goes. `/tor/hs//publish` is the
+input that tells them apart. **A guard is only tested by an input that reaches it** — the same shape
+as the padding boundary a few sections above.
