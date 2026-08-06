@@ -1,0 +1,196 @@
+// Onion service descriptors, against the document tor's own decoder accepted.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  DESC_SIG_PREFIX, descriptorDocument, encryptLayer, prefixed, signedSpanOf,
+} from "../../src/hsdescgen.wac";
+import { decryptLayer, superencryptedConstant, SALT_LEN, MAC_LEN } from "../../src/hsdesc.wac";
+import { ed25519Verify } from "../../../crypto/src/ed25519.wac";
+
+const i32 H_DESCRIPTOR = 0;
+const i32 H_CERT = 1;
+const i32 H_SUPERENCRYPTED = 2;
+const i32 H_SIGN_SEED = 3;
+const i32 H_SIGN_PUBLIC = 4;
+const i32 H_BLIND_SEED = 5;
+const i32 H_BLIND_PUBLIC = 6;
+const i32 H_NUM = 7;
+
+u8[] none() { return u8[0](); }
+
+u8[] at(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+
+i32 be32(u8[] b) { return b[0] * 16777216 + b[1] * 65536 + b[2] * 256 + b[3]; }
+
+i32 num(fn[u8[](i32, u8[], u8[])] ref, i32 which) { return be32(ref(H_NUM, at(which), none())); }
+
+u8[] built(fn[u8[](i32, u8[], u8[])] ref) {
+  return descriptorDocument(num(ref, 0), ref(H_CERT, none(), none()), num(ref, 1) as i64,
+                            ref(H_SUPERENCRYPTED, none(), none()), ref(H_SIGN_SEED, none(), none()));
+}
+
+export string test_the_document_tor_decoded_is_reproduced(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.eqBytes(built(ref), ref(H_DESCRIPTOR, none(), none()),
+            "the descriptor is the one tor's hs_desc_decode_plaintext accepted");
+  return t.report();
+}
+
+/**
+ * The signed span ends with the newline before `signature `, not before the object above it.
+ *
+ * tor finds `"\nsignature "` and steps *past* the newline, so that byte is inside the span. One byte
+ * either way leaves a document that parses and a signature that does not verify — the same shape as
+ * the ESTABLISH_INTRO span, and the reason both are pinned rather than described.
+ */
+export string test_the_signed_span_is_where_tor_stops(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] doc = built(ref);
+  u8[] span = signedSpanOf(doc);
+
+  t.eqI32(span.len(), num(ref, 2), "the span is the length recorded when tor accepted it");
+  t.eqI32(span[span.len() - 1], 10, "and it ends on the newline, which tor includes");
+  // What follows the span is exactly the signature line.
+  t.isTrue(startsWith(sub(doc, span.len(), doc.len()), "signature "),
+           "the byte after the span begins the signature line");
+
+  // The signature verifies over prefix+span with the descriptor signing key, and not over the span
+  // alone — the prefix is part of the message, as it is for ESTABLISH_INTRO.
+  u8[] sig = signatureOf(doc);
+  t.eqI32(sig.len(), 64, "there is a 64-byte signature to check");
+  t.isTrue(ed25519Verify(ref(H_SIGN_PUBLIC, none(), none()), prefixed(span), sig),
+           "the signature covers the prefixed span");
+  t.isTrue(!ed25519Verify(ref(H_SIGN_PUBLIC, none(), none()), span, sig),
+           "and not the bare span");
+  t.eqStr(DESC_SIG_PREFIX, "Tor onion service descriptor sig v3", "with tor's own prefix string");
+
+  // One byte more or less is a different message, which is the whole trap.
+  t.isTrue(!ed25519Verify(ref(H_SIGN_PUBLIC, none(), none()), prefixed(sub(doc, 0, span.len() - 1)),
+                          sig), "a span one byte short does not verify");
+  return t.report();
+}
+
+/**
+ * A layer encrypts to something the reader gets back, and the MAC is over the ciphertext.
+ *
+ * `decryptLayer` is our own, so this alone would be a round trip through one implementation. It earns
+ * its place by checking the *shape* tor's format fixes — salt first, MAC last, MAC over the
+ * ciphertext and not the plaintext — each of which a self-consistent pair would agree on wrongly.
+ * The layer contents are pinned against tor when the encrypted layers exist; this is the arithmetic.
+ */
+export string test_a_layer_round_trips_and_is_shaped_right(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] plain = "create2-formats 2\nintroduction-point AQAGAX8AAAEjKQ\n".toBytes();
+  u8[] secret = ref(H_BLIND_PUBLIC, none(), none());
+  u8[] subcred = u8[32]();
+  for (i32 i = 0; i < 32; i++) { subcred[i] = (i * 5 + 1) & 0xFF; }
+  u8[] salt = u8[SALT_LEN]();
+  for (i32 i = 0; i < SALT_LEN; i++) { salt[i] = (i * 13 + 2) & 0xFF; }
+
+  u8[] blob = encryptLayer(plain, secret, subcred, 42, salt, superencryptedConstant());
+  t.eqI32(blob.len(), SALT_LEN + plain.len() + MAC_LEN, "salt, ciphertext and MAC, and nothing else");
+  t.eqBytes(sub(blob, 0, SALT_LEN), salt, "the salt is first and is the one given");
+  t.eqBytes(decryptLayer(blob, secret, subcred, 42, superencryptedConstant()), plain,
+            "and the reader gets the plaintext back");
+
+  // The ciphertext is not the plaintext, which a cipher that silently did nothing would fail.
+  t.isTrue(!sameBytes(sub(blob, SALT_LEN, SALT_LEN + plain.len()), plain),
+           "the middle is enciphered rather than copied");
+
+  // Every input changes the output, and a corrupted blob is refused rather than returned.
+  u8[] other = encryptLayer(plain, secret, subcred, 43, salt, superencryptedConstant());
+  t.isTrue(!sameBytes(blob, other), "the revision counter changes the layer");
+  u8[] tampered = flipAt(blob, SALT_LEN + 1);
+  t.eqI32(decryptLayer(tampered, secret, subcred, 42, superencryptedConstant()).len(), 0,
+          "a flipped ciphertext byte fails the MAC");
+  t.eqI32(decryptLayer(flipAt(blob, 0), secret, subcred, 42, superencryptedConstant()).len(), 0,
+          "and so does a flipped salt byte, which changes the keys");
+
+  t.eqI32(encryptLayer(plain, secret, subcred, 42, u8[15](), superencryptedConstant()).len(), 0,
+          "a fifteen-byte salt is not a salt");
+  return t.report();
+}
+
+/** Inputs that cannot make a descriptor produce nothing, rather than an unsigned document. */
+export string test_bad_inputs_make_no_descriptor(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] cert = ref(H_CERT, none(), none());
+  u8[] sup = ref(H_SUPERENCRYPTED, none(), none());
+  u8[] seed = ref(H_SIGN_SEED, none(), none());
+
+  t.eqI32(descriptorDocument(180, u8[0](), 42, sup, seed).len(), 0, "no certificate, no descriptor");
+  t.eqI32(descriptorDocument(180, cert, 42, sup, u8[0]()).len(), 0, "no signing key, no descriptor");
+  t.eqI32(descriptorDocument(0, cert, 42, sup, seed).len(), 0, "a zero lifetime is not a lifetime");
+  t.eqI32(descriptorDocument(-1, cert, 42, sup, seed).len(), 0, "nor a negative one");
+  t.eqI32(signedSpanOf("no signature line here\n".toBytes()).len(), 0,
+          "a document with no signature line has no span");
+  return t.report();
+}
+
+/** The 64 bytes on the `signature ` line, decoded. */
+u8[] signatureOf(u8[] doc) {
+  u8[] span = signedSpanOf(doc);
+  if (span.len() == 0) { return u8[0](); }
+  i32 from = span.len() + "signature ".toBytes().len();
+  i32 end = from;
+  while (end < doc.len() && doc[end] != 10) { end = end + 1; }
+  return b64Decode(sub(doc, from, end));
+}
+
+/** Unpadded base64 back to bytes. Only what a signature line contains, so no padding handling. */
+u8[] b64Decode(u8[] text) {
+  i32 bits = 0;
+  i32 acc = 0;
+  u8[] out = u8[text.len() * 3 / 4]();
+  i32 n = 0;
+  for (i32 i = 0; i < text.len(); i++) {
+    i32 c = text[i];
+    i32 v = -1;
+    if (c >= 65 && c <= 90) { v = c - 65; }
+    else if (c >= 97 && c <= 122) { v = c - 71; }
+    else if (c >= 48 && c <= 57) { v = c + 4; }
+    else if (c == 43) { v = 62; }
+    else if (c == 47) { v = 63; }
+    if (v < 0) { continue; }
+    acc = (acc << 6) | v;
+    bits = bits + 6;
+    if (bits >= 8) {
+      bits = bits - 8;
+      out[n] = (acc >> bits) & 0xFF;
+      n = n + 1;
+    }
+  }
+  u8[] exact = u8[n]();
+  for (i32 i = 0; i < n; i++) { exact[i] = out[i]; }
+  return exact;
+}
+
+u8[] sub(u8[] s, i32 from, i32 to) {
+  u8[] out = u8[to - from]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = s[from + i]; }
+  return out;
+}
+
+u8[] flipAt(u8[] b, i32 i) {
+  u8[] out = u8[b.len()]();
+  for (i32 j = 0; j < b.len(); j++) { out[j] = b[j]; }
+  out[i] = out[i] ^ 1;
+  return out;
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+bool startsWith(u8[] s, string prefix) {
+  u8[] p = prefix.toBytes();
+  if (s.len() < p.len()) { return false; }
+  for (i32 i = 0; i < p.len(); i++) { if (s[i] != p[i]) { return false; } }
+  return true;
+}

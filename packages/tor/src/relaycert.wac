@@ -51,6 +51,8 @@ export const i32 CERT_TYPE_LINK = 5;
 export const i32 CERT_TYPE_AUTH = 6;
 /** `Ed25519 identity, signed with RSA identity` — a different format from 4, 5 and 6. */
 export const i32 CERT_TYPE_RSA_CROSSCERT = 7;
+/** `SIGNING_HS_DESC` — a blinded key certifying an onion service's descriptor signing key. */
+export const i32 CERT_TYPE_SIGNING_HS_DESC = 8;
 /**
  * `ntor onion key, cross-certifying ed25519 identity`, the `ntor-onion-key-crosscert` in a router
  * descriptor. Signed by a key that does not exist as a seed: proposal 228 derives it from the

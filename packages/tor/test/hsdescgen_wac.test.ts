@@ -1,0 +1,100 @@
+// Registers the wac-side onion service descriptor tests: the document a service publishes.
+//
+// The oracle is `test/data/hsdesc_generated.json`, produced by `src/genhsdesc.wac` and checked with
+// `tools/hsdesc-probe.c`, which puts it through tor's own `hs_desc_decode_plaintext`. That entry
+// point verifies the version, the lifetime, the signing-key **certificate** and the signature over
+// the document, and treats the `superencrypted` object as opaque — which is what lets the outer shell
+// be pinned before either encrypted layer exists.
+//
+// What ACCEPTED is worth here, measured by corrupting the committed bytes and asking tor:
+//
+//   | mutation | tor |
+//   |---|---|
+//   | unmodified | ACCEPTED |
+//   | one character of the signature | REJECTED |
+//   | the certificate's own signature | REJECTED |
+//   | the certificate's expiry | REJECTED |
+//   | the certified key | REJECTED |
+//   | `revision-counter` after signing | REJECTED |
+//   | `descriptor-lifetime` after signing | REJECTED |
+//   | one byte of the superencrypted object | REJECTED |
+//   | `hs-descriptor 4` | REJECTED |
+//   | truncated before the signature | REJECTED |
+//
+// So this verdict is a strong one — unlike a microdescriptor's, where only the digest discriminates.
+// Everything in the document is covered by either the signature or the certificate.
+//
+// One of those rows was nearly recorded wrongly. An early run reported "one character of the
+// certificate — ACCEPTED", which looked like a real gap; the string being replaced was from the
+// *previous* generated document and appeared nowhere in the current one, so the mutation changed
+// nothing. A mutation that does not mutate is indistinguishable from a surviving fault, and the only
+// defence is to assert that the bytes actually changed.
+
+import { wacTestRun } from "../../../harness/wacTestRun.ts";
+
+const H_DESCRIPTOR = 0; // the document tor decoded, byte for byte
+const H_CERT = 1;
+const H_SUPERENCRYPTED = 2;
+const H_SIGN_SEED = 3;
+const H_SIGN_PUBLIC = 4;
+const H_BLIND_SEED = 5;
+const H_BLIND_PUBLIC = 6;
+const H_NUM = 7; // a[0]: 0 lifetime, 1 revision, 2 signedSpanLen — 4 bytes big-endian
+
+const v = JSON.parse(
+  await Deno.readTextFile(new URL("data/hsdesc_generated.json", import.meta.url)),
+) as {
+  descriptor: string;
+  cert: string;
+  superencrypted: string;
+  signSeed: string;
+  signPublic: string;
+  blindSeed: string;
+  blindPublic: string;
+  lifetimeMinutes: number;
+  revision: number;
+  signedSpanLen: number;
+};
+
+const hex = (h: string) => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
+const utf8 = (s: string) => new TextEncoder().encode(s);
+const be32 = (n: number) => {
+  const out = new Uint8Array(4);
+  for (let i = 3; i >= 0; i--) out[i] = (n >> (8 * (3 - i))) & 0xff;
+  return out;
+};
+
+// The fixture has to be the shape the tests assume, or they are about nothing. Checked here so a
+// bad regeneration names itself rather than surfacing as a confusing wac assertion.
+if (!v.descriptor.startsWith("hs-descriptor 3\n")) {
+  throw new Error("the fixture is not a v3 descriptor");
+}
+if (!v.descriptor.includes("\nsignature ")) throw new Error("the fixture has no signature line");
+if (v.signedSpanLen <= 0 || v.signedSpanLen >= v.descriptor.length) {
+  throw new Error(`signedSpanLen ${v.signedSpanLen} is not inside a ${v.descriptor.length}-byte document`);
+}
+
+function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
+  switch (what) {
+    case H_DESCRIPTOR:
+      return utf8(v.descriptor);
+    case H_CERT:
+      return hex(v.cert);
+    case H_SUPERENCRYPTED:
+      return hex(v.superencrypted);
+    case H_SIGN_SEED:
+      return hex(v.signSeed);
+    case H_SIGN_PUBLIC:
+      return hex(v.signPublic);
+    case H_BLIND_SEED:
+      return hex(v.blindSeed);
+    case H_BLIND_PUBLIC:
+      return hex(v.blindPublic);
+    case H_NUM:
+      return be32([v.lifetimeMinutes, v.revision, v.signedSpanLen][a[0]]);
+    default:
+      throw new Error(`unknown vector field ${what}`);
+  }
+}
+
+await wacTestRun("packages/tor/test/wac/hsdescgen_test.wac", "hsdescgen", [ref]);
