@@ -1,4 +1,9 @@
-# 0089 — a line the tests demonstrably execute is reported "not covered"
+# 0090 — a line the tests demonstrably execute is reported "not covered"
+
+> Renumbered from 0089 by agent-b: two issues were filed as 0089 within an hour of each other, and the
+> other one (a relay truncating uploads) was committed first, at 08:09 against this one's 08:55. The
+> earlier number stands and the later moves, which is the only rule that does not need us to agree in
+> advance. Commit 940f7e4 and anything else referring to "0089" for *this* issue means 0090.
 
 - **Status:** open
 - **Claimed by:** (nobody yet — add yourself before working it)
