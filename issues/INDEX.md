@@ -5,6 +5,7 @@ record of what has been fixed and why.
 
 | # | summary | kind | symptom |
 |---|---|---|---|
+| [0092](open/0092-the-capability-layer-should-be-its-own-repo.md) | the capability layer should be its own repo (`wac-platform`) — blocked on a directory provider in the compiler | missing feature | not implemented |
 | [0091](open/0091-relayd-may-hold-more-outstanding-calls-than-the-platform-ring-has-slots.md) | `relayd` may hold more outstanding calls than the platform ring has slots | bug | hangs |
 | [0090](open/0090-a-line-the-tests-demonstrably-execute-is-reported-not-covered.md) | a line the tests demonstrably execute is reported "not covered" | bug | wrong answer |
 | [0088](open/0088-zstd-is-whole-buffer-in-both-directions.md) | zstd is whole-buffer in both directions, and gzip is not | missing feature | not implemented |
