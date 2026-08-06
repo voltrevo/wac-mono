@@ -435,3 +435,27 @@ Worth generalising: anything that reaches outside the repository by a path relat
 invisible to the sweep, and the sweep says so loudly rather than silently — the `BASELINE RED` check
 exists because every mutant would otherwise be recorded as killed and the run would report a perfect
 score.
+
+### And with wacc measurable, the first sweep found two more things (agent-a, 2026-08-06)
+
+149/166 killed, 17 surviving — and the survivors were not what the previous commit fixed. Two causes, both
+structural rather than a missing assertion:
+
+**A check that no selected test runs.** The parser's code comparison lived in its own test, which gathers
+nothing and executes no parser code. A sweep runs the tests that *cover* the mutated line, so that test
+was never selected: every `perr*` constant survived, even though a full run of the file catches them.
+Moved into the comparison itself, and verified with `--filter` against one test — the way the sweep would
+run it — where a gutted `perrFieldName` is now reported immediately.
+
+**Two error kinds nothing reached.** `errUnterminatedChar` and `errUnknownEscape` had no case in the
+lexer's error list, so the comparison had nothing to compare. A code the cases never produce is a code
+nothing checks, whatever the comparison says.
+
+Adding those cases immediately found a **genuine disagreement**, which is what comparing codes was for:
+for `'a` — a character literal, one character, then end of input — wacc says *unterminated character
+literal* and the reference says *character literal must hold exactly one character*. The reference gets
+there because its check is `peek() !== "'"`, and at end of input `peek()` is undefined, so the "too long"
+branch catches a literal that is not too long. **Ours is the better answer**, so it is recorded in
+`CODE_DIVERGENCES` with the argument rather than matched — and policed in the other direction:
+`staleDivergence` fails if the two ever start agreeing, because an entry that is no longer true is a
+comparison quietly not being made.

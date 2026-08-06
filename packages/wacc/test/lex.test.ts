@@ -11,7 +11,13 @@
 // silently comparing the wrong names.
 
 import { wacLex } from "wac/wacLex.ts";
-import { disagreement, LEX_CODES, tableFaults } from "./errorCodes.ts";
+import {
+  CODE_DIVERGENCES,
+  disagreement,
+  LEX_CODES,
+  staleDivergence,
+  tableFaults,
+} from "./errorCodes.ts";
 import { wacBind } from "../../../harness/wacBind.ts";
 import { loadCorpus } from "./corpus.ts";
 
@@ -177,8 +183,13 @@ Deno.test("lex: agrees on constructs a working corpus does not contain", () => {
 });
 
 Deno.test("lex: error codes and positions line up with the reference", () => {
-  // Errors are compared by count and position; the wac side reports codes rather
-  // than messages, so the mapping is checked by the order they occur in.
+  // Count, position **and code**. The wac side reports numbers where the reference reports English, so
+  // `errorCodes.ts` says which number means which message; a code with no entry — what a constant gutted
+  // to `return 0` produces — fails here.
+  //
+  // Every one of the seven error kinds has a case below, and that is not decoration: a sweep found
+  // `errUnterminatedChar` and `errUnknownEscape` surviving because no source here reached them, so the
+  // comparison had nothing to compare. A code the cases never produce is a code nothing checks.
   const cases: [string, number][] = [
     ["", 0],
     ['"unterminated', 1],
@@ -186,6 +197,11 @@ Deno.test("lex: error codes and positions line up with the reference", () => {
     ['"a\\qb"', 1],
     ["''", 1],
     ["'ab'", 1],
+    // errUnterminatedChar and errUnknownEscape, which nothing reached until a sweep said so.
+    ["'a", 1],
+    ["'", 1],
+    ["'\\q'", 1],
+    ['"a\\q"', 1],
     ["$", 1],
     ["$ $ $", 3],
     ['i32 x = 1; $ "open', 2],
@@ -210,6 +226,18 @@ Deno.test("lex: error codes and positions line up with the reference", () => {
       // **And the code, which nothing checked until now.** Position and count were compared and the
       // first field of each triple — the one that says *what went wrong* — was dropped. A mutation
       // sweep put `return 0` in place of every error constant and this test stayed green. wac-mono 0005.
+      if (CODE_DIVERGENCES.has(source)) {
+        // Recorded as a disagreement about *category*, with the argument in `errorCodes.ts`. Checked the
+        // other way instead: if the two have started agreeing, the entry is stale and hiding a real
+        // comparison, so it has to be removed rather than left standing.
+        if (staleDivergence(source, flat[i * 3], ref[i].message)) {
+          throw new Error(
+            `${JSON.stringify(source)} is recorded as a divergence but the two now agree — ` +
+              `delete the entry in errorCodes.ts`,
+          );
+        }
+        continue;
+      }
       const wrong = disagreement(LEX_CODES, flat[i * 3], ref[i].message);
       if (wrong !== null) throw new Error(`${JSON.stringify(source)}: error ${i}: ${wrong}`);
     }

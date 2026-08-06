@@ -157,6 +157,35 @@ export function relationFaults(
 }
 
 /**
+ * Sources where the two sides categorise the same error differently, and why.
+ *
+ * Comparing codes at all is new (wac-mono 0005), and the first thing it found was a disagreement rather
+ * than a bug: for `'a` — a character literal opened, one character, then end of input — wacc says
+ * *unterminated character literal* and the reference says *character literal must hold exactly one
+ * character*. The reference gets there because its check is `peek() !== "'"`, and at end of input `peek()`
+ * is undefined, so the "too long" branch catches a literal that is not too long at all. **Ours is the
+ * better answer**, so this is recorded rather than matched.
+ *
+ * Position and count are still compared strictly for these sources; only the category is exempt. And the
+ * exemption is checked in both directions — see `staleDivergence`, which fails when the two sides start
+ * agreeing, because an entry here that is no longer true is a comparison quietly not being made.
+ */
+export const CODE_DIVERGENCES: ReadonlyMap<string, string> = new Map([
+  [
+    "'a",
+    "at end of input the reference reports `must hold exactly one character`, because its check is " +
+    "`peek() !== \"'\"` and `peek()` is undefined there; wacc reports `unterminated character literal`, " +
+    "which is what it is",
+  ],
+]);
+
+/** Whether a recorded divergence has stopped being one, in which case the entry has to go. */
+export function staleDivergence(source: string, code: number, message: string): boolean {
+  if (!CODE_DIVERGENCES.has(source)) return false;
+  return disagreement(LEX_CODES, code, message) === null;
+}
+
+/**
  * Check one error: the code the wac side reported must mean what the reference said.
  *
  * Returns null when they agree, or the complaint when they do not. A code with no entry is a failure —

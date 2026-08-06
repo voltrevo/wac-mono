@@ -70,6 +70,17 @@ function agree(source: string): void {
   // relation once at the end — see `errorCodes.ts` for why the parser gets consistency and discrimination
   // rather than a table of meanings. wac-mono 0005.
   for (let i = 0; i < a.length; i++) {
+    // **Checked here, not only in the summary at the end.** A mutation sweep runs the tests that *cover*
+    // the mutated line, and a check living in its own test — one that executes no parser code — is never
+    // selected. So every `perr*` constant survived the sweep even though the summary would have caught
+    // them in a full run: the assertion has to sit in the test whose coverage reaches the line.
+    // wac-mono 0005.
+    if (!PARSE_CODE_VALUES.has(a[i].code)) {
+      throw new Error(
+        `${JSON.stringify(source)}: error ${i} came back as code ${a[i].code}, which no constant in ` +
+          `parse.wac declares — a gutted constant looks exactly like this`,
+      );
+    }
     OBSERVED.push({ shape: shapeOf(b[i].message), code: a[i].code, where: JSON.stringify(source) });
   }
 }
