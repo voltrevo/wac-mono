@@ -84,17 +84,26 @@ export u8[] emptyTrieRoot() { return keccak256(u8[](0x80)); }
  */
 export Proved verify(u8[] root, u8[] key, u8[][] nodes) {
   if (root.len() != 32) { return Proved.of(false, false, u8[0](), "a root must be 32 bytes"); }
-  if (nodes.len() == 0) {
-    // **An empty trie is the one root a proof of absence needs no nodes for.** There is nothing to walk:
-    // the root itself says the trie is empty, and every key is absent from an empty trie. Refusing this was
-    // not a safety property, it was an off-by-one in what "proves nothing" means — and the case is
-    // ordinary rather than exotic, because it is what an untouched account's storage looks like. A provider
-    // asked for a slot of an account that has never written one has exactly zero nodes to send
-    // (wac-mono upstream #44).
-    if (bytesEq(root, emptyTrieRoot())) { return Proved.of(true, false, u8[0](), ""); }
+  // **An empty trie is the one root a proof of absence needs no nodes for.** There is nothing to walk: the
+  // root itself says the trie is empty, and every key is absent from an empty trie. Refusing this was not a
+  // safety property, it was an off-by-one in what "proves nothing" means — and the case is ordinary rather
+  // than exotic, because it is what an untouched account's storage looks like (wac-mono upstream #44).
+  //
+  // Two spellings arrive in practice and both are accepted. Zero nodes is what `test/trie.ts` produces and
+  // what #44 describes. **One node, the single byte `0x80`, is what a real client sends** — `eth_getProof`
+  // against anvil answers `["0x80"]` for the storage of an account that has never written a slot, because
+  // `rlp("")` is what the empty root is the hash of. That is not a node in any shape this walk understands,
+  // so it was refused with "a node must be a list, and this one is a byte string" until a real client was
+  // asked; the fixtures in `test/vendor/getproof.json` are the record of it.
+  if (bytesEq(root, emptyTrieRoot())) {
+    if (nodes.len() == 0) { return Proved.of(true, false, u8[0](), ""); }
+    if (nodes.len() == 1 && nodes[0].len() == 1 && nodes[0][0] == 0x80) {
+      return Proved.of(true, false, u8[0](), "");
+    }
     return Proved.of(false, false, u8[0](),
-      "a proof with no nodes proves nothing, unless the root is the empty trie's");
+      "the empty trie's root, with " + itoa(nodes.len()) + " nodes offered as a proof about it");
   }
+  if (nodes.len() == 0) { return Proved.of(false, false, u8[0](), "a proof with no nodes proves nothing"); }
 
   u8[] path = nibblesOf(key);
   Walk w = Walk(nodes, 0, path, 0, "", false, u8[0]());

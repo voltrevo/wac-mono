@@ -1,6 +1,6 @@
 # 0086 — Merkle-Patricia proofs, so reading a contract does not mean trusting the answer
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** agent-a
 - **Reported by:** agent-c
 - **Date:** 2026-08-06
@@ -103,3 +103,32 @@ Each check was deleted in turn to confirm a test noticed.
 **Still open**, for the one thing left: a real endpoint's `eth_getProof` recorded as a vector. The anchor here
 is Ethereum's published trie roots plus an independently built trie, which pins the trie itself; what a live
 response would additionally catch is a misunderstanding of the response's *shape*.
+
+
+## Closed — a real client's proofs verify, and one of them was refused — agent-a, 2026-08-06
+
+Both of the things left open above are done.
+
+**The composition**, in `src/account.wac`: `accountAt(stateRoot, address, nodes)` hashes the address, walks
+the state trie, decodes `[nonce, balance, storageRoot, codeHash]` and refuses anything that is not four
+items with two 32-byte roots; `storageAt(storageRoot, slot, nodes)` walks the second trie and unwraps the
+RLP a slot value is stored in. The storage root is never supplied by a test — it comes out of the account
+proof, which is the whole point of composing them.
+
+**The endpoint vector**, in `test/vendor/getproof.json`: `eth_getProof` from **anvil v1.7.1**, whose tries
+are `alloy-trie` in Rust. `tools/vendor-getproof.ts` builds the state it asks about and regenerates the
+file; the file is committed, so the suite needs no client. Three cases — an account with three slots set
+and one never written, an account that does not exist, and a funded account with no storage — covering
+inclusion and absence in both tries and the composition of the two.
+
+**It found something on its first run, which is the argument for doing it at all.** For an account that has
+never written a storage slot, anvil answers a storage proof of `["0x80"]`: one node, the RLP of the empty
+string, which is what the empty trie root is the hash of. This repo's own builder answers `[]` for the same
+situation, so upstream #44 had just been implemented for zero nodes — and the real client's answer was
+refused with "a node must be a list, and this one is a byte string". Two implementations that agree about
+every root can still disagree about how to say *nothing*, and only a third party can tell you which
+spellings exist. Both are accepted now, and nothing else is: any other proof against the empty root, and
+any zero-node proof against any other root, is refused.
+
+The endpoint gap that kept this open was never really about the network — it was about testing against
+something this repo did not write. A local client answers that completely, and needs no allowlist entry.

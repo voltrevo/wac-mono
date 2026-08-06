@@ -77,7 +77,7 @@ Ordered by dependency, not by intent.
 | keccak256 | **done** — `crypto.keccak256`, the sponge's fourth domain byte; three published vectors at three lengths, and asserted to disagree with SHA3-256 and truncated SHAKE256 |
 | RLP — `packages/rlp` | **done** — `RLPTests` from `ethereum/tests`, 28 valid driven in both directions against the published bytes and 26 invalid all refused; the one rule the corpus does not cover is named in `test/vendor/README.md` |
 | ABI encoding and decoding — `packages/abi` | **done** — schema-driven, thirty cases from `npm:ethers` including every nested shape, decoded *and* re-encoded byte for byte, with the malformed-offset refusals |
-| Merkle-Patricia state proofs — `packages/mpt` | **done bar one vector** — the verifier and the account-and-storage composition, anchored to all seven of `trieanyorder.json`'s published roots; inclusion, absence and every perturbation. 0086 stays open only for a live `eth_getProof` recorded as a vector |
+| Merkle-Patricia state proofs — `packages/mpt` | **done** — the verifier and the account-and-storage composition, anchored to all seven of `trieanyorder.json`'s published roots and to `eth_getProof` from a real client (anvil, `alloy-trie` in Rust); inclusion, absence and every perturbation. 0086 closed |
 | ENS resolution — `packages/ens` | **the name half is done** — namehash, DNS wire encoding, selectors and the two calls' calldata, all against `npm:ethers`. ENSIP-15 normalisation is not implemented and says so; making the calls needs an endpoint, which is the same gap 0086 has |
 | secp256k1 signing | not started — see the section below, which is the reason it is last |
 | content-addressed retrieval (IPFS or otherwise) | not started — needs a decision about what is being promised |
@@ -131,8 +131,8 @@ Issues reference this document rather than restating it. Unblocked today, in dep
 - [0083](../issues/closed/0083-keccak256-for-ethereum-not-just-sha3.md) — keccak256 — **closed**
 - [0084](../issues/closed/0084-rlp-encoding-and-decoding.md) — RLP — **closed**
 - [0085](../issues/closed/0085-abi-encoding-and-decoding.md) — ABI — **closed**
-- [0086](../issues/open/0086-merkle-patricia-proofs-so-a-contract-read-is-verified.md) — state proofs —
-  open for a recorded `eth_getProof` vector
+- [0086](../issues/closed/0086-merkle-patricia-proofs-so-a-contract-read-is-verified.md) — state proofs
+  — **closed**
 
 Not yet issues, and why: **ENS** needs the three above; **signing** needs its gate designed first;
 **content-addressed retrieval** needs a decision about what is being promised; the **reference
