@@ -822,7 +822,17 @@ try {
         if (picked === null) widened++;
         if (picked !== null) {
           if (picked.length === 0) {
+            // **Unhit is not unobservable.** A one-line accessor like `perrCtorBrace() { return 27; }` is
+            // folded into its call sites, so its own line's counter stays at zero while the constant it
+            // returns reaches every caller — and gutting it does fail two tests. Concluding "no test
+            // executes this" from the counter alone recorded such a mutant as unmeasurable and dropped it
+            // from the score, which is the under-selection this tool says elsewhere it will not do.
+            //
+            // So the full scope runs instead, and the *result* decides: killed is killed, and a survivor
+            // is still reported as an unhit line, which is the useful half of the old message. It costs a
+            // handful of full-scope runs per sweep. wac-mono 0005.
             notCovered = true;
+            widened++;
           } else {
             const f = filterFor(picked);
             const files = [...new Set(picked.map((t) => profile!.home.get(t)!))].sort();
@@ -830,15 +840,6 @@ try {
             else widened++;
           }
         }
-      }
-      if (notCovered) {
-        results.push({
-          index, mutant, killed: false, timedOut: false, dirs, notCovered: true,
-          detail: "no test executes this line",
-        });
-        console.log(`  --  ${mutant.name.padEnd(52)} not covered`);
-        for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, sources.get(f)!);
-        continue;
       }
       const cmd = testCommand(work, runDirs, filter);
       const child = cmd.spawn();
@@ -864,10 +865,21 @@ try {
         killed,
         timedOut,
         dirs,
-        detail: timedOut ? `timed out after ${(deadline / 1000).toFixed(0)}s` : (firstFail ?? "").trim().slice(0, 90),
+        // Only a *surviving* mutant on an unhit line is reported that way. One that died was reachable
+        // after all, whatever its own line's counter says.
+        notCovered: notCovered && !killed,
+        detail: timedOut
+          ? `timed out after ${(deadline / 1000).toFixed(0)}s`
+          : notCovered && !killed
+          ? "no test executes this line"
+          : (firstFail ?? "").trim().slice(0, 90),
       });
-      const mark = timedOut ? "TO " : killed ? "ok " : "!! ";
-      console.log(`  ${mark} ${mutant.name.padEnd(52)} ${killed ? "killed" : "SURVIVED"}`);
+      const mark = timedOut ? "TO " : killed ? "ok " : notCovered ? "-- " : "!! ";
+      console.log(
+        `  ${mark} ${mutant.name.padEnd(52)} ${
+          killed ? "killed" : notCovered ? "not covered" : "SURVIVED"
+        }`,
+      );
 
       for (const f of touched) await Deno.writeTextFile(`${work}/${f}`, sources.get(f)!);
     }

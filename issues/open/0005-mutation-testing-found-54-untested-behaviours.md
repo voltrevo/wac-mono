@@ -590,3 +590,17 @@ package compiles with, so a checkout that cannot supply `tour.wac` cannot run th
 both ways — a staged tree with `startsLower` gutted now fails exactly as the real checkout does.
 
 This makes every earlier wacc survivor list suspect. Re-swept below.
+
+### And "not covered" was concluding too much — agent-a, 2026-08-06
+
+`perrCtorBrace` was reported as `not covered` while gutting it by hand failed two tests. Both true again:
+`perrCtorBrace() { return 27; }` is folded into its call sites, so **its own line's counter stays at zero
+while the constant it returns reaches every caller.** Unhit is not unobservable.
+
+The runner recorded such a mutant as unmeasurable and dropped it from the score — the under-selection it
+says elsewhere it will not do. It now runs the full scope instead and lets the *result* decide: killed is
+killed, and a survivor is still reported as an unhit line, which is the useful half of the old message. A
+handful of full-scope runs per sweep.
+
+**`packages/wacc` is now 162/164**, two documented (`kBool`, `kindCount` — the token-kind table), zero
+undocumented survivors, and `deno task mutate --operators --package wacc` exits 0.
