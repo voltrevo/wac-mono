@@ -1058,9 +1058,16 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
   }
 }
 
-async function bash(script: string) {
+async function bash(script: string, cwd: string) {
   const r = await new Deno.Command("bash", {
     args: ["-c", script],
+    // **A directory of its own, and the same one our shell gets.** Without it both shells ran in the
+    // repository's root, because neither `Deno.Command` nor the in-process runner sets one — so a case
+    // like `echo x > f` wrote `f` into the checkout, `git status` grew a stray file after every suite
+    // run, and the two shells being compared shared a directory with each other and with the previous
+    // 680 cases. A differential test whose halves can see each other's leftovers is comparing the
+    // wrong thing; this is also how `f` came to be committed to the repo root once already.
+    cwd,
     // No standard input for either shell, and said rather than inherited. A script that reads — `cat`
     // or `read` with nothing redirected into it — now reads the *shell's* input, since `sh` claims it
     // (issue 0032). Inheriting the test runner's would mean both shells waiting on a terminal that
@@ -1135,10 +1142,10 @@ const SH_ENV: Record<string, string> = {
   HOME: Deno.env.get("HOME") ?? "",
 };
 
-async function wacsh(script: string, note?: (what: string) => void) {
+async function wacsh(script: string, cwd: string, note?: (what: string) => void) {
   // No standard input, as for bash above: the comparison is of scripts, not of terminals. The
   // runner ends the input stream at once when none is given, which is what `stdin: "null"` did.
-  const r = await sh.run(["-c", script], { env: SH_ENV, note });
+  const r = await sh.run(["-c", script], { env: SH_ENV, cwd, note });
   return { stdout: r.out, code: r.code, stderr: r.err };
 }
 
@@ -1151,11 +1158,6 @@ const haveBash = await (async () => {
 })();
 
 Deno.test({
-  // **Tagged flaky against wac-mono 0082.** This hangs about once in fifty runs, and only on an idle
-  // machine: the last four scripts stop with our shell blocked in a host call that was taken and never
-  // answered. The tag is in the *name* so that a failure carries its own alternative explanation — the
-  // point of it is to stop the next person diagnosing their own change for an hour, which is what this
-  // issue cost the first time. It comes off when 0082 does; `tools/flaky.test.ts` enforces that.
   name: "every script agrees with bash on output and exit status",
   ignore: !haveBash,
   fn: async () => {
@@ -1169,6 +1171,11 @@ Deno.test({
     // harness by hand, which is what I did the first time and then deleted.
     const differences: string[] = [];
     await pool(CASES, 4, async (script, _index, note) => {
+      // One directory per case, removed after it. Per case rather than per run because several scripts
+      // write the same names — `f`, `d`, `out` — and a case that found the previous one's file would
+      // pass or fail on the order the pool happened to run them in.
+      const dir = await Deno.makeTempDir({ prefix: "sh-case-" });
+      try {
       // Both halves run at once, and the note says which are still outstanding. Without it a wedge names
       // the script and leaves it open whether the stuck half is the real `bash` subprocess or our own
       // shell in this process — wac-mono 0082, where four cases hung for 550s and that was the question.
@@ -1179,13 +1186,13 @@ Deno.test({
       };
       note("bash+wacsh");
       const [want, got] = await Promise.all([
-        bash(script).then((r) => {
+        bash(script, dir).then((r) => {
           finish("bash");
           return r;
         }),
         // The phase goes into the note too: `[wacsh:running]` and `[wacsh:draining]` are different
         // bugs, and a wedge that says which costs one run instead of a bisect.
-        wacsh(script, (phase) => {
+        wacsh(script, dir, (phase) => {
           if (waiting.has("wacsh")) note([...waiting].join("+").replace("wacsh", `wacsh:${phase}`));
         }).then((r) => {
           finish("wacsh");
@@ -1199,6 +1206,9 @@ Deno.test({
           `  ours: ${JSON.stringify(got.stdout)} exit ${got.code}` +
           (got.stderr.trim() === "" ? "" : `\n  stderr: ${got.stderr.trim().split("\n")[0]}`),
         );
+      }
+      } finally {
+        await Deno.remove(dir, { recursive: true }).catch(() => {});
       }
     }, {
       what: "script",
