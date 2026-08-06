@@ -1,0 +1,93 @@
+// Publishing a descriptor: what each directory's answer means, and when the service is done.
+//
+// The transport is `publishOverCircuit` in `link.wac`; the plan is `servicePlan` in `hsdir.wac`. What
+// is here is the part between them — reading a directory's reply, and deciding from a set of replies
+// whether the service is published or has a problem.
+//
+// ## Three outcomes, not two
+//
+// tor's `handle_response_upload_hsdesc` separates a rejection from a surprise, and the separation is
+// operational rather than cosmetic:
+//
+//   - **200** — this directory has it.
+//   - **400** — this directory read the descriptor and refused it. Every other directory will read
+//     the same bytes and refuse them too, so trying more is not a recovery, it is the same failure
+//     repeated. The descriptor is wrong.
+//   - **anything else** — this directory did something unexpected. That says nothing about the
+//     descriptor, and another directory may well accept it.
+//
+// Collapsing those two failures into "failed" is what turns a signing bug into an intermittent
+// outage: a service would retry its way around the ring, each directory refusing for the same reason,
+// and the logs would show eight failures against eight directories rather than one bad document.
+//
+// ## When a service is published
+//
+// tor uploads to every responsible directory and does not require them all to succeed — a directory
+// that is down is an ordinary event on a network of volunteers, and a descriptor that reached most of
+// its ring is findable by most clients. So `publicationState` reports what happened rather than a
+// boolean, and the caller decides. What it does insist on is the distinction above: any rejection at
+// all is a fact about the descriptor and is worth surfacing immediately, however many other uploads
+// succeeded.
+
+/** This directory has the descriptor. */
+export const i32 UPLOAD_OK = 0;
+/** The directory read the descriptor and refused it — every other one will too. */
+export const i32 UPLOAD_REJECTED = 1;
+/** An answer tor calls unexpected: this directory, rather than the descriptor. */
+export const i32 UPLOAD_UNEXPECTED = 2;
+/** No answer at all — the circuit broke or the stream closed unanswered. */
+export const i32 UPLOAD_NO_ANSWER = 3;
+
+/**
+ * What a directory's HTTP status means for an upload, following `handle_response_upload_hsdesc`.
+ *
+ * A status of -1 is `splitResponse`'s "nothing arrived", which tor never sees as a status because it
+ * handles a dead connection elsewhere. It is kept separate from `UNEXPECTED` because a broken circuit
+ * says nothing at all about the directory, and a service that counted it against one would eventually
+ * blame a directory it never reached.
+ */
+export i32 uploadOutcome(i32 status) {
+  if (status == 200) { return UPLOAD_OK; }
+  if (status == 400) { return UPLOAD_REJECTED; }
+  if (status < 0) { return UPLOAD_NO_ANSWER; }
+  return UPLOAD_UNEXPECTED;
+}
+
+/** What a round of uploads came to. */
+export struct Publication {
+  i32 uploaded;      // directories that took it
+  i32 rejected;      // directories that read it and said no
+  i32 unreachable;   // unexpected answers and silent circuits together — a directory problem
+  /**
+   * Whether the descriptor itself is in question.
+   *
+   * True as soon as *one* directory rejects. A rejection is a fact about the bytes, and eight
+   * directories rejecting is the same fact eight times rather than eight problems — so a service that
+   * waited for a majority before believing it would spend a full round of circuits confirming
+   * something the first answer already established.
+   */
+  bool descriptorRefused;
+}
+
+/** Tally a round of upload outcomes. */
+export Publication publicationState(i32[] outcomes) {
+  i32 ok = 0;
+  i32 no = 0;
+  i32 other = 0;
+  for (i32 i = 0; i < outcomes.len(); i++) {
+    if (outcomes[i] == UPLOAD_OK) { ok = ok + 1; }
+    else if (outcomes[i] == UPLOAD_REJECTED) { no = no + 1; }
+    else { other = other + 1; }
+  }
+  return Publication(ok, no, other, no > 0);
+}
+
+/**
+ * Whether this upload is worth trying again at *another* directory.
+ *
+ * Not "did it fail". A rejected descriptor retried elsewhere is the same request answered the same
+ * way, and doing that eight times turns one legible failure into eight illegible ones.
+ */
+export bool worthRetryingElsewhere(i32 outcome) {
+  return outcome == UPLOAD_UNEXPECTED || outcome == UPLOAD_NO_ANSWER;
+}
