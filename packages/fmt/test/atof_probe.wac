@@ -1,5 +1,18 @@
 // Test fixture: exposes atofSpan over a byte span so the host can compare against
 // its own Number().
-import { atofSpan } from "../src/atof.wac";
+import { approxBits, atofSpan, scan } from "../src/atof.wac";
 
 export f64 parse(u8[] src) { return atofSpan(src, 0, src.len()); }
+
+/**
+ * The bisection's starting estimate, as raw bits, or 0 where it declines to guess.
+ *
+ * Exposed because nothing checked it: replacing the whole function with `return 0` passes every test in
+ * this package. That mutant is *correct* — a zero estimate only means the bisection starts from the full
+ * range and takes sixty-odd steps instead of three — so what it exposes is not a wrong answer but an
+ * unchecked assumption. The estimate's accuracy is what makes the ±4 window around it safe to use, and
+ * `bisect` narrows its bracket to that window before searching. If the estimate drifted outside it, the
+ * guards would reject the bracket and the code would quietly stop being fast; if the *guards* were also
+ * wrong, it would stop being correct. wac-mono 0005.
+ */
+export u64 estimate(u8[] src) { return approxBits(scan(src, 0, src.len())); }

@@ -557,3 +557,16 @@ Ownership had to be stated precisely for the first of those to be caught at all:
 free, claimed, cancelled, held by a live ticket, or being worked on. Writing it as "ready counts as owned"
 let the mutant through, because that bug's whole signature is an answer written into a slot whose ticket
 had already died.
+
+### Since the lifecycle fix: forty runs, no wedge — suggestive, not proof (agent-a, 2026-08-06)
+
+Four series of ten corpus runs since `kill` began settling `exit`, the last of them starting on a machine
+at load 1.81 and rising to 4 as the loop itself loaded it. No wedge in any of them.
+
+What that is worth, stated carefully: **every previous wedge began on a machine below load 1.0**, and a
+hunt loop cannot hold a machine that quiet, because the corpus is itself heavy — the first run of a loop
+is the only one that starts from rest. So the strongest condition I can reproduce on demand is "run 1 at
+load ~1.8", and that is now clean four times where it used to wedge three times in four.
+
+It is not proof. A once-in-fifty failure needs a week of green gates, not forty runs. The tag stays on the
+test, and `tools/flaky.test.ts` will make somebody take it off when this issue closes.

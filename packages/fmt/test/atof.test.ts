@@ -8,6 +8,7 @@ import { wacBind } from "../../../harness/wacBind.ts";
 
 const mod = await wacBind("packages/fmt/test/atof_probe.wac") as unknown as {
   parse(b: Uint8Array): number;
+  estimate(b: Uint8Array): bigint;
 };
 const enc = new TextEncoder();
 const atof = (s: string): number => mod.parse(enc.encode(s));
@@ -121,5 +122,45 @@ Deno.test("atof: random decimals across the exponent range are bit-exact", () =>
     for (let d = 0; d < digits; d++) mant += Math.floor(next() * 10).toString();
     const exp = Math.floor(next() * 680) - 340;
     assertSame(`${next() < 0.5 ? "-" : ""}${mant}e${exp}`);
+  }
+});
+
+Deno.test("atof: the starting estimate is inside the window the bisection trusts", () => {
+  // **Why this test exists.** A mutation sweep replaced `approxBits` with `return 0` and every test in
+  // this package still passed — correctly, because a declined estimate only means the bisection starts
+  // from the full range and takes sixty-odd steps instead of three. What the mutant exposed is an
+  // unchecked *assumption*: `bisect` narrows its bracket to estimate ± 4 before searching, and that is
+  // only safe if the estimate really is within four ulps of the answer.
+  //
+  // If the estimate drifted outside the window, the guards in `bisect` would reject the bracket and the
+  // code would quietly stop being fast — and if those guards were ever wrong too, it would stop being
+  // correct. This checks the assumption directly rather than through its consequences. wac-mono 0005.
+  const bitsOf = (x: number): bigint => {
+    const view = new DataView(new ArrayBuffer(8));
+    view.setFloat64(0, x);
+    return view.getBigUint64(0);
+  };
+
+  const cases = [
+    "1", "1.5", "0.1", "0.2", "3.141592653589793", "2.718281828459045",
+    "9007199254740993", "123456789.123456789", "1e10", "1e-10", "6.02214076e23",
+    "1.7976931348623157e308", "5e-324", "0.000001", "999999999999999999999",
+    "1.0000000000000002", "4.9406564584124654e-324", "2.2250738585072014e-308",
+  ];
+  let guessed = 0;
+  for (const src of cases) {
+    const estimate = mod.estimate(enc.encode(src));
+    if (estimate === 0n) continue;   // declined — legal, and the slow path is still correct
+    guessed++;
+    const want = bitsOf(Number(src));
+    const off = estimate > want ? estimate - want : want - estimate;
+    if (off > 4n) {
+      throw new Error(`${src}: estimate is ${off} ulps out; the bisection window is 4`);
+    }
+  }
+  // And it must actually guess: a function that always declined would satisfy the loop above without
+  // ever being tested, which is exactly the mutant this test was written for.
+  if (guessed < cases.length - 4) {
+    throw new Error(`only ${guessed} of ${cases.length} produced an estimate; the fast path is not working`);
   }
 });

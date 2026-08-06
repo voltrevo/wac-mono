@@ -17,6 +17,18 @@ export type KnownSurvivor = { name: string; why: string };
 
 export const KNOWN_SURVIVORS: KnownSurvivor[] = [
   {
+    name: "guard/fmt/ftoa:230:23",
+    why:
+      "The carry-out-of-the-first-digit trap in `writeDecimal`, and the source above it carries the " +
+      "proof that it cannot fire: if digit k+1 rounded up while `high` held, then r_k + mPlus_k > s, " +
+      "which is the loop's own stopping condition at step k — so the loop would already have stopped " +
+      "there, and only the first digit has no previous step to contradict. Measured as well as argued: " +
+      "the branch was never taken by 60,000 random doubles nor by 60,000 neighbours of round decimals, " +
+      "which is what prompted the proof. A test cannot kill this mutant because no input reaches the " +
+      "line; the trap stays because an unreachable branch that stops beats one that silently does the " +
+      "wrong thing if the proof is ever broken by a change. wac-mono 0005.",
+  },
+  {
     name: "extreme/bls/fp/isEvenRaw",
     why:
       "Binary extended GCD's halving test. Forcing it false removes every halving step, which " +

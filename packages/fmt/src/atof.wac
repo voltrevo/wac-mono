@@ -171,7 +171,9 @@ f64 fastPath(Quick q) {
 }
 
 /** Split the span into significant digits and a decimal exponent. */
-Parts scan(u8[] src, i32 start, i32 end) {
+// Exported with `approxBits`, which takes what this produces: a probe cannot check the estimate without
+// being able to make the input it estimates from.
+export Parts scan(u8[] src, i32 start, i32 end) {
   Parts p = Parts(u8[MAX_DIGITS()](), 0, 0, false, false);
   i32 i = start;
   if (i < end && src[i] == '-') { p.neg = true; i++; }
@@ -360,7 +362,10 @@ f64 bisect(Parts p) {
  * Zero or infinity means "no useful estimate", and the caller then bisects the
  * whole range.
  */
-u64 approxBits(Parts p) {
+// Exported for `test/atof_probe.wac` alone. The accuracy of this estimate is the assumption the ±4
+// window in `bisect` rests on, and nothing checked it: replacing the body with `return 0` passed every
+// test in the package, because a declined estimate only costs bisection steps. wac-mono 0005.
+export u64 approxBits(Parts p) {
   f64 m = 0.0;
   i32 used = p.count < 17 ? p.count : 17;
   for (i32 i = 0; i < used; i++) {
