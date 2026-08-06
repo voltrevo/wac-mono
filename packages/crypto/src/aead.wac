@@ -8,6 +8,7 @@
 import { chachaBlock, chacha20 } from "./chacha20.wac";
 import { poly1305 } from "./poly1305.wac";
 import { padTo16 } from "./layout.wac";
+import { ctEqualN } from "./ct.wac";
 
 /** The one-time Poly1305 key: the first 32 bytes of keystream block 0. */
 u8[] oneTimeKey(u8[] key, u8[] nonce) {
@@ -62,10 +63,7 @@ export u8[] aeadEncrypt(u8[] key, u8[] nonce, u8[] plain) {
 export u8[] aeadDecrypt(u8[] key, u8[] nonce, u8[] aad, u8[] ct, u8[] tag) {
   u8[] want = aeadTag(key, nonce, aad, ct);
   if (tag.len() != 16) { trap; }
-  // Compared without an early exit. Not a constant-time guarantee — wac gives
-  // no such control — but it costs nothing and removes the obvious leak.
-  i32 diff = 0;
-  for (i32 i = 0; i < 16; i++) { diff |= want[i] ^ tag[i]; }
-  if (diff != 0) { trap; }
+  // Compared without an early exit — see `ct.wac` for what that does and does not promise.
+  if (!ctEqualN(want, tag, 16)) { trap; }
   return chacha20(key, 1, nonce, ct);
 }

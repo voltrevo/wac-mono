@@ -1,0 +1,86 @@
+// Comparing secrets, and the one property no caller's test can check.
+//
+// Every user of `ctEqual` — a MAC tag, a replay digest — is tested against real inputs, and none of
+// those tests can tell a full comparison from a truncated one. Constructing two values whose digests
+// or tags agree on their first four bytes is precisely the work the digest exists to prevent, so a
+// test that feeds real inputs will never produce the case that separates them.
+//
+// This file can, because it chooses the bytes directly. That is the whole reason the loop is worth
+// having in one place: the property is checked once, here, and inherited by everything that calls it.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { ctEqual, ctEqualN } from "../../src/ct.wac";
+
+/** Equal is equal, different is different, and length is not a detail. */
+export string test_it_compares_what_it_is_given(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.isTrue(ctEqual(seq(32, 0), seq(32, 0)), "the same bytes are the same");
+  t.isTrue(!ctEqual(seq(32, 0), seq(32, 1)), "different bytes are not");
+  t.isTrue(ctEqual(u8[0](), u8[0]()), "nothing equals nothing");
+  t.isTrue(!ctEqual(seq(32, 0), seq(31, 0)), "and a prefix is not the whole");
+  t.isTrue(!ctEqual(seq(31, 0), seq(32, 0)), "in either direction");
+  return t.report();
+}
+
+/**
+ * **Every** byte is compared, including the last one.
+ *
+ * A comparison that stopped early — at four bytes of thirty-two, say — would pass every test its
+ * callers have, because their inputs are digests and tags and no two of those agree on a prefix by
+ * accident. So the difference is placed at each position in turn, and the last position is the one
+ * that catches a loop bound that is short by any amount at all.
+ */
+export string test_every_byte_is_compared(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 missed = 0;
+  for (i32 at = 0; at < 32; at++) {
+    u8[] a = seq(32, 0);
+    u8[] b = seq(32, 0);
+    b[at] = b[at] ^ 1;
+    if (ctEqual(a, b)) { missed = missed + 1; }
+  }
+  t.eqI32(missed, 0, "a difference at any of the 32 positions is found");
+
+  // And one bit, not one byte: a comparison that masked low bits would pass the loop above if it
+  // flipped whole bytes, so the flip is deliberately the lowest bit.
+  u8[] a = seq(32, 0);
+  u8[] b = seq(32, 0);
+  b[31] = b[31] ^ 1;
+  t.isTrue(!ctEqual(a, b), "one bit in the last byte is a difference");
+  return t.report();
+}
+
+/** The fixed-length form compares exactly what it was asked to, and refuses what it cannot. */
+export string test_the_counted_form(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  t.isTrue(ctEqualN(seq(16, 0), seq(16, 0), 16), "sixteen equal bytes");
+
+  i32 missed = 0;
+  for (i32 at = 0; at < 16; at++) {
+    u8[] b = seq(16, 0);
+    b[at] = b[at] ^ 1;
+    if (ctEqualN(seq(16, 0), b, 16)) { missed = missed + 1; }
+  }
+  t.eqI32(missed, 0, "a difference at any of the sixteen is found");
+
+  // Bytes past the count are not looked at — which is what lets a caller compare a tag against a
+  // longer buffer without copying, and is worth stating because it is also how a bug would look.
+  u8[] longer = seq(32, 0);
+  t.isTrue(ctEqualN(seq(16, 0), longer, 16), "only the first n are compared");
+
+  // A count that does not fit is refused rather than read past the end. Trapping would be defensible
+  // and returning true would not: a caller that asked to compare more than it has is a caller whose
+  // idea of the message length is wrong, and answering "equal" to that is the worst of the options.
+  t.isTrue(!ctEqualN(seq(8, 0), seq(16, 0), 16), "a short left side is not equal");
+  t.isTrue(!ctEqualN(seq(16, 0), seq(8, 0), 16), "nor a short right side");
+  t.isTrue(!ctEqualN(seq(16, 0), seq(16, 0), 0), "and comparing nothing is not a match");
+  t.isTrue(!ctEqualN(seq(16, 0), seq(16, 0), -1), "nor is a negative count");
+  return t.report();
+}
+
+/** `n` bytes, offset by `role` so two sequences differ everywhere rather than in a prefix. */
+u8[] seq(i32 n, i32 role) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (role * 97 + i * 13 + 5) & 0xFF; }
+  return out;
+}
