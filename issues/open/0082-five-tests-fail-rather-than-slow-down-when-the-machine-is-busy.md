@@ -423,3 +423,38 @@ broken.
 
 What this buys, until the cause is found: a wedge costs one failing test with the wait named, instead of
 the push gate's 45-minute timeout spent on no information at all.
+
+### The three that still flake say so in their names (operator's call, 2026-08-06)
+
+> "I think we should tag these tests as flaky in the test name and link the issue. That way when they fail
+> the flake is a clear alternative explanation. Obviously we should just not be flaky in the first place,
+> but until that's solved it should at least be clear to avoid chasing the wrong geese."
+
+Done, for the three that are still open members of this class:
+
+| test | file |
+| --- | --- |
+| `[flaky 0082] every script agrees with bash on output and exit status` | `packages/sh/test/differential.test.ts` |
+| `[flaky 0082] run a command on a real OpenSSH server and read its output` | `packages/ssh/test/transport.test.ts` |
+| `[flaky 0082] an endless producer stops at the cap rather than filling memory` | `packages/box/test/shell.test.ts` |
+
+In the *name*, so the explanation arrives in the line the runner prints, at the moment somebody is deciding
+whether they broke something. A tracker entry only helps a reader who already suspects the suite, which is
+the state this issue's reporter reached after an hour.
+
+**Deliberately not tagged: the four that were fixed.** Tagging a test that is no longer flaky is how a real
+regression gets waved through, and it is the failure mode of this whole practice.
+
+`tools/flaky.test.ts` is what keeps it from becoming one:
+
+- every `[flaky NNNN]` must name an issue in `issues/open/`. **When this issue is closed and the tags are
+  not, the suite fails and names the lines to edit** — so the tag and the issue come off together.
+- the issue it names has to read as one about intermittent failure, or the tag is a dead end for whoever
+  follows it mid-diagnosis;
+- the convention is required to be written down in `issues/README.md`, so the next person does not invent
+  a different spelling;
+- and every green run prints the list, because three flaky tests became normal here by nobody counting
+  them out loud.
+
+Verified it fails: pointing one tag at a closed issue reports
+`packages/box/test/shell.test.ts:130 is tagged [flaky 0011], which is closed`.

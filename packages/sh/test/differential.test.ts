@@ -1151,7 +1151,12 @@ const haveBash = await (async () => {
 })();
 
 Deno.test({
-  name: "every script agrees with bash on output and exit status",
+  // **Tagged flaky against wac-mono 0082.** This hangs about once in fifty runs, and only on an idle
+  // machine: the last four scripts stop with our shell blocked in a host call that was taken and never
+  // answered. The tag is in the *name* so that a failure carries its own alternative explanation — the
+  // point of it is to stop the next person diagnosing their own change for an hour, which is what this
+  // issue cost the first time. It comes off when 0082 does; `tools/flaky.test.ts` enforces that.
+  name: "[flaky 0082] every script agrees with bash on output and exit status",
   ignore: !haveBash,
   fn: async () => {
     // Four at a time. Each script is a bash subprocess and an in-process run of our shell, so serially this
