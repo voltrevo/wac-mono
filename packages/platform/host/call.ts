@@ -32,6 +32,7 @@ import {
   ST_CANCELLED,
   ST_CLAIMED,
   ST_FREE,
+  ST_RUNNING,
   ST_PENDING,
   ST_READY,
   STATUS_ERR,
@@ -102,13 +103,33 @@ export type Ticket = { slot: number; gen: number };
  * anything: it prints.
  */
 export function describeSlots(b: Bridge): string {
-  const names = ["free", "claimed", "pending", "ready", "cancelled"];
+  // Indexed by the constant's *value*, not by the order they happen to be declared in: `ST_CLAIMED` is
+  // 5, not 1, and a table written from the declaration order labelled `ST_RUNNING` as "pending". That is
+  // not cosmetic — it inverts the diagnosis, since "pending" means the host has not taken the slot and
+  // "running" means it has and the handler never came back. wac-mono 0082 was read backwards for an hour
+  // on the strength of it.
+  const names: Record<number, string> = {
+    [ST_FREE]: "free",
+    [ST_PENDING]: "pending",
+    [ST_RUNNING]: "running",
+    [ST_READY]: "ready",
+    [ST_CANCELLED]: "cancelled",
+    [ST_CLAIMED]: "claimed",
+  };
   const busy: string[] = [];
   for (let i = 0; i < SLOTS; i++) {
     const at = slotAt(i);
     const st = Atomics.load(b.ctrl, at + S_STATUS);
     if (st === ST_FREE) continue;
-    busy.push(`${i}:${names[st] ?? st}:${opName(Atomics.load(b.ctrl, at + S_OP))}`);
+    const op = Atomics.load(b.ctrl, at + S_OP);
+    // The handle for the stream operations, because `RECV` on standard input and `RECV` on a spawned
+    // child's output are different waits with different causes, and the opcode alone cannot tell them
+    // apart. Handle 0 is standard input; anything else counts from 1.
+    const handle = (op === OP.RECV || op === OP.SEND) &&
+        Atomics.load(b.ctrl, at + S_REQ_LEN) >= 4
+      ? `(h=${new DataView(b.req(i).buffer, b.req(i).byteOffset, 4).getInt32(0, true)})`
+      : "";
+    busy.push(`${i}:${names[st] ?? st}:${opName(op)}${handle}`);
   }
   return busy.length === 0
     ? `no slot in use (submit=${Atomics.load(b.ctrl, SUBMIT_SEQ)} done=${Atomics.load(b.ctrl, DONE_SEQ)})`

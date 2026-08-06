@@ -32,6 +32,7 @@ import {
   slotAt,
   ST_CANCELLED,
   ST_FREE,
+  ST_CLAIMED,
   ST_PENDING,
   ST_READY,
   ST_RUNNING,
@@ -72,7 +73,7 @@ export function serveHostCalls(
   b: Bridge,
   handlers: Handlers,
   opts: { signal?: AbortSignal } = {},
-): { stop(): void; done: Promise<void> } {
+): { stats(): { running: boolean; sweeps: number }; stop(): void; done: Promise<void> } {
   let running = true;
 
   // Per-slot state kept between the pieces of one call.
@@ -209,6 +210,30 @@ export function serveHostCalls(
     })();
   };
 
+  /** Sweeps completed, so a stalled caller can tell a parked responder from a dead one. */
+  let sweeps = 0;
+
+  /**
+   * Answer every slot still holding a request, so a parked worker learns rather than waits.
+   *
+   * A worker in `Atomics.wait` is waiting for *this* loop and nothing else. If the loop stops — an
+   * exception, or a bug that lets it park with work outstanding — the worker waits for ever, and what
+   * that looks like from outside is a test that hangs with no message anywhere. wac-mono 0082 spent
+   * three days as that shape. A failure the worker can see is worth more than a tidy stack trace here.
+   */
+  const failPending = (why: string): void => {
+    for (let s = 0; s < SLOTS; s++) {
+      const st = Atomics.load(b.ctrl, slotAt(s) + S_STATUS);
+      if (st === ST_PENDING || st === ST_CLAIMED) {
+        try {
+          reply(s, STATUS_ERR, faultedBytes(FAULT_OTHER, why));
+        } catch {
+          // Nothing better to do: the bridge is already in a state we are explaining.
+        }
+      }
+    }
+  };
+
   const loop = async (): Promise<void> => {
     while (running && !opts.signal?.aborted) {
       // Loaded *before* the sweep, which is the same discipline the whole file uses:
@@ -221,14 +246,32 @@ export function serveHostCalls(
         if (st === ST_PENDING) take(s);
         else if (st === ST_CANCELLED) abandon(s);
       }
+      sweeps++;
       const w = Atomics.waitAsync(b.ctrl, SUBMIT_SEQ, seen);
       if (w.async) await w.value;
       if (!running || opts.signal?.aborted) return;
     }
   };
 
-  const done = loop();
+  // **A responder that dies must not leave its worker parked.** `loop()`'s promise is not awaited by
+  // most callers, so a rejection here used to disappear: the loop stopped, the slots stayed pending, and
+  // the worker waited for an answer that could no longer come. Now the failure reaches the worker as a
+  // failed host call — which a program reports in its own words — and is said out loud besides.
+  const done = loop().catch((e: unknown) => {
+    const why = `the host responder stopped: ${e instanceof Error ? e.message : String(e)}`;
+    try {
+      console.error(`wac: ${why}`);
+    } catch {
+      // A closed stderr is not a reason to skip the part that unparks the worker.
+    }
+    failPending(why);
+    throw e;
+  });
   return {
+    /** Whether the loop is still going, and how many sweeps it has made. For a caller narrating a stall. */
+    stats() {
+      return { running, sweeps };
+    },
     stop() {
       running = false;
       // Wake the loop so it can notice. Bumping the counter it waits on is the only way

@@ -328,3 +328,44 @@ That distinguishes the two remaining shapes without another wedge to interpret:
 
 Provoked deliberately to check it fires (`WAC_STALL_MS=300` against `seq 1 3000000 | wc -l`), because a
 narrator nobody has seen fire is one nobody knows is broken.
+
+### The slot table, and a label that had me reading it backwards (agent-a, 2026-08-06)
+
+The dump fired on the next wedge, and said this — four children, all the same:
+
+```
+wac: packages/sh/src/sh.wac still running: 0:pending:RECV 1:pending:RECV (submit=23 done=42)
+```
+
+**Then I found the labels were wrong.** `describeSlots` indexed its name table by declaration order, and
+the constants are not declared in value order: `ST_CLAIMED` is 5, not 1. So what it printed as `pending`
+was `ST_RUNNING`. That inverts the diagnosis completely —
+
+- `pending` would mean *the host never took the slot*: a responder that stopped, or a lost wakeup.
+- `running` means *the host took it and the handler never came back*: a wait inside a capability.
+
+An hour of the reading above was spent on the first. The table is keyed by value now, and the comment
+says why, because this is the second time a diagnostic in this repo has been confidently wrong.
+
+**With that fixed, the dump names the wait.** A healthy pipeline looks like:
+
+```
+still running: 0:running:RECV(h=1) 1:running:RECV(h=2) 2:running:RECV(h=3) 3:running:RECV(h=4)
+               (submit=386 done=764) host: running=true sweeps=386
+```
+
+The handle is in it now, because `RECV(h=0)` is standard input and `RECV(h=N)` is *a spawned child's
+output* — different waits with different causes, and the opcode alone cannot tell them apart. The
+responder's own liveness is in it too: `sweeps` that stops moving says the loop is parked, `running=false`
+says it is gone.
+
+**So the shape to expect at the next wedge** is a shell blocked in `RECV` on a child it spawned, whose
+output queue never ends — which moves the question one level down, to what that grandchild is waiting for.
+`packages/sh` spawns its applets when it can, so `wc f` really is two programs.
+
+**And a fix that stands on its own, whatever the cause turns out to be:** a responder whose loop throws
+used to leave every pending slot pending for ever, because `loop()`'s promise is not awaited by most
+callers — the worker then waits in `Atomics.wait` for an answer that can no longer come, which is a silent
+hang exactly like this one. The loop now catches, says `the host responder stopped: …` on standard error,
+and fails every outstanding slot so the worker unparks with an error it can report. That is worth having
+even though it is not yet known to be this bug.

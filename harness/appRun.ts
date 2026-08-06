@@ -116,11 +116,15 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
       // call and which one. Without it a wedged run reports "still running" and nothing else, which is
       // where wac-mono 0082 stood for two days.
       let bridge: Bridge | undefined;
+      // And the responder, because "the worker is waiting" and "the host stopped answering" are the two
+      // halves of a stall and the slot table alone cannot tell them apart: a sweep count that stops
+      // moving says the loop is parked, and `running: false` says it is gone.
+      let responder: { stats(): { running: boolean; sweeps: number } } | undefined;
       const child = spawnChild(
         source,
         args.map((a) => enc.encode(a)),
         (sab, cargs, out, input, cerr) =>
-          serveHostCalls(bridgeOf(sab), denoWorld({
+          (responder = serveHostCalls(bridgeOf(sab), denoWorld({
             args: cargs,
             // Absent rather than false where nothing is granted: the world reads a missing option
             // as "no such capability", and `fs: {}` is not the same as no `fs`. Copied from
@@ -146,7 +150,7 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
             readStdin: () => input.rest(),
             readStdinChunk: () => input.next(),
             selfSource: source,
-          })),
+          }))),
         () => {
           bridge = newBridge();
           return bridge;
@@ -177,7 +181,10 @@ export async function appRunner(entry: string, grants: Grants = {}): Promise<App
       const stall = setInterval(() => {
         if (bridge === undefined) return;
         try {
-          console.error(`wac: ${entry} still running: ${describeSlots(bridge)}`);
+          const host = responder === undefined
+            ? ""
+            : ` host: running=${responder.stats().running} sweeps=${responder.stats().sweeps}`;
+          console.error(`wac: ${entry} still running: ${describeSlots(bridge)}${host}`);
         } catch {
           // A bridge whose buffer has gone is not worth an exception here.
         }
