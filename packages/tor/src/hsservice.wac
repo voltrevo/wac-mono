@@ -1,0 +1,147 @@
+// Hosting an onion service: the cells a service sends that a client never does.
+//
+// Design 0002 step 6. Everything in `hsconnect.wac`, `hsfetch.wac` and `hsintro.wac` is the *client*
+// half — fetching a descriptor, sending INTRODUCE1, receiving RENDEZVOUS2. A service does the mirror
+// of each, and the mirrors are not symmetric: the client proves nothing about itself and the service
+// proves everything, so every cell here carries a signature or a MAC that the client's equivalent
+// does not.
+//
+// ## ESTABLISH_INTRO, and the two spans that are easy to get wrong
+//
+// The layout is tor's `src/trunnel/hs/cell_establish_intro.trunnel`, and the two `@ptr` markers in it
+// are the whole difficulty:
+//
+//     auth_key_type   1        <- start_cell
+//     auth_key_len    2
+//     auth_key       32
+//     extensions      1 + …
+//                              <- end_mac_fields
+//     handshake_mac  32
+//                              <- end_sig_fields
+//     sig_len         2
+//     sig            64
+//
+//   - the **MAC** covers `start_cell .. end_mac_fields` — everything before the MAC itself
+//   - the **signature** covers `start_cell .. end_sig_fields`, which **includes the MAC and excludes
+//     `sig_len`**
+//
+// That second one is the trap. `end_sig_fields` sits between `handshake_mac` and `sig_len`, so a
+// signature computed over "everything before the signature" — the obvious reading — includes two
+// bytes tor does not sign, and tor rejects the cell with `signature not as expected`. Nothing about
+// the cell's shape hints at it; only the position of a marker in a trunnel file does. Both spans are
+// pinned against tor's own parser in `test/hsservice_wac.test.ts`, which reads them out of the parsed
+// cell rather than recomputing them, so this comment cannot drift from what tor does.
+//
+// ## What the MAC is keyed with
+//
+// `circuitKH` is the circuit's `rend_circ_nonce` — the KH from the CREATE handshake with the
+// introduction point, 20 bytes. It ties the cell to *this* circuit, so a recorded ESTABLISH_INTRO
+// cannot be replayed onto another one. It is a MAC and not a signature because the intro point
+// already knows the value and nobody else needs to check it.
+//
+// The MAC construction is `crypto_mac_sha3_256`, which `hsMac` already is: SHA3-256 over the key
+// length as eight big-endian bytes, then the key, then the message.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { hsMac } from "./hsntor.wac";
+import { ed25519Sign } from "../../crypto/src/ed25519.wac";
+
+/** ed25519, and the only type this builds. Tor's own check rejects anything else before verifying. */
+export const i32 AUTH_KEY_TYPE_ED25519 = 2;
+
+/** What tor prepends before verifying the signature — `strlen`, so no terminating NUL. */
+export const string ESTABLISH_INTRO_SIG_PREFIX = "Tor establish-intro cell v1";
+
+/**
+ * The body of an ESTABLISH_INTRO cell, or empty if the inputs are not the right sizes.
+ *
+ * `authPublic` and `authSeed` are the introduction point authentication keypair — per-intro-point and
+ * per-service, not the service's identity key, which never appears in a cell. The secret half is the
+ * 32-byte *seed*, which is what `ed25519Sign` takes and what a service stores.
+ *
+ * Empty rather than a partly-built cell: an intro point that receives a malformed one closes the
+ * circuit, and the service learns only that the circuit died.
+ */
+export u8[] establishIntroCell(u8[] authPublic, u8[] authSeed, u8[] circuitKH) {
+  if (authPublic.len() != 32 || authSeed.len() != 32 || circuitKH.len() == 0) { return u8[0](); }
+
+  Buf b = Buf.create();
+  b.push(AUTH_KEY_TYPE_ED25519);
+  b.push(0);
+  b.push(32);
+  b.pushAll(authPublic);
+  // No extensions. The count is still written: a reader consumes one byte here whatever it says, and
+  // omitting it shifts everything after it.
+  b.push(0);
+
+  // `end_mac_fields` is here.
+  u8[] macSpan = b.bytes();
+  u8[] mac = hsMac(circuitKH, macSpan);
+  if (mac.len() != 32) { return u8[0](); }
+  b.pushAll(mac);
+
+  // `end_sig_fields` is here — after the MAC, before `sig_len`. See the header.
+  u8[] sigSpan = b.bytes();
+  u8[] sig = ed25519Sign(authSeed, prefixed(sigSpan));
+  if (sig.len() != 64) { return u8[0](); }
+
+  b.push(0);
+  b.push(64);
+  b.pushAll(sig);
+  return b.bytes();
+}
+
+/** The bytes tor signs: the prefix, then the span. */
+export u8[] prefixed(u8[] span) {
+  Buf b = Buf.create();
+  b.pushAll(ESTABLISH_INTRO_SIG_PREFIX.toBytes());
+  b.pushAll(span);
+  return b.bytes();
+}
+
+/**
+ * The span the MAC covers, taken from a finished cell.
+ *
+ * Exported because the test compares it against the span tor's parser reports, which is the only way
+ * to know the boundary is where tor thinks it is rather than where this file thinks it is.
+ */
+export u8[] macSpanOf(u8[] cell) {
+  i32 end = macEnd(cell);
+  return end < 0 ? u8[0]() : head(cell, end);
+}
+
+/** The span the signature covers — the MAC span plus the 32-byte MAC. */
+export u8[] sigSpanOf(u8[] cell) {
+  i32 end = macEnd(cell);
+  if (end < 0 || end + 32 > cell.len()) { return u8[0](); }
+  return head(cell, end + 32);
+}
+
+/**
+ * Where the MAC span ends: past the auth key and the extensions.
+ *
+ * The extension count is a byte and each extension is a type byte and a length byte followed by that
+ * many bytes, so the end is found by walking rather than by arithmetic on a fixed size. −1 for a cell
+ * that runs out while being walked, which is what a truncated one does.
+ */
+i32 macEnd(u8[] cell) {
+  if (cell.len() < 4) { return -1; }
+  i32 keyLen = cell[1] * 256 + cell[2];
+  i32 at = 3 + keyLen;
+  if (at >= cell.len()) { return -1; }
+  i32 count = cell[at];
+  at = at + 1;
+  for (i32 i = 0; i < count; i++) {
+    if (at + 2 > cell.len()) { return -1; }
+    i32 len = cell[at + 1];
+    at = at + 2 + len;
+    if (at > cell.len()) { return -1; }
+  }
+  return at;
+}
+
+u8[] head(u8[] s, i32 n) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = s[i]; }
+  return out;
+}

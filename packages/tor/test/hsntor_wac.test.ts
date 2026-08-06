@@ -12,6 +12,7 @@ const V_COUNT = 0, V_CASE = 1;
 type Case = {
   introAuthKey: string;
   introEncKey: string;
+  introEncSecret: string;
   clientEphemeralSecret: string;
   clientEphemeralPublic: string;
   serviceEphemeralPublic: string;
@@ -38,6 +39,8 @@ function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
     const parts = [
       c.introAuthKey, c.introEncKey, c.clientEphemeralSecret, c.clientEphemeralPublic,
       c.serviceEphemeralPublic, c.subcredential, c.encKey, c.macKey, c.authMac, c.ntorKeySeed,
+      // The service's own secret, appended rather than inserted so the offsets above do not move.
+      c.introEncSecret,
     ];
     for (const p of parts) {
       if (p.length !== 64) throw new Error(`field is ${p.length / 2} bytes, expected 32: ${p}`);

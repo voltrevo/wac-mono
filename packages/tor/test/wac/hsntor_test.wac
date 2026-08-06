@@ -13,12 +13,14 @@ import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import {
   clientIntroduceKeys, clientRendezvousKeys, hsMac, clientPublicKey, rendezvousCircuitKeys,
-  tHsEnc, tHsVerify, tHsMac, mHsExpand, S_KEY_LEN, MAC_LEN,
+  serviceIntroduceKeys, tHsEnc, tHsVerify, tHsMac, mHsExpand, S_KEY_LEN, MAC_LEN,
 } from "../../src/hsntor.wac";
+import { x25519Base } from "../../../crypto/src/x25519.wac";
 
 const i32 V_COUNT = 0;
 const i32 V_CASE = 1;   // authKey(32) encKey(32) clientSec(32) clientPub(32) svcPub(32)
                         // subcred(32) encOut(32) macOut(32) authMac(32) keySeed(32)
+                        // introEncSecret(32) — appended, so the offsets above are unchanged
 
 bool same(u8[] a, u8[] b) {
   if (a.len() != b.len()) { return false; }
@@ -63,6 +65,78 @@ export string test_the_introduce1_keys_are_tors(fn[u8[](i32, u8[], u8[])] ref) {
     t.isTrue(same(slice(keys, 32, 64), slice(c, 224, 256)),
              "case " + itoa64(i as i64) + ": MAC_KEY agrees with tor's");
   }
+  return t.report();
+}
+
+/**
+ * The service derives the same INTRODUCE1 keys the client does.
+ *
+ * Both sides are compared against **tor's**, not against each other: `capture-hsntor.py` runs
+ * `test-hs-ntor-cl client1` and `server1` over the same inputs and refuses to write a vector if they
+ * disagree, so the expected value here is tor's twice over. Checking our service against our client
+ * would pass for a pair that shared a mistake, which is the failure mode this repo has already hit on
+ * two other seams.
+ *
+ * The inputs are the asymmetry: the service holds the secret half of `enc-key ntor` and receives the
+ * client's ephemeral public key in the cell, where the client holds the public half and its own
+ * secret. Everything hashed after that is identical.
+ */
+export string test_the_service_derives_the_same_introduce_keys(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(V_COUNT, none(), none())[0];
+  t.isTrue(n >= 3, "there are several cases, not one");
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] c = ref(V_CASE, arg1(i), none());
+    u8[] authKey = slice(c, 0, 32);
+    u8[] encKey = slice(c, 32, 64);
+    u8[] clientPub = slice(c, 96, 128);
+    u8[] subcred = slice(c, 160, 192);
+    u8[] wantEnc = slice(c, 192, 224);
+    u8[] wantMac = slice(c, 224, 256);
+    u8[] encSecret = slice(c, 320, 352);
+
+    // The vector's own two halves must belong together, or the rest of this proves nothing.
+    t.eqBytes(x25519Base(encSecret), encKey, "the service's secret matches the descriptor's enc-key");
+
+    u8[] keys = serviceIntroduceKeys(authKey, encSecret, clientPub, subcred);
+    t.eqI32(keys.len(), 64, "the service gets 64 bytes of key material");
+    t.eqBytes(slice(keys, 0, 32), wantEnc, "ENC_KEY is tor's");
+    t.eqBytes(slice(keys, 32, 64), wantMac, "MAC_KEY is tor's");
+
+    // And it is the same material the client half produces, which is what makes the handshake work.
+    u8[] clientSec = slice(c, 64, 96);
+    t.eqBytes(keys, clientIntroduceKeys(authKey, encKey, clientSec, subcred),
+              "the two sides agree, which is the point of the handshake");
+  }
+  return t.report();
+}
+
+/** Every input matters to the service too, and a degenerate client key is refused. */
+export string test_the_service_refuses_what_it_should(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] c = ref(V_CASE, arg1(0), none());
+  u8[] authKey = slice(c, 0, 32);
+  u8[] clientPub = slice(c, 96, 128);
+  u8[] subcred = slice(c, 160, 192);
+  u8[] encSecret = slice(c, 320, 352);
+  u8[] good = serviceIntroduceKeys(authKey, encSecret, clientPub, subcred);
+
+  t.isTrue(!same(good, serviceIntroduceKeys(flip(authKey), encSecret, clientPub, subcred)),
+           "the auth key changes the keys");
+  t.isTrue(!same(good, serviceIntroduceKeys(authKey, flipScalar(encSecret), clientPub, subcred)),
+           "the service secret changes the keys");
+  t.isTrue(!same(good, serviceIntroduceKeys(authKey, encSecret, flip(clientPub), subcred)),
+           "the client key changes the keys");
+  t.isTrue(!same(good, serviceIntroduceKeys(authKey, encSecret, clientPub, flip(subcred))),
+           "the subcredential changes the keys");
+
+  // A small-order client key makes the shared value zero whatever the service's secret is, so anyone
+  // could derive what the service derives. Refused rather than returned.
+  t.eqI32(serviceIntroduceKeys(authKey, encSecret, u8[32](), subcred).len(), 0,
+          "an all-zero client key is refused");
+  t.eqI32(serviceIntroduceKeys(authKey, u8[0](), clientPub, subcred).len(), 0,
+          "and a missing secret is not a secret");
   return t.report();
 }
 

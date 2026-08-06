@@ -44,10 +44,15 @@ def run(*args):
     hex digits distinguishes the two cases completely, and anything else exits rather than being
     recorded as a vector.
     """
+    return run_n(2, *args)
+
+
+def run_n(want, *args):
+    """`want` lines of 64 hex characters, or exit. See `run` for why the exit code is not used."""
     r = subprocess.run([str(PROG)] + [str(a) for a in args], capture_output=True)
     lines = [line.strip().lower() for line in r.stdout.decode().split() if line.strip()]
-    if len(lines) != 2 or any(len(x) != 64 or not all(c in '0123456789abcdef' for c in x)
-                              for x in lines):
+    if len(lines) != want or any(len(x) != 64 or not all(c in '0123456789abcdef' for c in x)
+                                 for x in lines):
         sys.exit(f"{PROG} {args[0]} produced {lines!r}, not two 32-byte hex values"
                  f"{': ' + r.stderr.decode().strip() if r.stderr.strip() else ''}")
     return lines
@@ -94,11 +99,22 @@ def main():
         service_pub = x25519_public(bytes(service_sec).hex())
 
         enc_key, mac_key = run('client1', auth_pub, enc_pub, bytes(client_sec).hex(), subcred)
+        # The service's side of the same two keys. `server1` also emits rendezvous values, but its
+        # ephemeral keypair is generated inside the tool, so only the first two lines are reproducible
+        # — the rest are recorded as nothing and would be a vector that changes every run.
+        s_enc_key, s_mac_key, _authmac, _seed, _y = run_n(
+            5, 'server1', auth_pub, bytes(enc_sec).hex(), client_pub, subcred)
+        # tor's own statement that the two sides agree. If this ever differed, one of the two
+        # derivations in tor would be wrong and no test of ours could be trusted either way.
+        if (s_enc_key, s_mac_key) != (enc_key, mac_key):
+            sys.exit("tor's client and service disagree about the INTRODUCE1 keys, which cannot "
+                     "happen — check the tool's arguments before trusting anything here")
         auth_mac, key_seed = run('client2', auth_pub, bytes(client_sec).hex(), enc_pub,
                                  service_pub, subcred)
         cases.append(dict(
             introAuthKey=auth_pub,
             introEncKey=enc_pub,
+            introEncSecret=bytes(enc_sec).hex(),
             clientEphemeralSecret=bytes(client_sec).hex(),
             clientEphemeralPublic=client_pub,
             serviceEphemeralPublic=service_pub,
