@@ -1,0 +1,150 @@
+// Key blinding's service half, against the keys tor's own `ed25519_keypair_blind` produced.
+
+import { T } from "../../../wactest/src/assert.wac";
+import { BLIND_PREFIX_STRING, blindedSecretKey } from "../../src/hsblind.wac";
+import {
+  ed25519ExpandedSecret, ed25519PublicKeyExpanded, ed25519SignExpanded, ed25519Verify,
+} from "../../../crypto/src/ed25519.wac";
+
+const i32 B_COUNT = 0;
+const i32 B_SEED = 1;
+const i32 B_FACTOR = 2;
+const i32 B_IDENTITY_SECRET = 3;
+const i32 B_IDENTITY_PUBLIC = 4;
+const i32 B_BLINDED_SECRET = 5;
+const i32 B_BLINDED_PUBLIC = 6;
+const i32 B_SIGNATURE = 7;
+const i32 B_MESSAGE = 8;
+
+u8[] none() { return u8[0](); }
+
+u8[] at(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+
+/** The blinded secret tor derived, reproduced from the identity secret and the blinding factor. */
+export string test_the_blinded_secret_is_tors(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(B_COUNT, none(), none())[0];
+  t.isTrue(n >= 3, "there are several cases, not one");
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] got = blindedSecretKey(ref(B_IDENTITY_SECRET, at(i), none()), ref(B_FACTOR, at(i), none()));
+    t.eqI32(got.len(), 64, "the blinded secret is scalar and prefix");
+    t.eqBytes(got, ref(B_BLINDED_SECRET, at(i), none()), "and it is the one tor derived");
+  }
+  return t.report();
+}
+
+/**
+ * The public half follows from the secret, and it is the one a client computes independently.
+ *
+ * This is the join that makes blinding work at all: a service derives the keypair from its identity
+ * secret, a client derives only the public half from the identity *public* key, and the two must
+ * agree or the descriptor a service signs is one no client will accept.
+ */
+export string test_the_public_half_agrees_with_tors(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(B_COUNT, none(), none())[0];
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] blinded = blindedSecretKey(ref(B_IDENTITY_SECRET, at(i), none()),
+                                    ref(B_FACTOR, at(i), none()));
+    t.eqBytes(ed25519PublicKeyExpanded(blinded), ref(B_BLINDED_PUBLIC, at(i), none()),
+              "the public half of our blinded secret is tor's blinded public key");
+  }
+  return t.report();
+}
+
+/**
+ * It signs, and tor's own signature verifies against it.
+ *
+ * A scalar wrong by a factor of the cofactor is still a scalar and still produces sixty-four
+ * plausible bytes; comparing keys alone would not tell the two apart. Two directions are checked:
+ * tor's signature verifies under the key we derived, and ours verifies under tor's.
+ */
+export string test_the_blinded_key_signs(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(B_COUNT, none(), none())[0];
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] blinded = blindedSecretKey(ref(B_IDENTITY_SECRET, at(i), none()),
+                                    ref(B_FACTOR, at(i), none()));
+    u8[] msg = ref(B_MESSAGE, at(i), none());
+
+    // tor signed this message with the key it derived; it must verify under ours.
+    t.isTrue(ed25519Verify(ed25519PublicKeyExpanded(blinded), msg, ref(B_SIGNATURE, at(i), none())),
+             "tor's signature verifies under the key we derived");
+
+    // And ours must be tor's exactly — ed25519 is deterministic, so the bytes are comparable.
+    t.eqBytes(ed25519SignExpanded(blinded, msg), ref(B_SIGNATURE, at(i), none()),
+              "and our signature with that key is byte-identical to tor's");
+  }
+  return t.report();
+}
+
+/**
+ * The identity keypair the vector was built from is the one we would have built.
+ *
+ * Without this the tests above could pass while agreeing about the wrong starting point — the whole
+ * chain would be self-consistent and rooted in a key nobody else has.
+ */
+export string test_the_identity_key_is_the_seeds(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(B_COUNT, none(), none())[0];
+
+  for (i32 i = 0; i < n; i++) {
+    u8[] expanded = ed25519ExpandedSecret(ref(B_SEED, at(i), none()));
+    t.eqBytes(expanded, ref(B_IDENTITY_SECRET, at(i), none()),
+              "the expanded secret is the seed's own");
+    t.eqBytes(ed25519PublicKeyExpanded(expanded), ref(B_IDENTITY_PUBLIC, at(i), none()),
+              "and the identity public key follows from it");
+  }
+  return t.report();
+}
+
+/** Every input matters, and the wrong sizes are refused rather than padded with zeros. */
+export string test_blinding_refuses_what_it_should(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] secret = ref(B_IDENTITY_SECRET, at(0), none());
+  u8[] factor = ref(B_FACTOR, at(0), none());
+  u8[] good = blindedSecretKey(secret, factor);
+
+  t.isTrue(!same(good, blindedSecretKey(secret, flipScalar(factor))),
+           "a different factor gives a different key");
+  t.isTrue(!same(good, blindedSecretKey(flipPrefix(secret), factor)),
+           "a different prefix half gives a different key, because the prefix is rehashed");
+  t.isTrue(!same(good, blindedSecretKey(ref(B_IDENTITY_SECRET, at(1), none()), factor)),
+           "another identity gives another key");
+
+  t.eqI32(blindedSecretKey(u8[32](), factor).len(), 0, "a 32-byte secret is not an expanded one");
+  t.eqI32(blindedSecretKey(secret, u8[31]()).len(), 0, "a 31-byte factor is not a factor");
+  t.eqI32(blindedSecretKey(u8[0](), factor).len(), 0, "and nothing is not a secret");
+
+  t.eqStr(BLIND_PREFIX_STRING, "Derive temporary signing key hash input", "tor's own string");
+  return t.report();
+}
+
+/** Flip a bit that keeps the scalar clamped, so the change is about blinding and not about clamping. */
+u8[] flipScalar(u8[] b) {
+  u8[] out = u8[b.len()]();
+  for (i32 i = 0; i < b.len(); i++) { out[i] = b[i]; }
+  out[1] = out[1] ^ 1;
+  return out;
+}
+
+/** Flip a byte of the prefix half, which only the rehash depends on. */
+u8[] flipPrefix(u8[] b) {
+  u8[] out = u8[b.len()]();
+  for (i32 i = 0; i < b.len(); i++) { out[i] = b[i]; }
+  out[40] = out[40] ^ 1;
+  return out;
+}
+
+bool same(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
+}

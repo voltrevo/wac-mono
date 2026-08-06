@@ -382,7 +382,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
-| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Not done:** publishing to the HSDirs, real key blinding, and the program that holds it together |
+| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's. **Not done:** publishing to the HSDirs, and the program that holds it together |
 | 7 — the interop matrix | **not started as a document.** Steps 2–6 each contribute rows and most are green; nothing collects them, so a regression in one would not be visible as a regression in *the matrix* |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
@@ -1275,3 +1275,34 @@ Two smaller things the format fixes and nothing hints at: both intro-point certi
 the **descriptor signing key** — not the blinded key, and not each other — and the inner layer is
 **not** padded, so its length tracks the number of introduction points. The middle layer's padding is
 what hides that from anyone who has not decrypted that far.
+
+### Key blinding's other half, and why no descriptor test could have caught it
+
+`hsblind.wac` derived the blinded **public** key — everything a client needs, pinned long ago against
+a key tor published. A service needs the blinded **secret**, because it signs the descriptor's
+signing-key certificate with it. That was the piece the descriptor work stood on top of without
+having: `genhsdesc.wac` used an ordinary keypair where a real service must use a blinded one.
+
+**The reason it needed an oracle of its own is the interesting part.** Nothing in a descriptor says
+which key signed it — tor verifies the certificate against the key carried *inside* that certificate.
+So a wrong blinded secret produces a descriptor that decodes perfectly for anyone who does not know
+the identity key, and fails only for the clients who matter, because only they derive the blinded key
+independently and expect it to match. `hsdesc-probe.c` accepts such a descriptor happily. That is not
+a gap in the probe; it is what the format allows, and it means the descriptor oracle — however
+thorough — is structurally incapable of checking this.
+
+So `tools/blind-probe.c` calls tor's own `ed25519_keypair_blind`, and the derivation is now pinned
+against it:
+
+    a'  = a * h  (mod L)
+    RH' = SHA-512("Derive temporary signing key hash input" | RH)[0..32]
+
+The prefix half is **rehashed** rather than carried across; reusing it would have two keys sharing a
+nonce derivation, and a service signing with both would leak its identity scalar.
+
+The captured signature earns its place separately from the key: a scalar wrong by a factor of the
+cofactor is still a scalar and still produces sixty-four plausible bytes. Both directions are checked
+— tor's signature verifies under the key we derived, and ours is byte-identical to tor's.
+
+Six faults planted, all caught, including "clamp the blinded scalar again" — which is the plausible
+mistake, since every *other* scalar in ed25519 is clamped and this one must not be.

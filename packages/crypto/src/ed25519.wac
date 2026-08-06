@@ -281,8 +281,13 @@ u8[] scReduce(u8[] wide) {
   return out;
 }
 
-/** (a*b + c) mod L, with a, b, c each 32 bytes little-endian. */
-u8[] scMulAdd(u8[] a, u8[] b, u8[] c) {
+/**
+ * (a*b + c) mod L, with a, b, c each 32 bytes little-endian.
+ *
+ * Exported because signing is no longer the only caller: Tor's key blinding multiplies a secret
+ * scalar by a blinding factor, which is this with `c` zero. See `hsblind.wac`.
+ */
+export u8[] scMulAdd(u8[] a, u8[] b, u8[] c) {
   u8[] wide = u8[64]();
   for (i32 i = 0; i < 32; i++) {
     i32 carry = 0;
@@ -343,6 +348,24 @@ u8[] clampScalar(u8[] h) {
   a[31] = a[31] & 63;
   a[31] = a[31] | 64;
   return a;
+}
+
+/**
+ * The 64-byte expanded secret for a seed: the clamped scalar, then the nonce prefix.
+ *
+ * This is what an ed25519 secret key *is* once a seed has been expanded — tor stores exactly these
+ * bytes — and it is what `ed25519SignExpanded` and Tor's key blinding both take. Exported because a
+ * caller that needs to blind a key cannot start from the seed: blinding multiplies the scalar, and
+ * the scalar only exists after expansion and clamping.
+ */
+export u8[] ed25519ExpandedSecret(u8[] seed) {
+  if (seed.len() != 32) { return u8[0](); }
+  u8[] h = expandSeed(seed);
+  u8[] a = clampScalar(h);
+  u8[] out = u8[64]();
+  for (i32 i = 0; i < 32; i++) { out[i] = a[i]; }
+  for (i32 i = 0; i < 32; i++) { out[32 + i] = h[32 + i]; }
+  return out;
 }
 
 /** The 32-byte public key for a 32-byte seed. */

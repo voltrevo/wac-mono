@@ -39,7 +39,8 @@
 // `hsdir_interval` in tor's `networkstatus_get_param` call. Tor's spelling is the one on the wire.
 
 import { sha3_256 } from "../../crypto/src/keccak.wac";
-import { Point, ptDecode, ptEncode, ptMul } from "../../crypto/src/ed25519.wac";
+import { Point, ptDecode, ptEncode, ptMul, scMulAdd } from "../../crypto/src/ed25519.wac";
+import { sha512 } from "../../crypto/src/sha512.wac";
 
 /** `SHARED_RANDOM_N_ROUNDS`, the rounds in one phase of the shared-random protocol. */
 export const i32 SHARED_RANDOM_N_ROUNDS = 12;
@@ -165,6 +166,52 @@ export u8[] blindedPublicKey(u8[] identityKey, i64 periodNum, i64 periodLength) 
   Point? a = ptDecode(identityKey);
   if (a is null) { return u8[0](); }
   return ptEncode(ptMul(h, a!));
+}
+
+/** What tor hashes to derive the blinded key's prefix half. `strlen`, so no terminating NUL. */
+export const string BLIND_PREFIX_STRING = "Derive temporary signing key hash input";
+
+/**
+ * The blinded **secret** a service signs its descriptor with: 64 bytes, scalar then prefix.
+ *
+ * The client only ever needs `blindedPublicKey`; a service needs this, because the descriptor's
+ * signing-key certificate is signed with it. **Nothing in a descriptor says which key signed it** —
+ * tor verifies the certificate against the key carried inside the certificate — so a wrong
+ * derivation produces a document that decodes perfectly for anyone who does not already know the
+ * identity key, and fails only for the clients who matter. No descriptor-level check can catch that,
+ * which is why this is pinned against tor's own `ed25519_keypair_blind`.
+ *
+ * From tor's `ed25519_donna_blind_secret_key`:
+ *
+ *     a'  = a * h        (mod L)          — the scalar half, multiplied by the blinding factor
+ *     RH' = SHA-512("Derive temporary signing key hash input" | RH)[0..32]
+ *
+ * `expandedSecret` is the 64 bytes SHA-512 of a seed produces, clamped — what `ed25519SignExpanded`
+ * takes. `factor` is `blindingFactor`'s output, already carrying the three masks tor's
+ * `gettweak` applies, so passing it through is idempotent rather than double-clamped.
+ *
+ * Empty unless both inputs are the right size: a short scalar would be multiplied as if the missing
+ * bytes were zero, which is a different key rather than an error.
+ */
+export u8[] blindedSecretKey(u8[] expandedSecret, u8[] factor) {
+  if (expandedSecret.len() != 64 || factor.len() != 32) { return u8[0](); }
+
+  u8[] scalar = u8[32]();
+  for (i32 i = 0; i < 32; i++) { scalar[i] = expandedSecret[i]; }
+  u8[] blinded = scMulAdd(scalar, factor, u8[32]());
+
+  // The prefix half is *rehashed* rather than carried across. Reusing it would mean two keys sharing
+  // the nonce derivation, and a service that signed with both would leak its identity scalar.
+  u8[] input = u8[BLIND_PREFIX_STRING.toBytes().len() + 32]();
+  u8[] pre = BLIND_PREFIX_STRING.toBytes();
+  for (i32 i = 0; i < pre.len(); i++) { input[i] = pre[i]; }
+  for (i32 i = 0; i < 32; i++) { input[pre.len() + i] = expandedSecret[32 + i]; }
+  u8[] rh = sha512(input);
+
+  u8[] out = u8[64]();
+  for (i32 i = 0; i < 32; i++) { out[i] = blinded[i]; }
+  for (i32 i = 0; i < 32; i++) { out[32 + i] = rh[i]; }
+  return out;
 }
 
 /**

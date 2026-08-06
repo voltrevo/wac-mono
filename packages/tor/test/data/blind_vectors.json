@@ -1,0 +1,47 @@
+{
+ "source": "tor's own ed25519_keypair_blind and ed25519_sign, tor 0.4.7.13",
+ "produced_by": "packages/tor/tools/capture-blind.py",
+ "note": "The blinded secret is the service half of key blinding. A wrong one yields a descriptor that decodes for anyone who does not know the identity key and fails only for clients who do, so no descriptor-level check finds it \u2014 which is why the values here come from tor rather than from a round trip through our own blinding.",
+ "cases": [
+  {
+   "seed": "d0e169945035b1f62c826ce2bbd5e5b0b3ee72ddfa8caa3fdcdef7f9f0adffce",
+   "factor": "401fe916d25ed6be7d08cff161c60cecee19176ce51e7efc9a6511f8a6f88c62",
+   "identitySecret": "7031cd16f3309abf1c729b7128457c8d1a4bace2118c431e07c5b11fa690316d880d93d838d445e1f7c6f3fa1baeba5d18726ea95e6492184542e22898247f90",
+   "identityPublic": "5c6b76adec65f8b8a86db42b55d62cc261d0c2d2692bc509901c1240b0511097",
+   "blindedSecret": "3481727288d39d49a66e8c34471ffa5c962fe96dfe36a80c1ae09589efee6908c7b9f26787fac0775fff2aa445f656d98f25b46c0eace0ea87073a176bc423fe",
+   "blindedPublic": "0a942c36ba47c6be3f16dbd78a5c667fada9e845ee5f986fd9e539d72b0741c5",
+   "signature": "8aa19efc2cad11726ee62a6ac97c2f59fcf2e89834129c80270e8897a172df65864f52d764073f0a1c0c65dfdd1b65990bfbb6987f4c752205cf96c357151908",
+   "message": "wac-mono blinded signing check"
+  },
+  {
+   "seed": "14dfc7c259ed895ee219db23efc535285da1414bb22a20c8af2428f08468c95a",
+   "factor": "2032b1bb5991f8bc88dc6c0e562354f281884bf97b54b2663057dcf7eaedd163",
+   "identitySecret": "a8cda101d24de244f192ed12f82d19541d9c35fdb630352ae609fcb4b9f2ec772e8951df928e0697e3c87894c9081b2474237a41956b0fd721130171ee4b786d",
+   "identityPublic": "f7f6eb12dfcc89879b799a4f68acca0fd6d10146c5d4801ee42ccc311b8a1411",
+   "blindedSecret": "27ca9097885b60cd66ae716c767a0916a89a9dedc520c99a2adf9b53ca726e0d70ada0477c13d183826bb798c313de4649eb8ed6431b41451d149c0ca9f1a45e",
+   "blindedPublic": "49f13bac555ae8305f55ba06f07b4d64e4be48982e4278d6a9532b05b72922d8",
+   "signature": "5c75629755921db18863836f7fdfbe393ec64bf99e5526ee917507469d6128516927c86ec0688a3a751c46db3734691818cd520f4413a98ddb6a40f6b39e640d",
+   "message": "wac-mono blinded signing check"
+  },
+  {
+   "seed": "e5625af8ebb6e72d781e0da849308ecb1e9c8961f85d6275a0924392ca29d2fb",
+   "factor": "801a891f9b9cbb2ebc42ccc707a84321b3de329a97d995cc6d134dbd302cf74a",
+   "identitySecret": "e8583d8f1329990ead92e1b21cffabfb43830f4795260ec964b93b0b74f2c05525568b3f88d3bf681b4e1e87ade982cb44839a2695e85ae0801d55aa86799fe3",
+   "identityPublic": "949e70a6222014d0dbcd2395c0c8905a43aa5e6cec660d1d4594af82133829e9",
+   "blindedSecret": "34794cd5cbee43861b097bafe67837ddbdd7fb9901401d6fd8672c0e67d073004040e9b4522cadf3858855032e77cf0bd60b1fe6d1abbece720ad44ac0f00322",
+   "blindedPublic": "330a6a50b9fa7df593acdbd7ee997ed77ef3865b91c347493daa66902d7ced62",
+   "signature": "f7edb2ee912a876ffccab75aa813d0bdbb75b3caba1684a12e7a1fee49517c1956c1755b10b7aeba230d8386ad67b57e2c0fc7dd9a29ba83d0a89ced481f960c",
+   "message": "wac-mono blinded signing check"
+  },
+  {
+   "seed": "e482b196a0a85965444f597c8cd8e5345acfef92063225fb9cf314470b360bc0",
+   "factor": "50f2dc78ce9f68345fcde5c9f466409f263aee01388c362ed86a65e3166ed77c",
+   "identitySecret": "00ac0e23341720b6760345bd4ac41d8227b4b3ad25056ff312ba700efa96e96a2a4f0882b3fe1fa60774e8f2e16f458583a9401137f042a0f228f61822c527b1",
+   "identityPublic": "831ae8ad721e97e1653bd8efa4aeab21f30e0221590bb9df25bad1e3fb51d576",
+   "blindedSecret": "512ddf665c301f139ebd03a84793463857d1dfde22eed31adaa2ff792393010f6d80f4186c710b19b3addcd18f714a15d72505517889e369883b1b30821cf1af",
+   "blindedPublic": "01d98ae6186ad78f03da6095ff825287337c248b29739570efc6271da2c208d4",
+   "signature": "a6f7fe9b4b65910b6a18ef581b91f373ee6e0476c59eda56bce530cf0182e5a54bfd8ac3cc9b0695d6c202665f47ebcd766e377db1956ba23b83183b9feb1005",
+   "message": "wac-mono blinded signing check"
+  }
+ ]
+}
