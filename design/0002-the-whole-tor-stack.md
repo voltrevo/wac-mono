@@ -371,21 +371,28 @@ much as the thing steps 2–6 each contribute a row to, and it is where a regres
 
 ## State of play
 
+Last checked 2026-08-06. **Three different things get called "done" below and the difference matters**,
+so each row says which: *pinned* means pure functions checked against C tor's own vectors or parsers;
+*runs* means there is a program; *live* means a C tor was on the other side of it and the thing worked.
+
 | step | state |
 |---|---|
-| 1 — RSA signing | **done** — `rsaSignPkcs1`, `rsaSignRawPkcs1`, byte-identical to node's |
-| 2 — onion service client | **done** — `src/hsconnect.wac` fetches a page from a real onion service over our own circuits |
-| 3 — relay | **a C tor client builds a circuit through it** — `src/relayd.wac`. EXTEND2 is parsed and refused, so it is a one-hop relay |
-| 4 — directory authority | **descriptor and key certificate done** — `src/routerdesc.wac` and `src/authcert.wac` generate both, and C tor's own parsers accept them, rejecting either if a signature, the certificate chain or a single body byte is disturbed. **vote and consensus both build** — `src/vote.wac` and `src/consensus.wac`. C tor accepts the vote *including its signature* (a vote embeds its certificate); for the consensus tor checks structure only, so the signature is verified by node instead — see issue 0081. and **a C tor fetched our consensus over our own dir port, fetched our certificate, and verified our signature** — `A consensus needs 1 good signatures from recognized authorities for us to accept it. This ns one has 1 (wacauth)`, and its `cached-consensus` is byte-identical to ours. It then fetched our router descriptor. and then, with the relay joined to it: a C tor **fetched our consensus, learned our relay from it, connected to that relay's ORPort, completed the v3 link handshake and built a circuit through it** — `Negotiated version 5 with 127.0.0.1:5555 RSA_ID=ED6057…`, `First hop: finished sending CREATE_FAST cell to '$ED6057…~wacrelay'`, `Bootstrapped 50%`. It stops at 50% because one relay cannot make a three-hop circuit; more relays is step 5's business, and `EXTEND2` is step 3's |
-| 5 — the launcher | not started |
-| 6 — onion service host | not started |
-| 7 — the interop matrix | not started |
-| — X.509 generation | **done** — `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
-| — RSA key generation | **done** — `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
+| 1 — RSA signing | **pinned.** `rsaSignPkcs1`, `rsaSignRawPkcs1`, byte-identical to node's |
+| 2 — onion service client | **live.** `src/hsconnect.wac` fetches a page from a real onion service over our own circuits |
+| 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, DATA both ways, END all have live witnesses. A connection multiplexes several circuits |
+| 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
+| 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
+| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. **Not done:** the rendezvous half of the responder (`serviceRendezvousKeys`), building and encrypting a descriptor (the inverse of `hsdesc.wac`), publishing it to the HSDirs, and the program that holds it all together |
+| 7 — the interop matrix | **not started as a document.** Steps 2–6 each contribute rows and most are green; nothing collects them, so a regression in one would not be visible as a regression in *the matrix* |
+| — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
+| — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
 
-The client itself is done and its own limitations live in `packages/tor/README.md` — guard algorithm,
-circuit padding, isolation by credential and the rest. Those are that package's roadmap and are
-deliberately not restated here.
+Known holes that are not steps: flow control (`SENDME`) has never run under a transfer big enough to
+exhaust a window; a relay extending to *its own* port still fails in the uninstrumented VERSIONS
+exchange; `certsCount` and `certsCell` have still never been shown each other's output.
+
+The client's own limitations — guard algorithm, circuit padding, isolation by credential — live in
+`packages/tor/README.md` and are deliberately not restated here.
 
 ## Open questions
 
