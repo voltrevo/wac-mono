@@ -1015,3 +1015,30 @@ download reads one socket and writes another, while an upload writes a socket th
 
 Step 3's line in the state table said "a stream carries bytes". It does — in one direction. The table
 now says which.
+
+### Chasing 0089: two hypotheses, both wrong, and a better question
+
+The upload failure was worth an hour because each wrong answer narrowed it.
+
+**First hypothesis — the platform breaks a read when the same handle is written.** It was the only
+structural difference between the two directions, so it was worth asking without Tor in the way.
+`packages/platform/example/writeread.wac` asks it in forty lines: connect to a peer that never speaks,
+issue a `recv`, then `send` twenty times and poll after each. *Still pending after 20 sends.* The
+platform is fine, and the example stays because the question will be asked again.
+
+**Second hypothesis — the relay truncates the body after about six cells.** Byte counters per stream
+killed that one: the `stream closed by the far end` line that started the issue turns out to be the
+*GET control*, closing normally after `89 bytes in, 69 bytes out` — exactly a curl GET and exactly the
+sink's reply. The upload stream is the *next* one, and it has no closing line at all.
+
+**What it actually is.** With the first data cell each way logged, the upload stream never carries one.
+tor's log says why: `circuit_mark_for_close_ … orig reason: 520`, which is the remote flag with
+`CHANNEL_CLOSED` — **one of our relays destroyed the circuit** right after the second stream opened on
+it. So the fault is not in forwarding data; it is in what happens to a circuit when a stream closes
+and another begins on it.
+
+Two things this leaves behind that are worth more than the fix will be. `relayd` now counts bytes each
+way per stream and logs the first cell in each direction, so a stalled stream no longer looks
+identical to one that was never written to — the same argument that found the accept spin. And the
+issue records both dead hypotheses, because the reasoning that produced them was sound and someone
+will have it again.

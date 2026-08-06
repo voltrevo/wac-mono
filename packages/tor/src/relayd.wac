@@ -602,6 +602,9 @@ struct Circ {
   i32 streamSock;
   i32 streamId;
   Pending<Read> fromStream;
+  /** Bytes forwarded each way on this stream, so a stream that ends early can say how early. */
+  i32 streamIn;
+  i32 streamOut;
   /** Whether anything has been forwarded, so the first one can be logged and the rest not. */
   bool forwardedAny;
 }
@@ -615,7 +618,7 @@ struct Circ {
  */
 Circ newCirc(Core core, Cli cli, i32 circId, Hop hop, Pending<Read> idle) {
   return Circ(circId, hop, false, Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]()), 0, idle,
-              -1, Buf.create(), false, -1, -1, idle, false);
+              -1, Buf.create(), false, -1, -1, idle, 0, 0, false);
 }
 
 /** A connection as it arrives: TLS begun, nothing else known yet. */
@@ -683,11 +686,13 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
                        sendToClient(k.hop, k.circId, relayEnd(), k.streamId, endReason()));
         cli.closeSocket(k.streamSock);
         k.hasStream = false;
-        core.log("relayd:   stream " + itoa(k.streamId) + " closed by the far end");
+        core.log("relayd:   stream " + itoa(k.streamId) + " closed by the far end after " +
+                 itoa(k.streamIn) + " bytes in, " + itoa(k.streamOut) + " bytes out");
         // The stream is gone; the circuit is not. A client reuses a circuit for the next stream, so
         // tearing down the connection here would cost it a fresh three-hop build per request.
         return;
       }
+      k.streamOut = k.streamOut + payload.len();
       u8[][] parts = chunkRequest(payload);
       for (i32 pi = 0; pi < parts.len(); pi++) {
         c.tls = sendCell(cli, c.sockObj, c.tls,
@@ -936,6 +941,13 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
         }
 
         if (inbound.command == relayData() && k.hasStream && inbound.streamId == k.streamId) {
+          // The first cell each way is logged and the rest are not. Without this a stream that
+          // stalls looks exactly like a stream that was never written to, which is the difference
+          // that mattered when uploads were being chased (issue 0089).
+          if (k.streamIn == 0) {
+            core.log("relayd:   stream " + itoa(k.streamId) + " is carrying data from the client");
+          }
+          k.streamIn = k.streamIn + inbound.data.len();
           if (!cli.send(k.streamSock, inbound.data).wait()) {
             core.warn("relayd:   the stream would not take the data");
             c.tls = sendCell(cli, c.sockObj, c.tls,
@@ -947,7 +959,8 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
         }
 
         if (inbound.command == relayEnd() && k.hasStream && inbound.streamId == k.streamId) {
-          core.log("relayd:   the client ended stream " + itoa(k.streamId));
+          core.log("relayd:   the client ended stream " + itoa(k.streamId) + " after " +
+                   itoa(k.streamIn) + " bytes in, " + itoa(k.streamOut) + " bytes out");
           cli.closeSocket(k.streamSock);
           k.hasStream = false;
           continue;
@@ -1002,7 +1015,8 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
         }
 
         core.log("relayd:   relay command " + itoa(inbound.command) + " on stream " +
-                 itoa(inbound.streamId));
+                 itoa(inbound.streamId) + " (this circuit has " +
+                 (k.hasStream ? "stream " + itoa(k.streamId) : "no stream") + ")");
         continue;
       }
 

@@ -1,0 +1,153 @@
+// Can a socket be written to while a read on it is still outstanding?
+//
+//   writeread [port]
+//
+// The question comes from wac-mono issue 0089: a Tor relay carries downloads and truncates uploads
+// after about six cells, reporting that the far end closed when nothing had. The two directions
+// differ in exactly one way — a download reads one socket and writes another, an upload writes a
+// socket that already has a `recv` in flight — so this asks that question with no Tor in the picture
+// at all.
+//
+// The shape is the one `relayd.wac` uses for a stream:
+//
+//   1. connect to a peer that will never send anything
+//   2. issue `recv` and keep the ticket
+//   3. `send` on the same handle, repeatedly
+//   4. ask `waitAny` whether that `recv` has settled, and if so with what
+//
+// A `recv` that settles as `End` here, with the peer still connected and holding the connection open,
+// would mean a handle may not have a read and a write in flight together — which nothing in
+// `platform.wac` says, and which would make the relay's behaviour a platform matter rather than a Tor
+// one. A `recv` that stays pending means the platform is fine and the fault is the relay's.
+//
+// Either answer is worth having in one place, which is why this is an example rather than a scratch
+// file: it is the smallest program that distinguishes them.
+
+import { Core, Cli, Socket, Pending } from "../src/platform.wac";
+import { Read } from "../../bytes/src/read.wac";
+
+export i32 main(Core core, Cli cli) {
+  i32 port = cli.argCount().wait() > 0 ? parsePort(cli.arg(0).wait()) : 18099;
+  if (port <= 0) {
+    core.warn("writeread: the argument must be a port");
+    return 2;
+  }
+
+  Socket listener = cli.listen("127.0.0.1", port).wait();
+  if (listener.handle < 0) {
+    core.warn("writeread: listen: " + listener.error);
+    return 1;
+  }
+
+  // The accept has to be outstanding before the connect, or the connect has nobody to talk to.
+  Pending<Socket> incoming = cli.accept(listener.handle);
+  Socket client = cli.connect("127.0.0.1", listener.port).wait();
+  if (client.handle < 0) {
+    core.warn("writeread: connect: " + client.error);
+    return 1;
+  }
+  Socket server = incoming.wait();
+  if (server.handle < 0) {
+    core.warn("writeread: accept: " + server.error);
+    return 1;
+  }
+  core.log("writeread: connected on port " + itoa(listener.port));
+
+  // The peer — `server` — never sends and never closes. So a `recv` on `client` should stay pending
+  // for as long as that holds, and anything else is the thing being looked for.
+  Pending<Read> pending = cli.recv(client.handle);
+
+  i32[] one = i32[1]();
+  one[0] = pending.id;
+  if (core.waitAny(one, 200) >= 0) {
+    core.warn("writeread: the read settled before anything was written — the peer is not silent");
+    return 1;
+  }
+  core.log("writeread: the read is outstanding and the peer is silent, as expected");
+
+  // Now write, in the same shape a relay forwards cells: several sends, one after another, with that
+  // read still in flight. 498 bytes each, which is a relay cell's payload.
+  u8[] payload = u8[498]();
+  for (i32 i = 0; i < 498; i++) { payload[i] = (i * 7 + 13) & 0xFF; }
+
+  i32 sent = 0;
+  for (i32 i = 0; i < 20; i++) {
+    if (!cli.send(client.handle, payload).wait()) {
+      core.warn("writeread: send " + itoa(i) + " failed");
+      break;
+    }
+    sent = sent + 1;
+    // After each send, ask whether the outstanding read has settled. Polling with a zero deadline is
+    // what `waitAny` is for — this is a question about *now*, not a wait.
+    i32 which = core.waitAny(one, 0);
+    if (which >= 0) {
+      core.log("writeread: the read settled after " + itoa(sent) + " sends (" +
+               itoa(sent * 498) + " bytes)");
+      match (pending.wait()) {
+        case Data(bytes): {
+          core.log("writeread: VERDICT data — " + itoa(bytes.len()) +
+                   " bytes, so the peer spoke after all");
+          return 0;
+        }
+        case End: {
+          core.warn("writeread: VERDICT End — a write ended a read on the same handle, with the " +
+                    "peer still connected. This is the platform, not the caller.");
+          return 3;
+        }
+        case Failed(why): {
+          core.warn("writeread: VERDICT failed — " + why);
+          return 4;
+        }
+      }
+    }
+  }
+
+  // Give it a moment: a read broken by a write might settle a little after the write rather than
+  // during it, and a poll that only ever ran between sends would miss that.
+  i32 late = core.waitAny(one, 1000);
+  if (late >= 0) {
+    match (pending.wait()) {
+      case Data(bytes): {
+        core.log("writeread: VERDICT data — " + itoa(bytes.len()) + " bytes, late");
+        return 0;
+      }
+      case End: {
+        core.warn("writeread: VERDICT End, shortly after the writes — the platform, not the caller.");
+        return 3;
+      }
+      case Failed(why): {
+        core.warn("writeread: VERDICT failed, late — " + why);
+        return 4;
+      }
+    }
+  }
+
+  core.log("writeread: VERDICT still pending after " + itoa(sent) + " sends (" +
+           itoa(sent * 498) + " bytes). A write does not disturb a read on the same handle.");
+  cli.closeSocket(client.handle);
+  cli.closeSocket(server.handle);
+  cli.closeSocket(listener.handle);
+  return 0;
+}
+
+i32 parsePort(u8[] text) {
+  if (text.len() == 0) { return -1; }
+  i32 v = 0;
+  for (i32 i = 0; i < text.len(); i++) {
+    if (text[i] < 48 || text[i] > 57) { return -1; }
+    v = v * 10 + (text[i] - 48);
+    if (v > 65535) { return -1; }
+  }
+  return v;
+}
+
+string itoa(i32 n) {
+  if (n == 0) { return "0"; }
+  i32 v = n < 0 ? 0 - n : n;
+  u8[] digits = u8[12](fill: 0);
+  i32 at = 12;
+  while (v > 0) { at--; digits[at] = '0' + (v % 10); v = v / 10; }
+  u8[] used = u8[12 - at](fill: 0);
+  used.copyFrom(digits, at, 0, 12 - at);
+  return (n < 0 ? "-" : "") + string.fromBytes(used);
+}

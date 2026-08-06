@@ -24,10 +24,77 @@ The control is in the same run: a direct POST of the same 64 KB to the same sink
 delivers all 65,536 bytes.
 
 ~2,988 and ~3,329 bytes are about six 498-byte cells, and the two runs differing says it is a race
-rather than a fixed limit. The second run's relay logs show no circuit failure at all — the first
+rather than a fixed limit. **See below** — a later run with byte counters suggests those numbers may
+belong to a different stream than the one that fails. The second run's relay logs show no circuit failure at all — the first
 run's did, which is why it was repeated before anything was concluded.
 
-## A hypothesis, clearly labelled as one
+## The hypothesis below was tested and is **wrong**
+
+`packages/platform/example/writeread.wac` asks the question with no Tor in it: connect to a peer that
+never speaks, issue a `recv`, then `send` on the same handle twenty times and poll the read after each.
+
+    writeread: the read is outstanding and the peer is silent, as expected
+    writeread: VERDICT still pending after 20 sends (9960 bytes).
+               A write does not disturb a read on the same handle.
+
+So the platform is fine and the fault is `relayd`'s. The hypothesis is kept below rather than deleted,
+because the reasoning that produced it — the download/upload asymmetry — is still the right shape of
+question even though the answer was no.
+
+## What the byte counters then showed
+
+`relayd` now counts bytes each way per stream and says so when a stream closes. With that, the
+`stream N closed by the far end` line that started this issue turns out to be **a different stream**:
+
+    stream 56061 closed by the far end after 89 bytes in, 69 bytes out
+
+89 bytes is exactly a curl `GET` request and 69 is exactly the sink's reply, so that stream is the GET
+control and it worked perfectly — the close was the sink's own `Connection: close`. The stream that
+matters is the next one, and it has *no* closing line at all: it opens and then nothing happens to it.
+
+That changes the shape of the bug. It is not "the relay truncates an upload after six cells" so much
+as "the relay opens the stream and then the client's DATA does not arrive, or does not match" — the
+earlier partial deliveries (2,988 and 3,329 bytes) were real but came from runs where a different
+relay was the exit, so they may not be the same event.
+
+## And then tor's own log moved it again
+
+With the first data cell each way logged, the upload stream never logs one at all — no `RELAY_DATA`
+for it reaches the exit, and none arrives with a mismatched stream id either (that would hit the
+catch-all). So the body is never sent. tor's log says why it is never sent:
+
+    'connected' received for circid 2293307825 streamid 39711 after 0 seconds.
+    exit circ (length 3): …(open) …(open) …(open)
+    circuit_mark_for_close_(): Circuit 0 (id: 2) marked for close at circuitlist.c:1677
+                               (orig reason: 520, new reason: 0)
+
+520 is `END_CIRC_REASON_FLAG_REMOTE | 8` — the remote flag with `CHANNEL_CLOSED`. **One of our relays
+tore the circuit down**, immediately after the second stream on it opened and before any body could
+flow. So this is not about forwarding `RELAY_DATA` at all.
+
+The sequence that precedes it is the interesting part, and it is the *second* stream on a reused
+circuit:
+
+    stream 39710 open          (the GET control)
+    stream 39710 is carrying data from the client
+    stream 39710 closed by the far end after 89 bytes in, 69 bytes out
+    relay command 3 on stream 39710 (this circuit has no stream)   <- the client's own RELAY_END,
+                                                                      arriving after we dropped it
+    stream 39711 open          (the upload)
+    …nothing…
+
+**Suspects, in order.** The `!inbound.recognized` branch destroys the circuit when a cell does not
+authenticate — at an exit that means the running backward/forward digest has gone out of step, and
+the most likely place for that is the exchange of two `RELAY_END`s around a stream closing. Second:
+whatever `dropCirc` is reached by. Both are `relayd.wac`'s, not the platform's.
+
+**Removing the randomness is still the next step**: tor picks an exit from the three at will, so each
+run instruments a different relay, and the runs above each answered a third of the question. A
+single-relay path or a pinned exit would let one run answer it. Note also that the machine was at load
+4.4 from another agent for these runs, and one earlier run showed genuine relay-to-relay connection
+failures, so a quiet box is worth waiting for before drawing the last conclusion.
+
+## A hypothesis, clearly labelled as one — since disproved, see above
 
 The two directions differ in exactly one way:
 
