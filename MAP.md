@@ -4,7 +4,7 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-32 packages, 65,487 lines of wac, 1346 tests,
+32 packages, 65,597 lines of wac, 1351 tests,
 38 command-line programs and 4 browser pages.
 
 ## Packages
@@ -35,13 +35,13 @@ In dependency order: nothing here imports anything below it.
 | [`rlp`](packages/rlp/) | Recursive Length Prefix — the Ethereum execution layer's serialisation, in wac. | 317 | 8 | `fmt` |
 | [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 222 | 16 | `fmt` |
 | [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 4,049 | 45 | `crypto` |
-| [`ens`](packages/ens/) | The name a person types, turned into the node a contract is asked about. | 251 | 8 | `crypto` |
 | [`mpt`](packages/mpt/) | Merkle-Patricia proofs, verified — the piece that turns "a provider told me" into "the state root I already verified commits to this". | 489 | 27 | `codec` `crypto` `fmt` `rlp` `std` |
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
 | [`sh`](packages/sh/) | A shell, in wac. | 6,564 | 31 | `bytes` `fmt` `fs` `platform` `std` |
 | [`ssz`](packages/ssz/) | **Everything an Altair light client needs is done and checked against Ethereum's vectors. | 808 | 26 | `crypto` |
 | [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,696 | 78 | `crypto` |
 | [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 4,008 | 33 | `bytes` `codec` `crypto` `datetime` `fmt` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
+| [`ens`](packages/ens/) | The name a person types, turned into the node a contract is asked about. | 361 | 13 | `crypto` `mpt` |
 | [`lightclient`](packages/lightclient/) | **The Altair sync protocol works. | 642 | 12 | `bls` `ssz` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,551 | 46 | `bytes` `codec` `crypto` `fmt` `platform` `sh` |
 | [`tor`](packages/tor/) | Tor in wac, both ends: a client and SOCKS5 proxy, a relay, a directory authority, an onion-service client, and a test network with no C tor in it. | 14,222 | 268 | `bytes` `codec` `crypto` `datetime` `fmt` `http` `platform` `std` `tls` `wactest` |

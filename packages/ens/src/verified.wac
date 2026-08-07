@@ -1,0 +1,109 @@
+// Resolving a name without trusting the answer: the whole chain, end to end.
+//
+// This is the first thing in the repo that composes several of these packages rather than testing one
+// against an oracle. Every step is ours:
+//
+//     name          "vitalik.eth"
+//       -> node     `namehash`                  — this package
+//       -> slot     `ownerSlot`, `resolverSlot` — `src/registry.wac`, Solidity's mapping layout
+//       -> account  `accountAt`                 — `packages/mpt`, the state trie under a verified root
+//       -> value    `storageAt`                 — `packages/mpt`, that account's storage trie
+//       -> address  20 bytes, left-padded away  — here
+//
+// What a caller supplies is a **state root it already believes** — from `packages/lightclient`, or from a
+// header it checked some other way — and the two node lists an `eth_getProof` response carries. What it
+// gets back is either the address or the reason the proof did not establish one. Nothing here asks a
+// provider what a name resolves to; a provider that lies has to produce a trie that hashes to a root the
+// caller already has, which is the whole point of design/0003.
+//
+// ## The padding, which is where a composition like this goes wrong
+//
+// A storage slot holds 32 bytes, and the trie stores its value **RLP-encoded and minimal** — leading zero
+// bytes removed. An address is 20 bytes and almost always has a few leading zeros, so what comes back from
+// `storageAt` is *shorter than an address* and has to be left-padded before it means anything. Reading
+// those bytes as if they were the address, right-aligned, yields a plausible wrong address — which is the
+// failure this repo keeps finding: not an error, a believable answer.
+//
+// `addressFromWord` in `ens.wac` handles the other direction, an `eth_call` return word, where the bytes
+// are 32 with twelve zeros in front. Both exist because both encodings are real; neither guesses.
+//
+// ## Not implemented
+//
+// **The resolver's own storage.** `ownerOf` reads the registry, whose layout is a fact about one deployed
+// contract that has not changed since 2017. A *resolver* is a contract of somebody's choosing, and its
+// layout is not this package's to assume — see `registry.wac`. Resolving a name to an address the way a
+// wallet does means reading a resolver, so what is verifiable here is ownership and the resolver's
+// address, not the final answer. Said plainly rather than approximated.
+
+import { namehash } from "./ens.wac";
+import { ownerSlot, resolverSlot } from "./registry.wac";
+import { accountAt, storageAt, AccountProof, StorageProof } from "../../mpt/src/account.wac";
+
+/** What the chain of proofs established about one name. */
+export struct Resolved {
+  /** Whether the proofs verified. False means the answer is unknown, not that the name is unowned. */
+  bool ok;
+  /** Whether the slot holds anything. A name nobody owns proves absent, which is an answer. */
+  bool present;
+  /** The 20-byte address, zero-length when absent. */
+  u8[] address;
+  /** Why the proofs did not establish an answer. Empty when `ok`. */
+  string error;
+
+  Resolved of(bool ok, bool present, u8[] address, string error) {
+    return Resolved(ok, present, address, error);
+  }
+}
+
+/**
+ * The owner of `name`, proved against `stateRoot`.
+ *
+ * `registry` is the ENS registry's address — a parameter rather than a constant, because pinning the
+ * mainnet address here would make every other chain a special case and would put a piece of deployment
+ * configuration in a library.
+ */
+export Resolved ownerOf(u8[] stateRoot, u8[] registry, u8[] name,
+                        u8[][] accountNodes, u8[][] storageNodes) {
+  return slotOf(stateRoot, registry, ownerSlot(namehash(name)), accountNodes, storageNodes);
+}
+
+/** The resolver contract for `name`, proved the same way — the struct's second field. */
+export Resolved resolverOf(u8[] stateRoot, u8[] registry, u8[] name,
+                           u8[][] accountNodes, u8[][] storageNodes) {
+  return slotOf(stateRoot, registry, resolverSlot(namehash(name)), accountNodes, storageNodes);
+}
+
+/** One address-valued slot of one account, both walks and the padding. */
+Resolved slotOf(u8[] stateRoot, u8[] registry, u8[] slot, u8[][] accountNodes, u8[][] storageNodes) {
+  AccountProof a = accountAt(stateRoot, registry, accountNodes);
+  if (!a.ok) { return Resolved.of(false, false, u8[0](), "the registry's account: " + a.error); }
+  if (!a.present) {
+    // Not the same as "the name has no owner": there is no registry at that address on this chain.
+    return Resolved.of(false, false, u8[0](), "there is no account at the registry address");
+  }
+
+  // The storage root comes out of the account proof and is never supplied by the caller — that is the
+  // composition. A root from anywhere else proves something true about a different contract.
+  StorageProof s = storageAt(a.account.storageRoot, slot, storageNodes);
+  if (!s.ok) { return Resolved.of(false, false, u8[0](), "the registry's storage: " + s.error); }
+  if (!s.present) { return Resolved.of(true, false, u8[0](), ""); }
+
+  return addressOfSlot(s.value);
+}
+
+/**
+ * A stored slot value as an address.
+ *
+ * The trie's value is minimal big-endian, so an address with leading zero bytes arrives short and has to be
+ * left-padded to twenty. Anything longer than twenty bytes is not an address, and refusing is the point: a
+ * slot holding a `uint256` would otherwise have its low twenty bytes read as one.
+ */
+export Resolved addressOfSlot(u8[] value) {
+  if (value.len() > 20) {
+    return Resolved.of(false, false, u8[0](), "an address slot holds at most 20 bytes");
+  }
+  u8[] out = u8[20]();
+  i32 at = 20 - value.len();
+  for (i32 i = 0; i < value.len(); i++) { out[at + i] = value[i]; }
+  return Resolved.of(true, true, out, "");
+}
