@@ -13,6 +13,7 @@
 // wac-mono 0088 asked for exactly this shape, borrowed from `packages/gzip/test/stream.test.ts`, which
 // 0006 wrote for the same reason: fixed vectors do not find boundary bugs, and cutting at every byte does.
 
+import zlib from "node:zlib";
 import { wacBind } from "../../../harness/wacBind.ts";
 
 const mod = await wacBind("packages/zstd/src/stream.wac") as unknown as {
@@ -113,6 +114,46 @@ Deno.test("every frame, cut every possible way, decodes to what the buffered dec
         );
       }
     }
+  }
+});
+
+Deno.test("frames from the reference encoder, which are not the shape ours emits", () => {
+  // **The frames above all come from our own encoder, which emits exactly one header shape**: four-byte
+  // content size, checksum present. Node's zstd — the reference encoder, and this package's oracle
+  // elsewhere — emits a descriptor of `0x00` for a short input: no content size at all, no checksum, and
+  // a window descriptor instead. So the streaming decoder's no-checksum path and its content-size-absent
+  // path had no test, because the only frames it had ever been shown were its own side's.
+  //
+  // This is the "suspect the oracle" question asked of a test I wrote two hours ago: the answer was that
+  // the inputs were self-produced, which is a narrower thing than it looked.
+  const ref = (zlib as unknown as { zstdCompressSync(b: Uint8Array): Uint8Array }).zstdCompressSync;
+  const enc = new TextEncoder();
+  const inputs = [
+    enc.encode("hello"),
+    enc.encode("the quick brown fox jumps over the lazy dog\n".repeat(2000)),
+    new Uint8Array(0),
+    new Uint8Array(70000).fill(0x5a),
+  ];
+  const shapes = new Set<number>();
+  for (const data of inputs) {
+    const frame = ref(data);
+    shapes.add(frame[4]);
+    const want = buffered.decompress(frame);
+    if (!same(want, data)) throw new Error("the buffered decoder cannot read a reference frame either");
+    for (const chunk of [1, 7, 64, 4096, frame.length]) {
+      const got = streamed(frame, chunk);
+      if (!same(got, want)) {
+        throw new Error(
+          `reference frame of ${frame.length} bytes (descriptor 0x${frame[4].toString(16)}), ` +
+            `cut every ${chunk}: got ${got.length} bytes, want ${want.length}`,
+        );
+      }
+    }
+  }
+  // And the shapes really are different from ours, or this test is the previous one again.
+  const oursDescriptor = encoder.compress(enc.encode("hello"))[4];
+  if (shapes.has(oursDescriptor) && shapes.size === 1) {
+    throw new Error("the reference encoder emitted only the shape ours does — this test proves nothing");
   }
 });
 

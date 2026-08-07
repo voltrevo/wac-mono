@@ -344,7 +344,7 @@ encoder stops choosing one, the test says so instead of quietly testing less.
 | `src/xxh64.wac` | the content checksum |
 | `src/fseenc.wac` | FSE encoding: normalisation, encoding tables, the backwards bit writer |
 | `src/encode.wac` | the compressor: matching, sequences, blocks, frames |
-| `test/oracle.mjs` | Node's zstd, both directions, one subprocess per run |
+| `test/reference.ts` | Node's zstd, both directions, in this process — `node:zlib` works under Deno |
 | `test/frame.test.ts` | against encoder output, and hand-built frames Node validates |
 | `test/fse.test.ts` | the three checks above |
 | `test/huffman.test.ts` | literals as a subsequence, and the table build |
