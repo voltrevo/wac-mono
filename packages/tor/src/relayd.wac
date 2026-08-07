@@ -60,6 +60,19 @@ import {
 } from "./link.wac";
 import { itoa64 } from "../../wactest/src/itoa64.wac";
 import {
+  INTRO_ACK_SUCCESS, INTRO_ACK_UNKNOWN_ID, IntroPoints, Introduced, establishIntro,
+  forgetCircuit, forgetConnection, introduce1, introduceAckBody,
+} from "./introrelay.wac";
+import {
+  Joined, RV_OK, RendPoints, establishRendezvous, forgetRendCircuit, forgetRendConnection,
+  rendezvous1,
+} from "./rendrelay.wac";
+import {
+  relayEstablishIntro, relayEstablishRendezvous, relayIntroEstablished, relayIntroduce1,
+  relayIntroduce2, relayIntroduceAck, relayRendezvous1, relayRendezvous2,
+  relayRendezvousEstablished,
+} from "./relay.wac";
+import {
   tlsServerInit, tlsServerFeed, tlsServerSend, tlsPhase, phaseEstablished, phaseFailed,
 } from "../../tls/src/server.wac";
 import { recordsReady } from "../../tls/src/record.wac";
@@ -456,6 +469,12 @@ export i32 main(Core core, Cli cli) {
   // Connections are numbered from one for the log. `live` is a position in an array that compacts,
   // so it names a different connection over time and is no use for telling them apart.
   i32 nextConnId = 0;
+  // The two onion-service roles this relay can be asked to play. Both are relay-wide rather than
+  // per-connection: a service establishes its introduction point over one circuit and a client
+  // arrives over another, and the whole point is that the relay joins two parties who never share a
+  // connection.
+  IntroPoints intros = IntroPoints.create(MAX_CONNS * 2);
+  RendPoints rends = RendPoints.create(MAX_CONNS * 2);
   Pending<Socket> incoming = cli.accept(listener.handle);
   bool accepting = true;
 
@@ -503,7 +522,7 @@ export i32 main(Core core, Cli cli) {
     if (which < 0) {
       // Nothing spoke for two minutes. Dropping everything is heavy-handed and it is what a relay with
       // no traffic should do rather than hold sockets for a network that has gone.
-      for (i32 i = 0; i < live; i++) { dropConn(core, cli, conns[i]!); }
+      for (i32 i = 0; i < live; i++) { dropConn(core, cli, conns[i]!, intros, rends); }
       live = 0;
       // The accept ticket is **not** re-armed here. `cancel` detaches this program from the answer but
       // does not stop the host accepting, so a fresh `accept` collides with the one still running and
@@ -540,9 +559,10 @@ export i32 main(Core core, Cli cli) {
 
     i32 who = owner[which];
     Conn hot = conns[who]!;
-    feedConn(core, cli, hot, source[which], slot[which], id, certs, docs, hasDir);
+    feedConn(core, cli, hot, source[which], slot[which], id, certs, docs, hasDir,
+             conns, live, intros, rends);
     if (!hot.live) {
-      dropConn(core, cli, hot);
+      dropConn(core, cli, hot, intros, rends);
       // Close the gap rather than leave a hole: the wait list is built by walking 0..live, and a dead
       // entry in the middle would be waited on forever.
       for (i32 i = who; i + 1 < live; i++) { conns[i] = conns[i + 1]; }
@@ -661,6 +681,20 @@ struct Circ {
    *  whether cells stopped arriving or stopped being sent, which is the question issue 0089 is on. */
   i32 forwardedOut;
   i32 forwardedBack;
+
+  // ── Onion service roles ──
+  /**
+   * KH, the nonce shared with whoever built this circuit. Empty for a circuit we extended onward.
+   *
+   * An ESTABLISH_INTRO arriving here is MACed with it, which is what stops one being replayed from
+   * another circuit. It comes from the CREATE handshake and nowhere else.
+   */
+  u8[] kh;
+  /** Whether an INTRODUCE1 has already been seen here. tor allows exactly one per circuit. */
+  bool introduced;
+  /** The connection id and circuit id this one is spliced to, or -1 — a completed rendezvous. */
+  i32 spliceConn;
+  i32 spliceCirc;
 }
 
 /**
@@ -670,9 +704,71 @@ struct Circ {
  * consults — but the fields cannot be empty, so the connection's own read stands in until there is
  * something real to hold.
  */
-Circ newCirc(Core core, Cli cli, i32 circId, Hop hop, Pending<Read> idle) {
+Circ newCirc(Core core, Cli cli, i32 circId, Hop hop, Pending<Read> idle, u8[] kh) {
   return Circ(circId, hop, false, Link(core, cli, -1, u8[0](), u8[0](), true, u8[0]()), 0, idle,
-              -1, Buf.create(), false, -1, -1, idle, 0, 0, 0, 0, false, 0, 0);
+              -1, Buf.create(), false, -1, -1, idle, 0, 0, 0, 0, false, 0, 0,
+              kh, false, -1, -1);
+}
+
+/**
+ * Send a relay cell to the last hop of a circuit that may be on another connection.
+ *
+ * Introduction points and rendezvous points are the only places a relay moves a cell *sideways*: it
+ * arrives on one circuit and leaves on another, with no stream and no next hop between them. So the
+ * connection is found by id rather than being to hand, and a false return means the far side has gone
+ * — which is ordinary, since the party waiting there may have given up.
+ */
+bool sendToSlot(Core core, Cli cli, Conn?[] conns, i32 connCount, i32 connId, i32 circId,
+                i32 command, u8[] body) {
+  for (i32 i = 0; i < connCount; i++) {
+    if (conns[i] is null) { continue; }
+    Conn other = conns[i]!;
+    if (!other.live || other.id != connId) { continue; }
+    for (i32 j = 0; j < other.circCount; j++) {
+      Circ target = other.circs[j]!;
+      if (target.circId != circId) { continue; }
+      other.tls = sendCell(cli, other.sockObj, other.tls,
+                           sendToClient(target.hop, target.circId, command, 0, body));
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Forward an already-peeled payload to the far side of a rendezvous, adding that circuit's layer. */
+bool sendToSplice(Core core, Cli cli, Conn?[] conns, i32 connCount, i32 connId, i32 circId,
+                  u8[] payload) {
+  for (i32 i = 0; i < connCount; i++) {
+    if (conns[i] is null) { continue; }
+    Conn other = conns[i]!;
+    if (!other.live || other.id != connId) { continue; }
+    for (i32 j = 0; j < other.circCount; j++) {
+      Circ target = other.circs[j]!;
+      if (target.circId != circId) { continue; }
+      other.tls = sendCell(cli, other.sockObj, other.tls,
+                           encodeFixed(target.circId, cmdRelay(),
+                                       wrapForClient(target.hop, payload)));
+      target.forwardedBack = target.forwardedBack + 1;
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Record the other half of a splice on the circuit that was waiting. */
+void spliceBack(Conn?[] conns, i32 connCount, i32 connId, i32 circId, i32 toConn, i32 toCirc) {
+  for (i32 i = 0; i < connCount; i++) {
+    if (conns[i] is null) { continue; }
+    Conn other = conns[i]!;
+    if (!other.live || other.id != connId) { continue; }
+    for (i32 j = 0; j < other.circCount; j++) {
+      Circ target = other.circs[j]!;
+      if (target.circId != circId) { continue; }
+      target.spliceConn = toConn;
+      target.spliceCirc = toCirc;
+      return;
+    }
+  }
 }
 
 /** A connection as it arrives: TLS begun, nothing else known yet. */
@@ -698,8 +794,13 @@ i32 findCirc(Conn c, i32 circId) {
  * The slot is closed by compaction rather than by a flag, for the same reason connections are: the
  * wait list is built by walking 0..circCount, so a hole in the middle would be waited on forever.
  */
-void dropCirc(Core core, Cli cli, Conn c, i32 slot) {
+void dropCirc(Core core, Cli cli, Conn c, i32 slot, IntroPoints intros, RendPoints rends) {
   Circ k = c.circs[slot]!;
+  // Whatever this circuit was holding for the onion protocol goes with it. Without this the maps
+  // fill with entries naming circuits that are gone, and the symptom is a relay quietly refusing new
+  // introduction points because it is full of dead ones.
+  forgetCircuit(intros, c.id, k.circId);
+  forgetRendCircuit(rends, c.id, k.circId);
   if (k.forwardedOut > 0 || k.forwardedBack > 0) {
     core.log("relayd: [" + itoa(c.id) + "]  circuit " + itoa(k.circId) + " carried " +
              itoa(k.forwardedOut) + " cells out, " + itoa(k.forwardedBack) + " back");
@@ -714,10 +815,12 @@ void dropCirc(Core core, Cli cli, Conn c, i32 slot) {
 }
 
 /** Everything a closing connection holds: its own socket, and every circuit's. */
-void dropConn(Core core, Cli cli, Conn c) {
+void dropConn(Core core, Cli cli, Conn c, IntroPoints intros, RendPoints rends) {
   core.log("relayd: [" + itoa(c.id) + "]  dropping a connection carrying " + itoa(c.circCount) + " circuit(s), " +
            itoa(c.droppedCircs) + " already torn down");
-  while (c.circCount > 0) { dropCirc(core, cli, c, c.circCount - 1); }
+  while (c.circCount > 0) { dropCirc(core, cli, c, c.circCount - 1, intros, rends); }
+  forgetConnection(intros, c.id);
+  forgetRendConnection(rends, c.id);
   cli.closeSocket(c.sock);
   c.live = false;
 }
@@ -730,8 +833,15 @@ void dropConn(Core core, Cli cli, Conn c) {
  * is meaningless for the client, whose cells name their own circuit. The function returns when the
  * event is handled; `c.live` says whether the connection survived it.
  */
+/**
+ * `conns` and the two maps are passed in because the onion-service roles are the only place a relay
+ * moves a cell *sideways* — out of the connection it arrived on and into another. Everything else
+ * here concerns one connection and one circuit, which is why this function did not need them until
+ * now, and why they are arguments rather than a wider refactor.
+ */
 void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[] certs,
-              DirDocuments docs, bool hasDir) {
+              DirDocuments docs, bool hasDir, Conn?[] conns, i32 connCount, IntroPoints intros,
+              RendPoints rends) {
     if (source == 2) {
       Circ k = c.circs[slot]!;
       bool open = false;
@@ -785,7 +895,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
       if (!alive) {
         core.warn("relayd: [" + itoa(c.id) + "]  the next hop closed the connection");
         c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_NONE));
-        dropCirc(core, cli, c, slot);
+        dropCirc(core, cli, c, slot, intros, rends);
         return;
       }
       // As above: only a hop that is staying gets a fresh read.
@@ -798,7 +908,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
         if (backCommand == cmdDestroy()) {
           core.log("relayd: [" + itoa(c.id) + "]  the next hop destroyed its leg of the circuit");
           c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_NONE));
-          dropCirc(core, cli, c, slot);
+          dropCirc(core, cli, c, slot, intros, rends);
           return;
         }
         if (backCommand != cmdRelay() && backCommand != cmdRelayEarly()) { continue; }
@@ -909,7 +1019,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
           c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(cellCircId(cell, 0), DESTROY_PROTOCOL));
           continue;
         }
-        c.circs[c.circCount] = newCirc(core, cli, cellCircId(cell, 0), fast.hop, c.fromClient);
+        c.circs[c.circCount] = newCirc(core, cli, cellCircId(cell, 0), fast.hop, c.fromClient, fast.kh);
         c.circCount = c.circCount + 1;
         c.tls = sendCell(cli, c.sockObj, c.tls, fast.cell);
         core.log("relayd: [" + itoa(c.id) + "]  circuit " + itoa(cellCircId(cell, 0)) + " created (CREATE_FAST)");
@@ -926,7 +1036,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
           c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(cellCircId(cell, 0), DESTROY_PROTOCOL));
           continue;
         }
-        c.circs[c.circCount] = newCirc(core, cli, cellCircId(cell, 0), answer.hop, c.fromClient);
+        c.circs[c.circCount] = newCirc(core, cli, cellCircId(cell, 0), answer.hop, c.fromClient, answer.kh);
         c.circCount = c.circCount + 1;
         c.tls = sendCell(cli, c.sockObj, c.tls, answer.cell);
         core.log("relayd: [" + itoa(c.id) + "]  circuit " + itoa(cellCircId(cell, 0)) + " created");
@@ -944,10 +1054,23 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
         if (!inbound.recognized) {
           // Not for us, so it belongs to a hop beyond us: forward the once-peeled payload verbatim.
           // A relay never learns what is inside — that is between the client and the further hop.
+          // A joined rendezvous is the other thing an unrecognised cell can mean. The client and the
+          // service share keys through us, so the cell is re-wrapped for the far circuit and not read:
+          // one layer of ours comes off on the way in and one goes on on the way out, which is what
+          // tor does when it rewrites `cell->circ_id` and hands the cell to the spliced circuit.
+          if (!k.hasNext && k.spliceConn >= 0) {
+            if (!sendToSplice(core, cli, conns, connCount, k.spliceConn, k.spliceCirc,
+                              inbound.payload)) {
+              core.warn("relayd: [" + itoa(c.id) + "]  the far side of the rendezvous is gone");
+              c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_PROTOCOL));
+              dropCirc(core, cli, c, slotOf, intros, rends);
+            }
+            continue;
+          }
           if (!k.hasNext) {
             core.warn("relayd: [" + itoa(c.id) + "]  a cell for a later hop, but nothing has been extended to");
             c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_PROTOCOL));
-            dropCirc(core, cli, c, slotOf);
+            dropCirc(core, cli, c, slotOf, intros, rends);
             continue;
           }
           // Forwarding was silent, which made "no stream opened" impossible to tell apart from "no cell
@@ -966,14 +1089,14 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
           if (k.hasNext) {
             core.warn("relayd: [" + itoa(c.id) + "]  a second EXTEND2 on one circuit is not supported");
             c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_PROTOCOL));
-            dropCirc(core, cli, c, slotOf);
+            dropCirc(core, cli, c, slotOf, intros, rends);
             continue;
           }
           Extended done = extendCircuit(core, cli, inbound.data, id);
           if (!done.ok) {
             // A refusal the client can act on: it will try another path rather than hang.
             c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_INTERNAL));
-            dropCirc(core, cli, c, slotOf);
+            dropCirc(core, cli, c, slotOf, intros, rends);
             continue;
           }
           k.next = done.link;
@@ -985,6 +1108,99 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
                                       extended2Body(done.reply)));
           core.log("relayd: [" + itoa(c.id) + "]  extended circuit " + itoa(k.circId) + " to the next hop as " +
                    itoa(k.nextCircId));
+          continue;
+        }
+
+        // ── The onion-service relay roles ──────────────────────────────────
+        //
+        // A relay holding an introduction point or a rendezvous point learns nothing from either: the
+        // first is a key it files a circuit under, the second a cookie it matches. Everything that
+        // could identify a service is encrypted to somebody else.
+
+        if (inbound.command == relayEstablishIntro()) {
+          // Only on a circuit that ends here — a circuit we extended onward belongs to a further hop
+          // and claiming it would be promising to deliver cells we cannot deliver.
+          u8[] filed = establishIntro(intros, inbound.data, k.kh, c.id, k.circId, !k.hasNext);
+          if (filed.len() == 0) {
+            core.warn("relayd: [" + itoa(c.id) + "]  an ESTABLISH_INTRO we would not accept");
+            c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_PROTOCOL));
+            dropCirc(core, cli, c, slotOf, intros, rends);
+            continue;
+          }
+          c.tls = sendCell(cli, c.sockObj, c.tls,
+                           sendToClient(k.hop, k.circId, relayIntroEstablished(), 0, u8[0]()));
+          core.log("relayd: [" + itoa(c.id) + "]  circuit " + itoa(k.circId) +
+                   " is an introduction point");
+          continue;
+        }
+
+        if (inbound.command == relayIntroduce1()) {
+          Introduced decided = introduce1(intros, inbound.data, !k.introduced);
+          k.introduced = true;
+          i32 status = decided.status;
+          if (status == INTRO_ACK_SUCCESS) {
+            // Read the target *before* anything can change it: `forgetCircuit` below compacts the
+            // map, so an index taken afterwards would name a different entry.
+            i32 toConn = intros.connIds[decided.at];
+            i32 toCirc = intros.circIds[decided.at];
+            // The body goes on unchanged — an INTRODUCE2 *is* an INTRODUCE1, and only the command
+            // differs. A relay that rewrote any of it would be rewriting ciphertext.
+            if (!sendToSlot(core, cli, conns, connCount, toConn, toCirc, relayIntroduce2(),
+                            inbound.data)) {
+              // The service's circuit is gone. Drop the registration so the next client is told
+              // *unknown id* immediately rather than after another failed forward, and tell this one
+              // the same thing — from a client's side an introduction point that has lost the service
+              // and one that never had it are the same event.
+              forgetCircuit(intros, toConn, toCirc);
+              status = INTRO_ACK_UNKNOWN_ID;
+            }
+          }
+          c.tls = sendCell(cli, c.sockObj, c.tls,
+                           sendToClient(k.hop, k.circId, relayIntroduceAck(), 0,
+                                        introduceAckBody(status)));
+          core.log("relayd: [" + itoa(c.id) + "]  an introduction, status " + itoa(status));
+          continue;
+        }
+
+        if (inbound.command == relayEstablishRendezvous()) {
+          i32 held = establishRendezvous(rends, inbound.data, c.id, k.circId, !k.hasNext);
+          if (held != RV_OK) {
+            core.warn("relayd: [" + itoa(c.id) + "]  an ESTABLISH_RENDEZVOUS we would not accept");
+            c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_PROTOCOL));
+            dropCirc(core, cli, c, slotOf, intros, rends);
+            continue;
+          }
+          c.tls = sendCell(cli, c.sockObj, c.tls,
+                           sendToClient(k.hop, k.circId, relayRendezvousEstablished(), 0, u8[0]()));
+          core.log("relayd: [" + itoa(c.id) + "]  circuit " + itoa(k.circId) +
+                   " is waiting at a rendezvous");
+          continue;
+        }
+
+        if (inbound.command == relayRendezvous1()) {
+          Joined join = rendezvous1(rends, inbound.data, !k.hasNext);
+          if (join.error != RV_OK) {
+            // An unknown cookie is ordinary rather than suspicious — tor's own note is that a client
+            // which gave up after INTRODUCE1 leaves exactly this.
+            core.warn("relayd: [" + itoa(c.id) + "]  a RENDEZVOUS1 with nothing waiting for it");
+            c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_PROTOCOL));
+            dropCirc(core, cli, c, slotOf, intros, rends);
+            continue;
+          }
+          if (!sendToSlot(core, cli, conns, connCount, join.connId, join.circId,
+                          relayRendezvous2(), join.rendezvous2)) {
+            core.warn("relayd: [" + itoa(c.id) + "]  the waiting circuit went away");
+            c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_PROTOCOL));
+            dropCirc(core, cli, c, slotOf, intros, rends);
+            continue;
+          }
+          // Spliced both ways. From here neither circuit is read again: cells arriving on one are
+          // re-wrapped for the other, which is the whole of what a rendezvous point does.
+          k.spliceConn = join.connId;
+          k.spliceCirc = join.circId;
+          spliceBack(conns, connCount, join.connId, join.circId, c.id, k.circId);
+          core.log("relayd: [" + itoa(c.id) + "]  rendezvous joined: circuit " + itoa(k.circId) +
+                   " to " + itoa(join.circId));
           continue;
         }
 
@@ -1127,7 +1343,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
       if (command == cmdDestroy()) {
         core.log("relayd: [" + itoa(c.id) + "]  the initiator destroyed circuit " + itoa(cellCircId(cell, 0)));
         i32 gone = findCirc(c, cellCircId(cell, 0));
-        if (gone >= 0) { dropCirc(core, cli, c, gone); }
+        if (gone >= 0) { dropCirc(core, cli, c, gone, intros, rends); }
         continue;
       }
     }

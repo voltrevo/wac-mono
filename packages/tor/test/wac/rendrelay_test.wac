@@ -10,7 +10,7 @@
 import { T } from "../../../wactest/src/assert.wac";
 import {
   Joined, REND_COOKIE_LEN, RV_OK, RV_REFUSED, RV_UNKNOWN_COOKIE, RendPoints, establishRendezvous,
-  forgetCircuit, forgetConnection, indexOfCookie, rendezvous1,
+  forgetRendCircuit, forgetRendConnection, indexOfCookie, rendezvous1,
 } from "../../src/rendrelay.wac";
 
 /** A client waits, a service arrives, and the two are joined. */
@@ -122,15 +122,15 @@ export string test_refusals_and_lifetimes() {
 
   // And circuits going away take their cookies.
   t.eqI32(nearly.count, 1, "still waiting");
-  forgetCircuit(nearly, 3, 0x7002);
+  forgetRendCircuit(nearly, 3, 0x7002);
   t.eqI32(nearly.count, 1, "another circuit closing changes nothing");
-  forgetCircuit(nearly, 3, 0x7001);
+  forgetRendCircuit(nearly, 3, 0x7001);
   t.eqI32(nearly.count, 0, "its own does");
 
   establishRendezvous(nearly, cookie, 5, 0x8001, true);
-  forgetConnection(nearly, 6);
+  forgetRendConnection(nearly, 6);
   t.eqI32(nearly.count, 1, "another connection closing changes nothing");
-  forgetConnection(nearly, 5);
+  forgetRendConnection(nearly, 5);
   t.eqI32(nearly.count, 0, "and its own takes it");
   return t.report();
 }

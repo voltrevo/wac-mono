@@ -111,7 +111,7 @@ export Joined rendezvous1(RendPoints m, u8[] body, bool circuitEndsHere) {
 }
 
 /** Forget a waiting circuit that has gone away. */
-export void forgetCircuit(RendPoints m, i32 connId, i32 circId) {
+export void forgetRendCircuit(RendPoints m, i32 connId, i32 circId) {
   i32 kept = 0;
   for (i32 i = 0; i < m.count; i++) {
     if (m.connIds[i] == connId && m.circIds[i] == circId) { continue; }
@@ -124,7 +124,7 @@ export void forgetCircuit(RendPoints m, i32 connId, i32 circId) {
 }
 
 /** Forget everything on a connection that has closed. */
-export void forgetConnection(RendPoints m, i32 connId) {
+export void forgetRendConnection(RendPoints m, i32 connId) {
   i32 kept = 0;
   for (i32 i = 0; i < m.count; i++) {
     if (m.connIds[i] == connId) { continue; }
