@@ -21,7 +21,7 @@ import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import { recordLength, recordType, maxPlaintext, typeHandshake, typeAlert } from "../../src/record.wac";
 import { Reader } from "../../src/wire.wac";
-import { tlsClientInit, tlsClientFeed, tlsClientFailure, tlsClientPhase }
+import { tlsClientInit, tlsClientFeed, tlsClientFailure, tlsClientPhase, tlsClientClose }
   from "../../src/client.wac";
 import { parseCert, verifyChain, Cert } from "../../src/x509.wac";
 
@@ -198,6 +198,23 @@ export string test_feeding_a_failed_connection_is_answered_not_fatal(fn[u8[](i32
     state = firstField(tlsClientFeed(state, after[i]));
     t.eqI32(tlsClientFailure(state), code, "the failure is unchanged, and nothing aborted");
     t.eqI32(tlsClientPhase(state), 4, "and so is the phase");
+  }
+
+  // **And the same after a clean close, which is the case a peer can drive.** The block above reaches
+  // phase 4 through a *failure*, and the early return keyed on the failure code. A `close_notify` sets
+  // phase 4 with no failure, and a caller feeds whole records in one call — so a server sending an
+  // alert followed by any further record put both in the same `tlsClientFeed`, and the second one
+  // fell through to a `trap`. Checking the phase between calls, which every caller here does, cannot
+  // help when both records are inside one of them.
+  u8[] closing = firstField(tlsClientInit("example.com".toBytes(), u8[0](), i32[0](),
+                          entropy(0), entropy(1), entropy(2), entropy(3), 1785715200));
+  closing = firstField(tlsClientClose(closing));
+  t.eqI32(tlsClientPhase(closing), 4, "a closed connection is in phase 4");
+  t.eqI32(tlsClientFailure(closing), 0, "and it did not fail — it was closed");
+  for (i32 i = 0; i < after.len(); i++) {
+    closing = firstField(tlsClientFeed(closing, after[i]));
+    t.eqI32(tlsClientPhase(closing), 4, "a closed connection stays closed, and nothing aborted");
+    t.eqI32(tlsClientFailure(closing), 0, "and it still has not failed");
   }
   return t.report();
 }

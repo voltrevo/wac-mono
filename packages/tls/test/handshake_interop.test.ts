@@ -21,6 +21,7 @@
 
 import { withDeadline } from "../../../harness/deadline.ts";
 import { feed, newConnection, recordNeeded, send, tlsClose, unpack } from "../host/serve.ts";
+import { announceIfMissing, HAVE_OPENSSL35, OPENSSL35 } from "./openssl35.ts";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -181,22 +182,12 @@ Deno.test("tls: the connection closes cleanly, not as a truncation", async () =>
   await server.done;
 });
 
-/** OpenSSL 3.5.7, built by tools/openssl35.sh. The system 3.0.13 has no ML-KEM. */
-const OPENSSL35 = Deno.env.get("OPENSSL35") ??
-  "/tmp/ossl/openssl-openssl-3.5.7/apps/openssl";
-const HAVE_OPENSSL35 = (() => {
-  try {
-    return Deno.statSync(OPENSSL35).isFile;
-  } catch {
-    return false;
-  }
-})();
 
 Deno.test({
   name: "tls: the server negotiates X25519MLKEM768 with a post-quantum client",
   // Skipped rather than failed without the newer OpenSSL: it is a reference this repo
   // does not ship, and a suite that goes red over a missing optional tool gets ignored.
-  ignore: !HAVE_OPENSSL35,
+  ignore: (announceIfMissing(), !HAVE_OPENSSL35),
   fn: async () => {
     // `-groups X25519MLKEM768` makes it the *only* group offered, so a server that
     // quietly fell back to X25519 would fail the handshake rather than silently

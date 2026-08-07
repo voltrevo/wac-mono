@@ -24,8 +24,8 @@ u8[] at(i32 i) {
 }
 
 Introduce2 parsed(fn[u8[](i32, u8[], u8[])] ref, i32 i) {
-  return parseIntroduce2(ref(I_CELL, at(i), none()), ref(I_ENC_SECRET, at(i), none()),
-                         ref(I_SUBCRED, at(i), none()));
+  return parseIntroduce2(ref(I_CELL, at(i), none()), ref(I_AUTH_KEY, at(i), none()),
+                         ref(I_ENC_SECRET, at(i), none()), ref(I_SUBCRED, at(i), none()));
 }
 
 /** Everything tor put in, recovered. */
@@ -81,25 +81,38 @@ export string test_the_link_specifiers_stop_before_the_padding(fn[u8[](i32, u8[]
 export string test_a_tampered_cell_is_refused(fn[u8[](i32, u8[], u8[])] ref) {
   T t = T.create();
   u8[] cell = ref(I_CELL, at(0), none());
+  u8[] auth = ref(I_AUTH_KEY, at(0), none());
   u8[] secret = ref(I_ENC_SECRET, at(0), none());
   u8[] subcred = ref(I_SUBCRED, at(0), none());
 
-  t.isTrue(parseIntroduce2(cell, secret, subcred).ok, "the unmodified cell is accepted");
+  t.isTrue(parseIntroduce2(cell, auth, secret, subcred).ok, "the unmodified cell is accepted");
 
-  t.isTrue(!parseIntroduce2(flipAt(cell, 25), secret, subcred).ok, "a changed auth key is refused");
-  t.isTrue(!parseIntroduce2(flipAt(cell, 60), secret, subcred).ok, "a changed CLIENT_PK is refused");
-  t.isTrue(!parseIntroduce2(flipAt(cell, 120), secret, subcred).ok,
+  // A *tampered* auth key: the MAC covers the field, so this fails whether the key used for the
+  // derivation comes from the cell or from us. It passed before the fix below existed, which is why
+  // it did not notice that the key was being taken from the cell.
+  t.isTrue(!parseIntroduce2(flipAt(cell, 25), auth, secret, subcred).ok, "a changed auth key is refused");
+
+  // The case that tells the two apart: tor's own cell, entirely self-consistent, offered at an
+  // introduction point whose auth key is a different one. tor sets `data.auth_pk` from its own record
+  // for the circuit the cell arrived on and never reads the field, so it rejects this. Deriving the
+  // MAC key from the cell's field accepts it — the client names a key, we key the MAC with the same
+  // wrong value, and it verifies. Nothing is tampered, so no MAC check can notice.
+  t.isTrue(!parseIntroduce2(cell, flipAt(auth, 0), secret, subcred).ok,
+           "a valid cell for another introduction point is refused");
+  t.isTrue(!parseIntroduce2(cell, u8[31](), secret, subcred).ok, "and a key that is not a key");
+  t.isTrue(!parseIntroduce2(flipAt(cell, 60), auth, secret, subcred).ok, "a changed CLIENT_PK is refused");
+  t.isTrue(!parseIntroduce2(flipAt(cell, 120), auth, secret, subcred).ok,
            "a changed ciphertext byte is refused");
-  t.isTrue(!parseIntroduce2(flipAt(cell, cell.len() - 1), secret, subcred).ok,
+  t.isTrue(!parseIntroduce2(flipAt(cell, cell.len() - 1), auth, secret, subcred).ok,
            "a changed MAC is refused");
   // The leading LEGACY_KEY_ID is twenty zeros and is inside the MAC span, which is the detail the
   // specification states differently from what tor does. A parser using the shorter span accepts this.
-  t.isTrue(!parseIntroduce2(flipAt(cell, 3), secret, subcred).ok,
+  t.isTrue(!parseIntroduce2(flipAt(cell, 3), auth, secret, subcred).ok,
            "a byte of LEGACY_KEY_ID is covered too");
 
   // Wrong keys, which is what an introduction point relaying to the wrong service looks like.
-  t.isTrue(!parseIntroduce2(cell, flipScalar(secret), subcred).ok, "another service's secret fails");
-  t.isTrue(!parseIntroduce2(cell, secret, flipAt(subcred, 0)).ok,
+  t.isTrue(!parseIntroduce2(cell, auth, flipScalar(secret), subcred).ok, "another service's secret fails");
+  t.isTrue(!parseIntroduce2(cell, auth, secret, flipAt(subcred, 0)).ok,
            "another period's subcredential fails");
   return t.report();
 }
@@ -108,12 +121,13 @@ export string test_a_tampered_cell_is_refused(fn[u8[](i32, u8[], u8[])] ref) {
 export string test_a_malformed_cell_is_refused(fn[u8[](i32, u8[], u8[])] ref) {
   T t = T.create();
   u8[] cell = ref(I_CELL, at(0), none());
+  u8[] auth = ref(I_AUTH_KEY, at(0), none());
   u8[] secret = ref(I_ENC_SECRET, at(0), none());
   u8[] subcred = ref(I_SUBCRED, at(0), none());
 
-  t.isTrue(!parseIntroduce2(u8[0](), secret, subcred).ok, "an empty cell is not a cell");
-  t.isTrue(!parseIntroduce2(u8[40](), secret, subcred).ok, "nor is a short run of zeros");
-  t.isTrue(!parseIntroduce2(head(cell, 100), secret, subcred).ok, "a truncated cell is refused");
+  t.isTrue(!parseIntroduce2(u8[0](), auth, secret, subcred).ok, "an empty cell is not a cell");
+  t.isTrue(!parseIntroduce2(u8[40](), auth, secret, subcred).ok, "nor is a short run of zeros");
+  t.isTrue(!parseIntroduce2(head(cell, 100), auth, secret, subcred).ok, "a truncated cell is refused");
 
   // A non-zero LEGACY_KEY_ID means a v2 introduction point, which this does not serve.
   //
@@ -128,7 +142,7 @@ export string test_a_malformed_cell_is_refused(fn[u8[](i32, u8[], u8[])] ref) {
   t.eqI32(keys.len(), 64, "the keys for the modified cell are derivable");
   u8[] remac = hsMac(sub(keys, 32, 64), sub(legacy, 0, legacy.len() - 32));
   for (i32 i = 0; i < 32; i++) { legacy[legacy.len() - 32 + i] = remac[i]; }
-  t.isTrue(!parseIntroduce2(legacy, secret, subcred).ok,
+  t.isTrue(!parseIntroduce2(legacy, auth, secret, subcred).ok,
            "a legacy key id is refused even with a MAC that checks out");
   return t.report();
 }
