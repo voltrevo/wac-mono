@@ -424,7 +424,14 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
 
     assertEquals((await box(["head", "-3", fixture])).out, sys("head", ["-3", fixture]), "head -N");
     assertEquals((await box(["tail", "-n", "2", fixture])).out, sys("tail", ["-n", "2", fixture]), "tail -n N");
-    assertEquals((await box(["wc", "-l", fixture])).out.trim(), sys("wc", ["-l", fixture]).trim().split(/\s+/)[0]);
+    // The whole line, not just the first field. Taking `[0]` was how `wc -l file` came to drop the
+    // filename: the assertion threw away the difference, and the applet's comment claimed the real one
+    // does the same. It does not — only reading standard input has no name to print.
+    assertEquals(
+      (await box(["wc", "-l", fixture])).out.trim().replace(/\s+/g, " "),
+      sys("wc", ["-l", fixture]).trim().replace(/\s+/g, " "),
+      "wc -l over a file",
+    );
     assertEquals(
       (await box(["sha512sum", fixture])).out.split(" ")[0],
       sys("sha512sum", [fixture]).split(" ")[0],
@@ -693,8 +700,8 @@ Deno.test("the applets that read several files read all of them", async () => {
   const dir = await Deno.makeTempDir({ prefix: "wac-box-multi-" });
   try {
     const a1 = `${dir}/a.txt`, a2 = `${dir}/b.txt`;
-    await Deno.writeTextFile(a1, "alpha\nbeta\n");
-    await Deno.writeTextFile(a2, "gamma\ndelta\n");
+    await Deno.writeTextFile(a1, "alpha\nbeta\ngamma\n");
+    await Deno.writeTextFile(a2, "delta\nepsilon\n");
     const runner = await appRunner(BOX, { read: true });
     const sys = (cmd: string, args: string[]) => {
       const r = new Deno.Command(cmd, { args, stdout: "piped", stderr: "null" }).outputSync();
@@ -709,6 +716,11 @@ Deno.test("the applets that read several files read all of them", async () => {
       // `-f` with a delimiter, because box's `cut` is field-based only — `-c` prints a usage and
       // exits 2, which is its own gap and not this test's subject.
       ["cut", "cut", ["-f1", "-d", " "]],
+      ["sort", "sort", []],
+      // `tac` reverses **each file**, in the order named — not the concatenation. The two differ only
+      // when a file's lines are not a palindrome, which the fixture above is, so these lines are not.
+      ["tac", "tac", []],
+      ["strings", "strings", []],
     ] as [string, string, string[]][]) {
       const got = await runner.run([applet, ...flags, a1, a2]);
       assertEquals(got.out, sys(cmd, [...flags, a1, a2]), `${applet} over two files`);
@@ -721,6 +733,31 @@ Deno.test("the applets that read several files read all of them", async () => {
     // more lines" and cannot distinguish "that file would not open", so the first version of this printed
     // the first file and exited 0 with the error on stderr — the bug the whole issue is about, one level
     // up, in the fix for it.
+    // And the ones the real tools give a *single* operand must not have grown a second one: `base64`,
+    // `base32`, `shuf` and `tr` all answer "extra operand" in GNU, so multi-file support for them would be
+    // an incompatibility invented here. I converted all four before checking, and the comparison is what
+    // said so — see 0096.
+    for (const [applet, cmd] of [["base64", "base64"], ["base32", "base32"], ["shuf", "shuf"]]) {
+      const got = await runner.run([applet, a1, a2]);
+      const real = new Deno.Command(cmd, { args: [a1, a2], stdout: "null", stderr: "null" }).outputSync();
+      assertEquals(got.code !== 0, real.code !== 0, `${applet} should refuse two operands as ${cmd} does`);
+    }
+
+    // `wc` is its own shape: a line per file, a `total` when there is more than one, and the filename on
+    // every line. It used to print the first file's counts and nothing else — and with `-l`, `-w` or `-c`
+    // it dropped the filename too, on a comment claiming that is what the real one does. It is not: the
+    // label goes with the file, and only reading standard input drops it.
+    const norm = (t: string) => t.split("\n").map((l) => l.trim().replace(/\s+/g, " ")).join("\n");
+    for (const flags of [[], ["-l"], ["-w"], ["-c"]]) {
+      for (const files of [[a1], [a1, a2]]) {
+        const got = await runner.run(["wc", ...flags, ...files]);
+        const real = new Deno.Command("wc", { args: [...flags, ...files], stdout: "piped", stderr: "null" })
+          .outputSync();
+        assertEquals(norm(got.out), norm(new TextDecoder().decode(real.stdout)),
+          `wc ${flags.join(" ")} over ${files.length} file(s)`);
+      }
+    }
+
     const missing = await runner.run(["nl", a1, `${dir}/nope.txt`]);
     assertEquals(missing.code, 1, `a missing operand should fail, got ${missing.code}`);
     assertEquals(missing.err.includes("nope.txt"), true, missing.err);

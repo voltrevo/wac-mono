@@ -8,12 +8,12 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, readInput } from "../lib/input.wac";
+import { Input, readAll } from "../lib/input.wac";
 import { withNewline } from "../lib/bytes.wac";
 import { encode, SET_COMPONENT } from "../../../url/src/percent.wac";
 
 export i32 urlencode(Core core, Cli cli, Args a) {
-  Input in = readInput(core, cli, a, 0);
+  Input in = readAll(core, cli, a, 0);
   if (!in.ok) { return 1; }
   cli.write(withNewline(encode(trimNewline(in.bytes), SET_COMPONENT())));
   return 0;

@@ -5,9 +5,10 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Chunk, Input, openStream, nextChunk } from "../lib/input.wac";
+import { Chunk, Input, openStream, nextChunk, tooManyOperands } from "../lib/input.wac";
 
 export i32 tr(Core core, Cli cli, Args a) {
+  if (tooManyOperands(core, a, 3)) { return 1; }
   if (a.rest.len() < 2) { core.warn("usage: " + a.name + " <set1> <set2> [file]"); return 2; }
   u8[] from = expand(a.rest[0].toBytes());
   u8[] to = expand(a.rest[1].toBytes());

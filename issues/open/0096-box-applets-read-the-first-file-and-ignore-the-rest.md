@@ -83,3 +83,29 @@ Using the program by hand again, this time with arguments a person mistypes rath
 Both fixed cases are now in `test/box.test.ts`, along with multi-file cases for `cat`, `nl`, `rev`, `fold`
 and `cut`. **Nothing in the suite passed a zero or a second file before this**, which is why a loop that
 never terminates lived in a program with 33 passing tests.
+
+
+## The three answers, and which applet gets which — agent-a, 2026-08-07
+
+Converting them one batch at a time made it clear this is not one question but three, and the real tool
+decides which:
+
+1. **Read them all.** `cat`, `nl`, `cut`, `rev`, `fold` (streaming, through `Reader`/`nextSpan`), `sort`,
+   `strings` (whole-input, through `readAll`). Done, each compared against the real one on two files.
+2. **Read each, separately.** `tac` — it reverses *each file* in the order named, not the concatenation.
+   The two answers differ only when a file's lines are not a palindrome, and the first fixture I used was
+   one, so the wrong version looked right. Done.
+3. **Refuse the extra.** `base64`, `base32`, `shuf`, `tr` answer "extra operand" in GNU, and `uniq`'s
+   second operand is an *output file*. I converted all four to read several before checking, which would
+   have invented an incompatibility — and reverting them restored the original silent truncation, which is
+   worse. `tooManyOperands` is the third answer, and it is what the real ones do.
+
+**`wc` is done**, and it was the first of the presentation group: a line per file, a `total` when there is
+more than one, and the filename on every line. It also had a second bug that a *test* was hiding — the
+assertion compared `sys("wc", ["-l", f]).split(/\s+/)[0]`, throwing away the filename before comparing, so
+the applet's dropping it was invisible. The applet's own comment claimed "no label when exactly one of
+-l -w -c is asked for, as the real one does", which is what `wc -l < f` does. The label goes with the
+file; standard input is what has no name to print.
+
+Still to do: `grep` (a `file:` prefix when there is more than one), `head` and `tail` (`==> name <==`
+banners), `sha256sum`/`sha512sum` (a line each), `crc32`.

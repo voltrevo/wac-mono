@@ -5,12 +5,13 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
-import { Input, openStream } from "../lib/input.wac";
+import { Input, openStream, tooManyOperands } from "../lib/input.wac";
 import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
 import { cmpBytes } from "../lib/lines.wac";
 import { itoa } from "../../../fmt/src/itoa.wac";
 
 export i32 uniq(Core core, Cli cli, Args a) {
+  if (tooManyOperands(core, a, 1)) { return 1; }
   Input in = openStream(core, cli, a, 0);
   if (!in.ok) { return 1; }
   bool counting = has(a, 'c');
