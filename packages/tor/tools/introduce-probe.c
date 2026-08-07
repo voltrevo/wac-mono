@@ -82,17 +82,44 @@ setup(void)
   }
 }
 
-/** One IPv4 link specifier, so the encrypted section carries a realistic list. */
+/** The link specifiers a real client sends: where the rendezvous point is, and who it is.
+ *
+ * Three entries rather than one. A single IPv4 entry was enough to test a *parser* — the list is
+ * opaque to it — and is not enough to test anything that has to act on the result: tor's own
+ * `hs_get_extend_info_from_lspecs` requires the legacy identity and refuses a list without it, so a
+ * fixture carrying only an address names a rendezvous point tor itself would decline to use. The
+ * ed25519 identity is optional in that function and is included because a real client includes it.
+ */
 static smartlist_t *
 one_link_specifier(void)
 {
   smartlist_t *lst = smartlist_new();
+
   link_specifier_t *ls = link_specifier_new();
   link_specifier_set_ls_type(ls, LS_IPV4);
   link_specifier_set_un_ipv4_addr(ls, 0x7f000001);   /* 127.0.0.1 */
   link_specifier_set_un_ipv4_port(ls, 9001);
   link_specifier_set_ls_len(ls, 6);
   smartlist_add(lst, ls);
+
+  /* The RSA identity digest, 20 bytes. Fixed rather than random so the fixture is reproducible. */
+  link_specifier_t *legacy = link_specifier_new();
+  link_specifier_set_ls_type(legacy, LS_LEGACY_ID);
+  link_specifier_set_ls_len(legacy, 20);
+  for (int i = 0; i < 20; i++) {
+    link_specifier_getarray_un_legacy_id(legacy)[i] = (uint8_t)(0xA0 + i);
+  }
+  smartlist_add(lst, legacy);
+
+  /* And the ed25519 identity, 32 bytes — optional to tor, sent by every real client. */
+  link_specifier_t *ed = link_specifier_new();
+  link_specifier_set_ls_type(ed, LS_ED25519_ID);
+  link_specifier_set_ls_len(ed, 32);
+  for (int i = 0; i < 32; i++) {
+    link_specifier_getarray_un_ed25519_id(ed)[i] = (uint8_t)(0x40 + i);
+  }
+  smartlist_add(lst, ed);
+
   return lst;
 }
 

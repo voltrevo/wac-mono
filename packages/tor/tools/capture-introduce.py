@@ -101,8 +101,13 @@ def main(argv):
                 clientPublic=client_pk.hex(),
                 rendCookie=cookie.hex(),
                 rendOnionKey=onion_pk.hex(),
-                # One IPv4 link specifier for 127.0.0.1:9001, which the probe puts in every cell.
-                linkSpecifiers="0100067f0000012329",
+                # What the probe puts in every cell: the rendezvous point's address, its RSA
+                # identity digest and its ed25519 identity — the list a real client sends, and the
+                # one tor's own hs_get_extend_info_from_lspecs will accept. An address alone parses
+                # and names a rendezvous point tor would decline to use.
+                linkSpecifiers=("0300067f0000012329"
+                                "0214" + "".join(f"{0xA0 + i:02x}" for i in range(20)) +
+                                "0320" + "".join(f"{0x40 + i:02x}" for i in range(32))),
                 cell=cell.hex(),
             ))
 

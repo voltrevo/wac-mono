@@ -57,7 +57,11 @@ for (const c of v.cases) {
   if (cell.length < 200) {
     throw new Error(`cell is ${cell.length} bytes — too short to carry the padding this pins`);
   }
-  if (specs.length > 32) throw new Error("the link specifier list should be one small entry");
+  // Three entries — address, RSA identity, ed25519 identity — which is what a real client sends and
+  // what tor's own `hs_get_extend_info_from_lspecs` requires. A one-entry list parses identically and
+  // names a rendezvous point tor would decline to use, so a fixture that shrank back to one would
+  // quietly stop exercising anything that acts on the result.
+  if (specs[0] < 3) throw new Error("the link specifier list should carry an identity, not just an address");
 }
 
 function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {

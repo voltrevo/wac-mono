@@ -1,0 +1,227 @@
+// A service answering one INTRODUCE2 that C tor built.
+//
+// Each piece is pinned elsewhere. What is checked here is the **order**, because three of the steps
+// are placed where they are for reasons invisible from the step itself, and every one of those
+// placements is observable if you pick the input carefully.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  INTRO2_BAD_RENDEZVOUS, INTRO2_COOKIE_SEEN, INTRO2_NO_KEYS, INTRO2_OK, INTRO2_REPLAYED,
+  INTRO2_UNREADABLE, Introduction, handleIntroduce2,
+} from "../../src/hsintroduce.wac";
+import { ReplayCache, cookieReplayCache, introReplayCache } from "../../src/hsreplay.wac";
+import { REND_OK } from "../../src/hsrendpoint.wac";
+import { serviceRendezvousKeys } from "../../src/hsntor.wac";
+import { x25519Base } from "../../../crypto/src/x25519.wac";
+
+const i32 I_COUNT = 0;
+const i32 I_CELL = 1;
+const i32 I_ENC_SECRET = 2;
+const i32 I_SUBCRED = 3;
+const i32 I_AUTH_KEY = 4;
+const i32 I_COOKIE = 5;
+
+const i64 NOW = 1785931200;
+
+u8[] none() { return u8[0](); }
+
+u8[] at(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
+}
+
+/** A service ephemeral secret. Clamped, and fixed so a failure is reproducible. */
+u8[] ephemeral() {
+  u8[] s = u8[32]();
+  for (i32 i = 0; i < 32; i++) { s[i] = (i * 37 + 11) & 0xFF; }
+  s[0] = s[0] & 248;
+  s[31] = (s[31] & 127) | 64;
+  return s;
+}
+
+/**
+ * The whole answer, from tor's cell to the cell we would send back.
+ *
+ * `allowPrivate` is true because the cells come from chutney and name 127.0.0.1 — which is the
+ * configuration a test network runs in, and is checked in both directions below.
+ */
+export string test_one_introduction_end_to_end(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  i32 n = ref(I_COUNT, none(), none())[0];
+  t.isTrue(n >= 1, "there is a cell tor built");
+
+  for (i32 i = 0; i < n; i++) {
+    Introduction got = handleIntroduce2(
+      ref(I_CELL, at(i), none()), ref(I_AUTH_KEY, at(i), none()), ref(I_ENC_SECRET, at(i), none()),
+      ref(I_SUBCRED, at(i), none()), ephemeral(), introReplayCache(8), cookieReplayCache(8), NOW,
+      true);
+
+    t.eqI32(got.error, INTRO2_OK, "tor's own INTRODUCE2 is answered");
+    t.eqI32(got.rendezvous.error, REND_OK, "the rendezvous point resolves");
+    t.eqI32(got.rendezvous.port, 9001, "at the port the client named");
+    t.eqI32(got.rendezvous.address[0], 127, "and the address");
+
+    // RENDEZVOUS1 is the cookie the client chose, then our ephemeral public key and AUTH.
+    t.eqI32(got.rendezvous1.len(), 84, "the cell is a 20-byte cookie and a 64-byte handshake");
+    t.eqBytes(slice(got.rendezvous1, 0, 20), ref(I_COOKIE, at(i), none()),
+              "and it opens with the client's own cookie, which is how the rendezvous point pairs it");
+    // The 64 bytes between the cookie and the end are `Y | AUTH`, and both halves are checkable
+    // here because each is pinned on its own elsewhere: the ephemeral public key is a base
+    // multiplication, and `serviceRendezvousKeys` is pinned against tor's own hs-ntor vectors. What
+    // is being tested is the **assembly** — which half goes where — and nothing about the cell's
+    // length or its cookie can see that. Two planted faults, swapping AUTH for the key seed and
+    // sending the client's key instead of ours, survived until this assertion existed.
+    u8[] keys = serviceRendezvousKeys(ref(I_AUTH_KEY, at(i), none()),
+                                      ref(I_ENC_SECRET, at(i), none()), ephemeral(),
+                                      got.clientPublic);
+    t.eqI32(keys.len(), 64, "the responder produced keys");
+    t.eqBytes(slice(got.rendezvous1, 20, 52), x25519Base(ephemeral()),
+              "the handshake opens with our ephemeral public key, not the client's");
+    t.eqBytes(slice(got.rendezvous1, 52, 84), slice(keys, 0, 32),
+              "and ends with AUTH, which is the first half of the responder's output");
+    t.eqBytes(got.keySeed, slice(keys, 32, 64),
+              "while the key seed is the second half and stays here");
+    t.eqI32(got.keySeed.len(), 32, "the seed for the joined circuit's keys comes back separately");
+    t.eqI32(got.clientPublic.len(), 32, "as does the client's ephemeral key");
+  }
+  return t.report();
+}
+
+/**
+ * A replay is refused **before** the MAC is verified.
+ *
+ * Observable, and this is the input that makes it so: replay the same cell with a *wrong* encryption
+ * secret. If the parse came first the MAC would fail and the answer would be `UNREADABLE`; because
+ * the replay cache is consulted first, the answer is `REPLAYED` and no handshake was computed. That
+ * ordering is what stops a replayed cell costing a curve25519 operation.
+ */
+export string test_a_replay_is_refused_before_any_crypto(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  ReplayCache cells = introReplayCache(8);
+  ReplayCache cookies = cookieReplayCache(8);
+  u8[] cell = ref(I_CELL, at(0), none());
+  u8[] auth = ref(I_AUTH_KEY, at(0), none());
+  u8[] secret = ref(I_ENC_SECRET, at(0), none());
+  u8[] subcred = ref(I_SUBCRED, at(0), none());
+
+  t.eqI32(handleIntroduce2(cell, auth, secret, subcred, ephemeral(), cells, cookies, NOW, true).error,
+          INTRO2_OK, "the first arrival is answered");
+
+  u8[] wrongSecret = u8[32]();
+  for (i32 i = 0; i < 32; i++) { wrongSecret[i] = secret[i]; }
+  wrongSecret[1] = wrongSecret[1] ^ 1;
+  t.eqI32(handleIntroduce2(cell, auth, wrongSecret, subcred, ephemeral(), cells, cookies, NOW,
+                           true).error,
+          INTRO2_REPLAYED,
+          "the second is a replay, decided before the key that would have failed was used");
+
+  // And a cell we could not read is still remembered, so retrying it is cheap the second time too.
+  ReplayCache fresh = introReplayCache(8);
+  u8[] garbage = u8[200](fill: 7);
+  t.eqI32(handleIntroduce2(garbage, auth, secret, subcred, ephemeral(), fresh, cookies, NOW,
+                           true).error,
+          INTRO2_UNREADABLE, "nonsense with a parseable header is unreadable");
+  t.eqI32(handleIntroduce2(garbage, auth, secret, subcred, ephemeral(), fresh, cookies, NOW,
+                           true).error,
+          INTRO2_REPLAYED, "and the second time it is not even read");
+  return t.report();
+}
+
+/**
+ * The same cookie through a different introduction point is a client retrying.
+ *
+ * tor's comment is that this is usually not an attack: a client whose introduction circuit timed out
+ * sends a new INTRODUCE1 with the same rendezvous cookie, and the service may already be building
+ * that circuit. Modelled by a fresh cell cache — a different introduction point — and the service's
+ * one cookie cache, which is the pair of scopes that makes this case distinguishable at all.
+ */
+export string test_the_same_cookie_again_is_dropped(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  ReplayCache cookies = cookieReplayCache(8);
+  u8[] cell = ref(I_CELL, at(0), none());
+  u8[] auth = ref(I_AUTH_KEY, at(0), none());
+  u8[] secret = ref(I_ENC_SECRET, at(0), none());
+  u8[] subcred = ref(I_SUBCRED, at(0), none());
+
+  t.eqI32(handleIntroduce2(cell, auth, secret, subcred, ephemeral(), introReplayCache(8), cookies,
+                           NOW, true).error,
+          INTRO2_OK, "the first introduction is answered");
+  t.eqI32(handleIntroduce2(cell, auth, secret, subcred, ephemeral(), introReplayCache(8), cookies,
+                           NOW, true).error,
+          INTRO2_COOKIE_SEEN,
+          "the same rendezvous arriving elsewhere is dropped — we are already building it");
+
+  // The cookie cache forgets after five minutes, so the same cookie much later is a new attempt
+  // rather than a retry in flight, and gets a circuit of its own.
+  t.eqI32(handleIntroduce2(cell, auth, secret, subcred, ephemeral(), introReplayCache(8), cookies,
+                           NOW + 3600, true).error,
+          INTRO2_OK, "an hour later it is a new attempt");
+  return t.report();
+}
+
+/**
+ * A rendezvous point we will not connect to, and the order that check sits in.
+ *
+ * The cells name 127.0.0.1, so refusing private addresses refuses tor's own cells — which is the
+ * right answer off a test network and is why `allowPrivate` is a parameter rather than a constant.
+ * The check is after the parse: unreadable bytes are unreadable, not a bad rendezvous point, because
+ * until the MAC verifies there are no link specifiers to have an opinion about.
+ */
+export string test_where_the_client_wants_to_meet(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] cell = ref(I_CELL, at(0), none());
+  u8[] auth = ref(I_AUTH_KEY, at(0), none());
+  u8[] secret = ref(I_ENC_SECRET, at(0), none());
+  u8[] subcred = ref(I_SUBCRED, at(0), none());
+
+  Introduction refused = handleIntroduce2(cell, auth, secret, subcred, ephemeral(),
+                                          introReplayCache(8), cookieReplayCache(8), NOW, false);
+  t.eqI32(refused.error, INTRO2_BAD_RENDEZVOUS,
+          "on a real network a loopback rendezvous point is refused");
+  t.eqI32(refused.rendezvous1.len(), 0, "and nothing is sent");
+  t.eqI32(refused.clientPublic.len(), 32,
+          "though the client key is still reported — the cell was read, it was the address we refused");
+
+  t.eqI32(handleIntroduce2(u8[200](fill: 7), auth, secret, subcred, ephemeral(), introReplayCache(8),
+                           cookieReplayCache(8), NOW, false).error,
+          INTRO2_UNREADABLE, "while a cell that does not verify is unreadable, not a bad address");
+  return t.report();
+}
+
+/** What cannot be answered at all. */
+export string test_what_is_refused(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] cell = ref(I_CELL, at(0), none());
+  u8[] auth = ref(I_AUTH_KEY, at(0), none());
+  u8[] secret = ref(I_ENC_SECRET, at(0), none());
+  u8[] subcred = ref(I_SUBCRED, at(0), none());
+
+  t.eqI32(handleIntroduce2(u8[0](), auth, secret, subcred, ephemeral(), introReplayCache(8),
+                           cookieReplayCache(8), NOW, true).error,
+          INTRO2_UNREADABLE, "an empty cell has no encrypted section to remember");
+  t.eqI32(handleIntroduce2(u8[40](), auth, secret, subcred, ephemeral(), introReplayCache(8),
+                           cookieReplayCache(8), NOW, true).error,
+          INTRO2_UNREADABLE, "nor does a short one");
+
+  // A service ephemeral secret that is not one. The handshake produces nothing and no cell is built,
+  // rather than a cell built around an empty key.
+  t.eqI32(handleIntroduce2(cell, auth, secret, subcred, u8[31](), introReplayCache(8),
+                           cookieReplayCache(8), NOW, true).error,
+          INTRO2_NO_KEYS, "and a service key that is not a key answers nothing");
+
+  // Another service's subcredential: the MAC is over a key derived from it, so this is unreadable.
+  u8[] otherSub = u8[32]();
+  for (i32 i = 0; i < 32; i++) { otherSub[i] = subcred[i]; }
+  otherSub[0] = otherSub[0] ^ 1;
+  t.eqI32(handleIntroduce2(cell, auth, secret, otherSub, ephemeral(), introReplayCache(8),
+                           cookieReplayCache(8), NOW, true).error,
+          INTRO2_UNREADABLE, "and a cell for another service is not ours to answer");
+  return t.report();
+}
+
+u8[] slice(u8[] b, i32 from, i32 to) {
+  u8[] out = u8[to - from]();
+  for (i32 i = from; i < to; i++) { out[i - from] = b[i]; }
+  return out;
+}
