@@ -693,8 +693,8 @@ Deno.test("the applets that read several files read all of them", async () => {
   const dir = await Deno.makeTempDir({ prefix: "wac-box-multi-" });
   try {
     const a1 = `${dir}/a.txt`, a2 = `${dir}/b.txt`;
-    await Deno.writeTextFile(a1, "alpha\nbeta\n");
-    await Deno.writeTextFile(a2, "gamma\ndelta\n");
+    await Deno.writeTextFile(a1, "alpha\nbeta\ngamma\n");
+    await Deno.writeTextFile(a2, "delta\nepsilon\n");
     const runner = await appRunner(BOX, { read: true });
     const sys = (cmd: string, args: string[]) => {
       const r = new Deno.Command(cmd, { args, stdout: "piped", stderr: "null" }).outputSync();
@@ -709,6 +709,11 @@ Deno.test("the applets that read several files read all of them", async () => {
       // `-f` with a delimiter, because box's `cut` is field-based only — `-c` prints a usage and
       // exits 2, which is its own gap and not this test's subject.
       ["cut", "cut", ["-f1", "-d", " "]],
+      ["sort", "sort", []],
+      // `tac` reverses **each file**, in the order named — not the concatenation. The two differ only
+      // when a file's lines are not a palindrome, which the fixture above is, so these lines are not.
+      ["tac", "tac", []],
+      ["strings", "strings", []],
     ] as [string, string, string[]][]) {
       const got = await runner.run([applet, ...flags, a1, a2]);
       assertEquals(got.out, sys(cmd, [...flags, a1, a2]), `${applet} over two files`);
@@ -721,6 +726,16 @@ Deno.test("the applets that read several files read all of them", async () => {
     // more lines" and cannot distinguish "that file would not open", so the first version of this printed
     // the first file and exited 0 with the error on stderr — the bug the whole issue is about, one level
     // up, in the fix for it.
+    // And the ones the real tools give a *single* operand must not have grown a second one: `base64`,
+    // `base32`, `shuf` and `tr` all answer "extra operand" in GNU, so multi-file support for them would be
+    // an incompatibility invented here. I converted all four before checking, and the comparison is what
+    // said so — see 0096.
+    for (const [applet, cmd] of [["base64", "base64"], ["base32", "base32"], ["shuf", "shuf"]]) {
+      const got = await runner.run([applet, a1, a2]);
+      const real = new Deno.Command(cmd, { args: [a1, a2], stdout: "null", stderr: "null" }).outputSync();
+      assertEquals(got.code !== 0, real.code !== 0, `${applet} should refuse two operands as ${cmd} does`);
+    }
+
     const missing = await runner.run(["nl", a1, `${dir}/nope.txt`]);
     assertEquals(missing.code, 1, `a missing operand should fail, got ${missing.code}`);
     assertEquals(missing.err.includes("nope.txt"), true, missing.err);

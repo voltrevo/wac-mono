@@ -52,6 +52,52 @@ export Input openStream(Core core, Cli cli, Args a, i32 n) {
   return Input(false, u8[0](), path);
 }
 
+/**
+ * Refuse more operands than this applet takes, in the words the real one uses.
+ *
+ * Not every tool reads many files: `base64`, `base32`, `shuf` and `tr` answer "extra operand" in GNU, and
+ * `uniq`'s second operand is an *output* file. Reading a second one for them would be an incompatibility
+ * invented here — but so is **ignoring** it, which is what they all did (wac-mono 0096). Refusing is what
+ * is left, and it is what the real ones do.
+ *
+ * Returns true when the caller should stop, having already reported why.
+ */
+export bool tooManyOperands(Core core, Args a, i32 most) {
+  if (a.rest.len() <= most) { return false; }
+  core.warn(a.name + ": extra operand '" + a.rest[most] + "'");
+  return true;
+}
+
+/**
+ * Every file from operand `n` on, concatenated — or standard input when there are none.
+ *
+ * The whole-input half of `nextSpan`, for the applets that need the bytes all at once: `sort` has to see
+ * every line before it can order them, `json` has to see a whole document. Those read operand `n` and
+ * ignored the rest (wac-mono 0096), so `sort a b` sorted `a` and said nothing about `b`.
+ *
+ * A file that will not open stops it, with the reason already reported — same rule as `Reader`, and the
+ * same difference from GNU, which carries on and exits 1 at the end.
+ */
+export Input readAll(Core core, Cli cli, Args a, i32 n) {
+  i32 files = operandCount(a, n);
+  if (files <= 1) { return readInput(core, cli, a, n); }
+  u8[][] parts = u8[][files](fill: u8[0]());
+  i32 total = 0;
+  for (i32 i = 0; i < files; i++) {
+    Input one = readInput(core, cli, a, n + i);
+    if (!one.ok) { return one; }
+    parts[i] = one.bytes;
+    total = total + one.bytes.len();
+  }
+  u8[] all = u8[total]();
+  i32 at = 0;
+  for (i32 i = 0; i < files; i++) {
+    all.copyFrom(parts[i], 0, at, parts[i].len());
+    at = at + parts[i].len();
+  }
+  return Input(true, all, a.rest[n]);
+}
+
 /** Positional argument `n` names a file; without one, standard input. */
 export Input readInput(Core core, Cli cli, Args a, i32 n) {
   if (a.rest.len() <= n) { return Input(true, cli.readStdin().wait(), ""); }

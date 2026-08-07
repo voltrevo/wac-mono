@@ -2,16 +2,25 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, readInput } from "../lib/input.wac";
+import { Input, operandCount, readInput } from "../lib/input.wac";
 import { joinLines, splitLines } from "../lib/lines.wac";
 
 export i32 tac(Core core, Cli cli, Args a) {
-  Input in = readInput(core, cli, a, 0);
-  if (!in.ok) { return 1; }
-  u8[][] lines = splitLines(in.bytes);
-  i32 n = lines.len();
-  u8[][] out = u8[][n](fill: u8[0]());
-  for (i32 i = 0; i < n; i++) { out[i] = lines[n - 1 - i]; }
-  cli.write(joinLines(out, n));
+  // **Each file reversed, in the order they were named** — not the concatenation reversed. `tac a b`
+  // prints `a` backwards and then `b` backwards, which is what the real one does and is not what
+  // "reverse the input" would give you. Measured against it: reversing the join puts `b`'s lines first,
+  // and the difference is invisible on a file whose lines happen to be a palindrome, which is exactly the
+  // fixture I first tried it on.
+  i32 files = operandCount(a, 0);
+  i32 count = files == 0 ? 1 : files;
+  for (i32 f = 0; f < count; f++) {
+    Input in = readInput(core, cli, a, f);
+    if (!in.ok) { return 1; }
+    u8[][] lines = splitLines(in.bytes);
+    i32 n = lines.len();
+    u8[][] out = u8[][n](fill: u8[0]());
+    for (i32 i = 0; i < n; i++) { out[i] = lines[n - 1 - i]; }
+    cli.write(joinLines(out, n));
+  }
   return 0;
 }

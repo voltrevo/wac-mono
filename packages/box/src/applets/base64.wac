@@ -2,11 +2,12 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, readInput } from "../lib/input.wac";
+import { Input, readInput, tooManyOperands } from "../lib/input.wac";
 import { withNewline } from "../lib/bytes.wac";
 import { encode as b64, ALPHABET_STANDARD } from "../../../codec/src/base64.wac";
 
 export i32 base64(Core core, Cli cli, Args a) {
+  if (tooManyOperands(core, a, 1)) { return 1; }
   Input in = readInput(core, cli, a, 0);
   if (!in.ok) { return 1; }
   cli.write(withNewline(b64(in.bytes, ALPHABET_STANDARD(), true)));

@@ -7,11 +7,11 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
-import { Input, readInput } from "../lib/input.wac";
+import { Input, readAll } from "../lib/input.wac";
 import { cmpBytes, cmpNumeric, cmpNumericThenBytes, joinLines, mergeSortWith, splitLines } from "../lib/lines.wac";
 
 export i32 sort(Core core, Cli cli, Args a) {
-  Input in = readInput(core, cli, a, 0);
+  Input in = readAll(core, cli, a, 0);
   if (!in.ok) { return 1; }
   bool reverse = has(a, 'r');
   bool unique = has(a, 'u');
