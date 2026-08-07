@@ -387,8 +387,8 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
 
-Known holes that are not steps: a relay extending to *its own* port still fails in the uninstrumented
-VERSIONS exchange.
+Known holes that are not steps: **none of the ones this list carried.** The self-extend was not a
+handshake bug — see below.
 
 **`certsCount` and `certsCell` have been introduced** (2026-08-07). They agree, and five planted
 faults across the pair are caught. Both ends were already live against C tor separately — the parser
@@ -2000,3 +2000,36 @@ wrong, not the directory* — which is the strictly-greater rule working exactly
 caller being wrong. It counts seconds into the time period now, as tor does. **tor encrypts that
 counter and we do not**, which publishes when the service last updated; recorded in `INTEROP.md` as a
 difference rather than left to be discovered.
+
+### The self-extend was never a handshake bug
+
+This document carried it for days as the last unexplained failure: a relay asked to extend to
+`127.0.0.1:5555`, **its own port**, failed somewhere in a VERSIONS exchange nobody had instrumented,
+and the note read *a relay extending to itself is the case to look at, and tor is entitled to ask for
+it*.
+
+tor is entitled to ask. The answer is no. `connection_or_connect`:
+
+    if (server_mode(options) && router_digest_is_me(id_digest)) {
+      log_info(LD_PROTOCOL,"Client asked me to connect to myself. Refusing.");
+      return NULL;
+    }
+
+and again for the ed25519 identity. **A relay never connects to itself**, so everything the handshake
+did was downstream of a connection that should never have been opened. Instrumenting it — the obvious
+next move, and the one this document had queued — would have produced a precise description of a
+symptom.
+
+`mayExtendTo` is the refusal, and the relay now makes it before dialling. What it costs to get wrong
+in the other direction is why the test has one-byte-apart cases on both ends of the digest: a
+comparison that stopped early would refuse *strangers*, and a relay that cannot be extended through
+looks like a relay that is unreachable.
+
+**Still not checked, and tor does check it:** extending back to the *previous* hop, which tor refuses
+by both identities as a circular-path defence. Our relay does not retain the identity of the party a
+circuit arrived from, so there is nothing to compare against yet. Recorded here rather than left out,
+because the two rules are the same family and only one of them is done.
+
+The general lesson is the one this project keeps paying for from the other side. **A missing refusal
+presents as a broken mechanism.** The failure was real, the component it appeared in was innocent, and
+the fix was upstream of everything anyone was looking at.

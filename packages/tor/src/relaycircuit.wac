@@ -274,6 +274,31 @@ export u8[] extendTarget(u8[] linkSpecifiers) {
 }
 
 /** The 20-byte legacy identity a link specifier list names, or empty. */
+/**
+ * Whether a relay may act on this EXTEND2 at all, given its own identity.
+ *
+ * **A relay never connects to itself.** tor's `connection_or_connect` refuses outright — *"Client
+ * asked me to connect to myself. Refusing."* — and refuses again on the ed25519 identity. Trying it
+ * opens a connection to your own listener and runs a link handshake against yourself: a circular path
+ * with nothing at the end, and a way for one client's cell to cost a relay two connections and a
+ * circuit.
+ *
+ * An EXTEND2 carrying **no** legacy identity is not refused here. It is refused later, by
+ * `parseExtend2` and by the handshake, for not naming who to expect — and returning "may not extend"
+ * for a cell that named nobody would conflate *asked for something forbidden* with *asked for nothing*.
+ *
+ * **Not checked, and tor does check it:** extending back to the *previous* hop, which tor refuses by
+ * both identities as a circular-path defence. Our relay does not retain the identity of the party a
+ * circuit arrived from, so the check has nothing to compare against yet.
+ */
+export bool mayExtendTo(u8[] linkSpecifiers, u8[] ourFingerprint) {
+  u8[] wants = extendIdentity(linkSpecifiers);
+  if (wants.len() != 20 || ourFingerprint.len() != 20) { return true; }
+  i32 diff = 0;
+  for (i32 i = 0; i < 20; i++) { diff = diff | (wants[i] ^ ourFingerprint[i]); }
+  return diff != 0;
+}
+
 export u8[] extendIdentity(u8[] linkSpecifiers) {
   if (linkSpecifiers.len() < 1) { return u8[0](); }
   i32 n = linkSpecifiers[0];

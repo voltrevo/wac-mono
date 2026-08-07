@@ -88,7 +88,8 @@ import {
 } from "./relaycert.wac";
 import { relayHandshakeReply, responderVersion, netinfoOtherAddress } from "./relaylink.wac";
 import {
-  Begin, Created, Extend, Inbound, answerCreate2, parseBegin, answerCreateFast, destroyCell, extendTarget,
+  Begin, Created, Extend, Inbound, answerCreate2, parseBegin, answerCreateFast, destroyCell,
+  extendTarget, mayExtendTo,
   extended2Body, parseExtend2, receiveFromClient, sendToClient,
   DESTROY_INTERNAL, DESTROY_NONE, DESTROY_PROTOCOL, DESTROY_RESOURCELIMIT,
 } from "./relaycircuit.wac";
@@ -1406,6 +1407,23 @@ Extended extendCircuit(Core core, Cli cli, u8[] extendBody, Identity id) {
   u8[] target = extendTarget(want.linkSpecifiers);
   if (target.len() != 6) {
     core.warn("relayd:   the EXTEND2 named no IPv4 address we can reach");
+    return bad;
+  }
+
+  // **Never extend to ourselves.** tor's `connection_or_connect` refuses outright —
+  // *"Client asked me to connect to myself. Refusing."* — and does the same for the ed25519 identity.
+  // A relay that tried it would open a connection to its own listener and run a link handshake with
+  // itself, which is a circular path with nothing at the end of it and a way to make a relay spend
+  // two connections and a circuit on one client's request.
+  //
+  // design/0002 carried this as an unexplained handshake bug for days: one relay asked to extend to
+  // `127.0.0.1:5555`, its own port, failed somewhere in an uninstrumented VERSIONS exchange, and the
+  // note said *a relay extending to itself is the case to look at, and tor is entitled to ask for it*.
+  // tor is entitled to ask; the answer is no. Whatever the handshake did was downstream of a
+  // connection that should never have been opened, and instrumenting it would have described a
+  // symptom.
+  if (!mayExtendTo(want.linkSpecifiers, id.fingerprint)) {
+    core.warn("relayd:   asked to extend to ourselves; refusing");
     return bad;
   }
   string host = itoa(target[0]) + "." + itoa(target[1]) + "." + itoa(target[2]) + "." +
