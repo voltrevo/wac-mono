@@ -641,8 +641,30 @@ with stdout byte-identical to the microdesc consensus the authority was holding.
 against relays —
 it knows about processes and ready markers, not about Tor, and a launcher test that stood up three
 relays would fail whenever anything in the stack did. **The Tor network is not stood up by the
-suite**, because the ports a relay listens on are baked into its signed descriptor and two agents
-running the suite at once would collide on them. Run the recipe above by hand.
+suite.** Run the recipe above by hand.
+
+Two things stand between here and a suite that does stand it up, and one of them has just moved.
+
+**Ports, which used to be the blocker, no longer are.** A relay's port is baked into its signed
+descriptor, so the recipe used fixed ones, and two agents running a network at once collided on them
+— this happened three times in one session, each time as three stale relays holding 5551-5553 while
+the new ones logged `Address already in use` and carried on looking healthy. `relayd -p 0` now asks
+the operating system for a free port, and `--descriptor` writes *after* binding and then keeps
+serving, so the descriptor advertises the port actually bound and the socket is never released in
+between:
+
+    $ relayd seed -p 0 -n wacp0 --descriptor r.desc
+    relayd: listening on 127.0.0.1:32831
+    relayd: wrote a 2112-byte descriptor for port 32831 to r.desc
+    $ grep ^router r.desc
+    router wacp0 127.0.0.1 32831 0 0
+
+**What remains is the order of the bootstrap.** A relay reads its consensus and certificate once, at
+startup, from `-C`/`-K`. But the consensus cannot exist until the relays do — it is built from their
+descriptors, and their descriptors do not name a port until they have bound one. So the harness needs
+either a relay that can be handed its documents after it is already listening, or an authority the
+relays fetch from rather than are given. Until one of those exists the two passes cannot collapse into
+one, whatever the ports do.
 
 ## What is not here
 

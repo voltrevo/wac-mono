@@ -368,25 +368,6 @@ export i32 main(Core core, Cli cli) {
   core.log("relayd: fingerprint " + hex(id.fingerprint));
   core.log("relayd: ntor onion key " + hex(x25519Base(id.onionPrivate)));
 
-  // `--descriptor` writes what an authority should publish about this relay and exits. Separate from
-  // serving because the authority needs the document before the relay is useful, and because the
-  // second prime search should not be paid by a relay that is only serving.
-  if (descriptorOut != "") {
-    core.log("relayd: deriving the TAP onion key a descriptor needs (another moment)");
-    RsaKey tap = deriveTapOnionKey(seed);
-    u8[] desc = ownDescriptor(id, tap, nickname, bind, port, now);
-    if (desc.len() == 0) {
-      core.warn("relayd: could not build a descriptor");
-      return 1;
-    }
-    Change wrote = cli.writeFile(descriptorOut, desc).wait();
-    if (!wrote.ok()) {
-      core.warn("relayd: " + descriptorOut + ": " + wrote.message);
-      return 1;
-    }
-    core.log("relayd: wrote a " + itoa(desc.len()) + "-byte descriptor to " + descriptorOut);
-    return 0;
-  }
 
   // A relay serves directory documents over RELAY_BEGIN_DIR, and a bootstrapping tor asks *any* relay
   // it knows for them — there is no flag that stops it asking, so a relay that cannot answer leaves the
@@ -459,6 +440,36 @@ export i32 main(Core core, Cli cli) {
     return 1;
   }
   core.log("relayd: listening on " + bind + ":" + itoa(listener.port));
+
+  // `--descriptor` writes what an authority should publish about this relay, **after binding**, and
+  // then carries on serving.
+  //
+  // It used to write and exit, taking the port from `-p`. That made `-p 0` — ask the operating system
+  // for a free one — useless here, because the descriptor would advertise port zero and the real port
+  // was released on exit anyway. Fixed ports are then the only option, and two agents running a
+  // network at once collide on them: this session lost three separate runs to a previous batch of
+  // relays still holding 5551-5553 while the new ones logged `Address already in use` and carried on.
+  //
+  // Binding first and keeping the socket removes both problems. The descriptor advertises the port the
+  // relay is actually listening on, whoever chose it, and there is no window between writing and
+  // serving for anyone else to take it.
+  if (descriptorOut != "") {
+    core.log("relayd: deriving the TAP onion key a descriptor needs (another moment)");
+    RsaKey tap = deriveTapOnionKey(seed);
+    u8[] desc = ownDescriptor(id, tap, nickname, bind, listener.port, now);
+    if (desc.len() == 0) {
+      core.warn("relayd: could not build a descriptor");
+      return 1;
+    }
+    Change wrote = cli.writeFile(descriptorOut, desc).wait();
+    if (!wrote.ok()) {
+      core.warn("relayd: " + descriptorOut + ": " + wrote.message);
+      return 1;
+    }
+    core.log("relayd: wrote a " + itoa(desc.len()) + "-byte descriptor for port " +
+             itoa(listener.port) + " to " + descriptorOut);
+  }
+
 
   // Accept and serve at once. The listener's ticket sits in the same `waitAny` as every live
   // connection's, so a relay busy carrying one circuit still answers the relay extending to it — which
