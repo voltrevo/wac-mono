@@ -6,7 +6,7 @@
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
 import { Feed, Line, Lines, Sink, nextLine } from "../../../platform/src/stream.wac";
-import { Input, openStream } from "../lib/input.wac";
+import { Input, openStream, operandCount } from "../lib/input.wac";
 import { itoa } from "../../../fmt/src/itoa.wac";
 import { compile, compileIgnoreCase, search, slotCount } from "../../../regex/src/regex.wac";
 import { Program, BUDGET, NO_MATCH } from "../../../regex/src/program.wac";
@@ -19,42 +19,54 @@ export i32 grep(Core core, Cli cli, Args a) {
   if (prog is null) { core.warn(a.name + ": bad pattern: " + a.rest[0]); return 2; }
   Program p = prog!;
 
-  Input in = openStream(core, cli, a, 1);
-  if (!in.ok) { return 1; }
-
   i32[] caps = i32[slotCount(p)](fill: 0);
   bool invert = has(a, 'v');
   bool number = has(a, 'n');
   bool countOnly = has(a, 'c');
   i32 matches = 0;
-  i32 n = 0;
-  Lines s = Lines.create();
-  Feed fed = Feed.fromStdin(cli);
   Sink out = Sink.create(cli);
-  while (true) {
-    Line l = nextLine(s, fed);
-    if (!l.ok) { break; }
-    n++;
+
+  // Every file named, and **the name in front of every line when there is more than one**, which is what
+  // makes `grep pattern *.c` usable and is what the real one does. It used to search the first file and
+  // say nothing about the others (wac-mono 0096). `-c` counts per file the same way.
+  i32 files = operandCount(a, 1);
+  i32 count = files == 0 ? 1 : files;
+  bool label = files > 1;
+  for (i32 f = 0; f < count; f++) {
+    Input in = openStream(core, cli, a, 1 + f);
+    if (!in.ok) { return 1; }
+    string where = label ? in.label + ":" : "";
+    i32 n = 0;
+    i32 here = 0;
+    Lines s = Lines.create();
+    Feed fed = Feed.fromStdin(cli);
+    while (true) {
+      Line l = nextLine(s, fed);
+      if (!l.ok) { break; }
+      n++;
     i32 found = search(p, l.bytes, 0, caps, 1000000);
     // Three answers, not two. `BUDGET` means the engine gave up backtracking on this line, and
     // testing `!= NO_MATCH()` counted that as a match — so a pathological pattern reported hits it
     // had never found, and `grep -c` counted them. Exiting 2 is what the real one does when it
     // cannot answer, and it is the only honest status: neither "matched" nor "did not match" is
     // known.
-    if (found == BUDGET()) {
-      core.warn(a.name + ": " + itoa(n) + ": pattern too expensive on this line, giving up");
-      return 2;
+      if (found == BUDGET()) {
+        core.warn(a.name + ": " + itoa(n) + ": pattern too expensive on this line, giving up");
+        return 2;
+      }
+      bool hit = found != NO_MATCH();
+      if (hit == invert) { continue; }
+      matches++;
+      here++;
+      if (countOnly) { continue; }
+      string text = string.fromBytes(l.bytes);
+      // Buffered: a pattern that matches most of a large file is one host call per line otherwise, and
+      // each is a park and a wake. Issue 0039.
+      if (!out.line(where + (number ? itoa(n) + ":" + text : text))) { break; }
     }
-    bool hit = found != NO_MATCH();
-    if (hit == invert) { continue; }
-    matches++;
-    if (countOnly) { continue; }
-    string text = string.fromBytes(l.bytes);
-    // Buffered: a pattern that matches most of a large file is one host call per line otherwise, and
-    // each is a park and a wake. Issue 0039.
-    if (!out.line(number ? itoa(n) + ":" + text : text)) { break; }
+    // `-c` prints a count for each file, with the name in front when there is more than one.
+    if (countOnly) { out.line(where + itoa(here)); }
   }
-  if (countOnly) { out.line(itoa(matches)); }
   out.flush();
   return matches > 0 ? 0 : 1;
 }

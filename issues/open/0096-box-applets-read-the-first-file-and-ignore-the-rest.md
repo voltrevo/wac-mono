@@ -110,5 +110,7 @@ file; standard input is what has no name to print.
 **`sha256sum` and `sha512sum` are done** — a line per file, `-` for standard input, matching the real
 ones on one file and on several.
 
-Still to do: `grep` (a `file:` prefix when there is more than one), `head` and `tail` (`==> name <==`
-banners), `crc32`.
+**`grep` is done** — every file, with the name in front of every line once there is more than one, and
+`-c` counting per file rather than in total.
+
+Still to do: `head` and `tail` (`==> name <==` banners), and `crc32`.

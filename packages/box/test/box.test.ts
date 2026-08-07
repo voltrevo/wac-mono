@@ -723,6 +723,11 @@ Deno.test("the applets that read several files read all of them", async () => {
       ["strings", "strings", []],
       ["sha256sum", "sha256sum", []],
       ["sha512sum", "sha512sum", []],
+      // `grep` puts the filename in front of every line once there is more than one file — that prefix is
+      // what makes `grep pattern *.c` usable, and `-c` counts per file rather than in total.
+      ["grep", "grep", ["alpha"]],
+      ["grep", "grep", ["-n", "a"]],
+      ["grep", "grep", ["-c", "a"]],
     ] as [string, string, string[]][]) {
       const got = await runner.run([applet, ...flags, a1, a2]);
       assertEquals(got.out, sys(cmd, [...flags, a1, a2]), `${applet} over two files`);
