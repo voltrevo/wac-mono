@@ -17,7 +17,7 @@
 import { Core, Cli, Change, FileResult } from "../../platform/src/platform.wac";
 import { Buf } from "../../bytes/src/buf.wac";
 import { itoa, itoa64 } from "../../fmt/src/itoa.wac";
-import { encode as hexEncode } from "../../codec/src/hex.wac";
+import { encode as hexEncode, encodeUpper } from "../../codec/src/hex.wac";
 import { rsaFingerprint } from "./routerdesc.wac";
 import { generateRsaKey, RsaKey } from "../../crypto/src/rsagen.wac";
 import { RelayInfo, RelayKeys, descriptorIdentity, routerDescriptor } from "./routerdesc.wac";
@@ -159,6 +159,20 @@ export i32 main(Core core, Cli cli) {
     // The certificate on its own, for the same reason as the consensus below: `relayd -K` and `dird`
     // want the document, not a vector with the document inside it.
     if (!writeWire(core, cli, certOut + ".cert", cert, "authority certificate")) { return 1; }
+    // And the one line a client needs: the fingerprint of the authority it should trust.
+    //
+    // This is the whole basis of a client's trust, which is why `app.wac` takes it as a file the
+    // user chooses rather than reading it out of the directory being checked — a list taken from the
+    // documents it is verifying would make the verification vacuous. That argument is about where the
+    // list comes *from*, not about who types it: on a network generated from scratch, the authority
+    // is whoever this program just made keys for, and nothing else knows the answer.
+    // Unbroken uppercase hex, which is how `authcert.wac` writes it into the certificate and how a
+    // client reads it — a router descriptor spells the same 20 bytes in groups of four, and mixing
+    // the two spellings is a comparison that silently never matches.
+    string fpLine =
+      string.fromBytes(encodeUpper(rsaFingerprint(ak.identityN, ak.identityE))) + "\n";
+    if (!writeWire(core, cli, certOut + ".fingerprint", fpLine.toBytes(),
+                   "authority fingerprint a client should trust")) { return 1; }
 
     // And a vote, when a third path is given. The relay it votes about is the one whose descriptor
     // this run produced, so the whole set is consistent and reproducible from the same seeds.

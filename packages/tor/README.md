@@ -734,8 +734,24 @@ runs rather than a step a human does in between.
 The `now` argument takes `-`, meaning *read the clock*. A plan is written once and run whenever, so a
 timestamp baked into it is a document that expires.
 
-**What remains is the description itself** — which relays, which authority, and what the client is
-asked to fetch. Every mechanism it needs is in place; nothing here is waiting on a decision.
+**And each program now writes down what only it knows.** The client takes two files —
+a *seed line*, `host port identityHex ntorOnionKeyBase64`, and a list of authority fingerprints to
+trust. Every field in both is either a key derived inside a process or a port the operating system
+chose at bind time, so a description written in advance cannot hold any of them and a human copying
+them out of a log is a step rather than a network:
+
+    relayd … --seedline seed.txt     ->  127.0.0.1 38295 45C2B216…AA48 wJjT4NI7…fSI
+    gendesc … cert …                 ->  cert.fingerprint: F4748D52B8375DB5B1E705F3DBEC2814CDAEC884
+
+The fingerprint is unbroken uppercase hex, the spelling `authcert.wac` puts in the certificate and
+the one a client reads. A router descriptor spells the same 20 bytes in groups of four, and mixing
+the two is a comparison that silently never matches.
+
+**What remains is the description itself**, and one ordering problem in it: `run` directives start as
+soon as every node is *listening*, but a relay does not serve directory documents until it has polled
+and found them, up to `DIR_POLL_MS` after the authority writes them. So a client run straight after
+`gendesc` can reach a relay that is up and not yet serving. The launcher needs a way to wait for a
+second marker after a run step, or the client needs to retry. Nothing here is waiting on a decision.
 
 ## What is not here
 
