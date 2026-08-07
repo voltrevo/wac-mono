@@ -402,8 +402,9 @@ export u8[] tlsClientFeed(u8[] state, u8[] input) {
   Writer toSend = Writer.create();
   Writer appData = Writer.create();
 
-  // A connection that has already failed takes no more bytes, and says so by handing the
-  // state back unchanged rather than by aborting.
+  // A connection that is over takes no more bytes, and says so by handing the state back
+  // unchanged rather than by aborting. Over means either of two things, and only one of them
+  // used to be checked here: a **failure**, and a **clean close**.
   //
   // It used to abort. Nothing below expects to run without keys, so a record arriving after
   // a failure reached the decrypt path and trapped — found by fuzzing, with a sequence as
@@ -412,7 +413,15 @@ export u8[] tlsClientFeed(u8[] state, u8[] input) {
   // crash; a peer can cause the failure but not the second call. That is still an
   // undocumented precondition whose penalty is killing the process, which is too sharp an
   // edge to leave on the one function a caller is expected to drive in a loop.
-  if (c.failure != 0) { return result(c, toSend.take(), appData.take()); }
+  //
+  // The clean close was the hole, and unlike the one above **a peer could reach it**. `phase == 4`
+  // with no failure code is what a `close_notify` leaves behind, and a caller feeds whole records in
+  // one call — `packages/box`'s `gets` hands over everything `recordsReady` counted. So a server
+  // sending `close_notify` followed by anything at all in the same flight put both records in one
+  // `tlsClientFeed`: the first set phase 4, the second fell through to a `trap`. The caller checking
+  // the phase between calls, which every caller here does, cannot help — both records are inside one
+  // call. `tlsClientClose` reaches it too, from any phase, which is the cheap way to see it.
+  if (c.failure != 0 || c.phase == 4) { return result(c, toSend.take(), appData.take()); }
 
   i32 pos = 0;
   while (pos < input.len()) {

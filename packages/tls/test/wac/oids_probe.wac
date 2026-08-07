@@ -1,0 +1,45 @@
+// Every OID constant in `../../src/asn1.wac`, so `test/oids.test.ts` can ask the compiled module for the
+// bytes rather than reading them out of the source it is checking.
+//
+// One wrapper per constant, prefixed, because wac has no re-export: an `import` binds the name in this file
+// and an `export` of the same name would collide with it. Adding an OID to `asn1.wac` without adding it
+// here fails the test, which asserts the two lists are the same length.
+import {
+  oidEd25519,
+  oidSubjectAltName,
+  oidBasicConstraints,
+  oidEcPublicKey,
+  oidPrime256v1,
+  oidSecp384r1,
+  oidEcdsaSha256,
+  oidEcdsaSha384,
+  oidRsaEncryption,
+  oidRsaPss,
+  oidRsaSha256,
+  oidRsaSha384,
+  oidRsaSha512,
+  oidKeyUsage,
+  oidExtKeyUsage,
+  oidServerAuth,
+  oidAnyExtKeyUsage,
+  oidNameConstraints,
+} from "../../src/asn1.wac";
+
+export u8[] p_oidEd25519() { return oidEd25519(); }
+export u8[] p_oidSubjectAltName() { return oidSubjectAltName(); }
+export u8[] p_oidBasicConstraints() { return oidBasicConstraints(); }
+export u8[] p_oidEcPublicKey() { return oidEcPublicKey(); }
+export u8[] p_oidPrime256v1() { return oidPrime256v1(); }
+export u8[] p_oidSecp384r1() { return oidSecp384r1(); }
+export u8[] p_oidEcdsaSha256() { return oidEcdsaSha256(); }
+export u8[] p_oidEcdsaSha384() { return oidEcdsaSha384(); }
+export u8[] p_oidRsaEncryption() { return oidRsaEncryption(); }
+export u8[] p_oidRsaPss() { return oidRsaPss(); }
+export u8[] p_oidRsaSha256() { return oidRsaSha256(); }
+export u8[] p_oidRsaSha384() { return oidRsaSha384(); }
+export u8[] p_oidRsaSha512() { return oidRsaSha512(); }
+export u8[] p_oidKeyUsage() { return oidKeyUsage(); }
+export u8[] p_oidExtKeyUsage() { return oidExtKeyUsage(); }
+export u8[] p_oidServerAuth() { return oidServerAuth(); }
+export u8[] p_oidAnyExtKeyUsage() { return oidAnyExtKeyUsage(); }
+export u8[] p_oidNameConstraints() { return oidNameConstraints(); }
