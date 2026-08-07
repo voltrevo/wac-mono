@@ -44,7 +44,7 @@ In dependency order: nothing here imports anything below it.
 | [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 4,008 | 33 | `bytes` `codec` `crypto` `datetime` `fmt` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`lightclient`](packages/lightclient/) | **The Altair sync protocol works. | 642 | 12 | `bls` `ssz` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,551 | 46 | `bytes` `codec` `crypto` `fmt` `platform` `sh` |
-| [`tor`](packages/tor/) | Tor in wac — a client, a relay, a directory authority and an onion-service client, on top of this repo's TLS 1.3 stack. | 14,222 | 268 | `bytes` `codec` `crypto` `datetime` `fmt` `http` `platform` `std` `tls` `wactest` |
+| [`tor`](packages/tor/) | Tor in wac, both ends: a client and SOCKS5 proxy, a relay, a directory authority, an onion-service client, and a test network with no C tor in it. | 14,222 | 268 | `bytes` `codec` `crypto` `datetime` `fmt` `http` `platform` `std` `tls` `wactest` |
 
 ## Programs
 

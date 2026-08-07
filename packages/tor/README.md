@@ -1,6 +1,6 @@
 # tor
 
-Tor in wac — a client, a relay, a directory authority and an onion-service client, on top of this repo's TLS 1.3 stack.
+Tor in wac, both ends: a client and SOCKS5 proxy, a relay, a directory authority, an onion-service client, and a test network with no C tor in it.
 
 Both ends of the protocol, in other words. The package started as a client and the name stuck, but
 what is here now is most of a small Tor network and the tools to stand one up:
