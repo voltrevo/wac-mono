@@ -1,8 +1,10 @@
 // test-lane: exclusive — three relays and an authority, deriving RSA identities on real ports
 //
-// Design 0002's done condition, or the first half of it: *`deno task test` stands up a Tor network
-// with no C in it*. Three relays, an authority, and a client that bootstraps through them and fetches
-// a document over a multi-hop circuit — every layer of it wac, from the TLS record up.
+// Design 0002's done condition: *`deno task test` stands up a Tor network with no C in it, publishes
+// an onion service on it, fetches a page from that service through a three-hop circuit, and tears it
+// down.* Three relays, an authority, a service and two clients — every layer of it wac, from the TLS
+// record up. The first test here is the network and a document fetched over a circuit; the second is
+// the onion service on that same network.
 //
 // This is the file `network.test.ts` deliberately is not. That one tests the launcher against
 // `waiter` and `wc`, so it fails when the *launcher* is wrong; this one fails when anything in the
@@ -100,6 +102,84 @@ Deno.test("a Tor network with no C in it, stood up and fetched from", async () =
     // relay that answered 404 would give a short body, and a short body is not obviously wrong.
     assertContains(out, "network-status-version 3", "stdout is a consensus, fetched over the circuit");
     assertContains(out, "directory-signature ", "signed, and complete to the end of the document");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("an onion service published on that network, and a page fetched from it", async () => {
+  // The rest of design 0002's done condition: *publishes an onion service on it, fetches a page from
+  // that service through a three-hop circuit, and tears it down.*
+  //
+  // The service is a `node` placed after the authority has run and the relays are serving, because it
+  // bootstraps *through* them — it cannot exist before there is a consensus to bootstrap from. That is
+  // what stages are for.
+  //
+  // Its address is not knowable in advance: it is derived from an identity seed inside the process.
+  // The service logs it as the first thing it says, so a `wait` on `hsserviced: ` captures it — a
+  // marker it has long since printed by the time the wait runs, which is the path that only started
+  // capturing correctly one commit ago.
+  const dir = await Deno.makeTempDir({ prefix: "wac-onion-" });
+  try {
+    const launcher = `${dir}/network`;
+    await buildApp("packages/tor/src/network.wac", launcher, { read: true, write: true, net: true });
+    await buildApp("packages/tor/src/relayd.wac", `${dir}/relayd.worker.js`, {}, "deno", true);
+    await buildApp("packages/tor/src/gendesc.wac", `${dir}/gendesc.worker.js`, {}, "deno", true);
+    await buildApp("packages/tor/src/hsserviced.wac", `${dir}/hsserviced.worker.js`, {}, "deno", true);
+    await buildApp("packages/tor/src/hsconnect.wac", `${dir}/hsconnect.worker.js`, {}, "deno", true);
+
+    for (const n of [1, 2, 3]) {
+      await Deno.writeFile(`${dir}/s${n}`, crypto.getRandomValues(new Uint8Array(32)));
+    }
+    await Deno.writeFile(`${dir}/hs.seed`, crypto.getRandomValues(new Uint8Array(32)));
+
+    const docs = "-C v.consensus -K cert.cert -D r1.desc -D r2.desc -D r3.desc" +
+      " -M v.consensus.micro -m v.consensus.mds";
+    const relay = (n: number, extra = "") =>
+      `node relay${n} | -byte descriptor for port | relayd.worker.js s${n} -p 0 -n wacon${n} ` +
+      `--descriptor r${n}.desc ${extra}${docs}`;
+
+    await Deno.writeTextFile(
+      `${dir}/net.txt`,
+      [
+        "timeout 300000",
+        relay(1, "--seedline seed.txt "),
+        relay(2),
+        relay(3),
+        "run  vote    |                       | gendesc.worker.js keys.json cert vote v - r1.desc r2.desc r3.desc",
+        "wait relay1  | serving the consensus |",
+        "wait relay2  | serving the consensus |",
+        "wait relay3  | serving the consensus |",
+        "node service | waiting for a client  | hsserviced.worker.js seed.txt cert.fingerprint hs.seed --testnet",
+        // A node's own output never reaches the launcher's streams — only a `run`'s does — so the
+        // service's stages are asserted the way the launcher can see them: as markers it was asked to
+        // wait for and reports matching. All three are long since printed by the time the service is
+        // ready, which is the point: they are stages it passed on the way there.
+        "wait service | introduction point established |",
+        "wait service | published to                   |",
+        "wait service | hsserviced:                    |",
+        "run  visit   |                       | hsconnect.worker.js seed.txt cert.fingerprint {service} 80 --testnet",
+        "",
+      ].join("\n"),
+    );
+
+    const r = new Deno.Command(launcher, {
+      args: ["net.txt"],
+      cwd: dir,
+      stdout: "piped",
+      stderr: "piped",
+    }).outputSync();
+    const dec = new TextDecoder();
+    const out = dec.decode(r.stdout);
+    const err = dec.decode(r.stderr);
+
+    if (r.code !== 0) throw new Error(`the onion service run failed:\n${err}`);
+
+    assertContains(err, 'service had already said "introduction point established"',
+                   "the service claimed an introduction point");
+    assertContains(err, 'service had already said "published to"',
+                   "and published its descriptor to the directories");
+    assertContains(out, "hello from behind an onion", "and the page came back through the rendezvous");
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
