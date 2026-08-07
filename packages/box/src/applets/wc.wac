@@ -31,6 +31,15 @@ export i32 wc(Core core, Cli cli, Args a) {
   // No operands means standard input, which is one unnamed pass.
   i32 count = files == 0 ? 1 : files;
 
+  // Every file's counts are held until the end, because the column width is a property of the whole run:
+  // the real one right-aligns every number to the width of the total byte count. Printing as it went is
+  // what made this package's `wc` unpadded, and the test compensated by comparing numbers rather than
+  // text — which then hid a missing filename for months. A few integers per file is what that costs.
+  i32[] lines = i32[count](fill: 0);
+  i32[] words = i32[count](fill: 0);
+  i32[] sizes = i32[count](fill: 0);
+  string[] labels = string[count](fill: "");
+
   Counts total = Counts(0, 0, 0);
   for (i32 f = 0; f < count; f++) {
     Input in = openStream(core, cli, a, f);
@@ -50,35 +59,82 @@ export i32 wc(Core core, Cli cli, Args a) {
         if (space) { inWord = false; } else if (!inWord) { inWord = true; one.words++; }
       }
     }
-    core.log(row(a, one, in.label));
+    lines[f] = one.lines;
+    words[f] = one.words;
+    sizes[f] = one.bytes;
+    labels[f] = in.label;
     total.lines = total.lines + one.lines;
     total.words = total.words + one.words;
     total.bytes = total.bytes + one.bytes;
   }
 
+  // The width is the digits in the total byte count — which is what the real one uses, rather than the
+  // widest number it is about to print. `wc -l` over two small files still pads to three when the files
+  // are 408 bytes between them, which only makes sense once you know it is the *size* being measured.
+  //
+  // Standard input is the exception, and has a rule of its own that nothing in the output explains —
+  // measured, one flag combination at a time:
+  //
+  //     printf 'a b\nc\n' | wc -l     ->  `2`
+  //     printf 'a b\nc\n' | wc -lw    ->  `      2       3`
+  //
+  // Nothing can be stat'd, so there is no size to derive a width from: the real one uses **seven**, except
+  // when exactly one column is asked for, where it pads to nothing. A file's width comes from its size,
+  // which is why `wc -l` over two small files still pads to three when they are 408 bytes between them.
+  // The rule, measured one flag combination at a time rather than reasoned about:
+  //
+  //     wc -l a.txt              ->  `3 a.txt`            one column, one input: no padding at all
+  //     wc -lw big.txt           ->  `  6   6 big.txt`    two columns: the width of the total size
+  //     wc -l big.txt tiny.txt   ->  `  6 big.txt` …      two inputs: likewise, and a `total` row
+  //     printf … | wc -lw        ->  `      2       3`    nothing to stat: seven
+  //
+  // So: one column *and* one input means no padding; otherwise it is the digits in the total byte count,
+  // or seven when there is no file to take a size from.
+  i32 asked = (has(a, 'l') ? 1 : 0) + (has(a, 'w') ? 1 : 0) + (has(a, 'c') ? 1 : 0);
+  bool single = asked == 1 && count == 1;
+  i32 width = single ? 1 : (files == 0 ? 7 : digits(total.bytes));
+  for (i32 f = 0; f < count; f++) {
+    core.log(row(a, Counts(lines[f], words[f], sizes[f]), labels[f], width));
+  }
   // A total only when there was more than one file to total, which is the real one's rule.
-  if (files > 1) { core.log(row(a, total, "total")); }
+  if (files > 1) { core.log(row(a, total, "total", width)); }
   return 0;
 }
 
+/** How many characters a count needs, at least one. */
+i32 digits(i32 n) {
+  i32 d = 1;
+  i32 x = n;
+  while (x >= 10) { d++; x = x / 10; }
+  return d;
+}
+
+/** `s` right-aligned in `width`, which is how every column here is printed. */
+string pad(string s, i32 width) {
+  string out = s;
+  for (i32 i = s.toBytes().len(); i < width; i++) { out = " " + out; }
+  return out;
+}
+
 /**
- * One line of output: the columns asked for, then the label if there is one.
+ * One line of output: the columns asked for, right-aligned in `width`, then the label if there is one.
  *
- * The columns are not padded, where the real one right-aligns them to the width of its largest count.
- * That difference is deliberate and old — `test/box.test.ts` compares the numbers rather than the text
- * and says so — but the *label* is not a column, and dropping it was a bug rather than a choice.
+ * The padding used to be missing, and `test/box.test.ts` compensated by comparing the numbers rather than
+ * the text — which is how a *missing filename* then went unnoticed, because the comparison that would have
+ * caught it had already been loosened for the padding. Matching the real one exactly is what lets the test
+ * compare bytes.
  */
-string row(Args a, Counts c, string label) {
+string row(Args a, Counts c, string label, i32 width) {
   bool l = has(a, 'l');
   bool w = has(a, 'w');
   bool b = has(a, 'c');
   string nums = "";
   if (!l && !w && !b) {
-    nums = itoa(c.lines) + " " + itoa(c.words) + " " + itoa(c.bytes);
+    nums = pad(itoa(c.lines), width) + " " + pad(itoa(c.words), width) + " " + pad(itoa(c.bytes), width);
   } else {
-    if (l) { nums = itoa(c.lines); }
-    if (w) { nums = nums == "" ? itoa(c.words) : nums + " " + itoa(c.words); }
-    if (b) { nums = nums == "" ? itoa(c.bytes) : nums + " " + itoa(c.bytes); }
+    if (l) { nums = pad(itoa(c.lines), width); }
+    if (w) { nums = nums == "" ? pad(itoa(c.words), width) : nums + " " + pad(itoa(c.words), width); }
+    if (b) { nums = nums == "" ? pad(itoa(c.bytes), width) : nums + " " + pad(itoa(c.bytes), width); }
   }
   return label == "" ? nums : nums + " " + label;
 }
