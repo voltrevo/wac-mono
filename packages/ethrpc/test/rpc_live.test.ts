@@ -10,6 +10,7 @@
 // stop. `~/tools/foundry` rather than `/tmp` for the same reason: /tmp does not survive a restart.
 
 import { appRunner } from "../../../harness/appRun.ts";
+import { anvil, HAVE_ANVIL } from "./anvil.ts";
 
 /** Local, because this repo has no third-party dependencies. */
 function assertEquals<T>(got: T, want: T, msg?: string): void {
@@ -19,58 +20,6 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
         `  got:  ${JSON.stringify(got)}\n  want: ${JSON.stringify(want)}`,
     );
   }
-}
-
-const ANVIL = Deno.env.get("ANVIL") ?? `${Deno.env.get("HOME") ?? "/home/claude"}/tools/foundry/anvil`;
-const HAVE_ANVIL = (() => {
-  try {
-    return Deno.statSync(ANVIL).isFile;
-  } catch {
-    return false;
-  }
-})();
-if (!HAVE_ANVIL) {
-  console.error(
-    `\n  anvil not found at ${ANVIL} — packages/ethrpc's live test will not run.\n` +
-      `  Install it with the release tarball for this machine's architecture (aarch64):\n` +
-      `    https://github.com/foundry-rs/foundry/releases  →  ~/tools/foundry/anvil\n`,
-  );
-}
-
-/** A node on a free port, and a promise that resolves when it is answering. */
-async function anvil(): Promise<{ port: number; stop: () => Promise<void> }> {
-  const probe = Deno.listen({ hostname: "127.0.0.1", port: 0 });
-  const port = (probe.addr as Deno.NetAddr).port;
-  probe.close();
-  const proc = new Deno.Command(ANVIL, {
-    args: ["--port", String(port), "--silent"],
-    stdout: "null",
-    stderr: "null",
-  }).spawn();
-  // Wait for it to answer rather than sleeping a fixed time: a fixed sleep is either flaky or slow, and
-  // on a shared machine it is both.
-  for (let i = 0; i < 100; i++) {
-    try {
-      const r = await fetch(`http://127.0.0.1:${port}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] }),
-      });
-      await r.text();
-      break;
-    } catch {
-      await new Promise((r) => setTimeout(r, 100));
-    }
-  }
-  return {
-    port,
-    stop: async () => {
-      try {
-        proc.kill();
-      } catch { /* already gone */ }
-      await proc.status;
-    },
-  };
 }
 
 Deno.test({

@@ -4,8 +4,8 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-33 packages, 66,841 lines of wac, 1365 tests,
-40 command-line programs and 4 browser pages.
+33 packages, 67,041 lines of wac, 1370 tests,
+41 command-line programs and 4 browser pages.
 
 ## Packages
 
@@ -35,17 +35,17 @@ In dependency order: nothing here imports anything below it.
 | [`rlp`](packages/rlp/) | Recursive Length Prefix — the Ethereum execution layer's serialisation, in wac. | 317 | 8 | `fmt` |
 | [`wactest`](packages/wactest/) | Assertions for tests written in wac. | 222 | 16 | `fmt` |
 | [`bls`](packages/bls/) | BLS signature verification on BLS12-381 — the Ethereum parameters and encodings. | 4,049 | 45 | `crypto` |
-| [`ethrpc`](packages/ethrpc/) | Asking an Ethereum node a question, so the packages that *verify* answers have something to verify. | 126 | 1 | `fmt` `http` `json` `platform` |
 | [`mpt`](packages/mpt/) | Merkle-Patricia proofs, verified — the piece that turns "a provider told me" into "the state root I already verified commits to this". | 489 | 27 | `codec` `crypto` `fmt` `rlp` `std` |
 | [`server`](packages/server/) | An HTTP server written in wac. | 333 | 20 | `bytes` `codec` `datetime` `http` `json` `regex` `url` |
 | [`sh`](packages/sh/) | A shell, in wac. | 6,564 | 31 | `bytes` `fmt` `fs` `platform` `std` |
 | [`ssz`](packages/ssz/) | **Everything an Altair light client needs is done and checked against Ethereum's vectors. | 808 | 26 | `crypto` |
-| [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,696 | 78 | `crypto` |
+| [`tls`](packages/tls/) | TLS 1.3 (RFC 8446) in wac. | 3,696 | 82 | `crypto` |
 | [`box`](packages/box/) | 60 applets in one program, chosen by the first argument. | 3,965 | 33 | `bytes` `codec` `crypto` `datetime` `fmt` `gzip` `http` `json` `platform` `regex` `server` `sh` `std` `tls` `unicode` `url` `zstd` |
 | [`ens`](packages/ens/) | The name a person types, turned into the node a contract is asked about. | 361 | 13 | `crypto` `mpt` |
 | [`lightclient`](packages/lightclient/) | **The Altair sync protocol works. | 642 | 12 | `bls` `ssz` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,551 | 46 | `bytes` `codec` `crypto` `fmt` `platform` `sh` |
 | [`tor`](packages/tor/) | Tor in wac, both ends: a client and SOCKS5 proxy, a relay, a directory authority, an onion-service client, and a test network with no C tor in it. | 15,273 | 281 | `bytes` `codec` `crypto` `datetime` `fmt` `http` `platform` `std` `tls` `wactest` |
+| [`ethrpc`](packages/ethrpc/) | Asking an Ethereum node a question, so the packages that *verify* answers have something to verify. | 326 | 2 | `codec` `ens` `fmt` `http` `json` `platform` |
 
 ## Programs
 
@@ -77,7 +77,6 @@ reach — see `packages/platform/README.md`.
 | `packages/platform/example/whichever.wac` | Wait on two sockets and report whichever speaks first. |
 | `packages/platform/example/writeread.wac` | Can a socket be written to while a read on it is still outstanding? |
 | `packages/fs/example/ops.wac` | The same filesystem operations against memory or against the host, so the two can be compared. |
-| `packages/ethrpc/example/blocknumber.wac` | The smallest thing that asks a node a question: `eth_blockNumber`, printed. |
 | `packages/sh/src/sealed.wac` | A shell whose filesystem is its own: nothing it writes touches the host. |
 | `packages/sh/src/sh.wac` | `sh` — the shell as a program, entire, in wac. |
 | `packages/box/example/term.wac` | A shell, in a browser tab. |
@@ -100,6 +99,8 @@ reach — see `packages/platform/README.md`.
 | `packages/tor/src/network.wac` | Stand up a Tor network from a description, run something across it, and take it down. |
 | `packages/tor/src/relayd.wac` | A Tor relay: accept a connection, prove who we are, and carry circuits. |
 | `packages/tor/src/socks.wac` | A SOCKS5 proxy that carries streams over Tor. |
+| `packages/ethrpc/example/blocknumber.wac` | The smallest thing that asks a node a question: `eth_blockNumber`, printed. |
+| `packages/ethrpc/example/ensowner.wac` | Who owns this ENS name — asked of a node, and believed only because a proof says so. |
 
 ## Pages
 

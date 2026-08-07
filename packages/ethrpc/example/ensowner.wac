@@ -1,0 +1,89 @@
+// Who owns this ENS name — asked of a node, and believed only because a proof says so.
+//
+//     deno task app:build packages/ethrpc/example/ensowner.wac --allow-net -o ensowner
+//     ./ensowner wac.eth 127.0.0.1 8545
+//
+// This is the whole stack in one program, and the first here that goes out to a chain for the answer:
+//
+//     the name        `packages/ens`      namehash, right to left
+//     the slot        `packages/ens`      keccak256(node ++ 0), Solidity's mapping layout
+//     the proofs      `packages/ethrpc`   eth_getProof, over `packages/http` and `packages/json`
+//     the answer      `packages/mpt`      the state trie to the registry, its storage trie to the slot
+//
+// **What this does not do is trust the node's answer** — it asks for a proof and checks it. What it *does*
+// still trust is the state root, which it takes from the same node's `eth_getBlockByNumber`. That proves
+// the node is internally consistent and nothing more: a node willing to invent a state can invent a root
+// to match. `packages/lightclient` is what closes that, and until they are wired together this program is
+// honest about being one step short. Printed on every run, because a proof that is not anchored looks
+// exactly like one that is.
+
+import { Cli, Core } from "../../platform/src/platform.wac";
+import { proofOf, Proof } from "../src/getproof.wac";
+import { ownerOf, Resolved } from "../../ens/src/verified.wac";
+import { ownerSlot } from "../../ens/src/registry.wac";
+import { namehash } from "../../ens/src/ens.wac";
+import { encode as hexEncode } from "../../codec/src/hex.wac";
+import { itoa } from "../../fmt/src/itoa.wac";
+
+/** The ENS registry, at the address it has had since 2017. */
+string REGISTRY() { return "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e"; }
+
+export i32 main(Core core, Cli cli) {
+  i32 n = cli.argCount().wait();
+  if (n < 1) {
+    core.warn("usage: ensowner <name> [host] [port] [registry]");
+    return 2;
+  }
+  u8[] name = cli.arg(0).wait();
+  string host = n > 1 ? string.fromBytes(cli.arg(1).wait()) : "127.0.0.1";
+  i32 port = n > 2 ? atoiOr(string.fromBytes(cli.arg(2).wait()), 8545) : 8545;
+  string registry = n > 3 ? string.fromBytes(cli.arg(3).wait()) : REGISTRY();
+
+  string slot = "0x" + string.fromBytes(hexEncode(ownerSlot(namehash(name))));
+  Proof p = proofOf(cli, host, port, registry, slot);
+  if (!p.ok) { core.warn("ensowner: " + p.error); return 1; }
+
+  u8[] registryBytes = hexOf(registry);
+  if (registryBytes.len() != 20) { core.warn("ensowner: the registry address is not 20 bytes"); return 2; }
+
+  Resolved r = ownerOf(p.stateRoot, registryBytes, name, p.accountNodes, p.storageNodes);
+  if (!r.ok) { core.warn("ensowner: " + r.error); return 1; }
+  if (!r.present) {
+    core.log("no owner");
+    // Absence is an answer and the exit code says so: 0, because the question was answered.
+    core.warn("ensowner: proved against a state root this node also supplied — see the README");
+    return 0;
+  }
+  core.log("0x" + string.fromBytes(hexEncode(r.address)));
+  core.warn("ensowner: proved against a state root this node also supplied — see the README");
+  return 0;
+}
+
+u8[] hexOf(string s) {
+  u8[] b = s.toBytes();
+  i32 at = b.len() >= 2 && b[0] == '0' && (b[1] == 'x' || b[1] == 'X') ? 2 : 0;
+  i32 n = (b.len() - at) / 2;
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) {
+    out[i] = (digit(b[at + i * 2]) << 4) | digit(b[at + i * 2 + 1]);
+  }
+  return out;
+}
+
+i32 digit(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+  return 0;
+}
+
+i32 atoiOr(string s, i32 fallback) {
+  u8[] b = s.toBytes();
+  if (b.len() == 0) { return fallback; }
+  i32 v = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return fallback; }
+    v = v * 10 + (b[i] - '0');
+  }
+  return v;
+}

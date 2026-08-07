@@ -28,10 +28,37 @@ state and be believed. `packages/lightclient` is what closes that, by following 
 a header nobody has to trust. Until those are wired together, a composition built on this is a proof of
 consistency wearing the clothes of a proof of truth, and saying so is cheaper than someone discovering it.
 
+## The whole stack, as a program
+
+`example/ensowner.wac` asks a node who owns an ENS name and believes the answer only because a proof says
+so:
+
+    ./ensowner wac.eth 127.0.0.1 8545
+    0xd8da6bf26964af9d7eed9e03e53415d37aa96045
+    ensowner: proved against a state root this node also supplied — see the README
+
+    the name     packages/ens      namehash, right to left
+    the slot     packages/ens      keccak256(node ++ 0), Solidity's mapping layout
+    the proofs   packages/ethrpc   eth_getProof, over packages/http and packages/json
+    the answer   packages/mpt      the state trie to the registry, its storage trie to the slot
+
+The second line is printed on every run and is not decoration: see the caveat above. A proof that is not
+anchored to an independently verified header looks exactly like one that is, and this program is one step
+short of that.
+
+`test/ensowner_live.test.ts` runs it against a real anvil, with the owner slot set through cheatcodes at a
+location **`cast` computed** — so a namehash built left-to-right, or a mapping slot hashed `slot ++ key`,
+would ask about a slot nothing was written to and print "no owner". A wrong answer that looks like an
+answer is exactly what a fixture cannot catch.
+
 ## What is here
 
 - `src/rpc.wac` — one call: build the request, POST it, parse the JSON, hand back the `result` node or the
   node's own error message. Batching is not implemented; every call is its own connection.
+- `src/getproof.wac` — `eth_getProof` and `eth_getBlockByNumber`, decoded into the byte arrays
+  `packages/mpt` verifies. The only place that knows both shapes: nothing above it has to know `0x` exists.
+  Malformed hex is refused rather than guessed at, because a nibble-shifted root verifies against nothing
+  and reads as a bad proof.
 - The HTTP itself is `packages/http/src/client.wac`, which is `Connection: close` and read-to-EOF. Keep-alive
   would want a connection object with state, and this package does not have one.
 

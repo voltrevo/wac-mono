@@ -1,0 +1,109 @@
+// `eth_getProof` and `eth_getBlockByNumber`, shaped into what `packages/mpt` verifies.
+//
+// The node answers JSON with hex strings in it; the verifier wants byte arrays and a state root. This is
+// the whole of the translation, and it is deliberately the only place that knows both shapes: everything
+// above works in bytes and nothing above should have to know that `0x` exists.
+//
+// **A short hex string is not padded and a malformed one is refused.** `0x` prefixes are optional in the
+// spec's own examples and mandatory in practice; an odd number of digits is a node bug and is rejected
+// rather than guessed at, because guessing means a nibble-shifted 32-byte root that verifies against
+// nothing and looks like a bad proof.
+
+import { Cli } from "../../platform/src/platform.wac";
+import { call, stringOf, Answer } from "./rpc.wac";
+import { JsonValue, JsonObject, JsonArray } from "../../json/src/value.wac";
+import { decode as hexDecode } from "../../codec/src/hex.wac";
+import { itoa } from "../../fmt/src/itoa.wac";
+
+/** A proof, in the shape `packages/mpt` takes. */
+export struct Proof {
+  bool ok;
+  /** The state root the proofs are against — see the README on where this may and may not come from. */
+  u8[] stateRoot;
+  /** The account trie's nodes, root first. */
+  u8[][] accountNodes;
+  /** The storage trie's nodes for the one slot asked about. */
+  u8[][] storageNodes;
+  string error;
+
+  Proof of(bool ok, u8[] stateRoot, u8[][] accountNodes, u8[][] storageNodes, string error) {
+    return Proof(ok, stateRoot, accountNodes, storageNodes, error);
+  }
+}
+
+/**
+ * `eth_getProof(address, [slot], "latest")` plus the block's state root, decoded.
+ *
+ * Two calls, and the root comes from the second — from the *same node*, which proves internal consistency
+ * and not truth. `packages/lightclient` is what makes the root worth something; see the README.
+ */
+export Proof proofOf(Cli cli, string host, i32 port, string address, string slot) {
+  Answer block = call(cli, host, port, "eth_getBlockByNumber", "[\"latest\",false]");
+  if (!block.ok) { return failed(block.error); }
+  u8[] root = memberBytes(block.result, "stateRoot");
+  if (root.len() != 32) { return failed("the block has no usable stateRoot"); }
+
+  string params = "[\"" + address + "\",[\"" + slot + "\"],\"latest\"]";
+  Answer got = call(cli, host, port, "eth_getProof", params);
+  if (!got.ok) { return failed(got.error); }
+
+  u8[][] accountNodes = hexArray(memberOf(got.result, "accountProof"));
+  JsonValue storageProof = memberOf(got.result, "storageProof");
+  match (storageProof) {
+    case Array(items): {
+      if (items.len() != 1) {
+        return failed("asked about one slot and got " + itoa(items.len()) + " storage proofs");
+      }
+      u8[][] storageNodes = hexArray(memberOf(items.get(0), "proof"));
+      return Proof.of(true, root, accountNodes, storageNodes, "");
+    }
+    else: { return failed("the answer has no storageProof array"); }
+  }
+}
+
+/** A member of a JSON object, or `Null` when it is not there or the value is not an object. */
+JsonValue memberOf(JsonValue v, string key) {
+  match (v) {
+    case Object(members): {
+      JsonValue? m = members.getStr(key);
+      return m is null ? JsonValue.Null : m!;
+    }
+    else: { return JsonValue.Null; }
+  }
+}
+
+/** A member that should be a hex string, as bytes. Empty when it is missing or malformed. */
+u8[] memberBytes(JsonValue v, string key) { return fromHex(stringOf(memberOf(v, key))); }
+
+/** An array of hex strings, as byte arrays. */
+u8[][] hexArray(JsonValue v) {
+  match (v) {
+    case Array(items): {
+      u8[][] out = u8[][items.len()](fill: u8[0]());
+      for (i32 i = 0; i < items.len(); i++) { out[i] = fromHex(stringOf(items.get(i))); }
+      return out;
+    }
+    else: { return u8[][0](fill: u8[0]()); }
+  }
+}
+
+/**
+ * `0x…` as bytes, or empty for anything that is not clean hex.
+ *
+ * Empty rather than a trap because every one of these came off a network from a peer that is not trusted:
+ * a node answering nonsense should produce a proof that does not verify, which is a caller's error path
+ * already, rather than killing the program.
+ */
+export u8[] fromHex(u8[] text) {
+  i32 at = text.len() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X') ? 2 : 0;
+  i32 n = text.len() - at;
+  if (n <= 0 || (n & 1) == 1) { return u8[0](); }
+  u8[] body = u8[n]();
+  body.copyFrom(text, at, 0, n);
+  u8[]? decoded = hexDecode(body);
+  return decoded is null ? u8[0]() : decoded!;
+}
+
+Proof failed(string why) {
+  return Proof.of(false, u8[0](), u8[][0](fill: u8[0]()), u8[][0](fill: u8[0]()), why);
+}
