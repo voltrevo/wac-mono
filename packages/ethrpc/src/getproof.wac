@@ -25,12 +25,28 @@ export struct Proof {
   u8[] stateRoot;
   /** The account trie's nodes, root first. */
   u8[][] accountNodes;
-  /** The storage trie's nodes for the one slot asked about. */
+  /** The storage trie's nodes for the first slot asked about. */
   u8[][] storageNodes;
+  /**
+   * A slot's nodes, for a call that asked about several.
+   *
+   * `eth_getProof` takes a list of slots and answers about all of them against one account proof and one
+   * root, so asking one slot at a time is a round trip and an account walk per slot — and worse, each
+   * answer is about whatever block was latest when *that* call arrived. Resolving an ENS name's owner and
+   * resolver is two slots of one contract, which is the case this exists for.
+   */
+  u8[][][] slots;
   string error;
 
   Proof of(bool ok, u8[] stateRoot, u8[][] accountNodes, u8[][] storageNodes, string error) {
-    return Proof(ok, stateRoot, accountNodes, storageNodes, error);
+    u8[][][] one = u8[][][1](fill: u8[][0](fill: u8[0]()));
+    one[0] = storageNodes;
+    return Proof(ok, stateRoot, accountNodes, storageNodes, one, error);
+  }
+
+  Proof many(bool ok, u8[] stateRoot, u8[][] accountNodes, u8[][][] slots, string error) {
+    u8[][] first = slots.len() > 0 ? slots[0] : u8[][0](fill: u8[0]());
+    return Proof(ok, stateRoot, accountNodes, first, slots, error);
   }
 }
 
@@ -48,6 +64,19 @@ export struct Proof {
  * anchored path therefore answers about the past, deliberately — that is what having a trusted hash means.
  */
 export Proof proofOf(Cli cli, string host, i32 port, string address, string slot, u8[] expectedHash) {
+  string[] one = string[](slot);
+  return proofOfSlots(cli, host, port, address, one, expectedHash);
+}
+
+/**
+ * The same, for several slots of one account — one round trip, one account proof, one root.
+ *
+ * The slots come back in the order asked for, in `slots`. Anything else is a node answering a different
+ * question from the one put to it, and is refused rather than matched up by key: a caller that indexes by
+ * position and a node that reorders is a silent mix-up between two slots of the same contract.
+ */
+export Proof proofOfSlots(Cli cli, string host, i32 port, string address, string[] slots,
+                          u8[] expectedHash) {
   bool anchored = expectedHash.len() == 32;
   string where = anchored
     ? "[\"0x" + string.fromBytes(hexOf(expectedHash)) + "\",false]"
@@ -71,7 +100,11 @@ export Proof proofOf(Cli cli, string host, i32 port, string address, string slot
   string at = anchored ? "\"" + string.fromBytes(jsonString(numberAt)) + "\"" : "\"latest\"";
   if (anchored && jsonString(numberAt).len() == 0) { return failed("the block has no number"); }
 
-  string params = "[\"" + address + "\",[\"" + slot + "\"]," + at + "]";
+  string list = "";
+  for (i32 i = 0; i < slots.len(); i++) {
+    list = list + (i > 0 ? "," : "") + "\"" + slots[i] + "\"";
+  }
+  string params = "[\"" + address + "\",[" + list + "]," + at + "]";
   Answer got = call(cli, host, port, "eth_getProof", params);
   if (!got.ok) { return failed(got.error); }
 
@@ -98,16 +131,30 @@ export Proof proofOf(Cli cli, string host, i32 port, string address, string slot
   JsonValue storageProof = memberOf(got.result, "storageProof");
   match (storageProof) {
     case Array(items): {
-      if (items.len() != 1) {
-        return failed("asked about one slot and got " + itoa(items.len()) + " storage proofs");
+      if (items.len() != slots.len()) {
+        return failed("asked about " + itoa(slots.len()) + " slot(s) and got "
+                      + itoa(items.len()) + " storage proofs");
       }
-      u8[][] storageNodes = hexArray(memberOf(items.get(0), "proof"));
-      return Proof.of(true, root, accountNodes, storageNodes, "");
+      u8[][][] out = u8[][][slots.len()](fill: u8[][0](fill: u8[0]()));
+      for (i32 i = 0; i < slots.len(); i++) {
+        JsonValue entry = items.get(i);
+        // The key each answer is about, checked against the slot asked for at that position. A node that
+        // reordered them would otherwise hand a caller the resolver where it asked for the owner, and
+        // both are addresses of the same shape.
+        u8[] key = memberBytes(entry, "key");
+        u8[] want = fromHex(slots[i].toBytes());
+        if (key.len() != want.len()) { return failed("a storage proof is about a slot of another size"); }
+        for (i32 j = 0; j < key.len(); j++) {
+          if (key[j] != want[j]) { return failed("the node answered about a slot that was not asked for"); }
+        }
+        out[i] = hexArray(memberOf(entry, "proof"));
+      }
+      return Proof.many(true, root, accountNodes, out, "");
     }
     else: { return failed("the answer has no storageProof array"); }
   }
 }
 
 Proof failed(string why) {
-  return Proof.of(false, u8[0](), u8[][0](fill: u8[0]()), u8[][0](fill: u8[0]()), why);
+  return Proof.many(false, u8[0](), u8[][0](fill: u8[0]()), u8[][][0](fill: u8[][0](fill: u8[0]())), why);
 }

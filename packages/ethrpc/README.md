@@ -79,6 +79,12 @@ answer is exactly what a fixture cannot catch.
 
 - `src/rpc.wac` — one call: build the request, POST it, parse the JSON, hand back the `result` node or the
   node's own error message. Batching is not implemented; every call is its own connection.
+- `src/getproof.wac` — `proofOfSlots` takes several slots of one account and answers about all of them
+  from **one** request, one account proof and one block. `proofOf` is the one-slot spelling. Asking twice
+  is not the same thing: on a live chain the second answer is about a state the first never saw, so an ENS
+  name transferred in between yields an owner and a resolver that never coexisted. Each answer's `key` is
+  checked against the slot asked for at that position, because a node that reordered them would hand a
+  caller the resolver where it asked for the owner and both are addresses of the same shape.
 - `src/getproof.wac` — `eth_getProof` and `eth_getBlockByNumber`, decoded into the byte arrays
   `packages/mpt` verifies. The only place that knows both shapes: nothing above it has to know `0x` exists.
   Malformed hex is refused rather than guessed at, because a nibble-shifted root verifies against nothing
