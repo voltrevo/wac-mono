@@ -73,6 +73,32 @@ wildcard resolver, one answering offchain through CCIP-read — and it has no la
 Reading `addr(node)` from its storage needs that resolver's layout; reading it by `eth_call` means trusting
 the answer. Neither is pretended.
 
+## The whole chain, in one call — `src/verified.wac`
+
+The pieces above compose, and `verified.wac` is where they do: a name goes in and an address comes out,
+with a state root the caller already believes as the only thing taken on faith.
+
+```wac
+Resolved r = ownerOf(stateRoot, registryAddress, "wac.eth".toBytes(), accountNodes, storageNodes);
+// r.ok       the proofs verified
+// r.present  the slot holds something — a name nobody owns proves *absent*, which is an answer
+// r.address  20 bytes
+```
+
+    "wac.eth" --namehash--> node --keccak(node ++ 0)--> slot
+              --state trie--> the registry's account --storage trie--> the owner
+
+`packages/ens` does the first two steps, `packages/mpt` the second two, `packages/rlp` and
+`packages/crypto` underneath both. **The storage root is never a parameter** — it comes out of the account
+proof, which is what makes this a composition rather than two proofs about possibly-different contracts.
+
+The step that a composition like this gets wrong quietly is the padding: a storage slot's value is stored
+minimally, so an address with leading zero bytes arrives *shorter than an address* and has to be
+left-padded. Read right-aligned instead, it is a plausible wrong address.
+
+`resolverOf` is the same walk one slot up. Resolving the name the rest of the way — asking that resolver
+for `addr(node)` — needs the resolver's own layout, which is the gap named above and still not implemented.
+
 ## How it is tested
 
 `npm:ethers@6` computed every expectation: twelve names' namehashes and DNS encodings, seven selectors. The
@@ -81,3 +107,12 @@ corpus is committed so the suite needs no network, and regenerating it is `tools
 Two properties are checked directly rather than against the corpus, because they are what the recursion
 *means*: the empty name is the root, and `namehash("foo.eth")` equals `hashInto(namehash("eth"), keccak256("foo"))`.
 Swapping the node and the label hash — the obvious way to get the concatenation wrong — fails both.
+
+**The composition is tested against a real client.** `test/vendor/registry.json` is `eth_getProof` from
+anvil over a registry whose slots were set through its cheatcodes, and the two derivations are cross-checked
+against `cast` — Foundry's own, in Rust — because those are what fail silently: a node computed
+left-to-right, or a mapping slot hashed as `slot ++ key`, both produce a valid proof about the wrong slot,
+and the answer is "this name has no owner". Regenerate with `tools/vendor-registry.ts`.
+
+Four perturbations have to be refused: another name's slot proof, the resolver slot's proof offered as the
+owner's, no storage proof at all, and the right proofs against a state root one bit different.

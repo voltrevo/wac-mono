@@ -1,0 +1,52 @@
+// `verified.wac` flattened, because bindgen marshals arrays and not structs.
+//
+// One call is one answer: `[ok, present, address(20), error…]`, with the address present only when the
+// proof established one. A proof arrives as one blob with a four-byte length in front of each node — the
+// same packing `packages/mpt`'s probe uses, and for the same reason.
+import { ownerOf, resolverOf, Resolved } from "../../src/verified.wac";
+import { namehash } from "../../src/ens.wac";
+import { ownerSlot, resolverSlot } from "../../src/registry.wac";
+
+u8[][] unpack(u8[] packed) {
+  i32 count = 0;
+  i32 at = 0;
+  while (at < packed.len()) {
+    i32 n = packed[at] | (packed[at + 1] << 8) | (packed[at + 2] << 16) | (packed[at + 3] << 24);
+    at = at + 4 + n;
+    count++;
+  }
+  u8[][] out = u8[][count](fill: u8[0]());
+  at = 0;
+  for (i32 i = 0; i < count; i++) {
+    i32 n = packed[at] | (packed[at + 1] << 8) | (packed[at + 2] << 16) | (packed[at + 3] << 24);
+    u8[] node = u8[n]();
+    for (i32 j = 0; j < n; j++) { node[j] = packed[at + 4 + j]; }
+    out[i] = node;
+    at = at + 4 + n;
+  }
+  return out;
+}
+
+u8[] flatten(Resolved r) {
+  u8[] err = r.error.toBytes();
+  i32 n = r.present ? 20 : 0;
+  u8[] out = u8[2 + n + err.len()]();
+  out[0] = r.ok ? 1 : 0;
+  out[1] = r.present ? 1 : 0;
+  for (i32 i = 0; i < n; i++) { out[2 + i] = r.address[i]; }
+  for (i32 i = 0; i < err.len(); i++) { out[2 + n + i] = err[i]; }
+  return out;
+}
+
+export u8[] resolveOwner(u8[] stateRoot, u8[] registry, u8[] name, u8[] account, u8[] storage) {
+  return flatten(ownerOf(stateRoot, registry, name, unpack(account), unpack(storage)));
+}
+
+export u8[] resolveResolver(u8[] stateRoot, u8[] registry, u8[] name, u8[] account, u8[] storage) {
+  return flatten(resolverOf(stateRoot, registry, name, unpack(account), unpack(storage)));
+}
+
+/** The two derivations on their own, so the test can compare them with `cast`'s. */
+export u8[] nodeOf(u8[] name) { return namehash(name); }
+export u8[] ownerSlotOf(u8[] name) { return ownerSlot(namehash(name)); }
+export u8[] resolverSlotOf(u8[] name) { return resolverSlot(namehash(name)); }
