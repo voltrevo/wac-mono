@@ -342,6 +342,15 @@ export const KNOWN_SURVIVORS: KnownSurvivor[] = [
   { name: "guard/tls/hybrid:70:24", why: "See guard/tls/hybrid:50:30 — `mlkemEncaps` checks its randomness." },
   { name: "guard/tls/hybrid:71:28", why: "See guard/tls/hybrid:50:30 — `x25519` checks its own scalar." },
   {
+    name: "guard/tls/hybrid:105:28",
+    why:
+      "`hybridClientFinish`'s scalar, and the sixth of the redundant set — `x25519` checks it one frame " +
+      "down, exactly as at 51:28 and 71:28. Missed when the other five were recorded because I had the " +
+      "line numbers off by one and believed this was the `serverShare` check. It is not: **that one is " +
+      "line 104, it is not redundant, and `test/hybrid_traps.test.ts` kills it** — which is why it is not " +
+      "in this file. A sweep reporting `hybrid:105:28` twice is what said so. wac-mono 0005.",
+  },
+  {
     name: "guard/rlp/rlp:120:18",
     why:
       "`header`'s negative check, the private one. Its exported neighbour `fromI64` has the same guard and " +

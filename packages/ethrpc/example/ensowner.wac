@@ -31,16 +31,19 @@ string REGISTRY() { return "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e"; }
 export i32 main(Core core, Cli cli) {
   i32 n = cli.argCount().wait();
   if (n < 1) {
-    core.warn("usage: ensowner <name> [host] [port] [registry]");
+    core.warn("usage: ensowner <name> [host] [port] [registry] [expected-block-hash]");
     return 2;
   }
   u8[] name = cli.arg(0).wait();
   string host = n > 1 ? string.fromBytes(cli.arg(1).wait()) : "127.0.0.1";
   i32 port = n > 2 ? atoiOr(string.fromBytes(cli.arg(2).wait()), 8545) : 8545;
   string registry = n > 3 ? string.fromBytes(cli.arg(3).wait()) : REGISTRY();
+  // A block hash the caller got from somewhere that is not this node — a friend, an explorer, a
+  // checkpoint. With one, the state root is anchored; without one, it is the node's own word.
+  u8[] expected = n > 4 ? hexOf(string.fromBytes(cli.arg(4).wait())) : u8[0]();
 
   string slot = "0x" + string.fromBytes(hexEncode(ownerSlot(namehash(name))));
-  Proof p = proofOf(cli, host, port, registry, slot);
+  Proof p = proofOf(cli, host, port, registry, slot, expected);
   if (!p.ok) { core.warn("ensowner: " + p.error); return 1; }
 
   u8[] registryBytes = hexOf(registry);
@@ -51,12 +54,19 @@ export i32 main(Core core, Cli cli) {
   if (!r.present) {
     core.log("no owner");
     // Absence is an answer and the exit code says so: 0, because the question was answered.
-    core.warn("ensowner: proved against a state root this node also supplied — see the README");
+    core.warn(anchorNote(expected));
     return 0;
   }
   core.log("0x" + string.fromBytes(hexEncode(r.address)));
-  core.warn("ensowner: proved against a state root this node also supplied — see the README");
+  core.warn(anchorNote(expected));
   return 0;
+}
+
+/** What the answer rests on, said every run, because the two cases look identical in the output. */
+string anchorNote(u8[] expected) {
+  return expected.len() == 32
+    ? "ensowner: the state root is from a header hashing to the block hash you gave"
+    : "ensowner: proved against a state root this node also supplied — pass a block hash to anchor it";
 }
 
 u8[] hexOf(string s) {

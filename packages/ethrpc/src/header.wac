@@ -1,0 +1,124 @@
+// A block header, re-encoded and hashed, so a state root can be tied to a block hash.
+//
+// A header's hash *is* `keccak256(rlp(header))` — there is nothing else to it — so a node that hands over
+// a block and its hash has made a checkable claim. Recomputing it is worth two different things:
+//
+//   - **Self-consistency.** A node that edited the state root and forgot to recompute the hash is caught.
+//     That is a bug catcher, not a security property: a node willing to lie can hash its lie.
+//   - **Anchoring, which is the real reason.** A block *hash* is small enough to come from somewhere else
+//     — a friend, an explorer, a checkpoint, eventually `packages/lightclient` — and once one is in hand,
+//     this is what turns it into a trusted state root. `example/ensowner.wac` takes one as an optional
+//     argument for exactly that.
+//
+// ## The field list is fork-dependent, and that is handled by looking
+//
+// The header grew with every fork: `baseFeePerGas` at London, `withdrawalsRoot` at Shanghai,
+// `blobGasUsed`/`excessBlobGas`/`parentBeaconBlockRoot` at Cancun, `requestsHash` at Prague. They are
+// **appended**, always in that order, and each is present only from its fork onwards.
+//
+// So this encodes the fifteen that have always been there and then appends each optional one **only if the
+// node reported it**, stopping at the first absent. Hard-coding a fork would be wrong within months, and
+// guessing a missing field as zero would produce a different hash than the chain's — which is the failure
+// that looks like "the node is lying" and is actually "we are one fork behind".
+
+import { keccak256 } from "../../crypto/src/keccak.wac";
+import { encode, Item } from "../../rlp/src/rlp.wac";
+import { JsonValue } from "../../json/src/value.wac";
+import { memberOf, memberBytes, isNull } from "./jsonhex.wac";
+import { itoa } from "../../fmt/src/itoa.wac";
+
+/** A header, re-encoded and checked against the hash the node gave it. */
+export struct Header {
+  bool ok;
+  /** `keccak256(rlp(header))`, as computed here. */
+  u8[] hash;
+  /** The state root out of the header — the field everything else hangs from. */
+  u8[] stateRoot;
+  string error;
+
+  Header of(bool ok, u8[] hash, u8[] stateRoot, string error) {
+    return Header(ok, hash, stateRoot, error);
+  }
+}
+
+/** The fields in the order the encoding takes them, up to the first the node did not report. */
+string[] FIXED() {
+  return string[]("parentHash", "sha3Uncles", "miner", "stateRoot", "transactionsRoot", "receiptsRoot",
+                  "logsBloom", "difficulty", "number", "gasLimit", "gasUsed", "timestamp", "extraData",
+                  "mixHash", "nonce");
+}
+
+/** Appended by later forks, in this order, each present only from its fork onwards. */
+string[] OPTIONAL() {
+  return string[]("baseFeePerGas", "withdrawalsRoot", "blobGasUsed", "excessBlobGas",
+                  "parentBeaconBlockRoot", "requestsHash");
+}
+
+/** Which fields are integers — RLP-minimal — rather than fixed-width byte strings. */
+bool isQuantity(string name) {
+  return name == "difficulty" || name == "number" || name == "gasLimit" || name == "gasUsed"
+      || name == "timestamp" || name == "baseFeePerGas" || name == "blobGasUsed"
+      || name == "excessBlobGas";
+}
+
+/**
+ * Re-encode `block` — an `eth_getBlockByNumber` result — and check its hash.
+ *
+ * `expectedHash` is compared against the computed hash when it is 32 bytes; pass an empty array to skip
+ * that and use the node's own `hash` field, which only proves the node is consistent with itself.
+ */
+export Header headerOf(JsonValue block, u8[] expectedHash) {
+  Item[] parts = Item[21](fill: Item.Bytes(u8[0]()));
+  i32 n = 0;
+
+  string[] fixed = FIXED();
+  for (i32 i = 0; i < fixed.len(); i++) {
+    // Absent, not empty: `extraData` is legitimately `"0x"` on a chain nobody has written a message into,
+    // and a difficulty of zero is what every post-Merge block has. Treating either as missing rejects
+    // every block anvil produces, which is how this was found.
+    if (isNull(memberOf(block, fixed[i]))) {
+      return Header.of(false, u8[0](), u8[0](), "the block has no " + fixed[i]);
+    }
+    u8[] raw = memberBytes(block, fixed[i]);
+    parts[n] = Item.Bytes(isQuantity(fixed[i]) ? minimal(raw) : raw);
+    n++;
+  }
+
+  // Each optional field only if the one before it was there: they are appended in fork order, and a gap
+  // would mean the node reported a later field without an earlier one, which no chain does.
+  string[] optional = OPTIONAL();
+  for (i32 i = 0; i < optional.len(); i++) {
+    // Absent stops the list; *present and zero* does not. `blobGasUsed: "0x0"` decodes to no bytes and
+    // must still be encoded, as RLP's empty string — a missing field must not be encoded at all, and the
+    // two produce different hashes.
+    if (isNull(memberOf(block, optional[i]))) { break; }
+    u8[] raw = memberBytes(block, optional[i]);
+    parts[n] = Item.Bytes(isQuantity(optional[i]) ? minimal(raw) : raw);
+    n++;
+  }
+
+  Item[] used = Item[n](fill: Item.Bytes(u8[0]()));
+  for (i32 i = 0; i < n; i++) { used[i] = parts[i]; }
+  u8[] hash = keccak256(encode(Item.List(used)));
+
+  u8[] want = expectedHash.len() == 32 ? expectedHash : memberBytes(block, "hash");
+  if (want.len() != 32) {
+    return Header.of(false, hash, u8[0](), "there is no block hash to check against");
+  }
+  for (i32 i = 0; i < 32; i++) {
+    if (hash[i] != want[i]) {
+      return Header.of(false, hash, u8[0](),
+        "the header re-encodes to a different hash than the one it was given — " + itoa(n) + " fields");
+    }
+  }
+  return Header.of(true, hash, memberBytes(block, "stateRoot"), "");
+}
+
+/** A quantity's bytes with leading zeroes stripped — RLP has one encoding of a number, and it is minimal. */
+u8[] minimal(u8[] raw) {
+  i32 at = 0;
+  while (at < raw.len() && raw[at] == 0) { at++; }
+  u8[] out = u8[raw.len() - at]();
+  out.copyFrom(raw, at, 0, out.len());
+  return out;
+}

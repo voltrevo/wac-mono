@@ -21,7 +21,20 @@ hashes to a root the caller already has.
 What it *is* trusted for is availability. It can refuse, stall, or answer about an old block, and nothing
 here can tell — those are liveness failures, and no proof rules them out.
 
-**Where the root comes from is the open question, and it is not solved here.** Taking the state root from
+**A block hash anchors it, and that is now wired up.** `src/header.wac` re-encodes the header the node
+returned and hashes it: a header's hash *is* `keccak256(rlp(header))`, so a block hash from anywhere the
+caller trusts — a friend, an explorer, a checkpoint, eventually `packages/lightclient` — turns into a
+trusted state root here. `ensowner` takes one as its fifth argument and refuses when it does not match.
+Without one, the check is against the node's own `hash` field, which catches a node whose block does not
+hash to what it claims and nothing more.
+
+The header's field list is fork-dependent — `baseFeePerGas` at London, `withdrawalsRoot` at Shanghai, three
+more at Cancun, `requestsHash` at Prague — so the encoder appends each optional field **only if the node
+reported it** rather than hard-coding a fork. Present-and-zero is not the same as absent: `blobGasUsed: 0x0`
+must be encoded as RLP's empty string and a missing one must not be encoded at all, and the two hash
+differently.
+
+**Where the root comes from is still the open question for a live chain.** Taking the state root from
 the same `eth_getBlockByNumber` that served the proof — which is all a caller can do with this package
 today — proves the node is *internally consistent*, not that it is telling the truth: it can invent a whole
 state and be believed. `packages/lightclient` is what closes that, by following the chain and handing over

@@ -1,0 +1,79 @@
+// Reading an Ethereum node's JSON: members, hex strings, arrays of hex strings.
+//
+// Its own file because `getproof.wac` and `header.wac` both need it and neither should import the other —
+// `getproof` verifies a header, and a header is one of the things a proof is about.
+//
+// **Malformed hex decodes to empty rather than trapping.** Every byte here came off a network from a peer
+// that is not trusted: a node answering nonsense should produce a proof that does not verify — an error
+// path the caller already has — rather than killing the program.
+
+import { JsonValue, JsonObject, JsonArray } from "../../json/src/value.wac";
+import { decode as hexDecode } from "../../codec/src/hex.wac";
+
+/** A member of a JSON object, or `Null` when it is absent or the value is not an object. */
+export JsonValue memberOf(JsonValue v, string key) {
+  match (v) {
+    case Object(members): {
+      JsonValue? m = members.getStr(key);
+      return m is null ? JsonValue.Null : m!;
+    }
+    else: { return JsonValue.Null; }
+  }
+}
+
+/** Whether a value is JSON `null` or absent — which for a header field is not the same as zero. */
+export bool isNull(JsonValue v) {
+  match (v) {
+    case Null: { return true; }
+    else: { return false; }
+  }
+}
+
+/** A `Str`'s bytes, empty for anything else. */
+export u8[] stringOf(JsonValue v) {
+  match (v) {
+    case Str(bytes): { return bytes; }
+    else: { return u8[0](); }
+  }
+}
+
+/** A member that should be a hex string, as bytes. Empty when missing or malformed. */
+export u8[] memberBytes(JsonValue v, string key) { return fromHex(stringOf(memberOf(v, key))); }
+
+/** An array of hex strings, as byte arrays. */
+export u8[][] hexArray(JsonValue v) {
+  match (v) {
+    case Array(items): {
+      u8[][] out = u8[][items.len()](fill: u8[0]());
+      for (i32 i = 0; i < items.len(); i++) { out[i] = fromHex(stringOf(items.get(i))); }
+      return out;
+    }
+    else: { return u8[][0](fill: u8[0]()); }
+  }
+}
+
+/**
+ * `0x…` as bytes, or empty for anything that is not clean hex.
+ *
+ * An odd number of digits is a node bug and is refused rather than padded: guessing means a nibble-shifted
+ * root that verifies against nothing and reads as a bad proof, which sends the reader to the wrong file.
+ * `0x0` — one digit — is the exception the callers handle, because a *quantity* is minimally encoded and
+ * `0x0` means zero.
+ */
+export u8[] fromHex(u8[] text) {
+  i32 at = text.len() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X') ? 2 : 0;
+  i32 n = text.len() - at;
+  if (n <= 0) { return u8[0](); }
+  if ((n & 1) == 1) {
+    // An odd quantity like `0x1a2`: pad one nibble, which is what makes it a number rather than bytes.
+    u8[] padded = u8[n + 1]();
+    padded[0] = '0';
+    padded.copyFrom(text, at, 1, n);
+    u8[]? d = hexDecode(padded);
+    return d is null ? u8[0]() : d!;
+  }
+  u8[] body = u8[n]();
+  body.copyFrom(text, at, 0, n);
+  u8[]? decoded = hexDecode(body);
+  return decoded is null ? u8[0]() : decoded!;
+}

@@ -51,6 +51,22 @@ Deno.test({
       // exactly like one anchored to a verified header.
       assertEquals(r.err.includes("state root this node also supplied"), true, r.err);
 
+      // **Anchored to a block hash.** The program re-encodes the header it was given and hashes it, so
+      // this passing means our RLP of anvil's header — field order, minimal quantities, and which of the
+      // six fork-appended fields are present — reproduces the hash anvil computed itself. A differential
+      // against a real client, on the one value that ties a state root to a block.
+      const block = await rpc(node.port, "eth_getBlockByNumber", ["latest", false]) as { hash: string };
+      const anchored = await run.run(["wac.eth", "127.0.0.1", String(node.port), REGISTRY, block.hash]);
+      assertEquals(anchored.code, 0, `exit ${anchored.code}: ${anchored.err}`);
+      assertEquals(anchored.out.trim(), OWNER.toLowerCase(), anchored.out);
+      assertEquals(anchored.err.includes("hashing to the block hash you gave"), true, anchored.err);
+
+      // And a hash from somewhere else has to be refused rather than ignored, or the argument is theatre.
+      const wrong = await run.run(["wac.eth", "127.0.0.1", String(node.port), REGISTRY,
+        "0x" + "00".repeat(31) + "01"]);
+      assertEquals(wrong.code, 1, `a wrong anchor should fail, got ${wrong.code}: ${wrong.out}`);
+      assertEquals(wrong.err.includes("re-encodes to a different hash"), true, wrong.err);
+
       // A name nobody owns: absence is an answer, and the exit code says the question was answered.
       const none = await run.run(["nobody-owns-this.eth", "127.0.0.1", String(node.port)]);
       assertEquals(none.code, 0, `exit ${none.code}: ${none.err}`);
