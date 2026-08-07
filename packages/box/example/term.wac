@@ -107,6 +107,11 @@ export i32 page(Core core, Cli cli, Page page) {
     // capability per widget — but a label focuses its control natively, so clicking dead space in
     // the scrollback puts the keyboard back in the prompt. Dragging still selects: a label focuses
     // on click and does not eat a drag, which is what makes copying output out of here still work.
+    // A page with no stylesheet under it is `content-box`, and `#wrap` below is `height: 100%`
+    // with padding: those two make the scroller 44px taller than the frame that clips it, which
+    // put the prompt below the visible edge — reading as no bottom margin, and as a scrollback
+    // that stopped just short of the newest line until a keystroke scrolled the caret into view.
+    "  #term, #term * { box-sizing: border-box; }" +
     "  #term { position: fixed; inset: 0; overflow: hidden; display: block; cursor: text;" +
     "          background: #06070a; color: #d7dde6;" +
     "          font: 13px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }" +

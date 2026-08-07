@@ -419,6 +419,33 @@ Deno.test({
         `scrolled to the top and the first line is still ${scroll.reachedTop}px away from it`,
       );
 
+      // **The newest line has to be inside the frame.** The scroller is `height: 100%` with
+      // padding, and on a page with no stylesheet under it that is `content-box` — so the scroller
+      // ends up taller than the element clipping it and the prompt renders past the visible edge.
+      // It reads as two separate faults, which is why it is worth pinning: no margin under the
+      // prompt, and a scrollback that stops short of the newest line until a keystroke scrolls the
+      // caret into view. Both are this.
+      const fits = await page.evaluate(`(() => {
+        // Back to the newest line: the check above left the view at the top of the scrollback.
+        document.getElementById("wrap").scrollTop = 0;
+        const box = (id) => document.getElementById(id).getBoundingClientRect();
+        return {
+          slack: Math.round(box("term").height - box("wrap").height),
+          under: Math.round(box("term").bottom - box("bar").bottom),
+        };
+      })()`) as { slack: number; under: number };
+      assertEquals(
+        fits.slack >= 0,
+        true,
+        `the scroller is ${-fits.slack}px taller than the frame that clips it, so its last line ` +
+          `is rendered where nothing can scroll to it`,
+      );
+      assertEquals(
+        fits.under >= 16,
+        true,
+        `the prompt sits ${fits.under}px from the bottom edge — typing happens against the border`,
+      );
+
       // **Which route answered.** Every assertion above passes either way: an applet called inside
       // the shell's own instance and one spawned as a worker print the same bytes, which is what made
       // the in-process fallback worth having and also what made this half of 0030 unfalsifiable.
