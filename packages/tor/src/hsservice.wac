@@ -196,7 +196,10 @@ Introduce2 noIntroduce2() {
  * the cell, which is safe only because `ENC_KEY` is derived per-handshake from the client's ephemeral
  * key — a service that reused a key across cells would be reusing a keystream.
  */
-export Introduce2 parseIntroduce2(u8[] cell, u8[] introEncSecret, u8[] subcredential) {
+export Introduce2 parseIntroduce2(
+  u8[] cell, u8[] introAuthKey, u8[] introEncSecret, u8[] subcredential
+) {
+  if (introAuthKey.len() != 32) { return noIntroduce2(); }
   // 20 legacy id, 1 type, 2 key len, 32 key, 1 extension count, then CLIENT_PK and a MAC at least.
   if (cell.len() < 56 + 32 + 32) { return noIntroduce2(); }
   for (i32 i = 0; i < 20; i++) {
@@ -204,7 +207,28 @@ export Introduce2 parseIntroduce2(u8[] cell, u8[] introEncSecret, u8[] subcreden
   }
   if (cell[20] != 2) { return noIntroduce2(); }               // AUTH_KEY_TYPE: ed25519
   if (cell[21] != 0 || cell[22] != 32) { return noIntroduce2(); }
-  u8[] authKey = sub(cell, 23, 55);
+
+  // **The auth key is ours, not the cell's.** tor sets `data.auth_pk` from the introduction point's
+  // own keypair (`hs_circuit.c`: `data.auth_pk = &ip->auth_key_kp.pubkey`) and never compares the
+  // cell's AUTH_KEY field against it — the field is decorative on this side, and the real binding is
+  // that a client had to use the *right* key to compute a MAC we will accept.
+  //
+  // Reading it out of the cell instead, as this did until 2026-08-07, hands the attacker an input to
+  // our own key derivation: a client can name any auth key, we derive the MAC key from that same
+  // wrong value, and the MAC verifies. The cell is then accepted where tor would reject it, and the
+  // field that is supposed to say *which introduction point this arrived through* says whatever the
+  // sender preferred. A tampered byte was still caught — the MAC covers the field — which is why the
+  // test for it passed and the hole stayed open: tampering and a self-consistent forgery are
+  // different attacks and only the first was being tried.
+  //
+  // The field itself is **not** compared against ours, and that is deliberate. tor does not compare
+  // it, so a client that MACs with the right key and writes anything it likes in the field is a cell
+  // tor accepts — and refusing it here would be stricter than the network, which is its own failure
+  // mode and one this package has already been bitten by twice. There is nothing to gain: a cell with
+  // a correct MAC was built by somebody holding the descriptor, which is every legitimate client.
+  //
+  // The security property is not in the comparison. It is that the key feeding the derivation is ours.
+  u8[] authKey = introAuthKey;
 
   i32 at = 55;
   i32 extensions = cell[at];

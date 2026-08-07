@@ -78,7 +78,7 @@ export i32 main(Core core, Cli cli) {
       core.warn("genintro: " + cellPath + ": " + f.error);
       return 1;
     }
-    Introduce2 got = parseIntroduce2(f.bytes, encSecret, subcred);
+    Introduce2 got = parseIntroduce2(f.bytes, authPublic, encSecret, subcred);
     if (!got.ok) {
       cli.write("PARSE_FAILED\n".toBytes());
       return 1;
