@@ -1,0 +1,126 @@
+// A service answering one INTRODUCE2, from the cell to the cell it sends back.
+//
+// Every piece of this was already here and pinned against C tor — the parse, the two replay caches,
+// the rendezvous point resolution, the hs-ntor responder, the RENDEZVOUS1 encoding. What was missing
+// is the order, and the order is the substance: tor's `hs_circ_handle_introduce2` does these in a
+// particular sequence, and three of the steps are placed where they are for reasons that are not
+// visible from the step itself.
+//
+// ## The sequence, and why each step is where it is
+//
+//   1. **the ENCRYPTED section against the introduction point's replay cache** —
+//      before the ntor keys are derived and before the MAC is verified. A replayed cell then costs
+//      one SHA-256 rather than a curve25519 handshake, so replaying is not cheaper for the sender
+//      than it is for us. Moving this after the parse would keep the same verdicts and hand an
+//      attacker a work multiplier.
+//   2. **the parse**, which verifies the MAC with *our* auth key and decrypts.
+//   3. **the rendezvous cookie against the service's replay cache** — after the parse, because until
+//      the MAC verifies there is no reason to believe the cookie is a cookie. tor's comment on this
+//      one is the interesting part: it is usually *not* an attack. A client whose introduction
+//      circuit timed out resends with the same cookie, and we may already be building that very
+//      rendezvous circuit. Dropping it is right because the work is in hand, not because the client
+//      misbehaved.
+//   4. **the rendezvous point**, from link specifiers a stranger chose — see `hsrendpoint.wac` for
+//      why that sentence is the whole reason those checks exist.
+//   5. **the keys and the cell**, which is the only step that is pure computation.
+//
+// ## What this does not do
+//
+// It does not build a circuit, and it takes the service's ephemeral secret as a parameter rather than
+// drawing one. Both for the same reason the descriptor's salts are parameters: a function that
+// reached for randomness or a socket could not be tested against a stated sequence at all. A caller
+// draws a fresh ephemeral secret **per introduction** — reusing one across two clients would give
+// them a shared view of the handshake — and this returns what to send once the circuit is up.
+
+import {
+  Introduce2, encryptedSectionOf, parseIntroduce2, rendezvous1Cell,
+} from "./hsservice.wac";
+import { ReplayCache, seenBefore } from "./hsreplay.wac";
+import { RendPoint, REND_OK, rendezvousPoint } from "./hsrendpoint.wac";
+import { serviceRendezvousKeys } from "./hsntor.wac";
+import { x25519Base } from "../../crypto/src/x25519.wac";
+
+export const i32 INTRO2_OK = 0;
+/** This exact ENCRYPTED section has arrived here before. */
+export const i32 INTRO2_REPLAYED = 1;
+/** Malformed, or the MAC does not verify under our own introduction point key. */
+export const i32 INTRO2_UNREADABLE = 2;
+/** A rendezvous we are already working on — usually a client retrying, not an attack. */
+export const i32 INTRO2_COOKIE_SEEN = 3;
+/** The client named a rendezvous point we will not connect to. */
+export const i32 INTRO2_BAD_RENDEZVOUS = 4;
+/** The handshake produced nothing usable — a degenerate client key, or bad service inputs. */
+export const i32 INTRO2_NO_KEYS = 5;
+
+/** What to do about one INTRODUCE2. */
+export struct Introduction {
+  i32 error;
+  /** Where to build the rendezvous circuit. Meaningless unless `error` is `INTRO2_OK`. */
+  RendPoint rendezvous;
+  /** The RENDEZVOUS1 cell to send once that circuit is open: cookie, then `Y | AUTH`. */
+  u8[] rendezvous1;
+  /** The seed the rendezvous circuit's own keys come from. */
+  u8[] keySeed;
+  /** The client's ephemeral public key, kept because a caller may want to log or count by it. */
+  u8[] clientPublic;
+}
+
+Introduction refused(i32 error) {
+  return Introduction(error, RendPoint(error, u8[0](), 0, u8[0](), u8[0]()), u8[0](), u8[0](),
+                      u8[0]());
+}
+
+/**
+ * Answer one INTRODUCE2.
+ *
+ * `introAuthKey` and `introEncSecret` are **this introduction point's**, from our own record of it
+ * rather than from the cell — see `parseIntroduce2`, where taking them from the cell was a real bug.
+ * `cellSeen` belongs to the introduction point and `cookieSeen` to the service; they are different
+ * caches with different horizons and passing one for the other would either forget too soon or
+ * remember another introduction point's traffic.
+ *
+ * Both caches are updated by the act of checking, so a caller cannot check, decide, and forget to
+ * record.
+ */
+export Introduction handleIntroduce2(
+  u8[] cell, u8[] introAuthKey, u8[] introEncSecret, u8[] subcredential,
+  u8[] serviceEphemeralSecret, ReplayCache cellSeen, ReplayCache cookieSeen, i64 now,
+  bool allowPrivate
+) {
+  // 1. The ENCRYPTED section, before any crypto. An unparseable header has no section to remember,
+  //    and is refused as unreadable rather than as a replay — a distinction worth keeping because one
+  //    of them says something about the sender and the other about the cell.
+  u8[] encrypted = encryptedSectionOf(cell);
+  if (encrypted.len() == 0) { return refused(INTRO2_UNREADABLE); }
+  if (seenBefore(cellSeen, encrypted, now)) { return refused(INTRO2_REPLAYED); }
+
+  // 2. The parse, which is where the MAC is checked and the body decrypted.
+  Introduce2 intro = parseIntroduce2(cell, introAuthKey, introEncSecret, subcredential);
+  if (!intro.ok) { return refused(INTRO2_UNREADABLE); }
+
+  // 3. The cookie, now that there is a reason to believe it.
+  if (seenBefore(cookieSeen, intro.rendCookie, now)) { return refused(INTRO2_COOKIE_SEEN); }
+
+  // 4. Where the client wants to meet.
+  RendPoint where = rendezvousPoint(intro.linkSpecifiers, allowPrivate);
+  if (where.error != REND_OK) {
+    return Introduction(INTRO2_BAD_RENDEZVOUS, where, u8[0](), u8[0](), intro.clientPublic);
+  }
+
+  // 5. The handshake. `serviceRendezvousKeys` returns AUTH then the key seed; RENDEZVOUS1 carries our
+  //    ephemeral public key and AUTH, and the seed stays here to key the circuit once it is joined.
+  u8[] keys = serviceRendezvousKeys(introAuthKey, introEncSecret, serviceEphemeralSecret,
+                                    intro.clientPublic);
+  if (keys.len() != 64) { return refused(INTRO2_NO_KEYS); }
+  u8[] handshake = u8[64]();
+  u8[] ephemeralPublic = x25519Base(serviceEphemeralSecret);
+  for (i32 i = 0; i < 32; i++) { handshake[i] = ephemeralPublic[i]; }
+  for (i32 i = 0; i < 32; i++) { handshake[32 + i] = keys[i]; }
+
+  u8[] cellOut = rendezvous1Cell(intro.rendCookie, handshake);
+  if (cellOut.len() == 0) { return refused(INTRO2_NO_KEYS); }
+
+  u8[] seed = u8[32]();
+  for (i32 i = 0; i < 32; i++) { seed[i] = keys[32 + i]; }
+  return Introduction(INTRO2_OK, where, cellOut, seed, intro.clientPublic);
+}

@@ -172,6 +172,35 @@ Introduce2 noIntroduce2() {
 }
 
 /**
+ * Where the ENCRYPTED section begins, or -1 if the header does not parse.
+ *
+ * Exported because a service has to hash exactly this span *before* deciding whether to do any of the
+ * work below: tor's replay cache is keyed on the ENCRYPTED section and is checked before the ntor
+ * keys are derived and before the MAC is verified, so a replayed cell costs one SHA-256 rather than a
+ * curve25519 handshake. Recomputing the offset beside that check would be a second copy of this
+ * arithmetic, and the two drifting would mean caching a span that is not the one being verified.
+ */
+export i32 encryptedSectionFrom(u8[] cell) {
+  if (cell.len() < 56) { return -1; }
+  i32 at = 55;
+  i32 extensions = cell[at];
+  at = at + 1;
+  for (i32 i = 0; i < extensions; i++) {
+    if (at + 2 > cell.len()) { return -1; }
+    at = at + 2 + cell[at + 1];
+    if (at > cell.len()) { return -1; }
+  }
+  return at;
+}
+
+/** The ENCRYPTED section itself — what the replay cache remembers. Empty if the header is bad. */
+export u8[] encryptedSectionOf(u8[] cell) {
+  i32 at = encryptedSectionFrom(cell);
+  if (at < 0 || at + 32 + 32 > cell.len()) { return u8[0](); }
+  return sub(cell, at, cell.len());
+}
+
+/**
  * Parse and decrypt an INTRODUCE2 cell.
  *
  * An INTRODUCE2 is byte-for-byte an INTRODUCE1 — the introduction point relays the body unchanged and
@@ -230,14 +259,8 @@ export Introduce2 parseIntroduce2(
   // The security property is not in the comparison. It is that the key feeding the derivation is ours.
   u8[] authKey = introAuthKey;
 
-  i32 at = 55;
-  i32 extensions = cell[at];
-  at = at + 1;
-  for (i32 i = 0; i < extensions; i++) {
-    if (at + 2 > cell.len()) { return noIntroduce2(); }
-    at = at + 2 + cell[at + 1];
-    if (at > cell.len()) { return noIntroduce2(); }
-  }
+  i32 at = encryptedSectionFrom(cell);
+  if (at < 0) { return noIntroduce2(); }
 
   // ENCRYPTED = CLIENT_PK | ENCRYPTED_DATA | MAC.
   if (at + 32 + 32 > cell.len()) { return noIntroduce2(); }
