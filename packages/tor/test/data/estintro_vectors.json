@@ -15,37 +15,51 @@
   {
    "name": "one bit of the auth key",
    "accepted": false,
-   "reason": "handshake_auth not as expected"
+   "reason": "handshake_auth not as expected",
+   "cell": "0200209737ccd6b78098503d7d87ee1c10a7b585d4900e1f16a116c71f87677158668e0034936215e48244c7956c194d7faa74c8c5abf100bbc6fd474e1fe51847055c940040267280f8e15c04845965bed1d746571beac5087881ce9bcaf6d4f27f97a58772ebc68edfb7f2dfdc6f353479995f3ef6184159a165b5990048cd3836e882810f",
+   "kh": "dfe6edf4fb020910171e252c333a41484f565d64"
   },
   {
    "name": "one bit of the handshake MAC",
    "accepted": false,
-   "reason": "handshake_auth not as expected"
+   "reason": "handshake_auth not as expected",
+   "cell": "0200209737cdd6b78098503d7d87ee1c10a7b585d4900e1f16a116c71f87677158668e0034936215e58244c7956c194d7faa74c8c5abf100bbc6fd474e1fe51847055c940040267280f8e15c04845965bed1d746571beac5087881ce9bcaf6d4f27f97a58772ebc68edfb7f2dfdc6f353479995f3ef6184159a165b5990048cd3836e882810f",
+   "kh": "dfe6edf4fb020910171e252c333a41484f565d64"
   },
   {
    "name": "one bit of the signature",
    "accepted": false,
-   "reason": "signature not as expected"
+   "reason": "signature not as expected",
+   "cell": "0200209737cdd6b78098503d7d87ee1c10a7b585d4900e1f16a116c71f87677158668e0034936215e48244c7956c194d7faa74c8c5abf100bbc6fd474e1fe51847055c940040267280f8e15c04845865bed1d746571beac5087881ce9bcaf6d4f27f97a58772ebc68edfb7f2dfdc6f353479995f3ef6184159a165b5990048cd3836e882810f",
+   "kh": "dfe6edf4fb020910171e252c333a41484f565d64"
   },
   {
    "name": "the wrong circuit KH",
    "accepted": false,
-   "reason": "handshake_auth not as expected"
+   "reason": "handshake_auth not as expected",
+   "cell": "0200209737cdd6b78098503d7d87ee1c10a7b585d4900e1f16a116c71f87677158668e0034936215e48244c7956c194d7faa74c8c5abf100bbc6fd474e1fe51847055c940040267280f8e15c04845965bed1d746571beac5087881ce9bcaf6d4f27f97a58772ebc68edfb7f2dfdc6f353479995f3ef6184159a165b5990048cd3836e882810f",
+   "kh": "0000000000000000000000000000000000000000"
   },
   {
    "name": "auth_key_type 1 instead of 2",
    "accepted": false,
-   "reason": "handshake_auth not as expected"
+   "reason": "handshake_auth not as expected",
+   "cell": "0100209737cdd6b78098503d7d87ee1c10a7b585d4900e1f16a116c71f87677158668e0034936215e48244c7956c194d7faa74c8c5abf100bbc6fd474e1fe51847055c940040267280f8e15c04845965bed1d746571beac5087881ce9bcaf6d4f27f97a58772ebc68edfb7f2dfdc6f353479995f3ef6184159a165b5990048cd3836e882810f",
+   "kh": "dfe6edf4fb020910171e252c333a41484f565d64"
   },
   {
    "name": "truncated",
    "accepted": false,
-   "reason": "trn_cell_establish_intro_parse returned -2"
+   "reason": "trn_cell_establish_intro_parse returned -2",
+   "cell": "0200209737cdd6b78098503d7d87ee1c10a7b585d4900e1f16a116c71f87677158668e0034936215e48244c7956c194d7faa74c8c5abf100bbc6fd47",
+   "kh": "dfe6edf4fb020910171e252c333a41484f565d64"
   },
   {
    "name": "signed over the obvious span, including sig_len",
    "accepted": false,
-   "reason": "signature not as expected"
+   "reason": "signature not as expected",
+   "cell": "0200209737cdd6b78098503d7d87ee1c10a7b585d4900e1f16a116c71f87677158668e0034936215e48244c7956c194d7faa74c8c5abf100bbc6fd474e1fe51847055c9400404b9e9c1d63f8f7984c39a21a8e7fa40a03cd5477cdaa6ad6f087ecd2c39302f4f3d58450d5317f8308431369a34a6e4b074d0118305ceb4c7e08d91bbfc94602",
+   "kh": "dfe6edf4fb020910171e252c333a41484f565d64"
   }
  ]
 }

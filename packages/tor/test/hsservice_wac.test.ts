@@ -28,6 +28,9 @@ const E_CELL = 3; // the cell tor parsed and verified, byte for byte
 const E_MAC_SPAN_LEN = 4; // 4 bytes big-endian: where tor says the MAC span ends
 const E_SIG_SPAN_LEN = 5; // 4 bytes big-endian: where tor says the SIGNATURE span ends
 const E_NODE_SIG = 6; // a = the message; node's signature over it with the same seed
+const E_MUTATION_COUNT = 7;
+const E_MUTATION = 8; // a[0] = index: the exact bytes tor's parser refused
+const E_MUTATION_KH = 9; // a[0] = index: the KH it was offered with
 
 const v = JSON.parse(
   await Deno.readTextFile(new URL("data/estintro_vectors.json", import.meta.url)),
@@ -40,7 +43,7 @@ const v = JSON.parse(
   sigSpanLen: number;
   torSpans: { macSpanLen: number; sigSpanLen: number };
   torParsedBytes: number;
-  mutations: { name: string; accepted: boolean; reason: string }[];
+  mutations: { name: string; accepted: boolean; reason: string; cell: string; kh: string }[];
 };
 
 const hex = (h: string) => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
@@ -76,6 +79,13 @@ function nodeSignature(msg: Uint8Array): Uint8Array {
   return new Uint8Array(nodeSign(null, msg, key));
 }
 
+// Every mutation must carry its bytes and must have been refused, or replaying them asks nothing.
+for (const m of v.mutations) {
+  if (m.accepted) throw new Error(`tor accepted the mutation ${m.name}; it proves nothing`);
+  if (!m.cell) throw new Error(`the mutation ${m.name} has no bytes to replay`);
+}
+if (v.mutations.length < 7) throw new Error("too few mutations to discriminate");
+
 function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
   switch (what) {
     case E_AUTH_SEED:
@@ -92,6 +102,12 @@ function ref(what: number, a: Uint8Array, _b: Uint8Array): Uint8Array {
       return be32(v.torSpans.sigSpanLen);
     case E_NODE_SIG:
       return nodeSignature(a);
+    case E_MUTATION_COUNT:
+      return new Uint8Array([v.mutations.length]);
+    case E_MUTATION:
+      return hex(v.mutations[a[0]].cell);
+    case E_MUTATION_KH:
+      return hex(v.mutations[a[0]].kh);
     default:
       throw new Error(`unknown vector field ${what}`);
   }
