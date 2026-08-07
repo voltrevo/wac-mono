@@ -93,6 +93,28 @@ export u8[] establishIntroCell(u8[] authPublic, u8[] authSeed, u8[] circuitKH) {
   return b.bytes();
 }
 
+/**
+ * The auth key out of an INTRODUCE1 or INTRODUCE2's *unencrypted* header, or empty.
+ *
+ * The two cells are byte-identical — an introduction point forwards the body unchanged and only the
+ * command differs — so one reader serves both, and this is the part a relay can read without holding
+ * any key at all. That is the whole mechanism: the relay learns which circuit to forward down and
+ * nothing else about the introduction.
+ *
+ * The validation is tor's `validate_introduce1_parsed_cell`: the legacy key id must be twenty zero
+ * bytes, the key type must be ed25519, and the length must be exactly thirty-two. A relay that
+ * skipped these would look up a key it read from the wrong offset.
+ */
+export u8[] introduceAuthKey(u8[] cell) {
+  if (cell.len() < 55) { return u8[0](); }
+  for (i32 i = 0; i < 20; i++) {
+    if (cell[i] != 0) { return u8[0](); }
+  }
+  if (cell[20] != AUTH_KEY_TYPE_ED25519) { return u8[0](); }
+  if (cell[21] != 0 || cell[22] != 32) { return u8[0](); }
+  return sub(cell, 23, 55);
+}
+
 /** What an introduction point learns from an ESTABLISH_INTRO it accepts. */
 export struct EstablishedIntro {
   bool ok;

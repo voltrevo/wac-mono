@@ -1,0 +1,151 @@
+// Being an introduction point: the relay's side, which is a lookup table and three refusals.
+//
+// A service asks a relay to hold a circuit open under a key, and clients later send INTRODUCE1 cells
+// naming that key. The relay forwards the body down the matching circuit and learns nothing else —
+// it cannot read the cell, does not know which service it is serving, and could not tell two of them
+// apart. That ignorance is the design rather than a limitation of it, and it is why this file is a
+// map and some validation rather than anything cryptographic: the cryptography is
+// `parseEstablishIntro`'s, and it happens once, when the circuit is claimed.
+//
+// The rules are `hs_intropoint.c`'s, and the three that are not obvious from the protocol are all
+// refusals:
+//
+//   - **an ESTABLISH_INTRO is only accepted on a circuit that ends here.** tor requires
+//     `!circ->n_chan` — the circuit must not have been extended onward. A relay that accepted one on
+//     a circuit passing through it would be claiming to be an introduction point on somebody else's
+//     behalf, and the INTRODUCE1 cells would have nowhere to go.
+//   - **one introduction per circuit.** tor's `already_received_introduce1` blocks the second with a
+//     comment naming it as an attack on the hidden service through the relay: a client that could
+//     send many down one circuit would get many rendezvous attempts for the cost of one circuit.
+//   - **an unknown auth key is a NACK, not a drop.** The client is told, so it can try another
+//     introduction point rather than waiting — and being told *unknown id* rather than *bad format*
+//     is what distinguishes a service that has rotated from a client that is broken.
+
+import { introduceAuthKey, parseEstablishIntro, EstablishedIntro } from "./hsservice.wac";
+import { ctEqual } from "../../crypto/src/ct.wac";
+
+/** `TRUNNEL_HS_INTRO_ACK_STATUS_*` — what an INTRODUCE_ACK carries. */
+export const i32 INTRO_ACK_SUCCESS = 0;
+export const i32 INTRO_ACK_UNKNOWN_ID = 1;
+export const i32 INTRO_ACK_BAD_FORMAT = 2;
+
+/**
+ * The circuits this relay is holding open as introduction points.
+ *
+ * Keyed by auth key, as tor's circuit map is. A second ESTABLISH_INTRO for a key already held
+ * replaces the first, which sounds like a hijack and is not: registering requires a signature by that
+ * key, so only its holder can do it, and a service re-establishing after a lost circuit is the
+ * ordinary case.
+ */
+export struct IntroPoints {
+  u8[][] authKeys;
+  i32[] connIds;
+  i32[] circIds;
+  i32 count;
+  i32 capacity;
+
+  IntroPoints create(i32 capacity) {
+    return IntroPoints(u8[][capacity](), i32[capacity](), i32[capacity](), 0, capacity);
+  }
+}
+
+/** Whether an ESTABLISH_INTRO may be accepted on this circuit at all. */
+export bool suitableForEstablishIntro(bool circuitEndsHere) { return circuitEndsHere; }
+
+/**
+ * Accept an ESTABLISH_INTRO and hold the circuit under its auth key.
+ *
+ * Returns the key it was filed under, or empty on refusal. `circuitEndsHere` is the caller's — a
+ * relay knows whether it extended this circuit onward and this file cannot.
+ */
+export u8[] establishIntro(
+  IntroPoints m, u8[] cell, u8[] circuitKH, i32 connId, i32 circId, bool circuitEndsHere
+) {
+  if (!suitableForEstablishIntro(circuitEndsHere)) { return u8[0](); }
+  EstablishedIntro got = parseEstablishIntro(cell, circuitKH);
+  if (!got.ok) { return u8[0](); }
+
+  i32 at = indexOfKey(m, got.authKey);
+  if (at >= 0) {
+    m.connIds[at] = connId;
+    m.circIds[at] = circId;
+    return got.authKey;
+  }
+  if (m.count >= m.capacity) { return u8[0](); }
+  m.authKeys[m.count] = got.authKey;
+  m.connIds[m.count] = connId;
+  m.circIds[m.count] = circId;
+  m.count = m.count + 1;
+  return got.authKey;
+}
+
+/** Forget every introduction point on a circuit that has gone away. */
+export void forgetCircuit(IntroPoints m, i32 connId, i32 circId) {
+  i32 kept = 0;
+  for (i32 i = 0; i < m.count; i++) {
+    if (m.connIds[i] == connId && m.circIds[i] == circId) { continue; }
+    m.authKeys[kept] = m.authKeys[i];
+    m.connIds[kept] = m.connIds[i];
+    m.circIds[kept] = m.circIds[i];
+    kept = kept + 1;
+  }
+  m.count = kept;
+}
+
+/** Forget everything on a connection that has closed. */
+export void forgetConnection(IntroPoints m, i32 connId) {
+  i32 kept = 0;
+  for (i32 i = 0; i < m.count; i++) {
+    if (m.connIds[i] == connId) { continue; }
+    m.authKeys[kept] = m.authKeys[i];
+    m.connIds[kept] = m.connIds[i];
+    m.circIds[kept] = m.circIds[i];
+    kept = kept + 1;
+  }
+  m.count = kept;
+}
+
+/** What to do about an INTRODUCE1: an ACK status, and where to forward it if there is anywhere. */
+export struct Introduced {
+  i32 status;
+  /** The entry to forward down, or -1. Meaningful only when `status` is `INTRO_ACK_SUCCESS`. */
+  i32 at;
+}
+
+/**
+ * Decide an INTRODUCE1.
+ *
+ * `firstOnThisCircuit` is the caller's: tor blocks a second introduction on one circuit, and only the
+ * relay knows whether it has seen one there. A repeat is `BAD_FORMAT` rather than `UNKNOWN_ID`
+ * because nothing is wrong with the *service* — it is the sender being told to stop.
+ *
+ * The body is never inspected beyond its header. A relay that parsed further would be reading a cell
+ * addressed to somebody else, and could not anyway: everything past the auth key is encrypted to the
+ * service.
+ */
+export Introduced introduce1(IntroPoints m, u8[] cell, bool firstOnThisCircuit) {
+  if (!firstOnThisCircuit) { return Introduced(INTRO_ACK_BAD_FORMAT, -1); }
+  u8[] authKey = introduceAuthKey(cell);
+  if (authKey.len() != 32) { return Introduced(INTRO_ACK_BAD_FORMAT, -1); }
+  i32 at = indexOfKey(m, authKey);
+  if (at < 0) { return Introduced(INTRO_ACK_UNKNOWN_ID, -1); }
+  return Introduced(INTRO_ACK_SUCCESS, at);
+}
+
+/** The two-byte body of an INTRODUCE_ACK: a status, big-endian, and no extensions. */
+export u8[] introduceAckBody(i32 status) {
+  u8[] out = u8[3]();
+  out[0] = (status >> 8) & 0xFF;
+  out[1] = status & 0xFF;
+  out[2] = 0;      // N_EXTENSIONS
+  return out;
+}
+
+/** Which entry holds this auth key, or -1. */
+export i32 indexOfKey(IntroPoints m, u8[] authKey) {
+  if (authKey.len() != 32) { return -1; }
+  for (i32 i = 0; i < m.count; i++) {
+    if (ctEqual(m.authKeys[i], authKey)) { return i; }
+  }
+  return -1;
+}

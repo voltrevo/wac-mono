@@ -1,0 +1,191 @@
+// Being an introduction point, against the cells C tor built.
+//
+// The relay side is a lookup table, and the interesting content is the refusals rather than the
+// lookup. Three of them come from `hs_intropoint.c` and each exists because of a specific thing an
+// attacker would otherwise get: a circuit claimed on somebody else's behalf, many rendezvous attempts
+// for the cost of one circuit, and a client left waiting instead of told to try elsewhere.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  INTRO_ACK_BAD_FORMAT, INTRO_ACK_SUCCESS, INTRO_ACK_UNKNOWN_ID, IntroPoints, Introduced,
+  establishIntro, forgetCircuit, forgetConnection, indexOfKey, introduce1, introduceAckBody,
+} from "../../src/introrelay.wac";
+
+const i32 R_ESTABLISH_CELL = 0;   // the ESTABLISH_INTRO tor built
+const i32 R_KH = 1;               // the circuit nonce it was MACed with
+const i32 R_AUTH_PUBLIC = 2;      // the key it asks to be filed under
+const i32 R_INTRODUCE_CELL = 3;   // an INTRODUCE1 tor built, for a different service
+const i32 R_INTRODUCE_AUTH = 4;   // and the auth key inside it
+
+u8[] none() { return u8[0](); }
+
+/** A service claims a circuit, and a client's cell finds it. */
+export string test_a_circuit_is_claimed_and_found(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  IntroPoints m = IntroPoints.create(4);
+  u8[] cell = ref(R_ESTABLISH_CELL, none(), none());
+  u8[] kh = ref(R_KH, none(), none());
+
+  u8[] filed = establishIntro(m, cell, kh, 7, 0x4001, true);
+  t.eqBytes(filed, ref(R_AUTH_PUBLIC, none(), none()), "the circuit is filed under the auth key");
+  t.eqI32(m.count, 1, "and the relay is holding one introduction point");
+  t.eqI32(indexOfKey(m, ref(R_AUTH_PUBLIC, none(), none())), 0, "which can be found by that key");
+
+  // Re-establishing replaces rather than duplicating. It requires a signature by the same key, so
+  // only the holder can do it, and a service whose circuit died does exactly this.
+  t.eqI32(establishIntro(m, cell, kh, 9, 0x4002, true).len(), 32, "the same key may be re-filed");
+  t.eqI32(m.count, 1, "and it replaces rather than accumulating");
+  t.eqI32(m.connIds[0], 9, "on the new connection");
+  t.eqI32(m.circIds[0], 0x4002, "and the new circuit");
+  return t.report();
+}
+
+/**
+ * The three refusals, each with the thing it prevents.
+ *
+ * A circuit that was extended onward is not ours to claim — accepting one would mean holding an
+ * introduction point on somebody else's behalf, with the INTRODUCE1 cells having nowhere to go.
+ */
+export string test_what_a_relay_refuses(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  IntroPoints m = IntroPoints.create(4);
+  u8[] cell = ref(R_ESTABLISH_CELL, none(), none());
+  u8[] kh = ref(R_KH, none(), none());
+
+  t.eqI32(establishIntro(m, cell, kh, 7, 0x4001, false).len(), 0,
+          "a circuit that carries on elsewhere cannot be an introduction point");
+  t.eqI32(m.count, 0, "and nothing is held");
+
+  // The MAC is keyed with this circuit's nonce, so the same cell on another circuit is refused —
+  // which is what stops a captured ESTABLISH_INTRO being replayed.
+  u8[] otherKh = flip(kh);
+  t.eqI32(establishIntro(m, cell, otherKh, 7, 0x4001, true).len(), 0,
+          "and a cell from another circuit is refused");
+  t.eqI32(m.count, 0, "still nothing held");
+
+  // Full is full. An unbounded map is a way to spend a relay's memory through the one mechanism it
+  // offers strangers, so the cap has to be *reached* to be tested — filling it with a different key
+  // first, since re-establishing the same one replaces rather than grows.
+  IntroPoints small = IntroPoints.create(1);
+  small.authKeys[0] = ref(R_INTRODUCE_AUTH, none(), none());
+  small.connIds[0] = 1;
+  small.circIds[0] = 0x1001;
+  small.count = 1;
+  t.eqI32(establishIntro(small, cell, kh, 7, 0x4001, true).len(), 0,
+          "a full relay refuses a new introduction point rather than growing");
+  t.eqI32(small.count, 1, "and holds what it had");
+  // With room, the same cell is accepted — so the refusal above is the cap and not the cell.
+  IntroPoints roomy = IntroPoints.create(2);
+  roomy.authKeys[0] = ref(R_INTRODUCE_AUTH, none(), none());
+  roomy.connIds[0] = 1;
+  roomy.circIds[0] = 0x1001;
+  roomy.count = 1;
+  t.eqI32(establishIntro(roomy, cell, kh, 7, 0x4001, true).len(), 32, "with room it is accepted");
+  t.eqI32(roomy.count, 2, "and both are held");
+  return t.report();
+}
+
+/**
+ * An INTRODUCE1 for a key nobody holds is a NACK, and the status says which kind of wrong.
+ *
+ * *Unknown id* rather than *bad format* is the difference between a service that has rotated away
+ * from this relay and a client that is broken — and a client that is told can try another
+ * introduction point instead of waiting.
+ */
+export string test_an_introduction_is_routed_or_refused(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  IntroPoints m = IntroPoints.create(4);
+  u8[] intro = ref(R_INTRODUCE_CELL, none(), none());
+
+  Introduced unknown = introduce1(m, intro, true);
+  t.eqI32(unknown.status, INTRO_ACK_UNKNOWN_ID, "nobody holds that key");
+  t.eqI32(unknown.at, -1, "so there is nowhere to forward it");
+
+  // File the very circuit that cell is for, and it routes.
+  IntroPoints held = IntroPoints.create(4);
+  held.authKeys[0] = ref(R_INTRODUCE_AUTH, none(), none());
+  held.connIds[0] = 3;
+  held.circIds[0] = 0x5001;
+  held.count = 1;
+  Introduced routed = introduce1(held, intro, true);
+  t.eqI32(routed.status, INTRO_ACK_SUCCESS, "the auth key in the cell is one we hold");
+  t.eqI32(routed.at, 0, "and it forwards down that circuit");
+
+  // One introduction per circuit. tor blocks the second by name as an attack on the service: many
+  // rendezvous attempts for the cost of one circuit.
+  t.eqI32(introduce1(held, intro, false).status, INTRO_ACK_BAD_FORMAT,
+          "a second introduction on one circuit is refused");
+
+  // A key that shares a first byte with ours and differs later. Two real keys almost never collide
+  // on a prefix, so a comparison that looked at one byte would pass every test above — the same trap
+  // as a truncated digest comparison, and the reason `ctEqual` compares all thirty-two.
+  IntroPoints nearly = IntroPoints.create(4);
+  u8[] lookalike = copy(ref(R_INTRODUCE_AUTH, none(), none()));
+  lookalike[31] = lookalike[31] ^ 1;
+  nearly.authKeys[0] = lookalike;
+  nearly.connIds[0] = 4;
+  nearly.circIds[0] = 0x6001;
+  nearly.count = 1;
+  t.eqI32(introduce1(nearly, intro, true).status, INTRO_ACK_UNKNOWN_ID,
+          "a key that matches only at the front is not the key");
+
+  // A cell whose header does not validate is bad format rather than unknown id — nothing has been
+  // said about any service.
+  t.eqI32(introduce1(held, u8[0](), true).status, INTRO_ACK_BAD_FORMAT, "an empty cell");
+  t.eqI32(introduce1(held, u8[200](), true).status, INTRO_ACK_BAD_FORMAT,
+          "and one whose key type is zero rather than ed25519");
+  u8[] wrongLegacy = copy(intro);
+  wrongLegacy[0] = 1;
+  t.eqI32(introduce1(held, wrongLegacy, true).status, INTRO_ACK_BAD_FORMAT,
+          "and one whose legacy key id is not twenty zeros");
+  return t.report();
+}
+
+/** A circuit or a connection going away takes its introduction points with it. */
+export string test_what_goes_away(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  IntroPoints m = IntroPoints.create(4);
+  u8[] cell = ref(R_ESTABLISH_CELL, none(), none());
+  u8[] kh = ref(R_KH, none(), none());
+  establishIntro(m, cell, kh, 7, 0x4001, true);
+  t.eqI32(m.count, 1, "one held");
+
+  forgetCircuit(m, 7, 0x4002);
+  t.eqI32(m.count, 1, "another circuit closing changes nothing");
+  forgetCircuit(m, 8, 0x4001);
+  t.eqI32(m.count, 1, "nor the same circuit id on another connection — the pair is the identity");
+  forgetCircuit(m, 7, 0x4001);
+  t.eqI32(m.count, 0, "its own circuit closing drops it");
+
+  establishIntro(m, cell, kh, 7, 0x4001, true);
+  forgetConnection(m, 8);
+  t.eqI32(m.count, 1, "another connection closing changes nothing");
+  forgetConnection(m, 7);
+  t.eqI32(m.count, 0, "and its own takes it");
+  return t.report();
+}
+
+/** The ACK body is a status and no extensions. */
+export string test_the_ack_body(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] ok = introduceAckBody(INTRO_ACK_SUCCESS);
+  t.eqI32(ok.len(), 3, "two bytes of status and an extension count");
+  t.eqI32(ok[0], 0, "big-endian high byte");
+  t.eqI32(ok[1], 0, "success is zero");
+  t.eqI32(ok[2], 0, "and no extensions");
+  t.eqI32(introduceAckBody(INTRO_ACK_UNKNOWN_ID)[1], 1, "unknown id is one");
+  t.eqI32(introduceAckBody(INTRO_ACK_BAD_FORMAT)[1], 2, "bad format is two");
+  return t.report();
+}
+
+u8[] flip(u8[] b) {
+  u8[] out = copy(b);
+  out[0] = out[0] ^ 1;
+  return out;
+}
+
+u8[] copy(u8[] b) {
+  u8[] out = u8[b.len()]();
+  for (i32 i = 0; i < b.len(); i++) { out[i] = b[i]; }
+  return out;
+}
