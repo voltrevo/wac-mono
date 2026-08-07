@@ -290,6 +290,10 @@ bool awaitMarker(Core core, Cli cli, Node?[] nodes, i32 live, string name, strin
   }
   Node n = nodes[at]!;
   if (contains(n.said.bytes(), marker)) {
+    // The capture moves here too. Setting it only on the path that waited would make a description
+    // mean different things depending on how fast the node was — the same plan capturing a value on a
+    // slow machine and an empty string on a quick one, which is the worst kind of test to own.
+    n.capture = afterMarker(n.said.bytes(), marker);
     core.warn("network: " + name + " had already said \"" + marker + "\"");
     return true;
   }
