@@ -1,0 +1,32 @@
+// A process that becomes ready twice, which is the shape `tor/src/network.wac`'s `wait` exists for.
+//
+// A relay listens long before it serves directory documents. The consensus it serves is built from
+// descriptors it could not write until it had bound a port, so the two states are necessarily ordered
+// and necessarily apart in time — being up is not one event, and a launcher that treats it as one
+// starts the next step against a process that is running and has nothing to give.
+//
+// Testing that needs a child whose second state arrives after its first has already been observed.
+// `waiter.wac` prints once and sleeps, so it cannot say anything a launcher did not already hear
+// while waiting for it. This prints twice, with a gap.
+//
+// The gap is short on purpose: what is being tested is the *order*, not the duration. A delay long
+// enough to be interesting would make the test a measurement of a sleep, and one shorter than a
+// scheduler tick would let both lines arrive in the same read — which is the case that passes whether
+// the launcher waits or not.
+
+import { Cli, Core } from "../src/platform.wac";
+
+export i32 main(Core core, Cli cli) {
+  core.log("stages: listening");
+  core.sleepMillis(300).wait();
+  core.log("stages: serving");
+
+  // Then the same as `waiter`: alive until something stops it, and loud if nothing does. An hour of
+  // not being stopped is a failure of whatever was supposed to stop it, and saying so is cheaper than
+  // a silent success.
+  for (i32 i = 0; i < 60; i++) {
+    core.sleepMillis(60000).wait();
+  }
+  core.warn("stages: nobody stopped me");
+  return 1;
+}
