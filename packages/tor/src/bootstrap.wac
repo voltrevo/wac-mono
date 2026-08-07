@@ -20,7 +20,7 @@ import { encodeCreate2, decodeCreated2, cellCommand, cellPayload, handshakeNtor,
 import { ntorClientRequest, ntorClientFinish } from "./ntor.wac";
 import { consensusPath, certificatePath, microdescPath, microdescBatches } from "./dirclient.wac";
 import { Link, connectRelay, handshakeTls, linkHandshake, createCircuit, extendTo,
-         fetchOverCircuit, sendCells, ipv4Of, itoa, lines, words, fromHex,
+         fetchOverCircuit, sendCells, nextCell, ipv4Of, itoa, lines, words, fromHex,
          randomI64 } from "./link.wac";
 
 /** A verified view of the network: who is out there, and how to weight them. */
@@ -413,4 +413,53 @@ void extendToward(Core core, Network n, Guard g, Building b, Relay r) {
   sendCells(g.link, b.circ.extendCell(ipv4Of(r.address), r.orPort, r.identity,
                                       ntorClientRequest(r.identity, r.ntorOnionKey,
                                                         b.ephemeral)));
+}
+
+// ── Waiting on a circuit, and finding a relay on it ───────────────────────────
+//
+// Both of these were private to `hsconnect.wac` until a second program needed them. They are here
+// rather than copied because the copies would have been the third and fourth of their kind in this
+// package this week, and two of the first three had already drifted apart.
+
+/** The result of waiting for one relay command. */
+export struct Awaited {
+  bool ok;
+  u8[] data;
+}
+
+/**
+ * Read cells until one carries `command`, or the circuit ends.
+ *
+ * Anything else on the way is fed back through `receive` and its SENDMEs sent, so a circuit that
+ * carries data while we are waiting does not stall. A DESTROY or an unrecognised cell ends the wait
+ * rather than looping: both mean this circuit is finished.
+ *
+ * **This blocks on one circuit**, which is right for a client doing one thing at a time and wrong for
+ * anything watching several at once — a service with three introduction points needs
+ * `startCircuit`/`advanceCircuit` and its own `waitAny`, not this.
+ */
+export Awaited awaitCommand(Core core, Link l, Circuit c, i32 command) {
+  while (!l.dead) {
+    u8[] cell = nextCell(l);
+    if (cell.len() == 0) { return Awaited(false, u8[0]()); }
+    Received got = c.receive(cell);
+    if (got.toSend.len() > 0) { sendCells(l, got.toSend); }
+    if (got.kind == gotDestroyed() || got.kind == gotBroken()) { return Awaited(false, u8[0]()); }
+    if (got.command == command) { return Awaited(true, got.data); }
+  }
+  return Awaited(false, u8[0]());
+}
+
+/** The index of the relay with this ed25519 identity, or -1. */
+export i32 relayByEd25519(Network net, u8[] want) {
+  if (want.len() != 32) { return -1; }
+  for (i32 i = 0; i < net.relays.len(); i++) {
+    u8[] have = net.relays[i].ed25519Identity;
+    if (have.len() == 32) {
+      i32 diff = 0;
+      for (i32 j = 0; j < 32; j++) { diff = diff | (have[j] ^ want[j]); }
+      if (diff == 0) { return i; }
+    }
+  }
+  return -1;
 }
