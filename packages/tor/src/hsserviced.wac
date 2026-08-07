@@ -1,0 +1,346 @@
+// Host a v3 onion service.
+//
+//   deno task app packages/tor/src/hsserviced.wac --allow-net --allow-read -- \
+//     <seed-file> <authorities-file> <identity-seed-file> [--testnet]
+//
+// The other half of `hsconnect.wac`. That program is a client: it fetches a descriptor, introduces
+// itself, and meets a service at a rendezvous point. This is what it meets.
+//
+// Everything it decides is decided elsewhere and pinned against C tor — which introduction points to
+// keep (`hsintropoint.wac`), what the descriptor says (`hsdescbuild.wac`), which directories to send
+// it to (`hsdir.wac`'s `servicePlan`), what an upload's answer means (`hsupload.wac`), and what to do
+// about an INTRODUCE2 (`hsintroduce.wac`). What is left here is the part that can only be done with
+// sockets attached: build the circuits, and keep several of them alive at once.
+//
+// ## Why the loop is the hard part
+//
+// A client does one thing at a time and `awaitCommand` suits it. A service cannot: it holds three
+// introduction circuits, any of which may deliver an INTRODUCE2 at any moment, and it must answer
+// each by building a *fourth* circuit to a rendezvous point while the other three stay up. Blocking
+// on any one of them is what `relayd` did until the multiplexer landed, and it produced exactly the
+// symptom recorded there — whether things worked depended on the order they arrived in.
+//
+// So the loop is a `waitAny` over every open link, and the state per introduction point is a struct
+// rather than a stack frame.
+//
+// ## What it does not do yet
+//
+// One introduction point rather than three, and one page rather than a stream in both directions. The
+// pieces for three are here — `introPointsWanted`, the rotation rules — and the reason for stopping
+// at one is that a second adds no *new* seam: the loop already multiplexes, and proving it does is
+// what matters before scaling the count.
+
+import { Core, Cli, FileResult } from "../../platform/src/platform.wac";
+import { itoa } from "../../fmt/src/itoa.wac";
+import {
+  Awaited, Network, Session, awaitCommand, bootstrap, buildCircuit, buildCircuitTo, relayByEd25519,
+} from "./bootstrap.wac";
+import { Link, publishOverCircuit, sendCells, nextCell } from "./link.wac";
+import { Circuit, Received, gotBroken, gotDestroyed } from "./circuit.wac";
+import {
+  relayEstablishIntro, relayIntroEstablished, relayIntroduce2, relayRendezvous1,
+} from "./relay.wac";
+import { establishIntroCell } from "./hsservice.wac";
+import { INTRO2_OK, Introduction, handleIntroduce2 } from "./hsintroduce.wac";
+import { UPLOAD_OK, UPLOAD_REJECTED } from "./hsupload.wac";
+import { cookieReplayCache, introReplayCache, ReplayCache } from "./hsreplay.wac";
+import { IntroPoint, BUILD_OK, Built, buildDescriptor } from "./hsdescbuild.wac";
+import { Publication, servicePlan, consensusTimePeriod } from "./hsdir.wac";
+import { timeOf } from "./dirclient.wac";
+import { blindedPublicKey, subcredential } from "./hsblind.wac";
+import { ed25519PublicKey } from "../../crypto/src/ed25519.wac";
+import { x25519Base } from "../../crypto/src/x25519.wac";
+import { onionAddress } from "./onionaddr.wac";
+
+/** Two hours, which is what a real service asks for. */
+const i32 LIFETIME_MINUTES = 180;
+
+export i32 main(Core core, Cli cli) {
+  if (cli.argCount().wait() < 3) {
+    core.warn("usage: hsserviced <seed-file> <authorities-file> <identity-seed-file> [--testnet]");
+    return 1;
+  }
+  FileResult seedFile = cli.readFile(string.fromBytes(cli.arg(0).wait())).wait();
+  FileResult authFile = cli.readFile(string.fromBytes(cli.arg(1).wait())).wait();
+  FileResult idFile = cli.readFile(string.fromBytes(cli.arg(2).wait())).wait();
+  if (!seedFile.ok || !authFile.ok || !idFile.ok) {
+    core.warn("hsserviced: could not read the seed, the authorities or the identity");
+    return 1;
+  }
+  if (idFile.bytes.len() < 32) {
+    core.warn("hsserviced: the identity seed must be at least 32 bytes");
+    return 1;
+  }
+  bool testnet = false;
+  i32 argc = cli.argCount().wait();
+  for (i32 i = 3; i < argc; i++) {
+    if (string.fromBytes(cli.arg(i).wait()) == "--testnet") { testnet = true; }
+  }
+
+  // The identity is what the onion address *is*. Printing it first means a caller can start a client
+  // against this service before it has finished publishing, which is how the two are run in one shell.
+  u8[] identitySeed = firstBytes(idFile.bytes, 32);
+  u8[] identityPublic = ed25519PublicKey(identitySeed);
+  core.log("hsserviced: " + string.fromBytes(onionAddress(identityPublic)));
+
+  Network net = bootstrap(core, cli, seedFile.bytes, authFile.bytes, testnet);
+  if (net.relays.len() == 0) {
+    core.warn("hsserviced: bootstrap found no relays");
+    return 1;
+  }
+  core.log("hsserviced: bootstrapped, " + itoa(net.relays.len()) + " relays");
+
+  // ── 1. An introduction point, and the cell that claims it ───────────────────
+  //
+  // The auth key is this circuit's name at that relay: the relay files the circuit under it, and a
+  // client's INTRODUCE1 names the same key so the relay knows which circuit to forward down. It is
+  // ours, generated here, and it is what `handleIntroduce2` must be given rather than reading from
+  // the cell — see `parseIntroduce2`, where taking it from the cell was a real bug.
+  u8[] authSeed = core.randomBytes(32).wait();
+  u8[] authPublic = ed25519PublicKey(authSeed);
+  u8[] encSecret = clamp(core.randomBytes(32).wait());
+  u8[] encPublic = x25519Base(encSecret);
+
+  // Chosen rather than read back off the circuit: a service picks its own introduction points, and
+  // asking the description which relay it ended at would be parsing a string to recover something we
+  // decided. `buildCircuitTo` takes the index.
+  i32 introRelay = firstHsdirCapable(net);
+  if (introRelay < 0) {
+    core.warn("hsserviced: no relay to use as an introduction point");
+    return 1;
+  }
+  Session intro = buildCircuitTo(core, cli, net, introRelay, 0x80000031);
+  if (!intro.ok) {
+    core.warn("hsserviced: could not build an introduction circuit");
+    return 1;
+  }
+  core.log("hsserviced: introduction circuit " + intro.description);
+
+  // ESTABLISH_INTRO is signed over the circuit's own KH, which is why it cannot be built before the
+  // circuit exists and cannot be replayed onto another one.
+  sendCells(intro.link, intro.circ.onionCell(relayEstablishIntro(),
+                                             establishIntroCell(authPublic, authSeed, intro.circ.kh)));
+  Awaited established = awaitCommand(core, intro.link, intro.circ, relayIntroEstablished());
+  if (!established.ok) {
+    core.warn("hsserviced: the introduction point did not confirm");
+    return 1;
+  }
+  core.log("hsserviced: introduction point established at " + net.relays[introRelay].nickname);
+
+  // ── 2. The descriptor, and the directories that hold it ─────────────────────
+  i64[] period = consensusTimePeriod(net.consensus, testnet, 0);
+  if (period[0] < 0) {
+    core.warn("hsserviced: the consensus carries no usable timings");
+    return 1;
+  }
+
+  IntroPoint[] points = IntroPoint[1](fill: IntroPoint(
+    linkSpecifiersFor(net, introRelay), net.relays[introRelay].ntorOnionKey, authSeed, encSecret));
+
+  Publication[] plan = servicePlan(net.consensus, net.relays, blindedKeysFor(identityPublic, period),
+                                   testnet, 0);
+  if (plan.len() != 2) {
+    core.warn("hsserviced: no publication plan — the consensus has no timings to plan from");
+    return 1;
+  }
+
+  i32 uploaded = 0;
+  for (i32 p = 0; p < plan.len(); p++) {
+    Built built = buildDescriptor(identitySeed, core.randomBytes(32).wait(), points,
+                                  plan[p].periodNum, plan[p].periodLength, 1, LIFETIME_MINUTES,
+                                  expiryHours(net), core.randomBytes(32).wait(),
+                                  core.randomBytes(16).wait(), core.randomBytes(16).wait(),
+                                  decoyClients(core));
+    if (built.error != BUILD_OK) {
+      core.warn("hsserviced: could not build the descriptor for period " + itoa(p) +
+                ", error " + itoa(built.error));
+      continue;
+    }
+    uploaded = uploaded + uploadTo(core, cli, net, plan[p], built);
+  }
+  if (uploaded == 0) {
+    core.warn("hsserviced: no directory took the descriptor");
+    return 1;
+  }
+  core.log("hsserviced: published to " + itoa(uploaded) + " directories");
+
+  // ── 3. Wait for a client, and go and meet it ────────────────────────────────
+  u8[] subcred = subcredential(identityPublic, blindedPublicKey(identityPublic, period[0],
+                                                                period[1]));
+  ReplayCache cells = introReplayCache(64);
+  ReplayCache cookies = cookieReplayCache(64);
+
+  while (!intro.link.dead) {
+    u8[] cell = nextCell(intro.link);
+    if (cell.len() == 0) { break; }
+    Received got = intro.circ.receive(cell);
+    if (got.toSend.len() > 0) { sendCells(intro.link, got.toSend); }
+    if (got.kind == gotDestroyed() || got.kind == gotBroken()) { break; }
+    if (got.command != relayIntroduce2()) { continue; }
+
+    // A fresh ephemeral secret per introduction. Reusing one would give two clients a shared view of
+    // the handshake, which is the sort of reuse that is invisible until it is not.
+    Introduction answer = handleIntroduce2(got.data, authPublic, encSecret, subcred,
+                                           clamp(core.randomBytes(32).wait()), cells, cookies,
+                                           core.nowMillis().wait() / 1000, testnet);
+    if (answer.error != INTRO2_OK) {
+      core.warn("hsserviced: an introduction was refused, reason " + itoa(answer.error));
+      continue;
+    }
+    core.log("hsserviced: an introduction, meeting at " +
+             itoa(answer.rendezvous.address[0]) + "." + itoa(answer.rendezvous.address[1]) + "." +
+             itoa(answer.rendezvous.address[2]) + "." + itoa(answer.rendezvous.address[3]) + ":" +
+             itoa(answer.rendezvous.port));
+
+    if (meet(core, cli, net, answer)) {
+      core.log("hsserviced: rendezvous joined");
+    } else {
+      core.warn("hsserviced: could not reach the rendezvous point");
+    }
+  }
+  core.warn("hsserviced: the introduction circuit closed");
+  return 0;
+}
+
+/**
+ * Build a circuit to the rendezvous point the client named and send RENDEZVOUS1.
+ *
+ * A separate circuit, built now rather than kept ready: a service that held one waiting would be
+ * holding it for a rendezvous point it cannot know in advance.
+ */
+bool meet(Core core, Cli cli, Network net, Introduction answer) {
+  i32 target = relayByEd25519(net, answer.rendezvous.ed25519Id);
+  if (target < 0) {
+    core.warn("hsserviced: the client named a rendezvous point that is not in the consensus");
+    return false;
+  }
+  Session rend = buildCircuitTo(core, cli, net, target, 0x80000032);
+  if (!rend.ok) { return false; }
+  sendCells(rend.link, rend.circ.onionCell(relayRendezvous1(), answer.rendezvous1));
+  return true;
+}
+
+/** Upload one descriptor to every directory the plan names, and count what took it. */
+i32 uploadTo(Core core, Cli cli, Network net, Publication where, Built built) {
+  i32 took = 0;
+  for (i32 i = 0; i < where.hsdirs.len(); i++) {
+    i32 r = where.hsdirs[i];
+    Session s = buildCircuitTo(core, cli, net, r, 0x80000040 + i);
+    if (!s.ok) {
+      core.warn("hsserviced: no circuit to " + net.relays[r].nickname);
+      continue;
+    }
+    i32 outcome = publishOverCircuit(s.link, s.circ, built.document,
+                                     net.relays[r].address + ":" + itoa(net.relays[r].orPort));
+    if (outcome == UPLOAD_OK) {
+      took = took + 1;
+      core.log("hsserviced: " + net.relays[r].nickname + " took the descriptor");
+    } else if (outcome == UPLOAD_REJECTED) {
+      // Every other directory will read the same bytes and refuse them too — see `hsupload.wac`.
+      core.warn("hsserviced: " + net.relays[r].nickname + " refused the descriptor; it is the "
+                + "document that is wrong, not the directory");
+      return took;
+    } else {
+      core.warn("hsserviced: " + net.relays[r].nickname + " answered oddly, outcome " +
+                itoa(outcome));
+    }
+  }
+  return took;
+}
+
+/** The blinded key for each of the two periods a service publishes for. */
+u8[][] blindedKeysFor(u8[] identityPublic, i64[] period) {
+  u8[][] out = u8[][2]();
+  out[0] = blindedPublicKey(identityPublic, period[0], period[1]);
+  out[1] = blindedPublicKey(identityPublic, period[0] + 1, period[1]);
+  return out;
+}
+
+/** Sixteen decoy client-auth entries, so using client authorisation is not visible from outside. */
+u8[][] decoyClients(Core core) {
+  u8[][] out = u8[][16]();
+  for (i32 i = 0; i < 16; i++) { out[i] = core.randomBytes(40).wait(); }
+  return out;
+}
+
+/** Hours since the epoch, a year out — the unit a proposal 220 certificate states its expiry in. */
+i64 expiryHours(Network net) {
+  i64 validAfter = timeOf(net.consensus, "valid-after");
+  if (validAfter <= 0) { return 0; }
+  return (validAfter / 3600) + 8760;
+}
+
+/** An IPv4 link specifier list for a relay: where it is, and both of its identities. */
+u8[] linkSpecifiersFor(Network net, i32 i) {
+  u8[] v4 = ipv4Bytes(net.relays[i].address);
+  u8[] id = net.relays[i].identity;
+  u8[] ed = net.relays[i].ed25519Identity;
+  if (v4.len() != 4 || id.len() != 20 || ed.len() != 32) { return u8[0](); }
+  u8[] out = u8[1 + 8 + 22 + 34]();
+  out[0] = 3;
+  out[1] = 0; out[2] = 6;
+  for (i32 k = 0; k < 4; k++) { out[3 + k] = v4[k]; }
+  out[7] = (net.relays[i].orPort >> 8) & 0xFF;
+  out[8] = net.relays[i].orPort & 0xFF;
+  out[9] = 2; out[10] = 20;
+  for (i32 k = 0; k < 20; k++) { out[11 + k] = id[k]; }
+  out[31] = 3; out[32] = 32;
+  for (i32 k = 0; k < 32; k++) { out[33 + k] = ed[k]; }
+  return out;
+}
+
+u8[] ipv4Bytes(string address) {
+  u8[] out = u8[4]();
+  i32 part = 0;
+  i32 value = 0;
+  u8[] a = address.toBytes();
+  for (i32 i = 0; i < a.len(); i++) {
+    if (a[i] == '.') {
+      if (part >= 3) { return u8[0](); }
+      out[part] = value;
+      part = part + 1;
+      value = 0;
+    } else if (a[i] >= '0' && a[i] <= '9') {
+      value = value * 10 + (a[i] - '0');
+      if (value > 255) { return u8[0](); }
+    } else {
+      return u8[0]();
+    }
+  }
+  if (part != 3) { return u8[0](); }
+  out[3] = value;
+  return out;
+}
+
+u8[] firstBytes(u8[] b, i32 n) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = b[i]; }
+  return out;
+}
+
+u8[] clamp(u8[] s) {
+  u8[] out = u8[32]();
+  for (i32 i = 0; i < 32; i++) { out[i] = s[i]; }
+  out[0] = out[0] & 248;
+  out[31] = (out[31] & 127) | 64;
+  return out;
+}
+
+/**
+ * A relay to use as an introduction point.
+ *
+ * The first with both identities and an ntor key, which is what a circuit and a descriptor entry both
+ * need. Deliberately not weighted or random: a service running three of these would choose them the
+ * way a client chooses a path, and choosing well is `pathsel.wac`'s job rather than something to
+ * approximate here — with one introduction point the honest thing is to say it is the first usable
+ * one rather than imply a selection that is not happening.
+ */
+i32 firstHsdirCapable(Network net) {
+  for (i32 i = 0; i < net.relays.len(); i++) {
+    if (net.relays[i].ed25519Identity.len() == 32 && net.relays[i].identity.len() == 20 &&
+        net.relays[i].ntorOnionKey.len() == 32) {
+      return i;
+    }
+  }
+  return -1;
+}
