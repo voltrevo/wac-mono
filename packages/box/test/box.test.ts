@@ -458,6 +458,13 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     assertEquals((await box(["true"])).code, 0);
     assertEquals((await box(["false"])).code, 1);
     assertEquals((await box(["nope"])).code, 2, "an unknown applet is a usage error");
+    // Asked for is not got wrong. Reaching the usage message by mistake is 2; asking for it is 0, which
+    // is what every tool this package imitates does and what a script testing `box --help` expects.
+    for (const how of ["help", "--help", "-h"]) {
+      const asked = await box([how]);
+      assertEquals(asked.code, 0, `box ${how} should succeed, got ${asked.code}`);
+      assertEquals(asked.err.includes("usage: box"), true, `box ${how} should print the usage`);
+    }
 
     // The first applets that recurse, against the real tools over a nested tree.
     //
@@ -2036,9 +2043,22 @@ Deno.test("the README states the applet count the dispatcher actually has", asyn
   // forty-two in a paragraph further down, both written by someone who had just counted.
   const dispatch = await Deno.readTextFile("packages/box/src/box.wac");
   const readme = await Deno.readTextFile("packages/box/README.md");
-  const actual = [...dispatch.matchAll(/if \(applet == "[a-z0-9-]+"/g)].length;
+  const dispatched = [...dispatch.matchAll(/if \(applet == "([a-z0-9-]+)"/g)].map((m) => m[1]).sort();
+  const actual = dispatched.length;
   const claimed = Number(readme.match(/^(\d+) applets/m)?.[1] ?? 0);
   assertEquals(claimed, actual, `the README says ${claimed} applets, box.wac dispatches ${actual}`);
+
+  // And the list the usage message prints must be the same list. It was not: `help` was dispatched and
+  // unlisted, so `box help` worked and the only way to find out was to read the dispatcher. Three counts
+  // were reachable — 57 files in `src/applets/`, 59 names in the usage, 60 branches here — and the test
+  // above only tied two of them together.
+  const listed = (dispatch.match(/string\[\] appletNames\(\) \{[\s\S]*?\n\}/)?.[0] ?? "")
+    .match(/"[a-z0-9-]+"/g)?.map((q) => q.slice(1, -1)).sort() ?? [];
+  assertEquals(
+    listed.join(" "),
+    dispatched.join(" "),
+    "the usage message and the dispatcher disagree about which applets exist",
+  );
   // And the aside in the `bin/` section, which drifted independently of the first line.
   assertEquals(
     readme.includes("with sixty entry points"),

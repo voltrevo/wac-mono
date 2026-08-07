@@ -133,7 +133,11 @@ export i32 dispatch(Core core, Cli cli, Args a, string applet) {
   if (applet == "gunzip")    { return gunzip(core, cli, a); }
   if (applet == "gzip")      { return gzip(core, cli, a); }
   if (applet == "head")      { return head(core, cli, a); }
-  if (applet == "help")      { return usage(core); }
+  // **Asked for is not got wrong.** `usage` answers 2 because reaching it means the command line was
+  // not understood; `box help`, `box --help` and `box -h` are a person asking, and a person who asked
+  // gets 0. Every tool this package imitates does the same, and a script testing `box --help` for
+  // success is a reasonable thing to write.
+  if (applet == "help" || applet == "--help" || applet == "-h") { usage(core); return 0; }
   if (applet == "hex")       { return hex(core, cli, a); }
   if (applet == "httpd")     { return httpd(core, cli, a); }
   if (applet == "json")      { return json(core, cli, a); }
@@ -192,7 +196,7 @@ export string[] appletNames() {
   return string[](
     "base32", "base64", "basename", "cat", "cp", "crc32", "cut", "date", "diff", "dirname",
     "du", "echo", "false", "find", "fold", "get", "gets", "grep", "gunzip", "gzip", "head",
-    "hex", "httpd", "json", "ls", "mkdir", "mv", "nc", "nl", "paste", "rev", "rm", "rmdir",
+    "help", "hex", "httpd", "json", "ls", "mkdir", "mv", "nc", "nl", "paste", "rev", "rm", "rmdir",
     "seq", "serve", "sha256sum", "sha512sum", "shuf", "sort", "split", "sponge", "stat",
     "strings", "tac", "tail", "tar", "tee", "touch", "tr", "true", "uniq", "unzstd",
     "urldecode", "urlencode", "uuid", "wc", "wget", "yes", "zstd"
@@ -211,6 +215,14 @@ i32 usage(Core core) {
   return 2;
 }
 
+/**
+ * The names the usage message prints, which must be the ones the dispatcher answers to.
+ *
+ * Hand-maintained, because wac has no reflection — so `test/box.test.ts` compares this list against the
+ * `if (applet == "…")` branches in this file and fails on any difference. It found the first one: `help`
+ * was dispatched and not listed, so `box help` worked and nothing said so, and the three counts a reader
+ * could arrive at — 57 source files, 59 names here, 60 branches — were all different and all defensible.
+ */
 /** Names in lines no wider than `width`, each indented with `lead`. */
 export string wrapped(string[] ns, string lead, i32 width) {
   string out = "";
