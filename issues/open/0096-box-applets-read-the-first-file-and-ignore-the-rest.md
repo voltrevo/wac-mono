@@ -107,5 +107,8 @@ the applet's dropping it was invisible. The applet's own comment claimed "no lab
 -l -w -c is asked for, as the real one does", which is what `wc -l < f` does. The label goes with the
 file; standard input is what has no name to print.
 
+**`sha256sum` and `sha512sum` are done** — a line per file, `-` for standard input, matching the real
+ones on one file and on several.
+
 Still to do: `grep` (a `file:` prefix when there is more than one), `head` and `tail` (`==> name <==`
-banners), `sha256sum`/`sha512sum` (a line each), `crc32`.
+banners), `crc32`.

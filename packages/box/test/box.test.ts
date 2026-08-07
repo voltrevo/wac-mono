@@ -721,6 +721,8 @@ Deno.test("the applets that read several files read all of them", async () => {
       // when a file's lines are not a palindrome, which the fixture above is, so these lines are not.
       ["tac", "tac", []],
       ["strings", "strings", []],
+      ["sha256sum", "sha256sum", []],
+      ["sha512sum", "sha512sum", []],
     ] as [string, string, string[]][]) {
       const got = await runner.run([applet, ...flags, a1, a2]);
       assertEquals(got.out, sys(cmd, [...flags, a1, a2]), `${applet} over two files`);

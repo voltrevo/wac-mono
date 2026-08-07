@@ -5,24 +5,31 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Chunk, Input, openStream, nextChunk } from "../lib/input.wac";
+import { Chunk, Input, openStream, nextChunk, operandCount } from "../lib/input.wac";
 import { encode as hexencode } from "../../../codec/src/hex.wac";
 import { Sha512 } from "../../../crypto/src/sha512.wac";
 
 export i32 sha512sum(Core core, Cli cli, Args a) {
-  Input in = openStream(core, cli, a, 0);
-  if (!in.ok) { return 1; }
+  // One line per file, as the real one prints — it used to hash the first operand and stop, so
+  // `sha256sum *.tar` checksummed one archive and said nothing about the others (wac-mono 0096).
+  i32 files = operandCount(a, 0);
+  i32 count = files == 0 ? 1 : files;
+  for (i32 f = 0; f < count; f++) {
+    Input in = openStream(core, cli, a, f);
+    if (!in.ok) { return 1; }
 
-  Sha512 h = Sha512.create();
-  while (true) {
-    Chunk got = nextChunk(core, cli, a);
-    if (!got.ok) { return 1; }
-    if (!got.more) { break; }
-    u8[] chunk = got.bytes;
-    h.update(chunk);
+    Sha512 h = Sha512.create();
+    while (true) {
+      Chunk got = nextChunk(core, cli, a);
+      if (!got.ok) { return 1; }
+      if (!got.more) { break; }
+      u8[] chunk = got.bytes;
+      h.update(chunk);
+    }
+
+    string name = in.label == "" ? "-" : in.label;
+    core.log(string.fromBytes(hexencode(h.digest(64))) + "  " + name);
   }
 
-  string name = in.label == "" ? "-" : in.label;
-  core.log(string.fromBytes(hexencode(h.digest(64))) + "  " + name);
   return 0;
 }
