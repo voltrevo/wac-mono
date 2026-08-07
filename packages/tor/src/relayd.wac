@@ -390,8 +390,17 @@ export i32 main(Core core, Cli cli) {
                                  microdescPath);
   DirDocuments docs = loaded.docs;
   bool hasDir = loaded.ok;
+  // Said once per distinct problem rather than once per attempt: the poll runs twice a second, and a
+  // relay pointed at the wrong file should say so clearly, not four hundred times a minute.
+  string complained = "";
   if (wantDir && !hasDir) {
-    core.log("relayd: waiting for " + consensusPath + " — serving no directory documents until it is there");
+    if (loaded.problem != "") {
+      core.warn("relayd: " + loaded.problem);
+      complained = loaded.problem;
+    } else {
+      core.log("relayd: waiting for " + consensusPath +
+               " — serving no directory documents until it is there");
+    }
   }
 
   u8[] certs = identityCerts(id, now);
@@ -510,6 +519,9 @@ export i32 main(Core core, Cli cli) {
       if (again.ok) {
         docs = again.docs;
         hasDir = true;
+      } else if (again.problem != "" && again.problem != complained) {
+        core.warn("relayd: " + again.problem);
+        complained = again.problem;
       }
       continue;
     }
@@ -831,10 +843,33 @@ void dropConn(Core core, Cli cli, Conn c, IntroPoints intros, RendPoints rends) 
  * is meaningless for the client, whose cells name their own circuit. The function returns when the
  * event is handled; `c.live` says whether the connection survived it.
  */
-/** What `loadDocuments` found: the documents, and whether every one of them was there. */
+/** What `loadDocuments` found: the documents, whether every one was there, and what was wrong. */
 struct DirLoad {
   DirDocuments docs;
   bool ok;
+  /** Empty when the files are merely not there yet; otherwise what is wrong with one that is. */
+  string problem;
+}
+
+/**
+ * Whether a file that exists is the document it is supposed to be.
+ *
+ * A relay does not verify a consensus — it is a cache, and the client it hands one to is the party
+ * that checks the signatures. But *serving something that is not a consensus at all* is a different
+ * thing, and until this check existed it happened silently: a run of this program was pointed at
+ * `gendesc`'s JSON vector file, loaded it, logged `serving the consensus`, and would have handed a
+ * bootstrapping client a block of JSON. Nothing anywhere said a word.
+ *
+ * The rule is tor's own: `networkstatus_parse_vote_from_string` requires the document to *start* with
+ * its version keyword. Checking the first keyword is also what makes a half-written file retry
+ * instead of stick — a reader that catches an authority mid-write sees a truncated document, and a
+ * truncated document does not start with the keyword either.
+ */
+bool startsWith(u8[] doc, string keyword) {
+  u8[] k = keyword.toBytes();
+  if (doc.len() < k.len()) { return false; }
+  for (i32 i = 0; i < k.len(); i++) { if (doc[i] != k[i]) { return false; } }
+  return true;
 }
 
 /** The empty set — what a relay serves before its documents exist, and answers 404 from. */
@@ -856,11 +891,19 @@ DirDocuments none() {
  */
 DirLoad loadDocuments(Core core, Cli cli, string consensusPath, string certPath, string[] descPaths,
                       string microConsensusPath, string microdescPath) {
-  if (consensusPath == "" || certPath == "") { return DirLoad(none(), false); }
+  if (consensusPath == "" || certPath == "") { return DirLoad(none(), false, ""); }
   FileResult cf = cli.readFile(consensusPath).wait();
   FileResult kf = cli.readFile(certPath).wait();
   if (!cf.ok || !kf.ok) {
-    return DirLoad(none(), false);
+    return DirLoad(none(), false, "");
+  }
+  if (!startsWith(cf.bytes, "network-status-version")) {
+    return DirLoad(none(), false, consensusPath + " is not a consensus — it does not begin " +
+                                  "\"network-status-version\"");
+  }
+  if (!startsWith(kf.bytes, "dir-key-certificate-version")) {
+    return DirLoad(none(), false, certPath + " is not an authority certificate — it does not begin " +
+                                  "\"dir-key-certificate-version\"");
   }
   // The descriptors too, because tor asks for them over BEGIN_DIR as readily as for the consensus.
   // Leaving them out did not make it ask elsewhere: it read our 404's ten-byte body as "server info"
@@ -870,8 +913,7 @@ DirLoad loadDocuments(Core core, Cli cli, string consensusPath, string certPath,
   for (i32 di = 0; di < descPaths.len(); di++) {
     FileResult df = cli.readFile(descPaths[di]).wait();
     if (!df.ok) {
-      core.warn("relayd: " + descPaths[di] + ": " + df.error);
-      return DirLoad(none(), false);
+      return DirLoad(none(), false, "");
     }
     descriptors = joinBytes(descriptors, df.bytes);
     digests[di] = rsaDescriptorDigest(df.bytes);
@@ -889,7 +931,7 @@ DirLoad loadDocuments(Core core, Cli cli, string consensusPath, string certPath,
     FileResult mcf = cli.readFile(microConsensusPath).wait();
     FileResult mdf = cli.readFile(microdescPath).wait();
     if (!mcf.ok || !mdf.ok) {
-      return DirLoad(none(), false);
+      return DirLoad(none(), false, "");
     }
     microCons = mcf.bytes;
     micros = mdf.bytes;
@@ -902,7 +944,7 @@ DirLoad loadDocuments(Core core, Cli cli, string consensusPath, string certPath,
                               : ", plus " + itoa(microDigests.len()) + " microdescriptor(s)"));
   return DirLoad(DirDocuments(cf.bytes, microCons, kf.bytes, descriptors, digests,
                               dirSourceFingerprint(cf.bytes), micros, microDigests, u8[][0](),
-                              u8[][0]()), true);
+                              u8[][0]()), true, "");
 }
 
 /**

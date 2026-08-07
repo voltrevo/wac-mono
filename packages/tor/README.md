@@ -690,17 +690,28 @@ that sequence needs a port anyone agreed in advance, so two agents can run it at
 that node printed after its ready marker — so a description ending relay1's marker at
 `listening on 127.0.0.1:` makes the port relay1 was given reach a later directive as `{relay1}`:
 
-    node relay1 | listening on 127.0.0.1: | relayd.worker.js s1 -p 0 --descriptor r1.desc -C consensus -K cert -D r1.desc
-    node relay2 | listening on 127.0.0.1: | relayd.worker.js s2 -p 0 --descriptor r2.desc -C consensus -K cert -D r2.desc
-    run  vote   |                         | gendesc.worker.js consensus cert vote microcons <now> r1.desc r2.desc
+    node relay1 | listening on 127.0.0.1: | relayd.worker.js s1 -p 0 --descriptor r1.desc -C v.consensus -K cert.cert -D r1.desc -D r2.desc
+    node relay2 | listening on 127.0.0.1: | relayd.worker.js s2 -p 0 --descriptor r2.desc -C v.consensus -K cert.cert -D r1.desc -D r2.desc
+    run  vote   |                         | gendesc.worker.js keys.json cert vote v - r1.desc r2.desc
     run  fetch  |                         | torapp.worker.js … 127.0.0.1:{relay1} …
 
 An unknown name fails the run by name rather than being passed through as text, because a client that
 dialled a host called `{relya1}` would fail in a way that looked like the network.
 
-**What remains is the description itself** — which relays, which authority, what the client is asked
-to fetch, and a `now` that a static file cannot hold. Every mechanism it needs is in place; nothing
-here is waiting on a decision.
+**And `gendesc` now writes the documents, not only vectors of them.** It always wrote JSON — the
+document wrapped up with the keys that signed it, which is what the differential tests want — and
+every caller that needed a *document* extracted it with a script first. `dird` has documented the
+convention since it was written (*"`<consensus>.micro` and `<consensus>.mds` are what `gendesc`
+writes"*) and gendesc never wrote them. It does now, under the names dird was already looking for:
+`<consensus-out>.consensus`, `.consensus.micro`, `.consensus.mds`, and `<cert-out>.cert`. A
+description file can only name wac programs, so this is what makes an authority a thing a launcher
+runs rather than a step a human does in between.
+
+The `now` argument takes `-`, meaning *read the clock*. A plan is written once and run whenever, so a
+timestamp baked into it is a document that expires.
+
+**What remains is the description itself** — which relays, which authority, and what the client is
+asked to fetch. Every mechanism it needs is in place; nothing here is waiting on a decision.
 
 ## What is not here
 
