@@ -1,0 +1,182 @@
+// Being a rendezvous point.
+//
+// **On the oracle, honestly.** The other relay-side files are checked against cells C tor built.
+// These two cells carry no cryptography a relay can check — ESTABLISH_RENDEZVOUS is twenty bytes of
+// cookie, RENDEZVOUS1 is that cookie and an opaque handshake — so a captured cell would pin nothing a
+// hand-written one does not. What is being checked here is the *rules*, read from `rendmid.c`, and
+// they are all refusals and lifetimes rather than bytes. The cells come from our own builders, which
+// is a symmetric oracle and is stated rather than glossed.
+
+import { T } from "../../../wactest/src/assert.wac";
+import {
+  Joined, REND_COOKIE_LEN, RV_OK, RV_REFUSED, RV_UNKNOWN_COOKIE, RendPoints, establishRendezvous,
+  forgetCircuit, forgetConnection, indexOfCookie, rendezvous1,
+} from "../../src/rendrelay.wac";
+
+/** A client waits, a service arrives, and the two are joined. */
+export string test_a_cookie_joins_two_circuits() {
+  T t = T.create();
+  RendPoints m = RendPoints.create(4);
+  u8[] cookie = cookieOf(1);
+
+  t.eqI32(establishRendezvous(m, cookie, 3, 0x7001, true), RV_OK, "the client's cookie is held");
+  t.eqI32(m.count, 1, "one circuit waiting");
+  t.eqI32(indexOfCookie(m, cookie), 0, "found by its cookie");
+
+  u8[] handshake = fill(64, 9);
+  Joined joined = rendezvous1(m, withCookie(cookie, handshake), true);
+  t.eqI32(joined.error, RV_OK, "the service's cell finds it");
+  t.eqI32(joined.connId, 3, "on the connection the client used");
+  t.eqI32(joined.circId, 0x7001, "and the circuit it used");
+  t.eqBytes(joined.rendezvous2, handshake,
+            "and the client is sent everything after the cookie, which the relay never reads");
+
+  // Consumed. Leaving it would let a third circuit present the same cookie to a rendezvous already
+  // in progress.
+  t.eqI32(m.count, 0, "the cookie is gone once it has done its job");
+  t.eqI32(rendezvous1(m, withCookie(cookie, handshake), true).error, RV_UNKNOWN_COOKIE,
+          "so presenting it again finds nothing");
+  return t.report();
+}
+
+/**
+ * A duplicate cookie is refused — the opposite of an introduction point.
+ *
+ * There is no signature and no key here: anyone may pick any cookie, and the client sends it to this
+ * relay in the clear. Letting a second establishment take over an existing one would let anyone steal
+ * a rendezvous by guessing or by watching.
+ */
+export string test_a_duplicate_cookie_is_refused() {
+  T t = T.create();
+  RendPoints m = RendPoints.create(4);
+  u8[] cookie = cookieOf(2);
+
+  t.eqI32(establishRendezvous(m, cookie, 3, 0x7001, true), RV_OK, "the first is held");
+  t.eqI32(establishRendezvous(m, cookie, 4, 0x7002, true), RV_REFUSED,
+          "and a second circuit cannot take it over");
+  t.eqI32(m.count, 1, "the original is untouched");
+  t.eqI32(m.connIds[0], 3, "on its own connection");
+  t.eqI32(m.circIds[0], 0x7001, "and its own circuit");
+
+  // A different cookie is a different rendezvous and is fine.
+  t.eqI32(establishRendezvous(m, cookieOf(3), 4, 0x7002, true), RV_OK, "another cookie is held");
+  t.eqI32(m.count, 2, "both wait");
+  return t.report();
+}
+
+/**
+ * The two cells check their lengths differently, and it matters.
+ *
+ * ESTABLISH_RENDEZVOUS is *exactly* twenty bytes; RENDEZVOUS1 is *at least* twenty, because the
+ * handshake follows the cookie. Writing one check where the other belongs breaks the protocol in a
+ * way that appears only once a service actually answers.
+ */
+export string test_the_lengths_are_checked_differently() {
+  T t = T.create();
+  RendPoints m = RendPoints.create(4);
+
+  t.eqI32(establishRendezvous(m, fill(19, 1), 3, 0x7001, true), RV_REFUSED, "nineteen is not a cookie");
+  t.eqI32(establishRendezvous(m, fill(21, 1), 3, 0x7001, true), RV_REFUSED,
+          "and neither is twenty-one — there is nothing else in that cell");
+  t.eqI32(establishRendezvous(m, u8[0](), 3, 0x7001, true), RV_REFUSED, "nor nothing at all");
+  t.eqI32(m.count, 0, "so nothing is waiting");
+
+  u8[] cookie = cookieOf(4);
+  t.eqI32(establishRendezvous(m, cookie, 3, 0x7001, true), RV_OK, "twenty exactly is");
+
+  // RENDEZVOUS1 with the cookie and no handshake is well-formed: the length rule is `>=`.
+  Joined bare = rendezvous1(m, cookie, true);
+  t.eqI32(bare.error, RV_OK, "a RENDEZVOUS1 of exactly twenty bytes is accepted");
+  t.eqI32(bare.rendezvous2.len(), 0, "with nothing to forward");
+
+  t.eqI32(establishRendezvous(m, cookie, 3, 0x7001, true), RV_OK, "waiting again");
+  t.eqI32(rendezvous1(m, fill(19, 4), true).error, RV_REFUSED, "and nineteen is too short for either");
+  return t.report();
+}
+
+/** What a relay refuses, and what it forgets. */
+export string test_refusals_and_lifetimes() {
+  T t = T.create();
+  RendPoints m = RendPoints.create(4);
+  u8[] cookie = cookieOf(5);
+
+  t.eqI32(establishRendezvous(m, cookie, 3, 0x7001, false), RV_REFUSED,
+          "a circuit that carries on elsewhere is not a rendezvous point");
+  t.eqI32(rendezvous1(m, withCookie(cookie, fill(64, 1)), false).error, RV_REFUSED,
+          "and cannot complete one either");
+
+  // Full is full, and reaching the cap needs distinct cookies rather than a repeat.
+  RendPoints small = RendPoints.create(2);
+  t.eqI32(establishRendezvous(small, cookieOf(6), 1, 1, true), RV_OK, "one");
+  t.eqI32(establishRendezvous(small, cookieOf(7), 1, 2, true), RV_OK, "two");
+  t.eqI32(establishRendezvous(small, cookieOf(8), 1, 3, true), RV_REFUSED, "and no more");
+  t.eqI32(small.count, 2, "the relay holds what it said it would");
+
+  // A cookie matching only at the front is not the cookie.
+  RendPoints nearly = RendPoints.create(4);
+  establishRendezvous(nearly, cookie, 3, 0x7001, true);
+  u8[] lookalike = copy(cookie);
+  lookalike[19] = lookalike[19] ^ 1;
+  t.eqI32(rendezvous1(nearly, withCookie(lookalike, fill(64, 1)), true).error, RV_UNKNOWN_COOKIE,
+          "one byte apart is a different rendezvous");
+
+  // And circuits going away take their cookies.
+  t.eqI32(nearly.count, 1, "still waiting");
+  forgetCircuit(nearly, 3, 0x7002);
+  t.eqI32(nearly.count, 1, "another circuit closing changes nothing");
+  forgetCircuit(nearly, 3, 0x7001);
+  t.eqI32(nearly.count, 0, "its own does");
+
+  establishRendezvous(nearly, cookie, 5, 0x8001, true);
+  forgetConnection(nearly, 6);
+  t.eqI32(nearly.count, 1, "another connection closing changes nothing");
+  forgetConnection(nearly, 5);
+  t.eqI32(nearly.count, 0, "and its own takes it");
+  return t.report();
+}
+
+/** Several waiting at once, and the right one is joined. */
+export string test_the_right_one_is_joined() {
+  T t = T.create();
+  RendPoints m = RendPoints.create(8);
+  for (i32 i = 0; i < 5; i++) {
+    t.eqI32(establishRendezvous(m, cookieOf(20 + i), i + 1, 0x9000 + i, true), RV_OK, "waiting");
+  }
+  t.eqI32(m.count, 5, "five circuits waiting");
+
+  Joined middle = rendezvous1(m, withCookie(cookieOf(22), fill(64, 3)), true);
+  t.eqI32(middle.error, RV_OK, "the third is found");
+  t.eqI32(middle.connId, 3, "on its own connection");
+  t.eqI32(middle.circId, 0x9002, "and its own circuit");
+  t.eqI32(m.count, 4, "and only it is consumed");
+  // The ones after it are still findable, which a removal that shuffled wrongly would break.
+  t.isTrue(indexOfCookie(m, cookieOf(23)) >= 0, "the fourth is still waiting");
+  t.isTrue(indexOfCookie(m, cookieOf(24)) >= 0, "and the fifth");
+  t.eqI32(indexOfCookie(m, cookieOf(22)), -1, "while the third is gone");
+  return t.report();
+}
+
+u8[] cookieOf(i32 role) {
+  u8[] out = u8[REND_COOKIE_LEN]();
+  for (i32 i = 0; i < REND_COOKIE_LEN; i++) { out[i] = (role * 37 + i * 11 + 3) & 0xFF; }
+  return out;
+}
+
+u8[] withCookie(u8[] cookie, u8[] rest) {
+  u8[] out = u8[cookie.len() + rest.len()]();
+  for (i32 i = 0; i < cookie.len(); i++) { out[i] = cookie[i]; }
+  for (i32 i = 0; i < rest.len(); i++) { out[cookie.len() + i] = rest[i]; }
+  return out;
+}
+
+u8[] fill(i32 n, i32 role) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (role * 53 + i * 7 + 1) & 0xFF; }
+  return out;
+}
+
+u8[] copy(u8[] b) {
+  u8[] out = u8[b.len()]();
+  for (i32 i = 0; i < b.len(); i++) { out[i] = b[i]; }
+  return out;
+}

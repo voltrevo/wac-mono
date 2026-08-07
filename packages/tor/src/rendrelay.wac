@@ -1,0 +1,155 @@
+// Being a rendezvous point: hold a cookie, then join two circuits that never learn about each other.
+//
+// A client builds a circuit here and leaves a twenty-byte cookie. A service, told that cookie through
+// an introduction point, builds its own circuit here and presents it. The relay matches them, hands
+// the service's handshake to the client, and from then on relays cells between two circuits it cannot
+// read.
+//
+// It is the least cryptographic file in the onion protocol and the most exposed: everything it holds
+// comes from strangers, the cookie is the only credential, and the cookie is the only thing that ever
+// needs to match. So the whole of it is `rendmid.c`'s rules, and the ones worth naming are:
+//
+//   - **a duplicate cookie is refused rather than replacing.** The opposite of an introduction point,
+//     where re-establishing under the same auth key is a service recovering. Here there is no
+//     signature and no key: anyone may pick any cookie, so letting a second establishment take over
+//     an existing one would let anyone steal a rendezvous by guessing — or by watching, since the
+//     client sends it in the clear to the relay.
+//   - **the cookie is removed when the circuits join.** It has done its job, and leaving it would let
+//     a third circuit present the same cookie to a rendezvous that is already in progress.
+//   - **an unknown cookie is ordinary.** tor's comment says so: a client that gave up after sending
+//     INTRODUCE1 but before the service answered leaves exactly this. It closes the circuit and is
+//     not evidence of an attack.
+//   - **the length check differs between the two cells.** ESTABLISH_RENDEZVOUS must be *exactly*
+//     twenty bytes; RENDEZVOUS1 must be *at least* twenty, because the handshake follows the cookie.
+//     One `==` where the other wants `>=` breaks the protocol in a way that only shows up once a
+//     service actually answers.
+
+import { ctEqual } from "../../crypto/src/ct.wac";
+
+/** `REND_COOKIE_LEN`. */
+export const i32 REND_COOKIE_LEN = 20;
+
+export const i32 RV_OK = 0;
+/** Not an edge circuit, the wrong length, or a cookie already held. */
+export const i32 RV_REFUSED = 1;
+/** No circuit is waiting for that cookie — usually a client that gave up. */
+export const i32 RV_UNKNOWN_COOKIE = 2;
+
+/** The circuits waiting at this relay for somebody to present their cookie. */
+export struct RendPoints {
+  u8[][] cookies;
+  i32[] connIds;
+  i32[] circIds;
+  i32 count;
+  i32 capacity;
+
+  RendPoints create(i32 capacity) {
+    return RendPoints(u8[][capacity](), i32[capacity](), i32[capacity](), 0, capacity);
+  }
+}
+
+/**
+ * A client leaves a cookie and waits.
+ *
+ * `circuitEndsHere` is the caller's: tor refuses this on a circuit it has extended onward, because a
+ * rendezvous point is by definition where a circuit stops.
+ */
+export i32 establishRendezvous(
+  RendPoints m, u8[] body, i32 connId, i32 circId, bool circuitEndsHere
+) {
+  if (!circuitEndsHere) { return RV_REFUSED; }
+  // Exactly twenty. A longer body is not a cookie with something after it — there is nothing else in
+  // this cell — and accepting one would mean two clients could hold cookies that differ only in bytes
+  // nobody compares.
+  if (body.len() != REND_COOKIE_LEN) { return RV_REFUSED; }
+  if (indexOfCookie(m, body) >= 0) { return RV_REFUSED; }
+  if (m.count >= m.capacity) { return RV_REFUSED; }
+
+  m.cookies[m.count] = body;
+  m.connIds[m.count] = connId;
+  m.circIds[m.count] = circId;
+  m.count = m.count + 1;
+  return RV_OK;
+}
+
+/** What to do about a RENDEZVOUS1: whether it joined, to whom, and what to forward. */
+export struct Joined {
+  i32 error;
+  /** The waiting entry that matched, or -1 — read it before `remove` drops it. */
+  i32 at;
+  /** The body of the RENDEZVOUS2 to send the client: everything after the cookie. */
+  u8[] rendezvous2;
+  i32 connId;
+  i32 circId;
+}
+
+Joined refused(i32 error) { return Joined(error, -1, u8[0](), 0, 0); }
+
+/**
+ * A service presents a cookie, and the two circuits become one path.
+ *
+ * The cookie is consumed: on success the entry is gone, so a second cell carrying it finds nothing.
+ * The client is sent everything *after* the cookie — tor forwards `request + REND_COOKIE_LEN` — and
+ * the relay never looks at those bytes, which are the service's half of a handshake addressed to the
+ * client.
+ */
+export Joined rendezvous1(RendPoints m, u8[] body, bool circuitEndsHere) {
+  if (!circuitEndsHere) { return refused(RV_REFUSED); }
+  // At least twenty, not exactly: the handshake follows the cookie.
+  if (body.len() < REND_COOKIE_LEN) { return refused(RV_REFUSED); }
+
+  u8[] cookie = u8[REND_COOKIE_LEN]();
+  for (i32 i = 0; i < REND_COOKIE_LEN; i++) { cookie[i] = body[i]; }
+  i32 at = indexOfCookie(m, cookie);
+  if (at < 0) { return refused(RV_UNKNOWN_COOKIE); }
+
+  u8[] rest = u8[body.len() - REND_COOKIE_LEN]();
+  for (i32 i = 0; i < rest.len(); i++) { rest[i] = body[REND_COOKIE_LEN + i]; }
+  Joined out = Joined(RV_OK, at, rest, m.connIds[at], m.circIds[at]);
+  removeAt(m, at);
+  return out;
+}
+
+/** Forget a waiting circuit that has gone away. */
+export void forgetCircuit(RendPoints m, i32 connId, i32 circId) {
+  i32 kept = 0;
+  for (i32 i = 0; i < m.count; i++) {
+    if (m.connIds[i] == connId && m.circIds[i] == circId) { continue; }
+    m.cookies[kept] = m.cookies[i];
+    m.connIds[kept] = m.connIds[i];
+    m.circIds[kept] = m.circIds[i];
+    kept = kept + 1;
+  }
+  m.count = kept;
+}
+
+/** Forget everything on a connection that has closed. */
+export void forgetConnection(RendPoints m, i32 connId) {
+  i32 kept = 0;
+  for (i32 i = 0; i < m.count; i++) {
+    if (m.connIds[i] == connId) { continue; }
+    m.cookies[kept] = m.cookies[i];
+    m.connIds[kept] = m.connIds[i];
+    m.circIds[kept] = m.circIds[i];
+    kept = kept + 1;
+  }
+  m.count = kept;
+}
+
+/** Which entry holds this cookie, or -1. */
+export i32 indexOfCookie(RendPoints m, u8[] cookie) {
+  if (cookie.len() != REND_COOKIE_LEN) { return -1; }
+  for (i32 i = 0; i < m.count; i++) {
+    if (ctEqual(m.cookies[i], cookie)) { return i; }
+  }
+  return -1;
+}
+
+void removeAt(RendPoints m, i32 at) {
+  for (i32 i = at; i < m.count - 1; i++) {
+    m.cookies[i] = m.cookies[i + 1];
+    m.connIds[i] = m.connIds[i + 1];
+    m.circIds[i] = m.circIds[i + 1];
+  }
+  m.count = m.count - 1;
+}
