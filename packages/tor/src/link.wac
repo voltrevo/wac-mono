@@ -9,7 +9,7 @@
 // is a stranger from a public directory and one that answers the TCP handshake and then says
 // nothing is not hypothetical.
 
-import { relayDataLen } from "./relay.wac";
+import { NTOR_KEY_MATERIAL, relayDataLen } from "./relay.wac";
 import { Core, Cli, Socket, Pending } from "../../platform/src/platform.wac";
 import { Vec } from "../../std/src/vec.wac";
 import { Relay } from "./directory.wac";
@@ -311,8 +311,10 @@ export u8[] createCircuit(Link l, Circuit c, u8[] identity, u8[] onionKey, u8[] 
     return u8[0]();
   }
   if (cellCommand(cell, 0) != cmdCreated2()) { return u8[0](); }
+  // 92 rather than 72: the extra twenty are KH, which `Circuit` keeps and a service needs. See
+  // `Hop.create`.
   return ntorClientFinish(identity, onionKey, ephemeral,
-                          decodeCreated2(cellPayload(cell, 0)), 72);
+                          decodeCreated2(cellPayload(cell, 0)), NTOR_KEY_MATERIAL);
 }
 
 /** Extend to one more relay, through the hops already built. */
@@ -326,7 +328,7 @@ export bool extendTo(Link l, Circuit c, Relay r, u8[] ephemeral) {
     if (got.kind == gotBroken() || got.kind == gotDestroyed()) { return false; }
     if (got.kind == gotExtended()) {
       u8[] keys = ntorClientFinish(r.identity, r.ntorOnionKey, ephemeral,
-                                   extendedReply(got.data), 72);
+                                   extendedReply(got.data), NTOR_KEY_MATERIAL);
       // An empty return is how ntor reports failure: the AUTH did not match, or the reply
       // was a small-order point. Either way the party at the other end does not hold the
       // key the consensus named, and there is nothing to negotiate.

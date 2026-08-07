@@ -95,6 +95,20 @@ export i32 relayIntroduceAck() { return 40; }
  * or a facade of function pointers. A boolean and two spare hash states is the smallest of the three,
  * and the branch is in the two places that take a digest rather than spread through the file.
  */
+/**
+ * How many bytes to expand from an ntor handshake: the hop's own seventy-two, then KH.
+ *
+ * `onion_crypto.c` asks for `keys_out_len + DIGEST_LEN` and reads the nonce from
+ * `keys_tmp + keys_out_len`, so the two are one expansion rather than two derivations. Named because
+ * it is passed at every handshake call site, and a site that quietly went back to seventy-two would
+ * produce a circuit that works for everything except hosting an onion service — a failure that only
+ * shows up as an introduction point refusing an ESTABLISH_INTRO whose MAC was keyed with nothing.
+ */
+export const i32 NTOR_KEY_MATERIAL = 92;
+
+/** The hop's share of it — two digests and two keys. The rest is the circuit's. */
+export const i32 HOP_KEY_MATERIAL = 72;
+
 export struct Hop {
   bool wide;
   Sha1 forwardDigest;
@@ -104,8 +118,18 @@ export struct Hop {
   CtrStream forwardCipher;
   CtrStream backwardCipher;
 
+  /**
+   * A hop from ntor key material.
+   *
+   * **72 or 92.** The first seventy-two bytes are this hop's — two digests and two keys. A ninety-two
+   * byte expansion carries twenty more, the nonce tor calls `rend_circ_nonce` and the specification
+   * calls KH, which a service keys ESTABLISH_INTRO's MAC with. It belongs to the *circuit* rather
+   * than to the hop's crypto, so it is read off by `Circuit` and ignored here — but the length is
+   * accepted rather than trapped on, because trapping would mean every caller that wants a KH has to
+   * slice before calling and the two lengths would drift apart at each call site.
+   */
   Hop create(u8[] material) {
-    if (material.len() != 72) { trap; }
+    if (material.len() != HOP_KEY_MATERIAL && material.len() != NTOR_KEY_MATERIAL) { trap; }
     u8[] df = u8[20]();
     u8[] db = u8[20]();
     u8[] kf = u8[16]();

@@ -173,13 +173,23 @@ export string test_agrees_with_tors_own_implementation(fn[u8[](u8[], u8[], u8[],
     u8[] clientPriv = fill(32, i + 43);
     u8[] req = ntorClientRequest(id, onionKey, clientPriv);
 
-    u8[] out = ref(onionPriv, id, req, 72);
-    t.isTrue(out.len() == 64 + 72, "tor answered round " + itoa64(i as i64));
-    if (out.len() == 64 + 72) {
-      u8[] keys = ntorClientFinish(id, onionKey, clientPriv, slice(out, 0, 64), 72);
-      t.eqI32(keys.len(), 72, "we accepted tor's reply " + itoa64(i as i64));
+    // **92, not 72.** The first 72 bytes are the two digests and the two keys a circuit hop needs;
+    // the twenty after them are the nonce tor calls `rend_circ_nonce` and the specification calls KH,
+    // which is what ESTABLISH_INTRO's MAC is keyed with. `onion_crypto.c` asks its handshake for
+    // `keys_out_len + DIGEST_LEN` and takes the nonce from `keys_tmp + keys_out_len`, so requesting
+    // the longer stream from tor's own tool pins both halves at once — and pins that they come from
+    // *one* expansion rather than two, which is the thing a service that derived KH separately would
+    // get subtly wrong.
+    u8[] out = ref(onionPriv, id, req, 92);
+    t.isTrue(out.len() == 64 + 92, "tor answered round " + itoa64(i as i64));
+    if (out.len() == 64 + 92) {
+      u8[] keys = ntorClientFinish(id, onionKey, clientPriv, slice(out, 0, 64), 92);
+      t.eqI32(keys.len(), 92, "we accepted tor's reply " + itoa64(i as i64));
       t.eqBytes(keys, slice(out, 64, out.len()),
-                "and derived tor's keys byte for byte " + itoa64(i as i64));
+                "and derived tor's keys and nonce byte for byte " + itoa64(i as i64));
+      // Named, so a reader knows where the boundary is and a change to it is visible here.
+      t.eqI32(slice(keys, 0, 72).len(), 72, "the first seventy-two are the hop's");
+      t.eqI32(slice(keys, 72, 92).len(), 20, "and the last twenty are KH");
     }
   }
   return t.report();

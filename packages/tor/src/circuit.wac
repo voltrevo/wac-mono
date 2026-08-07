@@ -36,7 +36,7 @@
 // multiple of the increment, which is one cell *before* the SENDME goes out.
 
 import { Vec } from "../../std/src/vec.wac";
-import {
+import { HOP_KEY_MATERIAL, NTOR_KEY_MATERIAL,
   Hop, encryptRelay, decryptRelay, relayRecognized, relayCommand, relayStreamId,
   relayPayload, relayLengthValid, beginBody, extend2Body, extended2Reply, sendmeBodyV1,
   relayBegin, relayData, relayEnd, relayConnected, relaySendme, relayBeginDir,
@@ -90,6 +90,14 @@ export struct Stream {
   bool ended;
 }
 
+/** The trailing twenty bytes of a 92-byte ntor expansion — KH — or empty if it was the short one. */
+u8[] nonceOf(u8[] material) {
+  if (material.len() < NTOR_KEY_MATERIAL) { return u8[0](); }
+  u8[] out = u8[NTOR_KEY_MATERIAL - HOP_KEY_MATERIAL]();
+  for (i32 i = 0; i < out.len(); i++) { out[i] = material[HOP_KEY_MATERIAL + i]; }
+  return out;
+}
+
 export struct Circuit {
   i32 circId;
   Vec<Hop> hops;
@@ -102,18 +110,38 @@ export struct Circuit {
    * multiple of the increment. Empty when none is owed.
    */
   u8[] pendingSendmeDigest;
+  /**
+   * KH — the twenty-byte nonce shared with the **last** hop, or empty if the material was short.
+   *
+   * `onion_crypto.c` asks the handshake for `keys_out_len + DIGEST_LEN` and takes this from
+   * `keys_tmp + keys_out_len`, so it is the tail of the same expansion the hop's keys came from
+   * rather than a separate derivation. A service needs it to key ESTABLISH_INTRO, which is what
+   * stops that cell being replayable onto another circuit.
+   */
+  u8[] kh;
 
   Circuit create(i32 circId, u8[] material) {
     Vec<Hop> hops = Vec.create();
     hops.push(Hop.create(material));
-    return Circuit(circId, hops, CIRCUIT_WINDOW, CIRCUIT_WINDOW, Vec.create(), 1, u8[0]());
+    return Circuit(circId, hops, CIRCUIT_WINDOW, CIRCUIT_WINDOW, Vec.create(), 1, u8[0](),
+                   nonceOf(material));
   }
 
   /** How many relays the circuit runs through. */
   i32 length(const this) { return this.hops.len(); }
 
-  /** Add a hop from the key material an EXTENDED2 produced. */
-  void addHop(this, u8[] material) { this.hops.push(Hop.create(material)); }
+  /**
+   * Add a hop from the key material an EXTENDED2 produced.
+   *
+   * The KH follows the *last* hop, because that is the relay a circuit-level onion cell is addressed
+   * to: a service's ESTABLISH_INTRO is MACed with the nonce shared with the introduction point, which
+   * is wherever the circuit currently ends. Extending again replaces it, which is correct and worth
+   * saying — a KH captured before an extension would be keyed to a relay in the middle.
+   */
+  void addHop(this, u8[] material) {
+    this.hops.push(Hop.create(material));
+    this.kh = nonceOf(material);
+  }
 
   /**
    * A relay cell for hop `target`, wrapped in the layers between us and it.

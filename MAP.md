@@ -4,8 +4,8 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-32 packages, 65,597 lines of wac, 1351 tests,
-38 command-line programs and 4 browser pages.
+32 packages, 66,072 lines of wac, 1353 tests,
+39 command-line programs and 4 browser pages.
 
 ## Packages
 
@@ -44,7 +44,7 @@ In dependency order: nothing here imports anything below it.
 | [`ens`](packages/ens/) | The name a person types, turned into the node a contract is asked about. | 361 | 13 | `crypto` `mpt` |
 | [`lightclient`](packages/lightclient/) | **The Altair sync protocol works. | 642 | 12 | `bls` `ssz` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,551 | 46 | `bytes` `codec` `crypto` `fmt` `platform` `sh` |
-| [`tor`](packages/tor/) | Tor in wac, both ends: a client and SOCKS5 proxy, a relay, a directory authority, an onion-service client, and a test network with no C tor in it. | 14,222 | 268 | `bytes` `codec` `crypto` `datetime` `fmt` `http` `platform` `std` `tls` `wactest` |
+| [`tor`](packages/tor/) | Tor in wac, both ends: a client and SOCKS5 proxy, a relay, a directory authority, an onion-service client, and a test network with no C tor in it. | 14,697 | 270 | `bytes` `codec` `crypto` `datetime` `fmt` `http` `platform` `std` `tls` `wactest` |
 
 ## Programs
 
@@ -94,6 +94,7 @@ reach — see `packages/platform/README.md`.
 | `packages/tor/src/genintro.wac` | Write an ESTABLISH_INTRO cell to a file, so tor's own parser can judge it. |
 | `packages/tor/src/hsconnect.wac` | Connect to a v3 onion service and fetch a page from it. |
 | `packages/tor/src/hsfetch.wac` | Fetch a v3 onion service's descriptor from the network, and say what is in it. |
+| `packages/tor/src/hsserviced.wac` | Host a v3 onion service. |
 | `packages/tor/src/network.wac` | Stand up a Tor network from a description, run something across it, and take it down. |
 | `packages/tor/src/relayd.wac` | A Tor relay: accept a connection, prove who we are, and carry circuits. |
 | `packages/tor/src/socks.wac` | A SOCKS5 proxy that carries streams over Tor. |

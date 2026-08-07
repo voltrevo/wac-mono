@@ -13,6 +13,7 @@ import { Circuit, Received, gotData, gotEnd, gotConnected, gotBroken, gotDestroy
 import { Hop, encryptRelay, decryptRelay, relayRecognized, relayPayload, relayCommand,
          relayData, relayEnd, relayConnected, relaySendme } from "../../src/relay.wac";
 import { encodeFixed, cmdRelay, cmdDestroy, cellPayload } from "../../src/cell.wac";
+import { HOP_KEY_MATERIAL, NTOR_KEY_MATERIAL } from "../../src/relay.wac";
 
 u8[] material(i32 seed) {
   u8[] m = u8[72]();
@@ -43,7 +44,7 @@ u8[] fromRelay(Hop relay, i32 circId, i32 command, i32 streamId, u8[] data) {
 
 export string test_a_stream_carries_data_both_ways() {
   T t = T.create();
-  u8[] m = material(1);
+  u8[] m = khMaterial(1);
   Circuit c = Circuit.create(7, m);
   Hop relay = Hop.create(swapped(m));
 
@@ -236,4 +237,66 @@ u8[] encryptRelayRaw(Hop hop, u8[] body) {
   u8[] digest = hop.forwardDigest.peek();
   for (i32 i = 0; i < 4; i++) { body[5 + i] = digest[i]; }
   return hop.forwardCipher.apply(body);
+}
+
+/**
+ * KH is the tail of the hop's own key expansion, and it follows the last hop.
+ *
+ * A service keys ESTABLISH_INTRO's MAC with it, which is what stops that cell being replayed onto
+ * another circuit — so it has to be the nonce shared with the relay the circuit currently *ends* at,
+ * and it has to come from the same expansion as that hop's keys rather than a second derivation.
+ * `onion_crypto.c` takes it from `keys_tmp + keys_out_len` of one handshake, and the agreement with
+ * tor's own numbers is pinned in `ntor_wac.test.ts`, which now asks for all ninety-two bytes.
+ */
+export string test_the_circuit_nonce_follows_the_last_hop() {
+  T t = T.create();
+  u8[] first = khMaterial(1);
+  Circuit c = Circuit.create(7, first);
+  t.eqI32(c.kh.len(), 20, "a circuit built from a full expansion has a nonce");
+  t.eqBytes(c.kh, khTail(first), "and it is the tail of that expansion, not a fresh derivation");
+
+  u8[] second = khMaterial(2);
+  c.addHop(second);
+  t.eqI32(c.length(), 2, "extended");
+  t.eqBytes(c.kh, khTail(second),
+            "the nonce follows the new last hop — one captured earlier would be keyed to a middle relay");
+  t.isTrue(!khSameBytes(khTail(first), khTail(second)), "and the two hops really do differ");
+
+  t.eqI32(NTOR_KEY_MATERIAL, 92, "the expansion is the hop's keys and the nonce together");
+  t.eqI32(HOP_KEY_MATERIAL, 72, "and the hop's share of it is the first seventy-two");
+  // Named because they are passed at every handshake call site, and **the live path is not in this
+  // suite**: a call site that quietly went back to seventy-two would build circuits that work for
+  // everything except hosting an onion service, and the only symptom would be an introduction point
+  // refusing an ESTABLISH_INTRO whose MAC was keyed with nothing. That fault is caught by a running
+  // service and by nothing here, which is why the length is a constant rather than a literal.
+
+  // The short expansion is still accepted, because a circuit that never hosts an onion cell has no
+  // use for a nonce. It reports none rather than inventing one.
+  Circuit shortOne = Circuit.create(8, khShortMaterial(3));
+  t.eqI32(shortOne.kh.len(), 0, "a seventy-two byte expansion yields no nonce");
+  return t.report();
+}
+
+u8[] khMaterial(i32 role) {
+  u8[] out = u8[92]();
+  for (i32 i = 0; i < 92; i++) { out[i] = (role * 71 + i * 13 + 5) & 0xFF; }
+  return out;
+}
+
+u8[] khShortMaterial(i32 role) {
+  u8[] out = u8[72]();
+  for (i32 i = 0; i < 72; i++) { out[i] = (role * 71 + i * 13 + 5) & 0xFF; }
+  return out;
+}
+
+u8[] khTail(u8[] m) {
+  u8[] out = u8[20]();
+  for (i32 i = 0; i < 20; i++) { out[i] = m[72 + i]; }
+  return out;
+}
+
+bool khSameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
 }

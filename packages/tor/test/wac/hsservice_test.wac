@@ -5,7 +5,9 @@ import {
   ESTABLISH_INTRO_SIG_PREFIX, establishIntroCell, macSpanOf, prefixed, sigSpanOf,
 } from "../../src/hsservice.wac";
 import { hsMac } from "../../src/hsntor.wac";
-import { ed25519PublicKey, ed25519Verify } from "../../../crypto/src/ed25519.wac";
+import { ed25519PublicKey, ed25519Sign, ed25519Verify } from "../../../crypto/src/ed25519.wac";
+import { EstablishedIntro, parseEstablishIntro } from "../../src/hsservice.wac";
+import { Buf } from "../../../bytes/src/buf.wac";
 
 const i32 E_AUTH_SEED = 0;
 const i32 E_AUTH_PUBLIC = 1;
@@ -14,6 +16,9 @@ const i32 E_CELL = 3;
 const i32 E_MAC_SPAN_LEN = 4;
 const i32 E_SIG_SPAN_LEN = 5;
 const i32 E_NODE_SIG = 6;
+const i32 E_MUTATION_COUNT = 7;
+const i32 E_MUTATION = 8;      // a[0] = index: the exact bytes tor's parser refused
+const i32 E_MUTATION_KH = 9;   // a[0] = index: the KH it was offered with
 
 u8[] none() { return u8[0](); }
 
@@ -143,4 +148,87 @@ bool sameBytes(u8[] a, u8[] b) {
   if (a.len() != b.len()) { return false; }
   for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
   return true;
+}
+
+/**
+ * The relay's side: accept the cell tor built, refuse every cell tor refused.
+ *
+ * The service half of this file has been pinned against tor's own cell from the start. This direction
+ * had nothing — no relay in this repo could be an introduction point, so a service could establish
+ * one only against a C tor. The oracle is the same vector read the other way: tor built the good
+ * cell, tor's parser refused each of the seven mutations, and the mutations now carry their bytes so
+ * ours is asked the same question rather than a described one.
+ */
+export string test_the_relay_accepts_what_tor_built(fn[u8[](i32, u8[], u8[])] ref) {
+  T t = T.create();
+  u8[] cell = ref(E_CELL, none(), none());
+  u8[] kh = ref(E_KH, none(), none());
+
+  EstablishedIntro good = parseEstablishIntro(cell, kh);
+  t.isTrue(good.ok, "the cell tor built is accepted");
+  t.eqBytes(good.authKey, ref(E_AUTH_PUBLIC, none(), none()),
+            "and it comes back with the key the circuit should be filed under");
+
+  i32 n = ref(E_MUTATION_COUNT, none(), none())[0];
+  t.isTrue(n >= 7, "there are several mutations, not one");
+  for (i32 i = 0; i < n; i++) {
+    t.isTrue(!parseEstablishIntro(ref(E_MUTATION, oneByte(i), none()),
+                                  ref(E_MUTATION_KH, oneByte(i), none())).ok,
+             "a cell tor refused is refused");
+  }
+
+  // The nonce is per circuit, which is what stops a captured cell being replayed onto another.
+  u8[] otherKh = u8[kh.len()]();
+  for (i32 i = 0; i < kh.len(); i++) { otherKh[i] = kh[i]; }
+  otherKh[0] = otherKh[0] ^ 1;
+  t.isTrue(!parseEstablishIntro(cell, otherKh).ok, "the same cell on another circuit is refused");
+  t.isTrue(!parseEstablishIntro(cell, u8[0]()).ok, "and a circuit with no nonce cannot host one");
+  t.isTrue(!parseEstablishIntro(u8[0](), kh).ok, "an empty cell is not a cell");
+
+  // Two cells that are **self-consistent** rather than tampered. tor's mutations all break something
+  // the MAC covers, so they are refused whatever we check — the same trap as the INTRODUCE2 auth key,
+  // where flipping a byte proved nothing because the MAC covered it. These are built properly, with
+  // the MAC and the signature recomputed, so only the specific check refuses them.
+  u8[] seed = ref(E_AUTH_SEED, none(), none());
+
+  // AUTH_KEY_TYPE 1, MACed and signed as though it were legitimate. tor knows one key type.
+  u8[] wrongType = rebuilt(cell, kh, seed, 1, 64);
+  t.isTrue(wrongType.len() > 0, "the wrong-type cell was built");
+  t.isTrue(!parseEstablishIntro(wrongType, kh).ok,
+           "a well-formed cell claiming another key type is refused");
+
+  // A SIG_LEN that lies. Those two bytes are in neither span, so nothing else notices them —
+  // accepting the cell would mean verifying sixty-four bytes the sender said were thirty-two.
+  u8[] lyingLen = rebuilt(cell, kh, seed, 2, 32);
+  t.isTrue(lyingLen.len() > 0, "the lying-length cell was built");
+  t.isTrue(!parseEstablishIntro(lyingLen, kh).ok, "a signature length that lies is refused");
+  return t.report();
+}
+
+/**
+ * The cell rebuilt with a chosen key type and a chosen SIG_LEN, MAC and signature recomputed.
+ *
+ * Not a mutation of the bytes — a cell somebody could actually have sent.
+ */
+u8[] rebuilt(u8[] cell, u8[] kh, u8[] seed, i32 keyType, i32 sigLen) {
+  if (cell.len() < 38) { return u8[0](); }
+  Buf b = Buf.create();
+  b.push(keyType);
+  b.push(0);
+  b.push(32);
+  for (i32 i = 3; i < 35; i++) { b.push(cell[i]); }
+  b.push(0);
+  u8[] macSpan = b.bytes();
+  b.pushAll(hsMac(kh, macSpan));
+  u8[] sigSpan = b.bytes();
+  b.push((sigLen >> 8) & 0xFF);
+  b.push(sigLen & 0xFF);
+  b.pushAll(ed25519Sign(seed, prefixed(sigSpan)));
+  return b.bytes();
+}
+
+u8[] oneByte(i32 i) {
+  u8[] a = u8[1]();
+  a[0] = i;
+  return a;
 }

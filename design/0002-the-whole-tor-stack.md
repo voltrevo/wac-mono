@@ -382,7 +382,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
-| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. The **descriptor build is a function** now — `buildDescriptor` takes a service's own introduction points, time period and revision — and is checked by both oracles on three variants, not just the committed fixture. The **publication plan is complete**: from a consensus alone, `servicePlan` chooses the two time periods, the shared random value for each, and the directories — reaching exactly the ones a real service uploaded to. The **upload has a transport** (`publishOverCircuit`) and its answers three meanings, and an **INTRODUCE2 seen twice is dropped**. **Introduction point rotation** follows tor's two drawn limits. **Not done:** the service loop that ties it together — establishing the circuits, and driving a rendezvous from an INTRODUCE2 |
+| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. The **descriptor build is a function** now — `buildDescriptor` takes a service's own introduction points, time period and revision — and is checked by both oracles on three variants, not just the committed fixture. The **publication plan is complete**: from a consensus alone, `servicePlan` chooses the two time periods, the shared random value for each, and the directories — reaching exactly the ones a real service uploaded to. The **upload has a transport** (`publishOverCircuit`) and its answers three meanings, and an **INTRODUCE2 seen twice is dropped**. **Introduction point rotation** follows tor's two drawn limits. **Answering an INTRODUCE2 is done end to end** — `handleIntroduce2` runs tor's sequence from the cell to the RENDEZVOUS1 it sends back. **Not done:** the loop around it, which is circuits — establishing the introduction points, and building the rendezvous circuit this now says to build |
 | 7 — the interop matrix | **not started as a document.** Steps 2–6 each contribute rows and most are green; nothing collects them, so a regression in one would not be visible as a regression in *the matrix* |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
@@ -1718,3 +1718,40 @@ accepts — and refusing it here would be *stricter than the network*, which thi
 recorded twice as its own failure mode. There is nothing to gain either: a correct MAC means the
 sender holds the descriptor, which is every legitimate client. The security property is not the
 comparison. It is that the key feeding the derivation is ours.
+
+### The fixture named a rendezvous point tor would have declined to use
+
+`handleIntroduce2` is the composition: cell in, RENDEZVOUS1 out, in the sequence
+`hs_circ_handle_introduce2` uses. Every piece was already pinned, so the only thing left to get wrong
+was the order — and three of the placements are load-bearing in ways the step itself does not show.
+
+**Each one is observable if the input is chosen for it**, which is the difference between testing an
+order and asserting it in a comment:
+
+- the ENCRYPTED section is checked against the introduction point's replay cache *before* the MAC.
+  Replay the cell with a **wrong encryption secret**: parse-first would answer `UNREADABLE`,
+  replay-first answers `REPLAYED`. That is the proof no handshake was computed, and it is the whole
+  reason a replayed cell costs a SHA-256 rather than a curve25519 operation.
+- a cell that could not be read is still remembered, so the second copy of a garbage cell is not even
+  parsed.
+- the cookie is checked *after* the parse, and its cache belongs to the service while the cell cache
+  belongs to the introduction point. A fresh cell cache with a shared cookie cache is a client
+  retrying through a different introduction point — tor's own stated case, and one that only exists
+  because the two scopes differ.
+
+**The fixture had to be fixed before any of it could be tested, and the way it was wrong is the
+lesson.** Its cells carried a single IPv4 link specifier. That is enough to test a *parser*, because
+the list is opaque to one — and it names a rendezvous point **tor itself would decline to use**, since
+`hs_get_extend_info_from_lspecs` requires the legacy identity. A fixture adequate for the question it
+was built for was inadequate for the next question, and nothing announced the difference.
+
+Four of five new cases failed against it. The fifth passed *for the wrong reason*: "a loopback
+rendezvous point is refused on a real network" passed because every case was being refused. That is
+the fifth instance this week of a test exercising the right line for the wrong reason, and the second
+where the passing test was the misleading one.
+
+Twelve faults planted, nine caught. The three survivors were a single gap — the cell's length and its
+cookie were asserted, its 64-byte handshake was not — so swapping AUTH for the key seed, or sending
+the client's ephemeral key where ours belongs, went unnoticed. Both halves are recomputable in the
+test because each is pinned separately, which makes checking the **assembly** possible without a
+captured RENDEZVOUS1 to compare against.

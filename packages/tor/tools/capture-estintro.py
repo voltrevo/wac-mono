@@ -75,7 +75,12 @@ def main(argv):
 
         def mutate(name, blob, khhex=kh):
             v = ask(probe, tmp, blob, khhex)
-            mutations.append({"name": name, "accepted": v["accepted"], "reason": v["reason"]})
+            # The bytes are recorded as well as the verdict. A name and a verdict are enough to show
+            # tor's parser discriminates; they are not enough for *our* parser to be asked the same
+            # question, because it cannot reconstruct the cell from a description. Two ends agreeing
+            # about a mutation neither is running is the failure this avoids.
+            mutations.append({"name": name, "accepted": v["accepted"], "reason": v["reason"],
+                              "cell": bytes(blob).hex(), "kh": khhex})
 
         b = bytearray(cell); b[5] ^= 1
         mutate("one bit of the auth key", b)
@@ -96,6 +101,8 @@ def main(argv):
                 "name": "signed over the obvious span, including sig_len",
                 "accepted": v["accepted"],
                 "reason": v["reason"],
+                "cell": trap.read_bytes().hex(),
+                "kh": kh,
             })
 
     out = dict(base)

@@ -45,7 +45,7 @@
 import { Buf } from "../../bytes/src/buf.wac";
 import { aesCtr } from "../../crypto/src/aesctr.wac";
 import { hsMac, serviceIntroduceKeys } from "./hsntor.wac";
-import { ed25519Sign } from "../../crypto/src/ed25519.wac";
+import { ed25519Sign, ed25519Verify } from "../../crypto/src/ed25519.wac";
 import { ctEqual } from "../../crypto/src/ct.wac";
 
 /** ed25519, and the only type this builds. Tor's own check rejects anything else before verifying. */
@@ -91,6 +91,65 @@ export u8[] establishIntroCell(u8[] authPublic, u8[] authSeed, u8[] circuitKH) {
   b.push(64);
   b.pushAll(sig);
   return b.bytes();
+}
+
+/** What an introduction point learns from an ESTABLISH_INTRO it accepts. */
+export struct EstablishedIntro {
+  bool ok;
+  /** The key a later INTRODUCE1 names to say which circuit it is for. */
+  u8[] authKey;
+}
+
+/**
+ * The **relay's** side: is this a cell we should accept, and what does it claim?
+ *
+ * `establishIntroCell` builds one; this is what an introduction point does with it, and the two are
+ * here together because the spans they agree about are the whole difficulty. The service side has
+ * been pinned against tor's own cells since the beginning; this direction had nothing at all — no
+ * relay in this repo could be an introduction point, so a service could establish one only against a
+ * C tor.
+ *
+ * Both proofs are required and they prove different things:
+ *
+ *   - **the MAC**, keyed with the circuit's KH, proves the sender is the party this circuit was built
+ *     with. Without it a cell captured from one circuit could be replayed onto another — which is
+ *     precisely why the nonce exists and why it is per-circuit.
+ *   - **the signature**, by the auth key over the prefixed span, proves the sender holds the secret
+ *     half of the key it is asking to be filed under. Without it anyone could claim somebody else's
+ *     introduction point and receive their INTRODUCE1 cells.
+ *
+ * Checking the MAC first is not required by anything, and is what tor does: it is the cheaper of the
+ * two, and a cell that fails it was not sent by the party we are talking to.
+ */
+export EstablishedIntro parseEstablishIntro(u8[] cell, u8[] circuitKH) {
+  if (circuitKH.len() == 0) { return EstablishedIntro(false, u8[0]()); }
+  // AUTH_KEY_TYPE[1] AUTH_KEY_LEN[2] AUTH_KEY[32] N_EXT[1] ... MAC[32] SIG_LEN[2] SIG[64]
+  if (cell.len() < 1 + 2 + 32 + 1 + 32 + 2 + 64) { return EstablishedIntro(false, u8[0]()); }
+  if (cell[0] != AUTH_KEY_TYPE_ED25519) { return EstablishedIntro(false, u8[0]()); }
+  if (cell[1] != 0 || cell[2] != 32) { return EstablishedIntro(false, u8[0]()); }
+  u8[] authKey = sub(cell, 3, 35);
+
+  u8[] macSpan = macSpanOf(cell);
+  u8[] sigSpan = sigSpanOf(cell);
+  if (macSpan.len() == 0 || sigSpan.len() == 0) { return EstablishedIntro(false, u8[0]()); }
+
+  // The MAC sits immediately after the span it covers.
+  i32 macAt = macSpan.len();
+  if (macAt + 32 > cell.len()) { return EstablishedIntro(false, u8[0]()); }
+  if (!ctEqual(hsMac(circuitKH, macSpan), sub(cell, macAt, macAt + 32))) {
+    return EstablishedIntro(false, u8[0]());
+  }
+
+  // Then SIG_LEN and the signature. The length is read rather than assumed: a cell claiming a shorter
+  // signature and padding the rest would otherwise verify against bytes nobody signed.
+  i32 sigLenAt = sigSpan.len();
+  if (sigLenAt + 2 > cell.len()) { return EstablishedIntro(false, u8[0]()); }
+  i32 sigLen = (cell[sigLenAt] * 256) + cell[sigLenAt + 1];
+  if (sigLen != 64 || sigLenAt + 2 + 64 > cell.len()) { return EstablishedIntro(false, u8[0]()); }
+  u8[] sig = sub(cell, sigLenAt + 2, sigLenAt + 2 + 64);
+
+  if (!ed25519Verify(authKey, prefixed(sigSpan), sig)) { return EstablishedIntro(false, u8[0]()); }
+  return EstablishedIntro(true, authKey);
 }
 
 /** The bytes tor signs: the prefix, then the span. */

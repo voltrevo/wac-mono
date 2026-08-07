@@ -33,7 +33,9 @@
 // recognisable shape.
 
 import { Core, Cli, FileResult } from "../../platform/src/platform.wac";
-import { Network, Session, bootstrap, buildCircuit, buildCircuitTo } from "./bootstrap.wac";
+import {
+  Awaited, Network, Session, awaitCommand, bootstrap, buildCircuit, buildCircuitTo, relayByEd25519,
+} from "./bootstrap.wac";
 import {
   Link, connectRelay, handshakeTls, linkHandshake, createCircuit, extendTo, sendCells, nextCell,
   itoa,
@@ -264,30 +266,6 @@ i32 afterJoin(Core core, Cli cli, Session rend, i32 port) {
   return 0;
 }
 
-struct Awaited {
-  bool ok;
-  u8[] data;
-}
-
-/**
- * Read cells until one carries `command`, or the circuit ends.
- *
- * Anything else on the way is fed back through `receive` and its SENDMEs sent, so a circuit that
- * carries data while we are waiting does not stall. A DESTROY or an unrecognised cell ends the wait
- * rather than looping: both mean this circuit is finished.
- */
-Awaited awaitCommand(Core core, Link l, Circuit c, i32 command) {
-  while (!l.dead) {
-    u8[] cell = nextCell(l);
-    if (cell.len() == 0) { return Awaited(false, u8[0]()); }
-    Received got = c.receive(cell);
-    if (got.toSend.len() > 0) { sendCells(l, got.toSend); }
-    if (got.kind == gotDestroyed() || got.kind == gotBroken()) { return Awaited(false, u8[0]()); }
-    if (got.command == command) { return Awaited(true, got.data); }
-  }
-  return Awaited(false, u8[0]());
-}
-
 /** A plain HTTP GET over the finished circuit, and whatever comes back. */
 u8[] readStream(Core core, Link l, Circuit c, i32 sid, i32 port) {
   u8[] raw = u8[0]();
@@ -328,18 +306,6 @@ u8[] join(u8[] a, u8[] b) {
 }
 
 /** The relay whose ed25519 identity matches, or −1. */
-i32 relayByEd25519(Network net, u8[] want) {
-  if (want.len() != 32) { return -1; }
-  for (i32 i = 0; i < net.relays.len(); i++) {
-    u8[] have = net.relays[i].ed25519Identity;
-    if (have.len() == 32) {
-      i32 diff = 0;
-      for (i32 j = 0; j < 32; j++) { diff = diff | (have[j] ^ want[j]); }
-      if (diff == 0) { return i; }
-    }
-  }
-  return -1;
-}
 
 /**
  * The link specifiers describing a relay, for telling the service where to meet.

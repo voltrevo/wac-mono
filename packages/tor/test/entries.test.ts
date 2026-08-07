@@ -27,6 +27,7 @@ const ENTRIES = [
   "packages/tor/src/network.wac",
   "packages/tor/src/genintro.wac",
   "packages/tor/src/genhsdesc.wac",
+  "packages/tor/src/hsserviced.wac",
   "packages/tor/size/proto_only.wac",
   "packages/tor/size/tor_only.wac",
   "packages/tor/size/tls_only.wac",
