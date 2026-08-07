@@ -19,6 +19,15 @@
 //   deno task mutate --seed=12345        # reproduce a particular --sample draw
 //   deno task mutate --operators --dry-run   # what would run, without running it
 //
+// **A run that is cut short says so.** A sweep of a whole package is minutes to hours, so it is usually
+// launched under a `timeout` or in the background — and its output is one line per mutant followed by a
+// score at the end, which means a run killed part way through leaves a log whose last line is an ordinary
+// result. It reads exactly like a finished one. That happened twice in one evening here, and both partial
+// logs were believed. SIGTERM and SIGINT now print `CUT SHORT ... N of M mutants run` and exit 130, so the
+// absence of a score is stated rather than inferred. Two things follow for a caller: **check the exit
+// code** (130 cut short, 124 from `timeout` itself, 1 real survivors, 2 harness broken), and do not pipe
+// the run into `grep` — that throws the code away, which is how both of those logs came to be misread.
+//
 // Four things make this affordable enough to run over more than one package.
 //
 // **Trivial Compiler Equivalence.** Every mutant is compiled before any test runs. If
@@ -144,6 +153,40 @@ const TIMEOUT_CAP_MS = 600_000;
  * `--no-nice` exists for a sweep on a machine you have to yourself, where it is pure overhead.
  */
 const NICE = !args.includes("--no-nice");
+
+/**
+ * Say how far this got, if something cuts it short.
+ *
+ * A sweep prints one line per mutant and its score at the end, so a run killed part way through leaves a
+ * log that **reads as complete** — the last line is an ordinary result and the score is simply absent. That
+ * has now happened twice on this machine, both times to a `timeout` around the sweep, and both times the
+ * partial log was taken for a finished one until the missing line was noticed.
+ *
+ * `timeout` sends SIGTERM, so there is a moment to say so. The exit code is 124 from the shell either way;
+ * what was missing was a sentence in the log itself, because that is what a reader looks at.
+ *
+ * Deno delivers these to a listener rather than dying, so the handler has to exit — 130 by convention for
+ * an interrupted run, and non-zero so a caller checking the code sees a failure rather than a score.
+ */
+let totalToRun = 0;
+let ranCount = 0;
+/** What the run is doing, for a log that ends without warning. Set at each stage boundary. */
+let phase = "starting up";
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+  try {
+    Deno.addSignalListener(sig, () => {
+      // `writeSync`, not `console.log`: `Deno.exit` does not flush a buffered writer, and a message that
+      // does not survive the exit is worth less than no message, because the log looks the same either way.
+      Deno.stdout.writeSync(new TextEncoder().encode(
+        `\n\nCUT SHORT by ${sig} while ${phase} — ${ranCount} of ${totalToRun} mutants run.\n` +
+          `There is no score for this run, and what is above is a prefix rather than a sample: mutants\n` +
+          `run in the order they were generated, so whole files may not have been reached.\n`,
+      ));
+      Deno.exit(130);
+    });
+  } catch { /* a platform without this signal */ }
+}
+
 
 /** The deadline for a mutant whose scope took `baseline` ms unmutated. */
 function deadlineFor(baseline: number): number {
@@ -408,6 +451,8 @@ function triage(m: Mutant): Triage {
   return { verdict: "run" };
 }
 
+totalToRun = mutants.length;
+phase = "compiling mutants to find the equivalent ones";
 console.log(`${mutants.length} mutant(s) generated; compiling for equivalence…`);
 const triaged = mutants.map((m) => ({ mutant: m, triage: triage(m) }));
 const toRun = triaged.filter((t) => t.triage.verdict === "run");
@@ -653,6 +698,7 @@ let narrowed = 0, widened = 0;
 const noSelect = args.includes("--no-select");
 let measurable: typeof toRun = [];
 const results: (Result & { index: number })[] = [];
+
 try {
   // One staging directory now; the rest after the scope's test files are known, because how many
   // mutants may run at once depends on what those tests *do* — see `jobsFor`. Staging is a `cp -r`,
@@ -734,6 +780,7 @@ try {
   measurable = toRun.filter((t) => !redScopes.has(testDirs(t.mutant).join(" ")));
 
   // ── Per-test coverage, so a mutant only faces the tests that reach it ──────
+  phase = "measuring baselines and building the coverage profile";
   if (!noSelect && measurable.length > 0) {
     const scope = [...new Set(measurable.flatMap((t) => testDirs(t.mutant)))].sort();
     const files = await testFilesIn(scope.map((d) => `${workDirs[0]}/${d}`));
@@ -790,6 +837,8 @@ try {
     await stageProject(dir);
   }
 
+  totalToRun = measurable.length;
+  phase = "running mutants";
   let next = 0;
   const worker = async (work: string) => {
     while (true) {
@@ -848,6 +897,7 @@ try {
       // A timeout counts as killed: an infinite loop is a detected defect, not a silent one.
       const killed = timedOut || code !== 0;
       const firstFail = output.split("\n").find((l) => l.includes("FAILED") || l.includes("error"));
+      ranCount++;
       results.push({
         index,
         mutant,
