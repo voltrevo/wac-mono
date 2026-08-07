@@ -48,6 +48,7 @@ import { Read } from core;
 import { Buf } from "../../bytes/src/buf.wac";
 import { Parsed, parseRequest } from "../../http/src/request.wac";
 import { DirDocuments, dirSourceFingerprint } from "./dirserve.wac";
+import { ALPHABET_STANDARD, encode as base64Encode } from "../../codec/src/base64.wac";
 import { AuthorityCert, Verdict, parseCertificates, verifyConsensus } from "./consensus.wac";
 import { DirAction, dirStep, filed } from "./dirstep.wac";
 import { PUB_OK } from "./hsstore.wac";
@@ -299,6 +300,7 @@ export i32 main(Core core, Cli cli) {
   string bind = "127.0.0.1";
   string seedPath = "";
   string descriptorOut = "";
+  string seedLineOut = "";
   string nickname = "wacrelay";
   string consensusPath = "";
   string microConsensusPath = "";
@@ -313,6 +315,9 @@ export i32 main(Core core, Cli cli) {
       i = i + 1;
     } else if (a == "-a" && i + 1 < argc) {
       bind = string.fromBytes(cli.arg(i + 1).wait());
+      i = i + 1;
+    } else if (a == "--seedline" && i + 1 < argc) {
+      seedLineOut = string.fromBytes(cli.arg(i + 1).wait());
       i = i + 1;
     } else if (a == "--descriptor" && i + 1 < argc) {
       descriptorOut = string.fromBytes(cli.arg(i + 1).wait());
@@ -341,7 +346,7 @@ export i32 main(Core core, Cli cli) {
   }
   if (seedPath == "") {
     core.warn("usage: relayd <seed-file> [-p port] [-a address] [-n nickname] " +
-              "[--descriptor path] [-C consensus -K certificate] [-D descriptor]... " +
+              "[--descriptor path] [--seedline path] [-C consensus -K certificate] [-D descriptor]... " +
               "[-M microdesc-consensus -m microdescriptors]");
     return 1;
   }
@@ -429,6 +434,26 @@ export i32 main(Core core, Cli cli) {
   // Binding first and keeping the socket removes both problems. The descriptor advertises the port the
   // relay is actually listening on, whoever chose it, and there is no window between writing and
   // serving for anyone else to take it.
+  // What a client needs in order to ask *this* relay for a consensus: where it is, who it is, and
+  // the key its ntor handshake uses. `bootstrap` calls this a seed line and wants exactly four
+  // fields, `host port identityHex ntorOnionKeyBase64`.
+  //
+  // Written by the relay for the same reason the descriptor is: two of the four facts are keys only
+  // this process has derived, and the third is a port only the operating system knows until the bind
+  // happened. A launcher's description cannot hold any of them, and a human copying them out of the
+  // log is the step this removes.
+  if (seedLineOut != "") {
+    string line = bind + " " + itoa(listener.port) + " " + hex(id.fingerprint) + " " +
+                  string.fromBytes(base64Encode(x25519Base(id.onionPrivate), ALPHABET_STANDARD(),
+                                                false)) + "\n";
+    Change wroteSeed = cli.writeFile(seedLineOut, line.toBytes()).wait();
+    if (!wroteSeed.ok()) {
+      core.warn("relayd: " + seedLineOut + ": " + wroteSeed.message);
+      return 1;
+    }
+    core.log("relayd: wrote a seed line for this relay to " + seedLineOut);
+  }
+
   if (descriptorOut != "") {
     core.log("relayd: deriving the TAP onion key a descriptor needs (another moment)");
     RsaKey tap = deriveTapOnionKey(seed);
