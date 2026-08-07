@@ -100,7 +100,12 @@ decides which:
    have invented an incompatibility — and reverting them restored the original silent truncation, which is
    worse. `tooManyOperands` is the third answer, and it is what the real ones do.
 
-Still to do: the per-file presentation group — `wc` (a line each plus a total, and the filename that
-currently appears without a flag and vanishes with one), `grep` (a `file:` prefix when there is more than
-one), `head` and `tail` (`==> name <==` banners), `sha256sum`/`sha512sum` (a line each), `crc32`. These
-need output changes rather than a different reader, which is why they are last.
+**`wc` is done**, and it was the first of the presentation group: a line per file, a `total` when there is
+more than one, and the filename on every line. It also had a second bug that a *test* was hiding — the
+assertion compared `sys("wc", ["-l", f]).split(/\s+/)[0]`, throwing away the filename before comparing, so
+the applet's dropping it was invisible. The applet's own comment claimed "no label when exactly one of
+-l -w -c is asked for, as the real one does", which is what `wc -l < f` does. The label goes with the
+file; standard input is what has no name to print.
+
+Still to do: `grep` (a `file:` prefix when there is more than one), `head` and `tail` (`==> name <==`
+banners), `sha256sum`/`sha512sum` (a line each), `crc32`.

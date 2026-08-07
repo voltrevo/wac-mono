@@ -424,7 +424,14 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
 
     assertEquals((await box(["head", "-3", fixture])).out, sys("head", ["-3", fixture]), "head -N");
     assertEquals((await box(["tail", "-n", "2", fixture])).out, sys("tail", ["-n", "2", fixture]), "tail -n N");
-    assertEquals((await box(["wc", "-l", fixture])).out.trim(), sys("wc", ["-l", fixture]).trim().split(/\s+/)[0]);
+    // The whole line, not just the first field. Taking `[0]` was how `wc -l file` came to drop the
+    // filename: the assertion threw away the difference, and the applet's comment claimed the real one
+    // does the same. It does not — only reading standard input has no name to print.
+    assertEquals(
+      (await box(["wc", "-l", fixture])).out.trim().replace(/\s+/g, " "),
+      sys("wc", ["-l", fixture]).trim().replace(/\s+/g, " "),
+      "wc -l over a file",
+    );
     assertEquals(
       (await box(["sha512sum", fixture])).out.split(" ")[0],
       sys("sha512sum", [fixture]).split(" ")[0],
@@ -734,6 +741,21 @@ Deno.test("the applets that read several files read all of them", async () => {
       const got = await runner.run([applet, a1, a2]);
       const real = new Deno.Command(cmd, { args: [a1, a2], stdout: "null", stderr: "null" }).outputSync();
       assertEquals(got.code !== 0, real.code !== 0, `${applet} should refuse two operands as ${cmd} does`);
+    }
+
+    // `wc` is its own shape: a line per file, a `total` when there is more than one, and the filename on
+    // every line. It used to print the first file's counts and nothing else — and with `-l`, `-w` or `-c`
+    // it dropped the filename too, on a comment claiming that is what the real one does. It is not: the
+    // label goes with the file, and only reading standard input drops it.
+    const norm = (t: string) => t.split("\n").map((l) => l.trim().replace(/\s+/g, " ")).join("\n");
+    for (const flags of [[], ["-l"], ["-w"], ["-c"]]) {
+      for (const files of [[a1], [a1, a2]]) {
+        const got = await runner.run(["wc", ...flags, ...files]);
+        const real = new Deno.Command("wc", { args: [...flags, ...files], stdout: "piped", stderr: "null" })
+          .outputSync();
+        assertEquals(norm(got.out), norm(new TextDecoder().decode(real.stdout)),
+          `wc ${flags.join(" ")} over ${files.length} file(s)`);
+      }
     }
 
     const missing = await runner.run(["nl", a1, `${dir}/nope.txt`]);
