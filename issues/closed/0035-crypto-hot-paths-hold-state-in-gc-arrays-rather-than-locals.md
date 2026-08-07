@@ -1,7 +1,7 @@
 # 0035 — crypto hot paths hold state in GC arrays rather than locals
 
-- **Status:** open
-- **Claimed by:** (nobody yet — add yourself before working it)
+- **Status:** closed
+- **Claimed by:** agent-a
 - **Reported by:** agent-c
 - **Date:** 2026-08-04
 - **Kind:** performance
@@ -161,3 +161,40 @@ plainly before somebody spends a week on it.
 
 The issue can close once somebody agrees the remaining generate-or-unroll question no longer has a
 subject. wac 0074 is where the language-level version of it went.
+
+
+## Closed — every case it named, and the one it did not — agent-a, 2026-08-06
+
+| | before | after | |
+| --- | --- | --- | --- |
+| `chacha20` | 73 MB/s | 339 MB/s | **4.7x** |
+| `keccak256` / `sha3_256` | 38 MB/s | 250 MB/s | **6.8x** |
+| `sha256` | 153 MB/s | 165 MB/s | -15% on the one-shot path only (wac-mono 0034) |
+| `sha512` | 209 MB/s | 238 MB/s | same |
+
+`sha256` and `sha512` needed almost nothing from this issue: their working variables `a`..`h` are already
+locals, and the message schedule genuinely wants an array, since it is indexed `t-2`, `t-7`, `t-15`,
+`t-16`. What they had was 0034's problem — a padded duplicate of the message — and that is fixed.
+
+**The rule that came out of it, which is not the one the issue proposed:** write out one *repeating unit*
+and keep the loop over units. ChaCha's unit is a double round, keccak's is a round. Neither is unrolled and
+neither is generated — the issue's fear was hand-unrolling twenty rounds or writing a generator like
+`packages/bls`'s, and both were avoided. `keccak.wac` is 338 lines before and after; `chacha20.wac` grew
+71, of which 25 is the comment explaining why.
+
+Unrolling was never the lever in any measurement here. It matters only as an *enabler* — it makes indices
+compile-time constants so the state can be promoted — and writing out one unit gets that without
+duplicating anything.
+
+### What is left, and it is not this issue
+
+**`sha256` is 13x off OpenSSL and that is mostly hardware.** OpenSSL uses the SHA extensions: one
+instruction per round. A scalar implementation without them does 300-400 MB/s, so there may be ~2x of
+shape left in ours — the message schedule as a sixteen-word rolling window in locals, which needs the
+round loop written out in units of sixteen. That is a **much bigger unit** than ChaCha's or keccak's, and
+it is the first case where the generate-or-write-out question would really be asked. It should be its own
+issue, with a measurement first, rather than left implied here.
+
+The language-level version of all of this is [wac 0074](https://github.com/voltrevo/wac) — values with no
+identity, tuples or value structs — filed with the decisions and with the finding that V8 inlines a
+quarter-round-sized function for free, so no inliner is needed first.
