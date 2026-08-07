@@ -186,11 +186,21 @@ What stays in TypeScript, and why:
 
 ## Not for production
 
-Nothing in the dependency chain is constant-time — see [crypto's
-README](../crypto/README.md). Beyond that, this has not been reviewed by anyone, has no
-protection against the implementation mistakes TLS deployments spend their lives
-avoiding, and exists because building it is how you find out what the packages
-underneath are missing.
+**Side channels are measured rather than assumed, and the measurement is not a clean bill
+of health.** `packages/crypto` traces each routine twice with different secrets and compares
+the branches taken *and* the memory indices used: `sha256`, `chachaBlock`, `poly1305` and the
+x25519 ladder come out uniform — the ladder across 1.6 million events — while **AES and GHASH
+leak**, by construction rather than by accident, because a table indexed by a secret byte
+touches a cache line chosen by the key. Both suites are offered, so the choice matters: a
+`TLS_CHACHA20_POLY1305_SHA256` connection runs on the routines that measured uniform, and a
+`TLS_AES_128_GCM_SHA256` one runs on the two that did not. See [crypto's README](../crypto/README.md) for the table and the line numbers.
+
+Uniform under that trace is **not** the same as constant-time. It is dynamic, it sees only
+what wasm does, and it cannot see that an instruction's own latency may depend on its
+operands. Beyond that, none of this has been reviewed by anyone, it has no protection against
+the implementation mistakes TLS deployments spend their lives avoiding, and it exists because
+building it is how you find out what the packages underneath are missing. **Do not use it
+where an attacker can observe timing.**
 
 ## Not only sockets
 

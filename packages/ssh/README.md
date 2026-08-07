@@ -6,8 +6,14 @@ algorithm negotiation, curve25519-sha256 key exchange, `ssh-ed25519` host key ve
 not — publickey authentication, and the connection protocol: session channels, flow control and
 `exec`.
 
-> **Not for production**, for the same reason [crypto](../crypto/README.md) is not: it is built on
-> primitives that are known to leak timing, and nothing here has been reviewed by anyone.
+> **Not for production**, and nothing here has been reviewed by anyone. On timing, the accurate
+> statement is narrower than it used to be: the transport is `chacha20-poly1305@openssh.com` over
+> x25519, and [crypto](../crypto/README.md) measures `chachaBlock`, `poly1305` and the x25519 ladder
+> as **uniform** under its trace — the leaky routines in that table, AES and GHASH, are not used
+> here at all. What is not clean: `bcryptPbkdf`, which decrypts an on-disk private key, leaks by
+> construction and is too expensive to trace; Ed25519 signing has not been measured either way; and
+> uniform under a dynamic wasm-level trace is not a proof of constant time. Do not use this where an
+> attacker can observe timing.
 
 ```sh
 deno task app packages/ssh/src/ssh.wac --allow-read --allow-net --allow-env -- user@host uname -a
