@@ -1,0 +1,62 @@
+// The length guards in `hybrid.wac`, one call each, because a trap ends the module.
+//
+// Six of them survived mutation testing: `hybridClientOffer`'s seed and scalar,
+// `hybridServerAccept`'s share, randomness and scalar, and `hybridClientFinish`'s server share. Nothing
+// exercised them, which for a key exchange is a specific kind of hole.
+//
+// **The over-long cases are the point.** A *short* input traps whatever the guard does, because the copy
+// loops below read past its end — so a fixture of short inputs alone leaves every one of these deletable
+// with the suite still green, which is what the first version of `packages/ens`'s equivalent did. A
+// *longer* input is copied happily and silently truncated: `hybridServerAccept` would take the first 1184
+// bytes of a 1300-byte "share" as the ML-KEM key and the next 32 as the X25519 point, encapsulate to them,
+// and return a perfectly well-formed 1120-byte answer built from part of what it was sent. Both ends then
+// derive different secrets and the handshake fails at Finished — a length check turned into a confusing
+// failure three messages later, which is the good case. The bad case is a peer that chose the extra bytes.
+import { hybridClientOffer, hybridServerAccept, hybridClientFinish } from "../../src/hybrid.wac";
+
+u8[] bytes(i32 n) {
+  u8[] b = u8[n]();
+  for (i32 i = 0; i < n; i++) { b[i] = (i * 7 + 1) & 0xFF; }
+  return b;
+}
+
+/** A valid offer, for the cases that need one to get past the first guard. */
+u8[] offer() { return hybridClientOffer(bytes(64), bytes(32)); }
+
+// ── hybridClientOffer ─────────────────────────────────────────────────────────
+
+export i32 offerSeedShort() { hybridClientOffer(bytes(63), bytes(32)); return 0; }
+export i32 offerSeedLong() { hybridClientOffer(bytes(65), bytes(32)); return 0; }
+export i32 offerScalarShort() { hybridClientOffer(bytes(64), bytes(31)); return 0; }
+export i32 offerScalarLong() { hybridClientOffer(bytes(64), bytes(33)); return 0; }
+
+// ── hybridServerAccept ────────────────────────────────────────────────────────
+
+export i32 acceptShareShort() { hybridServerAccept(bytes(1215), bytes(32), bytes(32)); return 0; }
+export i32 acceptShareLong() { hybridServerAccept(bytes(1300), bytes(32), bytes(32)); return 0; }
+export i32 acceptRandomShort() { hybridServerAccept(bytes(1216), bytes(31), bytes(32)); return 0; }
+export i32 acceptRandomLong() { hybridServerAccept(bytes(1216), bytes(33), bytes(32)); return 0; }
+export i32 acceptScalarLong() { hybridServerAccept(bytes(1216), bytes(32), bytes(33)); return 0; }
+
+// ── hybridClientFinish ────────────────────────────────────────────────────────
+
+export i32 finishOfferLong() { hybridClientFinish(bytes(1216 + 2401), bytes(1120), bytes(32)); return 0; }
+export i32 finishServerShareShort() { hybridClientFinish(offer(), bytes(1119), bytes(32)); return 0; }
+export i32 finishServerShareLong() { hybridClientFinish(offer(), bytes(1200), bytes(32)); return 0; }
+export i32 finishScalarLong() { hybridClientFinish(offer(), bytes(1120), bytes(33)); return 0; }
+
+/**
+ * A real exchange, so the fixture cannot pass by being broken.
+ *
+ * If the module trapped on load, or any of these functions trapped for every input, every case above would
+ * "pass" and this file would be measuring nothing. This one has to return 64 — the shared secret's length.
+ */
+export i32 ordinary() {
+  u8[] mine = offer();
+  u8[] share = u8[1216]();
+  share.copyFrom(mine, 0, 0, 1216);
+  u8[] accepted = hybridServerAccept(share, bytes(32), bytes(32));
+  u8[] serverShare = u8[1120]();
+  serverShare.copyFrom(accepted, 0, 0, 1120);
+  return hybridClientFinish(mine, serverShare, bytes(32)).len();
+}

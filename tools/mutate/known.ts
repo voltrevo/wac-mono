@@ -325,6 +325,23 @@ export const KNOWN_SURVIVORS: KnownSurvivor[] = [
       "people in log lines, and `//` in one is a question somebody has to answer twice. wac-mono 0005.",
   },
   {
+    name: "guard/tls/hybrid:50:30",
+    why:
+      "`hybridClientOffer`'s seed length, and four of its neighbours below. Each was measured by deleting " +
+      "it on its own: the call still traps, from `packages/crypto`'s own guard one frame down — " +
+      "`mlkemKeyGen` checks its 64-byte seed, `mlkemEncaps` its key and randomness, `x25519` both its " +
+      "32-byte arguments. So these five buy a *message*, not a refusal: the trap happens either way, and " +
+      "with them it happens at the boundary of the function the caller actually called rather than inside " +
+      "ML-KEM. Kept for that, and recorded rather than deleted because the redundancy is the point — a " +
+      "later change to `packages/crypto` that relaxed one of those checks would silently move the " +
+      "boundary. The sixth guard in this file, `serverShare.len() != 1120`, is *not* redundant and is " +
+      "killed by `test/hybrid_traps.test.ts`. wac-mono 0005.",
+  },
+  { name: "guard/tls/hybrid:51:28", why: "See guard/tls/hybrid:50:30 — `x25519` checks its own scalar." },
+  { name: "guard/tls/hybrid:69:36", why: "See guard/tls/hybrid:50:30 — `mlkemEncaps` checks the key it is given." },
+  { name: "guard/tls/hybrid:70:24", why: "See guard/tls/hybrid:50:30 — `mlkemEncaps` checks its randomness." },
+  { name: "guard/tls/hybrid:71:28", why: "See guard/tls/hybrid:50:30 — `x25519` checks its own scalar." },
+  {
     name: "guard/rlp/rlp:120:18",
     why:
       "`header`'s negative check, the private one. Its exported neighbour `fromI64` has the same guard and " +
