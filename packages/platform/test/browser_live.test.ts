@@ -364,6 +364,34 @@ Deno.test({
       // Redirection into OPFS and back out again: a shell with a real filesystem under it.
       assertEquals((await command("echo kept > note.txt; cat note.txt")).endsWith("kept"), true);
 
+      // **Output you cannot scroll to is output you did not print.** The scrollback is a reversed
+      // flex column, and a reversed flex column has a trap in it: content pushed past the start
+      // edge by `justify-content` is unreachable — no scrollbar, no wheel, `scrollHeight` equal to
+      // `clientHeight`. That shipped, and one `ls` was enough to lose the answer off the top. What
+      // makes it worth a test rather than a comment is that everything else still passes: the text
+      // is in `#scr`, so every assertion above is happy about output nobody can see.
+      await command("seq 1 200");
+      const scroll = await page.evaluate(`(() => {
+        const w = document.getElementById("wrap");
+        w.scrollTop = -1e6; // a reversed column scrolls to negative; clamped to the top either way
+        const first = document.getElementById("scr").getBoundingClientRect().top;
+        return {
+          over: w.scrollHeight - w.clientHeight,
+          reachedTop: first - w.getBoundingClientRect().top,
+        };
+      })()`) as { over: number; reachedTop: number };
+      assertEquals(
+        scroll.over > 0,
+        true,
+        `200 lines did not make the scrollback scrollable (scrollHeight - clientHeight = ` +
+          `${scroll.over}), so the earlier output is on the page and out of reach`,
+      );
+      assertEquals(
+        Math.abs(scroll.reachedTop) < 40,
+        true,
+        `scrolled to the top and the first line is still ${scroll.reachedTop}px away from it`,
+      );
+
       // **Which route answered.** Every assertion above passes either way: an applet called inside
       // the shell's own instance and one spawned as a worker print the same bytes, which is what made
       // the in-process fallback worth having and also what made this half of 0030 unfalsifiable.
