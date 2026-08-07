@@ -1,0 +1,24 @@
+// `box` and the shell in one command-line program — the twin of `term.wac`, without a browser.
+//
+//   deno task app packages/box/example/boxsh.wac --allow-read --allow-write -- -c 'seq 1 20 | grep 7 | wc -l'
+//
+// `packages/sh`'s own `wacsh` carries twelve programs; the terminal on the website carries all sixty
+// applets, because it wires `sh.external = boxRun`. Nothing on a command line did, so the transcript
+// the website prints could not be reproduced outside a page — which is the whole reason this exists:
+// wac's `tools/site.test.ts` runs the commands the front page shows through this and compares.
+//
+// The wiring below is `term.wac`'s, minus the screen.
+
+import { Core, Cli } from "../../platform/src/platform.wac";
+import { Shell } from "../../sh/src/exec.wac";
+import { shellMain } from "../../sh/src/entry.wac";
+import { boxNames, boxRun } from "../src/shrun.wac";
+
+export i32 main(Core core, Cli cli) {
+  Shell sh = Shell.create(core, cli);
+  // Called rather than spawned: a spawn needs this program to be its own applet host, which is
+  // `term.wac`'s arrangement and not something a plain command-line build has.
+  sh.external = boxRun;
+  sh.externalNames = boxNames;
+  return shellMain(core, cli, sh, 0);
+}
