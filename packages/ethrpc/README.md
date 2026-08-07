@@ -70,6 +70,20 @@ The second line is printed on every run and is not decoration: see the caveat ab
 anchored to an independently verified header looks exactly like one that is, and this program is one step
 short of that.
 
+`example/ethbalance.wac` is the other half of the same walk: the account rather than what it points at.
+
+    ./ethbalance 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 127.0.0.1 8545
+    10000000000000000000000 wei
+    nonce 0
+
+Checked against `eth_getBalance` — the number a caller would otherwise have believed — which makes it the
+right oracle: the proof has to arrive at exactly that, having got there down the state trie instead. It is
+also the only live exercise of the account's own fields; `packages/mpt` proves them against vendored
+fixtures and `ensowner` only ever reads a storage slot. An address nothing has touched is **absent from
+the trie**, which is a proof that it holds nothing and is not the same as a zero somebody wrote — the
+output says which. Balances are printed by long division over the bytes, because 2^256 wei does not fit an
+i64 and the low 64 bits would be readable and wrong.
+
 `test/ensowner_live.test.ts` runs it against a real anvil, with the owner slot set through cheatcodes at a
 location **`cast` computed** — so a namehash built left-to-right, or a mapping slot hashed `slot ++ key`,
 would ask about a slot nothing was written to and print "no owner". A wrong answer that looks like an

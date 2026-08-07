@@ -4,8 +4,8 @@ Every package, what it is, and every program you can build. **Generated — do n
 Run `deno task map` after adding a package or an entry point; `deno task map -- --check`
 runs in the suite, so a stale map is a failing test rather than a document nobody trusts.
 
-33 packages, 68,847 lines of wac, 1399 tests,
-43 command-line programs and 4 browser pages.
+33 packages, 68,966 lines of wac, 1400 tests,
+44 command-line programs and 4 browser pages.
 
 ## Packages
 
@@ -45,7 +45,7 @@ In dependency order: nothing here imports anything below it.
 | [`lightclient`](packages/lightclient/) | **The Altair sync protocol works. | 642 | 12 | `bls` `ssz` |
 | [`ssh`](packages/ssh/) | An SSH-2 client and server, in wac, **and `ssh` and `sshd` programs built from them. | 3,551 | 46 | `bytes` `codec` `crypto` `fmt` `platform` `sh` |
 | [`tor`](packages/tor/) | Tor in wac, both ends: a client and SOCKS5 proxy, a relay, a directory authority, an onion-service client, and a test network with no C tor in it. | 15,942 | 290 | `bytes` `codec` `crypto` `datetime` `fmt` `http` `platform` `std` `tls` `wactest` |
-| [`ethrpc`](packages/ethrpc/) | Asking an Ethereum node a question, so the packages that *verify* answers have something to verify. | 602 | 2 | `codec` `crypto` `ens` `fmt` `http` `json` `platform` `rlp` |
+| [`ethrpc`](packages/ethrpc/) | Asking an Ethereum node a question, so the packages that *verify* answers have something to verify. | 721 | 3 | `codec` `crypto` `ens` `fmt` `http` `json` `mpt` `platform` `rlp` |
 
 ## Programs
 
@@ -103,6 +103,7 @@ reach — see `packages/platform/README.md`.
 | `packages/tor/src/socks.wac` | A SOCKS5 proxy that carries streams over Tor. |
 | `packages/ethrpc/example/blocknumber.wac` | The smallest thing that asks a node a question: `eth_blockNumber`, printed. |
 | `packages/ethrpc/example/ensowner.wac` | Who owns this ENS name — asked of a node, and believed only because a proof says so. |
+| `packages/ethrpc/example/ethbalance.wac` | What an account holds, proved rather than asked. |
 
 ## Pages
 
