@@ -7,20 +7,18 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, openStream } from "../lib/input.wac";
-import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
+import { Reader } from "../lib/input.wac";
+import { Line, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
 import { decode, Scalar } from "../../../unicode/src/utf8.wac";
 
 export i32 rev(Core core, Cli cli, Args a) {
-  Input in = openStream(core, cli, a, 0);
-  if (!in.ok) { return 1; }
+  Reader r = Reader.create(core, cli, a, 0);
+  if (!r.ok) { return 1; }
 
-  Lines s = Lines.create();
-  Feed fed = Feed.fromStdin(cli);
   Sink out = Sink.create(cli);
   while (true) {
-    Line l = nextLine(s, fed);
-    if (!l.ok) { out.flush(); return 0; }
+    Line l = r.next(core, cli, a);
+    if (!l.ok) { out.flush(); return r.broken ? 1 : 0; }
     if (!emitTo(out, reversed(l.bytes), l.nl)) { return 0; }
   }
   return 0;

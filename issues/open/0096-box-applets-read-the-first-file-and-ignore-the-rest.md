@@ -45,14 +45,23 @@ people's bytes; it was sitting in the one program a person actually types.
 
 ## What is left, and it is not all the same job
 
-- **Concatenating applets** — `tr`, `rev`, `fold`, `nl`, `cut`, `strings`, `hex`, `uniq`, `sort`, `tac`,
-  `base32`, `base64`, `urlencode`, `urldecode`, `shuf`, `json`. Semantically these just need `nextSpan`,
-  but the line-oriented ones pull chunks through `src/lib/lines.wac` rather than directly, so the helper
-  has to learn about operands too.
+- **Concatenating applets.** `nl`, `cut`, `rev` and `fold` are **done** — they read through `Reader`,
+  which spans operands, and match GNU on several files. Left: `tr`, `strings`, `hex` (streaming, need
+  `nextSpan`), and `sort`, `tac`, `base32`, `base64`, `urlencode`, `urldecode`, `shuf`, `json`, which read
+  the whole input through `readInput` and need the same treatment there.
+- **`uniq` is not in that group, and putting it there was a mistake.** GNU's `uniq [INPUT [OUTPUT]]` takes
+  a second operand as an *output file* — `uniq a b` writes to `b` — so reading it as a second input is
+  wrong twice over: it produces the wrong answer and, in GNU, would have overwritten the file. Converting
+  it was caught by comparing against the real tool, which is the argument for doing that rather than
+  reasoning about it. **box's `uniq` ignores the OUTPUT operand entirely**, which is its own gap and is
+  not fixed here.
 - **Per-file presentation** — `wc` (a line each plus a total), `grep` (a `file:` prefix when there is more
   than one), `head` and `tail` (`==> name <==` banners), `sha256sum`/`sha512sum` (a line each), `crc32`.
   These need their own output changes, not just a different reader.
 - **Already multi-operand, and correct** — `cp`, `mv`, `paste`, `diff`, `tar`, `split`. Do not "fix" these.
 
 A caller that names a file which cannot be opened stops there, where GNU carries on and exits 1 at the
-end. That difference is deliberate for now and worth revisiting with the rest.
+end. That difference is deliberate for now and worth revisiting with the rest — but it **does** exit 1:
+`Line.ok` false cannot distinguish "no more lines" from "that file would not open", so `Reader` carries a
+`broken` flag and every converted applet checks it. Without that the first version printed the earlier
+files and exited 0, which is the failure this whole issue is about, one level up.

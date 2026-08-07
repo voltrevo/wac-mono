@@ -5,6 +5,7 @@
 
 import { Change, Cli, Core, faultWords, FileResult } from "../../../platform/src/platform.wac";
 import { Args } from "./args.wac";
+import { Feed, Line, Lines, nextLine } from "../../../platform/src/stream.wac";
 
 export struct Input { bool ok; u8[] bytes; string label; }
 
@@ -125,4 +126,56 @@ export Span nextSpan(Core core, Cli cli, Args a, i32 at, bool opened) {
     return nextSpan(core, cli, a, at + 1, true);
   }
   return Span(true, false, u8[0](), at);
+}
+
+/**
+ * Lines across every file an invocation names, as one sequence.
+ *
+ * The line-oriented applets pull through `packages/platform`'s `Lines`/`Feed`, which know about *a*
+ * source and rightly nothing about operands — a platform abstraction should not know what `Args` is. This
+ * is the box-level wrapper that does: when one file runs out and another was named, it opens the next and
+ * makes a fresh pair, so `nl a b` numbers straight through the join exactly as `nl` does.
+ *
+ * `create` opens the first file, so a caller that gets `ok` false has already had the reason reported.
+ */
+export struct Reader {
+  bool ok;
+  /**
+   * True when the sequence ended because something failed rather than because the input ran out.
+   *
+   * `Line.ok` false means "no more lines" and cannot tell those apart, so a caller that only looks at it
+   * reports success over a file it could not open — which is what the first version of this did, and it
+   * printed the earlier files' contents on the way out. Every converted applet checks this before
+   * returning 0. `Lines.broken` exists in `packages/platform` for the same reason and says so.
+   */
+  bool broken;
+  i32 at;
+  Lines s;
+  Feed fed;
+
+  Reader create(Core core, Cli cli, Args a, i32 first) {
+    Input in = openStream(core, cli, a, first);
+    return Reader(in.ok, false, first, Lines.create(), Feed.fromStdin(cli));
+  }
+
+  /**
+   * The next line, rolling on to the next file at the end of one.
+   *
+   * A file that cannot be opened stops the sequence with the reason already reported, which is where this
+   * differs from GNU: `nl a missing b` stops after `a` rather than carrying on and exiting 1 at the end.
+   * Named in wac-mono 0096 rather than left to be discovered.
+   */
+  Line next(this, Core core, Cli cli, Args a) {
+    Line l = nextLine(this.s, this.fed);
+    if (l.ok) { return l; }
+    // A read that failed part way is not an end of input, and `Line.ok` cannot say which happened.
+    if (this.s.broken != "") { this.broken = true; return l; }
+    if (operandCount(a, 0) <= this.at + 1) { return l; }
+    this.at = this.at + 1;
+    Input in = openStream(core, cli, a, this.at);
+    if (!in.ok) { this.broken = true; return Line(false, u8[0](), false); }
+    this.s = Lines.create();
+    this.fed = Feed.fromStdin(cli);
+    return this.next(core, cli, a);
+  }
 }
