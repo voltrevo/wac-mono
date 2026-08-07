@@ -65,10 +65,10 @@ const string SOURCE =
   "https://github.com/voltrevo/wac-mono/blob/master/packages/box/example/README.md#termwac";
 
 const string BANNER =
-  "wac sh — packages/sh with every packages/box applet, in a browser tab.\n" +
-  "Sixty programs and a shell, all of it wac compiled to WebAssembly. `help` lists them,\n" +
-  "Up and Down walk the history, `clear` empties the screen, and / is an Origin Private\n" +
-  "File System that survives a reload and is visible to nothing outside this tab.\n" +
+  "wac sh — packages/sh with every packages/box applet, in a browser tab. Type at the\n" +
+  "prompt; `help` lists the sixty programs, Up and Down walk the history, `clear` empties\n" +
+  "the screen. / is an Origin Private File System: what you write survives a reload and is\n" +
+  "visible to nothing outside this tab.\n" +
   "\n";
 
 /**
@@ -83,6 +83,15 @@ const string BANNER =
  */
 export i32 main(Core core, Cli cli) { return boxApplet(core, cli); }
 
+/**
+ * The prompt: where you are, and a `$`.
+ *
+ * A prompt that never changes is decoration. `cd` is a built-in here and the filesystem is real,
+ * so the working directory is a thing the reader can move around in and get lost in, and a shell
+ * that will not say where it is is the one thing every real one does say.
+ */
+string prompt(Shell sh) { return sh.cwd + " $"; }
+
 export i32 page(Core core, Cli cli, Page page) {
   page.title("wac sh").wait();
 
@@ -92,9 +101,16 @@ export i32 page(Core core, Cli cli, Page page) {
     "<style>" +
     // Tuned to sit inside the website's terminal frame: the same ground, text and accent the page
     // around it uses, so the embed reads as one object rather than a window into another site.
-    "  #term { position: fixed; inset: 0; overflow: hidden;" +
+    //
+    // The root is a `<label for="cmd">`, which is the whole of click-anywhere-to-type. A page has
+    // no way to move focus — there is no `focus` capability and adding one for this would be a
+    // capability per widget — but a label focuses its control natively, so clicking dead space in
+    // the scrollback puts the keyboard back in the prompt. Dragging still selects: a label focuses
+    // on click and does not eat a drag, which is what makes copying output out of here still work.
+    "  #term { position: fixed; inset: 0; overflow: hidden; display: block; cursor: text;" +
     "          background: #06070a; color: #d7dde6;" +
     "          font: 13px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }" +
+    "  #term ::selection { background: #1c4b45; color: #eafffb; }" +
     // `column-reverse` is what makes new output stick to the bottom without scripting, and the
     // prompt is inside the scroller rather than below it so that it is the next line of the
     // session rather than a footer bolted to the window. Reversed, so both come first in the
@@ -107,33 +123,51 @@ export i32 page(Core core, Cli cli, Page page) {
     // output somewhere the reader cannot reach. `#pad` does the same job as a flex item instead:
     // it takes the free space while there is any, and is 0 tall once there is none, so the
     // overflow is ordinary overflow and scrolls.
+    //
+    // The bottom padding is a reserved strip for `#src`, which is fixed to the frame rather than
+    // sitting in the prompt line: a link floating at the end of the line you are typing on is the
+    // one thing here that never looked like a terminal, and reserving the strip is what stops the
+    // prompt from ever sliding under it.
     "  #wrap { height: 100%; overflow-y: auto; display: flex;" +
-    "          flex-direction: column-reverse; padding: 14px 16px;" +
+    "          flex-direction: column-reverse; padding: 14px 16px 30px;" +
     // Thin, and visible: scrollback nobody can tell is there is scrollback nobody scrolls.
     "          scrollbar-width: thin; scrollbar-color: #2b3240 transparent; }" +
     "  #pad { flex: 1 1 0; min-height: 0; }" +
     "  #scr { margin: 0; white-space: pre-wrap; word-break: break-word; }" +
-    "  #bar { display: flex; align-items: baseline; gap: .5rem; padding-top: 2px; }" +
-    "  #ps1 { color: #5eead4; user-select: none; }" +
-    "  #cmd { flex: 1; background: transparent; border: 0; outline: 0; color: inherit;" +
-    "         font: inherit; caret-color: #5eead4; padding: 0; }" +
-    "  #cmd::placeholder { color: #5e6878; }" +
+    "  #bar { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 1ch; }" +
+    "  #ps1 { color: #5eead4; user-select: none; white-space: pre; }" +
+    // `caret-shape: block` is the cursor, blinking, sized and positioned by the browser rather
+    // than drawn by us. Doing it by hand would mean mirroring the value into a span and tracking
+    // the caret index through every arrow key, paste and IME composition — a second implementation
+    // of text editing, to be wrong in a different way. Where it is unsupported the caret stays a
+    // line, which is the shape it was before.
+    //
+    // The field is `flex: 1` and not `field-sizing: content`, and that is the whole reason this
+    // comment exists. Content sizing is the obvious choice here — it makes prompt, command and
+    // cursor one continuous line instead of a text box with a prompt next to it — and it silently
+    // costs the block: a field exactly as wide as its text has no cell left for a caret past the
+    // last character, so the browser clips the block to a bar. Measured both, zoomed, with
+    // `caret: "initial"` screenshots: identical markup, block in one and a bar in the other. The
+    // width does not show, because the field is transparent and the line has nothing to its right.
+    "  #cmd { flex: 1; min-width: 4ch;" +
+    "         background: transparent; border: 0; outline: 0; color: inherit;" +
+    "         font: inherit; padding: 0; caret-color: #5eead4; caret-shape: block; }" +
     "  .k { color: #5eead4; }" +
-    // Dim, and out at the edge of the prompt line: it is a way out, not the thing to look at.
-    "  #src { margin-left: auto; color: #8b95a5; font-size: 12px; text-decoration: none;" +
-    "         white-space: nowrap; }" +
+    // A status line rather than part of the prompt: down in the strip `#wrap` reserves for it.
+    "  #src { position: fixed; right: 16px; bottom: 7px; color: #6b7482; font-size: 11.5px;" +
+    "         text-decoration: none; white-space: nowrap; }" +
     "  #src:hover { color: #5eead4; text-decoration: underline; }" +
     "</style>" +
-    "<div id=\"term\">" +
+    "<label id=\"term\" for=\"cmd\">" +
     "  <div id=\"wrap\">" +
     "    <div id=\"pad\"></div>" +
     "    <div id=\"bar\"><span id=\"ps1\">$</span>" +
     "      <input id=\"cmd\" autofocus autocomplete=\"off\" spellcheck=\"false\"" +
-    "             placeholder=\"a command, then Enter\">" +
-    "      <a id=\"src\" href=\"" + SOURCE + "\">source &amp; build it</a></div>" +
+    "             autocapitalize=\"off\" autocorrect=\"off\"></div>" +
     "    <pre id=\"scr\"></pre>" +
     "  </div>" +
-    "</div>"
+    "  <a id=\"src\" href=\"" + SOURCE + "\">source &amp; build it</a>" +
+    "</label>"
   ).wait();
 
   string screen = BANNER;
@@ -167,8 +201,9 @@ export i32 page(Core core, Cli cli, Page page) {
     "echo 'a whole new stack' | gzip -c | wc -c",
     "echo hello | sha256sum"
   );
+  page.setText("ps1", prompt(sh)).wait();
   for (i32 i = 0; i < opening.len(); i++) {
-    screen = screen + "$ " + opening[i] + "\n";
+    screen = screen + prompt(sh) + " " + opening[i] + "\n";
     runScript(sh, opening[i]);
     screen = screen + string.fromBytes(sh.outBuf.take()) + string.fromBytes(sh.errOut.take());
     page.setText("scr", screen).wait();
@@ -213,8 +248,12 @@ export i32 page(Core core, Cli cli, Page page) {
       continue;
     }
 
-    screen = screen + "$ " + line + "\n";
+    screen = screen + prompt(sh) + " " + line + "\n";
     i32 status = runScript(sh, line);
+    // `cd` is a built-in, so the directory it moved to is the shell's own field and the prompt has
+    // to be told. After the command rather than before it: the line just echoed belongs to where
+    // it was run, and the next prompt to where that left us.
+    page.setText("ps1", prompt(sh)).wait();
     screen = screen + string.fromBytes(sh.outBuf.take()) + string.fromBytes(sh.errOut.take());
     // A non-zero status is worth showing: without a prompt that displays `$?`, a command that
     // failed silently and one that printed nothing look identical.

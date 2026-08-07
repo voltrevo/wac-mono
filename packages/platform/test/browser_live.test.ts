@@ -364,6 +364,33 @@ Deno.test({
       // Redirection into OPFS and back out again: a shell with a real filesystem under it.
       assertEquals((await command("echo kept > note.txt; cat note.txt")).endsWith("kept"), true);
 
+      // **The cursor is a block, and stays one.** `caret-shape: block` only paints a full cell if
+      // the field has a cell left to paint in; sizing the input to its content — which is the
+      // obvious way to make prompt, command and cursor one line — silently clips it back to a bar.
+      // Nothing about that shows up in the DOM, so what is checked is the condition that causes
+      // it: the field is wider than the text in it.
+      await page.fill("#cmd", "echo hi");
+      const caret = await page.evaluate(`(() => {
+        const el = document.getElementById("cmd");
+        const s = getComputedStyle(el);
+        const probe = document.createElement("span");
+        probe.style.font = s.font;
+        probe.style.whiteSpace = "pre";
+        probe.textContent = el.value;
+        document.body.appendChild(probe);
+        const text = probe.getBoundingClientRect().width;
+        probe.remove();
+        return { shape: s.caretShape, field: el.getBoundingClientRect().width, text };
+      })()`) as { shape: string; field: number; text: number };
+      await page.fill("#cmd", "");
+      assertEquals(caret.shape, "block", "the prompt cursor should be a block, not a line");
+      assertEquals(
+        caret.field > caret.text + 4,
+        true,
+        `the input is ${Math.round(caret.field)}px for ${Math.round(caret.text)}px of text, so a ` +
+          `block caret at the end of the line has no cell and the browser clips it to a bar`,
+      );
+
       // **Output you cannot scroll to is output you did not print.** The scrollback is a reversed
       // flex column, and a reversed flex column has a trap in it: content pushed past the start
       // edge by `justify-content` is unreachable — no scrollbar, no wheel, `scrollHeight` equal to
