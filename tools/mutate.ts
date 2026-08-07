@@ -483,6 +483,36 @@ if (dryRun) {
  * staged project fails to type-check and *every* mutant reports as killed, which is why
  * there is a control mutation.
  */
+/**
+ * Which tree a score is about.
+ *
+ * A sweep stages a copy of the project and measures *that*, which is right — an edit half way through
+ * would otherwise corrupt the run. What it costs is that the result describes a tree which may no longer
+ * exist by the time anyone reads it. That is not hypothetical: a `hybrid` re-sweep here reported six
+ * survivors against a snapshot taken four minutes before the test that kills one of them was written, and
+ * the score was read as a statement about the current tree. The mutants had not moved; the tree had.
+ *
+ * So every run says what it staged, in the header and again beside the score, with the time. A reader
+ * comparing a score against `git status` can then see that they are about different things.
+ */
+function stagedFrom(): string {
+  const run = (args: string[]) => {
+    try {
+      const r = new Deno.Command("git", { args, stdout: "piped", stderr: "null" }).outputSync();
+      return r.code === 0 ? new TextDecoder().decode(r.stdout).trim() : "";
+    } catch {
+      return "";
+    }
+  };
+  const head = run(["rev-parse", "--short", "HEAD"]);
+  if (head === "") return "an unknown revision";
+  const dirty = run(["status", "--porcelain"]).split("\n").filter((l) => l !== "").length;
+  const when = new Date().toISOString().slice(11, 16);
+  return `${head}${dirty > 0 ? ` with ${dirty} file(s) modified` : ""}, staged at ${when}`;
+}
+
+const staged = stagedFrom();
+
 async function stageProject(dest: string): Promise<void> {
   // `packages` and `harness` are the code. Every *file* at the repo root comes too, and that is not
   // tidiness: `packages/box/test/box.test.ts` reads `README.md` as its input — a real file of real
@@ -717,6 +747,7 @@ try {
     const load = (await Deno.readTextFile("/proc/loadavg")).split(" ").slice(0, 3).join(" ");
     const cores = navigator.hardwareConcurrency || 0;
     console.log(`  load before starting: ${load} on ${cores} core(s)`);
+    console.log(`  measuring ${staged}`);
     if (Number(load.split(" ")[0]) > cores * 0.7) {
       console.log(
         "  NOTE: this machine is already busy. A sweep is background work — it is niced, so it " +
@@ -996,7 +1027,7 @@ if (brokenControls.length > 0) {
 }
 
 const killedCount = real.filter((r) => r.killed).length;
-console.log(`\n${killedCount}/${real.length} mutants killed` +
+console.log(`\n${killedCount}/${real.length} mutants killed, measuring ${staged}` +
   (controls.length > 0
     ? `  (${controls.length} control(s) survived, and TCE independently confirmed each is a no-op)`
     : ""));
