@@ -1,0 +1,36 @@
+// The streaming XXH64, driven from the host in pieces of a caller's choosing.
+//
+// `Xxh64` is a struct and bindgen marshals arrays, not structs, so the whole run happens on this side:
+// the host says how to cut the input and gets one digest back.
+import { xxh64, Xxh64 } from "../../src/xxh64.wac";
+
+/** `data` hashed in pieces of `cut` bytes — 0 means one piece. */
+export u64 streamed(u8[] data, i32 cut) {
+  Xxh64 h = Xxh64.create();
+  i32 step = cut <= 0 ? data.len() : cut;
+  i32 at = 0;
+  while (at < data.len()) {
+    i32 take = data.len() - at < step ? data.len() - at : step;
+    h.update(data, at, take);
+    at = at + take;
+  }
+  return h.finish();
+}
+
+/** The same input through the one-shot function, which is the oracle. */
+export u64 whole(u8[] data) { return xxh64(data, 0, data.len()); }
+
+/** Pieces of uneven size, since a real stream does not arrive in equal chunks. */
+export u64 ragged(u8[] data) {
+  Xxh64 h = Xxh64.create();
+  i32 at = 0;
+  i32 step = 1;
+  while (at < data.len()) {
+    i32 take = data.len() - at < step ? data.len() - at : step;
+    h.update(data, at, take);
+    at = at + take;
+    step = step * 2 + 1;
+    if (step > 97) { step = 1; }
+  }
+  return h.finish();
+}

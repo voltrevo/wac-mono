@@ -48,6 +48,10 @@ async function fixture(): Promise<{ dir: string; launcher: string }> {
   await buildApp("packages/tor/src/network.wac", launcher, { read: true, write: true, net: true });
   await buildApp("packages/platform/example/waiter.wac", `${dir}/waiter.worker.js`, {}, "deno", true);
   await buildApp("packages/platform/example/wc.wac", `${dir}/wc.worker.js`, {}, "deno", true);
+  // Two-stage: prints `stages: listening`, waits, then `stages: serving`. The second line cannot
+  // already have arrived when the ready marker resolves, which is what makes the `wait` cases below
+  // test the waiting rather than the luck.
+  await buildApp("packages/platform/example/stages.wac", `${dir}/stages.worker.js`, {}, "deno", true);
   await Deno.writeTextFile(`${dir}/counted.txt`, "one two three\n");
   // Named for what `waiter: running` leaves after the marker `waiter: runn`, which is how the
   // substitution case below gets a value that only exists once the node has spoken.
@@ -277,6 +281,81 @@ Deno.test("braces that are not references are left alone", async () => {
 
     assertEquals(r.code, 0, r.err);
     assertContains(r.out, "1 2 15", "the file literally called {}.txt was counted");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("wait holds the next step until a node reaches a later state", async () => {
+  // Being up is not one event. A relay listens, and only later finds the documents an authority built
+  // from descriptors it could not write until it had bound. `waiter` prints `waiter: running` and then
+  // `waiter: still here` a moment afterwards, which is the same two-stage shape: the second line is
+  // not available at ready time.
+  const { dir, launcher } = await fixture();
+  try {
+    await Deno.writeTextFile(
+      `${dir}/net.txt`,
+      [
+        "node alpha | stages: listening | stages.worker.js",
+        "wait alpha | stages: serving   |",
+        "run  count |                    | wc.worker.js counted.txt",
+        "",
+      ].join("\n"),
+    );
+    const r = run(launcher, dir, "net.txt");
+
+    assertEquals(r.code, 0, r.err);
+    assertContains(r.err, "alpha says stages: serving", "the later state was seen, not assumed");
+    assertContains(r.out, "1 3 14", "and the work ran after it");
+    // Order matters and is the whole point: the wait has to resolve before the run starts.
+    const waitedAt = r.err.indexOf("alpha says stages: serving");
+    const ranAt = r.err.indexOf("running count");
+    assertEquals(waitedAt >= 0 && ranAt > waitedAt, true, "the wait resolved before the work started");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("a wait for something a node never says fails the run, by name", async () => {
+  const { dir, launcher } = await fixture();
+  try {
+    await Deno.writeTextFile(
+      `${dir}/net.txt`,
+      [
+        "timeout 4000",
+        "node alpha | waiter: running | waiter.worker.js",
+        "wait alpha | never says this |",
+        "run  count |                 | wc.worker.js counted.txt",
+        "",
+      ].join("\n"),
+    );
+    const r = run(launcher, dir, "net.txt");
+
+    assertEquals(r.code, 1, "a state never reached is a failed run");
+    assertContains(r.err, 'alpha never said "never says this"');
+    assertContains(r.err, "what alpha did say", "and what it did say is shown");
+    assertEquals(r.err.includes("running count"), false, "the step behind the wait did not run");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("a wait naming a node that does not exist fails, by name", async () => {
+  const { dir, launcher } = await fixture();
+  try {
+    await Deno.writeTextFile(
+      `${dir}/net.txt`,
+      [
+        "node alpha | waiter: running | waiter.worker.js",
+        "wait beta  | waiter: running |",
+        "run  count |                 | wc.worker.js counted.txt",
+        "",
+      ].join("\n"),
+    );
+    const r = run(launcher, dir, "net.txt");
+
+    assertEquals(r.code, 1);
+    assertContains(r.err, "wait names beta, which is not a node");
   } finally {
     await Deno.remove(dir, { recursive: true });
   }

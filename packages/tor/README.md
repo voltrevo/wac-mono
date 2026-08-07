@@ -747,11 +747,24 @@ The fingerprint is unbroken uppercase hex, the spelling `authcert.wac` puts in t
 the one a client reads. A router descriptor spells the same 20 bytes in groups of four, and mixing
 the two is a comparison that silently never matches.
 
-**What remains is the description itself**, and one ordering problem in it: `run` directives start as
-soon as every node is *listening*, but a relay does not serve directory documents until it has polled
-and found them, up to `DIR_POLL_MS` after the authority writes them. So a client run straight after
-`gendesc` can reach a relay that is up and not yet serving. The launcher needs a way to wait for a
-second marker after a run step, or the client needs to retry. Nothing here is waiting on a decision.
+**And the launcher can express the ordering.** `run` directives start as soon as every node is
+*listening*, but a relay does not serve directory documents until it has polled and found them — up to
+`DIR_POLL_MS` after the authority writes them — so a client run straight after `gendesc` reaches a
+relay that is up and has nothing to give. A `wait` directive names the state instead:
+
+    node relay1 | listening on 127.0.0.1: | relayd.worker.js s1 -p 0 --descriptor r1.desc --seedline seed.txt …
+    node relay2 | listening on 127.0.0.1: | relayd.worker.js s2 -p 0 --descriptor r2.desc …
+    run  vote   |                         | gendesc.worker.js keys.json cert vote v - r1.desc r2.desc
+    wait relay1 | serving the consensus   |
+    wait relay2 | serving the consensus   |
+    run  fetch  |                         | torapp.worker.js seed.txt cert.fingerprint /tor/status-vote/current/consensus
+
+The alternative was a client that retries. That works too, and it puts the ordering somewhere nobody
+can read it: this program's claim is that every stage was *seen* to happen, and a retry loop in the
+payload turns a missing stage into a slow one.
+
+**What remains is the description itself** — writing that plan down, building the worker bundles it
+names, and a test that runs it. Every mechanism it needs now exists.
 
 ## What is not here
 

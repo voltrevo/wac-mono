@@ -25,6 +25,17 @@
 //   - **`run`** is the thing done across the network, started once every node is ready. Its exit code
 //     is this program's exit code, so a launcher that stood the network up and then quietly failed the
 //     fetch cannot report success.
+//   - **`wait`** is a state a named node must reach before the next directive runs, given as a marker
+//     the same way a node's ready line is. `wait relay1 | serving the consensus |` and nothing else on
+//     the line.
+//
+// `wait` exists because being up is not one event. A relay listens, and only later — once an authority
+// has built a consensus from the descriptors it and its peers wrote *after* binding — does it find
+// those documents and begin serving them. The consensus cannot exist before the relays do, so the two
+// stages cannot be collapsed, and a client run between them reaches a relay that is up and has nothing
+// to give. The alternative was a client that retries, which works and hides the ordering; this
+// program's claim is that every stage was seen to happen, and a retry loop turns a missing stage into
+// a slow one.
 //
 // ## `{name}` — what a node tells the rest of the network
 //
@@ -90,9 +101,13 @@ const i32 READY_TIMEOUT_MS = 120000;
 /** How long the thing run across the network has to finish. */
 const i32 RUN_TIMEOUT_MS = 180000;
 
-/** A line from the description: a server to bring up, or the work to do once they are all up. */
+/** A line from the description: a server to bring up, work to do, or a state to wait for. */
+const i32 KIND_NODE = 0;
+const i32 KIND_RUN = 1;
+const i32 KIND_WAIT = 2;
+
 struct Directive {
-  bool isNode;
+  i32 kind;
   string name;
   string ready;
   string bundle;
@@ -134,7 +149,7 @@ export i32 main(Core core, Cli cli) {
   }
 
   i32 nodeCount = 0;
-  for (i32 i = 0; i < plan.len(); i++) { if (plan[i]!.isNode) { nodeCount = nodeCount + 1; } }
+  for (i32 i = 0; i < plan.len(); i++) { if (plan[i]!.kind == KIND_NODE) { nodeCount = nodeCount + 1; } }
   if (nodeCount == 0) {
     core.warn("network: the description has no nodes, so there is no network to run across");
     return 1;
@@ -145,7 +160,7 @@ export i32 main(Core core, Cli cli) {
   Node?[] nodes = Node?[nodeCount]();
   i32 live = 0;
   for (i32 i = 0; i < plan.len(); i++) {
-    if (!plan[i]!.isNode) { continue; }
+    if (plan[i]!.kind != KIND_NODE) { continue; }
     Node? started = startNode(core, cli, plan[i]!);
     if (started is null) {
       stopAll(cli, nodes, live);
@@ -167,7 +182,17 @@ export i32 main(Core core, Cli cli) {
   i32 code = 0;
   bool ranSomething = false;
   for (i32 i = 0; i < plan.len(); i++) {
-    if (plan[i]!.isNode) { continue; }
+    if (plan[i]!.kind == KIND_NODE) { continue; }
+
+    // `wait` is not work, so it does not satisfy "the description asks for something to be run" —
+    // a plan that only waits has still done nothing across the network.
+    if (plan[i]!.kind == KIND_WAIT) {
+      if (!awaitMarker(core, cli, nodes, live, plan[i]!.name, plan[i]!.ready, readyTimeout)) {
+        code = 1;
+        break;
+      }
+      continue;
+    }
     ranSomething = true;
     // The arguments are resolved here rather than at parse time because the values do not exist until
     // the nodes are up: a relay's port is chosen by the operating system when it binds.
@@ -184,7 +209,7 @@ export i32 main(Core core, Cli cli) {
       args[a] = one.text;
     }
     if (!resolved) { code = 1; continue; }
-    i32 got = runOnce(core, cli, Directive(false, plan[i]!.name, plan[i]!.ready, plan[i]!.bundle,
+    i32 got = runOnce(core, cli, Directive(KIND_RUN, plan[i]!.name, plan[i]!.ready, plan[i]!.bundle,
                                            args));
     if (got != 0) { code = got; }
   }
@@ -229,6 +254,76 @@ Node? startNode(Core core, Cli cli, Directive d) {
  * marker that only ever appeared on the unwatched one would look exactly like a node that never
  * started.
  */
+/**
+ * Wait for a node to say something *after* it is already up.
+ *
+ * A relay is ready in two stages, and only the first is a bind. It listens, and later — once an
+ * authority has written a consensus built from the descriptors it and its peers wrote after binding —
+ * it polls, finds the documents and begins serving them. Both are real states of the same process
+ * and there is no way to collapse them: the consensus cannot exist until the relays do.
+ *
+ * So the description says so, between the two runs that straddle it:
+ *
+ *     run  vote   |                        | gendesc.worker.js … - r1.desc r2.desc
+ *     wait relay1 | serving the consensus  |
+ *     run  fetch  |                        | torapp.worker.js …
+ *
+ * The alternative was a client that retries. That would also work and it would put the ordering
+ * somewhere it cannot be read: the launcher's whole claim is that every stage was *seen* to happen,
+ * and a retry loop in the payload turns a missing stage into a slower one.
+ *
+ * The marker may already have arrived — a node prints on its own schedule and nothing was reading it
+ * between the ready phase and here — so `said` is checked before waiting on anything. Waiting first
+ * would hang until the deadline on exactly the runs that were fastest.
+ */
+bool awaitMarker(Core core, Cli cli, Node?[] nodes, i32 live, string name, string marker,
+                 i32 timeout) {
+  i32 at = -1;
+  for (i32 i = 0; i < live; i++) { if (nodes[i]!.name == name) { at = i; break; } }
+  if (at < 0) {
+    core.warn("network: wait names " + name + ", which is not a node in this description");
+    return false;
+  }
+  if (marker == "") {
+    core.warn("network: wait " + name + " has no marker, so it would wait for nothing");
+    return false;
+  }
+  Node n = nodes[at]!;
+  if (contains(n.said.bytes(), marker)) {
+    core.warn("network: " + name + " had already said \"" + marker + "\"");
+    return true;
+  }
+
+  while (true) {
+    i32[] ids = i32[2]();
+    ids[0] = n.fromOut.id;
+    ids[1] = n.fromErr.id;
+    i32 which = core.waitAny(ids, timeout);
+    if (which < 0) {
+      core.warn("network: " + name + " never said \"" + marker + "\" — the network did not reach " +
+                "the state the description says the next step needs");
+      core.warn("network: what " + name + " did say: " + string.fromBytes(n.said.bytes()));
+      return false;
+    }
+    bool isErr = which == 1;
+    bool alive = false;
+    match ((isErr ? n.fromErr : n.fromOut).wait()) {
+      case Data(bytes): { n.said.pushAll(bytes); alive = true; }
+      case End: { }
+      case Failed(why): { core.warn("network: " + n.name + ": " + why); }
+    }
+    if (isErr) { n.fromErr = cli.recv(n.errHandle); } else { n.fromOut = cli.recv(n.handle); }
+    if (!alive) { continue; }
+    if (contains(n.said.bytes(), marker)) {
+      // The capture moves with the marker, so a later state can carry a value too.
+      n.capture = afterMarker(n.said.bytes(), marker);
+      core.warn("network: " + name + " says " + marker);
+      return true;
+    }
+  }
+  return false;
+}
+
 bool awaitReady(Core core, Cli cli, Node?[] nodes, i32 live, i32 readyTimeout) {
   i32 ready = 0;
   for (i32 i = 0; i < live; i++) {
@@ -383,7 +478,8 @@ Directive?[] parsePlan(u8[] text) {
     string bundle = words.len() > 0 ? string.fromBytes(words[0]) : "";
     u8[][] args = u8[][words.len() > 0 ? words.len() - 1 : 0]();
     for (i32 j = 1; j < words.len(); j++) { args[j - 1] = words[j]; }
-    out[at] = Directive(kind == "node", name, ready, bundle, args);
+    i32 which = kind == "node" ? KIND_NODE : (kind == "wait" ? KIND_WAIT : KIND_RUN);
+    out[at] = Directive(which, name, ready, bundle, args);
     at = at + 1;
   }
   return out;
@@ -396,7 +492,7 @@ bool isDirective(u8[] line) {
   u8[][] head = splitSpaces(t);
   if (head.len() == 0) { return false; }
   string kind = string.fromBytes(head[0]);
-  return kind == "node" || kind == "run";
+  return kind == "node" || kind == "run" || kind == "wait";
 }
 
 /**

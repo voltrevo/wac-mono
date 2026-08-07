@@ -74,3 +74,47 @@ Deno.test("out of range is refused", () => {
     if (!trapped) throw new Error(`accepted start ${start} len ${len} on ${d.length} bytes`);
   }
 });
+
+// ── The streaming form ────────────────────────────────────────────────────────
+
+const stream = await wacBind("packages/zstd/test/wac/xxh64_probe.wac") as unknown as {
+  streamed(d: Uint8Array, cut: number): bigint;
+  whole(d: Uint8Array): bigint;
+  ragged(d: Uint8Array): bigint;
+};
+
+Deno.test("streamed in every chunk size, the digest is the one-shot's", () => {
+  // The property that matters and the one a naive version fails: XXH64 consumes 32 bytes at a time and
+  // treats the tail differently, so hashing each piece separately agrees with the whole only when every
+  // piece is a multiple of 32. Cutting at *every* size from one byte upwards is what finds that.
+  // `packages/gzip`'s streaming tests use the same shape — 0006, and 0088 asks for it here.
+  for (const len of [0, 1, 7, 31, 32, 33, 63, 64, 65, 200, 1000]) {
+    const d = new Uint8Array(len);
+    for (let i = 0; i < len; i++) d[i] = (i * 37 + 11) & 0xff;
+    const want = stream.whole(d);
+    for (let cut = 1; cut <= Math.max(1, len) + 1; cut++) {
+      const got = stream.streamed(d, cut);
+      if (got !== want) {
+        throw new Error(`length ${len} cut every ${cut}: ${got.toString(16)}, want ${want.toString(16)}`);
+      }
+    }
+    if (stream.ragged(d) !== want) throw new Error(`length ${len} in ragged pieces disagrees`);
+  }
+});
+
+Deno.test("and the published vectors survive being cut up", () => {
+  // The vectors above are the real oracle; this checks the streaming path against them directly rather
+  // than only against our own one-shot, which could be wrong in the same way.
+  const vectors: [string, string][] = [
+    ["", "ef46db3751d8e999"],
+    ["abc", "44bc2cf5ad770999"],
+    ["ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", "aaa46907d3047814"],
+  ];
+  for (const [text, want] of vectors) {
+    const d = enc.encode(text);
+    for (const cut of [1, 2, 3, 8, 16, 32, 64]) {
+      const got = hex(stream.streamed(d, cut));
+      if (got !== want) throw new Error(`${JSON.stringify(text)} cut every ${cut}: ${got}, want ${want}`);
+    }
+  }
+});

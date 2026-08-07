@@ -1,0 +1,217 @@
+// Decoding a zstd frame as its bytes arrive, and sending the output away as it is produced.
+//
+// wac-mono 0088. `decompress` holds the whole input *and* the whole output, so `box unzstd` on a file
+// larger than the heap fails where `box gunzip` on the same file does not.
+//
+// ## Why this is an ordinary loop and not a state machine
+//
+// The transform does not suspend; the *host* blocks in `read`. `packages/stream`'s bridge already works
+// that way and `packages/gzip` is written against it, so the loops below are the ordinary ones — no phase
+// field, no resumable position. `packages/stream/README.md` has the argument; the short version is that a
+// resumable DEFLATE is every loop position turned into a field, and a resumable zstd would be worse.
+//
+// ## The two things that make zstd harder than gzip here
+//
+// **The block is the unit.** A compressed block carries its own literals section and FSE tables and
+// nothing in it can be decoded until all of it has arrived, so the reader accumulates to a block boundary
+// rather than working from whatever the caller happened to hand over. `Pull` below is that accumulation,
+// and a block's size is in its three-byte header, so the amount to wait for is always known exactly.
+//
+// **The window is declared, not fixed.** DEFLATE reaches back 32 KiB; zstd reaches back as far as the
+// frame header says, which may be megabytes. Output is therefore retained until it is `windowSize` behind
+// and only then written away. That works without touching the match code because `sequences.wac` copies
+// with `out.pushRepeat(out.len - offset, …)` — an index computed from the *current* length — so dropping
+// the front of the buffer moves the base under it and every offset still lands on the same byte.
+//
+// ## Not implemented
+//
+// **Compression.** `zstdStream` is not here. The encoder chooses Huffman and FSE tables from a whole
+// block, so the streaming unit would be the block on the *input* side, and 0006 reached the same
+// conclusion for DEFLATE. Decoding alone is the useful half: it is what a large download needs.
+
+import { Buf } from "../../bytes/src/buf.wac";
+import { Read } from core;
+import { Xxh64, xxh64Low } from "./xxh64.wac";
+import { FrameHeader, Reader, readHeader, headerLength, magic, skippableBase, blockMaxSize }
+  from "./frame.wac";
+import { decodeCompressed, Decoder } from "./block.wac";
+
+/**
+ * Input that arrives in pieces, presented as a contiguous window a decoder can index into.
+ *
+ * `need(n)` reads until `n` bytes are available from `pos`, or answers false at a clean end of input.
+ * Everything before `pos` is dropped when the buffer grows, so holding the input costs one block rather
+ * than one file.
+ */
+export struct Pull {
+  fn[Read()] read;
+  Buf held;
+  i32 pos;
+  bool ended;
+
+  Pull create(fn[Read()] read) { return Pull(read, Buf.create(), 0, false); }
+
+  /** Bytes available without reading more. */
+  i32 have(const this) { return this.held.len - this.pos; }
+
+  /**
+   * Ensure `n` bytes are available. False means the input ended first.
+   *
+   * A partial tail is a truncated frame and the caller traps on it; this only reports the difference
+   * between "the frame ended here" and "the file ended here", which are not the same thing.
+   */
+  bool need(this, i32 n) {
+    while (this.have() < n) {
+      if (this.ended) { return false; }
+      match (this.read()) {
+        case Data(bytes): { this.held.pushAll(bytes); }
+        case End: { this.ended = true; }
+        // A read that failed is not an end of input: reporting it as one is how a truncated download
+        // becomes a valid short file. `packages/gzip` learnt this the same way (0006).
+        case Failed(why): { trap; }
+      }
+    }
+    return true;
+  }
+
+  /** Drop what has been consumed, so the buffer holds a block rather than a file. */
+  void compact(this) {
+    if (this.pos > 0) {
+      this.held.dropFront(this.pos);
+      this.pos = 0;
+    }
+  }
+
+  i32 byte(this) {
+    if (!this.need(1)) { trap; }
+    i32 v = this.held.data[this.pos];
+    this.pos++;
+    return v;
+  }
+
+  /** `n` bytes little-endian as an i32, for the header fields that are at most four. */
+  i32 num(this, i32 n) {
+    i32 v = 0;
+    for (i32 i = 0; i < n; i++) { v = v | (this.byte() << (i * 8)); }
+    return v;
+  }
+
+  void skip(this, i32 n) {
+    if (n < 0) { trap; }
+    if (!this.need(n)) { trap; }
+    this.pos = this.pos + n;
+  }
+}
+
+/**
+ * Decode every frame in the stream, writing the content out as it is produced.
+ *
+ * Returns the number of bytes written. `write` answering false means the far end stopped listening, and
+ * the decode stops there — the same contract `gunzipStream` has.
+ */
+export i64 unzstdStream(fn[Read()] read, fn[bool(u8[])] write) {
+  Pull p = Pull.create(read);
+  i64 written = 0;
+
+  while (true) {
+    // A frame starts with four bytes of magic. Not having them is the end of the stream, which is the
+    // one place where running out of input is not an error.
+    if (!p.need(4)) { return written; }
+    i32 m = p.num(4);
+
+    if ((m & 0xFFFFFFF0) == skippableBase()) {
+      i32 size = p.num(4);
+      if (size < 0) { trap; }
+      p.skip(size);
+      p.compact();
+      continue;
+    }
+    if (m != magic()) { trap; }
+
+    // The header's length is a function of its first byte, so the amount to wait for is knowable before
+    // the rest arrives — `headerLength` is beside the parser that defines it.
+    if (!p.need(1)) { trap; }
+    i32 n = headerLength(p.held.data[p.pos]);
+    if (!p.need(n)) { trap; }
+    u8[] head = u8[n]();
+    head.copyFrom(p.held.data, p.pos, 0, n);
+    p.pos = p.pos + n;
+    p.compact();
+    FrameHeader h = readHeader(Reader.create(head));
+    // A frame naming a dictionary cannot be decoded without it — refused here as `decompress` refuses it,
+    // because a plausible wrong answer is worse than a stop.
+    if (h.dictId != 0) { trap; }
+
+    written = written + decodeFrame(p, h, write);
+  }
+  return written;
+}
+
+/** One frame's blocks, retaining a window's worth of output and writing the rest away. */
+i64 decodeFrame(Pull p, FrameHeader h, fn[bool(u8[])] write) {
+  Buf out = Buf.create();
+  Decoder d = Decoder.create();
+  Xxh64 sum = Xxh64.create();
+  i64 produced = 0;
+  // Zero means the header did not say, which the format allows only for a single-segment frame — where
+  // the content size is the window. `readHeader` has already resolved that, so a zero here would mean a
+  // frame that declares neither, and retaining everything is the only safe reading of it.
+  i32 window = h.windowSize > 0 ? h.windowSize : 0x7FFFFFFF;
+
+  bool last = false;
+  while (!last) {
+    if (!p.need(3)) { trap; }
+    i32 header = p.num(3);
+    last = (header & 1) == 1;
+    i32 blockType = (header >>> 1) & 3;
+    i32 size = header >>> 3;
+
+    if (blockType == 0) {
+      if (size > blockMaxSize()) { trap; }
+      if (!p.need(size)) { trap; }
+      out.pushBytes(p.held.data, p.pos, size);
+      p.pos = p.pos + size;
+    } else if (blockType == 1) {
+      if (size > blockMaxSize()) { trap; }
+      i32 v = p.byte();
+      for (i32 i = 0; i < size; i++) { out.push(v); }
+    } else if (blockType == 2) {
+      if (!p.need(size)) { trap; }
+      decodeCompressed(p.held.data, p.pos, size, out, d);
+      p.pos = p.pos + size;
+    } else {
+      trap;   // reserved
+    }
+    p.compact();
+
+    // Everything more than a window behind can never be reached by a later match, so it can go now.
+    // This is the whole of the streaming property on the output side.
+    if (out.len > window) {
+      i32 spill = out.len - window;
+      produced = produced + spill as i64;
+      if (!flush(out, spill, sum, write)) { return produced; }
+    }
+  }
+
+  // The tail: whatever the window still holds.
+  produced = produced + out.len as i64;
+  if (!flush(out, out.len, sum, write)) { return produced; }
+
+  if (h.contentSize >= 0 && produced != h.contentSize) { trap; }
+  if (h.hasChecksum) {
+    u32 want = p.num(4) as@ u32;
+    if (sum.finish() as@ u32 != want) { trap; }
+  }
+  p.compact();
+  return produced;
+}
+
+/** Send `n` bytes from the front of `out`, hashing them on the way past. */
+bool flush(Buf out, i32 n, Xxh64 sum, fn[bool(u8[])] write) {
+  if (n <= 0) { return true; }
+  u8[] piece = u8[n]();
+  piece.copyFrom(out.data, 0, 0, n);
+  sum.update(piece, 0, n);
+  out.dropFront(n);
+  return write(piece);
+}
