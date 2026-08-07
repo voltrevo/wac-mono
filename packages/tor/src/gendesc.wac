@@ -163,13 +163,22 @@ export i32 main(Core core, Cli cli) {
         // would not build a path however many relays the consensus listed. The descriptors were fine:
         // it logged "3 elements to add" and then ran out of guards.
         //
-        // Still no `HSDir`: nothing here serves a hidden-service directory, and a client that believed
-        // that flag would publish onion descriptors into a hole.
+        // `HSDir` is here now, and it is the third flag to arrive by becoming true rather than by
+        // being wanted. It was withheld while nothing served a hidden-service directory — a client
+        // believing it would have published descriptors into a hole. `relayd` answers
+        // `POST /tor/hs/3/publish` over BEGIN_DIR and serves `/tor/hs/3/<z>` back, so the flag now
+        // describes something.
+        //
+        // Its absence was invisible until a service tried to publish on our own network and was told
+        // *no directory took the descriptor* — with nothing wrong anywhere except that
+        // `hsdirCandidates` had nobody to choose from. A network that cannot host the thing it was
+        // built to host, because of one missing word in a vote.
+        //
         // `accept` became true when `relayd` learned to carry a stream: it parses RELAY_BEGIN, opens
         // the socket, answers CONNECTED and forwards data both ways. D4 is why this is the order —
         // the policy follows the capability rather than advertising ahead of it, which is what the
         // V2Dir and HSDir decisions were both about.
-        relays[ri] = RelayOpinion(subject, "Exit Fast Guard Running Stable V2Dir Valid",
+        relays[ri] = RelayOpinion(subject, "Exit Fast Guard HSDir Running Stable V2Dir Valid",
                                   640416, "accept 1-65535");
       }
       VoteInfo vi = VoteInfo("wacauth", "127.0.0.1", "127.0.0.1", 7000, 5000,
