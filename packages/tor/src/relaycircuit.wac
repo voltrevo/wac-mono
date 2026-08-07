@@ -22,6 +22,7 @@ import { Hop, encryptRelay, decryptRelay, relayRecognized, relayCommand, relaySt
 import { encodeFixed, cellPayload, cellCommand, cellCircId, cmdCreate2, cmdCreated2, cmdDestroy,
          cmdRelay, cmdCreateFast, cmdCreatedFast, handshakeNtor } from "./cell.wac";
 import { ntorServerRespond } from "./ntor.wac";
+import { NTOR_KEY_MATERIAL } from "./relay.wac";
 import { sha1 } from "../../crypto/src/sha1.wac";
 
 /** The key material one hop needs: `Df | Db | Kf | Kb` for SHA-1 and AES-128. */
@@ -77,27 +78,42 @@ export struct Created {
   u8[] cell;
   /** The hop, ready to carry relay cells. Only meaningful when `cell` is not empty. */
   Hop hop;
+  /**
+   * KH — the nonce shared with the client on this circuit, or empty.
+   *
+   * The responder needs it for the same reason the client does: an ESTABLISH_INTRO arriving on this
+   * circuit is MACed with it, and a relay that did not keep it cannot be an introduction point. It is
+   * the tail of the same ntor expansion the hop's keys came from, which is why it comes back here
+   * rather than being derived again from something.
+   */
+  u8[] kh;
 }
 
 export Created answerCreate2(
   i32 circId, u8[] createPayload, u8[] identity, u8[] onionPriv, u8[] serverEphemeralPriv
 ) {
-  Created bad = Created(u8[0](), Hop.create(u8[HOP_KEY_LEN]()));
+  Created bad = Created(u8[0](), Hop.create(u8[HOP_KEY_LEN]()), u8[0]());
   if (identity.len() != 20 || onionPriv.len() != 32 || serverEphemeralPriv.len() != 32) {
     return bad;
   }
   u8[] handshake = create2Handshake(createPayload);
   if (handshake.len() != NTOR_REQUEST_LEN) { return bad; }
 
-  u8[] out = ntorServerRespond(identity, onionPriv, handshake, serverEphemeralPriv, HOP_KEY_LEN);
-  if (out.len() != NTOR_REPLY_LEN + HOP_KEY_LEN) { return bad; }
+  // `NTOR_KEY_MATERIAL`, not `HOP_KEY_LEN`: the extra twenty bytes are KH. The client half of this
+  // was expanding seventy-two too, so neither end had the nonce and no relay here could host an
+  // introduction point.
+  u8[] out = ntorServerRespond(identity, onionPriv, handshake, serverEphemeralPriv,
+                               NTOR_KEY_MATERIAL);
+  if (out.len() != NTOR_REPLY_LEN + NTOR_KEY_MATERIAL) { return bad; }
 
   u8[] reply = u8[NTOR_REPLY_LEN]();
   for (i32 i = 0; i < NTOR_REPLY_LEN; i++) { reply[i] = out[i]; }
   u8[] material = u8[HOP_KEY_LEN]();
   for (i32 i = 0; i < HOP_KEY_LEN; i++) { material[i] = out[NTOR_REPLY_LEN + i]; }
+  u8[] kh = u8[NTOR_KEY_MATERIAL - HOP_KEY_LEN]();
+  for (i32 i = 0; i < kh.len(); i++) { kh[i] = out[NTOR_REPLY_LEN + HOP_KEY_LEN + i]; }
 
-  return Created(created2Cell(circId, reply), Hop.createReversed(material));
+  return Created(created2Cell(circId, reply), Hop.createReversed(material), kh);
 }
 
 /** A DESTROY cell with a reason byte, tor-spec §5.4. */
@@ -345,7 +361,7 @@ export u8[] kdfTor(u8[] k0, i32 outLen) {
  * here, so this is the only secret the relay contributes.
  */
 export Created answerCreateFast(i32 circId, u8[] createPayload, u8[] serverRandom) {
-  Created bad = Created(u8[0](), Hop.create(u8[HOP_KEY_LEN]()));
+  Created bad = Created(u8[0](), Hop.create(u8[HOP_KEY_LEN]()), u8[0]());
   if (serverRandom.len() != CREATE_FAST_LEN) { return bad; }
   if (createPayload.len() < CREATE_FAST_LEN) { return bad; }
 
@@ -361,7 +377,12 @@ export Created answerCreateFast(i32 circId, u8[] createPayload, u8[] serverRando
 
   u8[] hopKeys = u8[HOP_KEY_LEN]();
   for (i32 i = 0; i < HOP_KEY_LEN; i++) { hopKeys[i] = material[CREATE_FAST_LEN + i]; }
-  return Created(encodeFixed(circId, cmdCreatedFast(), payload), Hop.createReversed(hopKeys));
+  // The first `CREATE_FAST_LEN` bytes *are* KH — they are what the reply's second half proves
+  // knowledge of. The comment above has said so all along beside code that kept only the rest.
+  u8[] fastKh = u8[CREATE_FAST_LEN]();
+  for (i32 i = 0; i < CREATE_FAST_LEN; i++) { fastKh[i] = material[i]; }
+  return Created(encodeFixed(circId, cmdCreatedFast(), payload), Hop.createReversed(hopKeys),
+                 fastKh);
 }
 
 // ── Opening a stream: the exit's half of RELAY_BEGIN ──────────────────────────

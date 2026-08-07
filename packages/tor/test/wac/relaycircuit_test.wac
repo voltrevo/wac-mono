@@ -15,6 +15,8 @@
 // condition.
 
 import { T } from "../../../wactest/src/assert.wac";
+import { Circuit } from "../../src/circuit.wac";
+import { NTOR_KEY_MATERIAL } from "../../src/relay.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import { x25519Base } from "../../../crypto/src/x25519.wac";
 import {
@@ -454,4 +456,66 @@ export string test_a_begin_says_where_to_connect() {
   t.isFalse(parseBegin(beginBody("127.0.0.1:8o")).ok, "a port that is not digits");
   t.isFalse(parseBegin(u8[0]()).ok, "an empty body");
   return t.report();
+}
+
+/**
+ * Both ends of one handshake arrive at the same KH.
+ *
+ * This is what makes an introduction point possible at all: a service MACs its ESTABLISH_INTRO with
+ * the nonce it derived, and the relay checks it with the nonce *it* derived. If the two ends took it
+ * from different places — or one of them did not take it at all, which is where both ends were until
+ * now — every ESTABLISH_INTRO would be refused and the only symptom would be a circuit that closes.
+ *
+ * The agreement is not the interesting half: two implementations of one KDF agreeing proves only that
+ * they are the same code. What pins the *value* is `ntor_wac.test.ts`, where tor's own `test-ntor-cl`
+ * produces all ninety-two bytes and our client reproduces them. This checks the plumbing on top of
+ * that: that the responder keeps what it derived, and keeps the right twenty bytes of it.
+ */
+export string test_both_ends_agree_about_the_circuit_nonce() {
+  T t = T.create();
+  u8[] identity = fill(20, 61);
+  u8[] onionPriv = scalar(62);
+  u8[] onionKey = x25519Base(onionPriv);
+  u8[] clientEphemeral = scalar(63);
+
+  u8[] request = ntorClientRequest(identity, onionKey, clientEphemeral);
+  Created answered = answerCreate2(9, cellPayload(encodeCreate2(9, handshakeNtor(), request), 0),
+                                   identity, onionPriv, scalar(64));
+  t.isTrue(answered.cell.len() > 0, "the relay answered the handshake");
+  t.eqI32(answered.kh.len(), 20, "and kept a nonce");
+
+  // The client's side of the same handshake, expanded to the full length.
+  u8[] material = ntorClientFinish(identity, onionKey, clientEphemeral,
+                                   decodeCreated2(cellPayload(answered.cell, 0)),
+                                   NTOR_KEY_MATERIAL);
+  t.eqI32(material.len(), NTOR_KEY_MATERIAL, "the client accepted the reply");
+  Circuit c = Circuit.create(9, material);
+  t.eqBytes(c.kh, answered.kh, "and both ends hold the same nonce");
+
+  // CREATE_FAST derives one too, and tor takes it from `reply_out + DIGEST_LEN` — which is the
+  // derivative half of the reply, the very bytes the client checks to know the relay ran the KDF. So
+  // the nonce is not a fourth thing to derive: it is already in the cell, and keeping it costs a copy.
+  // Onion circuits use ntor rather than CREATE_FAST, so this path is unexercised by a service and is
+  // asserted here rather than left to be discovered wrong by whoever first needs it.
+  Created fast = answerCreateFast(11, fill(CREATE_FAST_LEN, 70), fill(CREATE_FAST_LEN, 71));
+  t.isTrue(fast.cell.len() > 0, "the relay answered a CREATE_FAST");
+  t.eqI32(fast.kh.len(), CREATE_FAST_LEN, "and kept a nonce");
+  u8[] fastPayload = cellPayload(fast.cell, 0);
+  t.eqBytes(fast.kh, slice(fastPayload, CREATE_FAST_LEN, CREATE_FAST_LEN * 2),
+            "which is the derivative half of the reply, as tor reads it");
+
+  // A different handshake gives a different nonce, or the value is not doing any work.
+  Created other = answerCreate2(10,
+    cellPayload(encodeCreate2(10, handshakeNtor(),
+                              ntorClientRequest(identity, onionKey, scalar(65))), 0),
+    identity, onionPriv, scalar(64));
+  t.isTrue(other.cell.len() > 0, "a second handshake answered");
+  t.isTrue(!sameBytes(other.kh, answered.kh), "and its nonce is its own");
+  return t.report();
+}
+
+bool sameBytes(u8[] a, u8[] b) {
+  if (a.len() != b.len()) { return false; }
+  for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
+  return true;
 }
