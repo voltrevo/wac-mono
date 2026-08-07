@@ -16,13 +16,13 @@ import { Decoder, decodeCompressed } from "./block.wac";
 import { xxh64Low } from "./xxh64.wac";
 
 /** `0xFD2FB528`, little-endian, at the start of every zstd frame. */
-i32 magic() { return 0xFD2FB528; }
+export i32 magic() { return 0xFD2FB528; }
 
 /** Skippable frames use `0x184D2A50` through `0x184D2A5F` — the low nibble is the caller's. */
-i32 skippableBase() { return 0x184D2A50; }
+export i32 skippableBase() { return 0x184D2A50; }
 
 /** The largest a single block may be, regardless of window size. */
-i32 blockMaxSize() { return 131072; }
+export i32 blockMaxSize() { return 131072; }
 
 /**
  * A little-endian reader over the whole input.
@@ -31,7 +31,7 @@ i32 blockMaxSize() { return 131072; }
  * the sizes below are attacker-controlled, and a frame that claims more than it carries must
  * be refused rather than read past.
  */
-struct Reader {
+export struct Reader {
   u8[] src;
   i32 pos;
 
@@ -77,11 +77,36 @@ struct Reader {
  * streaming does not know it yet. It is a hint for allocation and a check at the end, never
  * something to trust for sizing a buffer.
  */
-struct FrameHeader {
+export struct FrameHeader {
   i64 contentSize;      // -1 when absent
   i32 windowSize;       // bytes a match may reach back
   bool hasChecksum;
   i32 dictId;           // 0 when absent
+}
+
+/**
+ * How many bytes the header is, from its first one.
+ *
+ * The descriptor packs two fields that change the size of what follows, so a reader that cannot look
+ * ahead — `packages/zstd/src/stream.wac`, pulling from a socket — has to ask before it can wait for the
+ * right number of bytes. Beside `readHeader` deliberately: the two must agree, and the way to keep them
+ * agreeing is to have them read the same descriptor bits in the same order, three lines apart.
+ */
+export i32 headerLength(i32 fhd) {
+  i32 fcsFlag = (fhd >>> 6) & 3;
+  bool singleSegment = ((fhd >>> 5) & 1) == 1;
+  i32 didFlag = fhd & 3;
+
+  i32 n = 1;                                  // the descriptor itself
+  if (!singleSegment) { n = n + 1; }          // Window_Descriptor
+  if (didFlag == 1) { n = n + 1; }
+  if (didFlag == 2) { n = n + 2; }
+  if (didFlag == 3) { n = n + 4; }
+  if (fcsFlag == 0) { if (singleSegment) { n = n + 1; } }
+  else if (fcsFlag == 1) { n = n + 2; }
+  else if (fcsFlag == 2) { n = n + 4; }
+  else { n = n + 8; }
+  return n;
 }
 
 /**
@@ -90,7 +115,7 @@ struct FrameHeader {
  * The descriptor byte packs six fields, two of which change the size of what follows, so this
  * is read strictly in order: get one wrong and every later field is misaligned.
  */
-FrameHeader readHeader(Reader r) {
+export FrameHeader readHeader(Reader r) {
   i32 fhd = r.byte();
   i32 fcsFlag = (fhd >>> 6) & 3;
   bool singleSegment = ((fhd >>> 5) & 1) == 1;
