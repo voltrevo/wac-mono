@@ -1781,3 +1781,49 @@ at the tail of the ntor expansion. The client half of that was missing too and i
 responder in `relaycircuit.wac` still expands seventy-two bytes and keeps none of it. The `CREATE_FAST`
 path is the giveaway — it computes KH, uses it as the reply's second half, and discards it, with a
 comment that says "KH, then the hop's 72 bytes" beside code that keeps only the second part.
+
+### An onion service published, on a network with no C in it
+
+    hsserviced: kybekhkldvk3o4oml655meubbbmbt75rrapbgm2ex5rpgqmtqwsoxqqd
+    consensus verified: 1 of 1 authorities signed
+    hsserviced: bootstrapped, 3 relays
+    hsserviced: introduction circuit wacrelay1 -> wacrelay2 -> wacrelay3
+    hsserviced: introduction point established at wacrelay3
+    hsserviced: wacrelay3 took the descriptor
+    ... six in all
+    hsserviced: published to 6 directories
+
+and on the relays, the other side of the same events:
+
+    relayd: [2]  circuit -690182948 is an introduction point
+    relayd: [4]  filed an onion service descriptor, 1 held
+
+Six uploads because a service publishes for **two** time periods and this network has three
+directories. Every part of it is ours: our `gendesc` wrote the documents, our `relayd` carried the
+circuit and accepted the ESTABLISH_INTRO, our KH derivation on both ends agreed well enough for its
+MAC to verify, and our directory stored the descriptor `hsdescbuild` produced.
+
+**What the run cost, and what it found.** Two failures before it worked, and both were in the setup
+rather than the code — which is its own lesson, since both looked like protocol failures:
+
+- *the consensus is not acceptable — not valid yet*, twice, with a `valid-after` that was plainly in
+  the past. The relays serving it had never restarted: the previous batch still held the ports and the
+  new processes had logged `listen: Address already in use` and carried on. `ss` showed three
+  listeners and I read that as success. This is the third time this exact thing has cost an hour, so:
+  **kill by PID, then assert the port is free, then assert each relay logged that it loaded documents
+  and did not log a bind failure.** A check that is not fatal is not a check.
+- *no directory took the descriptor*, with nothing wrong anywhere. Our authority had never voted the
+  **`HSDir`** flag, so `hsdirCandidates` had nobody to choose from and the plan was empty. A network
+  that could not host the thing it was built to host, for one missing word in a vote.
+
+`HSDir` is the third flag to arrive by *becoming true* rather than by being wanted — `V2Dir` and
+`accept` were the others. It was withheld deliberately while nothing served a hidden-service
+directory, and the comment saying so was correct right up until `relayd` learned to answer
+`POST /tor/hs/3/publish`. The flag lagging the capability is the right order; noticing the capability
+had arrived took a service failing to publish.
+
+**What is not done.** The service then sat waiting for a client and the introduction circuit closed
+after thirty seconds of silence — a link timeout, not a protocol event. A service must hold that
+circuit open indefinitely, so the timeout needs to be per-purpose rather than global. Nothing has yet
+sent an INTRODUCE1 into this network, so the introduce/rendezvous half of the relay work has been
+built and pinned but not carried.
