@@ -92,6 +92,30 @@ no private key derives the same keys the client does. tor-spec says abort; `ntor
 returns an empty array rather than keys plus a boolean, because a boolean invites using the
 keys anyway.
 
+## Reading C tor, and the line this package draws
+
+C tor is this package's oracle. The specs are incomplete and in places wrong — one tor comment
+misdescribes its own function's half-open range — so "what does tor actually do" frequently has no
+answer but the source, and design 0002's whole approach depends on being able to get one.
+
+**The rule: consult the C only to answer a specific behavioural question.** Write the question down,
+read until it is answered, write the answer down as a rule in prose, and implement from the prose.
+Never write wac with a C file open beside it. What comes back from a read is a sentence about
+behaviour — an ordering, a refusal, a boundary — not a shape to follow.
+
+The distinction is not pedantry. A rule extracted and then implemented is our own work; wac written
+alongside C is a transliteration, and tor is 3-clause BSD, which makes that a different thing in
+licence as well as in intent. Quoting a few lines to explain a rule is citation and is fine; there are
+six such lines in this repository, and they are marked as quotations where they appear.
+
+How much of what is already here was written that way has never been audited — [issue
+0097](../../issues/open/0097-how-much-of-packages-tor-is-ours-rather-than-a-transliteration.md) is
+that audit. Three spot checks say the structure genuinely diverges: our ntor is stateless pure
+functions against tor's `ntor_handshake_state_t` and precomputed tweak set; our consensus verifier
+scans document text where tor walks a parsed `networkstatus_t` with five tally lists; our relay is one
+`waitAny` over a rebuilt id table where tor is libevent callbacks. Reassuring, and not a substitute
+for the audit.
+
 ## How it is tested
 
 Five tests are relations between the handshake's own outputs, and one is a differential
