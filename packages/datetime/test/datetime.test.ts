@@ -17,6 +17,16 @@
 
 import { wacBind } from "../../../harness/wacBind.ts";
 
+/** Local, because this repo has no third-party dependencies — and this file threw plain Errors before. */
+function assertEquals<T>(got: T, want: T, msg?: string): void {
+  if (got !== want) {
+    throw new Error(
+      `assertEquals failed${msg === undefined ? "" : ` — ${msg}`}\n` +
+        `  got:  ${JSON.stringify(got)}\n  want: ${JSON.stringify(want)}`,
+    );
+  }
+}
+
 const mod = await wacBind("packages/datetime/test/probe.wac") as unknown as {
   toDays(y: number, m: number, d: number): bigint;
   fromDaysYear(days: bigint): number;
@@ -203,6 +213,30 @@ Deno.test("format matches Date.toISOString", () => {
     const want = new Date(Number(ms)).toISOString();
     const got = dec.decode(mod.formatMillis(ms));
     if (got !== want) throw new Error(`${ms}: got ${got}, Date says ${want}`);
+  }
+});
+
+Deno.test("-00:00 is an unknown offset, and Z is not", () => {
+  // RFC 3339 §4.3: `-00:00` means the instant is known and the local offset is *not*. `Z` and `+00:00`
+  // both assert an offset of zero, so all three arrive as `offsetMin == 0` and only `offsetKnown` tells
+  // them apart — which is the whole of GitHub wac-mono#15.
+  //
+  // `parseOffsetKnown` was added to the probe for that issue and **nothing ever called it**: the branch
+  // report says `probe.wac:34 entry` never executed. A field with a nine-line rationale, unverified.
+  // `Date` cannot help here — it maps every one of the three to the same instant and keeps nothing — so
+  // this is checked against the RFC rather than against an oracle, and says so.
+  const known = (s: string) => mod.parseOffsetKnown(enc.encode(s));
+  assertEquals(known("2020-06-15T10:00:00-00:00"), 0, "-00:00 is the unknown-offset spelling");
+  for (const s of ["2020-06-15T10:00:00Z", "2020-06-15T10:00:00z", "2020-06-15T10:00:00+00:00",
+                   "2020-06-15T10:00:00+05:30", "2020-06-15T10:00:00-05:00"]) {
+    assertEquals(known(s), 1, `${s} asserts an offset`);
+  }
+  assertEquals(known("2020-06-15T10:00:00"), -1, "a rejected timestamp answers neither");
+
+  // And the instant is the same for all three zero spellings, which is the half `Date` can confirm.
+  const at = Date.parse("2020-06-15T10:00:00Z");
+  for (const s of ["2020-06-15T10:00:00Z", "2020-06-15T10:00:00+00:00", "2020-06-15T10:00:00-00:00"]) {
+    assertEquals(Number(mod.parseMillis(enc.encode(s))), at, `${s} is the same instant`);
   }
 });
 

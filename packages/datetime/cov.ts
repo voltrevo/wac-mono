@@ -4,6 +4,12 @@
 // timestamps — which are the only things that reach the rejection paths — and a spread of
 // instants either side of the epoch, which is where the floor-division cases are.
 //
+// **That sentence was not true when it was checked.** This file and `test/datetime.test.ts` had drifted
+// apart in both directions: the tests reached `padYear`'s expanded form and this did not, and neither of
+// them ever called `parseOffsetKnown`. The README said 100% and the tool said 92. Two exercises of the
+// same code will drift unless something compares them, and nothing does — so when you add a case to one,
+// add it here too, and read the branch report rather than trusting this comment.
+//
 //   deno task coverage:datetime
 //   deno task coverage:datetime --verbose
 
@@ -26,6 +32,7 @@ const m = run.mod as unknown as {
   accepts(s: Uint8Array): boolean;
   parseMillis(s: Uint8Array): bigint;
   parseOffset(s: Uint8Array): number;
+  parseOffsetKnown(s: Uint8Array): number;
   formatMillis(ms: bigint): Uint8Array;
 };
 
@@ -101,6 +108,31 @@ for (
   m.accepts(enc.encode(s));
   m.parseMillis(enc.encode(s));
   m.parseOffset(enc.encode(s));
+  m.parseOffsetKnown(enc.encode(s));
+}
+
+// `-00:00` against the other two spellings of zero — the branch `offsetKnown` exists for, which nothing
+// here reached: this file's header says it runs "the same exercises the tests run" and it had drifted
+// out of that. So had the tests, in the other direction, which is how a probe export written for
+// GitHub wac-mono#15 came to be called by neither.
+for (const s of ["2020-06-15T10:00:00-00:00", "2020-06-15T10:00:00+00:00", "2020-06-15T10:00:00Z"]) {
+  m.parseOffsetKnown(enc.encode(s));
+}
+
+// Years outside 0000..9999, where `padYear` writes a sign and six digits. The spread above covers about
+// 1963 to 1976 and cannot reach it; `test/datetime.test.ts` does reach it, which is exactly the drift
+// this file's header denies.
+for (
+  const ms of [
+    253402300800000n,   // +010000-01-01, the first year needing the expanded form
+    253402300799999n,   // and the last that does not
+    -62167219200000n,   // 0000-01-01
+    -62167219200001n,   // -000001-12-31
+    8640000000000000n,  // +275760-09-13, the largest instant Date supports
+    -8640000000000000n, // -271821-04-20, the smallest
+  ]
+) {
+  m.formatMillis(ms);
 }
 
 report([run], "packages/datetime/", { verbose });
