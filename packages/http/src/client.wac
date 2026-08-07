@@ -1,0 +1,109 @@
+// One HTTP/1.1 request over a socket, read to the end, parsed.
+//
+// The request/read/parse loop existed twice before this file: `packages/box/src/lib/fetch.wac`, which is
+// GET-only and writes the body to standard output, and the beginning of a third copy in a JSON-RPC client.
+// The differences between them were the method, the body, and what to do with the answer — none of which
+// is a reason to write the socket loop again.
+//
+// **`Connection: close` and read to EOF.** That is the framing this supports, and it is a deliberate
+// restriction rather than an oversight: with the connection closing, the body's end *is* the socket's end,
+// so a truncated read is indistinguishable from a complete one unless the parser is told. `parseResponse`
+// is called once with `eof` set, which is what makes "the socket ended" mean "the body is complete" —
+// and a connection that *failed* half way is reported as a failure rather than parsed as a short body.
+//
+// Keep-alive, chunked request bodies and pipelining are **not implemented**. A caller that needs them
+// wants a connection object with state, which is a different shape from this function.
+
+import { Cli, Socket } from "../../platform/src/platform.wac";
+import { itoa } from "../../fmt/src/itoa.wac";
+import { Incoming, ParsedResponse, parseResponse } from "./incoming.wac";
+import { Headers } from "./headers.wac";
+
+/** What one request produced. `ok` false means there is no response, and `error` says why. */
+export struct Fetched {
+  bool ok;
+  /** The parsed response, when `ok`. */
+  Incoming response;
+  /** Why there is no response: a socket failure, or how the parse refused. */
+  string error;
+
+  Fetched of(bool ok, Incoming response, string error) {
+    return Fetched(ok, response, error);
+  }
+}
+
+/**
+ * `method` `path` to `host:port`, with `body` if there is one, and the whole response back.
+ *
+ * `contentType` is ignored when `body` is empty — a GET carries no `Content-Type`, and sending one is the
+ * kind of detail a server is entitled to reject.
+ */
+export Fetched request(Cli cli, u8[] method, string host, i32 port, string path,
+                       u8[] body, string contentType) {
+  Socket s = cli.connect(host, port).wait();
+  if (s.handle < 0) { return failed(host + ": " + s.error); }
+
+  string head = string.fromBytes(method) + " " + path + " HTTP/1.1\r\n"
+    + "Host: " + host + "\r\n"
+    + "User-Agent: wac\r\n"
+    + "Connection: close\r\n";
+  if (body.len() > 0) {
+    head = head + "Content-Type: " + contentType + "\r\n"
+         + "Content-Length: " + itoa(body.len()) + "\r\n";
+  }
+  head = head + "\r\n";
+
+  u8[] out = u8[head.toBytes().len() + body.len()]();
+  u8[] headBytes = head.toBytes();
+  out.copyFrom(headBytes, 0, 0, headBytes.len());
+  out.copyFrom(body, 0, headBytes.len(), body.len());
+
+  if (!cli.send(s.handle, out).wait()) {
+    cli.closeSocket(s.handle);
+    return failed(host + ": cannot send the request");
+  }
+
+  u8[] all = u8[0]();
+  bool reading = true;
+  string why = "";
+  while (reading) {
+    match (cli.recv(s.handle).wait()) {
+      case Data(bytes): { all = append(all, bytes); }
+      case End: { reading = false; }
+      case Failed(reason): { why = reason; reading = false; }
+    }
+  }
+  cli.closeSocket(s.handle);
+  // A connection that failed halfway is not a short body. With `Connection: close` the body's end is the
+  // socket's end, so this is exactly the case that would otherwise parse as a whole small page.
+  if (why != "") { return failed(host + ": " + why); }
+
+  match (parseResponse(all, method, true, 1 << 26)) {
+    case Incomplete: { return failed("the response ended mid-message"); }
+    case Bad(code): { return failed("unparseable response (" + itoa(code) + ")"); }
+    case Ok(res): { return Fetched.of(true, res, ""); }
+  }
+}
+
+/** A GET, which is what most callers want. */
+export Fetched get(Cli cli, string host, i32 port, string path) {
+  return request(cli, "GET".toBytes(), host, port, path, u8[0](), "");
+}
+
+/** A POST with a body — `packages/ethrpc` is the caller this exists for. */
+export Fetched post(Cli cli, string host, i32 port, string path, u8[] body, string contentType) {
+  return request(cli, "POST".toBytes(), host, port, path, body, contentType);
+}
+
+Fetched failed(string why) {
+  // A `Fetched` that is not `ok` still has to carry *an* `Incoming`, since wac has no nullable struct
+  // field worth using here — an empty one, which a caller that checks `ok` never looks at.
+  return Fetched.of(false, Incoming(0, 1, u8[0](), Headers.create(), u8[0](), 0, false), why);
+}
+
+u8[] append(u8[] a, u8[] b) {
+  u8[] out = u8[a.len() + b.len()]();
+  out.copyFrom(a, 0, 0, a.len());
+  out.copyFrom(b, 0, a.len(), b.len());
+  return out;
+}

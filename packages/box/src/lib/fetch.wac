@@ -1,75 +1,32 @@
-// One HTTP GET, written once and used by both `get` and `wget`.
+// One HTTP GET for `get` and `wget`, which differ by three lines: `wget` points the current output at a
+// file first, and the fetch itself does not know the difference.
 //
-// The body goes out through `cli.write`, which is the whole reason the two applets differ
-// by three lines: `wget` points the current output at a file first, and the fetch itself
-// does not know the difference.
+// **The socket loop moved.** It is `packages/http/src/client.wac` now — the same request, read-to-EOF and
+// parse that a JSON-RPC client needs, and there is no version of "write the loop again with POST in it"
+// that ends well. What is left here is what was actually specific to these two applets: the header dump
+// and the exit code.
 
-import { Cli, Core, Socket } from "../../../platform/src/platform.wac";
+import { Cli, Core } from "../../../platform/src/platform.wac";
 import { itoa } from "../../../fmt/src/itoa.wac";
-import { concat } from "./bytes.wac";
-import { Incoming, ParsedResponse, parseResponse } from "../../../http/src/incoming.wac";
-import { Read } from core;
+import { get, Fetched } from "../../../http/src/client.wac";
 
 /** The exit code the applet should return. */
 export i32 fetch(Core core, Cli cli, string name, string host, string path, i32 port, bool headers) {
-  Socket s = cli.connect(host, port).wait();
-  if (s.handle < 0) { core.warn(name + ": " + host + ": " + s.error); return 1; }
-
-  string req = "GET " + path + " HTTP/1.1\r\n"
-    + "Host: " + host + "\r\n"
-    + "User-Agent: box\r\n"
-    + "Connection: close\r\n\r\n";
-  if (!cli.send(s.handle, req.toBytes()).wait()) {
-    core.warn(name + ": " + host + ": cannot send");
-    cli.closeSocket(s.handle);
+  Fetched f = get(cli, host, port, path);
+  if (!f.ok) {
+    core.warn(name + ": " + f.error);
     return 1;
   }
 
-  // `Connection: close` means the body ends when the socket does, so this reads to the end
-  // and then parses once with `eof` set — which is what tells the parser a body with no
-  // length is complete rather than truncated.
-  u8[] all = u8[0]();
-  bool reading = true;
-  bool broke = false;
-  while (reading) {
-    match (cli.recv(s.handle).wait()) {
-      case Data(bytes): { all = concat(all, bytes); }
-      case End: { reading = false; }
-      // A connection that failed halfway is not a short body — and with `Connection: close` the
-      // body's end *is* the socket's end, so this is precisely the case that used to be invisible:
-      // half a page would have parsed as a whole one.
-      case Failed(why): {
-        core.warn(name + ": " + host + ": " + why);
-        reading = false;
-        broke = true;
-      }
+  if (headers) {
+    core.log("HTTP " + itoa(f.response.status));
+    for (i32 i = 0; i < f.response.headers.count; i++) {
+      core.log(string.fromBytes(f.response.headers.nameAt(i)) + ": "
+             + string.fromBytes(f.response.headers.valueAt(i)));
     }
+    core.log("");
   }
-  cli.closeSocket(s.handle);
-  // Reported above; the exit code is what a script reads.
-  if (broke) { return 1; }
-
-  match (parseResponse(all, "GET".toBytes(), true, 1 << 26)) {
-    case Incomplete: {
-      core.warn(name + ": the response ended mid-message");
-      return 1;
-    }
-    case Bad(code): {
-      core.warn(name + ": unparseable response (" + itoa(code) + ")");
-      return 1;
-    }
-    case Ok(res): {
-      if (headers) {
-        core.log("HTTP " + itoa(res.status));
-        for (i32 i = 0; i < res.headers.count; i++) {
-          core.log(string.fromBytes(res.headers.nameAt(i)) + ": "
-                 + string.fromBytes(res.headers.valueAt(i)));
-        }
-        core.log("");
-      }
-      cli.write(res.body);
-      return res.status >= 400 ? 1 : 0;
-    }
-  }
-  return 1;
+  cli.write(f.response.body);
+  // A 4xx or 5xx is a fetch that worked and a request that did not, which is what `wget` reports too.
+  return f.response.status >= 400 ? 1 : 0;
 }

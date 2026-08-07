@@ -1,0 +1,13 @@
+// The RPC client, reachable from a test that drives a real node.
+import { call, stringOf, Answer } from "../../src/rpc.wac";
+import { Cli } from "../../../platform/src/platform.wac";
+
+/** `[ok, payload…]` — the result as text when it worked, the error when it did not. */
+export u8[] rpc(Cli cli, string host, i32 port, string method, string params) {
+  Answer a = call(cli, host, port, method, params);
+  u8[] body = a.ok ? stringOf(a.result) : a.error.toBytes();
+  u8[] out = u8[1 + body.len()]();
+  out[0] = a.ok ? 1 : 0;
+  out.copyFrom(body, 0, 1, body.len());
+  return out;
+}

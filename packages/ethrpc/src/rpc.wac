@@ -1,0 +1,92 @@
+// JSON-RPC to an Ethereum node, over the HTTP client this repo already has.
+//
+// This is the piece design/0003 calls "chain access": everything above it — `packages/mpt`,
+// `packages/ens`, `packages/lightclient` — verifies what a node says, and until now nothing here could
+// *ask*. The tests handed those packages fixtures.
+//
+// ## What trusting this does and does not mean
+//
+// **A JSON-RPC endpoint is not trusted for anything it says**, and that is the whole point of the packages
+// above. What it is trusted for is *availability*: it can refuse to answer, answer slowly, or answer about
+// an old block, and nothing here can tell. What it cannot do is lie about state, because a proof is checked
+// against a root — provided the root came from somewhere else.
+//
+// **Where the root comes from is the open question.** `packages/lightclient` is what makes it real: it
+// follows the chain and hands over a verified header. Taking the state root from the same `eth_getBlock`
+// that served the proof, which is what a caller can do today, proves only that the node is *internally
+// consistent* — it can invent a whole state and be believed. That is stated here rather than glossed,
+// because a composition that looks verified and is not is worse than one that admits it.
+
+import { Cli } from "../../platform/src/platform.wac";
+import { post, Fetched } from "../../http/src/client.wac";
+import { parse } from "../../json/src/json.wac";
+import { JsonValue, JsonObject } from "../../json/src/value.wac";
+import { itoa } from "../../fmt/src/itoa.wac";
+
+/** One call's answer. `result` is the raw JSON of the `result` member, undecoded. */
+export struct Answer {
+  bool ok;
+  /** The `result` value, when `ok` — a `Str` for most `eth_` methods, an `Object` for `eth_getProof`. */
+  JsonValue result;
+  string error;
+
+  Answer of(bool ok, JsonValue result, string error) {
+    return Answer(ok, result, error);
+  }
+}
+
+/**
+ * `method` with `params` — the params as JSON text, brackets included, because building them is the
+ * caller's business and every method's shape is different.
+ *
+ * The id is always 1: these are synchronous single calls over a connection that closes, so there is
+ * nothing to correlate. Batching would need real ids and is not implemented.
+ */
+export Answer call(Cli cli, string host, i32 port, string method, string params) {
+  string body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"" + method + "\",\"params\":" + params + "}";
+  Fetched f = post(cli, host, port, "/", body.toBytes(), "application/json");
+  if (!f.ok) { return bad(method + ": " + f.error); }
+  if (f.response.status != 200) {
+    return bad(method + ": the node answered HTTP " + itoa(f.response.status));
+  }
+
+  JsonValue? parsed = parse(f.response.body);
+  if (parsed is null) { return bad(method + ": the node's answer is not JSON"); }
+  match (parsed!) {
+    case Object(members): {
+      // An error member is the node refusing, and it is not the same as a transport failure: the request
+      // arrived and was understood. Its message is the useful part and is passed through.
+      JsonValue? err = members.get("error".toBytes());
+      if (!(err is null)) { return bad(method + ": " + describe(err!)); }
+      JsonValue? result = members.get("result".toBytes());
+      if (result is null) { return bad(method + ": the answer has no result"); }
+      return Answer.of(true, result!, "");
+    }
+    else: { return bad(method + ": the answer is not a JSON object"); }
+  }
+}
+
+/** An error object's `message`, or its shape when it has none. */
+string describe(JsonValue err) {
+  match (err) {
+    case Object(members): {
+      JsonValue? msg = members.get("message".toBytes());
+      if (msg is null) { return "the node refused, with no message"; }
+      match (msg!) {
+        case Str(bytes): { return string.fromBytes(bytes); }
+        else: { return "the node refused, and its message is not a string"; }
+      }
+    }
+    else: { return "the node refused"; }
+  }
+}
+
+/** A `Str` result's bytes — most `eth_` methods answer with a hex string. */
+export u8[] stringOf(JsonValue v) {
+  match (v) {
+    case Str(bytes): { return bytes; }
+    else: { return u8[0](); }
+  }
+}
+
+Answer bad(string why) { return Answer.of(false, JsonValue.Null, why); }
