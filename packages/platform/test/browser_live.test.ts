@@ -338,6 +338,16 @@ Deno.test({
       );
       await page.goto(`http://127.0.0.1:${port}/term.html`, { waitUntil: "load" });
       await page.waitForSelector("#cmd", { timeout: 30_000 });
+      // The terminal runs an opening session before it takes the keyboard, so the frame the website
+      // embeds shows real output rather than an empty prompt. Wait for the last of it: without this
+      // the first `command` below races the startup and reads its output instead. Waiting for the
+      // hash also checks the opening session in a real browser, which is where it is displayed.
+      await page.waitForFunction(
+        `document.getElementById('scr').textContent.includes(` +
+          `'5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03')`,
+        null,
+        { timeout: 60_000 },
+      );
       const command = async (line: string): Promise<string> => {
         const before = (await page.textContent("#scr")) ?? "";
         await page.fill("#cmd", line);

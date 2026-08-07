@@ -73,6 +73,13 @@ arithmetic, pipelines, redirection, `&&`/`||`, `if`/`while`/`for`/`case`, functi
 globbing, the built-ins including `cd`, `pwd`, `ls`, `mkdir` and `rm` — and all sixty applets from
 this package. Up and Down walk a 64-entry history; `clear` empties the screen.
 
+It opens on a session rather than on an empty prompt: three commands run through the same
+`runScript` the keyboard reaches, before the loop starts. That is for the page that embeds it — a
+terminal showing output it produced a second ago says something a terminal showing a help banner
+does not. The website prints the same three lines where the frame cannot load, and
+`tools/frontpage.test.ts` fails if the two lists drift apart or if the shell stops answering what
+either of them claims.
+
 ```sh
 deno task app:build packages/box/example/term.wac --target browser \
   --allow-read --allow-write -o page/index.html

@@ -41,7 +41,10 @@
 // **The scrollback pins itself with CSS, not with a capability.** A terminal has to show the
 // newest line, and `setText` cannot scroll anything. Rather than adding a `scrollToEnd`
 // capability for one caller, the scroller is `flex-direction: column-reverse`, which anchors it
-// to the end — the browser keeps a reversed column scrolled to its bottom for free.
+// to the end — the browser keeps a reversed column scrolled to its bottom for free. A reversed
+// column also pins a *short* session to the bottom of the frame, under a screenful of nothing,
+// which is what this looked like embedded in a page; `justify-content: flex-end` is the top in a
+// reversed column, so a short session starts at the top and a long one still ends at the bottom.
 //
 // **History is a ring in a local.** Up and Down arrive as `keydown` events with the key in
 // `Event.value`, so the whole feature is a `string[]` and two integers in the loop — no state
@@ -63,16 +66,9 @@ const string SOURCE =
 
 const string BANNER =
   "wac sh — packages/sh with every packages/box applet, in a browser tab.\n" +
-  "Sixty programs and a shell, all of it wac compiled to WebAssembly. `help` lists them.\n" +
-  "\n" +
-  "  echo wac | sha256sum             seq 1 20 | shuf | sort -n | head -3\n" +
-  "  echo hello | tr a-z A-Z          printf 'a,b,c\\n' | cut -f2 -d,\n" +
-  "  echo hi > f; gzip < f | base64   for i in 1 2 3; do echo $i; done\n" +
-  "  mkdir d; cd d; pwd               x=world; echo \"hey $x\"\n" +
-  "\n" +
-  "The filesystem is the Origin Private File System, empty at / and yours: what you write\n" +
-  "survives a reload and is visible to nothing outside this tab. Up and Down walk the\n" +
-  "history, `clear` empties the screen.\n" +
+  "Sixty programs and a shell, all of it wac compiled to WebAssembly. `help` lists them,\n" +
+  "Up and Down walk the history, `clear` empties the screen, and / is an Origin Private\n" +
+  "File System that survives a reload and is visible to nothing outside this tab.\n" +
   "\n";
 
 /**
@@ -94,29 +90,41 @@ export i32 page(Core core, Cli cli, Page page) {
   // That is why the launcher's page is bare now — an application dresses itself.
   page.render(
     "<style>" +
-    "  #term { position: fixed; inset: 0; display: flex; flex-direction: column;" +
-    "          background: #0b0f10; color: #d7e2e0;" +
-    "          font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }" +
-    "  #wrap { flex: 1; min-height: 0; overflow-y: auto; display: flex;" +
-    "          flex-direction: column-reverse; padding: 0 1rem; }" +
+    // Tuned to sit inside the website's terminal frame: the same ground, text and accent the page
+    // around it uses, so the embed reads as one object rather than a window into another site.
+    "  #term { position: fixed; inset: 0; overflow: hidden;" +
+    "          background: #06070a; color: #d7dde6;" +
+    "          font: 13px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }" +
+    // `column-reverse` is what makes new output stick to the bottom without scripting, and the
+    // prompt is inside the scroller rather than below it so that it is the next line of the
+    // session rather than a footer bolted to the window. Reversed, so it comes first in the
+    // markup and renders last. On its own the reversal also pins a *short* session to the bottom,
+    // under a screenful of nothing; in a reversed column the main axis runs upward, so `flex-end`
+    // is the top: content starts at the top while it is short, and sticks to the bottom once it
+    // outgrows the frame.
+    "  #wrap { height: 100%; overflow-y: auto; display: flex;" +
+    "          flex-direction: column-reverse; justify-content: flex-end;" +
+    "          padding: 14px 16px; }" +
     "  #scr { margin: 0; white-space: pre-wrap; word-break: break-word; }" +
-    "  #bar { display: flex; align-items: center; gap: .5rem; padding: .5rem 1rem;" +
-    "         border-top: 1px solid #1c3238; background: #0e1d21; }" +
-    "  #ps1 { color: #46d9c0; user-select: none; }" +
+    "  #bar { display: flex; align-items: baseline; gap: .5rem; padding-top: 2px; }" +
+    "  #ps1 { color: #5eead4; user-select: none; }" +
     "  #cmd { flex: 1; background: transparent; border: 0; outline: 0; color: inherit;" +
-    "         font: inherit; padding: 2px 0; }" +
-    "  #cmd::placeholder { color: #4a5f62; }" +
-    "  .k { color: #46d9c0; }" +
-    "  #src { color: #46d9c0; font-size: 12px; text-decoration: none; opacity: .8;" +
+    "         font: inherit; caret-color: #5eead4; padding: 0; }" +
+    "  #cmd::placeholder { color: #5e6878; }" +
+    "  .k { color: #5eead4; }" +
+    // Dim, and out at the edge of the prompt line: it is a way out, not the thing to look at.
+    "  #src { margin-left: auto; color: #8b95a5; font-size: 12px; text-decoration: none;" +
     "         white-space: nowrap; }" +
-    "  #src:hover { opacity: 1; text-decoration: underline; }" +
+    "  #src:hover { color: #5eead4; text-decoration: underline; }" +
     "</style>" +
     "<div id=\"term\">" +
-    "  <div id=\"wrap\"><pre id=\"scr\"></pre></div>" +
-    "  <div id=\"bar\"><span id=\"ps1\">$</span>" +
-    "    <input id=\"cmd\" autofocus autocomplete=\"off\" spellcheck=\"false\"" +
-    "           placeholder=\"a command, then Enter\">" +
-    "    <a id=\"src\" href=\"" + SOURCE + "\">source &amp; build it</a></div>" +
+    "  <div id=\"wrap\">" +
+    "    <div id=\"bar\"><span id=\"ps1\">$</span>" +
+    "      <input id=\"cmd\" autofocus autocomplete=\"off\" spellcheck=\"false\"" +
+    "             placeholder=\"a command, then Enter\">" +
+    "      <a id=\"src\" href=\"" + SOURCE + "\">source &amp; build it</a></div>" +
+    "    <pre id=\"scr\"></pre>" +
+    "  </div>" +
     "</div>"
   ).wait();
 
@@ -140,6 +148,24 @@ export i32 page(Core core, Cli cli, Page page) {
   // on the first argument. Its own instance, its own grants — and in a page this is the only route
   // to a real program at all.
   sh.externalSpawnable = true;
+
+  // Open on a session rather than on a prompt with nothing above it. These are run through the
+  // same `runScript` the keyboard reaches, so what the frame shows on load is this build's real
+  // output — a screenshot of a terminal is a drawing, and a terminal that has already done
+  // something is not. The website prints the same three lines beside the embed, and
+  // `tools/frontpage.test.ts` fails if either drifts from what the shell actually answers.
+  string[] opening = string[](
+    "seq 1 20 | grep 7 | wc -l",
+    "echo 'a whole new stack' | gzip -c | wc -c",
+    "echo hello | sha256sum"
+  );
+  for (i32 i = 0; i < opening.len(); i++) {
+    screen = screen + "$ " + opening[i] + "\n";
+    runScript(sh, opening[i]);
+    screen = screen + string.fromBytes(sh.outBuf.take()) + string.fromBytes(sh.errOut.take());
+    page.setText("scr", screen).wait();
+  }
+  screen = screen + "\n";
 
   string[] history = string[HISTORY](fill: "");
   i32 count = 0;      // how many commands have been run, ever
