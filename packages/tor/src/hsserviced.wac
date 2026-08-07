@@ -35,13 +35,15 @@ import { itoa } from "../../fmt/src/itoa.wac";
 import {
   Awaited, Network, Session, awaitCommand, bootstrap, buildCircuit, buildCircuitTo, relayByEd25519,
 } from "./bootstrap.wac";
-import { Link, nextCellFor, publishOverCircuit, sendCells } from "./link.wac";
+import { Link, chunkRequest, nextCellFor, publishOverCircuit, sendCells } from "./link.wac";
 import { Circuit, Received, gotBroken, gotDestroyed } from "./circuit.wac";
 import {
-  relayEstablishIntro, relayIntroEstablished, relayIntroduce2, relayRendezvous1,
+  relayBegin, relayConnected, relayEnd, relayEstablishIntro, relayIntroEstablished,
+  relayIntroduce2, relayRendezvous1,
 } from "./relay.wac";
 import { establishIntroCell } from "./hsservice.wac";
 import { INTRO2_OK, Introduction, handleIntroduce2 } from "./hsintroduce.wac";
+import { rendezvousCircuitKeys } from "./hsntor.wac";
 import { UPLOAD_OK, UPLOAD_REJECTED } from "./hsupload.wac";
 import { cookieReplayCache, introReplayCache, ReplayCache } from "./hsreplay.wac";
 import { IntroPoint, BUILD_OK, Built, buildDescriptor } from "./hsdescbuild.wac";
@@ -197,9 +199,7 @@ export i32 main(Core core, Cli cli) {
              itoa(answer.rendezvous.address[2]) + "." + itoa(answer.rendezvous.address[3]) + ":" +
              itoa(answer.rendezvous.port));
 
-    if (meet(core, cli, net, answer)) {
-      core.log("hsserviced: rendezvous joined");
-    } else {
+    if (!serveOne(core, cli, net, answer)) {
       core.warn("hsserviced: could not reach the rendezvous point");
     }
   }
@@ -213,7 +213,7 @@ export i32 main(Core core, Cli cli) {
  * A separate circuit, built now rather than kept ready: a service that held one waiting would be
  * holding it for a rendezvous point it cannot know in advance.
  */
-bool meet(Core core, Cli cli, Network net, Introduction answer) {
+bool serveOne(Core core, Cli cli, Network net, Introduction answer) {
   i32 target = relayByEd25519(net, answer.rendezvous.ed25519Id);
   if (target < 0) {
     core.warn("hsserviced: the client named a rendezvous point that is not in the consensus");
@@ -222,7 +222,58 @@ bool meet(Core core, Cli cli, Network net, Introduction answer) {
   Session rend = buildCircuitTo(core, cli, net, target, 0x80000032);
   if (!rend.ok) { return false; }
   sendCells(rend.link, rend.circ.onionCell(relayRendezvous1(), answer.rendezvous1));
+
+  // The client is beyond the rendezvous point, reachable only because that relay splices the two
+  // circuits. Adding the hop is what makes it the far end of *this* one, and it is the same key
+  // expansion the client added — read the other way round, because we are the other end of it.
+  rend.circ.addRendezvousHopAsService(rendezvousCircuitKeys(answer.keySeed));
+  core.log("hsserviced: rendezvous joined, the client is hop " + itoa(rend.circ.length()));
+
+  // Then serve whatever it asks for. **One client at a time**, which is the honest limit of this
+  // program rather than of the protocol: while this loop runs, an INTRODUCE2 arriving on the
+  // introduction circuit waits. The pieces for doing better are here — `bootstrap` exports the
+  // incremental `startCircuit`/`advanceCircuit`, and `waitAny` takes a list — and a second client is
+  // the thing to build next.
+  bool connected = false;
+  while (!rend.link.dead) {
+    u8[] cell = nextCellFor(rend.link, 60000);
+    if (cell.len() == 0) { break; }
+    Received got = rend.circ.receive(cell);
+    if (got.toSend.len() > 0) { sendCells(rend.link, got.toSend); }
+    if (got.kind == gotDestroyed() || got.kind == gotBroken()) { break; }
+
+    if (got.command == relayBegin() && !connected) {
+      connected = true;
+      // A BEGIN on a rendezvous circuit names `:port` and no host — the service *is* the far end, so
+      // there is nowhere else to connect to and nothing to look up. CONNECTED carries no address for
+      // the same reason.
+      sendCells(rend.link, rend.circ.sendToEnd(relayConnected(), got.streamId, u8[0]()));
+      u8[] page = greeting();
+      u8[][] parts = chunkRequest(page);
+      for (i32 i = 0; i < parts.len(); i++) {
+        sendCells(rend.link, rend.circ.dataCell(got.streamId, parts[i]));
+      }
+      sendCells(rend.link, rend.circ.sendToEnd(relayEnd(), got.streamId, endDone()));
+      core.log("hsserviced: served " + itoa(page.len()) + " bytes to a client");
+      break;
+    }
+  }
+  cli.closeSocket(rend.link.sock);
   return true;
+}
+
+/** What this service says. A fixed page, because the point is the path rather than the content. */
+u8[] greeting() {
+  string body = "hello from behind an onion\n";
+  return ("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+          itoa(body.toBytes().len()) + "\r\n\r\n" + body).toBytes();
+}
+
+/** REASON_DONE, the one-byte body of a RELAY_END that is not an error. */
+u8[] endDone() {
+  u8[] out = u8[1]();
+  out[0] = 6;
+  return out;
 }
 
 /** Upload one descriptor to every directory the plan names, and count what took it. */

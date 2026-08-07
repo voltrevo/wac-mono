@@ -339,6 +339,17 @@ export struct Circuit {
    */
   void addRendezvousHop(this, u8[] material) { this.hops.push(Hop.createWide(material)); }
 
+  /**
+   * The same hop from the service's side, where forward and backward are the other way round.
+   *
+   * A service's rendezvous circuit ends at the rendezvous point; the client is beyond it, reachable
+   * only because that relay splices the two. Adding this hop is what makes the client the far end of
+   * *this* circuit, so an ordinary `RELAY_CONNECTED` addressed to the last hop reaches it.
+   */
+  void addRendezvousHopAsService(this, u8[] material) {
+    this.hops.push(Hop.createWideReversed(material));
+  }
+
   u8[] endCell(this, i32 streamId, i32 reason) {
     return this.sendToEnd(relayEnd(), streamId, u8[](reason));
   }

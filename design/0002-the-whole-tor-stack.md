@@ -382,7 +382,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
-| 6 — the onion service host | **partly pinned.** ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. The **descriptor build is a function** now — `buildDescriptor` takes a service's own introduction points, time period and revision — and is checked by both oracles on three variants, not just the committed fixture. The **publication plan is complete**: from a consensus alone, `servicePlan` chooses the two time periods, the shared random value for each, and the directories — reaching exactly the ones a real service uploaded to. The **upload has a transport** (`publishOverCircuit`) and its answers three meanings, and an **INTRODUCE2 seen twice is dropped**. **Introduction point rotation** follows tor's two drawn limits. **The service is complete**: `hsserviced` establishes an introduction point, publishes for both time periods and answers an INTRODUCE2. **Not done, and larger than it looked:** `relayd` implements *none* of the onion-service **relay** roles, so there is nothing here for a service to establish an introduction point *on* — see below |
+| 6 — the onion service host | **done.** A page fetched from a v3 onion service on a network with no C in it — see *hello from behind an onion* below. Previously: ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. The **descriptor build is a function** now — `buildDescriptor` takes a service's own introduction points, time period and revision — and is checked by both oracles on three variants, not just the committed fixture. The **publication plan is complete**: from a consensus alone, `servicePlan` chooses the two time periods, the shared random value for each, and the directories — reaching exactly the ones a real service uploaded to. The **upload has a transport** (`publishOverCircuit`) and its answers three meanings, and an **INTRODUCE2 seen twice is dropped**. **Introduction point rotation** follows tor's two drawn limits. **The service is complete**: `hsserviced` establishes an introduction point, publishes for both time periods and answers an INTRODUCE2. **Not done, and larger than it looked:** `relayd` implements *none* of the onion-service **relay** roles, so there is nothing here for a service to establish an introduction point *on* — see below |
 | 7 — the interop matrix | **not started as a document.** Steps 2–6 each contribute rows and most are green; nothing collects them, so a regression in one would not be visible as a regression in *the matrix* |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
@@ -1878,3 +1878,63 @@ watches the rendezvous circuit, so it never sees the RELAY_BEGIN, never answers 
 serves anything. That is the last piece of step 6 — and it is the piece the whole multiplexing
 argument was about, because a service holding an introduction circuit *and* a rendezvous circuit
 cannot block on either.
+
+### hello from behind an onion
+
+    $ ./hsconnect seed.txt auth.txt kybekhk…qqd.onion 80 --testnet
+    consensus verified: 1 of 1 authorities signed
+    time period 20671, 1440 minutes long
+    3 responsible directories
+    asking wacrelay3 at 127.0.0.1:5553
+      path: wacrelay2 -> wacrelay1 -> wacrelay3
+    descriptor: 14102 bytes
+    1 introduction points
+    rendezvous circuit: wacrelay3 -> wacrelay2 -> wacrelay1
+    rendezvous established at wacrelay1
+    introduction circuit: wacrelay1 -> wacrelay2 -> wacrelay3
+    introduction acknowledged
+    joined: the service is hop 4
+    HTTP/1.0 200 OK
+    Content-Type: text/plain
+    Content-Length: 27
+
+    hello from behind an onion
+
+Exit status 0. **Step 6's done condition is met**: a network stood up with no C in it, an onion
+service published on it, and a page fetched from that service through a three-hop circuit.
+
+The service's side of the same minute:
+
+    hsserviced: introduction point established at wacrelay3
+    hsserviced: published to 6 directories
+    hsserviced: waiting for a client
+    hsserviced: an introduction, meeting at 127.0.0.1:5551
+    hsserviced: rendezvous joined, the client is hop 4
+    hsserviced: served 92 bytes to a client
+
+and the two relays', each playing a role neither had a week ago:
+
+    relayd: [2]   circuit -1210906950 is an introduction point     (wacrelay3)
+    relayd: [12]  an introduction, status 0
+    relayd: [9]   circuit -840668884 is waiting at a rendezvous    (wacrelay1)
+    relayd: [11]  rendezvous joined: circuit -1380243118 to -840668884
+
+Everything in that path is ours on both sides, which D1 says proves the least — and every cell along
+it was pinned separately against cells C tor wrote, which is what makes the composition worth
+believing. The two ends of the hs-ntor handshake are the sharpest case: `joined: the service is hop 4`
+means the client's AUTH check passed, and the client and the service derived that key material from
+opposite sides of one expansion, each pinned against tor's own vectors.
+
+**The last piece was a hop read the wrong way round.** A service's rendezvous circuit ends at the
+rendezvous point; the client is beyond it and reachable only because that relay splices two circuits.
+The client adds the service as a hop with `createWide`; the service adds the client with the same key
+expansion **reversed**, because forward for one end is backward for the other. `createReversed` had
+existed for the narrow hop since the relay work and its comment already warned what getting it wrong
+looks like — every cell unrecognised in both directions at once, which reads as a broken circuit
+rather than as keys the wrong way round.
+
+**What this is not.** `hsserviced` serves one client at a time: while it is answering, an INTRODUCE2
+on the introduction circuit waits. That is a limit of the program rather than of the protocol, and the
+pieces for fixing it are already here — `bootstrap` exports the incremental `startCircuit` and
+`advanceCircuit`, and `waitAny` takes a list. It is the same argument the relay multiplexer settled,
+one layer up.

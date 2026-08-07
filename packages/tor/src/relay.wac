@@ -197,6 +197,29 @@ export struct Hop {
     return Hop(true, Sha1.create(), Sha1.create(), fd, bd,
                CtrStream.create(kf, u8[16]()), CtrStream.create(kb, u8[16]()));
   }
+
+  /**
+   * The rendezvous hop as the **service** holds it.
+   *
+   * `createWide` is the client's view: its forward keys carry cells towards the service. The service
+   * is the other end of the same hop, so its forward is the client's backward, exactly as
+   * `createReversed` is to `create`. There is one key expansion and the two ends read it in opposite
+   * directions — deriving a second one would be a different circuit.
+   *
+   * The failure mode is the one `createReversed` describes: every cell is unrecognised in both
+   * directions at once, which reads as a broken circuit rather than as keys the wrong way round.
+   */
+  Hop createWideReversed(u8[] material) {
+    if (material.len() != 128) { trap; }
+    u8[] swapped = u8[128]();
+    for (i32 i = 0; i < 32; i++) {
+      swapped[i] = material[32 + i];          // their Db is our Df
+      swapped[32 + i] = material[i];
+      swapped[64 + i] = material[96 + i];     // their Kb is our Kf
+      swapped[96 + i] = material[64 + i];
+    }
+    return Hop.createWide(swapped);
+  }
 }
 
 /** The plaintext body of a relay cell, with the digest field left zero. */
