@@ -518,6 +518,86 @@ const hx = hash.mod as unknown as { xxh64(d: Uint8Array, start: number, len: num
   }
 }
 
+// ── The streaming half ────────────────────────────────────────────────────────
+//
+// `Xxh64` and `unzstdStream` arrived with 0088 and nothing here reached them, which took this package
+// from the 100% its README claimed to 91.2% within the hour — the same drift `packages/datetime` had
+// between its two exercises, and the same lesson: a coverage number in prose cannot fail, and a driver
+// that is not extended alongside the code silently stops being about it.
+
+// The streaming hash through the probe the tests use, because a struct cannot be constructed from the
+// host: `Xxh64`'s held-bytes path is the whole of its bookkeeping and only a chunk size that is not a
+// multiple of 32 reaches it.
+const hashProbe = await instrument("packages/zstd/test/wac/xxh64_probe.wac");
+{
+  const hp = hashProbe.mod as unknown as {
+    streamed(d: Uint8Array, cut: number): bigint;
+    whole(d: Uint8Array): bigint;
+    ragged(d: Uint8Array): bigint;
+  };
+  const d = new Uint8Array(200);
+  for (let i = 0; i < d.length; i++) d[i] = (i * 37 + 11) & 0xff;
+  for (const cut of [1, 7, 31, 32, 33, 64, 200, 0]) hp.streamed(d, cut);
+  hp.whole(d);
+  hp.ragged(d);
+  hp.streamed(new Uint8Array(0), 1);
+}
+
+const strm = await instrument("packages/zstd/src/stream.wac");
+{
+  const sm = strm.mod as unknown as {
+    unzstdStream(read: () => unknown, write: (b: Uint8Array) => boolean): bigint;
+    Read: { Data(bytes: Uint8Array): unknown; End(): unknown; Failed(why: string): unknown };
+  };
+  const enc2 = await instrument("packages/zstd/src/encode.wac");
+  const em = enc2.mod as unknown as { compress(d: Uint8Array): Uint8Array };
+
+  // One reader and one writer, reused: bindgen keeps sixteen callback identities per signature and
+  // never frees one, so a closure per call dies partway through.
+  let queue: Uint8Array[] = [];
+  let next = 0;
+  const read = () => next < queue.length ? sm.Read.Data(queue[next++]) : sm.Read.End();
+  const write = (_b: Uint8Array) => true;
+  const stream1 = (src: Uint8Array, chunk: number) => {
+    queue = [];
+    for (let i = 0; i < src.length; i += chunk) queue.push(src.slice(i, i + chunk));
+    next = 0;
+    ignoringTraps(() => sm.unzstdStream(read, write));
+  };
+
+  const inputs: Uint8Array[] = [
+    new Uint8Array(0),
+    new Uint8Array(5000).fill(0x41),                                   // long runs: RLE and long matches
+    new TextEncoder().encode("the quick brown fox\n".repeat(3000)),    // matches across block boundaries
+  ];
+  const noise = new Uint8Array(9000);
+  let st = 999;
+  for (let i = 0; i < noise.length; i++) {
+    st = (Math.imul(st, 1103515245) + 12345) & 0x7fffffff;
+    noise[i] = (st >> 16) & 0xff;
+  }
+  inputs.push(noise);                                                  // incompressible: raw blocks
+
+  for (const data of inputs) {
+    const frame = em.compress(data);
+    for (const chunk of [1, 3, 64, 4096, frame.length]) stream1(frame, chunk);
+  }
+  // Malformed and truncated frames, which are the only things that reach the refusals.
+  const good = em.compress(new TextEncoder().encode("hello"));
+  for (const bad of [
+    good.slice(0, good.length - 1),                     // truncated mid-frame
+    good.slice(0, 3),                                   // not even a magic
+    new Uint8Array([0x50, 0x2a, 0x4d, 0x18, 2, 0, 0, 0, 1, 2]),   // a skippable frame
+    new Uint8Array(0),                                  // nothing at all
+  ]) {
+    stream1(bad, 7);
+  }
+  // A reader that fails rather than ending: not an end of input, and the refusal is the point.
+  queue = [];
+  next = 0;
+  ignoringTraps(() => sm.unzstdStream(() => sm.Read.Failed("the disk gave out"), write));
+}
+
 // ── FSE encoding ──────────────────────────────────────────────────────────────
 //
 // Driven the way the tests drive it — encode a symbol stream, decode it back — because that is
@@ -863,7 +943,7 @@ const NOT_COVERED: { file: string; line: number; snippet: string; proven: boolea
 ];
 
 const huffe = await instrument("packages/zstd/src/huffenc.wac");
-report([run, fse, huff, hash, fsee, encoder, huffe], "packages/zstd/", { verbose });
+report([run, fse, huff, hash, hashProbe, fsee, encoder, huffe, strm], "packages/zstd/", { verbose });
 
 let stale = false;
 const sources = new Map<string, string[]>();

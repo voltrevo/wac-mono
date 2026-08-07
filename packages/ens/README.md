@@ -96,7 +96,9 @@ The step that a composition like this gets wrong quietly is the padding: a stora
 minimally, so an address with leading zero bytes arrives *shorter than an address* and has to be
 left-padded. Read right-aligned instead, it is a plausible wrong address.
 
-`resolverOf` is the same walk one slot up. Resolving the name the rest of the way — asking that resolver
+`resolverOf` is the same walk one slot up — and `recordOf` does both from **one** account proof, which is
+what a caller actually wants: two calls answer about two blocks, and a name transferred between them gives
+an owner and a resolver that never coexisted. Resolving the name the rest of the way — asking that resolver
 for `addr(node)` — needs the resolver's own layout, which is the gap named above and still not implemented.
 
 ## How it is tested

@@ -72,9 +72,14 @@ them too, so this is not a case where the platform could have supplied the answe
 | far past and future | −271820 to 275759, the limits of `Date` itself |
 | `format` | 20 000 random instants plus every hour either side of the epoch |
 | `parse` | the RFC's shapes, offsets, fractional digits, lowercase `t`/`z` |
+| `-00:00` | the unknown-offset spelling, against `Z` and `+00:00` — checked against the RFC, since `Date` maps all three to one instant and keeps nothing |
 | rejection | 40 malformed timestamps, including a non-digit in each numeric field in turn |
 
-`deno task coverage:datetime` reports 100%.
+`deno task coverage:datetime` reports 100% — and did not when that line was last checked. It said 92%,
+because `cov.ts` and `test/datetime.test.ts` are two exercises of the same code and had drifted apart in
+both directions: the tests reached `padYear`'s expanded years and `cov.ts` did not, and **neither of them
+ever called `parseOffsetKnown`** — a probe export written for GitHub wac-mono#15, with a nine-line
+rationale on the field it reports, called by nothing. A number in prose cannot fail; run the task.
 
 ## Not here yet
 

@@ -73,6 +73,38 @@ export Resolved resolverOf(u8[] stateRoot, u8[] registry, u8[] name,
   return slotOf(stateRoot, registry, resolverSlot(namehash(name)), accountNodes, storageNodes);
 }
 
+/**
+ * The owner and the resolver together, from one account proof and one pair of storage proofs.
+ *
+ * `ownerOf` then `resolverOf` is two round trips and two account walks for two slots of one contract —
+ * and worse, two *blocks*: on a live chain the second call answers about a state the first never saw, so
+ * a name transferred in between gives an owner and a resolver that never coexisted. One proof cannot do
+ * that. `packages/ethrpc`'s `proofOfSlots` is the other half.
+ */
+export struct Record {
+  bool ok;
+  bool present;
+  u8[] owner;
+  u8[] resolver;
+  string error;
+
+  Record of(bool ok, bool present, u8[] owner, u8[] resolver, string error) {
+    return Record(ok, present, owner, resolver, error);
+  }
+}
+
+export Record recordOf(u8[] stateRoot, u8[] registry, u8[] name,
+                       u8[][] accountNodes, u8[][] ownerNodes, u8[][] resolverNodes) {
+  u8[] node = namehash(name);
+  Resolved o = slotOf(stateRoot, registry, ownerSlot(node), accountNodes, ownerNodes);
+  if (!o.ok) { return Record.of(false, false, u8[0](), u8[0](), o.error); }
+  Resolved r = slotOf(stateRoot, registry, resolverSlot(node), accountNodes, resolverNodes);
+  if (!r.ok) { return Record.of(false, false, u8[0](), u8[0](), r.error); }
+  // A name with no owner has no resolver worth reporting: the record is absent, not half-absent.
+  if (!o.present) { return Record.of(true, false, u8[0](), u8[0](), ""); }
+  return Record.of(true, true, o.address, r.present ? r.address : u8[0](), "");
+}
+
 /** One address-valued slot of one account, both walks and the padding. */
 Resolved slotOf(u8[] stateRoot, u8[] registry, u8[] slot, u8[][] accountNodes, u8[][] storageNodes) {
   AccountProof a = accountAt(stateRoot, registry, accountNodes);

@@ -26,6 +26,7 @@ function assertEquals<T>(got: T, want: T, msg?: string): void {
 
 const REGISTRY = "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e";
 const OWNER = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+const RESOLVER = "0x4976fb03C32e5B8cfe2b6cCB31c09Ba78EBaBa41";
 
 Deno.test({
   name: "ensowner: resolves a name against a live node, and proves it",
@@ -44,9 +45,21 @@ Deno.test({
       ]);
       await rpc(node.port, "evm_mine", []);
 
+      // The resolver goes in the slot above the owner's, and both come back from **one** request now —
+      // one account proof, one block. Asking twice would answer about two states, and a name transferred
+      // between them would give an owner and a resolver that never coexisted.
+      const resolverSlot = "0x" + (BigInt(slot) + 1n).toString(16).padStart(64, "0");
+      await rpc(node.port, "anvil_setStorageAt", [
+        REGISTRY,
+        resolverSlot,
+        "0x" + RESOLVER.replace(/^0x/, "").toLowerCase().padStart(64, "0"),
+      ]);
+      await rpc(node.port, "evm_mine", []);
+
       const r = await run.run(["wac.eth", "127.0.0.1", String(node.port)]);
       assertEquals(r.code, 0, `exit ${r.code}: ${r.err}`);
-      assertEquals(r.out.trim(), OWNER.toLowerCase(), r.out);
+      assertEquals(r.out.split("\n")[0], OWNER.toLowerCase(), r.out);
+      assertEquals(r.out.includes(`resolver ${RESOLVER.toLowerCase()}`), true, r.out);
       // The caveat is printed every run, because a proof against a root the same node supplied looks
       // exactly like one anchored to a verified header.
       assertEquals(r.err.includes("state root this node also supplied"), true, r.err);
@@ -58,7 +71,7 @@ Deno.test({
       const block = await rpc(node.port, "eth_getBlockByNumber", ["latest", false]) as { hash: string };
       const anchored = await run.run(["wac.eth", "127.0.0.1", String(node.port), REGISTRY, block.hash]);
       assertEquals(anchored.code, 0, `exit ${anchored.code}: ${anchored.err}`);
-      assertEquals(anchored.out.trim(), OWNER.toLowerCase(), anchored.out);
+      assertEquals(anchored.out.split("\n")[0], OWNER.toLowerCase(), anchored.out);
       assertEquals(anchored.err.includes("hashing to the block hash you gave"), true, anchored.err);
 
       // A hash from somewhere else has to be refused rather than ignored, or the argument is theatre — and

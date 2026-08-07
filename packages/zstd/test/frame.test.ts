@@ -6,6 +6,7 @@
 // input that quietly started compressing would turn these into tests of the trap path.
 
 import { wacBind } from "../../../harness/wacBind.ts";
+import { refCompress, refDecompress } from "./reference.ts";
 
 const mod = await wacBind("packages/zstd/src/frame.wac") as unknown as {
   decompress(src: Uint8Array): Uint8Array;
@@ -15,26 +16,25 @@ type Job = { data?: string; decode?: string; level?: number; checksum?: boolean 
 type Encoded = { frame: string; blocks: string[] };
 type Decoded = { data?: string; error?: string };
 
-/** Compress everything in one subprocess: spawning dominates otherwise. */
-async function encode(jobs: Job[]): Promise<Encoded[]> {
-  const cmd = new Deno.Command("node", {
-    args: ["packages/zstd/test/oracle.mjs"],
-    stdin: "piped",
-    stdout: "piped",
-    stderr: "piped",
+// The reference encoder, in this process — see `test/reference.ts` for why this is no longer a
+// subprocess. The job shape is kept because the tests below are written against it and it reads well:
+// a list of things to compress, a list of frames back.
+function encode(jobs: Job[]): Encoded[] {
+  return jobs.map((job) => {
+    if (job.decode !== undefined) {
+      const got = refDecompress(unb64(job.decode));
+      return (got === null
+        ? { error: "the reference decoder refused the frame" }
+        : { data: b64(got) }) as unknown as Encoded;
+    }
+    const out = refCompress(unb64(job.data!), { level: job.level, checksum: job.checksum });
+    return { frame: b64(out.frame), blocks: out.blocks };
   });
-  const child = cmd.spawn();
-  const w = child.stdin.getWriter();
-  await w.write(new TextEncoder().encode(JSON.stringify(jobs)));
-  await w.close();
-  const { code, stdout, stderr } = await child.output();
-  if (code !== 0) throw new Error(`oracle failed: ${new TextDecoder().decode(stderr)}`);
-  return JSON.parse(new TextDecoder().decode(stdout));
 }
 
-/** The same subprocess, the other way: what the reference decoder makes of these frames. */
-async function decode(frames: Uint8Array[]): Promise<Decoded[]> {
-  return await encode(frames.map(f => ({ decode: b64(f) }))) as unknown as Decoded[];
+/** The same, the other way: what the reference decoder makes of these frames. */
+function decode(frames: Uint8Array[]): Decoded[] {
+  return encode(frames.map((f) => ({ decode: b64(f) }))) as unknown as Decoded[];
 }
 
 /** Chunked: spreading a few hundred thousand arguments into fromCharCode overflows the stack. */
@@ -85,7 +85,7 @@ function plainCases(): [string, Uint8Array][] {
 
 Deno.test("frames the reference encoder produced decode to what went in", async () => {
   const cases = plainCases();
-  const results = await encode(cases.map(([, d]) => ({ data: b64(d) })));
+  const results = encode(cases.map(([, d]) => ({ data: b64(d) })));
 
   for (let i = 0; i < cases.length; i++) {
     const [name, data] = cases[i];
@@ -104,7 +104,7 @@ Deno.test("raw blocks are what the corpus above actually exercises", async () =>
   // Worth asserting rather than assuming: if a future zstd started compressing these, the
   // test above would silently become a test of the trap path instead.
   const cases = plainCases();
-  const results = await encode(cases.map(([, d]) => ({ data: b64(d) })));
+  const results = encode(cases.map(([, d]) => ({ data: b64(d) })));
   const seen = new Set(results.flatMap(r => r.blocks));
   if (!seen.has("raw")) throw new Error(`no raw block in the corpus: ${[...seen]}`);
 });
@@ -146,7 +146,7 @@ Deno.test("RLE blocks, on a frame the reference decoder agrees with", async () =
   ] as [number, number][];
 
   const frames = cases.map(([v, n]) => rleFrame(v, n));
-  const results = await decode(frames);
+  const results = decode(frames);
 
   for (let i = 0; i < cases.length; i++) {
     const [value, count] = cases[i];
@@ -164,7 +164,7 @@ Deno.test("a frame that declares its content size is held to it", async () => {
   // Single-segment frames carry the size in the header, which is also how the decoder knows
   // the window. A frame whose body is short of what it promised must not be handed over.
   const data = prng(40, 3);
-  const [{ frame }] = await encode([{ data: b64(data) }]);
+  const [{ frame }] = encode([{ data: b64(data) }]);
   const bytes = unb64(frame);
 
   const truncated = bytes.slice(0, bytes.length - 1);
@@ -181,7 +181,7 @@ Deno.test("concatenated frames are one stream, because the format says so", asyn
   // `cat a.zst b.zst` is a valid zstd file and decodes to the concatenation.
   const a = prng(50, 5);
   const b = enc.encode("second frame");
-  const [ra, rb] = await encode([{ data: b64(a) }, { data: b64(b) }]);
+  const [ra, rb] = encode([{ data: b64(a) }, { data: b64(b) }]);
   const joined = new Uint8Array([...unb64(ra.frame), ...unb64(rb.frame)]);
 
   const got = mod.decompress(joined);
@@ -193,7 +193,7 @@ Deno.test("a skippable frame is stepped over, not decoded", async () => {
   // Anything at all may sit between frames under a skippable magic — other tools use it for
   // their own metadata, and a decoder that tried to read it would fail on valid input.
   const data = enc.encode("after the skippable");
-  const [{ frame }] = await encode([{ data: b64(data) }]);
+  const [{ frame }] = encode([{ data: b64(data) }]);
 
   const payload = enc.encode("this is not zstd data at all");
   const skip = new Uint8Array(8 + payload.length);

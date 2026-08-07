@@ -1,0 +1,118 @@
+// What an account holds, proved rather than asked.
+//
+//     deno task app:build packages/ethrpc/example/ethbalance.wac --allow-net -o ethbalance
+//     ./ethbalance 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045 127.0.0.1 8545
+//
+// `eth_getBalance` is one call and one number to believe. This asks for a *proof* instead: the state trie
+// down to the account, and the balance read out of the four RLP items the trie stores — nonce, balance,
+// storage root, code hash. A node that lies has to produce a trie that hashes to the root, which is the
+// same argument `ensowner` makes for storage.
+//
+// The account fields had no live exercise before this: `packages/mpt`'s tests prove them against vendored
+// fixtures, and `ensowner` only ever reads a storage slot. This walks the same account proof and reads the
+// *account* rather than what it points at.
+
+import { Cli, Core } from "../../platform/src/platform.wac";
+import { proofOf, Proof } from "../src/getproof.wac";
+import { accountAt, AccountProof } from "../../mpt/src/account.wac";
+import { encode as hexEncode } from "../../codec/src/hex.wac";
+import { itoa } from "../../fmt/src/itoa.wac";
+
+export i32 main(Core core, Cli cli) {
+  i32 n = cli.argCount().wait();
+  if (n < 1) {
+    core.warn("usage: ethbalance <address> [host] [port] [expected-block-hash]");
+    return 2;
+  }
+  u8[] address = hexOf(string.fromBytes(cli.arg(0).wait()));
+  if (address.len() != 20) { core.warn("ethbalance: an address is 20 bytes"); return 2; }
+  string host = n > 1 ? string.fromBytes(cli.arg(1).wait()) : "127.0.0.1";
+  i32 port = n > 2 ? atoiOr(string.fromBytes(cli.arg(2).wait()), 8545) : 8545;
+  u8[] expected = n > 3 ? hexOf(string.fromBytes(cli.arg(3).wait())) : u8[0]();
+
+  // Slot zero, because `eth_getProof` wants a slot list and the account proof is what is actually wanted.
+  // Asking about a slot nothing wrote is not wasted: an absence proof is as small as it gets.
+  string zero = "0x0000000000000000000000000000000000000000000000000000000000000000";
+  Proof p = proofOf(cli, host, port, "0x" + string.fromBytes(hexEncode(address)), zero, expected);
+  if (!p.ok) { core.warn("ethbalance: " + p.error); return 1; }
+
+  AccountProof a = accountAt(p.stateRoot, address, p.accountNodes);
+  if (!a.ok) { core.warn("ethbalance: " + a.error); return 1; }
+  if (!a.present) {
+    // An address nothing has ever touched is absent from the state trie, which is a proof that it holds
+    // nothing — not a failure, and not the same as a balance of zero that was written.
+    core.log("0 wei (this address is not in the state trie)");
+    core.warn(note(expected));
+    return 0;
+  }
+
+  // Big-endian and minimal, as the trie stores it: a balance of zero is the empty string, not a zero byte.
+  core.log(decimal(a.account.balance) + " wei");
+  core.log("nonce " + decimal(a.account.nonce));
+  core.warn(note(expected));
+  return 0;
+}
+
+string note(u8[] expected) {
+  return expected.len() == 32
+    ? "ethbalance: the state root is from a header hashing to the block hash you gave"
+    : "ethbalance: proved against a state root this node also supplied — pass a block hash to anchor it";
+}
+
+/**
+ * A big-endian byte string as decimal.
+ *
+ * A balance does not fit an i64 — 2^256 wei is the range — so this is long division by ten over the bytes
+ * rather than a conversion to an integer. Printing it as hex would be honest and unreadable; printing the
+ * low 64 bits would be readable and wrong.
+ */
+string decimal(u8[] be) {
+  if (be.len() == 0) { return "0"; }
+  u8[] digits = u8[be.len() * 3 + 1]();
+  i32 count = 0;
+  u8[] work = u8[be.len()]();
+  work.copyFrom(be, 0, 0, be.len());
+  i32 start = 0;
+  while (start < work.len()) {
+    i32 remainder = 0;
+    for (i32 i = start; i < work.len(); i++) {
+      i32 acc = remainder * 256 + work[i];
+      work[i] = acc / 10;
+      remainder = acc % 10;
+    }
+    digits[count] = 48 + remainder;
+    count++;
+    while (start < work.len() && work[start] == 0) { start++; }
+  }
+  if (count == 0) { return "0"; }
+  u8[] out = u8[count]();
+  for (i32 i = 0; i < count; i++) { out[i] = digits[count - 1 - i]; }
+  return string.fromBytes(out);
+}
+
+u8[] hexOf(string s) {
+  u8[] b = s.toBytes();
+  i32 at = b.len() >= 2 && b[0] == '0' && (b[1] == 'x' || b[1] == 'X') ? 2 : 0;
+  i32 n = (b.len() - at) / 2;
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (digit(b[at + i * 2]) << 4) | digit(b[at + i * 2 + 1]); }
+  return out;
+}
+
+i32 digit(i32 c) {
+  if (c >= '0' && c <= '9') { return c - '0'; }
+  if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+  if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+  return 0;
+}
+
+i32 atoiOr(string s, i32 fallback) {
+  u8[] b = s.toBytes();
+  if (b.len() == 0) { return fallback; }
+  i32 v = 0;
+  for (i32 i = 0; i < b.len(); i++) {
+    if (b[i] < '0' || b[i] > '9') { return fallback; }
+    v = v * 10 + (b[i] - '0');
+  }
+  return v;
+}

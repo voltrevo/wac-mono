@@ -102,6 +102,14 @@ capability for running an arbitrary binary. So the C half of every live row abov
 is not in the suite. That is deliberate and it is the reason these rows can rot without anything going
 red.
 
+What changed on 2026-08-07 is which half is watched. `test/network_tor.test.ts` now stands the whole
+wac network up on every run of the suite — three relays, an authority, an onion service, a client, a
+descriptor published and a page fetched through a rendezvous — so **our own side of these rows is
+exercised continuously**. That narrows the rot to exactly one thing, and it is worth naming precisely
+rather than being comforted by the green: a row can now only go stale in the direction of *tor no
+longer agreeing with us*, and nothing in the suite can see that. Our code staying self-consistent is
+what is checked; agreement with C tor is still a claim about a run somebody did by hand on a date.
+
 ## Regressions this table is meant to catch
 
 A row moving from **live** or **pinned** back to **ours only** is the event worth noticing, and it can

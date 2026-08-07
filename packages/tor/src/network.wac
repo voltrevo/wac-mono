@@ -63,13 +63,27 @@
 // with "network: ok" in the middle of it — which is what the first run of this produced, and what a
 // launcher whose chatter shares a stream with its payload always produces.
 //
-// ## Why the nodes start together
+// ## Stages: the plan runs in order, and consecutive nodes start together
 //
-// Every node is spawned first and then all of them are waited on through one `waitAny`, rather than
-// each being started and awaited in turn. Three relays derive RSA identities in parallel that way
-// instead of one after another — but the real reason is that relays *need* each other: a relay that
-// answers a directory request during another's startup would deadlock a sequential launcher, and the
-// deadlock would look like a slow relay.
+// A run of consecutive `node` lines is one stage. All of them are spawned before any is waited on,
+// through a single `waitAny`. Three relays derive RSA identities in parallel that way instead of one
+// after another — but the real reason is that relays *need* each other: a relay answering a directory
+// request during another's startup would deadlock a sequential launcher, and the deadlock would look
+// like a slow relay.
+//
+// A `run` or a `wait` ends a stage, so **nodes after it start after it**. That is the only way to
+// express a server which cannot begin until something has happened on the network — an onion service
+// bootstraps *through* the relays, so it cannot exist before the authority has made a consensus for
+// them to serve:
+//
+//     node relay1  | -byte descriptor for port | relayd.worker.js …
+//     run  vote    |                           | gendesc.worker.js …
+//     wait relay1  | serving the consensus     |
+//     node service | waiting for a client      | hsserviced.worker.js …
+//     run  visit   |                           | hsconnect.worker.js …
+//
+// Starting the service early and letting it retry would work, and it is the same mistake `wait`
+// exists to avoid: it turns a missing stage into a slow one.
 //
 // ## What this cannot do, and why it is not an oversight
 //
@@ -155,44 +169,57 @@ export i32 main(Core core, Cli cli) {
     return 1;
   }
 
-  // Start them all before waiting on any, so their startups overlap and none can be blocked waiting
-  // for a peer that has not been launched yet.
+  // The plan runs in order, and a stage is a run of consecutive `node` lines.
+  //
+  // Nodes in one stage are all started before any of them is waited on, which is the point the
+  // original version of this made and it still holds: three relays derive RSA identities in parallel
+  // that way rather than one after another, and — the real reason — relays *need* each other, so a
+  // sequential launcher would deadlock on a relay answering a directory request during another's
+  // startup, and the deadlock would look like a slow relay.
+  //
+  // What is new is that a `run` or a `wait` **ends** a stage. Nodes after it start after it, which is
+  // the only way to express a server that cannot begin until something has happened on the network:
+  // an onion service bootstraps *through* the relays, so it cannot be started before the authority has
+  // made a consensus for them to serve. Starting it early and letting it retry would work and would be
+  // the same mistake `wait` exists to avoid — it turns a missing stage into a slow one, and the
+  // launcher's whole claim is that each stage was seen to happen.
   Node?[] nodes = Node?[nodeCount]();
   i32 live = 0;
-  for (i32 i = 0; i < plan.len(); i++) {
-    if (plan[i]!.kind != KIND_NODE) { continue; }
-    Node? started = startNode(core, cli, plan[i]!);
-    if (started is null) {
-      stopAll(cli, nodes, live);
-      return 1;
-    }
-    nodes[live] = started!;
-    live = live + 1;
-    core.warn("network: started " + plan[i]!.name);
-  }
-
-  if (!awaitReady(core, cli, nodes, live, readyTimeout)) {
-    stopAll(cli, nodes, live);
-    return 1;
-  }
-  core.warn("network: all " + itoa(live) + " nodes are up");
-
-  // Now the work. Its exit code is the verdict, so a network that came up and a fetch that failed is
-  // reported as a failure rather than as "the network came up".
+  i32 pending = 0;                 // nodes started in this stage, not yet waited on
+  i32 stage = 0;
   i32 code = 0;
   bool ranSomething = false;
-  for (i32 i = 0; i < plan.len(); i++) {
-    if (plan[i]!.kind == KIND_NODE) { continue; }
+  bool failed = false;
 
-    // `wait` is not work, so it does not satisfy "the description asks for something to be run" —
-    // a plan that only waits has still done nothing across the network.
+  for (i32 i = 0; i < plan.len() && !failed; i++) {
+    if (plan[i]!.kind == KIND_NODE) {
+      Node? started = startNode(core, cli, plan[i]!);
+      if (started is null) { failed = true; break; }
+      nodes[live] = started!;
+      live = live + 1;
+      pending = pending + 1;
+      core.warn("network: started " + plan[i]!.name);
+      continue;
+    }
+
+    // A run or a wait: everything started so far must be up first.
+    if (pending > 0) {
+      if (!awaitReady(core, cli, nodes, live, readyTimeout)) { failed = true; break; }
+      stage = stage + 1;
+      core.warn("network: all " + itoa(live) + " nodes are up");
+      pending = 0;
+    }
+
     if (plan[i]!.kind == KIND_WAIT) {
+      // `wait` is not work, so it does not satisfy "the description asks for something to be run" —
+      // a plan that only waits has still done nothing across the network.
       if (!awaitMarker(core, cli, nodes, live, plan[i]!.name, plan[i]!.ready, readyTimeout)) {
         code = 1;
-        break;
+        failed = true;
       }
       continue;
     }
+
     ranSomething = true;
     // The arguments are resolved here rather than at parse time because the values do not exist until
     // the nodes are up: a relay's port is chosen by the operating system when it binds.
@@ -213,6 +240,23 @@ export i32 main(Core core, Cli cli) {
                                            args));
     if (got != 0) { code = got; }
   }
+
+  // Nodes at the end of the plan, with no run after them, are still started and still waited for —
+  // a description may legitimately be "bring these up and check they came up".
+  if (!failed && pending > 0) {
+    if (!awaitReady(core, cli, nodes, live, readyTimeout)) {
+      failed = true;
+    } else {
+      core.warn("network: all " + itoa(live) + " nodes are up");
+    }
+  }
+
+  if (failed) {
+    stopAll(cli, nodes, live);
+    return code == 0 ? 1 : code;
+  }
+
+
   if (!ranSomething) {
     core.warn("network: every node came up and the description asks for nothing to be run");
     code = 1;
@@ -290,6 +334,10 @@ bool awaitMarker(Core core, Cli cli, Node?[] nodes, i32 live, string name, strin
   }
   Node n = nodes[at]!;
   if (contains(n.said.bytes(), marker)) {
+    // The capture moves here too. Setting it only on the path that waited would make a description
+    // mean different things depending on how fast the node was — the same plan capturing a value on a
+    // slow machine and an empty string on a quick one, which is the worst kind of test to own.
+    n.capture = afterMarker(n.said.bytes(), marker);
     core.warn("network: " + name + " had already said \"" + marker + "\"");
     return true;
   }
@@ -327,6 +375,11 @@ bool awaitMarker(Core core, Cli cli, Node?[] nodes, i32 live, string name, strin
 bool awaitReady(Core core, Cli cli, Node?[] nodes, i32 live, i32 readyTimeout) {
   i32 ready = 0;
   for (i32 i = 0; i < live; i++) {
+    // Already up from an earlier stage. Counting these is not bookkeeping: a node that is up
+    // contributes no id to the wait list below, so leaving it out of the count leaves the loop waiting
+    // for an event that can never arrive — with an empty list, on the second stage of every staged
+    // plan, reported as the newest node never announcing itself.
+    if (nodes[i]!.up) { ready = ready + 1; continue; }
     if (nodes[i]!.ready == "") { nodes[i]!.up = true; ready = ready + 1; }
   }
 

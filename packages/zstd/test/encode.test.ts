@@ -10,6 +10,7 @@
 // that quietly loses ground is visible in the numbers rather than in a threshold nobody trusts.
 
 import { wacBind } from "../../../harness/wacBind.ts";
+import { refDecompress } from "./reference.ts";
 
 const enc = await wacBind("packages/zstd/src/encode.wac") as unknown as {
   compress(data: Uint8Array): Uint8Array;
@@ -27,27 +28,9 @@ function b64(u: Uint8Array): string {
 }
 const unb64 = (s: string) => Uint8Array.from(atob(s), c => c.charCodeAt(0));
 
-/** Decompress with Node's zstd; null where it refused the frame. */
-async function nodeDecompress(frames: Uint8Array[]): Promise<(Uint8Array | null)[]> {
-  const script = `
-    const z = require("zlib");
-    const c = [];
-    process.stdin.on("data", d => c.push(d)).on("end", () => {
-      const jobs = JSON.parse(Buffer.concat(c).toString());
-      process.stdout.write(JSON.stringify(jobs.map(j => {
-        try { return z.zstdDecompressSync(Buffer.from(j, "base64")).toString("base64"); }
-        catch (e) { return null; }
-      })));
-    });`;
-  const cmd = new Deno.Command("node", { args: ["-e", script], stdin: "piped", stdout: "piped", stderr: "piped" });
-  const child = cmd.spawn();
-  const w = child.stdin.getWriter();
-  await w.write(new TextEncoder().encode(JSON.stringify(frames.map(b64))));
-  await w.close();
-  const { code, stdout, stderr } = await child.output();
-  if (code !== 0) throw new Error(`node failed: ${new TextDecoder().decode(stderr)}`);
-  return (JSON.parse(new TextDecoder().decode(stdout)) as (string | null)[])
-    .map(s => s === null ? null : unb64(s));
+/** Decompress with the reference decoder — in this process now; see `test/reference.ts`. */
+function nodeDecompress(frames: Uint8Array[]): (Uint8Array | null)[] {
+  return frames.map(refDecompress);
 }
 
 function same(a: Uint8Array, b: Uint8Array): number {
@@ -101,7 +84,7 @@ function corpus(): [string, Uint8Array][] {
 Deno.test("zstd decompresses what we produce, back to the original", async () => {
   const cases = corpus();
   const frames = cases.map(([, d]) => enc.compress(d));
-  const back = await nodeDecompress(frames);
+  const back = nodeDecompress(frames);
 
   for (let i = 0; i < cases.length; i++) {
     const [name, data] = cases[i];
@@ -193,7 +176,7 @@ Deno.test("fuzz: every shape and size round trips through zstd", async () => {
   }
 
   const frames = inputs.map(d => enc.compress(d));
-  const back = await nodeDecompress(frames);
+  const back = nodeDecompress(frames);
   for (let i = 0; i < inputs.length; i++) {
     const got = back[i];
     if (got === null) throw new Error(`${names[i]}: zstd refused the frame`);
@@ -341,7 +324,7 @@ Deno.test("literals sections at every header width", async () => {
   const cases = [800, 5_000, 20_000, 90_000, 300_000, 900_000];
   const inputs = cases.map(build);
   const frames = inputs.map(d => enc.compress(d));
-  const back = await nodeDecompress(frames);
+  const back = nodeDecompress(frames);
   for (let i = 0; i < inputs.length; i++) {
     const got = back[i];
     if (got === null) throw new Error(`${cases[i]} symbols: zstd refused the frame`);

@@ -381,7 +381,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 2 — onion service client | **live.** `src/hsconnect.wac` fetches a page from a real onion service over our own circuits |
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
-| 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
+| 5 — the launcher | **done, and the suite stands the network up.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. `test/network_tor.test.ts` does exactly that on every run of the suite: three relays, an authority, a service, a client, thirteen seconds. The port collision that used to make this impossible is gone — relays take `-p 0` and announce what they were given, so nothing in a description is agreed in advance and two agents' suites do not collide. One limit remains and is structural: it cannot start a C tor, because `spawn` takes a worker bundle by design |
 | 6 — the onion service host | **done, against its own condition.** A C tor client fetched a page from a service we host: `curl --socks5-hostname` → `hello from behind an onion`. The introduction point and rendezvous point relay roles went live in the same run — `packages/tor/INTEROP.md` |
 | 7 — the interop matrix | **written**, `packages/tor/INTEROP.md`: each component in both directions, with *pinned*, *live* and *ours only* kept apart. Its first act was to catch step 6 above being marked done against the wrong condition |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
@@ -766,7 +766,9 @@ and the same fault is caught now.
 ### A network with no C in it
 
 Step 5's *done* condition: "the suite stands up a network with no C in it and a client fetches through
-three of our relays." The condition is met. The deliverable it belongs to is not yet — see below.
+three of our relays." The condition was met by this run, which was by hand; **the deliverable it
+belongs to was met later**, on 2026-08-07, when the suite itself began standing the network up — see
+*The done condition, met* at the end of this document.
 
 Nothing in this run is C tor. Our `gendesc` produced the documents, our `dird` served them, three of
 our `relayd` carried the traffic, and our `socks.wac` was the client:
@@ -848,13 +850,19 @@ circuit. `cmp` is the whole check.
 
 about a second, on a quiet machine.
 
-**Two things it does not do, both stated rather than discovered.** It cannot start a C tor: `Cli.spawn`
+**Two things it did not do, both stated rather than discovered.** It cannot start a C tor: `Cli.spawn`
 takes a worker bundle and this world deliberately has no capability for running an arbitrary binary,
 so "a mixed network" in this document's sense needs a platform change and the C tor half of the
-interop matrix stays a shell script. And **the suite does not stand up a Tor network with it** — the
-ports a relay listens on are baked into its signed descriptor, so two agents running the suite at once
-would collide on 5555. `test/network.test.ts` tests the launcher against `packages/platform/example/waiter.wac`, which
-is the right subject anyway: it knows about processes and ready markers, not about Tor.
+interop matrix stays a shell script. That one is still true.
+
+The second was that **the suite did not stand up a Tor network with it** — the ports a relay listens
+on are baked into its signed descriptor, so two agents running the suite at once would collide on
+5555. That is no longer true and stopped being a property of Tor the moment anyone looked at it: a
+relay takes `-p 0`, is given a port by the operating system, and announces it. `test/network_tor.test.ts`
+now stands the whole network up on every run. `test/network.test.ts` still tests the launcher against
+`packages/platform/example/waiter.wac`, which remains the right subject for *that* file — it knows
+about processes and ready markers, not about Tor, and it should fail when the launcher is wrong rather
+than when anything in the stack is.
 
 ### Step 6 begins: ESTABLISH_INTRO, and a span nothing in the cell hints at
 
@@ -2033,3 +2041,39 @@ because the two rules are the same family and only one of them is done.
 The general lesson is the one this project keeps paying for from the other side. **A missing refusal
 presents as a broken mechanism.** The failure was real, the component it appeared in was innocent, and
 the fix was upstream of everything anyone was looking at.
+
+### The done condition, met
+
+*"`deno task test` stands up a Tor network with no C in it, publishes an onion service on it, fetches
+a page from that service through a three-hop circuit, and tears it down."* On 2026-08-07, in
+`packages/tor/test/network_tor.test.ts`, in thirteen seconds:
+
+    gendesc: wrote a 2472-byte consensus and a 2485-byte microdesc one
+    3 responsible directories
+      path: wacon2 -> wacon1 -> wacon3
+    descriptor: 14107 bytes
+    rendezvous circuit: wacon1 -> wacon2 -> wacon3
+    introduction circuit: wacon2 -> wacon3 -> wacon1
+    joined: the service is hop 4
+    hello from behind an onion
+
+Three relays, an authority, a service and a client, all wac, no process in the run that was not built
+from this repository.
+
+**What made it possible was not the plan, it was six smaller things,** each of which had to exist
+before a description could be written at all: a relay that takes `-p 0` and announces the port it was
+given; documents *waited for* rather than required at startup, since a consensus cannot exist before
+the relays it describes; `{name}`, so a later directive can read what an earlier node said; each
+program writing down the part of the configuration only it knows — a seed line, an authority
+fingerprint; `wait`, because being up is not one event; and stages, because a service that bootstraps
+through the network cannot start with it.
+
+None of those is about Tor. They are all the same shape: **a fact that does not exist until something
+has run has to be produced by the thing that knows it and carried forward, not agreed in advance.**
+Every one of them replaced something that had been a human step, and the human step was where the
+by-hand runs kept going wrong.
+
+**What this is still not.** The C half of the interop matrix is unchanged — `Cli.spawn` takes a worker
+bundle, so `network.wac` cannot start a C tor, and every `live` row in `INTEROP.md` is still witnessed
+by hand. This condition was always about a network with no C in it. The other half of step 7, *each of
+our components inside a chutney network of real tors*, is a separate claim and is not this.

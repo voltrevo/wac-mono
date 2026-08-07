@@ -360,3 +360,64 @@ Deno.test("a wait naming a node that does not exist fails, by name", async () =>
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test("a wait captures even when the node had already said it", async () => {
+  // The capture has to move with the marker on *both* paths, or the same description means different
+  // things depending on how fast the node was — a value on a slow machine, an empty string on a quick
+  // one. `stages` prints `listening` and then, 300ms later, `serving`; making the second line the
+  // ready marker guarantees the first is already in the buffer by the time the wait runs.
+  //
+  // The two markers capture different things, which is what makes this discriminate: `stages: serving`
+  // has nothing after it, so a wait that failed to re-capture would leave the empty string behind and
+  // the work would be asked for `.txt`.
+  const { dir, launcher } = await fixture();
+  try {
+    await Deno.writeTextFile(
+      `${dir}/net.txt`,
+      [
+        "node alpha | stages: serving | stages.worker.js",
+        "wait alpha | stages: listen  |",
+        "run  count |                 | wc.worker.js {alpha}.txt",
+        "",
+      ].join("\n"),
+    );
+    const r = run(launcher, dir, "net.txt");
+
+    assertEquals(r.code, 0, r.err);
+    assertContains(r.err, 'alpha had already said "stages: listen"', "it did not have to wait");
+    assertContains(r.out, "1 5 27 ing.txt", "and the capture moved to the marker it had already seen");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("a node after a run starts after it, not at the beginning", async () => {
+  // Stages. A server that cannot begin until something has happened on the network — an onion service
+  // needs a consensus to bootstrap through — has to start late, and the plan says so by position.
+  //
+  // `wc` writes nothing the launcher watches, so the ordering is read off the launcher's own log:
+  // "started late" must appear after "running first", and "started early" before it.
+  const { dir, launcher } = await fixture();
+  try {
+    await Deno.writeTextFile(
+      `${dir}/net.txt`,
+      [
+        "node early | waiter: running | waiter.worker.js",
+        "run  first |                 | wc.worker.js counted.txt",
+        "node late  | waiter: running | waiter.worker.js",
+        "run  second|                 | wc.worker.js counted.txt",
+        "",
+      ].join("\n"),
+    );
+    const r = run(launcher, dir, "net.txt");
+
+    assertEquals(r.code, 0, r.err);
+    const startedEarly = r.err.indexOf("started early");
+    const ranFirst = r.err.indexOf("running first");
+    const startedLate = r.err.indexOf("started late");
+    assertEquals(startedEarly >= 0 && startedEarly < ranFirst, true, "early started before the run");
+    assertEquals(startedLate > ranFirst, true, "late started after it — this is the whole feature");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
