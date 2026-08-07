@@ -23,6 +23,7 @@ import {
   Created, Inbound, answerCreate2, create2Handshake, created2Cell, destroyCell,
   receiveFromClient, sendToClient, HOP_KEY_LEN, NTOR_REQUEST_LEN, NTOR_REPLY_LEN,
   DESTROY_PROTOCOL, Extend, parseExtend2, extendTarget, extendIdentity, extended2Body,
+  mayExtendTo,
   kdfTor, answerCreateFast, CREATE_FAST_LEN,
   LS_IPV4, LS_IPV6, LS_LEGACY_IDENTITY, LS_ED25519_IDENTITY, Begin, parseBegin,
 } from "../../src/relaycircuit.wac";
@@ -518,4 +519,55 @@ bool sameBytes(u8[] a, u8[] b) {
   if (a.len() != b.len()) { return false; }
   for (i32 i = 0; i < a.len(); i++) { if (a[i] != b[i]) { return false; } }
   return true;
+}
+
+/**
+ * A relay never extends to itself.
+ *
+ * tor refuses in `connection_or_connect` — *"Client asked me to connect to myself. Refusing."* — and
+ * refuses again on the ed25519 identity. `design/0002` carried this for days as an unexplained
+ * handshake failure: a relay asked to extend to its own port failed somewhere in an uninstrumented
+ * VERSIONS exchange, and the note said *a relay extending to itself is the case to look at, and tor is
+ * entitled to ask for it*. tor is entitled to ask. The answer is no, and everything the handshake did
+ * was downstream of a connection that should never have been opened.
+ */
+export string test_a_relay_will_not_extend_to_itself() {
+  T t = T.create();
+  u8[] ours = idBytes(1);
+  u8[] theirs = idBytes(2);
+
+  t.isTrue(mayExtendTo(specsFor(theirs), ours), "another relay is fine");
+  t.isTrue(!mayExtendTo(specsFor(ours), ours), "our own identity is refused");
+
+  // One byte apart is another relay. A comparison that stopped early would refuse a stranger, which
+  // is a relay that cannot be extended through — the failure would look like unreachability.
+  u8[] nearly = idBytes(1);
+  nearly[19] = nearly[19] ^ 1;
+  t.isTrue(mayExtendTo(specsFor(nearly), ours), "one byte apart is somebody else");
+  u8[] alsoNearly = idBytes(1);
+  alsoNearly[0] = alsoNearly[0] ^ 1;
+  t.isTrue(mayExtendTo(specsFor(alsoNearly), ours), "and so is one byte apart at the front");
+
+  // A cell naming nobody is *not* refused here. It fails later for naming nobody, and answering
+  // "may not extend" would conflate asking for something forbidden with asking for nothing.
+  t.isTrue(mayExtendTo(u8[1](), ours), "a list with no identity is not this check's business");
+  t.isTrue(mayExtendTo(u8[0](), ours), "nor is an empty list");
+  t.isTrue(mayExtendTo(specsFor(ours), u8[0]()), "and a relay with no identity refuses nothing");
+  return t.report();
+}
+
+/** A link specifier list carrying one legacy identity, which is what an EXTEND2 names a relay by. */
+u8[] specsFor(u8[] identity) {
+  u8[] out = u8[1 + 2 + 20]();
+  out[0] = 1;
+  out[1] = 2;      // LS_LEGACY_IDENTITY
+  out[2] = 20;
+  for (i32 i = 0; i < 20; i++) { out[3 + i] = identity[i]; }
+  return out;
+}
+
+u8[] idBytes(i32 role) {
+  u8[] out = u8[20]();
+  for (i32 i = 0; i < 20; i++) { out[i] = (role * 53 + i * 11 + 7) & 0xFF; }
+  return out;
 }

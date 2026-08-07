@@ -41,8 +41,11 @@ if (${JSON.stringify(mode)} === "wedge") {
   const running = pool(["a-quick-one", "the-one-that-wedges"], 2, async (label: string) => {
     if (label === "the-one-that-wedges") await stuck;
   }, { what: "script", quietMs: 300, label: (s: string) => s });
-  // Long enough for the narrator to tick more than once, so "and again every quietMs" is covered too.
-  await sleep(1100);
+  // Long enough for the narrator to speak more than once — and yielding the whole time, in small steps
+  // rather than one long sleep. That matters on a shared machine: the narrator speaks at most once per
+  // *tick* that crosses a new budget, so when the event loop stalls, several budgets pass unspoken and it
+  // reports once. A single 1100ms sleep left exactly that gap and this test failed on a loaded gate.
+  for (let i = 0; i < 24; i++) await sleep(100);
   release();
   await running;
 } else {

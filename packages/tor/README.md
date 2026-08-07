@@ -641,8 +641,54 @@ with stdout byte-identical to the microdesc consensus the authority was holding.
 against relays —
 it knows about processes and ready markers, not about Tor, and a launcher test that stood up three
 relays would fail whenever anything in the stack did. **The Tor network is not stood up by the
-suite**, because the ports a relay listens on are baked into its signed descriptor and two agents
-running the suite at once would collide on them. Run the recipe above by hand.
+suite.** Run the recipe above by hand.
+
+Two things stand between here and a suite that does stand it up, and one of them has just moved.
+
+**Ports, which used to be the blocker, no longer are.** A relay's port is baked into its signed
+descriptor, so the recipe used fixed ones, and two agents running a network at once collided on them
+— this happened three times in one session, each time as three stale relays holding 5551-5553 while
+the new ones logged `Address already in use` and carried on looking healthy. `relayd -p 0` now asks
+the operating system for a free port, and `--descriptor` writes *after* binding and then keeps
+serving, so the descriptor advertises the port actually bound and the socket is never released in
+between:
+
+    $ relayd seed -p 0 -n wacp0 --descriptor r.desc
+    relayd: listening on 127.0.0.1:32831
+    relayd: wrote a 2112-byte descriptor for port 32831 to r.desc
+    $ grep ^router r.desc
+    router wacp0 127.0.0.1 32831 0 0
+
+**The order of the bootstrap has moved too.** A relay used to read its consensus and certificate once,
+at startup, and treat a missing file as fatal. But the consensus cannot exist until the relays do — it
+is built from their descriptors, and their descriptors do not name a port until they have bound one.
+That circularity is what forced two passes, and the fixed ports were how the second pass found the
+first one's ports again.
+
+`-C`/`-K` are now a standing instruction rather than a precondition: *serve these once they are
+there*. A relay whose documents do not exist yet listens, carries circuits, answers 404 for directory
+documents, and looks every half second for the files it was pointed at. So one pass does it:
+
+    relayd s1 -p 0 -n wacone1 --descriptor r1.desc -C consensus -K cert -D r1.desc -D r2.desc &
+    relayd s2 -p 0 -n wacone2 --descriptor r2.desc -C consensus -K cert -D r1.desc -D r2.desc &
+    # both are listening and waiting; their descriptors name the ports they bound
+    gendesc consensus cert vote microcons $(date +%s) r1.desc r2.desc
+
+which on 2026-08-07 read:
+
+    relay1: waiting for …/consensus — serving no directory documents until it is there
+    relay1: listening on 127.0.0.1:33741
+    relay2: listening on 127.0.0.1:38839
+    …
+    relay1: serving the consensus, certificate and 2 descriptor(s) over BEGIN_DIR
+    relay2: serving the consensus, certificate and 2 descriptor(s) over BEGIN_DIR
+
+— the relays still on the ports the kernel gave them a minute earlier, never restarted. Nothing about
+that sequence needs a port anyone agreed in advance, so two agents can run it at once.
+
+**What remains is `network.wac` itself**, which still launches relays with fixed ports on a script of
+its own. Teaching it this sequence is what would put the network in the suite; the pieces it would
+need now exist.
 
 ## What is not here
 

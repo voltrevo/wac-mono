@@ -2,21 +2,19 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, openStream } from "../lib/input.wac";
-import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
+import { Reader } from "../lib/input.wac";
+import { Line, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
 import { slice } from "../lib/bytes.wac";
 
 export i32 fold(Core core, Cli cli, Args a) {
-  Input in = openStream(core, cli, a, 0);
-  if (!in.ok) { return 1; }
+  Reader r = Reader.create(core, cli, a, 0);
+  if (!r.ok) { return 1; }
   i32 width = a.hasNum ? a.num : 80;
 
-  Lines s = Lines.create();
-  Feed fed = Feed.fromStdin(cli);
   Sink out = Sink.create(cli);
   while (true) {
-    Line l = nextLine(s, fed);
-    if (!l.ok) { out.flush(); return 0; }
+    Line l = r.next(core, cli, a);
+    if (!l.ok) { out.flush(); return r.broken ? 1 : 0; }
     u8[] line = l.bytes;
     if (line.len() == 0) { emitTo(out, line, l.nl); continue; }
     i32 start = 0;

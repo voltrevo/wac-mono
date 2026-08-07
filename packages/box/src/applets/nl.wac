@@ -4,21 +4,19 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, openStream } from "../lib/input.wac";
-import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
+import { Reader } from "../lib/input.wac";
+import { Line, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
 import { itoa } from "../../../fmt/src/itoa.wac";
 
 export i32 nl(Core core, Cli cli, Args a) {
-  Input in = openStream(core, cli, a, 0);
-  if (!in.ok) { return 1; }
+  Reader r = Reader.create(core, cli, a, 0);
+  if (!r.ok) { return 1; }
 
-  Lines s = Lines.create();
-  Feed fed = Feed.fromStdin(cli);
   Sink out = Sink.create(cli);
   i32 n = 0;
   while (true) {
-    Line l = nextLine(s, fed);
-    if (!l.ok) { out.flush(); return 0; }
+    Line l = r.next(core, cli, a);
+    if (!l.ok) { out.flush(); return r.broken ? 1 : 0; }
     if (l.bytes.len() == 0) {
       // Seven spaces where the number and its tab would be, which is what the real one
       // emits — measured, not derived from the six-wide number field.

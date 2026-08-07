@@ -28,6 +28,17 @@ trusted state root here. `ensowner` takes one as its fifth argument and refuses 
 Without one, the check is against the node's own `hash` field, which catches a node whose block does not
 hash to what it claims and nothing more.
 
+**An anchor selects the block**, rather than being compared against whatever `latest` happens to be. A
+caller holding a trusted hash for block N wants the state at N, and on a live chain `latest` moves every
+twelve seconds — so the hash is looked up with `eth_getBlockByHash` and the proof is taken at that block's
+number. The anchored path answers about the past on purpose.
+
+That needs a node which serves historical proofs. **anvil does not**: it answers `eth_getProof` with the
+latest state whatever block is asked for. The proof's root node hashes to the state root by definition, so
+that mismatch is caught here and reported as itself — "the node answered with a proof for a different block
+than the one anchored to — it may not serve historical proofs" — rather than surfacing as an unreadable
+trie failure. geth serves the last 128 blocks by default; an archive node serves all of them.
+
 The header's field list is fork-dependent — `baseFeePerGas` at London, `withdrawalsRoot` at Shanghai, three
 more at Cancun, `requestsHash` at Prague — so the encoder appends each optional field **only if the node
 reported it** rather than hard-coding a fork. Present-and-zero is not the same as absent: `blobGasUsed: 0x0`

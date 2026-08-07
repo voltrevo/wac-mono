@@ -88,7 +88,8 @@ import {
 } from "./relaycert.wac";
 import { relayHandshakeReply, responderVersion, netinfoOtherAddress } from "./relaylink.wac";
 import {
-  Begin, Created, Extend, Inbound, answerCreate2, parseBegin, answerCreateFast, destroyCell, extendTarget,
+  Begin, Created, Extend, Inbound, answerCreate2, parseBegin, answerCreateFast, destroyCell,
+  extendTarget, mayExtendTo,
   extended2Body, parseExtend2, receiveFromClient, sendToClient,
   DESTROY_INTERNAL, DESTROY_NONE, DESTROY_PROTOCOL, DESTROY_RESOURCELIMIT,
 } from "./relaycircuit.wac";
@@ -108,6 +109,8 @@ import {
 
 /** How long a circuit may be silent before the connection is dropped. */
 const i32 IDLE_TIMEOUT_MS = 120000;
+/** How often a relay that is waiting for its directory documents looks to see whether they exist. */
+const i32 DIR_POLL_MS = 500;
 
 /** How many connections a relay will hold at once. Beyond this it refuses rather than collapses. */
 const i32 MAX_CONNS = 64;
@@ -367,83 +370,28 @@ export i32 main(Core core, Cli cli) {
   core.log("relayd: fingerprint " + hex(id.fingerprint));
   core.log("relayd: ntor onion key " + hex(x25519Base(id.onionPrivate)));
 
-  // `--descriptor` writes what an authority should publish about this relay and exits. Separate from
-  // serving because the authority needs the document before the relay is useful, and because the
-  // second prime search should not be paid by a relay that is only serving.
-  if (descriptorOut != "") {
-    core.log("relayd: deriving the TAP onion key a descriptor needs (another moment)");
-    RsaKey tap = deriveTapOnionKey(seed);
-    u8[] desc = ownDescriptor(id, tap, nickname, bind, port, now);
-    if (desc.len() == 0) {
-      core.warn("relayd: could not build a descriptor");
-      return 1;
-    }
-    Change wrote = cli.writeFile(descriptorOut, desc).wait();
-    if (!wrote.ok()) {
-      core.warn("relayd: " + descriptorOut + ": " + wrote.message);
-      return 1;
-    }
-    core.log("relayd: wrote a " + itoa(desc.len()) + "-byte descriptor to " + descriptorOut);
-    return 0;
-  }
 
   // A relay serves directory documents over RELAY_BEGIN_DIR, and a bootstrapping tor asks *any* relay
   // it knows for them — there is no flag that stops it asking, so a relay that cannot answer leaves the
-  // client stuck with a consensus it cannot check. Only the consensus and the certificate are served:
-  // those are what it asks for at this stage, and `dirserve.wac` answers 404 for what we do not hold.
-  DirDocuments docs = DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](),
-                                   u8[0](), u8[][0](), u8[][0](), u8[][0]());
-  bool hasDir = false;
-  if (consensusPath != "" && certPath != "") {
-    FileResult cf = cli.readFile(consensusPath).wait();
-    FileResult kf = cli.readFile(certPath).wait();
-    if (!cf.ok || !kf.ok) {
-      core.warn("relayd: could not read the directory documents to serve");
-      return 1;
-    }
-    // The descriptors too, because tor asks for them over BEGIN_DIR as readily as for the consensus.
-    // Leaving them out did not make it ask elsewhere: it read our 404's ten-byte body as "server info"
-    // eight times over and stayed at 0/2 usable descriptors.
-    u8[] descriptors = u8[0]();
-    u8[][] digests = u8[][descPaths.len()]();
-    for (i32 di = 0; di < descPaths.len(); di++) {
-      FileResult df = cli.readFile(descPaths[di]).wait();
-      if (!df.ok) {
-        core.warn("relayd: " + descPaths[di] + ": " + df.error);
-        return 1;
-      }
-      descriptors = joinBytes(descriptors, df.bytes);
-      digests[di] = rsaDescriptorDigest(df.bytes);
-    }
-    // The microdesc flavour and the microdescriptors, when given. A client of this package asks for
-    // those and nothing else, so a relay serving only the ns flavour is one our own client cannot
-    // bootstrap from — which is how this gap survived four rounds of C tor interop.
-    //
-    // The `m` digests are computed here rather than passed in, exactly as a real cache does: it stores
-    // microdescriptors keyed by their own digest, so the key and the document cannot disagree.
-    u8[] microCons = u8[0]();
-    u8[] micros = u8[0]();
-    u8[][] microDigests = u8[][0]();
-    if (microConsensusPath != "" && microdescPath != "") {
-      FileResult mcf = cli.readFile(microConsensusPath).wait();
-      FileResult mdf = cli.readFile(microdescPath).wait();
-      if (!mcf.ok || !mdf.ok) {
-        core.warn("relayd: could not read the microdesc documents to serve");
-        return 1;
-      }
-      microCons = mcf.bytes;
-      micros = mdf.bytes;
-      microDigests = microdescDigests(micros);
-    }
-
-    docs = DirDocuments(cf.bytes, microCons, kf.bytes, descriptors, digests,
-                        dirSourceFingerprint(cf.bytes), micros, microDigests, u8[][0](),
-                        u8[][0]());
-    hasDir = true;
-    core.log("relayd: serving the consensus, certificate and " + itoa(descPaths.len()) +
-             " descriptor(s) over BEGIN_DIR" +
-             (micros.len() == 0 ? ""
-                                : ", plus " + itoa(microDigests.len()) + " microdescriptor(s)"));
+  // client stuck with a consensus it cannot check.
+  //
+  // They may not exist yet, and that is not an error. A consensus is built from the descriptors of the
+  // relays it describes, and a descriptor does not name a port until its relay has bound one — so on a
+  // network being stood up from nothing, every relay is listening before any consensus can exist. A
+  // relay that treated the missing file as fatal forced two passes: start, write descriptors, die,
+  // build a consensus, start again on the same ports. That is where the fixed ports came from, and
+  // with them the collisions.
+  //
+  // So the paths are a standing instruction rather than a precondition: serve these once they are
+  // there. Until then the relay carries circuits and answers 404 for directory documents, which is
+  // exactly what it did before with no `-C` at all.
+  bool wantDir = consensusPath != "" && certPath != "";
+  DirLoad loaded = loadDocuments(core, cli, consensusPath, certPath, descPaths, microConsensusPath,
+                                 microdescPath);
+  DirDocuments docs = loaded.docs;
+  bool hasDir = loaded.ok;
+  if (wantDir && !hasDir) {
+    core.log("relayd: waiting for " + consensusPath + " — serving no directory documents until it is there");
   }
 
   u8[] certs = identityCerts(id, now);
@@ -458,6 +406,36 @@ export i32 main(Core core, Cli cli) {
     return 1;
   }
   core.log("relayd: listening on " + bind + ":" + itoa(listener.port));
+
+  // `--descriptor` writes what an authority should publish about this relay, **after binding**, and
+  // then carries on serving.
+  //
+  // It used to write and exit, taking the port from `-p`. That made `-p 0` — ask the operating system
+  // for a free one — useless here, because the descriptor would advertise port zero and the real port
+  // was released on exit anyway. Fixed ports are then the only option, and two agents running a
+  // network at once collide on them: this session lost three separate runs to a previous batch of
+  // relays still holding 5551-5553 while the new ones logged `Address already in use` and carried on.
+  //
+  // Binding first and keeping the socket removes both problems. The descriptor advertises the port the
+  // relay is actually listening on, whoever chose it, and there is no window between writing and
+  // serving for anyone else to take it.
+  if (descriptorOut != "") {
+    core.log("relayd: deriving the TAP onion key a descriptor needs (another moment)");
+    RsaKey tap = deriveTapOnionKey(seed);
+    u8[] desc = ownDescriptor(id, tap, nickname, bind, listener.port, now);
+    if (desc.len() == 0) {
+      core.warn("relayd: could not build a descriptor");
+      return 1;
+    }
+    Change wrote = cli.writeFile(descriptorOut, desc).wait();
+    if (!wrote.ok()) {
+      core.warn("relayd: " + descriptorOut + ": " + wrote.message);
+      return 1;
+    }
+    core.log("relayd: wrote a " + itoa(desc.len()) + "-byte descriptor for port " +
+             itoa(listener.port) + " to " + descriptorOut);
+  }
+
 
   // Accept and serve at once. The listener's ticket sits in the same `waitAny` as every live
   // connection's, so a relay busy carrying one circuit still answers the relay extending to it — which
@@ -518,7 +496,23 @@ export i32 main(Core core, Cli cli) {
       }
     }
 
-    i32 which = core.waitAny(ids, IDLE_TIMEOUT_MS);
+    // A relay still waiting for its documents wakes twice a second to look for them; one that has
+    // them waits out the idle timeout as before. The short poll is not a background timer — it is the
+    // same `waitAny`, given a deadline — so it costs nothing while traffic is arriving and stops the
+    // moment the documents are read.
+    i32 which = core.waitAny(ids, wantDir && !hasDir ? DIR_POLL_MS : IDLE_TIMEOUT_MS);
+    if (which < 0 && wantDir && !hasDir) {
+      // Not idle: still waiting. Dropping the connections here would drop the relay that is extending
+      // through us while the authority is still counting votes, which is the one moment a network
+      // being stood up cannot afford it.
+      DirLoad again = loadDocuments(core, cli, consensusPath, certPath, descPaths, microConsensusPath,
+                                    microdescPath);
+      if (again.ok) {
+        docs = again.docs;
+        hasDir = true;
+      }
+      continue;
+    }
     if (which < 0) {
       // Nothing spoke for two minutes. Dropping everything is heavy-handed and it is what a relay with
       // no traffic should do rather than hold sockets for a network that has gone.
@@ -837,6 +831,80 @@ void dropConn(Core core, Cli cli, Conn c, IntroPoints intros, RendPoints rends) 
  * is meaningless for the client, whose cells name their own circuit. The function returns when the
  * event is handled; `c.live` says whether the connection survived it.
  */
+/** What `loadDocuments` found: the documents, and whether every one of them was there. */
+struct DirLoad {
+  DirDocuments docs;
+  bool ok;
+}
+
+/** The empty set — what a relay serves before its documents exist, and answers 404 from. */
+DirDocuments none() {
+  return DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](),
+                      u8[0](), u8[][0](), u8[][0](), u8[][0]());
+}
+
+/**
+ * Read the directory documents, if they are all there yet.
+ *
+ * A missing file is `false` rather than a warning, because this is called repeatedly until it
+ * succeeds and a relay waiting for a consensus that has not been built yet should say so once, not
+ * once every half second. A file that is there but unreadable — a permission, a disk — is still worth
+ * saying, and is still not fatal: the next attempt may find it.
+ *
+ * Partial is not a state. Either every path given resolves or nothing is served, so a relay can never
+ * answer with a consensus and 404 for the descriptors that consensus names.
+ */
+DirLoad loadDocuments(Core core, Cli cli, string consensusPath, string certPath, string[] descPaths,
+                      string microConsensusPath, string microdescPath) {
+  if (consensusPath == "" || certPath == "") { return DirLoad(none(), false); }
+  FileResult cf = cli.readFile(consensusPath).wait();
+  FileResult kf = cli.readFile(certPath).wait();
+  if (!cf.ok || !kf.ok) {
+    return DirLoad(none(), false);
+  }
+  // The descriptors too, because tor asks for them over BEGIN_DIR as readily as for the consensus.
+  // Leaving them out did not make it ask elsewhere: it read our 404's ten-byte body as "server info"
+  // eight times over and stayed at 0/2 usable descriptors.
+  u8[] descriptors = u8[0]();
+  u8[][] digests = u8[][descPaths.len()]();
+  for (i32 di = 0; di < descPaths.len(); di++) {
+    FileResult df = cli.readFile(descPaths[di]).wait();
+    if (!df.ok) {
+      core.warn("relayd: " + descPaths[di] + ": " + df.error);
+      return DirLoad(none(), false);
+    }
+    descriptors = joinBytes(descriptors, df.bytes);
+    digests[di] = rsaDescriptorDigest(df.bytes);
+  }
+  // The microdesc flavour and the microdescriptors, when given. A client of this package asks for
+  // those and nothing else, so a relay serving only the ns flavour is one our own client cannot
+  // bootstrap from — which is how this gap survived four rounds of C tor interop.
+  //
+  // The `m` digests are computed here rather than passed in, exactly as a real cache does: it stores
+  // microdescriptors keyed by their own digest, so the key and the document cannot disagree.
+  u8[] microCons = u8[0]();
+  u8[] micros = u8[0]();
+  u8[][] microDigests = u8[][0]();
+  if (microConsensusPath != "" && microdescPath != "") {
+    FileResult mcf = cli.readFile(microConsensusPath).wait();
+    FileResult mdf = cli.readFile(microdescPath).wait();
+    if (!mcf.ok || !mdf.ok) {
+      return DirLoad(none(), false);
+    }
+    microCons = mcf.bytes;
+    micros = mdf.bytes;
+    microDigests = microdescDigests(micros);
+  }
+
+  core.log("relayd: serving the consensus, certificate and " + itoa(descPaths.len()) +
+           " descriptor(s) over BEGIN_DIR" +
+           (micros.len() == 0 ? ""
+                              : ", plus " + itoa(microDigests.len()) + " microdescriptor(s)"));
+  return DirLoad(DirDocuments(cf.bytes, microCons, kf.bytes, descriptors, digests,
+                              dirSourceFingerprint(cf.bytes), micros, microDigests, u8[][0](),
+                              u8[][0]()), true);
+}
+
 /**
  * `conns` and the two maps are passed in because the onion-service roles are the only place a relay
  * moves a cell *sideways* — out of the connection it arrived on and into another. Everything else
@@ -1406,6 +1474,23 @@ Extended extendCircuit(Core core, Cli cli, u8[] extendBody, Identity id) {
   u8[] target = extendTarget(want.linkSpecifiers);
   if (target.len() != 6) {
     core.warn("relayd:   the EXTEND2 named no IPv4 address we can reach");
+    return bad;
+  }
+
+  // **Never extend to ourselves.** tor's `connection_or_connect` refuses outright —
+  // *"Client asked me to connect to myself. Refusing."* — and does the same for the ed25519 identity.
+  // A relay that tried it would open a connection to its own listener and run a link handshake with
+  // itself, which is a circular path with nothing at the end of it and a way to make a relay spend
+  // two connections and a circuit on one client's request.
+  //
+  // design/0002 carried this as an unexplained handshake bug for days: one relay asked to extend to
+  // `127.0.0.1:5555`, its own port, failed somewhere in an uninstrumented VERSIONS exchange, and the
+  // note said *a relay extending to itself is the case to look at, and tor is entitled to ask for it*.
+  // tor is entitled to ask; the answer is no. Whatever the handshake did was downstream of a
+  // connection that should never have been opened, and instrumenting it would have described a
+  // symptom.
+  if (!mayExtendTo(want.linkSpecifiers, id.fingerprint)) {
+    core.warn("relayd:   asked to extend to ourselves; refusing");
     return bad;
   }
   string host = itoa(target[0]) + "." + itoa(target[1]) + "." + itoa(target[2]) + "." +

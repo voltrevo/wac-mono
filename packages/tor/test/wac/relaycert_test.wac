@@ -21,6 +21,7 @@ import { T } from "../../../wactest/src/assert.wac";
 import { itoa64 } from "../../../wactest/src/itoa64.wac";
 import { ed25519PublicKey, ed25519Verify } from "../../../crypto/src/ed25519.wac";
 import { sha256 } from "../../../crypto/src/sha256.wac";
+import { certsCount } from "../../src/cell.wac";
 import {
   ed25519Cert, verifyEd25519Cert, rsaCrossCert, onionKeyCrosscert, linkCertDigest, certsCell,
   certOfType,
@@ -243,6 +244,46 @@ export string test_a_certs_cell_carries_one_of_each(fn[u8[](i32, u8[], u8[])] re
   short_[3] = 200;
   t.eqI32(certOfType(short_, CERT_TYPE_SIGNING).len(), 0,
           "a certificate longer than the cell is refused");
+
+  // ── The writer and the *production* reader, introduced ──────────────────────
+  //
+  // Everything above reads the cell back with `certOfType`, which lives in this file. The parser a
+  // relay and a client actually use is `certsCount` in `cell.wac`, and until now these two had never
+  // been shown each other's output — design 0002 listed it as a known hole for exactly that reason.
+  //
+  // Both ends are separately live against C tor: `certsCount` parses the CERTS cells tor relays send
+  // us, and tor accepts the ones `certsCell` builds when it bootstraps through our relay. What was
+  // unchecked is that *ours* agree with *each other*, which is the only pair that matters on a
+  // network with no C tor in it — and that is the network every onion-service run uses.
+  t.eqI32(certsCount(cell), 2, "the parser counts what the builder wrote");
+
+  // A 300-byte certificate is the case that separates a two-byte length from a one-byte one. A reader
+  // that took only the low byte would see 44, resynchronise inside the certificate body, and report
+  // some other number — or -1 — rather than two.
+  u8[][] four = u8[][4]();
+  four[0] = a;
+  four[1] = b;
+  four[2] = fillBytes(700, 5);
+  four[3] = fillBytes(1, 9);
+  u8[] real = certsCell(i32[](2, CERT_TYPE_SIGNING, CERT_TYPE_LINK,
+                              CERT_TYPE_RSA_CROSSCERT), four);
+  t.isTrue(real.len() > 0, "the four a relay actually sends");
+  t.eqI32(certsCount(real), 4, "and the parser counts four");
+
+  // One byte short of what the last length claims: the writer never produces this, and the reader
+  // must refuse it rather than returning a count for a cell that ends mid-certificate.
+  t.eqI32(certsCount(headBytes(real, real.len() - 1)), -1, "a cell one byte short is malformed");
+  t.eqI32(certsCount(headBytes(cell, 1)), -1, "and a count with no certificates after it");
+
+  // A count that lies upward. Every length inside is well-formed, so only the running total notices.
+  u8[] overcount = copyBytes(cell);
+  overcount[0] = 3;
+  t.eqI32(certsCount(overcount), -1, "a cell claiming more certificates than it carries");
+
+  // And a single certificate, which is where an off-by-one in the loop would hide.
+  u8[][] one = u8[][1]();
+  one[0] = a;
+  t.eqI32(certsCount(certsCell(i32[](CERT_TYPE_SIGNING), one)), 1, "one is one");
   return t.report();
 }
 
@@ -283,4 +324,22 @@ export string test_the_onion_key_crosscert_binds_both_identities(fn[u8[](i32, u8
   t.eqI32(onionKeyCrosscert(fingerprint, u8[31](), onionN, onionD).len(), 0,
           "a 31-byte ed25519 identity is refused");
   return t.report();
+}
+
+u8[] headBytes(u8[] b, i32 n) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = b[i]; }
+  return out;
+}
+
+u8[] fillBytes(i32 n, i32 role) {
+  u8[] out = u8[n]();
+  for (i32 i = 0; i < n; i++) { out[i] = (role * 41 + i * 7 + 3) & 0xFF; }
+  return out;
+}
+
+u8[] copyBytes(u8[] b) {
+  u8[] out = u8[b.len()]();
+  for (i32 i = 0; i < b.len(); i++) { out[i] = b[i]; }
+  return out;
 }

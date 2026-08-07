@@ -10,7 +10,10 @@
 // So the pool says what it is holding. Two ways in, both cheap:
 //
 //   - **On a wedge, unprompted.** If nothing completes for `quietMs`, the labels still in flight go to
-//     standard error, and again every `quietMs` after. Nobody has to have predicted the hang.
+//     standard error, and again after each further `quietMs` of silence — *as soon as the event loop gets
+//     a turn*. It speaks at most once per tick, so a stalled loop that skips several budgets is reported
+//     once rather than several times in a row: catching up would spam the log at exactly the moment the
+//     machine was least able to answer. Nobody has to have predicted the hang.
 //   - **`WAC_TRACE=1`, on purpose.** Every start and finish, for when the interesting part is the order or
 //     the overlap rather than the stall.
 //
