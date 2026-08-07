@@ -114,10 +114,13 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
       "sha256sum differs",
     );
 
-    // `wc` prints its columns without padding, so compare the numbers rather than the text.
+    // Byte for byte now: `wc` pads its columns exactly as the real one does — the width is the digits in
+    // the total byte count, or seven for standard input unless a single column was asked for. The old
+    // comparison took the first three fields "because box prints its columns without padding", and a
+    // loosened comparison is how the missing filename beside it went unnoticed.
     assertEquals(
-      (await box(["wc", fixture])).out.trim().split(/\s+/).slice(0, 3).join(" "),
-      sys("wc", [fixture]).trim().split(/\s+/).slice(0, 3).join(" "),
+      (await box(["wc", fixture])).out,
+      sys("wc", [fixture]),
       "wc counts differ",
     );
 
@@ -427,11 +430,7 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     // The whole line, not just the first field. Taking `[0]` was how `wc -l file` came to drop the
     // filename: the assertion threw away the difference, and the applet's comment claimed the real one
     // does the same. It does not — only reading standard input has no name to print.
-    assertEquals(
-      (await box(["wc", "-l", fixture])).out.trim().replace(/\s+/g, " "),
-      sys("wc", ["-l", fixture]).trim().replace(/\s+/g, " "),
-      "wc -l over a file",
-    );
+    assertEquals((await box(["wc", "-l", fixture])).out, sys("wc", ["-l", fixture]), "wc -l over a file");
     assertEquals(
       (await box(["sha512sum", fixture])).out.split(" ")[0],
       sys("sha512sum", [fixture]).split(" ")[0],
@@ -586,7 +585,14 @@ Deno.test("box works as a filter, and its applets need only what they use", asyn
   // even where the filesystem was withheld.
   const piped = await runFilter(BOX, ["wc"], input);
   assertEquals(piped.code, 0, piped.err);
-  assertEquals(new TextDecoder().decode(piped.out).trim(), "2 3 14");
+  // Against the real `wc` rather than a literal: the columns are padded now, and a literal is how the
+  // padding came to be missing in the first place — somebody wrote down what this printed.
+  const realWc = new Deno.Command("wc", { stdin: "piped", stdout: "piped", stderr: "null" }).spawn();
+  const w = realWc.stdin.getWriter();
+  await w.write(input);
+  await w.close();
+  const { stdout: realOut } = await realWc.output();
+  assertEquals(new TextDecoder().decode(piped.out), new TextDecoder().decode(realOut));
 
   const hashed = await runFilter(BOX, ["sha256sum"], input);
   assertEquals(new TextDecoder().decode(hashed.out).trim().endsWith("  -"), true, "stdin is '-'");
@@ -764,13 +770,14 @@ Deno.test("the applets that read several files read all of them", async () => {
     // every line. It used to print the first file's counts and nothing else — and with `-l`, `-w` or `-c`
     // it dropped the filename too, on a comment claiming that is what the real one does. It is not: the
     // label goes with the file, and only reading standard input drops it.
-    const norm = (t: string) => t.split("\n").map((l) => l.trim().replace(/\s+/g, " ")).join("\n");
-    for (const flags of [[], ["-l"], ["-w"], ["-c"]]) {
+    for (const flags of [[], ["-l"], ["-w"], ["-c"], ["-lw"]]) {
       for (const files of [[a1], [a1, a2]]) {
         const got = await runner.run(["wc", ...flags, ...files]);
         const real = new Deno.Command("wc", { args: [...flags, ...files], stdout: "piped", stderr: "null" })
           .outputSync();
-        assertEquals(norm(got.out), norm(new TextDecoder().decode(real.stdout)),
+        // No normalising: the padding is part of the answer, and every loosened comparison here has
+        // eventually hidden something.
+        assertEquals(got.out, new TextDecoder().decode(real.stdout),
           `wc ${flags.join(" ")} over ${files.length} file(s)`);
       }
     }
@@ -1114,7 +1121,13 @@ Deno.test("bin/: one applet alone states only the grants it needs", async () => 
 
     // The applet is the same code, so it must behave the same with no `box` in front.
     const text = "alpha beta\ngamma\n";
-    assertEquals(dec.decode((await pipe(wc, [], text)).stdout).trim(), "2 3 17");
+    // The real one decides the text, here as everywhere else in this file.
+    const ref = new Deno.Command("wc", { stdin: "piped", stdout: "piped", stderr: "null" }).spawn();
+    const rw = ref.stdin.getWriter();
+    await rw.write(new TextEncoder().encode(text));
+    await rw.close();
+    const refOut = dec.decode((await ref.output()).stdout);
+    assertEquals(dec.decode((await pipe(wc, [], text)).stdout), refOut);
     assertEquals(dec.decode((await pipe(wc, ["-l"], text)).stdout).trim(), "2", "flags still parse");
     assertEquals(
       dec.decode((await pipe(sha, [], text)).stdout).trim().endsWith("  -"),

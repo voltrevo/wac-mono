@@ -14,6 +14,7 @@
 import { appRunner } from "../harness/appRun.ts";
 
 const SITE = new URL("../../wac/src/next/Home.tsx", import.meta.url).pathname;
+const TERM = new URL("../packages/box/example/term.wac", import.meta.url).pathname;
 
 /** The `TRANSCRIPT` table on the front page: each command and the output printed beneath it. */
 function parseTranscript(src: string): [string, string][] {
@@ -26,6 +27,26 @@ function parseTranscript(src: string): [string, string][] {
   }
   return rows;
 }
+
+/** The commands `term.wac` runs before it hands the keyboard over. */
+function parseOpening(src: string): string[] {
+  const block = src.match(/string\[\] opening = string\[\]\(([\s\S]*?)\n\s*\);/);
+  if (!block) throw new Error("term.wac has no opening session — has it been renamed?");
+  return [...block[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1].replace(/\\"/g, '"'));
+}
+
+// The embedded terminal runs its own opening session, so the reader sees real output rather than a
+// prompt with nothing above it. That session and the table on the page are two hardcoded lists of
+// the same commands in two repositories, which is exactly the pair that drifts.
+Deno.test("the terminal opens on the session the website prints", async () => {
+  const opening = parseOpening(await Deno.readTextFile(TERM));
+  const shown = parseTranscript(await Deno.readTextFile(SITE)).map(([c]) => c);
+  if (JSON.stringify(opening) !== JSON.stringify(shown)) {
+    throw new Error(
+      `term.wac opens on ${JSON.stringify(opening)} but the page prints ${JSON.stringify(shown)}`,
+    );
+  }
+});
 
 Deno.test("the website's shell transcript is what the shell actually prints", async () => {
   let src: string;
