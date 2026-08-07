@@ -325,6 +325,24 @@ export const KNOWN_SURVIVORS: KnownSurvivor[] = [
       "people in log lines, and `//` in one is a question somebody has to answer twice. wac-mono 0005.",
   },
   {
+    name: "guard/tls/record:165:32",
+    why:
+      "`recordOpen`'s four framing checks and `recordContent`'s `end < 0`, measured one at a time: with " +
+      "any of them deleted the call still traps, from a slice that runs past the end or a negative array " +
+      "length one frame down. So no *test* can distinguish them — which is not the same as their being " +
+      "worthless, and the difference is the reason they stay. `if (sealedLen > maxPlaintext() + 256)` " +
+      "refuses **before** `u8[sealedLen - 16]()` allocates: with it gone, a peer's two length bytes are an " +
+      "instruction to allocate up to 64 KB before the trap. A mutation test cannot see an allocation that " +
+      "happens on the way to the same outcome, and this is what that blind spot looks like. The one guard " +
+      "in the file that *is* observable — `content.len() > maxPlaintext()` in `recordSeal` — is killed by " +
+      "`test/record_traps.test.ts`. wac-mono 0005.",
+  },
+  { name: "guard/tls/record:167:40", why: "See guard/tls/record:165:32 — the length mismatch, same measurement." },
+  { name: "guard/tls/record:168:25", why: "See guard/tls/record:165:32 — no room for the tag." },
+  { name: "guard/tls/record:171:43", why: "See guard/tls/record:165:32 — the allocation guard, and the clearest of them." },
+  { name: "guard/tls/record:207:18", why: "See guard/tls/record:165:32 — `u8[end]()` traps on a negative length anyway." },
+  { name: "guard/tls/record:87:21", why: "See guard/tls/record:165:32 — negative padding shortens the array and the type byte then writes past it." },
+  {
     name: "guard/tls/hybrid:50:30",
     why:
       "`hybridClientOffer`'s seed length, and four of its neighbours below. Each was measured by deleting " +

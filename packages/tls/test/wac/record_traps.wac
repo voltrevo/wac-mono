@@ -1,0 +1,97 @@
+// `record.wac`'s framing guards, one call each, because a trap ends the module.
+//
+// Eight of them came back from mutation testing untouched — four surviving, four with no test executing
+// the line at all — on the layer whose whole input is a peer's bytes. The file's own comment on one of
+// them says what is at stake: "a sealed payload longer than the plaintext limit plus its own overhead
+// cannot be legitimate, and admitting one is how a peer makes us allocate on demand".
+//
+// The record header is five bytes and the length is two of them, so every case below is a record a peer
+// can send: a header cut short, a length that disagrees with what arrived, a length too small to hold an
+// authentication tag, one larger than TLS allows. None of them can be told apart from a valid record
+// without checking, which is the point.
+import { recordSeal, recordOpen, recordContent, maxPlaintext } from "../../src/record.wac";
+
+u8[] bytes(i32 n) {
+  u8[] b = u8[n]();
+  for (i32 i = 0; i < n; i++) { b[i] = (i * 5 + 1) & 0xFF; }
+  return b;
+}
+
+u8[] key() { return bytes(16); }
+u8[] iv() { return bytes(12); }
+
+/** A record header saying `len`, followed by `have` bytes of body. */
+u8[] record(i32 len, i32 have) {
+  u8[] r = u8[5 + have]();
+  r[0] = 23; r[1] = 3; r[2] = 3;
+  r[3] = (len >> 8) & 0xFF;
+  r[4] = len & 0xFF;
+  for (i32 i = 0; i < have; i++) { r[5 + i] = (i * 3) & 0xFF; }
+  return r;
+}
+
+// ── What a peer can send ──────────────────────────────────────────────────────
+
+/** Shorter than a header and a tag: there is nothing to open. */
+export i32 openTooShort() { recordOpen(0x1301, key(), iv(), 0, record(4, 4)); return 0; }
+
+/** The length in the header disagrees with what arrived — the classic framing lie. */
+export i32 openLengthMismatch() { recordOpen(0x1301, key(), iv(), 0, record(64, 32)); return 0; }
+
+/** Long enough to be a record, too short to hold the 16-byte tag every suite here appends. */
+export i32 openNoRoomForTag() { recordOpen(0x1301, key(), iv(), 0, record(15, 15)); return 0; }
+
+/**
+ * Longer than TLS allows.
+ *
+ * The guard's own comment calls this out: without it the length is a peer's instruction to allocate.
+ */
+export i32 openTooLong() {
+  i32 len = maxPlaintext() + 257;
+  return openWith(len);
+}
+
+i32 openWith(i32 len) {
+  u8[] r = u8[5 + len]();
+  r[0] = 23; r[1] = 3; r[2] = 3;
+  r[3] = (len >> 8) & 0xFF;
+  r[4] = len & 0xFF;
+  recordOpen(0x1301, key(), iv(), 0, r);
+  return 0;
+}
+
+// ── What a caller can get wrong ───────────────────────────────────────────────
+
+/** A suite that was never negotiated: neither AES-GCM nor ChaCha20-Poly1305. */
+export i32 sealUnknownSuite() { recordSeal(0x1302, key(), iv(), 0, 23, bytes(4), 0); return 0; }
+
+export i32 openUnknownSuite() { recordOpen(0x1302, key(), iv(), 0, record(32, 32)); return 0; }
+
+/** Negative padding is not less padding. */
+export i32 sealNegativePadding() { recordSeal(0x1301, key(), iv(), 0, 23, bytes(4), -1); return 0; }
+
+/** More content than a record can carry. */
+export i32 sealTooMuchContent() {
+  recordSeal(0x1301, key(), iv(), 0, 23, bytes(maxPlaintext() + 1), 0);
+  return 0;
+}
+
+/**
+ * An inner plaintext that is all padding and no content type.
+ *
+ * RFC 8446 §5.4 calls this `unexpected_message`. It is reachable from a peer: the padding is inside the
+ * encryption, so this is what a decryption that succeeded can still hand back.
+ */
+export i32 contentAllPadding() { recordContent(u8[8]()); return 0; }
+
+/**
+ * A sealed record really opens, so the fixture cannot pass by being broken.
+ *
+ * Every case above would "pass" if the module trapped on load or these functions trapped for everything.
+ * This one seals four bytes and opens them again, and has to get the same four back.
+ */
+export i32 ordinary() {
+  u8[] sealed = recordSeal(0x1301, key(), iv(), 0, 23, bytes(4), 0);
+  u8[] inner = recordOpen(0x1301, key(), iv(), 0, sealed);
+  return recordContent(inner).len();
+}
