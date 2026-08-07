@@ -354,4 +354,20 @@ encoder stops choosing one, the test says so instead of quietly testing less.
 | `test/encode.test.ts` | our frames, decompressed by zstd itself |
 | `test/frames.ts` | walking a real frame to find its FSE-coded pieces |
 | `test/writer.ts` | the description writer, for round-tripping |
-| `cov.ts` | `deno task coverage:zstd` — 100% of branches |
+| `cov.ts` | `deno task coverage:zstd` — **91.8%**, and the number is in the tool rather than here |
+
+
+## Coverage, and why the number moved
+
+This said 100% and the tool said 91.2%. The gap was **an hour old**: `unzstdStream` and the streaming
+`Xxh64` arrived with 0088 and `cov.ts` did not learn about them, so the newest code in the package had no
+measurement at all — `stream.wac` was not even a row in the report.
+
+`cov.ts` exercises both now — frames cut at five chunk sizes, truncated and malformed input, a reader that
+fails rather than ending, and the hash at every chunk size across a stripe boundary — which puts the
+package at **91.8%**, with `stream.wac` itself at 57%. What is left there is mostly the refusal paths
+inside a frame: a reserved block type, a dictionary id, a content-size mismatch. They are worth reaching
+and are not reached yet.
+
+The number is written here because it is useful, and it will rot again. It rotted within the hour last
+time. **Run the task** — that is the only version of this that cannot be wrong.
