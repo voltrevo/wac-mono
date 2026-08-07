@@ -382,7 +382,7 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | 3 — the relay | **live, end to end.** A C tor bootstraps from our authority, builds a three-hop circuit through our relays, and **a stream carries bytes**: `stream 5129 open to 192.168.80.2:8087`, 5004 bytes byte-identical to the file served. Link handshake, CREATE2, EXTEND2, BEGIN, CONNECTED, END and DATA **towards the client** all have live witnesses, up to 8 MB with a slow reader. DATA the other way works too, past the 500-cell window, since `relayd` returns SENDMEs (1 MB measured). A connection multiplexes several circuits |
 | 4 — the directory authority | **live, both flavours.** Descriptor, key certificate, vote and consensus all accepted by C tor's parsers; the vote's signature verified inside the parse, and the ns **and** microdesc consensuses verified by `networkstatus_check_consensus_signature` — `This microdesc one has 1 (wacauth)`. Microdescriptors are generated, served at `/tor/micro/d/`, fetched by a C tor and accepted; it reaches `Bootstrapped 100% (done)` with `UseMicrodescriptors` at its default |
 | 5 — the launcher | **runs, and its condition is met.** `src/network.wac` brings a network up from a description, waits for each node's own ready line, runs work across it and tears it down. A network with **no C tor in it** — our authority, our `dird`, three of our relays, our `socks.wac` — fetched a document whose bytes are identical to the one the authority holds. Two limits: it cannot start a C tor (`spawn` takes a worker bundle, by design), and the suite does not stand a Tor network up with it, because a relay's ports are baked into its signed descriptor and two agents' suites would collide |
-| 6 — the onion service host | **ours only, and the deliverable's condition is met.** A page fetched from a v3 onion service on a network with no C in it — *hello from behind an onion* below. **Step 6's own line says "done when a C tor client reaches a service we host", and that has not happened**; every seam in the run has our code on both sides. See `packages/tor/INTEROP.md`. Previously: ESTABLISH_INTRO, the hs-ntor responder's introduce keys, INTRODUCE2 parsing and RENDEZVOUS1 are done and checked against cells C tor wrote. The hs-ntor responder is complete (introduce **and** rendezvous keys), and the descriptor's **outer document** is pinned against tor's `hs_desc_decode_plaintext`. **The whole descriptor decodes** under tor's `hs_desc_decode_descriptor`, introduction point and both certificates included. **Key blinding is complete in both directions** — the blinded secret a service signs with is byte-identical to tor's, and the generator now walks the whole chain from one identity seed. **Publication works end to end**, on a DirPort and over a BEGIN_DIR stream: `dird` and `relayd` both accept a `POST /tor/hs/3/publish`, check the descriptor the way `desc_decode_plaintext_v3` does, file it under the blinded key from its certificate, and serve it back at `/tor/hs/3/<z>` — replacing what they hold only for a strictly newer revision counter, as `cache_store_v3_as_dir` does. The **descriptor build is a function** now — `buildDescriptor` takes a service's own introduction points, time period and revision — and is checked by both oracles on three variants, not just the committed fixture. The **publication plan is complete**: from a consensus alone, `servicePlan` chooses the two time periods, the shared random value for each, and the directories — reaching exactly the ones a real service uploaded to. The **upload has a transport** (`publishOverCircuit`) and its answers three meanings, and an **INTRODUCE2 seen twice is dropped**. **Introduction point rotation** follows tor's two drawn limits. **The service is complete**: `hsserviced` establishes an introduction point, publishes for both time periods and answers an INTRODUCE2. **Not done, and larger than it looked:** `relayd` implements *none* of the onion-service **relay** roles, so there is nothing here for a service to establish an introduction point *on* — see below |
+| 6 — the onion service host | **done, against its own condition.** A C tor client fetched a page from a service we host: `curl --socks5-hostname` → `hello from behind an onion`. The introduction point and rendezvous point relay roles went live in the same run — `packages/tor/INTEROP.md` |
 | 7 — the interop matrix | **written**, `packages/tor/INTEROP.md`: each component in both directions, with *pinned*, *live* and *ours only* kept apart. Its first act was to catch step 6 above being marked done against the wrong condition |
 | — X.509 generation | **pinned.** `packages/tls/src/derwrite.wac` and `src/x509gen.wac`, verified by OpenSSL |
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
@@ -1963,3 +1963,32 @@ and a row for the component, so a claim has nowhere to hide between them.
 
 Three rows are `ours only` and stay that way until a C tor client fetches from `hsserviced`: the
 introduction point and rendezvous point relay roles, and hosting itself.
+
+### A C tor client reached a service we host
+
+    $ curl --socks5-hostname 127.0.0.1:9250 http://kybekhk…qqd.onion/
+    hello from behind an onion
+
+**Step 6's own condition, which the previous run did not meet.** `tor 0.4.7.13` bootstrapped from a
+consensus our authority signed, built a circuit through our relays, left a rendezvous cookie at one of
+them, sent an INTRODUCE1 through another, and our service met it. Every party logged its own side.
+
+The three rows the interop matrix had marked `ours only` yesterday are live, and the matrix is why the
+distinction was there to close: it recorded the gap in a column rather than leaving it as a sentence
+nobody re-read.
+
+Two findings from the run, neither of which any test had:
+
+**A C tor client will not use a DirPort.** It prefers a tunnelled connection even for a direct fetch,
+dials the ORPort in the `DirAuthority` line and speaks the link protocol there — so a `dird` serving
+only a DirPort is invisible to it. The fix is to point the authority line at something that answers
+BEGIN_DIR and let the two identities differ: `v3ident` is whose signature to trust on the consensus,
+the trailing fingerprint is whose TLS identity to expect on the wire. Different keys, different
+questions, and the line's shape says so.
+
+**A service that always publishes revision 1 can never republish.** Restarting `hsserviced` against a
+network it had already published to gave *wacrelay2 refused the descriptor; it is the document that is
+wrong, not the directory* — which is the strictly-greater rule working exactly as written and the
+caller being wrong. It counts seconds into the time period now, as tor does. **tor encrypts that
+counter and we do not**, which publishes when the service last updated; recorded in `INTEROP.md` as a
+difference rather than left to be discovered.

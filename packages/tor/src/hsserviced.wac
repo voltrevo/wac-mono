@@ -147,9 +147,24 @@ export i32 main(Core core, Cli cli) {
   }
 
   i32 uploaded = 0;
+  i64 nowSeconds = core.nowMillis().wait() / 1000;
   for (i32 p = 0; p < plan.len(); p++) {
+    // **Not a constant.** An HSDir replaces a descriptor only when the revision counter is strictly
+    // greater, so a service that always published `1` could never update — and after a restart could
+    // not republish at all, because the directories still hold the previous run's descriptor with the
+    // same number. That is exactly what happened the first time this program was restarted against a
+    // network it had already published to: *wacrelay2 refused the descriptor; it is the document that
+    // is wrong, not the directory*, which is the rule working and the caller being wrong.
+    //
+    // Seconds into the time period, which is what tor counts. **tor then encrypts it** with an
+    // order-preserving cipher so the ordering survives and the value does not — publishing it in the
+    // clear, as this does, tells anyone who fetches the descriptor when the service last published.
+    // A real disclosure, recorded in `INTEROP.md` rather than left for someone to notice.
+    i64 revision = nowSeconds - plan[p].periodNum * plan[p].periodLength * 60;
+    if (revision < 1) { revision = 1; }
     Built built = buildDescriptor(identitySeed, core.randomBytes(32).wait(), points,
-                                  plan[p].periodNum, plan[p].periodLength, 1, LIFETIME_MINUTES,
+                                  plan[p].periodNum, plan[p].periodLength, revision,
+                                  LIFETIME_MINUTES,
                                   expiryHours(net), core.randomBytes(32).wait(),
                                   core.randomBytes(16).wait(), core.randomBytes(16).wait(),
                                   decoyClients(core));

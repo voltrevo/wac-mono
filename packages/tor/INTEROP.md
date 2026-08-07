@@ -46,42 +46,61 @@ difference is the whole point:
 | ESTABLISH_INTRO (`hsservice`) | **pinned** — tor's parser accepts ours | **pinned** — we accept tor's and refuse its seven mutations |
 | INTRODUCE1/2 (`hsintro`, `hsintroduce`) | **pinned** — tor built the cells we parse | **pinned** — same cells, our parser |
 | hs-ntor (`hsntor`) | **pinned** — both halves against `capture-hsntor.py` | **pinned** — same |
-| introduction point, relay side (`introrelay`) | **ours only** | **ours only** |
-| rendezvous point, relay side (`rendrelay`) | **ours only** | **ours only** |
-| onion service hosting (`hsserviced`) | **—** | **ours only** — our client fetched a page from it |
+| introduction point, relay side (`introrelay`) | **live** — a C tor client's INTRODUCE1 relayed to our service | **live** — same exchange |
+| rendezvous point, relay side (`rendrelay`) | **live** — a C tor client established a cookie here and our service joined it | **live** — same exchange |
+| onion service hosting (`hsserviced`) | **live** — `curl --socks5-hostname` through C tor returned our page | n/a |
 
-## The row that is not green, and why it is the important one
+## Step 6's own condition, met
 
-**Step 6's own condition is "done when a C tor client reaches a service we host", and that has not
-happened.** What happened on 2026-08-07 is that *our* client reached it:
+**"Done when a C tor client reaches a service we host."** On 2026-08-07:
 
-    joined: the service is hop 4
+    $ curl --socks5-hostname 127.0.0.1:9250 http://kybekhk…qqd.onion/
     hello from behind an onion
 
-That meets the deliverable's condition — a network with no C in it, a service published on it, a page
-fetched through a three-hop circuit — and it is not the same claim. Every seam in that path has our
-code on both sides, which is the arrangement design 0002's D1 says proves the least.
+`tor 0.4.7.13`, bootstrapped from a consensus our authority signed, through our relays, to a service
+our code hosts. The three onion-service rows above moved from `ours only` to `live` on that run, and
+each party logged its own side of it:
 
-It is worth being precise about what it *does* prove, because it is not nothing: every cell along that
-path was pinned separately against cells C tor wrote, so the composition is the only new thing being
-asserted. The sharpest case is `joined: the service is hop 4` — the client's hs-ntor AUTH check
-passed, and the two ends derived that key material from opposite sides of one expansion, each pinned
-against tor's own vectors.
+    ctor:    Bootstrapped 100% (done)
+    relay3:  circuit -1250964417 is an introduction point
+    relay3:  an introduction, status 0
+    relay2:  circuit -305703914 is waiting at a rendezvous
+    relay2:  rendezvous joined: circuit -810529448 to -305703914
+    service: rendezvous joined, the client is hop 4
+    service: served 92 bytes to a client
 
-But *pinned on both ends* and *live* are different rows, and this table exists so that difference is
-visible without reading three thousand lines of design notes. **This matrix's first act was to catch
-its own author marking step 6 done against the wrong condition.**
+Three days earlier this table would have read `ours only` for all three, and the day before that the
+relay roles did not exist.
 
-## What would turn the last three rows green
+### Two things that run taught, which no test had
 
-A C tor client fetching from `hsserviced`, which needs a C tor configured with our authority — the
-same shape as the existing relay and directory interop runs, which are shell scripts rather than suite
-tests because `Cli.spawn` takes a worker bundle and this world has no capability for running an
-arbitrary binary. That is a deliberate limit, recorded here rather than left as an omission:
+**A C tor client will not use a DirPort.** It prefers a tunnelled directory connection even when the
+fetch is direct, so it dials the *ORPort* named in the `DirAuthority` line and speaks the link
+protocol there. A `dird` serving only a DirPort is unreachable to it. What works is pointing the
+authority line at something that answers BEGIN_DIR — `relayd -C -K -D` does — and letting the two
+identities differ, which tor allows and which is the point of the line's shape:
 
-- `network.wac` **cannot start a C tor**, so the C half of every live row is run by hand.
-- The relay and authority rows were witnessed that way and are recorded as live on that basis.
-- The onion-service rows have not been, and are recorded as `ours only` on that basis.
+    DirAuthority wacauth orport=5551 no-v2 v3ident=<authority> 127.0.0.1:7000 <relay1 fingerprint>
+
+`v3ident` is whose signature to trust on the consensus; the trailing fingerprint is whose TLS identity
+to expect on the wire. They are different keys and different questions.
+
+**A service that always publishes revision 1 can never republish.** An HSDir replaces a descriptor
+only on a strictly greater revision counter, so restarting `hsserviced` against a network it had
+already published to produced *wacrelay2 refused the descriptor; it is the document that is wrong, not
+the directory* — the rule working and the caller wrong. It now counts seconds into the time period,
+which is what tor counts.
+
+**Where we differ from tor, and it is a disclosure:** tor encrypts that counter with an
+order-preserving cipher, so the ordering survives and the value does not. We publish it in the clear,
+which tells anyone who fetches a descriptor when the service last published.
+
+## The limit that remains
+
+`network.wac` **cannot start a C tor** — `Cli.spawn` takes a worker bundle and this world has no
+capability for running an arbitrary binary. So the C half of every live row above is run by hand and
+is not in the suite. That is deliberate and it is the reason these rows can rot without anything going
+red.
 
 ## Regressions this table is meant to catch
 
