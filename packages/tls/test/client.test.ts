@@ -19,6 +19,7 @@ import {
 import {
   feed as srvFeed, newConnection, recordNeeded, send as srvSend, tlsClose, unpack as srvUnpack,
 } from "../host/serve.ts";
+import { announceIfMissing, HAVE_OPENSSL35, OPENSSL35 } from "./openssl35.ts";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -229,8 +230,17 @@ Deno.test("client: completes a handshake against an RSA-2048 certificate", async
   await againstOpenSslServer("rsa");
 });
 
+Deno.test("client: completes a handshake when only P-256 key exchange is offered", async () => {
+  // Pins `groupP256()` — 0x0017 — against a server that will accept nothing else. Our client offers three
+  // groups and a server normally picks the hybrid or x25519, so the P-256 code point was never exercised:
+  // mutation testing replaced `groupP256`'s body with a constant and every test stayed green. A wrong code
+  // point here is not a parse error, it is a HelloRetryRequest loop or a handshake failure against the one
+  // group RFC 8446 §9.1 makes mandatory.
+  await againstOpenSslServer("ec", ["-groups", "P-256"]);
+});
+
 /** Run openssl s_server with the named key pair and complete one handshake. */
-async function againstOpenSslServer(kind: "ec" | "rsa"): Promise<void> {
+async function againstOpenSslServer(kind: "ec" | "rsa", extra: string[] = []): Promise<void> {
   const probe = Deno.listen({ hostname: "127.0.0.1", port: 0 });
   const port = (probe.addr as Deno.NetAddr).port;
   probe.close();
@@ -238,7 +248,7 @@ async function againstOpenSslServer(kind: "ec" | "rsa"): Promise<void> {
   const dir = new URL("./data/", import.meta.url).pathname;
   const proc = new Deno.Command("openssl", {
     args: ["s_server", "-accept", String(port), "-cert", `${dir}${kind}_leaf.pem`,
-           "-key", `${dir}${kind}_leaf.key`, "-tls1_3", "-www", "-quiet"],
+           "-key", `${dir}${kind}_leaf.key`, "-tls1_3", "-www", "-quiet", ...extra],
     stdout: "null", stderr: "null",
   }).spawn();
   await new Promise((r) => setTimeout(r, 1500));
@@ -257,20 +267,10 @@ async function againstOpenSslServer(kind: "ec" | "rsa"): Promise<void> {
   }
 }
 
-/** OpenSSL 3.5.7, which unlike the system 3.0.13 speaks ML-KEM. */
-const OPENSSL35 = Deno.env.get("OPENSSL35") ??
-  "/tmp/ossl/openssl-openssl-3.5.7/apps/openssl";
-const HAVE_OPENSSL35 = (() => {
-  try {
-    return Deno.statSync(OPENSSL35).isFile;
-  } catch {
-    return false;
-  }
-})();
 
 Deno.test({
   name: "client: negotiates X25519MLKEM768 against a post-quantum-only server",
-  ignore: !HAVE_OPENSSL35,
+  ignore: (announceIfMissing(), !HAVE_OPENSSL35),
   fn: async () => {
     // The server accepts nothing else, so a client whose 1216-byte share were built the
     // wrong way round — ML-KEM and X25519 are concatenated in one order for this group
