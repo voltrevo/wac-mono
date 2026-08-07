@@ -61,11 +61,29 @@ Deno.test({
       assertEquals(anchored.out.trim(), OWNER.toLowerCase(), anchored.out);
       assertEquals(anchored.err.includes("hashing to the block hash you gave"), true, anchored.err);
 
-      // And a hash from somewhere else has to be refused rather than ignored, or the argument is theatre.
-      const wrong = await run.run(["wac.eth", "127.0.0.1", String(node.port), REGISTRY,
-        "0x" + "00".repeat(31) + "01"]);
-      assertEquals(wrong.code, 1, `a wrong anchor should fail, got ${wrong.code}: ${wrong.out}`);
-      assertEquals(wrong.err.includes("re-encodes to a different hash"), true, wrong.err);
+      // A hash from somewhere else has to be refused rather than ignored, or the argument is theatre — and
+      // since an anchor *selects* the block, that refusal is now at the lookup rather than at a header
+      // comparison. This case replaced one asserting the old message; keeping both would have been two
+      // tests of one behaviour, one of them wrong.
+      const unknown = await run.run(["wac.eth", "127.0.0.1", String(node.port), REGISTRY,
+        "0x" + "de".repeat(32)]);
+      assertEquals(unknown.code, 1, `an unknown block should fail, got ${unknown.code}`);
+      assertEquals(unknown.err.includes("does not have the block"), true, unknown.err);
+
+      // **A node that serves the latest state whatever block is asked for.** anvil does exactly this, so
+      // this is not a hypothetical: mine a second block, anchor to the first, and the proof that comes
+      // back is about the wrong one. Caught where it is legible — the account proof's root node hashes to
+      // the state root by definition — rather than three layers down in the trie walk.
+      // Sealed first, then captured: a cheatcode writes into the *pending* state, so a hash read before
+      // one lands describes a block anvil then rebuilds — and the child gets "no such block", which is a
+      // true answer to a question about a block that no longer exists. Mine, then capture, then write.
+      await rpc(node.port, "evm_mine", []);
+      const before = await rpc(node.port, "eth_getBlockByNumber", ["latest", false]) as { hash: string };
+      await rpc(node.port, "anvil_setStorageAt", [REGISTRY, slot, "0x" + "00".repeat(30) + "beef"]);
+      await rpc(node.port, "evm_mine", []);
+      const stale = await run.run(["wac.eth", "127.0.0.1", String(node.port), REGISTRY, before.hash]);
+      assertEquals(stale.code, 1, `a historical anchor should fail here, got ${stale.code}: ${stale.out}`);
+      assertEquals(stale.err.includes("historical proofs"), true, stale.err);
 
       // A name nobody owns: absence is an answer, and the exit code says the question was answered.
       const none = await run.run(["nobody-owns-this.eth", "127.0.0.1", String(node.port)]);

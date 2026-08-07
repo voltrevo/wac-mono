@@ -10,10 +10,12 @@
 // nothing and looks like a bad proof.
 
 import { Cli } from "../../platform/src/platform.wac";
-import { call, stringOf, Answer } from "./rpc.wac";
+import { call, Answer } from "./rpc.wac";
 import { JsonValue } from "../../json/src/value.wac";
-import { memberOf, memberBytes, hexArray, fromHex } from "./jsonhex.wac";
+import { memberOf, memberBytes, hexArray, fromHex, isNull, stringOf as jsonString } from "./jsonhex.wac";
+import { encode as hexOf } from "../../codec/src/hex.wac";
 import { headerOf, Header } from "./header.wac";
+import { keccak256 } from "../../crypto/src/keccak.wac";
 import { itoa } from "../../fmt/src/itoa.wac";
 
 /** A proof, in the shape `packages/mpt` takes. */
@@ -33,15 +35,27 @@ export struct Proof {
 }
 
 /**
- * `eth_getProof(address, [slot], "latest")` plus the block's state root, decoded.
+ * `eth_getProof` for one slot, plus the state root of the block it is proved against.
  *
- * Two calls. The root is taken from a header this re-encodes and hashes, so `expectedHash` — 32 bytes from
+ * Two calls. The root comes out of a header this re-encodes and hashes, so `expectedHash` — 32 bytes from
  * anywhere the caller trusts — anchors it. Pass an empty array and the check is against the node's own
  * `hash` field, which proves the node is internally consistent and nothing more.
+ *
+ * **An anchor selects the block, rather than being checked against whatever `latest` is now.** A caller
+ * with a trusted hash for block N wants the state at block N: asking for `latest` and then comparing its
+ * header to N's hash fails the moment a new block arrives, which on a live chain is every twelve seconds.
+ * So a hash is looked up with `eth_getBlockByHash` and the proof is taken *at that block's number*. The
+ * anchored path therefore answers about the past, deliberately — that is what having a trusted hash means.
  */
 export Proof proofOf(Cli cli, string host, i32 port, string address, string slot, u8[] expectedHash) {
-  Answer block = call(cli, host, port, "eth_getBlockByNumber", "[\"latest\",false]");
+  bool anchored = expectedHash.len() == 32;
+  string where = anchored
+    ? "[\"0x" + string.fromBytes(hexOf(expectedHash)) + "\",false]"
+    : "[\"latest\",false]";
+  Answer block = call(cli, host, port,
+                      anchored ? "eth_getBlockByHash" : "eth_getBlockByNumber", where);
   if (!block.ok) { return failed(block.error); }
+  if (isNull(block.result)) { return failed("this node does not have the block you anchored to"); }
 
   // **The root comes out of a header that was re-encoded and hashed**, not straight out of the JSON. With
   // an `expectedHash` from somewhere else that makes the root trustworthy; without one it catches a node
@@ -51,11 +65,36 @@ export Proof proofOf(Cli cli, string host, i32 port, string address, string slot
   u8[] root = h.stateRoot;
   if (root.len() != 32) { return failed("the block has no usable stateRoot"); }
 
-  string params = "[\"" + address + "\",[\"" + slot + "\"],\"latest\"]";
+  // The proof has to be about the same block as the root, which is the whole point: `latest` here with an
+  // anchored root above would verify a fresh trie against an old root and report every slot as absent.
+  JsonValue numberAt = memberOf(block.result, "number");
+  string at = anchored ? "\"" + string.fromBytes(jsonString(numberAt)) + "\"" : "\"latest\"";
+  if (anchored && jsonString(numberAt).len() == 0) { return failed("the block has no number"); }
+
+  string params = "[\"" + address + "\",[\"" + slot + "\"]," + at + "]";
   Answer got = call(cli, host, port, "eth_getProof", params);
   if (!got.ok) { return failed(got.error); }
 
   u8[][] accountNodes = hexArray(memberOf(got.result, "accountProof"));
+
+  // **The proof has to be about the block the root came from**, and the first node is where that is
+  // checkable: an account proof's root node hashes to the state root by definition. Checking it here turns
+  // an unreadable failure three layers down — "node 0 hashes to X, but its parent named Y", which sends
+  // the reader into the trie code — into the sentence that is actually true.
+  //
+  // It is not hypothetical. **anvil answers `eth_getProof` with the latest state whatever block is asked
+  // for**, so every anchored proof against an older block arrives inconsistent; a real node either serves
+  // the block or refuses. Either way the caller learns which, here, instead of downstream.
+  if (accountNodes.len() == 0) { return failed("the node answered with no account proof"); }
+  u8[] proofRoot = keccak256(accountNodes[0]);
+  for (i32 i = 0; i < 32; i++) {
+    if (proofRoot[i] != root[i]) {
+      return failed(anchored
+        ? "the node answered with a proof for a different block than the one anchored to — it may not "
+          + "serve historical proofs"
+        : "the node's proof does not match the state root of the block it sent");
+    }
+  }
   JsonValue storageProof = memberOf(got.result, "storageProof");
   match (storageProof) {
     case Array(items): {
