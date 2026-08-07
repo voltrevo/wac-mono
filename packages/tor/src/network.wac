@@ -26,6 +26,25 @@
 //     is this program's exit code, so a launcher that stood the network up and then quietly failed the
 //     fetch cannot report success.
 //
+// ## `{name}` — what a node tells the rest of the network
+//
+// A `run` argument may contain `{name}`, which is replaced by what node `name` printed **after its
+// ready marker**, to the end of that line. So the marker chooses the capture: end it where the
+// interesting part starts.
+//
+//     node relay1 | listening on 127.0.0.1: | relayd.worker.js s1 -p 0 --descriptor r1.desc
+//     run  fetch  |                         | torapp.worker.js 127.0.0.1:{relay1} …
+//
+// This exists for one reason. A relay told to bind port 0 is given a port by the operating system, so
+// no description written in advance can name it — but the relay says it on the line that makes it
+// ready. Without this, a network can only be stood up on ports agreed beforehand, and two agents
+// running one at the same time collide on them; that collision cost this project three runs in a
+// single session, each one reported as healthy.
+//
+// An unknown name is a failure, not a literal. Passing `{relya1}` through would have a client dial a
+// host by that name, fail, and the failure would look like the network rather than like the typo.
+// `{}` and an unclosed `{` are left alone, so a program whose argument is JSON can still be run.
+//
 // ## Progress goes to the error channel
 //
 // Everything this program says about itself is a `warn`, and stdout carries only what the work wrote.
@@ -89,6 +108,8 @@ struct Node {
   bool up;
   /** Everything it has written, kept because the marker may be split across two reads. */
   Buf said;
+  /** What followed the marker on the line that matched — see `afterMarker`. */
+  string capture;
   Pending<Read> fromOut;
   Pending<Read> fromErr;
 }
@@ -148,8 +169,24 @@ export i32 main(Core core, Cli cli) {
   for (i32 i = 0; i < plan.len(); i++) {
     if (plan[i]!.isNode) { continue; }
     ranSomething = true;
-    i32 one = runOnce(core, cli, plan[i]!);
-    if (one != 0) { code = one; }
+    // The arguments are resolved here rather than at parse time because the values do not exist until
+    // the nodes are up: a relay's port is chosen by the operating system when it binds.
+    u8[][] args = u8[][plan[i]!.args.len()]();
+    bool resolved = true;
+    for (i32 a = 0; a < args.len(); a++) {
+      Substituted one = substituted(plan[i]!.args[a], nodes, live);
+      if (!one.ok) {
+        core.warn("network: " + plan[i]!.name + ": {" + one.unknown + "} is not a node in this " +
+                  "description, so there is nothing it could stand for");
+        resolved = false;
+        break;
+      }
+      args[a] = one.text;
+    }
+    if (!resolved) { code = 1; continue; }
+    i32 got = runOnce(core, cli, Directive(false, plan[i]!.name, plan[i]!.ready, plan[i]!.bundle,
+                                           args));
+    if (got != 0) { code = got; }
   }
   if (!ranSomething) {
     core.warn("network: every node came up and the description asks for nothing to be run");
@@ -180,7 +217,7 @@ Node? startNode(Core core, Cli cli, Directive d) {
     core.warn("network: " + d.name + ": " + kid.error);
     return null;
   }
-  return Node(d.name, d.ready, kid.handle, kid.errHandle, false, Buf.create(),
+  return Node(d.name, d.ready, kid.handle, kid.errHandle, false, Buf.create(), "",
               cli.recv(kid.handle), cli.recv(kid.errHandle));
 }
 
@@ -243,6 +280,7 @@ bool awaitReady(Core core, Cli cli, Node?[] nodes, i32 live, i32 readyTimeout) {
     }
     if (contains(hot.said.bytes(), hot.ready)) {
       hot.up = true;
+      hot.capture = afterMarker(hot.said.bytes(), hot.ready);
       ready = ready + 1;
       core.warn("network: " + hot.name + " is up");
     }
@@ -383,6 +421,83 @@ i32 timeoutIn(u8[] text) {
     if (ok && v > 0) { return v; }
   }
   return READY_TIMEOUT_MS;
+}
+
+// ## What a node tells the rest of the network about itself
+//
+// A relay asked for port 0 is told its port by the operating system, so nothing that starts before it
+// can name that port — not the description file, not the client that has to dial it. But the relay
+// says it, on the line that makes it ready: `listening on 127.0.0.1:33741`.
+//
+// So the ready marker does two jobs. Ending it at `listening on 127.0.0.1:` makes it match, and makes
+// **the rest of that line** the node's capture, which later directives reach as `{relay1}`. Where you
+// stop the marker is where the capture begins; there is no second syntax for saying what to take.
+//
+// This is the whole reason a launcher can stand up a network on ports nobody agreed in advance, and
+// therefore the reason two of these can run at once on one machine.
+
+/** What followed the marker, to the end of that line. Empty if the marker ends the line. */
+string afterMarker(u8[] said, string marker) {
+  u8[] t = marker.toBytes();
+  if (t.len() == 0) { return ""; }
+  for (i32 i = 0; i + t.len() <= said.len(); i++) {
+    bool hit = true;
+    for (i32 j = 0; j < t.len(); j++) { if (said[i + j] != t[j]) { hit = false; break; } }
+    if (!hit) { continue; }
+    i32 from = i + t.len();
+    i32 to = from;
+    while (to < said.len() && said[to] != 10 && said[to] != 13) { to = to + 1; }
+    // Trim, because a marker written with a trailing space and one written without should capture the
+    // same thing. A capture with a stray space in it becomes an argument with a stray space in it.
+    while (from < to && said[from] == 32) { from = from + 1; }
+    while (to > from && said[to - 1] == 32) { to = to - 1; }
+    u8[] out = u8[to - from]();
+    for (i32 k = from; k < to; k++) { out[k - from] = said[k]; }
+    return string.fromBytes(out);
+  }
+  return "";
+}
+
+/** One argument with its `{name}` references resolved, or the reference that could not be. */
+struct Substituted {
+  u8[] text;
+  bool ok;
+  string unknown;
+}
+
+/**
+ * Replace every `{name}` in one argument with that node's capture.
+ *
+ * An unknown name is a failure rather than a literal. This program exists because four runs in a row
+ * measured the wrong thing and none of them said so, and passing `{relya1}` through to a client as
+ * text is exactly that shape of bug: the client would dial a host called `{relya1}`, fail, and the
+ * failure would look like the network.
+ *
+ * `{}` and a `{` with no `}` are left alone. They are not references, and a launcher that rewrote
+ * every brace would be unable to run a program whose arguments contain JSON.
+ */
+Substituted substituted(u8[] arg, Node?[] nodes, i32 live) {
+  Buf out = Buf.create();
+  i32 i = 0;
+  while (i < arg.len()) {
+    if (arg[i] != 123) { out.push(arg[i]); i = i + 1; continue; }
+    i32 close = -1;
+    for (i32 j = i + 1; j < arg.len(); j++) {
+      if (arg[j] == 125) { close = j; break; }
+      // A brace or a space inside means this was never a reference.
+      if (arg[j] == 123 || arg[j] == 32) { break; }
+    }
+    if (close < 0 || close == i + 1) { out.push(arg[i]); i = i + 1; continue; }
+    u8[] name = u8[close - i - 1]();
+    for (i32 k = i + 1; k < close; k++) { name[k - i - 1] = arg[k]; }
+    string want = string.fromBytes(name);
+    i32 at = -1;
+    for (i32 n = 0; n < live; n++) { if (nodes[n]!.name == want) { at = n; break; } }
+    if (at < 0) { return Substituted(u8[0](), false, want); }
+    out.pushAll(nodes[at]!.capture.toBytes());
+    i = close + 1;
+  }
+  return Substituted(out.bytes(), true, "");
 }
 
 bool contains(u8[] s, string text) {

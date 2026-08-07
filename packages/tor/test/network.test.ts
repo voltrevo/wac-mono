@@ -2,9 +2,13 @@
 //
 // Deliberately **not** a Tor network. `src/network.wac` knows about processes and ready markers, not
 // about relays, and testing it against three relays would mean this test fails whenever anything in
-// the tor stack does — plus it would bind the fixed ports a signed descriptor advertises, so two
-// agents running the suite at once would collide. `packages/platform/example/waiter.wac` exists to be started and
-// killed and `example/wc.wac` exits 0 or 1 on demand, which is the whole vocabulary the launcher has.
+// the tor stack does. `packages/platform/example/waiter.wac` exists to be started and killed and
+// `example/wc.wac` exits 0 or 1 on demand, which is the whole vocabulary the launcher has.
+//
+// It used to also say that a Tor network here would bind the fixed ports a signed descriptor
+// advertises, so two agents running the suite would collide. That is no longer true — a relay takes
+// `-p 0` and announces the port it got, and the `{name}` cases below are how a later directive reads
+// it. The reason this file stays away from relays is now only the first one.
 //
 // What is checked is the part that made every shell script this replaces untrustworthy:
 //
@@ -45,6 +49,9 @@ async function fixture(): Promise<{ dir: string; launcher: string }> {
   await buildApp("packages/platform/example/waiter.wac", `${dir}/waiter.worker.js`, {}, "deno", true);
   await buildApp("packages/platform/example/wc.wac", `${dir}/wc.worker.js`, {}, "deno", true);
   await Deno.writeTextFile(`${dir}/counted.txt`, "one two three\n");
+  // Named for what `waiter: running` leaves after the marker `waiter: runn`, which is how the
+  // substitution case below gets a value that only exists once the node has spoken.
+  await Deno.writeTextFile(`${dir}/ing.txt`, "captured from a ready line\n");
   return { dir, launcher };
 }
 
@@ -192,6 +199,84 @@ Deno.test("a bundle that is not there is reported against the node that wanted i
     assertEquals(r.code, 1);
     assertContains(r.err, "gone", "the node is named, not just the file");
     assertEquals(r.out.includes("1 3 14"), false, "no work runs");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("a node's ready line supplies an argument to the work that follows", async () => {
+  // The point of this, in one sentence: a relay told to bind port 0 is given a port by the operating
+  // system, so no description file can name it, but the relay *says* it on the line that makes it
+  // ready. Ending the marker before the part that varies makes the rest of that line the node's
+  // capture, and `{name}` reaches it. Without this a network can only be stood up on ports agreed in
+  // advance, and two agents running the suite collide on them.
+  //
+  // `waiter` prints `waiter: running`, so a marker of `waiter: runn` captures `ing` — a value that
+  // does not appear anywhere in the description and could not have been written into it.
+  const { dir, launcher } = await fixture();
+  try {
+    await Deno.writeTextFile(
+      `${dir}/net.txt`,
+      [
+        "node alpha | waiter: runn | waiter.worker.js",
+        "run  count |              | wc.worker.js {alpha}.txt",
+        "",
+      ].join("\n"),
+    );
+    const r = run(launcher, dir, "net.txt");
+
+    assertEquals(r.code, 0, r.err);
+    // `wc` echoes the name it was given, so this is the substituted argument coming back from the
+    // child — not just a file that happened to be countable.
+    assertContains(r.out, "1 5 27 ing.txt", "wc counted ing.txt, which only {alpha} could have named");
+    assertContains(r.err, "network: ok");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("a reference to a node that is not in the description fails, by name", async () => {
+  // Passing `{relya1}` through as a literal is the failure this program exists to prevent: the client
+  // would dial a host called `{relya1}`, fail, and the failure would look like the network rather
+  // than like the typo it is.
+  const { dir, launcher } = await fixture();
+  try {
+    await Deno.writeTextFile(
+      `${dir}/net.txt`,
+      [
+        "node alpha | waiter: running | waiter.worker.js",
+        "run  count |                 | wc.worker.js {alpah}.txt",
+        "",
+      ].join("\n"),
+    );
+    const r = run(launcher, dir, "net.txt");
+
+    assertEquals(r.code, 1, "an unresolved reference is a failed run");
+    assertContains(r.err, "{alpah} is not a node", "the reference that could not be resolved is named");
+    assertEquals(r.err.includes("running count"), false, "and nothing was run with it unresolved");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("braces that are not references are left alone", async () => {
+  // A launcher that rewrote every brace could not run a program whose argument is JSON. `{}` is not a
+  // name, and `{` with no `}` is not a reference — both reach the child as written.
+  const { dir, launcher } = await fixture();
+  try {
+    await Deno.writeTextFile(`${dir}/{}.txt`, "literal braces\n");
+    await Deno.writeTextFile(
+      `${dir}/net.txt`,
+      [
+        "node alpha | waiter: running | waiter.worker.js",
+        "run  count |                 | wc.worker.js {}.txt",
+        "",
+      ].join("\n"),
+    );
+    const r = run(launcher, dir, "net.txt");
+
+    assertEquals(r.code, 0, r.err);
+    assertContains(r.out, "1 2 15", "the file literally called {}.txt was counted");
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
