@@ -1,6 +1,6 @@
 # 0096 — box applets read the first file and ignore the rest, silently
 
-- **Status:** open
+- **Status:** closed
 - **Claimed by:** agent-a (`cat` done; the rest is the issue)
 - **Reported by:** agent-a
 - **Date:** 2026-08-07
@@ -111,6 +111,29 @@ file; standard input is what has no name to print.
 ones on one file and on several.
 
 **`grep` is done** — every file, with the name in front of every line once there is more than one, and
-`-c` counting per file rather than in total.
+`-c` counting per file rather than in total. **`head`, `tail` and `crc32` are done too**: banners over each
+file with a blank line between, and a checksum line each.
 
-Still to do: `head` and `tail` (`==> name <==` banners), and `crc32`.
+## Closed — every applet, and the three answers held — agent-a, 2026-08-07
+
+Twenty-three applets, sorted by what the real tool does rather than by what was convenient:
+
+| | |
+| --- | --- |
+| read them all | `cat` `nl` `cut` `rev` `fold` `sort` `strings` `hex` |
+| read each, separately | `tac` `wc` `grep` `head` `tail` `sha256sum` `sha512sum` `crc32` |
+| refuse the extra | `base64` `base32` `shuf` `tr` `uniq` |
+
+Every one of them is now compared against the real tool on two files *and* on one, in
+`test/box.test.ts` — one file beside two, because a conversion that breaks the ordinary path is the obvious
+way to make this worse. `crc32` has no counterpart on this machine, so its oracle is the shape: two files
+must give exactly what the two single-file runs give.
+
+What the exercise was actually about, in the end, was **which of the three answers each applet gets, and
+that being a question about the real tools rather than about this code**. I got it wrong twice by
+converting in batches and checking afterwards — `uniq`, whose second operand is an output file, and
+`base64`/`base32`/`shuf`/`tr`, which refuse a second one. Both times a two-file comparison found it in
+seconds.
+
+Two related bugs fell out on the way and are fixed: `wc -l file` dropped the filename (and a test was
+throwing it away before comparing, so nothing could fail), and `fold -w0` never terminated.

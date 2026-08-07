@@ -728,6 +728,9 @@ Deno.test("the applets that read several files read all of them", async () => {
       ["grep", "grep", ["alpha"]],
       ["grep", "grep", ["-n", "a"]],
       ["grep", "grep", ["-c", "a"]],
+      // `head` and `tail` put a `==> name <==` banner over each file and a blank line between them.
+      ["head", "head", ["-2"]],
+      ["tail", "tail", ["-n2"]],
     ] as [string, string, string[]][]) {
       const got = await runner.run([applet, ...flags, a1, a2]);
       assertEquals(got.out, sys(cmd, [...flags, a1, a2]), `${applet} over two files`);
@@ -764,6 +767,14 @@ Deno.test("the applets that read several files read all of them", async () => {
           `wc ${flags.join(" ")} over ${files.length} file(s)`);
       }
     }
+
+    // `crc32` has no counterpart on this machine — `cksum` is a different checksum — so the oracle is the
+    // shape rather than a second implementation: two files must give exactly what the two single-file
+    // runs give. That catches the bug this issue is about without inventing an expected digest.
+    const both = await runner.run(["crc32", a1, a2]);
+    const one = await runner.run(["crc32", a1]);
+    const two = await runner.run(["crc32", a2]);
+    assertEquals(both.out, one.out + two.out, "crc32 over two files");
 
     const missing = await runner.run(["nl", a1, `${dir}/nope.txt`]);
     assertEquals(missing.code, 1, `a missing operand should fail, got ${missing.code}`);
