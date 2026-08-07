@@ -48,6 +48,7 @@ import { Read } from core;
 import { Buf } from "../../bytes/src/buf.wac";
 import { Parsed, parseRequest } from "../../http/src/request.wac";
 import { DirDocuments, dirSourceFingerprint } from "./dirserve.wac";
+import { AuthorityCert, Verdict, parseCertificates, verifyConsensus } from "./consensus.wac";
 import { DirAction, dirStep, filed } from "./dirstep.wac";
 import { PUB_OK } from "./hsstore.wac";
 
@@ -854,16 +855,12 @@ struct DirLoad {
 /**
  * Whether a file that exists is the document it is supposed to be.
  *
- * A relay does not verify a consensus — it is a cache, and the client it hands one to is the party
- * that checks the signatures. But *serving something that is not a consensus at all* is a different
- * thing, and until this check existed it happened silently: a run of this program was pointed at
- * `gendesc`'s JSON vector file, loaded it, logged `serving the consensus`, and would have handed a
- * bootstrapping client a block of JSON. Nothing anywhere said a word.
+ * The first keyword, which is tor's own rule — `networkstatus_parse_vote_from_string` requires the
+ * document to *start* with its version keyword. This is the cheap check, and its real value is that
+ * it makes a half-written file retry instead of stick: a reader that catches an authority mid-write
+ * sees a truncation, and a truncation does not start with the keyword either.
  *
- * The rule is tor's own: `networkstatus_parse_vote_from_string` requires the document to *start* with
- * its version keyword. Checking the first keyword is also what makes a half-written file retry
- * instead of stick — a reader that catches an authority mid-write sees a truncated document, and a
- * truncated document does not start with the keyword either.
+ * It is not the check that matters. See `verifiedAgainst` below for that one.
  */
 bool startsWith(u8[] doc, string keyword) {
   u8[] k = keyword.toBytes();
@@ -876,6 +873,84 @@ bool startsWith(u8[] doc, string keyword) {
 DirDocuments none() {
   return DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](),
                       u8[0](), u8[][0](), u8[][0](), u8[][0]());
+}
+
+
+/**
+ * The authority a certificate belongs to, from its own `fingerprint` line.
+ *
+ * Taken from the file rather than from configuration because the file *is* the configuration: an
+ * operator who points `-K` at a certificate has named the authority this relay trusts, exactly as a
+ * `DirAuthority` line does in tor. `parseCertificates` then recomputes the fingerprint from the
+ * identity key inside and drops the certificate if the two disagree, so a `fingerprint` line that
+ * lies about its own key does not survive being read.
+ */
+string certificateFingerprint(u8[] cert) {
+  i32 at = -1;
+  if (startsWith(cert, "fingerprint ")) {
+    at = 0;
+  } else {
+    for (i32 i = 0; i + 12 <= cert.len(); i++) {
+      if (cert[i] != 10) { continue; }
+      bool hit = true;
+      u8[] k = "fingerprint ".toBytes();
+      for (i32 j = 0; j < k.len(); j++) {
+        if (i + 1 + j >= cert.len() || cert[i + 1 + j] != k[j]) { hit = false; break; }
+      }
+      if (hit) { at = i + 1; break; }
+    }
+  }
+  if (at < 0) { return ""; }
+  i32 from = at + 12;
+  i32 to = from;
+  while (to < cert.len() && cert[to] != 10 && cert[to] != 13) { to = to + 1; }
+  u8[] out = u8[to - from]();
+  for (i32 i = from; i < to; i++) { out[i - from] = cert[i]; }
+  return string.fromBytes(out);
+}
+
+/**
+ * Whether the authority whose certificate we hold actually signed this consensus.
+ *
+ * **This relay used to serve whatever it was handed.** The reasoning was that a relay is a cache and
+ * the client is the party that checks signatures — which is true about who is *protected*, and wrong
+ * about what a cache does. C tor puts every consensus it receives through
+ * `networkstatus_set_current_consensus`, and the call that makes one servable —
+ * `dirserv_set_cached_consensus_networkstatus` — sits *after* `networkstatus_check_consensus_signature`
+ * in that function. One that fails goes to `unverified-consensus`, a different file, and is not
+ * served. tor's own comment about a flavour it will not use says it plainly: *"we won't use it, we
+ * didn't want it, and we won't serve it."*
+ *
+ * So the client checking is not a reason for the cache not to. Serving an unsigned consensus is
+ * handing every client that asks a document they will spend a round trip rejecting, and — on a test
+ * network, which is what this program is for — it converts a wrong file at the relay into a mystery
+ * at the client. That is precisely how the JSON-instead-of-a-consensus mistake in the previous commit
+ * stayed invisible for a whole session.
+ *
+ * **Where this is weaker than tor, and why:** tor requires a *majority* of the authorities it knows.
+ * This relay is configured with one certificate, so a majority of what it knows is that one signature.
+ * The rule is the same rule; the trust set is as large as the configuration makes it. A relay given
+ * several authorities' certificates in one `-K` file gets the majority rule with no change here,
+ * because `verifyConsensus` counts distinct trusted signers and that is where the threshold lives.
+ */
+string verifiedAgainst(u8[] consensus, u8[] certFile, i64 now, string what) {
+  string fp = certificateFingerprint(certFile);
+  if (fp == "") { return "the certificate has no fingerprint line, so there is no authority to trust"; }
+  string[] trusted = string[1]();
+  trusted[0] = fp;
+  AuthorityCert[] certs = parseCertificates(certFile, trusted);
+  if (certs.len() == 0) {
+    return "the certificate does not verify against its own identity key, so it says nothing about " +
+           "who signed the " + what;
+  }
+  Verdict v = verifyConsensus(consensus, certs, trusted, now);
+  if (!v.ok) {
+    string why = v.stale != "" ? v.stale
+                               : itoa(v.goodSignatures) + " good signature(s), " + itoa(v.needed) +
+                                 " needed";
+    return "the " + what + " is not signed by " + fp + " — " + why;
+  }
+  return "";
 }
 
 /**
@@ -905,6 +980,11 @@ DirLoad loadDocuments(Core core, Cli cli, string consensusPath, string certPath,
     return DirLoad(none(), false, certPath + " is not an authority certificate — it does not begin " +
                                   "\"dir-key-certificate-version\"");
   }
+  // The check that matters: this relay does not serve a consensus the authority it was configured
+  // with did not sign. See `verifiedAgainst`.
+  i64 now = core.nowMillis().wait() / 1000;
+  string bad = verifiedAgainst(cf.bytes, kf.bytes, now, "consensus");
+  if (bad != "") { return DirLoad(none(), false, consensusPath + ": " + bad); }
   // The descriptors too, because tor asks for them over BEGIN_DIR as readily as for the consensus.
   // Leaving them out did not make it ask elsewhere: it read our 404's ten-byte body as "server info"
   // eight times over and stayed at 0/2 usable descriptors.
@@ -933,6 +1013,15 @@ DirLoad loadDocuments(Core core, Cli cli, string consensusPath, string certPath,
     if (!mcf.ok || !mdf.ok) {
       return DirLoad(none(), false, "");
     }
+    // The microdesc flavour is a consensus too, signed by the same authority over its own body, and a
+    // relay that checked one flavour and served the other unchecked would have done the work and kept
+    // the hole — ours is the flavour our own client asks for.
+    if (!startsWith(mcf.bytes, "network-status-version")) {
+      return DirLoad(none(), false, microConsensusPath + " is not a consensus — it does not begin " +
+                                    "\"network-status-version\"");
+    }
+    string badMicro = verifiedAgainst(mcf.bytes, kf.bytes, now, "microdesc consensus");
+    if (badMicro != "") { return DirLoad(none(), false, microConsensusPath + ": " + badMicro); }
     microCons = mcf.bytes;
     micros = mdf.bytes;
     microDigests = microdescDigests(micros);
