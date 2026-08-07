@@ -35,7 +35,7 @@ import { itoa } from "../../fmt/src/itoa.wac";
 import {
   Awaited, Network, Session, awaitCommand, bootstrap, buildCircuit, buildCircuitTo, relayByEd25519,
 } from "./bootstrap.wac";
-import { Link, publishOverCircuit, sendCells, nextCell } from "./link.wac";
+import { Link, nextCellFor, publishOverCircuit, sendCells } from "./link.wac";
 import { Circuit, Received, gotBroken, gotDestroyed } from "./circuit.wac";
 import {
   relayEstablishIntro, relayIntroEstablished, relayIntroduce2, relayRendezvous1,
@@ -170,8 +170,13 @@ export i32 main(Core core, Cli cli) {
   ReplayCache cells = introReplayCache(64);
   ReplayCache cookies = cookieReplayCache(64);
 
+  core.log("hsserviced: waiting for a client");
   while (!intro.link.dead) {
-    u8[] cell = nextCell(intro.link);
+    // No deadline. Silence on an introduction circuit is the normal state — it lasts until somebody
+    // decides to visit — and a thirty-second read timeout would make this service reachable only by a
+    // client who arrived in the first half minute. What bounds the circuit is the introduction
+    // point's own eighteen-to-twenty-four hour expiry.
+    u8[] cell = nextCellFor(intro.link, -1);
     if (cell.len() == 0) { break; }
     Received got = intro.circ.receive(cell);
     if (got.toSend.len() > 0) { sendCells(intro.link, got.toSend); }

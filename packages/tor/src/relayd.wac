@@ -559,8 +559,12 @@ export i32 main(Core core, Cli cli) {
 
     i32 who = owner[which];
     Conn hot = conns[who]!;
-    feedConn(core, cli, hot, source[which], slot[which], id, certs, docs, hasDir,
-             conns, live, intros, rends);
+    // The documents come back because a publish *replaces* them: `filed` builds a new struct when
+    // the arrays grow, so assigning inside `feedConn` would rebind its own parameter and every upload
+    // would be forgotten the moment that connection was done with. Which is exactly what happened —
+    // three relays each reported "1 held" for two different descriptors and then answered 404.
+    docs = feedConn(core, cli, hot, source[which], slot[which], id, certs, docs, hasDir,
+                    conns, live, intros, rends);
     if (!hot.live) {
       dropConn(core, cli, hot, intros, rends);
       // Close the gap rather than leave a hole: the wait list is built by walking 0..live, and a dead
@@ -839,7 +843,7 @@ void dropConn(Core core, Cli cli, Conn c, IntroPoints intros, RendPoints rends) 
  * here concerns one connection and one circuit, which is why this function did not need them until
  * now, and why they are arguments rather than a wider refactor.
  */
-void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[] certs,
+DirDocuments feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[] certs,
               DirDocuments docs, bool hasDir, Conn?[] conns, i32 connCount, IntroPoints intros,
               RendPoints rends) {
     if (source == 2) {
@@ -863,7 +867,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
                  itoa(k.streamIn) + " bytes in, " + itoa(k.streamOut) + " bytes out");
         // The stream is gone; the circuit is not. A client reuses a circuit for the next stream, so
         // tearing down the connection here would cost it a fresh three-hop build per request.
-        return;
+        return docs;
       }
       // Re-armed **after** the check, not before it. Arming a read on a socket that is about to be
       // closed leaves a ticket outstanding on a dead handle for the rest of the program: nothing ever
@@ -879,7 +883,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
       // Return, but stay live: forwarding a body is the connection working, not the connection ending.
       // This was `continue` in the single-connection loop and became `c.live = false` in the move to
       // `feedConn`, which closed the circuit after the first cell of every response.
-      return;
+      return docs;
     }
 
 
@@ -896,7 +900,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
         core.warn("relayd: [" + itoa(c.id) + "]  the next hop closed the connection");
         c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_NONE));
         dropCirc(core, cli, c, slot, intros, rends);
-        return;
+        return docs;
       }
       // As above: only a hop that is staying gets a fresh read.
       k.fromNext = cli.recv(k.next.sock);
@@ -909,7 +913,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
           core.log("relayd: [" + itoa(c.id) + "]  the next hop destroyed its leg of the circuit");
           c.tls = sendCell(cli, c.sockObj, c.tls, destroyCell(k.circId, DESTROY_NONE));
           dropCirc(core, cli, c, slot, intros, rends);
-          return;
+          return docs;
         }
         if (backCommand != cmdRelay() && backCommand != cmdRelayEarly()) { continue; }
         // One layer on, and out to the client. The payload is opaque here: it was encrypted for the
@@ -919,7 +923,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
                        encodeFixed(k.circId, cmdRelay(), wrapForClient(k.hop, cellPayload(back, 0))));
       }
       // Same as the stream case: cells arriving from the next hop are the circuit carrying traffic.
-      return;
+      return docs;
     }
 
 
@@ -940,14 +944,14 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
       // The client is gone, so every circuit it built over this connection is too. `dropConn` in the
       // main loop closes them; saying so here is what `c.live = false` means.
       c.live = false;
-      return;
+      return docs;
     }
     // And here: a connection that is going does not need another read outstanding on it.
     c.fromClient = cli.recv(c.sock);
     // Whole records only, or `tlsServerFeed` traps. Anything left over waits for the next read.
     c.raw = concat(c.raw, incoming);
     i32 ready = recordsReady(c.raw);
-    if (ready == 0) { return; }
+    if (ready == 0) { return docs; }
     u8[] whole = slice(c.raw, 0, ready);
     c.raw = slice(c.raw, ready, c.raw.len());
 
@@ -957,7 +961,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
     if (tlsPhase(c.tls) == phaseFailed()) {
       core.warn("relayd: [" + itoa(c.id) + "]  the TLS handshake failed");
       c.live = false;
-      return;
+      return docs;
     }
     if (!c.established && tlsPhase(c.tls) == phaseEstablished()) {
       c.established = true;
@@ -978,13 +982,13 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
         if (command != cmdVersions()) {
           core.warn("relayd: [" + itoa(c.id) + "]  first cell was not VERSIONS");
           c.live = false;
-          return;
+          return docs;
         }
         i32 version = responderVersion(cell);
         if (version < 0) {
           core.warn("relayd: [" + itoa(c.id) + "]  no link protocol version in common");
           c.live = false;
-          return;
+          return docs;
         }
         core.log("relayd: [" + itoa(c.id) + "]  link protocol " + itoa(version));
         c.versionsSeen = true;
@@ -992,7 +996,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
         if (reply.len() == 0) {
           core.warn("relayd: [" + itoa(c.id) + "]  could not build the handshake reply");
           c.live = false;
-          return;
+          return docs;
         }
         c.tls = sendCell(cli, c.sockObj, c.tls, reply);
         continue;
@@ -1347,6 +1351,7 @@ void feedConn(Core core, Cli cli, Conn c, i32 source, i32 slot, Identity id, u8[
         continue;
       }
     }
+  return docs;
 }
 
 /**

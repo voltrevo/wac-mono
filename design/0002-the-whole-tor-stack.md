@@ -1827,3 +1827,54 @@ after thirty seconds of silence — a link timeout, not a protocol event. A serv
 circuit open indefinitely, so the timeout needs to be per-purpose rather than global. Nothing has yet
 sent an INTRODUCE1 into this network, so the introduce/rendezvous half of the relay work has been
 built and pinned but not carried.
+
+### A client reached the service, and the two bugs a live run found
+
+    descriptor: 14102 bytes
+    1 introduction points
+    rendezvous circuit: wacrelay2 -> wacrelay1 -> wacrelay3
+    rendezvous established at wacrelay3
+    introduction circuit: wacrelay1 -> wacrelay2 -> wacrelay3
+    introduction acknowledged
+    joined: the service is hop 4
+
+with the same events from the other two sides — the service's
+
+    hsserviced: an introduction, meeting at 127.0.0.1:5553
+    hsserviced: rendezvous joined
+
+and the relay's
+
+    relayd: [2]   circuit -1852074750 is an introduction point
+    relayd: [11]  circuit -1752381383 is waiting at a rendezvous
+    relayd: [12]  an introduction, status 0
+    relayd: [13]  rendezvous joined: circuit -636721961 to -1752381383
+
+**`joined: the service is hop 4` is the line that matters.** It means the client received a
+RENDEZVOUS2, ran hs-ntor against it and the AUTH matched — so the service authenticated, over two
+three-hop circuits meeting at a relay that spliced them, with no C tor anywhere. Every seam in that
+path is ours on both sides, which is the arrangement D1 says proves least; it is reported here because
+it proves the *plumbing*, and each cell along it was pinned separately against cells C tor built.
+
+**Two bugs, and only a live run could have found either.**
+
+The first was a directory that forgot. Every upload arrived on its own connection and each logged
+`filed an onion service descriptor, 1 held` — never *2 held* — and every later fetch answered 404.
+`feedConn` did `docs = filed(docs, …)` on its **own parameter**: `filed` builds a new struct when the
+arrays grow, so the assignment rebound a local and the caller's documents never changed. The unit
+tests could not see it because `dirstep` and `filed` are correct in isolation — what was wrong was the
+wiring, and the wiring is the part with no test. `feedConn` returns the documents now.
+
+The second was a service that could not wait. `pump` had a fixed thirty-second read deadline, which is
+right for a client — its circuits are always mid-transaction, so silence means wedged — and exactly
+wrong for a service, whose introduction circuit is silent until somebody decides to visit. A
+thirty-second deadline makes a service reachable only by a client who arrives in the first half
+minute. The deadline is the caller's now, and what bounds an introduction circuit is the introduction
+point's own eighteen-to-twenty-four hour expiry: a property of the protocol rather than of a socket.
+
+**What is left.** The client then said *the service did not open the stream*, and it is right:
+`hsserviced` sends its RENDEZVOUS1 and goes back to watching the introduction circuit. It never
+watches the rendezvous circuit, so it never sees the RELAY_BEGIN, never answers CONNECTED, and never
+serves anything. That is the last piece of step 6 — and it is the piece the whole multiplexing
+argument was about, because a service holding an introduction circuit *and* a rendezvous circuit
+cannot block on either.
