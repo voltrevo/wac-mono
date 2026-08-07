@@ -337,6 +337,18 @@ export u8[] tlsServerFeed(u8[] state, u8[] input) {
   Writer toSend = Writer.create();
   Writer appData = Writer.create();
 
+  // A connection that is over takes no more bytes, and says so by handing the state back
+  // unchanged rather than by aborting.
+  //
+  // **The peer can reach this**, which is why it is a refusal and not a precondition. A caller feeds whole
+  // records in one call — the loop below consumes as many as arrived — so a client sending a `close_notify`
+  // followed by anything at all in the same flight put both records into one `tlsServerFeed`: the alert set
+  // `phaseFailed`, and the next record fell through the phase dispatch to the `trap` at the bottom.
+  // Checking the phase between calls, which every caller here does, cannot help when both records are
+  // inside one of them. `tlsClientFeed` had the identical hole and was fixed first; this is the side that
+  // accepts connections from strangers.
+  if (c.phase == phaseFailed()) { return result(c, toSend.take(), appData.take()); }
+
   i32 pos = 0;
   while (pos < input.len()) {
     if (input.len() - pos < 5) { trap; }

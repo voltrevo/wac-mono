@@ -1,0 +1,84 @@
+// `server.wac`'s framing guards, and the one that turned out not to be a guard at all.
+//
+// `tlsServerFeed` consumes as many whole records as arrived in one call, and every step of that framing
+// traps on input it cannot make sense of: a record header cut short, a length reaching past what was
+// handed over, a record that is not a handshake before the handshake has started. Twelve of those were
+// reported by mutation testing as **not covered** — no test executes the line at all — which for the side
+// that accepts connections from strangers is the wrong list to have.
+//
+// **And one of them was not a caller error.** The `trap` at the end of the phase dispatch is reached when
+// the connection is already over, and a peer can arrange that: an alert sets `phaseFailed`, and any record
+// after it *in the same call* falls through. `tlsClientFeed` had the identical hole. `closedTakesNoMore`
+// is that case, and it is the one function here that must **return** rather than trap.
+import { tlsServerInit, tlsServerFeed, tlsServerClose, tlsPhase, phaseFailed }
+  from "../../src/server.wac";
+
+u8[] bytes(i32 n) {
+  u8[] b = u8[n]();
+  for (i32 i = 0; i < n; i++) { b[i] = (i * 11 + 3) & 0xFF; }
+  return b;
+}
+
+/** A fresh server, with a certificate that is never parsed because nothing gets that far. */
+u8[] fresh() { return tlsServerInit(bytes(64), bytes(32), bytes(32), bytes(32)); }
+
+/**
+ * `[stateLen][state]…` — the state is the first field of what these functions answer.
+ *
+ * The length is **big-endian**, because `Writer.u32` is TLS's byte order and this is TLS's writer. Reading
+ * it little-endian asks for a 130-megabyte array and gets `requested new array is too large`, which is how
+ * the first version of this fixture failed.
+ */
+u8[] stateOf(u8[] answer) {
+  i32 n = (answer[0] << 24) | (answer[1] << 16) | (answer[2] << 8) | answer[3];
+  u8[] out = u8[n]();
+  out.copyFrom(answer, 4, 0, n);
+  return out;
+}
+
+// ── The framing, which is somebody else's bytes ───────────────────────────────
+
+/** Fewer than five bytes cannot be a record header. */
+export i32 shortHeader() { tlsServerFeed(fresh(), u8[](22, 3, 3, 0)); return 0; }
+
+/** A length reaching past the end of what the caller handed over. */
+export i32 lengthPastEnd() { tlsServerFeed(fresh(), u8[](22, 3, 3, 0x10, 0x00, 1, 2, 3)); return 0; }
+
+/** Not a handshake record, before a handshake has started. */
+export i32 wrongTypeAtStart() { tlsServerFeed(fresh(), u8[](23, 3, 3, 0, 1, 9)); return 0; }
+
+/** A handshake record whose message length does not match the record's. */
+export i32 messageLengthMismatch() {
+  // A handshake header claiming 16 bytes of body inside a record carrying four.
+  tlsServerFeed(fresh(), u8[](22, 3, 3, 0, 4, 1, 0, 0, 16));
+  return 0;
+}
+
+/** A handshake message that is not a ClientHello. */
+export i32 notAClientHello() {
+  tlsServerFeed(fresh(), u8[](22, 3, 3, 0, 4, 20, 0, 0, 0));
+  return 0;
+}
+
+// ── The one that must not trap ────────────────────────────────────────────────
+
+/**
+ * A closed connection takes no more bytes and says so by returning.
+ *
+ * `tlsServerClose` from the start phase is the cheap route to `phaseFailed` — a `close_notify` arriving
+ * mid-connection is the same state and needs a whole handshake to reach. Before the fix this trapped, and
+ * a peer could drive it by sending an alert and one more record in a single flight.
+ */
+export i32 closedTakesNoMore() {
+  u8[] closed = stateOf(tlsServerClose(fresh()));
+  u8[] after = stateOf(tlsServerFeed(closed, u8[](22, 3, 3, 0, 1, 1)));
+  u8[] again = stateOf(tlsServerFeed(after, u8[](23, 3, 3, 0, 0)));
+  return tlsPhase(again) == phaseFailed() ? 1 : 0;
+}
+
+/**
+ * An ordinary refusal still works, so the fixture cannot pass by being broken.
+ *
+ * Every trap case above would "pass" if the module trapped on load. This one has to return.
+ */
+export i32 ordinary() { return tlsPhase(fresh()); }
