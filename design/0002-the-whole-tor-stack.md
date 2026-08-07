@@ -388,7 +388,15 @@ so each row says which: *pinned* means pure functions checked against C tor's ow
 | — RSA key generation | **pinned.** `packages/crypto/src/rsagen.wac`, and OpenSSL accepts the keys |
 
 Known holes that are not steps: a relay extending to *its own* port still fails in the uninstrumented
-VERSIONS exchange; `certsCount` and `certsCell` have still never been shown each other's output.
+VERSIONS exchange.
+
+**`certsCount` and `certsCell` have been introduced** (2026-08-07). They agree, and five planted
+faults across the pair are caught. Both ends were already live against C tor separately — the parser
+reads the CERTS cells tor relays send, and tor accepts the ones the builder writes when it bootstraps
+through our relay — so what was untested was that *ours* agree with *each other*. That is the only
+pair that matters on a network with no C tor in it, which is the network every onion-service run
+uses. The existing test read the cell back with a parser defined in the test file; the production
+reader had never seen the production writer's output.
 
 **Flow control was on this list and is not any more** (agent-a, 2026-08-06, from
 [#45](https://github.com/voltrevo/wac-mono/issues/45)). It said `SENDME` had never run under a
