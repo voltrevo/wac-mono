@@ -390,3 +390,34 @@ Deno.test("a wait captures even when the node had already said it", async () => 
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test("a node after a run starts after it, not at the beginning", async () => {
+  // Stages. A server that cannot begin until something has happened on the network — an onion service
+  // needs a consensus to bootstrap through — has to start late, and the plan says so by position.
+  //
+  // `wc` writes nothing the launcher watches, so the ordering is read off the launcher's own log:
+  // "started late" must appear after "running first", and "started early" before it.
+  const { dir, launcher } = await fixture();
+  try {
+    await Deno.writeTextFile(
+      `${dir}/net.txt`,
+      [
+        "node early | waiter: running | waiter.worker.js",
+        "run  first |                 | wc.worker.js counted.txt",
+        "node late  | waiter: running | waiter.worker.js",
+        "run  second|                 | wc.worker.js counted.txt",
+        "",
+      ].join("\n"),
+    );
+    const r = run(launcher, dir, "net.txt");
+
+    assertEquals(r.code, 0, r.err);
+    const startedEarly = r.err.indexOf("started early");
+    const ranFirst = r.err.indexOf("running first");
+    const startedLate = r.err.indexOf("started late");
+    assertEquals(startedEarly >= 0 && startedEarly < ranFirst, true, "early started before the run");
+    assertEquals(startedLate > ranFirst, true, "late started after it — this is the whole feature");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
