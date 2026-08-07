@@ -1,0 +1,134 @@
+// `wire.wac`'s bounds checks, one call at a time, because a trap ends the module.
+//
+// The file's own header says what it is for:
+//
+//   > Almost every parsing bug in a TLS implementation is a length prefix trusted without checking it
+//   > against the bytes actually present, so the reader here bounds-checks every read against the
+//   > enclosing slice and traps rather than returning a short value.
+//
+// Mutation testing disagreed. `u8`'s end check, `take`'s two, and all three of the writer's length limits
+// survived — the claim was true of the code and unverified by anything, which is the same position the
+// reader was warned about being in.
+//
+// **The length-prefix cases are the ones the header is really about.** `vec8`/`vec16`/`vec24` read a
+// prefix from the same bytes they then take, so a prefix larger than what remains is the exact attack: a
+// peer says "300 bytes follow" and sends nine. Without the check in `take`, the read runs off the end of
+// the enclosing slice into whatever the record buffer holds next.
+import { Reader, Writer } from "../../src/wire.wac";
+
+u8[] bytes(i32 n) {
+  u8[] b = u8[n]();
+  for (i32 i = 0; i < n; i++) { b[i] = (i * 13 + 5) & 0xFF; }
+  return b;
+}
+
+// ── Reading past the end ──────────────────────────────────────────────────────
+
+export i32 u8PastEnd() {
+  Reader r = Reader.create(bytes(2));
+  r.u8(); r.u8();
+  r.u8();                       // the third byte of a two-byte buffer
+  return 0;
+}
+
+export i32 u16PastEnd() {
+  Reader r = Reader.create(bytes(1));
+  r.u16();
+  return 0;
+}
+
+export i32 takePastEnd() {
+  Reader r = Reader.create(bytes(4));
+  r.take(5);
+  return 0;
+}
+
+export i32 takeNegative() {
+  Reader r = Reader.create(bytes(4));
+  r.take(-1);
+  return 0;
+}
+
+export i32 slicePastEnd() {
+  Reader r = Reader.create(bytes(4));
+  r.slice(5);
+  return 0;
+}
+
+export i32 sliceNegative() {
+  Reader r = Reader.create(bytes(4));
+  r.slice(-1);
+  return 0;
+}
+
+/** A sub-reader must not see past its own end, even though the buffer under it goes further. */
+export i32 sliceIsBounded() {
+  Reader r = Reader.create(bytes(10));
+  Reader inner = r.slice(2);
+  inner.u8(); inner.u8();
+  inner.u8();                   // there are eight more bytes in `buf`, and none of them are its business
+  return 0;
+}
+
+// ── A length prefix larger than what follows ──────────────────────────────────
+
+export i32 vec8Overruns() {
+  // `0x09` then three bytes: the prefix promises nine.
+  Reader r = Reader.create(u8[](0x09, 1, 2, 3));
+  r.vec8();
+  return 0;
+}
+
+export i32 vec16Overruns() {
+  Reader r = Reader.create(u8[](0x01, 0x2C, 1, 2, 3));   // 300 promised, three present
+  r.vec16();
+  return 0;
+}
+
+export i32 vec24Overruns() {
+  Reader r = Reader.create(u8[](0x00, 0x01, 0x00, 1, 2));   // 256 promised, two present
+  r.vec24();
+  return 0;
+}
+
+// ── The writer's limits ───────────────────────────────────────────────────────
+
+export i32 writeVec8TooLong() {
+  Writer w = Writer.create();
+  w.vec8(bytes(256));
+  return 0;
+}
+
+export i32 writeVec16TooLong() {
+  Writer w = Writer.create();
+  w.vec16(bytes(65536));
+  return 0;
+}
+
+/**
+ * A `vec24` that does not fit its own prefix.
+ *
+ * 16,777,216 bytes is a 16 MB allocation to prove a bound, which is the honest cost of testing this one:
+ * the limit is what it is, and a fixture that tested a smaller number would be testing nothing.
+ */
+export i32 writeVec24TooLong() {
+  Writer w = Writer.create();
+  w.vec24(bytes(16777216));
+  return 0;
+}
+
+/**
+ * An ordinary round trip, so the fixture cannot pass by being broken.
+ *
+ * Every case above would "pass" if the module trapped on load or these functions trapped for everything.
+ * This one has to return the length it wrote and read back: 3 + 1 + 2 + 3 = the vec8 payload's length.
+ */
+export i32 ordinary() {
+  Writer w = Writer.create();
+  w.vec8(bytes(3));
+  w.vec16(bytes(4));
+  Reader r = Reader.create(w.take());
+  i32 first = r.vec8().len();
+  i32 second = r.vec16().len();
+  return first * 10 + second;
+}
