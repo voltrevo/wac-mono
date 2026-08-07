@@ -1685,3 +1685,36 @@ With the caveat D13 also states, which belongs here more than there: **a closed-
 symmetric oracle**, and this document is a record of that trap being fallen into repeatedly. Every
 defect found this week came from C tor and none would have survived contact with a simulator that only
 ran our own code faster. Virtual time is for the transitions; C tor stays the oracle for the steps.
+
+### The auth key was the attacker's, and the test for it passed
+
+`parseIntroduce2` read the AUTH_KEY field out of the INTRODUCE2 cell and derived the MAC key from it.
+tor does not: `hs_circuit.c` sets `data.auth_pk` from the introduction point's **own** keypair, and
+`hs_cell.c` never compares the cell's field against it.
+
+The consequence is that the auth key contributed nothing to the check it is part of. A client names
+any key it likes, we derive the MAC key from that same wrong value, the MAC verifies, and the cell is
+accepted where tor would reject it — with the field that says *which introduction point this arrived
+through* saying whatever the sender preferred.
+
+**The test for exactly this passed the whole time, and passed for the wrong reason.** It read:
+
+    t.isTrue(!parseIntroduce2(flipAt(cell, 25), secret, subcred).ok, "a changed auth key is refused");
+
+Flipping a byte *tampers* the cell, and the MAC covers the field, so it fails whether the derivation
+key came from the cell or from us. Tampering and a self-consistent forgery are different attacks and
+only the first was ever tried. The case that separates them needs no construction at all — tor's own
+cell, unmodified, offered at an introduction point whose auth key is a different one — and it is the
+kind of case that only gets written once the parameter exists to express it.
+
+That is the same shape as three other findings this week and worth naming as a class: **a test can
+exercise the right line for the wrong reason.** The padding boundary, the one-entry store, the
+one-sided consensus and now this were all covered by an assertion that could not have failed the way
+the code was wrong.
+
+**What was deliberately not done.** The cell's field is not compared against ours. tor does not
+compare it, so a client that MACs with the right key and writes anything in the field is a cell tor
+accepts — and refusing it here would be *stricter than the network*, which this document has already
+recorded twice as its own failure mode. There is nothing to gain either: a correct MAC means the
+sender holds the descriptor, which is every legitimate client. The security property is not the
+comparison. It is that the key feeding the derivation is ours.

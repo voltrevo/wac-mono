@@ -47,6 +47,9 @@ encrypted private keys.
 **`tls` — TLS 1.3**, interoperating with OpenSSL and rustls. **`tor`** is a Tor client on top
 of it, with a SOCKS5 proxy, and by now the other side too: a relay, a directory authority, and
 a launcher that stands a whole network up with no C tor in it. It reaches onion services.
+**It should not be pointed at the real Tor network** — it is unaudited, nothing under it is
+constant-time, and `packages/tor/README.md` enumerates the anonymity properties it does not
+have yet.
 **`crypto`** is what they stand on: SHA-2, SHA-3, keccak256, HMAC, HKDF, AES-GCM,
 ChaCha20-Poly1305, X25519, Ed25519, P-256, P-384, RSA verification, ML-KEM-768 — all in wac,
 all against published vectors.
