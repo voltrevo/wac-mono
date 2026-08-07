@@ -12,8 +12,12 @@ what is here now is most of a small Tor network and the tools to stand one up:
 | **relay** — certificates, the responder link handshake, CREATE2/EXTEND2, being a hop | `src/relaycert.wac`, `src/relaylink.wac`, `src/relaycircuit.wac`, `src/relayd.wac` | live: a C tor bootstraps through it and carries bytes |
 | **directory authority** — votes, consensus generation, the HTTP port | `src/vote.wac`, `src/consensusgen.wac`, `src/dird.wac` | live: a C tor bootstraps from it |
 | **onion-service client** — addresses, blinding, the HSDir ring, descriptors, hs-ntor | `src/onionaddr.wac` … `src/hsntor.wac`, `src/hsconnect.wac` | live against a real service |
-| **onion-service hosting** | `src/hsservice.wac` | **partial** — see *Hosting one* |
+| **onion-service hosting** | `src/hsservice.wac`, `src/hsserviced.wac`, `src/introrelay.wac`, `src/rendrelay.wac` | our client fetches a page from it; no C tor has — [`INTEROP.md`](INTEROP.md) |
 | **a whole test network** | `src/network.wac` | wac all the way down: authorities, relays and the run, from a description |
+
+[`INTEROP.md`](INTEROP.md) is the same claim laid out by component **and direction**, with *pinned*,
+*live* and *ours only* kept apart — it is where a regression shows, and where to look before believing
+a row above.
 
 Every row is checked against C tor rather than against another part of this package — parsers, cell
 formats and key material pinned by tor's own code, and the live ones witnessed by a C tor doing the
