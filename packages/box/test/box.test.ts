@@ -686,6 +686,73 @@ Deno.test("box's applets compose in a pipeline", async () => {
   }
 });
 
+Deno.test("the applets that read several files read all of them", async () => {
+  // Every other test here passes **one** file, which is how `box cat a b` came to print `a` and exit 0
+  // without mentioning `b` — for ten applets at once (wac-mono 0096). One operand is the shape a test
+  // author reaches for and the shape a person never types.
+  const dir = await Deno.makeTempDir({ prefix: "wac-box-multi-" });
+  try {
+    const a1 = `${dir}/a.txt`, a2 = `${dir}/b.txt`;
+    await Deno.writeTextFile(a1, "alpha\nbeta\n");
+    await Deno.writeTextFile(a2, "gamma\ndelta\n");
+    const runner = await appRunner(BOX, { read: true });
+    const sys = (cmd: string, args: string[]) => {
+      const r = new Deno.Command(cmd, { args, stdout: "piped", stderr: "null" }).outputSync();
+      return new TextDecoder().decode(r.stdout);
+    };
+
+    for (const [applet, cmd, flags] of [
+      ["cat", "cat", []],
+      ["nl", "nl", []],
+      ["rev", "rev", []],
+      ["fold", "fold", ["-w4"]],
+      // `-f` with a delimiter, because box's `cut` is field-based only — `-c` prints a usage and
+      // exits 2, which is its own gap and not this test's subject.
+      ["cut", "cut", ["-f1", "-d", " "]],
+    ] as [string, string, string[]][]) {
+      const got = await runner.run([applet, ...flags, a1, a2]);
+      assertEquals(got.out, sys(cmd, [...flags, a1, a2]), `${applet} over two files`);
+      // And one file still behaves, which is what a conversion breaks if it breaks anything.
+      assertEquals((await runner.run([applet, ...flags, a1])).out, sys(cmd, [...flags, a1]),
+        `${applet} over one file`);
+    }
+
+    // A file that cannot be opened ends the run **and the exit code says so**. `Line.ok` false means "no
+    // more lines" and cannot distinguish "that file would not open", so the first version of this printed
+    // the first file and exited 0 with the error on stderr — the bug the whole issue is about, one level
+    // up, in the fix for it.
+    const missing = await runner.run(["nl", a1, `${dir}/nope.txt`]);
+    assertEquals(missing.code, 1, `a missing operand should fail, got ${missing.code}`);
+    assertEquals(missing.err.includes("nope.txt"), true, missing.err);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("a count that cannot make progress is refused, not looped on", async () => {
+  // `fold -w0` emitted an empty line for ever: `end = start + 0` leaves `start` where it was. Through a
+  // pipe that is an out-of-memory kill rather than a hang, which is how it was found — by hand, since
+  // nothing in the suite passes a zero. GNU refuses it and so does this now.
+  const dir = await Deno.makeTempDir({ prefix: "wac-box-zero-" });
+  try {
+    const file = `${dir}/a.txt`;
+    await Deno.writeTextFile(file, "alpha\nbeta\n");
+    const runner = await appRunner(BOX, { read: true, write: true });
+    for (const [args, what] of [
+      [["fold", "-w0", file], "fold's width"],
+      [["split", "-0", file, `${dir}/part-`], "split's line count"],
+    ] as [string[], string][]) {
+      const got = await runner.run(args);
+      assertEquals(got.code, 1, `${what}: expected a refusal, got exit ${got.code}`);
+      assertEquals(got.err.includes("invalid number"), true, `${what}: ${got.err}`);
+    }
+    // And the ordinary case still works, or the refusal above is just a broken applet.
+    assertEquals((await runner.run(["fold", "-w4", file])).out, "alph\na\nbeta\n", "fold -w4");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test("box's text applets agree with the system tools they imitate", async () => {
   // The second differential batch: `cut`, `tr`, `fold` and `strings`. Everything is checked
   // against the real tool rather than against my idea of it, as the first batch is.

@@ -65,3 +65,21 @@ end. That difference is deliberate for now and worth revisiting with the rest �
 `Line.ok` false cannot distinguish "no more lines" from "that file would not open", so `Reader` carries a
 `broken` flag and every converted applet checks it. Without that the first version printed the earlier
 files and exited 0, which is the failure this whole issue is about, one level up.
+
+
+## A second family, found the same way — agent-a, 2026-08-07
+
+Using the program by hand again, this time with arguments a person mistypes rather than files:
+
+- **`fold -w0` never finishes.** `end = start + 0` leaves `start` where it was, so the inner loop emits an
+  empty line for ever; through a pipe that is an out-of-memory kill rather than a hang. GNU says
+  `fold: invalid number of columns: '0'`. Fixed, in those words.
+- **`split -0` exited 0 having done nothing.** GNU refuses it. Fixed.
+- `fold -w-1` folds nothing and exits 0 where GNU refuses — the argument parser does not see `-w-1` as a
+  negative number, which is a parsing question rather than this one, and is **not** fixed.
+- `tac` on a file with no trailing newline adds one; GNU does not. Not fixed.
+- `cut -c` is not implemented at all — it prints a usage and exits 2, which is the right shape for a gap.
+
+Both fixed cases are now in `test/box.test.ts`, along with multi-file cases for `cat`, `nl`, `rev`, `fold`
+and `cut`. **Nothing in the suite passed a zero or a second file before this**, which is why a loop that
+never terminates lived in a program with 33 passing tests.

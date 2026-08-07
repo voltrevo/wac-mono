@@ -16,6 +16,13 @@ export i32 split(Core core, Cli cli, Args a) {
     return 2;
   }
   i32 per = a.hasNum ? a.num : 1000;
+  // Zero lines a piece is not a small piece, it is no piece: the counter never reaches the limit and every
+  // line lands in the first file, or — depending where the check goes — a new file is opened per line
+  // for ever. `split -0` used to exit 0 having done nothing at all, which is the worst of the three.
+  if (per <= 0) {
+    core.warn(a.name + ": invalid number of lines: '" + itoa(per) + "'");
+    return 1;
+  }
   string prefix = a.rest.len() > 1 ? a.rest[1] : "x";
 
   Input in = openStream(core, cli, a, 0);
