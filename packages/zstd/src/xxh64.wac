@@ -108,6 +108,109 @@ export u64 xxh64(u8[] d, i32 start, i32 len) {
 }
 
 /**
+ * XXH64 over input that arrives a piece at a time.
+ *
+ * The same hash as `xxh64` above and checked against it — a streaming frame decoder cannot hold the
+ * content it is checksumming, which is the whole point of streaming, so the checksum has to be able to
+ * arrive in pieces too (wac-mono 0088).
+ *
+ * The only state that has to survive a call is the four lanes, the byte count, and up to 31 bytes that
+ * did not fill a stripe. That last part is the whole of the bookkeeping: XXH64 consumes 32 bytes at a
+ * time and the tail is handled differently, so a naive streaming version that hashed each piece
+ * separately would agree with the one-shot only when every piece was a multiple of 32.
+ */
+export struct Xxh64 {
+  u64 a1; u64 a2; u64 a3; u64 a4;
+  /** Bytes that did not fill a stripe, kept until the next call brings enough. */
+  u8[] held;
+  i32 heldLen;
+  /** Every byte seen, which the final avalanche needs. */
+  i64 total;
+  /** Whether 32 bytes have ever been consumed — below that, XXH64 starts from a different seed. */
+  bool striped;
+
+  Xxh64 create() {
+    return Xxh64(prime1() + prime2(), prime2(), 0, 0 - prime1(), u8[32](), 0, 0, false);
+  }
+
+  void update(this, u8[] d, i32 start, i32 len) {
+    if (start < 0 || len < 0 || start + len > d.len()) { trap; }
+    this.total += len as i64;
+    i32 at = start;
+    i32 end = start + len;
+
+    // Top up the held bytes first, so the loop below is whole stripes only.
+    if (this.heldLen > 0) {
+      i32 want = 32 - this.heldLen;
+      i32 take = end - at < want ? end - at : want;
+      for (i32 i = 0; i < take; i++) { this.held[this.heldLen + i] = d[at + i]; }
+      this.heldLen = this.heldLen + take;
+      at = at + take;
+      if (this.heldLen < 32) { return; }
+      this.stripe(this.held, 0);
+      this.heldLen = 0;
+    }
+
+    while (end - at >= 32) {
+      this.stripe(d, at);
+      at += 32;
+    }
+
+    i32 rest = end - at;
+    for (i32 i = 0; i < rest; i++) { this.held[i] = d[at + i]; }
+    this.heldLen = rest;
+  }
+
+  void stripe(this, u8[] d, i32 at) {
+    this.a1 = round(this.a1, read64(d, at));
+    this.a2 = round(this.a2, read64(d, at + 8));
+    this.a3 = round(this.a3, read64(d, at + 16));
+    this.a4 = round(this.a4, read64(d, at + 24));
+    this.striped = true;
+  }
+
+  /** The digest. The state is spent afterwards and must not be updated again. */
+  u64 finish(this) {
+    u64 acc = 0;
+    if (this.striped) {
+      acc = rotl(this.a1, 1) + rotl(this.a2, 7) + rotl(this.a3, 12) + rotl(this.a4, 18);
+      acc = mergeRound(acc, this.a1);
+      acc = mergeRound(acc, this.a2);
+      acc = mergeRound(acc, this.a3);
+      acc = mergeRound(acc, this.a4);
+    } else {
+      acc = prime5();
+    }
+    acc += this.total as@ u64;
+
+    i32 at = 0;
+    i32 end = this.heldLen;
+    while (end - at >= 8) {
+      acc = acc ^ round(0, read64(this.held, at));
+      acc = rotl(acc, 27) * prime1() + prime4();
+      at += 8;
+    }
+    if (end - at >= 4) {
+      acc = acc ^ (read32(this.held, at) * prime1());
+      acc = rotl(acc, 23) * prime2() + prime3();
+      at += 4;
+    }
+    while (at < end) {
+      acc = acc ^ ((this.held[at] as! u64) * prime5());
+      acc = rotl(acc, 11) * prime1();
+      at++;
+    }
+
+    acc = acc ^ (acc >> 33);
+    acc = acc * prime2();
+    acc = acc ^ (acc >> 29);
+    acc = acc * prime3();
+    acc = acc ^ (acc >> 32);
+    return acc;
+  }
+}
+
+/**
  * The low 32 bits, which is all a frame stores.
  *
  * `as@` and not `as~`: the raw cast keeps the low bits, where the nearest cast would clamp a
