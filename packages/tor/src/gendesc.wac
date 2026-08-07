@@ -45,6 +45,17 @@ u8[] ntorSecret() {
   return s;
 }
 
+/** One document, on its own, as it goes over the wire. */
+bool writeWire(Core core, Cli cli, string path, u8[] doc, string what) {
+  Change c = cli.writeFile(path, doc).wait();
+  if (!c.ok()) {
+    core.warn("gendesc: " + path + ": " + c.message);
+    return false;
+  }
+  core.log("gendesc: wrote the " + what + " to " + path);
+  return true;
+}
+
 export i32 main(Core core, Cli cli) {
   if (cli.argCount().wait() < 1) {
     core.warn("usage: gendesc <out-path>");
@@ -72,15 +83,30 @@ export i32 main(Core core, Cli cli) {
   // window is in the past is correctly refused by any client, so the committed fixture cannot also be
   // the thing a real tor bootstraps from. The window widens with it for the same reason — the default
   // 20/40/60 seconds mirrors chutney's voting interval and is far too short to bootstrap against.
+  //
+  // `-` means *read the clock*, which is what a description file needs: a launcher's plan is written
+  // once and run whenever, and a timestamp baked into it is a document that expires. The caller could
+  // compute the seconds and pass them, and by hand that is what happens — but nothing in a static
+  // description can, so the program that needs the time asks for it.
   i64 published = 1785931200;
   bool live = cli.argCount().wait() >= 5;
   if (live) {
-    i64 given = atoi64(cli.arg(4).wait());
-    if (given <= 0) {
-      core.warn("gendesc: the fifth argument must be a unix time in seconds");
-      return 1;
+    string when = string.fromBytes(cli.arg(4).wait());
+    if (when == "-") {
+      // A window back, not now. `valid-after` is `published + window` — a consensus is published
+      // before the period it covers — so `-` meaning literally *now* produces documents that become
+      // valid in an hour, which is not what anybody asking for "now" wants. This was wrong when `-`
+      // was added and no test could see it: nothing that read a consensus checked its validity
+      // window, so the whole network came up around a document that was not yet in force.
+      published = core.nowMillis().wait() / 1000 - 3600;
+    } else {
+      i64 given = atoi64(cli.arg(4).wait());
+      if (given <= 0) {
+        core.warn("gendesc: the fifth argument must be a unix time in seconds, or `-` for now");
+        return 1;
+      }
+      published = given;
     }
-    published = given;
   }
   i64 window = live ? 3600 : 20;
   RelayInfo info = RelayInfo("wacrelay", "127.0.0.1", 9001, 0, published,
@@ -130,6 +156,9 @@ export i32 main(Core core, Cli cli) {
       return 1;
     }
     core.log("gendesc: wrote a " + itoa(cert.len()) + "-byte authority certificate to " + certOut);
+    // The certificate on its own, for the same reason as the consensus below: `relayd -K` and `dird`
+    // want the document, not a vector with the document inside it.
+    if (!writeWire(core, cli, certOut + ".cert", cert, "authority certificate")) { return 1; }
 
     // And a vote, when a third path is given. The relay it votes about is the one whose descriptor
     // this run produced, so the whole set is consistent and reproducible from the same seeds.
@@ -229,6 +258,23 @@ export i32 main(Core core, Cli cli) {
         }
         core.log("gendesc: wrote a " + itoa(cons.len()) + "-byte consensus and a " +
                  itoa(micro.len()) + "-byte microdesc one to " + consOut);
+
+        // And the documents themselves, on their own, in the form they go over the wire.
+        //
+        // Everything above is a *vector* file: the document wrapped in JSON next to the keys that
+        // signed it, which is what the differential tests want. Nothing consumed them as documents,
+        // so every caller that needed one — `dird`, `relayd -C`, the by-hand recipe — extracted it
+        // with a script first. `dird` has documented this convention for as long as it has existed
+        // ("`<consensus>.micro` and `<consensus>.mds` are what `gendesc` writes") and gendesc has
+        // never written them. It does now, and the names are the ones dird was already looking for.
+        //
+        // A description file for `network.wac` can only name wac programs, so this is what makes an
+        // authority something a launcher can run rather than a step a human does in between.
+        if (!writeWire(core, cli, consOut + ".consensus", cons, "consensus")) { return 1; }
+        if (!writeWire(core, cli, consOut + ".consensus.micro", micro, "microdesc consensus")) {
+          return 1;
+        }
+        if (!writeWire(core, cli, consOut + ".consensus.mds", mds, "microdescriptors")) { return 1; }
       }
     }
   }

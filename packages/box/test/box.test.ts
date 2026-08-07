@@ -424,7 +424,14 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
 
     assertEquals((await box(["head", "-3", fixture])).out, sys("head", ["-3", fixture]), "head -N");
     assertEquals((await box(["tail", "-n", "2", fixture])).out, sys("tail", ["-n", "2", fixture]), "tail -n N");
-    assertEquals((await box(["wc", "-l", fixture])).out.trim(), sys("wc", ["-l", fixture]).trim().split(/\s+/)[0]);
+    // The whole line, not just the first field. Taking `[0]` was how `wc -l file` came to drop the
+    // filename: the assertion threw away the difference, and the applet's comment claimed the real one
+    // does the same. It does not — only reading standard input has no name to print.
+    assertEquals(
+      (await box(["wc", "-l", fixture])).out.trim().replace(/\s+/g, " "),
+      sys("wc", ["-l", fixture]).trim().replace(/\s+/g, " "),
+      "wc -l over a file",
+    );
     assertEquals(
       (await box(["sha512sum", fixture])).out.split(" ")[0],
       sys("sha512sum", [fixture]).split(" ")[0],
@@ -451,6 +458,13 @@ Deno.test("box's applets agree with the system tools they imitate", async () => 
     assertEquals((await box(["true"])).code, 0);
     assertEquals((await box(["false"])).code, 1);
     assertEquals((await box(["nope"])).code, 2, "an unknown applet is a usage error");
+    // Asked for is not got wrong. Reaching the usage message by mistake is 2; asking for it is 0, which
+    // is what every tool this package imitates does and what a script testing `box --help` expects.
+    for (const how of ["help", "--help", "-h"]) {
+      const asked = await box([how]);
+      assertEquals(asked.code, 0, `box ${how} should succeed, got ${asked.code}`);
+      assertEquals(asked.err.includes("usage: box"), true, `box ${how} should print the usage`);
+    }
 
     // The first applets that recurse, against the real tools over a nested tree.
     //
@@ -683,6 +697,121 @@ Deno.test("box's applets compose in a pipeline", async () => {
     assertEquals(await run(["tac"], sorted), "c\nb\na\n");
   } finally {
     await Deno.remove(built);
+  }
+});
+
+Deno.test("the applets that read several files read all of them", async () => {
+  // Every other test here passes **one** file, which is how `box cat a b` came to print `a` and exit 0
+  // without mentioning `b` — for ten applets at once (wac-mono 0096). One operand is the shape a test
+  // author reaches for and the shape a person never types.
+  const dir = await Deno.makeTempDir({ prefix: "wac-box-multi-" });
+  try {
+    const a1 = `${dir}/a.txt`, a2 = `${dir}/b.txt`;
+    await Deno.writeTextFile(a1, "alpha\nbeta\ngamma\n");
+    await Deno.writeTextFile(a2, "delta\nepsilon\n");
+    const runner = await appRunner(BOX, { read: true });
+    const sys = (cmd: string, args: string[]) => {
+      const r = new Deno.Command(cmd, { args, stdout: "piped", stderr: "null" }).outputSync();
+      return new TextDecoder().decode(r.stdout);
+    };
+
+    for (const [applet, cmd, flags] of [
+      ["cat", "cat", []],
+      ["nl", "nl", []],
+      ["rev", "rev", []],
+      ["fold", "fold", ["-w4"]],
+      // `-f` with a delimiter, because box's `cut` is field-based only — `-c` prints a usage and
+      // exits 2, which is its own gap and not this test's subject.
+      ["cut", "cut", ["-f1", "-d", " "]],
+      ["sort", "sort", []],
+      // `tac` reverses **each file**, in the order named — not the concatenation. The two differ only
+      // when a file's lines are not a palindrome, which the fixture above is, so these lines are not.
+      ["tac", "tac", []],
+      ["strings", "strings", []],
+      ["sha256sum", "sha256sum", []],
+      ["sha512sum", "sha512sum", []],
+      // `grep` puts the filename in front of every line once there is more than one file — that prefix is
+      // what makes `grep pattern *.c` usable, and `-c` counts per file rather than in total.
+      ["grep", "grep", ["alpha"]],
+      ["grep", "grep", ["-n", "a"]],
+      ["grep", "grep", ["-c", "a"]],
+      // `head` and `tail` put a `==> name <==` banner over each file and a blank line between them.
+      ["head", "head", ["-2"]],
+      ["tail", "tail", ["-n2"]],
+    ] as [string, string, string[]][]) {
+      const got = await runner.run([applet, ...flags, a1, a2]);
+      assertEquals(got.out, sys(cmd, [...flags, a1, a2]), `${applet} over two files`);
+      // And one file still behaves, which is what a conversion breaks if it breaks anything.
+      assertEquals((await runner.run([applet, ...flags, a1])).out, sys(cmd, [...flags, a1]),
+        `${applet} over one file`);
+    }
+
+    // A file that cannot be opened ends the run **and the exit code says so**. `Line.ok` false means "no
+    // more lines" and cannot distinguish "that file would not open", so the first version of this printed
+    // the first file and exited 0 with the error on stderr — the bug the whole issue is about, one level
+    // up, in the fix for it.
+    // And the ones the real tools give a *single* operand must not have grown a second one: `base64`,
+    // `base32`, `shuf` and `tr` all answer "extra operand" in GNU, so multi-file support for them would be
+    // an incompatibility invented here. I converted all four before checking, and the comparison is what
+    // said so — see 0096.
+    for (const [applet, cmd] of [["base64", "base64"], ["base32", "base32"], ["shuf", "shuf"]]) {
+      const got = await runner.run([applet, a1, a2]);
+      const real = new Deno.Command(cmd, { args: [a1, a2], stdout: "null", stderr: "null" }).outputSync();
+      assertEquals(got.code !== 0, real.code !== 0, `${applet} should refuse two operands as ${cmd} does`);
+    }
+
+    // `wc` is its own shape: a line per file, a `total` when there is more than one, and the filename on
+    // every line. It used to print the first file's counts and nothing else — and with `-l`, `-w` or `-c`
+    // it dropped the filename too, on a comment claiming that is what the real one does. It is not: the
+    // label goes with the file, and only reading standard input drops it.
+    const norm = (t: string) => t.split("\n").map((l) => l.trim().replace(/\s+/g, " ")).join("\n");
+    for (const flags of [[], ["-l"], ["-w"], ["-c"]]) {
+      for (const files of [[a1], [a1, a2]]) {
+        const got = await runner.run(["wc", ...flags, ...files]);
+        const real = new Deno.Command("wc", { args: [...flags, ...files], stdout: "piped", stderr: "null" })
+          .outputSync();
+        assertEquals(norm(got.out), norm(new TextDecoder().decode(real.stdout)),
+          `wc ${flags.join(" ")} over ${files.length} file(s)`);
+      }
+    }
+
+    // `crc32` has no counterpart on this machine — `cksum` is a different checksum — so the oracle is the
+    // shape rather than a second implementation: two files must give exactly what the two single-file
+    // runs give. That catches the bug this issue is about without inventing an expected digest.
+    const both = await runner.run(["crc32", a1, a2]);
+    const one = await runner.run(["crc32", a1]);
+    const two = await runner.run(["crc32", a2]);
+    assertEquals(both.out, one.out + two.out, "crc32 over two files");
+
+    const missing = await runner.run(["nl", a1, `${dir}/nope.txt`]);
+    assertEquals(missing.code, 1, `a missing operand should fail, got ${missing.code}`);
+    assertEquals(missing.err.includes("nope.txt"), true, missing.err);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("a count that cannot make progress is refused, not looped on", async () => {
+  // `fold -w0` emitted an empty line for ever: `end = start + 0` leaves `start` where it was. Through a
+  // pipe that is an out-of-memory kill rather than a hang, which is how it was found — by hand, since
+  // nothing in the suite passes a zero. GNU refuses it and so does this now.
+  const dir = await Deno.makeTempDir({ prefix: "wac-box-zero-" });
+  try {
+    const file = `${dir}/a.txt`;
+    await Deno.writeTextFile(file, "alpha\nbeta\n");
+    const runner = await appRunner(BOX, { read: true, write: true });
+    for (const [args, what] of [
+      [["fold", "-w0", file], "fold's width"],
+      [["split", "-0", file, `${dir}/part-`], "split's line count"],
+    ] as [string[], string][]) {
+      const got = await runner.run(args);
+      assertEquals(got.code, 1, `${what}: expected a refusal, got exit ${got.code}`);
+      assertEquals(got.err.includes("invalid number"), true, `${what}: ${got.err}`);
+    }
+    // And the ordinary case still works, or the refusal above is just a broken applet.
+    assertEquals((await runner.run(["fold", "-w4", file])).out, "alph\na\nbeta\n", "fold -w4");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
   }
 });
 
@@ -1914,9 +2043,22 @@ Deno.test("the README states the applet count the dispatcher actually has", asyn
   // forty-two in a paragraph further down, both written by someone who had just counted.
   const dispatch = await Deno.readTextFile("packages/box/src/box.wac");
   const readme = await Deno.readTextFile("packages/box/README.md");
-  const actual = [...dispatch.matchAll(/if \(applet == "[a-z0-9-]+"/g)].length;
+  const dispatched = [...dispatch.matchAll(/if \(applet == "([a-z0-9-]+)"/g)].map((m) => m[1]).sort();
+  const actual = dispatched.length;
   const claimed = Number(readme.match(/^(\d+) applets/m)?.[1] ?? 0);
   assertEquals(claimed, actual, `the README says ${claimed} applets, box.wac dispatches ${actual}`);
+
+  // And the list the usage message prints must be the same list. It was not: `help` was dispatched and
+  // unlisted, so `box help` worked and the only way to find out was to read the dispatcher. Three counts
+  // were reachable — 57 files in `src/applets/`, 59 names in the usage, 60 branches here — and the test
+  // above only tied two of them together.
+  const listed = (dispatch.match(/string\[\] appletNames\(\) \{[\s\S]*?\n\}/)?.[0] ?? "")
+    .match(/"[a-z0-9-]+"/g)?.map((q) => q.slice(1, -1)).sort() ?? [];
+  assertEquals(
+    listed.join(" "),
+    dispatched.join(" "),
+    "the usage message and the dispatcher disagree about which applets exist",
+  );
   // And the aside in the `bin/` section, which drifted independently of the first line.
   assertEquals(
     readme.includes("with sixty entry points"),

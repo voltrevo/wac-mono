@@ -92,6 +92,30 @@ no private key derives the same keys the client does. tor-spec says abort; `ntor
 returns an empty array rather than keys plus a boolean, because a boolean invites using the
 keys anyway.
 
+## Reading C tor, and the line this package draws
+
+C tor is this package's oracle. The specs are incomplete and in places wrong — one tor comment
+misdescribes its own function's half-open range — so "what does tor actually do" frequently has no
+answer but the source, and design 0002's whole approach depends on being able to get one.
+
+**The rule: consult the C only to answer a specific behavioural question.** Write the question down,
+read until it is answered, write the answer down as a rule in prose, and implement from the prose.
+Never write wac with a C file open beside it. What comes back from a read is a sentence about
+behaviour — an ordering, a refusal, a boundary — not a shape to follow.
+
+The distinction is not pedantry. A rule extracted and then implemented is our own work; wac written
+alongside C is a transliteration, and tor is 3-clause BSD, which makes that a different thing in
+licence as well as in intent. Quoting a few lines to explain a rule is citation and is fine; there are
+six such lines in this repository, and they are marked as quotations where they appear.
+
+How much of what is already here was written that way has never been audited — [issue
+0097](../../issues/open/0097-how-much-of-packages-tor-is-ours-rather-than-a-transliteration.md) is
+that audit. Three spot checks say the structure genuinely diverges: our ntor is stateless pure
+functions against tor's `ntor_handshake_state_t` and precomputed tweak set; our consensus verifier
+scans document text where tor walks a parsed `networkstatus_t` with five tally lists; our relay is one
+`waitAny` over a rebuilt id table where tor is libevent callbacks. Reassuring, and not a substitute
+for the audit.
+
 ## How it is tested
 
 Five tests are relations between the handshake's own outputs, and one is a differential
@@ -686,9 +710,32 @@ which on 2026-08-07 read:
 — the relays still on the ports the kernel gave them a minute earlier, never restarted. Nothing about
 that sequence needs a port anyone agreed in advance, so two agents can run it at once.
 
-**What remains is `network.wac` itself**, which still launches relays with fixed ports on a script of
-its own. Teaching it this sequence is what would put the network in the suite; the pieces it would
-need now exist.
+**And the launcher can now carry the ports.** A `run` argument may contain `{name}`, replaced by what
+that node printed after its ready marker — so a description ending relay1's marker at
+`listening on 127.0.0.1:` makes the port relay1 was given reach a later directive as `{relay1}`:
+
+    node relay1 | listening on 127.0.0.1: | relayd.worker.js s1 -p 0 --descriptor r1.desc -C v.consensus -K cert.cert -D r1.desc -D r2.desc
+    node relay2 | listening on 127.0.0.1: | relayd.worker.js s2 -p 0 --descriptor r2.desc -C v.consensus -K cert.cert -D r1.desc -D r2.desc
+    run  vote   |                         | gendesc.worker.js keys.json cert vote v - r1.desc r2.desc
+    run  fetch  |                         | torapp.worker.js … 127.0.0.1:{relay1} …
+
+An unknown name fails the run by name rather than being passed through as text, because a client that
+dialled a host called `{relya1}` would fail in a way that looked like the network.
+
+**And `gendesc` now writes the documents, not only vectors of them.** It always wrote JSON — the
+document wrapped up with the keys that signed it, which is what the differential tests want — and
+every caller that needed a *document* extracted it with a script first. `dird` has documented the
+convention since it was written (*"`<consensus>.micro` and `<consensus>.mds` are what `gendesc`
+writes"*) and gendesc never wrote them. It does now, under the names dird was already looking for:
+`<consensus-out>.consensus`, `.consensus.micro`, `.consensus.mds`, and `<cert-out>.cert`. A
+description file can only name wac programs, so this is what makes an authority a thing a launcher
+runs rather than a step a human does in between.
+
+The `now` argument takes `-`, meaning *read the clock*. A plan is written once and run whenever, so a
+timestamp baked into it is a document that expires.
+
+**What remains is the description itself** — which relays, which authority, and what the client is
+asked to fetch. Every mechanism it needs is in place; nothing here is waiting on a decision.
 
 ## What is not here
 

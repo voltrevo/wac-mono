@@ -6,22 +6,35 @@
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args } from "../lib/args.wac";
-import { Input, openStream } from "../lib/input.wac";
+import { Input, openStream, operandCount } from "../lib/input.wac";
 import { Feed, Line, Lines, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
 
 export i32 head(Core core, Cli cli, Args a) {
-  Input in = openStream(core, cli, a, 0);
-  if (!in.ok) { return 1; }
   // `hasNum`, not `num == 0`: `head -0` and `head -n 0` mean no lines, as GNU's do.
   i32 want = a.hasNum ? a.num : 10;
 
-  Lines s = Lines.create();
-  Feed fed = Feed.fromStdin(cli);
+  // A banner over each file, and a blank line between them, once there is more than one — which is what
+  // the real one does and the only way to tell whose lines you are looking at. It used to read the first
+  // operand and stop (wac-mono 0096).
+  i32 files = operandCount(a, 0);
+  i32 count = files == 0 ? 1 : files;
+  bool banner = files > 1;
+
   Sink out = Sink.create(cli);
-  for (i32 i = 0; i < want; i++) {
-    Line l = nextLine(s, fed);
-    if (!l.ok) { break; }
-    if (!emitTo(out, l.bytes, l.nl)) { return 0; }
+  for (i32 f = 0; f < count; f++) {
+    Input in = openStream(core, cli, a, f);
+    if (!in.ok) { return 1; }
+    if (banner) {
+      if (f > 0) { out.line(""); }
+      out.line("==> " + in.label + " <==");
+    }
+    Lines s = Lines.create();
+    Feed fed = Feed.fromStdin(cli);
+    for (i32 i = 0; i < want; i++) {
+      Line l = nextLine(s, fed);
+      if (!l.ok) { break; }
+      if (!emitTo(out, l.bytes, l.nl)) { out.flush(); return 0; }
+    }
   }
   out.flush();
   return 0;

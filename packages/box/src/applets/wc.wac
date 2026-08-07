@@ -1,45 +1,84 @@
-// Lines, words and bytes. `-l`, `-w` or `-c` alone prints just that number.
+// Lines, words and bytes, for each file named, with a total when there is more than one.
 //
-// Counted a chunk at a time. The only state that has to survive a chunk boundary is
-// `inWord`: a word split across two reads is one word, and forgetting that would count it
-// twice — which is the whole difficulty of turning a whole-input loop into a streaming one.
+// Counted a chunk at a time. The only state that has to survive a chunk boundary is `inWord`: a word
+// split across two reads is one word, and forgetting that would count it twice — which is the whole
+// difficulty of turning a whole-input loop into a streaming one.
+//
+// ## Two things this got wrong, both by believing a comment
+//
+// It read the first operand and ignored the rest, so `wc -l *.txt` over twelve files answered about one
+// and said nothing (wac-mono 0096). And where it did print, the line above the single-flag paths said
+// "one number and no label when exactly one of -l -w -c is asked for, **as the real one does**" — which
+// is not what the real one does:
+//
+//     $ wc -l a.txt          $ wc -l < a.txt
+//     3 a.txt                3
+//
+// The label goes with the *file*, not with the number of columns. Reading from standard input is what
+// drops it, because there is no name to print. The comment described `wc -l < f` and the code was written
+// to match the comment.
 
 import { Cli, Core } from "../../../platform/src/platform.wac";
 import { Args, has } from "../lib/args.wac";
-import { Chunk, Input, openStream, nextChunk } from "../lib/input.wac";
+import { Chunk, Input, openStream, nextChunk, operandCount } from "../lib/input.wac";
 import { itoa } from "../../../fmt/src/itoa.wac";
 
-export i32 wc(Core core, Cli cli, Args a) {
-  Input in = openStream(core, cli, a, 0);
-  if (!in.ok) { return 1; }
+/** One file's counts. */
+struct Counts { i32 lines; i32 words; i32 bytes; }
 
-  i32 lineCount = 0;
-  i32 words = 0;
-  i32 bytes = 0;
-  bool inWord = false;
-  while (true) {
-    Chunk got = nextChunk(core, cli, a);
-    if (!got.ok) { return 1; }
-    if (!got.more) { break; }
-    u8[] data = got.bytes;
-    bytes = bytes + data.len();
-    for (i32 i = 0; i < data.len(); i++) {
-      i32 b = data[i];
-      if (b == '\n') { lineCount++; }
-      bool space = b == ' ' || b == '\n' || b == '\t' || b == '\r';
-      if (space) { inWord = false; } else if (!inWord) { inWord = true; words++; }
+export i32 wc(Core core, Cli cli, Args a) {
+  i32 files = operandCount(a, 0);
+  // No operands means standard input, which is one unnamed pass.
+  i32 count = files == 0 ? 1 : files;
+
+  Counts total = Counts(0, 0, 0);
+  for (i32 f = 0; f < count; f++) {
+    Input in = openStream(core, cli, a, f);
+    if (!in.ok) { return 1; }
+    Counts one = Counts(0, 0, 0);
+    bool inWord = false;
+    while (true) {
+      Chunk got = nextChunk(core, cli, a);
+      if (!got.ok) { return 1; }
+      if (!got.more) { break; }
+      u8[] data = got.bytes;
+      one.bytes = one.bytes + data.len();
+      for (i32 i = 0; i < data.len(); i++) {
+        i32 b = data[i];
+        if (b == '\n') { one.lines++; }
+        bool space = b == ' ' || b == '\n' || b == '\t' || b == '\r';
+        if (space) { inWord = false; } else if (!inWord) { inWord = true; one.words++; }
+      }
     }
+    core.log(row(a, one, in.label));
+    total.lines = total.lines + one.lines;
+    total.words = total.words + one.words;
+    total.bytes = total.bytes + one.bytes;
   }
 
-  // One number and no label when exactly one of -l -w -c is asked for, as the real one does.
+  // A total only when there was more than one file to total, which is the real one's rule.
+  if (files > 1) { core.log(row(a, total, "total")); }
+  return 0;
+}
+
+/**
+ * One line of output: the columns asked for, then the label if there is one.
+ *
+ * The columns are not padded, where the real one right-aligns them to the width of its largest count.
+ * That difference is deliberate and old — `test/box.test.ts` compares the numbers rather than the text
+ * and says so — but the *label* is not a column, and dropping it was a bug rather than a choice.
+ */
+string row(Args a, Counts c, string label) {
   bool l = has(a, 'l');
   bool w = has(a, 'w');
-  bool c = has(a, 'c');
-  if (l && !w && !c) { core.log(itoa(lineCount)); return 0; }
-  if (w && !l && !c) { core.log(itoa(words)); return 0; }
-  if (c && !l && !w) { core.log(itoa(bytes)); return 0; }
-
-  string line = itoa(lineCount) + " " + itoa(words) + " " + itoa(bytes);
-  core.log(in.label == "" ? line : line + " " + in.label);
-  return 0;
+  bool b = has(a, 'c');
+  string nums = "";
+  if (!l && !w && !b) {
+    nums = itoa(c.lines) + " " + itoa(c.words) + " " + itoa(c.bytes);
+  } else {
+    if (l) { nums = itoa(c.lines); }
+    if (w) { nums = nums == "" ? itoa(c.words) : nums + " " + itoa(c.words); }
+    if (b) { nums = nums == "" ? itoa(c.bytes) : nums + " " + itoa(c.bytes); }
+  }
+  return label == "" ? nums : nums + " " + label;
 }

@@ -48,6 +48,7 @@ import { Read } from core;
 import { Buf } from "../../bytes/src/buf.wac";
 import { Parsed, parseRequest } from "../../http/src/request.wac";
 import { DirDocuments, dirSourceFingerprint } from "./dirserve.wac";
+import { AuthorityCert, Verdict, parseCertificates, verifyConsensus } from "./consensus.wac";
 import { DirAction, dirStep, filed } from "./dirstep.wac";
 import { PUB_OK } from "./hsstore.wac";
 
@@ -390,8 +391,17 @@ export i32 main(Core core, Cli cli) {
                                  microdescPath);
   DirDocuments docs = loaded.docs;
   bool hasDir = loaded.ok;
+  // Said once per distinct problem rather than once per attempt: the poll runs twice a second, and a
+  // relay pointed at the wrong file should say so clearly, not four hundred times a minute.
+  string complained = "";
   if (wantDir && !hasDir) {
-    core.log("relayd: waiting for " + consensusPath + " — serving no directory documents until it is there");
+    if (loaded.problem != "") {
+      core.warn("relayd: " + loaded.problem);
+      complained = loaded.problem;
+    } else {
+      core.log("relayd: waiting for " + consensusPath +
+               " — serving no directory documents until it is there");
+    }
   }
 
   u8[] certs = identityCerts(id, now);
@@ -510,6 +520,9 @@ export i32 main(Core core, Cli cli) {
       if (again.ok) {
         docs = again.docs;
         hasDir = true;
+      } else if (again.problem != "" && again.problem != complained) {
+        core.warn("relayd: " + again.problem);
+        complained = again.problem;
       }
       continue;
     }
@@ -831,16 +844,113 @@ void dropConn(Core core, Cli cli, Conn c, IntroPoints intros, RendPoints rends) 
  * is meaningless for the client, whose cells name their own circuit. The function returns when the
  * event is handled; `c.live` says whether the connection survived it.
  */
-/** What `loadDocuments` found: the documents, and whether every one of them was there. */
+/** What `loadDocuments` found: the documents, whether every one was there, and what was wrong. */
 struct DirLoad {
   DirDocuments docs;
   bool ok;
+  /** Empty when the files are merely not there yet; otherwise what is wrong with one that is. */
+  string problem;
+}
+
+/**
+ * Whether a file that exists is the document it is supposed to be.
+ *
+ * The first keyword, which is tor's own rule — `networkstatus_parse_vote_from_string` requires the
+ * document to *start* with its version keyword. This is the cheap check, and its real value is that
+ * it makes a half-written file retry instead of stick: a reader that catches an authority mid-write
+ * sees a truncation, and a truncation does not start with the keyword either.
+ *
+ * It is not the check that matters. See `verifiedAgainst` below for that one.
+ */
+bool startsWith(u8[] doc, string keyword) {
+  u8[] k = keyword.toBytes();
+  if (doc.len() < k.len()) { return false; }
+  for (i32 i = 0; i < k.len(); i++) { if (doc[i] != k[i]) { return false; } }
+  return true;
 }
 
 /** The empty set — what a relay serves before its documents exist, and answers 404 from. */
 DirDocuments none() {
   return DirDocuments(u8[0](), u8[0](), u8[0](), u8[0](), u8[][0](), u8[0](),
                       u8[0](), u8[][0](), u8[][0](), u8[][0]());
+}
+
+
+/**
+ * The authority a certificate belongs to, from its own `fingerprint` line.
+ *
+ * Taken from the file rather than from configuration because the file *is* the configuration: an
+ * operator who points `-K` at a certificate has named the authority this relay trusts, exactly as a
+ * `DirAuthority` line does in tor. `parseCertificates` then recomputes the fingerprint from the
+ * identity key inside and drops the certificate if the two disagree, so a `fingerprint` line that
+ * lies about its own key does not survive being read.
+ */
+string certificateFingerprint(u8[] cert) {
+  i32 at = -1;
+  if (startsWith(cert, "fingerprint ")) {
+    at = 0;
+  } else {
+    for (i32 i = 0; i + 12 <= cert.len(); i++) {
+      if (cert[i] != 10) { continue; }
+      bool hit = true;
+      u8[] k = "fingerprint ".toBytes();
+      for (i32 j = 0; j < k.len(); j++) {
+        if (i + 1 + j >= cert.len() || cert[i + 1 + j] != k[j]) { hit = false; break; }
+      }
+      if (hit) { at = i + 1; break; }
+    }
+  }
+  if (at < 0) { return ""; }
+  i32 from = at + 12;
+  i32 to = from;
+  while (to < cert.len() && cert[to] != 10 && cert[to] != 13) { to = to + 1; }
+  u8[] out = u8[to - from]();
+  for (i32 i = from; i < to; i++) { out[i - from] = cert[i]; }
+  return string.fromBytes(out);
+}
+
+/**
+ * Whether the authority whose certificate we hold actually signed this consensus.
+ *
+ * **This relay used to serve whatever it was handed.** The reasoning was that a relay is a cache and
+ * the client is the party that checks signatures — which is true about who is *protected*, and wrong
+ * about what a cache does. C tor puts every consensus it receives through
+ * `networkstatus_set_current_consensus`, and the call that makes one servable —
+ * `dirserv_set_cached_consensus_networkstatus` — sits *after* `networkstatus_check_consensus_signature`
+ * in that function. One that fails goes to `unverified-consensus`, a different file, and is not
+ * served. tor's own comment about a flavour it will not use says it plainly: *"we won't use it, we
+ * didn't want it, and we won't serve it."*
+ *
+ * So the client checking is not a reason for the cache not to. Serving an unsigned consensus is
+ * handing every client that asks a document they will spend a round trip rejecting, and — on a test
+ * network, which is what this program is for — it converts a wrong file at the relay into a mystery
+ * at the client. That is precisely how the JSON-instead-of-a-consensus mistake in the previous commit
+ * stayed invisible for a whole session.
+ *
+ * **Where this is weaker than tor, and why:** tor requires a *majority* of the authorities it knows.
+ * This relay is configured with one certificate, so a majority of what it knows is that one signature.
+ * The rule is the same rule; the trust set is as large as the configuration makes it. A relay given
+ * several authorities' certificates in one `-K` file gets the majority rule with no change here,
+ * because `verifyConsensus` counts distinct trusted signers and that is where the threshold lives.
+ */
+string verifiedAgainst(u8[] consensus, u8[] certFile, i64 now, string what) {
+  string fp = certificateFingerprint(certFile);
+  if (fp == "") { return "the certificate has no fingerprint line, so there is no authority to trust"; }
+  string[] trusted = string[1]();
+  trusted[0] = fp;
+  AuthorityCert[] certs = parseCertificates(certFile, trusted);
+  if (certs.len() == 0) {
+    return "the certificate does not verify against its own identity key, so it says nothing about " +
+           "who signed the " + what;
+  }
+  Verdict v = verifyConsensus(consensus, certs, trusted, now);
+  if (!v.ok) {
+    string why = v.stale != "" ? v.stale
+                               : itoa(v.goodSignatures) + " good signature(s), " + itoa(v.needed) +
+                                 " needed";
+    return "the " + what + " is not signed by " + fp + " — " + why;
+  }
+  return "";
 }
 
 /**
@@ -856,12 +966,25 @@ DirDocuments none() {
  */
 DirLoad loadDocuments(Core core, Cli cli, string consensusPath, string certPath, string[] descPaths,
                       string microConsensusPath, string microdescPath) {
-  if (consensusPath == "" || certPath == "") { return DirLoad(none(), false); }
+  if (consensusPath == "" || certPath == "") { return DirLoad(none(), false, ""); }
   FileResult cf = cli.readFile(consensusPath).wait();
   FileResult kf = cli.readFile(certPath).wait();
   if (!cf.ok || !kf.ok) {
-    return DirLoad(none(), false);
+    return DirLoad(none(), false, "");
   }
+  if (!startsWith(cf.bytes, "network-status-version")) {
+    return DirLoad(none(), false, consensusPath + " is not a consensus — it does not begin " +
+                                  "\"network-status-version\"");
+  }
+  if (!startsWith(kf.bytes, "dir-key-certificate-version")) {
+    return DirLoad(none(), false, certPath + " is not an authority certificate — it does not begin " +
+                                  "\"dir-key-certificate-version\"");
+  }
+  // The check that matters: this relay does not serve a consensus the authority it was configured
+  // with did not sign. See `verifiedAgainst`.
+  i64 now = core.nowMillis().wait() / 1000;
+  string bad = verifiedAgainst(cf.bytes, kf.bytes, now, "consensus");
+  if (bad != "") { return DirLoad(none(), false, consensusPath + ": " + bad); }
   // The descriptors too, because tor asks for them over BEGIN_DIR as readily as for the consensus.
   // Leaving them out did not make it ask elsewhere: it read our 404's ten-byte body as "server info"
   // eight times over and stayed at 0/2 usable descriptors.
@@ -870,8 +993,7 @@ DirLoad loadDocuments(Core core, Cli cli, string consensusPath, string certPath,
   for (i32 di = 0; di < descPaths.len(); di++) {
     FileResult df = cli.readFile(descPaths[di]).wait();
     if (!df.ok) {
-      core.warn("relayd: " + descPaths[di] + ": " + df.error);
-      return DirLoad(none(), false);
+      return DirLoad(none(), false, "");
     }
     descriptors = joinBytes(descriptors, df.bytes);
     digests[di] = rsaDescriptorDigest(df.bytes);
@@ -889,8 +1011,17 @@ DirLoad loadDocuments(Core core, Cli cli, string consensusPath, string certPath,
     FileResult mcf = cli.readFile(microConsensusPath).wait();
     FileResult mdf = cli.readFile(microdescPath).wait();
     if (!mcf.ok || !mdf.ok) {
-      return DirLoad(none(), false);
+      return DirLoad(none(), false, "");
     }
+    // The microdesc flavour is a consensus too, signed by the same authority over its own body, and a
+    // relay that checked one flavour and served the other unchecked would have done the work and kept
+    // the hole — ours is the flavour our own client asks for.
+    if (!startsWith(mcf.bytes, "network-status-version")) {
+      return DirLoad(none(), false, microConsensusPath + " is not a consensus — it does not begin " +
+                                    "\"network-status-version\"");
+    }
+    string badMicro = verifiedAgainst(mcf.bytes, kf.bytes, now, "microdesc consensus");
+    if (badMicro != "") { return DirLoad(none(), false, microConsensusPath + ": " + badMicro); }
     microCons = mcf.bytes;
     micros = mdf.bytes;
     microDigests = microdescDigests(micros);
@@ -902,7 +1033,7 @@ DirLoad loadDocuments(Core core, Cli cli, string consensusPath, string certPath,
                               : ", plus " + itoa(microDigests.len()) + " microdescriptor(s)"));
   return DirLoad(DirDocuments(cf.bytes, microCons, kf.bytes, descriptors, digests,
                               dirSourceFingerprint(cf.bytes), micros, microDigests, u8[][0](),
-                              u8[][0]()), true);
+                              u8[][0]()), true, "");
 }
 
 /**

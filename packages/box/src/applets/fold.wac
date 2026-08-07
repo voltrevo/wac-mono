@@ -5,11 +5,20 @@ import { Args } from "../lib/args.wac";
 import { Reader } from "../lib/input.wac";
 import { Line, Sink, emitTo, nextLine } from "../../../platform/src/stream.wac";
 import { slice } from "../lib/bytes.wac";
+import { itoa } from "../../../fmt/src/itoa.wac";
 
 export i32 fold(Core core, Cli cli, Args a) {
+  i32 width = a.hasNum ? a.num : 80;
+  // **A width of zero never finishes.** `end = start + 0` leaves `start` where it was, so the inner loop
+  // emits an empty line for ever — on a pipe that is an out-of-memory kill rather than a hang, which is
+  // how it was found. A negative width folded nothing at all, silently. GNU refuses both, in these words.
+  if (width <= 0) {
+    core.warn(a.name + ": invalid number of columns: '" + itoa(width) + "'");
+    return 1;
+  }
+
   Reader r = Reader.create(core, cli, a, 0);
   if (!r.ok) { return 1; }
-  i32 width = a.hasNum ? a.num : 80;
 
   Sink out = Sink.create(cli);
   while (true) {
