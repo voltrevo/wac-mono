@@ -21,6 +21,16 @@ export string whyUnread(FileResult f) {
 }
 
 /**
+ * How many files this invocation names, from operand `n` on.
+ *
+ * Zero means standard input. **Every applet here read operand 0 and ignored the rest**, silently: `cat a b`
+ * printed `a`, `sort *.txt` sorted the first one, `wc -l a b` counted `a` and said nothing about `b`. That
+ * is the shape this repo keeps calling out in other people's parsers — an input that cannot be seen is
+ * reported as absent — and it was in the one program a person actually types.
+ */
+export i32 operandCount(Args a, i32 n) { return a.rest.len() <= n ? 0 : a.rest.len() - n; }
+
+/**
  * The same choice, for the streaming pair.
  *
  * `readInput` answers with the whole of the input, which is fine for a filename and wrong
@@ -78,4 +88,41 @@ export Chunk nextChunk(Core core, Cli cli, Args a) {
       return Chunk(false, false, u8[0]());
     }
   }
+}
+
+/**
+ * The next chunk, rolling on to the next file when one ends.
+ *
+ * This is what `cat a b` needs and what every streaming applet here wanted: the operands are one stream
+ * with joins in it. `at` is the operand the caller is on and comes back advanced, so the loop is
+ *
+ *     i32 at = 0;
+ *     while (true) {
+ *       Span got = nextSpan(core, cli, a, at, first);
+ *       …
+ *       at = got.at;
+ *     }
+ *
+ * A file that cannot be opened is reported and stops the run, as it does for a single operand — GNU keeps
+ * going and exits 1 at the end, which is a difference worth naming rather than a difference worth
+ * pretending about: `cat a missing b` here stops after `a`.
+ */
+export struct Span { bool ok; bool more; u8[] bytes; i32 at; }
+
+export Span nextSpan(Core core, Cli cli, Args a, i32 at, bool opened) {
+  i32 files = operandCount(a, 0);
+  if (!opened) {
+    Input in = openStream(core, cli, a, at);
+    if (!in.ok) { return Span(false, false, u8[0](), at); }
+  }
+  Chunk got = nextChunk(core, cli, a);
+  if (!got.ok) { return Span(false, false, u8[0](), at); }
+  if (got.more) { return Span(true, true, got.bytes, at); }
+  // This file is done. If another was named, open it and keep going; the caller sees one stream.
+  if (files > at + 1) {
+    Input next = openStream(core, cli, a, at + 1);
+    if (!next.ok) { return Span(false, false, u8[0](), at + 1); }
+    return nextSpan(core, cli, a, at + 1, true);
+  }
+  return Span(true, false, u8[0](), at);
 }
